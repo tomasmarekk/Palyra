@@ -592,7 +592,13 @@ mod tests {
                 warning_checks_failed: 0,
                 info_checks_failed: 0,
             },
-            config: DoctorConfigSnapshot { path: None, exists: true, parsed: true, error: None },
+            config: DoctorConfigSnapshot {
+                path: None,
+                exists: true,
+                parsed: true,
+                migration: None,
+                error: None,
+            },
             identity: DoctorIdentitySnapshot {
                 store_root: None,
                 exists: true,
@@ -679,6 +685,7 @@ mod tests {
                 remote_bind_detected: false,
                 warnings: Vec::new(),
             },
+            config_ref_health: None,
         }
     }
 

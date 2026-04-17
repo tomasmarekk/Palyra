@@ -46,7 +46,6 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::{Path as FsPath, PathBuf},
     process::Stdio,
-    str::FromStr,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -125,6 +124,7 @@ use palyra_common::{
         is_sensitive_key as redaction_key_is_sensitive, redact_auth_error, redact_url,
         redact_url_segments_in_text,
     },
+    secret_refs::{SecretRef, SecretSource},
     validate_canonical_id,
 };
 use palyra_common::{
@@ -161,7 +161,10 @@ use palyra_skills::{
     SkillManifest, SkillQuotaConfig, SkillSecurityAuditPolicy, SkillToolEntrypoint, SkillToolRisk,
     SkillTrustStore, SKILL_MANIFEST_VERSION,
 };
-use palyra_vault::{Vault, VaultConfig as VaultConfigOptions, VaultRef, VaultScope};
+use palyra_vault::{
+    SecretResolutionStatus, SecretResolveErrorKind, SecretResolver, Vault,
+    VaultConfig as VaultConfigOptions, VaultRef, VaultScope,
+};
 use reqwest::{Client as ReqwestClient, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1731,10 +1734,12 @@ struct IdentityRuntime {
 
 #[derive(Debug, Clone)]
 struct SecretAccessAuditRecord {
-    scope: String,
-    key: String,
     action: String,
+    config_path: String,
+    secret_id: String,
+    source_kind: String,
     value_bytes: usize,
+    resolved_at_unix_ms: i64,
 }
 
 struct ModelProviderMemoryEmbeddingAdapter {
@@ -1950,13 +1955,6 @@ pub async fn run() -> Result<()> {
 
     let identity_runtime = load_identity_runtime(loaded.gateway.identity_store_dir.clone())
         .context("failed to initialize gateway identity runtime")?;
-    let auth = GatewayAuthConfig {
-        require_auth: loaded.admin.require_auth,
-        admin_token: loaded.admin.auth_token.clone(),
-        connector_token: loaded.admin.connector_token.clone(),
-        bound_principal: loaded.admin.bound_principal.clone(),
-    };
-    validate_admin_auth_config(&auth)?;
     let offline_mode = offline_mode_enabled()?;
     let memory_embedding_provider =
         build_memory_embedding_provider(&loaded.model_provider, offline_mode)?;
@@ -1982,14 +1980,32 @@ pub async fn run() -> Result<()> {
         AuthProfileRegistry::open(identity_runtime.store_root.as_path())
             .context("failed to initialize auth profile registry state")?,
     );
+    let secret_resolver = SecretResolver::with_working_dir(
+        Some(vault.as_ref()),
+        secret_resolution_working_dir(&loaded)?,
+    );
     for access_audit in resolve_model_provider_secret(
         &mut loaded.model_provider,
         auth_registry.as_ref(),
         vault.as_ref(),
+        &secret_resolver,
     )? {
         record_secret_access_journal_event(&journal_store, &access_audit)
             .context("failed to audit model provider secret access")?;
     }
+    for access_audit in resolve_admin_and_browser_secret_refs(&mut loaded, &secret_resolver)? {
+        record_secret_access_journal_event(&journal_store, &access_audit)
+            .context("failed to audit runtime secret access")?;
+    }
+    let configured_secrets =
+        build_configured_secrets_state(&loaded, &secret_resolver, 1, "startup")?;
+    let auth = GatewayAuthConfig {
+        require_auth: loaded.admin.require_auth,
+        admin_token: loaded.admin.auth_token.clone(),
+        connector_token: loaded.admin.connector_token.clone(),
+        bound_principal: loaded.admin.bound_principal.clone(),
+    };
+    validate_admin_auth_config(&auth)?;
     let model_provider = build_model_provider(&loaded.model_provider)
         .context("failed to initialize model provider runtime")?;
     let agent_registry = agents::AgentRegistry::open(identity_runtime.store_root.as_path())
@@ -2406,6 +2422,7 @@ pub async fn run() -> Result<()> {
     let state = build_app_state(
         &loaded,
         dangerous_remote_bind_ack_env,
+        configured_secrets,
         AppStateBuildContext {
             runtime: runtime.clone(),
             node_runtime: Arc::clone(&node_runtime),
@@ -2917,17 +2934,20 @@ fn resolve_model_provider_secret(
     model_provider: &mut ModelProviderConfig,
     auth_registry: &AuthProfileRegistry,
     vault: &Vault,
+    resolver: &SecretResolver<'_>,
 ) -> Result<Vec<SecretAccessAuditRecord>> {
     let mut audits = Vec::new();
 
     if let Some(access_audit) =
-        resolve_primary_model_provider_secret(model_provider, auth_registry, vault)?
+        resolve_primary_model_provider_secret(model_provider, auth_registry, vault, resolver)?
     {
         audits.push(access_audit);
     }
 
     for entry in &mut model_provider.registry.providers {
-        if let Some(access_audit) = resolve_registry_provider_secret(entry, auth_registry, vault)? {
+        if let Some(access_audit) =
+            resolve_registry_provider_secret(entry, auth_registry, vault, resolver)?
+        {
             audits.push(access_audit);
         }
     }
@@ -2938,7 +2958,8 @@ fn resolve_model_provider_secret(
 fn resolve_primary_model_provider_secret(
     model_provider: &mut ModelProviderConfig,
     auth_registry: &AuthProfileRegistry,
-    vault: &Vault,
+    _vault: &Vault,
+    resolver: &SecretResolver<'_>,
 ) -> Result<Option<SecretAccessAuditRecord>> {
     let Some(expected_provider) = auth_provider_kind_for_model_provider(model_provider.kind) else {
         return Ok(None);
@@ -2949,12 +2970,6 @@ fn resolve_primary_model_provider_secret(
         ModelProviderKind::Anthropic => &mut model_provider.anthropic_api_key,
         ModelProviderKind::Deterministic => return Ok(None),
     };
-    let vault_ref = match model_provider.kind {
-        ModelProviderKind::OpenAiCompatible => model_provider.openai_api_key_vault_ref.clone(),
-        ModelProviderKind::Anthropic => model_provider.anthropic_api_key_vault_ref.clone(),
-        ModelProviderKind::Deterministic => None,
-    };
-
     if inline_api_key.is_some() {
         model_provider.credential_source = Some(ModelProviderCredentialSource::InlineConfig);
         return Ok(None);
@@ -2964,7 +2979,7 @@ fn resolve_primary_model_provider_secret(
         let (decoded, access_audit, credential_source, resolved_profile_id) =
             resolve_provider_secret_from_auth_profile(
                 auth_registry,
-                vault,
+                resolver,
                 auth_profile_id.as_str(),
                 model_provider.auth_profile_provider_kind.unwrap_or(expected_provider),
                 "model provider runtime",
@@ -2976,37 +2991,53 @@ fn resolve_primary_model_provider_secret(
         return Ok(Some(access_audit));
     }
 
-    let Some(vault_ref_raw) = vault_ref else {
-        return Ok(None);
+    let (secret_ref, config_path) = match model_provider.kind {
+        ModelProviderKind::OpenAiCompatible => {
+            if let Some(secret_ref) = model_provider.openai_api_key_secret_ref.clone() {
+                (secret_ref, "model_provider.openai_api_key_secret_ref")
+            } else if let Some(vault_ref) = model_provider.openai_api_key_vault_ref.clone() {
+                let secret_ref = SecretRef::from_legacy_vault_ref(vault_ref);
+                model_provider.openai_api_key_secret_ref = Some(secret_ref.clone());
+                (secret_ref, "model_provider.openai_api_key_vault_ref")
+            } else {
+                return Ok(None);
+            }
+        }
+        ModelProviderKind::Anthropic => {
+            if let Some(secret_ref) = model_provider.anthropic_api_key_secret_ref.clone() {
+                (secret_ref, "model_provider.anthropic_api_key_secret_ref")
+            } else if let Some(vault_ref) = model_provider.anthropic_api_key_vault_ref.clone() {
+                let secret_ref = SecretRef::from_legacy_vault_ref(vault_ref);
+                model_provider.anthropic_api_key_secret_ref = Some(secret_ref.clone());
+                (secret_ref, "model_provider.anthropic_api_key_vault_ref")
+            } else {
+                return Ok(None);
+            }
+        }
+        ModelProviderKind::Deterministic => return Ok(None),
     };
     let action = match model_provider.kind {
         ModelProviderKind::OpenAiCompatible => "model_provider.openai_api_key.resolve",
         ModelProviderKind::Anthropic => "model_provider.anthropic_api_key.resolve",
         ModelProviderKind::Deterministic => "model_provider.api_key.resolve",
     };
-    let access_audit = resolve_provider_secret_from_vault_ref(
-        vault,
-        vault_ref_raw.as_str(),
+    let (value, access_audit) = resolve_provider_secret_from_secret_ref(
+        resolver,
+        &secret_ref,
         "model provider API key",
         action,
+        config_path,
     )?;
-    let value = load_secret_for_audit(
-        vault,
-        &access_audit,
-        format!("model provider API key from vault ref {}", vault_ref_raw).as_str(),
-    )?;
-    *inline_api_key = Some(decode_provider_secret_value(
-        value,
-        format!("model provider API key from vault ref {}", vault_ref_raw).as_str(),
-    )?);
-    model_provider.credential_source = Some(ModelProviderCredentialSource::VaultRef);
+    *inline_api_key = Some(value);
+    model_provider.credential_source = Some(secret_ref_credential_source(&secret_ref));
     Ok(Some(access_audit))
 }
 
 fn resolve_registry_provider_secret(
     entry: &mut ProviderRegistryEntryConfig,
     auth_registry: &AuthProfileRegistry,
-    vault: &Vault,
+    _vault: &Vault,
+    resolver: &SecretResolver<'_>,
 ) -> Result<Option<SecretAccessAuditRecord>> {
     let Some(expected_provider) = auth_provider_kind_for_model_provider(entry.kind) else {
         return Ok(None);
@@ -3024,7 +3055,7 @@ fn resolve_registry_provider_secret(
         let (decoded, access_audit, credential_source, resolved_profile_id) =
             resolve_provider_secret_from_auth_profile(
                 auth_registry,
-                vault,
+                resolver,
                 auth_profile_id.as_str(),
                 entry.auth_profile_provider_kind.unwrap_or(expected_provider),
                 context_label.as_str(),
@@ -3036,34 +3067,31 @@ fn resolve_registry_provider_secret(
         return Ok(Some(access_audit));
     }
 
-    let Some(vault_ref_raw) = entry.api_key_vault_ref.clone() else {
+    let (secret_ref, config_path) = if let Some(secret_ref) = entry.api_key_secret_ref.clone() {
+        (
+            secret_ref,
+            format!("model_provider.registry.providers[{}].api_key_secret_ref", entry.provider_id),
+        )
+    } else if let Some(vault_ref) = entry.api_key_vault_ref.clone() {
+        let secret_ref = SecretRef::from_legacy_vault_ref(vault_ref);
+        entry.api_key_secret_ref = Some(secret_ref.clone());
+        (
+            secret_ref,
+            format!("model_provider.registry.providers[{}].api_key_vault_ref", entry.provider_id),
+        )
+    } else {
         return Ok(None);
     };
     let action_prefix = format!("model_provider.registry.providers[{}].api_key", entry.provider_id);
-    let access_audit = resolve_provider_secret_from_vault_ref(
-        vault,
-        vault_ref_raw.as_str(),
+    let (value, access_audit) = resolve_provider_secret_from_secret_ref(
+        resolver,
+        &secret_ref,
         format!("provider registry entry '{}' API key", entry.provider_id).as_str(),
         action_prefix.as_str(),
+        config_path.as_str(),
     )?;
-    let value = load_secret_for_audit(
-        vault,
-        &access_audit,
-        format!(
-            "provider registry entry '{}' API key from vault ref {}",
-            entry.provider_id, vault_ref_raw
-        )
-        .as_str(),
-    )?;
-    entry.api_key = Some(decode_provider_secret_value(
-        value,
-        format!(
-            "provider registry entry '{}' API key from vault ref {}",
-            entry.provider_id, vault_ref_raw
-        )
-        .as_str(),
-    )?);
-    entry.credential_source = Some(ModelProviderCredentialSource::VaultRef);
+    entry.api_key = Some(value);
+    entry.credential_source = Some(secret_ref_credential_source(&secret_ref));
     Ok(Some(access_audit))
 }
 
@@ -3079,7 +3107,7 @@ fn auth_provider_kind_for_model_provider(
 
 fn resolve_provider_secret_from_auth_profile(
     auth_registry: &AuthProfileRegistry,
-    vault: &Vault,
+    resolver: &SecretResolver<'_>,
     auth_profile_id: &str,
     expected_provider: ModelProviderAuthProviderKind,
     context_label: &str,
@@ -3116,93 +3144,323 @@ fn resolve_provider_secret_from_auth_profile(
         );
     }
 
-    let (vault_ref_raw, action, credential_source) = match &profile.credential {
+    let (secret_ref, action, credential_source) = match &profile.credential {
         AuthCredential::ApiKey { api_key_vault_ref } => (
-            api_key_vault_ref.clone(),
+            SecretRef::from_legacy_vault_ref(api_key_vault_ref.clone()),
             format!("{action_prefix}.api_key.resolve"),
             ModelProviderCredentialSource::AuthProfileApiKey,
         ),
         AuthCredential::Oauth { access_token_vault_ref, .. } => (
-            access_token_vault_ref.clone(),
+            SecretRef::from_legacy_vault_ref(access_token_vault_ref.clone()),
             format!("{action_prefix}.oauth_access_token.resolve"),
             ModelProviderCredentialSource::AuthProfileOauthAccessToken,
         ),
     };
-    let access_audit = resolve_provider_secret_from_vault_ref(
-        vault,
-        vault_ref_raw.as_str(),
+    let (value, access_audit) = resolve_provider_secret_from_secret_ref(
+        resolver,
+        &secret_ref,
         format!("{} credential from auth profile '{}'", context_label, profile.profile_id).as_str(),
         action.as_str(),
+        format!("{action_prefix}.resolved_secret").as_str(),
     )?;
-    let value = load_secret_for_audit(
-        vault,
-        &access_audit,
-        format!(
-            "{} credential from auth profile '{}' vault ref '{}'",
-            context_label, profile.profile_id, vault_ref_raw
-        )
-        .as_str(),
-    )?;
+    Ok((value, access_audit, credential_source, profile.profile_id))
+}
+
+fn resolve_provider_secret_from_secret_ref(
+    resolver: &SecretResolver<'_>,
+    secret_ref: &SecretRef,
+    context_label: &str,
+    action: &str,
+    config_path: &str,
+) -> Result<(String, SecretAccessAuditRecord)> {
+    let resolution = resolver
+        .resolve(secret_ref)
+        .map_err(|error| anyhow::anyhow!("failed to resolve {context_label}: {}", error.message))?;
+    let resolved_at_unix_ms = resolution.metadata.resolved_at_unix_ms;
+    let value_bytes = resolution.metadata.value_bytes.unwrap_or(0);
+    let decoded = resolution.decode_utf8(context_label)?;
     Ok((
-        decode_provider_secret_value(
-            value,
-            format!(
-                "{} credential from auth profile '{}' vault ref '{}'",
-                context_label, profile.profile_id, vault_ref_raw
-            )
-            .as_str(),
-        )?,
-        access_audit,
-        credential_source,
-        profile.profile_id,
+        decoded,
+        SecretAccessAuditRecord {
+            action: action.to_owned(),
+            config_path: config_path.to_owned(),
+            secret_id: secret_ref.fingerprint(),
+            source_kind: secret_ref.source_kind().to_owned(),
+            value_bytes,
+            resolved_at_unix_ms,
+        },
     ))
 }
 
-fn resolve_provider_secret_from_vault_ref(
-    vault: &Vault,
-    vault_ref_raw: &str,
-    context_label: &str,
-    action: &str,
-) -> Result<SecretAccessAuditRecord> {
-    let vault_ref = VaultRef::parse(vault_ref_raw)
-        .with_context(|| format!("invalid vault ref '{}' for {}", vault_ref_raw, context_label))?;
-    let value = vault.get_secret(&vault_ref.scope, vault_ref.key.as_str()).with_context(|| {
-        format!("failed to load {} from vault ref {}", context_label, vault_ref_raw)
-    })?;
-    if value.is_empty() {
-        anyhow::bail!("vault ref {} resolved to an empty secret value", vault_ref_raw);
+fn resolve_admin_and_browser_secret_refs(
+    loaded: &mut config::LoadedConfig,
+    resolver: &SecretResolver<'_>,
+) -> Result<Vec<SecretAccessAuditRecord>> {
+    let mut audits = Vec::new();
+
+    if let Some(secret_ref) = loaded.admin.auth_token_secret_ref.as_ref() {
+        let (decoded, audit) = resolve_provider_secret_from_secret_ref(
+            resolver,
+            secret_ref,
+            "admin auth token",
+            "admin.auth_token.resolve",
+            "admin.auth_token_secret_ref",
+        )?;
+        loaded.admin.auth_token = Some(decoded);
+        audits.push(audit);
     }
-    Ok(SecretAccessAuditRecord {
-        scope: vault_ref.scope.to_string(),
-        key: vault_ref.key,
-        action: action.to_owned(),
-        value_bytes: value.len(),
+    if let Some(secret_ref) = loaded.admin.connector_token_secret_ref.as_ref() {
+        let (decoded, audit) = resolve_provider_secret_from_secret_ref(
+            resolver,
+            secret_ref,
+            "admin connector token",
+            "admin.connector_token.resolve",
+            "admin.connector_token_secret_ref",
+        )?;
+        loaded.admin.connector_token = Some(decoded);
+        audits.push(audit);
+    }
+    if let Some(secret_ref) = loaded.tool_call.browser_service.auth_token_secret_ref.as_ref() {
+        let (decoded, audit) = resolve_provider_secret_from_secret_ref(
+            resolver,
+            secret_ref,
+            "browser service auth token",
+            "tool_call.browser_service.auth_token.resolve",
+            "tool_call.browser_service.auth_token_secret_ref",
+        )?;
+        loaded.tool_call.browser_service.auth_token = Some(decoded);
+        audits.push(audit);
+    }
+
+    Ok(audits)
+}
+
+pub(crate) fn build_configured_secrets_state(
+    loaded: &config::LoadedConfig,
+    resolver: &SecretResolver<'_>,
+    snapshot_generation: u64,
+    resolution_scope: &str,
+) -> Result<app::state::ConfiguredSecretsState> {
+    let mut secrets = Vec::new();
+    collect_configured_secret_record(
+        &mut secrets,
+        loaded.model_provider.openai_api_key_secret_ref.as_ref(),
+        "model_provider",
+        "model_provider.openai_api_key_secret_ref",
+        resolver,
+        snapshot_generation,
+        resolution_scope,
+    )?;
+    collect_configured_secret_record(
+        &mut secrets,
+        loaded.model_provider.anthropic_api_key_secret_ref.as_ref(),
+        "model_provider",
+        "model_provider.anthropic_api_key_secret_ref",
+        resolver,
+        snapshot_generation,
+        resolution_scope,
+    )?;
+    for provider in &loaded.model_provider.registry.providers {
+        collect_configured_secret_record(
+            &mut secrets,
+            provider.api_key_secret_ref.as_ref(),
+            "model_provider_registry",
+            format!(
+                "model_provider.registry.providers[{}].api_key_secret_ref",
+                provider.provider_id
+            )
+            .as_str(),
+            resolver,
+            snapshot_generation,
+            resolution_scope,
+        )?;
+    }
+    collect_configured_secret_record(
+        &mut secrets,
+        loaded.tool_call.browser_service.auth_token_secret_ref.as_ref(),
+        "browser_service",
+        "tool_call.browser_service.auth_token_secret_ref",
+        resolver,
+        snapshot_generation,
+        resolution_scope,
+    )?;
+    collect_configured_secret_record(
+        &mut secrets,
+        loaded.tool_call.browser_service.state_key_secret_ref.as_ref(),
+        "browser_service",
+        "tool_call.browser_service.state_key_secret_ref",
+        resolver,
+        snapshot_generation,
+        resolution_scope,
+    )?;
+    collect_configured_secret_record(
+        &mut secrets,
+        loaded.admin.auth_token_secret_ref.as_ref(),
+        "admin_auth",
+        "admin.auth_token_secret_ref",
+        resolver,
+        snapshot_generation,
+        resolution_scope,
+    )?;
+    collect_configured_secret_record(
+        &mut secrets,
+        loaded.admin.connector_token_secret_ref.as_ref(),
+        "admin_auth",
+        "admin.connector_token_secret_ref",
+        resolver,
+        snapshot_generation,
+        resolution_scope,
+    )?;
+
+    Ok(app::state::ConfiguredSecretsState {
+        generated_at_unix_ms: unix_ms_now()?,
+        snapshot_generation,
+        secrets,
     })
 }
 
-fn decode_provider_secret_value(value: Vec<u8>, context_label: &str) -> Result<String> {
-    let decoded = String::from_utf8(value)
-        .with_context(|| format!("{context_label} must be valid UTF-8 text"))?;
-    if decoded.trim().is_empty() {
-        anyhow::bail!("{context_label} cannot be whitespace only");
+fn collect_configured_secret_record(
+    records: &mut Vec<control_plane::ConfiguredSecretRecord>,
+    secret_ref: Option<&SecretRef>,
+    component: &str,
+    config_path: &str,
+    resolver: &SecretResolver<'_>,
+    snapshot_generation: u64,
+    resolution_scope: &str,
+) -> Result<()> {
+    let Some(secret_ref) = secret_ref else {
+        return Ok(());
+    };
+    let source = configured_secret_source_view(secret_ref);
+    match resolver.resolve(secret_ref) {
+        Ok(resolution) => {
+            records.push(control_plane::ConfiguredSecretRecord {
+                secret_id: format!("{}:{}", config_path, secret_ref.fingerprint()),
+                component: component.to_owned(),
+                config_path: config_path.to_owned(),
+                status: match resolution.metadata.status {
+                    SecretResolutionStatus::Resolved => "healthy",
+                    SecretResolutionStatus::Missing => "missing",
+                    SecretResolutionStatus::Blocked => "blocked",
+                    SecretResolutionStatus::Failed => "failed",
+                }
+                .to_owned(),
+                resolution_scope: resolution_scope.to_owned(),
+                reload_action: reload_action_for_secret_path(config_path).to_owned(),
+                snapshot_generation,
+                source,
+                affected_components: vec![component.to_owned()],
+                last_resolved_at_unix_ms: Some(resolution.metadata.resolved_at_unix_ms),
+                last_error_kind: None,
+                last_error: None,
+                value_bytes: resolution
+                    .metadata
+                    .value_bytes
+                    .map(|value| u32::try_from(value).unwrap_or(u32::MAX)),
+            });
+        }
+        Err(error) => {
+            records.push(control_plane::ConfiguredSecretRecord {
+                secret_id: format!("{}:{}", config_path, secret_ref.fingerprint()),
+                component: component.to_owned(),
+                config_path: config_path.to_owned(),
+                status: match error.metadata.status {
+                    SecretResolutionStatus::Resolved => "healthy",
+                    SecretResolutionStatus::Missing => "missing",
+                    SecretResolutionStatus::Blocked => "blocked",
+                    SecretResolutionStatus::Failed => "failed",
+                }
+                .to_owned(),
+                resolution_scope: resolution_scope.to_owned(),
+                reload_action: reload_action_for_secret_path(config_path).to_owned(),
+                snapshot_generation,
+                source,
+                affected_components: vec![component.to_owned()],
+                last_resolved_at_unix_ms: Some(error.metadata.resolved_at_unix_ms),
+                last_error_kind: Some(secret_resolve_error_kind_label(error.kind).to_owned()),
+                last_error: Some(error.message),
+                value_bytes: error
+                    .metadata
+                    .value_bytes
+                    .map(|value| u32::try_from(value).unwrap_or(u32::MAX)),
+            });
+        }
     }
-    Ok(decoded)
+    Ok(())
 }
 
-fn load_secret_for_audit(
-    vault: &Vault,
-    audit: &SecretAccessAuditRecord,
-    context_label: &str,
-) -> Result<Vec<u8>> {
-    let scope = VaultScope::from_str(audit.scope.as_str()).with_context(|| {
-        format!("invalid vault scope '{}' recorded for {}", audit.scope, context_label)
-    })?;
-    vault.get_secret(&scope, audit.key.as_str()).with_context(|| {
-        format!(
-            "failed to load {} from vault scope '{}' key '{}'",
-            context_label, audit.scope, audit.key
-        )
-    })
+fn configured_secret_source_view(
+    secret_ref: &SecretRef,
+) -> control_plane::ConfiguredSecretSourceView {
+    let redacted = secret_ref.redacted_view();
+    control_plane::ConfiguredSecretSourceView {
+        kind: redacted.kind,
+        fingerprint: redacted.fingerprint,
+        required: redacted.required,
+        refresh_policy: redacted.refresh_policy,
+        snapshot_policy: redacted.snapshot_policy,
+        description: redacted.source.description,
+        display_name: redacted.display_name,
+        redaction_label: redacted.redaction_label,
+        max_bytes: redacted.max_bytes,
+        exec_timeout_ms: redacted.exec_timeout_ms,
+        trusted_dir_count: redacted
+            .source
+            .trusted_dir_count
+            .map(|value| u32::try_from(value).unwrap_or(u32::MAX)),
+        inherited_env_count: redacted
+            .source
+            .inherited_env_count
+            .map(|value| u32::try_from(value).unwrap_or(u32::MAX)),
+        allow_symlinks: redacted.source.allow_symlinks,
+    }
+}
+
+fn secret_resolve_error_kind_label(kind: SecretResolveErrorKind) -> &'static str {
+    match kind {
+        SecretResolveErrorKind::Missing => "missing",
+        SecretResolveErrorKind::InvalidReference => "invalid_reference",
+        SecretResolveErrorKind::PolicyBlocked => "policy_blocked",
+        SecretResolveErrorKind::Io => "io",
+        SecretResolveErrorKind::TooLarge => "too_large",
+        SecretResolveErrorKind::Timeout => "timeout",
+        SecretResolveErrorKind::ExecFailed => "exec_failed",
+        SecretResolveErrorKind::DecodeFailed => "decode_failed",
+    }
+}
+
+fn reload_action_for_secret_path(config_path: &str) -> &'static str {
+    if config_path.starts_with("model_provider.") {
+        "blocked_while_runs_active"
+    } else if config_path.starts_with("tool_call.browser_service.")
+        || config_path.starts_with("admin.")
+    {
+        "restart_required"
+    } else {
+        "manual_review"
+    }
+}
+
+fn secret_ref_credential_source(secret_ref: &SecretRef) -> ModelProviderCredentialSource {
+    match secret_ref.source {
+        SecretSource::Vault { .. } => ModelProviderCredentialSource::VaultRef,
+        _ => ModelProviderCredentialSource::SecretRef,
+    }
+}
+
+pub(crate) fn secret_resolution_working_dir(loaded: &config::LoadedConfig) -> Result<PathBuf> {
+    let source_path = loaded.source.split(" +env(").next().map(str::trim).unwrap_or("defaults");
+    if source_path.eq_ignore_ascii_case("defaults") {
+        return std::env::current_dir().context("failed to resolve current working directory");
+    }
+    let path = PathBuf::from(source_path);
+    if path.is_dir() {
+        Ok(path)
+    } else if let Some(parent) = path.parent() {
+        Ok(parent.to_path_buf())
+    } else {
+        std::env::current_dir().context("failed to resolve current working directory")
+    }
 }
 
 fn record_secret_access_journal_event(
@@ -3220,9 +3478,11 @@ fn record_secret_access_journal_event(
             payload_json: json!({
                 "event": "secret.accessed",
                 "action": audit.action,
-                "scope": audit.scope,
-                "key": audit.key,
+                "config_path": audit.config_path,
+                "secret_id": audit.secret_id,
+                "source_kind": audit.source_kind,
                 "value_bytes": audit.value_bytes,
+                "resolved_at_unix_ms": audit.resolved_at_unix_ms,
             })
             .to_string()
             .into_bytes(),
@@ -3441,7 +3701,9 @@ mod tests {
         AuthCredential, AuthProfileRegistry, AuthProfileScope, AuthProfileSetRequest, AuthProvider,
         AuthProviderKind,
     };
-    use palyra_vault::{BackendPreference, Vault, VaultConfig as VaultConfigOptions, VaultRef};
+    use palyra_vault::{
+        BackendPreference, SecretResolver, Vault, VaultConfig as VaultConfigOptions, VaultRef,
+    };
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -4137,7 +4399,8 @@ mod tests {
 
     #[test]
     fn model_provider_secret_resolver_prefers_auth_profile_over_legacy_vault_ref() {
-        let (_tempdir, auth_registry, vault) = setup_auth_registry_and_vault();
+        let (tempdir, auth_registry, vault) = setup_auth_registry_and_vault();
+        let resolver = SecretResolver::with_working_dir(Some(&vault), tempdir.path());
         let legacy_ref =
             VaultRef::parse("global/openai_legacy_key").expect("legacy vault ref should parse");
         vault
@@ -4165,8 +4428,9 @@ mod tests {
         model_provider.auth_profile_provider_kind = Some(ModelProviderAuthProviderKind::Openai);
         model_provider.openai_api_key_vault_ref = Some("global/openai_legacy_key".to_owned());
 
-        let audits = resolve_model_provider_secret(&mut model_provider, &auth_registry, &vault)
-            .expect("auth profile resolution should succeed");
+        let audits =
+            resolve_model_provider_secret(&mut model_provider, &auth_registry, &vault, &resolver)
+                .expect("auth profile resolution should succeed");
         let audit =
             audits.into_iter().next().expect("audit record should be emitted for resolved secret");
         assert_eq!(
@@ -4179,14 +4443,15 @@ mod tests {
             Some(ModelProviderCredentialSource::AuthProfileApiKey),
             "credential source should reflect auth profile API key path"
         );
-        assert_eq!(audit.scope, "global");
-        assert_eq!(audit.key, "openai_auth_key");
         assert_eq!(audit.action, "model_provider.auth_profile.api_key.resolve");
+        assert_eq!(audit.source_kind, "vault");
+        assert_eq!(audit.config_path, "model_provider.auth_profile.resolved_secret");
     }
 
     #[test]
     fn model_provider_secret_resolver_uses_legacy_vault_ref_when_auth_profile_is_unset() {
-        let (_tempdir, auth_registry, vault) = setup_auth_registry_and_vault();
+        let (tempdir, auth_registry, vault) = setup_auth_registry_and_vault();
+        let resolver = SecretResolver::with_working_dir(Some(&vault), tempdir.path());
         let legacy_ref =
             VaultRef::parse("global/openai_legacy_key").expect("legacy vault ref should parse");
         vault
@@ -4196,8 +4461,9 @@ mod tests {
         let mut model_provider = openai_model_provider_config();
         model_provider.openai_api_key_vault_ref = Some("global/openai_legacy_key".to_owned());
 
-        let audits = resolve_model_provider_secret(&mut model_provider, &auth_registry, &vault)
-            .expect("legacy vault-ref resolution should succeed");
+        let audits =
+            resolve_model_provider_secret(&mut model_provider, &auth_registry, &vault, &resolver)
+                .expect("legacy vault-ref resolution should succeed");
         let audit =
             audits.into_iter().next().expect("audit record should be emitted for resolved secret");
         assert_eq!(
@@ -4211,11 +4477,14 @@ mod tests {
             "credential source should reflect legacy vault-ref path"
         );
         assert_eq!(audit.action, "model_provider.openai_api_key.resolve");
+        assert_eq!(audit.source_kind, "vault");
+        assert_eq!(audit.config_path, "model_provider.openai_api_key_vault_ref");
     }
 
     #[test]
     fn model_provider_secret_resolver_rejects_auth_profile_provider_mismatch() {
-        let (_tempdir, auth_registry, vault) = setup_auth_registry_and_vault();
+        let (tempdir, auth_registry, vault) = setup_auth_registry_and_vault();
+        let resolver = SecretResolver::with_working_dir(Some(&vault), tempdir.path());
         auth_registry
             .set_profile(AuthProfileSetRequest {
                 profile_id: "anthropic-default".to_owned(),
@@ -4232,8 +4501,9 @@ mod tests {
         model_provider.auth_profile_id = Some("anthropic-default".to_owned());
         model_provider.auth_profile_provider_kind = Some(ModelProviderAuthProviderKind::Openai);
 
-        let error = resolve_model_provider_secret(&mut model_provider, &auth_registry, &vault)
-            .expect_err("provider mismatch should fail closed");
+        let error =
+            resolve_model_provider_secret(&mut model_provider, &auth_registry, &vault, &resolver)
+                .expect_err("provider mismatch should fail closed");
         assert!(
             error.to_string().contains("provider mismatch"),
             "resolver should explain provider mismatch when auth profile kind is incompatible"
@@ -4242,7 +4512,8 @@ mod tests {
 
     #[test]
     fn model_provider_secret_resolver_loads_oauth_access_token_from_auth_profile() {
-        let (_tempdir, auth_registry, vault) = setup_auth_registry_and_vault();
+        let (tempdir, auth_registry, vault) = setup_auth_registry_and_vault();
+        let resolver = SecretResolver::with_working_dir(Some(&vault), tempdir.path());
         let access_ref = VaultRef::parse("global/openai_access_token")
             .expect("oauth access-token vault ref should parse");
         vault
@@ -4271,8 +4542,9 @@ mod tests {
         model_provider.auth_profile_id = Some("openai-oauth".to_owned());
         model_provider.auth_profile_provider_kind = Some(ModelProviderAuthProviderKind::Openai);
 
-        let audits = resolve_model_provider_secret(&mut model_provider, &auth_registry, &vault)
-            .expect("oauth auth profile resolution should succeed");
+        let audits =
+            resolve_model_provider_secret(&mut model_provider, &auth_registry, &vault, &resolver)
+                .expect("oauth auth profile resolution should succeed");
         let audit = audits
             .into_iter()
             .next()
@@ -4295,7 +4567,8 @@ mod tests {
 
     #[test]
     fn model_provider_secret_resolver_hydrates_registry_provider_auth_profile() {
-        let (_tempdir, auth_registry, vault) = setup_auth_registry_and_vault();
+        let (tempdir, auth_registry, vault) = setup_auth_registry_and_vault();
+        let resolver = SecretResolver::with_working_dir(Some(&vault), tempdir.path());
         let auth_ref = VaultRef::parse("global/anthropic_auth_key")
             .expect("auth profile vault ref should parse");
         vault
@@ -4324,6 +4597,7 @@ mod tests {
             auth_profile_id: Some("anthropic-default".to_owned()),
             auth_profile_provider_kind: Some(ModelProviderAuthProviderKind::Anthropic),
             api_key: None,
+            api_key_secret_ref: None,
             api_key_vault_ref: None,
             credential_source: None,
             request_timeout_ms: 15_000,
@@ -4333,8 +4607,9 @@ mod tests {
             circuit_breaker_cooldown_ms: 30_000,
         }];
 
-        let audits = resolve_model_provider_secret(&mut model_provider, &auth_registry, &vault)
-            .expect("registry auth profile resolution should succeed");
+        let audits =
+            resolve_model_provider_secret(&mut model_provider, &auth_registry, &vault, &resolver)
+                .expect("registry auth profile resolution should succeed");
 
         assert_eq!(audits.len(), 1);
         assert_eq!(
@@ -4348,6 +4623,57 @@ mod tests {
         assert_eq!(
             audits[0].action,
             "model_provider.registry.providers[anthropic-primary].auth_profile.api_key.resolve"
+        );
+    }
+
+    #[test]
+    fn model_provider_secret_resolver_hydrates_registry_provider_legacy_vault_ref() {
+        let (tempdir, auth_registry, vault) = setup_auth_registry_and_vault();
+        let resolver = SecretResolver::with_working_dir(Some(&vault), tempdir.path());
+        let legacy_ref = VaultRef::parse("global/anthropic_legacy_key")
+            .expect("legacy provider vault ref should parse");
+        vault
+            .put_secret(&legacy_ref.scope, legacy_ref.key.as_str(), b"anthropic-legacy")
+            .expect("legacy registry provider key should be written");
+
+        let mut model_provider = ModelProviderConfig::default();
+        model_provider.registry.providers = vec![ProviderRegistryEntryConfig {
+            provider_id: "anthropic-primary".to_owned(),
+            display_name: Some("Anthropic".to_owned()),
+            kind: ModelProviderKind::Anthropic,
+            base_url: Some("https://api.anthropic.com".to_owned()),
+            allow_private_base_url: false,
+            enabled: true,
+            auth_profile_id: None,
+            auth_profile_provider_kind: Some(ModelProviderAuthProviderKind::Anthropic),
+            api_key: None,
+            api_key_secret_ref: None,
+            api_key_vault_ref: Some("global/anthropic_legacy_key".to_owned()),
+            credential_source: None,
+            request_timeout_ms: 15_000,
+            max_retries: 2,
+            retry_backoff_ms: 100,
+            circuit_breaker_failure_threshold: 3,
+            circuit_breaker_cooldown_ms: 30_000,
+        }];
+
+        let audits =
+            resolve_model_provider_secret(&mut model_provider, &auth_registry, &vault, &resolver)
+                .expect("legacy registry provider vault-ref resolution should succeed");
+
+        assert_eq!(audits.len(), 1);
+        assert_eq!(
+            model_provider.registry.providers[0].api_key.as_deref(),
+            Some("anthropic-legacy")
+        );
+        assert_eq!(
+            model_provider.registry.providers[0].credential_source,
+            Some(ModelProviderCredentialSource::VaultRef)
+        );
+        assert!(model_provider.registry.providers[0].api_key_secret_ref.is_some());
+        assert_eq!(
+            audits[0].config_path,
+            "model_provider.registry.providers[anthropic-primary].api_key_vault_ref"
         );
     }
 

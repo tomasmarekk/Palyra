@@ -9,6 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use palyra_common::secret_refs::SecretRef;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -151,6 +152,7 @@ pub struct ProviderRegistryEntryConfig {
     pub auth_profile_id: Option<String>,
     pub auth_profile_provider_kind: Option<ModelProviderAuthProviderKind>,
     pub api_key: Option<String>,
+    pub api_key_secret_ref: Option<SecretRef>,
     pub api_key_vault_ref: Option<String>,
     pub credential_source: Option<ModelProviderCredentialSource>,
     pub request_timeout_ms: u64,
@@ -259,6 +261,7 @@ impl ModelProviderAuthProviderKind {
 #[serde(rename_all = "snake_case")]
 pub enum ModelProviderCredentialSource {
     InlineConfig,
+    SecretRef,
     VaultRef,
     AuthProfileApiKey,
     AuthProfileOauthAccessToken,
@@ -269,6 +272,7 @@ impl ModelProviderCredentialSource {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::InlineConfig => "inline_config",
+            Self::SecretRef => "secret_ref",
             Self::VaultRef => "vault_ref",
             Self::AuthProfileApiKey => "auth_profile_api_key",
             Self::AuthProfileOauthAccessToken => "auth_profile_oauth_access_token",
@@ -287,8 +291,10 @@ pub struct ModelProviderConfig {
     pub openai_embeddings_model: Option<String>,
     pub openai_embeddings_dims: Option<u32>,
     pub openai_api_key: Option<String>,
+    pub openai_api_key_secret_ref: Option<SecretRef>,
     pub openai_api_key_vault_ref: Option<String>,
     pub anthropic_api_key: Option<String>,
+    pub anthropic_api_key_secret_ref: Option<SecretRef>,
     pub anthropic_api_key_vault_ref: Option<String>,
     pub auth_profile_id: Option<String>,
     pub auth_profile_provider_kind: Option<ModelProviderAuthProviderKind>,
@@ -313,8 +319,10 @@ impl Default for ModelProviderConfig {
             openai_embeddings_model: None,
             openai_embeddings_dims: None,
             openai_api_key: None,
+            openai_api_key_secret_ref: None,
             openai_api_key_vault_ref: None,
             anthropic_api_key: None,
+            anthropic_api_key_secret_ref: None,
             anthropic_api_key_vault_ref: None,
             auth_profile_id: None,
             auth_profile_provider_kind: None,
@@ -367,36 +375,47 @@ fn legacy_registry_from_config(config: &ModelProviderConfig) -> ModelProviderReg
         ModelProviderKind::OpenAiCompatible => "openai-primary".to_owned(),
         ModelProviderKind::Anthropic => "anthropic-primary".to_owned(),
     };
-    let (display_name, base_url, api_key, api_key_vault_ref, model_id, auth_kind, capabilities) =
-        match config.kind {
-            ModelProviderKind::Deterministic => (
-                Some("Deterministic".to_owned()),
-                None,
-                None,
-                None,
-                "deterministic".to_owned(),
-                None,
-                capability_defaults_for_kind(config.kind, ProviderModelRole::Chat),
-            ),
-            ModelProviderKind::OpenAiCompatible => (
-                Some("OpenAI-compatible".to_owned()),
-                Some(config.openai_base_url.clone()),
-                config.openai_api_key.clone(),
-                config.openai_api_key_vault_ref.clone(),
-                config.openai_model.clone(),
-                Some(ModelProviderAuthProviderKind::Openai),
-                capability_defaults_for_kind(config.kind, ProviderModelRole::Chat),
-            ),
-            ModelProviderKind::Anthropic => (
-                Some("Anthropic".to_owned()),
-                Some(config.anthropic_base_url.clone()),
-                config.anthropic_api_key.clone(),
-                config.anthropic_api_key_vault_ref.clone(),
-                config.anthropic_model.clone(),
-                Some(ModelProviderAuthProviderKind::Anthropic),
-                capability_defaults_for_kind(config.kind, ProviderModelRole::Chat),
-            ),
-        };
+    let (
+        display_name,
+        base_url,
+        api_key,
+        api_key_secret_ref,
+        api_key_vault_ref,
+        model_id,
+        auth_kind,
+        capabilities,
+    ) = match config.kind {
+        ModelProviderKind::Deterministic => (
+            Some("Deterministic".to_owned()),
+            None,
+            None,
+            None,
+            None,
+            "deterministic".to_owned(),
+            None,
+            capability_defaults_for_kind(config.kind, ProviderModelRole::Chat),
+        ),
+        ModelProviderKind::OpenAiCompatible => (
+            Some("OpenAI-compatible".to_owned()),
+            Some(config.openai_base_url.clone()),
+            config.openai_api_key.clone(),
+            config.openai_api_key_secret_ref.clone(),
+            config.openai_api_key_vault_ref.clone(),
+            config.openai_model.clone(),
+            Some(ModelProviderAuthProviderKind::Openai),
+            capability_defaults_for_kind(config.kind, ProviderModelRole::Chat),
+        ),
+        ModelProviderKind::Anthropic => (
+            Some("Anthropic".to_owned()),
+            Some(config.anthropic_base_url.clone()),
+            config.anthropic_api_key.clone(),
+            config.anthropic_api_key_secret_ref.clone(),
+            config.anthropic_api_key_vault_ref.clone(),
+            config.anthropic_model.clone(),
+            Some(ModelProviderAuthProviderKind::Anthropic),
+            capability_defaults_for_kind(config.kind, ProviderModelRole::Chat),
+        ),
+    };
     let mut registry = ModelProviderRegistryConfig {
         providers: vec![ProviderRegistryEntryConfig {
             provider_id: provider_id.clone(),
@@ -408,6 +427,7 @@ fn legacy_registry_from_config(config: &ModelProviderConfig) -> ModelProviderReg
             auth_profile_id: config.auth_profile_id.clone(),
             auth_profile_provider_kind: config.auth_profile_provider_kind.or(auth_kind),
             api_key,
+            api_key_secret_ref,
             api_key_vault_ref,
             credential_source: config.credential_source,
             request_timeout_ms: config.request_timeout_ms,
@@ -911,11 +931,11 @@ pub enum ProviderError {
     #[error("model provider circuit breaker is open; retry after {retry_after_ms}ms")]
     CircuitOpen { retry_after_ms: u64 },
     #[error(
-        "openai-compatible provider requires PALYRA_MODEL_PROVIDER_OPENAI_API_KEY, PALYRA_MODEL_PROVIDER_AUTH_PROFILE_ID, or model_provider.openai_api_key_vault_ref"
+        "openai-compatible provider requires PALYRA_MODEL_PROVIDER_OPENAI_API_KEY, PALYRA_MODEL_PROVIDER_AUTH_PROFILE_ID, model_provider.openai_api_key_secret_ref, or model_provider.openai_api_key_vault_ref"
     )]
     MissingApiKey,
     #[error(
-        "anthropic provider requires PALYRA_MODEL_PROVIDER_ANTHROPIC_API_KEY, PALYRA_MODEL_PROVIDER_AUTH_PROFILE_ID, or model_provider.anthropic_api_key_vault_ref"
+        "anthropic provider requires PALYRA_MODEL_PROVIDER_ANTHROPIC_API_KEY, PALYRA_MODEL_PROVIDER_AUTH_PROFILE_ID, model_provider.anthropic_api_key_secret_ref, or model_provider.anthropic_api_key_vault_ref"
     )]
     MissingAnthropicApiKey,
     #[error(
@@ -1745,6 +1765,7 @@ impl ModelProvider for RegistryBackedModelProvider {
                     .credential_source
                     .map(|source| source.as_str().to_owned()),
                 api_key_configured: provider.api_key.is_some()
+                    || provider.api_key_secret_ref.is_some()
                     || provider.api_key_vault_ref.is_some()
                     || provider.auth_profile_id.is_some(),
                 retry_policy: ProviderRetryPolicySnapshot {
@@ -1822,6 +1843,7 @@ impl ModelProvider for RegistryBackedModelProvider {
             }),
             api_key_configured: default_provider_entry.is_some_and(|provider| {
                 provider.api_key.is_some()
+                    || provider.api_key_secret_ref.is_some()
                     || provider.api_key_vault_ref.is_some()
                     || provider.auth_profile_id.is_some()
             }),
@@ -1938,8 +1960,10 @@ fn build_registry_provider_runtime(
             .map(|model| model.model_id.clone()),
         openai_embeddings_dims: None,
         openai_api_key: None,
+        openai_api_key_secret_ref: None,
         openai_api_key_vault_ref: None,
         anthropic_api_key: None,
+        anthropic_api_key_secret_ref: None,
         anthropic_api_key_vault_ref: None,
         auth_profile_id: entry
             .auth_profile_id
@@ -1968,6 +1992,13 @@ fn build_registry_provider_runtime(
                     None
                 }
             });
+            config.openai_api_key_secret_ref = entry.api_key_secret_ref.clone().or_else(|| {
+                if base_config.kind == ModelProviderKind::OpenAiCompatible {
+                    base_config.openai_api_key_secret_ref.clone()
+                } else {
+                    None
+                }
+            });
             config.openai_api_key_vault_ref = entry.api_key_vault_ref.clone().or_else(|| {
                 if base_config.kind == ModelProviderKind::OpenAiCompatible {
                     base_config.openai_api_key_vault_ref.clone()
@@ -1981,6 +2012,13 @@ fn build_registry_provider_runtime(
             config.anthropic_api_key = entry.api_key.clone().or_else(|| {
                 if base_config.kind == ModelProviderKind::Anthropic {
                     base_config.anthropic_api_key.clone()
+                } else {
+                    None
+                }
+            });
+            config.anthropic_api_key_secret_ref = entry.api_key_secret_ref.clone().or_else(|| {
+                if base_config.kind == ModelProviderKind::Anthropic {
+                    base_config.anthropic_api_key_secret_ref.clone()
                 } else {
                     None
                 }
@@ -3822,6 +3860,7 @@ mod tests {
                         auth_profile_id: None,
                         auth_profile_provider_kind: Some(ModelProviderAuthProviderKind::Openai),
                         api_key: Some("sk-openai-test".to_owned()),
+                        api_key_secret_ref: None,
                         api_key_vault_ref: None,
                         credential_source: None,
                         request_timeout_ms: 5_000,
@@ -3840,6 +3879,7 @@ mod tests {
                         auth_profile_id: None,
                         auth_profile_provider_kind: Some(ModelProviderAuthProviderKind::Anthropic),
                         api_key: Some("sk-anthropic-test".to_owned()),
+                        api_key_secret_ref: None,
                         api_key_vault_ref: None,
                         credential_source: None,
                         request_timeout_ms: 5_000,

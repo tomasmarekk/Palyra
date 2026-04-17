@@ -2576,6 +2576,135 @@ pub struct SecretDeleteRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfiguredSecretSourceView {
+    pub kind: String,
+    pub fingerprint: String,
+    pub required: bool,
+    pub refresh_policy: String,
+    pub snapshot_policy: String,
+    pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redaction_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exec_timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trusted_dir_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inherited_env_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_symlinks: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfiguredSecretRecord {
+    pub secret_id: String,
+    pub component: String,
+    pub config_path: String,
+    pub status: String,
+    pub resolution_scope: String,
+    pub reload_action: String,
+    pub snapshot_generation: u64,
+    pub source: ConfiguredSecretSourceView,
+    #[serde(default)]
+    pub affected_components: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_resolved_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_bytes: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfiguredSecretListEnvelope {
+    pub contract: ContractDescriptor,
+    pub generated_at_unix_ms: i64,
+    pub snapshot_generation: u64,
+    #[serde(default)]
+    pub secrets: Vec<ConfiguredSecretRecord>,
+    pub page: PageInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfiguredSecretEnvelope {
+    pub contract: ContractDescriptor,
+    pub generated_at_unix_ms: i64,
+    pub snapshot_generation: u64,
+    pub secret: ConfiguredSecretRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfiguredSecretQuery {
+    pub secret_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigReloadPlanRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigReloadPlanSummary {
+    pub hot_safe: u32,
+    pub restart_required: u32,
+    pub blocked_while_runs_active: u32,
+    pub manual_review: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigReloadPlanStep {
+    pub component: String,
+    pub config_path: String,
+    pub category: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigReloadPlanEnvelope {
+    pub contract: ContractDescriptor,
+    pub plan_id: String,
+    pub source_path: String,
+    pub generated_at_unix_ms: i64,
+    pub active_runs: u64,
+    pub requires_restart: bool,
+    pub hot_safe_applicable: bool,
+    pub summary: ConfigReloadPlanSummary,
+    #[serde(default)]
+    pub steps: Vec<ConfigReloadPlanStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigReloadApplyRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigReloadApplyEnvelope {
+    pub contract: ContractDescriptor,
+    pub outcome: String,
+    pub message: String,
+    pub plan: ConfigReloadPlanEnvelope,
+    #[serde(default)]
+    pub applied_steps: Vec<ConfigReloadPlanStep>,
+    #[serde(default)]
+    pub skipped_steps: Vec<ConfigReloadPlanStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebhookIntegrationView {
     pub integration_id: String,
     pub provider: String,

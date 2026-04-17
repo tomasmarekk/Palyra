@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use palyra_common::{default_identity_store_root, feature_rollouts::FeatureRolloutSetting};
+use palyra_common::{
+    default_identity_store_root, feature_rollouts::FeatureRolloutSetting, secret_refs::SecretRef,
+};
 
 use crate::channel_router::ChannelRouterConfig;
 use crate::cron::CronTimezoneMode;
@@ -292,7 +294,9 @@ pub struct BrowserServiceConfig {
     pub enabled: bool,
     pub endpoint: String,
     pub auth_token: Option<String>,
+    pub auth_token_secret_ref: Option<SecretRef>,
     pub state_dir: Option<PathBuf>,
+    pub state_key_secret_ref: Option<SecretRef>,
     pub state_key_vault_ref: Option<String>,
     pub connect_timeout_ms: u64,
     pub request_timeout_ms: u64,
@@ -315,7 +319,9 @@ pub struct CanvasHostConfig {
 pub struct AdminConfig {
     pub require_auth: bool,
     pub auth_token: Option<String>,
+    pub auth_token_secret_ref: Option<SecretRef>,
     pub connector_token: Option<String>,
+    pub connector_token_secret_ref: Option<SecretRef>,
     pub bound_principal: Option<String>,
 }
 
@@ -533,7 +539,9 @@ impl Default for BrowserServiceConfig {
             enabled: DEFAULT_BROWSER_SERVICE_ENABLED,
             endpoint: DEFAULT_BROWSER_SERVICE_ENDPOINT.to_owned(),
             auth_token: None,
+            auth_token_secret_ref: None,
             state_dir: None,
+            state_key_secret_ref: None,
             state_key_vault_ref: None,
             connect_timeout_ms: DEFAULT_BROWSER_SERVICE_CONNECT_TIMEOUT_MS,
             request_timeout_ms: DEFAULT_BROWSER_SERVICE_REQUEST_TIMEOUT_MS,
@@ -562,7 +570,9 @@ impl Default for AdminConfig {
         Self {
             require_auth: DEFAULT_ADMIN_REQUIRE_AUTH,
             auth_token: None,
+            auth_token_secret_ref: None,
             connector_token: None,
+            connector_token_secret_ref: None,
             bound_principal: None,
         }
     }

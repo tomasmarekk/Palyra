@@ -4995,6 +4995,8 @@ fn parse_secrets_apply_offline_strict_json() {
                 path: Some("config/palyra.toml".to_owned()),
                 offline: true,
                 strict: true,
+                runtime: false,
+                dry_run: false,
                 json: true,
             }
         }

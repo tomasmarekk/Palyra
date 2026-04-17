@@ -778,6 +778,20 @@ impl ControlPlaneClient {
         self.request_json(Method::POST, "console/v1/config/recover", Some(request), true).await
     }
 
+    pub async fn plan_config_reload(
+        &self,
+        request: &ConfigReloadPlanRequest,
+    ) -> Result<ConfigReloadPlanEnvelope, ControlPlaneClientError> {
+        self.request_json(Method::POST, "console/v1/config/reload/plan", Some(request), false).await
+    }
+
+    pub async fn apply_config_reload(
+        &self,
+        request: &ConfigReloadApplyRequest,
+    ) -> Result<ConfigReloadApplyEnvelope, ControlPlaneClientError> {
+        self.request_json(Method::POST, "console/v1/config/reload/apply", Some(request), true).await
+    }
+
     pub async fn list_secrets(
         &self,
         scope: &str,
@@ -828,6 +842,25 @@ impl ControlPlaneClient {
         request: &SecretDeleteRequest,
     ) -> Result<SecretMetadataEnvelope, ControlPlaneClientError> {
         self.request_json(Method::POST, "console/v1/secrets/delete", Some(request), true).await
+    }
+
+    pub async fn list_configured_secrets(
+        &self,
+    ) -> Result<ConfiguredSecretListEnvelope, ControlPlaneClientError> {
+        self.request_json(Method::GET, "console/v1/secrets/configured", None::<&Value>, false).await
+    }
+
+    pub async fn get_configured_secret(
+        &self,
+        secret_id: &str,
+    ) -> Result<ConfiguredSecretEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::GET,
+            format!("console/v1/secrets/configured/detail?secret_id={}", urlencoding(secret_id)),
+            None::<&Value>,
+            false,
+        )
+        .await
     }
 
     pub async fn list_webhooks(

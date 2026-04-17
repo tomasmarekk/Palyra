@@ -2472,6 +2472,16 @@ fn build_default_next_steps(report: &DoctorReport) -> Vec<String> {
     {
         next_steps.push("palyra browser status".to_owned());
     }
+    if report
+        .config_ref_health
+        .as_ref()
+        .and_then(|payload| payload.get("severity"))
+        .and_then(JsonValue::as_str)
+        .is_some_and(|value| value == "blocking" || value == "warning")
+    {
+        next_steps.push("palyra secrets inventory --json".to_owned());
+        next_steps.push("palyra secrets plan --json".to_owned());
+    }
     next_steps.push("palyra doctor --repair --dry-run --json".to_owned());
     dedupe_strings(next_steps)
 }
@@ -2506,6 +2516,35 @@ fn render_doctor_text(execution: &DoctorExecutionReport) {
         info_checks.len(),
         execution.diagnostics.summary.required_checks_failed
     );
+    if let Some(config_ref_health) = execution.diagnostics.config_ref_health.as_ref() {
+        let state = config_ref_health.get("state").and_then(JsonValue::as_str).unwrap_or("unknown");
+        let severity =
+            config_ref_health.get("severity").and_then(JsonValue::as_str).unwrap_or("info");
+        let summary = config_ref_health.get("summary").and_then(JsonValue::as_object);
+        let blocking_refs = summary
+            .and_then(|summary| summary.get("blocking_refs"))
+            .and_then(JsonValue::as_u64)
+            .unwrap_or(0);
+        let warning_refs = summary
+            .and_then(|summary| summary.get("warning_refs"))
+            .and_then(JsonValue::as_u64)
+            .unwrap_or(0);
+        let stale_refs = summary
+            .and_then(|summary| summary.get("stale"))
+            .and_then(JsonValue::as_u64)
+            .unwrap_or(0);
+        println!(
+            "doctor.config_ref_health state={} severity={} blocking_refs={} warning_refs={} stale_refs={}",
+            state, severity, blocking_refs, warning_refs, stale_refs
+        );
+        if let Some(recommendations) =
+            config_ref_health.get("recommendations").and_then(JsonValue::as_array)
+        {
+            for recommendation in recommendations.iter().filter_map(JsonValue::as_str).take(4) {
+                println!("doctor.config_ref_advice={recommendation}");
+            }
+        }
+    }
     if execution.recovery.requested {
         println!(
             "doctor.recovery requested=true mode={:?} dry_run={} force={}",

@@ -161,7 +161,10 @@ pub(crate) fn run_secrets(command: SecretsCommand) -> Result<()> {
             }
             Ok(())
         }
-        SecretsCommand::Apply { path, offline, strict, json } => {
+        SecretsCommand::Apply { path, offline, strict, runtime, dry_run, json } => {
+            if runtime {
+                return run_runtime_secret_apply(path, dry_run, json);
+            }
             let audit = build_secrets_audit_payload(path, offline)?;
             if output::preferred_json(json) {
                 let action_modes = build_secrets_apply_modes(&audit);
@@ -186,6 +189,11 @@ pub(crate) fn run_secrets(command: SecretsCommand) -> Result<()> {
             }
             Ok(())
         }
+        SecretsCommand::Inventory { json } => run_configured_secret_inventory(json),
+        SecretsCommand::Explain { secret_id, json } => {
+            run_configured_secret_explain(secret_id.as_str(), json)
+        }
+        SecretsCommand::Plan { path, json } => run_runtime_secret_plan(path, json),
         SecretsCommand::Configure { command } => run_secrets_configure(command),
     }
 }
@@ -776,6 +784,140 @@ fn load_runtime_webhooks(offline: bool) -> Result<RuntimeWebhookIntegrations> {
         }
     });
     Ok(result)
+}
+
+fn run_configured_secret_inventory(json: bool) -> Result<()> {
+    let runtime = build_runtime()?;
+    let envelope = runtime.block_on(async {
+        let context =
+            client::control_plane::connect_admin_console(app::ConnectionOverrides::default())
+                .await?;
+        context.client.list_configured_secrets().await.map_err(anyhow::Error::from)
+    })?;
+    if output::preferred_json(json) {
+        output::print_json_pretty(&envelope, "failed to encode configured secret inventory")?;
+        return Ok(());
+    }
+    let summary_line = format!(
+        "configured_secrets snapshot_generation={} count={}",
+        envelope.snapshot_generation,
+        envelope.secrets.len()
+    );
+    output::print_text_line(summary_line.as_str())?;
+    for secret in envelope.secrets {
+        let secret_line = format!(
+            "secret component={} path={} status={} reload_action={} source={} id={}",
+            secret.component,
+            secret.config_path,
+            secret.status,
+            secret.reload_action,
+            secret.source.kind,
+            secret.secret_id
+        );
+        output::print_text_line(secret_line.as_str())?;
+    }
+    Ok(())
+}
+
+fn run_configured_secret_explain(secret_id: &str, json: bool) -> Result<()> {
+    let runtime = build_runtime()?;
+    let envelope = runtime.block_on(async {
+        let context =
+            client::control_plane::connect_admin_console(app::ConnectionOverrides::default())
+                .await?;
+        context.client.get_configured_secret(secret_id).await.map_err(anyhow::Error::from)
+    })?;
+    if output::preferred_json(json) {
+        output::print_json_pretty(&envelope, "failed to encode configured secret detail")?;
+        return Ok(());
+    }
+    let secret = envelope.secret;
+    let headline = format!(
+        "secret.explain id={} component={} path={} status={} reload_action={}",
+        secret.secret_id, secret.component, secret.config_path, secret.status, secret.reload_action
+    );
+    output::print_text_line(headline.as_str())?;
+    let source_line = format!(
+        "source kind={} fingerprint={} refresh_policy={} snapshot_policy={}",
+        secret.source.kind,
+        secret.source.fingerprint,
+        secret.source.refresh_policy,
+        secret.source.snapshot_policy
+    );
+    output::print_text_line(source_line.as_str())?;
+    if let Some(error) = secret.last_error {
+        let error_line = format!("last_error={error}");
+        output::print_text_line(error_line.as_str())?;
+    }
+    Ok(())
+}
+
+fn run_runtime_secret_plan(path: Option<String>, json: bool) -> Result<()> {
+    let runtime = build_runtime()?;
+    let envelope = runtime.block_on(async {
+        let context =
+            client::control_plane::connect_admin_console(app::ConnectionOverrides::default())
+                .await?;
+        context
+            .client
+            .plan_config_reload(&control_plane::ConfigReloadPlanRequest { path })
+            .await
+            .map_err(anyhow::Error::from)
+    })?;
+    if output::preferred_json(json) {
+        output::print_json_pretty(&envelope, "failed to encode reload plan")?;
+        return Ok(());
+    }
+    emit_reload_plan_summary(&envelope)
+}
+
+fn run_runtime_secret_apply(path: Option<String>, dry_run: bool, json: bool) -> Result<()> {
+    let runtime = build_runtime()?;
+    let envelope = runtime.block_on(async {
+        let context =
+            client::control_plane::connect_admin_console(app::ConnectionOverrides::default())
+                .await?;
+        context
+            .client
+            .apply_config_reload(&control_plane::ConfigReloadApplyRequest {
+                path,
+                plan_id: None,
+                dry_run,
+                force: false,
+            })
+            .await
+            .map_err(anyhow::Error::from)
+    })?;
+    if output::preferred_json(json) {
+        output::print_json_pretty(&envelope, "failed to encode reload apply result")?;
+        return Ok(());
+    }
+    let result_line =
+        format!("secrets.reload outcome={} message={}", envelope.outcome, envelope.message);
+    output::print_text_line(result_line.as_str())?;
+    emit_reload_plan_summary(&envelope.plan)?;
+    Ok(())
+}
+
+fn emit_reload_plan_summary(plan: &control_plane::ConfigReloadPlanEnvelope) -> Result<()> {
+    let plan_line = format!(
+        "reload.plan id={} active_runs={} hot_safe={} restart_required={} blocked={} manual_review={}",
+        plan.plan_id,
+        plan.active_runs,
+        plan.summary.hot_safe,
+        plan.summary.restart_required,
+        plan.summary.blocked_while_runs_active,
+        plan.summary.manual_review
+    );
+    output::print_text_line(plan_line.as_str())?;
+    for step in &plan.steps {
+        let step_line = format!(
+            "reload.step component={} path={} category={} reason={}",
+            step.component, step.config_path, step.category, step.reason
+        );
+        output::print_text_line(step_line.as_str())?;
+    }
+    Ok(())
 }
 
 fn sanitize_secret_error(raw: &str) -> String {

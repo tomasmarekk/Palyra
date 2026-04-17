@@ -519,6 +519,7 @@ pub(crate) async fn build_observability_payload(
     Ok(json!({
         "failure_classes": failure_classes,
         "provider_auth": provider_auth,
+        "config_ref_health": build_config_ref_health_observability(state),
         "dashboard": serde_json::to_value(state.observability.dashboard_mutation_snapshot())
             .unwrap_or_else(|_| json!({})),
         "support_bundle": support_bundle,
@@ -548,6 +549,347 @@ pub(crate) async fn build_observability_payload(
             ]
         }
     }))
+}
+
+pub(crate) fn build_config_ref_health_observability(state: &AppState) -> Value {
+    let snapshot = super::secrets::configured_secrets_snapshot(state);
+    let reload_state = state.reload_state.lock().unwrap_or_else(|error| error.into_inner());
+    let latest_plan = reload_state.latest_plan.clone();
+    let recent_events = reload_state.recent_events.iter().take(5).cloned().collect::<Vec<_>>();
+    drop(reload_state);
+
+    let config_migration = current_config_migration_observability(state);
+    let latest_active_runs = latest_plan.as_ref().map(|plan| plan.active_runs).unwrap_or(0);
+    let mut healthy = 0_u64;
+    let mut missing = 0_u64;
+    let mut blocked = 0_u64;
+    let mut failed = 0_u64;
+    let mut stale = 0_u64;
+    let mut hot_safe_refs = 0_u64;
+    let mut restart_required_refs = 0_u64;
+    let mut blocked_refs = 0_u64;
+    let mut manual_review_refs = 0_u64;
+    let mut blocking_refs = 0_u64;
+    let mut warning_refs = 0_u64;
+    let mut recommendations = std::collections::BTreeSet::<String>::new();
+
+    let items = snapshot
+        .secrets
+        .iter()
+        .map(|entry| {
+            match entry.status.as_str() {
+                "healthy" => healthy = healthy.saturating_add(1),
+                "missing" => missing = missing.saturating_add(1),
+                "blocked" => blocked = blocked.saturating_add(1),
+                "failed" => failed = failed.saturating_add(1),
+                "stale" => stale = stale.saturating_add(1),
+                _ => {}
+            }
+            match entry.reload_action.as_str() {
+                "hot_safe" => hot_safe_refs = hot_safe_refs.saturating_add(1),
+                "restart_required" => {
+                    restart_required_refs = restart_required_refs.saturating_add(1);
+                }
+                "blocked_while_runs_active" => {
+                    blocked_refs = blocked_refs.saturating_add(1);
+                }
+                "manual_review" => {
+                    manual_review_refs = manual_review_refs.saturating_add(1);
+                }
+                _ => {}
+            }
+
+            let (severity, advice) =
+                config_ref_item_guidance(entry, latest_active_runs, latest_plan.as_ref());
+            match severity {
+                "blocking" => blocking_refs = blocking_refs.saturating_add(1),
+                "warning" => warning_refs = warning_refs.saturating_add(1),
+                _ => {}
+            }
+            if let Some(advice) = advice.as_ref() {
+                recommendations.insert(advice.clone());
+            }
+
+            json!({
+                "ref_id": entry.secret_id,
+                "component": entry.component,
+                "config_path": entry.config_path,
+                "state": entry.status,
+                "severity": severity,
+                "reload_mode": entry.reload_action,
+                "scope": entry.resolution_scope,
+                "source_kind": entry.source.kind,
+                "fingerprint": entry.source.fingerprint,
+                "required": entry.source.required,
+                "refresh_policy": entry.source.refresh_policy,
+                "snapshot_policy": entry.source.snapshot_policy,
+                "display_name": entry.source.display_name,
+                "description": entry.source.description,
+                "redaction_label": entry.source.redaction_label,
+                "trusted_dir_count": entry.source.trusted_dir_count,
+                "inherited_env_count": entry.source.inherited_env_count,
+                "allow_symlinks": entry.source.allow_symlinks,
+                "exec_timeout_ms": entry.source.exec_timeout_ms,
+                "last_checked_at_unix_ms": entry.last_resolved_at_unix_ms,
+                "last_error_kind": entry.last_error_kind,
+                "last_error": entry.last_error,
+                "value_bytes": entry.value_bytes,
+                "advice": advice,
+                "affected_components": entry.affected_components,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if let Some(plan) = latest_plan.as_ref() {
+        if plan.summary.blocked_while_runs_active > 0 {
+            recommendations.insert(
+                "Wait for active runs to finish, then rerun the reload plan or apply step."
+                    .to_owned(),
+            );
+        }
+        if plan.summary.restart_required > 0 {
+            recommendations.insert(
+                "Schedule a daemon restart after applying the pending config changes.".to_owned(),
+            );
+        }
+        if plan.summary.manual_review > 0 {
+            recommendations.insert(
+                "Review safety and routing changes manually before attempting a hot reload."
+                    .to_owned(),
+            );
+        }
+    }
+    if let Some(advice) = config_migration
+        .get("advice")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        recommendations.insert(advice.to_owned());
+    }
+
+    let migration_severity =
+        config_migration.get("severity").and_then(Value::as_str).unwrap_or("info");
+    let overall = if blocking_refs > 0 || migration_severity == "blocking" {
+        ("blocking", "blocking")
+    } else if warning_refs > 0
+        || migration_severity == "warning"
+        || latest_plan.as_ref().is_some_and(|plan| {
+            plan.summary.restart_required > 0
+                || plan.summary.blocked_while_runs_active > 0
+                || plan.summary.manual_review > 0
+        })
+    {
+        ("degraded", "warning")
+    } else {
+        ("ok", "info")
+    };
+
+    json!({
+        "state": overall.0,
+        "severity": overall.1,
+        "summary": {
+            "total_refs": snapshot.secrets.len(),
+            "healthy": healthy,
+            "missing": missing,
+            "blocked": blocked,
+            "failed": failed,
+            "stale": stale,
+            "hot_safe_refs": hot_safe_refs,
+            "restart_required_refs": restart_required_refs,
+            "blocked_while_runs_active_refs": blocked_refs,
+            "manual_review_refs": manual_review_refs,
+            "blocking_refs": blocking_refs,
+            "warning_refs": warning_refs,
+            "latest_snapshot_generation": snapshot.snapshot_generation,
+            "latest_snapshot_at_unix_ms": snapshot.generated_at_unix_ms,
+            "active_runs": latest_active_runs,
+        },
+        "recommendations": recommendations.into_iter().collect::<Vec<_>>(),
+        "config_migration": config_migration,
+        "latest_plan": latest_plan.as_ref().map(config_ref_reload_plan_observability),
+        "recent_events": recent_events
+            .iter()
+            .map(config_ref_reload_event_observability)
+            .collect::<Vec<_>>(),
+        "items": items,
+    })
+}
+
+fn current_config_migration_observability(state: &AppState) -> Value {
+    let loaded = state.loaded_config.lock().unwrap_or_else(|error| error.into_inner()).clone();
+    let source_path = loaded
+        .source
+        .split(" +env(")
+        .next()
+        .map(str::trim)
+        .unwrap_or(loaded.source.as_str())
+        .to_owned();
+    if source_path.eq_ignore_ascii_case("defaults") {
+        return json!({
+            "state": "defaults_only",
+            "severity": "info",
+            "source_path": source_path,
+            "advice": "Persist a config file before relying on reload planning or migration workflows.",
+        });
+    }
+
+    let path = PathBuf::from(source_path.as_str());
+    let content = match std::fs::read_to_string(path.as_path()) {
+        Ok(content) => content,
+        Err(error) => {
+            return json!({
+                "state": "unavailable",
+                "severity": "warning",
+                "source_path": source_path,
+                "error": sanitize_http_error_message(error.to_string().as_str()),
+                "advice": "Restore or recreate the active config file before attempting reload planning.",
+            });
+        }
+    };
+
+    match palyra_common::config_system::parse_document_with_migration(content.as_str()) {
+        Ok((_document, migration)) => json!({
+            "state": if migration.migrated {
+                "migration_available"
+            } else {
+                "current"
+            },
+            "severity": if migration.migrated { "warning" } else { "info" },
+            "source_path": source_path,
+            "source_version": migration.source_version,
+            "target_version": migration.target_version,
+            "requires_writeback": migration.migrated,
+            "advice": if migration.migrated {
+                "Run `palyra config migrate --path <active-config>` before relying on repeated reload plans."
+            } else {
+                "The active config document already matches the current schema version."
+            },
+        }),
+        Err(error) => json!({
+            "state": "unavailable",
+            "severity": "warning",
+            "source_path": source_path,
+            "error": sanitize_http_error_message(error.to_string().as_str()),
+            "advice": "Validate or recover the config document before planning reloads.",
+        }),
+    }
+}
+
+fn config_ref_item_guidance(
+    entry: &control_plane::ConfiguredSecretRecord,
+    active_runs: u64,
+    latest_plan: Option<&control_plane::ConfigReloadPlanEnvelope>,
+) -> (&'static str, Option<String>) {
+    let required = entry.source.required;
+    let source_kind = entry.source.kind.as_str();
+    let error_kind = entry.last_error_kind.as_deref().unwrap_or_default();
+    match entry.status.as_str() {
+        "healthy" => ("info", None),
+        "stale" => {
+            let advice = match entry.reload_action.as_str() {
+                "blocked_while_runs_active" if active_runs > 0 => {
+                    "Wait for active runs to finish, then rerun the reload apply step for this config ref."
+                }
+                "restart_required" => {
+                    "Restart the daemon to refresh this config ref in the running runtime."
+                }
+                "manual_review" => {
+                    "Review the latest reload plan before revalidating this config ref."
+                }
+                _ if latest_plan.is_some() => {
+                    "Reapply the latest hot-safe reload plan to refresh this config ref snapshot."
+                }
+                _ => "Rebuild the runtime snapshot before relying on this config ref.",
+            };
+            ("warning", Some(advice.to_owned()))
+        }
+        "missing" => {
+            let advice = match source_kind {
+                "env" => "Set the missing environment variable or migrate this ref to vault.",
+                "file" => {
+                    "Create the referenced file inside a trusted directory or update the file ref path."
+                }
+                "exec" => {
+                    "Fix the command so it returns a value within the configured timeout, or move this ref to vault."
+                }
+                _ => "Write the missing value into the referenced vault scope/key or update the ref.",
+            };
+            (if required { "blocking" } else { "warning" }, Some(advice.to_owned()))
+        }
+        "blocked" => {
+            let advice = match (source_kind, error_kind) {
+                ("file", "policy_blocked") => {
+                    "Move the file under a trusted directory or expand trusted_dirs explicitly."
+                }
+                ("exec", "policy_blocked") => {
+                    "Adjust inherited env/cwd policy or move this ref to vault."
+                }
+                (_, "timeout") => {
+                    "Lower command latency or raise exec_timeout_ms only after reviewing the command."
+                }
+                (_, "invalid_reference") => {
+                    "Fix the ref shape and rerun config validation before retrying."
+                }
+                _ => "Adjust the source policy or move this ref to vault.",
+            };
+            ("blocking", Some(advice.to_owned()))
+        }
+        "failed" => {
+            let advice = match error_kind {
+                "too_large" => "Reduce the returned bytes or tighten max_bytes for this ref.",
+                "exec_failed" => {
+                    "Inspect the command exit status and stderr, then rerun validation."
+                }
+                "io" => "Fix filesystem access and confirm the referenced path is readable.",
+                "decode_failed" => {
+                    "Ensure the source returns valid UTF-8 text for this runtime field."
+                }
+                "invalid_reference" => {
+                    "Fix the ref shape and rerun config validation before retrying."
+                }
+                "timeout" => {
+                    "Lower command latency or raise exec_timeout_ms only after reviewing the command."
+                }
+                _ => "Repair the source and rerun validation before retrying.",
+            };
+            ("blocking", Some(advice.to_owned()))
+        }
+        _ => (
+            "warning",
+            Some("Inspect and revalidate this config ref before relying on it.".to_owned()),
+        ),
+    }
+}
+
+fn config_ref_reload_plan_observability(plan: &control_plane::ConfigReloadPlanEnvelope) -> Value {
+    json!({
+        "plan_id": plan.plan_id,
+        "generated_at_unix_ms": plan.generated_at_unix_ms,
+        "active_runs": plan.active_runs,
+        "requires_restart": plan.requires_restart,
+        "hot_safe_applicable": plan.hot_safe_applicable,
+        "summary": plan.summary,
+        "steps": plan.steps,
+    })
+}
+
+fn config_ref_reload_event_observability(
+    event: &control_plane::ConfigReloadApplyEnvelope,
+) -> Value {
+    let severity = match event.outcome.as_str() {
+        "rejected" => "warning",
+        "applied_partial" => "warning",
+        _ => "info",
+    };
+    json!({
+        "outcome": event.outcome,
+        "severity": severity,
+        "message": event.message,
+        "plan_id": event.plan.plan_id,
+        "generated_at_unix_ms": event.plan.generated_at_unix_ms,
+        "applied_step_count": event.applied_steps.len(),
+        "skipped_step_count": event.skipped_steps.len(),
+    })
 }
 
 pub(crate) fn build_provider_auth_observability(
@@ -3230,6 +3572,88 @@ pub(crate) fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod config_ref_health_tests {
+    use super::config_ref_item_guidance;
+    use palyra_control_plane as control_plane;
+
+    fn sample_record(
+        state: &str,
+        source_kind: &str,
+        reload_action: &str,
+    ) -> control_plane::ConfiguredSecretRecord {
+        control_plane::ConfiguredSecretRecord {
+            secret_id: "model_provider.openai_api_key_secret_ref:fp-1".to_owned(),
+            component: "model_provider".to_owned(),
+            config_path: "model_provider.openai_api_key_secret_ref".to_owned(),
+            status: state.to_owned(),
+            resolution_scope: "startup".to_owned(),
+            reload_action: reload_action.to_owned(),
+            snapshot_generation: 1,
+            source: control_plane::ConfiguredSecretSourceView {
+                kind: source_kind.to_owned(),
+                fingerprint: "fp-1".to_owned(),
+                required: true,
+                refresh_policy: "startup_only".to_owned(),
+                snapshot_policy: "runtime_snapshot".to_owned(),
+                description: "test".to_owned(),
+                display_name: None,
+                redaction_label: None,
+                max_bytes: None,
+                exec_timeout_ms: Some(500),
+                trusted_dir_count: Some(1),
+                inherited_env_count: Some(0),
+                allow_symlinks: Some(false),
+            },
+            affected_components: vec!["model_provider".to_owned()],
+            last_resolved_at_unix_ms: Some(1_700_000_000_000),
+            last_error_kind: None,
+            last_error: None,
+            value_bytes: None,
+        }
+    }
+
+    #[test]
+    fn config_ref_item_guidance_recommends_missing_env_sources() {
+        let record = sample_record("missing", "env", "blocked_while_runs_active");
+        let (severity, advice) = config_ref_item_guidance(&record, 0, None);
+        assert_eq!(severity, "blocking");
+        assert_eq!(
+            advice.as_deref(),
+            Some("Set the missing environment variable or migrate this ref to vault.")
+        );
+    }
+
+    #[test]
+    fn config_ref_item_guidance_recommends_waiting_for_active_runs_on_stale_entries() {
+        let record = sample_record("stale", "env", "blocked_while_runs_active");
+        let plan = control_plane::ConfigReloadPlanEnvelope {
+            contract: super::contract_descriptor(),
+            plan_id: "plan-1".to_owned(),
+            source_path: "./palyra.toml".to_owned(),
+            generated_at_unix_ms: 1_700_000_000_000,
+            active_runs: 3,
+            requires_restart: false,
+            hot_safe_applicable: false,
+            summary: control_plane::ConfigReloadPlanSummary {
+                hot_safe: 0,
+                restart_required: 0,
+                blocked_while_runs_active: 1,
+                manual_review: 0,
+            },
+            steps: Vec::new(),
+        };
+        let (severity, advice) = config_ref_item_guidance(&record, plan.active_runs, Some(&plan));
+        assert_eq!(severity, "warning");
+        assert_eq!(
+            advice.as_deref(),
+            Some(
+                "Wait for active runs to finish, then rerun the reload apply step for this config ref."
+            )
+        );
+    }
 }
 
 #[cfg(test)]

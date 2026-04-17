@@ -16,6 +16,7 @@ use palyra_common::{
         EXECUTION_BACKEND_REMOTE_NODE_ROLLOUT_ENV, EXECUTION_BACKEND_SSH_TUNNEL_ROLLOUT_ENV,
     },
     parse_config_path,
+    secret_refs::{SecretRef, SecretSource},
 };
 use palyra_vault::VaultRef;
 
@@ -336,13 +337,21 @@ pub fn load_config() -> Result<LoadedConfig> {
                 model_provider.openai_api_key =
                     if openai_api_key.trim().is_empty() { None } else { Some(openai_api_key) };
             }
+            if let Some(openai_api_key_secret_ref) = file_model_provider.openai_api_key_secret_ref {
+                model_provider.openai_api_key_secret_ref = Some(parse_structured_secret_ref_field(
+                    openai_api_key_secret_ref,
+                    "model_provider.openai_api_key_secret_ref",
+                )?);
+            }
             if let Some(openai_api_key_vault_ref) = file_model_provider.openai_api_key_vault_ref {
-                model_provider.openai_api_key_vault_ref =
-                    if openai_api_key_vault_ref.trim().is_empty() {
-                        None
-                    } else {
-                        Some(openai_api_key_vault_ref)
-                    };
+                model_provider.openai_api_key_vault_ref = parse_optional_vault_ref_field(
+                    openai_api_key_vault_ref.as_str(),
+                    "model_provider.openai_api_key_vault_ref",
+                )?;
+                model_provider.openai_api_key_secret_ref = model_provider
+                    .openai_api_key_vault_ref
+                    .clone()
+                    .map(SecretRef::from_legacy_vault_ref);
             }
             if let Some(anthropic_api_key) = file_model_provider.anthropic_api_key {
                 model_provider.anthropic_api_key = if anthropic_api_key.trim().is_empty() {
@@ -351,15 +360,26 @@ pub fn load_config() -> Result<LoadedConfig> {
                     Some(anthropic_api_key)
                 };
             }
+            if let Some(anthropic_api_key_secret_ref) =
+                file_model_provider.anthropic_api_key_secret_ref
+            {
+                model_provider.anthropic_api_key_secret_ref =
+                    Some(parse_structured_secret_ref_field(
+                        anthropic_api_key_secret_ref,
+                        "model_provider.anthropic_api_key_secret_ref",
+                    )?);
+            }
             if let Some(anthropic_api_key_vault_ref) =
                 file_model_provider.anthropic_api_key_vault_ref
             {
-                model_provider.anthropic_api_key_vault_ref =
-                    if anthropic_api_key_vault_ref.trim().is_empty() {
-                        None
-                    } else {
-                        Some(anthropic_api_key_vault_ref)
-                    };
+                model_provider.anthropic_api_key_vault_ref = parse_optional_vault_ref_field(
+                    anthropic_api_key_vault_ref.as_str(),
+                    "model_provider.anthropic_api_key_vault_ref",
+                )?;
+                model_provider.anthropic_api_key_secret_ref = model_provider
+                    .anthropic_api_key_vault_ref
+                    .clone()
+                    .map(SecretRef::from_legacy_vault_ref);
             }
             if let Some(auth_profile_ref) = file_model_provider.auth_profile_ref {
                 model_provider.auth_profile_id = parse_optional_auth_profile_id(
@@ -666,17 +686,36 @@ pub fn load_config() -> Result<LoadedConfig> {
                     tool_call.browser_service.auth_token =
                         if trimmed.is_empty() { None } else { Some(trimmed.to_owned()) };
                 }
+                if let Some(auth_token_secret_ref) = file_browser_service.auth_token_secret_ref {
+                    tool_call.browser_service.auth_token_secret_ref =
+                        Some(parse_structured_secret_ref_field(
+                            auth_token_secret_ref,
+                            "tool_call.browser_service.auth_token_secret_ref",
+                        )?);
+                }
                 if let Some(state_dir) = file_browser_service.state_dir {
                     tool_call.browser_service.state_dir = parse_optional_browser_state_dir(
                         state_dir.as_str(),
                         "tool_call.browser_service.state_dir",
                     )?;
                 }
+                if let Some(state_key_secret_ref) = file_browser_service.state_key_secret_ref {
+                    tool_call.browser_service.state_key_secret_ref =
+                        Some(parse_structured_secret_ref_field(
+                            state_key_secret_ref,
+                            "tool_call.browser_service.state_key_secret_ref",
+                        )?);
+                }
                 if let Some(state_key_vault_ref) = file_browser_service.state_key_vault_ref {
                     tool_call.browser_service.state_key_vault_ref = parse_optional_vault_ref_field(
                         state_key_vault_ref.as_str(),
                         "tool_call.browser_service.state_key_vault_ref",
                     )?;
+                    tool_call.browser_service.state_key_secret_ref = tool_call
+                        .browser_service
+                        .state_key_vault_ref
+                        .clone()
+                        .map(SecretRef::from_legacy_vault_ref);
                 }
                 if let Some(connect_timeout_ms) = file_browser_service.connect_timeout_ms {
                     tool_call.browser_service.connect_timeout_ms = parse_positive_u64(
@@ -825,9 +864,21 @@ pub fn load_config() -> Result<LoadedConfig> {
                 admin.auth_token =
                     if auth_token.trim().is_empty() { None } else { Some(auth_token) };
             }
+            if let Some(auth_token_secret_ref) = file_admin.auth_token_secret_ref {
+                admin.auth_token_secret_ref = Some(parse_structured_secret_ref_field(
+                    auth_token_secret_ref,
+                    "admin.auth_token_secret_ref",
+                )?);
+            }
             if let Some(connector_token) = file_admin.connector_token {
                 admin.connector_token =
                     if connector_token.trim().is_empty() { None } else { Some(connector_token) };
+            }
+            if let Some(connector_token_secret_ref) = file_admin.connector_token_secret_ref {
+                admin.connector_token_secret_ref = Some(parse_structured_secret_ref_field(
+                    connector_token_secret_ref,
+                    "admin.connector_token_secret_ref",
+                )?);
             }
             if let Some(bound_principal) = file_admin.bound_principal {
                 let trimmed = bound_principal.trim();
@@ -1129,11 +1180,12 @@ pub fn load_config() -> Result<LoadedConfig> {
 
     if let Ok(openai_api_key_vault_ref) = env::var("PALYRA_MODEL_PROVIDER_OPENAI_API_KEY_VAULT_REF")
     {
-        model_provider.openai_api_key_vault_ref = if openai_api_key_vault_ref.trim().is_empty() {
-            None
-        } else {
-            Some(openai_api_key_vault_ref)
-        };
+        model_provider.openai_api_key_vault_ref = parse_optional_vault_ref_field(
+            openai_api_key_vault_ref.as_str(),
+            "PALYRA_MODEL_PROVIDER_OPENAI_API_KEY_VAULT_REF",
+        )?;
+        model_provider.openai_api_key_secret_ref =
+            model_provider.openai_api_key_vault_ref.clone().map(SecretRef::from_legacy_vault_ref);
         source.push_str(" +env(PALYRA_MODEL_PROVIDER_OPENAI_API_KEY_VAULT_REF)");
     }
     if let Ok(auth_profile_ref) = env::var("PALYRA_MODEL_PROVIDER_AUTH_PROFILE_REF") {
@@ -1354,6 +1406,11 @@ pub fn load_config() -> Result<LoadedConfig> {
             browserd_state_key_vault_ref.as_str(),
             "PALYRA_BROWSERD_STATE_ENCRYPTION_KEY_VAULT_REF",
         )?;
+        tool_call.browser_service.state_key_secret_ref = tool_call
+            .browser_service
+            .state_key_vault_ref
+            .clone()
+            .map(SecretRef::from_legacy_vault_ref);
         source.push_str(" +env(PALYRA_BROWSERD_STATE_ENCRYPTION_KEY_VAULT_REF)");
     }
     if let Ok(connect_timeout_ms) = env::var("PALYRA_BROWSER_SERVICE_CONNECT_TIMEOUT_MS") {
@@ -1607,6 +1664,7 @@ pub fn load_config() -> Result<LoadedConfig> {
             model_provider.allow_private_base_url,
         )?;
     }
+    validate_secret_source_conflicts(&model_provider, &tool_call.browser_service, &admin)?;
 
     Ok(LoadedConfig {
         source,
@@ -1719,6 +1777,21 @@ fn parse_optional_vault_ref_field(raw: &str, source_name: &str) -> Result<Option
     Ok(refs.into_iter().next())
 }
 
+fn parse_structured_secret_ref_field(
+    secret_ref: SecretRef,
+    source_name: &str,
+) -> Result<SecretRef> {
+    let mut parsed = secret_ref;
+    if let SecretSource::Vault { vault_ref } = &mut parsed.source {
+        *vault_ref =
+            parse_optional_vault_ref_field(vault_ref.as_str(), source_name)?.ok_or_else(|| {
+                anyhow::anyhow!("{source_name} must contain exactly one <scope>/<key> entry")
+            })?;
+    }
+    parsed.validate().map_err(|error| anyhow::anyhow!("{source_name}: {error}"))?;
+    Ok(parsed)
+}
+
 fn parse_optional_auth_profile_id(raw: &str, source_name: &str) -> Result<Option<String>> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -1735,6 +1808,68 @@ fn parse_optional_auth_profile_id(raw: &str, source_name: &str) -> Result<Option
         anyhow::bail!("{source_name} contains unsupported characters");
     }
     Ok(Some(normalized))
+}
+
+fn validate_secret_source_conflicts(
+    model_provider: &ModelProviderConfig,
+    browser_service: &BrowserServiceConfig,
+    admin: &AdminConfig,
+) -> Result<()> {
+    validate_secret_field_conflict(
+        "model_provider.openai_api_key",
+        model_provider.openai_api_key.is_some(),
+        model_provider.openai_api_key_secret_ref.is_some(),
+        model_provider.openai_api_key_vault_ref.is_some(),
+    )?;
+    validate_secret_field_conflict(
+        "model_provider.anthropic_api_key",
+        model_provider.anthropic_api_key.is_some(),
+        model_provider.anthropic_api_key_secret_ref.is_some(),
+        model_provider.anthropic_api_key_vault_ref.is_some(),
+    )?;
+    validate_secret_field_conflict(
+        "tool_call.browser_service.auth_token",
+        browser_service.auth_token.is_some(),
+        browser_service.auth_token_secret_ref.is_some(),
+        false,
+    )?;
+    validate_secret_field_conflict(
+        "tool_call.browser_service.state_key",
+        false,
+        browser_service.state_key_secret_ref.is_some(),
+        browser_service.state_key_vault_ref.is_some(),
+    )?;
+    validate_secret_field_conflict(
+        "admin.auth_token",
+        admin.auth_token.is_some(),
+        admin.auth_token_secret_ref.is_some(),
+        false,
+    )?;
+    validate_secret_field_conflict(
+        "admin.connector_token",
+        admin.connector_token.is_some(),
+        admin.connector_token_secret_ref.is_some(),
+        false,
+    )?;
+    Ok(())
+}
+
+fn validate_secret_field_conflict(
+    field_name: &str,
+    inline_present: bool,
+    secret_ref_present: bool,
+    legacy_vault_ref_present: bool,
+) -> Result<()> {
+    if inline_present && secret_ref_present {
+        anyhow::bail!("{field_name} cannot set both inline value and *_secret_ref");
+    }
+    if inline_present && legacy_vault_ref_present {
+        anyhow::bail!("{field_name} cannot set both inline value and legacy vault_ref");
+    }
+    if secret_ref_present && legacy_vault_ref_present {
+        anyhow::bail!("{field_name} cannot set both *_secret_ref and legacy vault_ref");
+    }
+    Ok(())
 }
 
 fn parse_optional_text(raw: &str, source_name: &str) -> Result<Option<String>> {
@@ -2032,17 +2167,41 @@ fn parse_model_provider_registry_entry(
         raw.api_key.unwrap_or_default().as_str(),
         format!("{source_name}.api_key").as_str(),
     )?;
+    let api_key_secret_ref = raw
+        .api_key_secret_ref
+        .map(|secret_ref| {
+            parse_structured_secret_ref_field(
+                secret_ref,
+                format!("{source_name}.api_key_secret_ref").as_str(),
+            )
+        })
+        .transpose()?;
     let api_key_vault_ref = parse_optional_vault_ref_field(
         raw.api_key_vault_ref.unwrap_or_default().as_str(),
         format!("{source_name}.api_key_vault_ref").as_str(),
     )?;
+    if api_key.is_some() && api_key_secret_ref.is_some() {
+        anyhow::bail!(
+            "{source_name} cannot set both api_key and api_key_secret_ref for the same provider entry"
+        );
+    }
     if api_key.is_some() && api_key_vault_ref.is_some() {
         anyhow::bail!(
             "{source_name} cannot set both api_key and api_key_vault_ref for the same provider entry"
         );
     }
+    if api_key_secret_ref.is_some() && api_key_vault_ref.is_some() {
+        anyhow::bail!(
+            "{source_name} cannot set both api_key_secret_ref and api_key_vault_ref for the same provider entry"
+        );
+    }
+    let resolved_api_key_secret_ref = api_key_secret_ref
+        .clone()
+        .or_else(|| api_key_vault_ref.clone().map(SecretRef::from_legacy_vault_ref));
     let credential_source = if api_key.is_some() {
         Some(ModelProviderCredentialSource::InlineConfig)
+    } else if let Some(secret_ref) = resolved_api_key_secret_ref.as_ref() {
+        Some(secret_ref_credential_source(secret_ref))
     } else if api_key_vault_ref.is_some() {
         Some(ModelProviderCredentialSource::VaultRef)
     } else if auth_profile_id.is_some() {
@@ -2070,6 +2229,7 @@ fn parse_model_provider_registry_entry(
         auth_profile_id,
         auth_profile_provider_kind,
         api_key,
+        api_key_secret_ref: resolved_api_key_secret_ref,
         api_key_vault_ref,
         credential_source,
         request_timeout_ms: raw
@@ -2112,6 +2272,13 @@ fn parse_model_provider_registry_entry(
             .transpose()?
             .unwrap_or(defaults.circuit_breaker_cooldown_ms),
     })
+}
+
+fn secret_ref_credential_source(secret_ref: &SecretRef) -> ModelProviderCredentialSource {
+    match secret_ref.source {
+        SecretSource::Vault { .. } => ModelProviderCredentialSource::VaultRef,
+        _ => ModelProviderCredentialSource::SecretRef,
+    }
 }
 
 fn parse_model_provider_registry_model(
@@ -3855,6 +4022,7 @@ mod tests {
                 auth_profile_id: Some("OpenAI.Default".to_owned()),
                 auth_provider_kind: None,
                 api_key: None,
+                api_key_secret_ref: None,
                 api_key_vault_ref: Some("GLOBAL/openai_api_key".to_owned()),
                 request_timeout_ms: None,
                 max_retries: None,
@@ -3871,6 +4039,7 @@ mod tests {
         assert_eq!(entry.display_name.as_deref(), Some("OpenAI Primary"));
         assert_eq!(entry.auth_profile_id.as_deref(), Some("openai.default"));
         assert_eq!(entry.auth_profile_provider_kind, Some(ModelProviderAuthProviderKind::Openai));
+        assert!(entry.api_key_secret_ref.is_some());
         assert_eq!(entry.api_key_vault_ref.as_deref(), Some("global/openai_api_key"));
         assert_eq!(entry.request_timeout_ms, 9_000);
         assert_eq!(entry.max_retries, 4);
@@ -3892,6 +4061,7 @@ mod tests {
                 auth_profile_id: None,
                 auth_provider_kind: None,
                 api_key: None,
+                api_key_secret_ref: None,
                 api_key_vault_ref: None,
                 request_timeout_ms: None,
                 max_retries: None,

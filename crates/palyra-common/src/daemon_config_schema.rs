@@ -1,17 +1,25 @@
 use serde::Deserialize;
 use toml::Value;
 
+use crate::secret_refs::SecretRef;
+
 const REDACTED_CONFIG_VALUE: &str = "<redacted>";
 
 pub const SECRET_CONFIG_PATHS: &[&str] = &[
     "admin.auth_token",
+    "admin.auth_token_secret_ref",
     "admin.connector_token",
+    "admin.connector_token_secret_ref",
     "model_provider.openai_api_key",
+    "model_provider.openai_api_key_secret_ref",
     "model_provider.openai_api_key_vault_ref",
     "model_provider.anthropic_api_key",
+    "model_provider.anthropic_api_key_secret_ref",
     "model_provider.anthropic_api_key_vault_ref",
     "gateway.admin_token",
     "tool_call.browser_service.auth_token",
+    "tool_call.browser_service.auth_token_secret_ref",
+    "tool_call.browser_service.state_key_secret_ref",
     "tool_call.browser_service.state_key_vault_ref",
 ];
 
@@ -81,10 +89,13 @@ fn redact_provider_registry_secrets(document: &mut Value) {
         };
         for secret_field in [
             "api_key",
+            "api_key_secret_ref",
             "api_key_vault_ref",
             "openai_api_key",
+            "openai_api_key_secret_ref",
             "openai_api_key_vault_ref",
             "anthropic_api_key",
+            "anthropic_api_key_secret_ref",
             "anthropic_api_key_vault_ref",
         ] {
             if provider_table.contains_key(secret_field) {
@@ -249,8 +260,10 @@ pub struct FileModelProviderConfig {
     pub openai_embeddings_model: Option<String>,
     pub openai_embeddings_dims: Option<u32>,
     pub openai_api_key: Option<String>,
+    pub openai_api_key_secret_ref: Option<SecretRef>,
     pub openai_api_key_vault_ref: Option<String>,
     pub anthropic_api_key: Option<String>,
+    pub anthropic_api_key_secret_ref: Option<SecretRef>,
     pub anthropic_api_key_vault_ref: Option<String>,
     pub auth_profile_id: Option<String>,
     pub auth_profile_ref: Option<String>,
@@ -285,6 +298,7 @@ pub struct FileModelProviderRegistryEntry {
     pub auth_profile_id: Option<String>,
     pub auth_provider_kind: Option<String>,
     pub api_key: Option<String>,
+    pub api_key_secret_ref: Option<SecretRef>,
     pub api_key_vault_ref: Option<String>,
     pub request_timeout_ms: Option<u64>,
     pub max_retries: Option<u32>,
@@ -348,7 +362,9 @@ pub struct FileBrowserServiceConfig {
     pub enabled: Option<bool>,
     pub endpoint: Option<String>,
     pub auth_token: Option<String>,
+    pub auth_token_secret_ref: Option<SecretRef>,
     pub state_dir: Option<String>,
+    pub state_key_secret_ref: Option<SecretRef>,
     pub state_key_vault_ref: Option<String>,
     pub connect_timeout_ms: Option<u64>,
     pub request_timeout_ms: Option<u64>,
@@ -447,7 +463,9 @@ pub struct FileWasmRuntimeConfig {
 pub struct FileAdminConfig {
     pub require_auth: Option<bool>,
     pub auth_token: Option<String>,
+    pub auth_token_secret_ref: Option<SecretRef>,
     pub connector_token: Option<String>,
+    pub connector_token_secret_ref: Option<SecretRef>,
     pub bound_principal: Option<String>,
 }
 
@@ -474,13 +492,18 @@ mod tests {
     #[test]
     fn secret_config_path_matching_is_case_insensitive() {
         assert!(is_secret_config_path("model_provider.openai_api_key"));
+        assert!(is_secret_config_path("model_provider.openai_api_key_secret_ref"));
         assert!(is_secret_config_path("model_provider.OPENAI_API_KEY"));
         assert!(is_secret_config_path("model_provider.openai_api_key_vault_ref"));
         assert!(is_secret_config_path("gateway.admin_token"));
         assert!(is_secret_config_path("tool_call.browser_service.auth_token"));
+        assert!(is_secret_config_path("tool_call.browser_service.auth_token_secret_ref"));
+        assert!(is_secret_config_path("tool_call.browser_service.state_key_secret_ref"));
         assert!(is_secret_config_path("tool_call.browser_service.state_key_vault_ref"));
         assert!(is_secret_config_path(" admin.auth_token "));
+        assert!(is_secret_config_path("admin.auth_token_secret_ref"));
         assert!(is_secret_config_path("admin.connector_token"));
+        assert!(is_secret_config_path("admin.connector_token_secret_ref"));
         assert!(!is_secret_config_path("daemon.port"));
     }
 
@@ -495,11 +518,25 @@ mod tests {
             [model_provider]
             openai_api_key = "sk-secret"
             openai_api_key_vault_ref = "vault://global/openai_api_key"
+            [model_provider.openai_api_key_secret_ref]
+            kind = "env"
+            variable = "PALYRA_OPENAI_API_KEY"
             [gateway]
             admin_token = "legacy-token"
+            [admin.auth_token_secret_ref]
+            kind = "file"
+            path = "secrets/admin.txt"
+            trusted_dirs = ["secrets"]
             [tool_call.browser_service]
             auth_token = "browserd-token"
+            [tool_call.browser_service.auth_token_secret_ref]
+            kind = "exec"
+            command = ["git", "--version"]
             state_key_vault_ref = "global/browserd_state_key"
+            [tool_call.browser_service.state_key_secret_ref]
+            kind = "file"
+            path = "secrets/browserd.key"
+            trusted_dirs = ["secrets"]
             "#,
         )
         .expect("config document should parse");
@@ -536,8 +573,22 @@ mod tests {
         );
         assert_eq!(
             document
+                .get("model_provider")
+                .and_then(|provider| provider.get("openai_api_key_secret_ref"))
+                .and_then(toml::Value::as_str),
+            Some("<redacted>")
+        );
+        assert_eq!(
+            document
                 .get("gateway")
                 .and_then(|gateway| gateway.get("admin_token"))
+                .and_then(toml::Value::as_str),
+            Some("<redacted>")
+        );
+        assert_eq!(
+            document
+                .get("admin")
+                .and_then(|admin| admin.get("auth_token_secret_ref"))
                 .and_then(toml::Value::as_str),
             Some("<redacted>")
         );
@@ -553,9 +604,61 @@ mod tests {
             document
                 .get("tool_call")
                 .and_then(|tool_call| tool_call.get("browser_service"))
+                .and_then(|browser_service| browser_service.get("auth_token_secret_ref"))
+                .and_then(toml::Value::as_str),
+            Some("<redacted>")
+        );
+        assert_eq!(
+            document
+                .get("tool_call")
+                .and_then(|tool_call| tool_call.get("browser_service"))
+                .and_then(|browser_service| browser_service.get("state_key_secret_ref"))
+                .and_then(toml::Value::as_str),
+            Some("<redacted>")
+        );
+        assert_eq!(
+            document
+                .get("tool_call")
+                .and_then(|tool_call| tool_call.get("browser_service"))
                 .and_then(|browser_service| browser_service.get("state_key_vault_ref"))
                 .and_then(toml::Value::as_str),
             Some("<redacted>")
+        );
+    }
+
+    #[test]
+    fn structured_secret_ref_fields_parse_in_config_schema() {
+        let parsed: RootFileConfig = toml::from_str(
+            r#"
+            [model_provider.openai_api_key_secret_ref]
+            kind = "env"
+            variable = "PALYRA_OPENAI_API_KEY"
+            display_name = "OpenAI API key"
+            [tool_call.browser_service.state_key_secret_ref]
+            kind = "file"
+            path = "secrets/browserd.key"
+            trusted_dirs = ["secrets"]
+            "#,
+        )
+        .expect("structured secret refs should parse");
+
+        let model_provider = parsed.model_provider.expect("model_provider section should parse");
+        assert_eq!(
+            model_provider
+                .openai_api_key_secret_ref
+                .expect("secret ref should be present")
+                .source_kind(),
+            "env"
+        );
+        let tool_call = parsed.tool_call.expect("tool_call section should parse");
+        assert_eq!(
+            tool_call
+                .browser_service
+                .expect("browser service section should parse")
+                .state_key_secret_ref
+                .expect("browser state secret ref should be present")
+                .source_kind(),
+            "file"
         );
     }
 

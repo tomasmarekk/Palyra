@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     net::IpAddr,
     sync::{Arc, Mutex},
     time::Instant,
@@ -17,6 +17,7 @@ use crate::gateway::proto::palyra::common::v1 as common_v1;
 use crate::{
     access_control::AccessRegistry,
     channels,
+    config::LoadedConfig,
     cron::CronTimezoneMode,
     gateway::{self, GatewayAuthConfig, GatewayRuntimeState},
     node_runtime::NodeRuntimeState,
@@ -29,6 +30,7 @@ use crate::{
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) started_at: Instant,
+    pub(crate) loaded_config: Arc<Mutex<LoadedConfig>>,
     pub(crate) runtime: Arc<GatewayRuntimeState>,
     pub(crate) node_runtime: Arc<NodeRuntimeState>,
     pub(crate) identity_manager: Arc<Mutex<IdentityManager>>,
@@ -55,9 +57,24 @@ pub(crate) struct AppState {
     pub(crate) support_bundle_jobs: Arc<Mutex<HashMap<String, control_plane::SupportBundleJob>>>,
     pub(crate) doctor_jobs: Arc<Mutex<HashMap<String, control_plane::DoctorRecoveryJob>>>,
     pub(crate) observability: Arc<ObservabilityState>,
+    pub(crate) configured_secrets: Arc<Mutex<ConfiguredSecretsState>>,
+    pub(crate) reload_state: Arc<Mutex<ReloadOperationsState>>,
     pub(crate) deployment: DeploymentRuntimeSnapshot,
     pub(crate) remote_admin_access: Arc<Mutex<Option<RemoteAdminAccessAttempt>>>,
     pub(crate) access_registry: Arc<Mutex<AccessRegistry>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ConfiguredSecretsState {
+    pub(crate) generated_at_unix_ms: i64,
+    pub(crate) snapshot_generation: u64,
+    pub(crate) secrets: Vec<control_plane::ConfiguredSecretRecord>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ReloadOperationsState {
+    pub(crate) latest_plan: Option<control_plane::ConfigReloadPlanEnvelope>,
+    pub(crate) recent_events: VecDeque<control_plane::ConfigReloadApplyEnvelope>,
 }
 
 #[derive(Debug, Clone)]

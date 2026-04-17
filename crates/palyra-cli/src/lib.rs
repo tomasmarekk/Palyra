@@ -777,6 +777,7 @@ fn build_doctor_report(checks: &[DoctorCheck]) -> Result<DoctorReport> {
     let access = collect_doctor_access_snapshot();
     let deployment = collect_doctor_deployment_snapshot();
     let skills = build_default_skills_inventory_snapshot();
+    let config_ref_health = collect_doctor_config_ref_health_snapshot(admin_payload.as_ref());
 
     let required_checks_total = checks.iter().filter(|check| check.required).count();
     let required_checks_ok = checks.iter().filter(|check| check.required && check.ok).count();
@@ -812,13 +813,20 @@ fn build_doctor_report(checks: &[DoctorCheck]) -> Result<DoctorReport> {
             tier_c_windows_backend_supported: process_runner_tier_c_windows_backend_config_ok(),
         },
         deployment,
+        config_ref_health,
     })
 }
 
 fn collect_doctor_config_snapshot() -> DoctorConfigSnapshot {
     let path = doctor_config_path().map(|value| value.to_string_lossy().into_owned());
     let Some(path) = path else {
-        return DoctorConfigSnapshot { path: None, exists: false, parsed: false, error: None };
+        return DoctorConfigSnapshot {
+            path: None,
+            exists: false,
+            parsed: false,
+            migration: None,
+            error: None,
+        };
     };
     let path_ref = PathBuf::from(path.as_str());
     if !path_ref.exists() {
@@ -826,24 +834,31 @@ fn collect_doctor_config_snapshot() -> DoctorConfigSnapshot {
             path: Some(path),
             exists: false,
             parsed: false,
+            migration: None,
             error: Some("configured path does not exist".to_owned()),
         };
     }
 
-    match read_doctor_root_file_config() {
-        Ok(Some(_)) => {
-            DoctorConfigSnapshot { path: Some(path), exists: true, parsed: true, error: None }
-        }
+    match read_doctor_root_file_config_with_migration() {
+        Ok(Some((_parsed, migration))) => DoctorConfigSnapshot {
+            path: Some(path),
+            exists: true,
+            parsed: true,
+            migration: Some(config_migration_snapshot(migration)),
+            error: None,
+        },
         Ok(None) => DoctorConfigSnapshot {
             path: Some(path),
             exists: true,
             parsed: false,
+            migration: None,
             error: Some("config path resolved but no config was loaded".to_owned()),
         },
         Err(error) => DoctorConfigSnapshot {
             path: Some(path),
             exists: true,
             parsed: false,
+            migration: None,
             error: Some(sanitize_diagnostic_error(error.to_string().as_str())),
         },
     }
@@ -1125,6 +1140,10 @@ fn collect_doctor_browser_snapshot(
         recent_health_failures,
         error,
     }
+}
+
+fn collect_doctor_config_ref_health_snapshot(admin_payload: Option<&Value>) -> Option<Value> {
+    admin_payload.and_then(|payload| payload.pointer("/observability/config_ref_health").cloned())
 }
 
 fn collect_doctor_access_snapshot() -> DoctorAccessSnapshot {
@@ -1627,6 +1646,7 @@ fn build_support_bundle_config_snapshot() -> SupportBundleConfigSnapshot {
             path,
             redacted_document: None,
             fingerprint_sha256: None,
+            migration: None,
             error: None,
         };
     };
@@ -1637,12 +1657,13 @@ fn build_support_bundle_config_snapshot() -> SupportBundleConfigSnapshot {
             path,
             redacted_document: None,
             fingerprint_sha256: None,
+            migration: None,
             error: Some("config path does not exist".to_owned()),
         };
     }
 
     match load_document_from_existing_path(path_ref.as_path()) {
-        Ok((mut document, _)) => {
+        Ok((mut document, migration)) => {
             redact_secret_config_values(&mut document);
             match serde_json::to_value(document) {
                 Ok(mut payload) => {
@@ -1653,6 +1674,7 @@ fn build_support_bundle_config_snapshot() -> SupportBundleConfigSnapshot {
                         path,
                         redacted_document: Some(payload),
                         fingerprint_sha256,
+                        migration: Some(config_migration_snapshot(migration)),
                         error: None,
                     }
                 }
@@ -1660,6 +1682,7 @@ fn build_support_bundle_config_snapshot() -> SupportBundleConfigSnapshot {
                     path,
                     redacted_document: None,
                     fingerprint_sha256: None,
+                    migration: Some(config_migration_snapshot(migration)),
                     error: Some(sanitize_diagnostic_error(error.to_string().as_str())),
                 },
             }
@@ -1668,6 +1691,7 @@ fn build_support_bundle_config_snapshot() -> SupportBundleConfigSnapshot {
             path,
             redacted_document: None,
             fingerprint_sha256: None,
+            migration: None,
             error: Some(sanitize_diagnostic_error(error.to_string().as_str())),
         },
     }
@@ -1690,6 +1714,7 @@ fn build_support_bundle_diagnostics_snapshot() -> SupportBundleDiagnosticsSnapsh
             browser_status: None,
             node_status: None,
             admin_status: None,
+            config_ref_health: None,
             admin_status_error: Some("skipped (PALYRA_ADMIN_TOKEN is not set)".to_owned()),
             skills: build_default_skills_inventory_snapshot(),
         };
@@ -1704,6 +1729,7 @@ fn build_support_bundle_diagnostics_snapshot() -> SupportBundleDiagnosticsSnapsh
                 browser_status: None,
                 node_status: None,
                 admin_status: None,
+                config_ref_health: None,
                 admin_status_error: Some(sanitize_diagnostic_error(error.to_string().as_str())),
                 skills: build_default_skills_inventory_snapshot(),
             };
@@ -1718,6 +1744,7 @@ fn build_support_bundle_diagnostics_snapshot() -> SupportBundleDiagnosticsSnapsh
                 browser_status: None,
                 node_status: None,
                 admin_status: None,
+                config_ref_health: None,
                 admin_status_error: Some(sanitize_diagnostic_error(error.to_string().as_str())),
                 skills: build_default_skills_inventory_snapshot(),
             };
@@ -1737,6 +1764,7 @@ fn build_support_bundle_diagnostics_snapshot() -> SupportBundleDiagnosticsSnapsh
         Ok(mut payload) => {
             let browser_status = payload.get("browserd").cloned();
             let node_status = payload.get("node").cloned();
+            let config_ref_health = payload.pointer("/observability/config_ref_health").cloned();
             redact_json_value_tree(&mut payload, None);
             SupportBundleDiagnosticsSnapshot {
                 gateway_health,
@@ -1744,6 +1772,7 @@ fn build_support_bundle_diagnostics_snapshot() -> SupportBundleDiagnosticsSnapsh
                 browser_status,
                 node_status,
                 admin_status: Some(payload),
+                config_ref_health,
                 admin_status_error: None,
                 skills: build_default_skills_inventory_snapshot(),
             }
@@ -1754,6 +1783,7 @@ fn build_support_bundle_diagnostics_snapshot() -> SupportBundleDiagnosticsSnapsh
             browser_status: None,
             node_status: None,
             admin_status: None,
+            config_ref_health: None,
             admin_status_error: Some(sanitize_diagnostic_error(error.to_string().as_str())),
             skills: build_default_skills_inventory_snapshot(),
         },
@@ -1795,6 +1825,7 @@ fn build_support_bundle_triage_snapshot() -> SupportBundleTriageSnapshot {
         ],
         common_order: vec![
             "Check deployment posture and operator auth first.".to_owned(),
+            "Check config ref health and reload blockers next.".to_owned(),
             "Check OpenAI profile health and refresh metrics next.".to_owned(),
             "Check Discord queue depth, dead letters, and upload failures next.".to_owned(),
             "Check browser relay failures and service health next.".to_owned(),
@@ -6483,6 +6514,11 @@ fn doctor_config_path() -> Option<PathBuf> {
 }
 
 fn read_doctor_root_file_config() -> Result<Option<RootFileConfig>> {
+    Ok(read_doctor_root_file_config_with_migration()?.map(|(parsed, _)| parsed))
+}
+
+fn read_doctor_root_file_config_with_migration(
+) -> Result<Option<(RootFileConfig, ConfigMigrationInfo)>> {
     let Some(config_path) = doctor_config_path() else {
         return Ok(None);
     };
@@ -6492,13 +6528,26 @@ fn read_doctor_root_file_config() -> Result<Option<RootFileConfig>> {
 
     let content = fs::read_to_string(config_path.as_path())
         .with_context(|| format!("failed to read {}", config_path.display()))?;
-    let (document, _) = parse_document_with_migration(content.as_str())
+    let (document, migration) = parse_document_with_migration(content.as_str())
         .context("failed to migrate doctor config document")?;
     let migrated =
         toml::to_string(&document).context("failed to serialize doctor config document")?;
     let parsed: RootFileConfig =
         toml::from_str(migrated.as_str()).context("invalid doctor daemon config schema")?;
-    Ok(Some(parsed))
+    Ok(Some((parsed, migration)))
+}
+
+fn config_migration_snapshot(migration: ConfigMigrationInfo) -> Value {
+    json!({
+        "state": if migration.migrated {
+            "migration_available"
+        } else {
+            "current"
+        },
+        "source_version": migration.source_version,
+        "target_version": migration.target_version,
+        "requires_writeback": migration.migrated,
+    })
 }
 
 fn process_runner_tier_b_allowlist_preflight_only(parsed: &RootFileConfig) -> bool {
@@ -6686,6 +6735,8 @@ struct DoctorReport {
     skills: SkillsInventorySnapshot,
     sandbox: DoctorSandboxSnapshot,
     deployment: DoctorDeploymentSnapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config_ref_health: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -6702,6 +6753,8 @@ struct DoctorConfigSnapshot {
     path: Option<String>,
     exists: bool,
     parsed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    migration: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -6861,6 +6914,8 @@ struct SupportBundleConfigSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     fingerprint_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    migration: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
 
@@ -6876,6 +6931,8 @@ struct SupportBundleDiagnosticsSnapshot {
     node_status: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     admin_status: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config_ref_health: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     admin_status_error: Option<String>,
     skills: SkillsInventorySnapshot,
@@ -8249,6 +8306,7 @@ mod diagnostics_bundle_tests {
                 path: Some("palyra.toml".to_owned()),
                 exists: true,
                 parsed: true,
+                migration: None,
                 error: None,
             },
             identity: DoctorIdentitySnapshot {
@@ -8337,6 +8395,7 @@ mod diagnostics_bundle_tests {
                 remote_bind_detected: false,
                 warnings: Vec::new(),
             },
+            config_ref_health: None,
         }
     }
 
@@ -8398,6 +8457,7 @@ mod diagnostics_bundle_tests {
                     }
                 })),
                 fingerprint_sha256: Some("f".repeat(64)),
+                migration: None,
                 error: None,
             },
             observability: SupportBundleObservabilitySnapshot {
@@ -8438,6 +8498,7 @@ mod diagnostics_bundle_tests {
                         }
                     }
                 })),
+                config_ref_health: None,
                 admin_status_error: None,
                 skills: SkillsInventorySnapshot {
                     skills_root: "state/skills".to_owned(),

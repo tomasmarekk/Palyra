@@ -157,3 +157,67 @@ pub(crate) async fn console_secret_delete_handler(
         secret: metadata,
     }))
 }
+
+pub(crate) async fn console_configured_secrets_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<control_plane::ConfiguredSecretListEnvelope>, Response> {
+    let _session = authorize_console_session(&state, &headers, false)?;
+    let snapshot = configured_secrets_snapshot(&state);
+    Ok(Json(control_plane::ConfiguredSecretListEnvelope {
+        contract: contract_descriptor(),
+        generated_at_unix_ms: snapshot.generated_at_unix_ms,
+        snapshot_generation: snapshot.snapshot_generation,
+        page: build_page_info(snapshot.secrets.len().max(1), snapshot.secrets.len(), None),
+        secrets: snapshot.secrets,
+    }))
+}
+
+pub(crate) async fn console_configured_secret_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<control_plane::ConfiguredSecretQuery>,
+) -> Result<Json<control_plane::ConfiguredSecretEnvelope>, Response> {
+    let _session = authorize_console_session(&state, &headers, false)?;
+    let snapshot = configured_secrets_snapshot(&state);
+    let secret =
+        snapshot.secrets.into_iter().find(|entry| entry.secret_id == query.secret_id).ok_or_else(
+            || runtime_status_response(tonic::Status::not_found("configured secret not found")),
+        )?;
+    Ok(Json(control_plane::ConfiguredSecretEnvelope {
+        contract: contract_descriptor(),
+        generated_at_unix_ms: snapshot.generated_at_unix_ms,
+        snapshot_generation: snapshot.snapshot_generation,
+        secret,
+    }))
+}
+
+pub(crate) fn configured_secrets_snapshot(
+    state: &AppState,
+) -> crate::app::state::ConfiguredSecretsState {
+    let snapshot =
+        state.configured_secrets.lock().unwrap_or_else(|error| error.into_inner()).clone();
+    let latest_plan =
+        state.reload_state.lock().unwrap_or_else(|error| error.into_inner()).latest_plan.clone();
+    if let Some(plan) = latest_plan {
+        let secrets = snapshot
+            .secrets
+            .into_iter()
+            .map(|mut secret| {
+                if secret.status == "healthy"
+                    && plan.steps.iter().any(|step| step.config_path == secret.config_path)
+                {
+                    secret.status = "stale".to_owned();
+                    secret.last_error = Some(
+                        "runtime snapshot is older than the latest reload plan for this secret"
+                            .to_owned(),
+                    );
+                }
+                secret
+            })
+            .collect::<Vec<_>>();
+        crate::app::state::ConfiguredSecretsState { secrets, ..snapshot }
+    } else {
+        snapshot
+    }
+}

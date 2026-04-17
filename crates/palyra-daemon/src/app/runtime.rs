@@ -9,8 +9,8 @@ use tokio::sync::Notify;
 
 use super::state::{
     AdminRateLimitEntry, AppState, CanvasRateLimitEntry, CompatApiRateLimitEntry,
-    ConsoleBrowserHandoff, ConsoleChatRunStream, ConsoleRelayToken, ConsoleSession,
-    DeploymentRuntimeSnapshot, RemoteAdminAccessAttempt,
+    ConfiguredSecretsState, ConsoleBrowserHandoff, ConsoleChatRunStream, ConsoleRelayToken,
+    ConsoleSession, DeploymentRuntimeSnapshot, ReloadOperationsState, RemoteAdminAccessAttempt,
 };
 use crate::{
     access_control::AccessRegistry,
@@ -44,10 +44,12 @@ pub(crate) struct AppStateBuildContext {
 pub(crate) fn build_app_state(
     loaded: &LoadedConfig,
     dangerous_remote_bind_ack_env: bool,
+    configured_secrets: ConfiguredSecretsState,
     context: AppStateBuildContext,
 ) -> AppState {
     AppState {
         started_at: Instant::now(),
+        loaded_config: Arc::new(Mutex::new(loaded.clone())),
         runtime: context.runtime,
         node_runtime: context.node_runtime,
         identity_manager: context.identity_manager,
@@ -80,6 +82,8 @@ pub(crate) fn build_app_state(
         support_bundle_jobs: Arc::new(Mutex::new(HashMap::new())),
         doctor_jobs: Arc::new(Mutex::new(HashMap::new())),
         observability: Arc::new(ObservabilityState::default()),
+        configured_secrets: Arc::new(Mutex::new(configured_secrets)),
+        reload_state: Arc::new(Mutex::new(ReloadOperationsState::default())),
         deployment: build_deployment_runtime_snapshot(loaded, dangerous_remote_bind_ack_env),
         remote_admin_access: Arc::new(Mutex::new(None::<RemoteAdminAccessAttempt>)),
         access_registry: context.access_registry,

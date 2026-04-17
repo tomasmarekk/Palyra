@@ -350,11 +350,27 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/console/v1/config/mutate", post(console::config::console_config_mutate_handler))
         .route("/console/v1/config/migrate", post(console::config::console_config_migrate_handler))
         .route("/console/v1/config/recover", post(console::config::console_config_recover_handler))
+        .route(
+            "/console/v1/config/reload/plan",
+            post(console::config::console_config_reload_plan_handler),
+        )
+        .route(
+            "/console/v1/config/reload/apply",
+            post(console::config::console_config_reload_apply_handler),
+        )
         .route("/console/v1/secrets", get(console::secrets::console_secrets_list_handler))
         .route("/console/v1/secrets", post(console::secrets::console_secret_set_handler))
         .route(
+            "/console/v1/secrets/configured",
+            get(console::secrets::console_configured_secrets_handler),
+        )
+        .route(
             "/console/v1/secrets/metadata",
             get(console::secrets::console_secret_metadata_handler),
+        )
+        .route(
+            "/console/v1/secrets/configured/detail",
+            get(console::secrets::console_configured_secret_handler),
         )
         .route("/console/v1/secrets/reveal", post(console::secrets::console_secret_reveal_handler))
         .route("/console/v1/secrets/delete", post(console::secrets::console_secret_delete_handler))
