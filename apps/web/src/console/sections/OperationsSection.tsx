@@ -62,6 +62,12 @@ export function OperationsSection({ app }: OperationsSectionProps) {
   const connector = readObject(observability ?? {}, "connector");
   const browser = readObject(observability ?? {}, "browser");
   const doctorRecovery = readObject(observability ?? {}, "doctor_recovery");
+  const configRefHealth = readObject(observability ?? {}, "config_ref_health");
+  const configRefSummary = readObject(configRefHealth ?? {}, "summary");
+  const configRefItems = readJsonObjectArray(configRefHealth?.items);
+  const configRefRecommendations = toStringArray(
+    Array.isArray(configRefHealth?.recommendations) ? configRefHealth.recommendations : [],
+  );
   const selfHealing = readObject(observability ?? {}, "self_healing");
   const selfHealingSummary = readObject(selfHealing ?? {}, "summary");
   const selfHealingSettings = readObject(selfHealing ?? {}, "settings");
@@ -177,6 +183,12 @@ export function OperationsSection({ app }: OperationsSectionProps) {
           tone={workspaceToneForState(readString(latestDoctorRecovery ?? {}, "state") ?? "unknown")}
         />
         <WorkspaceMetricCard
+          label="Config ref health"
+          value={readNumber(configRefSummary ?? {}, "blocking_refs") ?? 0}
+          detail={`${readNumber(configRefSummary ?? {}, "warning_refs") ?? 0} warnings · ${readString(configRefHealth ?? {}, "state") ?? "No ref health loaded."}`}
+          tone={workspaceToneForState(readString(configRefHealth ?? {}, "state") ?? "unknown")}
+        />
+        <WorkspaceMetricCard
           label="Learning reflections"
           value={readNumber(learningCounters ?? {}, "reflections_scheduled") ?? 0}
           detail={`${readNumber(learningCounters ?? {}, "candidates_created") ?? 0} candidates · ${readNumber(learningCounters ?? {}, "candidates_auto_applied") ?? 0} auto-applied`}
@@ -244,6 +256,52 @@ export function OperationsSection({ app }: OperationsSectionProps) {
         </div>
 
         <div className="workspace-stack">
+          <WorkspaceSectionCard
+            title="Config ref health"
+            description="Configured secret sources, stale runtime snapshots, and reload blockers stay visible alongside the broader diagnostics stream."
+          >
+            {configRefItems.length === 0 ? (
+              <WorkspaceEmptyState
+                compact
+                title="No config ref health published"
+                description="Refresh diagnostics after the daemon publishes configured ref health."
+              />
+            ) : (
+              <div className="workspace-stack">
+                <WorkspaceTable
+                  ariaLabel="Config ref health"
+                  columns={["Config path", "State", "Reload", "Advice"]}
+                >
+                  {configRefItems.slice(0, 5).map((item, index) => (
+                    <tr
+                      key={`${readString(item, "ref_id") ?? readString(item, "config_path") ?? "ref"}-${index}`}
+                    >
+                      <td>{readString(item, "config_path") ?? "n/a"}</td>
+                      <td>
+                        <WorkspaceStatusChip
+                          tone={workspaceToneForState(readString(item, "severity") ?? "unknown")}
+                        >
+                          {readString(item, "state") ?? "unknown"}
+                        </WorkspaceStatusChip>
+                      </td>
+                      <td>{readString(item, "reload_mode") ?? "n/a"}</td>
+                      <td>{readString(item, "advice") ?? "No operator advice published."}</td>
+                    </tr>
+                  ))}
+                </WorkspaceTable>
+                {configRefRecommendations.length > 0 ? (
+                  <WorkspaceInlineNotice title="Recommended next steps" tone="warning">
+                    <ul className="console-compact-list">
+                      {configRefRecommendations.slice(0, 4).map((recommendation) => (
+                        <li key={recommendation}>{recommendation}</li>
+                      ))}
+                    </ul>
+                  </WorkspaceInlineNotice>
+                ) : null}
+              </div>
+            )}
+          </WorkspaceSectionCard>
+
           <WorkspaceSectionCard
             title="Routing and budget telemetry"
             description="Routing recommendations, enforced overrides, and alerting stay visible from the diagnostics surface."

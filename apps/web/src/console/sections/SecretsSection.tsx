@@ -14,7 +14,7 @@ import {
   WorkspaceRedactedValue,
   WorkspaceTable,
 } from "../components/workspace/WorkspacePatterns";
-import { formatUnixMs, readNumber, readString } from "../shared";
+import { formatUnixMs, readNumber, readString, type JsonObject } from "../shared";
 import type { ConsoleAppState } from "../useConsoleAppState";
 
 type SecretsSectionProps = {
@@ -30,12 +30,15 @@ type SecretsSectionProps = {
     | "configSecretValue"
     | "setConfigSecretValue"
     | "configSecretReveal"
+    | "configuredSecrets"
+    | "configuredSecretDetail"
     | "revealSensitiveValues"
     | "refreshSecrets"
     | "loadSecretMetadata"
     | "setSecretValue"
     | "revealSecretValue"
     | "deleteSecretValue"
+    | "loadConfiguredSecret"
   >;
 };
 
@@ -57,6 +60,9 @@ export function SecretsSection({ app }: SecretsSectionProps) {
     (sum, secret) => sum + (readNumber(secret, "value_bytes") ?? 0),
     0,
   );
+  const configuredSecretCount = app.configuredSecrets.length;
+  const configuredSecretSource =
+    (app.configuredSecretDetail?.source as JsonObject | undefined) ?? {};
 
   return (
     <main className="workspace-page">
@@ -103,6 +109,12 @@ export function SecretsSection({ app }: SecretsSectionProps) {
           value={totalBytes}
           detail="Combined metadata only, not revealed secret payload length in memory."
           tone={totalBytes > 0 ? "accent" : "default"}
+        />
+        <WorkspaceMetricCard
+          label="Configured refs"
+          value={configuredSecretCount}
+          detail="Structured secret references tracked by runtime diagnostics."
+          tone={configuredSecretCount > 0 ? "warning" : "default"}
         />
       </section>
 
@@ -192,6 +204,46 @@ export function SecretsSection({ app }: SecretsSectionProps) {
               placeholder="No secret has been revealed in this session."
               hint={`Scope: ${selectedScope}`}
             />
+          </WorkspaceSectionCard>
+
+          <WorkspaceSectionCard
+            title="Configured secret refs"
+            description="Runtime-facing secret references expose source kind, status, and reload impact without leaking values."
+          >
+            {app.configuredSecrets.length === 0 ? (
+              <WorkspaceEmptyState
+                title="No configured refs loaded"
+                description="Refresh the page to inspect runtime secret references from the active config snapshot."
+                compact
+              />
+            ) : (
+              <WorkspaceTable
+                ariaLabel="Configured secret references"
+                columns={["Component", "Path", "Status", "Reload", "Actions"]}
+              >
+                {app.configuredSecrets.map((secret) => {
+                  const secretId = readString(secret, "secret_id") ?? "unknown";
+                  return (
+                    <tr key={secretId}>
+                      <td>{readString(secret, "component") ?? "unknown"}</td>
+                      <td>{readString(secret, "config_path") ?? "n/a"}</td>
+                      <td>{readString(secret, "status") ?? "unknown"}</td>
+                      <td>{readString(secret, "reload_action") ?? "manual_review"}</td>
+                      <td>
+                        <ActionButton
+                          type="button"
+                          variant="secondary"
+                          onPress={() => void app.loadConfiguredSecret(secretId)}
+                          isDisabled={app.configBusy}
+                        >
+                          Explain
+                        </ActionButton>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </WorkspaceTable>
+            )}
           </WorkspaceSectionCard>
         </div>
 
@@ -285,6 +337,50 @@ export function SecretsSection({ app }: SecretsSectionProps) {
                 <div>
                   <dt>Value bytes</dt>
                   <dd>{readString(app.configSecretMetadata, "value_bytes") ?? "n/a"}</dd>
+                </div>
+              </dl>
+            )}
+          </WorkspaceSectionCard>
+
+          <WorkspaceSectionCard
+            title="Configured explain"
+            description="The detail view mirrors CLI explain output with safe resolver metadata."
+          >
+            {app.configuredSecretDetail === null ? (
+              <WorkspaceEmptyState
+                title="No configured ref selected"
+                description="Choose a configured secret reference to inspect resolver status and source fingerprint."
+                compact
+              />
+            ) : (
+              <dl className="workspace-key-value-grid">
+                <div>
+                  <dt>Path</dt>
+                  <dd>{readString(app.configuredSecretDetail, "config_path") ?? "n/a"}</dd>
+                </div>
+                <div>
+                  <dt>Status</dt>
+                  <dd>{readString(app.configuredSecretDetail, "status") ?? "unknown"}</dd>
+                </div>
+                <div>
+                  <dt>Reload</dt>
+                  <dd>{readString(app.configuredSecretDetail, "reload_action") ?? "manual_review"}</dd>
+                </div>
+                <div>
+                  <dt>Source kind</dt>
+                  <dd>
+                    {readString(configuredSecretSource, "kind") ?? "n/a"}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Fingerprint</dt>
+                  <dd>
+                    {readString(configuredSecretSource, "fingerprint") ?? "n/a"}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Last error</dt>
+                  <dd>{readString(app.configuredSecretDetail, "last_error") ?? "none"}</dd>
                 </div>
               </dl>
             )}

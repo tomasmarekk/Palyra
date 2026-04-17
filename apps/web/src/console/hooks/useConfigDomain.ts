@@ -36,16 +36,24 @@ export function useConfigDomain({ api, setError, setNotice }: UseConfigDomainArg
   const [configSecretMetadata, setConfigSecretMetadata] = useState<JsonObject | null>(null);
   const [configSecretValue, setConfigSecretValue] = useState("");
   const [configSecretReveal, setConfigSecretReveal] = useState<JsonObject | null>(null);
+  const [configuredSecrets, setConfiguredSecrets] = useState<JsonObject[]>([]);
+  const [configuredSecretDetail, setConfiguredSecretDetail] = useState<JsonObject | null>(null);
+  const [configReloadPlan, setConfigReloadPlan] = useState<JsonObject | null>(null);
+  const [configReloadResult, setConfigReloadResult] = useState<JsonObject | null>(null);
 
   async function refreshConfigSurface(): Promise<void> {
     setConfigBusy(true);
     setError(null);
     try {
-      const [secretsResponse, deploymentResponse] = await Promise.all([
+      const [secretsResponse, configuredSecretsResponse, deploymentResponse] = await Promise.all([
         api.listSecrets(configSecretsScope),
+        api.listConfiguredSecrets(),
         api.getDeploymentPosture(),
       ]);
       setConfigSecrets(toJsonObjectArray(secretsResponse.secrets as unknown as JsonValue[]));
+      setConfiguredSecrets(
+        toJsonObjectArray(configuredSecretsResponse.secrets as unknown as JsonValue[]),
+      );
       setConfigDeploymentPosture(
         isJsonObject(deploymentResponse as unknown as JsonValue)
           ? (deploymentResponse as unknown as JsonObject)
@@ -216,8 +224,12 @@ export function useConfigDomain({ api, setError, setNotice }: UseConfigDomainArg
     setConfigBusy(true);
     setError(null);
     try {
-      const response = await api.listSecrets(configSecretsScope);
+      const [response, configuredResponse] = await Promise.all([
+        api.listSecrets(configSecretsScope),
+        api.listConfiguredSecrets(),
+      ]);
       setConfigSecrets(toJsonObjectArray(response.secrets as unknown as JsonValue[]));
+      setConfiguredSecrets(toJsonObjectArray(configuredResponse.secrets as unknown as JsonValue[]));
       setConfigSecretMetadata(null);
     } catch (failure) {
       setError(toErrorMessage(failure));
@@ -324,6 +336,70 @@ export function useConfigDomain({ api, setError, setNotice }: UseConfigDomainArg
     }
   }
 
+  async function loadConfiguredSecret(secretId: string): Promise<void> {
+    if (secretId.trim().length === 0) {
+      setError("Configured secret id cannot be empty.");
+      return;
+    }
+    setConfigBusy(true);
+    setError(null);
+    try {
+      const response = await api.getConfiguredSecret(secretId.trim());
+      setConfiguredSecretDetail(
+        isJsonObject(response.secret as unknown as JsonValue)
+          ? (response.secret as unknown as JsonObject)
+          : null,
+      );
+      setNotice("Configured secret detail refreshed.");
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setConfigBusy(false);
+    }
+  }
+
+  async function planConfigReload(): Promise<void> {
+    setConfigBusy(true);
+    setError(null);
+    try {
+      const response = await api.planConfigReload({
+        path: emptyToUndefined(configInspectPath),
+      });
+      setConfigReloadPlan(
+        isJsonObject(response as unknown as JsonValue) ? (response as unknown as JsonObject) : null,
+      );
+      setNotice("Reload plan generated.");
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setConfigBusy(false);
+    }
+  }
+
+  async function applyConfigReload(dryRun = false): Promise<void> {
+    setConfigBusy(true);
+    setError(null);
+    try {
+      const response = await api.applyConfigReload({
+        path: emptyToUndefined(configInspectPath),
+        dry_run: dryRun,
+      });
+      setConfigReloadResult(
+        isJsonObject(response as unknown as JsonValue) ? (response as unknown as JsonObject) : null,
+      );
+      const normalizedPlan = isJsonObject(response.plan as unknown as JsonValue)
+        ? (response.plan as unknown as JsonObject)
+        : null;
+      setConfigReloadPlan(normalizedPlan);
+      await refreshConfigSurface();
+      setNotice(dryRun ? "Reload dry-run completed." : "Reload apply finished.");
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setConfigBusy(false);
+    }
+  }
+
   function resetConfigDomain(): void {
     setConfigBusy(false);
     setConfigInspectPath("palyra.toml");
@@ -343,6 +419,10 @@ export function useConfigDomain({ api, setError, setNotice }: UseConfigDomainArg
     setConfigSecretMetadata(null);
     setConfigSecretValue("");
     setConfigSecretReveal(null);
+    setConfiguredSecrets([]);
+    setConfiguredSecretDetail(null);
+    setConfigReloadPlan(null);
+    setConfigReloadResult(null);
   }
 
   return {
@@ -373,6 +453,10 @@ export function useConfigDomain({ api, setError, setNotice }: UseConfigDomainArg
     configSecretValue,
     setConfigSecretValue,
     configSecretReveal,
+    configuredSecrets,
+    configuredSecretDetail,
+    configReloadPlan,
+    configReloadResult,
     refreshConfigSurface,
     inspectConfigSurface,
     validateConfigSurface,
@@ -384,6 +468,9 @@ export function useConfigDomain({ api, setError, setNotice }: UseConfigDomainArg
     setSecretValue,
     revealSecretValue,
     deleteSecretValue,
+    loadConfiguredSecret,
+    planConfigReload,
+    applyConfigReload,
     resetConfigDomain,
   };
 }

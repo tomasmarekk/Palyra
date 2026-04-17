@@ -20,6 +20,7 @@ import {
   configInspectFixture,
   configMutationFixture,
   configValidationFixture,
+  configuredSecretListFixture,
   secretMetadataFixture,
   secretMetadataListFixture,
   secretRevealFixture,
@@ -62,9 +63,7 @@ describe("M56 config, access, and support surfaces", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Config" }));
     expect(await screen.findByRole("heading", { name: "Config" })).toBeInTheDocument();
     await waitFor(() => {
-      expect(document.body).toHaveTextContent(
-        "Remote gateway exposure requires explicit verification and operator acknowledgement.",
-      );
+      expect(document.body).toHaveTextContent("No snapshot loaded");
     });
 
     expect(inspectCalls).toBe(0);
@@ -133,9 +132,7 @@ describe("M56 config, access, and support surfaces", () => {
       fireEvent.click(await screen.findByRole("button", { name: "Config" }));
       expect(await screen.findByRole("heading", { name: "Config" })).toBeInTheDocument();
       await waitFor(() => {
-        expect(document.body).toHaveTextContent(
-          "Remote gateway exposure requires explicit verification and operator acknowledgement.",
-        );
+        expect(document.body).toHaveTextContent("No snapshot loaded");
       });
 
       fireEvent.click(screen.getByRole("tab", { name: "Mutate" }));
@@ -428,8 +425,10 @@ describe("M56 config, access, and support surfaces", () => {
       await screen.findByRole("heading", { name: "Support and Recovery" }),
     ).toBeInTheDocument();
     expect(screen.getByText("Provider auth recovery")).toBeInTheDocument();
+    expect(screen.getByText("Secret and reload health")).toBeInTheDocument();
     expect(screen.getAllByText("Bundle reliability").length).toBeGreaterThan(0);
     expect(screen.getByText("Triage playbook")).toBeInTheDocument();
+    expect(screen.getByText("Wait for active runs to finish, then rerun the reload plan or apply step.")).toBeInTheDocument();
     expect(
       screen.getByText(
         "docs-codebase/docs-tree/web_console_operator_dashboard/console_sections_and_navigation/support_recovery.md",
@@ -519,6 +518,9 @@ function routeOverviewRequests(
   }
   if (request.path === "/console/v1/diagnostics" && request.method === "GET") {
     return jsonResponse(diagnosticsFixture());
+  }
+  if (request.path === "/console/v1/secrets/configured" && request.method === "GET") {
+    return jsonResponse(configuredSecretListFixture());
   }
   if (request.path === "/console/v1/audit/events" && request.method === "GET") {
     return jsonResponse(auditEventsFixture());

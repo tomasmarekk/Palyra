@@ -2384,6 +2384,88 @@ export interface SecretRevealEnvelope {
   value_utf8?: string;
 }
 
+export interface ConfiguredSecretSourceView {
+  kind: string;
+  fingerprint: string;
+  required: boolean;
+  refresh_policy: string;
+  snapshot_policy: string;
+  description: string;
+  display_name?: string;
+  redaction_label?: string;
+  max_bytes?: number;
+  exec_timeout_ms?: number;
+  trusted_dir_count?: number;
+  inherited_env_count?: number;
+  allow_symlinks?: boolean;
+}
+
+export interface ConfiguredSecretRecord {
+  secret_id: string;
+  component: string;
+  config_path: string;
+  status: string;
+  resolution_scope: string;
+  reload_action: string;
+  snapshot_generation: number;
+  source: ConfiguredSecretSourceView;
+  affected_components: string[];
+  last_resolved_at_unix_ms?: number;
+  last_error_kind?: string;
+  last_error?: string;
+  value_bytes?: number;
+}
+
+export interface ConfiguredSecretListEnvelope {
+  contract: ContractDescriptor;
+  generated_at_unix_ms: number;
+  snapshot_generation: number;
+  secrets: ConfiguredSecretRecord[];
+  page: PageInfo;
+}
+
+export interface ConfiguredSecretEnvelope {
+  contract: ContractDescriptor;
+  generated_at_unix_ms: number;
+  snapshot_generation: number;
+  secret: ConfiguredSecretRecord;
+}
+
+export interface ConfigReloadPlanSummary {
+  hot_safe: number;
+  restart_required: number;
+  blocked_while_runs_active: number;
+  manual_review: number;
+}
+
+export interface ConfigReloadPlanStep {
+  component: string;
+  config_path: string;
+  category: string;
+  reason: string;
+}
+
+export interface ConfigReloadPlanEnvelope {
+  contract: ContractDescriptor;
+  plan_id: string;
+  source_path: string;
+  generated_at_unix_ms: number;
+  active_runs: number;
+  requires_restart: boolean;
+  hot_safe_applicable: boolean;
+  summary: ConfigReloadPlanSummary;
+  steps: ConfigReloadPlanStep[];
+}
+
+export interface ConfigReloadApplyEnvelope {
+  contract: ContractDescriptor;
+  outcome: string;
+  message: string;
+  plan: ConfigReloadPlanEnvelope;
+  applied_steps: ConfigReloadPlanStep[];
+  skipped_steps: ConfigReloadPlanStep[];
+}
+
 export interface PairingCodeRecord {
   code: string;
   channel: string;
@@ -3439,6 +3521,35 @@ export class ConsoleApiClient {
     );
   }
 
+  async planConfigReload(payload: {
+    path?: string;
+  }): Promise<ConfigReloadPlanEnvelope> {
+    return this.request(
+      "/console/v1/config/reload/plan",
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: false },
+    );
+  }
+
+  async applyConfigReload(payload: {
+    path?: string;
+    plan_id?: string;
+    dry_run?: boolean;
+    force?: boolean;
+  }): Promise<ConfigReloadApplyEnvelope> {
+    return this.request(
+      "/console/v1/config/reload/apply",
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+  }
+
   async listSecrets(scope: string): Promise<SecretMetadataList> {
     return this.request(`/console/v1/secrets?scope=${encodeURIComponent(scope)}`);
   }
@@ -3487,6 +3598,16 @@ export class ConsoleApiClient {
         body: JSON.stringify(payload),
       },
       { csrf: true },
+    );
+  }
+
+  async listConfiguredSecrets(): Promise<ConfiguredSecretListEnvelope> {
+    return this.request("/console/v1/secrets/configured");
+  }
+
+  async getConfiguredSecret(secretId: string): Promise<ConfiguredSecretEnvelope> {
+    return this.request(
+      `/console/v1/secrets/configured/detail?secret_id=${encodeURIComponent(secretId)}`,
     );
   }
 

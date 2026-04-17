@@ -314,6 +314,12 @@ export function SupportSection({ app }: SupportSectionProps) {
   const supportBundle = readObject(observability ?? {}, "support_bundle");
   const doctorRecovery = readObject(observability ?? {}, "doctor_recovery");
   const providerAuth = readObject(observability ?? {}, "provider_auth");
+  const configRefHealth = readObject(observability ?? {}, "config_ref_health");
+  const configRefSummary = readObject(configRefHealth ?? {}, "summary");
+  const configRefRecommendations = toStringArray(
+    Array.isArray(configRefHealth?.recommendations) ? configRefHealth.recommendations : [],
+  );
+  const configRefLatestPlan = readObject(configRefHealth ?? {}, "latest_plan");
   const recentFailures = toJsonObjectArray(observability?.recent_failures);
   const latestFailure = recentFailures[0] ?? null;
   const failedJobs = app.supportBundleJobs.filter((job) => readString(job, "state") === "failed");
@@ -322,6 +328,7 @@ export function SupportSection({ app }: SupportSectionProps) {
   );
   const providerAuthState = readString(providerAuth ?? {}, "state") ?? "unknown";
   const recoveryBacklog = readNumber(providerAuth ?? {}, "degraded_profiles") ?? 0;
+  const configRefState = readString(configRefHealth ?? {}, "state") ?? "unknown";
   const latestDoctorRecovery = readObject(doctorRecovery ?? {}, "last_job");
   const latestDoctorRecoveryState = readString(latestDoctorRecovery ?? {}, "state") ?? "unknown";
   const selectedDoctorReport = readObject(app.supportSelectedDoctorJob ?? {}, "report");
@@ -412,6 +419,12 @@ export function SupportSection({ app }: SupportSectionProps) {
           label={t("metric.deploymentPosture")}
           value={readString(deployment, "bind_profile") ?? "unknown"}
           detail={readString(deployment, "mode") ?? t("metric.modeUnavailableLong")}
+        />
+        <WorkspaceMetricCard
+          label="Config ref health"
+          value={readNumber(configRefSummary ?? {}, "blocking_refs") ?? 0}
+          detail={`${readNumber(configRefSummary ?? {}, "warning_refs") ?? 0} warnings Â· ${configRefState}`}
+          tone={configRefState === "ok" ? "success" : "warning"}
         />
       </section>
 
@@ -581,6 +594,62 @@ export function SupportSection({ app }: SupportSectionProps) {
               </ActionButton>
             </ActionCluster>
           </div>
+        </WorkspaceSectionCard>
+      </section>
+
+      <section className="workspace-stack">
+        <WorkspaceSectionCard
+          title="Secret and reload health"
+          description="Keep configured secret-source health, reload blockers, and operator advice close to support actions."
+        >
+          {configRefHealth === null ? (
+            <EmptyState
+              compact
+              title="No secret or reload health published"
+              description="Refresh support after the daemon publishes configured ref health."
+            />
+          ) : (
+            <div className="workspace-stack">
+              <div className="workspace-inline">
+                <WorkspaceStatusChip tone={configRefState === "ok" ? "success" : "warning"}>
+                  {configRefState}
+                </WorkspaceStatusChip>
+                <WorkspaceStatusChip
+                  tone={
+                    (readNumber(configRefSummary ?? {}, "blocking_refs") ?? 0) > 0
+                      ? "warning"
+                      : "default"
+                  }
+                >
+                  {readNumber(configRefSummary ?? {}, "blocking_refs") ?? 0} blocking refs
+                </WorkspaceStatusChip>
+                <WorkspaceStatusChip
+                  tone={
+                    (readNumber(configRefSummary ?? {}, "blocked_while_runs_active_refs") ?? 0) > 0
+                      ? "warning"
+                      : "default"
+                  }
+                >
+                  {readNumber(configRefSummary ?? {}, "blocked_while_runs_active_refs") ?? 0} reload blockers
+                </WorkspaceStatusChip>
+              </div>
+              {configRefRecommendations.length > 0 ? (
+                <InlineNotice title="Recommended next steps" tone="warning">
+                  <ul className="console-compact-list">
+                    {configRefRecommendations.slice(0, 4).map((recommendation) => (
+                      <li key={recommendation}>{recommendation}</li>
+                    ))}
+                  </ul>
+                </InlineNotice>
+              ) : null}
+              {configRefLatestPlan === null ? null : (
+                <PrettyJsonBlock
+                  value={configRefLatestPlan}
+                  revealSensitiveValues={app.revealSensitiveValues}
+                />
+              )}
+            </div>
+          )}
         </WorkspaceSectionCard>
       </section>
 

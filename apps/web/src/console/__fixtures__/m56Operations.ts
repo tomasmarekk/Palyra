@@ -81,6 +81,52 @@ export function secretRevealFixture() {
   };
 }
 
+export function configuredSecretListFixture() {
+  return {
+    contract: controlPlaneContract(),
+    generated_at_unix_ms: 1700000002500,
+    snapshot_generation: 2,
+    secrets: [
+      {
+        secret_id: "model_provider.openai_api_key_secret_ref:fp-1",
+        component: "model_provider",
+        config_path: "model_provider.openai_api_key_secret_ref",
+        status: "healthy",
+        resolution_scope: "startup",
+        reload_action: "hot_safe",
+        snapshot_generation: 2,
+        source: {
+          kind: "vault",
+          fingerprint: "fp-1",
+          required: true,
+          refresh_policy: "startup_only",
+          snapshot_policy: "runtime_snapshot",
+          description: "Vault-backed OpenAI API key",
+          display_name: "OpenAI API key",
+          redaction_label: "OpenAI API key",
+        },
+        affected_components: ["model_provider"],
+        last_resolved_at_unix_ms: 1700000002000,
+        value_bytes: 32,
+      },
+    ],
+    page: {
+      limit: 50,
+      returned: 1,
+      has_more: false,
+    },
+  };
+}
+
+export function configuredSecretDetailFixture() {
+  return {
+    contract: controlPlaneContract(),
+    generated_at_unix_ms: 1700000002500,
+    snapshot_generation: 2,
+    secret: configuredSecretListFixture().secrets[0],
+  };
+}
+
 export function cronJobsFixture() {
   return {
     routines: [

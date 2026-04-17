@@ -47,6 +47,8 @@ type ConfigSectionProps = {
     | "configDiffPreview"
     | "configRecoverBackup"
     | "setConfigRecoverBackup"
+    | "configReloadPlan"
+    | "configReloadResult"
     | "configDeploymentPosture"
     | "diagnosticsSnapshot"
     | "revealSensitiveValues"
@@ -56,6 +58,8 @@ type ConfigSectionProps = {
     | "mutateConfigSurface"
     | "migrateConfigSurface"
     | "recoverConfigSurface"
+    | "planConfigReload"
+    | "applyConfigReload"
   >;
 };
 
@@ -73,6 +77,10 @@ export function ConfigSection({ app }: ConfigSectionProps) {
       )
     : [];
   const providerRegistry = readProviderRegistrySummary(app.diagnosticsSnapshot);
+  const reloadPlanSummary =
+    typeof app.configReloadPlan?.summary === "object" && app.configReloadPlan.summary !== null
+      ? (app.configReloadPlan.summary as JsonObject)
+      : null;
 
   return (
     <main className="workspace-page">
@@ -139,6 +147,12 @@ export function ConfigSection({ app }: ConfigSectionProps) {
           tone={providerRegistry?.defaultChatModelId ? "accent" : "default"}
           value={providerRegistry?.defaultChatModelId ?? "n/a"}
         />
+        <WorkspaceMetricCard
+          detail="Latest reload plan tracks hot-safe, restart-required, blocked, and manual-review categories."
+          label="Reload hot-safe"
+          tone={readNumber(reloadPlanSummary ?? {}, "hot_safe") ? "accent" : "default"}
+          value={readNumber(reloadPlanSummary ?? {}, "hot_safe") ?? 0}
+        />
       </section>
 
       {warnings.length > 0 ? (
@@ -204,6 +218,30 @@ export function ConfigSection({ app }: ConfigSectionProps) {
                       onPress={() => void app.migrateConfigSurface()}
                     >
                       Migrate
+                    </ActionButton>
+                    <ActionButton
+                      isDisabled={app.configBusy}
+                      type="button"
+                      variant="secondary"
+                      onPress={() => void app.planConfigReload()}
+                    >
+                      Plan reload
+                    </ActionButton>
+                    <ActionButton
+                      isDisabled={app.configBusy}
+                      type="button"
+                      variant="secondary"
+                      onPress={() => void app.applyConfigReload(true)}
+                    >
+                      Dry-run reload
+                    </ActionButton>
+                    <ActionButton
+                      isDisabled={app.configBusy}
+                      type="button"
+                      variant="primary"
+                      onPress={() => void app.applyConfigReload(false)}
+                    >
+                      Apply hot-safe
                     </ActionButton>
                   </div>
                 </div>
@@ -310,6 +348,46 @@ export function ConfigSection({ app }: ConfigSectionProps) {
                       </tr>
                     ))}
                   </WorkspaceTable>
+                )}
+              </WorkspaceSectionCard>
+
+              <WorkspaceSectionCard
+                description="The reload planner works on typed config categories instead of a raw text diff."
+                title="Reload plan"
+              >
+                {app.configReloadPlan === null ? (
+                  <WorkspaceEmptyState
+                    compact
+                    description="Generate a reload plan after inspecting or mutating config."
+                    title="No reload plan"
+                  />
+                ) : (
+                  <div className="workspace-stack">
+                    <dl className="workspace-key-value-grid">
+                      <div>
+                        <dt>Plan id</dt>
+                        <dd>{readString(app.configReloadPlan, "plan_id") ?? "n/a"}</dd>
+                      </div>
+                      <div>
+                        <dt>Active runs</dt>
+                        <dd>{readString(app.configReloadPlan, "active_runs") ?? "0"}</dd>
+                      </div>
+                      <div>
+                        <dt>Restart required</dt>
+                        <dd>{readString(app.configReloadPlan, "requires_restart") ?? "false"}</dd>
+                      </div>
+                    </dl>
+                    <PrettyJsonBlock
+                      revealSensitiveValues={app.revealSensitiveValues}
+                      value={app.configReloadPlan}
+                    />
+                    {app.configReloadResult !== null ? (
+                      <PrettyJsonBlock
+                        revealSensitiveValues={app.revealSensitiveValues}
+                        value={app.configReloadResult}
+                      />
+                    ) : null}
+                  </div>
                 )}
               </WorkspaceSectionCard>
             </section>

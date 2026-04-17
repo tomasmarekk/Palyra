@@ -1603,6 +1603,128 @@ describe("ConsoleApiClient", () => {
     );
   });
 
+  it("uses configured ref inventory and reload planning endpoints with the expected verbs and CSRF posture", async () => {
+    const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    const responses = [
+      jsonResponse({
+        principal: "admin:web-console",
+        device_id: "device-1",
+        csrf_token: "csrf-1",
+        issued_at_unix_ms: 100,
+        expires_at_unix_ms: 200,
+      }),
+      jsonResponse({
+        contract: { contract_version: "control-plane.v1" },
+        generated_at_unix_ms: 100,
+        snapshot_generation: 1,
+        page: { limit: 20, returned: 1, has_more: false },
+        secrets: [],
+      }),
+      jsonResponse({
+        contract: { contract_version: "control-plane.v1" },
+        generated_at_unix_ms: 100,
+        snapshot_generation: 1,
+        secret: {
+          secret_id: "model_provider.openai_api_key_secret_ref:fp-1",
+          component: "model_provider",
+          config_path: "model_provider.openai_api_key_secret_ref",
+          status: "healthy",
+          resolution_scope: "startup",
+          reload_action: "blocked_while_runs_active",
+          snapshot_generation: 1,
+          source: {
+            kind: "env",
+            fingerprint: "fp-1",
+            required: true,
+            refresh_policy: "startup_only",
+            snapshot_policy: "runtime_snapshot",
+            description: "PALYRA_MODEL_PROVIDER_OPENAI_API_KEY",
+          },
+          affected_components: ["model_provider"],
+        },
+      }),
+      jsonResponse({
+        contract: { contract_version: "control-plane.v1" },
+        plan_id: "plan-1",
+        source_path: "./palyra.toml",
+        generated_at_unix_ms: 100,
+        active_runs: 0,
+        requires_restart: true,
+        hot_safe_applicable: true,
+        summary: {
+          hot_safe: 1,
+          restart_required: 1,
+          blocked_while_runs_active: 0,
+          manual_review: 0,
+        },
+        steps: [],
+      }),
+      jsonResponse({
+        contract: { contract_version: "control-plane.v1" },
+        outcome: "dry_run",
+        message: "reload dry-run generated a plan without applying any runtime changes",
+        plan: {
+          contract: { contract_version: "control-plane.v1" },
+          plan_id: "plan-1",
+          source_path: "./palyra.toml",
+          generated_at_unix_ms: 100,
+          active_runs: 0,
+          requires_restart: true,
+          hot_safe_applicable: true,
+          summary: {
+            hot_safe: 1,
+            restart_required: 1,
+            blocked_while_runs_active: 0,
+            manual_review: 0,
+          },
+          steps: [],
+        },
+        applied_steps: [],
+        skipped_steps: [],
+      }),
+    ];
+    const fetcher: typeof fetch = (input, init) => {
+      calls.push({ input, init });
+      const response = responses.shift();
+      if (response === undefined) {
+        throw new Error("No response queued for fetch mock.");
+      }
+      return Promise.resolve(response);
+    };
+
+    const client = new ConsoleApiClient("", fetcher);
+    await client.login({
+      admin_token: "token",
+      principal: "admin:web-console",
+      device_id: "device-1",
+      channel: "web",
+    });
+    await client.listConfiguredSecrets();
+    await client.getConfiguredSecret("model_provider.openai_api_key_secret_ref:fp-1");
+    await client.planConfigReload({ path: "./palyra.toml" });
+    await client.applyConfigReload({ path: "./palyra.toml", dry_run: true });
+
+    expect(requestUrl(calls[1]?.input)).toBe("/console/v1/secrets/configured");
+    expect(calls[1]?.init?.method ?? "GET").toBe("GET");
+    expect(new Headers(calls[1]?.init?.headers).get("x-palyra-csrf-token")).toBeNull();
+
+    expect(requestUrl(calls[2]?.input)).toBe(
+      "/console/v1/secrets/configured/detail?secret_id=model_provider.openai_api_key_secret_ref%3Afp-1",
+    );
+    expect(calls[2]?.init?.method ?? "GET").toBe("GET");
+    expect(new Headers(calls[2]?.init?.headers).get("x-palyra-csrf-token")).toBeNull();
+
+    expect(requestUrl(calls[3]?.input)).toBe("/console/v1/config/reload/plan");
+    expect(calls[3]?.init?.method).toBe("POST");
+    expect(new Headers(calls[3]?.init?.headers).get("x-palyra-csrf-token")).toBeNull();
+    expect(requestBody(calls[3]?.init?.body)).toContain('"path":"./palyra.toml"');
+
+    expect(requestUrl(calls[4]?.input)).toBe("/console/v1/config/reload/apply");
+    expect(calls[4]?.init?.method).toBe("POST");
+    expect(new Headers(calls[4]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
+    expect(requestBody(calls[4]?.init?.body)).toContain('"dry_run":true');
+  });
+
   it("lists chat sessions and streams NDJSON responses with CSRF", async () => {
     const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
     const responses = [
