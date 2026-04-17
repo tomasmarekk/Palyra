@@ -1,0 +1,842 @@
+{
+  "contract": {
+    "contract_version": "control-plane.v1"
+  },
+  "catalog_version": "capability-catalog.v2",
+  "diagnostics_sections": [
+    "access",
+    "auth_profiles",
+    "browserd",
+    "canvas_experiments",
+    "contract",
+    "deployment",
+    "execution_backends",
+    "feature_rollouts",
+    "generated_at_unix_ms",
+    "hooks",
+    "learning",
+    "media",
+    "memory",
+    "model_provider",
+    "objectives",
+    "observability",
+    "plugins",
+    "rate_limits",
+    "skills",
+    "webhooks"
+  ],
+  "capabilities": [
+    {
+      "id": "approvals",
+      "domain": "approvals",
+      "dashboard_section": "approvals",
+      "surfaces": [
+        "backend",
+        "dashboard"
+      ],
+      "execution_mode": "direct_ui",
+      "mutation_classes": [
+        "policy"
+      ],
+      "contract_paths": [
+        "/console/v1/approvals",
+        "/console/v1/approvals/{approval_id}/decision"
+      ],
+      "cli_handoff_commands": null
+    },
+    {
+      "id": "audit",
+      "domain": "audit",
+      "dashboard_section": "operations",
+      "surfaces": [
+        "backend",
+        "dashboard"
+      ],
+      "execution_mode": "direct_ui",
+      "mutation_classes": [
+        "audit"
+      ],
+      "contract_paths": [
+        "/console/v1/audit/events"
+      ],
+      "cli_handoff_commands": null
+    },
+    {
+      "id": "auth.health",
+      "domain": "auth",
+      "dashboard_section": "auth",
+      "surfaces": [
+        "backend",
+        "dashboard",
+        "cli"
+      ],
+      "execution_mode": "direct_ui",
+      "mutation_classes": [
+        "provider_auth"
+      ],
+      "contract_paths": [
+        "/console/v1/auth/health"
+      ],
+      "cli_handoff_commands": null
+    },
+    {
+      "id": "auth.openai",
+      "domain": "auth",
+      "dashboard_section": "auth",
+      "surfaces": [
+        "backend",
+        "dashboard"
+      ],
+      "execution_mode": "direct_ui",
+      "mutation_classes": [
+        "provider_auth",
+        "deployment"
+      ],
+      "contract_paths": [
+        "/console/v1/auth/providers/openai",
+        "/console/v1/auth/providers/openai/api-key",
+        "/console/v1/auth/providers/openai/bootstrap",
+        "/console/v1/auth/providers/openai/callback-state",
+        "/console/v1/auth/providers/openai/reconnect",
+        "/console/v1/auth/providers/openai/refresh",
+        "/console/v1/auth/providers/openai/revoke",
+        "/console/v1/auth/providers/openai/default-profile",
+        "/console/v1/auth/providers/anthropic",
+        "/console/v1/auth/providers/anthropic/api-key",
+        "/console/v1/auth/providers/anthropic/revoke",
+        "/console/v1/auth/providers/anthropic/default-profile",
+        "/console/v1/models/test-connection",
+        "/console/v1/models/discover"
+      ],
+      "cli_handoff_commands": null
+    },
+    {
+      "id": "auth.profiles",
+      "domain": "auth",
+      "dashboard_section": "auth",
+      "surfaces": [
+        "backend",
+        "dashboard",
+        "cli"
+      ],
+      "execution_mode": "direct_ui",
+      "mutation_classes": [
+        "provider_auth",
+        "secrets"
+      ],
+      "contract_paths": [
+        "/console/v1/auth/profiles"
+      ],
+      "cli_handoff_commands": null
+    },
+    {
+      "id": "browser.downloads",
+      "domain": "browser",
+      "dashboard_section": "browser",
+      "surfaces": [
+        "backend",
+        "dashboard"
+      ],
+      "execution_mode": "direct_ui",
+      "mutation_classes": [
+        "browser"
+      ],
+      "contract_paths": [
+        "/console/v1/browser/downloads"
+      ],
+      "cli_handoff_commands": null
+    },
+    {
+      "id": "browser.profiles",
+      "domain": "browser",
+      "dashboard_section": "browser",
+      "surfaces": [
+        "backend",
+        "dashboard"
+      ],
+      "execution_mode": "direct_ui",
+      "mutation_classes": [
+        "browser"
+      ],
+      "contract_paths": [
+        "/console/v1/browser/profiles",
+        "/console/v1/browser/profiles/create",
+        "/console/v1/browser/profiles/{profile_id}/rename"
+      ],
+      "cli_handoff_commands": null
+    },
+    {
+      "id": "browser.relay",
+      "domain": "browser",
+      "dashboard_section": "browser",
+      "surfaces": [
+        "backend",
+        "dashboard"
+      ],
+      "execution_mode": "direct_ui",
+      "mutation_classes": [
+        "browser"
+      ],
+      "contract_paths": [
+        "/console/v1/browser/relay/tokens",
+        "/console/v1/browser/relay/actions"
+      ],
+      "cli_handoff_commands": null
+    },
+    {
+      "id": "channel.router",
+      "domain": "channels",
+      "dashboard_section": "channels",
+      "surfaces": [
+        "backend",
+        "dashboard"
+      ],
+      "execution_mode": "direct_ui",
+      "mutation_classes": [
+        "policy"
+      ],
+      "contract_paths": [
+        "/console/v1/channels/router/rules",
+        "/console/v1/channels/router/warnings",
+        "/console/v1/channels/router/preview",
+        "/console/v1/channels/router/pairings"
+      ],
+      "cli_handoff_commands": null
+    },
+    {
+      "id": "channels",
+      "domain": "channels",
+      "dashboard_section": "channels",
+      "surfaces": [
+        "backend",
+        "dashboard"
+      ],
+      "execution_mode": "direct_ui",
+      "mutation_classes": [
+        "deployment"
+      ],
+      "contract_paths": [
+        "/console/v1/channels",
+        "/console/v1/channels/{connector_id}/enabled"
+      ],
+      "cli_handoff_commands": null
+    },
+    {
+      "id": "chat.sessions",
+      "domain": "chat",
+      "dashboard_section": "chat",
+      "surfaces": [
+        "backend",
+        "dashboard"
+      ],
+      "execution_mode": "direct_ui",
+      "mutation_classes": [
+        "none"
+      ],
+      "contract_paths": [
+        "/console/v1/chat/sessions",
+        "/console/v1/chat/runs/{run_id}/status"
+      ],
+      "cli_handoff_commands": null
+    },
+    {
+      "id": "chat.stream",
+      "domain": "chat",
+      "dashboard_section": "chat",
+      "surfaces": [
+        "backend",
+        "dashboard"
+      ],
+      "execution_mode": "direct_ui",
+      "mutation_classes": [
+        "tool_calls"
+      ],
+      "contract_paths": [
+        "/console/v1/chat/sessions/{session_id}/messages/stream"
+      ],
+      "cli_handoff_commands": null
+    },
+    {
+      "id": "config.inspect",
+      "domain": "config",
+      "dashboard_section": "config",
+      "surfaces": [
+        "backend",
+        "dashboard",
+        "cli"
+      ],
+      "execution_mode": "direct_ui",
+      "mutation_classes": [
+        "deployment",
+        "secrets"
+      ],
+      "contract_paths": [
+        "/console/v1/config/inspect",
+        "/console/v1/config/validate"
+      ],
+      "cli_handoff_commands": null
+    },
+    {
+      "id": "config.mutate",
+      "domain": "config",
+      "dashboard_section": "config",
+      "surfaces": [
+        "backend",
+        "dashboard",
+        "cli"
+      ],
+      "execution_mode": "direct_ui",
+      "mutation_classes": [
+        "deployment",
+        "secrets"
+      ],
+      "contract_paths": [
+        "/console/v1/config/mutate",
+        "/console/v1/config/migrate",
+        "/console/v1/config/recover"
+      ],
+      "cli_handoff_commands": null
+    },
+    {
+      "id": "cron",
+      "domain": "cron",
+      "dashboard_section": "cron",
+      "surfaces": [
+        "backend",
+        "dashboard"
+      ],
+      "execution_mode": "direct_ui",
+      "mutation_classes": [
+        "scheduler"
+      ],
+      "contract_paths": [
+        "/console/v1/cron/jobs",
+        "/console/v1/cron/jobs/{job_id}/runs"
+      ],
+      "cli_handoff_commands": null
+    },
+    {
+      "id": "discord.onboarding",
+      "domain": "channels",
+      "dashboard_section": "channels",
+      "surfaces": [
+        "backend",
+        "dashboard",
+        "cli"
+      ],
+      "execution_mode": "direct_ui",
+      "mutation_classes": [
+        "secrets",
+        "deployment"
+      ],
+      "contract_paths": [
+        "/console/v1/channels/discord/onboarding/probe",
+        "/console/v1/channels/discord/onboarding/apply",
+        "/console/v1/channels/{connector_id}/test-send"
+      ],
+      "cli_handoff_commands": null
+    },
+    {
+      "id": "gateway.access",
+      "domain": "deployment",
+      "dashboard_section": "access",
+      "surfaces": [
+        "backend",
+        "dashboard",
+        "desktop",
+        "cli"
+      ],
+      "execution_mode": "direct_ui",
+      "mutation_classes": [
+        "deployment"
+      ],
+      "contract_paths": [
+        "/console/v1/deployment/posture"
+      ],
+      "cli_handoff_commands": null
+    },
+    {
+      "id": "gateway.access.tunnel",
+      "domain": "deployment",
+      "dashboard_section": "access",
+      "surfaces": [
+        "cli",
+        "dashboard"
+      ],
+      "execution_mode": "generated_cli",
+      "mutation_classes": [
+        "deployment"
+      ],
+      "contract_paths": [],
+      "cli_handoff_commands": [
+        "cargo run -p palyra-cli -- tunnel --ssh <user>@<host> --remote-port 7142 --local-port 7142"
+      ]
+    },
+    {
+      "id": "gateway.access.verify_remote",
+      "domain": "deployment",
+      "dashboard_section": "access",
+      "surfaces": [
+        "cli",
+        "dashboard"
+      ],
+      "execution_mode": "generated_cli",
+      "mutation_classes": [
+        "deployment"
+      ],
+      "contract_paths": [],
+      "cli_handoff_commands": [
+        "cargo run -p palyra-cli -- dashboard --verify-remote --json"
+      ]
+    },
+    {
+      "id": "hooks",
+      "domain": "hooks",
+      "dashboard_section": "automation",
+      "surfaces": [
+        "backend",
+        "cli"
+      ],
+      "execution_mode": "direct_ui",
+      "mutation_classes": [
+        "plugins",
+        "audit"
+      ],
+      "contract_paths": [
+        "/console/v1/hooks",
+        "/console/v1/hooks/{hook_id}",
+        "/console/v1/hooks/{hook_id}/check",
+        "/console/v1/hooks/{hook_id}/enable"
+      ],
+      "cli_handoff_commands": [
+        "cargo run -p palyra-cli -- hooks list --json"
+      ]
+    },
+    {
+      "id": "memory",
+      "domain": "memory",
+      "dashboard_section": "memory",
+      "surfaces": [
+        "backend",
+        "dashboard"
+      ],
+      "execution_mode": "direct_ui",
+      "mutation_classes": [
+        "memory"
+      ],
+      "contract_paths": [
+        "/console/v1/memory/status",
+        "/console/v1/memory/search",
+        "/console/v1/memory/recall/preview",
+        "/console/v1/memory/search-all",
+        "/console/v1/memory/workspace/documents",
+        "/console/v1/memory/workspace/document",
+        "/console/v1/memory/workspace/document/move",
+        "/console/v1/memory/workspace/document/delete",
+        "/console/v1/memory/workspace/document/pin",
+        "/console/v1/memory/workspace/document/versions",
+        "/console/v1/memory/workspace/bootstrap",
+        "/console/v1/memory/workspace/search",
+        "/console/v1/memory/purge"
+      ],
+      "cli_handoff_commands": null
+    },
+    {
+      "id": "onboarding.posture",
+      "domain": "onboarding",
+      "dashboard_section": "access",
+      "surfaces": [
+        "backend",
+        "dashboard",
+        "desktop",
+        "cli"
+      ],
+      "execution_mode": "direct_ui",
+      "mutation_classes": [
+        "deployment",
+        "provider_auth",
+        "channels"
+      ],
+      "contract_paths": [
+        "/console/v1/onboarding/posture"
+      ],
+      "cli_handoff_commands": null
+    },
+    {
+      "id": "pairing",
+      "domain": "pairing",
+      "dashboard_section": "access",
+      "surfaces": [
+        "backend",
+        "dashboard"
+      ],
+      "execution_mode": "direct_ui",
+      "mutation_classes": [
+        "channels",
+        "approvals"
+      ],
+      "contract_paths": [
+        "/console/v1/pairing",
+        "/console/v1/pairing/codes"
+      ],
+      "cli_handoff_commands": null
+    },
+    {
+      "id": "plugins",
+      "domain": "plugins",
+      "dashboard_section": "extensions",
+      "surfaces": [
+        "backend",
+        "cli"
+      ],
+      "execution_mode": "direct_ui",
+      "mutation_classes": [
+        "skills",
+        "sandbox"
+      ],
+      "contract_paths": [
+        "/console/v1/plugins",
+        "/console/v1/plugins/{plugin_id}",
+        "/console/v1/plugins/{plugin_id}/check",
+        "/console/v1/plugins/{plugin_id}/enable"
+      ],
+      "cli_handoff_commands": [
+        "cargo run -p palyra-cli -- plugins list --json"
+      ]
+    },
+    {
+      "id": "policy.explain",
+      "domain": "policy",
+      "dashboard_section": "operations",
+      "surfaces": [
+        "backend",
+        "internal"
+      ],
+      "execution_mode": "internal",
+      "mutation_classes": [
+        "policy"
+      ],
+      "contract_paths": [
+        "/admin/v1/policy/explain"
+      ],
+      "cli_handoff_commands": null
+    },
+    {
+      "id": "protocol.contracts",
+      "domain": "protocol",
+      "dashboard_section": "operations",
+      "surfaces": [
+        "cli",
+        "dashboard"
+      ],
+      "execution_mode": "generated_cli",
+      "mutation_classes": [
+        "protocol"
+      ],
+      "contract_paths": [],
+      "cli_handoff_commands": [
+        "bash scripts/protocol/check-generated-stubs.sh",
+        "pwsh scripts/protocol/check-generated-stubs.ps1"
+      ]
+    },
+    {
+      "id": "runtime.doctor",
+      "domain": "runtime",
+      "dashboard_section": "operations",
+      "surfaces": [
+        "cli",
+        "dashboard"
+      ],
+      "execution_mode": "generated_cli",
+      "mutation_classes": [
+        "support",
+        "deployment"
+      ],
+      "contract_paths": [],
+      "cli_handoff_commands": [
+        "cargo run -p palyra-cli -- doctor --json"
+      ]
+    },
+    {
+      "id": "runtime.health",
+      "domain": "runtime",
+      "dashboard_section": "operations",
+      "surfaces": [
+        "backend",
+        "dashboard",
+        "desktop"
+      ],
+      "execution_mode": "direct_ui",
+      "mutation_classes": [
+        "deployment"
+      ],
+      "contract_paths": [
+        "/console/v1/diagnostics",
+        "/console/v1/deployment/posture"
+      ],
+      "cli_handoff_commands": null
+    },
+    {
+      "id": "secrets",
+      "domain": "secrets",
+      "dashboard_section": "config",
+      "surfaces": [
+        "backend",
+        "dashboard",
+        "cli"
+      ],
+      "execution_mode": "direct_ui",
+      "mutation_classes": [
+        "secrets"
+      ],
+      "contract_paths": [
+        "/console/v1/secrets",
+        "/console/v1/secrets/metadata",
+        "/console/v1/secrets/reveal",
+        "/console/v1/secrets/delete"
+      ],
+      "cli_handoff_commands": null
+    },
+    {
+      "id": "skills",
+      "domain": "skills",
+      "dashboard_section": "skills",
+      "surfaces": [
+        "backend",
+        "dashboard",
+        "cli"
+      ],
+      "execution_mode": "direct_ui",
+      "mutation_classes": [
+        "skills"
+      ],
+      "contract_paths": [
+        "/console/v1/skills",
+        "/console/v1/skills/{skill_id}/audit"
+      ],
+      "cli_handoff_commands": null
+    },
+    {
+      "id": "support.bundle",
+      "domain": "support",
+      "dashboard_section": "support",
+      "surfaces": [
+        "backend",
+        "dashboard",
+        "desktop",
+        "cli"
+      ],
+      "execution_mode": "direct_ui",
+      "mutation_classes": [
+        "support"
+      ],
+      "contract_paths": [
+        "/console/v1/support-bundle/jobs"
+      ],
+      "cli_handoff_commands": null
+    },
+    {
+      "id": "webhooks",
+      "domain": "webhooks",
+      "dashboard_section": "integrations",
+      "surfaces": [
+        "backend",
+        "cli"
+      ],
+      "execution_mode": "direct_ui",
+      "mutation_classes": [
+        "secrets"
+      ],
+      "contract_paths": [
+        "/console/v1/webhooks",
+        "/console/v1/webhooks/{integration_id}",
+        "/console/v1/webhooks/{integration_id}/enabled",
+        "/console/v1/webhooks/{integration_id}/test"
+      ],
+      "cli_handoff_commands": [
+        "cargo run -p palyra-cli -- webhooks list --json"
+      ]
+    }
+  ],
+  "migration_notes": [
+    {
+      "id": "m52-page-meta",
+      "message": "M52 adds typed contract/page/error metadata while preserving legacy response keys for existing dashboard consumers."
+    },
+    {
+      "id": "m52-openai-contract",
+      "message": "OpenAI provider auth endpoints publish the control-plane contract in M52; interactive OAuth bootstrap/callback UX is completed in M54."
+    },
+    {
+      "id": "m56-capability-exposure",
+      "message": "M56 expands capability catalog entries with dashboard section ownership and CLI handoff metadata so the dashboard can surface direct actions, read-only handoffs, and internal-only capabilities explicitly."
+    }
+  ],
+  "feature_rollouts": {
+    "dynamic_tool_builder": {
+      "enabled": false,
+      "source": "default",
+      "config_path": "feature_rollouts.dynamic_tool_builder",
+      "env_var": "PALYRA_EXPERIMENTAL_DYNAMIC_TOOL_BUILDER"
+    },
+    "execution_backend_remote_node": {
+      "enabled": false,
+      "source": "default",
+      "config_path": "feature_rollouts.execution_backend_remote_node",
+      "env_var": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_REMOTE_NODE"
+    },
+    "execution_backend_ssh_tunnel": {
+      "enabled": false,
+      "source": "default",
+      "config_path": "feature_rollouts.execution_backend_ssh_tunnel",
+      "env_var": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_SSH_TUNNEL"
+    }
+  },
+  "execution_backend_preferences": [
+    "automatic",
+    "local_sandbox",
+    "desktop_node",
+    "ssh_tunnel"
+  ],
+  "execution_backends": [
+    {
+      "backend_id": "desktop_node",
+      "label": "Desktop node",
+      "state": "disabled",
+      "selectable": false,
+      "selected_by_default": false,
+      "description": "Hand work off to a paired first-party desktop node when a healthy node is available.",
+      "operator_summary": "Preview backend is disabled. Set PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_REMOTE_NODE=1 and keep at least one paired desktop node healthy before selecting it.",
+      "executor_label": null,
+      "rollout_flag": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_REMOTE_NODE",
+      "rollout_source": "default",
+      "rollout_enabled": false,
+      "capabilities": [
+        "paired_desktop_capabilities"
+      ],
+      "tradeoffs": [
+        "Supports first-party desktop capabilities and local mediation flows",
+        "Depends on node heartbeat, pairing trust, and explicit rollout opt-in"
+      ],
+      "active_node_count": 0,
+      "total_node_count": 0
+    },
+    {
+      "backend_id": "local_sandbox",
+      "label": "Local sandbox",
+      "state": "available",
+      "selectable": true,
+      "selected_by_default": true,
+      "description": "Run work on the daemon host and keep sandbox/process-runner guardrails local.",
+      "operator_summary": "Process runner is disabled by runtime policy; local daemon-host execution remains the conservative default. Tier-C backend 'windows_job_object', runtime_network_isolation=false, host_allowlists=false.",
+      "executor_label": "sandbox_tier_b",
+      "rollout_flag": null,
+      "rollout_source": null,
+      "rollout_enabled": true,
+      "capabilities": [
+        "daemon_host_execution",
+        "workspace_patch"
+      ],
+      "tradeoffs": [
+        "Most conservative default posture",
+        "Cannot satisfy first-party desktop-native capability requests by itself"
+      ],
+      "active_node_count": 0,
+      "total_node_count": 0
+    },
+    {
+      "backend_id": "ssh_tunnel",
+      "label": "SSH tunnel",
+      "state": "disabled",
+      "selectable": false,
+      "selected_by_default": false,
+      "description": "Use an operator-established SSH tunnel for remote control-plane access and remote operator workflows.",
+      "operator_summary": "Preview backend is disabled. Set PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_SSH_TUNNEL=1 before advertising SSH tunnel workflows.",
+      "executor_label": null,
+      "rollout_flag": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_SSH_TUNNEL",
+      "rollout_source": "default",
+      "rollout_enabled": false,
+      "capabilities": [
+        "verified_remote_dashboard_access",
+        "operator_handoff"
+      ],
+      "tradeoffs": [
+        "Useful for explicit remote operator access and controlled handoff",
+        "Requires manual tunnel setup and does not replace sandbox or node trust boundaries"
+      ],
+      "active_node_count": 0,
+      "total_node_count": 0
+    }
+  ],
+  "compat_routes": [
+    {
+      "path": "/v1/models",
+      "method": "GET",
+      "registered": true
+    },
+    {
+      "path": "/v1/chat/completions",
+      "method": "POST",
+      "registered": true
+    },
+    {
+      "path": "/v1/responses",
+      "method": "POST",
+      "registered": true
+    }
+  ],
+  "cli_families": [
+    "acp",
+    "agent",
+    "agents",
+    "approvals",
+    "auth",
+    "backup",
+    "browser",
+    "channels",
+    "completion",
+    "config",
+    "configure",
+    "cron",
+    "dashboard",
+    "devices",
+    "docs",
+    "doctor",
+    "gateway",
+    "health",
+    "hooks",
+    "logs",
+    "mcp",
+    "memory",
+    "message",
+    "models",
+    "node",
+    "nodes",
+    "objectives",
+    "onboarding",
+    "pairing",
+    "palyra",
+    "patch",
+    "plugins",
+    "policy",
+    "profile",
+    "protocol",
+    "reset",
+    "routines",
+    "sandbox",
+    "secrets",
+    "security",
+    "sessions",
+    "setup",
+    "skills",
+    "status",
+    "support-bundle",
+    "system",
+    "tui",
+    "tunnel",
+    "uninstall",
+    "update",
+    "version",
+    "webhooks"
+  ]
+}
