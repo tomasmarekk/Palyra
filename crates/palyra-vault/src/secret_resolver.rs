@@ -75,10 +75,10 @@ impl SecretResolution {
             None => Err(SecretResolveError {
                 kind: SecretResolveErrorKind::Missing,
                 message: "secret value is not present in the current snapshot".to_owned(),
-                metadata: SecretResolutionMetadata {
+                metadata: Box::new(SecretResolutionMetadata {
                     status: SecretResolutionStatus::Missing,
                     ..metadata
-                },
+                }),
             }),
         }
     }
@@ -89,31 +89,31 @@ impl SecretResolution {
             return Err(SecretResolveError {
                 kind: SecretResolveErrorKind::Missing,
                 message: "secret value is not present in the current snapshot".to_owned(),
-                metadata: SecretResolutionMetadata {
+                metadata: Box::new(SecretResolutionMetadata {
                     status: SecretResolutionStatus::Missing,
                     ..metadata
-                },
+                }),
             });
         };
         let decoded =
             String::from_utf8(value.as_ref().to_vec()).map_err(|error| SecretResolveError {
                 kind: SecretResolveErrorKind::DecodeFailed,
                 message: format!("{context} must be valid UTF-8: {error}"),
-                metadata: SecretResolutionMetadata {
+                metadata: Box::new(SecretResolutionMetadata {
                     status: SecretResolutionStatus::Failed,
                     value_bytes: Some(value.as_ref().len()),
                     ..metadata.clone()
-                },
+                }),
             })?;
         if decoded.trim().is_empty() {
             return Err(SecretResolveError {
                 kind: SecretResolveErrorKind::Missing,
                 message: format!("{context} resolved to an empty value"),
-                metadata: SecretResolutionMetadata {
+                metadata: Box::new(SecretResolutionMetadata {
                     status: SecretResolutionStatus::Missing,
                     value_bytes: Some(0),
                     ..metadata
-                },
+                }),
             });
         }
         Ok(decoded)
@@ -124,7 +124,7 @@ impl SecretResolution {
 pub struct SecretResolveError {
     pub kind: SecretResolveErrorKind,
     pub message: String,
-    pub metadata: SecretResolutionMetadata,
+    pub metadata: Box<SecretResolutionMetadata>,
 }
 
 impl std::fmt::Display for SecretResolveError {
@@ -508,7 +508,7 @@ impl<'a> SecretResolver<'a> {
         SecretResolveError {
             kind,
             message: message.into(),
-            metadata: self.metadata(secret_ref, status, None),
+            metadata: Box::new(self.metadata(secret_ref, status, None)),
         }
     }
 

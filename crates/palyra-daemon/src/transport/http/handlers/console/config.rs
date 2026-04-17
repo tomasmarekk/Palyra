@@ -179,7 +179,8 @@ pub(crate) async fn console_config_reload_plan_handler(
 ) -> Result<Json<control_plane::ConfigReloadPlanEnvelope>, Response> {
     let session = authorize_console_session(&state, &headers, false)?;
     let current = state.loaded_config.lock().unwrap_or_else(|error| error.into_inner()).clone();
-    let source_path = validate_requested_reload_path(payload.path.as_deref(), &current)?;
+    let source_path = validate_requested_reload_path(payload.path.as_deref(), &current)
+        .map_err(|response| *response)?;
     let candidate = crate::config::load_config().map_err(|error| {
         runtime_status_response(tonic::Status::failed_precondition(format!(
             "failed to load candidate config for reload planning: {error}"
@@ -212,7 +213,8 @@ pub(crate) async fn console_config_reload_apply_handler(
 ) -> Result<Json<control_plane::ConfigReloadApplyEnvelope>, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
     let current = state.loaded_config.lock().unwrap_or_else(|error| error.into_inner()).clone();
-    let source_path = validate_requested_reload_path(payload.path.as_deref(), &current)?;
+    let source_path = validate_requested_reload_path(payload.path.as_deref(), &current)
+        .map_err(|response| *response)?;
     let candidate = crate::config::load_config().map_err(|error| {
         runtime_status_response(tonic::Status::failed_precondition(format!(
             "failed to load candidate config for reload apply: {error}"
@@ -341,7 +343,7 @@ pub(crate) async fn console_config_reload_apply_handler(
 fn validate_requested_reload_path(
     requested_path: Option<&str>,
     current: &crate::config::LoadedConfig,
-) -> Result<String, Response> {
+) -> Result<String, Box<Response>> {
     let active_path = current
         .source
         .split(" +env(")
@@ -352,14 +354,14 @@ fn validate_requested_reload_path(
     if let Some(requested_path) = requested_path.map(str::trim).filter(|value| !value.is_empty()) {
         let resolved_requested = resolve_console_config_path(Some(requested_path), false)?
             .ok_or_else(|| {
-                runtime_status_response(tonic::Status::failed_precondition(
+                Box::new(runtime_status_response(tonic::Status::failed_precondition(
                     "config path could not be resolved for reload planning",
-                ))
+                )))
             })?;
         if !resolved_requested.eq_ignore_ascii_case(active_path.as_str()) {
-            return Err(runtime_status_response(tonic::Status::failed_precondition(
+            return Err(Box::new(runtime_status_response(tonic::Status::failed_precondition(
                 "reload planning currently supports only the active daemon config path",
-            )));
+            ))));
         }
     }
     Ok(active_path)
