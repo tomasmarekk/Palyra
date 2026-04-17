@@ -630,8 +630,7 @@ export function SupportSection({ app }: SupportSectionProps) {
                       : "default"
                   }
                 >
-                  {readNumber(configRefSummary ?? {}, "blocked_while_runs_active_refs") ?? 0} reload
-                  blockers
+                  {`${readNumber(configRefSummary ?? {}, "blocked_while_runs_active_refs") ?? 0} reload blockers`}
                 </WorkspaceStatusChip>
               </div>
               {configRefRecommendations.length > 0 ? (
