@@ -428,7 +428,9 @@ describe("M56 config, access, and support surfaces", () => {
     expect(screen.getByText("Secret and reload health")).toBeInTheDocument();
     expect(screen.getAllByText("Bundle reliability").length).toBeGreaterThan(0);
     expect(screen.getByText("Triage playbook")).toBeInTheDocument();
-    expect(screen.getByText("Wait for active runs to finish, then rerun the reload plan or apply step.")).toBeInTheDocument();
+    expect(
+      screen.getByText("Wait for active runs to finish, then rerun the reload plan or apply step."),
+    ).toBeInTheDocument();
     expect(
       screen.getByText(
         "docs-codebase/docs-tree/web_console_operator_dashboard/console_sections_and_navigation/support_recovery.md",

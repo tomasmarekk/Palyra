@@ -29,7 +29,9 @@ describe("OperationsSection", () => {
               config_ref_health: {
                 state: "degraded",
                 summary: { blocking_refs: 1, warning_refs: 1 },
-                recommendations: ["Restart the daemon to refresh this config ref in the running runtime."],
+                recommendations: [
+                  "Restart the daemon to refresh this config ref in the running runtime.",
+                ],
                 items: [
                   {
                     ref_id: "admin.auth_token_secret_ref:fp-1",
@@ -60,9 +62,8 @@ describe("OperationsSection", () => {
     expect(screen.getByText("0 active alerts")).toBeInTheDocument();
     expect(screen.getAllByText("Config ref health").length).toBeGreaterThan(0);
     expect(
-      screen.getAllByText(
-        "Restart the daemon to refresh this config ref in the running runtime.",
-      ).length,
+      screen.getAllByText("Restart the daemon to refresh this config ref in the running runtime.")
+        .length,
     ).toBeGreaterThan(0);
   });
 });

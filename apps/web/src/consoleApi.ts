@@ -3521,9 +3521,7 @@ export class ConsoleApiClient {
     );
   }
 
-  async planConfigReload(payload: {
-    path?: string;
-  }): Promise<ConfigReloadPlanEnvelope> {
+  async planConfigReload(payload: { path?: string }): Promise<ConfigReloadPlanEnvelope> {
     return this.request(
       "/console/v1/config/reload/plan",
       {

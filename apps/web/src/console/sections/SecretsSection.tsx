@@ -364,19 +364,17 @@ export function SecretsSection({ app }: SecretsSectionProps) {
                 </div>
                 <div>
                   <dt>Reload</dt>
-                  <dd>{readString(app.configuredSecretDetail, "reload_action") ?? "manual_review"}</dd>
+                  <dd>
+                    {readString(app.configuredSecretDetail, "reload_action") ?? "manual_review"}
+                  </dd>
                 </div>
                 <div>
                   <dt>Source kind</dt>
-                  <dd>
-                    {readString(configuredSecretSource, "kind") ?? "n/a"}
-                  </dd>
+                  <dd>{readString(configuredSecretSource, "kind") ?? "n/a"}</dd>
                 </div>
                 <div>
                   <dt>Fingerprint</dt>
-                  <dd>
-                    {readString(configuredSecretSource, "fingerprint") ?? "n/a"}
-                  </dd>
+                  <dd>{readString(configuredSecretSource, "fingerprint") ?? "n/a"}</dd>
                 </div>
                 <div>
                   <dt>Last error</dt>
