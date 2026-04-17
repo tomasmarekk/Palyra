@@ -631,6 +631,16 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    fn oversized_exec_command() -> Vec<String> {
+        vec!["cmd.exe".to_owned(), "/C".to_owned(), "echo 12345".to_owned()]
+    }
+
+    #[cfg(unix)]
+    fn oversized_exec_command() -> Vec<String> {
+        vec!["sh".to_owned(), "-c".to_owned(), "printf 12345".to_owned()]
+    }
+
     #[test]
     fn resolves_env_source() {
         let key = format!("PALYRA_SECRET_REF_TEST_{}", Ulid::new());
@@ -743,12 +753,12 @@ mod tests {
         let temp = TempDir::new().expect("temp dir should initialize");
         let resolver = SecretResolver::with_working_dir(None, temp.path());
         let mut reference = make_ref(SecretSource::Exec {
-            command: vec!["git".to_owned(), "--version".to_owned()],
+            command: oversized_exec_command(),
             inherited_env: vec![],
             cwd: None,
         });
         reference.max_bytes = Some(4);
-        reference.exec_timeout_ms = Some(500);
+        reference.exec_timeout_ms = Some(2_000);
         let error = resolver.resolve(&reference).expect_err("oversized exec stdout should fail");
         assert_eq!(error.kind, SecretResolveErrorKind::TooLarge);
     }
