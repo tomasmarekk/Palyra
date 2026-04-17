@@ -110,7 +110,24 @@ fn build_current_state_inventory_snapshot(
         .get("execution_backends")
         .and_then(Value::as_array)
         .context("diagnostics should expose execution_backends array")?
-        .clone();
+        .iter()
+        .map(|entry| {
+            json!({
+                "backend_id": entry.get("backend_id").cloned().unwrap_or(Value::Null),
+                "label": entry.get("label").cloned().unwrap_or(Value::Null),
+                "state": entry.get("state").cloned().unwrap_or(Value::Null),
+                "selectable": entry.get("selectable").cloned().unwrap_or(Value::Null),
+                "selected_by_default": entry.get("selected_by_default").cloned().unwrap_or(Value::Null),
+                "description": entry.get("description").cloned().unwrap_or(Value::Null),
+                "rollout_flag": entry.get("rollout_flag").cloned().unwrap_or(Value::Null),
+                "rollout_enabled": entry.get("rollout_enabled").cloned().unwrap_or(Value::Null),
+                "capabilities": entry.get("capabilities").cloned().unwrap_or(Value::Null),
+                "tradeoffs": entry.get("tradeoffs").cloned().unwrap_or(Value::Null),
+                "active_node_count": entry.get("active_node_count").cloned().unwrap_or(Value::Null),
+                "total_node_count": entry.get("total_node_count").cloned().unwrap_or(Value::Null),
+            })
+        })
+        .collect::<Vec<_>>();
     execution_backends.sort_by(|left, right| {
         left.get("backend_id")
             .and_then(Value::as_str)

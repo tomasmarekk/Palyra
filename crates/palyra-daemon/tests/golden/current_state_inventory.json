@@ -706,10 +706,7 @@
       "selectable": false,
       "selected_by_default": false,
       "description": "Hand work off to a paired first-party desktop node when a healthy node is available.",
-      "operator_summary": "Preview backend is disabled. Set PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_REMOTE_NODE=1 and keep at least one paired desktop node healthy before selecting it.",
-      "executor_label": null,
       "rollout_flag": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_REMOTE_NODE",
-      "rollout_source": "default",
       "rollout_enabled": false,
       "capabilities": [
         "paired_desktop_capabilities"
@@ -728,10 +725,7 @@
       "selectable": true,
       "selected_by_default": true,
       "description": "Run work on the daemon host and keep sandbox/process-runner guardrails local.",
-      "operator_summary": "Process runner is disabled by runtime policy; local daemon-host execution remains the conservative default. Tier-C backend 'windows_job_object', runtime_network_isolation=false, host_allowlists=false.",
-      "executor_label": "sandbox_tier_b",
       "rollout_flag": null,
-      "rollout_source": null,
       "rollout_enabled": true,
       "capabilities": [
         "daemon_host_execution",
@@ -751,10 +745,7 @@
       "selectable": false,
       "selected_by_default": false,
       "description": "Use an operator-established SSH tunnel for remote control-plane access and remote operator workflows.",
-      "operator_summary": "Preview backend is disabled. Set PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_SSH_TUNNEL=1 before advertising SSH tunnel workflows.",
-      "executor_label": null,
       "rollout_flag": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_SSH_TUNNEL",
-      "rollout_source": "default",
       "rollout_enabled": false,
       "capabilities": [
         "verified_remote_dashboard_access",
