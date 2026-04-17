@@ -630,17 +630,14 @@ mod tests {
             display_name: Some("Test secret".to_owned()),
         }
     }
-
     #[cfg(windows)]
     fn oversized_exec_command() -> Vec<String> {
         vec!["cmd.exe".to_owned(), "/C".to_owned(), "echo 12345".to_owned()]
     }
-
     #[cfg(unix)]
     fn oversized_exec_command() -> Vec<String> {
         vec!["sh".to_owned(), "-c".to_owned(), "printf 12345".to_owned()]
     }
-
     #[test]
     fn resolves_env_source() {
         let key = format!("PALYRA_SECRET_REF_TEST_{}", Ulid::new());
@@ -660,7 +657,6 @@ mod tests {
         );
         std::env::remove_var(key.as_str());
     }
-
     #[test]
     fn resolves_vault_source() {
         let temp = TempDir::new().expect("temp dir should initialize");
@@ -682,7 +678,6 @@ mod tests {
             "vault-secret"
         );
     }
-
     #[test]
     fn file_source_blocks_paths_outside_trusted_dirs() {
         let temp = TempDir::new().expect("temp dir should initialize");
@@ -703,7 +698,6 @@ mod tests {
             .expect_err("file-backed secret outside trusted dir must be blocked");
         assert_eq!(error.kind, SecretResolveErrorKind::PolicyBlocked);
     }
-
     #[cfg(unix)]
     #[test]
     fn file_source_blocks_symlink_when_symlinks_disabled() {
@@ -727,7 +721,6 @@ mod tests {
             .expect_err("symlinked secret should be blocked");
         assert_eq!(error.kind, SecretResolveErrorKind::PolicyBlocked);
     }
-
     #[test]
     fn exec_source_uses_argv_without_shell_interpolation() {
         let temp = TempDir::new().expect("temp dir should initialize");
@@ -747,7 +740,6 @@ mod tests {
                 | SecretResolveErrorKind::PolicyBlocked
         ));
     }
-
     #[test]
     fn exec_source_respects_max_bytes_limit() {
         let temp = TempDir::new().expect("temp dir should initialize");
@@ -762,7 +754,6 @@ mod tests {
         let error = resolver.resolve(&reference).expect_err("oversized exec stdout should fail");
         assert_eq!(error.kind, SecretResolveErrorKind::TooLarge);
     }
-
     #[cfg(windows)]
     #[test]
     fn exec_source_times_out() {
@@ -782,7 +773,6 @@ mod tests {
         let error = resolver.resolve(&reference).expect_err("slow exec should time out");
         assert_eq!(error.kind, SecretResolveErrorKind::Timeout);
     }
-
     #[cfg(unix)]
     #[test]
     fn exec_source_times_out() {
