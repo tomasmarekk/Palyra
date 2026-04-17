@@ -561,6 +561,14 @@ fn normalize_hook_identifier(raw: &str, field_name: &'static str) -> Result<Stri
     Ok(trimmed)
 }
 
+fn normalize_hook_operator_metadata(mut operator: HookOperatorMetadata) -> HookOperatorMetadata {
+    operator.display_name = operator.display_name.and_then(trim_to_option);
+    operator.notes = operator.notes.and_then(trim_to_option);
+    operator.owner_principal = operator.owner_principal.and_then(trim_to_option);
+    operator.updated_by = operator.updated_by.and_then(trim_to_option);
+    operator
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -581,12 +589,4 @@ mod tests {
         assert_eq!(index.updated_at_unix_ms, 0);
         assert!(index.entries.is_empty());
     }
-}
-
-fn normalize_hook_operator_metadata(mut operator: HookOperatorMetadata) -> HookOperatorMetadata {
-    operator.display_name = operator.display_name.and_then(trim_to_option);
-    operator.notes = operator.notes.and_then(trim_to_option);
-    operator.owner_principal = operator.owner_principal.and_then(trim_to_option);
-    operator.updated_by = operator.updated_by.and_then(trim_to_option);
-    operator
 }

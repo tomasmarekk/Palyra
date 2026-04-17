@@ -119,9 +119,9 @@ fn build_current_state_inventory_snapshot(
 
     let cli_families = load_cli_families()?;
     let compat_routes = vec![
-        compat_route_probe(&harness, Method::GET, "/v1/models")?,
-        compat_route_probe(&harness, Method::POST, "/v1/chat/completions")?,
-        compat_route_probe(&harness, Method::POST, "/v1/responses")?,
+        compat_route_probe(harness, Method::GET, "/v1/models")?,
+        compat_route_probe(harness, Method::POST, "/v1/chat/completions")?,
+        compat_route_probe(harness, Method::POST, "/v1/responses")?,
     ];
 
     Ok(json!({

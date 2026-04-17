@@ -196,7 +196,7 @@ pub struct CronConfig {
     pub timezone: CronTimezoneMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FeatureRolloutsConfig {
     pub dynamic_tool_builder: FeatureRolloutSetting,
     pub execution_backend_remote_node: FeatureRolloutSetting,
@@ -418,16 +418,6 @@ impl Default for CronConfig {
 impl Default for OrchestratorConfig {
     fn default() -> Self {
         Self { runloop_v1_enabled: DEFAULT_ORCHESTRATOR_RUNLOOP_V1_ENABLED }
-    }
-}
-
-impl Default for FeatureRolloutsConfig {
-    fn default() -> Self {
-        Self {
-            dynamic_tool_builder: FeatureRolloutSetting::default(),
-            execution_backend_remote_node: FeatureRolloutSetting::default(),
-            execution_backend_ssh_tunnel: FeatureRolloutSetting::default(),
-        }
     }
 }
 

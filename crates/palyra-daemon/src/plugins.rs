@@ -243,30 +243,6 @@ fn normalize_registry_identifier(raw: &str, field_name: &'static str) -> Result<
     Ok(trimmed)
 }
 
-#[cfg(test)]
-mod tests {
-    use std::fs;
-
-    use tempfile::tempdir;
-
-    use super::{
-        load_plugin_bindings_index, plugin_bindings_index_path, PLUGIN_BINDINGS_LAYOUT_VERSION,
-    };
-
-    #[test]
-    fn load_plugin_bindings_index_migrates_legacy_metadata() {
-        let tempdir = tempdir().expect("temporary directory should be created");
-        let index_path = plugin_bindings_index_path(tempdir.path());
-        fs::write(index_path, br#"{"entries":[]}"#)
-            .expect("legacy plugin bindings index should be written");
-        let index = load_plugin_bindings_index(tempdir.path())
-            .expect("legacy plugin bindings index should load");
-        assert_eq!(index.schema_version, PLUGIN_BINDINGS_LAYOUT_VERSION);
-        assert_eq!(index.updated_at_unix_ms, 0);
-        assert!(index.entries.is_empty());
-    }
-}
-
 fn normalize_optional_text(value: Option<String>) -> Option<String> {
     value.and_then(trim_to_option)
 }
@@ -432,5 +408,29 @@ pub(crate) fn plugin_capability_profile_from_manifest(
             .collect(),
         storage_prefixes: manifest.capabilities.filesystem.write_roots.clone(),
         channels: manifest.capabilities.node_capabilities.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::{
+        load_plugin_bindings_index, plugin_bindings_index_path, PLUGIN_BINDINGS_LAYOUT_VERSION,
+    };
+
+    #[test]
+    fn load_plugin_bindings_index_migrates_legacy_metadata() {
+        let tempdir = tempdir().expect("temporary directory should be created");
+        let index_path = plugin_bindings_index_path(tempdir.path());
+        fs::write(index_path, br#"{"entries":[]}"#)
+            .expect("legacy plugin bindings index should be written");
+        let index = load_plugin_bindings_index(tempdir.path())
+            .expect("legacy plugin bindings index should load");
+        assert_eq!(index.schema_version, PLUGIN_BINDINGS_LAYOUT_VERSION);
+        assert_eq!(index.updated_at_unix_ms, 0);
+        assert!(index.entries.is_empty());
     }
 }

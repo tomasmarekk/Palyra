@@ -829,31 +829,6 @@ fn save_skill_builder_candidate_index(
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use std::fs;
-
-    use tempfile::tempdir;
-
-    use super::{load_skill_builder_candidate_index, skill_builder_candidates_index_path};
-    use crate::SKILL_BUILDER_CANDIDATE_LAYOUT_VERSION;
-
-    #[test]
-    fn load_skill_builder_candidate_index_migrates_legacy_metadata() {
-        let tempdir = tempdir().expect("temporary directory should be created");
-        let index_path = skill_builder_candidates_index_path(tempdir.path());
-        let parent = index_path.parent().expect("candidate index path should have a parent");
-        fs::create_dir_all(parent).expect("candidate index parent should be created");
-        fs::write(index_path, br#"{"entries":[]}"#)
-            .expect("legacy skill builder candidate index should be written");
-        let index = load_skill_builder_candidate_index(tempdir.path())
-            .expect("legacy skill builder candidate index should load");
-        assert_eq!(index.schema_version, SKILL_BUILDER_CANDIDATE_LAYOUT_VERSION);
-        assert_eq!(index.updated_at_unix_ms, 0);
-        assert!(index.entries.is_empty());
-    }
-}
-
 fn skill_builder_candidates_root(skills_root: &FsPath) -> PathBuf {
     skills_root.join("builder-candidates")
 }
@@ -1182,5 +1157,30 @@ fn builder_source_summary(source: &BuilderSource) -> String {
     match source {
         BuilderSource::Procedure(candidate) => candidate.summary.clone(),
         BuilderSource::Prompt { prompt, .. } => prompt.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::{load_skill_builder_candidate_index, skill_builder_candidates_index_path};
+    use crate::SKILL_BUILDER_CANDIDATE_LAYOUT_VERSION;
+
+    #[test]
+    fn load_skill_builder_candidate_index_migrates_legacy_metadata() {
+        let tempdir = tempdir().expect("temporary directory should be created");
+        let index_path = skill_builder_candidates_index_path(tempdir.path());
+        let parent = index_path.parent().expect("candidate index path should have a parent");
+        fs::create_dir_all(parent).expect("candidate index parent should be created");
+        fs::write(index_path, br#"{"entries":[]}"#)
+            .expect("legacy skill builder candidate index should be written");
+        let index = load_skill_builder_candidate_index(tempdir.path())
+            .expect("legacy skill builder candidate index should load");
+        assert_eq!(index.schema_version, SKILL_BUILDER_CANDIDATE_LAYOUT_VERSION);
+        assert_eq!(index.updated_at_unix_ms, 0);
+        assert!(index.entries.is_empty());
     }
 }
