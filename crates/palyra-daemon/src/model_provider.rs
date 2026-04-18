@@ -5,7 +5,7 @@ use std::{
     net::{IpAddr, ToSocketAddrs},
     pin::Pin,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -730,6 +730,10 @@ fn empty_runtime_metrics_snapshot() -> ProviderRuntimeMetricsSnapshot {
         last_latency_ms: 0,
         avg_latency_ms: 0,
         max_latency_ms: 0,
+        last_used_at_unix_ms: None,
+        last_success_at_unix_ms: None,
+        last_error_at_unix_ms: None,
+        last_error: None,
     }
 }
 
@@ -753,6 +757,7 @@ fn registry_snapshot_from_config(
             failover_enabled: false,
             response_cache_enabled: false,
             providers: Vec::new(),
+            credentials: Vec::new(),
             models: Vec::new(),
         };
     };
@@ -762,6 +767,11 @@ fn registry_snapshot_from_config(
         .iter()
         .map(|provider| ProviderRegistryProviderSnapshot {
             provider_id: provider.provider_id.clone(),
+            credential_id: normalized_provider_credential_id(
+                provider.provider_id.as_str(),
+                provider.auth_profile_id.as_deref(),
+                provider.credential_source,
+            ),
             display_name: provider
                 .display_name
                 .clone()
@@ -792,19 +802,7 @@ fn registry_snapshot_from_config(
             runtime_metrics: if provider.provider_id == runtime_status.provider_id {
                 runtime_status.runtime_metrics.clone()
             } else {
-                ProviderRuntimeMetricsSnapshot {
-                    request_count: 0,
-                    error_count: 0,
-                    error_rate_bps: 0,
-                    total_retry_attempts: 0,
-                    total_prompt_tokens: 0,
-                    total_completion_tokens: 0,
-                    avg_prompt_tokens_per_run: 0,
-                    avg_completion_tokens_per_run: 0,
-                    last_latency_ms: 0,
-                    avg_latency_ms: 0,
-                    max_latency_ms: 0,
-                }
+                empty_runtime_metrics_snapshot()
             },
             health: if provider.provider_id == runtime_status.provider_id {
                 runtime_status.health.clone()
@@ -822,6 +820,57 @@ fn registry_snapshot_from_config(
             } else {
                 empty_discovery_snapshot("registry")
             },
+        })
+        .collect::<Vec<_>>();
+    let credentials = registry
+        .providers
+        .iter()
+        .map(|provider| {
+            let runtime_metrics = if provider.provider_id == runtime_status.provider_id {
+                runtime_status.runtime_metrics.clone()
+            } else {
+                empty_runtime_metrics_snapshot()
+            };
+            let health = if provider.provider_id == runtime_status.provider_id {
+                runtime_status.health.clone()
+            } else if provider.api_key.is_some() || provider.auth_profile_id.is_some() {
+                empty_health_probe_snapshot("ok", "provider configured", "registry")
+            } else {
+                empty_health_probe_snapshot(
+                    "missing_auth",
+                    "provider has no credential reference",
+                    "registry",
+                )
+            };
+            ProviderRegistryCredentialSnapshot {
+                credential_id: normalized_provider_credential_id(
+                    provider.provider_id.as_str(),
+                    provider.auth_profile_id.as_deref(),
+                    provider.credential_source,
+                ),
+                provider_id: provider.provider_id.clone(),
+                provider_kind: provider.kind.as_str().to_owned(),
+                auth_profile_id: provider.auth_profile_id.clone(),
+                auth_profile_provider_kind: provider
+                    .auth_profile_provider_kind
+                    .map(|kind| kind.as_str().to_owned()),
+                credential_source: provider
+                    .credential_source
+                    .map(|source| source.as_str().to_owned()),
+                availability_state: credential_availability_state(
+                    health.state.as_str(),
+                    runtime_metrics.last_error.as_ref(),
+                )
+                .to_owned(),
+                capability_summary: credential_capability_summary(
+                    registry
+                        .models
+                        .iter()
+                        .filter(|model| model.provider_id == provider.provider_id && model.enabled),
+                ),
+                health,
+                runtime_metrics,
+            }
         })
         .collect::<Vec<_>>();
 
@@ -844,7 +893,71 @@ fn registry_snapshot_from_config(
         failover_enabled: registry.failover_enabled,
         response_cache_enabled: registry.response_cache_enabled,
         providers,
+        credentials,
         models,
+    }
+}
+
+fn normalized_provider_credential_id(
+    provider_id: &str,
+    auth_profile_id: Option<&str>,
+    credential_source: Option<ModelProviderCredentialSource>,
+) -> String {
+    if let Some(profile_id) = auth_profile_id {
+        return format!("auth-profile:{provider_id}:{profile_id}");
+    }
+    match credential_source {
+        Some(source) => format!("config:{provider_id}:{}", source.as_str()),
+        None => format!("config:{provider_id}:unbound"),
+    }
+}
+
+fn credential_capability_summary<'a>(
+    models: impl IntoIterator<Item = &'a ProviderModelEntryConfig>,
+) -> ProviderCredentialCapabilitySummary {
+    let mut summary = ProviderCredentialCapabilitySummary {
+        chat: false,
+        embeddings: false,
+        audio_transcription: false,
+        vision: false,
+        max_context_tokens: None,
+    };
+    for model in models {
+        match model.role {
+            ProviderModelRole::Chat => summary.chat = true,
+            ProviderModelRole::Embeddings => summary.embeddings = true,
+            ProviderModelRole::AudioTranscription => summary.audio_transcription = true,
+        }
+        summary.vision |= model.capabilities.vision;
+        summary.max_context_tokens =
+            summary.max_context_tokens.max(model.capabilities.max_context_tokens);
+    }
+    summary
+}
+
+fn credential_availability_state(
+    health_state: &str,
+    last_error: Option<&ProviderFailureSnapshot>,
+) -> &'static str {
+    if let Some(last_error) = last_error {
+        return match last_error.class.as_str() {
+            "auth_invalid" => "auth_invalid",
+            "auth_expired" => "auth_expired",
+            "permission_denied" => "permission_denied",
+            "rate_limited" => "rate_limited",
+            "context_window_exceeded" | "content_policy_blocked" => "available",
+            "network_unavailable"
+            | "transient_upstream"
+            | "malformed_response"
+            | "permanent_upstream" => "provider_degraded",
+            _ => "degraded",
+        };
+    }
+    match health_state {
+        "ok" | "static" => "available",
+        "missing_auth" => "missing_auth",
+        "degraded" => "degraded",
+        _ => "unknown",
     }
 }
 
@@ -957,9 +1070,18 @@ pub enum ProviderError {
     #[error(
         "provider request failed after {retry_count} retries (retryable={retryable}): {message}"
     )]
-    RequestFailed { message: String, retryable: bool, retry_count: u32 },
+    RequestFailed {
+        message: String,
+        retryable: bool,
+        retry_count: u32,
+        classification: ProviderFailureClassification,
+    },
     #[error("provider response was invalid after {retry_count} retries: {message}")]
-    InvalidResponse { message: String, retry_count: u32 },
+    InvalidResponse {
+        message: String,
+        retry_count: u32,
+        classification: ProviderFailureClassification,
+    },
     #[error("provider state lock was poisoned")]
     StatePoisoned,
 }
@@ -978,6 +1100,176 @@ impl ProviderError {
     pub const fn is_circuit_open(&self) -> bool {
         matches!(self, Self::CircuitOpen { .. })
     }
+
+    #[must_use]
+    pub fn classification(&self) -> ProviderFailureClassification {
+        match self {
+            Self::CircuitOpen { .. } => ProviderFailureClassification::new(
+                ProviderFailureClass::TransientUpstream,
+                ProviderFailureAction::Retry,
+                None,
+                Some("circuit_open".to_owned()),
+            ),
+            Self::MissingApiKey | Self::MissingAnthropicApiKey => {
+                ProviderFailureClassification::new(
+                    ProviderFailureClass::AuthInvalid,
+                    ProviderFailureAction::RotateCredential,
+                    None,
+                    Some("missing_api_key".to_owned()),
+                )
+            }
+            Self::MissingEmbeddingsModel => ProviderFailureClassification::new(
+                ProviderFailureClass::PermanentUpstream,
+                ProviderFailureAction::FailClosedNoRetry,
+                None,
+                Some("missing_embeddings_model".to_owned()),
+            ),
+            Self::VisionUnsupported { .. } => ProviderFailureClassification::new(
+                ProviderFailureClass::PermanentUpstream,
+                ProviderFailureAction::ProviderFailover,
+                None,
+                Some("vision_unsupported".to_owned()),
+            ),
+            Self::InvalidEmbeddingsRequest { .. } => ProviderFailureClassification::new(
+                ProviderFailureClass::MalformedResponse,
+                ProviderFailureAction::FailClosedNoRetry,
+                None,
+                Some("invalid_embeddings_request".to_owned()),
+            ),
+            Self::RequestFailed { classification, .. }
+            | Self::InvalidResponse { classification, .. } => classification.clone(),
+            Self::StatePoisoned => ProviderFailureClassification::new(
+                ProviderFailureClass::PermanentUpstream,
+                ProviderFailureAction::FailClosedNoRetry,
+                None,
+                Some("state_poisoned".to_owned()),
+            ),
+        }
+    }
+
+    #[must_use]
+    pub fn failure_snapshot(&self) -> ProviderFailureSnapshot {
+        let message = match self {
+            Self::CircuitOpen { retry_after_ms } => {
+                format!("model provider circuit breaker is open; retry after {retry_after_ms}ms")
+            }
+            Self::MissingApiKey => "model provider API key is missing".to_owned(),
+            Self::MissingAnthropicApiKey => {
+                "anthropic model provider API key is missing".to_owned()
+            }
+            Self::MissingEmbeddingsModel => "model provider embeddings model is missing".to_owned(),
+            Self::VisionUnsupported { provider } => {
+                format!("provider '{provider}' does not support vision inputs")
+            }
+            Self::InvalidEmbeddingsRequest { message }
+            | Self::RequestFailed { message, .. }
+            | Self::InvalidResponse { message, .. } => message.clone(),
+            Self::StatePoisoned => "model provider state lock poisoned".to_owned(),
+        };
+        self.classification().snapshot(message)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderFailureClass {
+    AuthInvalid,
+    AuthExpired,
+    PermissionDenied,
+    RateLimited,
+    TransientUpstream,
+    PermanentUpstream,
+    ContextWindowExceeded,
+    ContentPolicyBlocked,
+    MalformedResponse,
+    NetworkUnavailable,
+}
+
+impl ProviderFailureClass {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AuthInvalid => "auth_invalid",
+            Self::AuthExpired => "auth_expired",
+            Self::PermissionDenied => "permission_denied",
+            Self::RateLimited => "rate_limited",
+            Self::TransientUpstream => "transient_upstream",
+            Self::PermanentUpstream => "permanent_upstream",
+            Self::ContextWindowExceeded => "context_window_exceeded",
+            Self::ContentPolicyBlocked => "content_policy_blocked",
+            Self::MalformedResponse => "malformed_response",
+            Self::NetworkUnavailable => "network_unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderFailureAction {
+    Retry,
+    RotateCredential,
+    ProviderFailover,
+    ReevaluateBudget,
+    UserActionRequired,
+    FailClosedNoRetry,
+}
+
+impl ProviderFailureAction {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Retry => "retry",
+            Self::RotateCredential => "rotate_credential",
+            Self::ProviderFailover => "provider_failover",
+            Self::ReevaluateBudget => "budget_re_evaluate",
+            Self::UserActionRequired => "user_action_required",
+            Self::FailClosedNoRetry => "fail_closed_no_retry",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderFailureClassification {
+    pub class: ProviderFailureClass,
+    pub recommended_action: ProviderFailureAction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_code: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_detail: Option<String>,
+}
+
+impl ProviderFailureClassification {
+    #[must_use]
+    pub const fn new(
+        class: ProviderFailureClass,
+        recommended_action: ProviderFailureAction,
+        status_code: Option<u16>,
+        provider_detail: Option<String>,
+    ) -> Self {
+        Self { class, recommended_action, status_code, provider_detail }
+    }
+
+    #[must_use]
+    pub fn snapshot(&self, message: String) -> ProviderFailureSnapshot {
+        ProviderFailureSnapshot {
+            class: self.class.as_str().to_owned(),
+            recommended_action: self.recommended_action.as_str().to_owned(),
+            status_code: self.status_code,
+            provider_detail: self.provider_detail.clone(),
+            message,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProviderFailureSnapshot {
+    pub class: String,
+    pub recommended_action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_code: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_detail: Option<String>,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -998,6 +1290,121 @@ pub struct ProviderCapabilitiesSnapshot {
     pub known_limitations: Vec<String>,
     pub operator_override: bool,
     pub metadata_source: String,
+}
+
+fn provider_failure_classification(
+    class: ProviderFailureClass,
+    recommended_action: ProviderFailureAction,
+    status_code: Option<u16>,
+    provider_detail: impl Into<String>,
+) -> ProviderFailureClassification {
+    ProviderFailureClassification::new(
+        class,
+        recommended_action,
+        status_code,
+        Some(provider_detail.into()),
+    )
+}
+
+fn fail_closed_provider_classification(
+    provider_detail: impl Into<String>,
+) -> ProviderFailureClassification {
+    provider_failure_classification(
+        ProviderFailureClass::PermanentUpstream,
+        ProviderFailureAction::FailClosedNoRetry,
+        None,
+        provider_detail,
+    )
+}
+
+fn failover_provider_classification(
+    provider_detail: impl Into<String>,
+) -> ProviderFailureClassification {
+    provider_failure_classification(
+        ProviderFailureClass::PermanentUpstream,
+        ProviderFailureAction::ProviderFailover,
+        None,
+        provider_detail,
+    )
+}
+
+fn retry_provider_classification(
+    provider_detail: impl Into<String>,
+) -> ProviderFailureClassification {
+    provider_failure_classification(
+        ProviderFailureClass::TransientUpstream,
+        ProviderFailureAction::Retry,
+        None,
+        provider_detail,
+    )
+}
+
+fn user_action_provider_classification(
+    provider_detail: impl Into<String>,
+) -> ProviderFailureClassification {
+    provider_failure_classification(
+        ProviderFailureClass::PermanentUpstream,
+        ProviderFailureAction::UserActionRequired,
+        None,
+        provider_detail,
+    )
+}
+
+fn classify_http_provider_failure(
+    status_code: u16,
+    retryable: bool,
+    provider_detail: &str,
+    response_body: &str,
+) -> ProviderFailureClassification {
+    let normalized_body = response_body.to_ascii_lowercase();
+    let (class, recommended_action) = if status_code == 401 {
+        if normalized_body.contains("expired") {
+            (ProviderFailureClass::AuthExpired, ProviderFailureAction::RotateCredential)
+        } else {
+            (ProviderFailureClass::AuthInvalid, ProviderFailureAction::RotateCredential)
+        }
+    } else if matches!(status_code, 400 | 413)
+        && (normalized_body.contains("context")
+            || normalized_body.contains("maximum context")
+            || normalized_body.contains("context_length")
+            || normalized_body.contains("token limit")
+            || normalized_body.contains("too many tokens"))
+    {
+        (ProviderFailureClass::ContextWindowExceeded, ProviderFailureAction::UserActionRequired)
+    } else if normalized_body.contains("policy")
+        || normalized_body.contains("safety")
+        || normalized_body.contains("moderation")
+        || normalized_body.contains("blocked")
+    {
+        (ProviderFailureClass::ContentPolicyBlocked, ProviderFailureAction::FailClosedNoRetry)
+    } else if status_code == 403 {
+        (ProviderFailureClass::PermissionDenied, ProviderFailureAction::UserActionRequired)
+    } else if status_code == 429 {
+        (ProviderFailureClass::RateLimited, ProviderFailureAction::ReevaluateBudget)
+    } else if retryable {
+        (ProviderFailureClass::TransientUpstream, ProviderFailureAction::Retry)
+    } else {
+        (ProviderFailureClass::PermanentUpstream, ProviderFailureAction::ProviderFailover)
+    };
+    provider_failure_classification(class, recommended_action, Some(status_code), provider_detail)
+}
+
+fn classify_network_provider_failure(provider_detail: &str) -> ProviderFailureClassification {
+    provider_failure_classification(
+        ProviderFailureClass::NetworkUnavailable,
+        ProviderFailureAction::Retry,
+        None,
+        provider_detail,
+    )
+}
+
+fn invalid_response_classification(provider_detail: &str) -> ProviderFailureClassification {
+    provider_failure_classification(
+        ProviderFailureClass::MalformedResponse,
+        ProviderFailureAction::FailClosedNoRetry,
+        None,
+        provider_detail,
+    )
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1027,6 +1434,14 @@ pub struct ProviderRuntimeMetricsSnapshot {
     pub last_latency_ms: u64,
     pub avg_latency_ms: u64,
     pub max_latency_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_used_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_success_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<ProviderFailureSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1057,6 +1472,7 @@ pub struct ProviderDiscoverySnapshot {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProviderRegistryProviderSnapshot {
     pub provider_id: String,
+    pub credential_id: String,
     pub display_name: String,
     pub kind: String,
     pub enabled: bool,
@@ -1074,6 +1490,33 @@ pub struct ProviderRegistryProviderSnapshot {
     pub runtime_metrics: ProviderRuntimeMetricsSnapshot,
     pub health: ProviderHealthProbeSnapshot,
     pub discovery: ProviderDiscoverySnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProviderCredentialCapabilitySummary {
+    pub chat: bool,
+    pub embeddings: bool,
+    pub audio_transcription: bool,
+    pub vision: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_context_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProviderRegistryCredentialSnapshot {
+    pub credential_id: String,
+    pub provider_id: String,
+    pub provider_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_profile_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_profile_provider_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_source: Option<String>,
+    pub availability_state: String,
+    pub capability_summary: ProviderCredentialCapabilitySummary,
+    pub health: ProviderHealthProbeSnapshot,
+    pub runtime_metrics: ProviderRuntimeMetricsSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1096,6 +1539,8 @@ pub struct ProviderRegistrySnapshot {
     pub failover_enabled: bool,
     pub response_cache_enabled: bool,
     pub providers: Vec<ProviderRegistryProviderSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credentials: Vec<ProviderRegistryCredentialSnapshot>,
     pub models: Vec<ProviderRegistryModelSnapshot>,
 }
 
@@ -1111,6 +1556,7 @@ pub struct ProviderResponseCacheSnapshot {
 pub struct ProviderStatusSnapshot {
     pub kind: String,
     pub provider_id: String,
+    pub credential_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
     pub capabilities: ProviderCapabilitiesSnapshot,
@@ -1379,9 +1825,10 @@ impl RegistryBackedModelProvider {
         completion_tokens: u64,
         retry_count: u32,
         latency_ms: u64,
+        failure: Option<ProviderFailureSnapshot>,
     ) {
         let mut metrics = lock_runtime_metrics(&self.runtime_metrics);
-        metrics.record(error, prompt_tokens, completion_tokens, retry_count, latency_ms);
+        metrics.record(error, prompt_tokens, completion_tokens, retry_count, latency_ms, failure);
     }
 
     fn runtime_metrics_snapshot(&self) -> ProviderRuntimeMetricsSnapshot {
@@ -1438,6 +1885,9 @@ impl RegistryBackedModelProvider {
                     .to_owned(),
                 retryable: false,
                 retry_count: 0,
+                classification: failover_provider_classification(
+                    "registry_no_enabled_chat_model_matches_request",
+                ),
             });
         }
 
@@ -1449,6 +1899,9 @@ impl RegistryBackedModelProvider {
                 message: "provider registry does not define a default chat model".to_owned(),
                 retryable: false,
                 retry_count: 0,
+                classification: fail_closed_provider_classification(
+                    "registry_default_chat_model_missing",
+                ),
             })?;
         let primary = compatible
             .iter()
@@ -1458,6 +1911,9 @@ impl RegistryBackedModelProvider {
                 message: format!("requested chat model '{requested_model_id}' is unavailable"),
                 retryable: false,
                 retry_count: 0,
+                classification: failover_provider_classification(
+                    "registry_requested_chat_model_unavailable",
+                ),
             })?;
 
         let mut fallbacks = compatible
@@ -1634,6 +2090,7 @@ impl ModelProvider for RegistryBackedModelProvider {
                         0,
                         error.retry_count(),
                         elapsed_millis_since(started_at),
+                        Some(error.failure_snapshot()),
                     );
                     return Err(error);
                 }
@@ -1658,6 +2115,7 @@ impl ModelProvider for RegistryBackedModelProvider {
                         cached.completion_tokens,
                         cached.retry_count,
                         elapsed_millis_since(started_at),
+                        None,
                     );
                     return Ok(cached);
                 }
@@ -1689,6 +2147,7 @@ impl ModelProvider for RegistryBackedModelProvider {
                             response.completion_tokens,
                             response.retry_count,
                             elapsed_millis_since(started_at),
+                            None,
                         );
                         return Ok(response);
                     }
@@ -1723,6 +2182,7 @@ impl ModelProvider for RegistryBackedModelProvider {
                 0,
                 error.retry_count(),
                 elapsed_millis_since(started_at),
+                Some(error.failure_snapshot()),
             );
             Err(error)
         })
@@ -1741,6 +2201,9 @@ impl ModelProvider for RegistryBackedModelProvider {
                             .to_owned(),
                         retryable: false,
                         retry_count: 0,
+                        classification: fail_closed_provider_classification(
+                            "registry_default_audio_transcription_model_missing",
+                        ),
                     }
                 })?;
             let model = self.models.get(model_id.as_str()).ok_or(ProviderError::StatePoisoned)?;
@@ -1780,6 +2243,11 @@ impl ModelProvider for RegistryBackedModelProvider {
             let runtime_status = statuses.get(provider.provider_id.as_str());
             providers.push(ProviderRegistryProviderSnapshot {
                 provider_id: provider.provider_id.clone(),
+                credential_id: normalized_provider_credential_id(
+                    provider.provider_id.as_str(),
+                    provider.auth_profile_id.as_deref(),
+                    provider.credential_source,
+                ),
                 display_name: provider
                     .display_name
                     .clone()
@@ -1827,6 +2295,53 @@ impl ModelProvider for RegistryBackedModelProvider {
                     .unwrap_or_else(|| empty_discovery_snapshot("registry")),
             });
         }
+        let credentials = self
+            .registry
+            .providers
+            .iter()
+            .map(|provider| {
+                let runtime_status = statuses.get(provider.provider_id.as_str());
+                let runtime_metrics = runtime_status
+                    .map(|snapshot| snapshot.runtime_metrics.clone())
+                    .unwrap_or_else(empty_runtime_metrics_snapshot);
+                let health =
+                    runtime_status.map(|snapshot| snapshot.health.clone()).unwrap_or_else(|| {
+                        empty_health_probe_snapshot(
+                            "unknown",
+                            "provider has not been probed yet",
+                            "registry",
+                        )
+                    });
+                ProviderRegistryCredentialSnapshot {
+                    credential_id: normalized_provider_credential_id(
+                        provider.provider_id.as_str(),
+                        provider.auth_profile_id.as_deref(),
+                        provider.credential_source,
+                    ),
+                    provider_id: provider.provider_id.clone(),
+                    provider_kind: provider.kind.as_str().to_owned(),
+                    auth_profile_id: provider.auth_profile_id.clone(),
+                    auth_profile_provider_kind: provider
+                        .auth_profile_provider_kind
+                        .map(|kind| kind.as_str().to_owned()),
+                    credential_source: provider
+                        .credential_source
+                        .map(|source| source.as_str().to_owned()),
+                    availability_state: credential_availability_state(
+                        health.state.as_str(),
+                        runtime_metrics.last_error.as_ref(),
+                    )
+                    .to_owned(),
+                    capability_summary: credential_capability_summary(
+                        self.registry.models.iter().filter(|model| {
+                            model.provider_id == provider.provider_id && model.enabled
+                        }),
+                    ),
+                    health,
+                    runtime_metrics,
+                }
+            })
+            .collect::<Vec<_>>();
         let models = self
             .registry
             .models
@@ -1845,6 +2360,21 @@ impl ModelProvider for RegistryBackedModelProvider {
                 .map(|provider| provider.kind.as_str().to_owned())
                 .unwrap_or_else(|| self.config.kind.as_str().to_owned()),
             provider_id: default_provider_id.clone(),
+            credential_id: default_provider_entry
+                .map(|provider| {
+                    normalized_provider_credential_id(
+                        provider.provider_id.as_str(),
+                        provider.auth_profile_id.as_deref(),
+                        provider.credential_source,
+                    )
+                })
+                .unwrap_or_else(|| {
+                    normalized_provider_credential_id(
+                        default_provider_id.as_str(),
+                        self.config.auth_profile_id.as_deref(),
+                        self.config.credential_source,
+                    )
+                }),
             model_id: default_model_id.clone(),
             capabilities: default_model.map(|model| model.capabilities.clone()).unwrap_or_else(
                 || capability_defaults_for_kind(self.config.kind, ProviderModelRole::Chat),
@@ -1918,6 +2448,7 @@ impl ModelProvider for RegistryBackedModelProvider {
                 failover_enabled: self.registry.failover_enabled,
                 response_cache_enabled: self.registry.response_cache_enabled,
                 providers,
+                credentials,
                 models,
             },
         }
@@ -2084,9 +2615,10 @@ impl DeterministicProvider {
         completion_tokens: u64,
         retry_count: u32,
         latency_ms: u64,
+        failure: Option<ProviderFailureSnapshot>,
     ) {
         let mut metrics = lock_runtime_metrics(&self.runtime_metrics);
-        metrics.record(error, prompt_tokens, completion_tokens, retry_count, latency_ms);
+        metrics.record(error, prompt_tokens, completion_tokens, retry_count, latency_ms, failure);
     }
 
     fn runtime_metrics_snapshot(&self) -> ProviderRuntimeMetricsSnapshot {
@@ -2102,10 +2634,17 @@ impl ModelProvider for DeterministicProvider {
         Box::pin(async move {
             let started_at = Instant::now();
             if provider_request_has_vision(&request) {
-                self.record_runtime_metrics(true, 0, 0, 0, elapsed_millis_since(started_at));
-                return Err(ProviderError::VisionUnsupported {
-                    provider: "deterministic".to_owned(),
-                });
+                let error =
+                    ProviderError::VisionUnsupported { provider: "deterministic".to_owned() };
+                self.record_runtime_metrics(
+                    true,
+                    0,
+                    0,
+                    0,
+                    elapsed_millis_since(started_at),
+                    Some(error.failure_snapshot()),
+                );
+                return Err(error);
             }
 
             let completion_source = if request.json_mode {
@@ -2138,6 +2677,7 @@ impl ModelProvider for DeterministicProvider {
                 completion_tokens,
                 0,
                 elapsed_millis_since(started_at),
+                None,
             );
             Ok(ProviderResponse {
                 events,
@@ -2170,6 +2710,9 @@ impl ModelProvider for DeterministicProvider {
                     .to_owned(),
                 retryable: false,
                 retry_count: 0,
+                classification: failover_provider_classification(
+                    "deterministic_audio_transcription_unsupported",
+                ),
             })
         })
     }
@@ -2178,6 +2721,11 @@ impl ModelProvider for DeterministicProvider {
         let mut snapshot = ProviderStatusSnapshot {
             kind: self.config.kind.as_str().to_owned(),
             provider_id: "deterministic-primary".to_owned(),
+            credential_id: normalized_provider_credential_id(
+                "deterministic-primary",
+                self.config.auth_profile_id.as_deref(),
+                self.config.credential_source,
+            ),
             model_id: Some("deterministic".to_owned()),
             capabilities: ProviderCapabilitiesSnapshot {
                 streaming_tokens: true,
@@ -2247,6 +2795,7 @@ impl ModelProvider for DeterministicProvider {
                 failover_enabled: false,
                 response_cache_enabled: true,
                 providers: Vec::new(),
+                credentials: Vec::new(),
                 models: Vec::new(),
             },
         };
@@ -2312,15 +2861,25 @@ struct AttemptError {
     message: String,
     retryable: bool,
     invalid_response: bool,
+    classification: ProviderFailureClassification,
 }
 
 impl AttemptError {
-    fn request_failed(message: String, retryable: bool) -> Self {
-        Self { message, retryable, invalid_response: false }
+    fn request_failed(
+        message: String,
+        retryable: bool,
+        classification: ProviderFailureClassification,
+    ) -> Self {
+        Self { message, retryable, invalid_response: false, classification }
     }
 
-    fn invalid_response(message: String) -> Self {
-        Self { message, retryable: false, invalid_response: true }
+    fn invalid_response(message: String, provider_detail: &str) -> Self {
+        Self {
+            message,
+            retryable: false,
+            invalid_response: true,
+            classification: invalid_response_classification(provider_detail),
+        }
     }
 }
 
@@ -2448,12 +3007,13 @@ impl OpenAiCompatibleEmbeddingsProvider {
         api_key: &str,
         inputs: &[String],
     ) -> Result<EmbeddingsResponse, AttemptError> {
-        let model_name = self
-            .config
-            .openai_embeddings_model
-            .as_ref()
-            .ok_or(ProviderError::MissingEmbeddingsModel)
-            .map_err(|error| AttemptError::request_failed(error.to_string(), false))?;
+        let model_name = self.config.openai_embeddings_model.as_ref().ok_or_else(|| {
+            AttemptError::request_failed(
+                ProviderError::MissingEmbeddingsModel.to_string(),
+                false,
+                fail_closed_provider_classification("openai_embeddings_model_missing"),
+            )
+        })?;
         let mut body = json!({
             "model": model_name,
             "input": inputs,
@@ -2474,6 +3034,7 @@ impl OpenAiCompatibleEmbeddingsProvider {
                 AttemptError::request_failed(
                     format!("openai-compatible embeddings request failed: {error}"),
                     true,
+                    classify_network_provider_failure("openai_compatible_embeddings_request"),
                 )
             })?;
 
@@ -2490,17 +3051,25 @@ impl OpenAiCompatibleEmbeddingsProvider {
                     sanitize_remote_error(&body_text)
                 ),
                 retryable,
+                classify_http_provider_failure(
+                    status,
+                    retryable,
+                    "openai_compatible_embeddings_http",
+                    body_text.as_str(),
+                ),
             ));
         }
 
         let parsed = response.json::<OpenAiEmbeddingsResponse>().await.map_err(|error| {
-            AttemptError::invalid_response(format!(
-                "openai-compatible embeddings response JSON parsing failed: {error}"
-            ))
+            AttemptError::invalid_response(
+                format!("openai-compatible embeddings response JSON parsing failed: {error}"),
+                "openai_compatible_embeddings_response_json",
+            )
         })?;
         if parsed.data.is_empty() {
             return Err(AttemptError::invalid_response(
                 "openai-compatible embeddings response did not include vectors".to_owned(),
+                "openai_compatible_embeddings_vectors_missing",
             ));
         }
 
@@ -2510,12 +3079,15 @@ impl OpenAiCompatibleEmbeddingsProvider {
             if index >= ordered_vectors.len() {
                 return Err(AttemptError::invalid_response(format!(
                     "openai-compatible embeddings response contained out-of-range vector index {index}"
-                )));
+                ), "openai_compatible_embeddings_vector_index_out_of_range"));
             }
             if ordered_vectors[index].is_some() {
-                return Err(AttemptError::invalid_response(format!(
-                    "openai-compatible embeddings response duplicated vector index {index}"
-                )));
+                return Err(AttemptError::invalid_response(
+                    format!(
+                        "openai-compatible embeddings response duplicated vector index {index}"
+                    ),
+                    "openai_compatible_embeddings_vector_index_duplicate",
+                ));
             }
             ordered_vectors[index] = Some(item.embedding);
         }
@@ -2527,6 +3099,7 @@ impl OpenAiCompatibleEmbeddingsProvider {
                     AttemptError::invalid_response(
                         "openai-compatible embeddings response omitted one or more vectors"
                             .to_owned(),
+                        "openai_compatible_embeddings_vectors_omitted",
                     )
                 })
             })
@@ -2536,28 +3109,36 @@ impl OpenAiCompatibleEmbeddingsProvider {
         if dimensions == 0 {
             return Err(AttemptError::invalid_response(
                 "openai-compatible embeddings response vectors must be non-empty".to_owned(),
+                "openai_compatible_embeddings_vectors_empty",
             ));
         }
         if vectors.iter().any(|vector| vector.len() != dimensions) {
             return Err(AttemptError::invalid_response(
                 "openai-compatible embeddings response returned inconsistent vector dimensions"
                     .to_owned(),
+                "openai_compatible_embeddings_dims_inconsistent",
             ));
         }
         if let Some(expected_dimensions) = self.config.openai_embeddings_dims {
             if dimensions != expected_dimensions as usize {
-                return Err(AttemptError::invalid_response(format!(
+                return Err(AttemptError::invalid_response(
+                    format!(
                     "openai-compatible embeddings response returned dims {dimensions}, expected {}",
                     expected_dimensions
-                )));
+                ),
+                    "openai_compatible_embeddings_dims_mismatch",
+                ));
             }
         }
         if vectors.len() != inputs.len() {
-            return Err(AttemptError::invalid_response(format!(
-                "openai-compatible embeddings response returned {} vectors for {} inputs",
-                vectors.len(),
-                inputs.len()
-            )));
+            return Err(AttemptError::invalid_response(
+                format!(
+                    "openai-compatible embeddings response returned {} vectors for {} inputs",
+                    vectors.len(),
+                    inputs.len()
+                ),
+                "openai_compatible_embeddings_vector_count_mismatch",
+            ));
         }
 
         Ok(EmbeddingsResponse {
@@ -2598,12 +3179,17 @@ impl EmbeddingsProvider for OpenAiCompatibleEmbeddingsProvider {
                             continue;
                         }
                         return Err(if error.invalid_response {
-                            ProviderError::InvalidResponse { message: error.message, retry_count }
+                            ProviderError::InvalidResponse {
+                                message: error.message,
+                                retry_count,
+                                classification: error.classification,
+                            }
                         } else {
                             ProviderError::RequestFailed {
                                 message: error.message,
                                 retryable: error.retryable,
                                 retry_count,
+                                classification: error.classification,
                             }
                         });
                     }
@@ -2614,6 +3200,9 @@ impl EmbeddingsProvider for OpenAiCompatibleEmbeddingsProvider {
                 message: "openai-compatible embeddings execution exhausted retries".to_owned(),
                 retryable: true,
                 retry_count,
+                classification: retry_provider_classification(
+                    "openai_compatible_embeddings_retries_exhausted",
+                ),
             })
         })
     }
@@ -2643,9 +3232,10 @@ impl OpenAiCompatibleProvider {
         completion_tokens: u64,
         retry_count: u32,
         latency_ms: u64,
+        failure: Option<ProviderFailureSnapshot>,
     ) {
         let mut metrics = lock_runtime_metrics(&self.runtime_metrics);
-        metrics.record(error, prompt_tokens, completion_tokens, retry_count, latency_ms);
+        metrics.record(error, prompt_tokens, completion_tokens, retry_count, latency_ms, failure);
     }
 
     fn runtime_metrics_snapshot(&self) -> ProviderRuntimeMetricsSnapshot {
@@ -2743,6 +3333,7 @@ impl OpenAiCompatibleProvider {
                 AttemptError::request_failed(
                     format!("openai-compatible request failed: {error}"),
                     true,
+                    classify_network_provider_failure("openai_compatible_chat_request"),
                 )
             })?;
 
@@ -2759,17 +3350,25 @@ impl OpenAiCompatibleProvider {
                     sanitize_remote_error(&body_text)
                 ),
                 retryable,
+                classify_http_provider_failure(
+                    status,
+                    retryable,
+                    "openai_compatible_chat_http",
+                    body_text.as_str(),
+                ),
             ));
         }
 
         let parsed = response.json::<OpenAiChatCompletionResponse>().await.map_err(|error| {
-            AttemptError::invalid_response(format!(
-                "openai-compatible response JSON parsing failed: {error}"
-            ))
+            AttemptError::invalid_response(
+                format!("openai-compatible response JSON parsing failed: {error}"),
+                "openai_compatible_chat_response_json",
+            )
         })?;
         let choice = parsed.choices.into_iter().next().ok_or_else(|| {
             AttemptError::invalid_response(
                 "openai-compatible response did not include choices".to_owned(),
+                "openai_compatible_chat_choices_missing",
             )
         })?;
 
@@ -2783,9 +3382,10 @@ impl OpenAiCompatibleProvider {
             }
             let input_json =
                 normalize_tool_arguments(function.arguments.as_str()).map_err(|error| {
-                    AttemptError::invalid_response(format!(
-                        "openai-compatible tool arguments are invalid: {error}"
-                    ))
+                    AttemptError::invalid_response(
+                        format!("openai-compatible tool arguments are invalid: {error}"),
+                        "openai_compatible_chat_tool_arguments",
+                    )
                 })?;
             events.push(ProviderEvent::ToolProposal {
                 proposal_id: Ulid::new().to_string(),
@@ -2839,6 +3439,9 @@ impl OpenAiCompatibleProvider {
                 AttemptError::request_failed(
                     format!("invalid audio transcription content type: {error}"),
                     false,
+                    user_action_provider_classification(
+                        "openai_compatible_audio_content_type_invalid",
+                    ),
                 )
             })?;
         let mut form = reqwest::multipart::Form::new()
@@ -2867,6 +3470,7 @@ impl OpenAiCompatibleProvider {
                 AttemptError::request_failed(
                     format!("openai-compatible audio transcription request failed: {error}"),
                     true,
+                    classify_network_provider_failure("openai_compatible_audio_request"),
                 )
             })?;
         if !response.status().is_success() {
@@ -2882,14 +3486,23 @@ impl OpenAiCompatibleProvider {
                     sanitize_remote_error(&body_text)
                 ),
                 retryable,
+                classify_http_provider_failure(
+                    status,
+                    retryable,
+                    "openai_compatible_audio_http",
+                    body_text.as_str(),
+                ),
             ));
         }
 
         let parsed =
             response.json::<OpenAiAudioTranscriptionResponse>().await.map_err(|error| {
-                AttemptError::invalid_response(format!(
+                AttemptError::invalid_response(
+                    format!(
                     "openai-compatible audio transcription response JSON parsing failed: {error}"
-                ))
+                ),
+                    "openai_compatible_audio_response_json",
+                )
             })?;
         let segments = parsed
             .segments
@@ -2921,8 +3534,16 @@ impl ModelProvider for OpenAiCompatibleProvider {
         Box::pin(async move {
             let started_at = Instant::now();
             let Some(api_key) = self.config.openai_api_key.as_ref() else {
-                self.record_runtime_metrics(true, 0, 0, 0, elapsed_millis_since(started_at));
-                return Err(ProviderError::MissingApiKey);
+                let error = ProviderError::MissingApiKey;
+                self.record_runtime_metrics(
+                    true,
+                    0,
+                    0,
+                    0,
+                    elapsed_millis_since(started_at),
+                    Some(error.failure_snapshot()),
+                );
+                return Err(error);
             };
             if let Err(error) = self.ensure_circuit_closed() {
                 self.record_runtime_metrics(
@@ -2931,6 +3552,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
                     0,
                     error.retry_count(),
                     elapsed_millis_since(started_at),
+                    Some(error.failure_snapshot()),
                 );
                 return Err(error);
             }
@@ -2947,6 +3569,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
                             response.completion_tokens,
                             response.retry_count,
                             elapsed_millis_since(started_at),
+                            None,
                         );
                         return Ok(response);
                     }
@@ -2960,12 +3583,17 @@ impl ModelProvider for OpenAiCompatibleProvider {
 
                         self.record_failure()?;
                         let provider_error = if error.invalid_response {
-                            ProviderError::InvalidResponse { message: error.message, retry_count }
+                            ProviderError::InvalidResponse {
+                                message: error.message,
+                                retry_count,
+                                classification: error.classification,
+                            }
                         } else {
                             ProviderError::RequestFailed {
                                 message: error.message,
                                 retryable: error.retryable,
                                 retry_count,
+                                classification: error.classification,
                             }
                         };
                         self.record_runtime_metrics(
@@ -2974,6 +3602,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
                             0,
                             provider_error.retry_count(),
                             elapsed_millis_since(started_at),
+                            Some(provider_error.failure_snapshot()),
                         );
                         return Err(provider_error);
                     }
@@ -2984,6 +3613,9 @@ impl ModelProvider for OpenAiCompatibleProvider {
                 message: "openai-compatible execution exhausted retries".to_owned(),
                 retryable: true,
                 retry_count,
+                classification: retry_provider_classification(
+                    "openai_compatible_chat_retries_exhausted",
+                ),
             };
             self.record_runtime_metrics(
                 true,
@@ -2991,6 +3623,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
                 0,
                 exhausted_error.retry_count(),
                 elapsed_millis_since(started_at),
+                Some(exhausted_error.failure_snapshot()),
             );
             Err(exhausted_error)
         })
@@ -3024,12 +3657,17 @@ impl ModelProvider for OpenAiCompatibleProvider {
                         }
                         self.record_failure()?;
                         return Err(if error.invalid_response {
-                            ProviderError::InvalidResponse { message: error.message, retry_count }
+                            ProviderError::InvalidResponse {
+                                message: error.message,
+                                retry_count,
+                                classification: error.classification,
+                            }
                         } else {
                             ProviderError::RequestFailed {
                                 message: error.message,
                                 retryable: error.retryable,
                                 retry_count,
+                                classification: error.classification,
                             }
                         });
                     }
@@ -3040,6 +3678,9 @@ impl ModelProvider for OpenAiCompatibleProvider {
                 message: "openai-compatible audio transcription exhausted retries".to_owned(),
                 retryable: true,
                 retry_count,
+                classification: retry_provider_classification(
+                    "openai_compatible_audio_retries_exhausted",
+                ),
             })
         })
     }
@@ -3057,6 +3698,11 @@ impl ModelProvider for OpenAiCompatibleProvider {
         let mut snapshot = ProviderStatusSnapshot {
             kind: self.config.kind.as_str().to_owned(),
             provider_id: "openai-primary".to_owned(),
+            credential_id: normalized_provider_credential_id(
+                "openai-primary",
+                self.config.auth_profile_id.as_deref(),
+                self.config.credential_source,
+            ),
             model_id: Some(self.config.openai_model.clone()),
             capabilities: ProviderCapabilitiesSnapshot {
                 streaming_tokens: true,
@@ -3132,6 +3778,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
                 failover_enabled: true,
                 response_cache_enabled: true,
                 providers: Vec::new(),
+                credentials: Vec::new(),
                 models: Vec::new(),
             },
         };
@@ -3172,9 +3819,10 @@ impl AnthropicProvider {
         completion_tokens: u64,
         retry_count: u32,
         latency_ms: u64,
+        failure: Option<ProviderFailureSnapshot>,
     ) {
         let mut metrics = lock_runtime_metrics(&self.runtime_metrics);
-        metrics.record(error, prompt_tokens, completion_tokens, retry_count, latency_ms);
+        metrics.record(error, prompt_tokens, completion_tokens, retry_count, latency_ms, failure);
     }
 
     fn runtime_metrics_snapshot(&self) -> ProviderRuntimeMetricsSnapshot {
@@ -3269,7 +3917,11 @@ impl AnthropicProvider {
             .send()
             .await
             .map_err(|error| {
-                AttemptError::request_failed(format!("anthropic request failed: {error}"), true)
+                AttemptError::request_failed(
+                    format!("anthropic request failed: {error}"),
+                    true,
+                    classify_network_provider_failure("anthropic_chat_request"),
+                )
             })?;
 
         if !response.status().is_success() {
@@ -3285,13 +3937,20 @@ impl AnthropicProvider {
                     sanitize_remote_error(&body_text)
                 ),
                 retryable,
+                classify_http_provider_failure(
+                    status,
+                    retryable,
+                    "anthropic_chat_http",
+                    body_text.as_str(),
+                ),
             ));
         }
 
         let parsed = response.json::<AnthropicMessagesResponse>().await.map_err(|error| {
-            AttemptError::invalid_response(format!(
-                "anthropic response JSON parsing failed: {error}"
-            ))
+            AttemptError::invalid_response(
+                format!("anthropic response JSON parsing failed: {error}"),
+                "anthropic_chat_response_json",
+            )
         })?;
         let mut events = Vec::new();
         let mut completion_fragments = Vec::new();
@@ -3310,9 +3969,10 @@ impl AnthropicProvider {
                         &block.input.unwrap_or(Value::Object(serde_json::Map::new())),
                     )
                     .map_err(|error| {
-                        AttemptError::invalid_response(format!(
-                            "anthropic tool payload serialization failed: {error}"
-                        ))
+                        AttemptError::invalid_response(
+                            format!("anthropic tool payload serialization failed: {error}"),
+                            "anthropic_chat_tool_payload",
+                        )
                     })?;
                     events.push(ProviderEvent::ToolProposal {
                         proposal_id: block.id.unwrap_or_else(|| Ulid::new().to_string()),
@@ -3366,8 +4026,16 @@ impl ModelProvider for AnthropicProvider {
         Box::pin(async move {
             let started_at = Instant::now();
             let Some(api_key) = self.config.anthropic_api_key.as_ref() else {
-                self.record_runtime_metrics(true, 0, 0, 0, elapsed_millis_since(started_at));
-                return Err(ProviderError::MissingAnthropicApiKey);
+                let error = ProviderError::MissingAnthropicApiKey;
+                self.record_runtime_metrics(
+                    true,
+                    0,
+                    0,
+                    0,
+                    elapsed_millis_since(started_at),
+                    Some(error.failure_snapshot()),
+                );
+                return Err(error);
             };
             if let Err(error) = self.ensure_circuit_closed() {
                 self.record_runtime_metrics(
@@ -3376,6 +4044,7 @@ impl ModelProvider for AnthropicProvider {
                     0,
                     error.retry_count(),
                     elapsed_millis_since(started_at),
+                    Some(error.failure_snapshot()),
                 );
                 return Err(error);
             }
@@ -3392,6 +4061,7 @@ impl ModelProvider for AnthropicProvider {
                             response.completion_tokens,
                             response.retry_count,
                             elapsed_millis_since(started_at),
+                            None,
                         );
                         return Ok(response);
                     }
@@ -3405,12 +4075,17 @@ impl ModelProvider for AnthropicProvider {
 
                         self.record_failure()?;
                         let provider_error = if error.invalid_response {
-                            ProviderError::InvalidResponse { message: error.message, retry_count }
+                            ProviderError::InvalidResponse {
+                                message: error.message,
+                                retry_count,
+                                classification: error.classification,
+                            }
                         } else {
                             ProviderError::RequestFailed {
                                 message: error.message,
                                 retryable: error.retryable,
                                 retry_count,
+                                classification: error.classification,
                             }
                         };
                         self.record_runtime_metrics(
@@ -3419,6 +4094,7 @@ impl ModelProvider for AnthropicProvider {
                             0,
                             provider_error.retry_count(),
                             elapsed_millis_since(started_at),
+                            Some(provider_error.failure_snapshot()),
                         );
                         return Err(provider_error);
                     }
@@ -3429,6 +4105,7 @@ impl ModelProvider for AnthropicProvider {
                 message: "anthropic execution exhausted retries".to_owned(),
                 retryable: true,
                 retry_count,
+                classification: retry_provider_classification("anthropic_chat_retries_exhausted"),
             })
         })
     }
@@ -3443,6 +4120,9 @@ impl ModelProvider for AnthropicProvider {
                 message: "anthropic provider does not support audio transcription".to_owned(),
                 retryable: false,
                 retry_count: 0,
+                classification: failover_provider_classification(
+                    "anthropic_audio_transcription_unsupported",
+                ),
             })
         })
     }
@@ -3460,6 +4140,11 @@ impl ModelProvider for AnthropicProvider {
         let mut snapshot = ProviderStatusSnapshot {
             kind: self.config.kind.as_str().to_owned(),
             provider_id: "anthropic-primary".to_owned(),
+            credential_id: normalized_provider_credential_id(
+                "anthropic-primary",
+                self.config.auth_profile_id.as_deref(),
+                self.config.credential_source,
+            ),
             model_id: Some(self.config.anthropic_model.clone()),
             capabilities: capability_defaults_for_kind(
                 ModelProviderKind::Anthropic,
@@ -3517,6 +4202,7 @@ impl ModelProvider for AnthropicProvider {
                 failover_enabled: true,
                 response_cache_enabled: true,
                 providers: Vec::new(),
+                credentials: Vec::new(),
                 models: Vec::new(),
             },
         };
@@ -3525,7 +4211,7 @@ impl ModelProvider for AnthropicProvider {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct ProviderRuntimeMetrics {
     request_count: u64,
     error_count: u64,
@@ -3535,6 +4221,10 @@ struct ProviderRuntimeMetrics {
     total_latency_ms: u64,
     last_latency_ms: u64,
     max_latency_ms: u64,
+    last_used_at_unix_ms: Option<i64>,
+    last_success_at_unix_ms: Option<i64>,
+    last_error_at_unix_ms: Option<i64>,
+    last_error: Option<ProviderFailureSnapshot>,
 }
 
 impl ProviderRuntimeMetrics {
@@ -3545,10 +4235,17 @@ impl ProviderRuntimeMetrics {
         completion_tokens: u64,
         retry_count: u32,
         latency_ms: u64,
+        failure: Option<ProviderFailureSnapshot>,
     ) {
+        let observed_at_unix_ms = current_unix_ms().ok();
         self.request_count = self.request_count.saturating_add(1);
+        self.last_used_at_unix_ms = observed_at_unix_ms;
         if error {
             self.error_count = self.error_count.saturating_add(1);
+            self.last_error_at_unix_ms = observed_at_unix_ms;
+            self.last_error = failure;
+        } else {
+            self.last_success_at_unix_ms = observed_at_unix_ms;
         }
         self.total_retry_attempts =
             self.total_retry_attempts.saturating_add(u64::from(retry_count));
@@ -3587,6 +4284,10 @@ impl ProviderRuntimeMetrics {
             last_latency_ms: self.last_latency_ms,
             avg_latency_ms,
             max_latency_ms: self.max_latency_ms,
+            last_used_at_unix_ms: self.last_used_at_unix_ms,
+            last_success_at_unix_ms: self.last_success_at_unix_ms,
+            last_error_at_unix_ms: self.last_error_at_unix_ms,
+            last_error: self.last_error.clone(),
         }
     }
 }
@@ -3682,6 +4383,10 @@ fn lock_runtime_metrics(
 
 fn elapsed_millis_since(started_at: Instant) -> u64 {
     started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn current_unix_ms() -> Result<i64, std::time::SystemTimeError> {
+    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64)
 }
 
 pub(crate) fn sanitize_remote_error(body: &str) -> String {

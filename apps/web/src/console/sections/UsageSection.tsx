@@ -50,6 +50,10 @@ export function UsageSection({ app }: UsageSectionProps) {
       })),
     [usage.insights?.routing.recent_decisions],
   );
+  const credentialAttentionCount =
+    providerRegistry?.credentials.filter(
+      (credential) => credential.availabilityState !== "available",
+    ).length ?? 0;
 
   return (
     <main className="workspace-page">
@@ -231,16 +235,22 @@ export function UsageSection({ app }: UsageSectionProps) {
                 <dt>Default chat model</dt>
                 <dd>{providerRegistry?.defaultChatModelId ?? "n/a"}</dd>
               </div>
+              <div>
+                <dt>Runtime credential</dt>
+                <dd>{providerRegistry?.credentialId ?? providerRegistry?.credentialSource ?? "n/a"}</dd>
+              </div>
             </dl>
             {providerRegistry !== null ? (
               <WorkspaceInlineNotice
                 title="Registry posture"
-                tone={providerRegistry.failoverEnabled ? "accent" : "default"}
+                tone={credentialAttentionCount > 0 ? "warning" : providerRegistry.failoverEnabled ? "accent" : "default"}
               >
                 <p>
-                  {providerRegistry.providers.length} providers, {providerRegistry.models.length}{" "}
-                  models, failover {providerRegistry.failoverEnabled ? "enabled" : "disabled"},
-                  response cache {providerRegistry.responseCacheEnabled ? "enabled" : "disabled"}.
+                  {providerRegistry.providers.length} providers, {providerRegistry.credentials.length}{" "}
+                  credentials, {providerRegistry.models.length} models, failover{" "}
+                  {providerRegistry.failoverEnabled ? "enabled" : "disabled"}, response cache{" "}
+                  {providerRegistry.responseCacheEnabled ? "enabled" : "disabled"}, credential
+                  attention {credentialAttentionCount}.
                 </p>
               </WorkspaceInlineNotice>
             ) : null}
@@ -705,8 +715,11 @@ export function UsageSection({ app }: UsageSectionProps) {
                   {
                     key: "explanation",
                     label: "Explanation",
-                    render: (row) =>
-                      row.explanation.explanation.slice(0, 2).join(" / ") || "No explanation",
+                    render: (row) => {
+                      const summary = row.explanation.explanation.slice(0, 2).join(" / ");
+                      const reasons = row.explanation.reasonCodes.slice(0, 2).join(", ");
+                      return summary || reasons || "No explanation";
+                    },
                   },
                   {
                     key: "budget",

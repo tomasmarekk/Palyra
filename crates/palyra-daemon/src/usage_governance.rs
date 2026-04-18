@@ -1298,6 +1298,10 @@ mod tests {
             last_latency_ms: 0,
             avg_latency_ms: 0,
             max_latency_ms: 0,
+            last_used_at_unix_ms: None,
+            last_success_at_unix_ms: None,
+            last_error_at_unix_ms: None,
+            last_error: None,
         }
     }
 
@@ -1309,6 +1313,7 @@ mod tests {
     ) -> ProviderRegistryProviderSnapshot {
         ProviderRegistryProviderSnapshot {
             provider_id: provider_id.to_owned(),
+            credential_id: format!("credential-{provider_id}"),
             display_name: provider_id.to_owned(),
             kind: kind.to_owned(),
             enabled: true,
@@ -1379,6 +1384,7 @@ mod tests {
         ProviderStatusSnapshot {
             kind: default_provider.kind.clone(),
             provider_id: default_provider.provider_id.clone(),
+            credential_id: default_provider.credential_id.clone(),
             model_id: Some(default_model.model_id.clone()),
             capabilities: default_model.capabilities.clone(),
             openai_base_url: Some("https://api.openai.test/v1".to_owned()),
@@ -1409,6 +1415,7 @@ mod tests {
                 failover_enabled: true,
                 response_cache_enabled: true,
                 providers,
+                credentials: Vec::new(),
                 models,
             },
         }

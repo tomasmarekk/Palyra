@@ -79,6 +79,11 @@ export function AuthSection({ app }: AuthSectionProps) {
   const summary = summarizeAuthHealth(app.authHealth?.profiles ?? []);
   const providerRegistry = readProviderRegistrySummary(app.diagnosticsSnapshot);
   const providerCount = new Set(profiles.map((profile) => profile.provider.kind)).size;
+  const credentialCount = providerRegistry?.credentials.length ?? 0;
+  const credentialAttentionCount =
+    providerRegistry?.credentials.filter(
+      (credential) => credential.availabilityState !== "available",
+    ).length ?? 0;
 
   return (
     <main className="workspace-page">
@@ -132,7 +137,11 @@ export function AuthSection({ app }: AuthSectionProps) {
         <WorkspaceMetricCard
           label="Providers"
           value={providerCount}
-          detail="Profile inventory spans every provider kind currently published by auth."
+          detail={
+            providerRegistry === null
+              ? "Profile inventory spans every provider kind currently published by auth."
+              : `${credentialCount} runtime credential bindings, ${credentialAttentionCount} needing attention.`
+          }
           tone={providerCount > 1 ? "accent" : "default"}
         />
         <WorkspaceMetricCard
@@ -276,12 +285,20 @@ export function AuthSection({ app }: AuthSectionProps) {
                     <dd>{providerRegistry.defaultChatModelId ?? "n/a"}</dd>
                   </div>
                   <div>
+                    <dt>Runtime credential</dt>
+                    <dd>{providerRegistry.credentialId ?? providerRegistry.credentialSource ?? "n/a"}</dd>
+                  </div>
+                  <div>
                     <dt>Failover</dt>
                     <dd>{providerRegistry.failoverEnabled ? "enabled" : "disabled"}</dd>
                   </div>
                   <div>
                     <dt>Response cache</dt>
                     <dd>{providerRegistry.responseCacheEnabled ? "enabled" : "disabled"}</dd>
+                  </div>
+                  <div>
+                    <dt>Credential entries</dt>
+                    <dd>{providerRegistry.credentials.length}</dd>
                   </div>
                 </dl>
                 <WorkspaceTable
@@ -304,10 +321,17 @@ export function AuthSection({ app }: AuthSectionProps) {
                         </td>
                         <td>{provider.kind}</td>
                         <td>
-                          <div className="workspace-table__status">
-                            <WorkspaceStatusChip tone={workspaceToneForState(provider.healthState)}>
-                              {probe?.state ?? provider.healthState}
-                            </WorkspaceStatusChip>
+                          <div className="workspace-stack">
+                            <div className="workspace-table__status">
+                              <WorkspaceStatusChip tone={workspaceToneForState(provider.healthState)}>
+                                {probe?.state ?? provider.healthState}
+                              </WorkspaceStatusChip>
+                            </div>
+                            {provider.lastError !== undefined ? (
+                              <small className="text-muted">
+                                {provider.lastError.class} · {provider.lastError.recommendedAction ?? "inspect"}
+                              </small>
+                            ) : null}
                           </div>
                         </td>
                         <td>
@@ -322,9 +346,19 @@ export function AuthSection({ app }: AuthSectionProps) {
                                 ", ",
                               ) || "No models"}
                             </span>
+                            <span className="chat-muted">
+                              {provider.avgLatencyMs > 0 ? `${provider.avgLatencyMs} ms avg` : "No runtime latency yet"}
+                            </span>
                           </div>
                         </td>
-                        <td>{provider.authProfileId ?? provider.credentialSource ?? "unbound"}</td>
+                        <td>
+                          <div className="workspace-table__meta">
+                            <strong>{provider.credentialId ?? "unbound"}</strong>
+                            <span className="chat-muted">
+                              {provider.authProfileId ?? provider.credentialSource ?? "registry only"}
+                            </span>
+                          </div>
+                        </td>
                         <td>
                           <div className="workspace-table__actions">
                             <ActionButton
@@ -349,6 +383,68 @@ export function AuthSection({ app }: AuthSectionProps) {
                     );
                   })}
                 </WorkspaceTable>
+                {providerRegistry.credentials.length > 0 ? (
+                  <WorkspaceTable
+                    ariaLabel="Credential registry health"
+                    columns={["Credential", "Provider", "Availability", "Capabilities", "Activity", "Last failure"]}
+                  >
+                    {providerRegistry.credentials.map((credential) => (
+                      <tr key={credential.credentialId}>
+                        <td>
+                          <div className="workspace-table__meta">
+                            <strong>{credential.credentialId}</strong>
+                            <span className="chat-muted">
+                              {credential.authProfileId ?? credential.credentialSource ?? "runtime-only binding"}
+                            </span>
+                          </div>
+                        </td>
+                        <td>
+                          <div className="workspace-table__meta">
+                            <strong>{credential.providerId}</strong>
+                            <span className="chat-muted">{credential.providerKind}</span>
+                          </div>
+                        </td>
+                        <td>
+                          <div className="workspace-stack">
+                            <div className="workspace-table__status">
+                              <WorkspaceStatusChip
+                                tone={toneForCredentialAvailability(credential.availabilityState)}
+                              >
+                                {credential.availabilityState}
+                              </WorkspaceStatusChip>
+                            </div>
+                            <small className="text-muted">
+                              {credential.healthState}
+                              {credential.healthMessage ? ` · ${credential.healthMessage}` : ""}
+                            </small>
+                          </div>
+                        </td>
+                        <td>{credential.capabilitySummary.join(", ") || "n/a"}</td>
+                        <td>
+                          <div className="workspace-table__meta">
+                            <strong>{formatUnixMs(credential.lastUsedAtUnixMs)}</strong>
+                            <span className="chat-muted">
+                              {describeCredentialActivity(credential.lastSuccessAtUnixMs, credential.lastErrorAtUnixMs)}
+                            </span>
+                          </div>
+                        </td>
+                        <td>
+                          {credential.lastError === undefined ? (
+                            <span className="text-muted">No failure recorded</span>
+                          ) : (
+                            <div className="workspace-table__meta">
+                              <strong>{credential.lastError.class}</strong>
+                              <span className="chat-muted">
+                                {credential.lastError.recommendedAction ?? "inspect"}
+                                {credential.lastError.message ? ` · ${credential.lastError.message}` : ""}
+                              </span>
+                            </div>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </WorkspaceTable>
+                ) : null}
                 {Object.values(app.authProviderProbeResults).length > 0 ? (
                   <WorkspaceTable
                     ariaLabel="Provider probe results"
@@ -399,6 +495,40 @@ function summarizeAuthHealth(profiles: AuthHealthProfile[]) {
     },
     { ok: 0, expiring: 0, expired: 0, missing: 0, staticCount: 0 },
   );
+}
+
+function toneForCredentialAvailability(state: string): Parameters<typeof WorkspaceStatusChip>[0]["tone"] {
+  switch (state) {
+    case "available":
+      return "success";
+    case "rate_limited":
+    case "provider_degraded":
+    case "degraded":
+      return "warning";
+    case "auth_invalid":
+    case "auth_expired":
+    case "permission_denied":
+    case "missing_auth":
+      return "danger";
+    default:
+      return workspaceToneForState(state);
+  }
+}
+
+function describeCredentialActivity(
+  lastSuccessAtUnixMs: number | undefined,
+  lastErrorAtUnixMs: number | undefined,
+) {
+  if (lastErrorAtUnixMs !== undefined && lastSuccessAtUnixMs !== undefined) {
+    return `ok ${formatUnixMs(lastSuccessAtUnixMs)} · err ${formatUnixMs(lastErrorAtUnixMs)}`;
+  }
+  if (lastSuccessAtUnixMs !== undefined) {
+    return `ok ${formatUnixMs(lastSuccessAtUnixMs)}`;
+  }
+  if (lastErrorAtUnixMs !== undefined) {
+    return `err ${formatUnixMs(lastErrorAtUnixMs)}`;
+  }
+  return "No success or failure recorded";
 }
 
 type SelectedProfileCardProps = {

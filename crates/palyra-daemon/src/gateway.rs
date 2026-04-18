@@ -414,19 +414,40 @@ pub(crate) fn map_provider_error(error: ProviderError) -> Status {
         ProviderError::InvalidEmbeddingsRequest { message } => {
             Status::invalid_argument(format!("embeddings request invalid: {message}"))
         }
-        ProviderError::RequestFailed { message, retryable, retry_count } => {
+        ProviderError::RequestFailed {
+            message,
+            retryable,
+            retry_count,
+            classification,
+        } => {
             let status_message = format!(
-                "model provider request failed after {retry_count} retries (retryable={retryable}): {message}"
+                "model provider request failed after {retry_count} retries (retryable={retryable}, class={}, action={}): {message}",
+                classification.class.as_str(),
+                classification.recommended_action.as_str(),
             );
             if retryable {
                 Status::unavailable(status_message)
+            } else if classification.class.as_str() == "auth_invalid"
+                || classification.class.as_str() == "auth_expired"
+            {
+                Status::unauthenticated(status_message)
+            } else if classification.class.as_str() == "permission_denied" {
+                Status::permission_denied(status_message)
+            } else if classification.class.as_str() == "context_window_exceeded" {
+                Status::invalid_argument(status_message)
+            } else if classification.class.as_str() == "content_policy_blocked" {
+                Status::failed_precondition(status_message)
             } else {
                 Status::internal(status_message)
             }
         }
-        ProviderError::InvalidResponse { message, retry_count } => Status::internal(format!(
-            "model provider response invalid after {retry_count} retries: {message}"
-        )),
+        ProviderError::InvalidResponse { message, retry_count, classification } => Status::internal(
+            format!(
+                "model provider response invalid after {retry_count} retries (class={}, action={}): {message}",
+                classification.class.as_str(),
+                classification.recommended_action.as_str(),
+            ),
+        ),
         ProviderError::StatePoisoned => Status::internal("model provider state lock poisoned"),
     }
 }
