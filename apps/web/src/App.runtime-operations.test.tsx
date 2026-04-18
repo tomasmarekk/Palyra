@@ -614,7 +614,9 @@ describe("M56 runtime and operations surfaces", () => {
       });
       const missingGrantRow = screen.getByText("acme.echo_missing_grant").closest("tr");
       expect(missingGrantRow).not.toBeNull();
-      fireEvent.click(within(missingGrantRow as HTMLElement).getByRole("button", { name: "Inspect" }));
+      fireEvent.click(
+        within(missingGrantRow as HTMLElement).getByRole("button", { name: "Inspect" }),
+      );
       await waitFor(() => {
         expect(
           screen.getByText("Capability grants are missing required entries."),

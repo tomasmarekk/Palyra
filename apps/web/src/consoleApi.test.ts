@@ -1709,22 +1709,16 @@ describe("ConsoleApiClient", () => {
     expect(requestUrl(calls[2]?.input)).toBe("/console/v1/plugins/acme.echo_invalid_config");
     expect(new Headers(calls[2]?.init?.headers).get("x-palyra-csrf-token")).toBeNull();
 
-    expect(requestUrl(calls[3]?.input)).toBe(
-      "/console/v1/plugins/acme.echo_invalid_config/check",
-    );
+    expect(requestUrl(calls[3]?.input)).toBe("/console/v1/plugins/acme.echo_invalid_config/check");
     expect(new Headers(calls[3]?.init?.headers).get("x-palyra-csrf-token")).toBeNull();
 
     expect(requestUrl(calls[4]?.input)).toBe("/console/v1/plugins/install-or-bind");
     expect(calls[4]?.init?.method).toBe("POST");
     expect(new Headers(calls[4]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
     expect(requestBody(calls[4]?.init?.body)).toContain('"plugin_id":"acme.echo_invalid_config"');
-    expect(requestBody(calls[4]?.init?.body)).toContain(
-      '"api_base_url":"https://api.example.com"',
-    );
+    expect(requestBody(calls[4]?.init?.body)).toContain('"api_base_url":"https://api.example.com"');
 
-    expect(requestUrl(calls[5]?.input)).toBe(
-      "/console/v1/plugins/acme.echo_invalid_config/enable",
-    );
+    expect(requestUrl(calls[5]?.input)).toBe("/console/v1/plugins/acme.echo_invalid_config/enable");
     expect(calls[5]?.init?.method).toBe("POST");
     expect(new Headers(calls[5]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
     expect(requestBody(calls[5]?.init?.body)).toBe("{}");
@@ -1736,9 +1730,7 @@ describe("ConsoleApiClient", () => {
     expect(new Headers(calls[6]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
     expect(requestBody(calls[6]?.init?.body)).toBe("{}");
 
-    expect(requestUrl(calls[7]?.input)).toBe(
-      "/console/v1/plugins/acme.echo_invalid_config/delete",
-    );
+    expect(requestUrl(calls[7]?.input)).toBe("/console/v1/plugins/acme.echo_invalid_config/delete");
     expect(calls[7]?.init?.method).toBe("POST");
     expect(new Headers(calls[7]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
   });

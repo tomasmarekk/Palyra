@@ -512,9 +512,7 @@ export function pluginInvalidConfigDetailFixture() {
         entries: [],
       },
       reasons: ["config property 'api_base_url' must be a string"],
-      remediation: [
-        "Paste a valid JSON object with string values for api_base_url and api_token.",
-      ],
+      remediation: ["Paste a valid JSON object with string values for api_base_url and api_token."],
     },
   };
 }
@@ -590,10 +588,7 @@ export function pluginSignatureStateDetailFixture() {
     contract: controlPlaneContract(),
     schema_version: 2,
     binding,
-    installed_skill: pluginInstalledSkillFixture(
-      "acme.echo_signature_state",
-      "untrusted_override",
-    ),
+    installed_skill: pluginInstalledSkillFixture("acme.echo_signature_state", "untrusted_override"),
     check: {
       ready: false,
       discovery: {

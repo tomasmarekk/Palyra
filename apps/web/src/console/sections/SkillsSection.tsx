@@ -94,9 +94,6 @@ export function SkillsSection({ app }: SkillsSectionProps) {
   const quarantinedCount = app.skillsEntries.filter(
     (entry) => readString(entry, "status") === "quarantined",
   ).length;
-  const promotableProcedureCount = app.skillProcedureCandidates.filter(
-    (candidate) => !["rejected", "suppressed"].includes(readString(candidate, "status") ?? ""),
-  ).length;
   const builderCandidateCount = app.skillBuilderCandidates.length;
 
   const selectedPlugin = app.selectedPluginDetail;
@@ -378,7 +375,9 @@ export function SkillsSection({ app }: SkillsSectionProps) {
             title="Plugin health detail"
             description="Keep artifact trust, binding validity, config validity, and runtime runnable state visible as separate operator decisions."
           >
-            {selectedPlugin === null || selectedPluginBinding === null || selectedPluginCheck === null ? (
+            {selectedPlugin === null ||
+            selectedPluginBinding === null ||
+            selectedPluginCheck === null ? (
               <WorkspaceEmptyState
                 title="Select a plugin"
                 description="Choose a plugin from the inventory to inspect discovery, config contract, capability drift, and remediation guidance."
@@ -543,7 +542,8 @@ export function SkillsSection({ app }: SkillsSectionProps) {
                           type="button"
                           variant="danger"
                           onPress={() =>
-                            selectedPluginId !== null && void app.clearPluginConfig(selectedPluginId)
+                            selectedPluginId !== null &&
+                            void app.clearPluginConfig(selectedPluginId)
                           }
                           isDisabled={app.skillsBusy || selectedPluginId === null}
                         >
@@ -601,7 +601,9 @@ export function SkillsSection({ app }: SkillsSectionProps) {
                             <td>{code}</td>
                             <td>
                               <WorkspaceStatusChip
-                                tone={toneForPluginState(readString(issue, "severity") ?? "unknown")}
+                                tone={toneForPluginState(
+                                  readString(issue, "severity") ?? "unknown",
+                                )}
                               >
                                 {readString(issue, "severity") ?? "unknown"}
                               </WorkspaceStatusChip>
@@ -981,7 +983,9 @@ function humanizeState(value: string | null): string {
   return (value ?? "unknown").replace(/_/g, " ");
 }
 
-function toneForPluginState(state: string): "default" | "success" | "warning" | "danger" | "accent" {
+function toneForPluginState(
+  state: string,
+): "default" | "success" | "warning" | "danger" | "accent" {
   switch (state) {
     case "installed":
     case "resolved":
@@ -1006,7 +1010,12 @@ function toneForPluginState(state: string): "default" | "success" | "warning" | 
     case "wildcard_risk":
       return "danger";
     default:
-      return workspaceToneForState(state) as "default" | "success" | "warning" | "danger" | "accent";
+      return workspaceToneForState(state) as
+        | "default"
+        | "success"
+        | "warning"
+        | "danger"
+        | "accent";
   }
 }
 
