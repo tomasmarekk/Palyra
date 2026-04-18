@@ -1258,8 +1258,8 @@ mod tests {
     use crate::model_provider::{
         ProviderCapabilitiesSnapshot, ProviderCircuitBreakerSnapshot, ProviderDiscoverySnapshot,
         ProviderHealthProbeSnapshot, ProviderRegistryModelSnapshot,
-        ProviderRegistryProviderSnapshot, ProviderRegistrySnapshot, ProviderRetryPolicySnapshot,
-        ProviderRuntimeMetricsSnapshot, ProviderStatusSnapshot,
+        ProviderRegistryProviderSnapshot, ProviderRegistrySnapshot, ProviderResponseCacheSnapshot,
+        ProviderRetryPolicySnapshot, ProviderRuntimeMetricsSnapshot, ProviderStatusSnapshot,
     };
 
     fn capabilities(
@@ -1394,6 +1394,12 @@ mod tests {
             retry_policy: default_provider.retry_policy.clone(),
             circuit_breaker: default_provider.circuit_breaker.clone(),
             runtime_metrics: default_provider.runtime_metrics.clone(),
+            response_cache: ProviderResponseCacheSnapshot {
+                enabled: true,
+                entry_count: 0,
+                hit_count: 0,
+                miss_count: 0,
+            },
             health: default_provider.health.clone(),
             discovery: default_provider.discovery.clone(),
             registry: ProviderRegistrySnapshot {

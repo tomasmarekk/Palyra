@@ -12,8 +12,9 @@ use palyra_common::{
     daemon_config_schema::RootFileConfig,
     default_config_search_paths,
     feature_rollouts::{
-        parse_boolish_feature_rollout, FeatureRolloutSetting, DYNAMIC_TOOL_BUILDER_ROLLOUT_ENV,
-        EXECUTION_BACKEND_REMOTE_NODE_ROLLOUT_ENV, EXECUTION_BACKEND_SSH_TUNNEL_ROLLOUT_ENV,
+        parse_boolish_feature_rollout, FeatureRolloutSetting, CONTEXT_ENGINE_ROLLOUT_ENV,
+        DYNAMIC_TOOL_BUILDER_ROLLOUT_ENV, EXECUTION_BACKEND_REMOTE_NODE_ROLLOUT_ENV,
+        EXECUTION_BACKEND_SSH_TUNNEL_ROLLOUT_ENV,
     },
     parse_config_path,
     secret_refs::{SecretRef, SecretSource},
@@ -151,6 +152,9 @@ pub fn load_config() -> Result<LoadedConfig> {
         if let Some(file_feature_rollouts) = parsed.feature_rollouts {
             if let Some(enabled) = file_feature_rollouts.dynamic_tool_builder {
                 feature_rollouts.dynamic_tool_builder = FeatureRolloutSetting::from_config(enabled);
+            }
+            if let Some(enabled) = file_feature_rollouts.context_engine {
+                feature_rollouts.context_engine = FeatureRolloutSetting::from_config(enabled);
             }
             if let Some(enabled) = file_feature_rollouts.execution_backend_remote_node {
                 feature_rollouts.execution_backend_remote_node =
@@ -1637,6 +1641,11 @@ pub fn load_config() -> Result<LoadedConfig> {
         DYNAMIC_TOOL_BUILDER_ROLLOUT_ENV,
         &mut source,
     )?;
+    feature_rollouts.context_engine = apply_feature_rollout_env_override(
+        feature_rollouts.context_engine,
+        CONTEXT_ENGINE_ROLLOUT_ENV,
+        &mut source,
+    )?;
     feature_rollouts.execution_backend_remote_node = apply_feature_rollout_env_override(
         feature_rollouts.execution_backend_remote_node,
         EXECUTION_BACKEND_REMOTE_NODE_ROLLOUT_ENV,
@@ -3119,6 +3128,7 @@ mod tests {
             r#"
             [feature_rollouts]
             dynamic_tool_builder = true
+            context_engine = true
             execution_backend_remote_node = false
             execution_backend_ssh_tunnel = true
             "#,
@@ -3127,6 +3137,7 @@ mod tests {
         let feature_rollouts =
             parsed.feature_rollouts.expect("feature_rollouts section should be present");
         assert_eq!(feature_rollouts.dynamic_tool_builder, Some(true));
+        assert_eq!(feature_rollouts.context_engine, Some(true));
         assert_eq!(feature_rollouts.execution_backend_remote_node, Some(false));
         assert_eq!(feature_rollouts.execution_backend_ssh_tunnel, Some(true));
     }

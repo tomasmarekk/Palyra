@@ -1,5 +1,6 @@
 use crate::*;
 use palyra_common::feature_rollouts::{
+    CONTEXT_ENGINE_ROLLOUT_CONFIG_PATH, CONTEXT_ENGINE_ROLLOUT_ENV,
     DYNAMIC_TOOL_BUILDER_ROLLOUT_CONFIG_PATH, DYNAMIC_TOOL_BUILDER_ROLLOUT_ENV,
     EXECUTION_BACKEND_REMOTE_NODE_ROLLOUT_CONFIG_PATH, EXECUTION_BACKEND_REMOTE_NODE_ROLLOUT_ENV,
     EXECUTION_BACKEND_SSH_TUNNEL_ROLLOUT_CONFIG_PATH, EXECUTION_BACKEND_SSH_TUNNEL_ROLLOUT_ENV,
@@ -184,6 +185,12 @@ fn collect_console_feature_rollouts_diagnostics(state: &AppState) -> Value {
             "source": feature_rollouts.dynamic_tool_builder.source,
             "config_path": DYNAMIC_TOOL_BUILDER_ROLLOUT_CONFIG_PATH,
             "env_var": DYNAMIC_TOOL_BUILDER_ROLLOUT_ENV,
+        },
+        "context_engine": {
+            "enabled": feature_rollouts.context_engine.enabled,
+            "source": feature_rollouts.context_engine.source,
+            "config_path": CONTEXT_ENGINE_ROLLOUT_CONFIG_PATH,
+            "env_var": CONTEXT_ENGINE_ROLLOUT_ENV,
         },
         "execution_backend_remote_node": {
             "enabled": feature_rollouts.execution_backend_remote_node.enabled,

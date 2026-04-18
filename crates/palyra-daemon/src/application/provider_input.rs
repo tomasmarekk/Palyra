@@ -108,7 +108,7 @@ struct AttachmentRecallSelection {
     chunks: Vec<MediaDerivedArtifactSelection>,
 }
 
-fn build_provider_image_inputs(
+pub(crate) fn build_provider_image_inputs(
     attachments: &[common_v1::MessageAttachment],
     media_config: &MediaRuntimeConfig,
 ) -> Vec<ProviderImageInput> {
@@ -159,7 +159,7 @@ fn build_provider_image_inputs(
 }
 
 #[allow(clippy::result_large_err)]
-async fn build_memory_augmented_prompt(
+pub(crate) async fn build_memory_augmented_prompt(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: &RequestContext,
     run_id: &str,
@@ -268,7 +268,7 @@ fn select_workspace_hits(
 }
 
 #[allow(clippy::result_large_err)]
-async fn build_explicit_recall_prompt(
+pub(crate) async fn build_explicit_recall_prompt(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: &RequestContext,
     run_id: &str,
@@ -394,7 +394,7 @@ fn parse_project_context_preview(
 }
 
 #[allow(clippy::result_large_err)]
-async fn build_project_context_prompt(
+pub(crate) async fn build_project_context_prompt(
     runtime_state: &Arc<GatewayRuntimeState>,
     run_id: &str,
     tape_seq: &mut i64,
@@ -440,7 +440,7 @@ async fn build_project_context_prompt(
 }
 
 #[allow(clippy::result_large_err)]
-async fn build_context_reference_prompt(
+pub(crate) async fn build_context_reference_prompt(
     runtime_state: &Arc<GatewayRuntimeState>,
     run_id: &str,
     tape_seq: &mut i64,
@@ -484,7 +484,7 @@ async fn build_context_reference_prompt(
 }
 
 #[allow(clippy::result_large_err)]
-async fn build_attachment_recall_prompt(
+pub(crate) async fn build_attachment_recall_prompt(
     runtime_state: &Arc<GatewayRuntimeState>,
     run_id: &str,
     tape_seq: &mut i64,
@@ -706,7 +706,35 @@ async fn maybe_apply_automatic_session_compaction(
 }
 
 #[allow(clippy::result_large_err)]
-async fn load_session_compaction_prompt(
+pub(crate) async fn resolve_latest_session_compaction_artifact(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: &RequestContext,
+    run_id: &str,
+    tape_seq: &mut i64,
+    session_id: &str,
+) -> Result<Option<OrchestratorCompactionArtifactRecord>, Status> {
+    Ok(
+        match maybe_apply_automatic_session_compaction(
+            runtime_state,
+            context,
+            run_id,
+            tape_seq,
+            session_id,
+        )
+        .await?
+        {
+            Some(artifact) => Some(artifact),
+            None => runtime_state
+                .list_orchestrator_compaction_artifacts(session_id.to_owned())
+                .await?
+                .into_iter()
+                .next(),
+        },
+    )
+}
+
+#[allow(clippy::result_large_err)]
+pub(crate) async fn load_session_compaction_prompt(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: &RequestContext,
     run_id: &str,
@@ -714,22 +742,14 @@ async fn load_session_compaction_prompt(
     session_id: &str,
     prompt_input_text: &str,
 ) -> Result<String, Status> {
-    let latest = match maybe_apply_automatic_session_compaction(
+    let latest = resolve_latest_session_compaction_artifact(
         runtime_state,
         context,
         run_id,
         tape_seq,
         session_id,
     )
-    .await?
-    {
-        Some(artifact) => Some(artifact),
-        None => runtime_state
-            .list_orchestrator_compaction_artifacts(session_id.to_owned())
-            .await?
-            .into_iter()
-            .next(),
-    };
+    .await?;
     let Some(artifact) = latest else {
         return Ok(prompt_input_text.to_owned());
     };
@@ -744,6 +764,23 @@ async fn load_session_compaction_prompt(
 
 #[allow(clippy::result_large_err)]
 pub(crate) async fn prepare_model_provider_input(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: &RequestContext,
+    request: PrepareModelProviderInputRequest<'_>,
+) -> Result<PreparedModelProviderInput, Status> {
+    if runtime_state.config.feature_rollouts.context_engine.enabled {
+        return crate::application::context_engine::prepare_model_provider_input_with_context_engine(
+            runtime_state,
+            context,
+            request,
+        )
+        .await;
+    }
+    prepare_model_provider_input_legacy(runtime_state, context, request).await
+}
+
+#[allow(clippy::result_large_err)]
+async fn prepare_model_provider_input_legacy(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: &RequestContext,
     request: PrepareModelProviderInputRequest<'_>,

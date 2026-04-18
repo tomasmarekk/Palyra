@@ -163,6 +163,18 @@ fn build_test_runtime_state_with_http_fetch_private_targets(
     hash_chain_enabled: bool,
     allow_private_targets: bool,
 ) -> std::sync::Arc<GatewayRuntimeState> {
+    build_test_runtime_state_with_runtime_overrides(
+        hash_chain_enabled,
+        allow_private_targets,
+        crate::config::FeatureRolloutsConfig::default(),
+    )
+}
+
+fn build_test_runtime_state_with_runtime_overrides(
+    hash_chain_enabled: bool,
+    allow_private_targets: bool,
+    feature_rollouts: crate::config::FeatureRolloutsConfig,
+) -> std::sync::Arc<GatewayRuntimeState> {
     let db_path = unique_temp_journal_path();
     let state_root = std::env::temp_dir().join(format!(
         "palyra-gateway-unit-state-{}-{}",
@@ -192,7 +204,7 @@ fn build_test_runtime_state_with_http_fetch_private_targets(
             vault_get_approval_required_refs: vec!["global/openai_api_key".to_owned()],
             max_tape_entries_per_response: 1_000,
             max_tape_bytes_per_response: 2 * 1024 * 1024,
-            feature_rollouts: crate::config::FeatureRolloutsConfig::default(),
+            feature_rollouts,
             channel_router: crate::channel_router::ChannelRouterConfig::default(),
             media: MediaRuntimeConfig::default(),
             tool_call: crate::tool_protocol::ToolCallConfig {
@@ -1069,6 +1081,125 @@ async fn prepare_model_provider_input_collects_vision_inputs_for_image_attachmen
     assert_eq!(
         prepared.provider_input_text, "summarize screenshot",
         "without memory auto-inject helper should preserve raw input text"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn prepare_model_provider_input_supports_legacy_and_context_engine_flows() {
+    let context = RequestContext {
+        principal: "user:ops".to_owned(),
+        device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+        channel: Some("cli".to_owned()),
+    };
+    let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FBC";
+    let input_text = "check provider input parity";
+
+    let legacy_state = build_test_runtime_state(false);
+    upsert_test_orchestrator_session(&legacy_state, &context, session_id);
+    legacy_state
+        .journal_store
+        .start_orchestrator_run(&OrchestratorRunStartRequest {
+            run_id: "01ARZ3NDEKTSV4RRFFQ69G5FBD".to_owned(),
+            session_id: session_id.to_owned(),
+            origin_kind: String::new(),
+            origin_run_id: None,
+            triggered_by_principal: None,
+            parameter_delta_json: None,
+        })
+        .expect("legacy run should start");
+
+    let mut legacy_tape_seq = 1_i64;
+    let legacy_prepared = prepare_model_provider_input(
+        &legacy_state,
+        &context,
+        PrepareModelProviderInputRequest {
+            run_id: "01ARZ3NDEKTSV4RRFFQ69G5FBD",
+            tape_seq: &mut legacy_tape_seq,
+            session_id,
+            previous_run_id: None,
+            parameter_delta_json: None,
+            input_text,
+            attachments: &[],
+            memory_ingest_reason: "prepare_model_provider_input_legacy_parity_test",
+            memory_prompt_failure_mode: MemoryPromptFailureMode::Fail,
+            channel_for_log: "cli",
+        },
+    )
+    .await
+    .expect("legacy provider input preparation should succeed");
+    let legacy_tape = legacy_state
+        .journal_store
+        .orchestrator_tape("01ARZ3NDEKTSV4RRFFQ69G5FBD")
+        .expect("legacy tape should load");
+    assert!(
+        legacy_tape.iter().all(|event| event.event_type != "context.engine.plan"),
+        "legacy flow must not emit context engine explain events"
+    );
+
+    let rollout_state = build_test_runtime_state_with_runtime_overrides(
+        false,
+        false,
+        crate::config::FeatureRolloutsConfig {
+            context_engine: palyra_common::feature_rollouts::FeatureRolloutSetting::from_config(
+                true,
+            ),
+            ..crate::config::FeatureRolloutsConfig::default()
+        },
+    );
+    upsert_test_orchestrator_session(&rollout_state, &context, session_id);
+    rollout_state
+        .journal_store
+        .start_orchestrator_run(&OrchestratorRunStartRequest {
+            run_id: "01ARZ3NDEKTSV4RRFFQ69G5FBE".to_owned(),
+            session_id: session_id.to_owned(),
+            origin_kind: String::new(),
+            origin_run_id: None,
+            triggered_by_principal: None,
+            parameter_delta_json: None,
+        })
+        .expect("rollout run should start");
+
+    let mut rollout_tape_seq = 1_i64;
+    let rollout_prepared = prepare_model_provider_input(
+        &rollout_state,
+        &context,
+        PrepareModelProviderInputRequest {
+            run_id: "01ARZ3NDEKTSV4RRFFQ69G5FBE",
+            tape_seq: &mut rollout_tape_seq,
+            session_id,
+            previous_run_id: None,
+            parameter_delta_json: None,
+            input_text,
+            attachments: &[],
+            memory_ingest_reason: "prepare_model_provider_input_context_engine_test",
+            memory_prompt_failure_mode: MemoryPromptFailureMode::Fail,
+            channel_for_log: "cli",
+        },
+    )
+    .await
+    .expect("context engine provider input preparation should succeed");
+
+    assert_eq!(
+        rollout_prepared.provider_input_text, legacy_prepared.provider_input_text,
+        "context engine rollout should preserve provider input for the simple baseline case"
+    );
+    let rollout_tape = rollout_state
+        .journal_store
+        .orchestrator_tape("01ARZ3NDEKTSV4RRFFQ69G5FBE")
+        .expect("rollout tape should load");
+    let plan_event = rollout_tape
+        .iter()
+        .find(|event| event.event_type == "context.engine.plan")
+        .expect("context engine rollout should emit plan tape event");
+    let payload: Value =
+        serde_json::from_str(plan_event.payload_json.as_str()).expect("plan payload should decode");
+    assert_eq!(payload.get("rollout_enabled").and_then(Value::as_bool), Some(true));
+    assert_eq!(payload.get("strategy").and_then(Value::as_str), Some("noop"));
+    assert!(
+        payload.get("selected_segments").and_then(Value::as_array).is_some_and(|segments| segments
+            .iter()
+            .any(|segment| { segment.get("kind").and_then(Value::as_str) == Some("user_input") })),
+        "plan explain payload should surface the selected user input segment"
     );
 }
 

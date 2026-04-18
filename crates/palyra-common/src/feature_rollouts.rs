@@ -3,12 +3,14 @@ use std::{error::Error, fmt};
 use serde::{Deserialize, Serialize};
 
 pub const DYNAMIC_TOOL_BUILDER_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_DYNAMIC_TOOL_BUILDER";
+pub const CONTEXT_ENGINE_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_CONTEXT_ENGINE";
 pub const EXECUTION_BACKEND_REMOTE_NODE_ROLLOUT_ENV: &str =
     "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_REMOTE_NODE";
 pub const EXECUTION_BACKEND_SSH_TUNNEL_ROLLOUT_ENV: &str =
     "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_SSH_TUNNEL";
 
 pub const DYNAMIC_TOOL_BUILDER_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.dynamic_tool_builder";
+pub const CONTEXT_ENGINE_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.context_engine";
 pub const EXECUTION_BACKEND_REMOTE_NODE_ROLLOUT_CONFIG_PATH: &str =
     "feature_rollouts.execution_backend_remote_node";
 pub const EXECUTION_BACKEND_SSH_TUNNEL_ROLLOUT_CONFIG_PATH: &str =

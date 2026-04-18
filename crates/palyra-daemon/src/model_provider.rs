@@ -733,6 +733,14 @@ fn empty_runtime_metrics_snapshot() -> ProviderRuntimeMetricsSnapshot {
     }
 }
 
+fn empty_response_cache_snapshot(enabled: bool) -> ProviderResponseCacheSnapshot {
+    ProviderResponseCacheSnapshot { enabled, entry_count: 0, hit_count: 0, miss_count: 0 }
+}
+
+fn response_cache_enabled_from_config(config: &ModelProviderConfig) -> bool {
+    config.normalized_registry().map(|registry| registry.response_cache_enabled).unwrap_or(true)
+}
+
 fn registry_snapshot_from_config(
     config: &ModelProviderConfig,
     runtime_status: &ProviderStatusSnapshot,
@@ -1092,6 +1100,14 @@ pub struct ProviderRegistrySnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProviderResponseCacheSnapshot {
+    pub enabled: bool,
+    pub entry_count: usize,
+    pub hit_count: u64,
+    pub miss_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProviderStatusSnapshot {
     pub kind: String,
     pub provider_id: String,
@@ -1120,6 +1136,7 @@ pub struct ProviderStatusSnapshot {
     pub retry_policy: ProviderRetryPolicySnapshot,
     pub circuit_breaker: ProviderCircuitBreakerSnapshot,
     pub runtime_metrics: ProviderRuntimeMetricsSnapshot,
+    pub response_cache: ProviderResponseCacheSnapshot,
     pub health: ProviderHealthProbeSnapshot,
     pub discovery: ProviderDiscoverySnapshot,
     pub registry: ProviderRegistrySnapshot,
@@ -1369,6 +1386,19 @@ impl RegistryBackedModelProvider {
 
     fn runtime_metrics_snapshot(&self) -> ProviderRuntimeMetricsSnapshot {
         lock_runtime_metrics(&self.runtime_metrics).snapshot()
+    }
+
+    fn response_cache_snapshot(&self) -> ProviderResponseCacheSnapshot {
+        let cache = match self.response_cache.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        ProviderResponseCacheSnapshot {
+            enabled: self.registry.response_cache_enabled,
+            entry_count: cache.entries.len(),
+            hit_count: cache.hit_count,
+            miss_count: cache.miss_count,
+        }
     }
 
     fn compatible_chat_models(&self, request: &ProviderRequest) -> Vec<&ProviderModelEntryConfig> {
@@ -1865,6 +1895,7 @@ impl ModelProvider for RegistryBackedModelProvider {
                     open: false,
                 }),
             runtime_metrics: self.runtime_metrics_snapshot(),
+            response_cache: self.response_cache_snapshot(),
             health: default_provider_status.map(|snapshot| snapshot.health.clone()).unwrap_or_else(
                 || {
                     empty_health_probe_snapshot(
@@ -2193,6 +2224,9 @@ impl ModelProvider for DeterministicProvider {
                 open: false,
             },
             runtime_metrics: self.runtime_metrics_snapshot(),
+            response_cache: empty_response_cache_snapshot(response_cache_enabled_from_config(
+                &self.config,
+            )),
             health: empty_health_probe_snapshot(
                 "ok",
                 "deterministic provider is always available",
@@ -3070,6 +3104,9 @@ impl ModelProvider for OpenAiCompatibleProvider {
                 open,
             },
             runtime_metrics: self.runtime_metrics_snapshot(),
+            response_cache: empty_response_cache_snapshot(response_cache_enabled_from_config(
+                &self.config,
+            )),
             health: if self.config.openai_api_key.is_some() || self.config.auth_profile_id.is_some()
             {
                 empty_health_probe_snapshot("ok", "provider configured", "runtime")
@@ -3455,6 +3492,9 @@ impl ModelProvider for AnthropicProvider {
                 open,
             },
             runtime_metrics: self.runtime_metrics_snapshot(),
+            response_cache: empty_response_cache_snapshot(response_cache_enabled_from_config(
+                &self.config,
+            )),
             health: if self.config.anthropic_api_key.is_some()
                 || self.config.auth_profile_id.is_some()
             {
@@ -4125,6 +4165,11 @@ mod tests {
         assert!(second.served_from_cache);
         assert_eq!(second.attempts.len(), 1);
         assert_eq!(openai_request_count.load(Ordering::Relaxed), 1);
+        let snapshot = provider.status_snapshot();
+        assert!(snapshot.response_cache.enabled);
+        assert_eq!(snapshot.response_cache.entry_count, 1);
+        assert_eq!(snapshot.response_cache.hit_count, 1);
+        assert_eq!(snapshot.response_cache.miss_count, 1);
 
         openai_handle.join().expect("openai scripted server thread should exit");
     }

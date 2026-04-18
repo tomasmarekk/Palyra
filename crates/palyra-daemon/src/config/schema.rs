@@ -201,6 +201,7 @@ pub struct CronConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FeatureRolloutsConfig {
     pub dynamic_tool_builder: FeatureRolloutSetting,
+    pub context_engine: FeatureRolloutSetting,
     pub execution_backend_remote_node: FeatureRolloutSetting,
     pub execution_backend_ssh_tunnel: FeatureRolloutSetting,
 }

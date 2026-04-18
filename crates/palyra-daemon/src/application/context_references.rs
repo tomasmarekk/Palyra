@@ -128,9 +128,8 @@ pub(crate) async fn preview_context_references(
     })
 }
 
-pub(crate) fn render_context_reference_prompt(
+pub(crate) fn render_context_reference_block(
     preview: &ContextReferencePreviewEnvelope,
-    prompt_input_text: &str,
 ) -> Option<String> {
     if preview.references.is_empty() {
         return None;
@@ -159,7 +158,14 @@ pub(crate) fn render_context_reference_prompt(
         }
     }
     block.push_str("</context_references>");
+    Some(block)
+}
 
+pub(crate) fn render_context_reference_prompt(
+    preview: &ContextReferencePreviewEnvelope,
+    prompt_input_text: &str,
+) -> Option<String> {
+    let block = render_context_reference_block(preview)?;
     let trimmed_prompt = prompt_input_text.trim();
     let final_prompt = if trimmed_prompt.is_empty() {
         let clean_prompt = preview.clean_prompt.trim();

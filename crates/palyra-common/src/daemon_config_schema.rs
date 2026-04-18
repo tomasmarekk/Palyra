@@ -182,6 +182,7 @@ pub struct FileGatewayAccessConfig {
 #[serde(deny_unknown_fields)]
 pub struct FileFeatureRolloutsConfig {
     pub dynamic_tool_builder: Option<bool>,
+    pub context_engine: Option<bool>,
     pub execution_backend_remote_node: Option<bool>,
     pub execution_backend_ssh_tunnel: Option<bool>,
 }
@@ -689,6 +690,7 @@ mod tests {
             r#"
             [feature_rollouts]
             dynamic_tool_builder = true
+            context_engine = true
             execution_backend_remote_node = false
             execution_backend_ssh_tunnel = true
             "#,
@@ -698,6 +700,7 @@ mod tests {
         let feature_rollouts =
             parsed.feature_rollouts.as_ref().expect("feature_rollouts section should be available");
         assert_eq!(feature_rollouts.dynamic_tool_builder, Some(true));
+        assert_eq!(feature_rollouts.context_engine, Some(true));
         assert_eq!(feature_rollouts.execution_backend_remote_node, Some(false));
         assert_eq!(feature_rollouts.execution_backend_ssh_tunnel, Some(true));
     }
