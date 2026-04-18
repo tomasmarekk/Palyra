@@ -1062,11 +1062,67 @@ category = "nested_surface"
 status = "done"
 summary = "Plugin bind/install workflow."
 required_aliases = ["bind"]
-required_flags = ["artifact", "allow-tofu", "allow-untrusted"]
+required_flags = ["artifact", "config-json", "clear-config", "allow-tofu", "allow-untrusted", "json"]
 
 [entries.snapshot]
 path = "plugins install"
 file = "plugins-install-help.txt"
+
+[[entries]]
+path = "plugins inspect"
+category = "nested_surface"
+status = "done"
+summary = "Plugin inspection surface with discovery, config validation, and installed artifact details."
+required_aliases = ["info"]
+required_flags = ["json"]
+
+[entries.snapshot]
+path = "plugins inspect"
+file = "plugins-inspect-help.txt"
+
+[[entries]]
+path = "plugins discover"
+category = "nested_surface"
+status = "done"
+summary = "Plugin discovery inventory with readiness and skill filters."
+required_flags = ["plugin-id", "skill-id", "enabled-only", "ready-only", "json"]
+
+[entries.snapshot]
+path = "plugins discover"
+file = "plugins-discover-help.txt"
+
+[[entries]]
+path = "plugins explain"
+category = "nested_surface"
+status = "done"
+summary = "Explain why a plugin is not runnable across trust, config, grant, and filesystem checks."
+required_flags = ["json"]
+
+[entries.snapshot]
+path = "plugins explain"
+file = "plugins-explain-help.txt"
+
+[[entries]]
+path = "plugins doctor"
+category = "nested_surface"
+status = "done"
+summary = "Aggregate plugin health summary across all bindings or a selected plugin."
+required_flags = ["plugin-id", "json"]
+
+[entries.snapshot]
+path = "plugins doctor"
+file = "plugins-doctor-help.txt"
+
+[[entries]]
+path = "plugins update"
+category = "nested_surface"
+status = "done"
+summary = "Plugin binding update workflow with operator metadata and config contract management."
+required_flags = ["artifact", "config-json", "clear-config", "allow-tofu", "allow-untrusted", "json"]
+
+[entries.snapshot]
+path = "plugins update"
+file = "plugins-update-help.txt"
 
 [[entries]]
 path = "sessions show"

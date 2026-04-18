@@ -12,6 +12,7 @@ use std::{
 use anyhow::{Context, Result};
 use palyra_cli::proto::palyra::browser::v1 as browser_v1;
 use palyra_cli::proto::palyra::gateway::v1 as gateway_v1;
+use palyra_skills::{build_signed_skill_artifact, ArtifactFile, SkillArtifactBuildRequest};
 use reqwest::blocking::Client as BlockingClient;
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -333,6 +334,257 @@ fn session_compaction_cli_preview_surfaces_the_compaction_contract() -> Result<(
         "compaction preview output should include the structured summary contract"
     );
     assert_eq!(preview.get("eligible").and_then(Value::as_bool), Some(false));
+
+    Ok(())
+}
+
+#[test]
+fn plugin_operability_workflows_are_regression_tested() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let (daemon_child, admin_port, grpc_port) = spawn_palyrad_with_dynamic_ports(None, None)?;
+    let _daemon = ChildGuard::new(daemon_child);
+
+    let gateway_grpc_url = format!("http://127.0.0.1:{grpc_port}");
+    let config_path = workdir.path().join("plugin-workflow").join("palyra.toml");
+    write_browser_workflow_config(config_path.as_path(), admin_port, grpc_port)?;
+    let config_path_string = config_path.display().to_string();
+    let cli_env = admin_cli_envs(config_path_string.as_str(), gateway_grpc_url.as_str());
+    let fixtures = example_skill_fixture_paths()?;
+
+    let artifacts_dir = workdir.path().join("plugin-artifacts");
+    fs::create_dir_all(artifacts_dir.as_path())
+        .with_context(|| format!("failed to create {}", artifacts_dir.display()))?;
+
+    let stock_manifest = fs::read_to_string(fixtures.manifest_toml.as_path())
+        .with_context(|| format!("failed to read {}", fixtures.manifest_toml.display()))?;
+    let missing_grant_artifact = artifacts_dir.join("echo-missing-grant.palyra-skill");
+    build_workflow_plugin_artifact(
+        &fixtures,
+        missing_grant_artifact.as_path(),
+        stock_manifest,
+        [7_u8; 32],
+    )?;
+    let missing_grant_artifact_string = missing_grant_artifact.display().to_string();
+    let missing_grant_payload = assert_json_success(
+        run_cli(
+            &workdir,
+            &[
+                "plugins",
+                "install",
+                "acme.echo_missing_grant",
+                "--artifact",
+                missing_grant_artifact_string.as_str(),
+                "--tool-id",
+                "acme.echo",
+                "--module-path",
+                "modules/module.wasm",
+                "--entrypoint",
+                "run",
+                "--cap-http-host",
+                "api.example.com",
+                "--json",
+            ],
+            &cli_env,
+        )?,
+        "plugins install missing grant",
+    )?;
+    assert_eq!(
+        missing_grant_payload
+            .get("binding")
+            .and_then(|value| value.get("plugin_id"))
+            .and_then(Value::as_str),
+        Some("acme.echo_missing_grant")
+    );
+    assert_eq!(
+        missing_grant_payload
+            .get("check")
+            .and_then(|value| value.get("ready"))
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    let missing_grant_entries = missing_grant_payload
+        .get("check")
+        .and_then(|value| value.get("capabilities"))
+        .and_then(|value| value.get("entries"))
+        .and_then(Value::as_array)
+        .context("missing-grant install should expose capability diff entries")?;
+    assert!(
+        missing_grant_entries
+            .iter()
+            .any(|entry| entry.get("category").and_then(Value::as_str) == Some("missing_grant")),
+        "missing-grant install should surface missing_grant capability drift"
+    );
+
+    let invalid_config_artifact = artifacts_dir.join("echo-invalid-config.palyra-skill");
+    build_workflow_plugin_artifact(
+        &fixtures,
+        invalid_config_artifact.as_path(),
+        plugin_manifest_with_operator_config("acme.echo_configured", "1.0.0", "acme"),
+        [7_u8; 32],
+    )?;
+    let invalid_config_artifact_string = invalid_config_artifact.display().to_string();
+    let invalid_config_payload = assert_json_success(
+        run_cli(
+            &workdir,
+            &[
+                "plugins",
+                "install",
+                "acme.echo_invalid_config",
+                "--artifact",
+                invalid_config_artifact_string.as_str(),
+                "--config-json",
+                "{\"api_base_url\":42,\"api_token\":\"secret-token\"}",
+                "--json",
+            ],
+            &cli_env,
+        )?,
+        "plugins install invalid config",
+    )?;
+    assert_eq!(
+        invalid_config_payload
+            .get("check")
+            .and_then(|value| value.get("config"))
+            .and_then(|value| value.get("validation"))
+            .and_then(|value| value.get("state"))
+            .and_then(Value::as_str),
+        Some("invalid")
+    );
+
+    let signature_state_artifact = artifacts_dir.join("echo-signature-state.palyra-skill");
+    build_workflow_plugin_artifact(
+        &fixtures,
+        signature_state_artifact.as_path(),
+        plugin_manifest_with_operator_defaults("acme.echo_signature_state", "1.0.0", "acme"),
+        [19_u8; 32],
+    )?;
+    let signature_state_artifact_string = signature_state_artifact.display().to_string();
+    let signature_state_payload = assert_json_success(
+        run_cli(
+            &workdir,
+            &[
+                "plugins",
+                "install",
+                "acme.echo_signature_state",
+                "--artifact",
+                signature_state_artifact_string.as_str(),
+                "--allow-untrusted",
+                "--json",
+            ],
+            &cli_env,
+        )?,
+        "plugins install signature state override",
+    )?;
+    assert_eq!(
+        signature_state_payload
+            .get("installed_skill")
+            .and_then(|value| value.get("trust_decision"))
+            .and_then(Value::as_str),
+        Some("untrusted_override")
+    );
+    assert_eq!(
+        signature_state_payload
+            .get("check")
+            .and_then(|value| value.get("discovery"))
+            .and_then(|value| value.get("state"))
+            .and_then(Value::as_str),
+        Some("signature_failed")
+    );
+
+    let inspect_payload = assert_json_success(
+        run_cli(&workdir, &["plugins", "inspect", "acme.echo_invalid_config", "--json"], &cli_env)?,
+        "plugins inspect",
+    )?;
+    assert_eq!(
+        inspect_payload
+            .get("binding")
+            .and_then(|value| value.get("skill_id"))
+            .and_then(Value::as_str),
+        Some("acme.echo_configured")
+    );
+    assert_eq!(
+        inspect_payload
+            .get("check")
+            .and_then(|value| value.get("config"))
+            .and_then(|value| value.get("validation"))
+            .and_then(|value| value.get("state"))
+            .and_then(Value::as_str),
+        Some("invalid")
+    );
+
+    let discover_payload = assert_json_success(
+        run_cli(&workdir, &["plugins", "discover", "--json"], &cli_env)?,
+        "plugins discover",
+    )?;
+    assert_eq!(discover_payload.get("count").and_then(Value::as_u64), Some(3));
+    let discover_entries = discover_payload
+        .get("entries")
+        .and_then(Value::as_array)
+        .context("plugins discover should return entries")?;
+    assert_eq!(discover_entries.len(), 3);
+    assert!(
+        discover_entries.iter().any(|entry| {
+            entry.get("binding").and_then(|value| value.get("plugin_id")).and_then(Value::as_str)
+                == Some("acme.echo_signature_state")
+                && entry
+                    .get("check")
+                    .and_then(|value| value.get("discovery"))
+                    .and_then(|value| value.get("state"))
+                    .and_then(Value::as_str)
+                    == Some("signature_failed")
+        }),
+        "plugins discover should include signature failure state"
+    );
+
+    let explain_payload = assert_json_success(
+        run_cli(&workdir, &["plugins", "explain", "acme.echo_missing_grant", "--json"], &cli_env)?,
+        "plugins explain",
+    )?;
+    let explain_entries = explain_payload
+        .get("check")
+        .and_then(|value| value.get("capabilities"))
+        .and_then(|value| value.get("entries"))
+        .and_then(Value::as_array)
+        .context("plugins explain should include capability diff entries")?;
+    assert!(
+        explain_entries
+            .iter()
+            .any(|entry| entry.get("category").and_then(Value::as_str) == Some("missing_grant")),
+        "plugins explain should surface missing_grant capability drift"
+    );
+    assert!(
+        explain_payload
+            .get("check")
+            .and_then(|value| value.get("remediation"))
+            .and_then(Value::as_array)
+            .is_some_and(|steps| !steps.is_empty()),
+        "plugins explain should include remediation guidance"
+    );
+
+    let doctor_payload = assert_json_success(
+        run_cli(&workdir, &["plugins", "doctor", "--json"], &cli_env)?,
+        "plugins doctor",
+    )?;
+    assert_eq!(doctor_payload.get("total").and_then(Value::as_u64), Some(3));
+    assert_eq!(doctor_payload.get("ready").and_then(Value::as_u64), Some(0));
+    assert_eq!(doctor_payload.get("unhealthy").and_then(Value::as_u64), Some(3));
+    let doctor_plugins = doctor_payload
+        .get("plugins")
+        .and_then(Value::as_array)
+        .context("plugins doctor should return per-plugin summaries")?;
+    assert!(
+        doctor_plugins.iter().any(|plugin| {
+            plugin.get("plugin_id").and_then(Value::as_str) == Some("acme.echo_invalid_config")
+                && plugin.get("config").and_then(Value::as_str) == Some("invalid")
+        }),
+        "plugins doctor should summarize invalid config state"
+    );
+    assert!(
+        doctor_plugins.iter().any(|plugin| {
+            plugin.get("plugin_id").and_then(Value::as_str) == Some("acme.echo_signature_state")
+                && plugin.get("discovery").and_then(Value::as_str) == Some("signature_failed")
+        }),
+        "plugins doctor should summarize signature failure state"
+    );
 
     Ok(())
 }
@@ -1826,11 +2078,16 @@ fn parse_port_from_log(line: &str, prefix: &str) -> Option<u16> {
     rest[..end].parse::<SocketAddr>().ok().map(|address| address.port())
 }
 
-fn resolve_workspace_binary_path(base_name: &str) -> Result<PathBuf> {
-    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+fn workspace_root() -> Result<PathBuf> {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
-        .context("failed to resolve workspace root from CARGO_MANIFEST_DIR")?;
+        .map(Path::to_path_buf)
+        .context("failed to resolve workspace root from CARGO_MANIFEST_DIR")
+}
+
+fn resolve_workspace_binary_path(base_name: &str) -> Result<PathBuf> {
+    let workspace_root = workspace_root()?;
     let executable = if cfg!(windows) { format!("{base_name}.exe") } else { base_name.to_owned() };
     let path = workspace_root.join("target").join("debug").join(executable);
     if path.is_file() {
@@ -1854,6 +2111,160 @@ fn unique_temp_path(prefix: &str, extension: &str) -> PathBuf {
 
 fn unique_temp_dir_path(prefix: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{prefix}-{}-{}", std::process::id(), Ulid::new()))
+}
+
+struct ExampleSkillFixturePaths {
+    manifest_toml: PathBuf,
+    module_wasm: PathBuf,
+    prompt_asset: PathBuf,
+    sbom: PathBuf,
+    provenance: PathBuf,
+}
+
+fn example_skill_fixture_paths() -> Result<ExampleSkillFixturePaths> {
+    let root =
+        workspace_root()?.join("crates").join("palyra-skills").join("examples").join("echo-http");
+    let fixtures = ExampleSkillFixturePaths {
+        manifest_toml: root.join("skill.toml"),
+        module_wasm: root.join("module.wasm"),
+        prompt_asset: root.join("assets").join("prompt.txt"),
+        sbom: root.join("sbom.cdx.json"),
+        provenance: root.join("provenance.json"),
+    };
+    for path in [
+        fixtures.manifest_toml.as_path(),
+        fixtures.module_wasm.as_path(),
+        fixtures.prompt_asset.as_path(),
+        fixtures.sbom.as_path(),
+        fixtures.provenance.as_path(),
+    ] {
+        if !path.is_file() {
+            anyhow::bail!("workflow regression fixture is missing: {}", path.display());
+        }
+    }
+    Ok(fixtures)
+}
+
+fn build_workflow_plugin_artifact(
+    fixtures: &ExampleSkillFixturePaths,
+    artifact_path: &Path,
+    manifest_toml: String,
+    signing_key: [u8; 32],
+) -> Result<()> {
+    if let Some(parent) = artifact_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let output = build_signed_skill_artifact(SkillArtifactBuildRequest {
+        manifest_toml,
+        modules: vec![ArtifactFile {
+            path: "module.wasm".to_owned(),
+            bytes: fs::read(fixtures.module_wasm.as_path())
+                .with_context(|| format!("failed to read {}", fixtures.module_wasm.display()))?,
+        }],
+        assets: vec![ArtifactFile {
+            path: "prompt.txt".to_owned(),
+            bytes: fs::read(fixtures.prompt_asset.as_path())
+                .with_context(|| format!("failed to read {}", fixtures.prompt_asset.display()))?,
+        }],
+        sbom_cyclonedx_json: fs::read(fixtures.sbom.as_path())
+            .with_context(|| format!("failed to read {}", fixtures.sbom.display()))?,
+        provenance_json: fs::read(fixtures.provenance.as_path())
+            .with_context(|| format!("failed to read {}", fixtures.provenance.display()))?,
+        signing_key,
+    })
+    .context("failed to build workflow plugin artifact")?;
+    fs::write(artifact_path, output.artifact_bytes)
+        .with_context(|| format!("failed to write {}", artifact_path.display()))
+}
+
+fn plugin_manifest_with_operator_defaults(
+    skill_id: &str,
+    version: &str,
+    publisher: &str,
+) -> String {
+    format!(
+        r#"
+manifest_version = 2
+skill_id = "{skill_id}"
+name = "Workflow Plugin"
+version = "{version}"
+publisher = "{publisher}"
+
+[entrypoints]
+[[entrypoints.tools]]
+id = "acme.echo"
+name = "echo"
+description = "Echo fixture for plugin workflow regression"
+input_schema = {{ type = "object", properties = {{ text = {{ type = "string" }} }}, required = ["text"] }}
+output_schema = {{ type = "object", properties = {{ echo = {{ type = "string" }} }}, required = ["echo"] }}
+risk = {{ default_sensitive = false, requires_approval = false }}
+
+[compat]
+required_protocol_major = 1
+min_palyra_version = "0.1.0"
+
+[operator]
+display_name = "Workflow Plugin"
+summary = "Workflow regression fixture"
+
+[operator.plugin]
+default_tool_id = "acme.echo"
+default_module_path = "modules/module.wasm"
+default_entrypoint = "run"
+"#
+    )
+    .trim()
+    .to_owned()
+}
+
+fn plugin_manifest_with_operator_config(skill_id: &str, version: &str, publisher: &str) -> String {
+    format!(
+        r#"
+manifest_version = 2
+skill_id = "{skill_id}"
+name = "Configurable Workflow Plugin"
+version = "{version}"
+publisher = "{publisher}"
+
+[entrypoints]
+[[entrypoints.tools]]
+id = "acme.echo"
+name = "echo"
+description = "Echo fixture with operator config contract"
+input_schema = {{ type = "object", properties = {{ text = {{ type = "string" }} }}, required = ["text"] }}
+output_schema = {{ type = "object", properties = {{ echo = {{ type = "string" }} }}, required = ["echo"] }}
+risk = {{ default_sensitive = false, requires_approval = false }}
+
+[compat]
+required_protocol_major = 1
+min_palyra_version = "0.1.0"
+
+[operator]
+display_name = "Configurable Workflow Plugin"
+summary = "Workflow regression fixture with config contract"
+
+[operator.plugin]
+default_tool_id = "acme.echo"
+default_module_path = "modules/module.wasm"
+default_entrypoint = "run"
+
+[operator.config]
+schema_version = 1
+required = ["api_base_url", "api_token"]
+
+[operator.config.properties.api_base_url]
+type = "string"
+title = "API base URL"
+
+[operator.config.properties.api_token]
+type = "string"
+title = "API token"
+redacted = true
+"#
+    )
+    .trim()
+    .to_owned()
 }
 
 struct ChildGuard {

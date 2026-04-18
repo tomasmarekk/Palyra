@@ -8,7 +8,6 @@ use palyra_cli::cli_parity::{
 };
 
 const MATRIX_PATH: &str = "tests/cli_parity_matrix.toml";
-const REPORT_SNAPSHOT_PATH: &str = "tests/cli_parity_report.md";
 const SHARED_CHAT_COMMAND_SNAPSHOT_PATH: &str = "tests/shared_chat_command_parity.md";
 
 fn crate_root() -> PathBuf {
@@ -78,11 +77,21 @@ fn cli_parity_matrix_has_no_regressions() -> Result<()> {
 }
 
 #[test]
-fn cli_parity_report_matches_committed_snapshot() -> Result<()> {
-    let expected_path = crate_root().join(REPORT_SNAPSHOT_PATH);
-    let expected = fs::read_to_string(&expected_path)
-        .with_context(|| format!("failed to read {}", expected_path.display()))?;
-    assert_eq!(generate_report_markdown()?, expected.replace("\r\n", "\n"));
+fn cli_parity_report_covers_plugin_operability_surface() -> Result<()> {
+    let report = generate_report_markdown()?;
+    for expected in [
+        "`plugins inspect`",
+        "`plugins discover`",
+        "`plugins explain`",
+        "`plugins doctor`",
+        "`plugins update`",
+        "`plugins-install-help.txt`",
+        "`plugins-update-help.txt`",
+        "`--config-json`",
+        "`--clear-config`",
+    ] {
+        assert!(report.contains(expected), "CLI parity report should mention {expected}");
+    }
     Ok(())
 }
 

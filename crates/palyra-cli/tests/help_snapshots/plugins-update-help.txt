@@ -1,4 +1,4 @@
-Usage: palyra plugins install [OPTIONS] <PLUGIN_ID>
+Usage: palyra plugins update [OPTIONS] <PLUGIN_ID>
 
 Arguments:
   <PLUGIN_ID>

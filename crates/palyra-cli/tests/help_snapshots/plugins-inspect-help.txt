@@ -1,19 +1,10 @@
-Usage: palyra plugins [OPTIONS] <COMMAND>
+Usage: palyra plugins inspect [OPTIONS] <PLUGIN_ID>
 
-Commands:
-  list
-  inspect   [aliases: info]
-  discover
-  check
-  explain
-  doctor
-  install   [aliases: bind]
-  update
-  enable
-  disable
-  remove
+Arguments:
+  <PLUGIN_ID>
 
 Options:
+      --json
   -h, --help  Print help
 
 Global Options:

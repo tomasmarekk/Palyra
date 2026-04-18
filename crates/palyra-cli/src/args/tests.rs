@@ -4852,6 +4852,8 @@ fn parse_plugins_and_hooks_commands() {
                 notes: Some("prod plugin".to_owned()),
                 owner_principal: Some("user:ops".to_owned()),
                 tags: vec!["prod".to_owned()],
+                config_json: None,
+                clear_config: false,
                 disabled: false,
                 allow_tofu: true,
                 allow_untrusted: true,
@@ -5154,7 +5156,7 @@ fn parse_webhooks_verify_alias_and_payload_source_conflict() {
 }
 
 #[test]
-fn parse_plugins_install_and_check() {
+fn parse_plugins_install_command() {
     let install = Cli::parse_from([
         "palyra",
         "plugins",
@@ -5188,58 +5190,199 @@ fn parse_plugins_install_and_check() {
         "user:ops",
         "--tag",
         "prod",
+        "--config-json",
+        "{\"api_token\":\"vault:global/openai\"}",
         "--disabled",
         "--allow-untrusted",
         "--json",
     ]);
-    assert_eq!(
-        install.command,
+    match install.command {
         Command::Plugins {
-            command: PluginsCommand::Install {
-                plugin_id: "acme.echo_http_plugin".to_owned(),
-                skill_id: Some("acme.echo_http".to_owned()),
-                skill_version: Some("1.2.3".to_owned()),
-                artifact_path: Some("dist/acme.echo_http.palyra-skill".to_owned()),
-                tool_id: Some("acme.echo_http".to_owned()),
-                module_path: Some("modules/plugin.wasm".to_owned()),
-                entrypoint: Some("run".to_owned()),
-                capability_http_hosts: vec!["api.example.com".to_owned()],
-                capability_secrets: vec!["global/openai_api_key".to_owned()],
-                capability_storage_prefixes: vec!["plugins/cache".to_owned()],
-                capability_channels: vec!["cli".to_owned()],
-                display_name: Some("Echo HTTP".to_owned()),
-                notes: Some("ops managed".to_owned()),
-                owner_principal: Some("user:ops".to_owned()),
-                tags: vec!["prod".to_owned()],
-                disabled: true,
-                allow_tofu: false,
-                allow_untrusted: true,
-                json: true,
-            },
+            command:
+                PluginsCommand::Install {
+                    plugin_id,
+                    skill_id,
+                    skill_version,
+                    artifact_path,
+                    tool_id,
+                    module_path,
+                    entrypoint,
+                    capability_http_hosts,
+                    capability_secrets,
+                    capability_storage_prefixes,
+                    capability_channels,
+                    display_name,
+                    notes,
+                    owner_principal,
+                    tags,
+                    config_json,
+                    clear_config,
+                    disabled,
+                    allow_tofu,
+                    allow_untrusted,
+                    json,
+                },
+        } => {
+            assert_eq!(plugin_id, "acme.echo_http_plugin");
+            assert_eq!(skill_id.as_deref(), Some("acme.echo_http"));
+            assert_eq!(skill_version.as_deref(), Some("1.2.3"));
+            assert_eq!(artifact_path.as_deref(), Some("dist/acme.echo_http.palyra-skill"));
+            assert_eq!(tool_id.as_deref(), Some("acme.echo_http"));
+            assert_eq!(module_path.as_deref(), Some("modules/plugin.wasm"));
+            assert_eq!(entrypoint.as_deref(), Some("run"));
+            assert_eq!(capability_http_hosts, vec!["api.example.com".to_owned()]);
+            assert_eq!(capability_secrets, vec!["global/openai_api_key".to_owned()]);
+            assert_eq!(capability_storage_prefixes, vec!["plugins/cache".to_owned()]);
+            assert_eq!(capability_channels, vec!["cli".to_owned()]);
+            assert_eq!(display_name.as_deref(), Some("Echo HTTP"));
+            assert_eq!(notes.as_deref(), Some("ops managed"));
+            assert_eq!(owner_principal.as_deref(), Some("user:ops"));
+            assert_eq!(tags, vec!["prod".to_owned()]);
+            assert_eq!(config_json.as_deref(), Some("{\"api_token\":\"vault:global/openai\"}"));
+            assert!(!clear_config);
+            assert!(disabled);
+            assert!(!allow_tofu);
+            assert!(allow_untrusted);
+            assert!(json);
         }
-    );
+        other => panic!("unexpected install parse result: {other:?}"),
+    }
+}
 
+#[test]
+fn parse_plugins_inspect_and_check_commands() {
     let info = Cli::parse_from(["palyra", "plugins", "info", "acme.echo_http_plugin"]);
-    assert_eq!(
-        info.command,
-        Command::Plugins {
-            command: PluginsCommand::Info {
-                plugin_id: "acme.echo_http_plugin".to_owned(),
-                json: false,
-            },
+    match info.command {
+        Command::Plugins { command: PluginsCommand::Inspect { plugin_id, json } } => {
+            assert_eq!(plugin_id, "acme.echo_http_plugin");
+            assert!(!json);
         }
-    );
+        other => panic!("unexpected inspect parse result: {other:?}"),
+    }
 
     let check = Cli::parse_from(["palyra", "plugins", "check", "acme.echo_http_plugin"]);
-    assert_eq!(
-        check.command,
-        Command::Plugins {
-            command: PluginsCommand::Check {
-                plugin_id: "acme.echo_http_plugin".to_owned(),
-                json: false,
-            },
+    match check.command {
+        Command::Plugins { command: PluginsCommand::Check { plugin_id, json } } => {
+            assert_eq!(plugin_id, "acme.echo_http_plugin");
+            assert!(!json);
         }
-    );
+        other => panic!("unexpected check parse result: {other:?}"),
+    }
+}
+
+#[test]
+fn parse_plugins_discover_explain_and_doctor_commands() {
+    let discover = Cli::parse_from([
+        "palyra",
+        "plugins",
+        "discover",
+        "--skill-id",
+        "acme.echo_http",
+        "--ready-only",
+        "--json",
+    ]);
+    match discover.command {
+        Command::Plugins {
+            command:
+                PluginsCommand::Discover { plugin_id, skill_id, enabled_only, ready_only, json },
+        } => {
+            assert_eq!(plugin_id, None);
+            assert_eq!(skill_id.as_deref(), Some("acme.echo_http"));
+            assert!(!enabled_only);
+            assert!(ready_only);
+            assert!(json);
+        }
+        other => panic!("unexpected discover parse result: {other:?}"),
+    }
+
+    let explain = Cli::parse_from(["palyra", "plugins", "explain", "acme.echo_http_plugin"]);
+    match explain.command {
+        Command::Plugins { command: PluginsCommand::Explain { plugin_id, json } } => {
+            assert_eq!(plugin_id, "acme.echo_http_plugin");
+            assert!(!json);
+        }
+        other => panic!("unexpected explain parse result: {other:?}"),
+    }
+
+    let doctor = Cli::parse_from([
+        "palyra",
+        "plugins",
+        "doctor",
+        "--plugin-id",
+        "acme.echo_http_plugin",
+        "--json",
+    ]);
+    match doctor.command {
+        Command::Plugins { command: PluginsCommand::Doctor { plugin_id, json } } => {
+            assert_eq!(plugin_id.as_deref(), Some("acme.echo_http_plugin"));
+            assert!(json);
+        }
+        other => panic!("unexpected doctor parse result: {other:?}"),
+    }
+}
+
+#[test]
+fn parse_plugins_update_command() {
+    let update = Cli::parse_from([
+        "palyra",
+        "plugins",
+        "update",
+        "acme.echo_http_plugin",
+        "--skill-id",
+        "acme.echo_http",
+        "--clear-config",
+    ]);
+    match update.command {
+        Command::Plugins {
+            command:
+                PluginsCommand::Update {
+                    plugin_id,
+                    skill_id,
+                    skill_version,
+                    artifact_path,
+                    tool_id,
+                    module_path,
+                    entrypoint,
+                    capability_http_hosts,
+                    capability_secrets,
+                    capability_storage_prefixes,
+                    capability_channels,
+                    display_name,
+                    notes,
+                    owner_principal,
+                    tags,
+                    config_json,
+                    clear_config,
+                    disabled,
+                    allow_tofu,
+                    allow_untrusted,
+                    json,
+                },
+        } => {
+            assert_eq!(plugin_id, "acme.echo_http_plugin");
+            assert_eq!(skill_id.as_deref(), Some("acme.echo_http"));
+            assert_eq!(skill_version, None);
+            assert_eq!(artifact_path, None);
+            assert_eq!(tool_id, None);
+            assert_eq!(module_path, None);
+            assert_eq!(entrypoint, None);
+            assert!(capability_http_hosts.is_empty());
+            assert!(capability_secrets.is_empty());
+            assert!(capability_storage_prefixes.is_empty());
+            assert!(capability_channels.is_empty());
+            assert_eq!(display_name, None);
+            assert_eq!(notes, None);
+            assert_eq!(owner_principal, None);
+            assert!(tags.is_empty());
+            assert_eq!(config_json, None);
+            assert!(clear_config);
+            assert!(!disabled);
+            assert!(!allow_tofu);
+            assert!(!allow_untrusted);
+            assert!(!json);
+        }
+        other => panic!("unexpected update parse result: {other:?}"),
+    }
 }
 
 #[test]
