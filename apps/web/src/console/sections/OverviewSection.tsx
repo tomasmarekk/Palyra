@@ -1378,9 +1378,8 @@ function buildAttentionItems({
       `${leaseDeferredTotal} background or auxiliary runs were deferred by lease pressure.`,
     );
   }
-  if (objectiveAttentionCount > 0) {
+  if (objectiveAttentionCount > 0)
     items.push(`${objectiveAttentionCount} objectives need health follow-up.`);
-  }
   if (providerState === "degraded" || providerState === "expired" || providerState === "missing") {
     items.push(`Provider auth state is ${providerState}.`);
   }

@@ -56,10 +56,15 @@ export function UsageSection({ app }: UsageSectionProps) {
     providerRegistry?.credentials.filter(
       (credential) => credential.availabilityState !== "available",
     ).length ?? 0;
+  const budgetSignalCount = (usage.insights?.budgets.evaluations ?? []).filter(
+    (entry) => entry.status !== "ok",
+  ).length;
   const sharedLeaseWaiters =
     (readNumber(leaseManager ?? {}, "foreground_waiters") ?? 0) +
     (readNumber(leaseManager ?? {}, "background_waiters") ?? 0);
   const sharedLeaseDeferred = readNumber(leaseManager ?? {}, "deferred_total") ?? 0;
+  const runtimeCredentialLabel =
+    providerRegistry?.credentialId ?? providerRegistry?.credentialSource ?? "n/a";
 
   return (
     <main className="workspace-page">
@@ -226,12 +231,7 @@ export function UsageSection({ app }: UsageSectionProps) {
               </div>
               <div>
                 <dt>Budget signals</dt>
-                <dd>
-                  {
-                    usage.insights.budgets.evaluations.filter((entry) => entry.status !== "ok")
-                      .length
-                  }
-                </dd>
+                <dd>{budgetSignalCount}</dd>
               </div>
               <div>
                 <dt>Runtime provider</dt>
@@ -243,9 +243,7 @@ export function UsageSection({ app }: UsageSectionProps) {
               </div>
               <div>
                 <dt>Runtime credential</dt>
-                <dd>
-                  {providerRegistry?.credentialId ?? providerRegistry?.credentialSource ?? "n/a"}
-                </dd>
+                <dd>{runtimeCredentialLabel}</dd>
               </div>
               <div>
                 <dt>Shared lease waiters</dt>

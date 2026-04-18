@@ -84,6 +84,8 @@ export function AuthSection({ app }: AuthSectionProps) {
     providerRegistry?.credentials.filter(
       (credential) => credential.availabilityState !== "available",
     ).length ?? 0;
+  const runtimeCredentialLabel =
+    providerRegistry?.credentialId ?? providerRegistry?.credentialSource ?? "n/a";
 
   return (
     <main className="workspace-page">
@@ -286,9 +288,7 @@ export function AuthSection({ app }: AuthSectionProps) {
                   </div>
                   <div>
                     <dt>Runtime credential</dt>
-                    <dd>
-                      {providerRegistry.credentialId ?? providerRegistry.credentialSource ?? "n/a"}
-                    </dd>
+                    <dd>{runtimeCredentialLabel}</dd>
                   </div>
                   <div>
                     <dt>Failover</dt>
