@@ -17,6 +17,7 @@ use crate::{
         ProviderRegistryModelSnapshot, ProviderRegistryProviderSnapshot, ProviderStatusSnapshot,
     },
     orchestrator::estimate_token_count,
+    provider_leases::{LeasePreviewState, LeasePriority, ProviderLeasePreviewSnapshot},
     transport::grpc::auth::RequestContext,
 };
 
@@ -54,6 +55,7 @@ impl RoutingMode {
 pub(crate) struct SmartRoutingRuntimeConfig {
     pub enabled: bool,
     pub default_mode: String,
+    pub auxiliary_routing_enabled: bool,
 }
 
 impl SmartRoutingRuntimeConfig {
@@ -62,6 +64,63 @@ impl SmartRoutingRuntimeConfig {
             return RoutingMode::Suggest;
         }
         RoutingMode::parse(self.default_mode.as_str()).unwrap_or(RoutingMode::Suggest)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RoutingTaskClass {
+    PrimaryInteractive,
+    BackgroundAutomation,
+    AuxiliarySummary,
+    AuxiliaryRecall,
+    AuxiliaryClassification,
+}
+
+impl RoutingTaskClass {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::PrimaryInteractive => "primary_interactive",
+            Self::BackgroundAutomation => "background_automation",
+            Self::AuxiliarySummary => "auxiliary_summary",
+            Self::AuxiliaryRecall => "auxiliary_recall",
+            Self::AuxiliaryClassification => "auxiliary_classification",
+        }
+    }
+
+    pub(crate) const fn lease_priority(self) -> LeasePriority {
+        match self {
+            Self::PrimaryInteractive => LeasePriority::Foreground,
+            Self::BackgroundAutomation
+            | Self::AuxiliarySummary
+            | Self::AuxiliaryRecall
+            | Self::AuxiliaryClassification => LeasePriority::Background,
+        }
+    }
+
+    pub(crate) const fn max_lease_wait_ms(self) -> u64 {
+        match self {
+            Self::PrimaryInteractive => 750,
+            Self::BackgroundAutomation => 200,
+            Self::AuxiliarySummary | Self::AuxiliaryRecall => 150,
+            Self::AuxiliaryClassification => 100,
+        }
+    }
+
+    const fn is_auxiliary(self) -> bool {
+        !matches!(self, Self::PrimaryInteractive)
+    }
+
+    const fn prefers_low_cost(self) -> bool {
+        matches!(self, Self::BackgroundAutomation | Self::AuxiliarySummary | Self::AuxiliaryRecall)
+    }
+
+    const fn prefers_low_latency(self) -> bool {
+        matches!(self, Self::AuxiliaryClassification)
+    }
+
+    const fn allows_cost_escalation(self) -> bool {
+        matches!(self, Self::PrimaryInteractive)
     }
 }
 
@@ -113,20 +172,26 @@ pub(crate) struct RoutingDecision {
     pub mode: String,
     pub scope_kind: String,
     pub scope_id: String,
+    pub task_class: String,
     pub default_model_id: String,
     pub recommended_model_id: String,
     pub actual_model_id: String,
     pub provider_id: String,
     pub provider_kind: String,
+    pub credential_id: String,
     pub complexity_score: f64,
     pub health_state: String,
     pub explanation: Vec<String>,
+    pub reason_codes: Vec<String>,
+    pub routing_action: String,
+    pub lease: ProviderLeasePreviewSnapshot,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_cost: Option<PricingEstimate>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget_outcome: Option<String>,
     pub blocked: bool,
     pub approval_required: bool,
+    pub deferred: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -134,6 +199,7 @@ pub(crate) struct RoutingDecisionContext<'a> {
     pub scope_kind: &'a str,
     pub scope_id: &'a str,
     pub mode: RoutingMode,
+    pub task_class: RoutingTaskClass,
     pub default_model_id: &'a str,
     pub prompt_text: &'a str,
     pub prompt_tokens_estimate: u64,
@@ -141,6 +207,8 @@ pub(crate) struct RoutingDecisionContext<'a> {
     pub vision_inputs: usize,
     pub provider_health_state: &'a str,
     pub provider_snapshot: &'a ProviderStatusSnapshot,
+    pub auxiliary_routing_enabled: bool,
+    pub lease_previews: &'a HashMap<String, ProviderLeasePreviewSnapshot>,
     pub pricing: &'a [UsagePricingRecord],
     pub budgets: &'a [UsageBudgetEvaluation],
 }
@@ -149,10 +217,14 @@ pub(crate) struct RoutingDecisionContext<'a> {
 struct RoutingModelSelection {
     complexity_score: f64,
     explanation: Vec<String>,
+    reason_codes: Vec<String>,
     recommended_model_id: String,
     actual_model_id: String,
     provider_id: String,
     provider_kind: String,
+    credential_id: String,
+    routing_action: String,
+    lease: ProviderLeasePreviewSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,9 +232,11 @@ struct RoutingCandidate {
     model_id: String,
     provider_id: String,
     provider_kind: String,
+    credential_id: String,
     health_state: String,
     cost_rank: u8,
     latency_rank: u8,
+    lease: ProviderLeasePreviewSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -224,6 +298,7 @@ pub(crate) struct UsageRoutingPlanRequest<'a> {
     pub vision_inputs: usize,
     pub scope_kind: &'a str,
     pub scope_id: &'a str,
+    pub task_class: RoutingTaskClass,
     pub provider_snapshot: &'a ProviderStatusSnapshot,
 }
 
@@ -293,10 +368,16 @@ pub(crate) async fn plan_usage_routing(
         load_budget_override_approvals(request.runtime_state, &budget_policies).await;
     let provider_health_state = provider_health_state(request.provider_snapshot);
     let prompt_tokens_estimate = estimate_token_count(request.prompt_text);
+    let lease_previews = build_provider_lease_previews(
+        request.runtime_state,
+        request.provider_snapshot,
+        request.task_class,
+    );
     let projected_selection = select_routing_models(&RoutingDecisionContext {
         scope_kind: request.scope_kind,
         scope_id: request.scope_id,
         mode,
+        task_class: request.task_class,
         default_model_id: default_model_id.as_str(),
         prompt_text: request.prompt_text,
         prompt_tokens_estimate,
@@ -304,6 +385,12 @@ pub(crate) async fn plan_usage_routing(
         vision_inputs: request.vision_inputs,
         provider_health_state,
         provider_snapshot: request.provider_snapshot,
+        auxiliary_routing_enabled: request
+            .runtime_state
+            .config
+            .smart_routing
+            .auxiliary_routing_enabled,
+        lease_previews: &lease_previews,
         pricing: pricing.as_slice(),
         budgets: &[],
     });
@@ -377,6 +464,7 @@ pub(crate) async fn plan_usage_routing(
         scope_kind: request.scope_kind,
         scope_id: request.scope_id,
         mode,
+        task_class: request.task_class,
         default_model_id: default_model_id.as_str(),
         prompt_text: request.prompt_text,
         prompt_tokens_estimate,
@@ -384,6 +472,12 @@ pub(crate) async fn plan_usage_routing(
         vision_inputs: request.vision_inputs,
         provider_health_state,
         provider_snapshot: request.provider_snapshot,
+        auxiliary_routing_enabled: request
+            .runtime_state
+            .config
+            .smart_routing
+            .auxiliary_routing_enabled,
+        lease_previews: &lease_previews,
         pricing: pricing.as_slice(),
         budgets: budget_evaluations.as_slice(),
     });
@@ -409,6 +503,12 @@ pub(crate) async fn plan_usage_routing(
             explanation_json: json!({
                 "explanation": decision.explanation,
                 "budget_outcome": decision.budget_outcome,
+                "reason_codes": decision.reason_codes,
+                "task_class": decision.task_class,
+                "routing_action": decision.routing_action,
+                "credential_id": decision.credential_id,
+                "lease": decision.lease,
+                "deferred": decision.deferred,
             })
             .to_string(),
             estimated_cost_lower_usd: decision
@@ -448,6 +548,11 @@ pub(crate) async fn plan_usage_routing(
     if decision.blocked {
         return Err(Status::failed_precondition(
             "usage budget hard limit blocked the requested run",
+        ));
+    }
+    if decision.deferred {
+        return Err(Status::resource_exhausted(
+            "shared provider lease pressure deferred the requested background or auxiliary task",
         ));
     }
     Ok(decision)
@@ -620,9 +725,12 @@ pub(crate) fn evaluate_budget_policies(
 pub(crate) fn decide_routing(context: RoutingDecisionContext<'_>) -> RoutingDecision {
     let selection = select_routing_models(&context);
     let mut explanation = selection.explanation.clone();
+    let mut reason_codes = selection.reason_codes.clone();
 
     let mut blocked = false;
     let mut approval_required = false;
+    let deferred =
+        selection.lease.state == LeasePreviewState::Deferred && context.task_class.is_auxiliary();
     let mut budget_outcome = None;
     for evaluation in context.budgets {
         if matches!(
@@ -632,6 +740,14 @@ pub(crate) fn decide_routing(context: RoutingDecisionContext<'_>) -> RoutingDeci
             explanation.push(evaluation.message.clone());
             budget_outcome = Some(evaluation.status.clone());
         }
+        match evaluation.status.as_str() {
+            "soft_limit" => reason_codes.push("budget_soft_limit".to_owned()),
+            "hard_limit" => reason_codes.push("budget_hard_limit".to_owned()),
+            "blocked" => reason_codes.push("budget_blocked".to_owned()),
+            "approval_required" => reason_codes.push("budget_approval_required".to_owned()),
+            "override_applied" => reason_codes.push("budget_override_applied".to_owned()),
+            _ => {}
+        }
         if evaluation.status == "blocked" {
             blocked = true;
         }
@@ -639,6 +755,15 @@ pub(crate) fn decide_routing(context: RoutingDecisionContext<'_>) -> RoutingDeci
             approval_required = true;
         }
     }
+    if deferred {
+        explanation.push(
+            "Shared provider lease pressure reserved capacity for foreground work, so this background or auxiliary task should defer."
+                .to_owned(),
+        );
+        reason_codes.push("lease_deferred".to_owned());
+    }
+    reason_codes.sort();
+    reason_codes.dedup();
 
     let estimate = estimate_cost_for_model(
         context.pricing,
@@ -654,18 +779,32 @@ pub(crate) fn decide_routing(context: RoutingDecisionContext<'_>) -> RoutingDeci
         mode: context.mode.as_str().to_owned(),
         scope_kind: context.scope_kind.to_owned(),
         scope_id: context.scope_id.to_owned(),
+        task_class: context.task_class.as_str().to_owned(),
         default_model_id: context.default_model_id.to_owned(),
         recommended_model_id: selection.recommended_model_id,
         actual_model_id: selection.actual_model_id,
         provider_id: selection.provider_id,
         provider_kind: selection.provider_kind,
+        credential_id: selection.credential_id,
         complexity_score: selection.complexity_score,
         health_state: context.provider_health_state.to_owned(),
         explanation,
+        reason_codes,
+        routing_action: if approval_required {
+            "approval_required".to_owned()
+        } else if blocked {
+            "blocked".to_owned()
+        } else if deferred {
+            "defer".to_owned()
+        } else {
+            selection.routing_action
+        },
+        lease: selection.lease,
         estimated_cost: Some(estimate),
         budget_outcome,
         blocked,
         approval_required,
+        deferred,
     }
 }
 
@@ -676,15 +815,41 @@ fn select_routing_models(context: &RoutingDecisionContext<'_>) -> RoutingModelSe
         context.json_mode,
         context.vision_inputs,
     );
+    let mut reason_codes = vec![format!("task_class_{}", context.task_class.as_str())];
     let mut explanation = vec![format!(
         "Complexity {:.2} derived from prompt length, token estimate, JSON mode, and vision inputs.",
         complexity_score
     )];
+    explanation.push(format!(
+        "Task class {} applies shared routing, lease, and budget guardrails.",
+        context.task_class.as_str()
+    ));
+    if context.task_class.is_auxiliary() && !context.auxiliary_routing_enabled {
+        let default_candidate = default_routing_candidate(context);
+        explanation.push(
+            "Auxiliary routing is disabled, so the default model remains pinned for this internal task."
+                .to_owned(),
+        );
+        reason_codes.push("auxiliary_routing_disabled".to_owned());
+        return RoutingModelSelection {
+            complexity_score,
+            explanation,
+            reason_codes,
+            recommended_model_id: default_candidate.model_id.clone(),
+            actual_model_id: default_candidate.model_id.clone(),
+            provider_id: default_candidate.provider_id.clone(),
+            provider_kind: default_candidate.provider_kind.clone(),
+            credential_id: default_candidate.credential_id.clone(),
+            routing_action: "proceed".to_owned(),
+            lease: default_candidate.lease,
+        };
+    }
     if context.provider_health_state != "ok" {
         explanation.push(format!(
             "Provider health is {}, so routing stays conservative.",
             context.provider_health_state
         ));
+        reason_codes.push("provider_health_degraded".to_owned());
     }
 
     let mut candidates = build_routing_candidates(context);
@@ -706,6 +871,7 @@ fn select_routing_models(context: &RoutingDecisionContext<'_>) -> RoutingModelSe
             "Capability filters removed one or more chat models that could not satisfy the request."
                 .to_owned(),
         );
+        reason_codes.push("capability_filter_applied".to_owned());
     }
 
     let mut recommendation_pool = candidates.clone();
@@ -718,13 +884,47 @@ fn select_routing_models(context: &RoutingDecisionContext<'_>) -> RoutingModelSe
             "Default provider {} is {}, so smart routing prefers a healthy registry fallback.",
             default_candidate.provider_id, default_candidate.health_state
         ));
+        reason_codes.push("healthy_failover_preferred".to_owned());
+    }
+
+    if recommendation_pool.iter().any(|candidate| candidate.lease.state == LeasePreviewState::Ready)
+        && recommendation_pool
+            .iter()
+            .any(|candidate| candidate.lease.state != LeasePreviewState::Ready)
+    {
+        recommendation_pool.retain(|candidate| candidate.lease.state == LeasePreviewState::Ready);
+        explanation.push(
+            "Shared lease pressure removed one or more busy candidates from the active recommendation pool."
+                .to_owned(),
+        );
+        reason_codes.push("lease_ready_candidate_preferred".to_owned());
     }
 
     let recommended_candidate = choose_routing_candidate(
         recommendation_pool.as_slice(),
         &default_candidate,
+        context.task_class,
         complexity_score,
     );
+    let recommended_candidate = if context.task_class.is_auxiliary()
+        && !context.task_class.allows_cost_escalation()
+        && recommended_candidate.cost_rank > default_candidate.cost_rank
+    {
+        recommendation_pool
+            .iter()
+            .filter(|candidate| candidate.cost_rank <= default_candidate.cost_rank)
+            .min_by(|left, right| {
+                lease_pressure_rank(left)
+                    .cmp(&lease_pressure_rank(right))
+                    .then_with(|| left.cost_rank.cmp(&right.cost_rank))
+                    .then_with(|| left.latency_rank.cmp(&right.latency_rank))
+                    .then_with(|| left.model_id.cmp(&right.model_id))
+            })
+            .cloned()
+            .unwrap_or_else(|| default_candidate.clone())
+    } else {
+        recommended_candidate
+    };
     let actual_candidate = match context.mode {
         RoutingMode::Suggest | RoutingMode::DryRun => default_candidate.clone(),
         RoutingMode::Enforced => recommended_candidate.clone(),
@@ -737,15 +937,47 @@ fn select_routing_models(context: &RoutingDecisionContext<'_>) -> RoutingModelSe
             "Mode {} keeps the default model active while still publishing the recommendation.",
             context.mode.as_str()
         ));
+        reason_codes.push("mode_publish_only".to_owned());
     }
+    if context.task_class.is_auxiliary()
+        && !context.task_class.allows_cost_escalation()
+        && recommended_candidate.cost_rank > default_candidate.cost_rank
+    {
+        explanation.push(
+            "Auxiliary guardrails avoid escalating internal work onto a more expensive model than the default."
+                .to_owned(),
+        );
+        reason_codes.push("auxiliary_cost_guardrail".to_owned());
+    }
+    if actual_candidate.lease.state == LeasePreviewState::Waiting {
+        explanation.push(format!(
+            "Shared lease pressure may delay this request by roughly {} ms.",
+            actual_candidate.lease.estimated_wait_ms.unwrap_or_default()
+        ));
+        reason_codes.push("lease_wait_expected".to_owned());
+    }
+    if actual_candidate.lease.state == LeasePreviewState::Deferred {
+        explanation.push(
+            "Shared lease pressure currently reserves this provider slot for foreground work."
+                .to_owned(),
+        );
+        reason_codes.push("lease_defer_expected".to_owned());
+    }
+    reason_codes.sort();
+    reason_codes.dedup();
+    let routing_action = routing_action_for_selection(&default_candidate, &actual_candidate);
 
     RoutingModelSelection {
         complexity_score,
         explanation,
+        reason_codes,
         recommended_model_id: recommended_candidate.model_id,
         actual_model_id: actual_candidate.model_id,
         provider_id: actual_candidate.provider_id,
         provider_kind: actual_candidate.provider_kind,
+        credential_id: actual_candidate.credential_id,
+        routing_action,
+        lease: actual_candidate.lease,
     }
 }
 
@@ -769,13 +1001,24 @@ fn build_routing_candidates(context: &RoutingDecisionContext<'_>) -> Vec<Routing
         if !provider.enabled {
             continue;
         }
+        let credential_id = normalized_routing_credential_id(
+            provider.credential_id.as_str(),
+            provider.provider_id.as_str(),
+        );
         candidates.push(RoutingCandidate {
             model_id: model.model_id.clone(),
             provider_id: provider.provider_id.clone(),
             provider_kind: provider.kind.clone(),
+            credential_id: credential_id.clone(),
             health_state: registry_provider_health_state(provider).to_owned(),
             cost_rank: provider_cost_rank(model),
             latency_rank: provider_latency_rank(model),
+            lease: routing_lease_preview(
+                context.lease_previews,
+                provider.provider_id.as_str(),
+                credential_id.as_str(),
+                context.task_class.lease_priority(),
+            ),
         });
     }
     candidates
@@ -786,25 +1029,47 @@ fn default_routing_candidate(context: &RoutingDecisionContext<'_>) -> RoutingCan
         if let Some(provider) =
             find_registry_provider(context.provider_snapshot, model.provider_id.as_str())
         {
+            let credential_id = normalized_routing_credential_id(
+                provider.credential_id.as_str(),
+                provider.provider_id.as_str(),
+            );
             return RoutingCandidate {
                 model_id: model.model_id.clone(),
                 provider_id: provider.provider_id.clone(),
                 provider_kind: provider.kind.clone(),
+                credential_id: credential_id.clone(),
                 health_state: registry_provider_health_state(provider).to_owned(),
                 cost_rank: provider_cost_rank(model),
                 latency_rank: provider_latency_rank(model),
+                lease: routing_lease_preview(
+                    context.lease_previews,
+                    provider.provider_id.as_str(),
+                    credential_id.as_str(),
+                    context.task_class.lease_priority(),
+                ),
             };
         }
     }
 
+    let credential_id = normalized_routing_credential_id(
+        context.provider_snapshot.credential_id.as_str(),
+        context.provider_snapshot.provider_id.as_str(),
+    );
     RoutingCandidate {
         model_id: context.default_model_id.to_owned(),
         provider_id: context.provider_snapshot.provider_id.clone(),
         provider_kind: context.provider_snapshot.kind.clone(),
+        credential_id: credential_id.clone(),
         health_state: context.provider_health_state.to_owned(),
         cost_rank: cost_tier_rank(context.provider_snapshot.capabilities.cost_tier.as_str()),
         latency_rank: latency_tier_rank(
             context.provider_snapshot.capabilities.latency_tier.as_str(),
+        ),
+        lease: routing_lease_preview(
+            context.lease_previews,
+            context.provider_snapshot.provider_id.as_str(),
+            credential_id.as_str(),
+            context.task_class.lease_priority(),
         ),
     }
 }
@@ -812,18 +1077,68 @@ fn default_routing_candidate(context: &RoutingDecisionContext<'_>) -> RoutingCan
 fn choose_routing_candidate(
     candidates: &[RoutingCandidate],
     default_candidate: &RoutingCandidate,
+    task_class: RoutingTaskClass,
     complexity_score: f64,
 ) -> RoutingCandidate {
     if candidates.is_empty() {
         return default_candidate.clone();
     }
 
+    let pool =
+        if candidates.iter().any(|candidate| candidate.lease.state == LeasePreviewState::Ready) {
+            candidates
+                .iter()
+                .filter(|candidate| candidate.lease.state == LeasePreviewState::Ready)
+                .cloned()
+                .collect::<Vec<_>>()
+        } else if candidates
+            .iter()
+            .any(|candidate| candidate.lease.state != LeasePreviewState::Deferred)
+        {
+            candidates
+                .iter()
+                .filter(|candidate| candidate.lease.state != LeasePreviewState::Deferred)
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            candidates.to_vec()
+        };
+
+    if task_class.prefers_low_cost() {
+        return pool
+            .iter()
+            .min_by(|left, right| {
+                lease_pressure_rank(left)
+                    .cmp(&lease_pressure_rank(right))
+                    .then_with(|| left.cost_rank.cmp(&right.cost_rank))
+                    .then_with(|| left.latency_rank.cmp(&right.latency_rank))
+                    .then_with(|| left.model_id.cmp(&right.model_id))
+            })
+            .cloned()
+            .unwrap_or_else(|| default_candidate.clone());
+    }
+
+    if task_class.prefers_low_latency() {
+        return pool
+            .iter()
+            .min_by(|left, right| {
+                lease_pressure_rank(left)
+                    .cmp(&lease_pressure_rank(right))
+                    .then_with(|| left.latency_rank.cmp(&right.latency_rank))
+                    .then_with(|| left.cost_rank.cmp(&right.cost_rank))
+                    .then_with(|| left.model_id.cmp(&right.model_id))
+            })
+            .cloned()
+            .unwrap_or_else(|| default_candidate.clone());
+    }
+
     if complexity_score >= 0.75 {
-        return candidates
+        return pool
             .iter()
             .max_by(|left, right| {
-                left.cost_rank
-                    .cmp(&right.cost_rank)
+                lease_pressure_rank(right)
+                    .cmp(&lease_pressure_rank(left))
+                    .then_with(|| left.cost_rank.cmp(&right.cost_rank))
                     .then_with(|| right.latency_rank.cmp(&left.latency_rank))
                     .then_with(|| left.model_id.cmp(&right.model_id))
             })
@@ -832,11 +1147,12 @@ fn choose_routing_candidate(
     }
 
     if complexity_score <= 0.35 {
-        return candidates
+        return pool
             .iter()
             .min_by(|left, right| {
-                left.cost_rank
-                    .cmp(&right.cost_rank)
+                lease_pressure_rank(left)
+                    .cmp(&lease_pressure_rank(right))
+                    .then_with(|| left.cost_rank.cmp(&right.cost_rank))
                     .then_with(|| left.latency_rank.cmp(&right.latency_rank))
                     .then_with(|| left.model_id.cmp(&right.model_id))
             })
@@ -844,22 +1160,69 @@ fn choose_routing_candidate(
             .unwrap_or_else(|| default_candidate.clone());
     }
 
-    candidates
-        .iter()
+    pool.iter()
         .find(|candidate| candidate.model_id == default_candidate.model_id)
         .cloned()
         .or_else(|| {
-            candidates
-                .iter()
+            pool.iter()
                 .min_by(|left, right| {
-                    left.latency_rank
-                        .cmp(&right.latency_rank)
+                    lease_pressure_rank(left)
+                        .cmp(&lease_pressure_rank(right))
+                        .then_with(|| left.latency_rank.cmp(&right.latency_rank))
                         .then_with(|| left.cost_rank.cmp(&right.cost_rank))
                         .then_with(|| left.model_id.cmp(&right.model_id))
                 })
                 .cloned()
         })
         .unwrap_or_else(|| default_candidate.clone())
+}
+
+fn lease_pressure_rank(candidate: &RoutingCandidate) -> u8 {
+    match candidate.lease.state {
+        LeasePreviewState::Ready => 0,
+        LeasePreviewState::Waiting => 1,
+        LeasePreviewState::Deferred => 2,
+    }
+}
+
+fn routing_action_for_selection(
+    default_candidate: &RoutingCandidate,
+    actual_candidate: &RoutingCandidate,
+) -> String {
+    if actual_candidate.provider_id != default_candidate.provider_id {
+        "failover".to_owned()
+    } else if actual_candidate.model_id != default_candidate.model_id
+        && actual_candidate.cost_rank <= default_candidate.cost_rank
+    {
+        "degrade".to_owned()
+    } else {
+        "proceed".to_owned()
+    }
+}
+
+fn normalized_routing_credential_id(raw: &str, provider_id: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        format!("provider:{provider_id}")
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+fn lease_preview_key(provider_id: &str, credential_id: &str) -> String {
+    format!("{provider_id}:{credential_id}")
+}
+
+fn routing_lease_preview(
+    previews: &HashMap<String, ProviderLeasePreviewSnapshot>,
+    provider_id: &str,
+    credential_id: &str,
+    priority: LeasePriority,
+) -> ProviderLeasePreviewSnapshot {
+    previews
+        .get(lease_preview_key(provider_id, credential_id).as_str())
+        .cloned()
+        .unwrap_or_else(|| ProviderLeasePreviewSnapshot::ready(priority))
 }
 
 fn find_registry_provider<'a>(
@@ -886,6 +1249,75 @@ fn resolve_provider_for_model<'a>(
         }
     }
     (snapshot.provider_id.as_str(), snapshot.kind.as_str())
+}
+
+pub(crate) fn resolve_provider_binding_for_model(
+    snapshot: &ProviderStatusSnapshot,
+    model_id: &str,
+) -> (String, String, String) {
+    if let Some(model) = find_registry_model(snapshot, model_id) {
+        if let Some(provider) = find_registry_provider(snapshot, model.provider_id.as_str()) {
+            return (
+                provider.provider_id.clone(),
+                provider.kind.clone(),
+                normalized_routing_credential_id(
+                    provider.credential_id.as_str(),
+                    provider.provider_id.as_str(),
+                ),
+            );
+        }
+    }
+    (
+        snapshot.provider_id.clone(),
+        snapshot.kind.clone(),
+        normalized_routing_credential_id(
+            snapshot.credential_id.as_str(),
+            snapshot.provider_id.as_str(),
+        ),
+    )
+}
+
+fn build_provider_lease_previews(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    provider_snapshot: &ProviderStatusSnapshot,
+    task_class: RoutingTaskClass,
+) -> HashMap<String, ProviderLeasePreviewSnapshot> {
+    let mut previews = HashMap::new();
+    for provider in &provider_snapshot.registry.providers {
+        let credential_id = normalized_routing_credential_id(
+            provider.credential_id.as_str(),
+            provider.provider_id.as_str(),
+        );
+        previews.insert(
+            lease_preview_key(provider.provider_id.as_str(), credential_id.as_str()),
+            runtime_state.preview_provider_lease(
+                provider.provider_id.as_str(),
+                credential_id.as_str(),
+                task_class.lease_priority(),
+                task_class.as_str(),
+                task_class.max_lease_wait_ms(),
+            ),
+        );
+    }
+    let fallback_credential_id = normalized_routing_credential_id(
+        provider_snapshot.credential_id.as_str(),
+        provider_snapshot.provider_id.as_str(),
+    );
+    previews
+        .entry(lease_preview_key(
+            provider_snapshot.provider_id.as_str(),
+            fallback_credential_id.as_str(),
+        ))
+        .or_insert_with(|| {
+            runtime_state.preview_provider_lease(
+                provider_snapshot.provider_id.as_str(),
+                fallback_credential_id.as_str(),
+                task_class.lease_priority(),
+                task_class.as_str(),
+                task_class.max_lease_wait_ms(),
+            )
+        });
+    previews
 }
 
 fn registry_provider_health_state(provider: &ProviderRegistryProviderSnapshot) -> &'static str {
@@ -1250,9 +1682,11 @@ pub(crate) async fn load_budget_override_approvals(
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::{
         latest_routing_decisions_by_run_id, select_routing_models, RoutingDecisionContext,
-        RoutingMode,
+        RoutingMode, RoutingTaskClass,
     };
     use crate::journal::{UsagePricingRecord, UsageRoutingDecisionRecord};
     use crate::model_provider::{
@@ -1261,6 +1695,7 @@ mod tests {
         ProviderRegistryProviderSnapshot, ProviderRegistrySnapshot, ProviderResponseCacheSnapshot,
         ProviderRetryPolicySnapshot, ProviderRuntimeMetricsSnapshot, ProviderStatusSnapshot,
     };
+    use crate::provider_leases::{LeasePreviewState, LeasePriority, ProviderLeasePreviewSnapshot};
 
     fn capabilities(
         cost_tier: &str,
@@ -1471,9 +1906,40 @@ mod tests {
         }
     }
 
+    fn ready_lease_previews() -> HashMap<String, ProviderLeasePreviewSnapshot> {
+        HashMap::new()
+    }
+
+    fn waiting_lease_preview() -> ProviderLeasePreviewSnapshot {
+        ProviderLeasePreviewSnapshot {
+            state: LeasePreviewState::Waiting,
+            priority: LeasePriority::Foreground,
+            estimated_wait_ms: Some(75),
+            active_provider_leases: 1,
+            active_credential_leases: 1,
+            foreground_waiters: 1,
+            background_waiters: 0,
+            reason: Some("shared_capacity_exhausted".to_owned()),
+        }
+    }
+
+    fn deferred_lease_preview() -> ProviderLeasePreviewSnapshot {
+        ProviderLeasePreviewSnapshot {
+            state: LeasePreviewState::Deferred,
+            priority: LeasePriority::Background,
+            estimated_wait_ms: None,
+            active_provider_leases: 1,
+            active_credential_leases: 1,
+            foreground_waiters: 1,
+            background_waiters: 0,
+            reason: Some("foreground_waiters_present".to_owned()),
+        }
+    }
+
     #[test]
     fn select_routing_models_uses_enforced_premium_model() {
         let pricing = vec![pricing_record("cheap", 0.1, 0.2), pricing_record("premium", 2.0, 4.0)];
+        let lease_previews = ready_lease_previews();
         let snapshot = provider_snapshot(
             "cheap",
             vec![registry_provider("openai", "openai_compatible", "ok", 0)],
@@ -1486,6 +1952,7 @@ mod tests {
             scope_kind: "session",
             scope_id: "session-1",
             mode: RoutingMode::Enforced,
+            task_class: RoutingTaskClass::PrimaryInteractive,
             default_model_id: "cheap",
             prompt_text: &"complex request ".repeat(400),
             prompt_tokens_estimate: 2_400,
@@ -1493,6 +1960,8 @@ mod tests {
             vision_inputs: 2,
             provider_health_state: "ok",
             provider_snapshot: &snapshot,
+            auxiliary_routing_enabled: true,
+            lease_previews: &lease_previews,
             pricing: pricing.as_slice(),
             budgets: &[],
         });
@@ -1504,6 +1973,7 @@ mod tests {
 
     #[test]
     fn select_routing_models_prefers_healthy_registry_fallback_when_default_is_degraded() {
+        let lease_previews = ready_lease_previews();
         let snapshot = provider_snapshot(
             "cheap",
             vec![
@@ -1519,6 +1989,7 @@ mod tests {
             scope_kind: "session",
             scope_id: "session-1",
             mode: RoutingMode::Enforced,
+            task_class: RoutingTaskClass::PrimaryInteractive,
             default_model_id: "cheap",
             prompt_text: "summarize this request",
             prompt_tokens_estimate: 180,
@@ -1526,6 +1997,8 @@ mod tests {
             vision_inputs: 0,
             provider_health_state: "degraded",
             provider_snapshot: &snapshot,
+            auxiliary_routing_enabled: true,
+            lease_previews: &lease_previews,
             pricing: &[],
             budgets: &[],
         });
@@ -1533,6 +2006,110 @@ mod tests {
         assert_eq!(selection.actual_model_id, "claude-sonnet");
         assert_eq!(selection.provider_id, "anthropic");
         assert_eq!(selection.provider_kind, "anthropic");
+    }
+
+    #[test]
+    fn auxiliary_routing_prefers_lower_cost_candidate_even_for_complex_work() {
+        let mut lease_previews = HashMap::new();
+        lease_previews.insert("openai:credential-openai".to_owned(), waiting_lease_preview());
+        let snapshot = provider_snapshot(
+            "premium",
+            vec![registry_provider("openai", "openai_compatible", "ok", 0)],
+            vec![
+                registry_model("cheap", "openai", "low", "low", true, false),
+                registry_model("premium", "openai", "premium", "high", true, false),
+            ],
+        );
+        let selection = select_routing_models(&RoutingDecisionContext {
+            scope_kind: "session",
+            scope_id: "session-1",
+            mode: RoutingMode::Enforced,
+            task_class: RoutingTaskClass::AuxiliaryClassification,
+            default_model_id: "premium",
+            prompt_text: &"investigate architecture regression".repeat(120),
+            prompt_tokens_estimate: 2_100,
+            json_mode: false,
+            vision_inputs: 0,
+            provider_health_state: "ok",
+            provider_snapshot: &snapshot,
+            auxiliary_routing_enabled: true,
+            lease_previews: &lease_previews,
+            pricing: &[],
+            budgets: &[],
+        });
+        assert_eq!(selection.actual_model_id, "cheap");
+        assert!(selection
+            .reason_codes
+            .iter()
+            .any(|code| code == "task_class_auxiliary_classification"));
+        assert!(
+            selection.reason_codes.iter().any(|code| code == "lease_wait_expected"),
+            "lease pressure should stay visible in explain output"
+        );
+    }
+
+    #[test]
+    fn auxiliary_routing_can_be_disabled_without_moving_off_default_model() {
+        let snapshot = provider_snapshot(
+            "premium",
+            vec![registry_provider("openai", "openai_compatible", "ok", 0)],
+            vec![
+                registry_model("cheap", "openai", "low", "low", true, false),
+                registry_model("premium", "openai", "premium", "high", true, false),
+            ],
+        );
+        let selection = select_routing_models(&RoutingDecisionContext {
+            scope_kind: "session",
+            scope_id: "session-1",
+            mode: RoutingMode::Enforced,
+            task_class: RoutingTaskClass::AuxiliaryRecall,
+            default_model_id: "premium",
+            prompt_text: "summarize recall context",
+            prompt_tokens_estimate: 120,
+            json_mode: false,
+            vision_inputs: 0,
+            provider_health_state: "ok",
+            provider_snapshot: &snapshot,
+            auxiliary_routing_enabled: false,
+            lease_previews: &ready_lease_previews(),
+            pricing: &[],
+            budgets: &[],
+        });
+        assert_eq!(selection.actual_model_id, "premium");
+        assert!(selection.reason_codes.iter().any(|code| code == "auxiliary_routing_disabled"));
+    }
+
+    #[test]
+    fn background_auxiliary_selection_surfaces_deferred_lease_pressure() {
+        let mut lease_previews = HashMap::new();
+        lease_previews.insert("openai:credential-openai".to_owned(), deferred_lease_preview());
+        let snapshot = provider_snapshot(
+            "cheap",
+            vec![registry_provider("openai", "openai_compatible", "ok", 0)],
+            vec![registry_model("cheap", "openai", "low", "low", true, false)],
+        );
+        let selection = select_routing_models(&RoutingDecisionContext {
+            scope_kind: "session",
+            scope_id: "session-1",
+            mode: RoutingMode::Enforced,
+            task_class: RoutingTaskClass::BackgroundAutomation,
+            default_model_id: "cheap",
+            prompt_text: "background digest",
+            prompt_tokens_estimate: 80,
+            json_mode: false,
+            vision_inputs: 0,
+            provider_health_state: "ok",
+            provider_snapshot: &snapshot,
+            auxiliary_routing_enabled: true,
+            lease_previews: &lease_previews,
+            pricing: &[],
+            budgets: &[],
+        });
+        assert_eq!(selection.lease.state, LeasePreviewState::Deferred);
+        assert!(
+            selection.reason_codes.iter().any(|code| code == "lease_defer_expected"),
+            "background routing should explain lease deferral explicitly"
+        );
     }
 
     #[test]

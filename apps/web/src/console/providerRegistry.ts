@@ -96,6 +96,16 @@ export type RoutingExplanationView = {
   explanation: string[];
   budgetOutcome?: string;
   reasonCodes: string[];
+  taskClass?: string;
+  routingAction?: string;
+  credentialId?: string;
+  deferred?: boolean;
+  lease?: {
+    state?: string;
+    priority?: string;
+    estimatedWaitMs?: number;
+    reason?: string;
+  };
 };
 
 export function readProviderRegistrySummary(
@@ -156,6 +166,19 @@ export function parseRoutingExplanation(value: string | undefined): RoutingExpla
       explanation: readStringList(record, "explanation"),
       budgetOutcome: readString(record, "budget_outcome") ?? undefined,
       reasonCodes: readStringList(record, "reason_codes"),
+      taskClass: readString(record, "task_class") ?? undefined,
+      routingAction: readString(record, "routing_action") ?? undefined,
+      credentialId: readString(record, "credential_id") ?? undefined,
+      deferred: readBool(record, "deferred") || undefined,
+      lease: readObject(record, "lease")
+        ? {
+            state: readString(readObject(record, "lease") ?? {}, "state") ?? undefined,
+            priority: readString(readObject(record, "lease") ?? {}, "priority") ?? undefined,
+            estimatedWaitMs:
+              readNumber(readObject(record, "lease") ?? {}, "estimated_wait_ms") ?? undefined,
+            reason: readString(readObject(record, "lease") ?? {}, "reason") ?? undefined,
+          }
+        : undefined,
     };
   } catch {
     return { explanation: [], reasonCodes: [] };

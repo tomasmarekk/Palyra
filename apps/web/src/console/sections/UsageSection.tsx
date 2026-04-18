@@ -36,6 +36,8 @@ export function UsageSection({ app }: UsageSectionProps) {
   const usage = useUsageDomain(app);
   const detail = usage.selectedSessionDetail;
   const providerRegistry = readProviderRegistrySummary(app.diagnosticsSnapshot);
+  const observability = readObject(app.diagnosticsSnapshot ?? {}, "observability");
+  const leaseManager = readObject(observability ?? {}, "lease_manager");
   const learning = readObject(app.memoryStatus ?? {}, "learning");
   const learningCounters = readObject(learning ?? {}, "counters");
   const timelinePreview = useMemo(
@@ -54,6 +56,10 @@ export function UsageSection({ app }: UsageSectionProps) {
     providerRegistry?.credentials.filter(
       (credential) => credential.availabilityState !== "available",
     ).length ?? 0;
+  const sharedLeaseWaiters =
+    (readNumber(leaseManager ?? {}, "foreground_waiters") ?? 0) +
+    (readNumber(leaseManager ?? {}, "background_waiters") ?? 0);
+  const sharedLeaseDeferred = readNumber(leaseManager ?? {}, "deferred_total") ?? 0;
 
   return (
     <main className="workspace-page">
@@ -239,18 +245,33 @@ export function UsageSection({ app }: UsageSectionProps) {
                 <dt>Runtime credential</dt>
                 <dd>{providerRegistry?.credentialId ?? providerRegistry?.credentialSource ?? "n/a"}</dd>
               </div>
+              <div>
+                <dt>Shared lease waiters</dt>
+                <dd>{sharedLeaseWaiters}</dd>
+              </div>
+              <div>
+                <dt>Lease deferrals</dt>
+                <dd>{sharedLeaseDeferred}</dd>
+              </div>
             </dl>
             {providerRegistry !== null ? (
               <WorkspaceInlineNotice
                 title="Registry posture"
-                tone={credentialAttentionCount > 0 ? "warning" : providerRegistry.failoverEnabled ? "accent" : "default"}
+                tone={
+                  credentialAttentionCount > 0 || sharedLeaseWaiters > 0
+                    ? "warning"
+                    : providerRegistry.failoverEnabled
+                      ? "accent"
+                      : "default"
+                }
               >
                 <p>
                   {providerRegistry.providers.length} providers, {providerRegistry.credentials.length}{" "}
                   credentials, {providerRegistry.models.length} models, failover{" "}
                   {providerRegistry.failoverEnabled ? "enabled" : "disabled"}, response cache{" "}
                   {providerRegistry.responseCacheEnabled ? "enabled" : "disabled"}, credential
-                  attention {credentialAttentionCount}.
+                  attention {credentialAttentionCount}, shared lease waiters {sharedLeaseWaiters},
+                  deferrals {sharedLeaseDeferred}.
                 </p>
               </WorkspaceInlineNotice>
             ) : null}
@@ -698,6 +719,11 @@ export function UsageSection({ app }: UsageSectionProps) {
                   { key: "run", label: "Run", render: (row) => row.run_id },
                   { key: "mode", label: "Mode", render: (row) => row.mode },
                   {
+                    key: "task",
+                    label: "Task",
+                    render: (row) => row.explanation.taskClass ?? "primary_interactive",
+                  },
+                  {
                     key: "provider",
                     label: "Provider",
                     render: (row) => `${row.provider_kind}:${row.provider_id}`,
@@ -718,7 +744,14 @@ export function UsageSection({ app }: UsageSectionProps) {
                     render: (row) => {
                       const summary = row.explanation.explanation.slice(0, 2).join(" / ");
                       const reasons = row.explanation.reasonCodes.slice(0, 2).join(", ");
-                      return summary || reasons || "No explanation";
+                      const lease = row.explanation.lease;
+                      const leaseSummary =
+                        lease?.state === "waiting"
+                          ? `lease wait ${lease.estimatedWaitMs ?? 0} ms`
+                          : lease?.state === "deferred"
+                            ? "lease deferred"
+                            : "";
+                      return summary || reasons || leaseSummary || "No explanation";
                     },
                   },
                   {

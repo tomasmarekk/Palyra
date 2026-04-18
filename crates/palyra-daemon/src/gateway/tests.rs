@@ -285,6 +285,7 @@ fn build_test_runtime_state_with_runtime_overrides(
             smart_routing: crate::usage_governance::SmartRoutingRuntimeConfig {
                 enabled: true,
                 default_mode: "suggest".to_owned(),
+                auxiliary_routing_enabled: true,
             },
         },
         GatewayJournalConfigSnapshot { db_path, hash_chain_enabled },

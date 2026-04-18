@@ -27,6 +27,7 @@ mod openai_auth;
 mod openai_surface;
 mod orchestrator;
 mod plugins;
+mod provider_leases;
 mod quic_runtime;
 mod routines;
 mod sandbox_runner;
@@ -251,6 +252,7 @@ const DISCORD_ONBOARDING_INBOUND_RECENT_WINDOW_MS: i64 = 15 * 60 * 1_000;
 const DISCORD_ONBOARDING_MONITOR_WAIT_TIMEOUT_MS: u64 = 5_000;
 const SMART_ROUTING_ENABLED_ENV: &str = "PALYRA_SMART_ROUTING_ENABLED";
 const SMART_ROUTING_MODE_ENV: &str = "PALYRA_SMART_ROUTING_MODE";
+const SMART_ROUTING_AUXILIARY_ENABLED_ENV: &str = "PALYRA_SMART_ROUTING_AUXILIARY_ENABLED";
 
 fn load_smart_routing_runtime_config() -> usage_governance::SmartRoutingRuntimeConfig {
     let enabled = std::env::var(SMART_ROUTING_ENABLED_ENV)
@@ -268,7 +270,15 @@ fn load_smart_routing_runtime_config() -> usage_governance::SmartRoutingRuntimeC
                 .map(|mode| mode.as_str().to_owned())
         })
         .unwrap_or_else(|| usage_governance::RoutingMode::Suggest.as_str().to_owned());
-    usage_governance::SmartRoutingRuntimeConfig { enabled, default_mode }
+    let auxiliary_routing_enabled = std::env::var(SMART_ROUTING_AUXILIARY_ENABLED_ENV)
+        .ok()
+        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
+        .unwrap_or(true);
+    usage_governance::SmartRoutingRuntimeConfig { enabled, default_mode, auxiliary_routing_enabled }
 }
 const DISCORD_ONBOARDING_MONITOR_WAIT_POLL_MS: u64 = 250;
 const CONSOLE_SESSION_COOKIE_NAME: &str = "palyra_console_session";

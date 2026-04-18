@@ -32,6 +32,11 @@ use crate::journal::{
     WorkspaceRestoreReportListFilter, WorkspaceRestoreReportRecord, WorkspaceSearchHit,
     WorkspaceSearchRequest,
 };
+use crate::provider_leases::{
+    ProviderLeaseAcquireError, ProviderLeaseAcquireRequest, ProviderLeaseExecutionContext,
+    ProviderLeaseManager, ProviderLeaseManagerSnapshot, ProviderLeasePreviewRequest,
+    ProviderLeasePreviewSnapshot,
+};
 use crate::self_healing::{
     IncidentDomain, RemediationAttemptStatus, RuntimeIncidentHistoryEntry,
     RuntimeIncidentObservation, RuntimeIncidentRecord, RuntimeIncidentSummary,
@@ -356,6 +361,7 @@ pub struct GatewayRuntimeState {
     pub(crate) memory_search_cache: Mutex<HashMap<String, CachedMemorySearchEntry>>,
     pub(crate) http_fetch_cache: Mutex<HashMap<String, CachedHttpFetchEntry>>,
     tool_approval_cache: Mutex<HashMap<String, CachedToolApprovalDecision>>,
+    pub(crate) provider_leases: ProviderLeaseManager,
     pub(crate) tool_posture_registry: ToolPostureRegistry,
     pub(crate) vault_rate_limit: Mutex<HashMap<String, VaultRateLimitEntry>>,
     canvas_records: Mutex<HashMap<String, CanvasRecord>>,
@@ -1125,6 +1131,7 @@ impl GatewayRuntimeState {
             memory_search_cache: Mutex::new(HashMap::new()),
             http_fetch_cache: Mutex::new(HashMap::new()),
             tool_approval_cache: Mutex::new(HashMap::new()),
+            provider_leases: ProviderLeaseManager::default(),
             tool_posture_registry,
             vault_rate_limit: Mutex::new(HashMap::new()),
             canvas_records: Mutex::new(recovered_canvas_records),
@@ -2547,6 +2554,29 @@ impl GatewayRuntimeState {
         self.model_provider.status_snapshot()
     }
 
+    #[must_use]
+    pub fn provider_lease_snapshot(&self) -> ProviderLeaseManagerSnapshot {
+        self.provider_leases.snapshot()
+    }
+
+    #[must_use]
+    pub fn preview_provider_lease(
+        &self,
+        provider_id: &str,
+        credential_id: &str,
+        priority: crate::provider_leases::LeasePriority,
+        task_label: &str,
+        max_wait_ms: u64,
+    ) -> ProviderLeasePreviewSnapshot {
+        let _ = task_label;
+        self.provider_leases.preview(ProviderLeasePreviewRequest {
+            provider_id,
+            credential_id,
+            priority,
+            max_wait_ms,
+        })
+    }
+
     #[allow(clippy::result_large_err)]
     pub async fn execute_model_provider(
         self: &Arc<Self>,
@@ -2577,6 +2607,47 @@ impl GatewayRuntimeState {
                 Err(map_provider_error(error))
             }
         }
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn execute_model_provider_with_lease(
+        self: &Arc<Self>,
+        request: ProviderRequest,
+        lease_context: ProviderLeaseExecutionContext,
+    ) -> Result<crate::model_provider::ProviderResponse, Status> {
+        let _lease = self
+            .provider_leases
+            .acquire(ProviderLeaseAcquireRequest {
+                provider_id: lease_context.provider_id.as_str(),
+                credential_id: lease_context.credential_id.as_str(),
+                priority: lease_context.priority,
+                task_label: lease_context.task_label.as_str(),
+                max_wait_ms: lease_context.max_wait_ms,
+                session_id: lease_context.session_id.as_deref(),
+                run_id: lease_context.run_id.as_deref(),
+            })
+            .await
+            .map_err(|error| match error {
+                ProviderLeaseAcquireError::Deferred(preview) => {
+                    Status::resource_exhausted(format!(
+                        "shared provider lease deferred {} for {}:{} ({})",
+                        lease_context.task_label,
+                        lease_context.provider_id,
+                        lease_context.credential_id,
+                        preview.reason.unwrap_or_else(|| "foreground capacity reserved".to_owned()),
+                    ))
+                }
+                ProviderLeaseAcquireError::TimedOut { waited_ms, preview } => {
+                    Status::unavailable(format!(
+                        "shared provider lease wait exceeded {} ms for {}:{} ({})",
+                        waited_ms,
+                        lease_context.provider_id,
+                        lease_context.credential_id,
+                        preview.reason.unwrap_or_else(|| "shared capacity exhausted".to_owned()),
+                    ))
+                }
+            })?;
+        self.execute_model_provider(request).await
     }
 
     #[allow(clippy::result_large_err)]

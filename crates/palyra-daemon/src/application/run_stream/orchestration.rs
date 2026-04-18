@@ -27,9 +27,13 @@ use crate::{
     },
     model_provider::{ProviderRequest, ProviderResponse},
     orchestrator::{is_cancel_command, RunLifecycleState, RunStateMachine, RunTransition},
+    provider_leases::ProviderLeaseExecutionContext,
     self_healing::{WorkHeartbeatKind, WorkHeartbeatUpdate},
     transport::grpc::{auth::RequestContext, proto::palyra::common::v1 as common_v1},
-    usage_governance::{plan_usage_routing, UsageRoutingPlanRequest},
+    usage_governance::{
+        plan_usage_routing, resolve_provider_binding_for_model, RoutingTaskClass,
+        UsageRoutingPlanRequest,
+    },
 };
 
 use super::cancellation::transition_run_stream_to_cancelled;
@@ -150,9 +154,11 @@ async fn execute_run_stream_provider_request(
     run_state: &mut RunStateMachine,
     run_id: &str,
     provider_request: ProviderRequest,
+    lease_context: ProviderLeaseExecutionContext,
     tape_seq: &mut i64,
 ) -> Result<RunStreamProviderRequestOutcome, Status> {
-    let mut provider_future = Box::pin(runtime_state.execute_model_provider(provider_request));
+    let mut provider_future =
+        Box::pin(runtime_state.execute_model_provider_with_lease(provider_request, lease_context));
     let mut cancel_poll = interval(Duration::from_millis(100));
     cancel_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
@@ -401,6 +407,7 @@ pub(crate) async fn process_run_stream_message(
         vision_inputs: prepared_provider_input.vision_inputs.len(),
         scope_kind: "session",
         scope_id: session_id_for_message.as_str(),
+        task_class: RoutingTaskClass::PrimaryInteractive,
         provider_snapshot: &runtime_state.model_provider_status_snapshot(),
     })
     .await?;
@@ -414,6 +421,27 @@ pub(crate) async fn process_run_stream_message(
             .and_then(|session| session.model_profile_override)
     };
 
+    let provider_model_override = if routing_decision.mode == "enforced" {
+        Some(routing_decision.actual_model_id.clone())
+    } else {
+        session_model_override
+    };
+    let (lease_provider_id, _lease_provider_kind, lease_credential_id) =
+        provider_model_override.as_deref().map_or_else(
+            || {
+                (
+                    routing_decision.provider_id.clone(),
+                    routing_decision.provider_kind.clone(),
+                    routing_decision.credential_id.clone(),
+                )
+            },
+            |model_id| {
+                resolve_provider_binding_for_model(
+                    &runtime_state.model_provider_status_snapshot(),
+                    model_id,
+                )
+            },
+        );
     let provider_response = match execute_run_stream_provider_request(
         sender,
         runtime_state,
@@ -423,11 +451,16 @@ pub(crate) async fn process_run_stream_message(
             input_text: prepared_provider_input.provider_input_text,
             json_mode: json_mode_requested,
             vision_inputs: prepared_provider_input.vision_inputs,
-            model_override: if routing_decision.mode == "enforced" {
-                Some(routing_decision.actual_model_id.clone())
-            } else {
-                session_model_override
-            },
+            model_override: provider_model_override,
+        },
+        ProviderLeaseExecutionContext {
+            provider_id: lease_provider_id,
+            credential_id: lease_credential_id,
+            priority: RoutingTaskClass::PrimaryInteractive.lease_priority(),
+            task_label: RoutingTaskClass::PrimaryInteractive.as_str().to_owned(),
+            max_wait_ms: RoutingTaskClass::PrimaryInteractive.max_lease_wait_ms(),
+            session_id: Some(session_id_for_message.clone()),
+            run_id: Some(run_id.clone()),
         },
         tape_seq,
     )

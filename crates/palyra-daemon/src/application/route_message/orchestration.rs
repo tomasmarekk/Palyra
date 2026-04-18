@@ -26,11 +26,12 @@ use crate::{
     },
     model_provider::ProviderRequest,
     orchestrator::RunLifecycleState,
+    provider_leases::ProviderLeaseExecutionContext,
     transport::grpc::{
         auth::RequestContext,
         proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1},
     },
-    usage_governance::{plan_usage_routing, UsageRoutingPlanRequest},
+    usage_governance::{plan_usage_routing, RoutingTaskClass, UsageRoutingPlanRequest},
 };
 
 use super::response::{
@@ -277,18 +278,30 @@ pub(crate) async fn handle_routed_route_message(
         vision_inputs: prepared_provider_input.vision_inputs.len(),
         scope_kind: routing_scope_kind,
         scope_id: routing_scope_id,
+        task_class: RoutingTaskClass::PrimaryInteractive,
         provider_snapshot: &runtime_state.model_provider_status_snapshot(),
     })
     .await?;
 
     let provider_response = runtime_state
-        .execute_model_provider(ProviderRequest {
-            input_text: prepared_provider_input.provider_input_text,
-            json_mode: json_mode_requested,
-            vision_inputs: prepared_provider_input.vision_inputs,
-            model_override: (routing_decision.mode == "enforced")
-                .then(|| routing_decision.actual_model_id.clone()),
-        })
+        .execute_model_provider_with_lease(
+            ProviderRequest {
+                input_text: prepared_provider_input.provider_input_text,
+                json_mode: json_mode_requested,
+                vision_inputs: prepared_provider_input.vision_inputs,
+                model_override: (routing_decision.mode == "enforced")
+                    .then(|| routing_decision.actual_model_id.clone()),
+            },
+            ProviderLeaseExecutionContext {
+                provider_id: routing_decision.provider_id.clone(),
+                credential_id: routing_decision.credential_id.clone(),
+                priority: RoutingTaskClass::PrimaryInteractive.lease_priority(),
+                task_label: RoutingTaskClass::PrimaryInteractive.as_str().to_owned(),
+                max_wait_ms: RoutingTaskClass::PrimaryInteractive.max_lease_wait_ms(),
+                session_id: Some(session_id.clone()),
+                run_id: Some(run_id.clone()),
+            },
+        )
         .await;
 
     let provider_response = match provider_response {

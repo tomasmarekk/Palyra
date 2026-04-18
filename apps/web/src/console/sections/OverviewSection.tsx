@@ -281,6 +281,7 @@ export function OverviewSection({ app }: OverviewSectionProps) {
   const observability = readObject(diagnostics ?? {}, "observability");
   const connector = readObject(observability ?? {}, "connector");
   const providerAuth = readObject(observability ?? {}, "provider_auth");
+  const leaseManager = readObject(observability ?? {}, "lease_manager");
   const objectivesSnapshot = readObject(diagnostics ?? {}, "objectives");
   const warnings = toStringArray(Array.isArray(deployment?.warnings) ? deployment.warnings : []);
   const pendingApprovals = app.overviewApprovals.filter((approval) => {
@@ -295,6 +296,9 @@ export function OverviewSection({ app }: OverviewSectionProps) {
     readString(providerAuth ?? {}, "state") ??
     readString(readObject(diagnostics ?? {}, "auth_profiles") ?? {}, "state") ??
     "unknown";
+  const leaseForegroundWaiters = readNumber(leaseManager ?? {}, "foreground_waiters") ?? 0;
+  const leaseBackgroundWaiters = readNumber(leaseManager ?? {}, "background_waiters") ?? 0;
+  const leaseDeferredTotal = readNumber(leaseManager ?? {}, "deferred_total") ?? 0;
   const onboardingSteps = onboarding?.steps ?? [];
   const recommendedOnboardingStep =
     onboardingSteps.find((step) => step.step_id === onboarding?.recommended_step_id) ??
@@ -334,6 +338,9 @@ export function OverviewSection({ app }: OverviewSectionProps) {
     providerState,
     alertCount: usageInsights?.alerts.length ?? 0,
     objectiveAttentionCount,
+    leaseForegroundWaiters,
+    leaseBackgroundWaiters,
+    leaseDeferredTotal,
   });
   const hasAttentionItems = attentionItems.length > 0;
   const runtimePostureValue = hasAttentionItems
@@ -859,7 +866,7 @@ export function OverviewSection({ app }: OverviewSectionProps) {
           detail={
             usageInsights === null
               ? "Refresh overview to load routing posture and active alerts."
-              : `${usageInsights.routing.default_mode} default mode with ${usageInsights.alerts.length} active alerts.`
+              : `${usageInsights.routing.default_mode} default mode with ${usageInsights.alerts.length} active alerts, ${leaseForegroundWaiters + leaseBackgroundWaiters} shared waiters, ${leaseDeferredTotal} deferrals.`
           }
           label="Routing posture"
           tone={(usageInsights?.alerts.length ?? 0) > 0 ? "warning" : "default"}
@@ -1289,6 +1296,14 @@ export function OverviewSection({ app }: OverviewSectionProps) {
                 <dd>{usageInsights?.alerts.length ?? 0}</dd>
               </div>
               <div>
+                <dt>Shared lease waiters</dt>
+                <dd>{leaseForegroundWaiters + leaseBackgroundWaiters}</dd>
+              </div>
+              <div>
+                <dt>Lease deferrals</dt>
+                <dd>{leaseDeferredTotal}</dd>
+              </div>
+              <div>
                 <dt>Degraded connectors</dt>
                 <dd>{connectorDegraded}</dd>
               </div>
@@ -1333,6 +1348,9 @@ function buildAttentionItems({
   providerState,
   alertCount,
   objectiveAttentionCount,
+  leaseForegroundWaiters,
+  leaseBackgroundWaiters,
+  leaseDeferredTotal,
 }: {
   warnings: string[];
   pendingApprovals: number;
@@ -1341,12 +1359,23 @@ function buildAttentionItems({
   providerState: string;
   alertCount: number;
   objectiveAttentionCount: number;
+  leaseForegroundWaiters: number;
+  leaseBackgroundWaiters: number;
+  leaseDeferredTotal: number;
 }): string[] {
   const items = [...warnings];
   if (pendingApprovals > 0) items.push(`${pendingApprovals} approvals waiting for review.`);
   if (failedSupportJobs > 0) items.push(`${failedSupportJobs} support bundle jobs failed.`);
   if (connectorDegraded > 0) items.push(`${connectorDegraded} connectors are degraded.`);
   if (alertCount > 0) items.push(`${alertCount} usage governance alerts are active.`);
+  if (leaseForegroundWaiters + leaseBackgroundWaiters > 0) {
+    items.push(
+      `${leaseForegroundWaiters + leaseBackgroundWaiters} provider lease waiters are queued.`,
+    );
+  }
+  if (leaseDeferredTotal > 0) {
+    items.push(`${leaseDeferredTotal} background or auxiliary runs were deferred by lease pressure.`);
+  }
   if (objectiveAttentionCount > 0) {
     items.push(`${objectiveAttentionCount} objectives need health follow-up.`);
   }

@@ -566,6 +566,7 @@ pub(crate) async fn build_observability_payload(
         "support_bundle": support_bundle,
         "doctor_recovery": doctor_recovery,
         "connector": connector,
+        "lease_manager": state.runtime.provider_lease_snapshot(),
         "browser": browser,
         "self_healing": {
             "settings": healing_settings,
