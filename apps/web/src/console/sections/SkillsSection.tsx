@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import {
   ActionButton,
@@ -20,7 +20,18 @@ import {
   WorkspaceTable,
   workspaceToneForState,
 } from "../components/workspace/WorkspacePatterns";
-import { readNumber, readString, skillMetadata, toPrettyJson, type JsonObject } from "../shared";
+import {
+  PrettyJsonBlock,
+  formatUnixMs,
+  readBool,
+  readNumber,
+  readObject,
+  readString,
+  readStringList,
+  skillMetadata,
+  toJsonObjectArray,
+  type JsonObject,
+} from "../shared";
 import type { ConsoleAppState } from "../useConsoleAppState";
 
 type SkillAction = "verify" | "audit" | "quarantine" | "enable";
@@ -30,6 +41,9 @@ type SkillsSectionProps = {
     ConsoleAppState,
     | "skillsBusy"
     | "skillsEntries"
+    | "pluginEntries"
+    | "selectedPluginId"
+    | "selectedPluginDetail"
     | "skillProcedureCandidates"
     | "skillBuilderCandidates"
     | "lastSkillPromotion"
@@ -46,6 +60,11 @@ type SkillsSectionProps = {
     | "skillBuilderName"
     | "setSkillBuilderName"
     | "refreshSkills"
+    | "selectPlugin"
+    | "checkPlugin"
+    | "savePluginConfig"
+    | "clearPluginConfig"
+    | "togglePluginEnabled"
     | "installSkill"
     | "executeSkillAction"
     | "promoteProcedureCandidate"
@@ -60,6 +79,18 @@ export function SkillsSection({ app }: SkillsSectionProps) {
     action: Extract<SkillAction, "quarantine" | "enable">;
     skillId: string;
   } | null>(null);
+  const [pluginConfigDraft, setPluginConfigDraft] = useState("");
+
+  useEffect(() => {
+    if (app.selectedPluginDetail === null) {
+      setPluginConfigDraft("");
+      return;
+    }
+    setPluginConfigDraft(editablePluginConfig(app.selectedPluginDetail));
+  }, [app.selectedPluginDetail]);
+
+  const healthyPluginCount = app.pluginEntries.filter((entry) => pluginReady(entry)).length;
+  const unhealthyPluginCount = app.pluginEntries.length - healthyPluginCount;
   const quarantinedCount = app.skillsEntries.filter(
     (entry) => readString(entry, "status") === "quarantined",
   ).length;
@@ -68,25 +99,49 @@ export function SkillsSection({ app }: SkillsSectionProps) {
   ).length;
   const builderCandidateCount = app.skillBuilderCandidates.length;
 
+  const selectedPlugin = app.selectedPluginDetail;
+  const selectedPluginBinding = selectedPlugin === null ? null : pluginBinding(selectedPlugin);
+  const selectedPluginId =
+    selectedPluginBinding === null ? null : readString(selectedPluginBinding, "plugin_id");
+  const pluginEnabled = selectedPluginBinding?.["enabled"] === true;
+  const selectedPluginCheck = selectedPlugin === null ? null : pluginCheck(selectedPlugin);
+  const selectedPluginConfig = selectedPlugin === null ? null : pluginConfig(selectedPlugin);
+  const selectedPluginValidation =
+    selectedPlugin === null ? null : pluginValidation(selectedPlugin);
+  const selectedPluginReasons =
+    selectedPluginCheck === null ? [] : readStringList(selectedPluginCheck, "reasons");
+  const selectedPluginRemediation =
+    selectedPluginCheck === null ? [] : readStringList(selectedPluginCheck, "remediation");
+  const selectedPluginCapabilityEntries =
+    selectedPluginCheck === null ? [] : pluginCapabilityEntries(selectedPluginCheck);
+  const selectedPluginFilesystemIssues =
+    selectedPlugin === null ? [] : pluginFilesystemIssues(selectedPlugin);
+  const selectedPluginInstalledSkill =
+    selectedPlugin === null ? null : readObject(selectedPlugin, "installed_skill");
+  const selectedPluginRedactedFields =
+    selectedPluginValidation === null
+      ? []
+      : readStringList(selectedPluginValidation, "redacted_fields");
+
   return (
     <main className="workspace-page">
       <WorkspacePageHeader
         eyebrow="Agent"
-        title="Skills"
-        description="Track installed skills, keep trust posture readable, and force risky state changes like quarantine or re-enable through one consistent confirmation flow."
+        title="Skills & plugins"
+        description="Operate the signed skill inventory and the bound plugin surface from one page, with explicit trust, config, grant, and runtime states instead of a single misleading green light."
         status={
           <>
             <WorkspaceStatusChip tone={app.skillsEntries.length > 0 ? "success" : "default"}>
-              {app.skillsEntries.length} installed
+              {app.skillsEntries.length} skills
             </WorkspaceStatusChip>
-            <WorkspaceStatusChip tone={quarantinedCount > 0 ? "danger" : "default"}>
-              {quarantinedCount} quarantined
+            <WorkspaceStatusChip tone={app.pluginEntries.length > 0 ? "accent" : "default"}>
+              {app.pluginEntries.length} plugins
             </WorkspaceStatusChip>
-            <WorkspaceStatusChip tone={promotableProcedureCount > 0 ? "accent" : "default"}>
-              {promotableProcedureCount} procedure candidates
+            <WorkspaceStatusChip tone={healthyPluginCount > 0 ? "success" : "default"}>
+              {healthyPluginCount} plugin ready
             </WorkspaceStatusChip>
-            <WorkspaceStatusChip tone={builderCandidateCount > 0 ? "warning" : "default"}>
-              {builderCandidateCount} builder candidates
+            <WorkspaceStatusChip tone={unhealthyPluginCount > 0 ? "danger" : "default"}>
+              {unhealthyPluginCount} plugin blocked
             </WorkspaceStatusChip>
           </>
         }
@@ -97,46 +152,46 @@ export function SkillsSection({ app }: SkillsSectionProps) {
             onPress={() => void app.refreshSkills()}
             isDisabled={app.skillsBusy}
           >
-            {app.skillsBusy ? "Refreshing..." : "Refresh skills"}
+            {app.skillsBusy ? "Refreshing..." : "Refresh inventory"}
           </ActionButton>
         }
       />
 
       <section className="workspace-metric-grid workspace-metric-grid--compact">
         <WorkspaceMetricCard
-          label="Installed"
+          label="Installed skills"
           value={app.skillsEntries.length}
-          detail="Verified or not, only actually installed skills are shown here."
+          detail="Signed skill artifacts that are present in the runtime inventory."
           tone={app.skillsEntries.length > 0 ? "success" : "default"}
         />
         <WorkspaceMetricCard
-          label="Quarantined"
+          label="Bound plugins"
+          value={app.pluginEntries.length}
+          detail="Manifest-first bindings currently visible to the operator surface."
+          tone={app.pluginEntries.length > 0 ? "accent" : "default"}
+        />
+        <WorkspaceMetricCard
+          label="Plugin ready"
+          value={healthyPluginCount}
+          detail="Bindings whose artifact, config, grants, and runtime checks currently pass."
+          tone={healthyPluginCount > 0 ? "success" : "default"}
+        />
+        <WorkspaceMetricCard
+          label="Plugin blocked"
+          value={unhealthyPluginCount}
+          detail="Any trust, config, grant, filesystem, or runtime issue keeps the plugin here."
+          tone={unhealthyPluginCount > 0 ? "danger" : "default"}
+        />
+        <WorkspaceMetricCard
+          label="Quarantined skills"
           value={quarantinedCount}
-          detail="Quarantined skills are hard-stop runtime entries until re-enabled."
+          detail="Quarantined skills stay hard-stopped until an operator explicitly re-enables them."
           tone={quarantinedCount > 0 ? "danger" : "default"}
-        />
-        <WorkspaceMetricCard
-          label="Install posture"
-          value={
-            app.skillAllowUntrusted
-              ? "Untrusted allowed"
-              : app.skillAllowTofu
-                ? "TOFU allowed"
-                : "Strict"
-          }
-          detail="Keep trust exceptions visible instead of burying them in the install form."
-          tone={app.skillAllowUntrusted ? "danger" : app.skillAllowTofu ? "warning" : "success"}
-        />
-        <WorkspaceMetricCard
-          label="Procedure queue"
-          value={app.skillProcedureCandidates.length}
-          detail="Only reusable procedure candidates can be promoted into quarantined skill scaffolds."
-          tone={promotableProcedureCount > 0 ? "accent" : "default"}
         />
         <WorkspaceMetricCard
           label="Builder queue"
           value={builderCandidateCount}
-          detail="Experimental builder outputs stay separate from installed skills and remain quarantined by design."
+          detail="Prompt and procedure builder outputs remain separate from installed skills until review."
           tone={builderCandidateCount > 0 ? "warning" : "default"}
         />
       </section>
@@ -144,8 +199,90 @@ export function SkillsSection({ app }: SkillsSectionProps) {
       <section className="workspace-aside-grid">
         <div className="workspace-stack">
           <WorkspaceSectionCard
+            title="Plugin inventory"
+            description="Keep the list compact, then drive deeper diagnosis from the selected detail panel."
+          >
+            {app.pluginEntries.length === 0 ? (
+              <WorkspaceEmptyState
+                title="No plugins bound"
+                description="Bind a plugin to turn discovery, config validation, and capability drift into an operator workflow."
+              />
+            ) : (
+              <WorkspaceTable
+                ariaLabel="Plugin inventory"
+                columns={["Plugin", "Artifact", "Binding", "Config", "Runtime", "Actions"]}
+              >
+                {app.pluginEntries.map((entry, index) => {
+                  const binding = pluginBinding(entry);
+                  const pluginId = readString(binding, "plugin_id") ?? `plugin-${index + 1}`;
+                  const skillId = readString(binding, "skill_id") ?? "unknown";
+                  const version = readString(binding, "skill_version") ?? "current";
+                  const artifactState = pluginArtifactState(entry);
+                  const bindingState = pluginBindingState(entry);
+                  const configState = pluginConfigState(entry);
+                  const runtimeState = pluginReady(entry) ? "ready" : "blocked";
+                  const selected = pluginId === app.selectedPluginId;
+
+                  return (
+                    <tr key={pluginId}>
+                      <td>
+                        <div className="workspace-table__meta">
+                          <strong>{pluginId}</strong>
+                          <span className="chat-muted">
+                            {skillId} · {version}
+                          </span>
+                        </div>
+                      </td>
+                      <td>
+                        <WorkspaceStatusChip tone={toneForPluginState(artifactState)}>
+                          {humanizeState(artifactState)}
+                        </WorkspaceStatusChip>
+                      </td>
+                      <td>
+                        <WorkspaceStatusChip tone={toneForPluginState(bindingState)}>
+                          {humanizeState(bindingState)}
+                        </WorkspaceStatusChip>
+                      </td>
+                      <td>
+                        <WorkspaceStatusChip tone={toneForPluginState(configState)}>
+                          {humanizeState(configState)}
+                        </WorkspaceStatusChip>
+                      </td>
+                      <td>
+                        <WorkspaceStatusChip tone={toneForPluginState(runtimeState)}>
+                          {humanizeState(runtimeState)}
+                        </WorkspaceStatusChip>
+                      </td>
+                      <td>
+                        <div className="workspace-table__actions">
+                          <ActionButton
+                            type="button"
+                            variant={selected ? "primary" : "secondary"}
+                            onPress={() => void app.selectPlugin(pluginId)}
+                            isDisabled={app.skillsBusy}
+                          >
+                            {selected ? "Selected" : "Inspect"}
+                          </ActionButton>
+                          <ActionButton
+                            type="button"
+                            variant="secondary"
+                            onPress={() => void app.checkPlugin(pluginId)}
+                            isDisabled={app.skillsBusy}
+                          >
+                            Check
+                          </ActionButton>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </WorkspaceTable>
+            )}
+          </WorkspaceSectionCard>
+
+          <WorkspaceSectionCard
             title="Installed skills"
-            description="The table is primary so operator state stays readable. Raw JSON remains available only as supporting detail."
+            description="Skill packaging and trust lifecycle still matter, but raw plugin operability now gets its own primary surface."
           >
             {app.skillsEntries.length === 0 ? (
               <WorkspaceEmptyState
@@ -238,8 +375,291 @@ export function SkillsSection({ app }: SkillsSectionProps) {
 
         <div className="workspace-stack">
           <WorkspaceSectionCard
+            title="Plugin health detail"
+            description="Keep artifact trust, binding validity, config validity, and runtime runnable state visible as separate operator decisions."
+          >
+            {selectedPlugin === null || selectedPluginBinding === null || selectedPluginCheck === null ? (
+              <WorkspaceEmptyState
+                title="Select a plugin"
+                description="Choose a plugin from the inventory to inspect discovery, config contract, capability drift, and remediation guidance."
+              />
+            ) : (
+              <div className="workspace-stack">
+                <section className="workspace-metric-grid workspace-metric-grid--compact">
+                  <WorkspaceMetricCard
+                    label="Artifact"
+                    value={humanizeState(pluginArtifactState(selectedPlugin))}
+                    detail={
+                      readString(selectedPluginInstalledSkill ?? {}, "trust_decision") ??
+                      "No installed artifact metadata"
+                    }
+                    tone={toneForPluginState(pluginArtifactState(selectedPlugin))}
+                  />
+                  <WorkspaceMetricCard
+                    label="Binding"
+                    value={humanizeState(pluginBindingState(selectedPlugin))}
+                    detail={
+                      pluginEnabled
+                        ? "Binding is enabled."
+                        : "Binding is disabled and cannot run until re-enabled."
+                    }
+                    tone={toneForPluginState(pluginBindingState(selectedPlugin))}
+                  />
+                  <WorkspaceMetricCard
+                    label="Config"
+                    value={humanizeState(pluginConfigState(selectedPlugin))}
+                    detail={
+                      readString(selectedPluginConfig ?? {}, "path") ??
+                      "Manifest does not declare config."
+                    }
+                    tone={toneForPluginState(pluginConfigState(selectedPlugin))}
+                  />
+                  <WorkspaceMetricCard
+                    label="Runtime"
+                    value={pluginReady(selectedPlugin) ? "ready" : "blocked"}
+                    detail={
+                      pluginReady(selectedPlugin)
+                        ? "All current checks pass."
+                        : "One or more trust, config, grant, or filesystem checks still block runtime."
+                    }
+                    tone={toneForPluginState(pluginReady(selectedPlugin) ? "ready" : "blocked")}
+                  />
+                </section>
+
+                <div className="workspace-table__meta">
+                  <strong>{selectedPluginId}</strong>
+                  <span className="chat-muted">
+                    {readString(selectedPluginBinding, "skill_id") ?? "unknown skill"} ·{" "}
+                    {readString(selectedPluginBinding, "skill_version") ?? "current version"} ·{" "}
+                    {readString(selectedPluginBinding, "module_path") ?? "auto module"} ·{" "}
+                    {readString(selectedPluginBinding, "entrypoint") ?? "run"}
+                  </span>
+                </div>
+
+                {selectedPluginReasons.length > 0 && (
+                  <WorkspaceInlineNotice title="Why it is blocked" tone="danger">
+                    <ul>
+                      {selectedPluginReasons.map((reason) => (
+                        <li key={reason}>{reason}</li>
+                      ))}
+                    </ul>
+                  </WorkspaceInlineNotice>
+                )}
+
+                {selectedPluginRemediation.length > 0 && (
+                  <WorkspaceInlineNotice title="Remediation" tone="warning">
+                    <ul>
+                      {selectedPluginRemediation.map((step) => (
+                        <li key={step}>{step}</li>
+                      ))}
+                    </ul>
+                  </WorkspaceInlineNotice>
+                )}
+
+                <div className="workspace-inline">
+                  <ActionButton
+                    type="button"
+                    variant="secondary"
+                    onPress={() => void app.checkPlugin(selectedPluginId ?? undefined)}
+                    isDisabled={app.skillsBusy}
+                  >
+                    Check now
+                  </ActionButton>
+                  <ActionButton
+                    type="button"
+                    variant={pluginEnabled ? "danger-soft" : "primary"}
+                    onPress={() =>
+                      selectedPluginId !== null &&
+                      void app.togglePluginEnabled(selectedPluginId, !pluginEnabled)
+                    }
+                    isDisabled={app.skillsBusy || selectedPluginId === null}
+                  >
+                    {pluginEnabled ? "Disable plugin" : "Enable plugin"}
+                  </ActionButton>
+                </div>
+
+                <WorkspaceSectionCard
+                  title="Config remediation"
+                  description="Paste the full config object when editing. Redacted fields are intentionally not round-trippable."
+                >
+                  <div className="workspace-stack">
+                    <PrettyJsonBlock
+                      value={{
+                        path: readString(selectedPluginConfig ?? {}, "path"),
+                        validation: selectedPluginValidation ?? {},
+                        configured: readObject(selectedPluginConfig ?? {}, "configured"),
+                        effective: readObject(selectedPluginConfig ?? {}, "effective"),
+                      }}
+                      revealSensitiveValues={app.revealSensitiveValues}
+                      className="workspace-code-panel"
+                    />
+                    {selectedPluginRedactedFields.length > 0 && (
+                      <WorkspaceInlineNotice title="Redacted fields" tone="warning">
+                        <p>
+                          Hidden values are present for: {selectedPluginRedactedFields.join(", ")}.
+                          Paste the full object again when updating config so those values are not
+                          dropped.
+                        </p>
+                      </WorkspaceInlineNotice>
+                    )}
+                    <AppForm
+                      className="workspace-stack"
+                      onSubmit={(event) => {
+                        event.preventDefault();
+                        if (selectedPluginId === null) {
+                          return;
+                        }
+                        void app.savePluginConfig(selectedPluginId, pluginConfigDraft);
+                      }}
+                    >
+                      <TextAreaField
+                        label="Config JSON"
+                        rows={8}
+                        value={pluginConfigDraft}
+                        onChange={setPluginConfigDraft}
+                        placeholder='{"api_base_url":"https://api.example.com","api_token":"secret-token"}'
+                      />
+                      <div className="workspace-inline">
+                        <ActionButton
+                          type="submit"
+                          variant="primary"
+                          isDisabled={app.skillsBusy || selectedPluginId === null}
+                        >
+                          Save config
+                        </ActionButton>
+                        <ActionButton
+                          type="button"
+                          variant="secondary"
+                          onPress={() =>
+                            setPluginConfigDraft(
+                              selectedPlugin === null ? "" : editablePluginConfig(selectedPlugin),
+                            )
+                          }
+                          isDisabled={app.skillsBusy}
+                        >
+                          Reset editor
+                        </ActionButton>
+                        <ActionButton
+                          type="button"
+                          variant="danger"
+                          onPress={() =>
+                            selectedPluginId !== null && void app.clearPluginConfig(selectedPluginId)
+                          }
+                          isDisabled={app.skillsBusy || selectedPluginId === null}
+                        >
+                          Clear config
+                        </ActionButton>
+                      </div>
+                    </AppForm>
+                  </div>
+                </WorkspaceSectionCard>
+
+                {selectedPluginCapabilityEntries.length > 0 && (
+                  <WorkspaceSectionCard
+                    title="Capability diff"
+                    description="Diagnose grant drift and policy restriction before touching the binding."
+                  >
+                    <WorkspaceTable
+                      ariaLabel="Plugin capability diff"
+                      columns={["Category", "Capability", "Value", "Detail"]}
+                    >
+                      {selectedPluginCapabilityEntries.map((entry, index) => {
+                        const category = readString(entry, "category") ?? `category-${index + 1}`;
+                        const capabilityKind = readString(entry, "capability_kind") ?? "unknown";
+                        const value = readString(entry, "value") ?? "n/a";
+                        const message = readString(entry, "message") ?? "No detail";
+                        return (
+                          <tr key={`${category}-${capabilityKind}-${value}-${index}`}>
+                            <td>
+                              <WorkspaceStatusChip tone={toneForPluginState(category)}>
+                                {humanizeState(category)}
+                              </WorkspaceStatusChip>
+                            </td>
+                            <td>{capabilityKind}</td>
+                            <td>{value}</td>
+                            <td>{message}</td>
+                          </tr>
+                        );
+                      })}
+                    </WorkspaceTable>
+                  </WorkspaceSectionCard>
+                )}
+
+                {selectedPluginFilesystemIssues.length > 0 && (
+                  <WorkspaceSectionCard
+                    title="Filesystem safety"
+                    description="Path safety remains fail-closed and should be treated as an operator-visible blocker."
+                  >
+                    <WorkspaceTable
+                      ariaLabel="Plugin filesystem issues"
+                      columns={["Code", "Severity", "Message", "Remediation"]}
+                    >
+                      {selectedPluginFilesystemIssues.map((issue, index) => {
+                        const code = readString(issue, "code") ?? `issue-${index + 1}`;
+                        return (
+                          <tr key={code}>
+                            <td>{code}</td>
+                            <td>
+                              <WorkspaceStatusChip
+                                tone={toneForPluginState(readString(issue, "severity") ?? "unknown")}
+                              >
+                                {readString(issue, "severity") ?? "unknown"}
+                              </WorkspaceStatusChip>
+                            </td>
+                            <td>{readString(issue, "message") ?? "No detail"}</td>
+                            <td>{readString(issue, "remediation") ?? "No remediation"}</td>
+                          </tr>
+                        );
+                      })}
+                    </WorkspaceTable>
+                  </WorkspaceSectionCard>
+                )}
+
+                <WorkspaceSectionCard
+                  title="Installed artifact"
+                  description="Artifact provenance stays visible, but it is not allowed to hide binding or config problems."
+                >
+                  <PrettyJsonBlock
+                    value={{
+                      trust_decision: readString(
+                        selectedPluginInstalledSkill ?? {},
+                        "trust_decision",
+                      ),
+                      source: readObject(selectedPluginInstalledSkill ?? {}, "source"),
+                      payload_sha256: readString(
+                        selectedPluginInstalledSkill ?? {},
+                        "payload_sha256",
+                      ),
+                      signature_key_id: readString(
+                        selectedPluginInstalledSkill ?? {},
+                        "signature_key_id",
+                      ),
+                      installed_at: formatUnixMs(
+                        readNumber(selectedPluginInstalledSkill ?? {}, "installed_at_unix_ms"),
+                      ),
+                    }}
+                    revealSensitiveValues={app.revealSensitiveValues}
+                    className="workspace-code-panel"
+                  />
+                </WorkspaceSectionCard>
+
+                <WorkspaceSectionCard
+                  title="Selected raw detail"
+                  description="Raw payload stays as a supporting diagnostic surface, not the main workflow."
+                >
+                  <PrettyJsonBlock
+                    value={selectedPlugin}
+                    revealSensitiveValues={app.revealSensitiveValues}
+                    className="workspace-code-panel"
+                  />
+                </WorkspaceSectionCard>
+              </div>
+            )}
+          </WorkspaceSectionCard>
+
+          <WorkspaceSectionCard
             title="Install artifact"
-            description="Install stays compact and operational. This page should not feel like an app store."
+            description="Install stays compact and operational. This page still avoids turning into an app store."
           >
             <AppForm className="workspace-stack" onSubmit={(event) => void app.installSkill(event)}>
               <TextInputField
@@ -298,23 +718,6 @@ export function SkillsSection({ app }: SkillsSectionProps) {
                 {app.skillsBusy ? "Creating..." : "Create builder candidate"}
               </ActionButton>
             </AppForm>
-          </WorkspaceSectionCard>
-
-          <WorkspaceSectionCard
-            title="Selected raw detail"
-            description="Raw entry data is still available for operator inspection, but it no longer dominates the page."
-          >
-            {app.skillsEntries.length === 0 ? (
-              <WorkspaceEmptyState
-                title="No detail to inspect"
-                description="Once a skill is installed, its record stays available here as a supporting diagnostic surface."
-                compact
-              />
-            ) : (
-              <pre className="workspace-code-panel">
-                {toPrettyJson(app.skillsEntries[0], app.revealSensitiveValues)}
-              </pre>
-            )}
           </WorkspaceSectionCard>
 
           <WorkspaceSectionCard
@@ -444,16 +847,19 @@ export function SkillsSection({ app }: SkillsSectionProps) {
                 description="Promote a procedure candidate to inspect the generated scaffold metadata here."
               />
             ) : (
-              <pre className="workspace-code-panel">
-                {toPrettyJson(app.lastSkillPromotion, app.revealSensitiveValues)}
-              </pre>
+              <PrettyJsonBlock
+                value={app.lastSkillPromotion}
+                revealSensitiveValues={app.revealSensitiveValues}
+                className="workspace-code-panel"
+              />
             )}
           </WorkspaceSectionCard>
 
           <WorkspaceInlineNotice title="Trust posture" tone="warning">
             <p>
-              Quarantine and enable are operational safety actions, not casual toggles. The page
-              keeps those mutations explicit and records an operator reason alongside the workflow.
+              Plugin health is only green when artifact trust, binding resolution, config contract,
+              grant posture, and filesystem safety all agree. This page keeps those states separate
+              on purpose.
             </p>
           </WorkspaceInlineNotice>
         </div>
@@ -489,6 +895,119 @@ export function SkillsSection({ app }: SkillsSectionProps) {
       />
     </main>
   );
+}
+
+function pluginBinding(entry: JsonObject): JsonObject {
+  return readObject(entry, "binding") ?? {};
+}
+
+function pluginCheck(entry: JsonObject): JsonObject {
+  return readObject(entry, "check") ?? {};
+}
+
+function pluginDiscovery(entry: JsonObject): JsonObject {
+  return readObject(pluginCheck(entry), "discovery") ?? {};
+}
+
+function pluginConfig(entry: JsonObject): JsonObject {
+  return readObject(pluginCheck(entry), "config") ?? {};
+}
+
+function pluginValidation(entry: JsonObject): JsonObject {
+  return readObject(pluginConfig(entry), "validation") ?? {};
+}
+
+function pluginReady(entry: JsonObject): boolean {
+  return readBool(pluginCheck(entry), "ready");
+}
+
+function pluginArtifactState(entry: JsonObject): string {
+  const installedSkill = readObject(entry, "installed_skill");
+  const trustDecision = readString(installedSkill ?? {}, "trust_decision");
+  if (trustDecision === "untrusted_override") {
+    return trustDecision;
+  }
+  if (readString(pluginDiscovery(entry), "state") === "signature_failed") {
+    return "signature_failed";
+  }
+  if (readObject(pluginCheck(entry), "resolved") !== null) {
+    return "installed";
+  }
+  return readString(pluginDiscovery(entry), "state") ?? "unknown";
+}
+
+function pluginBindingState(entry: JsonObject): string {
+  const binding = pluginBinding(entry);
+  if (binding["enabled"] !== true) {
+    return "disabled";
+  }
+  const discoveryState = readString(pluginDiscovery(entry), "state");
+  if (discoveryState === "missing_module" || discoveryState === "filesystem_unsafe") {
+    return discoveryState;
+  }
+  if (readObject(pluginCheck(entry), "resolved") !== null) {
+    return "resolved";
+  }
+  return discoveryState ?? "unknown";
+}
+
+function pluginConfigState(entry: JsonObject): string {
+  return readString(pluginValidation(entry), "state") ?? "unknown";
+}
+
+function pluginCapabilityEntries(check: JsonObject): JsonObject[] {
+  const capabilityPayload = readObject(check, "capabilities");
+  const entries = capabilityPayload?.["entries"];
+  return Array.isArray(entries) ? toJsonObjectArray(entries) : [];
+}
+
+function pluginFilesystemIssues(detail: JsonObject): JsonObject[] {
+  const discovery = pluginDiscovery(detail);
+  const filesystem = readObject(discovery, "filesystem");
+  const issues = filesystem?.["issues"];
+  return Array.isArray(issues) ? toJsonObjectArray(issues) : [];
+}
+
+function editablePluginConfig(detail: JsonObject): string {
+  const validation = pluginValidation(detail);
+  if (readStringList(validation, "redacted_fields").length > 0) {
+    return "";
+  }
+  const configured = readObject(pluginConfig(detail), "configured");
+  return configured === null ? "" : JSON.stringify(configured, null, 2);
+}
+
+function humanizeState(value: string | null): string {
+  return (value ?? "unknown").replace(/_/g, " ");
+}
+
+function toneForPluginState(state: string): "default" | "success" | "warning" | "danger" | "accent" {
+  switch (state) {
+    case "installed":
+    case "resolved":
+    case "valid":
+    case "ready":
+    case "tofu_pinned":
+      return "success";
+    case "requires_migration":
+    case "missing":
+    case "review":
+      return "warning";
+    case "blocked":
+    case "disabled":
+    case "invalid":
+    case "signature_failed":
+    case "untrusted_override":
+    case "missing_module":
+    case "filesystem_unsafe":
+    case "missing_grant":
+    case "policy_restricted":
+    case "excess_grant":
+    case "wildcard_risk":
+      return "danger";
+    default:
+      return workspaceToneForState(state) as "default" | "success" | "warning" | "danger" | "accent";
+  }
 }
 
 function readRecord(entry: JsonObject): JsonObject {

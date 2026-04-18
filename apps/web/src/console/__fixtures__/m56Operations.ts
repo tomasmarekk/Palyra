@@ -406,6 +406,249 @@ export function skillsFixture() {
   };
 }
 
+function pluginBindingFixture(
+  pluginId: string,
+  skillId: string,
+  overrides: Partial<Record<string, unknown>> = {},
+) {
+  return {
+    plugin_id: pluginId,
+    enabled: true,
+    skill_id: skillId,
+    skill_version: "1.0.0",
+    tool_id: "acme.echo",
+    module_path: "modules/module.wasm",
+    entrypoint: "run",
+    capability_profile: {
+      http_hosts: ["api.example.com"],
+      secrets: ["api_token"],
+      storage_prefixes: ["workspace/plugins"],
+      channels: ["discord:default"],
+    },
+    operator: {
+      display_name: pluginId,
+      owner_principal: "admin:web-console",
+      updated_by: "admin:web-console",
+      tags: ["phase-3"],
+    },
+    ...overrides,
+  };
+}
+
+function pluginInstalledSkillFixture(
+  skillId: string,
+  trustDecision = "allowlisted",
+  overrides: Partial<Record<string, unknown>> = {},
+) {
+  return {
+    skill_id: skillId,
+    version: "1.0.0",
+    trust_decision: trustDecision,
+    payload_sha256: `sha256:${skillId}`,
+    signature_key_id: "publisher:acme",
+    installed_at_unix_ms: 1_700_000_005_000,
+    source: {
+      artifact_path: `fixtures/${skillId}.palyra-skill`,
+      publisher: "acme",
+    },
+    ...overrides,
+  };
+}
+
+function pluginInventoryEntryFromDetail(detail: {
+  binding: Record<string, unknown>;
+  check: Record<string, unknown>;
+}) {
+  return {
+    binding: detail.binding,
+    check: detail.check,
+  };
+}
+
+export function pluginInvalidConfigDetailFixture() {
+  const binding = pluginBindingFixture("acme.echo_invalid_config", "acme.echo_configured");
+  return {
+    contract: controlPlaneContract(),
+    schema_version: 2,
+    binding,
+    installed_skill: pluginInstalledSkillFixture("acme.echo_configured"),
+    check: {
+      ready: false,
+      resolved: {
+        tool_id: "acme.echo",
+        module_path: "modules/module.wasm",
+        entrypoint: "run",
+      },
+      discovery: {
+        state: "installed",
+        reasons: [],
+        missing_paths: [],
+        filesystem: {
+          safe: true,
+          issues: [],
+        },
+      },
+      config: {
+        path: "state/plugins/acme.echo_invalid_config/config.json",
+        validation: {
+          state: "invalid",
+          issues: [
+            "config property 'api_base_url' must be a string",
+            "required config property 'api_token' is missing",
+          ],
+          redacted_fields: ["api_token"],
+        },
+        configured: {
+          api_base_url: 42,
+          api_token: "[redacted]",
+        },
+        effective: {},
+      },
+      capabilities: {
+        valid: true,
+        declared: binding.capability_profile,
+        granted: binding.capability_profile,
+        effective: binding.capability_profile,
+        entries: [],
+      },
+      reasons: ["config property 'api_base_url' must be a string"],
+      remediation: [
+        "Paste a valid JSON object with string values for api_base_url and api_token.",
+      ],
+    },
+  };
+}
+
+export function pluginMissingGrantDetailFixture() {
+  const binding = pluginBindingFixture("acme.echo_missing_grant", "acme.echo_missing_grant", {
+    capability_profile: {
+      http_hosts: [],
+      secrets: ["api_token"],
+      storage_prefixes: ["workspace/plugins"],
+      channels: ["discord:default"],
+    },
+  });
+  return {
+    contract: controlPlaneContract(),
+    schema_version: 2,
+    binding,
+    installed_skill: pluginInstalledSkillFixture("acme.echo_missing_grant"),
+    check: {
+      ready: false,
+      resolved: {
+        tool_id: "acme.echo",
+        module_path: "modules/module.wasm",
+        entrypoint: "run",
+      },
+      discovery: {
+        state: "installed",
+        reasons: [],
+        missing_paths: [],
+        filesystem: {
+          safe: true,
+          issues: [],
+        },
+      },
+      config: {
+        path: "state/plugins/acme.echo_missing_grant/config.json",
+        validation: {
+          state: "valid",
+          issues: [],
+          redacted_fields: [],
+        },
+        configured: {},
+        effective: {},
+      },
+      capabilities: {
+        valid: false,
+        declared: {
+          http_hosts: ["api.example.com"],
+          secrets: ["api_token"],
+          storage_prefixes: ["workspace/plugins"],
+          channels: ["discord:default"],
+        },
+        granted: binding.capability_profile,
+        effective: binding.capability_profile,
+        entries: [
+          {
+            category: "missing_grant",
+            capability_kind: "http_hosts",
+            value: "api.example.com",
+            message: "Manifest declares api.example.com but the binding does not grant it.",
+          },
+        ],
+      },
+      reasons: ["Capability grants are missing required entries."],
+      remediation: ["Add the missing host grant to the plugin capability profile."],
+    },
+  };
+}
+
+export function pluginSignatureStateDetailFixture() {
+  const binding = pluginBindingFixture("acme.echo_signature_state", "acme.echo_signature_state");
+  return {
+    contract: controlPlaneContract(),
+    schema_version: 2,
+    binding,
+    installed_skill: pluginInstalledSkillFixture(
+      "acme.echo_signature_state",
+      "untrusted_override",
+    ),
+    check: {
+      ready: false,
+      discovery: {
+        state: "signature_failed",
+        reasons: ["installed skill artifact is running under untrusted override"],
+        missing_paths: [],
+        filesystem: {
+          safe: true,
+          issues: [],
+        },
+      },
+      config: {
+        path: "state/plugins/acme.echo_signature_state/config.json",
+        validation: {
+          state: "valid",
+          issues: [],
+          redacted_fields: [],
+        },
+        configured: {},
+        effective: {},
+      },
+      capabilities: {
+        valid: true,
+        declared: binding.capability_profile,
+        granted: binding.capability_profile,
+        effective: binding.capability_profile,
+        entries: [],
+      },
+      reasons: ["Installed skill artifact is running under untrusted override."],
+      remediation: ["Install a trusted signed artifact or remove the untrusted override."],
+    },
+  };
+}
+
+export function pluginsFixture(
+  entries = [
+    pluginInventoryEntryFromDetail(pluginInvalidConfigDetailFixture()),
+    pluginInventoryEntryFromDetail(pluginMissingGrantDetailFixture()),
+    pluginInventoryEntryFromDetail(pluginSignatureStateDetailFixture()),
+  ],
+) {
+  return {
+    contract: controlPlaneContract(),
+    schema_version: 2,
+    plugins_root: "state/plugins",
+    count: entries.length,
+    entries,
+    page: {
+      limit: entries.length === 0 ? 1 : entries.length,
+      returned: entries.length,
+      has_more: false,
+    },
+  };
+}
+
 export function builderCandidateRecordFixture(overrides: Partial<Record<string, unknown>> = {}) {
   return {
     candidate_id: "builder-candidate-1",

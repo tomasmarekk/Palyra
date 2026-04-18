@@ -5759,6 +5759,115 @@ export class ConsoleApiClient {
     return this.request(buildPathWithQuery("/console/v1/skills", params));
   }
 
+  async listPlugins(params?: URLSearchParams): Promise<{
+    contract: ContractDescriptor;
+    schema_version: number;
+    plugins_root: string;
+    count: number;
+    entries: JsonValue[];
+    page: PageInfo;
+  }> {
+    return this.request(buildPathWithQuery("/console/v1/plugins", params));
+  }
+
+  async getPlugin(pluginId: string): Promise<{
+    contract: ContractDescriptor;
+    schema_version: number;
+    binding: JsonValue;
+    check: JsonValue;
+    installed_skill?: JsonValue | null;
+  }> {
+    return this.request(`/console/v1/plugins/${encodeURIComponent(pluginId)}`);
+  }
+
+  async checkPlugin(pluginId: string): Promise<{
+    contract: ContractDescriptor;
+    schema_version: number;
+    binding: JsonValue;
+    check: JsonValue;
+    installed_skill?: JsonValue | null;
+  }> {
+    return this.request(`/console/v1/plugins/${encodeURIComponent(pluginId)}/check`);
+  }
+
+  async upsertPlugin(payload: {
+    plugin_id: string;
+    skill_id: string;
+    skill_version?: string;
+    artifact_path?: string;
+    tool_id?: string;
+    module_path?: string;
+    entrypoint?: string;
+    enabled?: boolean;
+    capability_profile?: JsonValue;
+    operator?: JsonValue;
+    config?: JsonValue;
+    clear_config?: boolean;
+    allow_tofu?: boolean;
+    allow_untrusted?: boolean;
+  }): Promise<{
+    contract: ContractDescriptor;
+    schema_version: number;
+    binding: JsonValue;
+    check: JsonValue;
+    installed_skill?: JsonValue | null;
+  }> {
+    return this.request(
+      "/console/v1/plugins/install-or-bind",
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+  }
+
+  async enablePlugin(pluginId: string): Promise<{
+    contract: ContractDescriptor;
+    schema_version: number;
+    binding: JsonValue;
+    check: JsonValue;
+    installed_skill?: JsonValue | null;
+  }> {
+    return this.request(
+      `/console/v1/plugins/${encodeURIComponent(pluginId)}/enable`,
+      {
+        method: "POST",
+        body: JSON.stringify({}),
+      },
+      { csrf: true },
+    );
+  }
+
+  async disablePlugin(pluginId: string): Promise<{
+    contract: ContractDescriptor;
+    schema_version: number;
+    binding: JsonValue;
+    check: JsonValue;
+    installed_skill?: JsonValue | null;
+  }> {
+    return this.request(
+      `/console/v1/plugins/${encodeURIComponent(pluginId)}/disable`,
+      {
+        method: "POST",
+        body: JSON.stringify({}),
+      },
+      { csrf: true },
+    );
+  }
+
+  async deletePlugin(pluginId: string): Promise<{
+    contract: ContractDescriptor;
+    deleted: boolean;
+    binding: JsonValue;
+  }> {
+    return this.request(
+      `/console/v1/plugins/${encodeURIComponent(pluginId)}/delete`,
+      { method: "POST" },
+      { csrf: true },
+    );
+  }
+
   async listSkillBuilderCandidates(
     params?: URLSearchParams,
   ): Promise<SkillBuilderCandidatesEnvelope> {

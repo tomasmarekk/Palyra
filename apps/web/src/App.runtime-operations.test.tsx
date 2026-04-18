@@ -27,6 +27,10 @@ import {
   learningPreferencesFixture,
   memoryHitsFixture,
   memoryStatusFixture,
+  pluginInvalidConfigDetailFixture,
+  pluginMissingGrantDetailFixture,
+  pluginSignatureStateDetailFixture,
+  pluginsFixture,
   procedurePromotionFixture,
   routerMintFixture,
   routerPairingsFixture,
@@ -259,6 +263,42 @@ describe("M56 runtime and operations surfaces", () => {
     async () => {
       const browserState = browserProfilesFixture();
       const builderState = skillBuilderCandidatesFixture();
+      type RuntimePluginFixture = {
+        contract: { contract_version: string };
+        schema_version: number;
+        binding: Record<string, unknown>;
+        installed_skill: Record<string, unknown>;
+        check: {
+          ready: boolean;
+          resolved?: Record<string, unknown>;
+          discovery: Record<string, unknown>;
+          config: {
+            path: string;
+            validation: {
+              state: string;
+              issues: string[];
+              redacted_fields: string[];
+            };
+            configured: Record<string, unknown>;
+            effective: Record<string, unknown>;
+          };
+          capabilities: Record<string, unknown>;
+          reasons: string[];
+          remediation: string[];
+        };
+      };
+      const pluginState: Record<string, RuntimePluginFixture> = {
+        "acme.echo_invalid_config": structuredClone(pluginInvalidConfigDetailFixture()),
+        "acme.echo_missing_grant": structuredClone(pluginMissingGrantDetailFixture()),
+        "acme.echo_signature_state": structuredClone(pluginSignatureStateDetailFixture()),
+      };
+      const listPluginInventory = () =>
+        pluginsFixture(
+          Object.values(pluginState).map((detail) => ({
+            binding: detail.binding,
+            check: detail.check,
+          })),
+        );
       const fetchMock = createFetchRouter(routeBaseRequests, (request) => {
         if (request.path === "/console/v1/memory/status" && request.method === "GET") {
           return jsonResponse(memoryStatusFixture());
@@ -319,6 +359,103 @@ describe("M56 runtime and operations surfaces", () => {
         }
         if (request.path === "/console/v1/skills" && request.method === "GET") {
           return jsonResponse(skillsFixture());
+        }
+        if (request.path === "/console/v1/plugins" && request.method === "GET") {
+          return jsonResponse(listPluginInventory());
+        }
+        if (request.path === "/console/v1/plugins/install-or-bind" && request.method === "POST") {
+          const payload = JSON.parse(request.body) as {
+            plugin_id?: string;
+            config?: { api_base_url?: unknown; api_token?: unknown };
+            clear_config?: boolean;
+          };
+          const pluginId = payload.plugin_id ?? "";
+          const detail = pluginState[pluginId];
+          if (detail === undefined) {
+            throw new Error(`Missing plugin fixture for ${pluginId}`);
+          }
+          if (pluginId === "acme.echo_invalid_config") {
+            if (payload.clear_config === true) {
+              detail.check.config.validation.state = "missing";
+              detail.check.config.validation.issues = [
+                "required config property 'api_base_url' is missing",
+                "required config property 'api_token' is missing",
+              ];
+              detail.check.config.configured = {};
+              detail.check.config.effective = {};
+              detail.check.reasons = ["required config property 'api_base_url' is missing"];
+              detail.check.remediation = [
+                "Provide operator config values for api_base_url and api_token.",
+              ];
+              detail.check.ready = false;
+            } else if (
+              typeof payload.config?.api_base_url === "string" &&
+              typeof payload.config?.api_token === "string"
+            ) {
+              detail.check.config.validation.state = "valid";
+              detail.check.config.validation.issues = [];
+              detail.check.config.configured = payload.config;
+              detail.check.config.effective = payload.config;
+              detail.check.reasons = [];
+              detail.check.remediation = [];
+              detail.check.ready = detail.binding.enabled === true;
+            }
+          }
+          return jsonResponse(detail);
+        }
+        if (
+          request.path === "/console/v1/plugins/acme.echo_invalid_config/enable" &&
+          request.method === "POST"
+        ) {
+          const detail = pluginState["acme.echo_invalid_config"];
+          detail.binding.enabled = true;
+          detail.check.ready = detail.check.config.validation.state === "valid";
+          return jsonResponse(detail);
+        }
+        if (
+          request.path === "/console/v1/plugins/acme.echo_invalid_config/disable" &&
+          request.method === "POST"
+        ) {
+          const detail = pluginState["acme.echo_invalid_config"];
+          detail.binding.enabled = false;
+          detail.check.ready = false;
+          return jsonResponse(detail);
+        }
+        if (
+          request.path === "/console/v1/plugins/acme.echo_invalid_config" &&
+          request.method === "GET"
+        ) {
+          return jsonResponse(pluginState["acme.echo_invalid_config"]);
+        }
+        if (
+          request.path === "/console/v1/plugins/acme.echo_invalid_config/check" &&
+          request.method === "GET"
+        ) {
+          return jsonResponse(pluginState["acme.echo_invalid_config"]);
+        }
+        if (
+          request.path === "/console/v1/plugins/acme.echo_missing_grant" &&
+          request.method === "GET"
+        ) {
+          return jsonResponse(pluginState["acme.echo_missing_grant"]);
+        }
+        if (
+          request.path === "/console/v1/plugins/acme.echo_missing_grant/check" &&
+          request.method === "GET"
+        ) {
+          return jsonResponse(pluginState["acme.echo_missing_grant"]);
+        }
+        if (
+          request.path === "/console/v1/plugins/acme.echo_signature_state" &&
+          request.method === "GET"
+        ) {
+          return jsonResponse(pluginState["acme.echo_signature_state"]);
+        }
+        if (
+          request.path === "/console/v1/plugins/acme.echo_signature_state/check" &&
+          request.method === "GET"
+        ) {
+          return jsonResponse(pluginState["acme.echo_signature_state"]);
         }
         if (request.path === "/console/v1/skills/builder/candidates" && request.method === "GET") {
           return jsonResponse({
@@ -450,7 +587,48 @@ describe("M56 runtime and operations surfaces", () => {
       });
 
       fireEvent.click(screen.getByRole("button", { name: "Skills" }));
-      expect(await screen.findByRole("heading", { name: "Skills" })).toBeInTheDocument();
+      expect(await screen.findByRole("heading", { name: "Skills & plugins" })).toBeInTheDocument();
+      expect((await screen.findAllByText("acme.echo_invalid_config")).length).toBeGreaterThan(0);
+      expect((await screen.findAllByText("acme.echo_missing_grant")).length).toBeGreaterThan(0);
+      expect((await screen.findAllByText("acme.echo_signature_state")).length).toBeGreaterThan(0);
+      expect((await screen.findAllByText("signature failed")).length).toBeGreaterThan(0);
+      expect(await screen.findByText("Redacted fields")).toBeInTheDocument();
+      fireEvent.change(screen.getByLabelText("Config JSON"), {
+        target: {
+          value: '{"api_base_url":"https://api.example.com","api_token":"secret-token"}',
+        },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Save config" }));
+      await waitFor(() => {
+        expect(
+          screen.getByText("Plugin config for 'acme.echo_invalid_config' saved."),
+        ).toBeInTheDocument();
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Disable plugin" }));
+      await waitFor(() => {
+        expect(screen.getByText("Plugin 'acme.echo_invalid_config' disabled.")).toBeInTheDocument();
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Enable plugin" }));
+      await waitFor(() => {
+        expect(screen.getByText("Plugin 'acme.echo_invalid_config' enabled.")).toBeInTheDocument();
+      });
+      const missingGrantRow = screen.getByText("acme.echo_missing_grant").closest("tr");
+      expect(missingGrantRow).not.toBeNull();
+      fireEvent.click(within(missingGrantRow as HTMLElement).getByRole("button", { name: "Inspect" }));
+      await waitFor(() => {
+        expect(
+          screen.getByText("Capability grants are missing required entries."),
+        ).toBeInTheDocument();
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Check now" }));
+      await waitFor(() => {
+        expect(screen.getByText("Plugin 'acme.echo_missing_grant' checked.")).toBeInTheDocument();
+      });
+      expect(
+        await screen.findByText(
+          "Manifest declares api.example.com but the binding does not grant it.",
+        ),
+      ).toBeInTheDocument();
       expect(await screen.findByText("acme.echo_http")).toBeInTheDocument();
       expect(await screen.findByText("palyra.generated.builder.release_check")).toBeInTheDocument();
       fireEvent.click(screen.getByRole("button", { name: "Verify" }));

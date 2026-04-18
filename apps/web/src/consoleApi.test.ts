@@ -1603,6 +1603,146 @@ describe("ConsoleApiClient", () => {
     );
   });
 
+  it("uses plugin inventory and remediation endpoints with the expected verbs and CSRF posture", async () => {
+    const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    const responses = [
+      jsonResponse({
+        principal: "admin:web-console",
+        device_id: "device-1",
+        csrf_token: "csrf-1",
+        issued_at_unix_ms: 100,
+        expires_at_unix_ms: 200,
+      }),
+      jsonResponse({
+        contract: { contract_version: "control-plane.v1" },
+        schema_version: 2,
+        plugins_root: "state/plugins",
+        count: 1,
+        entries: [],
+        page: { limit: 1, returned: 0, has_more: false },
+      }),
+      jsonResponse({
+        contract: { contract_version: "control-plane.v1" },
+        schema_version: 2,
+        binding: { plugin_id: "acme.echo_invalid_config", skill_id: "acme.echo_configured" },
+        check: { ready: false },
+        installed_skill: { trust_decision: "allowlisted" },
+      }),
+      jsonResponse({
+        contract: { contract_version: "control-plane.v1" },
+        schema_version: 2,
+        binding: { plugin_id: "acme.echo_invalid_config", skill_id: "acme.echo_configured" },
+        check: { ready: false },
+        installed_skill: { trust_decision: "allowlisted" },
+      }),
+      jsonResponse({
+        contract: { contract_version: "control-plane.v1" },
+        schema_version: 2,
+        binding: { plugin_id: "acme.echo_invalid_config", skill_id: "acme.echo_configured" },
+        check: { ready: true },
+        installed_skill: { trust_decision: "allowlisted" },
+      }),
+      jsonResponse({
+        contract: { contract_version: "control-plane.v1" },
+        schema_version: 2,
+        binding: { plugin_id: "acme.echo_invalid_config", skill_id: "acme.echo_configured" },
+        check: { ready: true },
+        installed_skill: { trust_decision: "allowlisted" },
+      }),
+      jsonResponse({
+        contract: { contract_version: "control-plane.v1" },
+        schema_version: 2,
+        binding: { plugin_id: "acme.echo_invalid_config", skill_id: "acme.echo_configured" },
+        check: { ready: false },
+        installed_skill: { trust_decision: "allowlisted" },
+      }),
+      jsonResponse({
+        contract: { contract_version: "control-plane.v1" },
+        deleted: true,
+        binding: { plugin_id: "acme.echo_invalid_config" },
+      }),
+    ];
+    const fetcher: typeof fetch = (input, init) => {
+      calls.push({ input, init });
+      const response = responses.shift();
+      if (response === undefined) {
+        throw new Error("No response queued for fetch mock.");
+      }
+      return Promise.resolve(response);
+    };
+
+    const client = new ConsoleApiClient("", fetcher);
+    await client.login({
+      admin_token: "token",
+      principal: "admin:web-console",
+      device_id: "device-1",
+      channel: "web",
+    });
+    await client.listPlugins();
+    await client.getPlugin("acme.echo_invalid_config");
+    await client.checkPlugin("acme.echo_invalid_config");
+    await client.upsertPlugin({
+      plugin_id: "acme.echo_invalid_config",
+      skill_id: "acme.echo_configured",
+      tool_id: "acme.echo",
+      module_path: "modules/module.wasm",
+      entrypoint: "run",
+      enabled: true,
+      capability_profile: {
+        http_hosts: ["api.example.com"],
+        secrets: ["api_token"],
+        storage_prefixes: ["workspace/plugins"],
+        channels: ["discord:default"],
+      },
+      config: {
+        api_base_url: "https://api.example.com",
+        api_token: "secret-token",
+      },
+    });
+    await client.enablePlugin("acme.echo_invalid_config");
+    await client.disablePlugin("acme.echo_invalid_config");
+    await client.deletePlugin("acme.echo_invalid_config");
+
+    expect(requestUrl(calls[1]?.input)).toBe("/console/v1/plugins");
+    expect(new Headers(calls[1]?.init?.headers).get("x-palyra-csrf-token")).toBeNull();
+
+    expect(requestUrl(calls[2]?.input)).toBe("/console/v1/plugins/acme.echo_invalid_config");
+    expect(new Headers(calls[2]?.init?.headers).get("x-palyra-csrf-token")).toBeNull();
+
+    expect(requestUrl(calls[3]?.input)).toBe(
+      "/console/v1/plugins/acme.echo_invalid_config/check",
+    );
+    expect(new Headers(calls[3]?.init?.headers).get("x-palyra-csrf-token")).toBeNull();
+
+    expect(requestUrl(calls[4]?.input)).toBe("/console/v1/plugins/install-or-bind");
+    expect(calls[4]?.init?.method).toBe("POST");
+    expect(new Headers(calls[4]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
+    expect(requestBody(calls[4]?.init?.body)).toContain('"plugin_id":"acme.echo_invalid_config"');
+    expect(requestBody(calls[4]?.init?.body)).toContain(
+      '"api_base_url":"https://api.example.com"',
+    );
+
+    expect(requestUrl(calls[5]?.input)).toBe(
+      "/console/v1/plugins/acme.echo_invalid_config/enable",
+    );
+    expect(calls[5]?.init?.method).toBe("POST");
+    expect(new Headers(calls[5]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
+    expect(requestBody(calls[5]?.init?.body)).toBe("{}");
+
+    expect(requestUrl(calls[6]?.input)).toBe(
+      "/console/v1/plugins/acme.echo_invalid_config/disable",
+    );
+    expect(calls[6]?.init?.method).toBe("POST");
+    expect(new Headers(calls[6]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
+    expect(requestBody(calls[6]?.init?.body)).toBe("{}");
+
+    expect(requestUrl(calls[7]?.input)).toBe(
+      "/console/v1/plugins/acme.echo_invalid_config/delete",
+    );
+    expect(calls[7]?.init?.method).toBe("POST");
+    expect(new Headers(calls[7]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
+  });
+
   it("uses configured ref inventory and reload planning endpoints with the expected verbs and CSRF posture", async () => {
     const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
     const responses = [
