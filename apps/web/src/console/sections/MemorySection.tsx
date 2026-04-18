@@ -1219,7 +1219,8 @@ export function MemorySection({ app }: MemorySectionProps) {
                   </WorkspaceStatusChip>
                   {readNumber(recallStructuredOutput, "confidence") !== null ? (
                     <WorkspaceStatusChip tone="accent">
-                      Confidence {(readNumber(recallStructuredOutput, "confidence") ?? 0).toFixed(2)}
+                      Confidence{" "}
+                      {(readNumber(recallStructuredOutput, "confidence") ?? 0).toFixed(2)}
                     </WorkspaceStatusChip>
                   ) : null}
                 </div>
@@ -1242,9 +1243,7 @@ export function MemorySection({ app }: MemorySectionProps) {
                         className="chat-ops-card"
                       >
                         <div className="chat-ops-card__copy">
-                          <strong>
-                            {formatRecallSourceKind(readString(item, "source_kind"))}
-                          </strong>
+                          <strong>{formatRecallSourceKind(readString(item, "source_kind"))}</strong>
                           <span>{readString(item, "reason") ?? "No planner reason returned."}</span>
                           <p>{readString(item, "query") ?? "No query rewrite returned."}</p>
                         </div>
@@ -1286,7 +1285,9 @@ export function MemorySection({ app }: MemorySectionProps) {
                           </p>
                         </div>
                         <div className="chat-ops-card__actions">
-                          <WorkspaceStatusChip tone="warning">{formatScore(item)}</WorkspaceStatusChip>
+                          <WorkspaceStatusChip tone="warning">
+                            {formatScore(item)}
+                          </WorkspaceStatusChip>
                           <WorkspaceStatusChip tone="default">
                             {formatUnixMs(readNumber(item, "created_at_unix_ms"))}
                           </WorkspaceStatusChip>
@@ -1306,7 +1307,8 @@ export function MemorySection({ app }: MemorySectionProps) {
                           <strong>{readString(item, "statement") ?? `Fact ${index + 1}`}</strong>
                           <p>
                             Evidence:{" "}
-                            {readStringArray(item, "evidence_ids").join(", ") || "No linked evidence"}
+                            {readStringArray(item, "evidence_ids").join(", ") ||
+                              "No linked evidence"}
                           </p>
                         </div>
                       </article>
@@ -1335,7 +1337,9 @@ export function MemorySection({ app }: MemorySectionProps) {
                           </p>
                         </div>
                         <div className="chat-ops-card__actions">
-                          <WorkspaceStatusChip tone="accent">{formatScore(item)}</WorkspaceStatusChip>
+                          <WorkspaceStatusChip tone="accent">
+                            {formatScore(item)}
+                          </WorkspaceStatusChip>
                         </div>
                       </article>
                     )}
@@ -1432,7 +1436,9 @@ export function MemorySection({ app }: MemorySectionProps) {
                           </p>
                         </div>
                         <div className="chat-ops-card__actions">
-                          <WorkspaceStatusChip tone="warning">{formatScore(item)}</WorkspaceStatusChip>
+                          <WorkspaceStatusChip tone="warning">
+                            {formatScore(item)}
+                          </WorkspaceStatusChip>
                           <WorkspaceStatusChip tone="default">
                             {formatUnixMs(readNumber(item, "created_at_unix_ms"))}
                           </WorkspaceStatusChip>
@@ -1460,7 +1466,9 @@ export function MemorySection({ app }: MemorySectionProps) {
                           </p>
                         </div>
                         <div className="chat-ops-card__actions">
-                          <WorkspaceStatusChip tone="success">{formatScore(item)}</WorkspaceStatusChip>
+                          <WorkspaceStatusChip tone="success">
+                            {formatScore(item)}
+                          </WorkspaceStatusChip>
                           <WorkspaceStatusChip tone="default">
                             {formatUnixMs(readNumber(item, "created_at_unix_ms"))}
                           </WorkspaceStatusChip>
@@ -1480,7 +1488,9 @@ export function MemorySection({ app }: MemorySectionProps) {
                         className="chat-ops-card"
                       >
                         <div className="chat-ops-card__copy">
-                          <strong>{readString(item, "artifact_id") ?? `Artifact ${index + 1}`}</strong>
+                          <strong>
+                            {readString(item, "artifact_id") ?? `Artifact ${index + 1}`}
+                          </strong>
                           <span>{readString(item, "reason") ?? "No rationale returned."}</span>
                           <p>
                             {readString(item, "summary_preview") ??
@@ -1488,7 +1498,9 @@ export function MemorySection({ app }: MemorySectionProps) {
                           </p>
                         </div>
                         <div className="chat-ops-card__actions">
-                          <WorkspaceStatusChip tone="accent">{formatScore(item)}</WorkspaceStatusChip>
+                          <WorkspaceStatusChip tone="accent">
+                            {formatScore(item)}
+                          </WorkspaceStatusChip>
                           <WorkspaceStatusChip tone="default">
                             {formatUnixMs(readNumber(item, "created_at_unix_ms"))}
                           </WorkspaceStatusChip>
