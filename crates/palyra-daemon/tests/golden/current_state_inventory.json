@@ -679,6 +679,12 @@
       "config_path": "feature_rollouts.dynamic_tool_builder",
       "env_var": "PALYRA_EXPERIMENTAL_DYNAMIC_TOOL_BUILDER"
     },
+    "context_engine": {
+      "enabled": false,
+      "source": "default",
+      "config_path": "feature_rollouts.context_engine",
+      "env_var": "PALYRA_EXPERIMENTAL_CONTEXT_ENGINE"
+    },
     "execution_backend_remote_node": {
       "enabled": false,
       "source": "default",
