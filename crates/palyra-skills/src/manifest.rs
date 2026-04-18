@@ -5,9 +5,12 @@ use palyra_common::{build_metadata, CANONICAL_PROTOCOL_MAJOR};
 use serde_json::Value;
 
 use crate::artifact::normalize_artifact_path;
-use crate::constants::SKILL_MANIFEST_VERSION;
+use crate::constants::{LEGACY_SKILL_MANIFEST_VERSION, SKILL_MANIFEST_VERSION};
 use crate::error::SkillPackagingError;
-use crate::models::{SkillCompat, SkillManifest};
+use crate::models::{
+    SkillBuilderMetadata, SkillCompat, SkillConfigContract, SkillConfigProperty,
+    SkillConfigValueType, SkillManifest, SkillManifestWarning, SkillManifestWarningSeverity,
+};
 
 pub fn parse_manifest_toml(raw: &str) -> Result<SkillManifest, SkillPackagingError> {
     let manifest = toml::from_str::<SkillManifest>(raw)
@@ -49,10 +52,13 @@ pub fn parse_ed25519_signing_key(secret: &[u8]) -> Result<[u8; 32], SkillPackagi
 }
 
 fn validate_manifest(manifest: &SkillManifest) -> Result<(), SkillPackagingError> {
-    if manifest.manifest_version != SKILL_MANIFEST_VERSION {
+    if !matches!(
+        manifest.manifest_version,
+        LEGACY_SKILL_MANIFEST_VERSION | SKILL_MANIFEST_VERSION
+    ) {
         return Err(SkillPackagingError::ManifestValidation(format!(
-            "manifest_version must equal {}",
-            SKILL_MANIFEST_VERSION
+            "manifest_version must equal {} or {}",
+            LEGACY_SKILL_MANIFEST_VERSION, SKILL_MANIFEST_VERSION
         )));
     }
     let publisher = normalize_identifier(manifest.publisher.as_str(), "publisher")?;
@@ -146,6 +152,7 @@ fn validate_manifest(manifest: &SkillManifest) -> Result<(), SkillPackagingError
     if let Some(builder) = manifest.builder.as_ref() {
         validate_builder_metadata(builder)?;
     }
+    validate_operator_metadata(manifest, publisher.as_str())?;
     Ok(())
 }
 
@@ -258,7 +265,7 @@ fn validate_secret_scope(scope: &str) -> Result<(), SkillPackagingError> {
 }
 
 fn validate_builder_metadata(
-    builder: &crate::models::SkillBuilderMetadata,
+    builder: &SkillBuilderMetadata,
 ) -> Result<(), SkillPackagingError> {
     if !builder.experimental {
         return Err(SkillPackagingError::ManifestValidation(
@@ -295,6 +302,122 @@ fn validate_builder_metadata(
     Ok(())
 }
 
+fn validate_operator_metadata(
+    manifest: &SkillManifest,
+    publisher: &str,
+) -> Result<(), SkillPackagingError> {
+    let operator = &manifest.operator;
+    if manifest.manifest_version == LEGACY_SKILL_MANIFEST_VERSION && !operator.is_empty() {
+        return Err(SkillPackagingError::ManifestValidation(format!(
+            "operator metadata requires manifest_version {}",
+            SKILL_MANIFEST_VERSION
+        )));
+    }
+    if operator.is_empty() {
+        return Ok(());
+    }
+
+    validate_optional_operator_text(operator.display_name.as_deref(), "operator.display_name")?;
+    validate_optional_operator_text(operator.summary.as_deref(), "operator.summary")?;
+    validate_optional_operator_text(operator.description.as_deref(), "operator.description")?;
+    for category in &operator.categories {
+        validate_operator_label(category.as_str(), "operator.categories")?;
+    }
+    for tag in &operator.tags {
+        validate_operator_label(tag.as_str(), "operator.tags")?;
+    }
+    if let Some(url) = operator.docs_url.as_deref() {
+        validate_operator_docs_url(url)?;
+    }
+
+    if let Some(tool_id) = operator.plugin.default_tool_id.as_deref() {
+        let normalized = normalize_identifier(tool_id, "operator.plugin.default_tool_id")?;
+        if !manifest.entrypoints.tools.iter().any(|tool| tool.id == normalized) {
+            return Err(SkillPackagingError::ManifestValidation(format!(
+                "operator.plugin.default_tool_id '{}' must reference an entrypoints.tools id",
+                tool_id
+            )));
+        }
+        if !normalized.starts_with(format!("{publisher}.").as_str()) {
+            return Err(SkillPackagingError::ManifestValidation(format!(
+                "operator.plugin.default_tool_id '{}' must be namespaced with '{}.'",
+                tool_id, publisher
+            )));
+        }
+    }
+    if let Some(module_path) = operator.plugin.default_module_path.as_deref() {
+        validate_plugin_module_path(module_path, "operator.plugin.default_module_path")?;
+    }
+    if let Some(entrypoint) = operator.plugin.default_entrypoint.as_deref() {
+        validate_plugin_entrypoint(entrypoint, "operator.plugin.default_entrypoint")?;
+    }
+    if let Some(config) = operator.config.as_ref() {
+        validate_config_contract(config)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn collect_manifest_warnings(manifest: &SkillManifest) -> Vec<SkillManifestWarning> {
+    let mut warnings = Vec::new();
+    if manifest.manifest_version == LEGACY_SKILL_MANIFEST_VERSION {
+        warnings.push(SkillManifestWarning {
+            code: "legacy_manifest_version".to_owned(),
+            severity: SkillManifestWarningSeverity::Warning,
+            message: format!(
+                "manifest_version {} is still supported for compatibility, but {} is now recommended",
+                LEGACY_SKILL_MANIFEST_VERSION, SKILL_MANIFEST_VERSION
+            ),
+        });
+    }
+    if manifest.operator.is_empty() {
+        warnings.push(SkillManifestWarning {
+            code: "missing_operator_metadata".to_owned(),
+            severity: SkillManifestWarningSeverity::Warning,
+            message: "operator-facing metadata is missing; inventory and doctor output will be degraded"
+                .to_owned(),
+        });
+    } else {
+        if manifest.operator.display_name.is_none() {
+            warnings.push(SkillManifestWarning {
+                code: "missing_operator_display_name".to_owned(),
+                severity: SkillManifestWarningSeverity::Warning,
+                message: "operator.display_name is missing".to_owned(),
+            });
+        }
+        if manifest
+            .operator
+            .config
+            .as_ref()
+            .is_some_and(|config| config.properties.is_empty())
+        {
+            warnings.push(SkillManifestWarning {
+                code: "empty_operator_config_contract".to_owned(),
+                severity: SkillManifestWarningSeverity::Warning,
+                message: "operator.config is present but does not declare any properties".to_owned(),
+            });
+        }
+        for (name, property) in manifest
+            .operator
+            .config
+            .as_ref()
+            .into_iter()
+            .flat_map(|config| config.properties.iter())
+        {
+            if !property.redacted && looks_secretish(name.as_str()) {
+                warnings.push(SkillManifestWarning {
+                    code: "operator_config_redaction_recommended".to_owned(),
+                    severity: SkillManifestWarningSeverity::Warning,
+                    message: format!(
+                        "operator.config property '{}' looks secret-like but is not marked redacted",
+                        name
+                    ),
+                });
+            }
+        }
+    }
+    warnings
+}
+
 fn validate_builder_artifact_path(path: &str, field_name: &str) -> Result<(), SkillPackagingError> {
     if path.trim().is_empty() {
         return Err(SkillPackagingError::ManifestValidation(format!(
@@ -319,6 +442,202 @@ fn validate_identifier_or_wildcard(
         )));
     }
     normalize_identifier(value, field).map(|_| ())
+}
+
+fn validate_optional_operator_text(
+    value: Option<&str>,
+    field_name: &'static str,
+) -> Result<(), SkillPackagingError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value.trim().is_empty() {
+        return Err(SkillPackagingError::ManifestValidation(format!(
+            "{field_name} cannot be empty"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_operator_label(value: &str, field_name: &'static str) -> Result<(), SkillPackagingError> {
+    let normalized = value.trim();
+    if normalized.is_empty()
+        || !normalized
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-'))
+    {
+        return Err(SkillPackagingError::ManifestValidation(format!(
+            "{field_name} entries must use [a-z0-9._-]"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_operator_docs_url(url: &str) -> Result<(), SkillPackagingError> {
+    let normalized = url.trim();
+    if normalized.is_empty()
+        || !normalized.starts_with("https://")
+        || normalized.contains(' ')
+        || normalized.contains('#')
+    {
+        return Err(SkillPackagingError::ManifestValidation(
+            "operator.docs_url must be an https URL without fragments or spaces".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_plugin_module_path(
+    module_path: &str,
+    field_name: &'static str,
+) -> Result<(), SkillPackagingError> {
+    if module_path.contains('\0')
+        || module_path.contains("..")
+        || !module_path.starts_with("modules/")
+        || !module_path.ends_with(".wasm")
+    {
+        return Err(SkillPackagingError::ManifestValidation(format!(
+            "{field_name} must reference a modules/*.wasm entry"
+        )));
+    }
+    normalize_artifact_path(module_path)?;
+    Ok(())
+}
+
+fn validate_plugin_entrypoint(
+    entrypoint: &str,
+    field_name: &'static str,
+) -> Result<(), SkillPackagingError> {
+    let normalized = entrypoint.trim();
+    if normalized.is_empty()
+        || !normalized
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '_' | '-'))
+    {
+        return Err(SkillPackagingError::ManifestValidation(format!(
+            "{field_name} must use [a-z0-9_-]"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_config_contract(contract: &SkillConfigContract) -> Result<(), SkillPackagingError> {
+    if contract.schema_version == 0 {
+        return Err(SkillPackagingError::ManifestValidation(
+            "operator.config.schema_version must be non-zero".to_owned(),
+        ));
+    }
+    for required in &contract.required {
+        validate_config_key(required.as_str(), "operator.config.required")?;
+        if !contract.properties.contains_key(required) {
+            return Err(SkillPackagingError::ManifestValidation(format!(
+                "operator.config.required references unknown property '{}'",
+                required
+            )));
+        }
+    }
+    for (name, property) in &contract.properties {
+        validate_config_key(name.as_str(), "operator.config.properties")?;
+        validate_config_property(name.as_str(), property)?;
+    }
+    Ok(())
+}
+
+fn validate_config_property(
+    name: &str,
+    property: &SkillConfigProperty,
+) -> Result<(), SkillPackagingError> {
+    validate_optional_operator_text(property.title.as_deref(), "operator.config.properties[].title")?;
+    validate_optional_operator_text(
+        property.description.as_deref(),
+        "operator.config.properties[].description",
+    )?;
+    if !property.enum_values.is_empty() {
+        if property.value_type != SkillConfigValueType::String {
+            return Err(SkillPackagingError::ManifestValidation(format!(
+                "operator.config property '{}' enum_values require type='string'",
+                name
+            )));
+        }
+        let mut unique = BTreeSet::new();
+        for value in &property.enum_values {
+            if value.trim().is_empty() {
+                return Err(SkillPackagingError::ManifestValidation(format!(
+                    "operator.config property '{}' enum_values cannot contain empty strings",
+                    name
+                )));
+            }
+            unique.insert(value.trim().to_owned());
+        }
+        if unique.len() != property.enum_values.len() {
+            return Err(SkillPackagingError::ManifestValidation(format!(
+                "operator.config property '{}' enum_values must be unique",
+                name
+            )));
+        }
+    }
+    if let Some(default) = property.default.as_ref() {
+        validate_config_value_type(name, &property.value_type, default)?;
+        if !property.enum_values.is_empty() {
+            let value = default.as_str().ok_or_else(|| {
+                SkillPackagingError::ManifestValidation(format!(
+                    "operator.config property '{}' default must be a string because enum_values are declared",
+                    name
+                ))
+            })?;
+            if !property.enum_values.iter().any(|candidate| candidate == value) {
+                return Err(SkillPackagingError::ManifestValidation(format!(
+                    "operator.config property '{}' default must be one of enum_values",
+                    name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_config_key(name: &str, field_name: &'static str) -> Result<(), SkillPackagingError> {
+    let normalized = name.trim();
+    if normalized.is_empty()
+        || !normalized
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-'))
+    {
+        return Err(SkillPackagingError::ManifestValidation(format!(
+            "{field_name} keys must use [a-z0-9._-]"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_config_value_type(
+    property_name: &str,
+    value_type: &SkillConfigValueType,
+    value: &Value,
+) -> Result<(), SkillPackagingError> {
+    let valid = match value_type {
+        SkillConfigValueType::String => value.is_string(),
+        SkillConfigValueType::Integer => value.as_i64().is_some() || value.as_u64().is_some(),
+        SkillConfigValueType::Number => value.is_number(),
+        SkillConfigValueType::Boolean => value.is_boolean(),
+        SkillConfigValueType::StringList => value.as_array().is_some_and(|values| {
+            values.iter().all(|candidate| candidate.as_str().is_some())
+        }),
+    };
+    if valid {
+        return Ok(());
+    }
+    Err(SkillPackagingError::ManifestValidation(format!(
+        "operator.config property '{}' default does not match declared type '{:?}'",
+        property_name, value_type
+    )))
+}
+
+fn looks_secretish(name: &str) -> bool {
+    let normalized = name.to_ascii_lowercase();
+    ["secret", "token", "password", "api_key", "client_key"]
+        .iter()
+        .any(|needle| normalized.contains(needle))
 }
 
 fn normalize_skill_id(value: &str) -> Result<String, SkillPackagingError> {

@@ -2852,6 +2852,12 @@ pub struct PluginBindingView {
     pub capability_profile: PluginCapabilityProfile,
     #[serde(default)]
     pub operator: PluginOperatorMetadata,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discovery: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capability_diff: Option<Value>,
     pub created_at_unix_ms: i64,
     pub updated_at_unix_ms: i64,
 }
@@ -2865,6 +2871,7 @@ pub struct PluginBindingListEntry {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PluginBindingListEnvelope {
     pub contract: ContractDescriptor,
+    pub schema_version: u32,
     pub plugins_root: String,
     pub count: usize,
     #[serde(default)]
@@ -2875,6 +2882,7 @@ pub struct PluginBindingListEnvelope {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PluginBindingEnvelope {
     pub contract: ContractDescriptor,
+    pub schema_version: u32,
     pub binding: PluginBindingView,
     pub check: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2913,6 +2921,10 @@ pub struct PluginBindingUpsertRequest {
     pub capability_profile: Option<PluginCapabilityProfile>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operator: Option<PluginOperatorMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clear_config: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

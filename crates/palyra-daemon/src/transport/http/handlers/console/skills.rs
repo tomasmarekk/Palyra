@@ -1101,6 +1101,27 @@ fn build_builder_skill_manifest(
                 review_notes: request.review_notes.clone().unwrap_or_default(),
             },
         }),
+        operator: palyra_skills::SkillOperatorMetadata {
+            display_name: Some(request.name.clone()),
+            summary: Some(request.tool_description.clone()),
+            description: request.review_notes.clone(),
+            categories: vec!["builder".to_owned()],
+            tags: vec!["generated".to_owned(), "quarantined".to_owned()],
+            docs_url: None,
+            plugin: palyra_skills::SkillPluginMetadata {
+                default_tool_id: Some(
+                    request
+                        .tool_id
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty())
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_else(|| format!("{}.run", request.publisher)),
+                ),
+                default_module_path: Some("modules/module.wasm".to_owned()),
+                default_entrypoint: Some("run".to_owned()),
+            },
+            config: None,
+        },
     }
 }
 

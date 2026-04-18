@@ -1,7 +1,7 @@
 use crate::artifact::{decode_zip, now_unix_ms, parse_and_verify_artifact, parse_verifying_key};
 use crate::constants::SKILL_VERIFICATION_EVENT_KIND;
 use crate::error::SkillPackagingError;
-use crate::manifest::assert_runtime_compatibility;
+use crate::manifest::{assert_runtime_compatibility, collect_manifest_warnings};
 use crate::models::{
     SkillArtifactInspection, SkillTrustStore, SkillVerificationAuditEvent, SkillVerificationReport,
     TrustDecision,
@@ -41,6 +41,7 @@ pub fn verify_skill_artifact(
 
     let capability_grants = capability_grants_from_manifest(&inspected.manifest);
     let policy_bindings = policy_bindings_from_manifest(&inspected.manifest);
+    let manifest_warnings = inspected.manifest_warnings.clone();
     let audit_event = SkillVerificationAuditEvent {
         event_kind: SKILL_VERIFICATION_EVENT_KIND.to_owned(),
         skill_id: inspected.manifest.skill_id.clone(),
@@ -57,6 +58,7 @@ pub fn verify_skill_artifact(
         trust_decision,
         payload_sha256: inspected.payload_sha256,
         manifest: inspected.manifest,
+        manifest_warnings,
         capability_grants,
         policy_bindings,
         audit_event,
@@ -70,6 +72,7 @@ pub fn inspect_skill_artifact(
     let parsed = parse_and_verify_artifact(&entries)?;
     assert_runtime_compatibility(&parsed.manifest.compat)?;
     Ok(SkillArtifactInspection {
+        manifest_warnings: collect_manifest_warnings(&parsed.manifest),
         manifest: parsed.manifest,
         signature: parsed.signature,
         payload_sha256: parsed.payload_sha256,

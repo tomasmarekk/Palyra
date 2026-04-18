@@ -36,6 +36,18 @@ pub fn audit_skill_artifact_security(
         "manifest passed strict schema and wildcard validation",
         None,
     ));
+    for warning in &inspected.manifest_warnings {
+        checks.push(SkillSecurityAuditCheck {
+            check_id: format!("manifest_warning:{}", warning.code),
+            status: SkillAuditCheckStatus::Warn,
+            severity: SkillAuditSeverity::Warning,
+            message: warning.message.clone(),
+            details: Some(json!({
+                "code": warning.code,
+                "severity": warning.severity,
+            })),
+        });
+    }
 
     let module_paths = inspected
         .entries
@@ -204,6 +216,7 @@ pub fn audit_skill_artifact_security(
         payload_sha256: verification.payload_sha256,
         generated_at_unix_ms: now_unix_ms(),
         policy: policy.clone(),
+        manifest_warnings: inspected.manifest_warnings,
         checks,
         quarantine_reasons,
         vulnerability_scan,

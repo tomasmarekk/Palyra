@@ -3585,6 +3585,11 @@ allowed_channels = []
     let bound_plugin = serde_json::from_str::<Value>(bound_plugin_body.as_str())
         .context("failed to parse plugin bind response json")?;
     assert_eq!(
+        bound_plugin.get("schema_version").and_then(Value::as_u64),
+        Some(2),
+        "plugin bind should surface the bindings index schema version"
+    );
+    assert_eq!(
         bound_plugin.pointer("/binding/plugin_id").and_then(Value::as_str),
         Some("acme-hook-plugin")
     );
@@ -3592,6 +3597,21 @@ allowed_channels = []
         bound_plugin.pointer("/check/ready").and_then(Value::as_bool),
         Some(true),
         "plugin check should resolve the installed signed skill artifact: {bound_plugin}"
+    );
+    assert_eq!(
+        bound_plugin.pointer("/check/discovery/state").and_then(Value::as_str),
+        Some("installed"),
+        "plugin discovery state should report the installed runtime-ready binding"
+    );
+    assert_eq!(
+        bound_plugin.pointer("/check/config/validation/state").and_then(Value::as_str),
+        Some("valid"),
+        "plugin config state should remain valid when the manifest declares no operator config"
+    );
+    assert_eq!(
+        bound_plugin.pointer("/check/capabilities/valid").and_then(Value::as_bool),
+        Some(true),
+        "plugin capability diff should stay valid when the binding matches the manifest/profile"
     );
 
     let listed_plugins = client
@@ -3607,6 +3627,19 @@ allowed_channels = []
         listed_plugins.get("count").and_then(Value::as_u64),
         Some(1),
         "plugin list should include the newly bound plugin"
+    );
+    assert_eq!(
+        listed_plugins.get("schema_version").and_then(Value::as_u64),
+        Some(2),
+        "plugin list should expose the migrated bindings schema version"
+    );
+    assert_eq!(
+        listed_plugins
+            .pointer("/entries/0/check/remediation")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0),
+        "healthy plugin bindings should not emit remediation steps"
     );
 
     let bound_hook = client

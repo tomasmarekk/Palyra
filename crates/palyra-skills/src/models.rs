@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::constants::{
-    default_manifest_version, default_quota_fuel_budget, default_quota_max_memory,
-    default_quota_timeout_ms, DEFAULT_SKILL_AUDIT_MAX_EXPORTED_FUNCTIONS,
+    default_manifest_version, default_operator_config_schema_version, default_quota_fuel_budget,
+    default_quota_max_memory, default_quota_timeout_ms, DEFAULT_SKILL_AUDIT_MAX_EXPORTED_FUNCTIONS,
     DEFAULT_SKILL_AUDIT_MAX_MODULE_BYTES,
 };
 
@@ -26,6 +26,8 @@ pub struct SkillManifest {
     pub integrity: SkillIntegrity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub builder: Option<SkillBuilderMetadata>,
+    #[serde(default)]
+    pub operator: SkillOperatorMetadata,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -172,6 +174,114 @@ pub struct SkillBuilderChecklist {
     pub review_notes: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SkillOperatorMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub categories: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docs_url: Option<String>,
+    #[serde(default)]
+    pub plugin: SkillPluginMetadata,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<SkillConfigContract>,
+}
+
+impl SkillOperatorMetadata {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.display_name.is_none()
+            && self.summary.is_none()
+            && self.description.is_none()
+            && self.categories.is_empty()
+            && self.tags.is_empty()
+            && self.docs_url.is_none()
+            && self.plugin.is_empty()
+            && self.config.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SkillPluginMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_tool_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_module_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_entrypoint: Option<String>,
+}
+
+impl SkillPluginMetadata {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.default_tool_id.is_none()
+            && self.default_module_path.is_none()
+            && self.default_entrypoint.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SkillConfigContract {
+    #[serde(default = "default_operator_config_schema_version")]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub required: Vec<String>,
+    #[serde(default)]
+    pub properties: BTreeMap<String, SkillConfigProperty>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SkillConfigProperty {
+    #[serde(rename = "type")]
+    pub value_type: SkillConfigValueType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<Value>,
+    #[serde(default)]
+    pub redacted: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enum_values: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillConfigValueType {
+    String,
+    Integer,
+    Number,
+    Boolean,
+    StringList,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillManifestWarningSeverity {
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SkillManifestWarning {
+    pub code: String,
+    pub severity: SkillManifestWarningSeverity,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SkillArtifactSignature {
@@ -261,6 +371,8 @@ pub struct SkillVerificationReport {
     pub trust_decision: TrustDecision,
     pub payload_sha256: String,
     pub manifest: SkillManifest,
+    #[serde(default)]
+    pub manifest_warnings: Vec<SkillManifestWarning>,
     pub capability_grants: SkillCapabilityGrantSnapshot,
     pub policy_bindings: Vec<SkillPolicyBinding>,
     pub audit_event: SkillVerificationAuditEvent,
@@ -323,6 +435,8 @@ pub struct SkillSecurityAuditReport {
     pub payload_sha256: String,
     pub generated_at_unix_ms: i64,
     pub policy: SkillSecurityAuditPolicy,
+    #[serde(default)]
+    pub manifest_warnings: Vec<SkillManifestWarning>,
     pub checks: Vec<SkillSecurityAuditCheck>,
     pub quarantine_reasons: Vec<String>,
     pub vulnerability_scan: SkillSecurityAuditCheck,
@@ -340,5 +454,6 @@ pub struct SkillArtifactInspection {
     pub manifest: SkillManifest,
     pub signature: SkillArtifactSignature,
     pub payload_sha256: String,
+    pub manifest_warnings: Vec<SkillManifestWarning>,
     pub entries: BTreeMap<String, Vec<u8>>,
 }

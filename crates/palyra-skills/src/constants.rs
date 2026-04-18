@@ -4,7 +4,8 @@ pub const SBOM_PATH: &str = "sbom.cdx.json";
 pub const PROVENANCE_PATH: &str = "provenance.json";
 pub const SIGNATURE_PATH: &str = "signature.json";
 pub const SKILL_VERIFICATION_EVENT_KIND: &str = "skill.artifact.verified";
-pub const SKILL_MANIFEST_VERSION: u32 = 1;
+pub const SKILL_MANIFEST_VERSION: u32 = 2;
+pub const LEGACY_SKILL_MANIFEST_VERSION: u32 = 1;
 pub const DEFAULT_SKILL_AUDIT_MAX_MODULE_BYTES: u64 = 8 * 1024 * 1024;
 pub const DEFAULT_SKILL_AUDIT_MAX_EXPORTED_FUNCTIONS: usize = 128;
 
@@ -17,6 +18,11 @@ pub(crate) const MAX_ENTRIES: usize = 256;
 #[must_use]
 pub(crate) fn default_manifest_version() -> u32 {
     SKILL_MANIFEST_VERSION
+}
+
+#[must_use]
+pub(crate) fn default_operator_config_schema_version() -> u32 {
+    1
 }
 
 #[must_use]

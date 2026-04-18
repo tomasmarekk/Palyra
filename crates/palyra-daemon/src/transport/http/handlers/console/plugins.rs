@@ -1,16 +1,23 @@
-use std::{collections::BTreeSet, fs, path::PathBuf};
+use std::{collections::BTreeMap, fs, path::PathBuf};
 
+use anyhow::anyhow;
 use palyra_skills::{verify_skill_artifact, SkillTrustStore};
 
 use crate::{
     hooks::{hooks_for_plugin, load_hook_bindings_index, resolve_hooks_root},
     plugins::{
-        delete_plugin_binding, load_plugin_bindings_index, normalize_plugin_binding_upsert,
-        plugin_binding, resolve_plugins_root, save_plugin_bindings_index,
-        set_plugin_binding_enabled, upsert_plugin_binding, PluginBindingRecord,
-        PluginBindingUpsert, PluginCapabilityProfile, PluginOperatorMetadata,
+        build_plugin_capability_diff, build_plugin_discovery_snapshot, delete_plugin_binding,
+        inspect_plugin_filesystem_safety, load_plugin_bindings_index, load_plugin_config_instance,
+        normalize_plugin_binding_upsert, plugin_binding, prepare_plugin_root,
+        redact_plugin_config_values, remove_plugin_config_instance, resolve_plugins_root,
+        save_plugin_bindings_index, save_plugin_config_instance, set_plugin_binding_enabled,
+        upsert_plugin_binding, validate_plugin_config_instance, PluginBindingRecord,
+        PluginBindingUpsert, PluginCapabilityProfile, PluginConfigInstance, PluginConfigInstanceRef,
+        PluginConfigValidationState, PluginOperatorMetadata,
     },
-    wasm_plugin_runner::{resolve_installed_skill_module, ResolvedInstalledSkillModule},
+    wasm_plugin_runner::{
+        resolve_installed_skill_module, ResolvedInstalledSkillModule, WasmPluginRunnerPolicy,
+    },
     *,
 };
 
@@ -46,6 +53,10 @@ pub(crate) struct ConsolePluginInstallOrBindRequest {
     capability_profile: Option<PluginCapabilityProfile>,
     #[serde(default)]
     operator: Option<PluginOperatorMetadata>,
+    #[serde(default)]
+    config: Option<Value>,
+    #[serde(default)]
+    clear_config: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,16 +82,26 @@ pub(crate) async fn console_plugins_list_handler(
     {
         index.entries.retain(|entry| entry.skill_id == skill_id.to_ascii_lowercase());
     }
+    let mut dirty = false;
     let mut entries = Vec::with_capacity(index.entries.len());
-    for binding in index.entries {
-        let check = build_plugin_binding_check(&state, &binding).await;
+    for binding in &mut index.entries {
+        let (updated_binding, check, _) =
+            evaluate_plugin_binding(&state, plugins_root.as_path(), binding).await?;
+        if *binding != updated_binding {
+            *binding = updated_binding.clone();
+            dirty = true;
+        }
         entries.push(json!({
-            "binding": binding,
+            "binding": updated_binding,
             "check": check,
         }));
     }
+    if dirty {
+        save_plugin_bindings_index(plugins_root.as_path(), &index).map_err(internal_console_error)?;
+    }
     Ok(Json(json!({
         "contract": contract_descriptor(),
+        "schema_version": index.schema_version,
         "plugins_root": plugins_root,
         "count": entries.len(),
         "entries": entries,
@@ -95,14 +116,26 @@ pub(crate) async fn console_plugin_get_handler(
 ) -> Result<Json<Value>, Response> {
     let _session = authorize_console_session(&state, &headers, false)?;
     let plugins_root = resolve_plugins_root().map_err(internal_console_error)?;
-    let index =
+    let mut index =
         load_plugin_bindings_index(plugins_root.as_path()).map_err(internal_console_error)?;
     let binding = plugin_binding(&index, plugin_id.as_str()).map_err(not_found_console_error)?;
-    let check = build_plugin_binding_check(&state, &binding).await;
+    let position = index
+        .entries
+        .iter()
+        .position(|entry| entry.plugin_id == binding.plugin_id)
+        .ok_or_else(|| not_found_console_error(anyhow!("plugin binding not found")))?;
+    let (binding, check, installed_skill) =
+        evaluate_plugin_binding(&state, plugins_root.as_path(), &binding).await?;
+    if index.entries[position] != binding {
+        index.entries[position] = binding.clone();
+        save_plugin_bindings_index(plugins_root.as_path(), &index).map_err(internal_console_error)?;
+    }
     Ok(Json(json!({
         "contract": contract_descriptor(),
+        "schema_version": index.schema_version,
         "binding": binding,
         "check": check,
+        "installed_skill": installed_skill,
     })))
 }
 
@@ -112,17 +145,36 @@ pub(crate) async fn console_plugins_install_or_bind_handler(
     Json(payload): Json<ConsolePluginInstallOrBindRequest>,
 ) -> Result<Json<Value>, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
-    let mut skill_id = payload.skill_id.and_then(trim_to_option);
-    let mut skill_version = payload.skill_version.and_then(trim_to_option);
+    let ConsolePluginInstallOrBindRequest {
+        plugin_id,
+        skill_id: requested_skill_id,
+        skill_version: requested_skill_version,
+        artifact_path,
+        tool_id,
+        module_path,
+        entrypoint,
+        enabled,
+        allow_tofu,
+        allow_untrusted,
+        capability_profile,
+        operator,
+        config,
+        clear_config,
+    } = payload;
+    let config_payload = normalize_plugin_config_payload(config)?;
+    let clear_config = clear_config.unwrap_or(false);
+    let requested_capability_profile = capability_profile.clone();
+    let mut skill_id = requested_skill_id.and_then(trim_to_option);
+    let mut skill_version = requested_skill_version.and_then(trim_to_option);
     let mut installed_record = None::<InstalledSkillRecord>;
 
     if let Some(artifact_path) =
-        payload.artifact_path.as_deref().map(str::trim).filter(|value| !value.is_empty())
+        artifact_path.as_deref().map(str::trim).filter(|value| !value.is_empty())
     {
         let record = install_skill_artifact_for_plugin_binding(
             PathBuf::from(artifact_path),
-            payload.allow_tofu.unwrap_or(true),
-            payload.allow_untrusted.unwrap_or(false),
+            allow_tofu.unwrap_or(true),
+            allow_untrusted.unwrap_or(false),
         )?;
         if let Some(expected) = skill_id.as_deref() {
             if expected.to_ascii_lowercase() != record.skill_id {
@@ -150,23 +202,23 @@ pub(crate) async fn console_plugins_install_or_bind_handler(
             "skill_id is required when artifact_path is not provided",
         ))
     })?;
-    let operator = payload.operator.unwrap_or_default();
+    let operator = operator.unwrap_or_default();
     let plugins_root = resolve_plugins_root().map_err(internal_console_error)?;
     let mut index =
         load_plugin_bindings_index(plugins_root.as_path()).map_err(internal_console_error)?;
     let existing = index
         .entries
         .iter()
-        .find(|entry| entry.plugin_id == payload.plugin_id.trim().to_ascii_lowercase());
+        .find(|entry| entry.plugin_id == plugin_id.trim().to_ascii_lowercase());
     let upsert = PluginBindingUpsert {
-        plugin_id: payload.plugin_id,
-        enabled: payload.enabled.unwrap_or(true),
+        plugin_id,
+        enabled: enabled.unwrap_or(true),
         skill_id,
         skill_version,
-        tool_id: payload.tool_id,
-        module_path: payload.module_path,
-        entrypoint: payload.entrypoint,
-        capability_profile: payload.capability_profile.unwrap_or_default(),
+        tool_id,
+        module_path,
+        entrypoint,
+        capability_profile: capability_profile.unwrap_or_default(),
         operator: PluginOperatorMetadata {
             updated_by: Some(session.context.principal.clone()),
             owner_principal: operator
@@ -182,9 +234,9 @@ pub(crate) async fn console_plugins_install_or_bind_handler(
             "failed to read system clock: {error}"
         )))
     })?;
-    let binding =
+    let mut binding =
         normalize_plugin_binding_upsert(upsert, now, existing).map_err(internal_console_error)?;
-    let _ = resolve_installed_skill_module(
+    let mut resolved = resolve_installed_skill_module(
         binding.skill_id.as_str(),
         binding.skill_version.as_deref(),
         binding.module_path.as_deref(),
@@ -192,13 +244,49 @@ pub(crate) async fn console_plugins_install_or_bind_handler(
         binding.tool_id.as_deref(),
     )
     .map_err(|error| runtime_status_response(tonic::Status::invalid_argument(error.message)))?;
+    apply_manifest_binding_defaults(&mut binding, &resolved);
+    if requested_capability_profile.is_none() && binding.capability_profile.is_empty() {
+        binding.capability_profile =
+            crate::plugins::plugin_capability_profile_from_manifest(&resolved.manifest);
+    }
+    resolved = resolve_installed_skill_module(
+        binding.skill_id.as_str(),
+        binding.skill_version.as_deref(),
+        binding.module_path.as_deref(),
+        binding.entrypoint.as_deref(),
+        binding.tool_id.as_deref(),
+    )
+    .map_err(|error| runtime_status_response(tonic::Status::invalid_argument(error.message)))?;
+    let current_installed_record = if installed_record.is_none() {
+        lookup_installed_skill_record(binding.skill_id.as_str(), binding.skill_version.as_deref())?
+    } else {
+        None
+    };
+    let manifest_payload_sha256 = installed_record
+        .as_ref()
+        .or(current_installed_record.as_ref())
+        .map(|record| record.payload_sha256.as_str());
+    let resolved_skill_version = binding.skill_version.clone();
+    persist_binding_config_instance(
+        plugins_root.as_path(),
+        &mut binding,
+        &resolved.manifest,
+        resolved_skill_version.as_deref(),
+        config_payload.as_ref(),
+        clear_config,
+        manifest_payload_sha256,
+        now,
+    )?;
     let binding = upsert_plugin_binding(&mut index, binding);
+    let (binding, check, installed_skill) =
+        evaluate_plugin_binding(&state, plugins_root.as_path(), &binding).await?;
+    upsert_plugin_binding(&mut index, binding.clone());
     save_plugin_bindings_index(plugins_root.as_path(), &index).map_err(internal_console_error)?;
-    let check = build_plugin_binding_check(&state, &binding).await;
     Ok(Json(json!({
         "contract": contract_descriptor(),
+        "schema_version": index.schema_version,
         "binding": binding,
-        "installed_skill": installed_record,
+        "installed_skill": installed_skill,
         "check": check,
     })))
 }
@@ -210,13 +298,26 @@ pub(crate) async fn console_plugin_check_handler(
 ) -> Result<Json<Value>, Response> {
     let _session = authorize_console_session(&state, &headers, false)?;
     let plugins_root = resolve_plugins_root().map_err(internal_console_error)?;
-    let index =
+    let mut index =
         load_plugin_bindings_index(plugins_root.as_path()).map_err(internal_console_error)?;
     let binding = plugin_binding(&index, plugin_id.as_str()).map_err(not_found_console_error)?;
+    let position = index
+        .entries
+        .iter()
+        .position(|entry| entry.plugin_id == binding.plugin_id)
+        .ok_or_else(|| not_found_console_error(anyhow!("plugin binding not found")))?;
+    let (binding, check, installed_skill) =
+        evaluate_plugin_binding(&state, plugins_root.as_path(), &binding).await?;
+    if index.entries[position] != binding {
+        index.entries[position] = binding.clone();
+        save_plugin_bindings_index(plugins_root.as_path(), &index).map_err(internal_console_error)?;
+    }
     Ok(Json(json!({
         "contract": contract_descriptor(),
+        "schema_version": index.schema_version,
         "binding": binding.clone(),
-        "check": build_plugin_binding_check(&state, &binding).await,
+        "installed_skill": installed_skill,
+        "check": check,
     })))
 }
 
@@ -237,11 +338,16 @@ pub(crate) async fn console_plugin_enable_handler(
         Some(session.context.principal.as_str()),
     )
     .map_err(not_found_console_error)?;
+    let (binding, check, installed_skill) =
+        evaluate_plugin_binding(&state, plugins_root.as_path(), &binding).await?;
+    upsert_plugin_binding(&mut index, binding.clone());
     save_plugin_bindings_index(plugins_root.as_path(), &index).map_err(internal_console_error)?;
     Ok(Json(json!({
         "contract": contract_descriptor(),
+        "schema_version": index.schema_version,
         "binding": binding.clone(),
-        "check": build_plugin_binding_check(&state, &binding).await,
+        "installed_skill": installed_skill,
+        "check": check,
     })))
 }
 
@@ -262,11 +368,16 @@ pub(crate) async fn console_plugin_disable_handler(
         Some(session.context.principal.as_str()),
     )
     .map_err(not_found_console_error)?;
+    let (binding, check, installed_skill) =
+        evaluate_plugin_binding(&state, plugins_root.as_path(), &binding).await?;
+    upsert_plugin_binding(&mut index, binding.clone());
     save_plugin_bindings_index(plugins_root.as_path(), &index).map_err(internal_console_error)?;
     Ok(Json(json!({
         "contract": contract_descriptor(),
+        "schema_version": index.schema_version,
         "binding": binding.clone(),
-        "check": build_plugin_binding_check(&state, &binding).await,
+        "installed_skill": installed_skill,
+        "check": check,
     })))
 }
 
@@ -292,6 +403,8 @@ pub(crate) async fn console_plugin_delete_handler(
         load_plugin_bindings_index(plugins_root.as_path()).map_err(internal_console_error)?;
     let binding =
         delete_plugin_binding(&mut index, plugin_id.as_str()).map_err(not_found_console_error)?;
+    remove_plugin_config_instance(plugins_root.as_path(), binding.plugin_id.as_str())
+        .map_err(internal_console_error)?;
     save_plugin_bindings_index(plugins_root.as_path(), &index).map_err(internal_console_error)?;
     Ok(Json(json!({
         "contract": contract_descriptor(),
@@ -300,12 +413,54 @@ pub(crate) async fn console_plugin_delete_handler(
     })))
 }
 
-async fn build_plugin_binding_check(state: &AppState, binding: &PluginBindingRecord) -> Value {
+async fn evaluate_plugin_binding(
+    state: &AppState,
+    plugins_root: &FsPath,
+    binding: &PluginBindingRecord,
+) -> Result<(PluginBindingRecord, Value, Option<Value>), Response> {
+    let mut binding = binding.clone();
     let mut ready = binding.enabled;
     let mut reasons = Vec::<String>::new();
+    let mut remediation = Vec::<String>::new();
     if !binding.enabled {
         reasons.push("plugin binding is disabled".to_owned());
+        remediation.push("Enable the plugin binding.".to_owned());
     }
+
+    let filesystem = inspect_plugin_filesystem_safety(plugins_root, binding.plugin_id.as_str());
+    if !filesystem.safe {
+        ready = false;
+        reasons.extend(filesystem.issues.iter().map(|issue| issue.message.clone()));
+        remediation.extend(filesystem.issues.iter().map(|issue| issue.remediation.clone()));
+    }
+
+    let installed_skill = lookup_installed_skill_record(
+        binding.skill_id.as_str(),
+        binding.skill_version.as_deref(),
+    )?;
+    if matches!(
+        installed_skill.as_ref().map(|record| record.trust_decision.as_str()),
+        Some("untrusted_override")
+    ) {
+        ready = false;
+        reasons.push("installed skill artifact is running under untrusted override".to_owned());
+        remediation.push(
+            "Reinstall or rebind the plugin from a verified signed artifact without --allow-untrusted."
+                .to_owned(),
+        );
+    }
+    let installed_skill_payload = installed_skill
+        .as_ref()
+        .and_then(|record| serde_json::to_value(record).ok());
+    let manifest_payload_sha256 =
+        installed_skill.as_ref().map(|record| record.payload_sha256.as_str());
+    let config_instance =
+        load_plugin_config_instance(plugins_root, binding.plugin_id.as_str()).map_err(internal_console_error)?;
+
+    let mut skill_status_payload = Value::Null;
+    let mut capability_payload = serde_json::to_value(&binding.capability_diff).unwrap_or(Value::Null);
+    let mut config_payload = Value::Null;
+    let mut resolved_payload = Value::Null;
 
     let resolved = match resolve_installed_skill_module(
         binding.skill_id.as_str(),
@@ -317,20 +472,23 @@ async fn build_plugin_binding_check(state: &AppState, binding: &PluginBindingRec
         Ok(resolved) => Some(resolved),
         Err(error) => {
             ready = false;
-            reasons.push(sanitize_http_error_message(error.message.as_str()));
+            let error_message = sanitize_http_error_message(error.message.as_str());
+            reasons.push(error_message.clone());
+            remediation.push(
+                "Repair the selected tool/module/entrypoint or reinstall the referenced skill artifact."
+                    .to_owned(),
+            );
+            binding.discovery = build_plugin_discovery_snapshot(
+                &binding,
+                false,
+                Some(error_message.as_str()),
+                installed_skill.as_ref().map(|record| record.trust_decision.as_str()),
+                filesystem.clone(),
+                None,
+            );
             None
         }
     };
-
-    let mut skill_status_payload = Value::Null;
-    let mut capability_payload = json!({
-        "valid": true,
-        "denied_http_hosts": [],
-        "denied_secrets": [],
-        "denied_storage_prefixes": [],
-        "denied_channels": [],
-    });
-    let mut resolved_payload = Value::Null;
 
     if let Some(resolved) = resolved.as_ref() {
         match state
@@ -346,6 +504,10 @@ async fn build_plugin_binding_check(state: &AppState, binding: &PluginBindingRec
                     ) {
                         ready = false;
                         reasons.push(format!("skill status is {}", record.status.as_str()));
+                        remediation.push(
+                            "Enable or unquarantine the installed skill before running the plugin."
+                                .to_owned(),
+                        );
                     }
                 }
                 skill_status_payload = serde_json::to_value(status).unwrap_or_else(|_| Value::Null);
@@ -356,12 +518,60 @@ async fn build_plugin_binding_check(state: &AppState, binding: &PluginBindingRec
             }
         }
 
-        capability_payload =
-            build_capability_profile_payload(&binding.capability_profile, resolved);
-        if !capability_payload.get("valid").and_then(Value::as_bool).unwrap_or(false) {
+        let wasm_policy = build_wasm_policy(state)?;
+        binding.capability_diff =
+            build_plugin_capability_diff(&resolved.manifest, &binding.capability_profile, &wasm_policy);
+        if !binding.capability_diff.valid {
             ready = false;
-            reasons.push("plugin capability profile exceeds signed skill manifest".to_owned());
+            reasons.push("plugin capability profile has binding/policy drift".to_owned());
+            remediation.push(
+                "Align binding grants with the signed manifest and current wasm runtime policy."
+                    .to_owned(),
+            );
         }
+        capability_payload = serde_json::to_value(&binding.capability_diff).unwrap_or(Value::Null);
+
+        let (config_validation, effective_config) =
+            validate_plugin_config_instance(&resolved.manifest, config_instance.as_ref(), manifest_payload_sha256);
+        binding.config = if resolved.manifest.operator.config.is_some() || config_instance.is_some() {
+            Some(PluginConfigInstanceRef {
+                schema_version: 1,
+                path: format!("{}/config.json", binding.plugin_id),
+                contract_schema_version: resolved
+                    .manifest
+                    .operator
+                    .config
+                    .as_ref()
+                    .map(|contract| contract.schema_version),
+                manifest_payload_sha256: manifest_payload_sha256.map(ToOwned::to_owned),
+                validation: config_validation.clone(),
+            })
+        } else {
+            None
+        };
+        if !matches!(config_validation.state, PluginConfigValidationState::Valid) {
+            ready = false;
+            reasons.extend(config_validation.issues.iter().cloned());
+            remediation.push(
+                "Update the plugin config instance so it satisfies the manifest contract and current schema."
+                    .to_owned(),
+            );
+        }
+        config_payload = json!({
+            "path": binding.config.as_ref().map(|config| config.path.clone()),
+            "validation": config_validation,
+            "configured": config_instance
+                .as_ref()
+                .map(|instance| redact_plugin_config_values(&instance.values, binding.config.as_ref().map(|config| &config.validation).expect("validation must exist when config instance exists"))),
+            "effective": redact_plugin_config_values(
+                &effective_config,
+                binding
+                    .config
+                    .as_ref()
+                    .map(|config| &config.validation)
+                    .unwrap_or(&crate::plugins::PluginConfigValidationSnapshot::default()),
+            ),
+        });
         resolved_payload = json!({
             "skill_id": resolved.skill_id,
             "skill_version": resolved.skill_version,
@@ -370,75 +580,183 @@ async fn build_plugin_binding_check(state: &AppState, binding: &PluginBindingRec
             "tool_id": resolved.selected_tool.as_ref().map(|tool| tool.id.clone()),
             "tool_name": resolved.selected_tool.as_ref().map(|tool| tool.name.clone()),
             "publisher": resolved.manifest.publisher,
+            "manifest_version": resolved.manifest.manifest_version,
+            "operator": resolved.manifest.operator,
             "current_binding_version": binding.skill_version.is_none(),
         });
+        binding.discovery = build_plugin_discovery_snapshot(
+            &binding,
+            true,
+            None,
+            installed_skill.as_ref().map(|record| record.trust_decision.as_str()),
+            filesystem,
+            binding.config.as_ref().map(|config| &config.validation),
+        );
+        reasons.extend(binding.discovery.reasons.iter().cloned());
     }
 
     reasons.sort();
     reasons.dedup();
-    json!({
-        "ready": ready,
-        "reasons": reasons,
-        "skill_status": skill_status_payload,
-        "resolved": resolved_payload,
-        "capabilities": capability_payload,
+    remediation.sort();
+    remediation.dedup();
+    Ok((
+        binding.clone(),
+        json!({
+            "ready": ready,
+            "reasons": reasons,
+            "remediation": remediation,
+            "skill_status": skill_status_payload,
+            "resolved": resolved_payload,
+            "capabilities": capability_payload,
+            "config": config_payload,
+            "discovery": binding.discovery,
+        }),
+        installed_skill_payload,
+    ))
+}
+
+fn build_wasm_policy(state: &AppState) -> Result<WasmPluginRunnerPolicy, Response> {
+    let loaded = state.loaded_config.lock().map_err(|_| {
+        runtime_status_response(tonic::Status::internal("loaded_config lock poisoned"))
+    })?;
+    Ok(WasmPluginRunnerPolicy {
+        enabled: loaded.tool_call.wasm_runtime.enabled,
+        allow_inline_modules: loaded.tool_call.wasm_runtime.allow_inline_modules,
+        max_module_size_bytes: loaded.tool_call.wasm_runtime.max_module_size_bytes,
+        fuel_budget: loaded.tool_call.wasm_runtime.fuel_budget,
+        max_memory_bytes: loaded.tool_call.wasm_runtime.max_memory_bytes,
+        max_table_elements: loaded.tool_call.wasm_runtime.max_table_elements,
+        max_instances: loaded.tool_call.wasm_runtime.max_instances,
+        allowed_http_hosts: loaded.tool_call.wasm_runtime.allowed_http_hosts.clone(),
+        allowed_secrets: loaded.tool_call.wasm_runtime.allowed_secrets.clone(),
+        allowed_storage_prefixes: loaded.tool_call.wasm_runtime.allowed_storage_prefixes.clone(),
+        allowed_channels: loaded.tool_call.wasm_runtime.allowed_channels.clone(),
     })
 }
 
-fn build_capability_profile_payload(
-    profile: &PluginCapabilityProfile,
-    resolved: &ResolvedInstalledSkillModule,
-) -> Value {
-    let declared_http =
-        resolved.capability_grants.http_hosts.iter().map(String::as_str).collect::<BTreeSet<_>>();
-    let declared_secrets =
-        resolved.capability_grants.secret_keys.iter().map(String::as_str).collect::<BTreeSet<_>>();
-    let declared_storage = resolved
-        .capability_grants
-        .storage_prefixes
-        .iter()
-        .map(String::as_str)
-        .collect::<BTreeSet<_>>();
-    let declared_channels =
-        resolved.capability_grants.channels.iter().map(String::as_str).collect::<BTreeSet<_>>();
+fn lookup_installed_skill_record(
+    skill_id: &str,
+    skill_version: Option<&str>,
+) -> Result<Option<InstalledSkillRecord>, Response> {
+    let skills_root = resolve_skills_root()?;
+    let index = load_installed_skills_index(skills_root.as_path())?;
+    let resolved_version = match resolve_skill_version(&index, skill_id, skill_version) {
+        Ok(version) => version,
+        Err(response) if response.status() == StatusCode::NOT_FOUND => return Ok(None),
+        Err(response) => return Err(response),
+    };
+    Ok(index
+        .entries
+        .into_iter()
+        .find(|record| record.skill_id == skill_id && record.version == resolved_version))
+}
 
-    let denied_http_hosts = profile
-        .http_hosts
-        .iter()
-        .filter(|value| !declared_http.contains(value.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
-    let denied_secrets = profile
-        .secrets
-        .iter()
-        .filter(|value| !declared_secrets.contains(value.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
-    let denied_storage_prefixes = profile
-        .storage_prefixes
-        .iter()
-        .filter(|value| !declared_storage.contains(value.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
-    let denied_channels = profile
-        .channels
-        .iter()
-        .filter(|value| !declared_channels.contains(value.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
+fn normalize_plugin_config_payload(
+    payload: Option<Value>,
+) -> Result<Option<BTreeMap<String, Value>>, Response> {
+    match payload {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Object(object)) => Ok(Some(
+            object
+                .into_iter()
+                .filter(|(_, value)| !value.is_null())
+                .collect::<BTreeMap<_, _>>(),
+        )),
+        Some(_) => Err(runtime_status_response(tonic::Status::invalid_argument(
+            "plugin config payload must be a JSON object",
+        ))),
+    }
+}
 
-    json!({
-        "valid": denied_http_hosts.is_empty()
-            && denied_secrets.is_empty()
-            && denied_storage_prefixes.is_empty()
-            && denied_channels.is_empty(),
-        "requested": profile,
-        "declared": resolved.capability_grants,
-        "denied_http_hosts": denied_http_hosts,
-        "denied_secrets": denied_secrets,
-        "denied_storage_prefixes": denied_storage_prefixes,
-        "denied_channels": denied_channels,
-    })
+fn apply_manifest_binding_defaults(binding: &mut PluginBindingRecord, resolved: &ResolvedInstalledSkillModule) {
+    if binding.tool_id.is_none() {
+        binding.tool_id = resolved.manifest.operator.plugin.default_tool_id.clone();
+    }
+    if binding.module_path.is_none() {
+        binding.module_path = resolved.manifest.operator.plugin.default_module_path.clone();
+    }
+    if binding.entrypoint.is_none() {
+        binding.entrypoint = resolved.manifest.operator.plugin.default_entrypoint.clone();
+    }
+    if binding.operator.display_name.is_none() {
+        binding.operator.display_name = resolved.manifest.operator.display_name.clone();
+    }
+    if binding.operator.tags.is_empty() {
+        binding.operator.tags = resolved.manifest.operator.tags.clone();
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn persist_binding_config_instance(
+    plugins_root: &FsPath,
+    binding: &mut PluginBindingRecord,
+    manifest: &palyra_skills::SkillManifest,
+    skill_version: Option<&str>,
+    config_payload: Option<&BTreeMap<String, Value>>,
+    clear_config: bool,
+    manifest_payload_sha256: Option<&str>,
+    now_unix_ms: i64,
+) -> Result<(), Response> {
+    if clear_config {
+        remove_plugin_config_instance(plugins_root, binding.plugin_id.as_str())
+            .map_err(internal_console_error)?;
+        binding.config = None;
+        if manifest.operator.config.is_none() {
+            return Ok(());
+        }
+    }
+    if manifest.operator.config.is_none() {
+        if config_payload.is_some() {
+            return Err(runtime_status_response(tonic::Status::invalid_argument(
+                "plugin config payload was provided but the installed skill manifest does not declare operator.config",
+            )));
+        }
+        if let Some(existing) = load_plugin_config_instance(plugins_root, binding.plugin_id.as_str())
+            .map_err(internal_console_error)?
+        {
+            let (validation, _) =
+                validate_plugin_config_instance(manifest, Some(&existing), manifest_payload_sha256);
+            binding.config = Some(PluginConfigInstanceRef {
+                schema_version: 1,
+                path: format!("{}/config.json", binding.plugin_id),
+                contract_schema_version: existing.contract_schema_version,
+                manifest_payload_sha256: existing.manifest_payload_sha256,
+                validation,
+            });
+        } else {
+            binding.config = None;
+        }
+        return Ok(());
+    }
+
+    prepare_plugin_root(plugins_root, binding.plugin_id.as_str()).map_err(internal_console_error)?;
+    let existing =
+        load_plugin_config_instance(plugins_root, binding.plugin_id.as_str()).map_err(internal_console_error)?;
+    let values = config_payload
+        .cloned()
+        .or_else(|| existing.as_ref().map(|instance| instance.values.clone()))
+        .unwrap_or_default();
+    let instance = PluginConfigInstance {
+        schema_version: 1,
+        plugin_id: binding.plugin_id.clone(),
+        skill_id: binding.skill_id.clone(),
+        skill_version: skill_version.map(ToOwned::to_owned),
+        contract_schema_version: manifest.operator.config.as_ref().map(|contract| contract.schema_version),
+        manifest_payload_sha256: manifest_payload_sha256.map(ToOwned::to_owned),
+        values,
+        updated_at_unix_ms: now_unix_ms,
+    };
+    save_plugin_config_instance(plugins_root, &instance).map_err(internal_console_error)?;
+    let (validation, _) =
+        validate_plugin_config_instance(manifest, Some(&instance), manifest_payload_sha256);
+    binding.config = Some(PluginConfigInstanceRef {
+        schema_version: 1,
+        path: format!("{}/config.json", binding.plugin_id),
+        contract_schema_version: instance.contract_schema_version,
+        manifest_payload_sha256: instance.manifest_payload_sha256.clone(),
+        validation,
+    });
+    Ok(())
 }
 
 #[allow(clippy::result_large_err)]

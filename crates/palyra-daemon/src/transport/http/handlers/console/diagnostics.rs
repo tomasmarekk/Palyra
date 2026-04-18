@@ -442,12 +442,46 @@ pub(crate) fn collect_console_plugins_diagnostics() -> Value {
         .iter()
         .map(|entry| entry.skill_id.clone())
         .collect::<std::collections::BTreeSet<_>>();
+    let mut discovery_states = std::collections::BTreeMap::<String, usize>::new();
+    let mut config_states = std::collections::BTreeMap::<String, usize>::new();
+    let mut capability_drift_total = 0_usize;
+    let mut config_references_total = 0_usize;
+    let mut last_scanned_at_unix_ms = 0_i64;
+    for entry in &index.entries {
+        let discovery_state = serde_json::to_value(entry.discovery.state)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "unknown".to_owned());
+        *discovery_states.entry(discovery_state).or_default() += 1;
+        if let Some(config) = entry.config.as_ref() {
+            config_references_total += 1;
+            let config_state = serde_json::to_value(config.validation.state)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_else(|| "unknown".to_owned());
+            *config_states.entry(config_state).or_default() += 1;
+        } else {
+            *config_states.entry("unknown".to_owned()).or_default() += 1;
+        }
+        if !entry.capability_diff.valid {
+            capability_drift_total += 1;
+        }
+        if let Some(scanned_at) = entry.discovery.last_scanned_at_unix_ms {
+            last_scanned_at_unix_ms = last_scanned_at_unix_ms.max(scanned_at);
+        }
+    }
     json!({
         "plugins_root": plugins_root,
+        "schema_version": index.schema_version,
         "bindings_total": index.entries.len(),
         "enabled_total": index.entries.iter().filter(|entry| entry.enabled).count(),
         "disabled_total": index.entries.iter().filter(|entry| !entry.enabled).count(),
         "distinct_skill_bindings": distinct_skills.len(),
+        "config_references_total": config_references_total,
+        "capability_drift_total": capability_drift_total,
+        "last_scanned_at_unix_ms": (last_scanned_at_unix_ms > 0).then_some(last_scanned_at_unix_ms),
+        "discovery_states": discovery_states,
+        "config_validation_states": config_states,
     })
 }
 
