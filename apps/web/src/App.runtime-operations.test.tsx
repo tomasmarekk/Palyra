@@ -50,7 +50,6 @@ afterEach(() => {
 
 describe("M56 runtime and operations surfaces", () => {
   const runtimeWorkflowTimeoutMs = 30_000;
-  const longRuntimeWorkflowTimeoutMs = 60_000;
 
   it(
     "surfaces operations handoffs and executes routines plus channels workflows",
@@ -734,7 +733,7 @@ describe("M56 runtime and operations surfaces", () => {
       fireEvent.click(screen.getByRole("button", { name: "Load downloads" }));
       expect((await screen.findAllByText(/report.csv/)).length).toBeGreaterThan(0);
     },
-    longRuntimeWorkflowTimeoutMs,
+    60_000,
   );
 
   it(
