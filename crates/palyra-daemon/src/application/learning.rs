@@ -1060,7 +1060,7 @@ fn compute_patch_base_digest(files: &[Value]) -> String {
             })
         })
         .collect::<Vec<_>>();
-    entries.sort_by(|left, right| left.to_string().cmp(&right.to_string()));
+    entries.sort_by_key(|left| left.to_string());
     crate::sha256_hex(
         serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_owned()).as_bytes(),
     )

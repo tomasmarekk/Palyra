@@ -64,9 +64,10 @@ impl RoutineTriggerKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutineRunMode {
+    #[default]
     SameSession,
     FreshSession,
 }
@@ -89,15 +90,10 @@ impl RoutineRunMode {
     }
 }
 
-impl Default for RoutineRunMode {
-    fn default() -> Self {
-        Self::SameSession
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutineExecutionPosture {
+    #[default]
     Standard,
     SensitiveTools,
 }
@@ -117,12 +113,6 @@ impl RoutineExecutionPosture {
             "sensitive_tools" => Some(Self::SensitiveTools),
             _ => None,
         }
-    }
-}
-
-impl Default for RoutineExecutionPosture {
-    fn default() -> Self {
-        Self::Standard
     }
 }
 
@@ -157,9 +147,10 @@ impl RoutineDeliveryMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutineSilentPolicy {
+    #[default]
     Noisy,
     FailureOnly,
     AuditOnly,
@@ -182,12 +173,6 @@ impl RoutineSilentPolicy {
             "audit_only" => Some(Self::AuditOnly),
             _ => None,
         }
-    }
-}
-
-impl Default for RoutineSilentPolicy {
-    fn default() -> Self {
-        Self::Noisy
     }
 }
 
@@ -216,9 +201,10 @@ impl RoutineRunOutcomeKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutineDispatchMode {
+    #[default]
     Normal,
     TestRun,
     Replay,
@@ -232,12 +218,6 @@ impl RoutineDispatchMode {
             Self::TestRun => "test_run",
             Self::Replay => "replay",
         }
-    }
-}
-
-impl Default for RoutineDispatchMode {
-    fn default() -> Self {
-        Self::Normal
     }
 }
 

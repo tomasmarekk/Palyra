@@ -1,4 +1,4 @@
-use clap::{ArgGroup, Subcommand, ValueEnum};
+use clap::{ArgGroup, Args, Subcommand, ValueEnum};
 
 use super::cron::{CronConcurrencyPolicyArg, CronMisfirePolicyArg, CronScheduleTypeArg};
 
@@ -43,80 +43,7 @@ pub enum RoutinesCommand {
         json: bool,
     },
     #[command(visible_alias = "apply")]
-    Upsert {
-        #[arg(long)]
-        id: Option<String>,
-        #[arg(long)]
-        name: String,
-        #[arg(long)]
-        prompt: String,
-        #[arg(long, value_enum)]
-        trigger_kind: RoutineTriggerKindArg,
-        #[arg(long)]
-        owner: Option<String>,
-        #[arg(long)]
-        channel: Option<String>,
-        #[arg(long)]
-        session_key: Option<String>,
-        #[arg(long)]
-        session_label: Option<String>,
-        #[arg(long)]
-        enabled: Option<bool>,
-        #[arg(long)]
-        natural_language_schedule: Option<String>,
-        #[arg(long, value_enum, requires = "schedule")]
-        schedule_type: Option<CronScheduleTypeArg>,
-        #[arg(long, requires = "schedule_type")]
-        schedule: Option<String>,
-        #[arg(long)]
-        trigger_payload: Option<String>,
-        #[arg(long, default_value_t = false, conflicts_with = "trigger_payload")]
-        trigger_payload_stdin: bool,
-        #[arg(long, value_enum, default_value_t = CronConcurrencyPolicyArg::Forbid)]
-        concurrency: CronConcurrencyPolicyArg,
-        #[arg(long, default_value_t = 1)]
-        retry_max_attempts: u32,
-        #[arg(long, default_value_t = 1000)]
-        retry_backoff_ms: u64,
-        #[arg(long, value_enum, default_value_t = CronMisfirePolicyArg::Skip)]
-        misfire: CronMisfirePolicyArg,
-        #[arg(long, default_value_t = 0)]
-        jitter_ms: u64,
-        #[arg(long, value_enum, default_value_t = RoutineDeliveryModeArg::SameChannel)]
-        delivery_mode: RoutineDeliveryModeArg,
-        #[arg(long)]
-        delivery_channel: Option<String>,
-        #[arg(long, value_enum)]
-        delivery_failure_mode: Option<RoutineDeliveryModeArg>,
-        #[arg(long)]
-        delivery_failure_channel: Option<String>,
-        #[arg(long, value_enum, default_value_t = RoutineSilentPolicyArg::Noisy)]
-        silent_policy: RoutineSilentPolicyArg,
-        #[arg(long, value_enum, default_value_t = RoutineRunModeArg::SameSession)]
-        run_mode: RoutineRunModeArg,
-        #[arg(long)]
-        procedure_profile_id: Option<String>,
-        #[arg(long)]
-        skill_profile_id: Option<String>,
-        #[arg(long)]
-        provider_profile_id: Option<String>,
-        #[arg(long, value_enum, default_value_t = RoutineExecutionPostureArg::Standard)]
-        execution_posture: RoutineExecutionPostureArg,
-        #[arg(long)]
-        quiet_hours_start: Option<String>,
-        #[arg(long)]
-        quiet_hours_end: Option<String>,
-        #[arg(long, value_enum)]
-        quiet_hours_timezone: Option<RoutinePreviewTimezoneArg>,
-        #[arg(long, default_value_t = 0)]
-        cooldown_ms: u64,
-        #[arg(long, value_enum, default_value_t = RoutineApprovalModeArg::None)]
-        approval_mode: RoutineApprovalModeArg,
-        #[arg(long)]
-        template_id: Option<String>,
-        #[arg(long, default_value_t = false)]
-        json: bool,
-    },
+    Upsert(Box<RoutineUpsertCommand>),
     CreateFromTemplate {
         #[arg(long)]
         template_id: String,
@@ -248,6 +175,82 @@ pub enum RoutinesCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+}
+
+#[derive(Debug, Args, PartialEq, Eq)]
+pub struct RoutineUpsertCommand {
+    #[arg(long)]
+    pub id: Option<String>,
+    #[arg(long)]
+    pub name: String,
+    #[arg(long)]
+    pub prompt: String,
+    #[arg(long, value_enum)]
+    pub trigger_kind: RoutineTriggerKindArg,
+    #[arg(long)]
+    pub owner: Option<String>,
+    #[arg(long)]
+    pub channel: Option<String>,
+    #[arg(long)]
+    pub session_key: Option<String>,
+    #[arg(long)]
+    pub session_label: Option<String>,
+    #[arg(long)]
+    pub enabled: Option<bool>,
+    #[arg(long)]
+    pub natural_language_schedule: Option<String>,
+    #[arg(long, value_enum, requires = "schedule")]
+    pub schedule_type: Option<CronScheduleTypeArg>,
+    #[arg(long, requires = "schedule_type")]
+    pub schedule: Option<String>,
+    #[arg(long)]
+    pub trigger_payload: Option<String>,
+    #[arg(long, default_value_t = false, conflicts_with = "trigger_payload")]
+    pub trigger_payload_stdin: bool,
+    #[arg(long, value_enum, default_value_t = CronConcurrencyPolicyArg::Forbid)]
+    pub concurrency: CronConcurrencyPolicyArg,
+    #[arg(long, default_value_t = 1)]
+    pub retry_max_attempts: u32,
+    #[arg(long, default_value_t = 1000)]
+    pub retry_backoff_ms: u64,
+    #[arg(long, value_enum, default_value_t = CronMisfirePolicyArg::Skip)]
+    pub misfire: CronMisfirePolicyArg,
+    #[arg(long, default_value_t = 0)]
+    pub jitter_ms: u64,
+    #[arg(long, value_enum, default_value_t = RoutineDeliveryModeArg::SameChannel)]
+    pub delivery_mode: RoutineDeliveryModeArg,
+    #[arg(long)]
+    pub delivery_channel: Option<String>,
+    #[arg(long, value_enum)]
+    pub delivery_failure_mode: Option<RoutineDeliveryModeArg>,
+    #[arg(long)]
+    pub delivery_failure_channel: Option<String>,
+    #[arg(long, value_enum, default_value_t = RoutineSilentPolicyArg::Noisy)]
+    pub silent_policy: RoutineSilentPolicyArg,
+    #[arg(long, value_enum, default_value_t = RoutineRunModeArg::SameSession)]
+    pub run_mode: RoutineRunModeArg,
+    #[arg(long)]
+    pub procedure_profile_id: Option<String>,
+    #[arg(long)]
+    pub skill_profile_id: Option<String>,
+    #[arg(long)]
+    pub provider_profile_id: Option<String>,
+    #[arg(long, value_enum, default_value_t = RoutineExecutionPostureArg::Standard)]
+    pub execution_posture: RoutineExecutionPostureArg,
+    #[arg(long)]
+    pub quiet_hours_start: Option<String>,
+    #[arg(long)]
+    pub quiet_hours_end: Option<String>,
+    #[arg(long, value_enum)]
+    pub quiet_hours_timezone: Option<RoutinePreviewTimezoneArg>,
+    #[arg(long, default_value_t = 0)]
+    pub cooldown_ms: u64,
+    #[arg(long, value_enum, default_value_t = RoutineApprovalModeArg::None)]
+    pub approval_mode: RoutineApprovalModeArg,
+    #[arg(long)]
+    pub template_id: Option<String>,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

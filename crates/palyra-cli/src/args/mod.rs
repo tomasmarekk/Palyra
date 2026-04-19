@@ -104,7 +104,7 @@ pub use reset::{ResetCommand, ResetScopeArg};
 pub use routines::{
     RoutineApprovalModeArg, RoutineDeliveryModeArg, RoutineExecutionPostureArg,
     RoutinePreviewTimezoneArg, RoutineRunModeArg, RoutineSilentPolicyArg, RoutineTriggerKindArg,
-    RoutinesCommand,
+    RoutineUpsertCommand, RoutinesCommand,
 };
 pub use sandbox::{SandboxCommand, SandboxRuntimeArg};
 pub use secrets::{SecretsCommand, SecretsConfigureCommand};

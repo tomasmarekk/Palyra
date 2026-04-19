@@ -19,9 +19,9 @@ use super::{
     ProfileCommand, ProfileExportModeArg, ProfileModeArg, ProfileRiskLevelArg, ProtocolCommand,
     RemoteVerificationModeArg, ResetCommand, ResetScopeArg, RoutineApprovalModeArg,
     RoutineDeliveryModeArg, RoutineExecutionPostureArg, RoutinePreviewTimezoneArg,
-    RoutineRunModeArg, RoutineSilentPolicyArg, RoutineTriggerKindArg, RoutinesCommand,
-    SandboxCommand, SandboxRuntimeArg, SecretsCommand, SecretsConfigureCommand, SecurityCommand,
-    SessionsCommand, SetupWizardOverridesArg, SkillsCommand, SkillsPackageCommand,
+    RoutineRunModeArg, RoutineSilentPolicyArg, RoutineTriggerKindArg, RoutineUpsertCommand,
+    RoutinesCommand, SandboxCommand, SandboxRuntimeArg, SecretsCommand, SecretsConfigureCommand,
+    SecurityCommand, SessionsCommand, SetupWizardOverridesArg, SkillsCommand, SkillsPackageCommand,
     SupportBundleCommand, SystemCommand, SystemEventCommand, SystemEventSeverityArg, TuiCommand,
     UninstallCommand, UpdateCommand, WebhooksCommand, WizardOverridesArg, WorkspaceRoleArg,
 };
@@ -1581,7 +1581,7 @@ fn parse_routines_upsert() {
     assert_eq!(
         parsed.command,
         Command::Routines {
-            command: RoutinesCommand::Upsert {
+            command: RoutinesCommand::Upsert(Box::new(RoutineUpsertCommand {
                 id: Some("01ARZ3NDEKTSV4RRFFQ69G5FB0".to_owned()),
                 name: "Daily report".to_owned(),
                 prompt: "Summarize incidents".to_owned(),
@@ -1618,7 +1618,7 @@ fn parse_routines_upsert() {
                 approval_mode: RoutineApprovalModeArg::BeforeFirstRun,
                 template_id: Some("daily-report".to_owned()),
                 json: true,
-            }
+            }))
         }
     );
 }
