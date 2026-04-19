@@ -1268,8 +1268,11 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route_layer(middleware::from_fn(http_middleware::canvas_security_headers_middleware));
     let compat_routes = Router::new()
         .route("/v1/models", get(compat::compat_models_handler))
+        .route("/v1/models/{model_id}", get(compat::compat_model_detail_handler))
+        .route("/v1/embeddings", post(compat::compat_embeddings_handler))
         .route("/v1/chat/completions", post(compat::compat_chat_completions_handler))
         .route("/v1/responses", post(compat::compat_responses_handler))
+        .route("/v1/tools/invoke", post(compat::compat_tools_invoke_handler))
         .layer(DefaultBodyLimit::max(HTTP_MAX_REQUEST_BODY_BYTES))
         .route_layer(middleware::from_fn(
             http_middleware::admin_console_security_headers_middleware,

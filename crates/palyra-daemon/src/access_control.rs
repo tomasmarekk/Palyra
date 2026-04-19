@@ -16,6 +16,8 @@ const TELEMETRY_EVENT_LIMIT: usize = 256;
 const DEFAULT_TOKEN_RATE_LIMIT_PER_MINUTE: u32 = 120;
 
 pub(crate) const FEATURE_COMPAT_API: &str = "compat_api";
+pub(crate) const FEATURE_COMPAT_EMBEDDINGS_API: &str = "compat_embeddings_api";
+pub(crate) const FEATURE_COMPAT_TOOLS_INVOKE: &str = "compat_tools_invoke";
 pub(crate) const FEATURE_API_TOKENS: &str = "api_tokens";
 pub(crate) const FEATURE_TEAM_MODE: &str = "team_mode";
 pub(crate) const FEATURE_RBAC: &str = "rbac";
@@ -23,7 +25,9 @@ pub(crate) const FEATURE_STAGED_ROLLOUT: &str = "staged_rollout";
 
 pub(crate) const PERMISSION_COMPAT_MODELS_READ: &str = "compat.models.read";
 pub(crate) const PERMISSION_COMPAT_CHAT_CREATE: &str = "compat.chat.create";
+pub(crate) const PERMISSION_COMPAT_EMBEDDINGS_CREATE: &str = "compat.embeddings.create";
 pub(crate) const PERMISSION_COMPAT_RESPONSES_CREATE: &str = "compat.responses.create";
+pub(crate) const PERMISSION_COMPAT_TOOLS_INVOKE: &str = "compat.tools.invoke";
 pub(crate) const PERMISSION_API_TOKENS_MANAGE: &str = "api_tokens.manage";
 pub(crate) const PERMISSION_WORKSPACE_MANAGE: &str = "workspace.manage";
 pub(crate) const PERMISSION_MEMBERSHIP_MANAGE: &str = "workspace.memberships.manage";
@@ -104,7 +108,9 @@ impl WorkspaceRole {
         let mut permissions = vec![
             PERMISSION_COMPAT_MODELS_READ.to_owned(),
             PERMISSION_COMPAT_CHAT_CREATE.to_owned(),
+            PERMISSION_COMPAT_EMBEDDINGS_CREATE.to_owned(),
             PERMISSION_COMPAT_RESPONSES_CREATE.to_owned(),
+            PERMISSION_COMPAT_TOOLS_INVOKE.to_owned(),
             PERMISSION_SESSION_USE.to_owned(),
             PERMISSION_MEMORY_USE.to_owned(),
             PERMISSION_ROUTINES_USE.to_owned(),
@@ -1664,6 +1670,30 @@ fn default_feature_flags() -> Vec<FeatureFlagRecord> {
             enabled: false,
             stage: "admin_only".to_owned(),
             depends_on: Vec::new(),
+            updated_at_unix_ms: 0,
+            updated_by_principal: "system".to_owned(),
+        },
+        FeatureFlagRecord {
+            key: FEATURE_COMPAT_EMBEDDINGS_API.to_owned(),
+            label: "Compat embeddings API".to_owned(),
+            description:
+                "Expose POST /v1/embeddings on the compat facade when a production embeddings path is available."
+                    .to_owned(),
+            enabled: false,
+            stage: "admin_only".to_owned(),
+            depends_on: vec![FEATURE_COMPAT_API.to_owned()],
+            updated_at_unix_ms: 0,
+            updated_by_principal: "system".to_owned(),
+        },
+        FeatureFlagRecord {
+            key: FEATURE_COMPAT_TOOLS_INVOKE.to_owned(),
+            label: "Compat tools invoke".to_owned(),
+            description:
+                "Allow the conservative /v1/tools/invoke compat skeleton for explicit operator testing."
+                    .to_owned(),
+            enabled: false,
+            stage: "lab".to_owned(),
+            depends_on: vec![FEATURE_COMPAT_API.to_owned()],
             updated_at_unix_ms: 0,
             updated_by_principal: "system".to_owned(),
         },

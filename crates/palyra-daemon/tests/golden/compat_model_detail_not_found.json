@@ -1,0 +1,8 @@
+{
+  "error": {
+    "message": "requested model 'missing-model' is not published by the current compat provider",
+    "type": "invalid_request_error",
+    "param": null,
+    "code": "model_not_found"
+  }
+}

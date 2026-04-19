@@ -1,0 +1,8 @@
+{
+  "error": {
+    "message": "feature 'compat_embeddings_api' is disabled for the compat API",
+    "type": "access_error",
+    "param": null,
+    "code": "feature_disabled"
+  }
+}

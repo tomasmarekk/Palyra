@@ -1,3 +1,6 @@
+#[allow(dead_code)]
+mod support;
+
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -17,6 +20,7 @@ use anyhow::{Context, Result};
 use reqwest::blocking::Client;
 use reqwest::Url;
 use serde_json::{json, Value};
+use support::assert_json_golden;
 
 const ADMIN_TOKEN: &str = "test-admin-token";
 const DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
@@ -343,6 +347,266 @@ fn console_models_probe_and_discover_publish_live_openai_results() -> Result<()>
         "provider validation + probe + discovery should all hit /v1/models: {:?}",
         mock_snapshot.model_request_paths
     );
+
+    Ok(())
+}
+
+#[test]
+fn compat_model_detail_and_embeddings_surface_publish_registry_backed_payloads() -> Result<()> {
+    let _test_guard = lock_openai_auth_surface_test();
+    let mock = OpenAiMockServer::new(None, None)?;
+    mock.allow_token("sk-compat-openai");
+    mock.set_embeddings_response_body(
+        r#"{"data":[{"index":0,"embedding":[0.1,0.2,0.3]},{"index":1,"embedding":[0.3,0.2,0.1]}],"model":"text-embedding-3-small"}"#,
+    );
+    wait_for_openai_mock_ready(&mock)?;
+
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[
+        ("PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(), CONSOLE_ADMIN_PRINCIPAL.to_owned()),
+        ("PALYRA_MODEL_PROVIDER_KIND".to_owned(), "openai_compatible".to_owned()),
+        ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL".to_owned(), format!("{}/v1", mock.base_url())),
+        ("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL".to_owned(), "true".to_owned()),
+        ("PALYRA_MODEL_PROVIDER_OPENAI_MODEL".to_owned(), "gpt-4.1-mini".to_owned()),
+        (
+            "PALYRA_MODEL_PROVIDER_OPENAI_EMBEDDINGS_MODEL".to_owned(),
+            "text-embedding-3-small".to_owned(),
+        ),
+        ("PALYRA_MODEL_PROVIDER_OPENAI_EMBEDDINGS_DIMS".to_owned(), "3".to_owned()),
+        ("PALYRA_MODEL_PROVIDER_OPENAI_API_KEY".to_owned(), "sk-compat-openai".to_owned()),
+    ])?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = http_client()?;
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+    enable_access_feature_flag(&client, admin_port, &cookie, &csrf_token, "compat_api")?;
+    enable_access_feature_flag(&client, admin_port, &cookie, &csrf_token, "api_tokens")?;
+    enable_access_feature_flag(&client, admin_port, &cookie, &csrf_token, "compat_embeddings_api")?;
+    let token = create_personal_api_token(
+        &client,
+        admin_port,
+        &cookie,
+        &csrf_token,
+        "Compat surface token",
+        &["compat.models.read", "compat.embeddings.create"],
+    )?;
+
+    let (model_status, model_detail) =
+        compat_get_json(&client, admin_port, "/v1/models/gpt-4.1-mini", token.as_str())?;
+    assert_eq!(model_status, 200);
+    assert_eq!(model_detail.get("id").and_then(Value::as_str), Some("gpt-4.1-mini"));
+    assert_eq!(model_detail.pointer("/metadata/role").and_then(Value::as_str), Some("chat"),);
+    assert_json_golden("compat_model_detail.json", &model_detail)?;
+
+    let (embeddings_status, embeddings_response) = compat_post_json(
+        &client,
+        admin_port,
+        "/v1/embeddings",
+        token.as_str(),
+        &json!({
+            "model": "text-embedding-3-small",
+            "input": ["alpha rollout", "beta recall"]
+        }),
+    )?;
+    assert_eq!(embeddings_status, 200);
+    assert_eq!(
+        embeddings_response.get("model").and_then(Value::as_str),
+        Some("text-embedding-3-small"),
+    );
+    assert_eq!(
+        embeddings_response.get("data").and_then(Value::as_array).map(std::vec::Vec::len),
+        Some(2),
+    );
+    assert_json_golden("compat_embeddings_response.json", &embeddings_response)?;
+
+    let mock_snapshot = mock.snapshot();
+    assert!(
+        mock_snapshot.embedding_request_paths.iter().any(|path| path == "/v1/embeddings"),
+        "compat embeddings should hit the upstream /v1/embeddings endpoint: {:?}",
+        mock_snapshot.embedding_request_paths
+    );
+    assert!(
+        mock_snapshot
+            .embedding_request_bodies
+            .iter()
+            .any(|body| body.contains("\"text-embedding-3-small\"")),
+        "compat embeddings should forward the configured embeddings model: {:?}",
+        mock_snapshot.embedding_request_bodies
+    );
+
+    Ok(())
+}
+
+#[test]
+fn compat_model_detail_returns_not_found_for_unknown_model() -> Result<()> {
+    let _test_guard = lock_openai_auth_surface_test();
+    let mock = OpenAiMockServer::new(None, None)?;
+    mock.allow_token("sk-compat-openai");
+    wait_for_openai_mock_ready(&mock)?;
+
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[
+        ("PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(), CONSOLE_ADMIN_PRINCIPAL.to_owned()),
+        ("PALYRA_MODEL_PROVIDER_KIND".to_owned(), "openai_compatible".to_owned()),
+        ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL".to_owned(), format!("{}/v1", mock.base_url())),
+        ("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL".to_owned(), "true".to_owned()),
+        ("PALYRA_MODEL_PROVIDER_OPENAI_MODEL".to_owned(), "gpt-4.1-mini".to_owned()),
+        ("PALYRA_MODEL_PROVIDER_OPENAI_API_KEY".to_owned(), "sk-compat-openai".to_owned()),
+    ])?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = http_client()?;
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+    enable_access_feature_flag(&client, admin_port, &cookie, &csrf_token, "compat_api")?;
+    enable_access_feature_flag(&client, admin_port, &cookie, &csrf_token, "api_tokens")?;
+    let token = create_personal_api_token(
+        &client,
+        admin_port,
+        &cookie,
+        &csrf_token,
+        "Compat model detail token",
+        &["compat.models.read"],
+    )?;
+
+    let (status, payload) =
+        compat_get_json(&client, admin_port, "/v1/models/missing-model", token.as_str())?;
+    assert_eq!(status, 404);
+    assert_json_golden("compat_model_detail_not_found.json", &payload)?;
+
+    Ok(())
+}
+
+#[test]
+fn compat_embeddings_surface_reports_feature_disabled_and_degraded_posture() -> Result<()> {
+    let _test_guard = lock_openai_auth_surface_test();
+    let mock = OpenAiMockServer::new(None, None)?;
+    mock.allow_token("sk-compat-openai");
+    wait_for_openai_mock_ready(&mock)?;
+
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[
+        ("PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(), CONSOLE_ADMIN_PRINCIPAL.to_owned()),
+        ("PALYRA_MODEL_PROVIDER_KIND".to_owned(), "openai_compatible".to_owned()),
+        ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL".to_owned(), format!("{}/v1", mock.base_url())),
+        ("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL".to_owned(), "true".to_owned()),
+        (
+            "PALYRA_MODEL_PROVIDER_OPENAI_EMBEDDINGS_MODEL".to_owned(),
+            "text-embedding-3-small".to_owned(),
+        ),
+        ("PALYRA_MODEL_PROVIDER_OPENAI_API_KEY".to_owned(), "sk-compat-openai".to_owned()),
+    ])?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = http_client()?;
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+    enable_access_feature_flag(&client, admin_port, &cookie, &csrf_token, "compat_api")?;
+    enable_access_feature_flag(&client, admin_port, &cookie, &csrf_token, "api_tokens")?;
+    let token = create_personal_api_token(
+        &client,
+        admin_port,
+        &cookie,
+        &csrf_token,
+        "Compat embeddings token",
+        &["compat.embeddings.create"],
+    )?;
+
+    let (feature_disabled_status, feature_disabled_payload) = compat_post_json(
+        &client,
+        admin_port,
+        "/v1/embeddings",
+        token.as_str(),
+        &json!({ "input": "alpha" }),
+    )?;
+    assert_eq!(feature_disabled_status, 403);
+    assert_json_golden("compat_embeddings_feature_disabled.json", &feature_disabled_payload)?;
+
+    drop(daemon);
+
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[
+        ("PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(), CONSOLE_ADMIN_PRINCIPAL.to_owned()),
+        ("PALYRA_MODEL_PROVIDER_KIND".to_owned(), "openai_compatible".to_owned()),
+        ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL".to_owned(), format!("{}/v1", mock.base_url())),
+        ("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL".to_owned(), "true".to_owned()),
+        (
+            "PALYRA_MODEL_PROVIDER_OPENAI_EMBEDDINGS_MODEL".to_owned(),
+            "text-embedding-3-small".to_owned(),
+        ),
+        ("PALYRA_MODEL_PROVIDER_OPENAI_API_KEY".to_owned(), "sk-compat-openai".to_owned()),
+        ("PALYRA_OFFLINE".to_owned(), "1".to_owned()),
+    ])?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = http_client()?;
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+    enable_access_feature_flag(&client, admin_port, &cookie, &csrf_token, "compat_api")?;
+    enable_access_feature_flag(&client, admin_port, &cookie, &csrf_token, "api_tokens")?;
+    enable_access_feature_flag(&client, admin_port, &cookie, &csrf_token, "compat_embeddings_api")?;
+    let token = create_personal_api_token(
+        &client,
+        admin_port,
+        &cookie,
+        &csrf_token,
+        "Compat degraded embeddings token",
+        &["compat.embeddings.create"],
+    )?;
+
+    let (degraded_status, degraded_payload) = compat_post_json(
+        &client,
+        admin_port,
+        "/v1/embeddings",
+        token.as_str(),
+        &json!({ "input": "alpha" }),
+    )?;
+    assert_eq!(degraded_status, 503);
+    assert_json_golden("compat_embeddings_degraded.json", &degraded_payload)?;
+
+    Ok(())
+}
+
+#[test]
+fn compat_tools_invoke_is_disabled_by_default_and_refuses_when_enabled() -> Result<()> {
+    let _test_guard = lock_openai_auth_surface_test();
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[(
+        "PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(),
+        CONSOLE_ADMIN_PRINCIPAL.to_owned(),
+    )])?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = http_client()?;
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+    enable_access_feature_flag(&client, admin_port, &cookie, &csrf_token, "compat_api")?;
+    enable_access_feature_flag(&client, admin_port, &cookie, &csrf_token, "api_tokens")?;
+    let token = create_personal_api_token(
+        &client,
+        admin_port,
+        &cookie,
+        &csrf_token,
+        "Compat tools token",
+        &["compat.tools.invoke"],
+    )?;
+
+    let (disabled_status, disabled_payload) = compat_post_json(
+        &client,
+        admin_port,
+        "/v1/tools/invoke",
+        token.as_str(),
+        &json!({ "tool": "palyra.echo", "input": { "text": "hello" } }),
+    )?;
+    assert_eq!(disabled_status, 403);
+    assert_json_golden("compat_tools_invoke_feature_disabled.json", &disabled_payload)?;
+
+    enable_access_feature_flag(&client, admin_port, &cookie, &csrf_token, "compat_tools_invoke")?;
+    let (enabled_status, enabled_payload) = compat_post_json(
+        &client,
+        admin_port,
+        "/v1/tools/invoke",
+        token.as_str(),
+        &json!({ "tool": "palyra.echo", "input": { "text": "hello" } }),
+    )?;
+    assert_eq!(enabled_status, 501);
+    assert_json_golden("compat_tools_invoke_refusal.json", &enabled_payload)?;
 
     Ok(())
 }
@@ -1306,6 +1570,8 @@ struct MockHttpResponse {
 #[derive(Debug, Default, Clone)]
 struct OpenAiMockSnapshot {
     model_request_paths: Vec<String>,
+    embedding_request_paths: Vec<String>,
+    embedding_request_bodies: Vec<String>,
     token_request_bodies: Vec<String>,
     revoke_request_bodies: Vec<String>,
     request_errors: Vec<String>,
@@ -1316,6 +1582,9 @@ struct OpenAiMockState {
     valid_tokens: HashSet<String>,
     model_request_paths: Vec<String>,
     models_response_body: Option<String>,
+    embedding_request_paths: Vec<String>,
+    embedding_request_bodies: Vec<String>,
+    embeddings_response_body: Option<String>,
     token_request_bodies: Vec<String>,
     revoke_request_bodies: Vec<String>,
     request_errors: Vec<String>,
@@ -1420,6 +1689,11 @@ impl OpenAiMockServer {
         state.models_response_body = Some(body.to_owned());
     }
 
+    fn set_embeddings_response_body(&self, body: &str) {
+        let mut state = self.state.lock().expect("OpenAI mock state lock should be available");
+        state.embeddings_response_body = Some(body.to_owned());
+    }
+
     fn base_url(&self) -> String {
         self.base_url.clone()
     }
@@ -1440,6 +1714,8 @@ impl OpenAiMockServer {
         let state = self.state.lock().expect("OpenAI mock state lock should be available");
         OpenAiMockSnapshot {
             model_request_paths: state.model_request_paths.clone(),
+            embedding_request_paths: state.embedding_request_paths.clone(),
+            embedding_request_bodies: state.embedding_request_bodies.clone(),
             token_request_bodies: state.token_request_bodies.clone(),
             revoke_request_bodies: state.revoke_request_bodies.clone(),
             request_errors: state.request_errors.clone(),
@@ -1489,6 +1765,29 @@ fn handle_openai_mock_request(
                 let guard = state.lock().expect("OpenAI mock state lock should be available");
                 guard.models_response_body.clone().unwrap_or_else(|| r#"{"data":[]}"#.to_owned())
             };
+            write_json_response(stream, "200 OK", body.as_str())?;
+        } else {
+            write_json_response(stream, "401 Unauthorized", r#"{"error":"invalid_api_key"}"#)?;
+        }
+        return Ok(());
+    }
+
+    if request.request_line.starts_with("POST /v1/embeddings ") {
+        let authorization =
+            request.headers.get("authorization").map(String::as_str).unwrap_or_default();
+        let bearer_token = authorization.strip_prefix("Bearer ").map(str::trim);
+        let presented_token = bearer_token.unwrap_or_default();
+        let (authorized, body) = {
+            let mut guard = state.lock().expect("OpenAI mock state lock should be available");
+            guard.embedding_request_paths.push(request.path.clone());
+            guard.embedding_request_bodies.push(request.body.clone());
+            let body = guard.embeddings_response_body.clone().unwrap_or_else(|| {
+                r#"{"data":[{"index":0,"embedding":[0.0,0.0,0.0]}],"model":"text-embedding-3-small"}"#
+                    .to_owned()
+            });
+            (guard.valid_tokens.contains(presented_token), body)
+        };
+        if authorized {
             write_json_response(stream, "200 OK", body.as_str())?;
         } else {
             write_json_response(stream, "401 Unauthorized", r#"{"error":"invalid_api_key"}"#)?;
@@ -1644,6 +1943,93 @@ fn post_console_json(
         .with_context(|| format!("console POST {path} returned non-success status"))?
         .json::<Value>()
         .with_context(|| format!("failed to parse console POST {path} response json"))
+}
+
+fn enable_access_feature_flag(
+    client: &Client,
+    admin_port: u16,
+    cookie: &str,
+    csrf_token: &str,
+    feature_key: &str,
+) -> Result<Value> {
+    post_console_json(
+        client,
+        admin_port,
+        format!("/console/v1/access/features/{feature_key}").as_str(),
+        cookie,
+        csrf_token,
+        &json!({
+            "enabled": true,
+            "stage": "test"
+        }),
+    )
+}
+
+fn create_personal_api_token(
+    client: &Client,
+    admin_port: u16,
+    cookie: &str,
+    csrf_token: &str,
+    label: &str,
+    scopes: &[&str],
+) -> Result<String> {
+    let created = post_console_json(
+        client,
+        admin_port,
+        "/console/v1/access/api-tokens",
+        cookie,
+        csrf_token,
+        &json!({
+            "label": label,
+            "scopes": scopes,
+            "principal": CONSOLE_ADMIN_PRINCIPAL,
+            "role": "owner"
+        }),
+    )?;
+    created
+        .get("created")
+        .and_then(|value| value.get("token"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("API token create response missing token secret"))
+}
+
+fn compat_get_json(
+    client: &Client,
+    admin_port: u16,
+    path: &str,
+    token: &str,
+) -> Result<(u16, Value)> {
+    let response = client
+        .get(console_url(admin_port, path))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .with_context(|| format!("failed to GET compat path {path}"))?;
+    let status = response.status().as_u16();
+    let payload = response
+        .json::<Value>()
+        .with_context(|| format!("failed to parse compat GET {path} response json"))?;
+    Ok((status, payload))
+}
+
+fn compat_post_json(
+    client: &Client,
+    admin_port: u16,
+    path: &str,
+    token: &str,
+    payload: &Value,
+) -> Result<(u16, Value)> {
+    let response = client
+        .post(console_url(admin_port, path))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(payload)
+        .send()
+        .with_context(|| format!("failed to POST compat path {path}"))?;
+    let status = response.status().as_u16();
+    let body = response
+        .json::<Value>()
+        .with_context(|| format!("failed to parse compat POST {path} response json"))?;
+    Ok((status, body))
 }
 
 fn find_profile<'a>(profiles: &'a Value, profile_id: &str) -> Result<&'a Value> {

@@ -1,0 +1,8 @@
+{
+  "error": {
+    "message": "feature 'compat_tools_invoke' is disabled for the compat API",
+    "type": "access_error",
+    "param": null,
+    "code": "feature_disabled"
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "id": "gpt-4.1-mini",
+  "object": "model",
+  "created": 0,
+  "owned_by": "palyra",
+  "root": "gpt-4.1-mini",
+  "parent": null,
+  "metadata": {
+    "provider_kind": "openai_compatible",
+    "provider_id": "openai-primary",
+    "credential_id": "config:openai-primary:inline_config",
+    "role": "chat",
+    "default": true,
+    "enabled": true,
+    "health_status": "ok",
+    "discovery_status": "static",
+    "dimensions": null,
+    "supports_streaming_tokens": true,
+    "supports_tool_calls": true,
+    "supports_json_mode": true,
+    "supports_vision": true,
+    "supports_audio_transcribe": true,
+    "supports_embeddings": false,
+    "max_context_tokens": 128000,
+    "cost_tier": "standard",
+    "latency_tier": "standard",
+    "recommended_use_cases": [
+      "general chat",
+      "JSON workflows",
+      "vision requests"
+    ],
+    "known_limitations": [],
+    "metadata_source": "static"
+  }
+}

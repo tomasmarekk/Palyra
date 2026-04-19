@@ -1,0 +1,8 @@
+{
+  "error": {
+    "message": "compat /v1/tools/invoke is intentionally gated off until an approval-bound execution surface is ready",
+    "type": "invalid_request_error",
+    "param": null,
+    "code": "tools_invoke_disabled"
+  }
+}

@@ -800,12 +800,27 @@
       "registered": true
     },
     {
+      "path": "/v1/models/compat-probe",
+      "method": "GET",
+      "registered": true
+    },
+    {
+      "path": "/v1/embeddings",
+      "method": "POST",
+      "registered": true
+    },
+    {
       "path": "/v1/chat/completions",
       "method": "POST",
       "registered": true
     },
     {
       "path": "/v1/responses",
+      "method": "POST",
+      "registered": true
+    },
+    {
+      "path": "/v1/tools/invoke",
       "method": "POST",
       "registered": true
     }

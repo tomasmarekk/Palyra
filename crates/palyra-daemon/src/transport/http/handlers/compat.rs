@@ -1,8 +1,10 @@
 use crate::{
     access_control::{
         AccessRegistry, AccessRegistryError, AuthenticatedApiToken, FEATURE_API_TOKENS,
-        FEATURE_COMPAT_API, PERMISSION_COMPAT_CHAT_CREATE, PERMISSION_COMPAT_MODELS_READ,
-        PERMISSION_COMPAT_RESPONSES_CREATE,
+        FEATURE_COMPAT_API, FEATURE_COMPAT_EMBEDDINGS_API, FEATURE_COMPAT_TOOLS_INVOKE,
+        PERMISSION_COMPAT_CHAT_CREATE, PERMISSION_COMPAT_EMBEDDINGS_CREATE,
+        PERMISSION_COMPAT_MODELS_READ, PERMISSION_COMPAT_RESPONSES_CREATE,
+        PERMISSION_COMPAT_TOOLS_INVOKE,
     },
     app::state::CompatApiRateLimitEntry,
     *,
@@ -29,6 +31,20 @@ pub(crate) struct CompatResponsesRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub(crate) struct CompatEmbeddingsRequest {
+    model: Option<String>,
+    input: CompatEmbeddingsInput,
+    #[serde(default)]
+    encoding_format: Option<String>,
+    #[serde(default)]
+    dimensions: Option<u32>,
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
 pub(crate) struct CompatChatMessage {
     role: String,
     content: CompatMessageContent,
@@ -41,6 +57,13 @@ pub(crate) struct CompatChatMessage {
 pub(crate) enum CompatResponsesInput {
     Text(String),
     Messages(Vec<CompatResponseInputItem>),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum CompatEmbeddingsInput {
+    Text(String),
+    Texts(Vec<String>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,15 +125,31 @@ struct CompatToolCall {
     arguments: String,
 }
 
+#[derive(Debug, Clone)]
+struct CompatModelDescriptor {
+    id: String,
+    role: &'static str,
+    provider_kind: String,
+    provider_id: String,
+    credential_id: String,
+    health_status: String,
+    discovery_status: String,
+    default_model: bool,
+    enabled: bool,
+    dimensions: Option<u32>,
+    capabilities: Option<model_provider::ProviderCapabilitiesSnapshot>,
+}
+
 pub(crate) async fn compat_models_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, Response> {
     let now = unix_ms_now().map_err(internal_clock_error_response)?;
-    let token = authorize_compat_api_token(&state, &headers, PERMISSION_COMPAT_MODELS_READ, now)?;
+    let token =
+        authorize_compat_api_token(&state, &headers, PERMISSION_COMPAT_MODELS_READ, None, now)?;
     enforce_compat_rate_limit(&state, token.token_id.as_str(), token.rate_limit_per_minute)?;
     let provider = state.runtime.model_provider_status_snapshot();
-    let models = build_compat_models(provider.clone());
+    let models = build_compat_models(&provider);
     touch_compat_api_token(
         &state,
         token.token_id.as_str(),
@@ -123,6 +162,216 @@ pub(crate) async fn compat_models_handler(
         "object": "list",
         "data": models,
     })))
+}
+
+pub(crate) async fn compat_model_detail_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(model_id): Path<String>,
+) -> Result<Json<Value>, Response> {
+    let now = unix_ms_now().map_err(internal_clock_error_response)?;
+    let token =
+        authorize_compat_api_token(&state, &headers, PERMISSION_COMPAT_MODELS_READ, None, now)?;
+    enforce_compat_rate_limit(&state, token.token_id.as_str(), token.rate_limit_per_minute)?;
+    let provider = state.runtime.model_provider_status_snapshot();
+    let descriptor = build_compat_model_descriptors(&provider)
+        .into_iter()
+        .find(|candidate| candidate.id == model_id)
+        .ok_or_else(|| compat_model_not_found_response(model_id.as_str()))?;
+    touch_compat_api_token(
+        &state,
+        token.token_id.as_str(),
+        "read",
+        "model_detail_read",
+        Some(model_id.as_str()),
+        now,
+    );
+    Ok(Json(compat_model_json(&descriptor)))
+}
+
+pub(crate) async fn compat_embeddings_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<CompatEmbeddingsRequest>,
+) -> Result<Json<Value>, Response> {
+    let _ = payload.user.as_deref();
+    let _ = payload.metadata.as_ref();
+    if payload.encoding_format.as_deref().is_some_and(|value| !value.eq_ignore_ascii_case("float"))
+    {
+        return Err(compat_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "unsupported_encoding_format",
+            "encoding_format must be omitted or set to 'float'",
+        ));
+    }
+
+    let now = unix_ms_now().map_err(internal_clock_error_response)?;
+    let token = authorize_compat_api_token(
+        &state,
+        &headers,
+        PERMISSION_COMPAT_EMBEDDINGS_CREATE,
+        Some(FEATURE_COMPAT_EMBEDDINGS_API),
+        now,
+    )?;
+    enforce_compat_rate_limit(&state, token.token_id.as_str(), token.rate_limit_per_minute)?;
+
+    let embeddings_status =
+        state.runtime.memory_embeddings_status().await.map_err(runtime_status_response)?;
+    if !embeddings_status.production_default_active {
+        let warning = embeddings_status.warning.unwrap_or_else(|| {
+            "compat embeddings are unavailable because the runtime is operating in a degraded embeddings posture"
+                .to_owned()
+        });
+        touch_compat_api_token(
+            &state,
+            token.token_id.as_str(),
+            "run",
+            "embeddings_degraded",
+            embeddings_status.degraded_reason_code.as_deref(),
+            now,
+        );
+        return Err(compat_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "embeddings_degraded",
+            warning,
+        ));
+    }
+
+    let requested_inputs = normalize_compat_embeddings_input(payload.input)?;
+    let prompt_tokens = requested_inputs
+        .iter()
+        .map(|input| crate::orchestrator::estimate_token_count(input))
+        .sum::<u64>();
+    let loaded_config = load_model_provider_config(&state);
+    let mut provider_config = crate::retrieval::resolve_embeddings_provider_config(&loaded_config)
+        .map_err(internal_runtime_error_response)?
+        .ok_or_else(|| {
+            compat_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_error",
+                "embeddings_unavailable",
+                "compat embeddings require a production embeddings-capable provider selection",
+            )
+        })?;
+    let available_model = provider_config.openai_embeddings_model.clone().ok_or_else(|| {
+        compat_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "embeddings_unavailable",
+            "compat embeddings model is not configured",
+        )
+    })?;
+
+    if let Some(requested_model) =
+        payload.model.as_deref().and_then(|value| trim_to_option(value.to_owned()))
+    {
+        if requested_model != available_model {
+            touch_compat_api_token(
+                &state,
+                token.token_id.as_str(),
+                "run",
+                "embeddings_model_rejected",
+                Some(requested_model.as_str()),
+                now,
+            );
+            return Err(compat_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "model_not_available",
+                format!(
+                    "requested embeddings model '{requested_model}' is not available through the current compat provider"
+                ),
+            ));
+        }
+    }
+    if let Some(dimensions) = payload.dimensions {
+        if dimensions == 0 {
+            return Err(compat_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "invalid_dimensions",
+                "dimensions must be greater than 0 when provided",
+            ));
+        }
+        provider_config.openai_embeddings_dims = Some(dimensions);
+    }
+
+    let provider =
+        crate::model_provider::build_embeddings_provider(&provider_config).map_err(|error| {
+            compat_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_error",
+                "embeddings_provider_unavailable",
+                error.to_string(),
+            )
+        })?;
+    let response = match provider
+        .embed(crate::model_provider::EmbeddingsRequest { inputs: requested_inputs.clone() })
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            touch_compat_api_token(
+                &state,
+                token.token_id.as_str(),
+                "run",
+                "embeddings_failed",
+                Some(available_model.as_str()),
+                now,
+            );
+            return Err(compat_embeddings_provider_error_response(error));
+        }
+    };
+
+    tracing::info!(
+        compat_model = %response.model_name,
+        input_count = requested_inputs.len(),
+        prompt_tokens,
+        embedding_dimensions = response.dimensions,
+        retry_count = response.retry_count,
+        "compat embeddings request completed"
+    );
+    touch_compat_api_token(
+        &state,
+        token.token_id.as_str(),
+        "run",
+        "embeddings_completed",
+        Some(response.model_name.as_str()),
+        now,
+    );
+    Ok(Json(build_compat_embeddings_payload(prompt_tokens, &response)))
+}
+
+pub(crate) async fn compat_tools_invoke_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(_payload): Json<Value>,
+) -> Result<Response, Response> {
+    let now = unix_ms_now().map_err(internal_clock_error_response)?;
+    let token = authorize_compat_api_token(
+        &state,
+        &headers,
+        PERMISSION_COMPAT_TOOLS_INVOKE,
+        Some(FEATURE_COMPAT_TOOLS_INVOKE),
+        now,
+    )?;
+    enforce_compat_rate_limit(&state, token.token_id.as_str(), token.rate_limit_per_minute)?;
+    touch_compat_api_token(
+        &state,
+        token.token_id.as_str(),
+        "run",
+        "tools_invoke_refused",
+        None,
+        now,
+    );
+    Err(compat_error_response(
+        StatusCode::NOT_IMPLEMENTED,
+        "invalid_request_error",
+        "tools_invoke_disabled",
+        "compat /v1/tools/invoke is intentionally gated off until an approval-bound execution surface is ready",
+    ))
 }
 
 pub(crate) async fn compat_chat_completions_handler(
@@ -258,7 +507,7 @@ async fn prepare_compat_run(
     required_scope: &str,
 ) -> Result<CompatPreparedRun, Response> {
     let now = unix_ms_now().map_err(internal_clock_error_response)?;
-    let token = authorize_compat_api_token(state, headers, required_scope, now)?;
+    let token = authorize_compat_api_token(state, headers, required_scope, None, now)?;
     enforce_compat_rate_limit(state, token.token_id.as_str(), token.rate_limit_per_minute)?;
 
     let provider = state.runtime.model_provider_status_snapshot();
@@ -753,36 +1002,235 @@ fn build_compat_chat_streaming_response(state: AppState, prepared: CompatPrepare
     response
 }
 
-fn build_compat_models(provider: model_provider::ProviderStatusSnapshot) -> Vec<Value> {
-    let mut models = Vec::new();
-    let chat_model =
-        provider.openai_model.clone().unwrap_or_else(|| format!("palyra-{}", provider.kind));
-    models.push(json!({
-        "id": chat_model,
+fn build_compat_models(provider: &model_provider::ProviderStatusSnapshot) -> Vec<Value> {
+    build_compat_model_descriptors(provider)
+        .into_iter()
+        .map(|descriptor| compat_model_json(&descriptor))
+        .collect()
+}
+
+fn build_compat_model_descriptors(
+    provider: &model_provider::ProviderStatusSnapshot,
+) -> Vec<CompatModelDescriptor> {
+    let mut descriptors = Vec::new();
+    let chat_model_id = current_compat_chat_model_id(provider);
+    descriptors.push(build_chat_model_descriptor(provider, chat_model_id.as_str()));
+    if let Some(model_id) = current_compat_embeddings_model_id(provider) {
+        descriptors.push(build_embeddings_model_descriptor(provider, model_id.as_str()));
+    }
+    descriptors
+}
+
+fn build_chat_model_descriptor(
+    provider: &model_provider::ProviderStatusSnapshot,
+    model_id: &str,
+) -> CompatModelDescriptor {
+    let registry_model = provider
+        .registry
+        .models
+        .iter()
+        .find(|entry| entry.model_id == model_id && entry.role == "chat");
+    CompatModelDescriptor {
+        id: model_id.to_owned(),
+        role: "chat",
+        provider_kind: provider.kind.clone(),
+        provider_id: registry_model
+            .map(|entry| entry.provider_id.clone())
+            .unwrap_or_else(|| provider.provider_id.clone()),
+        credential_id: provider.credential_id.clone(),
+        health_status: provider.health.state.clone(),
+        discovery_status: provider.discovery.status.clone(),
+        default_model: true,
+        enabled: registry_model.map(|entry| entry.enabled).unwrap_or(true),
+        dimensions: None,
+        capabilities: Some(
+            registry_model
+                .map(|entry| entry.capabilities.clone())
+                .unwrap_or_else(|| provider.capabilities.clone()),
+        ),
+    }
+}
+
+fn build_embeddings_model_descriptor(
+    provider: &model_provider::ProviderStatusSnapshot,
+    model_id: &str,
+) -> CompatModelDescriptor {
+    let registry_model = provider
+        .registry
+        .models
+        .iter()
+        .find(|entry| entry.model_id == model_id && entry.role == "embeddings");
+    CompatModelDescriptor {
+        id: model_id.to_owned(),
+        role: "embeddings",
+        provider_kind: provider.kind.clone(),
+        provider_id: registry_model
+            .map(|entry| entry.provider_id.clone())
+            .unwrap_or_else(|| provider.provider_id.clone()),
+        credential_id: provider.credential_id.clone(),
+        health_status: provider.health.state.clone(),
+        discovery_status: provider.discovery.status.clone(),
+        default_model: provider
+            .registry
+            .default_embeddings_model_id
+            .as_deref()
+            .is_some_and(|candidate| candidate == model_id),
+        enabled: registry_model.map(|entry| entry.enabled).unwrap_or(true),
+        dimensions: provider.openai_embeddings_dims,
+        capabilities: registry_model.map(|entry| entry.capabilities.clone()),
+    }
+}
+
+fn compat_model_json(model: &CompatModelDescriptor) -> Value {
+    json!({
+        "id": model.id,
         "object": "model",
         "created": 0,
         "owned_by": "palyra",
+        "root": model.id,
+        "parent": Value::Null,
         "metadata": {
-            "provider_kind": provider.kind,
-            "supports_streaming_tokens": provider.capabilities.streaming_tokens,
-            "supports_tool_calls": provider.capabilities.tool_calls,
-            "supports_json_mode": provider.capabilities.json_mode,
-            "supports_vision": provider.capabilities.vision,
+            "provider_kind": model.provider_kind,
+            "provider_id": model.provider_id,
+            "credential_id": model.credential_id,
+            "role": model.role,
+            "default": model.default_model,
+            "enabled": model.enabled,
+            "health_status": model.health_status,
+            "discovery_status": model.discovery_status,
+            "dimensions": model.dimensions,
+            "supports_streaming_tokens": model.capabilities.as_ref().map(|value| value.streaming_tokens),
+            "supports_tool_calls": model.capabilities.as_ref().map(|value| value.tool_calls),
+            "supports_json_mode": model.capabilities.as_ref().map(|value| value.json_mode),
+            "supports_vision": model.capabilities.as_ref().map(|value| value.vision),
+            "supports_audio_transcribe": model.capabilities.as_ref().map(|value| value.audio_transcribe),
+            "supports_embeddings": model.capabilities.as_ref().map(|value| value.embeddings),
+            "max_context_tokens": model.capabilities.as_ref().and_then(|value| value.max_context_tokens),
+            "cost_tier": model.capabilities.as_ref().map(|value| value.cost_tier.clone()),
+            "latency_tier": model.capabilities.as_ref().map(|value| value.latency_tier.clone()),
+            "recommended_use_cases": model.capabilities.as_ref().map(|value| value.recommended_use_cases.clone()).unwrap_or_default(),
+            "known_limitations": model.capabilities.as_ref().map(|value| value.known_limitations.clone()).unwrap_or_default(),
+            "metadata_source": model.capabilities.as_ref().map(|value| value.metadata_source.clone()),
         }
-    }));
-    if let Some(embeddings_model) = provider.openai_embeddings_model {
-        models.push(json!({
-            "id": embeddings_model,
-            "object": "model",
-            "created": 0,
-            "owned_by": "palyra",
-            "metadata": {
-                "provider_kind": "embeddings",
-                "dimensions": provider.openai_embeddings_dims,
-            }
-        }));
+    })
+}
+
+fn current_compat_chat_model_id(provider: &model_provider::ProviderStatusSnapshot) -> String {
+    provider.openai_model.clone().unwrap_or_else(|| format!("palyra-{}", provider.kind))
+}
+
+fn current_compat_embeddings_model_id(
+    provider: &model_provider::ProviderStatusSnapshot,
+) -> Option<String> {
+    provider.openai_embeddings_model.clone()
+}
+
+fn compat_model_not_found_response(model_id: &str) -> Response {
+    compat_error_response(
+        StatusCode::NOT_FOUND,
+        "invalid_request_error",
+        "model_not_found",
+        format!("requested model '{model_id}' is not published by the current compat provider"),
+    )
+}
+
+fn build_compat_embeddings_payload(
+    prompt_tokens: u64,
+    response: &crate::model_provider::EmbeddingsResponse,
+) -> Value {
+    json!({
+        "object": "list",
+        "data": response
+            .vectors
+            .iter()
+            .enumerate()
+            .map(|(index, embedding)| {
+                json!({
+                    "object": "embedding",
+                    "index": index,
+                    "embedding": embedding,
+                })
+            })
+            .collect::<Vec<_>>(),
+        "model": response.model_name,
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "total_tokens": prompt_tokens,
+        }
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn normalize_compat_embeddings_input(
+    input: CompatEmbeddingsInput,
+) -> Result<Vec<String>, Response> {
+    let values = match input {
+        CompatEmbeddingsInput::Text(text) => vec![text],
+        CompatEmbeddingsInput::Texts(texts) => texts,
+    };
+    let normalized = values.into_iter().filter_map(trim_to_option).collect::<Vec<_>>();
+    if normalized.is_empty() {
+        return Err(compat_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "empty_input",
+            "input cannot be empty",
+        ));
     }
-    models
+    Ok(normalized)
+}
+
+fn compat_embeddings_provider_error_response(
+    error: crate::model_provider::ProviderError,
+) -> Response {
+    match error {
+        crate::model_provider::ProviderError::MissingEmbeddingsModel => compat_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "embeddings_unavailable",
+            "compat embeddings model is not configured",
+        ),
+        crate::model_provider::ProviderError::InvalidEmbeddingsRequest { message } => {
+            compat_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "invalid_embeddings_request",
+                message,
+            )
+        }
+        crate::model_provider::ProviderError::CircuitOpen { retry_after_ms } => {
+            compat_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_error",
+                "provider_circuit_open",
+                format!(
+                    "embeddings provider circuit breaker is open; retry after {retry_after_ms}ms"
+                ),
+            )
+        }
+        crate::model_provider::ProviderError::RequestFailed { message, .. } => {
+            compat_error_response(
+                StatusCode::BAD_GATEWAY,
+                "server_error",
+                "provider_request_failed",
+                message,
+            )
+        }
+        crate::model_provider::ProviderError::InvalidResponse { message, .. } => {
+            compat_error_response(
+                StatusCode::BAD_GATEWAY,
+                "server_error",
+                "provider_invalid_response",
+                message,
+            )
+        }
+        other => compat_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "provider_error",
+            other.to_string(),
+        ),
+    }
 }
 
 #[allow(clippy::result_large_err)]
@@ -961,6 +1409,7 @@ fn authorize_compat_api_token(
     state: &AppState,
     headers: &HeaderMap,
     required_scope: &str,
+    additional_feature_flag: Option<&str>,
     now: i64,
 ) -> Result<AuthenticatedApiToken, Response> {
     let raw_token = extract_bearer_token(headers)?;
@@ -971,9 +1420,24 @@ fn authorize_compat_api_token(
     registry
         .require_feature_enabled(FEATURE_API_TOKENS)
         .map_err(access_registry_to_compat_response)?;
+    if let Some(feature_key) = additional_feature_flag {
+        registry
+            .require_feature_enabled(feature_key)
+            .map_err(access_registry_to_compat_response)?;
+    }
     registry
         .authenticate_api_token(raw_token.as_str(), required_scope, now)
         .map_err(access_registry_to_compat_response)
+}
+
+fn load_model_provider_config(state: &AppState) -> crate::model_provider::ModelProviderConfig {
+    match state.loaded_config.lock() {
+        Ok(guard) => guard.model_provider.clone(),
+        Err(poisoned) => {
+            tracing::warn!("loaded config lock poisoned while reading compat embeddings config");
+            poisoned.into_inner().model_provider.clone()
+        }
+    }
 }
 
 #[allow(clippy::result_large_err)]
@@ -1225,6 +1689,15 @@ fn internal_clock_error_response(error: impl std::fmt::Display) -> Response {
         "server_error",
         "clock_error",
         format!("failed to read system clock: {error}"),
+    )
+}
+
+fn internal_runtime_error_response(error: impl std::fmt::Display) -> Response {
+    compat_error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "server_error",
+        "runtime_error",
+        error.to_string(),
     )
 }
 

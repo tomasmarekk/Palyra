@@ -1,0 +1,8 @@
+{
+  "error": {
+    "message": "PALYRA_OFFLINE is enabled; retrieval embeddings are using the explicit hash fallback",
+    "type": "server_error",
+    "param": null,
+    "code": "embeddings_degraded"
+  }
+}

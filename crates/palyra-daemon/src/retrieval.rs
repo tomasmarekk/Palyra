@@ -863,7 +863,7 @@ fn char_ngrams(input: &str) -> std::collections::BTreeSet<String> {
     grams
 }
 
-fn resolve_embeddings_provider_config(
+pub(crate) fn resolve_embeddings_provider_config(
     config: &ModelProviderConfig,
 ) -> Result<Option<ModelProviderConfig>> {
     let registry = config.normalized_registry()?;
