@@ -804,10 +804,8 @@ fn run_configured_secret_inventory(json: bool) -> Result<()> {
         output::print_json_pretty(&envelope, "failed to encode configured secret inventory")?;
         return Ok(());
     }
-    for line in secrets_text::render_configured_secret_inventory_lines(
-        &secrets_text::summarize_configured_secret_inventory(&envelope),
-    ) {
-        output::print_text_line(line.as_str())?;
+    for line in secrets_text::render_configured_secret_inventory_lines() {
+        output::print_text_line(line)?;
     }
     Ok(())
 }
@@ -824,10 +822,8 @@ fn run_configured_secret_explain(secret_id: &str, json: bool) -> Result<()> {
         output::print_json_pretty(&envelope, "failed to encode configured secret detail")?;
         return Ok(());
     }
-    for line in secrets_text::render_configured_secret_explain_lines(
-        &secrets_text::summarize_configured_secret_explain(&envelope.secret),
-    ) {
-        output::print_text_line(line.as_str())?;
+    for line in secrets_text::render_configured_secret_explain_lines() {
+        output::print_text_line(line)?;
     }
     Ok(())
 }
