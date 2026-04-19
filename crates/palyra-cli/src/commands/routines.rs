@@ -10,8 +10,7 @@ use serde_json::{json, Map, Value};
 use crate::cli::{
     CronConcurrencyPolicyArg, CronMisfirePolicyArg, CronScheduleTypeArg, RoutineApprovalModeArg,
     RoutineDeliveryModeArg, RoutineExecutionPostureArg, RoutinePreviewTimezoneArg,
-    RoutineRunModeArg, RoutineSilentPolicyArg, RoutineTriggerKindArg, RoutineUpsertCommand,
-    RoutinesCommand,
+    RoutineRunModeArg, RoutineSilentPolicyArg, RoutineTriggerKindArg, RoutinesCommand,
 };
 use crate::*;
 
@@ -73,7 +72,7 @@ pub(crate) async fn run_routines_async(command: RoutinesCommand) -> Result<()> {
             emit_routine_envelope("routines.show", &payload, output::preferred_json(json))
         }
         RoutinesCommand::Upsert(args) => {
-            let RoutineUpsertCommand {
+            let crate::cli::RoutineUpsertCommand {
                 id,
                 name,
                 prompt,
@@ -1326,7 +1325,6 @@ fn milliseconds_summary(value: Option<i64>) -> String {
 fn compact_json(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned())
 }
-
 fn bump_counter(map: &mut Map<String, Value>, key: &str) {
     let current = map.get(key).and_then(Value::as_u64).unwrap_or(0);
     map.insert(key.to_owned(), Value::from(current.saturating_add(1)));
