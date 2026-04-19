@@ -1089,7 +1089,6 @@ mod tests {
         segment.estimated_tokens = estimated_tokens;
         segment
     }
-
     #[allow(clippy::too_many_arguments)]
     fn segment_with_safety(
         kind: ContextSegmentKind,

@@ -446,7 +446,6 @@ pub(crate) async fn evaluate_tool_proposal_security(
         backend_selection,
     }
 }
-
 #[allow(clippy::too_many_arguments)]
 fn resolve_tool_proposal_decision(
     remaining_tool_budget: &mut u32,
