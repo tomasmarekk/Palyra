@@ -798,23 +798,8 @@ fn run_configured_secret_inventory(json: bool) -> Result<()> {
         output::print_json_pretty(&envelope, "failed to encode configured secret inventory")?;
         return Ok(());
     }
-    let summary_line = format!(
-        "configured_secrets snapshot_generation={} count={}",
-        envelope.snapshot_generation,
-        envelope.secrets.len()
-    );
-    output::print_text_line(summary_line.as_str())?;
-    for secret in envelope.secrets {
-        let secret_line = format!(
-            "secret component={} path={} status={} reload_action={} source={} id={}",
-            secret.component,
-            secret.config_path,
-            secret.status,
-            secret.reload_action,
-            secret.source.kind,
-            secret.secret_id
-        );
-        output::print_text_line(secret_line.as_str())?;
+    for line in render_configured_secret_inventory_lines(&envelope) {
+        output::print_text_line(line.as_str())?;
     }
     Ok(())
 }
@@ -831,25 +816,61 @@ fn run_configured_secret_explain(secret_id: &str, json: bool) -> Result<()> {
         output::print_json_pretty(&envelope, "failed to encode configured secret detail")?;
         return Ok(());
     }
-    let secret = envelope.secret;
-    let headline = format!(
-        "secret.explain id={} component={} path={} status={} reload_action={}",
-        secret.secret_id, secret.component, secret.config_path, secret.status, secret.reload_action
-    );
-    output::print_text_line(headline.as_str())?;
-    let source_line = format!(
-        "source kind={} fingerprint={} refresh_policy={} snapshot_policy={}",
-        secret.source.kind,
-        secret.source.fingerprint,
-        secret.source.refresh_policy,
-        secret.source.snapshot_policy
-    );
-    output::print_text_line(source_line.as_str())?;
-    if let Some(error) = secret.last_error {
-        let error_line = format!("last_error={error}");
-        output::print_text_line(error_line.as_str())?;
+    for line in render_configured_secret_explain_lines(&envelope.secret) {
+        output::print_text_line(line.as_str())?;
     }
     Ok(())
+}
+
+fn render_configured_secret_inventory_lines(
+    envelope: &control_plane::ConfiguredSecretListEnvelope,
+) -> Vec<String> {
+    let mut lines = vec![format!(
+        "configured_secrets snapshot_generation={} count={}",
+        envelope.snapshot_generation,
+        envelope.secrets.len()
+    )];
+    for (index, secret) in envelope.secrets.iter().enumerate() {
+        lines.push(format!(
+            "secret index={} status={} reload_action={} source={} scope={} required={} affected_components={} error_kind={}",
+            index + 1,
+            secret.status,
+            secret.reload_action,
+            secret.source.kind,
+            secret.resolution_scope,
+            secret.source.required,
+            secret.affected_components.len(),
+            secret.last_error_kind.as_deref().unwrap_or("none")
+        ));
+    }
+    lines
+}
+
+fn render_configured_secret_explain_lines(
+    secret: &control_plane::ConfiguredSecretRecord,
+) -> Vec<String> {
+    let mut lines = vec![format!(
+        "secret.explain status={} reload_action={} scope={} required={} affected_components={} value_bytes={}",
+        secret.status,
+        secret.reload_action,
+        secret.resolution_scope,
+        secret.source.required,
+        secret.affected_components.len(),
+        secret
+            .value_bytes
+            .map_or_else(|| "unknown".to_owned(), |value| value.to_string())
+    )];
+    lines.push(format!(
+        "source kind={} refresh_policy={} snapshot_policy={} error_kind={}",
+        secret.source.kind,
+        secret.source.refresh_policy,
+        secret.source.snapshot_policy,
+        secret.last_error_kind.as_deref().unwrap_or("none")
+    ));
+    if secret.last_error.is_some() {
+        lines.push("last_error_present=true use --json for structured diagnostics".to_owned());
+    }
+    lines
 }
 
 fn run_runtime_secret_plan(path: Option<String>, json: bool) -> Result<()> {
@@ -927,6 +948,7 @@ fn sanitize_secret_error(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use palyra_control_plane::{ContractDescriptor, PageInfo, CONTROL_PLANE_CONTRACT_VERSION};
 
     fn sample_secret_audit_payload() -> SecretAuditPayload {
         SecretAuditPayload {
@@ -1000,5 +1022,68 @@ mod tests {
         .expect("serialize");
         assert!(output.contains("\"vault_ref_configured\":true"));
         assert!(!output.contains("global/openai"));
+    }
+
+    fn sample_configured_secret_record() -> control_plane::ConfiguredSecretRecord {
+        control_plane::ConfiguredSecretRecord {
+            secret_id: "model_provider.openai_api_key_secret_ref:super-secret-fingerprint"
+                .to_owned(),
+            component: "model_provider".to_owned(),
+            config_path: "model_provider.openai_api_key_secret_ref".to_owned(),
+            status: "healthy".to_owned(),
+            resolution_scope: "startup".to_owned(),
+            reload_action: "daemon_restart_required".to_owned(),
+            snapshot_generation: 7,
+            source: control_plane::ConfiguredSecretSourceView {
+                kind: "vault".to_owned(),
+                fingerprint: "super-secret-fingerprint".to_owned(),
+                required: true,
+                refresh_policy: "startup_only".to_owned(),
+                snapshot_policy: "runtime_snapshot".to_owned(),
+                description: "OpenAI credential".to_owned(),
+                display_name: Some("OpenAI API key".to_owned()),
+                redaction_label: Some("api_key".to_owned()),
+                max_bytes: Some(512),
+                exec_timeout_ms: None,
+                trusted_dir_count: None,
+                inherited_env_count: None,
+                allow_symlinks: None,
+            },
+            affected_components: vec!["model_provider".to_owned()],
+            last_resolved_at_unix_ms: Some(1_700_000_000_000),
+            last_error_kind: Some("auth_invalid".to_owned()),
+            last_error: Some("Bearer super-secret-token".to_owned()),
+            value_bytes: Some(42),
+        }
+    }
+
+    #[test]
+    fn configured_secret_inventory_text_lines_hide_sensitive_identifiers() {
+        let envelope = control_plane::ConfiguredSecretListEnvelope {
+            contract: ContractDescriptor {
+                contract_version: CONTROL_PLANE_CONTRACT_VERSION.to_owned(),
+            },
+            generated_at_unix_ms: 1_700_000_000_000,
+            snapshot_generation: 7,
+            secrets: vec![sample_configured_secret_record()],
+            page: PageInfo { limit: 1, returned: 1, next_cursor: None, has_more: false },
+        };
+        let rendered = render_configured_secret_inventory_lines(&envelope).join("\n");
+        assert!(rendered.contains("status=healthy"));
+        assert!(rendered.contains("source=vault"));
+        assert!(!rendered.contains("super-secret-fingerprint"));
+        assert!(!rendered.contains("model_provider.openai_api_key_secret_ref"));
+    }
+
+    #[test]
+    fn configured_secret_explain_text_lines_hide_sensitive_detail() {
+        let rendered =
+            render_configured_secret_explain_lines(&sample_configured_secret_record()).join("\n");
+        assert!(rendered.contains("status=healthy"));
+        assert!(rendered.contains("error_kind=auth_invalid"));
+        assert!(rendered.contains("last_error_present=true"));
+        assert!(!rendered.contains("super-secret-fingerprint"));
+        assert!(!rendered.contains("Bearer super-secret-token"));
+        assert!(!rendered.contains("model_provider.openai_api_key_secret_ref"));
     }
 }
