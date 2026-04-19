@@ -8,6 +8,9 @@ use std::{
 
 use palyra_common::parse_webhook_payload;
 use palyra_control_plane as control_plane;
+use palyra_safety::{
+    inspect_text, SafetyAction, SafetyContentKind, SafetyPhase, SafetySourceKind, TrustLabel,
+};
 use palyra_vault::{ensure_owner_only_dir, ensure_owner_only_file, Vault, VaultError, VaultRef};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -364,9 +367,25 @@ impl WebhookRegistry {
                 .find(|record| record.integration_id == normalized)
                 .ok_or_else(|| WebhookRegistryError::IntegrationNotFound(normalized.clone()))?;
         let readiness = evaluate_readiness(record, vault);
+        let payload_scan = inspect_text(
+            String::from_utf8_lossy(payload_bytes).as_ref(),
+            SafetyPhase::PrePrompt,
+            SafetySourceKind::Webhook,
+            SafetyContentKind::WebhookPayload,
+            TrustLabel::ExternalUntrusted,
+        );
+        let safety_findings = payload_scan.finding_codes();
+        let safety_blocked = payload_scan.recommended_action == SafetyAction::Block;
+        let safety_requires_review =
+            payload_scan.recommended_action == SafetyAction::RequireApproval;
         let mut issues = Vec::<String>::new();
         if !record.enabled {
             issues.push("integration is disabled".to_owned());
+        }
+        if safety_blocked {
+            issues.push("payload blocked by safety boundary".to_owned());
+        } else if safety_requires_review {
+            issues.push("payload requires safety review before prompt use".to_owned());
         }
 
         let result = match parse_webhook_payload(payload_bytes) {
@@ -405,13 +424,19 @@ impl WebhookRegistry {
                     && source_allowed
                     && event_allowed
                     && max_payload_ok
-                    && (!record.signature_required || signature_present);
+                    && (!record.signature_required || signature_present)
+                    && !safety_blocked
+                    && !safety_requires_review;
                 let outcome = if valid {
                     "accepted"
                 } else if !record.enabled {
                     "disabled"
                 } else if !readiness.is_ready() {
                     "not_ready"
+                } else if safety_blocked {
+                    "safety_blocked"
+                } else if safety_requires_review {
+                    "safety_review_required"
                 } else if record.signature_required && !signature_present {
                     "signature_missing"
                 } else {
@@ -428,6 +453,9 @@ impl WebhookRegistry {
                     outcome: outcome.to_owned(),
                     message,
                     payload_bytes: u32::try_from(payload_bytes.len()).unwrap_or(u32::MAX),
+                    trust_label: payload_scan.trust_label.as_str().to_owned(),
+                    safety_action: payload_scan.recommended_action.as_str().to_owned(),
+                    safety_findings: safety_findings.clone(),
                     event: Some(envelope.event),
                     source: Some(envelope.source),
                     signature_present,
@@ -443,6 +471,9 @@ impl WebhookRegistry {
                     outcome: "invalid_payload".to_owned(),
                     message: issues.join("; "),
                     payload_bytes: u32::try_from(payload_bytes.len()).unwrap_or(u32::MAX),
+                    trust_label: payload_scan.trust_label.as_str().to_owned(),
+                    safety_action: payload_scan.recommended_action.as_str().to_owned(),
+                    safety_findings,
                     event: None,
                     source: None,
                     signature_present: false,
@@ -876,6 +907,8 @@ fn unix_ms_now() -> Result<i64, WebhookRegistryError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use palyra_common::CANONICAL_JSON_ENVELOPE_VERSION;
+    use serde_json::json;
     use tempfile::tempdir;
 
     use palyra_vault::{BackendPreference, VaultConfig, VaultScope};
@@ -960,6 +993,69 @@ mod tests {
         assert!(
             matches!(error, WebhookRegistryError::RegistryLimitExceeded),
             "registry should reject documents above the configured cap: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn webhook_test_integration_surfaces_safety_blocking() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempdir()?;
+        let state_root = temp.path().join("state");
+        let identity_root = state_root.join("identity");
+        fs::create_dir_all(&identity_root)?;
+
+        let registry = WebhookRegistry::open(&state_root)?;
+        let vault = Vault::open_with_config(VaultConfig {
+            root: Some(state_root.join("vault")),
+            identity_store_root: Some(identity_root),
+            backend_preference: BackendPreference::EncryptedFile,
+            ..VaultConfig::default()
+        })?;
+        vault.put_secret(&VaultScope::Global, "github_repo_a", b"super-secret")?;
+
+        registry.set_integration(
+            WebhookIntegrationSetRequest {
+                integration_id: "github_repo_a".to_owned(),
+                provider: "github".to_owned(),
+                display_name: Some("GitHub Repo A".to_owned()),
+                secret_vault_ref: "global/github_repo_a".to_owned(),
+                allowed_events: vec!["push".to_owned()],
+                allowed_sources: vec!["github.repo_a".to_owned()],
+                enabled: true,
+                signature_required: false,
+                max_payload_bytes: DEFAULT_MAX_PAYLOAD_BYTES,
+            },
+            &vault,
+        )?;
+
+        let payload_bytes = serde_json::to_vec(&json!({
+            "v": CANONICAL_JSON_ENVELOPE_VERSION,
+            "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "event": "push",
+            "source": "github.repo_a",
+            "payload": {
+                "body": "Authorization: Bearer super-secret-token-value"
+            },
+            "replay_protection": {
+                "nonce": "01ARZ3NDEKTSV4RRFFQ69G5FAA",
+                "timestamp_unix_ms": unix_ms_now()? as u64
+            }
+        }))?;
+
+        let outcome =
+            registry.test_integration("github_repo_a", payload_bytes.as_slice(), &vault)?;
+        assert!(!outcome.result.valid);
+        assert_eq!(outcome.result.outcome, "safety_blocked");
+        assert_eq!(outcome.result.trust_label, "external_untrusted");
+        assert_eq!(outcome.result.safety_action, "block");
+        assert!(
+            outcome
+                .result
+                .safety_findings
+                .iter()
+                .any(|finding| finding.starts_with("secret_leak.")),
+            "webhook safety findings should surface a secret leak classification"
         );
         Ok(())
     }

@@ -1,7 +1,14 @@
 use std::{sync::Arc, time::Duration};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use palyra_common::{validate_canonical_id, CANONICAL_PROTOCOL_MAJOR};
+use palyra_common::{
+    redaction::{redact_header, redact_url},
+    validate_canonical_id, CANONICAL_PROTOCOL_MAJOR,
+};
+use palyra_safety::{
+    merge_scan_results, redact_text_for_export, ExportRedactionOutcome, SafetyContentKind,
+    SafetyPhase, SafetyScanResult, SafetySourceKind, TrustLabel,
+};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tonic::{Request, Status};
@@ -1044,9 +1051,14 @@ pub(crate) async fn execute_browser_tool(
             match client.get_title(request).await {
                 Ok(response) => {
                     let response = response.into_inner();
+                    let title_export = export_browser_text(
+                        response.title.as_str(),
+                        SafetyContentKind::BrowserTitle,
+                    );
                     let output = json!({
                         "success": response.success,
-                        "title": response.title,
+                        "title": title_export.redacted_text,
+                        "safety": browser_safety_json(&title_export.scan, title_export.redacted),
                         "error": response.error,
                     });
                     (
@@ -1233,15 +1245,45 @@ pub(crate) async fn execute_browser_tool(
             match client.observe(request).await {
                 Ok(response) => {
                     let response = response.into_inner();
+                    let dom_export = export_browser_text(
+                        response.dom_snapshot.as_str(),
+                        SafetyContentKind::BrowserObservation,
+                    );
+                    let accessibility_export = export_browser_text(
+                        response.accessibility_tree.as_str(),
+                        SafetyContentKind::BrowserObservation,
+                    );
+                    let visible_text_export = export_browser_text(
+                        response.visible_text.as_str(),
+                        SafetyContentKind::BrowserObservation,
+                    );
+                    let page_url = redact_url(response.page_url.as_str());
+                    let observation_scan = merge_scan_results(
+                        SafetyPhase::Export,
+                        SafetySourceKind::Browser,
+                        SafetyContentKind::BrowserObservation,
+                        &[
+                            dom_export.scan.clone(),
+                            accessibility_export.scan.clone(),
+                            visible_text_export.scan.clone(),
+                        ],
+                    );
                     let output = json!({
                         "success": response.success,
-                        "dom_snapshot": response.dom_snapshot,
-                        "accessibility_tree": response.accessibility_tree,
-                        "visible_text": response.visible_text,
+                        "dom_snapshot": dom_export.redacted_text,
+                        "accessibility_tree": accessibility_export.redacted_text,
+                        "visible_text": visible_text_export.redacted_text,
                         "dom_truncated": response.dom_truncated,
                         "accessibility_tree_truncated": response.accessibility_tree_truncated,
                         "visible_text_truncated": response.visible_text_truncated,
-                        "page_url": response.page_url,
+                        "page_url": page_url,
+                        "safety": browser_safety_json(
+                            &observation_scan,
+                            dom_export.redacted
+                                || accessibility_export.redacted
+                                || visible_text_export.redacted
+                                || page_url != response.page_url,
+                        ),
                         "error": response.error,
                     });
                     (
@@ -1298,14 +1340,23 @@ pub(crate) async fn execute_browser_tool(
             match client.network_log(request).await {
                 Ok(response) => {
                     let response = response.into_inner();
+                    let exported_entries = response
+                        .entries
+                        .into_iter()
+                        .map(browser_network_log_entry_to_json)
+                        .collect::<Vec<_>>();
+                    let network_scan = merge_browser_value_scans(
+                        SafetyContentKind::BrowserNetwork,
+                        exported_entries.as_slice(),
+                    );
                     let output = json!({
                         "success": response.success,
-                        "entries": response
-                            .entries
-                            .into_iter()
-                            .map(browser_network_log_entry_to_json)
-                            .collect::<Vec<_>>(),
+                        "entries": exported_entries.iter().map(|entry| entry.value.clone()).collect::<Vec<_>>(),
                         "truncated": response.truncated,
+                        "safety": browser_safety_json(
+                            &network_scan,
+                            exported_entries.iter().any(|entry| entry.redacted),
+                        ),
                         "error": response.error,
                     });
                     (
@@ -1379,17 +1430,38 @@ pub(crate) async fn execute_browser_tool(
             match client.console_log(request).await {
                 Ok(response) => {
                     let response = response.into_inner();
+                    let exported_entries = response
+                        .entries
+                        .into_iter()
+                        .map(browser_console_entry_to_json)
+                        .collect::<Vec<_>>();
+                    let page_diagnostics =
+                        response.page_diagnostics.map(browser_page_diagnostics_to_json);
+                    let mut scans =
+                        exported_entries.iter().map(|entry| entry.scan.clone()).collect::<Vec<_>>();
+                    if let Some(diagnostics) = page_diagnostics.as_ref() {
+                        scans.push(diagnostics.scan.clone());
+                    }
+                    let console_scan = if scans.is_empty() {
+                        export_browser_text("", SafetyContentKind::BrowserConsole).scan
+                    } else {
+                        merge_scan_results(
+                            SafetyPhase::Export,
+                            SafetySourceKind::Browser,
+                            SafetyContentKind::BrowserConsole,
+                            scans.as_slice(),
+                        )
+                    };
                     let output = json!({
                         "success": response.success,
-                        "entries": response
-                            .entries
-                            .into_iter()
-                            .map(browser_console_entry_to_json)
-                            .collect::<Vec<_>>(),
+                        "entries": exported_entries.iter().map(|entry| entry.value.clone()).collect::<Vec<_>>(),
                         "truncated": response.truncated,
-                        "page_diagnostics": response
-                            .page_diagnostics
-                            .map(browser_page_diagnostics_to_json),
+                        "page_diagnostics": page_diagnostics.as_ref().map(|value| value.value.clone()),
+                        "safety": browser_safety_json(
+                            &console_scan,
+                            exported_entries.iter().any(|entry| entry.redacted)
+                                || page_diagnostics.as_ref().is_some_and(|value| value.redacted),
+                        ),
                         "error": response.error,
                     });
                     (
@@ -2053,48 +2125,141 @@ fn browser_console_severity_label(value: i32) -> &'static str {
     }
 }
 
-fn browser_console_entry_to_json(entry: browser_v1::BrowserConsoleEntry) -> Value {
+struct BrowserValueExport {
+    value: Value,
+    scan: SafetyScanResult,
+    redacted: bool,
+}
+
+fn export_browser_text(text: &str, content_kind: SafetyContentKind) -> ExportRedactionOutcome {
+    redact_text_for_export(
+        text,
+        SafetySourceKind::Browser,
+        content_kind,
+        TrustLabel::ExternalUntrusted,
+    )
+}
+
+fn browser_safety_json(scan: &SafetyScanResult, redacted: bool) -> Value {
     json!({
-        "severity": browser_console_severity_label(entry.severity),
-        "kind": entry.kind,
-        "message": entry.message,
-        "captured_at_unix_ms": entry.captured_at_unix_ms,
-        "source": entry.source,
-        "stack_trace": entry.stack_trace,
-        "page_url": entry.page_url,
+        "trust_label": scan.trust_label.as_str(),
+        "action": scan.recommended_action.as_str(),
+        "findings": scan.finding_codes(),
+        "redacted": redacted,
     })
 }
 
-fn browser_page_diagnostics_to_json(diagnostics: browser_v1::BrowserPageDiagnostics) -> Value {
-    json!({
-        "page_url": diagnostics.page_url,
-        "page_title": diagnostics.page_title,
-        "console_entry_count": diagnostics.console_entry_count,
-        "warning_count": diagnostics.warning_count,
-        "error_count": diagnostics.error_count,
-        "last_event_unix_ms": diagnostics.last_event_unix_ms,
-    })
+fn merge_browser_value_scans(
+    content_kind: SafetyContentKind,
+    values: &[BrowserValueExport],
+) -> SafetyScanResult {
+    if values.is_empty() {
+        return export_browser_text("", content_kind).scan;
+    }
+    let scans = values.iter().map(|entry| entry.scan.clone()).collect::<Vec<_>>();
+    merge_scan_results(
+        SafetyPhase::Export,
+        SafetySourceKind::Browser,
+        content_kind,
+        scans.as_slice(),
+    )
 }
 
-fn browser_network_log_entry_to_json(entry: browser_v1::NetworkLogEntry) -> Value {
+fn browser_console_entry_to_json(entry: browser_v1::BrowserConsoleEntry) -> BrowserValueExport {
+    let message_export =
+        export_browser_text(entry.message.as_str(), SafetyContentKind::BrowserConsole);
+    let stack_export =
+        export_browser_text(entry.stack_trace.as_str(), SafetyContentKind::BrowserConsole);
+    let page_url = redact_url(entry.page_url.as_str());
+    let combined_scan = export_browser_text(
+        format!(
+            "message={}\nstack_trace={}\npage_url={}",
+            entry.message, entry.stack_trace, entry.page_url
+        )
+        .as_str(),
+        SafetyContentKind::BrowserConsole,
+    );
+    BrowserValueExport {
+        value: json!({
+            "severity": browser_console_severity_label(entry.severity),
+            "kind": entry.kind,
+            "message": message_export.redacted_text,
+            "captured_at_unix_ms": entry.captured_at_unix_ms,
+            "source": entry.source,
+            "stack_trace": stack_export.redacted_text,
+            "page_url": page_url,
+            "safety": browser_safety_json(&combined_scan.scan, combined_scan.redacted),
+        }),
+        scan: combined_scan.scan,
+        redacted: message_export.redacted
+            || stack_export.redacted
+            || combined_scan.redacted
+            || page_url != entry.page_url,
+    }
+}
+
+fn browser_page_diagnostics_to_json(
+    diagnostics: browser_v1::BrowserPageDiagnostics,
+) -> BrowserValueExport {
+    let title_export =
+        export_browser_text(diagnostics.page_title.as_str(), SafetyContentKind::BrowserTitle);
+    let page_url = redact_url(diagnostics.page_url.as_str());
+    BrowserValueExport {
+        value: json!({
+            "page_url": page_url,
+            "page_title": title_export.redacted_text,
+            "console_entry_count": diagnostics.console_entry_count,
+            "warning_count": diagnostics.warning_count,
+            "error_count": diagnostics.error_count,
+            "last_event_unix_ms": diagnostics.last_event_unix_ms,
+            "safety": browser_safety_json(&title_export.scan, title_export.redacted),
+        }),
+        scan: title_export.scan,
+        redacted: title_export.redacted || page_url != diagnostics.page_url,
+    }
+}
+
+fn browser_network_log_entry_to_json(entry: browser_v1::NetworkLogEntry) -> BrowserValueExport {
+    let raw_scan_input = {
+        let mut buffer = String::new();
+        buffer.push_str("request_url=");
+        buffer.push_str(entry.request_url.as_str());
+        for header in &entry.headers {
+            buffer.push('\n');
+            buffer.push_str(header.name.as_str());
+            buffer.push_str(": ");
+            buffer.push_str(header.value.as_str());
+        }
+        buffer
+    };
     let mut headers = entry
         .headers
         .into_iter()
-        .map(|header| json!({ "name": header.name, "value": header.value }))
+        .map(|header| {
+            let redacted_value = redact_header(header.name.as_str(), header.value.as_str());
+            json!({ "name": header.name, "value": redacted_value })
+        })
         .collect::<Vec<_>>();
     headers.sort_by(|left, right| {
         let left_name = left.get("name").and_then(Value::as_str).unwrap_or_default();
         let right_name = right.get("name").and_then(Value::as_str).unwrap_or_default();
         left_name.cmp(right_name)
     });
-    json!({
-        "request_url": entry.request_url,
-        "status_code": entry.status_code,
-        "timing_bucket": entry.timing_bucket,
-        "latency_ms": entry.latency_ms,
-        "captured_at_unix_ms": entry.captured_at_unix_ms,
-        "headers": headers,
-    })
+    let scan = export_browser_text(raw_scan_input.as_str(), SafetyContentKind::BrowserNetwork);
+    let request_url = redact_url(entry.request_url.as_str());
+    BrowserValueExport {
+        value: json!({
+            "request_url": request_url,
+            "status_code": entry.status_code,
+            "timing_bucket": entry.timing_bucket,
+            "latency_ms": entry.latency_ms,
+            "captured_at_unix_ms": entry.captured_at_unix_ms,
+            "headers": headers,
+            "safety": browser_safety_json(&scan.scan, scan.redacted),
+        }),
+        scan: scan.scan,
+        redacted: scan.redacted || request_url != entry.request_url,
+    }
 }
 
 fn browser_tab_to_json(tab: browser_v1::BrowserTab) -> Value {
@@ -2172,5 +2337,49 @@ fn browser_tool_execution_outcome(
             executor: "browser_broker".to_owned(),
             sandbox_enforcement: "browser_service".to_owned(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{browser_console_entry_to_json, browser_network_log_entry_to_json};
+    use crate::transport::grpc::proto::palyra::browser::v1 as browser_v1;
+    use palyra_common::CANONICAL_PROTOCOL_MAJOR;
+
+    #[test]
+    fn console_log_export_redacts_sensitive_message_content() {
+        let exported = browser_console_entry_to_json(browser_v1::BrowserConsoleEntry {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            severity: browser_v1::BrowserDiagnosticSeverity::Error as i32,
+            kind: "exception".to_owned(),
+            message: "Authorization: Bearer super-secret-token-value".to_owned(),
+            captured_at_unix_ms: 42,
+            source: "runtime".to_owned(),
+            stack_trace: "token=super-secret-token-value".to_owned(),
+            page_url: "https://example.test/path?token=abc123".to_owned(),
+        });
+        assert_eq!(exported.value["message"], "Authorization: [REDACTED_SECRET]");
+        assert_eq!(exported.value["safety"]["action"], "redact");
+        assert!(exported.redacted);
+    }
+
+    #[test]
+    fn network_log_export_redacts_sensitive_headers() {
+        let exported = browser_network_log_entry_to_json(browser_v1::NetworkLogEntry {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            request_url: "https://example.test/api?token=abc123".to_owned(),
+            status_code: 200,
+            timing_bucket: "fast".to_owned(),
+            latency_ms: 17,
+            captured_at_unix_ms: 7,
+            headers: vec![browser_v1::NetworkLogHeader {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                name: "Authorization".to_owned(),
+                value: "Bearer super-secret-token-value".to_owned(),
+            }],
+        });
+        assert_eq!(exported.value["headers"][0]["value"], "<redacted>");
+        assert_eq!(exported.value["safety"]["action"], "redact");
+        assert!(exported.redacted);
     }
 }

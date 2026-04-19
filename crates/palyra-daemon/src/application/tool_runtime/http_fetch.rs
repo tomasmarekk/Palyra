@@ -4,10 +4,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use palyra_common::netguard;
+use palyra_common::{netguard, redaction::redact_url};
 use palyra_egress_proxy::{
     CredentialBindingPlan, EgressPolicyVerdict, EgressProxyPolicyService, EgressProxyRequest,
 };
+use palyra_safety::{redact_text_for_export, SafetyContentKind, SafetySourceKind, TrustLabel};
 use palyra_vault::SecretResolver;
 use reqwest::{header::HeaderValue, redirect::Policy, Url};
 use serde_json::{json, Value};
@@ -320,21 +321,19 @@ pub(crate) async fn execute_http_fetch_tool(
             );
         }
     };
-    let resolved_credential_headers = match resolve_credential_bindings(
-        runtime_state,
-        credential_bindings.as_slice(),
-    ) {
-        Ok(value) => value,
-        Err(error) => {
-            return http_fetch_tool_execution_outcome(
-                proposal_id,
-                input_json,
-                false,
-                b"{}".to_vec(),
-                error,
-            );
-        }
-    };
+    let resolved_credential_headers =
+        match resolve_credential_bindings(runtime_state, credential_bindings.as_slice()) {
+            Ok(value) => value,
+            Err(error) => {
+                return http_fetch_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    error,
+                );
+            }
+        };
     let initial_resolved_addrs = initial_egress_verdict.resolved_addresses.clone();
     let mut current_egress_verdict = initial_egress_verdict;
     let mut next_egress_verdict =
@@ -572,16 +571,19 @@ pub(crate) async fn execute_http_fetch_tool(
 
         let status_code = response.status().as_u16();
         let success = response.status().is_success();
+        let body_text = String::from_utf8_lossy(body_bytes.as_slice()).to_string();
+        let body_export = export_http_fetch_body(body_text.as_str());
         let output_json = json!({
-            "url": current_url.as_str(),
+            "url": redact_url(current_url.as_str()),
             "method": method,
             "status_code": status_code,
             "redirects_followed": redirects_followed,
             "content_type": content_type,
             "body_bytes": body_bytes.len(),
-            "body_text": String::from_utf8_lossy(body_bytes.as_slice()).to_string(),
+            "body_text": body_export.body_text,
             "latency_ms": started_at.elapsed().as_millis() as u64,
             "request_headers": redacted_http_headers(request_headers.as_slice()),
+            "safety": body_export.safety_json,
             "egress": {
                 "request_fingerprint_sha256": current_egress_verdict.request_fingerprint_sha256,
                 "reason_code": current_egress_verdict.reason_code,
@@ -708,7 +710,8 @@ fn parse_credential_bindings(
         )
         .map_err(|error| format!("palyra.http.fetch credential_bindings are invalid: {error}")),
         Some(_) => {
-            Err("palyra.http.fetch credential_bindings must be an array of binding objects".to_owned())
+            Err("palyra.http.fetch credential_bindings must be an array of binding objects"
+                .to_owned())
         }
         None => Ok(Vec::new()),
     }
@@ -727,7 +730,12 @@ fn evaluate_http_fetch_egress(
             method,
             url: url.as_str(),
             allow_private_targets,
-            allowed_hosts: runtime_state.config.tool_call.process_runner.allowed_egress_hosts.as_slice(),
+            allowed_hosts: runtime_state
+                .config
+                .tool_call
+                .process_runner
+                .allowed_egress_hosts
+                .as_slice(),
             allowed_dns_suffixes: runtime_state
                 .config
                 .tool_call
@@ -833,8 +841,55 @@ fn http_fetch_tool_execution_outcome(
     }
 }
 
+struct HttpFetchBodyExport {
+    body_text: String,
+    safety_json: Value,
+}
+
+fn export_http_fetch_body(body_text: &str) -> HttpFetchBodyExport {
+    let outcome = redact_text_for_export(
+        body_text,
+        SafetySourceKind::HttpFetch,
+        SafetyContentKind::HttpResponse,
+        TrustLabel::ExternalUntrusted,
+    );
+    HttpFetchBodyExport {
+        body_text: outcome.redacted_text,
+        safety_json: json!({
+            "trust_label": outcome.scan.trust_label.as_str(),
+            "action": outcome.scan.recommended_action.as_str(),
+            "findings": outcome.scan.finding_codes(),
+            "redacted": outcome.redacted,
+        }),
+    }
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::export_http_fetch_body;
+
+    #[test]
+    fn http_fetch_export_redacts_sensitive_body_text() {
+        let exported = export_http_fetch_body("Authorization: Bearer super-secret-token-value");
+        assert_eq!(exported.body_text, "Authorization: [REDACTED_SECRET]");
+        assert_eq!(exported.safety_json["trust_label"], "external_untrusted");
+        assert_eq!(exported.safety_json["action"], "redact");
+        assert!(exported.safety_json["redacted"].as_bool().unwrap_or(false));
+        let findings = exported.safety_json["findings"]
+            .as_array()
+            .expect("findings should serialize as an array")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            findings.contains(&"secret_leak.header.authorization"),
+            "authorization header leak should be reported"
+        );
+    }
 }

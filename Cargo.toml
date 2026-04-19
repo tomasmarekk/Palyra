@@ -15,6 +15,7 @@ members = [
   "crates/palyra-plugins/runtime",
   "crates/palyra-plugins/sdk",
   "crates/palyra-identity",
+  "crates/palyra-safety",
   "crates/palyra-vault",
   "crates/palyra-workerd",
   "crates/palyra-skills",

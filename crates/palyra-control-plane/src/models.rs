@@ -2795,6 +2795,10 @@ pub struct WebhookIntegrationTestResult {
     pub outcome: String,
     pub message: String,
     pub payload_bytes: u32,
+    pub trust_label: String,
+    pub safety_action: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub safety_findings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

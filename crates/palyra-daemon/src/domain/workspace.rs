@@ -1,4 +1,7 @@
 use chrono::{Datelike, Utc};
+use palyra_safety::{
+    inspect_text, SafetyAction, SafetyContentKind, SafetyPhase, SafetySourceKind, TrustLabel,
+};
 use serde::{Deserialize, Serialize};
 
 const WORKSPACE_MAX_PATH_BYTES: usize = 512;
@@ -7,26 +10,6 @@ const WORKSPACE_MAX_CONTENT_BYTES: usize = 128 * 1024;
 const WORKSPACE_ALLOWED_TEXT_EXTENSIONS: &[&str] = &["md", "txt", "json", "yml", "yaml"];
 const WORKSPACE_SENSITIVE_SEGMENTS: &[&str] =
     &[".git", ".ssh", ".aws", "secrets", "secret", "vault", "node_modules", "target"];
-const PROMPT_INJECTION_HIGH_RISK_PATTERNS: &[&str] = &[
-    "ignore previous instructions",
-    "ignore all previous instructions",
-    "reveal the system prompt",
-    "show developer message",
-    "disregard earlier directions",
-    "override the assistant",
-    "exfiltrate secrets",
-    "print secret",
-];
-const PROMPT_INJECTION_WARNING_PATTERNS: &[&str] = &[
-    "system prompt",
-    "developer instructions",
-    "hidden prompt",
-    "ignore instructions",
-    "bypass policy",
-    "leak token",
-    "steal cookie",
-    "disable guardrails",
-];
 const PALYRA_MANAGED_BLOCK_PREFIX: &str = "<!-- PALYRA:BEGIN ";
 const PALYRA_MANAGED_BLOCK_SUFFIX: &str = " -->";
 const PALYRA_MANAGED_BLOCK_END_PREFIX: &str = "<!-- PALYRA:END ";
@@ -483,23 +466,19 @@ pub fn sync_workspace_managed_block(
 
 #[must_use]
 pub fn scan_workspace_content_for_prompt_injection(content: &str) -> WorkspaceRiskScan {
-    let normalized = content.to_ascii_lowercase();
-    let mut reasons = Vec::new();
-    let mut state = WorkspaceRiskState::Clean;
-
-    for pattern in PROMPT_INJECTION_HIGH_RISK_PATTERNS {
-        if normalized.contains(pattern) {
-            state = state.merge(WorkspaceRiskState::Quarantined);
-            reasons.push(format!("high_risk:{pattern}"));
-        }
-    }
-    for pattern in PROMPT_INJECTION_WARNING_PATTERNS {
-        if normalized.contains(pattern) {
-            state = state.merge(WorkspaceRiskState::Warning);
-            reasons.push(format!("warning:{pattern}"));
-        }
-    }
-
+    let safety_scan = inspect_text(
+        content,
+        SafetyPhase::PrePrompt,
+        SafetySourceKind::Workspace,
+        SafetyContentKind::WorkspaceDocument,
+        TrustLabel::TrustedLocal,
+    );
+    let state = match safety_scan.recommended_action {
+        SafetyAction::Allow => WorkspaceRiskState::Clean,
+        SafetyAction::Annotate | SafetyAction::Redact => WorkspaceRiskState::Warning,
+        SafetyAction::RequireApproval | SafetyAction::Block => WorkspaceRiskState::Quarantined,
+    };
+    let reasons = safety_scan.finding_codes();
     WorkspaceRiskScan { state, reasons }
 }
 

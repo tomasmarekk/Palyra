@@ -2999,6 +2999,7 @@ dependencies = [
  "palyra-plugins-runtime",
  "palyra-plugins-sdk",
  "palyra-policy",
+ "palyra-safety",
  "palyra-sandbox",
  "palyra-skills",
  "palyra-transport-quic",
@@ -3089,6 +3090,15 @@ version = "0.1.0"
 dependencies = [
  "cedar-policy",
  "criterion",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "palyra-safety"
+version = "0.1.0"
+dependencies = [
+ "serde",
  "serde_json",
  "thiserror",
 ]

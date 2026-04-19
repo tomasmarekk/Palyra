@@ -4,6 +4,9 @@ use std::{
     sync::Arc,
 };
 
+use palyra_safety::{
+    transform_text_for_prompt, SafetyAction, SafetyContentKind, SafetySourceKind, TrustLabel,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tonic::Status;
@@ -102,6 +105,10 @@ pub(crate) struct ContextEngineSegmentExplain {
     pub(crate) estimated_tokens: u64,
     pub(crate) stable: bool,
     pub(crate) protected: bool,
+    pub(crate) trust_label: TrustLabel,
+    pub(crate) safety_action: SafetyAction,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) safety_findings: Vec<String>,
     pub(crate) group_id: Option<String>,
     pub(crate) preview: String,
 }
@@ -167,6 +174,49 @@ struct ContextSegment {
     stable: bool,
     protected: bool,
     group_id: Option<String>,
+    trust_label: TrustLabel,
+    safety_action: SafetyAction,
+    safety_findings: Vec<String>,
+}
+
+impl ContextSegment {
+    fn trusted(
+        kind: ContextSegmentKind,
+        label: impl Into<String>,
+        content: String,
+        priority: u8,
+        stable: bool,
+        protected: bool,
+        group_id: Option<String>,
+    ) -> Self {
+        Self {
+            kind,
+            label: label.into(),
+            estimated_tokens: estimate_tokens(content.as_str()),
+            content,
+            priority,
+            stable,
+            protected,
+            group_id,
+            trust_label: TrustLabel::TrustedLocal,
+            safety_action: SafetyAction::Allow,
+            safety_findings: Vec::new(),
+        }
+    }
+
+    fn with_safety(
+        mut self,
+        trust_label: TrustLabel,
+        safety_action: SafetyAction,
+        mut safety_findings: Vec<String>,
+    ) -> Self {
+        safety_findings.sort();
+        safety_findings.dedup();
+        self.trust_label = trust_label;
+        self.safety_action = safety_action;
+        self.safety_findings = safety_findings;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -244,16 +294,15 @@ pub(crate) async fn prepare_model_provider_input_with_context_engine(
     {
         push_segment(
             &mut segments,
-            ContextSegment {
-                kind: ContextSegmentKind::PreferenceContext,
-                label: "preference_context".to_owned(),
-                estimated_tokens: estimate_tokens(preference_context.as_str()),
-                content: preference_context,
-                priority: 92,
-                stable: true,
-                protected: true,
-                group_id: None,
-            },
+            ContextSegment::trusted(
+                ContextSegmentKind::PreferenceContext,
+                "preference_context",
+                preference_context,
+                92,
+                true,
+                true,
+                None,
+            ),
         );
     }
 
@@ -264,16 +313,15 @@ pub(crate) async fn prepare_model_provider_input_with_context_engine(
     {
         push_segment(
             &mut segments,
-            ContextSegment {
-                kind: ContextSegmentKind::ProjectContext,
-                label: "project_context".to_owned(),
-                estimated_tokens: estimate_tokens(project_context_block.as_str()),
-                content: project_context_block,
-                priority: 86,
-                stable: true,
-                protected: false,
-                group_id: None,
-            },
+            ContextSegment::trusted(
+                ContextSegmentKind::ProjectContext,
+                "project_context",
+                project_context_block,
+                86,
+                true,
+                false,
+                None,
+            ),
         );
     }
 
@@ -290,23 +338,11 @@ pub(crate) async fn prepare_model_provider_input_with_context_engine(
         push_segment(&mut segments, segment);
     }
 
-    if let Some(context_reference_block) =
+    if let Some(context_reference_segment) =
         build_context_reference_segment(runtime_state, run_id, tape_seq, parameter_delta_json)
             .await?
     {
-        push_segment(
-            &mut segments,
-            ContextSegment {
-                kind: ContextSegmentKind::ContextReferences,
-                label: "context_references".to_owned(),
-                estimated_tokens: estimate_tokens(context_reference_block.as_str()),
-                content: context_reference_block,
-                priority: 96,
-                stable: false,
-                protected: true,
-                group_id: None,
-            },
-        );
+        push_segment(&mut segments, context_reference_segment);
     }
 
     if let Some(attachment_recall_block) =
@@ -314,18 +350,28 @@ pub(crate) async fn prepare_model_provider_input_with_context_engine(
             .await?
             .and_then(clean_segment_content)
     {
+        let transformed = transform_text_for_prompt(
+            attachment_recall_block.as_str(),
+            SafetySourceKind::AttachmentRecall,
+            SafetyContentKind::AttachmentRecall,
+            TrustLabel::ExternalUntrusted,
+        );
         push_segment(
             &mut segments,
-            ContextSegment {
-                kind: ContextSegmentKind::AttachmentRecall,
-                label: "attachment_recall".to_owned(),
-                estimated_tokens: estimate_tokens(attachment_recall_block.as_str()),
-                content: attachment_recall_block,
-                priority: 88,
-                stable: false,
-                protected: false,
-                group_id: None,
-            },
+            ContextSegment::trusted(
+                ContextSegmentKind::AttachmentRecall,
+                "attachment_recall",
+                transformed.transformed_text,
+                88,
+                false,
+                false,
+                None,
+            )
+            .with_safety(
+                transformed.scan.trust_label,
+                transformed.scan.recommended_action,
+                transformed.scan.finding_codes(),
+            ),
         );
     }
 
@@ -343,16 +389,15 @@ pub(crate) async fn prepare_model_provider_input_with_context_engine(
     if let Some(block) = explicit_recall_block.clone() {
         push_segment(
             &mut segments,
-            ContextSegment {
-                kind: ContextSegmentKind::ExplicitRecall,
-                label: "explicit_recall".to_owned(),
-                estimated_tokens: estimate_tokens(block.as_str()),
-                content: block,
-                priority: 90,
-                stable: false,
-                protected: false,
-                group_id: None,
-            },
+            ContextSegment::trusted(
+                ContextSegmentKind::ExplicitRecall,
+                "explicit_recall",
+                block,
+                90,
+                false,
+                false,
+                None,
+            ),
         );
     }
 
@@ -371,16 +416,15 @@ pub(crate) async fn prepare_model_provider_input_with_context_engine(
         {
             Ok(Some(memory_block)) => push_segment(
                 &mut segments,
-                ContextSegment {
-                    kind: ContextSegmentKind::MemoryRecall,
-                    label: "memory_auto_inject".to_owned(),
-                    estimated_tokens: estimate_tokens(memory_block.as_str()),
-                    content: memory_block,
-                    priority: 72,
-                    stable: false,
-                    protected: false,
-                    group_id: None,
-                },
+                ContextSegment::trusted(
+                    ContextSegmentKind::MemoryRecall,
+                    "memory_auto_inject",
+                    memory_block,
+                    72,
+                    false,
+                    false,
+                    None,
+                ),
             ),
             Ok(None) => {}
             Err(error) => match memory_prompt_failure_mode {
@@ -405,31 +449,29 @@ pub(crate) async fn prepare_model_provider_input_with_context_engine(
     ) {
         push_segment(
             &mut segments,
-            ContextSegment {
-                kind: ContextSegmentKind::SessionTail,
-                label: "recent_conversation".to_owned(),
-                estimated_tokens: estimate_tokens(previous_run_context_block.as_str()),
-                content: previous_run_context_block,
-                priority: 84,
-                stable: false,
-                protected: true,
-                group_id: None,
-            },
+            ContextSegment::trusted(
+                ContextSegmentKind::SessionTail,
+                "recent_conversation",
+                previous_run_context_block,
+                84,
+                false,
+                true,
+                None,
+            ),
         );
     }
 
     push_segment(
         &mut segments,
-        ContextSegment {
-            kind: ContextSegmentKind::UserInput,
-            label: "user_input".to_owned(),
-            estimated_tokens: estimate_tokens(normalized_input_text.as_str()),
-            content: normalized_input_text.clone(),
-            priority: 100,
-            stable: false,
-            protected: true,
-            group_id: None,
-        },
+        ContextSegment::trusted(
+            ContextSegmentKind::UserInput,
+            "user_input",
+            normalized_input_text.clone(),
+            100,
+            false,
+            true,
+            None,
+        ),
     );
 
     let strategy = select_strategy(
@@ -561,16 +603,12 @@ fn assemble_segments(
         }
         format!("{:016x}", hasher.finish())
     });
-    let trust_scope = if selected.iter().any(|entry| {
-        matches!(
-            entry.segment.kind,
-            ContextSegmentKind::AttachmentRecall | ContextSegmentKind::ContextReferences
-        )
-    }) {
-        "mixed".to_owned()
-    } else {
-        "trusted".to_owned()
-    };
+    let trust_scope =
+        if selected.iter().any(|entry| entry.segment.trust_label != TrustLabel::TrustedLocal) {
+            "mixed".to_owned()
+        } else {
+            "trusted".to_owned()
+        };
     let cache_scope_key = stable_prefix_hash.as_ref().map(|hash| {
         format!(
             "session={session_id};principal={};channel={};strategy={};trust={trust_scope};prefix={hash}",
@@ -611,6 +649,9 @@ fn assemble_segments(
                     estimated_tokens: entry.segment.estimated_tokens,
                     stable: entry.segment.stable,
                     protected: entry.segment.protected,
+                    trust_label: entry.segment.trust_label,
+                    safety_action: entry.segment.safety_action,
+                    safety_findings: entry.segment.safety_findings.clone(),
                     group_id: entry.segment.group_id.clone(),
                     preview: preview_text(entry.segment.content.as_str(), SEGMENT_PREVIEW_CHARS),
                 })
@@ -718,21 +759,20 @@ async fn collect_compaction_context_decision(
     );
     let checkpoint_segment = latest_checkpoint_segment(checkpoints.as_slice(), Some(&artifact));
     let segment = match quality.verdict.as_str() {
-        "allow" => Some(ContextSegment {
-            kind: ContextSegmentKind::SessionCompactionSummary,
-            label: "session_compaction_summary".to_owned(),
-            estimated_tokens: estimate_tokens(artifact.summary_text.as_str()),
-            content: crate::application::session_compaction::render_compaction_prompt_block(
+        "allow" => Some(ContextSegment::trusted(
+            ContextSegmentKind::SessionCompactionSummary,
+            "session_compaction_summary",
+            crate::application::session_compaction::render_compaction_prompt_block(
                 artifact.artifact_id.as_str(),
                 artifact.mode.as_str(),
                 artifact.trigger_reason.as_str(),
                 artifact.summary_text.as_str(),
             ),
-            priority: 82,
-            stable: true,
-            protected: false,
-            group_id: None,
-        }),
+            82,
+            true,
+            false,
+            None,
+        )),
         "fallback" | "reject" => checkpoint_segment,
         _ => None,
     };
@@ -776,16 +816,15 @@ fn latest_checkpoint_segment(
         block.push_str(format!("workspace_paths={}\n", workspace_paths.join(",")).as_str());
     }
     block.push_str("</session_checkpoint>");
-    Some(ContextSegment {
-        kind: ContextSegmentKind::CheckpointSummary,
-        label: "checkpoint_summary".to_owned(),
-        estimated_tokens: estimate_tokens(block.as_str()),
-        content: block,
-        priority: 80,
-        stable: true,
-        protected: false,
-        group_id: None,
-    })
+    Some(ContextSegment::trusted(
+        ContextSegmentKind::CheckpointSummary,
+        "checkpoint_summary",
+        block,
+        80,
+        true,
+        false,
+        None,
+    ))
 }
 
 fn evaluate_summary_quality(
@@ -880,7 +919,7 @@ async fn build_context_reference_segment(
     run_id: &str,
     tape_seq: &mut i64,
     parameter_delta_json: Option<&str>,
-) -> Result<Option<String>, Status> {
+) -> Result<Option<ContextSegment>, Status> {
     let preview = parse_context_reference_preview(parameter_delta_json);
     let Some(preview) = preview else {
         return Ok(None);
@@ -897,6 +936,9 @@ async fn build_context_reference_segment(
             payload_json: json!({
                 "clean_prompt": preview.clean_prompt,
                 "total_estimated_tokens": preview.total_estimated_tokens,
+                "trust_label": preview.trust_label.as_str(),
+                "safety_action": preview.safety_action.as_str(),
+                "safety_findings": preview.safety_findings,
                 "warnings": preview.warnings,
                 "errors": preview.errors,
                 "references": preview.references.iter().map(|reference| {
@@ -905,6 +947,9 @@ async fn build_context_reference_segment(
                         "kind": reference.kind.as_str(),
                         "target": reference.display_target,
                         "estimated_tokens": reference.estimated_tokens,
+                        "trust_label": reference.trust_label.as_str(),
+                        "safety_action": reference.safety_action.as_str(),
+                        "safety_findings": reference.safety_findings,
                         "warnings": reference.warnings,
                         "provenance": reference.provenance,
                     })
@@ -914,7 +959,33 @@ async fn build_context_reference_segment(
         })
         .await?;
     *tape_seq = tape_seq.saturating_add(1);
-    Ok(render_context_reference_block(&preview).and_then(clean_segment_content))
+    let Some(rendered_block) = render_context_reference_block(&preview) else {
+        return Ok(None);
+    };
+    let transformed = transform_text_for_prompt(
+        rendered_block.as_str(),
+        SafetySourceKind::ContextReference,
+        SafetyContentKind::ContextReference,
+        preview.trust_label,
+    );
+    let mut safety_findings = preview.safety_findings;
+    safety_findings.extend(transformed.scan.finding_codes());
+    Ok(clean_segment_content(transformed.transformed_text).map(|content| {
+        ContextSegment::trusted(
+            ContextSegmentKind::ContextReferences,
+            "context_references",
+            content,
+            96,
+            false,
+            true,
+            None,
+        )
+        .with_safety(
+            preview.trust_label,
+            preview.safety_action.max(transformed.scan.recommended_action),
+            safety_findings,
+        )
+    }))
 }
 
 fn parse_context_reference_preview(
@@ -994,6 +1065,7 @@ mod tests {
         ContextSegmentKind, ProviderContextBudget, SummaryQualityGateExplain,
     };
     use crate::transport::grpc::auth::RequestContext;
+    use palyra_safety::{SafetyAction, TrustLabel};
     use serde_json::json;
 
     fn segment(
@@ -1005,16 +1077,36 @@ mod tests {
         protected: bool,
         group_id: Option<&str>,
     ) -> ContextSegment {
-        ContextSegment {
+        let mut segment = ContextSegment::trusted(
             kind,
-            label: label.to_owned(),
-            content: label.to_owned(),
-            estimated_tokens,
+            label,
+            label.to_owned(),
             priority,
             stable,
             protected,
-            group_id: group_id.map(ToOwned::to_owned),
-        }
+            group_id.map(ToOwned::to_owned),
+        );
+        segment.estimated_tokens = estimated_tokens;
+        segment
+    }
+
+    fn segment_with_safety(
+        kind: ContextSegmentKind,
+        label: &str,
+        estimated_tokens: u64,
+        priority: u8,
+        stable: bool,
+        protected: bool,
+        group_id: Option<&str>,
+        trust_label: TrustLabel,
+        safety_action: SafetyAction,
+        safety_findings: &[&str],
+    ) -> ContextSegment {
+        segment(kind, label, estimated_tokens, priority, stable, protected, group_id).with_safety(
+            trust_label,
+            safety_action,
+            safety_findings.iter().map(|value| (*value).to_owned()).collect(),
+        )
     }
 
     #[test]
@@ -1120,7 +1212,7 @@ mod tests {
                     true,
                     None,
                 ),
-                segment(
+                segment_with_safety(
                     ContextSegmentKind::ContextReferences,
                     "focused files",
                     48,
@@ -1128,6 +1220,9 @@ mod tests {
                     false,
                     true,
                     None,
+                    TrustLabel::ExternalUntrusted,
+                    SafetyAction::Annotate,
+                    &["prompt_injection.ignore_previous_instructions"],
                 ),
                 segment(ContextSegmentKind::UserInput, "ship it", 24, 100, false, true, None),
             ],
@@ -1178,6 +1273,8 @@ mod tests {
                         "estimated_tokens": 64,
                         "stable": true,
                         "protected": true,
+                        "trust_label": "trusted_local",
+                        "safety_action": "allow",
                         "group_id": null,
                         "preview": "stable policy"
                     },
@@ -1187,6 +1284,9 @@ mod tests {
                         "estimated_tokens": 48,
                         "stable": false,
                         "protected": true,
+                        "trust_label": "external_untrusted",
+                        "safety_action": "annotate",
+                        "safety_findings": ["prompt_injection.ignore_previous_instructions"],
                         "group_id": null,
                         "preview": "focused files"
                     },
@@ -1196,6 +1296,8 @@ mod tests {
                         "estimated_tokens": 24,
                         "stable": false,
                         "protected": true,
+                        "trust_label": "trusted_local",
+                        "safety_action": "allow",
                         "group_id": null,
                         "preview": "ship it"
                     }

@@ -9,6 +9,10 @@ use palyra_common::context_references::{
     parse_context_references, ContextReferenceKind, ContextReferenceParseError,
     ContextReferenceParseResult, ParsedContextReference,
 };
+use palyra_common::redaction::redact_url;
+use palyra_safety::{
+    inspect_text, SafetyAction, SafetyContentKind, SafetyPhase, SafetySourceKind, TrustLabel,
+};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -56,6 +60,10 @@ pub(crate) struct ResolvedContextReference {
     pub(crate) estimated_tokens: usize,
     pub(crate) warnings: Vec<String>,
     pub(crate) provenance: Vec<ContextReferenceProvenance>,
+    pub(crate) trust_label: TrustLabel,
+    pub(crate) safety_action: SafetyAction,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) safety_findings: Vec<String>,
     pub(crate) preview_text: String,
     pub(crate) resolved_text: String,
 }
@@ -65,6 +73,10 @@ pub(crate) struct ContextReferencePreviewEnvelope {
     pub(crate) clean_prompt: String,
     pub(crate) references: Vec<ResolvedContextReference>,
     pub(crate) total_estimated_tokens: usize,
+    pub(crate) trust_label: TrustLabel,
+    pub(crate) safety_action: SafetyAction,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) safety_findings: Vec<String>,
     pub(crate) warnings: Vec<String>,
     pub(crate) errors: Vec<ContextReferenceParseError>,
 }
@@ -115,6 +127,13 @@ pub(crate) async fn preview_context_references(
         .await?;
         resolved_references.push(resolved);
     }
+    let trust_label = aggregate_reference_trust_label(&resolved_references);
+    let safety_action = resolved_references
+        .iter()
+        .map(|reference| reference.safety_action)
+        .max()
+        .unwrap_or(SafetyAction::Allow);
+    let safety_findings = aggregate_reference_findings(&resolved_references);
 
     Ok(ContextReferencePreviewEnvelope {
         clean_prompt: clean_text,
@@ -123,6 +142,9 @@ pub(crate) async fn preview_context_references(
             .map(|reference| reference.estimated_tokens)
             .sum(),
         references: resolved_references,
+        trust_label,
+        safety_action,
+        safety_findings,
         warnings,
         errors,
     })
@@ -149,6 +171,21 @@ pub(crate) fn render_context_reference_block(
         if !reference.warnings.is_empty() {
             block.push_str("warnings=");
             block.push_str(reference.warnings.join(" | ").as_str());
+            block.push('\n');
+        }
+        if reference.trust_label != TrustLabel::TrustedLocal {
+            block.push_str(
+                format!(
+                    "trust_label={} safety_action={}\n",
+                    reference.trust_label.as_str(),
+                    reference.safety_action.as_str(),
+                )
+                .as_str(),
+            );
+        }
+        if !reference.safety_findings.is_empty() {
+            block.push_str("safety_findings=");
+            block.push_str(reference.safety_findings.join(" | ").as_str());
             block.push('\n');
         }
         block.push_str(reference.resolved_text.trim());
@@ -402,15 +439,16 @@ async fn resolve_url_reference(
     let body_text =
         response_json.get("body_text").and_then(Value::as_str).unwrap_or_default().to_owned();
     let body_text = consume_reference_budget(body_text, total_chars, &mut warnings);
+    let redacted_target = redact_url(target.as_str());
     build_resolved_reference(
         reference,
         index,
-        target.clone(),
+        redacted_target.clone(),
         body_text,
         warnings,
         vec![ContextReferenceProvenance {
             kind: "url".to_owned(),
-            location: parsed_url.to_string(),
+            location: redacted_target,
             note: format!("Fetched via palyra.http.fetch ({content_type})."),
         }],
     )
@@ -503,6 +541,16 @@ fn build_resolved_reference(
     warnings: Vec<String>,
     provenance: Vec<ContextReferenceProvenance>,
 ) -> Result<ResolvedContextReference, Status> {
+    let trust_label = trust_label_for_reference_kind(reference.kind);
+    let safety_scan = inspect_text(
+        resolved_text.as_str(),
+        SafetyPhase::PrePrompt,
+        SafetySourceKind::ContextReference,
+        SafetyContentKind::ContextReference,
+        trust_label,
+    );
+    let safety_action = safety_scan.recommended_action;
+    let safety_findings = safety_scan.finding_codes();
     Ok(ResolvedContextReference {
         reference_id: format!("ref-{}", index + 1),
         kind: reference.kind,
@@ -516,10 +564,54 @@ fn build_resolved_reference(
             resolved_text.replace(['\r', '\n'], " "),
             MAX_PREVIEW_TEXT_CHARS,
         ),
+        trust_label,
+        safety_action,
+        safety_findings,
         resolved_text,
         warnings,
         provenance,
     })
+}
+
+fn trust_label_for_reference_kind(kind: ContextReferenceKind) -> TrustLabel {
+    match kind {
+        ContextReferenceKind::Url => TrustLabel::ExternalUntrusted,
+        ContextReferenceKind::File
+        | ContextReferenceKind::Folder
+        | ContextReferenceKind::Diff
+        | ContextReferenceKind::Staged
+        | ContextReferenceKind::Memory => TrustLabel::TrustedLocal,
+    }
+}
+
+fn aggregate_reference_trust_label(references: &[ResolvedContextReference]) -> TrustLabel {
+    let mut saw_trusted = false;
+    let mut saw_external = false;
+    let mut saw_mixed = false;
+    for reference in references {
+        match reference.trust_label {
+            TrustLabel::TrustedLocal => saw_trusted = true,
+            TrustLabel::ExternalUntrusted => saw_external = true,
+            TrustLabel::Mixed => saw_mixed = true,
+        }
+    }
+    if saw_mixed || (saw_trusted && saw_external) {
+        TrustLabel::Mixed
+    } else if saw_external {
+        TrustLabel::ExternalUntrusted
+    } else {
+        TrustLabel::TrustedLocal
+    }
+}
+
+fn aggregate_reference_findings(references: &[ResolvedContextReference]) -> Vec<String> {
+    let mut findings = references
+        .iter()
+        .flat_map(|reference| reference.safety_findings.iter().cloned())
+        .collect::<Vec<_>>();
+    findings.sort();
+    findings.dedup();
+    findings
 }
 
 fn consume_reference_budget(
@@ -807,6 +899,9 @@ mod tests {
         let preview = ContextReferencePreviewEnvelope {
             clean_prompt: "Summarize the referenced files.".to_owned(),
             total_estimated_tokens: 64,
+            trust_label: palyra_safety::TrustLabel::TrustedLocal,
+            safety_action: palyra_safety::SafetyAction::Allow,
+            safety_findings: Vec::new(),
             warnings: Vec::new(),
             errors: Vec::new(),
             references: vec![ResolvedContextReference {
@@ -824,6 +919,9 @@ mod tests {
                     location: "/tmp/README.md".to_owned(),
                     note: "fixture".to_owned(),
                 }],
+                trust_label: palyra_safety::TrustLabel::TrustedLocal,
+                safety_action: palyra_safety::SafetyAction::Allow,
+                safety_findings: Vec::new(),
                 preview_text: "README preview".to_owned(),
                 resolved_text: "<reference_file path=\"README.md\">README</reference_file>"
                     .to_owned(),
