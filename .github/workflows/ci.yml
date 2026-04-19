@@ -120,6 +120,21 @@ jobs:
       - name: Run deterministic core suite
         run: bash scripts/test/run-deterministic-core.sh
 
+  critical-attack-scenarios:
+    name: Critical attack scenarios
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust-toolchain
+        with:
+          toolchain: 1.91.0
+
+      - name: Run critical attack scenarios
+        run: bash scripts/test/run-critical-attack-scenarios.sh
+
   workflow-regression:
     name: Workflow regression matrix
     runs-on: ubuntu-latest

@@ -3038,6 +3038,7 @@ dependencies = [
  "palyra-common",
  "reqwest",
  "serde",
+ "serde_json",
  "sha2 0.11.0",
  "thiserror",
 ]
@@ -3174,6 +3175,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "serde",
+ "serde_json",
  "thiserror",
  "ulid",
 ]

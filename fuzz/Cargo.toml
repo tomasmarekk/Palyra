@@ -13,6 +13,7 @@ palyra-a2ui = { path = "../crates/palyra-a2ui" }
 palyra-auth = { path = "../crates/palyra-auth" }
 palyra-common = { path = "../crates/palyra-common" }
 palyra-connectors = { path = "../crates/palyra-connectors" }
+palyra-safety = { path = "../crates/palyra-safety" }
 serde_json = "1"
 
 [[bin]]
@@ -74,6 +75,13 @@ bench = false
 [[bin]]
 name = "webhook_replay_verifier"
 path = "fuzz_targets/webhook_replay_verifier.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "safety_boundary_transform"
+path = "fuzz_targets/safety_boundary_transform.rs"
 test = false
 doc = false
 bench = false
