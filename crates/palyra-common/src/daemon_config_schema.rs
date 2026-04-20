@@ -117,6 +117,14 @@ pub struct RootFileConfig {
     pub gateway: Option<FileGatewayConfig>,
     pub gateway_access: Option<FileGatewayAccessConfig>,
     pub feature_rollouts: Option<FileFeatureRolloutsConfig>,
+    pub session_queue_policy: Option<FileSessionQueuePolicyConfig>,
+    pub pruning_policy_matrix: Option<FilePruningPolicyMatrixConfig>,
+    pub retrieval_dual_path: Option<FileRetrievalDualPathConfig>,
+    pub auxiliary_executor: Option<FileAuxiliaryExecutorConfig>,
+    pub flow_orchestration: Option<FileFlowOrchestrationConfig>,
+    pub delivery_arbitration: Option<FileDeliveryArbitrationConfig>,
+    pub replay_capture: Option<FileReplayCaptureConfig>,
+    pub networked_workers: Option<FileNetworkedWorkersConfig>,
     pub cron: Option<FileCronConfig>,
     pub orchestrator: Option<FileOrchestratorConfig>,
     pub memory: Option<FileMemoryConfig>,
@@ -188,6 +196,78 @@ pub struct FileFeatureRolloutsConfig {
     pub execution_backend_ssh_tunnel: Option<bool>,
     pub safety_boundary: Option<bool>,
     pub execution_gate_pipeline_v2: Option<bool>,
+    pub session_queue_policy: Option<bool>,
+    pub pruning_policy_matrix: Option<bool>,
+    pub retrieval_dual_path: Option<bool>,
+    pub auxiliary_executor: Option<bool>,
+    pub flow_orchestration: Option<bool>,
+    pub delivery_arbitration: Option<bool>,
+    pub replay_capture: Option<bool>,
+    pub networked_workers: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileSessionQueuePolicyConfig {
+    pub mode: Option<String>,
+    pub max_depth: Option<u64>,
+    pub merge_window_ms: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FilePruningPolicyMatrixConfig {
+    pub mode: Option<String>,
+    pub manual_apply_enabled: Option<bool>,
+    pub min_token_savings: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileRetrievalDualPathConfig {
+    pub mode: Option<String>,
+    pub branch_timeout_ms: Option<u64>,
+    pub prompt_budget_tokens: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileAuxiliaryExecutorConfig {
+    pub mode: Option<String>,
+    pub max_tasks_per_session: Option<u64>,
+    pub default_budget_tokens: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileFlowOrchestrationConfig {
+    pub mode: Option<String>,
+    pub cancellation_gate_enabled: Option<bool>,
+    pub max_retry_count: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileDeliveryArbitrationConfig {
+    pub mode: Option<String>,
+    pub descendant_preference: Option<bool>,
+    pub suppression_limit: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileReplayCaptureConfig {
+    pub mode: Option<String>,
+    pub capture_runtime_decisions: Option<bool>,
+    pub max_events_per_run: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileNetworkedWorkersConfig {
+    pub mode: Option<String>,
+    pub lease_ttl_ms: Option<u64>,
+    pub require_attestation: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -737,6 +817,14 @@ mod tests {
             execution_backend_ssh_tunnel = true
             safety_boundary = true
             execution_gate_pipeline_v2 = false
+            session_queue_policy = true
+            pruning_policy_matrix = false
+            retrieval_dual_path = true
+            auxiliary_executor = true
+            flow_orchestration = false
+            delivery_arbitration = true
+            replay_capture = true
+            networked_workers = false
             "#,
         )
         .expect("feature_rollouts section should parse");
@@ -750,5 +838,98 @@ mod tests {
         assert_eq!(feature_rollouts.execution_backend_ssh_tunnel, Some(true));
         assert_eq!(feature_rollouts.safety_boundary, Some(true));
         assert_eq!(feature_rollouts.execution_gate_pipeline_v2, Some(false));
+        assert_eq!(feature_rollouts.session_queue_policy, Some(true));
+        assert_eq!(feature_rollouts.pruning_policy_matrix, Some(false));
+        assert_eq!(feature_rollouts.retrieval_dual_path, Some(true));
+        assert_eq!(feature_rollouts.auxiliary_executor, Some(true));
+        assert_eq!(feature_rollouts.flow_orchestration, Some(false));
+        assert_eq!(feature_rollouts.delivery_arbitration, Some(true));
+        assert_eq!(feature_rollouts.replay_capture, Some(true));
+        assert_eq!(feature_rollouts.networked_workers, Some(false));
+    }
+
+    #[test]
+    fn runtime_preview_sections_parse_expected_fields() {
+        let parsed: RootFileConfig = toml::from_str(
+            r#"
+            [session_queue_policy]
+            mode = "preview_only"
+            max_depth = 12
+            merge_window_ms = 2500
+
+            [pruning_policy_matrix]
+            mode = "enabled"
+            manual_apply_enabled = true
+            min_token_savings = 256
+
+            [retrieval_dual_path]
+            mode = "preview_only"
+            branch_timeout_ms = 2200
+            prompt_budget_tokens = 2048
+
+            [auxiliary_executor]
+            mode = "preview_only"
+            max_tasks_per_session = 4
+            default_budget_tokens = 1536
+
+            [flow_orchestration]
+            mode = "enabled"
+            cancellation_gate_enabled = true
+            max_retry_count = 2
+
+            [delivery_arbitration]
+            mode = "disabled"
+            descendant_preference = true
+            suppression_limit = 3
+
+            [replay_capture]
+            mode = "preview_only"
+            capture_runtime_decisions = true
+            max_events_per_run = 96
+
+            [networked_workers]
+            mode = "preview_only"
+            lease_ttl_ms = 900000
+            require_attestation = true
+            "#,
+        )
+        .expect("runtime preview sections should parse");
+
+        assert_eq!(
+            parsed.session_queue_policy.as_ref().and_then(|value| value.mode.as_deref()),
+            Some("preview_only")
+        );
+        assert_eq!(
+            parsed.session_queue_policy.as_ref().and_then(|value| value.max_depth),
+            Some(12)
+        );
+        assert_eq!(
+            parsed.pruning_policy_matrix.as_ref().and_then(|value| value.min_token_savings),
+            Some(256)
+        );
+        assert_eq!(
+            parsed.retrieval_dual_path.as_ref().and_then(|value| value.prompt_budget_tokens),
+            Some(2048)
+        );
+        assert_eq!(
+            parsed.auxiliary_executor.as_ref().and_then(|value| value.default_budget_tokens),
+            Some(1536)
+        );
+        assert_eq!(
+            parsed.flow_orchestration.as_ref().and_then(|value| value.max_retry_count),
+            Some(2)
+        );
+        assert_eq!(
+            parsed.delivery_arbitration.as_ref().and_then(|value| value.suppression_limit),
+            Some(3)
+        );
+        assert_eq!(
+            parsed.replay_capture.as_ref().and_then(|value| value.max_events_per_run),
+            Some(96)
+        );
+        assert_eq!(
+            parsed.networked_workers.as_ref().and_then(|value| value.lease_ttl_ms),
+            Some(900000)
+        );
     }
 }

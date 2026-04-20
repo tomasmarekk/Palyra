@@ -143,6 +143,33 @@ fn build_current_state_inventory_snapshot(
         compat_route_probe(harness, Method::POST, "/v1/responses")?,
         compat_route_probe(harness, Method::POST, "/v1/tools/invoke")?,
     ];
+    let mut runtime_controls = diagnostics
+        .get("runtime_controls")
+        .and_then(Value::as_object)
+        .context("diagnostics should expose runtime_controls object")?
+        .clone();
+    let runtime_control_capabilities = runtime_controls
+        .remove("capabilities")
+        .and_then(|value| value.as_array().cloned())
+        .context("runtime_controls should expose capabilities array")?;
+    let mut runtime_control_capabilities = runtime_control_capabilities
+        .into_iter()
+        .map(|entry| {
+            json!({
+                "capability": entry.get("capability").cloned().unwrap_or(Value::Null),
+                "mode": entry.get("mode").cloned().unwrap_or(Value::Null),
+                "effective_state": entry.get("effective_state").cloned().unwrap_or(Value::Null),
+                "rollout_enabled": entry.get("rollout_enabled").cloned().unwrap_or(Value::Null),
+                "rollout_source": entry.get("rollout_source").cloned().unwrap_or(Value::Null),
+                "activation_blockers": entry.get("activation_blockers").cloned().unwrap_or(Value::Null),
+            })
+        })
+        .collect::<Vec<_>>();
+    runtime_control_capabilities.sort_by(|left, right| {
+        left.get("capability")
+            .and_then(Value::as_str)
+            .cmp(&right.get("capability").and_then(Value::as_str))
+    });
 
     Ok(json!({
         "contract": capability_catalog.get("contract").cloned().unwrap_or(Value::Null),
@@ -151,6 +178,23 @@ fn build_current_state_inventory_snapshot(
         "capabilities": capabilities,
         "migration_notes": capability_catalog.get("migration_notes").cloned().unwrap_or(Value::Null),
         "feature_rollouts": diagnostics.get("feature_rollouts").cloned().unwrap_or(Value::Null),
+        "runtime_controls": {
+            "schema_version": runtime_controls.remove("schema_version").unwrap_or(Value::Null),
+            "state": runtime_controls.remove("state").unwrap_or(Value::Null),
+            "preview_capabilities": runtime_controls
+                .remove("preview_capabilities")
+                .unwrap_or(Value::Null),
+            "enabled_capabilities": runtime_controls
+                .remove("enabled_capabilities")
+                .unwrap_or(Value::Null),
+            "blocked_capabilities": runtime_controls
+                .remove("blocked_capabilities")
+                .unwrap_or(Value::Null),
+            "disabled_capabilities": runtime_controls
+                .remove("disabled_capabilities")
+                .unwrap_or(Value::Null),
+            "capabilities": runtime_control_capabilities,
+        },
         "execution_backend_preferences": ["automatic", "local_sandbox", "desktop_node", "networked_worker", "ssh_tunnel"],
         "execution_backends": execution_backends,
         "compat_routes": compat_routes,

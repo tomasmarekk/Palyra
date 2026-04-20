@@ -2,7 +2,7 @@
 //! auxiliary tasks, and worker lifecycle reporting.
 //!
 //! Design note:
-//! - These enums define the canonical wire names that Phase 1 stabilizes before
+//! - These enums define the canonical wire names that runtime preview stabilizes before
 //!   queue, retrieval, flow, and worker business logic is expanded.
 //! - Backward-compatible aliases keep persisted records and existing UI payloads
 //!   readable while new surfaces emit only the canonical forms.
@@ -273,7 +273,7 @@ mod tests {
     }
 
     #[test]
-    fn future_phase_contracts_expose_expected_canonical_names() {
+    fn extended_runtime_contracts_expose_expected_canonical_names() {
         assert_eq!(PruningPolicyClass::Balanced.as_str(), "balanced");
         assert_eq!(AuxiliaryTaskKind::PostRunReflection.as_str(), "post_run_reflection");
         assert_eq!(DeliveryPolicy::PreferTerminalDescendant.as_str(), "prefer_terminal_descendant");

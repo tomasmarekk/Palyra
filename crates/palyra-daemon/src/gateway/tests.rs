@@ -220,6 +220,14 @@ fn build_test_runtime_state_with_runtime_overrides(
             max_tape_entries_per_response: 1_000,
             max_tape_bytes_per_response: 2 * 1024 * 1024,
             feature_rollouts,
+            session_queue_policy: crate::config::SessionQueuePolicyConfig::default(),
+            pruning_policy_matrix: crate::config::PruningPolicyMatrixConfig::default(),
+            retrieval_dual_path: crate::config::RetrievalDualPathConfig::default(),
+            auxiliary_executor: crate::config::AuxiliaryExecutorConfig::default(),
+            flow_orchestration: crate::config::FlowOrchestrationConfig::default(),
+            delivery_arbitration: crate::config::DeliveryArbitrationConfig::default(),
+            replay_capture: crate::config::ReplayCaptureConfig::default(),
+            networked_workers: crate::config::NetworkedWorkersConfig::default(),
             channel_router: crate::channel_router::ChannelRouterConfig::default(),
             media: MediaRuntimeConfig::default(),
             tool_call: crate::tool_protocol::ToolCallConfig {
@@ -3323,13 +3331,13 @@ async fn session_compaction_apply_rolls_back_workspace_writes_on_partial_failure
         .expect("artifact list should succeed");
     assert!(
         artifacts.is_empty(),
-        "no compaction artifact should persist after a failed write phase"
+        "no compaction artifact should persist after a failed write step"
     );
     let checkpoints = state
         .list_orchestrator_checkpoints(session_id.to_owned())
         .await
         .expect("checkpoint list should succeed");
-    assert!(checkpoints.is_empty(), "no checkpoint should persist after a failed write phase");
+    assert!(checkpoints.is_empty(), "no checkpoint should persist after a failed write step");
 }
 
 fn workspace_patch_test_request<'a>(

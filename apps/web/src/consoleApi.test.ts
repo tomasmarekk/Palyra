@@ -663,6 +663,17 @@ describe("ConsoleApiClient", () => {
         rate_limits: { admin_api_max_requests_per_window: 30 },
         auth_profiles: { summary: { total_profiles: 1 } },
         browserd: { enabled: true },
+        runtime_controls: {
+          schema_version: 1,
+          state: "mixed",
+          capabilities: [
+            {
+              capability: "session_queue_policy",
+              mode: "preview_only",
+              effective_state: "preview_only",
+            },
+          ],
+        },
       }),
     ];
     const fetcher: typeof fetch = (input, init) => {
@@ -872,6 +883,11 @@ describe("ConsoleApiClient", () => {
           rate_limits: {},
           auth_profiles: {},
           browserd: {},
+          runtime_controls: {
+            schema_version: 1,
+            state: "mixed",
+            capabilities: [],
+          },
         }),
       );
     };
@@ -880,6 +896,10 @@ describe("ConsoleApiClient", () => {
     const diagnostics = await client.getDiagnostics();
 
     expect(diagnostics.generated_at_unix_ms).toBe(123);
+    expect(diagnostics.runtime_controls).toMatchObject({
+      schema_version: 1,
+      state: "mixed",
+    });
     expect(calls).toHaveLength(2);
     expect(requestUrl(calls[0]?.input)).toBe("/console/v1/diagnostics");
     expect(requestUrl(calls[1]?.input)).toBe("/console/v1/diagnostics");

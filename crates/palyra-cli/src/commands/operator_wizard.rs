@@ -4,6 +4,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use palyra_common::runtime_preview::{
+    RuntimePreviewCapability, RuntimePreviewMode, ALL_RUNTIME_PREVIEW_CAPABILITIES,
+};
 use serde::Serialize;
 
 use crate::{
@@ -458,6 +461,17 @@ pub(crate) fn run_configure_wizard(request: ConfigureWizardRequest) -> Result<()
                     &mut warnings,
                 )?;
             }
+            ConfigureSectionArg::RuntimeControls => {
+                wizard.note(WizardStep::note(
+                    "configure.runtime_controls.note",
+                    "Runtime Controls",
+                    format!(
+                        "Review rollout posture, preview modes, and activation blockers for guarded runtime capabilities. Current state: {}",
+                        join_section_state(before_snapshot.as_slice())
+                    ),
+                ))?;
+                configure_runtime_controls(&mut wizard, &mut document)?;
+            }
             ConfigureSectionArg::DaemonService => {
                 wizard.note(WizardStep::note(
                     "configure.service.note",
@@ -480,7 +494,7 @@ pub(crate) fn run_configure_wizard(request: ConfigureWizardRequest) -> Result<()
                     "configure.channels.note",
                     "Channels",
                     format!(
-                        "Channel lifecycle is still provider-specific in this phase. The configure wizard records the effective state and the next-step guidance here. Current state: {}",
+                        "Channel lifecycle is still provider-specific. The configure wizard records the effective state and the next-step guidance here. Current state: {}",
                         join_section_state(before_snapshot.as_slice())
                     ),
                 ))?;
@@ -887,14 +901,14 @@ fn execute_onboarding_flow(
     let configure_channels = wizard.confirm(confirm_step(
         "configure_channels",
         "Channels",
-        "Do you want this wizard to cover channel setup now? This phase only records the guidance; live connector provisioning remains under `palyra channels ...`.",
+        "Do you want this wizard to cover channel setup now? This wizard only records the guidance; live connector provisioning remains under `palyra channels ...`.",
         Some(false),
     ))?;
     if !configure_channels {
         plan.skipped_sections.push("channels".to_owned());
     } else {
         plan.warnings.push(
-            "channels remain guidance-only in this phase; use `palyra channels discord setup` for connector provisioning."
+            "channels remain guidance-only here; use `palyra channels discord setup` for connector provisioning."
                 .to_owned(),
         );
     }
@@ -902,14 +916,14 @@ fn execute_onboarding_flow(
     let configure_skills = wizard.confirm(confirm_step(
         "configure_skills",
         "Skills",
-        "Do you want skill lifecycle guidance as part of this flow? This phase does not change skill trust configuration automatically.",
+        "Do you want skill lifecycle guidance as part of this flow? This wizard does not change skill trust configuration automatically.",
         Some(false),
     ))?;
     if !configure_skills {
         plan.skipped_sections.push("skills".to_owned());
     } else {
         plan.warnings.push(
-            "skills lifecycle remains CLI-driven in this phase; use `palyra skills list|info|check` for concrete actions."
+            "skills lifecycle remains CLI-driven here; use `palyra skills list|info|check` for concrete actions."
                 .to_owned(),
         );
     }
@@ -917,7 +931,7 @@ fn execute_onboarding_flow(
     let service_mode = wizard.select(select_step(
         "service_install_mode",
         "Service Management",
-        "Choose how to handle daemon service installation in this phase.",
+        "Choose how to handle daemon service installation in this flow.",
         vec![
             choice(
                 "install_now",
@@ -1882,6 +1896,7 @@ fn select_configure_sections(
             choice("workspace", "Workspace", None),
             choice("auth-model", "Auth / Model", None),
             choice("gateway", "Gateway", None),
+            choice("runtime-controls", "Runtime Controls", None),
             choice("daemon-service", "Daemon / Service", None),
             choice("channels", "Channels", None),
             choice("skills", "Skills", None),
@@ -1895,6 +1910,7 @@ fn select_configure_sections(
             "workspace" => Ok(ConfigureSectionArg::Workspace),
             "auth-model" => Ok(ConfigureSectionArg::AuthModel),
             "gateway" => Ok(ConfigureSectionArg::Gateway),
+            "runtime-controls" => Ok(ConfigureSectionArg::RuntimeControls),
             "daemon-service" => Ok(ConfigureSectionArg::DaemonService),
             "channels" => Ok(ConfigureSectionArg::Channels),
             "skills" => Ok(ConfigureSectionArg::Skills),
@@ -2709,6 +2725,21 @@ fn describe_configure_section(
                 format!("remote_verification={remote_verification}"),
             ])
         }
+        ConfigureSectionArg::RuntimeControls => ALL_RUNTIME_PREVIEW_CAPABILITIES
+            .into_iter()
+            .map(|capability| {
+                Ok(format!(
+                    "{}={}/rollout:{}",
+                    capability.as_str(),
+                    runtime_preview_mode_for_document(document, capability)?.as_str(),
+                    if runtime_preview_rollout_for_document(document, capability)? {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                ))
+            })
+            .collect(),
         ConfigureSectionArg::DaemonService => Ok(vec![
             format!(
                 "deployment_mode={}",
@@ -2761,6 +2792,7 @@ fn section_requires_restart(section: ConfigureSectionArg, changed: bool) -> bool
             ConfigureSectionArg::Workspace
                 | ConfigureSectionArg::AuthModel
                 | ConfigureSectionArg::Gateway
+                | ConfigureSectionArg::RuntimeControls
         )
 }
 
@@ -2789,6 +2821,11 @@ fn section_follow_up_checks(
             }
             values
         }
+        ConfigureSectionArg::RuntimeControls => vec![
+            "palyra doctor".to_owned(),
+            "palyra gateway status".to_owned(),
+            "restart daemon so runtime control changes take effect".to_owned(),
+        ],
         ConfigureSectionArg::DaemonService => {
             vec!["palyra gateway install --start".to_owned(), "palyra gateway status".to_owned()]
         }
@@ -2806,6 +2843,160 @@ fn section_follow_up_checks(
     };
     dedupe_strings(&mut follow_ups);
     Ok(follow_ups)
+}
+
+fn configure_runtime_controls(
+    wizard: &mut WizardSession<'_, dyn WizardBackend>,
+    document: &mut toml::Value,
+) -> Result<()> {
+    for capability in ALL_RUNTIME_PREVIEW_CAPABILITIES {
+        let current_mode = runtime_preview_mode_for_document(document, capability)?;
+        let current_rollout = runtime_preview_rollout_for_document(document, capability)?;
+        let selection = wizard.select(select_step(
+            runtime_preview_step_id(capability),
+            capability.label(),
+            format!(
+                "{} Current state: mode={} | rollout={}.",
+                capability.summary(),
+                current_mode.as_str(),
+                if current_rollout { "enabled" } else { "disabled" }
+            ),
+            vec![
+                choice(
+                    "keep_current",
+                    "Keep Current",
+                    Some("leave the current mode and rollout flag unchanged"),
+                ),
+                choice(
+                    "disabled",
+                    "Disabled",
+                    Some("disable the capability and clear its rollout flag"),
+                ),
+                choice(
+                    "preview_only",
+                    "Preview Only",
+                    Some("keep preview mode active with rollout disabled"),
+                ),
+                choice(
+                    "preview_only_rollout",
+                    "Preview + Rollout",
+                    Some("keep preview mode active and arm its rollout flag"),
+                ),
+                choice(
+                    "enabled",
+                    "Enabled",
+                    Some("enable the capability and set its rollout flag"),
+                ),
+            ],
+            Some("keep_current".to_owned()),
+        ))?;
+        apply_runtime_control_choice(document, capability, selection.as_str())?;
+    }
+    Ok(())
+}
+
+fn apply_runtime_control_choice(
+    document: &mut toml::Value,
+    capability: RuntimePreviewCapability,
+    choice_value: &str,
+) -> Result<()> {
+    match choice_value {
+        "keep_current" => Ok(()),
+        "disabled" => {
+            set_runtime_control_state(document, capability, RuntimePreviewMode::Disabled, false)
+        }
+        "preview_only" => {
+            set_runtime_control_state(document, capability, RuntimePreviewMode::PreviewOnly, false)
+        }
+        "preview_only_rollout" => {
+            set_runtime_control_state(document, capability, RuntimePreviewMode::PreviewOnly, true)
+        }
+        "enabled" => {
+            set_runtime_control_state(document, capability, RuntimePreviewMode::Enabled, true)
+        }
+        _ => anyhow::bail!(
+            "unsupported runtime-control selection for {}: {choice_value}",
+            capability.as_str()
+        ),
+    }
+}
+
+fn set_runtime_control_state(
+    document: &mut toml::Value,
+    capability: RuntimePreviewCapability,
+    mode: RuntimePreviewMode,
+    rollout_enabled: bool,
+) -> Result<()> {
+    set_value_at_path(
+        document,
+        runtime_preview_mode_path(capability).as_str(),
+        toml::Value::String(mode.as_str().to_owned()),
+    )?;
+    set_value_at_path(
+        document,
+        runtime_preview_rollout_path(capability).as_str(),
+        toml::Value::Boolean(rollout_enabled),
+    )?;
+    Ok(())
+}
+
+fn runtime_preview_mode_for_document(
+    document: &toml::Value,
+    capability: RuntimePreviewCapability,
+) -> Result<RuntimePreviewMode> {
+    let mode_path = runtime_preview_mode_path(capability);
+    let Some(value) = get_string_value_at_path(document, mode_path.as_str())? else {
+        return Ok(runtime_preview_default_mode(capability));
+    };
+    RuntimePreviewMode::from_str(value.as_str()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} must be one of disabled, preview_only, or enabled; got '{}'",
+            mode_path,
+            value
+        )
+    })
+}
+
+fn runtime_preview_rollout_for_document(
+    document: &toml::Value,
+    capability: RuntimePreviewCapability,
+) -> Result<bool> {
+    Ok(get_bool_value_at_path(document, runtime_preview_rollout_path(capability).as_str())?
+        .unwrap_or(false))
+}
+
+fn runtime_preview_default_mode(capability: RuntimePreviewCapability) -> RuntimePreviewMode {
+    match capability {
+        RuntimePreviewCapability::SessionQueuePolicy
+        | RuntimePreviewCapability::PruningPolicyMatrix
+        | RuntimePreviewCapability::RetrievalDualPath
+        | RuntimePreviewCapability::AuxiliaryExecutor
+        | RuntimePreviewCapability::FlowOrchestration
+        | RuntimePreviewCapability::ReplayCapture => RuntimePreviewMode::PreviewOnly,
+        RuntimePreviewCapability::DeliveryArbitration
+        | RuntimePreviewCapability::NetworkedWorkers => RuntimePreviewMode::Disabled,
+    }
+}
+
+fn runtime_preview_mode_path(capability: RuntimePreviewCapability) -> String {
+    format!("{}.mode", capability.as_str())
+}
+
+fn runtime_preview_rollout_path(capability: RuntimePreviewCapability) -> String {
+    format!("feature_rollouts.{}", capability.as_str())
+}
+
+fn runtime_preview_step_id(capability: RuntimePreviewCapability) -> &'static str {
+    match capability {
+        RuntimePreviewCapability::SessionQueuePolicy => "runtime_controls_session_queue_policy",
+        RuntimePreviewCapability::PruningPolicyMatrix => "runtime_controls_pruning_policy_matrix",
+        RuntimePreviewCapability::RetrievalDualPath => "runtime_controls_retrieval_dual_path",
+        RuntimePreviewCapability::AuxiliaryExecutor => "runtime_controls_auxiliary_executor",
+        RuntimePreviewCapability::FlowOrchestration => "runtime_controls_flow_orchestration",
+        RuntimePreviewCapability::DeliveryArbitration => "runtime_controls_delivery_arbitration",
+        RuntimePreviewCapability::ReplayCapture => "runtime_controls_replay_capture",
+        RuntimePreviewCapability::NetworkedWorkers => "runtime_controls_networked_workers",
+    }
 }
 
 fn current_auth_method(document: &toml::Value) -> String {
@@ -2998,6 +3189,7 @@ impl ConfigureSectionLabel for ConfigureSectionArg {
             ConfigureSectionArg::Workspace => "workspace",
             ConfigureSectionArg::AuthModel => "auth-model",
             ConfigureSectionArg::Gateway => "gateway",
+            ConfigureSectionArg::RuntimeControls => "runtime-controls",
             ConfigureSectionArg::DaemonService => "daemon-service",
             ConfigureSectionArg::Channels => "channels",
             ConfigureSectionArg::Skills => "skills",

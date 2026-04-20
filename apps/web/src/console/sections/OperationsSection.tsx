@@ -332,13 +332,13 @@ export function OperationsSection({ app }: OperationsSectionProps) {
 
           <WorkspaceSectionCard
             title="Runtime preview"
-            description="Phase 1 queue, pruning, retrieval, flow, delivery, and worker telemetry stays visible here before the deeper runtime refactor ships."
+            description="Queue, pruning, retrieval, flow, delivery, and worker telemetry stays visible here while rollout-controlled runtime surfaces remain in preview."
           >
             {runtimePreviewCatalog.length === 0 ? (
               <WorkspaceEmptyState
                 compact
                 title="No runtime preview telemetry"
-                description="Refresh diagnostics after the daemon records Phase 1 runtime events."
+                description="Refresh diagnostics after the daemon records runtime preview events."
               />
             ) : (
               <div className="workspace-stack">

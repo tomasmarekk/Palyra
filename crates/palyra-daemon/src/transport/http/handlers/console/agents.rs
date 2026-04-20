@@ -275,6 +275,7 @@ fn backend_inventory(
         nodes.as_slice(),
         now_unix_ms,
         &state.runtime.config.feature_rollouts,
+        &state.runtime.config.networked_workers,
         state.runtime.worker_fleet_snapshot(),
         &state.runtime.worker_fleet_policy(),
     ))

@@ -4,12 +4,13 @@ use palyra_common::feature_rollouts::{
     FeatureRolloutSetting, FeatureRolloutSource, EXECUTION_BACKEND_NETWORKED_WORKER_ROLLOUT_ENV,
     EXECUTION_BACKEND_REMOTE_NODE_ROLLOUT_ENV, EXECUTION_BACKEND_SSH_TUNNEL_ROLLOUT_ENV,
 };
+use palyra_common::runtime_preview::RuntimePreviewMode;
 use palyra_sandbox::{current_backend_capabilities, current_backend_kind};
 use palyra_workerd::{WorkerFleetPolicy, WorkerFleetSnapshot};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    config::FeatureRolloutsConfig,
+    config::{FeatureRolloutsConfig, NetworkedWorkersConfig},
     node_runtime::RegisteredNodeRecord,
     sandbox_runner::{process_runner_executor_name, SandboxProcessRunnerPolicy},
 };
@@ -161,12 +162,14 @@ pub(crate) fn build_execution_backend_inventory(
     nodes: &[RegisteredNodeRecord],
     now_unix_ms: i64,
     feature_rollouts: &FeatureRolloutsConfig,
+    networked_workers: &NetworkedWorkersConfig,
 ) -> Vec<ExecutionBackendInventoryRecord> {
     build_execution_backend_inventory_with_worker_state(
         policy,
         nodes,
         now_unix_ms,
         feature_rollouts,
+        networked_workers,
         WorkerFleetSnapshot::default(),
         &WorkerFleetPolicy::default(),
     )
@@ -178,6 +181,7 @@ pub(crate) fn build_execution_backend_inventory_with_worker_state(
     nodes: &[RegisteredNodeRecord],
     now_unix_ms: i64,
     feature_rollouts: &FeatureRolloutsConfig,
+    networked_workers: &NetworkedWorkersConfig,
     worker_snapshot: WorkerFleetSnapshot,
     worker_policy: &WorkerFleetPolicy,
 ) -> Vec<ExecutionBackendInventoryRecord> {
@@ -193,7 +197,9 @@ pub(crate) fn build_execution_backend_inventory_with_worker_state(
         healthy_nodes.as_slice(),
         feature_rollouts.execution_backend_remote_node,
         feature_rollouts.execution_backend_networked_worker,
+        feature_rollouts.networked_workers,
         feature_rollouts.execution_backend_ssh_tunnel,
+        networked_workers,
         worker_snapshot,
         worker_policy,
     )
@@ -206,14 +212,22 @@ fn build_execution_backend_inventory_with_rollout(
     healthy_nodes: &[&RegisteredNodeRecord],
     remote_node_rollout: FeatureRolloutSetting,
     networked_worker_rollout: FeatureRolloutSetting,
+    networked_workers_runtime_rollout: FeatureRolloutSetting,
     ssh_tunnel_rollout: FeatureRolloutSetting,
+    networked_workers: &NetworkedWorkersConfig,
     worker_snapshot: WorkerFleetSnapshot,
     worker_policy: &WorkerFleetPolicy,
 ) -> Vec<ExecutionBackendInventoryRecord> {
     vec![
         local_sandbox_inventory_record(policy),
         desktop_node_inventory_record(total_nodes, healthy_nodes, remote_node_rollout),
-        networked_worker_inventory_record(networked_worker_rollout, worker_snapshot, worker_policy),
+        networked_worker_inventory_record(
+            networked_worker_rollout,
+            networked_workers_runtime_rollout,
+            networked_workers,
+            worker_snapshot,
+            worker_policy,
+        ),
         ssh_tunnel_inventory_record(ssh_tunnel_rollout),
     ]
 }
@@ -470,10 +484,22 @@ fn desktop_node_inventory_record(
 
 fn networked_worker_inventory_record(
     rollout: FeatureRolloutSetting,
+    runtime_rollout: FeatureRolloutSetting,
+    networked_workers: &NetworkedWorkersConfig,
     worker_snapshot: WorkerFleetSnapshot,
     worker_policy: &WorkerFleetPolicy,
 ) -> ExecutionBackendInventoryRecord {
-    let (state, selectable, operator_summary) = if !rollout.enabled {
+    let (state, selectable, operator_summary) = if matches!(
+        networked_workers.mode,
+        RuntimePreviewMode::Disabled
+    ) {
+        (
+            ExecutionBackendState::Disabled,
+            false,
+            "Networked workers runtime is disabled. Set networked_workers.mode to preview_only or enabled before advertising remote execution."
+                .to_owned(),
+        )
+    } else if !rollout.enabled {
         (
             ExecutionBackendState::Disabled,
             false,
@@ -481,6 +507,15 @@ fn networked_worker_inventory_record(
                 "Preview backend is disabled. Set {}=1 before attested worker registration can advertise networked execution.",
                 EXECUTION_BACKEND_NETWORKED_WORKER_ROLLOUT_ENV
             ),
+        )
+    } else if matches!(networked_workers.mode, RuntimePreviewMode::Enabled)
+        && !runtime_rollout.enabled
+    {
+        (
+            ExecutionBackendState::Disabled,
+            false,
+            "Networked workers runtime is pinned to enabled mode, but its dedicated rollout flag is still off."
+                .to_owned(),
         )
     } else if worker_snapshot.attested_workers > 0 {
         (
@@ -605,8 +640,10 @@ mod tests {
     use std::path::PathBuf;
 
     use palyra_common::feature_rollouts::FeatureRolloutSource;
+    use palyra_common::runtime_preview::RuntimePreviewMode;
     use palyra_workerd::{WorkerFleetPolicy, WorkerFleetSnapshot};
 
+    use crate::config::NetworkedWorkersConfig;
     use crate::sandbox_runner::{
         EgressEnforcementMode, SandboxProcessRunnerPolicy, SandboxProcessRunnerTier,
     };
@@ -635,6 +672,7 @@ mod tests {
 
     #[test]
     fn automatic_resolution_prefers_local_sandbox() {
+        let networked_workers = NetworkedWorkersConfig::default();
         let inventory = build_execution_backend_inventory_with_rollout(
             &test_policy(),
             0,
@@ -642,6 +680,8 @@ mod tests {
             FeatureRolloutSetting::default(),
             FeatureRolloutSetting::default(),
             FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            &networked_workers,
             WorkerFleetSnapshot::default(),
             &WorkerFleetPolicy::default(),
         );
@@ -653,6 +693,7 @@ mod tests {
 
     #[test]
     fn preview_backend_selection_rejects_disabled_rollout() {
+        let networked_workers = NetworkedWorkersConfig::default();
         let inventory = build_execution_backend_inventory_with_rollout(
             &test_policy(),
             0,
@@ -660,6 +701,8 @@ mod tests {
             FeatureRolloutSetting::default(),
             FeatureRolloutSetting::default(),
             FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            &networked_workers,
             WorkerFleetSnapshot::default(),
             &WorkerFleetPolicy::default(),
         );
@@ -673,13 +716,16 @@ mod tests {
 
     #[test]
     fn preview_backend_resolution_falls_back_to_local_sandbox() {
+        let networked_workers = NetworkedWorkersConfig::default();
         let inventory = build_execution_backend_inventory_with_rollout(
             &test_policy(),
             0,
             &[],
             FeatureRolloutSetting::default(),
             FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
             FeatureRolloutSetting::from_config(true),
+            &networked_workers,
             WorkerFleetSnapshot::default(),
             &WorkerFleetPolicy::default(),
         );
@@ -691,6 +737,7 @@ mod tests {
 
     #[test]
     fn preview_backend_inventory_is_degraded_without_healthy_nodes() {
+        let networked_workers = NetworkedWorkersConfig::default();
         let inventory = build_execution_backend_inventory_with_rollout(
             &test_policy(),
             1,
@@ -698,6 +745,8 @@ mod tests {
             FeatureRolloutSetting::from_config(true),
             FeatureRolloutSetting::default(),
             FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            &networked_workers,
             WorkerFleetSnapshot::default(),
             &WorkerFleetPolicy::default(),
         );
@@ -713,6 +762,10 @@ mod tests {
 
     #[test]
     fn networked_worker_inventory_is_available_only_with_attested_workers() {
+        let networked_workers = NetworkedWorkersConfig {
+            mode: RuntimePreviewMode::PreviewOnly,
+            ..NetworkedWorkersConfig::default()
+        };
         let inventory = build_execution_backend_inventory_with_rollout(
             &test_policy(),
             0,
@@ -720,6 +773,8 @@ mod tests {
             FeatureRolloutSetting::default(),
             FeatureRolloutSetting::from_config(true),
             FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            &networked_workers,
             WorkerFleetSnapshot {
                 registered_workers: 1,
                 attested_workers: 1,
@@ -736,5 +791,37 @@ mod tests {
         assert!(networked_worker.selectable);
         assert!(networked_worker.requires_attestation);
         assert!(networked_worker.requires_egress_proxy);
+    }
+
+    #[test]
+    fn networked_worker_inventory_requires_runtime_rollout_when_enabled_mode_is_pinned() {
+        let networked_workers = NetworkedWorkersConfig {
+            mode: RuntimePreviewMode::Enabled,
+            ..NetworkedWorkersConfig::default()
+        };
+        let inventory = build_execution_backend_inventory_with_rollout(
+            &test_policy(),
+            0,
+            &[],
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::from_config(true),
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            &networked_workers,
+            WorkerFleetSnapshot {
+                registered_workers: 1,
+                attested_workers: 1,
+                active_leases: 0,
+                orphaned_workers: 0,
+            },
+            &WorkerFleetPolicy::default(),
+        );
+        let networked_worker = inventory
+            .iter()
+            .find(|entry| entry.backend_id == ExecutionBackendPreference::NetworkedWorker.as_str())
+            .expect("networked worker backend should exist");
+        assert_eq!(networked_worker.state, ExecutionBackendState::Disabled);
+        assert!(!networked_worker.selectable);
+        assert!(networked_worker.operator_summary.contains("dedicated rollout flag"));
     }
 }

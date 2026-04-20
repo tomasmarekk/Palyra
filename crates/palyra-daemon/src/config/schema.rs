@@ -2,7 +2,8 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use palyra_common::{
-    default_identity_store_root, feature_rollouts::FeatureRolloutSetting, secret_refs::SecretRef,
+    default_identity_store_root, feature_rollouts::FeatureRolloutSetting,
+    runtime_preview::RuntimePreviewMode, secret_refs::SecretRef,
 };
 
 use crate::channel_router::ChannelRouterConfig;
@@ -26,6 +27,30 @@ const DEFAULT_GATEWAY_TLS_ENABLED: bool = false;
 const DEFAULT_GATEWAY_VAULT_GET_APPROVAL_REQUIRED_REFS: &[&str] = &["global/openai_api_key"];
 const DEFAULT_CRON_TIMEZONE_MODE: CronTimezoneMode = CronTimezoneMode::Utc;
 const DEFAULT_ORCHESTRATOR_RUNLOOP_V1_ENABLED: bool = false;
+const DEFAULT_SESSION_QUEUE_MODE: RuntimePreviewMode = RuntimePreviewMode::PreviewOnly;
+const DEFAULT_SESSION_QUEUE_MAX_DEPTH: usize = 8;
+const DEFAULT_SESSION_QUEUE_MERGE_WINDOW_MS: u64 = 1_500;
+const DEFAULT_PRUNING_POLICY_MODE: RuntimePreviewMode = RuntimePreviewMode::PreviewOnly;
+const DEFAULT_PRUNING_MANUAL_APPLY_ENABLED: bool = true;
+const DEFAULT_PRUNING_MIN_TOKEN_SAVINGS: u64 = 128;
+const DEFAULT_RETRIEVAL_DUAL_PATH_MODE: RuntimePreviewMode = RuntimePreviewMode::PreviewOnly;
+const DEFAULT_RETRIEVAL_BRANCH_TIMEOUT_MS: u64 = 2_000;
+const DEFAULT_RETRIEVAL_PROMPT_BUDGET_TOKENS: u64 = 1_800;
+const DEFAULT_AUXILIARY_EXECUTOR_MODE: RuntimePreviewMode = RuntimePreviewMode::PreviewOnly;
+const DEFAULT_AUXILIARY_MAX_TASKS_PER_SESSION: usize = 4;
+const DEFAULT_AUXILIARY_DEFAULT_BUDGET_TOKENS: u64 = 1_024;
+const DEFAULT_FLOW_ORCHESTRATION_MODE: RuntimePreviewMode = RuntimePreviewMode::PreviewOnly;
+const DEFAULT_FLOW_CANCELLATION_GATE_ENABLED: bool = true;
+const DEFAULT_FLOW_MAX_RETRY_COUNT: u32 = 1;
+const DEFAULT_DELIVERY_ARBITRATION_MODE: RuntimePreviewMode = RuntimePreviewMode::Disabled;
+const DEFAULT_DELIVERY_DESCENDANT_PREFERENCE: bool = true;
+const DEFAULT_DELIVERY_SUPPRESSION_LIMIT: u32 = 2;
+const DEFAULT_REPLAY_CAPTURE_MODE: RuntimePreviewMode = RuntimePreviewMode::PreviewOnly;
+const DEFAULT_REPLAY_CAPTURE_RUNTIME_DECISIONS: bool = true;
+const DEFAULT_REPLAY_MAX_EVENTS_PER_RUN: usize = 128;
+const DEFAULT_NETWORKED_WORKERS_MODE: RuntimePreviewMode = RuntimePreviewMode::Disabled;
+const DEFAULT_NETWORKED_WORKERS_LEASE_TTL_MS: u64 = 15 * 60 * 1_000;
+const DEFAULT_NETWORKED_WORKERS_REQUIRE_ATTESTATION: bool = true;
 const DEFAULT_MEMORY_MAX_ITEM_BYTES: usize = 16 * 1024;
 const DEFAULT_MEMORY_MAX_ITEM_TOKENS: usize = 2_048;
 const DEFAULT_MEMORY_DEFAULT_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
@@ -95,6 +120,14 @@ pub struct LoadedConfig {
     pub daemon: DaemonConfig,
     pub gateway: GatewayConfig,
     pub feature_rollouts: FeatureRolloutsConfig,
+    pub session_queue_policy: SessionQueuePolicyConfig,
+    pub pruning_policy_matrix: PruningPolicyMatrixConfig,
+    pub retrieval_dual_path: RetrievalDualPathConfig,
+    pub auxiliary_executor: AuxiliaryExecutorConfig,
+    pub flow_orchestration: FlowOrchestrationConfig,
+    pub delivery_arbitration: DeliveryArbitrationConfig,
+    pub replay_capture: ReplayCaptureConfig,
+    pub networked_workers: NetworkedWorkersConfig,
     pub cron: CronConfig,
     pub orchestrator: OrchestratorConfig,
     pub memory: MemoryConfig,
@@ -208,11 +241,155 @@ pub struct FeatureRolloutsConfig {
     pub execution_backend_ssh_tunnel: FeatureRolloutSetting,
     pub safety_boundary: FeatureRolloutSetting,
     pub execution_gate_pipeline_v2: FeatureRolloutSetting,
+    pub session_queue_policy: FeatureRolloutSetting,
+    pub pruning_policy_matrix: FeatureRolloutSetting,
+    pub retrieval_dual_path: FeatureRolloutSetting,
+    pub auxiliary_executor: FeatureRolloutSetting,
+    pub flow_orchestration: FeatureRolloutSetting,
+    pub delivery_arbitration: FeatureRolloutSetting,
+    pub replay_capture: FeatureRolloutSetting,
+    pub networked_workers: FeatureRolloutSetting,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratorConfig {
     pub runloop_v1_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionQueuePolicyConfig {
+    pub mode: RuntimePreviewMode,
+    pub max_depth: usize,
+    pub merge_window_ms: u64,
+}
+
+impl Default for SessionQueuePolicyConfig {
+    fn default() -> Self {
+        Self {
+            mode: DEFAULT_SESSION_QUEUE_MODE,
+            max_depth: DEFAULT_SESSION_QUEUE_MAX_DEPTH,
+            merge_window_ms: DEFAULT_SESSION_QUEUE_MERGE_WINDOW_MS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PruningPolicyMatrixConfig {
+    pub mode: RuntimePreviewMode,
+    pub manual_apply_enabled: bool,
+    pub min_token_savings: u64,
+}
+
+impl Default for PruningPolicyMatrixConfig {
+    fn default() -> Self {
+        Self {
+            mode: DEFAULT_PRUNING_POLICY_MODE,
+            manual_apply_enabled: DEFAULT_PRUNING_MANUAL_APPLY_ENABLED,
+            min_token_savings: DEFAULT_PRUNING_MIN_TOKEN_SAVINGS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetrievalDualPathConfig {
+    pub mode: RuntimePreviewMode,
+    pub branch_timeout_ms: u64,
+    pub prompt_budget_tokens: u64,
+}
+
+impl Default for RetrievalDualPathConfig {
+    fn default() -> Self {
+        Self {
+            mode: DEFAULT_RETRIEVAL_DUAL_PATH_MODE,
+            branch_timeout_ms: DEFAULT_RETRIEVAL_BRANCH_TIMEOUT_MS,
+            prompt_budget_tokens: DEFAULT_RETRIEVAL_PROMPT_BUDGET_TOKENS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuxiliaryExecutorConfig {
+    pub mode: RuntimePreviewMode,
+    pub max_tasks_per_session: usize,
+    pub default_budget_tokens: u64,
+}
+
+impl Default for AuxiliaryExecutorConfig {
+    fn default() -> Self {
+        Self {
+            mode: DEFAULT_AUXILIARY_EXECUTOR_MODE,
+            max_tasks_per_session: DEFAULT_AUXILIARY_MAX_TASKS_PER_SESSION,
+            default_budget_tokens: DEFAULT_AUXILIARY_DEFAULT_BUDGET_TOKENS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowOrchestrationConfig {
+    pub mode: RuntimePreviewMode,
+    pub cancellation_gate_enabled: bool,
+    pub max_retry_count: u32,
+}
+
+impl Default for FlowOrchestrationConfig {
+    fn default() -> Self {
+        Self {
+            mode: DEFAULT_FLOW_ORCHESTRATION_MODE,
+            cancellation_gate_enabled: DEFAULT_FLOW_CANCELLATION_GATE_ENABLED,
+            max_retry_count: DEFAULT_FLOW_MAX_RETRY_COUNT,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryArbitrationConfig {
+    pub mode: RuntimePreviewMode,
+    pub descendant_preference: bool,
+    pub suppression_limit: u32,
+}
+
+impl Default for DeliveryArbitrationConfig {
+    fn default() -> Self {
+        Self {
+            mode: DEFAULT_DELIVERY_ARBITRATION_MODE,
+            descendant_preference: DEFAULT_DELIVERY_DESCENDANT_PREFERENCE,
+            suppression_limit: DEFAULT_DELIVERY_SUPPRESSION_LIMIT,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayCaptureConfig {
+    pub mode: RuntimePreviewMode,
+    pub capture_runtime_decisions: bool,
+    pub max_events_per_run: usize,
+}
+
+impl Default for ReplayCaptureConfig {
+    fn default() -> Self {
+        Self {
+            mode: DEFAULT_REPLAY_CAPTURE_MODE,
+            capture_runtime_decisions: DEFAULT_REPLAY_CAPTURE_RUNTIME_DECISIONS,
+            max_events_per_run: DEFAULT_REPLAY_MAX_EVENTS_PER_RUN,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkedWorkersConfig {
+    pub mode: RuntimePreviewMode,
+    pub lease_ttl_ms: u64,
+    pub require_attestation: bool,
+}
+
+impl Default for NetworkedWorkersConfig {
+    fn default() -> Self {
+        Self {
+            mode: DEFAULT_NETWORKED_WORKERS_MODE,
+            lease_ttl_ms: DEFAULT_NETWORKED_WORKERS_LEASE_TTL_MS,
+            require_attestation: DEFAULT_NETWORKED_WORKERS_REQUIRE_ATTESTATION,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

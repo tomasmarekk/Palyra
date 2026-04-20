@@ -14,12 +14,17 @@ use palyra_common::{
     },
     default_config_search_paths,
     feature_rollouts::{
-        parse_boolish_feature_rollout, FeatureRolloutSetting, CONTEXT_ENGINE_ROLLOUT_ENV,
+        parse_boolish_feature_rollout, FeatureRolloutSetting, AUXILIARY_EXECUTOR_ROLLOUT_ENV,
+        CONTEXT_ENGINE_ROLLOUT_ENV, DELIVERY_ARBITRATION_ROLLOUT_ENV,
         DYNAMIC_TOOL_BUILDER_ROLLOUT_ENV, EXECUTION_BACKEND_NETWORKED_WORKER_ROLLOUT_ENV,
         EXECUTION_BACKEND_REMOTE_NODE_ROLLOUT_ENV, EXECUTION_BACKEND_SSH_TUNNEL_ROLLOUT_ENV,
-        EXECUTION_GATE_PIPELINE_V2_ROLLOUT_ENV, SAFETY_BOUNDARY_ROLLOUT_ENV,
+        EXECUTION_GATE_PIPELINE_V2_ROLLOUT_ENV, FLOW_ORCHESTRATION_ROLLOUT_ENV,
+        NETWORKED_WORKERS_ROLLOUT_ENV, PRUNING_POLICY_MATRIX_ROLLOUT_ENV,
+        REPLAY_CAPTURE_ROLLOUT_ENV, RETRIEVAL_DUAL_PATH_ROLLOUT_ENV, SAFETY_BOUNDARY_ROLLOUT_ENV,
+        SESSION_QUEUE_POLICY_ROLLOUT_ENV,
     },
     parse_config_path,
+    runtime_preview::{parse_runtime_preview_mode, RuntimePreviewMode},
     secret_refs::{SecretRef, SecretSource},
 };
 use palyra_vault::VaultRef;
@@ -46,6 +51,14 @@ pub fn load_config() -> Result<LoadedConfig> {
     let mut daemon = DaemonConfig::default();
     let mut gateway = GatewayConfig::default();
     let mut feature_rollouts = FeatureRolloutsConfig::default();
+    let mut session_queue_policy = SessionQueuePolicyConfig::default();
+    let mut pruning_policy_matrix = PruningPolicyMatrixConfig::default();
+    let mut retrieval_dual_path = RetrievalDualPathConfig::default();
+    let mut auxiliary_executor = AuxiliaryExecutorConfig::default();
+    let mut flow_orchestration = FlowOrchestrationConfig::default();
+    let mut delivery_arbitration = DeliveryArbitrationConfig::default();
+    let mut replay_capture = ReplayCaptureConfig::default();
+    let mut networked_workers = NetworkedWorkersConfig::default();
     let mut cron = CronConfig::default();
     let mut orchestrator = OrchestratorConfig::default();
     let mut memory = MemoryConfig::default();
@@ -180,6 +193,146 @@ pub fn load_config() -> Result<LoadedConfig> {
             if let Some(enabled) = file_feature_rollouts.execution_gate_pipeline_v2 {
                 feature_rollouts.execution_gate_pipeline_v2 =
                     FeatureRolloutSetting::from_config(enabled);
+            }
+            if let Some(enabled) = file_feature_rollouts.session_queue_policy {
+                feature_rollouts.session_queue_policy = FeatureRolloutSetting::from_config(enabled);
+            }
+            if let Some(enabled) = file_feature_rollouts.pruning_policy_matrix {
+                feature_rollouts.pruning_policy_matrix =
+                    FeatureRolloutSetting::from_config(enabled);
+            }
+            if let Some(enabled) = file_feature_rollouts.retrieval_dual_path {
+                feature_rollouts.retrieval_dual_path = FeatureRolloutSetting::from_config(enabled);
+            }
+            if let Some(enabled) = file_feature_rollouts.auxiliary_executor {
+                feature_rollouts.auxiliary_executor = FeatureRolloutSetting::from_config(enabled);
+            }
+            if let Some(enabled) = file_feature_rollouts.flow_orchestration {
+                feature_rollouts.flow_orchestration = FeatureRolloutSetting::from_config(enabled);
+            }
+            if let Some(enabled) = file_feature_rollouts.delivery_arbitration {
+                feature_rollouts.delivery_arbitration = FeatureRolloutSetting::from_config(enabled);
+            }
+            if let Some(enabled) = file_feature_rollouts.replay_capture {
+                feature_rollouts.replay_capture = FeatureRolloutSetting::from_config(enabled);
+            }
+            if let Some(enabled) = file_feature_rollouts.networked_workers {
+                feature_rollouts.networked_workers = FeatureRolloutSetting::from_config(enabled);
+            }
+        }
+        if let Some(file_session_queue_policy) = parsed.session_queue_policy {
+            if let Some(mode) = file_session_queue_policy.mode {
+                session_queue_policy.mode =
+                    parse_runtime_preview_mode(mode.as_str(), "session_queue_policy.mode")?;
+            }
+            if let Some(max_depth) = file_session_queue_policy.max_depth {
+                session_queue_policy.max_depth =
+                    parse_positive_usize(max_depth, "session_queue_policy.max_depth")?;
+            }
+            if let Some(merge_window_ms) = file_session_queue_policy.merge_window_ms {
+                session_queue_policy.merge_window_ms =
+                    parse_positive_u64(merge_window_ms, "session_queue_policy.merge_window_ms")?;
+            }
+        }
+        if let Some(file_pruning_policy_matrix) = parsed.pruning_policy_matrix {
+            if let Some(mode) = file_pruning_policy_matrix.mode {
+                pruning_policy_matrix.mode =
+                    parse_runtime_preview_mode(mode.as_str(), "pruning_policy_matrix.mode")?;
+            }
+            if let Some(manual_apply_enabled) = file_pruning_policy_matrix.manual_apply_enabled {
+                pruning_policy_matrix.manual_apply_enabled = manual_apply_enabled;
+            }
+            if let Some(min_token_savings) = file_pruning_policy_matrix.min_token_savings {
+                pruning_policy_matrix.min_token_savings = parse_positive_u64(
+                    min_token_savings,
+                    "pruning_policy_matrix.min_token_savings",
+                )?;
+            }
+        }
+        if let Some(file_retrieval_dual_path) = parsed.retrieval_dual_path {
+            if let Some(mode) = file_retrieval_dual_path.mode {
+                retrieval_dual_path.mode =
+                    parse_runtime_preview_mode(mode.as_str(), "retrieval_dual_path.mode")?;
+            }
+            if let Some(branch_timeout_ms) = file_retrieval_dual_path.branch_timeout_ms {
+                retrieval_dual_path.branch_timeout_ms =
+                    parse_positive_u64(branch_timeout_ms, "retrieval_dual_path.branch_timeout_ms")?;
+            }
+            if let Some(prompt_budget_tokens) = file_retrieval_dual_path.prompt_budget_tokens {
+                retrieval_dual_path.prompt_budget_tokens = parse_positive_u64(
+                    prompt_budget_tokens,
+                    "retrieval_dual_path.prompt_budget_tokens",
+                )?;
+            }
+        }
+        if let Some(file_auxiliary_executor) = parsed.auxiliary_executor {
+            if let Some(mode) = file_auxiliary_executor.mode {
+                auxiliary_executor.mode =
+                    parse_runtime_preview_mode(mode.as_str(), "auxiliary_executor.mode")?;
+            }
+            if let Some(max_tasks_per_session) = file_auxiliary_executor.max_tasks_per_session {
+                auxiliary_executor.max_tasks_per_session = parse_positive_usize(
+                    max_tasks_per_session,
+                    "auxiliary_executor.max_tasks_per_session",
+                )?;
+            }
+            if let Some(default_budget_tokens) = file_auxiliary_executor.default_budget_tokens {
+                auxiliary_executor.default_budget_tokens = parse_positive_u64(
+                    default_budget_tokens,
+                    "auxiliary_executor.default_budget_tokens",
+                )?;
+            }
+        }
+        if let Some(file_flow_orchestration) = parsed.flow_orchestration {
+            if let Some(mode) = file_flow_orchestration.mode {
+                flow_orchestration.mode =
+                    parse_runtime_preview_mode(mode.as_str(), "flow_orchestration.mode")?;
+            }
+            if let Some(cancellation_gate_enabled) =
+                file_flow_orchestration.cancellation_gate_enabled
+            {
+                flow_orchestration.cancellation_gate_enabled = cancellation_gate_enabled;
+            }
+            if let Some(max_retry_count) = file_flow_orchestration.max_retry_count {
+                flow_orchestration.max_retry_count = max_retry_count;
+            }
+        }
+        if let Some(file_delivery_arbitration) = parsed.delivery_arbitration {
+            if let Some(mode) = file_delivery_arbitration.mode {
+                delivery_arbitration.mode =
+                    parse_runtime_preview_mode(mode.as_str(), "delivery_arbitration.mode")?;
+            }
+            if let Some(descendant_preference) = file_delivery_arbitration.descendant_preference {
+                delivery_arbitration.descendant_preference = descendant_preference;
+            }
+            if let Some(suppression_limit) = file_delivery_arbitration.suppression_limit {
+                delivery_arbitration.suppression_limit = suppression_limit;
+            }
+        }
+        if let Some(file_replay_capture) = parsed.replay_capture {
+            if let Some(mode) = file_replay_capture.mode {
+                replay_capture.mode =
+                    parse_runtime_preview_mode(mode.as_str(), "replay_capture.mode")?;
+            }
+            if let Some(capture_runtime_decisions) = file_replay_capture.capture_runtime_decisions {
+                replay_capture.capture_runtime_decisions = capture_runtime_decisions;
+            }
+            if let Some(max_events_per_run) = file_replay_capture.max_events_per_run {
+                replay_capture.max_events_per_run =
+                    parse_positive_usize(max_events_per_run, "replay_capture.max_events_per_run")?;
+            }
+        }
+        if let Some(file_networked_workers) = parsed.networked_workers {
+            if let Some(mode) = file_networked_workers.mode {
+                networked_workers.mode =
+                    parse_runtime_preview_mode(mode.as_str(), "networked_workers.mode")?;
+            }
+            if let Some(lease_ttl_ms) = file_networked_workers.lease_ttl_ms {
+                networked_workers.lease_ttl_ms =
+                    parse_positive_u64(lease_ttl_ms, "networked_workers.lease_ttl_ms")?;
+            }
+            if let Some(require_attestation) = file_networked_workers.require_attestation {
+                networked_workers.require_attestation = require_attestation;
             }
         }
         if let Some(file_orchestrator) = parsed.orchestrator {
@@ -1691,6 +1844,46 @@ pub fn load_config() -> Result<LoadedConfig> {
         EXECUTION_GATE_PIPELINE_V2_ROLLOUT_ENV,
         &mut source,
     )?;
+    feature_rollouts.session_queue_policy = apply_feature_rollout_env_override(
+        feature_rollouts.session_queue_policy,
+        SESSION_QUEUE_POLICY_ROLLOUT_ENV,
+        &mut source,
+    )?;
+    feature_rollouts.pruning_policy_matrix = apply_feature_rollout_env_override(
+        feature_rollouts.pruning_policy_matrix,
+        PRUNING_POLICY_MATRIX_ROLLOUT_ENV,
+        &mut source,
+    )?;
+    feature_rollouts.retrieval_dual_path = apply_feature_rollout_env_override(
+        feature_rollouts.retrieval_dual_path,
+        RETRIEVAL_DUAL_PATH_ROLLOUT_ENV,
+        &mut source,
+    )?;
+    feature_rollouts.auxiliary_executor = apply_feature_rollout_env_override(
+        feature_rollouts.auxiliary_executor,
+        AUXILIARY_EXECUTOR_ROLLOUT_ENV,
+        &mut source,
+    )?;
+    feature_rollouts.flow_orchestration = apply_feature_rollout_env_override(
+        feature_rollouts.flow_orchestration,
+        FLOW_ORCHESTRATION_ROLLOUT_ENV,
+        &mut source,
+    )?;
+    feature_rollouts.delivery_arbitration = apply_feature_rollout_env_override(
+        feature_rollouts.delivery_arbitration,
+        DELIVERY_ARBITRATION_ROLLOUT_ENV,
+        &mut source,
+    )?;
+    feature_rollouts.replay_capture = apply_feature_rollout_env_override(
+        feature_rollouts.replay_capture,
+        REPLAY_CAPTURE_ROLLOUT_ENV,
+        &mut source,
+    )?;
+    feature_rollouts.networked_workers = apply_feature_rollout_env_override(
+        feature_rollouts.networked_workers,
+        NETWORKED_WORKERS_ROLLOUT_ENV,
+        &mut source,
+    )?;
 
     if gateway.tls.enabled && (gateway.tls.cert_path.is_none() || gateway.tls.key_path.is_none()) {
         anyhow::bail!(
@@ -1709,6 +1902,17 @@ pub fn load_config() -> Result<LoadedConfig> {
         )?;
     }
     memory.retrieval.validate()?;
+    validate_runtime_preview_config(
+        &feature_rollouts,
+        &session_queue_policy,
+        &pruning_policy_matrix,
+        &retrieval_dual_path,
+        &auxiliary_executor,
+        &flow_orchestration,
+        &delivery_arbitration,
+        &replay_capture,
+        &networked_workers,
+    )?;
     validate_secret_source_conflicts(&model_provider, &tool_call.browser_service, &admin)?;
 
     Ok(LoadedConfig {
@@ -1719,6 +1923,14 @@ pub fn load_config() -> Result<LoadedConfig> {
         daemon,
         gateway,
         feature_rollouts,
+        session_queue_policy,
+        pruning_policy_matrix,
+        retrieval_dual_path,
+        auxiliary_executor,
+        flow_orchestration,
+        delivery_arbitration,
+        replay_capture,
+        networked_workers,
         cron,
         orchestrator,
         memory,
@@ -1754,6 +1966,125 @@ fn apply_feature_rollout_env_override(
     let enabled = parse_boolish_feature_rollout(raw.as_str(), env_name)?;
     source.push_str(&format!(" +env({env_name})"));
     Ok(FeatureRolloutSetting::from_env(enabled))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_runtime_preview_config(
+    feature_rollouts: &FeatureRolloutsConfig,
+    session_queue_policy: &SessionQueuePolicyConfig,
+    pruning_policy_matrix: &PruningPolicyMatrixConfig,
+    retrieval_dual_path: &RetrievalDualPathConfig,
+    auxiliary_executor: &AuxiliaryExecutorConfig,
+    flow_orchestration: &FlowOrchestrationConfig,
+    delivery_arbitration: &DeliveryArbitrationConfig,
+    replay_capture: &ReplayCaptureConfig,
+    networked_workers: &NetworkedWorkersConfig,
+) -> Result<()> {
+    validate_enabled_mode_requires_rollout(
+        session_queue_policy.mode,
+        feature_rollouts.session_queue_policy,
+        "session_queue_policy.mode",
+        "feature_rollouts.session_queue_policy",
+        SESSION_QUEUE_POLICY_ROLLOUT_ENV,
+    )?;
+    validate_enabled_mode_requires_rollout(
+        pruning_policy_matrix.mode,
+        feature_rollouts.pruning_policy_matrix,
+        "pruning_policy_matrix.mode",
+        "feature_rollouts.pruning_policy_matrix",
+        PRUNING_POLICY_MATRIX_ROLLOUT_ENV,
+    )?;
+    validate_enabled_mode_requires_rollout(
+        retrieval_dual_path.mode,
+        feature_rollouts.retrieval_dual_path,
+        "retrieval_dual_path.mode",
+        "feature_rollouts.retrieval_dual_path",
+        RETRIEVAL_DUAL_PATH_ROLLOUT_ENV,
+    )?;
+    validate_enabled_mode_requires_rollout(
+        auxiliary_executor.mode,
+        feature_rollouts.auxiliary_executor,
+        "auxiliary_executor.mode",
+        "feature_rollouts.auxiliary_executor",
+        AUXILIARY_EXECUTOR_ROLLOUT_ENV,
+    )?;
+    validate_enabled_mode_requires_rollout(
+        flow_orchestration.mode,
+        feature_rollouts.flow_orchestration,
+        "flow_orchestration.mode",
+        "feature_rollouts.flow_orchestration",
+        FLOW_ORCHESTRATION_ROLLOUT_ENV,
+    )?;
+    validate_enabled_mode_requires_rollout(
+        delivery_arbitration.mode,
+        feature_rollouts.delivery_arbitration,
+        "delivery_arbitration.mode",
+        "feature_rollouts.delivery_arbitration",
+        DELIVERY_ARBITRATION_ROLLOUT_ENV,
+    )?;
+    validate_enabled_mode_requires_rollout(
+        replay_capture.mode,
+        feature_rollouts.replay_capture,
+        "replay_capture.mode",
+        "feature_rollouts.replay_capture",
+        REPLAY_CAPTURE_ROLLOUT_ENV,
+    )?;
+    validate_enabled_mode_requires_rollout(
+        networked_workers.mode,
+        feature_rollouts.networked_workers,
+        "networked_workers.mode",
+        "feature_rollouts.networked_workers",
+        NETWORKED_WORKERS_ROLLOUT_ENV,
+    )?;
+
+    if flow_orchestration.max_retry_count > 8 {
+        anyhow::bail!("flow_orchestration.max_retry_count must be in range 0..=8");
+    }
+    if delivery_arbitration.suppression_limit > 16 {
+        anyhow::bail!("delivery_arbitration.suppression_limit must be in range 0..=16");
+    }
+    if !(512..=4096).contains(&retrieval_dual_path.prompt_budget_tokens) {
+        anyhow::bail!("retrieval_dual_path.prompt_budget_tokens must be in range 512..=4096");
+    }
+    if !(250..=10_000).contains(&retrieval_dual_path.branch_timeout_ms) {
+        anyhow::bail!("retrieval_dual_path.branch_timeout_ms must be in range 250..=10000");
+    }
+    if auxiliary_executor.max_tasks_per_session > 32 {
+        anyhow::bail!("auxiliary_executor.max_tasks_per_session must be in range 1..=32");
+    }
+    if auxiliary_executor.default_budget_tokens > 16_384 {
+        anyhow::bail!("auxiliary_executor.default_budget_tokens must be in range 1..=16384");
+    }
+    if session_queue_policy.max_depth > 128 {
+        anyhow::bail!("session_queue_policy.max_depth must be in range 1..=128");
+    }
+    if session_queue_policy.merge_window_ms > 60_000 {
+        anyhow::bail!("session_queue_policy.merge_window_ms must be in range 1..=60000");
+    }
+    if pruning_policy_matrix.min_token_savings > 1_000_000 {
+        anyhow::bail!("pruning_policy_matrix.min_token_savings must be in range 1..=1000000");
+    }
+    if replay_capture.max_events_per_run > 4_096 {
+        anyhow::bail!("replay_capture.max_events_per_run must be in range 1..=4096");
+    }
+    if !(60_000..=3_600_000).contains(&networked_workers.lease_ttl_ms) {
+        anyhow::bail!("networked_workers.lease_ttl_ms must be in range 60000..=3600000");
+    }
+
+    Ok(())
+}
+
+fn validate_enabled_mode_requires_rollout(
+    mode: RuntimePreviewMode,
+    rollout: FeatureRolloutSetting,
+    mode_path: &str,
+    rollout_path: &str,
+    rollout_env_var: &str,
+) -> Result<()> {
+    if matches!(mode, RuntimePreviewMode::Enabled) && !rollout.enabled {
+        anyhow::bail!("{mode_path}=enabled requires {rollout_path}=true or {rollout_env_var}=1");
+    }
+    Ok(())
 }
 
 fn find_config_path() -> Result<Option<PathBuf>> {
@@ -3099,10 +3430,13 @@ mod tests {
         parse_positive_usize, parse_process_executable_allowlist,
         parse_process_runner_egress_enforcement_mode, parse_process_runner_tier,
         parse_root_file_config, parse_storage_prefix_allowlist, parse_tool_allowlist,
-        parse_vault_dir, parse_vault_ref_allowlist, AdminConfig, BrowserServiceConfig,
-        CanvasHostConfig, ChannelRouterConfig, CronConfig, DeploymentConfig, DeploymentMode,
-        GatewayBindProfile, GatewayConfig, GatewayTlsConfig, HttpFetchConfig, IdentityConfig,
-        MemoryConfig, ModelProviderConfig, OrchestratorConfig, StorageConfig, ToolCallConfig,
+        parse_vault_dir, parse_vault_ref_allowlist, validate_runtime_preview_config, AdminConfig,
+        AuxiliaryExecutorConfig, BrowserServiceConfig, CanvasHostConfig, ChannelRouterConfig,
+        CronConfig, DeliveryArbitrationConfig, DeploymentConfig, DeploymentMode,
+        FlowOrchestrationConfig, GatewayBindProfile, GatewayConfig, GatewayTlsConfig,
+        HttpFetchConfig, IdentityConfig, MemoryConfig, ModelProviderConfig, NetworkedWorkersConfig,
+        OrchestratorConfig, PruningPolicyMatrixConfig, ReplayCaptureConfig,
+        RetrievalDualPathConfig, SessionQueuePolicyConfig, StorageConfig, ToolCallConfig,
     };
     use crate::channel_router::{BroadcastStrategy, DirectMessagePolicy};
     use crate::model_provider::{
@@ -3115,7 +3449,9 @@ mod tests {
         },
         feature_rollouts::{
             FeatureRolloutSetting, FeatureRolloutSource, DYNAMIC_TOOL_BUILDER_ROLLOUT_ENV,
+            SESSION_QUEUE_POLICY_ROLLOUT_ENV,
         },
+        runtime_preview::RuntimePreviewMode,
     };
 
     fn env_lock() -> &'static Mutex<()> {
@@ -3280,6 +3616,14 @@ mod tests {
             execution_backend_ssh_tunnel = true
             safety_boundary = true
             execution_gate_pipeline_v2 = false
+            session_queue_policy = true
+            pruning_policy_matrix = false
+            retrieval_dual_path = true
+            auxiliary_executor = false
+            flow_orchestration = true
+            delivery_arbitration = false
+            replay_capture = true
+            networked_workers = false
             "#,
         )
         .expect("feature_rollouts should parse");
@@ -3292,6 +3636,14 @@ mod tests {
         assert_eq!(feature_rollouts.execution_backend_ssh_tunnel, Some(true));
         assert_eq!(feature_rollouts.safety_boundary, Some(true));
         assert_eq!(feature_rollouts.execution_gate_pipeline_v2, Some(false));
+        assert_eq!(feature_rollouts.session_queue_policy, Some(true));
+        assert_eq!(feature_rollouts.pruning_policy_matrix, Some(false));
+        assert_eq!(feature_rollouts.retrieval_dual_path, Some(true));
+        assert_eq!(feature_rollouts.auxiliary_executor, Some(false));
+        assert_eq!(feature_rollouts.flow_orchestration, Some(true));
+        assert_eq!(feature_rollouts.delivery_arbitration, Some(false));
+        assert_eq!(feature_rollouts.replay_capture, Some(true));
+        assert_eq!(feature_rollouts.networked_workers, Some(false));
     }
 
     #[test]
@@ -3340,6 +3692,45 @@ mod tests {
         let rendered = error.to_string();
         assert!(rendered.contains(DYNAMIC_TOOL_BUILDER_ROLLOUT_ENV));
         assert!(rendered.contains("boolean-like value"));
+    }
+
+    #[test]
+    fn runtime_preview_config_validation_rejects_enabled_mode_without_rollout() {
+        let error = validate_runtime_preview_config(
+            &crate::config::FeatureRolloutsConfig::default(),
+            &SessionQueuePolicyConfig {
+                mode: RuntimePreviewMode::Enabled,
+                ..SessionQueuePolicyConfig::default()
+            },
+            &PruningPolicyMatrixConfig::default(),
+            &RetrievalDualPathConfig::default(),
+            &AuxiliaryExecutorConfig::default(),
+            &FlowOrchestrationConfig::default(),
+            &DeliveryArbitrationConfig::default(),
+            &ReplayCaptureConfig::default(),
+            &NetworkedWorkersConfig::default(),
+        )
+        .expect_err("enabled mode without rollout should fail");
+        let rendered = error.to_string();
+        assert!(rendered.contains("session_queue_policy.mode=enabled"));
+        assert!(rendered.contains("feature_rollouts.session_queue_policy"));
+        assert!(rendered.contains(SESSION_QUEUE_POLICY_ROLLOUT_ENV));
+    }
+
+    #[test]
+    fn runtime_preview_config_validation_accepts_preview_only_defaults() {
+        validate_runtime_preview_config(
+            &crate::config::FeatureRolloutsConfig::default(),
+            &SessionQueuePolicyConfig::default(),
+            &PruningPolicyMatrixConfig::default(),
+            &RetrievalDualPathConfig::default(),
+            &AuxiliaryExecutorConfig::default(),
+            &FlowOrchestrationConfig::default(),
+            &DeliveryArbitrationConfig::default(),
+            &ReplayCaptureConfig::default(),
+            &NetworkedWorkersConfig::default(),
+        )
+        .expect("preview defaults should validate");
     }
 
     #[test]

@@ -2505,6 +2505,25 @@ fn console_system_surface_returns_presence_and_enforces_emit_csrf() -> Result<()
         diagnostics_response.pointer("/observability/operator_insights/summary/state").is_some(),
         "diagnostics should include operator insights summary"
     );
+    assert_eq!(
+        diagnostics_response.pointer("/runtime_controls/schema_version").and_then(Value::as_u64),
+        Some(1),
+        "diagnostics should publish the runtime controls schema version"
+    );
+    assert!(
+        diagnostics_response
+            .pointer("/runtime_controls/capabilities")
+            .and_then(Value::as_array)
+            .is_some_and(|capabilities| !capabilities.is_empty()),
+        "diagnostics should publish runtime capability entries"
+    );
+    assert_eq!(
+        diagnostics_response
+            .pointer("/feature_rollouts/session_queue_policy/config_path")
+            .and_then(Value::as_str),
+        Some("feature_rollouts.session_queue_policy"),
+        "diagnostics should expose the runtime rollout config path for session queue policy"
+    );
 
     let initial_events = client
         .get(format!("http://127.0.0.1:{admin_port}/console/v1/system/events?limit=5"))

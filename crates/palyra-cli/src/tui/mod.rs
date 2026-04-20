@@ -3829,7 +3829,7 @@ mod tests {
             run_id: Some(common_v1::CanonicalId { ulid: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned() }),
             body: Some(common_v1::run_stream_event::Body::Status(common_v1::StreamStatus {
                 kind: 0,
-                message: "phase\x1b[2J\r\nnext".to_owned(),
+                message: "status\x1b[2J\r\nnext".to_owned(),
             })),
             ..Default::default()
         })
@@ -3844,9 +3844,9 @@ mod tests {
         })
         .expect("token event should be accepted");
 
-        assert_eq!(app.status_line, "phase<ESC>[2J\nnext");
+        assert_eq!(app.status_line, "status<ESC>[2J\nnext");
         assert_eq!(app.transcript.len(), 2);
-        assert_eq!(app.transcript[0].body, "phase<ESC>[2J\nnext");
+        assert_eq!(app.transcript[0].body, "status<ESC>[2J\nnext");
         assert_eq!(app.transcript[1].body, "hello<ESC>]52;c;ZXZpbA==<U+0007>");
         assert!(app
             .transcript

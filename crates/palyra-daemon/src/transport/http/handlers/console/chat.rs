@@ -9,7 +9,7 @@ use palyra_common::{
     runtime_contracts::{AuxiliaryTaskKind, AuxiliaryTaskState, QueuedInputState},
     runtime_preview::{
         RuntimeDecisionActorKind, RuntimeDecisionEventType, RuntimeDecisionPayload,
-        RuntimeDecisionTiming, RuntimeEntityRef, RuntimeResourceBudget,
+        RuntimeDecisionTiming, RuntimeEntityRef, RuntimePreviewCapability, RuntimeResourceBudget,
     },
 };
 use serde::Serialize;
@@ -1393,6 +1393,10 @@ pub(crate) async fn console_chat_compaction_apply_handler(
     Json(payload): Json<ConsoleChatCompactionRequest>,
 ) -> Result<Json<Value>, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
+    ensure_console_runtime_preview_capability(
+        &state,
+        RuntimePreviewCapability::PruningPolicyMatrix,
+    )?;
     let session_record =
         load_console_chat_session(&state, &session.context, session_id.as_str(), true).await?;
     let execution = apply_session_compaction(SessionCompactionApplyRequest {
@@ -1525,6 +1529,7 @@ pub(crate) async fn console_chat_checkpoint_create_handler(
     Json(payload): Json<ConsoleChatCheckpointRequest>,
 ) -> Result<Json<Value>, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
+    ensure_console_runtime_preview_capability(&state, RuntimePreviewCapability::AuxiliaryExecutor)?;
     let session_record =
         load_console_chat_session(&state, &session.context, session_id.as_str(), true).await?;
     let name = trim_to_option(payload.name).ok_or_else(|| {
@@ -2213,6 +2218,7 @@ pub(crate) async fn console_chat_background_task_pause_handler(
     Path(task_id): Path<String>,
 ) -> Result<Json<Value>, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
+    ensure_console_runtime_preview_capability(&state, RuntimePreviewCapability::AuxiliaryExecutor)?;
     let task = load_console_background_task(&state, &session.context, task_id.as_str()).await?;
     if !matches!(
         AuxiliaryTaskState::from_str(task.state.as_str()),
@@ -2254,6 +2260,7 @@ pub(crate) async fn console_chat_background_task_resume_handler(
     Path(task_id): Path<String>,
 ) -> Result<Json<Value>, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
+    ensure_console_runtime_preview_capability(&state, RuntimePreviewCapability::AuxiliaryExecutor)?;
     let task = load_console_background_task(&state, &session.context, task_id.as_str()).await?;
     if AuxiliaryTaskState::from_str(task.state.as_str()) != Some(AuxiliaryTaskState::Paused) {
         return Err(runtime_status_response(tonic::Status::failed_precondition(
@@ -2293,6 +2300,7 @@ pub(crate) async fn console_chat_background_task_retry_handler(
     Path(task_id): Path<String>,
 ) -> Result<Json<Value>, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
+    ensure_console_runtime_preview_capability(&state, RuntimePreviewCapability::AuxiliaryExecutor)?;
     let task = load_console_background_task(&state, &session.context, task_id.as_str()).await?;
     if !matches!(
         AuxiliaryTaskState::from_str(task.state.as_str()),
@@ -2343,6 +2351,7 @@ pub(crate) async fn console_chat_background_task_cancel_handler(
     Path(task_id): Path<String>,
 ) -> Result<Json<Value>, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
+    ensure_console_runtime_preview_capability(&state, RuntimePreviewCapability::AuxiliaryExecutor)?;
     let task = load_console_background_task(&state, &session.context, task_id.as_str()).await?;
     if AuxiliaryTaskState::from_str(task.state.as_str()) == Some(AuxiliaryTaskState::Running) {
         if let Some(target_run_id) = task.target_run_id.clone() {
@@ -2407,6 +2416,11 @@ pub(crate) async fn console_chat_queue_handler(
     Json(payload): Json<ConsoleChatQueueRequest>,
 ) -> Result<Json<Value>, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
+    ensure_console_runtime_preview_capability(
+        &state,
+        RuntimePreviewCapability::SessionQueuePolicy,
+    )?;
+    ensure_console_runtime_preview_capability(&state, RuntimePreviewCapability::FlowOrchestration)?;
     validate_canonical_id(run_id.as_str()).map_err(|_| {
         runtime_status_response(tonic::Status::invalid_argument("run_id must be a canonical ULID"))
     })?;
@@ -3712,6 +3726,19 @@ async fn record_background_task_runtime_preview(
         )
         .await
         .map_err(runtime_status_response)
+}
+
+fn ensure_console_runtime_preview_capability(
+    state: &AppState,
+    capability: RuntimePreviewCapability,
+) -> Result<(), Response> {
+    if let Some(message) = crate::runtime_preview_controls::capability_blocker_message(
+        &state.runtime.config,
+        capability,
+    ) {
+        return Err(runtime_status_response(tonic::Status::failed_precondition(message)));
+    }
+    Ok(())
 }
 
 fn load_console_derived_artifact(

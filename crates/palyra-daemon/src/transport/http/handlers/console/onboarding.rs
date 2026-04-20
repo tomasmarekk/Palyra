@@ -377,7 +377,7 @@ fn build_onboarding_steps(
         actionable_step(
             "discord",
             "Discord channel",
-            "Discord onboarding is optional in this phase, but the shared step is ready when you want a first external channel.",
+            "Discord onboarding is optional here, but the shared step is ready when you want a first external channel.",
             control_plane::OnboardingStepStatus::Todo,
             Some(console_path_action(
                 "Configure Discord",

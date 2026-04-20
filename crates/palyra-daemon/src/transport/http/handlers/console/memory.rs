@@ -9,7 +9,7 @@ use crate::{
 };
 use palyra_common::runtime_preview::{
     RuntimeDecisionActorKind, RuntimeDecisionEventType, RuntimeDecisionPayload,
-    RuntimeDecisionTiming, RuntimeEntityRef, RuntimeResourceBudget,
+    RuntimeDecisionTiming, RuntimeEntityRef, RuntimePreviewCapability, RuntimeResourceBudget,
 };
 
 pub(crate) async fn console_memory_status_handler(
@@ -768,6 +768,12 @@ pub(crate) async fn console_recall_preview_handler(
     Json(payload): Json<ConsoleRecallPreviewRequest>,
 ) -> Result<Json<Value>, Response> {
     let session = authorize_console_session(&state, &headers, false)?;
+    if let Some(message) = crate::runtime_preview_controls::capability_blocker_message(
+        &state.runtime.config,
+        RuntimePreviewCapability::RetrievalDualPath,
+    ) {
+        return Err(runtime_status_response(tonic::Status::failed_precondition(message)));
+    }
     let query_text = payload.query.trim();
     if query_text.is_empty() {
         return Err(runtime_status_response(tonic::Status::invalid_argument(
@@ -794,7 +800,10 @@ pub(crate) async fn console_recall_preview_handler(
             "max_candidates must be in range 1..=12",
         )));
     }
-    let prompt_budget_tokens = payload.prompt_budget_tokens.unwrap_or(1_800);
+    let prompt_budget_tokens = payload.prompt_budget_tokens.unwrap_or(
+        usize::try_from(state.runtime.config.retrieval_dual_path.prompt_budget_tokens)
+            .unwrap_or(usize::MAX),
+    );
     if !(512..=4_096).contains(&prompt_budget_tokens) {
         return Err(runtime_status_response(tonic::Status::invalid_argument(
             "prompt_budget_tokens must be in range 512..=4096",

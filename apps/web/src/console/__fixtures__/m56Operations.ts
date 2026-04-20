@@ -429,7 +429,7 @@ function pluginBindingFixture(
       display_name: pluginId,
       owner_principal: "admin:web-console",
       updated_by: "admin:web-console",
-      tags: ["phase-3"],
+      tags: ["preview-rollout"],
     },
     ...overrides,
   };

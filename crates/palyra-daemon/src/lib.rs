@@ -31,6 +31,7 @@ mod provider_leases;
 mod quic_runtime;
 mod retrieval;
 mod routines;
+mod runtime_preview_controls;
 mod sandbox_runner;
 mod self_healing;
 pub mod support;
@@ -1967,6 +1968,14 @@ pub async fn run() -> Result<()> {
             max_tape_entries_per_response: loaded.gateway.max_tape_entries_per_response,
             max_tape_bytes_per_response: loaded.gateway.max_tape_bytes_per_response,
             feature_rollouts: loaded.feature_rollouts.clone(),
+            session_queue_policy: loaded.session_queue_policy.clone(),
+            pruning_policy_matrix: loaded.pruning_policy_matrix.clone(),
+            retrieval_dual_path: loaded.retrieval_dual_path.clone(),
+            auxiliary_executor: loaded.auxiliary_executor.clone(),
+            flow_orchestration: loaded.flow_orchestration.clone(),
+            delivery_arbitration: loaded.delivery_arbitration.clone(),
+            replay_capture: loaded.replay_capture.clone(),
+            networked_workers: loaded.networked_workers.clone(),
             channel_router: loaded.channel_router.clone(),
             media: loaded.media.clone(),
             tool_call: tool_protocol::ToolCallConfig {

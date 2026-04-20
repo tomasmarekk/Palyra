@@ -9,6 +9,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::feature_rollouts::FeatureRolloutSource;
+
 pub const RUNTIME_PREVIEW_SCHEMA_VERSION: u32 = 1;
 
 macro_rules! runtime_preview_enum {
@@ -60,7 +62,7 @@ macro_rules! runtime_preview_enum {
 }
 
 runtime_preview_enum! {
-    /// Rollout-scoped Phase 1 capability identifiers exposed by config,
+    /// Rollout-scoped capability identifiers exposed by config,
     /// diagnostics, and workflow regression fixtures.
     pub enum RuntimePreviewCapability {
         SessionQueuePolicy => "session_queue_policy",
@@ -132,7 +134,105 @@ impl RuntimePreviewCapability {
 }
 
 runtime_preview_enum! {
-    /// Canonical Phase 1 runtime decision events shared across journal,
+    /// Activation mode for rollout-scoped preview capabilities.
+    pub enum RuntimePreviewMode {
+        Disabled => "disabled",
+        PreviewOnly => "preview_only" | "preview-only" | "preview",
+        Enabled => "enabled"
+    }
+}
+
+impl RuntimePreviewMode {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Disabled => "Disabled",
+            Self::PreviewOnly => "Preview only",
+            Self::Enabled => "Enabled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimePreviewModeParseError {
+    source_name: String,
+    value: String,
+}
+
+impl fmt::Display for RuntimePreviewModeParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} must be one of: disabled | preview_only | enabled; got '{}'",
+            self.source_name, self.value
+        )
+    }
+}
+
+impl std::error::Error for RuntimePreviewModeParseError {}
+
+pub fn parse_runtime_preview_mode(
+    raw: &str,
+    source_name: &str,
+) -> Result<RuntimePreviewMode, RuntimePreviewModeParseError> {
+    RuntimePreviewMode::from_str(raw).ok_or_else(|| RuntimePreviewModeParseError {
+        source_name: source_name.to_owned(),
+        value: raw.trim().to_owned(),
+    })
+}
+
+runtime_preview_enum! {
+    /// Effective diagnostics state derived from config mode, rollout posture,
+    /// and activation blockers.
+    pub enum RuntimePreviewEffectiveState {
+        Disabled => "disabled",
+        Blocked => "blocked",
+        PreviewOnly => "preview_only" | "preview-only" | "preview",
+        Enabled => "enabled"
+    }
+}
+
+runtime_preview_enum! {
+    /// Aggregate summary state for all preview capabilities.
+    pub enum RuntimePreviewSummaryState {
+        Disabled => "disabled",
+        Blocked => "blocked",
+        PreviewOnly => "preview_only" | "preview-only" | "preview",
+        Mixed => "mixed",
+        Enabled => "enabled"
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimePreviewCapabilityConfigSnapshot {
+    pub capability: RuntimePreviewCapability,
+    pub label: String,
+    pub summary: String,
+    pub mode: RuntimePreviewMode,
+    pub effective_state: RuntimePreviewEffectiveState,
+    pub rollout_enabled: bool,
+    pub rollout_source: FeatureRolloutSource,
+    pub rollout_env_var: String,
+    pub rollout_config_path: String,
+    pub config_section: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activation_blockers: Vec<String>,
+    pub settings: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimePreviewConfigSnapshot {
+    pub schema_version: u32,
+    pub state: RuntimePreviewSummaryState,
+    pub preview_capabilities: usize,
+    pub enabled_capabilities: usize,
+    pub blocked_capabilities: usize,
+    pub disabled_capabilities: usize,
+    pub capabilities: Vec<RuntimePreviewCapabilityConfigSnapshot>,
+}
+
+runtime_preview_enum! {
+    /// Canonical runtime decision events shared across journal,
     /// diagnostics, and tape surfaces.
     pub enum RuntimeDecisionEventType {
         QueueEnqueue => "queue_enqueue",
@@ -225,7 +325,7 @@ impl RuntimeDecisionEventType {
 }
 
 runtime_preview_enum! {
-    /// Canonical actor kinds attached to Phase 1 runtime decision payloads.
+    /// Canonical actor kinds attached to runtime decision payloads.
     pub enum RuntimeDecisionActorKind {
         Operator => "operator",
         System => "system",
@@ -397,7 +497,7 @@ fn runtime_resource_budget_is_empty(budget: &RuntimeResourceBudget) -> bool {
 }
 
 runtime_preview_enum! {
-    /// Acceptance scenarios that Phase 1 must keep wired into regression and CI.
+    /// Acceptance scenarios that regression and CI must keep wired into runtime preview coverage.
     pub enum RuntimeAcceptanceScenario {
         QueuedInputLifecycle => "queued_input_lifecycle",
         PruningDecision => "pruning_decision",
@@ -525,11 +625,15 @@ pub fn runtime_acceptance_fixture_catalog() -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        runtime_acceptance_fixture_catalog, RuntimeAcceptanceScenario, RuntimeDecisionActor,
-        RuntimeDecisionActorKind, RuntimeDecisionEventType, RuntimeDecisionPayload,
-        RuntimeDecisionTiming, RuntimeEntityRef, RuntimePreviewCapability, RuntimeResourceBudget,
-        ALL_RUNTIME_ACCEPTANCE_SCENARIOS, ALL_RUNTIME_PREVIEW_CAPABILITIES,
+        parse_runtime_preview_mode, runtime_acceptance_fixture_catalog, RuntimeAcceptanceScenario,
+        RuntimeDecisionActor, RuntimeDecisionActorKind, RuntimeDecisionEventType,
+        RuntimeDecisionPayload, RuntimeDecisionTiming, RuntimeEntityRef, RuntimePreviewCapability,
+        RuntimePreviewCapabilityConfigSnapshot, RuntimePreviewConfigSnapshot,
+        RuntimePreviewEffectiveState, RuntimePreviewMode, RuntimePreviewSummaryState,
+        RuntimeResourceBudget, ALL_RUNTIME_ACCEPTANCE_SCENARIOS, ALL_RUNTIME_PREVIEW_CAPABILITIES,
+        RUNTIME_PREVIEW_SCHEMA_VERSION,
     };
+    use crate::feature_rollouts::FeatureRolloutSource;
     use serde_json::json;
 
     #[test]
@@ -594,7 +698,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_acceptance_fixture_catalog_exposes_shared_phase_one_fixtures() {
+    fn runtime_acceptance_fixture_catalog_exposes_shared_runtime_fixtures() {
         let fixture = runtime_acceptance_fixture_catalog();
         assert_eq!(fixture["schema_version"], 1);
         assert!(fixture.get("session_transcript").is_some());
@@ -602,5 +706,64 @@ mod tests {
         assert!(fixture.get("workspace_patch").is_some());
         assert!(fixture.get("delegated_child_run").is_some());
         assert!(fixture.get("replay_bundle").is_some());
+    }
+
+    #[test]
+    fn runtime_preview_mode_parser_accepts_canonical_values_and_aliases() {
+        assert_eq!(
+            parse_runtime_preview_mode("disabled", "runtime.mode").expect("disabled should parse"),
+            RuntimePreviewMode::Disabled
+        );
+        assert_eq!(
+            parse_runtime_preview_mode(" preview-only ", "runtime.mode")
+                .expect("preview alias should parse"),
+            RuntimePreviewMode::PreviewOnly
+        );
+        assert_eq!(
+            parse_runtime_preview_mode("enabled", "runtime.mode").expect("enabled should parse"),
+            RuntimePreviewMode::Enabled
+        );
+    }
+
+    #[test]
+    fn runtime_preview_mode_parser_rejects_unknown_values() {
+        let error = parse_runtime_preview_mode("pilot", "runtime.mode").expect_err("invalid mode");
+        assert!(error.to_string().contains("runtime.mode"));
+        assert!(error.to_string().contains("pilot"));
+    }
+
+    #[test]
+    fn runtime_preview_config_snapshot_serializes_shared_rollout_shapes() {
+        let snapshot = RuntimePreviewConfigSnapshot {
+            schema_version: RUNTIME_PREVIEW_SCHEMA_VERSION,
+            state: RuntimePreviewSummaryState::PreviewOnly,
+            preview_capabilities: 1,
+            enabled_capabilities: 0,
+            blocked_capabilities: 0,
+            disabled_capabilities: 7,
+            capabilities: vec![RuntimePreviewCapabilityConfigSnapshot {
+                capability: RuntimePreviewCapability::SessionQueuePolicy,
+                label: RuntimePreviewCapability::SessionQueuePolicy.label().to_owned(),
+                summary: RuntimePreviewCapability::SessionQueuePolicy.summary().to_owned(),
+                mode: RuntimePreviewMode::PreviewOnly,
+                effective_state: RuntimePreviewEffectiveState::PreviewOnly,
+                rollout_enabled: false,
+                rollout_source: FeatureRolloutSource::Default,
+                rollout_env_var: "PALYRA_EXPERIMENTAL_SESSION_QUEUE_POLICY".to_owned(),
+                rollout_config_path: "feature_rollouts.session_queue_policy".to_owned(),
+                config_section: "session_queue_policy".to_owned(),
+                activation_blockers: Vec::new(),
+                settings: json!({
+                    "max_depth": 8,
+                    "merge_window_ms": 1500,
+                }),
+            }],
+        };
+
+        let encoded = serde_json::to_value(&snapshot).expect("snapshot should serialize");
+        assert_eq!(encoded["state"], "preview_only");
+        assert_eq!(encoded["capabilities"][0]["capability"], "session_queue_policy");
+        assert_eq!(encoded["capabilities"][0]["effective_state"], "preview_only");
+        assert_eq!(encoded["capabilities"][0]["settings"]["max_depth"], 8);
     }
 }

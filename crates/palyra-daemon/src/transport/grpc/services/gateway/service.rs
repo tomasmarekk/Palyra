@@ -93,6 +93,7 @@ impl GatewayServiceImpl {
             nodes.as_slice(),
             now_unix_ms,
             &self.state.config.feature_rollouts,
+            &self.state.config.networked_workers,
             self.state.worker_fleet_snapshot(),
             &self.state.worker_fleet_policy(),
         ))

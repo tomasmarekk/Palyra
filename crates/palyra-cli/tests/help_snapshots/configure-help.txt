@@ -6,7 +6,7 @@ Options:
       --path <PATH>
 
       --section <SECTIONS>
-          [possible values: workspace, auth-model, gateway, daemon-service, channels, skills, health-security]
+          [possible values: workspace, auth-model, gateway, runtime-controls, daemon-service, channels, skills, health-security]
 
       --non-interactive
 

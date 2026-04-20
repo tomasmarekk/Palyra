@@ -1,13 +1,21 @@
 use crate::*;
 use palyra_common::feature_rollouts::{
+    AUXILIARY_EXECUTOR_ROLLOUT_CONFIG_PATH, AUXILIARY_EXECUTOR_ROLLOUT_ENV,
     CONTEXT_ENGINE_ROLLOUT_CONFIG_PATH, CONTEXT_ENGINE_ROLLOUT_ENV,
+    DELIVERY_ARBITRATION_ROLLOUT_CONFIG_PATH, DELIVERY_ARBITRATION_ROLLOUT_ENV,
     DYNAMIC_TOOL_BUILDER_ROLLOUT_CONFIG_PATH, DYNAMIC_TOOL_BUILDER_ROLLOUT_ENV,
     EXECUTION_BACKEND_NETWORKED_WORKER_ROLLOUT_CONFIG_PATH,
     EXECUTION_BACKEND_NETWORKED_WORKER_ROLLOUT_ENV,
     EXECUTION_BACKEND_REMOTE_NODE_ROLLOUT_CONFIG_PATH, EXECUTION_BACKEND_REMOTE_NODE_ROLLOUT_ENV,
     EXECUTION_BACKEND_SSH_TUNNEL_ROLLOUT_CONFIG_PATH, EXECUTION_BACKEND_SSH_TUNNEL_ROLLOUT_ENV,
     EXECUTION_GATE_PIPELINE_V2_ROLLOUT_CONFIG_PATH, EXECUTION_GATE_PIPELINE_V2_ROLLOUT_ENV,
+    FLOW_ORCHESTRATION_ROLLOUT_CONFIG_PATH, FLOW_ORCHESTRATION_ROLLOUT_ENV,
+    NETWORKED_WORKERS_ROLLOUT_CONFIG_PATH, NETWORKED_WORKERS_ROLLOUT_ENV,
+    PRUNING_POLICY_MATRIX_ROLLOUT_CONFIG_PATH, PRUNING_POLICY_MATRIX_ROLLOUT_ENV,
+    REPLAY_CAPTURE_ROLLOUT_CONFIG_PATH, REPLAY_CAPTURE_ROLLOUT_ENV,
+    RETRIEVAL_DUAL_PATH_ROLLOUT_CONFIG_PATH, RETRIEVAL_DUAL_PATH_ROLLOUT_ENV,
     SAFETY_BOUNDARY_ROLLOUT_CONFIG_PATH, SAFETY_BOUNDARY_ROLLOUT_ENV,
+    SESSION_QUEUE_POLICY_ROLLOUT_CONFIG_PATH, SESSION_QUEUE_POLICY_ROLLOUT_ENV,
 };
 
 #[cfg(windows)]
@@ -79,6 +87,16 @@ pub(crate) async fn console_diagnostics_handler(
     let deployment_payload = collect_console_deployment_diagnostics(&state);
     let execution_backends_payload =
         collect_console_execution_backend_diagnostics(&state).map_err(runtime_status_response)?;
+    let runtime_controls_payload = serde_json::to_value(
+        crate::runtime_preview_controls::build_runtime_preview_config_snapshot(
+            &state.runtime.config,
+        ),
+    )
+    .map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to serialize runtime controls diagnostics payload: {error}"
+        )))
+    })?;
     let canvas_experiments_payload =
         serde_json::to_value(crate::gateway::build_canvas_experiment_governance_snapshot(
             &state.runtime.config.canvas_host,
@@ -128,6 +146,7 @@ pub(crate) async fn console_diagnostics_handler(
             "telemetry": access_snapshot.telemetry,
         },
         "feature_rollouts": collect_console_feature_rollouts_diagnostics(&state),
+        "runtime_controls": runtime_controls_payload,
         "deployment": deployment_payload,
         "execution_backends": execution_backends_payload,
         "canvas_experiments": canvas_experiments_payload,
@@ -192,6 +211,7 @@ fn collect_console_execution_backend_diagnostics(state: &AppState) -> Result<Val
             nodes.as_slice(),
             now_unix_ms,
             &state.runtime.config.feature_rollouts,
+            &state.runtime.config.networked_workers,
             state.runtime.worker_fleet_snapshot(),
             &state.runtime.worker_fleet_policy(),
         ),
@@ -245,6 +265,54 @@ fn collect_console_feature_rollouts_diagnostics(state: &AppState) -> Value {
             "source": feature_rollouts.execution_gate_pipeline_v2.source,
             "config_path": EXECUTION_GATE_PIPELINE_V2_ROLLOUT_CONFIG_PATH,
             "env_var": EXECUTION_GATE_PIPELINE_V2_ROLLOUT_ENV,
+        },
+        "session_queue_policy": {
+            "enabled": feature_rollouts.session_queue_policy.enabled,
+            "source": feature_rollouts.session_queue_policy.source,
+            "config_path": SESSION_QUEUE_POLICY_ROLLOUT_CONFIG_PATH,
+            "env_var": SESSION_QUEUE_POLICY_ROLLOUT_ENV,
+        },
+        "pruning_policy_matrix": {
+            "enabled": feature_rollouts.pruning_policy_matrix.enabled,
+            "source": feature_rollouts.pruning_policy_matrix.source,
+            "config_path": PRUNING_POLICY_MATRIX_ROLLOUT_CONFIG_PATH,
+            "env_var": PRUNING_POLICY_MATRIX_ROLLOUT_ENV,
+        },
+        "retrieval_dual_path": {
+            "enabled": feature_rollouts.retrieval_dual_path.enabled,
+            "source": feature_rollouts.retrieval_dual_path.source,
+            "config_path": RETRIEVAL_DUAL_PATH_ROLLOUT_CONFIG_PATH,
+            "env_var": RETRIEVAL_DUAL_PATH_ROLLOUT_ENV,
+        },
+        "auxiliary_executor": {
+            "enabled": feature_rollouts.auxiliary_executor.enabled,
+            "source": feature_rollouts.auxiliary_executor.source,
+            "config_path": AUXILIARY_EXECUTOR_ROLLOUT_CONFIG_PATH,
+            "env_var": AUXILIARY_EXECUTOR_ROLLOUT_ENV,
+        },
+        "flow_orchestration": {
+            "enabled": feature_rollouts.flow_orchestration.enabled,
+            "source": feature_rollouts.flow_orchestration.source,
+            "config_path": FLOW_ORCHESTRATION_ROLLOUT_CONFIG_PATH,
+            "env_var": FLOW_ORCHESTRATION_ROLLOUT_ENV,
+        },
+        "delivery_arbitration": {
+            "enabled": feature_rollouts.delivery_arbitration.enabled,
+            "source": feature_rollouts.delivery_arbitration.source,
+            "config_path": DELIVERY_ARBITRATION_ROLLOUT_CONFIG_PATH,
+            "env_var": DELIVERY_ARBITRATION_ROLLOUT_ENV,
+        },
+        "replay_capture": {
+            "enabled": feature_rollouts.replay_capture.enabled,
+            "source": feature_rollouts.replay_capture.source,
+            "config_path": REPLAY_CAPTURE_ROLLOUT_CONFIG_PATH,
+            "env_var": REPLAY_CAPTURE_ROLLOUT_ENV,
+        },
+        "networked_workers": {
+            "enabled": feature_rollouts.networked_workers.enabled,
+            "source": feature_rollouts.networked_workers.source,
+            "config_path": NETWORKED_WORKERS_ROLLOUT_CONFIG_PATH,
+            "env_var": NETWORKED_WORKERS_ROLLOUT_ENV,
         },
     })
 }

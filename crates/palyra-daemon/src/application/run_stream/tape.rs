@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use palyra_common::runtime_preview::RuntimeDecisionPayload;
+use palyra_common::runtime_preview::{RuntimeDecisionPayload, RuntimePreviewCapability};
 use palyra_common::CANONICAL_PROTOCOL_MAJOR;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -228,6 +228,13 @@ pub(crate) async fn append_runtime_decision_tape_event(
     tape_seq: &mut i64,
     payload: &RuntimeDecisionPayload,
 ) -> Result<(), Status> {
+    if !crate::runtime_preview_controls::capability_active(
+        &runtime_state.config,
+        RuntimePreviewCapability::ReplayCapture,
+    ) || !runtime_state.config.replay_capture.capture_runtime_decisions
+    {
+        return Ok(());
+    }
     let payload_json = serde_json::to_string(payload).map_err(|error| {
         Status::internal(format!("failed to serialize runtime decision payload: {error}"))
     })?;

@@ -202,6 +202,7 @@ async fn derive_tool_proposal_backend_selection(
         &[],
         current_unix_ms(),
         &runtime_state.config.feature_rollouts,
+        &runtime_state.config.networked_workers,
         runtime_state.worker_fleet_snapshot(),
         &runtime_state.worker_fleet_policy(),
     );

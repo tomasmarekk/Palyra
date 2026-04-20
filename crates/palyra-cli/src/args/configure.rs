@@ -5,6 +5,7 @@ pub enum ConfigureSectionArg {
     Workspace,
     AuthModel,
     Gateway,
+    RuntimeControls,
     DaemonService,
     Channels,
     Skills,

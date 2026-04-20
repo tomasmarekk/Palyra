@@ -22,6 +22,7 @@
     "observability",
     "plugins",
     "rate_limits",
+    "runtime_controls",
     "skills",
     "webhooks"
   ],
@@ -714,7 +715,129 @@
       "source": "default",
       "config_path": "feature_rollouts.execution_gate_pipeline_v2",
       "env_var": "PALYRA_EXPERIMENTAL_EXECUTION_GATE_PIPELINE_V2"
+    },
+    "session_queue_policy": {
+      "enabled": false,
+      "source": "default",
+      "config_path": "feature_rollouts.session_queue_policy",
+      "env_var": "PALYRA_EXPERIMENTAL_SESSION_QUEUE_POLICY"
+    },
+    "pruning_policy_matrix": {
+      "enabled": false,
+      "source": "default",
+      "config_path": "feature_rollouts.pruning_policy_matrix",
+      "env_var": "PALYRA_EXPERIMENTAL_PRUNING_POLICY_MATRIX"
+    },
+    "retrieval_dual_path": {
+      "enabled": false,
+      "source": "default",
+      "config_path": "feature_rollouts.retrieval_dual_path",
+      "env_var": "PALYRA_EXPERIMENTAL_RETRIEVAL_DUAL_PATH"
+    },
+    "auxiliary_executor": {
+      "enabled": false,
+      "source": "default",
+      "config_path": "feature_rollouts.auxiliary_executor",
+      "env_var": "PALYRA_EXPERIMENTAL_AUXILIARY_EXECUTOR"
+    },
+    "flow_orchestration": {
+      "enabled": false,
+      "source": "default",
+      "config_path": "feature_rollouts.flow_orchestration",
+      "env_var": "PALYRA_EXPERIMENTAL_FLOW_ORCHESTRATION"
+    },
+    "delivery_arbitration": {
+      "enabled": false,
+      "source": "default",
+      "config_path": "feature_rollouts.delivery_arbitration",
+      "env_var": "PALYRA_EXPERIMENTAL_DELIVERY_ARBITRATION"
+    },
+    "replay_capture": {
+      "enabled": false,
+      "source": "default",
+      "config_path": "feature_rollouts.replay_capture",
+      "env_var": "PALYRA_EXPERIMENTAL_REPLAY_CAPTURE"
+    },
+    "networked_workers": {
+      "enabled": false,
+      "source": "default",
+      "config_path": "feature_rollouts.networked_workers",
+      "env_var": "PALYRA_EXPERIMENTAL_NETWORKED_WORKERS"
     }
+  },
+  "runtime_controls": {
+    "schema_version": 1,
+    "state": "preview_only",
+    "preview_capabilities": 6,
+    "enabled_capabilities": 0,
+    "blocked_capabilities": 0,
+    "disabled_capabilities": 2,
+    "capabilities": [
+      {
+        "capability": "auxiliary_executor",
+        "mode": "preview_only",
+        "effective_state": "preview_only",
+        "rollout_enabled": false,
+        "rollout_source": "default",
+        "activation_blockers": null
+      },
+      {
+        "capability": "delivery_arbitration",
+        "mode": "disabled",
+        "effective_state": "disabled",
+        "rollout_enabled": false,
+        "rollout_source": "default",
+        "activation_blockers": null
+      },
+      {
+        "capability": "flow_orchestration",
+        "mode": "preview_only",
+        "effective_state": "preview_only",
+        "rollout_enabled": false,
+        "rollout_source": "default",
+        "activation_blockers": null
+      },
+      {
+        "capability": "networked_workers",
+        "mode": "disabled",
+        "effective_state": "disabled",
+        "rollout_enabled": false,
+        "rollout_source": "default",
+        "activation_blockers": null
+      },
+      {
+        "capability": "pruning_policy_matrix",
+        "mode": "preview_only",
+        "effective_state": "preview_only",
+        "rollout_enabled": false,
+        "rollout_source": "default",
+        "activation_blockers": null
+      },
+      {
+        "capability": "replay_capture",
+        "mode": "preview_only",
+        "effective_state": "preview_only",
+        "rollout_enabled": false,
+        "rollout_source": "default",
+        "activation_blockers": null
+      },
+      {
+        "capability": "retrieval_dual_path",
+        "mode": "preview_only",
+        "effective_state": "preview_only",
+        "rollout_enabled": false,
+        "rollout_source": "default",
+        "activation_blockers": null
+      },
+      {
+        "capability": "session_queue_policy",
+        "mode": "preview_only",
+        "effective_state": "preview_only",
+        "rollout_enabled": false,
+        "rollout_source": "default",
+        "activation_blockers": null
+      }
+    ]
   },
   "execution_backend_preferences": [
     "automatic",

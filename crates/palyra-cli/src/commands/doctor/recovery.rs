@@ -2714,7 +2714,7 @@ pinned_gateway_ca_fingerprint_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
     }
 
     #[test]
-    fn repair_plan_matrix_covers_phase_one_broken_states() -> Result<()> {
+    fn repair_plan_matrix_covers_runtime_preview_broken_states() -> Result<()> {
         let temp = tempdir()?;
         let state_root = temp.path().join("state");
         fs::create_dir_all(&state_root)?;
