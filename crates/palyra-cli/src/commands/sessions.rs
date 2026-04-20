@@ -25,6 +25,12 @@ pub(crate) async fn run_sessions_async(
         | SessionsCommand::Reset { json, .. }
         | SessionsCommand::Cleanup { json, .. }
         | SessionsCommand::Abort { json, .. }
+        | SessionsCommand::QueuePolicy { json, .. }
+        | SessionsCommand::QueuePause { json, .. }
+        | SessionsCommand::QueueResume { json, .. }
+        | SessionsCommand::QueueDrain { json, .. }
+        | SessionsCommand::QueueCollectSummary { json, .. }
+        | SessionsCommand::QueueCancel { json, .. }
         | SessionsCommand::Retry { json, .. }
         | SessionsCommand::Branch { json, .. }
         | SessionsCommand::TranscriptSearch { json, .. }
@@ -412,6 +418,51 @@ pub(crate) async fn run_sessions_async(
                     redacted_text_or_none(!response.reason.trim().is_empty())
                 );
             }
+        }
+        SessionsCommand::QueuePolicy { session_id, json: _ } => {
+            let context = connect_sessions_admin_console(&connection).await?;
+            let payload = context
+                .client
+                .get_json_value(format!(
+                    "console/v1/chat/sessions/{}/queue/policy",
+                    percent_encode_component(session_id.as_str())
+                ))
+                .await?;
+            print_session_queue_payload("policy", &payload, json)?;
+        }
+        SessionsCommand::QueuePause { session_id, reason, json: _ } => {
+            handle_session_queue_action(&connection, session_id, "pause", reason, None, json)
+                .await?;
+        }
+        SessionsCommand::QueueResume { session_id, json: _ } => {
+            handle_session_queue_action(&connection, session_id, "resume", None, None, json)
+                .await?;
+        }
+        SessionsCommand::QueueDrain { session_id, reason, json: _ } => {
+            handle_session_queue_action(&connection, session_id, "drain", reason, None, json)
+                .await?;
+        }
+        SessionsCommand::QueueCollectSummary { session_id, reason, json: _ } => {
+            handle_session_queue_action(
+                &connection,
+                session_id,
+                "collect-summary",
+                reason,
+                None,
+                json,
+            )
+            .await?;
+        }
+        SessionsCommand::QueueCancel { session_id, queued_input_id, reason, json: _ } => {
+            handle_session_queue_action(
+                &connection,
+                session_id,
+                "cancel",
+                reason,
+                Some(queued_input_id),
+                json,
+            )
+            .await?;
         }
         SessionsCommand::Retry { session_id, json: _ } => {
             let context = connect_sessions_admin_console(&connection).await?;
@@ -1073,6 +1124,73 @@ async fn connect_sessions_admin_console(
         channel: Some(connection.channel.clone()),
     })
     .await
+}
+
+async fn handle_session_queue_action(
+    connection: &AgentConnection,
+    session_id: String,
+    action: &str,
+    reason: Option<String>,
+    queued_input_id: Option<String>,
+    json_output: bool,
+) -> Result<()> {
+    let context = connect_sessions_admin_console(connection).await?;
+    let path = if action == "cancel" {
+        let queued_input_id =
+            queued_input_id.context("queued_input_id is required for queue cancel")?;
+        format!(
+            "console/v1/chat/sessions/{}/queue/items/{}/cancel",
+            percent_encode_component(session_id.as_str()),
+            percent_encode_component(queued_input_id.as_str())
+        )
+    } else {
+        format!(
+            "console/v1/chat/sessions/{}/queue/{}",
+            percent_encode_component(session_id.as_str()),
+            action
+        )
+    };
+    let payload = context.client.post_json_value(path, &json!({ "reason": reason })).await?;
+    print_session_queue_payload(action, &payload, json_output)
+}
+
+fn print_session_queue_payload(action: &str, payload: &Value, json_output: bool) -> Result<()> {
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(payload)?);
+        return Ok(());
+    }
+    let queue = payload.pointer("/queue").unwrap_or(payload);
+    let metrics = queue.pointer("/metrics").unwrap_or(&Value::Null);
+    let control = queue.pointer("/control").unwrap_or(&Value::Null);
+    let queued_inputs =
+        queue.pointer("/queued_inputs").and_then(Value::as_array).cloned().unwrap_or_default();
+    println!(
+        "sessions.queue.{} paused={} pending_depth={} terminal_count={} total_count={} active_run_id={}",
+        action,
+        control.pointer("/paused").and_then(Value::as_bool).unwrap_or(false),
+        metrics.pointer("/pending_depth").and_then(Value::as_u64).unwrap_or_default(),
+        metrics.pointer("/terminal_count").and_then(Value::as_u64).unwrap_or_default(),
+        metrics.pointer("/total_count").and_then(Value::as_u64).unwrap_or_default(),
+        redacted_optional_identifier_for_output(queue.pointer("/active_run_id").and_then(Value::as_str))
+    );
+    for queued in queued_inputs.iter().rev().take(12) {
+        println!(
+            "queued_input id={} state={} mode={} lane={} run_id={} reason={}",
+            redacted_optional_identifier_for_output(
+                queued.pointer("/queued_input_id").and_then(Value::as_str)
+            ),
+            json_optional_string_in(queued, "/state").unwrap_or_else(|| "unknown".to_owned()),
+            json_optional_string_in(queued, "/queue_mode").unwrap_or_else(|| "unknown".to_owned()),
+            json_optional_string_in(queued, "/priority_lane")
+                .unwrap_or_else(|| "normal".to_owned()),
+            redacted_optional_identifier_for_output(
+                queued.pointer("/run_id").and_then(Value::as_str)
+            ),
+            json_optional_string_in(queued, "/decision_reason")
+                .unwrap_or_else(|| "none".to_owned())
+        );
+    }
+    Ok(())
 }
 
 async fn handle_background_task_action(

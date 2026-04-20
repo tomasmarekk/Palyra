@@ -5,13 +5,16 @@ import type { ConsoleApiClient, ChatTranscriptRecord } from "../consoleApi";
 import type { DetailPanelState } from "./ChatInspectorColumn";
 import type { ChatConsoleWorkspaceView } from "./ChatConsoleWorkspaceView";
 import {
+  cancelQueuedInputAction,
   inspectBackgroundTaskDetail,
   inspectDerivedArtifactDetail,
   inspectLiveEntryDetail,
+  inspectSessionQueuePolicy,
   inspectSearchMatchDetail,
   inspectTranscriptRecordDetail,
   runBackgroundTaskLifecycleAction,
   runDerivedArtifactLifecycleAction,
+  runSessionQueueLifecycleAction,
 } from "./chatInspectorActions";
 
 type WorkspaceViewProps = ComponentProps<typeof ChatConsoleWorkspaceView>;
@@ -192,6 +195,51 @@ export function buildInspectorProps({
       void restoreCheckpoint(checkpointId, { source: "inspector" });
     },
     queuedInputs,
+    inspectQueuePolicy: () => {
+      if (selectedSession === null) {
+        setError("Select a session before inspecting queue policy.");
+        return;
+      }
+      void inspectSessionQueuePolicy({
+        api,
+        sessionId: selectedSession.session_id,
+        setDetailPanel,
+        setError,
+        setSessionMaintenanceBusyKey,
+      });
+    },
+    runSessionQueueAction: (action) => {
+      if (selectedSession === null) {
+        setError("Select a session before changing queue state.");
+        return;
+      }
+      void runSessionQueueLifecycleAction({
+        api,
+        sessionId: selectedSession.session_id,
+        action,
+        refreshSessionTranscript,
+        setDetailPanel,
+        setError,
+        setNotice,
+        setSessionMaintenanceBusyKey,
+      });
+    },
+    cancelQueuedInput: (queuedInputId) => {
+      if (selectedSession === null) {
+        setError("Select a session before cancelling queued input.");
+        return;
+      }
+      void cancelQueuedInputAction({
+        api,
+        sessionId: selectedSession.session_id,
+        queuedInputId,
+        refreshSessionTranscript,
+        setDetailPanel,
+        setError,
+        setNotice,
+        setSessionMaintenanceBusyKey,
+      });
+    },
     backgroundTasks,
     inspectBackgroundTask: (taskId) => {
       void inspectBackgroundTaskDetail({

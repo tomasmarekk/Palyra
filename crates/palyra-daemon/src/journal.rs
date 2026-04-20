@@ -1455,6 +1455,15 @@ pub struct OrchestratorQueuedInputRecord {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct OrchestratorSessionQueueControlRecord {
+    pub session_id: String,
+    pub paused: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pause_reason: Option<String>,
+    pub updated_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct OrchestratorCompactionArtifactRecord {
     pub artifact_id: String,
     pub session_id: String,
@@ -1987,6 +1996,16 @@ pub struct OrchestratorQueuedInputCreateRequest {
 pub struct OrchestratorQueuedInputUpdateRequest {
     pub queued_input_id: String,
     pub state: String,
+    pub overflow_summary_ref: Option<String>,
+    pub decision_reason: Option<String>,
+    pub explain_json: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrchestratorSessionQueueControlUpdateRequest {
+    pub session_id: String,
+    pub paused: bool,
+    pub pause_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -3541,6 +3560,21 @@ const MIGRATIONS: &[Migration] = &[
                 ON orchestrator_queued_inputs(session_ulid, state, created_at_unix_ms);
             CREATE INDEX IF NOT EXISTS idx_orchestrator_queued_inputs_mode
                 ON orchestrator_queued_inputs(session_ulid, queue_mode, created_at_unix_ms);
+        "#,
+    },
+    Migration {
+        version: 26,
+        name: "session_queue_operator_controls",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS orchestrator_session_queue_controls (
+                session_ulid TEXT PRIMARY KEY,
+                paused INTEGER NOT NULL DEFAULT 0,
+                pause_reason TEXT,
+                updated_at_unix_ms INTEGER NOT NULL,
+                FOREIGN KEY(session_ulid) REFERENCES orchestrator_sessions(session_ulid) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_orchestrator_session_queue_controls_paused
+                ON orchestrator_session_queue_controls(paused, updated_at_unix_ms DESC);
         "#,
     },
 ];
@@ -5461,6 +5495,9 @@ impl JournalStore {
                 UPDATE orchestrator_queued_inputs
                 SET
                     state = ?2,
+                    overflow_summary_ref = COALESCE(?4, overflow_summary_ref),
+                    decision_reason = COALESCE(?5, decision_reason),
+                    explain_json = COALESCE(?6, explain_json),
                     forwarded_at_unix_ms = CASE
                         WHEN ?2 = 'forwarded' THEN COALESCE(forwarded_at_unix_ms, ?3)
                         ELSE forwarded_at_unix_ms
@@ -5476,9 +5513,76 @@ impl JournalStore {
                     updated_at_unix_ms = ?3
                 WHERE queued_input_ulid = ?1
             "#,
-            params![request.queued_input_id, request.state, now],
+            params![
+                request.queued_input_id,
+                request.state,
+                now,
+                request.overflow_summary_ref.as_deref(),
+                request.decision_reason.as_deref(),
+                request.explain_json.as_deref(),
+            ],
         )?;
         Ok(())
+    }
+
+    pub fn get_orchestrator_session_queue_control(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<OrchestratorSessionQueueControlRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        guard
+            .query_row(
+                r#"
+                    SELECT session_ulid, paused, pause_reason, updated_at_unix_ms
+                    FROM orchestrator_session_queue_controls
+                    WHERE session_ulid = ?1
+                "#,
+                params![session_id],
+                |row| {
+                    Ok(OrchestratorSessionQueueControlRecord {
+                        session_id: row.get(0)?,
+                        paused: row.get::<_, i64>(1)? == 1,
+                        pause_reason: row.get(2)?,
+                        updated_at_unix_ms: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(JournalError::from)
+    }
+
+    pub fn upsert_orchestrator_session_queue_control(
+        &self,
+        request: &OrchestratorSessionQueueControlUpdateRequest,
+    ) -> Result<OrchestratorSessionQueueControlRecord, JournalError> {
+        let now = current_unix_ms()?;
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        guard.execute(
+            r#"
+                INSERT INTO orchestrator_session_queue_controls (
+                    session_ulid,
+                    paused,
+                    pause_reason,
+                    updated_at_unix_ms
+                ) VALUES (?1, ?2, ?3, ?4)
+                ON CONFLICT(session_ulid) DO UPDATE SET
+                    paused = excluded.paused,
+                    pause_reason = excluded.pause_reason,
+                    updated_at_unix_ms = excluded.updated_at_unix_ms
+            "#,
+            params![
+                request.session_id,
+                if request.paused { 1_i64 } else { 0_i64 },
+                request.pause_reason.as_deref(),
+                now,
+            ],
+        )?;
+        Ok(OrchestratorSessionQueueControlRecord {
+            session_id: request.session_id.clone(),
+            paused: request.paused,
+            pause_reason: request.pause_reason.clone(),
+            updated_at_unix_ms: now,
+        })
     }
 
     pub fn list_orchestrator_queued_inputs(

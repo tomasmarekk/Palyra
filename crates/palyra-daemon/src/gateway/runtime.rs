@@ -18,19 +18,20 @@ use crate::journal::{
     OrchestratorQueuedInputUpdateRequest, OrchestratorRunMetadataUpdateRequest,
     OrchestratorSessionCleanupOutcome, OrchestratorSessionCleanupRequest,
     OrchestratorSessionLineageUpdateRequest, OrchestratorSessionPinCreateRequest,
-    OrchestratorSessionPinRecord, OrchestratorSessionRecord, OrchestratorSessionTitleUpdateRequest,
-    OrchestratorSessionTranscriptRecord, OrchestratorUsageQuery, OrchestratorUsageRunRecord,
-    OrchestratorUsageSessionRecord, OrchestratorUsageSummary,
-    SessionProjectContextStateCopyRequest, SessionProjectContextStateRecord,
-    SessionProjectContextStateUpsertRequest, WorkspaceBootstrapOutcome, WorkspaceBootstrapRequest,
-    WorkspaceCheckpointCreateRequest, WorkspaceCheckpointFilePayload,
-    WorkspaceCheckpointFileRecord, WorkspaceCheckpointListFilter, WorkspaceCheckpointRecord,
-    WorkspaceCheckpointRestoreMarkRequest, WorkspaceDocumentDeleteRequest,
-    WorkspaceDocumentListFilter, WorkspaceDocumentMoveRequest, WorkspaceDocumentRecord,
-    WorkspaceDocumentVersionRecord, WorkspaceDocumentWriteRequest, WorkspaceRestoreActivityFilter,
-    WorkspaceRestoreActivitySummary, WorkspaceRestoreReportCreateRequest,
-    WorkspaceRestoreReportListFilter, WorkspaceRestoreReportRecord, WorkspaceSearchHit,
-    WorkspaceSearchRequest,
+    OrchestratorSessionPinRecord, OrchestratorSessionQueueControlRecord,
+    OrchestratorSessionQueueControlUpdateRequest, OrchestratorSessionRecord,
+    OrchestratorSessionTitleUpdateRequest, OrchestratorSessionTranscriptRecord,
+    OrchestratorUsageQuery, OrchestratorUsageRunRecord, OrchestratorUsageSessionRecord,
+    OrchestratorUsageSummary, SessionProjectContextStateCopyRequest,
+    SessionProjectContextStateRecord, SessionProjectContextStateUpsertRequest,
+    WorkspaceBootstrapOutcome, WorkspaceBootstrapRequest, WorkspaceCheckpointCreateRequest,
+    WorkspaceCheckpointFilePayload, WorkspaceCheckpointFileRecord, WorkspaceCheckpointListFilter,
+    WorkspaceCheckpointRecord, WorkspaceCheckpointRestoreMarkRequest,
+    WorkspaceDocumentDeleteRequest, WorkspaceDocumentListFilter, WorkspaceDocumentMoveRequest,
+    WorkspaceDocumentRecord, WorkspaceDocumentVersionRecord, WorkspaceDocumentWriteRequest,
+    WorkspaceRestoreActivityFilter, WorkspaceRestoreActivitySummary,
+    WorkspaceRestoreReportCreateRequest, WorkspaceRestoreReportListFilter,
+    WorkspaceRestoreReportRecord, WorkspaceSearchHit, WorkspaceSearchRequest,
 };
 use crate::provider_leases::{
     ProviderLeaseAcquireError, ProviderLeaseAcquireRequest, ProviderLeaseExecutionContext,
@@ -3959,6 +3960,52 @@ impl GatewayRuntimeState {
         })
         .await
         .map_err(|_| Status::internal("orchestrator queued input state worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn get_orchestrator_session_queue_control_blocking(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<OrchestratorSessionQueueControlRecord>, Status> {
+        self.journal_store.get_orchestrator_session_queue_control(session_id).map_err(|error| {
+            map_orchestrator_store_error("load orchestrator session queue control", error)
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn get_orchestrator_session_queue_control(
+        self: &Arc<Self>,
+        session_id: String,
+    ) -> Result<Option<OrchestratorSessionQueueControlRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.get_orchestrator_session_queue_control_blocking(session_id.as_str())
+        })
+        .await
+        .map_err(|_| Status::internal("orchestrator queue control worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn upsert_orchestrator_session_queue_control_blocking(
+        &self,
+        request: &OrchestratorSessionQueueControlUpdateRequest,
+    ) -> Result<OrchestratorSessionQueueControlRecord, Status> {
+        self.journal_store.upsert_orchestrator_session_queue_control(request).map_err(|error| {
+            map_orchestrator_store_error("upsert orchestrator session queue control", error)
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn upsert_orchestrator_session_queue_control(
+        self: &Arc<Self>,
+        request: OrchestratorSessionQueueControlUpdateRequest,
+    ) -> Result<OrchestratorSessionQueueControlRecord, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.upsert_orchestrator_session_queue_control_blocking(&request)
+        })
+        .await
+        .map_err(|_| Status::internal("orchestrator queue control upsert worker panicked"))?
     }
 
     #[allow(clippy::result_large_err)]

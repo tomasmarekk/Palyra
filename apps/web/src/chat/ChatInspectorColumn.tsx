@@ -95,6 +95,9 @@ type ChatInspectorColumnProps = {
   inspectCheckpoint: (checkpointId: string) => void;
   restoreCheckpoint: (checkpointId: string) => void;
   queuedInputs: ChatQueuedInputRecord[];
+  inspectQueuePolicy: () => void;
+  runSessionQueueAction: (action: "pause" | "resume" | "drain" | "collect-summary") => void;
+  cancelQueuedInput: (queuedInputId: string) => void;
   backgroundTasks: ChatBackgroundTaskRecord[];
   inspectBackgroundTask: (taskId: string) => void;
   runBackgroundTaskAction: (
@@ -162,6 +165,9 @@ export function ChatInspectorColumn({
   inspectCheckpoint,
   restoreCheckpoint,
   queuedInputs,
+  inspectQueuePolicy,
+  runSessionQueueAction,
+  cancelQueuedInput,
   backgroundTasks,
   inspectBackgroundTask,
   runBackgroundTaskAction,
@@ -786,6 +792,53 @@ export function ChatInspectorColumn({
             <p className="workspace-kicker">Queued follow-ups</p>
             <h3>{queuedInputs.length}</h3>
           </div>
+          <ActionCluster>
+            <ActionButton
+              isDisabled={selectedSession === null || sessionMaintenanceBusy}
+              size="sm"
+              type="button"
+              variant="secondary"
+              onPress={inspectQueuePolicy}
+            >
+              {sessionMaintenanceBusyKey === "queue-policy" ? "Loading..." : "Policy"}
+            </ActionButton>
+            <ActionButton
+              isDisabled={selectedSession === null || sessionMaintenanceBusy}
+              size="sm"
+              type="button"
+              variant="secondary"
+              onPress={() => runSessionQueueAction("pause")}
+            >
+              {sessionMaintenanceBusyKey === "queue-pause" ? "Pausing..." : "Pause"}
+            </ActionButton>
+            <ActionButton
+              isDisabled={selectedSession === null || sessionMaintenanceBusy}
+              size="sm"
+              type="button"
+              variant="secondary"
+              onPress={() => runSessionQueueAction("resume")}
+            >
+              {sessionMaintenanceBusyKey === "queue-resume" ? "Resuming..." : "Resume"}
+            </ActionButton>
+            <ActionButton
+              isDisabled={selectedSession === null || sessionMaintenanceBusy || queuedInputs.length === 0}
+              size="sm"
+              type="button"
+              variant="secondary"
+              onPress={() => runSessionQueueAction("collect-summary")}
+            >
+              {sessionMaintenanceBusyKey === "queue-collect-summary" ? "Collecting..." : "Collect"}
+            </ActionButton>
+            <ActionButton
+              isDisabled={selectedSession === null || sessionMaintenanceBusy || queuedInputs.length === 0}
+              size="sm"
+              type="button"
+              variant="danger"
+              onPress={() => runSessionQueueAction("drain")}
+            >
+              {sessionMaintenanceBusyKey === "queue-drain" ? "Draining..." : "Drain"}
+            </ActionButton>
+          </ActionCluster>
           {queuedInputs.length === 0 ? (
             <p className="chat-muted">No queued follow-ups are stored for this session.</p>
           ) : (
@@ -794,10 +847,32 @@ export function ChatInspectorColumn({
                 <div className="chat-ops-card__copy">
                   <strong>{queued.state}</strong>
                   <span>
-                    {shortId(queued.queued_input_id)} · run {shortId(queued.run_id)}
+                    {shortId(queued.queued_input_id)} · run {shortId(queued.run_id)} ·{" "}
+                    {queued.queue_mode} · {queued.priority_lane}
+                  </span>
+                  <span>
+                    {queued.decision_reason}
+                    {queued.overflow_summary_ref !== undefined
+                      ? ` · ${queued.overflow_summary_ref}`
+                      : ""}
                   </span>
                   <p>{queued.text}</p>
                 </div>
+                {queued.state === "pending" ? (
+                  <div className="chat-ops-card__actions">
+                    <ActionButton
+                      isDisabled={sessionMaintenanceBusy}
+                      size="sm"
+                      type="button"
+                      variant="danger"
+                      onPress={() => cancelQueuedInput(queued.queued_input_id)}
+                    >
+                      {sessionMaintenanceBusyKey === `queue-cancel:${queued.queued_input_id}`
+                        ? "Cancelling..."
+                        : "Cancel"}
+                    </ActionButton>
+                  </div>
+                ) : null}
               </article>
             ))
           )}

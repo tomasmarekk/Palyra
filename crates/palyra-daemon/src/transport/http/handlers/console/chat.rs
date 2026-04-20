@@ -3,7 +3,8 @@ use crate::{
         apply_session_compaction, preview_session_compaction, SessionCompactionApplyRequest,
     },
     application::session_queue::{
-        decide_session_queue_mode, SessionQueuePolicy, SessionQueueSafeBoundary,
+        build_queue_collect_summary, decide_session_queue_mode, pending_queue_depth,
+        SessionQueuePolicy, SessionQueueSafeBoundary,
     },
     *,
 };
@@ -2469,32 +2470,96 @@ pub(crate) async fn console_chat_queue_handler(
         .list_orchestrator_queued_inputs(stream.session_id.clone())
         .await
         .map_err(runtime_status_response)?;
-    let current_depth = existing_queued_inputs
-        .iter()
-        .filter(|queued| queued.state == QueuedInputState::Pending.as_str())
-        .count();
     let policy = SessionQueuePolicy::from_config(
         &state.runtime.config.session_queue_policy,
         stream.session_id.as_str(),
         session.context.channel.as_deref(),
         None,
     );
+    let queue_control = state
+        .runtime
+        .get_orchestrator_session_queue_control(stream.session_id.clone())
+        .await
+        .map_err(runtime_status_response)?
+        .unwrap_or_else(|| default_session_queue_control(stream.session_id.clone()));
+    let coalescing_group = policy.coalescing_group.clone();
+    let current_depth =
+        pending_queue_depth(existing_queued_inputs.as_slice(), Some(coalescing_group.as_str()));
     let safe_boundary = SessionQueueSafeBoundary::active(true, pending_approval);
-    let queue_decision =
-        decide_session_queue_mode(policy, requested_mode, safe_boundary, current_depth);
+    let mut queue_decision = decide_session_queue_mode(
+        policy,
+        if queue_control.paused { Some(QueueMode::Collect) } else { requested_mode },
+        safe_boundary,
+        current_depth,
+    );
+    if queue_control.paused && queue_decision.decision != QueueDecision::Overflow {
+        queue_decision.decision = QueueDecision::Defer;
+        queue_decision.mode = QueueMode::Collect;
+        queue_decision.reason = "session_queue_paused".to_owned();
+    }
     let queued_input_id = Ulid::new().to_string();
+    let pending_group_inputs = existing_queued_inputs
+        .iter()
+        .filter(|queued| {
+            queued.state == QueuedInputState::Pending.as_str()
+                && queued.coalescing_group.as_deref() == Some(coalescing_group.as_str())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let should_collect_summary = queue_decision.decision == QueueDecision::Overflow
+        || (queue_decision.mode == QueueMode::Collect && !pending_group_inputs.is_empty());
+    let mut effective_text = text.clone();
+    let mut overflow_summary_ref = None;
+    if should_collect_summary {
+        if queue_decision.decision != QueueDecision::Overflow {
+            queue_decision.decision = QueueDecision::Merge;
+            queue_decision.reason = "collect_coalesced_with_pending_backlog".to_owned();
+        }
+        let summary_ref = format!("queue-summary:{queued_input_id}");
+        let mut summary_sources = pending_group_inputs.clone();
+        summary_sources.push(journal::OrchestratorQueuedInputRecord {
+            queued_input_id: queued_input_id.clone(),
+            run_id: run_id.clone(),
+            session_id: stream.session_id.clone(),
+            state: QueuedInputState::Pending.as_str().to_owned(),
+            queue_mode: queue_decision.mode.as_str().to_owned(),
+            priority_lane: queue_decision.policy.priority_lane.clone(),
+            coalescing_group: Some(coalescing_group.clone()),
+            overflow_summary_ref: Some(summary_ref.clone()),
+            safe_boundary_flags_json: serde_json::to_string(&queue_decision.safe_boundary)
+                .unwrap_or_else(|_| "{}".to_owned()),
+            decision_reason: queue_decision.reason.clone(),
+            text: text.clone(),
+            accepted_at_unix_ms: Some(timestamp_unix_ms),
+            coalesced_at_unix_ms: None,
+            forwarded_at_unix_ms: None,
+            terminal_at_unix_ms: None,
+            policy_snapshot_json: queue_decision.policy.snapshot_json().to_string(),
+            explain_json: queue_decision.explain_json().to_string(),
+            created_at_unix_ms: timestamp_unix_ms,
+            updated_at_unix_ms: timestamp_unix_ms,
+            origin_run_id: Some(run_id.clone()),
+        });
+        let collect_summary = build_queue_collect_summary(
+            summary_ref.clone(),
+            summary_sources.as_slice(),
+            queue_decision.reason.as_str(),
+        );
+        effective_text = collect_summary.text;
+        overflow_summary_ref = Some(collect_summary.summary_ref);
+    }
     let mut queued = state
         .runtime
         .create_orchestrator_queued_input(journal::OrchestratorQueuedInputCreateRequest {
             queued_input_id: queued_input_id.clone(),
             run_id: run_id.clone(),
             session_id: stream.session_id.clone(),
-            text: text.clone(),
+            text: effective_text.clone(),
             origin_run_id: Some(run_id.clone()),
             queue_mode: queue_decision.mode.as_str().to_owned(),
             priority_lane: queue_decision.policy.priority_lane.clone(),
             coalescing_group: Some(queue_decision.policy.coalescing_group.clone()),
-            overflow_summary_ref: None,
+            overflow_summary_ref: overflow_summary_ref.clone(),
             safe_boundary_flags_json: serde_json::to_string(&queue_decision.safe_boundary)
                 .unwrap_or_else(|_| "{}".to_owned()),
             decision_reason: queue_decision.reason.clone(),
@@ -2504,6 +2569,23 @@ pub(crate) async fn console_chat_queue_handler(
         })
         .await
         .map_err(runtime_status_response)?;
+    for pending in &pending_group_inputs {
+        state
+            .runtime
+            .update_orchestrator_queued_input_state(journal::OrchestratorQueuedInputUpdateRequest {
+                queued_input_id: pending.queued_input_id.clone(),
+                state: if queue_decision.decision == QueueDecision::Overflow {
+                    QueuedInputState::Overflowed.as_str().to_owned()
+                } else {
+                    QueuedInputState::Merged.as_str().to_owned()
+                },
+                overflow_summary_ref: overflow_summary_ref.clone(),
+                decision_reason: Some(queue_decision.reason.clone()),
+                explain_json: Some(queue_decision.explain_json().to_string()),
+            })
+            .await
+            .map_err(runtime_status_response)?;
+    }
     let mut queue_tape_seq = run.tape_events as i64;
     let queue_event_type = match queue_decision.decision {
         QueueDecision::Overflow => RuntimeDecisionEventType::QueueOverflow,
@@ -2603,6 +2685,9 @@ pub(crate) async fn console_chat_queue_handler(
             .update_orchestrator_queued_input_state(journal::OrchestratorQueuedInputUpdateRequest {
                 queued_input_id,
                 state: QueuedInputState::DeliveryFailed.as_str().to_owned(),
+                overflow_summary_ref: None,
+                decision_reason: None,
+                explain_json: None,
             })
             .await
             .map_err(runtime_status_response)?;
@@ -2661,6 +2746,9 @@ pub(crate) async fn console_chat_queue_handler(
         .update_orchestrator_queued_input_state(journal::OrchestratorQueuedInputUpdateRequest {
             queued_input_id: queued.queued_input_id.clone(),
             state: QueuedInputState::Forwarded.as_str().to_owned(),
+            overflow_summary_ref: None,
+            decision_reason: None,
+            explain_json: None,
         })
         .await
         .map_err(runtime_status_response)?;
@@ -2715,6 +2803,314 @@ pub(crate) async fn console_chat_queue_handler(
         "queued_input": queued,
         "decision": queue_decision.explain_json(),
         "policy": queue_decision.policy.snapshot_json(),
+        "contract": contract_descriptor(),
+    })))
+}
+
+pub(crate) async fn console_chat_queue_policy_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    ensure_console_runtime_preview_capability(
+        &state,
+        RuntimePreviewCapability::SessionQueuePolicy,
+    )?;
+    let snapshot =
+        load_console_session_queue_snapshot(&state, &session.context, session_id.as_str(), false)
+            .await?;
+    Ok(Json(session_queue_snapshot_json(snapshot)))
+}
+
+pub(crate) async fn console_chat_queue_pause_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Json(payload): Json<ConsoleChatQueueControlRequest>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    ensure_console_runtime_preview_capability(
+        &state,
+        RuntimePreviewCapability::SessionQueuePolicy,
+    )?;
+    let session_record =
+        load_console_chat_session(&state, &session.context, session_id.as_str(), true).await?;
+    let reason = payload
+        .reason
+        .and_then(trim_to_option)
+        .unwrap_or_else(|| "operator_paused_queue".to_owned());
+    let control = state
+        .runtime
+        .upsert_orchestrator_session_queue_control(
+            journal::OrchestratorSessionQueueControlUpdateRequest {
+                session_id: session_record.session_id.clone(),
+                paused: true,
+                pause_reason: Some(reason),
+            },
+        )
+        .await
+        .map_err(runtime_status_response)?;
+    let snapshot = load_console_session_queue_snapshot(
+        &state,
+        &session.context,
+        session_record.session_id.as_str(),
+        false,
+    )
+    .await?;
+    Ok(Json(json!({
+        "action": "pause",
+        "control": control,
+        "queue": session_queue_snapshot_json(snapshot),
+        "contract": contract_descriptor(),
+    })))
+}
+
+pub(crate) async fn console_chat_queue_resume_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    ensure_console_runtime_preview_capability(
+        &state,
+        RuntimePreviewCapability::SessionQueuePolicy,
+    )?;
+    let session_record =
+        load_console_chat_session(&state, &session.context, session_id.as_str(), true).await?;
+    let control = state
+        .runtime
+        .upsert_orchestrator_session_queue_control(
+            journal::OrchestratorSessionQueueControlUpdateRequest {
+                session_id: session_record.session_id.clone(),
+                paused: false,
+                pause_reason: None,
+            },
+        )
+        .await
+        .map_err(runtime_status_response)?;
+    let snapshot = load_console_session_queue_snapshot(
+        &state,
+        &session.context,
+        session_record.session_id.as_str(),
+        false,
+    )
+    .await?;
+    Ok(Json(json!({
+        "action": "resume",
+        "control": control,
+        "queue": session_queue_snapshot_json(snapshot),
+        "contract": contract_descriptor(),
+    })))
+}
+
+pub(crate) async fn console_chat_queue_drain_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Json(payload): Json<ConsoleChatQueueControlRequest>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    ensure_console_runtime_preview_capability(
+        &state,
+        RuntimePreviewCapability::SessionQueuePolicy,
+    )?;
+    let snapshot =
+        load_console_session_queue_snapshot(&state, &session.context, session_id.as_str(), true)
+            .await?;
+    let reason = payload
+        .reason
+        .and_then(trim_to_option)
+        .unwrap_or_else(|| "queue_drained_by_operator".to_owned());
+    let pending_inputs = snapshot.pending_inputs();
+    for queued in &pending_inputs {
+        state
+            .runtime
+            .update_orchestrator_queued_input_state(journal::OrchestratorQueuedInputUpdateRequest {
+                queued_input_id: queued.queued_input_id.clone(),
+                state: QueuedInputState::Cancelled.as_str().to_owned(),
+                overflow_summary_ref: None,
+                decision_reason: Some(reason.clone()),
+                explain_json: Some(
+                    json!({
+                        "decision": "cancel",
+                        "reason": reason.as_str(),
+                        "queue_mode": queued.queue_mode.as_str(),
+                    })
+                    .to_string(),
+                ),
+            })
+            .await
+            .map_err(runtime_status_response)?;
+    }
+    state.observability.observe_runtime_queue_depth(0);
+    let refreshed =
+        load_console_session_queue_snapshot(&state, &session.context, session_id.as_str(), false)
+            .await?;
+    Ok(Json(json!({
+        "action": "drain",
+        "drained_count": pending_inputs.len(),
+        "queue": session_queue_snapshot_json(refreshed),
+        "contract": contract_descriptor(),
+    })))
+}
+
+pub(crate) async fn console_chat_queue_cancel_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((session_id, queued_input_id)): Path<(String, String)>,
+    Json(payload): Json<ConsoleChatQueueControlRequest>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    ensure_console_runtime_preview_capability(
+        &state,
+        RuntimePreviewCapability::SessionQueuePolicy,
+    )?;
+    validate_canonical_id(queued_input_id.as_str()).map_err(|_| {
+        runtime_status_response(tonic::Status::invalid_argument(
+            "queued_input_id must be a canonical ULID",
+        ))
+    })?;
+    let snapshot =
+        load_console_session_queue_snapshot(&state, &session.context, session_id.as_str(), true)
+            .await?;
+    let queued = snapshot
+        .queued_inputs
+        .iter()
+        .find(|queued| queued.queued_input_id == queued_input_id)
+        .ok_or_else(|| {
+            runtime_status_response(tonic::Status::not_found(format!(
+                "queued input not found: {queued_input_id}"
+            )))
+        })?;
+    if queued.state != QueuedInputState::Pending.as_str() {
+        return Err(runtime_status_response(tonic::Status::failed_precondition(
+            "only pending queued inputs can be cancelled",
+        )));
+    }
+    let reason = payload
+        .reason
+        .and_then(trim_to_option)
+        .unwrap_or_else(|| "queued_input_cancelled_by_operator".to_owned());
+    state
+        .runtime
+        .update_orchestrator_queued_input_state(journal::OrchestratorQueuedInputUpdateRequest {
+            queued_input_id: queued_input_id.clone(),
+            state: QueuedInputState::Cancelled.as_str().to_owned(),
+            overflow_summary_ref: None,
+            decision_reason: Some(reason.clone()),
+            explain_json: Some(
+                json!({
+                    "decision": "cancel",
+                    "reason": reason.as_str(),
+                    "queue_mode": queued.queue_mode.as_str(),
+                })
+                .to_string(),
+            ),
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    let refreshed =
+        load_console_session_queue_snapshot(&state, &session.context, session_id.as_str(), false)
+            .await?;
+    Ok(Json(json!({
+        "action": "cancel",
+        "queued_input_id": queued_input_id,
+        "queue": session_queue_snapshot_json(refreshed),
+        "contract": contract_descriptor(),
+    })))
+}
+
+pub(crate) async fn console_chat_queue_collect_summary_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Json(payload): Json<ConsoleChatQueueControlRequest>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    ensure_console_runtime_preview_capability(
+        &state,
+        RuntimePreviewCapability::SessionQueuePolicy,
+    )?;
+    let snapshot =
+        load_console_session_queue_snapshot(&state, &session.context, session_id.as_str(), true)
+            .await?;
+    let pending_inputs = snapshot.pending_inputs();
+    if pending_inputs.is_empty() {
+        return Err(runtime_status_response(tonic::Status::failed_precondition(
+            "queue has no pending inputs to summarize",
+        )));
+    }
+    let timestamp_unix_ms = unix_ms_now().map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to read system clock: {error}"
+        )))
+    })?;
+    let reason = payload
+        .reason
+        .and_then(trim_to_option)
+        .unwrap_or_else(|| "operator_forced_collect_summary".to_owned());
+    let queued_input_id = Ulid::new().to_string();
+    let summary_ref = format!("queue-summary:{queued_input_id}");
+    let collect_summary = build_queue_collect_summary(
+        summary_ref.clone(),
+        pending_inputs.as_slice(),
+        reason.as_str(),
+    );
+    let run_id = pending_inputs.first().map(|queued| queued.run_id.clone()).ok_or_else(|| {
+        runtime_status_response(tonic::Status::internal("pending queue vanished"))
+    })?;
+    let explain_json = json!({
+        "decision": "merge",
+        "mode": QueueMode::Collect.as_str(),
+        "accepted": true,
+        "reason": reason.as_str(),
+        "safe_boundary": &snapshot.safe_boundary,
+        "policy": snapshot.policy.snapshot_json(),
+        "summary": collect_summary.provenance_json,
+    });
+    let summary_input = state
+        .runtime
+        .create_orchestrator_queued_input(journal::OrchestratorQueuedInputCreateRequest {
+            queued_input_id: queued_input_id.clone(),
+            run_id: run_id.clone(),
+            session_id: snapshot.session_record.session_id.clone(),
+            text: collect_summary.text,
+            origin_run_id: Some(run_id),
+            queue_mode: QueueMode::Collect.as_str().to_owned(),
+            priority_lane: snapshot.policy.priority_lane.clone(),
+            coalescing_group: Some(snapshot.policy.coalescing_group.clone()),
+            overflow_summary_ref: Some(summary_ref.clone()),
+            safe_boundary_flags_json: serde_json::to_string(&snapshot.safe_boundary)
+                .unwrap_or_else(|_| "{}".to_owned()),
+            decision_reason: reason.clone(),
+            accepted_at_unix_ms: Some(timestamp_unix_ms),
+            policy_snapshot_json: snapshot.policy.snapshot_json().to_string(),
+            explain_json: explain_json.to_string(),
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    for queued in &pending_inputs {
+        state
+            .runtime
+            .update_orchestrator_queued_input_state(journal::OrchestratorQueuedInputUpdateRequest {
+                queued_input_id: queued.queued_input_id.clone(),
+                state: QueuedInputState::Merged.as_str().to_owned(),
+                overflow_summary_ref: Some(summary_ref.clone()),
+                decision_reason: Some(reason.clone()),
+                explain_json: Some(explain_json.to_string()),
+            })
+            .await
+            .map_err(runtime_status_response)?;
+    }
+    let refreshed =
+        load_console_session_queue_snapshot(&state, &session.context, session_id.as_str(), false)
+            .await?;
+    Ok(Json(json!({
+        "action": "collect_summary",
+        "queued_input": summary_input,
+        "merged_count": pending_inputs.len(),
+        "queue": session_queue_snapshot_json(refreshed),
         "contract": contract_descriptor(),
     })))
 }
@@ -3484,6 +3880,128 @@ async fn load_console_chat_session(
         .await
         .map_err(runtime_status_response)?;
     Ok(response.session)
+}
+
+#[derive(Debug, Clone)]
+struct ConsoleSessionQueueSnapshot {
+    session_record: journal::OrchestratorSessionRecord,
+    queued_inputs: Vec<journal::OrchestratorQueuedInputRecord>,
+    control: journal::OrchestratorSessionQueueControlRecord,
+    policy: SessionQueuePolicy,
+    safe_boundary: SessionQueueSafeBoundary,
+    active_run_id: Option<String>,
+}
+
+impl ConsoleSessionQueueSnapshot {
+    fn pending_inputs(&self) -> Vec<journal::OrchestratorQueuedInputRecord> {
+        self.queued_inputs
+            .iter()
+            .filter(|queued| queued.state == QueuedInputState::Pending.as_str())
+            .cloned()
+            .collect()
+    }
+}
+
+async fn load_console_session_queue_snapshot(
+    state: &AppState,
+    context: &gateway::RequestContext,
+    session_id: &str,
+    require_write: bool,
+) -> Result<ConsoleSessionQueueSnapshot, Response> {
+    let session_record =
+        load_console_chat_session(state, context, session_id, require_write).await?;
+    let queued_inputs = state
+        .runtime
+        .list_orchestrator_queued_inputs(session_record.session_id.clone())
+        .await
+        .map_err(runtime_status_response)?;
+    let control = state
+        .runtime
+        .get_orchestrator_session_queue_control(session_record.session_id.clone())
+        .await
+        .map_err(runtime_status_response)?
+        .unwrap_or_else(|| default_session_queue_control(session_record.session_id.clone()));
+    let policy = SessionQueuePolicy::from_config(
+        &state.runtime.config.session_queue_policy,
+        session_record.session_id.as_str(),
+        context.channel.as_deref(),
+        None,
+    );
+    let (active_run_stream, pending_approval, active_run_id) =
+        active_session_queue_boundary(state, session_record.session_id.as_str());
+    let safe_boundary = SessionQueueSafeBoundary::active(active_run_stream, pending_approval);
+    Ok(ConsoleSessionQueueSnapshot {
+        session_record,
+        queued_inputs,
+        control,
+        policy,
+        safe_boundary,
+        active_run_id,
+    })
+}
+
+fn active_session_queue_boundary(
+    state: &AppState,
+    session_id: &str,
+) -> (bool, bool, Option<String>) {
+    let active_stream = {
+        let streams = lock_console_chat_streams(&state.console_chat_streams);
+        streams
+            .iter()
+            .find(|(_, stream)| stream.session_id == session_id)
+            .map(|(run_id, stream)| (run_id.clone(), stream.clone()))
+    };
+    let Some((run_id, stream)) = active_stream else {
+        return (false, false, None);
+    };
+    let pending_approval =
+        !lock_console_chat_pending_approvals(&stream.pending_approvals).is_empty();
+    (true, pending_approval, Some(run_id))
+}
+
+fn default_session_queue_control(
+    session_id: String,
+) -> journal::OrchestratorSessionQueueControlRecord {
+    journal::OrchestratorSessionQueueControlRecord {
+        session_id,
+        paused: false,
+        pause_reason: None,
+        updated_at_unix_ms: 0,
+    }
+}
+
+fn session_queue_snapshot_json(snapshot: ConsoleSessionQueueSnapshot) -> Value {
+    let pending_depth = pending_queue_depth(
+        snapshot.queued_inputs.as_slice(),
+        Some(snapshot.policy.coalescing_group.as_str()),
+    );
+    let terminal_count = snapshot
+        .queued_inputs
+        .iter()
+        .filter(|queued| queued.state != QueuedInputState::Pending.as_str())
+        .count();
+    let preview_mode = if snapshot.control.paused { Some(QueueMode::Collect) } else { None };
+    let preview_decision = decide_session_queue_mode(
+        snapshot.policy.clone(),
+        preview_mode,
+        snapshot.safe_boundary.clone(),
+        pending_depth,
+    );
+    json!({
+        "session_id": snapshot.session_record.session_id,
+        "control": snapshot.control,
+        "policy": snapshot.policy.snapshot_json(),
+        "safe_boundary": snapshot.safe_boundary,
+        "active_run_id": snapshot.active_run_id,
+        "queued_inputs": snapshot.queued_inputs,
+        "metrics": {
+            "pending_depth": pending_depth,
+            "terminal_count": terminal_count,
+            "total_count": pending_depth.saturating_add(terminal_count),
+        },
+        "decision_preview": preview_decision.explain_json(),
+        "contract": contract_descriptor(),
+    })
 }
 
 fn load_console_chat_canvas_summaries(

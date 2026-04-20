@@ -83,6 +83,45 @@ pub enum SessionsCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    QueuePolicy {
+        session_id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    QueuePause {
+        session_id: String,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    QueueResume {
+        session_id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    QueueDrain {
+        session_id: String,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    QueueCollectSummary {
+        session_id: String,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    QueueCancel {
+        session_id: String,
+        queued_input_id: String,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     Retry {
         session_id: String,
         #[arg(long, default_value_t = false)]

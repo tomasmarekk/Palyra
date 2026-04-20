@@ -1038,6 +1038,65 @@ fn parse_sessions_rename_and_abort() {
 }
 
 #[test]
+fn parse_sessions_queue_controls() {
+    let policy = Cli::parse_from([
+        "palyra",
+        "sessions",
+        "queue-policy",
+        "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+        "--json",
+    ]);
+    assert_eq!(
+        policy.command,
+        Command::Sessions {
+            command: SessionsCommand::QueuePolicy {
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FB0".to_owned(),
+                json: true,
+            }
+        }
+    );
+
+    let pause = Cli::parse_from([
+        "palyra",
+        "sessions",
+        "queue-pause",
+        "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+        "--reason",
+        "operator handoff",
+    ]);
+    assert_eq!(
+        pause.command,
+        Command::Sessions {
+            command: SessionsCommand::QueuePause {
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FB0".to_owned(),
+                reason: Some("operator handoff".to_owned()),
+                json: false,
+            }
+        }
+    );
+
+    let cancel = Cli::parse_from([
+        "palyra",
+        "sessions",
+        "queue-cancel",
+        "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+        "01ARZ3NDEKTSV4RRFFQ69G5FB1",
+        "--json",
+    ]);
+    assert_eq!(
+        cancel.command,
+        Command::Sessions {
+            command: SessionsCommand::QueueCancel {
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FB0".to_owned(),
+                queued_input_id: "01ARZ3NDEKTSV4RRFFQ69G5FB1".to_owned(),
+                reason: None,
+                json: true,
+            }
+        }
+    );
+}
+
+#[test]
 fn parse_sessions_history_with_resume_first() {
     let parsed = Cli::parse_from([
         "palyra",

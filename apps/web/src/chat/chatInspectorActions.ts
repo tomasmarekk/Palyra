@@ -4,6 +4,7 @@ import type {
   ChatAttachmentRecord,
   ChatTranscriptRecord,
   ConsoleApiClient,
+  JsonValue,
   MediaDerivedArtifactRecord,
 } from "../consoleApi";
 import type { DetailPanelState, TranscriptSearchMatch } from "./ChatInspectorColumn";
@@ -188,6 +189,128 @@ export async function runBackgroundTaskLifecycleAction({
       refreshSessionTranscript,
       setNotice,
     });
+  } catch (error) {
+    setError(toErrorMessage(error));
+  } finally {
+    setBusyKey(setSessionMaintenanceBusyKey, null);
+  }
+}
+
+export async function inspectSessionQueuePolicy({
+  api,
+  sessionId,
+  setDetailPanel,
+  setError,
+  setSessionMaintenanceBusyKey,
+}: {
+  api: ConsoleApiClient;
+  sessionId: string;
+  setDetailPanel: (next: DetailPanelState | null) => void;
+  setError: (next: string | null) => void;
+  setSessionMaintenanceBusyKey?: (next: string | null) => void;
+}): Promise<void> {
+  setBusyKey(setSessionMaintenanceBusyKey, "queue-policy");
+  setError(null);
+  try {
+    const queue = await api.getChatQueuePolicy(sessionId);
+    setDetailPanel({
+      id: `queue-policy:${sessionId}`,
+      title: "Queue policy",
+      subtitle: `${queue.metrics.pending_depth} pending input(s)`,
+      body: queue.control.paused ? "Session queue is paused." : "Session queue is active.",
+      payload: queue as unknown as JsonValue,
+    });
+  } catch (error) {
+    setError(toErrorMessage(error));
+  } finally {
+    setBusyKey(setSessionMaintenanceBusyKey, null);
+  }
+}
+
+export async function runSessionQueueLifecycleAction({
+  api,
+  sessionId,
+  action,
+  refreshSessionTranscript,
+  setDetailPanel,
+  setError,
+  setNotice,
+  setSessionMaintenanceBusyKey,
+}: {
+  api: ConsoleApiClient;
+  sessionId: string;
+  action: "pause" | "resume" | "drain" | "collect-summary";
+  refreshSessionTranscript: () => Promise<void>;
+  setDetailPanel: (next: DetailPanelState | null) => void;
+  setError: (next: string | null) => void;
+  setNotice: (next: string | null) => void;
+  setSessionMaintenanceBusyKey?: (next: string | null) => void;
+}): Promise<void> {
+  setBusyKey(setSessionMaintenanceBusyKey, `queue-${action}`);
+  setError(null);
+  setNotice(null);
+  try {
+    const response =
+      action === "pause"
+        ? await api.pauseChatQueue(sessionId, { reason: "Paused from chat inspector." })
+        : action === "resume"
+          ? await api.resumeChatQueue(sessionId)
+          : action === "drain"
+            ? await api.drainChatQueue(sessionId, { reason: "Drained from chat inspector." })
+            : await api.collectChatQueueSummary(sessionId, {
+                reason: "Collect summary forced from chat inspector.",
+              });
+    await refreshSessionTranscript();
+    setDetailPanel({
+      id: `queue-${action}:${sessionId}`,
+      title: "Queue action",
+      subtitle: action,
+      body: `${response.queue.metrics.pending_depth} pending input(s) remain.`,
+      payload: response as unknown as JsonValue,
+    });
+    setNotice(`Queue action applied: ${action}.`);
+  } catch (error) {
+    setError(toErrorMessage(error));
+  } finally {
+    setBusyKey(setSessionMaintenanceBusyKey, null);
+  }
+}
+
+export async function cancelQueuedInputAction({
+  api,
+  sessionId,
+  queuedInputId,
+  refreshSessionTranscript,
+  setDetailPanel,
+  setError,
+  setNotice,
+  setSessionMaintenanceBusyKey,
+}: {
+  api: ConsoleApiClient;
+  sessionId: string;
+  queuedInputId: string;
+  refreshSessionTranscript: () => Promise<void>;
+  setDetailPanel: (next: DetailPanelState | null) => void;
+  setError: (next: string | null) => void;
+  setNotice: (next: string | null) => void;
+  setSessionMaintenanceBusyKey?: (next: string | null) => void;
+}): Promise<void> {
+  setBusyKey(setSessionMaintenanceBusyKey, `queue-cancel:${queuedInputId}`);
+  setError(null);
+  setNotice(null);
+  try {
+    const response = await api.cancelChatQueuedInput(sessionId, queuedInputId, {
+      reason: "Cancelled from chat inspector.",
+    });
+    await refreshSessionTranscript();
+    setDetailPanel({
+      id: `queue-cancel:${queuedInputId}`,
+      title: "Queued input cancelled",
+      subtitle: queuedInputId,
+      body: `${response.queue.metrics.pending_depth} pending input(s) remain.`,
+      payload: response as unknown as JsonValue,
+    });
+    setNotice("Queued input cancelled.");
   } catch (error) {
     setError(toErrorMessage(error));
   } finally {

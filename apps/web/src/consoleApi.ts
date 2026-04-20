@@ -1073,6 +1073,40 @@ export interface ChatQueuedInputRecord {
   origin_run_id?: string;
 }
 
+export interface ChatQueueControlRecord {
+  session_id: string;
+  paused: boolean;
+  pause_reason?: string;
+  updated_at_unix_ms: number;
+}
+
+export interface ChatQueuePolicySnapshot {
+  session_id: string;
+  control: ChatQueueControlRecord;
+  policy: JsonValue;
+  safe_boundary: JsonValue;
+  active_run_id?: string;
+  queued_inputs: ChatQueuedInputRecord[];
+  metrics: {
+    pending_depth: number;
+    terminal_count: number;
+    total_count: number;
+  };
+  decision_preview: JsonValue;
+  contract: ContractDescriptor;
+}
+
+export interface ChatQueueActionEnvelope {
+  action: string;
+  control?: ChatQueueControlRecord;
+  queue: ChatQueuePolicySnapshot;
+  queued_input?: ChatQueuedInputRecord;
+  queued_input_id?: string;
+  drained_count?: number;
+  merged_count?: number;
+  contract: ContractDescriptor;
+}
+
 export interface ChatPinRecord {
   pin_id: string;
   session_id: string;
@@ -1443,6 +1477,15 @@ export interface ChatBackgroundTaskRecord {
 
 type RawChatQueuedInputRecord = Omit<ChatQueuedInputRecord, "state"> & {
   state: string;
+};
+
+type RawChatQueuePolicySnapshot = Omit<ChatQueuePolicySnapshot, "queued_inputs"> & {
+  queued_inputs: RawChatQueuedInputRecord[];
+};
+
+type RawChatQueueActionEnvelope = Omit<ChatQueueActionEnvelope, "queue" | "queued_input"> & {
+  queue: RawChatQueuePolicySnapshot;
+  queued_input?: RawChatQueuedInputRecord;
 };
 
 type RawChatBackgroundTaskRecord = Omit<ChatBackgroundTaskRecord, "task_kind" | "state"> & {
@@ -3322,6 +3365,28 @@ function normalizeChatQueuedInputRecord(record: RawChatQueuedInputRecord): ChatQ
   };
 }
 
+function normalizeChatQueuePolicySnapshot(
+  snapshot: RawChatQueuePolicySnapshot,
+): ChatQueuePolicySnapshot {
+  return {
+    ...snapshot,
+    queued_inputs: snapshot.queued_inputs.map(normalizeChatQueuedInputRecord),
+  };
+}
+
+function normalizeChatQueueActionEnvelope(
+  envelope: RawChatQueueActionEnvelope,
+): ChatQueueActionEnvelope {
+  return {
+    ...envelope,
+    queue: normalizeChatQueuePolicySnapshot(envelope.queue),
+    queued_input:
+      envelope.queued_input !== undefined
+        ? normalizeChatQueuedInputRecord(envelope.queued_input)
+        : undefined,
+  };
+}
+
 function normalizeChatBackgroundTaskRecord(
   record: RawChatBackgroundTaskRecord,
 ): ChatBackgroundTaskRecord {
@@ -4593,10 +4658,17 @@ export class ConsoleApiClient {
 
   async queueFollowUp(
     runId: string,
-    payload: { text: string },
-  ): Promise<{ queued_input: ChatQueuedInputRecord; contract: ContractDescriptor }> {
+    payload: { text: string; queue_mode?: QueueMode },
+  ): Promise<{
+    queued_input: ChatQueuedInputRecord;
+    decision?: JsonValue;
+    policy?: JsonValue;
+    contract: ContractDescriptor;
+  }> {
     const response = await this.request<{
       queued_input: RawChatQueuedInputRecord;
+      decision?: JsonValue;
+      policy?: JsonValue;
       contract: ContractDescriptor;
     }>(
       `/console/v1/chat/runs/${encodeURIComponent(runId)}/queue`,
@@ -4610,6 +4682,86 @@ export class ConsoleApiClient {
       ...response,
       queued_input: normalizeChatQueuedInputRecord(response.queued_input),
     };
+  }
+
+  async getChatQueuePolicy(sessionId: string): Promise<ChatQueuePolicySnapshot> {
+    const response = await this.request<RawChatQueuePolicySnapshot>(
+      `/console/v1/chat/sessions/${encodeURIComponent(sessionId)}/queue/policy`,
+    );
+    return normalizeChatQueuePolicySnapshot(response);
+  }
+
+  async pauseChatQueue(
+    sessionId: string,
+    payload: { reason?: string } = {},
+  ): Promise<ChatQueueActionEnvelope> {
+    const response = await this.request<RawChatQueueActionEnvelope>(
+      `/console/v1/chat/sessions/${encodeURIComponent(sessionId)}/queue/pause`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+    return normalizeChatQueueActionEnvelope(response);
+  }
+
+  async resumeChatQueue(sessionId: string): Promise<ChatQueueActionEnvelope> {
+    const response = await this.request<RawChatQueueActionEnvelope>(
+      `/console/v1/chat/sessions/${encodeURIComponent(sessionId)}/queue/resume`,
+      {
+        method: "POST",
+        body: JSON.stringify({}),
+      },
+      { csrf: true },
+    );
+    return normalizeChatQueueActionEnvelope(response);
+  }
+
+  async drainChatQueue(
+    sessionId: string,
+    payload: { reason?: string } = {},
+  ): Promise<ChatQueueActionEnvelope> {
+    const response = await this.request<RawChatQueueActionEnvelope>(
+      `/console/v1/chat/sessions/${encodeURIComponent(sessionId)}/queue/drain`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+    return normalizeChatQueueActionEnvelope(response);
+  }
+
+  async collectChatQueueSummary(
+    sessionId: string,
+    payload: { reason?: string } = {},
+  ): Promise<ChatQueueActionEnvelope> {
+    const response = await this.request<RawChatQueueActionEnvelope>(
+      `/console/v1/chat/sessions/${encodeURIComponent(sessionId)}/queue/collect-summary`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+    return normalizeChatQueueActionEnvelope(response);
+  }
+
+  async cancelChatQueuedInput(
+    sessionId: string,
+    queuedInputId: string,
+    payload: { reason?: string } = {},
+  ): Promise<ChatQueueActionEnvelope> {
+    const response = await this.request<RawChatQueueActionEnvelope>(
+      `/console/v1/chat/sessions/${encodeURIComponent(sessionId)}/queue/items/${encodeURIComponent(queuedInputId)}/cancel`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      { csrf: true },
+    );
+    return normalizeChatQueueActionEnvelope(response);
   }
 
   async getSessionTranscript(sessionId: string): Promise<{

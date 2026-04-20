@@ -678,6 +678,30 @@ pub(crate) fn build_router(state: AppState) -> Router {
             get(console::chat::console_chat_transcript_handler),
         )
         .route(
+            "/console/v1/chat/sessions/{session_id}/queue/policy",
+            get(console::chat::console_chat_queue_policy_handler),
+        )
+        .route(
+            "/console/v1/chat/sessions/{session_id}/queue/pause",
+            post(console::chat::console_chat_queue_pause_handler),
+        )
+        .route(
+            "/console/v1/chat/sessions/{session_id}/queue/resume",
+            post(console::chat::console_chat_queue_resume_handler),
+        )
+        .route(
+            "/console/v1/chat/sessions/{session_id}/queue/drain",
+            post(console::chat::console_chat_queue_drain_handler),
+        )
+        .route(
+            "/console/v1/chat/sessions/{session_id}/queue/collect-summary",
+            post(console::chat::console_chat_queue_collect_summary_handler),
+        )
+        .route(
+            "/console/v1/chat/sessions/{session_id}/queue/items/{queued_input_id}/cancel",
+            post(console::chat::console_chat_queue_cancel_handler),
+        )
+        .route(
             "/console/v1/chat/sessions/{session_id}/canvases",
             get(console::chat::console_chat_canvas_list_handler),
         )

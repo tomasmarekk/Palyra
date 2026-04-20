@@ -1452,6 +1452,12 @@ struct ConsoleChatQueueRequest {
     queue_mode: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct ConsoleChatQueueControlRequest {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ConsoleChatRetryRequest {
     #[serde(default)]
