@@ -47,7 +47,7 @@ import { useChatContextBudget } from "./useChatContextBudget";
 import { useChatRunStream } from "./useChatRunStream";
 import { useChatSessions } from "./useChatSessions";
 import { useChatSlashPalette } from "./useChatSlashPalette";
-import { usePhase4DeepLinks } from "./usePhase4DeepLinks";
+import { useChatDeepLinks } from "./useChatDeepLinks";
 import { useChatObjectives } from "./useChatObjectives";
 import { useChatPanelViewState } from "./useChatPanelViewState";
 import { useChatPanelBootstrap } from "./useChatPanelBootstrap";
@@ -341,7 +341,7 @@ export function ChatConsolePanel({
       setSessionMaintenanceBusyKey,
       setError,
     });
-  usePhase4DeepLinks({
+  useChatDeepLinks({
     activeSessionId: sessions.activeSessionId,
     preferredSessionId,
     preferredRunId,

@@ -13,7 +13,10 @@ import {
   buildDetailFromSearchMatch,
   buildDetailFromTranscriptRecord,
 } from "./chatConsoleUtils";
-import { inspectBackgroundTaskAction, runBackgroundTaskActionRequest } from "./chatPhase4Actions";
+import {
+  inspectBackgroundTaskAction,
+  runBackgroundTaskActionRequest,
+} from "./chatTranscriptMaintenanceActions";
 import { toErrorMessage, type ComposerAttachment, type TranscriptEntry } from "./chatShared";
 import { handleAttachmentFilesAction } from "./chatSessionActions";
 

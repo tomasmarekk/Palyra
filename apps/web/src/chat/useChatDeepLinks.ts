@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 
-interface UsePhase4DeepLinksOptions {
+interface UseChatDeepLinksOptions {
   readonly activeSessionId: string;
   readonly preferredSessionId: string | null;
   readonly preferredRunId: string | null;
@@ -11,7 +11,7 @@ interface UsePhase4DeepLinksOptions {
   readonly inspectCheckpoint: (checkpointId: string) => Promise<void>;
 }
 
-export function usePhase4DeepLinks({
+export function useChatDeepLinks({
   activeSessionId,
   preferredSessionId,
   preferredRunId,
@@ -20,7 +20,7 @@ export function usePhase4DeepLinks({
   openRunDetails,
   inspectCompaction,
   inspectCheckpoint,
-}: UsePhase4DeepLinksOptions): void {
+}: UseChatDeepLinksOptions): void {
   const deepLinkedRunRef = useRef<string | null>(null);
   const deepLinkedCompactionRef = useRef<string | null>(null);
   const deepLinkedCheckpointRef = useRef<string | null>(null);

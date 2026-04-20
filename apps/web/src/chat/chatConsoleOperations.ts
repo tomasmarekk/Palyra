@@ -13,7 +13,7 @@ import {
   inspectCompactionAction,
   restoreCheckpointAction,
   runCompactionFlowAction,
-} from "./chatPhase4Actions";
+} from "./chatTranscriptMaintenanceActions";
 import {
   deletePinAction,
   exportTranscriptAction,
