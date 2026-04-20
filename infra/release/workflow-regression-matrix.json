@@ -1,249 +1,456 @@
 {
   "schema_version": 1,
-  "release_scope": "compat_plugin_insights_hardening",
+  "release_scope": "runtime_preview_acceptance_harness",
   "updated_at": "2026-04-20",
   "profiles": {
     "fast": {
-      "description": "Per-push Linux regression subset that still exercises every Phase 8 subsystem at least once.",
+      "description": "Per-push runtime preview acceptance baseline that keeps every canonical acceptance scenario wired through deterministic contract checks.",
       "required_subsystems": [
-        "compat_api",
-        "secrets",
-        "reload",
-        "plugin_contracts",
-        "context_engine",
-        "provider_resilience",
-        "auxiliary_routing",
-        "retrieval_tuning",
-        "safety_boundary",
-        "networked_backend",
-        "cron_delivery",
-        "operator_insights"
+        "session_queue_policy",
+        "pruning_policy_matrix",
+        "retrieval_dual_path",
+        "replay_capture",
+        "auxiliary_executor",
+        "flow_orchestration",
+        "delivery_arbitration",
+        "networked_workers"
       ],
-      "minimum_chaos_scenarios": 5
+      "minimum_chaos_scenarios": 0
     },
     "full": {
-      "description": "Nightly and pre-release workflow regression profile with broader runtime coverage and additional degraded-path validation.",
+      "description": "Nightly and pre-release runtime preview profile that keeps the contract baseline plus deeper runtime diagnostics, flow, and worker coverage green.",
       "required_subsystems": [
-        "compat_api",
-        "secrets",
-        "reload",
-        "plugin_contracts",
-        "context_engine",
-        "provider_resilience",
-        "auxiliary_routing",
-        "retrieval_tuning",
-        "safety_boundary",
-        "networked_backend",
-        "cron_delivery",
-        "operator_insights"
+        "session_queue_policy",
+        "pruning_policy_matrix",
+        "retrieval_dual_path",
+        "replay_capture",
+        "auxiliary_executor",
+        "flow_orchestration",
+        "delivery_arbitration",
+        "networked_workers"
       ],
-      "minimum_chaos_scenarios": 8
+      "minimum_chaos_scenarios": 2
     }
   },
   "required_subsystems": [
     {
-      "id": "compat_api",
-      "summary": "OpenAI-compatible models, embeddings, and guarded tools invoke surface."
+      "id": "session_queue_policy",
+      "summary": "Queued input lifecycle naming, states, and follow-up acceptance coverage."
     },
     {
-      "id": "secrets",
-      "summary": "SecretRef resolution, redaction, and missing-secret recovery behavior."
+      "id": "pruning_policy_matrix",
+      "summary": "Pruning and compaction preview contracts stay stable before runtime rollout widens."
     },
     {
-      "id": "reload",
-      "summary": "Config migrate, reload planning, and recovery behavior after operator changes."
+      "id": "retrieval_dual_path",
+      "summary": "Dual-path retrieval diagnostics and degraded recall posture remain explicit."
     },
     {
-      "id": "plugin_contracts",
-      "summary": "Typed plugin contract negotiation, discovery, and invalid config handling."
+      "id": "replay_capture",
+      "summary": "Replay-oriented checkpoint and capture fixtures stay serializable before full replay runtime lands."
     },
     {
-      "id": "context_engine",
-      "summary": "Context assembly, session compaction, and legacy/context-engine interop."
+      "id": "auxiliary_executor",
+      "summary": "Delegated child execution fixtures remain stable for future merge and lineage work."
     },
     {
-      "id": "provider_resilience",
-      "summary": "Provider failover, degraded auth posture, and compat embeddings fallback handling."
+      "id": "flow_orchestration",
+      "summary": "Flow transition lifecycle coverage remains wired before durable orchestration expands."
     },
     {
-      "id": "auxiliary_routing",
-      "summary": "Auxiliary routing and lease-pressure degradation decisions."
+      "id": "delivery_arbitration",
+      "summary": "Delivery policy and audit-only override behavior remain regression-tested."
     },
     {
-      "id": "retrieval_tuning",
-      "summary": "Retrieval backend/scoring config and degraded retrieval diagnostics."
-    },
-    {
-      "id": "safety_boundary",
-      "summary": "Safety gates around guarded compat/tool and networked worker execution."
-    },
-    {
-      "id": "networked_backend",
-      "summary": "Networked worker inventory, attestation, lifecycle, and restricted tool posture."
-    },
-    {
-      "id": "cron_delivery",
-      "summary": "Cron workflow delivery, list/runs surfaces, and ownership boundaries."
-    },
-    {
-      "id": "operator_insights",
-      "summary": "Operator insights API and diagnostics exposure for degraded hotspots."
+      "id": "networked_workers",
+      "summary": "Networked worker preview inventory, lifecycle, and degrade posture stay fail-closed."
     }
   ],
-  "setup_steps": [
+  "runtime_acceptance_fixtures": [
     {
-      "id": "build-core",
-      "label": "Build palyra-daemon and palyra-cli for workflow regression",
-      "profiles": [
+      "id": "session_transcript",
+      "summary": "Shared queued-input and checkpoint transcript fixture for acceptance and diagnostics tests."
+    },
+    {
+      "id": "retrieval_query",
+      "summary": "Shared dual-path retrieval query payload with explicit top-k and budget knobs."
+    },
+    {
+      "id": "workspace_patch",
+      "summary": "Workspace patch preview fixture for pruning and replay-ready mutation coverage."
+    },
+    {
+      "id": "delegated_child_run",
+      "summary": "Delegated child run fixture for auxiliary execution, progress merge, and delivery surfaces."
+    },
+    {
+      "id": "replay_bundle",
+      "summary": "Replay-preview bundle fixture for checkpoint pairing and future incident capture flows."
+    },
+    {
+      "id": "worker_lease",
+      "summary": "Attested worker lease fixture for networked worker preview inventory and lifecycle coverage."
+    }
+  ],
+  "runtime_acceptance_scenarios": [
+    {
+      "id": "queued_input_lifecycle",
+      "label": "Queued input lifecycle",
+      "summary": "Follow-up queue creation, forwarding, and fail-closed delivery updates.",
+      "capability": "session_queue_policy",
+      "required_profiles": [
         "fast",
         "full"
       ],
-      "command": [
-        "cargo",
-        "build",
-        "-p",
-        "palyra-daemon",
-        "-p",
-        "palyra-cli",
-        "--locked"
+      "fixture_keys": [
+        "session_transcript"
       ]
     },
     {
-      "id": "build-browserd",
-      "label": "Build palyra-browserd for browser and channel workflow coverage",
-      "profiles": [
+      "id": "pruning_decision",
+      "label": "Pruning decision",
+      "summary": "Compaction preview/apply contract and pruning savings surfaces remain stable.",
+      "capability": "pruning_policy_matrix",
+      "required_profiles": [
+        "fast",
         "full"
       ],
-      "command": [
-        "cargo",
-        "build",
-        "-p",
-        "palyra-browserd",
-        "--bin",
-        "palyra-browserd",
-        "--locked"
+      "fixture_keys": [
+        "session_transcript",
+        "workspace_patch"
+      ]
+    },
+    {
+      "id": "dual_path_retrieval",
+      "label": "Dual-path retrieval",
+      "summary": "Recall preview exercises memory and transcript/workspace retrieval branches.",
+      "capability": "retrieval_dual_path",
+      "required_profiles": [
+        "fast",
+        "full"
+      ],
+      "fixture_keys": [
+        "session_transcript",
+        "retrieval_query"
+      ]
+    },
+    {
+      "id": "preflight_checkpoint_pair",
+      "label": "Preflight checkpoint pair",
+      "summary": "Checkpoint + replay preflight pair remains serializable before replay capture expands.",
+      "capability": "replay_capture",
+      "required_profiles": [
+        "fast",
+        "full"
+      ],
+      "fixture_keys": [
+        "session_transcript",
+        "replay_bundle"
+      ]
+    },
+    {
+      "id": "child_progress_merge",
+      "label": "Child progress merge",
+      "summary": "Delegated child progress merge fixtures stay available for descendant delivery work.",
+      "capability": "auxiliary_executor",
+      "required_profiles": [
+        "fast",
+        "full"
+      ],
+      "fixture_keys": [
+        "delegated_child_run"
+      ]
+    },
+    {
+      "id": "flow_transitions",
+      "label": "Flow transitions",
+      "summary": "Flow cancellation, retry, and preview transition surfaces remain regression-tested.",
+      "capability": "flow_orchestration",
+      "required_profiles": [
+        "fast",
+        "full"
+      ],
+      "fixture_keys": [
+        "session_transcript",
+        "delegated_child_run"
+      ]
+    },
+    {
+      "id": "delivery_arbitration",
+      "label": "Delivery arbitration",
+      "summary": "Descendant-aware delivery policy and stale-parent suppression stay explicit.",
+      "capability": "delivery_arbitration",
+      "required_profiles": [
+        "fast",
+        "full"
+      ],
+      "fixture_keys": [
+        "session_transcript",
+        "delegated_child_run"
+      ]
+    },
+    {
+      "id": "networked_worker_preview",
+      "label": "Networked worker preview",
+      "summary": "Networked worker preview inventory and lifecycle telemetry stay wired and fail-closed.",
+      "capability": "networked_workers",
+      "required_profiles": [
+        "fast",
+        "full"
+      ],
+      "fixture_keys": [
+        "worker_lease"
       ]
     }
   ],
+  "setup_steps": [],
   "scenarios": [
     {
-      "id": "compat_model_detail_and_embeddings",
-      "label": "Compat model detail and embeddings surface stays registry-backed",
-      "category": "runtime",
+      "id": "queued_input_lifecycle_contract",
+      "label": "Queued input lifecycle contract remains wired into workflow regression",
+      "category": "contract",
       "profiles": [
         "fast",
         "full"
       ],
       "subsystems": [
-        "compat_api"
+        "session_queue_policy"
       ],
       "chaos": false,
-      "command": [
-        "cargo",
-        "test",
-        "-p",
-        "palyra-daemon",
-        "--test",
-        "openai_auth_surface",
-        "--locked",
-        "compat_model_detail_and_embeddings_surface_publish_registry_backed_payloads",
-        "--",
-        "--exact",
-        "--test-threads=1"
-      ]
-    },
-    {
-      "id": "compat_tools_invoke_guardrail",
-      "label": "Compat tools invoke remains explicitly gated even when enabled",
-      "category": "chaos",
-      "profiles": [
-        "fast",
-        "full"
+      "acceptance_scenarios": [
+        "queued_input_lifecycle"
       ],
-      "subsystems": [
-        "compat_api",
-        "safety_boundary"
-      ],
-      "chaos": true,
-      "command": [
-        "cargo",
-        "test",
-        "-p",
-        "palyra-daemon",
-        "--test",
-        "openai_auth_surface",
-        "--locked",
-        "compat_tools_invoke_is_disabled_by_default_and_refuses_when_enabled",
-        "--",
-        "--exact",
-        "--test-threads=1"
-      ]
-    },
-    {
-      "id": "compat_embeddings_degraded_posture",
-      "label": "Compat embeddings surfaces explicit degraded posture when the feature path is unavailable",
-      "category": "chaos",
-      "profiles": [
-        "fast",
-        "full"
-      ],
-      "subsystems": [
-        "compat_api",
-        "provider_resilience"
-      ],
-      "chaos": true,
-      "command": [
-        "cargo",
-        "test",
-        "-p",
-        "palyra-daemon",
-        "--test",
-        "openai_auth_surface",
-        "--locked",
-        "compat_embeddings_surface_reports_feature_disabled_and_degraded_posture",
-        "--",
-        "--exact",
-        "--test-threads=1"
-      ]
-    },
-    {
-      "id": "plugin_contract_workflows",
-      "label": "Typed plugin contract workflows stay installable, inspectable, and explainable",
-      "category": "runtime",
-      "profiles": [
-        "fast",
-        "full"
-      ],
-      "subsystems": [
-        "plugin_contracts"
-      ],
-      "chaos": false,
       "command": [
         "cargo",
         "test",
         "-p",
         "palyra-cli",
         "--test",
-        "workflow_regression_matrix",
+        "workflow_regression_contract",
         "--locked",
-        "plugin_operability_workflows_are_regression_tested",
+        "queued_input_lifecycle_contract",
         "--",
         "--exact",
         "--test-threads=1"
       ]
     },
     {
-      "id": "session_compaction_contract",
-      "label": "Session compaction CLI preview keeps the structured contract stable",
-      "category": "runtime",
+      "id": "pruning_decision_contract",
+      "label": "Pruning decision contract remains wired into workflow regression",
+      "category": "contract",
       "profiles": [
         "fast",
         "full"
       ],
       "subsystems": [
-        "context_engine"
+        "pruning_policy_matrix"
       ],
       "chaos": false,
+      "acceptance_scenarios": [
+        "pruning_decision"
+      ],
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "palyra-cli",
+        "--test",
+        "workflow_regression_contract",
+        "--locked",
+        "pruning_decision_contract",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "id": "dual_path_retrieval_contract",
+      "label": "Dual-path retrieval contract remains wired into workflow regression",
+      "category": "contract",
+      "profiles": [
+        "fast",
+        "full"
+      ],
+      "subsystems": [
+        "retrieval_dual_path"
+      ],
+      "chaos": false,
+      "acceptance_scenarios": [
+        "dual_path_retrieval"
+      ],
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "palyra-cli",
+        "--test",
+        "workflow_regression_contract",
+        "--locked",
+        "dual_path_retrieval_contract",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "id": "preflight_checkpoint_pair_contract",
+      "label": "Preflight checkpoint pair contract remains wired into workflow regression",
+      "category": "contract",
+      "profiles": [
+        "fast",
+        "full"
+      ],
+      "subsystems": [
+        "replay_capture"
+      ],
+      "chaos": false,
+      "acceptance_scenarios": [
+        "preflight_checkpoint_pair"
+      ],
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "palyra-cli",
+        "--test",
+        "workflow_regression_contract",
+        "--locked",
+        "preflight_checkpoint_pair_contract",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "id": "child_progress_merge_contract",
+      "label": "Child progress merge contract remains wired into workflow regression",
+      "category": "contract",
+      "profiles": [
+        "fast",
+        "full"
+      ],
+      "subsystems": [
+        "auxiliary_executor"
+      ],
+      "chaos": false,
+      "acceptance_scenarios": [
+        "child_progress_merge"
+      ],
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "palyra-cli",
+        "--test",
+        "workflow_regression_contract",
+        "--locked",
+        "child_progress_merge_contract",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "id": "flow_transitions_contract",
+      "label": "Flow transitions contract remains wired into workflow regression",
+      "category": "contract",
+      "profiles": [
+        "fast",
+        "full"
+      ],
+      "subsystems": [
+        "flow_orchestration"
+      ],
+      "chaos": false,
+      "acceptance_scenarios": [
+        "flow_transitions"
+      ],
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "palyra-cli",
+        "--test",
+        "workflow_regression_contract",
+        "--locked",
+        "flow_transitions_contract",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "id": "delivery_arbitration_contract",
+      "label": "Delivery arbitration contract remains wired into workflow regression",
+      "category": "contract",
+      "profiles": [
+        "fast",
+        "full"
+      ],
+      "subsystems": [
+        "delivery_arbitration"
+      ],
+      "chaos": false,
+      "acceptance_scenarios": [
+        "delivery_arbitration"
+      ],
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "palyra-cli",
+        "--test",
+        "workflow_regression_contract",
+        "--locked",
+        "delivery_arbitration_contract",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "id": "networked_worker_preview_contract",
+      "label": "Networked worker preview contract remains wired into workflow regression",
+      "category": "contract",
+      "profiles": [
+        "fast",
+        "full"
+      ],
+      "subsystems": [
+        "networked_workers"
+      ],
+      "chaos": false,
+      "acceptance_scenarios": [
+        "networked_worker_preview"
+      ],
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "palyra-cli",
+        "--test",
+        "workflow_regression_contract",
+        "--locked",
+        "networked_worker_preview_contract",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "id": "pruning_decision_runtime_preview",
+      "label": "Session compaction preview keeps pruning signals stable",
+      "category": "runtime",
+      "profiles": [
+        "full"
+      ],
+      "subsystems": [
+        "pruning_policy_matrix"
+      ],
+      "chaos": false,
+      "acceptance_scenarios": [
+        "pruning_decision"
+      ],
       "command": [
         "cargo",
         "test",
@@ -259,95 +466,19 @@
       ]
     },
     {
-      "id": "config_migrate_recover_redaction",
-      "label": "Config migrate and recover keep CSRF enforcement and secrets redacted",
+      "id": "dual_path_retrieval_runtime_diagnostics",
+      "label": "Memory diagnostics expose degraded dual-path retrieval posture",
       "category": "chaos",
       "profiles": [
-        "fast",
         "full"
       ],
       "subsystems": [
-        "secrets",
-        "reload"
+        "retrieval_dual_path"
       ],
       "chaos": true,
-      "command": [
-        "cargo",
-        "test",
-        "-p",
-        "palyra-daemon",
-        "--test",
-        "admin_surface",
-        "--locked",
-        "console_config_migrate_and_recover_require_session_csrf_and_keep_secrets_redacted",
-        "--",
-        "--exact",
-        "--test-threads=1"
-      ]
-    },
-    {
-      "id": "provider_failover_explain",
-      "label": "CLI provider explain surface preserves primary and failover candidates",
-      "category": "runtime",
-      "profiles": [
-        "fast",
-        "full"
+      "acceptance_scenarios": [
+        "dual_path_retrieval"
       ],
-      "subsystems": [
-        "provider_resilience"
-      ],
-      "chaos": false,
-      "command": [
-        "cargo",
-        "test",
-        "-p",
-        "palyra-cli",
-        "--test",
-        "models_cli",
-        "--locked",
-        "models_explain_reports_primary_and_failover_candidates",
-        "--",
-        "--exact",
-        "--test-threads=1"
-      ]
-    },
-    {
-      "id": "auxiliary_lease_degrade",
-      "label": "Auxiliary routing surfaces deferred lease pressure under degraded capacity",
-      "category": "chaos",
-      "profiles": [
-        "fast",
-        "full"
-      ],
-      "subsystems": [
-        "auxiliary_routing"
-      ],
-      "chaos": true,
-      "command": [
-        "cargo",
-        "test",
-        "-p",
-        "palyra-daemon",
-        "--lib",
-        "--locked",
-        "background_auxiliary_selection_surfaces_deferred_lease_pressure",
-        "--",
-        "--exact"
-      ]
-    },
-    {
-      "id": "memory_degraded_diagnostics",
-      "label": "Memory diagnostics publish explicit degraded retrieval posture",
-      "category": "chaos",
-      "profiles": [
-        "fast",
-        "full"
-      ],
-      "subsystems": [
-        "retrieval_tuning",
-        "operator_insights"
-      ],
-      "chaos": true,
       "command": [
         "cargo",
         "test",
@@ -363,18 +494,19 @@
       ]
     },
     {
-      "id": "networked_worker_filesystem_block",
-      "label": "Networked worker backend blocks filesystem write tools",
-      "category": "chaos",
+      "id": "flow_transitions_runtime_workflow",
+      "label": "Routines flow runtime keeps pause, resume, and schedule preview transitions stable",
+      "category": "runtime",
       "profiles": [
-        "fast",
         "full"
       ],
       "subsystems": [
-        "safety_boundary",
-        "networked_backend"
+        "flow_orchestration"
       ],
-      "chaos": true,
+      "chaos": false,
+      "acceptance_scenarios": [
+        "flow_transitions"
+      ],
       "command": [
         "cargo",
         "test",
@@ -382,279 +514,25 @@
         "palyra-daemon",
         "--lib",
         "--locked",
-        "networked_worker_backend_denies_filesystem_write_tools",
+        "routines_tool_flow_supports_upsert_listing_pause_resume_and_schedule_preview",
         "--",
         "--exact"
       ]
     },
     {
-      "id": "cron_delivery_workflow",
-      "label": "Cron workflow create, disable, and list-runs contract stays stable",
-      "category": "runtime",
-      "profiles": [
-        "fast",
-        "full"
-      ],
-      "subsystems": [
-        "cron_delivery"
-      ],
-      "chaos": false,
-      "command": [
-        "cargo",
-        "test",
-        "-p",
-        "palyra-daemon",
-        "--test",
-        "admin_surface",
-        "--locked",
-        "console_cron_workflow_create_disable_and_list_runs",
-        "--",
-        "--exact",
-        "--test-threads=1"
-      ]
-    },
-    {
-      "id": "operator_insights_surface",
-      "label": "System and diagnostics surfaces publish operator insights hotspots",
-      "category": "runtime",
-      "profiles": [
-        "fast",
-        "full"
-      ],
-      "subsystems": [
-        "operator_insights"
-      ],
-      "chaos": false,
-      "command": [
-        "cargo",
-        "test",
-        "-p",
-        "palyra-daemon",
-        "--test",
-        "admin_surface",
-        "--locked",
-        "console_system_surface_returns_presence_and_enforces_emit_csrf",
-        "--",
-        "--exact",
-        "--test-threads=1"
-      ]
-    },
-    {
-      "id": "compat_model_detail_not_found",
-      "label": "Compat model detail returns a deterministic not-found payload for unknown models",
-      "category": "chaos",
-      "profiles": [
-        "full"
-      ],
-      "subsystems": [
-        "compat_api"
-      ],
-      "chaos": true,
-      "command": [
-        "cargo",
-        "test",
-        "-p",
-        "palyra-daemon",
-        "--test",
-        "openai_auth_surface",
-        "--locked",
-        "compat_model_detail_returns_not_found_for_unknown_model",
-        "--",
-        "--exact",
-        "--test-threads=1"
-      ]
-    },
-    {
-      "id": "local_remote_lifecycle_workflows",
-      "label": "Setup, onboarding, backup, update, uninstall, and reset workflows stay regression-tested",
+      "id": "delivery_arbitration_runtime_override",
+      "label": "Routine test-run replay keeps audit-only delivery overrides explicit",
       "category": "runtime",
       "profiles": [
         "full"
       ],
       "subsystems": [
-        "secrets",
-        "reload"
+        "delivery_arbitration"
       ],
       "chaos": false,
-      "command": [
-        "cargo",
-        "test",
-        "-p",
-        "palyra-cli",
-        "--test",
-        "workflow_regression_matrix",
-        "--locked",
-        "local_remote_and_lifecycle_workflows_are_regression_tested",
-        "--",
-        "--exact",
-        "--test-threads=1"
-      ]
-    },
-    {
-      "id": "browser_channels_sessions",
-      "label": "Browser, channel verification, and session runtime workflows stay regression-tested",
-      "category": "runtime",
-      "profiles": [
-        "full"
+      "acceptance_scenarios": [
+        "delivery_arbitration"
       ],
-      "subsystems": [
-        "context_engine",
-        "networked_backend"
-      ],
-      "chaos": false,
-      "command": [
-        "cargo",
-        "test",
-        "-p",
-        "palyra-cli",
-        "--test",
-        "workflow_regression_matrix",
-        "--locked",
-        "browser_channels_and_session_workflows_are_regression_tested",
-        "--",
-        "--exact",
-        "--test-threads=1"
-      ]
-    },
-    {
-      "id": "discord_admin_cli_workflows",
-      "label": "Discord message admin CLI workflows stay regression-tested",
-      "category": "runtime",
-      "profiles": [
-        "full"
-      ],
-      "subsystems": [
-        "cron_delivery"
-      ],
-      "chaos": false,
-      "command": [
-        "cargo",
-        "test",
-        "-p",
-        "palyra-cli",
-        "--test",
-        "workflow_regression_matrix",
-        "--locked",
-        "discord_message_admin_cli_workflows_are_regression_tested",
-        "--",
-        "--exact",
-        "--test-threads=1"
-      ]
-    },
-    {
-      "id": "cron_owner_boundary",
-      "label": "Cron endpoints enforce owner principal boundaries",
-      "category": "chaos",
-      "profiles": [
-        "full"
-      ],
-      "subsystems": [
-        "cron_delivery",
-        "safety_boundary"
-      ],
-      "chaos": true,
-      "command": [
-        "cargo",
-        "test",
-        "-p",
-        "palyra-daemon",
-        "--test",
-        "admin_surface",
-        "--locked",
-        "console_cron_endpoints_enforce_owner_principal_boundaries",
-        "--",
-        "--exact",
-        "--test-threads=1"
-      ]
-    },
-    {
-      "id": "plugin_hook_bindings",
-      "label": "Plugins and hooks stay bound to installed skills and dispatch events",
-      "category": "runtime",
-      "profiles": [
-        "full"
-      ],
-      "subsystems": [
-        "plugin_contracts"
-      ],
-      "chaos": false,
-      "command": [
-        "cargo",
-        "test",
-        "-p",
-        "palyra-daemon",
-        "--test",
-        "admin_surface",
-        "--locked",
-        "console_plugins_and_hooks_bind_installed_skills_and_dispatch_skill_events",
-        "--",
-        "--exact",
-        "--test-threads=1"
-      ]
-    },
-    {
-      "id": "provider_auth_redaction",
-      "label": "CLI provider test-connection keeps auth failures redacted",
-      "category": "chaos",
-      "profiles": [
-        "full"
-      ],
-      "subsystems": [
-        "provider_resilience",
-        "secrets"
-      ],
-      "chaos": true,
-      "command": [
-        "cargo",
-        "test",
-        "-p",
-        "palyra-cli",
-        "--test",
-        "models_cli",
-        "--locked",
-        "models_test_connection_redacts_provider_auth_failures",
-        "--",
-        "--exact",
-        "--test-threads=1"
-      ]
-    },
-    {
-      "id": "profile_secret_ref_roundtrip",
-      "label": "Encrypted profile export/import surfaces missing secret refs instead of silently degrading",
-      "category": "chaos",
-      "profiles": [
-        "full"
-      ],
-      "subsystems": [
-        "secrets",
-        "reload"
-      ],
-      "chaos": true,
-      "command": [
-        "cargo",
-        "test",
-        "-p",
-        "palyra-cli",
-        "--test",
-        "wizard_cli",
-        "--locked",
-        "profile_export_encrypted_and_import_reports_missing_secret_refs",
-        "--",
-        "--exact",
-        "--test-threads=1"
-      ]
-    },
-    {
-      "id": "auxiliary_low_cost_routing",
-      "label": "Auxiliary routing prefers the lower-cost candidate when enabled",
-      "category": "runtime",
-      "profiles": [
-        "full"
-      ],
-      "subsystems": [
-        "auxiliary_routing"
-      ],
-      "chaos": false,
       "command": [
         "cargo",
         "test",
@@ -662,114 +540,25 @@
         "palyra-daemon",
         "--lib",
         "--locked",
-        "auxiliary_routing_prefers_lower_cost_candidate_even_for_complex_work",
+        "routines_tool_test_run_and_replay_force_fresh_sessions_and_audit_only_delivery",
         "--",
         "--exact"
       ]
     },
     {
-      "id": "retrieval_backend_overrides",
-      "label": "Retrieval backend and scoring overrides stay configurable",
+      "id": "networked_worker_inventory_runtime_preview",
+      "label": "Networked worker inventory only becomes selectable for attested workers",
       "category": "runtime",
       "profiles": [
         "full"
       ],
       "subsystems": [
-        "retrieval_tuning"
+        "networked_workers"
       ],
       "chaos": false,
-      "command": [
-        "cargo",
-        "test",
-        "-p",
-        "palyra-daemon",
-        "--lib",
-        "--locked",
-        "memory_retrieval_config_applies_backend_and_scoring_overrides",
-        "--",
-        "--exact"
-      ]
-    },
-    {
-      "id": "retrieval_invalid_weight_sum",
-      "label": "Retrieval config rejects invalid scoring weight sums",
-      "category": "chaos",
-      "profiles": [
-        "full"
+      "acceptance_scenarios": [
+        "networked_worker_preview"
       ],
-      "subsystems": [
-        "retrieval_tuning"
-      ],
-      "chaos": true,
-      "command": [
-        "cargo",
-        "test",
-        "-p",
-        "palyra-daemon",
-        "--lib",
-        "--locked",
-        "memory_retrieval_config_rejects_invalid_weight_sum",
-        "--",
-        "--exact"
-      ]
-    },
-    {
-      "id": "context_engine_legacy_bridge",
-      "label": "Gateway model-provider input still supports legacy and context-engine flows",
-      "category": "runtime",
-      "profiles": [
-        "full"
-      ],
-      "subsystems": [
-        "context_engine"
-      ],
-      "chaos": false,
-      "command": [
-        "cargo",
-        "test",
-        "-p",
-        "palyra-daemon",
-        "--lib",
-        "--locked",
-        "prepare_model_provider_input_supports_legacy_and_context_engine_flows",
-        "--",
-        "--exact"
-      ]
-    },
-    {
-      "id": "networked_backend_degraded_inventory",
-      "label": "Networked backend inventory reports degraded posture without healthy workers",
-      "category": "chaos",
-      "profiles": [
-        "full"
-      ],
-      "subsystems": [
-        "networked_backend"
-      ],
-      "chaos": true,
-      "command": [
-        "cargo",
-        "test",
-        "-p",
-        "palyra-daemon",
-        "--lib",
-        "--locked",
-        "preview_backend_inventory_is_degraded_without_healthy_nodes",
-        "--",
-        "--exact"
-      ]
-    },
-    {
-      "id": "networked_backend_attested_inventory",
-      "label": "Networked backend inventory exposes only attested workers",
-      "category": "runtime",
-      "profiles": [
-        "full"
-      ],
-      "subsystems": [
-        "networked_backend"
-      ],
-      "chaos": false,
       "command": [
         "cargo",
         "test",
@@ -783,17 +572,19 @@
       ]
     },
     {
-      "id": "networked_worker_reason_codes",
-      "label": "Networked worker annotations surface backend reason codes",
-      "category": "runtime",
+      "id": "networked_worker_degraded_runtime_preview",
+      "label": "Networked worker preview stays degraded without healthy workers",
+      "category": "chaos",
       "profiles": [
         "full"
       ],
       "subsystems": [
-        "networked_backend",
-        "safety_boundary"
+        "networked_workers"
       ],
-      "chaos": false,
+      "chaos": true,
+      "acceptance_scenarios": [
+        "networked_worker_preview"
+      ],
       "command": [
         "cargo",
         "test",
@@ -801,22 +592,25 @@
         "palyra-daemon",
         "--lib",
         "--locked",
-        "networked_worker_annotation_surfaces_backend_reason_codes",
+        "preview_backend_inventory_is_degraded_without_healthy_nodes",
         "--",
         "--exact"
       ]
     },
     {
-      "id": "networked_worker_lifecycle_journal",
-      "label": "Networked worker lifecycle events stay journaled",
+      "id": "networked_worker_lifecycle_runtime_preview",
+      "label": "Networked worker lifecycle events stay journaled during preview flows",
       "category": "runtime",
       "profiles": [
         "full"
       ],
       "subsystems": [
-        "networked_backend"
+        "networked_workers"
       ],
       "chaos": false,
+      "acceptance_scenarios": [
+        "networked_worker_preview"
+      ],
       "command": [
         "cargo",
         "test",
@@ -827,29 +621,6 @@
         "networked_worker_lifecycle_events_are_journaled",
         "--",
         "--exact"
-      ]
-    },
-    {
-      "id": "legacy_acp_shim",
-      "label": "Legacy ACP shim coverage stays in the full workflow regression profile",
-      "category": "runtime",
-      "profiles": [
-        "full"
-      ],
-      "subsystems": [
-        "compat_api"
-      ],
-      "chaos": false,
-      "command": [
-        "cargo",
-        "test",
-        "-p",
-        "palyra-cli",
-        "--test",
-        "cli_v1_acp_shim",
-        "--locked",
-        "--",
-        "--test-threads=1"
       ]
     }
   ]

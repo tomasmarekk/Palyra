@@ -521,6 +521,31 @@ pub const ALL_RUNTIME_ACCEPTANCE_SCENARIOS: [RuntimeAcceptanceScenario; 8] = [
     RuntimeAcceptanceScenario::NetworkedWorkerPreview,
 ];
 
+pub const RUNTIME_ACCEPTANCE_FIXTURE_SESSION_TRANSCRIPT: &str = "session_transcript";
+pub const RUNTIME_ACCEPTANCE_FIXTURE_RETRIEVAL_QUERY: &str = "retrieval_query";
+pub const RUNTIME_ACCEPTANCE_FIXTURE_WORKSPACE_PATCH: &str = "workspace_patch";
+pub const RUNTIME_ACCEPTANCE_FIXTURE_DELEGATED_CHILD_RUN: &str = "delegated_child_run";
+pub const RUNTIME_ACCEPTANCE_FIXTURE_REPLAY_BUNDLE: &str = "replay_bundle";
+pub const RUNTIME_ACCEPTANCE_FIXTURE_WORKER_LEASE: &str = "worker_lease";
+
+const QUEUED_INPUT_LIFECYCLE_FIXTURES: &[&str] = &[RUNTIME_ACCEPTANCE_FIXTURE_SESSION_TRANSCRIPT];
+const PRUNING_DECISION_FIXTURES: &[&str] =
+    &[RUNTIME_ACCEPTANCE_FIXTURE_SESSION_TRANSCRIPT, RUNTIME_ACCEPTANCE_FIXTURE_WORKSPACE_PATCH];
+const DUAL_PATH_RETRIEVAL_FIXTURES: &[&str] =
+    &[RUNTIME_ACCEPTANCE_FIXTURE_SESSION_TRANSCRIPT, RUNTIME_ACCEPTANCE_FIXTURE_RETRIEVAL_QUERY];
+const PREFLIGHT_CHECKPOINT_PAIR_FIXTURES: &[&str] =
+    &[RUNTIME_ACCEPTANCE_FIXTURE_SESSION_TRANSCRIPT, RUNTIME_ACCEPTANCE_FIXTURE_REPLAY_BUNDLE];
+const CHILD_PROGRESS_MERGE_FIXTURES: &[&str] = &[RUNTIME_ACCEPTANCE_FIXTURE_DELEGATED_CHILD_RUN];
+const FLOW_TRANSITIONS_FIXTURES: &[&str] = &[
+    RUNTIME_ACCEPTANCE_FIXTURE_SESSION_TRANSCRIPT,
+    RUNTIME_ACCEPTANCE_FIXTURE_DELEGATED_CHILD_RUN,
+];
+const DELIVERY_ARBITRATION_FIXTURES: &[&str] = &[
+    RUNTIME_ACCEPTANCE_FIXTURE_SESSION_TRANSCRIPT,
+    RUNTIME_ACCEPTANCE_FIXTURE_DELEGATED_CHILD_RUN,
+];
+const NETWORKED_WORKER_PREVIEW_FIXTURES: &[&str] = &[RUNTIME_ACCEPTANCE_FIXTURE_WORKER_LEASE];
+
 impl RuntimeAcceptanceScenario {
     #[must_use]
     pub const fn label(self) -> &'static str {
@@ -579,6 +604,20 @@ impl RuntimeAcceptanceScenario {
             Self::NetworkedWorkerPreview => RuntimePreviewCapability::NetworkedWorkers,
         }
     }
+
+    #[must_use]
+    pub const fn required_fixture_keys(self) -> &'static [&'static str] {
+        match self {
+            Self::QueuedInputLifecycle => QUEUED_INPUT_LIFECYCLE_FIXTURES,
+            Self::PruningDecision => PRUNING_DECISION_FIXTURES,
+            Self::DualPathRetrieval => DUAL_PATH_RETRIEVAL_FIXTURES,
+            Self::PreflightCheckpointPair => PREFLIGHT_CHECKPOINT_PAIR_FIXTURES,
+            Self::ChildProgressMerge => CHILD_PROGRESS_MERGE_FIXTURES,
+            Self::FlowTransitions => FLOW_TRANSITIONS_FIXTURES,
+            Self::DeliveryArbitration => DELIVERY_ARBITRATION_FIXTURES,
+            Self::NetworkedWorkerPreview => NETWORKED_WORKER_PREVIEW_FIXTURES,
+        }
+    }
 }
 
 #[must_use]
@@ -618,6 +657,13 @@ pub fn runtime_acceptance_fixture_catalog() -> Value {
             "artifact_count": 2,
             "contains_transcript": true,
             "contains_workspace_patch": true
+        },
+        "worker_lease": {
+            "worker_id": "worker-preview-01",
+            "attested": true,
+            "lease_id": "lease-preview-01",
+            "requested_backend": "networked_worker",
+            "requested_capability": "networked_worker_preview"
         }
     })
 }
@@ -698,6 +744,32 @@ mod tests {
     }
 
     #[test]
+    fn runtime_acceptance_scenarios_publish_required_fixture_keys() {
+        let fixture_catalog = runtime_acceptance_fixture_catalog();
+        let fixture_keys = fixture_catalog
+            .as_object()
+            .expect("fixture catalog should serialize as an object")
+            .keys()
+            .filter(|key| key.as_str() != "schema_version")
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        for scenario in ALL_RUNTIME_ACCEPTANCE_SCENARIOS {
+            assert!(
+                !scenario.required_fixture_keys().is_empty(),
+                "{} should publish required fixtures",
+                scenario.as_str()
+            );
+            for fixture_key in scenario.required_fixture_keys() {
+                assert!(
+                    fixture_keys.contains(*fixture_key),
+                    "{} should reference a declared shared fixture",
+                    scenario.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn runtime_acceptance_fixture_catalog_exposes_shared_runtime_fixtures() {
         let fixture = runtime_acceptance_fixture_catalog();
         assert_eq!(fixture["schema_version"], 1);
@@ -706,6 +778,7 @@ mod tests {
         assert!(fixture.get("workspace_patch").is_some());
         assert!(fixture.get("delegated_child_run").is_some());
         assert!(fixture.get("replay_bundle").is_some());
+        assert!(fixture.get("worker_lease").is_some());
     }
 
     #[test]

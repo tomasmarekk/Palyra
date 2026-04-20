@@ -22,6 +22,7 @@ cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked openai_pro
 cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked discord_onboarding_preflight_apply_and_verify_use_console_session_and_csrf
 cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked support_bundle_export_plan_capture_does_not_hold_supervisor_lock
 
+cargo test -p palyra-cli --test workflow_regression_contract --locked
 cargo test -p palyra-daemon --test openai_auth_surface --locked
 cargo test -p palyra-daemon --test admin_surface --locked console_support_bundle_job_lifecycle_publishes_deterministic_completion_state
 cargo test -p palyra-daemon --test gateway_grpc --locked grpc_route_message_with_fake_adapter_emits_reply_and_journal_events

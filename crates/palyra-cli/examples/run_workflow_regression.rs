@@ -7,8 +7,10 @@ use std::{
 
 use anyhow::{Context, Result};
 use palyra_cli::workflow_regression::{
-    build_compat_checklist_status, covered_subsystems_for_profile, load_compat_release_readiness,
-    load_workflow_regression_manifest, repo_root_from_manifest_dir, resolve_repo_relative_path,
+    build_compat_checklist_status, covered_acceptance_scenarios_for_profile,
+    covered_subsystems_for_profile, load_compat_release_readiness,
+    load_workflow_regression_manifest, repo_root_from_manifest_dir,
+    required_acceptance_scenarios_for_profile, resolve_repo_relative_path,
     validate_compat_release_readiness, validate_workflow_regression_manifest, CompatChecklistState,
     WorkflowRegressionCoverageSummary, WorkflowRegressionExecutionRecord,
     WorkflowRegressionExecutionStatus, WorkflowRegressionRunReport, WorkflowRegressionRunSummary,
@@ -131,6 +133,19 @@ fn main() -> Result<()> {
         .filter(|entry| !covered_subsystems.iter().any(|covered| covered == *entry))
         .cloned()
         .collect::<Vec<_>>();
+    let required_acceptance_scenarios =
+        required_acceptance_scenarios_for_profile(&manifest, options.profile.as_str())
+            .into_iter()
+            .collect::<Vec<_>>();
+    let covered_acceptance_scenarios =
+        covered_acceptance_scenarios_for_profile(&manifest, options.profile.as_str())
+            .into_iter()
+            .collect::<Vec<_>>();
+    let missing_acceptance_scenarios = required_acceptance_scenarios
+        .iter()
+        .filter(|entry| !covered_acceptance_scenarios.iter().any(|covered| covered == *entry))
+        .cloned()
+        .collect::<Vec<_>>();
     let summary = WorkflowRegressionRunSummary {
         setup_total: setup_records.len(),
         setup_failed: setup_records
@@ -162,6 +177,9 @@ fn main() -> Result<()> {
         required_subsystems,
         covered_subsystems,
         missing_subsystems,
+        required_acceptance_scenarios,
+        covered_acceptance_scenarios,
+        missing_acceptance_scenarios,
     };
 
     let placeholder_report = WorkflowRegressionRunReport {

@@ -5,6 +5,9 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use palyra_common::runtime_preview::{
+    runtime_acceptance_fixture_catalog, ALL_RUNTIME_ACCEPTANCE_SCENARIOS,
+};
 use serde::{Deserialize, Serialize};
 
 pub const WORKFLOW_REGRESSION_SCHEMA_VERSION: u32 = 1;
@@ -16,6 +19,8 @@ pub struct WorkflowRegressionManifest {
     pub updated_at: String,
     pub profiles: BTreeMap<String, WorkflowRegressionProfile>,
     pub required_subsystems: Vec<WorkflowRegressionSubsystem>,
+    pub runtime_acceptance_fixtures: Vec<WorkflowRegressionFixture>,
+    pub runtime_acceptance_scenarios: Vec<WorkflowRegressionAcceptanceScenario>,
     pub setup_steps: Vec<WorkflowRegressionSetupStep>,
     pub scenarios: Vec<WorkflowRegressionScenario>,
 }
@@ -42,6 +47,22 @@ pub struct WorkflowRegressionSetupStep {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowRegressionFixture {
+    pub id: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowRegressionAcceptanceScenario {
+    pub id: String,
+    pub label: String,
+    pub summary: String,
+    pub capability: String,
+    pub required_profiles: Vec<String>,
+    pub fixture_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowRegressionScenario {
     pub id: String,
     pub label: String,
@@ -49,6 +70,8 @@ pub struct WorkflowRegressionScenario {
     pub profiles: Vec<String>,
     pub subsystems: Vec<String>,
     pub chaos: bool,
+    #[serde(default)]
+    pub acceptance_scenarios: Vec<String>,
     pub command: Vec<String>,
 }
 
@@ -149,6 +172,9 @@ pub struct WorkflowRegressionCoverageSummary {
     pub required_subsystems: Vec<String>,
     pub covered_subsystems: Vec<String>,
     pub missing_subsystems: Vec<String>,
+    pub required_acceptance_scenarios: Vec<String>,
+    pub covered_acceptance_scenarios: Vec<String>,
+    pub missing_acceptance_scenarios: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -240,14 +266,39 @@ pub fn validate_workflow_regression_manifest(manifest: &WorkflowRegressionManife
     if manifest.required_subsystems.is_empty() {
         anyhow::bail!("workflow regression manifest must define at least one required subsystem");
     }
+    if manifest.runtime_acceptance_fixtures.is_empty() {
+        anyhow::bail!(
+            "workflow regression manifest must define shared runtime acceptance fixtures"
+        );
+    }
+    if manifest.runtime_acceptance_scenarios.is_empty() {
+        anyhow::bail!(
+            "workflow regression manifest must define runtime acceptance minimum scenarios"
+        );
+    }
     if manifest.scenarios.is_empty() {
         anyhow::bail!("workflow regression manifest must define at least one scenario");
     }
 
     let profile_ids = manifest.profiles.keys().cloned().collect::<BTreeSet<_>>();
     let subsystem_ids = validate_subsystem_catalog(manifest.required_subsystems.as_slice())?;
+    let fixture_catalog_ids = runtime_acceptance_fixture_catalog_ids()?;
+    let manifest_fixture_ids = validate_runtime_acceptance_fixtures(
+        manifest.runtime_acceptance_fixtures.as_slice(),
+        &fixture_catalog_ids,
+    )?;
+    let runtime_acceptance_ids = validate_runtime_acceptance_catalog(
+        manifest.runtime_acceptance_scenarios.as_slice(),
+        &profile_ids,
+        &manifest_fixture_ids,
+    )?;
     validate_setup_steps(manifest.setup_steps.as_slice(), &profile_ids)?;
-    validate_scenarios(manifest.scenarios.as_slice(), &profile_ids, &subsystem_ids)?;
+    validate_scenarios(
+        manifest.scenarios.as_slice(),
+        &profile_ids,
+        &subsystem_ids,
+        &runtime_acceptance_ids,
+    )?;
 
     for (profile_id, profile) in &manifest.profiles {
         ensure_nonempty_value(
@@ -270,6 +321,20 @@ pub fn validate_workflow_regression_manifest(manifest: &WorkflowRegressionManife
             if !covered_subsystems.contains(subsystem_id) {
                 anyhow::bail!(
                     "workflow regression profile '{profile_id}' is missing scenario coverage for subsystem '{subsystem_id}'"
+                );
+            }
+        }
+        let covered_acceptance_scenarios =
+            covered_acceptance_scenarios_for_profile(manifest, profile_id.as_str());
+        for acceptance in manifest
+            .runtime_acceptance_scenarios
+            .iter()
+            .filter(|entry| entry.required_profiles.iter().any(|value| value == profile_id))
+        {
+            if !covered_acceptance_scenarios.contains(acceptance.id.as_str()) {
+                anyhow::bail!(
+                    "workflow regression profile '{profile_id}' is missing acceptance coverage for scenario '{}'",
+                    acceptance.id
                 );
             }
         }
@@ -624,6 +689,30 @@ pub fn covered_subsystems_for_profile(
         .collect()
 }
 
+pub fn required_acceptance_scenarios_for_profile(
+    manifest: &WorkflowRegressionManifest,
+    profile_id: &str,
+) -> BTreeSet<String> {
+    manifest
+        .runtime_acceptance_scenarios
+        .iter()
+        .filter(|scenario| scenario.required_profiles.iter().any(|value| value == profile_id))
+        .map(|scenario| scenario.id.clone())
+        .collect()
+}
+
+pub fn covered_acceptance_scenarios_for_profile(
+    manifest: &WorkflowRegressionManifest,
+    profile_id: &str,
+) -> BTreeSet<String> {
+    manifest
+        .scenarios
+        .iter()
+        .filter(|scenario| scenario.profiles.iter().any(|value| value == profile_id))
+        .flat_map(|scenario| scenario.acceptance_scenarios.iter().cloned())
+        .collect()
+}
+
 pub fn repo_root_from_manifest_dir() -> Result<PathBuf> {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -691,6 +780,7 @@ fn validate_scenarios(
     scenarios: &[WorkflowRegressionScenario],
     profile_ids: &BTreeSet<String>,
     subsystem_ids: &BTreeSet<String>,
+    runtime_acceptance_ids: &BTreeSet<String>,
 ) -> Result<()> {
     ensure_unique_ids(
         scenarios.iter().map(|scenario| scenario.id.as_str()),
@@ -729,8 +819,145 @@ fn validate_scenarios(
                 );
             }
         }
+        for acceptance_scenario in &scenario.acceptance_scenarios {
+            if !runtime_acceptance_ids.contains(acceptance_scenario) {
+                anyhow::bail!(
+                    "workflow regression scenario '{}' references unknown runtime acceptance scenario '{}'",
+                    scenario.id,
+                    acceptance_scenario
+                );
+            }
+        }
     }
     Ok(())
+}
+
+fn runtime_acceptance_fixture_catalog_ids() -> Result<BTreeSet<String>> {
+    let fixture_catalog = runtime_acceptance_fixture_catalog();
+    let fixture_catalog = fixture_catalog.as_object().ok_or_else(|| {
+        anyhow::anyhow!("runtime acceptance fixture catalog should serialize as an object")
+    })?;
+    let mut fixture_ids = BTreeSet::new();
+    for key in fixture_catalog.keys() {
+        if key == "schema_version" {
+            continue;
+        }
+        fixture_ids.insert(key.clone());
+    }
+    if fixture_ids.is_empty() {
+        anyhow::bail!("runtime acceptance fixture catalog must declare shared fixtures");
+    }
+    Ok(fixture_ids)
+}
+
+fn validate_runtime_acceptance_fixtures(
+    fixtures: &[WorkflowRegressionFixture],
+    fixture_catalog_ids: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    ensure_unique_ids(
+        fixtures.iter().map(|fixture| fixture.id.as_str()),
+        "workflow regression fixture ids",
+    )?;
+    let mut fixture_ids = BTreeSet::new();
+    for fixture in fixtures {
+        ensure_nonempty_value(
+            fixture.summary.as_str(),
+            format!("workflow regression fixture '{}' summary must not be empty", fixture.id),
+        )?;
+        if !fixture_catalog_ids.contains(fixture.id.as_str()) {
+            anyhow::bail!(
+                "workflow regression fixture '{}' is not published by palyra-common runtime acceptance fixtures",
+                fixture.id
+            );
+        }
+        fixture_ids.insert(fixture.id.clone());
+    }
+    Ok(fixture_ids)
+}
+
+fn validate_runtime_acceptance_catalog(
+    scenarios: &[WorkflowRegressionAcceptanceScenario],
+    profile_ids: &BTreeSet<String>,
+    fixture_ids: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    ensure_unique_ids(
+        scenarios.iter().map(|scenario| scenario.id.as_str()),
+        "workflow regression runtime acceptance scenario ids",
+    )?;
+    let canonical_scenarios = ALL_RUNTIME_ACCEPTANCE_SCENARIOS
+        .into_iter()
+        .map(|scenario| (scenario.as_str(), scenario))
+        .collect::<BTreeMap<_, _>>();
+    let mut scenario_ids = BTreeSet::new();
+    for scenario in scenarios {
+        ensure_nonempty_value(
+            scenario.label.as_str(),
+            format!(
+                "workflow regression runtime acceptance scenario '{}' label must not be empty",
+                scenario.id
+            ),
+        )?;
+        ensure_nonempty_value(
+            scenario.summary.as_str(),
+            format!(
+                "workflow regression runtime acceptance scenario '{}' summary must not be empty",
+                scenario.id
+            ),
+        )?;
+        validate_profiles(
+            profile_ids,
+            scenario.required_profiles.as_slice(),
+            format!("workflow regression runtime acceptance scenario '{}'", scenario.id),
+        )?;
+        let Some(canonical) = canonical_scenarios.get(scenario.id.as_str()).copied() else {
+            anyhow::bail!(
+                "workflow regression runtime acceptance scenario '{}' is not declared in palyra-common",
+                scenario.id
+            );
+        };
+        if scenario.capability != canonical.capability().as_str() {
+            anyhow::bail!(
+                "workflow regression runtime acceptance scenario '{}' must target capability '{}', found '{}'",
+                scenario.id,
+                canonical.capability().as_str(),
+                scenario.capability
+            );
+        }
+        let expected_fixture_keys = canonical
+            .required_fixture_keys()
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<BTreeSet<_>>();
+        let actual_fixture_keys = scenario.fixture_keys.iter().cloned().collect::<BTreeSet<_>>();
+        if actual_fixture_keys != expected_fixture_keys {
+            anyhow::bail!(
+                "workflow regression runtime acceptance scenario '{}' fixture keys do not match the canonical shared fixture set",
+                scenario.id
+            );
+        }
+        for fixture_id in &scenario.fixture_keys {
+            if !fixture_ids.contains(fixture_id) {
+                anyhow::bail!(
+                    "workflow regression runtime acceptance scenario '{}' references unknown fixture '{}'",
+                    scenario.id,
+                    fixture_id
+                );
+            }
+        }
+        scenario_ids.insert(scenario.id.clone());
+    }
+    let missing_canonical_scenarios = canonical_scenarios
+        .keys()
+        .filter(|id| !scenario_ids.contains(**id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing_canonical_scenarios.is_empty() {
+        anyhow::bail!(
+            "workflow regression manifest is missing canonical runtime acceptance scenarios: {}",
+            missing_canonical_scenarios.join(", ")
+        );
+    }
+    Ok(scenario_ids)
 }
 
 fn validate_profiles(

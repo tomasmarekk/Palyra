@@ -72,6 +72,7 @@ run_desktop_test openai_profile_actions_hit_expected_routes_including_reconnect
 run_desktop_test discord_onboarding_preflight_apply_and_verify_use_console_session_and_csrf
 run_desktop_test support_bundle_export_plan_capture_does_not_hold_supervisor_lock
 
+"$CARGO_BIN" test -p palyra-cli --test workflow_regression_contract --locked
 "$CARGO_BIN" test -p palyra-daemon --test openai_auth_surface --locked
 "$CARGO_BIN" test -p palyra-daemon --test admin_surface --locked console_support_bundle_job_lifecycle_publishes_deterministic_completion_state
 "$CARGO_BIN" test -p palyra-daemon --test gateway_grpc --locked grpc_route_message_with_fake_adapter_emits_reply_and_journal_events
