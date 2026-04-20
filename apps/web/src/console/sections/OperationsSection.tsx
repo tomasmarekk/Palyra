@@ -74,9 +74,7 @@ export function OperationsSection({ app }: OperationsSectionProps) {
     Array.isArray(previewGuardrails?.recommendations) ? previewGuardrails.recommendations : [],
   );
   const runtimeGuardrailChecklist = toStringArray(
-    Array.isArray(previewGuardrails?.rollout_checklist)
-      ? previewGuardrails.rollout_checklist
-      : [],
+    Array.isArray(previewGuardrails?.rollout_checklist) ? previewGuardrails.rollout_checklist : [],
   );
   const runtimeFailureModes = toStringArray(
     Array.isArray(previewGuardrails?.failure_modes) ? previewGuardrails.failure_modes : [],
@@ -401,7 +399,9 @@ export function OperationsSection({ app }: OperationsSectionProps) {
                   </tr>
                   <tr>
                     <td>Overflow summaries</td>
-                    <td>{readNumber(previewMetrics, "queue_overflow_summary_rate_bps") ?? 0} bps</td>
+                    <td>
+                      {readNumber(previewMetrics, "queue_overflow_summary_rate_bps") ?? 0} bps
+                    </td>
                     <td>
                       {readNumber(previewMetrics, "queue_overflow_events") ?? 0} overflow summary
                       events; {readNumber(previewMetrics, "queue_steering_deferrals") ?? 0} steering

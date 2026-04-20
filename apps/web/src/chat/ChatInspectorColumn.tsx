@@ -821,7 +821,9 @@ export function ChatInspectorColumn({
               {sessionMaintenanceBusyKey === "queue-resume" ? "Resuming..." : "Resume"}
             </ActionButton>
             <ActionButton
-              isDisabled={selectedSession === null || sessionMaintenanceBusy || queuedInputs.length === 0}
+              isDisabled={
+                selectedSession === null || sessionMaintenanceBusy || queuedInputs.length === 0
+              }
               size="sm"
               type="button"
               variant="secondary"
@@ -830,7 +832,9 @@ export function ChatInspectorColumn({
               {sessionMaintenanceBusyKey === "queue-collect-summary" ? "Collecting..." : "Collect"}
             </ActionButton>
             <ActionButton
-              isDisabled={selectedSession === null || sessionMaintenanceBusy || queuedInputs.length === 0}
+              isDisabled={
+                selectedSession === null || sessionMaintenanceBusy || queuedInputs.length === 0
+              }
               size="sm"
               type="button"
               variant="danger"
