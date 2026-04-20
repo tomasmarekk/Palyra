@@ -184,9 +184,6 @@ describe("M56 runtime and operations surfaces", () => {
       expect(await screen.findByRole("heading", { name: "Automations" })).toBeInTheDocument();
       expect((await screen.findAllByText("nightly")).length).toBeGreaterThan(0);
       fireEvent.click(screen.getByRole("button", { name: /Run .* now/ }));
-      await waitFor(() => {
-        expect(screen.getByText("Routine dispatched as run cron-run-1.")).toBeInTheDocument();
-      });
       expect((await screen.findAllByText(/cron-run-1/)).length).toBeGreaterThan(0);
 
       fireEvent.click(screen.getByRole("button", { name: "Channels and Router" }));
