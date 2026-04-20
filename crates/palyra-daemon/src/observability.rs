@@ -13,6 +13,10 @@ use serde::Serialize;
 
 const RECENT_FAILURE_LIMIT: usize = 24;
 const RECENT_RUNTIME_DECISION_LIMIT: usize = 24;
+const QUEUE_DELIVERY_FAILURE_AUTO_DISABLE_THRESHOLD: u64 = 3;
+const QUEUE_DELIVERY_FAILURE_RATE_AUTO_DISABLE_BPS: u32 = 5_000;
+const PRUNING_LOW_SAVINGS_AUTO_DISABLE_THRESHOLD: u64 = 5;
+const PRUNING_LOW_SAVINGS_FALLBACK_TOKENS: u64 = 128;
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct CorrelationSnapshot {
@@ -113,8 +117,24 @@ pub struct RuntimeDecisionEventSample {
 pub struct RuntimeDecisionMetricsSnapshot {
     pub queue_depth: u64,
     pub queue_peak_depth: u64,
+    pub queue_average_depth: u64,
+    pub queue_depth_samples: u64,
+    pub queue_decision_events: u64,
+    pub queue_merge_events: u64,
+    pub queue_overflow_events: u64,
+    pub queue_steer_events: u64,
+    pub queue_interrupt_events: u64,
+    pub queue_steering_deferrals: u64,
+    pub queue_delivery_failures: u64,
+    pub queue_coalescing_rate_bps: u32,
+    pub queue_overflow_summary_rate_bps: u32,
     pub pruning_apply_events: u64,
+    pub pruning_preview_events: u64,
+    pub pruning_applied_events: u64,
     pub pruning_tokens_saved: u64,
+    pub pruning_average_savings_tokens: u64,
+    pub compaction_avoidance_events: u64,
+    pub compaction_avoidance_rate_bps: u32,
     pub retrieval_searches: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retrieval_branch_latency_avg_ms: Option<u64>,
@@ -134,7 +154,18 @@ pub struct RuntimeDecisionObservabilitySnapshot {
     pub state: String,
     pub catalog: Vec<RuntimeDecisionCatalogEntry>,
     pub metrics: RuntimeDecisionMetricsSnapshot,
+    pub guardrails: RuntimeDecisionGuardrailSnapshot,
     pub recent_events: Vec<RuntimeDecisionEventSample>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeDecisionGuardrailSnapshot {
+    pub state: String,
+    pub queue_auto_disable_active: bool,
+    pub pruning_auto_disable_active: bool,
+    pub recommendations: Vec<String>,
+    pub rollout_checklist: Vec<String>,
+    pub failure_modes: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -144,8 +175,20 @@ struct RuntimeDecisionTelemetryState {
     recent_events: VecDeque<RuntimeDecisionEventSample>,
     queue_depth: u64,
     queue_peak_depth: u64,
+    queue_depth_total: u64,
+    queue_depth_samples: u64,
+    queue_decision_events: u64,
+    queue_merge_events: u64,
+    queue_overflow_events: u64,
+    queue_steer_events: u64,
+    queue_interrupt_events: u64,
+    queue_steering_deferrals: u64,
+    queue_delivery_failures: u64,
     pruning_apply_events: u64,
+    pruning_preview_events: u64,
+    pruning_applied_events: u64,
     pruning_tokens_saved: u64,
+    compaction_avoidance_events: u64,
     retrieval_searches: u64,
     retrieval_branch_latency_total_ms: u64,
     retrieval_branch_latency_max_ms: u64,
@@ -319,9 +362,25 @@ impl ObservabilityState {
         match payload.event_type {
             RuntimeDecisionEventType::PruningApply => {
                 guard.pruning_apply_events = guard.pruning_apply_events.saturating_add(1);
+                let output_state = payload.output.as_ref().and_then(|value| value.state.as_deref());
+                match output_state {
+                    Some("pruned") => {
+                        guard.pruning_applied_events =
+                            guard.pruning_applied_events.saturating_add(1);
+                    }
+                    Some("preview") => {
+                        guard.pruning_preview_events =
+                            guard.pruning_preview_events.saturating_add(1);
+                    }
+                    _ => {}
+                }
                 guard.pruning_tokens_saved = guard.pruning_tokens_saved.saturating_add(
                     payload.resource_budget.pruning_token_delta.unwrap_or_default(),
                 );
+                if payload.resource_budget.pruning_token_delta.unwrap_or_default() > 0 {
+                    guard.compaction_avoidance_events =
+                        guard.compaction_avoidance_events.saturating_add(1);
+                }
             }
             RuntimeDecisionEventType::RecallSessionSearch => {
                 guard.retrieval_searches = guard.retrieval_searches.saturating_add(1);
@@ -342,6 +401,9 @@ impl ObservabilityState {
                 guard.flow_retries = guard.flow_retries.saturating_add(u64::from(
                     payload.resource_budget.retry_count.unwrap_or_default(),
                 ));
+                if payload.reason == "queued_followup_delivery_failed" {
+                    guard.queue_delivery_failures = guard.queue_delivery_failures.saturating_add(1);
+                }
             }
             RuntimeDecisionEventType::DeliveryArbitration => {
                 guard.arbitration_suppressions = guard
@@ -360,7 +422,30 @@ impl ObservabilityState {
             | RuntimeDecisionEventType::QueueMerge
             | RuntimeDecisionEventType::QueueSteer
             | RuntimeDecisionEventType::QueueInterrupt
-            | RuntimeDecisionEventType::QueueOverflow => {}
+            | RuntimeDecisionEventType::QueueOverflow => {
+                guard.queue_decision_events = guard.queue_decision_events.saturating_add(1);
+                match payload.event_type {
+                    RuntimeDecisionEventType::QueueMerge => {
+                        guard.queue_merge_events = guard.queue_merge_events.saturating_add(1);
+                    }
+                    RuntimeDecisionEventType::QueueOverflow => {
+                        guard.queue_overflow_events = guard.queue_overflow_events.saturating_add(1);
+                    }
+                    RuntimeDecisionEventType::QueueSteer => {
+                        guard.queue_steer_events = guard.queue_steer_events.saturating_add(1);
+                    }
+                    RuntimeDecisionEventType::QueueInterrupt => {
+                        guard.queue_interrupt_events =
+                            guard.queue_interrupt_events.saturating_add(1);
+                    }
+                    _ => {}
+                }
+                let decision = payload.details.get("decision").and_then(serde_json::Value::as_str);
+                if decision == Some("defer") || payload.reason.contains("_deferred_") {
+                    guard.queue_steering_deferrals =
+                        guard.queue_steering_deferrals.saturating_add(1);
+                }
+            }
         }
     }
 
@@ -368,6 +453,18 @@ impl ObservabilityState {
         let mut guard = self.runtime_decisions.lock().unwrap_or_else(|error| error.into_inner());
         guard.queue_depth = queue_depth;
         guard.queue_peak_depth = guard.queue_peak_depth.max(queue_depth);
+        guard.queue_depth_total = guard.queue_depth_total.saturating_add(queue_depth);
+        guard.queue_depth_samples = guard.queue_depth_samples.saturating_add(1);
+    }
+
+    pub fn session_queue_auto_disable_active(&self) -> bool {
+        let guard = self.runtime_decisions.lock().unwrap_or_else(|error| error.into_inner());
+        session_queue_auto_disable_active(&guard)
+    }
+
+    pub fn pruning_auto_disable_active(&self, min_token_savings: u64) -> bool {
+        let guard = self.runtime_decisions.lock().unwrap_or_else(|error| error.into_inner());
+        pruning_auto_disable_active(&guard, min_token_savings)
     }
 
     pub fn runtime_decision_snapshot(&self) -> RuntimeDecisionObservabilitySnapshot {
@@ -388,6 +485,18 @@ impl ObservabilityState {
         } else {
             Some(guard.retrieval_branch_latency_total_ms / guard.retrieval_searches)
         };
+        let queue_average_depth = if guard.queue_depth_samples == 0 {
+            0
+        } else {
+            guard.queue_depth_total / guard.queue_depth_samples
+        };
+        let pruning_average_savings_tokens = if guard.pruning_apply_events == 0 {
+            0
+        } else {
+            guard.pruning_tokens_saved / guard.pruning_apply_events
+        };
+        let guardrails =
+            runtime_decision_guardrail_snapshot(&guard, PRUNING_LOW_SAVINGS_FALLBACK_TOKENS);
         RuntimeDecisionObservabilitySnapshot {
             state: if guard.event_counts.is_empty() {
                 "contract_ready".to_owned()
@@ -398,8 +507,33 @@ impl ObservabilityState {
             metrics: RuntimeDecisionMetricsSnapshot {
                 queue_depth: guard.queue_depth,
                 queue_peak_depth: guard.queue_peak_depth,
+                queue_average_depth,
+                queue_depth_samples: guard.queue_depth_samples,
+                queue_decision_events: guard.queue_decision_events,
+                queue_merge_events: guard.queue_merge_events,
+                queue_overflow_events: guard.queue_overflow_events,
+                queue_steer_events: guard.queue_steer_events,
+                queue_interrupt_events: guard.queue_interrupt_events,
+                queue_steering_deferrals: guard.queue_steering_deferrals,
+                queue_delivery_failures: guard.queue_delivery_failures,
+                queue_coalescing_rate_bps: ratio_bps(
+                    guard.queue_merge_events,
+                    guard.queue_decision_events,
+                ),
+                queue_overflow_summary_rate_bps: ratio_bps(
+                    guard.queue_overflow_events,
+                    guard.queue_decision_events,
+                ),
                 pruning_apply_events: guard.pruning_apply_events,
+                pruning_preview_events: guard.pruning_preview_events,
+                pruning_applied_events: guard.pruning_applied_events,
                 pruning_tokens_saved: guard.pruning_tokens_saved,
+                pruning_average_savings_tokens,
+                compaction_avoidance_events: guard.compaction_avoidance_events,
+                compaction_avoidance_rate_bps: ratio_bps(
+                    guard.compaction_avoidance_events,
+                    guard.pruning_apply_events,
+                ),
                 retrieval_searches: guard.retrieval_searches,
                 retrieval_branch_latency_avg_ms,
                 retrieval_branch_latency_max_ms: (guard.retrieval_branch_latency_max_ms > 0)
@@ -415,6 +549,7 @@ impl ObservabilityState {
                     guard.worker_events,
                 ),
             },
+            guardrails,
             recent_events: guard.recent_events.iter().cloned().collect(),
         }
     }
@@ -437,6 +572,84 @@ impl RuntimeDecisionTelemetryState {
     }
 }
 
+fn runtime_decision_guardrail_snapshot(
+    state: &RuntimeDecisionTelemetryState,
+    pruning_min_token_savings: u64,
+) -> RuntimeDecisionGuardrailSnapshot {
+    let queue_auto_disable_active = session_queue_auto_disable_active(state);
+    let pruning_auto_disable_active = pruning_auto_disable_active(state, pruning_min_token_savings);
+    let mut recommendations = Vec::new();
+    if queue_auto_disable_active {
+        recommendations.push(
+            "Queue delivery failures crossed the auto-disable threshold; keep session_queue_policy in preview or disabled until delivery is stable."
+                .to_owned(),
+        );
+    }
+    if pruning_auto_disable_active {
+        recommendations.push(
+            "Applied pruning is not saving enough tokens; fall back to preview_only or disabled until the reducer is retuned."
+                .to_owned(),
+        );
+    }
+    if recommendations.is_empty() {
+        recommendations.push(
+            "Keep queue and pruning in preview until burst handling, safe-boundary decisions, and token savings are visible in diagnostics."
+                .to_owned(),
+        );
+    }
+
+    RuntimeDecisionGuardrailSnapshot {
+        state: if queue_auto_disable_active || pruning_auto_disable_active {
+            "auto_disabled".to_owned()
+        } else if state.queue_delivery_failures > 0
+            || state.queue_steering_deferrals > 0
+            || state.pruning_apply_events > 0
+        {
+            "watch".to_owned()
+        } else {
+            "ok".to_owned()
+        },
+        queue_auto_disable_active,
+        pruning_auto_disable_active,
+        recommendations,
+        rollout_checklist: vec![
+            "Verify average queue depth, coalescing rate, overflow summary rate, and steering deferrals stay within expected preview bounds."
+                .to_owned(),
+            "Verify pruning tokens saved and compaction avoidance rate are positive before enabling pruning beyond preview."
+                .to_owned(),
+            "Keep queue/pruning explain payloads in the chat inspector and diagnostics snapshot during rollout."
+                .to_owned(),
+        ],
+        failure_modes: vec![
+            "Repeated queued follow-up delivery failures trigger queue auto-disable."
+                .to_owned(),
+            "Applied pruning with sustained low token savings triggers pruning auto-disable."
+                .to_owned(),
+            "Steer or interrupt requests during approvals are deferred to collect mode and counted as steering deferrals."
+                .to_owned(),
+        ],
+    }
+}
+
+fn session_queue_auto_disable_active(state: &RuntimeDecisionTelemetryState) -> bool {
+    if state.queue_delivery_failures < QUEUE_DELIVERY_FAILURE_AUTO_DISABLE_THRESHOLD {
+        return false;
+    }
+    ratio_bps(state.queue_delivery_failures, state.queue_decision_events.max(1))
+        >= QUEUE_DELIVERY_FAILURE_RATE_AUTO_DISABLE_BPS
+}
+
+fn pruning_auto_disable_active(
+    state: &RuntimeDecisionTelemetryState,
+    min_token_savings: u64,
+) -> bool {
+    if state.pruning_applied_events < PRUNING_LOW_SAVINGS_AUTO_DISABLE_THRESHOLD {
+        return false;
+    }
+    let average_savings = state.pruning_tokens_saved / state.pruning_applied_events.max(1);
+    average_savings < min_token_savings.max(1)
+}
+
 fn ratio_bps(numerator: u64, denominator: u64) -> u32 {
     if denominator == 0 {
         return 0;
@@ -452,6 +665,7 @@ mod tests {
         RuntimeDecisionActor, RuntimeDecisionActorKind, RuntimeDecisionEventType,
         RuntimeDecisionPayload, RuntimeDecisionTiming, RuntimeEntityRef, RuntimeResourceBudget,
     };
+    use serde_json::json;
 
     #[test]
     fn runtime_decision_snapshot_tracks_catalog_metrics_and_recent_events() {
@@ -518,11 +732,17 @@ mod tests {
         assert_eq!(snapshot.state, "active");
         assert_eq!(snapshot.metrics.queue_depth, 2);
         assert_eq!(snapshot.metrics.queue_peak_depth, 2);
+        assert_eq!(snapshot.metrics.queue_average_depth, 2);
+        assert_eq!(snapshot.metrics.queue_decision_events, 1);
         assert_eq!(snapshot.metrics.pruning_apply_events, 1);
+        assert_eq!(snapshot.metrics.pruning_applied_events, 0);
+        assert_eq!(snapshot.metrics.pruning_preview_events, 0);
         assert_eq!(snapshot.metrics.pruning_tokens_saved, 128);
+        assert_eq!(snapshot.metrics.compaction_avoidance_rate_bps, 10_000);
         assert_eq!(snapshot.metrics.worker_events, 1);
         assert_eq!(snapshot.metrics.worker_orphaned_events, 1);
         assert_eq!(snapshot.metrics.worker_orphan_rate_bps, 10_000);
+        assert_eq!(snapshot.guardrails.state, "watch");
         assert!(
             snapshot
                 .catalog
@@ -531,5 +751,83 @@ mod tests {
             "queue enqueue should appear in the runtime preview catalog"
         );
         assert_eq!(snapshot.recent_events.len(), 3);
+    }
+
+    #[test]
+    fn runtime_decision_guardrails_auto_disable_regressions() {
+        let state = ObservabilityState::default();
+        let actor = RuntimeDecisionActor::new(
+            RuntimeDecisionActorKind::Operator,
+            "admin:web-console",
+            "device-1",
+            Some("web".to_owned()),
+        );
+        for index in 0..3 {
+            state.record_runtime_decision_event(
+                &RuntimeDecisionPayload::new(
+                    RuntimeDecisionEventType::QueueEnqueue,
+                    actor.clone(),
+                    "followup_requested",
+                    "session_queue.v1",
+                    RuntimeDecisionTiming::observed(1_730_000_000_000 + index),
+                )
+                .with_details(json!({ "decision": "enqueue" })),
+            );
+            state.record_runtime_decision_event(
+                &RuntimeDecisionPayload::new(
+                    RuntimeDecisionEventType::FlowLifecycle,
+                    actor.clone(),
+                    "queued_followup_delivery_failed",
+                    "flow_orchestration.preview.queue_delivery",
+                    RuntimeDecisionTiming::observed(1_730_000_000_100 + index),
+                )
+                .with_resource_budget(RuntimeResourceBudget {
+                    queue_depth: Some(0),
+                    token_budget: None,
+                    pruning_token_delta: None,
+                    retrieval_branch_latency_ms: None,
+                    retry_count: Some(0),
+                    suppression_count: None,
+                }),
+            );
+        }
+        for index in 0..5 {
+            state.record_runtime_decision_event(
+                &RuntimeDecisionPayload::new(
+                    RuntimeDecisionEventType::PruningApply,
+                    RuntimeDecisionActor::new(
+                        RuntimeDecisionActorKind::System,
+                        "system:compaction",
+                        "daemon",
+                        Some("system".to_owned()),
+                    ),
+                    "ephemeral_provider_input_pruned",
+                    "session_pruning.v1",
+                    RuntimeDecisionTiming::observed(1_730_000_001_000 + index),
+                )
+                .with_output(
+                    RuntimeEntityRef::new("provider_input", "provider_input", "R1")
+                        .with_state("pruned"),
+                )
+                .with_resource_budget(RuntimeResourceBudget {
+                    queue_depth: None,
+                    token_budget: Some(10_000),
+                    pruning_token_delta: Some(1),
+                    retrieval_branch_latency_ms: None,
+                    retry_count: None,
+                    suppression_count: None,
+                }),
+            );
+        }
+
+        let snapshot = state.runtime_decision_snapshot();
+        assert!(state.session_queue_auto_disable_active());
+        assert!(state.pruning_auto_disable_active(128));
+        assert_eq!(snapshot.guardrails.state, "auto_disabled");
+        assert!(snapshot.guardrails.queue_auto_disable_active);
+        assert!(snapshot.guardrails.pruning_auto_disable_active);
+        assert_eq!(snapshot.metrics.queue_delivery_failures, 3);
+        assert_eq!(snapshot.metrics.queue_coalescing_rate_bps, 0);
+        assert_eq!(snapshot.metrics.pruning_average_savings_tokens, 1);
     }
 }

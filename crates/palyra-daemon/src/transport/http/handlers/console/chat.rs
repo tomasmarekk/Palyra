@@ -4306,6 +4306,13 @@ fn ensure_console_runtime_preview_capability(
     state: &AppState,
     capability: RuntimePreviewCapability,
 ) -> Result<(), Response> {
+    if capability == RuntimePreviewCapability::SessionQueuePolicy
+        && state.observability.session_queue_auto_disable_active()
+    {
+        return Err(runtime_status_response(tonic::Status::failed_precondition(
+            "session_queue_policy auto-disabled by rollout guardrail after repeated delivery failures",
+        )));
+    }
     if let Some(message) = crate::runtime_preview_controls::capability_blocker_message(
         &state.runtime.config,
         capability,

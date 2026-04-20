@@ -283,6 +283,9 @@ export function OverviewSection({ app }: OverviewSectionProps) {
   const connector = readObject(observability ?? {}, "connector");
   const providerAuth = readObject(observability ?? {}, "provider_auth");
   const leaseManager = readObject(observability ?? {}, "lease_manager");
+  const runtimePreview = readObject(observability ?? {}, "runtime_preview");
+  const previewMetrics = readObject(runtimePreview ?? {}, "metrics");
+  const previewGuardrails = readObject(runtimePreview ?? {}, "guardrails");
   const objectivesSnapshot = readObject(diagnostics ?? {}, "objectives");
   const warnings = toStringArray(Array.isArray(deployment?.warnings) ? deployment.warnings : []);
   const pendingApprovals = app.overviewApprovals.filter((approval) => {
@@ -305,6 +308,7 @@ export function OverviewSection({ app }: OverviewSectionProps) {
   const leaseForegroundWaiters = readNumber(leaseManager ?? {}, "foreground_waiters") ?? 0;
   const leaseBackgroundWaiters = readNumber(leaseManager ?? {}, "background_waiters") ?? 0;
   const leaseDeferredTotal = readNumber(leaseManager ?? {}, "deferred_total") ?? 0;
+  const runtimeGuardrailState = readString(previewGuardrails ?? {}, "state") ?? "unknown";
   const onboardingSteps = onboarding?.steps ?? [];
   const recommendedOnboardingStep =
     onboardingSteps.find((step) => step.step_id === onboarding?.recommended_step_id) ??
@@ -349,6 +353,7 @@ export function OverviewSection({ app }: OverviewSectionProps) {
     leaseForegroundWaiters,
     leaseBackgroundWaiters,
     leaseDeferredTotal,
+    runtimeGuardrailState,
   });
   const hasAttentionItems = attentionItems.length > 0;
   const runtimePostureValue = hasAttentionItems
@@ -883,6 +888,12 @@ export function OverviewSection({ app }: OverviewSectionProps) {
           value={operatorSummary?.state ?? "unknown"}
         />
         <WorkspaceMetricCard
+          detail={`${readNumber(previewMetrics ?? {}, "queue_average_depth") ?? 0} avg queue depth, ${readNumber(previewMetrics ?? {}, "pruning_tokens_saved") ?? 0} pruning tokens saved.`}
+          label="Runtime pressure"
+          tone={workspaceToneForState(runtimeGuardrailState)}
+          value={runtimeGuardrailState}
+        />
+        <WorkspaceMetricCard
           detail={
             pendingApprovals > 0
               ? "Review sensitive actions before they block runs."
@@ -1363,6 +1374,7 @@ function buildAttentionItems({
   leaseForegroundWaiters,
   leaseBackgroundWaiters,
   leaseDeferredTotal,
+  runtimeGuardrailState,
 }: {
   warnings: string[];
   pendingApprovals: number;
@@ -1376,6 +1388,7 @@ function buildAttentionItems({
   leaseForegroundWaiters: number;
   leaseBackgroundWaiters: number;
   leaseDeferredTotal: number;
+  runtimeGuardrailState: string;
 }): string[] {
   const items = [...warnings];
   if (pendingApprovals > 0) items.push(`${pendingApprovals} approvals waiting for review.`);
@@ -1396,6 +1409,11 @@ function buildAttentionItems({
     items.push(
       `${leaseDeferredTotal} background or auxiliary runs were deferred by lease pressure.`,
     );
+  }
+  if (runtimeGuardrailState === "auto_disabled") {
+    items.push("Queue or pruning guardrails auto-disabled runtime preview behavior.");
+  } else if (runtimeGuardrailState === "watch") {
+    items.push("Queue or pruning guardrails are in watch state.");
   }
   if (objectiveAttentionCount > 0)
     items.push(`${objectiveAttentionCount} objectives need health follow-up.`);

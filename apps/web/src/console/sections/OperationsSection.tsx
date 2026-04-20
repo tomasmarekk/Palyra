@@ -67,8 +67,20 @@ export function OperationsSection({ app }: OperationsSectionProps) {
   const doctorRecovery = readObject(observability ?? {}, "doctor_recovery");
   const runtimePreview = readObject(observability ?? {}, "runtime_preview");
   const previewMetrics = readObject(runtimePreview ?? {}, "metrics") ?? {};
+  const previewGuardrails = readObject(runtimePreview ?? {}, "guardrails");
   const runtimePreviewCatalog = readJsonObjectArray(runtimePreview?.catalog);
   const runtimePreviewEvents = readJsonObjectArray(runtimePreview?.recent_events);
+  const runtimeGuardrailRecommendations = toStringArray(
+    Array.isArray(previewGuardrails?.recommendations) ? previewGuardrails.recommendations : [],
+  );
+  const runtimeGuardrailChecklist = toStringArray(
+    Array.isArray(previewGuardrails?.rollout_checklist)
+      ? previewGuardrails.rollout_checklist
+      : [],
+  );
+  const runtimeFailureModes = toStringArray(
+    Array.isArray(previewGuardrails?.failure_modes) ? previewGuardrails.failure_modes : [],
+  );
   const configRefHealth = readObject(observability ?? {}, "config_ref_health");
   const configRefSummary = readObject(configRefHealth ?? {}, "summary");
   const configRefItems = readJsonObjectArray(configRefHealth?.items);
@@ -213,8 +225,14 @@ export function OperationsSection({ app }: OperationsSectionProps) {
         <WorkspaceMetricCard
           label="Runtime preview"
           value={readString(runtimePreview ?? {}, "state") ?? "n/a"}
-          detail={`${readNumber(previewMetrics, "queue_depth") ?? 0} queue depth · ${readNumber(previewMetrics, "pruning_tokens_saved") ?? 0} tokens saved`}
+          detail={`${readNumber(previewMetrics, "queue_average_depth") ?? 0} avg queue depth · ${readNumber(previewMetrics, "pruning_tokens_saved") ?? 0} pruning tokens saved`}
           tone={workspaceToneForState(readString(runtimePreview ?? {}, "state") ?? "unknown")}
+        />
+        <WorkspaceMetricCard
+          label="Runtime guardrails"
+          value={readString(previewGuardrails ?? {}, "state") ?? "n/a"}
+          detail={`${readNumber(previewMetrics, "queue_steering_deferrals") ?? 0} steering deferrals · ${readNumber(previewMetrics, "queue_delivery_failures") ?? 0} delivery failures`}
+          tone={workspaceToneForState(readString(previewGuardrails ?? {}, "state") ?? "unknown")}
         />
         <WorkspaceMetricCard
           label="Learning reflections"
@@ -367,7 +385,45 @@ export function OperationsSection({ app }: OperationsSectionProps) {
                       {readNumber(previewMetrics, "queue_depth") ?? 0} /{" "}
                       {readNumber(previewMetrics, "queue_peak_depth") ?? 0}
                     </td>
-                    <td>Current / peak observed queue depth.</td>
+                    <td>
+                      Current / peak observed depth. Average{" "}
+                      {readNumber(previewMetrics, "queue_average_depth") ?? 0} across{" "}
+                      {readNumber(previewMetrics, "queue_depth_samples") ?? 0} samples.
+                    </td>
+                  </tr>
+                  <tr>
+                    <td>Queue coalescing</td>
+                    <td>{readNumber(previewMetrics, "queue_coalescing_rate_bps") ?? 0} bps</td>
+                    <td>
+                      {readNumber(previewMetrics, "queue_merge_events") ?? 0} merge events from{" "}
+                      {readNumber(previewMetrics, "queue_decision_events") ?? 0} queue decisions.
+                    </td>
+                  </tr>
+                  <tr>
+                    <td>Overflow summaries</td>
+                    <td>{readNumber(previewMetrics, "queue_overflow_summary_rate_bps") ?? 0} bps</td>
+                    <td>
+                      {readNumber(previewMetrics, "queue_overflow_events") ?? 0} overflow summary
+                      events; {readNumber(previewMetrics, "queue_steering_deferrals") ?? 0} steering
+                      deferrals.
+                    </td>
+                  </tr>
+                  <tr>
+                    <td>Pruning savings</td>
+                    <td>{readNumber(previewMetrics, "pruning_tokens_saved") ?? 0}</td>
+                    <td>
+                      Avg {readNumber(previewMetrics, "pruning_average_savings_tokens") ?? 0} tokens
+                      across {readNumber(previewMetrics, "pruning_apply_events") ?? 0} pruning
+                      decisions.
+                    </td>
+                  </tr>
+                  <tr>
+                    <td>Compaction avoidance</td>
+                    <td>{readNumber(previewMetrics, "compaction_avoidance_rate_bps") ?? 0} bps</td>
+                    <td>
+                      {readNumber(previewMetrics, "compaction_avoidance_events") ?? 0} pruning
+                      decisions saved enough context to avoid heavier compaction.
+                    </td>
                   </tr>
                   <tr>
                     <td>Recall latency</td>
@@ -407,6 +463,39 @@ export function OperationsSection({ app }: OperationsSectionProps) {
                         <td>{readString(event, "event_type") ?? "unknown"}</td>
                         <td>{readString(event, "reason") ?? "No reason published."}</td>
                         <td>{readString(event, "principal") ?? "n/a"}</td>
+                      </tr>
+                    ))}
+                  </WorkspaceTable>
+                ) : null}
+                {runtimeGuardrailRecommendations.length > 0 ? (
+                  <WorkspaceInlineNotice
+                    title="Queue and pruning guardrails"
+                    tone={workspaceToneForState(
+                      readString(previewGuardrails ?? {}, "state") ?? "unknown",
+                    )}
+                  >
+                    <ul className="console-compact-list">
+                      {runtimeGuardrailRecommendations.slice(0, 4).map((recommendation) => (
+                        <li key={recommendation}>{recommendation}</li>
+                      ))}
+                    </ul>
+                  </WorkspaceInlineNotice>
+                ) : null}
+                {runtimeGuardrailChecklist.length > 0 || runtimeFailureModes.length > 0 ? (
+                  <WorkspaceTable
+                    ariaLabel="Queue and pruning rollout checklist"
+                    columns={["Area", "Operator signal"]}
+                  >
+                    {runtimeGuardrailChecklist.slice(0, 3).map((item) => (
+                      <tr key={`checklist-${item}`}>
+                        <td>Checklist</td>
+                        <td>{item}</td>
+                      </tr>
+                    ))}
+                    {runtimeFailureModes.slice(0, 3).map((item) => (
+                      <tr key={`failure-${item}`}>
+                        <td>Failure mode</td>
+                        <td>{item}</td>
                       </tr>
                     ))}
                   </WorkspaceTable>

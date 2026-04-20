@@ -24,7 +24,7 @@ use crate::{
     },
     application::session_pruning::{
         apply_ephemeral_prompt_pruning, classify_pruning_task, detect_pruning_risk,
-        pruning_decision_from_config, SessionPruningOutcome,
+        pruning_decision_from_config, SessionPruningOutcome, SESSION_PRUNING_POLICY_ID,
     },
     gateway::{
         ingest_memory_best_effort, non_empty, truncate_with_ellipsis, GatewayRuntimeState,
@@ -928,6 +928,11 @@ async fn finalize_provider_input_with_pruning(
         task_class,
         risk_level,
     );
+    if decision.apply_enabled
+        && runtime_state.observability.pruning_auto_disable_active(decision.min_token_savings)
+    {
+        return Ok(provider_input_text);
+    }
     let outcome = apply_ephemeral_prompt_pruning(provider_input_text.as_str(), &decision);
     if outcome.eligible {
         record_provider_pruning_decision(
@@ -957,7 +962,7 @@ pub(crate) async fn record_provider_pruning_decision(
         runtime_state
             .runtime_decision_actor_from_context(context, RuntimeDecisionActorKind::System),
         outcome.reason.clone(),
-        "session_pruning.v1",
+        SESSION_PRUNING_POLICY_ID,
         RuntimeDecisionTiming::observed(crate::gateway::current_unix_ms()),
     )
     .with_input(RuntimeEntityRef::new("provider_input", "provider_input", run_id.to_owned()))
