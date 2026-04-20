@@ -3,13 +3,7 @@ function normalizeRuntimeToken(value?: string | null): string | undefined {
   return normalized && normalized.length > 0 ? normalized : undefined;
 }
 
-export const QUEUE_MODES = [
-  "followup",
-  "collect",
-  "steer",
-  "steer_backlog",
-  "interrupt",
-] as const;
+export const QUEUE_MODES = ["followup", "collect", "steer", "steer_backlog", "interrupt"] as const;
 export type QueueMode = (typeof QUEUE_MODES)[number];
 
 export function normalizeQueueMode(value?: string | null): QueueMode {

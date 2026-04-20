@@ -311,86 +311,88 @@ export function ConfigSection({ app }: ConfigSectionProps) {
                     </div>
                   </dl>
                 )}
-            </WorkspaceSectionCard>
+              </WorkspaceSectionCard>
 
-            <WorkspaceSectionCard
-              description="Each runtime capability publishes its config mode, rollout posture, and activation blockers before deeper behavior is promoted."
-              title="Runtime controls"
-            >
-              {runtimeControls === null ? (
-                <WorkspaceEmptyState
-                  compact
-                  description="Refresh diagnostics to publish rollout and effective config data."
-                  title="No runtime controls loaded"
-                />
-              ) : (
-                <div className="workspace-stack">
-                  <dl className="workspace-key-value-grid">
-                    <div>
-                      <dt>State</dt>
-                      <dd>{readString(runtimeControls, "state") ?? "n/a"}</dd>
-                    </div>
-                    <div>
-                      <dt>Preview</dt>
-                      <dd>{readNumber(runtimeControls, "preview_capabilities") ?? 0}</dd>
-                    </div>
-                    <div>
-                      <dt>Enabled</dt>
-                      <dd>{readNumber(runtimeControls, "enabled_capabilities") ?? 0}</dd>
-                    </div>
-                    <div>
-                      <dt>Blocked</dt>
-                      <dd>{readNumber(runtimeControls, "blocked_capabilities") ?? 0}</dd>
-                    </div>
-                  </dl>
-                  {(readNumber(runtimeControls, "blocked_capabilities") ?? 0) > 0 ? (
-                    <WorkspaceInlineNotice title="Activation blockers published" tone="warning">
-                      Review the blocked capabilities below before promoting any preview mode to
-                      `enabled`.
-                    </WorkspaceInlineNotice>
-                  ) : null}
-                  {runtimeCapabilities.length === 0 ? (
-                    <WorkspaceEmptyState
-                      compact
-                      description="The daemon has not published any runtime capability entries yet."
-                      title="No capability diagnostics"
-                    />
-                  ) : (
-                    <WorkspaceTable
-                      ariaLabel="Runtime controls"
-                      columns={["Capability", "Mode", "Effective", "Rollout", "Blockers"]}
-                    >
-                      {runtimeCapabilities.map((entry: JsonObject) => (
-                        <tr key={readString(entry, "capability") ?? "runtime-preview"}>
-                          <td>
-                            <div>{readString(entry, "label") ?? readString(entry, "capability")}</div>
-                            <div>{readString(entry, "summary") ?? "No summary published."}</div>
-                          </td>
-                          <td>{readString(entry, "mode") ?? "n/a"}</td>
-                          <td>{readString(entry, "effective_state") ?? "n/a"}</td>
-                          <td>
-                            {readString(entry, "rollout_source") ?? "default"} /{" "}
-                            {entry.rollout_enabled === true ? "enabled" : "disabled"}
-                          </td>
-                          <td>
-                            {toStringArray(
-                              Array.isArray(entry.activation_blockers)
-                                ? entry.activation_blockers
-                                : [],
-                            ).join("; ") || "ready"}
-                          </td>
-                        </tr>
-                      ))}
-                    </WorkspaceTable>
-                  )}
-                </div>
-              )}
-            </WorkspaceSectionCard>
+              <WorkspaceSectionCard
+                description="Each runtime capability publishes its config mode, rollout posture, and activation blockers before deeper behavior is promoted."
+                title="Runtime controls"
+              >
+                {runtimeControls === null ? (
+                  <WorkspaceEmptyState
+                    compact
+                    description="Refresh diagnostics to publish rollout and effective config data."
+                    title="No runtime controls loaded"
+                  />
+                ) : (
+                  <div className="workspace-stack">
+                    <dl className="workspace-key-value-grid">
+                      <div>
+                        <dt>State</dt>
+                        <dd>{readString(runtimeControls, "state") ?? "n/a"}</dd>
+                      </div>
+                      <div>
+                        <dt>Preview</dt>
+                        <dd>{readNumber(runtimeControls, "preview_capabilities") ?? 0}</dd>
+                      </div>
+                      <div>
+                        <dt>Enabled</dt>
+                        <dd>{readNumber(runtimeControls, "enabled_capabilities") ?? 0}</dd>
+                      </div>
+                      <div>
+                        <dt>Blocked</dt>
+                        <dd>{readNumber(runtimeControls, "blocked_capabilities") ?? 0}</dd>
+                      </div>
+                    </dl>
+                    {(readNumber(runtimeControls, "blocked_capabilities") ?? 0) > 0 ? (
+                      <WorkspaceInlineNotice title="Activation blockers published" tone="warning">
+                        Review the blocked capabilities below before promoting any preview mode to
+                        `enabled`.
+                      </WorkspaceInlineNotice>
+                    ) : null}
+                    {runtimeCapabilities.length === 0 ? (
+                      <WorkspaceEmptyState
+                        compact
+                        description="The daemon has not published any runtime capability entries yet."
+                        title="No capability diagnostics"
+                      />
+                    ) : (
+                      <WorkspaceTable
+                        ariaLabel="Runtime controls"
+                        columns={["Capability", "Mode", "Effective", "Rollout", "Blockers"]}
+                      >
+                        {runtimeCapabilities.map((entry: JsonObject) => (
+                          <tr key={readString(entry, "capability") ?? "runtime-preview"}>
+                            <td>
+                              <div>
+                                {readString(entry, "label") ?? readString(entry, "capability")}
+                              </div>
+                              <div>{readString(entry, "summary") ?? "No summary published."}</div>
+                            </td>
+                            <td>{readString(entry, "mode") ?? "n/a"}</td>
+                            <td>{readString(entry, "effective_state") ?? "n/a"}</td>
+                            <td>
+                              {readString(entry, "rollout_source") ?? "default"} /{" "}
+                              {entry.rollout_enabled === true ? "enabled" : "disabled"}
+                            </td>
+                            <td>
+                              {toStringArray(
+                                Array.isArray(entry.activation_blockers)
+                                  ? entry.activation_blockers
+                                  : [],
+                              ).join("; ") || "ready"}
+                            </td>
+                          </tr>
+                        ))}
+                      </WorkspaceTable>
+                    )}
+                  </div>
+                )}
+              </WorkspaceSectionCard>
 
-            <WorkspaceSectionCard
-              description="Published provider bindings and model roles make it obvious what the registry can actually route."
-              title="Registry inventory"
-            >
+              <WorkspaceSectionCard
+                description="Published provider bindings and model roles make it obvious what the registry can actually route."
+                title="Registry inventory"
+              >
                 {providerRegistry === null ? (
                   <WorkspaceEmptyState
                     compact

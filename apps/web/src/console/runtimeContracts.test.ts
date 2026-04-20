@@ -36,9 +36,7 @@ describe("runtimeContracts", () => {
     expect(normalizeQueuedInputState("delivered")).toBe("forwarded");
     expect(normalizeFlowState("approval_wait")).toBe("waiting_for_approval");
     expect(normalizeFlowStepState("timeout")).toBe("timed_out");
-    expect(normalizeDeliveryPolicy("prefer_child_terminal")).toBe(
-      "prefer_terminal_descendant",
-    );
+    expect(normalizeDeliveryPolicy("prefer_child_terminal")).toBe("prefer_terminal_descendant");
     expect(normalizeWorkerLifecycleState("leased")).toBe("assigned");
   });
 });

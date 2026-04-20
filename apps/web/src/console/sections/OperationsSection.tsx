@@ -385,7 +385,9 @@ export function OperationsSection({ app }: OperationsSectionProps) {
                   </tr>
                   <tr>
                     <td>Auxiliary spend</td>
-                    <td>{readNumber(runtimePreviewMetrics ?? {}, "auxiliary_budget_tokens") ?? 0}</td>
+                    <td>
+                      {readNumber(runtimePreviewMetrics ?? {}, "auxiliary_budget_tokens") ?? 0}
+                    </td>
                     <td>
                       {readNumber(runtimePreviewMetrics ?? {}, "auxiliary_task_events") ?? 0} task
                       lifecycle events captured.
@@ -393,7 +395,9 @@ export function OperationsSection({ app }: OperationsSectionProps) {
                   </tr>
                   <tr>
                     <td>Worker orphan rate</td>
-                    <td>{readNumber(runtimePreviewMetrics ?? {}, "worker_orphan_rate_bps") ?? 0}</td>
+                    <td>
+                      {readNumber(runtimePreviewMetrics ?? {}, "worker_orphan_rate_bps") ?? 0}
+                    </td>
                     <td>
                       {readNumber(runtimePreviewMetrics ?? {}, "worker_orphaned_events") ?? 0} of{" "}
                       {readNumber(runtimePreviewMetrics ?? {}, "worker_events") ?? 0} worker
