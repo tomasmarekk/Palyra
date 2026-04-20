@@ -3727,7 +3727,6 @@ async fn record_background_task_runtime_preview(
         .await
         .map_err(runtime_status_response)
 }
-
 #[allow(clippy::result_large_err)]
 fn ensure_console_runtime_preview_capability(
     state: &AppState,

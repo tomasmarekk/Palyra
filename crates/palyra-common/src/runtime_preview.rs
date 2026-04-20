@@ -51,20 +51,6 @@ macro_rules! runtime_preview_enum {
                     _ => None,
                 }
             }
-
-            #[allow(clippy::should_implement_trait)]
-            #[must_use]
-            pub fn from_str(value: &str) -> Option<Self> {
-                Self::parse(value)
-            }
-        }
-
-        impl std::str::FromStr for $name {
-            type Err = ();
-
-            fn from_str(value: &str) -> Result<Self, Self::Err> {
-                Self::parse(value).ok_or(())
-            }
         }
 
         impl fmt::Display for $name {
