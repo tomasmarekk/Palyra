@@ -55,9 +55,17 @@ pub(crate) fn build_runtime_preview_config_snapshot<C: RuntimePreviewConfigView>
         RuntimePreviewSummaryState::Disabled
     } else if enabled_capabilities == capabilities.len() {
         RuntimePreviewSummaryState::Enabled
-    } else if preview_capabilities > 0 && enabled_capabilities == 0 && blocked_capabilities == 0 {
+    } else if preview_capabilities > 0
+        && enabled_capabilities == 0
+        && blocked_capabilities == 0
+        && disabled_capabilities == 0
+    {
         RuntimePreviewSummaryState::PreviewOnly
-    } else if blocked_capabilities > 0 && preview_capabilities == 0 && enabled_capabilities == 0 {
+    } else if blocked_capabilities > 0
+        && preview_capabilities == 0
+        && enabled_capabilities == 0
+        && disabled_capabilities == 0
+    {
         RuntimePreviewSummaryState::Blocked
     } else {
         RuntimePreviewSummaryState::Mixed

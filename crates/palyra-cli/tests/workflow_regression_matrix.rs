@@ -9,6 +9,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "support/workflow_binaries.rs"]
+mod workflow_binaries;
+
 use anyhow::{Context, Result};
 use palyra_cli::proto::palyra::browser::v1 as browser_v1;
 use palyra_cli::proto::palyra::gateway::v1 as gateway_v1;
@@ -19,6 +22,7 @@ use tempfile::TempDir;
 use tokio::runtime::Runtime;
 use tonic::{metadata::MetadataValue, transport::Endpoint, Request};
 use ulid::Ulid;
+use workflow_binaries::{resolve_workspace_binary_path, workspace_root};
 
 const ADMIN_TOKEN: &str = "test-admin-token";
 const BROWSER_AUTH_TOKEN: &str = "test-browser-token";
@@ -2250,28 +2254,6 @@ fn parse_port_from_log(line: &str, prefix: &str) -> Option<u16> {
     let rest = &line[start..];
     let end = rest.find('"')?;
     rest[..end].parse::<SocketAddr>().ok().map(|address| address.port())
-}
-
-fn workspace_root() -> Result<PathBuf> {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .context("failed to resolve workspace root from CARGO_MANIFEST_DIR")
-}
-
-fn resolve_workspace_binary_path(base_name: &str) -> Result<PathBuf> {
-    let workspace_root = workspace_root()?;
-    let executable = if cfg!(windows) { format!("{base_name}.exe") } else { base_name.to_owned() };
-    let path = workspace_root.join("target").join("debug").join(executable);
-    if path.is_file() {
-        Ok(path)
-    } else {
-        anyhow::bail!(
-            "required test binary is missing: {} (build palyrad and palyra-browserd before running this test)",
-            path.display()
-        );
-    }
 }
 
 fn unique_temp_path(prefix: &str, extension: &str) -> PathBuf {

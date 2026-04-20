@@ -767,7 +767,7 @@
   },
   "runtime_controls": {
     "schema_version": 1,
-    "state": "preview_only",
+    "state": "mixed",
     "preview_capabilities": 6,
     "enabled_capabilities": 0,
     "blocked_capabilities": 0,
