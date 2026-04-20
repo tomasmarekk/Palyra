@@ -38,13 +38,11 @@ if [[ "${OS:-}" == "Windows_NT" ]] && command -v pwsh.exe >/dev/null 2>&1; then
 fi
 
 CARGO_BIN="$(resolve_cargo)"
+PROFILE="${PALYRA_WORKFLOW_REGRESSION_PROFILE:-fast}"
+REPORT_DIR="${PALYRA_WORKFLOW_REGRESSION_REPORT_DIR:-$ROOT_DIR/target/release-artifacts/workflow-regression/$PROFILE}"
 
-"$CARGO_BIN" build -p palyra-daemon -p palyra-cli --locked
-"$CARGO_BIN" build -p palyra-browserd --bin palyra-browserd --locked
+export PALYRA_WORKFLOW_REGRESSION_CARGO_BIN="$CARGO_BIN"
 
-"$CARGO_BIN" test -p palyra-daemon --lib --locked compat::tests
-"$CARGO_BIN" test -p palyra-daemon --lib --locked session_compaction_apply_persists_durable_writes_and_quality_gates
-"$CARGO_BIN" test -p palyra-daemon --lib --locked session_compaction_apply_rolls_back_workspace_writes_on_partial_failure
-"$CARGO_BIN" test -p palyra-cli --test wizard_cli --locked -- --test-threads=1
-"$CARGO_BIN" test -p palyra-cli --test cli_v1_acp_shim --locked -- --test-threads=1
-"$CARGO_BIN" test -p palyra-cli --test workflow_regression_matrix --locked -- --test-threads=1
+"$CARGO_BIN" run -p palyra-cli --example run_workflow_regression --locked -- \
+  --profile "$PROFILE" \
+  --report-dir "$REPORT_DIR"

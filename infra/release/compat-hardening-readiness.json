@@ -1,0 +1,195 @@
+{
+  "schema_version": 1,
+  "release_scope": "compat_plugin_insights_hardening",
+  "updated_at": "2026-04-20",
+  "matrix_manifest": "infra/release/workflow-regression-matrix.json",
+  "rollout_controls": [
+    {
+      "id": "compat_embeddings_api",
+      "kind": "feature_flag",
+      "summary": "Keep POST /v1/embeddings behind the explicit compat_embeddings_api access-control feature until workflow regression and release smoke stay green."
+    },
+    {
+      "id": "compat_tools_invoke_api",
+      "kind": "feature_flag",
+      "summary": "Keep /v1/tools/invoke on the guarded refusal path unless the dedicated approval-bound execution surface is shipped."
+    },
+    {
+      "id": "compat_api_tokens",
+      "kind": "permission_scope",
+      "summary": "Use scoped compat API tokens and keep compat.models.read, compat.embeddings.create, and compat.tools.invoke permissions explicitly opt-in."
+    },
+    {
+      "id": "typed_plugin_contract_negotiation",
+      "kind": "install_gate",
+      "summary": "Require typed plugin contracts to negotiate accepted adapters while leaving legacy plugins on the compatibility path."
+    },
+    {
+      "id": "operator_insights_surface",
+      "kind": "operator_surface",
+      "summary": "Treat /console/v1/system/insights, diagnostics observability payloads, and palyra system insights as read-only rollout signals for degraded hotspots."
+    }
+  ],
+  "migration_tracks": [
+    {
+      "id": "legacy_config_reload",
+      "surface": "palyra config migrate + palyra config recover + console reload planner",
+      "apply": "Run config migration before enabling updated compat/provider/retrieval settings, then verify the reload plan or apply result stays explainable and redacted.",
+      "rollback": "Use the latest config backup or config recover surface and confirm secrets remain redacted before reloading again."
+    },
+    {
+      "id": "legacy_bindings_and_plugin_contracts",
+      "surface": "bindings schema + typed plugin contract installation",
+      "apply": "Reinstall typed plugins with explicit grants and accepted contract adapters before switching operators onto the typed extension path.",
+      "rollback": "Remove the typed binding, return to the prior compatibility binding, and rerun plugin explain or doctor to confirm the legacy path is healthy."
+    },
+    {
+      "id": "provider_and_embeddings_setup",
+      "surface": "provider failover + compat embeddings exposure",
+      "apply": "Confirm the registry-backed chat and embeddings models are configured before turning on compat token permissions for embeddings clients.",
+      "rollback": "Disable compat embeddings exposure, keep compat models read-only, and fall back to the existing provider status and explain surfaces until provider health is restored."
+    }
+  ],
+  "known_limitations": [
+    {
+      "id": "tools_invoke_guarded_skeleton",
+      "state": "expected_guardrail",
+      "summary": "Compat /v1/tools/invoke intentionally stays on a guarded refusal path; widening it would require a separate approval-bound execution surface."
+    },
+    {
+      "id": "legacy_plugin_compatibility_path",
+      "state": "compatibility_path",
+      "summary": "Typed plugin contracts are additive; untyped legacy plugins remain installable and must keep a visible remediation path instead of hard failure."
+    },
+    {
+      "id": "profile_scoped_readiness",
+      "state": "two_stage_validation",
+      "summary": "Fast workflow regression validates the per-push profile and points at pending full-profile evidence; full regression must still pass before wider release widening."
+    }
+  ],
+  "evidence": [
+    {
+      "id": "workflow_regression_fast",
+      "kind": "workflow_report",
+      "summary": "Per-push regression run must cover all Phase 8 subsystems and pass the fast scenario set.",
+      "validation_mode": "runtime",
+      "profile": "fast",
+      "required_subsystems": [
+        "compat_api",
+        "secrets",
+        "reload",
+        "plugin_contracts",
+        "context_engine",
+        "provider_resilience",
+        "auxiliary_routing",
+        "retrieval_tuning",
+        "safety_boundary",
+        "networked_backend",
+        "cron_delivery",
+        "operator_insights"
+      ],
+      "must_pass_scenarios": [
+        "compat_model_detail_and_embeddings",
+        "compat_tools_invoke_guardrail",
+        "compat_embeddings_degraded_posture",
+        "plugin_contract_workflows",
+        "session_compaction_contract",
+        "config_migrate_recover_redaction",
+        "provider_failover_explain",
+        "auxiliary_lease_degrade",
+        "memory_degraded_diagnostics",
+        "networked_worker_filesystem_block",
+        "cron_delivery_workflow",
+        "operator_insights_surface"
+      ]
+    },
+    {
+      "id": "workflow_regression_full",
+      "kind": "workflow_report",
+      "summary": "Nightly or pre-release regression run must pass the broader runtime matrix before rollout widening.",
+      "validation_mode": "runtime",
+      "profile": "full",
+      "required_subsystems": [
+        "compat_api",
+        "secrets",
+        "reload",
+        "plugin_contracts",
+        "context_engine",
+        "provider_resilience",
+        "auxiliary_routing",
+        "retrieval_tuning",
+        "safety_boundary",
+        "networked_backend",
+        "cron_delivery",
+        "operator_insights"
+      ],
+      "must_pass_scenarios": [
+        "compat_model_detail_not_found",
+        "browser_channels_sessions",
+        "discord_admin_cli_workflows",
+        "cron_owner_boundary",
+        "provider_auth_redaction",
+        "profile_secret_ref_roundtrip",
+        "retrieval_invalid_weight_sum",
+        "networked_backend_degraded_inventory",
+        "networked_worker_lifecycle_journal",
+        "legacy_acp_shim"
+      ]
+    },
+    {
+      "id": "critical_attack_suite_contract",
+      "kind": "source_contract",
+      "summary": "Critical attack scenarios must remain wired into CI as a release gate.",
+      "validation_mode": "structural",
+      "path": ".github/workflows/ci.yml",
+      "must_contain": [
+        "critical-attack-scenarios:",
+        "run-critical-attack-scenarios.sh"
+      ]
+    },
+    {
+      "id": "performance_smoke_contract",
+      "kind": "source_contract",
+      "summary": "Performance smoke must continue validating the desktop snapshot and support-bundle hot path before wider rollout.",
+      "validation_mode": "structural",
+      "path": "scripts/test/run-performance-smoke.sh",
+      "must_contain": [
+        "desktop_refresh_payload_reuses_single_snapshot_build_for_home_and_onboarding_views",
+        "support_bundle_export_plan_capture_does_not_hold_supervisor_lock"
+      ]
+    },
+    {
+      "id": "support_bundle_validation_contract",
+      "kind": "source_contract",
+      "summary": "Support bundle lifecycle validation must remain available for operator troubleshooting evidence.",
+      "validation_mode": "structural",
+      "path": "crates/palyra-daemon/tests/admin_surface.rs",
+      "must_contain": [
+        "fn console_support_bundle_job_lifecycle_publishes_deterministic_completion_state()"
+      ]
+    },
+    {
+      "id": "release_smoke_summary_contract",
+      "kind": "source_contract",
+      "summary": "Release smoke must emit machine-readable package and provenance evidence.",
+      "validation_mode": "structural",
+      "path": "scripts/test/run-release-smoke.ps1",
+      "must_contain": [
+        "release_smoke=passed",
+        "provenance_path=$provenancePath",
+        "summary_path=$summaryPath"
+      ]
+    },
+    {
+      "id": "cli_install_smoke_summary_contract",
+      "kind": "source_contract",
+      "summary": "CLI install smoke must continue exporting machine-readable inventory and summary outputs for package validation.",
+      "validation_mode": "structural",
+      "path": "scripts/test/run-cli-install-smoke.ps1",
+      "must_contain": [
+        "summary.json",
+        "inventory.json"
+      ]
+    }
+  ]
+}

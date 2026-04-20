@@ -138,6 +138,8 @@ jobs:
   workflow-regression:
     name: Workflow regression matrix
     runs-on: ubuntu-latest
+    env:
+      PALYRA_WORKFLOW_REGRESSION_PROFILE: fast
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -149,6 +151,14 @@ jobs:
 
       - name: Run workflow regression matrix
         run: bash scripts/test/run-workflow-regression.sh
+
+      - name: Upload workflow regression artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: workflow-regression-fast
+          path: target/release-artifacts/workflow-regression
+          if-no-files-found: error
 
   performance-smoke:
     name: Performance smoke

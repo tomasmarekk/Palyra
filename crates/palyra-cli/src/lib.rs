@@ -12,6 +12,7 @@ pub mod shared_chat_commands;
 pub mod support;
 pub mod transport;
 mod tui;
+pub mod workflow_regression;
 
 pub mod proto {
     pub mod palyra {

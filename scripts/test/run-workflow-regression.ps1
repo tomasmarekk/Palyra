@@ -6,13 +6,21 @@ $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 
 Push-Location $repoRoot
 try {
-    cargo build -p palyra-daemon -p palyra-cli --locked
-    cargo build -p palyra-browserd --bin palyra-browserd --locked
+    $profile = if ($env:PALYRA_WORKFLOW_REGRESSION_PROFILE) {
+        $env:PALYRA_WORKFLOW_REGRESSION_PROFILE
+    } else {
+        "fast"
+    }
+    $reportDir = if ($env:PALYRA_WORKFLOW_REGRESSION_REPORT_DIR) {
+        $env:PALYRA_WORKFLOW_REGRESSION_REPORT_DIR
+    } else {
+        Join-Path $repoRoot "target/release-artifacts/workflow-regression/$profile"
+    }
 
-    cargo test -p palyra-daemon --lib --locked compat::tests
-    cargo test -p palyra-cli --test wizard_cli --locked -- --test-threads=1
-    cargo test -p palyra-cli --test cli_v1_acp_shim --locked -- --test-threads=1
-    cargo test -p palyra-cli --test workflow_regression_matrix --locked -- --test-threads=1
+    $env:PALYRA_WORKFLOW_REGRESSION_CARGO_BIN = "cargo"
+    cargo run -p palyra-cli --example run_workflow_regression --locked -- `
+        --profile $profile `
+        --report-dir $reportDir
 }
 finally {
     Pop-Location

@@ -23,6 +23,8 @@ jobs:
   workflow-regression:
     name: Workflow regression matrix
     runs-on: ubuntu-latest
+    env:
+      PALYRA_WORKFLOW_REGRESSION_PROFILE: full
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -34,6 +36,14 @@ jobs:
 
       - name: Run workflow regression matrix
         run: bash scripts/test/run-workflow-regression.sh
+
+      - name: Upload workflow regression artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: workflow-regression-full
+          path: target/release-artifacts/workflow-regression
+          if-no-files-found: error
 
   release-smoke:
     name: Release packaging smoke (${{ matrix.os }})
@@ -75,10 +85,10 @@ jobs:
         shell: pwsh
         run: ./scripts/test/run-release-smoke.ps1
 
-      - name: Upload release smoke artifacts on failure
-        if: failure()
+      - name: Upload release smoke artifacts
+        if: ${{ always() }}
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         with:
           name: release-smoke-${{ matrix.os }}
           path: target/release-artifacts/smoke
-          if-no-files-found: ignore
+          if-no-files-found: error

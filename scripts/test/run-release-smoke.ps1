@@ -122,6 +122,7 @@ function Invoke-InstalledCliSmoke {
 
 $version = & (Join-Path $repoRoot "scripts/release/assert-version-coherence.ps1")
 $outputRoot = Join-Path $repoRoot "target/release-artifacts/smoke"
+$summaryPath = Join-Path $outputRoot "release-smoke-summary.json"
 if (Test-Path -LiteralPath $outputRoot) {
     Remove-Item -LiteralPath $outputRoot -Recurse -Force
 }
@@ -241,8 +242,21 @@ if (Test-Path -LiteralPath $sharedCliCommandRoot -PathType Container) {
     }
 }
 
+$summary = [ordered]@{
+    version = $version
+    platform = $platform
+    desktop_archive = $desktopArchive
+    headless_archive = $headlessArchive
+    provenance_path = $provenancePath
+    desktop_archive_validated = $true
+    headless_archive_validated = $true
+    installed_cli_smoke = $true
+}
+$summary | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $summaryPath -Encoding utf8
+
 Write-Output "release_smoke=passed"
 Write-Output "version=$version"
 Write-Output "desktop_archive=$desktopArchive"
 Write-Output "headless_archive=$headlessArchive"
 Write-Output "provenance_path=$provenancePath"
+Write-Output "summary_path=$summaryPath"
