@@ -42,7 +42,7 @@ macro_rules! runtime_contract_enum {
             }
 
             #[must_use]
-            pub fn from_str(value: &str) -> Option<Self> {
+            pub fn parse(value: &str) -> Option<Self> {
                 let normalized = value.trim().to_ascii_lowercase();
                 match normalized.as_str() {
                     $(
@@ -50,6 +50,20 @@ macro_rules! runtime_contract_enum {
                     )+
                     _ => None,
                 }
+            }
+
+            #[allow(clippy::should_implement_trait)]
+            #[must_use]
+            pub fn from_str(value: &str) -> Option<Self> {
+                Self::parse(value)
+            }
+        }
+
+        impl std::str::FromStr for $name {
+            type Err = ();
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Self::parse(value).ok_or(())
             }
         }
 
@@ -256,11 +270,11 @@ mod tests {
 
     #[test]
     fn runtime_contract_aliases_stay_backward_compatible() {
-        assert_eq!(QueueMode::from_str("follow_up"), Some(QueueMode::Followup));
-        assert_eq!(QueueDecision::from_str("coalesce"), Some(QueueDecision::Merge));
-        assert_eq!(QueuedInputState::from_str("delivered"), Some(QueuedInputState::Forwarded));
-        assert_eq!(AuxiliaryTaskState::from_str("canceled"), Some(AuxiliaryTaskState::Cancelled));
-        assert_eq!(WorkerLifecycleState::from_str("leased"), Some(WorkerLifecycleState::Assigned));
+        assert_eq!(QueueMode::parse("follow_up"), Some(QueueMode::Followup));
+        assert_eq!(QueueDecision::parse("coalesce"), Some(QueueDecision::Merge));
+        assert_eq!(QueuedInputState::parse("delivered"), Some(QueuedInputState::Forwarded));
+        assert_eq!(AuxiliaryTaskState::parse("canceled"), Some(AuxiliaryTaskState::Cancelled));
+        assert_eq!(WorkerLifecycleState::parse("leased"), Some(WorkerLifecycleState::Assigned));
     }
 
     #[test]

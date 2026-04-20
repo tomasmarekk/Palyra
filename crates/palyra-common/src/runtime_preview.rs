@@ -42,7 +42,7 @@ macro_rules! runtime_preview_enum {
             }
 
             #[must_use]
-            pub fn from_str(value: &str) -> Option<Self> {
+            pub fn parse(value: &str) -> Option<Self> {
                 let normalized = value.trim().to_ascii_lowercase();
                 match normalized.as_str() {
                     $(
@@ -50,6 +50,20 @@ macro_rules! runtime_preview_enum {
                     )+
                     _ => None,
                 }
+            }
+
+            #[allow(clippy::should_implement_trait)]
+            #[must_use]
+            pub fn from_str(value: &str) -> Option<Self> {
+                Self::parse(value)
+            }
+        }
+
+        impl std::str::FromStr for $name {
+            type Err = ();
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Self::parse(value).ok_or(())
             }
         }
 
@@ -175,7 +189,7 @@ pub fn parse_runtime_preview_mode(
     raw: &str,
     source_name: &str,
 ) -> Result<RuntimePreviewMode, RuntimePreviewModeParseError> {
-    RuntimePreviewMode::from_str(raw).ok_or_else(|| RuntimePreviewModeParseError {
+    RuntimePreviewMode::parse(raw).ok_or_else(|| RuntimePreviewModeParseError {
         source_name: source_name.to_owned(),
         value: raw.trim().to_owned(),
     })
@@ -690,7 +704,7 @@ mod tests {
             let decoded: RuntimePreviewCapability =
                 serde_json::from_str(encoded.as_str()).expect("capability should deserialize");
             assert_eq!(decoded, capability);
-            assert!(RuntimePreviewCapability::from_str(capability.as_str()).is_some());
+            assert!(RuntimePreviewCapability::parse(capability.as_str()).is_some());
             assert!(!capability.label().is_empty());
             assert!(!capability.summary().is_empty());
         }
@@ -736,7 +750,7 @@ mod tests {
     #[test]
     fn runtime_acceptance_scenarios_map_back_to_capabilities() {
         for scenario in ALL_RUNTIME_ACCEPTANCE_SCENARIOS {
-            assert!(RuntimeAcceptanceScenario::from_str(scenario.as_str()).is_some());
+            assert!(RuntimeAcceptanceScenario::parse(scenario.as_str()).is_some());
             assert!(!scenario.label().is_empty());
             assert!(!scenario.summary().is_empty());
             assert!(ALL_RUNTIME_PREVIEW_CAPABILITIES.contains(&scenario.capability()));

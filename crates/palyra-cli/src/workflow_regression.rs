@@ -926,7 +926,8 @@ fn validate_runtime_acceptance_catalog(
         let expected_fixture_keys = canonical
             .required_fixture_keys()
             .iter()
-            .map(|value| value.to_string())
+            .copied()
+            .map(str::to_owned)
             .collect::<BTreeSet<_>>();
         let actual_fixture_keys = scenario.fixture_keys.iter().cloned().collect::<BTreeSet<_>>();
         if actual_fixture_keys != expected_fixture_keys {

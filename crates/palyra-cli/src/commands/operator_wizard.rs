@@ -2948,7 +2948,7 @@ fn runtime_preview_mode_for_document(
     let Some(value) = get_string_value_at_path(document, mode_path.as_str())? else {
         return Ok(runtime_preview_default_mode(capability));
     };
-    RuntimePreviewMode::from_str(value.as_str()).ok_or_else(|| {
+    RuntimePreviewMode::parse(value.as_str()).ok_or_else(|| {
         anyhow::anyhow!(
             "{} must be one of disabled, preview_only, or enabled; got '{}'",
             mode_path,

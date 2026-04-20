@@ -122,11 +122,7 @@ fn assert_runtime_acceptance_contract(
     assert_eq!(manifest_acceptance.required_profiles, vec!["fast".to_owned(), "full".to_owned()]);
     assert_eq!(
         manifest_acceptance.fixture_keys,
-        acceptance
-            .required_fixture_keys()
-            .iter()
-            .map(|value| value.to_string())
-            .collect::<Vec<_>>()
+        acceptance.required_fixture_keys().iter().copied().map(str::to_owned).collect::<Vec<_>>()
     );
 
     let scenario =
