@@ -9,6 +9,7 @@
     "browserd",
     "canvas_experiments",
     "contract",
+    "delegation",
     "deployment",
     "execution_backends",
     "feature_rollouts",
