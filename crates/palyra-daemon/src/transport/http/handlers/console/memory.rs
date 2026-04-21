@@ -250,9 +250,9 @@ pub(crate) async fn console_memory_search_handler(
     }
 
     let sources = parse_memory_sources_csv(query.sources_csv.as_deref())?;
-    let hits = state
+    let outcome = state
         .runtime
-        .search_memory(journal::MemorySearchRequest {
+        .search_memory_with_diagnostics(journal::MemorySearchRequest {
             principal: session.context.principal,
             channel: query.channel.or(session.context.channel),
             session_id: session_scope.clone(),
@@ -264,7 +264,10 @@ pub(crate) async fn console_memory_search_handler(
         })
         .await
         .map_err(runtime_status_response)?;
-    Ok(Json(json!({ "hits": hits })))
+    Ok(Json(json!({
+        "hits": outcome.hits,
+        "diagnostics": outcome.diagnostics,
+    })))
 }
 
 pub(crate) async fn console_memory_purge_handler(
@@ -741,9 +744,9 @@ pub(crate) async fn console_workspace_search_handler(
             "min_score must be in range 0.0..=1.0",
         )));
     }
-    let hits = state
+    let outcome = state
         .runtime
-        .search_workspace_documents(journal::WorkspaceSearchRequest {
+        .search_workspace_documents_with_diagnostics(journal::WorkspaceSearchRequest {
             principal: session.context.principal.clone(),
             channel: query.channel.or(session.context.channel),
             agent_id: query.agent_id.and_then(trim_to_option),
@@ -757,7 +760,8 @@ pub(crate) async fn console_workspace_search_handler(
         .await
         .map_err(runtime_status_response)?;
     Ok(Json(json!({
-        "hits": hits,
+        "hits": outcome.hits,
+        "diagnostics": outcome.diagnostics,
         "contract": contract_descriptor(),
     })))
 }
@@ -869,6 +873,7 @@ pub(crate) async fn console_recall_preview_handler(
                 "checkpoint_hits": preview.checkpoint_hits.len(),
                 "compaction_hits": preview.compaction_hits.len(),
                 "top_candidates": preview.top_candidates.len(),
+                "diagnostics": preview.diagnostics.clone(),
             })),
         )
         .await
@@ -894,6 +899,7 @@ pub(crate) async fn console_recall_preview_handler(
         "top_candidates": preview.top_candidates,
         "structured_output": preview.structured_output,
         "plan": preview.plan,
+        "diagnostics": preview.diagnostics,
         "parameter_delta": preview.parameter_delta,
         "prompt_preview": preview.prompt_preview,
         "contract": contract_descriptor(),

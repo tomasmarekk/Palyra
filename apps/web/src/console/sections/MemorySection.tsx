@@ -155,6 +155,15 @@ export function MemorySection({ app }: MemorySectionProps) {
   const recallCheckpointHits = readObjectArray(app.memoryRecallPreview, "checkpoint_hits");
   const recallCompactionHits = readObjectArray(app.memoryRecallPreview, "compaction_hits");
   const recallTopCandidates = readObjectArray(app.memoryRecallPreview, "top_candidates");
+  const recallDiagnostics = readObjectArray(app.memoryRecallPreview, "diagnostics");
+  const recallLatencyMs = recallDiagnostics.reduce(
+    (maxLatency, diagnostic) =>
+      Math.max(maxLatency, readNumber(diagnostic, "total_latency_ms") ?? 0),
+    0,
+  );
+  const recallCacheHits = recallDiagnostics.filter((diagnostic) =>
+    readBoolean(diagnostic, "query_embedding_cache_hit"),
+  ).length;
   const recallPlan = readObject(app.memoryRecallPreview ?? EMPTY_OBJECT, "plan") ?? EMPTY_OBJECT;
   const recallPlanSources = readObjectArray(recallPlan, "sources");
   const recallPlanBudget = readObject(recallPlan, "budget") ?? EMPTY_OBJECT;
@@ -1290,6 +1299,20 @@ export function MemorySection({ app }: MemorySectionProps) {
                 </WorkspaceStatusChip>
                 <WorkspaceStatusChip tone={recallTopCandidates.length > 0 ? "warning" : "default"}>
                   {recallTopCandidates.length} top candidates
+                </WorkspaceStatusChip>
+                <WorkspaceStatusChip
+                  tone={
+                    recallDiagnostics.some((diagnostic) =>
+                      readBoolean(diagnostic, "latency_budget_exceeded"),
+                    )
+                      ? "warning"
+                      : "default"
+                  }
+                >
+                  {recallLatencyMs}ms retrieval
+                </WorkspaceStatusChip>
+                <WorkspaceStatusChip tone={recallCacheHits > 0 ? "success" : "default"}>
+                  {recallCacheHits}/{recallDiagnostics.length} cached
                 </WorkspaceStatusChip>
               </div>
             </form>

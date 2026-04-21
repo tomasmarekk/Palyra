@@ -16,7 +16,8 @@ use crate::{
     journal::{
         MemorySearchHit, MemorySearchRequest, OrchestratorCheckpointRecord,
         OrchestratorCompactionArtifactRecord, OrchestratorSessionResolveRequest,
-        OrchestratorSessionTranscriptRecord, WorkspaceSearchHit, WorkspaceSearchRequest,
+        OrchestratorSessionTranscriptRecord, RetrievalBranchDiagnostics, WorkspaceSearchHit,
+        WorkspaceSearchRequest,
     },
     retrieval::{
         checkpoint_source_quality as retrieval_checkpoint_source_quality,
@@ -242,6 +243,8 @@ pub(crate) struct RecallPreviewEnvelope {
     pub(crate) top_candidates: Vec<RecallCandidate>,
     pub(crate) structured_output: StructuredRecallOutput,
     pub(crate) plan: RecallPlan,
+    #[serde(default)]
+    pub(crate) diagnostics: Vec<RetrievalBranchDiagnostics>,
     pub(crate) parameter_delta: Value,
     pub(crate) prompt_preview: String,
 }
@@ -291,6 +294,7 @@ struct RecallExecution {
     parameter_delta: Value,
     prompt_preview: String,
     plan: RecallPlan,
+    diagnostics: Vec<RetrievalBranchDiagnostics>,
 }
 
 #[derive(Debug, Clone)]
@@ -380,6 +384,7 @@ pub(crate) async fn preview_recall(
         top_candidates: execution.top_candidates,
         structured_output: execution.structured_output,
         plan: execution.plan,
+        diagnostics: execution.diagnostics,
         parameter_delta: execution.parameter_delta,
         prompt_preview: execution.prompt_preview,
     })
@@ -458,6 +463,7 @@ pub(crate) fn recall_preview_console_payload(preview: &RecallPreviewEnvelope) ->
         "compaction_hits": preview.compaction_hits.len(),
         "top_candidates": preview.top_candidates.len(),
         "structured_output": preview.structured_output,
+        "diagnostics": preview.diagnostics,
     })
 }
 
@@ -609,26 +615,28 @@ async fn execute_recall(
     let plan =
         build_recall_plan(query, query_variants.as_slice(), scoped_session_id.is_some(), request);
 
-    let memory_hits = if plan_source_selected(plan.sources.as_slice(), RecallSourceKind::Memory) {
-        runtime_state
-            .search_memory(MemorySearchRequest {
-                principal: context.principal.clone(),
-                channel: request.channel.clone().or_else(|| context.channel.clone()),
-                session_id: scoped_session_id.clone(),
-                query: query.to_owned(),
-                top_k: request.memory_top_k.max(1),
-                min_score: request.min_score,
-                tags: Vec::new(),
-                sources: Vec::new(),
-            })
-            .await?
-    } else {
-        Vec::new()
-    };
-    let workspace_hits =
+    let (memory_hits, memory_diagnostics) =
+        if plan_source_selected(plan.sources.as_slice(), RecallSourceKind::Memory) {
+            let outcome = runtime_state
+                .search_memory_with_diagnostics(MemorySearchRequest {
+                    principal: context.principal.clone(),
+                    channel: request.channel.clone().or_else(|| context.channel.clone()),
+                    session_id: scoped_session_id.clone(),
+                    query: query.to_owned(),
+                    top_k: request.memory_top_k.max(1),
+                    min_score: request.min_score,
+                    tags: Vec::new(),
+                    sources: Vec::new(),
+                })
+                .await?;
+            (outcome.hits, vec![outcome.diagnostics])
+        } else {
+            (Vec::new(), Vec::new())
+        };
+    let (workspace_hits, workspace_diagnostics) =
         if plan_source_selected(plan.sources.as_slice(), RecallSourceKind::WorkspaceDocument) {
-            runtime_state
-                .search_workspace_documents(WorkspaceSearchRequest {
+            let outcome = runtime_state
+                .search_workspace_documents_with_diagnostics(WorkspaceSearchRequest {
                     principal: context.principal.clone(),
                     channel: request.channel.clone().or_else(|| context.channel.clone()),
                     agent_id: request.agent_id.clone(),
@@ -639,10 +647,13 @@ async fn execute_recall(
                     include_historical: request.include_workspace_historical,
                     include_quarantined: request.include_workspace_quarantined,
                 })
-                .await?
+                .await?;
+            (outcome.hits, vec![outcome.diagnostics])
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
+    let mut diagnostics = memory_diagnostics;
+    diagnostics.extend(workspace_diagnostics);
     let transcript_records =
         if plan_source_selected(plan.sources.as_slice(), RecallSourceKind::Transcript) {
             runtime_state
@@ -754,6 +765,7 @@ async fn execute_recall(
         parameter_delta,
         prompt_preview,
         plan,
+        diagnostics,
     })
 }
 
@@ -2153,6 +2165,7 @@ mod tests {
                 },
                 sources: Vec::new(),
             },
+            diagnostics: Vec::new(),
             parameter_delta: json!({
                 "explicit_recall": ExplicitRecallSelection {
                     query: "rollback".to_owned(),

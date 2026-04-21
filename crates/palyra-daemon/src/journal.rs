@@ -514,6 +514,38 @@ pub struct WorkspaceSearchCandidateRecord {
     pub vector_candidate: bool,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RetrievalBranchDiagnostics {
+    pub source_kind: String,
+    pub query_embedding_cache_hit: bool,
+    pub lexical_latency_ms: u64,
+    pub vector_latency_ms: u64,
+    pub fusion_latency_ms: u64,
+    pub total_latency_ms: u64,
+    pub latency_budget_ms: u64,
+    pub latency_budget_exceeded: bool,
+    pub candidate_count: u64,
+    pub lexical_candidate_count: u64,
+    pub vector_candidate_count: u64,
+    pub fused_hit_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub degraded_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coverage_gap: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemorySearchCandidateOutcome {
+    pub candidates: Vec<MemorySearchCandidateRecord>,
+    pub diagnostics: RetrievalBranchDiagnostics,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkspaceSearchCandidateOutcome {
+    pub candidates: Vec<WorkspaceSearchCandidateRecord>,
+    pub diagnostics: RetrievalBranchDiagnostics,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceDocumentWriteRequest {
     pub document_id: Option<String>,
@@ -3626,6 +3658,12 @@ struct QueryEmbeddingCacheEntry {
     expires_at_unix_ms: i64,
 }
 
+#[derive(Debug, Clone)]
+struct QueryEmbeddingLookup {
+    vector: Vec<f32>,
+    cache_hit: bool,
+}
+
 #[derive(Debug, Default)]
 struct QueryEmbeddingCacheState {
     entries: BTreeMap<String, QueryEmbeddingCacheEntry>,
@@ -3736,7 +3774,7 @@ impl JournalStore {
         embedding_dims: usize,
         embedding_version: i64,
         now_unix_ms: i64,
-    ) -> Vec<f32> {
+    ) -> QueryEmbeddingLookup {
         let cache_key = query_embedding_cache_key(
             query_text,
             embedding_model_id,
@@ -3769,7 +3807,7 @@ impl JournalStore {
             }
         };
         if let Some(vector) = cached_vector {
-            return vector;
+            return QueryEmbeddingLookup { vector, cache_hit: true };
         }
 
         let vector = normalize_embedding_dimensions(
@@ -3804,7 +3842,7 @@ impl JournalStore {
                 );
             }
         }
-        vector
+        QueryEmbeddingLookup { vector, cache_hit: false }
     }
 
     fn query_embedding_cache_status(&self, now_unix_ms: i64) -> QueryEmbeddingCacheStatus {
@@ -9391,34 +9429,50 @@ impl JournalStore {
         })
     }
 
-    pub fn search_memory_candidates(
+    pub fn search_memory_candidate_outcome(
         &self,
         request: &MemorySearchRequest,
-    ) -> Result<Vec<MemorySearchCandidateRecord>, JournalError> {
+    ) -> Result<MemorySearchCandidateOutcome, JournalError> {
+        let total_started = Instant::now();
         let query_text = normalize_memory_text(request.query.as_str());
         let embedding_model_id = self.memory_embedding_provider.model_name().to_owned();
         let embedding_dims = self.memory_embedding_provider.dimensions();
         let embedding_version = CURRENT_MEMORY_EMBEDDING_VERSION;
         let requested_tags = normalize_memory_tags(request.tags.as_slice());
         if query_text.is_empty() {
-            return Ok(Vec::new());
+            return Ok(MemorySearchCandidateOutcome {
+                candidates: Vec::new(),
+                diagnostics: retrieval_branch_diagnostics(
+                    "memory",
+                    false,
+                    0,
+                    0,
+                    elapsed_millis(total_started),
+                    0,
+                    0,
+                    0,
+                ),
+            });
         }
         let now = current_unix_ms()?;
         let top_k = request.top_k.clamp(1, MAX_MEMORY_ITEMS_LIST_LIMIT);
         let candidate_limit = top_k.saturating_mul(8).clamp(top_k, MAX_MEMORY_SEARCH_CANDIDATES);
         let fts_query = build_fts_query(query_text.as_str());
-        let query_vector = self.query_embedding_for_search(
+        let query_embedding = self.query_embedding_for_search(
             query_text.as_str(),
             embedding_model_id.as_str(),
             embedding_dims,
             embedding_version,
             now,
         );
+        let query_vector = query_embedding.vector;
         self.purge_expired_memory_items(now)?;
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let mut candidates_by_id = BTreeMap::<String, MemorySearchCandidateRecord>::new();
 
+        let mut lexical_latency_ms = 0;
         if !fts_query.is_empty() {
+            let lexical_started = Instant::now();
             let mut statement = guard.prepare(
                 r#"
                     SELECT
@@ -9509,8 +9563,10 @@ impl JournalStore {
                     },
                 );
             }
+            lexical_latency_ms = elapsed_millis(lexical_started);
         }
 
+        let vector_started = Instant::now();
         let vector_scan_limit = candidate_limit
             .saturating_mul(4)
             .clamp(candidate_limit, MAX_MEMORY_VECTOR_SCAN_CANDIDATES);
@@ -9600,6 +9656,7 @@ impl JournalStore {
                 },
             );
         }
+        let vector_latency_ms = elapsed_millis(vector_started);
 
         let mut candidates = candidates_by_id.into_values().collect::<Vec<_>>();
         candidates.sort_by(|left, right| {
@@ -9611,7 +9668,31 @@ impl JournalStore {
                 .then_with(|| left.item.memory_id.cmp(&right.item.memory_id))
         });
         candidates.truncate(candidate_limit);
-        Ok(candidates)
+        let candidate_count = candidates.len() as u64;
+        let lexical_candidate_count =
+            candidates.iter().filter(|candidate| candidate.lexical_candidate).count() as u64;
+        let vector_candidate_count =
+            candidates.iter().filter(|candidate| candidate.vector_candidate).count() as u64;
+        Ok(MemorySearchCandidateOutcome {
+            candidates,
+            diagnostics: retrieval_branch_diagnostics(
+                "memory",
+                query_embedding.cache_hit,
+                lexical_latency_ms,
+                vector_latency_ms,
+                elapsed_millis(total_started),
+                candidate_count,
+                lexical_candidate_count,
+                vector_candidate_count,
+            ),
+        })
+    }
+
+    pub fn search_memory_candidates(
+        &self,
+        request: &MemorySearchRequest,
+    ) -> Result<Vec<MemorySearchCandidateRecord>, JournalError> {
+        Ok(self.search_memory_candidate_outcome(request)?.candidates)
     }
 
     #[allow(dead_code)]
@@ -10322,10 +10403,11 @@ impl JournalStore {
         })
     }
 
-    pub fn search_workspace_candidates(
+    pub fn search_workspace_candidate_outcome(
         &self,
         request: &WorkspaceSearchRequest,
-    ) -> Result<Vec<WorkspaceSearchCandidateRecord>, JournalError> {
+    ) -> Result<WorkspaceSearchCandidateOutcome, JournalError> {
+        let total_started = Instant::now();
         if !request.min_score.is_finite() || !(0.0..=1.0).contains(&request.min_score) {
             return Err(JournalError::InvalidWorkspaceContent {
                 reason: "min_score must be in range 0.0..=1.0".to_owned(),
@@ -10333,27 +10415,42 @@ impl JournalStore {
         }
         let query_text = normalize_memory_text(request.query.as_str());
         if query_text.is_empty() {
-            return Ok(Vec::new());
+            return Ok(WorkspaceSearchCandidateOutcome {
+                candidates: Vec::new(),
+                diagnostics: retrieval_branch_diagnostics(
+                    "workspace_document",
+                    false,
+                    0,
+                    0,
+                    elapsed_millis(total_started),
+                    0,
+                    0,
+                    0,
+                ),
+            });
         }
         let prefix = request.prefix.as_deref().map(normalize_workspace_prefix).transpose()?;
         let prefix_like = prefix.as_deref().map(|value| format!("{value}/%"));
         let embedding_model_id = self.memory_embedding_provider.model_name().to_owned();
         let embedding_dims = self.memory_embedding_provider.dimensions();
         let now = current_unix_ms()?;
-        let query_vector = self.query_embedding_for_search(
+        let query_embedding = self.query_embedding_for_search(
             query_text.as_str(),
             embedding_model_id.as_str(),
             embedding_dims,
             CURRENT_MEMORY_EMBEDDING_VERSION,
             now,
         );
+        let query_vector = query_embedding.vector;
         let fts_query = build_fts_query(query_text.as_str());
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let top_k = request.top_k.clamp(1, MAX_WORKSPACE_DOCUMENT_LIST_LIMIT);
         let candidate_limit = top_k.saturating_mul(8).clamp(top_k, MAX_WORKSPACE_SEARCH_CANDIDATES);
         let mut candidates_by_key = BTreeMap::<String, WorkspaceSearchCandidateRecord>::new();
 
+        let mut lexical_latency_ms = 0;
         if !fts_query.is_empty() {
+            let lexical_started = Instant::now();
             let mut statement = guard.prepare(
                 r#"
                     SELECT
@@ -10470,8 +10567,10 @@ impl JournalStore {
                     },
                 );
             }
+            lexical_latency_ms = elapsed_millis(lexical_started);
         }
 
+        let vector_started = Instant::now();
         let vector_scan_limit = candidate_limit
             .saturating_mul(4)
             .clamp(candidate_limit, MAX_WORKSPACE_VECTOR_SCAN_CANDIDATES);
@@ -10585,6 +10684,7 @@ impl JournalStore {
                 },
             );
         }
+        let vector_latency_ms = elapsed_millis(vector_started);
 
         let mut candidates = candidates_by_key.into_values().collect::<Vec<_>>();
         candidates.sort_by(|left, right| {
@@ -10598,7 +10698,31 @@ impl JournalStore {
                 .then_with(|| left.document.document_id.cmp(&right.document.document_id))
         });
         candidates.truncate(candidate_limit);
-        Ok(candidates)
+        let candidate_count = candidates.len() as u64;
+        let lexical_candidate_count =
+            candidates.iter().filter(|candidate| candidate.lexical_candidate).count() as u64;
+        let vector_candidate_count =
+            candidates.iter().filter(|candidate| candidate.vector_candidate).count() as u64;
+        Ok(WorkspaceSearchCandidateOutcome {
+            candidates,
+            diagnostics: retrieval_branch_diagnostics(
+                "workspace_document",
+                query_embedding.cache_hit,
+                lexical_latency_ms,
+                vector_latency_ms,
+                elapsed_millis(total_started),
+                candidate_count,
+                lexical_candidate_count,
+                vector_candidate_count,
+            ),
+        })
+    }
+
+    pub fn search_workspace_candidates(
+        &self,
+        request: &WorkspaceSearchRequest,
+    ) -> Result<Vec<WorkspaceSearchCandidateRecord>, JournalError> {
+        Ok(self.search_workspace_candidate_outcome(request)?.candidates)
     }
 
     #[allow(dead_code)]
@@ -10682,6 +10806,58 @@ fn query_embedding_cache_key(
 
 fn prune_query_embedding_cache(cache: &mut QueryEmbeddingCacheState, now_unix_ms: i64) {
     cache.entries.retain(|_, entry| entry.expires_at_unix_ms > now_unix_ms);
+}
+
+fn elapsed_millis(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn retrieval_coverage_gap(
+    candidate_count: u64,
+    lexical_candidate_count: u64,
+    vector_candidate_count: u64,
+) -> Option<String> {
+    if candidate_count == 0 {
+        Some("no_candidates".to_owned())
+    } else if lexical_candidate_count == 0 {
+        Some("lexical_branch_empty".to_owned())
+    } else if vector_candidate_count == 0 {
+        Some("vector_branch_empty".to_owned())
+    } else {
+        None
+    }
+}
+
+fn retrieval_branch_diagnostics(
+    source_kind: &str,
+    query_embedding_cache_hit: bool,
+    lexical_latency_ms: u64,
+    vector_latency_ms: u64,
+    total_latency_ms: u64,
+    candidate_count: u64,
+    lexical_candidate_count: u64,
+    vector_candidate_count: u64,
+) -> RetrievalBranchDiagnostics {
+    RetrievalBranchDiagnostics {
+        source_kind: source_kind.to_owned(),
+        query_embedding_cache_hit,
+        lexical_latency_ms,
+        vector_latency_ms,
+        fusion_latency_ms: 0,
+        total_latency_ms,
+        latency_budget_ms: 0,
+        latency_budget_exceeded: false,
+        candidate_count,
+        lexical_candidate_count,
+        vector_candidate_count,
+        fused_hit_count: 0,
+        degraded_reason: None,
+        coverage_gap: retrieval_coverage_gap(
+            candidate_count,
+            lexical_candidate_count,
+            vector_candidate_count,
+        ),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -16267,13 +16443,27 @@ mod tests {
             tags: Vec::new(),
             sources: Vec::new(),
         };
-        store.search_memory_candidates(&request).expect("first candidate search should succeed");
+        let first_outcome = store
+            .search_memory_candidate_outcome(&request)
+            .expect("first candidate search should succeed");
         let calls_after_first_search = calls.load(Ordering::SeqCst);
-        store.search_memory_candidates(&request).expect("second candidate search should succeed");
+        let second_outcome = store
+            .search_memory_candidate_outcome(&request)
+            .expect("second candidate search should succeed");
 
         let status = store
             .memory_embeddings_status()
             .expect("embedding status should include query cache counters");
+        assert!(
+            !first_outcome.diagnostics.query_embedding_cache_hit,
+            "first search should miss the query embedding cache"
+        );
+        assert!(
+            second_outcome.diagnostics.query_embedding_cache_hit,
+            "second search should report a query embedding cache hit"
+        );
+        assert_eq!(second_outcome.diagnostics.source_kind, "memory");
+        assert_eq!(second_outcome.diagnostics.vector_candidate_count, 1);
         assert_eq!(
             calls_after_first_search,
             calls_after_indexing + 1,

@@ -22,7 +22,7 @@ use crate::journal::{
     OrchestratorSessionQueueControlUpdateRequest, OrchestratorSessionRecord,
     OrchestratorSessionTitleUpdateRequest, OrchestratorSessionTranscriptRecord,
     OrchestratorUsageQuery, OrchestratorUsageRunRecord, OrchestratorUsageSessionRecord,
-    OrchestratorUsageSummary, SessionProjectContextStateCopyRequest,
+    OrchestratorUsageSummary, RetrievalBranchDiagnostics, SessionProjectContextStateCopyRequest,
     SessionProjectContextStateRecord, SessionProjectContextStateUpsertRequest,
     WorkspaceBootstrapOutcome, WorkspaceBootstrapRequest, WorkspaceCheckpointCreateRequest,
     WorkspaceCheckpointFilePayload, WorkspaceCheckpointFileRecord, WorkspaceCheckpointListFilter,
@@ -243,6 +243,18 @@ pub(crate) struct CachedHttpFetchEntry {
 pub(crate) struct CachedMemorySearchEntry {
     pub(crate) hits: Vec<MemorySearchHit>,
     pub(crate) expires_at_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MemorySearchOutcome {
+    pub(crate) hits: Vec<MemorySearchHit>,
+    pub(crate) diagnostics: RetrievalBranchDiagnostics,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct WorkspaceSearchOutcome {
+    pub(crate) hits: Vec<WorkspaceSearchHit>,
+    pub(crate) diagnostics: RetrievalBranchDiagnostics,
 }
 
 #[derive(Debug, Clone)]
@@ -984,6 +996,25 @@ impl RuntimeCounters {
             canvas_denied: self.canvas_denied.load(Ordering::Relaxed),
         }
     }
+}
+
+fn complete_retrieval_diagnostics(
+    mut diagnostics: RetrievalBranchDiagnostics,
+    fusion_latency_ms: u64,
+    fused_hit_count: u64,
+    total_latency_ms: u64,
+) -> RetrievalBranchDiagnostics {
+    let latency_budget_ms = u64::try_from(MEMORY_SEARCH_LATENCY_BUDGET_MS).unwrap_or(u64::MAX);
+    diagnostics.fusion_latency_ms = fusion_latency_ms;
+    diagnostics.fused_hit_count = fused_hit_count;
+    diagnostics.total_latency_ms = total_latency_ms;
+    diagnostics.latency_budget_ms = latency_budget_ms;
+    diagnostics.latency_budget_exceeded = total_latency_ms > latency_budget_ms;
+    diagnostics
+}
+
+fn elapsed_millis(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 impl GatewayRuntimeState {
@@ -6175,6 +6206,45 @@ impl GatewayRuntimeState {
     }
 
     #[allow(clippy::result_large_err)]
+    pub async fn search_memory_with_diagnostics(
+        self: &Arc<Self>,
+        request: MemorySearchRequest,
+    ) -> Result<MemorySearchOutcome, Status> {
+        self.counters.memory_search_requests.fetch_add(1, Ordering::Relaxed);
+        let total_started = Instant::now();
+        let state = Arc::clone(self);
+        let outcome = tokio::task::spawn_blocking(move || {
+            let candidate_outcome = state
+                .retrieval_backend
+                .search_memory_candidate_outcome(&state.journal_store, &request)
+                .map_err(|error| map_memory_store_error("search memory items", error))?;
+            let fusion_started = Instant::now();
+            let hits = score_memory_candidates(
+                candidate_outcome.candidates,
+                request.min_score,
+                &state.retrieval_config_snapshot(),
+            );
+            let diagnostics = complete_retrieval_diagnostics(
+                candidate_outcome.diagnostics,
+                elapsed_millis(fusion_started),
+                hits.len() as u64,
+                elapsed_millis(total_started),
+            );
+            Ok::<_, Status>(MemorySearchOutcome { hits, diagnostics })
+        })
+        .await
+        .map_err(|_| Status::internal("memory search worker panicked"))??;
+        if outcome.diagnostics.latency_budget_exceeded {
+            warn!(
+                elapsed_ms = outcome.diagnostics.total_latency_ms,
+                budget_ms = outcome.diagnostics.latency_budget_ms,
+                "memory search exceeded latency budget"
+            );
+        }
+        Ok(outcome)
+    }
+
+    #[allow(clippy::result_large_err)]
     pub async fn search_memory(
         self: &Arc<Self>,
         request: MemorySearchRequest,
@@ -6442,24 +6512,49 @@ impl GatewayRuntimeState {
     }
 
     #[allow(clippy::result_large_err)]
+    pub async fn search_workspace_documents_with_diagnostics(
+        self: &Arc<Self>,
+        request: WorkspaceSearchRequest,
+    ) -> Result<WorkspaceSearchOutcome, Status> {
+        let total_started = Instant::now();
+        let state = Arc::clone(self);
+        let outcome = tokio::task::spawn_blocking(move || {
+            let candidate_outcome = state
+                .retrieval_backend
+                .search_workspace_candidate_outcome(&state.journal_store, &request)
+                .map_err(|error| map_memory_store_error("search workspace documents", error))?;
+            let fusion_started = Instant::now();
+            let hits = score_workspace_candidates(
+                candidate_outcome.candidates,
+                request.min_score,
+                &state.retrieval_config_snapshot(),
+            );
+            let diagnostics = complete_retrieval_diagnostics(
+                candidate_outcome.diagnostics,
+                elapsed_millis(fusion_started),
+                hits.len() as u64,
+                elapsed_millis(total_started),
+            );
+            Ok::<_, Status>(WorkspaceSearchOutcome { hits, diagnostics })
+        })
+        .await
+        .map_err(|_| Status::internal("workspace search worker panicked"))??;
+        if outcome.diagnostics.latency_budget_exceeded {
+            warn!(
+                elapsed_ms = outcome.diagnostics.total_latency_ms,
+                budget_ms = outcome.diagnostics.latency_budget_ms,
+                "workspace search exceeded latency budget"
+            );
+        }
+        Ok(outcome)
+    }
+
+    #[allow(clippy::result_large_err)]
     pub async fn search_workspace_documents(
         self: &Arc<Self>,
         request: WorkspaceSearchRequest,
     ) -> Result<Vec<WorkspaceSearchHit>, Status> {
-        let state = Arc::clone(self);
-        tokio::task::spawn_blocking(move || {
-            let candidates = state
-                .retrieval_backend
-                .search_workspace_candidates(&state.journal_store, &request)
-                .map_err(|error| map_memory_store_error("search workspace documents", error))?;
-            Ok::<_, Status>(score_workspace_candidates(
-                candidates,
-                request.min_score,
-                &state.retrieval_config_snapshot(),
-            ))
-        })
-        .await
-        .map_err(|_| Status::internal("workspace search worker panicked"))?
+        Ok(self.search_workspace_documents_with_diagnostics(request).await?.hits)
     }
 
     pub fn record_cron_trigger_fired(&self) {

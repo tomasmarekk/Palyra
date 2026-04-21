@@ -135,6 +135,14 @@ export function ChatComposer({
       contextReferencePreview.warnings.length > 0);
   const projectContextEntryPreview = projectContextPreview?.entries.slice(0, 4) ?? [];
   const previewWorkspaceHits = recallPreview?.workspace_hits.slice(0, 2) ?? [];
+  const recallDiagnostics = recallPreview?.diagnostics ?? [];
+  const recallLatencyMs = recallDiagnostics.reduce(
+    (maxLatency, diagnostic) => Math.max(maxLatency, diagnostic.total_latency_ms),
+    0,
+  );
+  const recallCacheHits = recallDiagnostics.filter(
+    (diagnostic) => diagnostic.query_embedding_cache_hit,
+  ).length;
   const previewMemoryHits: Record<string, unknown>[] = [];
   for (const hit of recallPreview?.memory_hits ?? []) {
     if (isRecord(hit)) {
@@ -389,6 +397,18 @@ export function ChatComposer({
             </StatusChip>
             <StatusChip tone={previewMemoryHits.length > 0 ? "success" : "default"}>
               {recallPreview?.memory_hits.length ?? 0} memory refs
+            </StatusChip>
+            <StatusChip
+              tone={
+                recallDiagnostics.some((diagnostic) => diagnostic.latency_budget_exceeded)
+                  ? "warning"
+                  : "default"
+              }
+            >
+              {recallLatencyMs}ms retrieval
+            </StatusChip>
+            <StatusChip tone={recallCacheHits > 0 ? "success" : "default"}>
+              {recallCacheHits}/{recallDiagnostics.length} cached
             </StatusChip>
             <StatusChip tone={recallPreviewStale ? "warning" : "default"}>
               {recallPreviewStale ? "Draft changed" : "In sync"}

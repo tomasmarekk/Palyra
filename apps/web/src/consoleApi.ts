@@ -1672,6 +1672,23 @@ export interface WorkspaceSearchHit {
   document: WorkspaceDocumentRecord;
 }
 
+export interface RetrievalBranchDiagnostics {
+  source_kind: string;
+  query_embedding_cache_hit: boolean;
+  lexical_latency_ms: number;
+  vector_latency_ms: number;
+  fusion_latency_ms: number;
+  total_latency_ms: number;
+  latency_budget_ms: number;
+  latency_budget_exceeded: boolean;
+  candidate_count: number;
+  lexical_candidate_count: number;
+  vector_candidate_count: number;
+  fused_hit_count: number;
+  degraded_reason?: string;
+  coverage_gap?: string;
+}
+
 export interface WorkspaceBootstrapOutcome {
   ran_at_unix_ms: number;
   created_paths: string[];
@@ -1750,6 +1767,7 @@ export interface RecallPreviewEnvelope {
   top_candidates?: RecallCandidate[];
   structured_output?: StructuredRecallOutput;
   plan?: RecallPlan;
+  diagnostics?: RetrievalBranchDiagnostics[];
   parameter_delta: JsonValue;
   prompt_preview: string;
   contract: ContractDescriptor;
@@ -6117,7 +6135,10 @@ export class ConsoleApiClient {
     return applyDiscordOnboardingRequest(this.request.bind(this), payload);
   }
 
-  async searchMemory(params?: URLSearchParams): Promise<{ hits: JsonValue[] }> {
+  async searchMemory(params?: URLSearchParams): Promise<{
+    hits: JsonValue[];
+    diagnostics?: RetrievalBranchDiagnostics;
+  }> {
     return this.request(buildPathWithQuery("/console/v1/memory/search", params));
   }
 
@@ -6320,7 +6341,11 @@ export class ConsoleApiClient {
 
   async searchWorkspaceDocuments(
     params?: URLSearchParams,
-  ): Promise<{ hits: WorkspaceSearchHit[]; contract: ContractDescriptor }> {
+  ): Promise<{
+    hits: WorkspaceSearchHit[];
+    diagnostics?: RetrievalBranchDiagnostics;
+    contract: ContractDescriptor;
+  }> {
     return this.request(buildPathWithQuery("/console/v1/memory/workspace/search", params));
   }
 

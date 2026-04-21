@@ -7,10 +7,11 @@ use serde_json::Value;
 use crate::{
     journal::{
         HashMemoryEmbeddingProvider, JournalError, JournalStore, MemoryEmbeddingProvider,
-        MemoryEmbeddingsMode, MemoryScoreBreakdown, MemorySearchCandidateRecord, MemorySearchHit,
-        MemorySearchRequest, MemorySource, OrchestratorCheckpointRecord,
-        OrchestratorCompactionArtifactRecord, WorkspaceScoreBreakdown,
-        WorkspaceSearchCandidateRecord, WorkspaceSearchHit, WorkspaceSearchRequest,
+        MemoryEmbeddingsMode, MemoryScoreBreakdown, MemorySearchCandidateOutcome,
+        MemorySearchCandidateRecord, MemorySearchHit, MemorySearchRequest, MemorySource,
+        OrchestratorCheckpointRecord, OrchestratorCompactionArtifactRecord,
+        WorkspaceScoreBreakdown, WorkspaceSearchCandidateOutcome, WorkspaceSearchCandidateRecord,
+        WorkspaceSearchHit, WorkspaceSearchRequest,
     },
     model_provider::{
         build_embeddings_provider, ModelProviderConfig, ModelProviderCredentialSource,
@@ -330,11 +331,17 @@ pub(crate) trait RetrievalBackend: Send + Sync {
         request: &MemorySearchRequest,
     ) -> Result<Vec<MemorySearchCandidateRecord>, JournalError>;
 
-    fn search_workspace_candidates(
+    fn search_memory_candidate_outcome(
+        &self,
+        store: &JournalStore,
+        request: &MemorySearchRequest,
+    ) -> Result<MemorySearchCandidateOutcome, JournalError>;
+
+    fn search_workspace_candidate_outcome(
         &self,
         store: &JournalStore,
         request: &WorkspaceSearchRequest,
-    ) -> Result<Vec<WorkspaceSearchCandidateRecord>, JournalError>;
+    ) -> Result<WorkspaceSearchCandidateOutcome, JournalError>;
 }
 
 #[derive(Debug, Default)]
@@ -386,12 +393,20 @@ impl RetrievalBackend for JournalRetrievalBackend {
         store.search_memory_candidates(request)
     }
 
-    fn search_workspace_candidates(
+    fn search_memory_candidate_outcome(
+        &self,
+        store: &JournalStore,
+        request: &MemorySearchRequest,
+    ) -> Result<MemorySearchCandidateOutcome, JournalError> {
+        store.search_memory_candidate_outcome(request)
+    }
+
+    fn search_workspace_candidate_outcome(
         &self,
         store: &JournalStore,
         request: &WorkspaceSearchRequest,
-    ) -> Result<Vec<WorkspaceSearchCandidateRecord>, JournalError> {
-        store.search_workspace_candidates(request)
+    ) -> Result<WorkspaceSearchCandidateOutcome, JournalError> {
+        store.search_workspace_candidate_outcome(request)
     }
 }
 
