@@ -930,12 +930,48 @@ export interface ChatDelegationMergeProvenanceRecord {
   requires_approval: boolean;
 }
 
+export interface ChatDelegationMergeUsageSummary {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  started_at_unix_ms?: number;
+  completed_at_unix_ms?: number;
+  duration_ms?: number;
+}
+
+export interface ChatDelegationMergeApprovalSummary {
+  approval_required: boolean;
+  approval_events: number;
+  approval_pending: boolean;
+  approval_denied: boolean;
+}
+
+export interface ChatDelegationMergeArtifactReference {
+  artifact_id: string;
+  artifact_kind: string;
+  label: string;
+}
+
+export interface ChatDelegationToolTraceSummary {
+  child_run_id: string;
+  proposal_id?: string;
+  tool_name: string;
+  status: string;
+  excerpt: string;
+  requires_approval: boolean;
+}
+
 export interface ChatDelegationMergeResult {
   status: string;
   strategy: string;
   summary_text: string;
   warnings: string[];
+  failure_category?: string;
   approval_required: boolean;
+  approval_summary: ChatDelegationMergeApprovalSummary;
+  usage_summary: ChatDelegationMergeUsageSummary;
+  artifact_references?: ChatDelegationMergeArtifactReference[];
+  tool_trace_summary?: ChatDelegationToolTraceSummary[];
   provenance: ChatDelegationMergeProvenanceRecord[];
   merged_at_unix_ms?: number;
 }

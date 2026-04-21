@@ -4,6 +4,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use palyra_common::runtime_contracts::AuxiliaryTaskState;
 use serde_json::{json, Value};
+use tokio::time::MissedTickBehavior;
 use tokio_stream::StreamExt;
 use tonic::{Code, Request, Status};
 use tracing::warn;
@@ -13,8 +14,10 @@ use crate::{
     application::learning::{process_post_run_reflection_task, REFLECTION_TASK_KIND},
     auxiliary_executor::{execute_auxiliary_task, AuxiliaryExecutionRequest, AuxiliaryTaskType},
     delegation::{
-        DelegationExecutionMode, DelegationMergeProvenanceRecord, DelegationMergeResult,
-        DelegationMergeStrategy, DelegationSnapshot,
+        DelegationExecutionMode, DelegationMergeApprovalSummary, DelegationMergeArtifactReference,
+        DelegationMergeFailureCategory, DelegationMergeProvenanceRecord, DelegationMergeResult,
+        DelegationMergeStrategy, DelegationMergeUsageSummary, DelegationSnapshot,
+        DelegationToolTraceSummary,
     },
     gateway::{
         proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1},
@@ -30,6 +33,8 @@ use crate::{
 
 const BACKGROUND_QUEUE_IDLE_SLEEP: Duration = Duration::from_secs(3);
 const DEFAULT_BACKGROUND_CHANNEL: &str = "console:background";
+const CHILD_PROGRESS_MIN_INTERVAL_MS: i64 = 2_000;
+const CHILD_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
 pub(crate) fn spawn_background_queue_loop(
     runtime: Arc<GatewayRuntimeState>,
@@ -564,10 +569,71 @@ async fn run_background_task_stream(
     append_parent_spawned_event(runtime, task, run_id).await?;
 
     let mut stream_error = None::<String>;
-    while let Some(event) = stream.next().await {
-        if let Err(error) = event {
-            stream_error = Some(format!("background run stream read failed: {error}"));
-            break;
+    let mut latest_child_state = "running".to_owned();
+    let mut last_progress_at_unix_ms = 0_i64;
+    let mut model_token_chars = 0_usize;
+    let mut heartbeat = tokio::time::interval(CHILD_HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let _ = heartbeat.tick().await;
+    loop {
+        tokio::select! {
+            maybe_event = stream.next() => {
+                match maybe_event {
+                    Some(Ok(event)) => {
+                        if let Some(progress) =
+                            summarize_child_stream_event(&event, &mut model_token_chars)
+                        {
+                            latest_child_state = progress.child_state.clone();
+                            let now = crate::gateway::current_unix_ms();
+                            let should_emit = progress.event_type != "child_progress"
+                                || progress.user_visible
+                                || now.saturating_sub(last_progress_at_unix_ms)
+                                    >= CHILD_PROGRESS_MIN_INTERVAL_MS;
+                            if should_emit {
+                                append_child_lifecycle_event(
+                                    runtime,
+                                    task,
+                                    Some(run_id),
+                                    progress.event_type,
+                                    progress.child_state.as_str(),
+                                    progress.user_visible,
+                                    progress.details,
+                                )
+                                .await?;
+                                last_progress_at_unix_ms = now;
+                            }
+                        }
+                    }
+                    Some(Err(error)) => {
+                        let message = format!("background run stream read failed: {error}");
+                        stream_error = Some(message.clone());
+                        append_child_lifecycle_event(
+                            runtime,
+                            task,
+                            Some(run_id),
+                            "child_failed",
+                            "transport_error",
+                            true,
+                            json!({ "error": message }),
+                        )
+                        .await?;
+                        break;
+                    }
+                    None => break,
+                }
+            }
+            _ = heartbeat.tick() => {
+                append_child_lifecycle_event(
+                    runtime,
+                    task,
+                    Some(run_id),
+                    "child_heartbeat",
+                    latest_child_state.as_str(),
+                    false,
+                    json!({ "state": latest_child_state }),
+                )
+                .await?;
+            }
         }
     }
 
@@ -837,6 +903,166 @@ fn extract_parameter_delta_value(payload_json: Option<&str>) -> Result<Option<Va
     })
 }
 
+struct ChildStreamProgress {
+    event_type: &'static str,
+    child_state: String,
+    user_visible: bool,
+    details: Value,
+}
+
+fn summarize_child_stream_event(
+    event: &common_v1::RunStreamEvent,
+    model_token_chars: &mut usize,
+) -> Option<ChildStreamProgress> {
+    match event.body.as_ref()? {
+        common_v1::run_stream_event::Body::Status(status) => {
+            let (event_type, child_state, user_visible) = match status_kind(status.kind) {
+                Some(common_v1::stream_status::StatusKind::Accepted) => {
+                    ("child_progress", "accepted", false)
+                }
+                Some(common_v1::stream_status::StatusKind::InProgress) => {
+                    ("child_progress", "running", true)
+                }
+                Some(common_v1::stream_status::StatusKind::Done) => {
+                    ("child_completed", "completed", true)
+                }
+                Some(common_v1::stream_status::StatusKind::Failed) => {
+                    ("child_failed", "failed", true)
+                }
+                _ => ("child_progress", "unknown", false),
+            };
+            Some(ChildStreamProgress {
+                event_type,
+                child_state: child_state.to_owned(),
+                user_visible,
+                details: json!({
+                    "stream_event": "status",
+                    "message": truncate_excerpt(status.message.as_str(), 240),
+                }),
+            })
+        }
+        common_v1::run_stream_event::Body::ModelToken(model_token) => {
+            *model_token_chars =
+                model_token_chars.saturating_add(model_token.token.chars().count());
+            Some(ChildStreamProgress {
+                event_type: "child_progress",
+                child_state: if model_token.is_final {
+                    "model_stream_final".to_owned()
+                } else {
+                    "model_streaming".to_owned()
+                },
+                user_visible: true,
+                details: json!({
+                    "stream_event": "model_token",
+                    "token_chars_seen": *model_token_chars,
+                    "is_final": model_token.is_final,
+                }),
+            })
+        }
+        common_v1::run_stream_event::Body::ToolProposal(proposal) => Some(ChildStreamProgress {
+            event_type: "child_progress",
+            child_state: "tool_proposed".to_owned(),
+            user_visible: false,
+            details: json!({
+                "stream_event": "tool_proposal",
+                "proposal_id": proposal.proposal_id.as_ref().map(|value| value.ulid.clone()),
+                "tool_name": proposal.tool_name,
+                "approval_required": proposal.approval_required,
+            }),
+        }),
+        common_v1::run_stream_event::Body::ToolDecision(decision) => Some(ChildStreamProgress {
+            event_type: if decision.approval_required { "child_waiting" } else { "child_progress" },
+            child_state: if decision.approval_required {
+                "waiting_for_approval".to_owned()
+            } else {
+                "tool_decided".to_owned()
+            },
+            user_visible: decision.approval_required,
+            details: json!({
+                "stream_event": "tool_decision",
+                "proposal_id": decision.proposal_id.as_ref().map(|value| value.ulid.clone()),
+                "decision": tool_decision_kind(decision.kind),
+                "approval_required": decision.approval_required,
+                "policy_enforced": decision.policy_enforced,
+                "reason": truncate_excerpt(decision.reason.as_str(), 240),
+            }),
+        }),
+        common_v1::run_stream_event::Body::ToolApprovalRequest(request) => {
+            Some(ChildStreamProgress {
+                event_type: "child_waiting",
+                child_state: "waiting_for_approval".to_owned(),
+                user_visible: true,
+                details: json!({
+                    "stream_event": "tool_approval_request",
+                    "proposal_id": request.proposal_id.as_ref().map(|value| value.ulid.clone()),
+                    "approval_id": request.approval_id.as_ref().map(|value| value.ulid.clone()),
+                    "tool_name": request.tool_name,
+                    "request_summary": truncate_excerpt(request.request_summary.as_str(), 240),
+                }),
+            })
+        }
+        common_v1::run_stream_event::Body::ToolApprovalResponse(response) => {
+            Some(ChildStreamProgress {
+                event_type: "child_progress",
+                child_state: "approval_resolved".to_owned(),
+                user_visible: true,
+                details: json!({
+                    "stream_event": "tool_approval_response",
+                    "proposal_id": response.proposal_id.as_ref().map(|value| value.ulid.clone()),
+                    "approval_id": response.approval_id.as_ref().map(|value| value.ulid.clone()),
+                    "approved": response.approved,
+                    "reason": truncate_excerpt(response.reason.as_str(), 240),
+                }),
+            })
+        }
+        common_v1::run_stream_event::Body::ToolResult(result) => Some(ChildStreamProgress {
+            event_type: "child_progress",
+            child_state: if result.success {
+                "tool_completed".to_owned()
+            } else {
+                "tool_failed".to_owned()
+            },
+            user_visible: !result.success,
+            details: json!({
+                "stream_event": "tool_result",
+                "proposal_id": result.proposal_id.as_ref().map(|value| value.ulid.clone()),
+                "success": result.success,
+                "error": truncate_excerpt(result.error.as_str(), 240),
+            }),
+        }),
+        common_v1::run_stream_event::Body::ToolAttestation(attestation) => {
+            Some(ChildStreamProgress {
+                event_type: "child_heartbeat",
+                child_state: "tool_attested".to_owned(),
+                user_visible: false,
+                details: json!({
+                    "stream_event": "tool_attestation",
+                    "proposal_id": attestation.proposal_id.as_ref().map(|value| value.ulid.clone()),
+                    "attestation_id": attestation.attestation_id.as_ref().map(|value| value.ulid.clone()),
+                    "timed_out": attestation.timed_out,
+                    "executor": attestation.executor,
+                }),
+            })
+        }
+        common_v1::run_stream_event::Body::A2uiUpdate(_)
+        | common_v1::run_stream_event::Body::JournalEvent(_) => None,
+    }
+}
+
+fn status_kind(raw: i32) -> Option<common_v1::stream_status::StatusKind> {
+    common_v1::stream_status::StatusKind::try_from(raw).ok()
+}
+
+fn tool_decision_kind(raw: i32) -> &'static str {
+    match common_v1::tool_decision::DecisionKind::try_from(raw)
+        .unwrap_or(common_v1::tool_decision::DecisionKind::Unspecified)
+    {
+        common_v1::tool_decision::DecisionKind::Allow => "allow",
+        common_v1::tool_decision::DecisionKind::Deny => "deny",
+        common_v1::tool_decision::DecisionKind::Unspecified => "unspecified",
+    }
+}
+
 async fn build_merge_result(
     runtime: &Arc<GatewayRuntimeState>,
     run: &crate::journal::OrchestratorRunStatusSnapshot,
@@ -847,6 +1073,12 @@ async fn build_merge_result(
     let mut model_output = String::new();
     let mut warnings = Vec::new();
     let mut provenance = Vec::new();
+    let mut approval_summary = DelegationMergeApprovalSummary {
+        approval_required: delegation.merge_contract.approval_required,
+        ..DelegationMergeApprovalSummary::default()
+    };
+    let mut artifact_references = Vec::new();
+    let mut tool_trace_summary = Vec::new();
 
     for event in tape_events {
         let payload =
@@ -860,7 +1092,34 @@ async fn build_merge_result(
                     payload.get("tool_name").and_then(Value::as_str).unwrap_or("unknown_tool");
                 let approval_required =
                     payload.get("approval_required").and_then(Value::as_bool).unwrap_or(false);
+                approval_summary.approval_required |= approval_required;
                 proposals.insert(proposal_id.to_owned(), (tool_name.to_owned(), approval_required));
+            }
+            "tool_approval_request" => {
+                approval_summary.approval_required = true;
+                approval_summary.approval_events =
+                    approval_summary.approval_events.saturating_add(1);
+                approval_summary.approval_pending = true;
+            }
+            "tool_approval_response" => {
+                approval_summary.approval_events =
+                    approval_summary.approval_events.saturating_add(1);
+                approval_summary.approval_pending = false;
+                if !payload.get("approved").and_then(Value::as_bool).unwrap_or(false) {
+                    approval_summary.approval_denied = true;
+                }
+            }
+            "tool_decision" => {
+                let approval_required =
+                    payload.get("approval_required").and_then(Value::as_bool).unwrap_or(false);
+                approval_summary.approval_required |= approval_required;
+                if approval_required {
+                    approval_summary.approval_events =
+                        approval_summary.approval_events.saturating_add(1);
+                }
+                if payload.get("kind").and_then(Value::as_str) == Some("deny") {
+                    approval_summary.approval_denied = true;
+                }
             }
             "model_token" => {
                 if let Some(token) = payload.get("token").and_then(Value::as_str) {
@@ -876,6 +1135,7 @@ async fn build_merge_result(
                     .get(proposal_id)
                     .cloned()
                     .unwrap_or_else(|| ("unknown_tool".to_owned(), false));
+                let success = payload.get("success").and_then(Value::as_bool).unwrap_or(true);
                 let excerpt = payload
                     .get("output_json")
                     .map(value_excerpt)
@@ -892,6 +1152,26 @@ async fn build_merge_result(
                     tool_name: Some(tool_name),
                     requires_approval: approval_required,
                 });
+                if tool_trace_summary.len() < 24 {
+                    tool_trace_summary.push(DelegationToolTraceSummary {
+                        child_run_id: run.run_id.clone(),
+                        proposal_id: Some(proposal_id.to_owned()),
+                        tool_name: provenance
+                            .last()
+                            .and_then(|record| record.tool_name.clone())
+                            .unwrap_or_else(|| "unknown_tool".to_owned()),
+                        status: if success { "succeeded" } else { "failed" }.to_owned(),
+                        excerpt: truncate_excerpt(excerpt.as_str(), 320),
+                        requires_approval: approval_required,
+                    });
+                }
+                if let Some(output_json) = payload.get("output_json") {
+                    append_artifact_references(
+                        &mut artifact_references,
+                        output_json,
+                        run.run_id.as_str(),
+                    );
+                }
             }
             _ => {}
         }
@@ -927,15 +1207,130 @@ async fn build_merge_result(
         provenance.as_slice(),
         warnings.as_slice(),
     );
+    let usage_summary = DelegationMergeUsageSummary {
+        prompt_tokens: run.prompt_tokens,
+        completion_tokens: run.completion_tokens,
+        total_tokens: run.total_tokens,
+        started_at_unix_ms: Some(run.started_at_unix_ms),
+        completed_at_unix_ms: run.completed_at_unix_ms,
+        duration_ms: run
+            .completed_at_unix_ms
+            .map(|completed_at| completed_at.saturating_sub(run.started_at_unix_ms)),
+    };
+    let failure_category = categorize_child_failure(
+        run,
+        warnings.as_slice(),
+        tool_trace_summary.as_slice(),
+        &approval_summary,
+    );
     Ok(DelegationMergeResult {
         status: run.state.clone(),
         strategy: delegation.merge_contract.strategy,
         summary_text,
         warnings,
+        failure_category,
         approval_required: delegation.merge_contract.approval_required,
+        approval_summary,
+        usage_summary,
+        artifact_references,
+        tool_trace_summary,
         provenance,
         merged_at_unix_ms: Some(crate::gateway::current_unix_ms()),
     })
+}
+
+fn append_artifact_references(
+    references: &mut Vec<DelegationMergeArtifactReference>,
+    value: &Value,
+    child_run_id: &str,
+) {
+    if references.len() >= 16 {
+        return;
+    }
+    match value {
+        Value::Object(object) => {
+            if let Some(artifact_id) = object.get("artifact_id").and_then(Value::as_str) {
+                let artifact_kind = object
+                    .get("artifact_kind")
+                    .or_else(|| object.get("kind"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("artifact");
+                let label = object
+                    .get("label")
+                    .or_else(|| object.get("filename"))
+                    .or_else(|| object.get("path"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(child_run_id);
+                if !references.iter().any(|reference| reference.artifact_id == artifact_id) {
+                    references.push(DelegationMergeArtifactReference {
+                        artifact_id: artifact_id.to_owned(),
+                        artifact_kind: artifact_kind.to_owned(),
+                        label: truncate_excerpt(label, 160),
+                    });
+                }
+            }
+            for key in ["artifact", "artifacts", "artifact_reference", "artifact_references"] {
+                if let Some(candidate) = object.get(key) {
+                    append_artifact_references(references, candidate, child_run_id);
+                }
+                if references.len() >= 16 {
+                    break;
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                append_artifact_references(references, item, child_run_id);
+                if references.len() >= 16 {
+                    break;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn categorize_child_failure(
+    run: &crate::journal::OrchestratorRunStatusSnapshot,
+    warnings: &[String],
+    tool_trace_summary: &[DelegationToolTraceSummary],
+    approval_summary: &DelegationMergeApprovalSummary,
+) -> Option<DelegationMergeFailureCategory> {
+    if run.state == "done" {
+        return None;
+    }
+    if run.state == "cancelled" || run.cancel_requested {
+        return Some(DelegationMergeFailureCategory::Cancellation);
+    }
+    if approval_summary.approval_denied || approval_summary.approval_pending {
+        return Some(DelegationMergeFailureCategory::Approval);
+    }
+    if tool_trace_summary.iter().any(|trace| trace.status == "failed") {
+        return Some(DelegationMergeFailureCategory::Tool);
+    }
+    let message = run
+        .last_error
+        .iter()
+        .chain(warnings.iter())
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if message.contains("budget") || message.contains("quota") || message.contains("limit") {
+        return Some(DelegationMergeFailureCategory::Budget);
+    }
+    if message.contains("approval") {
+        return Some(DelegationMergeFailureCategory::Approval);
+    }
+    if message.contains("tool") || message.contains("sandbox") {
+        return Some(DelegationMergeFailureCategory::Tool);
+    }
+    if message.contains("provider") || message.contains("model") || message.contains("circuit") {
+        return Some(DelegationMergeFailureCategory::Model);
+    }
+    if message.contains("transport") || message.contains("stream") || message.contains("connect") {
+        return Some(DelegationMergeFailureCategory::Transport);
+    }
+    Some(DelegationMergeFailureCategory::Unknown)
 }
 
 async fn load_run_tape(
@@ -1010,6 +1405,19 @@ async fn append_parent_spawned_event(
             "delegation": task.delegation,
         }),
     )
+    .await?;
+    append_child_lifecycle_event(
+        runtime,
+        task,
+        Some(child_run_id),
+        "child_started",
+        "running",
+        true,
+        json!({
+            "legacy_event_type": "child_run_spawned",
+            "delegation": task.delegation,
+        }),
+    )
     .await
 }
 
@@ -1037,6 +1445,55 @@ async fn append_parent_merge_event(
             "child_run_id": run.run_id,
             "child_state": run.state,
             "merge_result": merge_result,
+        }),
+    )
+    .await?;
+    let (child_event_type, child_state) = match run.state.as_str() {
+        "done" => ("child_completed", "completed"),
+        "failed" => ("child_failed", "failed"),
+        "cancelled" => ("child_failed", "cancelled"),
+        other => ("child_completed", other),
+    };
+    append_child_lifecycle_event(
+        runtime,
+        task,
+        Some(run.run_id.as_str()),
+        child_event_type,
+        child_state,
+        true,
+        json!({
+            "legacy_event_type": event_type,
+            "merge_result": merge_result,
+        }),
+    )
+    .await
+}
+
+async fn append_child_lifecycle_event(
+    runtime: &Arc<GatewayRuntimeState>,
+    task: &OrchestratorBackgroundTaskRecord,
+    child_run_id: Option<&str>,
+    event_type: &str,
+    child_state: &str,
+    user_visible: bool,
+    details: Value,
+) -> Result<(), Status> {
+    let Some(parent_run_id) = task.parent_run_id.as_deref() else {
+        return Ok(());
+    };
+    append_parent_tape_event(
+        runtime,
+        parent_run_id,
+        event_type,
+        json!({
+            "task_id": task.task_id,
+            "child_run_id": child_run_id,
+            "session_id": task.session_id,
+            "child_state": child_state,
+            "user_visible": user_visible,
+            "delegation": task.delegation,
+            "observed_at_unix_ms": crate::gateway::current_unix_ms(),
+            "details": details,
         }),
     )
     .await
@@ -1155,4 +1612,90 @@ fn is_terminal_task_state(state: &str) -> bool {
 
 fn is_terminal_run_state(state: &str) -> bool {
     matches!(state, "done" | "failed" | "cancelled")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{append_artifact_references, categorize_child_failure};
+    use crate::{
+        delegation::{DelegationMergeApprovalSummary, DelegationMergeFailureCategory},
+        journal::OrchestratorRunStatusSnapshot,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn append_artifact_references_extracts_nested_artifacts() {
+        let mut references = Vec::new();
+        append_artifact_references(
+            &mut references,
+            &json!({
+                "artifacts": [
+                    { "artifact_id": "artifact-1", "kind": "patch", "label": "Patch report" },
+                    { "artifact_id": "artifact-1", "kind": "patch", "label": "Duplicate" },
+                    { "artifact_id": "artifact-2", "artifact_kind": "log", "path": "logs/run.txt" }
+                ]
+            }),
+            "child-run",
+        );
+
+        assert_eq!(references.len(), 2);
+        assert_eq!(references[0].artifact_kind, "patch");
+        assert_eq!(references[1].label, "logs/run.txt");
+    }
+
+    #[test]
+    fn categorize_child_failure_prefers_runtime_and_approval_categories() {
+        let mut run = sample_run("cancelled", None);
+        assert_eq!(
+            categorize_child_failure(&run, &[], &[], &DelegationMergeApprovalSummary::default()),
+            Some(DelegationMergeFailureCategory::Cancellation)
+        );
+
+        run = sample_run("failed", Some("usage budget exhausted"));
+        assert_eq!(
+            categorize_child_failure(&run, &[], &[], &DelegationMergeApprovalSummary::default()),
+            Some(DelegationMergeFailureCategory::Budget)
+        );
+
+        let approval = DelegationMergeApprovalSummary {
+            approval_required: true,
+            approval_events: 1,
+            approval_pending: false,
+            approval_denied: true,
+        };
+        run = sample_run("failed", Some("tool denied"));
+        assert_eq!(
+            categorize_child_failure(&run, &[], &[], &approval),
+            Some(DelegationMergeFailureCategory::Approval)
+        );
+    }
+
+    fn sample_run(state: &str, last_error: Option<&str>) -> OrchestratorRunStatusSnapshot {
+        OrchestratorRunStatusSnapshot {
+            run_id: "child-run".to_owned(),
+            session_id: "session".to_owned(),
+            state: state.to_owned(),
+            cancel_requested: state == "cancelled",
+            cancel_reason: None,
+            principal: "principal".to_owned(),
+            device_id: "device".to_owned(),
+            channel: Some("web".to_owned()),
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            created_at_unix_ms: 1,
+            started_at_unix_ms: 2,
+            completed_at_unix_ms: Some(10),
+            updated_at_unix_ms: 10,
+            last_error: last_error.map(ToOwned::to_owned),
+            origin_kind: "delegation".to_owned(),
+            origin_run_id: Some("parent".to_owned()),
+            parent_run_id: Some("parent".to_owned()),
+            triggered_by_principal: None,
+            parameter_delta_json: None,
+            delegation: None,
+            merge_result: None,
+            tape_events: 0,
+        }
+    }
 }

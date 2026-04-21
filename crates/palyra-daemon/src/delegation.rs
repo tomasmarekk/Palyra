@@ -80,13 +80,74 @@ pub struct DelegationMergeProvenanceRecord {
     pub requires_approval: bool,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationMergeFailureCategory {
+    Model,
+    Tool,
+    Approval,
+    Budget,
+    Cancellation,
+    Transport,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DelegationMergeUsageSummary {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DelegationMergeApprovalSummary {
+    pub approval_required: bool,
+    pub approval_events: u64,
+    pub approval_pending: bool,
+    pub approval_denied: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DelegationMergeArtifactReference {
+    pub artifact_id: String,
+    pub artifact_kind: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DelegationToolTraceSummary {
+    pub child_run_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposal_id: Option<String>,
+    pub tool_name: String,
+    pub status: String,
+    pub excerpt: String,
+    pub requires_approval: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DelegationMergeResult {
     pub status: String,
     pub strategy: DelegationMergeStrategy,
     pub summary_text: String,
     pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_category: Option<DelegationMergeFailureCategory>,
     pub approval_required: bool,
+    #[serde(default)]
+    pub approval_summary: DelegationMergeApprovalSummary,
+    #[serde(default)]
+    pub usage_summary: DelegationMergeUsageSummary,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifact_references: Vec<DelegationMergeArtifactReference>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_trace_summary: Vec<DelegationToolTraceSummary>,
     pub provenance: Vec<DelegationMergeProvenanceRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub merged_at_unix_ms: Option<i64>,
