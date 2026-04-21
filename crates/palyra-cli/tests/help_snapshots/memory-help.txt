@@ -2,13 +2,15 @@ Usage: palyra memory [OPTIONS] <COMMAND>
 
 Commands:
   status
-  index       [aliases: reindex]
+  index             [aliases: reindex]
   search
   purge
   ingest
   workspace
   recall
   search-all
+  session-search
+  recall-artifacts
   learning
 
 Options:
