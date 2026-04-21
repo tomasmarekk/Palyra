@@ -149,6 +149,12 @@ fn context_cell() -> &'static Mutex<Option<RootCommandContext>> {
     ROOT_CONTEXT.get_or_init(|| Mutex::new(None))
 }
 
+#[cfg(test)]
+pub(crate) fn test_env_lock_for_tests() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 pub(crate) fn install_root_context(root: RootOptions) -> Result<RootCommandContext> {
     let context = build_root_context(root)?;
     let mut guard =
@@ -832,14 +838,8 @@ mod tests {
     use crate::args::{LogLevelArg, OutputFormatArg};
     use anyhow::Result;
     use palyra_common::IdentityStorePathError;
-    use std::{env, fs, sync::Mutex, sync::OnceLock};
+    use std::{env, fs};
     use tempfile::tempdir;
-
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-    fn env_lock() -> &'static Mutex<()> {
-        ENV_LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     fn clear_env() {
         for key in [
@@ -862,7 +862,7 @@ mod tests {
 
     #[test]
     fn explicit_root_options_override_profile_and_env_values() -> Result<()> {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = super::test_env_lock_for_tests().lock().expect("env lock");
         clear_env();
         let temp = tempdir()?;
         let state_root = temp.path().join("state");
@@ -923,7 +923,7 @@ channel = "profile"
 
     #[test]
     fn profile_values_fill_connection_defaults_when_flags_are_absent() -> Result<()> {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = super::test_env_lock_for_tests().lock().expect("env lock");
         clear_env();
         let temp = tempdir()?;
         let profile_path = temp.path().join("profiles.toml");
@@ -961,7 +961,7 @@ channel = "staging"
 
     #[test]
     fn profile_admin_token_env_overrides_global_env_fallback() -> Result<()> {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = super::test_env_lock_for_tests().lock().expect("env lock");
         clear_env();
         let temp = tempdir()?;
         let profile_path = temp.path().join("profiles.toml");
@@ -988,7 +988,7 @@ admin_token_env = "PALYRA_PROFILE_ADMIN_TOKEN"
 
     #[test]
     fn config_bound_principal_overrides_user_defaults_when_flags_are_absent() -> Result<()> {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = super::test_env_lock_for_tests().lock().expect("env lock");
         clear_env();
         let temp = tempdir()?;
         let state_root = temp.path().join("state");
@@ -1039,7 +1039,7 @@ bound_principal = "admin:local"
 
     #[test]
     fn expected_profile_fails_closed_on_mismatch() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = super::test_env_lock_for_tests().lock().expect("env lock");
         clear_env();
         let temp = tempdir().expect("tempdir");
         let profile_path = temp.path().join("profiles.toml");
@@ -1069,7 +1069,7 @@ daemon_url = "http://127.0.0.1:8200"
 
     #[test]
     fn cli_profiles_registry_path_prefers_installed_root_context_state_root() -> Result<()> {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = super::test_env_lock_for_tests().lock().expect("env lock");
         clear_env();
         let temp = tempdir()?;
         let state_root = temp.path().join("portable-state");

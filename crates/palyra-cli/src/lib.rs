@@ -7324,7 +7324,6 @@ mod cli_v1_tests {
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
     use std::path::Path;
-    use std::sync::{Mutex, OnceLock};
     use std::thread;
     use std::time::Duration;
 
@@ -7406,9 +7405,8 @@ mod cli_v1_tests {
         }
     }
 
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        crate::app::test_env_lock_for_tests()
     }
 
     struct ScopedEnvVar {
@@ -7446,6 +7444,8 @@ mod cli_v1_tests {
     #[test]
     fn resolve_skills_root_prefers_installed_root_context_state_root() {
         let _lock = env_lock().lock().expect("env lock should be available");
+        let _profile = ScopedEnvVar::set("PALYRA_CLI_PROFILE", "");
+        let _profiles_path = ScopedEnvVar::set("PALYRA_CLI_PROFILES_PATH", "");
         crate::app::clear_root_context_for_tests();
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let state_root = tempdir.path().join("portable-state");
