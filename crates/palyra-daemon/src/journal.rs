@@ -9785,16 +9785,16 @@ impl JournalStore {
         if query_text.is_empty() {
             return Ok(MemorySearchCandidateOutcome {
                 candidates: Vec::new(),
-                diagnostics: retrieval_branch_diagnostics(
-                    "memory",
-                    false,
-                    0,
-                    0,
-                    elapsed_millis(total_started),
-                    0,
-                    0,
-                    0,
-                ),
+                diagnostics: retrieval_branch_diagnostics(RetrievalBranchDiagnosticsArgs {
+                    source_kind: "memory",
+                    query_embedding_cache_hit: false,
+                    lexical_latency_ms: 0,
+                    vector_latency_ms: 0,
+                    total_latency_ms: elapsed_millis(total_started),
+                    candidate_count: 0,
+                    lexical_candidate_count: 0,
+                    vector_candidate_count: 0,
+                }),
             });
         }
         let now = current_unix_ms()?;
@@ -10018,16 +10018,16 @@ impl JournalStore {
             candidates.iter().filter(|candidate| candidate.vector_candidate).count() as u64;
         Ok(MemorySearchCandidateOutcome {
             candidates,
-            diagnostics: retrieval_branch_diagnostics(
-                "memory",
-                query_embedding.cache_hit,
+            diagnostics: retrieval_branch_diagnostics(RetrievalBranchDiagnosticsArgs {
+                source_kind: "memory",
+                query_embedding_cache_hit: query_embedding.cache_hit,
                 lexical_latency_ms,
                 vector_latency_ms,
-                elapsed_millis(total_started),
+                total_latency_ms: elapsed_millis(total_started),
                 candidate_count,
                 lexical_candidate_count,
                 vector_candidate_count,
-            ),
+            }),
         })
     }
 
@@ -10760,16 +10760,16 @@ impl JournalStore {
         if query_text.is_empty() {
             return Ok(WorkspaceSearchCandidateOutcome {
                 candidates: Vec::new(),
-                diagnostics: retrieval_branch_diagnostics(
-                    "workspace_document",
-                    false,
-                    0,
-                    0,
-                    elapsed_millis(total_started),
-                    0,
-                    0,
-                    0,
-                ),
+                diagnostics: retrieval_branch_diagnostics(RetrievalBranchDiagnosticsArgs {
+                    source_kind: "workspace_document",
+                    query_embedding_cache_hit: false,
+                    lexical_latency_ms: 0,
+                    vector_latency_ms: 0,
+                    total_latency_ms: elapsed_millis(total_started),
+                    candidate_count: 0,
+                    lexical_candidate_count: 0,
+                    vector_candidate_count: 0,
+                }),
             });
         }
         let prefix = request.prefix.as_deref().map(normalize_workspace_prefix).transpose()?;
@@ -11048,16 +11048,16 @@ impl JournalStore {
             candidates.iter().filter(|candidate| candidate.vector_candidate).count() as u64;
         Ok(WorkspaceSearchCandidateOutcome {
             candidates,
-            diagnostics: retrieval_branch_diagnostics(
-                "workspace_document",
-                query_embedding.cache_hit,
+            diagnostics: retrieval_branch_diagnostics(RetrievalBranchDiagnosticsArgs {
+                source_kind: "workspace_document",
+                query_embedding_cache_hit: query_embedding.cache_hit,
                 lexical_latency_ms,
                 vector_latency_ms,
-                elapsed_millis(total_started),
+                total_latency_ms: elapsed_millis(total_started),
                 candidate_count,
                 lexical_candidate_count,
                 vector_candidate_count,
-            ),
+            }),
         })
     }
 
@@ -11171,8 +11171,9 @@ fn retrieval_coverage_gap(
     }
 }
 
-fn retrieval_branch_diagnostics(
-    source_kind: &str,
+#[derive(Debug, Clone, Copy)]
+struct RetrievalBranchDiagnosticsArgs<'a> {
+    source_kind: &'a str,
     query_embedding_cache_hit: bool,
     lexical_latency_ms: u64,
     vector_latency_ms: u64,
@@ -11180,7 +11181,21 @@ fn retrieval_branch_diagnostics(
     candidate_count: u64,
     lexical_candidate_count: u64,
     vector_candidate_count: u64,
+}
+
+fn retrieval_branch_diagnostics(
+    args: RetrievalBranchDiagnosticsArgs<'_>,
 ) -> RetrievalBranchDiagnostics {
+    let RetrievalBranchDiagnosticsArgs {
+        source_kind,
+        query_embedding_cache_hit,
+        lexical_latency_ms,
+        vector_latency_ms,
+        total_latency_ms,
+        candidate_count,
+        lexical_candidate_count,
+        vector_candidate_count,
+    } = args;
     RetrievalBranchDiagnostics {
         source_kind: source_kind.to_owned(),
         query_embedding_cache_hit,
@@ -12069,16 +12084,16 @@ fn search_orchestrator_session_windows(
     groups.truncate(top_k);
 
     let total_windows = groups.iter().map(|group| group.windows.len() as u64).sum::<u64>();
-    let mut diagnostics = retrieval_branch_diagnostics(
-        "transcript",
-        false,
+    let mut diagnostics = retrieval_branch_diagnostics(RetrievalBranchDiagnosticsArgs {
+        source_kind: "transcript",
+        query_embedding_cache_hit: false,
         lexical_latency_ms,
-        0,
-        elapsed_millis(started_at),
-        total_windows,
-        total_windows,
-        0,
-    );
+        vector_latency_ms: 0,
+        total_latency_ms: elapsed_millis(started_at),
+        candidate_count: total_windows,
+        lexical_candidate_count: total_windows,
+        vector_candidate_count: 0,
+    });
     diagnostics.degraded_reason = Some("transcript_vector_index_unavailable".to_owned());
     diagnostics.fused_hit_count = total_windows;
     diagnostics.coverage_gap = if total_windows == 0 {
