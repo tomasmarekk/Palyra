@@ -44,7 +44,11 @@ pub(crate) enum RetrievalBackendState {
 pub(crate) struct RetrievalBackendCapabilities {
     pub(crate) lexical_search: bool,
     pub(crate) vector_search: bool,
+    pub(crate) lexical_candidate_generation: bool,
+    pub(crate) vector_candidate_generation: bool,
     pub(crate) hybrid_fusion: bool,
+    pub(crate) source_aware_fusion: bool,
+    pub(crate) branch_diagnostics: bool,
     pub(crate) transcript_fusion: bool,
     pub(crate) checkpoint_fusion: bool,
     pub(crate) compaction_fusion: bool,
@@ -360,7 +364,11 @@ impl RetrievalBackend for JournalRetrievalBackend {
             capabilities: RetrievalBackendCapabilities {
                 lexical_search: true,
                 vector_search: true,
+                lexical_candidate_generation: true,
+                vector_candidate_generation: true,
                 hybrid_fusion: true,
+                source_aware_fusion: true,
+                branch_diagnostics: true,
                 transcript_fusion: true,
                 checkpoint_fusion: true,
                 compaction_fusion: true,
@@ -608,6 +616,8 @@ pub(crate) fn score_workspace_candidates(
                 profile,
             );
             let pinned = candidate.document.pinned;
+            let branches =
+                retrieval_candidate_branches(candidate.lexical_candidate, candidate.vector_candidate);
             WorkspaceSearchHit {
                 document: candidate.document,
                 version: candidate.version,
@@ -616,10 +626,11 @@ pub(crate) fn score_workspace_candidates(
                 snippet: candidate.snippet,
                 score: breakdown.final_score,
                 reason: if pinned {
-                    "pinned_workspace_document".to_owned()
+                    format!("pinned_workspace_document; fusion_branches={branches}")
                 } else {
                     format!(
-                        "hybrid(lexical={:.2},vector={:.2},recency={:.2},quality={:.2})",
+                        "fusion(branches={},lexical={:.2},vector={:.2},recency={:.2},quality={:.2})",
+                        branches,
                         breakdown.lexical_score,
                         breakdown.vector_score,
                         breakdown.recency_score,
@@ -646,6 +657,16 @@ pub(crate) fn score_workspace_candidates(
             .then_with(|| left.document.document_id.cmp(&right.document.document_id))
     });
     hits
+}
+
+#[must_use]
+pub(crate) fn retrieval_candidate_branches(lexical: bool, vector: bool) -> &'static str {
+    match (lexical, vector) {
+        (true, true) => "lexical+vector",
+        (true, false) => "lexical",
+        (false, true) => "vector",
+        (false, false) => "unknown",
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

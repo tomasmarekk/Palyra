@@ -50,6 +50,7 @@ const MAX_APPROVALS_LIST_LIMIT: usize = 500;
 const MAX_APPROVALS_QUERY_LIMIT: usize = MAX_APPROVALS_LIST_LIMIT + 1;
 const MAX_MEMORY_ITEMS_LIST_LIMIT: usize = 500;
 const MAX_MEMORY_SEARCH_CANDIDATES: usize = 256;
+const MAX_MEMORY_VECTOR_SCAN_CANDIDATES: usize = 1_024;
 const MAX_CANVAS_PATCHES_QUERY_LIMIT: usize = 1_000;
 const DEFAULT_MEMORY_VECTOR_DIMS: usize = 64;
 const DEFAULT_MEMORY_EMBEDDING_MODEL: &str = "hash-embedding-v1";
@@ -59,6 +60,7 @@ const MEMORY_MAINTENANCE_STATE_SINGLETON_KEY: i64 = 1;
 const CURRENT_WORKSPACE_TEMPLATE_VERSION: i64 = 1;
 const MAX_WORKSPACE_DOCUMENT_LIST_LIMIT: usize = 256;
 const MAX_WORKSPACE_SEARCH_CANDIDATES: usize = 256;
+const MAX_WORKSPACE_VECTOR_SCAN_CANDIDATES: usize = 1_024;
 const WORKSPACE_CHUNK_TARGET_BYTES: usize = 1_024;
 const WORKSPACE_CHUNK_OVERLAP_BYTES: usize = 160;
 
@@ -492,6 +494,8 @@ pub struct MemorySearchCandidateRecord {
     pub lexical_raw: f64,
     pub vector_raw: f64,
     pub recency_raw: f64,
+    pub lexical_candidate: bool,
+    pub vector_candidate: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -504,6 +508,8 @@ pub struct WorkspaceSearchCandidateRecord {
     pub lexical_raw: f64,
     pub vector_raw: f64,
     pub recency_raw: f64,
+    pub lexical_candidate: bool,
+    pub vector_candidate: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9268,16 +9274,110 @@ impl JournalStore {
         let top_k = request.top_k.clamp(1, MAX_MEMORY_ITEMS_LIST_LIMIT);
         let candidate_limit = top_k.saturating_mul(8).clamp(top_k, MAX_MEMORY_SEARCH_CANDIDATES);
         let fts_query = build_fts_query(query_text.as_str());
-        if fts_query.is_empty() {
-            return Ok(Vec::new());
-        }
-
         let query_vector = normalize_embedding_dimensions(
             self.memory_embedding_provider.embed_text(query_text.as_str()),
             embedding_dims,
         );
         self.purge_expired_memory_items(now)?;
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let mut candidates_by_id = BTreeMap::<String, MemorySearchCandidateRecord>::new();
+
+        if !fts_query.is_empty() {
+            let mut statement = guard.prepare(
+                r#"
+                    SELECT
+                        memory.memory_ulid,
+                        memory.principal,
+                        memory.channel,
+                        memory.session_ulid,
+                        memory.source,
+                        memory.content_text,
+                        memory.content_hash,
+                        memory.tags_json,
+                        memory.confidence,
+                        memory.ttl_unix_ms,
+                        memory.created_at_unix_ms,
+                        memory.updated_at_unix_ms,
+                        bm25(memory_items_fts) AS lexical_rank,
+                        COALESCE(vectors.embedding_model_id, vectors.embedding_model),
+                        COALESCE(vectors.embedding_dims, vectors.dims),
+                        COALESCE(vectors.embedding_version, ?7),
+                        COALESCE(vectors.embedding_vector, vectors.vector_blob)
+                    FROM memory_items_fts
+                    INNER JOIN memory_items AS memory
+                        ON memory.memory_ulid = memory_items_fts.memory_ulid
+                    LEFT JOIN memory_vectors AS vectors
+                        ON vectors.memory_ulid = memory.memory_ulid
+                    WHERE
+                        memory_items_fts MATCH ?1 AND
+                        memory.principal = ?2 AND
+                        (?3 IS NULL OR memory.channel = ?3) AND
+                        (?4 IS NULL OR memory.session_ulid = ?4) AND
+                        (memory.ttl_unix_ms IS NULL OR memory.ttl_unix_ms > ?5)
+                    ORDER BY lexical_rank ASC, memory.created_at_unix_ms DESC
+                    LIMIT ?6
+                "#,
+            )?;
+            let mut rows = statement.query(params![
+                fts_query,
+                request.principal.as_str(),
+                request.channel.as_deref(),
+                request.session_id.as_deref(),
+                now,
+                candidate_limit as i64,
+                embedding_version,
+            ])?;
+
+            while let Some(row) = rows.next()? {
+                let item = map_memory_item_row(row)?;
+                if !memory_source_matches(item.source, request.sources.as_slice()) {
+                    continue;
+                }
+                if !memory_tags_match(item.tags.as_slice(), requested_tags.as_slice()) {
+                    continue;
+                }
+                let lexical_rank: f64 = row.get(12)?;
+                let lexical_raw = (-lexical_rank).max(0.0);
+                let model_id = row.get::<_, Option<String>>(13)?.unwrap_or_default();
+                let dims = row.get::<_, Option<i64>>(14)?.unwrap_or_default() as usize;
+                let version = row.get::<_, Option<i64>>(15)?.unwrap_or(embedding_version);
+                let vector_raw = if model_id == embedding_model_id
+                    && dims == embedding_dims
+                    && version == embedding_version
+                {
+                    let vector_blob: Option<Vec<u8>> = row.get(16)?;
+                    vector_blob
+                        .as_ref()
+                        .map(|blob| decode_vector_blob(blob.as_slice(), dims))
+                        .map(|embedding| {
+                            cosine_similarity(query_vector.as_slice(), embedding.as_slice())
+                        })
+                        .unwrap_or(0.0)
+                        .max(0.0)
+                } else {
+                    0.0
+                };
+                let recency_raw = recency_score(now, item.created_at_unix_ms);
+                let snippet = memory_snippet(item.content_text.as_str(), query_text.as_str());
+                let key = item.memory_id.clone();
+                candidates_by_id.insert(
+                    key,
+                    MemorySearchCandidateRecord {
+                        item,
+                        snippet,
+                        lexical_raw,
+                        vector_raw,
+                        recency_raw,
+                        lexical_candidate: true,
+                        vector_candidate: false,
+                    },
+                );
+            }
+        }
+
+        let vector_scan_limit = candidate_limit
+            .saturating_mul(4)
+            .clamp(candidate_limit, MAX_MEMORY_VECTOR_SCAN_CANDIDATES);
         let mut statement = guard.prepare(
             r#"
                 SELECT
@@ -9293,37 +9393,37 @@ impl JournalStore {
                     memory.ttl_unix_ms,
                     memory.created_at_unix_ms,
                     memory.updated_at_unix_ms,
-                    bm25(memory_items_fts) AS lexical_rank,
                     COALESCE(vectors.embedding_model_id, vectors.embedding_model),
                     COALESCE(vectors.embedding_dims, vectors.dims),
-                    COALESCE(vectors.embedding_version, ?7),
+                    COALESCE(vectors.embedding_version, ?1),
                     COALESCE(vectors.embedding_vector, vectors.vector_blob)
-                FROM memory_items_fts
-                INNER JOIN memory_items AS memory
-                    ON memory.memory_ulid = memory_items_fts.memory_ulid
-                LEFT JOIN memory_vectors AS vectors
+                FROM memory_items AS memory
+                INNER JOIN memory_vectors AS vectors
                     ON vectors.memory_ulid = memory.memory_ulid
                 WHERE
-                    memory_items_fts MATCH ?1 AND
                     memory.principal = ?2 AND
                     (?3 IS NULL OR memory.channel = ?3) AND
                     (?4 IS NULL OR memory.session_ulid = ?4) AND
-                    (memory.ttl_unix_ms IS NULL OR memory.ttl_unix_ms > ?5)
-                ORDER BY lexical_rank ASC, memory.created_at_unix_ms DESC
-                LIMIT ?6
+                    (memory.ttl_unix_ms IS NULL OR memory.ttl_unix_ms > ?5) AND
+                    COALESCE(vectors.embedding_model_id, vectors.embedding_model, '') = ?6 AND
+                    COALESCE(vectors.embedding_dims, vectors.dims, 0) = ?7 AND
+                    COALESCE(vectors.embedding_version, 0) = ?8
+                ORDER BY memory.updated_at_unix_ms DESC, memory.memory_ulid ASC
+                LIMIT ?9
             "#,
         )?;
         let mut rows = statement.query(params![
-            fts_query,
+            embedding_version,
             request.principal.as_str(),
             request.channel.as_deref(),
             request.session_id.as_deref(),
             now,
-            candidate_limit as i64,
+            embedding_model_id.as_str(),
+            embedding_dims as i64,
             embedding_version,
+            vector_scan_limit as i64,
         ])?;
 
-        let mut candidates = Vec::new();
         while let Some(row) = rows.next()? {
             let item = map_memory_item_row(row)?;
             if !memory_source_matches(item.source, request.sources.as_slice()) {
@@ -9332,38 +9432,49 @@ impl JournalStore {
             if !memory_tags_match(item.tags.as_slice(), requested_tags.as_slice()) {
                 continue;
             }
-            let lexical_rank: f64 = row.get(12)?;
-            let lexical_raw = (-lexical_rank).max(0.0);
-            let model_id = row.get::<_, Option<String>>(13)?.unwrap_or_default();
-            let dims = row.get::<_, Option<i64>>(14)?.unwrap_or_default() as usize;
-            let version = row.get::<_, Option<i64>>(15)?.unwrap_or(embedding_version);
-            let vector_raw = if model_id == embedding_model_id
-                && dims == embedding_dims
-                && version == embedding_version
-            {
-                let vector_blob: Option<Vec<u8>> = row.get(16)?;
-                vector_blob
-                    .as_ref()
-                    .map(|blob| decode_vector_blob(blob.as_slice(), dims))
-                    .map(|embedding| {
-                        cosine_similarity(query_vector.as_slice(), embedding.as_slice())
-                    })
-                    .unwrap_or(0.0)
-                    .max(0.0)
-            } else {
-                0.0
-            };
+            let dims = row.get::<_, Option<i64>>(13)?.unwrap_or_default() as usize;
+            let vector_blob: Option<Vec<u8>> = row.get(15)?;
+            let vector_raw = vector_blob
+                .as_ref()
+                .map(|blob| decode_vector_blob(blob.as_slice(), dims))
+                .map(|embedding| cosine_similarity(query_vector.as_slice(), embedding.as_slice()))
+                .unwrap_or(0.0)
+                .max(0.0);
+            if vector_raw <= 0.0 {
+                continue;
+            }
             let recency_raw = recency_score(now, item.created_at_unix_ms);
             let snippet = memory_snippet(item.content_text.as_str(), query_text.as_str());
-            candidates.push(MemorySearchCandidateRecord {
-                item,
-                snippet,
-                lexical_raw,
-                vector_raw,
-                recency_raw,
-            });
+            let key = item.memory_id.clone();
+            if let Some(existing) = candidates_by_id.get_mut(key.as_str()) {
+                existing.vector_raw = existing.vector_raw.max(vector_raw);
+                existing.vector_candidate = true;
+                continue;
+            }
+            candidates_by_id.insert(
+                key,
+                MemorySearchCandidateRecord {
+                    item,
+                    snippet,
+                    lexical_raw: 0.0,
+                    vector_raw,
+                    recency_raw,
+                    lexical_candidate: false,
+                    vector_candidate: true,
+                },
+            );
         }
 
+        let mut candidates = candidates_by_id.into_values().collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            right
+                .vector_raw
+                .total_cmp(&left.vector_raw)
+                .then_with(|| right.lexical_raw.total_cmp(&left.lexical_raw))
+                .then_with(|| right.item.created_at_unix_ms.cmp(&left.item.created_at_unix_ms))
+                .then_with(|| left.item.memory_id.cmp(&right.item.memory_id))
+        });
+        candidates.truncate(candidate_limit);
         Ok(candidates)
     }
 
@@ -10097,11 +10208,134 @@ impl JournalStore {
             embedding_dims,
         );
         let fts_query = build_fts_query(query_text.as_str());
-        if fts_query.is_empty() {
-            return Ok(Vec::new());
-        }
         let now = current_unix_ms()?;
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let top_k = request.top_k.clamp(1, MAX_WORKSPACE_DOCUMENT_LIST_LIMIT);
+        let candidate_limit = top_k.saturating_mul(8).clamp(top_k, MAX_WORKSPACE_SEARCH_CANDIDATES);
+        let mut candidates_by_key = BTreeMap::<String, WorkspaceSearchCandidateRecord>::new();
+
+        if !fts_query.is_empty() {
+            let mut statement = guard.prepare(
+                r#"
+                    SELECT
+                        documents.document_ulid,
+                        documents.principal,
+                        documents.channel,
+                        documents.agent_id,
+                        documents.latest_session_ulid,
+                        documents.path,
+                        documents.parent_path,
+                        documents.title,
+                        documents.kind,
+                        documents.document_class,
+                        documents.state,
+                        documents.prompt_binding,
+                        documents.risk_state,
+                        documents.risk_reasons_json,
+                        documents.pinned,
+                        documents.manual_override,
+                        documents.bootstrap_template_id,
+                        documents.bootstrap_template_version,
+                        documents.source_memory_ulid,
+                        documents.latest_version,
+                        documents.content_text,
+                        documents.content_hash,
+                        documents.created_at_unix_ms,
+                        documents.updated_at_unix_ms,
+                        documents.deleted_at_unix_ms,
+                        documents.last_recalled_at_unix_ms,
+                        chunks.version,
+                        chunks.chunk_index,
+                        chunks.chunk_count,
+                        chunks.content_text,
+                        bm25(workspace_document_chunks_fts) AS lexical_rank,
+                        vectors.embedding_model_id,
+                        vectors.embedding_dims,
+                        vectors.embedding_version,
+                        vectors.embedding_vector
+                    FROM workspace_document_chunks_fts
+                    INNER JOIN workspace_document_chunks AS chunks
+                        ON chunks.chunk_ulid = workspace_document_chunks_fts.chunk_ulid
+                    INNER JOIN workspace_documents AS documents
+                        ON documents.document_ulid = chunks.document_ulid
+                    LEFT JOIN workspace_document_chunk_vectors AS vectors
+                        ON vectors.chunk_ulid = chunks.chunk_ulid
+                    WHERE
+                        workspace_document_chunks_fts MATCH ?1 AND
+                        documents.principal = ?2 AND
+                        (?3 IS NULL OR documents.channel = ?3) AND
+                        (?4 IS NULL OR documents.agent_id = ?4) AND
+                        (?5 IS NULL OR documents.path = ?5 OR documents.path LIKE ?6) AND
+                        (?7 = 1 OR chunks.is_latest = 1) AND
+                        documents.state = 'active' AND
+                        (?8 = 1 OR documents.risk_state != 'quarantined')
+                    ORDER BY lexical_rank ASC, documents.updated_at_unix_ms DESC
+                    LIMIT ?9
+                "#,
+            )?;
+            let mut rows = statement.query(params![
+                fts_query,
+                request.principal.as_str(),
+                request.channel.as_deref(),
+                request.agent_id.as_deref(),
+                prefix.as_deref(),
+                prefix_like.as_deref(),
+                request.include_historical,
+                request.include_quarantined,
+                candidate_limit as i64,
+            ])?;
+
+            while let Some(row) = rows.next()? {
+                let document = map_workspace_document_row(row)?;
+                let lexical_rank: f64 = row.get(30)?;
+                let lexical_raw = (-lexical_rank).max(0.0);
+                let version = row.get::<_, i64>(26)?;
+                let chunk_index = row.get::<_, i64>(27)? as usize;
+                let chunk_count = row.get::<_, i64>(28)? as usize;
+                let chunk_text = row.get::<_, String>(29)?;
+                let model_id = row.get::<_, Option<String>>(31)?.unwrap_or_default();
+                let dims = row.get::<_, Option<i64>>(32)?.unwrap_or_default() as usize;
+                let version_id =
+                    row.get::<_, Option<i64>>(33)?.unwrap_or(CURRENT_MEMORY_EMBEDDING_VERSION);
+                let vector_raw = if model_id == embedding_model_id
+                    && dims == embedding_dims
+                    && version_id == CURRENT_MEMORY_EMBEDDING_VERSION
+                {
+                    row.get::<_, Option<Vec<u8>>>(34)?
+                        .as_ref()
+                        .map(|blob| decode_vector_blob(blob.as_slice(), dims))
+                        .map(|embedding| {
+                            cosine_similarity(query_vector.as_slice(), embedding.as_slice())
+                        })
+                        .unwrap_or(0.0)
+                        .max(0.0)
+                } else {
+                    0.0
+                };
+                let recency_raw = recency_score(now, document.updated_at_unix_ms);
+                let key =
+                    workspace_candidate_key(document.document_id.as_str(), version, chunk_index);
+                candidates_by_key.insert(
+                    key,
+                    WorkspaceSearchCandidateRecord {
+                        document,
+                        version,
+                        chunk_index,
+                        chunk_count,
+                        snippet: memory_snippet(chunk_text.as_str(), query_text.as_str()),
+                        lexical_raw,
+                        vector_raw,
+                        recency_raw,
+                        lexical_candidate: true,
+                        vector_candidate: false,
+                    },
+                );
+            }
+        }
+
+        let vector_scan_limit = candidate_limit
+            .saturating_mul(4)
+            .clamp(candidate_limit, MAX_WORKSPACE_VECTOR_SCAN_CANDIDATES);
         let mut statement = guard.prepare(
             r#"
                 SELECT
@@ -10135,35 +10369,31 @@ impl JournalStore {
                     chunks.chunk_index,
                     chunks.chunk_count,
                     chunks.content_text,
-                    bm25(workspace_document_chunks_fts) AS lexical_rank,
                     vectors.embedding_model_id,
                     vectors.embedding_dims,
                     vectors.embedding_version,
                     vectors.embedding_vector
-                FROM workspace_document_chunks_fts
-                INNER JOIN workspace_document_chunks AS chunks
-                    ON chunks.chunk_ulid = workspace_document_chunks_fts.chunk_ulid
+                FROM workspace_document_chunks AS chunks
                 INNER JOIN workspace_documents AS documents
                     ON documents.document_ulid = chunks.document_ulid
-                LEFT JOIN workspace_document_chunk_vectors AS vectors
+                INNER JOIN workspace_document_chunk_vectors AS vectors
                     ON vectors.chunk_ulid = chunks.chunk_ulid
                 WHERE
-                    workspace_document_chunks_fts MATCH ?1 AND
-                    documents.principal = ?2 AND
-                    (?3 IS NULL OR documents.channel = ?3) AND
-                    (?4 IS NULL OR documents.agent_id = ?4) AND
-                    (?5 IS NULL OR documents.path = ?5 OR documents.path LIKE ?6) AND
-                    (?7 = 1 OR chunks.is_latest = 1) AND
+                    documents.principal = ?1 AND
+                    (?2 IS NULL OR documents.channel = ?2) AND
+                    (?3 IS NULL OR documents.agent_id = ?3) AND
+                    (?4 IS NULL OR documents.path = ?4 OR documents.path LIKE ?5) AND
+                    (?6 = 1 OR chunks.is_latest = 1) AND
                     documents.state = 'active' AND
-                    (?8 = 1 OR documents.risk_state != 'quarantined')
-                ORDER BY lexical_rank ASC, documents.updated_at_unix_ms DESC
-                LIMIT ?9
+                    (?7 = 1 OR documents.risk_state != 'quarantined') AND
+                    vectors.embedding_model_id = ?8 AND
+                    vectors.embedding_dims = ?9 AND
+                    vectors.embedding_version = ?10
+                ORDER BY documents.updated_at_unix_ms DESC, chunks.chunk_index ASC
+                LIMIT ?11
             "#,
         )?;
-        let top_k = request.top_k.clamp(1, MAX_WORKSPACE_DOCUMENT_LIST_LIMIT);
-        let candidate_limit = top_k.saturating_mul(8).clamp(top_k, MAX_WORKSPACE_SEARCH_CANDIDATES);
         let mut rows = statement.query(params![
-            fts_query,
             request.principal.as_str(),
             request.channel.as_deref(),
             request.agent_id.as_deref(),
@@ -10171,49 +10401,64 @@ impl JournalStore {
             prefix_like.as_deref(),
             request.include_historical,
             request.include_quarantined,
-            candidate_limit as i64,
+            embedding_model_id.as_str(),
+            embedding_dims as i64,
+            CURRENT_MEMORY_EMBEDDING_VERSION,
+            vector_scan_limit as i64,
         ])?;
-
-        let mut candidates = Vec::new();
         while let Some(row) = rows.next()? {
             let document = map_workspace_document_row(row)?;
-            let lexical_rank: f64 = row.get(30)?;
-            let lexical_raw = (-lexical_rank).max(0.0);
             let version = row.get::<_, i64>(26)?;
             let chunk_index = row.get::<_, i64>(27)? as usize;
             let chunk_count = row.get::<_, i64>(28)? as usize;
             let chunk_text = row.get::<_, String>(29)?;
-            let model_id = row.get::<_, Option<String>>(31)?.unwrap_or_default();
-            let dims = row.get::<_, Option<i64>>(32)?.unwrap_or_default() as usize;
-            let version_id =
-                row.get::<_, Option<i64>>(33)?.unwrap_or(CURRENT_MEMORY_EMBEDDING_VERSION);
-            let vector_raw = if model_id == embedding_model_id
-                && dims == embedding_dims
-                && version_id == CURRENT_MEMORY_EMBEDDING_VERSION
-            {
-                row.get::<_, Option<Vec<u8>>>(34)?
-                    .as_ref()
-                    .map(|blob| decode_vector_blob(blob.as_slice(), dims))
-                    .map(|embedding| {
-                        cosine_similarity(query_vector.as_slice(), embedding.as_slice())
-                    })
-                    .unwrap_or(0.0)
-                    .max(0.0)
-            } else {
-                0.0
-            };
+            let dims = row.get::<_, Option<i64>>(31)?.unwrap_or_default() as usize;
+            let vector_raw = row
+                .get::<_, Option<Vec<u8>>>(33)?
+                .as_ref()
+                .map(|blob| decode_vector_blob(blob.as_slice(), dims))
+                .map(|embedding| cosine_similarity(query_vector.as_slice(), embedding.as_slice()))
+                .unwrap_or(0.0)
+                .max(0.0);
+            if vector_raw <= 0.0 {
+                continue;
+            }
+            let key = workspace_candidate_key(document.document_id.as_str(), version, chunk_index);
+            if let Some(existing) = candidates_by_key.get_mut(key.as_str()) {
+                existing.vector_raw = existing.vector_raw.max(vector_raw);
+                existing.vector_candidate = true;
+                continue;
+            }
             let recency_raw = recency_score(now, document.updated_at_unix_ms);
-            candidates.push(WorkspaceSearchCandidateRecord {
-                document,
-                version,
-                chunk_index,
-                chunk_count,
-                snippet: memory_snippet(chunk_text.as_str(), query_text.as_str()),
-                lexical_raw,
-                vector_raw,
-                recency_raw,
-            });
+            candidates_by_key.insert(
+                key,
+                WorkspaceSearchCandidateRecord {
+                    document,
+                    version,
+                    chunk_index,
+                    chunk_count,
+                    snippet: memory_snippet(chunk_text.as_str(), query_text.as_str()),
+                    lexical_raw: 0.0,
+                    vector_raw,
+                    recency_raw,
+                    lexical_candidate: false,
+                    vector_candidate: true,
+                },
+            );
         }
+
+        let mut candidates = candidates_by_key.into_values().collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            right
+                .vector_raw
+                .total_cmp(&left.vector_raw)
+                .then_with(|| right.lexical_raw.total_cmp(&left.lexical_raw))
+                .then_with(|| {
+                    right.document.updated_at_unix_ms.cmp(&left.document.updated_at_unix_ms)
+                })
+                .then_with(|| left.document.document_id.cmp(&right.document.document_id))
+        });
+        candidates.truncate(candidate_limit);
         Ok(candidates)
     }
 
@@ -10280,6 +10525,10 @@ impl JournalStore {
         hits.truncate(request.top_k.clamp(1, MAX_WORKSPACE_DOCUMENT_LIST_LIMIT));
         Ok(hits)
     }
+}
+
+fn workspace_candidate_key(document_id: &str, version: i64, chunk_index: usize) -> String {
+    format!("{document_id}:{version}:{chunk_index}")
 }
 
 #[derive(Debug, Clone)]
@@ -15687,7 +15936,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_retrieval_service_preserves_legacy_scoring_defaults() {
+    fn memory_retrieval_service_exposes_dual_path_candidates() {
         let db_path = temp_db_path();
         let store = JournalStore::open(test_journal_config(db_path, false))
             .expect("journal store should open");
@@ -15734,34 +15983,76 @@ mod tests {
             sources: Vec::new(),
         };
 
-        let legacy_hits =
-            store.search_memory(&request).expect("legacy memory search should succeed");
         let candidates = store
             .search_memory_candidates(&request)
             .expect("candidate memory search should succeed");
+        assert!(
+            candidates.iter().any(|candidate| candidate.lexical_candidate),
+            "candidate generation should retain the lexical branch"
+        );
+        assert!(
+            candidates.iter().any(|candidate| candidate.vector_candidate),
+            "candidate generation should include the independent vector branch"
+        );
         let service_hits = crate::retrieval::score_memory_candidates(
             candidates,
             request.min_score,
             &crate::retrieval::RetrievalRuntimeConfig::default(),
         );
 
-        assert_eq!(legacy_hits.len(), service_hits.len(), "memory hit counts should match");
-        for (legacy, service) in legacy_hits.iter().zip(service_hits.iter()) {
-            assert_eq!(
-                legacy.item.memory_id, service.item.memory_id,
-                "memory retrieval service should preserve legacy result ordering"
-            );
-            assert!(
-                (legacy.score - service.score).abs() < 0.001,
-                "memory retrieval service should stay within a tight score delta; legacy={} service={}",
-                legacy.score,
-                service.score
-            );
-            assert!(
-                service.breakdown.source_quality_score > 0.0,
-                "service path should expose explainable source quality signals"
-            );
-        }
+        assert!(
+            service_hits.iter().any(|hit| hit.item.content_text.contains("rollback verification")),
+            "fused retrieval should keep the strongest lexical memory visible"
+        );
+        assert!(
+            service_hits.iter().all(|hit| hit.breakdown.source_quality_score > 0.0),
+            "service path should expose explainable source quality signals"
+        );
+    }
+
+    #[test]
+    fn memory_vector_branch_generates_candidates_without_fts_seed() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open_with_memory_embedding_provider(
+            test_journal_config(db_path, false),
+            Arc::new(FixedMemoryEmbeddingProvider {
+                model_name: "test-vector-branch-v1",
+                dimensions: 4,
+                vector: vec![1.0, 0.0, 0.0, 0.0],
+            }),
+        )
+        .expect("journal store should open");
+        let memory_id = "01ARZ3NDEKTSV4RRFFQ69G5VF1";
+        store
+            .create_memory_item(&sample_memory_request(
+                memory_id,
+                "user:ops",
+                Some("cli"),
+                None,
+                MemorySource::Manual,
+                "only semantic storage should retrieve this durable fact",
+            ))
+            .expect("memory item should be created");
+
+        let request = MemorySearchRequest {
+            principal: "user:ops".to_owned(),
+            channel: Some("cli".to_owned()),
+            session_id: None,
+            query: "lexical-token-that-does-not-exist".to_owned(),
+            top_k: 4,
+            min_score: 0.0,
+            tags: Vec::new(),
+            sources: Vec::new(),
+        };
+        let candidates = store
+            .search_memory_candidates(&request)
+            .expect("candidate memory search should succeed");
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.item.memory_id == memory_id)
+            .expect("direct vector branch should surface the memory item");
+        assert!(!candidate.lexical_candidate, "fixture should not have an FTS seed");
+        assert!(candidate.vector_candidate, "vector branch should generate the candidate directly");
     }
 
     #[test]
@@ -17039,7 +17330,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_retrieval_service_preserves_legacy_scoring_defaults() {
+    fn workspace_retrieval_service_exposes_dual_path_candidates() {
         let db_path = temp_db_path();
         let store = JournalStore::open(test_journal_config(db_path, false))
             .expect("journal store should open");
@@ -17086,35 +17377,76 @@ mod tests {
             include_quarantined: false,
         };
 
-        let legacy_hits = store
-            .search_workspace_documents(&request)
-            .expect("legacy workspace search should succeed");
         let candidates = store
             .search_workspace_candidates(&request)
             .expect("candidate workspace search should succeed");
+        assert!(
+            candidates.iter().any(|candidate| candidate.lexical_candidate),
+            "candidate generation should retain the workspace lexical branch"
+        );
+        assert!(
+            candidates.iter().any(|candidate| candidate.vector_candidate),
+            "candidate generation should include the workspace vector branch"
+        );
         let service_hits = crate::retrieval::score_workspace_candidates(
             candidates,
             request.min_score,
             &crate::retrieval::RetrievalRuntimeConfig::default(),
         );
 
-        assert_eq!(legacy_hits.len(), service_hits.len(), "workspace hit counts should match");
-        for (legacy, service) in legacy_hits.iter().zip(service_hits.iter()) {
-            assert_eq!(
-                legacy.document.document_id, service.document.document_id,
-                "workspace retrieval service should preserve legacy result ordering"
-            );
-            assert!(
-                (legacy.score - service.score).abs() < 0.001,
-                "workspace retrieval service should stay within a tight score delta; legacy={} service={}",
-                legacy.score,
-                service.score
-            );
-            assert!(
-                service.breakdown.source_quality_score > 0.0,
-                "service path should expose workspace source quality signals"
-            );
-        }
+        assert!(
+            service_hits.iter().any(|hit| hit.document.path == "projects/deploy-checklist.md"),
+            "fused retrieval should keep the strongest workspace document visible"
+        );
+        assert!(
+            service_hits.iter().all(|hit| hit.breakdown.source_quality_score > 0.0),
+            "service path should expose workspace source quality signals"
+        );
+        assert!(
+            service_hits.iter().any(|hit| hit.reason.contains("branches=")),
+            "workspace hits should explain which retrieval branch contributed"
+        );
+    }
+
+    #[test]
+    fn workspace_vector_branch_generates_candidates_without_fts_seed() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open_with_memory_embedding_provider(
+            test_journal_config(db_path, false),
+            Arc::new(FixedMemoryEmbeddingProvider {
+                model_name: "test-workspace-vector-branch-v1",
+                dimensions: 4,
+                vector: vec![1.0, 0.0, 0.0, 0.0],
+            }),
+        )
+        .expect("journal store should open");
+        let document = store
+            .upsert_workspace_document(&sample_workspace_write_request(
+                "projects/vector-only.md",
+                "semantic storage should retrieve this curated workspace record",
+            ))
+            .expect("workspace document should be created");
+
+        let request = WorkspaceSearchRequest {
+            principal: "user:ops".to_owned(),
+            channel: Some("cli".to_owned()),
+            agent_id: Some("agent:writer".to_owned()),
+            query: "workspace-token-that-does-not-exist".to_owned(),
+            prefix: Some("projects".to_owned()),
+            top_k: 4,
+            min_score: 0.0,
+            include_historical: false,
+            include_quarantined: false,
+        };
+        let candidates = store
+            .search_workspace_candidates(&request)
+            .expect("workspace candidate search should succeed");
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.document.document_id == document.document_id)
+            .expect("direct vector branch should surface the workspace document");
+        assert!(!candidate.lexical_candidate, "fixture should not have an FTS seed");
+        assert!(candidate.vector_candidate, "vector branch should generate the candidate directly");
     }
 
     #[test]
