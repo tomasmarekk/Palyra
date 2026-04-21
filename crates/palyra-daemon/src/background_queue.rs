@@ -97,6 +97,7 @@ async fn poll_background_queue(
                 .await;
         }
     }
+    crate::flows::FlowCoordinator::poll(runtime).await?;
     Ok(())
 }
 

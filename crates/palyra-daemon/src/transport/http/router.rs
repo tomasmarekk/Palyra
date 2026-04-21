@@ -812,6 +812,33 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/console/v1/objectives",
             post(console::objectives::console_objective_upsert_handler),
         )
+        .route("/console/v1/flows", get(console::flows::console_flows_list_handler))
+        .route("/console/v1/flows", post(console::flows::console_flow_create_handler))
+        .route("/console/v1/flows/{flow_id}", get(console::flows::console_flow_get_handler))
+        .route(
+            "/console/v1/flows/{flow_id}/pause",
+            post(console::flows::console_flow_pause_handler),
+        )
+        .route(
+            "/console/v1/flows/{flow_id}/resume",
+            post(console::flows::console_flow_resume_handler),
+        )
+        .route(
+            "/console/v1/flows/{flow_id}/cancel",
+            post(console::flows::console_flow_cancel_handler),
+        )
+        .route(
+            "/console/v1/flows/{flow_id}/steps/{step_id}/retry",
+            post(console::flows::console_flow_step_retry_handler),
+        )
+        .route(
+            "/console/v1/flows/{flow_id}/steps/{step_id}/skip",
+            post(console::flows::console_flow_step_skip_handler),
+        )
+        .route(
+            "/console/v1/flows/{flow_id}/steps/{step_id}/compensate",
+            post(console::flows::console_flow_step_compensate_handler),
+        )
         .route(
             "/console/v1/routines/templates",
             get(console::routines::console_routine_templates_handler),

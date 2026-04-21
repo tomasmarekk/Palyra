@@ -6,28 +6,29 @@ use crate::agents::{
 };
 use crate::application::auth::map_auth_profile_error;
 use crate::journal::{
-    LearningCandidateCreateRequest, LearningCandidateHistoryRecord, LearningCandidateListFilter,
-    LearningCandidateRecord, LearningCandidateReviewRequest, LearningPreferenceListFilter,
-    LearningPreferenceRecord, LearningPreferenceUpsertRequest, MemoryEmbeddingsStatus,
-    MemoryItemRecord, OrchestratorBackgroundTaskCreateRequest,
-    OrchestratorBackgroundTaskListFilter, OrchestratorBackgroundTaskRecord,
-    OrchestratorBackgroundTaskUpdateRequest, OrchestratorCheckpointCreateRequest,
-    OrchestratorCheckpointRecord, OrchestratorCheckpointRestoreMarkRequest,
-    OrchestratorCompactionArtifactCreateRequest, OrchestratorCompactionArtifactRecord,
-    OrchestratorQueuedInputCreateRequest, OrchestratorQueuedInputRecord,
-    OrchestratorQueuedInputUpdateRequest, OrchestratorRunMetadataUpdateRequest,
-    OrchestratorSessionCleanupOutcome, OrchestratorSessionCleanupRequest,
-    OrchestratorSessionLineageUpdateRequest, OrchestratorSessionPinCreateRequest,
-    OrchestratorSessionPinRecord, OrchestratorSessionQueueControlRecord,
-    OrchestratorSessionQueueControlUpdateRequest, OrchestratorSessionRecord,
-    OrchestratorSessionTitleUpdateRequest, OrchestratorSessionTranscriptRecord,
-    OrchestratorUsageQuery, OrchestratorUsageRunRecord, OrchestratorUsageSessionRecord,
-    OrchestratorUsageSummary, RecallArtifactCreateRequest, RecallArtifactListFilter,
-    RecallArtifactRecord, RetrievalBranchDiagnostics, SessionProjectContextStateCopyRequest,
-    SessionProjectContextStateRecord, SessionProjectContextStateUpsertRequest,
-    SessionSearchOutcome, SessionSearchRequest, WorkspaceBootstrapOutcome,
-    WorkspaceBootstrapRequest, WorkspaceCheckpointCreateRequest, WorkspaceCheckpointFilePayload,
-    WorkspaceCheckpointFileRecord, WorkspaceCheckpointListFilter,
+    FlowBundleRecord, FlowCreateRequest, FlowListFilter, FlowRecord, FlowStepRecord,
+    FlowStepUpdateRequest, FlowTransitionRequest, LearningCandidateCreateRequest,
+    LearningCandidateHistoryRecord, LearningCandidateListFilter, LearningCandidateRecord,
+    LearningCandidateReviewRequest, LearningPreferenceListFilter, LearningPreferenceRecord,
+    LearningPreferenceUpsertRequest, MemoryEmbeddingsStatus, MemoryItemRecord,
+    OrchestratorBackgroundTaskCreateRequest, OrchestratorBackgroundTaskListFilter,
+    OrchestratorBackgroundTaskRecord, OrchestratorBackgroundTaskUpdateRequest,
+    OrchestratorCheckpointCreateRequest, OrchestratorCheckpointRecord,
+    OrchestratorCheckpointRestoreMarkRequest, OrchestratorCompactionArtifactCreateRequest,
+    OrchestratorCompactionArtifactRecord, OrchestratorQueuedInputCreateRequest,
+    OrchestratorQueuedInputRecord, OrchestratorQueuedInputUpdateRequest,
+    OrchestratorRunMetadataUpdateRequest, OrchestratorSessionCleanupOutcome,
+    OrchestratorSessionCleanupRequest, OrchestratorSessionLineageUpdateRequest,
+    OrchestratorSessionPinCreateRequest, OrchestratorSessionPinRecord,
+    OrchestratorSessionQueueControlRecord, OrchestratorSessionQueueControlUpdateRequest,
+    OrchestratorSessionRecord, OrchestratorSessionTitleUpdateRequest,
+    OrchestratorSessionTranscriptRecord, OrchestratorUsageQuery, OrchestratorUsageRunRecord,
+    OrchestratorUsageSessionRecord, OrchestratorUsageSummary, RecallArtifactCreateRequest,
+    RecallArtifactListFilter, RecallArtifactRecord, RetrievalBranchDiagnostics,
+    SessionProjectContextStateCopyRequest, SessionProjectContextStateRecord,
+    SessionProjectContextStateUpsertRequest, SessionSearchOutcome, SessionSearchRequest,
+    WorkspaceBootstrapOutcome, WorkspaceBootstrapRequest, WorkspaceCheckpointCreateRequest,
+    WorkspaceCheckpointFilePayload, WorkspaceCheckpointFileRecord, WorkspaceCheckpointListFilter,
     WorkspaceCheckpointPairLinkRequest, WorkspaceCheckpointRecord,
     WorkspaceCheckpointRestoreMarkRequest, WorkspaceDocumentDeleteRequest,
     WorkspaceDocumentListFilter, WorkspaceDocumentMoveRequest, WorkspaceDocumentRecord,
@@ -4599,6 +4600,109 @@ impl GatewayRuntimeState {
         })
         .await
         .map_err(|_| Status::internal("workspace checkpoint restore worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn create_flow_blocking(&self, request: &FlowCreateRequest) -> Result<FlowRecord, Status> {
+        self.journal_store
+            .create_flow(request)
+            .map_err(|error| map_orchestrator_store_error("create flow", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn create_flow(
+        self: &Arc<Self>,
+        request: FlowCreateRequest,
+    ) -> Result<FlowRecord, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.create_flow_blocking(&request))
+            .await
+            .map_err(|_| Status::internal("flow create worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn list_flows_blocking(&self, filter: &FlowListFilter) -> Result<Vec<FlowRecord>, Status> {
+        self.journal_store
+            .list_flows(filter)
+            .map_err(|error| map_orchestrator_store_error("list flows", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn list_flows(
+        self: &Arc<Self>,
+        filter: FlowListFilter,
+    ) -> Result<Vec<FlowRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.list_flows_blocking(&filter))
+            .await
+            .map_err(|_| Status::internal("flow list worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn get_flow_bundle_blocking(
+        &self,
+        flow_id: &str,
+        event_limit: usize,
+    ) -> Result<Option<FlowBundleRecord>, Status> {
+        self.journal_store
+            .get_flow_bundle(flow_id, event_limit)
+            .map_err(|error| map_orchestrator_store_error("load flow", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn get_flow_bundle(
+        self: &Arc<Self>,
+        flow_id: String,
+        event_limit: usize,
+    ) -> Result<Option<FlowBundleRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.get_flow_bundle_blocking(flow_id.as_str(), event_limit)
+        })
+        .await
+        .map_err(|_| Status::internal("flow detail worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn transition_flow_blocking(
+        &self,
+        request: &FlowTransitionRequest,
+    ) -> Result<FlowRecord, Status> {
+        self.journal_store
+            .transition_flow(request)
+            .map_err(|error| map_orchestrator_store_error("transition flow", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn transition_flow(
+        self: &Arc<Self>,
+        request: FlowTransitionRequest,
+    ) -> Result<FlowRecord, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.transition_flow_blocking(&request))
+            .await
+            .map_err(|_| Status::internal("flow transition worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn update_flow_step_blocking(
+        &self,
+        request: &FlowStepUpdateRequest,
+    ) -> Result<FlowStepRecord, Status> {
+        self.journal_store
+            .update_flow_step(request)
+            .map_err(|error| map_orchestrator_store_error("update flow step", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn update_flow_step(
+        self: &Arc<Self>,
+        request: FlowStepUpdateRequest,
+    ) -> Result<FlowStepRecord, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.update_flow_step_blocking(&request))
+            .await
+            .map_err(|_| Status::internal("flow step update worker panicked"))?
     }
 
     #[allow(clippy::result_large_err)]

@@ -18,6 +18,7 @@ use palyra_common::feature_rollouts::{
     SESSION_QUEUE_POLICY_ROLLOUT_CONFIG_PATH, SESSION_QUEUE_POLICY_ROLLOUT_ENV,
 };
 use palyra_common::replay_bundle::replay_contract_snapshot;
+use palyra_common::runtime_contracts::{FlowState, FlowStepState};
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -85,6 +86,8 @@ pub(crate) async fn console_diagnostics_handler(
     };
     let objectives_payload =
         collect_console_objectives_diagnostics(&state, session.context.principal.as_str())?;
+    let flows_payload =
+        collect_console_flows_diagnostics(&state, session.context.principal.as_str()).await?;
     let delegation_payload = collect_console_delegation_diagnostics(&state, &session.context)
         .await
         .map_err(runtime_status_response)?;
@@ -143,6 +146,7 @@ pub(crate) async fn console_diagnostics_handler(
         "webhooks": webhook_payload,
         "media": media_payload,
         "objectives": objectives_payload,
+        "flows": flows_payload,
         "delegation": delegation_payload,
         "access": {
             "feature_flags": access_snapshot.feature_flags,
@@ -535,6 +539,108 @@ fn collect_console_objectives_diagnostics(
         "count": objectives.len(),
         "by_state": by_state,
         "by_kind": by_kind,
+        "recent": recent,
+    }))
+}
+
+#[allow(clippy::result_large_err)]
+async fn collect_console_flows_diagnostics(
+    state: &AppState,
+    principal: &str,
+) -> Result<Value, Response> {
+    let limit = 50_usize;
+    let flows = state
+        .runtime
+        .list_flows(crate::journal::FlowListFilter {
+            owner_principal: Some(principal.to_owned()),
+            device_id: None,
+            channel: None,
+            state: None,
+            include_terminal: false,
+            limit,
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    let mut by_state = std::collections::BTreeMap::<String, u64>::new();
+    let mut active_flows = 0_u64;
+    let mut blocked_flows = 0_u64;
+    let mut waiting_flows = 0_u64;
+    for flow in &flows {
+        *by_state.entry(flow.state.clone()).or_default() += 1;
+        match FlowState::from_str(flow.state.as_str()) {
+            Some(FlowState::Blocked) => blocked_flows += 1,
+            Some(FlowState::WaitingForApproval) => waiting_flows += 1,
+            Some(state) if !state.is_terminal() => active_flows += 1,
+            _ => {}
+        }
+    }
+
+    let mut blocked_steps = 0_u64;
+    let mut retrying_steps = 0_u64;
+    let mut timed_out_steps = 0_u64;
+    let mut waiting_steps = 0_u64;
+    let mut recent = Vec::new();
+    for flow in flows.iter().take(10) {
+        let Some(bundle) = state
+            .runtime
+            .get_flow_bundle(flow.flow_id.clone(), 64)
+            .await
+            .map_err(runtime_status_response)?
+        else {
+            continue;
+        };
+        for step in &bundle.steps {
+            match FlowStepState::from_str(step.state.as_str()) {
+                Some(FlowStepState::Blocked) => blocked_steps += 1,
+                Some(FlowStepState::Retrying) => retrying_steps += 1,
+                Some(FlowStepState::TimedOut) => timed_out_steps += 1,
+                Some(FlowStepState::WaitingForApproval) => waiting_steps += 1,
+                _ => {}
+            }
+        }
+        let latest_event = bundle.events.last().map(|event| {
+            json!({
+                "event_id": event.event_id.clone(),
+                "event_type": event.event_type.clone(),
+                "step_id": event.step_id.clone(),
+                "summary": event.summary.clone(),
+                "created_at_unix_ms": event.created_at_unix_ms,
+            })
+        });
+        recent.push(json!({
+            "flow_id": bundle.flow.flow_id,
+            "mode": bundle.flow.mode,
+            "state": bundle.flow.state,
+            "title": bundle.flow.title,
+            "current_step_id": bundle.flow.current_step_id,
+            "revision": bundle.flow.revision,
+            "updated_at_unix_ms": bundle.flow.updated_at_unix_ms,
+            "step_count": bundle.steps.len(),
+            "event_count": bundle.events.len(),
+            "latest_event": latest_event,
+        }));
+    }
+
+    Ok(json!({
+        "active_count": flows.len(),
+        "active_flows": active_flows,
+        "blocked_flows": blocked_flows,
+        "waiting_for_approval_flows": waiting_flows,
+        "by_state": by_state,
+        "steps": {
+            "blocked": blocked_steps,
+            "retrying": retrying_steps,
+            "timed_out": timed_out_steps,
+            "waiting_for_approval": waiting_steps,
+        },
+        "runtime": {
+            "mode": state.runtime.config.flow_orchestration.mode.as_str(),
+            "rollout_enabled": state.runtime.config.feature_rollouts.flow_orchestration.enabled,
+            "rollout_source": state.runtime.config.feature_rollouts.flow_orchestration.source,
+            "max_retry_count": state.runtime.config.flow_orchestration.max_retry_count,
+            "cancellation_gate_enabled": state.runtime.config.flow_orchestration.cancellation_gate_enabled,
+        },
+        "adapters": crate::flows::flow_adapter_contracts(),
         "recent": recent,
     }))
 }

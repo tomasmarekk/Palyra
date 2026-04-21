@@ -1904,6 +1904,198 @@ pub struct OrchestratorBackgroundTaskListFilter {
     pub limit: usize,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct FlowRecord {
+    pub flow_id: String,
+    pub mode: String,
+    pub state: String,
+    pub owner_principal: String,
+    pub device_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub objective_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routine_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub webhook_id: Option<String>,
+    pub title: String,
+    pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_step_id: Option<String>,
+    pub revision: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_expires_at_unix_ms: Option<i64>,
+    pub retry_policy_json: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<i64>,
+    pub metadata_json: String,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct FlowStepRecord {
+    pub step_id: String,
+    pub flow_id: String,
+    pub step_index: i64,
+    pub step_kind: String,
+    pub adapter: String,
+    pub state: String,
+    pub title: String,
+    pub input_json: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_json: Option<String>,
+    pub lineage_json: String,
+    pub depends_on_step_ids_json: String,
+    pub attempt_count: u64,
+    pub max_attempts: u64,
+    pub backoff_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_before_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct FlowEventRecord {
+    pub event_id: String,
+    pub flow_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step_id: Option<String>,
+    pub event_type: String,
+    pub actor_principal: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_state: Option<String>,
+    pub summary: String,
+    pub payload_json: String,
+    pub created_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct FlowRevisionRecord {
+    pub revision_id: String,
+    pub flow_id: String,
+    pub revision: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_revision: Option<i64>,
+    pub change_kind: String,
+    pub actor_principal: String,
+    pub payload_json: String,
+    pub created_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct FlowBundleRecord {
+    pub flow: FlowRecord,
+    pub steps: Vec<FlowStepRecord>,
+    pub events: Vec<FlowEventRecord>,
+    pub revisions: Vec<FlowRevisionRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowCreateRequest {
+    pub flow_id: String,
+    pub mode: String,
+    pub state: String,
+    pub owner_principal: String,
+    pub device_id: String,
+    pub channel: Option<String>,
+    pub session_id: Option<String>,
+    pub origin_run_id: Option<String>,
+    pub objective_id: Option<String>,
+    pub routine_id: Option<String>,
+    pub webhook_id: Option<String>,
+    pub title: String,
+    pub summary: String,
+    pub retry_policy_json: String,
+    pub timeout_ms: Option<i64>,
+    pub metadata_json: String,
+    pub actor_principal: String,
+    pub steps: Vec<FlowStepCreateRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowStepCreateRequest {
+    pub step_id: String,
+    pub step_index: i64,
+    pub step_kind: String,
+    pub adapter: String,
+    pub state: String,
+    pub title: String,
+    pub input_json: String,
+    pub lineage_json: String,
+    pub depends_on_step_ids_json: String,
+    pub max_attempts: u64,
+    pub backoff_ms: u64,
+    pub timeout_ms: Option<i64>,
+    pub not_before_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowListFilter {
+    pub owner_principal: Option<String>,
+    pub device_id: Option<String>,
+    pub channel: Option<String>,
+    pub state: Option<String>,
+    pub include_terminal: bool,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowTransitionRequest {
+    pub flow_id: String,
+    pub expected_revision: Option<i64>,
+    pub state: String,
+    pub current_step_id: Option<Option<String>>,
+    pub lock_owner: Option<Option<String>>,
+    pub lock_expires_at_unix_ms: Option<Option<i64>>,
+    pub completed_at_unix_ms: Option<Option<i64>>,
+    pub actor_principal: String,
+    pub event_type: String,
+    pub summary: String,
+    pub payload_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowStepUpdateRequest {
+    pub flow_id: String,
+    pub step_id: String,
+    pub state: Option<String>,
+    pub increment_attempt_count: bool,
+    pub output_json: Option<Option<String>>,
+    pub lineage_json: Option<String>,
+    pub not_before_unix_ms: Option<Option<i64>>,
+    pub waiting_reason: Option<Option<String>>,
+    pub last_error: Option<Option<String>>,
+    pub started_at_unix_ms: Option<Option<i64>>,
+    pub completed_at_unix_ms: Option<Option<i64>>,
+    pub actor_principal: String,
+    pub event_type: String,
+    pub summary: String,
+    pub payload_json: String,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct LearningCandidateRecord {
     pub candidate_id: String,
@@ -2660,6 +2852,12 @@ pub enum JournalError {
     InvalidWorkspaceContent { reason: String },
     #[error("approval record not found: {approval_id}")]
     ApprovalNotFound { approval_id: String },
+    #[error("flow not found: {flow_id}")]
+    FlowNotFound { flow_id: String },
+    #[error("flow step not found: {flow_id}/{step_id}")]
+    FlowStepNotFound { flow_id: String, step_id: String },
+    #[error("flow revision conflict for {flow_id}: expected {expected_revision}, found {actual_revision}")]
+    FlowRevisionConflict { flow_id: String, expected_revision: i64, actual_revision: i64 },
     #[error("canvas state not found: {canvas_id}")]
     CanvasStateNotFound { canvas_id: String },
     #[error("orchestrator run not found: {run_id}")]
@@ -3858,6 +4056,138 @@ const MIGRATIONS: &[Migration] = &[
                 ON workspace_checkpoints(mutation_ulid, checkpoint_stage, created_at_unix_ms DESC);
             CREATE INDEX IF NOT EXISTS idx_workspace_checkpoints_pair_missing
                 ON workspace_checkpoints(checkpoint_stage, paired_checkpoint_ulid, created_at_unix_ms DESC);
+        "#,
+    },
+    Migration {
+        version: 29,
+        name: "durable_flow_orchestration",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS flows (
+                flow_ulid TEXT PRIMARY KEY,
+                mode TEXT NOT NULL,
+                state TEXT NOT NULL,
+                owner_principal TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                channel TEXT,
+                session_ulid TEXT,
+                origin_run_ulid TEXT,
+                objective_id TEXT,
+                routine_id TEXT,
+                webhook_id TEXT,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                current_step_ulid TEXT,
+                revision INTEGER NOT NULL DEFAULT 1,
+                lock_owner TEXT,
+                lock_expires_at_unix_ms INTEGER,
+                retry_policy_json TEXT NOT NULL DEFAULT '{}',
+                timeout_ms INTEGER,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at_unix_ms INTEGER NOT NULL,
+                updated_at_unix_ms INTEGER NOT NULL,
+                completed_at_unix_ms INTEGER,
+                FOREIGN KEY(session_ulid) REFERENCES orchestrator_sessions(session_ulid),
+                FOREIGN KEY(origin_run_ulid) REFERENCES orchestrator_runs(run_ulid)
+            );
+            CREATE INDEX IF NOT EXISTS idx_flows_owner_state
+                ON flows(owner_principal, device_id, channel, state, updated_at_unix_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_flows_session
+                ON flows(session_ulid, updated_at_unix_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_flows_origin_run
+                ON flows(origin_run_ulid, updated_at_unix_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_flows_routine
+                ON flows(routine_id, updated_at_unix_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_flows_objective
+                ON flows(objective_id, updated_at_unix_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_flows_webhook
+                ON flows(webhook_id, updated_at_unix_ms DESC);
+
+            CREATE TABLE IF NOT EXISTS flow_steps (
+                step_ulid TEXT PRIMARY KEY,
+                flow_ulid TEXT NOT NULL,
+                step_index INTEGER NOT NULL,
+                step_kind TEXT NOT NULL,
+                adapter TEXT NOT NULL,
+                state TEXT NOT NULL,
+                title TEXT NOT NULL,
+                input_json TEXT NOT NULL DEFAULT '{}',
+                output_json TEXT,
+                lineage_json TEXT NOT NULL DEFAULT '{}',
+                depends_on_step_ids_json TEXT NOT NULL DEFAULT '[]',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL DEFAULT 1,
+                backoff_ms INTEGER NOT NULL DEFAULT 0,
+                timeout_ms INTEGER,
+                not_before_unix_ms INTEGER,
+                waiting_reason TEXT,
+                last_error TEXT,
+                created_at_unix_ms INTEGER NOT NULL,
+                updated_at_unix_ms INTEGER NOT NULL,
+                started_at_unix_ms INTEGER,
+                completed_at_unix_ms INTEGER,
+                UNIQUE(flow_ulid, step_index),
+                FOREIGN KEY(flow_ulid) REFERENCES flows(flow_ulid) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_flow_steps_flow_index
+                ON flow_steps(flow_ulid, step_index ASC);
+            CREATE INDEX IF NOT EXISTS idx_flow_steps_state_due
+                ON flow_steps(state, not_before_unix_ms, updated_at_unix_ms ASC);
+            CREATE INDEX IF NOT EXISTS idx_flow_steps_adapter
+                ON flow_steps(adapter, state, updated_at_unix_ms DESC);
+
+            CREATE TABLE IF NOT EXISTS flow_events (
+                event_ulid TEXT PRIMARY KEY,
+                flow_ulid TEXT NOT NULL,
+                step_ulid TEXT,
+                event_type TEXT NOT NULL,
+                actor_principal TEXT NOT NULL,
+                from_state TEXT,
+                to_state TEXT,
+                summary TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at_unix_ms INTEGER NOT NULL,
+                FOREIGN KEY(flow_ulid) REFERENCES flows(flow_ulid) ON DELETE CASCADE,
+                FOREIGN KEY(step_ulid) REFERENCES flow_steps(step_ulid) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_flow_events_flow_time
+                ON flow_events(flow_ulid, created_at_unix_ms ASC);
+            CREATE INDEX IF NOT EXISTS idx_flow_events_step_time
+                ON flow_events(step_ulid, created_at_unix_ms ASC);
+            CREATE TRIGGER IF NOT EXISTS trg_flow_events_prevent_update
+            BEFORE UPDATE ON flow_events
+            BEGIN
+                SELECT RAISE(ABORT, 'flow_events is append-only');
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_flow_events_prevent_delete
+            BEFORE DELETE ON flow_events
+            BEGIN
+                SELECT RAISE(ABORT, 'flow_events is append-only');
+            END;
+
+            CREATE TABLE IF NOT EXISTS flow_revisions (
+                revision_ulid TEXT PRIMARY KEY,
+                flow_ulid TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                parent_revision INTEGER,
+                change_kind TEXT NOT NULL,
+                actor_principal TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at_unix_ms INTEGER NOT NULL,
+                UNIQUE(flow_ulid, revision),
+                FOREIGN KEY(flow_ulid) REFERENCES flows(flow_ulid) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_flow_revisions_flow_revision
+                ON flow_revisions(flow_ulid, revision ASC);
+            CREATE TRIGGER IF NOT EXISTS trg_flow_revisions_prevent_update
+            BEFORE UPDATE ON flow_revisions
+            BEGIN
+                SELECT RAISE(ABORT, 'flow_revisions is append-only');
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_flow_revisions_prevent_delete
+            BEFORE DELETE ON flow_revisions
+            BEGIN
+                SELECT RAISE(ABORT, 'flow_revisions is append-only');
+            END;
         "#,
     },
 ];
@@ -7978,6 +8308,586 @@ impl JournalStore {
             )
             .optional()
             .map_err(JournalError::from)
+    }
+
+    pub fn create_flow(&self, request: &FlowCreateRequest) -> Result<FlowRecord, JournalError> {
+        ensure_json_field(request.retry_policy_json.as_str(), "retry_policy_json")?;
+        ensure_json_field(request.metadata_json.as_str(), "metadata_json")?;
+        for step in &request.steps {
+            ensure_json_field(step.input_json.as_str(), "input_json")?;
+            ensure_json_field(step.lineage_json.as_str(), "lineage_json")?;
+            ensure_json_field(step.depends_on_step_ids_json.as_str(), "depends_on_step_ids_json")?;
+        }
+
+        let now = current_unix_ms()?;
+        let current_step_id = request
+            .steps
+            .iter()
+            .min_by_key(|step| step.step_index)
+            .map(|step| step.step_id.clone());
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction()?;
+        transaction.execute(
+            r#"
+                INSERT INTO flows (
+                    flow_ulid,
+                    mode,
+                    state,
+                    owner_principal,
+                    device_id,
+                    channel,
+                    session_ulid,
+                    origin_run_ulid,
+                    objective_id,
+                    routine_id,
+                    webhook_id,
+                    title,
+                    summary,
+                    current_step_ulid,
+                    revision,
+                    retry_policy_json,
+                    timeout_ms,
+                    metadata_json,
+                    created_at_unix_ms,
+                    updated_at_unix_ms,
+                    completed_at_unix_ms
+                ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 1, ?15, ?16, ?17, ?18, ?18, NULL
+                )
+            "#,
+            params![
+                request.flow_id,
+                request.mode,
+                request.state,
+                request.owner_principal,
+                request.device_id,
+                request.channel,
+                request.session_id,
+                request.origin_run_id,
+                request.objective_id,
+                request.routine_id,
+                request.webhook_id,
+                request.title,
+                request.summary,
+                current_step_id,
+                request.retry_policy_json,
+                request.timeout_ms,
+                request.metadata_json,
+                now,
+            ],
+        )?;
+
+        for step in &request.steps {
+            transaction.execute(
+                r#"
+                    INSERT INTO flow_steps (
+                        step_ulid,
+                        flow_ulid,
+                        step_index,
+                        step_kind,
+                        adapter,
+                        state,
+                        title,
+                        input_json,
+                        output_json,
+                        lineage_json,
+                        depends_on_step_ids_json,
+                        attempt_count,
+                        max_attempts,
+                        backoff_ms,
+                        timeout_ms,
+                        not_before_unix_ms,
+                        waiting_reason,
+                        last_error,
+                        created_at_unix_ms,
+                        updated_at_unix_ms,
+                        started_at_unix_ms,
+                        completed_at_unix_ms
+                    ) VALUES (
+                        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, 0, ?11, ?12, ?13, ?14, NULL, NULL, ?15, ?15, NULL, NULL
+                    )
+                "#,
+                params![
+                    step.step_id,
+                    request.flow_id,
+                    step.step_index,
+                    step.step_kind,
+                    step.adapter,
+                    step.state,
+                    step.title,
+                    step.input_json,
+                    step.lineage_json,
+                    step.depends_on_step_ids_json,
+                    u64_to_sqlite(step.max_attempts, "flow_step.max_attempts")?,
+                    u64_to_sqlite(step.backoff_ms, "flow_step.backoff_ms")?,
+                    step.timeout_ms,
+                    step.not_before_unix_ms,
+                    now,
+                ],
+            )?;
+        }
+
+        insert_flow_event(
+            &transaction,
+            FlowEventInsert {
+                event_id: Ulid::new().to_string(),
+                flow_id: request.flow_id.as_str(),
+                step_id: None,
+                event_type: "flow.created",
+                actor_principal: request.actor_principal.as_str(),
+                from_state: None,
+                to_state: Some(request.state.as_str()),
+                summary: "flow created",
+                payload_json: request.metadata_json.as_str(),
+                created_at_unix_ms: now,
+            },
+        )?;
+        insert_flow_revision(
+            &transaction,
+            FlowRevisionInsert {
+                revision_id: Ulid::new().to_string(),
+                flow_id: request.flow_id.as_str(),
+                revision: 1,
+                parent_revision: None,
+                change_kind: "create",
+                actor_principal: request.actor_principal.as_str(),
+                payload_json: request.metadata_json.as_str(),
+                created_at_unix_ms: now,
+            },
+        )?;
+        transaction.commit()?;
+
+        self.get_flow(request.flow_id.as_str())?
+            .ok_or_else(|| JournalError::FlowNotFound { flow_id: request.flow_id.clone() })
+    }
+
+    pub fn list_flows(&self, filter: &FlowListFilter) -> Result<Vec<FlowRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let limit = filter.limit.clamp(1, 500) as i64;
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    flow_ulid,
+                    mode,
+                    state,
+                    owner_principal,
+                    device_id,
+                    channel,
+                    session_ulid,
+                    origin_run_ulid,
+                    objective_id,
+                    routine_id,
+                    webhook_id,
+                    title,
+                    summary,
+                    current_step_ulid,
+                    revision,
+                    lock_owner,
+                    lock_expires_at_unix_ms,
+                    retry_policy_json,
+                    timeout_ms,
+                    metadata_json,
+                    created_at_unix_ms,
+                    updated_at_unix_ms,
+                    completed_at_unix_ms
+                FROM flows
+                WHERE (?1 IS NULL OR owner_principal = ?1)
+                  AND (?2 IS NULL OR device_id = ?2)
+                  AND (?3 IS NULL OR COALESCE(channel, '') = COALESCE(?3, ''))
+                  AND (?4 IS NULL OR state = ?4)
+                  AND (?5 = 1 OR state NOT IN ('succeeded', 'failed', 'timed_out', 'cancelled'))
+                ORDER BY updated_at_unix_ms DESC, created_at_unix_ms DESC
+                LIMIT ?6
+            "#,
+        )?;
+        let rows = statement.query_map(
+            params![
+                filter.owner_principal,
+                filter.device_id,
+                filter.channel,
+                filter.state,
+                if filter.include_terminal { 1_i64 } else { 0_i64 },
+                limit,
+            ],
+            map_flow_row,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(JournalError::from)
+    }
+
+    pub fn get_flow(&self, flow_id: &str) -> Result<Option<FlowRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        query_flow_by_id(&guard, flow_id)
+    }
+
+    pub fn get_flow_bundle(
+        &self,
+        flow_id: &str,
+        event_limit: usize,
+    ) -> Result<Option<FlowBundleRecord>, JournalError> {
+        let Some(flow) = self.get_flow(flow_id)? else {
+            return Ok(None);
+        };
+        Ok(Some(FlowBundleRecord {
+            steps: self.list_flow_steps(flow_id)?,
+            events: self.list_flow_events(flow_id, event_limit)?,
+            revisions: self.list_flow_revisions(flow_id)?,
+            flow,
+        }))
+    }
+
+    pub fn list_flow_steps(&self, flow_id: &str) -> Result<Vec<FlowStepRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    step_ulid,
+                    flow_ulid,
+                    step_index,
+                    step_kind,
+                    adapter,
+                    state,
+                    title,
+                    input_json,
+                    output_json,
+                    lineage_json,
+                    depends_on_step_ids_json,
+                    attempt_count,
+                    max_attempts,
+                    backoff_ms,
+                    timeout_ms,
+                    not_before_unix_ms,
+                    waiting_reason,
+                    last_error,
+                    created_at_unix_ms,
+                    updated_at_unix_ms,
+                    started_at_unix_ms,
+                    completed_at_unix_ms
+                FROM flow_steps
+                WHERE flow_ulid = ?1
+                ORDER BY step_index ASC, created_at_unix_ms ASC
+            "#,
+        )?;
+        let rows = statement.query_map(params![flow_id], map_flow_step_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(JournalError::from)
+    }
+
+    pub fn get_flow_step(
+        &self,
+        flow_id: &str,
+        step_id: &str,
+    ) -> Result<Option<FlowStepRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        query_flow_step_by_id(&guard, flow_id, step_id)
+    }
+
+    pub fn list_flow_events(
+        &self,
+        flow_id: &str,
+        limit: usize,
+    ) -> Result<Vec<FlowEventRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let limit = limit.clamp(1, 1_000) as i64;
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    event_ulid,
+                    flow_ulid,
+                    step_ulid,
+                    event_type,
+                    actor_principal,
+                    from_state,
+                    to_state,
+                    summary,
+                    payload_json,
+                    created_at_unix_ms
+                FROM flow_events
+                WHERE flow_ulid = ?1
+                ORDER BY created_at_unix_ms ASC, event_ulid ASC
+                LIMIT ?2
+            "#,
+        )?;
+        let rows = statement.query_map(params![flow_id, limit], map_flow_event_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(JournalError::from)
+    }
+
+    pub fn list_flow_revisions(
+        &self,
+        flow_id: &str,
+    ) -> Result<Vec<FlowRevisionRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    revision_ulid,
+                    flow_ulid,
+                    revision,
+                    parent_revision,
+                    change_kind,
+                    actor_principal,
+                    payload_json,
+                    created_at_unix_ms
+                FROM flow_revisions
+                WHERE flow_ulid = ?1
+                ORDER BY revision ASC
+            "#,
+        )?;
+        let rows = statement.query_map(params![flow_id], map_flow_revision_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(JournalError::from)
+    }
+
+    pub fn transition_flow(
+        &self,
+        request: &FlowTransitionRequest,
+    ) -> Result<FlowRecord, JournalError> {
+        ensure_json_field(request.payload_json.as_str(), "payload_json")?;
+        let now = current_unix_ms()?;
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction()?;
+        let (previous_state, previous_revision): (String, i64) = transaction
+            .query_row(
+                "SELECT state, revision FROM flows WHERE flow_ulid = ?1",
+                params![request.flow_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| JournalError::FlowNotFound { flow_id: request.flow_id.clone() })?;
+        if let Some(expected_revision) = request.expected_revision {
+            if expected_revision != previous_revision {
+                return Err(JournalError::FlowRevisionConflict {
+                    flow_id: request.flow_id.clone(),
+                    expected_revision,
+                    actual_revision: previous_revision,
+                });
+            }
+        }
+        let next_revision = previous_revision + 1;
+        let current_step_id = request.current_step_id.clone().flatten();
+        let clear_current_step_id = request.current_step_id.is_some() && current_step_id.is_none();
+        let lock_owner = request.lock_owner.clone().flatten();
+        let clear_lock_owner = request.lock_owner.is_some() && lock_owner.is_none();
+        let lock_expires_at_unix_ms = request.lock_expires_at_unix_ms.flatten();
+        let clear_lock_expires_at =
+            request.lock_expires_at_unix_ms.is_some() && lock_expires_at_unix_ms.is_none();
+        let completed_at_unix_ms = request.completed_at_unix_ms.flatten();
+        let clear_completed_at =
+            request.completed_at_unix_ms.is_some() && completed_at_unix_ms.is_none();
+        transaction.execute(
+            r#"
+                UPDATE flows
+                SET
+                    state = ?2,
+                    current_step_ulid = CASE
+                        WHEN ?3 = 1 THEN NULL
+                        ELSE COALESCE(?4, current_step_ulid)
+                    END,
+                    lock_owner = CASE
+                        WHEN ?5 = 1 THEN NULL
+                        ELSE COALESCE(?6, lock_owner)
+                    END,
+                    lock_expires_at_unix_ms = CASE
+                        WHEN ?7 = 1 THEN NULL
+                        ELSE COALESCE(?8, lock_expires_at_unix_ms)
+                    END,
+                    completed_at_unix_ms = CASE
+                        WHEN ?9 = 1 THEN NULL
+                        ELSE COALESCE(?10, completed_at_unix_ms)
+                    END,
+                    revision = ?11,
+                    updated_at_unix_ms = ?12
+                WHERE flow_ulid = ?1
+            "#,
+            params![
+                request.flow_id,
+                request.state,
+                if clear_current_step_id { 1_i64 } else { 0_i64 },
+                current_step_id,
+                if clear_lock_owner { 1_i64 } else { 0_i64 },
+                lock_owner,
+                if clear_lock_expires_at { 1_i64 } else { 0_i64 },
+                lock_expires_at_unix_ms,
+                if clear_completed_at { 1_i64 } else { 0_i64 },
+                completed_at_unix_ms,
+                next_revision,
+                now,
+            ],
+        )?;
+        insert_flow_event(
+            &transaction,
+            FlowEventInsert {
+                event_id: Ulid::new().to_string(),
+                flow_id: request.flow_id.as_str(),
+                step_id: None,
+                event_type: request.event_type.as_str(),
+                actor_principal: request.actor_principal.as_str(),
+                from_state: Some(previous_state.as_str()),
+                to_state: Some(request.state.as_str()),
+                summary: request.summary.as_str(),
+                payload_json: request.payload_json.as_str(),
+                created_at_unix_ms: now,
+            },
+        )?;
+        insert_flow_revision(
+            &transaction,
+            FlowRevisionInsert {
+                revision_id: Ulid::new().to_string(),
+                flow_id: request.flow_id.as_str(),
+                revision: next_revision,
+                parent_revision: Some(previous_revision),
+                change_kind: request.event_type.as_str(),
+                actor_principal: request.actor_principal.as_str(),
+                payload_json: request.payload_json.as_str(),
+                created_at_unix_ms: now,
+            },
+        )?;
+        transaction.commit()?;
+        self.get_flow(request.flow_id.as_str())?
+            .ok_or_else(|| JournalError::FlowNotFound { flow_id: request.flow_id.clone() })
+    }
+
+    pub fn update_flow_step(
+        &self,
+        request: &FlowStepUpdateRequest,
+    ) -> Result<FlowStepRecord, JournalError> {
+        ensure_json_field(request.payload_json.as_str(), "payload_json")?;
+        if let Some(output_json) = request.output_json.as_ref().and_then(|value| value.as_ref()) {
+            ensure_json_field(output_json.as_str(), "output_json")?;
+        }
+        if let Some(lineage_json) = request.lineage_json.as_deref() {
+            ensure_json_field(lineage_json, "lineage_json")?;
+        }
+
+        let now = current_unix_ms()?;
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction()?;
+        let (previous_state, previous_revision): (String, i64) = transaction
+            .query_row(
+                r#"
+                    SELECT flow_steps.state, flows.revision
+                    FROM flow_steps
+                    INNER JOIN flows ON flows.flow_ulid = flow_steps.flow_ulid
+                    WHERE flow_steps.flow_ulid = ?1 AND flow_steps.step_ulid = ?2
+                "#,
+                params![request.flow_id, request.step_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| JournalError::FlowStepNotFound {
+                flow_id: request.flow_id.clone(),
+                step_id: request.step_id.clone(),
+            })?;
+        let next_state = request.state.as_deref().unwrap_or(previous_state.as_str());
+        let output_json = request.output_json.clone().flatten();
+        let clear_output_json = request.output_json.is_some() && output_json.is_none();
+        let not_before_unix_ms = request.not_before_unix_ms.flatten();
+        let clear_not_before = request.not_before_unix_ms.is_some() && not_before_unix_ms.is_none();
+        let waiting_reason = request.waiting_reason.clone().flatten();
+        let clear_waiting_reason = request.waiting_reason.is_some() && waiting_reason.is_none();
+        let last_error = request.last_error.clone().flatten();
+        let clear_last_error = request.last_error.is_some() && last_error.is_none();
+        let started_at_unix_ms = request.started_at_unix_ms.flatten();
+        let clear_started_at = request.started_at_unix_ms.is_some() && started_at_unix_ms.is_none();
+        let completed_at_unix_ms = request.completed_at_unix_ms.flatten();
+        let clear_completed_at =
+            request.completed_at_unix_ms.is_some() && completed_at_unix_ms.is_none();
+        transaction.execute(
+            r#"
+                UPDATE flow_steps
+                SET
+                    state = COALESCE(?3, state),
+                    attempt_count = attempt_count + ?4,
+                    output_json = CASE
+                        WHEN ?5 = 1 THEN NULL
+                        ELSE COALESCE(?6, output_json)
+                    END,
+                    lineage_json = COALESCE(?7, lineage_json),
+                    not_before_unix_ms = CASE
+                        WHEN ?8 = 1 THEN NULL
+                        ELSE COALESCE(?9, not_before_unix_ms)
+                    END,
+                    waiting_reason = CASE
+                        WHEN ?10 = 1 THEN NULL
+                        ELSE COALESCE(?11, waiting_reason)
+                    END,
+                    last_error = CASE
+                        WHEN ?12 = 1 THEN NULL
+                        ELSE COALESCE(?13, last_error)
+                    END,
+                    started_at_unix_ms = CASE
+                        WHEN ?14 = 1 THEN NULL
+                        ELSE COALESCE(?15, started_at_unix_ms)
+                    END,
+                    completed_at_unix_ms = CASE
+                        WHEN ?16 = 1 THEN NULL
+                        ELSE COALESCE(?17, completed_at_unix_ms)
+                    END,
+                    updated_at_unix_ms = ?18
+                WHERE flow_ulid = ?1 AND step_ulid = ?2
+            "#,
+            params![
+                request.flow_id,
+                request.step_id,
+                request.state,
+                if request.increment_attempt_count { 1_i64 } else { 0_i64 },
+                if clear_output_json { 1_i64 } else { 0_i64 },
+                output_json,
+                request.lineage_json,
+                if clear_not_before { 1_i64 } else { 0_i64 },
+                not_before_unix_ms,
+                if clear_waiting_reason { 1_i64 } else { 0_i64 },
+                waiting_reason,
+                if clear_last_error { 1_i64 } else { 0_i64 },
+                last_error,
+                if clear_started_at { 1_i64 } else { 0_i64 },
+                started_at_unix_ms,
+                if clear_completed_at { 1_i64 } else { 0_i64 },
+                completed_at_unix_ms,
+                now,
+            ],
+        )?;
+        let next_revision = previous_revision + 1;
+        transaction.execute(
+            r#"
+                UPDATE flows
+                SET revision = ?2, updated_at_unix_ms = ?3
+                WHERE flow_ulid = ?1
+            "#,
+            params![request.flow_id, next_revision, now],
+        )?;
+        insert_flow_event(
+            &transaction,
+            FlowEventInsert {
+                event_id: Ulid::new().to_string(),
+                flow_id: request.flow_id.as_str(),
+                step_id: Some(request.step_id.as_str()),
+                event_type: request.event_type.as_str(),
+                actor_principal: request.actor_principal.as_str(),
+                from_state: Some(previous_state.as_str()),
+                to_state: Some(next_state),
+                summary: request.summary.as_str(),
+                payload_json: request.payload_json.as_str(),
+                created_at_unix_ms: now,
+            },
+        )?;
+        insert_flow_revision(
+            &transaction,
+            FlowRevisionInsert {
+                revision_id: Ulid::new().to_string(),
+                flow_id: request.flow_id.as_str(),
+                revision: next_revision,
+                parent_revision: Some(previous_revision),
+                change_kind: request.event_type.as_str(),
+                actor_principal: request.actor_principal.as_str(),
+                payload_json: request.payload_json.as_str(),
+                created_at_unix_ms: now,
+            },
+        )?;
+        transaction.commit()?;
+        self.get_flow_step(request.flow_id.as_str(), request.step_id.as_str())?.ok_or_else(|| {
+            JournalError::FlowStepNotFound {
+                flow_id: request.flow_id.clone(),
+                step_id: request.step_id.clone(),
+            }
+        })
     }
 
     pub fn upsert_learning_candidate(
@@ -13894,6 +14804,267 @@ fn u64_to_sqlite(value: u64, field_name: &'static str) -> Result<i64, JournalErr
             format!("{field_name} exceeds sqlite INTEGER range"),
         )))
         .into()
+    })
+}
+
+fn ensure_json_field(raw: &str, field: &'static str) -> Result<(), JournalError> {
+    serde_json::from_str::<Value>(raw).map(|_| ()).map_err(|error| {
+        JournalError::InvalidArgument(format!("{field} must be valid JSON: {error}"))
+    })
+}
+
+struct FlowEventInsert<'a> {
+    event_id: String,
+    flow_id: &'a str,
+    step_id: Option<&'a str>,
+    event_type: &'a str,
+    actor_principal: &'a str,
+    from_state: Option<&'a str>,
+    to_state: Option<&'a str>,
+    summary: &'a str,
+    payload_json: &'a str,
+    created_at_unix_ms: i64,
+}
+
+fn insert_flow_event(
+    transaction: &Transaction<'_>,
+    event: FlowEventInsert<'_>,
+) -> Result<(), JournalError> {
+    transaction.execute(
+        r#"
+            INSERT INTO flow_events (
+                event_ulid,
+                flow_ulid,
+                step_ulid,
+                event_type,
+                actor_principal,
+                from_state,
+                to_state,
+                summary,
+                payload_json,
+                created_at_unix_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "#,
+        params![
+            event.event_id,
+            event.flow_id,
+            event.step_id,
+            event.event_type,
+            event.actor_principal,
+            event.from_state,
+            event.to_state,
+            event.summary,
+            event.payload_json,
+            event.created_at_unix_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+struct FlowRevisionInsert<'a> {
+    revision_id: String,
+    flow_id: &'a str,
+    revision: i64,
+    parent_revision: Option<i64>,
+    change_kind: &'a str,
+    actor_principal: &'a str,
+    payload_json: &'a str,
+    created_at_unix_ms: i64,
+}
+
+fn insert_flow_revision(
+    transaction: &Transaction<'_>,
+    revision: FlowRevisionInsert<'_>,
+) -> Result<(), JournalError> {
+    transaction.execute(
+        r#"
+            INSERT INTO flow_revisions (
+                revision_ulid,
+                flow_ulid,
+                revision,
+                parent_revision,
+                change_kind,
+                actor_principal,
+                payload_json,
+                created_at_unix_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+        params![
+            revision.revision_id,
+            revision.flow_id,
+            revision.revision,
+            revision.parent_revision,
+            revision.change_kind,
+            revision.actor_principal,
+            revision.payload_json,
+            revision.created_at_unix_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+fn query_flow_by_id(
+    connection: &Connection,
+    flow_id: &str,
+) -> Result<Option<FlowRecord>, JournalError> {
+    connection
+        .query_row(
+            r#"
+                SELECT
+                    flow_ulid,
+                    mode,
+                    state,
+                    owner_principal,
+                    device_id,
+                    channel,
+                    session_ulid,
+                    origin_run_ulid,
+                    objective_id,
+                    routine_id,
+                    webhook_id,
+                    title,
+                    summary,
+                    current_step_ulid,
+                    revision,
+                    lock_owner,
+                    lock_expires_at_unix_ms,
+                    retry_policy_json,
+                    timeout_ms,
+                    metadata_json,
+                    created_at_unix_ms,
+                    updated_at_unix_ms,
+                    completed_at_unix_ms
+                FROM flows
+                WHERE flow_ulid = ?1
+            "#,
+            params![flow_id],
+            map_flow_row,
+        )
+        .optional()
+        .map_err(JournalError::from)
+}
+
+fn query_flow_step_by_id(
+    connection: &Connection,
+    flow_id: &str,
+    step_id: &str,
+) -> Result<Option<FlowStepRecord>, JournalError> {
+    connection
+        .query_row(
+            r#"
+                SELECT
+                    step_ulid,
+                    flow_ulid,
+                    step_index,
+                    step_kind,
+                    adapter,
+                    state,
+                    title,
+                    input_json,
+                    output_json,
+                    lineage_json,
+                    depends_on_step_ids_json,
+                    attempt_count,
+                    max_attempts,
+                    backoff_ms,
+                    timeout_ms,
+                    not_before_unix_ms,
+                    waiting_reason,
+                    last_error,
+                    created_at_unix_ms,
+                    updated_at_unix_ms,
+                    started_at_unix_ms,
+                    completed_at_unix_ms
+                FROM flow_steps
+                WHERE flow_ulid = ?1 AND step_ulid = ?2
+            "#,
+            params![flow_id, step_id],
+            map_flow_step_row,
+        )
+        .optional()
+        .map_err(JournalError::from)
+}
+
+fn map_flow_row(row: &rusqlite::Row<'_>) -> Result<FlowRecord, rusqlite::Error> {
+    Ok(FlowRecord {
+        flow_id: row.get(0)?,
+        mode: row.get(1)?,
+        state: row.get(2)?,
+        owner_principal: row.get(3)?,
+        device_id: row.get(4)?,
+        channel: row.get(5)?,
+        session_id: row.get(6)?,
+        origin_run_id: row.get(7)?,
+        objective_id: row.get(8)?,
+        routine_id: row.get(9)?,
+        webhook_id: row.get(10)?,
+        title: row.get(11)?,
+        summary: row.get(12)?,
+        current_step_id: row.get(13)?,
+        revision: row.get(14)?,
+        lock_owner: row.get(15)?,
+        lock_expires_at_unix_ms: row.get(16)?,
+        retry_policy_json: row.get(17)?,
+        timeout_ms: row.get(18)?,
+        metadata_json: row.get(19)?,
+        created_at_unix_ms: row.get(20)?,
+        updated_at_unix_ms: row.get(21)?,
+        completed_at_unix_ms: row.get(22)?,
+    })
+}
+
+fn map_flow_step_row(row: &rusqlite::Row<'_>) -> Result<FlowStepRecord, rusqlite::Error> {
+    Ok(FlowStepRecord {
+        step_id: row.get(0)?,
+        flow_id: row.get(1)?,
+        step_index: row.get(2)?,
+        step_kind: row.get(3)?,
+        adapter: row.get(4)?,
+        state: row.get(5)?,
+        title: row.get(6)?,
+        input_json: row.get(7)?,
+        output_json: row.get(8)?,
+        lineage_json: row.get(9)?,
+        depends_on_step_ids_json: row.get(10)?,
+        attempt_count: row.get::<_, i64>(11)?.max(0) as u64,
+        max_attempts: row.get::<_, i64>(12)?.max(0) as u64,
+        backoff_ms: row.get::<_, i64>(13)?.max(0) as u64,
+        timeout_ms: row.get(14)?,
+        not_before_unix_ms: row.get(15)?,
+        waiting_reason: row.get(16)?,
+        last_error: row.get(17)?,
+        created_at_unix_ms: row.get(18)?,
+        updated_at_unix_ms: row.get(19)?,
+        started_at_unix_ms: row.get(20)?,
+        completed_at_unix_ms: row.get(21)?,
+    })
+}
+
+fn map_flow_event_row(row: &rusqlite::Row<'_>) -> Result<FlowEventRecord, rusqlite::Error> {
+    Ok(FlowEventRecord {
+        event_id: row.get(0)?,
+        flow_id: row.get(1)?,
+        step_id: row.get(2)?,
+        event_type: row.get(3)?,
+        actor_principal: row.get(4)?,
+        from_state: row.get(5)?,
+        to_state: row.get(6)?,
+        summary: row.get(7)?,
+        payload_json: row.get(8)?,
+        created_at_unix_ms: row.get(9)?,
+    })
+}
+
+fn map_flow_revision_row(row: &rusqlite::Row<'_>) -> Result<FlowRevisionRecord, rusqlite::Error> {
+    Ok(FlowRevisionRecord {
+        revision_id: row.get(0)?,
+        flow_id: row.get(1)?,
+        revision: row.get(2)?,
+        parent_revision: row.get(3)?,
+        change_kind: row.get(4)?,
+        actor_principal: row.get(5)?,
+        payload_json: row.get(6)?,
+        created_at_unix_ms: row.get(7)?,
     })
 }
 

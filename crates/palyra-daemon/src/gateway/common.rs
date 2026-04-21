@@ -25,6 +25,20 @@ pub(crate) fn map_orchestrator_store_error(operation: &str, error: JournalError)
         JournalError::InvalidSessionSelector { reason } => {
             Status::invalid_argument(format!("invalid orchestrator session selector: {reason}"))
         }
+        JournalError::FlowNotFound { flow_id } => {
+            Status::not_found(format!("flow not found: {flow_id}"))
+        }
+        JournalError::FlowStepNotFound { flow_id, step_id } => {
+            Status::not_found(format!("flow step not found: {flow_id}/{step_id}"))
+        }
+        JournalError::FlowRevisionConflict {
+            flow_id,
+            expected_revision,
+            actual_revision,
+        } => Status::aborted(format!(
+            "flow revision conflict for {flow_id}: expected {expected_revision}, found {actual_revision}"
+        )),
+        JournalError::InvalidArgument(message) => Status::invalid_argument(message),
         other => Status::internal(format!("{operation} failed: {other}")),
     }
 }
