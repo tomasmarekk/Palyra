@@ -279,9 +279,11 @@ mod tests {
 
     #[test]
     fn policy_maps_legacy_depth_and_merge_window_to_cap_and_debounce() {
-        let mut config = SessionQueuePolicyConfig::default();
-        config.max_depth = 12;
-        config.merge_window_ms = 2_500;
+        let config = SessionQueuePolicyConfig {
+            max_depth: 12,
+            merge_window_ms: 2_500,
+            ..SessionQueuePolicyConfig::default()
+        };
 
         let policy =
             SessionQueuePolicy::from_config(&config, "session-1", Some("discord"), Some("agent-1"));
@@ -317,8 +319,8 @@ mod tests {
 
     #[test]
     fn queue_cap_switches_to_overflow_summary() {
-        let mut config = SessionQueuePolicyConfig::default();
-        config.max_depth = 2;
+        let config =
+            SessionQueuePolicyConfig { max_depth: 2, ..SessionQueuePolicyConfig::default() };
         let policy = SessionQueuePolicy::from_config(&config, "session-1", None, None);
         let decision = decide_session_queue_mode(
             policy,

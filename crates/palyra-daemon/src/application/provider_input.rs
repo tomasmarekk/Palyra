@@ -821,11 +821,7 @@ async fn prepare_model_provider_input_legacy(
         let provider_input_text = finalize_provider_input_with_pruning(
             runtime_state,
             context,
-            run_id,
-            tape_seq,
-            session_id,
-            parameter_delta_json,
-            memory_ingest_reason,
+            (run_id, tape_seq, session_id, parameter_delta_json, memory_ingest_reason),
             provider_input_text,
         )
         .await?;
@@ -896,11 +892,7 @@ async fn prepare_model_provider_input_legacy(
     let provider_input_text = finalize_provider_input_with_pruning(
         runtime_state,
         context,
-        run_id,
-        tape_seq,
-        session_id,
-        parameter_delta_json,
-        memory_ingest_reason,
+        (run_id, tape_seq, session_id, parameter_delta_json, memory_ingest_reason),
         provider_input_text,
     )
     .await?;
@@ -911,16 +903,16 @@ async fn prepare_model_provider_input_legacy(
 }
 
 #[allow(clippy::result_large_err)]
+type ProviderInputPruningRequest<'a> = (&'a str, &'a mut i64, &'a str, Option<&'a str>, &'a str);
+
+#[allow(clippy::result_large_err)]
 async fn finalize_provider_input_with_pruning(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: &RequestContext,
-    run_id: &str,
-    tape_seq: &mut i64,
-    session_id: &str,
-    parameter_delta_json: Option<&str>,
-    memory_ingest_reason: &str,
+    request: ProviderInputPruningRequest<'_>,
     provider_input_text: String,
 ) -> Result<String, Status> {
+    let (run_id, tape_seq, session_id, parameter_delta_json, memory_ingest_reason) = request;
     let task_class = classify_pruning_task(memory_ingest_reason, parameter_delta_json);
     let risk_level = detect_pruning_risk(provider_input_text.as_str());
     let decision = pruning_decision_from_config(
