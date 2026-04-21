@@ -155,7 +155,8 @@ const SUPPORT_MESSAGES = {
   "replay.gateProfiles": "Gate profiles",
   "replay.reporting": "Reporting",
   "replay.emptyTitle": "No replay contract published",
-  "replay.emptyDescription": "Refresh support after the daemon publishes replay support diagnostics.",
+  "replay.emptyDescription":
+    "Refresh support after the daemon publishes replay support diagnostics.",
   "summary.title": "Latest recovery summary",
   "summary.description": "Surface the latest published doctor summary directly from diagnostics.",
   "summary.emptyTitle": "No recovery summary published",
@@ -761,7 +762,6 @@ export function SupportSection({ app }: SupportSectionProps) {
             </InlineNotice>
           </div>
         </WorkspaceSectionCard>
-
         <WorkspaceSectionCard title={t("replay.title")} description={t("replay.description")}>
           {replay === null ? (
             <EmptyState
