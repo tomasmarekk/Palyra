@@ -453,7 +453,6 @@ impl DeliveryProgressUpdate {
         }
     }
 
-    #[cfg(test)]
     #[must_use]
     pub(crate) fn flow_step(
         source_id: impl Into<String>,

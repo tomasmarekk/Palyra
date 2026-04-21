@@ -607,6 +607,12 @@ async fn collect_console_flows_diagnostics(
                 "created_at_unix_ms": event.created_at_unix_ms,
             })
         });
+        let delivery_progress = crate::flows::merge_flow_step_progress_for_delivery(
+            bundle.steps.as_slice(),
+            bundle.flow.channel.as_deref(),
+            crate::gateway::current_unix_ms(),
+        )
+        .snapshot_json();
         recent.push(json!({
             "flow_id": bundle.flow.flow_id,
             "mode": bundle.flow.mode,
@@ -618,6 +624,7 @@ async fn collect_console_flows_diagnostics(
             "step_count": bundle.steps.len(),
             "event_count": bundle.events.len(),
             "latest_event": latest_event,
+            "delivery_progress": delivery_progress,
         }));
     }
 

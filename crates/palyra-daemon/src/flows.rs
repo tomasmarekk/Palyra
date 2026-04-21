@@ -10,6 +10,10 @@ use tonic::Status;
 use ulid::Ulid;
 
 use crate::{
+    application::delivery_arbitration::{
+        merge_delivery_progress_updates, DeliveryProgressUpdate, DeliverySurface,
+        MergedDeliveryProgress,
+    },
     gateway::GatewayRuntimeState,
     journal::{
         ApprovalDecision, FlowCreateRequest, FlowListFilter, FlowRecord, FlowStepCreateRequest,
@@ -577,6 +581,47 @@ pub(crate) fn flow_adapter_contracts() -> Vec<FlowAdapterContract> {
     ]
 }
 
+pub(crate) fn merge_flow_step_progress_for_delivery(
+    steps: &[FlowStepRecord],
+    channel: Option<&str>,
+    observed_at_unix_ms: i64,
+) -> MergedDeliveryProgress {
+    let updates = steps.iter().map(flow_step_progress_update).collect::<Vec<_>>();
+    merge_delivery_progress_updates(
+        updates.as_slice(),
+        DeliverySurface::from_channel(channel),
+        observed_at_unix_ms,
+    )
+}
+
+fn flow_step_progress_update(step: &FlowStepRecord) -> DeliveryProgressUpdate {
+    let state = FlowStepState::from_str(step.state.as_str());
+    let detail = step
+        .last_error
+        .clone()
+        .or_else(|| step.waiting_reason.clone())
+        .or_else(|| (!step.adapter.trim().is_empty()).then(|| step.adapter.clone()));
+    DeliveryProgressUpdate::flow_step(
+        format!("{}/{}", step.flow_id, step.step_id),
+        step.title.clone(),
+        step.state.clone(),
+        detail,
+        state.is_some_and(|value| {
+            matches!(
+                value,
+                FlowStepState::Running
+                    | FlowStepState::WaitingForApproval
+                    | FlowStepState::Failed
+                    | FlowStepState::TimedOut
+                    | FlowStepState::Succeeded
+                    | FlowStepState::Skipped
+            )
+        }),
+        state.is_some_and(FlowStepState::is_terminal),
+        step.updated_at_unix_ms,
+    )
+}
+
 pub(crate) struct FlowCreateDescriptor {
     pub(crate) owner_principal: String,
     pub(crate) device_id: String,
@@ -934,5 +979,22 @@ mod tests {
             &[step("one", FlowStepState::Failed), dependent.clone()],
             &dependent
         ));
+    }
+
+    #[test]
+    fn flow_step_progress_merge_uses_channel_cadence_and_preserves_terminal_state() {
+        let mut failed = step("terminal", FlowStepState::Failed);
+        failed.updated_at_unix_ms = 20;
+        failed.last_error = Some("adapter failed".to_owned());
+        let merged = merge_flow_step_progress_for_delivery(
+            &[step("one", FlowStepState::Running), failed],
+            Some("discord"),
+            25,
+        );
+
+        assert_eq!(merged.presentation, "periodic_summary");
+        assert_eq!(merged.refresh_cadence_ms, 30_000);
+        assert_eq!(merged.terminal_state.as_deref(), Some("failed"));
+        assert_eq!(merged.items[0].state, "failed");
     }
 }
