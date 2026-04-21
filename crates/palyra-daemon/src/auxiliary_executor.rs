@@ -416,8 +416,10 @@ pub(crate) async fn record_auxiliary_lifecycle_event(
     run_id: Option<&str>,
     event: AuxiliaryLifecycleEventInput<'_>,
 ) -> Result<(), Status> {
-    let mut budget = RuntimeResourceBudget::default();
-    budget.token_budget = event.token_budget;
+    let budget = RuntimeResourceBudget {
+        token_budget: event.token_budget,
+        ..RuntimeResourceBudget::default()
+    };
     let payload = RuntimeDecisionPayload::new(
         RuntimeDecisionEventType::AuxiliaryTaskLifecycle,
         runtime_state

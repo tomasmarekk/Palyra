@@ -563,12 +563,11 @@ fn evaluate_delegation_scheduler_limits(
                 continue;
             }
             let group_id = running_delegation.group_id.as_str();
-            if !active_groups.iter().any(|candidate| *candidate == group_id) {
+            if !active_groups.contains(&group_id) {
                 active_groups.push(group_id);
             }
         }
-        let current_group_active =
-            active_groups.iter().any(|candidate| *candidate == delegation.group_id.as_str());
+        let current_group_active = active_groups.contains(&delegation.group_id.as_str());
         let active_group_count = u64::try_from(active_groups.len()).unwrap_or(u64::MAX);
         if !current_group_active && active_group_count >= limits.max_parallel_groups {
             return Some(DelegationSchedulerDecision::Defer {
