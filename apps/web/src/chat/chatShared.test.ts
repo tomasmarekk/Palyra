@@ -3,6 +3,7 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import type { JsonValue } from "../consoleApi";
+import { summarizeDeliveryPayload } from "./chatSessionPresentation";
 import {
   CHAT_SLASH_COMMANDS,
   buildContextBudgetSummary,
@@ -165,6 +166,46 @@ describe("chatShared helpers", () => {
     expect(describeTitleGenerationState("ready", false)).toBe("Auto title ready");
     expect(describeTitleGenerationState("pending", false)).toBe("Auto title pending");
     expect(describeTitleGenerationState("idle", true)).toBe("Manual title");
+  });
+
+  it("summarizes merged delivery progress and arbitration payloads", () => {
+    expect(
+      summarizeDeliveryPayload({
+        details: {
+          delivery: {
+            progress: {
+              title: "Delegated work completed",
+              text: "4 updates merged; latest child_run is completed.",
+              terminal_state: "completed",
+              presentation: "periodic_summary",
+              hidden_count: 2,
+            },
+          },
+        },
+      }),
+    ).toMatchObject({
+      title: "Delegated work completed",
+      status: "completed",
+      tone: "success",
+      presentation: "periodic_summary",
+      hiddenCount: 2,
+    });
+
+    expect(
+      summarizeDeliveryPayload({
+        delivery_arbitration: {
+          decision: "hold_for_review",
+          reason: "final_review_required",
+          descendant_output: {
+            preferred: false,
+          },
+        },
+      }),
+    ).toMatchObject({
+      title: "Delivery waiting for review",
+      status: "hold_for_review",
+      tone: "warning",
+    });
   });
 });
 

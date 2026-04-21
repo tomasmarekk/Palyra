@@ -455,6 +455,14 @@ export function OperationsSection({ app }: OperationsSectionProps) {
                     </td>
                   </tr>
                   <tr>
+                    <td>Delivery arbitration</td>
+                    <td>{readNumber(previewMetrics, "arbitration_suppressions") ?? 0}</td>
+                    <td>
+                      Stale parent suppressions recorded while descendant-aware delivery decisions
+                      keep full audit payloads in the runtime event stream.
+                    </td>
+                  </tr>
+                  <tr>
                     <td>Worker orphan rate</td>
                     <td>{readNumber(previewMetrics, "worker_orphan_rate_bps") ?? 0}</td>
                     <td>

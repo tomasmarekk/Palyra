@@ -42,6 +42,7 @@ pub(crate) struct RouteMessageOutputTemplate<'a> {
     pub(crate) attachments: &'a [common_v1::MessageAttachment],
     pub(crate) structured_json: &'a [u8],
     pub(crate) a2ui_update: Option<&'a common_v1::A2uiUpdate>,
+    pub(crate) delivery_metadata: Option<&'a Value>,
 }
 
 pub(crate) fn parse_route_message_structured_output(
@@ -78,6 +79,7 @@ pub(crate) fn build_route_message_outputs(
         .unwrap_or(DEFAULT_ROUTE_MESSAGE_OUTPUT_MAX_BYTES)
         .min(DEFAULT_ROUTE_MESSAGE_OUTPUT_MAX_BYTES);
     let chunks = split_route_message_reply_text(reply_text, max_bytes);
+    let first_structured_json = build_route_message_first_structured_json(template);
     let mut outputs = Vec::with_capacity(chunks.len());
     for (index, chunk) in chunks.into_iter().enumerate() {
         outputs.push(gateway_v1::OutboundMessage {
@@ -96,15 +98,24 @@ pub(crate) fn build_route_message_outputs(
             } else {
                 String::new()
             },
-            structured_json: if index == 0 {
-                template.structured_json.to_vec()
-            } else {
-                Vec::new()
-            },
+            structured_json: if index == 0 { first_structured_json.clone() } else { Vec::new() },
             a2ui_update: if index == 0 { template.a2ui_update.cloned() } else { None },
         });
     }
     outputs
+}
+
+fn build_route_message_first_structured_json(template: &RouteMessageOutputTemplate<'_>) -> Vec<u8> {
+    if !template.structured_json.is_empty() {
+        return template.structured_json.to_vec();
+    }
+    let Some(delivery_metadata) = template.delivery_metadata else {
+        return Vec::new();
+    };
+    serde_json::to_vec(&serde_json::json!({
+        "delivery": delivery_metadata,
+    }))
+    .unwrap_or_default()
 }
 
 #[allow(clippy::result_large_err)]
@@ -215,4 +226,61 @@ fn parse_route_message_a2ui_update(value: &Value) -> Option<common_v1::A2uiUpdat
         return None;
     }
     Some(common_v1::A2uiUpdate { v: CANONICAL_PROTOCOL_MAJOR, surface, patch_json })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_route_message_outputs, RouteMessageOutputTemplate};
+    use serde_json::json;
+
+    fn output_template<'a>(
+        structured_json: &'a [u8],
+        delivery_metadata: Option<&'a serde_json::Value>,
+    ) -> RouteMessageOutputTemplate<'a> {
+        RouteMessageOutputTemplate {
+            thread_id: "thread",
+            in_reply_to_message_id: "message",
+            broadcast: false,
+            auto_ack_text: "",
+            auto_reaction: "",
+            attachments: &[],
+            structured_json,
+            a2ui_update: None,
+            delivery_metadata,
+        }
+    }
+
+    #[test]
+    fn route_outputs_attach_delivery_metadata_when_structured_json_is_empty() {
+        let delivery_metadata = json!({
+            "policy": {
+                "policy_id": "delivery_arbitration.v1",
+                "surface": "external_channel",
+            }
+        });
+        let outputs = build_route_message_outputs(
+            "hello",
+            2_000,
+            &output_template(&[], Some(&delivery_metadata)),
+        );
+
+        assert_eq!(outputs.len(), 1);
+        let structured: serde_json::Value =
+            serde_json::from_slice(outputs[0].structured_json.as_slice())
+                .expect("delivery metadata should be valid json");
+        assert_eq!(structured["delivery"], delivery_metadata);
+    }
+
+    #[test]
+    fn route_outputs_preserve_model_structured_json_over_delivery_metadata() {
+        let structured_json = br#"{"model":true}"#;
+        let delivery_metadata = json!({ "policy": "delivery_arbitration.v1" });
+        let outputs = build_route_message_outputs(
+            "hello",
+            2_000,
+            &output_template(structured_json, Some(&delivery_metadata)),
+        );
+
+        assert_eq!(outputs[0].structured_json, structured_json);
+    }
 }

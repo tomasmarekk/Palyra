@@ -668,7 +668,35 @@ pub fn runtime_acceptance_fixture_catalog() -> Value {
             "task_kind": "delegation_prompt",
             "parent_run_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
             "child_run_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
-            "delivery_policy": "merge_progress_updates"
+            "delivery_policy": "merge_progress_updates",
+            "delivery_arbitration": {
+                "policy_id": "delivery_arbitration.v1",
+                "policies": [
+                    "deliver_interim_parent",
+                    "merge_progress_updates",
+                    "prefer_terminal_descendant",
+                    "suppress_stale_parent",
+                    "require_final_review"
+                ],
+                "preferred_terminal_output": "child_run",
+                "stale_parent_action": "suppress_or_annotate",
+                "audit_retained": true,
+                "approval_required_blocks_final_delivery": true
+            },
+            "progress_merge": {
+                "source_kinds": ["child_run", "flow_step", "approval_wait"],
+                "web_chat": {
+                    "presentation": "inline_timeline",
+                    "refresh_cadence_ms": 1000,
+                    "max_items": 8
+                },
+                "external_channel": {
+                    "presentation": "periodic_summary",
+                    "refresh_cadence_ms": 30000,
+                    "max_items": 4
+                },
+                "terminal_state_visible": true
+            }
         },
         "replay_bundle": {
             "bundle_id": "replay-preview-bundle",
@@ -803,7 +831,23 @@ mod tests {
             fixture["workspace_patch"]["rollback_smoke"]["restore_target"],
             "preflight_checkpoint"
         );
-        assert!(fixture.get("delegated_child_run").is_some());
+        assert_eq!(
+            fixture["delegated_child_run"]["delivery_arbitration"]["policy_id"],
+            "delivery_arbitration.v1"
+        );
+        assert_eq!(
+            fixture["delegated_child_run"]["delivery_arbitration"]["preferred_terminal_output"],
+            "child_run"
+        );
+        assert_eq!(
+            fixture["delegated_child_run"]["progress_merge"]["source_kinds"],
+            json!(["child_run", "flow_step", "approval_wait"])
+        );
+        assert_eq!(
+            fixture["delegated_child_run"]["progress_merge"]["external_channel"]
+                ["refresh_cadence_ms"],
+            30000
+        );
         assert!(fixture.get("replay_bundle").is_some());
         assert!(fixture.get("worker_lease").is_some());
     }

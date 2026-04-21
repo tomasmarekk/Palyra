@@ -211,6 +211,22 @@ export function ChatTranscript({
 
                 {entry.text !== undefined && <p className="chat-entry-text">{entry.text}</p>}
 
+                {entry.kind === "delivery" ? (
+                  <div className="workspace-inline-actions">
+                    <StatusChip tone={entry.delivery_tone ?? toneForDeliveryStatus(entry.status)}>
+                      {entry.status ?? "delivery"}
+                    </StatusChip>
+                    {entry.delivery_presentation !== undefined ? (
+                      <StatusChip tone="default">{entry.delivery_presentation}</StatusChip>
+                    ) : null}
+                    {entry.delivery_hidden_count !== undefined && entry.delivery_hidden_count > 0 ? (
+                      <StatusChip tone="warning">
+                        {entry.delivery_hidden_count} merged offscreen
+                      </StatusChip>
+                    ) : null}
+                  </div>
+                ) : null}
+
                 {entry.attachments !== undefined && entry.attachments.length > 0 ? (
                   <div className="chat-entry__attachment-list">
                     {entry.attachments.map((attachment) => (
@@ -362,5 +378,27 @@ function toneForDerivedArtifactState(
       return "danger";
     default:
       return "default";
+  }
+}
+
+function toneForDeliveryStatus(
+  status: string | undefined,
+): "default" | "accent" | "success" | "warning" | "danger" {
+  switch (status) {
+    case "failed":
+    case "transport_error":
+      return "danger";
+    case "waiting_for_approval":
+    case "hold_for_review":
+    case "cancelled":
+    case "canceled":
+      return "warning";
+    case "completed":
+    case "done":
+    case "suppressed":
+    case "prefer_terminal_descendant":
+      return "success";
+    default:
+      return "accent";
   }
 }

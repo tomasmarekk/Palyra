@@ -3,6 +3,7 @@ pub mod auth;
 pub mod channels;
 pub mod context_engine;
 pub mod context_references;
+pub mod delivery_arbitration;
 pub mod execution_gate;
 pub mod learning;
 pub mod memory;

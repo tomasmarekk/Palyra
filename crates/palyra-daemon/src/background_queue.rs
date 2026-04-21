@@ -2,7 +2,14 @@
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use palyra_common::runtime_contracts::AuxiliaryTaskState;
+use palyra_common::{
+    runtime_contracts::AuxiliaryTaskState,
+    runtime_preview::{
+        RuntimeDecisionActor, RuntimeDecisionActorKind, RuntimeDecisionEventType,
+        RuntimeDecisionPayload, RuntimeDecisionTiming, RuntimeEntityRef, RuntimePreviewCapability,
+        RuntimeResourceBudget,
+    },
+};
 use serde_json::{json, Value};
 use tokio::time::MissedTickBehavior;
 use tokio_stream::StreamExt;
@@ -11,7 +18,14 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::{
-    application::learning::{process_post_run_reflection_task, REFLECTION_TASK_KIND},
+    application::{
+        delivery_arbitration::{
+            arbitrate_delivery, delivery_review_summary, merge_delivery_progress_updates,
+            resolve_delivery_policy, DeliveryDecision, DeliveryDecisionInput, DeliveryPolicySet,
+            DeliveryProgressUpdate, MergedDeliveryProgress, DELIVERY_ARBITRATION_POLICY_ID,
+        },
+        learning::{process_post_run_reflection_task, REFLECTION_TASK_KIND},
+    },
     auxiliary_executor::{execute_auxiliary_task, AuxiliaryExecutionRequest, AuxiliaryTaskType},
     delegation::{
         DelegationExecutionMode, DelegationMergeApprovalSummary, DelegationMergeArtifactReference,
@@ -35,6 +49,7 @@ const BACKGROUND_QUEUE_IDLE_SLEEP: Duration = Duration::from_secs(3);
 const DEFAULT_BACKGROUND_CHANNEL: &str = "console:background";
 const CHILD_PROGRESS_MIN_INTERVAL_MS: i64 = 2_000;
 const CHILD_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const CHILD_PROGRESS_HISTORY_LIMIT: usize = 64;
 
 pub(crate) fn spawn_background_queue_loop(
     runtime: Arc<GatewayRuntimeState>,
@@ -853,6 +868,17 @@ async fn run_background_task_stream(
 
     append_parent_spawned_event(runtime, task, run_id).await?;
 
+    let delivery_policy = resolve_delivery_policy(
+        &runtime.config.delivery_arbitration,
+        task.delegation.as_ref(),
+        None,
+        task.channel.as_deref(),
+    );
+    let delivery_progress_active = crate::runtime_preview_controls::capability_active(
+        &runtime.config,
+        RuntimePreviewCapability::DeliveryArbitration,
+    );
+    let mut delivery_progress_updates = Vec::<DeliveryProgressUpdate>::new();
     let mut stream_error = None::<String>;
     let mut latest_child_state = "running".to_owned();
     let mut last_progress_at_unix_ms = 0_i64;
@@ -870,11 +896,31 @@ async fn run_background_task_stream(
                         {
                             latest_child_state = progress.child_state.clone();
                             let now = crate::gateway::current_unix_ms();
+                            if delivery_progress_active {
+                                delivery_progress_updates.push(
+                                    progress.to_delivery_progress_update(run_id, now),
+                                );
+                                trim_delivery_progress_history(&mut delivery_progress_updates);
+                            }
                             let should_emit = progress.event_type != "child_progress"
                                 || progress.user_visible
                                 || now.saturating_sub(last_progress_at_unix_ms)
                                     >= CHILD_PROGRESS_MIN_INTERVAL_MS;
                             if should_emit {
+                                let details = if delivery_progress_active {
+                                    let merged_progress = merge_delivery_progress_updates(
+                                        delivery_progress_updates.as_slice(),
+                                        delivery_policy.surface,
+                                        now,
+                                    );
+                                    attach_delivery_progress_details(
+                                        progress.details,
+                                        &delivery_policy,
+                                        &merged_progress,
+                                    )
+                                } else {
+                                    progress.details
+                                };
                                 append_child_lifecycle_event(
                                     runtime,
                                     task,
@@ -882,7 +928,7 @@ async fn run_background_task_stream(
                                     progress.event_type,
                                     progress.child_state.as_str(),
                                     progress.user_visible,
-                                    progress.details,
+                                    details,
                                 )
                                 .await?;
                                 last_progress_at_unix_ms = now;
@@ -1193,6 +1239,31 @@ struct ChildStreamProgress {
     child_state: String,
     user_visible: bool,
     details: Value,
+}
+
+impl ChildStreamProgress {
+    fn to_delivery_progress_update(
+        &self,
+        child_run_id: &str,
+        observed_at_unix_ms: i64,
+    ) -> DeliveryProgressUpdate {
+        let detail = delivery_progress_detail(&self.details);
+        if self.event_type == "child_waiting" || self.child_state == "waiting_for_approval" {
+            return DeliveryProgressUpdate::approval_wait(
+                child_run_id.to_owned(),
+                detail,
+                observed_at_unix_ms,
+            );
+        }
+        DeliveryProgressUpdate::child_run(
+            child_run_id.to_owned(),
+            self.child_state.clone(),
+            detail,
+            self.user_visible,
+            is_terminal_child_progress(self.event_type, self.child_state.as_str()),
+            observed_at_unix_ms,
+        )
+    }
 }
 
 fn summarize_child_stream_event(
@@ -1721,6 +1792,8 @@ async fn append_parent_merge_event(
         "cancelled" => "child_run_cancelled",
         _ => "child_run_merged",
     };
+    let (delivery_policy, delivery_decision) =
+        evaluate_delivery_arbitration_for_merge(runtime, task, run, merge_result).await?;
     append_parent_tape_event(
         runtime,
         parent_run_id,
@@ -1730,9 +1803,13 @@ async fn append_parent_merge_event(
             "child_run_id": run.run_id,
             "child_state": run.state,
             "merge_result": merge_result,
+            "delivery_review": delivery_review_summary(&merge_result.approval_summary),
+            "delivery_arbitration": delivery_decision.explain_json.clone(),
         }),
     )
     .await?;
+    emit_delivery_arbitration_audit(runtime, task, run, &delivery_policy, &delivery_decision)
+        .await?;
     let (child_event_type, child_state) = match run.state.as_str() {
         "done" => ("child_completed", "completed"),
         "failed" => ("child_failed", "failed"),
@@ -1749,9 +1826,126 @@ async fn append_parent_merge_event(
         json!({
             "legacy_event_type": event_type,
             "merge_result": merge_result,
+            "delivery_review": delivery_review_summary(&merge_result.approval_summary),
+            "delivery_arbitration": delivery_decision.explain_json.clone(),
         }),
     )
     .await
+}
+
+async fn evaluate_delivery_arbitration_for_merge(
+    runtime: &Arc<GatewayRuntimeState>,
+    task: &OrchestratorBackgroundTaskRecord,
+    run: &crate::journal::OrchestratorRunStatusSnapshot,
+    merge_result: &DelegationMergeResult,
+) -> Result<(DeliveryPolicySet, DeliveryDecision), Status> {
+    let parent_state = if let Some(parent_run_id) = task.parent_run_id.as_deref() {
+        runtime
+            .orchestrator_run_status_snapshot(parent_run_id.to_owned())
+            .await?
+            .map(|snapshot| snapshot.state)
+    } else {
+        None
+    };
+    let policy = resolve_delivery_policy(
+        &runtime.config.delivery_arbitration,
+        task.delegation.as_ref(),
+        None,
+        task.channel.as_deref(),
+    );
+    let approval_summary = &merge_result.approval_summary;
+    let decision = arbitrate_delivery(DeliveryDecisionInput {
+        policy: &policy,
+        parent_run_id: task.parent_run_id.as_deref(),
+        parent_state: parent_state.as_deref(),
+        descendant_run_id: Some(run.run_id.as_str()),
+        descendant_state: run.state.as_str(),
+        approval_required: merge_result.approval_required || approval_summary.approval_required,
+        approval_events: approval_summary.approval_events,
+        approval_pending: approval_summary.approval_pending,
+        approval_denied: approval_summary.approval_denied,
+        observed_at_unix_ms: crate::gateway::current_unix_ms(),
+    });
+    Ok((policy, decision))
+}
+
+async fn emit_delivery_arbitration_audit(
+    runtime: &Arc<GatewayRuntimeState>,
+    task: &OrchestratorBackgroundTaskRecord,
+    run: &crate::journal::OrchestratorRunStatusSnapshot,
+    policy: &DeliveryPolicySet,
+    decision: &DeliveryDecision,
+) -> Result<(), Status> {
+    if !crate::runtime_preview_controls::capability_active(
+        &runtime.config,
+        RuntimePreviewCapability::DeliveryArbitration,
+    ) {
+        return Ok(());
+    }
+    let Some(parent_run_id) = task.parent_run_id.as_deref() else {
+        return Ok(());
+    };
+    append_parent_tape_event(
+        runtime,
+        parent_run_id,
+        "delivery.arbitrated",
+        decision.explain_json.clone(),
+    )
+    .await?;
+
+    let payload = RuntimeDecisionPayload::new(
+        RuntimeDecisionEventType::DeliveryArbitration,
+        RuntimeDecisionActor::new(
+            RuntimeDecisionActorKind::System,
+            task.owner_principal.clone(),
+            task.device_id.clone(),
+            task.channel.clone(),
+        ),
+        decision.reason.clone(),
+        DELIVERY_ARBITRATION_POLICY_ID,
+        RuntimeDecisionTiming::observed(crate::gateway::current_unix_ms()),
+    )
+    .with_input(
+        RuntimeEntityRef::new("candidate_parent", "orchestrator_run", parent_run_id.to_owned())
+            .with_state(
+                decision.explain_json["parent_output"]["state"]
+                    .as_str()
+                    .unwrap_or("unknown")
+                    .to_owned(),
+            ),
+    )
+    .with_output(
+        RuntimeEntityRef::new("preferred_descendant", "orchestrator_run", run.run_id.clone())
+            .with_state(run.state.clone()),
+    )
+    .with_resource_budget(RuntimeResourceBudget {
+        queue_depth: None,
+        token_budget: None,
+        pruning_token_delta: None,
+        retrieval_branch_latency_ms: None,
+        retry_count: None,
+        suppression_count: Some(decision.suppression_count()),
+    })
+    .with_related_entity(RuntimeEntityRef::new(
+        "background_task",
+        "orchestrator_background_task",
+        task.task_id.clone(),
+    ))
+    .with_details(json!({
+        "policy": policy.snapshot_json(),
+        "decision": decision.explain_json.clone(),
+    }));
+
+    runtime
+        .record_system_runtime_decision_event(
+            task.owner_principal.as_str(),
+            task.device_id.as_str(),
+            task.channel.as_deref(),
+            Some(task.session_id.as_str()),
+            Some(parent_run_id),
+            payload,
+        )
+        .await
 }
 
 async fn append_child_lifecycle_event(
@@ -1827,6 +2021,53 @@ fn truncate_excerpt(value: &str, max_chars: usize) -> String {
         excerpt.push_str("...");
     }
     excerpt
+}
+
+fn delivery_progress_detail(details: &Value) -> Option<String> {
+    if let Some(message) = details.get("message").and_then(Value::as_str) {
+        return Some(truncate_excerpt(message, 180));
+    }
+    if let Some(state) = details.get("state").and_then(Value::as_str) {
+        return Some(truncate_excerpt(state, 180));
+    }
+    let excerpt = truncate_excerpt(value_excerpt(details).as_str(), 180);
+    (!excerpt.is_empty()).then_some(excerpt)
+}
+
+fn is_terminal_child_progress(event_type: &str, child_state: &str) -> bool {
+    event_type == "child_completed"
+        || event_type == "child_failed"
+        || matches!(child_state, "completed" | "failed" | "cancelled" | "canceled")
+}
+
+fn trim_delivery_progress_history(updates: &mut Vec<DeliveryProgressUpdate>) {
+    if updates.len() <= CHILD_PROGRESS_HISTORY_LIMIT {
+        return;
+    }
+    let remove_count = updates.len().saturating_sub(CHILD_PROGRESS_HISTORY_LIMIT);
+    updates.drain(0..remove_count);
+}
+
+fn attach_delivery_progress_details(
+    details: Value,
+    policy: &DeliveryPolicySet,
+    merged_progress: &MergedDeliveryProgress,
+) -> Value {
+    let delivery = json!({
+        "policy": policy.snapshot_json(),
+        "progress": merged_progress.snapshot_json(),
+    });
+    match details {
+        Value::Object(mut object) => {
+            object.insert("delivery".to_owned(), delivery);
+            Value::Object(object)
+        }
+        Value::Null => json!({ "delivery": delivery }),
+        other => json!({
+            "raw_details": other,
+            "delivery": delivery,
+        }),
+    }
 }
 
 fn inject_background_metadata(

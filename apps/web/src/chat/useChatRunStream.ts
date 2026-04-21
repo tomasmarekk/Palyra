@@ -16,6 +16,7 @@ import type {
   ConsoleApiClient,
   JsonValue,
 } from "../consoleApi";
+import { summarizeDeliveryPayload } from "./chatSessionPresentation";
 
 import {
   DEFAULT_APPROVAL_SCOPE,
@@ -469,6 +470,24 @@ export function useChatRunStream({
       return;
     }
 
+    const deliverySummary = summarizeDeliveryPayload(event);
+    if (deliverySummary !== null || isDeliveryEventType(event.event_type)) {
+      appendTranscriptEntry({
+        id: `delivery-${Date.now()}`,
+        kind: "delivery",
+        created_at_unix_ms: Date.now(),
+        run_id: runId,
+        title: deliverySummary?.title ?? prettifyEventType(event.event_type),
+        text: deliverySummary?.text,
+        status: deliverySummary?.status,
+        delivery_tone: deliverySummary?.tone,
+        delivery_presentation: deliverySummary?.presentation,
+        delivery_hidden_count: deliverySummary?.hiddenCount,
+        payload: event,
+      });
+      return;
+    }
+
     if (event.event_type === "journal_event") {
       appendTranscriptEntry({
         id: `journal-${Date.now()}`,
@@ -608,6 +627,18 @@ export function useChatRunStream({
       return reason;
     }
     return `${kind}: ${reason}`;
+  }
+
+  function isDeliveryEventType(eventType: string): boolean {
+    return (
+      eventType === "delivery.arbitrated" ||
+      eventType === "runtime.delivery.arbitration" ||
+      eventType === "child_progress" ||
+      eventType === "child_waiting" ||
+      eventType === "child_completed" ||
+      eventType === "child_failed" ||
+      eventType === "child_run_merged"
+    );
   }
 
   function flushPendingStreamUpdates(): void {

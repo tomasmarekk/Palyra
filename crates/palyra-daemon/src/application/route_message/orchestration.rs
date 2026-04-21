@@ -1,6 +1,6 @@
 use std::sync::{atomic::Ordering, Arc};
 
-use palyra_common::CANONICAL_PROTOCOL_MAJOR;
+use palyra_common::{runtime_preview::RuntimePreviewCapability, CANONICAL_PROTOCOL_MAJOR};
 use serde_json::json;
 use tonic::Status;
 use tracing::warn;
@@ -8,10 +8,13 @@ use ulid::Ulid;
 
 use crate::{
     agents::AgentResolveRequest,
-    application::provider_input::{
-        prepare_model_provider_input, MemoryPromptFailureMode, PrepareModelProviderInputRequest,
+    application::{
+        delivery_arbitration::resolve_delivery_policy,
+        provider_input::{
+            prepare_model_provider_input, MemoryPromptFailureMode, PrepareModelProviderInputRequest,
+        },
+        service_authorization::authorize_message_action,
     },
-    application::service_authorization::authorize_message_action,
     channel_router::{
         InboundMessage as ChannelInboundMessage, RetryDisposition, RoutePlan as ChannelRoutePlan,
     },
@@ -472,6 +475,23 @@ pub(crate) async fn handle_routed_route_message(
         "route_message_model_summary",
     )
     .await;
+    let route_delivery_policy = resolve_delivery_policy(
+        &runtime_state.config.delivery_arbitration,
+        None,
+        None,
+        Some(plan.channel.as_str()),
+    );
+    let route_delivery_metadata = crate::runtime_preview_controls::capability_active(
+        &runtime_state.config,
+        RuntimePreviewCapability::DeliveryArbitration,
+    )
+    .then(|| {
+        json!({
+            "policy": route_delivery_policy.snapshot_json(),
+            "decision": "deliver_interim_parent",
+            "reason": "route_message_channel_default",
+        })
+    });
     runtime_state
         .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
             run_id: run_id.clone(),
@@ -489,6 +509,7 @@ pub(crate) async fn handle_routed_route_message(
                 "attachments": route_attachment_metadata.clone(),
                 "agent_id": route_agent_id.clone(),
                 "agent_resolution_source": route_agent_resolution_source.clone(),
+                "delivery_policy": route_delivery_policy.snapshot_json(),
             })
             .to_string(),
         })
@@ -546,6 +567,7 @@ pub(crate) async fn handle_routed_route_message(
             "attachments": route_attachment_metadata,
             "agent_id": route_agent_id,
             "agent_resolution_source": route_agent_resolution_source,
+            "delivery_policy": route_delivery_policy.snapshot_json(),
             "config_hash": route_config_hash,
             "actor": {
                 "connector_channel": actor_connector,
@@ -567,6 +589,7 @@ pub(crate) async fn handle_routed_route_message(
         attachments: route_output_attachments.as_slice(),
         structured_json: route_structured_output.structured_json.as_slice(),
         a2ui_update: route_structured_output.a2ui_update.as_ref(),
+        delivery_metadata: route_delivery_metadata.as_ref(),
     };
     let route_outputs = build_route_message_outputs(
         reply_text.as_str(),

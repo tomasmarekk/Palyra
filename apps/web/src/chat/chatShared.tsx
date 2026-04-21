@@ -97,6 +97,7 @@ export type TranscriptEntryKind =
   | "approval_response"
   | "a2ui"
   | "canvas"
+  | "delivery"
   | "journal"
   | "error"
   | "complete"
@@ -117,6 +118,9 @@ export interface TranscriptEntry {
   readonly surface?: string;
   readonly canvas_url?: string;
   readonly status?: string;
+  readonly delivery_tone?: "default" | "accent" | "success" | "warning" | "danger";
+  readonly delivery_presentation?: string;
+  readonly delivery_hidden_count?: number;
   readonly is_final?: boolean;
   readonly attachments?: TranscriptAttachmentSummary[];
 }

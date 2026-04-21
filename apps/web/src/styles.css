@@ -823,6 +823,10 @@ pre {
   background: color-mix(in oklab, var(--warning) 8%, var(--surface));
 }
 
+.chat-entry--delivery {
+  background: color-mix(in oklab, var(--success) 5%, var(--surface));
+}
+
 .chat-entry-header {
   display: flex;
   justify-content: space-between;
