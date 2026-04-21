@@ -1183,6 +1183,9 @@ export interface WorkspaceCheckpointSummary {
   run_id: string;
   source_kind: string;
   source_label: string;
+  checkpoint_stage: string;
+  mutation_id?: string;
+  paired_checkpoint_id?: string;
   tool_name?: string;
   proposal_id?: string;
   actor_principal: string;
@@ -1190,6 +1193,9 @@ export interface WorkspaceCheckpointSummary {
   channel?: string;
   summary_text: string;
   diff_summary: JsonValue;
+  compare_summary: JsonValue;
+  risk_level: string;
+  review_posture: string;
   created_at_unix_ms: number;
   restore_count: number;
   last_restored_at_unix_ms?: number;
@@ -1313,6 +1319,9 @@ export interface WorkspaceCheckpointRecord {
   run_id: string;
   source_kind: string;
   source_label: string;
+  checkpoint_stage: string;
+  mutation_id?: string;
+  paired_checkpoint_id?: string;
   tool_name?: string;
   proposal_id?: string;
   actor_principal: string;
@@ -1320,6 +1329,9 @@ export interface WorkspaceCheckpointRecord {
   channel?: string;
   summary_text: string;
   diff_summary_json: string;
+  compare_summary_json: string;
+  risk_level: string;
+  review_posture: string;
   created_at_unix_ms: number;
   restore_count: number;
   last_restored_at_unix_ms?: number;
@@ -1371,11 +1383,20 @@ export interface WorkspaceRestoreReportDetail {
 
 export interface WorkspaceRestoreActivitySummary {
   checkpoint_count: number;
+  preflight_checkpoint_count: number;
+  post_change_checkpoint_count: number;
+  paired_checkpoint_count: number;
+  missing_checkpoint_pair_count: number;
+  high_risk_mutation_count: number;
+  review_required_mutation_count: number;
   checkpoint_restore_total: number;
   restore_report_count: number;
   succeeded_restore_count: number;
   partial_failure_restore_count: number;
   failed_restore_count: number;
+  restore_success_rate_bps: number;
+  missing_checkpoint_pair_rate_bps: number;
+  high_risk_mutation_rate_bps: number;
 }
 
 export interface WorkspaceActivitySnapshot {
@@ -3125,11 +3146,20 @@ export interface InventoryDeviceDetailEnvelope {
 
 export interface InventoryWorkspaceRestoreSummary {
   checkpoint_count: number;
+  preflight_checkpoint_count: number;
+  post_change_checkpoint_count: number;
+  paired_checkpoint_count: number;
+  missing_checkpoint_pair_count: number;
+  high_risk_mutation_count: number;
+  review_required_mutation_count: number;
   checkpoint_restore_total: number;
   restore_report_count: number;
   succeeded_restore_count: number;
   partial_failure_restore_count: number;
   failed_restore_count: number;
+  restore_success_rate_bps: number;
+  missing_checkpoint_pair_rate_bps: number;
+  high_risk_mutation_rate_bps: number;
 }
 
 export interface InventoryWorkspaceCheckpointRecord {
@@ -3138,12 +3168,18 @@ export interface InventoryWorkspaceCheckpointRecord {
   run_id: string;
   source_kind: string;
   source_label: string;
+  checkpoint_stage: string;
+  mutation_id?: string;
+  paired_checkpoint_id?: string;
   tool_name?: string;
   proposal_id?: string;
   actor_principal: string;
   device_id: string;
   channel?: string;
   summary_text: string;
+  compare_summary?: JsonValue;
+  risk_level: string;
+  review_posture: string;
   created_at_unix_ms: number;
   restore_count: number;
   last_restored_at_unix_ms?: number;

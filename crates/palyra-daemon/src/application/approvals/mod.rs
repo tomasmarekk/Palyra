@@ -21,6 +21,8 @@ use crate::{
     transport::grpc::{auth::RequestContext, proto::palyra::common::v1 as common_v1},
 };
 
+const WORKSPACE_PATCH_TOOL_NAME: &str = "palyra.fs.apply_patch";
+
 #[derive(Debug, Clone)]
 pub(crate) struct PendingToolApproval {
     pub(crate) approval_id: String,
@@ -129,6 +131,9 @@ pub(crate) fn build_pending_tool_approval(
             "reason": execution_context.reason,
             "agent_id": execution_context.agent_id,
         });
+    }
+    if tool_name == WORKSPACE_PATCH_TOOL_NAME {
+        details["workspace_safety"] = workspace_patch_approval_context(input_json);
     }
     let prompt = ApprovalPromptRecord {
         title: format!("Approve {}", tool_name),
@@ -265,6 +270,75 @@ fn build_tool_policy_snapshot(config: &ToolCallConfig, tool_name: &str) -> Appro
             "action=tool.execute resource=tool:{tool_name} approval_required=true deny_by_default=true"
         ),
     }
+}
+
+fn workspace_patch_approval_context(input_json: &[u8]) -> Value {
+    let parsed = serde_json::from_slice::<Value>(input_json).unwrap_or(Value::Null);
+    let patch = parsed.get("patch").and_then(Value::as_str).unwrap_or_default();
+    json!({
+        "checkpoint_flow": "preflight -> post_change",
+        "preflight_checkpoint_required": true,
+        "post_change_checkpoint_required": true,
+        "compare_available_after_execution": true,
+        "restore_target": "preflight_checkpoint",
+        "review_posture": "review_required",
+        "policy_hooks": workspace_patch_policy_hooks(patch),
+        "paths": workspace_patch_header_paths(patch),
+        "degrade_behavior": {
+            "high_risk": "fail_closed_without_preflight",
+            "low_or_medium_risk": "explicit_tool_result_degradation"
+        },
+    })
+}
+
+fn workspace_patch_policy_hooks(patch: &str) -> Vec<&'static str> {
+    let paths = workspace_patch_header_paths(patch);
+    let mut hooks = vec!["workspace_source_code"];
+    if paths.iter().any(|path| {
+        let lower = path.to_ascii_lowercase();
+        lower.ends_with(".toml")
+            || lower.ends_with(".yaml")
+            || lower.ends_with(".yml")
+            || lower.ends_with(".json")
+    }) {
+        hooks.push("config");
+    }
+    if paths.iter().any(|path| {
+        let lower = path.to_ascii_lowercase();
+        lower.contains("/generated/") || lower.starts_with("schemas/generated/")
+    }) {
+        hooks.push("generated_artifacts");
+    }
+    if paths.iter().any(|path| {
+        let lower = path.to_ascii_lowercase();
+        lower.ends_with(".md") || lower.starts_with("docs/")
+    }) {
+        hooks.push("docs");
+    }
+    if paths.len() > 8 {
+        hooks.push("bulk_patch");
+    }
+    hooks
+}
+
+fn workspace_patch_header_paths(patch: &str) -> Vec<String> {
+    const PATH_PREFIXES: &[&str] =
+        &["*** Add File: ", "*** Update File: ", "*** Delete File: ", "*** Move to: "];
+    let mut paths = Vec::new();
+    for line in patch.lines() {
+        let Some(path) = PATH_PREFIXES.iter().find_map(|prefix| line.strip_prefix(prefix)) else {
+            continue;
+        };
+        let normalized = path.trim();
+        if normalized.is_empty() || paths.iter().any(|existing| existing == normalized) {
+            continue;
+        }
+        paths.push(truncate_with_ellipsis(normalized.to_owned(), 256));
+        if paths.len() >= 16 {
+            break;
+        }
+    }
+    paths
 }
 
 pub(crate) fn approval_risk_for_tool(
@@ -452,6 +526,40 @@ mod tests {
     use super::*;
     use serde_json::Value;
 
+    fn test_tool_call_config(allowed_tool: &str) -> ToolCallConfig {
+        ToolCallConfig {
+            allowed_tools: vec![allowed_tool.to_owned()],
+            max_calls_per_run: 1,
+            execution_timeout_ms: 250,
+            process_runner: crate::sandbox_runner::SandboxProcessRunnerPolicy {
+                enabled: true,
+                tier: crate::sandbox_runner::SandboxProcessRunnerTier::B,
+                workspace_root: std::env::current_dir().expect("current_dir should resolve"),
+                allowed_executables: vec!["cargo".to_owned()],
+                allow_interpreters: false,
+                egress_enforcement_mode: crate::sandbox_runner::EgressEnforcementMode::Preflight,
+                allowed_egress_hosts: Vec::new(),
+                allowed_dns_suffixes: Vec::new(),
+                cpu_time_limit_ms: 1_000,
+                memory_limit_bytes: 1_048_576,
+                max_output_bytes: 1_048_576,
+            },
+            wasm_runtime: crate::wasm_plugin_runner::WasmPluginRunnerPolicy {
+                enabled: false,
+                allow_inline_modules: false,
+                max_module_size_bytes: 256 * 1024,
+                fuel_budget: 1_000_000,
+                max_memory_bytes: 64 * 1024 * 1024,
+                max_table_elements: 1_024,
+                max_instances: 8,
+                allowed_http_hosts: Vec::new(),
+                allowed_secrets: Vec::new(),
+                allowed_storage_prefixes: Vec::new(),
+                allowed_channels: Vec::new(),
+            },
+        }
+    }
+
     #[test]
     fn approval_resolved_payload_includes_proposal_id_when_available() {
         let payload = approval_resolved_journal_payload(
@@ -537,37 +645,7 @@ mod tests {
             reason: "attested worker fleet is available".to_owned(),
             agent_id: Some("agent.networked".to_owned()),
         };
-        let config = ToolCallConfig {
-            allowed_tools: vec!["palyra.process.run".to_owned()],
-            max_calls_per_run: 1,
-            execution_timeout_ms: 250,
-            process_runner: crate::sandbox_runner::SandboxProcessRunnerPolicy {
-                enabled: true,
-                tier: crate::sandbox_runner::SandboxProcessRunnerTier::B,
-                workspace_root: std::env::current_dir().expect("current_dir should resolve"),
-                allowed_executables: vec!["cargo".to_owned()],
-                allow_interpreters: false,
-                egress_enforcement_mode: crate::sandbox_runner::EgressEnforcementMode::Preflight,
-                allowed_egress_hosts: Vec::new(),
-                allowed_dns_suffixes: Vec::new(),
-                cpu_time_limit_ms: 1_000,
-                memory_limit_bytes: 1_048_576,
-                max_output_bytes: 1_048_576,
-            },
-            wasm_runtime: crate::wasm_plugin_runner::WasmPluginRunnerPolicy {
-                enabled: false,
-                allow_inline_modules: false,
-                max_module_size_bytes: 256 * 1024,
-                fuel_budget: 1_000_000,
-                max_memory_bytes: 64 * 1024 * 1024,
-                max_table_elements: 1_024,
-                max_instances: 8,
-                allowed_http_hosts: Vec::new(),
-                allowed_secrets: Vec::new(),
-                allowed_storage_prefixes: Vec::new(),
-                allowed_channels: Vec::new(),
-            },
-        };
+        let config = test_tool_call_config("palyra.process.run");
         let pending = build_pending_tool_approval(
             "palyra.process.run",
             None,
@@ -592,6 +670,43 @@ mod tests {
                 .and_then(|value| value.get("reason_code"))
                 .and_then(Value::as_str),
             Some("backend.available.networked_worker")
+        );
+    }
+
+    #[test]
+    fn workspace_patch_approval_embeds_rollback_path_context() {
+        let config = test_tool_call_config(WORKSPACE_PATCH_TOOL_NAME);
+        let pending = build_pending_tool_approval(
+            WORKSPACE_PATCH_TOOL_NAME,
+            None,
+            br#"{"patch":"*** Begin Patch\n*** Update File: crates/palyra-daemon/src/lib.rs\n@@\n-old\n+new\n*** End Patch\n"}"#,
+            &config,
+            None,
+        );
+        let details_json: Value = serde_json::from_str(pending.prompt.details_json.as_str())
+            .expect("approval prompt details should remain valid JSON");
+        let safety = details_json
+            .pointer("/input_json/workspace_safety")
+            .expect("workspace safety context should be embedded");
+        assert_eq!(
+            safety.get("checkpoint_flow").and_then(Value::as_str),
+            Some("preflight -> post_change")
+        );
+        assert_eq!(
+            safety.get("restore_target").and_then(Value::as_str),
+            Some("preflight_checkpoint")
+        );
+        assert_eq!(
+            safety.pointer("/degrade_behavior/high_risk").and_then(Value::as_str),
+            Some("fail_closed_without_preflight")
+        );
+        assert_eq!(
+            safety
+                .get("paths")
+                .and_then(Value::as_array)
+                .and_then(|paths| paths.first())
+                .and_then(Value::as_str),
+            Some("crates/palyra-daemon/src/lib.rs")
         );
     }
 }

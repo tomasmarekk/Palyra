@@ -314,6 +314,8 @@ export function SupportSection({ app }: SupportSectionProps) {
   const supportBundle = readObject(observability ?? {}, "support_bundle");
   const doctorRecovery = readObject(observability ?? {}, "doctor_recovery");
   const providerAuth = readObject(observability ?? {}, "provider_auth");
+  const workspaceRestore = readObject(observability ?? {}, "workspace_restore");
+  const workspaceRestoreSummary = readObject(workspaceRestore ?? {}, "summary");
   const configRefHealth = readObject(observability ?? {}, "config_ref_health");
   const configRefSummary = readObject(configRefHealth ?? {}, "summary");
   const configRefRecommendations = toStringArray(
@@ -425,6 +427,45 @@ export function SupportSection({ app }: SupportSectionProps) {
           value={readNumber(configRefSummary ?? {}, "blocking_refs") ?? 0}
           detail={`${readNumber(configRefSummary ?? {}, "warning_refs") ?? 0} warnings Â· ${configRefState}`}
           tone={configRefState === "ok" ? "success" : "warning"}
+        />
+        <WorkspaceMetricCard
+          label="Workspace restore"
+          value={formatRate(readNumber(workspaceRestoreSummary ?? {}, "restore_success_rate_bps"))}
+          detail={`${readNumber(workspaceRestoreSummary ?? {}, "restore_report_count") ?? 0} attempts`}
+          tone={
+            (readNumber(workspaceRestoreSummary ?? {}, "failed_restore_count") ?? 0) > 0
+              ? "warning"
+              : "success"
+          }
+        />
+        <WorkspaceMetricCard
+          label="Checkpoint pairs"
+          value={readNumber(workspaceRestoreSummary ?? {}, "paired_checkpoint_count") ?? 0}
+          detail={`${formatRate(readNumber(workspaceRestoreSummary ?? {}, "missing_checkpoint_pair_rate_bps"))} missing-pair rate`}
+          tone={
+            (readNumber(workspaceRestoreSummary ?? {}, "missing_checkpoint_pair_count") ?? 0) > 0
+              ? "warning"
+              : "default"
+          }
+        />
+        <WorkspaceMetricCard
+          label="High-risk mutations"
+          value={readNumber(workspaceRestoreSummary ?? {}, "high_risk_mutation_count") ?? 0}
+          detail={`${formatRate(readNumber(workspaceRestoreSummary ?? {}, "high_risk_mutation_rate_bps"))} of checkpointed mutations`}
+          tone={
+            (readNumber(workspaceRestoreSummary ?? {}, "review_required_mutation_count") ?? 0) > 0
+              ? "warning"
+              : "default"
+          }
+        />
+        <WorkspaceMetricCard
+          label="Compare latency"
+          value={
+            readNumber(workspaceRestore ?? {}, "latest_compare_latency_ms") === null
+              ? "n/a"
+              : `${readNumber(workspaceRestore ?? {}, "latest_compare_latency_ms")} ms`
+          }
+          detail="Latest checkpoint-pair compare sample"
         />
       </section>
 

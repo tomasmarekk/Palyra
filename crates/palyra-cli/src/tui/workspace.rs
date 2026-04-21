@@ -196,8 +196,22 @@ async fn show_workspace_summary(app: &mut App, run_id: &str, changed_only: bool)
         } else {
             lines.push("Rollback checkpoints:".to_owned());
             lines.extend(checkpoints.iter().take(6).map(|checkpoint| {
+                let stage = checkpoint
+                    .pointer("/checkpoint_stage")
+                    .and_then(serde_json::Value::as_str)
+                    .map(workspace_checkpoint_stage_label)
+                    .unwrap_or("checkpoint");
+                let risk = checkpoint
+                    .pointer("/risk_level")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("risk unknown");
+                let pair = checkpoint
+                    .pointer("/paired_checkpoint_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(shorten_id)
+                    .unwrap_or_else(|| "unpaired".to_owned());
                 format!(
-                    "  {} · {} · restores {}",
+                    "  {} · {} · {} · {} · paired {} · restores {}",
                     checkpoint
                         .pointer("/checkpoint_id")
                         .and_then(serde_json::Value::as_str)
@@ -207,6 +221,9 @@ async fn show_workspace_summary(app: &mut App, run_id: &str, changed_only: bool)
                         .pointer("/source_label")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("workspace checkpoint"),
+                    stage,
+                    risk,
+                    pair,
                     checkpoint
                         .pointer("/restore_count")
                         .and_then(serde_json::Value::as_u64)
@@ -230,6 +247,14 @@ async fn show_workspace_summary(app: &mut App, run_id: &str, changed_only: bool)
         "Workspace summary loaded".to_owned()
     };
     Ok(())
+}
+
+fn workspace_checkpoint_stage_label(stage: &str) -> &'static str {
+    match stage {
+        "preflight" => "preflight",
+        "post_change" => "post-change",
+        _ => "checkpoint",
+    }
 }
 
 async fn show_workspace_artifact(app: &mut App, run_id: &str, artifact_ref: &str) -> Result<()> {

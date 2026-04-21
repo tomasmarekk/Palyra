@@ -1283,9 +1283,18 @@ fn build_workspace_restore_observability(state: &AppState) -> Value {
             });
         }
     };
+    let latest_compare_latency_ms = recent_checkpoints
+        .iter()
+        .filter_map(|checkpoint| {
+            serde_json::from_str::<Value>(checkpoint.compare_summary_json.as_str())
+                .ok()
+                .and_then(|summary| summary.get("compare_latency_ms").and_then(Value::as_u64))
+        })
+        .next();
 
     json!({
         "summary": summary,
+        "latest_compare_latency_ms": latest_compare_latency_ms,
         "recent_checkpoints": recent_checkpoints
             .into_iter()
             .map(workspace_checkpoint_support_summary)
@@ -1306,6 +1315,9 @@ fn workspace_checkpoint_support_summary(
         "run_id": checkpoint.run_id,
         "source_kind": checkpoint.source_kind,
         "source_label": checkpoint.source_label,
+        "checkpoint_stage": checkpoint.checkpoint_stage,
+        "mutation_id": checkpoint.mutation_id,
+        "paired_checkpoint_id": checkpoint.paired_checkpoint_id,
         "tool_name": checkpoint.tool_name,
         "proposal_id": checkpoint.proposal_id,
         "actor_principal": checkpoint.actor_principal,
@@ -1314,6 +1326,10 @@ fn workspace_checkpoint_support_summary(
         "summary_text": checkpoint.summary_text,
         "diff_summary": serde_json::from_str::<Value>(checkpoint.diff_summary_json.as_str())
             .unwrap_or_else(|_| Value::String(checkpoint.diff_summary_json)),
+        "compare_summary": serde_json::from_str::<Value>(checkpoint.compare_summary_json.as_str())
+            .unwrap_or_else(|_| Value::String(checkpoint.compare_summary_json)),
+        "risk_level": checkpoint.risk_level,
+        "review_posture": checkpoint.review_posture,
         "created_at_unix_ms": checkpoint.created_at_unix_ms,
         "restore_count": checkpoint.restore_count,
         "last_restored_at_unix_ms": checkpoint.last_restored_at_unix_ms,

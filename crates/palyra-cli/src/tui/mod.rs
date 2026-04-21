@@ -2167,6 +2167,13 @@ impl App {
             .map(|value| TuiSlashWorkspaceCheckpointRecord {
                 checkpoint_id: read_json_string(&value, "/checkpoint_id"),
                 source_label: read_json_string(&value, "/source_label"),
+                checkpoint_stage: read_json_string(&value, "/checkpoint_stage"),
+                paired_checkpoint_id: value
+                    .pointer("/paired_checkpoint_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned),
+                risk_level: read_json_string(&value, "/risk_level"),
+                review_posture: read_json_string(&value, "/review_posture"),
                 summary_text: read_json_string(&value, "/summary_text"),
                 restore_count: value
                     .pointer("/restore_count")

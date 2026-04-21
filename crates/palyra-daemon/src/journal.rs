@@ -1614,6 +1614,11 @@ pub struct WorkspaceCheckpointRecord {
     pub run_id: String,
     pub source_kind: String,
     pub source_label: String,
+    pub checkpoint_stage: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mutation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paired_checkpoint_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1624,6 +1629,9 @@ pub struct WorkspaceCheckpointRecord {
     pub channel: Option<String>,
     pub summary_text: String,
     pub diff_summary_json: String,
+    pub compare_summary_json: String,
+    pub risk_level: String,
+    pub review_posture: String,
     pub created_at_unix_ms: i64,
     pub restore_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1691,6 +1699,9 @@ pub struct WorkspaceCheckpointCreateRequest {
     pub run_id: String,
     pub source_kind: String,
     pub source_label: String,
+    pub checkpoint_stage: String,
+    pub mutation_id: Option<String>,
+    pub paired_checkpoint_id: Option<String>,
     pub tool_name: Option<String>,
     pub proposal_id: Option<String>,
     pub actor_principal: String,
@@ -1698,7 +1709,19 @@ pub struct WorkspaceCheckpointCreateRequest {
     pub channel: Option<String>,
     pub summary_text: String,
     pub diff_summary_json: String,
+    pub compare_summary_json: String,
+    pub risk_level: String,
+    pub review_posture: String,
     pub files: Vec<WorkspaceCheckpointFileCreateRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceCheckpointPairLinkRequest {
+    pub mutation_id: String,
+    pub preflight_checkpoint_id: String,
+    pub post_change_checkpoint_id: String,
+    pub compare_summary_json: String,
+    pub review_posture: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1728,11 +1751,20 @@ pub struct WorkspaceRestoreActivityFilter {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
 pub struct WorkspaceRestoreActivitySummary {
     pub checkpoint_count: u64,
+    pub preflight_checkpoint_count: u64,
+    pub post_change_checkpoint_count: u64,
+    pub paired_checkpoint_count: u64,
+    pub missing_checkpoint_pair_count: u64,
+    pub high_risk_mutation_count: u64,
+    pub review_required_mutation_count: u64,
     pub checkpoint_restore_total: u64,
     pub restore_report_count: u64,
     pub succeeded_restore_count: u64,
     pub partial_failure_restore_count: u64,
     pub failed_restore_count: u64,
+    pub restore_success_rate_bps: u64,
+    pub missing_checkpoint_pair_rate_bps: u64,
+    pub high_risk_mutation_rate_bps: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3804,6 +3836,28 @@ const MIGRATIONS: &[Migration] = &[
             BEGIN
                 SELECT RAISE(ABORT, 'recall_artifacts is append-only');
             END;
+        "#,
+    },
+    Migration {
+        version: 28,
+        name: "workspace_checkpoint_pair_metadata",
+        sql: r#"
+            ALTER TABLE workspace_checkpoints
+                ADD COLUMN checkpoint_stage TEXT NOT NULL DEFAULT 'post_change';
+            ALTER TABLE workspace_checkpoints
+                ADD COLUMN mutation_ulid TEXT;
+            ALTER TABLE workspace_checkpoints
+                ADD COLUMN paired_checkpoint_ulid TEXT;
+            ALTER TABLE workspace_checkpoints
+                ADD COLUMN compare_summary_json TEXT NOT NULL DEFAULT '{}';
+            ALTER TABLE workspace_checkpoints
+                ADD COLUMN risk_level TEXT NOT NULL DEFAULT 'low';
+            ALTER TABLE workspace_checkpoints
+                ADD COLUMN review_posture TEXT NOT NULL DEFAULT 'standard';
+            CREATE INDEX IF NOT EXISTS idx_workspace_checkpoints_mutation
+                ON workspace_checkpoints(mutation_ulid, checkpoint_stage, created_at_unix_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_workspace_checkpoints_pair_missing
+                ON workspace_checkpoints(checkpoint_stage, paired_checkpoint_ulid, created_at_unix_ms DESC);
         "#,
     },
 ];
@@ -6681,6 +6735,9 @@ impl JournalStore {
                     run_ulid,
                     source_kind,
                     source_label,
+                    checkpoint_stage,
+                    mutation_ulid,
+                    paired_checkpoint_ulid,
                     tool_name,
                     proposal_id,
                     actor_principal,
@@ -6688,11 +6745,14 @@ impl JournalStore {
                     channel,
                     summary_text,
                     diff_summary_json,
+                    compare_summary_json,
+                    risk_level,
+                    review_posture,
                     created_at_unix_ms,
                     restore_count,
                     last_restored_at_unix_ms,
                     latest_restore_report_ulid
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0, NULL, NULL)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, 0, NULL, NULL)
             "#,
             params![
                 request.checkpoint_id,
@@ -6700,6 +6760,9 @@ impl JournalStore {
                 request.run_id,
                 request.source_kind,
                 request.source_label,
+                request.checkpoint_stage,
+                request.mutation_id,
+                request.paired_checkpoint_id,
                 request.tool_name,
                 request.proposal_id,
                 request.actor_principal,
@@ -6707,6 +6770,9 @@ impl JournalStore {
                 request.channel,
                 request.summary_text,
                 request.diff_summary_json,
+                request.compare_summary_json,
+                request.risk_level,
+                request.review_posture,
                 now,
             ],
         )?;
@@ -6846,6 +6912,9 @@ impl JournalStore {
             run_id: request.run_id.clone(),
             source_kind: request.source_kind.clone(),
             source_label: request.source_label.clone(),
+            checkpoint_stage: request.checkpoint_stage.clone(),
+            mutation_id: request.mutation_id.clone(),
+            paired_checkpoint_id: request.paired_checkpoint_id.clone(),
             tool_name: request.tool_name.clone(),
             proposal_id: request.proposal_id.clone(),
             actor_principal: request.actor_principal.clone(),
@@ -6853,6 +6922,9 @@ impl JournalStore {
             channel: request.channel.clone(),
             summary_text: request.summary_text.clone(),
             diff_summary_json: request.diff_summary_json.clone(),
+            compare_summary_json: request.compare_summary_json.clone(),
+            risk_level: request.risk_level.clone(),
+            review_posture: request.review_posture.clone(),
             created_at_unix_ms: now,
             restore_count: 0,
             last_restored_at_unix_ms: None,
@@ -6875,6 +6947,9 @@ impl JournalStore {
                     run_ulid,
                     source_kind,
                     source_label,
+                    checkpoint_stage,
+                    mutation_ulid,
+                    paired_checkpoint_ulid,
                     tool_name,
                     proposal_id,
                     actor_principal,
@@ -6882,6 +6957,9 @@ impl JournalStore {
                     channel,
                     summary_text,
                     diff_summary_json,
+                    compare_summary_json,
+                    risk_level,
+                    review_posture,
                     created_at_unix_ms,
                     restore_count,
                     last_restored_at_unix_ms,
@@ -6910,7 +6988,10 @@ impl JournalStore {
         }
         let limit_placeholder = params.len() + 1;
         sql.push_str(
-            format!(" ORDER BY created_at_unix_ms DESC LIMIT ?{limit_placeholder}").as_str(),
+            format!(
+                " ORDER BY created_at_unix_ms DESC, checkpoint_stage DESC, checkpoint_ulid DESC LIMIT ?{limit_placeholder}"
+            )
+            .as_str(),
         );
         params.push(Box::new(limit));
 
@@ -6926,17 +7007,23 @@ impl JournalStore {
                 run_id: row.get(2)?,
                 source_kind: row.get(3)?,
                 source_label: row.get(4)?,
-                tool_name: row.get(5)?,
-                proposal_id: row.get(6)?,
-                actor_principal: row.get(7)?,
-                device_id: row.get(8)?,
-                channel: row.get(9)?,
-                summary_text: row.get(10)?,
-                diff_summary_json: row.get(11)?,
-                created_at_unix_ms: row.get(12)?,
-                restore_count: row.get::<_, i64>(13)?.max(0) as u64,
-                last_restored_at_unix_ms: row.get(14)?,
-                latest_restore_report_id: row.get(15)?,
+                checkpoint_stage: row.get(5)?,
+                mutation_id: row.get(6)?,
+                paired_checkpoint_id: row.get(7)?,
+                tool_name: row.get(8)?,
+                proposal_id: row.get(9)?,
+                actor_principal: row.get(10)?,
+                device_id: row.get(11)?,
+                channel: row.get(12)?,
+                summary_text: row.get(13)?,
+                diff_summary_json: row.get(14)?,
+                compare_summary_json: row.get(15)?,
+                risk_level: row.get(16)?,
+                review_posture: row.get(17)?,
+                created_at_unix_ms: row.get(18)?,
+                restore_count: row.get::<_, i64>(19)?.max(0) as u64,
+                last_restored_at_unix_ms: row.get(20)?,
+                latest_restore_report_id: row.get(21)?,
             });
         }
         Ok(records)
@@ -6956,6 +7043,9 @@ impl JournalStore {
                         run_ulid,
                         source_kind,
                         source_label,
+                        checkpoint_stage,
+                        mutation_ulid,
+                        paired_checkpoint_ulid,
                         tool_name,
                         proposal_id,
                         actor_principal,
@@ -6963,6 +7053,9 @@ impl JournalStore {
                         channel,
                         summary_text,
                         diff_summary_json,
+                        compare_summary_json,
+                        risk_level,
+                        review_posture,
                         created_at_unix_ms,
                         restore_count,
                         last_restored_at_unix_ms,
@@ -6978,22 +7071,80 @@ impl JournalStore {
                         run_id: row.get(2)?,
                         source_kind: row.get(3)?,
                         source_label: row.get(4)?,
-                        tool_name: row.get(5)?,
-                        proposal_id: row.get(6)?,
-                        actor_principal: row.get(7)?,
-                        device_id: row.get(8)?,
-                        channel: row.get(9)?,
-                        summary_text: row.get(10)?,
-                        diff_summary_json: row.get(11)?,
-                        created_at_unix_ms: row.get(12)?,
-                        restore_count: row.get::<_, i64>(13)?.max(0) as u64,
-                        last_restored_at_unix_ms: row.get(14)?,
-                        latest_restore_report_id: row.get(15)?,
+                        checkpoint_stage: row.get(5)?,
+                        mutation_id: row.get(6)?,
+                        paired_checkpoint_id: row.get(7)?,
+                        tool_name: row.get(8)?,
+                        proposal_id: row.get(9)?,
+                        actor_principal: row.get(10)?,
+                        device_id: row.get(11)?,
+                        channel: row.get(12)?,
+                        summary_text: row.get(13)?,
+                        diff_summary_json: row.get(14)?,
+                        compare_summary_json: row.get(15)?,
+                        risk_level: row.get(16)?,
+                        review_posture: row.get(17)?,
+                        created_at_unix_ms: row.get(18)?,
+                        restore_count: row.get::<_, i64>(19)?.max(0) as u64,
+                        last_restored_at_unix_ms: row.get(20)?,
+                        latest_restore_report_id: row.get(21)?,
                     })
                 },
             )
             .optional()
             .map_err(JournalError::from)
+    }
+
+    pub fn link_workspace_checkpoint_pair(
+        &self,
+        request: &WorkspaceCheckpointPairLinkRequest,
+    ) -> Result<(), JournalError> {
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction()?;
+        let preflight_updated = transaction.execute(
+            r#"
+                UPDATE workspace_checkpoints
+                SET mutation_ulid = ?1,
+                    paired_checkpoint_ulid = ?2,
+                    compare_summary_json = ?3,
+                    review_posture = ?4
+                WHERE checkpoint_ulid = ?5
+                    AND checkpoint_stage = 'preflight'
+            "#,
+            params![
+                request.mutation_id,
+                request.post_change_checkpoint_id,
+                request.compare_summary_json,
+                request.review_posture,
+                request.preflight_checkpoint_id,
+            ],
+        )?;
+        let post_change_updated = transaction.execute(
+            r#"
+                UPDATE workspace_checkpoints
+                SET mutation_ulid = ?1,
+                    paired_checkpoint_ulid = ?2,
+                    compare_summary_json = ?3,
+                    review_posture = ?4
+                WHERE checkpoint_ulid = ?5
+                    AND checkpoint_stage = 'post_change'
+            "#,
+            params![
+                request.mutation_id,
+                request.preflight_checkpoint_id,
+                request.compare_summary_json,
+                request.review_posture,
+                request.post_change_checkpoint_id,
+            ],
+        )?;
+        if preflight_updated == 0 || post_change_updated == 0 {
+            return Err(JournalError::InvalidArgument(format!(
+                "workspace checkpoint pair not found for mutation {}",
+                request.mutation_id
+            )));
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn get_workspace_restore_report(
@@ -7139,9 +7290,19 @@ impl JournalStore {
     ) -> Result<WorkspaceRestoreActivitySummary, JournalError> {
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
 
-        let mut checkpoint_sql =
-            "SELECT COUNT(*), COALESCE(SUM(restore_count), 0) FROM workspace_checkpoints"
-                .to_owned();
+        let mut checkpoint_sql = r#"
+                SELECT
+                    COUNT(*),
+                    COALESCE(SUM(CASE WHEN checkpoint_stage = 'preflight' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN checkpoint_stage = 'post_change' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN paired_checkpoint_ulid IS NOT NULL THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN paired_checkpoint_ulid IS NULL THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN risk_level = 'high' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN review_posture = 'review_required' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(restore_count), 0)
+                FROM workspace_checkpoints
+            "#
+        .to_owned();
         let mut checkpoint_conditions = Vec::new();
         let mut checkpoint_params = Vec::<Box<dyn rusqlite::ToSql>>::new();
         let push_condition = |conditions: &mut Vec<String>,
@@ -7176,12 +7337,32 @@ impl JournalStore {
             checkpoint_sql.push_str(" WHERE ");
             checkpoint_sql.push_str(checkpoint_conditions.join(" AND ").as_str());
         }
-        let (checkpoint_count, checkpoint_restore_total): (i64, i64) = guard.query_row(
+        let (
+            checkpoint_count,
+            preflight_checkpoint_count,
+            post_change_checkpoint_count,
+            paired_checkpoint_count,
+            missing_checkpoint_pair_count,
+            high_risk_mutation_count,
+            review_required_mutation_count,
+            checkpoint_restore_total,
+        ): (i64, i64, i64, i64, i64, i64, i64, i64) = guard.query_row(
             checkpoint_sql.as_str(),
             params_from_iter(
                 checkpoint_params.iter().map(|value| value.as_ref() as &dyn rusqlite::ToSql),
             ),
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
         )?;
 
         let mut report_sql = r#"
@@ -7222,11 +7403,29 @@ impl JournalStore {
 
         Ok(WorkspaceRestoreActivitySummary {
             checkpoint_count: checkpoint_count.max(0) as u64,
+            preflight_checkpoint_count: preflight_checkpoint_count.max(0) as u64,
+            post_change_checkpoint_count: post_change_checkpoint_count.max(0) as u64,
+            paired_checkpoint_count: paired_checkpoint_count.max(0) as u64,
+            missing_checkpoint_pair_count: missing_checkpoint_pair_count.max(0) as u64,
+            high_risk_mutation_count: high_risk_mutation_count.max(0) as u64,
+            review_required_mutation_count: review_required_mutation_count.max(0) as u64,
             checkpoint_restore_total: checkpoint_restore_total.max(0) as u64,
             restore_report_count: restore_report_count.max(0) as u64,
             succeeded_restore_count: succeeded_restore_count.max(0) as u64,
             partial_failure_restore_count: partial_failure_restore_count.max(0) as u64,
             failed_restore_count: failed_restore_count.max(0) as u64,
+            restore_success_rate_bps: restore_success_rate_bps(
+                succeeded_restore_count.max(0) as u64,
+                restore_report_count.max(0) as u64,
+            ),
+            missing_checkpoint_pair_rate_bps: ratio_bps(
+                missing_checkpoint_pair_count.max(0) as u64,
+                checkpoint_count.max(0) as u64,
+            ),
+            high_risk_mutation_rate_bps: ratio_bps(
+                high_risk_mutation_count.max(0) as u64,
+                checkpoint_count.max(0) as u64,
+            ),
         })
     }
 
@@ -15253,6 +15452,20 @@ fn current_unix_ms() -> Result<i64, JournalError> {
     Ok(now.as_millis() as i64)
 }
 
+fn ratio_bps(numerator: u64, denominator: u64) -> u64 {
+    if denominator == 0 {
+        return 0;
+    }
+    ((u128::from(numerator) * 10_000) / u128::from(denominator)).min(10_000) as u64
+}
+
+fn restore_success_rate_bps(succeeded: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 10_000;
+    }
+    ratio_bps(succeeded, total)
+}
+
 fn normalize_optional_session_field(value: String) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -19071,6 +19284,9 @@ mod tests {
                 run_id: "01ARZ3NDEKTSV4RRFFQ69G5WB1".to_owned(),
                 source_kind: "tool_result".to_owned(),
                 source_label: "Workspace patch".to_owned(),
+                checkpoint_stage: "preflight".to_owned(),
+                mutation_id: Some("01ARZ3NDEKTSV4RRFFQ69G5WM1".to_owned()),
+                paired_checkpoint_id: None,
                 tool_name: Some("palyra.fs.apply_patch".to_owned()),
                 proposal_id: Some("01ARZ3NDEKTSV4RRFFQ69G5WD1".to_owned()),
                 actor_principal: "user:ops".to_owned(),
@@ -19078,6 +19294,9 @@ mod tests {
                 channel: Some("cli".to_owned()),
                 summary_text: "checkpoint alpha".to_owned(),
                 diff_summary_json: "{\"files\":1}".to_owned(),
+                compare_summary_json: "{\"files_changed\":1}".to_owned(),
+                risk_level: "high".to_owned(),
+                review_posture: "review_required".to_owned(),
                 files: vec![super::WorkspaceCheckpointFileCreateRequest {
                     artifact_id: "01ARZ3NDEKTSV4RRFFQ69G5WE1".to_owned(),
                     path: "src/main.rs".to_owned(),
@@ -19129,6 +19348,9 @@ mod tests {
                 run_id: "01ARZ3NDEKTSV4RRFFQ69G5WB2".to_owned(),
                 source_kind: "tool_result".to_owned(),
                 source_label: "Workspace patch".to_owned(),
+                checkpoint_stage: "post_change".to_owned(),
+                mutation_id: Some("01ARZ3NDEKTSV4RRFFQ69G5WM1".to_owned()),
+                paired_checkpoint_id: None,
                 tool_name: Some("palyra.fs.apply_patch".to_owned()),
                 proposal_id: Some("01ARZ3NDEKTSV4RRFFQ69G5WD2".to_owned()),
                 actor_principal: "user:ops".to_owned(),
@@ -19136,6 +19358,9 @@ mod tests {
                 channel: Some("cli".to_owned()),
                 summary_text: "checkpoint beta".to_owned(),
                 diff_summary_json: "{\"files\":1}".to_owned(),
+                compare_summary_json: "{\"files_changed\":1}".to_owned(),
+                risk_level: "low".to_owned(),
+                review_posture: "standard".to_owned(),
                 files: vec![super::WorkspaceCheckpointFileCreateRequest {
                     artifact_id: "01ARZ3NDEKTSV4RRFFQ69G5WE2".to_owned(),
                     path: "src/lib.rs".to_owned(),
@@ -19154,6 +19379,15 @@ mod tests {
                 }],
             })
             .expect("second workspace checkpoint should be created");
+        store
+            .link_workspace_checkpoint_pair(&super::WorkspaceCheckpointPairLinkRequest {
+                mutation_id: "01ARZ3NDEKTSV4RRFFQ69G5WM1".to_owned(),
+                preflight_checkpoint_id: "01ARZ3NDEKTSV4RRFFQ69G5WC1".to_owned(),
+                post_change_checkpoint_id: "01ARZ3NDEKTSV4RRFFQ69G5WC2".to_owned(),
+                compare_summary_json: "{\"files_changed\":1}".to_owned(),
+                review_posture: "review_required".to_owned(),
+            })
+            .expect("workspace checkpoint pair should link");
 
         let filtered = store
             .summarize_workspace_restore_activity(&super::WorkspaceRestoreActivityFilter {
@@ -19163,11 +19397,20 @@ mod tests {
             })
             .expect("workspace restore activity summary should load");
         assert_eq!(filtered.checkpoint_count, 1);
+        assert_eq!(filtered.preflight_checkpoint_count, 1);
+        assert_eq!(filtered.post_change_checkpoint_count, 0);
+        assert_eq!(filtered.paired_checkpoint_count, 1);
+        assert_eq!(filtered.missing_checkpoint_pair_count, 0);
+        assert_eq!(filtered.high_risk_mutation_count, 1);
+        assert_eq!(filtered.review_required_mutation_count, 1);
         assert_eq!(filtered.checkpoint_restore_total, 1);
         assert_eq!(filtered.restore_report_count, 1);
         assert_eq!(filtered.succeeded_restore_count, 1);
         assert_eq!(filtered.partial_failure_restore_count, 0);
         assert_eq!(filtered.failed_restore_count, 0);
+        assert_eq!(filtered.restore_success_rate_bps, 10_000);
+        assert_eq!(filtered.missing_checkpoint_pair_rate_bps, 0);
+        assert_eq!(filtered.high_risk_mutation_rate_bps, 10_000);
 
         let reports = store
             .list_workspace_restore_reports(&super::WorkspaceRestoreReportListFilter {
@@ -19191,6 +19434,11 @@ mod tests {
             .expect("workspace checkpoints should load");
         assert_eq!(checkpoint_records.len(), 1);
         assert_eq!(checkpoint_records[0].checkpoint_id, "01ARZ3NDEKTSV4RRFFQ69G5WC1");
+        assert_eq!(checkpoint_records[0].checkpoint_stage, "preflight");
+        assert_eq!(
+            checkpoint_records[0].paired_checkpoint_id.as_deref(),
+            Some("01ARZ3NDEKTSV4RRFFQ69G5WC2")
+        );
 
         let report = store
             .get_workspace_restore_report("01ARZ3NDEKTSV4RRFFQ69G5WF1")

@@ -643,7 +643,26 @@ pub fn runtime_acceptance_fixture_catalog() -> Value {
             "tool_name": "palyra.fs.apply_patch",
             "policy_id": "workspace_patch.preview",
             "paths": ["src/runtime.rs", "src/observability.rs"],
-            "attestation_required": true
+            "attestation_required": true,
+            "checkpoint_pair": {
+                "mutation_id": "01ARZ3NDEKTSV4RRFFQ69G5WMP",
+                "preflight_checkpoint_id": "01ARZ3NDEKTSV4RRFFQ69G5WPF",
+                "post_change_checkpoint_id": "01ARZ3NDEKTSV4RRFFQ69G5WPC",
+                "stages": ["preflight", "post_change"],
+                "review_posture": "review_required",
+                "risk_level": "high",
+                "compare_summary": {
+                    "files_changed": 2,
+                    "paths": ["src/runtime.rs", "src/observability.rs"]
+                }
+            },
+            "rollback_smoke": {
+                "restore_target": "preflight_checkpoint",
+                "restore_attempts": 1,
+                "restore_success_rate_bps": 10000,
+                "missing_checkpoint_pair_rate_bps": 0,
+                "high_risk_mutation_rate_bps": 10000
+            }
         },
         "delegated_child_run": {
             "task_kind": "delegation_prompt",
@@ -776,6 +795,14 @@ mod tests {
         assert!(fixture.get("session_transcript").is_some());
         assert!(fixture.get("retrieval_query").is_some());
         assert!(fixture.get("workspace_patch").is_some());
+        assert_eq!(
+            fixture["workspace_patch"]["checkpoint_pair"]["stages"],
+            json!(["preflight", "post_change"])
+        );
+        assert_eq!(
+            fixture["workspace_patch"]["rollback_smoke"]["restore_target"],
+            "preflight_checkpoint"
+        );
         assert!(fixture.get("delegated_child_run").is_some());
         assert!(fixture.get("replay_bundle").is_some());
         assert!(fixture.get("worker_lease").is_some());

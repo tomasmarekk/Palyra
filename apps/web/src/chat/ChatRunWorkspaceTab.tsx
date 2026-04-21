@@ -795,8 +795,15 @@ export function ChatRunWorkspaceTab({
                     <div className="chat-ops-card__copy">
                       <strong>{checkpoint.source_label}</strong>
                       <span>
-                        {checkpoint.tool_name ?? checkpoint.source_kind} ·{" "}
-                        {shortId(checkpoint.checkpoint_id)}
+                        {checkpointStageLabel(checkpoint.checkpoint_stage)} ·{" "}
+                        {checkpoint.risk_level} · {shortId(checkpoint.checkpoint_id)}
+                      </span>
+                      <span>
+                        {checkpoint.paired_checkpoint_id
+                          ? `paired ${shortId(checkpoint.paired_checkpoint_id)}`
+                          : "unpaired"}
+                        {" · "}
+                        {checkpoint.review_posture}
                       </span>
                       <p>{checkpoint.summary_text}</p>
                     </div>
@@ -846,6 +853,18 @@ export function ChatRunWorkspaceTab({
                       { label: "Run", value: shortId(checkpointEnvelope.checkpoint.run_id) },
                       { label: "Device", value: checkpointEnvelope.checkpoint.device_id },
                       {
+                        label: "Stage",
+                        value: checkpointStageLabel(checkpointEnvelope.checkpoint.checkpoint_stage),
+                      },
+                      {
+                        label: "Pair",
+                        value: checkpointEnvelope.checkpoint.paired_checkpoint_id
+                          ? shortId(checkpointEnvelope.checkpoint.paired_checkpoint_id)
+                          : "unpaired",
+                      },
+                      { label: "Risk", value: checkpointEnvelope.checkpoint.risk_level },
+                      { label: "Review", value: checkpointEnvelope.checkpoint.review_posture },
+                      {
                         label: "Tool",
                         value:
                           checkpointEnvelope.checkpoint.tool_name ??
@@ -860,6 +879,10 @@ export function ChatRunWorkspaceTab({
                   <PrettyJsonBlock
                     revealSensitiveValues={revealSensitiveValues}
                     value={safeParseJson(checkpointEnvelope.checkpoint.diff_summary_json)}
+                  />
+                  <PrettyJsonBlock
+                    revealSensitiveValues={revealSensitiveValues}
+                    value={safeParseJson(checkpointEnvelope.checkpoint.compare_summary_json)}
                   />
                   <ActionCluster>
                     <ActionButton
@@ -1069,11 +1092,22 @@ function buildAnchorOptions(
   for (const checkpoint of checkpoints) {
     options.push({
       key: `checkpoint:${checkpoint.checkpoint_id}`,
-      label: `${checkpoint.source_label} · ${shortId(checkpoint.checkpoint_id)}`,
-      description: checkpoint.summary_text,
+      label: `${checkpointStageLabel(checkpoint.checkpoint_stage)} · ${shortId(checkpoint.checkpoint_id)}`,
+      description: `${checkpoint.risk_level} · ${checkpoint.summary_text}`,
     });
   }
   return options;
+}
+
+function checkpointStageLabel(stage: string | undefined): string {
+  switch (stage) {
+    case "preflight":
+      return "Preflight";
+    case "post_change":
+      return "Post-change";
+    default:
+      return stage || "Checkpoint";
+  }
 }
 
 function parseAnchor(value: string): { kind: "run" | "checkpoint"; id: string } | null {

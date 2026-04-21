@@ -105,6 +105,10 @@ pub(crate) struct TuiSlashWorkspaceArtifactRecord {
 pub(crate) struct TuiSlashWorkspaceCheckpointRecord {
     pub(crate) checkpoint_id: String,
     pub(crate) source_label: String,
+    pub(crate) checkpoint_stage: String,
+    pub(crate) paired_checkpoint_id: Option<String>,
+    pub(crate) risk_level: String,
+    pub(crate) review_posture: String,
     pub(crate) summary_text: String,
     pub(crate) restore_count: u64,
     pub(crate) created_at_unix_ms: i64,
@@ -448,6 +452,10 @@ mod tests {
                 workspace_checkpoints: vec![TuiSlashWorkspaceCheckpointRecord {
                     checkpoint_id: "workspace-1".to_owned(),
                     source_label: "filesystem_write".to_owned(),
+                    checkpoint_stage: "post_change".to_owned(),
+                    paired_checkpoint_id: Some("workspace-0".to_owned()),
+                    risk_level: "low".to_owned(),
+                    review_posture: "standard".to_owned(),
                     summary_text: "src/lib.rs changed".to_owned(),
                     restore_count: 0,
                     created_at_unix_ms: 42,

@@ -537,15 +537,34 @@ pub(super) fn build_workspace_checkpoint_suggestions(
         })
         .take(6)
         .map(|checkpoint| TuiSlashSuggestion {
-            title: checkpoint.source_label.clone(),
+            title: format!(
+                "{} · {}",
+                workspace_checkpoint_stage_label(checkpoint.checkpoint_stage.as_str()),
+                checkpoint.source_label
+            ),
             subtitle: checkpoint.checkpoint_id.clone(),
             detail: format!(
-                "{} · restores {}",
+                "{} · {} · {} · paired {} · restores {}",
                 if checkpoint.summary_text.is_empty() {
                     "Workspace checkpoint".to_owned()
                 } else {
                     checkpoint.summary_text.clone()
                 },
+                if checkpoint.risk_level.is_empty() {
+                    "risk unknown"
+                } else {
+                    checkpoint.risk_level.as_str()
+                },
+                if checkpoint.review_posture.is_empty() {
+                    "review unknown"
+                } else {
+                    checkpoint.review_posture.as_str()
+                },
+                checkpoint
+                    .paired_checkpoint_id
+                    .as_deref()
+                    .map(shorten_palette_id)
+                    .unwrap_or_else(|| "none".to_owned()),
                 checkpoint.restore_count
             ),
             example: if action == "restore" {
@@ -561,6 +580,18 @@ pub(super) fn build_workspace_checkpoint_suggestions(
             badge: "workspace checkpoint".to_owned(),
         })
         .collect()
+}
+
+fn workspace_checkpoint_stage_label(stage: &str) -> &'static str {
+    match stage {
+        "preflight" => "preflight",
+        "post_change" => "post-change",
+        _ => "checkpoint",
+    }
+}
+
+fn shorten_palette_id(value: &str) -> String {
+    value.chars().take(8).collect()
 }
 
 pub(super) fn build_undo_suggestions(

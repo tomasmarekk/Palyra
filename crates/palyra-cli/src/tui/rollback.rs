@@ -41,8 +41,22 @@ pub(super) async fn handle_rollback_command(app: &mut App, arguments: Vec<String
         } else {
             lines.push("Recent workspace checkpoints:".to_owned());
             lines.extend(checkpoints.iter().take(6).map(|checkpoint| {
+                let stage = checkpoint
+                    .pointer("/checkpoint_stage")
+                    .and_then(serde_json::Value::as_str)
+                    .map(workspace_checkpoint_stage_label)
+                    .unwrap_or("checkpoint");
+                let risk = checkpoint
+                    .pointer("/risk_level")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("risk unknown");
+                let pair = checkpoint
+                    .pointer("/paired_checkpoint_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(shorten_id)
+                    .unwrap_or_else(|| "unpaired".to_owned());
                 format!(
-                    "  {} · {} · restores {}",
+                    "  {} · {} · {} · {} · paired {} · restores {}",
                     checkpoint
                         .pointer("/checkpoint_id")
                         .and_then(serde_json::Value::as_str)
@@ -52,6 +66,9 @@ pub(super) async fn handle_rollback_command(app: &mut App, arguments: Vec<String
                         .pointer("/source_label")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("workspace checkpoint"),
+                    stage,
+                    risk,
+                    pair,
                     checkpoint
                         .pointer("/restore_count")
                         .and_then(serde_json::Value::as_u64)
@@ -79,6 +96,13 @@ pub(super) async fn handle_rollback_command(app: &mut App, arguments: Vec<String
         if !request.confirmed {
             let source_label = read_json_string(&payload, "/checkpoint/source_label");
             let summary = read_json_string(&payload, "/checkpoint/summary_text");
+            let stage = payload
+                .pointer("/checkpoint/checkpoint_stage")
+                .and_then(serde_json::Value::as_str)
+                .map(workspace_checkpoint_stage_label)
+                .unwrap_or("checkpoint");
+            let risk = read_json_string(&payload, "/checkpoint/risk_level");
+            let review_posture = read_json_string(&payload, "/checkpoint/review_posture");
             let restore_count = payload
                 .pointer("/checkpoint/restore_count")
                 .and_then(serde_json::Value::as_u64)
@@ -87,9 +111,16 @@ pub(super) async fn handle_rollback_command(app: &mut App, arguments: Vec<String
                 EntryKind::System,
                 "Workspace restore confirmation",
                 format!(
-                    "{} · {}\n{}\nrestore_count={}\nRestore stays branch-safe by default.\nRun `/rollback restore {} --confirm{}` to proceed.",
+                    "{} · {} · {} · {} · {}\n{}\nrestore_count={}\nRestore stays branch-safe by default.\nRun `/rollback restore {} --confirm{}` to proceed.",
                     shorten_id(request.checkpoint_id.as_str()),
                     source_label,
+                    stage,
+                    if risk.is_empty() { "risk unknown" } else { risk.as_str() },
+                    if review_posture.is_empty() {
+                        "review unknown"
+                    } else {
+                        review_posture.as_str()
+                    },
                     summary,
                     restore_count,
                     request.checkpoint_id,
@@ -252,6 +283,18 @@ pub(super) async fn handle_rollback_command(app: &mut App, arguments: Vec<String
             let checkpoint_id = read_json_string(&payload, "/checkpoint/checkpoint_id");
             let source_label = read_json_string(&payload, "/checkpoint/source_label");
             let summary = read_json_string(&payload, "/checkpoint/summary_text");
+            let stage = payload
+                .pointer("/checkpoint/checkpoint_stage")
+                .and_then(serde_json::Value::as_str)
+                .map(workspace_checkpoint_stage_label)
+                .unwrap_or("checkpoint");
+            let risk = read_json_string(&payload, "/checkpoint/risk_level");
+            let review_posture = read_json_string(&payload, "/checkpoint/review_posture");
+            let pair = payload
+                .pointer("/checkpoint/paired_checkpoint_id")
+                .and_then(serde_json::Value::as_str)
+                .map(shorten_id)
+                .unwrap_or_else(|| "unpaired".to_owned());
             let restore_reports = payload
                 .pointer("/restore_reports")
                 .and_then(serde_json::Value::as_array)
@@ -261,9 +304,17 @@ pub(super) async fn handle_rollback_command(app: &mut App, arguments: Vec<String
                 EntryKind::System,
                 "Workspace checkpoint",
                 format!(
-                    "{} · {}\n{}\nrestore_reports={}\nUse `/rollback diff {}` before restoring, then `/rollback restore {} --confirm` when you're ready.",
+                    "{} · {} · {} · {} · {} · paired {}\n{}\nrestore_reports={}\nUse `/rollback diff {}` before restoring, then `/rollback restore {} --confirm` when you're ready.",
                     shorten_id(checkpoint_id.as_str()),
                     source_label,
+                    stage,
+                    if risk.is_empty() { "risk unknown" } else { risk.as_str() },
+                    if review_posture.is_empty() {
+                        "review unknown"
+                    } else {
+                        review_posture.as_str()
+                    },
+                    pair,
                     summary,
                     restore_reports,
                     checkpoint_id,
@@ -304,6 +355,14 @@ pub(super) async fn handle_rollback_command(app: &mut App, arguments: Vec<String
         }
     }
     Ok(())
+}
+
+fn workspace_checkpoint_stage_label(stage: &str) -> &'static str {
+    match stage {
+        "preflight" => "preflight",
+        "post_change" => "post-change",
+        _ => "checkpoint",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

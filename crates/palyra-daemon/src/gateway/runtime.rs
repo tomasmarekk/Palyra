@@ -27,7 +27,8 @@ use crate::journal::{
     SessionProjectContextStateRecord, SessionProjectContextStateUpsertRequest,
     SessionSearchOutcome, SessionSearchRequest, WorkspaceBootstrapOutcome,
     WorkspaceBootstrapRequest, WorkspaceCheckpointCreateRequest, WorkspaceCheckpointFilePayload,
-    WorkspaceCheckpointFileRecord, WorkspaceCheckpointListFilter, WorkspaceCheckpointRecord,
+    WorkspaceCheckpointFileRecord, WorkspaceCheckpointListFilter,
+    WorkspaceCheckpointPairLinkRequest, WorkspaceCheckpointRecord,
     WorkspaceCheckpointRestoreMarkRequest, WorkspaceDocumentDeleteRequest,
     WorkspaceDocumentListFilter, WorkspaceDocumentMoveRequest, WorkspaceDocumentRecord,
     WorkspaceDocumentVersionRecord, WorkspaceDocumentWriteRequest, WorkspaceRestoreActivityFilter,
@@ -4373,6 +4374,27 @@ impl GatewayRuntimeState {
         tokio::task::spawn_blocking(move || state.create_workspace_checkpoint_blocking(&request))
             .await
             .map_err(|_| Status::internal("workspace checkpoint worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn link_workspace_checkpoint_pair_blocking(
+        &self,
+        request: &WorkspaceCheckpointPairLinkRequest,
+    ) -> Result<(), Status> {
+        self.journal_store
+            .link_workspace_checkpoint_pair(request)
+            .map_err(|error| map_orchestrator_store_error("link workspace checkpoint pair", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn link_workspace_checkpoint_pair(
+        self: &Arc<Self>,
+        request: WorkspaceCheckpointPairLinkRequest,
+    ) -> Result<(), Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.link_workspace_checkpoint_pair_blocking(&request))
+            .await
+            .map_err(|_| Status::internal("workspace checkpoint pair worker panicked"))?
     }
 
     #[allow(clippy::result_large_err)]

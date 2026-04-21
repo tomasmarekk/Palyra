@@ -9,6 +9,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use palyra_common::workspace_patch::WorkspacePatchFileAttestation;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::Digest;
 use tonic::Status;
 use ulid::Ulid;
 
@@ -55,6 +56,11 @@ pub(crate) struct WorkspaceCheckpointSummary {
     pub run_id: String,
     pub source_kind: String,
     pub source_label: String,
+    pub checkpoint_stage: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mutation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paired_checkpoint_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -65,6 +71,9 @@ pub(crate) struct WorkspaceCheckpointSummary {
     pub channel: Option<String>,
     pub summary_text: String,
     pub diff_summary: Value,
+    pub compare_summary: Value,
+    pub risk_level: String,
+    pub review_posture: String,
     pub created_at_unix_ms: i64,
     pub restore_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -180,8 +189,43 @@ pub(crate) struct WorkspacePatchCheckpointCapture<'a> {
     pub run_id: &'a str,
     pub tool_name: &'a str,
     pub proposal_id: &'a str,
+    pub checkpoint_stage: WorkspacePatchCheckpointStage,
+    pub mutation_id: Option<&'a str>,
+    pub paired_checkpoint_id: Option<&'a str>,
+    pub compare_summary_json: &'a str,
+    pub risk_level: &'a str,
+    pub review_posture: &'a str,
     pub workspace_roots: &'a [PathBuf],
     pub files_touched: &'a [WorkspacePatchFileAttestation],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkspacePatchCheckpointStage {
+    Preflight,
+    PostChange,
+}
+
+impl WorkspacePatchCheckpointStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Preflight => "preflight",
+            Self::PostChange => "post_change",
+        }
+    }
+
+    fn source_kind(self) -> &'static str {
+        match self {
+            Self::Preflight => "tool_preflight",
+            Self::PostChange => "tool_result",
+        }
+    }
+
+    fn source_label(self) -> &'static str {
+        match self {
+            Self::Preflight => "Workspace patch preflight",
+            Self::PostChange => "Workspace patch",
+        }
+    }
 }
 
 pub(crate) struct WorkspaceArtifactListQuery<'a> {
@@ -700,6 +744,10 @@ async fn aggregate_run_workspace_artifacts(
                 .checkpoint
                 .created_at_unix_ms
                 .cmp(&left.checkpoint.created_at_unix_ms)
+                .then_with(|| {
+                    checkpoint_stage_order(right.checkpoint.checkpoint_stage.as_str())
+                        .cmp(&checkpoint_stage_order(left.checkpoint.checkpoint_stage.as_str()))
+                })
                 .then_with(|| right.checkpoint.checkpoint_id.cmp(&left.checkpoint.checkpoint_id))
         });
         let latest = versions
@@ -944,12 +992,23 @@ async fn collect_workspace_state_for_checkpoint(
         .await?;
     checkpoints.retain(|candidate| {
         candidate.created_at_unix_ms < checkpoint.created_at_unix_ms
-            || (candidate.created_at_unix_ms == checkpoint.created_at_unix_ms
-                && candidate.checkpoint_id <= checkpoint.checkpoint_id)
+            || (candidate.created_at_unix_ms == checkpoint.created_at_unix_ms && {
+                let candidate_stage_order =
+                    checkpoint_stage_order(candidate.checkpoint_stage.as_str());
+                let target_stage_order =
+                    checkpoint_stage_order(checkpoint.checkpoint_stage.as_str());
+                candidate_stage_order < target_stage_order
+                    || (candidate_stage_order == target_stage_order
+                        && candidate.checkpoint_id <= checkpoint.checkpoint_id)
+            })
     });
     checkpoints.sort_by(|left, right| {
         left.created_at_unix_ms
             .cmp(&right.created_at_unix_ms)
+            .then_with(|| {
+                checkpoint_stage_order(left.checkpoint_stage.as_str())
+                    .cmp(&checkpoint_stage_order(right.checkpoint_stage.as_str()))
+            })
             .then_with(|| left.checkpoint_id.cmp(&right.checkpoint_id))
     });
 
@@ -1033,6 +1092,9 @@ fn workspace_checkpoint_summary(
         run_id: checkpoint.run_id,
         source_kind: checkpoint.source_kind,
         source_label: checkpoint.source_label,
+        checkpoint_stage: checkpoint.checkpoint_stage,
+        mutation_id: checkpoint.mutation_id,
+        paired_checkpoint_id: checkpoint.paired_checkpoint_id,
         tool_name: checkpoint.tool_name,
         proposal_id: checkpoint.proposal_id,
         actor_principal: checkpoint.actor_principal,
@@ -1040,6 +1102,9 @@ fn workspace_checkpoint_summary(
         channel: checkpoint.channel,
         summary_text: checkpoint.summary_text,
         diff_summary: parse_diff_summary_value(checkpoint.diff_summary_json.as_str()),
+        compare_summary: parse_diff_summary_value(checkpoint.compare_summary_json.as_str()),
+        risk_level: checkpoint.risk_level,
+        review_posture: checkpoint.review_posture,
         created_at_unix_ms: checkpoint.created_at_unix_ms,
         restore_count: checkpoint.restore_count,
         last_restored_at_unix_ms: checkpoint.last_restored_at_unix_ms,
@@ -1251,7 +1316,7 @@ pub(crate) async fn capture_workspace_patch_checkpoint(
         return Ok(None);
     }
 
-    let mut files = Vec::with_capacity(input.files_touched.len());
+    let mut files = Vec::new();
     let mut created = 0usize;
     let mut updated = 0usize;
     let mut deleted = 0usize;
@@ -1264,7 +1329,11 @@ pub(crate) async fn capture_workspace_patch_checkpoint(
             "move" => moved += 1,
             _ => updated += 1,
         }
-        files.push(build_workspace_checkpoint_file(input.workspace_roots, attestation)?);
+        files.extend(build_workspace_checkpoint_files(
+            input.checkpoint_stage,
+            input.workspace_roots,
+            attestation,
+        )?);
     }
 
     let checkpoint = runtime_state
@@ -1272,8 +1341,11 @@ pub(crate) async fn capture_workspace_patch_checkpoint(
             checkpoint_id: Ulid::new().to_string(),
             session_id: input.session_id.to_owned(),
             run_id: input.run_id.to_owned(),
-            source_kind: "tool_result".to_owned(),
-            source_label: "Workspace patch".to_owned(),
+            source_kind: input.checkpoint_stage.source_kind().to_owned(),
+            source_label: input.checkpoint_stage.source_label().to_owned(),
+            checkpoint_stage: input.checkpoint_stage.as_str().to_owned(),
+            mutation_id: input.mutation_id.map(str::to_owned),
+            paired_checkpoint_id: input.paired_checkpoint_id.map(str::to_owned),
             tool_name: Some(input.tool_name.to_owned()),
             proposal_id: Some(input.proposal_id.to_owned()),
             actor_principal: input.principal.to_owned(),
@@ -1294,13 +1366,31 @@ pub(crate) async fn capture_workspace_patch_checkpoint(
                 "paths": input.files_touched.iter().map(|file| file.path.clone()).collect::<Vec<_>>(),
             })
             .to_string(),
+            compare_summary_json: input.compare_summary_json.to_owned(),
+            risk_level: input.risk_level.to_owned(),
+            review_posture: input.review_posture.to_owned(),
             files,
         })
         .await?;
     Ok(Some(checkpoint))
 }
 
-fn build_workspace_checkpoint_file(
+fn build_workspace_checkpoint_files(
+    stage: WorkspacePatchCheckpointStage,
+    workspace_roots: &[PathBuf],
+    attestation: &WorkspacePatchFileAttestation,
+) -> Result<Vec<WorkspaceCheckpointFileCreateRequest>, Status> {
+    match stage {
+        WorkspacePatchCheckpointStage::PostChange => {
+            Ok(vec![build_post_change_checkpoint_file(workspace_roots, attestation)?])
+        }
+        WorkspacePatchCheckpointStage::Preflight => {
+            build_preflight_checkpoint_files(workspace_roots, attestation)
+        }
+    }
+}
+
+fn build_post_change_checkpoint_file(
     workspace_roots: &[PathBuf],
     attestation: &WorkspacePatchFileAttestation,
 ) -> Result<WorkspaceCheckpointFileCreateRequest, Status> {
@@ -1338,6 +1428,129 @@ fn build_workspace_checkpoint_file(
         search_text,
         content_bytes,
     })
+}
+
+fn build_preflight_checkpoint_files(
+    workspace_roots: &[PathBuf],
+    attestation: &WorkspacePatchFileAttestation,
+) -> Result<Vec<WorkspaceCheckpointFileCreateRequest>, Status> {
+    match attestation.operation.as_str() {
+        "create" => Ok(vec![build_absent_checkpoint_file(
+            attestation.path.clone(),
+            attestation.workspace_root_index,
+            None,
+            "preflight_create",
+        )]),
+        "move" => {
+            let source_path = attestation.moved_from.clone().ok_or_else(|| {
+                Status::internal("workspace preflight move checkpoint missing source path")
+            })?;
+            Ok(vec![
+                build_existing_checkpoint_file(
+                    workspace_roots,
+                    source_path.clone(),
+                    attestation.workspace_root_index,
+                    None,
+                    "preflight_move_source",
+                    attestation.before_sha256.clone(),
+                    attestation.before_size_bytes,
+                )?,
+                build_absent_checkpoint_file(
+                    attestation.path.clone(),
+                    attestation.workspace_root_index,
+                    Some(source_path),
+                    "preflight_move_destination",
+                ),
+            ])
+        }
+        "delete" => Ok(vec![build_existing_checkpoint_file(
+            workspace_roots,
+            attestation.path.clone(),
+            attestation.workspace_root_index,
+            None,
+            "preflight_delete",
+            attestation.before_sha256.clone(),
+            attestation.before_size_bytes,
+        )?]),
+        _ => Ok(vec![build_existing_checkpoint_file(
+            workspace_roots,
+            attestation.path.clone(),
+            attestation.workspace_root_index,
+            attestation.moved_from.clone(),
+            "preflight_update",
+            attestation.before_sha256.clone(),
+            attestation.before_size_bytes,
+        )?]),
+    }
+}
+
+fn build_existing_checkpoint_file(
+    workspace_roots: &[PathBuf],
+    path: String,
+    workspace_root_index: usize,
+    moved_from_path: Option<String>,
+    change_kind: &str,
+    content_sha256: Option<String>,
+    size_bytes: Option<u64>,
+) -> Result<WorkspaceCheckpointFileCreateRequest, Status> {
+    let workspace_root = workspace_roots
+        .get(workspace_root_index)
+        .ok_or_else(|| Status::internal("workspace checkpoint root index is out of range"))?;
+    let absolute_path = workspace_root.join(Path::new(path.as_str()));
+    let content_bytes = fs::read(absolute_path.as_path()).map_err(|error| {
+        Status::internal(format!(
+            "failed to read workspace preflight artifact {}: {error}",
+            absolute_path.display()
+        ))
+    })?;
+    let content_sha256 = content_sha256
+        .unwrap_or_else(|| hex::encode(sha2::Sha256::digest(content_bytes.as_slice())));
+    let size_bytes = size_bytes.unwrap_or(content_bytes.len() as u64);
+    let content_type = infer_content_type(path.as_str(), Some(content_bytes.as_slice()));
+    let (is_text, preview_text, search_text) =
+        summarize_workspace_content(content_type.as_str(), Some(content_bytes.as_slice()));
+
+    Ok(WorkspaceCheckpointFileCreateRequest {
+        artifact_id: Ulid::new().to_string(),
+        path,
+        workspace_root_index: workspace_root_index as u32,
+        moved_from_path,
+        change_kind: change_kind.to_owned(),
+        before_content_sha256: Some(content_sha256.clone()),
+        before_size_bytes: Some(size_bytes),
+        after_content_sha256: Some(content_sha256),
+        after_size_bytes: Some(size_bytes),
+        content_type,
+        is_text,
+        preview_text,
+        search_text,
+        content_bytes: Some(content_bytes),
+    })
+}
+
+fn build_absent_checkpoint_file(
+    path: String,
+    workspace_root_index: usize,
+    moved_from_path: Option<String>,
+    change_kind: &str,
+) -> WorkspaceCheckpointFileCreateRequest {
+    let content_type = infer_content_type(path.as_str(), None);
+    WorkspaceCheckpointFileCreateRequest {
+        artifact_id: Ulid::new().to_string(),
+        path,
+        workspace_root_index: workspace_root_index as u32,
+        moved_from_path,
+        change_kind: change_kind.to_owned(),
+        before_content_sha256: None,
+        before_size_bytes: None,
+        after_content_sha256: None,
+        after_size_bytes: None,
+        content_type,
+        is_text: false,
+        preview_text: None,
+        search_text: None,
+        content_bytes: None,
+    }
 }
 
 fn infer_content_type(path: &str, content_bytes: Option<&[u8]>) -> String {
@@ -1411,6 +1624,14 @@ impl WorkspaceCheckpointFileRecordExt for WorkspaceCheckpointFileRecord {
     }
 }
 
+fn checkpoint_stage_order(stage: &str) -> u8 {
+    match stage {
+        "preflight" => 0,
+        "post_change" => 1,
+        _ => 2,
+    }
+}
+
 struct LoadedCompareAnchor {
     summary: WorkspaceAnchorSummary,
     artifacts: BTreeMap<WorkspaceArtifactKey, WorkspaceArtifactEntry>,
@@ -1419,9 +1640,12 @@ struct LoadedCompareAnchor {
 #[cfg(test)]
 mod tests {
     use super::{
-        artifact_matches_query, build_line_diff_preview, infer_content_type,
-        summarize_workspace_content, WorkspaceArtifactRecord, WorkspaceArtifactVersion,
+        artifact_matches_query, build_line_diff_preview, build_preflight_checkpoint_files,
+        infer_content_type, summarize_workspace_content, WorkspaceArtifactRecord,
+        WorkspaceArtifactVersion,
     };
+    use palyra_common::workspace_patch::WorkspacePatchFileAttestation;
+    use sha2::{Digest, Sha256};
 
     fn sample_artifact() -> WorkspaceArtifactRecord {
         WorkspaceArtifactRecord {
@@ -1476,6 +1700,46 @@ mod tests {
         assert!(!is_text);
         assert!(preview.is_none());
         assert!(search.is_none());
+    }
+
+    #[test]
+    fn preflight_move_checkpoint_restores_source_and_removes_destination() {
+        let tempdir = tempfile::tempdir().expect("workspace tempdir should be created");
+        let source_parent = tempdir.path().join("src");
+        std::fs::create_dir_all(source_parent.as_path()).expect("source parent should be created");
+        let source_path = source_parent.join("old.rs");
+        std::fs::write(source_path.as_path(), b"old").expect("source file should be written");
+        let before_sha256 = hex::encode(Sha256::digest(b"old"));
+
+        let files = build_preflight_checkpoint_files(
+            &[tempdir.path().to_path_buf()],
+            &WorkspacePatchFileAttestation {
+                path: "src/new.rs".to_owned(),
+                workspace_root_index: 0,
+                operation: "move".to_owned(),
+                moved_from: Some("src/old.rs".to_owned()),
+                before_sha256: Some(before_sha256.clone()),
+                before_size_bytes: Some(3),
+                after_sha256: Some(hex::encode(Sha256::digest(b"new"))),
+                after_size_bytes: Some(3),
+            },
+        )
+        .expect("preflight move checkpoint should be captured");
+
+        assert_eq!(files.len(), 2);
+        let source = files
+            .iter()
+            .find(|file| file.path == "src/old.rs")
+            .expect("source restore entry should exist");
+        assert_eq!(source.after_content_sha256.as_deref(), Some(before_sha256.as_str()));
+        assert_eq!(source.content_bytes.as_deref(), Some(&b"old"[..]));
+
+        let destination = files
+            .iter()
+            .find(|file| file.path == "src/new.rs")
+            .expect("destination absence entry should exist");
+        assert!(destination.after_content_sha256.is_none());
+        assert!(destination.content_bytes.is_none());
     }
 
     #[test]
