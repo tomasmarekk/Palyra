@@ -903,6 +903,14 @@ export interface ChatDelegationMergeContract {
   approval_required: boolean;
 }
 
+export interface ChatDelegationRuntimeLimits {
+  max_concurrent_children: number;
+  max_children_per_parent: number;
+  max_parallel_groups: number;
+  child_budget_override?: number;
+  child_timeout_ms: number;
+}
+
 export interface ChatDelegationSnapshot {
   profile_id: string;
   display_name: string;
@@ -918,6 +926,7 @@ export interface ChatDelegationSnapshot {
   budget_tokens: number;
   max_attempts: number;
   merge_contract: ChatDelegationMergeContract;
+  runtime_limits: ChatDelegationRuntimeLimits;
   agent_id?: string;
 }
 
@@ -989,6 +998,7 @@ export interface ChatDelegationProfileDefinition {
   max_attempts: number;
   execution_mode: "serial" | "parallel";
   merge_contract: ChatDelegationMergeContract;
+  runtime_limits: ChatDelegationRuntimeLimits;
 }
 
 export interface ChatDelegationTemplateDefinition {
@@ -999,6 +1009,7 @@ export interface ChatDelegationTemplateDefinition {
   recommended_profiles: string[];
   execution_mode: "serial" | "parallel";
   merge_strategy: string;
+  runtime_limits?: ChatDelegationRuntimeLimits;
   examples: string[];
 }
 
@@ -5167,6 +5178,11 @@ export class ConsoleApiClient {
           max_attempts?: number;
           merge_strategy?: string;
           approval_required?: boolean;
+          max_concurrent_children?: number;
+          max_children_per_parent?: number;
+          max_parallel_groups?: number;
+          child_budget_override?: number;
+          child_timeout_ms?: number;
         };
       };
     },

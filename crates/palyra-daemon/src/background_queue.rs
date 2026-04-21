@@ -63,7 +63,7 @@ async fn poll_background_queue(
             channel: None,
             session_id: None,
             include_completed: false,
-            limit: 32,
+            limit: 256,
         })
         .await?;
     for task in tasks.iter() {
@@ -205,6 +205,9 @@ async fn process_background_task(
             if let Some(run) = snapshot.as_ref() {
                 if is_terminal_run_state(run.state.as_str()) {
                     finalize_task_from_run(runtime, task, Some(run), run.state.as_str()).await?;
+                } else if let Some(message) = delegated_child_timeout_message(task, now) {
+                    request_delegated_child_timeout_cancel(runtime, task, target_run_id, message)
+                        .await?;
                 }
                 return Ok(());
             }
@@ -236,7 +239,27 @@ async fn process_background_task(
         return Ok(());
     }
 
+    if let Some(decision) = evaluate_delegation_scheduler_limits(all_tasks, task) {
+        match decision {
+            DelegationSchedulerDecision::Defer { reason, message } => {
+                mark_delegation_task_waiting(runtime, task, reason, message).await?;
+                return Ok(());
+            }
+            DelegationSchedulerDecision::Fail { reason, message } => {
+                fail_delegation_task(runtime, task, reason, message).await?;
+                return Ok(());
+            }
+        }
+    }
+
     if task_is_blocked_by_serial_sibling(all_tasks, task) {
+        mark_delegation_task_waiting(
+            runtime,
+            task,
+            "flow_dependency",
+            "delegated child is waiting for an earlier serial sibling".to_owned(),
+        )
+        .await?;
         return Ok(());
     }
 
@@ -492,6 +515,268 @@ async fn dispatch_auxiliary_executor_task(
         }
     });
     Ok(())
+}
+
+enum DelegationSchedulerDecision {
+    Defer { reason: &'static str, message: String },
+    Fail { reason: &'static str, message: String },
+}
+
+fn evaluate_delegation_scheduler_limits(
+    all_tasks: &[OrchestratorBackgroundTaskRecord],
+    task: &OrchestratorBackgroundTaskRecord,
+) -> Option<DelegationSchedulerDecision> {
+    let delegation = task.delegation.as_ref()?;
+    let parent_run_id = task.parent_run_id.as_deref()?;
+    let limits = &delegation.runtime_limits;
+    let child_rank = delegated_child_rank_for_parent(all_tasks, task, parent_run_id);
+    if child_rank > limits.max_children_per_parent {
+        return Some(DelegationSchedulerDecision::Fail {
+            reason: "max_children_per_parent",
+            message: format!(
+                "delegated child would exceed max_children_per_parent={} for parent run {}",
+                limits.max_children_per_parent, parent_run_id
+            ),
+        });
+    }
+
+    let running_children =
+        running_delegated_children_for_parent(all_tasks, parent_run_id).collect::<Vec<_>>();
+    let running_child_count = u64::try_from(running_children.len()).unwrap_or(u64::MAX);
+    if running_child_count >= limits.max_concurrent_children {
+        return Some(DelegationSchedulerDecision::Defer {
+            reason: "max_concurrent_children",
+            message: format!(
+                "delegated child is waiting for max_concurrent_children={} under parent run {}",
+                limits.max_concurrent_children, parent_run_id
+            ),
+        });
+    }
+
+    if delegation.execution_mode == DelegationExecutionMode::Parallel {
+        let mut active_groups = Vec::<&str>::new();
+        for running in running_children {
+            let Some(running_delegation) = running.delegation.as_ref() else {
+                continue;
+            };
+            if running_delegation.execution_mode != DelegationExecutionMode::Parallel {
+                continue;
+            }
+            let group_id = running_delegation.group_id.as_str();
+            if !active_groups.iter().any(|candidate| *candidate == group_id) {
+                active_groups.push(group_id);
+            }
+        }
+        let current_group_active =
+            active_groups.iter().any(|candidate| *candidate == delegation.group_id.as_str());
+        let active_group_count = u64::try_from(active_groups.len()).unwrap_or(u64::MAX);
+        if !current_group_active && active_group_count >= limits.max_parallel_groups {
+            return Some(DelegationSchedulerDecision::Defer {
+                reason: "max_parallel_groups",
+                message: format!(
+                    "delegated child is waiting for max_parallel_groups={} under parent run {}",
+                    limits.max_parallel_groups, parent_run_id
+                ),
+            });
+        }
+    }
+
+    None
+}
+
+fn delegated_child_rank_for_parent(
+    all_tasks: &[OrchestratorBackgroundTaskRecord],
+    task: &OrchestratorBackgroundTaskRecord,
+    parent_run_id: &str,
+) -> u64 {
+    let rank = all_tasks
+        .iter()
+        .filter(|candidate| {
+            candidate.parent_run_id.as_deref() == Some(parent_run_id)
+                && candidate.delegation.is_some()
+                && !is_terminal_task_state(candidate.state.as_str())
+                && task_precedes_or_equals(candidate, task)
+        })
+        .count();
+    u64::try_from(rank).unwrap_or(u64::MAX)
+}
+
+fn running_delegated_children_for_parent<'a>(
+    all_tasks: &'a [OrchestratorBackgroundTaskRecord],
+    parent_run_id: &'a str,
+) -> impl Iterator<Item = &'a OrchestratorBackgroundTaskRecord> {
+    all_tasks.iter().filter(move |candidate| {
+        candidate.parent_run_id.as_deref() == Some(parent_run_id)
+            && candidate.delegation.is_some()
+            && matches!(
+                AuxiliaryTaskState::from_str(candidate.state.as_str()),
+                Some(AuxiliaryTaskState::Running | AuxiliaryTaskState::CancelRequested)
+            )
+            && candidate.target_run_id.is_some()
+    })
+}
+
+fn task_precedes_or_equals(
+    candidate: &OrchestratorBackgroundTaskRecord,
+    task: &OrchestratorBackgroundTaskRecord,
+) -> bool {
+    candidate.created_at_unix_ms < task.created_at_unix_ms
+        || (candidate.created_at_unix_ms == task.created_at_unix_ms
+            && candidate.task_id.as_str() <= task.task_id.as_str())
+}
+
+async fn mark_delegation_task_waiting(
+    runtime: &Arc<GatewayRuntimeState>,
+    task: &OrchestratorBackgroundTaskRecord,
+    reason: &'static str,
+    message: String,
+) -> Result<(), Status> {
+    if task.last_error.as_deref() == Some(message.as_str()) {
+        return Ok(());
+    }
+    runtime
+        .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
+            task_id: task.task_id.clone(),
+            state: None,
+            target_run_id: None,
+            increment_attempt_count: false,
+            last_error: Some(Some(message.clone())),
+            result_json: Some(Some(
+                json!({
+                    "status": "waiting",
+                    "task_id": task.task_id,
+                    "reason": reason,
+                    "message": message,
+                })
+                .to_string(),
+            )),
+            started_at_unix_ms: None,
+            completed_at_unix_ms: None,
+        })
+        .await?;
+    append_child_lifecycle_event(
+        runtime,
+        task,
+        None,
+        "child_waiting",
+        reason,
+        true,
+        json!({
+            "reason": reason,
+            "message": message,
+            "runtime_limits": task.delegation.as_ref().map(|delegation| &delegation.runtime_limits),
+        }),
+    )
+    .await
+}
+
+async fn fail_delegation_task(
+    runtime: &Arc<GatewayRuntimeState>,
+    task: &OrchestratorBackgroundTaskRecord,
+    reason: &'static str,
+    message: String,
+) -> Result<(), Status> {
+    let completed_at_unix_ms = crate::gateway::current_unix_ms();
+    runtime
+        .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
+            task_id: task.task_id.clone(),
+            state: Some(AuxiliaryTaskState::Failed.as_str().to_owned()),
+            target_run_id: Some(None),
+            increment_attempt_count: false,
+            last_error: Some(Some(message.clone())),
+            result_json: Some(Some(
+                json!({
+                    "status": "failed",
+                    "task_id": task.task_id,
+                    "reason": reason,
+                    "error": message,
+                    "runtime_limits": task.delegation.as_ref().map(|delegation| &delegation.runtime_limits),
+                })
+                .to_string(),
+            )),
+            started_at_unix_ms: None,
+            completed_at_unix_ms: Some(Some(completed_at_unix_ms)),
+        })
+        .await?;
+    append_child_lifecycle_event(
+        runtime,
+        task,
+        None,
+        "child_failed",
+        reason,
+        true,
+        json!({
+            "reason": reason,
+            "message": message,
+        }),
+    )
+    .await?;
+    runtime.clear_self_healing_heartbeat(WorkHeartbeatKind::BackgroundTask, task.task_id.as_str());
+    Ok(())
+}
+
+fn delegated_child_timeout_message(
+    task: &OrchestratorBackgroundTaskRecord,
+    now_unix_ms: i64,
+) -> Option<String> {
+    let delegation = task.delegation.as_ref()?;
+    let started_at_unix_ms = task.started_at_unix_ms?;
+    let timeout_ms = i64::try_from(delegation.runtime_limits.child_timeout_ms).unwrap_or(i64::MAX);
+    let elapsed_ms = now_unix_ms.saturating_sub(started_at_unix_ms);
+    (elapsed_ms >= timeout_ms).then(|| {
+        format!(
+            "delegated child timed out after {} ms (limit {} ms)",
+            elapsed_ms, delegation.runtime_limits.child_timeout_ms
+        )
+    })
+}
+
+async fn request_delegated_child_timeout_cancel(
+    runtime: &Arc<GatewayRuntimeState>,
+    task: &OrchestratorBackgroundTaskRecord,
+    target_run_id: &str,
+    message: String,
+) -> Result<(), Status> {
+    runtime
+        .request_orchestrator_cancel(crate::journal::OrchestratorCancelRequest {
+            run_id: target_run_id.to_owned(),
+            reason: "delegated_child_timeout".to_owned(),
+        })
+        .await?;
+    runtime
+        .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
+            task_id: task.task_id.clone(),
+            state: Some(AuxiliaryTaskState::CancelRequested.as_str().to_owned()),
+            target_run_id: None,
+            increment_attempt_count: false,
+            last_error: Some(Some(message.clone())),
+            result_json: Some(Some(
+                json!({
+                    "status": "cancel_requested",
+                    "task_id": task.task_id,
+                    "run_id": target_run_id,
+                    "reason": "child_timeout",
+                    "message": message,
+                })
+                .to_string(),
+            )),
+            started_at_unix_ms: None,
+            completed_at_unix_ms: None,
+        })
+        .await?;
+    append_child_lifecycle_event(
+        runtime,
+        task,
+        Some(target_run_id),
+        "child_failed",
+        "timeout_cancel_requested",
+        true,
+        json!({
+            "reason": "child_timeout",
+            "message": message,
+        }),
+    )
+    .await
 }
 
 async fn run_background_task_stream(
@@ -1616,11 +1901,19 @@ fn is_terminal_run_state(state: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{append_artifact_references, categorize_child_failure};
-    use crate::{
-        delegation::{DelegationMergeApprovalSummary, DelegationMergeFailureCategory},
-        journal::OrchestratorRunStatusSnapshot,
+    use super::{
+        append_artifact_references, categorize_child_failure, delegated_child_timeout_message,
+        evaluate_delegation_scheduler_limits, DelegationSchedulerDecision,
     };
+    use crate::{
+        delegation::{
+            DelegationExecutionMode, DelegationMemoryScopeKind, DelegationMergeApprovalSummary,
+            DelegationMergeContract, DelegationMergeFailureCategory, DelegationMergeStrategy,
+            DelegationRole, DelegationRuntimeLimits, DelegationSnapshot,
+        },
+        journal::{OrchestratorBackgroundTaskRecord, OrchestratorRunStatusSnapshot},
+    };
+    use palyra_common::runtime_contracts::AuxiliaryTaskState;
     use serde_json::json;
 
     #[test]
@@ -1670,6 +1963,91 @@ mod tests {
         );
     }
 
+    #[test]
+    fn evaluate_delegation_scheduler_limits_defers_for_concurrency() {
+        let limits = DelegationRuntimeLimits {
+            max_concurrent_children: 1,
+            max_children_per_parent: 8,
+            max_parallel_groups: 2,
+            child_budget_override: None,
+            child_timeout_ms: 60_000,
+        };
+        let running = sample_task(
+            "task-running",
+            AuxiliaryTaskState::Running.as_str(),
+            10,
+            "group-a",
+            limits.clone(),
+        );
+        let queued =
+            sample_task("task-queued", AuxiliaryTaskState::Queued.as_str(), 20, "group-b", limits);
+
+        let decision = evaluate_delegation_scheduler_limits(&[running, queued.clone()], &queued)
+            .expect("queued child should be deferred");
+        match decision {
+            DelegationSchedulerDecision::Defer { reason, .. } => {
+                assert_eq!(reason, "max_concurrent_children");
+            }
+            DelegationSchedulerDecision::Fail { .. } => {
+                panic!("concurrency pressure should defer, not fail");
+            }
+        }
+    }
+
+    #[test]
+    fn evaluate_delegation_scheduler_limits_fails_child_overflow() {
+        let limits = DelegationRuntimeLimits {
+            max_concurrent_children: 4,
+            max_children_per_parent: 1,
+            max_parallel_groups: 2,
+            child_budget_override: None,
+            child_timeout_ms: 60_000,
+        };
+        let older = sample_task(
+            "task-older",
+            AuxiliaryTaskState::Queued.as_str(),
+            10,
+            "group-a",
+            limits.clone(),
+        );
+        let current =
+            sample_task("task-current", AuxiliaryTaskState::Queued.as_str(), 20, "group-b", limits);
+
+        let decision = evaluate_delegation_scheduler_limits(&[older, current.clone()], &current)
+            .expect("overflow child should fail closed");
+        match decision {
+            DelegationSchedulerDecision::Fail { reason, .. } => {
+                assert_eq!(reason, "max_children_per_parent");
+            }
+            DelegationSchedulerDecision::Defer { .. } => {
+                panic!("child overflow should fail closed");
+            }
+        }
+    }
+
+    #[test]
+    fn delegated_child_timeout_message_uses_runtime_limit() {
+        let mut task = sample_task(
+            "task-timeout",
+            AuxiliaryTaskState::Running.as_str(),
+            10,
+            "group-a",
+            DelegationRuntimeLimits {
+                max_concurrent_children: 1,
+                max_children_per_parent: 8,
+                max_parallel_groups: 1,
+                child_budget_override: None,
+                child_timeout_ms: 25,
+            },
+        );
+        task.started_at_unix_ms = Some(100);
+
+        assert!(delegated_child_timeout_message(&task, 124).is_none());
+        assert!(delegated_child_timeout_message(&task, 125)
+            .expect("task should time out at the limit")
+            .contains("limit 25 ms"));
+    }
+
     fn sample_run(state: &str, last_error: Option<&str>) -> OrchestratorRunStatusSnapshot {
         OrchestratorRunStatusSnapshot {
             run_id: "child-run".to_owned(),
@@ -1696,6 +2074,65 @@ mod tests {
             delegation: None,
             merge_result: None,
             tape_events: 0,
+        }
+    }
+
+    fn sample_task(
+        task_id: &str,
+        state: &str,
+        created_at_unix_ms: i64,
+        group_id: &str,
+        runtime_limits: DelegationRuntimeLimits,
+    ) -> OrchestratorBackgroundTaskRecord {
+        OrchestratorBackgroundTaskRecord {
+            task_id: task_id.to_owned(),
+            task_kind: "delegation_prompt".to_owned(),
+            session_id: "session".to_owned(),
+            parent_run_id: Some("parent-run".to_owned()),
+            target_run_id: (state == AuxiliaryTaskState::Running.as_str())
+                .then(|| format!("run-{task_id}")),
+            queued_input_id: None,
+            owner_principal: "principal".to_owned(),
+            device_id: "device".to_owned(),
+            channel: Some("web".to_owned()),
+            state: state.to_owned(),
+            priority: 0,
+            attempt_count: 0,
+            max_attempts: 3,
+            budget_tokens: runtime_limits.child_budget_override.unwrap_or(1_000),
+            delegation: Some(DelegationSnapshot {
+                profile_id: "research".to_owned(),
+                display_name: "Research".to_owned(),
+                description: None,
+                template_id: None,
+                role: DelegationRole::Research,
+                execution_mode: DelegationExecutionMode::Parallel,
+                group_id: group_id.to_owned(),
+                model_profile: "gpt-4o-mini".to_owned(),
+                tool_allowlist: Vec::new(),
+                skill_allowlist: Vec::new(),
+                memory_scope: DelegationMemoryScopeKind::ParentSession,
+                budget_tokens: runtime_limits.child_budget_override.unwrap_or(1_000),
+                max_attempts: 3,
+                merge_contract: DelegationMergeContract {
+                    strategy: DelegationMergeStrategy::Summarize,
+                    approval_required: false,
+                },
+                runtime_limits,
+                agent_id: Some("main".to_owned()),
+            }),
+            not_before_unix_ms: None,
+            expires_at_unix_ms: None,
+            notification_target_json: None,
+            input_text: Some("delegate".to_owned()),
+            payload_json: None,
+            last_error: None,
+            result_json: None,
+            created_at_unix_ms,
+            updated_at_unix_ms: created_at_unix_ms,
+            started_at_unix_ms: (state == AuxiliaryTaskState::Running.as_str())
+                .then_some(created_at_unix_ms),
+            completed_at_unix_ms: None,
         }
     }
 }

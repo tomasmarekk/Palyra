@@ -3,8 +3,16 @@ use tonic::Status;
 
 const DEFAULT_MODEL_PROFILE: &str = "gpt-4o-mini";
 const DEFAULT_MAX_ATTEMPTS: u64 = 3;
+const DEFAULT_MAX_CONCURRENT_CHILDREN: u64 = 2;
+const DEFAULT_MAX_CHILDREN_PER_PARENT: u64 = 8;
+const DEFAULT_MAX_PARALLEL_GROUPS: u64 = 2;
+const DEFAULT_CHILD_TIMEOUT_MS: u64 = 10 * 60 * 1_000;
 const MAX_DELEGATION_BUDGET_TOKENS: u64 = 32_768;
 const MAX_DELEGATION_ATTEMPTS: u64 = 16;
+const MAX_DELEGATION_CONCURRENT_CHILDREN: u64 = 16;
+const MAX_DELEGATION_CHILDREN_PER_PARENT: u64 = 64;
+const MAX_DELEGATION_PARALLEL_GROUPS: u64 = 16;
+const MAX_DELEGATION_CHILD_TIMEOUT_MS: u64 = 6 * 60 * 60 * 1_000;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -48,6 +56,28 @@ pub struct DelegationMergeContract {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DelegationRuntimeLimits {
+    pub max_concurrent_children: u64,
+    pub max_children_per_parent: u64,
+    pub max_parallel_groups: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_budget_override: Option<u64>,
+    pub child_timeout_ms: u64,
+}
+
+impl Default for DelegationRuntimeLimits {
+    fn default() -> Self {
+        Self {
+            max_concurrent_children: DEFAULT_MAX_CONCURRENT_CHILDREN,
+            max_children_per_parent: DEFAULT_MAX_CHILDREN_PER_PARENT,
+            max_parallel_groups: DEFAULT_MAX_PARALLEL_GROUPS,
+            child_budget_override: None,
+            child_timeout_ms: DEFAULT_CHILD_TIMEOUT_MS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DelegationSnapshot {
     pub profile_id: String,
     pub display_name: String,
@@ -65,6 +95,8 @@ pub struct DelegationSnapshot {
     pub budget_tokens: u64,
     pub max_attempts: u64,
     pub merge_contract: DelegationMergeContract,
+    #[serde(default)]
+    pub runtime_limits: DelegationRuntimeLimits,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
 }
@@ -167,6 +199,8 @@ pub struct DelegationProfileDefinition {
     pub max_attempts: u64,
     pub execution_mode: DelegationExecutionMode,
     pub merge_contract: DelegationMergeContract,
+    #[serde(default)]
+    pub runtime_limits: DelegationRuntimeLimits,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -178,6 +212,8 @@ pub struct DelegationTemplateDefinition {
     pub recommended_profiles: Vec<String>,
     pub execution_mode: DelegationExecutionMode,
     pub merge_strategy: DelegationMergeStrategy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_limits: Option<DelegationRuntimeLimits>,
     pub examples: Vec<String>,
 }
 
@@ -227,6 +263,16 @@ pub struct DelegationManifestInput {
     pub merge_strategy: Option<DelegationMergeStrategy>,
     #[serde(default)]
     pub approval_required: Option<bool>,
+    #[serde(default)]
+    pub max_concurrent_children: Option<u64>,
+    #[serde(default)]
+    pub max_children_per_parent: Option<u64>,
+    #[serde(default)]
+    pub max_parallel_groups: Option<u64>,
+    #[serde(default)]
+    pub child_budget_override: Option<u64>,
+    #[serde(default)]
+    pub child_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -267,7 +313,19 @@ fn profile_definition(
         max_attempts: DEFAULT_MAX_ATTEMPTS,
         execution_mode,
         merge_contract: DelegationMergeContract { strategy: merge_strategy, approval_required },
+        runtime_limits: default_runtime_limits_for_execution_mode(execution_mode),
     }
+}
+
+fn default_runtime_limits_for_execution_mode(
+    execution_mode: DelegationExecutionMode,
+) -> DelegationRuntimeLimits {
+    let mut limits = DelegationRuntimeLimits::default();
+    if execution_mode == DelegationExecutionMode::Serial {
+        limits.max_concurrent_children = 1;
+        limits.max_parallel_groups = 1;
+    }
+    limits
 }
 
 pub fn built_in_delegation_catalog() -> DelegationCatalog {
@@ -343,6 +401,13 @@ pub fn built_in_delegation_catalog() -> DelegationCatalog {
             recommended_profiles: vec!["research".to_owned(), "synthesis".to_owned()],
             execution_mode: DelegationExecutionMode::Parallel,
             merge_strategy: DelegationMergeStrategy::Compare,
+            runtime_limits: Some(DelegationRuntimeLimits {
+                max_concurrent_children: 2,
+                max_children_per_parent: 8,
+                max_parallel_groups: 2,
+                child_budget_override: None,
+                child_timeout_ms: DEFAULT_CHILD_TIMEOUT_MS,
+            }),
             examples: vec![
                 "/delegate compare_variants Compare the current branch with the release branch for migration risk."
                     .to_owned(),
@@ -356,6 +421,13 @@ pub fn built_in_delegation_catalog() -> DelegationCatalog {
             recommended_profiles: vec!["research".to_owned(), "synthesis".to_owned()],
             execution_mode: DelegationExecutionMode::Serial,
             merge_strategy: DelegationMergeStrategy::Summarize,
+            runtime_limits: Some(DelegationRuntimeLimits {
+                max_concurrent_children: 1,
+                max_children_per_parent: 6,
+                max_parallel_groups: 1,
+                child_budget_override: None,
+                child_timeout_ms: DEFAULT_CHILD_TIMEOUT_MS,
+            }),
             examples: vec![
                 "/delegate research_then_synthesize Read the recent daemon changes and summarize deployment impact."
                     .to_owned(),
@@ -369,6 +441,13 @@ pub fn built_in_delegation_catalog() -> DelegationCatalog {
             recommended_profiles: vec!["review".to_owned(), "patching".to_owned()],
             execution_mode: DelegationExecutionMode::Serial,
             merge_strategy: DelegationMergeStrategy::PatchReview,
+            runtime_limits: Some(DelegationRuntimeLimits {
+                max_concurrent_children: 1,
+                max_children_per_parent: 4,
+                max_parallel_groups: 1,
+                child_budget_override: None,
+                child_timeout_ms: DEFAULT_CHILD_TIMEOUT_MS,
+            }),
             examples: vec![
                 "/delegate review_and_patch Investigate the failing web lint output and propose the minimal fix."
                     .to_owned(),
@@ -383,6 +462,13 @@ pub fn built_in_delegation_catalog() -> DelegationCatalog {
             recommended_profiles: vec!["triage".to_owned(), "research".to_owned()],
             execution_mode: DelegationExecutionMode::Parallel,
             merge_strategy: DelegationMergeStrategy::Triage,
+            runtime_limits: Some(DelegationRuntimeLimits {
+                max_concurrent_children: 3,
+                max_children_per_parent: 10,
+                max_parallel_groups: 3,
+                child_budget_override: None,
+                child_timeout_ms: DEFAULT_CHILD_TIMEOUT_MS,
+            }),
             examples: vec![
                 "/delegate multi_source_triage Triage the failing workflow signals and summarize the probable root causes."
                     .to_owned(),
@@ -472,6 +558,96 @@ fn ensure_attempts(value: u64, field: &str) -> Result<u64, Status> {
     Ok(value)
 }
 
+fn ensure_count_limit(value: u64, field: &str, maximum: u64) -> Result<u64, Status> {
+    if value == 0 {
+        return Err(Status::invalid_argument(format!("{field} must be greater than zero")));
+    }
+    if value > maximum {
+        return Err(Status::invalid_argument(format!("{field} exceeds the supported maximum")));
+    }
+    Ok(value)
+}
+
+fn ensure_child_timeout_ms(value: u64, field: &str) -> Result<u64, Status> {
+    if value == 0 {
+        return Err(Status::invalid_argument(format!("{field} must be greater than zero")));
+    }
+    if value > MAX_DELEGATION_CHILD_TIMEOUT_MS {
+        return Err(Status::invalid_argument(format!(
+            "{field} exceeds the maximum supported child timeout"
+        )));
+    }
+    Ok(value)
+}
+
+fn ensure_runtime_limits(
+    limits: DelegationRuntimeLimits,
+    field: &str,
+) -> Result<DelegationRuntimeLimits, Status> {
+    let child_budget_override = limits
+        .child_budget_override
+        .map(|value| ensure_budget_tokens(value, &format!("{field}.child_budget_override")))
+        .transpose()?;
+    Ok(DelegationRuntimeLimits {
+        max_concurrent_children: ensure_count_limit(
+            limits.max_concurrent_children,
+            &format!("{field}.max_concurrent_children"),
+            MAX_DELEGATION_CONCURRENT_CHILDREN,
+        )?,
+        max_children_per_parent: ensure_count_limit(
+            limits.max_children_per_parent,
+            &format!("{field}.max_children_per_parent"),
+            MAX_DELEGATION_CHILDREN_PER_PARENT,
+        )?,
+        max_parallel_groups: ensure_count_limit(
+            limits.max_parallel_groups,
+            &format!("{field}.max_parallel_groups"),
+            MAX_DELEGATION_PARALLEL_GROUPS,
+        )?,
+        child_budget_override,
+        child_timeout_ms: ensure_child_timeout_ms(
+            limits.child_timeout_ms,
+            &format!("{field}.child_timeout_ms"),
+        )?,
+    })
+}
+
+fn apply_manifest_runtime_overrides(
+    limits: &mut DelegationRuntimeLimits,
+    manifest: &DelegationManifestInput,
+) -> Result<(), Status> {
+    if let Some(value) = manifest.max_concurrent_children {
+        limits.max_concurrent_children = ensure_count_limit(
+            value,
+            "delegation.manifest.max_concurrent_children",
+            MAX_DELEGATION_CONCURRENT_CHILDREN,
+        )?;
+    }
+    if let Some(value) = manifest.max_children_per_parent {
+        limits.max_children_per_parent = ensure_count_limit(
+            value,
+            "delegation.manifest.max_children_per_parent",
+            MAX_DELEGATION_CHILDREN_PER_PARENT,
+        )?;
+    }
+    if let Some(value) = manifest.max_parallel_groups {
+        limits.max_parallel_groups = ensure_count_limit(
+            value,
+            "delegation.manifest.max_parallel_groups",
+            MAX_DELEGATION_PARALLEL_GROUPS,
+        )?;
+    }
+    if let Some(value) = manifest.child_budget_override {
+        limits.child_budget_override =
+            Some(ensure_budget_tokens(value, "delegation.manifest.child_budget_override")?);
+    }
+    if let Some(value) = manifest.child_timeout_ms {
+        limits.child_timeout_ms =
+            ensure_child_timeout_ms(value, "delegation.manifest.child_timeout_ms")?;
+    }
+    Ok(())
+}
+
 fn validate_allowlist_subset(
     field: &str,
     requested: &[String],
@@ -529,6 +705,9 @@ pub fn resolve_delegation_request(
             })?;
         base_profile.execution_mode = template.execution_mode;
         base_profile.merge_contract.strategy = template.merge_strategy;
+        if let Some(runtime_limits) = template.runtime_limits.clone() {
+            base_profile.runtime_limits = runtime_limits;
+        }
         template_id = Some(template.template_id.clone());
     }
 
@@ -579,11 +758,20 @@ pub fn resolve_delegation_request(
         if let Some(approval_required) = manifest.approval_required {
             base_profile.merge_contract.approval_required = approval_required;
         }
+        apply_manifest_runtime_overrides(&mut base_profile.runtime_limits, manifest)?;
     }
 
     let execution_mode = request.execution_mode.unwrap_or(base_profile.execution_mode);
-    let budget_tokens =
-        ensure_budget_tokens(base_profile.budget_tokens, "delegation.budget_tokens")?;
+    if execution_mode == DelegationExecutionMode::Serial {
+        base_profile.runtime_limits.max_concurrent_children = 1;
+        base_profile.runtime_limits.max_parallel_groups = 1;
+    }
+    let runtime_limits =
+        ensure_runtime_limits(base_profile.runtime_limits, "delegation.runtime_limits")?;
+    let budget_tokens = ensure_budget_tokens(
+        runtime_limits.child_budget_override.unwrap_or(base_profile.budget_tokens),
+        "delegation.budget_tokens",
+    )?;
     let max_attempts = ensure_attempts(base_profile.max_attempts, "delegation.max_attempts")?;
     if let Some(parent_budget_tokens) = parent.parent_budget_tokens {
         if budget_tokens > parent_budget_tokens {
@@ -648,6 +836,7 @@ pub fn resolve_delegation_request(
         budget_tokens,
         max_attempts,
         merge_contract: base_profile.merge_contract,
+        runtime_limits,
         agent_id: parent.agent_id.clone(),
     })
 }
@@ -732,5 +921,67 @@ mod tests {
         assert_eq!(snapshot.memory_scope, DelegationMemoryScopeKind::ParentSession);
         assert_eq!(snapshot.budget_tokens, 1_200);
         assert_eq!(snapshot.template_id.as_deref(), Some("research_then_synthesize"));
+    }
+
+    #[test]
+    fn resolve_delegation_request_applies_runtime_overrides_and_budget_ceiling() {
+        let snapshot = resolve_delegation_request(
+            &DelegationRequestInput {
+                profile_id: Some("research".to_owned()),
+                manifest: Some(DelegationManifestInput {
+                    max_concurrent_children: Some(3),
+                    max_children_per_parent: Some(9),
+                    max_parallel_groups: Some(2),
+                    child_budget_override: Some(1_100),
+                    child_timeout_ms: Some(45_000),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            &parent_context(),
+        )
+        .expect("safe runtime overrides should resolve");
+
+        assert_eq!(snapshot.budget_tokens, 1_100);
+        assert_eq!(snapshot.runtime_limits.max_concurrent_children, 3);
+        assert_eq!(snapshot.runtime_limits.max_children_per_parent, 9);
+        assert_eq!(snapshot.runtime_limits.max_parallel_groups, 2);
+        assert_eq!(snapshot.runtime_limits.child_budget_override, Some(1_100));
+        assert_eq!(snapshot.runtime_limits.child_timeout_ms, 45_000);
+
+        let error = resolve_delegation_request(
+            &DelegationRequestInput {
+                manifest: Some(DelegationManifestInput {
+                    child_budget_override: Some(9_999),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            &parent_context(),
+        )
+        .expect_err("child budget override above parent ceiling should fail");
+        assert!(error.message().contains("delegation budget_tokens exceeds"));
+    }
+
+    #[test]
+    fn resolve_delegation_request_forces_serial_runtime_limits() {
+        let snapshot = resolve_delegation_request(
+            &DelegationRequestInput {
+                profile_id: Some("research".to_owned()),
+                execution_mode: Some(DelegationExecutionMode::Serial),
+                manifest: Some(DelegationManifestInput {
+                    max_concurrent_children: Some(4),
+                    max_parallel_groups: Some(3),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            &parent_context(),
+        )
+        .expect("serial override should resolve");
+
+        assert_eq!(snapshot.execution_mode, DelegationExecutionMode::Serial);
+        assert_eq!(snapshot.runtime_limits.max_concurrent_children, 1);
+        assert_eq!(snapshot.runtime_limits.max_parallel_groups, 1);
     }
 }
