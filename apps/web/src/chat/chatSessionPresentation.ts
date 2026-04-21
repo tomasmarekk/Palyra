@@ -143,7 +143,10 @@ export function summarizeDeliveryPayload(payload: JsonValue): DeliveryPresentati
       readObjectPath(arbitration, ["descendant_output"]) ?? {},
       "preferred",
     );
-    const suppressed = readBoolean(readObjectPath(arbitration, ["parent_output"]) ?? {}, "suppressed");
+    const suppressed = readBoolean(
+      readObjectPath(arbitration, ["parent_output"]) ?? {},
+      "suppressed",
+    );
     return {
       title: titleForDeliveryDecision(decision),
       text: reason.replaceAll("_", " "),

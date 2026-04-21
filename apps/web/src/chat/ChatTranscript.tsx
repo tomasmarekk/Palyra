@@ -219,7 +219,8 @@ export function ChatTranscript({
                     {entry.delivery_presentation !== undefined ? (
                       <StatusChip tone="default">{entry.delivery_presentation}</StatusChip>
                     ) : null}
-                    {entry.delivery_hidden_count !== undefined && entry.delivery_hidden_count > 0 ? (
+                    {entry.delivery_hidden_count !== undefined &&
+                    entry.delivery_hidden_count > 0 ? (
                       <StatusChip tone="warning">
                         {entry.delivery_hidden_count} merged offscreen
                       </StatusChip>
