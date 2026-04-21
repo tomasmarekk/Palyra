@@ -51,6 +51,8 @@ const MAX_APPROVALS_QUERY_LIMIT: usize = MAX_APPROVALS_LIST_LIMIT + 1;
 const MAX_MEMORY_ITEMS_LIST_LIMIT: usize = 500;
 const MAX_MEMORY_SEARCH_CANDIDATES: usize = 256;
 const MAX_MEMORY_VECTOR_SCAN_CANDIDATES: usize = 1_024;
+const QUERY_EMBEDDING_CACHE_CAPACITY: usize = 256;
+const QUERY_EMBEDDING_CACHE_TTL_MS: i64 = 5 * 60 * 1_000;
 const MAX_CANVAS_PATCHES_QUERY_LIMIT: usize = 1_000;
 const DEFAULT_MEMORY_VECTOR_DIMS: usize = 64;
 const DEFAULT_MEMORY_EMBEDDING_MODEL: &str = "hash-embedding-v1";
@@ -714,6 +716,15 @@ pub enum MemoryEmbeddingsMode {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct QueryEmbeddingCacheStatus {
+    pub capacity: usize,
+    pub ttl_ms: i64,
+    pub entry_count: usize,
+    pub hits: u64,
+    pub misses: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct MemoryEmbeddingsStatus {
     pub mode: MemoryEmbeddingsMode,
     pub posture: MemoryEmbeddingsPosture,
@@ -734,6 +745,7 @@ pub struct MemoryEmbeddingsStatus {
     pub batch_limit: usize,
     pub request_timeout_ms: u64,
     pub retry_max: u32,
+    pub query_cache: QueryEmbeddingCacheStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3608,11 +3620,25 @@ fn parse_optional_json_column<T: DeserializeOwned>(
     })
 }
 
+#[derive(Debug, Clone)]
+struct QueryEmbeddingCacheEntry {
+    vector: Vec<f32>,
+    expires_at_unix_ms: i64,
+}
+
+#[derive(Debug, Default)]
+struct QueryEmbeddingCacheState {
+    entries: BTreeMap<String, QueryEmbeddingCacheEntry>,
+    hits: u64,
+    misses: u64,
+}
+
 pub struct JournalStore {
     config: JournalConfig,
     connection: Mutex<Connection>,
     memory_embedding_provider: Arc<dyn MemoryEmbeddingProvider>,
     memory_embedding_runtime: MemoryEmbeddingsRuntimeProfile,
+    query_embedding_cache: Mutex<QueryEmbeddingCacheState>,
 }
 
 impl fmt::Debug for JournalStore {
@@ -3699,7 +3725,112 @@ impl JournalStore {
             connection: Mutex::new(connection),
             memory_embedding_provider,
             memory_embedding_runtime,
+            query_embedding_cache: Mutex::new(QueryEmbeddingCacheState::default()),
         })
+    }
+
+    fn query_embedding_for_search(
+        &self,
+        query_text: &str,
+        embedding_model_id: &str,
+        embedding_dims: usize,
+        embedding_version: i64,
+        now_unix_ms: i64,
+    ) -> Vec<f32> {
+        let cache_key = query_embedding_cache_key(
+            query_text,
+            embedding_model_id,
+            embedding_dims,
+            embedding_version,
+        );
+        let cached_vector = match self.query_embedding_cache.lock() {
+            Ok(mut cache) => {
+                prune_query_embedding_cache(&mut cache, now_unix_ms);
+                if let Some(entry) = cache.entries.get(cache_key.as_str()) {
+                    let vector = entry.vector.clone();
+                    cache.hits = cache.hits.saturating_add(1);
+                    Some(vector)
+                } else {
+                    cache.misses = cache.misses.saturating_add(1);
+                    None
+                }
+            }
+            Err(poisoned) => {
+                let mut cache = poisoned.into_inner();
+                prune_query_embedding_cache(&mut cache, now_unix_ms);
+                if let Some(entry) = cache.entries.get(cache_key.as_str()) {
+                    let vector = entry.vector.clone();
+                    cache.hits = cache.hits.saturating_add(1);
+                    Some(vector)
+                } else {
+                    cache.misses = cache.misses.saturating_add(1);
+                    None
+                }
+            }
+        };
+        if let Some(vector) = cached_vector {
+            return vector;
+        }
+
+        let vector = normalize_embedding_dimensions(
+            self.memory_embedding_provider.embed_text(query_text),
+            embedding_dims,
+        );
+        let expires_at_unix_ms = now_unix_ms.saturating_add(QUERY_EMBEDDING_CACHE_TTL_MS);
+        match self.query_embedding_cache.lock() {
+            Ok(mut cache) => {
+                prune_query_embedding_cache(&mut cache, now_unix_ms);
+                if cache.entries.len() >= QUERY_EMBEDDING_CACHE_CAPACITY {
+                    if let Some(first_key) = cache.entries.keys().next().cloned() {
+                        cache.entries.remove(first_key.as_str());
+                    }
+                }
+                cache.entries.insert(
+                    cache_key,
+                    QueryEmbeddingCacheEntry { vector: vector.clone(), expires_at_unix_ms },
+                );
+            }
+            Err(poisoned) => {
+                let mut cache = poisoned.into_inner();
+                prune_query_embedding_cache(&mut cache, now_unix_ms);
+                if cache.entries.len() >= QUERY_EMBEDDING_CACHE_CAPACITY {
+                    if let Some(first_key) = cache.entries.keys().next().cloned() {
+                        cache.entries.remove(first_key.as_str());
+                    }
+                }
+                cache.entries.insert(
+                    cache_key,
+                    QueryEmbeddingCacheEntry { vector: vector.clone(), expires_at_unix_ms },
+                );
+            }
+        }
+        vector
+    }
+
+    fn query_embedding_cache_status(&self, now_unix_ms: i64) -> QueryEmbeddingCacheStatus {
+        match self.query_embedding_cache.lock() {
+            Ok(mut cache) => {
+                prune_query_embedding_cache(&mut cache, now_unix_ms);
+                QueryEmbeddingCacheStatus {
+                    capacity: QUERY_EMBEDDING_CACHE_CAPACITY,
+                    ttl_ms: QUERY_EMBEDDING_CACHE_TTL_MS,
+                    entry_count: cache.entries.len(),
+                    hits: cache.hits,
+                    misses: cache.misses,
+                }
+            }
+            Err(poisoned) => {
+                let mut cache = poisoned.into_inner();
+                prune_query_embedding_cache(&mut cache, now_unix_ms);
+                QueryEmbeddingCacheStatus {
+                    capacity: QUERY_EMBEDDING_CACHE_CAPACITY,
+                    ttl_ms: QUERY_EMBEDDING_CACHE_TTL_MS,
+                    entry_count: cache.entries.len(),
+                    hits: cache.hits,
+                    misses: cache.misses,
+                }
+            }
+        }
     }
 
     pub fn append(
@@ -9025,6 +9156,7 @@ impl JournalStore {
     }
 
     pub fn memory_embeddings_status(&self) -> Result<MemoryEmbeddingsStatus, JournalError> {
+        let now = current_unix_ms()?;
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let usage = query_memory_usage_snapshot(&guard)?;
         let target_model_id = self.memory_embedding_runtime.active_model_id.clone();
@@ -9052,6 +9184,7 @@ impl JournalStore {
             batch_limit: self.memory_embedding_runtime.batch_limit,
             request_timeout_ms: self.memory_embedding_runtime.request_timeout_ms,
             retry_max: self.memory_embedding_runtime.retry_max,
+            query_cache: self.query_embedding_cache_status(now),
         })
     }
 
@@ -9274,9 +9407,12 @@ impl JournalStore {
         let top_k = request.top_k.clamp(1, MAX_MEMORY_ITEMS_LIST_LIMIT);
         let candidate_limit = top_k.saturating_mul(8).clamp(top_k, MAX_MEMORY_SEARCH_CANDIDATES);
         let fts_query = build_fts_query(query_text.as_str());
-        let query_vector = normalize_embedding_dimensions(
-            self.memory_embedding_provider.embed_text(query_text.as_str()),
+        let query_vector = self.query_embedding_for_search(
+            query_text.as_str(),
+            embedding_model_id.as_str(),
             embedding_dims,
+            embedding_version,
+            now,
         );
         self.purge_expired_memory_items(now)?;
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
@@ -10203,12 +10339,15 @@ impl JournalStore {
         let prefix_like = prefix.as_deref().map(|value| format!("{value}/%"));
         let embedding_model_id = self.memory_embedding_provider.model_name().to_owned();
         let embedding_dims = self.memory_embedding_provider.dimensions();
-        let query_vector = normalize_embedding_dimensions(
-            self.memory_embedding_provider.embed_text(query_text.as_str()),
+        let now = current_unix_ms()?;
+        let query_vector = self.query_embedding_for_search(
+            query_text.as_str(),
+            embedding_model_id.as_str(),
             embedding_dims,
+            CURRENT_MEMORY_EMBEDDING_VERSION,
+            now,
         );
         let fts_query = build_fts_query(query_text.as_str());
-        let now = current_unix_ms()?;
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let top_k = request.top_k.clamp(1, MAX_WORKSPACE_DOCUMENT_LIST_LIMIT);
         let candidate_limit = top_k.saturating_mul(8).clamp(top_k, MAX_WORKSPACE_SEARCH_CANDIDATES);
@@ -10529,6 +10668,20 @@ impl JournalStore {
 
 fn workspace_candidate_key(document_id: &str, version: i64, chunk_index: usize) -> String {
     format!("{document_id}:{version}:{chunk_index}")
+}
+
+fn query_embedding_cache_key(
+    query_text: &str,
+    embedding_model_id: &str,
+    embedding_dims: usize,
+    embedding_version: i64,
+) -> String {
+    let digest = sha256_hex(query_text.as_bytes());
+    format!("{embedding_model_id}:{embedding_dims}:{embedding_version}:{digest}")
+}
+
+fn prune_query_embedding_cache(cache: &mut QueryEmbeddingCacheState, now_unix_ms: i64) {
+    cache.entries.retain(|_, entry| entry.expires_at_unix_ms > now_unix_ms);
 }
 
 #[derive(Debug, Clone)]
@@ -14127,6 +14280,29 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct CountingMemoryEmbeddingProvider {
+        model_name: &'static str,
+        dimensions: usize,
+        vector: Vec<f32>,
+        calls: Arc<AtomicU64>,
+    }
+
+    impl MemoryEmbeddingProvider for CountingMemoryEmbeddingProvider {
+        fn model_name(&self) -> &'static str {
+            self.model_name
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dimensions
+        }
+
+        fn embed_text(&self, _text: &str) -> Vec<f32> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.vector.clone()
+        }
+    }
+
+    #[derive(Debug)]
     struct BlockingMemoryEmbeddingProvider {
         model_name: &'static str,
         dimensions: usize,
@@ -16053,6 +16229,64 @@ mod tests {
             .expect("direct vector branch should surface the memory item");
         assert!(!candidate.lexical_candidate, "fixture should not have an FTS seed");
         assert!(candidate.vector_candidate, "vector branch should generate the candidate directly");
+    }
+
+    #[test]
+    fn memory_query_embedding_cache_reuses_repeated_search_vector() {
+        let db_path = temp_db_path();
+        let calls = Arc::new(AtomicU64::new(0));
+        let store = JournalStore::open_with_memory_embedding_provider(
+            test_journal_config(db_path, false),
+            Arc::new(CountingMemoryEmbeddingProvider {
+                model_name: "test-query-cache-v1",
+                dimensions: 4,
+                vector: vec![1.0, 0.0, 0.0, 0.0],
+                calls: Arc::clone(&calls),
+            }),
+        )
+        .expect("journal store should open");
+        store
+            .create_memory_item(&sample_memory_request(
+                "01ARZ3NDEKTSV4RRFFQ69G5QC1",
+                "user:ops",
+                Some("cli"),
+                None,
+                MemorySource::Manual,
+                "semantic durable fact available through vector retrieval",
+            ))
+            .expect("memory item should be created");
+
+        let calls_after_indexing = calls.load(Ordering::SeqCst);
+        let request = MemorySearchRequest {
+            principal: "user:ops".to_owned(),
+            channel: Some("cli".to_owned()),
+            session_id: None,
+            query: "cacheable semantic query".to_owned(),
+            top_k: 4,
+            min_score: 0.0,
+            tags: Vec::new(),
+            sources: Vec::new(),
+        };
+        store.search_memory_candidates(&request).expect("first candidate search should succeed");
+        let calls_after_first_search = calls.load(Ordering::SeqCst);
+        store.search_memory_candidates(&request).expect("second candidate search should succeed");
+
+        let status = store
+            .memory_embeddings_status()
+            .expect("embedding status should include query cache counters");
+        assert_eq!(
+            calls_after_first_search,
+            calls_after_indexing + 1,
+            "first search should embed the query once"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            calls_after_first_search,
+            "second identical search should reuse the cached query embedding"
+        );
+        assert_eq!(status.query_cache.entry_count, 1);
+        assert_eq!(status.query_cache.misses, 1);
+        assert_eq!(status.query_cache.hits, 1);
     }
 
     #[test]

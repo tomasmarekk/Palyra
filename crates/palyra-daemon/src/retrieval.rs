@@ -1118,7 +1118,7 @@ mod tests {
     };
     use crate::journal::{
         MemoryEmbeddingsMode, MemoryEmbeddingsStatus, MemorySource, OrchestratorCheckpointRecord,
-        OrchestratorCompactionArtifactRecord,
+        OrchestratorCompactionArtifactRecord, QueryEmbeddingCacheStatus,
     };
     use crate::model_provider::{ModelProviderConfig, ModelProviderKind};
 
@@ -1234,6 +1234,13 @@ mod tests {
                 batch_limit: 64,
                 request_timeout_ms: 15_000,
                 retry_max: 2,
+                query_cache: QueryEmbeddingCacheStatus {
+                    capacity: 256,
+                    ttl_ms: 300_000,
+                    entry_count: 0,
+                    hits: 0,
+                    misses: 0,
+                },
             },
         );
         assert_eq!(ready.state, RetrievalBackendState::Ready);
@@ -1261,6 +1268,13 @@ mod tests {
                 batch_limit: 64,
                 request_timeout_ms: 15_000,
                 retry_max: 2,
+                query_cache: QueryEmbeddingCacheStatus {
+                    capacity: 256,
+                    ttl_ms: 300_000,
+                    entry_count: 0,
+                    hits: 0,
+                    misses: 0,
+                },
             },
         );
         assert_eq!(degraded.state, RetrievalBackendState::Degraded);
