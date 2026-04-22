@@ -363,6 +363,8 @@ fn routines_tool_test_context() -> super::ToolRuntimeExecutionContext<'static> {
         channel: Some("cli"),
         session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAB",
         run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAC",
+        execution_backend: ExecutionBackendPreference::LocalSandbox,
+        backend_reason_code: "backend.default.local_sandbox",
     }
 }
 
@@ -2353,6 +2355,92 @@ async fn networked_worker_cleanup_failure_is_journaled_and_fail_closed() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn networked_worker_runtime_executes_echo_with_artifact_transport_journal() {
+    let state = build_test_runtime_state(false);
+    state
+        .register_networked_worker(test_worker_attestation("worker-runtime-01"))
+        .await
+        .expect("worker registration should succeed");
+
+    let outcome = super::execute_tool_with_runtime_dispatch(
+        &state,
+        super::ToolRuntimeExecutionContext {
+            principal: "user:ops",
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            channel: Some("cli"),
+            session_id: "session-networked-worker-runtime",
+            run_id: "run-networked-worker-runtime",
+            execution_backend: ExecutionBackendPreference::NetworkedWorker,
+            backend_reason_code: "backend.available.networked_worker",
+        },
+        "proposal-networked-worker-runtime",
+        "palyra.echo",
+        br#"{"text":"remote worker"}"#,
+    )
+    .await;
+
+    assert!(outcome.success, "networked worker echo should succeed: {}", outcome.error);
+    assert_eq!(
+        parse_tool_output_json(&outcome).get("echo").and_then(Value::as_str),
+        Some("remote worker")
+    );
+    assert!(outcome.attestation.executor.starts_with("networked_worker:"));
+    assert!(outcome.attestation.sandbox_enforcement.contains("lease_id="));
+    assert_eq!(state.worker_fleet_snapshot().active_leases, 0);
+
+    let snapshot = state
+        .recent_journal_snapshot(100)
+        .await
+        .expect("recent journal snapshot should be returned");
+    let artifact_payload = snapshot
+        .events
+        .iter()
+        .find_map(|event| {
+            let payload = serde_json::from_str::<Value>(event.payload_json.as_str()).ok()?;
+            (payload.pointer("/payload/reason").and_then(Value::as_str)
+                == Some("worker.artifact_transport.attested"))
+            .then_some(payload)
+        })
+        .expect("artifact transport runtime event should be journaled");
+    assert_eq!(
+        artifact_payload.pointer("/payload/details/tool_name").and_then(Value::as_str),
+        Some("palyra.echo")
+    );
+    assert!(
+        artifact_payload
+            .pointer("/payload/details/artifact_transport/output_manifest_sha256")
+            .and_then(Value::as_str)
+            .is_some(),
+        "artifact transport event should attest output manifest"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn networked_worker_runtime_rejects_unsupported_context_tools() {
+    let state = build_test_runtime_state(false);
+    let outcome = super::execute_tool_with_runtime_dispatch(
+        &state,
+        super::ToolRuntimeExecutionContext {
+            principal: "user:ops",
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            channel: Some("cli"),
+            session_id: "session-networked-worker-runtime",
+            run_id: "run-networked-worker-runtime",
+            execution_backend: ExecutionBackendPreference::NetworkedWorker,
+            backend_reason_code: "backend.available.networked_worker",
+        },
+        "proposal-networked-worker-runtime-unsupported",
+        "palyra.memory.search",
+        br#"{"query":"incident"}"#,
+    )
+    .await;
+
+    assert!(!outcome.success);
+    assert!(outcome.error.contains("backend.policy.tool_unsupported"));
+    assert_eq!(outcome.attestation.executor, "networked_worker");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn auth_refresh_journal_event_redacts_reason_text() {
     let state = build_test_runtime_state(false);
     let context = RequestContext {
@@ -3112,6 +3200,8 @@ async fn memory_recall_tool_channel_override_requires_authenticated_channel_cont
             channel: None,
             session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAW",
             run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+            execution_backend: ExecutionBackendPreference::LocalSandbox,
+            backend_reason_code: "backend.default.local_sandbox",
         },
         "01ARZ3NDEKTSV4RRFFQ69G5FB0",
         input_json,
@@ -3139,6 +3229,8 @@ async fn memory_recall_tool_rejects_out_of_range_prompt_budget() {
             channel: Some("cli"),
             session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAW",
             run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+            execution_backend: ExecutionBackendPreference::LocalSandbox,
+            backend_reason_code: "backend.default.local_sandbox",
         },
         "01ARZ3NDEKTSV4RRFFQ69G5FB1",
         input_json,

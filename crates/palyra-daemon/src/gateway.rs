@@ -53,6 +53,7 @@ use crate::{
         PairingConsumeOutcome, RoutePreview as ChannelRoutePreview,
     },
     cron::schedule_to_proto,
+    execution_backends::ExecutionBackendPreference,
     journal::{
         ApprovalCreateRequest, ApprovalDecision, ApprovalDecisionScope, ApprovalPolicySnapshot,
         ApprovalPromptOption, ApprovalPromptRecord, ApprovalRecord, ApprovalResolveRequest,
@@ -485,6 +486,8 @@ pub(crate) struct ToolRuntimeExecutionContext<'a> {
     pub(crate) channel: Option<&'a str>,
     pub(crate) session_id: &'a str,
     pub(crate) run_id: &'a str,
+    pub(crate) execution_backend: ExecutionBackendPreference,
+    pub(crate) backend_reason_code: &'a str,
 }
 
 #[derive(Clone, Copy)]
@@ -502,7 +505,16 @@ pub(crate) async fn execute_tool_with_runtime_dispatch(
     tool_name: &str,
     input_json: &[u8],
 ) -> ToolExecutionOutcome {
-    if tool_name == MEMORY_SEARCH_TOOL_NAME {
+    if context.execution_backend == ExecutionBackendPreference::NetworkedWorker {
+        crate::application::tool_runtime::networked_worker::execute_networked_worker_tool(
+            runtime_state,
+            context,
+            proposal_id,
+            tool_name,
+            input_json,
+        )
+        .await
+    } else if tool_name == MEMORY_SEARCH_TOOL_NAME {
         crate::application::tool_runtime::memory::execute_memory_search_tool(
             runtime_state,
             context.principal,

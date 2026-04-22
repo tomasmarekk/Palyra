@@ -459,6 +459,33 @@ pub fn denied_execution_outcome(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_tool_execution_outcome(
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+    success: bool,
+    output_json: Vec<u8>,
+    error: String,
+    timed_out: bool,
+    executor: String,
+    sandbox_enforcement: String,
+) -> ToolExecutionOutcome {
+    build_execution_outcome(
+        proposal_id,
+        tool_name,
+        input_json,
+        ToolExecutionRawResult {
+            success,
+            output_json,
+            error,
+            timed_out,
+            executor,
+            sandbox_enforcement,
+        },
+    )
+}
+
 pub async fn execute_tool_call(
     config: &ToolCallConfig,
     proposal_id: &str,

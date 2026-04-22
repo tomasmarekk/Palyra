@@ -18,6 +18,7 @@ use crate::{
         append_audit_finalization_step, evaluate_execution_gate_pipeline,
         ExecutionGatePipelineInput, ExecutionGateReport, ToolProposalApprovalState,
     },
+    application::tool_runtime::networked_worker::networked_worker_supports_tool,
     execution_backends::{
         build_execution_backend_inventory_with_worker_state, resolve_execution_backend,
         ExecutionBackendPreference, ExecutionBackendResolution,
@@ -270,20 +271,32 @@ pub(crate) fn evaluate_backend_capability_gate(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    if restricted_capabilities.is_empty() {
-        return None;
+    if !restricted_capabilities.is_empty() {
+        return Some(ToolDecision {
+            allowed: false,
+            reason: format!(
+                "backend policy blocked tool={tool_name}; reason_code=backend.policy.capability_denied; resolved_backend={}; blocked_capabilities={}; remediation=switch agent backend_preference to local_sandbox or automatic; backend_reason={}",
+                backend_selection.resolution.resolved.as_str(),
+                restricted_capabilities.join(","),
+                backend_selection.resolution.reason
+            ),
+            approval_required: false,
+            policy_enforced: true,
+        });
     }
-    Some(ToolDecision {
-        allowed: false,
-        reason: format!(
-            "backend policy blocked tool={tool_name}; reason_code=backend.policy.capability_denied; resolved_backend={}; blocked_capabilities={}; remediation=switch agent backend_preference to local_sandbox or automatic; backend_reason={}",
-            backend_selection.resolution.resolved.as_str(),
-            restricted_capabilities.join(","),
-            backend_selection.resolution.reason
-        ),
-        approval_required: false,
-        policy_enforced: true,
-    })
+    if !networked_worker_supports_tool(tool_name) {
+        return Some(ToolDecision {
+            allowed: false,
+            reason: format!(
+                "backend policy blocked tool={tool_name}; reason_code=backend.policy.tool_unsupported; resolved_backend={}; remediation=switch agent backend_preference to local_sandbox or automatic; backend_reason={}",
+                backend_selection.resolution.resolved.as_str(),
+                backend_selection.resolution.reason
+            ),
+            approval_required: false,
+            policy_enforced: true,
+        });
+    }
+    None
 }
 
 pub(crate) fn annotate_tool_decision_with_backend_context(
@@ -770,6 +783,15 @@ mod tests {
         assert!(!decision.allowed);
         assert!(decision.reason.contains("backend.policy.capability_denied"));
         assert!(decision.reason.contains("filesystem_write"));
+    }
+
+    #[test]
+    fn networked_worker_backend_denies_runtime_context_tools() {
+        let selection = networked_worker_selection();
+        let decision = evaluate_backend_capability_gate("palyra.memory.search", &selection)
+            .expect("gateway-context tool should be blocked on networked workers");
+        assert!(!decision.allowed);
+        assert!(decision.reason.contains("backend.policy.tool_unsupported"));
     }
 
     #[test]

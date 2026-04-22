@@ -304,6 +304,27 @@ pub(crate) fn resolve_execution_backend(
         }
     }
 
+    if matches!(preference, ExecutionBackendPreference::NetworkedWorker) {
+        return ExecutionBackendResolution {
+            requested: preference,
+            resolved: preference,
+            fallback_used: false,
+            reason_code: "backend.unavailable.networked_worker".to_owned(),
+            approval_required: true,
+            reason: requested_record
+                .map(|record| {
+                    format!(
+                        "Requested backend 'networked_worker' is not selectable and local fallback is denied for run-scoped worker grants. {}",
+                        record.operator_summary
+                    )
+                })
+                .unwrap_or_else(|| {
+                    "Requested backend 'networked_worker' is missing from inventory and local fallback is denied for run-scoped worker grants."
+                        .to_owned()
+                }),
+        };
+    }
+
     if let Some(record) = local_record.filter(|entry| entry.selectable) {
         return ExecutionBackendResolution {
             requested: preference,
@@ -733,6 +754,30 @@ mod tests {
             resolve_execution_backend(ExecutionBackendPreference::DesktopNode, &inventory);
         assert_eq!(resolution.resolved, ExecutionBackendPreference::LocalSandbox);
         assert!(resolution.fallback_used);
+    }
+
+    #[test]
+    fn networked_worker_resolution_denies_local_fallback_without_attestation() {
+        let networked_workers = NetworkedWorkersConfig::default();
+        let inventory = build_execution_backend_inventory_with_rollout(
+            &test_policy(),
+            0,
+            &[],
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            &networked_workers,
+            WorkerFleetSnapshot::default(),
+            &WorkerFleetPolicy::default(),
+        );
+        let resolution =
+            resolve_execution_backend(ExecutionBackendPreference::NetworkedWorker, &inventory);
+
+        assert_eq!(resolution.resolved, ExecutionBackendPreference::NetworkedWorker);
+        assert!(!resolution.fallback_used);
+        assert_eq!(resolution.reason_code, "backend.unavailable.networked_worker");
+        assert!(resolution.reason.contains("local fallback is denied"));
     }
 
     #[test]

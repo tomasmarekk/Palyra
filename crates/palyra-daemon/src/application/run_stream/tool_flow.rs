@@ -48,6 +48,7 @@ use super::{
 pub(crate) struct RunStreamToolProposalPreparation {
     decision: crate::tool_protocol::ToolDecision,
     resolved_session_id: String,
+    backend_selection: ToolProposalBackendSelection,
 }
 
 #[allow(clippy::result_large_err)]
@@ -69,7 +70,7 @@ pub(crate) async fn process_run_stream_tool_proposal_event(
     remaining_tool_budget: &mut u32,
     tape_seq: &mut i64,
 ) -> Result<RunStreamToolExecutionOutcome, Status> {
-    let RunStreamToolProposalPreparation { decision, resolved_session_id } =
+    let RunStreamToolProposalPreparation { decision, resolved_session_id, backend_selection } =
         prepare_run_stream_tool_proposal_execution(
             sender,
             stream,
@@ -96,6 +97,7 @@ pub(crate) async fn process_run_stream_tool_proposal_event(
         tool_name,
         input_json,
         &decision,
+        &backend_selection,
         resolved_session_id.as_str(),
         tape_seq,
     )
@@ -218,6 +220,7 @@ async fn prepare_run_stream_tool_proposal_execution(
     Ok(RunStreamToolProposalPreparation {
         decision,
         resolved_session_id: resolved_session_id.to_owned(),
+        backend_selection,
     })
 }
 
@@ -448,6 +451,7 @@ async fn execute_run_stream_tool_proposal(
     tool_name: &str,
     input_json: &[u8],
     decision: &crate::tool_protocol::ToolDecision,
+    backend_selection: &ToolProposalBackendSelection,
     resolved_session_id: &str,
     tape_seq: &mut i64,
 ) -> Result<RunStreamToolExecutionOutcome, Status> {
@@ -466,6 +470,8 @@ async fn execute_run_stream_tool_proposal(
                 channel: request_context.channel.as_deref(),
                 session_id: resolved_session_id,
                 run_id,
+                execution_backend: backend_selection.resolution.resolved,
+                backend_reason_code: backend_selection.resolution.reason_code.as_str(),
             },
             proposal_id,
             tool_name,
@@ -558,6 +564,8 @@ async fn execute_run_stream_tool_proposal(
             channel: request_context.channel.as_deref(),
             session_id: resolved_session_id,
             run_id,
+            execution_backend: backend_selection.resolution.resolved,
+            backend_reason_code: backend_selection.resolution.reason_code.as_str(),
         },
         tool_name,
         decision.allowed,
