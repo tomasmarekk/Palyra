@@ -686,7 +686,7 @@ port = 7142
 kind = "openai_compatible"
 openai_base_url = "https://api.openai.com/v1"
 openai_api_key = "sk-inline-secret"
-openai_api_key_vault_ref = "global/openai_api_key"
+anthropic_api_key_vault_ref = "global/anthropic_api_key"
 "#,
     )?;
     let config_path_string = config_path.to_string_lossy().into_owned();
@@ -732,7 +732,7 @@ openai_api_key_vault_ref = "global/openai_api_key"
     );
     assert_eq!(
         exported_bundle.pointer("/secret_references/0/reference").and_then(Value::as_str),
-        Some("global/openai_api_key")
+        Some("global/anthropic_api_key")
     );
     Ok(())
 }
