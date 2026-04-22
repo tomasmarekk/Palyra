@@ -32,6 +32,7 @@ const DEFAULT_LEGACY_MIN_SOURCE_QUALITY_BPS: u16 = 2_000;
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RetrievalBackendKind {
     JournalSqliteFts,
+    ExternalDerivedPreview,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -55,6 +56,12 @@ pub(crate) struct RetrievalBackendCapabilities {
     pub(crate) compaction_fusion: bool,
     pub(crate) lazy_reindex: bool,
     pub(crate) batch_backfill: bool,
+    pub(crate) external_derived_index: bool,
+    pub(crate) journal_source_of_truth: bool,
+    pub(crate) journal_fallback: bool,
+    pub(crate) drift_detection: bool,
+    pub(crate) async_indexer: bool,
+    pub(crate) scale_slos: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -63,6 +70,51 @@ pub(crate) struct RetrievalBackendSnapshot {
     pub(crate) state: RetrievalBackendState,
     pub(crate) reason: String,
     pub(crate) capabilities: RetrievalBackendCapabilities,
+    pub(crate) externalization: RetrievalExternalizationPolicySnapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) external_index: Option<ExternalRetrievalIndexSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RetrievalExternalizationClass {
+    DerivedIndex,
+    JournalOnly,
+    ArtifactOnly,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RetrievalDerivedFieldPolicy {
+    pub(crate) field: String,
+    pub(crate) classification: RetrievalExternalizationClass,
+    pub(crate) reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RetrievalExternalizationPolicySnapshot {
+    pub(crate) source_of_truth: String,
+    pub(crate) derived_index_allowed: bool,
+    pub(crate) replay_requires_live_external_index: bool,
+    pub(crate) field_policy: Vec<RetrievalDerivedFieldPolicy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ExternalRetrievalIndexSnapshot {
+    pub(crate) provider: String,
+    pub(crate) state: RetrievalBackendState,
+    pub(crate) reason: String,
+    pub(crate) indexed_memory_items: u64,
+    pub(crate) indexed_workspace_chunks: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_indexed_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) journal_watermark_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) freshness_lag_ms: Option<u64>,
+    pub(crate) drift_count: u64,
+    pub(crate) pending_reconciliation_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -212,6 +264,59 @@ impl RetrievalRuntimeConfig {
     }
 }
 
+#[must_use]
+pub(crate) fn retrieval_externalization_policy() -> RetrievalExternalizationPolicySnapshot {
+    RetrievalExternalizationPolicySnapshot {
+        source_of_truth: "journal_store_and_artifact_storage".to_owned(),
+        derived_index_allowed: true,
+        replay_requires_live_external_index: false,
+        field_policy: vec![
+            RetrievalDerivedFieldPolicy {
+                field: "memory_items.memory_ulid".to_owned(),
+                classification: RetrievalExternalizationClass::DerivedIndex,
+                reason: "opaque ids are required to join external candidates back to JournalStore evidence"
+                    .to_owned(),
+            },
+            RetrievalDerivedFieldPolicy {
+                field: "memory_items.normalized_search_text".to_owned(),
+                classification: RetrievalExternalizationClass::DerivedIndex,
+                reason: "bounded normalized text may be projected for lexical/vector candidate generation"
+                    .to_owned(),
+            },
+            RetrievalDerivedFieldPolicy {
+                field: "memory_vectors.embedding_vector".to_owned(),
+                classification: RetrievalExternalizationClass::DerivedIndex,
+                reason: "embeddings are derived from journal memory content and can be rebuilt"
+                    .to_owned(),
+            },
+            RetrievalDerivedFieldPolicy {
+                field: "workspace_document_chunks.normalized_search_text".to_owned(),
+                classification: RetrievalExternalizationClass::DerivedIndex,
+                reason: "workspace chunk excerpts are derived projections for retrieval only"
+                    .to_owned(),
+            },
+            RetrievalDerivedFieldPolicy {
+                field: "orchestrator_tape.payload_json".to_owned(),
+                classification: RetrievalExternalizationClass::JournalOnly,
+                reason: "full tape payloads remain audit evidence and must not become external index authority"
+                    .to_owned(),
+            },
+            RetrievalDerivedFieldPolicy {
+                field: "approvals.*".to_owned(),
+                classification: RetrievalExternalizationClass::JournalOnly,
+                reason: "approval records and hash-chain evidence stay in JournalStore"
+                    .to_owned(),
+            },
+            RetrievalDerivedFieldPolicy {
+                field: "artifact_storage.bytes".to_owned(),
+                classification: RetrievalExternalizationClass::ArtifactOnly,
+                reason: "large artifacts remain in artifact storage; indexes may keep only ids and bounded snippets"
+                    .to_owned(),
+            },
+        ],
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum MemoryEmbeddingsPosture {
@@ -329,22 +434,25 @@ pub(crate) trait RetrievalBackend: Send + Sync {
         &self,
         store: &JournalStore,
         request: &MemorySearchRequest,
+        config: &RetrievalRuntimeConfig,
     ) -> Result<Vec<MemorySearchCandidateRecord>, JournalError>;
 
     fn search_memory_candidate_outcome(
         &self,
         store: &JournalStore,
         request: &MemorySearchRequest,
+        config: &RetrievalRuntimeConfig,
     ) -> Result<MemorySearchCandidateOutcome, JournalError>;
 
     fn search_workspace_candidate_outcome(
         &self,
         store: &JournalStore,
         request: &WorkspaceSearchRequest,
+        config: &RetrievalRuntimeConfig,
     ) -> Result<WorkspaceSearchCandidateOutcome, JournalError>;
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct JournalRetrievalBackend;
 
 impl RetrievalBackend for JournalRetrievalBackend {
@@ -381,7 +489,15 @@ impl RetrievalBackend for JournalRetrievalBackend {
                 compaction_fusion: true,
                 lazy_reindex: true,
                 batch_backfill: true,
+                external_derived_index: false,
+                journal_source_of_truth: true,
+                journal_fallback: false,
+                drift_detection: false,
+                async_indexer: false,
+                scale_slos: false,
             },
+            externalization: retrieval_externalization_policy(),
+            external_index: None,
         }
     }
 
@@ -389,6 +505,7 @@ impl RetrievalBackend for JournalRetrievalBackend {
         &self,
         store: &JournalStore,
         request: &MemorySearchRequest,
+        _config: &RetrievalRuntimeConfig,
     ) -> Result<Vec<MemorySearchCandidateRecord>, JournalError> {
         store.search_memory_candidates(request)
     }
@@ -397,6 +514,7 @@ impl RetrievalBackend for JournalRetrievalBackend {
         &self,
         store: &JournalStore,
         request: &MemorySearchRequest,
+        _config: &RetrievalRuntimeConfig,
     ) -> Result<MemorySearchCandidateOutcome, JournalError> {
         store.search_memory_candidate_outcome(request)
     }
@@ -405,8 +523,202 @@ impl RetrievalBackend for JournalRetrievalBackend {
         &self,
         store: &JournalStore,
         request: &WorkspaceSearchRequest,
+        _config: &RetrievalRuntimeConfig,
     ) -> Result<WorkspaceSearchCandidateOutcome, JournalError> {
         store.search_workspace_candidate_outcome(request)
+    }
+}
+
+pub(crate) trait ExternalRetrievalIndex: Send + Sync {
+    fn snapshot(&self) -> ExternalRetrievalIndexSnapshot;
+
+    fn search_memory_candidate_outcome(
+        &self,
+        request: &MemorySearchRequest,
+    ) -> Result<Option<MemorySearchCandidateOutcome>, JournalError>;
+
+    fn search_workspace_candidate_outcome(
+        &self,
+        request: &WorkspaceSearchRequest,
+    ) -> Result<Option<WorkspaceSearchCandidateOutcome>, JournalError>;
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct UnavailableExternalRetrievalIndex;
+
+impl ExternalRetrievalIndex for UnavailableExternalRetrievalIndex {
+    fn snapshot(&self) -> ExternalRetrievalIndexSnapshot {
+        ExternalRetrievalIndexSnapshot {
+            provider: "unconfigured".to_owned(),
+            state: RetrievalBackendState::Degraded,
+            reason: "external retrieval index is not configured; journal fallback remains active"
+                .to_owned(),
+            indexed_memory_items: 0,
+            indexed_workspace_chunks: 0,
+            last_indexed_at_unix_ms: None,
+            journal_watermark_unix_ms: None,
+            freshness_lag_ms: None,
+            drift_count: 0,
+            pending_reconciliation_count: 0,
+            last_error: None,
+        }
+    }
+
+    fn search_memory_candidate_outcome(
+        &self,
+        _request: &MemorySearchRequest,
+    ) -> Result<Option<MemorySearchCandidateOutcome>, JournalError> {
+        Ok(None)
+    }
+
+    fn search_workspace_candidate_outcome(
+        &self,
+        _request: &WorkspaceSearchRequest,
+    ) -> Result<Option<WorkspaceSearchCandidateOutcome>, JournalError> {
+        Ok(None)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ExternalDerivedRetrievalBackend {
+    external_index: Arc<dyn ExternalRetrievalIndex>,
+    journal_fallback: JournalRetrievalBackend,
+}
+
+impl Default for ExternalDerivedRetrievalBackend {
+    fn default() -> Self {
+        Self::new(Arc::new(UnavailableExternalRetrievalIndex))
+    }
+}
+
+impl ExternalDerivedRetrievalBackend {
+    #[must_use]
+    pub(crate) fn new(external_index: Arc<dyn ExternalRetrievalIndex>) -> Self {
+        Self { external_index, journal_fallback: JournalRetrievalBackend }
+    }
+
+    fn fallback_memory_outcome(
+        &self,
+        store: &JournalStore,
+        request: &MemorySearchRequest,
+        reason: &str,
+    ) -> Result<MemorySearchCandidateOutcome, JournalError> {
+        let mut outcome = store.search_memory_candidate_outcome(request)?;
+        outcome.diagnostics.degraded_reason = Some(reason.to_owned());
+        Ok(outcome)
+    }
+
+    fn fallback_workspace_outcome(
+        &self,
+        store: &JournalStore,
+        request: &WorkspaceSearchRequest,
+        reason: &str,
+    ) -> Result<WorkspaceSearchCandidateOutcome, JournalError> {
+        let mut outcome = store.search_workspace_candidate_outcome(request)?;
+        outcome.diagnostics.degraded_reason = Some(reason.to_owned());
+        Ok(outcome)
+    }
+}
+
+impl RetrievalBackend for ExternalDerivedRetrievalBackend {
+    fn snapshot(
+        &self,
+        config: &RetrievalRuntimeConfig,
+        embeddings_status: &crate::journal::MemoryEmbeddingsStatus,
+    ) -> RetrievalBackendSnapshot {
+        if config.backend.kind == RetrievalBackendKind::JournalSqliteFts {
+            return self.journal_fallback.snapshot(config, embeddings_status);
+        }
+
+        let external = self.external_index.snapshot();
+        let embeddings_degraded = !embeddings_status.production_default_active;
+        let external_degraded = external.state == RetrievalBackendState::Degraded;
+        let state = if embeddings_degraded || external_degraded {
+            RetrievalBackendState::Degraded
+        } else {
+            RetrievalBackendState::Ready
+        };
+        let reason = if external_degraded {
+            format!(
+                "{}; searches fall back to journal-derived retrieval without changing write paths",
+                external.reason
+            )
+        } else if embeddings_degraded {
+            embeddings_status.warning.clone().unwrap_or_else(|| {
+                "external retrieval index is available but embeddings are degraded".to_owned()
+            })
+        } else {
+            "external derived retrieval index is ready with journal fallback".to_owned()
+        };
+
+        RetrievalBackendSnapshot {
+            kind: config.backend.kind,
+            state,
+            reason,
+            capabilities: RetrievalBackendCapabilities {
+                lexical_search: true,
+                vector_search: true,
+                lexical_candidate_generation: true,
+                vector_candidate_generation: true,
+                hybrid_fusion: true,
+                source_aware_fusion: true,
+                branch_diagnostics: true,
+                transcript_fusion: true,
+                checkpoint_fusion: true,
+                compaction_fusion: true,
+                lazy_reindex: true,
+                batch_backfill: true,
+                external_derived_index: true,
+                journal_source_of_truth: true,
+                journal_fallback: true,
+                drift_detection: true,
+                async_indexer: false,
+                scale_slos: false,
+            },
+            externalization: retrieval_externalization_policy(),
+            external_index: Some(external),
+        }
+    }
+
+    fn search_memory_candidates(
+        &self,
+        store: &JournalStore,
+        request: &MemorySearchRequest,
+        config: &RetrievalRuntimeConfig,
+    ) -> Result<Vec<MemorySearchCandidateRecord>, JournalError> {
+        Ok(self.search_memory_candidate_outcome(store, request, config)?.candidates)
+    }
+
+    fn search_memory_candidate_outcome(
+        &self,
+        store: &JournalStore,
+        request: &MemorySearchRequest,
+        config: &RetrievalRuntimeConfig,
+    ) -> Result<MemorySearchCandidateOutcome, JournalError> {
+        if config.backend.kind == RetrievalBackendKind::JournalSqliteFts {
+            return self.journal_fallback.search_memory_candidate_outcome(store, request, config);
+        }
+        if let Some(outcome) = self.external_index.search_memory_candidate_outcome(request)? {
+            return Ok(outcome);
+        }
+        self.fallback_memory_outcome(store, request, "external_index_unavailable")
+    }
+
+    fn search_workspace_candidate_outcome(
+        &self,
+        store: &JournalStore,
+        request: &WorkspaceSearchRequest,
+        config: &RetrievalRuntimeConfig,
+    ) -> Result<WorkspaceSearchCandidateOutcome, JournalError> {
+        if config.backend.kind == RetrievalBackendKind::JournalSqliteFts {
+            return self
+                .journal_fallback
+                .search_workspace_candidate_outcome(store, request, config);
+        }
+        if let Some(outcome) = self.external_index.search_workspace_candidate_outcome(request)? {
+            return Ok(outcome);
+        }
+        self.fallback_workspace_outcome(store, request, "external_index_unavailable")
     }
 }
 
@@ -1128,11 +1440,13 @@ mod tests {
         build_memory_embedding_runtime_selection, checkpoint_source_quality,
         compaction_source_quality, lexical_overlap_score, memory_source_quality,
         proxy_vector_score, recency_score, score_with_profile, transcript_source_quality,
-        workspace_source_quality, JournalRetrievalBackend, RetrievalBackend, RetrievalBackendState,
-        RetrievalRuntimeConfig, RetrievalSourceProfileKind,
+        workspace_source_quality, ExternalDerivedRetrievalBackend, JournalRetrievalBackend,
+        RetrievalBackend, RetrievalBackendKind, RetrievalBackendState,
+        RetrievalExternalizationClass, RetrievalRuntimeConfig, RetrievalSourceProfileKind,
     };
     use crate::journal::{
-        MemoryEmbeddingsMode, MemoryEmbeddingsStatus, MemorySource, OrchestratorCheckpointRecord,
+        JournalConfig, JournalStore, MemoryEmbeddingsMode, MemoryEmbeddingsStatus,
+        MemoryItemCreateRequest, MemorySearchRequest, MemorySource, OrchestratorCheckpointRecord,
         OrchestratorCompactionArtifactRecord, QueryEmbeddingCacheStatus,
     };
     use crate::model_provider::{ModelProviderConfig, ModelProviderKind};
@@ -1226,6 +1540,25 @@ mod tests {
     }
 
     #[test]
+    fn externalization_policy_keeps_journal_as_source_of_truth() {
+        let policy = super::retrieval_externalization_policy();
+        assert_eq!(policy.source_of_truth, "journal_store_and_artifact_storage");
+        assert!(policy.derived_index_allowed);
+        assert!(
+            !policy.replay_requires_live_external_index,
+            "replay must remain journal-derived and offline"
+        );
+        assert!(policy.field_policy.iter().any(|field| {
+            field.field == "orchestrator_tape.payload_json"
+                && field.classification == RetrievalExternalizationClass::JournalOnly
+        }));
+        assert!(policy.field_policy.iter().any(|field| {
+            field.field == "memory_vectors.embedding_vector"
+                && field.classification == RetrievalExternalizationClass::DerivedIndex
+        }));
+    }
+
+    #[test]
     fn retrieval_backend_snapshot_tracks_embeddings_posture() {
         let backend = JournalRetrievalBackend;
         let config = RetrievalRuntimeConfig::default();
@@ -1296,6 +1629,72 @@ mod tests {
         assert!(
             degraded.reason.contains("PALYRA_OFFLINE"),
             "degraded backend reason should surface the operator warning"
+        );
+    }
+
+    #[test]
+    fn external_preview_backend_falls_back_to_journal_candidates() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let store = JournalStore::open(JournalConfig {
+            db_path: temp.path().join("journal.sqlite3"),
+            hash_chain_enabled: false,
+            max_payload_bytes: 256 * 1024,
+            max_events: 10_000,
+        })
+        .expect("journal store should open");
+        store
+            .create_memory_item(&MemoryItemCreateRequest {
+                memory_id: "01ARZ3NDEKTSV4RRFFQ69G5M49".to_owned(),
+                principal: "user:ops".to_owned(),
+                channel: Some("cli".to_owned()),
+                session_id: None,
+                source: MemorySource::Manual,
+                content_text: "rollback checklist and release gate notes".to_owned(),
+                tags: Vec::new(),
+                confidence: Some(0.9),
+                ttl_unix_ms: None,
+            })
+            .expect("memory item should be indexed in journal");
+        let request = MemorySearchRequest {
+            principal: "user:ops".to_owned(),
+            channel: Some("cli".to_owned()),
+            session_id: None,
+            query: "rollback checklist".to_owned(),
+            top_k: 4,
+            min_score: 0.0,
+            tags: Vec::new(),
+            sources: Vec::new(),
+        };
+        let journal_backend = JournalRetrievalBackend;
+        let journal_config = RetrievalRuntimeConfig::default();
+        let journal = journal_backend
+            .search_memory_candidate_outcome(&store, &request, &journal_config)
+            .expect("journal candidate generation should work");
+        let external_backend = ExternalDerivedRetrievalBackend::default();
+        let external_config = RetrievalRuntimeConfig {
+            backend: super::RetrievalBackendConfig {
+                kind: RetrievalBackendKind::ExternalDerivedPreview,
+            },
+            ..RetrievalRuntimeConfig::default()
+        };
+        let external = external_backend
+            .search_memory_candidate_outcome(&store, &request, &external_config)
+            .expect("external backend should fall back to journal candidates");
+
+        let journal_ids = journal
+            .candidates
+            .iter()
+            .map(|candidate| candidate.item.memory_id.as_str())
+            .collect::<Vec<_>>();
+        let external_ids = external
+            .candidates
+            .iter()
+            .map(|candidate| candidate.item.memory_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(external_ids, journal_ids);
+        assert_eq!(
+            external.diagnostics.degraded_reason.as_deref(),
+            Some("external_index_unavailable")
         );
     }
 

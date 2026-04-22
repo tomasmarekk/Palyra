@@ -3361,7 +3361,11 @@ fn parse_retrieval_backend_kind(raw: &str, name: &str) -> Result<RetrievalBacken
         "journal_sqlite_fts" | "journal-sqlite-fts" | "journal" | "sqlite_fts" | "sqlite-fts" => {
             Ok(RetrievalBackendKind::JournalSqliteFts)
         }
-        _ => anyhow::bail!("{name} must be one of: journal_sqlite_fts"),
+        "external_derived_preview"
+        | "external-derived-preview"
+        | "external_preview"
+        | "external-preview" => Ok(RetrievalBackendKind::ExternalDerivedPreview),
+        _ => anyhow::bail!("{name} must be one of: journal_sqlite_fts, external_derived_preview"),
     }
 }
 
@@ -3935,6 +3939,28 @@ mod tests {
             "workspace pinned bonus should follow file override"
         );
         runtime.retrieval.validate().expect("applied retrieval config should remain valid");
+    }
+
+    #[test]
+    fn memory_retrieval_config_accepts_external_preview_backend() {
+        let (parsed, _) = parse_root_file_config(
+            r#"
+            [memory.retrieval.backend]
+            kind = "external_derived_preview"
+            "#,
+        )
+        .expect("external retrieval backend config should parse");
+        let file_memory = parsed.memory.expect("memory section should exist");
+        let file_retrieval = file_memory.retrieval.expect("memory.retrieval section should exist");
+
+        let mut runtime = MemoryConfig::default();
+        super::apply_memory_retrieval_config(&mut runtime.retrieval, file_retrieval)
+            .expect("external retrieval backend should apply");
+
+        assert_eq!(
+            runtime.retrieval.backend.kind,
+            crate::retrieval::RetrievalBackendKind::ExternalDerivedPreview
+        );
     }
 
     #[test]

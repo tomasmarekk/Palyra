@@ -6697,15 +6697,16 @@ impl GatewayRuntimeState {
         let total_started = Instant::now();
         let state = Arc::clone(self);
         let outcome = tokio::task::spawn_blocking(move || {
+            let retrieval_config = state.retrieval_config_snapshot();
             let candidate_outcome = state
                 .retrieval_backend
-                .search_memory_candidate_outcome(&state.journal_store, &request)
+                .search_memory_candidate_outcome(&state.journal_store, &request, &retrieval_config)
                 .map_err(|error| map_memory_store_error("search memory items", error))?;
             let fusion_started = Instant::now();
             let hits = score_memory_candidates(
                 candidate_outcome.candidates,
                 request.min_score,
-                &state.retrieval_config_snapshot(),
+                &retrieval_config,
             );
             let diagnostics = complete_retrieval_diagnostics(
                 candidate_outcome.diagnostics,
@@ -6773,14 +6774,15 @@ impl GatewayRuntimeState {
         let started_at = Instant::now();
         let state = Arc::clone(self);
         let results = tokio::task::spawn_blocking(move || {
+            let retrieval_config = state.retrieval_config_snapshot();
             let candidates = state
                 .retrieval_backend
-                .search_memory_candidates(&state.journal_store, &request)
+                .search_memory_candidates(&state.journal_store, &request, &retrieval_config)
                 .map_err(|error| map_memory_store_error("search memory items", error))?;
             Ok::<_, Status>(score_memory_candidates(
                 candidates,
                 request.min_score,
-                &state.retrieval_config_snapshot(),
+                &retrieval_config,
             ))
         })
         .await
@@ -7002,15 +7004,20 @@ impl GatewayRuntimeState {
         let total_started = Instant::now();
         let state = Arc::clone(self);
         let outcome = tokio::task::spawn_blocking(move || {
+            let retrieval_config = state.retrieval_config_snapshot();
             let candidate_outcome = state
                 .retrieval_backend
-                .search_workspace_candidate_outcome(&state.journal_store, &request)
+                .search_workspace_candidate_outcome(
+                    &state.journal_store,
+                    &request,
+                    &retrieval_config,
+                )
                 .map_err(|error| map_memory_store_error("search workspace documents", error))?;
             let fusion_started = Instant::now();
             let hits = score_workspace_candidates(
                 candidate_outcome.candidates,
                 request.min_score,
-                &state.retrieval_config_snapshot(),
+                &retrieval_config,
             );
             let diagnostics = complete_retrieval_diagnostics(
                 candidate_outcome.diagnostics,

@@ -171,7 +171,7 @@ use palyra_vault::{
     VaultConfig as VaultConfigOptions, VaultRef, VaultScope,
 };
 use reqwest::{Client as ReqwestClient, Url};
-use retrieval::{build_memory_embedding_runtime_selection, JournalRetrievalBackend};
+use retrieval::{build_memory_embedding_runtime_selection, ExternalDerivedRetrievalBackend};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -2132,7 +2132,7 @@ pub async fn run() -> Result<()> {
             vault: Arc::clone(&vault),
             agent_registry,
             tool_posture_registry,
-            retrieval_backend: Arc::new(JournalRetrievalBackend),
+            retrieval_backend: Arc::new(ExternalDerivedRetrievalBackend::default()),
         },
     )
     .context("failed to initialize gateway runtime state")?;
