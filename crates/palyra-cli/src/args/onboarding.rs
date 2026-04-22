@@ -1,6 +1,6 @@
 use clap::{Args, Subcommand, ValueEnum};
 
-use super::InitTlsScaffoldArg;
+use super::{DeploymentProfileArg, InitTlsScaffoldArg};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OnboardingFlowArg {
@@ -50,6 +50,8 @@ pub struct WizardOverridesArg {
     pub api_key_stdin: bool,
     #[arg(long, default_value_t = false)]
     pub api_key_prompt: bool,
+    #[arg(long, value_enum)]
+    pub deployment_profile: Option<DeploymentProfileArg>,
     #[arg(long, value_enum)]
     pub bind_profile: Option<GatewayBindProfileArg>,
     #[arg(long)]
@@ -108,6 +110,8 @@ pub struct SetupWizardOverridesArg {
     pub api_key_stdin: bool,
     #[arg(long, default_value_t = false)]
     pub api_key_prompt: bool,
+    #[arg(long, value_enum)]
+    pub deployment_profile: Option<DeploymentProfileArg>,
     #[arg(long, value_enum)]
     pub bind_profile: Option<GatewayBindProfileArg>,
     #[arg(long)]

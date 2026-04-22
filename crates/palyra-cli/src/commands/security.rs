@@ -806,6 +806,11 @@ mod tests {
                 contract: control_plane::ContractDescriptor {
                     contract_version: "control-plane.v1".to_owned(),
                 },
+                profile: "single-vm".to_owned(),
+                profile_manifest: serde_json::json!({
+                    "schema_version": 1,
+                    "profile_id": "single-vm",
+                }),
                 mode: "remote_vps".to_owned(),
                 bind_profile: "public_tls".to_owned(),
                 bind_addresses: control_plane::DeploymentBindAddresses {

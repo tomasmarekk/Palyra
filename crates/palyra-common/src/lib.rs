@@ -3,6 +3,7 @@ mod config;
 pub mod config_system;
 pub mod context_references;
 pub mod daemon_config_schema;
+pub mod deployment_profiles;
 pub mod feature_rollouts;
 mod health;
 mod ids;

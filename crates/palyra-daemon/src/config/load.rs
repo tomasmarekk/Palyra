@@ -48,6 +48,7 @@ use crate::sandbox_runner::{EgressEnforcementMode, SandboxProcessRunnerTier};
 
 pub fn load_config() -> Result<LoadedConfig> {
     let mut deployment = DeploymentConfig::default();
+    let mut deployment_profile_explicit = false;
     let mut daemon = DaemonConfig::default();
     let mut gateway = GatewayConfig::default();
     let mut feature_rollouts = FeatureRolloutsConfig::default();
@@ -84,6 +85,14 @@ pub fn load_config() -> Result<LoadedConfig> {
             migrated_from_version = Some(migration.source_version);
         }
         if let Some(file_deployment) = parsed.deployment {
+            if let Some(profile) = file_deployment.profile {
+                let profile = palyra_common::deployment_profiles::DeploymentProfileId::parse(
+                    profile.as_str(),
+                )
+                .with_context(|| "failed to parse deployment.profile")?;
+                deployment.profile = profile.as_str().to_owned();
+                deployment_profile_explicit = true;
+            }
             if let Some(mode) = file_deployment.mode {
                 deployment.mode = DeploymentMode::parse(mode.as_str(), "deployment.mode")?;
             }
@@ -1137,6 +1146,15 @@ pub fn load_config() -> Result<LoadedConfig> {
         source.push_str(" +env(PALYRA_DEPLOYMENT_MODE)");
     }
 
+    if let Ok(profile) = env::var("PALYRA_DEPLOYMENT_PROFILE") {
+        let profile =
+            palyra_common::deployment_profiles::DeploymentProfileId::parse(profile.as_str())
+                .with_context(|| "failed to parse PALYRA_DEPLOYMENT_PROFILE")?;
+        deployment.profile = profile.as_str().to_owned();
+        deployment_profile_explicit = true;
+        source.push_str(" +env(PALYRA_DEPLOYMENT_PROFILE)");
+    }
+
     if let Ok(dangerous_remote_bind_ack) = env::var("PALYRA_DEPLOYMENT_DANGEROUS_REMOTE_BIND_ACK") {
         deployment.dangerous_remote_bind_ack = dangerous_remote_bind_ack
             .parse::<bool>()
@@ -1941,6 +1959,15 @@ pub fn load_config() -> Result<LoadedConfig> {
         &networked_workers,
     )?;
     validate_secret_source_conflicts(&model_provider, &tool_call.browser_service, &admin)?;
+    if !deployment_profile_explicit {
+        let derived = palyra_common::deployment_profiles::derive_deployment_profile(
+            None,
+            Some(deployment.mode.as_str()),
+            feature_rollouts.networked_workers.enabled
+                || networked_workers.mode != RuntimePreviewMode::Disabled,
+        );
+        deployment.profile = derived.as_str().to_owned();
+    }
 
     Ok(LoadedConfig {
         source,

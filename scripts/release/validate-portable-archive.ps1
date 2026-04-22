@@ -42,6 +42,15 @@ try {
     }
     Assert-FileExists -Path (Join-Path $payloadRoot "web/index.html") -Label "web/index.html" | Out-Null
     Assert-FileExists -Path (Join-Path $payloadRoot "docs/help_snapshots/docs-help.txt") -Label "docs/help_snapshots/docs-help.txt" | Out-Null
+    Assert-FileExists -Path (Join-Path $payloadRoot "deployment/single-vm/profile-manifest.json") -Label "deployment/single-vm/profile-manifest.json" | Out-Null
+    Assert-FileExists -Path (Join-Path $payloadRoot "deployment/single-vm/compose/single-vm.yml") -Label "deployment/single-vm/compose/single-vm.yml" | Out-Null
+    Assert-FileExists -Path (Join-Path $payloadRoot "deployment/worker-enabled/profile-manifest.json") -Label "deployment/worker-enabled/profile-manifest.json" | Out-Null
+    Assert-FileExists -Path (Join-Path $payloadRoot "deployment/worker-enabled/compose/worker-enabled.yml") -Label "deployment/worker-enabled/compose/worker-enabled.yml" | Out-Null
+    Assert-FileExists -Path (Join-Path $payloadRoot "deployment/worker-enabled/systemd/palyra-workerd.service") -Label "deployment/worker-enabled/systemd/palyra-workerd.service" | Out-Null
+
+    if ($null -eq $manifest.deployment_recipes -or $manifest.deployment_recipes.Count -lt 10) {
+        throw "Release manifest must list generated deployment recipes for single-vm and worker-enabled profiles."
+    }
 
     $requiredBinaries =
         if ($manifest.artifact_kind -eq "desktop") {

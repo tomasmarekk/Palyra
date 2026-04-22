@@ -65,6 +65,8 @@ function Invoke-InstalledCliSmoke {
         @("browser", "--help"),
         @("node", "--help"),
         @("nodes", "--help"),
+        @("deployment", "--help"),
+        @("deployment", "profiles", "--help"),
         @("docs", "--help"),
         @("update", "--help"),
         @("uninstall", "--help"),
@@ -90,6 +92,18 @@ function Invoke-InstalledCliSmoke {
         foreach ($command in $helpCommands) {
             Invoke-CommandQuiet -Command "palyra" -Arguments $command
         }
+        $deploymentSmokeRoot = Join-Path $StateRoot "deployment-smoke"
+        New-Item -ItemType Directory -Path $deploymentSmokeRoot -Force | Out-Null
+        $deploymentConfigPath = Join-Path $deploymentSmokeRoot "worker-enabled.toml"
+        $deploymentRecipeRoot = Join-Path $deploymentSmokeRoot "recipes"
+        Invoke-CommandQuiet -Command "palyra" -Arguments @("deployment", "profiles", "--json")
+        Invoke-CommandQuiet -Command "palyra" -Arguments @("deployment", "manifest", "--deployment-profile", "single-vm")
+        Invoke-CommandQuiet -Command "palyra" -Arguments @("setup", "--mode", "remote", "--deployment-profile", "worker-enabled", "--path", $deploymentConfigPath, "--force", "--tls-scaffold", "none")
+        Invoke-CommandQuiet -Command "palyra" -Arguments @("deployment", "preflight", "--deployment-profile", "worker-enabled", "--path", $deploymentConfigPath, "--json")
+        Invoke-CommandQuiet -Command "palyra" -Arguments @("deployment", "recipe", "--deployment-profile", "worker-enabled", "--output-dir", $deploymentRecipeRoot)
+        Invoke-CommandQuiet -Command "palyra" -Arguments @("deployment", "upgrade-smoke", "--deployment-profile", "worker-enabled", "--path", $deploymentConfigPath, "--json")
+        Invoke-CommandQuiet -Command "palyra" -Arguments @("deployment", "promotion-check", "--deployment-profile", "worker-enabled", "--json")
+        Invoke-CommandQuiet -Command "palyra" -Arguments @("deployment", "rollback-plan", "--deployment-profile", "worker-enabled", "--json")
         Invoke-CommandQuiet -Command "palyra" -Arguments @(
             "update",
             "--install-root",

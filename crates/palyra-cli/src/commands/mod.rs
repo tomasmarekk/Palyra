@@ -11,6 +11,7 @@ pub mod config;
 pub mod configure;
 pub mod cron;
 pub mod daemon;
+pub mod deployment;
 pub mod devices;
 pub mod docs;
 pub mod doctor;

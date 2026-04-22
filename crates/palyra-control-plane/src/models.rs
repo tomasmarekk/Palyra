@@ -156,6 +156,8 @@ pub struct RemoteAdminAccessAttempt {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeploymentPostureSummary {
     pub contract: ContractDescriptor,
+    pub profile: String,
+    pub profile_manifest: Value,
     pub mode: String,
     pub bind_profile: String,
     pub bind_addresses: DeploymentBindAddresses,

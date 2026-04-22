@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "release_scope": "deployment_profiles",
+  "updated_at": "2026-04-22",
+  "gates": [
+    {
+      "id": "deployment_preflight",
+      "profiles": [
+        "local",
+        "single-vm",
+        "worker-enabled"
+      ],
+      "required": true,
+      "default_status": "manual",
+      "summary": "deployment preflight passes for the selected profile with fail-closed bind and auth posture"
+    },
+    {
+      "id": "deployment_recipe_generated",
+      "profiles": [
+        "single-vm",
+        "worker-enabled"
+      ],
+      "required": true,
+      "default_status": "manual",
+      "summary": "deployment recipe was generated from the canonical profile manifest and includes env, compose, systemd, and rollback artifacts"
+    },
+    {
+      "id": "runtime_smoke_queue_retrieval_flow",
+      "profiles": [
+        "single-vm",
+        "worker-enabled"
+      ],
+      "required": true,
+      "default_status": "manual",
+      "summary": "staging smoke covers queue posture, retrieval diagnostics, checkpoint/replay metadata, and flow runtime surfaces"
+    },
+    {
+      "id": "support_bundle_export",
+      "profiles": [
+        "local",
+        "single-vm",
+        "worker-enabled"
+      ],
+      "required": true,
+      "default_status": "manual",
+      "summary": "support bundle export captures config, queue, retrieval, replay, flow, and worker posture"
+    },
+    {
+      "id": "rollback_plan_reviewed",
+      "profiles": [
+        "single-vm",
+        "worker-enabled"
+      ],
+      "required": true,
+      "default_status": "manual",
+      "summary": "rollback plan was generated and reviewed for config, migrations, flow tables, replay schema, and rollout flags"
+    },
+    {
+      "id": "worker_attestation_digest",
+      "profiles": [
+        "worker-enabled"
+      ],
+      "required": true,
+      "default_status": "blocked",
+      "summary": "worker-enabled promotion requires an expected worker digest and explicit execution-plane egress review before broad rollout"
+    }
+  ]
+}

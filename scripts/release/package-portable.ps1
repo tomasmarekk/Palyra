@@ -91,6 +91,36 @@ Copy-Item -LiteralPath $resolvedWebDistPath -Destination (Join-Path $payloadRoot
 New-Item -ItemType Directory -Path (Join-Path $payloadRoot "docs") -Force | Out-Null
 Copy-Item -LiteralPath $resolvedHelpSnapshotsRoot -Destination (Join-Path $payloadRoot "docs/help_snapshots") -Recurse -Force
 
+$deploymentRecipeEntries = [System.Collections.Generic.List[object]]::new()
+
+function Invoke-DeploymentRecipeIntoPayload {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Profile
+    )
+
+    $recipeRoot = Join-Path $payloadRoot "deployment/$Profile"
+    New-Item -ItemType Directory -Path $recipeRoot -Force | Out-Null
+    & $resolvedCliBinary deployment recipe --deployment-profile $Profile --output-dir $recipeRoot | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to generate deployment recipe for profile '$Profile'."
+    }
+
+    Get-ChildItem -LiteralPath $recipeRoot -Recurse -File |
+        Sort-Object FullName |
+        ForEach-Object {
+            $deploymentRecipeEntries.Add([ordered]@{
+                    profile = $Profile
+                    relative_path = Get-RelativePosixPath -BasePath $payloadRoot -TargetPath $_.FullName
+                    sha256 = Get-Sha256Hex -Path $_.FullName
+                    size_bytes = $_.Length
+                }) | Out-Null
+        }
+}
+
+Invoke-DeploymentRecipeIntoPayload -Profile "single-vm"
+Invoke-DeploymentRecipeIntoPayload -Profile "worker-enabled"
+
 $installBody =
     if ($ArtifactKind -eq "desktop") {
 @"
@@ -125,12 +155,13 @@ Platform: $Platform
 Install
 1. Extract this archive into a dedicated directory.
 2. Treat `palyra` as a first-class entry point: either run it directly from this directory or expose it on your shell `PATH` with a shim or symlink.
-3. Run `palyra setup --mode remote --path <install-root>/config/palyra.toml --force`.
+3. Run `palyra setup --mode remote --deployment-profile single-vm --path <install-root>/config/palyra.toml --force`.
 4. Validate the generated config with `palyra config validate --path <install-root>/config/palyra.toml`.
-5. Review the installed operator surfaces with `palyra gateway --help`, `palyra browser --help`, `palyra node --help`, `palyra nodes --help`, `palyra docs --help`, `palyra update --help`, and `palyra uninstall --help`.
-6. Use `palyra docs search gateway` for bundled offline CLI help guidance.
-7. Start `palyrad` with `PALYRA_CONFIG=<install-root>/config/palyra.toml`.
-8. Start `palyra-browserd` only when browser automation is intentionally enabled by config.
+5. Review generated deployment recipes under `deployment/single-vm/` and `deployment/worker-enabled/`.
+6. Review the installed operator surfaces with `palyra gateway --help`, `palyra browser --help`, `palyra node --help`, `palyra nodes --help`, `palyra deployment --help`, `palyra docs --help`, `palyra update --help`, and `palyra uninstall --help`.
+7. Use `palyra docs search gateway` for bundled offline CLI help guidance.
+8. Start `palyrad` with `PALYRA_CONFIG=<install-root>/config/palyra.toml`.
+9. Start `palyra-browserd` only when browser automation is intentionally enabled by config.
 
 Update
 1. Stop `palyrad`.
@@ -199,6 +230,7 @@ $manifest = [ordered]@{
     install_mode = "portable-archive"
     source_sha = $sourceSha
     binaries = @($binaryEntries)
+    deployment_recipes = @($deploymentRecipeEntries)
     packaging_boundaries = [ordered]@{
         excluded_patterns = @(
             "*.sqlite",

@@ -36,6 +36,7 @@ pub(crate) struct OnboardingWizardRequest {
 pub(crate) struct ConfigureWizardRequest {
     pub(crate) path: Option<String>,
     pub(crate) sections: Vec<ConfigureSectionArg>,
+    pub(crate) deployment_profile: Option<DeploymentProfileArg>,
     pub(crate) non_interactive: bool,
     pub(crate) accept_risk: bool,
     pub(crate) json: bool,
@@ -171,6 +172,7 @@ struct BindProfileConfig {
 #[derive(Debug, Default, Clone)]
 struct OnboardingMutationPlan {
     flow: String,
+    deployment_profile: palyra_common::deployment_profiles::DeploymentProfileId,
     deployment_mode: String,
     workspace_root: Option<String>,
     auth_method: String,
@@ -201,6 +203,7 @@ struct OnboardingMutationPlan {
 struct OnboardingSummary {
     status: &'static str,
     flow: String,
+    deployment_profile: String,
     deployment_mode: String,
     config_path: String,
     state_root: String,
@@ -287,6 +290,7 @@ pub(crate) fn run_onboarding_wizard(request: OnboardingWizardRequest) -> Result<
     let summary = OnboardingSummary {
         status: "complete",
         flow: plan.flow,
+        deployment_profile: plan.deployment_profile.as_str().to_owned(),
         deployment_mode: plan.deployment_mode,
         config_path: apply_context.config_path.display().to_string(),
         state_root: apply_context.state_root.display().to_string(),
@@ -329,6 +333,78 @@ pub(crate) fn run_configure_wizard(request: ConfigureWizardRequest) -> Result<()
         let before_snapshot = describe_configure_section(&document, section)?;
         let before = document.clone();
         match section {
+            ConfigureSectionArg::DeploymentProfile => {
+                wizard.note(WizardStep::note(
+                    "configure.deployment_profile.note",
+                    "Deployment Profile",
+                    format!(
+                        "Select the canonical profile used for config defaults, deployment recipes, and health preflights. Current state: {}",
+                        join_section_state(before_snapshot.as_slice())
+                    ),
+                ))?;
+                let current_profile = get_string_value_at_path(&document, "deployment.profile")?
+                    .unwrap_or_else(|| {
+                        let worker_enabled =
+                            get_bool_value_at_path(&document, "feature_rollouts.networked_workers")
+                                .ok()
+                                .flatten()
+                                .unwrap_or(false);
+                        palyra_common::deployment_profiles::derive_deployment_profile(
+                            None,
+                            get_string_value_at_path(&document, "deployment.mode")
+                                .ok()
+                                .flatten()
+                                .as_deref(),
+                            worker_enabled,
+                        )
+                        .as_str()
+                        .to_owned()
+                    });
+                let deployment_profile = wizard.select(select_step(
+                    "deployment_profile",
+                    "Deployment Profile",
+                    "Choose the profile that should own bootstrap defaults and rollout posture.",
+                    vec![
+                        choice("local", "Local", Some("loopback-only workstation runtime")),
+                        choice(
+                            "single-vm",
+                            "Single VM",
+                            Some("loopback-first service profile for one host"),
+                        ),
+                        choice(
+                            "worker-enabled",
+                            "Worker Enabled",
+                            Some("service profile with guarded networked worker execution"),
+                        ),
+                    ],
+                    Some(current_profile),
+                ))?;
+                let deployment_profile =
+                    palyra_common::deployment_profiles::DeploymentProfileId::parse(
+                        deployment_profile.as_str(),
+                    )
+                    .context("configure selected an invalid deployment profile")?;
+                apply_deployment_profile_defaults(&mut document, deployment_profile)?;
+                set_value_at_path(
+                    &mut document,
+                    "deployment.profile",
+                    toml::Value::String(deployment_profile.as_str().to_owned()),
+                )?;
+                set_value_at_path(
+                    &mut document,
+                    "deployment.mode",
+                    toml::Value::String(deployment_profile.deployment_mode().to_owned()),
+                )?;
+                set_value_at_path(
+                    &mut document,
+                    "gateway.bind_profile",
+                    toml::Value::String(deployment_profile.bind_profile().to_owned()),
+                )?;
+                follow_up_checks.push(format!(
+                    "palyra deployment preflight --deployment-profile {}",
+                    deployment_profile.as_str()
+                ));
+            }
             ConfigureSectionArg::Workspace => {
                 wizard.note(WizardStep::note(
                     "configure.workspace.note",
@@ -618,6 +694,19 @@ fn resolve_onboarding_flow(
     }
 }
 
+fn default_deployment_profile_for_flow(
+    flow: WizardFlowKind,
+    setup_mode: Option<InitModeArg>,
+) -> palyra_common::deployment_profiles::DeploymentProfileId {
+    if flow == WizardFlowKind::Remote {
+        return palyra_common::deployment_profiles::DeploymentProfileId::SingleVm;
+    }
+    setup_mode
+        .map(InitMode::from_arg)
+        .map(default_deployment_profile_for_init)
+        .unwrap_or(palyra_common::deployment_profiles::DeploymentProfileId::Local)
+}
+
 fn build_backend(
     non_interactive: bool,
     answers: BTreeMap<String, WizardValue>,
@@ -679,6 +768,12 @@ fn build_onboarding_answers(
     });
     if let Some(auth_method) = auth_method {
         answers.insert("auth_method".to_owned(), WizardValue::Choice(auth_method));
+    }
+    if let Some(deployment_profile) = request.options.deployment_profile {
+        answers.insert(
+            "deployment_profile".to_owned(),
+            WizardValue::Choice(deployment_profile_value(deployment_profile).to_owned()),
+        );
     }
     if let Some(api_key) = secrets.api_key {
         answers.insert("model_provider_api_key".to_owned(), WizardValue::SensitiveText(api_key));
@@ -776,6 +871,12 @@ fn build_configure_answers(
             ),
         );
     }
+    if let Some(deployment_profile) = request.deployment_profile {
+        answers.insert(
+            "deployment_profile".to_owned(),
+            WizardValue::Choice(deployment_profile_value(deployment_profile).to_owned()),
+        );
+    }
     if let Some(auth_method) = request.auth_method {
         answers
             .insert("auth_method".to_owned(), WizardValue::Choice(auth_method_value(auth_method)));
@@ -870,18 +971,35 @@ fn execute_onboarding_flow(
             step_id: "existing_config_action".to_owned(),
         }));
     }
+    let default_profile = request
+        .options
+        .deployment_profile
+        .map(deployment_profile_id_from_arg)
+        .unwrap_or_else(|| default_deployment_profile_for_flow(flow, request.setup_mode));
+    let selected_profile = wizard.select(select_step(
+        "deployment_profile",
+        "Deployment Profile",
+        "Choose the canonical bootstrap profile that should shape config defaults, preflights, and deploy recipes.",
+        vec![
+            choice("local", "Local", Some("loopback-only workstation runtime")),
+            choice("single-vm", "Single VM", Some("loopback-first service profile for one host")),
+            choice(
+                "worker-enabled",
+                "Worker Enabled",
+                Some("service profile with guarded networked worker execution"),
+            ),
+        ],
+        Some(default_profile.as_str().to_owned()),
+    ))?;
+    let deployment_profile =
+        palyra_common::deployment_profiles::DeploymentProfileId::parse(selected_profile.as_str())
+            .context("wizard selected an invalid deployment profile")?;
 
     let mut plan = OnboardingMutationPlan {
         flow: flow.as_str().to_owned(),
-        deployment_mode: if flow == WizardFlowKind::Remote {
-            "remote_vps".to_owned()
-        } else {
-            request
-                .setup_mode
-                .map(|mode| InitMode::from_arg(mode).deployment_mode().to_owned())
-                .unwrap_or_else(|| "local_desktop".to_owned())
-        },
-        bind_profile: "loopback_only".to_owned(),
+        deployment_profile,
+        deployment_mode: deployment_profile.deployment_mode().to_owned(),
+        bind_profile: deployment_profile.bind_profile().to_owned(),
         auth_method: "skip".to_owned(),
         skipped_sections: Vec::new(),
         warnings: Vec::new(),
@@ -1491,6 +1609,7 @@ fn apply_onboarding_plan(
         let tls_paths = if plan.tls_enabled { context.tls_paths.as_ref() } else { None };
         build_init_config_document(
             mode,
+            plan.deployment_profile,
             context.identity_store_dir.as_path(),
             context.vault_dir.as_path(),
             admin_token.as_str(),
@@ -1511,6 +1630,17 @@ fn apply_onboarding_plan(
         apply_model_provider_api_key(&mut document, plan.auth_method.as_str(), api_key.as_str())?;
     }
 
+    set_value_at_path(
+        &mut document,
+        "deployment.profile",
+        toml::Value::String(plan.deployment_profile.as_str().to_owned()),
+    )?;
+    apply_deployment_profile_defaults(&mut document, plan.deployment_profile)?;
+    set_value_at_path(
+        &mut document,
+        "deployment.profile",
+        toml::Value::String(plan.deployment_profile.as_str().to_owned()),
+    )?;
     set_value_at_path(
         &mut document,
         "deployment.mode",
@@ -1788,6 +1918,7 @@ fn emit_onboarding_summary(summary: &OnboardingSummary, json_output: bool) -> Re
             summary.config_path,
             summary.state_root
         );
+        println!("onboarding.deployment_profile={}", summary.deployment_profile);
         println!(
             "onboarding.summary workspace_root_configured={} auth_method={} dashboard_access={} health_status={:?} service_install_mode={}",
             summary.workspace_root.is_some(),
@@ -1893,6 +2024,7 @@ fn select_configure_sections(
         "Configure Sections",
         "Choose the sections you want to reconfigure.",
         vec![
+            choice("deployment-profile", "Deployment Profile", None),
             choice("workspace", "Workspace", None),
             choice("auth-model", "Auth / Model", None),
             choice("gateway", "Gateway", None),
@@ -1902,11 +2034,12 @@ fn select_configure_sections(
             choice("skills", "Skills", None),
             choice("health-security", "Health / Security", None),
         ],
-        Some("workspace,auth-model,gateway,health-security".to_owned()),
+        Some("deployment-profile,workspace,auth-model,gateway,health-security".to_owned()),
     ))?;
     selected
         .into_iter()
         .map(|value| match value.as_str() {
+            "deployment-profile" => Ok(ConfigureSectionArg::DeploymentProfile),
             "workspace" => Ok(ConfigureSectionArg::Workspace),
             "auth-model" => Ok(ConfigureSectionArg::AuthModel),
             "gateway" => Ok(ConfigureSectionArg::Gateway),
@@ -2631,6 +2764,23 @@ fn describe_configure_section(
     section: ConfigureSectionArg,
 ) -> Result<Vec<String>> {
     match section {
+        ConfigureSectionArg::DeploymentProfile => Ok(vec![
+            format!(
+                "deployment_profile={}",
+                get_string_value_at_path(document, "deployment.profile")?
+                    .unwrap_or_else(|| "derived".to_owned())
+            ),
+            format!(
+                "deployment_mode={}",
+                get_string_value_at_path(document, "deployment.mode")?
+                    .unwrap_or_else(|| "unset".to_owned())
+            ),
+            format!(
+                "networked_workers_rollout={}",
+                get_bool_value_at_path(document, "feature_rollouts.networked_workers")?
+                    .unwrap_or(false)
+            ),
+        ]),
         ConfigureSectionArg::Workspace => Ok(vec![format!(
             "workspace_root={}",
             get_string_value_at_path(document, "tool_call.process_runner.workspace_root")?
@@ -2789,7 +2939,8 @@ fn section_requires_restart(section: ConfigureSectionArg, changed: bool) -> bool
     changed
         && matches!(
             section,
-            ConfigureSectionArg::Workspace
+            ConfigureSectionArg::DeploymentProfile
+                | ConfigureSectionArg::Workspace
                 | ConfigureSectionArg::AuthModel
                 | ConfigureSectionArg::Gateway
                 | ConfigureSectionArg::RuntimeControls
@@ -2801,6 +2952,15 @@ fn section_follow_up_checks(
     document: &toml::Value,
 ) -> Result<Vec<String>> {
     let mut follow_ups = match section {
+        ConfigureSectionArg::DeploymentProfile => {
+            let profile = get_string_value_at_path(document, "deployment.profile")?
+                .unwrap_or_else(|| "local".to_owned());
+            vec![
+                format!("palyra deployment preflight --deployment-profile {profile}"),
+                format!("palyra deployment recipe --deployment-profile {profile} --output-dir ./artifacts/deploy"),
+                "restart daemon so deployment profile changes take effect".to_owned(),
+            ]
+        }
         ConfigureSectionArg::Workspace => {
             vec!["restart daemon or new runs to pick up workspace-root changes".to_owned()]
         }
@@ -3054,6 +3214,10 @@ fn api_key_field_label(auth_method: &str) -> &'static str {
     }
 }
 
+fn deployment_profile_value(value: DeploymentProfileArg) -> &'static str {
+    deployment_profile_id_from_arg(value).as_str()
+}
+
 fn bind_profile_value(value: GatewayBindProfileArg) -> &'static str {
     match value {
         GatewayBindProfileArg::LoopbackOnly => "loopback_only",
@@ -3186,6 +3350,7 @@ trait ConfigureSectionLabel {
 impl ConfigureSectionLabel for ConfigureSectionArg {
     fn slug(self) -> &'static str {
         match self {
+            ConfigureSectionArg::DeploymentProfile => "deployment-profile",
             ConfigureSectionArg::Workspace => "workspace",
             ConfigureSectionArg::AuthModel => "auth-model",
             ConfigureSectionArg::Gateway => "gateway",
@@ -3221,6 +3386,7 @@ mod tests {
                 api_key_env: None,
                 api_key_stdin: false,
                 api_key_prompt: false,
+                deployment_profile: None,
                 bind_profile: None,
                 daemon_port: None,
                 grpc_port: None,
@@ -3284,6 +3450,7 @@ mod tests {
             &ConfigureWizardRequest {
                 path: None,
                 sections: Vec::new(),
+                deployment_profile: None,
                 non_interactive: false,
                 accept_risk: false,
                 json: false,

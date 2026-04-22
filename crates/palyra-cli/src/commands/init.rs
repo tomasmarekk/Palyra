@@ -2,11 +2,21 @@ use crate::*;
 
 pub(crate) fn run_init(
     mode: InitModeArg,
+    deployment_profile: Option<DeploymentProfileArg>,
     path: Option<String>,
     force: bool,
     tls_scaffold: InitTlsScaffoldArg,
 ) -> Result<()> {
-    let mode = InitMode::from_arg(mode);
+    let requested_mode = InitMode::from_arg(mode);
+    let deployment_profile = deployment_profile
+        .map(deployment_profile_id_from_arg)
+        .unwrap_or_else(|| default_deployment_profile_for_init(requested_mode));
+    let mode =
+        if deployment_profile == palyra_common::deployment_profiles::DeploymentProfileId::Local {
+            InitMode::LocalDesktop
+        } else {
+            InitMode::RemoteVps
+        };
     let config_path = resolve_init_path(path)?;
     if config_path.exists() && !force {
         anyhow::bail!(
@@ -52,6 +62,7 @@ pub(crate) fn run_init(
     let admin_token = generate_admin_token();
     let document = build_init_config_document(
         mode,
+        deployment_profile,
         identity_store_dir.as_path(),
         vault_dir.as_path(),
         admin_token.as_str(),
@@ -71,6 +82,7 @@ pub(crate) fn run_init(
         config_path.display(),
         force
     );
+    println!("init.deployment_profile={}", deployment_profile.as_str());
     println!(
         "init.state_root={} identity_store={} vault_dir={}",
         state_root.display(),

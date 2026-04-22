@@ -14,6 +14,7 @@ mod config;
 mod configure;
 mod cron;
 mod daemon;
+mod deployment;
 mod devices;
 mod docs;
 mod flows;
@@ -75,6 +76,7 @@ pub use config::ConfigCommand;
 pub use configure::ConfigureSectionArg;
 pub use cron::{CronCommand, CronConcurrencyPolicyArg, CronMisfirePolicyArg, CronScheduleTypeArg};
 pub use daemon::{DaemonCommand, JournalCheckpointModeArg};
+pub use deployment::{DeploymentCommand, DeploymentProfileArg};
 pub use devices::DevicesCommand;
 pub use docs::DocsCommand;
 pub use flows::{FlowStateArg, FlowsCommand};
@@ -123,6 +125,8 @@ pub use webhooks::WebhooksCommand;
 const ROOT_AFTER_HELP: &str = "\
 Examples:
   palyra setup --mode local
+  palyra setup --deployment-profile single-vm --path ./config/palyra.toml
+  palyra deployment profiles --json
   palyra acp --session-key ops:triage
   palyra docs search gateway
   palyra gateway status
@@ -162,6 +166,8 @@ Canonical command map:
 const SETUP_AFTER_HELP: &str = "\
 Examples:
   palyra setup --mode local
+  palyra setup --deployment-profile single-vm --path ./config/palyra.toml
+  palyra setup --deployment-profile worker-enabled --wizard --non-interactive --accept-risk
   palyra setup --mode local --wizard
   palyra setup --mode remote --path ./config/palyra.toml --force
 
@@ -230,6 +236,16 @@ Examples:
   palyra update --check
   palyra update --install-root ./install --archive ./artifacts/palyra-headless.zip --dry-run
   palyra update --install-root ./install --archive ./artifacts/palyra-headless.zip --yes --skip-service-restart";
+
+const DEPLOYMENT_AFTER_HELP: &str = "\
+Examples:
+  palyra deployment profiles --json
+  palyra deployment manifest --deployment-profile worker-enabled --output ./artifacts/worker-profile.json
+  palyra deployment preflight --deployment-profile single-vm --path ./palyra.toml
+  palyra deployment recipe --deployment-profile worker-enabled --output-dir ./artifacts/deploy
+  palyra deployment upgrade-smoke --deployment-profile worker-enabled --path ./palyra.toml
+  palyra deployment promotion-check --deployment-profile worker-enabled
+  palyra deployment rollback-plan --deployment-profile worker-enabled --output ./artifacts/rollback.json";
 
 const HEALTH_AFTER_HELP: &str = "\
 Examples:
@@ -660,6 +676,14 @@ pub enum Command {
         command: OnboardingCommand,
     },
     #[command(
+        about = "Inspect deployment profiles, run preflights, and generate deploy recipes",
+        after_long_help = DEPLOYMENT_AFTER_HELP
+    )]
+    Deployment {
+        #[command(subcommand)]
+        command: DeploymentCommand,
+    },
+    #[command(
         about = "Safely reconfigure an existing installation",
         after_long_help = CONFIGURE_AFTER_HELP
     )]
@@ -668,6 +692,8 @@ pub enum Command {
         path: Option<String>,
         #[arg(long = "section", value_enum)]
         sections: Vec<ConfigureSectionArg>,
+        #[arg(long = "deployment-profile", value_enum)]
+        deployment_profile: Option<DeploymentProfileArg>,
         #[arg(long, default_value_t = false)]
         non_interactive: bool,
         #[arg(long, default_value_t = false)]

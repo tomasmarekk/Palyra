@@ -1837,6 +1837,7 @@ pub(crate) fn build_support_bundle_observability(state: &AppState) -> Value {
     let runtime_preview = serde_json::to_value(state.observability.runtime_decision_snapshot())
         .unwrap_or_else(|_| json!({ "state": "encode_failed" }));
     let networked_workers = collect_console_networked_worker_diagnostics(state);
+    let runtime_support = build_runtime_support_observability(state, &networked_workers);
     let latest_job = lock_support_bundle_jobs(&state.support_bundle_jobs)
         .values()
         .cloned()
@@ -1854,6 +1855,9 @@ pub(crate) fn build_support_bundle_observability(state: &AppState) -> Value {
         "replay": build_replay_support_observability(),
         "runtime_preview": runtime_preview,
         "networked_workers": networked_workers,
+        "runtime_support": runtime_support,
+        "operator_runbooks": build_operator_runbooks_observability(),
+        "incident_checklists": build_incident_checklists_observability(),
         "last_job": latest_job.map(|job| json!({
             "job_id": job.job_id,
             "state": match job.state {
@@ -1868,6 +1872,149 @@ pub(crate) fn build_support_bundle_observability(state: &AppState) -> Value {
             "error": job.error,
         })),
     })
+}
+
+fn build_runtime_support_observability(state: &AppState, networked_workers: &Value) -> Value {
+    let support_jobs = lock_support_bundle_jobs(&state.support_bundle_jobs);
+    let mut support_jobs_by_state = std::collections::BTreeMap::<String, u64>::new();
+    for job in support_jobs.values() {
+        let state = match job.state {
+            control_plane::SupportBundleJobState::Queued => "queued",
+            control_plane::SupportBundleJobState::Running => "running",
+            control_plane::SupportBundleJobState::Succeeded => "succeeded",
+            control_plane::SupportBundleJobState::Failed => "failed",
+        };
+        *support_jobs_by_state.entry(state.to_owned()).or_default() += 1;
+    }
+    json!({
+        "queue_state": {
+            "support_bundle_jobs_by_state": support_jobs_by_state,
+            "session_queue_policy": {
+                "mode": state.runtime.config.session_queue_policy.mode.as_str(),
+                "max_depth": state.runtime.config.session_queue_policy.max_depth,
+                "merge_window_ms": state.runtime.config.session_queue_policy.merge_window_ms,
+                "rollout_enabled": state.runtime.config.feature_rollouts.session_queue_policy.enabled,
+                "rollout_source": state.runtime.config.feature_rollouts.session_queue_policy.source,
+            },
+            "doctor_recovery_jobs": build_doctor_recovery_observability(state),
+            "connector_queue_source": "observability.connector",
+        },
+        "pruning_explain": {
+            "mode": state.runtime.config.pruning_policy_matrix.mode.as_str(),
+            "manual_apply_enabled": state.runtime.config.pruning_policy_matrix.manual_apply_enabled,
+            "min_token_savings": state.runtime.config.pruning_policy_matrix.min_token_savings,
+            "rollout_enabled": state.runtime.config.feature_rollouts.pruning_policy_matrix.enabled,
+            "rollout_source": state.runtime.config.feature_rollouts.pruning_policy_matrix.source,
+        },
+        "recall_artifacts": {
+            "endpoint": "/console/v1/memory/recall-artifacts",
+            "latest_source": "/console/v1/memory/status",
+            "support_bundle_source": "journal.recall_artifacts",
+        },
+        "flow_snapshots": {
+            "endpoint": "/console/v1/diagnostics",
+            "mode": state.runtime.config.flow_orchestration.mode.as_str(),
+            "rollout_enabled": state.runtime.config.feature_rollouts.flow_orchestration.enabled,
+        },
+        "replay_bundle_metadata": build_replay_support_observability(),
+        "worker_diagnostics": networked_workers,
+    })
+}
+
+fn build_operator_runbooks_observability() -> Value {
+    json!([
+        {
+            "id": "queue_backlog",
+            "failure_mode": "Queue backlog",
+            "trigger": "Queued inputs, support jobs, or delegated children keep growing.",
+            "first_actions": [
+                "Check runtime_support.queue_state and connector queue diagnostics.",
+                "Pause risky rollout changes until queued work drains.",
+                "Inspect recent failures before applying repair or rollback."
+            ],
+            "escalation": "Escalate with the support bundle if queue state does not change after one retry window."
+        },
+        {
+            "id": "degraded_retrieval",
+            "failure_mode": "Degraded retrieval",
+            "trigger": "Memory retrieval backend reports degraded state or recall artifacts are missing.",
+            "first_actions": [
+                "Check runtime_support.pruning_explain and memory retrieval diagnostics.",
+                "Verify retention limits, embedding backend state, and recall artifact provenance.",
+                "Run a recall preview before changing memory retention settings."
+            ],
+            "escalation": "Escalate when retrieval remains degraded after config and provider health are both ok."
+        },
+        {
+            "id": "failed_restore",
+            "failure_mode": "Failed restore",
+            "trigger": "Workspace restore or checkpoint compare reports failures.",
+            "first_actions": [
+                "Inspect workspace_restore and recent journal errors.",
+                "Run doctor rollback preview before applying destructive recovery.",
+                "Keep the previous config and state root unchanged until verification passes."
+            ],
+            "escalation": "Escalate with checkpoint ids and restore report ids from the bundle."
+        },
+        {
+            "id": "stuck_flow",
+            "failure_mode": "Stuck flow",
+            "trigger": "Flow orchestration remains blocked or waiting for approval.",
+            "first_actions": [
+                "Inspect runtime_support.flow_snapshots and pending approvals.",
+                "Resolve approvals before retrying or skipping a flow step.",
+                "Use replay export for the affected run before manual intervention."
+            ],
+            "escalation": "Escalate if the same flow remains non-terminal after retry and approval resolution."
+        },
+        {
+            "id": "orphan_worker",
+            "failure_mode": "Orphan worker",
+            "trigger": "Networked worker snapshot reports orphaned or failed-closed workers.",
+            "first_actions": [
+                "Inspect runtime_support.worker_diagnostics.",
+                "Drain or quarantine affected workers before increasing rollout.",
+                "Run force cleanup only with operator evidence for removed artifacts/logs."
+            ],
+            "escalation": "Escalate with worker ids, lifecycle events, and attestation mismatch samples."
+        },
+        {
+            "id": "replay_mismatch",
+            "failure_mode": "Replay mismatch",
+            "trigger": "Offline replay diff or baseline gate fails.",
+            "first_actions": [
+                "Run support-bundle replay-run with a diff output artifact.",
+                "Inspect replay reporting diff categories and journal hash-chain state.",
+                "Do not promote a new baseline until validation and redaction both pass."
+            ],
+            "escalation": "Escalate with the replay bundle canonical hash and diff report."
+        }
+    ])
+}
+
+fn build_incident_checklists_observability() -> Value {
+    json!([
+        {
+            "id": "first_response",
+            "title": "First response",
+            "items": [
+                "Queue or export a fresh support bundle.",
+                "Record current deployment profile, mode, bind profile, and admin auth posture.",
+                "Check recent failures and config ref health before changing config.",
+                "Use preview mode for doctor repair or rollback before apply."
+            ]
+        },
+        {
+            "id": "promotion_or_rollback",
+            "title": "Promotion or rollback",
+            "items": [
+                "Run deployment preflight for the active profile.",
+                "Run upgrade smoke and inspect promotion gate status.",
+                "Export a support bundle before restart or rollback.",
+                "Verify doctor, gateway status, replay smoke, and worker diagnostics after restart."
+            ]
+        }
+    ])
 }
 
 fn build_replay_support_observability() -> Value {
@@ -2264,6 +2411,21 @@ pub(crate) fn build_deployment_posture_summary(
 
     control_plane::DeploymentPostureSummary {
         contract: contract_descriptor(),
+        profile: state.deployment.profile.clone(),
+        profile_manifest: serde_json::to_value(
+            palyra_common::deployment_profiles::DeploymentProfileId::parse(
+                state.deployment.profile.as_str(),
+            )
+            .map(palyra_common::deployment_profiles::deployment_profile_manifest)
+            .unwrap_or_else(|_| {
+                palyra_common::deployment_profiles::deployment_profile_manifest(
+                    palyra_common::deployment_profiles::DeploymentProfileId::Local,
+                )
+            }),
+        )
+        .unwrap_or_else(
+            |_| json!({ "schema_version": 1, "profile_id": state.deployment.profile.clone() }),
+        ),
         mode: state.deployment.mode.clone(),
         bind_profile: state.deployment.bind_profile.clone(),
         bind_addresses: control_plane::DeploymentBindAddresses {

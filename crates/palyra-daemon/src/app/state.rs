@@ -79,6 +79,7 @@ pub(crate) struct ReloadOperationsState {
 
 #[derive(Debug, Clone)]
 pub(crate) struct DeploymentRuntimeSnapshot {
+    pub(crate) profile: String,
     pub(crate) mode: String,
     pub(crate) bind_profile: String,
     pub(crate) admin_bind_addr: String,

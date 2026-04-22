@@ -40,6 +40,9 @@ jobs:
       - name: Run replay gate
         run: bash scripts/test/run-replay-gate.sh
 
+      - name: Run deployment smoke
+        run: bash scripts/test/run-deployment-smoke.sh
+
       - name: Upload workflow regression artifact
         if: ${{ always() }}
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f

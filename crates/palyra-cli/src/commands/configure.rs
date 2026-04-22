@@ -6,6 +6,7 @@ use crate::*;
 pub(crate) fn run_configure(
     path: Option<String>,
     sections: Vec<ConfigureSectionArg>,
+    deployment_profile: Option<DeploymentProfileArg>,
     non_interactive: bool,
     accept_risk: bool,
     json: bool,
@@ -38,6 +39,7 @@ pub(crate) fn run_configure(
         commands::operator_wizard::ConfigureWizardRequest {
             path,
             sections,
+            deployment_profile,
             non_interactive,
             accept_risk,
             json,

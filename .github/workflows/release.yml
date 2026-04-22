@@ -266,6 +266,9 @@ jobs:
       - name: Build release binaries
         run: cargo build -p palyra-daemon -p palyra-browserd -p palyra-cli --release --locked
 
+      - name: Run deployment smoke
+        run: bash scripts/test/run-deployment-smoke.sh
+
       - name: Package portable headless bundle
         id: package
         shell: pwsh

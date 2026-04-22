@@ -80,14 +80,15 @@ use cli::{
     AcpCommand, AgentCommand, AgentsCommand, ApprovalDecisionArg, ApprovalExportFormatArg,
     ApprovalsCommand, AuthAccessCommand, AuthCommand, AuthCredentialArg, AuthOpenAiCommand,
     AuthProfilesCommand, AuthProviderArg, AuthScopeArg, BrowserCommand, Cli, Command as CliCommand,
-    CompletionShell, ConfigCommand, ConfigureSectionArg, CronCommand, DaemonCommand, DocsCommand,
-    GatewayBindProfileArg, HooksCommand, InitModeArg, InitTlsScaffoldArg, JournalCheckpointModeArg,
-    MemoryCommand, MemoryLearningCommand, MemoryScopeArg, MemorySourceArg, ModelsCommand,
-    OnboardingAuthMethodArg, OnboardingCommand, OnboardingFlowArg, PatchCommand, PluginsCommand,
-    PolicyCommand, ProtocolCommand, RemoteVerificationModeArg, SandboxCommand, SandboxRuntimeArg,
-    SecretsCommand, SecurityCommand, SessionsCommand, SetupWizardOverridesArg, SkillsCommand,
-    SkillsPackageCommand, SupportBundleCommand, SystemCommand, SystemEventCommand,
-    SystemEventSeverityArg, WebhooksCommand, WizardOverridesArg, WorkspaceRoleArg,
+    CompletionShell, ConfigCommand, ConfigureSectionArg, CronCommand, DaemonCommand,
+    DeploymentCommand, DeploymentProfileArg, DocsCommand, GatewayBindProfileArg, HooksCommand,
+    InitModeArg, InitTlsScaffoldArg, JournalCheckpointModeArg, MemoryCommand,
+    MemoryLearningCommand, MemoryScopeArg, MemorySourceArg, ModelsCommand, OnboardingAuthMethodArg,
+    OnboardingCommand, OnboardingFlowArg, PatchCommand, PluginsCommand, PolicyCommand,
+    ProtocolCommand, RemoteVerificationModeArg, SandboxCommand, SandboxRuntimeArg, SecretsCommand,
+    SecurityCommand, SessionsCommand, SetupWizardOverridesArg, SkillsCommand, SkillsPackageCommand,
+    SupportBundleCommand, SystemCommand, SystemEventCommand, SystemEventSeverityArg,
+    WebhooksCommand, WizardOverridesArg, WorkspaceRoleArg,
 };
 use cli::{PairingClientKindArg, PairingCommand, PairingMethodArg};
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
@@ -292,9 +293,11 @@ fn run_cli() -> Result<()> {
         CliCommand::Sandbox { command } => commands::sandbox::run_sandbox(command),
         CliCommand::Completion { shell } => commands::completion::run_completion(shell),
         CliCommand::Onboarding { command } => commands::onboarding::run_onboarding(command),
+        CliCommand::Deployment { command } => commands::deployment::run_deployment(command),
         CliCommand::Configure {
             path,
             sections,
+            deployment_profile,
             non_interactive,
             accept_risk,
             json,
@@ -324,6 +327,7 @@ fn run_cli() -> Result<()> {
         } => commands::configure::run_configure(
             path,
             sections,
+            deployment_profile,
             non_interactive,
             accept_risk,
             json,
@@ -498,6 +502,31 @@ impl InitMode {
     }
 }
 
+fn deployment_profile_id_from_arg(
+    value: DeploymentProfileArg,
+) -> palyra_common::deployment_profiles::DeploymentProfileId {
+    match value {
+        DeploymentProfileArg::Local => {
+            palyra_common::deployment_profiles::DeploymentProfileId::Local
+        }
+        DeploymentProfileArg::SingleVm => {
+            palyra_common::deployment_profiles::DeploymentProfileId::SingleVm
+        }
+        DeploymentProfileArg::WorkerEnabled => {
+            palyra_common::deployment_profiles::DeploymentProfileId::WorkerEnabled
+        }
+    }
+}
+
+fn default_deployment_profile_for_init(
+    mode: InitMode,
+) -> palyra_common::deployment_profiles::DeploymentProfileId {
+    match mode {
+        InitMode::LocalDesktop => palyra_common::deployment_profiles::DeploymentProfileId::Local,
+        InitMode::RemoteVps => palyra_common::deployment_profiles::DeploymentProfileId::SingleVm,
+    }
+}
+
 fn resolve_init_path(path: Option<String>) -> Result<PathBuf> {
     if let Some(path) = path {
         return parse_config_path(path.as_str())
@@ -521,6 +550,7 @@ const DEFAULT_ADMIN_BOUND_PRINCIPAL: &str = "admin:local";
 
 fn build_init_config_document(
     mode: InitMode,
+    deployment_profile: palyra_common::deployment_profiles::DeploymentProfileId,
     identity_store_dir: &Path,
     vault_dir: &Path,
     admin_token: &str,
@@ -528,6 +558,12 @@ fn build_init_config_document(
 ) -> Result<toml::Value> {
     let (mut document, _) =
         parse_document_with_migration("").context("failed to initialize config document")?;
+    set_value_at_path(
+        &mut document,
+        "deployment.mode",
+        toml::Value::String(mode.deployment_mode().to_owned()),
+    )?;
+    apply_deployment_profile_defaults(&mut document, deployment_profile)?;
     set_value_at_path(
         &mut document,
         "deployment.mode",
@@ -621,6 +657,32 @@ fn build_init_config_document(
     }
 
     Ok(document)
+}
+
+fn apply_deployment_profile_defaults(
+    document: &mut toml::Value,
+    deployment_profile: palyra_common::deployment_profiles::DeploymentProfileId,
+) -> Result<()> {
+    let manifest =
+        palyra_common::deployment_profiles::deployment_profile_manifest(deployment_profile);
+    for default in manifest.defaults {
+        let value = match default.value {
+            palyra_common::deployment_profiles::DeploymentProfileDefaultValue::String(value) => {
+                toml::Value::String(value)
+            }
+            palyra_common::deployment_profiles::DeploymentProfileDefaultValue::Integer(value) => {
+                toml::Value::Integer(value)
+            }
+            palyra_common::deployment_profiles::DeploymentProfileDefaultValue::Boolean(value) => {
+                toml::Value::Boolean(value)
+            }
+            palyra_common::deployment_profiles::DeploymentProfileDefaultValue::StringList(
+                values,
+            ) => toml::Value::Array(values.into_iter().map(toml::Value::String).collect()),
+        };
+        set_value_at_path(document, default.config_path.as_str(), value)?;
+    }
+    Ok(())
 }
 
 fn emit_remote_init_guidance(
@@ -1832,19 +1894,78 @@ fn build_support_bundle_observability_snapshot(
         .worker_status
         .clone()
         .or_else(|| summary.as_ref().and_then(|payload| payload.get("networked_workers")).cloned());
+    let runtime_support = build_support_bundle_runtime_support_snapshot(
+        diagnostics,
+        summary.as_ref(),
+        networked_workers.as_ref(),
+    );
     SupportBundleObservabilitySnapshot {
         summary,
         recent_failures,
         runtime_preview,
         networked_workers,
+        runtime_support,
+    }
+}
+
+fn build_support_bundle_runtime_support_snapshot(
+    diagnostics: &SupportBundleDiagnosticsSnapshot,
+    summary: Option<&Value>,
+    networked_workers: Option<&Value>,
+) -> SupportBundleRuntimeSupportSnapshot {
+    let admin_status = diagnostics.admin_status.as_ref();
+    let queue_state = json!({
+        "delegation": admin_status.and_then(|payload| payload.get("delegation")).cloned(),
+        "doctor_recovery": summary.and_then(|payload| payload.get("doctor_recovery")).cloned(),
+        "support_bundle": summary.and_then(|payload| payload.get("support_bundle")).cloned(),
+        "connector": summary.and_then(|payload| payload.get("connector")).cloned(),
+        "runtime_preview": summary.and_then(|payload| payload.get("runtime_preview")).cloned(),
+    });
+    let pruning_explain = json!({
+        "feature_rollout": admin_status
+            .and_then(|payload| payload.pointer("/feature_rollouts/pruning_policy_matrix"))
+            .cloned(),
+        "runtime_controls": admin_status
+            .and_then(|payload| payload.pointer("/runtime_controls"))
+            .cloned(),
+        "runtime_preview": summary.and_then(|payload| payload.get("runtime_preview")).cloned(),
+    });
+    let recall_artifacts = admin_status
+        .and_then(|payload| payload.pointer("/memory/recall_artifacts"))
+        .cloned()
+        .unwrap_or_else(|| {
+            json!({
+                "source": "journal.recall_artifacts",
+                "note": "recent recall artifacts are included in the journal snapshot when the local journal is available",
+            })
+        });
+    let flow_snapshots =
+        admin_status.and_then(|payload| payload.get("flows")).cloned().unwrap_or_else(|| {
+            json!({
+                "source": "journal.flow_timeline",
+                "note": "recent flow records and events are included in the journal snapshot",
+            })
+        });
+    let replay_bundle_metadata = serde_json::to_value(build_support_bundle_replay_snapshot())
+        .unwrap_or_else(|_| {
+            json!({
+                "state": "encode_failed",
+                "offline_only": true,
+            })
+        });
+    SupportBundleRuntimeSupportSnapshot {
+        queue_state,
+        pruning_explain,
+        recall_artifacts,
+        flow_snapshots,
+        replay_bundle_metadata,
+        worker_diagnostics: networked_workers.cloned(),
     }
 }
 
 fn build_support_bundle_triage_snapshot() -> SupportBundleTriageSnapshot {
     SupportBundleTriageSnapshot {
-        playbook:
-            "docs-codebase/docs-tree/web_console_operator_dashboard/console_sections_and_navigation/support_recovery.md"
-                .to_owned(),
+        playbook: "embedded-support-triage-v1".to_owned(),
         failure_classes: vec![
             "config_failure".to_owned(),
             "upstream_provider_failure".to_owned(),
@@ -1859,6 +1980,128 @@ fn build_support_bundle_triage_snapshot() -> SupportBundleTriageSnapshot {
             "If still unresolved, inspect observability.recent_failures and diagnostics.admin_status."
                 .to_owned(),
         ],
+        runbooks: build_support_bundle_operator_runbooks(),
+        checklists: build_support_bundle_incident_checklists(),
+    }
+}
+
+fn build_support_bundle_operator_runbooks() -> Vec<SupportBundleRunbook> {
+    vec![
+        support_runbook(
+            "queue_backlog",
+            "Queue backlog",
+            "Queued inputs, support jobs, or delegated children keep growing.",
+            &[
+                "Check journal.queue_state and observability.runtime_support.queue_state.",
+                "Pause new risky rollout changes until queued work drains.",
+                "Inspect recent failures before applying repair or rollback.",
+            ],
+            "Escalate with the support bundle if queue state does not change after one retry window.",
+        ),
+        support_runbook(
+            "degraded_retrieval",
+            "Degraded retrieval",
+            "Memory retrieval backend reports degraded state or recall artifacts are missing.",
+            &[
+                "Check observability.runtime_support.pruning_explain and diagnostics.admin_status.memory.",
+                "Verify retention limits, embedding backend state, and recall artifact provenance.",
+                "Run a recall preview before changing memory retention settings.",
+            ],
+            "Escalate when retrieval remains degraded after config and provider health are both ok.",
+        ),
+        support_runbook(
+            "failed_restore",
+            "Failed restore",
+            "Workspace restore or checkpoint compare reports failures.",
+            &[
+                "Inspect observability.summary.workspace_restore and journal.last_errors.",
+                "Run doctor rollback preview before applying destructive recovery.",
+                "Keep the previous config and state root unchanged until verification passes.",
+            ],
+            "Escalate with checkpoint ids and restore report ids from the bundle.",
+        ),
+        support_runbook(
+            "stuck_flow",
+            "Stuck flow",
+            "Flow orchestration remains blocked or waiting for approval.",
+            &[
+                "Inspect journal.flow_timeline.active_flows and recent_events.",
+                "Resolve pending approvals before retrying or skipping a flow step.",
+                "Use replay export for the affected run before manual intervention.",
+            ],
+            "Escalate if the same flow remains non-terminal after retry and approval resolution.",
+        ),
+        support_runbook(
+            "orphan_worker",
+            "Orphan worker",
+            "Networked worker snapshot reports orphaned or failed-closed workers.",
+            &[
+                "Inspect observability.networked_workers and runtime_support.worker_diagnostics.",
+                "Drain or quarantine affected workers before increasing rollout.",
+                "Run force cleanup only with operator evidence for removed artifacts/logs.",
+            ],
+            "Escalate with worker ids, lifecycle events, and attestation mismatch samples.",
+        ),
+        support_runbook(
+            "replay_mismatch",
+            "Replay mismatch",
+            "Offline replay diff or baseline gate fails.",
+            &[
+                "Run support-bundle replay-run with a diff output artifact.",
+                "Inspect replay.reporting.diff_categories and journal hash-chain state.",
+                "Do not promote a new baseline until validation and redaction both pass.",
+            ],
+            "Escalate with the replay bundle canonical hash and diff report.",
+        ),
+    ]
+}
+
+fn build_support_bundle_incident_checklists() -> Vec<SupportBundleChecklist> {
+    vec![
+        support_checklist(
+            "first_response",
+            "First response",
+            &[
+                "Export or queue a fresh support bundle.",
+                "Record current deployment profile, mode, bind profile, and admin auth posture.",
+                "Check recent failures and config ref health before changing config.",
+                "Use preview mode for doctor repair or rollback before apply.",
+            ],
+        ),
+        support_checklist(
+            "promotion_or_rollback",
+            "Promotion or rollback",
+            &[
+                "Run deployment preflight for the active profile.",
+                "Run upgrade smoke and inspect promotion gate status.",
+                "Export a support bundle before restart or rollback.",
+                "Verify doctor, gateway status, replay smoke, and worker diagnostics after restart.",
+            ],
+        ),
+    ]
+}
+
+fn support_runbook(
+    id: &str,
+    failure_mode: &str,
+    trigger: &str,
+    first_actions: &[&str],
+    escalation: &str,
+) -> SupportBundleRunbook {
+    SupportBundleRunbook {
+        id: id.to_owned(),
+        failure_mode: failure_mode.to_owned(),
+        trigger: trigger.to_owned(),
+        first_actions: first_actions.iter().map(|value| (*value).to_owned()).collect(),
+        escalation: escalation.to_owned(),
+    }
+}
+
+fn support_checklist(id: &str, title: &str, items: &[&str]) -> SupportBundleChecklist {
+    SupportBundleChecklist {
+        id: id.to_owned(),
+        title: title.to_owned(),
+        items: items.iter().map(|value| (*value).to_owned()).collect(),
     }
 }
 
@@ -1949,6 +2192,8 @@ fn build_support_bundle_journal_snapshot(
                 latest_hash: None,
                 recent_hashes: Vec::new(),
                 last_errors: Vec::new(),
+                queue_state: unavailable_support_bundle_queue_state(error.to_string()),
+                recall_artifacts: unavailable_support_bundle_recall_artifacts(error.to_string()),
                 flow_timeline: unavailable_support_bundle_flow_timeline(error.to_string()),
                 error: Some(sanitize_diagnostic_error(error.to_string().as_str())),
             };
@@ -1963,6 +2208,10 @@ fn build_support_bundle_journal_snapshot(
             latest_hash: None,
             recent_hashes: Vec::new(),
             last_errors: Vec::new(),
+            queue_state: unavailable_support_bundle_queue_state("journal database is unavailable"),
+            recall_artifacts: unavailable_support_bundle_recall_artifacts(
+                "journal database is unavailable",
+            ),
             flow_timeline: unavailable_support_bundle_flow_timeline(
                 "journal database is unavailable",
             ),
@@ -1980,6 +2229,8 @@ fn build_support_bundle_journal_snapshot(
                 latest_hash: None,
                 recent_hashes: Vec::new(),
                 last_errors: Vec::new(),
+                queue_state: unavailable_support_bundle_queue_state(error.to_string()),
+                recall_artifacts: unavailable_support_bundle_recall_artifacts(error.to_string()),
                 flow_timeline: unavailable_support_bundle_flow_timeline(error.to_string()),
                 error: Some(sanitize_diagnostic_error(error.to_string().as_str())),
             };
@@ -1991,6 +2242,8 @@ fn build_support_bundle_journal_snapshot(
         read_recent_journal_hashes(&connection, journal_hash_limit).unwrap_or_default();
     let last_errors =
         read_recent_journal_errors(&connection, error_limit.clamp(1, 256)).unwrap_or_default();
+    let queue_state = read_support_bundle_queue_state(&connection);
+    let recall_artifacts = read_support_bundle_recall_artifacts(&connection);
     let flow_timeline = read_support_bundle_flow_timeline(&connection);
     SupportBundleJournalSnapshot {
         db_path,
@@ -1999,8 +2252,35 @@ fn build_support_bundle_journal_snapshot(
         latest_hash,
         recent_hashes,
         last_errors,
+        queue_state,
+        recall_artifacts,
         flow_timeline,
         error: None,
+    }
+}
+
+fn unavailable_support_bundle_queue_state(
+    error: impl Into<String>,
+) -> SupportBundleQueueStateSnapshot {
+    SupportBundleQueueStateSnapshot {
+        available: false,
+        queued_inputs_by_state: BTreeMap::new(),
+        queued_inputs_by_mode: BTreeMap::new(),
+        recent_queued_inputs: Vec::new(),
+        background_tasks_by_state: BTreeMap::new(),
+        active_background_tasks: 0,
+        paused_session_count: 0,
+        error: Some(sanitize_diagnostic_error(error.into().as_str())),
+    }
+}
+
+fn unavailable_support_bundle_recall_artifacts(
+    error: impl Into<String>,
+) -> SupportBundleRecallArtifactsSnapshot {
+    SupportBundleRecallArtifactsSnapshot {
+        available: false,
+        recent: Vec::new(),
+        error: Some(sanitize_diagnostic_error(error.into().as_str())),
     }
 }
 
@@ -2015,6 +2295,146 @@ fn unavailable_support_bundle_flow_timeline(
         recent_events: Vec::new(),
         error: Some(sanitize_diagnostic_error(error.as_str())),
     }
+}
+
+fn read_support_bundle_queue_state(connection: &Connection) -> SupportBundleQueueStateSnapshot {
+    let queued_inputs_by_state = match read_grouped_count(
+        connection,
+        "SELECT state, COUNT(*) FROM orchestrator_queued_inputs GROUP BY state",
+    ) {
+        Ok(value) => value,
+        Err(error) => return unavailable_support_bundle_queue_state(error.to_string()),
+    };
+    let queued_inputs_by_mode = match read_grouped_count(
+        connection,
+        "SELECT queue_mode, COUNT(*) FROM orchestrator_queued_inputs GROUP BY queue_mode",
+    ) {
+        Ok(value) => value,
+        Err(error) => return unavailable_support_bundle_queue_state(error.to_string()),
+    };
+    let recent_queued_inputs = match read_recent_support_bundle_queued_inputs(connection, 16) {
+        Ok(value) => value,
+        Err(error) => return unavailable_support_bundle_queue_state(error.to_string()),
+    };
+    let background_tasks_by_state = match read_grouped_count(
+        connection,
+        "SELECT state, COUNT(*) FROM orchestrator_background_tasks GROUP BY state",
+    ) {
+        Ok(value) => value,
+        Err(error) => return unavailable_support_bundle_queue_state(error.to_string()),
+    };
+    let active_background_tasks = background_tasks_by_state
+        .iter()
+        .filter(|(state, _)| {
+            !matches!(state.as_str(), "completed" | "failed" | "cancelled" | "canceled")
+        })
+        .map(|(_, count)| *count)
+        .sum();
+    let paused_session_count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM orchestrator_session_queue_controls WHERE paused = 1",
+            [],
+            |row| {
+                let count = row.get::<_, i64>(0)?;
+                Ok(u64::try_from(count).unwrap_or(0))
+            },
+        )
+        .unwrap_or(0);
+    SupportBundleQueueStateSnapshot {
+        available: true,
+        queued_inputs_by_state,
+        queued_inputs_by_mode,
+        recent_queued_inputs,
+        background_tasks_by_state,
+        active_background_tasks,
+        paused_session_count,
+        error: None,
+    }
+}
+
+fn read_grouped_count(connection: &Connection, sql: &str) -> Result<BTreeMap<String, u64>> {
+    let mut statement = connection.prepare(sql)?;
+    let rows = statement.query_map([], |row| {
+        let count = row.get::<_, i64>(1)?;
+        Ok((row.get::<_, String>(0)?, u64::try_from(count).unwrap_or(0)))
+    })?;
+    let mut values = BTreeMap::new();
+    for row in rows {
+        let (key, count) = row?;
+        values.insert(key, count);
+    }
+    Ok(values)
+}
+
+fn read_recent_support_bundle_queued_inputs(
+    connection: &Connection,
+    limit: usize,
+) -> Result<Vec<SupportBundleQueuedInputRecord>> {
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut statement = connection.prepare(
+        "SELECT queued_input_ulid, run_ulid, session_ulid, state, queue_mode, priority, created_at_unix_ms, updated_at_unix_ms \
+         FROM orchestrator_queued_inputs ORDER BY created_at_unix_ms DESC LIMIT ?1",
+    )?;
+    let rows = statement.query_map([limit], |row| {
+        Ok(SupportBundleQueuedInputRecord {
+            queued_input_id: row.get(0)?,
+            run_id: row.get(1)?,
+            session_id: row.get(2)?,
+            state: row.get(3)?,
+            queue_mode: row.get(4)?,
+            priority: row.get(5)?,
+            created_at_unix_ms: row.get(6)?,
+            updated_at_unix_ms: row.get(7)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, rusqlite::Error>>()
+        .context("failed to read support-bundle queue state")
+}
+
+fn read_support_bundle_recall_artifacts(
+    connection: &Connection,
+) -> SupportBundleRecallArtifactsSnapshot {
+    let recent = match read_recent_support_bundle_recall_artifacts(connection, 16) {
+        Ok(value) => value,
+        Err(error) => return unavailable_support_bundle_recall_artifacts(error.to_string()),
+    };
+    SupportBundleRecallArtifactsSnapshot { available: true, recent, error: None }
+}
+
+fn read_recent_support_bundle_recall_artifacts(
+    connection: &Connection,
+    limit: usize,
+) -> Result<Vec<SupportBundleRecallArtifactRecord>> {
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut statement = connection.prepare(
+        "SELECT artifact_ulid, artifact_kind, principal, channel, session_ulid, summary, diagnostics_json, provenance_json, created_at_unix_ms \
+         FROM recall_artifacts ORDER BY created_at_unix_ms DESC LIMIT ?1",
+    )?;
+    let rows = statement.query_map([limit], |row| {
+        let diagnostics_raw: String = row.get(6)?;
+        let provenance_raw: String = row.get(7)?;
+        Ok(SupportBundleRecallArtifactRecord {
+            artifact_id: row.get(0)?,
+            artifact_kind: row.get(1)?,
+            principal: row.get(2)?,
+            channel: row.get(3)?,
+            session_id: row.get(4)?,
+            summary: row.get(5)?,
+            diagnostics: serde_json::from_str(diagnostics_raw.as_str()).unwrap_or_else(|_| {
+                json!({
+                    "decode_error": "recall artifact diagnostics JSON could not be parsed",
+                })
+            }),
+            provenance: serde_json::from_str(provenance_raw.as_str()).unwrap_or_else(|_| {
+                json!({
+                    "decode_error": "recall artifact provenance JSON could not be parsed",
+                })
+            }),
+            created_at_unix_ms: row.get(8)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, rusqlite::Error>>()
+        .context("failed to read support-bundle recall artifacts")
 }
 
 fn read_support_bundle_flow_timeline(connection: &Connection) -> SupportBundleFlowTimelineSnapshot {
@@ -7119,6 +7539,7 @@ struct SupportBundleObservabilitySnapshot {
     runtime_preview: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     networked_workers: Option<Value>,
+    runtime_support: SupportBundleRuntimeSupportSnapshot,
 }
 
 #[derive(Debug, Serialize)]
@@ -7126,6 +7547,35 @@ struct SupportBundleTriageSnapshot {
     playbook: String,
     failure_classes: Vec<String>,
     common_order: Vec<String>,
+    runbooks: Vec<SupportBundleRunbook>,
+    checklists: Vec<SupportBundleChecklist>,
+}
+
+#[derive(Debug, Serialize)]
+struct SupportBundleRuntimeSupportSnapshot {
+    queue_state: Value,
+    pruning_explain: Value,
+    recall_artifacts: Value,
+    flow_snapshots: Value,
+    replay_bundle_metadata: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worker_diagnostics: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct SupportBundleRunbook {
+    id: String,
+    failure_mode: String,
+    trigger: String,
+    first_actions: Vec<String>,
+    escalation: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SupportBundleChecklist {
+    id: String,
+    title: String,
+    items: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -7153,9 +7603,59 @@ struct SupportBundleJournalSnapshot {
     latest_hash: Option<String>,
     recent_hashes: Vec<String>,
     last_errors: Vec<SupportBundleJournalErrorRecord>,
+    queue_state: SupportBundleQueueStateSnapshot,
+    recall_artifacts: SupportBundleRecallArtifactsSnapshot,
     flow_timeline: SupportBundleFlowTimelineSnapshot,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SupportBundleQueueStateSnapshot {
+    available: bool,
+    queued_inputs_by_state: BTreeMap<String, u64>,
+    queued_inputs_by_mode: BTreeMap<String, u64>,
+    recent_queued_inputs: Vec<SupportBundleQueuedInputRecord>,
+    background_tasks_by_state: BTreeMap<String, u64>,
+    active_background_tasks: u64,
+    paused_session_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SupportBundleQueuedInputRecord {
+    queued_input_id: String,
+    run_id: String,
+    session_id: String,
+    state: String,
+    queue_mode: String,
+    priority: i64,
+    created_at_unix_ms: i64,
+    updated_at_unix_ms: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct SupportBundleRecallArtifactsSnapshot {
+    available: bool,
+    recent: Vec<SupportBundleRecallArtifactRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SupportBundleRecallArtifactRecord {
+    artifact_id: String,
+    artifact_kind: String,
+    principal: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    summary: String,
+    diagnostics: Value,
+    provenance: Value,
+    created_at_unix_ms: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -8458,6 +8958,7 @@ mod init_command_tests {
     fn local_init_document_uses_loopback_defaults() {
         let document = build_init_config_document(
             InitMode::LocalDesktop,
+            palyra_common::deployment_profiles::DeploymentProfileId::Local,
             PathBuf::from("state/identity").as_path(),
             PathBuf::from("state/vault").as_path(),
             "token-local",
@@ -8484,6 +8985,7 @@ mod init_command_tests {
         let tls_paths = (PathBuf::from("tls/gateway.crt"), PathBuf::from("tls/gateway.key"));
         let document = build_init_config_document(
             InitMode::RemoteVps,
+            palyra_common::deployment_profiles::DeploymentProfileId::SingleVm,
             PathBuf::from("state/identity").as_path(),
             PathBuf::from("state/vault").as_path(),
             "token-remote",
@@ -8507,8 +9009,10 @@ mod init_command_tests {
 #[cfg(test)]
 mod diagnostics_bundle_tests {
     use super::{
+        build_support_bundle_incident_checklists, build_support_bundle_operator_runbooks,
         encode_support_bundle_with_cap, extract_support_bundle_error_message,
-        read_support_bundle_flow_timeline, DoctorAccessSnapshot, DoctorBrowserSnapshot,
+        read_support_bundle_flow_timeline, unavailable_support_bundle_queue_state,
+        unavailable_support_bundle_recall_artifacts, DoctorAccessSnapshot, DoctorBrowserSnapshot,
         DoctorConfigSnapshot, DoctorConnectivityProbe, DoctorConnectivitySnapshot,
         DoctorDeploymentBindSnapshot, DoctorDeploymentSnapshot, DoctorIdentitySnapshot,
         DoctorProviderAuthSnapshot, DoctorReport, DoctorSandboxSnapshot, DoctorSummary,
@@ -8516,7 +9020,8 @@ mod diagnostics_bundle_tests {
         SupportBundleConfigSnapshot, SupportBundleDiagnosticsSnapshot,
         SupportBundleFlowTimelineSnapshot, SupportBundleJournalErrorRecord,
         SupportBundleJournalSnapshot, SupportBundleObservabilitySnapshot,
-        SupportBundleReplaySnapshot, SupportBundleTriageSnapshot,
+        SupportBundleReplaySnapshot, SupportBundleRuntimeSupportSnapshot,
+        SupportBundleTriageSnapshot,
     };
     use rusqlite::{params, Connection};
     use serde_json::{json, Value};
@@ -8719,17 +9224,41 @@ mod diagnostics_bundle_tests {
                     "metrics": { "queue_depth": 0, "pruning_tokens_saved": 128 }
                 })),
                 networked_workers: None,
+                runtime_support: SupportBundleRuntimeSupportSnapshot {
+                    queue_state: json!({
+                        "runtime_preview": {
+                            "state": "active",
+                            "metrics": { "queue_depth": 0, "pruning_tokens_saved": 128 }
+                        }
+                    }),
+                    pruning_explain: json!({
+                        "runtime_preview": {
+                            "state": "active",
+                            "metrics": { "pruning_tokens_saved": 128 }
+                        }
+                    }),
+                    recall_artifacts: json!({
+                        "source": "journal.recall_artifacts"
+                    }),
+                    flow_snapshots: json!({
+                        "source": "journal.flow_timeline"
+                    }),
+                    replay_bundle_metadata: json!({
+                        "offline_only": true
+                    }),
+                    worker_diagnostics: None,
+                },
             },
             triage: SupportBundleTriageSnapshot {
-                playbook:
-                    "docs-codebase/docs-tree/web_console_operator_dashboard/console_sections_and_navigation/support_recovery.md"
-                        .to_owned(),
+                playbook: "embedded-support-triage-v1".to_owned(),
                 failure_classes: vec![
                     "config_failure".to_owned(),
                     "upstream_provider_failure".to_owned(),
                     "product_failure".to_owned(),
                 ],
                 common_order: vec!["Check deployment posture and operator auth first.".to_owned()],
+                runbooks: build_support_bundle_operator_runbooks(),
+                checklists: build_support_bundle_incident_checklists(),
             },
             replay: SupportBundleReplaySnapshot {
                 contract: crate::replay_contract_snapshot(),
@@ -8822,6 +9351,10 @@ mod diagnostics_bundle_tests {
                 latest_hash: Some("f".repeat(64)),
                 recent_hashes: hashes,
                 last_errors: errors,
+                queue_state: unavailable_support_bundle_queue_state("not loaded in test bundle"),
+                recall_artifacts: unavailable_support_bundle_recall_artifacts(
+                    "not loaded in test bundle",
+                ),
                 flow_timeline: SupportBundleFlowTimelineSnapshot {
                     available: true,
                     active_flows: 0,

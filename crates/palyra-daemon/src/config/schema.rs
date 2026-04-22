@@ -143,6 +143,7 @@ pub struct LoadedConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeploymentConfig {
+    pub profile: String,
     pub mode: DeploymentMode,
     pub dangerous_remote_bind_ack: bool,
 }
@@ -537,6 +538,9 @@ impl Default for DaemonConfig {
 impl Default for DeploymentConfig {
     fn default() -> Self {
         Self {
+            profile: palyra_common::deployment_profiles::DeploymentProfileId::Local
+                .as_str()
+                .to_owned(),
             mode: DEFAULT_DEPLOYMENT_MODE,
             dangerous_remote_bind_ack: DEFAULT_DANGEROUS_REMOTE_BIND_ACK,
         }

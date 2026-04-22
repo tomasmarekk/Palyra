@@ -108,6 +108,7 @@ pub(crate) fn build_deployment_runtime_snapshot(
     dangerous_remote_bind_ack_env: bool,
 ) -> DeploymentRuntimeSnapshot {
     DeploymentRuntimeSnapshot {
+        profile: loaded.deployment.profile.clone(),
         mode: loaded.deployment.mode.as_str().to_owned(),
         bind_profile: loaded.gateway.bind_profile.as_str().to_owned(),
         admin_bind_addr: loaded.daemon.bind_addr.clone(),

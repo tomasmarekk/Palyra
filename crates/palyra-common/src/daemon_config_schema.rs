@@ -141,6 +141,7 @@ pub struct RootFileConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileDeploymentConfig {
+    pub profile: Option<String>,
     pub mode: Option<String>,
     pub dangerous_remote_bind_ack: Option<bool>,
 }
