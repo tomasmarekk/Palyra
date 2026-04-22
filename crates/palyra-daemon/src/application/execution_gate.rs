@@ -1034,11 +1034,11 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_requires_backend_approval_for_safe_tool_and_restores_budget_on_pending_state() {
+    fn pipeline_requires_networked_backend_approval_for_supported_tool() {
         let outcome = evaluate_execution_gate_pipeline(ExecutionGatePipelineInput {
-            tool_call_config: &tool_call_config(&["palyra.memory.search"]),
+            tool_call_config: &tool_call_config(&["palyra.echo"]),
             request_context: &request_context(),
-            tool_name: "palyra.memory.search",
+            tool_name: "palyra.echo",
             skill_context: None,
             skill_gate_decision: None,
             proposal_approval_required: true,
