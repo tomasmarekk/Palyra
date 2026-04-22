@@ -2878,7 +2878,7 @@ describe("ConsoleApiClient", () => {
       api_key: "sk-ant-test",
       set_default: true,
     });
-    await client.setAnthropicDefaultProfile({ profile_id: "anthropic-default" });
+    await client.setProviderDefaultProfile("anthropic", { profile_id: "anthropic-default" });
 
     expect(requestUrl(calls[1]?.input)).toBe("/console/v1/auth/providers/anthropic/api-key");
     expect(calls[1]?.init?.method).toBe("POST");

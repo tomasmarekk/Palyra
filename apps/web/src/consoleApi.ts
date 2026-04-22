@@ -3518,6 +3518,11 @@ function buildPathWithQuery(path: string, params?: URLSearchParams): string {
   return `${path}?${params.toString()}`;
 }
 
+function providerAuthPath(provider: string, action?: string): string {
+  const base = `/console/v1/auth/providers/${encodeURIComponent(provider)}`;
+  return action === undefined ? base : `${base}/${action}`;
+}
+
 function normalizeChatQueuedInputRecord(record: RawChatQueuedInputRecord): ChatQueuedInputRecord {
   return {
     ...record,
@@ -3691,130 +3696,113 @@ export class ConsoleApiClient {
   async connectOpenAiApiKey(
     payload: ProviderApiKeyUpsertRequest,
   ): Promise<ProviderAuthActionEnvelope> {
-    return this.request(
-      "/console/v1/auth/providers/openai/api-key",
-      {
-        method: "POST",
-        body: JSON.stringify(payload),
-      },
-      { csrf: true },
-    );
+    return this.connectProviderApiKey("openai", payload);
   }
 
-  async getOpenAiProviderState(): Promise<ProviderAuthStateEnvelope> {
-    return this.request("/console/v1/auth/providers/openai");
+  async connectProviderApiKey(
+    provider: string,
+    payload: ProviderApiKeyUpsertRequest,
+  ): Promise<ProviderAuthActionEnvelope> {
+    return this.mutateProviderAuth(provider, "api-key", payload);
+  }
+
+  async getProviderState(provider: string): Promise<ProviderAuthStateEnvelope> {
+    return this.request(providerAuthPath(provider));
   }
 
   async connectAnthropicApiKey(
     payload: ProviderApiKeyUpsertRequest,
   ): Promise<ProviderAuthActionEnvelope> {
-    return this.request(
-      "/console/v1/auth/providers/anthropic/api-key",
-      {
-        method: "POST",
-        body: JSON.stringify(payload),
-      },
-      { csrf: true },
-    );
-  }
-
-  async getAnthropicProviderState(): Promise<ProviderAuthStateEnvelope> {
-    return this.request("/console/v1/auth/providers/anthropic");
+    return this.connectProviderApiKey("anthropic", payload);
   }
 
   async startOpenAiProviderBootstrap(
     payload: OpenAiOAuthBootstrapRequest = {},
   ): Promise<OpenAiOAuthBootstrapEnvelope> {
-    return this.request(
-      "/console/v1/auth/providers/openai/bootstrap",
-      {
-        method: "POST",
-        body: JSON.stringify(payload),
-      },
-      { csrf: true },
-    );
+    return this.startProviderBootstrap("openai", payload);
+  }
+
+  async startProviderBootstrap(
+    provider: string,
+    payload: OpenAiOAuthBootstrapRequest = {},
+  ): Promise<OpenAiOAuthBootstrapEnvelope> {
+    return this.mutateProviderAuth(provider, "bootstrap", payload);
   }
 
   async getOpenAiProviderCallbackState(
     attemptId: string,
   ): Promise<OpenAiOAuthCallbackStateEnvelope> {
+    return this.getProviderCallbackState("openai", attemptId);
+  }
+
+  async getProviderCallbackState(
+    provider: string,
+    attemptId: string,
+  ): Promise<OpenAiOAuthCallbackStateEnvelope> {
     const params = new URLSearchParams();
     params.set("attempt_id", attemptId);
-    return this.request(
-      buildPathWithQuery("/console/v1/auth/providers/openai/callback-state", params),
-    );
+    return this.request(buildPathWithQuery(providerAuthPath(provider, "callback-state"), params));
   }
 
   async reconnectOpenAiProvider(
     payload: ProviderAuthActionRequest = {},
   ): Promise<OpenAiOAuthBootstrapEnvelope> {
-    return this.request(
-      "/console/v1/auth/providers/openai/reconnect",
-      {
-        method: "POST",
-        body: JSON.stringify(payload),
-      },
-      { csrf: true },
-    );
+    return this.reconnectProvider("openai", payload);
+  }
+
+  async reconnectProvider(
+    provider: string,
+    payload: ProviderAuthActionRequest = {},
+  ): Promise<OpenAiOAuthBootstrapEnvelope> {
+    return this.mutateProviderAuth(provider, "reconnect", payload);
   }
 
   async refreshOpenAiProvider(
     payload: ProviderAuthActionRequest = {},
   ): Promise<ProviderAuthActionEnvelope> {
-    return this.request(
-      "/console/v1/auth/providers/openai/refresh",
-      {
-        method: "POST",
-        body: JSON.stringify(payload),
-      },
-      { csrf: true },
-    );
+    return this.refreshProvider("openai", payload);
+  }
+
+  async refreshProvider(
+    provider: string,
+    payload: ProviderAuthActionRequest = {},
+  ): Promise<ProviderAuthActionEnvelope> {
+    return this.mutateProviderAuth(provider, "refresh", payload);
   }
 
   async revokeOpenAiProvider(
     payload: ProviderAuthActionRequest = {},
   ): Promise<ProviderAuthActionEnvelope> {
-    return this.request(
-      "/console/v1/auth/providers/openai/revoke",
-      {
-        method: "POST",
-        body: JSON.stringify(payload),
-      },
-      { csrf: true },
-    );
+    return this.revokeProvider("openai", payload);
   }
 
-  async setOpenAiDefaultProfile(
+  async revokeProvider(
+    provider: string,
     payload: ProviderAuthActionRequest = {},
   ): Promise<ProviderAuthActionEnvelope> {
-    return this.request(
-      "/console/v1/auth/providers/openai/default-profile",
-      {
-        method: "POST",
-        body: JSON.stringify(payload),
-      },
-      { csrf: true },
-    );
+    return this.mutateProviderAuth(provider, "revoke", payload);
+  }
+
+  async setProviderDefaultProfile(
+    provider: string,
+    payload: ProviderAuthActionRequest = {},
+  ): Promise<ProviderAuthActionEnvelope> {
+    return this.mutateProviderAuth(provider, "default-profile", payload);
   }
 
   async revokeAnthropicProvider(
     payload: ProviderAuthActionRequest = {},
   ): Promise<ProviderAuthActionEnvelope> {
-    return this.request(
-      "/console/v1/auth/providers/anthropic/revoke",
-      {
-        method: "POST",
-        body: JSON.stringify(payload),
-      },
-      { csrf: true },
-    );
+    return this.revokeProvider("anthropic", payload);
   }
 
-  async setAnthropicDefaultProfile(
-    payload: ProviderAuthActionRequest = {},
-  ): Promise<ProviderAuthActionEnvelope> {
+  private async mutateProviderAuth<T>(
+    provider: string,
+    action: string,
+    payload: unknown,
+  ): Promise<T> {
     return this.request(
-      "/console/v1/auth/providers/anthropic/default-profile",
+      providerAuthPath(provider, action),
       {
         method: "POST",
         body: JSON.stringify(payload),

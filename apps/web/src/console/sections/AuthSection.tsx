@@ -23,6 +23,11 @@ import {
 } from "../components/workspace/WorkspacePatterns";
 import { readProviderRegistrySummary } from "../providerRegistry";
 import { formatUnixMs, readNumber, type JsonObject } from "../shared";
+import {
+  AUTH_PROVIDER_CONFIGS,
+  providerConfig,
+  providerKeyForProfile,
+} from "../hooks/useAuthDomain";
 import type { ConsoleAppState } from "../useConsoleAppState";
 
 type AuthSectionProps = {
@@ -45,9 +50,9 @@ type AuthSectionProps = {
     | "authOauthCallbackState"
     | "refreshAuth"
     | "connectApiKeyProfile"
-    | "startOpenAiOAuth"
-    | "reconnectOpenAiProfile"
-    | "refreshOpenAiProfile"
+    | "startProviderOAuth"
+    | "reconnectProviderProfile"
+    | "refreshProviderProfile"
     | "revokeProviderProfile"
     | "setDefaultProviderProfile"
     | "probeProvider"
@@ -78,7 +83,7 @@ export function AuthSection({ app }: AuthSectionProps) {
     null;
   const summary = summarizeAuthHealth(app.authHealth?.profiles ?? []);
   const providerRegistry = readProviderRegistrySummary(app.diagnosticsSnapshot);
-  const providerCount = new Set(profiles.map((profile) => profile.provider.kind)).size;
+  const providerCount = new Set(profiles.map((profile) => providerKeyForProfile(profile))).size;
   const credentialCount = providerRegistry?.credentials.length ?? 0;
   const credentialAttentionCount =
     providerRegistry?.credentials.filter(
@@ -186,7 +191,7 @@ export function AuthSection({ app }: AuthSectionProps) {
                           <span className="chat-muted">{profile.profile_id}</span>
                         </div>
                       </td>
-                      <td>{profile.provider.kind}</td>
+                      <td>{providerConfig(providerKeyForProfile(profile)).label}</td>
                       <td>{scopeLabel}</td>
                       <td>{profile.credential.type === "oauth" ? "OAuth" : "API key"}</td>
                       <td>
@@ -563,12 +568,11 @@ type SelectedProfileCardProps = {
 };
 
 function SelectedProfileCard({ app, profile, health }: SelectedProfileCardProps) {
-  const providerState = app.authProviderStates[profile.provider.kind] ?? null;
+  const providerKind = providerKeyForProfile(profile);
+  const providerState = app.authProviderStates[providerKind] ?? null;
+  const providerLabel = providerConfig(providerKind).label;
   const isDefault = profile.profile_id === providerState?.default_profile_id;
   const oauthCredential = profile.credential.type === "oauth" ? profile.credential : null;
-  const providerKind = profile.provider.kind;
-  const isOpenAiProfile = providerKind === "openai";
-  const isAnthropicProfile = providerKind === "anthropic";
 
   return (
     <div className="workspace-stack">
@@ -591,7 +595,7 @@ function SelectedProfileCard({ app, profile, health }: SelectedProfileCardProps)
         </div>
         <div>
           <dt>Provider</dt>
-          <dd>{providerKind}</dd>
+          <dd>{providerLabel}</dd>
         </div>
         <div>
           <dt>Updated</dt>
@@ -686,7 +690,7 @@ function SelectedProfileCard({ app, profile, health }: SelectedProfileCardProps)
         </WorkspaceInlineNotice>
       ) : null}
 
-      {isOpenAiProfile ? (
+      {providerState !== null ? (
         <div className="workspace-inline">
           {!isDefault && providerState?.default_selection_supported && (
             <ActionButton
@@ -703,7 +707,7 @@ function SelectedProfileCard({ app, profile, health }: SelectedProfileCardProps)
               <ActionButton
                 type="button"
                 variant="secondary"
-                onPress={() => void app.reconnectOpenAiProfile(profile.profile_id)}
+                onPress={() => void app.reconnectProviderProfile(profile)}
                 isDisabled={app.authBusy || !providerState?.reconnect_supported}
               >
                 Reconnect
@@ -711,7 +715,7 @@ function SelectedProfileCard({ app, profile, health }: SelectedProfileCardProps)
               <ActionButton
                 type="button"
                 variant="secondary"
-                onPress={() => void app.refreshOpenAiProfile(profile.profile_id)}
+                onPress={() => void app.refreshProviderProfile(profile)}
                 isDisabled={app.authBusy}
               >
                 Refresh token
@@ -736,35 +740,6 @@ function SelectedProfileCard({ app, profile, health }: SelectedProfileCardProps)
             Revoke
           </ActionButton>
         </div>
-      ) : isAnthropicProfile ? (
-        <div className="workspace-inline">
-          {!isDefault && providerState?.default_selection_supported && (
-            <ActionButton
-              type="button"
-              variant="secondary"
-              onPress={() => void app.setDefaultProviderProfile(profile)}
-              isDisabled={app.authBusy}
-            >
-              Set as default
-            </ActionButton>
-          )}
-          <ActionButton
-            type="button"
-            variant="secondary"
-            onPress={() => app.prepareApiKeyRotation(profile)}
-            isDisabled={app.authBusy}
-          >
-            Rotate API key
-          </ActionButton>
-          <ActionButton
-            type="button"
-            variant="danger"
-            onPress={() => void app.revokeProviderProfile(profile)}
-            isDisabled={app.authBusy || !providerState?.revoke_supported}
-          >
-            Revoke
-          </ActionButton>
-        </div>
       ) : (
         <WorkspaceInlineNotice title="Provider actions unavailable" tone="default">
           <p>Interactive provider actions are not published for this provider kind yet.</p>
@@ -775,6 +750,7 @@ function SelectedProfileCard({ app, profile, health }: SelectedProfileCardProps)
 }
 
 function ApiKeyForm({ app }: { app: AuthSectionProps["app"] }) {
+  const selectedProvider = providerConfig(app.authApiKeyDraft.provider);
   return (
     <WorkspaceSectionCard
       title={
@@ -783,7 +759,7 @@ function ApiKeyForm({ app }: { app: AuthSectionProps["app"] }) {
       description={
         app.authApiKeyDraft.profileId.trim().length > 0
           ? `Updating profile ${app.authApiKeyDraft.profileId}.`
-          : `Create a new ${app.authApiKeyDraft.provider === "anthropic" ? "Anthropic" : "OpenAI"} auth profile backed by a Vault-stored API key.`
+          : `Create a new ${selectedProvider.label} auth profile backed by a Vault-stored API key.`
       }
       actions={
         app.authApiKeyDraft.profileId.trim().length > 0 ? (
@@ -812,13 +788,13 @@ function ApiKeyForm({ app }: { app: AuthSectionProps["app"] }) {
             onChange={(value) =>
               app.setAuthApiKeyDraft((current) => ({
                 ...current,
-                provider: value === "anthropic" ? "anthropic" : "openai",
+                provider: value === "anthropic" || value === "minimax" ? value : "openai",
               }))
             }
-            options={[
-              { key: "openai", label: "OpenAI" },
-              { key: "anthropic", label: "Anthropic" },
-            ]}
+            options={AUTH_PROVIDER_CONFIGS.map((provider) => ({
+              key: provider.key,
+              label: provider.label,
+            }))}
             disabled={app.authApiKeyDraft.profileId.trim().length > 0}
           />
           <TextInputField
@@ -873,7 +849,7 @@ function ApiKeyForm({ app }: { app: AuthSectionProps["app"] }) {
               ? "Submitting..."
               : app.authApiKeyDraft.profileId.trim().length > 0
                 ? "Rotate API key"
-                : `Create ${app.authApiKeyDraft.provider === "anthropic" ? "Anthropic" : "OpenAI"} profile`}
+                : `Create ${selectedProvider.label} profile`}
           </ActionButton>
         </div>
       </AppForm>
@@ -882,6 +858,7 @@ function ApiKeyForm({ app }: { app: AuthSectionProps["app"] }) {
 }
 
 function OAuthForm({ app }: { app: AuthSectionProps["app"] }) {
+  const selectedProvider = providerConfig(app.authOAuthDraft.provider);
   return (
     <WorkspaceSectionCard
       title="Connect via OAuth"
@@ -891,17 +868,36 @@ function OAuthForm({ app }: { app: AuthSectionProps["app"] }) {
         className="workspace-stack"
         onSubmit={(event) => {
           event.preventDefault();
-          void app.startOpenAiOAuth();
+          void app.startProviderOAuth();
         }}
       >
         <div className="workspace-form-grid">
+          <SelectField
+            label="Provider"
+            value={app.authOAuthDraft.provider}
+            onChange={(value) => {
+              const provider = value === "minimax" || value === "anthropic" ? value : "openai";
+              app.setAuthOAuthDraft((current) => ({
+                ...current,
+                provider,
+                scopes: providerConfig(provider).defaultOAuthScopes,
+              }));
+            }}
+            options={AUTH_PROVIDER_CONFIGS.filter((provider) => provider.oauthSupported).map(
+              (provider) => ({ key: provider.key, label: provider.label }),
+            )}
+          />
           <TextInputField
             label="Profile name"
             value={app.authOAuthDraft.profileName}
             onChange={(value) =>
               app.setAuthOAuthDraft((current) => ({ ...current, profileName: value }))
             }
-            placeholder="default-openai-oauth"
+            placeholder={
+              app.authOAuthDraft.provider === "minimax"
+                ? "default-minimax-oauth"
+                : "default-openai-oauth"
+            }
           />
           <SelectField
             label="Scope"
@@ -942,27 +938,29 @@ function OAuthForm({ app }: { app: AuthSectionProps["app"] }) {
               app.setAuthOAuthDraft((current) => ({ ...current, clientId: value }))
             }
           />
-          <TextInputField
-            label="Client secret"
-            type="password"
-            autoComplete="off"
-            value={app.authOAuthDraft.clientSecret}
-            onChange={(value) =>
-              app.setAuthOAuthDraft((current) => ({ ...current, clientSecret: value }))
-            }
-          />
+          {selectedProvider.oauthRequiresClientSecret && (
+            <TextInputField
+              label="Client secret"
+              type="password"
+              autoComplete="off"
+              value={app.authOAuthDraft.clientSecret}
+              onChange={(value) =>
+                app.setAuthOAuthDraft((current) => ({ ...current, clientSecret: value }))
+              }
+            />
+          )}
           <TextInputField
             label="Scopes"
             value={app.authOAuthDraft.scopes}
             onChange={(value) =>
               app.setAuthOAuthDraft((current) => ({ ...current, scopes: value }))
             }
-            placeholder="openid profile email"
+            placeholder={selectedProvider.defaultOAuthScopes}
           />
         </div>
         <div className="workspace-inline">
           <ActionButton type="submit" variant="primary" isDisabled={app.authBusy}>
-            {app.authBusy ? "Starting..." : "Start OpenAI OAuth"}
+            {app.authBusy ? "Starting..." : `Start ${selectedProvider.label} OAuth`}
           </ActionButton>
           {app.authActiveOauthAttempt !== null && (
             <ActionButton
