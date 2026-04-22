@@ -8,3 +8,4 @@ crates/palyra-cli/tests/*
 crates/palyra-browserd/src/support/tests.rs
 apps/web/src/*.test.ts
 apps/web/src/*.test.tsx
+apps/web/src/console/__fixtures__/controlPlaneFixtures.ts
