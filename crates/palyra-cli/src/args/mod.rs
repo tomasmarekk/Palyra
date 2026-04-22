@@ -425,8 +425,6 @@ pub struct RootOptions {
     version,
     about = "Palyra operator CLI",
     long_about = "Palyra operator CLI for secure local and remote runtime management.",
-    propagate_version = true,
-    disable_version_flag = true,
     arg_required_else_help = true,
     disable_help_subcommand = true,
     after_help = ROOT_AFTER_HELP,
