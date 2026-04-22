@@ -671,7 +671,8 @@ export function diagnosticsFixture() {
           {
             id: "degraded_retrieval",
             failure_mode: "Degraded retrieval",
-            trigger: "Memory retrieval backend reports degraded state or recall artifacts are missing.",
+            trigger:
+              "Memory retrieval backend reports degraded state or recall artifacts are missing.",
           },
         ],
         incident_checklists: [
