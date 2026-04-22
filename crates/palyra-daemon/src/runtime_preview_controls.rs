@@ -508,6 +508,9 @@ impl RuntimePreviewSection for NetworkedWorkersConfig {
         json!({
             "lease_ttl_ms": self.lease_ttl_ms,
             "require_attestation": self.require_attestation,
+            "expected_image_digest_sha256_configured": self.expected_image_digest_sha256.is_some(),
+            "expected_build_digest_sha256_configured": self.expected_build_digest_sha256.is_some(),
+            "expected_artifact_digest_sha256_configured": self.expected_artifact_digest_sha256.is_some(),
         })
     }
 }

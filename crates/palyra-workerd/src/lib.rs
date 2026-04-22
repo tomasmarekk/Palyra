@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 pub use palyra_common::runtime_contracts::WorkerLifecycleState;
 use serde::{Deserialize, Serialize};
@@ -6,6 +6,8 @@ use thiserror::Error;
 use ulid::Ulid;
 
 const MAX_WORKER_ID_BYTES: usize = 128;
+const MAX_GRANT_ID_BYTES: usize = 128;
+const MAX_RECENT_LIFECYCLE_EVENTS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerAttestation {
@@ -14,6 +16,8 @@ pub struct WorkerAttestation {
     pub build_digest_sha256: String,
     pub artifact_digest_sha256: String,
     pub egress_proxy_attested: bool,
+    #[serde(default)]
+    pub supported_capabilities: Vec<String>,
     pub issued_at_unix_ms: i64,
     pub expires_at_unix_ms: i64,
 }
@@ -111,11 +115,22 @@ pub struct WorkerArtifactTransport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerRunGrant {
+    pub grant_id: String,
+    pub run_id: String,
+    pub tool_name: String,
+    pub expires_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerLeaseRequest {
     pub run_id: String,
     pub ttl_ms: u64,
+    #[serde(default)]
+    pub required_capabilities: Vec<String>,
     pub workspace_scope: WorkerWorkspaceScope,
     pub artifact_transport: WorkerArtifactTransport,
+    pub grant: WorkerRunGrant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,8 +139,10 @@ pub struct WorkerLease {
     pub worker_id: String,
     pub run_id: String,
     pub expires_at_unix_ms: i64,
+    pub required_capabilities: Vec<String>,
     pub workspace_scope: WorkerWorkspaceScope,
     pub artifact_transport: WorkerArtifactTransport,
+    pub grant: WorkerRunGrant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,12 +163,20 @@ pub struct WorkerLifecycleEvent {
     pub timestamp_unix_ms: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerCleanupOutcome {
+    pub event: WorkerLifecycleEvent,
+    pub cleanup_report: WorkerCleanupReport,
+    pub cleanup_succeeded: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct WorkerFleetSnapshot {
     pub registered_workers: usize,
     pub attested_workers: usize,
     pub active_leases: usize,
     pub orphaned_workers: usize,
+    pub failed_closed_workers: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,6 +203,12 @@ pub enum WorkerLifecycleError {
     TtlExceeded,
     #[error("worker '{0}' already has an active lease")]
     LeaseAlreadyActive(String),
+    #[error("worker '{0}' is fail-closed and cannot accept work")]
+    WorkerFailClosed(String),
+    #[error("no attested worker is available for the requested capabilities")]
+    NoAvailableWorker,
+    #[error("worker lease request is invalid: {0}")]
+    InvalidLeaseRequest(String),
     #[error("worker cleanup failed and the worker stayed fail-closed")]
     CleanupFailed,
 }
@@ -192,26 +223,44 @@ struct WorkerRecord {
 #[derive(Debug, Default)]
 pub struct WorkerFleetManager {
     workers: BTreeMap<String, WorkerRecord>,
+    recent_events: VecDeque<WorkerLifecycleEvent>,
 }
 
 impl WorkerFleetManager {
     #[must_use]
     pub fn snapshot(&self) -> WorkerFleetSnapshot {
         let registered_workers = self.workers.len();
-        let attested_workers =
-            self.workers.values().filter(|worker| worker.attestation.egress_proxy_attested).count();
+        let attested_workers = self
+            .workers
+            .values()
+            .filter(|worker| {
+                worker.attestation.egress_proxy_attested
+                    && !matches!(worker.state, WorkerLifecycleState::Failed)
+            })
+            .count();
         let active_leases = self.workers.values().filter(|worker| worker.lease.is_some()).count();
         let orphaned_workers = self
             .workers
             .values()
             .filter(|worker| matches!(worker.state, WorkerLifecycleState::Orphaned))
             .count();
+        let failed_closed_workers = self
+            .workers
+            .values()
+            .filter(|worker| matches!(worker.state, WorkerLifecycleState::Failed))
+            .count();
         WorkerFleetSnapshot {
             registered_workers,
             attested_workers,
             active_leases,
             orphaned_workers,
+            failed_closed_workers,
         }
+    }
+
+    #[must_use]
+    pub fn recent_events(&self) -> Vec<WorkerLifecycleEvent> {
+        self.recent_events.iter().cloned().collect()
     }
 
     pub fn register_worker(
@@ -229,13 +278,15 @@ impl WorkerFleetManager {
             worker_id.clone(),
             WorkerRecord { attestation, state: WorkerLifecycleState::Registered, lease: None },
         );
-        Ok(WorkerLifecycleEvent {
+        let event = WorkerLifecycleEvent {
             worker_id,
             state: WorkerLifecycleState::Registered,
             run_id: None,
             reason_code: "worker.registered".to_owned(),
             timestamp_unix_ms: now_unix_ms,
-        })
+        };
+        self.push_recent_event(event.clone());
+        Ok(event)
     }
 
     pub fn assign_work(
@@ -245,37 +296,37 @@ impl WorkerFleetManager {
         policy: &WorkerFleetPolicy,
         now_unix_ms: i64,
     ) -> Result<(WorkerLease, WorkerLifecycleEvent), WorkerLifecycleError> {
+        validate_lease_request(&request, policy, now_unix_ms)?;
         let worker = self
             .workers
             .get_mut(worker_id)
             .ok_or_else(|| WorkerLifecycleError::UnknownWorker(worker_id.to_owned()))?;
-        worker.attestation.validate(&policy.attestation, now_unix_ms)?;
-        if request.ttl_ms > policy.max_ttl_ms {
-            return Err(WorkerLifecycleError::TtlExceeded);
-        }
-        if worker.lease.is_some() {
-            return Err(WorkerLifecycleError::LeaseAlreadyActive(worker_id.to_owned()));
-        }
-        let lease = WorkerLease {
-            lease_id: Ulid::new().to_string(),
-            worker_id: worker_id.to_owned(),
-            run_id: request.run_id.clone(),
-            expires_at_unix_ms: now_unix_ms.saturating_add(request.ttl_ms as i64),
-            workspace_scope: request.workspace_scope,
-            artifact_transport: request.artifact_transport,
+        let (lease, event) = assign_worker_record(worker_id, worker, request, policy, now_unix_ms)?;
+        self.push_recent_event(event.clone());
+        Ok((lease, event))
+    }
+
+    pub fn assign_next_work(
+        &mut self,
+        request: WorkerLeaseRequest,
+        policy: &WorkerFleetPolicy,
+        now_unix_ms: i64,
+    ) -> Result<(WorkerLease, WorkerLifecycleEvent), WorkerLifecycleError> {
+        validate_lease_request(&request, policy, now_unix_ms)?;
+        let Some(worker_id) = self.workers.iter().find_map(|(worker_id, worker)| {
+            worker_record_can_accept(worker, &request, policy, now_unix_ms)
+                .then(|| worker_id.clone())
+        }) else {
+            return Err(WorkerLifecycleError::NoAvailableWorker);
         };
-        worker.state = WorkerLifecycleState::Assigned;
-        worker.lease = Some(lease.clone());
-        Ok((
-            lease.clone(),
-            WorkerLifecycleEvent {
-                worker_id: worker_id.to_owned(),
-                state: WorkerLifecycleState::Assigned,
-                run_id: Some(lease.run_id.clone()),
-                reason_code: "worker.assigned".to_owned(),
-                timestamp_unix_ms: now_unix_ms,
-            },
-        ))
+        let worker = self
+            .workers
+            .get_mut(worker_id.as_str())
+            .ok_or_else(|| WorkerLifecycleError::UnknownWorker(worker_id.clone()))?;
+        let (lease, event) =
+            assign_worker_record(worker_id.as_str(), worker, request, policy, now_unix_ms)?;
+        self.push_recent_event(event.clone());
+        Ok((lease, event))
     }
 
     pub fn complete_work(
@@ -284,29 +335,52 @@ impl WorkerFleetManager {
         cleanup: &WorkerCleanupReport,
         now_unix_ms: i64,
     ) -> Result<WorkerLifecycleEvent, WorkerLifecycleError> {
+        let outcome = self.finalize_work(worker_id, cleanup.clone(), now_unix_ms)?;
+        if outcome.cleanup_succeeded {
+            Ok(outcome.event)
+        } else {
+            Err(WorkerLifecycleError::CleanupFailed)
+        }
+    }
+
+    pub fn finalize_work(
+        &mut self,
+        worker_id: &str,
+        cleanup: WorkerCleanupReport,
+        now_unix_ms: i64,
+    ) -> Result<WorkerCleanupOutcome, WorkerLifecycleError> {
         let worker = self
             .workers
             .get_mut(worker_id)
             .ok_or_else(|| WorkerLifecycleError::UnknownWorker(worker_id.to_owned()))?;
         let run_id = worker.lease.as_ref().map(|lease| lease.run_id.clone());
-        if cleanup.failure_reason.is_some()
-            || !cleanup.removed_workspace_scope
-            || !cleanup.removed_artifacts
-            || !cleanup.removed_logs
-        {
+        let cleanup_succeeded = cleanup.failure_reason.is_none()
+            && cleanup.removed_workspace_scope
+            && cleanup.removed_artifacts
+            && cleanup.removed_logs;
+        let event = if cleanup_succeeded {
+            worker.state = WorkerLifecycleState::Completed;
+            worker.lease = None;
+            WorkerLifecycleEvent {
+                worker_id: worker_id.to_owned(),
+                state: WorkerLifecycleState::Completed,
+                run_id,
+                reason_code: "worker.completed".to_owned(),
+                timestamp_unix_ms: now_unix_ms,
+            }
+        } else {
             worker.state = WorkerLifecycleState::Failed;
             worker.lease = None;
-            return Err(WorkerLifecycleError::CleanupFailed);
-        }
-        worker.state = WorkerLifecycleState::Completed;
-        worker.lease = None;
-        Ok(WorkerLifecycleEvent {
-            worker_id: worker_id.to_owned(),
-            state: WorkerLifecycleState::Completed,
-            run_id,
-            reason_code: "worker.completed".to_owned(),
-            timestamp_unix_ms: now_unix_ms,
-        })
+            WorkerLifecycleEvent {
+                worker_id: worker_id.to_owned(),
+                state: WorkerLifecycleState::Failed,
+                run_id,
+                reason_code: "worker.cleanup_failed".to_owned(),
+                timestamp_unix_ms: now_unix_ms,
+            }
+        };
+        self.push_recent_event(event.clone());
+        Ok(WorkerCleanupOutcome { event, cleanup_report: cleanup, cleanup_succeeded })
     }
 
     pub fn reap_expired_workers(&mut self, now_unix_ms: i64) -> Vec<WorkerLifecycleEvent> {
@@ -327,8 +401,119 @@ impl WorkerFleetManager {
                 });
             }
         }
+        for event in &events {
+            self.push_recent_event(event.clone());
+        }
         events
     }
+
+    fn push_recent_event(&mut self, event: WorkerLifecycleEvent) {
+        self.recent_events.push_front(event);
+        while self.recent_events.len() > MAX_RECENT_LIFECYCLE_EVENTS {
+            self.recent_events.pop_back();
+        }
+    }
+}
+
+fn validate_lease_request(
+    request: &WorkerLeaseRequest,
+    policy: &WorkerFleetPolicy,
+    now_unix_ms: i64,
+) -> Result<(), WorkerLifecycleError> {
+    if request.run_id.trim().is_empty() {
+        return Err(WorkerLifecycleError::InvalidLeaseRequest(
+            "run_id must not be empty".to_owned(),
+        ));
+    }
+    if request.ttl_ms == 0 {
+        return Err(WorkerLifecycleError::InvalidLeaseRequest(
+            "ttl_ms must be positive".to_owned(),
+        ));
+    }
+    if request.ttl_ms > policy.max_ttl_ms {
+        return Err(WorkerLifecycleError::TtlExceeded);
+    }
+    if request.grant.grant_id.trim().is_empty() || request.grant.grant_id.len() > MAX_GRANT_ID_BYTES
+    {
+        return Err(WorkerLifecycleError::InvalidLeaseRequest(
+            "grant_id must be present and bounded".to_owned(),
+        ));
+    }
+    if request.grant.run_id != request.run_id {
+        return Err(WorkerLifecycleError::InvalidLeaseRequest(
+            "grant run_id must match lease run_id".to_owned(),
+        ));
+    }
+    if request.grant.expires_at_unix_ms <= now_unix_ms {
+        return Err(WorkerLifecycleError::InvalidLeaseRequest("grant is expired".to_owned()));
+    }
+    Ok(())
+}
+
+fn assign_worker_record(
+    worker_id: &str,
+    worker: &mut WorkerRecord,
+    request: WorkerLeaseRequest,
+    policy: &WorkerFleetPolicy,
+    now_unix_ms: i64,
+) -> Result<(WorkerLease, WorkerLifecycleEvent), WorkerLifecycleError> {
+    worker.attestation.validate(&policy.attestation, now_unix_ms)?;
+    if worker.lease.is_some() {
+        return Err(WorkerLifecycleError::LeaseAlreadyActive(worker_id.to_owned()));
+    }
+    if matches!(worker.state, WorkerLifecycleState::Failed | WorkerLifecycleState::Orphaned) {
+        return Err(WorkerLifecycleError::WorkerFailClosed(worker_id.to_owned()));
+    }
+    if !worker_supports_capabilities(worker, request.required_capabilities.as_slice()) {
+        return Err(WorkerLifecycleError::NoAvailableWorker);
+    }
+    let lease = WorkerLease {
+        lease_id: Ulid::new().to_string(),
+        worker_id: worker_id.to_owned(),
+        run_id: request.run_id.clone(),
+        expires_at_unix_ms: now_unix_ms.saturating_add(request.ttl_ms as i64),
+        required_capabilities: request.required_capabilities,
+        workspace_scope: request.workspace_scope,
+        artifact_transport: request.artifact_transport,
+        grant: request.grant,
+    };
+    worker.state = WorkerLifecycleState::Assigned;
+    worker.lease = Some(lease.clone());
+    Ok((
+        lease.clone(),
+        WorkerLifecycleEvent {
+            worker_id: worker_id.to_owned(),
+            state: WorkerLifecycleState::Assigned,
+            run_id: Some(lease.run_id.clone()),
+            reason_code: "worker.assigned".to_owned(),
+            timestamp_unix_ms: now_unix_ms,
+        },
+    ))
+}
+
+fn worker_record_can_accept(
+    worker: &WorkerRecord,
+    request: &WorkerLeaseRequest,
+    policy: &WorkerFleetPolicy,
+    now_unix_ms: i64,
+) -> bool {
+    worker.lease.is_none()
+        && !matches!(worker.state, WorkerLifecycleState::Failed | WorkerLifecycleState::Orphaned)
+        && worker.attestation.validate(&policy.attestation, now_unix_ms).is_ok()
+        && worker_supports_capabilities(worker, request.required_capabilities.as_slice())
+}
+
+fn worker_supports_capabilities(worker: &WorkerRecord, required_capabilities: &[String]) -> bool {
+    if required_capabilities.is_empty() {
+        return true;
+    }
+    required_capabilities.iter().all(|required| {
+        worker
+            .attestation
+            .supported_capabilities
+            .iter()
+            .any(|available| available.eq_ignore_ascii_case(required))
+    })
 }
 
 #[cfg(test)]
@@ -336,7 +521,7 @@ mod tests {
     use super::{
         WorkerArtifactTransport, WorkerAttestation, WorkerCleanupReport, WorkerFleetManager,
         WorkerFleetPolicy, WorkerLeaseRequest, WorkerLifecycleError, WorkerLifecycleState,
-        WorkerWorkspaceScope,
+        WorkerRunGrant, WorkerWorkspaceScope,
     };
 
     fn attestation(worker_id: &str) -> WorkerAttestation {
@@ -346,6 +531,7 @@ mod tests {
             build_digest_sha256: "bld".repeat(16),
             artifact_digest_sha256: "art".repeat(16),
             egress_proxy_attested: true,
+            supported_capabilities: vec!["tool:palyra.echo".to_owned()],
             issued_at_unix_ms: 1_000,
             expires_at_unix_ms: 10_000,
         }
@@ -355,6 +541,7 @@ mod tests {
         WorkerLeaseRequest {
             run_id: run_id.to_owned(),
             ttl_ms,
+            required_capabilities: Vec::new(),
             workspace_scope: WorkerWorkspaceScope {
                 workspace_root: "/workspace".to_owned(),
                 allowed_paths: vec!["src".to_owned()],
@@ -365,6 +552,12 @@ mod tests {
                 output_manifest_sha256: "out".repeat(32),
                 log_stream_id: "log-stream".to_owned(),
                 scratch_directory_id: "scratch".to_owned(),
+            },
+            grant: WorkerRunGrant {
+                grant_id: format!("grant-{run_id}"),
+                run_id: run_id.to_owned(),
+                tool_name: "palyra.echo".to_owned(),
+                expires_at_unix_ms: 9_000,
             },
         }
     }
@@ -452,5 +645,69 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].state, WorkerLifecycleState::Orphaned);
         assert_eq!(manager.snapshot().orphaned_workers, 1);
+    }
+
+    #[test]
+    fn worker_auto_assignment_matches_required_capabilities() {
+        let mut manager = WorkerFleetManager::default();
+        let policy = WorkerFleetPolicy::default();
+        manager.register_worker(attestation("worker-e"), &policy, 2_000).unwrap();
+
+        let mut request = lease_request("run-4", 500);
+        request.required_capabilities = vec!["tool:palyra.echo".to_owned()];
+        let (lease, event) = manager
+            .assign_next_work(request, &policy, 2_500)
+            .expect("matching worker should accept the lease");
+
+        assert_eq!(lease.worker_id, "worker-e");
+        assert_eq!(lease.required_capabilities, vec!["tool:palyra.echo"]);
+        assert_eq!(event.state, WorkerLifecycleState::Assigned);
+        assert_eq!(manager.recent_events().len(), 2);
+    }
+
+    #[test]
+    fn worker_auto_assignment_rejects_missing_capability() {
+        let mut manager = WorkerFleetManager::default();
+        let policy = WorkerFleetPolicy::default();
+        manager.register_worker(attestation("worker-f"), &policy, 2_000).unwrap();
+
+        let mut request = lease_request("run-5", 500);
+        request.required_capabilities = vec!["tool:palyra.sleep".to_owned()];
+        let error = manager
+            .assign_next_work(request, &policy, 2_500)
+            .expect_err("missing worker capability should fail closed");
+
+        assert_eq!(error, WorkerLifecycleError::NoAvailableWorker);
+        assert_eq!(manager.snapshot().active_leases, 0);
+    }
+
+    #[test]
+    fn worker_cleanup_failure_records_failed_event_for_journal_surfaces() {
+        let mut manager = WorkerFleetManager::default();
+        let policy = WorkerFleetPolicy::default();
+        manager.register_worker(attestation("worker-g"), &policy, 2_000).unwrap();
+        manager.assign_work("worker-g", lease_request("run-6", 500), &policy, 2_500).unwrap();
+
+        let outcome = manager
+            .finalize_work(
+                "worker-g",
+                WorkerCleanupReport {
+                    removed_workspace_scope: true,
+                    removed_artifacts: false,
+                    removed_logs: true,
+                    failure_reason: Some("artifact cleanup failure".to_owned()),
+                },
+                3_000,
+            )
+            .expect("cleanup outcome should be returned for journal emission");
+
+        assert!(!outcome.cleanup_succeeded);
+        assert_eq!(outcome.event.state, WorkerLifecycleState::Failed);
+        assert_eq!(outcome.event.reason_code, "worker.cleanup_failed");
+        assert_eq!(manager.snapshot().failed_closed_workers, 1);
+        let error = manager
+            .assign_work("worker-g", lease_request("run-7", 500), &policy, 3_100)
+            .expect_err("failed worker must stay fail closed");
+        assert!(matches!(error, WorkerLifecycleError::WorkerFailClosed(_)));
     }
 }

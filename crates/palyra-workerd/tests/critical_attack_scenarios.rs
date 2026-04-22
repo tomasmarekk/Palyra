@@ -72,6 +72,7 @@ fn critical_worker_attestation_attack_corpus_stays_fail_closed() {
                     build_digest_sha256: scenario.build_digest_sha256,
                     artifact_digest_sha256: scenario.artifact_digest_sha256,
                     egress_proxy_attested: scenario.egress_proxy_attested,
+                    supported_capabilities: Vec::new(),
                     issued_at_unix_ms: 1_000,
                     expires_at_unix_ms: 10_000,
                 },

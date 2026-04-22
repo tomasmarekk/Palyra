@@ -268,6 +268,9 @@ pub struct FileNetworkedWorkersConfig {
     pub mode: Option<String>,
     pub lease_ttl_ms: Option<u64>,
     pub require_attestation: Option<bool>,
+    pub expected_image_digest_sha256: Option<String>,
+    pub expected_build_digest_sha256: Option<String>,
+    pub expected_artifact_digest_sha256: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -891,6 +894,9 @@ mod tests {
             mode = "preview_only"
             lease_ttl_ms = 900000
             require_attestation = true
+            expected_image_digest_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            expected_build_digest_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            expected_artifact_digest_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
             "#,
         )
         .expect("runtime preview sections should parse");
@@ -930,6 +936,13 @@ mod tests {
         assert_eq!(
             parsed.networked_workers.as_ref().and_then(|value| value.lease_ttl_ms),
             Some(900000)
+        );
+        assert_eq!(
+            parsed
+                .networked_workers
+                .as_ref()
+                .and_then(|value| value.expected_image_digest_sha256.as_deref()),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
     }
 }

@@ -334,6 +334,33 @@ pub fn load_config() -> Result<LoadedConfig> {
             if let Some(require_attestation) = file_networked_workers.require_attestation {
                 networked_workers.require_attestation = require_attestation;
             }
+            if let Some(expected_image_digest_sha256) =
+                file_networked_workers.expected_image_digest_sha256
+            {
+                networked_workers.expected_image_digest_sha256 =
+                    parse_optional_sha256_digest_field(
+                        expected_image_digest_sha256.as_str(),
+                        "networked_workers.expected_image_digest_sha256",
+                    )?;
+            }
+            if let Some(expected_build_digest_sha256) =
+                file_networked_workers.expected_build_digest_sha256
+            {
+                networked_workers.expected_build_digest_sha256 =
+                    parse_optional_sha256_digest_field(
+                        expected_build_digest_sha256.as_str(),
+                        "networked_workers.expected_build_digest_sha256",
+                    )?;
+            }
+            if let Some(expected_artifact_digest_sha256) =
+                file_networked_workers.expected_artifact_digest_sha256
+            {
+                networked_workers.expected_artifact_digest_sha256 =
+                    parse_optional_sha256_digest_field(
+                        expected_artifact_digest_sha256.as_str(),
+                        "networked_workers.expected_artifact_digest_sha256",
+                    )?;
+            }
         }
         if let Some(file_orchestrator) = parsed.orchestrator {
             if let Some(runloop_v1_enabled) = file_orchestrator.runloop_v1_enabled {
@@ -2186,6 +2213,17 @@ fn parse_optional_auth_profile_id(raw: &str, source_name: &str) -> Result<Option
     Ok(Some(normalized))
 }
 
+fn parse_optional_sha256_digest_field(raw: &str, source_name: &str) -> Result<Option<String>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.len() != 64 || !trimmed.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        anyhow::bail!("{source_name} must be a 64-character hex SHA-256 digest");
+    }
+    Ok(Some(trimmed.to_ascii_lowercase()))
+}
+
 fn validate_secret_source_conflicts(
     model_provider: &ModelProviderConfig,
     browser_service: &BrowserServiceConfig,
@@ -3426,17 +3464,18 @@ mod tests {
         parse_model_provider_auth_provider_kind, parse_model_provider_registry_entry,
         parse_model_provider_registry_model, parse_openai_base_url, parse_openai_embeddings_dims,
         parse_optional_auth_profile_id, parse_optional_browser_state_dir,
-        parse_optional_openai_embeddings_model, parse_optional_vault_ref_field, parse_positive_u32,
-        parse_positive_usize, parse_process_executable_allowlist,
-        parse_process_runner_egress_enforcement_mode, parse_process_runner_tier,
-        parse_root_file_config, parse_storage_prefix_allowlist, parse_tool_allowlist,
-        parse_vault_dir, parse_vault_ref_allowlist, validate_runtime_preview_config, AdminConfig,
-        AuxiliaryExecutorConfig, BrowserServiceConfig, CanvasHostConfig, ChannelRouterConfig,
-        CronConfig, DeliveryArbitrationConfig, DeploymentConfig, DeploymentMode,
-        FlowOrchestrationConfig, GatewayBindProfile, GatewayConfig, GatewayTlsConfig,
-        HttpFetchConfig, IdentityConfig, MemoryConfig, ModelProviderConfig, NetworkedWorkersConfig,
-        OrchestratorConfig, PruningPolicyMatrixConfig, ReplayCaptureConfig,
-        RetrievalDualPathConfig, SessionQueuePolicyConfig, StorageConfig, ToolCallConfig,
+        parse_optional_openai_embeddings_model, parse_optional_sha256_digest_field,
+        parse_optional_vault_ref_field, parse_positive_u32, parse_positive_usize,
+        parse_process_executable_allowlist, parse_process_runner_egress_enforcement_mode,
+        parse_process_runner_tier, parse_root_file_config, parse_storage_prefix_allowlist,
+        parse_tool_allowlist, parse_vault_dir, parse_vault_ref_allowlist,
+        validate_runtime_preview_config, AdminConfig, AuxiliaryExecutorConfig,
+        BrowserServiceConfig, CanvasHostConfig, ChannelRouterConfig, CronConfig,
+        DeliveryArbitrationConfig, DeploymentConfig, DeploymentMode, FlowOrchestrationConfig,
+        GatewayBindProfile, GatewayConfig, GatewayTlsConfig, HttpFetchConfig, IdentityConfig,
+        MemoryConfig, ModelProviderConfig, NetworkedWorkersConfig, OrchestratorConfig,
+        PruningPolicyMatrixConfig, ReplayCaptureConfig, RetrievalDualPathConfig,
+        SessionQueuePolicyConfig, StorageConfig, ToolCallConfig,
     };
     use crate::channel_router::{BroadcastStrategy, DirectMessagePolicy};
     use crate::model_provider::{
@@ -3731,6 +3770,27 @@ mod tests {
             &NetworkedWorkersConfig::default(),
         )
         .expect("preview defaults should validate");
+    }
+
+    #[test]
+    fn networked_worker_expected_digest_fields_are_normalized_and_validated() {
+        let digest = "A".repeat(64);
+        let parsed = parse_optional_sha256_digest_field(
+            digest.as_str(),
+            "networked_workers.expected_image_digest_sha256",
+        )
+        .expect("valid digest should parse");
+        assert_eq!(
+            parsed.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+
+        let error = parse_optional_sha256_digest_field(
+            "not-a-digest",
+            "networked_workers.expected_image_digest_sha256",
+        )
+        .expect_err("invalid digest should fail closed");
+        assert!(error.to_string().contains("64-character hex SHA-256 digest"));
     }
 
     #[test]

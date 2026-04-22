@@ -780,6 +780,7 @@ mod tests {
                 attested_workers: 1,
                 active_leases: 0,
                 orphaned_workers: 0,
+                failed_closed_workers: 0,
             },
             &WorkerFleetPolicy::default(),
         );
@@ -813,6 +814,7 @@ mod tests {
                 attested_workers: 1,
                 active_leases: 0,
                 orphaned_workers: 0,
+                failed_closed_workers: 0,
             },
             &WorkerFleetPolicy::default(),
         );

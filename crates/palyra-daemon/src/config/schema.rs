@@ -380,6 +380,9 @@ pub struct NetworkedWorkersConfig {
     pub mode: RuntimePreviewMode,
     pub lease_ttl_ms: u64,
     pub require_attestation: bool,
+    pub expected_image_digest_sha256: Option<String>,
+    pub expected_build_digest_sha256: Option<String>,
+    pub expected_artifact_digest_sha256: Option<String>,
 }
 
 impl Default for NetworkedWorkersConfig {
@@ -388,6 +391,9 @@ impl Default for NetworkedWorkersConfig {
             mode: DEFAULT_NETWORKED_WORKERS_MODE,
             lease_ttl_ms: DEFAULT_NETWORKED_WORKERS_LEASE_TTL_MS,
             require_attestation: DEFAULT_NETWORKED_WORKERS_REQUIRE_ATTESTATION,
+            expected_image_digest_sha256: None,
+            expected_build_digest_sha256: None,
+            expected_artifact_digest_sha256: None,
         }
     }
 }

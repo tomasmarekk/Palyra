@@ -91,7 +91,7 @@ use crate::transport::grpc::auth::{
 use crate::transport::grpc::services::gateway::GatewayServiceImpl;
 use palyra_workerd::{
     WorkerArtifactTransport, WorkerAttestation, WorkerCleanupReport, WorkerLeaseRequest,
-    WorkerWorkspaceScope,
+    WorkerRunGrant, WorkerWorkspaceScope,
 };
 
 static TEMP_JOURNAL_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -437,6 +437,7 @@ fn test_worker_attestation(worker_id: &str) -> WorkerAttestation {
         build_digest_sha256: "bld".repeat(16),
         artifact_digest_sha256: "art".repeat(16),
         egress_proxy_attested: true,
+        supported_capabilities: vec!["tool:palyra.echo".to_owned()],
         issued_at_unix_ms: now_unix_ms.saturating_sub(1_000),
         expires_at_unix_ms: now_unix_ms.saturating_add(60_000),
     }
@@ -446,6 +447,7 @@ fn test_worker_lease_request(run_id: &str) -> WorkerLeaseRequest {
     WorkerLeaseRequest {
         run_id: run_id.to_owned(),
         ttl_ms: 30_000,
+        required_capabilities: vec!["tool:palyra.echo".to_owned()],
         workspace_scope: WorkerWorkspaceScope {
             workspace_root: "C:/workspace".to_owned(),
             allowed_paths: vec!["src".to_owned(), "Cargo.toml".to_owned()],
@@ -456,6 +458,12 @@ fn test_worker_lease_request(run_id: &str) -> WorkerLeaseRequest {
             output_manifest_sha256: "output".repeat(16),
             log_stream_id: "logs/run-1".to_owned(),
             scratch_directory_id: "scratch-run-1".to_owned(),
+        },
+        grant: WorkerRunGrant {
+            grant_id: format!("grant-{run_id}"),
+            run_id: run_id.to_owned(),
+            tool_name: "palyra.echo".to_owned(),
+            expires_at_unix_ms: super::current_unix_ms().saturating_add(30_000),
         },
     }
 }
@@ -2277,6 +2285,70 @@ async fn networked_worker_lifecycle_events_are_journaled() {
             && reason_codes.contains(&"worker.assigned")
             && reason_codes.contains(&"worker.completed"),
         "worker lifecycle journal payloads should preserve all expected reason codes"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn networked_worker_cleanup_failure_is_journaled_and_fail_closed() {
+    let state = build_test_runtime_state(false);
+    state
+        .register_networked_worker(test_worker_attestation("worker-cleanup-failure"))
+        .await
+        .expect("worker registration should succeed");
+    state
+        .assign_networked_worker_lease(
+            "worker-cleanup-failure",
+            test_worker_lease_request("run-worker-cleanup-failure"),
+        )
+        .await
+        .expect("worker lease assignment should succeed");
+
+    let error = state
+        .complete_networked_worker_lease(
+            "worker-cleanup-failure",
+            WorkerCleanupReport {
+                removed_workspace_scope: true,
+                removed_artifacts: false,
+                removed_logs: true,
+                failure_reason: Some("artifact cleanup failed".to_owned()),
+            },
+        )
+        .await
+        .expect_err("cleanup failure should fail closed");
+    assert!(error.message().contains("artifact cleanup failed"));
+    assert_eq!(state.worker_fleet_snapshot().failed_closed_workers, 1);
+
+    let reassignment = state
+        .assign_networked_worker_lease(
+            "worker-cleanup-failure",
+            test_worker_lease_request("run-worker-after-cleanup-failure"),
+        )
+        .await
+        .expect_err("failed worker should not accept another lease");
+    assert!(reassignment.message().contains("fail-closed"));
+    let recent_events = state.worker_fleet_recent_events();
+    assert!(
+        recent_events.iter().any(|event| event.reason_code == "worker.cleanup_failed"),
+        "cleanup failure should be retained for diagnostics surfaces"
+    );
+
+    let snapshot = state
+        .recent_journal_snapshot(100)
+        .await
+        .expect("recent journal snapshot should be returned");
+    let failed_payload = snapshot
+        .events
+        .iter()
+        .find_map(|event| {
+            let payload = serde_json::from_str::<Value>(event.payload_json.as_str()).ok()?;
+            (payload.pointer("/payload/details/reason_code").and_then(Value::as_str)
+                == Some("worker.cleanup_failed"))
+            .then_some(payload)
+        })
+        .expect("cleanup failure lifecycle event should be journaled");
+    assert_eq!(
+        failed_payload.pointer("/payload/details/state").and_then(Value::as_str),
+        Some("failed")
     );
 }
 

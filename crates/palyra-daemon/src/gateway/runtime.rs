@@ -5920,7 +5920,27 @@ impl GatewayRuntimeState {
 
     #[must_use]
     pub fn worker_fleet_policy(&self) -> WorkerFleetPolicy {
-        WorkerFleetPolicy::default()
+        WorkerFleetPolicy {
+            max_ttl_ms: self.config.networked_workers.lease_ttl_ms,
+            attestation: palyra_workerd::WorkerAttestationExpectation {
+                require_egress_proxy: self.config.networked_workers.require_attestation,
+                image_digest_sha256: self
+                    .config
+                    .networked_workers
+                    .expected_image_digest_sha256
+                    .clone(),
+                build_digest_sha256: self
+                    .config
+                    .networked_workers
+                    .expected_build_digest_sha256
+                    .clone(),
+                artifact_digest_sha256: self
+                    .config
+                    .networked_workers
+                    .expected_artifact_digest_sha256
+                    .clone(),
+            },
+        }
     }
 
     #[must_use]
@@ -5930,6 +5950,18 @@ impl GatewayRuntimeState {
             Err(poisoned) => {
                 warn!("worker fleet lock poisoned while reading snapshot");
                 poisoned.into_inner().snapshot()
+            }
+        }
+    }
+
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn worker_fleet_recent_events(&self) -> Vec<WorkerLifecycleEvent> {
+        match self.worker_fleet.read() {
+            Ok(manager) => manager.recent_events(),
+            Err(poisoned) => {
+                warn!("worker fleet lock poisoned while reading recent events");
+                poisoned.into_inner().recent_events()
             }
         }
     }
@@ -5995,15 +6027,42 @@ impl GatewayRuntimeState {
 
     #[allow(clippy::result_large_err)]
     #[allow(dead_code)]
+    pub async fn assign_next_networked_worker_lease(
+        self: &Arc<Self>,
+        request: WorkerLeaseRequest,
+    ) -> Result<(WorkerLease, WorkerLifecycleEvent), Status> {
+        let policy = self.worker_fleet_policy();
+        let now_unix_ms = current_unix_ms();
+        let assign_work = |manager: &mut WorkerFleetManager| {
+            manager.assign_next_work(request.clone(), &policy, now_unix_ms).map_err(|error| {
+                Status::failed_precondition(format!(
+                    "networked worker lease assignment failed: {error}"
+                ))
+            })
+        };
+        let (lease, event) = match self.worker_fleet.write() {
+            Ok(mut manager) => assign_work(&mut manager)?,
+            Err(poisoned) => {
+                warn!("worker fleet lock poisoned while assigning next lease");
+                let mut manager = poisoned.into_inner();
+                assign_work(&mut manager)?
+            }
+        };
+        self.record_networked_worker_lifecycle_event(&event).await?;
+        Ok((lease, event))
+    }
+
+    #[allow(clippy::result_large_err)]
+    #[allow(dead_code)]
     pub async fn complete_networked_worker_lease(
         self: &Arc<Self>,
         worker_id: &str,
         cleanup_report: WorkerCleanupReport,
     ) -> Result<WorkerLifecycleEvent, Status> {
         let now_unix_ms = current_unix_ms();
-        let event = match self.worker_fleet.write() {
+        let outcome = match self.worker_fleet.write() {
             Ok(mut manager) => {
-                manager.complete_work(worker_id, &cleanup_report, now_unix_ms).map_err(|error| {
+                manager.finalize_work(worker_id, cleanup_report, now_unix_ms).map_err(|error| {
                     Status::failed_precondition(format!("networked worker cleanup failed: {error}"))
                 })?
             }
@@ -6011,7 +6070,7 @@ impl GatewayRuntimeState {
                 warn!("worker fleet lock poisoned while completing worker lease");
                 poisoned
                     .into_inner()
-                    .complete_work(worker_id, &cleanup_report, now_unix_ms)
+                    .finalize_work(worker_id, cleanup_report, now_unix_ms)
                     .map_err(|error| {
                         Status::failed_precondition(format!(
                             "networked worker cleanup failed: {error}"
@@ -6019,8 +6078,14 @@ impl GatewayRuntimeState {
                     })?
             }
         };
-        self.record_networked_worker_lifecycle_event(&event).await?;
-        Ok(event)
+        self.record_networked_worker_lifecycle_event(&outcome.event).await?;
+        if outcome.cleanup_succeeded {
+            Ok(outcome.event)
+        } else {
+            Err(Status::failed_precondition(outcome.cleanup_report.failure_reason.unwrap_or_else(
+                || "networked worker cleanup did not remove all scoped data".to_owned(),
+            )))
+        }
     }
 
     #[allow(clippy::result_large_err)]
@@ -6080,6 +6145,7 @@ impl GatewayRuntimeState {
             .with_details(json!({
                 "run_id": event.run_id,
                 "reason_code": event.reason_code,
+                "state": event.state.as_str(),
             })),
         )
         .await
