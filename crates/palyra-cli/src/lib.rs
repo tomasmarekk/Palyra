@@ -4240,6 +4240,12 @@ fn resolve_dashboard_config_path(path_override: Option<String>) -> Result<Option
         return Ok(Some(parsed));
     }
 
+    if let Some(path) =
+        app::current_root_context().and_then(|context| context.config_path().map(Path::to_path_buf))
+    {
+        return Ok(Some(path));
+    }
+
     if let Ok(explicit) = env::var("PALYRA_CONFIG") {
         let trimmed = explicit.trim();
         if !trimmed.is_empty() {
