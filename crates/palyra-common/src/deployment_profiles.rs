@@ -155,17 +155,18 @@ pub fn derive_deployment_profile(
 }
 
 fn local_profile_manifest() -> DeploymentProfileManifest {
-    manifest(
-        DeploymentProfileId::Local,
-        "Local operator workstation",
-        "Loopback-only local runtime with admin auth, local state, and no remote worker execution.",
-        vec![
+    manifest(DeploymentProfileManifestSpec {
+        profile_id: DeploymentProfileId::Local,
+        display_name: "Local operator workstation",
+        operator_summary:
+            "Loopback-only local runtime with admin auth, local state, and no remote worker execution.",
+        capabilities: vec![
             capability("gateway.loopback", true, "required"),
             capability("browserd.local", false, "opt-in"),
             capability("networked_workers", false, "disabled"),
             capability("public_gateway", false, "blocked-by-default"),
         ],
-        vec![
+        defaults: vec![
             default_string(
                 "deployment.profile",
                 "local",
@@ -193,8 +194,8 @@ fn local_profile_manifest() -> DeploymentProfileManifest {
                 "worker runtime remains unavailable until another profile is selected",
             ),
         ],
-        vec![],
-        vec![
+        blockers: vec![],
+        health_preflights: vec![
             preflight(
                 "config_schema",
                 true,
@@ -214,28 +215,29 @@ fn local_profile_manifest() -> DeploymentProfileManifest {
                 "model-provider credentials may still need operator setup",
             ),
         ],
-        vec![],
-        vec![
+        recipe_targets: vec![],
+        next_steps: vec![
             "palyra doctor --json",
             "palyra gateway status",
             "palyra onboarding status --flow quickstart",
         ],
-    )
+    })
 }
 
 fn single_vm_profile_manifest() -> DeploymentProfileManifest {
-    manifest(
-        DeploymentProfileId::SingleVm,
-        "Single VM service deployment",
-        "A loopback-first server profile for one host, intended to sit behind SSH tunneling or a hardened reverse proxy.",
-        vec![
+    manifest(DeploymentProfileManifestSpec {
+        profile_id: DeploymentProfileId::SingleVm,
+        display_name: "Single VM service deployment",
+        operator_summary:
+            "A loopback-first server profile for one host, intended to sit behind SSH tunneling or a hardened reverse proxy.",
+        capabilities: vec![
             capability("gateway.loopback", true, "required"),
             capability("systemd.palyrad", true, "recipe"),
             capability("docker.compose", true, "recipe"),
             capability("public_gateway", false, "requires-explicit-public-tls"),
             capability("networked_workers", false, "disabled"),
         ],
-        vec![
+        defaults: vec![
             default_string(
                 "deployment.profile",
                 "single-vm",
@@ -264,7 +266,7 @@ fn single_vm_profile_manifest() -> DeploymentProfileManifest {
                 "worker fleet remains disabled until worker-enabled is selected",
             ),
         ],
-        vec![
+        blockers: vec![
             blocker(
                 "public_tls_requires_dual_ack",
                 "blocking",
@@ -272,38 +274,39 @@ fn single_vm_profile_manifest() -> DeploymentProfileManifest {
                 "Keep loopback-only or configure public_tls with deployment.dangerous_remote_bind_ack plus PALYRA_GATEWAY_DANGEROUS_REMOTE_BIND_ACK.",
             ),
         ],
-        vec![
+        health_preflights: vec![
             preflight("config_schema", true, "config", "profile config parses against the daemon schema"),
             preflight("bind_posture", true, "network", "remote bind is not enabled without public TLS guardrails"),
             preflight("storage_paths", true, "storage", "state, identity, and vault paths are writable by the service user"),
             preflight("systemd_or_compose", false, "service", "operator selects either systemd or Compose service lifecycle"),
         ],
-        vec![
+        recipe_targets: vec![
             recipe("dockerfile", "infra/deployment/docker/Dockerfile.palyra", "palyra"),
             recipe("compose", "infra/deployment/compose/single-vm.yml", "palyrad"),
             recipe("systemd", "infra/deployment/systemd/palyrad.service", "palyrad"),
         ],
-        vec![
+        next_steps: vec![
             "palyra deployment preflight --deployment-profile single-vm --path ./palyra.toml",
             "palyra deployment recipe --deployment-profile single-vm --output-dir ./artifacts/deploy",
             "palyra gateway status",
         ],
-    )
+    })
 }
 
 fn worker_enabled_profile_manifest() -> DeploymentProfileManifest {
-    manifest(
-        DeploymentProfileId::WorkerEnabled,
-        "Worker-enabled service deployment",
-        "A server profile that keeps the control plane loopback-first while enabling guarded networked worker execution with attestation.",
-        vec![
+    manifest(DeploymentProfileManifestSpec {
+        profile_id: DeploymentProfileId::WorkerEnabled,
+        display_name: "Worker-enabled service deployment",
+        operator_summary:
+            "A server profile that keeps the control plane loopback-first while enabling guarded networked worker execution with attestation.",
+        capabilities: vec![
             capability("gateway.loopback", true, "required"),
             capability("networked_workers", true, "preview-with-attestation"),
             capability("worker.attestation", true, "required"),
             capability("artifact_transport", true, "required"),
             capability("public_gateway", false, "requires-explicit-public-tls"),
         ],
-        vec![
+        defaults: vec![
             default_string(
                 "deployment.profile",
                 "worker-enabled",
@@ -342,7 +345,7 @@ fn worker_enabled_profile_manifest() -> DeploymentProfileManifest {
                 "keeps leases bounded for orphan reaping and rollback",
             ),
         ],
-        vec![
+        blockers: vec![
             blocker(
                 "worker_attestation_digest_required",
                 "blocking",
@@ -356,14 +359,14 @@ fn worker_enabled_profile_manifest() -> DeploymentProfileManifest {
                 "Keep process-runner egress none/preflight or document explicit allowed hosts for the worker pool.",
             ),
         ],
-        vec![
+        health_preflights: vec![
             preflight("config_schema", true, "config", "profile config parses against the daemon schema"),
             preflight("worker_rollout", true, "rollout", "networked worker rollout is enabled but starts in preview mode"),
             preflight("attestation", true, "security", "worker leases require attestation"),
             preflight("artifact_transport", true, "storage", "daemon state root can persist worker artifacts"),
             preflight("orphan_reaper", true, "recovery", "lease TTL supports fail-closed cleanup"),
         ],
-        vec![
+        recipe_targets: vec![
             recipe("dockerfile", "infra/deployment/docker/Dockerfile.palyra", "palyra"),
             recipe(
                 "compose",
@@ -373,39 +376,41 @@ fn worker_enabled_profile_manifest() -> DeploymentProfileManifest {
             recipe("systemd", "infra/deployment/systemd/palyrad.service", "palyrad"),
             recipe("systemd", "infra/deployment/systemd/palyra-workerd.service", "palyra-workerd"),
         ],
-        vec![
+        next_steps: vec![
             "palyra deployment preflight --deployment-profile worker-enabled --path ./palyra.toml",
             "palyra deployment upgrade-smoke --deployment-profile worker-enabled --path ./palyra.toml",
             "palyra deployment promotion-check --deployment-profile worker-enabled",
             "palyra support-bundle export --output ./artifacts/palyra-support-bundle.json",
         ],
-    )
+    })
 }
 
-fn manifest(
+struct DeploymentProfileManifestSpec<'a> {
     profile_id: DeploymentProfileId,
-    display_name: &str,
-    operator_summary: &str,
+    display_name: &'a str,
+    operator_summary: &'a str,
     capabilities: Vec<DeploymentProfileCapability>,
     defaults: Vec<DeploymentProfileDefault>,
     blockers: Vec<DeploymentProfileBlocker>,
     health_preflights: Vec<DeploymentProfileHealthPreflight>,
     recipe_targets: Vec<DeploymentRecipeTarget>,
-    next_steps: Vec<&str>,
-) -> DeploymentProfileManifest {
+    next_steps: Vec<&'a str>,
+}
+
+fn manifest(spec: DeploymentProfileManifestSpec<'_>) -> DeploymentProfileManifest {
     DeploymentProfileManifest {
         schema_version: DEPLOYMENT_PROFILE_SCHEMA_VERSION,
-        profile_id: profile_id.as_str().to_owned(),
-        display_name: display_name.to_owned(),
-        deployment_mode: profile_id.deployment_mode().to_owned(),
-        bind_profile: profile_id.bind_profile().to_owned(),
-        operator_summary: operator_summary.to_owned(),
-        capabilities,
-        defaults,
-        blockers,
-        health_preflights,
-        recipe_targets,
-        next_steps: next_steps.into_iter().map(ToOwned::to_owned).collect(),
+        profile_id: spec.profile_id.as_str().to_owned(),
+        display_name: spec.display_name.to_owned(),
+        deployment_mode: spec.profile_id.deployment_mode().to_owned(),
+        bind_profile: spec.profile_id.bind_profile().to_owned(),
+        operator_summary: spec.operator_summary.to_owned(),
+        capabilities: spec.capabilities,
+        defaults: spec.defaults,
+        blockers: spec.blockers,
+        health_preflights: spec.health_preflights,
+        recipe_targets: spec.recipe_targets,
+        next_steps: spec.next_steps.into_iter().map(ToOwned::to_owned).collect(),
     }
 }
 
