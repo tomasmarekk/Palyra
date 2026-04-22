@@ -3,6 +3,8 @@ Usage: palyra memory [OPTIONS] <COMMAND>
 Commands:
   status
   index             [aliases: reindex]
+  index-drift
+  index-reconcile
   search
   purge
   ingest

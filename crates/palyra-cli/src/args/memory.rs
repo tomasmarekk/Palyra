@@ -17,6 +17,18 @@ pub enum MemoryCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(name = "index-drift")]
+    IndexDrift {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    #[command(name = "index-reconcile")]
+    IndexReconcile {
+        #[arg(long)]
+        batch_size: Option<u32>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     Search {
         query: String,
         #[arg(long, value_enum, default_value_t = MemoryScopeArg::Principal)]

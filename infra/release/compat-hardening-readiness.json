@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "release_scope": "runtime_preview_acceptance_harness",
-  "updated_at": "2026-04-20",
+  "updated_at": "2026-04-22",
   "matrix_manifest": "infra/release/workflow-regression-matrix.json",
   "rollout_controls": [
     {
@@ -122,6 +122,7 @@
         "networked_worker_preview_contract",
         "pruning_decision_runtime_preview",
         "dual_path_retrieval_runtime_diagnostics",
+        "external_retrieval_index_slo_runtime",
         "flow_transitions_runtime_workflow",
         "delivery_arbitration_runtime_override",
         "networked_worker_inventory_runtime_preview",

@@ -929,6 +929,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
             get(console::memory::console_memory_derived_artifacts_handler),
         )
         .route("/console/v1/memory/index", post(console::memory::console_memory_index_handler))
+        .route(
+            "/console/v1/memory/index/drift",
+            get(console::memory::console_memory_index_drift_handler),
+        )
+        .route(
+            "/console/v1/memory/index/reconcile",
+            post(console::memory::console_memory_index_reconcile_handler),
+        )
         .route("/console/v1/memory/search", get(console::memory::console_memory_search_handler))
         .route(
             "/console/v1/memory/learning/candidates",

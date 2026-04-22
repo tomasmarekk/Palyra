@@ -8,6 +8,8 @@ pub(crate) fn run_memory(command: MemoryCommand) -> Result<()> {
     match command {
         MemoryCommand::Status { .. }
         | MemoryCommand::Index { .. }
+        | MemoryCommand::IndexDrift { .. }
+        | MemoryCommand::IndexReconcile { .. }
         | MemoryCommand::Workspace { .. }
         | MemoryCommand::Recall { .. }
         | MemoryCommand::SearchAll { .. }
@@ -232,6 +234,8 @@ pub(crate) async fn run_memory_async(
         }
         MemoryCommand::Status { .. }
         | MemoryCommand::Index { .. }
+        | MemoryCommand::IndexDrift { .. }
+        | MemoryCommand::IndexReconcile { .. }
         | MemoryCommand::Workspace { .. }
         | MemoryCommand::Recall { .. }
         | MemoryCommand::SearchAll { .. }
@@ -264,6 +268,21 @@ async fn run_memory_admin_async(command: MemoryCommand) -> Result<()> {
             let payload =
                 context.client.post_json_value("console/v1/memory/index", &request).await?;
             emit_memory_index(&payload, output::preferred_json(json))
+        }
+        MemoryCommand::IndexDrift { json } => {
+            let payload = context.client.get_json_value("console/v1/memory/index/drift").await?;
+            emit_memory_index_drift(&payload, output::preferred_json(json))
+        }
+        MemoryCommand::IndexReconcile { batch_size, json } => {
+            let mut request = json!({});
+            if let Some(batch_size) = batch_size {
+                request["batch_size"] = json!(batch_size);
+            }
+            let payload = context
+                .client
+                .post_json_value("console/v1/memory/index/reconcile", &request)
+                .await?;
+            emit_memory_index_reconcile(&payload, output::preferred_json(json))
         }
         MemoryCommand::Workspace { command } => match command {
             MemoryWorkspaceCommand::List {
@@ -906,6 +925,9 @@ fn emit_memory_status(payload: &Value, json_output: bool) -> Result<()> {
         "memory.maintenance interval_ms={} last_run_at_unix_ms={} last_deleted_total={} next_run_at_unix_ms={} next_vacuum_due_at_unix_ms={}",
         interval_ms, last_run_at_ms, last_deleted_total, next_run_at_ms, next_vacuum_due_at_ms
     );
+    if let Some(external_index) = memory_external_index_payload(payload) {
+        print_external_index_line("memory.external_index", external_index);
+    }
     std::io::stdout().flush().context("stdout flush failed")
 }
 
@@ -952,7 +974,137 @@ fn emit_memory_index(payload: &Value, json_output: bool) -> Result<()> {
             ran_at_unix_ms, deleted_total, vacuum_performed
         );
     }
+    if let Some(external_indexer) = payload.get("external_indexer").filter(|value| !value.is_null())
+    {
+        let indexed_memory_items =
+            external_indexer.get("indexed_memory_items").and_then(Value::as_u64).unwrap_or(0);
+        let indexed_workspace_chunks =
+            external_indexer.get("indexed_workspace_chunks").and_then(Value::as_u64).unwrap_or(0);
+        let pending_memory_items =
+            external_indexer.get("pending_memory_items").and_then(Value::as_u64).unwrap_or(0);
+        let pending_workspace_chunks =
+            external_indexer.get("pending_workspace_chunks").and_then(Value::as_u64).unwrap_or(0);
+        let checkpoint_committed =
+            external_indexer.get("checkpoint_committed").and_then(Value::as_bool).unwrap_or(false);
+        let complete = external_indexer.get("complete").and_then(Value::as_bool).unwrap_or(false);
+        println!(
+            "memory.external_indexer indexed_memory_items={} indexed_workspace_chunks={} pending_memory_items={} pending_workspace_chunks={} checkpoint_committed={} complete={}",
+            indexed_memory_items,
+            indexed_workspace_chunks,
+            pending_memory_items,
+            pending_workspace_chunks,
+            checkpoint_committed,
+            complete
+        );
+    }
+    if let Some(external_index) = memory_external_index_payload(payload) {
+        print_external_index_line("memory.external_index", external_index);
+    }
+    if let Some(drift) = payload.get("drift").filter(|value| !value.is_null()) {
+        print_external_drift_line("memory.external_index.drift", drift);
+    }
     std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn emit_memory_index_drift(payload: &Value, json_output: bool) -> Result<()> {
+    if json_output {
+        return output::print_json_pretty(
+            payload,
+            "failed to encode memory index drift payload as JSON",
+        );
+    }
+
+    if let Some(drift) = payload.get("drift").filter(|value| !value.is_null()) {
+        print_external_drift_line("memory.external_index.drift", drift);
+    }
+    if let Some(external_index) = memory_external_index_payload(payload) {
+        print_external_index_line("memory.external_index", external_index);
+    }
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn emit_memory_index_reconcile(payload: &Value, json_output: bool) -> Result<()> {
+    if json_output {
+        return output::print_json_pretty(
+            payload,
+            "failed to encode memory index reconciliation payload as JSON",
+        );
+    }
+
+    let reconciliation = payload.get("reconciliation").unwrap_or(&Value::Null);
+    let success = reconciliation.get("success").and_then(Value::as_bool).unwrap_or(false);
+    let checked_at_unix_ms = reconciliation
+        .get("checked_at_unix_ms")
+        .and_then(Value::as_i64)
+        .map_or("none".to_owned(), |value| value.to_string());
+    let drift_before =
+        reconciliation.pointer("/drift_before/drift_count").and_then(Value::as_u64).unwrap_or(0);
+    let drift_after =
+        reconciliation.pointer("/drift_after/drift_count").and_then(Value::as_u64).unwrap_or(0);
+    println!(
+        "memory.external_index.reconcile success={} checked_at_unix_ms={} drift_before={} drift_after={}",
+        success, checked_at_unix_ms, drift_before, drift_after
+    );
+    if let Some(external_index) = memory_external_index_payload(payload) {
+        print_external_index_line("memory.external_index", external_index);
+    }
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn memory_external_index_payload(payload: &Value) -> Option<&Value> {
+    payload
+        .pointer("/external_index")
+        .filter(|value| !value.is_null())
+        .or_else(|| payload.pointer("/retrieval/external_index").filter(|value| !value.is_null()))
+        .or_else(|| {
+            payload.pointer("/retrieval/backend/external_index").filter(|value| !value.is_null())
+        })
+}
+
+fn print_external_index_line(label: &str, external_index: &Value) {
+    let state = external_index.get("state").and_then(Value::as_str).unwrap_or("unknown");
+    let reason = external_index.get("reason").and_then(Value::as_str).unwrap_or("unknown");
+    let indexed_memory_items =
+        external_index.get("indexed_memory_items").and_then(Value::as_u64).unwrap_or(0);
+    let indexed_workspace_chunks =
+        external_index.get("indexed_workspace_chunks").and_then(Value::as_u64).unwrap_or(0);
+    let drift_count = external_index.get("drift_count").and_then(Value::as_u64).unwrap_or(0);
+    let freshness_lag_ms = external_index
+        .pointer("/scale_slos/freshness_lag_ms")
+        .and_then(Value::as_u64)
+        .map_or("unknown".to_owned(), |value| value.to_string());
+    let gate = external_index
+        .pointer("/scale_slos/preview_gate_state")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    println!(
+        "{label} state={} indexed_memory_items={} indexed_workspace_chunks={} drift_count={} freshness_lag_ms={} gate={} reason={}",
+        state,
+        indexed_memory_items,
+        indexed_workspace_chunks,
+        drift_count,
+        freshness_lag_ms,
+        gate,
+        reason
+    );
+}
+
+fn print_external_drift_line(label: &str, drift: &Value) {
+    let drift_count = drift.get("drift_count").and_then(Value::as_u64).unwrap_or(0);
+    let memory_drift = drift.get("memory_drift").and_then(Value::as_i64).unwrap_or(0);
+    let workspace_chunk_drift =
+        drift.get("workspace_chunk_drift").and_then(Value::as_i64).unwrap_or(0);
+    let freshness_lag_ms = drift.get("freshness_lag_ms").and_then(Value::as_u64).unwrap_or(0);
+    let reconciliation_required =
+        drift.get("reconciliation_required").and_then(Value::as_bool).unwrap_or(false);
+    println!(
+        "{label} drift_count={} memory_drift={} workspace_chunk_drift={} freshness_lag_ms={} reconciliation_required={}",
+        drift_count,
+        memory_drift,
+        workspace_chunk_drift,
+        freshness_lag_ms,
+        reconciliation_required
+    );
 }
 
 fn memory_session_scope_label(has_session_scope: bool) -> &'static str {

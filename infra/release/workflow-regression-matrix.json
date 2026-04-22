@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "release_scope": "runtime_preview_acceptance_harness",
-  "updated_at": "2026-04-20",
+  "updated_at": "2026-04-22",
   "profiles": {
     "fast": {
       "description": "Per-push runtime preview acceptance baseline that keeps every canonical acceptance scenario wired through deterministic contract checks.",
@@ -491,6 +491,32 @@
         "--",
         "--exact",
         "--test-threads=1"
+      ]
+    },
+    {
+      "id": "external_retrieval_index_slo_runtime",
+      "label": "External derived retrieval indexer keeps drift reconciliation and SLO gates wired",
+      "category": "runtime",
+      "profiles": [
+        "full"
+      ],
+      "subsystems": [
+        "retrieval_dual_path"
+      ],
+      "chaos": false,
+      "acceptance_scenarios": [
+        "dual_path_retrieval"
+      ],
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "palyra-daemon",
+        "--lib",
+        "--locked",
+        "external_runtime_indexer_checkpoint_opens_ready_external_path",
+        "--",
+        "--exact"
       ]
     },
     {

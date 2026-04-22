@@ -43,8 +43,9 @@ use crate::provider_leases::{
     ProviderLeasePreviewSnapshot,
 };
 use crate::retrieval::{
-    score_memory_candidates, score_workspace_candidates, RetrievalBackend,
-    RetrievalBackendSnapshot, RetrievalRuntimeConfig,
+    score_memory_candidates, score_workspace_candidates, ExternalRetrievalDriftReport,
+    ExternalRetrievalIndexerOutcome, ExternalRetrievalReconciliationOutcome,
+    ExternalRetrievalRuntime, RetrievalBackend, RetrievalBackendSnapshot, RetrievalRuntimeConfig,
 };
 use crate::self_healing::{
     IncidentDomain, RemediationAttemptStatus, RuntimeIncidentHistoryEntry,
@@ -382,7 +383,7 @@ pub struct GatewayJournalConfigSnapshot {
 }
 
 #[rustfmt::skip]
-pub struct GatewayRuntimeDependencies { pub model_provider: Arc<dyn ModelProvider>, pub vault: Arc<Vault>, pub agent_registry: AgentRegistry, pub tool_posture_registry: ToolPostureRegistry, pub retrieval_backend: Arc<dyn RetrievalBackend> }
+pub struct GatewayRuntimeDependencies { pub model_provider: Arc<dyn ModelProvider>, pub vault: Arc<Vault>, pub agent_registry: AgentRegistry, pub tool_posture_registry: ToolPostureRegistry, pub retrieval_backend: Arc<dyn RetrievalBackend>, pub external_retrieval_index: Arc<ExternalRetrievalRuntime> }
 
 #[derive(Clone)]
 pub(crate) struct RoutinesRuntimeConfig {
@@ -412,6 +413,7 @@ pub struct GatewayRuntimeState {
     worker_fleet: RwLock<WorkerFleetManager>,
     pub(crate) provider_leases: ProviderLeaseManager,
     pub(crate) retrieval_backend: Arc<dyn RetrievalBackend>,
+    pub(crate) external_retrieval_index: Arc<ExternalRetrievalRuntime>,
     pub(crate) tool_posture_registry: ToolPostureRegistry,
     pub(crate) routines_runtime: RwLock<Option<RoutinesRuntimeConfig>>,
     pub(crate) vault_rate_limit: Mutex<HashMap<String, VaultRateLimitEntry>>,
@@ -1045,7 +1047,7 @@ impl GatewayRuntimeState {
         let tool_posture_registry = ToolPostureRegistry::open(tool_posture_root.as_path())
             .expect("test tool posture registry should initialize");
         #[rustfmt::skip]
-        let dependencies = GatewayRuntimeDependencies { model_provider: default_provider, vault: default_vault, agent_registry, tool_posture_registry, retrieval_backend: Arc::new(crate::retrieval::JournalRetrievalBackend) };
+        let dependencies = GatewayRuntimeDependencies { model_provider: default_provider, vault: default_vault, agent_registry, tool_posture_registry, retrieval_backend: Arc::new(crate::retrieval::JournalRetrievalBackend), external_retrieval_index: Arc::new(crate::retrieval::ExternalRetrievalRuntime::default()) };
         Self::new_with_provider(
             config,
             journal_config,
@@ -1063,7 +1065,7 @@ impl GatewayRuntimeState {
         dependencies: GatewayRuntimeDependencies,
     ) -> Result<Arc<Self>, JournalError> {
         #[rustfmt::skip]
-        let GatewayRuntimeDependencies { model_provider, vault, agent_registry, tool_posture_registry, retrieval_backend } = dependencies;
+        let GatewayRuntimeDependencies { model_provider, vault, agent_registry, tool_posture_registry, retrieval_backend, external_retrieval_index } = dependencies;
         let build = build_metadata();
         let existing_events = journal_store.total_events()? as u64;
         let canvas_snapshots =
@@ -1206,6 +1208,7 @@ impl GatewayRuntimeState {
             worker_fleet: RwLock::new(WorkerFleetManager::default()),
             provider_leases: ProviderLeaseManager::default(),
             retrieval_backend,
+            external_retrieval_index,
             tool_posture_registry,
             routines_runtime: RwLock::new(None),
             vault_rate_limit: Mutex::new(HashMap::new()),
@@ -6686,6 +6689,55 @@ impl GatewayRuntimeState {
             self.clear_memory_search_cache();
         }
         Ok(outcome)
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn run_external_retrieval_indexer(
+        self: &Arc<Self>,
+        batch_size: usize,
+    ) -> Result<ExternalRetrievalIndexerOutcome, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state
+                .external_retrieval_index
+                .run_indexer(&state.journal_store, batch_size, 1, current_unix_ms())
+                .map_err(|error| map_memory_store_error("run external retrieval indexer", error))
+        })
+        .await
+        .map_err(|_| Status::internal("external retrieval indexer worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn external_retrieval_drift_report(
+        self: &Arc<Self>,
+    ) -> Result<ExternalRetrievalDriftReport, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state
+                .external_retrieval_index
+                .detect_drift(&state.journal_store, current_unix_ms())
+                .map_err(|error| map_memory_store_error("detect external retrieval drift", error))
+        })
+        .await
+        .map_err(|_| Status::internal("external retrieval drift worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn reconcile_external_retrieval_index(
+        self: &Arc<Self>,
+        batch_size: usize,
+    ) -> Result<ExternalRetrievalReconciliationOutcome, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state
+                .external_retrieval_index
+                .reconcile(&state.journal_store, batch_size, current_unix_ms())
+                .map_err(|error| {
+                    map_memory_store_error("reconcile external retrieval index", error)
+                })
+        })
+        .await
+        .map_err(|_| Status::internal("external retrieval reconciliation worker panicked"))?
     }
 
     #[allow(clippy::result_large_err)]

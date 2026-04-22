@@ -1964,6 +1964,20 @@ fn parse_memory_status_and_index() {
             }
         }
     );
+
+    let drift = Cli::parse_from(["palyra", "memory", "index-drift", "--json"]);
+    assert_eq!(
+        drift.command,
+        Command::Memory { command: MemoryCommand::IndexDrift { json: true } }
+    );
+
+    let reconcile = Cli::parse_from(["palyra", "memory", "index-reconcile", "--batch-size", "512"]);
+    assert_eq!(
+        reconcile.command,
+        Command::Memory {
+            command: MemoryCommand::IndexReconcile { batch_size: Some(512), json: false }
+        }
+    );
 }
 
 #[test]

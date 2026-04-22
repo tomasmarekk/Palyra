@@ -27,7 +27,7 @@ import {
 } from "../components/workspace/WorkspacePatterns";
 import { useUsageDomain } from "../hooks/useUsageDomain";
 import { parseRoutingExplanation, readProviderRegistrySummary } from "../providerRegistry";
-import { formatUnixMs, readNumber, readObject } from "../shared";
+import { formatUnixMs, readNumber, readObject, readString } from "../shared";
 import type { ConsoleAppState } from "../useConsoleAppState";
 
 type UsageSectionProps = {
@@ -46,6 +46,15 @@ export function UsageSection({ app }: UsageSectionProps) {
   const leaseManager = readObject(observability ?? {}, "lease_manager");
   const learning = readObject(app.memoryStatus ?? {}, "learning");
   const learningCounters = readObject(learning ?? {}, "counters");
+  const retrieval = readObject(app.memoryStatus ?? {}, "retrieval");
+  const retrievalBackend = readObject(retrieval ?? {}, "backend");
+  const externalIndex =
+    readObject(retrieval ?? {}, "external_index") ??
+    readObject(retrievalBackend ?? {}, "external_index");
+  const externalIndexSlos = readObject(externalIndex ?? {}, "scale_slos");
+  const externalIndexState = readString(externalIndex ?? {}, "state") ?? "unknown";
+  const externalIndexGate =
+    readString(externalIndexSlos ?? {}, "preview_gate_state") ?? "preview_blocked";
   const timelinePreview = useMemo(
     () => (usage.summary?.timeline ?? []).slice(-8).reverse(),
     [usage.summary?.timeline],
@@ -273,6 +282,16 @@ export function UsageSection({ app }: UsageSectionProps) {
               : "default"
           }
           value={readNumber(learningCounters ?? {}, "reflections_scheduled") ?? 0}
+        />
+        <WorkspaceMetricCard
+          detail={`Gate ${externalIndexGate}, freshness ${
+            readNumber(externalIndexSlos ?? {}, "freshness_lag_ms") ?? 0
+          } ms, fallback ${
+            readNumber(externalIndexSlos ?? {}, "degraded_fallback_rate_bps") ?? 0
+          } bps.`}
+          label="Retrieval index"
+          tone={workspaceToneForState(externalIndexState)}
+          value={externalIndexState}
         />
         <WorkspaceMetricCard
           detail={
