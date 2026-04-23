@@ -1072,25 +1072,30 @@ fn collect_doctor_connectivity_snapshot(
         }
     }
 
-    let admin_token = env::var("PALYRA_ADMIN_TOKEN")
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty());
-    if let (Some(client), Some(token)) = (http_client.as_ref(), admin_token) {
-        let principal = resolve_doctor_admin_principal();
-        match fetch_admin_status_payload(
-            client,
-            daemon_url.as_str(),
-            Some(token),
-            principal,
-            DEFAULT_DEVICE_ID.to_owned(),
-            None,
-            None,
-        ) {
-            Ok(mut payload) => {
-                redact_json_value_tree(&mut payload, None);
-                admin_probe.ok = true;
-                admin_payload = Some(payload);
+    if let Some(client) = http_client.as_ref() {
+        match resolve_doctor_admin_connection(daemon_url.as_str()) {
+            Ok(Some(connection)) => match fetch_admin_status_payload(
+                client,
+                connection.base_url.as_str(),
+                connection.token,
+                connection.principal,
+                connection.device_id,
+                Some(connection.channel),
+                Some(connection.trace_id).filter(|trace_id| !trace_id.trim().is_empty()),
+            ) {
+                Ok(mut payload) => {
+                    redact_json_value_tree(&mut payload, None);
+                    admin_probe.ok = true;
+                    admin_payload = Some(payload);
+                }
+                Err(error) => {
+                    let message = sanitize_diagnostic_error(error.to_string().as_str());
+                    admin_probe.message = Some(message.clone());
+                    admin_error = Some(message);
+                }
+            },
+            Ok(None) => {
+                admin_probe.message = Some("skipped (admin auth is not configured)".to_owned());
             }
             Err(error) => {
                 let message = sanitize_diagnostic_error(error.to_string().as_str());
@@ -1098,8 +1103,6 @@ fn collect_doctor_connectivity_snapshot(
                 admin_error = Some(message);
             }
         }
-    } else {
-        admin_probe.message = Some("skipped (PALYRA_ADMIN_TOKEN is not set)".to_owned());
     }
 
     (
@@ -1117,6 +1120,31 @@ fn collect_doctor_connectivity_snapshot(
         admin_payload,
         admin_error,
     )
+}
+
+fn resolve_doctor_admin_connection(daemon_url: &str) -> Result<Option<app::HttpConnection>> {
+    if let Some(context) = app::current_root_context() {
+        return context
+            .resolve_http_connection(app::ConnectionOverrides::default(), app::ConnectionDefaults::ADMIN)
+            .map(Some);
+    }
+
+    let token = env::var("PALYRA_ADMIN_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let Some(token) = token else {
+        return Ok(None);
+    };
+
+    Ok(Some(app::HttpConnection {
+        base_url: daemon_url.trim().to_owned(),
+        token: Some(token),
+        principal: resolve_doctor_admin_principal(),
+        device_id: DEFAULT_DEVICE_ID.to_owned(),
+        channel: DEFAULT_CHANNEL.to_owned(),
+        trace_id: String::new(),
+    }))
 }
 
 fn collect_doctor_provider_auth_snapshot(
