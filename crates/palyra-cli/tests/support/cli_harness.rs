@@ -1,3 +1,8 @@
+#![allow(dead_code)]
+
+// Shared integration-test helpers are compiled into each test binary, so some helpers are
+// intentionally unused in narrower binaries such as `logs_cli`.
+
 use std::{
     io::Write,
     path::{Path, PathBuf},
