@@ -715,7 +715,7 @@ fn build_backend(
         return Ok(Box::new(NonInteractiveWizardBackend::new(answers)));
     }
     ensure_interactive_terminal()?;
-    Ok(Box::new(InteractiveWizardBackend::new()))
+    Ok(Box::new(InteractiveWizardBackend::with_answers(answers)))
 }
 
 fn ensure_interactive_terminal() -> Result<()> {

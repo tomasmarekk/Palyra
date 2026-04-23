@@ -244,11 +244,13 @@ where
     }
 }
 
-pub(crate) struct InteractiveWizardBackend;
+pub(crate) struct InteractiveWizardBackend {
+    answers: BTreeMap<String, WizardValue>,
+}
 
 impl InteractiveWizardBackend {
-    pub(crate) fn new() -> Self {
-        Self
+    pub(crate) fn with_answers(answers: BTreeMap<String, WizardValue>) -> Self {
+        Self { answers }
     }
 
     fn print_step_header(step: &WizardStep) {
@@ -296,6 +298,11 @@ impl InteractiveWizardBackend {
 
 impl WizardBackend for InteractiveWizardBackend {
     fn execute_step(&mut self, step: &WizardStep) -> Result<WizardValue, WizardError> {
+        if !matches!(step.kind, StepKind::Note | StepKind::Progress | StepKind::Action) {
+            if let Some(value) = self.answers.remove(step.id) {
+                return Ok(value);
+            }
+        }
         Self::print_step_header(step);
         match step.kind {
             StepKind::Note | StepKind::Progress => Ok(WizardValue::None),
@@ -609,5 +616,25 @@ mod tests {
                 message: "non-interactive mode requires an explicit value".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn interactive_backend_consumes_prefilled_answers_before_prompting() {
+        let mut answers = BTreeMap::new();
+        answers.insert(
+            "workspace".to_owned(),
+            WizardValue::SensitiveText("sk-prefilled".to_owned()),
+        );
+        let mut backend = InteractiveWizardBackend::with_answers(answers);
+        let mut wizard = WizardSession::new(&mut backend);
+        let value = wizard
+            .text(text_step("workspace"), |value| {
+                if value.trim().is_empty() {
+                    return Err("workspace root cannot be empty".to_owned());
+                }
+                Ok(())
+            })
+            .expect("interactive backend should accept prefilled answer");
+        assert_eq!(value, "sk-prefilled");
     }
 }
