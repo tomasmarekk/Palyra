@@ -149,6 +149,13 @@ fn context_cell() -> &'static Mutex<Option<RootCommandContext>> {
     ROOT_CONTEXT.get_or_init(|| Mutex::new(None))
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) enum ExplicitConfigPathPolicy {
+    #[default]
+    RequireExisting,
+    AllowMissingForBootstrap,
+}
+
 #[cfg(test)]
 pub(crate) fn test_env_lock_for_tests() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -156,7 +163,14 @@ pub(crate) fn test_env_lock_for_tests() -> &'static Mutex<()> {
 }
 
 pub(crate) fn install_root_context(root: RootOptions) -> Result<RootCommandContext> {
-    let context = build_root_context(root)?;
+    install_root_context_with_policy(root, ExplicitConfigPathPolicy::RequireExisting)
+}
+
+pub(crate) fn install_root_context_with_policy(
+    root: RootOptions,
+    explicit_config_path_policy: ExplicitConfigPathPolicy,
+) -> Result<RootCommandContext> {
+    let context = build_root_context(root, explicit_config_path_policy)?;
     let mut guard =
         context_cell().lock().map_err(|_| anyhow::anyhow!("CLI root context lock poisoned"))?;
     *guard = Some(context.clone());
@@ -356,7 +370,10 @@ impl RootCommandContext {
     }
 }
 
-fn build_root_context(root: RootOptions) -> Result<RootCommandContext> {
+fn build_root_context(
+    root: RootOptions,
+    explicit_config_path_policy: ExplicitConfigPathPolicy,
+) -> Result<RootCommandContext> {
     let bootstrap_state_root = resolve_cli_state_root(root.state_root.as_deref())?;
     let profiles_path = resolve_profiles_path(&bootstrap_state_root)?;
     let profiles = load_profiles_document(profiles_path.as_deref())?;
@@ -364,7 +381,7 @@ fn build_root_context(root: RootOptions) -> Result<RootCommandContext> {
     let expected_profile_name = normalize_owned_text(root.expect_profile.clone());
     let profile = resolve_profile(profile_name.as_deref(), &profiles)?;
     let state_root = resolve_final_state_root(&root, profile.as_ref())?;
-    let config_path = resolve_config_path(&root, profile.as_ref())?;
+    let config_path = resolve_config_path(&root, profile.as_ref(), explicit_config_path_policy)?;
     let config_defaults = load_config_defaults(config_path.as_deref())?;
     validate_expected_profile(
         expected_profile_name.as_deref(),
@@ -705,11 +722,18 @@ fn resolve_final_state_root(
 fn resolve_config_path(
     root: &RootOptions,
     profile: Option<&CliConnectionProfile>,
+    explicit_config_path_policy: ExplicitConfigPathPolicy,
 ) -> Result<Option<PathBuf>> {
     if let Some(explicit) = normalize_optional_text(root.config_path.as_deref()) {
         let parsed = parse_config_path(explicit)
             .with_context(|| format!("config path is invalid: {explicit}"))?;
         if !parsed.exists() {
+            if matches!(
+                explicit_config_path_policy,
+                ExplicitConfigPathPolicy::AllowMissingForBootstrap
+            ) {
+                return Ok(Some(parsed));
+            }
             anyhow::bail!("config file does not exist: {}", parsed.display());
         }
         return Ok(Some(parsed));
@@ -743,6 +767,9 @@ fn load_config_defaults(config_path: Option<&Path>) -> Result<ConfigConnectionDe
     let Some(config_path) = config_path else {
         return Ok(ConfigConnectionDefaults::default());
     };
+    if !config_path.exists() {
+        return Ok(ConfigConnectionDefaults::default());
+    }
     let (document, _) = load_document_from_existing_path(config_path)
         .with_context(|| format!("failed to parse {}", config_path.display()))?;
 
@@ -832,8 +859,8 @@ fn read_normalized_env_var(name: &str) -> Option<String> {
 mod tests {
     use super::{
         build_active_profile_context, build_root_context, cli_profiles_registry_path, context_cell,
-        CliConnectionProfile, ConnectionDefaults, ConnectionOverrides, RootOptions,
-        CLI_PROFILES_PATH_ENV, CLI_PROFILES_RELATIVE_PATH, CLI_PROFILE_ENV,
+        CliConnectionProfile, ConnectionDefaults, ConnectionOverrides, ExplicitConfigPathPolicy,
+        RootOptions, CLI_PROFILES_PATH_ENV, CLI_PROFILES_RELATIVE_PATH, CLI_PROFILE_ENV,
     };
     use crate::args::{LogLevelArg, OutputFormatArg};
     use anyhow::Result;
@@ -883,19 +910,22 @@ channel = "profile"
         env::set_var(CLI_PROFILES_PATH_ENV, &profile_path);
         env::set_var("PALYRA_DAEMON_URL", "http://127.0.0.1:9999");
 
-        let context = build_root_context(RootOptions {
-            profile: Some("ops".to_owned()),
-            expect_profile: None,
-            config_path: None,
-            state_root: Some(state_root.display().to_string()),
-            verbose: 1,
-            log_level: LogLevelArg::Info,
-            output_format: OutputFormatArg::Json,
-            plain: false,
-            no_color: true,
-            allow_profile_mismatch: false,
-            allow_strict_profile_actions: false,
-        })?;
+        let context = build_root_context(
+            RootOptions {
+                profile: Some("ops".to_owned()),
+                expect_profile: None,
+                config_path: None,
+                state_root: Some(state_root.display().to_string()),
+                verbose: 1,
+                log_level: LogLevelArg::Info,
+                output_format: OutputFormatArg::Json,
+                plain: false,
+                no_color: true,
+                allow_profile_mismatch: false,
+                allow_strict_profile_actions: false,
+            },
+            ExplicitConfigPathPolicy::RequireExisting,
+        )?;
 
         let grpc = context.resolve_grpc_connection(
             ConnectionOverrides {
@@ -943,7 +973,8 @@ channel = "staging"
         )?;
         env::set_var(CLI_PROFILES_PATH_ENV, &profile_path);
 
-        let context = build_root_context(RootOptions::default())?;
+        let context =
+            build_root_context(RootOptions::default(), ExplicitConfigPathPolicy::RequireExisting)?;
         let http = context
             .resolve_http_connection(ConnectionOverrides::default(), ConnectionDefaults::ADMIN)?;
         let grpc = context
@@ -978,7 +1009,8 @@ admin_token_env = "PALYRA_PROFILE_ADMIN_TOKEN"
         env::set_var("PALYRA_PROFILE_ADMIN_TOKEN", "profile-env-token");
         env::set_var("PALYRA_ADMIN_TOKEN", "global-env-token");
 
-        let context = build_root_context(RootOptions::default())?;
+        let context =
+            build_root_context(RootOptions::default(), ExplicitConfigPathPolicy::RequireExisting)?;
         let http = context
             .resolve_http_connection(ConnectionOverrides::default(), ConnectionDefaults::ADMIN)?;
 
@@ -1011,19 +1043,22 @@ bound_principal = "admin:local"
 "#,
         )?;
 
-        let context = build_root_context(RootOptions {
-            profile: None,
-            expect_profile: None,
-            config_path: Some(config_path.display().to_string()),
-            state_root: Some(state_root.display().to_string()),
-            verbose: 0,
-            log_level: LogLevelArg::Info,
-            output_format: OutputFormatArg::Text,
-            plain: false,
-            no_color: true,
-            allow_profile_mismatch: false,
-            allow_strict_profile_actions: false,
-        })?;
+        let context = build_root_context(
+            RootOptions {
+                profile: None,
+                expect_profile: None,
+                config_path: Some(config_path.display().to_string()),
+                state_root: Some(state_root.display().to_string()),
+                verbose: 0,
+                log_level: LogLevelArg::Info,
+                output_format: OutputFormatArg::Text,
+                plain: false,
+                no_color: true,
+                allow_profile_mismatch: false,
+                allow_strict_profile_actions: false,
+            },
+            ExplicitConfigPathPolicy::RequireExisting,
+        )?;
 
         let grpc = context
             .resolve_grpc_connection(ConnectionOverrides::default(), ConnectionDefaults::USER)?;
@@ -1055,10 +1090,10 @@ daemon_url = "http://127.0.0.1:8200"
         .expect("profile registry should be written");
         env::set_var(CLI_PROFILES_PATH_ENV, &profile_path);
 
-        let error = build_root_context(RootOptions {
-            expect_profile: Some("prod".to_owned()),
-            ..RootOptions::default()
-        })
+        let error = build_root_context(
+            RootOptions { expect_profile: Some("prod".to_owned()), ..RootOptions::default() },
+            ExplicitConfigPathPolicy::RequireExisting,
+        )
         .expect_err("profile mismatch should fail closed");
 
         assert!(
@@ -1073,16 +1108,38 @@ daemon_url = "http://127.0.0.1:8200"
         clear_env();
         let temp = tempdir()?;
         let state_root = temp.path().join("portable-state");
-        let context = build_root_context(RootOptions {
-            state_root: Some(state_root.display().to_string()),
-            ..RootOptions::default()
-        })?;
+        let context = build_root_context(
+            RootOptions {
+                state_root: Some(state_root.display().to_string()),
+                ..RootOptions::default()
+            },
+            ExplicitConfigPathPolicy::RequireExisting,
+        )?;
         let mut guard = context_cell().lock().expect("context lock");
         *guard = Some(context);
         drop(guard);
 
         let registry_path = cli_profiles_registry_path()?;
         assert_eq!(registry_path, state_root.join(CLI_PROFILES_RELATIVE_PATH));
+        Ok(())
+    }
+
+    #[test]
+    fn bootstrap_policy_accepts_missing_explicit_config_path() -> Result<()> {
+        let _guard = super::test_env_lock_for_tests().lock().expect("env lock");
+        clear_env();
+        let temp = tempdir()?;
+        let missing_config_path = temp.path().join("config").join("palyra.toml");
+
+        let context = build_root_context(
+            RootOptions {
+                config_path: Some(missing_config_path.display().to_string()),
+                ..RootOptions::default()
+            },
+            ExplicitConfigPathPolicy::AllowMissingForBootstrap,
+        )?;
+
+        assert_eq!(context.config_path(), Some(missing_config_path.as_path()));
         Ok(())
     }
 

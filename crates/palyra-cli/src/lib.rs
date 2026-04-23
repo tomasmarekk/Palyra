@@ -239,7 +239,12 @@ fn run_cli() -> Result<()> {
         }
         Err(error) => return Err(error.into()),
     };
-    let _root_context = app::install_root_context(cli.root.clone())?;
+    let _root_context = match root_context_config_path_policy(&cli.command) {
+        app::ExplicitConfigPathPolicy::RequireExisting => {
+            app::install_root_context(cli.root.clone())?
+        }
+        policy => app::install_root_context_with_policy(cli.root.clone(), policy)?,
+    };
     enforce_profile_guardrails(&cli.command)?;
     match cli.command {
         CliCommand::Version => print_version(),
@@ -406,6 +411,16 @@ fn enforce_profile_guardrails(command: &CliCommand) -> Result<()> {
         profile.environment,
         profile.risk_level
     );
+}
+
+fn root_context_config_path_policy(command: &CliCommand) -> app::ExplicitConfigPathPolicy {
+    match command {
+        CliCommand::Setup { .. }
+        | CliCommand::Onboarding { command: OnboardingCommand::Wizard { .. } } => {
+            app::ExplicitConfigPathPolicy::AllowMissingForBootstrap
+        }
+        _ => app::ExplicitConfigPathPolicy::RequireExisting,
+    }
 }
 
 fn is_strict_profile_blocked_command(command: &CliCommand) -> bool {

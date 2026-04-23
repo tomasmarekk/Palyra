@@ -186,6 +186,51 @@ fn setup_wizard_quickstart_emits_json_summary() -> Result<()> {
 }
 
 #[test]
+fn setup_wizard_bootstraps_missing_global_config_path() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let config_path = workdir.path().join("global-config").join("palyra.toml");
+    let config_path_string = config_path.to_string_lossy().into_owned();
+    let output = run_cli(
+        &workdir,
+        &[
+            "--config",
+            &config_path_string,
+            "setup",
+            "--wizard",
+            "--mode",
+            "local",
+            "--force",
+            "--flow",
+            "quickstart",
+            "--non-interactive",
+            "--accept-risk",
+            "--auth-method",
+            "api-key",
+            "--api-key-env",
+            "OPENAI_API_KEY",
+            "--skip-health",
+            "--skip-channels",
+            "--skip-skills",
+            "--json",
+        ],
+        &[("OPENAI_API_KEY", "sk-test-bootstrap-config")],
+    )?;
+    assert!(
+        output.status.success(),
+        "setup wizard should accept a missing global --config bootstrap target: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: Value =
+        serde_json::from_slice(&output.stdout).context("setup wizard stdout should be JSON")?;
+    assert_eq!(
+        payload.get("config_path").and_then(Value::as_str),
+        Some(config_path_string.as_str())
+    );
+    assert!(config_path.exists(), "setup wizard should create global config path");
+    Ok(())
+}
+
+#[test]
 fn setup_wizard_quickstart_supports_anthropic_api_key() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let config_path = workdir.path().join("config").join("palyra.toml");
