@@ -29,36 +29,68 @@ $workspaceRoot =
 
 $artifactsRoot = Join-Path $workspaceRoot "artifacts"
 $desktopPackageOutput = Join-Path $artifactsRoot "desktop"
+$cargoTargetRoot = Join-Path $artifactsRoot "cargo-target"
 $installRoot = Join-Path $workspaceRoot "install"
 $stateRoot = Join-Path $workspaceRoot "state"
 $cliCommandRoot = Join-Path $workspaceRoot "cli-bin"
+$desktopExecutable = Resolve-ExecutableName -BaseName "palyra-desktop-control-center"
+$daemonExecutable = Resolve-ExecutableName -BaseName "palyrad"
+$browserExecutable = Resolve-ExecutableName -BaseName "palyra-browserd"
+$cliExecutable = Resolve-ExecutableName -BaseName "palyra"
 
 New-Item -ItemType Directory -Path $workspaceRoot -Force | Out-Null
 
 if (-not $SkipBuild) {
     Push-Location $repoRoot
+    $previousCargoTargetDir = $env:CARGO_TARGET_DIR
     try {
+        New-Item -ItemType Directory -Path $cargoTargetRoot -Force | Out-Null
+        $env:CARGO_TARGET_DIR = $cargoTargetRoot
         & (Join-Path $repoRoot "scripts/test/ensure-desktop-ui.ps1")
         & (Join-Path $repoRoot "scripts/test/ensure-web-ui.ps1")
         cargo build -p palyra-daemon -p palyra-browserd -p palyra-cli --release --locked
         cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml --release --locked
     }
     finally {
+        if ($null -eq $previousCargoTargetDir) {
+            Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue
+        } else {
+            $env:CARGO_TARGET_DIR = $previousCargoTargetDir
+        }
         Pop-Location
     }
 }
 
 $version = & (Join-Path $repoRoot "scripts/release/assert-version-coherence.ps1")
 $platform = Get-PlatformSlug
+$isolatedDesktopBinary = Join-Path $cargoTargetRoot ("release/" + $desktopExecutable)
+$isolatedDaemonBinary = Join-Path $cargoTargetRoot ("release/" + $daemonExecutable)
+$isolatedBrowserBinary = Join-Path $cargoTargetRoot ("release/" + $browserExecutable)
+$isolatedCliBinary = Join-Path $cargoTargetRoot ("release/" + $cliExecutable)
 $desktopBinary =
-    Join-Path $repoRoot (
-        "apps/desktop/src-tauri/target/release/" +
-        (Resolve-ExecutableName -BaseName "palyra-desktop-control-center")
-    )
-$daemonBinary = Join-Path $repoRoot ("target/release/" + (Resolve-ExecutableName -BaseName "palyrad"))
+    if (Test-Path -LiteralPath $isolatedDesktopBinary -PathType Leaf) {
+        $isolatedDesktopBinary
+    } else {
+        Join-Path $repoRoot ("apps/desktop/src-tauri/target/release/" + $desktopExecutable)
+    }
+$daemonBinary =
+    if (Test-Path -LiteralPath $isolatedDaemonBinary -PathType Leaf) {
+        $isolatedDaemonBinary
+    } else {
+        Join-Path $repoRoot ("target/release/" + $daemonExecutable)
+    }
 $browserBinary =
-    Join-Path $repoRoot ("target/release/" + (Resolve-ExecutableName -BaseName "palyra-browserd"))
-$cliBinary = Join-Path $repoRoot ("target/release/" + (Resolve-ExecutableName -BaseName "palyra"))
+    if (Test-Path -LiteralPath $isolatedBrowserBinary -PathType Leaf) {
+        $isolatedBrowserBinary
+    } else {
+        Join-Path $repoRoot ("target/release/" + $browserExecutable)
+    }
+$cliBinary =
+    if (Test-Path -LiteralPath $isolatedCliBinary -PathType Leaf) {
+        $isolatedCliBinary
+    } else {
+        Join-Path $repoRoot ("target/release/" + $cliExecutable)
+    }
 $webDist = Join-Path $repoRoot "apps/web/dist"
 
 $packageOutput = & (Join-Path $repoRoot "scripts/release/package-portable.ps1") `
@@ -104,10 +136,6 @@ if ([string]::IsNullOrWhiteSpace($resolvedCliCommandRoot)) {
 }
 
 $launcherPath = Join-Path $resolvedInstallRoot "Launch-Palyra-Test.ps1"
-$desktopExecutable = Resolve-ExecutableName -BaseName "palyra-desktop-control-center"
-$daemonExecutable = Resolve-ExecutableName -BaseName "palyrad"
-$browserExecutable = Resolve-ExecutableName -BaseName "palyra-browserd"
-$cliExecutable = Resolve-ExecutableName -BaseName "palyra"
 
 $launcherBody =
 @"
