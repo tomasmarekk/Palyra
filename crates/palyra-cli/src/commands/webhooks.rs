@@ -136,8 +136,12 @@ fn emit_webhook_list(
     envelope: &control_plane::WebhookIntegrationListEnvelope,
     json: bool,
 ) -> Result<()> {
-    if json {
+    if output::preferred_json(json) {
         return output::print_json_pretty(envelope, "failed to encode webhook list output as JSON");
+    }
+    if output::preferred_ndjson(json, false) {
+        output::print_json_line(envelope, "failed to encode webhook list output as NDJSON")?;
+        return std::io::stdout().flush().context("stdout flush failed");
     }
     println!("webhooks.list count={}", envelope.integrations.len());
     for integration in &envelope.integrations {
@@ -158,8 +162,12 @@ fn emit_webhook_envelope(
     envelope: &control_plane::WebhookIntegrationEnvelope,
     json: bool,
 ) -> Result<()> {
-    if json {
+    if output::preferred_json(json) {
         return output::print_json_pretty(envelope, "failed to encode webhook output as JSON");
+    }
+    if output::preferred_ndjson(json, false) {
+        output::print_json_line(envelope, "failed to encode webhook output as NDJSON")?;
+        return std::io::stdout().flush().context("stdout flush failed");
     }
     let integration = &envelope.integration;
     println!(

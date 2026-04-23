@@ -165,10 +165,15 @@ async fn run_plugins_async(command: PluginsCommand) -> Result<()> {
         }
         PluginsCommand::Remove { plugin_id, json } => {
             let envelope = context.client.delete_plugin(plugin_id.as_str()).await?;
-            if json {
+            if output::preferred_json(json) {
                 output::print_json_pretty(
                     &envelope,
                     "failed to encode plugin delete output as JSON",
+                )?;
+            } else if output::preferred_ndjson(json, false) {
+                output::print_json_line(
+                    &envelope,
+                    "failed to encode plugin delete output as NDJSON",
                 )?;
             } else {
                 println!(
@@ -199,8 +204,12 @@ fn emit_plugin_list(
         envelope.entries.retain(|entry| json_bool(entry.check.as_object(), "ready"));
     }
 
-    if json {
+    if output::preferred_json(json) {
         return output::print_json_pretty(&envelope, "failed to encode plugin list as JSON");
+    }
+    if output::preferred_ndjson(json, false) {
+        output::print_json_line(&envelope, "failed to encode plugin list as NDJSON")?;
+        return std::io::stdout().flush().context("stdout flush failed");
     }
 
     println!(
@@ -259,8 +268,12 @@ fn emit_plugin_envelope(
     envelope: &control_plane::PluginBindingEnvelope,
     json: bool,
 ) -> Result<()> {
-    if json {
+    if output::preferred_json(json) {
         return output::print_json_pretty(envelope, "failed to encode plugin output as JSON");
+    }
+    if output::preferred_ndjson(json, false) {
+        output::print_json_line(envelope, "failed to encode plugin output as NDJSON")?;
+        return std::io::stdout().flush().context("stdout flush failed");
     }
 
     println!(
@@ -309,11 +322,15 @@ fn emit_plugin_envelope(
 }
 
 fn emit_plugin_explain(envelope: &control_plane::PluginBindingEnvelope, json: bool) -> Result<()> {
-    if json {
+    if output::preferred_json(json) {
         return output::print_json_pretty(
             envelope,
             "failed to encode plugin explain output as JSON",
         );
+    }
+    if output::preferred_ndjson(json, false) {
+        output::print_json_line(envelope, "failed to encode plugin explain output as NDJSON")?;
+        return std::io::stdout().flush().context("stdout flush failed");
     }
     println!(
         "plugins.explain plugin_id={} schema_version={} ready={} discovery={} config={} skill_id={} version={}",
@@ -389,11 +406,15 @@ fn emit_plugin_doctor(
         "unhealthy": unhealthy,
         "plugins": plugin_reports,
     });
-    if json {
+    if output::preferred_json(json) {
         return output::print_json_pretty(
             &summary,
             "failed to encode plugin doctor output as JSON",
         );
+    }
+    if output::preferred_ndjson(json, false) {
+        output::print_json_line(&summary, "failed to encode plugin doctor output as NDJSON")?;
+        return std::io::stdout().flush().context("stdout flush failed");
     }
     println!(
         "plugins.doctor schema_version={} root={} total={} ready={} unhealthy={}",

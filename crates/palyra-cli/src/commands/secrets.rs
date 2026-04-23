@@ -116,6 +116,47 @@ pub(crate) fn run_secrets(command: SecretsCommand) -> Result<()> {
                 })
                 .collect::<Vec<_>>();
             let entry_count = listed_entries.len();
+            if output::preferred_json(false) {
+                return output::print_json_pretty(
+                    &json!({
+                        "scope": scope.to_string(),
+                        "count": entry_count,
+                        "backend": vault.backend_kind().as_str(),
+                        "entries": listed_entries.iter().map(
+                            |(key, created_at_unix_ms, updated_at_unix_ms, value_bytes)| {
+                                json!({
+                                    "key": key,
+                                    "created_at_unix_ms": created_at_unix_ms,
+                                    "updated_at_unix_ms": updated_at_unix_ms,
+                                    "value_bytes": value_bytes,
+                                })
+                            }
+                        ).collect::<Vec<_>>(),
+                    }),
+                    "failed to encode secrets list output as JSON",
+                );
+            }
+            if output::preferred_ndjson(false, false) {
+                output::print_json_line(
+                    &json!({
+                        "scope": scope.to_string(),
+                        "count": entry_count,
+                        "backend": vault.backend_kind().as_str(),
+                        "entries": listed_entries.iter().map(
+                            |(key, created_at_unix_ms, updated_at_unix_ms, value_bytes)| {
+                                json!({
+                                    "key": key,
+                                    "created_at_unix_ms": created_at_unix_ms,
+                                    "updated_at_unix_ms": updated_at_unix_ms,
+                                    "value_bytes": value_bytes,
+                                })
+                            }
+                        ).collect::<Vec<_>>(),
+                    }),
+                    "failed to encode secrets list output as NDJSON",
+                )?;
+                return std::io::stdout().flush().context("stdout flush failed");
+            }
             println!(
                 "secrets.list scope={} count={} backend={}",
                 scope,

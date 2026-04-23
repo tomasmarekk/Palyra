@@ -695,7 +695,11 @@ fn run_skills_list(
         entries.retain(|entry| entry.eligibility.eligible);
     }
 
-    skills_output::emit_inventory_list(skills_root.as_path(), entries.as_slice(), json_output)?;
+    skills_output::emit_inventory_list(
+        skills_root.as_path(),
+        entries.as_slice(),
+        output::preferred_json(json_output),
+    )?;
     std::io::stdout().flush().context("stdout flush failed")
 }
 

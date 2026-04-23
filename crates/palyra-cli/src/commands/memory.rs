@@ -79,7 +79,7 @@ pub(crate) async fn run_memory_async(
                 .await
                 .context("failed to call memory SearchMemory")?
                 .into_inner();
-            if json {
+            if output::preferred_json(json) {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&json!({
@@ -87,6 +87,17 @@ pub(crate) async fn run_memory_async(
                     }))
                     .context("failed to serialize JSON output")?
                 );
+            } else if output::preferred_ndjson(json, false) {
+                output::print_json_line(
+                    &json!({
+                        "hits": response
+                            .hits
+                            .iter()
+                            .map(memory_search_hit_to_json)
+                            .collect::<Vec<_>>(),
+                    }),
+                    "failed to encode memory search output as NDJSON",
+                )?;
             } else {
                 println!("memory.search hits={}", response.hits.len());
                 for hit in response.hits {

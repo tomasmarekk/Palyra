@@ -164,6 +164,20 @@ pub(crate) fn run_daemon(command: DaemonCommand) -> Result<()> {
                 Some(connection.trace_id),
             )?;
 
+            if output::preferred_json(false) {
+                return output::print_json_pretty(
+                    &response,
+                    "failed to encode admin status output as JSON",
+                );
+            }
+            if output::preferred_ndjson(false, false) {
+                output::print_json_line(
+                    &response,
+                    "failed to encode admin status output as NDJSON",
+                )?;
+                return std::io::stdout().flush().context("stdout flush failed");
+            }
+
             println!(
                 "admin.status={} service={} grpc={}:{} quic_enabled={} denied_requests={} journal_events={}",
                 response.status,

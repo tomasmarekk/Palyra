@@ -8124,7 +8124,7 @@ struct SupportBundleJournalErrorRecord {
     message: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct AdminStatusResponse {
     service: String,
     status: String,
@@ -8132,14 +8132,14 @@ struct AdminStatusResponse {
     counters: AdminCountersSnapshot,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct AdminTransportSnapshot {
     grpc_bind_addr: String,
     grpc_port: u16,
     quic_enabled: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct AdminCountersSnapshot {
     denied_requests: u64,
     journal_events: u64,

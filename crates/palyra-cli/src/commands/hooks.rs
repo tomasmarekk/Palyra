@@ -64,10 +64,15 @@ async fn run_hooks_async(command: HooksCommand) -> Result<()> {
         }
         HooksCommand::Remove { hook_id, json } => {
             let envelope = context.client.delete_hook(hook_id.as_str()).await?;
-            if json {
+            if output::preferred_json(json) {
                 output::print_json_pretty(
                     &envelope,
                     "failed to encode hook delete output as JSON",
+                )?;
+            } else if output::preferred_ndjson(json, false) {
+                output::print_json_line(
+                    &envelope,
+                    "failed to encode hook delete output as NDJSON",
                 )?;
             } else {
                 println!(
@@ -97,8 +102,12 @@ fn emit_hook_list(
         envelope.entries.retain(|entry| json_bool(entry.check.as_object(), "ready"));
     }
 
-    if json {
+    if output::preferred_json(json) {
         return output::print_json_pretty(&envelope, "failed to encode hook list as JSON");
+    }
+    if output::preferred_ndjson(json, false) {
+        output::print_json_line(&envelope, "failed to encode hook list as NDJSON")?;
+        return std::io::stdout().flush().context("stdout flush failed");
     }
 
     println!("hooks.list root={} count={}", envelope.hooks_root, envelope.entries.len());
@@ -129,8 +138,12 @@ fn emit_hook_envelope(
     envelope: &control_plane::HookBindingEnvelope,
     json: bool,
 ) -> Result<()> {
-    if json {
+    if output::preferred_json(json) {
         return output::print_json_pretty(envelope, "failed to encode hook output as JSON");
+    }
+    if output::preferred_ndjson(json, false) {
+        output::print_json_line(envelope, "failed to encode hook output as NDJSON")?;
+        return std::io::stdout().flush().context("stdout flush failed");
     }
 
     println!(

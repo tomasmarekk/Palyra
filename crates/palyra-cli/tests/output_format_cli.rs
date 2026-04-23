@@ -89,6 +89,31 @@ fn global_output_format_json_is_honored_for_core_cli_surfaces() -> Result<()> {
     )?;
     assert!(docs_search.is_array(), "docs search should emit a JSON array: {docs_search}");
 
+    let secrets_list = parse_stdout_json(
+        run_cli(&workdir, &["--output-format", "json", "secrets", "list", "global"])?,
+        "secrets list --output-format json",
+    )?;
+    assert_eq!(secrets_list.get("scope").and_then(Value::as_str), Some("global"));
+    assert!(secrets_list.get("entries").and_then(Value::as_array).is_some());
+
+    let policy_explain = parse_stdout_json(
+        run_cli(&workdir, &["--output-format", "json", "policy", "explain"])?,
+        "policy explain --output-format json",
+    )?;
+    assert_eq!(policy_explain.get("decision").and_then(Value::as_str), Some("deny_by_default"));
+
+    let protocol_version = parse_stdout_json(
+        run_cli(&workdir, &["--output-format", "json", "protocol", "version"])?,
+        "protocol version --output-format json",
+    )?;
+    assert_eq!(protocol_version.get("protocol_major").and_then(Value::as_u64), Some(1));
+
+    let skills_list = parse_stdout_json(
+        run_cli(&workdir, &["--output-format", "json", "skills", "list"])?,
+        "skills list --output-format json",
+    )?;
+    assert_eq!(skills_list.get("count").and_then(Value::as_u64), Some(0));
+
     let support_bundle = parse_stdout_json(
         run_cli(
             &workdir,
