@@ -710,6 +710,10 @@ fn resolve_final_state_root(
         return parse_config_path(explicit)
             .with_context(|| format!("state root path is invalid: {explicit}"));
     }
+    if let Some(raw) = normalize_optional_text(env::var("PALYRA_STATE_ROOT").ok().as_deref()) {
+        return parse_config_path(raw)
+            .with_context(|| "PALYRA_STATE_ROOT contains an invalid path");
+    }
     if let Some(profile_state_root) =
         profile.and_then(|profile| normalize_optional_text(profile.state_root.as_deref()))
     {
@@ -739,6 +743,16 @@ fn resolve_config_path(
         return Ok(Some(parsed));
     }
 
+    if let Ok(raw) = env::var("PALYRA_CONFIG") {
+        if let Some(raw) = normalize_optional_text(Some(raw.as_str())) {
+            let parsed =
+                parse_config_path(raw).with_context(|| "PALYRA_CONFIG contains an invalid path")?;
+            if parsed.exists() {
+                return Ok(Some(parsed));
+            }
+        }
+    }
+
     if let Some(profile_path) =
         profile.and_then(|profile| normalize_optional_text(profile.config_path.as_deref()))
     {
@@ -748,16 +762,6 @@ fn resolve_config_path(
             anyhow::bail!("profile config file does not exist: {}", parsed.display());
         }
         return Ok(Some(parsed));
-    }
-
-    if let Ok(raw) = env::var("PALYRA_CONFIG") {
-        if let Some(raw) = normalize_optional_text(Some(raw.as_str())) {
-            let parsed =
-                parse_config_path(raw).with_context(|| "PALYRA_CONFIG contains an invalid path")?;
-            if parsed.exists() {
-                return Ok(Some(parsed));
-            }
-        }
     }
 
     Ok(default_config_search_paths().into_iter().find(|candidate| candidate.exists()))
@@ -987,6 +991,86 @@ channel = "staging"
         assert_eq!(http.principal, "admin:staging");
         assert_eq!(grpc.device_id, "01ARZ3NDEKTSV4RRFFQ69G5FB2");
         assert_eq!(grpc.channel, "staging");
+        Ok(())
+    }
+
+    #[test]
+    fn env_config_path_overrides_default_profile_config_path() -> Result<()> {
+        let _guard = super::test_env_lock_for_tests().lock().expect("env lock");
+        clear_env();
+        let temp = tempdir()?;
+        let profile_path = temp.path().join("profiles.toml");
+        let profile_config = temp.path().join("profile").join("palyra.toml");
+        let env_config = temp.path().join("installed").join("palyra.toml");
+        let profile_config_literal = profile_config.display().to_string().replace('\\', "\\\\");
+        fs::create_dir_all(profile_config.parent().expect("profile config parent"))?;
+        fs::create_dir_all(env_config.parent().expect("env config parent"))?;
+        fs::write(&profile_path, format!(
+            r#"
+version = 1
+default_profile = "installed"
+[profiles.installed]
+config_path = "{}"
+"#,
+            profile_config_literal
+        ))?;
+        fs::write(
+            &profile_config,
+            r#"
+[daemon]
+bind_addr = "127.0.0.1"
+port = 8110
+"#,
+        )?;
+        fs::write(
+            &env_config,
+            r#"
+[daemon]
+bind_addr = "127.0.0.1"
+port = 9222
+"#,
+        )?;
+        env::set_var(CLI_PROFILES_PATH_ENV, &profile_path);
+        env::set_var("PALYRA_CONFIG", &env_config);
+
+        let context =
+            build_root_context(RootOptions::default(), ExplicitConfigPathPolicy::RequireExisting)?;
+
+        assert_eq!(context.config_path(), Some(env_config.as_path()));
+        let http = context
+            .resolve_http_connection(ConnectionOverrides::default(), ConnectionDefaults::ADMIN)?;
+        assert_eq!(http.base_url, "http://127.0.0.1:9222");
+        Ok(())
+    }
+
+    #[test]
+    fn env_state_root_overrides_default_profile_state_root() -> Result<()> {
+        let _guard = super::test_env_lock_for_tests().lock().expect("env lock");
+        clear_env();
+        let temp = tempdir()?;
+        let profile_path = temp.path().join("profiles.toml");
+        let profile_state_root = temp.path().join("profile-state");
+        let env_state_root = temp.path().join("installed-state");
+        let profile_state_root_literal =
+            profile_state_root.display().to_string().replace('\\', "\\\\");
+        fs::create_dir_all(&profile_state_root)?;
+        fs::create_dir_all(&env_state_root)?;
+        fs::write(&profile_path, format!(
+            r#"
+version = 1
+default_profile = "installed"
+[profiles.installed]
+state_root = "{}"
+"#,
+            profile_state_root_literal
+        ))?;
+        env::set_var(CLI_PROFILES_PATH_ENV, &profile_path);
+        env::set_var("PALYRA_STATE_ROOT", &env_state_root);
+
+        let context =
+            build_root_context(RootOptions::default(), ExplicitConfigPathPolicy::RequireExisting)?;
+
+        assert_eq!(context.state_root(), env_state_root.as_path());
         Ok(())
     }
 
