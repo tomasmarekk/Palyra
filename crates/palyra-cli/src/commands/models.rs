@@ -1530,13 +1530,13 @@ fn probe_provider(
                 payload.state = if discover {
                     "discovery_unsupported".to_owned()
                 } else {
-                    "verification_incomplete".to_owned()
+                    "ok".to_owned()
                 };
                 payload.message = if discover {
                     "provider returned HTTP 404 for model discovery; using configured model registry for reference only"
                         .to_owned()
                 } else {
-                    "provider returned HTTP 404 for model discovery; using configured model registry for reference only and not verifying model usability"
+                    "provider connection succeeded, but live model discovery is unsupported (HTTP 404); showing configured model registry for reference only. This confirms endpoint and credentials, not model usability."
                         .to_owned()
                 };
             } else {

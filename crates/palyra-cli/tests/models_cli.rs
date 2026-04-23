@@ -524,7 +524,7 @@ enabled = true
         .pointer("/providers/0")
         .context("test-connection output should include the provider")?;
 
-    assert_eq!(provider.get("state").and_then(Value::as_str), Some("verification_incomplete"));
+    assert_eq!(provider.get("state").and_then(Value::as_str), Some("ok"));
     assert_eq!(provider.get("live_discovery_verified").and_then(Value::as_bool), Some(false));
     assert_eq!(provider.get("discovery_source").and_then(Value::as_str), Some("registry_fallback"));
     assert_eq!(
@@ -543,8 +543,11 @@ enabled = true
         provider
             .get("message")
             .and_then(Value::as_str)
-            .is_some_and(|message| message.contains("not verifying model usability")),
-        "fallback message should call out the incomplete verification: {payload}"
+            .is_some_and(|message| {
+                message.contains("confirms endpoint and credentials")
+                    && message.contains("not model usability")
+            }),
+        "fallback message should clarify the connection-only verification scope: {payload}"
     );
     server.finish()?;
     Ok(())
