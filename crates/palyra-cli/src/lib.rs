@@ -3455,14 +3455,14 @@ fn execute_agent_stream(
     connection: AgentConnection,
     request: AgentRunInput,
     ndjson: bool,
-) -> Result<()> {
+) -> Result<AgentStreamOutcome> {
     let ndjson = output::preferred_ndjson(false, ndjson);
     let json_output = !ndjson && output::preferred_json(false);
     let runtime = build_runtime()?;
     runtime
         .block_on(async {
             let mut client = client::runtime::GatewayRuntimeClient::connect(connection).await?;
-            if json_output {
+            let outcome = if json_output {
                 let mut events = Vec::new();
                 let outcome = stream_agent_events_async(&mut client, request, |event| {
                     events.push(agent_event_json_value(event));
@@ -3474,6 +3474,7 @@ fn execute_agent_stream(
                     "failed to encode agent stream as JSON",
                 )?;
                 outcome.ensure_success()?;
+                outcome
             } else {
                 let outcome = stream_agent_events_async(&mut client, request, |event| {
                     if ndjson {
@@ -3484,8 +3485,9 @@ fn execute_agent_stream(
                 })
                 .await?;
                 outcome.ensure_success()?;
-            }
-            Result::<()>::Ok(())
+                outcome
+            };
+            Result::<AgentStreamOutcome>::Ok(outcome)
         })
         .context("agent stream execution failed")
 }
@@ -3516,6 +3518,7 @@ where
     let mut stream = client.open_run_stream(build_resolved_run_stream_request(&resolved)?).await?;
     let mut request_stream_closed = false;
     let mut failed_message = None::<String>;
+    let mut completed = false;
     while let Some(event) = stream.next_event().await? {
         let reached_terminal_status = matches!(
             event.body.as_ref(),
@@ -3525,6 +3528,8 @@ where
         if let Some(common_v1::run_stream_event::Body::Status(status)) = event.body.as_ref() {
             if status.kind == common_v1::stream_status::StatusKind::Failed as i32 {
                 failed_message = Some(sanitize_agent_failure_message(status.message.as_str()));
+            } else if status.kind == common_v1::stream_status::StatusKind::Done as i32 {
+                completed = true;
             }
         }
         if !request_stream_closed && run_stream_can_close_request_side(&event) {
@@ -3556,7 +3561,7 @@ where
             break;
         }
     }
-    Ok(AgentStreamOutcome { failed_message })
+    Ok(AgentStreamOutcome { completed, failed_message })
 }
 
 fn run_acp_shim_from_stdin(
@@ -4061,6 +4066,7 @@ mod agent_stream_output_tests {
     #[test]
     fn failed_stream_outcome_is_command_error() {
         let outcome = AgentStreamOutcome {
+            completed: false,
             failed_message: Some(
                 "model_provider_missing_auth: provider has no credential".to_owned(),
             ),
@@ -4338,10 +4344,15 @@ struct ResolvedAgentRunInput {
 }
 
 struct AgentStreamOutcome {
+    completed: bool,
     failed_message: Option<String>,
 }
 
 impl AgentStreamOutcome {
+    fn completed(&self) -> bool {
+        self.completed
+    }
+
     fn ensure_success(&self) -> Result<()> {
         if let Some(message) = self.failed_message.as_ref() {
             anyhow::bail!("agent run failed: {message}");

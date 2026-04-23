@@ -70,7 +70,16 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<()> {
                 origin_run_id: None,
                 parameter_delta_json: None,
             })?;
-            execute_agent_stream(connection, request, output::preferred_ndjson(false, ndjson))
+            let run_id = request.run_id.clone();
+            let outcome =
+                execute_agent_stream(connection, request, output::preferred_ndjson(false, ndjson))?;
+            if outcome.completed() && root_context.config_path().is_some() {
+                commands::onboarding::record_cli_first_success(
+                    root_context.state_root(),
+                    run_id.as_str(),
+                )?;
+            }
+            Ok(())
         }
         AgentCommand::Interactive {
             grpc_url,
@@ -97,8 +106,13 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<()> {
                 app::ConnectionDefaults::USER,
             )?;
             let runtime = build_runtime()?;
+            let onboarding_state_root = root_context
+                .config_path()
+                .is_some()
+                .then(|| root_context.state_root().to_path_buf());
             runtime.block_on(run_agent_interactive_async(
                 connection,
+                onboarding_state_root,
                 session_id,
                 session_key,
                 session_label,
@@ -114,6 +128,7 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<()> {
 
 async fn run_agent_interactive_async(
     connection: AgentConnection,
+    onboarding_state_root: Option<std::path::PathBuf>,
     session_id: Option<String>,
     session_key: Option<String>,
     session_label: Option<String>,
@@ -232,7 +247,11 @@ async fn run_agent_interactive_async(
             parameter_delta_json: None,
         })?;
         last_run_id = Some(request.run_id.clone());
-        execute_agent_stream(connection.clone(), request, ndjson)?;
+        let run_id = request.run_id.clone();
+        let outcome = execute_agent_stream(connection.clone(), request, ndjson)?;
+        if let Some(state_root) = onboarding_state_root.as_ref().filter(|_| outcome.completed()) {
+            commands::onboarding::record_cli_first_success(state_root.as_path(), run_id.as_str())?;
+        }
     }
     Ok(())
 }

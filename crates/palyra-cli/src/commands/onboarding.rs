@@ -1,8 +1,14 @@
-use std::path::Path;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use palyra_control_plane as control_plane;
+use serde_json::{json, Value};
 
 use crate::*;
+
+const CLI_FIRST_SUCCESS_MARKER_RELATIVE_PATH: &str = "onboarding/first-success.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OnboardingVariant {
@@ -51,6 +57,7 @@ struct OnboardingSignals {
     provider_health_message: String,
     model_discovery_ready: bool,
     model_discovery_message: String,
+    first_success_completed: bool,
 }
 
 #[derive(Debug)]
@@ -98,11 +105,9 @@ fn run_onboarding_status(
     let signals = collect_onboarding_signals(&document, config_path, variant)?;
     let steps = build_onboarding_steps(variant, &signals);
     let counts = build_onboarding_counts(&steps);
-    let ready_for_first_success = steps
-        .iter()
-        .filter(|step| !step.optional)
-        .all(|step| step.status == control_plane::OnboardingStepStatus::Done);
-    let status = derive_posture_status(&steps, ready_for_first_success);
+    let first_success_completed = onboarding_step_done(&steps, "first_success");
+    let ready_for_first_success = onboarding_prerequisites_ready(&steps);
+    let status = derive_posture_status(&steps, ready_for_first_success, first_success_completed);
     let payload = control_plane::OnboardingPostureEnvelope {
         contract: cli_contract_descriptor(),
         flow: variant.flow(),
@@ -115,7 +120,7 @@ fn run_onboarding_status(
             .iter()
             .find(|step| step.status != control_plane::OnboardingStepStatus::Done)
             .map(|step| step.step_id.clone()),
-        first_success_hint: ready_for_first_success.then(|| {
+        first_success_hint: (ready_for_first_success && !first_success_completed).then(|| {
             "Open the dashboard or chat workspace and send a real first request to complete onboarding."
                 .to_owned()
         }),
@@ -226,6 +231,7 @@ fn collect_onboarding_signals(
         provider_health_message,
         model_discovery_ready,
         model_discovery_message,
+        first_success_completed: cli_first_success_completed()?,
     })
 }
 
@@ -421,7 +427,17 @@ fn build_onboarding_steps(
         [config_step.status, remote_step.status, provider_step.status, verification_step.status]
             .into_iter()
             .all(|status| status == control_plane::OnboardingStepStatus::Done);
-    let first_success_step = if first_success_ready {
+    let first_success_step = if first_success_ready && signals.first_success_completed {
+        done_step(
+            "first_success",
+            "First success",
+            "A CLI agent run has completed successfully for this installation.",
+            Some(run_cli_action(
+                "Run another prompt",
+                "palyra agent run --prompt-stdin".to_owned(),
+            )),
+        )
+    } else if first_success_ready {
         actionable_step(
             "first_success",
             "First success",
@@ -545,9 +561,13 @@ fn build_onboarding_counts(
 fn derive_posture_status(
     steps: &[control_plane::OnboardingStepView],
     ready_for_first_success: bool,
+    first_success_completed: bool,
 ) -> control_plane::OnboardingPostureState {
     if steps.iter().all(|step| step.status == control_plane::OnboardingStepStatus::Todo) {
         return control_plane::OnboardingPostureState::NotStarted;
+    }
+    if first_success_completed {
+        return control_plane::OnboardingPostureState::Complete;
     }
     if ready_for_first_success {
         return control_plane::OnboardingPostureState::Ready;
@@ -556,6 +576,59 @@ fn derive_posture_status(
         return control_plane::OnboardingPostureState::Blocked;
     }
     control_plane::OnboardingPostureState::InProgress
+}
+
+fn onboarding_prerequisites_ready(steps: &[control_plane::OnboardingStepView]) -> bool {
+    steps
+        .iter()
+        .filter(|step| !step.optional && step.step_id != "first_success")
+        .all(|step| step.status == control_plane::OnboardingStepStatus::Done)
+}
+
+fn onboarding_step_done(steps: &[control_plane::OnboardingStepView], step_id: &str) -> bool {
+    steps.iter().any(|step| {
+        step.step_id == step_id && step.status == control_plane::OnboardingStepStatus::Done
+    })
+}
+
+pub(crate) fn record_cli_first_success(state_root: &Path, run_id: &str) -> Result<()> {
+    let marker_path = cli_first_success_marker_path(state_root);
+    if let Some(parent) = marker_path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!("failed to create onboarding state directory {}", parent.display())
+        })?;
+    }
+    let payload = json!({
+        "version": 1,
+        "source": "cli_agent_run",
+        "run_id": run_id,
+        "completed_at_unix_ms": now_unix_ms_i64()?,
+    });
+    let encoded =
+        serde_json::to_vec_pretty(&payload).context("failed to encode first-success marker")?;
+    fs::write(marker_path.as_path(), encoded)
+        .with_context(|| format!("failed to write first-success marker {}", marker_path.display()))
+}
+
+fn cli_first_success_completed() -> Result<bool> {
+    let Some(context) = app::current_root_context() else {
+        return Ok(false);
+    };
+    let marker_path = cli_first_success_marker_path(context.state_root());
+    if !marker_path.exists() {
+        return Ok(false);
+    }
+    let raw = fs::read(marker_path.as_path()).with_context(|| {
+        format!("failed to read first-success marker {}", marker_path.display())
+    })?;
+    let payload: Value = serde_json::from_slice(raw.as_slice()).with_context(|| {
+        format!("failed to parse first-success marker {}", marker_path.display())
+    })?;
+    Ok(payload.get("completed_at_unix_ms").and_then(Value::as_i64).is_some_and(|value| value > 0))
+}
+
+fn cli_first_success_marker_path(state_root: &Path) -> PathBuf {
+    state_root.join(CLI_FIRST_SUCCESS_MARKER_RELATIVE_PATH)
 }
 
 fn done_step(
@@ -698,10 +771,12 @@ mod tests {
     use std::fs;
 
     use anyhow::Result;
+    use palyra_control_plane as control_plane;
     use tempfile::tempdir;
 
     use super::{
-        build_onboarding_steps, collect_onboarding_signals, load_onboarding_document,
+        build_onboarding_steps, collect_onboarding_signals, derive_posture_status,
+        load_onboarding_document, onboarding_prerequisites_ready, record_cli_first_success,
         OnboardingSignals, OnboardingVariant,
     };
     use crate::{app, args::RootOptions};
@@ -755,11 +830,55 @@ kind = "anthropic"
                 provider_health_message: "configured".to_owned(),
                 model_discovery_ready: true,
                 model_discovery_message: "ready".to_owned(),
+                first_success_completed: false,
             },
         );
         let config_step = steps.iter().find(|step| step.step_id == "config").expect("config step");
         let action = config_step.action.as_ref().expect("config step action");
         assert_eq!(action.target, "palyra config list --path C:/portable/palyra.toml");
+    }
+
+    #[test]
+    fn cli_first_success_marker_completes_first_success_step() -> Result<()> {
+        let _guard = app::test_env_lock_for_tests().lock().expect("env lock");
+        app::clear_root_context_for_tests();
+
+        let temp = tempdir()?;
+        let state_root = temp.path().join("state-root");
+        let config_path = temp.path().join("config").join("palyra.toml");
+        let config = r#"
+[model_provider]
+kind = "anthropic"
+anthropic_model = "MiniMax-M2.7"
+anthropic_api_key_vault_ref = "global/minimax_api_key"
+"#;
+        fs::create_dir_all(config_path.parent().expect("config parent"))?;
+        fs::write(config_path.as_path(), config)?;
+        record_cli_first_success(&state_root, "01ARZ3NDEKTSV4RRFFQ69G5FAV")?;
+
+        let _context = app::install_root_context(RootOptions {
+            config_path: Some(config_path.display().to_string()),
+            state_root: Some(state_root.display().to_string()),
+            ..RootOptions::default()
+        })?;
+        let document: toml::Value = toml::from_str(config)?;
+        let signals = collect_onboarding_signals(
+            &document,
+            config_path.display().to_string(),
+            OnboardingVariant::Quickstart,
+        )?;
+        let steps = build_onboarding_steps(OnboardingVariant::Quickstart, &signals);
+        let first_success =
+            steps.iter().find(|step| step.step_id == "first_success").expect("first_success step");
+
+        assert_eq!(first_success.status, control_plane::OnboardingStepStatus::Done);
+        assert_eq!(
+            derive_posture_status(&steps, onboarding_prerequisites_ready(&steps), true),
+            control_plane::OnboardingPostureState::Complete
+        );
+
+        app::clear_root_context_for_tests();
+        Ok(())
     }
 
     #[test]
