@@ -349,6 +349,7 @@ fn build_windows_task_install_error(
     )
 }
 
+#[cfg(windows)]
 fn summarize_command_output(output: &Output) -> Option<String> {
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
@@ -824,10 +825,11 @@ fn current_uid() -> Result<u32> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use super::summarize_command_output;
     use super::{
         default_service_name, load_service_metadata, query_gateway_service_status,
-        service_metadata_path, summarize_command_output, GatewayServiceMetadata,
-        SERVICE_METADATA_SCHEMA_VERSION,
+        service_metadata_path, GatewayServiceMetadata, SERVICE_METADATA_SCHEMA_VERSION,
     };
     use std::fs;
     use tempfile::tempdir;
