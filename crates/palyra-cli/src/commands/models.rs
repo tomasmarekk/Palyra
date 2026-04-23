@@ -1527,11 +1527,8 @@ fn probe_provider(
                 }
             } else if status.as_u16() == 404 && !target.configured_model_ids.is_empty() {
                 payload.discovery_source = "registry_fallback".to_owned();
-                payload.state = if discover {
-                    "discovery_unsupported".to_owned()
-                } else {
-                    "ok".to_owned()
-                };
+                payload.state =
+                    if discover { "discovery_unsupported".to_owned() } else { "ok".to_owned() };
                 payload.message = if discover {
                     "provider returned HTTP 404 for model discovery; using configured model registry for reference only"
                         .to_owned()

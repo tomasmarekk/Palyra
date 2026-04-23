@@ -10114,7 +10114,8 @@ mod journal_path_tests {
     #[test]
     fn installed_journal_path_overrides_missing_root_context_default() -> Result<()> {
         let tempdir = tempdir()?;
-        let root_context_default_path = tempdir.path().join("state-root").join(DEFAULT_JOURNAL_DB_PATH);
+        let root_context_default_path =
+            tempdir.path().join("state-root").join(DEFAULT_JOURNAL_DB_PATH);
         let installed_journal_path = tempdir.path().join("install").join(DEFAULT_JOURNAL_DB_PATH);
 
         fs::create_dir_all(installed_journal_path.parent().expect("installed journal parent"))?;
@@ -10132,7 +10133,8 @@ mod journal_path_tests {
     #[test]
     fn existing_root_context_journal_path_wins_over_installed_fallback() -> Result<()> {
         let tempdir = tempdir()?;
-        let root_context_default_path = tempdir.path().join("state-root").join(DEFAULT_JOURNAL_DB_PATH);
+        let root_context_default_path =
+            tempdir.path().join("state-root").join(DEFAULT_JOURNAL_DB_PATH);
         let installed_journal_path = tempdir.path().join("install").join(DEFAULT_JOURNAL_DB_PATH);
 
         fs::create_dir_all(root_context_default_path.parent().expect("root journal parent"))?;

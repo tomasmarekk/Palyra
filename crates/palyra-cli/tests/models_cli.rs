@@ -540,13 +540,10 @@ enabled = true
         Some("MiniMax-M2.7")
     );
     assert!(
-        provider
-            .get("message")
-            .and_then(Value::as_str)
-            .is_some_and(|message| {
-                message.contains("confirms endpoint and credentials")
-                    && message.contains("not model usability")
-            }),
+        provider.get("message").and_then(Value::as_str).is_some_and(|message| {
+            message.contains("confirms endpoint and credentials")
+                && message.contains("not model usability")
+        }),
         "fallback message should clarify the connection-only verification scope: {payload}"
     );
     server.finish()?;
