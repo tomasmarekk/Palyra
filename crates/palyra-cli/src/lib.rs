@@ -532,6 +532,27 @@ fn resolve_init_path(path: Option<String>) -> Result<PathBuf> {
         return parse_config_path(path.as_str())
             .with_context(|| format!("init config path is invalid: {}", path));
     }
+    let root_context = app::current_root_context();
+    if let Some(path) =
+        root_context.as_ref().and_then(|context| context.config_path().map(Path::to_path_buf))
+    {
+        return Ok(path);
+    }
+    if let Ok(path) = env::var("PALYRA_CONFIG") {
+        if let Some(path) = normalize_optional_text(path.as_str()) {
+            return parse_config_path(path)
+                .with_context(|| format!("PALYRA_CONFIG contains an invalid path: {path}"));
+        }
+    }
+    if let Some(path) =
+        root_context.as_ref().map(|context| context.state_root().join("config").join("palyra.toml"))
+    {
+        return Ok(path);
+    }
+    if let Some(path) = find_default_config_path() {
+        return parse_config_path(path.as_str())
+            .with_context(|| format!("default init config path is invalid: {}", path));
+    }
     Ok(PathBuf::from("palyra.toml"))
 }
 
@@ -9953,7 +9974,7 @@ mod doctor_check_tests {
 mod journal_path_tests {
     use super::{
         discover_installed_journal_db_path_from_binary, resolve_config_relative_path,
-        resolve_daemon_journal_db_path, DEFAULT_JOURNAL_DB_PATH,
+        resolve_daemon_journal_db_path, resolve_init_path, DEFAULT_JOURNAL_DB_PATH,
     };
     use crate::support::lifecycle::InstallMetadata;
     use anyhow::Result;
@@ -10013,6 +10034,35 @@ mod journal_path_tests {
         let resolved = resolve_config_relative_path(config_path.as_path(), "data/journal.sqlite3");
 
         assert_eq!(resolved, config_dir.join("data").join("journal.sqlite3"));
+        Ok(())
+    }
+
+    #[test]
+    fn init_path_uses_active_root_context_config_path() -> Result<()> {
+        let _guard = crate::app::test_env_lock_for_tests().lock().expect("env lock");
+        crate::app::clear_root_context_for_tests();
+        let tempdir = tempdir()?;
+        let state_root = tempdir.path().join("state-root");
+        let config_path = state_root.join("config").join("palyra.toml");
+        let config_home = tempdir.path().join("xdg-config");
+        let home = tempdir.path().join("home");
+        let local_app_data = tempdir.path().join("localappdata");
+        let app_data = tempdir.path().join("appdata");
+        let _xdg_config_home = ScopedEnvVar::set("XDG_CONFIG_HOME", config_home.as_path());
+        let _home = ScopedEnvVar::set("HOME", home.as_path());
+        let _local_app_data = ScopedEnvVar::set("LOCALAPPDATA", local_app_data.as_path());
+        let _app_data = ScopedEnvVar::set("APPDATA", app_data.as_path());
+        let _palyra_config = ScopedEnvVar::unset("PALYRA_CONFIG");
+
+        crate::app::install_root_context(crate::args::RootOptions {
+            state_root: Some(state_root.display().to_string()),
+            ..crate::args::RootOptions::default()
+        })?;
+
+        let resolved = resolve_init_path(None)?;
+
+        assert_eq!(resolved, config_path);
+        crate::app::clear_root_context_for_tests();
         Ok(())
     }
 
