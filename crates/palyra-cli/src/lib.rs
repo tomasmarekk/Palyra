@@ -5198,12 +5198,10 @@ fn resolve_skills_trust_store_path(raw: Option<&str>) -> Result<PathBuf> {
         Ok(value) if !value.trim().is_empty() => Ok(PathBuf::from(value)),
         Ok(_) => anyhow::bail!("PALYRA_SKILLS_TRUST_STORE cannot be empty when set"),
         Err(std::env::VarError::NotPresent) => {
-            let identity_root = default_identity_store_root()
-                .context("failed to resolve default identity store root")?;
-            let state_root = identity_root
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| identity_root.clone());
+            let state_root = match app::current_root_context() {
+                Some(context) => context.state_root().to_path_buf(),
+                None => app::resolve_cli_state_root(None)?,
+            };
             Ok(state_root.join("skills").join("trust-store.json"))
         }
         Err(std::env::VarError::NotUnicode(_)) => {
@@ -8355,6 +8353,15 @@ mod cli_v1_tests {
             }
             Self { key, previous }
         }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: tests serialize env updates via env_lock().
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, previous }
+        }
     }
 
     impl Drop for ScopedEnvVar {
@@ -8390,6 +8397,29 @@ mod cli_v1_tests {
 
         let skills_root = super::resolve_skills_root(None).expect("skills root should resolve");
         assert_eq!(skills_root, context.state_root().join("skills"));
+        crate::app::clear_root_context_for_tests();
+    }
+
+    #[test]
+    fn resolve_skills_trust_store_prefers_active_root_context_state_root() {
+        let _lock = env_lock().lock().expect("env lock should be available");
+        let _profile = ScopedEnvVar::set("PALYRA_CLI_PROFILE", "");
+        let _profiles_path = ScopedEnvVar::set("PALYRA_CLI_PROFILES_PATH", "");
+        let _trust_store = ScopedEnvVar::unset("PALYRA_SKILLS_TRUST_STORE");
+        crate::app::clear_root_context_for_tests();
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let state_root = tempdir.path().join("portable-state");
+        let state_root_string = state_root.to_string_lossy().into_owned();
+        let context = crate::app::install_root_context(crate::args::RootOptions {
+            state_root: Some(state_root_string),
+            ..crate::args::RootOptions::default()
+        })
+        .expect("root context should install");
+
+        let trust_store = super::resolve_skills_trust_store_path(None)
+            .expect("skills trust store should resolve");
+
+        assert_eq!(trust_store, context.state_root().join("skills").join("trust-store.json"));
         crate::app::clear_root_context_for_tests();
     }
 

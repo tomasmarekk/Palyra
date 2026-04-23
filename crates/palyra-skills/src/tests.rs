@@ -563,6 +563,17 @@ fn trust_store_load_rejects_invalid_key() {
 }
 
 #[test]
+fn trust_store_load_accepts_empty_uninitialized_file() {
+    let path = unique_temp_trust_store_path();
+    std::fs::write(&path, b"  \n\t").expect("empty trust store fixture should be written");
+
+    let store = SkillTrustStore::load(path.as_path()).expect("empty trust store should load");
+
+    assert_eq!(store, SkillTrustStore::default());
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn mapping_to_runtime_grants_and_policy_requests() {
     let manifest = parse_manifest_toml(sample_manifest().as_str()).expect("manifest");
     let grants = capability_grants_from_manifest(&manifest);

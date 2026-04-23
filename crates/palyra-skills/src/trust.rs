@@ -15,6 +15,9 @@ impl SkillTrustStore {
                 path.display()
             ))
         })?;
+        if payload.iter().all(u8::is_ascii_whitespace) {
+            return Ok(Self::default());
+        }
         let mut trust_store =
             serde_json::from_slice::<Self>(payload.as_slice()).map_err(|error| {
                 SkillPackagingError::Serialization(format!(
