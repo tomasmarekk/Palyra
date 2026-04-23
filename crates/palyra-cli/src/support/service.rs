@@ -1,7 +1,7 @@
 use std::{
     env, fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output},
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -288,13 +288,23 @@ fn install_windows_task(
     let task_name = format!("\\{}", context.service_name);
     let query = Command::new("schtasks")
         .args(["/Query", "/TN", task_name.as_str()])
-        .status()
+        .output()
         .context("failed to query existing scheduled task")?;
-    if query.success() {
-        let _ =
-            Command::new("schtasks").args(["/Delete", "/TN", task_name.as_str(), "/F"]).status();
+    if query.status.success() {
+        let delete = Command::new("schtasks")
+            .args(["/Delete", "/TN", task_name.as_str(), "/F"])
+            .output()
+            .context("failed to remove existing scheduled task before reinstall")?;
+        if !delete.status.success() {
+            return Err(build_windows_task_install_error(
+                "remove existing",
+                task_name.as_str(),
+                wrapper_path.as_path(),
+                &delete,
+            ));
+        }
     }
-    let status = Command::new("schtasks")
+    let create = Command::new("schtasks")
         .args([
             "/Create",
             "/TN",
@@ -307,18 +317,50 @@ fn install_windows_task(
             wrapper_path.display().to_string().as_str(),
             "/F",
         ])
-        .status()
+        .output()
         .context("failed to install scheduled task for gateway service")?;
-    if !status.success() {
-        anyhow::bail!(
-            "schtasks create failed with status {}",
-            status.code().map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_owned())
-        );
+    if !create.status.success() {
+        return Err(build_windows_task_install_error(
+            "create",
+            task_name.as_str(),
+            wrapper_path.as_path(),
+            &create,
+        ));
     }
     if context.start_now {
         let _ = Command::new("schtasks").args(["/Run", "/TN", task_name.as_str()]).status();
     }
     Ok((wrapper_path.clone(), wrapper_path, "schtasks".to_owned()))
+}
+
+#[cfg(windows)]
+fn build_windows_task_install_error(
+    operation: &str,
+    task_name: &str,
+    wrapper_path: &Path,
+    output: &Output,
+) -> anyhow::Error {
+    let status = output
+        .status
+        .code()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let detail = summarize_command_output(output).unwrap_or_else(|| "no additional output".to_owned());
+    anyhow!(
+        "failed to {operation} Windows scheduled task {task_name} (wrapper: {}): schtasks exited with status {status}; {detail}. Use `palyra gateway run` for a foreground runtime, or remove the conflicting scheduled task / fix the current user-task permissions and retry `palyra gateway install --start`.",
+        wrapper_path.display()
+    )
+}
+
+fn summarize_command_output(output: &Output) -> Option<String> {
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (false, false) => Some(format!("stdout: {stdout}; stderr: {stderr}")),
+        (false, true) => Some(format!("stdout: {stdout}")),
+        (true, false) => Some(format!("stderr: {stderr}")),
+        (true, true) => None,
+    }
 }
 
 #[cfg(windows)]
@@ -787,10 +829,16 @@ fn current_uid() -> Result<u32> {
 mod tests {
     use super::{
         default_service_name, load_service_metadata, query_gateway_service_status,
-        service_metadata_path, GatewayServiceMetadata, SERVICE_METADATA_SCHEMA_VERSION,
+        service_metadata_path, summarize_command_output, GatewayServiceMetadata,
+        SERVICE_METADATA_SCHEMA_VERSION,
     };
     use std::fs;
     use tempfile::tempdir;
+
+    #[cfg(windows)]
+    use std::os::windows::process::ExitStatusExt;
+    #[cfg(windows)]
+    use std::process::Output;
 
     #[test]
     fn query_gateway_service_status_without_metadata_reports_not_installed() {
@@ -836,5 +884,19 @@ mod tests {
         assert_eq!(loaded.service_name, metadata.service_name);
         assert_eq!(loaded.manager, metadata.manager);
         assert_eq!(loaded.stdout_log_path, metadata.stdout_log_path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn summarize_command_output_combines_stdout_and_stderr() {
+        let output = Output {
+            status: std::process::ExitStatus::from_raw(1),
+            stdout: b"ERROR: Syst\xc3\xa9m nem\xc5\xaf\xc5\xbee nal\xc3\xa9zt uveden\xc3\xbd soubor.".to_vec(),
+            stderr: b"ERROR: P\xc5\x99\xc3\xadstup byl odep\xc5\x99en.".to_vec(),
+        };
+
+        let summary = summarize_command_output(&output).expect("summary should include command output");
+        assert!(summary.contains("stdout: ERROR:"));
+        assert!(summary.contains("stderr: ERROR:"));
     }
 }
