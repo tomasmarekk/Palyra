@@ -1525,8 +1525,12 @@ fn parse_profile_path(raw: &str, label: &str) -> Result<PathBuf> {
 fn ensure_safe_profile_state_root_removal(path: &Path) -> Result<()> {
     crate::support::lifecycle::ensure_safe_removal_target(path, "profile state root")?;
     let canonical = crate::support::lifecycle::canonicalize_lossy(path)?;
-    let default_root = app::resolve_cli_state_root(None)?;
-    if !crate::support::lifecycle::path_starts_with(canonical.as_path(), default_root.as_path()) {
+    let cli_state_root = app::current_root_context()
+        .map(|context| context.cli_state_root().to_path_buf())
+        .unwrap_or(app::resolve_cli_state_root(None)?);
+    let cli_state_root = crate::support::lifecycle::canonicalize_lossy(cli_state_root.as_path())?;
+    if !crate::support::lifecycle::path_starts_with(canonical.as_path(), cli_state_root.as_path())
+    {
         anyhow::bail!(
             "refusing to remove state root outside the CLI state root namespace: {}",
             canonical.display()
@@ -1604,11 +1608,18 @@ fn paths_equivalent(left: &Path, right: &Path) -> bool {
 mod tests {
     use super::{
         collect_secret_references, decrypt_profile_bundle, default_environment, default_risk_level,
-        encrypt_profile_bundle, profile_mode_label, PortableProfileConfig,
+        encrypt_profile_bundle, ensure_safe_profile_state_root_removal, profile_mode_label,
+        PortableProfileConfig,
         ProfilePortabilityBundle, ProfileSecretReference,
     };
-    use crate::{args::ProfileModeArg, sha256_hex};
+    use crate::{
+        app,
+        args::{ProfileModeArg, RootOptions},
+        sha256_hex,
+    };
     use anyhow::Result;
+    use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn profile_mode_defaults_match_environment_story() {
@@ -1689,6 +1700,31 @@ state_key_vault_ref = "global/browser_state_key"
             round_trip.config.as_ref().map(|config| config.source_path.as_str()),
             Some("prod/palyra.toml")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn delete_state_root_allows_paths_under_explicit_cli_state_root() -> Result<()> {
+        let _guard = app::test_env_lock_for_tests().lock().expect("env lock");
+        app::clear_root_context_for_tests();
+
+        let temp = tempdir()?;
+        let cli_state_root = temp.path().join("state");
+        let profile_state_root = cli_state_root.join("profiles").join("demo").join("state");
+        fs::create_dir_all(&profile_state_root)?;
+        let config_path = temp.path().join("config").join("palyra.toml");
+        fs::create_dir_all(config_path.parent().expect("config parent"))?;
+        fs::write(&config_path, "[daemon]\nport = 7142\n")?;
+
+        let _context = app::install_root_context(RootOptions {
+            config_path: Some(config_path.display().to_string()),
+            state_root: Some(cli_state_root.display().to_string()),
+            ..RootOptions::default()
+        })?;
+
+        ensure_safe_profile_state_root_removal(profile_state_root.as_path())?;
+
+        app::clear_root_context_for_tests();
         Ok(())
     }
 }

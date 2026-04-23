@@ -221,6 +221,10 @@ impl RootCommandContext {
         self.state_root.as_path()
     }
 
+    pub(crate) fn cli_state_root(&self) -> &Path {
+        self.cli_state_root.as_path()
+    }
+
     pub(crate) fn config_path(&self) -> Option<&Path> {
         self.config_path.as_deref()
     }
