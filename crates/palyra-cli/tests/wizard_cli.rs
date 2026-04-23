@@ -776,6 +776,70 @@ fn configure_auth_model_accepts_api_key_from_stdin() -> Result<()> {
 }
 
 #[test]
+fn configure_auth_model_backfills_admin_defaults_for_resume_path() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let config_path = workdir.path().join("configure").join("palyra.toml");
+    fs::create_dir_all(config_path.parent().expect("config parent"))
+        .context("failed to create config parent")?;
+    fs::write(config_path.as_path(), "version = 1\n")
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+
+    let config_path_string = config_path.to_string_lossy().into_owned();
+    let output = run_cli_with_stdin(
+        &workdir,
+        &[
+            "configure",
+            "--path",
+            &config_path_string,
+            "--section",
+            "auth-model",
+            "--non-interactive",
+            "--accept-risk",
+            "--auth-method",
+            "minimax-api-key",
+            "--api-key-stdin",
+            "--json",
+        ],
+        &[],
+        Some(b"sk-minimax-resume\n"),
+    )?;
+    assert!(
+        output.status.success(),
+        "configure auth-model should complete resume repair: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: Value =
+        serde_json::from_slice(&output.stdout).context("configure stdout should be JSON")?;
+    assert!(
+        payload
+            .get("changed_sections")
+            .and_then(Value::as_array)
+            .is_some_and(|values| values.iter().any(|value| value.as_str() == Some("auth-model"))),
+        "auth-model should be marked changed when admin defaults are backfilled: {payload}"
+    );
+
+    let written = fs::read_to_string(&config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    assert!(
+        written.contains("auth_provider_kind = \"minimax\""),
+        "expected MiniMax auth provider after configure: {written}"
+    );
+    assert!(
+        written.contains("require_auth = true"),
+        "configure auth-model should enable admin auth when it repairs a partial install: {written}"
+    );
+    assert!(
+        written.contains("auth_token = "),
+        "configure auth-model should write an admin token when missing: {written}"
+    );
+    assert!(
+        written.contains("bound_principal = \"admin:local\""),
+        "configure auth-model should write the local admin principal when missing: {written}"
+    );
+    Ok(())
+}
+
+#[test]
 fn profile_lifecycle_create_and_setup_attach_profile_paths() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let create = run_cli(

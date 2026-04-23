@@ -478,6 +478,12 @@ pub(crate) fn run_configure_wizard(request: ConfigureWizardRequest) -> Result<()
                     auth_method.as_str(),
                     &mut warnings,
                 )?;
+                if ensure_admin_auth_defaults(&mut document)? {
+                    warnings.push(
+                        "admin auth defaults were backfilled so the daemon can start after this reconfiguration."
+                            .to_owned(),
+                    );
+                }
             }
             ConfigureSectionArg::Gateway => {
                 wizard.note(WizardStep::note(
@@ -1804,11 +1810,23 @@ fn ensure_onboarding_admin_defaults(
     document: &mut toml::Value,
     plan: &OnboardingMutationPlan,
 ) -> Result<()> {
+    ensure_admin_auth_defaults_with_token(document, plan.admin_token.as_deref()).map(|_| ())
+}
+
+fn ensure_admin_auth_defaults(document: &mut toml::Value) -> Result<bool> {
+    ensure_admin_auth_defaults_with_token(document, None)
+}
+
+fn ensure_admin_auth_defaults_with_token(
+    document: &mut toml::Value,
+    admin_token: Option<&str>,
+) -> Result<bool> {
+    let before = document.clone();
     if get_bool_value_at_path(document, "admin.require_auth")?.is_none() {
         set_value_at_path(document, "admin.require_auth", toml::Value::Boolean(true))?;
     }
     if get_string_value_at_path(document, "admin.auth_token")?.is_none() {
-        let admin_token = plan.admin_token.clone().unwrap_or_else(generate_admin_token);
+        let admin_token = admin_token.map(str::to_owned).unwrap_or_else(generate_admin_token);
         set_value_at_path(document, "admin.auth_token", toml::Value::String(admin_token))?;
     }
     if get_string_value_at_path(document, "admin.bound_principal")?.is_none() {
@@ -1818,7 +1836,7 @@ fn ensure_onboarding_admin_defaults(
             toml::Value::String(DEFAULT_ADMIN_BOUND_PRINCIPAL.to_owned()),
         )?;
     }
-    Ok(())
+    Ok(document != &before)
 }
 
 fn run_post_apply_health_check(
