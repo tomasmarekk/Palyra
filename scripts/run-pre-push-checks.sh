@@ -52,6 +52,9 @@ run_fast_profile() {
   echo "Running rustfmt check..."
   "$CARGO_BIN" fmt --all --check
 
+  echo "Running clippy..."
+  "$CARGO_BIN" clippy --workspace --all-targets -- -D warnings
+
   echo "Checking runtime artifact hygiene before local validation..."
   bash "$ROOT_DIR/scripts/check-runtime-artifacts.sh"
 
