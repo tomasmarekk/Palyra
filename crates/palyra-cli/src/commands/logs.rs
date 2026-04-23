@@ -42,6 +42,7 @@ impl From<control_plane::LogRecord> for CliLogRecord {
 enum LogInput {
     Journal { db_path: PathBuf },
     File { source: String, path: PathBuf },
+    Unavailable { message: String },
 }
 
 pub(crate) fn run_logs(
@@ -62,13 +63,16 @@ pub(crate) fn run_logs(
     }
 
     let lines = lines.clamp(1, 500);
-    let input = resolve_log_input(db_path)?;
+    let input = resolve_log_input(db_path.clone())?;
     match input {
         LogInput::Journal { db_path } => {
             run_journal_logs(db_path.as_path(), lines, follow, poll_interval_ms)
         }
         LogInput::File { source, path } => {
             run_file_logs(source.as_str(), path.as_path(), lines, follow, poll_interval_ms)
+        }
+        LogInput::Unavailable { message } => {
+            run_unavailable_logs(db_path, lines, follow, poll_interval_ms, message)
         }
     }
 }
@@ -120,8 +124,52 @@ fn resolve_log_input(db_path: Option<String>) -> Result<LogInput> {
         }
     }
 
+    if !db_path.exists() {
+        return Ok(LogInput::Unavailable {
+            message: format!(
+                "no journal or service logs exist yet for state_root={}; start the daemon in foreground with `palyra gateway run` to inspect startup errors",
+                root_context.state_root().display()
+            ),
+        });
+    }
     ensure_journal_db_exists(db_path.as_path())?;
     Ok(LogInput::Journal { db_path })
+}
+
+fn run_unavailable_logs(
+    db_path: Option<String>,
+    lines: usize,
+    follow: bool,
+    poll_interval_ms: u64,
+    message: String,
+) -> Result<()> {
+    let notice = CliLogRecord {
+        source: "diagnostic".to_owned(),
+        seq: None,
+        event_id: None,
+        kind: None,
+        timestamp_unix_ms: None,
+        line_number: None,
+        message: Some(message),
+    };
+    emit_log_records(&[notice])?;
+    if !follow {
+        return Ok(());
+    }
+
+    let sleep_duration = Duration::from_millis(poll_interval_ms.clamp(250, 30_000));
+    loop {
+        thread::sleep(sleep_duration);
+        match resolve_log_input(db_path.clone())? {
+            LogInput::Unavailable { .. } => continue,
+            LogInput::Journal { db_path } => {
+                return run_journal_logs(db_path.as_path(), lines, true, poll_interval_ms);
+            }
+            LogInput::File { source, path } => {
+                return run_file_logs(source.as_str(), path.as_path(), lines, true, poll_interval_ms);
+            }
+        }
+    }
 }
 
 fn run_journal_logs(
@@ -308,6 +356,8 @@ fn emit_log_record(record: &CliLogRecord) -> Result<()> {
             record.timestamp_unix_ms.unwrap_or(0),
             record.message.as_deref().unwrap_or("none")
         );
+    } else if record.source == "diagnostic" {
+        println!("logs.notice message={}", record.message.as_deref().unwrap_or("none"));
     } else {
         println!(
             "logs.line source={} line={} message={}",
