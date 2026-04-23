@@ -569,6 +569,46 @@ pub(crate) fn update_active_profile_paths(
     persist_cli_profiles_registry(path.as_path(), &document)
 }
 
+pub(crate) fn ensure_bootstrap_local_profile(
+    config_path: &Path,
+    state_root: Option<&Path>,
+) -> Result<()> {
+    let (path, mut document) = load_cli_profiles_registry()?;
+    if !document.profiles.is_empty() {
+        return Ok(());
+    }
+
+    let now = current_unix_timestamp_ms()?;
+    let name = "local".to_owned();
+    document.default_profile = Some(name.clone());
+    document.profiles.insert(
+        name,
+        CliConnectionProfile {
+            config_path: Some(config_path.display().to_string()),
+            state_root: state_root.map(|value| value.display().to_string()),
+            daemon_url: Some(DEFAULT_DAEMON_URL.to_owned()),
+            grpc_url: Some(format!(
+                "http://{DEFAULT_GATEWAY_GRPC_BIND_ADDR}:{DEFAULT_GATEWAY_GRPC_PORT}"
+            )),
+            admin_token: None,
+            admin_token_env: None,
+            principal: Some("admin:local".to_owned()),
+            device_id: Some(DEFAULT_DEVICE_ID.to_owned()),
+            channel: Some(DEFAULT_CHANNEL.to_owned()),
+            label: Some("Local".to_owned()),
+            environment: Some("local".to_owned()),
+            color: Some("green".to_owned()),
+            risk_level: Some("low".to_owned()),
+            strict_mode: false,
+            mode: Some("local".to_owned()),
+            created_at_unix_ms: Some(now),
+            updated_at_unix_ms: Some(now),
+            last_used_at_unix_ms: Some(now),
+        },
+    );
+    persist_cli_profiles_registry(path.as_path(), &document)
+}
+
 fn resolve_active_profile_name(
     root: &RootOptions,
     profiles: &CliProfilesDocument,

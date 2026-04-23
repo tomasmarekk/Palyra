@@ -54,5 +54,6 @@ pub(crate) fn run_setup(
     let config_path = resolve_init_path(requested_path)?;
     let state_root = app::current_root_context().map(|context| context.state_root().to_path_buf());
     app::update_active_profile_paths(Some(config_path.as_path()), state_root.as_deref())?;
+    app::ensure_bootstrap_local_profile(config_path.as_path(), state_root.as_deref())?;
     Ok(())
 }

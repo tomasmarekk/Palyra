@@ -380,6 +380,28 @@ fn setup_wizard_quickstart_supports_minimax_api_key() -> Result<()> {
         written.contains("anthropic_api_key_vault_ref = \"global/minimax_api_key\""),
         "expected vault-backed MiniMax auth in onboarding config"
     );
+
+    let profile_list = run_cli(&workdir, &["profile", "list", "--json"], &[])?;
+    assert!(
+        profile_list.status.success(),
+        "profile list should succeed after setup: {}",
+        String::from_utf8_lossy(&profile_list.stderr)
+    );
+    let profile_payload: Value = serde_json::from_slice(&profile_list.stdout)
+        .context("profile list stdout should be JSON")?;
+    assert_eq!(profile_payload.get("default_profile").and_then(Value::as_str), Some("local"));
+    assert_eq!(
+        profile_payload.pointer("/profiles/0/config_path").and_then(Value::as_str),
+        Some(config_path_string.as_str()),
+        "setup should register the generated config path in the default profile: {profile_payload}"
+    );
+
+    let profile_show = run_cli(&workdir, &["profile", "show", "--json"], &[])?;
+    assert!(
+        profile_show.status.success(),
+        "profile show should resolve the setup-created default profile: {}",
+        String::from_utf8_lossy(&profile_show.stderr)
+    );
     Ok(())
 }
 
