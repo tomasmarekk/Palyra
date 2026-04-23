@@ -94,6 +94,19 @@ fn secrets_set_then_get_reveal_returns_exact_bytes() -> Result<()> {
 }
 
 #[test]
+fn secrets_set_help_documents_scope_syntax() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let output = run_cli(&workdir, &["secrets", "set", "--help"])?;
+    assert!(output.status.success(), "secrets set --help should succeed");
+    let stdout = String::from_utf8(output.stdout).context("stdout was not UTF-8")?;
+    assert!(
+        stdout.contains("Secret scope: global | principal:<id> | channel:<name>:<account_id> | skill:<skill_id>"),
+        "help should document the supported scope grammar: {stdout}"
+    );
+    Ok(())
+}
+
+#[test]
 fn secrets_get_without_reveal_redacts_output() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let secret_value = b"super-secret-token";

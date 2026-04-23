@@ -1,23 +1,30 @@
 use clap::Subcommand;
 
+const VAULT_SCOPE_HELP: &str =
+    "Secret scope: global | principal:<id> | channel:<name>:<account_id> | skill:<skill_id>";
+
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum SecretsCommand {
     Set {
+        #[arg(help = VAULT_SCOPE_HELP)]
         scope: String,
         key: String,
         #[arg(long, default_value_t = false)]
         value_stdin: bool,
     },
     Get {
+        #[arg(help = VAULT_SCOPE_HELP)]
         scope: String,
         key: String,
         #[arg(long, default_value_t = false)]
         reveal: bool,
     },
     List {
+        #[arg(help = VAULT_SCOPE_HELP)]
         scope: String,
     },
     Delete {
+        #[arg(help = VAULT_SCOPE_HELP)]
         scope: String,
         key: String,
     },
@@ -69,6 +76,7 @@ pub enum SecretsCommand {
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum SecretsConfigureCommand {
     OpenaiApiKey {
+        #[arg(help = VAULT_SCOPE_HELP)]
         scope: String,
         key: String,
         #[arg(long, default_value_t = false)]
@@ -81,6 +89,7 @@ pub enum SecretsConfigureCommand {
         json: bool,
     },
     BrowserStateKey {
+        #[arg(help = VAULT_SCOPE_HELP)]
         scope: String,
         key: String,
         #[arg(long, default_value_t = false)]
