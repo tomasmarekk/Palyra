@@ -112,13 +112,15 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<()> {
                 .then(|| root_context.state_root().to_path_buf());
             runtime.block_on(run_agent_interactive_async(
                 connection,
-                onboarding_state_root,
-                session_id,
-                session_key,
-                session_label,
-                require_existing,
-                allow_sensitive_tools,
-                ndjson,
+                AgentInteractiveOptions {
+                    onboarding_state_root,
+                    session_id,
+                    session_key,
+                    session_label,
+                    require_existing,
+                    allow_sensitive_tools,
+                    ndjson,
+                },
             ))
         }
         AgentCommand::AcpShim { command } => commands::acp::run_legacy_agent_acp_shim(command),
@@ -126,8 +128,7 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<()> {
     }
 }
 
-async fn run_agent_interactive_async(
-    connection: AgentConnection,
+struct AgentInteractiveOptions {
     onboarding_state_root: Option<std::path::PathBuf>,
     session_id: Option<String>,
     session_key: Option<String>,
@@ -135,7 +136,21 @@ async fn run_agent_interactive_async(
     require_existing: bool,
     allow_sensitive_tools: bool,
     ndjson: bool,
+}
+
+async fn run_agent_interactive_async(
+    connection: AgentConnection,
+    options: AgentInteractiveOptions,
 ) -> Result<()> {
+    let AgentInteractiveOptions {
+        onboarding_state_root,
+        session_id,
+        session_key,
+        session_label,
+        require_existing,
+        allow_sensitive_tools,
+        ndjson,
+    } = options;
     let runtime = client::operator::OperatorRuntime::new(connection.clone());
     let mut session = None::<gateway_v1::SessionSummary>;
     let initial_session_id = session_id;
