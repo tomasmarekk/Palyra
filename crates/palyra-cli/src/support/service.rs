@@ -1,7 +1,9 @@
+#[cfg(windows)]
+use std::process::Output;
 use std::{
     env, fs,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::Command,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -831,12 +833,11 @@ mod tests {
         service_metadata_path, GatewayServiceMetadata, SERVICE_METADATA_SCHEMA_VERSION,
     };
     use std::fs;
-    use tempfile::tempdir;
-
     #[cfg(windows)]
     use std::os::windows::process::ExitStatusExt;
     #[cfg(windows)]
     use std::process::Output;
+    use tempfile::tempdir;
 
     #[test]
     fn query_gateway_service_status_without_metadata_reports_not_installed() {
