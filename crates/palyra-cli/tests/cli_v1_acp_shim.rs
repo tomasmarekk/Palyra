@@ -196,6 +196,10 @@ fn agent_run_streams_status_events() -> Result<()> {
         stdout.contains("agent.status") && stdout.contains("kind=done"),
         "agent run should include done status event: {stdout}"
     );
+    assert!(
+        stdout.contains("agent.token") && stdout.contains("token=hello"),
+        "agent run should surface streamed model token text instead of a redacted placeholder: {stdout}"
+    );
     Ok(())
 }
 
@@ -238,6 +242,7 @@ fn agent_acp_shim_emits_ndjson_events() -> Result<()> {
     let stdout = String::from_utf8(output.stdout).context("stdout was not valid UTF-8")?;
     let mut saw_done = false;
     let mut saw_token = false;
+    let mut tokens = Vec::new();
     for line in stdout.lines() {
         let parsed: Value = serde_json::from_str(line).context("acp-shim output must be NDJSON")?;
         if parsed.get("type").and_then(Value::as_str) == Some("run.status")
@@ -247,10 +252,17 @@ fn agent_acp_shim_emits_ndjson_events() -> Result<()> {
         }
         if parsed.get("type").and_then(Value::as_str) == Some("model.token") {
             saw_token = true;
+            if let Some(token) = parsed.get("token").and_then(Value::as_str) {
+                tokens.push(token.to_owned());
+            }
         }
     }
     assert!(saw_done, "acp-shim stream should include done status line: {stdout}");
     assert!(saw_token, "acp-shim stream should include at least one token line: {stdout}");
+    assert!(
+        tokens.join(" ").contains("hello from ndjson"),
+        "acp-shim stream should keep literal token text in NDJSON output: {stdout}"
+    );
     Ok(())
 }
 
@@ -293,6 +305,7 @@ fn top_level_acp_shim_emits_ndjson_events() -> Result<()> {
     let stdout = String::from_utf8(output.stdout).context("stdout was not valid UTF-8")?;
     let mut saw_done = false;
     let mut saw_token = false;
+    let mut tokens = Vec::new();
     for line in stdout.lines() {
         let parsed: Value = serde_json::from_str(line).context("acp shim output must be NDJSON")?;
         if parsed.get("type").and_then(Value::as_str) == Some("run.status")
@@ -302,10 +315,17 @@ fn top_level_acp_shim_emits_ndjson_events() -> Result<()> {
         }
         if parsed.get("type").and_then(Value::as_str) == Some("model.token") {
             saw_token = true;
+            if let Some(token) = parsed.get("token").and_then(Value::as_str) {
+                tokens.push(token.to_owned());
+            }
         }
     }
     assert!(saw_done, "acp shim stream should include done status line: {stdout}");
     assert!(saw_token, "acp shim stream should include at least one token line: {stdout}");
+    assert!(
+        tokens.join(" ").contains("hello from top-level ndjson"),
+        "top-level acp shim should keep literal token text in NDJSON output: {stdout}"
+    );
     Ok(())
 }
 

@@ -7961,10 +7961,22 @@ async fn grpc_run_stream_persists_orchestrator_snapshot_and_matches_golden_tape(
 
     let tape_snapshot =
         admin_get_json_async(admin_port, format!("/admin/v1/runs/{RUN_ID}/tape")).await?;
+    let tape_events = tape_snapshot
+        .get("events")
+        .and_then(Value::as_array)
+        .context("run tape snapshot missing events array")?;
+    let reply_event = tape_events
+        .iter()
+        .find(|event| event.get("event_type").and_then(Value::as_str) == Some("message.replied"))
+        .context("run tape snapshot should include message.replied transcript event")?;
     assert_eq!(
-        tape_snapshot.get("events").cloned().context("run tape snapshot missing events")?,
-        expected_tape
+        reply_event
+            .get("payload_json")
+            .and_then(Value::as_str)
+            .context("message.replied tape event missing payload_json")?,
+        r#"{"reply_text":"alpha beta gamma"}"#,
     );
+    assert_eq!(Value::Array(tape_events.clone()), expected_tape);
     Ok(())
 }
 

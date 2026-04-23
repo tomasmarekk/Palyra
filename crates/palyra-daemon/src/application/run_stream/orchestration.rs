@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::{
     sync::mpsc,
     time::{interval, MissedTickBehavior},
@@ -18,12 +18,13 @@ use crate::{
     },
     delegation::DelegationSnapshot,
     gateway::{
-        canonical_id, ingest_memory_best_effort, non_empty, security_requests_json_mode,
-        GatewayRuntimeState,
+        canonical_id, ingest_memory_best_effort, non_empty, record_message_router_journal_event,
+        security_requests_json_mode, truncate_with_ellipsis, GatewayRuntimeState,
     },
     journal::{
         MemorySource, OrchestratorCancelRequest, OrchestratorRunMetadataUpdateRequest,
-        OrchestratorRunStartRequest, OrchestratorSessionResolveRequest, OrchestratorUsageDelta,
+        OrchestratorRunStartRequest, OrchestratorSessionResolveRequest,
+        OrchestratorTapeAppendRequest, OrchestratorUsageDelta,
     },
     model_provider::{ProviderRequest, ProviderResponse},
     orchestrator::{is_cancel_command, RunLifecycleState, RunStateMachine, RunTransition},
@@ -547,6 +548,7 @@ async fn process_run_stream_provider_response(
             return Ok(RunStreamProviderResponseOutcome::Cancelled);
         }
     };
+    let reply_text = summary_tokens.join(" ");
 
     if provider_response.completion_tokens > 0 {
         runtime_state
@@ -558,15 +560,24 @@ async fn process_run_stream_provider_response(
             .await?;
     }
 
+    persist_run_stream_reply_text(
+        runtime_state,
+        request_context,
+        session_id_for_message,
+        run_id,
+        tape_seq,
+        reply_text.as_str(),
+    )
+    .await?;
+
     if !summary_tokens.is_empty() {
-        let summary_text = summary_tokens.join(" ");
         ingest_memory_best_effort(
             runtime_state,
             request_context.principal.as_str(),
             request_context.channel.as_deref(),
             Some(session_id_for_message),
             MemorySource::Summary,
-            summary_text.as_str(),
+            reply_text.as_str(),
             vec!["summary:model_output".to_owned()],
             Some(0.75),
             "run_stream_model_summary",
@@ -594,4 +605,46 @@ async fn process_run_stream_provider_response(
     }
 
     Ok(RunStreamProviderResponseOutcome::Completed)
+}
+
+#[allow(clippy::result_large_err)]
+async fn persist_run_stream_reply_text(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    request_context: &RequestContext,
+    session_id: &str,
+    run_id: &str,
+    tape_seq: &mut i64,
+    reply_text: &str,
+) -> Result<(), Status> {
+    if reply_text.trim().is_empty() {
+        return Ok(());
+    }
+
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: "message.replied".to_owned(),
+            payload_json: json!({
+                "reply_text": reply_text,
+            })
+            .to_string(),
+        })
+        .await?;
+    *tape_seq += 1;
+
+    let _ = record_message_router_journal_event(
+        runtime_state,
+        request_context,
+        session_id,
+        run_id,
+        "message.replied",
+        common_v1::journal_event::EventActor::System as i32,
+        json!({
+            "reply_preview": truncate_with_ellipsis(reply_text.to_owned(), 256),
+        }),
+    )
+    .await;
+
+    Ok(())
 }

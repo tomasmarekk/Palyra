@@ -26,6 +26,11 @@
   },
   {
     "seq": 5,
+    "event_type": "message.replied",
+    "payload_json": "{\"reply_text\":\"alpha beta gamma\"}"
+  },
+  {
+    "seq": 6,
     "event_type": "status",
     "payload_json": "{\"kind\":\"done\",\"message\":\"completed\"}"
   }

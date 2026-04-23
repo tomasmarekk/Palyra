@@ -3810,9 +3810,7 @@ fn emit_agent_event_text(event: &common_v1::RunStreamEvent) -> Result<()> {
         Some(common_v1::run_stream_event::Body::ModelToken(token)) => {
             println!(
                 "agent.token run_id={} token={} final={}",
-                run_id,
-                redacted_presence_for_output(!token.token.trim().is_empty()),
-                token.is_final
+                run_id, token.token, token.is_final
             );
         }
         Some(common_v1::run_stream_event::Body::Status(status)) => {
@@ -3915,7 +3913,7 @@ fn emit_acp_event_ndjson(event: &common_v1::RunStreamEvent) -> Result<()> {
         Some(common_v1::run_stream_event::Body::ModelToken(token)) => json!({
             "type": "model.token",
             "run_id": run_id,
-            "token": redacted_presence_json_value(!token.token.trim().is_empty()),
+            "token": token.token,
             "is_final": token.is_final,
         }),
         Some(common_v1::run_stream_event::Body::Status(status)) => json!({
