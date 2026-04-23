@@ -339,6 +339,67 @@ anthropic_api_key_vault_ref = "global/minimax_api_key"
 }
 
 #[test]
+fn models_set_preserves_minimax_legacy_anthropic_provider() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let config_path = workdir.path().join("palyra.toml");
+    fs::write(
+        &config_path,
+        r#"
+version = 1
+[model_provider]
+kind = "anthropic"
+auth_provider_kind = "minimax"
+anthropic_base_url = "https://api.minimax.io/anthropic"
+anthropic_model = "MiniMax-M2.7"
+anthropic_api_key_vault_ref = "global/minimax_api_key"
+"#,
+    )
+    .with_context(|| format!("failed to write {}", config_path.display()))?;
+    let config_path_string = config_path.to_string_lossy().into_owned();
+
+    let output = run_cli(
+        &workdir,
+        &["models", "set", "MiniMax-M2.7", "--path", &config_path_string, "--json"],
+    )?;
+    assert!(
+        output.status.success(),
+        "models set should preserve MiniMax legacy config: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).context("stdout was not valid UTF-8")?;
+    let payload: Value = serde_json::from_str(stdout.as_str()).context("stdout was not JSON")?;
+    assert_eq!(
+        payload.get("provider_kind").and_then(Value::as_str),
+        Some("anthropic"),
+        "models set should report the preserved provider kind: {payload}"
+    );
+
+    let config_body = fs::read_to_string(&config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    assert!(
+        config_body.contains("kind = \"anthropic\""),
+        "models set must preserve the Anthropic-compatible provider kind: {config_body}"
+    );
+    assert!(
+        config_body.contains("auth_provider_kind = \"minimax\""),
+        "models set must preserve MiniMax auth provider selection: {config_body}"
+    );
+    assert!(
+        config_body.contains("anthropic_model = \"MiniMax-M2.7\""),
+        "models set should update the Anthropic-compatible model key: {config_body}"
+    );
+    assert!(
+        !config_body.contains("openai_base_url"),
+        "models set must not inject an OpenAI base URL into MiniMax configs: {config_body}"
+    );
+    assert!(
+        !config_body.contains("openai_model"),
+        "models set must not create an OpenAI text model key in MiniMax configs: {config_body}"
+    );
+    Ok(())
+}
+
+#[test]
 fn models_test_connection_discovers_live_models_with_cache() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let state_root = workdir.path().join("state");

@@ -495,39 +495,46 @@ pub(crate) fn mutate_model_defaults(
         .with_context(|| format!("failed to parse {}", path_ref.display()))?;
     let has_registry = registry_configured(&document)?;
     if !has_registry {
-        set_value_at_path(
-            &mut document,
-            "model_provider.kind",
-            toml::Value::String(OPENAI_COMPATIBLE_PROVIDER_KIND.to_owned()),
-        )
-        .context("invalid config key path: model_provider.kind")?;
-        let existing_base_url =
-            get_string_value_at_path(&document, "model_provider.openai_base_url")?;
-        if existing_base_url.is_none() {
+        let provider_kind = legacy_provider_kind_for_mutation(&document)?;
+        if get_string_value_at_path(&document, "model_provider.kind")?.is_none() {
             set_value_at_path(
                 &mut document,
-                "model_provider.openai_base_url",
-                toml::Value::String(OPENAI_DEFAULT_BASE_URL.to_owned()),
+                "model_provider.kind",
+                toml::Value::String(provider_kind.clone()),
             )
-            .context("invalid config key path: model_provider.openai_base_url")?;
+            .context("invalid config key path: model_provider.kind")?;
+        }
+        if provider_kind == OPENAI_COMPATIBLE_PROVIDER_KIND {
+            let existing_base_url =
+                get_string_value_at_path(&document, "model_provider.openai_base_url")?;
+            if existing_base_url.is_none() {
+                set_value_at_path(
+                    &mut document,
+                    "model_provider.openai_base_url",
+                    toml::Value::String(OPENAI_DEFAULT_BASE_URL.to_owned()),
+                )
+                .context("invalid config key path: model_provider.openai_base_url")?;
+            }
         }
     }
 
     match target {
         "text" => {
-            let key = if has_registry {
-                "model_provider.default_chat_model_id"
+            let key = if !has_registry {
+                let provider_kind = legacy_provider_kind_for_mutation(&document)?;
+                legacy_text_model_key(provider_kind.as_str())?
             } else {
-                "model_provider.openai_model"
+                "model_provider.default_chat_model_id"
             };
             set_value_at_path(&mut document, key, toml::Value::String(model.clone()))
                 .with_context(|| format!("invalid config key path: {key}"))?;
         }
         "embeddings" => {
-            let key = if has_registry {
-                "model_provider.default_embeddings_model_id"
+            let key = if !has_registry {
+                let provider_kind = legacy_provider_kind_for_mutation(&document)?;
+                legacy_embeddings_model_key(provider_kind.as_str())?
             } else {
-                "model_provider.openai_embeddings_model"
+                "model_provider.default_embeddings_model_id"
             };
             set_value_at_path(&mut document, key, toml::Value::String(model.clone()))
                 .with_context(|| format!("invalid config key path: {key}"))?;
@@ -557,6 +564,54 @@ pub(crate) fn mutate_model_defaults(
         embeddings_dims: dims,
         backups,
     })
+}
+
+fn legacy_provider_kind_for_mutation(document: &toml::Value) -> Result<String> {
+    Ok(get_string_value_at_path(document, "model_provider.kind")?
+        .as_deref()
+        .map(normalize_legacy_provider_kind)
+        .transpose()?
+        .unwrap_or_else(|| OPENAI_COMPATIBLE_PROVIDER_KIND.to_owned()))
+}
+
+fn normalize_legacy_provider_kind(raw: &str) -> Result<String> {
+    let normalized = raw.trim().to_ascii_lowercase().replace('-', "_");
+    match normalized.as_str() {
+        OPENAI_COMPATIBLE_PROVIDER_KIND | "openai" => {
+            Ok(OPENAI_COMPATIBLE_PROVIDER_KIND.to_owned())
+        }
+        ANTHROPIC_PROVIDER_KIND => Ok(ANTHROPIC_PROVIDER_KIND.to_owned()),
+        DETERMINISTIC_PROVIDER_KIND => Ok(DETERMINISTIC_PROVIDER_KIND.to_owned()),
+        _ => anyhow::bail!(
+            "model_provider.kind must be one of deterministic, openai_compatible, or anthropic"
+        ),
+    }
+}
+
+fn legacy_text_model_key(provider_kind: &str) -> Result<&'static str> {
+    match provider_kind {
+        OPENAI_COMPATIBLE_PROVIDER_KIND | DETERMINISTIC_PROVIDER_KIND => {
+            Ok("model_provider.openai_model")
+        }
+        ANTHROPIC_PROVIDER_KIND => Ok("model_provider.anthropic_model"),
+        _ => anyhow::bail!(
+            "model_provider.kind must be one of deterministic, openai_compatible, or anthropic"
+        ),
+    }
+}
+
+fn legacy_embeddings_model_key(provider_kind: &str) -> Result<&'static str> {
+    match provider_kind {
+        OPENAI_COMPATIBLE_PROVIDER_KIND | DETERMINISTIC_PROVIDER_KIND => {
+            Ok("model_provider.openai_embeddings_model")
+        }
+        ANTHROPIC_PROVIDER_KIND => anyhow::bail!(
+            "legacy anthropic model provider configs do not support embeddings defaults; configure model_provider.default_embeddings_model_id with a provider registry"
+        ),
+        _ => anyhow::bail!(
+            "model_provider.kind must be one of deterministic, openai_compatible, or anthropic"
+        ),
+    }
 }
 
 pub(crate) fn load_models_status(path: Option<String>) -> Result<ModelsStatusPayload> {
