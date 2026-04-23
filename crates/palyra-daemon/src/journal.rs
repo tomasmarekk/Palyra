@@ -2841,6 +2841,8 @@ pub enum JournalError {
     DuplicateCanvasStateVersion { canvas_id: String, state_version: u64 },
     #[error("cron job not found: {job_id}")]
     CronJobNotFound { job_id: String },
+    #[error("cron job has an active run and cannot be deleted: {job_id}")]
+    CronJobHasActiveRuns { job_id: String },
     #[error("cron run not found: {run_id}")]
     CronRunNotFound { run_id: String },
     #[error("memory item not found: {memory_id}")]
@@ -9420,9 +9422,26 @@ impl JournalStore {
     }
 
     pub fn delete_cron_job(&self, job_id: &str) -> Result<bool, JournalError> {
-        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction()?;
+        let active_runs = transaction.query_row(
+            r#"
+                SELECT COUNT(*)
+                FROM cron_runs
+                WHERE job_ulid = ?1
+                  AND status IN ('accepted', 'running')
+            "#,
+            params![job_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if active_runs > 0 {
+            return Err(JournalError::CronJobHasActiveRuns { job_id: job_id.to_owned() });
+        }
+
+        transaction.execute("DELETE FROM cron_runs WHERE job_ulid = ?1", params![job_id])?;
         let deleted =
-            guard.execute("DELETE FROM cron_jobs WHERE job_ulid = ?1", params![job_id])?;
+            transaction.execute("DELETE FROM cron_jobs WHERE job_ulid = ?1", params![job_id])?;
+        transaction.commit()?;
         Ok(deleted > 0)
     }
 
@@ -18235,6 +18254,61 @@ mod tests {
             .expect("cron runs listing should succeed");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].run_id, "01ARZ3NDEKTSV4RRFFQ69G5FBD");
+    }
+
+    #[test]
+    fn cron_job_delete_removes_terminal_run_history() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let job = store
+            .create_cron_job(&sample_cron_job_request("01ARZ3NDEKTSV4RRFFQ69G5FBM"))
+            .expect("cron job should be inserted");
+
+        store
+            .start_cron_run(&CronRunStartRequest {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FBK".to_owned(),
+                job_id: job.job_id.clone(),
+                attempt: 1,
+                session_id: None,
+                orchestrator_run_id: None,
+                status: CronRunStatus::Skipped,
+                error_kind: Some("quiet_hours".to_owned()),
+                error_message_redacted: Some("quiet hours".to_owned()),
+            })
+            .expect("skipped cron run should persist");
+        store
+            .finalize_cron_run(&CronRunFinalizeRequest {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FBK".to_owned(),
+                status: CronRunStatus::Skipped,
+                error_kind: Some("quiet_hours".to_owned()),
+                error_message_redacted: Some("quiet hours".to_owned()),
+                model_tokens_in: 0,
+                model_tokens_out: 0,
+                tool_calls: 0,
+                tool_denies: 0,
+                orchestrator_run_id: None,
+                session_id: None,
+            })
+            .expect("skipped cron run should finalize");
+
+        let deleted = store
+            .delete_cron_job(job.job_id.as_str())
+            .expect("cron job delete should remove terminal run history first");
+
+        assert!(deleted, "cron job should be deleted");
+        assert!(
+            store.cron_job(job.job_id.as_str()).expect("cron job lookup should succeed").is_none(),
+            "cron job should no longer exist"
+        );
+        let remaining_runs = store
+            .list_cron_runs(CronRunsListFilter {
+                job_id: Some(job.job_id.as_str()),
+                after_run_id: None,
+                limit: 10,
+            })
+            .expect("cron run listing should succeed");
+        assert!(remaining_runs.is_empty(), "terminal run history should be removed");
     }
 
     #[test]
