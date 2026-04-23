@@ -166,7 +166,13 @@ fn run_unavailable_logs(
                 return run_journal_logs(db_path.as_path(), lines, true, poll_interval_ms);
             }
             LogInput::File { source, path } => {
-                return run_file_logs(source.as_str(), path.as_path(), lines, true, poll_interval_ms);
+                return run_file_logs(
+                    source.as_str(),
+                    path.as_path(),
+                    lines,
+                    true,
+                    poll_interval_ms,
+                );
             }
         }
     }

@@ -325,9 +325,7 @@ fn setup_wizard_stores_minimax_secret_in_state_root_vault_by_default() -> Result
     );
 
     let state_root = workdir.path().join("state-root");
-    let scope = "global"
-        .parse::<VaultScope>()
-        .context("failed to parse global vault scope")?;
+    let scope = "global".parse::<VaultScope>().context("failed to parse global vault scope")?;
     let vault = Vault::open_with_config(VaultConfigOptions {
         root: Some(state_root.join("vault")),
         identity_store_root: Some(state_root.join("identity")),

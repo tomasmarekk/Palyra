@@ -101,16 +101,13 @@ anthropic_api_key_vault_ref = "global/minimax_api_key"
         Some(1)
     );
     assert!(
-        payload
-            .pointer("/diagnostics/checks")
-            .and_then(Value::as_array)
-            .is_some_and(|checks| {
-                checks.iter().any(|check| {
-                    check.get("key").and_then(Value::as_str) == Some("config_secret_refs_ok")
-                        && check.get("ok").and_then(Value::as_bool) == Some(false)
-                        && check.get("severity").and_then(Value::as_str) == Some("blocking")
-                })
-            }),
+        payload.pointer("/diagnostics/checks").and_then(Value::as_array).is_some_and(|checks| {
+            checks.iter().any(|check| {
+                check.get("key").and_then(Value::as_str) == Some("config_secret_refs_ok")
+                    && check.get("ok").and_then(Value::as_bool) == Some(false)
+                    && check.get("severity").and_then(Value::as_str) == Some("blocking")
+            })
+        }),
         "doctor checks should include a blocking config_secret_refs_ok failure: {payload}"
     );
     Ok(())

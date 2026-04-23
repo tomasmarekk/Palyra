@@ -1307,11 +1307,7 @@ fn build_local_doctor_config_ref_health_snapshot() -> Option<Value> {
 }
 
 fn build_doctor_config_ref_health_check(config_ref_health: Option<&Value>) -> Option<DoctorCheck> {
-    match config_ref_health?
-        .get("severity")
-        .and_then(Value::as_str)
-        .unwrap_or("info")
-    {
+    match config_ref_health?.get("severity").and_then(Value::as_str).unwrap_or("info") {
         "blocking" => Some(DoctorCheck::blocking(
             "config_secret_refs_ok",
             false,

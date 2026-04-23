@@ -528,10 +528,7 @@ enabled = true
     assert_eq!(provider.get("live_discovery_verified").and_then(Value::as_bool), Some(false));
     assert_eq!(provider.get("discovery_source").and_then(Value::as_str), Some("registry_fallback"));
     assert_eq!(
-        provider
-            .get("discovered_model_ids")
-            .and_then(Value::as_array)
-            .map(Vec::len),
+        provider.get("discovered_model_ids").and_then(Value::as_array).map(Vec::len),
         Some(0)
     );
     assert_eq!(
