@@ -62,8 +62,10 @@ struct LocalSecurityConfigSnapshot {
     path_exists: bool,
     provider_kind: String,
     auth_profile_id: Option<String>,
-    api_key_vault_ref: Option<String>,
-    inline_api_key: bool,
+    openai_api_key_vault_ref: Option<String>,
+    openai_inline_api_key: bool,
+    anthropic_api_key_vault_ref: Option<String>,
+    anthropic_inline_api_key: bool,
     browser_service_enabled: bool,
     browser_service_auth_token_configured: bool,
     effective_provider_kind: Option<String>,
@@ -209,23 +211,35 @@ fn build_security_findings(
         });
     }
 
-    if should_flag_missing_model_provider_auth(local_config) {
+    if let Some(provider_kind) = missing_model_provider_auth_kind(local_config) {
         findings.push(SecurityFinding {
             severity: "blocking".to_owned(),
             code: "model_provider_missing_auth".to_owned(),
             component: "model_provider".to_owned(),
-            message: "OpenAI-compatible model provider is configured without any auth source.".to_owned(),
-            remediation: "Configure OpenAI auth with `palyra auth openai api-key` or select a default auth profile before relying on the runtime.".to_owned(),
+            message: missing_model_provider_auth_message(provider_kind),
+            remediation: missing_model_provider_auth_remediation(provider_kind),
         });
     }
 
-    if local_config.inline_api_key {
+    if local_config.openai_inline_api_key {
         findings.push(SecurityFinding {
             severity: "warning".to_owned(),
             code: "inline_api_key".to_owned(),
             component: "model_provider".to_owned(),
             message: "The OpenAI API key is configured inline in the daemon config.".to_owned(),
             remediation: "Move the credential into the vault via `palyra auth openai api-key` or `palyra secrets configure openai-api-key`.".to_owned(),
+        });
+    }
+    if local_config.anthropic_inline_api_key {
+        findings.push(SecurityFinding {
+            severity: "warning".to_owned(),
+            code: "inline_api_key".to_owned(),
+            component: "model_provider".to_owned(),
+            message: "The Anthropic-compatible API key is configured inline in the daemon config."
+                .to_owned(),
+            remediation:
+                "Move the credential into the vault via `palyra configure --section auth-model` before relying on the runtime."
+                    .to_owned(),
         });
     }
 
@@ -383,18 +397,65 @@ fn build_security_findings(
     findings
 }
 
-fn should_flag_missing_model_provider_auth(local_config: &LocalSecurityConfigSnapshot) -> bool {
-    if local_config.provider_kind != "openai_compatible"
-        || local_config.auth_profile_id.is_some()
-        || local_config.api_key_vault_ref.is_some()
-        || local_config.inline_api_key
-    {
-        return false;
+fn missing_model_provider_auth_kind(local_config: &LocalSecurityConfigSnapshot) -> Option<&'static str> {
+    let effective_provider_kind = local_config
+        .effective_provider_kind
+        .as_deref()
+        .map(normalize_provider_kind)
+        .unwrap_or_else(|| normalize_provider_kind(local_config.provider_kind.as_str()));
+    let provider_kind = match effective_provider_kind.as_str() {
+        "openai_compatible" => "openai_compatible",
+        "anthropic" => "anthropic",
+        _ => return None,
+    };
+    if model_provider_auth_configured(local_config, provider_kind) {
+        return None;
     }
+    Some(provider_kind)
+}
 
-    match local_config.effective_provider_kind.as_deref() {
-        Some("openai_compatible") | None => true,
-        Some(_) => false,
+fn normalize_provider_kind(kind: &str) -> String {
+    kind.trim().to_ascii_lowercase().replace('-', "_")
+}
+
+fn model_provider_auth_configured(
+    local_config: &LocalSecurityConfigSnapshot,
+    provider_kind: &str,
+) -> bool {
+    if local_config.auth_profile_id.is_some() {
+        return true;
+    }
+    match provider_kind {
+        "openai_compatible" => {
+            local_config.openai_api_key_vault_ref.is_some() || local_config.openai_inline_api_key
+        }
+        "anthropic" => {
+            local_config.anthropic_api_key_vault_ref.is_some()
+                || local_config.anthropic_inline_api_key
+        }
+        _ => true,
+    }
+}
+
+fn missing_model_provider_auth_message(provider_kind: &str) -> String {
+    match provider_kind {
+        "anthropic" => {
+            "Anthropic-compatible model provider is configured without any auth source.".to_owned()
+        }
+        _ => "OpenAI-compatible model provider is configured without any auth source.".to_owned(),
+    }
+}
+
+fn missing_model_provider_auth_remediation(provider_kind: &str) -> String {
+    match provider_kind {
+        "anthropic" => {
+            "Configure Anthropic-compatible auth with `palyra configure --section auth-model` or select a default auth profile before relying on the runtime."
+                .to_owned()
+        }
+        _ => {
+            "Configure OpenAI auth with `palyra auth openai api-key` or select a default auth profile before relying on the runtime."
+                .to_owned()
+        }
     }
 }
 
@@ -509,8 +570,10 @@ fn load_local_security_config_snapshot(
                     path_exists: false,
                     provider_kind: "deterministic".to_owned(),
                     auth_profile_id: None,
-                    api_key_vault_ref: None,
-                    inline_api_key: false,
+                    openai_api_key_vault_ref: None,
+                    openai_inline_api_key: false,
+                    anthropic_api_key_vault_ref: None,
+                    anthropic_inline_api_key: false,
                     browser_service_enabled: false,
                     browser_service_auth_token_configured: false,
                     effective_provider_kind: None,
@@ -541,13 +604,23 @@ fn load_local_security_config_snapshot(
                 .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned)
         });
-    let api_key_vault_ref =
+    let openai_api_key_vault_ref =
         get_value_at_path(&document, "model_provider.openai_api_key_vault_ref")?
             .and_then(toml::Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned);
-    let inline_api_key = get_value_at_path(&document, "model_provider.openai_api_key")?
+    let openai_inline_api_key = get_value_at_path(&document, "model_provider.openai_api_key")?
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    let anthropic_api_key_vault_ref =
+        get_value_at_path(&document, "model_provider.anthropic_api_key_vault_ref")?
+            .and_then(toml::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+    let anthropic_inline_api_key = get_value_at_path(&document, "model_provider.anthropic_api_key")?
         .and_then(toml::Value::as_str)
         .map(str::trim)
         .is_some_and(|value| !value.is_empty());
@@ -567,8 +640,10 @@ fn load_local_security_config_snapshot(
         path_exists: true,
         provider_kind,
         auth_profile_id,
-        api_key_vault_ref,
-        inline_api_key,
+        openai_api_key_vault_ref,
+        openai_inline_api_key,
+        anthropic_api_key_vault_ref,
+        anthropic_inline_api_key,
         browser_service_enabled,
         browser_service_auth_token_configured,
         effective_provider_kind,
@@ -713,8 +788,10 @@ mod tests {
             path_exists: true,
             provider_kind: "openai_compatible".to_owned(),
             auth_profile_id: None,
-            api_key_vault_ref: None,
-            inline_api_key: false,
+            openai_api_key_vault_ref: None,
+            openai_inline_api_key: false,
+            anthropic_api_key_vault_ref: None,
+            anthropic_inline_api_key: false,
             browser_service_enabled: false,
             browser_service_auth_token_configured: false,
             effective_provider_kind: None,
@@ -740,8 +817,10 @@ mod tests {
             path_exists: true,
             provider_kind: "openai_compatible".to_owned(),
             auth_profile_id: None,
-            api_key_vault_ref: None,
-            inline_api_key: false,
+            openai_api_key_vault_ref: None,
+            openai_inline_api_key: false,
+            anthropic_api_key_vault_ref: None,
+            anthropic_inline_api_key: false,
             browser_service_enabled: false,
             browser_service_auth_token_configured: false,
             effective_provider_kind: Some("deterministic".to_owned()),
@@ -767,8 +846,10 @@ mod tests {
             path_exists: true,
             provider_kind: "openai_compatible".to_owned(),
             auth_profile_id: None,
-            api_key_vault_ref: None,
-            inline_api_key: false,
+            openai_api_key_vault_ref: None,
+            openai_inline_api_key: false,
+            anthropic_api_key_vault_ref: None,
+            anthropic_inline_api_key: false,
             browser_service_enabled: false,
             browser_service_auth_token_configured: false,
             effective_provider_kind: Some("openai_compatible".to_owned()),
@@ -788,14 +869,45 @@ mod tests {
     }
 
     #[test]
+    fn security_audit_ignores_missing_model_provider_auth_for_anthropic_vault_ref() {
+        let doctor = minimal_doctor();
+        let local = LocalSecurityConfigSnapshot {
+            path_exists: true,
+            provider_kind: "anthropic".to_owned(),
+            auth_profile_id: None,
+            openai_api_key_vault_ref: None,
+            openai_inline_api_key: false,
+            anthropic_api_key_vault_ref: Some("global/minimax_api_key".to_owned()),
+            anthropic_inline_api_key: false,
+            browser_service_enabled: false,
+            browser_service_auth_token_configured: false,
+            effective_provider_kind: Some("anthropic".to_owned()),
+        };
+        let runtime = RuntimeSecuritySnapshot {
+            used_runtime_posture: false,
+            deployment: None,
+            auth_summary: None,
+            browser: None,
+            error: None,
+        };
+        let findings = build_security_findings(&doctor, &local, &runtime, &minimal_secrets());
+        assert!(
+            !findings.iter().any(|finding| finding.code == "model_provider_missing_auth"),
+            "security audit should not flag missing auth when Anthropic-compatible vault auth is configured"
+        );
+    }
+
+    #[test]
     fn security_audit_flags_remote_bind_without_tls() {
         let doctor = minimal_doctor();
         let local = LocalSecurityConfigSnapshot {
             path_exists: true,
             provider_kind: "deterministic".to_owned(),
             auth_profile_id: None,
-            api_key_vault_ref: None,
-            inline_api_key: false,
+            openai_api_key_vault_ref: None,
+            openai_inline_api_key: false,
+            anthropic_api_key_vault_ref: None,
+            anthropic_inline_api_key: false,
             browser_service_enabled: false,
             browser_service_auth_token_configured: false,
             effective_provider_kind: Some("deterministic".to_owned()),
@@ -847,8 +959,10 @@ mod tests {
             path_exists: true,
             provider_kind: "deterministic".to_owned(),
             auth_profile_id: None,
-            api_key_vault_ref: None,
-            inline_api_key: false,
+            openai_api_key_vault_ref: None,
+            openai_inline_api_key: false,
+            anthropic_api_key_vault_ref: None,
+            anthropic_inline_api_key: false,
             browser_service_enabled: true,
             browser_service_auth_token_configured: true,
             effective_provider_kind: Some("deterministic".to_owned()),
