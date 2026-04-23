@@ -240,7 +240,7 @@ fn build_onboarding_steps(
             format!("Daemon config is available at {}.", signals.config_path),
             Some(run_cli_action(
                 "Inspect config",
-                format!("palyra config inspect --path {}", signals.config_path),
+                format!("palyra config list --path {}", signals.config_path),
             )),
         )
     } else {
@@ -700,7 +700,12 @@ mod tests {
     use anyhow::Result;
     use tempfile::tempdir;
 
-    use super::load_onboarding_document;
+    use super::{
+        build_onboarding_steps,
+        load_onboarding_document,
+        OnboardingSignals,
+        OnboardingVariant,
+    };
     use crate::{
         app,
         args::RootOptions,
@@ -735,5 +740,30 @@ kind = "anthropic"
 
         app::clear_root_context_for_tests();
         Ok(())
+    }
+
+    #[test]
+    fn config_ready_action_points_to_existing_config_command() {
+        let steps = build_onboarding_steps(
+            OnboardingVariant::Quickstart,
+            &OnboardingSignals {
+                config_exists: true,
+                config_path: "C:/portable/palyra.toml".to_owned(),
+                workspace_root_configured: true,
+                remote_base_url_configured: false,
+                remote_verification_mode: None,
+                remote_posture_safe: true,
+                deployment_warning: None,
+                provider_auth_configured: true,
+                provider_model_selected: true,
+                provider_health_state: "configured".to_owned(),
+                provider_health_message: "configured".to_owned(),
+                model_discovery_ready: true,
+                model_discovery_message: "ready".to_owned(),
+            },
+        );
+        let config_step = steps.iter().find(|step| step.step_id == "config").expect("config step");
+        let action = config_step.action.as_ref().expect("config step action");
+        assert_eq!(action.target, "palyra config list --path C:/portable/palyra.toml");
     }
 }
