@@ -4740,17 +4740,34 @@ fn resolve_daemon_journal_db_path(db_path_override: Option<String>) -> Result<Pa
         }
     }
 
+    let installed_journal_path = discover_installed_journal_db_path()?;
+
     if let Some(context) = app::current_root_context() {
-        return Ok(context.state_root().join(DEFAULT_JOURNAL_DB_PATH));
+        return Ok(select_preferred_journal_db_path(
+            context.state_root().join(DEFAULT_JOURNAL_DB_PATH),
+            installed_journal_path,
+        ));
     }
 
-    if let Some(installed_journal_path) = discover_installed_journal_db_path()? {
+    if let Some(installed_journal_path) = installed_journal_path {
         return Ok(installed_journal_path);
     }
 
     Ok(app::resolve_cli_state_root(None)
         .map(|state_root| state_root.join(DEFAULT_JOURNAL_DB_PATH))
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_JOURNAL_DB_PATH)))
+}
+
+fn select_preferred_journal_db_path(
+    root_context_default_path: PathBuf,
+    installed_journal_path: Option<PathBuf>,
+) -> PathBuf {
+    match installed_journal_path {
+        Some(installed_journal_path) if !root_context_default_path.is_file() => {
+            installed_journal_path
+        }
+        _ => root_context_default_path,
+    }
 }
 
 fn resolve_config_relative_path(config_path: &Path, raw_path: &str) -> PathBuf {
@@ -9972,7 +9989,8 @@ mod doctor_check_tests {
 mod journal_path_tests {
     use super::{
         discover_installed_journal_db_path_from_binary, resolve_config_relative_path,
-        resolve_daemon_journal_db_path, resolve_init_path, DEFAULT_JOURNAL_DB_PATH,
+        resolve_daemon_journal_db_path, resolve_init_path, select_preferred_journal_db_path,
+        DEFAULT_JOURNAL_DB_PATH,
     };
     use crate::support::lifecycle::InstallMetadata;
     use anyhow::Result;
@@ -10090,6 +10108,44 @@ mod journal_path_tests {
 
         assert_eq!(resolved, state_root.join(DEFAULT_JOURNAL_DB_PATH));
         crate::app::clear_root_context_for_tests();
+        Ok(())
+    }
+
+    #[test]
+    fn installed_journal_path_overrides_missing_root_context_default() -> Result<()> {
+        let tempdir = tempdir()?;
+        let root_context_default_path = tempdir.path().join("state-root").join(DEFAULT_JOURNAL_DB_PATH);
+        let installed_journal_path = tempdir.path().join("install").join(DEFAULT_JOURNAL_DB_PATH);
+
+        fs::create_dir_all(installed_journal_path.parent().expect("installed journal parent"))?;
+        fs::write(installed_journal_path.as_path(), [])?;
+
+        let resolved = select_preferred_journal_db_path(
+            root_context_default_path.clone(),
+            Some(installed_journal_path.clone()),
+        );
+
+        assert_eq!(resolved, installed_journal_path);
+        Ok(())
+    }
+
+    #[test]
+    fn existing_root_context_journal_path_wins_over_installed_fallback() -> Result<()> {
+        let tempdir = tempdir()?;
+        let root_context_default_path = tempdir.path().join("state-root").join(DEFAULT_JOURNAL_DB_PATH);
+        let installed_journal_path = tempdir.path().join("install").join(DEFAULT_JOURNAL_DB_PATH);
+
+        fs::create_dir_all(root_context_default_path.parent().expect("root journal parent"))?;
+        fs::write(root_context_default_path.as_path(), [])?;
+        fs::create_dir_all(installed_journal_path.parent().expect("installed journal parent"))?;
+        fs::write(installed_journal_path.as_path(), [])?;
+
+        let resolved = select_preferred_journal_db_path(
+            root_context_default_path.clone(),
+            Some(installed_journal_path),
+        );
+
+        assert_eq!(resolved, root_context_default_path);
         Ok(())
     }
 
