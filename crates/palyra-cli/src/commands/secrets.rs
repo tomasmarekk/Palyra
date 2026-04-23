@@ -224,6 +224,15 @@ pub(crate) fn build_secrets_audit_payload(
         });
     }
     if let Some(reference) =
+        get_string_value_at_path(&document, "model_provider.anthropic_api_key_vault_ref")?
+    {
+        candidates.push(SecretReferenceCandidate {
+            component: "model_provider".to_owned(),
+            reference_kind: "model_provider_api_key".to_owned(),
+            reference,
+        });
+    }
+    if let Some(reference) =
         get_string_value_at_path(&document, "tool_call.browser_service.state_key_vault_ref")?
     {
         candidates.push(SecretReferenceCandidate {
@@ -680,7 +689,7 @@ fn read_secret_bytes_from_stdin(value_stdin: bool) -> Result<Vec<u8>> {
 fn load_config_document_for_audit(path: Option<String>) -> Result<(String, toml::Value)> {
     let resolved = match path {
         Some(path) => resolve_config_path(Some(path), false)?,
-        None => match find_default_config_path() {
+        None => match effective_config_path() {
             Some(path) => path,
             None => {
                 let (document, _) = parse_document_with_migration("")

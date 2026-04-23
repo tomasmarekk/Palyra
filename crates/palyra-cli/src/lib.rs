@@ -850,6 +850,11 @@ fn build_doctor_report(checks: &[DoctorCheck]) -> Result<DoctorReport> {
     let deployment = collect_doctor_deployment_snapshot();
     let skills = build_default_skills_inventory_snapshot();
     let config_ref_health = collect_doctor_config_ref_health_snapshot(admin_payload.as_ref());
+    let mut checks = checks.to_vec();
+    if let Some(config_ref_check) = build_doctor_config_ref_health_check(config_ref_health.as_ref())
+    {
+        checks.push(config_ref_check);
+    }
 
     let required_checks_total = checks.iter().filter(|check| check.required).count();
     let required_checks_ok = checks.iter().filter(|check| check.required && check.ok).count();
@@ -937,7 +942,7 @@ fn collect_doctor_config_snapshot() -> DoctorConfigSnapshot {
 }
 
 fn collect_doctor_identity_snapshot() -> DoctorIdentitySnapshot {
-    match default_identity_store_root() {
+    match resolve_cli_identity_store_root() {
         Ok(store_root) => {
             let exists = store_root.exists();
             let writable = is_directory_writable(store_root.as_path()).unwrap_or(false);
@@ -1215,7 +1220,110 @@ fn collect_doctor_browser_snapshot(
 }
 
 fn collect_doctor_config_ref_health_snapshot(admin_payload: Option<&Value>) -> Option<Value> {
-    admin_payload.and_then(|payload| payload.pointer("/observability/config_ref_health").cloned())
+    admin_payload
+        .and_then(|payload| payload.pointer("/observability/config_ref_health").cloned())
+        .or_else(build_local_doctor_config_ref_health_snapshot)
+}
+
+fn build_local_doctor_config_ref_health_snapshot() -> Option<Value> {
+    let audit = commands::secrets::build_secrets_audit_payload(None, true).ok()?;
+    let mut healthy = 0_u64;
+    let mut missing = 0_u64;
+    let mut failed = 0_u64;
+    let mut stale = 0_u64;
+    let items = audit
+        .references
+        .iter()
+        .map(|reference| {
+            let severity = if reference.status == "resolved" { "info" } else { "blocking" };
+            match reference.status.as_str() {
+                "resolved" => healthy = healthy.saturating_add(1),
+                "missing" => missing = missing.saturating_add(1),
+                "invalid" => failed = failed.saturating_add(1),
+                "stale" => stale = stale.saturating_add(1),
+                _ => failed = failed.saturating_add(1),
+            }
+            json!({
+                "ref_id": format!("{}:{}", reference.component, reference.reference),
+                "component": reference.component,
+                "config_path": reference.reference_kind,
+                "state": reference.status,
+                "severity": severity,
+                "reload_mode": "unknown",
+                "scope": reference.scope,
+                "advice": if reference.status == "resolved" {
+                    None::<String>
+                } else {
+                    Some("Store the referenced secret in the configured scope/key, or update the config to the correct vault ref.".to_owned())
+                },
+                "last_error": if reference.status == "resolved" {
+                    None::<String>
+                } else {
+                    Some(reference.detail.clone())
+                },
+                "value_bytes": if reference.status == "resolved" { Some(1_u64) } else { None::<u64> },
+            })
+        })
+        .collect::<Vec<_>>();
+    let blocking_refs = audit.summary.blocking_findings as u64;
+    let warning_refs = audit.summary.warning_findings as u64;
+    let recommendations = audit
+        .findings
+        .iter()
+        .map(|finding| finding.remediation.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let (state, severity) = if blocking_refs > 0 {
+        ("blocking", "blocking")
+    } else if warning_refs > 0 {
+        ("degraded", "warning")
+    } else {
+        ("ok", "info")
+    };
+    Some(json!({
+        "state": state,
+        "severity": severity,
+        "summary": {
+            "total_refs": audit.summary.total_references,
+            "healthy": healthy,
+            "missing": missing,
+            "blocked": blocking_refs,
+            "failed": failed,
+            "stale": stale,
+            "hot_safe_refs": 0,
+            "restart_required_refs": 0,
+            "blocked_while_runs_active_refs": 0,
+            "manual_review_refs": 0,
+            "blocking_refs": blocking_refs,
+            "warning_refs": warning_refs,
+            "latest_snapshot_generation": 0,
+            "latest_snapshot_at_unix_ms": Value::Null,
+            "active_runs": 0,
+        },
+        "recommendations": recommendations,
+        "items": items,
+    }))
+}
+
+fn build_doctor_config_ref_health_check(config_ref_health: Option<&Value>) -> Option<DoctorCheck> {
+    match config_ref_health?
+        .get("severity")
+        .and_then(Value::as_str)
+        .unwrap_or("info")
+    {
+        "blocking" => Some(DoctorCheck::blocking(
+            "config_secret_refs_ok",
+            false,
+            &["palyra secrets inventory --json", "palyra secrets plan --json"],
+        )),
+        "warning" => Some(DoctorCheck::warning(
+            "config_secret_refs_ok",
+            false,
+            &["palyra secrets inventory --json", "palyra secrets plan --json"],
+        )),
+        _ => None,
+    }
 }
 
 fn collect_doctor_access_snapshot() -> DoctorAccessSnapshot {
