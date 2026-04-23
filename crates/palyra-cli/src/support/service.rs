@@ -340,12 +340,10 @@ fn build_windows_task_install_error(
     wrapper_path: &Path,
     output: &Output,
 ) -> anyhow::Error {
-    let status = output
-        .status
-        .code()
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "unknown".to_owned());
-    let detail = summarize_command_output(output).unwrap_or_else(|| "no additional output".to_owned());
+    let status =
+        output.status.code().map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_owned());
+    let detail =
+        summarize_command_output(output).unwrap_or_else(|| "no additional output".to_owned());
     anyhow!(
         "failed to {operation} Windows scheduled task {task_name} (wrapper: {}): schtasks exited with status {status}; {detail}. Use `palyra gateway run` for a foreground runtime, or remove the conflicting scheduled task / fix the current user-task permissions and retry `palyra gateway install --start`.",
         wrapper_path.display()
@@ -891,11 +889,14 @@ mod tests {
     fn summarize_command_output_combines_stdout_and_stderr() {
         let output = Output {
             status: std::process::ExitStatus::from_raw(1),
-            stdout: b"ERROR: Syst\xc3\xa9m nem\xc5\xaf\xc5\xbee nal\xc3\xa9zt uveden\xc3\xbd soubor.".to_vec(),
+            stdout:
+                b"ERROR: Syst\xc3\xa9m nem\xc5\xaf\xc5\xbee nal\xc3\xa9zt uveden\xc3\xbd soubor."
+                    .to_vec(),
             stderr: b"ERROR: P\xc5\x99\xc3\xadstup byl odep\xc5\x99en.".to_vec(),
         };
 
-        let summary = summarize_command_output(&output).expect("summary should include command output");
+        let summary =
+            summarize_command_output(&output).expect("summary should include command output");
         assert!(summary.contains("stdout: ERROR:"));
         assert!(summary.contains("stderr: ERROR:"));
     }

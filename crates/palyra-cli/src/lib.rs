@@ -1125,7 +1125,10 @@ fn collect_doctor_connectivity_snapshot(
 fn resolve_doctor_admin_connection(daemon_url: &str) -> Result<Option<app::HttpConnection>> {
     if let Some(context) = app::current_root_context() {
         return context
-            .resolve_http_connection(app::ConnectionOverrides::default(), app::ConnectionDefaults::ADMIN)
+            .resolve_http_connection(
+                app::ConnectionOverrides::default(),
+                app::ConnectionDefaults::ADMIN,
+            )
             .map(Some);
     }
 

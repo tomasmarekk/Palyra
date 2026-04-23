@@ -397,7 +397,9 @@ fn build_security_findings(
     findings
 }
 
-fn missing_model_provider_auth_kind(local_config: &LocalSecurityConfigSnapshot) -> Option<&'static str> {
+fn missing_model_provider_auth_kind(
+    local_config: &LocalSecurityConfigSnapshot,
+) -> Option<&'static str> {
     let effective_provider_kind = local_config
         .effective_provider_kind
         .as_deref()
@@ -620,10 +622,11 @@ fn load_local_security_config_snapshot(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned);
-    let anthropic_inline_api_key = get_value_at_path(&document, "model_provider.anthropic_api_key")?
-        .and_then(toml::Value::as_str)
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty());
+    let anthropic_inline_api_key =
+        get_value_at_path(&document, "model_provider.anthropic_api_key")?
+            .and_then(toml::Value::as_str)
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
     let browser_service_enabled =
         get_value_at_path(&document, "tool_call.browser_service.enabled")?
             .and_then(toml::Value::as_bool)

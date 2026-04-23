@@ -34,9 +34,7 @@ fn run_cli(workdir: &TempDir, args: &[&str]) -> Result<Output> {
 fn spawn_doctor_http_server(admin_token: &str) -> Result<(String, thread::JoinHandle<Result<()>>)> {
     let listener = TcpListener::bind("127.0.0.1:0").context("failed to bind doctor test server")?;
     let address = listener.local_addr().context("failed to read doctor test server address")?;
-    listener
-        .set_nonblocking(true)
-        .context("failed to mark doctor test server as non-blocking")?;
+    listener.set_nonblocking(true).context("failed to mark doctor test server as non-blocking")?;
     let expected_auth = format!("authorization: bearer {}", admin_token.to_ascii_lowercase());
     let handle = thread::spawn(move || -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -81,7 +79,10 @@ fn spawn_doctor_http_server(admin_token: &str) -> Result<(String, thread::JoinHa
                 .write_all(response.as_bytes())
                 .context("failed to write doctor test response")?;
         }
-        assert!(saw_admin_probe, "doctor should request /admin/v1/status when config resolves admin auth");
+        assert!(
+            saw_admin_probe,
+            "doctor should request /admin/v1/status when config resolves admin auth"
+        );
         Ok(())
     });
     Ok((format!("http://{address}"), handle))
@@ -222,10 +223,8 @@ fn doctor_uses_configured_admin_token_for_admin_probe() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let admin_token = "config-admin-token";
     let (daemon_url, server_handle) = spawn_doctor_http_server(admin_token)?;
-    let daemon_port = daemon_url
-        .rsplit(':')
-        .next()
-        .context("doctor test server URL should include a port")?;
+    let daemon_port =
+        daemon_url.rsplit(':').next().context("doctor test server URL should include a port")?;
     let config_path = workdir.path().join("admin-config-palyra.toml");
     fs::write(
         config_path.as_path(),
@@ -251,9 +250,9 @@ auth_token = "{admin_token}"
         .current_dir(workdir.path())
         .args(["--config", config_path_string.as_str(), "doctor", "--json"])
         .env("PALYRA_DAEMON_URL", daemon_url.as_str());
-    let output = command
-        .output()
-        .with_context(|| format!("failed to execute palyra --config {} doctor --json", config_path.display()))?;
+    let output = command.output().with_context(|| {
+        format!("failed to execute palyra --config {} doctor --json", config_path.display())
+    })?;
     let server_result = server_handle.join();
     if let Err(panic) = server_result {
         anyhow::bail!(
