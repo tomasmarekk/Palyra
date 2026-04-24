@@ -994,6 +994,7 @@ fn credential_availability_state(
             "auth_expired" => "auth_expired",
             "permission_denied" => "permission_denied",
             "rate_limited" => "rate_limited",
+            "quota_exceeded" => "quota_exceeded",
             "context_window_exceeded" | "content_policy_blocked" => "available",
             "network_unavailable"
             | "provider_timeout"
@@ -1216,7 +1217,12 @@ impl ProviderError {
             | Self::InvalidResponse { message, .. } => message.clone(),
             Self::StatePoisoned => "model provider state lock poisoned".to_owned(),
         };
-        self.classification().snapshot(message)
+        match self {
+            Self::CircuitOpen { retry_after_ms } => {
+                self.classification().snapshot(message).with_retry_after_ms(Some(*retry_after_ms))
+            }
+            _ => self.classification().snapshot(message),
+        }
     }
 }
 
@@ -1227,6 +1233,7 @@ pub enum ProviderFailureClass {
     AuthExpired,
     PermissionDenied,
     RateLimited,
+    QuotaExceeded,
     TransientUpstream,
     PermanentUpstream,
     ContextWindowExceeded,
@@ -1244,6 +1251,7 @@ impl ProviderFailureClass {
             Self::AuthExpired => "auth_expired",
             Self::PermissionDenied => "permission_denied",
             Self::RateLimited => "rate_limited",
+            Self::QuotaExceeded => "quota_exceeded",
             Self::TransientUpstream => "transient_upstream",
             Self::PermanentUpstream => "permanent_upstream",
             Self::ContextWindowExceeded => "context_window_exceeded",
@@ -1280,6 +1288,70 @@ impl ProviderFailureAction {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderFailureCategory {
+    Transient,
+    RateLimit,
+    Quota,
+    Auth,
+    Policy,
+    ContextOverflow,
+    MalformedResponse,
+    SafetyStop,
+    ProviderBug,
+}
+
+impl ProviderFailureCategory {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Transient => "transient",
+            Self::RateLimit => "rate_limit",
+            Self::Quota => "quota",
+            Self::Auth => "auth",
+            Self::Policy => "policy",
+            Self::ContextOverflow => "context_overflow",
+            Self::MalformedResponse => "malformed_response",
+            Self::SafetyStop => "safety_stop",
+            Self::ProviderBug => "provider_bug",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderRecoveryAction {
+    RetrySame,
+    RetryAfter,
+    FallbackModel,
+    CompactAndRetry,
+    AskUser,
+    Abort,
+}
+
+impl ProviderRecoveryAction {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RetrySame => "retry_same",
+            Self::RetryAfter => "retry_after",
+            Self::FallbackModel => "fallback_model",
+            Self::CompactAndRetry => "compact_and_retry",
+            Self::AskUser => "ask_user",
+            Self::Abort => "abort",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderRecoveryPlanSnapshot {
+    pub category: String,
+    pub action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderFailureClassification {
     pub class: ProviderFailureClass,
@@ -1306,6 +1378,7 @@ impl ProviderFailureClassification {
         ProviderFailureSnapshot {
             class: self.class.as_str().to_owned(),
             recommended_action: self.recommended_action.as_str().to_owned(),
+            recovery: provider_recovery_plan(self),
             status_code: self.status_code,
             provider_detail: self.provider_detail.clone(),
             message,
@@ -1317,11 +1390,20 @@ impl ProviderFailureClassification {
 pub struct ProviderFailureSnapshot {
     pub class: String,
     pub recommended_action: String,
+    pub recovery: ProviderRecoveryPlanSnapshot,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status_code: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_detail: Option<String>,
     pub message: String,
+}
+
+impl ProviderFailureSnapshot {
+    #[must_use]
+    pub fn with_retry_after_ms(mut self, retry_after_ms: Option<u64>) -> Self {
+        self.recovery.retry_after_ms = retry_after_ms;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1342,6 +1424,57 @@ pub struct ProviderCapabilitiesSnapshot {
     pub known_limitations: Vec<String>,
     pub operator_override: bool,
     pub metadata_source: String,
+}
+
+fn provider_recovery_plan(
+    classification: &ProviderFailureClassification,
+) -> ProviderRecoveryPlanSnapshot {
+    let (category, action) = match classification.class {
+        ProviderFailureClass::AuthInvalid | ProviderFailureClass::AuthExpired => {
+            (ProviderFailureCategory::Auth, ProviderRecoveryAction::AskUser)
+        }
+        ProviderFailureClass::PermissionDenied => {
+            (ProviderFailureCategory::Policy, ProviderRecoveryAction::AskUser)
+        }
+        ProviderFailureClass::RateLimited => {
+            (ProviderFailureCategory::RateLimit, ProviderRecoveryAction::RetryAfter)
+        }
+        ProviderFailureClass::QuotaExceeded => {
+            (ProviderFailureCategory::Quota, ProviderRecoveryAction::AskUser)
+        }
+        ProviderFailureClass::ContextWindowExceeded => {
+            (ProviderFailureCategory::ContextOverflow, ProviderRecoveryAction::CompactAndRetry)
+        }
+        ProviderFailureClass::ContentPolicyBlocked => {
+            (ProviderFailureCategory::SafetyStop, ProviderRecoveryAction::Abort)
+        }
+        ProviderFailureClass::MalformedResponse => {
+            (ProviderFailureCategory::MalformedResponse, ProviderRecoveryAction::FallbackModel)
+        }
+        ProviderFailureClass::NetworkUnavailable | ProviderFailureClass::ProviderTimeout => {
+            (ProviderFailureCategory::Transient, ProviderRecoveryAction::RetrySame)
+        }
+        ProviderFailureClass::TransientUpstream => {
+            let action = if classification
+                .provider_detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("circuit_open"))
+            {
+                ProviderRecoveryAction::RetryAfter
+            } else {
+                ProviderRecoveryAction::RetrySame
+            };
+            (ProviderFailureCategory::Transient, action)
+        }
+        ProviderFailureClass::PermanentUpstream => {
+            (ProviderFailureCategory::ProviderBug, ProviderRecoveryAction::FallbackModel)
+        }
+    };
+    ProviderRecoveryPlanSnapshot {
+        category: category.as_str().to_owned(),
+        action: action.as_str().to_owned(),
+        retry_after_ms: None,
+    }
 }
 
 fn provider_failure_classification(
@@ -1415,6 +1548,13 @@ fn classify_http_provider_failure(
         } else {
             (ProviderFailureClass::AuthInvalid, ProviderFailureAction::RotateCredential)
         }
+    } else if status_code == 402
+        || normalized_body.contains("insufficient_quota")
+        || normalized_body.contains("quota")
+        || normalized_body.contains("billing")
+        || normalized_body.contains("credits")
+    {
+        (ProviderFailureClass::QuotaExceeded, ProviderFailureAction::UserActionRequired)
     } else if matches!(status_code, 400 | 413)
         && (normalized_body.contains("context")
             || normalized_body.contains("maximum context")
@@ -4641,9 +4781,10 @@ mod tests {
 
     use super::{
         build_embeddings_provider, build_model_provider, capability_defaults_for_kind,
-        classify_transport_provider_failure, extract_completion_text, normalize_tool_arguments,
-        sanitize_remote_error, validate_openai_base_url_network_policy_with_resolver,
-        EmbeddingsRequest, ModelProviderAuthProviderKind, ModelProviderConfig, ModelProviderKind,
+        classify_http_provider_failure, classify_transport_provider_failure,
+        extract_completion_text, normalize_tool_arguments, sanitize_remote_error,
+        validate_openai_base_url_network_policy_with_resolver, EmbeddingsRequest,
+        ModelProviderAuthProviderKind, ModelProviderConfig, ModelProviderKind,
         ModelProviderRegistryConfig, ProviderError, ProviderEvent, ProviderFailureAction,
         ProviderFailureClass, ProviderImageInput, ProviderMetadataSource, ProviderModelEntryConfig,
         ProviderModelRole, ProviderRegistryEntryConfig, ProviderRequest,
@@ -4663,6 +4804,55 @@ mod tests {
         let network_failure = classify_transport_provider_failure("anthropic_chat_request", false);
         assert_eq!(network_failure.class, ProviderFailureClass::NetworkUnavailable);
         assert_eq!(network_failure.recommended_action, ProviderFailureAction::Retry);
+    }
+
+    #[test]
+    fn provider_failure_recovery_plan_uses_phase_two_taxonomy() {
+        let rate_limit =
+            classify_http_provider_failure(429, true, "openai_chat_http", "rate limit exceeded")
+                .snapshot("redacted 429".to_owned());
+        assert_eq!(rate_limit.class, "rate_limited");
+        assert_eq!(rate_limit.recovery.category, "rate_limit");
+        assert_eq!(rate_limit.recovery.action, "retry_after");
+
+        let quota = classify_http_provider_failure(
+            402,
+            false,
+            "openai_chat_http",
+            "insufficient_quota: billing credits exhausted",
+        )
+        .snapshot("redacted quota".to_owned());
+        assert_eq!(quota.class, "quota_exceeded");
+        assert_eq!(quota.recovery.category, "quota");
+        assert_eq!(quota.recovery.action, "ask_user");
+
+        let context = classify_http_provider_failure(
+            400,
+            false,
+            "openai_chat_http",
+            "maximum context length exceeded",
+        )
+        .snapshot("redacted context".to_owned());
+        assert_eq!(context.recovery.category, "context_overflow");
+        assert_eq!(context.recovery.action, "compact_and_retry");
+
+        let safety = classify_http_provider_failure(
+            400,
+            false,
+            "openai_chat_http",
+            "safety policy blocked this request",
+        )
+        .snapshot("redacted safety".to_owned());
+        assert_eq!(safety.recovery.category, "safety_stop");
+        assert_eq!(safety.recovery.action, "abort");
+    }
+
+    #[test]
+    fn circuit_open_failure_exposes_retry_after_recovery() {
+        let snapshot = ProviderError::CircuitOpen { retry_after_ms: 1_250 }.failure_snapshot();
+        assert_eq!(snapshot.recovery.category, "transient");
+        assert_eq!(snapshot.recovery.action, "retry_after");
+        assert_eq!(snapshot.recovery.retry_after_ms, Some(1_250));
     }
 
     fn openai_test_config(base_url: String) -> ModelProviderConfig {

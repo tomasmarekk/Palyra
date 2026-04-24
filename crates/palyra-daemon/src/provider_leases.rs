@@ -32,10 +32,14 @@ pub(crate) struct ProviderLeasePreviewSnapshot {
     pub priority: LeasePriority,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_wait_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
     pub active_provider_leases: u16,
     pub active_credential_leases: u16,
     pub foreground_waiters: u16,
     pub background_waiters: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_state: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -46,10 +50,12 @@ impl ProviderLeasePreviewSnapshot {
             state: LeasePreviewState::Ready,
             priority,
             estimated_wait_ms: None,
+            retry_after_ms: None,
             active_provider_leases: 0,
             active_credential_leases: 0,
             foreground_waiters: 0,
             background_waiters: 0,
+            credential_state: None,
             reason: None,
         }
     }
@@ -74,6 +80,52 @@ pub(crate) struct ProviderLeaseEventSnapshot {
     pub observed_at_unix_ms: i64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProviderCredentialFeedbackKind {
+    Success,
+    RateLimited,
+    QuotaExhausted,
+    AuthFailed,
+    TransientFailure,
+}
+
+impl ProviderCredentialFeedbackKind {
+    #[must_use]
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::RateLimited => "rate_limited",
+            Self::QuotaExhausted => "quota_exhausted",
+            Self::AuthFailed => "auth_failed",
+            Self::TransientFailure => "transient_failure",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProviderCredentialFeedbackRequest {
+    pub provider_id: String,
+    pub credential_id: String,
+    pub kind: ProviderCredentialFeedbackKind,
+    pub retry_after_ms: Option<u64>,
+    pub reason: String,
+    pub observed_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct ProviderCredentialFeedbackSnapshot {
+    pub provider_id: String,
+    pub credential_id: String,
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_until_unix_ms: Option<i64>,
+    pub reason: String,
+    pub observed_at_unix_ms: i64,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct ProviderLeaseManagerSnapshot {
     pub provider_limit: u16,
@@ -87,6 +139,7 @@ pub(crate) struct ProviderLeaseManagerSnapshot {
     pub timed_out_total: u64,
     pub wait_events_total: u64,
     pub recent_events: Vec<ProviderLeaseEventSnapshot>,
+    pub credential_feedback: Vec<ProviderCredentialFeedbackSnapshot>,
 }
 
 #[derive(Debug, Clone)]
@@ -183,7 +236,55 @@ impl ProviderLeaseManager {
             timed_out_total: guard.timed_out_total,
             wait_events_total: guard.wait_events_total,
             recent_events: guard.recent_events.iter().cloned().collect(),
+            credential_feedback: guard
+                .credential_feedback
+                .values()
+                .filter(|feedback| feedback.is_active(crate::gateway::current_unix_ms()))
+                .map(ProviderCredentialFeedbackState::snapshot)
+                .collect(),
         }
+    }
+
+    pub(crate) fn record_credential_feedback(&self, request: ProviderCredentialFeedbackRequest) {
+        let mut guard = self.inner.state.lock().unwrap_or_else(|error| error.into_inner());
+        if request.kind == ProviderCredentialFeedbackKind::Success {
+            guard.credential_feedback.remove(request.credential_id.as_str());
+            self.inner.push_event_locked(
+                &mut guard,
+                ProviderLeaseEventSnapshot {
+                    event: "credential_feedback_cleared".to_owned(),
+                    provider_id: request.provider_id,
+                    credential_id: request.credential_id,
+                    priority: LeasePriority::Foreground,
+                    task_label: "provider_feedback".to_owned(),
+                    session_id: None,
+                    run_id: None,
+                    waited_ms: 0,
+                    held_ms: None,
+                    reason: Some(request.reason),
+                    observed_at_unix_ms: request.observed_at_unix_ms,
+                },
+            );
+            return;
+        }
+        let feedback = ProviderCredentialFeedbackState::from_request(request);
+        self.inner.push_event_locked(
+            &mut guard,
+            ProviderLeaseEventSnapshot {
+                event: "credential_feedback_recorded".to_owned(),
+                provider_id: feedback.provider_id.clone(),
+                credential_id: feedback.credential_id.clone(),
+                priority: LeasePriority::Foreground,
+                task_label: "provider_feedback".to_owned(),
+                session_id: None,
+                run_id: None,
+                waited_ms: 0,
+                held_ms: None,
+                reason: Some(format!("{}:{}", feedback.state, feedback.reason)),
+                observed_at_unix_ms: feedback.observed_at_unix_ms,
+            },
+        );
+        guard.credential_feedback.insert(feedback.credential_id.clone(), feedback);
     }
 
     pub(crate) async fn acquire(
@@ -429,6 +530,26 @@ impl ProviderLeaseManagerInner {
         let background_waiters = provider.waiting_background.max(credential.waiting_background);
         let provider_active = provider.active_total();
         let credential_active = credential.active_total();
+        if let Some(feedback) = state.active_credential_feedback(credential_id) {
+            let retry_after_ms = feedback.retry_after_ms(crate::gateway::current_unix_ms());
+            let state_kind = if retry_after_ms.is_some_and(|value| value <= max_wait_ms.max(1)) {
+                LeasePreviewState::Waiting
+            } else {
+                LeasePreviewState::Deferred
+            };
+            return ProviderLeasePreviewSnapshot {
+                state: state_kind,
+                priority,
+                estimated_wait_ms: retry_after_ms,
+                retry_after_ms,
+                active_provider_leases: provider_active,
+                active_credential_leases: credential_active,
+                foreground_waiters,
+                background_waiters,
+                credential_state: Some(feedback.state.clone()),
+                reason: Some(format!("credential_feedback:{}", feedback.reason)),
+            };
+        }
         let provider_reason =
             bucket_reason(provider, priority, self.provider_limit, foreground_waiters);
         let credential_reason =
@@ -455,10 +576,12 @@ impl ProviderLeaseManagerInner {
             state: state_kind,
             priority,
             estimated_wait_ms,
+            retry_after_ms: None,
             active_provider_leases: provider_active,
             active_credential_leases: credential_active,
             foreground_waiters,
             background_waiters,
+            credential_state: None,
             reason: reason.map(str::to_owned),
         }
     }
@@ -475,10 +598,85 @@ impl ProviderLeaseManagerInner {
 struct ProviderLeaseState {
     providers: HashMap<String, LeaseBucketState>,
     credentials: HashMap<String, LeaseBucketState>,
+    credential_feedback: HashMap<String, ProviderCredentialFeedbackState>,
     recent_events: VecDeque<ProviderLeaseEventSnapshot>,
     deferred_total: u64,
     timed_out_total: u64,
     wait_events_total: u64,
+}
+
+impl ProviderLeaseState {
+    fn active_credential_feedback(
+        &self,
+        credential_id: &str,
+    ) -> Option<&ProviderCredentialFeedbackState> {
+        let feedback = self.credential_feedback.get(credential_id)?;
+        if feedback.is_active(crate::gateway::current_unix_ms()) {
+            Some(feedback)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProviderCredentialFeedbackState {
+    provider_id: String,
+    credential_id: String,
+    state: String,
+    retry_after_ms: Option<u64>,
+    blocked_until_unix_ms: Option<i64>,
+    reason: String,
+    observed_at_unix_ms: i64,
+}
+
+impl ProviderCredentialFeedbackState {
+    fn from_request(request: ProviderCredentialFeedbackRequest) -> Self {
+        let default_retry_after_ms = match request.kind {
+            ProviderCredentialFeedbackKind::RateLimited => Some(30_000),
+            ProviderCredentialFeedbackKind::TransientFailure => Some(5_000),
+            ProviderCredentialFeedbackKind::QuotaExhausted
+            | ProviderCredentialFeedbackKind::AuthFailed => None,
+            ProviderCredentialFeedbackKind::Success => None,
+        };
+        let retry_after_ms = request.retry_after_ms.or(default_retry_after_ms);
+        let blocked_until_unix_ms =
+            retry_after_ms.map(|value| request.observed_at_unix_ms.saturating_add(value as i64));
+        Self {
+            provider_id: request.provider_id,
+            credential_id: request.credential_id,
+            state: request.kind.as_str().to_owned(),
+            retry_after_ms,
+            blocked_until_unix_ms,
+            reason: request.reason,
+            observed_at_unix_ms: request.observed_at_unix_ms,
+        }
+    }
+
+    fn is_active(&self, now_unix_ms: i64) -> bool {
+        match self.blocked_until_unix_ms {
+            Some(blocked_until_unix_ms) => blocked_until_unix_ms > now_unix_ms,
+            None => true,
+        }
+    }
+
+    fn retry_after_ms(&self, now_unix_ms: i64) -> Option<u64> {
+        self.blocked_until_unix_ms
+            .map(|blocked_until| blocked_until.saturating_sub(now_unix_ms) as u64)
+            .or(self.retry_after_ms)
+    }
+
+    fn snapshot(&self) -> ProviderCredentialFeedbackSnapshot {
+        ProviderCredentialFeedbackSnapshot {
+            provider_id: self.provider_id.clone(),
+            credential_id: self.credential_id.clone(),
+            state: self.state.clone(),
+            retry_after_ms: self.retry_after_ms,
+            blocked_until_unix_ms: self.blocked_until_unix_ms,
+            reason: self.reason.clone(),
+            observed_at_unix_ms: self.observed_at_unix_ms,
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -610,7 +808,8 @@ fn decrement_waiting(
 #[cfg(test)]
 mod tests {
     use super::{
-        LeasePreviewState, LeasePriority, ProviderLeaseAcquireError, ProviderLeaseAcquireRequest,
+        LeasePreviewState, LeasePriority, ProviderCredentialFeedbackKind,
+        ProviderCredentialFeedbackRequest, ProviderLeaseAcquireError, ProviderLeaseAcquireRequest,
         ProviderLeaseManager, ProviderLeasePreviewRequest,
     };
     use tokio::time::{sleep, Duration};
@@ -788,5 +987,56 @@ mod tests {
             snapshot.recent_events.iter().any(|entry| entry.event == "timed_out"),
             "timeout events should stay visible in recent lease telemetry"
         );
+    }
+
+    #[tokio::test]
+    async fn lease_manager_defers_rate_limited_credentials_until_feedback_clears() {
+        let manager = ProviderLeaseManager::new(2, 2);
+        manager.record_credential_feedback(ProviderCredentialFeedbackRequest {
+            provider_id: "openai".to_owned(),
+            credential_id: "cred-a".to_owned(),
+            kind: ProviderCredentialFeedbackKind::RateLimited,
+            retry_after_ms: Some(250),
+            reason: "provider returned 429".to_owned(),
+            observed_at_unix_ms: crate::gateway::current_unix_ms(),
+        });
+
+        let preview = manager.preview(ProviderLeasePreviewRequest {
+            provider_id: "openai",
+            credential_id: "cred-a",
+            priority: LeasePriority::Foreground,
+            max_wait_ms: 100,
+        });
+        assert_eq!(
+            preview.state,
+            LeasePreviewState::Deferred,
+            "foreground work should not acquire a credential during a rate-limit cooldown"
+        );
+        assert_eq!(preview.credential_state.as_deref(), Some("rate_limited"));
+        assert!(
+            preview.retry_after_ms.is_some(),
+            "rate-limit feedback should expose scheduler retry-after timing"
+        );
+
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.credential_feedback.len(), 1);
+        assert_eq!(snapshot.credential_feedback[0].state, "rate_limited");
+
+        manager.record_credential_feedback(ProviderCredentialFeedbackRequest {
+            provider_id: "openai".to_owned(),
+            credential_id: "cred-a".to_owned(),
+            kind: ProviderCredentialFeedbackKind::Success,
+            retry_after_ms: None,
+            reason: "successful provider call".to_owned(),
+            observed_at_unix_ms: crate::gateway::current_unix_ms(),
+        });
+        let ready = manager.preview(ProviderLeasePreviewRequest {
+            provider_id: "openai",
+            credential_id: "cred-a",
+            priority: LeasePriority::Foreground,
+            max_wait_ms: 100,
+        });
+        assert_eq!(ready.state, LeasePreviewState::Ready);
+        assert!(manager.snapshot().credential_feedback.is_empty());
     }
 }

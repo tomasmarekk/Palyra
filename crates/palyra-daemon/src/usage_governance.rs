@@ -1929,10 +1929,12 @@ mod tests {
             state: LeasePreviewState::Waiting,
             priority: LeasePriority::Foreground,
             estimated_wait_ms: Some(75),
+            retry_after_ms: None,
             active_provider_leases: 1,
             active_credential_leases: 1,
             foreground_waiters: 1,
             background_waiters: 0,
+            credential_state: None,
             reason: Some("shared_capacity_exhausted".to_owned()),
         }
     }
@@ -1942,10 +1944,12 @@ mod tests {
             state: LeasePreviewState::Deferred,
             priority: LeasePriority::Background,
             estimated_wait_ms: None,
+            retry_after_ms: None,
             active_provider_leases: 1,
             active_credential_leases: 1,
             foreground_waiters: 1,
             background_waiters: 0,
+            credential_state: None,
             reason: Some("foreground_waiters_present".to_owned()),
         }
     }

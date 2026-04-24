@@ -439,6 +439,8 @@ pub(crate) fn map_provider_error(error: ProviderError) -> Status {
                 Status::unauthenticated(status_message)
             } else if classification.class.as_str() == "permission_denied" {
                 Status::permission_denied(status_message)
+            } else if classification.class.as_str() == "quota_exceeded" {
+                Status::resource_exhausted(status_message)
             } else if classification.class.as_str() == "context_window_exceeded" {
                 Status::invalid_argument(status_message)
             } else if classification.class.as_str() == "content_policy_blocked" {

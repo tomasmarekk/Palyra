@@ -41,9 +41,9 @@ use crate::journal::{
     WorkspaceSearchRequest,
 };
 use crate::provider_leases::{
-    ProviderLeaseAcquireError, ProviderLeaseAcquireRequest, ProviderLeaseExecutionContext,
-    ProviderLeaseManager, ProviderLeaseManagerSnapshot, ProviderLeasePreviewRequest,
-    ProviderLeasePreviewSnapshot,
+    ProviderCredentialFeedbackKind, ProviderCredentialFeedbackRequest, ProviderLeaseAcquireError,
+    ProviderLeaseAcquireRequest, ProviderLeaseExecutionContext, ProviderLeaseManager,
+    ProviderLeaseManagerSnapshot, ProviderLeasePreviewRequest, ProviderLeasePreviewSnapshot,
 };
 use crate::retrieval::{
     score_memory_candidates, score_workspace_candidates, ExternalRetrievalRuntime,
@@ -2700,6 +2700,10 @@ impl GatewayRuntimeState {
         self.provider_leases.snapshot()
     }
 
+    pub fn record_provider_credential_feedback(&self, request: ProviderCredentialFeedbackRequest) {
+        self.provider_leases.record_credential_feedback(request);
+    }
+
     #[allow(clippy::result_large_err)]
     pub fn retrieval_backend_snapshot(&self) -> Result<RetrievalBackendSnapshot, Status> {
         let embeddings_status = self
@@ -2797,7 +2801,66 @@ impl GatewayRuntimeState {
                     ))
                 }
             })?;
-        self.execute_model_provider(request).await
+        self.counters.model_provider_requests.fetch_add(1, Ordering::Relaxed);
+        match self.model_provider.complete(request).await {
+            Ok(response) => {
+                self.record_provider_credential_feedback(ProviderCredentialFeedbackRequest {
+                    provider_id: lease_context.provider_id.clone(),
+                    credential_id: lease_context.credential_id.clone(),
+                    kind: ProviderCredentialFeedbackKind::Success,
+                    retry_after_ms: None,
+                    reason: "provider call succeeded".to_owned(),
+                    observed_at_unix_ms: current_unix_ms(),
+                });
+                if response.retry_count > 0 {
+                    self.counters
+                        .model_provider_retry_attempts
+                        .fetch_add(response.retry_count as u64, Ordering::Relaxed);
+                }
+                Ok(response)
+            }
+            Err(error) => {
+                self.counters.model_provider_failures.fetch_add(1, Ordering::Relaxed);
+                if error.retry_count() > 0 {
+                    self.counters
+                        .model_provider_retry_attempts
+                        .fetch_add(error.retry_count() as u64, Ordering::Relaxed);
+                }
+                if error.is_circuit_open() {
+                    self.counters
+                        .model_provider_circuit_open_rejections
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                self.record_provider_lease_feedback_for_error(&lease_context, &error);
+                Err(map_provider_error(error))
+            }
+        }
+    }
+
+    fn record_provider_lease_feedback_for_error(
+        &self,
+        lease_context: &ProviderLeaseExecutionContext,
+        error: &ProviderError,
+    ) {
+        let failure = error.failure_snapshot();
+        let kind = match failure.recovery.category.as_str() {
+            "rate_limit" => ProviderCredentialFeedbackKind::RateLimited,
+            "quota" => ProviderCredentialFeedbackKind::QuotaExhausted,
+            "auth" => ProviderCredentialFeedbackKind::AuthFailed,
+            "transient" => ProviderCredentialFeedbackKind::TransientFailure,
+            _ => return,
+        };
+        self.record_provider_credential_feedback(ProviderCredentialFeedbackRequest {
+            provider_id: lease_context.provider_id.clone(),
+            credential_id: lease_context.credential_id.clone(),
+            kind,
+            retry_after_ms: failure.recovery.retry_after_ms,
+            reason: format!(
+                "class={} category={} action={}",
+                failure.class, failure.recovery.category, failure.recovery.action
+            ),
+            observed_at_unix_ms: current_unix_ms(),
+        });
     }
 
     #[allow(clippy::result_large_err)]
