@@ -690,39 +690,163 @@ pub(crate) async fn best_effort_mark_approval_error(
     }
 }
 
-pub(crate) async fn finalize_run_failure(
-    sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
-    runtime_state: &Arc<GatewayRuntimeState>,
-    run_state: &mut RunStateMachine,
-    active_run_id: Option<&str>,
-    tape_seq: &mut i64,
-    reason: &str,
-) {
-    let Some(run_id) = active_run_id else {
+pub(crate) struct RunFailureFinalization<'a> {
+    pub(crate) sender: &'a mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
+    pub(crate) runtime_state: &'a Arc<GatewayRuntimeState>,
+    pub(crate) request_context: Option<&'a RequestContext>,
+    pub(crate) active_session_id: Option<&'a str>,
+    pub(crate) run_state: &'a mut RunStateMachine,
+    pub(crate) active_run_id: Option<&'a str>,
+    pub(crate) tape_seq: &'a mut i64,
+    pub(crate) reason: &'a str,
+}
+
+pub(crate) async fn finalize_run_failure(input: RunFailureFinalization<'_>) {
+    let Some(run_id) = input.active_run_id else {
         return;
     };
-    if run_state.state().is_terminal() {
+    if input.run_state.state().is_terminal() {
         return;
     }
-    if run_state.transition(RunTransition::Fail).is_err() {
+    if input.run_state.transition(RunTransition::Fail).is_err() {
         return;
     }
-    let _ = runtime_state
+    let _ = input
+        .runtime_state
         .update_orchestrator_run_state(
             run_id.to_owned(),
             RunLifecycleState::Failed,
-            Some(reason.to_owned()),
+            Some(input.reason.to_owned()),
         )
         .await;
     let _ = crate::application::run_stream::tape::send_status_with_tape(
-        sender,
-        runtime_state,
+        input.sender,
+        input.runtime_state,
         run_id,
-        tape_seq,
+        input.tape_seq,
         common_v1::stream_status::StatusKind::Failed,
-        reason,
+        input.reason,
     )
     .await;
+    record_run_failure_journal_event(
+        input.runtime_state,
+        input.request_context,
+        input.active_session_id,
+        run_id,
+        input.reason,
+    )
+    .await;
+}
+
+async fn record_run_failure_journal_event(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    request_context: Option<&RequestContext>,
+    session_id: Option<&str>,
+    run_id: &str,
+    reason: &str,
+) {
+    let (Some(context), Some(session_id)) = (request_context, session_id) else {
+        return;
+    };
+    let diagnostic = run_failure_diagnostic(reason);
+    let mut payload = json!({
+        "event": "run.failed",
+        "success": false,
+        "message": truncate_with_ellipsis(reason.to_owned(), 512),
+        "error": truncate_with_ellipsis(reason.to_owned(), 512),
+        "diagnostic_hint": diagnostic.diagnostic_hint,
+    });
+    if let Some(payload_map) = payload.as_object_mut() {
+        if let Some(error_class) = diagnostic.error_class {
+            payload_map.insert("error_class".to_owned(), Value::String(error_class));
+        }
+        if let Some(recommended_action) = diagnostic.recommended_action {
+            payload_map.insert("recommended_action".to_owned(), Value::String(recommended_action));
+        }
+    }
+
+    if let Err(error) = runtime_state
+        .record_journal_event(JournalAppendRequest {
+            event_id: Ulid::new().to_string(),
+            session_id: session_id.to_owned(),
+            run_id: run_id.to_owned(),
+            kind: common_v1::journal_event::EventKind::RunFailed as i32,
+            actor: common_v1::journal_event::EventActor::System as i32,
+            timestamp_unix_ms: current_unix_ms(),
+            payload_json: payload.to_string().into_bytes(),
+            principal: context.principal.clone(),
+            device_id: context.device_id.clone(),
+            channel: context.channel.clone(),
+        })
+        .await
+    {
+        warn!(run_id, error = %error, "failed to record run failure journal event");
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunFailureDiagnostic {
+    error_class: Option<String>,
+    recommended_action: Option<String>,
+    diagnostic_hint: &'static str,
+}
+
+fn run_failure_diagnostic(reason: &str) -> RunFailureDiagnostic {
+    let error_class = extract_failure_marker(reason, "class=");
+    let recommended_action = extract_failure_marker(reason, "action=");
+    let diagnostic_hint = match error_class.as_deref() {
+        Some("provider_timeout") => {
+            "Provider request timed out; retry or increase model_provider.request_timeout_ms for slow model responses."
+        }
+        Some("network_unavailable") => {
+            "Check DNS, proxy, firewall, and provider reachability. If direct provider calls work, inspect model_provider timeout and base URL settings."
+        }
+        Some("auth_invalid") | Some("auth_expired") => {
+            "Refresh or rotate the model provider credential, then rerun the agent."
+        }
+        Some("permission_denied") => {
+            "Verify the model provider account, API key scopes, and selected model access."
+        }
+        Some("rate_limited") => {
+            "Retry after the provider rate limit clears or switch to a lower-pressure model/provider."
+        }
+        Some("context_window_exceeded") => {
+            "Reduce prompt or attachment size, then rerun the agent."
+        }
+        Some("content_policy_blocked") => {
+            "Revise the prompt or inputs; the provider rejected the request by policy."
+        }
+        _ => "Inspect the run tape and provider status for the failed run before retrying.",
+    };
+    RunFailureDiagnostic { error_class, recommended_action, diagnostic_hint }
+}
+
+fn extract_failure_marker(reason: &str, marker: &str) -> Option<String> {
+    let value = reason.split(marker).nth(1)?;
+    let value = value
+        .split(|character: char| {
+            character == ',' || character == ')' || character == ':' || character.is_whitespace()
+        })
+        .next()
+        .unwrap_or_default()
+        .trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+#[cfg(test)]
+mod run_failure_diagnostic_tests {
+    use super::run_failure_diagnostic;
+
+    #[test]
+    fn extracts_provider_failure_class_and_action() {
+        let diagnostic = run_failure_diagnostic(
+            "model provider request failed after 2 retries (retryable=true, class=provider_timeout, action=retry): anthropic request failed",
+        );
+
+        assert_eq!(diagnostic.error_class.as_deref(), Some("provider_timeout"));
+        assert_eq!(diagnostic.recommended_action.as_deref(), Some("retry"));
+        assert!(diagnostic.diagnostic_hint.contains("timed out"));
+    }
 }
 
 #[allow(clippy::result_large_err)]

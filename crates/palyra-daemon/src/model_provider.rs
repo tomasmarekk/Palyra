@@ -334,7 +334,7 @@ impl Default for ModelProviderConfig {
             auth_profile_id: None,
             auth_profile_provider_kind: None,
             credential_source: None,
-            request_timeout_ms: 15_000,
+            request_timeout_ms: 60_000,
             max_retries: 2,
             retry_backoff_ms: 150,
             circuit_breaker_failure_threshold: 3,
@@ -971,6 +971,7 @@ fn credential_availability_state(
             "rate_limited" => "rate_limited",
             "context_window_exceeded" | "content_policy_blocked" => "available",
             "network_unavailable"
+            | "provider_timeout"
             | "transient_upstream"
             | "malformed_response"
             | "permanent_upstream" => "provider_degraded",
@@ -1207,6 +1208,7 @@ pub enum ProviderFailureClass {
     ContentPolicyBlocked,
     MalformedResponse,
     NetworkUnavailable,
+    ProviderTimeout,
 }
 
 impl ProviderFailureClass {
@@ -1223,6 +1225,7 @@ impl ProviderFailureClass {
             Self::ContentPolicyBlocked => "content_policy_blocked",
             Self::MalformedResponse => "malformed_response",
             Self::NetworkUnavailable => "network_unavailable",
+            Self::ProviderTimeout => "provider_timeout",
         }
     }
 }
@@ -1420,6 +1423,28 @@ fn classify_network_provider_failure(provider_detail: &str) -> ProviderFailureCl
         None,
         provider_detail,
     )
+}
+
+fn classify_transport_provider_failure(
+    provider_detail: &str,
+    is_timeout: bool,
+) -> ProviderFailureClassification {
+    if is_timeout {
+        return provider_failure_classification(
+            ProviderFailureClass::ProviderTimeout,
+            ProviderFailureAction::Retry,
+            None,
+            format!("{provider_detail}:timeout"),
+        );
+    }
+    classify_network_provider_failure(provider_detail)
+}
+
+fn classify_reqwest_provider_failure(
+    provider_detail: &str,
+    error: &reqwest::Error,
+) -> ProviderFailureClassification {
+    classify_transport_provider_failure(provider_detail, error.is_timeout())
 }
 
 fn invalid_response_classification(provider_detail: &str) -> ProviderFailureClassification {
@@ -3058,7 +3083,10 @@ impl OpenAiCompatibleEmbeddingsProvider {
                 AttemptError::request_failed(
                     format!("openai-compatible embeddings request failed: {error}"),
                     true,
-                    classify_network_provider_failure("openai_compatible_embeddings_request"),
+                    classify_reqwest_provider_failure(
+                        "openai_compatible_embeddings_request",
+                        &error,
+                    ),
                 )
             })?;
 
@@ -3357,7 +3385,7 @@ impl OpenAiCompatibleProvider {
                 AttemptError::request_failed(
                     format!("openai-compatible request failed: {error}"),
                     true,
-                    classify_network_provider_failure("openai_compatible_chat_request"),
+                    classify_reqwest_provider_failure("openai_compatible_chat_request", &error),
                 )
             })?;
 
@@ -3494,7 +3522,7 @@ impl OpenAiCompatibleProvider {
                 AttemptError::request_failed(
                     format!("openai-compatible audio transcription request failed: {error}"),
                     true,
-                    classify_network_provider_failure("openai_compatible_audio_request"),
+                    classify_reqwest_provider_failure("openai_compatible_audio_request", &error),
                 )
             })?;
         if !response.status().is_success() {
@@ -3946,7 +3974,7 @@ impl AnthropicProvider {
             AttemptError::request_failed(
                 format!("anthropic request failed: {error}"),
                 true,
-                classify_network_provider_failure("anthropic_chat_request"),
+                classify_reqwest_provider_failure("anthropic_chat_request", &error),
             )
         })?;
 
@@ -4579,13 +4607,29 @@ mod tests {
 
     use super::{
         build_embeddings_provider, build_model_provider, capability_defaults_for_kind,
-        extract_completion_text, normalize_tool_arguments, sanitize_remote_error,
-        validate_openai_base_url_network_policy_with_resolver, EmbeddingsRequest,
-        ModelProviderAuthProviderKind, ModelProviderConfig, ModelProviderKind,
-        ModelProviderRegistryConfig, ProviderError, ProviderEvent, ProviderImageInput,
-        ProviderMetadataSource, ProviderModelEntryConfig, ProviderModelRole,
-        ProviderRegistryEntryConfig, ProviderRequest,
+        classify_transport_provider_failure, extract_completion_text, normalize_tool_arguments,
+        sanitize_remote_error, validate_openai_base_url_network_policy_with_resolver,
+        EmbeddingsRequest, ModelProviderAuthProviderKind, ModelProviderConfig, ModelProviderKind,
+        ModelProviderRegistryConfig, ProviderError, ProviderEvent, ProviderFailureAction,
+        ProviderFailureClass, ProviderImageInput, ProviderMetadataSource, ProviderModelEntryConfig,
+        ProviderModelRole, ProviderRegistryEntryConfig, ProviderRequest,
     };
+
+    #[test]
+    fn transport_timeout_classification_is_actionable() {
+        let timeout_failure = classify_transport_provider_failure("anthropic_chat_request", true);
+
+        assert_eq!(timeout_failure.class, ProviderFailureClass::ProviderTimeout);
+        assert_eq!(timeout_failure.recommended_action, ProviderFailureAction::Retry);
+        assert_eq!(
+            timeout_failure.provider_detail.as_deref(),
+            Some("anthropic_chat_request:timeout")
+        );
+
+        let network_failure = classify_transport_provider_failure("anthropic_chat_request", false);
+        assert_eq!(network_failure.class, ProviderFailureClass::NetworkUnavailable);
+        assert_eq!(network_failure.recommended_action, ProviderFailureAction::Retry);
+    }
 
     fn openai_test_config(base_url: String) -> ModelProviderConfig {
         ModelProviderConfig {

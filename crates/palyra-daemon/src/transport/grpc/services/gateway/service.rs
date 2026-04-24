@@ -36,7 +36,7 @@ use crate::{
         non_empty, normalize_agent_identifier, optional_canonical_id, record_agent_journal_event,
         record_message_router_journal_event, require_supported_version,
         security_requests_json_mode, session_summary_message, GatewayRuntimeState,
-        ListOrchestratorSessionsRequest, APPROVAL_PROMPT_TIMEOUT_SECONDS,
+        ListOrchestratorSessionsRequest, RunFailureFinalization, APPROVAL_PROMPT_TIMEOUT_SECONDS,
         SENSITIVE_TOOLS_DENY_REASON,
     },
     journal::{
@@ -1290,14 +1290,16 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     Err(error) => {
                         let status =
                             Status::internal(format!("failed to read run stream request: {error}"));
-                        finalize_run_failure(
-                            &sender,
-                            &state_for_stream,
-                            &mut run_state,
-                            active_run_id.as_deref(),
-                            &mut tape_seq,
-                            status.message(),
-                        )
+                        finalize_run_failure(RunFailureFinalization {
+                            sender: &sender,
+                            runtime_state: &state_for_stream,
+                            request_context: Some(&context_for_stream),
+                            active_session_id: active_session_id.as_deref(),
+                            run_state: &mut run_state,
+                            active_run_id: active_run_id.as_deref(),
+                            tape_seq: &mut tape_seq,
+                            reason: status.message(),
+                        })
                         .await;
                         let _ = sender.send(Err(status)).await;
                         return;
@@ -1305,14 +1307,16 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                 };
                 if message.v != CANONICAL_PROTOCOL_MAJOR {
                     let status = Status::failed_precondition("unsupported protocol major version");
-                    finalize_run_failure(
-                        &sender,
-                        &state_for_stream,
-                        &mut run_state,
-                        active_run_id.as_deref(),
-                        &mut tape_seq,
-                        status.message(),
-                    )
+                    finalize_run_failure(RunFailureFinalization {
+                        sender: &sender,
+                        runtime_state: &state_for_stream,
+                        request_context: Some(&context_for_stream),
+                        active_session_id: active_session_id.as_deref(),
+                        run_state: &mut run_state,
+                        active_run_id: active_run_id.as_deref(),
+                        tape_seq: &mut tape_seq,
+                        reason: status.message(),
+                    })
                     .await;
                     let _ = sender.send(Err(status)).await;
                     return;
@@ -1322,14 +1326,16 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     let status = Status::permission_denied(format!(
                         "decision=deny_by_default approval_required=true reason={SENSITIVE_TOOLS_DENY_REASON}",
                     ));
-                    finalize_run_failure(
-                        &sender,
-                        &state_for_stream,
-                        &mut run_state,
-                        active_run_id.as_deref(),
-                        &mut tape_seq,
-                        SENSITIVE_TOOLS_DENY_REASON,
-                    )
+                    finalize_run_failure(RunFailureFinalization {
+                        sender: &sender,
+                        runtime_state: &state_for_stream,
+                        request_context: Some(&context_for_stream),
+                        active_session_id: active_session_id.as_deref(),
+                        run_state: &mut run_state,
+                        active_run_id: active_run_id.as_deref(),
+                        tape_seq: &mut tape_seq,
+                        reason: SENSITIVE_TOOLS_DENY_REASON,
+                    })
                     .await;
                     let _ = sender.send(Err(status)).await;
                     return;
@@ -1358,14 +1364,16 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                         return;
                     }
                     Err(error) => {
-                        finalize_run_failure(
-                            &sender,
-                            &state_for_stream,
-                            &mut run_state,
-                            active_run_id.as_deref(),
-                            &mut tape_seq,
-                            error.message(),
-                        )
+                        finalize_run_failure(RunFailureFinalization {
+                            sender: &sender,
+                            runtime_state: &state_for_stream,
+                            request_context: Some(&context_for_stream),
+                            active_session_id: active_session_id.as_deref(),
+                            run_state: &mut run_state,
+                            active_run_id: active_run_id.as_deref(),
+                            tape_seq: &mut tape_seq,
+                            reason: error.message(),
+                        })
                         .await;
                         let _ = sender.send(Err(error)).await;
                         return;
@@ -1386,14 +1394,16 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     Ok(RunStreamPostProviderOutcome::Completed) => {}
                     Ok(RunStreamPostProviderOutcome::Cancelled) => {}
                     Err(error) => {
-                        finalize_run_failure(
-                            &sender,
-                            &state_for_stream,
-                            &mut run_state,
-                            Some(run_id.as_str()),
-                            &mut tape_seq,
-                            error.message(),
-                        )
+                        finalize_run_failure(RunFailureFinalization {
+                            sender: &sender,
+                            runtime_state: &state_for_stream,
+                            request_context: Some(&context_for_stream),
+                            active_session_id: active_session_id.as_deref(),
+                            run_state: &mut run_state,
+                            active_run_id: Some(run_id.as_str()),
+                            tape_seq: &mut tape_seq,
+                            reason: error.message(),
+                        })
                         .await;
                         let _ = sender.send(Err(error)).await;
                     }

@@ -20,6 +20,47 @@ fn apply_http_connection_headers(
     request
 }
 
+fn enrich_journal_recent_response(response: &mut JournalRecentResponse) {
+    for event in &mut response.events {
+        event.kind_label = Some(journal_event_kind_label(event.kind));
+        event.actor_label = Some(journal_event_actor_label(event.actor));
+    }
+}
+
+fn journal_event_kind_label(kind: i32) -> String {
+    common_v1::journal_event::EventKind::try_from(kind)
+        .map(|kind| proto_enum_label(kind.as_str_name(), "EVENT_KIND_"))
+        .unwrap_or_else(|_| format!("unknown_{kind}"))
+}
+
+fn journal_event_actor_label(actor: i32) -> String {
+    common_v1::journal_event::EventActor::try_from(actor)
+        .map(|actor| proto_enum_label(actor.as_str_name(), "EVENT_ACTOR_"))
+        .unwrap_or_else(|_| format!("unknown_{actor}"))
+}
+
+fn proto_enum_label(name: &str, prefix: &str) -> String {
+    name.strip_prefix(prefix).unwrap_or(name).to_ascii_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{journal_event_actor_label, journal_event_kind_label};
+    use crate::common_v1;
+
+    #[test]
+    fn journal_recent_labels_known_proto_enums() {
+        assert_eq!(
+            journal_event_kind_label(common_v1::journal_event::EventKind::RunFailed as i32),
+            "run_failed"
+        );
+        assert_eq!(
+            journal_event_actor_label(common_v1::journal_event::EventActor::System as i32),
+            "system"
+        );
+    }
+}
+
 pub(crate) fn run_daemon(command: DaemonCommand) -> Result<()> {
     match command {
         DaemonCommand::Run { bin_path } => run_gateway_foreground(bin_path),
@@ -213,13 +254,14 @@ pub(crate) fn run_daemon(command: DaemonCommand) -> Result<()> {
                 request = request.query(&[("limit", limit)]);
             }
 
-            let response: JournalRecentResponse = request
+            let mut response: JournalRecentResponse = request
                 .send()
                 .context("failed to call daemon journal recent endpoint")?
                 .error_for_status()
                 .context("daemon journal recent endpoint returned non-success status")?
                 .json()
                 .context("failed to parse daemon journal recent payload")?;
+            enrich_journal_recent_response(&mut response);
 
             if output::preferred_json(json) {
                 output::print_json_pretty(
@@ -244,10 +286,12 @@ pub(crate) fn run_daemon(command: DaemonCommand) -> Result<()> {
             );
             for event in response.events {
                 println!(
-                    "journal.event event_id={} kind={} actor={} redacted={} timestamp_unix_ms={} hash={}",
+                    "journal.event event_id={} kind={} kind_label={} actor={} actor_label={} redacted={} timestamp_unix_ms={} hash={}",
                     event.event_id,
                     event.kind,
+                    event.kind_label.as_deref().unwrap_or("unknown"),
                     event.actor,
+                    event.actor_label.as_deref().unwrap_or("unknown"),
                     event.redacted,
                     event.timestamp_unix_ms,
                     event.hash.as_deref().unwrap_or("none")

@@ -4371,6 +4371,7 @@ mod tests {
             config.auth_profile_provider_kind.is_none(),
             "auth provider kind should default to unset"
         );
+        assert_eq!(config.request_timeout_ms, 60_000);
         assert_eq!(config.max_retries, 2);
     }
 

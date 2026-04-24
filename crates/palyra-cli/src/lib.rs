@@ -8154,7 +8154,11 @@ struct JournalRecentResponse {
 struct JournalRecentEvent {
     event_id: String,
     kind: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kind_label: Option<String>,
     actor: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    actor_label: Option<String>,
     redacted: bool,
     timestamp_unix_ms: i64,
     hash: Option<String>,
