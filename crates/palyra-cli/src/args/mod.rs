@@ -342,7 +342,7 @@ Examples:
   palyra system heartbeat
   palyra system presence --json
   palyra system insights --json
-  palyra system event --limit 50
+  palyra system event list --limit 50
 
 Discoverability:
   `system` is the top-level operator view over runtime heartbeat, subsystem presence, operator insights, and recent journal events.";
