@@ -47,17 +47,29 @@ pub(super) fn resolve_connector_selector(
     provider: Option<ChannelProviderArg>,
     account_id: Option<String>,
 ) -> Result<String> {
+    match resolve_optional_connector_selector(connector_id, provider, account_id)? {
+        Some(connector_id) => Ok(connector_id),
+        None => bail!("connector selector requires connector_id or --provider [--account-id]"),
+    }
+}
+
+pub(super) fn resolve_optional_connector_selector(
+    connector_id: Option<String>,
+    provider: Option<ChannelProviderArg>,
+    account_id: Option<String>,
+) -> Result<Option<String>> {
     match (connector_id, provider) {
         (Some(connector_id), None) | (Some(connector_id), Some(_)) => {
-            normalize_required_text_arg(connector_id, "connector_id")
+            normalize_required_text_arg(connector_id, "connector_id").map(Some)
         }
         (None, Some(provider)) => {
             let account_id = account_id.unwrap_or_else(|| "default".to_owned());
-            super::providers::connector_id_for_provider(provider, account_id.as_str())
+            super::providers::connector_id_for_provider(provider, account_id.as_str()).map(Some)
         }
-        (None, None) => {
-            bail!("connector selector requires connector_id or --provider [--account-id]")
+        (None, None) if account_id.is_some() => {
+            bail!("--account-id requires --provider when connector_id is omitted")
         }
+        (None, None) => Ok(None),
     }
 }
 
@@ -215,4 +227,53 @@ pub(super) fn post_discord_account_action(
         request_context,
         error_context,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_connector_selector, resolve_optional_connector_selector};
+    use crate::args::ChannelProviderArg;
+
+    #[test]
+    fn optional_connector_selector_accepts_global_selection() {
+        let selector = resolve_optional_connector_selector(None, None, None)
+            .expect("global channel selection should be accepted");
+
+        assert_eq!(selector, None);
+    }
+
+    #[test]
+    fn connector_selector_still_requires_an_explicit_selector() {
+        let error = resolve_connector_selector(None, None, None)
+            .expect_err("selector-only surfaces should keep rejecting global selection");
+
+        assert!(
+            error.to_string().contains("connector selector requires"),
+            "error should keep selector guidance: {error}"
+        );
+    }
+
+    #[test]
+    fn optional_connector_selector_rejects_account_id_without_provider() {
+        let error = resolve_optional_connector_selector(None, None, Some("default".to_owned()))
+            .expect_err("--account-id alone is ambiguous");
+
+        assert!(
+            error.to_string().contains("--provider"),
+            "error should point to the missing provider flag: {error}"
+        );
+    }
+
+    #[test]
+    fn optional_connector_selector_resolves_provider_account_pairs() {
+        let selector = resolve_optional_connector_selector(
+            None,
+            Some(ChannelProviderArg::Discord),
+            Some("ops".to_owned()),
+        )
+        .expect("provider selector should resolve")
+        .expect("provider selector should produce connector id");
+
+        assert_eq!(selector, "discord:ops");
+    }
 }
