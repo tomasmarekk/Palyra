@@ -4,6 +4,7 @@ use std::{
 };
 
 use palyra_control_plane as control_plane;
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::*;
@@ -57,7 +58,24 @@ struct OnboardingSignals {
     provider_health_message: String,
     model_discovery_ready: bool,
     model_discovery_message: String,
+    default_agent_configured: bool,
+    default_agent_message: String,
+    workspace_root: Option<String>,
+    chat_model: Option<String>,
     first_success_completed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentRegistryStatusDocument {
+    #[serde(default)]
+    default_agent_id: Option<String>,
+    #[serde(default)]
+    agents: Vec<AgentRegistryStatusRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentRegistryStatusRecord {
+    agent_id: String,
 }
 
 #[derive(Debug)]
@@ -197,7 +215,8 @@ fn collect_onboarding_signals(
     let provider_kind = get_string_at_path(document, "model_provider.kind")
         .unwrap_or_else(|| "openai_compatible".to_owned());
     let provider_auth_configured = model_auth_configured(document)?;
-    let provider_model_selected = configured_chat_model(document)?.is_some();
+    let chat_model = configured_chat_model(document)?;
+    let provider_model_selected = chat_model.is_some();
     let provider_health_state =
         if provider_auth_configured { "configured".to_owned() } else { "missing_auth".to_owned() };
     let provider_health_message = if provider_auth_configured {
@@ -207,11 +226,12 @@ fn collect_onboarding_signals(
     };
     let model_discovery_ready = provider_model_selected;
     let model_discovery_message = if model_discovery_ready {
-        "model selection is present in the config; run `palyra models test-connection` for runtime verification"
+        "model selection is present in the config; run a real agent prompt to verify model usability"
             .to_owned()
     } else {
         "no chat model is selected in the config yet".to_owned()
     };
+    let (default_agent_configured, default_agent_message) = default_agent_status()?;
 
     Ok(OnboardingSignals {
         config_exists: config_path != "defaults" && Path::new(&config_path).exists(),
@@ -231,6 +251,10 @@ fn collect_onboarding_signals(
         provider_health_message,
         model_discovery_ready,
         model_discovery_message,
+        default_agent_configured,
+        default_agent_message,
+        workspace_root: get_string_at_path(document, "tool_call.process_runner.workspace_root"),
+        chat_model,
         first_success_completed: cli_first_success_completed()?,
     })
 }
@@ -375,6 +399,24 @@ fn build_onboarding_steps(
         )
     };
 
+    let agent_step = if signals.default_agent_configured {
+        done_step(
+            "agent_identity",
+            "Default agent",
+            signals.default_agent_message.clone(),
+            Some(run_cli_action("Inspect agents", "palyra agents list".to_owned())),
+        )
+    } else {
+        actionable_step(
+            "agent_identity",
+            "Default agent",
+            signals.default_agent_message.clone(),
+            control_plane::OnboardingStepStatus::Todo,
+            Some(run_cli_action("Create default agent", default_agent_create_command(signals))),
+            StepPresentation::required(Some("missing_default_agent".to_owned())),
+        )
+    };
+
     let verification_step = if !signals.provider_auth_configured || !signals.provider_model_selected
     {
         actionable_step(
@@ -394,15 +436,28 @@ fn build_onboarding_steps(
                 ),
             )),
         )
-    } else if signals.model_discovery_ready {
+    } else if signals.first_success_completed {
         done_step(
             "model_verification",
             "Model verification",
-            "Model selection is present; the next verification pass can use the dedicated models command.",
+            "A real agent prompt completed successfully for the selected model.",
             Some(run_cli_action(
-                "Run test connection",
-                format!("palyra models test-connection --path {} --json", signals.config_path),
+                "Run another prompt",
+                "palyra agent run --prompt-stdin".to_owned(),
             )),
+        )
+    } else if signals.model_discovery_ready {
+        actionable_step(
+            "model_verification",
+            "Model verification",
+            "Model selection is present, but live model usability is still pending a real agent prompt.",
+            control_plane::OnboardingStepStatus::InProgress,
+            Some(run_cli_action(
+                "Run smoke prompt",
+                "palyra agent run --session-key onboarding-smoke --reset-session --prompt \"Reply exactly PALYRA_ONBOARDING_OK\""
+                    .to_owned(),
+            )),
+            StepPresentation::required(Some("prompt_required".to_owned())),
         )
     } else {
         actionable_step(
@@ -423,10 +478,15 @@ fn build_onboarding_steps(
         )
     };
 
-    let first_success_ready =
-        [config_step.status, remote_step.status, provider_step.status, verification_step.status]
-            .into_iter()
-            .all(|status| status == control_plane::OnboardingStepStatus::Done);
+    let first_success_ready = [
+        config_step.status,
+        remote_step.status,
+        provider_step.status,
+        agent_step.status,
+        verification_step.status,
+    ]
+    .into_iter()
+    .all(|status| status == control_plane::OnboardingStepStatus::Done);
     let first_success_step = if first_success_ready && signals.first_success_completed {
         done_step(
             "first_success",
@@ -471,7 +531,7 @@ fn build_onboarding_steps(
 
     match variant {
         OnboardingVariant::Quickstart => {
-            vec![config_step, provider_step, verification_step, first_success_step]
+            vec![config_step, provider_step, agent_step, verification_step, first_success_step]
         }
         OnboardingVariant::Manual | OnboardingVariant::Remote => {
             vec![
@@ -479,6 +539,7 @@ fn build_onboarding_steps(
                 workspace_step,
                 remote_step,
                 provider_step,
+                agent_step,
                 verification_step,
                 first_success_step,
             ]
@@ -631,6 +692,43 @@ fn cli_first_success_marker_path(state_root: &Path) -> PathBuf {
     state_root.join(CLI_FIRST_SUCCESS_MARKER_RELATIVE_PATH)
 }
 
+fn default_agent_status() -> Result<(bool, String)> {
+    let Some(context) = app::current_root_context() else {
+        return Ok((false, "CLI state root is unavailable; run setup first".to_owned()));
+    };
+    let registry_path = context.state_root().join("agents.toml");
+    if !registry_path.exists() {
+        return Ok((
+            false,
+            format!(
+                "no agent registry exists yet at {}; create a default agent before first chat",
+                registry_path.display()
+            ),
+        ));
+    }
+    let raw = fs::read_to_string(registry_path.as_path())
+        .with_context(|| format!("failed to read agent registry {}", registry_path.display()))?;
+    let document: AgentRegistryStatusDocument = toml::from_str(raw.as_str())
+        .with_context(|| format!("failed to parse agent registry {}", registry_path.display()))?;
+    let Some(default_agent_id) = document.default_agent_id.as_deref().map(str::trim) else {
+        return Ok((false, "agent registry does not define a default agent".to_owned()));
+    };
+    if default_agent_id.is_empty() {
+        return Ok((false, "agent registry default agent is empty".to_owned()));
+    }
+    let found = document.agents.iter().any(|agent| agent.agent_id.trim() == default_agent_id);
+    if found {
+        Ok((true, format!("default agent `{default_agent_id}` is configured")))
+    } else {
+        Ok((
+            false,
+            format!(
+                "agent registry default `{default_agent_id}` does not match any configured agent"
+            ),
+        ))
+    }
+}
+
 fn done_step(
     step_id: &str,
     title: &str,
@@ -685,6 +783,47 @@ fn run_cli_action(label: &str, command: String) -> control_plane::OnboardingStep
         kind: control_plane::OnboardingActionKind::RunCliCommand,
         surface: "cli".to_owned(),
         target: command,
+    }
+}
+
+fn default_agent_create_command(signals: &OnboardingSignals) -> String {
+    let mut parts = vec![
+        "palyra".to_owned(),
+        "agents".to_owned(),
+        "create".to_owned(),
+        "local-default".to_owned(),
+        "--display-name".to_owned(),
+        quote_cli_arg("Local Default Agent"),
+        "--set-default".to_owned(),
+    ];
+    if let Some(workspace_root) = signals.workspace_root.as_deref() {
+        parts.push("--workspace-root".to_owned());
+        parts.push(quote_cli_arg(workspace_root));
+        if looks_absolute_path(workspace_root) {
+            parts.push("--allow-absolute-paths".to_owned());
+        }
+    }
+    if let Some(model) = signals.chat_model.as_deref() {
+        parts.push("--model-profile".to_owned());
+        parts.push(quote_cli_arg(model));
+    }
+    parts.join(" ")
+}
+
+fn looks_absolute_path(value: &str) -> bool {
+    Path::new(value).is_absolute()
+        || value.starts_with(r"\\")
+        || value.as_bytes().get(1).is_some_and(|byte| *byte == b':')
+}
+
+fn quote_cli_arg(value: &str) -> String {
+    let safe = value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | '\\' | ':'));
+    if safe {
+        value.to_owned()
+    } else {
+        format!("\"{}\"", value.replace('"', "\\\""))
     }
 }
 
@@ -830,12 +969,57 @@ kind = "anthropic"
                 provider_health_message: "configured".to_owned(),
                 model_discovery_ready: true,
                 model_discovery_message: "ready".to_owned(),
+                default_agent_configured: false,
+                default_agent_message: "agent registry does not define a default agent".to_owned(),
+                workspace_root: Some("C:/portable".to_owned()),
+                chat_model: Some("MiniMax-M2.7".to_owned()),
                 first_success_completed: false,
             },
         );
         let config_step = steps.iter().find(|step| step.step_id == "config").expect("config step");
         let action = config_step.action.as_ref().expect("config step action");
         assert_eq!(action.target, "palyra config list --path C:/portable/palyra.toml");
+    }
+
+    #[test]
+    fn model_selection_requires_real_prompt_before_ready_posture() {
+        let steps = build_onboarding_steps(
+            OnboardingVariant::Quickstart,
+            &OnboardingSignals {
+                config_exists: true,
+                config_path: "C:/portable/palyra.toml".to_owned(),
+                workspace_root_configured: true,
+                remote_base_url_configured: false,
+                remote_verification_mode: None,
+                remote_posture_safe: true,
+                deployment_warning: None,
+                provider_auth_configured: true,
+                provider_model_selected: true,
+                provider_health_state: "configured".to_owned(),
+                provider_health_message: "configured".to_owned(),
+                model_discovery_ready: true,
+                model_discovery_message: "model selection is present".to_owned(),
+                default_agent_configured: true,
+                default_agent_message: "default agent `local-default` is configured".to_owned(),
+                workspace_root: Some("C:/portable".to_owned()),
+                chat_model: Some("MiniMax-M2.7".to_owned()),
+                first_success_completed: false,
+            },
+        );
+        let verification = steps
+            .iter()
+            .find(|step| step.step_id == "model_verification")
+            .expect("model verification step");
+        let first_success =
+            steps.iter().find(|step| step.step_id == "first_success").expect("first_success step");
+
+        assert_eq!(verification.status, control_plane::OnboardingStepStatus::InProgress);
+        assert_eq!(verification.verification_state.as_deref(), Some("prompt_required"));
+        assert_eq!(first_success.status, control_plane::OnboardingStepStatus::Blocked);
+        assert_eq!(
+            derive_posture_status(&steps, onboarding_prerequisites_ready(&steps), false),
+            control_plane::OnboardingPostureState::Blocked
+        );
     }
 
     #[test]
@@ -855,6 +1039,16 @@ anthropic_api_key_vault_ref = "global/minimax_api_key"
         fs::create_dir_all(config_path.parent().expect("config parent"))?;
         fs::write(config_path.as_path(), config)?;
         record_cli_first_success(&state_root, "01ARZ3NDEKTSV4RRFFQ69G5FAV")?;
+        fs::write(
+            state_root.join("agents.toml"),
+            r#"
+version = 1
+default_agent_id = "local-default"
+
+[[agents]]
+agent_id = "local-default"
+"#,
+        )?;
 
         let _context = app::install_root_context(RootOptions {
             config_path: Some(config_path.display().to_string()),
