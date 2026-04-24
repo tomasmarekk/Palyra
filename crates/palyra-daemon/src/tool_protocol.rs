@@ -144,6 +144,8 @@ const MAX_ECHO_TOOL_INPUT_BYTES: usize = 16 * 1024;
 const MAX_SLEEP_TOOL_INPUT_BYTES: usize = 8 * 1024;
 const MAX_MEMORY_SEARCH_TOOL_INPUT_BYTES: usize = 64 * 1024;
 const MAX_MEMORY_RECALL_TOOL_INPUT_BYTES: usize = 64 * 1024;
+const MAX_MEMORY_RETAIN_TOOL_INPUT_BYTES: usize = 64 * 1024;
+const MAX_MEMORY_REFLECT_TOOL_INPUT_BYTES: usize = 64 * 1024;
 const MAX_ROUTINES_QUERY_TOOL_INPUT_BYTES: usize = 64 * 1024;
 const MAX_ROUTINES_CONTROL_TOOL_INPUT_BYTES: usize = 128 * 1024;
 const MAX_HTTP_FETCH_TOOL_INPUT_BYTES: usize = 64 * 1024;
@@ -294,6 +296,12 @@ pub fn tool_metadata(tool_name: &str) -> Option<ToolMetadata> {
             Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: false })
         }
         "palyra.memory.recall" => {
+            Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: false })
+        }
+        "palyra.memory.retain" => {
+            Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: false })
+        }
+        "palyra.memory.reflect" => {
             Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: false })
         }
         "palyra.routines.query" => {
@@ -628,6 +636,22 @@ async fn run_allowlisted_tool(
             executor: "gateway_runtime".to_owned(),
             sandbox_enforcement: "none".to_owned(),
         },
+        "palyra.memory.retain" => ToolExecutionRawResult {
+            success: false,
+            output_json: b"{}".to_vec(),
+            error: "palyra.memory.retain requires gateway memory runtime context".to_owned(),
+            timed_out: false,
+            executor: "gateway_runtime".to_owned(),
+            sandbox_enforcement: "none".to_owned(),
+        },
+        "palyra.memory.reflect" => ToolExecutionRawResult {
+            success: false,
+            output_json: b"{}".to_vec(),
+            error: "palyra.memory.reflect requires gateway memory runtime context".to_owned(),
+            timed_out: false,
+            executor: "gateway_runtime".to_owned(),
+            sandbox_enforcement: "none".to_owned(),
+        },
         "palyra.routines.query" | "palyra.routines.control" => ToolExecutionRawResult {
             success: false,
             output_json: b"{}".to_vec(),
@@ -710,6 +734,8 @@ fn is_runtime_supported_tool(tool_name: &str) -> bool {
             | "palyra.sleep"
             | "palyra.memory.search"
             | "palyra.memory.recall"
+            | "palyra.memory.retain"
+            | "palyra.memory.reflect"
             | "palyra.routines.query"
             | "palyra.routines.control"
             | "palyra.artifact.read"
@@ -752,7 +778,13 @@ fn tool_executor_name(config: &ToolCallConfig, tool_name: &str) -> String {
         "gateway_http_fetch".to_owned()
     } else if tool_name.starts_with("palyra.browser.") {
         "browser_broker".to_owned()
-    } else if matches!(tool_name, "palyra.memory.search" | "palyra.memory.recall") {
+    } else if matches!(
+        tool_name,
+        "palyra.memory.search"
+            | "palyra.memory.recall"
+            | "palyra.memory.retain"
+            | "palyra.memory.reflect"
+    ) {
         "gateway_runtime".to_owned()
     } else if matches!(tool_name, "palyra.routines.query" | "palyra.routines.control") {
         "routines_runtime".to_owned()
@@ -771,6 +803,8 @@ fn tool_input_limit_bytes(tool_name: &str) -> usize {
         "palyra.sleep" => MAX_SLEEP_TOOL_INPUT_BYTES,
         "palyra.memory.search" => MAX_MEMORY_SEARCH_TOOL_INPUT_BYTES,
         "palyra.memory.recall" => MAX_MEMORY_RECALL_TOOL_INPUT_BYTES,
+        "palyra.memory.retain" => MAX_MEMORY_RETAIN_TOOL_INPUT_BYTES,
+        "palyra.memory.reflect" => MAX_MEMORY_REFLECT_TOOL_INPUT_BYTES,
         "palyra.routines.query" => MAX_ROUTINES_QUERY_TOOL_INPUT_BYTES,
         "palyra.routines.control" => MAX_ROUTINES_CONTROL_TOOL_INPUT_BYTES,
         "palyra.artifact.read" => MAX_ARTIFACT_READ_TOOL_INPUT_BYTES,
@@ -1182,6 +1216,29 @@ mod tests {
     }
 
     #[test]
+    fn decide_tool_call_allows_memory_lifecycle_tools_when_allowlisted() {
+        for tool_name in ["palyra.memory.retain", "palyra.memory.reflect"] {
+            let config = ToolCallConfig {
+                allowed_tools: vec![tool_name.to_owned()],
+                max_calls_per_run: 1,
+                execution_timeout_ms: 250,
+                process_runner: default_process_runner_policy(),
+                wasm_runtime: default_wasm_runtime_policy(),
+            };
+            let mut budget = 1;
+            let request_context = tool_request_context("user:ops");
+            let decision =
+                decide_tool_call(&config, &mut budget, &request_context, tool_name, false);
+            assert!(decision.allowed, "allowlisted {tool_name} should be executable");
+            assert!(
+                !decision.approval_required,
+                "{tool_name} should return structured lifecycle status instead of approval gating"
+            );
+            assert_eq!(budget, 0, "allowed tool should consume budget");
+        }
+    }
+
+    #[test]
     fn decide_tool_call_denies_allowlisted_unsupported_runtime_tool() {
         let config = ToolCallConfig {
             allowed_tools: vec!["custom.noop".to_owned()],
@@ -1303,6 +1360,8 @@ mod tests {
         assert!(!tool_requires_approval("palyra.sleep"));
         assert!(!tool_requires_approval("palyra.memory.search"));
         assert!(!tool_requires_approval("palyra.memory.recall"));
+        assert!(!tool_requires_approval("palyra.memory.retain"));
+        assert!(!tool_requires_approval("palyra.memory.reflect"));
         assert!(!tool_requires_approval("palyra.routines.query"));
         assert!(!tool_requires_approval("palyra.artifact.read"));
         assert!(tool_requires_approval("palyra.routines.control"));
@@ -1417,6 +1476,34 @@ mod tests {
         );
         assert_eq!(outcome.attestation.executor, "gateway_runtime");
         assert!(!outcome.attestation.timed_out, "delegation error must not be timeout");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_tool_call_memory_lifecycle_tools_require_gateway_runtime_context() {
+        for (tool_name, input_json) in [
+            ("palyra.memory.retain", br#"{"content_text":"remember this"}"#.as_slice()),
+            ("palyra.memory.reflect", br#"{"content_text":"prefer concise output"}"#.as_slice()),
+        ] {
+            let config = ToolCallConfig {
+                allowed_tools: vec![tool_name.to_owned()],
+                max_calls_per_run: 1,
+                execution_timeout_ms: 250,
+                process_runner: default_process_runner_policy(),
+                wasm_runtime: default_wasm_runtime_policy(),
+            };
+            let outcome =
+                execute_tool_call(&config, "01ARZ3NDEKTSV4RRFFQ69G5FAB", tool_name, input_json)
+                    .await;
+
+            assert!(!outcome.success, "generic tool executor should not run {tool_name}");
+            assert!(
+                outcome.error.contains("requires gateway memory runtime context"),
+                "delegated executor error should be explicit: {}",
+                outcome.error
+            );
+            assert_eq!(outcome.attestation.executor, "gateway_runtime");
+            assert!(!outcome.attestation.timed_out, "delegation error must not be timeout");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

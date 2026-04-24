@@ -422,6 +422,17 @@ pub struct MemoryItemCreateRequest {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct MemoryItemLifecycleUpdateRequest {
+    pub memory_id: String,
+    pub principal: String,
+    pub channel: Option<String>,
+    pub session_id: Option<String>,
+    pub tags: Vec<String>,
+    pub confidence: Option<f64>,
+    pub ttl_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct MemorySearchRequest {
     pub principal: String,
     pub channel: Option<String>,
@@ -11498,6 +11509,44 @@ impl JournalStore {
         self.purge_expired_memory_items(now)?;
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         load_memory_item_by_id(&guard, memory_id, now)
+    }
+
+    pub fn update_memory_item_lifecycle(
+        &self,
+        request: &MemoryItemLifecycleUpdateRequest,
+    ) -> Result<Option<MemoryItemRecord>, JournalError> {
+        let now = current_unix_ms()?;
+        let tags = normalize_memory_tags(request.tags.as_slice());
+        let tags_json = serde_json::to_string(&tags)?;
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let updated = guard.execute(
+            r#"
+                UPDATE memory_items
+                SET
+                    tags_json = ?2,
+                    confidence = COALESCE(?3, confidence),
+                    ttl_unix_ms = COALESCE(?4, ttl_unix_ms),
+                    updated_at_unix_ms = ?5
+                WHERE memory_ulid = ?1
+                  AND principal = ?6
+                  AND ((?7 IS NULL AND channel IS NULL) OR channel = ?7)
+                  AND ((?8 IS NULL AND session_ulid IS NULL) OR session_ulid = ?8)
+            "#,
+            params![
+                request.memory_id.as_str(),
+                tags_json,
+                request.confidence,
+                request.ttl_unix_ms,
+                now,
+                request.principal.as_str(),
+                request.channel.as_deref(),
+                request.session_id.as_deref(),
+            ],
+        )?;
+        if updated == 0 {
+            return Ok(None);
+        }
+        load_memory_item_by_id(&guard, request.memory_id.as_str(), now)
     }
 
     pub fn delete_memory_item(

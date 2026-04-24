@@ -1,12 +1,18 @@
 use std::sync::Arc;
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
 use crate::{
     application::{
-        memory::redact_memory_text_for_output,
+        memory::{
+            normalize_lifecycle_content, redact_memory_text_for_output, reflect_memory_candidates,
+            ttl_unix_ms_from_input, MemoryLifecycleProvider, MemoryLifecycleRetainOutcome,
+            MemoryLifecycleRetainRequest, MemoryLifecycleScope, MemoryReflectionCategory,
+            MemoryReflectionOutcome, MemoryReflectionRequest, MEMORY_CONTEXT_FENCE_VERSION,
+            MEMORY_TRUST_LABEL_RETRIEVED,
+        },
         recall::{preview_recall, RecallPreviewEnvelope, RecallRequest},
         service_authorization::authorize_memory_action,
     },
@@ -38,6 +44,8 @@ pub(crate) fn memory_search_tool_output_payload(search_hits: &[MemorySearchHit])
                 "content_hash": hit.item.content_hash,
                 "tags": hit.item.tags,
                 "confidence": hit.item.confidence,
+                "trust_label": MEMORY_TRUST_LABEL_RETRIEVED,
+                "provenance": memory_hit_provenance(hit),
                 "breakdown": {
                     "lexical_score": hit.breakdown.lexical_score,
                     "vector_score": hit.breakdown.vector_score,
@@ -67,6 +75,223 @@ pub(crate) fn memory_recall_tool_output_payload(preview: &RecallPreviewEnvelope)
         "parameter_delta": preview.parameter_delta,
         "prompt_preview": preview.prompt_preview,
     })
+}
+
+pub(crate) async fn execute_memory_retain_tool(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: ToolRuntimeExecutionContext<'_>,
+    proposal_id: &str,
+    input_json: &[u8],
+) -> ToolExecutionOutcome {
+    let namespace = b"palyra.memory.retain.attestation.v1";
+    let parsed = match parse_memory_tool_object(input_json) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return memory_tool_execution_outcome(
+                namespace,
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                format!("palyra.memory.retain {error}"),
+            );
+        }
+    };
+
+    let content_text = match required_string_field(&parsed, "content_text") {
+        Ok(value) => value,
+        Err(error) => {
+            return memory_tool_execution_outcome(
+                namespace,
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                format!("palyra.memory.retain {error}"),
+            );
+        }
+    };
+    if content_text.len() > MAX_MEMORY_TOOL_QUERY_BYTES {
+        return memory_tool_execution_outcome(
+            namespace,
+            proposal_id,
+            input_json,
+            false,
+            b"{}".to_vec(),
+            format!(
+                "palyra.memory.retain content_text exceeds {MAX_MEMORY_TOOL_QUERY_BYTES} bytes"
+            ),
+        );
+    }
+    let scope = match MemoryLifecycleScope::parse(parsed.get("scope").and_then(Value::as_str)) {
+        Ok(scope) => scope,
+        Err(error) => {
+            return memory_tool_execution_outcome(
+                namespace,
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                format!("palyra.memory.retain {}", error.message()),
+            );
+        }
+    };
+    let source = match parsed.get("source").and_then(Value::as_str) {
+        Some(raw) => match parse_memory_source_literal(raw) {
+            Some(source) => source,
+            None => {
+                return memory_tool_execution_outcome(
+                    namespace,
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    format!("palyra.memory.retain unknown source value: {raw}"),
+                );
+            }
+        },
+        None => MemorySource::Manual,
+    };
+    let tags = match parse_string_array_field(parsed.get("tags"), "tags", MAX_MEMORY_TOOL_TAGS) {
+        Ok(tags) => tags,
+        Err(error) => {
+            return memory_tool_execution_outcome(
+                namespace,
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                error,
+            );
+        }
+    };
+    let confidence = match parsed.get("confidence").and_then(Value::as_f64) {
+        Some(value) if value.is_finite() && (0.0..=1.0).contains(&value) => Some(value),
+        Some(_) => {
+            return memory_tool_execution_outcome(
+                namespace,
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                "palyra.memory.retain confidence must be in range 0.0..=1.0".to_owned(),
+            );
+        }
+        None => None,
+    };
+    let ttl_unix_ms = match ttl_unix_ms_from_input(
+        parsed.get("ttl_ms").and_then(Value::as_i64),
+        parsed.get("ttl_unix_ms").and_then(Value::as_i64),
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            return memory_tool_execution_outcome(
+                namespace,
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                format!("palyra.memory.retain {}", error.message()),
+            );
+        }
+    };
+    let provenance = parsed
+        .get("provenance")
+        .cloned()
+        .unwrap_or_else(|| retain_tool_provenance(context, proposal_id));
+
+    let provider = MemoryLifecycleProvider::new(Arc::clone(runtime_state));
+    let outcome = match provider
+        .retain(MemoryLifecycleRetainRequest {
+            principal: context.principal.to_owned(),
+            channel: context.channel.map(str::to_owned),
+            session_id: context.session_id.to_owned(),
+            scope,
+            source,
+            content_text,
+            tags,
+            confidence,
+            ttl_unix_ms,
+            provenance,
+        })
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return memory_tool_execution_outcome(
+                namespace,
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                format!("palyra.memory.retain failed: {}", error.message()),
+            );
+        }
+    };
+    serialize_memory_lifecycle_outcome(namespace, proposal_id, input_json, &outcome)
+}
+
+pub(crate) async fn execute_memory_reflect_tool(
+    context: ToolRuntimeExecutionContext<'_>,
+    proposal_id: &str,
+    input_json: &[u8],
+) -> ToolExecutionOutcome {
+    let namespace = b"palyra.memory.reflect.attestation.v1";
+    let parsed = match parse_memory_tool_object(input_json) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return memory_tool_execution_outcome(
+                namespace,
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                format!("palyra.memory.reflect {error}"),
+            );
+        }
+    };
+    let observations = match parse_reflection_observations(&parsed) {
+        Ok(observations) => observations,
+        Err(error) => {
+            return memory_tool_execution_outcome(
+                namespace,
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                error,
+            );
+        }
+    };
+    let categories = match parse_reflection_categories(parsed.get("categories")) {
+        Ok(categories) => categories,
+        Err(error) => {
+            return memory_tool_execution_outcome(
+                namespace,
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                error,
+            );
+        }
+    };
+    let max_candidates = parsed
+        .get("max_candidates")
+        .and_then(Value::as_u64)
+        .map(|value| (value as usize).clamp(1, 16))
+        .unwrap_or(8);
+    let provenance = parsed
+        .get("provenance")
+        .cloned()
+        .unwrap_or_else(|| retain_tool_provenance(context, proposal_id));
+    let outcome = reflect_memory_candidates(MemoryReflectionRequest {
+        observations,
+        allowed_categories: categories,
+        max_candidates,
+        provenance,
+    });
+    serialize_memory_reflection_outcome(namespace, proposal_id, input_json, &outcome)
 }
 
 pub(crate) async fn execute_memory_search_tool(
@@ -557,6 +782,243 @@ pub(crate) async fn execute_memory_recall_tool(
             false,
             b"{}".to_vec(),
             format!("palyra.memory.recall failed to serialize output: {error}"),
+        ),
+    }
+}
+
+fn parse_memory_tool_object(input_json: &[u8]) -> Result<Map<String, Value>, String> {
+    match serde_json::from_slice::<Value>(input_json) {
+        Ok(Value::Object(map)) => Ok(map),
+        Ok(_) => Err("requires JSON object input".to_owned()),
+        Err(error) => Err(format!("invalid JSON input: {error}")),
+    }
+}
+
+fn required_string_field(parsed: &Map<String, Value>, field: &str) -> Result<String, String> {
+    parsed
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| format!("requires non-empty string field '{field}'"))
+}
+
+fn parse_string_array_field(
+    value: Option<&Value>,
+    field: &str,
+    max_items: usize,
+) -> Result<Vec<String>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let Value::Array(values) = value else {
+        return Err(format!("palyra.memory.retain {field} must be an array of strings"));
+    };
+    if values.len() > max_items {
+        return Err(format!("palyra.memory.retain {field} exceeds limit ({max_items})"));
+    }
+    let mut parsed = Vec::new();
+    for value in values {
+        let Some(raw) = value.as_str() else {
+            return Err(format!("palyra.memory.retain {field} must be an array of strings"));
+        };
+        let normalized = raw.trim();
+        if !normalized.is_empty() {
+            parsed.push(normalized.to_owned());
+        }
+    }
+    Ok(parsed)
+}
+
+fn parse_reflection_observations(parsed: &Map<String, Value>) -> Result<Vec<String>, String> {
+    if let Some(value) = parsed.get("observations") {
+        let Value::Array(values) = value else {
+            return Err("palyra.memory.reflect observations must be an array of strings".to_owned());
+        };
+        let mut observations = Vec::new();
+        for value in values {
+            let Some(raw) = value.as_str() else {
+                return Err(
+                    "palyra.memory.reflect observations must be an array of strings".to_owned()
+                );
+            };
+            let normalized = normalize_lifecycle_content(raw);
+            if !normalized.is_empty() {
+                observations.push(normalized);
+            }
+        }
+        if !observations.is_empty() {
+            return Ok(observations);
+        }
+    }
+    if let Some(value) = parsed.get("messages") {
+        let Value::Array(values) = value else {
+            return Err("palyra.memory.reflect messages must be an array".to_owned());
+        };
+        let observations = values
+            .iter()
+            .filter_map(|value| {
+                value.get("content").and_then(Value::as_str).map(normalize_lifecycle_content)
+            })
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        if !observations.is_empty() {
+            return Ok(observations);
+        }
+    }
+    match parsed.get("content_text").and_then(Value::as_str).map(normalize_lifecycle_content) {
+        Some(value) if !value.is_empty() => Ok(value
+            .split(['\n', ';'])
+            .map(normalize_lifecycle_content)
+            .filter(|entry| !entry.is_empty())
+            .collect()),
+        _ => {
+            Err("palyra.memory.reflect requires observations, messages, or content_text".to_owned())
+        }
+    }
+}
+
+fn parse_reflection_categories(
+    value: Option<&Value>,
+) -> Result<Vec<MemoryReflectionCategory>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let Value::Array(values) = value else {
+        return Err("palyra.memory.reflect categories must be an array of strings".to_owned());
+    };
+    let mut categories = Vec::new();
+    for value in values {
+        let Some(raw) = value.as_str() else {
+            return Err("palyra.memory.reflect categories must be an array of strings".to_owned());
+        };
+        let Some(category) = MemoryReflectionCategory::parse(raw) else {
+            return Err(format!("palyra.memory.reflect unknown category: {raw}"));
+        };
+        if !categories.contains(&category) {
+            categories.push(category);
+        }
+    }
+    Ok(categories)
+}
+
+fn retain_tool_provenance(context: ToolRuntimeExecutionContext<'_>, proposal_id: &str) -> Value {
+    json!({
+        "tool_proposal_id": proposal_id,
+        "run_id": context.run_id,
+        "session_id": context.session_id,
+        "principal": context.principal,
+        "channel": context.channel,
+        "source": "tool_call",
+    })
+}
+
+fn memory_hit_provenance(hit: &MemorySearchHit) -> Value {
+    json!({
+        "memory_id": hit.item.memory_id.as_str(),
+        "source": hit.item.source.as_str(),
+        "scope": memory_item_scope_label(&hit.item),
+        "session_id": hit.item.session_id.as_deref(),
+        "channel": hit.item.channel.as_deref(),
+        "content_hash": hit.item.content_hash.as_str(),
+        "fence": MEMORY_CONTEXT_FENCE_VERSION,
+    })
+}
+
+fn memory_item_scope_label(item: &crate::journal::MemoryItemRecord) -> &'static str {
+    if item.session_id.is_some() {
+        "session"
+    } else if item.channel.is_some() {
+        "channel"
+    } else {
+        "principal"
+    }
+}
+
+fn serialize_memory_lifecycle_outcome(
+    namespace: &'static [u8],
+    proposal_id: &str,
+    input_json: &[u8],
+    outcome: &MemoryLifecycleRetainOutcome,
+) -> ToolExecutionOutcome {
+    let payload = json!({
+        "status": outcome.status.as_str(),
+        "reason": outcome.reason.as_str(),
+        "scope": outcome.scope.as_str(),
+        "trust_label": outcome.trust_label.as_str(),
+        "durable_memory_write": outcome.durable_memory_write,
+        "matched_memory_id": outcome.matched_memory_id.as_deref(),
+        "provenance": outcome.provenance.clone(),
+        "item": outcome.item.as_ref().map(memory_item_output_payload),
+    });
+    match serde_json::to_vec(&payload) {
+        Ok(output_json) => memory_tool_execution_outcome(
+            namespace,
+            proposal_id,
+            input_json,
+            true,
+            output_json,
+            String::new(),
+        ),
+        Err(error) => memory_tool_execution_outcome(
+            namespace,
+            proposal_id,
+            input_json,
+            false,
+            b"{}".to_vec(),
+            format!("palyra.memory.retain failed to serialize output: {error}"),
+        ),
+    }
+}
+
+fn memory_item_output_payload(item: &crate::journal::MemoryItemRecord) -> Value {
+    json!({
+        "memory_id": item.memory_id.as_str(),
+        "source": item.source.as_str(),
+        "scope": memory_item_scope_label(item),
+        "channel": item.channel.as_deref(),
+        "session_id": item.session_id.as_deref(),
+        "content_text": redact_memory_text_for_output(item.content_text.as_str()),
+        "content_hash": item.content_hash.as_str(),
+        "tags": item.tags.clone(),
+        "confidence": item.confidence,
+        "ttl_unix_ms": item.ttl_unix_ms,
+        "created_at_unix_ms": item.created_at_unix_ms,
+        "updated_at_unix_ms": item.updated_at_unix_ms,
+        "trust_label": MEMORY_TRUST_LABEL_RETRIEVED,
+        "provenance": {
+            "memory_id": item.memory_id.as_str(),
+            "source": item.source.as_str(),
+            "scope": memory_item_scope_label(item),
+            "content_hash": item.content_hash.as_str(),
+            "fence": MEMORY_CONTEXT_FENCE_VERSION,
+        },
+    })
+}
+
+fn serialize_memory_reflection_outcome(
+    namespace: &'static [u8],
+    proposal_id: &str,
+    input_json: &[u8],
+    outcome: &MemoryReflectionOutcome,
+) -> ToolExecutionOutcome {
+    match serde_json::to_vec(outcome) {
+        Ok(output_json) => memory_tool_execution_outcome(
+            namespace,
+            proposal_id,
+            input_json,
+            true,
+            output_json,
+            String::new(),
+        ),
+        Err(error) => memory_tool_execution_outcome(
+            namespace,
+            proposal_id,
+            input_json,
+            false,
+            b"{}".to_vec(),
+            format!("palyra.memory.reflect failed to serialize output: {error}"),
         ),
     }
 }

@@ -11,25 +11,26 @@ use crate::journal::{
     IdempotencyCompleteRequest, IdempotencyFailRequest, LearningCandidateCreateRequest,
     LearningCandidateHistoryRecord, LearningCandidateListFilter, LearningCandidateRecord,
     LearningCandidateReviewRequest, LearningPreferenceListFilter, LearningPreferenceRecord,
-    LearningPreferenceUpsertRequest, MemoryEmbeddingsStatus, MemoryItemRecord,
-    OrchestratorBackgroundTaskCreateRequest, OrchestratorBackgroundTaskListFilter,
-    OrchestratorBackgroundTaskRecord, OrchestratorBackgroundTaskUpdateRequest,
-    OrchestratorCheckpointCreateRequest, OrchestratorCheckpointRecord,
-    OrchestratorCheckpointRestoreMarkRequest, OrchestratorCompactionArtifactCreateRequest,
-    OrchestratorCompactionArtifactRecord, OrchestratorQueuedInputCreateRequest,
-    OrchestratorQueuedInputRecord, OrchestratorQueuedInputUpdateRequest,
-    OrchestratorRunMetadataUpdateRequest, OrchestratorSessionCleanupOutcome,
-    OrchestratorSessionCleanupRequest, OrchestratorSessionLineageUpdateRequest,
-    OrchestratorSessionPinCreateRequest, OrchestratorSessionPinRecord,
-    OrchestratorSessionQueueControlRecord, OrchestratorSessionQueueControlUpdateRequest,
-    OrchestratorSessionRecord, OrchestratorSessionTitleUpdateRequest,
-    OrchestratorSessionTranscriptRecord, OrchestratorUsageQuery, OrchestratorUsageRunRecord,
-    OrchestratorUsageSessionRecord, OrchestratorUsageSummary, RecallArtifactCreateRequest,
-    RecallArtifactListFilter, RecallArtifactRecord, RetrievalBranchDiagnostics,
-    SessionProjectContextStateCopyRequest, SessionProjectContextStateRecord,
-    SessionProjectContextStateUpsertRequest, SessionSearchOutcome, SessionSearchRequest,
-    ToolResultArtifactCreateRequest, ToolResultArtifactReadRequest, WorkspaceBootstrapOutcome,
-    WorkspaceBootstrapRequest, WorkspaceCheckpointCreateRequest, WorkspaceCheckpointFilePayload,
+    LearningPreferenceUpsertRequest, MemoryEmbeddingsStatus, MemoryItemLifecycleUpdateRequest,
+    MemoryItemRecord, OrchestratorBackgroundTaskCreateRequest,
+    OrchestratorBackgroundTaskListFilter, OrchestratorBackgroundTaskRecord,
+    OrchestratorBackgroundTaskUpdateRequest, OrchestratorCheckpointCreateRequest,
+    OrchestratorCheckpointRecord, OrchestratorCheckpointRestoreMarkRequest,
+    OrchestratorCompactionArtifactCreateRequest, OrchestratorCompactionArtifactRecord,
+    OrchestratorQueuedInputCreateRequest, OrchestratorQueuedInputRecord,
+    OrchestratorQueuedInputUpdateRequest, OrchestratorRunMetadataUpdateRequest,
+    OrchestratorSessionCleanupOutcome, OrchestratorSessionCleanupRequest,
+    OrchestratorSessionLineageUpdateRequest, OrchestratorSessionPinCreateRequest,
+    OrchestratorSessionPinRecord, OrchestratorSessionQueueControlRecord,
+    OrchestratorSessionQueueControlUpdateRequest, OrchestratorSessionRecord,
+    OrchestratorSessionTitleUpdateRequest, OrchestratorSessionTranscriptRecord,
+    OrchestratorUsageQuery, OrchestratorUsageRunRecord, OrchestratorUsageSessionRecord,
+    OrchestratorUsageSummary, RecallArtifactCreateRequest, RecallArtifactListFilter,
+    RecallArtifactRecord, RetrievalBranchDiagnostics, SessionProjectContextStateCopyRequest,
+    SessionProjectContextStateRecord, SessionProjectContextStateUpsertRequest,
+    SessionSearchOutcome, SessionSearchRequest, ToolResultArtifactCreateRequest,
+    ToolResultArtifactReadRequest, WorkspaceBootstrapOutcome, WorkspaceBootstrapRequest,
+    WorkspaceCheckpointCreateRequest, WorkspaceCheckpointFilePayload,
     WorkspaceCheckpointFileRecord, WorkspaceCheckpointListFilter,
     WorkspaceCheckpointPairLinkRequest, WorkspaceCheckpointRecord,
     WorkspaceCheckpointRestoreMarkRequest, WorkspaceDocumentDeleteRequest,
@@ -6738,6 +6739,26 @@ impl GatewayRuntimeState {
         })
         .await
         .map_err(|_| Status::internal("memory read worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn update_memory_item_lifecycle(
+        self: &Arc<Self>,
+        request: MemoryItemLifecycleUpdateRequest,
+    ) -> Result<Option<MemoryItemRecord>, Status> {
+        let state = Arc::clone(self);
+        let updated = tokio::task::spawn_blocking(move || {
+            state
+                .journal_store
+                .update_memory_item_lifecycle(&request)
+                .map_err(|error| map_memory_store_error("update memory item lifecycle", error))
+        })
+        .await
+        .map_err(|_| Status::internal("memory lifecycle update worker panicked"))??;
+        if updated.is_some() {
+            self.clear_memory_search_cache();
+        }
+        Ok(updated)
     }
 
     #[allow(clippy::result_large_err)]
