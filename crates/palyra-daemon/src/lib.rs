@@ -8,6 +8,7 @@ mod auxiliary_executor;
 mod background_queue;
 mod channel_router;
 mod channels;
+mod command_router;
 mod config;
 mod cron;
 mod delegation;
@@ -31,6 +32,7 @@ mod orchestrator;
 mod plugins;
 mod provider_leases;
 mod quic_runtime;
+mod realtime;
 #[allow(dead_code)]
 mod replay_capture;
 mod retrieval;

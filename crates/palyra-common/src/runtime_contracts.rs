@@ -11,6 +11,7 @@
 //!   guardrails, diagnostics, and regression harnesses.
 //!
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fmt;
 
 macro_rules! runtime_contract_enum {
@@ -23,7 +24,7 @@ macro_rules! runtime_contract_enum {
         }
     ) => {
         $(#[$meta])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
         pub enum $name {
             $(
                 #[serde(rename = $canonical $(, alias = $alias)*)]
@@ -362,6 +363,262 @@ pub struct ToolResultBudgetMetrics {
     pub saved_model_visible_bytes: u64,
 }
 
+pub const REALTIME_PROTOCOL_MIN_VERSION: u32 = 1;
+pub const REALTIME_PROTOCOL_MAX_VERSION: u32 = 1;
+pub const REALTIME_DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 15_000;
+
+runtime_contract_enum! {
+    /// Role declared by a realtime client during the initial handshake.
+    pub enum RealtimeRole {
+        Operator => "operator",
+        ReadOnly => "read_only",
+        Agent => "agent",
+        Connector => "connector",
+        Node => "node"
+    }
+}
+
+runtime_contract_enum! {
+    /// Scope names used by realtime method and event authorization.
+    pub enum RealtimeScope {
+        RunsRead => "runs:read",
+        RunsWrite => "runs:write",
+        ApprovalsRead => "approvals:read",
+        ApprovalsWrite => "approvals:write",
+        NodesRead => "nodes:read",
+        NodesWrite => "nodes:write",
+        ConfigRead => "config:read",
+        ConfigWrite => "config:write",
+        EventsRead => "events:read",
+        EventsSensitive => "events:sensitive"
+    }
+}
+
+runtime_contract_enum! {
+    /// Capability names returned by realtime negotiation and checked by handlers.
+    pub enum RealtimeCapability {
+        EventStream => "event_stream",
+        SnapshotRefresh => "snapshot_refresh",
+        RunControl => "run_control",
+        ApprovalControl => "approval_control",
+        NodePresence => "node_presence",
+        CapabilityGrant => "capability_grant",
+        ConfigSchemaLookup => "config_schema_lookup",
+        ConfigReload => "config_reload",
+        SensitiveEvents => "sensitive_events"
+    }
+}
+
+runtime_contract_enum! {
+    /// Stable command names for command-router backed realtime methods.
+    pub enum RealtimeCommand {
+        RunCreate => "run.create",
+        RunWait => "run.wait",
+        RunEvents => "run.events",
+        RunAbort => "run.abort",
+        RunGet => "run.get",
+        ApprovalList => "approval.list",
+        ApprovalGet => "approval.get",
+        ApprovalDecide => "approval.decide",
+        NodePresence => "node.presence",
+        NodeCapabilityGrant => "node.capability.grant",
+        NodeCapabilityRevoke => "node.capability.revoke",
+        ConfigSchemaLookup => "config.schema.lookup",
+        ConfigReloadPlan => "config.reload.plan",
+        ConfigReloadApply => "config.reload.apply"
+    }
+}
+
+runtime_contract_enum! {
+    /// Event topics routed through the realtime event router.
+    pub enum RealtimeEventTopic {
+        Run => "run",
+        Approval => "approval",
+        Node => "node",
+        Config => "config",
+        System => "system"
+    }
+}
+
+runtime_contract_enum! {
+    /// Event sensitivity is evaluated before serialization to each client.
+    pub enum RealtimeEventSensitivity {
+        Public => "public",
+        Internal => "internal",
+        Sensitive => "sensitive",
+        Secret => "secret"
+    }
+}
+
+/// Supported realtime protocol range advertised in compatibility errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealtimeProtocolVersionRange {
+    pub min: u32,
+    pub max: u32,
+}
+
+impl Default for RealtimeProtocolVersionRange {
+    fn default() -> Self {
+        Self { min: REALTIME_PROTOCOL_MIN_VERSION, max: REALTIME_PROTOCOL_MAX_VERSION }
+    }
+}
+
+impl RealtimeProtocolVersionRange {
+    #[must_use]
+    pub const fn contains(self, protocol_version: u32) -> bool {
+        protocol_version >= self.min && protocol_version <= self.max
+    }
+}
+
+/// Cursor supplied by realtime clients when reconnecting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RealtimeCursor {
+    pub sequence: u64,
+}
+
+/// Handshake request sent as the first realtime WebSocket frame.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealtimeHandshakeRequest {
+    pub protocol_version: u32,
+    pub client_id: String,
+    pub role: RealtimeRole,
+    #[serde(default)]
+    pub requested_scopes: Vec<RealtimeScope>,
+    #[serde(default)]
+    pub requested_capabilities: Vec<RealtimeCapability>,
+    #[serde(default)]
+    pub requested_commands: Vec<RealtimeCommand>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_cursor: Option<RealtimeCursor>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subscriptions: Vec<RealtimeSubscription>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heartbeat_interval_ms: Option<u64>,
+}
+
+/// Handshake response after role/scope/capability/command negotiation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealtimeHandshakeAccepted {
+    pub protocol_version: u32,
+    pub client_id: String,
+    pub auth_subject: String,
+    pub role: RealtimeRole,
+    pub scopes: Vec<RealtimeScope>,
+    pub capabilities: Vec<RealtimeCapability>,
+    pub commands: Vec<RealtimeCommand>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subscriptions: Vec<RealtimeSubscription>,
+    pub cursor: RealtimeCursor,
+    pub heartbeat_interval_ms: u64,
+    pub server_time_unix_ms: i64,
+    pub sdk_abi_version: String,
+}
+
+/// Stable realtime error envelope with optional compatibility metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealtimeErrorEnvelope {
+    pub error: StableErrorEnvelope,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supported_protocol_versions: Option<RealtimeProtocolVersionRange>,
+}
+
+/// Event envelope stored and filtered before serialization.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RealtimeEventEnvelope {
+    pub schema_version: u32,
+    pub sequence: u64,
+    pub event_id: String,
+    pub topic: RealtimeEventTopic,
+    pub sensitivity: RealtimeEventSensitivity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_principal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_session_id: Option<String>,
+    pub occurred_at_unix_ms: i64,
+    pub payload: Value,
+}
+
+/// Subscription filter carried in connection state and restored on reconnect.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealtimeSubscription {
+    #[serde(default)]
+    pub topics: Vec<RealtimeEventTopic>,
+    #[serde(default)]
+    pub session_ids: Vec<String>,
+}
+
+impl RealtimeSubscription {
+    #[must_use]
+    pub fn all_topics() -> Self {
+        Self { topics: Vec::new(), session_ids: Vec::new() }
+    }
+}
+
+/// Method/command descriptor exported by the runtime registry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealtimeMethodDescriptor {
+    pub command: RealtimeCommand,
+    pub version: u32,
+    pub required_scopes: Vec<RealtimeScope>,
+    pub required_capabilities: Vec<RealtimeCapability>,
+    pub idempotency_required: bool,
+    pub side_effecting: bool,
+    pub rate_limit_bucket: String,
+}
+
+/// Command frame accepted by the shared backend command router.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RealtimeCommandEnvelope {
+    pub request_id: String,
+    pub command: RealtimeCommand,
+    #[serde(default)]
+    pub params: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_version: Option<u64>,
+}
+
+/// Stable command-router result envelope.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RealtimeCommandResultEnvelope {
+    pub request_id: String,
+    pub command: RealtimeCommand,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<StableErrorEnvelope>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    pub replayed: bool,
+}
+
+/// Schema lookup record for runtime config control-plane clients.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeConfigSchemaField {
+    pub path: String,
+    pub value_type: String,
+    pub default_value: String,
+    pub validator: String,
+    pub sensitivity: ToolResultSensitivity,
+    pub reloadable: bool,
+    pub reload_impact: String,
+}
+
+/// Node/device presence surfaced over realtime without exposing secrets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealtimeNodePresence {
+    pub device_id: String,
+    pub state: String,
+    pub ttl_ms: u64,
+    pub last_seen_at_unix_ms: i64,
+    pub heartbeat_interval_ms: u64,
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub attestation: Vec<String>,
+}
+
 runtime_contract_enum! {
     /// Canonical queue runtime modes used by queue orchestration surfaces.
     pub enum QueueMode {
@@ -548,9 +805,14 @@ mod tests {
     use super::{
         ArtifactRetentionDisposition, ArtifactRetentionPolicy, AuxiliaryTaskKind,
         AuxiliaryTaskState, DeliveryPolicy, FlowState, FlowStepState, IdempotencyReplayDecision,
-        PruningPolicyClass, QueueDecision, QueueMode, QueuedInputState, RunLifecyclePhase,
-        ToolResultSensitivity, ToolResultVisibility, ToolTurnBudget, WorkerLifecycleState,
+        PruningPolicyClass, QueueDecision, QueueMode, QueuedInputState, RealtimeCapability,
+        RealtimeCommand, RealtimeCommandEnvelope, RealtimeEventSensitivity, RealtimeEventTopic,
+        RealtimeHandshakeRequest, RealtimeProtocolVersionRange, RealtimeRole, RealtimeScope,
+        RealtimeSubscription, RunLifecyclePhase, ToolResultSensitivity, ToolResultVisibility,
+        ToolTurnBudget, WorkerLifecycleState, REALTIME_PROTOCOL_MAX_VERSION,
+        REALTIME_PROTOCOL_MIN_VERSION,
     };
+    use serde_json::json;
 
     #[test]
     fn queue_modes_round_trip_with_canonical_serialization() {
@@ -621,5 +883,72 @@ mod tests {
         let budget = ToolTurnBudget::default();
         assert!(budget.max_model_inline_bytes > budget.max_model_summary_bytes);
         assert!(budget.max_artifact_read_bytes >= budget.max_model_inline_bytes);
+    }
+
+    #[test]
+    fn realtime_contracts_use_stable_wire_names() {
+        assert_eq!(RealtimeRole::Operator.as_str(), "operator");
+        assert_eq!(RealtimeScope::RunsRead.as_str(), "runs:read");
+        assert_eq!(RealtimeCapability::SnapshotRefresh.as_str(), "snapshot_refresh");
+        assert_eq!(RealtimeCommand::ConfigReloadApply.as_str(), "config.reload.apply");
+        assert_eq!(RealtimeEventTopic::Approval.as_str(), "approval");
+        assert_eq!(RealtimeEventSensitivity::Sensitive.as_str(), "sensitive");
+        assert!(RealtimeProtocolVersionRange::default().contains(REALTIME_PROTOCOL_MIN_VERSION));
+        assert!(RealtimeProtocolVersionRange::default().contains(REALTIME_PROTOCOL_MAX_VERSION));
+    }
+
+    #[test]
+    fn realtime_handshake_and_command_frames_are_json_safe() {
+        let handshake = RealtimeHandshakeRequest {
+            protocol_version: 1,
+            client_id: "console-a".to_owned(),
+            role: RealtimeRole::Operator,
+            requested_scopes: vec![RealtimeScope::RunsRead, RealtimeScope::ApprovalsWrite],
+            requested_capabilities: vec![RealtimeCapability::RunControl],
+            requested_commands: vec![RealtimeCommand::RunGet, RealtimeCommand::ApprovalDecide],
+            event_cursor: None,
+            subscriptions: vec![RealtimeSubscription {
+                topics: vec![RealtimeEventTopic::Run],
+                session_ids: vec!["session-a".to_owned()],
+            }],
+            heartbeat_interval_ms: Some(5_000),
+        };
+        let serialized = serde_json::to_value(&handshake).expect("handshake should serialize");
+        assert_eq!(serialized["requested_scopes"], json!(["runs:read", "approvals:write"]));
+        assert_eq!(serialized["subscriptions"][0]["topics"], json!(["run"]));
+
+        let command = RealtimeCommandEnvelope {
+            request_id: "req-1".to_owned(),
+            command: RealtimeCommand::RunWait,
+            params: json!({ "run_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV" }),
+            idempotency_key: None,
+            expected_version: None,
+        };
+        let decoded: RealtimeCommandEnvelope =
+            serde_json::from_value(serde_json::to_value(command).unwrap()).unwrap();
+        assert_eq!(decoded.command, RealtimeCommand::RunWait);
+    }
+
+    #[test]
+    fn realtime_handshake_rejects_unknown_scope_and_capability_names() {
+        let unknown_scope = json!({
+            "protocol_version": 1,
+            "client_id": "console-a",
+            "role": "operator",
+            "requested_scopes": ["runs:read", "unknown:scope"],
+            "requested_capabilities": [],
+            "requested_commands": []
+        });
+        assert!(serde_json::from_value::<RealtimeHandshakeRequest>(unknown_scope).is_err());
+
+        let unknown_capability = json!({
+            "protocol_version": 1,
+            "client_id": "console-a",
+            "role": "operator",
+            "requested_scopes": [],
+            "requested_capabilities": ["unknown_capability"],
+            "requested_commands": []
+        });
+        assert!(serde_json::from_value::<RealtimeHandshakeRequest>(unknown_capability).is_err());
     }
 }

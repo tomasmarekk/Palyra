@@ -32,7 +32,7 @@ rust-version = "1.91"
 agent-client-protocol = { version = "0.10.0", features = ["unstable_session_list"] }
 anyhow = "1.0.102"
 async-trait = "0.1.89"
-axum = "0.8.1"
+axum = { version = "0.8.1", features = ["ws"] }
 base64 = "0.22.1"
 clap = { version = "4.6.0", features = ["derive"] }
 clap_complete = "4.6.0"

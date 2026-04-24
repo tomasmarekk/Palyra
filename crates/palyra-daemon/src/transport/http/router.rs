@@ -8,7 +8,7 @@ use axum::{
 use crate::{
     app::state::AppState,
     transport::http::{
-        handlers::{admin, canvas, compat, console, health, web_ui},
+        handlers::{admin, canvas, compat, console, health, realtime, web_ui},
         middleware as http_middleware,
     },
     HTTP_MAX_REQUEST_BODY_BYTES,
@@ -1400,6 +1400,11 @@ pub(crate) fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/runtime", get(health::dashboard_handoff_handler))
         .route("/healthz", get(health::health_handler))
+        .route("/realtime/v1/ws", get(realtime::realtime_ws_handler))
+        .route("/console/v1/realtime/methods", get(realtime::realtime_methods_handler))
+        .route("/console/v1/realtime/handshake", post(realtime::realtime_handshake_handler))
+        .route("/console/v1/realtime/command", post(realtime::realtime_command_handler))
+        .route("/console/v1/realtime/ws", get(realtime::realtime_ws_handler))
         .merge(compat_routes)
         .merge(canvas_routes)
         .merge(admin_routes)

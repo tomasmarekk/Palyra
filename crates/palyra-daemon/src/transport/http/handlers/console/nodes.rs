@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use crate::node_runtime::{CapabilityExecutionResult, RegisteredNodeRecord};
 use crate::*;
+use palyra_common::runtime_contracts::REALTIME_DEFAULT_HEARTBEAT_INTERVAL_MS;
 
 fn capability_execution_mode(name: &str) -> &'static str {
     match name {
@@ -99,9 +100,11 @@ pub(crate) async fn console_node_invoke_handler(
             "device_id must be a canonical ULID",
         ))
     })?;
-    if state.node_runtime.node(device_id.as_str()).map_err(runtime_status_response)?.is_none() {
-        return Err(runtime_status_response(tonic::Status::not_found("node was not found")));
-    }
+    let node =
+        state.node_runtime.node(device_id.as_str()).map_err(runtime_status_response)?.ok_or_else(
+            || runtime_status_response(tonic::Status::not_found("node was not found")),
+        )?;
+    ensure_node_fresh_for_work(&node).map_err(runtime_status_response)?;
     let input_json = serde_json::to_vec(&payload.input_json).map_err(|error| {
         runtime_status_response(tonic::Status::invalid_argument(error.to_string()))
     })?;
@@ -131,6 +134,20 @@ pub(crate) async fn console_node_invoke_handler(
             ))
         })?;
     Ok(Json(node_capability_result_json(device_id.as_str(), payload.capability.as_str(), result)))
+}
+
+fn ensure_node_fresh_for_work(node: &RegisteredNodeRecord) -> Result<(), tonic::Status> {
+    let now = unix_ms_now().map_err(|error| {
+        tonic::Status::internal(format!("failed to read system clock: {error}"))
+    })?;
+    let ttl_ms =
+        i64::try_from(REALTIME_DEFAULT_HEARTBEAT_INTERVAL_MS.saturating_mul(4)).unwrap_or(i64::MAX);
+    if now.saturating_sub(node.last_seen_at_unix_ms) > ttl_ms {
+        return Err(tonic::Status::failed_precondition(
+            "stale node cannot receive new capability work",
+        ));
+    }
+    Ok(())
 }
 
 fn collect_nodes(state: &AppState) -> Result<Vec<control_plane::NodeRecord>, tonic::Status> {

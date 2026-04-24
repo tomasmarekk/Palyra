@@ -178,6 +178,14 @@ pub(crate) async fn console_config_reload_plan_handler(
     Json(payload): Json<control_plane::ConfigReloadPlanRequest>,
 ) -> Result<Json<control_plane::ConfigReloadPlanEnvelope>, Response> {
     let session = authorize_console_session(&state, &headers, false)?;
+    Ok(Json(plan_config_reload_for_context(&state, &session.context, payload).await?))
+}
+
+pub(crate) async fn plan_config_reload_for_context(
+    state: &AppState,
+    context: &gateway::RequestContext,
+    payload: control_plane::ConfigReloadPlanRequest,
+) -> Result<control_plane::ConfigReloadPlanEnvelope, Response> {
     let current = state.loaded_config.lock().unwrap_or_else(|error| error.into_inner()).clone();
     let source_path = validate_requested_reload_path(payload.path.as_deref(), &current)
         .map_err(|response| *response)?;
@@ -186,13 +194,13 @@ pub(crate) async fn console_config_reload_plan_handler(
             "failed to load candidate config for reload planning: {error}"
         )))
     })?;
-    let plan = build_reload_plan(&current, &candidate, source_path, estimate_active_runs(&state));
+    let plan = build_reload_plan(&current, &candidate, source_path, estimate_active_runs(state));
     state.reload_state.lock().unwrap_or_else(|error| error.into_inner()).latest_plan =
         Some(plan.clone());
     state
         .runtime
         .record_console_event(
-            &session.context,
+            context,
             "reload_plan_created",
             json!({
                 "plan_id": plan.plan_id,
@@ -203,7 +211,7 @@ pub(crate) async fn console_config_reload_plan_handler(
         )
         .await
         .map_err(runtime_status_response)?;
-    Ok(Json(plan))
+    Ok(plan)
 }
 
 pub(crate) async fn console_config_reload_apply_handler(
@@ -212,6 +220,14 @@ pub(crate) async fn console_config_reload_apply_handler(
     Json(payload): Json<control_plane::ConfigReloadApplyRequest>,
 ) -> Result<Json<control_plane::ConfigReloadApplyEnvelope>, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
+    Ok(Json(apply_config_reload_for_context(&state, &session.context, payload).await?))
+}
+
+pub(crate) async fn apply_config_reload_for_context(
+    state: &AppState,
+    context: &gateway::RequestContext,
+    payload: control_plane::ConfigReloadApplyRequest,
+) -> Result<control_plane::ConfigReloadApplyEnvelope, Response> {
     let current = state.loaded_config.lock().unwrap_or_else(|error| error.into_inner()).clone();
     let source_path = validate_requested_reload_path(payload.path.as_deref(), &current)
         .map_err(|response| *response)?;
@@ -220,7 +236,7 @@ pub(crate) async fn console_config_reload_apply_handler(
             "failed to load candidate config for reload apply: {error}"
         )))
     })?;
-    let plan = build_reload_plan(&current, &candidate, source_path, estimate_active_runs(&state));
+    let plan = build_reload_plan(&current, &candidate, source_path, estimate_active_runs(state));
 
     let hot_safe_steps =
         plan.steps.iter().filter(|step| step.category == "hot_safe").cloned().collect::<Vec<_>>();
@@ -325,7 +341,7 @@ pub(crate) async fn console_config_reload_apply_handler(
     state
         .runtime
         .record_console_event(
-            &session.context,
+            context,
             event_name,
             json!({
                 "plan_id": plan.plan_id,
@@ -337,7 +353,7 @@ pub(crate) async fn console_config_reload_apply_handler(
         )
         .await
         .map_err(runtime_status_response)?;
-    Ok(Json(envelope))
+    Ok(envelope)
 }
 
 fn validate_requested_reload_path(

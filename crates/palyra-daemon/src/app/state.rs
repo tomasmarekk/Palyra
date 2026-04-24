@@ -25,6 +25,7 @@ use crate::{
     objectives,
     observability::ObservabilityState,
     openai_auth::OpenAiOAuthAttemptStateRecord,
+    realtime::{RealtimeEventRouter, RealtimeRateLimiter},
     routines, webhooks,
 };
 
@@ -60,6 +61,8 @@ pub(crate) struct AppState {
     pub(crate) observability: Arc<ObservabilityState>,
     pub(crate) configured_secrets: Arc<Mutex<ConfiguredSecretsState>>,
     pub(crate) reload_state: Arc<Mutex<ReloadOperationsState>>,
+    pub(crate) realtime_events: Arc<Mutex<RealtimeEventRouter>>,
+    pub(crate) realtime_rate_limit: Arc<Mutex<RealtimeRateLimiter>>,
     pub(crate) deployment: DeploymentRuntimeSnapshot,
     pub(crate) remote_admin_access: Arc<Mutex<Option<RemoteAdminAccessAttempt>>>,
     pub(crate) access_registry: Arc<Mutex<AccessRegistry>>,

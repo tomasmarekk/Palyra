@@ -18,7 +18,9 @@ use crate::{
     config::{BrowserServiceConfig, LoadedConfig},
     gateway::{self, GatewayAuthConfig, GatewayRuntimeState},
     node_runtime::NodeRuntimeState,
-    objectives, routines, webhooks,
+    objectives,
+    realtime::{RealtimeEventRouter, RealtimeRateLimiter},
+    routines, webhooks,
 };
 use palyra_identity::IdentityManager;
 use palyra_vault::Vault;
@@ -83,6 +85,8 @@ pub(crate) fn build_app_state(
         observability,
         configured_secrets: Arc::new(Mutex::new(configured_secrets)),
         reload_state: Arc::new(Mutex::new(ReloadOperationsState::default())),
+        realtime_events: Arc::new(Mutex::new(RealtimeEventRouter::default())),
+        realtime_rate_limit: Arc::new(Mutex::new(RealtimeRateLimiter::default())),
         deployment: build_deployment_runtime_snapshot(loaded, dangerous_remote_bind_ack_env),
         remote_admin_access: Arc::new(Mutex::new(None::<RemoteAdminAccessAttempt>)),
         access_registry: context.access_registry,

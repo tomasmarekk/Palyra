@@ -488,6 +488,42 @@ impl NodeRuntimeState {
         Ok(persisted.nodes.get(device_id).cloned())
     }
 
+    pub(crate) fn set_node_capability_availability(
+        &self,
+        device_id: &str,
+        capability: &str,
+        available: bool,
+    ) -> Result<RegisteredNodeRecord, Status> {
+        let capability = capability.trim();
+        if capability.is_empty() {
+            return Err(Status::invalid_argument("node capability must not be empty"));
+        }
+        let now = current_unix_ms()?;
+        let mut persisted = lock_mutex(&self.persisted, "node runtime state")?;
+        let Some(record) = persisted.nodes.get_mut(device_id) else {
+            return Err(Status::not_found(format!("node not found: {device_id}")));
+        };
+        if let Some(existing) =
+            record.capabilities.iter_mut().find(|candidate| candidate.name == capability)
+        {
+            existing.available = available;
+        } else {
+            record
+                .capabilities
+                .push(DeviceCapabilityView { name: capability.to_owned(), available });
+            record.capabilities.sort_by(|left, right| left.name.cmp(&right.name));
+        }
+        record.last_event_name = Some(if available {
+            "capability_granted".to_owned()
+        } else {
+            "capability_revoked".to_owned()
+        });
+        record.last_event_at_unix_ms = Some(now);
+        let updated = record.clone();
+        self.persist_locked(&persisted)?;
+        Ok(updated)
+    }
+
     pub(crate) fn remove_node(&self, device_id: &str) -> Result<bool, Status> {
         let mut persisted = lock_mutex(&self.persisted, "node runtime state")?;
         let removed = persisted.nodes.remove(device_id).is_some();
@@ -946,5 +982,36 @@ mod tests {
             .expect("mediation request should remain visible");
         assert!(matches!(mediation.state, super::CapabilityRequestState::AwaitingLocalMediation));
         assert!(mediation.dispatched_at_unix_ms.is_some());
+    }
+
+    #[test]
+    fn capability_grant_and_revoke_update_node_presence_immediately() {
+        let tempdir = tempdir().expect("temp dir should be created");
+        let runtime =
+            NodeRuntimeState::load(tempdir.path()).expect("node runtime should initialize cleanly");
+        runtime
+            .register_node("01ARZ3NDEKTSV4RRFFQ69G5FAA", "windows-x86_64", Vec::new())
+            .expect("node should register");
+
+        let granted = runtime
+            .set_node_capability_availability(
+                "01ARZ3NDEKTSV4RRFFQ69G5FAA",
+                "desktop.open_url",
+                true,
+            )
+            .expect("grant should update node capability");
+        assert_eq!(granted.capabilities.len(), 1);
+        assert!(granted.capabilities[0].available);
+        assert_eq!(granted.last_event_name.as_deref(), Some("capability_granted"));
+
+        let revoked = runtime
+            .set_node_capability_availability(
+                "01ARZ3NDEKTSV4RRFFQ69G5FAA",
+                "desktop.open_url",
+                false,
+            )
+            .expect("revoke should update node capability");
+        assert!(!revoked.capabilities[0].available);
+        assert_eq!(revoked.last_event_name.as_deref(), Some("capability_revoked"));
     }
 }
