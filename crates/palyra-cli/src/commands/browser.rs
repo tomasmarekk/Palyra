@@ -163,6 +163,9 @@ pub(crate) fn run_browser(command: BrowserCommand) -> Result<()> {
 }
 
 async fn run_browser_async(command: BrowserCommand) -> Result<()> {
+    if let Some(action) = browser_command_policy_action(&command) {
+        ensure_browser_cli_policy_enabled(action)?;
+    }
     match command {
         BrowserCommand::Status { endpoint, health_url, token } => {
             run_browser_status(endpoint, health_url, token).await
@@ -392,6 +395,80 @@ async fn run_browser_async(command: BrowserCommand) -> Result<()> {
             run_browser_highlight(session_id, selector).await
         }
     }
+}
+
+fn browser_command_policy_action(command: &BrowserCommand) -> Option<&'static str> {
+    match command {
+        BrowserCommand::Status { .. } | BrowserCommand::Start { .. } | BrowserCommand::Stop => None,
+        BrowserCommand::Open { .. } => Some("open"),
+        BrowserCommand::Session { command } => Some(browser_session_policy_action(command)),
+        BrowserCommand::Profiles { command } => Some(browser_profiles_policy_action(command)),
+        BrowserCommand::Tabs { command, .. } => Some(browser_tabs_policy_action(command)),
+        BrowserCommand::Navigate { .. } => Some("navigate"),
+        BrowserCommand::Click { .. } => Some("click"),
+        BrowserCommand::Type { .. } => Some("type"),
+        BrowserCommand::Fill { .. } => Some("fill"),
+        BrowserCommand::Scroll { .. } => Some("scroll"),
+        BrowserCommand::Wait { .. } => Some("wait"),
+        BrowserCommand::Snapshot { .. } => Some("snapshot"),
+        BrowserCommand::Screenshot { .. } => Some("screenshot"),
+        BrowserCommand::Title { .. } => Some("title"),
+        BrowserCommand::Network { .. } => Some("network"),
+        BrowserCommand::Storage { .. } => Some("storage"),
+        BrowserCommand::Errors { .. } => Some("errors"),
+        BrowserCommand::Trace { .. } => Some("trace"),
+        BrowserCommand::Downloads { .. } => Some("downloads"),
+        BrowserCommand::Permissions { command, .. } => {
+            Some(browser_permissions_policy_action(command))
+        }
+        BrowserCommand::ResetState { .. } => Some("reset-state"),
+        BrowserCommand::Console { .. } => Some("console"),
+        BrowserCommand::Pdf { .. } => Some("pdf"),
+        BrowserCommand::Press { .. } => Some("press"),
+        BrowserCommand::Select { .. } => Some("select"),
+        BrowserCommand::Highlight { .. } => Some("highlight"),
+    }
+}
+
+fn browser_session_policy_action(command: &BrowserSessionCommand) -> &'static str {
+    match command {
+        BrowserSessionCommand::Create { .. } => "session create",
+        BrowserSessionCommand::List { .. } => "session list",
+        BrowserSessionCommand::Show { .. } => "session show",
+        BrowserSessionCommand::Inspect { .. } => "session inspect",
+        BrowserSessionCommand::Close { .. } => "session close",
+    }
+}
+
+fn browser_profiles_policy_action(command: &BrowserProfilesCommand) -> &'static str {
+    match command {
+        BrowserProfilesCommand::List { .. } => "profiles list",
+        BrowserProfilesCommand::Create { .. } => "profiles create",
+        BrowserProfilesCommand::Rename { .. } => "profiles rename",
+        BrowserProfilesCommand::Delete { .. } => "profiles delete",
+        BrowserProfilesCommand::Activate { .. } => "profiles activate",
+    }
+}
+
+fn browser_tabs_policy_action(command: &BrowserTabsCommand) -> &'static str {
+    match command {
+        BrowserTabsCommand::List => "tabs list",
+        BrowserTabsCommand::Open { .. } => "tabs open",
+        BrowserTabsCommand::Switch { .. } => "tabs switch",
+        BrowserTabsCommand::Close { .. } => "tabs close",
+    }
+}
+
+fn browser_permissions_policy_action(command: &BrowserPermissionsCommand) -> &'static str {
+    match command {
+        BrowserPermissionsCommand::Get => "permissions get",
+        BrowserPermissionsCommand::Set { .. } => "permissions set",
+    }
+}
+
+fn ensure_browser_cli_policy_enabled(action: &str) -> Result<()> {
+    let resolved = resolve_browser_config(None, None, None)?;
+    ensure_browser_service_enabled(&resolved.policy, action)
 }
 
 async fn run_browser_status(
@@ -3065,7 +3142,10 @@ fn proto_console_severity_text(value: i32) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_browser_service_enabled, BrowserPolicySnapshot};
+    use super::{
+        browser_command_policy_action, ensure_browser_service_enabled, BrowserPolicySnapshot,
+    };
+    use crate::args::BrowserCommand;
 
     fn disabled_policy() -> BrowserPolicySnapshot {
         BrowserPolicySnapshot {
@@ -3089,6 +3169,30 @@ mod tests {
             error.to_string().contains("tool_call.browser_service.enabled=false"),
             "disabled-service error should explain the policy gate: {error}"
         );
+    }
+
+    #[test]
+    fn browser_actions_fail_closed_when_service_is_disabled() {
+        let error = ensure_browser_service_enabled(&disabled_policy(), "navigate")
+            .expect_err("disabled browser service should block navigation");
+        assert!(
+            error.to_string().contains("palyra browser navigate"),
+            "disabled-service error should name the blocked browser action: {error}"
+        );
+    }
+
+    #[test]
+    fn browser_command_policy_action_covers_navigate() {
+        let command = BrowserCommand::Navigate {
+            session_id: "session".to_owned(),
+            url: "https://example.com".to_owned(),
+            timeout_ms: None,
+            allow_redirects: false,
+            max_redirects: None,
+            allow_private_targets: false,
+        };
+
+        assert_eq!(browser_command_policy_action(&command), Some("navigate"));
     }
 
     #[test]
