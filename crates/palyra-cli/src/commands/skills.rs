@@ -979,9 +979,28 @@ fn run_skills_audit(command: SkillsAuditCommand) -> Result<()> {
     }
 
     if targets.is_empty() {
-        anyhow::bail!(
-            "no skill artifacts were selected for audit; pass --artifact or install at least one skill first"
-        );
+        save_trust_store_with_integrity(trust_store_path.as_path(), &store)?;
+        let output_payload = json!({
+            "trust_store": trust_store_path,
+            "skills_root": managed_skills_root,
+            "audits": [],
+            "summary": {
+                "audited": 0,
+                "quarantine_required": 0,
+                "failed_checks": 0,
+                "warnings": 0,
+            },
+            "message": "no installed skill artifacts were selected for audit",
+        });
+        if command.json {
+            println!("{}", serde_json::to_string_pretty(&output_payload)?);
+        } else {
+            println!(
+                "skill.audit audited=0 should_quarantine=0 failed_checks=0 warnings=0 message=\"no installed skill artifacts were selected for audit\""
+            );
+        }
+        std::io::stdout().flush().context("stdout flush failed")?;
+        return Ok(());
     }
 
     let mut reports = Vec::new();
@@ -1034,6 +1053,33 @@ fn run_skills_audit(command: SkillsAuditCommand) -> Result<()> {
                 })
             })
             .collect::<Vec<_>>(),
+        "summary": {
+            "audited": reports.len(),
+            "quarantine_required": reports
+                .iter()
+                .filter(|(_, report)| report.should_quarantine)
+                .count(),
+            "failed_checks": reports
+                .iter()
+                .map(|(_, report)| {
+                    report
+                        .checks
+                        .iter()
+                        .filter(|check| matches!(check.status, SkillAuditCheckStatus::Fail))
+                        .count()
+                })
+                .sum::<usize>(),
+            "warnings": reports
+                .iter()
+                .map(|(_, report)| {
+                    report
+                        .checks
+                        .iter()
+                        .filter(|check| matches!(check.status, SkillAuditCheckStatus::Warn))
+                        .count()
+                })
+                .sum::<usize>(),
+        },
     });
     let quarantine_required = reports.iter().any(|(_, report)| report.should_quarantine);
 

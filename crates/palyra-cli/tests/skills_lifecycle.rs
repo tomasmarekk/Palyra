@@ -175,6 +175,50 @@ fn seed_skill_status(
 }
 
 #[test]
+fn skills_audit_empty_inventory_succeeds() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let skills_dir = workdir.path().join("skills-managed");
+    let trust_store = workdir.path().join("trust-store.json");
+
+    let audit_args = vec![
+        "skills".to_owned(),
+        "audit".to_owned(),
+        "--skills-dir".to_owned(),
+        skills_dir.to_string_lossy().into_owned(),
+        "--trust-store".to_owned(),
+        trust_store.to_string_lossy().into_owned(),
+        "--json".to_owned(),
+    ];
+    let audit_output = run_cli(&workdir, audit_args.as_slice())?;
+    assert!(
+        audit_output.status.success(),
+        "empty skills audit should succeed: {}",
+        String::from_utf8_lossy(&audit_output.stderr)
+    );
+
+    let payload: Value = serde_json::from_slice(audit_output.stdout.as_slice())
+        .context("empty audit output should be JSON")?;
+    let audits = payload
+        .get("audits")
+        .and_then(Value::as_array)
+        .context("empty audit output must include audits array")?;
+    assert!(audits.is_empty(), "empty skills directory should audit zero artifacts");
+    assert_eq!(
+        payload
+            .get("summary")
+            .and_then(Value::as_object)
+            .and_then(|summary| summary.get("audited"))
+            .and_then(Value::as_u64),
+        Some(0)
+    );
+    assert_eq!(
+        payload.get("message").and_then(Value::as_str),
+        Some("no installed skill artifacts were selected for audit")
+    );
+    Ok(())
+}
+
+#[test]
 fn skills_install_verify_remove_lifecycle_roundtrip() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let skills_dir = workdir.path().join("skills-managed");
