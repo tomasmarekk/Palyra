@@ -108,14 +108,17 @@ pub enum MemoryCommand {
     },
     #[command(name = "search-all")]
     SearchAll {
-        query: String,
+        #[arg(value_name = "QUERY")]
+        query: Option<String>,
+        #[arg(long = "query", value_name = "QUERY")]
+        query_option: Option<String>,
         #[arg(long)]
         session: Option<String>,
         #[arg(long)]
         channel: Option<String>,
         #[arg(long)]
         agent_id: Option<String>,
-        #[arg(long)]
+        #[arg(long, visible_alias = "limit")]
         top_k: Option<u32>,
         #[arg(long)]
         min_score: Option<String>,

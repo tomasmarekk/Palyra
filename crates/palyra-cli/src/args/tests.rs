@@ -1870,6 +1870,39 @@ fn parse_memory_search() {
 }
 
 #[test]
+fn parse_memory_search_all_accepts_query_and_limit_aliases() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "memory",
+        "search-all",
+        "--query",
+        "cross session recall",
+        "--limit",
+        "7",
+        "--channel",
+        "cli",
+        "--json",
+    ]);
+
+    assert_eq!(
+        parsed.command,
+        Command::Memory {
+            command: MemoryCommand::SearchAll {
+                query: None,
+                query_option: Some("cross session recall".to_owned()),
+                session: None,
+                channel: Some("cli".to_owned()),
+                agent_id: None,
+                top_k: Some(7),
+                min_score: None,
+                workspace_prefix: None,
+                json: true,
+            }
+        }
+    );
+}
+
+#[test]
 fn parse_memory_session_search() {
     let parsed = Cli::parse_from([
         "palyra",

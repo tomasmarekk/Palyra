@@ -563,6 +563,7 @@ async fn run_memory_admin_async(command: MemoryCommand) -> Result<()> {
         }
         MemoryCommand::SearchAll {
             query,
+            query_option,
             session,
             channel,
             agent_id,
@@ -571,6 +572,7 @@ async fn run_memory_admin_async(command: MemoryCommand) -> Result<()> {
             workspace_prefix,
             json,
         } => {
+            let query = resolve_optional_query_arg(query, query_option, "memory search-all")?;
             let min_score =
                 parse_float_arg(min_score, "memory search-all --min-score", 0.0, 1.0, Some(0.0))?;
             let path = build_console_query_path(
@@ -843,6 +845,20 @@ fn emit_admin_payload(
     std::io::stdout().flush().context("stdout flush failed")
 }
 
+fn resolve_optional_query_arg(
+    positional: Option<String>,
+    option: Option<String>,
+    command_label: &str,
+) -> Result<String> {
+    match (positional, option) {
+        (Some(positional), None) | (None, Some(positional)) => Ok(positional),
+        (None, None) => Err(anyhow!("{command_label} query cannot be empty")),
+        (Some(_), Some(_)) => {
+            Err(anyhow!("{command_label} accepts either a positional query or --query, not both"))
+        }
+    }
+}
+
 fn build_console_query_path(base: &str, params: Vec<(&str, Option<String>)>) -> String {
     let parts = params
         .into_iter()
@@ -1031,10 +1047,40 @@ fn memory_session_scope_label(has_session_scope: bool) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::memory_session_scope_label;
+    use super::{memory_session_scope_label, resolve_optional_query_arg};
+
     #[test]
     fn memory_session_scope_label_redacts_identifier_value() {
         assert_eq!(memory_session_scope_label(false), "none");
         assert_eq!(memory_session_scope_label(true), "present");
+    }
+
+    #[test]
+    fn resolve_optional_query_arg_accepts_positional_or_flagged_query() {
+        assert_eq!(
+            resolve_optional_query_arg(Some("positional".to_owned()), None, "memory search-all")
+                .expect("positional query should resolve"),
+            "positional"
+        );
+        assert_eq!(
+            resolve_optional_query_arg(None, Some("flagged".to_owned()), "memory search-all")
+                .expect("flagged query should resolve"),
+            "flagged"
+        );
+    }
+
+    #[test]
+    fn resolve_optional_query_arg_rejects_missing_or_ambiguous_query() {
+        let missing = resolve_optional_query_arg(None, None, "memory search-all")
+            .expect_err("missing query should fail");
+        assert!(missing.to_string().contains("query cannot be empty"));
+
+        let ambiguous = resolve_optional_query_arg(
+            Some("positional".to_owned()),
+            Some("flagged".to_owned()),
+            "memory search-all",
+        )
+        .expect_err("ambiguous query should fail");
+        assert!(ambiguous.to_string().contains("either a positional query or --query"));
     }
 }
