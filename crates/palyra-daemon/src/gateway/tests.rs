@@ -372,6 +372,35 @@ fn parse_tool_output_json(outcome: &super::ToolExecutionOutcome) -> Value {
     serde_json::from_slice(&outcome.output_json).expect("tool output should parse as JSON")
 }
 
+async fn start_tool_program_test_run(
+    state: &std::sync::Arc<GatewayRuntimeState>,
+    session_id: &str,
+    run_id: &str,
+) {
+    state
+        .journal_store
+        .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
+            session_id: session_id.to_owned(),
+            session_key: format!("tool-program:{session_id}"),
+            session_label: Some("Tool program runtime test".to_owned()),
+            principal: "user:ops".to_owned(),
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            channel: Some("cli".to_owned()),
+        })
+        .expect("tool program test session should upsert");
+    state
+        .start_orchestrator_run(OrchestratorRunStartRequest {
+            run_id: run_id.to_owned(),
+            session_id: session_id.to_owned(),
+            origin_kind: "tool_program_test".to_owned(),
+            origin_run_id: None,
+            triggered_by_principal: Some("user:ops".to_owned()),
+            parameter_delta_json: None,
+        })
+        .await
+        .expect("tool program test run should start");
+}
+
 async fn spawn_test_gateway_grpc_server(
     state: std::sync::Arc<GatewayRuntimeState>,
 ) -> (String, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
@@ -2513,6 +2542,100 @@ async fn networked_worker_runtime_rejects_unsupported_context_tools() {
     assert!(!outcome.success);
     assert!(outcome.error.contains("backend.policy.tool_unsupported"));
     assert_eq!(outcome.attestation.executor, "networked_worker");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tool_program_runtime_executes_echo_and_emits_child_attestation() {
+    let state = build_test_runtime_state(false);
+    start_tool_program_test_run(&state, "session-tool-program-runtime", "run-tool-program-runtime")
+        .await;
+    let outcome = super::execute_tool_with_runtime_dispatch(
+        &state,
+        super::ToolRuntimeExecutionContext {
+            principal: "user:ops",
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            channel: Some("cli"),
+            session_id: "session-tool-program-runtime",
+            run_id: "run-tool-program-runtime",
+            execution_backend: ExecutionBackendPreference::LocalSandbox,
+            backend_reason_code: "backend.default.local_sandbox",
+        },
+        "proposal-tool-program-runtime",
+        super::TOOL_PROGRAM_RUN_TOOL_NAME,
+        br#"{
+            "schema_version": 1,
+            "program_id": "program-runtime",
+            "steps": [
+                {"step_id": "echo", "tool": "palyra.echo", "input": {"text": "nested ok"}}
+            ]
+        }"#,
+    )
+    .await;
+
+    assert!(outcome.success, "tool program should succeed: {}", outcome.error);
+    assert_eq!(outcome.attestation.executor, "tool_program_runtime");
+    assert_eq!(outcome.attestation.sandbox_enforcement, "nested_tool_policy");
+
+    let output = parse_tool_output_json(&outcome);
+    assert_eq!(output.get("status").and_then(Value::as_str), Some("completed"));
+    assert_eq!(output.pointer("/steps/0/output/echo").and_then(Value::as_str), Some("nested ok"));
+    assert_eq!(output.pointer("/budget/child_runs_used").and_then(Value::as_u64), Some(1));
+    assert_eq!(
+        output.pointer("/child_attestations/0/tool_name").and_then(Value::as_str),
+        Some("palyra.echo"),
+        "program output should preserve child tool attestation metadata"
+    );
+    assert!(
+        output
+            .pointer("/child_attestations/0/execution_sha256")
+            .and_then(Value::as_str)
+            .is_some_and(|digest| !digest.is_empty()),
+        "child attestation must include execution digest"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tool_program_runtime_denies_sensitive_child_without_nested_approval() {
+    let state = build_test_runtime_state(false);
+    start_tool_program_test_run(&state, "session-tool-program-denied", "run-tool-program-denied")
+        .await;
+    let outcome = super::execute_tool_with_runtime_dispatch(
+        &state,
+        super::ToolRuntimeExecutionContext {
+            principal: "user:ops",
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            channel: Some("cli"),
+            session_id: "session-tool-program-denied",
+            run_id: "run-tool-program-denied",
+            execution_backend: ExecutionBackendPreference::LocalSandbox,
+            backend_reason_code: "backend.default.local_sandbox",
+        },
+        "proposal-tool-program-denied",
+        super::TOOL_PROGRAM_RUN_TOOL_NAME,
+        br#"{
+            "schema_version": 1,
+            "program_id": "program-denied",
+            "steps": [
+                {"step_id": "process", "tool": "palyra.process.run", "input": {"command": "echo", "args": ["blocked"]}}
+            ]
+        }"#,
+    )
+    .await;
+
+    assert!(!outcome.success, "sensitive child should fail closed");
+    let output = parse_tool_output_json(&outcome);
+    assert_eq!(output.get("status").and_then(Value::as_str), Some("failed"));
+    assert_eq!(output.pointer("/steps/0/status").and_then(Value::as_str), Some("denied"));
+    assert_eq!(output.pointer("/steps/0/approval_required").and_then(Value::as_bool), Some(true));
+    assert_eq!(output.pointer("/budget/child_runs_used").and_then(Value::as_u64), Some(0));
+    assert_eq!(output.pointer("/budget/nested_approval_requests").and_then(Value::as_u64), Some(1));
+    assert!(
+        output
+            .pointer("/steps/0/error")
+            .and_then(Value::as_str)
+            .is_some_and(|error| error.contains("cannot self-approve")),
+        "denial should explain nested approval fail-closed behavior"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

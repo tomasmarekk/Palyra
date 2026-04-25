@@ -169,6 +169,7 @@ pub(crate) const ARTIFACT_READ_TOOL_NAME: &str = "palyra.artifact.read";
 pub(crate) const WORKSPACE_PATCH_TOOL_NAME: &str = "palyra.fs.apply_patch";
 pub(crate) const PROCESS_RUNNER_TOOL_NAME: &str = "palyra.process.run";
 pub(crate) const HTTP_FETCH_TOOL_NAME: &str = "palyra.http.fetch";
+pub(crate) const TOOL_PROGRAM_RUN_TOOL_NAME: &str = "palyra.tool_program.run";
 pub(crate) const BROWSER_SESSION_CREATE_TOOL_NAME: &str = "palyra.browser.session.create";
 pub(crate) const BROWSER_SESSION_CLOSE_TOOL_NAME: &str = "palyra.browser.session.close";
 pub(crate) const BROWSER_NAVIGATE_TOOL_NAME: &str = "palyra.browser.navigate";
@@ -265,7 +266,7 @@ pub(crate) async fn ingest_memory_best_effort(
 }
 
 pub(crate) fn tool_cancellation_requires_execution_drain(tool_name: &str) -> bool {
-    matches!(tool_name, PROCESS_RUNNER_TOOL_NAME | "palyra.plugin.run")
+    matches!(tool_name, PROCESS_RUNNER_TOOL_NAME | TOOL_PROGRAM_RUN_TOOL_NAME | "palyra.plugin.run")
 }
 
 #[cfg(test)]
@@ -516,6 +517,14 @@ pub(crate) async fn execute_tool_with_runtime_dispatch(
             context,
             proposal_id,
             tool_name,
+            input_json,
+        )
+        .await
+    } else if tool_name == TOOL_PROGRAM_RUN_TOOL_NAME {
+        crate::application::tool_runtime::tool_program::execute_tool_program_run_tool(
+            runtime_state,
+            context,
+            proposal_id,
             input_json,
         )
         .await

@@ -150,6 +150,7 @@ const MAX_ROUTINES_QUERY_TOOL_INPUT_BYTES: usize = 64 * 1024;
 const MAX_ROUTINES_CONTROL_TOOL_INPUT_BYTES: usize = 128 * 1024;
 const MAX_HTTP_FETCH_TOOL_INPUT_BYTES: usize = 64 * 1024;
 const MAX_PROCESS_RUNNER_TOOL_INPUT_BYTES: usize = 128 * 1024;
+const MAX_TOOL_PROGRAM_RUN_TOOL_INPUT_BYTES: usize = 256 * 1024;
 const MAX_WORKSPACE_PATCH_TOOL_INPUT_BYTES: usize = 256 * 1024;
 const MAX_BROWSER_TOOL_INPUT_BYTES: usize = 128 * 1024;
 const MAX_ARTIFACT_READ_TOOL_INPUT_BYTES: usize = 16 * 1024;
@@ -321,6 +322,9 @@ pub fn tool_metadata(tool_name: &str) -> Option<ToolMetadata> {
             capabilities: PROCESS_RUNNER_CAPABILITIES,
             default_sensitive: true,
         }),
+        "palyra.tool_program.run" => {
+            Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: true })
+        }
         "palyra.fs.apply_patch" => Some(ToolMetadata {
             capabilities: WORKSPACE_PATCH_CAPABILITIES,
             default_sensitive: true,
@@ -677,6 +681,15 @@ async fn run_allowlisted_tool(
             sandbox_enforcement: "ssrf_guard".to_owned(),
         },
         "palyra.process.run" => execute_process_runner_tool(config, input_json).await,
+        "palyra.tool_program.run" => ToolExecutionRawResult {
+            success: false,
+            output_json: b"{}".to_vec(),
+            error: "palyra.tool_program.run requires gateway tool program runtime context"
+                .to_owned(),
+            timed_out: false,
+            executor: "tool_program_runtime".to_owned(),
+            sandbox_enforcement: "nested_tool_policy".to_owned(),
+        },
         "palyra.fs.apply_patch" => ToolExecutionRawResult {
             success: false,
             output_json: b"{}".to_vec(),
@@ -741,6 +754,7 @@ fn is_runtime_supported_tool(tool_name: &str) -> bool {
             | "palyra.artifact.read"
             | "palyra.http.fetch"
             | "palyra.process.run"
+            | "palyra.tool_program.run"
             | "palyra.fs.apply_patch"
             | "palyra.browser.session.create"
             | "palyra.browser.session.close"
@@ -772,6 +786,8 @@ fn is_runtime_supported_tool(tool_name: &str) -> bool {
 fn tool_executor_name(config: &ToolCallConfig, tool_name: &str) -> String {
     if tool_name == "palyra.process.run" {
         process_runner_executor_name(&config.process_runner)
+    } else if tool_name == "palyra.tool_program.run" {
+        "tool_program_runtime".to_owned()
     } else if tool_name == "palyra.fs.apply_patch" {
         "workspace_patch".to_owned()
     } else if tool_name == "palyra.http.fetch" {
@@ -810,6 +826,7 @@ fn tool_input_limit_bytes(tool_name: &str) -> usize {
         "palyra.artifact.read" => MAX_ARTIFACT_READ_TOOL_INPUT_BYTES,
         "palyra.http.fetch" => MAX_HTTP_FETCH_TOOL_INPUT_BYTES,
         "palyra.process.run" => MAX_PROCESS_RUNNER_TOOL_INPUT_BYTES,
+        "palyra.tool_program.run" => MAX_TOOL_PROGRAM_RUN_TOOL_INPUT_BYTES,
         "palyra.fs.apply_patch" => MAX_WORKSPACE_PATCH_TOOL_INPUT_BYTES,
         "palyra.browser.session.create"
         | "palyra.browser.session.close"
@@ -842,6 +859,8 @@ fn tool_input_limit_bytes(tool_name: &str) -> usize {
 fn sandbox_enforcement_for_tool(config: &ToolCallConfig, tool_name: &str) -> String {
     if tool_name == "palyra.process.run" {
         config.process_runner.egress_enforcement_mode.as_str().to_owned()
+    } else if tool_name == "palyra.tool_program.run" {
+        "nested_tool_policy".to_owned()
     } else if tool_name == "palyra.fs.apply_patch" {
         "workspace_roots".to_owned()
     } else if tool_name == "palyra.http.fetch" {
@@ -1368,6 +1387,7 @@ mod tests {
         assert!(tool_requires_approval("palyra.http.fetch"));
         assert!(tool_requires_approval("palyra.process.run"));
         assert!(tool_requires_approval("palyra.fs.apply_patch"));
+        assert!(tool_requires_approval("palyra.tool_program.run"));
         assert!(tool_requires_approval("palyra.browser.session.create"));
         assert!(tool_requires_approval("palyra.browser.navigate"));
         assert!(tool_requires_approval("palyra.browser.click"));
@@ -1422,6 +1442,33 @@ mod tests {
             serde_json::json!({ "echo": "hello" })
         );
         assert!(!outcome.attestation.execution_sha256.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_tool_call_tool_program_requires_gateway_runtime_context() {
+        let config = ToolCallConfig {
+            allowed_tools: vec!["palyra.tool_program.run".to_owned()],
+            max_calls_per_run: 1,
+            execution_timeout_ms: 250,
+            process_runner: default_process_runner_policy(),
+            wasm_runtime: default_wasm_runtime_policy(),
+        };
+        let outcome = execute_tool_call(
+            &config,
+            "01ARZ3NDEKTSV4RRFFQ69G5FAC",
+            "palyra.tool_program.run",
+            br#"{"schema_version":1,"program_id":"p","steps":[]}"#,
+        )
+        .await;
+
+        assert!(!outcome.success, "generic tool executor should not run tool programs");
+        assert!(
+            outcome.error.contains("requires gateway tool program runtime context"),
+            "delegated executor error should be explicit: {}",
+            outcome.error
+        );
+        assert_eq!(outcome.attestation.executor, "tool_program_runtime");
+        assert_eq!(outcome.attestation.sandbox_enforcement, "nested_tool_policy");
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -614,10 +614,10 @@ pub(crate) fn resolve_execution_backend_for_request(
     if matches!(request.preference, ExecutionBackendPreference::Automatic) {
         let selected = inventory
             .iter()
-            .filter(|entry| execution_backend_matches_request(*entry, request))
+            .filter(|entry| execution_backend_matches_request(entry, request))
             .find(|entry| entry.selected_by_default)
             .or_else(|| {
-                inventory.iter().find(|entry| execution_backend_matches_request(*entry, request))
+                inventory.iter().find(|entry| execution_backend_matches_request(entry, request))
             });
         if let Some(record) = selected {
             let resolved =
