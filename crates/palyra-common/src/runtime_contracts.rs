@@ -1086,7 +1086,12 @@ runtime_contract_enum! {
     /// Shared worker lifecycle states surfaced by preview diagnostics and audit events.
     pub enum WorkerLifecycleState {
         Registered => "registered",
+        Available => "available" | "ready",
         Assigned => "assigned" | "leased",
+        Busy => "busy" | "running",
+        Degraded => "degraded",
+        Draining => "draining",
+        Offline => "offline",
         Completed => "completed" | "succeeded",
         Failed => "failed",
         Orphaned => "orphaned"

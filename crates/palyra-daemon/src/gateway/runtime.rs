@@ -6240,6 +6240,14 @@ impl GatewayRuntimeState {
     pub fn worker_fleet_policy(&self) -> WorkerFleetPolicy {
         WorkerFleetPolicy {
             max_ttl_ms: self.config.networked_workers.lease_ttl_ms,
+            heartbeat_timeout_ms: 30_000,
+            trusted_capabilities: vec![
+                "tool:palyra.echo".to_owned(),
+                "tool:palyra.sleep".to_owned(),
+            ],
+            required_capability_authority_sha256: None,
+            required_sdk_protocol_version: Some(1),
+            required_wit_abi_version: Some("palyra-worker-abi/v1".to_owned()),
             attestation: palyra_workerd::WorkerAttestationExpectation {
                 require_egress_proxy: self.config.networked_workers.require_attestation,
                 image_digest_sha256: self

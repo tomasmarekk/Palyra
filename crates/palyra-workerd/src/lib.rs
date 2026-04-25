@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 pub use palyra_common::runtime_contracts::WorkerLifecycleState;
 use serde::{Deserialize, Serialize};
@@ -8,6 +8,16 @@ use ulid::Ulid;
 const MAX_WORKER_ID_BYTES: usize = 128;
 const MAX_GRANT_ID_BYTES: usize = 128;
 const MAX_RECENT_LIFECYCLE_EVENTS: usize = 64;
+const DEFAULT_WORKER_SDK_PROTOCOL_VERSION: u32 = 1;
+const DEFAULT_WORKER_WIT_ABI_VERSION: &str = "palyra-worker-abi/v1";
+
+fn default_worker_sdk_protocol_version() -> u32 {
+    DEFAULT_WORKER_SDK_PROTOCOL_VERSION
+}
+
+fn default_worker_wit_abi_version() -> String {
+    DEFAULT_WORKER_WIT_ABI_VERSION.to_owned()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerAttestation {
@@ -18,6 +28,14 @@ pub struct WorkerAttestation {
     pub egress_proxy_attested: bool,
     #[serde(default)]
     pub supported_capabilities: Vec<String>,
+    #[serde(default)]
+    pub capability_authority_sha256: Option<String>,
+    #[serde(default = "default_worker_sdk_protocol_version")]
+    pub sdk_protocol_version: u32,
+    #[serde(default = "default_worker_wit_abi_version")]
+    pub wit_abi_version: String,
+    #[serde(default)]
+    pub heartbeat_unix_ms: i64,
     pub issued_at_unix_ms: i64,
     pub expires_at_unix_ms: i64,
 }
@@ -175,6 +193,11 @@ pub struct WorkerFleetSnapshot {
     pub registered_workers: usize,
     pub attested_workers: usize,
     pub active_leases: usize,
+    pub available_workers: usize,
+    pub busy_workers: usize,
+    pub degraded_workers: usize,
+    pub draining_workers: usize,
+    pub offline_workers: usize,
     pub orphaned_workers: usize,
     pub failed_closed_workers: usize,
 }
@@ -182,12 +205,28 @@ pub struct WorkerFleetSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerFleetPolicy {
     pub max_ttl_ms: u64,
+    pub heartbeat_timeout_ms: u64,
+    pub trusted_capabilities: Vec<String>,
+    pub required_capability_authority_sha256: Option<String>,
+    pub required_sdk_protocol_version: Option<u32>,
+    pub required_wit_abi_version: Option<String>,
     pub attestation: WorkerAttestationExpectation,
 }
 
 impl Default for WorkerFleetPolicy {
     fn default() -> Self {
-        Self { max_ttl_ms: 15 * 60 * 1_000, attestation: WorkerAttestationExpectation::default() }
+        Self {
+            max_ttl_ms: 15 * 60 * 1_000,
+            heartbeat_timeout_ms: 30_000,
+            trusted_capabilities: vec![
+                "tool:palyra.echo".to_owned(),
+                "tool:palyra.sleep".to_owned(),
+            ],
+            required_capability_authority_sha256: None,
+            required_sdk_protocol_version: Some(DEFAULT_WORKER_SDK_PROTOCOL_VERSION),
+            required_wit_abi_version: Some(DEFAULT_WORKER_WIT_ABI_VERSION.to_owned()),
+            attestation: WorkerAttestationExpectation::default(),
+        }
     }
 }
 
@@ -205,8 +244,14 @@ pub enum WorkerLifecycleError {
     LeaseAlreadyActive(String),
     #[error("worker '{0}' is fail-closed and cannot accept work")]
     WorkerFailClosed(String),
+    #[error("worker '{0}' is draining and cannot accept new work")]
+    WorkerDraining(String),
+    #[error("worker '{0}' heartbeat is stale")]
+    WorkerOffline(String),
     #[error("no attested worker is available for the requested capabilities")]
     NoAvailableWorker,
+    #[error("worker compatibility check failed: {0}")]
+    CompatibilityMismatch(String),
     #[error("worker lease request is invalid: {0}")]
     InvalidLeaseRequest(String),
     #[error("worker cleanup failed and the worker stayed fail-closed")]
@@ -218,6 +263,7 @@ struct WorkerRecord {
     attestation: WorkerAttestation,
     state: WorkerLifecycleState,
     lease: Option<WorkerLease>,
+    last_heartbeat_unix_ms: i64,
 }
 
 #[derive(Debug, Default)]
@@ -239,6 +285,52 @@ impl WorkerFleetManager {
             })
             .count();
         let active_leases = self.workers.values().filter(|worker| worker.lease.is_some()).count();
+        let available_workers = self
+            .workers
+            .values()
+            .filter(|worker| {
+                worker.lease.is_none()
+                    && matches!(
+                        worker.state,
+                        WorkerLifecycleState::Registered
+                            | WorkerLifecycleState::Available
+                            | WorkerLifecycleState::Completed
+                    )
+            })
+            .count();
+        let busy_workers = self
+            .workers
+            .values()
+            .filter(|worker| {
+                worker.lease.is_some()
+                    || matches!(
+                        worker.state,
+                        WorkerLifecycleState::Assigned | WorkerLifecycleState::Busy
+                    )
+            })
+            .count();
+        let degraded_workers = self
+            .workers
+            .values()
+            .filter(|worker| {
+                matches!(
+                    worker.state,
+                    WorkerLifecycleState::Degraded
+                        | WorkerLifecycleState::Failed
+                        | WorkerLifecycleState::Orphaned
+                )
+            })
+            .count();
+        let draining_workers = self
+            .workers
+            .values()
+            .filter(|worker| matches!(worker.state, WorkerLifecycleState::Draining))
+            .count();
+        let offline_workers = self
+            .workers
+            .values()
+            .filter(|worker| matches!(worker.state, WorkerLifecycleState::Offline))
+            .count();
         let orphaned_workers = self
             .workers
             .values()
@@ -253,6 +345,11 @@ impl WorkerFleetManager {
             registered_workers,
             attested_workers,
             active_leases,
+            available_workers,
+            busy_workers,
+            degraded_workers,
+            draining_workers,
+            offline_workers,
             orphaned_workers,
             failed_closed_workers,
         }
@@ -270,13 +367,24 @@ impl WorkerFleetManager {
         now_unix_ms: i64,
     ) -> Result<WorkerLifecycleEvent, WorkerLifecycleError> {
         attestation.validate(&policy.attestation, now_unix_ms)?;
+        validate_worker_compatibility(&attestation, policy)?;
         if self.workers.contains_key(attestation.worker_id.as_str()) {
             return Err(WorkerLifecycleError::AlreadyRegistered(attestation.worker_id));
         }
         let worker_id = attestation.worker_id.clone();
+        let last_heartbeat_unix_ms = if attestation.heartbeat_unix_ms > 0 {
+            attestation.heartbeat_unix_ms
+        } else {
+            now_unix_ms
+        };
         self.workers.insert(
             worker_id.clone(),
-            WorkerRecord { attestation, state: WorkerLifecycleState::Registered, lease: None },
+            WorkerRecord {
+                attestation,
+                state: WorkerLifecycleState::Registered,
+                lease: None,
+                last_heartbeat_unix_ms,
+            },
         );
         let event = WorkerLifecycleEvent {
             worker_id,
@@ -452,12 +560,87 @@ impl WorkerFleetManager {
             return Err(WorkerLifecycleError::LeaseAlreadyActive(worker_id.to_owned()));
         }
         worker.attestation.validate(&policy.attestation, now_unix_ms)?;
+        validate_worker_compatibility(&worker.attestation, policy)?;
         worker.state = WorkerLifecycleState::Registered;
+        worker.last_heartbeat_unix_ms = now_unix_ms;
         let event = WorkerLifecycleEvent {
             worker_id: worker_id.to_owned(),
             state: WorkerLifecycleState::Registered,
             run_id: None,
             reason_code: "worker.reverified_by_operator".to_owned(),
+            timestamp_unix_ms: now_unix_ms,
+        };
+        self.push_recent_event(event.clone());
+        Ok(event)
+    }
+
+    pub fn heartbeat_worker(
+        &mut self,
+        worker_id: &str,
+        policy: &WorkerFleetPolicy,
+        now_unix_ms: i64,
+    ) -> Result<WorkerLifecycleEvent, WorkerLifecycleError> {
+        let worker = self
+            .workers
+            .get_mut(worker_id)
+            .ok_or_else(|| WorkerLifecycleError::UnknownWorker(worker_id.to_owned()))?;
+        worker.attestation.validate(&policy.attestation, now_unix_ms)?;
+        validate_worker_compatibility(&worker.attestation, policy)?;
+        worker.last_heartbeat_unix_ms = now_unix_ms;
+        if matches!(worker.state, WorkerLifecycleState::Offline) {
+            worker.state = WorkerLifecycleState::Registered;
+        }
+        let event = WorkerLifecycleEvent {
+            worker_id: worker_id.to_owned(),
+            state: worker.state,
+            run_id: worker.lease.as_ref().map(|lease| lease.run_id.clone()),
+            reason_code: "worker.heartbeat".to_owned(),
+            timestamp_unix_ms: now_unix_ms,
+        };
+        self.push_recent_event(event.clone());
+        Ok(event)
+    }
+
+    pub fn drain_worker(
+        &mut self,
+        worker_id: &str,
+        reason_code: &str,
+        now_unix_ms: i64,
+    ) -> Result<WorkerLifecycleEvent, WorkerLifecycleError> {
+        let worker = self
+            .workers
+            .get_mut(worker_id)
+            .ok_or_else(|| WorkerLifecycleError::UnknownWorker(worker_id.to_owned()))?;
+        worker.state = WorkerLifecycleState::Draining;
+        let event = WorkerLifecycleEvent {
+            worker_id: worker_id.to_owned(),
+            state: WorkerLifecycleState::Draining,
+            run_id: worker.lease.as_ref().map(|lease| lease.run_id.clone()),
+            reason_code: normalize_operator_reason_code(reason_code, "worker.draining"),
+            timestamp_unix_ms: now_unix_ms,
+        };
+        self.push_recent_event(event.clone());
+        Ok(event)
+    }
+
+    pub fn revoke_lease(
+        &mut self,
+        worker_id: &str,
+        reason_code: &str,
+        now_unix_ms: i64,
+    ) -> Result<WorkerLifecycleEvent, WorkerLifecycleError> {
+        let worker = self
+            .workers
+            .get_mut(worker_id)
+            .ok_or_else(|| WorkerLifecycleError::UnknownWorker(worker_id.to_owned()))?;
+        let run_id = worker.lease.as_ref().map(|lease| lease.run_id.clone());
+        worker.lease = None;
+        worker.state = WorkerLifecycleState::Orphaned;
+        let event = WorkerLifecycleEvent {
+            worker_id: worker_id.to_owned(),
+            state: WorkerLifecycleState::Orphaned,
+            run_id,
+            reason_code: normalize_operator_reason_code(reason_code, "worker.lease_revoked"),
             timestamp_unix_ms: now_unix_ms,
         };
         self.push_recent_event(event.clone());
@@ -490,6 +673,41 @@ impl WorkerFleetManager {
                     timestamp_unix_ms: now_unix_ms,
                 });
             }
+        }
+        for event in &events {
+            self.push_recent_event(event.clone());
+        }
+        events
+    }
+
+    pub fn mark_stale_heartbeat_workers(
+        &mut self,
+        policy: &WorkerFleetPolicy,
+        now_unix_ms: i64,
+    ) -> Vec<WorkerLifecycleEvent> {
+        let mut events = Vec::new();
+        for (worker_id, worker) in &mut self.workers {
+            if matches!(
+                worker.state,
+                WorkerLifecycleState::Failed
+                    | WorkerLifecycleState::Offline
+                    | WorkerLifecycleState::Orphaned
+            ) {
+                continue;
+            }
+            if worker_heartbeat_is_fresh(worker, policy, now_unix_ms) {
+                continue;
+            }
+            let run_id = worker.lease.as_ref().map(|lease| lease.run_id.clone());
+            worker.state = WorkerLifecycleState::Offline;
+            worker.lease = None;
+            events.push(WorkerLifecycleEvent {
+                worker_id: worker_id.clone(),
+                state: WorkerLifecycleState::Offline,
+                run_id,
+                reason_code: "worker.heartbeat_stale".to_owned(),
+                timestamp_unix_ms: now_unix_ms,
+            });
         }
         for event in &events {
             self.push_recent_event(event.clone());
@@ -552,6 +770,50 @@ fn validate_lease_request(
     Ok(())
 }
 
+fn validate_worker_compatibility(
+    attestation: &WorkerAttestation,
+    policy: &WorkerFleetPolicy,
+) -> Result<(), WorkerLifecycleError> {
+    if let Some(expected) = policy.required_capability_authority_sha256.as_deref() {
+        let Some(actual) = attestation.capability_authority_sha256.as_deref() else {
+            return Err(WorkerLifecycleError::CompatibilityMismatch(
+                "capability authority digest is required".to_owned(),
+            ));
+        };
+        if actual != expected {
+            return Err(WorkerLifecycleError::CompatibilityMismatch(
+                "capability authority digest mismatch".to_owned(),
+            ));
+        }
+    }
+    if let Some(expected) = policy.required_sdk_protocol_version {
+        if attestation.sdk_protocol_version != expected {
+            return Err(WorkerLifecycleError::CompatibilityMismatch(format!(
+                "sdk_protocol_version={} expected={expected}",
+                attestation.sdk_protocol_version
+            )));
+        }
+    }
+    if let Some(expected) = policy.required_wit_abi_version.as_deref() {
+        if attestation.wit_abi_version != expected {
+            return Err(WorkerLifecycleError::CompatibilityMismatch(format!(
+                "wit_abi_version={} expected={expected}",
+                attestation.wit_abi_version
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn worker_heartbeat_is_fresh(
+    worker: &WorkerRecord,
+    policy: &WorkerFleetPolicy,
+    now_unix_ms: i64,
+) -> bool {
+    now_unix_ms.saturating_sub(worker.last_heartbeat_unix_ms)
+        <= i64::try_from(policy.heartbeat_timeout_ms).unwrap_or(i64::MAX)
+}
+
 fn assign_worker_record(
     worker_id: &str,
     worker: &mut WorkerRecord,
@@ -560,13 +822,21 @@ fn assign_worker_record(
     now_unix_ms: i64,
 ) -> Result<(WorkerLease, WorkerLifecycleEvent), WorkerLifecycleError> {
     worker.attestation.validate(&policy.attestation, now_unix_ms)?;
+    validate_worker_compatibility(&worker.attestation, policy)?;
     if worker.lease.is_some() {
         return Err(WorkerLifecycleError::LeaseAlreadyActive(worker_id.to_owned()));
     }
     if matches!(worker.state, WorkerLifecycleState::Failed | WorkerLifecycleState::Orphaned) {
         return Err(WorkerLifecycleError::WorkerFailClosed(worker_id.to_owned()));
     }
-    if !worker_supports_capabilities(worker, request.required_capabilities.as_slice()) {
+    if matches!(worker.state, WorkerLifecycleState::Draining) {
+        return Err(WorkerLifecycleError::WorkerDraining(worker_id.to_owned()));
+    }
+    if !worker_heartbeat_is_fresh(worker, policy, now_unix_ms) {
+        worker.state = WorkerLifecycleState::Offline;
+        return Err(WorkerLifecycleError::WorkerOffline(worker_id.to_owned()));
+    }
+    if !worker_supports_capabilities(worker, request.required_capabilities.as_slice(), policy) {
         return Err(WorkerLifecycleError::NoAvailableWorker);
     }
     let lease = WorkerLease {
@@ -600,21 +870,40 @@ fn worker_record_can_accept(
     now_unix_ms: i64,
 ) -> bool {
     worker.lease.is_none()
-        && !matches!(worker.state, WorkerLifecycleState::Failed | WorkerLifecycleState::Orphaned)
+        && !matches!(
+            worker.state,
+            WorkerLifecycleState::Failed
+                | WorkerLifecycleState::Orphaned
+                | WorkerLifecycleState::Draining
+                | WorkerLifecycleState::Offline
+        )
         && worker.attestation.validate(&policy.attestation, now_unix_ms).is_ok()
-        && worker_supports_capabilities(worker, request.required_capabilities.as_slice())
+        && validate_worker_compatibility(&worker.attestation, policy).is_ok()
+        && worker_heartbeat_is_fresh(worker, policy, now_unix_ms)
+        && worker_supports_capabilities(worker, request.required_capabilities.as_slice(), policy)
 }
 
-fn worker_supports_capabilities(worker: &WorkerRecord, required_capabilities: &[String]) -> bool {
+fn worker_supports_capabilities(
+    worker: &WorkerRecord,
+    required_capabilities: &[String],
+    policy: &WorkerFleetPolicy,
+) -> bool {
     if required_capabilities.is_empty() {
         return true;
     }
+    let trusted_capabilities = policy
+        .trusted_capabilities
+        .iter()
+        .map(|capability| capability.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
     required_capabilities.iter().all(|required| {
-        worker
-            .attestation
-            .supported_capabilities
-            .iter()
-            .any(|available| available.eq_ignore_ascii_case(required))
+        let normalized_required = required.to_ascii_lowercase();
+        trusted_capabilities.contains(normalized_required.as_str())
+            && worker
+                .attestation
+                .supported_capabilities
+                .iter()
+                .any(|available| available.eq_ignore_ascii_case(required))
     })
 }
 
@@ -634,6 +923,10 @@ mod tests {
             artifact_digest_sha256: "art".repeat(16),
             egress_proxy_attested: true,
             supported_capabilities: vec!["tool:palyra.echo".to_owned()],
+            capability_authority_sha256: None,
+            sdk_protocol_version: 1,
+            wit_abi_version: "palyra-worker-abi/v1".to_owned(),
+            heartbeat_unix_ms: 2_000,
             issued_at_unix_ms: 1_000,
             expires_at_unix_ms: 10_000,
         }
@@ -891,5 +1184,78 @@ mod tests {
         assert!(recovered.cleanup_succeeded);
         assert_eq!(recovered.event.state, WorkerLifecycleState::Completed);
         assert_eq!(manager.snapshot().failed_closed_workers, 0);
+    }
+
+    #[test]
+    fn capability_matching_requires_worker_self_report_and_policy_trust() {
+        let mut manager = WorkerFleetManager::default();
+        let mut policy = WorkerFleetPolicy::default();
+        policy.trusted_capabilities = vec!["tool:palyra.sleep".to_owned()];
+        let mut attestation = attestation("worker-l");
+        attestation.supported_capabilities = vec!["tool:palyra.sleep".to_owned()];
+        manager.register_worker(attestation, &policy, 2_000).unwrap();
+
+        let mut request = lease_request("run-11", 500);
+        request.required_capabilities = vec!["tool:palyra.echo".to_owned()];
+        let error = manager
+            .assign_next_work(request, &policy, 2_500)
+            .expect_err("untrusted capability must fail closed even if another tool is trusted");
+
+        assert_eq!(error, WorkerLifecycleError::NoAvailableWorker);
+        assert_eq!(manager.snapshot().active_leases, 0);
+    }
+
+    #[test]
+    fn stale_heartbeat_marks_worker_offline_and_clears_active_lease() {
+        let mut manager = WorkerFleetManager::default();
+        let mut policy =
+            WorkerFleetPolicy { heartbeat_timeout_ms: 100, ..WorkerFleetPolicy::default() };
+        policy.trusted_capabilities = vec!["tool:palyra.echo".to_owned()];
+        manager.register_worker(attestation("worker-m"), &policy, 2_000).unwrap();
+        manager.assign_work("worker-m", lease_request("run-12", 500), &policy, 2_050).unwrap();
+
+        let events = manager.mark_stale_heartbeat_workers(&policy, 2_250);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].state, WorkerLifecycleState::Offline);
+        assert_eq!(events[0].run_id.as_deref(), Some("run-12"));
+        assert_eq!(manager.snapshot().offline_workers, 1);
+        assert_eq!(manager.snapshot().active_leases, 0);
+    }
+
+    #[test]
+    fn draining_worker_rejects_new_leases_without_quarantine() {
+        let mut manager = WorkerFleetManager::default();
+        let policy = WorkerFleetPolicy::default();
+        manager.register_worker(attestation("worker-n"), &policy, 2_000).unwrap();
+
+        let drain = manager
+            .drain_worker("worker-n", "worker.operator.drain", 2_100)
+            .expect("drain should be recorded");
+        assert_eq!(drain.state, WorkerLifecycleState::Draining);
+
+        let error = manager
+            .assign_work("worker-n", lease_request("run-13", 500), &policy, 2_200)
+            .expect_err("draining worker must not accept a new lease");
+        assert!(matches!(error, WorkerLifecycleError::WorkerDraining(_)));
+        assert_eq!(manager.snapshot().draining_workers, 1);
+        assert_eq!(manager.snapshot().failed_closed_workers, 0);
+    }
+
+    #[test]
+    fn compatibility_matrix_rejects_unversioned_worker_abi() {
+        let mut manager = WorkerFleetManager::default();
+        let policy = WorkerFleetPolicy {
+            required_sdk_protocol_version: Some(2),
+            required_wit_abi_version: Some("palyra-worker-abi/v2".to_owned()),
+            ..WorkerFleetPolicy::default()
+        };
+
+        let error = manager
+            .register_worker(attestation("worker-o"), &policy, 2_000)
+            .expect_err("worker ABI mismatch must fail closed");
+
+        assert!(matches!(error, WorkerLifecycleError::CompatibilityMismatch(_)));
+        assert_eq!(manager.snapshot().registered_workers, 0);
     }
 }

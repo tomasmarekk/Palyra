@@ -440,6 +440,10 @@ fn test_worker_attestation(worker_id: &str) -> WorkerAttestation {
         artifact_digest_sha256: "art".repeat(16),
         egress_proxy_attested: true,
         supported_capabilities: vec!["tool:palyra.echo".to_owned()],
+        capability_authority_sha256: None,
+        sdk_protocol_version: 1,
+        wit_abi_version: "palyra-worker-abi/v1".to_owned(),
+        heartbeat_unix_ms: now_unix_ms,
         issued_at_unix_ms: now_unix_ms.saturating_sub(1_000),
         expires_at_unix_ms: now_unix_ms.saturating_add(60_000),
     }

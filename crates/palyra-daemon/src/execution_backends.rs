@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::collections::BTreeSet;
 
 use palyra_common::feature_rollouts::{
@@ -8,6 +10,7 @@ use palyra_common::runtime_preview::RuntimePreviewMode;
 use palyra_sandbox::{current_backend_capabilities, current_backend_kind};
 use palyra_workerd::{WorkerFleetPolicy, WorkerFleetSnapshot};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{
     config::{FeatureRolloutsConfig, NetworkedWorkersConfig},
@@ -109,9 +112,14 @@ pub(crate) struct ExecutionBackendInventoryRecord {
     pub(crate) tradeoffs: Vec<String>,
     pub(crate) requires_attestation: bool,
     pub(crate) requires_egress_proxy: bool,
+    pub(crate) attestation_mode: BackendAttestationMode,
+    pub(crate) workspace_strategy: WorkspaceStrategyDescriptor,
     pub(crate) workspace_scope_mode: String,
     pub(crate) artifact_transport: String,
     pub(crate) cleanup_strategy: String,
+    pub(crate) supports_cancellation: bool,
+    pub(crate) supports_cleanup: bool,
+    pub(crate) health_probe: String,
     pub(crate) active_node_count: usize,
     pub(crate) total_node_count: usize,
 }
@@ -124,6 +132,351 @@ pub(crate) struct ExecutionBackendResolution {
     pub(crate) reason_code: String,
     pub(crate) approval_required: bool,
     pub(crate) reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WorkspaceStrategyKind {
+    DaemonWorkspaceRoot,
+    GitWorktree,
+    EphemeralCopy,
+    ContainerVolume,
+    RemoteLeaseWorkspace,
+    OperatorManagedRemote,
+}
+
+impl WorkspaceStrategyKind {
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::DaemonWorkspaceRoot => "daemon_workspace_root",
+            Self::GitWorktree => "git_worktree",
+            Self::EphemeralCopy => "ephemeral_copy",
+            Self::ContainerVolume => "container_volume",
+            Self::RemoteLeaseWorkspace => "remote_lease_workspace",
+            Self::OperatorManagedRemote => "operator_managed_remote",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WorkspaceWritebackMode {
+    None,
+    PatchBundle,
+    GitCommit,
+    LeaseCommit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct WorkspaceStrategyDescriptor {
+    pub(crate) kind: WorkspaceStrategyKind,
+    pub(crate) lifecycle: String,
+    pub(crate) isolation: String,
+    pub(crate) cleanup: String,
+    pub(crate) writeback: WorkspaceWritebackMode,
+    pub(crate) requires_clean_git_state: bool,
+    pub(crate) requires_lease: bool,
+    pub(crate) digest_required: bool,
+}
+
+impl WorkspaceStrategyDescriptor {
+    #[must_use]
+    pub(crate) fn daemon_workspace_root() -> Self {
+        Self {
+            kind: WorkspaceStrategyKind::DaemonWorkspaceRoot,
+            lifecycle: "validated daemon workspace root for the current run".to_owned(),
+            isolation: "workspace scope checks plus sandbox process policy".to_owned(),
+            cleanup: "process exit and scoped artifact cleanup".to_owned(),
+            writeback: WorkspaceWritebackMode::PatchBundle,
+            requires_clean_git_state: false,
+            requires_lease: false,
+            digest_required: true,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn git_worktree() -> Self {
+        Self {
+            kind: WorkspaceStrategyKind::GitWorktree,
+            lifecycle: "create scoped git worktree from a clean base ref".to_owned(),
+            isolation: "dedicated worktree path with dirty-state guard".to_owned(),
+            cleanup: "remove worktree after attested writeback or cancellation".to_owned(),
+            writeback: WorkspaceWritebackMode::GitCommit,
+            requires_clean_git_state: true,
+            requires_lease: false,
+            digest_required: true,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn ephemeral_copy() -> Self {
+        Self {
+            kind: WorkspaceStrategyKind::EphemeralCopy,
+            lifecycle: "copy scoped workspace into a per-run temporary root".to_owned(),
+            isolation: "copy-on-run workspace with no ambient host writeback".to_owned(),
+            cleanup: "delete temporary workspace on completion or cancellation".to_owned(),
+            writeback: WorkspaceWritebackMode::PatchBundle,
+            requires_clean_git_state: false,
+            requires_lease: false,
+            digest_required: true,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn container_volume() -> Self {
+        Self {
+            kind: WorkspaceStrategyKind::ContainerVolume,
+            lifecycle: "mount a scoped workspace volume into a declared container profile"
+                .to_owned(),
+            isolation: "container namespace plus explicit mount policy".to_owned(),
+            cleanup: "remove container volume and upload attested artifacts".to_owned(),
+            writeback: WorkspaceWritebackMode::PatchBundle,
+            requires_clean_git_state: false,
+            requires_lease: false,
+            digest_required: true,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn remote_lease_workspace() -> Self {
+        Self {
+            kind: WorkspaceStrategyKind::RemoteLeaseWorkspace,
+            lifecycle: "lease a remote worker workspace for one run-scoped grant".to_owned(),
+            isolation: "remote lease boundary with attested allowed paths".to_owned(),
+            cleanup: "lease TTL reap plus verified workspace/artifact/log cleanup".to_owned(),
+            writeback: WorkspaceWritebackMode::LeaseCommit,
+            requires_clean_git_state: false,
+            requires_lease: true,
+            digest_required: true,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn operator_managed_remote() -> Self {
+        Self {
+            kind: WorkspaceStrategyKind::OperatorManagedRemote,
+            lifecycle: "operator-established remote scope".to_owned(),
+            isolation: "manual tunnel boundary with identity-gated control plane".to_owned(),
+            cleanup: "operator teardown plus runtime audit event".to_owned(),
+            writeback: WorkspaceWritebackMode::None,
+            requires_clean_git_state: false,
+            requires_lease: false,
+            digest_required: true,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn attestation_digest_sha256(&self) -> String {
+        let encoded =
+            serde_json::to_vec(self).unwrap_or_else(|_| self.kind.as_str().as_bytes().to_vec());
+        let mut hasher = Sha256::new();
+        hasher.update(encoded);
+        hex::encode(hasher.finalize())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BackendAttestationMode {
+    None,
+    LocalExecutor,
+    ContainerProfile,
+    VaultIdentity,
+    WorkerLease,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExecutionBackendResolutionRequest {
+    pub(crate) preference: ExecutionBackendPreference,
+    pub(crate) required_capabilities: Vec<String>,
+    pub(crate) workspace_strategy: Option<WorkspaceStrategyKind>,
+}
+
+pub(crate) trait ExecutionBackend {
+    fn backend_id(&self) -> &str;
+    fn capabilities(&self) -> &[String];
+    fn workspace_strategy(&self) -> &WorkspaceStrategyDescriptor;
+    fn attestation_mode(&self) -> BackendAttestationMode;
+    fn artifact_transport(&self) -> &str;
+    fn cleanup_strategy(&self) -> &str;
+    fn supports_cancellation(&self) -> bool;
+    fn supports_cleanup(&self) -> bool;
+    fn health_probe(&self) -> &str;
+}
+
+impl ExecutionBackend for ExecutionBackendInventoryRecord {
+    fn backend_id(&self) -> &str {
+        self.backend_id.as_str()
+    }
+
+    fn capabilities(&self) -> &[String] {
+        self.capabilities.as_slice()
+    }
+
+    fn workspace_strategy(&self) -> &WorkspaceStrategyDescriptor {
+        &self.workspace_strategy
+    }
+
+    fn attestation_mode(&self) -> BackendAttestationMode {
+        self.attestation_mode
+    }
+
+    fn artifact_transport(&self) -> &str {
+        self.artifact_transport.as_str()
+    }
+
+    fn cleanup_strategy(&self) -> &str {
+        self.cleanup_strategy.as_str()
+    }
+
+    fn supports_cancellation(&self) -> bool {
+        self.supports_cancellation
+    }
+
+    fn supports_cleanup(&self) -> bool {
+        self.supports_cleanup
+    }
+
+    fn health_probe(&self) -> &str {
+        self.health_probe.as_str()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ContainerRuntimeKind {
+    Docker,
+    Podman,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ContainerNetworkPolicy {
+    None,
+    EgressProxy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ContainerMountPolicy {
+    pub(crate) host_path: String,
+    pub(crate) container_path: String,
+    pub(crate) read_only: bool,
+    pub(crate) workspace_scoped: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ContainerResourceLimits {
+    pub(crate) cpu_time_limit_ms: u64,
+    pub(crate) memory_limit_bytes: u64,
+    pub(crate) max_output_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ContainerEnvSourceKind {
+    LiteralSafeValue,
+    VaultRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ContainerEnvBinding {
+    pub(crate) name: String,
+    pub(crate) source_kind: ContainerEnvSourceKind,
+    pub(crate) value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ContainerBackendProfile {
+    pub(crate) profile_id: String,
+    pub(crate) runtime: ContainerRuntimeKind,
+    pub(crate) image: String,
+    pub(crate) mounts: Vec<ContainerMountPolicy>,
+    pub(crate) network: ContainerNetworkPolicy,
+    pub(crate) user: String,
+    pub(crate) privileged: bool,
+    pub(crate) limits: ContainerResourceLimits,
+    pub(crate) env: Vec<ContainerEnvBinding>,
+    pub(crate) cleanup_strategy: String,
+}
+
+impl ContainerBackendProfile {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.profile_id.trim().is_empty() {
+            return Err("container backend profile_id must not be empty".to_owned());
+        }
+        if self.image.trim().is_empty() {
+            return Err("container backend image must not be empty".to_owned());
+        }
+        if self.privileged {
+            return Err(
+                "container backend profiles are fail-closed for privileged containers".to_owned()
+            );
+        }
+        if self.user.trim().is_empty() || self.user.eq_ignore_ascii_case("root") {
+            return Err("container backend user must be an explicit non-root user".to_owned());
+        }
+        if self.limits.cpu_time_limit_ms == 0
+            || self.limits.memory_limit_bytes == 0
+            || self.limits.max_output_bytes == 0
+        {
+            return Err("container backend limits must be positive".to_owned());
+        }
+        if self.mounts.iter().any(|mount| !mount.workspace_scoped) {
+            return Err("container backend mounts must be workspace-scoped".to_owned());
+        }
+        if self.env.iter().any(|binding| {
+            matches!(binding.source_kind, ContainerEnvSourceKind::LiteralSafeValue)
+                && palyra_common::redaction::is_sensitive_key(binding.name.as_str())
+        }) {
+            return Err("container backend env secrets must use Vault refs".to_owned());
+        }
+        if self.env.iter().any(|binding| {
+            matches!(binding.source_kind, ContainerEnvSourceKind::VaultRef)
+                && !binding.value.starts_with("vault://")
+        }) {
+            return Err("container backend Vault env bindings must use vault:// handles".to_owned());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SshWorkerBackendProfile {
+    pub(crate) profile_id: String,
+    pub(crate) host_handle: String,
+    pub(crate) user_handle: String,
+    pub(crate) identity_handle: String,
+    pub(crate) host_trust_handle: String,
+    pub(crate) worker_protocol: String,
+    pub(crate) workspace_strategy: WorkspaceStrategyDescriptor,
+}
+
+impl SshWorkerBackendProfile {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.profile_id.trim().is_empty() {
+            return Err("ssh worker profile_id must not be empty".to_owned());
+        }
+        for (field_name, value) in [
+            ("host_handle", self.host_handle.as_str()),
+            ("user_handle", self.user_handle.as_str()),
+            ("identity_handle", self.identity_handle.as_str()),
+            ("host_trust_handle", self.host_trust_handle.as_str()),
+        ] {
+            if !(value.starts_with("vault://") || value.starts_with("identity://")) {
+                return Err(format!(
+                    "ssh worker {field_name} must be a Vault or identity handle, not plaintext"
+                ));
+            }
+        }
+        if self.worker_protocol != "palyra-worker-rpc/v1" {
+            return Err("ssh worker backend must use palyra-worker-rpc/v1 envelope".to_owned());
+        }
+        if !matches!(self.workspace_strategy.kind, WorkspaceStrategyKind::RemoteLeaseWorkspace) {
+            return Err("ssh worker backend requires a remote lease workspace strategy".to_owned());
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn parse_execution_backend_preference(
@@ -254,6 +607,90 @@ pub(crate) fn validate_execution_backend_selection(
 }
 
 #[must_use]
+pub(crate) fn resolve_execution_backend_for_request(
+    request: &ExecutionBackendResolutionRequest,
+    inventory: &[ExecutionBackendInventoryRecord],
+) -> ExecutionBackendResolution {
+    if matches!(request.preference, ExecutionBackendPreference::Automatic) {
+        let selected = inventory
+            .iter()
+            .filter(|entry| execution_backend_matches_request(*entry, request))
+            .find(|entry| entry.selected_by_default)
+            .or_else(|| {
+                inventory.iter().find(|entry| execution_backend_matches_request(*entry, request))
+            });
+        if let Some(record) = selected {
+            let resolved =
+                parse_execution_backend_preference(record.backend_id.as_str(), "backend_id")
+                    .unwrap_or(ExecutionBackendPreference::Automatic);
+            return ExecutionBackendResolution {
+                requested: request.preference,
+                resolved,
+                fallback_used: false,
+                reason_code: format!("backend.available.{}", record.backend_id),
+                approval_required: !matches!(resolved, ExecutionBackendPreference::LocalSandbox),
+                reason: format!(
+                    "Backend '{}' satisfies required capabilities and workspace strategy '{}'. {}",
+                    record.backend_id,
+                    record.workspace_strategy.kind.as_str(),
+                    record.operator_summary
+                ),
+            };
+        }
+        return ExecutionBackendResolution {
+            requested: request.preference,
+            resolved: ExecutionBackendPreference::Automatic,
+            fallback_used: false,
+            reason_code: "backend.policy.no_matching_backend".to_owned(),
+            approval_required: false,
+            reason: "No selectable execution backend satisfies the requested capabilities and workspace strategy."
+                .to_owned(),
+        };
+    }
+
+    let Some(record) =
+        inventory.iter().find(|entry| entry.backend_id == request.preference.as_str())
+    else {
+        return ExecutionBackendResolution {
+            requested: request.preference,
+            resolved: request.preference,
+            fallback_used: false,
+            reason_code: format!("backend.unavailable.{}", request.preference.as_str()),
+            approval_required: !matches!(
+                request.preference,
+                ExecutionBackendPreference::LocalSandbox
+            ),
+            reason: format!(
+                "Requested backend '{}' is missing from inventory.",
+                request.preference.as_str()
+            ),
+        };
+    };
+    if execution_backend_matches_request(record, request) {
+        return ExecutionBackendResolution {
+            requested: request.preference,
+            resolved: request.preference,
+            fallback_used: false,
+            reason_code: format!("backend.available.{}", request.preference.as_str()),
+            approval_required: !matches!(
+                request.preference,
+                ExecutionBackendPreference::LocalSandbox
+            ),
+            reason: record.operator_summary.clone(),
+        };
+    }
+
+    ExecutionBackendResolution {
+        requested: request.preference,
+        resolved: request.preference,
+        fallback_used: false,
+        reason_code: format!("backend.policy.unsatisfied.{}", request.preference.as_str()),
+        approval_required: !matches!(request.preference, ExecutionBackendPreference::LocalSandbox),
+        reason: backend_request_mismatch_reason(record, request),
+    }
+}
+
+#[must_use]
 pub(crate) fn resolve_execution_backend(
     preference: ExecutionBackendPreference,
     inventory: &[ExecutionBackendInventoryRecord],
@@ -372,6 +809,58 @@ pub(crate) fn resolve_execution_backend(
     }
 }
 
+fn execution_backend_matches_request(
+    record: &ExecutionBackendInventoryRecord,
+    request: &ExecutionBackendResolutionRequest,
+) -> bool {
+    record.selectable
+        && capabilities_satisfy(
+            record.capabilities.as_slice(),
+            request.required_capabilities.as_slice(),
+        )
+        && request
+            .workspace_strategy
+            .is_none_or(|strategy| record.workspace_strategy.kind == strategy)
+}
+
+fn capabilities_satisfy(available: &[String], required: &[String]) -> bool {
+    required.iter().all(|required| {
+        available.iter().any(|available| available.eq_ignore_ascii_case(required.as_str()))
+    })
+}
+
+fn backend_request_mismatch_reason(
+    record: &ExecutionBackendInventoryRecord,
+    request: &ExecutionBackendResolutionRequest,
+) -> String {
+    if !record.selectable {
+        return format!(
+            "Requested backend '{}' is not selectable: {}",
+            record.backend_id, record.operator_summary
+        );
+    }
+    if !capabilities_satisfy(
+        record.capabilities.as_slice(),
+        request.required_capabilities.as_slice(),
+    ) {
+        return format!(
+            "Requested backend '{}' does not satisfy required capabilities: {:?}",
+            record.backend_id, request.required_capabilities
+        );
+    }
+    if let Some(strategy) = request.workspace_strategy {
+        if record.workspace_strategy.kind != strategy {
+            return format!(
+                "Requested backend '{}' uses workspace strategy '{}' but '{}' was required.",
+                record.backend_id,
+                record.workspace_strategy.kind.as_str(),
+                strategy.as_str()
+            );
+        }
+    }
+    "Requested backend did not satisfy the execution policy request.".to_owned()
+}
+
 fn local_sandbox_inventory_record(
     policy: &SandboxProcessRunnerPolicy,
 ) -> ExecutionBackendInventoryRecord {
@@ -428,9 +917,14 @@ fn local_sandbox_inventory_record(
         ],
         requires_attestation: false,
         requires_egress_proxy: false,
+        attestation_mode: BackendAttestationMode::LocalExecutor,
+        workspace_strategy: WorkspaceStrategyDescriptor::daemon_workspace_root(),
         workspace_scope_mode: "daemon_workspace_root".to_owned(),
         artifact_transport: "direct_local_filesystem".to_owned(),
         cleanup_strategy: "process_exit_and_workspace_scope_validation".to_owned(),
+        supports_cancellation: true,
+        supports_cleanup: true,
+        health_probe: "sandbox_policy_and_tier_c_capability_probe".to_owned(),
         active_node_count: 0,
         total_node_count: 0,
     }
@@ -495,9 +989,14 @@ fn desktop_node_inventory_record(
         ],
         requires_attestation: true,
         requires_egress_proxy: false,
+        attestation_mode: BackendAttestationMode::VaultIdentity,
+        workspace_strategy: WorkspaceStrategyDescriptor::git_worktree(),
         workspace_scope_mode: "paired_node_workspace_contract".to_owned(),
         artifact_transport: "node_rpc_transfer".to_owned(),
         cleanup_strategy: "node_disconnect_or_run_completion_cleanup".to_owned(),
+        supports_cancellation: true,
+        supports_cleanup: true,
+        health_probe: "paired_node_heartbeat_and_capability_snapshot".to_owned(),
         active_node_count: healthy_nodes.len(),
         total_node_count: total_nodes,
     }
@@ -589,9 +1088,14 @@ fn networked_worker_inventory_record(
         ],
         requires_attestation: true,
         requires_egress_proxy: worker_policy.attestation.require_egress_proxy,
+        attestation_mode: BackendAttestationMode::WorkerLease,
+        workspace_strategy: WorkspaceStrategyDescriptor::remote_lease_workspace(),
         workspace_scope_mode: "ephemeral_scoped_mount".to_owned(),
         artifact_transport: "manifest_attested_bundle_transfer".to_owned(),
         cleanup_strategy: "lease_ttl_reap_with_fail_closed_cleanup".to_owned(),
+        supports_cancellation: true,
+        supports_cleanup: true,
+        health_probe: "worker_lease_heartbeat_and_cleanup_snapshot".to_owned(),
         active_node_count: worker_snapshot.attested_workers,
         total_node_count: worker_snapshot.registered_workers,
     }
@@ -633,9 +1137,14 @@ fn ssh_tunnel_inventory_record(rollout: FeatureRolloutSetting) -> ExecutionBacke
         ],
         requires_attestation: false,
         requires_egress_proxy: false,
+        attestation_mode: BackendAttestationMode::VaultIdentity,
+        workspace_strategy: WorkspaceStrategyDescriptor::operator_managed_remote(),
         workspace_scope_mode: "operator_managed_remote_scope".to_owned(),
         artifact_transport: "out_of_band_operator_tunnel".to_owned(),
         cleanup_strategy: "operator_managed_tunnel_teardown".to_owned(),
+        supports_cancellation: false,
+        supports_cleanup: false,
+        health_probe: "operator_tunnel_connectivity_check".to_owned(),
         active_node_count: 0,
         total_node_count: 0,
     }
@@ -671,8 +1180,12 @@ mod tests {
 
     use super::{
         build_execution_backend_inventory_with_rollout, resolve_execution_backend,
-        validate_execution_backend_selection, ExecutionBackendPreference, ExecutionBackendState,
-        FeatureRolloutSetting,
+        resolve_execution_backend_for_request, validate_execution_backend_selection,
+        ContainerBackendProfile, ContainerEnvBinding, ContainerEnvSourceKind, ContainerMountPolicy,
+        ContainerNetworkPolicy, ContainerResourceLimits, ContainerRuntimeKind, ExecutionBackend,
+        ExecutionBackendPreference, ExecutionBackendResolutionRequest, ExecutionBackendState,
+        FeatureRolloutSetting, SshWorkerBackendProfile, WorkspaceStrategyDescriptor,
+        WorkspaceStrategyKind,
     };
 
     fn test_policy() -> SandboxProcessRunnerPolicy {
@@ -824,8 +1337,7 @@ mod tests {
                 registered_workers: 1,
                 attested_workers: 1,
                 active_leases: 0,
-                orphaned_workers: 0,
-                failed_closed_workers: 0,
+                ..WorkerFleetSnapshot::default()
             },
             &WorkerFleetPolicy::default(),
         );
@@ -858,8 +1370,7 @@ mod tests {
                 registered_workers: 1,
                 attested_workers: 1,
                 active_leases: 0,
-                orphaned_workers: 0,
-                failed_closed_workers: 0,
+                ..WorkerFleetSnapshot::default()
             },
             &WorkerFleetPolicy::default(),
         );
@@ -870,5 +1381,176 @@ mod tests {
         assert_eq!(networked_worker.state, ExecutionBackendState::Disabled);
         assert!(!networked_worker.selectable);
         assert!(networked_worker.operator_summary.contains("dedicated rollout flag"));
+    }
+
+    #[test]
+    fn backend_contract_exposes_workspace_attestation_and_cleanup_flags() {
+        let networked_workers = NetworkedWorkersConfig {
+            mode: RuntimePreviewMode::PreviewOnly,
+            ..NetworkedWorkersConfig::default()
+        };
+        let inventory = build_execution_backend_inventory_with_rollout(
+            &test_policy(),
+            0,
+            &[],
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::from_config(true),
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            &networked_workers,
+            WorkerFleetSnapshot {
+                registered_workers: 1,
+                attested_workers: 1,
+                ..WorkerFleetSnapshot::default()
+            },
+            &WorkerFleetPolicy::default(),
+        );
+        let backend = inventory
+            .iter()
+            .find(|entry| entry.backend_id == ExecutionBackendPreference::NetworkedWorker.as_str())
+            .expect("networked worker backend should exist");
+
+        assert_eq!(backend.backend_id(), "networked_worker");
+        assert!(backend.supports_cancellation());
+        assert!(backend.supports_cleanup());
+        assert_eq!(backend.workspace_strategy().kind, WorkspaceStrategyKind::RemoteLeaseWorkspace);
+        assert!(!backend.workspace_strategy().attestation_digest_sha256().is_empty());
+        assert_eq!(backend.artifact_transport(), "manifest_attested_bundle_transfer");
+        assert_eq!(backend.cleanup_strategy(), "lease_ttl_reap_with_fail_closed_cleanup");
+        assert_eq!(backend.health_probe(), "worker_lease_heartbeat_and_cleanup_snapshot");
+        assert!(backend
+            .capabilities()
+            .iter()
+            .any(|capability| capability == "scoped_artifact_transport"));
+    }
+
+    #[test]
+    fn request_resolver_matches_capabilities_and_workspace_strategy() {
+        let networked_workers = NetworkedWorkersConfig {
+            mode: RuntimePreviewMode::PreviewOnly,
+            ..NetworkedWorkersConfig::default()
+        };
+        let inventory = build_execution_backend_inventory_with_rollout(
+            &test_policy(),
+            0,
+            &[],
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::from_config(true),
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            &networked_workers,
+            WorkerFleetSnapshot {
+                registered_workers: 1,
+                attested_workers: 1,
+                ..WorkerFleetSnapshot::default()
+            },
+            &WorkerFleetPolicy::default(),
+        );
+        let resolution = resolve_execution_backend_for_request(
+            &ExecutionBackendResolutionRequest {
+                preference: ExecutionBackendPreference::Automatic,
+                required_capabilities: vec!["scoped_artifact_transport".to_owned()],
+                workspace_strategy: Some(WorkspaceStrategyKind::RemoteLeaseWorkspace),
+            },
+            &inventory,
+        );
+
+        assert_eq!(resolution.resolved, ExecutionBackendPreference::NetworkedWorker);
+        assert_eq!(resolution.reason_code, "backend.available.networked_worker");
+    }
+
+    #[test]
+    fn request_resolver_fails_closed_on_workspace_strategy_mismatch() {
+        let networked_workers = NetworkedWorkersConfig::default();
+        let inventory = build_execution_backend_inventory_with_rollout(
+            &test_policy(),
+            0,
+            &[],
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            &networked_workers,
+            WorkerFleetSnapshot::default(),
+            &WorkerFleetPolicy::default(),
+        );
+        let resolution = resolve_execution_backend_for_request(
+            &ExecutionBackendResolutionRequest {
+                preference: ExecutionBackendPreference::LocalSandbox,
+                required_capabilities: vec!["sandbox_process_runner".to_owned()],
+                workspace_strategy: Some(WorkspaceStrategyKind::RemoteLeaseWorkspace),
+            },
+            &inventory,
+        );
+
+        assert_eq!(resolution.resolved, ExecutionBackendPreference::LocalSandbox);
+        assert_eq!(resolution.reason_code, "backend.policy.unsatisfied.local_sandbox");
+        assert!(resolution.reason.contains("workspace strategy"));
+    }
+
+    #[test]
+    fn container_backend_profile_rejects_privileged_and_plaintext_secret_env() {
+        let mut profile = ContainerBackendProfile {
+            profile_id: "docker-safe".to_owned(),
+            runtime: ContainerRuntimeKind::Docker,
+            image: "ghcr.io/palyra/worker:sha256-deadbeef".to_owned(),
+            mounts: vec![ContainerMountPolicy {
+                host_path: "workspace".to_owned(),
+                container_path: "/workspace".to_owned(),
+                read_only: false,
+                workspace_scoped: true,
+            }],
+            network: ContainerNetworkPolicy::EgressProxy,
+            user: "1000:1000".to_owned(),
+            privileged: false,
+            limits: ContainerResourceLimits {
+                cpu_time_limit_ms: 1_000,
+                memory_limit_bytes: 128 * 1024 * 1024,
+                max_output_bytes: 64 * 1024,
+            },
+            env: vec![ContainerEnvBinding {
+                name: "API_TOKEN".to_owned(),
+                source_kind: ContainerEnvSourceKind::VaultRef,
+                value: "vault://worker/api-token".to_owned(),
+            }],
+            cleanup_strategy: "remove_container_and_volume".to_owned(),
+        };
+        assert!(profile.validate().is_ok());
+
+        profile.privileged = true;
+        assert!(profile
+            .validate()
+            .expect_err("privileged containers must fail closed")
+            .contains("privileged"));
+        profile.privileged = false;
+        profile.env[0].source_kind = ContainerEnvSourceKind::LiteralSafeValue;
+        profile.env[0].value = "raw-secret".to_owned();
+        assert!(profile.validate().expect_err("secret env must use Vault").contains("Vault"));
+    }
+
+    #[test]
+    fn ssh_worker_profile_requires_vault_identity_handles_and_worker_rpc() {
+        let mut profile = SshWorkerBackendProfile {
+            profile_id: "ssh-worker".to_owned(),
+            host_handle: "vault://ssh/host".to_owned(),
+            user_handle: "identity://ssh/user".to_owned(),
+            identity_handle: "vault://ssh/key".to_owned(),
+            host_trust_handle: "vault://ssh/known-host".to_owned(),
+            worker_protocol: "palyra-worker-rpc/v1".to_owned(),
+            workspace_strategy: WorkspaceStrategyDescriptor::remote_lease_workspace(),
+        };
+        assert!(profile.validate().is_ok());
+
+        profile.identity_handle = "-----BEGIN PRIVATE KEY-----".to_owned();
+        assert!(profile
+            .validate()
+            .expect_err("plaintext identity material must fail closed")
+            .contains("identity_handle"));
+        profile.identity_handle = "vault://ssh/key".to_owned();
+        profile.worker_protocol = "raw-shell".to_owned();
+        assert!(profile
+            .validate()
+            .expect_err("raw shell protocol must fail closed")
+            .contains("worker-rpc"));
     }
 }
