@@ -13,7 +13,11 @@ use crate::{
     journal::{CronJobRecord, CronRunRecord, CronRunStatus},
 };
 use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
-use palyra_common::{default_state_root, IdentityStorePathError};
+use palyra_common::{
+    default_state_root,
+    redaction::{is_sensitive_key, REDACTED},
+    IdentityStorePathError,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -198,6 +202,300 @@ impl RoutineRunOutcomeKind {
             Self::Failed => "failed",
             Self::Denied => "denied",
         }
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) mod routine_preflight_contracts {
+    use super::*;
+
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub(crate) enum RoutinePreflightOutcome {
+        Proceed,
+        Skip,
+        Defer,
+        AskApproval,
+        Fail,
+    }
+
+    impl RoutinePreflightOutcome {
+        #[must_use]
+        pub(crate) const fn as_str(self) -> &'static str {
+            match self {
+                Self::Proceed => "proceed",
+                Self::Skip => "skip",
+                Self::Defer => "defer",
+                Self::AskApproval => "ask_approval",
+                Self::Fail => "fail",
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub(crate) struct RoutinePreflightStep {
+        pub(crate) step_id: String,
+        pub(crate) tool_name: String,
+        #[serde(default)]
+        pub(crate) input_schema: Value,
+        #[serde(default)]
+        pub(crate) output_schema: Value,
+        #[serde(default)]
+        pub(crate) required_scopes: Vec<String>,
+        #[serde(default)]
+        pub(crate) capability_names: Vec<String>,
+        pub(crate) timeout_ms: u64,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub(crate) struct RoutinePreflightOutput {
+        pub(crate) outcome: RoutinePreflightOutcome,
+        pub(crate) reason: String,
+        #[serde(default)]
+        pub(crate) context_delta: Value,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub(crate) struct RoutinePreflightValidation {
+        pub(crate) accepted: bool,
+        pub(crate) reason: String,
+    }
+
+    #[must_use]
+    pub(crate) fn validate_preflight_step(
+        step: &RoutinePreflightStep,
+    ) -> RoutinePreflightValidation {
+        if step.step_id.trim().is_empty() {
+            return validation_error("preflight_step_id_empty");
+        }
+        if step.tool_name.trim().is_empty() {
+            return validation_error("preflight_tool_name_empty");
+        }
+        if step.timeout_ms == 0 || step.timeout_ms > 120_000 {
+            return validation_error("preflight_timeout_out_of_range");
+        }
+        if step.required_scopes.iter().any(|scope| scope.trim().is_empty() || scope == "*") {
+            return validation_error("preflight_required_scope_invalid");
+        }
+        if step.capability_names.iter().any(|capability| capability.trim().is_empty()) {
+            return validation_error("preflight_capability_invalid");
+        }
+        RoutinePreflightValidation { accepted: true, reason: "preflight_step_valid".to_owned() }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct RoutinePreflightContextFence {
+        pub(crate) allowed_keys: BTreeSet<String>,
+        pub(crate) max_value_bytes: usize,
+    }
+
+    impl RoutinePreflightContextFence {
+        #[must_use]
+        pub(crate) fn allow_keys(keys: &[&str], max_value_bytes: usize) -> Self {
+            Self {
+                allowed_keys: keys.iter().map(|key| (*key).to_owned()).collect(),
+                max_value_bytes,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub(crate) struct RoutinePreflightFenceResult {
+        pub(crate) context: Value,
+        pub(crate) dropped_keys: Vec<String>,
+        pub(crate) redacted_keys: Vec<String>,
+    }
+
+    #[must_use]
+    pub(crate) fn fence_preflight_context(
+        input: &Value,
+        fence: &RoutinePreflightContextFence,
+    ) -> RoutinePreflightFenceResult {
+        let mut context = serde_json::Map::new();
+        let mut dropped_keys = Vec::new();
+        let mut redacted_keys = Vec::new();
+        let Some(object) = input.as_object() else {
+            return RoutinePreflightFenceResult {
+                context: Value::Object(context),
+                dropped_keys,
+                redacted_keys,
+            };
+        };
+        for (key, value) in object {
+            if !fence.allowed_keys.contains(key) {
+                dropped_keys.push(key.clone());
+                continue;
+            }
+            if is_sensitive_key(key) {
+                context.insert(key.clone(), Value::String(REDACTED.to_owned()));
+                redacted_keys.push(key.clone());
+                continue;
+            }
+            context.insert(key.clone(), bounded_json_value(value, fence.max_value_bytes));
+        }
+        dropped_keys.sort();
+        redacted_keys.sort();
+        RoutinePreflightFenceResult { context: Value::Object(context), dropped_keys, redacted_keys }
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub(crate) enum RoutineWakeGateReason {
+        Allowed,
+        RoutineDisabled,
+        ScheduleTickMissing,
+        LastRunStillActive,
+        PreflightSkipped,
+        PreflightDeferred,
+        PreflightApprovalRequired,
+        PreflightFailed,
+        ProviderCooldown,
+        ChannelUnhealthy,
+        PolicyDenied,
+    }
+
+    impl RoutineWakeGateReason {
+        #[must_use]
+        pub(crate) const fn as_str(self) -> &'static str {
+            match self {
+                Self::Allowed => "allowed",
+                Self::RoutineDisabled => "routine_disabled",
+                Self::ScheduleTickMissing => "schedule_tick_missing",
+                Self::LastRunStillActive => "last_run_still_active",
+                Self::PreflightSkipped => "preflight_skipped",
+                Self::PreflightDeferred => "preflight_deferred",
+                Self::PreflightApprovalRequired => "preflight_approval_required",
+                Self::PreflightFailed => "preflight_failed",
+                Self::ProviderCooldown => "provider_cooldown",
+                Self::ChannelUnhealthy => "channel_unhealthy",
+                Self::PolicyDenied => "policy_denied",
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct RoutineWakeGateInput {
+        pub(crate) enabled: bool,
+        pub(crate) schedule_tick_at_unix_ms: Option<i64>,
+        pub(crate) last_run_status: Option<CronRunStatus>,
+        pub(crate) preflight_outcome: Option<RoutinePreflightOutcome>,
+        pub(crate) provider_cooldown_until_unix_ms: Option<i64>,
+        pub(crate) channel_healthy: bool,
+        pub(crate) policy_allowed: bool,
+        pub(crate) now_unix_ms: i64,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub(crate) struct RoutineWakeGateDecision {
+        pub(crate) allowed: bool,
+        pub(crate) reason: RoutineWakeGateReason,
+        pub(crate) recovery_hint: String,
+    }
+
+    impl RoutineWakeGateDecision {
+        #[must_use]
+        pub(crate) fn snapshot_json(&self) -> Value {
+            json!({
+                "allowed": self.allowed,
+                "reason": self.reason.as_str(),
+                "recovery_hint": self.recovery_hint,
+            })
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn evaluate_routine_wake_gate(
+        input: RoutineWakeGateInput,
+    ) -> RoutineWakeGateDecision {
+        if !input.enabled {
+            return wake_gate_denied(
+                RoutineWakeGateReason::RoutineDisabled,
+                "enable_routine_before_dispatch",
+            );
+        }
+        if input.schedule_tick_at_unix_ms.is_none() {
+            return wake_gate_denied(
+                RoutineWakeGateReason::ScheduleTickMissing,
+                "wait_for_next_schedule_tick",
+            );
+        }
+        if input.last_run_status.is_some_and(CronRunStatus::is_active) {
+            return wake_gate_denied(
+                RoutineWakeGateReason::LastRunStillActive,
+                "repair_or_wait_for_active_run",
+            );
+        }
+        match input.preflight_outcome {
+            Some(RoutinePreflightOutcome::Skip) => {
+                return wake_gate_denied(RoutineWakeGateReason::PreflightSkipped, "record_skip");
+            }
+            Some(RoutinePreflightOutcome::Defer) => {
+                return wake_gate_denied(
+                    RoutineWakeGateReason::PreflightDeferred,
+                    "retry_after_preflight_deferral",
+                );
+            }
+            Some(RoutinePreflightOutcome::AskApproval) => {
+                return wake_gate_denied(
+                    RoutineWakeGateReason::PreflightApprovalRequired,
+                    "request_operator_approval",
+                );
+            }
+            Some(RoutinePreflightOutcome::Fail) => {
+                return wake_gate_denied(
+                    RoutineWakeGateReason::PreflightFailed,
+                    "record_failed_preflight",
+                );
+            }
+            Some(RoutinePreflightOutcome::Proceed) | None => {}
+        }
+        if input
+            .provider_cooldown_until_unix_ms
+            .is_some_and(|cooldown| cooldown > input.now_unix_ms)
+        {
+            return wake_gate_denied(
+                RoutineWakeGateReason::ProviderCooldown,
+                "wait_for_provider_cooldown",
+            );
+        }
+        if !input.channel_healthy {
+            return wake_gate_denied(
+                RoutineWakeGateReason::ChannelUnhealthy,
+                "route_to_failure_destination_or_operator_inbox",
+            );
+        }
+        if !input.policy_allowed {
+            return wake_gate_denied(RoutineWakeGateReason::PolicyDenied, "policy_denied");
+        }
+        RoutineWakeGateDecision {
+            allowed: true,
+            reason: RoutineWakeGateReason::Allowed,
+            recovery_hint: "dispatch_routine".to_owned(),
+        }
+    }
+
+    fn validation_error(reason: &str) -> RoutinePreflightValidation {
+        RoutinePreflightValidation { accepted: false, reason: reason.to_owned() }
+    }
+
+    fn wake_gate_denied(
+        reason: RoutineWakeGateReason,
+        recovery_hint: &str,
+    ) -> RoutineWakeGateDecision {
+        RoutineWakeGateDecision { allowed: false, reason, recovery_hint: recovery_hint.to_owned() }
+    }
+
+    fn bounded_json_value(value: &Value, max_value_bytes: usize) -> Value {
+        let rendered = value.to_string();
+        if rendered.len() <= max_value_bytes {
+            return value.clone();
+        }
+        let mut truncated = String::with_capacity(max_value_bytes.min(rendered.len()) + 3);
+        for character in rendered.chars().take(max_value_bytes) {
+            truncated.push(character);
+        }
+        truncated.push_str("...");
+        Value::String(truncated)
     }
 }
 
@@ -1977,5 +2275,102 @@ mod tests {
         assert_eq!(preview["failure"]["mode"], json!("specific_channel"));
         assert_eq!(preview["failure"]["channel"], json!("ops:alerts"));
         assert_eq!(preview["failure"]["announced"], json!(true));
+    }
+
+    #[test]
+    fn preflight_step_validation_fails_closed_for_scope_and_timeout() {
+        use super::routine_preflight_contracts::*;
+
+        let valid = validate_preflight_step(&RoutinePreflightStep {
+            step_id: "provider-health".to_owned(),
+            tool_name: "palyra.routines.preflight.provider_health".to_owned(),
+            input_schema: json!({"type": "object"}),
+            output_schema: json!({"type": "object"}),
+            required_scopes: vec!["routines:read".to_owned()],
+            capability_names: vec!["routine_preflight".to_owned()],
+            timeout_ms: 5_000,
+        });
+        let invalid = validate_preflight_step(&RoutinePreflightStep {
+            step_id: "bad".to_owned(),
+            tool_name: "palyra.routines.preflight.provider_health".to_owned(),
+            input_schema: json!({}),
+            output_schema: json!({}),
+            required_scopes: vec!["*".to_owned()],
+            capability_names: vec!["routine_preflight".to_owned()],
+            timeout_ms: 0,
+        });
+
+        assert!(valid.accepted);
+        assert!(!invalid.accepted);
+        assert_eq!(invalid.reason, "preflight_timeout_out_of_range");
+    }
+
+    #[test]
+    fn preflight_context_fence_drops_and_redacts_context() {
+        use super::routine_preflight_contracts::*;
+
+        let fence = RoutinePreflightContextFence::allow_keys(
+            &["routine_id", "channel", "api_token", "large"],
+            16,
+        );
+        let fenced = fence_preflight_context(
+            &json!({
+                "routine_id": "routine-1",
+                "channel": "ops",
+                "api_token": "secret",
+                "large": "abcdefghijklmnopqrstuvwxyz",
+                "untrusted": "drop",
+            }),
+            &fence,
+        );
+
+        assert_eq!(fenced.context["routine_id"], json!("routine-1"));
+        assert_eq!(fenced.context["api_token"], json!(palyra_common::redaction::REDACTED));
+        assert!(fenced.context["large"].as_str().unwrap().ends_with("..."));
+        assert_eq!(fenced.dropped_keys, vec!["untrusted".to_owned()]);
+        assert_eq!(fenced.redacted_keys, vec!["api_token".to_owned()]);
+    }
+
+    #[test]
+    fn wake_gate_records_typed_block_reasons() {
+        use super::routine_preflight_contracts::*;
+
+        let approval = evaluate_routine_wake_gate(RoutineWakeGateInput {
+            enabled: true,
+            schedule_tick_at_unix_ms: Some(1_000),
+            last_run_status: None,
+            preflight_outcome: Some(RoutinePreflightOutcome::AskApproval),
+            provider_cooldown_until_unix_ms: None,
+            channel_healthy: true,
+            policy_allowed: true,
+            now_unix_ms: 1_000,
+        });
+        let active = evaluate_routine_wake_gate(RoutineWakeGateInput {
+            enabled: true,
+            schedule_tick_at_unix_ms: Some(1_000),
+            last_run_status: Some(CronRunStatus::Running),
+            preflight_outcome: Some(RoutinePreflightOutcome::Proceed),
+            provider_cooldown_until_unix_ms: None,
+            channel_healthy: true,
+            policy_allowed: true,
+            now_unix_ms: 1_000,
+        });
+        let allowed = evaluate_routine_wake_gate(RoutineWakeGateInput {
+            enabled: true,
+            schedule_tick_at_unix_ms: Some(1_000),
+            last_run_status: Some(CronRunStatus::Succeeded),
+            preflight_outcome: Some(RoutinePreflightOutcome::Proceed),
+            provider_cooldown_until_unix_ms: None,
+            channel_healthy: true,
+            policy_allowed: true,
+            now_unix_ms: 1_000,
+        });
+
+        assert!(!approval.allowed);
+        assert_eq!(approval.reason, RoutineWakeGateReason::PreflightApprovalRequired);
+        assert!(!active.allowed);
+        assert_eq!(active.reason, RoutineWakeGateReason::LastRunStillActive);
+        assert!(allowed.allowed);
+        assert_eq!(allowed.snapshot_json()["reason"], json!("allowed"));
     }
 }

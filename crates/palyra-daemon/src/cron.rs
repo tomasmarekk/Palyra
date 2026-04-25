@@ -38,7 +38,7 @@ use crate::{
     },
     journal::{
         CronConcurrencyPolicy, CronJobRecord, CronMisfirePolicy, CronRunFinalizeRequest,
-        CronRunStartRequest, CronRunStatus, CronScheduleType, MemoryRetentionPolicy,
+        CronRunRecord, CronRunStartRequest, CronRunStatus, CronScheduleType, MemoryRetentionPolicy,
         OrchestratorCancelRequest, OrchestratorRunStatusSnapshot,
         OrchestratorSessionQuickControlsUpdateRequest, SkillExecutionStatus,
         SkillStatusUpsertRequest,
@@ -48,6 +48,9 @@ use crate::{
 
 const SCHEDULER_IDLE_SLEEP: Duration = Duration::from_secs(15);
 const SCHEDULER_MAX_DUE_BATCH: usize = 64;
+const SCHEDULER_CATCH_UP_MAX_RUNS: usize = 3;
+const SCHEDULER_CATCH_UP_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
+const SCHEDULER_STALE_RUN_AFTER_MS: i64 = 30 * 60 * 1_000;
 const SCHEDULER_DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const DEFAULT_CRON_CHANNEL: &str = "system:cron";
 const MAX_CRON_LOOKAHEAD_MINUTES: i64 = 60 * 24 * 370;
@@ -103,6 +106,35 @@ pub struct DispatchOutcome {
     pub run_id: Option<String>,
     pub status: CronRunStatus,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CronMisfireRecoveryAction {
+    Skip,
+    RunOnce,
+    CatchUpLimited,
+    RequireReview,
+}
+
+impl CronMisfireRecoveryAction {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Skip => "skip",
+            Self::RunOnce => "run_once",
+            Self::CatchUpLimited => "catch_up_limited",
+            Self::RequireReview => "require_review",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CronMisfireRecoveryPlan {
+    pub action: CronMisfireRecoveryAction,
+    pub next_run_at_unix_ms: Option<i64>,
+    pub missed_runs: usize,
+    pub oldest_missed_at_unix_ms: Option<i64>,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -423,29 +455,119 @@ pub fn schedule_to_proto(
     }
 }
 
-pub fn compute_next_run_after(
+#[cfg(test)]
+fn compute_next_run_after(
     job: &CronJobRecord,
     reference_unix_ms: i64,
     now_unix_ms: i64,
 ) -> Result<Option<i64>, Status> {
+    Ok(compute_misfire_recovery_plan(job, reference_unix_ms, now_unix_ms)?.next_run_at_unix_ms)
+}
+
+pub fn compute_misfire_recovery_plan(
+    job: &CronJobRecord,
+    reference_unix_ms: i64,
+    now_unix_ms: i64,
+) -> Result<CronMisfireRecoveryPlan, Status> {
     let parsed = parse_schedule_payload(job.schedule_type, job.schedule_payload_json.as_str())?;
-    let mut next = parsed.next_after(reference_unix_ms);
+    let first_next = parsed.next_after(reference_unix_ms);
+    let Some(first_next_value) = first_next else {
+        return Ok(CronMisfireRecoveryPlan {
+            action: CronMisfireRecoveryAction::Skip,
+            next_run_at_unix_ms: None,
+            missed_runs: 0,
+            oldest_missed_at_unix_ms: None,
+            reason: "schedule_has_no_future_tick".to_owned(),
+        });
+    };
+    if first_next_value > now_unix_ms {
+        return Ok(CronMisfireRecoveryPlan {
+            action: CronMisfireRecoveryAction::Skip,
+            next_run_at_unix_ms: Some(apply_stable_jitter(job, first_next_value)),
+            missed_runs: 0,
+            oldest_missed_at_unix_ms: None,
+            reason: "next_tick_is_in_future".to_owned(),
+        });
+    }
+
+    let (missed_runs, oldest_missed_at_unix_ms, future_after_backlog) =
+        count_missed_schedule_ticks(&parsed, first_next_value, now_unix_ms);
     if job.misfire_policy == CronMisfirePolicy::Skip {
-        while let Some(next_value) = next {
-            if next_value > now_unix_ms {
-                break;
-            }
-            next = parsed.next_after(next_value);
-        }
+        return Ok(CronMisfireRecoveryPlan {
+            action: CronMisfireRecoveryAction::Skip,
+            next_run_at_unix_ms: future_after_backlog.map(|value| apply_stable_jitter(job, value)),
+            missed_runs,
+            oldest_missed_at_unix_ms: Some(oldest_missed_at_unix_ms),
+            reason: "skip_policy_advances_past_missed_ticks".to_owned(),
+        });
     }
-    if let Some(next_value) = next {
-        if job.jitter_ms > 0 {
-            let jitter = deterministic_jitter_ms(job.job_id.as_str(), next_value, job.jitter_ms);
-            return Ok(Some(next_value.saturating_add(jitter as i64)));
-        }
-        return Ok(Some(next_value));
+
+    let outage_age_ms = now_unix_ms.saturating_sub(oldest_missed_at_unix_ms);
+    if missed_runs > SCHEDULER_CATCH_UP_MAX_RUNS && outage_age_ms > SCHEDULER_CATCH_UP_WINDOW_MS {
+        return Ok(CronMisfireRecoveryPlan {
+            action: CronMisfireRecoveryAction::RequireReview,
+            next_run_at_unix_ms: future_after_backlog.map(|value| apply_stable_jitter(job, value)),
+            missed_runs,
+            oldest_missed_at_unix_ms: Some(oldest_missed_at_unix_ms),
+            reason: "catch_up_backlog_exceeds_limit_and_window".to_owned(),
+        });
     }
-    Ok(None)
+    if missed_runs > SCHEDULER_CATCH_UP_MAX_RUNS {
+        return Ok(CronMisfireRecoveryPlan {
+            action: CronMisfireRecoveryAction::RunOnce,
+            next_run_at_unix_ms: future_after_backlog.map(|value| apply_stable_jitter(job, value)),
+            missed_runs,
+            oldest_missed_at_unix_ms: Some(oldest_missed_at_unix_ms),
+            reason: "catch_up_backlog_collapsed_to_single_run".to_owned(),
+        });
+    }
+
+    Ok(CronMisfireRecoveryPlan {
+        action: CronMisfireRecoveryAction::CatchUpLimited,
+        next_run_at_unix_ms: Some(apply_stable_jitter(job, first_next_value)),
+        missed_runs,
+        oldest_missed_at_unix_ms: Some(oldest_missed_at_unix_ms),
+        reason: "catch_up_within_limit".to_owned(),
+    })
+}
+
+fn count_missed_schedule_ticks(
+    parsed: &ParsedSchedule,
+    first_missed_unix_ms: i64,
+    now_unix_ms: i64,
+) -> (usize, i64, Option<i64>) {
+    match parsed {
+        ParsedSchedule::Every { interval_ms } if *interval_ms > 0 => {
+            let elapsed = now_unix_ms.saturating_sub(first_missed_unix_ms);
+            let missed_runs = elapsed.div_euclid(*interval_ms).saturating_add(1) as usize;
+            let next = first_missed_unix_ms
+                .saturating_add((missed_runs as i64).saturating_mul(*interval_ms));
+            return (missed_runs, first_missed_unix_ms, Some(next));
+        }
+        ParsedSchedule::At { .. } => return (1, first_missed_unix_ms, None),
+        _ => {}
+    }
+    let mut missed_runs = 0usize;
+    let mut cursor = Some(first_missed_unix_ms);
+    while let Some(value) = cursor {
+        if value > now_unix_ms {
+            return (missed_runs, first_missed_unix_ms, Some(value));
+        }
+        missed_runs = missed_runs.saturating_add(1);
+        if missed_runs > SCHEDULER_CATCH_UP_MAX_RUNS {
+            return (missed_runs, first_missed_unix_ms, parsed.next_after(now_unix_ms));
+        }
+        cursor = parsed.next_after(value);
+    }
+    (missed_runs, first_missed_unix_ms, None)
+}
+
+fn apply_stable_jitter(job: &CronJobRecord, scheduled_unix_ms: i64) -> i64 {
+    if job.jitter_ms > 0 {
+        let jitter = deterministic_jitter_ms(job.job_id.as_str(), scheduled_unix_ms, job.jitter_ms);
+        return scheduled_unix_ms.saturating_add(jitter as i64);
+    }
+    scheduled_unix_ms
 }
 
 fn parse_schedule_payload(
@@ -874,6 +996,9 @@ pub fn spawn_scheduler_loop(
         let mut next_skill_reaudit_at = Instant::now();
         let mut next_memory_maintenance_at = Instant::now();
         let mut next_memory_embeddings_backfill_at = Instant::now();
+        if let Err(error) = recover_stale_scheduler_runs(Arc::clone(&state)).await {
+            warn!(error = %error, "cron scheduler startup recovery failed");
+        }
         loop {
             if let Err(error) = process_due_jobs(
                 Arc::clone(&state),
@@ -952,6 +1077,52 @@ pub fn spawn_scheduler_loop(
     })
 }
 
+async fn recover_stale_scheduler_runs(state: Arc<GatewayRuntimeState>) -> Result<usize, Status> {
+    let now_unix_ms = now_unix_ms()?;
+    let mut after_run_id = None::<String>;
+    let mut repaired = 0usize;
+    loop {
+        let (runs, next_after_run_id) =
+            state.list_cron_runs(None, after_run_id.clone(), Some(500)).await?;
+        if runs.is_empty() {
+            break;
+        }
+        for run in runs {
+            if !should_repair_stale_cron_run(&run, now_unix_ms) {
+                continue;
+            }
+            let stale_age_ms = now_unix_ms.saturating_sub(run.updated_at_unix_ms);
+            state
+                .finalize_cron_run(CronRunFinalizeRequest {
+                    run_id: run.run_id.clone(),
+                    status: CronRunStatus::Failed,
+                    error_kind: Some("scheduler_startup_recovery".to_owned()),
+                    error_message_redacted: Some(format!(
+                        "stale active cron run repaired after daemon restart; stale_age_ms={stale_age_ms}"
+                    )),
+                    model_tokens_in: run.model_tokens_in,
+                    model_tokens_out: run.model_tokens_out,
+                    tool_calls: run.tool_calls,
+                    tool_denies: run.tool_denies,
+                    orchestrator_run_id: run.orchestrator_run_id.clone(),
+                    session_id: run.session_id.clone(),
+                })
+                .await?;
+            repaired = repaired.saturating_add(1);
+        }
+        let Some(next_after_run_id) = next_after_run_id else {
+            break;
+        };
+        after_run_id = Some(next_after_run_id);
+    }
+    Ok(repaired)
+}
+
+fn should_repair_stale_cron_run(run: &CronRunRecord, now_unix_ms: i64) -> bool {
+    run.status.is_active()
+        && now_unix_ms.saturating_sub(run.updated_at_unix_ms) >= SCHEDULER_STALE_RUN_AFTER_MS
+}
+
 pub async fn trigger_job_now(
     state: Arc<GatewayRuntimeState>,
     auth: GatewayAuthConfig,
@@ -991,11 +1162,22 @@ async fn process_due_jobs(
     let jobs = state.list_due_cron_jobs(now_unix_ms, SCHEDULER_MAX_DUE_BATCH).await?;
     for job in jobs {
         let reference_unix_ms = job.next_run_at_unix_ms.unwrap_or(now_unix_ms);
-        let next_run_at_unix_ms = compute_next_run_after(&job, reference_unix_ms, now_unix_ms)?;
+        let recovery_plan = compute_misfire_recovery_plan(&job, reference_unix_ms, now_unix_ms)?;
+        let next_run_at_unix_ms = recovery_plan.next_run_at_unix_ms;
         state
             .set_cron_job_next_run(job.job_id.clone(), next_run_at_unix_ms, Some(reference_unix_ms))
             .await?;
         state.record_cron_trigger_fired();
+        if recovery_plan.action == CronMisfireRecoveryAction::RequireReview {
+            record_misfire_review_required(
+                Arc::clone(&state),
+                &job,
+                &recovery_plan,
+                reference_unix_ms,
+            )
+            .await?;
+            continue;
+        }
         let _outcome = dispatch_job(
             Arc::clone(&state),
             auth.clone(),
@@ -1010,6 +1192,48 @@ async fn process_due_jobs(
             wake_signal.notify_one();
         }
     }
+    Ok(())
+}
+
+async fn record_misfire_review_required(
+    state: Arc<GatewayRuntimeState>,
+    job: &CronJobRecord,
+    recovery_plan: &CronMisfireRecoveryPlan,
+    reference_unix_ms: i64,
+) -> Result<(), Status> {
+    let run_id = Ulid::new().to_string();
+    let message = format!(
+        "cron misfire requires review: action={}, missed_runs={}, oldest_missed_at={:?}, reference={reference_unix_ms}",
+        recovery_plan.action.as_str(),
+        recovery_plan.missed_runs,
+        recovery_plan.oldest_missed_at_unix_ms
+    );
+    state
+        .start_cron_run(CronRunStartRequest {
+            run_id: run_id.clone(),
+            job_id: job.job_id.clone(),
+            attempt: 1,
+            session_id: None,
+            orchestrator_run_id: None,
+            status: CronRunStatus::Skipped,
+            error_kind: Some("cron_misfire_require_review".to_owned()),
+            error_message_redacted: Some(message.clone()),
+        })
+        .await?;
+    state
+        .finalize_cron_run(CronRunFinalizeRequest {
+            run_id,
+            status: CronRunStatus::Skipped,
+            error_kind: Some("cron_misfire_require_review".to_owned()),
+            error_message_redacted: Some(message),
+            model_tokens_in: 0,
+            model_tokens_out: 0,
+            tool_calls: 0,
+            tool_denies: 0,
+            orchestrator_run_id: None,
+            session_id: None,
+        })
+        .await?;
     Ok(())
 }
 
@@ -1768,14 +1992,17 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        compute_next_run_after, decide_concurrency_policy, load_periodic_reaudit_skills_index,
-        normalize_schedule, now_unix_ms_or_fallback, parse_skill_reaudit_interval,
-        periodic_reaudit_targets, ConcurrencyDecision, CronMatcher, CronTimezoneMode,
-        InstalledSkillRecord, InstalledSkillsIndex, SKILLS_INDEX_FILE_NAME, SKILLS_LAYOUT_VERSION,
+        compute_misfire_recovery_plan, compute_next_run_after, decide_concurrency_policy,
+        load_periodic_reaudit_skills_index, normalize_schedule, now_unix_ms_or_fallback,
+        parse_skill_reaudit_interval, periodic_reaudit_targets, should_repair_stale_cron_run,
+        ConcurrencyDecision, CronMatcher, CronMisfireRecoveryAction, CronTimezoneMode,
+        InstalledSkillRecord, InstalledSkillsIndex, SCHEDULER_STALE_RUN_AFTER_MS,
+        SKILLS_INDEX_FILE_NAME, SKILLS_LAYOUT_VERSION,
     };
     use crate::gateway::proto::palyra::cron::v1 as cron_v1;
     use crate::journal::{
-        CronConcurrencyPolicy, CronJobRecord, CronMisfirePolicy, CronRetryPolicy, CronScheduleType,
+        CronConcurrencyPolicy, CronJobRecord, CronMisfirePolicy, CronRetryPolicy, CronRunRecord,
+        CronRunStatus, CronScheduleType,
     };
     use chrono::TimeZone;
     use serde_json::json;
@@ -2019,7 +2246,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_next_run_after_catchup_policy_keeps_oldest_missed_slot_after_long_outage() {
+    fn compute_next_run_after_catchup_policy_collapses_large_backlog_to_run_once() {
         let job = CronJobRecord {
             job_id: "01ARZ3NDEKTSV4RRFFQ69G5FB3".to_owned(),
             name: "misfire-catchup-long-outage".to_owned(),
@@ -2042,13 +2269,85 @@ mod tests {
             updated_at_unix_ms: 0,
         };
 
+        let plan = compute_misfire_recovery_plan(&job, 0, 600_000)
+            .expect("catch-up policy should compute a recovery plan");
         let next = compute_next_run_after(&job, 0, 600_000)
             .expect("catch-up policy should compute next run");
+        assert_eq!(plan.action, CronMisfireRecoveryAction::RunOnce);
+        assert_eq!(plan.missed_runs, 10);
         assert_eq!(
             next,
-            Some(60_000),
-            "catch-up policy should replay the oldest missed slot first"
+            Some(660_000),
+            "large catch-up backlog should schedule future slot after one audited dispatch"
         );
+    }
+
+    #[test]
+    fn compute_misfire_recovery_requires_review_for_stale_backlog_window() {
+        let job = CronJobRecord {
+            job_id: "01ARZ3NDEKTSV4RRFFQ69G5FB4".to_owned(),
+            name: "misfire-require-review".to_owned(),
+            prompt: "test".to_owned(),
+            owner_principal: "user:ops".to_owned(),
+            channel: "system:cron".to_owned(),
+            session_key: None,
+            session_label: None,
+            schedule_type: CronScheduleType::Every,
+            schedule_payload_json: json!({ "interval_ms": 60_000_i64 }).to_string(),
+            enabled: true,
+            concurrency_policy: CronConcurrencyPolicy::Forbid,
+            retry_policy: CronRetryPolicy { max_attempts: 1, backoff_ms: 1 },
+            misfire_policy: CronMisfirePolicy::CatchUp,
+            jitter_ms: 0,
+            next_run_at_unix_ms: None,
+            last_run_at_unix_ms: None,
+            queued_run: false,
+            created_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+        };
+
+        let plan = compute_misfire_recovery_plan(&job, 0, 3 * 24 * 60 * 60 * 1_000)
+            .expect("catch-up policy should compute a recovery plan");
+
+        assert_eq!(plan.action, CronMisfireRecoveryAction::RequireReview);
+        assert!(plan.missed_runs > 3);
+        assert!(plan.next_run_at_unix_ms.is_some());
+    }
+
+    #[test]
+    fn stale_startup_recovery_repairs_only_active_old_runs() {
+        let stale_active = CronRunRecord {
+            run_id: "run-stale".to_owned(),
+            job_id: "job-1".to_owned(),
+            attempt: 1,
+            session_id: None,
+            orchestrator_run_id: None,
+            started_at_unix_ms: 1_000,
+            finished_at_unix_ms: None,
+            status: CronRunStatus::Running,
+            error_kind: None,
+            error_message_redacted: None,
+            model_tokens_in: 0,
+            model_tokens_out: 0,
+            tool_calls: 0,
+            tool_denies: 0,
+            created_at_unix_ms: 1_000,
+            updated_at_unix_ms: 1_000,
+        };
+        let mut recent_active = stale_active.clone();
+        recent_active.updated_at_unix_ms = SCHEDULER_STALE_RUN_AFTER_MS;
+        let mut stale_finished = stale_active.clone();
+        stale_finished.status = CronRunStatus::Succeeded;
+
+        assert!(should_repair_stale_cron_run(&stale_active, SCHEDULER_STALE_RUN_AFTER_MS + 1_000));
+        assert!(!should_repair_stale_cron_run(
+            &recent_active,
+            SCHEDULER_STALE_RUN_AFTER_MS + 1_000
+        ));
+        assert!(!should_repair_stale_cron_run(
+            &stale_finished,
+            SCHEDULER_STALE_RUN_AFTER_MS + 1_000
+        ));
     }
 
     #[test]
