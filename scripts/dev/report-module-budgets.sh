@@ -6,7 +6,9 @@ cd "${repo_root}"
 
 warn_threshold="${PALYRA_MODULE_BUDGET_WARN:-800}"
 critical_threshold="${PALYRA_MODULE_BUDGET_CRITICAL:-1200}"
+strict_threshold="${PALYRA_MODULE_BUDGET_STRICT:-${critical_threshold}}"
 entrypoint_threshold="${PALYRA_MODULE_BUDGET_ENTRYPOINT:-200}"
+entrypoint_strict_threshold="${PALYRA_MODULE_BUDGET_ENTRYPOINT_STRICT:-500}"
 allowlist_file="${PALYRA_MODULE_BUDGET_ALLOWLIST:-scripts/dev/module-budget-allowlist.txt}"
 strict_mode=false
 
@@ -28,8 +30,12 @@ declare -a critical_files=()
 declare -a large_entrypoints=()
 declare -a touched_budget_regressions=()
 declare -a allowlisted_touched_budget_regressions=()
+declare -a strict_budget_regressions=()
+declare -a allowlisted_strict_budget_regressions=()
 declare -a touched_entrypoint_regressions=()
 declare -a allowlisted_touched_entrypoint_regressions=()
+declare -a strict_entrypoint_regressions=()
+declare -a allowlisted_strict_entrypoint_regressions=()
 declare -a new_oversized_files=()
 declare -A discord_counts=(
   ["apps"]=0
@@ -197,6 +203,15 @@ while IFS= read -r path; do
     fi
   fi
 
+  if (( delta > 0 && current_lines >= strict_threshold )); then
+    regression_row="$(format_regression_row "${delta}" "${previous_lines}" "${current_lines}" "${path}")"
+    if is_allowlisted "${path}"; then
+      allowlisted_strict_budget_regressions+=("${regression_row}")
+    else
+      strict_budget_regressions+=("${regression_row}")
+    fi
+  fi
+
   case "${path}" in
     */main.rs|*/lib.rs)
       if (( delta > 0 && current_lines >= entrypoint_threshold )); then
@@ -207,6 +222,14 @@ while IFS= read -r path; do
           touched_entrypoint_regressions+=("${regression_row}")
         fi
       fi
+      if (( delta > 0 && current_lines >= entrypoint_strict_threshold )); then
+        regression_row="$(format_regression_row "${delta}" "${previous_lines}" "${current_lines}" "${path}")"
+        if is_allowlisted "${path}"; then
+          allowlisted_strict_entrypoint_regressions+=("${regression_row}")
+        else
+          strict_entrypoint_regressions+=("${regression_row}")
+        fi
+      fi
       ;;
   esac
 done < <(touched_source_files "${diff_base}")
@@ -215,7 +238,9 @@ echo "Palyra module budget report"
 echo "repo=${repo_root}"
 echo "warn_threshold=${warn_threshold}"
 echo "critical_threshold=${critical_threshold}"
+echo "strict_threshold=${strict_threshold}"
 echo "entrypoint_threshold=${entrypoint_threshold}"
+echo "entrypoint_strict_threshold=${entrypoint_strict_threshold}"
 echo "allowlist_file=${allowlist_file}"
 echo "diff_base=${diff_base:-none}"
 echo
@@ -244,7 +269,7 @@ else
 fi
 echo
 
-echo "Touched files that grew while already over budget (not allowlisted):"
+echo "Touched files that grew at or above warning threshold (not allowlisted, report-only):"
 if (( ${#touched_budget_regressions[@]} == 0 )); then
   echo "  none"
 else
@@ -252,7 +277,7 @@ else
 fi
 echo
 
-echo "Allowlisted touched files that grew while already over budget:"
+echo "Allowlisted touched files that grew at or above warning threshold:"
 if (( ${#allowlisted_touched_budget_regressions[@]} == 0 )); then
   echo "  none"
 else
@@ -260,7 +285,23 @@ else
 fi
 echo
 
-echo "Touched entrypoints that grew while already over budget (not allowlisted):"
+echo "Touched files that grew at or above strict threshold (not allowlisted):"
+if (( ${#strict_budget_regressions[@]} == 0 )); then
+  echo "  none"
+else
+  printf '%s\n' "${strict_budget_regressions[@]}" | sort -nr | sed 's/^/  /'
+fi
+echo
+
+echo "Allowlisted touched files that grew at or above strict threshold:"
+if (( ${#allowlisted_strict_budget_regressions[@]} == 0 )); then
+  echo "  none"
+else
+  printf '%s\n' "${allowlisted_strict_budget_regressions[@]}" | sort -nr | sed 's/^/  /'
+fi
+echo
+
+echo "Touched entrypoints that grew at or above warning threshold (not allowlisted, report-only):"
 if (( ${#touched_entrypoint_regressions[@]} == 0 )); then
   echo "  none"
 else
@@ -268,11 +309,27 @@ else
 fi
 echo
 
-echo "Allowlisted touched entrypoints that grew while already over budget:"
+echo "Allowlisted touched entrypoints that grew at or above warning threshold:"
 if (( ${#allowlisted_touched_entrypoint_regressions[@]} == 0 )); then
   echo "  none"
 else
   printf '%s\n' "${allowlisted_touched_entrypoint_regressions[@]}" | sort -nr | sed 's/^/  /'
+fi
+echo
+
+echo "Touched entrypoints that grew at or above strict threshold (not allowlisted):"
+if (( ${#strict_entrypoint_regressions[@]} == 0 )); then
+  echo "  none"
+else
+  printf '%s\n' "${strict_entrypoint_regressions[@]}" | sort -nr | sed 's/^/  /'
+fi
+echo
+
+echo "Allowlisted touched entrypoints that grew at or above strict threshold:"
+if (( ${#allowlisted_strict_entrypoint_regressions[@]} == 0 )); then
+  echo "  none"
+else
+  printf '%s\n' "${allowlisted_strict_entrypoint_regressions[@]}" | sort -nr | sed 's/^/  /'
 fi
 echo
 
@@ -293,13 +350,13 @@ echo
 if ${strict_mode}; then
   strict_failed=false
 
-  if (( ${#touched_budget_regressions[@]} > 0 )); then
-    echo "strict mode: one or more touched files grew while already over budget" >&2
+  if (( ${#strict_budget_regressions[@]} > 0 )); then
+    echo "strict mode: one or more touched files grew at or above strict threshold" >&2
     strict_failed=true
   fi
 
-  if (( ${#touched_entrypoint_regressions[@]} > 0 )); then
-    echo "strict mode: one or more touched entrypoints grew while already over budget" >&2
+  if (( ${#strict_entrypoint_regressions[@]} > 0 )); then
+    echo "strict mode: one or more touched entrypoints grew at or above strict threshold" >&2
     strict_failed=true
   fi
 
