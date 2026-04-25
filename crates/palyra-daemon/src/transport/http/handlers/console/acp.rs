@@ -32,81 +32,21 @@ use crate::{
 
 use crate::*;
 
+mod bindings;
+mod status;
+
+pub(crate) use bindings::{
+    console_binding_detach_handler, console_binding_explain_handler, console_binding_get_handler,
+    console_binding_upsert_handler, console_bindings_list_handler,
+    console_bindings_repair_apply_handler, console_bindings_repair_plan_handler,
+};
+pub(crate) use status::console_acp_status_handler;
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AcpHttpCommandRequest {
     pub(crate) client: AcpClientContext,
     pub(crate) command: AcpCommandEnvelope,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct BindingListQuery {
-    owner_principal: Option<String>,
-    connector_kind: Option<String>,
-    external_identity: Option<String>,
-    palyra_session_id: Option<String>,
-    include_detached: Option<bool>,
-    limit: Option<usize>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ConversationBindingUpsertRequest {
-    connector_kind: String,
-    external_identity: String,
-    external_conversation_id: String,
-    palyra_session_id: String,
-    device_id: Option<String>,
-    channel: Option<String>,
-    scopes: Option<Vec<String>>,
-    sensitivity: Option<String>,
-    cursor_sequence: Option<u64>,
-    last_event_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct BindingRepairApplyRequest {
-    apply: bool,
-}
-
-fn is_admin_principal(request_context: &RequestContext) -> bool {
-    request_context.principal.starts_with("admin:")
-}
-
-fn ensure_rest_binding_owner(
-    request_context: &RequestContext,
-    owner_principal: &str,
-) -> Result<(), tonic::Status> {
-    if request_context.principal == owner_principal || is_admin_principal(request_context) {
-        return Ok(());
-    }
-    Err(tonic::Status::permission_denied("binding belongs to a different principal"))
-}
-
-fn ensure_admin_binding_operation(request_context: &RequestContext) -> Result<(), tonic::Status> {
-    if is_admin_principal(request_context) {
-        return Ok(());
-    }
-    Err(tonic::Status::permission_denied("binding repair operations require an admin principal"))
-}
-
-pub(crate) async fn console_acp_status_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, Response> {
-    let _session = authorize_console_session(&state, &headers, false)?;
-    let snapshot = state.acp_runtime.snapshot().map_err(acp_runtime_response)?;
-    Ok(Json(json!({
-        "protocol": state.acp_runtime.protocol_range(),
-        "root": state.acp_runtime.root().display().to_string(),
-        "counts": {
-            "session_bindings": snapshot.session_bindings.len(),
-            "conversation_bindings": snapshot.conversation_bindings.len(),
-            "pending_prompts": snapshot.pending_prompts.len(),
-        },
-        "methods": acp_method_descriptors(),
-    })))
 }
 
 pub(crate) async fn console_acp_command_handler(
@@ -118,159 +58,6 @@ pub(crate) async fn console_acp_command_handler(
     let result =
         dispatch_acp_command(&state, &session.context, request.client, request.command).await;
     Ok(Json(json!(result)))
-}
-
-pub(crate) async fn console_bindings_list_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<BindingListQuery>,
-) -> Result<Json<Value>, Response> {
-    let session = authorize_console_session(&state, &headers, false)?;
-    let owner_principal = query.owner_principal.or_else(|| Some(session.context.principal.clone()));
-    if let Some(owner_principal) = owner_principal.as_deref() {
-        ensure_rest_binding_owner(&session.context, owner_principal)
-            .map_err(runtime_status_response)?;
-    }
-    let conversation_bindings = state
-        .acp_runtime
-        .list_conversation_bindings(ConversationBindingFilter {
-            owner_principal,
-            connector_kind: query.connector_kind,
-            external_identity: query.external_identity,
-            palyra_session_id: query.palyra_session_id,
-            include_detached: query.include_detached.unwrap_or(false),
-            limit: query.limit,
-        })
-        .map_err(acp_runtime_response)?;
-    let session_bindings = state
-        .acp_runtime
-        .list_session_bindings(Some(session.context.principal.as_str()))
-        .map_err(acp_runtime_response)?;
-    Ok(Json(json!({
-        "conversation_bindings": conversation_bindings,
-        "session_bindings": session_bindings,
-    })))
-}
-
-pub(crate) async fn console_binding_upsert_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(payload): Json<ConversationBindingUpsertRequest>,
-) -> Result<Json<Value>, Response> {
-    let session = authorize_console_session(&state, &headers, true)?;
-    let binding = state
-        .acp_runtime
-        .upsert_conversation_binding(conversation_upsert_from_http_payload(
-            &session.context,
-            payload,
-        ))
-        .map_err(acp_runtime_response)?;
-    let _ = state
-        .runtime
-        .record_console_event(
-            &session.context,
-            "acp.binding.upsert",
-            json!({
-                "binding_id": binding.binding_id,
-                "connector_kind": binding.connector_kind,
-                "palyra_session_id": binding.palyra_session_id,
-                "conflict_state": binding.conflict_state.as_str(),
-            }),
-        )
-        .await;
-    Ok(Json(json!({ "binding": binding })))
-}
-
-pub(crate) async fn console_binding_get_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(binding_id): Path<String>,
-) -> Result<Json<Value>, Response> {
-    let session = authorize_console_session(&state, &headers, false)?;
-    if let Ok(binding) = state.acp_runtime.get_conversation_binding(binding_id.as_str()) {
-        ensure_rest_binding_owner(&session.context, binding.owner_principal.as_str())
-            .map_err(runtime_status_response)?;
-        return Ok(Json(json!({ "binding": binding })));
-    }
-    let snapshot =
-        state.acp_runtime.explain_binding(binding_id.as_str()).map_err(acp_runtime_response)?;
-    ensure_rest_binding_owner(&session.context, snapshot.owner_principal.as_str())
-        .map_err(runtime_status_response)?;
-    Ok(Json(json!({ "binding": snapshot })))
-}
-
-pub(crate) async fn console_binding_detach_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(binding_id): Path<String>,
-) -> Result<Json<Value>, Response> {
-    let session = authorize_console_session(&state, &headers, true)?;
-    let before =
-        state.acp_runtime.explain_binding(binding_id.as_str()).map_err(acp_runtime_response)?;
-    ensure_rest_binding_owner(&session.context, before.owner_principal.as_str())
-        .map_err(runtime_status_response)?;
-    let detached = state
-        .acp_runtime
-        .detach_conversation_binding(binding_id.as_str())
-        .map_err(acp_runtime_response)?;
-    let _ = state
-        .runtime
-        .record_console_event(
-            &session.context,
-            "acp.binding.detach",
-            json!({ "binding_id": binding_id, "palyra_session_id": detached.palyra_session_id }),
-        )
-        .await;
-    Ok(Json(json!({ "binding": detached })))
-}
-
-pub(crate) async fn console_bindings_repair_plan_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, Response> {
-    let session = authorize_console_session(&state, &headers, false)?;
-    ensure_admin_binding_operation(&session.context).map_err(runtime_status_response)?;
-    let plan =
-        state.acp_runtime.plan_conversation_binding_repair().map_err(acp_runtime_response)?;
-    Ok(Json(json!({ "plan": plan })))
-}
-
-pub(crate) async fn console_bindings_repair_apply_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(payload): Json<BindingRepairApplyRequest>,
-) -> Result<Json<Value>, Response> {
-    let session = authorize_console_session(&state, &headers, true)?;
-    ensure_admin_binding_operation(&session.context).map_err(runtime_status_response)?;
-    if !payload.apply {
-        let plan =
-            state.acp_runtime.plan_conversation_binding_repair().map_err(acp_runtime_response)?;
-        return Ok(Json(json!({ "plan": plan, "applied": false })));
-    }
-    let plan =
-        state.acp_runtime.apply_conversation_binding_repair().map_err(acp_runtime_response)?;
-    let _ = state
-        .runtime
-        .record_console_event(
-            &session.context,
-            "acp.binding.repair.apply",
-            json!({ "action_count": plan.actions.len() }),
-        )
-        .await;
-    Ok(Json(json!({ "plan": plan, "applied": true })))
-}
-
-pub(crate) async fn console_binding_explain_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(binding_id): Path<String>,
-) -> Result<Json<Value>, Response> {
-    let session = authorize_console_session(&state, &headers, false)?;
-    let snapshot =
-        state.acp_runtime.explain_binding(binding_id.as_str()).map_err(acp_runtime_response)?;
-    ensure_rest_binding_owner(&session.context, snapshot.owner_principal.as_str())
-        .map_err(runtime_status_response)?;
-    Ok(Json(json!({ "explain": snapshot })))
 }
 
 async fn dispatch_acp_command(
@@ -1301,25 +1088,6 @@ fn parse_risk_level(raw: Option<&str>) -> ApprovalRiskLevel {
     }
 }
 
-fn conversation_upsert_from_http_payload(
-    request_context: &RequestContext,
-    payload: ConversationBindingUpsertRequest,
-) -> ConversationBindingUpsert {
-    ConversationBindingUpsert {
-        connector_kind: payload.connector_kind,
-        external_identity: payload.external_identity,
-        external_conversation_id: payload.external_conversation_id,
-        palyra_session_id: payload.palyra_session_id,
-        owner_principal: request_context.principal.clone(),
-        device_id: payload.device_id.unwrap_or_else(|| request_context.device_id.clone()),
-        channel: payload.channel.or_else(|| request_context.channel.clone()),
-        scopes: payload.scopes.unwrap_or_else(|| vec!["sessions:read".to_owned()]),
-        sensitivity: parse_binding_sensitivity(payload.sensitivity.as_deref()),
-        delivery_cursor: AcpCursor { sequence: payload.cursor_sequence.unwrap_or(0) },
-        last_event_id: payload.last_event_id,
-    }
-}
-
 fn conversation_upsert_from_command(
     request_context: &RequestContext,
     params: &Value,
@@ -1356,61 +1124,7 @@ fn parse_binding_sensitivity(raw: Option<&str>) -> ConversationBindingSensitivit
     }
 }
 
-fn acp_method_descriptors() -> Vec<Value> {
-    [
-        (AcpCommand::SessionList, AcpScope::SessionsRead, AcpCapability::SessionList, false),
-        (AcpCommand::SessionLoad, AcpScope::SessionsRead, AcpCapability::SessionLoad, false),
-        (AcpCommand::SessionNew, AcpScope::SessionsWrite, AcpCapability::SessionNew, true),
-        (AcpCommand::SessionReplay, AcpScope::SessionsRead, AcpCapability::SessionReplay, false),
-        (AcpCommand::SessionFork, AcpScope::SessionsWrite, AcpCapability::SessionFork, true),
-        (
-            AcpCommand::SessionCompactPreview,
-            AcpScope::SessionsRead,
-            AcpCapability::SessionCompact,
-            false,
-        ),
-        (
-            AcpCommand::SessionCompactApply,
-            AcpScope::SessionsWrite,
-            AcpCapability::SessionCompact,
-            true,
-        ),
-        (AcpCommand::SessionExplain, AcpScope::SessionsRead, AcpCapability::SessionExplain, false),
-        (AcpCommand::ApprovalDecide, AcpScope::ApprovalsWrite, AcpCapability::ApprovalBridge, true),
-        (
-            AcpCommand::BindingList,
-            AcpScope::BindingsRead,
-            AcpCapability::ConversationBindings,
-            false,
-        ),
-        (
-            AcpCommand::BindingUpsert,
-            AcpScope::BindingsWrite,
-            AcpCapability::ConversationBindings,
-            true,
-        ),
-        (
-            AcpCommand::BindingRepairApply,
-            AcpScope::BindingsWrite,
-            AcpCapability::BindingRepair,
-            true,
-        ),
-    ]
-    .into_iter()
-    .map(|(command, scope, capability, side_effecting)| {
-        json!({
-            "command": command.as_str(),
-            "version": 1,
-            "required_scopes": [scope.as_str()],
-            "required_capabilities": [capability.as_str()],
-            "side_effecting": side_effecting,
-            "rate_limit_bucket": "acp.command",
-        })
-    })
-    .collect()
-}
-
-fn acp_runtime_response(error: AcpRuntimeError) -> Response {
+pub(super) fn acp_runtime_response(error: AcpRuntimeError) -> Response {
     let message = error.to_string();
     let status = match error {
         AcpRuntimeError::NotFound { .. } => tonic::Status::not_found(message.clone()),
