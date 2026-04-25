@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     fs,
+    io::Write,
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -19,6 +20,7 @@ use palyra_common::{
 use palyra_vault::{ensure_owner_only_dir, ensure_owner_only_file};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tempfile::Builder as TempFileBuilder;
 use thiserror::Error;
 use ulid::Ulid;
 use validation::{normalize_scope_strings, normalize_state_root};
@@ -847,33 +849,78 @@ fn save_locked_index(root: &Path, index: &mut AcpBindingsIndex) -> AcpRuntimeRes
 
 fn save_index(root: &Path, index: &AcpBindingsIndex) -> AcpRuntimeResult<()> {
     create_state_dir(root)?;
+    let root = fs::canonicalize(root).map_err(|source| AcpRuntimeError::Io {
+        operation: "canonicalize",
+        path: root.to_path_buf(),
+        source,
+    })?;
+    let path = acp_bindings_index_path(root.as_path())?;
     let mut normalized = index.clone();
     normalized.schema_version = ACP_BINDINGS_LAYOUT_VERSION;
     normalized.updated_at_unix_ms = unix_ms_now().map_err(|error| {
         AcpRuntimeError::InvalidField { field: "system_time", message: error.to_string() }
     })?;
     normalize_loaded_index(&mut normalized)?;
-    let payload = serde_json::to_vec_pretty(&normalized).map_err(|source| {
-        AcpRuntimeError::Json { path: root.join(ACP_BINDINGS_INDEX_FILE_NAME), source }
-    })?;
-    let path = root.join(ACP_BINDINGS_INDEX_FILE_NAME);
-    write_atomically(path.as_path(), payload.as_slice())?;
+    let payload = serde_json::to_vec_pretty(&normalized)
+        .map_err(|source| AcpRuntimeError::Json { path: path.clone(), source })?;
+    write_atomically(root.as_path(), path.as_path(), payload.as_slice())?;
     ensure_owner_only_file(path.as_path())
         .map_err(|source| AcpRuntimeError::PermissionHarden { path, message: source.to_string() })
 }
 
-fn write_atomically(path: &Path, payload: &[u8]) -> AcpRuntimeResult<()> {
-    let temporary_path = path.with_extension(format!("json.tmp.{}", Ulid::new()));
-    fs::write(temporary_path.as_path(), payload).map_err(|source| AcpRuntimeError::Io {
-        operation: "write",
-        path: temporary_path.clone(),
-        source,
-    })?;
-    if let Err(source) = fs::rename(temporary_path.as_path(), path) {
-        let _ = fs::remove_file(temporary_path.as_path());
-        return Err(AcpRuntimeError::Io { operation: "rename", path: path.to_path_buf(), source });
+fn acp_bindings_index_path(root: &Path) -> AcpRuntimeResult<PathBuf> {
+    let path = root.join(ACP_BINDINGS_INDEX_FILE_NAME);
+    validate_acp_state_child_path(root, path.as_path(), "bindings index")?;
+    Ok(path)
+}
+
+fn validate_acp_state_child_path(
+    root: &Path,
+    path: &Path,
+    label: &'static str,
+) -> AcpRuntimeResult<()> {
+    if !path.starts_with(root) {
+        return Err(AcpRuntimeError::InvalidField {
+            field: "state_path",
+            message: format!("{label} path escapes the ACP state root"),
+        });
+    }
+    if path.components().any(|component| {
+        matches!(component, std::path::Component::ParentDir | std::path::Component::CurDir)
+    }) {
+        return Err(AcpRuntimeError::InvalidField {
+            field: "state_path",
+            message: format!("{label} path cannot contain relative traversal components"),
+        });
     }
     Ok(())
+}
+
+fn write_atomically(root: &Path, path: &Path, payload: &[u8]) -> AcpRuntimeResult<()> {
+    validate_acp_state_child_path(root, path, "bindings index")?;
+    let mut temporary_file =
+        TempFileBuilder::new().prefix("bindings.").suffix(".json.tmp").tempfile_in(root).map_err(
+            |source| AcpRuntimeError::Io {
+                operation: "create_temporary",
+                path: root.to_path_buf(),
+                source,
+            },
+        )?;
+    temporary_file.write_all(payload).map_err(|source| AcpRuntimeError::Io {
+        operation: "write",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    temporary_file.as_file_mut().sync_all().map_err(|source| AcpRuntimeError::Io {
+        operation: "sync",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    temporary_file.persist(path).map(|_| ()).map_err(|source| AcpRuntimeError::Io {
+        operation: "persist",
+        path: path.to_path_buf(),
+        source: source.error,
+    })
 }
 
 fn normalize_loaded_index(index: &mut AcpBindingsIndex) -> AcpRuntimeResult<()> {
