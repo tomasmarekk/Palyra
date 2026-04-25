@@ -7426,6 +7426,36 @@ impl JournalStore {
         Ok(())
     }
 
+    pub fn prioritize_orchestrator_queued_input(
+        &self,
+        queued_input_id: &str,
+        priority_lane: &str,
+        decision_reason: &str,
+        explain_json: &str,
+    ) -> Result<(), JournalError> {
+        let now = current_unix_ms()?;
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let rows = guard.execute(
+            r#"
+                UPDATE orchestrator_queued_inputs
+                SET
+                    priority_lane = ?2,
+                    decision_reason = ?3,
+                    explain_json = ?4,
+                    updated_at_unix_ms = ?5
+                WHERE queued_input_ulid = ?1
+                  AND state = 'pending'
+            "#,
+            params![queued_input_id, priority_lane, decision_reason, explain_json, now],
+        )?;
+        if rows == 0 {
+            return Err(JournalError::InvalidArgument(format!(
+                "pending queued input not found: {queued_input_id}"
+            )));
+        }
+        Ok(())
+    }
+
     pub fn get_orchestrator_session_queue_control(
         &self,
         session_id: &str,

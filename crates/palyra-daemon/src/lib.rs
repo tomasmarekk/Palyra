@@ -1500,6 +1500,8 @@ struct ConsoleChatQueueRequest {
 struct ConsoleChatQueueControlRequest {
     #[serde(default)]
     reason: Option<String>,
+    #[serde(default)]
+    priority_lane: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

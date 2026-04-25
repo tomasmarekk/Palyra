@@ -997,6 +997,7 @@ runtime_contract_enum! {
         Steered => "steered",
         Interrupted => "interrupted",
         Overflowed => "overflowed" | "overflow",
+        Rejected => "rejected" | "reject",
         Cancelled => "cancelled" | "canceled"
     }
 }

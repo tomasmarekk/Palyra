@@ -3,8 +3,8 @@ use crate::{
         apply_session_compaction, preview_session_compaction, SessionCompactionApplyRequest,
     },
     application::session_queue::{
-        build_queue_collect_summary, decide_session_queue_mode, pending_queue_depth,
-        SessionQueuePolicy, SessionQueueSafeBoundary,
+        analyze_session_queue, build_queue_collect_summary, decide_session_queue_mode,
+        pending_queue_depth, SessionQueuePolicy, SessionQueueSafeBoundary,
     },
     *,
 };
@@ -2927,7 +2927,7 @@ pub(crate) async fn console_chat_queue_pause_handler(
             journal::OrchestratorSessionQueueControlUpdateRequest {
                 session_id: session_record.session_id.clone(),
                 paused: true,
-                pause_reason: Some(reason),
+                pause_reason: Some(reason.clone()),
             },
         )
         .await
@@ -2937,6 +2937,25 @@ pub(crate) async fn console_chat_queue_pause_handler(
         &session.context,
         session_record.session_id.as_str(),
         false,
+    )
+    .await?;
+    let pending_depth = pending_queue_depth(
+        snapshot.queued_inputs.as_slice(),
+        Some(snapshot.policy.coalescing_group.as_str()),
+    );
+    record_session_queue_operator_event(
+        &state,
+        &session.context,
+        session_record.session_id.as_str(),
+        snapshot.active_run_id.as_deref(),
+        "pause",
+        reason.as_str(),
+        None,
+        pending_depth,
+        json!({
+            "paused": control.paused,
+            "pause_reason": control.pause_reason,
+        }),
     )
     .await?;
     Ok(Json(json!({
@@ -2959,6 +2978,7 @@ pub(crate) async fn console_chat_queue_resume_handler(
     )?;
     let session_record =
         load_console_chat_session(&state, &session.context, session_id.as_str(), true).await?;
+    let reason = "operator_resumed_queue";
     let control = state
         .runtime
         .upsert_orchestrator_session_queue_control(
@@ -2975,6 +2995,24 @@ pub(crate) async fn console_chat_queue_resume_handler(
         &session.context,
         session_record.session_id.as_str(),
         false,
+    )
+    .await?;
+    let pending_depth = pending_queue_depth(
+        snapshot.queued_inputs.as_slice(),
+        Some(snapshot.policy.coalescing_group.as_str()),
+    );
+    record_session_queue_operator_event(
+        &state,
+        &session.context,
+        session_record.session_id.as_str(),
+        snapshot.active_run_id.as_deref(),
+        "resume",
+        reason,
+        None,
+        pending_depth,
+        json!({
+            "paused": control.paused,
+        }),
     )
     .await?;
     Ok(Json(json!({
@@ -3028,6 +3066,20 @@ pub(crate) async fn console_chat_queue_drain_handler(
     let refreshed =
         load_console_session_queue_snapshot(&state, &session.context, session_id.as_str(), false)
             .await?;
+    record_session_queue_operator_event(
+        &state,
+        &session.context,
+        session_id.as_str(),
+        snapshot.active_run_id.as_deref(),
+        "drain",
+        reason.as_str(),
+        None,
+        0,
+        json!({
+            "drained_count": pending_inputs.len(),
+        }),
+    )
+    .await?;
     Ok(Json(json!({
         "action": "drain",
         "drained_count": pending_inputs.len(),
@@ -3091,12 +3143,189 @@ pub(crate) async fn console_chat_queue_cancel_handler(
         })
         .await
         .map_err(runtime_status_response)?;
+    let remaining_depth = snapshot.pending_inputs().len().saturating_sub(1);
+    record_session_queue_operator_event(
+        &state,
+        &session.context,
+        session_id.as_str(),
+        snapshot.active_run_id.as_deref(),
+        "cancel",
+        reason.as_str(),
+        Some(queued_input_id.as_str()),
+        remaining_depth,
+        json!({
+            "queued_input_state": QueuedInputState::Cancelled.as_str(),
+        }),
+    )
+    .await?;
     let refreshed =
         load_console_session_queue_snapshot(&state, &session.context, session_id.as_str(), false)
             .await?;
     Ok(Json(json!({
         "action": "cancel",
         "queued_input_id": queued_input_id,
+        "queue": session_queue_snapshot_json(refreshed),
+        "contract": contract_descriptor(),
+    })))
+}
+
+pub(crate) async fn console_chat_queue_reject_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((session_id, queued_input_id)): Path<(String, String)>,
+    Json(payload): Json<ConsoleChatQueueControlRequest>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    ensure_console_runtime_preview_capability(
+        &state,
+        RuntimePreviewCapability::SessionQueuePolicy,
+    )?;
+    validate_canonical_id(queued_input_id.as_str()).map_err(|_| {
+        runtime_status_response(tonic::Status::invalid_argument(
+            "queued_input_id must be a canonical ULID",
+        ))
+    })?;
+    let snapshot =
+        load_console_session_queue_snapshot(&state, &session.context, session_id.as_str(), true)
+            .await?;
+    let queued = snapshot
+        .queued_inputs
+        .iter()
+        .find(|queued| queued.queued_input_id == queued_input_id)
+        .ok_or_else(|| {
+            runtime_status_response(tonic::Status::not_found(format!(
+                "queued input not found: {queued_input_id}"
+            )))
+        })?;
+    if queued.state != QueuedInputState::Pending.as_str() {
+        return Err(runtime_status_response(tonic::Status::failed_precondition(
+            "only pending queued inputs can be rejected",
+        )));
+    }
+    let reason = payload
+        .reason
+        .and_then(trim_to_option)
+        .unwrap_or_else(|| "queued_input_rejected_by_operator".to_owned());
+    state
+        .runtime
+        .update_orchestrator_queued_input_state(journal::OrchestratorQueuedInputUpdateRequest {
+            queued_input_id: queued_input_id.clone(),
+            state: QueuedInputState::Rejected.as_str().to_owned(),
+            overflow_summary_ref: None,
+            decision_reason: Some(reason.clone()),
+            explain_json: Some(
+                json!({
+                    "decision": "reject",
+                    "reason": reason.as_str(),
+                    "queue_mode": queued.queue_mode.as_str(),
+                })
+                .to_string(),
+            ),
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    let remaining_depth = snapshot.pending_inputs().len().saturating_sub(1);
+    record_session_queue_operator_event(
+        &state,
+        &session.context,
+        session_id.as_str(),
+        snapshot.active_run_id.as_deref(),
+        "reject",
+        reason.as_str(),
+        Some(queued_input_id.as_str()),
+        remaining_depth,
+        json!({
+            "queued_input_state": QueuedInputState::Rejected.as_str(),
+        }),
+    )
+    .await?;
+    let refreshed =
+        load_console_session_queue_snapshot(&state, &session.context, session_id.as_str(), false)
+            .await?;
+    Ok(Json(json!({
+        "action": "reject",
+        "queued_input_id": queued_input_id,
+        "queue": session_queue_snapshot_json(refreshed),
+        "contract": contract_descriptor(),
+    })))
+}
+
+pub(crate) async fn console_chat_queue_prioritize_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((session_id, queued_input_id)): Path<(String, String)>,
+    Json(payload): Json<ConsoleChatQueueControlRequest>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    ensure_console_runtime_preview_capability(
+        &state,
+        RuntimePreviewCapability::SessionQueuePolicy,
+    )?;
+    validate_canonical_id(queued_input_id.as_str()).map_err(|_| {
+        runtime_status_response(tonic::Status::invalid_argument(
+            "queued_input_id must be a canonical ULID",
+        ))
+    })?;
+    let priority_lane = normalize_priority_lane(payload.priority_lane)?;
+    let reason = payload
+        .reason
+        .and_then(trim_to_option)
+        .unwrap_or_else(|| "queued_input_prioritized_by_operator".to_owned());
+    let snapshot =
+        load_console_session_queue_snapshot(&state, &session.context, session_id.as_str(), true)
+            .await?;
+    let queued = snapshot
+        .queued_inputs
+        .iter()
+        .find(|queued| queued.queued_input_id == queued_input_id)
+        .ok_or_else(|| {
+            runtime_status_response(tonic::Status::not_found(format!(
+                "queued input not found: {queued_input_id}"
+            )))
+        })?;
+    if queued.state != QueuedInputState::Pending.as_str() {
+        return Err(runtime_status_response(tonic::Status::failed_precondition(
+            "only pending queued inputs can be prioritized",
+        )));
+    }
+    let explain_json = json!({
+        "decision": "prioritize",
+        "reason": reason.as_str(),
+        "previous_priority_lane": queued.priority_lane.as_str(),
+        "priority_lane": priority_lane.as_str(),
+        "queue_mode": queued.queue_mode.as_str(),
+    });
+    state
+        .runtime
+        .prioritize_orchestrator_queued_input(
+            queued_input_id.clone(),
+            priority_lane.clone(),
+            reason.clone(),
+            explain_json.to_string(),
+        )
+        .await
+        .map_err(runtime_status_response)?;
+    record_session_queue_operator_event(
+        &state,
+        &session.context,
+        session_id.as_str(),
+        snapshot.active_run_id.as_deref(),
+        "prioritize",
+        reason.as_str(),
+        Some(queued_input_id.as_str()),
+        snapshot.pending_inputs().len(),
+        json!({
+            "priority_lane": priority_lane.as_str(),
+        }),
+    )
+    .await?;
+    let refreshed =
+        load_console_session_queue_snapshot(&state, &session.context, session_id.as_str(), false)
+            .await?;
+    Ok(Json(json!({
+        "action": "prioritize",
+        "queued_input_id": queued_input_id,
+        "priority_lane": priority_lane,
         "queue": session_queue_snapshot_json(refreshed),
         "contract": contract_descriptor(),
     })))
@@ -3187,6 +3416,24 @@ pub(crate) async fn console_chat_queue_collect_summary_handler(
     let refreshed =
         load_console_session_queue_snapshot(&state, &session.context, session_id.as_str(), false)
             .await?;
+    record_session_queue_operator_event(
+        &state,
+        &session.context,
+        session_id.as_str(),
+        snapshot.active_run_id.as_deref(),
+        "collect_summary",
+        reason.as_str(),
+        Some(summary_input.queued_input_id.as_str()),
+        pending_queue_depth(
+            refreshed.queued_inputs.as_slice(),
+            Some(refreshed.policy.coalescing_group.as_str()),
+        ),
+        json!({
+            "summary_ref": summary_ref,
+            "merged_count": pending_inputs.len(),
+        }),
+    )
+    .await?;
     Ok(Json(json!({
         "action": "collect_summary",
         "queued_input": summary_input,
@@ -4051,16 +4298,85 @@ fn default_session_queue_control(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn record_session_queue_operator_event(
+    state: &AppState,
+    context: &gateway::RequestContext,
+    session_id: &str,
+    run_id: Option<&str>,
+    action: &str,
+    reason: &str,
+    queued_input_id: Option<&str>,
+    queue_depth: usize,
+    details: Value,
+) -> Result<(), Response> {
+    let mut payload = RuntimeDecisionPayload::new(
+        RuntimeDecisionEventType::QueueControl,
+        state
+            .runtime
+            .runtime_decision_actor_from_context(context, RuntimeDecisionActorKind::Operator),
+        reason,
+        "session_queue.operator_control.v1",
+        RuntimeDecisionTiming::observed(crate::gateway::current_unix_ms()),
+    )
+    .with_input(RuntimeEntityRef::new("session", "session", session_id).with_state(action))
+    .with_resource_budget(RuntimeResourceBudget {
+        queue_depth: Some(queue_depth as u64),
+        token_budget: None,
+        pruning_token_delta: None,
+        retrieval_branch_latency_ms: None,
+        retry_count: None,
+        suppression_count: None,
+    })
+    .with_details(json!({
+        "action": action,
+        "queued_input_id": queued_input_id,
+        "details": details,
+    }));
+    if let Some(run_id) = run_id {
+        payload =
+            payload.with_output(RuntimeEntityRef::new("run", "run", run_id).with_state("active"));
+    }
+    if let Some(queued_input_id) = queued_input_id {
+        payload = payload.with_related_entity(RuntimeEntityRef::new(
+            "queued_input",
+            "queued_input",
+            queued_input_id,
+        ));
+    }
+    state
+        .runtime
+        .record_runtime_decision_event(context, Some(session_id), run_id, payload)
+        .await
+        .map_err(runtime_status_response)
+}
+
+fn normalize_priority_lane(raw: Option<String>) -> Result<String, Response> {
+    let lane = raw.and_then(trim_to_option).unwrap_or_else(|| "operator_priority".to_owned());
+    if lane.len() > 32
+        || !lane
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+    {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(
+            "priority_lane must be 1..=32 ASCII letters, digits, '_' or '-'",
+        )));
+    }
+    Ok(lane)
+}
+
 fn session_queue_snapshot_json(snapshot: ConsoleSessionQueueSnapshot) -> Value {
     let pending_depth = pending_queue_depth(
         snapshot.queued_inputs.as_slice(),
         Some(snapshot.policy.coalescing_group.as_str()),
     );
-    let terminal_count = snapshot
-        .queued_inputs
-        .iter()
-        .filter(|queued| queued.state != QueuedInputState::Pending.as_str())
-        .count();
+    let analysis = analyze_session_queue(
+        snapshot.queued_inputs.as_slice(),
+        &snapshot.policy,
+        &snapshot.safe_boundary,
+        snapshot.control.paused,
+        crate::gateway::current_unix_ms(),
+    );
     let preview_mode = if snapshot.control.paused { Some(QueueMode::Collect) } else { None };
     let preview_decision = decide_session_queue_mode(
         snapshot.policy.clone(),
@@ -4068,6 +4384,10 @@ fn session_queue_snapshot_json(snapshot: ConsoleSessionQueueSnapshot) -> Value {
         snapshot.safe_boundary.clone(),
         pending_depth,
     );
+    let analysis_json = analysis.snapshot_json();
+    let busy_state = analysis.busy_state.as_str();
+    let recommendation = analysis.recommendation.clone();
+    let metrics_json = analysis.metrics.snapshot_json();
     json!({
         "session_id": snapshot.session_record.session_id,
         "control": snapshot.control,
@@ -4075,11 +4395,10 @@ fn session_queue_snapshot_json(snapshot: ConsoleSessionQueueSnapshot) -> Value {
         "safe_boundary": snapshot.safe_boundary,
         "active_run_id": snapshot.active_run_id,
         "queued_inputs": snapshot.queued_inputs,
-        "metrics": {
-            "pending_depth": pending_depth,
-            "terminal_count": terminal_count,
-            "total_count": pending_depth.saturating_add(terminal_count),
-        },
+        "busy_state": busy_state,
+        "recommendation": recommendation,
+        "metrics": metrics_json,
+        "analysis": analysis_json,
         "decision_preview": preview_decision.explain_json(),
         "contract": contract_descriptor(),
     })

@@ -4341,6 +4341,47 @@ impl GatewayRuntimeState {
     }
 
     #[allow(clippy::result_large_err)]
+    fn prioritize_orchestrator_queued_input_blocking(
+        &self,
+        queued_input_id: &str,
+        priority_lane: &str,
+        decision_reason: &str,
+        explain_json: &str,
+    ) -> Result<(), Status> {
+        self.journal_store
+            .prioritize_orchestrator_queued_input(
+                queued_input_id,
+                priority_lane,
+                decision_reason,
+                explain_json,
+            )
+            .map_err(|error| {
+                map_orchestrator_store_error("prioritize queued orchestrator input", error)
+            })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn prioritize_orchestrator_queued_input(
+        self: &Arc<Self>,
+        queued_input_id: String,
+        priority_lane: String,
+        decision_reason: String,
+        explain_json: String,
+    ) -> Result<(), Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.prioritize_orchestrator_queued_input_blocking(
+                queued_input_id.as_str(),
+                priority_lane.as_str(),
+                decision_reason.as_str(),
+                explain_json.as_str(),
+            )
+        })
+        .await
+        .map_err(|_| Status::internal("orchestrator queued input priority worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
     fn get_orchestrator_session_queue_control_blocking(
         &self,
         session_id: &str,

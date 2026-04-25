@@ -778,6 +778,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
             post(console::chat::console_chat_queue_cancel_handler),
         )
         .route(
+            "/console/v1/chat/sessions/{session_id}/queue/items/{queued_input_id}/reject",
+            post(console::chat::console_chat_queue_reject_handler),
+        )
+        .route(
+            "/console/v1/chat/sessions/{session_id}/queue/items/{queued_input_id}/prioritize",
+            post(console::chat::console_chat_queue_prioritize_handler),
+        )
+        .route(
             "/console/v1/chat/sessions/{session_id}/canvases",
             get(console::chat::console_chat_canvas_list_handler),
         )

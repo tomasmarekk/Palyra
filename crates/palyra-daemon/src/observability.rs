@@ -422,7 +422,8 @@ impl ObservabilityState {
             | RuntimeDecisionEventType::QueueMerge
             | RuntimeDecisionEventType::QueueSteer
             | RuntimeDecisionEventType::QueueInterrupt
-            | RuntimeDecisionEventType::QueueOverflow => {
+            | RuntimeDecisionEventType::QueueOverflow
+            | RuntimeDecisionEventType::QueueControl => {
                 guard.queue_decision_events = guard.queue_decision_events.saturating_add(1);
                 match payload.event_type {
                     RuntimeDecisionEventType::QueueMerge => {

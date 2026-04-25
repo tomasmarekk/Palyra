@@ -240,6 +240,7 @@ runtime_preview_enum! {
         QueueSteer => "queue_steer",
         QueueInterrupt => "queue_interrupt",
         QueueOverflow => "queue_overflow",
+        QueueControl => "queue_control",
         PruningApply => "pruning_apply",
         RecallSessionSearch => "recall_session_search",
         AuxiliaryTaskLifecycle => "auxiliary_task_lifecycle",
@@ -249,12 +250,13 @@ runtime_preview_enum! {
     }
 }
 
-pub const ALL_RUNTIME_DECISION_EVENT_TYPES: [RuntimeDecisionEventType; 11] = [
+pub const ALL_RUNTIME_DECISION_EVENT_TYPES: [RuntimeDecisionEventType; 12] = [
     RuntimeDecisionEventType::QueueEnqueue,
     RuntimeDecisionEventType::QueueMerge,
     RuntimeDecisionEventType::QueueSteer,
     RuntimeDecisionEventType::QueueInterrupt,
     RuntimeDecisionEventType::QueueOverflow,
+    RuntimeDecisionEventType::QueueControl,
     RuntimeDecisionEventType::PruningApply,
     RuntimeDecisionEventType::RecallSessionSearch,
     RuntimeDecisionEventType::AuxiliaryTaskLifecycle,
@@ -272,6 +274,7 @@ impl RuntimeDecisionEventType {
             Self::QueueSteer => "runtime.queue.steer",
             Self::QueueInterrupt => "runtime.queue.interrupt",
             Self::QueueOverflow => "runtime.queue.overflow",
+            Self::QueueControl => "runtime.queue.control",
             Self::PruningApply => "runtime.pruning.apply",
             Self::RecallSessionSearch => "runtime.recall.session_search",
             Self::AuxiliaryTaskLifecycle => "runtime.auxiliary_task.lifecycle",
@@ -289,6 +292,7 @@ impl RuntimeDecisionEventType {
             Self::QueueSteer => "Queue steer",
             Self::QueueInterrupt => "Queue interrupt",
             Self::QueueOverflow => "Queue overflow",
+            Self::QueueControl => "Queue control",
             Self::PruningApply => "Pruning apply",
             Self::RecallSessionSearch => "Recall session search",
             Self::AuxiliaryTaskLifecycle => "Auxiliary task lifecycle",
@@ -306,6 +310,9 @@ impl RuntimeDecisionEventType {
             Self::QueueSteer => "Records queue steering toward a backlog or alternate flow.",
             Self::QueueInterrupt => "Records queue interruption of an existing foreground path.",
             Self::QueueOverflow => "Records queue overflow and fail-closed backpressure decisions.",
+            Self::QueueControl => {
+                "Records operator queue control changes and durable queue overrides."
+            }
             Self::PruningApply => "Records compaction/pruning token savings and write posture.",
             Self::RecallSessionSearch => {
                 "Records recall preview or retrieval-branch search decisions."
