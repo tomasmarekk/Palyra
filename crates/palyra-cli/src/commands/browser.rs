@@ -58,6 +58,8 @@ struct BrowserPolicySnapshot {
     max_title_bytes: Option<u64>,
     state_dir: Option<String>,
     state_key_vault_ref_configured: bool,
+    state_encryption_key_env_configured: bool,
+    profiles_ready: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +91,7 @@ struct BrowserLifecyclePayload {
     stdout_log_path: Option<String>,
     stderr_log_path: Option<String>,
     detail: String,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -495,7 +498,9 @@ async fn run_browser_status(
         probe_browser_grpc(&resolved.connection).await.err().map(|error| error.to_string());
     let control_plane = probe_browser_control_plane_policy().await;
     let browserd_reachable = health_response.is_some() || grpc_error.is_none();
-    let warnings = browser_status_warnings(&resolved.policy, &control_plane, browserd_reachable);
+    let mut warnings =
+        browser_status_warnings(&resolved.policy, &control_plane, browserd_reachable);
+    warnings.extend(browser_profile_prerequisite_warnings(&resolved.policy));
     let payload = BrowserStatusPayload {
         service: "palyra-browserd",
         grpc_url: resolved.connection.grpc_url,
@@ -530,6 +535,7 @@ async fn run_browser_start(
 ) -> Result<()> {
     let resolved = resolve_browser_config(endpoint, health_url, token)?;
     ensure_browser_service_enabled(&resolved.policy, "start", resolved.config_path.as_deref())?;
+    let lifecycle_warnings = browser_profile_prerequisite_warnings(&resolved.policy);
     if fetch_browser_health(resolved.connection.health_base_url.as_str()).await.is_ok() {
         let metadata = read_browser_service_metadata()?;
         let payload = BrowserLifecyclePayload {
@@ -541,6 +547,7 @@ async fn run_browser_start(
             stdout_log_path: metadata.as_ref().map(|value| value.stdout_log_path.clone()),
             stderr_log_path: metadata.as_ref().map(|value| value.stderr_log_path.clone()),
             detail: "browser service is already healthy".to_owned(),
+            warnings: lifecycle_warnings,
         };
         let value =
             serde_json::to_value(&payload).context("failed to encode browser lifecycle payload")?;
@@ -612,6 +619,7 @@ async fn run_browser_start(
                 stdout_log_path: Some(metadata.stdout_log_path),
                 stderr_log_path: Some(metadata.stderr_log_path),
                 detail: "browser service started and passed health check".to_owned(),
+                warnings: lifecycle_warnings,
             };
             let value = serde_json::to_value(&payload)
                 .context("failed to encode browser lifecycle payload")?;
@@ -644,6 +652,7 @@ fn run_browser_stop() -> Result<()> {
             stdout_log_path: None,
             stderr_log_path: None,
             detail: "no CLI-managed browser service metadata found".to_owned(),
+            warnings: Vec::new(),
         };
         let value =
             serde_json::to_value(&payload).context("failed to encode browser lifecycle payload")?;
@@ -669,6 +678,7 @@ fn run_browser_stop() -> Result<()> {
         stdout_log_path: Some(metadata.stdout_log_path),
         stderr_log_path: Some(metadata.stderr_log_path),
         detail: "browser service stop requested".to_owned(),
+        warnings: Vec::new(),
     };
     let value =
         serde_json::to_value(&payload).context("failed to encode browser lifecycle payload")?;
@@ -2374,6 +2384,7 @@ fn resolve_browser_config(
     let env_max_title_bytes = env_u64("PALYRA_BROWSER_SERVICE_MAX_TITLE_BYTES");
     let env_state_dir = env_optional("PALYRA_BROWSERD_STATE_DIR");
     let env_state_key_vault_ref = env_optional("PALYRA_BROWSERD_STATE_ENCRYPTION_KEY_VAULT_REF");
+    let env_state_encryption_key = env_optional("PALYRA_BROWSERD_STATE_ENCRYPTION_KEY");
 
     let grpc_url = normalize_browser_base_url(
         endpoint
@@ -2412,6 +2423,8 @@ fn resolve_browser_config(
             state_dir: env_state_dir.or(file_state_dir),
             state_key_vault_ref_configured: env_state_key_vault_ref.is_some()
                 || file_state_key_vault_ref.is_some(),
+            state_encryption_key_env_configured: env_state_encryption_key.is_some(),
+            profiles_ready: env_state_encryption_key.is_some(),
         },
         config_path: config_path.map(|value| value.display().to_string()),
     })
@@ -2475,6 +2488,16 @@ fn browser_status_warnings(
         );
     }
     warnings
+}
+
+fn browser_profile_prerequisite_warnings(policy: &BrowserPolicySnapshot) -> Vec<String> {
+    if !policy.configured_enabled || policy.profiles_ready {
+        return Vec::new();
+    }
+    vec![
+        "browser profiles require PALYRA_BROWSERD_STATE_ENCRYPTION_KEY in the browserd process environment; set it before starting browserd to use `palyra browser profiles ...`, persistent sessions, or profile-backed browser commands"
+            .to_owned(),
+    ]
 }
 
 fn browser_service_enable_command(config_path: Option<&str>) -> String {
@@ -2768,6 +2791,12 @@ fn format_browser_status_text(payload: &BrowserStatusPayload) -> String {
             .map(|value| value.to_string())
             .unwrap_or_else(|| "-".to_owned()),
     ));
+    lines.push(format!(
+        "browser.profile_policy profiles_ready={} state_key_env_configured={} state_key_vault_ref_configured={}",
+        payload.policy.profiles_ready,
+        payload.policy.state_encryption_key_env_configured,
+        payload.policy.state_key_vault_ref_configured,
+    ));
     if let Some(metadata) = payload.lifecycle_metadata.as_ref() {
         lines.push(format!(
             "browser.lifecycle pid={} binary={} stdout_log={} stderr_log={}",
@@ -2800,7 +2829,7 @@ fn format_browser_status_text(payload: &BrowserStatusPayload) -> String {
 }
 
 fn format_browser_lifecycle_text(payload: &BrowserLifecyclePayload) -> String {
-    format!(
+    let mut text = format!(
         "browser.{} running={} pid={} grpc_url={} health_url={} stdout_log={} stderr_log={} detail={}",
         payload.action,
         payload.running,
@@ -2810,7 +2839,12 @@ fn format_browser_lifecycle_text(payload: &BrowserLifecyclePayload) -> String {
         payload.stdout_log_path.as_deref().unwrap_or("-"),
         payload.stderr_log_path.as_deref().unwrap_or("-"),
         payload.detail,
-    )
+    );
+    for warning in &payload.warnings {
+        text.push('\n');
+        text.push_str(format!("browser.warning {warning}").as_str());
+    }
+    text
 }
 
 fn write_optional_json_output(
@@ -3259,6 +3293,8 @@ mod tests {
             max_title_bytes: None,
             state_dir: None,
             state_key_vault_ref_configured: false,
+            state_encryption_key_env_configured: false,
+            profiles_ready: false,
         }
     }
 
@@ -3356,6 +3392,31 @@ mod tests {
         let value = session_summary_value(&summary);
 
         assert_eq!(value.get("session_id").and_then(Value::as_str), Some(session_id));
+    }
+
+    #[test]
+    fn browser_profile_prerequisite_warning_mentions_state_key() {
+        let mut policy = disabled_policy();
+        policy.configured_enabled = true;
+        let warnings = super::browser_profile_prerequisite_warnings(&policy);
+
+        assert!(
+            warnings.iter().any(|warning| {
+                warning.contains("PALYRA_BROWSERD_STATE_ENCRYPTION_KEY")
+                    && warning.contains("browser profiles")
+            }),
+            "missing browser profile key should produce an actionable warning: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn browser_profile_prerequisite_warning_is_clear_when_ready() {
+        let mut policy = disabled_policy();
+        policy.configured_enabled = true;
+        policy.state_encryption_key_env_configured = true;
+        policy.profiles_ready = true;
+
+        assert!(super::browser_profile_prerequisite_warnings(&policy).is_empty());
     }
 
     #[test]
