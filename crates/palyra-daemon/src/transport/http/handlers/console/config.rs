@@ -251,7 +251,8 @@ pub(crate) async fn apply_config_reload_for_context(
         )))
     })?;
     let plan = build_reload_plan(&current, &candidate, source_path, estimate_active_runs(state));
-    validate_reload_plan_reference(state, payload.plan_id.as_deref(), payload.force)?;
+    validate_reload_plan_reference(state, payload.plan_id.as_deref(), payload.force)
+        .map_err(|response| *response)?;
 
     let hot_safe_steps =
         plan.steps.iter().filter(|step| step.category == "hot_safe").cloned().collect::<Vec<_>>();
@@ -414,7 +415,7 @@ fn validate_reload_plan_reference(
     state: &AppState,
     requested_plan_id: Option<&str>,
     force: bool,
-) -> Result<(), Response> {
+) -> Result<(), Box<Response>> {
     let Some(requested_plan_id) =
         requested_plan_id.map(str::trim).filter(|value| !value.is_empty())
     else {
@@ -430,9 +431,9 @@ fn validate_reload_plan_reference(
     if latest_plan_id.as_deref() == Some(requested_plan_id) || force {
         return Ok(());
     }
-    Err(runtime_status_response(tonic::Status::failed_precondition(
+    Err(Box::new(runtime_status_response(tonic::Status::failed_precondition(
         "reload plan_id is stale or unknown; create a new plan or pass force=true after review",
-    )))
+    ))))
 }
 
 #[allow(clippy::too_many_arguments)]

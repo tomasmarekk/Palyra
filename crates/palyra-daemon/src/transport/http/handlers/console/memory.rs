@@ -419,7 +419,8 @@ pub(crate) async fn console_learning_candidate_review_handler(
     let session = authorize_console_session(&state, &headers, true)?;
     let candidate =
         load_console_learning_candidate(&state, &session.context, candidate_id.as_str()).await?;
-    let status = normalize_learning_candidate_review_status(payload.status.as_str())?;
+    let status = normalize_learning_candidate_review_status(payload.status.as_str())
+        .map_err(runtime_status_response)?;
     let reviewed = state
         .runtime
         .review_learning_candidate(journal::LearningCandidateReviewRequest {
@@ -1369,7 +1370,7 @@ async fn run_memory_maintenance_now(
         .map_err(runtime_status_response)
 }
 
-fn normalize_learning_candidate_review_status(status: &str) -> Result<String, Response> {
+fn normalize_learning_candidate_review_status(status: &str) -> Result<String, tonic::Status> {
     let normalized = status.trim().to_ascii_lowercase().replace('_', "-");
     let accepted = match normalized.as_str() {
         "proposed" | "queued" => normalized,
@@ -1384,9 +1385,9 @@ fn normalize_learning_candidate_review_status(status: &str) -> Result<String, Re
         "rollback" | "rolled-back" => "rolled-back".to_owned(),
         "conflicted" => normalized,
         _ => {
-            return Err(runtime_status_response(tonic::Status::invalid_argument(
+            return Err(tonic::Status::invalid_argument(
                 "status must be proposed, needs-review, approved, rejected, deployed, rolled-back, or a supported legacy review state",
-            )));
+            ));
         }
     };
     Ok(accepted)

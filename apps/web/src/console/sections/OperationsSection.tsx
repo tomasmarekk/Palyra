@@ -772,7 +772,9 @@ export function OperationsSection({ app }: OperationsSectionProps) {
                   <tr>
                     <td>Security</td>
                     <td>{readString(operatorSecurity ?? {}, "state") ?? "unknown"}</td>
-                    <td>{readString(operatorSecurity ?? {}, "summary") ?? "No security summary"}</td>
+                    <td>
+                      {readString(operatorSecurity ?? {}, "summary") ?? "No security summary"}
+                    </td>
                   </tr>
                   <tr>
                     <td>Recall</td>

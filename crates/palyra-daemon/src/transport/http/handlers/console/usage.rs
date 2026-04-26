@@ -1511,19 +1511,19 @@ async fn build_operator_insights_snapshot(
     let security = build_operator_security_insight(&counters, &tape_aggregation);
     let routines = build_operator_routine_insight(cron_runs.as_slice(), &counters);
     let memory_learning = build_operator_memory_learning_insight(state, resolved).await?;
-    let hotspots = build_operator_hotspots(
-        &operations,
-        &provider_health,
-        &security,
-        &recall,
-        &compaction,
-        &safety_boundary,
-        &plugins,
-        &cron,
-        &routines,
-        &memory_learning,
-        &reload,
-    );
+    let hotspots = build_operator_hotspots(OperatorHotspotSources {
+        operations: &operations,
+        provider_health: &provider_health,
+        security: &security,
+        recall: &recall,
+        compaction: &compaction,
+        safety_boundary: &safety_boundary,
+        plugins: &plugins,
+        cron: &cron,
+        routines: &routines,
+        memory_learning: &memory_learning,
+        reload: &reload,
+    });
     let blocking_hotspots =
         hotspots.iter().filter(|hotspot| hotspot.severity == "blocking").count();
     let warning_hotspots = hotspots.iter().filter(|hotspot| hotspot.severity == "warning").count();
@@ -2619,19 +2619,34 @@ fn candidate_mentions_injection_conflict(candidate: &journal::LearningCandidateR
     })
 }
 
-fn build_operator_hotspots(
-    operations: &OperatorOperationsOverviewInsight,
-    provider_health: &OperatorProviderHealthInsight,
-    security: &OperatorSecurityInsight,
-    recall: &OperatorRecallInsight,
-    compaction: &OperatorCompactionInsight,
-    safety_boundary: &OperatorSafetyBoundaryInsight,
-    plugins: &OperatorPluginInsight,
-    cron: &OperatorCronInsight,
-    routines: &OperatorRoutineInsight,
-    memory_learning: &OperatorMemoryLearningInsight,
-    reload: &OperatorReloadInsight,
-) -> Vec<OperatorInsightHotspot> {
+struct OperatorHotspotSources<'a> {
+    operations: &'a OperatorOperationsOverviewInsight,
+    provider_health: &'a OperatorProviderHealthInsight,
+    security: &'a OperatorSecurityInsight,
+    recall: &'a OperatorRecallInsight,
+    compaction: &'a OperatorCompactionInsight,
+    safety_boundary: &'a OperatorSafetyBoundaryInsight,
+    plugins: &'a OperatorPluginInsight,
+    cron: &'a OperatorCronInsight,
+    routines: &'a OperatorRoutineInsight,
+    memory_learning: &'a OperatorMemoryLearningInsight,
+    reload: &'a OperatorReloadInsight,
+}
+
+fn build_operator_hotspots(sources: OperatorHotspotSources<'_>) -> Vec<OperatorInsightHotspot> {
+    let OperatorHotspotSources {
+        operations,
+        provider_health,
+        security,
+        recall,
+        compaction,
+        safety_boundary,
+        plugins,
+        cron,
+        routines,
+        memory_learning,
+        reload,
+    } = sources;
     let mut hotspots = Vec::new();
     for (hotspot_id, subsystem, state, severity, summary, detail, recommended_action, drill_down) in [
         (
@@ -3465,9 +3480,10 @@ mod tests {
     use super::{
         build_operator_hotspots, build_operator_summary, csv_escape, operator_drill_down,
         operator_query_preview, OperatorCompactionInsight, OperatorCronInsight,
-        OperatorMemoryLearningInsight, OperatorOperationsOverviewInsight, OperatorPluginInsight,
-        OperatorProviderHealthInsight, OperatorRecallInsight, OperatorReloadInsight,
-        OperatorRoutineInsight, OperatorSafetyBoundaryInsight, OperatorSecurityInsight,
+        OperatorHotspotSources, OperatorMemoryLearningInsight, OperatorOperationsOverviewInsight,
+        OperatorPluginInsight, OperatorProviderHealthInsight, OperatorRecallInsight,
+        OperatorReloadInsight, OperatorRoutineInsight, OperatorSafetyBoundaryInsight,
+        OperatorSecurityInsight,
     };
 
     #[test]
@@ -3483,19 +3499,28 @@ mod tests {
     fn operator_summary_prioritizes_blocking_hotspots() {
         let warning = test_provider_health("degraded", "warning", "provider warning");
         let blocking = test_reload("blocking", "blocking", "reload blocking");
-        let hotspots = build_operator_hotspots(
-            &test_operations("ok", "info", "operations ok"),
-            &warning,
-            &test_security("ok", "info", "security ok"),
-            &test_recall("ok", "info", "recall ok"),
-            &test_compaction("ok", "info", "compaction ok"),
-            &test_safety("ok", "info", "safety ok"),
-            &test_plugins("ok", "info", "plugins ok"),
-            &test_cron("ok", "info", "cron ok"),
-            &test_routines("ok", "info", "routines ok"),
-            &test_memory_learning("ok", "info", "memory learning ok"),
-            &blocking,
-        );
+        let operations = test_operations("ok", "info", "operations ok");
+        let security = test_security("ok", "info", "security ok");
+        let recall = test_recall("ok", "info", "recall ok");
+        let compaction = test_compaction("ok", "info", "compaction ok");
+        let safety_boundary = test_safety("ok", "info", "safety ok");
+        let plugins = test_plugins("ok", "info", "plugins ok");
+        let cron = test_cron("ok", "info", "cron ok");
+        let routines = test_routines("ok", "info", "routines ok");
+        let memory_learning = test_memory_learning("ok", "info", "memory learning ok");
+        let hotspots = build_operator_hotspots(OperatorHotspotSources {
+            operations: &operations,
+            provider_health: &warning,
+            security: &security,
+            recall: &recall,
+            compaction: &compaction,
+            safety_boundary: &safety_boundary,
+            plugins: &plugins,
+            cron: &cron,
+            routines: &routines,
+            memory_learning: &memory_learning,
+            reload: &blocking,
+        });
         assert_eq!(build_operator_summary(hotspots.as_slice()), ("blocking", "blocking"));
     }
 

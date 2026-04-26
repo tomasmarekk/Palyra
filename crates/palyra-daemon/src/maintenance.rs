@@ -47,72 +47,78 @@ impl Default for MaintenanceRegistry {
     fn default() -> Self {
         Self {
             sweepers: Arc::from([
-                sweeper(
-                    "stale_runs",
-                    "runs",
-                    "Detects run records that have stayed active past their runtime lease window.",
-                    "repairable",
-                    300_000,
-                    32,
-                    "run metadata retention",
-                    "runtime.policy.run_retention",
-                    "run_state_only",
-                ),
-                sweeper(
-                    "orphan_artifacts",
-                    "artifacts",
-                    "Finds content-addressed artifacts that no longer have a journal or run reference.",
-                    "retention_bound_delete",
-                    900_000,
-                    64,
-                    "artifact retention and replay reference policy",
-                    "runtime.policy.artifact_retention",
-                    "unreferenced_artifact_records",
-                ),
-                sweeper(
-                    "expired_leases",
-                    "leases",
-                    "Reaps expired provider and worker leases after fail-closed ownership checks.",
-                    "repairable",
-                    120_000,
-                    64,
-                    "lease TTL and active worker ownership",
-                    "runtime.policy.lease_ttl",
-                    "expired_lease_records",
-                ),
-                sweeper(
-                    "stale_bindings",
-                    "bindings",
-                    "Flags stale plugin, hook, and channel bindings that need operator review.",
-                    "review_required",
-                    600_000,
-                    32,
-                    "binding registry update policy",
-                    "runtime.policy.binding_integrity",
-                    "binding_metadata",
-                ),
-                sweeper(
-                    "old_delivery_attempts",
-                    "delivery",
-                    "Compacts old delivery attempts after retry, quarantine, and dead-letter retention gates.",
-                    "retention_bound_delete",
-                    600_000,
-                    128,
-                    "delivery attempt retention and dead-letter policy",
-                    "runtime.policy.delivery_retention",
-                    "delivery_attempt_records",
-                ),
-                sweeper(
-                    "memory_retention",
-                    "memory",
-                    "Applies memory TTL, capacity, and vacuum maintenance using the journal retention policy.",
-                    "retention_bound_delete",
-                    300_000,
-                    512,
-                    "memory retention config",
-                    "runtime.policy.memory_retention",
-                    "memory_items_and_fts_rows",
-                ),
+                sweeper(SweeperDefinitionSpec {
+                    task_id: "stale_runs",
+                    component: "runs",
+                    description:
+                        "Detects run records that have stayed active past their runtime lease window.",
+                    safety_level: "repairable",
+                    interval_ms: 300_000,
+                    max_work_per_run: 32,
+                    retention_policy: "run metadata retention",
+                    policy_gate: "runtime.policy.run_retention",
+                    delete_scope: "run_state_only",
+                }),
+                sweeper(SweeperDefinitionSpec {
+                    task_id: "orphan_artifacts",
+                    component: "artifacts",
+                    description:
+                        "Finds content-addressed artifacts that no longer have a journal or run reference.",
+                    safety_level: "retention_bound_delete",
+                    interval_ms: 900_000,
+                    max_work_per_run: 64,
+                    retention_policy: "artifact retention and replay reference policy",
+                    policy_gate: "runtime.policy.artifact_retention",
+                    delete_scope: "unreferenced_artifact_records",
+                }),
+                sweeper(SweeperDefinitionSpec {
+                    task_id: "expired_leases",
+                    component: "leases",
+                    description:
+                        "Reaps expired provider and worker leases after fail-closed ownership checks.",
+                    safety_level: "repairable",
+                    interval_ms: 120_000,
+                    max_work_per_run: 64,
+                    retention_policy: "lease TTL and active worker ownership",
+                    policy_gate: "runtime.policy.lease_ttl",
+                    delete_scope: "expired_lease_records",
+                }),
+                sweeper(SweeperDefinitionSpec {
+                    task_id: "stale_bindings",
+                    component: "bindings",
+                    description:
+                        "Flags stale plugin, hook, and channel bindings that need operator review.",
+                    safety_level: "review_required",
+                    interval_ms: 600_000,
+                    max_work_per_run: 32,
+                    retention_policy: "binding registry update policy",
+                    policy_gate: "runtime.policy.binding_integrity",
+                    delete_scope: "binding_metadata",
+                }),
+                sweeper(SweeperDefinitionSpec {
+                    task_id: "old_delivery_attempts",
+                    component: "delivery",
+                    description:
+                        "Compacts old delivery attempts after retry, quarantine, and dead-letter retention gates.",
+                    safety_level: "retention_bound_delete",
+                    interval_ms: 600_000,
+                    max_work_per_run: 128,
+                    retention_policy: "delivery attempt retention and dead-letter policy",
+                    policy_gate: "runtime.policy.delivery_retention",
+                    delete_scope: "delivery_attempt_records",
+                }),
+                sweeper(SweeperDefinitionSpec {
+                    task_id: "memory_retention",
+                    component: "memory",
+                    description:
+                        "Applies memory TTL, capacity, and vacuum maintenance using the journal retention policy.",
+                    safety_level: "retention_bound_delete",
+                    interval_ms: 300_000,
+                    max_work_per_run: 512,
+                    retention_policy: "memory retention config",
+                    policy_gate: "runtime.policy.memory_retention",
+                    delete_scope: "memory_items_and_fts_rows",
+                }),
             ]),
         }
     }
@@ -443,32 +449,34 @@ pub(crate) fn publish_maintenance_realtime_event(
     });
 }
 
-fn sweeper(
-    task_id: &str,
-    component: &str,
-    description: &str,
-    safety_level: &str,
+struct SweeperDefinitionSpec<'a> {
+    task_id: &'a str,
+    component: &'a str,
+    description: &'a str,
+    safety_level: &'a str,
     interval_ms: i64,
     max_work_per_run: u32,
-    retention_policy: &str,
-    policy_gate: &str,
-    delete_scope: &str,
-) -> MaintenanceSweeperDefinition {
+    retention_policy: &'a str,
+    policy_gate: &'a str,
+    delete_scope: &'a str,
+}
+
+fn sweeper(spec: SweeperDefinitionSpec<'_>) -> MaintenanceSweeperDefinition {
     MaintenanceSweeperDefinition {
-        task_id: task_id.to_owned(),
-        component: component.to_owned(),
-        description: description.to_owned(),
-        safety_level: safety_level.to_owned(),
+        task_id: spec.task_id.to_owned(),
+        component: spec.component.to_owned(),
+        description: spec.description.to_owned(),
+        safety_level: spec.safety_level.to_owned(),
         dry_run_supported: true,
-        interval_ms,
-        max_work_per_run,
-        retention_policy: retention_policy.to_owned(),
-        policy_gate: policy_gate.to_owned(),
-        delete_scope: delete_scope.to_owned(),
+        interval_ms: spec.interval_ms,
+        max_work_per_run: spec.max_work_per_run,
+        retention_policy: spec.retention_policy.to_owned(),
+        policy_gate: spec.policy_gate.to_owned(),
+        delete_scope: spec.delete_scope.to_owned(),
         event_names: MaintenanceEventNames {
-            started: format!("maintenance.{task_id}.started"),
-            completed: format!("maintenance.{task_id}.completed"),
-            failed: format!("maintenance.{task_id}.failed"),
+            started: format!("maintenance.{}.started", spec.task_id),
+            completed: format!("maintenance.{}.completed", spec.task_id),
+            failed: format!("maintenance.{}.failed", spec.task_id),
         },
     }
 }
@@ -1409,17 +1417,17 @@ mod tests {
 
     #[test]
     fn maintenance_summary_promotes_blocking_status() {
-        let definition = sweeper(
-            "expired_leases",
-            "leases",
-            "test",
-            "repairable",
-            1_000,
-            1,
-            "retention",
-            "policy",
-            "scope",
-        );
+        let definition = sweeper(SweeperDefinitionSpec {
+            task_id: "expired_leases",
+            component: "leases",
+            description: "test",
+            safety_level: "repairable",
+            interval_ms: 1_000,
+            max_work_per_run: 1,
+            retention_policy: "retention",
+            policy_gate: "policy",
+            delete_scope: "scope",
+        });
         let task = task_status(
             definition,
             "blocked",

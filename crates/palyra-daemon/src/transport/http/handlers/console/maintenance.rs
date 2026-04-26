@@ -45,7 +45,7 @@ pub(crate) async fn console_maintenance_status_handler(
                     "error_count": snapshot.summary.error_count,
                 }),
             );
-            Ok(Json(maintenance_payload(snapshot)?))
+            Ok(Json(maintenance_payload(snapshot).map_err(runtime_status_response)?))
         }
         Err(error) => {
             publish_maintenance_realtime_event(
@@ -69,33 +69,33 @@ pub(crate) async fn console_doctor_health_graph_handler(
     let graph = collect_doctor_health_graph(&state, &session.context)
         .await
         .map_err(runtime_status_response)?;
-    Ok(Json(doctor_health_graph_payload(graph)?))
+    Ok(Json(doctor_health_graph_payload(graph).map_err(runtime_status_response)?))
 }
 
-fn maintenance_payload(snapshot: MaintenanceStatusSnapshot) -> Result<Value, Response> {
+fn maintenance_payload(snapshot: MaintenanceStatusSnapshot) -> Result<Value, tonic::Status> {
     payload_with_contract(snapshot, "maintenance status")
 }
 
-fn doctor_health_graph_payload(snapshot: DoctorHealthGraphSnapshot) -> Result<Value, Response> {
+fn doctor_health_graph_payload(
+    snapshot: DoctorHealthGraphSnapshot,
+) -> Result<Value, tonic::Status> {
     payload_with_contract(snapshot, "doctor health graph")
 }
 
-fn payload_with_contract<T>(snapshot: T, label: &str) -> Result<Value, Response>
+fn payload_with_contract<T>(snapshot: T, label: &str) -> Result<Value, tonic::Status>
 where
     T: Serialize,
 {
     let mut payload = serde_json::to_value(snapshot).map_err(|error| {
-        runtime_status_response(tonic::Status::internal(format!(
-            "failed to serialize {label} payload: {error}"
-        )))
+        tonic::Status::internal(format!("failed to serialize {label} payload: {error}"))
     })?;
     if let Some(object) = payload.as_object_mut() {
         object.insert(
             "contract".to_owned(),
             serde_json::to_value(contract_descriptor()).map_err(|error| {
-                runtime_status_response(tonic::Status::internal(format!(
+                tonic::Status::internal(format!(
                     "failed to serialize {label} contract descriptor: {error}"
-                )))
+                ))
             })?,
         );
     }
