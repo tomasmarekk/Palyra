@@ -462,6 +462,7 @@ async fn config_reload_apply(
     let request = palyra_control_plane::ConfigReloadApplyRequest {
         path: optional_str(&envelope.params, "path").map(str::to_owned),
         plan_id: optional_str(&envelope.params, "plan_id").map(str::to_owned),
+        idempotency_key: optional_str(&envelope.params, "idempotency_key").map(str::to_owned),
         dry_run: envelope.params.get("dry_run").and_then(Value::as_bool).unwrap_or(false),
         force: envelope.params.get("force").and_then(Value::as_bool).unwrap_or(false),
     };

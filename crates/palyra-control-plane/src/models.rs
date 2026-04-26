@@ -1333,6 +1333,14 @@ pub struct DoctorRecoveryJob {
     pub state: DoctorRecoveryJobState,
     pub requested_at_unix_ms: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub requested_by_principal: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub requested_by_device_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_channel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at_unix_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at_unix_ms: Option<i64>,
@@ -2675,6 +2683,18 @@ pub struct ConfigReloadPlanStep {
     pub config_path: String,
     pub category: String,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub default_value: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub validator: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sensitivity: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reloadability: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub impact: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub redacted_diff: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2697,6 +2717,8 @@ pub struct ConfigReloadApplyRequest {
     pub path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
     #[serde(default)]
     pub dry_run: bool,
     #[serde(default)]
@@ -3080,6 +3102,8 @@ pub struct SupportBundleCreateRequest {
 pub struct DoctorRecoveryCreateRequest {
     #[serde(default = "default_doctor_recovery_jobs")]
     pub retain_jobs: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
     #[serde(default)]
     pub repair: bool,
     #[serde(default)]

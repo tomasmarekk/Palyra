@@ -2967,6 +2967,12 @@ export interface ConfigReloadPlanStep {
   config_path: string;
   category: string;
   reason: string;
+  default_value?: string;
+  validator?: string;
+  sensitivity?: string;
+  reloadability?: string;
+  impact?: string;
+  redacted_diff?: string;
 }
 
 export interface ConfigReloadPlanEnvelope {
@@ -3313,6 +3319,10 @@ export interface DoctorRecoveryJob {
   job_id: string;
   state: "queued" | "running" | "succeeded" | "failed";
   requested_at_unix_ms: number;
+  idempotency_key?: string;
+  requested_by_principal?: string;
+  requested_by_device_id?: string;
+  requested_channel?: string;
   started_at_unix_ms?: number;
   completed_at_unix_ms?: number;
   command: string[];
@@ -4371,6 +4381,7 @@ export class ConsoleApiClient {
 
   async createDoctorRecoveryJob(payload: {
     retain_jobs?: number;
+    idempotency_key?: string;
     repair?: boolean;
     dry_run?: boolean;
     force?: boolean;
@@ -6302,6 +6313,7 @@ export class ConsoleApiClient {
 
   async listLearningCandidates(params?: URLSearchParams): Promise<{
     candidates: LearningCandidateRecord[];
+    lifecycle?: JsonValue;
     contract: ContractDescriptor;
   }> {
     return this.request(buildPathWithQuery("/console/v1/memory/learning/candidates", params));
@@ -6310,6 +6322,7 @@ export class ConsoleApiClient {
   async getLearningCandidateHistory(candidateId: string): Promise<{
     candidate: LearningCandidateRecord;
     history: LearningCandidateHistoryRecord[];
+    lifecycle?: JsonValue;
     contract: ContractDescriptor;
   }> {
     return this.request(
@@ -6328,6 +6341,7 @@ export class ConsoleApiClient {
   ): Promise<{
     candidate: LearningCandidateRecord;
     applied_preference?: LearningPreferenceRecord;
+    lifecycle?: JsonValue;
     contract: ContractDescriptor;
   }> {
     return this.request(
@@ -6348,6 +6362,7 @@ export class ConsoleApiClient {
   ): Promise<{
     candidate: LearningCandidateRecord;
     apply: JsonValue;
+    lifecycle?: JsonValue;
     contract: ContractDescriptor;
   }> {
     return this.request(

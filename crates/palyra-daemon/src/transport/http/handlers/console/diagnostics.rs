@@ -1852,6 +1852,7 @@ pub(crate) fn build_support_bundle_observability(state: &AppState) -> Value {
             10_000_u32.saturating_sub(summary.failure_rate_bps)
         },
         "workspace_restore": build_workspace_restore_observability(state),
+        "health_graph": build_support_bundle_health_graph_observability(state),
         "replay": build_replay_support_observability(),
         "runtime_preview": runtime_preview,
         "networked_workers": networked_workers,
@@ -1871,6 +1872,64 @@ pub(crate) fn build_support_bundle_observability(state: &AppState) -> Value {
             "output_path": job.output_path,
             "error": job.error,
         })),
+    })
+}
+
+fn build_support_bundle_health_graph_observability(state: &AppState) -> Value {
+    let counters = state.runtime.counters.snapshot();
+    let runtime_preview = state.observability.runtime_decision_snapshot();
+    let workers = state.runtime.worker_fleet_snapshot();
+    let leases = state.runtime.provider_lease_snapshot();
+    let maintenance_tasks = state
+        .maintenance_registry
+        .definitions()
+        .iter()
+        .map(|definition| {
+            json!({
+                "task_id": definition.task_id.as_str(),
+                "component": definition.component.as_str(),
+                "safety_level": definition.safety_level.as_str(),
+                "dry_run_supported": definition.dry_run_supported,
+                "interval_ms": definition.interval_ms,
+                "max_work_per_run": definition.max_work_per_run,
+                "retention_policy": definition.retention_policy.as_str(),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "endpoint": "/console/v1/doctor/health-graph",
+        "support_bundle_source": "console.diagnostics.support_bundle.health_graph",
+        "components": [
+            "provider",
+            "vault",
+            "queue",
+            "scheduler",
+            "plugins",
+            "workers",
+            "storage",
+            "security",
+            "memory",
+            "maintenance",
+            "leases"
+        ],
+        "critical_path_inputs": {
+            "queue_depth": runtime_preview.metrics.queue_depth,
+            "queue_delivery_failures": runtime_preview.metrics.queue_delivery_failures,
+            "worker_orphaned_events": runtime_preview.metrics.worker_orphaned_events,
+            "registered_workers": workers.registered_workers,
+            "failed_closed_workers": workers.failed_closed_workers,
+            "active_provider_leases": leases.active_leases,
+            "provider_cooldown_count": leases.credential_feedback.len(),
+            "journal_persist_failures": counters.journal_persist_failures,
+            "sandbox_policy_denies": counters.sandbox_policy_denies,
+            "journal_hash_chain_enabled_source": "/console/v1/diagnostics.storage",
+        },
+        "maintenance_registry": maintenance_tasks,
+        "redaction": {
+            "raw_prompts_included": false,
+            "raw_secrets_included": false,
+            "provider_credentials_included": false,
+        },
     })
 }
 
@@ -2238,6 +2297,10 @@ fn build_doctor_recovery_job_summary(job: &control_plane::DoctorRecoveryJob) -> 
             control_plane::DoctorRecoveryJobState::Failed => "failed",
         },
         "requested_at_unix_ms": job.requested_at_unix_ms,
+        "idempotency_key_present": job.idempotency_key.is_some(),
+        "requested_by_principal": job.requested_by_principal.clone(),
+        "requested_by_device_id": job.requested_by_device_id.clone(),
+        "requested_channel": job.requested_channel.clone(),
         "started_at_unix_ms": job.started_at_unix_ms,
         "completed_at_unix_ms": job.completed_at_unix_ms,
         "command": job.command.clone(),
@@ -3435,19 +3498,38 @@ pub(crate) async fn run_support_bundle_job(
 #[allow(clippy::result_large_err)]
 pub(crate) fn create_doctor_job(
     state: &AppState,
+    context: &gateway::RequestContext,
     payload: control_plane::DoctorRecoveryCreateRequest,
 ) -> Result<control_plane::DoctorRecoveryJob, Response> {
-    let job_id = Ulid::new().to_string();
+    let idempotency_key = payload
+        .idempotency_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
     let requested_at_unix_ms = unix_ms_now().map_err(|error| {
         runtime_status_response(tonic::Status::internal(format!(
             "failed to read system clock: {error}"
         )))
     })?;
     let command = build_doctor_command_args(&payload);
+    if let Some(idempotency_key) = idempotency_key.as_deref() {
+        let jobs = lock_doctor_jobs(&state.doctor_jobs);
+        if let Some(existing) = jobs.values().find(|job| {
+            job.idempotency_key.as_deref() == Some(idempotency_key) && job.command == command
+        }) {
+            return Ok(existing.clone());
+        }
+    }
+    let job_id = Ulid::new().to_string();
     let job = control_plane::DoctorRecoveryJob {
         job_id: job_id.clone(),
         state: control_plane::DoctorRecoveryJobState::Queued,
         requested_at_unix_ms,
+        idempotency_key: idempotency_key.clone(),
+        requested_by_principal: context.principal.clone(),
+        requested_by_device_id: context.device_id.clone(),
+        requested_channel: context.channel.clone(),
         started_at_unix_ms: None,
         completed_at_unix_ms: None,
         command: command.clone(),
@@ -3459,7 +3541,6 @@ pub(crate) fn create_doctor_job(
         let mut jobs = lock_doctor_jobs(&state.doctor_jobs);
         jobs.insert(job_id.clone(), job.clone());
     }
-
     let retain_jobs = payload.retain_jobs.max(1);
     let config_path = std::env::var("PALYRA_CONFIG").ok().filter(|value| !value.trim().is_empty());
     let support_bundle_root = resolve_support_bundle_root()

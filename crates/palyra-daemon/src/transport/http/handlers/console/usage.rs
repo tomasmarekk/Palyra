@@ -523,6 +523,71 @@ pub(crate) struct OperatorReloadInsight {
 }
 
 #[derive(Debug, Serialize, Clone)]
+pub(crate) struct OperatorOperationsOverviewInsight {
+    state: String,
+    severity: String,
+    summary: String,
+    stuck_runs: u64,
+    provider_cooldowns: usize,
+    queue_backlog: u64,
+    routine_failures: usize,
+    plugin_errors: usize,
+    worker_orphaned: u64,
+    worker_failed_closed: u64,
+    recommended_action: String,
+    drill_down: OperatorInsightDrillDown,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub(crate) struct OperatorSecurityInsight {
+    state: String,
+    severity: String,
+    summary: String,
+    approval_denies: u64,
+    policy_denies: u64,
+    redaction_events: u64,
+    sandbox_violations: u64,
+    skill_execution_denies: u64,
+    sampled_denied_tool_decisions: usize,
+    recommended_action: String,
+    drill_down: OperatorInsightDrillDown,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub(crate) struct OperatorRoutineInsight {
+    state: String,
+    severity: String,
+    summary: String,
+    total_runs: usize,
+    failed_runs: usize,
+    skipped_runs: u64,
+    policy_denies: u64,
+    success_rate_bps: u32,
+    recommended_action: String,
+    drill_down: OperatorInsightDrillDown,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub(crate) struct OperatorMemoryLearningInsight {
+    state: String,
+    severity: String,
+    summary: String,
+    total_candidates: usize,
+    proposed_candidates: usize,
+    needs_review_candidates: usize,
+    approved_candidates: usize,
+    rejected_candidates: usize,
+    deployed_candidates: usize,
+    rolled_back_candidates: usize,
+    auto_applied_candidates: usize,
+    memory_rejections: u64,
+    injection_conflicts: usize,
+    rollback_events: usize,
+    recommended_action: String,
+    drill_down: OperatorInsightDrillDown,
+}
+
+#[derive(Debug, Serialize, Clone)]
 pub(crate) struct OperatorInsightsEnvelope {
     generated_at_unix_ms: i64,
     summary: OperatorInsightsSummary,
@@ -530,12 +595,16 @@ pub(crate) struct OperatorInsightsEnvelope {
     retention: OperatorInsightsRetentionPolicy,
     sampling: OperatorInsightsSamplingPolicy,
     privacy: OperatorInsightsPrivacyPolicy,
+    operations: OperatorOperationsOverviewInsight,
     provider_health: OperatorProviderHealthInsight,
+    security: OperatorSecurityInsight,
     recall: OperatorRecallInsight,
     compaction: OperatorCompactionInsight,
     safety_boundary: OperatorSafetyBoundaryInsight,
     plugins: OperatorPluginInsight,
     cron: OperatorCronInsight,
+    routines: OperatorRoutineInsight,
+    memory_learning: OperatorMemoryLearningInsight,
     reload: OperatorReloadInsight,
 }
 
@@ -1427,13 +1496,32 @@ async fn build_operator_insights_snapshot(
     let plugins = build_operator_plugin_insight(plugin_index.as_ref(), plugin_error.as_deref());
     let cron = build_operator_cron_insight(cron_runs.as_slice());
     let reload = build_operator_reload_insight(build_config_ref_health_observability(state));
+    let counters = state.runtime.counters.snapshot();
+    let runtime_decision = state.observability.runtime_decision_snapshot();
+    let lease_snapshot = state.runtime.provider_lease_snapshot();
+    let worker_snapshot = state.runtime.worker_fleet_snapshot();
+    let operations = build_operator_operations_overview_insight(
+        &counters,
+        &runtime_decision,
+        &lease_snapshot,
+        &worker_snapshot,
+        &plugins,
+        &cron,
+    );
+    let security = build_operator_security_insight(&counters, &tape_aggregation);
+    let routines = build_operator_routine_insight(cron_runs.as_slice(), &counters);
+    let memory_learning = build_operator_memory_learning_insight(state, resolved).await?;
     let hotspots = build_operator_hotspots(
+        &operations,
         &provider_health,
+        &security,
         &recall,
         &compaction,
         &safety_boundary,
         &plugins,
         &cron,
+        &routines,
+        &memory_learning,
         &reload,
     );
     let blocking_hotspots =
@@ -1522,12 +1610,16 @@ async fn build_operator_insights_snapshot(
             raw_config_values_included: false,
             secret_like_values_redacted: true,
         },
+        operations,
         provider_health,
+        security,
         recall,
         compaction,
         safety_boundary,
         plugins,
         cron,
+        routines,
+        memory_learning,
         reload,
     })
 }
@@ -2197,17 +2289,367 @@ fn build_operator_reload_insight(config_ref_health: Value) -> OperatorReloadInsi
     }
 }
 
+fn build_operator_operations_overview_insight(
+    counters: &crate::gateway::CountersSnapshot,
+    runtime_decision: &crate::observability::RuntimeDecisionObservabilitySnapshot,
+    lease_snapshot: &crate::provider_leases::ProviderLeaseManagerSnapshot,
+    worker_snapshot: &palyra_workerd::WorkerFleetSnapshot,
+    plugins: &OperatorPluginInsight,
+    cron: &OperatorCronInsight,
+) -> OperatorOperationsOverviewInsight {
+    let stuck_runs = counters
+        .orchestrator_runs_started
+        .saturating_sub(counters.orchestrator_runs_completed)
+        .saturating_sub(counters.orchestrator_runs_cancelled);
+    let queue_backlog =
+        counters.channel_router_queue_depth.saturating_add(runtime_decision.metrics.queue_depth);
+    let provider_cooldowns = lease_snapshot.credential_feedback.len();
+    let routine_failures = cron.failed_runs;
+    let plugin_errors = plugins.unhealthy_bindings;
+    let worker_orphaned = usize_to_u64(worker_snapshot.orphaned_workers);
+    let worker_failed_closed = usize_to_u64(worker_snapshot.failed_closed_workers);
+    let (state, severity, recommended_action) = if worker_failed_closed > 0 {
+        (
+            "blocking",
+            "blocking",
+            "Quarantine or force-clean failed-closed workers before accepting remote execution.",
+        )
+    } else if stuck_runs > 0
+        || provider_cooldowns > 0
+        || queue_backlog > 0
+        || routine_failures > 0
+        || plugin_errors > 0
+        || worker_orphaned > 0
+    {
+        (
+            "degraded",
+            "warning",
+            "Inspect the busiest degraded subsystem before expanding unattended automation.",
+        )
+    } else {
+        ("ok", "info", "Operations overview has no sampled degraded subsystems.")
+    };
+    OperatorOperationsOverviewInsight {
+        state: state.to_owned(),
+        severity: severity.to_owned(),
+        summary: format!(
+            "stuck_runs={} provider_cooldowns={} queue_backlog={} routine_failures={} plugin_errors={} worker_orphaned={} worker_failed_closed={}",
+            stuck_runs,
+            provider_cooldowns,
+            queue_backlog,
+            routine_failures,
+            plugin_errors,
+            worker_orphaned,
+            worker_failed_closed
+        ),
+        stuck_runs,
+        provider_cooldowns,
+        queue_backlog,
+        routine_failures,
+        plugin_errors,
+        worker_orphaned,
+        worker_failed_closed,
+        recommended_action: recommended_action.to_owned(),
+        drill_down: operator_drill_down(
+            "Operations overview",
+            "operations",
+            "/console/v1/system/insights",
+            "/control/operations",
+        ),
+    }
+}
+
+fn build_operator_security_insight(
+    counters: &crate::gateway::CountersSnapshot,
+    aggregation: &OperatorTapeAggregation,
+) -> OperatorSecurityInsight {
+    let sandbox_violations = counters
+        .sandbox_escape_attempts_blocked_workspace
+        .saturating_add(counters.sandbox_escape_attempts_blocked_egress)
+        .saturating_add(counters.sandbox_escape_attempts_blocked_executable);
+    let policy_denies = counters
+        .tool_decisions_denied
+        .saturating_add(counters.sandbox_policy_denies)
+        .saturating_add(counters.skill_execution_denied)
+        .saturating_add(u64::try_from(aggregation.policy_enforced_denies).unwrap_or(u64::MAX));
+    let approval_denies = counters.approvals_tool_resolved_deny;
+    let (state, severity, recommended_action) = if sandbox_violations > 0 {
+        (
+            "blocking",
+            "blocking",
+            "Review sandbox violations and blocked escape attempts before continuing automation.",
+        )
+    } else if policy_denies > 0 || approval_denies > 0 || counters.journal_redacted_events > 0 {
+        (
+            "degraded",
+            "warning",
+            "Review policy denies, approval denies, and redaction events for policy drift or abuse.",
+        )
+    } else {
+        ("ok", "info", "Security insights did not find sampled policy or sandbox anomalies.")
+    };
+    OperatorSecurityInsight {
+        state: state.to_owned(),
+        severity: severity.to_owned(),
+        summary: format!(
+            "approval_denies={} policy_denies={} redaction_events={} sandbox_violations={} skill_execution_denies={}",
+            approval_denies,
+            policy_denies,
+            counters.journal_redacted_events,
+            sandbox_violations,
+            counters.skill_execution_denied
+        ),
+        approval_denies,
+        policy_denies,
+        redaction_events: counters.journal_redacted_events,
+        sandbox_violations,
+        skill_execution_denies: counters.skill_execution_denied,
+        sampled_denied_tool_decisions: aggregation.denied_tool_decisions,
+        recommended_action: recommended_action.to_owned(),
+        drill_down: operator_drill_down(
+            "Security and approvals",
+            "operations",
+            "/console/v1/diagnostics",
+            "/control/operations",
+        ),
+    }
+}
+
+fn build_operator_routine_insight(
+    cron_runs: &[journal::CronRunRecord],
+    counters: &crate::gateway::CountersSnapshot,
+) -> OperatorRoutineInsight {
+    let total_runs = cron_runs.len();
+    let failed_runs = cron_runs
+        .iter()
+        .filter(|run| {
+            matches!(run.status, journal::CronRunStatus::Failed | journal::CronRunStatus::Denied)
+        })
+        .count();
+    let succeeded_runs =
+        cron_runs.iter().filter(|run| run.status == journal::CronRunStatus::Succeeded).count();
+    let success_rate_bps = ratio_bps(succeeded_runs, total_runs);
+    let policy_denies = cron_runs.iter().map(|run| run.tool_denies).sum::<u64>();
+    let (state, severity, recommended_action) = if failed_runs > 0 || policy_denies > 0 {
+        (
+            "degraded",
+            "warning",
+            "Inspect routine failures and policy denies before widening scheduled automation.",
+        )
+    } else if counters.cron_runs_skipped > 0 {
+        (
+            "watching",
+            "info",
+            "Routine skips are present but no sampled failures require intervention.",
+        )
+    } else {
+        ("ok", "info", "Routine delivery is healthy in the sampled window.")
+    };
+    OperatorRoutineInsight {
+        state: state.to_owned(),
+        severity: severity.to_owned(),
+        summary: format!(
+            "total_runs={} failed_runs={} skipped_runs={} policy_denies={} success_rate_bps={}",
+            total_runs, failed_runs, counters.cron_runs_skipped, policy_denies, success_rate_bps
+        ),
+        total_runs,
+        failed_runs,
+        skipped_runs: counters.cron_runs_skipped,
+        policy_denies,
+        success_rate_bps,
+        recommended_action: recommended_action.to_owned(),
+        drill_down: operator_drill_down(
+            "Routine delivery",
+            "cron",
+            "/console/v1/routines",
+            "/control/cron",
+        ),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+async fn build_operator_memory_learning_insight(
+    state: &AppState,
+    resolved: &ResolvedUsageQuery,
+) -> Result<OperatorMemoryLearningInsight, Response> {
+    let counters = state.runtime.counters.snapshot();
+    let candidates = state
+        .runtime
+        .list_learning_candidates(journal::LearningCandidateListFilter {
+            candidate_id: None,
+            owner_principal: Some(resolved.query.principal.clone()),
+            device_id: Some(resolved.query.device_id.clone()),
+            channel: resolved.query.channel.clone(),
+            session_id: resolved.query.session_id.clone(),
+            scope_kind: None,
+            scope_id: None,
+            candidate_kind: None,
+            status: None,
+            risk_level: None,
+            source_task_id: None,
+            min_confidence: None,
+            max_confidence: None,
+            limit: 256,
+        })
+        .await
+        .map_err(runtime_status_response)?;
+
+    let mut proposed_candidates = 0_usize;
+    let mut needs_review_candidates = 0_usize;
+    let mut approved_candidates = 0_usize;
+    let mut rejected_candidates = 0_usize;
+    let mut deployed_candidates = 0_usize;
+    let mut rolled_back_candidates = 0_usize;
+    let mut auto_applied_candidates = 0_usize;
+    let mut injection_conflicts = 0_usize;
+    let mut rollback_events = 0_usize;
+
+    for candidate in &candidates {
+        match learning_candidate_lifecycle_status(candidate.status.as_str(), candidate.auto_applied)
+        {
+            "proposed" => proposed_candidates = proposed_candidates.saturating_add(1),
+            "needs_review" => needs_review_candidates = needs_review_candidates.saturating_add(1),
+            "approved" => approved_candidates = approved_candidates.saturating_add(1),
+            "rejected" => rejected_candidates = rejected_candidates.saturating_add(1),
+            "deployed" => deployed_candidates = deployed_candidates.saturating_add(1),
+            "rolled_back" => rolled_back_candidates = rolled_back_candidates.saturating_add(1),
+            _ => {}
+        }
+        if candidate.auto_applied {
+            auto_applied_candidates = auto_applied_candidates.saturating_add(1);
+        }
+        if candidate_mentions_injection_conflict(candidate) {
+            injection_conflicts = injection_conflicts.saturating_add(1);
+        }
+        if candidate.status.eq_ignore_ascii_case("rolled-back")
+            || candidate.status.eq_ignore_ascii_case("rolled_back")
+            || candidate
+                .last_action_summary
+                .as_deref()
+                .is_some_and(|summary| summary.to_ascii_lowercase().contains("rollback"))
+        {
+            rollback_events = rollback_events.saturating_add(1);
+        }
+    }
+
+    let (state_label, severity, recommended_action) = if rolled_back_candidates > 0
+        || rollback_events > 0
+    {
+        (
+            "degraded",
+            "warning",
+            "Review rolled-back learning candidates and confirm the previous memory or routine state was restored.",
+        )
+    } else if needs_review_candidates > 0 || injection_conflicts > 0 {
+        (
+            "needs_review",
+            "warning",
+            "Review pending learning candidates and prompt-injection conflicts before deployment.",
+        )
+    } else {
+        ("ok", "info", "Learning candidates are either quiet or already handled within policy.")
+    };
+
+    Ok(OperatorMemoryLearningInsight {
+        state: state_label.to_owned(),
+        severity: severity.to_owned(),
+        summary: format!(
+            "candidates={} proposed={} needs_review={} approved={} rejected={} deployed={} rolled_back={} auto_applied={} injection_conflicts={}",
+            candidates.len(),
+            proposed_candidates,
+            needs_review_candidates,
+            approved_candidates,
+            rejected_candidates,
+            deployed_candidates,
+            rolled_back_candidates,
+            auto_applied_candidates,
+            injection_conflicts
+        ),
+        total_candidates: candidates.len(),
+        proposed_candidates,
+        needs_review_candidates,
+        approved_candidates,
+        rejected_candidates,
+        deployed_candidates,
+        rolled_back_candidates,
+        auto_applied_candidates,
+        memory_rejections: counters.memory_items_rejected,
+        injection_conflicts,
+        rollback_events,
+        recommended_action: recommended_action.to_owned(),
+        drill_down: operator_drill_down(
+            "Memory learning review",
+            "memory",
+            "/console/v1/memory/learning/candidates",
+            "/control/memory",
+        ),
+    })
+}
+
+fn learning_candidate_lifecycle_status(status: &str, auto_applied: bool) -> &'static str {
+    let normalized = status.trim().to_ascii_lowercase().replace('_', "-");
+    if auto_applied {
+        return "deployed";
+    }
+    match normalized.as_str() {
+        "" | "queued" | "proposed" => "proposed",
+        "needs-review" | "review" | "pending-review" => "needs_review",
+        "approved" | "accepted" => "approved",
+        "rejected" | "suppressed" => "rejected",
+        "deployed" | "auto-applied" => "deployed",
+        "rolled-back" | "rollback" => "rolled_back",
+        _ => "other",
+    }
+}
+
+fn candidate_mentions_injection_conflict(candidate: &journal::LearningCandidateRecord) -> bool {
+    [
+        candidate.risk_level.as_str(),
+        candidate.title.as_str(),
+        candidate.summary.as_str(),
+        candidate.content_json.as_str(),
+        candidate.provenance_json.as_str(),
+    ]
+    .iter()
+    .any(|value| {
+        let normalized = value.to_ascii_lowercase();
+        normalized.contains("prompt_injection")
+            || normalized.contains("prompt-injection")
+            || normalized.contains("injection conflict")
+    })
+}
+
 fn build_operator_hotspots(
+    operations: &OperatorOperationsOverviewInsight,
     provider_health: &OperatorProviderHealthInsight,
+    security: &OperatorSecurityInsight,
     recall: &OperatorRecallInsight,
     compaction: &OperatorCompactionInsight,
     safety_boundary: &OperatorSafetyBoundaryInsight,
     plugins: &OperatorPluginInsight,
     cron: &OperatorCronInsight,
+    routines: &OperatorRoutineInsight,
+    memory_learning: &OperatorMemoryLearningInsight,
     reload: &OperatorReloadInsight,
 ) -> Vec<OperatorInsightHotspot> {
     let mut hotspots = Vec::new();
     for (hotspot_id, subsystem, state, severity, summary, detail, recommended_action, drill_down) in [
+        (
+            "operations_overview",
+            "operations_overview",
+            operations.state.as_str(),
+            operations.severity.as_str(),
+            operations.summary.as_str(),
+            format!(
+                "stuck_runs={} provider_cooldowns={} queue_backlog={} worker_failed_closed={}",
+                operations.stuck_runs,
+                operations.provider_cooldowns,
+                operations.queue_backlog,
+                operations.worker_failed_closed
+            ),
+            operations.recommended_action.clone(),
+            operations.drill_down.clone(),
+        ),
         (
             "provider_health",
             "provider_health",
@@ -2223,6 +2665,19 @@ fn build_operator_hotspots(
             ),
             provider_health.recommended_action.clone(),
             provider_health.drill_down.clone(),
+        ),
+        (
+            "security_posture",
+            "security_posture",
+            security.state.as_str(),
+            security.severity.as_str(),
+            security.summary.as_str(),
+            format!(
+                "approval_denies={} policy_denies={} sandbox_violations={}",
+                security.approval_denies, security.policy_denies, security.sandbox_violations
+            ),
+            security.recommended_action.clone(),
+            security.drill_down.clone(),
         ),
         (
             "recall_quality",
@@ -2290,6 +2745,35 @@ fn build_operator_hotspots(
             ),
             cron.recommended_action.clone(),
             cron.drill_down.clone(),
+        ),
+        (
+            "routine_delivery",
+            "routine_delivery",
+            routines.state.as_str(),
+            routines.severity.as_str(),
+            routines.summary.as_str(),
+            format!(
+                "failed_runs={} skipped_runs={} policy_denies={}",
+                routines.failed_runs, routines.skipped_runs, routines.policy_denies
+            ),
+            routines.recommended_action.clone(),
+            routines.drill_down.clone(),
+        ),
+        (
+            "memory_learning",
+            "memory_learning",
+            memory_learning.state.as_str(),
+            memory_learning.severity.as_str(),
+            memory_learning.summary.as_str(),
+            format!(
+                "needs_review={} deployed={} rolled_back={} injection_conflicts={}",
+                memory_learning.needs_review_candidates,
+                memory_learning.deployed_candidates,
+                memory_learning.rolled_back_candidates,
+                memory_learning.injection_conflicts
+            ),
+            memory_learning.recommended_action.clone(),
+            memory_learning.drill_down.clone(),
         ),
         (
             "reload_health",
@@ -2416,6 +2900,14 @@ fn ratio_bps_u64(numerator: u64, denominator: u64) -> u32 {
         0
     } else {
         ((numerator as u128) * 10_000 / (denominator as u128)).min(u128::from(u32::MAX)) as u32
+    }
+}
+
+const fn usize_to_u64(value: usize) -> u64 {
+    if value > u64::MAX as usize {
+        u64::MAX
+    } else {
+        value as u64
     }
 }
 
@@ -2973,8 +3465,9 @@ mod tests {
     use super::{
         build_operator_hotspots, build_operator_summary, csv_escape, operator_drill_down,
         operator_query_preview, OperatorCompactionInsight, OperatorCronInsight,
-        OperatorPluginInsight, OperatorProviderHealthInsight, OperatorRecallInsight,
-        OperatorReloadInsight, OperatorSafetyBoundaryInsight,
+        OperatorMemoryLearningInsight, OperatorOperationsOverviewInsight, OperatorPluginInsight,
+        OperatorProviderHealthInsight, OperatorRecallInsight, OperatorReloadInsight,
+        OperatorRoutineInsight, OperatorSafetyBoundaryInsight, OperatorSecurityInsight,
     };
 
     #[test]
@@ -2991,12 +3484,16 @@ mod tests {
         let warning = test_provider_health("degraded", "warning", "provider warning");
         let blocking = test_reload("blocking", "blocking", "reload blocking");
         let hotspots = build_operator_hotspots(
+            &test_operations("ok", "info", "operations ok"),
             &warning,
+            &test_security("ok", "info", "security ok"),
             &test_recall("ok", "info", "recall ok"),
             &test_compaction("ok", "info", "compaction ok"),
             &test_safety("ok", "info", "safety ok"),
             &test_plugins("ok", "info", "plugins ok"),
             &test_cron("ok", "info", "cron ok"),
+            &test_routines("ok", "info", "routines ok"),
+            &test_memory_learning("ok", "info", "memory learning ok"),
             &blocking,
         );
         assert_eq!(build_operator_summary(hotspots.as_slice()), ("blocking", "blocking"));
@@ -3010,6 +3507,32 @@ mod tests {
         assert!(!preview.contains("sk-live-super-secret"));
         assert!(!preview.contains('\n'));
         assert!(preview.len() <= 240);
+    }
+
+    fn test_operations(
+        state: &str,
+        severity: &str,
+        summary: &str,
+    ) -> OperatorOperationsOverviewInsight {
+        OperatorOperationsOverviewInsight {
+            state: state.to_owned(),
+            severity: severity.to_owned(),
+            summary: summary.to_owned(),
+            stuck_runs: 0,
+            provider_cooldowns: 0,
+            queue_backlog: 0,
+            routine_failures: 0,
+            plugin_errors: 0,
+            worker_orphaned: 0,
+            worker_failed_closed: 0,
+            recommended_action: "Inspect operations overview.".to_owned(),
+            drill_down: operator_drill_down(
+                "Operations overview",
+                "operations",
+                "/console/v1/system/insights",
+                "/control/operations",
+            ),
+        }
     }
 
     fn test_provider_health(
@@ -3033,6 +3556,27 @@ mod tests {
             recommended_action: "Inspect provider diagnostics.".to_owned(),
             drill_down: operator_drill_down(
                 "Provider and auth diagnostics",
+                "operations",
+                "/console/v1/diagnostics",
+                "/control/operations",
+            ),
+        }
+    }
+
+    fn test_security(state: &str, severity: &str, summary: &str) -> OperatorSecurityInsight {
+        OperatorSecurityInsight {
+            state: state.to_owned(),
+            severity: severity.to_owned(),
+            summary: summary.to_owned(),
+            approval_denies: 0,
+            policy_denies: 0,
+            redaction_events: 0,
+            sandbox_violations: 0,
+            skill_execution_denies: 0,
+            sampled_denied_tool_decisions: 0,
+            recommended_action: "Inspect security posture.".to_owned(),
+            drill_down: operator_drill_down(
+                "Security and approvals",
                 "operations",
                 "/console/v1/diagnostics",
                 "/control/operations",
@@ -3142,6 +3686,56 @@ mod tests {
                 "cron",
                 "/console/v1/routines",
                 "/control/cron",
+            ),
+        }
+    }
+
+    fn test_routines(state: &str, severity: &str, summary: &str) -> OperatorRoutineInsight {
+        OperatorRoutineInsight {
+            state: state.to_owned(),
+            severity: severity.to_owned(),
+            summary: summary.to_owned(),
+            total_runs: 0,
+            failed_runs: 0,
+            skipped_runs: 0,
+            policy_denies: 0,
+            success_rate_bps: 0,
+            recommended_action: "Inspect routine delivery.".to_owned(),
+            drill_down: operator_drill_down(
+                "Routine delivery",
+                "cron",
+                "/console/v1/routines",
+                "/control/cron",
+            ),
+        }
+    }
+
+    fn test_memory_learning(
+        state: &str,
+        severity: &str,
+        summary: &str,
+    ) -> OperatorMemoryLearningInsight {
+        OperatorMemoryLearningInsight {
+            state: state.to_owned(),
+            severity: severity.to_owned(),
+            summary: summary.to_owned(),
+            total_candidates: 0,
+            proposed_candidates: 0,
+            needs_review_candidates: 0,
+            approved_candidates: 0,
+            rejected_candidates: 0,
+            deployed_candidates: 0,
+            rolled_back_candidates: 0,
+            auto_applied_candidates: 0,
+            memory_rejections: 0,
+            injection_conflicts: 0,
+            rollback_events: 0,
+            recommended_action: "Inspect memory learning.".to_owned(),
+            drill_down: operator_drill_down(
+                "Memory learning review",
+                "memory",
+                "/console/v1/memory/learning/candidates",
+                "/control/memory",
             ),
         }
     }

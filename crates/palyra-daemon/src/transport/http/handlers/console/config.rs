@@ -206,6 +206,20 @@ pub(crate) async fn plan_config_reload_for_context(
                 "plan_id": plan.plan_id,
                 "source_path": plan.source_path,
                 "summary": plan.summary,
+                "actor": {
+                    "principal": context.principal.as_str(),
+                    "device_id": context.device_id.as_str(),
+                    "channel": context.channel.as_deref(),
+                },
+                "redacted_diff": plan.steps.iter().map(|step| json!({
+                    "component": step.component,
+                    "config_path": step.config_path,
+                    "category": step.category,
+                    "sensitivity": step.sensitivity,
+                    "reloadability": step.reloadability,
+                    "impact": step.impact,
+                    "redacted_diff": step.redacted_diff,
+                })).collect::<Vec<_>>(),
                 "steps": plan.steps,
             }),
         )
@@ -237,6 +251,7 @@ pub(crate) async fn apply_config_reload_for_context(
         )))
     })?;
     let plan = build_reload_plan(&current, &candidate, source_path, estimate_active_runs(state));
+    validate_reload_plan_reference(state, payload.plan_id.as_deref(), payload.force)?;
 
     let hot_safe_steps =
         plan.steps.iter().filter(|step| step.category == "hot_safe").cloned().collect::<Vec<_>>();
@@ -265,12 +280,9 @@ pub(crate) async fn apply_config_reload_for_context(
         if current.memory != candidate.memory {
             state.runtime.configure_memory(memory_runtime_config_from_loaded(&candidate));
             next_loaded.memory = candidate.memory.clone();
-            applied_steps.push(control_plane::ConfigReloadPlanStep {
-                component: "memory_runtime".to_owned(),
-                config_path: "memory".to_owned(),
-                category: "hot_safe".to_owned(),
-                reason: "memory limits and retention settings were applied in place".to_owned(),
-            });
+            if let Some(step) = plan.steps.iter().find(|step| step.config_path == "memory") {
+                applied_steps.push(step.clone());
+            }
         }
         let next_generation = state
             .configured_secrets
@@ -347,6 +359,21 @@ pub(crate) async fn apply_config_reload_for_context(
                 "plan_id": plan.plan_id,
                 "outcome": envelope.outcome,
                 "message": envelope.message,
+                "actor": {
+                    "principal": context.principal.as_str(),
+                    "device_id": context.device_id.as_str(),
+                    "channel": context.channel.as_deref(),
+                },
+                "idempotency_key_present": payload.idempotency_key.as_deref().is_some_and(|value| !value.trim().is_empty()),
+                "redacted_diff": plan.steps.iter().map(|step| json!({
+                    "component": step.component,
+                    "config_path": step.config_path,
+                    "category": step.category,
+                    "sensitivity": step.sensitivity,
+                    "reloadability": step.reloadability,
+                    "impact": step.impact,
+                    "redacted_diff": step.redacted_diff,
+                })).collect::<Vec<_>>(),
                 "applied_steps": envelope.applied_steps,
                 "skipped_steps": envelope.skipped_steps,
             }),
@@ -383,6 +410,58 @@ fn validate_requested_reload_path(
     Ok(active_path)
 }
 
+fn validate_reload_plan_reference(
+    state: &AppState,
+    requested_plan_id: Option<&str>,
+    force: bool,
+) -> Result<(), Response> {
+    let Some(requested_plan_id) =
+        requested_plan_id.map(str::trim).filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    let latest_plan_id = state
+        .reload_state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .latest_plan
+        .as_ref()
+        .map(|plan| plan.plan_id.clone());
+    if latest_plan_id.as_deref() == Some(requested_plan_id) || force {
+        return Ok(());
+    }
+    Err(runtime_status_response(tonic::Status::failed_precondition(
+        "reload plan_id is stale or unknown; create a new plan or pass force=true after review",
+    )))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reload_plan_step(
+    component: &str,
+    config_path: &str,
+    category: &str,
+    reason: &str,
+    default_value: &str,
+    validator: &str,
+    sensitivity: &str,
+    reloadability: &str,
+    impact: &str,
+    redacted_diff: &str,
+) -> control_plane::ConfigReloadPlanStep {
+    control_plane::ConfigReloadPlanStep {
+        component: component.to_owned(),
+        config_path: config_path.to_owned(),
+        category: category.to_owned(),
+        reason: reason.to_owned(),
+        default_value: default_value.to_owned(),
+        validator: validator.to_owned(),
+        sensitivity: sensitivity.to_owned(),
+        reloadability: reloadability.to_owned(),
+        impact: impact.to_owned(),
+        redacted_diff: redacted_diff.to_owned(),
+    }
+}
+
 fn build_reload_plan(
     current: &crate::config::LoadedConfig,
     candidate: &crate::config::LoadedConfig,
@@ -394,49 +473,67 @@ fn build_reload_plan(
     let mut steps = Vec::new();
 
     if current.memory != candidate.memory {
-        steps.push(control_plane::ConfigReloadPlanStep {
-            component: "memory_runtime".to_owned(),
-            config_path: "memory".to_owned(),
-            category: "hot_safe".to_owned(),
-            reason: "memory quotas, retention, and auto-inject settings can reload in place"
-                .to_owned(),
-        });
+        steps.push(reload_plan_step(
+            "memory_runtime",
+            "memory",
+            "hot_safe",
+            "memory quotas, retention, and auto-inject settings can reload in place",
+            "daemon defaults from memory config schema",
+            "LoadedConfig memory validation plus runtime quota bounds",
+            "operational",
+            "hot_safe",
+            "updates memory quotas, retention, and auto-inject settings without daemon restart",
+            "memory config changed; values redacted from reload audit",
+        ));
     }
     if current.model_provider != candidate.model_provider {
-        steps.push(control_plane::ConfigReloadPlanStep {
-            component: "model_provider".to_owned(),
-            config_path: "model_provider".to_owned(),
-            category: if active_runs > 0 {
-                "blocked_while_runs_active".to_owned()
-            } else {
-                "restart_required".to_owned()
-            },
-            reason: if active_runs > 0 {
-                "provider credentials and routing changed while runs are active".to_owned()
-            } else {
-                "provider runtime must be rebuilt to pick up credential or routing changes"
-                    .to_owned()
-            },
-        });
+        let category =
+            if active_runs > 0 { "blocked_while_runs_active" } else { "restart_required" };
+        let reason = if active_runs > 0 {
+            "provider credentials and routing changed while runs are active"
+        } else {
+            "provider runtime must be rebuilt to pick up credential or routing changes"
+        };
+        steps.push(reload_plan_step(
+            "model_provider",
+            "model_provider",
+            category,
+            reason,
+            "provider registry defaults",
+            "provider registry, auth profile, and private base URL validation",
+            "secret_refs_redacted",
+            category,
+            "changes model credentials, routing, registry, or provider network targets",
+            "model provider config changed; credential values and URLs are redacted",
+        ));
     }
     if current.tool_call.browser_service != candidate.tool_call.browser_service {
-        steps.push(control_plane::ConfigReloadPlanStep {
-            component: "browser_service".to_owned(),
-            config_path: "tool_call.browser_service".to_owned(),
-            category: "restart_required".to_owned(),
-            reason:
-                "browser service endpoint/auth changes are consumed by long-lived runtime clients"
-                    .to_owned(),
-        });
+        steps.push(reload_plan_step(
+            "browser_service",
+            "tool_call.browser_service",
+            "restart_required",
+            "browser service endpoint/auth changes are consumed by long-lived runtime clients",
+            "browser service disabled with bounded timeouts by default",
+            "browser service endpoint, auth token, timeout, and output-size validation",
+            "secret_refs_redacted",
+            "restart_required",
+            "changes long-lived browser service client connectivity",
+            "browser service config changed; auth token values are redacted",
+        ));
     }
     if current.admin != candidate.admin {
-        steps.push(control_plane::ConfigReloadPlanStep {
-            component: "admin_auth".to_owned(),
-            config_path: "admin".to_owned(),
-            category: "restart_required".to_owned(),
-            reason: "admin and connector auth tokens are captured during daemon bootstrap"
-                .to_owned(),
-        });
+        steps.push(reload_plan_step(
+            "admin_auth",
+            "admin",
+            "restart_required",
+            "admin and connector auth tokens are captured during daemon bootstrap",
+            "admin auth required in hardened profiles",
+            "admin token, connector token, and auth requirement validation",
+            "secret_refs_redacted",
+            "restart_required",
+            "changes control-plane authentication and connector token posture",
+            "admin auth config changed; token values are redacted",
+        ));
     }
     if current.deployment != candidate.deployment
         || current.daemon != candidate.daemon
@@ -445,13 +542,18 @@ fn build_reload_plan(
         || current.storage != candidate.storage
         || current.canvas_host != candidate.canvas_host
     {
-        steps.push(control_plane::ConfigReloadPlanStep {
-            component: "daemon_runtime".to_owned(),
-            config_path: "deployment/daemon/gateway/storage".to_owned(),
-            category: "restart_required".to_owned(),
-            reason: "bind, identity, storage, or canvas hosting changes require daemon restart"
-                .to_owned(),
-        });
+        steps.push(reload_plan_step(
+            "daemon_runtime",
+            "deployment/daemon/gateway/storage",
+            "restart_required",
+            "bind, identity, storage, or canvas hosting changes require daemon restart",
+            "loopback-only local deployment defaults",
+            "deployment, bind, TLS, storage, and identity fail-closed validation",
+            "operational",
+            "restart_required",
+            "changes daemon bind, TLS, storage, identity, or canvas hosting behavior",
+            "daemon runtime config changed; bind/storage details summarized without secrets",
+        ));
     }
     if current.feature_rollouts != candidate.feature_rollouts
         || current.cron != candidate.cron
@@ -465,14 +567,18 @@ fn build_reload_plan(
         || current.tool_call.http_fetch != candidate.tool_call.http_fetch
         || current.channel_router != candidate.channel_router
     {
-        steps.push(control_plane::ConfigReloadPlanStep {
-            component: "safety_and_routing".to_owned(),
-            config_path: "tool_call/channel_router/feature_rollouts".to_owned(),
-            category: "manual_review".to_owned(),
-            reason:
-                "safety posture, rollout, or routing changes need explicit operator review before hot reload"
-                    .to_owned(),
-        });
+        steps.push(reload_plan_step(
+            "safety_and_routing",
+            "tool_call/channel_router/feature_rollouts",
+            "manual_review",
+            "safety posture, rollout, or routing changes need explicit operator review before hot reload",
+            "deny-by-default tool posture with conservative rollout defaults",
+            "tool, sandbox, fetch, routing, and rollout policy validation",
+            "policy",
+            "manual_review",
+            "changes sensitive action policy, routing, rollout, or channel behavior",
+            "safety or routing config changed; policy diff is summarized without secret values",
+        ));
     }
 
     let summary = control_plane::ConfigReloadPlanSummary {

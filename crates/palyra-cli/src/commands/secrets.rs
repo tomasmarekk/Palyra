@@ -1012,6 +1012,7 @@ fn run_runtime_secret_apply(path: Option<String>, dry_run: bool, json: bool) -> 
             .apply_config_reload(&control_plane::ConfigReloadApplyRequest {
                 path,
                 plan_id: None,
+                idempotency_key: None,
                 dry_run,
                 force: false,
             })

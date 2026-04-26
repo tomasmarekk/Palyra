@@ -380,8 +380,10 @@ pub(crate) async fn console_learning_candidates_list_handler(
         })
         .await
         .map_err(runtime_status_response)?;
+    let lifecycle = learning_candidates_lifecycle_summary(candidates.as_slice());
     Ok(Json(json!({
         "candidates": candidates,
+        "lifecycle": lifecycle,
         "contract": contract_descriptor(),
     })))
 }
@@ -399,9 +401,11 @@ pub(crate) async fn console_learning_candidate_history_handler(
         .learning_candidate_history(candidate.candidate_id.clone())
         .await
         .map_err(runtime_status_response)?;
+    let lifecycle = learning_candidate_lifecycle(&candidate, history.as_slice());
     Ok(Json(json!({
         "candidate": candidate,
         "history": history,
+        "lifecycle": lifecycle,
         "contract": contract_descriptor(),
     })))
 }
@@ -415,11 +419,12 @@ pub(crate) async fn console_learning_candidate_review_handler(
     let session = authorize_console_session(&state, &headers, true)?;
     let candidate =
         load_console_learning_candidate(&state, &session.context, candidate_id.as_str()).await?;
+    let status = normalize_learning_candidate_review_status(payload.status.as_str())?;
     let reviewed = state
         .runtime
         .review_learning_candidate(journal::LearningCandidateReviewRequest {
             candidate_id: candidate.candidate_id.clone(),
-            status: payload.status.trim().to_owned(),
+            status,
             reviewed_by_principal: session.context.principal.clone(),
             action_summary: payload.action_summary.and_then(trim_to_option),
             action_payload_json: payload.action_payload_json.and_then(trim_to_option),
@@ -427,7 +432,8 @@ pub(crate) async fn console_learning_candidate_review_handler(
         .await
         .map_err(runtime_status_response)?;
     let applied_preference = if payload.apply_preference.unwrap_or(false)
-        || (reviewed.candidate_kind == "preference" && reviewed.status == "accepted")
+        || (reviewed.candidate_kind == "preference"
+            && matches!(reviewed.status.as_str(), "accepted" | "approved" | "deployed"))
     {
         apply_preference_candidate(&state.runtime, &reviewed, session.context.principal.as_str())
             .await
@@ -435,9 +441,11 @@ pub(crate) async fn console_learning_candidate_review_handler(
     } else {
         None
     };
+    let lifecycle = learning_candidate_lifecycle(&reviewed, &[]);
     Ok(Json(json!({
         "candidate": reviewed,
         "applied_preference": applied_preference,
+        "lifecycle": lifecycle,
         "contract": contract_descriptor(),
     })))
 }
@@ -464,9 +472,12 @@ pub(crate) async fn console_learning_candidate_apply_handler(
             "only patch-based learning candidates can be applied",
         ))
     })?;
+    let response_candidate = applied.get("candidate").cloned().unwrap_or_else(|| json!(candidate));
+    let lifecycle = learning_candidate_lifecycle_from_value(&response_candidate);
     Ok(Json(json!({
-        "candidate": applied.get("candidate").cloned().unwrap_or_else(|| json!(candidate)),
+        "candidate": response_candidate,
         "apply": applied,
+        "lifecycle": lifecycle,
         "contract": contract_descriptor(),
     })))
 }
@@ -1356,6 +1367,219 @@ async fn run_memory_maintenance_now(
         )
         .await
         .map_err(runtime_status_response)
+}
+
+fn normalize_learning_candidate_review_status(status: &str) -> Result<String, Response> {
+    let normalized = status.trim().to_ascii_lowercase().replace('_', "-");
+    let accepted = match normalized.as_str() {
+        "proposed" | "queued" => normalized,
+        "needs-review" | "review" | "pending-review" => "needs-review".to_owned(),
+        "approve" | "approved" => "approved".to_owned(),
+        "accept" | "accepted" => "accepted".to_owned(),
+        "reject" | "rejected" => "rejected".to_owned(),
+        "deny" | "denied" => "denied".to_owned(),
+        "suppress" | "suppressed" => "suppressed".to_owned(),
+        "deploy" | "deployed" => "deployed".to_owned(),
+        "applied" | "auto-applied" => normalized,
+        "rollback" | "rolled-back" => "rolled-back".to_owned(),
+        "conflicted" => normalized,
+        _ => {
+            return Err(runtime_status_response(tonic::Status::invalid_argument(
+                "status must be proposed, needs-review, approved, rejected, deployed, rolled-back, or a supported legacy review state",
+            )));
+        }
+    };
+    Ok(accepted)
+}
+
+fn learning_candidates_lifecycle_summary(candidates: &[journal::LearningCandidateRecord]) -> Value {
+    let mut counts = serde_json::Map::new();
+    for status in ["proposed", "needs-review", "approved", "rejected", "deployed", "rolled-back"] {
+        counts.insert(status.to_owned(), json!(0_u64));
+    }
+    let mut injection_conflicts = 0_u64;
+    for candidate in candidates {
+        let status = learning_candidate_lifecycle_status(candidate);
+        let count = counts.get(status).and_then(Value::as_u64).unwrap_or(0).saturating_add(1);
+        counts.insert(status.to_owned(), json!(count));
+        if learning_candidate_has_injection_conflict(candidate) {
+            injection_conflicts = injection_conflicts.saturating_add(1);
+        }
+    }
+    json!({
+        "candidate_count": candidates.len(),
+        "status_counts": counts,
+        "injection_conflicts": injection_conflicts,
+        "allowed_statuses": [
+            "proposed",
+            "needs-review",
+            "approved",
+            "rejected",
+            "deployed",
+            "rolled-back"
+        ],
+        "review_actions": ["approve", "reject", "edit", "merge", "deploy", "rollback"],
+        "deployment_policy": {
+            "auto_deploy_enabled": false,
+            "policy_gate": "operator_review_required",
+            "raw_prompts_included": false,
+            "raw_secrets_included": false,
+        },
+    })
+}
+
+fn learning_candidate_lifecycle(
+    candidate: &journal::LearningCandidateRecord,
+    history: &[journal::LearningCandidateHistoryRecord],
+) -> Value {
+    let status = learning_candidate_lifecycle_status(candidate);
+    let rollback_seen = status == "rolled-back"
+        || history.iter().any(|entry| {
+            entry.status.eq_ignore_ascii_case("rolled-back")
+                || entry
+                    .action_summary
+                    .as_deref()
+                    .is_some_and(|summary| summary.to_ascii_lowercase().contains("rollback"))
+        });
+    json!({
+        "candidate_id": candidate.candidate_id,
+        "type": candidate.candidate_kind,
+        "status": status,
+        "stored_status": candidate.status,
+        "scope": {
+            "kind": candidate.scope_kind,
+            "id": candidate.scope_id,
+            "owner_principal": candidate.owner_principal,
+            "device_id": candidate.device_id,
+            "channel": candidate.channel,
+            "session_id": candidate.session_id,
+        },
+        "evidence": {
+            "confidence": candidate.confidence,
+            "risk_level": candidate.risk_level,
+            "provenance_present": !candidate.provenance_json.trim().is_empty(),
+            "source_task_id": candidate.source_task_id,
+            "created_at_unix_ms": candidate.created_at_unix_ms,
+            "updated_at_unix_ms": candidate.updated_at_unix_ms,
+        },
+        "proposed_change": {
+            "title": candidate.title,
+            "summary": candidate.summary,
+            "target_path": candidate.target_path,
+            "content_json_bytes": candidate.content_json.len(),
+        },
+        "deployment_posture": learning_candidate_deployment_posture(candidate, status),
+        "rollback": {
+            "available": matches!(status, "approved" | "deployed" | "rolled-back"),
+            "seen": rollback_seen,
+            "restore_contract": "rollback records status=rolled-back with action_payload_json evidence for restored memory, routine, config, or patch state",
+            "previous_state_restored": candidate
+                .last_action_payload_json
+                .as_deref()
+                .and_then(parse_json_object)
+                .and_then(|payload| payload.get("previous_state_restored").and_then(Value::as_bool))
+                .unwrap_or(false),
+        },
+    })
+}
+
+fn learning_candidate_lifecycle_from_value(candidate: &Value) -> Value {
+    let status = candidate.get("status").and_then(Value::as_str).unwrap_or("proposed");
+    let auto_applied = candidate.get("auto_applied").and_then(Value::as_bool).unwrap_or(false);
+    let lifecycle_status = learning_candidate_status_label(status, auto_applied, None);
+    json!({
+        "candidate_id": candidate.get("candidate_id").and_then(Value::as_str),
+        "type": candidate.get("candidate_kind").and_then(Value::as_str),
+        "status": lifecycle_status,
+        "stored_status": status,
+        "deployment_posture": {
+            "auto_deploy_enabled": false,
+            "policy_gate": "operator_review_required",
+            "impact_scope": candidate.get("scope_kind").and_then(Value::as_str),
+            "deployed": lifecycle_status == "deployed",
+        },
+        "rollback": {
+            "available": matches!(lifecycle_status, "approved" | "deployed" | "rolled-back"),
+            "restore_contract": "rollback records status=rolled-back with action_payload_json evidence for restored memory, routine, config, or patch state",
+        },
+    })
+}
+
+fn learning_candidate_lifecycle_status(
+    candidate: &journal::LearningCandidateRecord,
+) -> &'static str {
+    let applied_by_action = candidate
+        .last_action_payload_json
+        .as_deref()
+        .and_then(parse_json_object)
+        .and_then(|payload| payload.get("action").and_then(Value::as_str).map(str::to_owned))
+        .is_some_and(|action| action == "apply_preference" || action == "apply_patch_candidate");
+    learning_candidate_status_label(
+        candidate.status.as_str(),
+        candidate.auto_applied,
+        Some(applied_by_action),
+    )
+}
+
+fn learning_candidate_status_label(
+    status: &str,
+    auto_applied: bool,
+    applied_by_action: Option<bool>,
+) -> &'static str {
+    if auto_applied || applied_by_action.unwrap_or(false) {
+        return "deployed";
+    }
+    match status.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "" | "queued" | "proposed" => "proposed",
+        "needs-review" | "review" | "pending-review" => "needs-review",
+        "approved" | "accepted" => "approved",
+        "rejected" | "denied" | "suppressed" | "conflicted" => "rejected",
+        "applied" | "auto-applied" | "deployed" => "deployed",
+        "rolled-back" | "rollback" => "rolled-back",
+        _ => "proposed",
+    }
+}
+
+fn learning_candidate_deployment_posture(
+    candidate: &journal::LearningCandidateRecord,
+    lifecycle_status: &str,
+) -> Value {
+    let impact_scope = match candidate.scope_kind.as_str() {
+        "global" => "global",
+        "workspace" | "workspace_document" => "workspace",
+        "user" | "profile" => "user",
+        "session" => "session",
+        _ => "candidate_scope",
+    };
+    json!({
+        "auto_deploy_enabled": false,
+        "policy_gate": "operator_review_required",
+        "impact_scope": impact_scope,
+        "candidate_kind": candidate.candidate_kind,
+        "deployed": lifecycle_status == "deployed",
+        "requires_review_before_deploy": !matches!(lifecycle_status, "deployed" | "rolled-back"),
+    })
+}
+
+fn learning_candidate_has_injection_conflict(candidate: &journal::LearningCandidateRecord) -> bool {
+    [
+        candidate.risk_level.as_str(),
+        candidate.title.as_str(),
+        candidate.summary.as_str(),
+        candidate.content_json.as_str(),
+        candidate.provenance_json.as_str(),
+    ]
+    .iter()
+    .any(|value| {
+        let normalized = value.to_ascii_lowercase();
+        normalized.contains("prompt_injection")
+            || normalized.contains("prompt-injection")
+            || normalized.contains("injection conflict")
+    })
+}
+
+fn parse_json_object(payload: &str) -> Option<serde_json::Map<String, Value>> {
+    serde_json::from_str::<Value>(payload).ok()?.as_object().cloned()
 }
 
 async fn load_console_learning_candidate(
