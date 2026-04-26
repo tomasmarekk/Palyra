@@ -4,7 +4,7 @@ use crate::{
     app::state::AppState,
     application::channels::providers::{
         build_channel_provider_health_refresh_payload, build_channel_provider_operations_payload,
-        find_matching_message,
+        discord, find_matching_message,
     },
     *,
 };
@@ -23,7 +23,7 @@ pub(crate) fn build_channel_status_payload(
         .channels
         .dead_letters(connector_id, Some(5))
         .map_err(channel_platform_error_response)?;
-    Ok(json!({
+    let mut payload = json!({
         "connector": connector,
         "runtime": runtime,
         "operations": build_channel_operations_snapshot(
@@ -33,7 +33,13 @@ pub(crate) fn build_channel_status_payload(
             &queue,
             recent_dead_letters.as_slice(),
         ),
-    }))
+    });
+    if connector.kind == palyra_connectors::ConnectorKind::Discord {
+        if let Err(message) = discord::resolve_discord_connector_token(state, connector_id) {
+            apply_channel_auth_failure_surface(&mut payload, message.as_str());
+        }
+    }
+    Ok(payload)
 }
 
 #[allow(clippy::result_large_err)]
@@ -320,6 +326,43 @@ mod tests {
         assert_eq!(
             payload.pointer("/operations/saturation/state").and_then(Value::as_str),
             Some("auth_failed")
+        );
+    }
+
+    #[test]
+    fn credential_failure_overrides_disabled_ready_surface() {
+        let mut payload = json!({
+            "connector": {
+                "enabled": false,
+                "readiness": "ready",
+                "liveness": "stopped",
+                "last_error": null,
+            },
+            "operations": {
+                "last_auth_failure": null,
+                "saturation": {
+                    "state": "paused",
+                    "reasons": ["connector_disabled"],
+                },
+            },
+        });
+
+        apply_channel_auth_failure_surface(
+            &mut payload,
+            "failed to load Discord token from vault ref 'global/discord_bot_token': secret not found",
+        );
+
+        assert_eq!(
+            payload.pointer("/connector/readiness").and_then(Value::as_str),
+            Some("missing_credential")
+        );
+        assert_eq!(
+            payload.pointer("/connector/last_error").and_then(Value::as_str),
+            Some("failed to load Discord token from vault ref 'global/discord_bot_token': secret not found")
+        );
+        assert_eq!(
+            payload.pointer("/operations/last_auth_failure").and_then(Value::as_str),
+            Some("failed to load Discord token from vault ref 'global/discord_bot_token': secret not found")
         );
     }
 }

@@ -120,7 +120,10 @@ fn discord_account_id_from_connector_id(connector_id: &str) -> Option<&str> {
     connector_id.trim().strip_prefix("discord:").map(str::trim).filter(|value| !value.is_empty())
 }
 
-fn resolve_discord_connector_token(state: &AppState, connector_id: &str) -> Result<String, String> {
+pub(crate) fn resolve_discord_connector_token(
+    state: &AppState,
+    connector_id: &str,
+) -> Result<String, String> {
     let instance = state.channels.connector_instance(connector_id).map_err(|error| {
         format!(
             "failed to load connector instance '{}' for Discord token lookup: {error}",
