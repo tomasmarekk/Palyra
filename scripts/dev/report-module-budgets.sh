@@ -9,6 +9,8 @@ critical_threshold="${PALYRA_MODULE_BUDGET_CRITICAL:-1200}"
 strict_threshold="${PALYRA_MODULE_BUDGET_STRICT:-${critical_threshold}}"
 entrypoint_threshold="${PALYRA_MODULE_BUDGET_ENTRYPOINT:-200}"
 entrypoint_strict_threshold="${PALYRA_MODULE_BUDGET_ENTRYPOINT_STRICT:-500}"
+strict_delta_threshold="${PALYRA_MODULE_BUDGET_STRICT_DELTA:-200}"
+entrypoint_strict_delta_threshold="${PALYRA_MODULE_BUDGET_ENTRYPOINT_STRICT_DELTA:-100}"
 allowlist_file="${PALYRA_MODULE_BUDGET_ALLOWLIST:-scripts/dev/module-budget-allowlist.txt}"
 strict_mode=false
 
@@ -181,7 +183,7 @@ for scope in "${!discord_counts[@]}"; do
   fi
 done
 
-diff_base="$(discover_diff_base)"
+diff_base="${PALYRA_MODULE_BUDGET_DIFF_BASE:-$(discover_diff_base)}"
 
 while IFS= read -r path; do
   [[ -z "${path}" ]] && continue
@@ -205,10 +207,12 @@ while IFS= read -r path; do
 
   if (( delta > 0 && current_lines >= strict_threshold )); then
     regression_row="$(format_regression_row "${delta}" "${previous_lines}" "${current_lines}" "${path}")"
-    if is_allowlisted "${path}"; then
-      allowlisted_strict_budget_regressions+=("${regression_row}")
-    else
-      strict_budget_regressions+=("${regression_row}")
+    if (( previous_lines < strict_threshold || delta >= strict_delta_threshold )); then
+      if is_allowlisted "${path}"; then
+        allowlisted_strict_budget_regressions+=("${regression_row}")
+      else
+        strict_budget_regressions+=("${regression_row}")
+      fi
     fi
   fi
 
@@ -224,10 +228,12 @@ while IFS= read -r path; do
       fi
       if (( delta > 0 && current_lines >= entrypoint_strict_threshold )); then
         regression_row="$(format_regression_row "${delta}" "${previous_lines}" "${current_lines}" "${path}")"
-        if is_allowlisted "${path}"; then
-          allowlisted_strict_entrypoint_regressions+=("${regression_row}")
-        else
-          strict_entrypoint_regressions+=("${regression_row}")
+        if (( previous_lines < entrypoint_strict_threshold || delta >= entrypoint_strict_delta_threshold )); then
+          if is_allowlisted "${path}"; then
+            allowlisted_strict_entrypoint_regressions+=("${regression_row}")
+          else
+            strict_entrypoint_regressions+=("${regression_row}")
+          fi
         fi
       fi
       ;;
@@ -241,6 +247,8 @@ echo "critical_threshold=${critical_threshold}"
 echo "strict_threshold=${strict_threshold}"
 echo "entrypoint_threshold=${entrypoint_threshold}"
 echo "entrypoint_strict_threshold=${entrypoint_strict_threshold}"
+echo "strict_delta_threshold=${strict_delta_threshold}"
+echo "entrypoint_strict_delta_threshold=${entrypoint_strict_delta_threshold}"
 echo "allowlist_file=${allowlist_file}"
 echo "diff_base=${diff_base:-none}"
 echo
@@ -285,7 +293,7 @@ else
 fi
 echo
 
-echo "Touched files that grew at or above strict threshold (not allowlisted):"
+echo "Touched files that crossed strict threshold or grew by ${strict_delta_threshold}+ LOC above it (not allowlisted):"
 if (( ${#strict_budget_regressions[@]} == 0 )); then
   echo "  none"
 else
@@ -293,7 +301,7 @@ else
 fi
 echo
 
-echo "Allowlisted touched files that grew at or above strict threshold:"
+echo "Allowlisted touched files that crossed strict threshold or grew by ${strict_delta_threshold}+ LOC above it:"
 if (( ${#allowlisted_strict_budget_regressions[@]} == 0 )); then
   echo "  none"
 else
@@ -317,7 +325,7 @@ else
 fi
 echo
 
-echo "Touched entrypoints that grew at or above strict threshold (not allowlisted):"
+echo "Touched entrypoints that crossed strict threshold or grew by ${entrypoint_strict_delta_threshold}+ LOC above it (not allowlisted):"
 if (( ${#strict_entrypoint_regressions[@]} == 0 )); then
   echo "  none"
 else
@@ -325,7 +333,7 @@ else
 fi
 echo
 
-echo "Allowlisted touched entrypoints that grew at or above strict threshold:"
+echo "Allowlisted touched entrypoints that crossed strict threshold or grew by ${entrypoint_strict_delta_threshold}+ LOC above it:"
 if (( ${#allowlisted_strict_entrypoint_regressions[@]} == 0 )); then
   echo "  none"
 else
@@ -351,12 +359,12 @@ if ${strict_mode}; then
   strict_failed=false
 
   if (( ${#strict_budget_regressions[@]} > 0 )); then
-    echo "strict mode: one or more touched files grew at or above strict threshold" >&2
+    echo "strict mode: one or more touched files crossed the strict threshold or exceeded strict growth delta" >&2
     strict_failed=true
   fi
 
   if (( ${#strict_entrypoint_regressions[@]} > 0 )); then
-    echo "strict mode: one or more touched entrypoints grew at or above strict threshold" >&2
+    echo "strict mode: one or more touched entrypoints crossed the strict threshold or exceeded strict growth delta" >&2
     strict_failed=true
   fi
 
