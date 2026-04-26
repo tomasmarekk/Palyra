@@ -2161,7 +2161,7 @@ fn console_channels_endpoints_require_session_and_csrf() -> Result<()> {
     assert_eq!(
         test_response.status().as_u16(),
         412,
-        "channels test endpoint should fail with failed-precondition when connector token is missing"
+        "channels test endpoint should fail with failed-precondition when the connector is not user-testable"
     );
     let test_response = test_response
         .json::<Value>()
@@ -2170,8 +2170,9 @@ fn console_channels_endpoints_require_session_and_csrf() -> Result<()> {
         test_response
             .get("error")
             .and_then(Value::as_str)
-            .is_some_and(|value| value.contains("connector_token is required")),
-        "channels test error response should explain missing connector token requirement"
+            .is_some_and(|value| value.contains("internal_test_only")
+                && value.contains("does not support user-facing channel tests")),
+        "channels test error response should explain the connector's internal-test-only scope"
     );
 
     let discord_connector_id = "discord:default";
