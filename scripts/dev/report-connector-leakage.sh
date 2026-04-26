@@ -152,7 +152,7 @@ print_matches_or_none \
   bash -lc "printf '%s' \"\$0\"" "${connector_kind_violations}"
 
 cat <<'EOF'
-Milestone acceptance grep commands:
+Acceptance grep commands:
   rg -n 'palyra_connector_core|palyra_connector_discord' crates apps fuzz
   rg -n 'palyra-connector-core|palyra-connector-discord' crates/*/Cargo.toml apps/desktop/src-tauri/Cargo.toml
   rg -n 'ConnectorKind::Discord' crates/palyra-daemon crates/palyra-cli crates/palyra-connectors/src/providers

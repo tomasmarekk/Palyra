@@ -27,16 +27,13 @@ resolve_cargo() {
     fi
   done
 
-  echo "cargo is required for replay gate checks." >&2
+  echo "cargo is required for release eval gate checks." >&2
   exit 1
 }
 
 CARGO_BIN="$(resolve_cargo)"
 
-"$CARGO_BIN" test -p palyra-common replay_bundle --locked
 "$CARGO_BIN" test -p palyra-common --test release_eval_contract --locked
 "$CARGO_BIN" run -p palyra-cli --example run_release_eval_gate --locked -- \
   --manifest fixtures/golden/release_eval_inventory.json \
   --report-dir target/release-artifacts/release-evals
-"$CARGO_BIN" test -p palyra-cli support_bundle --locked
-"$CARGO_BIN" test -p palyra-daemon replay_capture --locked

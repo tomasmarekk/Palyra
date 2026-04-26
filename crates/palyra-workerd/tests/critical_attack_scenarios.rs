@@ -36,7 +36,7 @@ fn load_corpus() -> AttackCorpus {
         .join("..")
         .join("..")
         .join("fixtures")
-        .join("phase6")
+        .join("security")
         .join("critical_attack_scenarios.json");
     let raw = fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("failed to read attack corpus {}: {error}", path.display()));

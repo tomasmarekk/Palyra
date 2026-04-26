@@ -50,6 +50,9 @@ deterministic-core:
 retrieval-benchmark:
     bash scripts/test/run-retrieval-benchmark.sh
 
+release-eval-gate:
+    bash scripts/test/run-release-eval-gate.sh
+
 cli-test:
     cargo test -p palyra-cli --locked
 

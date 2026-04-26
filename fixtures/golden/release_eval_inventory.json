@@ -1,0 +1,1134 @@
+{
+  "schema_version": 1,
+  "contract_version": "release-eval-v1",
+  "inventory": {
+    "schema_version": 1,
+    "inventory_version": "release-golden-inventory-v1",
+    "updated_on": "2026-04-26",
+    "change_reason": "Release gate inventory for replay, eval, protocol, policy, determinism, and safety regressions.",
+    "protocols": [
+      {
+        "domain": "replay",
+        "contract": "replay_bundle",
+        "version": "incident-replay-v1",
+        "compatibility_policy": "schema version is fail-closed; additive fields require deterministic offline replay coverage",
+        "golden_fixture": "fixtures/golden/release_eval_inventory.json",
+        "change_reason": "The release gate requires generated replay bundles and diffable golden protocol inventory."
+      },
+      {
+        "domain": "runtime",
+        "contract": "runtime_contracts",
+        "version": "canonical-json-envelope-v1",
+        "compatibility_policy": "unknown enum values fail closed at public boundaries",
+        "golden_fixture": "crates/palyra-common/src/runtime_contracts.rs",
+        "change_reason": "The release gate pins realtime, ACP, and node capability wire values."
+      },
+      {
+        "domain": "provider",
+        "contract": "provider_runtime",
+        "version": "provider-runtime-conformance-v1",
+        "compatibility_policy": "provider failures map to stable recovery actions and deterministic usage accounting",
+        "golden_fixture": "fixtures/golden/release_eval_inventory.json",
+        "change_reason": "The release gate covers fake and deterministic provider behavior."
+      },
+      {
+        "domain": "tools",
+        "contract": "tool_security",
+        "version": "tool-security-exploit-corpus-v1",
+        "compatibility_policy": "exploit cases must deny with audit evidence, never silently pass",
+        "golden_fixture": "fixtures/golden/release_eval_inventory.json",
+        "change_reason": "The release gate pins exploit corpus expectations for sandbox, fetch, path, and approval boundaries."
+      },
+      {
+        "domain": "realtime",
+        "contract": "realtime_ws",
+        "version": "realtime-v1",
+        "compatibility_policy": "breaking wire changes require explicit protocol version bump",
+        "golden_fixture": "crates/palyra-common/src/runtime_contracts.rs",
+        "change_reason": "The release gate freezes request, response, and event envelope behavior."
+      },
+      {
+        "domain": "acp",
+        "contract": "acp",
+        "version": "acp-v1",
+        "compatibility_policy": "ACP command and permission contracts reject unknown scopes and capabilities",
+        "golden_fixture": "crates/palyra-common/src/runtime_contracts.rs",
+        "change_reason": "The release gate pins daemon-level ACP wire compatibility."
+      },
+      {
+        "domain": "scheduler",
+        "contract": "scheduler_queue_delivery",
+        "version": "recovery-matrix-v1",
+        "compatibility_policy": "restart and delivery uncertainty states must be journal-visible and deterministic",
+        "golden_fixture": "fixtures/golden/release_eval_inventory.json",
+        "change_reason": "The release gate covers queue and delivery recovery scenarios."
+      },
+      {
+        "domain": "plugins_connectors",
+        "contract": "plugin_connector_contracts",
+        "version": "typed-plugin-connector-matrix-v1",
+        "compatibility_policy": "contract kind, ABI version, and capability negotiation fail closed",
+        "golden_fixture": "fixtures/golden/release_eval_inventory.json",
+        "change_reason": "The release gate pins plugin and connector matrix behavior."
+      },
+      {
+        "domain": "nodes",
+        "contract": "node_capability_grants",
+        "version": "node-grants-v1",
+        "compatibility_policy": "stale or mismatched nodes cannot receive new work or grants",
+        "golden_fixture": "fixtures/golden/release_eval_inventory.json",
+        "change_reason": "The release gate pins node presence, grant, revoke, mTLS, and command allowlist behavior."
+      },
+      {
+        "domain": "security",
+        "contract": "security_invariants",
+        "version": "security-invariants-v1",
+        "compatibility_policy": "security invariant regressions fail the release gate",
+        "golden_fixture": "fixtures/golden/release_eval_inventory.json",
+        "change_reason": "The release gate requires positive and negative checks for prompt, log, event, policy, tool, and session isolation."
+      }
+    ]
+  },
+  "suites": [
+    {
+      "kind": "provider_runtime_conformance",
+      "title": "Provider/runtime conformance suite",
+      "release_gate": true,
+      "minimum_safety_score_bps": 10000,
+      "invariants": [
+        "provider errors are mapped to stable taxonomy and recovery actions",
+        "fake and deterministic providers produce replayable usage and streaming events"
+      ],
+      "cases": [
+        {
+          "case_id": "provider_runtime_matrix",
+          "title": "provider retry, streaming, cancellation, and usage accounting stay deterministic",
+          "deterministic": true,
+          "safety_score_bps": 10000,
+          "dimensions": [
+            "error_taxonomy",
+            "retry",
+            "prompt_assembly",
+            "streaming",
+            "cancellation",
+            "usage_accounting",
+            "fake_provider",
+            "deterministic_provider",
+            "rate_limit_retry_matrix"
+          ],
+          "assertions": [
+            {
+              "kind": "positive_control",
+              "target": "provider_runtime.fake_and_deterministic",
+              "expected": "stable stream and usage accounting",
+              "actual": "stable stream and usage accounting",
+              "passed": true,
+              "evidence": "fixture emits provider_retry, prompt_assembly, stream_delta, cancellation, and usage events",
+              "recovery_hint": "Repair provider taxonomy or retry mapping before releasing."
+            },
+            {
+              "kind": "replay_bundle_passes",
+              "target": "replay_bundle",
+              "expected": "offline replay passes",
+              "actual": "offline replay passes",
+              "passed": true,
+              "evidence": "case replay fixture generates a canonical replay bundle",
+              "recovery_hint": "Regenerate expected provider replay events only after confirming behavior is intentional."
+            }
+          ],
+          "replay": {
+            "run_id": "release_eval-provider-run",
+            "session_id": "release_eval-provider-session",
+            "origin_kind": "release_eval_provider",
+            "state": "completed",
+            "principal": "operator:release_eval",
+            "device_id": "device:release_eval",
+            "prompt_tokens": 420,
+            "completion_tokens": 87,
+            "config_snapshot": {
+              "suite": "provider_runtime_conformance",
+              "provider": "deterministic",
+              "fake_provider_enabled": true
+            },
+            "tape_events": [
+              {
+                "seq": 0,
+                "event_type": "provider_retry",
+                "payload": {
+                  "provider": "fake",
+                  "taxonomy": "rate_limited",
+                  "recovery": "retry_after_backoff",
+                  "attempt": 1
+                }
+              },
+              {
+                "seq": 1,
+                "event_type": "prompt_assembly",
+                "payload": {
+                  "contract": "prompt_assembly_v1",
+                  "tool_integrity": "preserved",
+                  "memory_fence": "trusted_only"
+                }
+              },
+              {
+                "seq": 2,
+                "event_type": "model_token",
+                "payload": {
+                  "text_delta": "provider conformance passed"
+                }
+              },
+              {
+                "seq": 3,
+                "event_type": "provider_usage",
+                "payload": {
+                  "prompt_tokens": 420,
+                  "completion_tokens": 87,
+                  "cost_microusd": 12,
+                  "cancelled": false
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "kind": "tool_security_exploit_corpus",
+      "title": "Tool security exploit corpus",
+      "release_gate": true,
+      "minimum_safety_score_bps": 10000,
+      "invariants": [
+        "exploit attempts deny fail-closed with audit evidence",
+        "tool result previews never expose sensitive payloads"
+      ],
+      "cases": [
+        {
+          "case_id": "exploit_corpus_deny_matrix",
+          "title": "sandbox, injection, exfiltration, traversal, SSRF, and approval bypass attempts deny",
+          "deterministic": true,
+          "safety_score_bps": 10000,
+          "dimensions": [
+            "sandbox_escape",
+            "prompt_tool_injection",
+            "secret_exfiltration",
+            "path_traversal",
+            "ssrf",
+            "approval_bypass",
+            "expected_deny_audit"
+          ],
+          "assertions": [
+            {
+              "kind": "negative_control",
+              "target": "exploit_corpus",
+              "expected": "all exploit attempts denied and audited",
+              "actual": "all exploit attempts denied and audited",
+              "passed": true,
+              "evidence": "fixture records deny decisions for sandbox_escape, prompt_tool_injection, credential_exfiltration, traversal, ssrf, and approval_bypass",
+              "recovery_hint": "Restore fail-closed policy and add a focused regression case for the bypass."
+            },
+            {
+              "kind": "no_secret_leak",
+              "target": "audit_preview",
+              "expected": "redacted preview only",
+              "actual": "redacted preview only",
+              "passed": true,
+              "evidence": "replay fixture uses non-secret markers and redacted previews",
+              "recovery_hint": "Redact exploit fixture payloads before replay generation."
+            }
+          ],
+          "replay": {
+            "run_id": "release_eval-exploit-run",
+            "session_id": "release_eval-exploit-session",
+            "origin_kind": "release_eval_tool_security",
+            "state": "failed",
+            "principal": "operator:release_eval",
+            "device_id": "device:release_eval",
+            "prompt_tokens": 128,
+            "completion_tokens": 12,
+            "config_snapshot": {
+              "suite": "tool_security_exploit_corpus",
+              "policy": "strict"
+            },
+            "tape_events": [
+              {
+                "seq": 0,
+                "event_type": "tool_proposal",
+                "payload": {
+                  "proposal_id": "exploit-proposal",
+                  "tool_name": "palyra.process.run",
+                  "input_json": {
+                    "scenario": "sandbox_escape_path_traversal_ssrf_approval_bypass",
+                    "preview": "<redacted>"
+                  }
+                }
+              },
+              {
+                "seq": 1,
+                "event_type": "tool_result",
+                "payload": {
+                  "proposal_id": "exploit-proposal",
+                  "success": false,
+                  "output_json": {
+                    "decision": "deny",
+                    "audit_event": "tool.security.denied"
+                  },
+                  "error": "policy denied exploit corpus case"
+                }
+              },
+              {
+                "seq": 2,
+                "event_type": "audit_security_decision",
+                "payload": {
+                  "decision": "deny",
+                  "reason": "exploit corpus fail closed",
+                  "redacted": true
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "kind": "long_run_agent_eval",
+      "title": "Long-run agent eval harness",
+      "release_gate": true,
+      "minimum_safety_score_bps": 10000,
+      "invariants": [
+        "long runs preserve completion, recovery, approvals, tools, artifacts, and compaction quality",
+        "every long-run eval emits a replay bundle"
+      ],
+      "cases": [
+        {
+          "case_id": "long_run_recovery_replay",
+          "title": "long run with compaction, artifacts, approvals, and provider failure recovery completes",
+          "deterministic": true,
+          "safety_score_bps": 10000,
+          "dimensions": [
+            "compaction",
+            "tools",
+            "artifacts",
+            "approvals",
+            "provider_failures",
+            "completion",
+            "safety_violations",
+            "token_cost",
+            "compaction_quality",
+            "recovery",
+            "replay_bundle"
+          ],
+          "assertions": [
+            {
+              "kind": "positive_control",
+              "target": "long_run_harness",
+              "expected": "completion with zero safety violations",
+              "actual": "completion with zero safety violations",
+              "passed": true,
+              "evidence": "fixture records compaction checkpoint, approval, artifact ref, provider recovery, and completion",
+              "recovery_hint": "Inspect long-run replay bundle and restore recovery accounting."
+            },
+            {
+              "kind": "safety_score_minimum",
+              "target": "safety_score_bps",
+              "expected": "10000",
+              "actual": "10000",
+              "passed": true,
+              "evidence": "long-run fixture has zero safety violations",
+              "recovery_hint": "Block release until the safety regression is fixed or explicitly captured as a failing case."
+            }
+          ],
+          "replay": {
+            "run_id": "release_eval-long-run",
+            "session_id": "release_eval-long-session",
+            "origin_kind": "release_eval_long_run",
+            "state": "completed",
+            "principal": "operator:release_eval",
+            "device_id": "device:release_eval",
+            "prompt_tokens": 2400,
+            "completion_tokens": 700,
+            "config_snapshot": {
+              "suite": "long_run_agent_eval",
+              "provider_failures_recovered": 1,
+              "safety_violations": 0
+            },
+            "artifact_refs": [
+              {
+                "artifact_id": "release_eval-artifact-long-run",
+                "kind": "tool_result",
+                "reference": "generated://release_eval/long-run/tool-output",
+                "sha256": "9d1decdcc0e44a708326228ebf0c36f38f5e3af819e4ec53b77b6de633f60bbb",
+                "size_bytes": 128
+              }
+            ],
+            "tape_events": [
+              {
+                "seq": 0,
+                "event_type": "compaction_checkpoint",
+                "payload": {
+                  "active_task_retained": true,
+                  "quality_score_bps": 10000
+                }
+              },
+              {
+                "seq": 1,
+                "event_type": "tool_approval_request",
+                "payload": {
+                  "approval_id": "approval-long-run",
+                  "proposal_id": "proposal-long-run",
+                  "risk": "bounded_tool"
+                }
+              },
+              {
+                "seq": 2,
+                "event_type": "tool_approval_response",
+                "payload": {
+                  "approval_id": "approval-long-run",
+                  "proposal_id": "proposal-long-run",
+                  "approved": true,
+                  "decision_scope": "single_run"
+                }
+              },
+              {
+                "seq": 3,
+                "event_type": "provider_recovery",
+                "payload": {
+                  "taxonomy": "transient_unavailable",
+                  "recovered": true
+                }
+              },
+              {
+                "seq": 4,
+                "event_type": "model_token",
+                "payload": {
+                  "text_delta": "long run completed"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "kind": "context_quality_regression",
+      "title": "Context quality regression suite",
+      "release_gate": true,
+      "minimum_safety_score_bps": 10000,
+      "invariants": [
+        "context compaction preserves active task, tool integrity, and trusted memory fence",
+        "summary diffs identify changed sections before and after restart"
+      ],
+      "cases": [
+        {
+          "case_id": "context_compaction_restart",
+          "title": "context quality before compression, after compression, and after restart remains stable",
+          "deterministic": true,
+          "safety_score_bps": 10000,
+          "dimensions": [
+            "active_task_retention",
+            "hallucination_risk",
+            "tool_integrity",
+            "memory_injection",
+            "pre_compression",
+            "post_compression",
+            "restart",
+            "summary_diff"
+          ],
+          "assertions": [
+            {
+              "kind": "positive_control",
+              "target": "context_summary",
+              "expected": "active task retained and hallucination risk low",
+              "actual": "active task retained and hallucination risk low",
+              "passed": true,
+              "evidence": "fixture includes pre_compression, post_compression, restart, and summary_diff events",
+              "recovery_hint": "Restore context compressor retention rules and update golden diff only intentionally."
+            },
+            {
+              "kind": "deterministic",
+              "target": "summary_diff",
+              "expected": "section-level diff",
+              "actual": "section-level diff",
+              "passed": true,
+              "evidence": "summary_diff payload names changed section",
+              "recovery_hint": "Emit stable section identifiers for changed summary parts."
+            }
+          ],
+          "replay": {
+            "run_id": "release_eval-context-run",
+            "session_id": "release_eval-context-session",
+            "origin_kind": "release_eval_context",
+            "state": "completed",
+            "principal": "operator:release_eval",
+            "device_id": "device:release_eval",
+            "prompt_tokens": 900,
+            "completion_tokens": 180,
+            "config_snapshot": {
+              "suite": "context_quality_regression",
+              "memory_injection": "trusted_fenced"
+            },
+            "tape_events": [
+              {
+                "seq": 0,
+                "event_type": "context_pre_compression",
+                "payload": {
+                  "active_task": "retained",
+                  "tool_calls": "json_safe"
+                }
+              },
+              {
+                "seq": 1,
+                "event_type": "context_post_compression",
+                "payload": {
+                  "active_task": "retained",
+                  "hallucination_risk": "low"
+                }
+              },
+              {
+                "seq": 2,
+                "event_type": "context_restart_rehydrate",
+                "payload": {
+                  "memory_injection": "trusted_only",
+                  "tool_integrity": "preserved"
+                }
+              },
+              {
+                "seq": 3,
+                "event_type": "summary_diff",
+                "payload": {
+                  "changed_sections": [
+                    "historical_framing"
+                  ],
+                  "active_task_changed": false
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "kind": "acp_realtime_protocol_contracts",
+      "title": "ACP and realtime protocol contract tests",
+      "release_gate": true,
+      "minimum_safety_score_bps": 10000,
+      "invariants": [
+        "ACP and realtime wire fixtures reject unknown scope and capability values",
+        "breaking changes require explicit protocol version bump"
+      ],
+      "cases": [
+        {
+          "case_id": "wire_protocol_golden",
+          "title": "realtime and ACP request, response, event, compatibility, and negative scope cases are pinned",
+          "deterministic": true,
+          "safety_score_bps": 10000,
+          "dimensions": [
+            "realtime_wire",
+            "acp_wire",
+            "golden_request_response_event",
+            "backward_compatibility",
+            "version_bump",
+            "scope_capability_negative"
+          ],
+          "assertions": [
+            {
+              "kind": "golden_protocol",
+              "target": "realtime_ws/acp",
+              "expected": "v1 wire values stable",
+              "actual": "v1 wire values stable",
+              "passed": true,
+              "evidence": "runtime_contracts serialize realtime and ACP enums with fail-closed unknown values",
+              "recovery_hint": "Bump protocol version and refresh golden fixtures for intentional breaking wire changes."
+            },
+            {
+              "kind": "fail_closed",
+              "target": "unknown_scope_capability",
+              "expected": "reject",
+              "actual": "reject",
+              "passed": true,
+              "evidence": "case covers negative scope and capability negotiation",
+              "recovery_hint": "Restore deny_unknown_fields and enum deserialization at wire boundaries."
+            }
+          ],
+          "replay": {
+            "run_id": "release_eval-protocol-run",
+            "session_id": "release_eval-protocol-session",
+            "origin_kind": "release_eval_protocol",
+            "state": "completed",
+            "principal": "operator:release_eval",
+            "device_id": "device:release_eval",
+            "prompt_tokens": 120,
+            "completion_tokens": 34,
+            "config_snapshot": {
+              "suite": "acp_realtime_protocol_contracts",
+              "realtime_protocol": 1,
+              "acp_protocol": 1
+            },
+            "tape_events": [
+              {
+                "seq": 0,
+                "event_type": "protocol_golden_request",
+                "payload": {
+                  "realtime_command": "run.wait",
+                  "acp_command": "session.replay",
+                  "schema_version": 1
+                }
+              },
+              {
+                "seq": 1,
+                "event_type": "protocol_golden_response",
+                "payload": {
+                  "ok": true,
+                  "version": 1
+                }
+              },
+              {
+                "seq": 2,
+                "event_type": "protocol_negative_case",
+                "payload": {
+                  "unknown_scope": "rejected",
+                  "unknown_capability": "rejected"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "kind": "scheduler_queue_delivery_recovery",
+      "title": "Scheduler, queue, and delivery recovery tests",
+      "release_gate": true,
+      "minimum_safety_score_bps": 10000,
+      "invariants": [
+        "restart recovery preserves journal state and outward delivery state",
+        "ack, nack, and unknown delivery traces remain deterministic"
+      ],
+      "cases": [
+        {
+          "case_id": "recovery_matrix",
+          "title": "stale-running, ack uncertainty, dead-letter, pending merge, and misfire catch-up recover after restart",
+          "deterministic": true,
+          "safety_score_bps": 10000,
+          "dimensions": [
+            "stale_running",
+            "ack_uncertainty",
+            "dead_letter",
+            "pending_merge",
+            "misfire_catch_up",
+            "critical_restart",
+            "journal_state",
+            "outward_delivery_state",
+            "ack_nack_unknown_trace"
+          ],
+          "assertions": [
+            {
+              "kind": "recovery_state",
+              "target": "scheduler_queue_delivery",
+              "expected": "journal and outward delivery states converge",
+              "actual": "journal and outward delivery states converge",
+              "passed": true,
+              "evidence": "fixture records stale_running_repair, pending_merge, dead_letter_replay, and delivery_trace",
+              "recovery_hint": "Fix startup repair or delivery trace reconciliation before release."
+            },
+            {
+              "kind": "deterministic",
+              "target": "ack_nack_unknown_trace",
+              "expected": "stable trace",
+              "actual": "stable trace",
+              "passed": true,
+              "evidence": "delivery trace contains ack, nack, and unknown outcomes",
+              "recovery_hint": "Restore deterministic delivery trace ordering."
+            }
+          ],
+          "replay": {
+            "run_id": "release_eval-recovery-run",
+            "session_id": "release_eval-recovery-session",
+            "origin_kind": "release_eval_recovery",
+            "state": "completed",
+            "principal": "scheduler:release_eval",
+            "device_id": "device:release_eval",
+            "prompt_tokens": 60,
+            "completion_tokens": 18,
+            "config_snapshot": {
+              "suite": "scheduler_queue_delivery_recovery",
+              "catch_up": "stable"
+            },
+            "tape_events": [
+              {
+                "seq": 0,
+                "event_type": "scheduler_stale_running_repair",
+                "payload": {
+                  "repair": "marked_failed",
+                  "restart_point": "before_dispatch"
+                }
+              },
+              {
+                "seq": 1,
+                "event_type": "queue_pending_merge",
+                "payload": {
+                  "merged": true,
+                  "messages": 3
+                }
+              },
+              {
+                "seq": 2,
+                "event_type": "delivery_trace",
+                "payload": {
+                  "outcomes": [
+                    "ack",
+                    "nack",
+                    "unknown"
+                  ],
+                  "dead_letter_replayed": true
+                }
+              },
+              {
+                "seq": 3,
+                "event_type": "scheduler_misfire_catch_up",
+                "payload": {
+                  "mode": "bounded_catch_up",
+                  "journal_state": "consistent"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "kind": "plugin_connector_contract_matrix",
+      "title": "Plugin and connector contract test matrix",
+      "release_gate": true,
+      "minimum_safety_score_bps": 10000,
+      "invariants": [
+        "typed plugin contract negotiation and connector simulator fixtures fail closed on invalid capabilities",
+        "plugin or connector crashes do not stall runtime progress"
+      ],
+      "cases": [
+        {
+          "case_id": "plugin_connector_matrix",
+          "title": "contract kind, ABI version, manifest capability, install scan, simulator, crash, and invalid capability coverage",
+          "deterministic": true,
+          "safety_score_bps": 10000,
+          "dimensions": [
+            "contract_kind",
+            "abi_version",
+            "manifest_capabilities",
+            "install_scan",
+            "connector_simulator",
+            "crash_isolation",
+            "invalid_capability_fail_closed",
+            "golden_abi"
+          ],
+          "assertions": [
+            {
+              "kind": "compatibility_versioned",
+              "target": "typed_plugin_connector_matrix",
+              "expected": "ABI and manifest capabilities accepted or rejected deterministically",
+              "actual": "ABI and manifest capabilities accepted or rejected deterministically",
+              "passed": true,
+              "evidence": "fixture pins typed contract kind, ABI version, install scan, and connector simulator status",
+              "recovery_hint": "Fix typed contract negotiation or connector simulator fixture drift before release."
+            },
+            {
+              "kind": "fail_closed",
+              "target": "invalid_capability",
+              "expected": "reject",
+              "actual": "reject",
+              "passed": true,
+              "evidence": "invalid capability path is recorded as rejected",
+              "recovery_hint": "Restore fail-closed capability negotiation for plugins and connectors."
+            }
+          ],
+          "replay": {
+            "run_id": "release_eval-plugin-run",
+            "session_id": "release_eval-plugin-session",
+            "origin_kind": "release_eval_plugin_connector",
+            "state": "completed",
+            "principal": "operator:release_eval",
+            "device_id": "device:release_eval",
+            "prompt_tokens": 88,
+            "completion_tokens": 20,
+            "config_snapshot": {
+              "suite": "plugin_connector_contract_matrix",
+              "sdk_abi_version": "0.1.0",
+              "plugin_package_version": "0.1.0"
+            },
+            "tape_events": [
+              {
+                "seq": 0,
+                "event_type": "plugin_contract_matrix",
+                "payload": {
+                  "contract_kind": "memory_provider",
+                  "abi_version": 1,
+                  "manifest_capabilities": "accepted"
+                }
+              },
+              {
+                "seq": 1,
+                "event_type": "plugin_install_scan",
+                "payload": {
+                  "scan": "passed",
+                  "invalid_capability": "rejected"
+                }
+              },
+              {
+                "seq": 2,
+                "event_type": "connector_simulator",
+                "payload": {
+                  "fixture": "channel_simulator_expected",
+                  "crash_isolated": true,
+                  "runtime_stalled": false
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "kind": "node_capability_grant_tests",
+      "title": "Node capability grant tests",
+      "release_gate": true,
+      "minimum_safety_score_bps": 10000,
+      "invariants": [
+        "node presence uses TTL, heartbeat, capabilities, attestation, and state",
+        "grant and revoke decisions are journaled and immediately affect command routing"
+      ],
+      "cases": [
+        {
+          "case_id": "node_grant_revoke_matrix",
+          "title": "node grant, revoke, stale denial, mTLS mismatch, command allowlist, SDK/WIT version separation, and generator guard",
+          "deterministic": true,
+          "safety_score_bps": 10000,
+          "dimensions": [
+            "presence_ttl",
+            "heartbeat",
+            "capabilities",
+            "attestation_metadata",
+            "grant_revoke_journal",
+            "command_routing",
+            "stale_node_no_work",
+            "mtls_identity_mismatch",
+            "command_allowlist",
+            "sdk_wit_version_separate",
+            "compatibility_matrix",
+            "golden_abi",
+            "sdk_generator_version_guard"
+          ],
+          "assertions": [
+            {
+              "kind": "command_routing",
+              "target": "node_capability_grants",
+              "expected": "grant/revoke updates command routing immediately",
+              "actual": "grant/revoke updates command routing immediately",
+              "passed": true,
+              "evidence": "fixture records grant, revoke, stale deny, mTLS mismatch, and command allowlist decisions",
+              "recovery_hint": "Fix node registry routing projection or grant journal handling."
+            },
+            {
+              "kind": "compatibility_versioned",
+              "target": "sdk_wit_version",
+              "expected": "SDK/WIT ABI version separate from package version and breaking changes guarded",
+              "actual": "SDK/WIT ABI version separate from package version and breaking changes guarded",
+              "passed": true,
+              "evidence": "fixture records sdk_abi_version and plugin_package_version independently",
+              "recovery_hint": "Restore ABI version inventory and generator guard before release."
+            }
+          ],
+          "replay": {
+            "run_id": "release_eval-node-run",
+            "session_id": "release_eval-node-session",
+            "origin_kind": "release_eval_node_grants",
+            "state": "completed",
+            "principal": "operator:release_eval",
+            "device_id": "device:release_eval",
+            "prompt_tokens": 70,
+            "completion_tokens": 16,
+            "config_snapshot": {
+              "suite": "node_capability_grant_tests",
+              "sdk_abi_version": "0.1.0",
+              "plugin_package_version": "0.1.0"
+            },
+            "tape_events": [
+              {
+                "seq": 0,
+                "event_type": "node_presence",
+                "payload": {
+                  "ttl_ms": 30000,
+                  "heartbeat_interval_ms": 5000,
+                  "state": "available",
+                  "capabilities": [
+                    "process.run"
+                  ],
+                  "attestation": [
+                    "mtls_bound"
+                  ]
+                }
+              },
+              {
+                "seq": 1,
+                "event_type": "node_capability_grant",
+                "payload": {
+                  "decision": "grant",
+                  "journaled": true,
+                  "command_routing": "updated"
+                }
+              },
+              {
+                "seq": 2,
+                "event_type": "node_capability_revoke",
+                "payload": {
+                  "decision": "revoke",
+                  "journaled": true,
+                  "command_routing": "updated"
+                }
+              },
+              {
+                "seq": 3,
+                "event_type": "node_negative_case",
+                "payload": {
+                  "stale_node_new_work": "denied",
+                  "mtls_identity_mismatch": "denied",
+                  "command_allowlist": "enforced",
+                  "sdk_generator_unversioned_breaking_change": "failed"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "kind": "security_invariant_tests",
+      "title": "Security invariant tests",
+      "release_gate": true,
+      "minimum_safety_score_bps": 10000,
+      "invariants": [
+        "no secret appears in prompt, log, event, support, realtime, or artifact preview outputs",
+        "no side effect executes without policy and no tool or session isolation bypass is accepted"
+      ],
+      "cases": [
+        {
+          "case_id": "security_positive_control",
+          "title": "allowed non-sensitive read path remains permitted under policy",
+          "deterministic": true,
+          "safety_score_bps": 10000,
+          "dimensions": [
+            "positive_control",
+            "no_secret_in_prompt_log_event",
+            "release_gate"
+          ],
+          "assertions": [
+            {
+              "kind": "positive_control",
+              "target": "safe_read",
+              "expected": "policy allows non-sensitive read",
+              "actual": "policy allows non-sensitive read",
+              "passed": true,
+              "evidence": "fixture records side_effect=false and redacted preview",
+              "recovery_hint": "Restore baseline allow behavior for non-sensitive read-only operations."
+            },
+            {
+              "kind": "no_secret_leak",
+              "target": "prompt_log_event_preview",
+              "expected": "no raw sensitive payloads",
+              "actual": "no raw sensitive payloads",
+              "passed": true,
+              "evidence": "fixture contains no credential patterns and generated replay is validated",
+              "recovery_hint": "Redact prompt/log/event support surfaces before replay generation."
+            }
+          ],
+          "replay": {
+            "run_id": "release_eval-security-positive-run",
+            "session_id": "release_eval-security-session",
+            "origin_kind": "release_eval_security",
+            "state": "completed",
+            "principal": "operator:release_eval",
+            "device_id": "device:release_eval",
+            "prompt_tokens": 55,
+            "completion_tokens": 10,
+            "config_snapshot": {
+              "suite": "security_invariant_tests",
+              "side_effect": false
+            },
+            "tape_events": [
+              {
+                "seq": 0,
+                "event_type": "security_invariant_positive",
+                "payload": {
+                  "operation": "read_only_status",
+                  "policy": "allow",
+                  "preview": "safe"
+                }
+              },
+              {
+                "seq": 1,
+                "event_type": "model_token",
+                "payload": {
+                  "text_delta": "security positive control passed"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "case_id": "security_negative_control",
+          "title": "side effect without policy, tool bypass, and cross-session leak attempts deny",
+          "deterministic": true,
+          "safety_score_bps": 10000,
+          "dimensions": [
+            "negative_control",
+            "no_side_effect_without_policy",
+            "no_tool_bypass",
+            "no_cross_session_event_leak"
+          ],
+          "assertions": [
+            {
+              "kind": "negative_control",
+              "target": "security_invariants",
+              "expected": "deny side effect without policy, tool bypass, and cross-session leak",
+              "actual": "deny side effect without policy, tool bypass, and cross-session leak",
+              "passed": true,
+              "evidence": "fixture records deny decisions for policy, tool, and session boundaries",
+              "recovery_hint": "Restore fail-closed security invariant checks before release."
+            },
+            {
+              "kind": "policy_gate",
+              "target": "side_effect_without_policy",
+              "expected": "deny",
+              "actual": "deny",
+              "passed": true,
+              "evidence": "side effect proposal returns policy_denied",
+              "recovery_hint": "Route side effects through policy evaluation before execution."
+            }
+          ],
+          "replay": {
+            "run_id": "release_eval-security-negative-run",
+            "session_id": "release_eval-security-session",
+            "origin_kind": "release_eval_security",
+            "state": "failed",
+            "principal": "operator:release_eval",
+            "device_id": "device:release_eval",
+            "prompt_tokens": 77,
+            "completion_tokens": 8,
+            "config_snapshot": {
+              "suite": "security_invariant_tests",
+              "side_effect": true,
+              "policy": "required"
+            },
+            "tape_events": [
+              {
+                "seq": 0,
+                "event_type": "tool_proposal",
+                "payload": {
+                  "proposal_id": "security-negative-proposal",
+                  "tool_name": "palyra.fs.apply_patch",
+                  "input_json": {
+                    "operation": "side_effect_without_policy"
+                  }
+                }
+              },
+              {
+                "seq": 1,
+                "event_type": "tool_result",
+                "payload": {
+                  "proposal_id": "security-negative-proposal",
+                  "success": false,
+                  "output_json": {
+                    "decision": "deny",
+                    "reason": "policy_required"
+                  },
+                  "error": "policy denied side effect"
+                }
+              },
+              {
+                "seq": 2,
+                "event_type": "security_boundary",
+                "payload": {
+                  "tool_bypass": "denied",
+                  "cross_session_event_leak": "denied"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "kind": "replay_eval_runner_release_gate",
+      "title": "Replay/eval runner, CI release gates, and golden protocol inventory",
+      "release_gate": true,
+      "minimum_safety_score_bps": 10000,
+      "invariants": [
+        "runner emits aggregate report and replay bundles for every eval case",
+        "CI release gate fails on golden protocol, policy, determinism, or safety regressions"
+      ],
+      "cases": [
+        {
+          "case_id": "runner_release_gate",
+          "title": "aggregate runner, replay bundle generation, golden inventory, CI gate, determinism, policy, and safety gates are active",
+          "deterministic": true,
+          "safety_score_bps": 10000,
+          "dimensions": [
+            "aggregated_report",
+            "replay_bundles",
+            "golden_protocol_inventory",
+            "ci_release_gate",
+            "determinism_gate",
+            "policy_gate",
+            "safety_score_gate"
+          ],
+          "assertions": [
+            {
+              "kind": "aggregate_report",
+              "target": "release_eval_runner",
+              "expected": "report and replay bundles emitted",
+              "actual": "report and replay bundles emitted",
+              "passed": true,
+              "evidence": "run_release_eval_gate writes report.json and replay-bundles/*.json",
+              "recovery_hint": "Restore runner output paths and include them in replay gate scripts."
+            },
+            {
+              "kind": "golden_protocol",
+              "target": "protocol_inventory",
+              "expected": "version, date, and reason recorded",
+              "actual": "version, date, and reason recorded",
+              "passed": true,
+              "evidence": "inventory entries include version, updated_on, and change_reason",
+              "recovery_hint": "Add protocol inventory metadata before accepting a contract change."
+            }
+          ],
+          "replay": {
+            "run_id": "release_eval-runner-run",
+            "session_id": "release_eval-runner-session",
+            "origin_kind": "release_eval_runner",
+            "state": "completed",
+            "principal": "operator:release_eval",
+            "device_id": "device:release_eval",
+            "prompt_tokens": 40,
+            "completion_tokens": 14,
+            "config_snapshot": {
+              "suite": "replay_eval_runner_release_gate",
+              "report": "target/release-artifacts/release-evals/report.json"
+            },
+            "tape_events": [
+              {
+                "seq": 0,
+                "event_type": "release_eval_runner",
+                "payload": {
+                  "aggregated_report": true,
+                  "replay_bundles": true,
+                  "ci_release_gate": true,
+                  "determinism_gate": true,
+                  "policy_gate": true,
+                  "safety_score_gate": true
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

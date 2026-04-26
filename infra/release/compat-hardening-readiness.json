@@ -12,7 +12,7 @@
     {
       "id": "session_queue_preview_mode",
       "kind": "preview_mode",
-      "summary": "Keep queued input lifecycle work on preview-only defaults until the dedicated queue runtime milestones land."
+      "summary": "Keep queued input lifecycle work on preview-only defaults until the dedicated queue runtime work lands."
     },
     {
       "id": "retrieval_dual_path_guardrail",
@@ -54,7 +54,7 @@
     {
       "id": "contract_first_preview_baseline",
       "state": "expected_guardrail",
-      "summary": "Fast workflow regression intentionally validates contract wiring first; richer queue, replay, and child-runtime behavior lands in later milestones."
+      "summary": "Fast workflow regression intentionally validates contract wiring first; richer queue, replay, and child-runtime behavior lands in later work."
     },
     {
       "id": "full_profile_required_for_deeper_runtime_evidence",
