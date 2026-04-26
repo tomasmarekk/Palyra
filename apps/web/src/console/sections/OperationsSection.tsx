@@ -118,10 +118,14 @@ export function OperationsSection({ app }: OperationsSectionProps) {
   const operatorInsights = readObject(observability ?? {}, "operator_insights");
   const operatorSummary = readObject(operatorInsights ?? {}, "summary");
   const operatorHotspots = readJsonObjectArray(operatorInsights?.hotspots);
+  const operatorOperations = readObject(operatorInsights ?? {}, "operations");
   const operatorProvider = readObject(operatorInsights ?? {}, "provider_health");
+  const operatorSecurity = readObject(operatorInsights ?? {}, "security");
   const operatorRecall = readObject(operatorInsights ?? {}, "recall");
   const operatorPlugins = readObject(operatorInsights ?? {}, "plugins");
   const operatorCron = readObject(operatorInsights ?? {}, "cron");
+  const operatorRoutines = readObject(operatorInsights ?? {}, "routines");
+  const operatorMemoryLearning = readObject(operatorInsights ?? {}, "memory_learning");
   const operatorReload = readObject(operatorInsights ?? {}, "reload");
   const latestDoctorRecovery = readObject(doctorRecovery ?? {}, "last_job");
   const activeIncidents = readJsonObjectArray(selfHealing?.active_incidents);
@@ -751,11 +755,24 @@ export function OperationsSection({ app }: OperationsSectionProps) {
                   columns={["Metric", "Value", "Detail"]}
                 >
                   <tr>
+                    <td>Operations</td>
+                    <td>{readString(operatorOperations ?? {}, "state") ?? "unknown"}</td>
+                    <td>
+                      {readString(operatorOperations ?? {}, "summary") ??
+                        "No operations overview summary"}
+                    </td>
+                  </tr>
+                  <tr>
                     <td>Provider</td>
                     <td>{readString(operatorProvider ?? {}, "state") ?? "unknown"}</td>
                     <td>
                       {readString(operatorProvider ?? {}, "summary") ?? "No provider summary"}
                     </td>
+                  </tr>
+                  <tr>
+                    <td>Security</td>
+                    <td>{readString(operatorSecurity ?? {}, "state") ?? "unknown"}</td>
+                    <td>{readString(operatorSecurity ?? {}, "summary") ?? "No security summary"}</td>
                   </tr>
                   <tr>
                     <td>Recall</td>
@@ -766,6 +783,19 @@ export function OperationsSection({ app }: OperationsSectionProps) {
                     <td>Plugins</td>
                     <td>{readString(operatorPlugins ?? {}, "state") ?? "unknown"}</td>
                     <td>{readString(operatorPlugins ?? {}, "summary") ?? "No plugin summary"}</td>
+                  </tr>
+                  <tr>
+                    <td>Routines</td>
+                    <td>{readString(operatorRoutines ?? {}, "state") ?? "unknown"}</td>
+                    <td>{readString(operatorRoutines ?? {}, "summary") ?? "No routine summary"}</td>
+                  </tr>
+                  <tr>
+                    <td>Memory learning</td>
+                    <td>{readString(operatorMemoryLearning ?? {}, "state") ?? "unknown"}</td>
+                    <td>
+                      {readString(operatorMemoryLearning ?? {}, "summary") ??
+                        "No memory learning summary"}
+                    </td>
                   </tr>
                   <tr>
                     <td>Cron / reload</td>

@@ -621,6 +621,21 @@ export interface OperatorInsightsSummary {
   recommendation: string;
 }
 
+export interface OperatorOperationsOverviewInsight {
+  state: string;
+  severity: string;
+  summary: string;
+  stuck_runs: number;
+  provider_cooldowns: number;
+  queue_backlog: number;
+  routine_failures: number;
+  plugin_errors: number;
+  worker_orphaned: number;
+  worker_failed_closed: number;
+  recommended_action: string;
+  drill_down: OperatorInsightDrillDown;
+}
+
 export interface OperatorProviderHealthInsight {
   state: string;
   severity: string;
@@ -634,6 +649,20 @@ export interface OperatorProviderHealthInsight {
   response_cache_enabled: boolean;
   response_cache_entries: number;
   response_cache_hit_rate_bps: number;
+  recommended_action: string;
+  drill_down: OperatorInsightDrillDown;
+}
+
+export interface OperatorSecurityInsight {
+  state: string;
+  severity: string;
+  summary: string;
+  approval_denies: number;
+  policy_denies: number;
+  redaction_events: number;
+  sandbox_violations: number;
+  skill_execution_denies: number;
+  sampled_denied_tool_decisions: number;
   recommended_action: string;
   drill_down: OperatorInsightDrillDown;
 }
@@ -755,6 +784,38 @@ export interface OperatorCronInsight {
   drill_down: OperatorInsightDrillDown;
 }
 
+export interface OperatorRoutineInsight {
+  state: string;
+  severity: string;
+  summary: string;
+  total_runs: number;
+  failed_runs: number;
+  skipped_runs: number;
+  policy_denies: number;
+  success_rate_bps: number;
+  recommended_action: string;
+  drill_down: OperatorInsightDrillDown;
+}
+
+export interface OperatorMemoryLearningInsight {
+  state: string;
+  severity: string;
+  summary: string;
+  total_candidates: number;
+  proposed_candidates: number;
+  needs_review_candidates: number;
+  approved_candidates: number;
+  rejected_candidates: number;
+  deployed_candidates: number;
+  rolled_back_candidates: number;
+  auto_applied_candidates: number;
+  memory_rejections: number;
+  injection_conflicts: number;
+  rollback_events: number;
+  recommended_action: string;
+  drill_down: OperatorInsightDrillDown;
+}
+
 export interface OperatorReloadHotspot {
   ref_id: string;
   config_path: string;
@@ -782,12 +843,16 @@ export interface OperatorInsightsEnvelope {
   retention: OperatorInsightsRetentionPolicy;
   sampling: OperatorInsightsSamplingPolicy;
   privacy: OperatorInsightsPrivacyPolicy;
+  operations: OperatorOperationsOverviewInsight;
   provider_health: OperatorProviderHealthInsight;
+  security: OperatorSecurityInsight;
   recall: OperatorRecallInsight;
   compaction: OperatorCompactionInsight;
   safety_boundary: OperatorSafetyBoundaryInsight;
   plugins: OperatorPluginInsight;
   cron: OperatorCronInsight;
+  routines: OperatorRoutineInsight;
+  memory_learning: OperatorMemoryLearningInsight;
   reload: OperatorReloadInsight;
 }
 

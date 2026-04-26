@@ -78,6 +78,15 @@ export function UsageSection({ app }: UsageSectionProps) {
         ? []
         : [
             {
+              key: "operations",
+              label: "Operations overview",
+              state: operatorInsights.operations.state,
+              severity: operatorInsights.operations.severity,
+              summary: operatorInsights.operations.summary,
+              action: operatorInsights.operations.recommended_action,
+              path: operatorInsights.operations.drill_down.console_path,
+            },
+            {
               key: "provider",
               label: "Provider health",
               state: operatorInsights.provider_health.state,
@@ -85,6 +94,15 @@ export function UsageSection({ app }: UsageSectionProps) {
               summary: operatorInsights.provider_health.summary,
               action: operatorInsights.provider_health.recommended_action,
               path: operatorInsights.provider_health.drill_down.console_path,
+            },
+            {
+              key: "security",
+              label: "Security posture",
+              state: operatorInsights.security.state,
+              severity: operatorInsights.security.severity,
+              summary: operatorInsights.security.summary,
+              action: operatorInsights.security.recommended_action,
+              path: operatorInsights.security.drill_down.console_path,
             },
             {
               key: "recall",
@@ -130,6 +148,24 @@ export function UsageSection({ app }: UsageSectionProps) {
               summary: operatorInsights.cron.summary,
               action: operatorInsights.cron.recommended_action,
               path: operatorInsights.cron.drill_down.console_path,
+            },
+            {
+              key: "routines",
+              label: "Routine delivery",
+              state: operatorInsights.routines.state,
+              severity: operatorInsights.routines.severity,
+              summary: operatorInsights.routines.summary,
+              action: operatorInsights.routines.recommended_action,
+              path: operatorInsights.routines.drill_down.console_path,
+            },
+            {
+              key: "memory-learning",
+              label: "Memory learning",
+              state: operatorInsights.memory_learning.state,
+              severity: operatorInsights.memory_learning.severity,
+              summary: operatorInsights.memory_learning.summary,
+              action: operatorInsights.memory_learning.recommended_action,
+              path: operatorInsights.memory_learning.drill_down.console_path,
             },
             {
               key: "reload",

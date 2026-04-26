@@ -7,11 +7,15 @@ import type {
   OperatorInsightsRetentionPolicy,
   OperatorInsightsSamplingPolicy,
   OperatorInsightsSummary,
+  OperatorMemoryLearningInsight,
+  OperatorOperationsOverviewInsight,
   OperatorPluginInsight,
   OperatorProviderHealthInsight,
   OperatorRecallInsight,
   OperatorReloadInsight,
+  OperatorRoutineInsight,
   OperatorSafetyBoundaryInsight,
+  OperatorSecurityInsight,
   UsageInsightsEnvelope,
 } from "../consoleApi";
 
@@ -76,6 +80,35 @@ const EMPTY_PROVIDER_HEALTH: OperatorProviderHealthInsight = {
   response_cache_entries: 0,
   response_cache_hit_rate_bps: 0,
   recommended_action: "Refresh diagnostics to load provider health.",
+  drill_down: EMPTY_DRILL_DOWN,
+};
+
+const EMPTY_OPERATIONS: OperatorOperationsOverviewInsight = {
+  state: "unknown",
+  severity: "unknown",
+  summary: "Operations overview is unavailable.",
+  stuck_runs: 0,
+  provider_cooldowns: 0,
+  queue_backlog: 0,
+  routine_failures: 0,
+  plugin_errors: 0,
+  worker_orphaned: 0,
+  worker_failed_closed: 0,
+  recommended_action: "Refresh diagnostics to load operations overview.",
+  drill_down: EMPTY_DRILL_DOWN,
+};
+
+const EMPTY_SECURITY: OperatorSecurityInsight = {
+  state: "unknown",
+  severity: "unknown",
+  summary: "Security insights are unavailable.",
+  approval_denies: 0,
+  policy_denies: 0,
+  redaction_events: 0,
+  sandbox_violations: 0,
+  skill_execution_denies: 0,
+  sampled_denied_tool_decisions: 0,
+  recommended_action: "Refresh diagnostics to load security insights.",
   drill_down: EMPTY_DRILL_DOWN,
 };
 
@@ -150,6 +183,38 @@ const EMPTY_CRON: OperatorCronInsight = {
   drill_down: EMPTY_DRILL_DOWN,
 };
 
+const EMPTY_ROUTINES: OperatorRoutineInsight = {
+  state: "unknown",
+  severity: "unknown",
+  summary: "Routine delivery insights are unavailable.",
+  total_runs: 0,
+  failed_runs: 0,
+  skipped_runs: 0,
+  policy_denies: 0,
+  success_rate_bps: 0,
+  recommended_action: "Refresh diagnostics to load routine delivery insights.",
+  drill_down: EMPTY_DRILL_DOWN,
+};
+
+const EMPTY_MEMORY_LEARNING: OperatorMemoryLearningInsight = {
+  state: "unknown",
+  severity: "unknown",
+  summary: "Memory learning insights are unavailable.",
+  total_candidates: 0,
+  proposed_candidates: 0,
+  needs_review_candidates: 0,
+  approved_candidates: 0,
+  rejected_candidates: 0,
+  deployed_candidates: 0,
+  rolled_back_candidates: 0,
+  auto_applied_candidates: 0,
+  memory_rejections: 0,
+  injection_conflicts: 0,
+  rollback_events: 0,
+  recommended_action: "Refresh memory learning to load candidate lifecycle insights.",
+  drill_down: EMPTY_DRILL_DOWN,
+};
+
 const EMPTY_RELOAD: OperatorReloadInsight = {
   state: "unknown",
   severity: "unknown",
@@ -168,12 +233,16 @@ const EMPTY_OPERATOR_INSIGHTS: OperatorInsightsEnvelope = {
   retention: EMPTY_RETENTION,
   sampling: EMPTY_SAMPLING,
   privacy: EMPTY_PRIVACY,
+  operations: EMPTY_OPERATIONS,
   provider_health: EMPTY_PROVIDER_HEALTH,
+  security: EMPTY_SECURITY,
   recall: EMPTY_RECALL,
   compaction: EMPTY_COMPACTION,
   safety_boundary: EMPTY_SAFETY,
   plugins: EMPTY_PLUGINS,
   cron: EMPTY_CRON,
+  routines: EMPTY_ROUTINES,
+  memory_learning: EMPTY_MEMORY_LEARNING,
   reload: EMPTY_RELOAD,
 };
 
@@ -226,13 +295,27 @@ export function normalizeOperatorInsightsEnvelope(
       ...EMPTY_PRIVACY,
       ...value?.privacy,
     },
+    operations: normalizeOperations(value?.operations),
     provider_health: normalizeProviderHealth(value?.provider_health),
+    security: normalizeSecurity(value?.security),
     recall: normalizeRecall(value?.recall),
     compaction: normalizeCompaction(value?.compaction),
     safety_boundary: normalizeSafety(value?.safety_boundary),
     plugins: normalizePlugins(value?.plugins),
     cron: normalizeCron(value?.cron),
+    routines: normalizeRoutines(value?.routines),
+    memory_learning: normalizeMemoryLearning(value?.memory_learning),
     reload: normalizeReload(value?.reload),
+  };
+}
+
+function normalizeOperations(
+  value: OperatorOperationsOverviewInsight | null | undefined,
+): OperatorOperationsOverviewInsight {
+  return {
+    ...EMPTY_OPERATIONS,
+    ...value,
+    drill_down: normalizeDrillDown(value?.drill_down),
   };
 }
 
@@ -241,6 +324,16 @@ function normalizeProviderHealth(
 ): OperatorProviderHealthInsight {
   return {
     ...EMPTY_PROVIDER_HEALTH,
+    ...value,
+    drill_down: normalizeDrillDown(value?.drill_down),
+  };
+}
+
+function normalizeSecurity(
+  value: OperatorSecurityInsight | null | undefined,
+): OperatorSecurityInsight {
+  return {
+    ...EMPTY_SECURITY,
     ...value,
     drill_down: normalizeDrillDown(value?.drill_down),
   };
@@ -291,6 +384,26 @@ function normalizeCron(value: OperatorCronInsight | null | undefined): OperatorC
     ...EMPTY_CRON,
     ...value,
     samples: Array.isArray(value?.samples) ? value.samples : [],
+    drill_down: normalizeDrillDown(value?.drill_down),
+  };
+}
+
+function normalizeRoutines(
+  value: OperatorRoutineInsight | null | undefined,
+): OperatorRoutineInsight {
+  return {
+    ...EMPTY_ROUTINES,
+    ...value,
+    drill_down: normalizeDrillDown(value?.drill_down),
+  };
+}
+
+function normalizeMemoryLearning(
+  value: OperatorMemoryLearningInsight | null | undefined,
+): OperatorMemoryLearningInsight {
+  return {
+    ...EMPTY_MEMORY_LEARNING,
+    ...value,
     drill_down: normalizeDrillDown(value?.drill_down),
   };
 }
