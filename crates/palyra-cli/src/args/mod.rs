@@ -364,7 +364,8 @@ Examples:
 
 Keys:
   Tab switches focus, F2/F3/F4 open agent/session/model pickers, F5 opens settings, Ctrl+R reloads data.
-  Enter sends input, `/` starts slash commands, `!` enters the local shell flow with explicit opt-in.";
+  Enter sends input, `/` starts slash commands, `!` enters the local shell flow with explicit opt-in.
+  Ctrl+C exits immediately; `/exit` and `/quit` exit from the composer. `q` exits only when the composer is empty.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]

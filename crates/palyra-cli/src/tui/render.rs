@@ -292,8 +292,12 @@ pub(super) fn compact_status_bar_line(app: &App, width: usize) -> String {
 pub(super) fn compact_shortcut_line(app: &App, width: usize) -> String {
     let slash_hint =
         if app.pending_slash_palette.is_some() { "slash Up/Down + Tab" } else { "/ commands" };
+    compact_shortcut_line_for_hint(slash_hint, width)
+}
+
+fn compact_shortcut_line_for_hint(slash_hint: &str, width: usize) -> String {
     let line = format!(
-        "Enter send · Alt+Enter/Ctrl+J newline · Ctrl+O attach · /status detail · /workspace · /rollback diff · F8 tips · {slash_hint}"
+        "Enter send · Ctrl+C exit · Alt+Enter/Ctrl+J newline · Ctrl+O attach · /status detail · /workspace · F8 tips · {slash_hint}"
     );
     truncate_text(line, width.max(8))
 }
@@ -395,7 +399,9 @@ pub(super) fn fit_segments_to_width(width: usize, segments: Vec<String>) -> Stri
 
 #[cfg(test)]
 mod tests {
-    use super::{display_gateway_grpc_endpoint, profile_header_summary};
+    use super::{
+        compact_shortcut_line_for_hint, display_gateway_grpc_endpoint, profile_header_summary,
+    };
 
     #[test]
     fn display_gateway_grpc_endpoint_uses_endpoint_without_scheme() {
@@ -412,5 +418,12 @@ mod tests {
         let summary = profile_header_summary(None);
         assert_eq!(summary, "Profile direct  Env local  Risk standard  Strict off");
         assert!(!summary.contains("none"));
+    }
+
+    #[test]
+    fn compact_shortcut_line_keeps_exit_gesture_visible() {
+        let line = compact_shortcut_line_for_hint("/ commands", 120);
+        assert!(line.contains("Ctrl+C exit"));
+        assert!(!line.contains("q quit"));
     }
 }

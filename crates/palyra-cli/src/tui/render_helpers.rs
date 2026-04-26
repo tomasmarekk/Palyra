@@ -303,7 +303,8 @@ pub(super) fn render_help_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Line::default(),
         Line::from("Controls"),
         Line::from("  Tab focus or accept slash suggestion  Up/Down navigate palette or composer"),
-        Line::from("  q quit when the composer is empty  Esc close overlay  /status detail expands context"),
+        Line::from("  Ctrl+C exit  /exit or /quit close TUI  q quits only when composer is empty"),
+        Line::from("  Esc close overlay  /status detail expands context"),
         Line::default(),
         Line::from(
             "Retry, undo, attachments, recap family navigation, workspace explorer, rollback, and background tasks all reuse the console HTTP contracts.",
