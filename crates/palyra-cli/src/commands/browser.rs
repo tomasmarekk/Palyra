@@ -167,8 +167,8 @@ async fn run_browser_async(command: BrowserCommand) -> Result<()> {
         ensure_browser_cli_policy_enabled(action)?;
     }
     match command {
-        BrowserCommand::Status { endpoint, health_url, token } => {
-            run_browser_status(endpoint, health_url, token).await
+        BrowserCommand::Status { endpoint, health_url, token, json } => {
+            run_browser_status(endpoint, health_url, token, json).await
         }
         BrowserCommand::Start { bin_path, endpoint, health_url, token, wait_ms } => {
             run_browser_start(bin_path, endpoint, health_url, token, wait_ms).await
@@ -475,6 +475,7 @@ async fn run_browser_status(
     endpoint: Option<String>,
     health_url: Option<String>,
     token: Option<String>,
+    json: bool,
 ) -> Result<()> {
     let resolved = resolve_browser_config(endpoint, health_url, token)?;
     let metadata = read_browser_service_metadata()?;
@@ -498,10 +499,11 @@ async fn run_browser_status(
     };
     let value =
         serde_json::to_value(&payload).context("failed to encode browser status payload")?;
-    emit_browser_value(
+    emit_browser_value_with_json(
         &value,
         format_browser_status_text(&payload),
         "failed to encode browser status output",
+        json,
     )
 }
 
@@ -2618,7 +2620,17 @@ fn browser_output_mode() -> BrowserOutputMode {
 }
 
 fn emit_browser_value(value: &Value, text: String, error_context: &'static str) -> Result<()> {
-    match browser_output_mode() {
+    emit_browser_value_with_json(value, text, error_context, false)
+}
+
+fn emit_browser_value_with_json(
+    value: &Value,
+    text: String,
+    error_context: &'static str,
+    json: bool,
+) -> Result<()> {
+    let mode = if json { BrowserOutputMode::Json } else { browser_output_mode() };
+    match mode {
         BrowserOutputMode::Json => {
             let mut redacted = value.clone();
             redact_browser_output_value(&mut redacted, None);

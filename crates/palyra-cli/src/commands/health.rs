@@ -1,6 +1,6 @@
 use crate::*;
 
-pub(crate) fn run_health(url: Option<String>, grpc_url: Option<String>) -> Result<()> {
+pub(crate) fn run_health(url: Option<String>, grpc_url: Option<String>, json: bool) -> Result<()> {
     let root_context = app::current_root_context()
         .ok_or_else(|| anyhow!("CLI root context is unavailable for health command"))?;
     let http_connection = root_context.resolve_http_connection(
@@ -21,7 +21,7 @@ pub(crate) fn run_health(url: Option<String>, grpc_url: Option<String>) -> Resul
     let runtime = build_runtime()?;
     let grpc = runtime.block_on(fetch_grpc_health_with_retry(grpc_connection.grpc_url.clone()))?;
 
-    if root_context.prefers_json() {
+    if output::preferred_json(json) {
         return output::print_json_pretty(
             &json!({
                 "overall": "ok",
@@ -45,7 +45,7 @@ pub(crate) fn run_health(url: Option<String>, grpc_url: Option<String>) -> Resul
             "failed to encode health output as JSON",
         );
     }
-    if root_context.prefers_ndjson() {
+    if output::preferred_ndjson(json, false) {
         output::print_json_line(
             &json!({
                 "type": "health",

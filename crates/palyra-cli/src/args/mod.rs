@@ -488,6 +488,8 @@ pub enum Command {
         url: Option<String>,
         #[arg(long)]
         grpc_url: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     #[command(
         about = "Tail local gateway journal diagnostics",
@@ -519,6 +521,8 @@ pub enum Command {
         device_id: Option<String>,
         #[arg(long)]
         channel: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     #[command(
         about = "Run the ACP stdio bridge and legacy compatibility shim",

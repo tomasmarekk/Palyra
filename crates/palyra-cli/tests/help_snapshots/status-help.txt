@@ -10,6 +10,7 @@ Options:
       --principal <PRINCIPAL>
       --device-id <DEVICE_ID>
       --channel <CHANNEL>
+      --json
   -h, --help                   Print help
 
 Global Options:

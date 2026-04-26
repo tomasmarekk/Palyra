@@ -125,7 +125,7 @@ pub(crate) fn run_secrets(command: SecretsCommand) -> Result<()> {
             }
             std::io::stdout().flush().context("stdout flush failed")
         }
-        SecretsCommand::List { scope } => {
+        SecretsCommand::List { scope, json } => {
             let vault = open_cli_vault().context("failed to initialize vault runtime")?;
             let scope = parse_vault_scope(scope.as_str())?;
             let listed_entries = vault
@@ -142,7 +142,7 @@ pub(crate) fn run_secrets(command: SecretsCommand) -> Result<()> {
                 })
                 .collect::<Vec<_>>();
             let entry_count = listed_entries.len();
-            if output::preferred_json(false) {
+            if output::preferred_json(json) {
                 return output::print_json_pretty(
                     &json!({
                         "scope": scope.to_string(),
@@ -162,7 +162,7 @@ pub(crate) fn run_secrets(command: SecretsCommand) -> Result<()> {
                     "failed to encode secrets list output as JSON",
                 );
             }
-            if output::preferred_ndjson(false, false) {
+            if output::preferred_ndjson(json, false) {
                 output::print_json_line(
                     &json!({
                         "scope": scope.to_string(),

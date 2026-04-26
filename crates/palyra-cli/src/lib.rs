@@ -263,12 +263,23 @@ fn run_cli() -> Result<()> {
                 rollback_run,
             })
         }
-        CliCommand::Health { url, grpc_url } => commands::health::run_health(url, grpc_url),
+        CliCommand::Health { url, grpc_url, json } => {
+            commands::health::run_health(url, grpc_url, json)
+        }
         CliCommand::Logs { db_path, lines, follow, poll_interval_ms } => {
             commands::logs::run_logs(db_path, lines, follow, poll_interval_ms)
         }
-        CliCommand::Status { url, grpc_url, admin, token, principal, device_id, channel } => {
-            commands::status::run_status(url, grpc_url, admin, token, principal, device_id, channel)
+        CliCommand::Status { url, grpc_url, admin, token, principal, device_id, channel, json } => {
+            commands::status::run_status(commands::status::StatusCommandArgs {
+                url,
+                grpc_url,
+                admin,
+                token,
+                principal,
+                device_id,
+                channel,
+                json,
+            })
         }
         CliCommand::Acp { command } => commands::acp::run_acp(command),
         CliCommand::Mcp { command } => commands::mcp::run_mcp(command),

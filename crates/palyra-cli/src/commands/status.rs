@@ -56,33 +56,34 @@ struct StatusRuntimeSnapshot {
     diagnostics_error: Option<String>,
 }
 
-pub(crate) fn run_status(
-    url: Option<String>,
-    grpc_url: Option<String>,
-    admin: bool,
-    token: Option<String>,
-    principal: Option<String>,
-    device_id: Option<String>,
-    channel: Option<String>,
-) -> Result<()> {
+pub(crate) struct StatusCommandArgs {
+    pub(crate) url: Option<String>,
+    pub(crate) grpc_url: Option<String>,
+    pub(crate) admin: bool,
+    pub(crate) token: Option<String>,
+    pub(crate) principal: Option<String>,
+    pub(crate) device_id: Option<String>,
+    pub(crate) channel: Option<String>,
+    pub(crate) json: bool,
+}
+
+pub(crate) fn run_status(args: StatusCommandArgs) -> Result<()> {
     let root_context = app::current_root_context()
         .ok_or_else(|| anyhow!("CLI root context is unavailable for status command"))?;
     let overrides = app::ConnectionOverrides {
-        daemon_url: url.clone(),
-        grpc_url: grpc_url.clone(),
-        token: token.clone(),
-        principal: principal.clone(),
-        device_id: device_id.clone(),
-        channel: channel.clone(),
+        daemon_url: args.url.clone(),
+        grpc_url: args.grpc_url.clone(),
+        token: args.token.clone(),
+        principal: args.principal.clone(),
+        device_id: args.device_id.clone(),
+        channel: args.channel.clone(),
     };
-    let report = build_status_report(root_context, overrides, admin)?;
+    let report = build_status_report(root_context, overrides, args.admin)?;
 
-    let context = app::current_root_context()
-        .ok_or_else(|| anyhow!("CLI root context is unavailable for status command"))?;
-    if context.prefers_json() {
+    if output::preferred_json(args.json) {
         return output::print_json_pretty(&report, "failed to encode status output as JSON");
     }
-    if context.prefers_ndjson() {
+    if output::preferred_ndjson(args.json, false) {
         output::print_json_line(
             &json!({
                 "type": "status.gateway.http",

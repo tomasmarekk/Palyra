@@ -240,6 +240,7 @@ fn parse_health_with_explicit_endpoints() {
         Command::Health {
             url: Some("http://127.0.0.1:7142".to_owned()),
             grpc_url: Some("http://127.0.0.1:7443".to_owned()),
+            json: false,
         }
     );
 }
@@ -425,6 +426,28 @@ fn parse_status_with_admin_context() {
             principal: Some("user:ops".to_owned()),
             device_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
             channel: Some("cli".to_owned()),
+            json: false,
+        }
+    );
+}
+
+#[test]
+fn parse_top_level_status_json_flags() {
+    let health = Cli::parse_from(["palyra", "health", "--json"]);
+    assert_eq!(health.command, Command::Health { url: None, grpc_url: None, json: true });
+
+    let status = Cli::parse_from(["palyra", "status", "--json"]);
+    assert_eq!(
+        status.command,
+        Command::Status {
+            url: None,
+            grpc_url: None,
+            admin: false,
+            token: None,
+            principal: None,
+            device_id: None,
+            channel: None,
+            json: true,
         }
     );
 }
@@ -3245,6 +3268,23 @@ fn parse_browser_status() {
                 endpoint: Some("http://127.0.0.1:7543".to_owned()),
                 health_url: Some("http://127.0.0.1:7143".to_owned()),
                 token: Some("browser-token".to_owned()),
+                json: false,
+            }
+        }
+    );
+}
+
+#[test]
+fn parse_browser_status_json_flag() {
+    let parsed = Cli::parse_from(["palyra", "browser", "status", "--json"]);
+    assert_eq!(
+        parsed.command,
+        Command::Browser {
+            command: BrowserCommand::Status {
+                endpoint: None,
+                health_url: None,
+                token: None,
+                json: true,
             }
         }
     );
@@ -4171,7 +4211,10 @@ fn parse_policy_explain() {
 #[test]
 fn parse_protocol_version() {
     let parsed = Cli::parse_from(["palyra", "protocol", "version"]);
-    assert_eq!(parsed.command, Command::Protocol { command: ProtocolCommand::Version });
+    assert_eq!(
+        parsed.command,
+        Command::Protocol { command: ProtocolCommand::Version { json: false } }
+    );
 }
 
 #[test]
@@ -4186,7 +4229,37 @@ fn parse_protocol_validate_id() {
     assert_eq!(
         parsed.command,
         Command::Protocol {
-            command: ProtocolCommand::ValidateId { id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned() }
+            command: ProtocolCommand::ValidateId {
+                id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                json: false
+            }
+        }
+    );
+}
+
+#[test]
+fn parse_protocol_json_flags() {
+    let version = Cli::parse_from(["palyra", "protocol", "version", "--json"]);
+    assert_eq!(
+        version.command,
+        Command::Protocol { command: ProtocolCommand::Version { json: true } }
+    );
+
+    let validate_id = Cli::parse_from([
+        "palyra",
+        "protocol",
+        "validate-id",
+        "--id",
+        "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "--json",
+    ]);
+    assert_eq!(
+        validate_id.command,
+        Command::Protocol {
+            command: ProtocolCommand::ValidateId {
+                id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                json: true,
+            }
         }
     );
 }
@@ -4842,7 +4915,18 @@ fn parse_secrets_list_scope() {
     assert_eq!(
         parsed.command,
         Command::Secrets {
-            command: SecretsCommand::List { scope: "principal:user:ops".to_owned() }
+            command: SecretsCommand::List { scope: "principal:user:ops".to_owned(), json: false }
+        }
+    );
+}
+
+#[test]
+fn parse_secrets_list_json_flag() {
+    let parsed = Cli::parse_from(["palyra", "secrets", "list", "global", "--json"]);
+    assert_eq!(
+        parsed.command,
+        Command::Secrets {
+            command: SecretsCommand::List { scope: "global".to_owned(), json: true }
         }
     );
 }

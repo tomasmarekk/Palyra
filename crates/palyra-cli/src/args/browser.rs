@@ -10,6 +10,8 @@ pub enum BrowserCommand {
         health_url: Option<String>,
         #[arg(long)]
         token: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     #[command(about = "Start a local browser service in the background")]
     Start {

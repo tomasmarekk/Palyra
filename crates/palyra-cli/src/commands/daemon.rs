@@ -64,7 +64,7 @@ mod tests {
 pub(crate) fn run_daemon(command: DaemonCommand) -> Result<()> {
     match command {
         DaemonCommand::Run { bin_path } => run_gateway_foreground(bin_path),
-        DaemonCommand::Health { url, grpc_url } => super::health::run_health(url, grpc_url),
+        DaemonCommand::Health { url, grpc_url } => super::health::run_health(url, grpc_url, false),
         DaemonCommand::Probe {
             url,
             grpc_url,

@@ -22,6 +22,8 @@ pub enum SecretsCommand {
     List {
         #[arg(help = VAULT_SCOPE_HELP)]
         scope: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     Delete {
         #[arg(help = VAULT_SCOPE_HELP)]
