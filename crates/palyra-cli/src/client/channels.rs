@@ -91,7 +91,56 @@ pub(crate) fn send_request(
         request = request.header("x-palyra-trace-id", trace_id);
     }
     let response = request.send().context(error_context)?;
-    let response =
-        response.error_for_status().context("channels endpoint returned non-success status")?;
+    let status = response.status();
+    if !status.is_success() {
+        let fallback = status.to_string();
+        let message = response
+            .text()
+            .map(|body| channel_error_message(body.as_str(), fallback.as_str()))
+            .unwrap_or(fallback);
+        anyhow::bail!(
+            "channels endpoint returned non-success status: HTTP {}: {}",
+            status.as_u16(),
+            message
+        );
+    }
     response.json().context("failed to parse channels endpoint JSON payload")
+}
+
+fn channel_error_message(body: &str, fallback: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return fallback.to_owned();
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        if let Some(message) = value.get("error").and_then(Value::as_str) {
+            return message.to_owned();
+        }
+        if let Some(message) = value.get("message").and_then(Value::as_str) {
+            return message.to_owned();
+        }
+    }
+    const MAX_ERROR_BODY_CHARS: usize = 512;
+    if trimmed.chars().count() <= MAX_ERROR_BODY_CHARS {
+        return trimmed.to_owned();
+    }
+    let mut truncated = trimmed.chars().take(MAX_ERROR_BODY_CHARS).collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
+#[cfg(test)]
+mod tests {
+    use super::channel_error_message;
+
+    #[test]
+    fn channel_error_message_prefers_control_plane_error_body() {
+        let message = channel_error_message(
+            r#"{"error":"connector 'echo:default' is internal_test_only; run `palyra message capabilities echo:default`"}"#,
+            "412 Precondition Failed",
+        );
+
+        assert!(message.contains("internal_test_only"));
+        assert!(message.contains("message capabilities echo:default"));
+    }
 }

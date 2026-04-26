@@ -75,6 +75,8 @@ pub enum ChannelPlatformError {
     Media(#[from] crate::media::MediaStoreError),
     #[error("invalid test message input: {0}")]
     InvalidInput(String),
+    #[error("unsupported connector: {0}")]
+    UnsupportedConnector(String),
 }
 
 #[derive(Debug, Clone)]
@@ -454,7 +456,14 @@ impl ChannelPlatform {
         connector_id: &str,
         request: ChannelTestMessageRequest,
     ) -> Result<InboundIngestOutcome, ChannelPlatformError> {
-        self.ensure_operator_visible(connector_id)?;
+        let status = self.ensure_operator_visible(connector_id)?;
+        if status.availability == ConnectorAvailability::InternalTestOnly {
+            return Err(ChannelPlatformError::UnsupportedConnector(format!(
+                "connector '{}' is internal_test_only and does not support user-facing channel tests; run `palyra message capabilities {}` to inspect supported message actions",
+                connector_id.trim(),
+                connector_id.trim()
+            )));
+        }
         if request.text.trim().is_empty() {
             return Err(ChannelPlatformError::InvalidInput("text cannot be empty".to_owned()));
         }
