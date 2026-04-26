@@ -4332,6 +4332,57 @@ async fn grpc_gateway_run_stream_emits_at_most_sixteen_model_tokens() -> Result<
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn grpc_run_stream_allows_sensitive_tool_mode_for_safe_prompt() -> Result<()> {
+    let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+
+    let mut request = sample_run_stream_request_with_text("Reply exactly SETTINGS_OK".to_owned());
+    request.allow_sensitive_tools = true;
+    let mut stream_request = tonic::Request::new(tokio_stream::iter(vec![request]));
+    authorize_metadata(stream_request.metadata_mut())?;
+
+    let mut response_stream =
+        client.run_stream(stream_request).await.context("failed to call RunStream")?.into_inner();
+
+    let mut saw_model_token = false;
+    let mut saw_done_status = false;
+    while let Some(event) = response_stream.next().await {
+        let event = event.context(
+            "allow_sensitive_tools should not pre-deny safe prompts before any tool proposal",
+        )?;
+        match event.body {
+            Some(common_v1::run_stream_event::Body::ModelToken(_)) => {
+                saw_model_token = true;
+            }
+            Some(common_v1::run_stream_event::Body::Status(status))
+                if status.kind == common_v1::stream_status::StatusKind::Done as i32 =>
+            {
+                saw_done_status = true;
+            }
+            Some(common_v1::run_stream_event::Body::Status(status))
+                if status.kind == common_v1::stream_status::StatusKind::Failed as i32 =>
+            {
+                anyhow::bail!("safe prompt failed unexpectedly: {}", status.message);
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        saw_model_token,
+        "safe prompt should reach deterministic model execution with sensitive mode flag present"
+    );
+    assert!(saw_done_status, "safe prompt should complete successfully");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn grpc_run_stream_uses_openai_compatible_provider_when_configured() -> Result<()> {
     let (openai_base_url, request_count, server_handle) =
         spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(

@@ -93,8 +93,6 @@ pub(crate) const MAX_AGENTS_PAGE_LIMIT: usize = 500;
 pub(crate) const JOURNAL_WRITE_LATENCY_BUDGET_MS: u128 = 25;
 pub(crate) const TOOL_EXECUTION_LATENCY_BUDGET_MS: u128 = 200;
 pub(crate) const MIN_TAPE_PAGE_LIMIT: usize = 1;
-pub(crate) const SENSITIVE_TOOLS_DENY_REASON: &str =
-    "allow_sensitive_tools=true is denied by default and requires explicit approvals";
 pub(crate) const CANCELLED_REASON: &str = "cancelled by request";
 pub(crate) const APPROVAL_CHANNEL_UNAVAILABLE_REASON: &str =
     "approval required but no interactive approval channel is available for this run";

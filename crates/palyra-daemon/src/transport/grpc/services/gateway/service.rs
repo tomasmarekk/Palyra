@@ -37,7 +37,6 @@ use crate::{
         record_message_router_journal_event, require_supported_version,
         security_requests_json_mode, session_summary_message, GatewayRuntimeState,
         ListOrchestratorSessionsRequest, RunFailureFinalization, APPROVAL_PROMPT_TIMEOUT_SECONDS,
-        SENSITIVE_TOOLS_DENY_REASON,
     },
     journal::{
         ApprovalCreateRequest, ApprovalDecisionScope, ApprovalPolicySnapshot, ApprovalPromptOption,
@@ -1321,26 +1320,6 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     let _ = sender.send(Err(status)).await;
                     return;
                 }
-                if message.allow_sensitive_tools {
-                    state_for_stream.record_denied();
-                    let status = Status::permission_denied(format!(
-                        "decision=deny_by_default approval_required=true reason={SENSITIVE_TOOLS_DENY_REASON}",
-                    ));
-                    finalize_run_failure(RunFailureFinalization {
-                        sender: &sender,
-                        runtime_state: &state_for_stream,
-                        request_context: Some(&context_for_stream),
-                        active_session_id: active_session_id.as_deref(),
-                        run_state: &mut run_state,
-                        active_run_id: active_run_id.as_deref(),
-                        tape_seq: &mut tape_seq,
-                        reason: SENSITIVE_TOOLS_DENY_REASON,
-                    })
-                    .await;
-                    let _ = sender.send(Err(status)).await;
-                    return;
-                }
-
                 match process_run_stream_message(
                     &sender,
                     &mut stream,
