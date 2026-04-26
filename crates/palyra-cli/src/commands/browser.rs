@@ -104,6 +104,15 @@ struct BrowserStatusPayload {
     lifecycle_metadata: Option<BrowserServiceMetadata>,
     config_path: Option<String>,
     policy: BrowserPolicySnapshot,
+    control_plane: BrowserControlPlaneSnapshot,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BrowserControlPlaneSnapshot {
+    reachable: bool,
+    browser_enabled: Option<bool>,
+    error: Option<String>,
 }
 
 struct BrowserOpenArgs {
@@ -484,6 +493,9 @@ async fn run_browser_status(
         fetch_browser_health(resolved.connection.health_base_url.as_str()).await.ok();
     let grpc_error =
         probe_browser_grpc(&resolved.connection).await.err().map(|error| error.to_string());
+    let control_plane = probe_browser_control_plane_policy().await;
+    let browserd_reachable = health_response.is_some() || grpc_error.is_none();
+    let warnings = browser_status_warnings(&resolved.policy, &control_plane, browserd_reachable);
     let payload = BrowserStatusPayload {
         service: "palyra-browserd",
         grpc_url: resolved.connection.grpc_url,
@@ -496,6 +508,8 @@ async fn run_browser_status(
         lifecycle_metadata: metadata,
         config_path: resolved.config_path,
         policy: resolved.policy,
+        control_plane,
+        warnings,
     };
     let value =
         serde_json::to_value(&payload).context("failed to encode browser status payload")?;
@@ -2413,8 +2427,54 @@ fn ensure_browser_service_enabled(
     }
     let enable_command = browser_service_enable_command(config_path);
     anyhow::bail!(
-        "browser service is disabled (tool_call.browser_service.enabled=false); enable it with `{enable_command}`, then rerun `palyra browser {action}`"
+        "browser service is disabled (tool_call.browser_service.enabled=false); enable it with `{enable_command}`, restart the gateway with `palyra gateway run` or restart the running gateway service, then rerun `palyra browser {action}`"
     );
+}
+
+async fn probe_browser_control_plane_policy() -> BrowserControlPlaneSnapshot {
+    match client::control_plane::connect_admin_console(app::ConnectionOverrides::default()).await {
+        Ok(context) => match context.client.get_diagnostics().await {
+            Ok(diagnostics) => BrowserControlPlaneSnapshot {
+                reachable: true,
+                browser_enabled: diagnostics.pointer("/browserd/enabled").and_then(Value::as_bool),
+                error: None,
+            },
+            Err(error) => BrowserControlPlaneSnapshot {
+                reachable: true,
+                browser_enabled: None,
+                error: Some(sanitize_diagnostic_error(error.to_string().as_str())),
+            },
+        },
+        Err(error) => BrowserControlPlaneSnapshot {
+            reachable: false,
+            browser_enabled: None,
+            error: Some(sanitize_diagnostic_error(error.to_string().as_str())),
+        },
+    }
+}
+
+fn browser_status_warnings(
+    policy: &BrowserPolicySnapshot,
+    control_plane: &BrowserControlPlaneSnapshot,
+    browserd_reachable: bool,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if policy.configured_enabled
+        && control_plane.reachable
+        && control_plane.browser_enabled == Some(false)
+    {
+        warnings.push(
+            "browser service is enabled in the local config, but the running gateway still reports tool_call.browser_service.enabled=false; restart the gateway with `palyra gateway run` or restart the running gateway service before using browser action commands"
+                .to_owned(),
+        );
+    }
+    if policy.configured_enabled && browserd_reachable && !control_plane.reachable {
+        warnings.push(
+            "browserd is reachable, but the gateway runtime policy could not be verified; if browser service was enabled while the gateway was already running, restart the gateway before using browser action commands"
+                .to_owned(),
+        );
+    }
+    warnings
 }
 
 fn browser_service_enable_command(config_path: Option<&str>) -> String {
@@ -2721,6 +2781,19 @@ fn format_browser_status_text(payload: &BrowserStatusPayload) -> String {
             "browser.lifecycle pid={} binary={} stdout_log={} stderr_log={}",
             metadata.pid, metadata.binary, metadata.stdout_log_path, metadata.stderr_log_path,
         ));
+    }
+    lines.push(format!(
+        "browser.control_plane reachable={} browser_enabled={} error={}",
+        payload.control_plane.reachable,
+        payload
+            .control_plane
+            .browser_enabled
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_owned()),
+        payload.control_plane.error.as_deref().unwrap_or("-"),
+    ));
+    for warning in &payload.warnings {
+        lines.push(format!("browser.warning {warning}"));
     }
     if let Some(error) = payload.grpc_error.as_deref() {
         lines.push(format!("browser.grpc_error {}", sanitize_diagnostic_error(error)));
@@ -3184,8 +3257,8 @@ fn proto_console_severity_text(value: i32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        browser_command_policy_action, browser_service_enable_command,
-        ensure_browser_service_enabled, BrowserPolicySnapshot,
+        browser_command_policy_action, browser_service_enable_command, browser_status_warnings,
+        ensure_browser_service_enabled, BrowserControlPlaneSnapshot, BrowserPolicySnapshot,
     };
     use crate::args::BrowserCommand;
 
@@ -3217,6 +3290,10 @@ mod tests {
                 .contains("palyra config set --key tool_call.browser_service.enabled --value true"),
             "disabled-service error should include an exact enable command: {error}"
         );
+        assert!(
+            error.to_string().contains("restart the gateway"),
+            "disabled-service error should explain that the running gateway must reload the config: {error}"
+        );
     }
 
     #[test]
@@ -3247,6 +3324,10 @@ mod tests {
             ),
             "disabled-service error should include a config-specific enable command: {error}"
         );
+        assert!(
+            error.to_string().contains("palyra gateway run"),
+            "disabled-service error should include a gateway restart command: {error}"
+        );
     }
 
     #[test]
@@ -3269,5 +3350,29 @@ mod tests {
         policy.configured_enabled = true;
         ensure_browser_service_enabled(&policy, "start", None)
             .expect("enabled browser service should allow start");
+    }
+
+    #[test]
+    fn browser_status_warns_when_gateway_policy_is_stale() {
+        let mut policy = disabled_policy();
+        policy.configured_enabled = true;
+        let warnings = browser_status_warnings(
+            &policy,
+            &BrowserControlPlaneSnapshot {
+                reachable: true,
+                browser_enabled: Some(false),
+                error: None,
+            },
+            true,
+        );
+
+        assert!(
+            warnings.iter().any(|warning| {
+                warning.contains("running gateway")
+                    && warning.contains("tool_call.browser_service.enabled=false")
+                    && warning.contains("restart the gateway")
+            }),
+            "stale gateway policy should produce a restart warning: {warnings:?}"
+        );
     }
 }
