@@ -582,22 +582,78 @@ export function MemorySection({ app }: MemorySectionProps) {
                     onPress={() =>
                       void app.reviewLearningCandidate(
                         selectedLearningCandidateId,
-                        "accepted",
+                        "approved",
                         readString(selectedLearningCandidate, "candidate_kind") === "preference",
+                        "approved from memory learning review",
+                        JSON.stringify({ action: "approve", previous_state_restored: false }),
                       )
                     }
                   >
-                    Accept
+                    Approve
                   </ActionButton>
                   <ActionButton
                     isDisabled={app.memoryLearningBusy}
                     type="button"
                     variant="secondary"
                     onPress={() =>
-                      void app.reviewLearningCandidate(selectedLearningCandidateId, "denied")
+                      void app.reviewLearningCandidate(
+                        selectedLearningCandidateId,
+                        "rejected",
+                        false,
+                        "rejected from memory learning review",
+                        JSON.stringify({ action: "reject", previous_state_restored: false }),
+                      )
                     }
                   >
-                    Deny
+                    Reject
+                  </ActionButton>
+                  <ActionButton
+                    isDisabled={app.memoryLearningBusy}
+                    type="button"
+                    variant="ghost"
+                    onPress={() =>
+                      void app.reviewLearningCandidate(
+                        selectedLearningCandidateId,
+                        "needs-review",
+                        false,
+                        "edit requested from memory learning review",
+                        JSON.stringify({ action: "edit", previous_state_restored: false }),
+                      )
+                    }
+                  >
+                    Edit
+                  </ActionButton>
+                  <ActionButton
+                    isDisabled={app.memoryLearningBusy}
+                    type="button"
+                    variant="ghost"
+                    onPress={() =>
+                      void app.reviewLearningCandidate(
+                        selectedLearningCandidateId,
+                        "approved",
+                        false,
+                        "merge approved from memory learning review",
+                        JSON.stringify({ action: "merge", previous_state_restored: false }),
+                      )
+                    }
+                  >
+                    Merge
+                  </ActionButton>
+                  <ActionButton
+                    isDisabled={app.memoryLearningBusy}
+                    type="button"
+                    variant="danger"
+                    onPress={() =>
+                      void app.reviewLearningCandidate(
+                        selectedLearningCandidateId,
+                        "rolled-back",
+                        false,
+                        "rollback recorded from memory learning review",
+                        JSON.stringify({ action: "rollback", previous_state_restored: false }),
+                      )
+                    }
+                  >
+                    Rollback
                   </ActionButton>
                   {selectedLearningPatchApplyAllowed ? (
                     <ActionButton

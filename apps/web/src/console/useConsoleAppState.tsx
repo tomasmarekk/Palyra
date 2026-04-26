@@ -1255,6 +1255,8 @@ export function useConsoleAppState() {
     candidateId: string,
     status: string,
     applyPreference = false,
+    actionSummary?: string,
+    actionPayloadJson?: string,
   ): Promise<void> {
     const trimmed = candidateId.trim();
     if (trimmed.length === 0) {
@@ -1266,6 +1268,8 @@ export function useConsoleAppState() {
     try {
       const response = await api.reviewLearningCandidate(trimmed, {
         status,
+        action_summary: actionSummary,
+        action_payload_json: actionPayloadJson,
         apply_preference: applyPreference,
       });
       setNotice(
