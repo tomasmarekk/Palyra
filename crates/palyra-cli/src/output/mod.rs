@@ -21,6 +21,8 @@ pub(crate) enum CliExitCode {
     Connectivity = 4,
     Unsupported = 5,
     Policy = 6,
+    Precondition = 7,
+    NotFound = 8,
     Internal = 1,
 }
 
@@ -95,6 +97,8 @@ pub(crate) fn emit_error(error: &anyhow::Error) -> Result<CliExitCode> {
         CliExitCode::Connectivity => "connectivity_failure",
         CliExitCode::Unsupported => "unsupported_capability",
         CliExitCode::Policy => "policy_denial",
+        CliExitCode::Precondition => "precondition_failed",
+        CliExitCode::NotFound => "not_found",
         CliExitCode::Internal => "internal_error",
     };
     let context = app::current_root_context();
@@ -174,6 +178,15 @@ pub(crate) fn classify_error(error: &anyhow::Error) -> CliExitCode {
     if error.chain().any(|cause| cause.is::<clap::Error>()) {
         return CliExitCode::Validation;
     }
+    if let Some(exit_code) = error.chain().find_map(classify_control_plane_error) {
+        return exit_code;
+    }
+    if let Some(exit_code) = error.chain().find_map(classify_tonic_status) {
+        return exit_code;
+    }
+    if let Some(exit_code) = error.chain().find_map(classify_reqwest_status) {
+        return exit_code;
+    }
     if lower.contains("unauthorized")
         || lower.contains("forbidden")
         || lower.contains("auth")
@@ -200,15 +213,95 @@ pub(crate) fn classify_error(error: &anyhow::Error) -> CliExitCode {
     if lower.contains("policy") || lower.contains("approval required") || lower.contains("denied") {
         return CliExitCode::Policy;
     }
+    if lower.contains("not found") {
+        return CliExitCode::NotFound;
+    }
+    if lower.contains("failed precondition")
+        || lower.contains("precondition failed")
+        || lower.contains("http 412")
+    {
+        return CliExitCode::Precondition;
+    }
     if lower.contains("invalid")
         || lower.contains("must be")
         || lower.contains("cannot be")
         || lower.contains("requires")
-        || lower.contains("not found")
+        || lower.contains("required")
+        || lower.contains("missing prompt")
     {
         return CliExitCode::Validation;
     }
     CliExitCode::Internal
+}
+
+fn classify_control_plane_error(cause: &(dyn std::error::Error + 'static)) -> Option<CliExitCode> {
+    match cause.downcast_ref::<palyra_control_plane::ControlPlaneClientError>()? {
+        palyra_control_plane::ControlPlaneClientError::Http { status, envelope, .. } => {
+            envelope.as_ref().map_or_else(
+                || classify_http_status(*status),
+                |envelope| classify_control_plane_envelope(*status, envelope),
+            )
+        }
+        palyra_control_plane::ControlPlaneClientError::InvalidBaseUrl(_) => {
+            Some(CliExitCode::Validation)
+        }
+        palyra_control_plane::ControlPlaneClientError::Transport(_) => {
+            Some(CliExitCode::Connectivity)
+        }
+        palyra_control_plane::ControlPlaneClientError::ClientInit(_)
+        | palyra_control_plane::ControlPlaneClientError::Decode(_) => None,
+    }
+}
+
+fn classify_control_plane_envelope(
+    status: u16,
+    envelope: &palyra_control_plane::ErrorEnvelope,
+) -> Option<CliExitCode> {
+    use palyra_control_plane::ErrorCategory;
+
+    match envelope.category {
+        ErrorCategory::Auth => Some(CliExitCode::Auth),
+        ErrorCategory::Validation => Some(CliExitCode::Validation),
+        ErrorCategory::Policy => Some(CliExitCode::Policy),
+        ErrorCategory::NotFound => Some(CliExitCode::NotFound),
+        ErrorCategory::Conflict => Some(CliExitCode::Precondition),
+        ErrorCategory::Dependency if status == 412 => Some(CliExitCode::Precondition),
+        ErrorCategory::Dependency | ErrorCategory::Availability => Some(CliExitCode::Connectivity),
+        ErrorCategory::Internal => classify_http_status(status),
+    }
+}
+
+fn classify_tonic_status(cause: &(dyn std::error::Error + 'static)) -> Option<CliExitCode> {
+    let status = cause.downcast_ref::<tonic::Status>()?;
+    Some(match status.code() {
+        tonic::Code::InvalidArgument => CliExitCode::Validation,
+        tonic::Code::Unauthenticated => CliExitCode::Auth,
+        tonic::Code::PermissionDenied => CliExitCode::Policy,
+        tonic::Code::NotFound => CliExitCode::NotFound,
+        tonic::Code::FailedPrecondition => CliExitCode::Precondition,
+        tonic::Code::Unavailable
+        | tonic::Code::DeadlineExceeded
+        | tonic::Code::ResourceExhausted => CliExitCode::Connectivity,
+        _ => return None,
+    })
+}
+
+fn classify_reqwest_status(cause: &(dyn std::error::Error + 'static)) -> Option<CliExitCode> {
+    let status = cause.downcast_ref::<reqwest::Error>()?.status()?;
+    classify_http_status(status.as_u16())
+}
+
+fn classify_http_status(status: u16) -> Option<CliExitCode> {
+    match status {
+        400 | 422 => Some(CliExitCode::Validation),
+        401 => Some(CliExitCode::Auth),
+        403 => Some(CliExitCode::Policy),
+        404 => Some(CliExitCode::NotFound),
+        409 | 412 => Some(CliExitCode::Precondition),
+        408 | 429 | 500..=599 => Some(CliExitCode::Connectivity),
+        400..=499 => Some(CliExitCode::Validation),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -247,6 +340,44 @@ mod tests {
             classify_error(&anyhow!("run_id must be a canonical ULID")),
             CliExitCode::Validation
         );
+        assert_eq!(
+            classify_error(&anyhow!("missing prompt: use --prompt or --prompt-stdin")),
+            CliExitCode::Validation
+        );
+    }
+
+    #[test]
+    fn classify_error_maps_control_plane_user_errors() {
+        let validation = palyra_control_plane::ControlPlaneClientError::Http {
+            status: 400,
+            message: "supported phrases include daily, hourly".to_owned(),
+            envelope: None,
+        };
+        assert_eq!(classify_error(&anyhow!(validation)), CliExitCode::Validation);
+
+        let precondition = palyra_control_plane::ControlPlaneClientError::Http {
+            status: 412,
+            message: "browser service is disabled".to_owned(),
+            envelope: Some(palyra_control_plane::ErrorEnvelope {
+                error: "browser service is disabled".to_owned(),
+                code: "failed_precondition".to_owned(),
+                category: palyra_control_plane::ErrorCategory::Dependency,
+                retryable: false,
+                redacted: false,
+                validation_errors: Vec::new(),
+            }),
+        };
+        assert_eq!(classify_error(&anyhow!(precondition)), CliExitCode::Precondition);
+    }
+
+    #[test]
+    fn classify_error_maps_tonic_not_found() {
+        let error = anyhow::Error::new(tonic::Status::not_found(
+            "orchestrator session not found for selector: missing",
+        ))
+        .context("failed to call ResolveSession");
+
+        assert_eq!(classify_error(&error), CliExitCode::NotFound);
     }
 
     #[test]
