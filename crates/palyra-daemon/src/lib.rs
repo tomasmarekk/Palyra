@@ -1869,7 +1869,6 @@ struct SecretAccessAuditRecord {
     config_path: String,
     secret_id: String,
     source_kind: String,
-    value_bytes: usize,
     resolved_at_unix_ms: i64,
 }
 
@@ -3235,7 +3234,6 @@ fn resolve_provider_secret_from_secret_ref(
         .resolve(secret_ref)
         .map_err(|error| anyhow::anyhow!("failed to resolve {context_label}: {}", error.message))?;
     let resolved_at_unix_ms = resolution.metadata.resolved_at_unix_ms;
-    let value_bytes = resolution.metadata.value_bytes.unwrap_or(0);
     let decoded = resolution.decode_utf8(context_label)?;
     Ok((
         decoded,
@@ -3244,7 +3242,6 @@ fn resolve_provider_secret_from_secret_ref(
             config_path: config_path.to_owned(),
             secret_id: secret_ref.fingerprint(),
             source_kind: secret_ref.source_kind().to_owned(),
-            value_bytes,
             resolved_at_unix_ms,
         },
     ))
@@ -3411,10 +3408,7 @@ fn collect_configured_secret_record(
                 last_resolved_at_unix_ms: Some(resolution.metadata.resolved_at_unix_ms),
                 last_error_kind: None,
                 last_error: None,
-                value_bytes: resolution
-                    .metadata
-                    .value_bytes
-                    .map(|value| u32::try_from(value).unwrap_or(u32::MAX)),
+                value_bytes: None,
             });
         }
         Err(error) => {
@@ -3437,10 +3431,7 @@ fn collect_configured_secret_record(
                 last_resolved_at_unix_ms: Some(error.metadata.resolved_at_unix_ms),
                 last_error_kind: Some(secret_resolve_error_kind_label(error.kind).to_owned()),
                 last_error: Some(error.message),
-                value_bytes: error
-                    .metadata
-                    .value_bytes
-                    .map(|value| u32::try_from(value).unwrap_or(u32::MAX)),
+                value_bytes: None,
             });
         }
     }
@@ -3539,7 +3530,6 @@ fn record_secret_access_journal_event(
                 "config_path": audit.config_path,
                 "secret_id": audit.secret_id,
                 "source_kind": audit.source_kind,
-                "value_bytes": audit.value_bytes,
                 "resolved_at_unix_ms": audit.resolved_at_unix_ms,
             })
             .to_string()

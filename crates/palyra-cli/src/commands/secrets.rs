@@ -59,7 +59,6 @@ struct VaultSecretExplainEnvelope {
     key: String,
     status: String,
     backend: String,
-    value_bytes: u32,
     created_at_unix_ms: i64,
     updated_at_unix_ms: i64,
     configured: bool,
@@ -94,11 +93,10 @@ pub(crate) fn run_secrets(command: SecretsCommand) -> Result<()> {
                 .put_secret(&scope, key.as_str(), value.as_slice())
                 .with_context(|| format!("failed to store secret key={} scope={scope}", key))?;
             println!(
-                "secrets.set scope={} key={} value_bytes={} backend={}",
+                "secrets.set scope={} key={} backend={}",
                 scope,
                 metadata.key,
-                metadata.value_bytes,
-                vault.backend_kind().as_str(),
+                vault.backend_kind().as_str()
             );
             std::io::stdout().flush().context("stdout flush failed")
         }
@@ -116,12 +114,7 @@ pub(crate) fn run_secrets(command: SecretsCommand) -> Result<()> {
                     .write_all(value.as_slice())
                     .context("failed to write secret value to stdout")?;
             } else {
-                println!(
-                    "secrets.get scope={} key={} value=<redacted> value_bytes={} reveal=false",
-                    scope,
-                    key,
-                    value.len()
-                );
+                println!("secrets.get scope={} key={} value=<redacted> reveal=false", scope, key);
             }
             std::io::stdout().flush().context("stdout flush failed")
         }
@@ -132,14 +125,7 @@ pub(crate) fn run_secrets(command: SecretsCommand) -> Result<()> {
                 .list_secrets(&scope)
                 .with_context(|| format!("failed to list secrets for scope={scope}"))?
                 .into_iter()
-                .map(|entry| {
-                    (
-                        entry.key,
-                        entry.created_at_unix_ms,
-                        entry.updated_at_unix_ms,
-                        entry.value_bytes,
-                    )
-                })
+                .map(|entry| (entry.key, entry.created_at_unix_ms, entry.updated_at_unix_ms))
                 .collect::<Vec<_>>();
             let entry_count = listed_entries.len();
             if output::preferred_json(json) {
@@ -149,12 +135,11 @@ pub(crate) fn run_secrets(command: SecretsCommand) -> Result<()> {
                         "count": entry_count,
                         "backend": vault.backend_kind().as_str(),
                         "entries": listed_entries.iter().map(
-                            |(key, created_at_unix_ms, updated_at_unix_ms, value_bytes)| {
+                            |(key, created_at_unix_ms, updated_at_unix_ms)| {
                                 json!({
                                     "key": key,
                                     "created_at_unix_ms": created_at_unix_ms,
                                     "updated_at_unix_ms": updated_at_unix_ms,
-                                    "value_bytes": value_bytes,
                                 })
                             }
                         ).collect::<Vec<_>>(),
@@ -169,12 +154,11 @@ pub(crate) fn run_secrets(command: SecretsCommand) -> Result<()> {
                         "count": entry_count,
                         "backend": vault.backend_kind().as_str(),
                         "entries": listed_entries.iter().map(
-                            |(key, created_at_unix_ms, updated_at_unix_ms, value_bytes)| {
+                            |(key, created_at_unix_ms, updated_at_unix_ms)| {
                                 json!({
                                     "key": key,
                                     "created_at_unix_ms": created_at_unix_ms,
                                     "updated_at_unix_ms": updated_at_unix_ms,
-                                    "value_bytes": value_bytes,
                                 })
                             }
                         ).collect::<Vec<_>>(),
@@ -189,15 +173,10 @@ pub(crate) fn run_secrets(command: SecretsCommand) -> Result<()> {
                 entry_count,
                 vault.backend_kind().as_str()
             );
-            for (entry_key, created_at_unix_ms, updated_at_unix_ms, value_byte_count) in
-                listed_entries
-            {
+            for (entry_key, created_at_unix_ms, updated_at_unix_ms) in listed_entries {
                 println!(
-                    "secrets.entry key={} created_at_unix_ms={} updated_at_unix_ms={} value_bytes={}",
-                    entry_key,
-                    created_at_unix_ms,
-                    updated_at_unix_ms,
-                    value_byte_count
+                    "secrets.entry key={} created_at_unix_ms={} updated_at_unix_ms={}",
+                    entry_key, created_at_unix_ms, updated_at_unix_ms
                 );
             }
             std::io::stdout().flush().context("stdout flush failed")
@@ -898,15 +877,12 @@ fn run_vault_secret_explain(vault_ref: &VaultRef, json: bool) -> Result<()> {
         .with_context(|| {
             format!("secret reference {reference} was not found in the local vault")
         })?;
-    let (status, value_bytes, last_error) = match vault.get_secret(&vault_ref.scope, &vault_ref.key)
-    {
-        Ok(value) if value.is_empty() => ("empty".to_owned(), 0, None),
-        Ok(value) => ("stored".to_owned(), u32::try_from(value.len()).unwrap_or(u32::MAX), None),
-        Err(error) => (
-            "unreadable".to_owned(),
-            u32::try_from(metadata.value_bytes).unwrap_or(u32::MAX),
-            Some(sanitize_secret_error(error.to_string().as_str())),
-        ),
+    let (status, last_error) = match vault.get_secret(&vault_ref.scope, &vault_ref.key) {
+        Ok(value) if value.is_empty() => ("empty".to_owned(), None),
+        Ok(_) => ("stored".to_owned(), None),
+        Err(error) => {
+            ("unreadable".to_owned(), Some(sanitize_secret_error(error.to_string().as_str())))
+        }
     };
     let (configured_references, config_usage_error) = match build_secrets_audit_payload(None, true)
     {
@@ -933,7 +909,6 @@ fn run_vault_secret_explain(vault_ref: &VaultRef, json: bool) -> Result<()> {
         key: vault_ref.key.clone(),
         status,
         backend: vault.backend_kind().as_str().to_owned(),
-        value_bytes,
         created_at_unix_ms: metadata.created_at_unix_ms,
         updated_at_unix_ms: metadata.updated_at_unix_ms,
         configured: !configured_references.is_empty(),
@@ -947,12 +922,8 @@ fn run_vault_secret_explain(vault_ref: &VaultRef, json: bool) -> Result<()> {
     }
     output::print_text_line(
         format!(
-            "secret.explain reference={} status={} configured={} backend={} value_bytes={}",
-            envelope.reference,
-            envelope.status,
-            envelope.configured,
-            envelope.backend,
-            envelope.value_bytes
+            "secret.explain reference={} status={} configured={} backend={}",
+            envelope.reference, envelope.status, envelope.configured, envelope.backend
         )
         .as_str(),
     )?;

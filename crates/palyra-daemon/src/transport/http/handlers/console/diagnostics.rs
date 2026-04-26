@@ -1426,7 +1426,6 @@ pub(crate) fn build_config_ref_health_observability(state: &AppState) -> Value {
                 "last_checked_at_unix_ms": entry.last_resolved_at_unix_ms,
                 "last_error_kind": entry.last_error_kind,
                 "last_error": entry.last_error,
-                "value_bytes": entry.value_bytes,
                 "advice": advice,
                 "affected_components": entry.affected_components,
             })

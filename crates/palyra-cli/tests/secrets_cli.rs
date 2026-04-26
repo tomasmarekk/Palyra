@@ -134,6 +134,10 @@ fn secrets_get_without_reveal_redacts_output() -> Result<()> {
         "secret output should be redacted by default: {get_stdout}"
     );
     assert!(
+        !get_stdout.contains("value_bytes"),
+        "redacted secret output must not disclose secret length: {get_stdout}"
+    );
+    assert!(
         !get_stdout.contains("super-secret-token"),
         "raw secret bytes must not appear without --reveal: {get_stdout}"
     );
@@ -193,6 +197,10 @@ fn secrets_explain_accepts_vault_reference_from_list() -> Result<()> {
     assert!(
         explain_stdout.contains("\"configured\": false"),
         "unreferenced vault secrets should be explained instead of rejected: {explain_stdout}"
+    );
+    assert!(
+        !explain_stdout.contains("value_bytes"),
+        "secrets explain must not disclose raw secret lengths: {explain_stdout}"
     );
     assert!(
         !explain_stdout.contains("minimax-secret-value"),
