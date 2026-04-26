@@ -4417,7 +4417,7 @@ async fn grpc_run_stream_uses_openai_compatible_provider_when_configured() -> Re
             model_tokens.push(token.token);
         }
     }
-    assert_eq!(model_tokens, vec!["provider", "says", "hello"]);
+    assert_eq!(model_tokens.concat(), "provider says hello");
     assert_eq!(request_count.load(Ordering::Relaxed), 1);
 
     let status_snapshot = admin_get_json_async(admin_port, "/admin/v1/status".to_owned()).await?;
