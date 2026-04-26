@@ -60,7 +60,7 @@ pub(crate) async fn run_sessions_async(
                     "{}",
                     serde_json::to_string_pretty(&json!({
                         "sessions": response.sessions.iter().map(session_to_json).collect::<Vec<_>>(),
-                        "next_after_session_key": redacted_text_json_or_null(
+                        "next_after_session_key": empty_to_json_or_null(
                             response.next_after_session_key.as_str()
                         ),
                         "include_archived": include_archived,
@@ -1020,8 +1020,8 @@ fn build_resolve_session_request(
 
 fn session_to_json(session: &gateway_v1::SessionSummary) -> Value {
     json!({
-        "session_id": if session.session_id.is_some() { Value::String(REDACTED.to_owned()) } else { Value::Null },
-        "session_key": redacted_presence_json_value(!session.session_key.trim().is_empty()),
+        "session_id": optional_canonical_id_json_value(&session.session_id),
+        "session_key": empty_to_json_or_null(session.session_key.as_str()),
         "session_label": redacted_presence_json_value(!session.session_label.trim().is_empty()),
         "title": empty_to_json_or_null(session.title.as_str()),
         "title_source": empty_to_json_or_null(session.title_source.as_str()),
@@ -1032,17 +1032,22 @@ fn session_to_json(session: &gateway_v1::SessionSummary) -> Value {
         "last_summary": empty_to_json_or_null(session.last_summary.as_str()),
         "match_snippet": empty_to_json_or_null(session.match_snippet.as_str()),
         "branch_state": empty_to_json_or_null(session.branch_state.as_str()),
-        "parent_session_id": if session.parent_session_id.is_some() {
-            Value::String(REDACTED.to_owned())
-        } else {
-            Value::Null
-        },
+        "parent_session_id": optional_canonical_id_json_value(&session.parent_session_id),
         "last_run_state": empty_to_json_or_null(session.last_run_state.as_str()),
         "created_at_unix_ms": session.created_at_unix_ms,
         "updated_at_unix_ms": session.updated_at_unix_ms,
-        "last_run_id": if session.last_run_id.is_some() { Value::String(REDACTED.to_owned()) } else { Value::Null },
+        "last_run_id": optional_canonical_id_json_value(&session.last_run_id),
         "archived_at_unix_ms": empty_unix_ms(session.archived_at_unix_ms),
     })
+}
+
+fn optional_canonical_id_json_value(value: &Option<common_v1::CanonicalId>) -> Value {
+    value
+        .as_ref()
+        .map(|id| id.ulid.trim())
+        .filter(|ulid| !ulid.is_empty())
+        .map(|ulid| Value::String(ulid.to_owned()))
+        .unwrap_or(Value::Null)
 }
 
 fn redacted_text_or_none(present: bool) -> String {
@@ -1386,7 +1391,9 @@ mod render_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_cleanup_session_request, build_resolve_session_request};
+    use super::{build_cleanup_session_request, build_resolve_session_request, session_to_json};
+    use crate::proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1};
+    use palyra_common::redaction::REDACTED;
 
     #[test]
     fn resolve_session_request_requires_identifier() {
@@ -1414,6 +1421,46 @@ mod tests {
         assert_eq!(request.session_label, "Ops Triage");
         assert!(request.require_existing);
         assert!(!request.reset_session);
+    }
+
+    #[test]
+    fn session_json_preserves_command_identifiers() {
+        let session = gateway_v1::SessionSummary {
+            session_id: Some(common_v1::CanonicalId {
+                ulid: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            }),
+            session_key: "onboarding-smoke".to_owned(),
+            session_label: "Sensitive user label".to_owned(),
+            parent_session_id: Some(common_v1::CanonicalId {
+                ulid: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned(),
+            }),
+            last_run_id: Some(common_v1::CanonicalId {
+                ulid: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+            }),
+            ..Default::default()
+        };
+        let payload = session_to_json(&session);
+
+        assert_eq!(
+            payload.get("session_id").and_then(serde_json::Value::as_str),
+            Some("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+        );
+        assert_eq!(
+            payload.get("session_key").and_then(serde_json::Value::as_str),
+            Some("onboarding-smoke")
+        );
+        assert_eq!(
+            payload.get("parent_session_id").and_then(serde_json::Value::as_str),
+            Some("01ARZ3NDEKTSV4RRFFQ69G5FAW")
+        );
+        assert_eq!(
+            payload.get("last_run_id").and_then(serde_json::Value::as_str),
+            Some("01ARZ3NDEKTSV4RRFFQ69G5FAX")
+        );
+        assert_eq!(
+            payload.get("session_label").and_then(serde_json::Value::as_str),
+            Some(REDACTED)
+        );
     }
 
     #[test]
