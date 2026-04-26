@@ -568,7 +568,7 @@ describe("M56 runtime and operations surfaces", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Refresh queue" }));
     expect((await screen.findAllByText("Preference: interaction.style")).length).toBeGreaterThan(0);
-    fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
     await waitFor(() => {
       expect(
         screen.getByText("Learning candidate Preference: interaction.style marked as accepted."),
