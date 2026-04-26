@@ -20,6 +20,7 @@ mod gateway;
 mod hooks;
 pub mod infra;
 mod journal;
+mod maintenance;
 mod media;
 mod media_derived;
 mod model_provider;

@@ -6,6 +6,7 @@ use super::diagnostics::{
 };
 use super::usage::build_operator_insights_for_context;
 use crate::gateway::current_unix_ms;
+use crate::maintenance::{collect_maintenance_status, MaintenanceStatusFilter};
 use crate::*;
 
 const DEFAULT_SYSTEM_EVENTS_LIMIT: usize = 200;
@@ -102,6 +103,10 @@ pub(crate) async fn console_system_presence_handler(
     let support_bundle_payload = build_support_bundle_observability(&state);
     let memory_status =
         state.runtime.memory_maintenance_status().await.map_err(runtime_status_response)?;
+    let maintenance_status =
+        collect_maintenance_status(&state, &session.context, MaintenanceStatusFilter::default())
+            .await
+            .map_err(runtime_status_response)?;
     let deployment = collect_console_deployment_diagnostics(&state);
     let generated_at_unix_ms = unix_ms_now().map_err(|error| {
         runtime_status_response(tonic::Status::internal(format!(
@@ -152,6 +157,10 @@ pub(crate) async fn console_system_presence_handler(
             "support_bundle": {
                 "state": support_bundle_presence_state(&support_bundle_payload),
                 "status": support_bundle_payload,
+            },
+            "maintenance": {
+                "state": maintenance_status.summary.overall_state.as_str(),
+                "status": maintenance_status,
             },
         },
         "deployment": deployment,

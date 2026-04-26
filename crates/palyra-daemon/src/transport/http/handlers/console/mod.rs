@@ -16,6 +16,7 @@ pub(crate) mod flows;
 pub(crate) mod hooks;
 pub(crate) mod inventory;
 pub(crate) mod logs;
+pub(crate) mod maintenance;
 pub(crate) mod memory;
 pub(crate) mod memory_external_index;
 pub(crate) mod mobile;
