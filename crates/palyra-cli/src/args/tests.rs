@@ -4046,6 +4046,39 @@ fn parse_daemon_run_status_with_run_id() {
                 device_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
                 channel: Some("cli".to_owned()),
                 run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+                json: false,
+            }
+        }
+    );
+}
+
+#[test]
+fn parse_daemon_run_tape_with_json() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "daemon",
+        "run-tape",
+        "--run-id",
+        "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+        "--after-seq",
+        "42",
+        "--limit",
+        "10",
+        "--json",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Gateway {
+            command: DaemonCommand::RunTape {
+                url: None,
+                token: None,
+                principal: None,
+                device_id: None,
+                channel: None,
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+                after_seq: Some(42),
+                limit: Some(10),
+                json: true,
             }
         }
     );

@@ -445,7 +445,7 @@ pub(crate) fn run_daemon(command: DaemonCommand) -> Result<()> {
             }
             std::io::stdout().flush().context("stdout flush failed")
         }
-        DaemonCommand::RunStatus { url, token, principal, device_id, channel, run_id } => {
+        DaemonCommand::RunStatus { url, token, principal, device_id, channel, run_id, json } => {
             validate_canonical_id(run_id.as_str())
                 .context("run_id must be a canonical ULID for daemon run-status")?;
             let connection = root_context()?.resolve_http_connection(
@@ -473,16 +473,23 @@ pub(crate) fn run_daemon(command: DaemonCommand) -> Result<()> {
                 .context("daemon run status endpoint returned non-success status")?
                 .json()
                 .context("failed to parse daemon run status payload")?;
-            println!(
-                "run.status run_id={} state={} cancel_requested={} prompt_tokens={} completion_tokens={} total_tokens={} tape_events={}",
-                response.run_id,
-                response.state,
-                response.cancel_requested,
-                response.prompt_tokens,
-                response.completion_tokens,
-                response.total_tokens,
-                response.tape_events
-            );
+            if output::preferred_json(json) {
+                output::print_json_pretty(
+                    &response,
+                    "failed to encode daemon run status output as JSON",
+                )?;
+            } else {
+                println!(
+                    "run.status run_id={} state={} cancel_requested={} prompt_tokens={} completion_tokens={} total_tokens={} tape_events={}",
+                    response.run_id,
+                    response.state,
+                    response.cancel_requested,
+                    response.prompt_tokens,
+                    response.completion_tokens,
+                    response.total_tokens,
+                    response.tape_events
+                );
+            }
             std::io::stdout().flush().context("stdout flush failed")
         }
         DaemonCommand::RunTape {
@@ -494,6 +501,7 @@ pub(crate) fn run_daemon(command: DaemonCommand) -> Result<()> {
             run_id,
             after_seq,
             limit,
+            json,
         } => {
             validate_canonical_id(run_id.as_str())
                 .context("run_id must be a canonical ULID for daemon run-tape")?;
@@ -530,21 +538,28 @@ pub(crate) fn run_daemon(command: DaemonCommand) -> Result<()> {
                 .context("daemon run tape endpoint returned non-success status")?
                 .json()
                 .context("failed to parse daemon run tape payload")?;
-            println!(
-                "run.tape run_id={} events={} returned_bytes={} next_after_seq={}",
-                response.run_id,
-                response.events.len(),
-                response.returned_bytes,
-                response
-                    .next_after_seq
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "none".to_owned())
-            );
-            for event in response.events {
+            if output::preferred_json(json) {
+                output::print_json_pretty(
+                    &response,
+                    "failed to encode daemon run tape output as JSON",
+                )?;
+            } else {
                 println!(
-                    "run.tape.event seq={} type={} payload_json={}",
-                    event.seq, event.event_type, event.payload_json
+                    "run.tape run_id={} events={} returned_bytes={} next_after_seq={}",
+                    response.run_id,
+                    response.events.len(),
+                    response.returned_bytes,
+                    response
+                        .next_after_seq
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "none".to_owned())
                 );
+                for event in response.events {
+                    println!(
+                        "run.tape.event seq={} type={} payload_json={}",
+                        event.seq, event.event_type, event.payload_json
+                    );
+                }
             }
             std::io::stdout().flush().context("stdout flush failed")
         }

@@ -1,5 +1,5 @@
 use std::{
-    io::Read,
+    io::{Read, Write},
     net::TcpListener,
     path::PathBuf,
     process::{Child, ChildStderr, Command, Stdio},
@@ -111,6 +111,78 @@ fn palyra_daemon_run_status_rejects_non_canonical_run_id() -> Result<()> {
     assert!(
         stderr.contains("run_id must be a canonical ULID"),
         "expected canonical ULID validation failure, got: {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn palyra_daemon_run_inspection_supports_json_output() -> Result<()> {
+    let run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAX";
+    let status_fixture = spawn_json_fixture(
+        format!("/admin/v1/runs/{run_id}"),
+        format!(
+            r#"{{"run_id":"{run_id}","state":"completed","cancel_requested":false,"prompt_tokens":11,"completion_tokens":7,"total_tokens":18,"tape_events":2}}"#
+        ),
+    )?;
+
+    let status_output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .args([
+            "--output-format",
+            "json",
+            "daemon",
+            "run-status",
+            "--url",
+            status_fixture.base_url.as_str(),
+            "--run-id",
+            run_id,
+        ])
+        .output()
+        .context("failed to execute palyra daemon run-status with global JSON output")?;
+    status_fixture.finish()?;
+    assert!(
+        status_output.status.success(),
+        "run-status should support global JSON output: {}",
+        String::from_utf8_lossy(&status_output.stderr)
+    );
+    let status_payload: serde_json::Value = serde_json::from_slice(status_output.stdout.as_slice())
+        .context("run-status stdout should be JSON")?;
+    assert_eq!(status_payload.get("run_id").and_then(serde_json::Value::as_str), Some(run_id));
+    assert_eq!(status_payload.get("total_tokens").and_then(serde_json::Value::as_u64), Some(18));
+
+    let tape_fixture = spawn_json_fixture(
+        format!("/admin/v1/runs/{run_id}/tape"),
+        format!(
+            r#"{{"run_id":"{run_id}","returned_bytes":45,"next_after_seq":7,"events":[{{"seq":7,"event_type":"model_token","payload_json":"{{\"text\":\"ok\"}}"}}]}}"#
+        ),
+    )?;
+    let tape_output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .args([
+            "daemon",
+            "run-tape",
+            "--url",
+            tape_fixture.base_url.as_str(),
+            "--run-id",
+            run_id,
+            "--after-seq",
+            "6",
+            "--limit",
+            "1",
+            "--json",
+        ])
+        .output()
+        .context("failed to execute palyra daemon run-tape with local JSON flag")?;
+    tape_fixture.finish()?;
+    assert!(
+        tape_output.status.success(),
+        "run-tape should accept --json: {}",
+        String::from_utf8_lossy(&tape_output.stderr)
+    );
+    let tape_payload: serde_json::Value = serde_json::from_slice(tape_output.stdout.as_slice())
+        .context("run-tape stdout should be JSON")?;
+    assert_eq!(tape_payload.get("run_id").and_then(serde_json::Value::as_str), Some(run_id));
+    assert_eq!(
+        tape_payload.pointer("/events/0/event_type").and_then(serde_json::Value::as_str),
+        Some("model_token")
     );
     Ok(())
 }
@@ -253,6 +325,63 @@ fn read_child_stderr(stderr: Option<ChildStderr>) -> String {
         return String::new();
     }
     output.trim().to_owned()
+}
+
+struct JsonFixture {
+    base_url: String,
+    handle: thread::JoinHandle<Result<()>>,
+}
+
+impl JsonFixture {
+    fn finish(self) -> Result<()> {
+        self.handle.join().map_err(|_| anyhow!("JSON fixture thread panicked"))?
+    }
+}
+
+fn spawn_json_fixture(expected_path_prefix: String, body: String) -> Result<JsonFixture> {
+    let listener =
+        TcpListener::bind("127.0.0.1:0").context("failed to bind JSON fixture listener")?;
+    listener.set_nonblocking(true).context("failed to configure JSON fixture listener")?;
+    let port =
+        listener.local_addr().context("failed to inspect JSON fixture listener address")?.port();
+    let handle = thread::spawn(move || -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() > deadline {
+                        anyhow::bail!("timed out waiting for JSON fixture request");
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error).context("failed to accept JSON fixture request"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .context("failed to configure JSON fixture request timeout")?;
+        let mut buffer = [0_u8; 4096];
+        let bytes = stream.read(&mut buffer).context("failed to read JSON fixture request")?;
+        let request = String::from_utf8_lossy(&buffer[..bytes]);
+        let first_line = request.lines().next().unwrap_or_default();
+        let expected = format!("GET {expected_path_prefix}");
+        if !first_line.starts_with(expected.as_str()) {
+            anyhow::bail!(
+                "expected request path prefix '{}' but received '{}'",
+                expected_path_prefix,
+                first_line
+            );
+        }
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).context("failed to write JSON fixture response")?;
+        Ok(())
+    });
+    Ok(JsonFixture { base_url: format!("http://127.0.0.1:{port}"), handle })
 }
 
 struct ChildGuard {

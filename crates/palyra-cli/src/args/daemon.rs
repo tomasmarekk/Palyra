@@ -162,6 +162,8 @@ pub enum DaemonCommand {
         channel: Option<String>,
         #[arg(long)]
         run_id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     RunTape {
         #[arg(long)]
@@ -180,6 +182,8 @@ pub enum DaemonCommand {
         after_seq: Option<i64>,
         #[arg(long)]
         limit: Option<usize>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     RunCancel {
         #[arg(long)]
