@@ -666,7 +666,11 @@ Set-StrictMode -Version Latest
 `$ErrorActionPreference = "Stop"
 $(if ($null -ne $resolvedStateRoot) { '$env:PALYRA_STATE_ROOT = "' + $resolvedStateRoot + '"' })
 $(if ($null -ne $resolvedConfigPath) { '$env:PALYRA_CONFIG = "' + $resolvedConfigPath + '"' })
-& "$resolvedTargetBinary" @args
+if (`$MyInvocation.ExpectingInput) {
+    `$input | & "$resolvedTargetBinary" @args
+} else {
+    & "$resolvedTargetBinary" @args
+}
 exit `$LASTEXITCODE
 "@
         Set-Content -LiteralPath $psShimPath -Value $psShimBody -NoNewline

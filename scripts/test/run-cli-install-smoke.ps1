@@ -329,6 +329,21 @@ try {
     if ([string]::IsNullOrWhiteSpace($binaryUnderTest)) {
         throw "install metadata did not expose cli_exposure.target_binary_path"
     }
+    $psShimUnderTest = $null
+    if ($IsWindows) {
+        $psShimUnderTest = @($installManifest.cli_exposure.shim_paths) |
+            Where-Object {
+                [string]::Equals(
+                    [IO.Path]::GetExtension([string]$_),
+                    ".ps1",
+                    [StringComparison]::OrdinalIgnoreCase
+                )
+            } |
+            Select-Object -First 1
+        if ([string]::IsNullOrWhiteSpace($psShimUnderTest)) {
+            throw "install metadata did not expose a Windows PowerShell CLI shim path"
+        }
+    }
 
     Invoke-TranscriptCommand `
         -Label "generate-cli-install-smoke-inventory" `
@@ -401,6 +416,17 @@ try {
         @{ Label = "functional :: update-dry-run"; Context = $baselineContext; Args = @("--output-format", "json", "update", "--install-root", $installRoot, "--archive", $archivePath, "--dry-run"); Environment = $baseInstallEnvironment }
         @{ Label = "functional :: uninstall-dry-run"; Context = $baselineContext; Args = @("--output-format", "json", "uninstall", "--install-root", $installRoot, "--dry-run"); Environment = $baseInstallEnvironment }
     )
+    if ($null -ne $psShimUnderTest) {
+        $functionalScenarios += @(
+            @{
+                Label = "functional :: ps-shim-patch-apply-dry-run"
+                Command = [string]$psShimUnderTest
+                Context = $patchContext
+                Args = @("patch", "apply", "--stdin", "--dry-run", "--json")
+                Stdin = "*** Begin Patch`n*** Update File: notes.txt`n@@`n-hello`n+hello from ps shim`n*** End Patch`n"
+            }
+        )
+    }
 
     foreach ($scenario in $functionalScenarios) {
         $slug = Get-TranscriptSlug $scenario.Label
@@ -411,9 +437,10 @@ try {
         $scenarioEnvironment = Merge-EnvironmentTables `
             -Base (Get-ScenarioEnvOverrides -Context $scenario.Context) `
             -Overlay $scenarioOverlay
+        $scenarioCommand = if ($scenario.ContainsKey("Command")) { [string]$scenario.Command } else { $binaryUnderTest }
         $invokeParams = @{
             Label            = $scenario.Label
-            Command          = $binaryUnderTest
+            Command          = $scenarioCommand
             Arguments        = $scenario.Args
             WorkingDirectory = $scenario.Context.Workspace
             LogPath          = (Join-Path $functionalTranscriptRoot "$slug.log")
