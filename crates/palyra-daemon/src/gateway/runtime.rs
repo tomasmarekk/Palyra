@@ -306,6 +306,7 @@ impl ToolSkillContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum RunStreamToolExecutionOutcome {
     Completed {
         proposal_id: String,

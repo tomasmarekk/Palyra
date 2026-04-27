@@ -119,6 +119,7 @@ impl ToolParallelism {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 enum ParallelToolExecutionTaskOutcome {
     Completed {
         order: usize,
@@ -559,7 +560,7 @@ fn classify_process_runner_parallelism(input_json: &[u8]) -> ToolParallelism {
         return ToolParallelism::Never;
     };
     let read_only_commands = ["cat", "head", "tail", "ls", "pwd", "rg", "grep", "find", "wc"];
-    if read_only_commands.iter().any(|candidate| *candidate == command) {
+    if read_only_commands.contains(&command) {
         ToolParallelism::PathScoped
     } else {
         ToolParallelism::Never
@@ -699,6 +700,7 @@ async fn execute_parallel_prepared_tool_group(
 }
 
 #[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
 async fn append_tool_parallel_group_tape_event(
     runtime_state: &Arc<GatewayRuntimeState>,
     run_id: &str,
