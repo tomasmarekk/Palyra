@@ -4744,6 +4744,63 @@ async fn grpc_run_stream_refeeds_tool_result_and_continues_model_turn() -> Resul
         "second provider turn must include the projected tool result"
     );
 
+    let tape_snapshot =
+        admin_get_json_async(admin_port, format!("/admin/v1/runs/{RUN_ID}/tape")).await?;
+    let events = tape_snapshot
+        .get("events")
+        .and_then(Value::as_array)
+        .context("run tape snapshot missing events")?;
+    let compaction_event = events
+        .iter()
+        .find(|event| {
+            if event.get("event_type").and_then(Value::as_str) != Some("session.compaction") {
+                return false;
+            }
+            let Some(payload_json) = event.get("payload_json").and_then(Value::as_str) else {
+                return false;
+            };
+            serde_json::from_str::<Value>(payload_json)
+                .ok()
+                .and_then(|payload| {
+                    payload.get("policy").and_then(Value::as_str).map(str::to_owned)
+                })
+                .as_deref()
+                == Some("agent_loop_tool_result_compaction_v1")
+        })
+        .context("tool-result refeed should run the agent-loop compaction hook")?;
+    let compaction_payload_json = compaction_event
+        .get("payload_json")
+        .and_then(Value::as_str)
+        .context("compaction event should include payload_json")?;
+    let compaction_payload: Value = serde_json::from_str(compaction_payload_json)
+        .context("compaction payload should decode as JSON")?;
+    assert_eq!(
+        compaction_payload.get("tool_result_count").and_then(Value::as_u64),
+        Some(1),
+        "compaction hook should record the triggering tool-result batch size"
+    );
+    assert!(
+        compaction_payload.get("fallback_reason").and_then(Value::as_str).is_some(),
+        "compaction hook should expose deterministic fallback provenance"
+    );
+    let termination_event = events
+        .iter()
+        .find(|event| {
+            event.get("event_type").and_then(Value::as_str) == Some("agent_loop.terminated")
+        })
+        .context("run tape should include agent-loop termination")?;
+    let termination_payload_json = termination_event
+        .get("payload_json")
+        .and_then(Value::as_str)
+        .context("termination event should include payload_json")?;
+    let termination_payload: Value = serde_json::from_str(termination_payload_json)
+        .context("termination payload should decode as JSON")?;
+    assert_eq!(
+        termination_payload.get("termination_reason").and_then(Value::as_str),
+        Some("final_answer"),
+        "model-tool-model regression should finish with a stable termination reason"
+    );
+
     server_handle.join().expect("scripted openai server thread should exit");
     Ok(())
 }

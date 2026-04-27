@@ -53,7 +53,7 @@ use super::{
         AgentLoopTerminationReason, AgentRunLoopState, DEFAULT_AGENT_LOOP_WALL_CLOCK_BUDGET_MS,
     },
     cancellation::transition_run_stream_to_cancelled,
-    tape::send_status_with_tape,
+    tape::{maybe_compact_context_after_tool_results, send_status_with_tape},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -734,7 +734,17 @@ pub(crate) async fn process_run_stream_message(
                     return Ok(RunStreamMessageProcessingOutcome::Continue);
                 }
 
+                let tool_result_count = tool_result_messages.len();
                 loop_state.append_tool_result_messages(tool_result_messages);
+                maybe_compact_context_after_tool_results(
+                    runtime_state,
+                    request_context,
+                    session_id.as_str(),
+                    run_id.as_str(),
+                    tape_seq,
+                    tool_result_count,
+                )
+                .await?;
                 append_agent_loop_tape_event(
                     runtime_state,
                     run_id.as_str(),

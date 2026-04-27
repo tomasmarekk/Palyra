@@ -400,6 +400,123 @@ pub(crate) async fn compact_model_token_tape(
 }
 
 #[allow(clippy::result_large_err)]
+pub(crate) async fn maybe_compact_context_after_tool_results(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    request_context: &RequestContext,
+    session_id: &str,
+    run_id: &str,
+    tape_seq: &mut i64,
+    tool_result_count: usize,
+) -> Result<(), Status> {
+    if tool_result_count == 0 {
+        return Ok(());
+    }
+
+    let trigger_reason = "agent_loop_tool_results";
+    let trigger_policy = "agent_loop_tool_result_compaction_v1";
+    let session = runtime_state
+        .resolve_orchestrator_session(crate::journal::OrchestratorSessionResolveRequest {
+            session_id: Some(session_id.to_owned()),
+            session_key: None,
+            session_label: None,
+            principal: request_context.principal.clone(),
+            device_id: request_context.device_id.clone(),
+            channel: request_context.channel.clone(),
+            require_existing: true,
+            reset_session: false,
+        })
+        .await?
+        .session;
+    let preview = preview_session_compaction(
+        runtime_state,
+        &session,
+        Some(trigger_reason),
+        Some(trigger_policy),
+    )
+    .await?;
+    let payload_json = if preview.eligible {
+        let execution = apply_session_compaction(SessionCompactionApplyRequest {
+            runtime_state,
+            session: &session,
+            actor_principal: session.principal.as_str(),
+            run_id: Some(run_id),
+            mode: "automatic",
+            trigger_reason: Some(trigger_reason),
+            trigger_policy: Some(trigger_policy),
+            accept_candidate_ids: &[],
+            reject_candidate_ids: &[],
+        })
+        .await?;
+        json!({
+            "event": "session.compaction.tool_results.applied",
+            "artifact_id": execution.artifact.artifact_id,
+            "checkpoint_id": execution.checkpoint.checkpoint_id,
+            "policy": trigger_policy,
+            "trigger_reason": trigger_reason,
+            "tool_result_count": tool_result_count,
+            "source_refs": [
+                {
+                    "kind": "tool_result_batch",
+                    "count": tool_result_count,
+                },
+                {
+                    "kind": "session_transcript",
+                    "count": execution.plan.source_event_count,
+                }
+            ],
+            "quality_gates": compaction_quality_gates(execution.plan.summary_json.as_str()),
+            "protected_event_count": execution.plan.protected_event_count,
+            "condensed_event_count": execution.plan.condensed_event_count,
+            "estimated_input_tokens": execution.plan.estimated_input_tokens,
+            "estimated_output_tokens": execution.plan.estimated_output_tokens,
+            "token_delta": execution.plan.estimated_input_tokens.saturating_sub(execution.plan.estimated_output_tokens),
+            "fallback_reason": "deterministic_context_compressor",
+            "write_count": execution.writes.len(),
+        })
+        .to_string()
+    } else {
+        json!({
+            "event": "session.compaction.tool_results.blocked",
+            "policy": trigger_policy,
+            "trigger_reason": trigger_reason,
+            "tool_result_count": tool_result_count,
+            "source_refs": [
+                {
+                    "kind": "tool_result_batch",
+                    "count": tool_result_count,
+                },
+                {
+                    "kind": "session_transcript",
+                    "count": preview.source_event_count,
+                }
+            ],
+            "blocked_reason": preview.blocked_reason,
+            "estimated_input_tokens": preview.estimated_input_tokens,
+            "estimated_output_tokens": preview.estimated_output_tokens,
+            "fallback_reason": "deterministic_context_compressor",
+        })
+        .to_string()
+    };
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: "session.compaction".to_owned(),
+            payload_json,
+        })
+        .await?;
+    *tape_seq += 1;
+    Ok(())
+}
+
+fn compaction_quality_gates(summary_json: &str) -> Value {
+    serde_json::from_str::<Value>(summary_json)
+        .ok()
+        .and_then(|summary| summary.get("quality_gates").cloned())
+        .unwrap_or(Value::Null)
+}
+
+#[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn append_tool_proposal_tape_event(
     runtime_state: &Arc<GatewayRuntimeState>,
