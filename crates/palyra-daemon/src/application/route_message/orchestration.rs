@@ -9,10 +9,17 @@ use ulid::Ulid;
 use crate::{
     agents::AgentResolveRequest,
     application::{
+        channel_commands::{
+            ChannelCommandName, ChannelCommandParseOutcome, ChannelCommandRegistry,
+        },
         conversation_bindings::{
             ConversationBindingCreateRequest, ConversationBindingKind, ConversationBindingLifecycle,
         },
         delivery_arbitration::resolve_delivery_policy,
+        inbound_coalescer::InboundCoalescingRequest,
+        outbound_lifecycle::{
+            ChannelOutboundCapabilities, OutboundLifecycle, OutboundLifecycleStart,
+        },
         provider_input::{
             build_provider_image_inputs, prepare_model_provider_input, MemoryPromptFailureMode,
             PrepareModelProviderInputRequest,
@@ -211,6 +218,42 @@ pub(crate) async fn handle_routed_route_message(
     plan.binding_kind = Some(binding_outcome.record.binding_kind.as_str().to_owned());
     plan.binding_expires_at_unix_ms = binding_outcome.record.expires_at_unix_ms;
     plan.binding_reason = Some(binding_outcome.reason.clone());
+    let (input_is_command, input_urgent_stop) =
+        match ChannelCommandRegistry::builtin().parse_text(input.text.as_str()) {
+            ChannelCommandParseOutcome::Parsed(invocation) => {
+                (true, invocation.command == ChannelCommandName::Stop)
+            }
+            ChannelCommandParseOutcome::Malformed(_) => (true, false),
+            ChannelCommandParseOutcome::NotCommand => (false, false),
+        };
+    let coalescing_decision = runtime_state
+        .inbound_coalescer
+        .submit_for_immediate_route(InboundCoalescingRequest {
+            message_id: input
+                .adapter_message_id
+                .clone()
+                .unwrap_or_else(|| input.envelope_id.clone()),
+            channel: plan.channel.clone(),
+            conversation_id: input.conversation_id.clone(),
+            thread_id: plan.reply_thread_id.clone().or_else(|| input.adapter_thread_id.clone()),
+            sender_identity: plan.sender_identity.clone(),
+            text: input.text.clone(),
+            received_at_unix_ms: current_unix_ms(),
+            has_media: !content.attachments.is_empty(),
+            is_command: input_is_command,
+            urgent_stop: input_urgent_stop,
+        })
+        .map_err(|error| {
+            Status::resource_exhausted(format!("{}: {}", error.code(), error.safe_message()))
+        })?;
+    let inbound_coalescing_snapshot =
+        coalescing_decision.safe_snapshot_json(runtime_state.inbound_coalescer.policy());
+    let effective_input_text = coalescing_decision
+        .coalesced
+        .as_ref()
+        .map(|coalesced| coalesced.text.trim().to_owned())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| input.text.clone());
     runtime_state
         .start_orchestrator_run(OrchestratorRunStartRequest {
             run_id: run_id.clone(),
@@ -296,6 +339,7 @@ pub(crate) async fn handle_routed_route_message(
             "binding_kind": plan.binding_kind.clone(),
             "binding_expires_at_unix_ms": plan.binding_expires_at_unix_ms,
             "binding_reason": plan.binding_reason.clone(),
+            "inbound_coalescing": inbound_coalescing_snapshot.clone(),
             "json_mode_requested": json_mode_requested,
             "agent_id": route_agent_id.clone(),
             "agent_resolution_source": route_agent_resolution_source.clone(),
@@ -345,12 +389,13 @@ pub(crate) async fn handle_routed_route_message(
             event_type: "message.received".to_owned(),
             payload_json: json!({
                 "envelope_id": input.envelope_id.clone(),
-                "text": input.text.clone(),
+                "text": effective_input_text.clone(),
                 "channel": input.channel.clone(),
                 "route_key": plan.route_key.clone(),
                 "binding_id": plan.binding_id.clone(),
                 "binding_kind": plan.binding_kind.clone(),
                 "binding_expires_at_unix_ms": plan.binding_expires_at_unix_ms,
+                "inbound_coalescing": inbound_coalescing_snapshot.clone(),
                 "json_mode_requested": json_mode_requested,
                 "attachments": route_attachment_metadata.clone(),
                 "agent_id": route_agent_id.clone(),
@@ -373,7 +418,7 @@ pub(crate) async fn handle_routed_route_message(
         run_id: run_id.as_str(),
         session_id: session_id.as_str(),
         parameter_delta_json: None,
-        prompt_text: input.text.as_str(),
+        prompt_text: effective_input_text.as_str(),
         json_mode: json_mode_requested,
         vision_inputs: routing_vision_inputs,
         scope_kind: routing_scope_kind,
@@ -404,7 +449,7 @@ pub(crate) async fn handle_routed_route_message(
             session_id: session_id.as_str(),
             previous_run_id: previous_run_id_for_context.as_deref(),
             parameter_delta_json: None,
-            input_text: input.text.as_str(),
+            input_text: effective_input_text.as_str(),
             attachments: content.attachments.as_slice(),
             provider_kind_hint: Some(routing_decision.provider_kind.as_str()),
             provider_model_id_hint: Some(routing_decision.actual_model_id.as_str()),
@@ -434,6 +479,21 @@ pub(crate) async fn handle_routed_route_message(
         provider_request.messages = messages;
     }
 
+    let mut outbound_lifecycle = OutboundLifecycle::start(OutboundLifecycleStart {
+        lifecycle_id: format!("out_{run_id}"),
+        channel: plan.channel.clone(),
+        run_id: run_id.clone(),
+        binding_id: plan.binding_id.clone(),
+        capabilities: ChannelOutboundCapabilities::for_channel(
+            plan.channel.as_str(),
+            input.max_payload_bytes,
+        ),
+        draft_requested: false,
+        typing_requested: false,
+        reaction_requested: plan.auto_reaction.as_deref().is_some_and(|value| !value.is_empty()),
+        observed_at_unix_ms: current_unix_ms(),
+    });
+
     let provider_response = runtime_state
         .execute_model_provider_with_lease(
             provider_request,
@@ -453,6 +513,8 @@ pub(crate) async fn handle_routed_route_message(
         Ok(response) => response,
         Err(error) => {
             let error_message = error.message().to_owned();
+            outbound_lifecycle.finalize_failure(error_message.as_str(), current_unix_ms());
+            let outbound_lifecycle_snapshot = outbound_lifecycle.safe_snapshot_json();
             let retry_disposition =
                 runtime_state.channel_router.record_processing_failure(input, "provider_error");
             match retry_disposition {
@@ -503,6 +565,7 @@ pub(crate) async fn handle_routed_route_message(
                     "quarantined": matches!(retry_disposition, RetryDisposition::Quarantined),
                     "binding_id": plan.binding_id.clone(),
                     "binding_kind": plan.binding_kind.clone(),
+                    "outbound_lifecycle": outbound_lifecycle_snapshot,
                     "config_hash": route_config_hash,
                     "actor": {
                         "connector_channel": actor_connector,
@@ -528,7 +591,7 @@ pub(crate) async fn handle_routed_route_message(
         }
     };
 
-    let route_provider_response = process_route_provider_response(
+    let route_provider_response = match process_route_provider_response(
         runtime_state,
         &route_request_context,
         session_id.as_str(),
@@ -540,7 +603,40 @@ pub(crate) async fn handle_routed_route_message(
         &mut remaining_tool_budget,
         &mut tape_seq,
     )
-    .await?;
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            outbound_lifecycle.finalize_failure(error.message(), current_unix_ms());
+            let _ = record_message_router_journal_event(
+                runtime_state,
+                &route_request_context,
+                session_id.as_str(),
+                run_id.as_str(),
+                "message.rejected",
+                common_v1::journal_event::EventActor::System as i32,
+                json!({
+                    "event": "message.rejected",
+                    "envelope_id": input.envelope_id.clone(),
+                    "channel": input.channel.clone(),
+                    "reason": error.message(),
+                    "queued_for_retry": false,
+                    "quarantined": false,
+                    "binding_id": plan.binding_id.clone(),
+                    "binding_kind": plan.binding_kind.clone(),
+                    "outbound_lifecycle": outbound_lifecycle.safe_snapshot_json(),
+                    "config_hash": route_config_hash,
+                    "actor": {
+                        "connector_channel": actor_connector,
+                        "gateway_principal": actor_gateway_principal,
+                        "gateway_device_id": actor_gateway_device_id,
+                    }
+                }),
+            )
+            .await;
+            return Err(error);
+        }
+    };
     let reply_text = route_provider_response.reply_text;
     let route_structured_output = route_provider_response.structured_output;
     if let Err(error) = authorize_message_action(
@@ -554,6 +650,7 @@ pub(crate) async fn handle_routed_route_message(
         runtime_state.record_denied();
         runtime_state.counters.channel_messages_rejected.fetch_add(1, Ordering::Relaxed);
         runtime_state.record_channel_reply_failure();
+        outbound_lifecycle.finalize_failure(error.message(), current_unix_ms());
         runtime_state
             .update_orchestrator_run_state(
                 run_id.clone(),
@@ -578,6 +675,7 @@ pub(crate) async fn handle_routed_route_message(
                 "quarantined": false,
                 "binding_id": plan.binding_id.clone(),
                 "binding_kind": plan.binding_kind.clone(),
+                "outbound_lifecycle": outbound_lifecycle.safe_snapshot_json(),
                 "config_hash": route_config_hash,
                 "actor": {
                     "connector_channel": actor_connector,
@@ -621,6 +719,8 @@ pub(crate) async fn handle_routed_route_message(
         "route_message_model_summary",
     )
     .await;
+    outbound_lifecycle.finalize_success(current_unix_ms());
+    let outbound_lifecycle_snapshot = outbound_lifecycle.safe_snapshot_json();
     let route_delivery_policy = resolve_delivery_policy(
         &runtime_state.config.delivery_arbitration,
         None,
@@ -636,6 +736,7 @@ pub(crate) async fn handle_routed_route_message(
             "policy": route_delivery_policy.snapshot_json(),
             "decision": "deliver_interim_parent",
             "reason": "route_message_channel_default",
+            "outbound_lifecycle": outbound_lifecycle_snapshot.clone(),
         })
     });
     runtime_state
@@ -659,6 +760,7 @@ pub(crate) async fn handle_routed_route_message(
                 "binding_kind": plan.binding_kind.clone(),
                 "binding_expires_at_unix_ms": plan.binding_expires_at_unix_ms,
                 "delivery_policy": route_delivery_policy.snapshot_json(),
+                "outbound_lifecycle": outbound_lifecycle_snapshot.clone(),
             })
             .to_string(),
         })
@@ -686,6 +788,7 @@ pub(crate) async fn handle_routed_route_message(
             "binding_id": plan.binding_id.clone(),
             "binding_kind": plan.binding_kind.clone(),
             "binding_expires_at_unix_ms": plan.binding_expires_at_unix_ms,
+            "outbound_lifecycle": outbound_lifecycle_snapshot.clone(),
             "broadcast": plan.is_broadcast,
             "queued_for_retry": false,
             "quarantined": false,
@@ -723,6 +826,7 @@ pub(crate) async fn handle_routed_route_message(
             "binding_kind": plan.binding_kind.clone(),
             "binding_expires_at_unix_ms": plan.binding_expires_at_unix_ms,
             "delivery_policy": route_delivery_policy.snapshot_json(),
+            "outbound_lifecycle": outbound_lifecycle_snapshot,
             "config_hash": route_config_hash,
             "actor": {
                 "connector_channel": actor_connector,

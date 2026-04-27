@@ -979,6 +979,26 @@ pub fn load_config() -> Result<LoadedConfig> {
                     256,
                 )?;
             }
+            if let Some(file_inbound_coalescing) = file_channel_router.inbound_coalescing {
+                if let Some(enabled) = file_inbound_coalescing.enabled {
+                    channel_router.inbound_coalescing.enabled = enabled;
+                }
+                if let Some(debounce_ms) = file_inbound_coalescing.debounce_ms {
+                    channel_router.inbound_coalescing.debounce_ms = debounce_ms;
+                }
+                if let Some(max_tracked_keys) = file_inbound_coalescing.max_tracked_keys {
+                    channel_router.inbound_coalescing.max_tracked_keys = parse_positive_usize(
+                        max_tracked_keys,
+                        "channel_router.inbound_coalescing.max_tracked_keys",
+                    )?;
+                }
+                if let Some(bypass_commands) = file_inbound_coalescing.bypass_commands {
+                    channel_router.inbound_coalescing.bypass_commands = bypass_commands;
+                }
+                if let Some(bypass_media) = file_inbound_coalescing.bypass_media {
+                    channel_router.inbound_coalescing.bypass_media = bypass_media;
+                }
+            }
             if let Some(file_routing) = file_channel_router.routing {
                 if let Some(default_channel_enabled) = file_routing.default_channel_enabled {
                     channel_router.default_channel_enabled = default_channel_enabled;
@@ -1709,6 +1729,49 @@ pub fn load_config() -> Result<LoadedConfig> {
             "PALYRA_CHANNEL_ROUTER_RETRY_BACKOFF_MS",
         )?;
         source.push_str(" +env(PALYRA_CHANNEL_ROUTER_RETRY_BACKOFF_MS)");
+    }
+
+    if let Ok(enabled) = env::var("PALYRA_CHANNEL_ROUTER_INBOUND_COALESCING_ENABLED") {
+        channel_router.inbound_coalescing.enabled = enabled
+            .parse::<bool>()
+            .context("PALYRA_CHANNEL_ROUTER_INBOUND_COALESCING_ENABLED must be true or false")?;
+        source.push_str(" +env(PALYRA_CHANNEL_ROUTER_INBOUND_COALESCING_ENABLED)");
+    }
+
+    if let Ok(debounce_ms) = env::var("PALYRA_CHANNEL_ROUTER_INBOUND_COALESCING_DEBOUNCE_MS") {
+        channel_router.inbound_coalescing.debounce_ms = debounce_ms
+            .parse::<u64>()
+            .context("PALYRA_CHANNEL_ROUTER_INBOUND_COALESCING_DEBOUNCE_MS must be a valid u64")?;
+        source.push_str(" +env(PALYRA_CHANNEL_ROUTER_INBOUND_COALESCING_DEBOUNCE_MS)");
+    }
+
+    if let Ok(max_tracked_keys) =
+        env::var("PALYRA_CHANNEL_ROUTER_INBOUND_COALESCING_MAX_TRACKED_KEYS")
+    {
+        channel_router.inbound_coalescing.max_tracked_keys = parse_positive_usize(
+            max_tracked_keys.parse::<u64>().context(
+                "PALYRA_CHANNEL_ROUTER_INBOUND_COALESCING_MAX_TRACKED_KEYS must be a valid u64",
+            )?,
+            "PALYRA_CHANNEL_ROUTER_INBOUND_COALESCING_MAX_TRACKED_KEYS",
+        )?;
+        source.push_str(" +env(PALYRA_CHANNEL_ROUTER_INBOUND_COALESCING_MAX_TRACKED_KEYS)");
+    }
+
+    if let Ok(bypass_commands) =
+        env::var("PALYRA_CHANNEL_ROUTER_INBOUND_COALESCING_BYPASS_COMMANDS")
+    {
+        channel_router.inbound_coalescing.bypass_commands =
+            bypass_commands.parse::<bool>().context(
+                "PALYRA_CHANNEL_ROUTER_INBOUND_COALESCING_BYPASS_COMMANDS must be true or false",
+            )?;
+        source.push_str(" +env(PALYRA_CHANNEL_ROUTER_INBOUND_COALESCING_BYPASS_COMMANDS)");
+    }
+
+    if let Ok(bypass_media) = env::var("PALYRA_CHANNEL_ROUTER_INBOUND_COALESCING_BYPASS_MEDIA") {
+        channel_router.inbound_coalescing.bypass_media = bypass_media.parse::<bool>().context(
+            "PALYRA_CHANNEL_ROUTER_INBOUND_COALESCING_BYPASS_MEDIA must be true or false",
+        )?;
+        source.push_str(" +env(PALYRA_CHANNEL_ROUTER_INBOUND_COALESCING_BYPASS_MEDIA)");
     }
 
     if let Ok(canvas_host_enabled) = env::var("PALYRA_CANVAS_HOST_ENABLED") {
@@ -4012,6 +4075,12 @@ mod tests {
         assert_eq!(config.default_direct_message_policy, DirectMessagePolicy::Deny);
         assert_eq!(config.default_broadcast_strategy, BroadcastStrategy::Deny);
         assert_eq!(config.default_concurrency_limit, 2);
+        assert!(
+            !config.inbound_coalescing.enabled,
+            "inbound coalescing must require explicit opt-in"
+        );
+        assert!(config.inbound_coalescing.bypass_commands);
+        assert!(config.inbound_coalescing.bypass_media);
     }
 
     #[test]
@@ -4025,6 +4094,13 @@ mod tests {
             max_retry_attempts = 2
             retry_backoff_ms = 150
             default_response_prefix = "Palyra: "
+
+            [channel_router.inbound_coalescing]
+            enabled = true
+            debounce_ms = 250
+            max_tracked_keys = 16
+            bypass_commands = true
+            bypass_media = false
 
             [channel_router.routing]
             default_channel_enabled = false
@@ -4042,6 +4118,12 @@ mod tests {
         let channel_router = parsed.channel_router.expect("channel_router section should exist");
         assert_eq!(channel_router.enabled, Some(true));
         assert_eq!(channel_router.max_message_bytes, Some(2048));
+        let inbound_coalescing =
+            channel_router.inbound_coalescing.expect("inbound coalescing should parse");
+        assert_eq!(inbound_coalescing.enabled, Some(true));
+        assert_eq!(inbound_coalescing.debounce_ms, Some(250));
+        assert_eq!(inbound_coalescing.max_tracked_keys, Some(16));
+        assert_eq!(inbound_coalescing.bypass_media, Some(false));
         let routing = channel_router.routing.expect("routing section should exist");
         assert_eq!(routing.default_concurrency_limit, Some(3));
         assert_eq!(routing.default_direct_message_policy.as_deref(), Some("pairing"));

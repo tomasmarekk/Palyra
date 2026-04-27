@@ -507,7 +507,18 @@ pub struct FileChannelRouterConfig {
     pub max_retry_attempts: Option<u32>,
     pub retry_backoff_ms: Option<u64>,
     pub default_response_prefix: Option<String>,
+    pub inbound_coalescing: Option<FileInboundCoalescingConfig>,
     pub routing: Option<FileChannelRoutingConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileInboundCoalescingConfig {
+    pub enabled: Option<bool>,
+    pub debounce_ms: Option<u64>,
+    pub max_tracked_keys: Option<u64>,
+    pub bypass_commands: Option<bool>,
+    pub bypass_media: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]

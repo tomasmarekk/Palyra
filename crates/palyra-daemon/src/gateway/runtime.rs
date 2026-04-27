@@ -450,6 +450,7 @@ pub struct GatewayRuntimeState {
     canvas_signing_secret: [u8; 32],
     agent_registry: AgentRegistry,
     pub(crate) channel_router: ChannelRouter,
+    pub(crate) inbound_coalescer: InboundCoalescer,
     pub(crate) conversation_bindings: ConversationBindingStore,
     pub(crate) observability: Arc<crate::observability::ObservabilityState>,
     pub(crate) self_healing: Arc<SelfHealingState>,
@@ -1170,6 +1171,8 @@ impl GatewayRuntimeState {
         let recovered_canvas_records =
             load_canvas_records_from_snapshots(canvas_snapshots.as_slice())?;
         let channel_router = ChannelRouter::new(config.channel_router.clone());
+        let inbound_coalescer =
+            InboundCoalescer::new(config.channel_router.inbound_coalescing.clone());
         Ok(Arc::new(Self {
             started_at: Instant::now(),
             build: BuildSnapshot {
@@ -1286,6 +1289,7 @@ impl GatewayRuntimeState {
             canvas_signing_secret: generate_canvas_signing_secret(),
             agent_registry,
             channel_router,
+            inbound_coalescer,
             conversation_bindings,
             observability: Arc::new(crate::observability::ObservabilityState::default()),
             self_healing: Arc::new(SelfHealingState::new()),

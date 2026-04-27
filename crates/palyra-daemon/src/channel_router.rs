@@ -188,6 +188,7 @@ pub struct ChannelRouterConfig {
     pub default_isolate_session_by_sender: bool,
     pub default_broadcast_strategy: BroadcastStrategy,
     pub default_concurrency_limit: usize,
+    pub inbound_coalescing: InboundCoalescingPolicy,
     pub channels: Vec<ChannelRoutingRule>,
 }
 
@@ -206,8 +207,37 @@ impl Default for ChannelRouterConfig {
             default_isolate_session_by_sender: false,
             default_broadcast_strategy: BroadcastStrategy::Deny,
             default_concurrency_limit: 2,
+            inbound_coalescing: InboundCoalescingPolicy::default(),
             channels: Vec::new(),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InboundCoalescingPolicy {
+    pub enabled: bool,
+    pub debounce_ms: u64,
+    pub max_tracked_keys: usize,
+    pub bypass_commands: bool,
+    pub bypass_media: bool,
+}
+
+impl Default for InboundCoalescingPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            debounce_ms: 0,
+            max_tracked_keys: 1_024,
+            bypass_commands: true,
+            bypass_media: true,
+        }
+    }
+}
+
+impl InboundCoalescingPolicy {
+    #[must_use]
+    pub const fn active(&self) -> bool {
+        self.enabled && self.debounce_ms > 0
     }
 }
 
@@ -1343,8 +1373,8 @@ fn sha256_hex(payload: &[u8]) -> String {
 mod tests {
     use super::{
         normalize_session_component, BroadcastStrategy, ChannelRouter, ChannelRouterConfig,
-        ChannelRoutingRule, DirectMessagePolicy, InboundMessage, PairingApprovalOutcome,
-        PairingConsumeOutcome, RetryDisposition, RouteOutcome,
+        ChannelRoutingRule, DirectMessagePolicy, InboundCoalescingPolicy, InboundMessage,
+        PairingApprovalOutcome, PairingConsumeOutcome, RetryDisposition, RouteOutcome,
     };
 
     fn baseline_config() -> ChannelRouterConfig {
@@ -1361,6 +1391,7 @@ mod tests {
             default_isolate_session_by_sender: false,
             default_broadcast_strategy: BroadcastStrategy::Deny,
             default_concurrency_limit: 2,
+            inbound_coalescing: InboundCoalescingPolicy::default(),
             channels: vec![ChannelRoutingRule {
                 channel: "slack".to_owned(),
                 enabled: true,

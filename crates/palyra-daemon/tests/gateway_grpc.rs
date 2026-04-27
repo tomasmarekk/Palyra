@@ -593,6 +593,29 @@ async fn grpc_route_message_persists_conversation_binding_and_command_resolves_i
         }),
         "message.received should include the binding id used for route explainability"
     );
+    let received_event = message_events
+        .iter()
+        .find(|payload| payload.get("event").and_then(Value::as_str) == Some("message.received"))
+        .context("route flow should journal message.received")?;
+    assert_eq!(
+        received_event.pointer("/inbound_coalescing/decision").and_then(Value::as_str),
+        Some("bypassed"),
+        "message.received should explain the inbound coalescing decision"
+    );
+    let replied_event = message_events
+        .iter()
+        .find(|payload| payload.get("event").and_then(Value::as_str) == Some("message.replied"))
+        .context("route flow should journal message.replied")?;
+    assert_eq!(
+        replied_event.pointer("/outbound_lifecycle/delivery_mode").and_then(Value::as_str),
+        Some("final_message"),
+        "connector without edit capability should fall back to final message delivery"
+    );
+    assert_eq!(
+        replied_event.pointer("/outbound_lifecycle/cleanup_completed").and_then(Value::as_bool),
+        Some(true),
+        "outbound lifecycle must record cleanup completion"
+    );
 
     server_handle.join().expect("scripted openai server thread should exit");
     Ok(())
