@@ -8338,7 +8338,7 @@ async fn grpc_run_stream_persists_orchestrator_snapshot_and_matches_golden_tape(
             .get("tape_events")
             .and_then(Value::as_u64)
             .context("run snapshot missing tape_events")?,
-        expected_tape.as_array().context("golden tape must be a JSON array")?.len() as u64 + 1
+        expected_tape.as_array().context("golden tape must be a JSON array")?.len() as u64 + 4
     );
     assert!(
         run_snapshot.get("tape").is_none(),
@@ -8375,6 +8375,34 @@ async fn grpc_run_stream_persists_orchestrator_snapshot_and_matches_golden_tape(
             .unwrap_or(false),
         "tool catalog snapshot should carry a catalog hash"
     );
+    let agent_loop_events = tape_events
+        .iter()
+        .filter(|event| {
+            event
+                .get("event_type")
+                .and_then(Value::as_str)
+                .map(|event_type| event_type.starts_with("agent_loop."))
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        agent_loop_events.len(),
+        3,
+        "basic run should record start, turn start, and termination loop events"
+    );
+    let termination_payload = agent_loop_events
+        .iter()
+        .find(|event| {
+            event.get("event_type").and_then(Value::as_str) == Some("agent_loop.terminated")
+        })
+        .and_then(|event| event.get("payload_json").and_then(Value::as_str))
+        .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
+        .context("agent loop termination payload should be valid JSON")?;
+    assert_eq!(
+        termination_payload.get("termination_reason").and_then(Value::as_str),
+        Some("final_answer"),
+        "basic run should persist a stable successful termination reason"
+    );
     let reply_event = tape_events
         .iter()
         .find(|event| event.get("event_type").and_then(Value::as_str) == Some("message.replied"))
@@ -8389,7 +8417,9 @@ async fn grpc_run_stream_persists_orchestrator_snapshot_and_matches_golden_tape(
     let comparable_tape_events = tape_events
         .iter()
         .filter(|event| {
-            event.get("event_type").and_then(Value::as_str) != Some("tool_catalog_snapshot")
+            let event_type = event.get("event_type").and_then(Value::as_str);
+            event_type != Some("tool_catalog_snapshot")
+                && !event_type.map(|value| value.starts_with("agent_loop.")).unwrap_or(false)
         })
         .enumerate()
         .map(|(index, event)| {
