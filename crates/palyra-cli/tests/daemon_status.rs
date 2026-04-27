@@ -359,6 +359,9 @@ fn spawn_json_fixture(expected_path_prefix: String, body: String) -> Result<Json
             }
         };
         stream
+            .set_nonblocking(false)
+            .context("failed to configure JSON fixture request as blocking")?;
+        stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .context("failed to configure JSON fixture request timeout")?;
         let mut buffer = [0_u8; 4096];
