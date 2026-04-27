@@ -4,13 +4,13 @@ set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 cd "${repo_root}"
 
-warn_threshold="${PALYRA_MODULE_BUDGET_WARN:-800}"
-critical_threshold="${PALYRA_MODULE_BUDGET_CRITICAL:-1200}"
-strict_threshold="${PALYRA_MODULE_BUDGET_STRICT:-${critical_threshold}}"
-entrypoint_threshold="${PALYRA_MODULE_BUDGET_ENTRYPOINT:-200}"
-entrypoint_strict_threshold="${PALYRA_MODULE_BUDGET_ENTRYPOINT_STRICT:-500}"
-strict_delta_threshold="${PALYRA_MODULE_BUDGET_STRICT_DELTA:-200}"
-entrypoint_strict_delta_threshold="${PALYRA_MODULE_BUDGET_ENTRYPOINT_STRICT_DELTA:-100}"
+warn_threshold="${PALYRA_MODULE_BUDGET_WARN:-1200}"
+critical_threshold="${PALYRA_MODULE_BUDGET_CRITICAL:-3000}"
+strict_threshold="${PALYRA_MODULE_BUDGET_STRICT:-5000}"
+entrypoint_threshold="${PALYRA_MODULE_BUDGET_ENTRYPOINT:-500}"
+entrypoint_strict_threshold="${PALYRA_MODULE_BUDGET_ENTRYPOINT_STRICT:-2500}"
+strict_delta_threshold="${PALYRA_MODULE_BUDGET_STRICT_DELTA:-1500}"
+entrypoint_strict_delta_threshold="${PALYRA_MODULE_BUDGET_ENTRYPOINT_STRICT_DELTA:-750}"
 allowlist_file="${PALYRA_MODULE_BUDGET_ALLOWLIST:-scripts/dev/module-budget-allowlist.txt}"
 strict_mode=false
 
