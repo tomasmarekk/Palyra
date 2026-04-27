@@ -1011,6 +1011,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
         )
         .route("/console/v1/memory/search", get(console::memory::console_memory_search_handler))
         .route(
+            "/console/v1/memory/providers/explain",
+            get(console::memory::console_memory_provider_explain_handler),
+        )
+        .route(
             "/console/v1/memory/learning/candidates",
             get(console::memory::console_learning_candidates_list_handler),
         )

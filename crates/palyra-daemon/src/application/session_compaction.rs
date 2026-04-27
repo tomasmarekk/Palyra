@@ -92,6 +92,10 @@ pub(crate) struct SessionCompactionPlan {
     pub(crate) estimated_output_tokens: u64,
     pub(crate) source_records_json: String,
     pub(crate) summary_json: String,
+    pub(crate) compressor_mode: String,
+    pub(crate) fallback_used: bool,
+    pub(crate) degraded_reason: Option<String>,
+    pub(crate) evidence_refs: Vec<String>,
     pub(crate) active_task_summary: SessionActiveTaskSummary,
     pub(crate) checkpoint_metadata: SessionCompactionCheckpointMetadata,
     pub(crate) candidates: Vec<SessionCompactionCandidate>,
@@ -105,6 +109,10 @@ impl SessionCompactionPlan {
             "blocked_reason": self.blocked_reason,
             "strategy": SESSION_COMPACTION_STRATEGY,
             "compressor_version": SESSION_COMPACTION_VERSION,
+            "compressor_mode": self.compressor_mode,
+            "fallback_used": self.fallback_used,
+            "degraded_reason": self.degraded_reason,
+            "evidence_refs": self.evidence_refs,
             "trigger_reason": self.trigger_reason,
             "trigger_policy": self.trigger_policy,
             "estimated_input_tokens": self.estimated_input_tokens,
@@ -311,6 +319,10 @@ struct CompactionSummaryJsonInput<'a> {
     checkpoint_preview: &'a SessionCompactionCheckpointPreview,
     lifecycle_state: &'a str,
     review_candidate_count: usize,
+    compressor_mode: Option<&'a str>,
+    fallback_used: bool,
+    degraded_reason: Option<&'a str>,
+    evidence_refs: &'a [String],
 }
 
 pub(crate) struct SessionContextCompressionInput<'a> {
@@ -343,6 +355,23 @@ impl ContextCompressor for DeterministicSessionContextCompressor {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct HybridSessionContextCompressor {
+    fallback: DeterministicSessionContextCompressor,
+}
+
+impl ContextCompressor for HybridSessionContextCompressor {
+    fn strategy(&self) -> &'static str {
+        SESSION_COMPACTION_STRATEGY
+    }
+
+    fn compress(&self, input: SessionContextCompressionInput<'_>) -> SessionCompactionPlan {
+        let mut plan = self.fallback.compress(input);
+        annotate_hybrid_compaction_plan(&mut plan);
+        plan
+    }
+}
+
 pub(crate) async fn preview_session_compaction(
     runtime_state: &Arc<GatewayRuntimeState>,
     session: &OrchestratorSessionRecord,
@@ -355,7 +384,7 @@ pub(crate) async fn preview_session_compaction(
         .list_orchestrator_compaction_artifacts(session.session_id.clone())
         .await?
         .len();
-    Ok(DeterministicSessionContextCompressor.compress(SessionContextCompressionInput {
+    Ok(HybridSessionContextCompressor::default().compress(SessionContextCompressionInput {
         session,
         transcript: transcript.as_slice(),
         pins: pins.as_slice(),
@@ -378,7 +407,7 @@ pub(crate) async fn apply_session_compaction(
         .list_orchestrator_compaction_artifacts(request.session.session_id.clone())
         .await?
         .len();
-    let plan = DeterministicSessionContextCompressor.compress(SessionContextCompressionInput {
+    let plan = HybridSessionContextCompressor::default().compress(SessionContextCompressionInput {
         session: request.session,
         transcript: transcript.as_slice(),
         pins: pins.as_slice(),
@@ -526,6 +555,10 @@ pub(crate) async fn apply_session_compaction(
                 checkpoint_preview: &plan.checkpoint_preview,
                 lifecycle_state,
                 review_candidate_count: pending_review_count,
+                compressor_mode: Some(plan.compressor_mode.as_str()),
+                fallback_used: plan.fallback_used,
+                degraded_reason: plan.degraded_reason.as_deref(),
+                evidence_refs: plan.evidence_refs.as_slice(),
             }),
             created_by_principal: request.actor_principal.to_owned(),
         })
@@ -735,6 +768,11 @@ fn build_session_compaction_plan_with_metadata(
         ),
         workspace_paths: write_previews.iter().map(|write| write.target_path.clone()).collect(),
     };
+    let evidence_refs = condensed_records
+        .iter()
+        .chain(protected_records.iter())
+        .map(compaction_record_evidence_ref)
+        .collect::<Vec<_>>();
     let summary_json = build_compaction_summary_json(CompactionSummaryJsonInput {
         session,
         eligible,
@@ -746,6 +784,10 @@ fn build_session_compaction_plan_with_metadata(
         checkpoint_preview: &checkpoint_preview,
         lifecycle_state: if eligible { "preview_ready" } else { "preview_blocked" },
         review_candidate_count,
+        compressor_mode: Some("deterministic"),
+        fallback_used: false,
+        degraded_reason: None,
+        evidence_refs: evidence_refs.as_slice(),
     });
     let source_records_json = json!({
         "records": condensed_records.iter().map(compaction_record_json).collect::<Vec<_>>(),
@@ -790,10 +832,72 @@ fn build_session_compaction_plan_with_metadata(
         estimated_output_tokens,
         source_records_json,
         summary_json,
+        compressor_mode: "deterministic".to_owned(),
+        fallback_used: false,
+        degraded_reason: None,
+        evidence_refs,
         active_task_summary,
         checkpoint_metadata,
         candidates,
         checkpoint_preview,
+    }
+}
+
+fn annotate_hybrid_compaction_plan(plan: &mut SessionCompactionPlan) {
+    let evidence_refs = collect_plan_evidence_refs(plan);
+    if evidence_refs.is_empty() {
+        plan.compressor_mode = "deterministic_fallback".to_owned();
+        plan.fallback_used = true;
+        plan.degraded_reason = Some("summary_without_evidence_refs".to_owned());
+    } else {
+        plan.compressor_mode = "hybrid_evidence_backed".to_owned();
+        plan.fallback_used = false;
+        plan.degraded_reason = None;
+        plan.evidence_refs = evidence_refs;
+    }
+    annotate_compaction_json(plan);
+}
+
+fn collect_plan_evidence_refs(plan: &SessionCompactionPlan) -> Vec<String> {
+    if !plan.evidence_refs.is_empty() {
+        return plan.evidence_refs.clone();
+    }
+    let Ok(value) = serde_json::from_str::<Value>(plan.source_records_json.as_str()) else {
+        return Vec::new();
+    };
+    let mut refs = Vec::new();
+    for key in ["records", "protected"] {
+        if let Some(records) = value.get(key).and_then(Value::as_array) {
+            refs.extend(records.iter().filter_map(|record| {
+                let run_id = record.get("run_id")?.as_str()?;
+                let seq = record.get("seq")?.as_i64()?;
+                let event_type = record.get("event_type")?.as_str()?;
+                Some(format!("{run_id}:{seq}:{event_type}"))
+            }));
+        }
+    }
+    refs
+}
+
+fn annotate_compaction_json(plan: &mut SessionCompactionPlan) {
+    let compression = json!({
+        "compressor_mode": plan.compressor_mode,
+        "fallback_used": plan.fallback_used,
+        "degraded_reason": plan.degraded_reason,
+        "evidence_refs": plan.evidence_refs,
+    });
+    if let Ok(mut summary) = serde_json::from_str::<Value>(plan.summary_json.as_str()) {
+        if let Some(object) = summary.as_object_mut() {
+            object.insert("compression".to_owned(), compression.clone());
+        }
+        plan.summary_json = summary.to_string();
+    }
+    if let Ok(mut trigger_inputs) = serde_json::from_str::<Value>(plan.trigger_inputs_json.as_str())
+    {
+        if let Some(object) = trigger_inputs.as_object_mut() {
+            object.insert("compression".to_owned(), compression);
+        }
+        plan.trigger_inputs_json = trigger_inputs.to_string();
     }
 }
 
@@ -1164,6 +1268,12 @@ fn build_compaction_summary_json(input: CompactionSummaryJsonInput<'_>) -> Strin
         "writes": input.writes,
         "checkpoint_preview": input.checkpoint_preview,
         "quality_gates": quality_gates,
+        "compression": {
+            "compressor_mode": input.compressor_mode.unwrap_or("deterministic"),
+            "fallback_used": input.fallback_used,
+            "degraded_reason": input.degraded_reason,
+            "evidence_refs": input.evidence_refs,
+        },
     })
     .to_string()
 }
@@ -1722,6 +1832,10 @@ fn compaction_record_json(record: &SessionCompactionRecordSnapshot) -> Value {
     })
 }
 
+fn compaction_record_evidence_ref(record: &SessionCompactionRecordSnapshot) -> String {
+    format!("{}:{}:{}", record.run_id, record.seq, record.event_type)
+}
+
 fn compaction_event_label(event_type: &str) -> &'static str {
     match event_type {
         "message.received" | "queued.input" => "User",
@@ -1771,7 +1885,10 @@ pub(crate) fn truncate_console_text(raw: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_session_compaction_plan, render_compaction_prompt_block};
+    use super::{
+        build_session_compaction_plan, render_compaction_prompt_block, ContextCompressor,
+        HybridSessionContextCompressor, SessionContextCompressionInput,
+    };
     use crate::journal::{
         OrchestratorSessionPinRecord, OrchestratorSessionRecord,
         OrchestratorSessionTranscriptRecord, WorkspaceDocumentRecord,
@@ -2010,6 +2127,68 @@ mod tests {
         assert_eq!(
             summary.pointer("/lifecycle_state").and_then(serde_json::Value::as_str),
             Some("preview_blocked")
+        );
+    }
+
+    #[test]
+    fn hybrid_compressor_requires_evidence_refs() {
+        let transcript = vec![
+            transcript_record(
+                0,
+                "message.received",
+                r#"{"text":"Decision: keep compaction audit records in the journal."}"#,
+            ),
+            transcript_record(
+                1,
+                "message.replied",
+                r#"{"reply_text":"Next action: wire durable writes into MEMORY.md."}"#,
+            ),
+            transcript_record(
+                2,
+                "message.replied",
+                r#"{"reply_text":"Use GH CLI for GitHub operations in this repo."}"#,
+            ),
+            transcript_record(
+                3,
+                "message.received",
+                r#"{"text":"Decision: disable remote dashboard access by default."}"#,
+            ),
+            transcript_record(
+                4,
+                "message.replied",
+                r#"{"reply_text":"Decision: preserve deterministic fixtures."}"#,
+            ),
+            transcript_record(
+                5,
+                "message.received",
+                r#"{"text":"Next action: expose compaction diffs in the operator UI."}"#,
+            ),
+            transcript_record(6, "message.received", r#"{"text":"Recent context one."}"#),
+            transcript_record(7, "message.replied", r#"{"reply_text":"Recent context two."}"#),
+            transcript_record(8, "message.received", r#"{"text":"Recent context three."}"#),
+            transcript_record(9, "message.replied", r#"{"reply_text":"Recent context four."}"#),
+            transcript_record(10, "message.received", r#"{"text":"Recent context five."}"#),
+        ];
+        let plan =
+            HybridSessionContextCompressor::default().compress(SessionContextCompressionInput {
+                session: &session_record(),
+                transcript: transcript.as_slice(),
+                pins: &[],
+                workspace_documents: &[],
+                trigger_reason: Some("test_compaction"),
+                trigger_policy: Some("test_policy"),
+                mode: "manual",
+                previous_compaction_count: 0,
+            });
+        let summary = serde_json::from_str::<serde_json::Value>(plan.summary_json.as_str())
+            .expect("summary JSON should decode");
+
+        assert_eq!(plan.compressor_mode, "hybrid_evidence_backed");
+        assert!(!plan.fallback_used);
+        assert!(!plan.evidence_refs.is_empty());
+        assert_eq!(
+            summary.pointer("/compression/compressor_mode").and_then(serde_json::Value::as_str),
+            Some("hybrid_evidence_backed")
         );
     }
 

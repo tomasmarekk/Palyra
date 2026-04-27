@@ -5,6 +5,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tonic::Status;
 
 use crate::{
@@ -108,9 +109,31 @@ pub(crate) struct RecallPlan {
 pub(crate) struct RecallScoreBreakdown {
     pub(crate) lexical_score: f64,
     pub(crate) vector_score: f64,
+    #[serde(default)]
+    pub(crate) semantic_score: f64,
     pub(crate) recency_score: f64,
     pub(crate) source_quality_score: f64,
+    #[serde(default)]
+    pub(crate) sensitivity_penalty: f64,
+    #[serde(default)]
+    pub(crate) exact_phrase_match: f64,
     pub(crate) final_score: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RecallCitation {
+    pub(crate) source_kind: RecallSourceKind,
+    pub(crate) source_ref: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) tape_seq: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) workspace_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) artifact_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -160,6 +183,7 @@ pub(crate) struct RecallCandidate {
     pub(crate) candidate_id: String,
     pub(crate) source_kind: RecallSourceKind,
     pub(crate) source_ref: String,
+    pub(crate) citation: RecallCitation,
     pub(crate) title: String,
     pub(crate) snippet: String,
     pub(crate) created_at_unix_ms: i64,
@@ -179,6 +203,7 @@ pub(crate) struct RecallEvidenceRecord {
     pub(crate) evidence_id: String,
     pub(crate) source_kind: RecallSourceKind,
     pub(crate) source_ref: String,
+    pub(crate) citation: RecallCitation,
     pub(crate) title: String,
     pub(crate) snippet: String,
     pub(crate) rationale: String,
@@ -186,11 +211,28 @@ pub(crate) struct RecallEvidenceRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct RecallProviderUsage {
+    pub(crate) provider_id: String,
+    pub(crate) source_kind: RecallSourceKind,
+    pub(crate) evidence_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct StructuredRecallOutput {
+    pub(crate) summary: String,
     #[serde(default)]
     pub(crate) facts: Vec<RecallFact>,
     #[serde(default)]
     pub(crate) evidence: Vec<RecallEvidenceRecord>,
+    #[serde(default)]
+    pub(crate) unresolved: Vec<String>,
+    #[serde(default)]
+    pub(crate) contradictions: Vec<String>,
+    #[serde(default)]
+    pub(crate) source_refs: Vec<RecallCitation>,
+    #[serde(default)]
+    pub(crate) provider_usage: Vec<RecallProviderUsage>,
+    pub(crate) synthesis_hash: String,
     pub(crate) why_relevant_now: String,
     pub(crate) suggested_next_step: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -898,8 +940,14 @@ async fn build_selection_context(
         compaction_hits,
         top_candidates: Vec::new(),
         structured_output: StructuredRecallOutput {
+            summary: String::new(),
             facts: Vec::new(),
             evidence: Vec::new(),
+            unresolved: Vec::new(),
+            contradictions: Vec::new(),
+            source_refs: Vec::new(),
+            provider_usage: Vec::new(),
+            synthesis_hash: String::new(),
             why_relevant_now: String::new(),
             suggested_next_step: String::new(),
             confidence: None,
@@ -1310,48 +1358,70 @@ fn build_candidate_records(
 ) -> Vec<CandidateRecord> {
     let mut records = Vec::new();
     for hit in sources.memory_hits {
-        let score = RecallScoreBreakdown {
-            lexical_score: hit.breakdown.lexical_score,
-            vector_score: hit.breakdown.vector_score,
-            recency_score: hit.breakdown.recency_score,
-            source_quality_score: hit.breakdown.source_quality_score,
-            final_score: hit.breakdown.final_score,
-        };
+        let score = recall_score_breakdown(
+            query_variants,
+            hit.snippet.as_str(),
+            hit.breakdown.lexical_score,
+            hit.breakdown.vector_score,
+            hit.breakdown.recency_score,
+            hit.breakdown.source_quality_score,
+            hit.breakdown.final_score,
+        );
+        let source_ref = hit.item.memory_id.clone();
         let candidate = RecallCandidate {
-            candidate_id: format!("memory:{}", hit.item.memory_id),
+            candidate_id: format!("memory:{source_ref}"),
             source_kind: RecallSourceKind::Memory,
-            source_ref: hit.item.memory_id.clone(),
-            title: format!("Memory {}", hit.item.memory_id),
+            source_ref: source_ref.clone(),
+            citation: RecallCitation {
+                source_kind: RecallSourceKind::Memory,
+                source_ref: source_ref.clone(),
+                session_id: hit.item.session_id.clone(),
+                run_id: None,
+                tape_seq: None,
+                workspace_path: None,
+                artifact_id: None,
+            },
+            title: format!("Memory {source_ref}"),
             snippet: truncate_console_text(hit.snippet.as_str(), 256),
             created_at_unix_ms: hit.item.created_at_unix_ms,
             rationale: format!(
-                "matched durable memory via lexical {:.2}, vector {:.2}, recency {:.2}",
-                hit.breakdown.lexical_score,
-                hit.breakdown.vector_score,
-                hit.breakdown.recency_score
+                "matched durable memory via lexical {:.2}, semantic {:.2}, recency {:.2}",
+                score.lexical_score, score.semantic_score, score.recency_score
             ),
             score,
         };
         records.push(CandidateRecord { candidate });
     }
     for hit in sources.workspace_hits {
-        let score = RecallScoreBreakdown {
-            lexical_score: hit.breakdown.lexical_score,
-            vector_score: hit.breakdown.vector_score,
-            recency_score: hit.breakdown.recency_score,
-            source_quality_score: hit.breakdown.source_quality_score,
-            final_score: hit.breakdown.final_score,
-        };
+        let score = recall_score_breakdown(
+            query_variants,
+            hit.snippet.as_str(),
+            hit.breakdown.lexical_score,
+            hit.breakdown.vector_score,
+            hit.breakdown.recency_score,
+            hit.breakdown.source_quality_score,
+            hit.breakdown.final_score,
+        );
+        let source_ref = hit.document.document_id.clone();
         let candidate = RecallCandidate {
-            candidate_id: format!("workspace:{}", hit.document.document_id),
+            candidate_id: format!("workspace:{source_ref}"),
             source_kind: RecallSourceKind::WorkspaceDocument,
-            source_ref: hit.document.document_id.clone(),
+            source_ref: source_ref.clone(),
+            citation: RecallCitation {
+                source_kind: RecallSourceKind::WorkspaceDocument,
+                source_ref: source_ref.clone(),
+                session_id: hit.document.latest_session_id.clone(),
+                run_id: None,
+                tape_seq: None,
+                workspace_path: Some(hit.document.path.clone()),
+                artifact_id: None,
+            },
             title: hit.document.title.clone(),
             snippet: truncate_console_text(hit.snippet.as_str(), 256),
             created_at_unix_ms: hit.document.updated_at_unix_ms,
             rationale: format!(
-                "matched workspace snippet with lexical {:.2} and document quality {:.2}",
-                hit.breakdown.lexical_score, hit.breakdown.source_quality_score
+                "matched workspace snippet with lexical {:.2}, semantic {:.2}, and document quality {:.2}",
+                score.lexical_score, score.semantic_score, score.source_quality_score
             ),
             score,
         };
@@ -1377,23 +1447,35 @@ fn build_candidate_records(
             false,
             profile,
         );
-        let score = RecallScoreBreakdown {
-            lexical_score: score_breakdown.lexical_score,
-            vector_score: score_breakdown.vector_score,
-            recency_score: score_breakdown.recency_score,
-            source_quality_score: score_breakdown.source_quality_score,
-            final_score: score_breakdown.final_score,
-        };
+        let score = recall_score_breakdown(
+            query_variants,
+            hit.snippet.as_str(),
+            score_breakdown.lexical_score,
+            score_breakdown.vector_score,
+            score_breakdown.recency_score,
+            score_breakdown.source_quality_score,
+            score_breakdown.final_score,
+        );
+        let source_ref = format!("{}:{}", hit.run_id, hit.seq);
         let candidate = RecallCandidate {
-            candidate_id: format!("transcript:{}:{}", hit.run_id, hit.seq),
+            candidate_id: format!("transcript:{source_ref}"),
             source_kind: RecallSourceKind::Transcript,
-            source_ref: format!("{}:{}", hit.run_id, hit.seq),
+            source_ref: source_ref.clone(),
+            citation: RecallCitation {
+                source_kind: RecallSourceKind::Transcript,
+                source_ref,
+                session_id: None,
+                run_id: Some(hit.run_id.clone()),
+                tape_seq: Some(hit.seq),
+                workspace_path: None,
+                artifact_id: None,
+            },
             title: format!("Transcript {}#{}", hit.run_id, hit.seq),
             snippet: hit.snippet.clone(),
             created_at_unix_ms: hit.created_at_unix_ms,
             rationale: format!(
-                "matched transcript event with lexical {:.2} and recency {:.2}",
-                lexical_score, recency_score
+                "matched transcript event with lexical {:.2}, semantic {:.2}, and recency {:.2}",
+                score.lexical_score, score.semantic_score, score.recency_score
             ),
             score,
         };
@@ -1420,23 +1502,35 @@ fn build_candidate_records(
             false,
             profile,
         );
-        let score = RecallScoreBreakdown {
-            lexical_score: score_breakdown.lexical_score,
-            vector_score: score_breakdown.vector_score,
-            recency_score: score_breakdown.recency_score,
-            source_quality_score: score_breakdown.source_quality_score,
-            final_score: score_breakdown.final_score,
-        };
+        let score = recall_score_breakdown(
+            query_variants,
+            searchable.as_str(),
+            score_breakdown.lexical_score,
+            score_breakdown.vector_score,
+            score_breakdown.recency_score,
+            score_breakdown.source_quality_score,
+            score_breakdown.final_score,
+        );
+        let source_ref = hit.checkpoint_id.clone();
         let candidate = RecallCandidate {
-            candidate_id: format!("checkpoint:{}", hit.checkpoint_id),
+            candidate_id: format!("checkpoint:{source_ref}"),
             source_kind: RecallSourceKind::Checkpoint,
-            source_ref: hit.checkpoint_id.clone(),
+            source_ref: source_ref.clone(),
+            citation: RecallCitation {
+                source_kind: RecallSourceKind::Checkpoint,
+                source_ref,
+                session_id: None,
+                run_id: None,
+                tape_seq: None,
+                workspace_path: None,
+                artifact_id: None,
+            },
             title: hit.name.clone(),
             snippet: truncate_console_text(searchable.as_str(), 256),
             created_at_unix_ms: hit.created_at_unix_ms,
             rationale: format!(
-                "matched checkpoint metadata with lexical {:.2} and source quality {:.2}",
-                lexical_score, source_quality_score
+                "matched checkpoint metadata with lexical {:.2}, semantic {:.2}, and source quality {:.2}",
+                score.lexical_score, score.semantic_score, score.source_quality_score
             ),
             score,
         };
@@ -1464,23 +1558,35 @@ fn build_candidate_records(
             false,
             profile,
         );
-        let score = RecallScoreBreakdown {
-            lexical_score: score_breakdown.lexical_score,
-            vector_score: score_breakdown.vector_score,
-            recency_score: score_breakdown.recency_score,
-            source_quality_score: score_breakdown.source_quality_score,
-            final_score: score_breakdown.final_score,
-        };
+        let score = recall_score_breakdown(
+            query_variants,
+            searchable.as_str(),
+            score_breakdown.lexical_score,
+            score_breakdown.vector_score,
+            score_breakdown.recency_score,
+            score_breakdown.source_quality_score,
+            score_breakdown.final_score,
+        );
+        let source_ref = hit.artifact_id.clone();
         let candidate = RecallCandidate {
-            candidate_id: format!("compaction:{}", hit.artifact_id),
+            candidate_id: format!("compaction:{source_ref}"),
             source_kind: RecallSourceKind::CompactionArtifact,
-            source_ref: hit.artifact_id.clone(),
+            source_ref: source_ref.clone(),
+            citation: RecallCitation {
+                source_kind: RecallSourceKind::CompactionArtifact,
+                source_ref: source_ref.clone(),
+                session_id: None,
+                run_id: None,
+                tape_seq: None,
+                workspace_path: None,
+                artifact_id: Some(source_ref),
+            },
             title: format!("Compaction {}", hit.artifact_id),
             snippet: hit.summary_preview.clone(),
             created_at_unix_ms: hit.created_at_unix_ms,
             rationale: format!(
-                "matched compaction summary with lexical {:.2} and recency {:.2}",
-                lexical_score, recency_score
+                "matched compaction summary with lexical {:.2}, semantic {:.2}, and recency {:.2}",
+                score.lexical_score, score.semantic_score, score.recency_score
             ),
             score,
         };
@@ -1488,6 +1594,57 @@ fn build_candidate_records(
     }
 
     records
+}
+
+fn recall_score_breakdown(
+    query_variants: &[String],
+    snippet: &str,
+    lexical_score: f64,
+    vector_score: f64,
+    recency_score: f64,
+    source_quality_score: f64,
+    base_final_score: f64,
+) -> RecallScoreBreakdown {
+    let exact_phrase_match = recall_exact_phrase_match(query_variants, snippet);
+    let sensitivity_penalty = recall_sensitivity_penalty(snippet);
+    let final_score =
+        (base_final_score + (exact_phrase_match * 0.03) - sensitivity_penalty).clamp(0.0, 1.0);
+    RecallScoreBreakdown {
+        lexical_score,
+        vector_score,
+        semantic_score: vector_score,
+        recency_score,
+        source_quality_score,
+        sensitivity_penalty,
+        exact_phrase_match,
+        final_score,
+    }
+}
+
+fn recall_exact_phrase_match(query_variants: &[String], snippet: &str) -> f64 {
+    let snippet = snippet.to_ascii_lowercase();
+    if query_variants
+        .iter()
+        .map(|variant| variant.trim().to_ascii_lowercase())
+        .filter(|variant| variant.len() >= 4)
+        .any(|variant| snippet.contains(variant.as_str()))
+    {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+fn recall_sensitivity_penalty(snippet: &str) -> f64 {
+    let lower = snippet.to_ascii_lowercase();
+    if contains_any(
+        lower.as_str(),
+        &["api key", "password", "private key", "secret", "session token", "bearer "],
+    ) {
+        0.25
+    } else {
+        0.0
+    }
 }
 
 fn finalize_top_candidates(
@@ -1576,6 +1733,7 @@ fn build_structured_output(
             evidence_id: format!("evidence-{}", index + 1),
             source_kind: candidate.source_kind.clone(),
             source_ref: candidate.source_ref.clone(),
+            citation: candidate.citation.clone(),
             title: candidate.title.clone(),
             snippet: candidate.snippet.clone(),
             rationale: candidate.rationale.clone(),
@@ -1594,6 +1752,17 @@ fn build_structured_output(
             evidence_ids: vec![evidence.evidence_id.clone()],
         })
         .collect::<Vec<_>>();
+    let summary = build_evidence_backed_summary(evidence.as_slice(), query);
+    let unresolved = build_unresolved_recall_items(evidence.as_slice(), query);
+    let contradictions = detect_recall_contradictions(evidence.as_slice());
+    let source_refs = evidence.iter().map(|record| record.citation.clone()).collect::<Vec<_>>();
+    let provider_usage = build_provider_usage(evidence.as_slice());
+    let synthesis_hash = recall_synthesis_hash(
+        query,
+        summary.as_str(),
+        evidence.as_slice(),
+        contradictions.as_slice(),
+    );
     let confidence = if evidence.is_empty() {
         None
     } else {
@@ -1630,7 +1799,126 @@ fn build_structured_output(
         "Attach the selected recall evidence to the next prompt and keep the query specific."
             .to_owned()
     };
-    StructuredRecallOutput { facts, evidence, why_relevant_now, suggested_next_step, confidence }
+    StructuredRecallOutput {
+        summary,
+        facts,
+        evidence,
+        unresolved,
+        contradictions,
+        source_refs,
+        provider_usage,
+        synthesis_hash,
+        why_relevant_now,
+        suggested_next_step,
+        confidence,
+    }
+}
+
+fn build_evidence_backed_summary(evidence: &[RecallEvidenceRecord], query: &str) -> String {
+    if evidence.is_empty() {
+        return format!("No evidence-backed recall summary is available for query '{query}'.");
+    }
+    let strongest = evidence
+        .iter()
+        .take(3)
+        .map(|record| {
+            format!("{} [{}]", summarize_fact(record.snippet.as_str()), record.evidence_id)
+        })
+        .collect::<Vec<_>>();
+    format!("Evidence-backed recall for '{query}': {}.", strongest.join("; "))
+}
+
+fn build_unresolved_recall_items(evidence: &[RecallEvidenceRecord], query: &str) -> Vec<String> {
+    if evidence.is_empty() {
+        return vec![format!(
+            "No selected memory, workspace, transcript, checkpoint, or compaction evidence matched '{query}'."
+        )];
+    }
+    let weak_evidence = evidence.iter().filter(|record| record.score.final_score < 0.35).count();
+    if weak_evidence == 0 {
+        Vec::new()
+    } else {
+        vec![format!(
+            "{weak_evidence} selected evidence record(s) are below the high-confidence recall threshold."
+        )]
+    }
+}
+
+fn detect_recall_contradictions(evidence: &[RecallEvidenceRecord]) -> Vec<String> {
+    const CONTRADICTION_PAIRS: &[(&str, &str)] = &[
+        ("enable", "disable"),
+        ("allow", "deny"),
+        ("must", "must not"),
+        ("use", "avoid"),
+        ("keep", "remove"),
+        ("public", "private"),
+    ];
+    let joined = evidence
+        .iter()
+        .map(|record| record.snippet.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join("\n");
+    CONTRADICTION_PAIRS
+        .iter()
+        .filter(|(left, right)| joined.contains(left) && joined.contains(right))
+        .map(|(left, right)| format!("Evidence contains both '{left}' and '{right}'."))
+        .collect()
+}
+
+fn build_provider_usage(evidence: &[RecallEvidenceRecord]) -> Vec<RecallProviderUsage> {
+    let mut usage = Vec::<RecallProviderUsage>::new();
+    for record in evidence {
+        let provider_id = provider_id_for_source(&record.source_kind);
+        if let Some(existing) = usage.iter_mut().find(|entry| {
+            entry.provider_id == provider_id && entry.source_kind == record.source_kind
+        }) {
+            existing.evidence_count = existing.evidence_count.saturating_add(1);
+        } else {
+            usage.push(RecallProviderUsage {
+                provider_id: provider_id.to_owned(),
+                source_kind: record.source_kind.clone(),
+                evidence_count: 1,
+            });
+        }
+    }
+    usage
+}
+
+fn provider_id_for_source(source_kind: &RecallSourceKind) -> &'static str {
+    match source_kind {
+        RecallSourceKind::Memory => "builtin_journal",
+        RecallSourceKind::WorkspaceDocument => "workspace",
+        RecallSourceKind::Transcript
+        | RecallSourceKind::Checkpoint
+        | RecallSourceKind::CompactionArtifact => "session_history",
+    }
+}
+
+fn recall_synthesis_hash(
+    query: &str,
+    summary: &str,
+    evidence: &[RecallEvidenceRecord],
+    contradictions: &[String],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(query.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(summary.as_bytes());
+    for record in evidence {
+        hasher.update(b"\n");
+        hasher.update(record.evidence_id.as_bytes());
+        hasher.update(b":");
+        hasher.update(record.source_kind.as_str().as_bytes());
+        hasher.update(b":");
+        hasher.update(record.source_ref.as_bytes());
+        hasher.update(b":");
+        hasher.update(record.snippet.as_bytes());
+    }
+    for contradiction in contradictions {
+        hasher.update(b"\ncontradiction:");
+        hasher.update(contradiction.as_bytes());
+    }
+    hex::encode(hasher.finalize())
 }
 
 fn summarize_fact(snippet: &str) -> String {
@@ -1955,8 +2243,9 @@ mod tests {
     use super::{
         build_query_variants, build_recall_plan, build_structured_output, finalize_top_candidates,
         lexical_overlap_score, proxy_vector_score, recall_preview_console_payload,
-        selection_from_candidates, ExplicitRecallSelection, RecallCandidate, RecallRequest,
-        RecallScoreBreakdown, RecallSourceDecision, RecallSourceKind, TranscriptRecallRef,
+        selection_from_candidates, ExplicitRecallSelection, RecallCandidate, RecallCitation,
+        RecallRequest, RecallScoreBreakdown, RecallSourceDecision, RecallSourceKind,
+        TranscriptRecallRef,
     };
     use serde_json::json;
 
@@ -1969,8 +2258,17 @@ mod tests {
     ) -> RecallCandidate {
         RecallCandidate {
             candidate_id: id.to_owned(),
-            source_kind,
+            source_kind: source_kind.clone(),
             source_ref: id.to_owned(),
+            citation: RecallCitation {
+                source_kind,
+                source_ref: id.to_owned(),
+                session_id: None,
+                run_id: None,
+                tape_seq: None,
+                workspace_path: None,
+                artifact_id: None,
+            },
             title: id.to_owned(),
             snippet: format!("snippet for {id}"),
             created_at_unix_ms,
@@ -1978,8 +2276,11 @@ mod tests {
             score: RecallScoreBreakdown {
                 lexical_score: final_score,
                 vector_score: final_score,
+                semantic_score: final_score,
                 recency_score: final_score,
                 source_quality_score,
+                sensitivity_penalty: 0.0,
+                exact_phrase_match: 0.0,
                 final_score,
             },
         }
@@ -2101,6 +2402,15 @@ mod tests {
                     candidate_id: "memory-1".to_owned(),
                     source_kind: RecallSourceKind::Memory,
                     source_ref: "memory-1".to_owned(),
+                    citation: RecallCitation {
+                        source_kind: RecallSourceKind::Memory,
+                        source_ref: "memory-1".to_owned(),
+                        session_id: None,
+                        run_id: None,
+                        tape_seq: None,
+                        workspace_path: None,
+                        artifact_id: None,
+                    },
                     title: "Memory".to_owned(),
                     snippet: "memory".to_owned(),
                     created_at_unix_ms: 1,
@@ -2108,8 +2418,11 @@ mod tests {
                     score: RecallScoreBreakdown {
                         lexical_score: 1.0,
                         vector_score: 1.0,
+                        semantic_score: 1.0,
                         recency_score: 1.0,
                         source_quality_score: 1.0,
+                        sensitivity_penalty: 0.0,
+                        exact_phrase_match: 0.0,
                         final_score: 1.0,
                     },
                 },
@@ -2117,6 +2430,15 @@ mod tests {
                     candidate_id: "transcript-1".to_owned(),
                     source_kind: RecallSourceKind::Transcript,
                     source_ref: "run-1:7".to_owned(),
+                    citation: RecallCitation {
+                        source_kind: RecallSourceKind::Transcript,
+                        source_ref: "run-1:7".to_owned(),
+                        session_id: None,
+                        run_id: Some("run-1".to_owned()),
+                        tape_seq: Some(7),
+                        workspace_path: None,
+                        artifact_id: None,
+                    },
                     title: "Transcript".to_owned(),
                     snippet: "transcript".to_owned(),
                     created_at_unix_ms: 2,
@@ -2124,8 +2446,11 @@ mod tests {
                     score: RecallScoreBreakdown {
                         lexical_score: 0.9,
                         vector_score: 0.9,
+                        semantic_score: 0.9,
                         recency_score: 0.9,
                         source_quality_score: 0.9,
+                        sensitivity_penalty: 0.0,
+                        exact_phrase_match: 0.0,
                         final_score: 0.9,
                     },
                 },

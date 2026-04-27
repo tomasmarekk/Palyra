@@ -9,6 +9,7 @@ pub mod execution_gate;
 pub mod instruction_compiler;
 pub mod learning;
 pub mod memory;
+pub mod memory_provider;
 pub mod project_context;
 pub mod project_context_summary;
 pub mod provider_events;

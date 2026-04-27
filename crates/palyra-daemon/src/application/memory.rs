@@ -119,6 +119,29 @@ pub(crate) const MEMORY_TRUST_LABEL_RETRIEVED: &str = "retrieved_memory";
 const MEMORY_RETAIN_LOW_CONFIDENCE_THRESHOLD: f64 = 0.45;
 const MEMORY_RETAIN_NEAR_DUPLICATE_SCORE: f64 = 0.92;
 const MEMORY_RETAIN_DEDUPE_MIN_SCORE: f64 = 0.55;
+const MEMORY_WRITE_SENSITIVE_PATTERNS: &[&str] = &[
+    "api key",
+    "bearer ",
+    "cookie",
+    "credential",
+    "password",
+    "private key",
+    "secret",
+    "session token",
+    "token",
+];
+const MEMORY_WRITE_HIGH_RISK_PATTERNS: &[&str] = &[
+    "approval",
+    "auth",
+    "cryptography",
+    "deny",
+    "policy",
+    "private",
+    "remote bind",
+    "sandbox",
+    "security",
+];
+const MEMORY_TRANSIENT_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -173,6 +196,91 @@ impl MemoryLifecycleStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MemoryWriteCategory {
+    Fact,
+    Preference,
+    Procedure,
+    Constraint,
+    Decision,
+    Correction,
+    TransientRuntimeFact,
+}
+
+impl MemoryWriteCategory {
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fact => "fact",
+            Self::Preference => "preference",
+            Self::Procedure => "procedure",
+            Self::Constraint => "constraint",
+            Self::Decision => "decision",
+            Self::Correction => "correction",
+            Self::TransientRuntimeFact => "transient_runtime_fact",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MemoryWriteSensitivity {
+    Normal,
+    Sensitive,
+    HighRisk,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MemoryWriteApprovalState {
+    NotRequired,
+    Required,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct MemoryWriteSourceRef {
+    pub(crate) source_kind: String,
+    pub(crate) source_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) tape_seq: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) artifact_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MemoryWriteClassificationInput {
+    pub(crate) principal: String,
+    pub(crate) channel: Option<String>,
+    pub(crate) session_id: String,
+    pub(crate) scope: MemoryLifecycleScope,
+    pub(crate) content_text: String,
+    pub(crate) confidence: f64,
+    pub(crate) ttl_unix_ms: Option<i64>,
+    pub(crate) provenance: Value,
+    pub(crate) now_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub(crate) struct MemoryWriteClassification {
+    pub(crate) category: MemoryWriteCategory,
+    pub(crate) confidence: f64,
+    pub(crate) sensitivity: MemoryWriteSensitivity,
+    pub(crate) approval_state: MemoryWriteApprovalState,
+    pub(crate) source_refs: Vec<MemoryWriteSourceRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) ttl_unix_ms: Option<i64>,
+    pub(crate) owner_principal: String,
+    pub(crate) scope: String,
+    pub(crate) source_hash: String,
+    pub(crate) rollback_id: String,
+    pub(crate) reason_codes: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct MemoryLifecycleRetainRequest {
     pub(crate) principal: String,
@@ -198,6 +306,8 @@ pub(crate) struct MemoryLifecycleRetainOutcome {
     pub(crate) item: Option<MemoryItemRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) matched_memory_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) write_classification: Option<MemoryWriteClassification>,
     pub(crate) provenance: Value,
 }
 
@@ -235,26 +345,55 @@ async fn retain_memory_candidate(
     }
 
     if request.content_text.is_empty() {
-        return Ok(memory_retain_outcome(
-            MemoryLifecycleStatus::Rejected,
-            "memory content is empty after normalization",
-            request.scope,
-            false,
-            None,
-            None,
-            request.provenance,
-        ));
+        return Ok(memory_retain_outcome(MemoryRetainOutcomeInput {
+            status: MemoryLifecycleStatus::Rejected,
+            reason: "memory content is empty after normalization",
+            scope: request.scope,
+            durable_memory_write: false,
+            item: None,
+            matched_memory_id: None,
+            provenance: request.provenance,
+            write_classification: None,
+        }));
     }
-    if confidence < MEMORY_RETAIN_LOW_CONFIDENCE_THRESHOLD {
-        return Ok(memory_retain_outcome(
-            MemoryLifecycleStatus::NeedsReview,
-            "memory confidence is below automatic retention threshold",
-            request.scope,
-            false,
-            None,
-            None,
-            request.provenance,
-        ));
+
+    let classification = classify_memory_write(MemoryWriteClassificationInput {
+        principal: request.principal.clone(),
+        channel: request.channel.clone(),
+        session_id: request.session_id.clone(),
+        scope: request.scope,
+        content_text: request.content_text.clone(),
+        confidence,
+        ttl_unix_ms: request.ttl_unix_ms,
+        provenance: request.provenance.clone(),
+        now_unix_ms: current_unix_ms_status()?,
+    });
+    request.ttl_unix_ms = classification.ttl_unix_ms;
+    request.tags.push(format!("memory_write:{}", classification.category.as_str()));
+    request
+        .tags
+        .push(format!("source_hash:{}", classification.source_hash.get(..16).unwrap_or("short")));
+    request.tags = lifecycle_tags(request.tags.as_slice(), request.scope);
+    request.provenance = memory_write_provenance(request.provenance, &classification);
+
+    if classification.approval_state == MemoryWriteApprovalState::Required
+        || confidence < MEMORY_RETAIN_LOW_CONFIDENCE_THRESHOLD
+    {
+        let reason = if classification.approval_state == MemoryWriteApprovalState::Required {
+            format!("memory write requires review: {}", classification.reason_codes.join(","))
+        } else {
+            "memory confidence is below automatic retention threshold".to_owned()
+        };
+        return Ok(memory_retain_outcome(MemoryRetainOutcomeInput {
+            status: MemoryLifecycleStatus::NeedsReview,
+            reason: reason.as_str(),
+            scope: request.scope,
+            durable_memory_write: false,
+            item: None,
+            matched_memory_id: None,
+            provenance: request.provenance,
+            write_classification: Some(classification),
+        }));
     }
 
     let (channel_scope, session_scope, resource) = resolve_lifecycle_write_scope(&request)?;
@@ -265,15 +404,16 @@ async fn retain_memory_candidate(
             SensitiveServiceRole::AdminOrSystem,
         )
     {
-        return Ok(memory_retain_outcome(
-            MemoryLifecycleStatus::NeedsReview,
-            "principal-scoped memory retention requires admin/system review",
-            request.scope,
-            false,
-            None,
-            None,
-            request.provenance,
-        ));
+        return Ok(memory_retain_outcome(MemoryRetainOutcomeInput {
+            status: MemoryLifecycleStatus::NeedsReview,
+            reason: "principal-scoped memory retention requires admin/system review",
+            scope: request.scope,
+            durable_memory_write: false,
+            item: None,
+            matched_memory_id: None,
+            provenance: request.provenance,
+            write_classification: Some(classification.clone()),
+        }));
     }
 
     if let Some(duplicate) = find_lifecycle_duplicate(
@@ -310,15 +450,16 @@ async fn retain_memory_candidate(
             } else {
                 "near-duplicate memory merged into existing lifecycle record"
             };
-            return Ok(memory_retain_outcome(
+            return Ok(memory_retain_outcome(MemoryRetainOutcomeInput {
                 status,
                 reason,
-                request.scope,
-                true,
-                Some(item),
-                Some(duplicate.item.memory_id),
-                request.provenance,
-            ));
+                scope: request.scope,
+                durable_memory_write: true,
+                item: Some(item),
+                matched_memory_id: Some(duplicate.item.memory_id),
+                provenance: request.provenance,
+                write_classification: Some(classification),
+            }));
         }
     }
 
@@ -335,15 +476,16 @@ async fn retain_memory_candidate(
             ttl_unix_ms: request.ttl_unix_ms,
         })
         .await?;
-    Ok(memory_retain_outcome(
-        MemoryLifecycleStatus::Retained,
-        "memory retained in lifecycle store",
-        request.scope,
-        true,
-        Some(item),
-        None,
-        request.provenance,
-    ))
+    Ok(memory_retain_outcome(MemoryRetainOutcomeInput {
+        status: MemoryLifecycleStatus::Retained,
+        reason: "memory retained in lifecycle store",
+        scope: request.scope,
+        durable_memory_write: true,
+        item: Some(item),
+        matched_memory_id: None,
+        provenance: request.provenance,
+        write_classification: Some(classification),
+    }))
 }
 
 #[derive(Debug, Clone)]
@@ -402,25 +544,186 @@ fn resolve_lifecycle_write_scope(
     }
 }
 
-fn memory_retain_outcome(
+struct MemoryRetainOutcomeInput<'a> {
     status: MemoryLifecycleStatus,
-    reason: &str,
+    reason: &'a str,
     scope: MemoryLifecycleScope,
     durable_memory_write: bool,
     item: Option<MemoryItemRecord>,
     matched_memory_id: Option<String>,
     provenance: Value,
-) -> MemoryLifecycleRetainOutcome {
+    write_classification: Option<MemoryWriteClassification>,
+}
+
+fn memory_retain_outcome(input: MemoryRetainOutcomeInput<'_>) -> MemoryLifecycleRetainOutcome {
     MemoryLifecycleRetainOutcome {
-        status,
-        reason: reason.to_owned(),
-        scope,
+        status: input.status,
+        reason: input.reason.to_owned(),
+        scope: input.scope,
         trust_label: MEMORY_TRUST_LABEL_RETRIEVED.to_owned(),
-        durable_memory_write,
-        item,
-        matched_memory_id,
-        provenance,
+        durable_memory_write: input.durable_memory_write,
+        item: input.item,
+        matched_memory_id: input.matched_memory_id,
+        write_classification: input.write_classification,
+        provenance: input.provenance,
     }
+}
+
+pub(crate) fn classify_memory_write(
+    input: MemoryWriteClassificationInput,
+) -> MemoryWriteClassification {
+    let normalized = normalize_lifecycle_content(input.content_text.as_str());
+    let lowered = normalized.to_ascii_lowercase();
+    let category = classify_memory_write_category(lowered.as_str());
+    let sensitivity = classify_memory_write_sensitivity(lowered.as_str(), input.scope);
+    let ttl_unix_ms = match (category, input.ttl_unix_ms) {
+        (MemoryWriteCategory::TransientRuntimeFact, None) => {
+            Some(input.now_unix_ms.saturating_add(MEMORY_TRANSIENT_TTL_MS))
+        }
+        (_, ttl) => ttl,
+    };
+    let source_hash = crate::sha256_hex(
+        format!(
+            "{}:{}:{}:{}:{}",
+            input.principal,
+            input.channel.as_deref().unwrap_or_default(),
+            input.session_id,
+            input.scope.as_str(),
+            normalized
+        )
+        .as_bytes(),
+    );
+    let mut reason_codes = vec![format!("category:{}", category.as_str())];
+    if ttl_unix_ms.is_some() {
+        reason_codes.push("ttl:bounded".to_owned());
+    }
+    if input.confidence < MEMORY_RETAIN_LOW_CONFIDENCE_THRESHOLD {
+        reason_codes.push("confidence:below_auto_retain_threshold".to_owned());
+    }
+    if input.scope == MemoryLifecycleScope::Principal {
+        reason_codes.push("scope:principal_review".to_owned());
+    }
+    match sensitivity {
+        MemoryWriteSensitivity::Normal => {}
+        MemoryWriteSensitivity::Sensitive => reason_codes.push("sensitivity:sensitive".to_owned()),
+        MemoryWriteSensitivity::HighRisk => reason_codes.push("sensitivity:high_risk".to_owned()),
+    }
+    if !principal_has_sensitive_service_role(
+        input.principal.as_str(),
+        SensitiveServiceRole::AdminOrSystem,
+    ) && matches!(category, MemoryWriteCategory::Procedure | MemoryWriteCategory::Constraint)
+    {
+        reason_codes.push("policy:operator_review_for_runtime_rule".to_owned());
+    }
+
+    let approval_state = if input.confidence < MEMORY_RETAIN_LOW_CONFIDENCE_THRESHOLD
+        || input.scope == MemoryLifecycleScope::Principal
+        || sensitivity != MemoryWriteSensitivity::Normal
+        || reason_codes.iter().any(|reason| reason == "policy:operator_review_for_runtime_rule")
+    {
+        MemoryWriteApprovalState::Required
+    } else {
+        MemoryWriteApprovalState::NotRequired
+    };
+    let source_refs = memory_write_source_refs(
+        &input.provenance,
+        source_hash.as_str(),
+        input.session_id.as_str(),
+    );
+    MemoryWriteClassification {
+        category,
+        confidence: input.confidence.clamp(0.0, 1.0),
+        sensitivity,
+        approval_state,
+        source_refs,
+        ttl_unix_ms,
+        owner_principal: input.principal,
+        scope: input.scope.as_str().to_owned(),
+        rollback_id: format!("memory-rollback-{}", &source_hash[..16]),
+        source_hash,
+        reason_codes,
+    }
+}
+
+fn classify_memory_write_category(lowered: &str) -> MemoryWriteCategory {
+    if contains_any(lowered, &["correction", "actually", "instead of", "replace "]) {
+        MemoryWriteCategory::Correction
+    } else if contains_any(lowered, &["prefer", "preference", "likes ", "wants "]) {
+        MemoryWriteCategory::Preference
+    } else if contains_any(lowered, &["procedure", "runbook", "workflow", "steps:", "checklist"]) {
+        MemoryWriteCategory::Procedure
+    } else if contains_any(lowered, &["must ", "must not", "always ", "never ", "constraint"]) {
+        MemoryWriteCategory::Constraint
+    } else if contains_any(lowered, &["decision", "decided", "we chose", "selected "]) {
+        MemoryWriteCategory::Decision
+    } else if contains_any(lowered, &["temporary", "today", "current run", "for this run"]) {
+        MemoryWriteCategory::TransientRuntimeFact
+    } else {
+        MemoryWriteCategory::Fact
+    }
+}
+
+fn classify_memory_write_sensitivity(
+    lowered: &str,
+    scope: MemoryLifecycleScope,
+) -> MemoryWriteSensitivity {
+    if contains_any(lowered, MEMORY_WRITE_SENSITIVE_PATTERNS) {
+        MemoryWriteSensitivity::Sensitive
+    } else if scope == MemoryLifecycleScope::Principal
+        && contains_any(lowered, MEMORY_WRITE_HIGH_RISK_PATTERNS)
+    {
+        MemoryWriteSensitivity::HighRisk
+    } else {
+        MemoryWriteSensitivity::Normal
+    }
+}
+
+fn memory_write_source_refs(
+    provenance: &Value,
+    source_hash: &str,
+    fallback_session_id: &str,
+) -> Vec<MemoryWriteSourceRef> {
+    let run_id = provenance.get("run_id").and_then(Value::as_str).map(str::to_owned);
+    let session_id = provenance
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| Some(fallback_session_id.to_owned()));
+    let tape_seq = provenance.get("seq").and_then(Value::as_i64);
+    let artifact_id = provenance.get("artifact_id").and_then(Value::as_str).map(str::to_owned);
+    let source_kind = if tape_seq.is_some() {
+        "orchestrator_tape"
+    } else if artifact_id.is_some() {
+        "artifact"
+    } else {
+        "memory_write"
+    };
+    let source_id = run_id
+        .clone()
+        .or_else(|| artifact_id.clone())
+        .unwrap_or_else(|| format!("source-{}", &source_hash[..16]));
+    vec![MemoryWriteSourceRef {
+        source_kind: source_kind.to_owned(),
+        source_id,
+        session_id,
+        run_id,
+        tape_seq,
+        artifact_id,
+    }]
+}
+
+fn memory_write_provenance(
+    mut provenance: Value,
+    classification: &MemoryWriteClassification,
+) -> Value {
+    let Value::Object(ref mut fields) = provenance else {
+        return json!({
+            "input": provenance,
+            "memory_write": classification,
+        });
+    };
+    fields.insert("memory_write".to_owned(), json!(classification));
+    provenance
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -601,6 +904,10 @@ pub(crate) fn normalize_lifecycle_content(raw: &str) -> String {
         .join(" ")
 }
 
+fn contains_any(input: &str, patterns: &[&str]) -> bool {
+    patterns.iter().any(|pattern| input.contains(pattern))
+}
+
 pub(crate) fn lifecycle_tags(raw: &[String], scope: MemoryLifecycleScope) -> Vec<String> {
     let mut tags = vec![
         "lifecycle:memory".to_owned(),
@@ -694,5 +1001,46 @@ pub(crate) fn memory_search_hit_message(
         } else {
             None
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn classification_input(content_text: &str) -> MemoryWriteClassificationInput {
+        MemoryWriteClassificationInput {
+            principal: "user:alice".to_owned(),
+            channel: Some("discord:channel:one".to_owned()),
+            session_id: "01H00000000000000000000001".to_owned(),
+            scope: MemoryLifecycleScope::Session,
+            content_text: content_text.to_owned(),
+            confidence: 0.86,
+            ttl_unix_ms: None,
+            provenance: json!({ "run_id": "run-1", "seq": 7 }),
+            now_unix_ms: 1_700_000_000_000,
+        }
+    }
+
+    #[test]
+    fn write_classifier_marks_sensitive_memory_for_review() {
+        let classification = classify_memory_write(classification_input(
+            "The deployment password is secret and must be remembered.",
+        ));
+
+        assert_eq!(classification.sensitivity, MemoryWriteSensitivity::Sensitive);
+        assert_eq!(classification.approval_state, MemoryWriteApprovalState::Required);
+        assert!(classification.reason_codes.iter().any(|reason| reason == "sensitivity:sensitive"));
+        assert_eq!(classification.source_refs[0].source_kind, "orchestrator_tape");
+    }
+
+    #[test]
+    fn write_classifier_bounds_transient_runtime_facts_with_ttl() {
+        let classification = classify_memory_write(classification_input(
+            "Today the current run is waiting on a retry.",
+        ));
+
+        assert_eq!(classification.category, MemoryWriteCategory::TransientRuntimeFact);
+        assert_eq!(classification.ttl_unix_ms, Some(1_700_000_000_000 + MEMORY_TRANSIENT_TTL_MS));
     }
 }

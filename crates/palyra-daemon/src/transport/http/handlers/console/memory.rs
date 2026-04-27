@@ -8,6 +8,11 @@ use crate::journal::{
 use crate::*;
 use crate::{
     application::learning::{apply_patch_learning_candidate, apply_preference_candidate},
+    application::memory_provider::{
+        explain_provider_hit, memory_provider_prefetch_snapshot, memory_provider_status_snapshot,
+        memory_provider_system_prompt_snapshot, run_memory_provider_reindex,
+        MemoryProviderHookContext,
+    },
     application::recall::{
         preview_recall, recall_preview_console_payload, RecallPreviewEnvelope, RecallRequest,
     },
@@ -17,6 +22,7 @@ use palyra_common::runtime_preview::{
     RuntimeDecisionActorKind, RuntimeDecisionEventType, RuntimeDecisionPayload,
     RuntimeDecisionTiming, RuntimeEntityRef, RuntimePreviewCapability, RuntimeResourceBudget,
 };
+use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
 pub(crate) async fn console_memory_status_handler(
@@ -24,6 +30,15 @@ pub(crate) async fn console_memory_status_handler(
     headers: HeaderMap,
 ) -> Result<Json<Value>, Response> {
     let _session = authorize_console_session(&state, &headers, false)?;
+    let provider_context = MemoryProviderHookContext::from_request_context(&_session.context);
+    let provider_statuses =
+        memory_provider_status_snapshot(state.runtime.clone(), &provider_context)
+            .await
+            .map_err(runtime_status_response)?;
+    let provider_system_prompt =
+        memory_provider_system_prompt_snapshot(state.runtime.clone(), &provider_context)
+            .await
+            .map_err(runtime_status_response)?;
     let maintenance_status =
         state.runtime.memory_maintenance_status().await.map_err(runtime_status_response)?;
     let embeddings_status =
@@ -68,6 +83,10 @@ pub(crate) async fn console_memory_status_handler(
             "backend": retrieval_backend,
             "external_index": retrieval_backend.external_index.clone(),
             "scoring": retrieval_config.scoring,
+        },
+        "providers": provider_statuses,
+        "provider_context": {
+            "system_prompt": provider_system_prompt,
         },
         "retention": {
             "max_entries": memory_config.retention_max_entries,
@@ -170,26 +189,32 @@ pub(crate) async fn console_memory_index_handler(
     let batch_size = payload.batch_size.unwrap_or(64).clamp(1, 256);
     let until_complete = payload.until_complete.unwrap_or(false);
     let run_maintenance = payload.run_maintenance.unwrap_or(false);
+    let cancel_after_batches = payload.cancel_after_batches.filter(|value| *value > 0);
 
     let maintenance =
         if run_maintenance { Some(run_memory_maintenance_now(&state).await?) } else { None };
 
-    let mut outcome = state
-        .runtime
-        .run_memory_embeddings_backfill(batch_size)
+    let mut provider_reindex = run_memory_provider_reindex(state.runtime.clone(), batch_size)
         .await
         .map_err(runtime_status_response)?;
     let mut batches_executed = 1_u64;
-    let mut scanned_count = outcome.scanned_count;
-    let mut updated_count = outcome.updated_count;
-    while until_complete && !outcome.is_complete() {
-        outcome = state
-            .runtime
-            .run_memory_embeddings_backfill(batch_size)
+    let mut scanned_count = provider_reindex.progress.scanned_count;
+    let mut updated_count = provider_reindex.progress.updated_count;
+    while until_complete && !provider_reindex.progress.complete {
+        if cancel_after_batches.is_some_and(|limit| batches_executed >= limit) {
+            provider_reindex.state = "cancelled".to_owned();
+            provider_reindex.cancelled = true;
+            provider_reindex.cancel_reason = Some("operator_requested_batch_limit".to_owned());
+            provider_reindex
+                .artifact_log
+                .push("memory provider reindex cancelled by operator batch limit".to_owned());
+            break;
+        }
+        provider_reindex = run_memory_provider_reindex(state.runtime.clone(), batch_size)
             .await
             .map_err(runtime_status_response)?;
-        scanned_count = scanned_count.saturating_add(outcome.scanned_count);
-        updated_count = updated_count.saturating_add(outcome.updated_count);
+        scanned_count = scanned_count.saturating_add(provider_reindex.progress.scanned_count);
+        updated_count = updated_count.saturating_add(provider_reindex.progress.updated_count);
         batches_executed = batches_executed.saturating_add(1);
     }
     let mut external_indexer = state
@@ -197,7 +222,7 @@ pub(crate) async fn console_memory_index_handler(
         .run_external_retrieval_indexer(batch_size)
         .await
         .map_err(runtime_status_response)?;
-    while until_complete && !external_indexer.complete {
+    while until_complete && !provider_reindex.cancelled && !external_indexer.complete {
         external_indexer = state
             .runtime
             .run_external_retrieval_indexer(batch_size)
@@ -227,17 +252,19 @@ pub(crate) async fn console_memory_index_handler(
         })
     });
     let index_payload = json!({
-        "ran_at_unix_ms": outcome.ran_at_unix_ms,
-        "batch_size": outcome.batch_size,
+        "ran_at_unix_ms": provider_reindex.ran_at_unix_ms,
+        "batch_size": provider_reindex.progress.batch_size,
         "batches_executed": batches_executed,
         "scanned_count": scanned_count,
         "updated_count": updated_count,
-        "pending_count": outcome.pending_count,
-        "complete": outcome.is_complete(),
-        "target_model_id": outcome.target_model_id,
-        "target_dims": outcome.target_dims,
-        "target_version": outcome.target_version,
+        "pending_count": provider_reindex.progress.pending_count,
+        "complete": provider_reindex.progress.complete,
+        "target_model_id": provider_reindex.progress.target_model_id,
+        "target_dims": provider_reindex.progress.target_dims,
+        "target_version": provider_reindex.progress.target_version,
         "until_complete": until_complete,
+        "cancel_after_batches": cancel_after_batches,
+        "cancelled": provider_reindex.cancelled,
     });
     let event_details = json!({
         "batch_size": batch_size,
@@ -245,6 +272,7 @@ pub(crate) async fn console_memory_index_handler(
         "run_maintenance": run_maintenance,
         "index": index_payload.clone(),
         "external_indexer": external_indexer.clone(),
+        "provider_reindex": provider_reindex.clone(),
         "drift": drift.clone(),
         "maintenance": maintenance_payload.clone(),
     });
@@ -260,6 +288,7 @@ pub(crate) async fn console_memory_index_handler(
         "maintenance": maintenance_payload,
         "index": index_payload,
         "external_indexer": external_indexer,
+        "provider_reindex": provider_reindex,
         "drift": drift,
         "external_index": retrieval_backend.external_index.clone(),
         "retrieval": {
@@ -314,6 +343,55 @@ pub(crate) async fn console_memory_search_handler(
     Ok(Json(json!({
         "hits": outcome.hits,
         "diagnostics": outcome.diagnostics,
+    })))
+}
+
+pub(crate) async fn console_memory_provider_explain_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ConsoleMemoryProviderExplainQuery>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    let search_query = query.query.trim();
+    if search_query.is_empty() {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(
+            "query cannot be empty",
+        )));
+    }
+    let min_score = query.min_score.unwrap_or(0.0);
+    if !min_score.is_finite() || !(0.0..=1.0).contains(&min_score) {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(
+            "min_score must be in range 0.0..=1.0",
+        )));
+    }
+    let mut provider_context = MemoryProviderHookContext::from_request_context(&session.context);
+    provider_context.channel = query.channel.or(session.context.channel.clone());
+    provider_context.session_id = query.session_id.and_then(trim_to_option);
+    provider_context.agent_id = query.agent_id.and_then(trim_to_option);
+    provider_context.workspace_id = query.workspace_prefix.and_then(trim_to_option);
+    provider_context.objective = Some(search_query.to_owned());
+    provider_context.provenance = json!({
+        "source": "console_memory_provider_explain",
+        "principal": session.context.principal.clone(),
+        "device_id": session.context.device_id.clone(),
+        "channel": provider_context.channel.clone(),
+    });
+    let outcomes = memory_provider_prefetch_snapshot(state.runtime.clone(), &provider_context)
+        .await
+        .map_err(runtime_status_response)?;
+    let top_k = query.top_k.unwrap_or(8).clamp(1, 32);
+    let explanations = outcomes
+        .iter()
+        .flat_map(|outcome| outcome.hits.iter())
+        .filter(|hit| hit.score.final_score >= min_score)
+        .take(top_k)
+        .map(explain_provider_hit)
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "query": search_query,
+        "providers": outcomes,
+        "explanations": explanations,
+        "contract": contract_descriptor(),
     })))
 }
 
@@ -1145,6 +1223,7 @@ pub(crate) async fn console_session_search_handler(
         "capability": "palyra.recall.session_search",
         "query": outcome.query,
         "groups": outcome.groups,
+        "synthesis": session_search_synthesis(&outcome),
         "diagnostics": outcome.diagnostics,
         "artifact": artifact,
         "contract": contract_descriptor(),
@@ -1219,6 +1298,8 @@ fn build_recall_preview_artifact_request(
             "memory_hit_count": preview.memory_hits.len(),
             "workspace_hit_count": preview.workspace_hits.len(),
             "transcript_hit_count": preview.transcript_hits.len(),
+            "provider_usage": preview.structured_output.provider_usage,
+            "synthesis_hash": preview.structured_output.synthesis_hash,
         }),
         provenance: recall_preview_provenance(preview),
         created_by_principal: context.principal.clone(),
@@ -1243,6 +1324,7 @@ fn build_session_search_artifact_request(
             "capability": "palyra.recall.session_search",
             "query": outcome.query,
             "groups": outcome.groups,
+            "synthesis": session_search_synthesis(outcome),
             "diagnostics": outcome.diagnostics,
             "durable_memory_write": false,
         }),
@@ -1253,6 +1335,7 @@ fn build_session_search_artifact_request(
             "total_latency_ms": outcome.diagnostics.total_latency_ms,
             "latency_budget_exceeded": outcome.diagnostics.latency_budget_exceeded,
             "degraded_reason": outcome.diagnostics.degraded_reason,
+            "synthesis_hash": session_search_synthesis_hash(outcome),
         }),
         provenance: session_search_provenance(outcome),
         created_by_principal: context.principal.clone(),
@@ -1277,6 +1360,9 @@ fn session_search_summary(outcome: &SessionSearchOutcome) -> String {
 fn recall_preview_provenance(preview: &RecallPreviewEnvelope) -> Value {
     json!({
         "source": "recall_preview",
+        "synthesis_hash": preview.structured_output.synthesis_hash,
+        "provider_usage": preview.structured_output.provider_usage,
+        "source_refs": preview.structured_output.source_refs,
         "memory": preview.memory_hits.iter().map(|hit| {
             json!({
                 "source_type": "memory",
@@ -1324,6 +1410,8 @@ fn recall_preview_provenance(preview: &RecallPreviewEnvelope) -> Value {
 fn session_search_provenance(outcome: &SessionSearchOutcome) -> Value {
     json!({
         "source": "session_search",
+        "synthesis_hash": session_search_synthesis_hash(outcome),
+        "provider_usage": session_search_provider_usage(outcome),
         "windows": outcome
             .groups
             .iter()
@@ -1331,6 +1419,121 @@ fn session_search_provenance(outcome: &SessionSearchOutcome) -> Value {
             .map(|window| json!(window.provenance))
             .collect::<Vec<_>>(),
     })
+}
+
+fn session_search_synthesis(outcome: &SessionSearchOutcome) -> Value {
+    let evidence = outcome
+        .groups
+        .iter()
+        .flat_map(|group| group.windows.iter())
+        .take(12)
+        .enumerate()
+        .map(|(index, window)| {
+            json!({
+                "evidence_id": format!("session-evidence-{}", index + 1),
+                "source_kind": "transcript",
+                "source_ref": format!("{}:{}", window.run_id, window.match_seq),
+                "citation": {
+                    "source_type": window.provenance.source_type,
+                    "session_id": window.provenance.session_id,
+                    "run_id": window.provenance.run_id,
+                    "tape_seq": window.provenance.tape_seq,
+                    "event_type": window.provenance.event_type,
+                    "created_at_unix_ms": window.provenance.created_at_unix_ms,
+                },
+                "snippet": window.snippet,
+                "score": window.score,
+            })
+        })
+        .collect::<Vec<_>>();
+    let summary = if evidence.is_empty() {
+        format!(
+            "No evidence-backed session recall summary is available for query '{}'.",
+            outcome.query
+        )
+    } else {
+        format!(
+            "Evidence-backed session recall for '{}': {} group(s), {} bounded window(s).",
+            outcome.query,
+            outcome.groups.len(),
+            evidence.len()
+        )
+    };
+    json!({
+        "summary": summary,
+        "confidence": session_search_confidence(outcome),
+        "unresolved": if evidence.is_empty() {
+            vec![format!("No session windows matched '{}'.", outcome.query)]
+        } else {
+            Vec::<String>::new()
+        },
+        "contradictions": session_search_contradictions(outcome),
+        "evidence": evidence,
+        "provider_usage": session_search_provider_usage(outcome),
+        "synthesis_hash": session_search_synthesis_hash(outcome),
+    })
+}
+
+fn session_search_provider_usage(outcome: &SessionSearchOutcome) -> Value {
+    let evidence_count = outcome.groups.iter().map(|group| group.windows.len()).sum::<usize>();
+    json!([{
+        "provider_id": "session_history",
+        "source_kind": "transcript",
+        "evidence_count": evidence_count,
+    }])
+}
+
+fn session_search_confidence(outcome: &SessionSearchOutcome) -> Option<f64> {
+    let scores = outcome
+        .groups
+        .iter()
+        .flat_map(|group| group.windows.iter().map(|window| window.score))
+        .take(3)
+        .collect::<Vec<_>>();
+    if scores.is_empty() {
+        return None;
+    }
+    let total = scores.iter().sum::<f64>();
+    Some(total / scores.len() as f64)
+}
+
+fn session_search_contradictions(outcome: &SessionSearchOutcome) -> Vec<String> {
+    const CONTRADICTION_PAIRS: &[(&str, &str)] = &[
+        ("enable", "disable"),
+        ("allow", "deny"),
+        ("must", "must not"),
+        ("use", "avoid"),
+        ("keep", "remove"),
+        ("public", "private"),
+    ];
+    let joined = outcome
+        .groups
+        .iter()
+        .flat_map(|group| group.windows.iter())
+        .map(|window| window.snippet.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join("\n");
+    CONTRADICTION_PAIRS
+        .iter()
+        .filter(|(left, right)| joined.contains(left) && joined.contains(right))
+        .map(|(left, right)| format!("Evidence contains both '{left}' and '{right}'."))
+        .collect()
+}
+
+fn session_search_synthesis_hash(outcome: &SessionSearchOutcome) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(outcome.query.as_bytes());
+    for group in &outcome.groups {
+        hasher.update(b"\nsession:");
+        hasher.update(group.session.session_id.as_bytes());
+        for window in &group.windows {
+            hasher.update(b"\nwindow:");
+            hasher.update(window.window_id.as_bytes());
+            hasher.update(b":");
+            hasher.update(window.snippet.as_bytes());
+        }
+    }
+    hex::encode(hasher.finalize())
 }
 
 fn recall_preview_console_event_payload(

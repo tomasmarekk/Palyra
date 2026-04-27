@@ -624,6 +624,23 @@ struct ConsoleMemorySearchQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct ConsoleMemoryProviderExplainQuery {
+    query: String,
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    workspace_prefix: Option<String>,
+    #[serde(default)]
+    top_k: Option<usize>,
+    #[serde(default)]
+    min_score: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ConsoleMemoryPurgeRequest {
     #[serde(default)]
     channel: Option<String>,
@@ -639,6 +656,8 @@ struct ConsoleMemoryIndexRequest {
     batch_size: Option<usize>,
     #[serde(default)]
     until_complete: Option<bool>,
+    #[serde(default)]
+    cancel_after_batches: Option<u64>,
     #[serde(default)]
     run_maintenance: Option<bool>,
 }

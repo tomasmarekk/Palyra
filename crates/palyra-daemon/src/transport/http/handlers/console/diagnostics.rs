@@ -78,6 +78,17 @@ pub(crate) async fn console_diagnostics_handler(
     let retrieval_backend =
         state.runtime.retrieval_backend_snapshot().map_err(runtime_status_response)?;
     let retrieval_config = state.runtime.retrieval_config_snapshot();
+    let memory_provider_context =
+        crate::application::memory_provider::MemoryProviderHookContext::from_request_context(
+            &session.context,
+        );
+    let memory_provider_statuses =
+        crate::application::memory_provider::memory_provider_status_snapshot(
+            state.runtime.clone(),
+            &memory_provider_context,
+        )
+        .await
+        .map_err(runtime_status_response)?;
     let memory_runtime_config = state.runtime.memory_config_snapshot();
     let learning_runtime_config = state.runtime.learning_config_snapshot();
     let access_snapshot = {
@@ -167,6 +178,7 @@ pub(crate) async fn console_diagnostics_handler(
         "memory": {
             "usage": memory_status.usage,
             "embeddings": memory_embeddings,
+            "providers": memory_provider_statuses,
             "retrieval": {
                 "backend": retrieval_backend,
                 "scoring": retrieval_config.scoring,

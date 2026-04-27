@@ -949,6 +949,7 @@ fn serialize_memory_lifecycle_outcome(
         "trust_label": outcome.trust_label.as_str(),
         "durable_memory_write": outcome.durable_memory_write,
         "matched_memory_id": outcome.matched_memory_id.as_deref(),
+        "write_classification": outcome.write_classification.clone(),
         "provenance": outcome.provenance.clone(),
         "item": outcome.item.as_ref().map(memory_item_output_payload),
     });
