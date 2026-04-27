@@ -305,9 +305,13 @@ impl ToolSkillContext {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RunStreamToolExecutionOutcome {
-    Completed,
+    Completed {
+        proposal_id: String,
+        tool_name: String,
+        outcome: crate::tool_protocol::ToolExecutionOutcome,
+    },
     Cancelled,
 }
 

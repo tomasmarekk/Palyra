@@ -67,6 +67,15 @@ pub struct ProviderMessage {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ProviderMessageToolCall>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderMessageToolCall {
+    pub proposal_id: String,
+    pub tool_name: String,
+    pub input_json: Value,
 }
 
 impl ProviderMessage {
@@ -77,6 +86,50 @@ impl ProviderMessage {
             content: vec![ProviderMessageContentPart::text(text)],
             name: None,
             tool_call_id: None,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn assistant_from_output(output: &ProviderTurnOutput) -> Self {
+        let mut content = Vec::new();
+        let mut tool_calls = Vec::new();
+        for part in &output.content_parts {
+            match part {
+                ProviderOutputContentPart::Text { text } => {
+                    if !text.is_empty() {
+                        content.push(ProviderMessageContentPart::text(text.clone()));
+                    }
+                }
+                ProviderOutputContentPart::ToolCall { proposal_id, tool_name, input_json } => {
+                    tool_calls.push(ProviderMessageToolCall {
+                        proposal_id: proposal_id.clone(),
+                        tool_name: tool_name.clone(),
+                        input_json: input_json.clone(),
+                    });
+                }
+            }
+        }
+        if content.is_empty() && tool_calls.is_empty() && !output.full_text.is_empty() {
+            content.push(ProviderMessageContentPart::text(output.full_text.clone()));
+        }
+        Self {
+            role: ProviderMessageRole::Assistant,
+            content,
+            name: None,
+            tool_call_id: None,
+            tool_calls,
+        }
+    }
+
+    #[must_use]
+    pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: ProviderMessageRole::Tool,
+            content: vec![ProviderMessageContentPart::text(content.into())],
+            name: None,
+            tool_call_id: Some(tool_call_id.into()),
+            tool_calls: Vec::new(),
         }
     }
 

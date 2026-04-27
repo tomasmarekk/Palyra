@@ -65,6 +65,28 @@ pub(super) fn build_openai_messages(request: &ProviderRequest) -> Vec<Value> {
                 "role": message.role.as_openai_role(),
                 "content": build_openai_message_content(message, &[]),
             });
+            if message.role == ProviderMessageRole::Assistant && !message.tool_calls.is_empty() {
+                payload["tool_calls"] = Value::Array(
+                    message
+                        .tool_calls
+                        .iter()
+                        .map(|tool_call| {
+                            json!({
+                                "id": tool_call.proposal_id.as_str(),
+                                "type": "function",
+                                "function": {
+                                    "name": tool_call.tool_name.as_str(),
+                                    "arguments": serde_json::to_string(&tool_call.input_json)
+                                        .unwrap_or_else(|_| "{}".to_owned()),
+                                }
+                            })
+                        })
+                        .collect(),
+                );
+                if message.content.is_empty() {
+                    payload["content"] = Value::Null;
+                }
+            }
             if let Some(name) = message.name.as_deref() {
                 payload["name"] = json!(name);
             }
@@ -77,6 +99,15 @@ pub(super) fn build_openai_messages(request: &ProviderRequest) -> Vec<Value> {
 }
 
 fn build_anthropic_content_parts(message: &ProviderMessage) -> Vec<Value> {
+    if message.role == ProviderMessageRole::Tool {
+        let content = message.text_content();
+        return vec![json!({
+            "type": "tool_result",
+            "tool_use_id": message.tool_call_id.as_deref().unwrap_or_default(),
+            "content": content,
+        })];
+    }
+
     let mut parts = Vec::new();
     for content_part in &message.content {
         match content_part {
@@ -96,6 +127,16 @@ fn build_anthropic_content_parts(message: &ProviderMessage) -> Vec<Value> {
                     }
                 }));
             }
+        }
+    }
+    if message.role == ProviderMessageRole::Assistant {
+        for tool_call in &message.tool_calls {
+            parts.push(json!({
+                "type": "tool_use",
+                "id": tool_call.proposal_id.as_str(),
+                "name": tool_call.tool_name.as_str(),
+                "input": &tool_call.input_json,
+            }));
         }
     }
     parts

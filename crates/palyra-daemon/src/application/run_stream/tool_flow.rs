@@ -254,7 +254,11 @@ async fn reject_run_stream_tool_call(
     )
     .await?;
     runtime_state.record_tool_attestation_emitted();
-    Ok(RunStreamToolExecutionOutcome::Completed)
+    Ok(RunStreamToolExecutionOutcome::Completed {
+        proposal_id: proposal_id.to_owned(),
+        tool_name: tool_name.to_owned(),
+        outcome: execution_outcome,
+    })
 }
 
 #[allow(clippy::result_large_err)]
@@ -742,7 +746,11 @@ async fn execute_run_stream_tool_proposal(
         "run_stream_tool_result",
     )
     .await;
-    Ok(RunStreamToolExecutionOutcome::Completed)
+    Ok(RunStreamToolExecutionOutcome::Completed {
+        proposal_id: proposal_id.to_owned(),
+        tool_name: tool_name.to_owned(),
+        outcome: execution_outcome,
+    })
 }
 
 async fn project_tool_result_for_model(

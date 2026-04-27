@@ -137,6 +137,7 @@ pub(crate) async fn process_route_provider_response(
     let provider_output = provider_response.output.clone();
     let mut reply_text = String::new();
     let mut summary_tokens = Vec::new();
+    let mut ignored_tool_results = Vec::new();
     for event in provider_response.events {
         match process_provider_event_for_surface(
             runtime_state,
@@ -145,6 +146,7 @@ pub(crate) async fn process_route_provider_response(
             event,
             tool_catalog_snapshot,
             &mut summary_tokens,
+            &mut ignored_tool_results,
             remaining_tool_budget,
             tape_seq,
             ProviderEventSurface::RouteMessage(RouteMessageProviderEventSurface {

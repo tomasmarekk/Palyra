@@ -24,10 +24,12 @@ mod streaming;
 
 use adapters::{AnthropicCompatibleChatAdapter, OpenAiCompatibleChatAdapter, ProviderChatAdapter};
 use contract::{provider_events_from_output, provider_request_has_vision};
+#[allow(unused_imports)]
 pub use contract::{
     ProviderEvent, ProviderFinishReason, ProviderImageInput, ProviderMessage,
-    ProviderMessageContentPart, ProviderMessageRole, ProviderOutputContentPart,
-    ProviderRawProviderRefs, ProviderRequest, ProviderResponse, ProviderTurnOutput, ProviderUsage,
+    ProviderMessageContentPart, ProviderMessageRole, ProviderMessageToolCall,
+    ProviderOutputContentPart, ProviderRawProviderRefs, ProviderRequest, ProviderResponse,
+    ProviderTurnOutput, ProviderUsage,
 };
 #[allow(unused_imports)]
 pub use error_envelope::{
@@ -2131,6 +2133,11 @@ impl RegistryBackedModelProvider {
             message.role.as_openai_role().hash(&mut hasher);
             message.name.hash(&mut hasher);
             message.tool_call_id.hash(&mut hasher);
+            for tool_call in &message.tool_calls {
+                tool_call.proposal_id.hash(&mut hasher);
+                tool_call.tool_name.hash(&mut hasher);
+                tool_call.input_json.to_string().hash(&mut hasher);
+            }
             for part in &message.content {
                 match part {
                     ProviderMessageContentPart::Text { text } => text.hash(&mut hasher),
@@ -4845,10 +4852,10 @@ mod tests {
         ModelProviderRegistryConfig, OpenAiCompatibleChatAdapter, ProviderChatAdapter,
         ProviderError, ProviderEvent, ProviderFailureAction, ProviderFailureClass,
         ProviderImageInput, ProviderMessage, ProviderMessageContentPart, ProviderMessageRole,
-        ProviderMetadataSource, ProviderModelEntryConfig, ProviderModelRole,
-        ProviderOutputContentPart, ProviderRawProviderRefs, ProviderRegistryEntryConfig,
-        ProviderRequest, ProviderRetryability, ProviderStreamAccumulator, ProviderStreamEvent,
-        ProviderTurnOutput, ProviderUsage,
+        ProviderMessageToolCall, ProviderMetadataSource, ProviderModelEntryConfig,
+        ProviderModelRole, ProviderOutputContentPart, ProviderRawProviderRefs,
+        ProviderRegistryEntryConfig, ProviderRequest, ProviderRetryability,
+        ProviderStreamAccumulator, ProviderStreamEvent, ProviderTurnOutput, ProviderUsage,
     };
 
     #[test]
@@ -4952,6 +4959,7 @@ mod tests {
                     content: vec![ProviderMessageContentPart::text("You are concise.")],
                     name: None,
                     tool_call_id: None,
+                    tool_calls: Vec::new(),
                 },
                 ProviderMessage::user_text("What changed?"),
             ],
@@ -4979,6 +4987,56 @@ mod tests {
             anthropic_payload["system"].as_str().unwrap_or_default().contains("You are concise."),
             "system/developer messages should stay outside Anthropic user turns"
         );
+    }
+
+    #[test]
+    fn provider_request_adapters_serialize_tool_refeed_messages() {
+        let request = ProviderRequest {
+            input_text: "Use a tool.".to_owned(),
+            messages: vec![
+                ProviderMessage::user_text("Use a tool."),
+                ProviderMessage {
+                    role: ProviderMessageRole::Assistant,
+                    content: Vec::new(),
+                    name: None,
+                    tool_call_id: None,
+                    tool_calls: vec![ProviderMessageToolCall {
+                        proposal_id: "call_01".to_owned(),
+                        tool_name: "palyra.echo".to_owned(),
+                        input_json: serde_json::json!({"text":"hello"}),
+                    }],
+                },
+                ProviderMessage::tool_result("call_01", r#"{"echo":"hello"}"#),
+            ],
+            json_mode: false,
+            vision_inputs: Vec::new(),
+            model_override: None,
+            tool_catalog_snapshot: None,
+            instruction_hash: None,
+            context_trace_id: None,
+            budget_profile: None,
+        };
+
+        let openai_payload =
+            OpenAiCompatibleChatAdapter.request_payload(&request, "gpt-contract-test");
+        assert_eq!(openai_payload["messages"][1]["role"], "assistant");
+        assert_eq!(openai_payload["messages"][1]["content"], serde_json::Value::Null);
+        assert_eq!(openai_payload["messages"][1]["tool_calls"][0]["id"], "call_01");
+        assert_eq!(
+            openai_payload["messages"][1]["tool_calls"][0]["function"]["name"],
+            "palyra.echo"
+        );
+        assert_eq!(openai_payload["messages"][2]["role"], "tool");
+        assert_eq!(openai_payload["messages"][2]["tool_call_id"], "call_01");
+
+        let anthropic_payload =
+            AnthropicCompatibleChatAdapter.request_payload(&request, "claude-contract-test");
+        assert_eq!(anthropic_payload["messages"][1]["role"], "assistant");
+        assert_eq!(anthropic_payload["messages"][1]["content"][0]["type"], "tool_use");
+        assert_eq!(anthropic_payload["messages"][1]["content"][0]["id"], "call_01");
+        assert_eq!(anthropic_payload["messages"][2]["role"], "user");
+        assert_eq!(anthropic_payload["messages"][2]["content"][0]["type"], "tool_result");
+        assert_eq!(anthropic_payload["messages"][2]["content"][0]["tool_use_id"], "call_01");
     }
 
     #[test]

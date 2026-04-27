@@ -20,6 +20,7 @@ use crate::{
     gateway::{GatewayRuntimeState, RunStreamToolExecutionOutcome},
     model_provider::ProviderEvent,
     orchestrator::RunStateMachine,
+    tool_protocol::ToolExecutionOutcome,
     transport::grpc::{auth::RequestContext, proto::palyra::common::v1 as common_v1},
 };
 
@@ -37,8 +38,15 @@ pub(crate) enum RunStreamProviderEventOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RunStreamProviderEventsOutcome {
-    Completed { summary_tokens: Vec<String> },
+    Completed { summary_tokens: Vec<String>, tool_results: Vec<RunStreamToolResultForModel> },
     Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunStreamToolResultForModel {
+    pub(crate) proposal_id: String,
+    pub(crate) tool_name: String,
+    pub(crate) outcome: ToolExecutionOutcome,
 }
 
 pub(crate) struct RunStreamProviderEventSurface<'a> {
@@ -121,6 +129,7 @@ pub(crate) async fn process_provider_event_for_surface(
     provider_event: ProviderEvent,
     tool_catalog_snapshot: &ModelVisibleToolCatalogSnapshot,
     summary_tokens: &mut Vec<String>,
+    tool_results: &mut Vec<RunStreamToolResultForModel>,
     remaining_tool_budget: &mut u32,
     tape_seq: &mut i64,
     surface: ProviderEventSurface<'_>,
@@ -170,7 +179,16 @@ pub(crate) async fn process_provider_event_for_surface(
                 )
                 .await?
                 {
-                    RunStreamToolExecutionOutcome::Completed => {
+                    RunStreamToolExecutionOutcome::Completed {
+                        proposal_id,
+                        tool_name,
+                        outcome,
+                    } => {
+                        tool_results.push(RunStreamToolResultForModel {
+                            proposal_id,
+                            tool_name,
+                            outcome,
+                        });
                         Ok(RunStreamProviderEventOutcome::Continue)
                     }
                     RunStreamToolExecutionOutcome::Cancelled => {
@@ -221,6 +239,7 @@ pub(crate) async fn process_run_stream_provider_events(
     model_token_compaction_emitted: &mut bool,
 ) -> Result<RunStreamProviderEventsOutcome, Status> {
     let mut summary_tokens = Vec::new();
+    let mut tool_results = Vec::new();
     for provider_event in provider_events {
         match gate_run_stream_provider_event_on_cancellation(
             sender,
@@ -251,6 +270,7 @@ pub(crate) async fn process_run_stream_provider_events(
             provider_event,
             tool_catalog_snapshot,
             &mut summary_tokens,
+            &mut tool_results,
             remaining_tool_budget,
             tape_seq,
             model_token_tape_events,
@@ -265,7 +285,7 @@ pub(crate) async fn process_run_stream_provider_events(
         }
     }
 
-    Ok(RunStreamProviderEventsOutcome::Completed { summary_tokens })
+    Ok(RunStreamProviderEventsOutcome::Completed { summary_tokens, tool_results })
 }
 
 #[allow(clippy::result_large_err)]
@@ -282,6 +302,7 @@ async fn process_run_stream_provider_event(
     provider_event: ProviderEvent,
     tool_catalog_snapshot: &ModelVisibleToolCatalogSnapshot,
     summary_tokens: &mut Vec<String>,
+    tool_results: &mut Vec<RunStreamToolResultForModel>,
     remaining_tool_budget: &mut u32,
     tape_seq: &mut i64,
     model_token_tape_events: &mut usize,
@@ -294,6 +315,7 @@ async fn process_run_stream_provider_event(
         provider_event,
         tool_catalog_snapshot,
         summary_tokens,
+        tool_results,
         remaining_tool_budget,
         tape_seq,
         ProviderEventSurface::RunStream(RunStreamProviderEventSurface {
