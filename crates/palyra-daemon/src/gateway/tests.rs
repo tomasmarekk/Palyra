@@ -3460,7 +3460,7 @@ async fn memory_recall_tool_rejects_out_of_range_prompt_budget() {
 async fn memory_retain_tool_updates_exact_duplicate_instead_of_writing_twice() {
     let state = build_test_runtime_state(false);
     let context = routines_tool_test_context();
-    let input_json = br#"{"content_text":"Rollback checklist stays in the release runbook","tags":["runbook"],"confidence":0.82}"#;
+    let input_json = br#"{"content_text":"Release notes live in the shared project archive","tags":["release-notes"],"confidence":0.82}"#;
     let first =
         execute_memory_retain_tool(&state, context, "01ARZ3NDEKTSV4RRFFQ69G5FC1", input_json).await;
     assert!(first.success, "first retain should succeed: {}", first.error);
