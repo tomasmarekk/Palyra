@@ -109,6 +109,7 @@ pub fn estimate_token_count(input: &str) -> u64 {
 }
 
 #[must_use]
+#[cfg(test)]
 pub fn split_model_tokens(input: &str, max_tokens: usize) -> Vec<String> {
     if max_tokens == 0 || input.trim().is_empty() {
         return Vec::new();

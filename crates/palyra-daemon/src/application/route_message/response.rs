@@ -10,7 +10,8 @@ use crate::{
         RunStreamProviderEventOutcome,
     },
     gateway::GatewayRuntimeState,
-    model_provider::ProviderResponse,
+    journal::OrchestratorTapeAppendRequest,
+    model_provider::{ProviderResponse, ProviderTurnOutput},
     transport::grpc::{
         auth::RequestContext,
         proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1},
@@ -131,6 +132,7 @@ pub(crate) async fn process_route_provider_response(
     remaining_tool_budget: &mut u32,
     tape_seq: &mut i64,
 ) -> Result<RouteProviderResponseOutcome, Status> {
+    let provider_output = provider_response.output.clone();
     let mut reply_text = String::new();
     let mut summary_tokens = Vec::new();
     for event in provider_response.events {
@@ -157,6 +159,14 @@ pub(crate) async fn process_route_provider_response(
             }
         }
     }
+    persist_route_provider_turn_output(runtime_state, run_id, tape_seq, &provider_output).await?;
+    if !provider_output.full_text.trim().is_empty() {
+        if reply_text.trim().is_empty() {
+            reply_text = provider_output.full_text.clone();
+        } else {
+            reply_text = format!("{}\n{}", provider_output.full_text, reply_text);
+        }
+    }
     if reply_text.trim().is_empty() && !summary_tokens.is_empty() {
         reply_text = summary_tokens.concat();
     }
@@ -175,6 +185,30 @@ pub(crate) async fn process_route_provider_response(
         prompt_tokens: provider_response.prompt_tokens,
         completion_tokens: provider_response.completion_tokens,
     })
+}
+
+#[allow(clippy::result_large_err)]
+async fn persist_route_provider_turn_output(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    output: &ProviderTurnOutput,
+) -> Result<(), Status> {
+    let payload_json = serde_json::to_string(output).map_err(|error| {
+        Status::internal(format!("failed to serialize provider turn output: {error}"))
+    })?;
+    let payload_json =
+        crate::journal::redact_payload_json(payload_json.as_bytes()).unwrap_or(payload_json);
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: "provider_turn_output".to_owned(),
+            payload_json,
+        })
+        .await?;
+    *tape_seq += 1;
+    Ok(())
 }
 
 fn split_route_message_reply_text(reply_text: &str, max_bytes: usize) -> Vec<String> {

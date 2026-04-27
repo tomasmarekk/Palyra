@@ -144,9 +144,7 @@ pub(crate) async fn process_provider_event_for_surface(
                     )
                     .await?;
                 }
-                ProviderEventSurface::RouteMessage(context) => {
-                    context.reply_text.push_str(token.as_str());
-                }
+                ProviderEventSurface::RouteMessage(_) => {}
             }
             Ok(RunStreamProviderEventOutcome::Continue)
         }

@@ -26,7 +26,7 @@ use crate::{
         OrchestratorRunStartRequest, OrchestratorSessionResolveRequest,
         OrchestratorTapeAppendRequest, OrchestratorUsageDelta,
     },
-    model_provider::{ProviderRequest, ProviderResponse},
+    model_provider::{ProviderRequest, ProviderResponse, ProviderTurnOutput},
     orchestrator::{is_cancel_command, RunLifecycleState, RunStateMachine, RunTransition},
     provider_leases::ProviderLeaseExecutionContext,
     self_healing::{WorkHeartbeatKind, WorkHeartbeatUpdate},
@@ -48,7 +48,7 @@ pub(crate) enum RunStreamPostProviderOutcome {
 
 #[derive(Debug, Clone)]
 pub(crate) enum RunStreamProviderRequestOutcome {
-    Completed(ProviderResponse),
+    Completed(Box<ProviderResponse>),
     Cancelled,
 }
 
@@ -166,7 +166,9 @@ async fn execute_run_stream_provider_request(
     loop {
         tokio::select! {
             provider_result = &mut provider_future => {
-                return provider_result.map(RunStreamProviderRequestOutcome::Completed);
+                return provider_result
+                    .map(Box::new)
+                    .map(RunStreamProviderRequestOutcome::Completed);
             }
             _ = cancel_poll.tick() => {
                 match runtime_state.is_orchestrator_cancel_requested(run_id.to_owned()).await {
@@ -448,12 +450,12 @@ pub(crate) async fn process_run_stream_message(
         runtime_state,
         run_state,
         run_id.as_str(),
-        ProviderRequest {
-            input_text: prepared_provider_input.provider_input_text,
-            json_mode: json_mode_requested,
-            vision_inputs: prepared_provider_input.vision_inputs,
-            model_override: provider_model_override,
-        },
+        ProviderRequest::from_input_text(
+            prepared_provider_input.provider_input_text,
+            json_mode_requested,
+            prepared_provider_input.vision_inputs,
+            provider_model_override,
+        ),
         ProviderLeaseExecutionContext {
             provider_id: lease_provider_id,
             credential_id: lease_credential_id,
@@ -467,7 +469,7 @@ pub(crate) async fn process_run_stream_message(
     )
     .await?
     {
-        RunStreamProviderRequestOutcome::Completed(response) => response,
+        RunStreamProviderRequestOutcome::Completed(response) => *response,
         RunStreamProviderRequestOutcome::Cancelled => {
             return Ok(RunStreamMessageProcessingOutcome::Terminate);
         }
@@ -518,6 +520,7 @@ async fn process_run_stream_provider_response(
     model_token_tape_events: &mut usize,
     model_token_compaction_emitted: &mut bool,
 ) -> Result<RunStreamProviderResponseOutcome, Status> {
+    let provider_output = provider_response.output.clone();
     runtime_state
         .add_orchestrator_usage(OrchestratorUsageDelta {
             run_id: run_id.to_owned(),
@@ -548,7 +551,13 @@ async fn process_run_stream_provider_response(
             return Ok(RunStreamProviderResponseOutcome::Cancelled);
         }
     };
-    let reply_text = summary_tokens.concat();
+    persist_run_stream_provider_turn_output(runtime_state, run_id, tape_seq, &provider_output)
+        .await?;
+    let reply_text = if provider_output.full_text.trim().is_empty() {
+        summary_tokens.concat()
+    } else {
+        provider_output.full_text.clone()
+    };
 
     if provider_response.completion_tokens > 0 {
         runtime_state
@@ -646,5 +655,29 @@ async fn persist_run_stream_reply_text(
     )
     .await;
 
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+async fn persist_run_stream_provider_turn_output(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    output: &ProviderTurnOutput,
+) -> Result<(), Status> {
+    let payload_json = serde_json::to_string(output).map_err(|error| {
+        Status::internal(format!("failed to serialize provider turn output: {error}"))
+    })?;
+    let payload_json =
+        crate::journal::redact_payload_json(payload_json.as_bytes()).unwrap_or(payload_json);
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: "provider_turn_output".to_owned(),
+            payload_json,
+        })
+        .await?;
+    *tape_seq += 1;
     Ok(())
 }

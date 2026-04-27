@@ -288,13 +288,13 @@ pub(crate) async fn handle_routed_route_message(
 
     let provider_response = runtime_state
         .execute_model_provider_with_lease(
-            ProviderRequest {
-                input_text: prepared_provider_input.provider_input_text,
-                json_mode: json_mode_requested,
-                vision_inputs: prepared_provider_input.vision_inputs,
-                model_override: (routing_decision.mode == "enforced")
+            ProviderRequest::from_input_text(
+                prepared_provider_input.provider_input_text,
+                json_mode_requested,
+                prepared_provider_input.vision_inputs,
+                (routing_decision.mode == "enforced")
                     .then(|| routing_decision.actual_model_id.clone()),
-            },
+            ),
             ProviderLeaseExecutionContext {
                 provider_id: routing_decision.provider_id.clone(),
                 credential_id: routing_decision.credential_id.clone(),

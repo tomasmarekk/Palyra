@@ -15,7 +15,27 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use ulid::Ulid;
 
-use crate::orchestrator::{estimate_token_count, split_model_tokens, MAX_MODEL_TOKENS_PER_EVENT};
+use crate::orchestrator::estimate_token_count;
+
+mod adapters;
+mod contract;
+mod error_envelope;
+mod streaming;
+
+use adapters::{AnthropicCompatibleChatAdapter, OpenAiCompatibleChatAdapter, ProviderChatAdapter};
+use contract::{provider_events_from_output, provider_request_has_vision};
+pub use contract::{
+    ProviderEvent, ProviderFinishReason, ProviderImageInput, ProviderMessage,
+    ProviderMessageContentPart, ProviderMessageRole, ProviderOutputContentPart,
+    ProviderRawProviderRefs, ProviderRequest, ProviderResponse, ProviderTurnOutput, ProviderUsage,
+};
+#[allow(unused_imports)]
+pub use error_envelope::{
+    ProviderErrorEnvelope, ProviderErrorKind, ProviderErrorSeverity, ProviderRetryability,
+};
+use streaming::provider_output_from_text_and_tools;
+#[allow(unused_imports)]
+pub use streaming::{ProviderStreamAccumulator, ProviderStreamEvent};
 
 const OPENAI_CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 const OPENAI_EMBEDDINGS_PATH: &str = "/embeddings";
@@ -204,32 +224,6 @@ impl Default for ModelProviderRegistryConfig {
             health_ttl_ms: DEFAULT_PROVIDER_HEALTH_TTL_MS,
         }
     }
-}
-
-fn provider_request_has_vision(request: &ProviderRequest) -> bool {
-    !request.vision_inputs.is_empty()
-}
-
-fn build_openai_chat_content(request: &ProviderRequest) -> Value {
-    if request.vision_inputs.is_empty() {
-        return Value::String(request.input_text.clone());
-    }
-
-    let mut parts = Vec::with_capacity(request.vision_inputs.len().saturating_add(1));
-    parts.push(json!({
-        "type": "text",
-        "text": request.input_text,
-    }));
-    for image in &request.vision_inputs {
-        parts.push(json!({
-            "type": "image_url",
-            "image_url": {
-                "url": format!("data:{};base64,{}", image.mime_type, image.bytes_base64),
-                "detail": "low",
-            }
-        }));
-    }
-    Value::Array(parts)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1012,43 +1006,6 @@ fn credential_availability_state(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderImageInput {
-    pub mime_type: String,
-    pub bytes_base64: String,
-    pub file_name: Option<String>,
-    pub width_px: Option<u32>,
-    pub height_px: Option<u32>,
-    pub artifact_id: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderRequest {
-    pub input_text: String,
-    pub json_mode: bool,
-    pub vision_inputs: Vec<ProviderImageInput>,
-    pub model_override: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProviderEvent {
-    ModelToken { token: String, is_final: bool },
-    ToolProposal { proposal_id: String, tool_name: String, input_json: Vec<u8> },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderResponse {
-    pub events: Vec<ProviderEvent>,
-    pub prompt_tokens: u64,
-    pub completion_tokens: u64,
-    pub retry_count: u32,
-    pub provider_id: String,
-    pub model_id: String,
-    pub served_from_cache: bool,
-    pub failover_count: u32,
-    pub attempts: Vec<ProviderAttemptSummary>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderAttemptSummary {
     pub provider_id: String,
@@ -1056,6 +1013,8 @@ pub struct ProviderAttemptSummary {
     pub outcome: String,
     pub retryable: bool,
     pub served_from_cache: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1224,6 +1183,11 @@ impl ProviderError {
             _ => self.classification().snapshot(message),
         }
     }
+
+    #[must_use]
+    pub fn envelope(&self) -> ProviderErrorEnvelope {
+        ProviderErrorEnvelope::from_error(self)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1386,7 +1350,7 @@ impl ProviderFailureClassification {
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderFailureSnapshot {
     pub class: String,
     pub recommended_action: String,
@@ -2162,6 +2126,31 @@ impl RegistryBackedModelProvider {
         model.model_id.hash(&mut hasher);
         request.input_text.hash(&mut hasher);
         request.json_mode.hash(&mut hasher);
+        request.model_override.hash(&mut hasher);
+        for message in &request.messages {
+            message.role.as_openai_role().hash(&mut hasher);
+            message.name.hash(&mut hasher);
+            message.tool_call_id.hash(&mut hasher);
+            for part in &message.content {
+                match part {
+                    ProviderMessageContentPart::Text { text } => text.hash(&mut hasher),
+                    ProviderMessageContentPart::Image { image } => {
+                        image.mime_type.hash(&mut hasher);
+                        image.bytes_base64.hash(&mut hasher);
+                        image.file_name.hash(&mut hasher);
+                        image.width_px.hash(&mut hasher);
+                        image.height_px.hash(&mut hasher);
+                        image.artifact_id.hash(&mut hasher);
+                    }
+                }
+            }
+        }
+        if let Some(tool_catalog_snapshot) = &request.tool_catalog_snapshot {
+            tool_catalog_snapshot.to_string().hash(&mut hasher);
+        }
+        request.instruction_hash.hash(&mut hasher);
+        request.context_trace_id.hash(&mut hasher);
+        request.budget_profile.hash(&mut hasher);
         for image in &request.vision_inputs {
             image.mime_type.hash(&mut hasher);
             image.bytes_base64.hash(&mut hasher);
@@ -2207,6 +2196,7 @@ impl RegistryBackedModelProvider {
             outcome: "cache_hit".to_owned(),
             retryable: false,
             served_from_cache: true,
+            reason_code: Some("response_cache_hit".to_owned()),
         }];
         Some(response)
     }
@@ -2352,6 +2342,7 @@ impl ModelProvider for RegistryBackedModelProvider {
                             },
                             retryable: false,
                             served_from_cache: false,
+                            reason_code: (index > 0).then(|| "failover_success".to_owned()),
                         });
                         response.attempts = attempts;
                         self.insert_cached_response(cache_key, &response);
@@ -2379,6 +2370,9 @@ impl ModelProvider for RegistryBackedModelProvider {
                             outcome: "error".to_owned(),
                             retryable,
                             served_from_cache: false,
+                            reason_code: Some(error.envelope().provider_trace_ref.unwrap_or_else(
+                                || error.classification().class.as_str().to_owned(),
+                            )),
                         });
                         last_error = Some(error);
                         if index + 1 < candidates.len() {
@@ -2876,22 +2870,25 @@ impl ModelProvider for DeterministicProvider {
                 request.input_text.clone()
             };
 
-            let mut tokens =
-                split_model_tokens(completion_source.as_str(), MAX_MODEL_TOKENS_PER_EVENT);
-            if tokens.is_empty() {
-                tokens.push("ack".to_owned());
-            }
-            let token_count = tokens.len();
-            let events = tokens
-                .into_iter()
-                .enumerate()
-                .map(|(index, token)| ProviderEvent::ModelToken {
-                    token,
-                    is_final: index + 1 == token_count,
-                })
-                .collect::<Vec<_>>();
             let prompt_tokens = estimate_token_count(request.input_text.as_str());
-            let completion_tokens = token_count as u64;
+            let completion_tokens = estimate_token_count(completion_source.as_str()).max(1);
+            let output = ProviderTurnOutput::text(
+                if completion_source.trim().is_empty() {
+                    "ack".to_owned()
+                } else {
+                    completion_source
+                },
+                ProviderFinishReason::Stop,
+                ProviderUsage::new(prompt_tokens, completion_tokens, "estimated"),
+                ProviderRawProviderRefs {
+                    provider_response_id: None,
+                    provider_model_id: request.model_override.clone(),
+                    system_fingerprint: None,
+                    provider_trace_ref: Some("deterministic".to_owned()),
+                    stream_spill_ref: None,
+                },
+            );
+            let events = provider_events_from_output(&output);
             let actual_model_id =
                 request.model_override.clone().unwrap_or_else(|| "deterministic".to_owned());
             self.record_runtime_metrics(
@@ -2903,6 +2900,7 @@ impl ModelProvider for DeterministicProvider {
                 None,
             );
             Ok(ProviderResponse {
+                output,
                 events,
                 prompt_tokens,
                 completion_tokens,
@@ -2917,6 +2915,7 @@ impl ModelProvider for DeterministicProvider {
                     outcome: "success".to_owned(),
                     retryable: false,
                     served_from_cache: false,
+                    reason_code: None,
                 }],
             })
         })
@@ -3108,12 +3107,22 @@ impl AttemptError {
 
 #[derive(Debug, Deserialize)]
 struct OpenAiChatCompletionResponse {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    system_fingerprint: Option<String>,
+    #[serde(default)]
+    usage: Option<OpenAiUsage>,
     choices: Vec<OpenAiChatChoice>,
 }
 
 #[derive(Debug, Deserialize)]
 struct OpenAiChatChoice {
     message: OpenAiChatMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3127,6 +3136,8 @@ struct OpenAiChatMessage {
 #[derive(Debug, Deserialize)]
 struct OpenAiToolCall {
     #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
     function: Option<OpenAiToolFunction>,
 }
 
@@ -3135,6 +3146,16 @@ struct OpenAiToolFunction {
     name: String,
     #[serde(default)]
     arguments: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+    #[serde(default)]
+    total_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3178,9 +3199,23 @@ struct OpenAiAudioTranscriptionSegment {
 #[derive(Debug, Deserialize)]
 struct AnthropicMessagesResponse {
     #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
     content: Vec<AnthropicContentBlock>,
     #[serde(default)]
     stop_reason: Option<String>,
+    #[serde(default)]
+    usage: Option<AnthropicUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3535,17 +3570,10 @@ impl OpenAiCompatibleProvider {
         api_key: &str,
         request: &ProviderRequest,
     ) -> Result<ProviderResponse, AttemptError> {
-        let mut body = json!({
-            "model": request
-                .model_override
-                .clone()
-                .unwrap_or_else(|| self.config.openai_model.clone()),
-            "messages": [{"role":"user","content": build_openai_chat_content(request)}],
-            "stream": false,
-        });
-        if request.json_mode {
-            body["response_format"] = json!({"type":"json_object"});
-        }
+        let actual_model_id =
+            request.model_override.clone().unwrap_or_else(|| self.config.openai_model.clone());
+        let adapter = OpenAiCompatibleChatAdapter;
+        let body = adapter.request_payload(request, actual_model_id.as_str());
 
         let endpoint = self.chat_completions_endpoint();
         let response = self
@@ -3591,6 +3619,19 @@ impl OpenAiCompatibleProvider {
                 "openai_compatible_chat_response_json",
             )
         })?;
+        let provider_response_id = parsed.id.clone();
+        let provider_model_id = parsed.model.clone();
+        let system_fingerprint = parsed.system_fingerprint.clone();
+        let provider_usage = parsed.usage.as_ref().map(|usage| ProviderUsage {
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            total_tokens: if usage.total_tokens == 0 {
+                usage.prompt_tokens.saturating_add(usage.completion_tokens)
+            } else {
+                usage.total_tokens
+            },
+            source: "provider".to_owned(),
+        });
         let choice = parsed.choices.into_iter().next().ok_or_else(|| {
             AttemptError::invalid_response(
                 "openai-compatible response did not include choices".to_owned(),
@@ -3598,7 +3639,7 @@ impl OpenAiCompatibleProvider {
             )
         })?;
 
-        let mut events = Vec::new();
+        let mut tool_events = Vec::new();
         for tool_call in choice.message.tool_calls {
             let Some(function) = tool_call.function else {
                 continue;
@@ -3613,31 +3654,46 @@ impl OpenAiCompatibleProvider {
                         "openai_compatible_chat_tool_arguments",
                     )
                 })?;
-            events.push(ProviderEvent::ToolProposal {
-                proposal_id: Ulid::new().to_string(),
+            tool_events.push(ProviderEvent::ToolProposal {
+                proposal_id: tool_call.id.unwrap_or_else(|| Ulid::new().to_string()),
                 tool_name: function.name,
                 input_json,
             });
         }
 
         let completion_text = extract_completion_text(choice.message.content);
-        let mut completion_tokens = 0_u64;
-        let mut tokens = split_model_tokens(completion_text.as_str(), MAX_MODEL_TOKENS_PER_EVENT);
-        if tokens.is_empty() && events.is_empty() {
-            tokens.push("ack".to_owned());
-        }
-        let token_count = tokens.len();
-        completion_tokens += token_count as u64;
-        for (index, token) in tokens.into_iter().enumerate() {
-            events.push(ProviderEvent::ModelToken { token, is_final: index + 1 == token_count });
-        }
-        let actual_model_id =
-            request.model_override.clone().unwrap_or_else(|| self.config.openai_model.clone());
+        let full_text = if completion_text.trim().is_empty() && tool_events.is_empty() {
+            "ack".to_owned()
+        } else {
+            completion_text
+        };
+        let usage = provider_usage.unwrap_or_else(|| {
+            ProviderUsage::new(
+                estimate_token_count(request.input_text.as_str()),
+                estimate_token_count(full_text.as_str()),
+                "estimated",
+            )
+        });
+        let output = provider_output_from_text_and_tools(
+            full_text,
+            tool_events,
+            ProviderFinishReason::from_openai(choice.finish_reason.as_deref()),
+            usage,
+            ProviderRawProviderRefs {
+                provider_response_id,
+                provider_model_id,
+                system_fingerprint,
+                provider_trace_ref: Some("openai_compatible_chat".to_owned()),
+                stream_spill_ref: None,
+            },
+        );
+        let events = provider_events_from_output(&output);
 
         Ok(ProviderResponse {
+            prompt_tokens: output.usage.prompt_tokens,
+            completion_tokens: output.usage.completion_tokens,
+            output,
             events,
-            prompt_tokens: estimate_token_count(request.input_text.as_str()),
-            completion_tokens,
             retry_count: 0,
             provider_id: "openai-primary".to_owned(),
             model_id: actual_model_id.clone(),
@@ -3649,6 +3705,7 @@ impl OpenAiCompatibleProvider {
                 outcome: "success".to_owned(),
                 retryable: false,
                 served_from_cache: false,
+                reason_code: None,
             }],
         })
     }
@@ -4108,31 +4165,8 @@ impl AnthropicProvider {
     ) -> Result<ProviderResponse, AttemptError> {
         let model_name =
             request.model_override.clone().unwrap_or_else(|| self.config.anthropic_model.clone());
-        let mut content = vec![json!({
-            "type": "text",
-            "text": request.input_text,
-        })];
-        for image in &request.vision_inputs {
-            content.push(json!({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": image.mime_type,
-                    "data": image.bytes_base64,
-                }
-            }));
-        }
-        let mut body = json!({
-            "model": model_name,
-            "max_tokens": 2048,
-            "messages": [{
-                "role": "user",
-                "content": content,
-            }],
-        });
-        if request.json_mode {
-            body["system"] = json!("Return valid JSON only.");
-        }
+        let adapter = AnthropicCompatibleChatAdapter;
+        let body = adapter.request_payload(request, model_name.as_str());
 
         let request_builder = self
             .client
@@ -4180,7 +4214,14 @@ impl AnthropicProvider {
                 "anthropic_chat_response_json",
             )
         })?;
-        let mut events = Vec::new();
+        let provider_response_id = parsed.id.clone();
+        let provider_model_id = parsed.model.clone();
+        let provider_usage = parsed
+            .usage
+            .as_ref()
+            .map(|usage| ProviderUsage::new(usage.input_tokens, usage.output_tokens, "provider"));
+        let finish_reason = ProviderFinishReason::from_anthropic(parsed.stop_reason.as_deref());
+        let mut tool_events = Vec::new();
         let mut completion_fragments = Vec::new();
         for block in parsed.content {
             match block.kind.as_str() {
@@ -4202,7 +4243,7 @@ impl AnthropicProvider {
                             "anthropic_chat_tool_payload",
                         )
                     })?;
-                    events.push(ProviderEvent::ToolProposal {
+                    tool_events.push(ProviderEvent::ToolProposal {
                         proposal_id: block.id.unwrap_or_else(|| Ulid::new().to_string()),
                         tool_name,
                         input_json,
@@ -4213,34 +4254,50 @@ impl AnthropicProvider {
         }
 
         let completion_text = completion_fragments.join("\n");
-        let mut completion_tokens = 0_u64;
-        let mut tokens = split_model_tokens(completion_text.as_str(), MAX_MODEL_TOKENS_PER_EVENT);
-        if tokens.is_empty() && events.is_empty() {
-            tokens.push(parsed.stop_reason.unwrap_or_else(|| "ack".to_owned()));
-        }
-        let token_count = tokens.len();
-        completion_tokens += token_count as u64;
-        for (index, token) in tokens.into_iter().enumerate() {
-            events.push(ProviderEvent::ModelToken { token, is_final: index + 1 == token_count });
-        }
-        let actual_model_id =
-            request.model_override.clone().unwrap_or_else(|| self.config.anthropic_model.clone());
+        let full_text = if completion_text.trim().is_empty() && tool_events.is_empty() {
+            "ack".to_owned()
+        } else {
+            completion_text
+        };
+        let usage = provider_usage.unwrap_or_else(|| {
+            ProviderUsage::new(
+                estimate_token_count(request.input_text.as_str()),
+                estimate_token_count(full_text.as_str()),
+                "estimated",
+            )
+        });
+        let output = provider_output_from_text_and_tools(
+            full_text,
+            tool_events,
+            finish_reason,
+            usage,
+            ProviderRawProviderRefs {
+                provider_response_id,
+                provider_model_id,
+                system_fingerprint: None,
+                provider_trace_ref: Some("anthropic_chat".to_owned()),
+                stream_spill_ref: None,
+            },
+        );
+        let events = provider_events_from_output(&output);
 
         Ok(ProviderResponse {
+            prompt_tokens: output.usage.prompt_tokens,
+            completion_tokens: output.usage.completion_tokens,
+            output,
             events,
-            prompt_tokens: estimate_token_count(request.input_text.as_str()),
-            completion_tokens,
             retry_count: 0,
             provider_id: "anthropic-primary".to_owned(),
-            model_id: actual_model_id.clone(),
+            model_id: model_name.clone(),
             served_from_cache: false,
             failover_count: 0,
             attempts: vec![ProviderAttemptSummary {
                 provider_id: "anthropic-primary".to_owned(),
-                model_id: actual_model_id,
+                model_id: model_name,
                 outcome: "success".to_owned(),
                 retryable: false,
                 served_from_cache: false,
+                reason_code: None,
             }],
         })
     }
@@ -4783,11 +4840,15 @@ mod tests {
         build_embeddings_provider, build_model_provider, capability_defaults_for_kind,
         classify_http_provider_failure, classify_transport_provider_failure,
         extract_completion_text, normalize_tool_arguments, sanitize_remote_error,
-        validate_openai_base_url_network_policy_with_resolver, EmbeddingsRequest,
-        ModelProviderAuthProviderKind, ModelProviderConfig, ModelProviderKind,
-        ModelProviderRegistryConfig, ProviderError, ProviderEvent, ProviderFailureAction,
-        ProviderFailureClass, ProviderImageInput, ProviderMetadataSource, ProviderModelEntryConfig,
-        ProviderModelRole, ProviderRegistryEntryConfig, ProviderRequest,
+        validate_openai_base_url_network_policy_with_resolver, AnthropicCompatibleChatAdapter,
+        EmbeddingsRequest, ModelProviderAuthProviderKind, ModelProviderConfig, ModelProviderKind,
+        ModelProviderRegistryConfig, OpenAiCompatibleChatAdapter, ProviderChatAdapter,
+        ProviderError, ProviderEvent, ProviderFailureAction, ProviderFailureClass,
+        ProviderImageInput, ProviderMessage, ProviderMessageContentPart, ProviderMessageRole,
+        ProviderMetadataSource, ProviderModelEntryConfig, ProviderModelRole,
+        ProviderOutputContentPart, ProviderRawProviderRefs, ProviderRegistryEntryConfig,
+        ProviderRequest, ProviderRetryability, ProviderStreamAccumulator, ProviderStreamEvent,
+        ProviderTurnOutput, ProviderUsage,
     };
 
     #[test]
@@ -4853,6 +4914,145 @@ mod tests {
         assert_eq!(snapshot.recovery.category, "transient");
         assert_eq!(snapshot.recovery.action, "retry_after");
         assert_eq!(snapshot.recovery.retry_after_ms, Some(1_250));
+    }
+
+    #[test]
+    fn provider_error_envelope_is_stable_and_redacted() {
+        let error = ProviderError::RequestFailed {
+            message: "Bearer secret-token rate limit exceeded".to_owned(),
+            retryable: true,
+            retry_count: 1,
+            classification: classify_http_provider_failure(
+                429,
+                true,
+                "openai_compatible_chat_http",
+                "rate limit exceeded",
+            ),
+        };
+
+        let envelope = error.envelope();
+
+        assert_eq!(envelope.kind, super::ProviderErrorKind::RateLimit);
+        assert_eq!(envelope.retryability, ProviderRetryability::RetryAfter);
+        assert!(envelope.failover_eligible);
+        assert!(
+            !envelope.redacted_message.contains("secret-token"),
+            "provider error envelope must not leak bearer token material"
+        );
+        assert_eq!(envelope.provider_trace_ref.as_deref(), Some("openai_compatible_chat_http"));
+    }
+
+    #[test]
+    fn provider_request_adapters_serialize_message_contracts() {
+        let request = ProviderRequest {
+            input_text: "What changed?".to_owned(),
+            messages: vec![
+                ProviderMessage {
+                    role: ProviderMessageRole::System,
+                    content: vec![ProviderMessageContentPart::text("You are concise.")],
+                    name: None,
+                    tool_call_id: None,
+                },
+                ProviderMessage::user_text("What changed?"),
+            ],
+            json_mode: true,
+            vision_inputs: Vec::new(),
+            model_override: None,
+            tool_catalog_snapshot: Some(serde_json::json!({"tools":["palyra.echo"]})),
+            instruction_hash: Some("instruction-sha256".to_owned()),
+            context_trace_id: Some("ctx-01".to_owned()),
+            budget_profile: Some("interactive-default".to_owned()),
+        };
+
+        let openai_payload =
+            OpenAiCompatibleChatAdapter.request_payload(&request, "gpt-contract-test");
+        assert_eq!(openai_payload["model"], "gpt-contract-test");
+        assert_eq!(openai_payload["messages"][0]["role"], "system");
+        assert_eq!(openai_payload["messages"][1]["role"], "user");
+        assert_eq!(openai_payload["response_format"]["type"], "json_object");
+
+        let anthropic_payload =
+            AnthropicCompatibleChatAdapter.request_payload(&request, "claude-contract-test");
+        assert_eq!(anthropic_payload["model"], "claude-contract-test");
+        assert_eq!(anthropic_payload["messages"][0]["role"], "user");
+        assert!(
+            anthropic_payload["system"].as_str().unwrap_or_default().contains("You are concise."),
+            "system/developer messages should stay outside Anthropic user turns"
+        );
+    }
+
+    #[test]
+    fn scripted_provider_stream_harness_accumulates_full_output_usage_and_tools() {
+        let mut harness =
+            ProviderStreamAccumulator::with_buffer_cap("fake-provider", "fake-model", 8);
+        harness.apply(ProviderStreamEvent::Started {
+            provider_id: "fake-provider".to_owned(),
+            model_id: "fake-model".to_owned(),
+        });
+        harness.apply(ProviderStreamEvent::Delta { text: "alpha ".to_owned() });
+        harness.apply(ProviderStreamEvent::Delta { text: "beta gamma".to_owned() });
+        harness.apply(ProviderStreamEvent::ToolDelta {
+            proposal_id: "tool-01".to_owned(),
+            tool_name: "palyra.echo".to_owned(),
+            input_json: serde_json::json!({"text":"hello"}),
+        });
+        harness.apply(ProviderStreamEvent::UsageDelta {
+            prompt_tokens: 5,
+            completion_tokens: 3,
+            total_tokens: None,
+        });
+        harness.apply(ProviderStreamEvent::Completed {
+            finish_reason: super::ProviderFinishReason::ToolCalls,
+            raw_provider_refs: ProviderRawProviderRefs {
+                provider_response_id: Some("resp_01".to_owned()),
+                provider_model_id: Some("fake-model".to_owned()),
+                system_fingerprint: None,
+                provider_trace_ref: Some("fake_trace".to_owned()),
+                stream_spill_ref: None,
+            },
+        });
+
+        let output = harness.finalize();
+
+        assert_eq!(output.full_text, "alpha beta gamma");
+        assert_eq!(output.usage.prompt_tokens, 5);
+        assert_eq!(output.usage.completion_tokens, 3);
+        assert_eq!(output.usage.total_tokens, 8);
+        assert_eq!(output.raw_provider_refs.provider_response_id.as_deref(), Some("resp_01"));
+        assert!(
+            output.raw_provider_refs.stream_spill_ref.is_some(),
+            "large streamed output should record the spill boundary"
+        );
+        assert!(output.content_parts.iter().any(|part| {
+            matches!(
+                part,
+                ProviderOutputContentPart::ToolCall { tool_name, .. }
+                    if tool_name == "palyra.echo"
+            )
+        }));
+    }
+
+    #[test]
+    fn provider_turn_output_serializes_deterministically() {
+        let output = ProviderTurnOutput::text(
+            "complete answer".to_owned(),
+            super::ProviderFinishReason::Stop,
+            ProviderUsage::new(2, 2, "provider"),
+            ProviderRawProviderRefs {
+                provider_response_id: Some("resp_snapshot".to_owned()),
+                provider_model_id: Some("model_snapshot".to_owned()),
+                system_fingerprint: None,
+                provider_trace_ref: Some("trace_snapshot".to_owned()),
+                stream_spill_ref: None,
+            },
+        );
+
+        let serialized = serde_json::to_string(&output).expect("output should serialize");
+
+        assert_eq!(
+            serialized,
+            r#"{"full_text":"complete answer","content_parts":[{"kind":"text","text":"complete answer"}],"finish_reason":"stop","usage":{"prompt_tokens":2,"completion_tokens":2,"total_tokens":4,"source":"provider"},"raw_provider_refs":{"provider_response_id":"resp_snapshot","provider_model_id":"model_snapshot","provider_trace_ref":"trace_snapshot"},"redaction_state":{"output_redacted":false,"user_visible_projected":true,"diagnostics_redacted":true}}"#
+        );
     }
 
     fn openai_test_config(base_url: String) -> ModelProviderConfig {
@@ -4970,15 +5170,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn deterministic_provider_streams_bounded_tokens() {
+    async fn deterministic_provider_preserves_full_output_and_chunks_preview() {
         let provider = build_model_provider(&ModelProviderConfig::default())
             .expect("provider should build from defaults");
-        let request = ProviderRequest {
-            input_text: (0..64).map(|index| format!("token{index}")).collect::<Vec<_>>().join(" "),
-            json_mode: false,
-            vision_inputs: Vec::new(),
-            model_override: None,
-        };
+        let input_text = (0..64).map(|index| format!("token{index}")).collect::<Vec<_>>().join(" ");
+        let request = ProviderRequest::from_input_text(input_text.clone(), false, Vec::new(), None);
         let response =
             provider.complete(request).await.expect("deterministic provider should succeed");
         let tokens = response
@@ -4989,7 +5185,13 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(tokens.len(), 16, "deterministic provider must enforce token bound");
+        assert_eq!(response.output.full_text, input_text);
+        let reconstructed = tokens.iter().map(|token| token.as_str()).collect::<String>();
+        assert_eq!(reconstructed, input_text, "preview chunks must reconstruct full output");
+        assert!(
+            tokens.len() > 1,
+            "long deterministic output should be split into bounded preview chunks"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4997,19 +5199,19 @@ mod tests {
         let provider = build_model_provider(&ModelProviderConfig::default())
             .expect("provider should build from defaults");
         provider
-            .complete(ProviderRequest {
-                input_text: "measure deterministic metrics".to_owned(),
-                json_mode: false,
-                vision_inputs: Vec::new(),
-                model_override: None,
-            })
+            .complete(ProviderRequest::from_input_text(
+                "measure deterministic metrics".to_owned(),
+                false,
+                Vec::new(),
+                None,
+            ))
             .await
             .expect("deterministic provider should succeed");
         let failed = provider
-            .complete(ProviderRequest {
-                input_text: "vision request".to_owned(),
-                json_mode: false,
-                vision_inputs: vec![ProviderImageInput {
+            .complete(ProviderRequest::from_input_text(
+                "vision request".to_owned(),
+                false,
+                vec![ProviderImageInput {
                     mime_type: "image/png".to_owned(),
                     bytes_base64: "iVBORw0KGgo=".to_owned(),
                     file_name: Some("vision.png".to_owned()),
@@ -5017,8 +5219,8 @@ mod tests {
                     height_px: Some(1),
                     artifact_id: None,
                 }],
-                model_override: None,
-            })
+                None,
+            ))
             .await;
         assert!(matches!(failed, Err(ProviderError::VisionUnsupported { .. })));
 
@@ -5052,12 +5254,7 @@ mod tests {
         let provider = build_model_provider(&config).expect("openai provider should build");
 
         let response = provider
-            .complete(ProviderRequest {
-                input_text: "hello".to_owned(),
-                json_mode: false,
-                vision_inputs: Vec::new(),
-                model_override: None,
-            })
+            .complete(ProviderRequest::from_input_text("hello".to_owned(), false, Vec::new(), None))
             .await
             .expect("provider should succeed after retry");
         assert_eq!(response.retry_count, 1, "one retry should be recorded");
@@ -5069,9 +5266,15 @@ mod tests {
         let model_tokens = response
             .events
             .iter()
-            .filter(|event| matches!(event, ProviderEvent::ModelToken { .. }))
-            .count();
-        assert_eq!(model_tokens, 3, "response should map completion text into model tokens");
+            .filter_map(|event| match event {
+                ProviderEvent::ModelToken { token, .. } => Some(token.as_str()),
+                ProviderEvent::ToolProposal { .. } => None,
+            })
+            .collect::<String>();
+        assert_eq!(
+            model_tokens, "alpha beta gamma",
+            "response preview chunks should reconstruct completion text"
+        );
         let snapshot = provider.status_snapshot();
         assert_eq!(snapshot.runtime_metrics.request_count, 1);
         assert_eq!(snapshot.runtime_metrics.error_count, 0);
@@ -5105,12 +5308,12 @@ mod tests {
                 .expect("registry-backed provider should build");
 
         let response = provider
-            .complete(ProviderRequest {
-                input_text: "fallback please".to_owned(),
-                json_mode: false,
-                vision_inputs: Vec::new(),
-                model_override: None,
-            })
+            .complete(ProviderRequest::from_input_text(
+                "fallback please".to_owned(),
+                false,
+                Vec::new(),
+                None,
+            ))
             .await
             .expect("fallback provider should succeed");
 
@@ -5142,21 +5345,21 @@ mod tests {
         .expect("registry-backed provider should build");
 
         let first = provider
-            .complete(ProviderRequest {
-                input_text: "cache me".to_owned(),
-                json_mode: false,
-                vision_inputs: Vec::new(),
-                model_override: None,
-            })
+            .complete(ProviderRequest::from_input_text(
+                "cache me".to_owned(),
+                false,
+                Vec::new(),
+                None,
+            ))
             .await
             .expect("first upstream request should succeed");
         let second = provider
-            .complete(ProviderRequest {
-                input_text: "cache me".to_owned(),
-                json_mode: false,
-                vision_inputs: Vec::new(),
-                model_override: None,
-            })
+            .complete(ProviderRequest::from_input_text(
+                "cache me".to_owned(),
+                false,
+                Vec::new(),
+                None,
+            ))
             .await
             .expect("second request should be served from cache");
 
@@ -5200,12 +5403,7 @@ mod tests {
         let provider = build_model_provider(&config).expect("minimax provider should build");
 
         provider
-            .complete(ProviderRequest {
-                input_text: "hello".to_owned(),
-                json_mode: false,
-                vision_inputs: Vec::new(),
-                model_override: None,
-            })
+            .complete(ProviderRequest::from_input_text("hello".to_owned(), false, Vec::new(), None))
             .await
             .expect("minimax-compatible provider should succeed");
 
@@ -5393,21 +5591,16 @@ mod tests {
         let provider = build_model_provider(&config).expect("openai provider should build");
 
         let first = provider
-            .complete(ProviderRequest {
-                input_text: "hello".to_owned(),
-                json_mode: false,
-                vision_inputs: Vec::new(),
-                model_override: None,
-            })
+            .complete(ProviderRequest::from_input_text("hello".to_owned(), false, Vec::new(), None))
             .await;
         assert!(matches!(first, Err(ProviderError::RequestFailed { .. })));
         let second = provider
-            .complete(ProviderRequest {
-                input_text: "hello again".to_owned(),
-                json_mode: false,
-                vision_inputs: Vec::new(),
-                model_override: None,
-            })
+            .complete(ProviderRequest::from_input_text(
+                "hello again".to_owned(),
+                false,
+                Vec::new(),
+                None,
+            ))
             .await;
         assert!(
             matches!(second, Err(ProviderError::CircuitOpen { .. })),
@@ -5630,12 +5823,7 @@ mod tests {
             .expect("openai provider should build");
 
         let response = provider
-            .complete(ProviderRequest {
-                input_text: "hello".to_owned(),
-                json_mode: false,
-                vision_inputs: Vec::new(),
-                model_override: None,
-            })
+            .complete(ProviderRequest::from_input_text("hello".to_owned(), false, Vec::new(), None))
             .await;
 
         match response {

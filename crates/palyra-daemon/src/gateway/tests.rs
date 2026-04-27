@@ -2168,19 +2168,19 @@ async fn status_snapshot_surfaces_model_provider_runtime_aggregates() {
     let state = build_test_runtime_state(false);
 
     state
-        .execute_model_provider(ProviderRequest {
-            input_text: "status snapshot provider metrics".to_owned(),
-            json_mode: false,
-            vision_inputs: Vec::new(),
-            model_override: None,
-        })
+        .execute_model_provider(ProviderRequest::from_input_text(
+            "status snapshot provider metrics".to_owned(),
+            false,
+            Vec::new(),
+            None,
+        ))
         .await
         .expect("deterministic provider request should succeed");
     let failed = state
-        .execute_model_provider(ProviderRequest {
-            input_text: "vision unsupported path".to_owned(),
-            json_mode: false,
-            vision_inputs: vec![ProviderImageInput {
+        .execute_model_provider(ProviderRequest::from_input_text(
+            "vision unsupported path".to_owned(),
+            false,
+            vec![ProviderImageInput {
                 mime_type: "image/png".to_owned(),
                 bytes_base64: "iVBORw0KGgo=".to_owned(),
                 file_name: Some("status.png".to_owned()),
@@ -2188,8 +2188,8 @@ async fn status_snapshot_surfaces_model_provider_runtime_aggregates() {
                 height_px: Some(1),
                 artifact_id: None,
             }],
-            model_override: None,
-        })
+            None,
+        ))
         .await;
     assert!(
         failed.is_err(),

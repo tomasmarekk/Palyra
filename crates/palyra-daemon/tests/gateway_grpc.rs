@@ -4288,7 +4288,7 @@ async fn grpc_abort_run_requests_cancellation() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn grpc_gateway_run_stream_emits_at_most_sixteen_model_tokens() -> Result<()> {
+async fn grpc_gateway_run_stream_preserves_long_model_output() -> Result<()> {
     let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
@@ -4301,7 +4301,7 @@ async fn grpc_gateway_run_stream_emits_at_most_sixteen_model_tokens() -> Result<
     let long_input = (0..64).map(|index| format!("token{index}")).collect::<Vec<_>>().join(" ");
     let mut stream_request =
         tonic::Request::new(tokio_stream::iter(vec![sample_run_stream_request_with_text(
-            long_input,
+            long_input.clone(),
         )]));
     stream_request.metadata_mut().insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
     stream_request.metadata_mut().insert("x-palyra-principal", "user:ops".parse()?);
@@ -4319,13 +4319,18 @@ async fn grpc_gateway_run_stream_emits_at_most_sixteen_model_tokens() -> Result<
         }
     }
 
-    assert_eq!(model_tokens.len(), 16, "run stream should emit at most 16 model tokens");
+    let reconstructed = model_tokens.iter().map(|token| token.token.as_str()).collect::<String>();
+    assert_eq!(reconstructed, long_input, "run stream must not truncate provider output");
+    assert!(
+        model_tokens.len() > 1,
+        "long provider output should still be split into preview chunks"
+    );
     assert!(
         model_tokens.last().map(|token| token.is_final).unwrap_or(false),
         "last emitted token should be final"
     );
     assert!(
-        model_tokens.iter().take(15).all(|token| !token.is_final),
+        model_tokens.iter().take(model_tokens.len().saturating_sub(1)).all(|token| !token.is_final),
         "only the last emitted token should be marked final"
     );
     Ok(())

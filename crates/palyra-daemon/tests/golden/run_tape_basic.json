@@ -12,25 +12,20 @@
   {
     "seq": 2,
     "event_type": "model_token",
-    "payload_json": "{\"is_final\":false,\"token\":\"<redacted>\"}"
-  },
-  {
-    "seq": 3,
-    "event_type": "model_token",
-    "payload_json": "{\"is_final\":false,\"token\":\"<redacted>\"}"
-  },
-  {
-    "seq": 4,
-    "event_type": "model_token",
     "payload_json": "{\"is_final\":true,\"token\":\"<redacted>\"}"
   },
   {
-    "seq": 5,
+    "seq": 3,
+    "event_type": "provider_turn_output",
+    "payload_json": "{\"full_text\":\"alpha beta gamma\",\"content_parts\":[{\"kind\":\"text\",\"text\":\"alpha beta gamma\"}],\"finish_reason\":\"stop\",\"usage\":{\"prompt_tokens\":\"<redacted>\",\"completion_tokens\":\"<redacted>\",\"total_tokens\":\"<redacted>\",\"source\":\"estimated\"},\"raw_provider_refs\":{\"provider_model_id\":\"deterministic\",\"provider_trace_ref\":\"deterministic\"},\"redaction_state\":{\"output_redacted\":false,\"user_visible_projected\":true,\"diagnostics_redacted\":true}}"
+  },
+  {
+    "seq": 4,
     "event_type": "message.replied",
     "payload_json": "{\"reply_text\":\"alpha beta gamma\"}"
   },
   {
-    "seq": 6,
+    "seq": 5,
     "event_type": "status",
     "payload_json": "{\"kind\":\"done\",\"message\":\"completed\"}"
   }

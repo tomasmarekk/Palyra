@@ -11,7 +11,7 @@ use tonic::Status;
 
 use crate::{
     gateway::{GatewayRuntimeState, RequestContext},
-    model_provider::{ProviderEvent, ProviderImageInput, ProviderRequest, ProviderResponse},
+    model_provider::{ProviderImageInput, ProviderRequest, ProviderResponse},
     provider_leases::ProviderLeaseExecutionContext,
     usage_governance::{
         plan_usage_routing, resolve_provider_binding_for_model, RoutingDecision, RoutingTaskClass,
@@ -299,12 +299,12 @@ pub(crate) async fn execute_auxiliary_task(
         );
     match runtime_state
         .execute_model_provider_with_lease(
-            ProviderRequest {
-                input_text: input_text.to_owned(),
-                json_mode: contract.json_mode,
-                vision_inputs: request.vision_inputs.clone(),
-                model_override: provider_model_override,
-            },
+            ProviderRequest::from_input_text(
+                input_text.to_owned(),
+                contract.json_mode,
+                request.vision_inputs.clone(),
+                provider_model_override,
+            ),
             ProviderLeaseExecutionContext {
                 provider_id: lease_provider_id,
                 credential_id: lease_credential_id,
@@ -374,14 +374,7 @@ fn build_execution_result(
     routing: RoutingDecision,
     response: ProviderResponse,
 ) -> AuxiliaryExecutionResult {
-    let output_text = response
-        .events
-        .iter()
-        .filter_map(|event| match event {
-            ProviderEvent::ModelToken { token, .. } => Some(token.as_str()),
-            ProviderEvent::ToolProposal { .. } => None,
-        })
-        .collect::<String>();
+    let output_text = response.output.full_text.clone();
     AuxiliaryExecutionResult {
         task_id,
         task_type,
