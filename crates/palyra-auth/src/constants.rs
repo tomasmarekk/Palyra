@@ -1,5 +1,7 @@
 pub(crate) const REGISTRY_VERSION: u32 = 1;
 pub(crate) const REGISTRY_FILE: &str = "auth_profiles.toml";
+pub(crate) const RUNTIME_STATE_VERSION: u32 = 1;
+pub(crate) const RUNTIME_STATE_FILE: &str = "auth_profile_runtime_state.toml";
 pub(crate) const ENV_STATE_ROOT: &str = "PALYRA_STATE_ROOT";
 pub(crate) const ENV_REGISTRY_PATH: &str = "PALYRA_AUTH_PROFILES_PATH";
 pub(crate) const MAX_PROFILE_COUNT: usize = 2_048;

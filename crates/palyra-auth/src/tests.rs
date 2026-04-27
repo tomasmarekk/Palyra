@@ -1,10 +1,11 @@
 use crate::{
     compute_backoff_ms, load_secret_utf8, normalize_optional_text, normalize_token_endpoint,
     persist_secret_utf8, validate_runtime_token_endpoint_with_resolver, AuthCredential,
-    AuthProfileError, AuthProfileListFilter, AuthProfileRegistry, AuthProfileScope,
-    AuthProfileSetRequest, AuthProvider, AuthProviderKind, HttpOAuthRefreshAdapter,
-    OAuthRefreshAdapter, OAuthRefreshError, OAuthRefreshOutcomeKind, OAuthRefreshRequest,
-    OAuthRefreshResponse, OAuthRefreshState,
+    AuthCredentialType, AuthProfileEligibility, AuthProfileError, AuthProfileFailureKind,
+    AuthProfileListFilter, AuthProfileRegistry, AuthProfileScope, AuthProfileSelectionRequest,
+    AuthProfileSetRequest, AuthProvider, AuthProviderKind, AuthTokenExpiryState,
+    HttpOAuthRefreshAdapter, OAuthRefreshAdapter, OAuthRefreshError, OAuthRefreshOutcomeKind,
+    OAuthRefreshRequest, OAuthRefreshResponse, OAuthRefreshState,
 };
 use palyra_vault::Vault;
 use palyra_vault::{
@@ -972,4 +973,135 @@ fn refresh_due_profiles_marks_transport_failure_without_retry_spam() {
         1,
         "cooldown should suppress immediate repeated refresh attempts"
     );
+}
+
+#[test]
+fn runtime_state_persists_refresh_failure_without_secret_material() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let identity_root = tempdir.path().join("identity");
+    let vault_root = tempdir.path().join("vault");
+    let registry =
+        AuthProfileRegistry::open(identity_root.as_path()).expect("registry should initialize");
+    let vault = open_test_vault(vault_root.as_path(), identity_root.as_path());
+    persist_secret_utf8(&vault, "global/auth_openai_access", "access-top-secret")
+        .expect("access secret should persist");
+    persist_secret_utf8(&vault, "global/auth_openai_refresh", "refresh-top-secret")
+        .expect("refresh secret should persist");
+    persist_secret_utf8(&vault, "global/auth_openai_client_secret", "client-top-secret")
+        .expect("client secret should persist");
+    let now = 1_730_000_000_000_i64;
+
+    registry
+        .set_profile(sample_oauth_profile_request(
+            "https://example.test/token".to_owned(),
+            Some(now.saturating_sub(1_000)),
+            OAuthRefreshState::default(),
+        ))
+        .expect("profile should persist");
+    let adapter = StubRefreshAdapter {
+        response: Err(OAuthRefreshError::Transport(
+            "response contained access-top-secret refresh-top-secret".to_owned(),
+        )),
+        call_count: Arc::new(Mutex::new(0_u64)),
+    };
+    let outcome = registry
+        .refresh_oauth_profile_with_clock("openai-default", &vault, &adapter, now)
+        .expect("refresh failure should persist");
+    assert_eq!(outcome.kind, OAuthRefreshOutcomeKind::Failed);
+
+    let records = registry
+        .runtime_records_for_agent_with_clock(&vault, None, now.saturating_add(1), 15 * 60 * 1_000)
+        .expect("runtime records should load");
+    let record = records.first().expect("runtime record should exist");
+    assert_eq!(record.profile_id, "openai-default");
+    assert_eq!(record.failure_count, 1);
+    assert_eq!(record.last_failure_kind, Some(AuthProfileFailureKind::RefreshFailed));
+    assert_eq!(record.eligibility, AuthProfileEligibility::CoolingDown);
+    assert_eq!(record.token_expiry_state, AuthTokenExpiryState::Expired);
+    assert!(record.cooldown_until_unix_ms.is_some());
+
+    let serialized = fs::read_to_string(tempdir.path().join("auth_profile_runtime_state.toml"))
+        .expect("runtime state should be readable");
+    assert!(!serialized.contains("access-top-secret"));
+    assert!(!serialized.contains("refresh-top-secret"));
+    assert!(!serialized.contains("client-top-secret"));
+}
+
+#[test]
+fn selector_respects_explicit_order_cooldown_and_least_recently_used() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let identity_root = tempdir.path().join("identity");
+    let vault_root = tempdir.path().join("vault");
+    let registry =
+        AuthProfileRegistry::open(identity_root.as_path()).expect("registry should initialize");
+    let vault = open_test_vault(vault_root.as_path(), identity_root.as_path());
+    persist_secret_utf8(&vault, "global/openai_a", "key-a").expect("key-a should persist");
+    persist_secret_utf8(&vault, "global/openai_b", "key-b").expect("key-b should persist");
+    for (profile_id, vault_ref) in
+        [("openai-a", "global/openai_a"), ("openai-b", "global/openai_b")]
+    {
+        registry
+            .set_profile(AuthProfileSetRequest {
+                profile_id: profile_id.to_owned(),
+                provider: AuthProvider::known(AuthProviderKind::Openai),
+                profile_name: profile_id.to_owned(),
+                scope: AuthProfileScope::Global,
+                credential: AuthCredential::ApiKey { api_key_vault_ref: vault_ref.to_owned() },
+            })
+            .expect("api key profile should persist");
+    }
+    let now = 1_730_000_000_000_i64;
+    registry
+        .record_profile_success_with_clock("openai-a", now.saturating_sub(10_000))
+        .expect("success state should persist");
+
+    let lru = registry
+        .select_auth_profile_with_clock(
+            &vault,
+            AuthProfileSelectionRequest {
+                provider: Some(AuthProvider::known(AuthProviderKind::Openai)),
+                agent_id: None,
+                explicit_profile_order: Vec::new(),
+                allowed_credential_types: vec![AuthCredentialType::ApiKey],
+                policy_denied_profile_ids: Vec::new(),
+            },
+            now,
+        )
+        .expect("selector should run");
+    assert_eq!(lru.selected_profile_id.as_deref(), Some("openai-b"));
+
+    let explicit = registry
+        .select_auth_profile_with_clock(
+            &vault,
+            AuthProfileSelectionRequest {
+                provider: Some(AuthProvider::known(AuthProviderKind::Openai)),
+                agent_id: None,
+                explicit_profile_order: vec!["openai-a".to_owned(), "openai-b".to_owned()],
+                allowed_credential_types: vec![AuthCredentialType::ApiKey],
+                policy_denied_profile_ids: Vec::new(),
+            },
+            now,
+        )
+        .expect("selector should honor explicit order");
+    assert_eq!(explicit.selected_profile_id.as_deref(), Some("openai-a"));
+
+    registry
+        .record_profile_failure_with_clock("openai-a", AuthProfileFailureKind::RateLimit, now)
+        .expect("cooldown state should persist");
+    let failover = registry
+        .select_auth_profile_with_clock(
+            &vault,
+            AuthProfileSelectionRequest {
+                provider: Some(AuthProvider::known(AuthProviderKind::Openai)),
+                agent_id: None,
+                explicit_profile_order: vec!["openai-a".to_owned(), "openai-b".to_owned()],
+                allowed_credential_types: vec![AuthCredentialType::ApiKey],
+                policy_denied_profile_ids: Vec::new(),
+            },
+            now.saturating_add(1),
+        )
+        .expect("selector should skip cooldown profile");
+    assert_eq!(failover.selected_profile_id.as_deref(), Some("openai-b"));
+    assert_eq!(failover.candidates[0].profile_id, "openai-a");
+    assert_eq!(failover.candidates[0].reason_code, "cooldown_active");
 }

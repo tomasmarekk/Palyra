@@ -10,9 +10,10 @@ use crate::{
     constants::{
         ENV_REGISTRY_PATH, ENV_STATE_ROOT, REGISTRY_FILE, REGISTRY_LOCK_MAX_ATTEMPTS,
         REGISTRY_LOCK_RETRY_DELAY_MS, REGISTRY_LOCK_STALE_AFTER_SECS, REGISTRY_VERSION,
+        RUNTIME_STATE_FILE, RUNTIME_STATE_VERSION,
     },
     error::AuthProfileError,
-    models::AuthProfileRecord,
+    models::{AuthProfileRecord, AuthProfileRuntimeRecord},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +26,19 @@ pub(crate) struct RegistryDocument {
 impl Default for RegistryDocument {
     fn default() -> Self {
         Self { version: REGISTRY_VERSION, profiles: Vec::new() }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RuntimeStateDocument {
+    pub(crate) version: u32,
+    #[serde(default)]
+    pub(crate) records: Vec<AuthProfileRuntimeRecord>,
+}
+
+impl Default for RuntimeStateDocument {
+    fn default() -> Self {
+        Self { version: RUNTIME_STATE_VERSION, records: Vec::new() }
     }
 }
 
@@ -51,6 +65,10 @@ pub(crate) fn resolve_registry_path(state_root: &Path) -> Result<PathBuf, AuthPr
     Ok(state_root.join(REGISTRY_FILE))
 }
 
+pub(crate) fn resolve_runtime_state_path(state_root: &Path) -> PathBuf {
+    state_root.join(RUNTIME_STATE_FILE)
+}
+
 fn normalize_configured_path(raw: &str, field: &'static str) -> Result<PathBuf, AuthProfileError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -74,6 +92,24 @@ fn normalize_configured_path(raw: &str, field: &'static str) -> Result<PathBuf, 
 pub(crate) fn persist_registry(
     path: &Path,
     document: &RegistryDocument,
+) -> Result<(), AuthProfileError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| AuthProfileError::WriteRegistry {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let _lock = acquire_registry_lock(path)
+        .map_err(|source| AuthProfileError::WriteRegistry { path: path.to_path_buf(), source })?;
+    let serialized = toml::to_string_pretty(document)?;
+    write_registry_atomically(path, serialized.as_str())
+        .map_err(|source| AuthProfileError::WriteRegistry { path: path.to_path_buf(), source })?;
+    Ok(())
+}
+
+pub(crate) fn persist_runtime_state(
+    path: &Path,
+    document: &RuntimeStateDocument,
 ) -> Result<(), AuthProfileError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| AuthProfileError::WriteRegistry {

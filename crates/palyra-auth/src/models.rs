@@ -67,7 +67,7 @@ impl AuthProfileScope {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthCredentialType {
     ApiKey,
@@ -212,6 +212,131 @@ pub struct AuthHealthReport {
     pub summary: AuthHealthSummary,
     pub expiry_distribution: AuthExpiryDistribution,
     pub profiles: Vec<AuthProfileHealthRecord>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthProfileFailureKind {
+    AuthInvalid,
+    RefreshDue,
+    RefreshFailed,
+    Quota,
+    RateLimit,
+    Transient,
+    ConfigMissing,
+}
+
+impl AuthProfileFailureKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AuthInvalid => "auth_invalid",
+            Self::RefreshDue => "refresh_due",
+            Self::RefreshFailed => "refresh_failed",
+            Self::Quota => "quota",
+            Self::RateLimit => "rate_limit",
+            Self::Transient => "transient",
+            Self::ConfigMissing => "config_missing",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthProfileDoctorSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthProfileDoctorHint {
+    pub code: String,
+    pub severity: AuthProfileDoctorSeverity,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthTokenExpiryState {
+    Static,
+    Missing,
+    Valid,
+    Expiring,
+    Expired,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthProfileEligibility {
+    Eligible,
+    CoolingDown,
+    Expired,
+    Revoked,
+    MissingCredential,
+    Unsupported,
+    PolicyDenied,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthProfileRuntimeRecord {
+    pub profile_id: String,
+    pub provider: String,
+    pub scope: String,
+    pub credential_type: AuthCredentialType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_used_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_success_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_failure_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_failure_kind: Option<AuthProfileFailureKind>,
+    pub failure_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_until_unix_ms: Option<i64>,
+    pub token_expiry_state: AuthTokenExpiryState,
+    pub eligibility: AuthProfileEligibility,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doctor_hint: Option<AuthProfileDoctorHint>,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthProfileSelectionRequest {
+    pub provider: Option<AuthProvider>,
+    pub agent_id: Option<String>,
+    pub explicit_profile_order: Vec<String>,
+    pub allowed_credential_types: Vec<AuthCredentialType>,
+    pub policy_denied_profile_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthProfileSelectionCandidate {
+    pub profile_id: String,
+    pub provider: String,
+    pub scope: String,
+    pub credential_type: AuthCredentialType,
+    pub token_expiry_state: AuthTokenExpiryState,
+    pub eligibility: AuthProfileEligibility,
+    pub failure_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_until_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_used_unix_ms: Option<i64>,
+    pub selected: bool,
+    pub reason_code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthProfileSelectionResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_profile_id: Option<String>,
+    pub reason_code: String,
+    pub candidates: Vec<AuthProfileSelectionCandidate>,
+    pub generated_at_unix_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
