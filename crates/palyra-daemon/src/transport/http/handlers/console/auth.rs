@@ -440,6 +440,349 @@ pub(crate) async fn console_auth_health_handler(
     }))
 }
 
+pub(crate) async fn console_auth_doctor_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ConsoleAuthRuntimeQuery>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    crate::application::service_authorization::authorize_auth_profile_action(
+        session.context.principal.as_str(),
+        "auth.profile.doctor",
+        "auth:doctor",
+    )
+    .map_err(runtime_status_response)?;
+    let agent_id = normalize_optional_query_value(query.agent_id.as_deref(), "agent_id")?;
+    let auth_runtime = Arc::clone(&state.auth_runtime);
+    let vault = Arc::clone(&state.vault);
+    let agent_id_for_worker = agent_id.clone();
+    let records = tokio::task::spawn_blocking(move || {
+        auth_runtime
+            .registry()
+            .runtime_records_for_agent(vault.as_ref(), agent_id_for_worker.as_deref())
+            .map_err(crate::application::auth::map_auth_profile_error)
+    })
+    .await
+    .map_err(|_| runtime_status_response(tonic::Status::internal("auth doctor worker panicked")))?
+    .map_err(runtime_status_response)?;
+    let warning_count = records.iter().filter(|record| record.doctor_hint.is_some()).count();
+    let error_count = records
+        .iter()
+        .filter(|record| {
+            record
+                .doctor_hint
+                .as_ref()
+                .is_some_and(|hint| hint.severity == palyra_auth::AuthProfileDoctorSeverity::Error)
+        })
+        .count();
+    Ok(Json(json!({
+        "contract": contract_descriptor(),
+        "generated_at_unix_ms": crate::gateway::current_unix_ms(),
+        "status": if error_count > 0 { "error" } else if warning_count > 0 { "warning" } else { "ok" },
+        "summary": {
+            "profile_count": records.len(),
+            "warning_count": warning_count,
+            "error_count": error_count,
+        },
+        "profiles": records,
+    })))
+}
+
+pub(crate) async fn console_auth_audit_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ConsoleAuthRuntimeQuery>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    crate::application::service_authorization::authorize_auth_profile_action(
+        session.context.principal.as_str(),
+        "auth.profile.audit",
+        "auth:audit",
+    )
+    .map_err(runtime_status_response)?;
+    let agent_id = normalize_optional_query_value(query.agent_id.as_deref(), "agent_id")?;
+    let provider = parse_runtime_auth_provider(
+        query.provider_kind.as_deref(),
+        query.provider_custom_name.as_deref(),
+    )?;
+    let auth_runtime = Arc::clone(&state.auth_runtime);
+    let vault = Arc::clone(&state.vault);
+    let agent_id_for_worker = agent_id.clone();
+    let provider_for_worker = provider.clone();
+    let (records, order) = tokio::task::spawn_blocking(move || {
+        let records = auth_runtime
+            .registry()
+            .runtime_records_for_agent_readonly(vault.as_ref(), agent_id_for_worker.as_deref())
+            .map_err(crate::application::auth::map_auth_profile_error)?;
+        let order = auth_runtime
+            .registry()
+            .profile_order(provider_for_worker.as_ref(), agent_id_for_worker.as_deref())
+            .map_err(crate::application::auth::map_auth_profile_error)?;
+        Ok::<_, tonic::Status>((records, order))
+    })
+    .await
+    .map_err(|_| runtime_status_response(tonic::Status::internal("auth audit worker panicked")))?
+    .map_err(runtime_status_response)?;
+    let snapshot =
+        state.runtime.recent_journal_snapshot(256).await.map_err(runtime_status_response)?;
+    let events = snapshot
+        .events
+        .into_iter()
+        .filter_map(|event| auth_audit_event_json(&event))
+        .collect::<Vec<_>>();
+    let returned_events = events.len();
+    Ok(Json(json!({
+        "contract": contract_descriptor(),
+        "generated_at_unix_ms": crate::gateway::current_unix_ms(),
+        "hash_chain_enabled": snapshot.hash_chain_enabled,
+        "total_events": snapshot.total_events,
+        "runtime_records": records,
+        "profile_order": order,
+        "events": events,
+        "page": build_page_info(256, returned_events, None),
+    })))
+}
+
+pub(crate) async fn console_auth_selection_explain_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ConsoleAuthSelectionExplainRequest>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    crate::application::service_authorization::authorize_auth_profile_action(
+        session.context.principal.as_str(),
+        "auth.profile.selection.explain",
+        "auth:selection",
+    )
+    .map_err(runtime_status_response)?;
+    let provider = parse_runtime_auth_provider(
+        payload.provider_kind.as_deref(),
+        payload.provider_custom_name.as_deref(),
+    )?;
+    let allowed_credential_types = payload
+        .allowed_credential_types
+        .iter()
+        .map(|value| parse_runtime_auth_credential_type(value.as_str()))
+        .collect::<Result<Vec<_>, Response>>()?;
+    let agent_id = normalize_optional_query_value(payload.agent_id.as_deref(), "agent_id")?;
+    let request = palyra_auth::AuthProfileSelectionRequest {
+        provider,
+        agent_id,
+        explicit_profile_order: payload.explicit_profile_order,
+        allowed_credential_types,
+        policy_denied_profile_ids: payload.policy_denied_profile_ids,
+    };
+    let auth_runtime = Arc::clone(&state.auth_runtime);
+    let vault = Arc::clone(&state.vault);
+    let result = tokio::task::spawn_blocking(move || {
+        auth_runtime
+            .registry()
+            .select_auth_profile(vault.as_ref(), request)
+            .map_err(crate::application::auth::map_auth_profile_error)
+    })
+    .await
+    .map_err(|_| {
+        runtime_status_response(tonic::Status::internal("auth selection worker panicked"))
+    })?
+    .map_err(runtime_status_response)?;
+    Ok(Json(json!({
+        "contract": contract_descriptor(),
+        "selection": result,
+    })))
+}
+
+pub(crate) async fn console_auth_profile_cooldown_clear_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(profile_id): Path<String>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    let profile_id = normalize_non_empty_field(profile_id, "profile_id")?;
+    crate::application::service_authorization::authorize_auth_profile_action(
+        session.context.principal.as_str(),
+        "auth.profile.cooldown.clear",
+        format!("auth:profile:{profile_id}").as_str(),
+    )
+    .map_err(runtime_status_response)?;
+    let auth_runtime = Arc::clone(&state.auth_runtime);
+    let profile_id_for_worker = profile_id.clone();
+    let record = tokio::task::spawn_blocking(move || {
+        auth_runtime
+            .registry()
+            .clear_profile_cooldown(profile_id_for_worker.as_str())
+            .map_err(crate::application::auth::map_auth_profile_error)
+    })
+    .await
+    .map_err(|_| runtime_status_response(tonic::Status::internal("auth cooldown worker panicked")))?
+    .map_err(runtime_status_response)?;
+    crate::application::auth::record_auth_runtime_operation_journal_event(
+        &state.runtime,
+        &session.context,
+        "auth.profile.cooldown_cleared",
+        json!({ "profile_id": profile_id.clone() }),
+    )
+    .await
+    .map_err(runtime_status_response)?;
+    Ok(Json(json!({
+        "contract": contract_descriptor(),
+        "profile_id": profile_id,
+        "runtime": record,
+    })))
+}
+
+pub(crate) async fn console_auth_profile_order_set_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ConsoleAuthProfileOrderSetRequest>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    if payload.profile_ids.is_empty() {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(
+            "profile_ids must include at least one profile",
+        )));
+    }
+    let agent_id = normalize_optional_query_value(payload.agent_id.as_deref(), "agent_id")?;
+    let provider = parse_runtime_auth_provider(
+        payload.provider_kind.as_deref(),
+        payload.provider_custom_name.as_deref(),
+    )?;
+    let resource = format!(
+        "auth:profile-order:{}:{}",
+        agent_id.as_deref().unwrap_or("global"),
+        provider
+            .as_ref()
+            .map(palyra_auth::AuthProvider::canonical_key)
+            .unwrap_or_else(|| "any".to_owned())
+    );
+    crate::application::service_authorization::authorize_auth_profile_action(
+        session.context.principal.as_str(),
+        "auth.profile.order.set",
+        resource.as_str(),
+    )
+    .map_err(runtime_status_response)?;
+    let auth_runtime = Arc::clone(&state.auth_runtime);
+    let provider_for_worker = provider.clone();
+    let agent_id_for_worker = agent_id.clone();
+    let profile_ids_for_worker = payload.profile_ids.clone();
+    let order = tokio::task::spawn_blocking(move || {
+        auth_runtime
+            .registry()
+            .set_profile_order(
+                provider_for_worker,
+                agent_id_for_worker.as_deref(),
+                profile_ids_for_worker,
+            )
+            .map_err(crate::application::auth::map_auth_profile_error)
+    })
+    .await
+    .map_err(|_| runtime_status_response(tonic::Status::internal("auth order worker panicked")))?
+    .map_err(runtime_status_response)?;
+    crate::application::auth::record_auth_runtime_operation_journal_event(
+        &state.runtime,
+        &session.context,
+        "auth.profile.order_set",
+        json!({
+            "scope": order.scope.clone(),
+            "provider": order.provider.clone(),
+            "profile_ids": order.profile_ids.clone(),
+        }),
+    )
+    .await
+    .map_err(runtime_status_response)?;
+    Ok(Json(json!({
+        "contract": contract_descriptor(),
+        "order": order,
+    })))
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_runtime_auth_provider(
+    kind: Option<&str>,
+    custom_name: Option<&str>,
+) -> Result<Option<palyra_auth::AuthProvider>, Response> {
+    let Some(kind) = kind.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let provider = match kind.to_ascii_lowercase().as_str() {
+        "openai" => palyra_auth::AuthProvider::known(palyra_auth::AuthProviderKind::Openai),
+        "anthropic" => palyra_auth::AuthProvider::known(palyra_auth::AuthProviderKind::Anthropic),
+        "telegram" => palyra_auth::AuthProvider::known(palyra_auth::AuthProviderKind::Telegram),
+        "slack" => palyra_auth::AuthProvider::known(palyra_auth::AuthProviderKind::Slack),
+        "discord" => palyra_auth::AuthProvider::known(palyra_auth::AuthProviderKind::Discord),
+        "webhook" => palyra_auth::AuthProvider::known(palyra_auth::AuthProviderKind::Webhook),
+        "custom" => {
+            let name =
+                custom_name.map(str::trim).filter(|value| !value.is_empty()).ok_or_else(|| {
+                    runtime_status_response(tonic::Status::invalid_argument(
+                        "provider_custom_name is required when provider_kind is custom",
+                    ))
+                })?;
+            palyra_auth::AuthProvider {
+                kind: palyra_auth::AuthProviderKind::Custom,
+                custom_name: Some(name.to_owned()),
+            }
+        }
+        _ => {
+            return Err(runtime_status_response(tonic::Status::invalid_argument(
+                "provider_kind is unsupported",
+            )));
+        }
+    };
+    Ok(Some(provider))
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_runtime_auth_credential_type(
+    value: &str,
+) -> Result<palyra_auth::AuthCredentialType, Response> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "api_key" | "api-key" => Ok(palyra_auth::AuthCredentialType::ApiKey),
+        "oauth" | "oauth_access_token" | "oauth-access-token" => {
+            Ok(palyra_auth::AuthCredentialType::Oauth)
+        }
+        _ => Err(runtime_status_response(tonic::Status::invalid_argument(
+            "allowed_credential_types contains unsupported credential type",
+        ))),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn normalize_optional_query_value(
+    value: Option<&str>,
+    field: &'static str,
+) -> Result<Option<String>, Response> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if value.contains(['\r', '\n', '\t']) {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(format!(
+            "{field} contains unsupported control characters"
+        ))));
+    }
+    Ok(Some(value.to_owned()))
+}
+
+fn auth_audit_event_json(event: &crate::journal::JournalEventRecord) -> Option<Value> {
+    if !event.payload_json.to_ascii_lowercase().contains("auth.") {
+        return None;
+    }
+    let payload = serde_json::from_str::<Value>(event.payload_json.as_str()).unwrap_or_else(|_| {
+        json!({
+            "raw": crate::model_provider::sanitize_remote_error(event.payload_json.as_str()),
+        })
+    });
+    Some(json!({
+        "event_id": event.event_id,
+        "kind": event.kind,
+        "actor": event.actor,
+        "timestamp_unix_ms": event.timestamp_unix_ms,
+        "principal": event.principal,
+        "channel": event.channel,
+        "redacted": event.redacted,
+        "payload": payload,
+    }))
+}
+
 pub(crate) async fn console_openai_provider_state_handler(
     State(state): State<AppState>,
     headers: HeaderMap,

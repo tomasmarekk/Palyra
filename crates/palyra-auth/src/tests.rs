@@ -1105,3 +1105,109 @@ fn selector_respects_explicit_order_cooldown_and_least_recently_used() {
     assert_eq!(failover.candidates[0].profile_id, "openai-a");
     assert_eq!(failover.candidates[0].reason_code, "cooldown_active");
 }
+
+#[test]
+fn persisted_profile_order_drives_selector_without_explicit_order() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let identity_root = tempdir.path().join("identity");
+    let vault_root = tempdir.path().join("vault");
+    let registry =
+        AuthProfileRegistry::open(identity_root.as_path()).expect("registry should initialize");
+    let vault = open_test_vault(vault_root.as_path(), identity_root.as_path());
+    persist_secret_utf8(&vault, "global/openai_a", "key-a").expect("key-a should persist");
+    persist_secret_utf8(&vault, "global/openai_b", "key-b").expect("key-b should persist");
+    for (profile_id, vault_ref) in
+        [("openai-a", "global/openai_a"), ("openai-b", "global/openai_b")]
+    {
+        registry
+            .set_profile(AuthProfileSetRequest {
+                profile_id: profile_id.to_owned(),
+                provider: AuthProvider::known(AuthProviderKind::Openai),
+                profile_name: profile_id.to_owned(),
+                scope: AuthProfileScope::Global,
+                credential: AuthCredential::ApiKey { api_key_vault_ref: vault_ref.to_owned() },
+            })
+            .expect("api key profile should persist");
+    }
+
+    let order = registry
+        .set_profile_order_with_clock(
+            Some(AuthProvider::known(AuthProviderKind::Openai)),
+            None,
+            vec!["openai-a".to_owned(), "openai-b".to_owned()],
+            1_730_000_000_000,
+        )
+        .expect("profile order should persist");
+    assert_eq!(order.profile_ids, vec!["openai-a", "openai-b"]);
+
+    let selected = registry
+        .select_auth_profile_with_clock(
+            &vault,
+            AuthProfileSelectionRequest {
+                provider: Some(AuthProvider::known(AuthProviderKind::Openai)),
+                agent_id: None,
+                explicit_profile_order: Vec::new(),
+                allowed_credential_types: vec![AuthCredentialType::ApiKey],
+                policy_denied_profile_ids: Vec::new(),
+            },
+            1_730_000_000_001,
+        )
+        .expect("selector should use persisted profile order");
+    assert_eq!(selected.selected_profile_id.as_deref(), Some("openai-a"));
+
+    let reopened =
+        AuthProfileRegistry::open(identity_root.as_path()).expect("registry should reopen");
+    let persisted_order = reopened
+        .profile_order(Some(&AuthProvider::known(AuthProviderKind::Openai)), None)
+        .expect("profile order lookup should succeed")
+        .expect("profile order should exist");
+    assert_eq!(persisted_order.profile_ids, vec!["openai-a", "openai-b"]);
+}
+
+#[test]
+fn readonly_runtime_records_do_not_persist_audit_materialization() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let identity_root = tempdir.path().join("identity");
+    let vault_root = tempdir.path().join("vault");
+    let registry =
+        AuthProfileRegistry::open(identity_root.as_path()).expect("registry should initialize");
+    let vault = open_test_vault(vault_root.as_path(), identity_root.as_path());
+    persist_secret_utf8(&vault, "global/openai_audit", "key-audit").expect("key should persist");
+    registry
+        .set_profile(AuthProfileSetRequest {
+            profile_id: "openai-audit".to_owned(),
+            provider: AuthProvider::known(AuthProviderKind::Openai),
+            profile_name: "audit".to_owned(),
+            scope: AuthProfileScope::Global,
+            credential: AuthCredential::ApiKey {
+                api_key_vault_ref: "global/openai_audit".to_owned(),
+            },
+        })
+        .expect("api key profile should persist");
+    let runtime_path = tempdir.path().join("auth_profile_runtime_state.toml");
+    let before = fs::read_to_string(runtime_path.as_path())
+        .expect("runtime state should be initialized by registry open");
+
+    let readonly_records = registry
+        .runtime_records_for_agent_readonly_with_clock(&vault, None, 1_730_000_000_000, 15 * 60_000)
+        .expect("readonly runtime records should load");
+    assert_eq!(readonly_records.len(), 1);
+    assert_eq!(readonly_records[0].eligibility, AuthProfileEligibility::Eligible);
+    let after_readonly = fs::read_to_string(runtime_path.as_path())
+        .expect("runtime state should still be readable after readonly load");
+    assert_eq!(
+        after_readonly, before,
+        "readonly audit materialization must not mutate runtime state persistence"
+    );
+
+    registry
+        .runtime_records_for_agent_with_clock(&vault, None, 1_730_000_000_001, 15 * 60_000)
+        .expect("runtime record materialization should persist");
+    let after_materialized = fs::read_to_string(runtime_path.as_path())
+        .expect("runtime state should be readable after materialization");
+    assert_ne!(
+        after_materialized, before,
+        "non-readonly materialization should still persist health records"
+    );
+    assert!(after_materialized.contains("openai-audit"));
+}

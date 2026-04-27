@@ -1,19 +1,9 @@
-Usage: palyra auth profiles [OPTIONS] <COMMAND>
-
-Commands:
-  list
-  show
-  set
-  delete
-  health
-  doctor
-  audit
-  cooldown-clear
-  order-set
-  explain-selection
+Usage: palyra auth profiles doctor [OPTIONS]
 
 Options:
-  -h, --help  Print help
+      --agent-id <AGENT_ID>
+      --json
+  -h, --help                 Print help
 
 Global Options:
       --profile <PROFILE>

@@ -11,10 +11,11 @@ pub use models::{
     AuthCredential, AuthCredentialType, AuthExpiryDistribution, AuthHealthReport,
     AuthHealthSummary, AuthProfileDoctorHint, AuthProfileDoctorSeverity, AuthProfileEligibility,
     AuthProfileFailureKind, AuthProfileHealthRecord, AuthProfileHealthState, AuthProfileListFilter,
-    AuthProfileRecord, AuthProfileRuntimeRecord, AuthProfileScope, AuthProfileSelectionCandidate,
-    AuthProfileSelectionRequest, AuthProfileSelectionResult, AuthProfileSetRequest,
-    AuthProfilesPage, AuthProvider, AuthProviderKind, AuthScopeFilter, AuthTokenExpiryState,
-    OAuthRefreshError, OAuthRefreshRequest, OAuthRefreshResponse, OAuthRefreshState,
+    AuthProfileOrderRecord, AuthProfileRecord, AuthProfileRuntimeRecord, AuthProfileScope,
+    AuthProfileSelectionCandidate, AuthProfileSelectionRequest, AuthProfileSelectionResult,
+    AuthProfileSetRequest, AuthProfilesPage, AuthProvider, AuthProviderKind, AuthScopeFilter,
+    AuthTokenExpiryState, OAuthRefreshError, OAuthRefreshRequest, OAuthRefreshResponse,
+    OAuthRefreshState,
 };
 pub use refresh::{
     compute_backoff_ms, provider_backoff_policy, HttpOAuthRefreshAdapter, OAuthRefreshAdapter,

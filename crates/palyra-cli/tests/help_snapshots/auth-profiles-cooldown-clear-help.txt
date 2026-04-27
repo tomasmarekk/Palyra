@@ -1,18 +1,10 @@
-Usage: palyra auth profiles [OPTIONS] <COMMAND>
+Usage: palyra auth profiles cooldown-clear [OPTIONS] <PROFILE_ID>
 
-Commands:
-  list
-  show
-  set
-  delete
-  health
-  doctor
-  audit
-  cooldown-clear
-  order-set
-  explain-selection
+Arguments:
+  <PROFILE_ID>
 
 Options:
+      --json
   -h, --help  Print help
 
 Global Options:

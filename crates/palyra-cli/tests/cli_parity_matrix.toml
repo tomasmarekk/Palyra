@@ -732,6 +732,69 @@ path = "auth profiles list"
 file = "auth-profiles-list-help.txt"
 
 [[entries]]
+path = "auth profiles doctor"
+category = "nested_surface"
+status = "done"
+summary = "Auth profile doctor and repair-hint surface."
+required_flags = ["agent-id", "json"]
+
+[entries.snapshot]
+path = "auth profiles doctor"
+file = "auth-profiles-doctor-help.txt"
+
+[[entries]]
+path = "auth profiles audit"
+category = "nested_surface"
+status = "done"
+summary = "Auth profile runtime audit surface."
+required_flags = ["agent-id", "provider", "provider-name", "json"]
+
+[entries.snapshot]
+path = "auth profiles audit"
+file = "auth-profiles-audit-help.txt"
+
+[[entries]]
+path = "auth profiles cooldown-clear"
+category = "nested_surface"
+status = "done"
+summary = "Auth profile cooldown clear operator surface."
+required_flags = ["json"]
+
+[entries.snapshot]
+path = "auth profiles cooldown-clear"
+file = "auth-profiles-cooldown-clear-help.txt"
+
+[[entries]]
+path = "auth profiles order-set"
+category = "nested_surface"
+status = "done"
+summary = "Auth profile order configuration surface."
+required_flags = ["provider", "provider-name", "agent-id", "json"]
+
+[entries.snapshot]
+path = "auth profiles order-set"
+file = "auth-profiles-order-set-help.txt"
+
+[[entries]]
+path = "auth profiles explain-selection"
+category = "nested_surface"
+status = "done"
+summary = "Auth profile selector explanation surface."
+required_flags = [
+    "provider",
+    "provider-name",
+    "agent-id",
+    "profile-id",
+    "credential",
+    "policy-denied-profile-id",
+    "json",
+]
+
+[entries.snapshot]
+path = "auth profiles explain-selection"
+file = "auth-profiles-explain-selection-help.txt"
+
+[[entries]]
 path = "browser session"
 category = "nested_surface"
 status = "done"

@@ -86,6 +86,55 @@ pub enum AuthProfilesCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    Doctor {
+        #[arg(long)]
+        agent_id: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Audit {
+        #[arg(long)]
+        agent_id: Option<String>,
+        #[arg(long, value_enum)]
+        provider: Option<AuthProviderArg>,
+        #[arg(long)]
+        provider_name: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    CooldownClear {
+        profile_id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    OrderSet {
+        #[arg(long, value_enum)]
+        provider: Option<AuthProviderArg>,
+        #[arg(long)]
+        provider_name: Option<String>,
+        #[arg(long)]
+        agent_id: Option<String>,
+        #[arg(required = true)]
+        profile_id: Vec<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    ExplainSelection {
+        #[arg(long, value_enum)]
+        provider: Option<AuthProviderArg>,
+        #[arg(long)]
+        provider_name: Option<String>,
+        #[arg(long)]
+        agent_id: Option<String>,
+        #[arg(long = "profile-id")]
+        profile_id: Vec<String>,
+        #[arg(long = "credential", value_enum)]
+        credential: Vec<AuthCredentialArg>,
+        #[arg(long = "policy-denied-profile-id")]
+        policy_denied_profile_id: Vec<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]

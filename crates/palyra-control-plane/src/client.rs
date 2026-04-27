@@ -1194,6 +1194,72 @@ impl ControlPlaneClient {
         .await
     }
 
+    pub async fn get_auth_doctor(
+        &self,
+        agent_id: Option<&str>,
+    ) -> Result<Value, ControlPlaneClientError> {
+        self.request_json(
+            Method::GET,
+            build_query_path(
+                "console/v1/auth/doctor",
+                vec![("agent_id", agent_id.map(str::to_owned))],
+            ),
+            None::<&Value>,
+            false,
+        )
+        .await
+    }
+
+    pub async fn get_auth_audit(
+        &self,
+        agent_id: Option<&str>,
+        provider_kind: Option<&str>,
+        provider_custom_name: Option<&str>,
+    ) -> Result<Value, ControlPlaneClientError> {
+        self.request_json(
+            Method::GET,
+            build_query_path(
+                "console/v1/auth/audit",
+                vec![
+                    ("agent_id", agent_id.map(str::to_owned)),
+                    ("provider_kind", provider_kind.map(str::to_owned)),
+                    ("provider_custom_name", provider_custom_name.map(str::to_owned)),
+                ],
+            ),
+            None::<&Value>,
+            false,
+        )
+        .await
+    }
+
+    pub async fn clear_auth_profile_cooldown(
+        &self,
+        profile_id: &str,
+    ) -> Result<Value, ControlPlaneClientError> {
+        self.request_json(
+            Method::POST,
+            format!("console/v1/auth/profiles/{}/cooldown/clear", urlencoding(profile_id)),
+            Some(&serde_json::json!({})),
+            true,
+        )
+        .await
+    }
+
+    pub async fn set_auth_profile_order<T: Serialize + ?Sized>(
+        &self,
+        request: &T,
+    ) -> Result<Value, ControlPlaneClientError> {
+        self.request_json(Method::POST, "console/v1/auth/profile-order", Some(request), true).await
+    }
+
+    pub async fn explain_auth_profile_selection<T: Serialize + ?Sized>(
+        &self,
+        request: &T,
+    ) -> Result<Value, ControlPlaneClientError> {
+        self.request_json(Method::POST, "console/v1/auth/selection/explain", Some(request), false)
+            .await
+    }
+
     pub async fn get_openai_provider_state(
         &self,
     ) -> Result<ProviderAuthStateEnvelope, ControlPlaneClientError> {

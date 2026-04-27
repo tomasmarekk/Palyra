@@ -444,6 +444,34 @@ struct ConsoleAuthHealthQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct ConsoleAuthRuntimeQuery {
+    agent_id: Option<String>,
+    provider_kind: Option<String>,
+    provider_custom_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleAuthSelectionExplainRequest {
+    agent_id: Option<String>,
+    provider_kind: Option<String>,
+    provider_custom_name: Option<String>,
+    #[serde(default)]
+    explicit_profile_order: Vec<String>,
+    #[serde(default)]
+    allowed_credential_types: Vec<String>,
+    #[serde(default)]
+    policy_denied_profile_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleAuthProfileOrderSetRequest {
+    agent_id: Option<String>,
+    provider_kind: Option<String>,
+    provider_custom_name: Option<String>,
+    profile_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ConsoleOpenAiCallbackStateQuery {
     attempt_id: String,
 }

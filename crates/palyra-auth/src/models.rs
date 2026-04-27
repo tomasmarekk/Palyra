@@ -304,6 +304,15 @@ pub struct AuthProfileRuntimeRecord {
     pub updated_at_unix_ms: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthProfileOrderRecord {
+    pub scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    pub profile_ids: Vec<String>,
+    pub updated_at_unix_ms: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthProfileSelectionRequest {
     pub provider: Option<AuthProvider>,

@@ -17,10 +17,10 @@ use crate::{
         AuthCredential, AuthExpiryDistribution, AuthHealthReport, AuthHealthSummary,
         AuthProfileDoctorHint, AuthProfileDoctorSeverity, AuthProfileEligibility,
         AuthProfileFailureKind, AuthProfileHealthRecord, AuthProfileHealthState,
-        AuthProfileListFilter, AuthProfileRecord, AuthProfileRuntimeRecord, AuthProfileScope,
-        AuthProfileSelectionCandidate, AuthProfileSelectionRequest, AuthProfileSelectionResult,
-        AuthProfileSetRequest, AuthProfilesPage, AuthProvider, AuthTokenExpiryState,
-        OAuthRefreshRequest,
+        AuthProfileListFilter, AuthProfileOrderRecord, AuthProfileRecord, AuthProfileRuntimeRecord,
+        AuthProfileScope, AuthProfileSelectionCandidate, AuthProfileSelectionRequest,
+        AuthProfileSelectionResult, AuthProfileSetRequest, AuthProfilesPage, AuthProvider,
+        AuthTokenExpiryState, OAuthRefreshRequest,
     },
     refresh::{
         compute_backoff_ms, evaluate_profile_health, load_secret_utf8, oauth_expires_at,
@@ -318,6 +318,40 @@ impl AuthProfileRegistry {
         Ok(records)
     }
 
+    pub fn runtime_records_for_agent_readonly(
+        &self,
+        vault: &Vault,
+        agent_id: Option<&str>,
+    ) -> Result<Vec<AuthProfileRuntimeRecord>, AuthProfileError> {
+        self.runtime_records_for_agent_readonly_with_clock(
+            vault,
+            agent_id,
+            unix_ms_now()?,
+            DEFAULT_EXPIRING_WINDOW_MS,
+        )
+    }
+
+    pub fn runtime_records_for_agent_readonly_with_clock(
+        &self,
+        vault: &Vault,
+        agent_id: Option<&str>,
+        now_unix_ms: i64,
+        expiring_window_ms: i64,
+    ) -> Result<Vec<AuthProfileRuntimeRecord>, AuthProfileError> {
+        let profiles = self.merged_profiles_for_agent(agent_id)?;
+        let runtime_guard =
+            self.runtime_state.lock().map_err(|_| AuthProfileError::LockPoisoned)?;
+        let mut records = Vec::with_capacity(profiles.len());
+        for profile in profiles {
+            let health = evaluate_profile_health(&profile, vault, now_unix_ms, expiring_window_ms);
+            let existing =
+                runtime_guard.records.iter().find(|record| record.profile_id == profile.profile_id);
+            records.push(runtime_record_from_health(&profile, &health, existing, now_unix_ms));
+        }
+        records.sort_by(|left, right| left.profile_id.cmp(&right.profile_id));
+        Ok(records)
+    }
+
     pub fn record_profile_success(&self, profile_id: &str) -> Result<(), AuthProfileError> {
         self.record_profile_success_with_clock(profile_id, unix_ms_now()?)
     }
@@ -405,6 +439,77 @@ impl AuthProfileRegistry {
         Ok(record)
     }
 
+    pub fn profile_order(
+        &self,
+        provider: Option<&AuthProvider>,
+        agent_id: Option<&str>,
+    ) -> Result<Option<AuthProfileOrderRecord>, AuthProfileError> {
+        let guard = self.runtime_state.lock().map_err(|_| AuthProfileError::LockPoisoned)?;
+        let scope = profile_order_scope_key(agent_id)?;
+        let provider_key = provider.map(AuthProvider::canonical_key);
+        Ok(guard
+            .profile_orders
+            .iter()
+            .find(|record| {
+                record.scope == scope && record.provider.as_deref() == provider_key.as_deref()
+            })
+            .cloned())
+    }
+
+    pub fn set_profile_order(
+        &self,
+        provider: Option<AuthProvider>,
+        agent_id: Option<&str>,
+        profile_ids: Vec<String>,
+    ) -> Result<AuthProfileOrderRecord, AuthProfileError> {
+        self.set_profile_order_with_clock(provider, agent_id, profile_ids, unix_ms_now()?)
+    }
+
+    pub fn set_profile_order_with_clock(
+        &self,
+        provider: Option<AuthProvider>,
+        agent_id: Option<&str>,
+        profile_ids: Vec<String>,
+        now_unix_ms: i64,
+    ) -> Result<AuthProfileOrderRecord, AuthProfileError> {
+        let normalized_profile_ids = normalize_profile_order(profile_ids.as_slice())?;
+        let profiles = self.merged_profiles_for_agent(agent_id)?;
+        let profiles_by_id = profiles
+            .iter()
+            .map(|profile| (profile.profile_id.as_str(), profile))
+            .collect::<BTreeMap<_, _>>();
+        for profile_id in &normalized_profile_ids {
+            let profile = profiles_by_id
+                .get(profile_id.as_str())
+                .ok_or_else(|| AuthProfileError::ProfileNotFound(profile_id.clone()))?;
+            if let Some(provider) = provider.as_ref() {
+                if profile.provider.canonical_key() != provider.canonical_key() {
+                    return Err(AuthProfileError::InvalidField {
+                        field: "profile_ids",
+                        message: format!(
+                            "profile '{profile_id}' does not belong to provider {}",
+                            provider.label()
+                        ),
+                    });
+                }
+            }
+        }
+        let scope = profile_order_scope_key(agent_id)?;
+        let provider_key = provider.as_ref().map(AuthProvider::canonical_key);
+        let record = AuthProfileOrderRecord {
+            scope: scope.clone(),
+            provider: provider_key.clone(),
+            profile_ids: normalized_profile_ids,
+            updated_at_unix_ms: now_unix_ms,
+        };
+        let mut guard = self.runtime_state.lock().map_err(|_| AuthProfileError::LockPoisoned)?;
+        let mut next = guard.clone();
+        upsert_profile_order(&mut next.profile_orders, record.clone());
+        persist_runtime_state(self.runtime_state_path.as_path(), &next)?;
+        *guard = next;
+        Ok(record)
+    }
+
     pub fn select_auth_profile(
         &self,
         vault: &Vault,
@@ -431,7 +536,14 @@ impl AuthProfileRegistry {
             .into_iter()
             .map(|record| (record.profile_id.clone(), record))
             .collect::<BTreeMap<_, _>>();
-        let explicit_order = normalize_profile_order(request.explicit_profile_order.as_slice())?;
+        let explicit_order = if request.explicit_profile_order.is_empty() {
+            self.profile_order(request.provider.as_ref(), agent_id)?
+                .map(|record| record.profile_ids)
+                .unwrap_or_default()
+        } else {
+            request.explicit_profile_order
+        };
+        let explicit_order = normalize_profile_order(explicit_order.as_slice())?;
         let explicit_positions = explicit_order
             .iter()
             .enumerate()
@@ -1076,6 +1188,29 @@ fn normalize_profile_order(values: &[String]) -> Result<Vec<String>, AuthProfile
         }
     }
     Ok(normalized)
+}
+
+fn profile_order_scope_key(agent_id: Option<&str>) -> Result<String, AuthProfileError> {
+    match agent_id.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(agent_id) => {
+            let normalized = normalize_agent_id(agent_id)?;
+            Ok(format!("agent:{normalized}"))
+        }
+        None => Ok("global".to_owned()),
+    }
+}
+
+fn upsert_profile_order(records: &mut Vec<AuthProfileOrderRecord>, record: AuthProfileOrderRecord) {
+    if let Some(existing) = records.iter_mut().find(|existing| {
+        existing.scope == record.scope && existing.provider.as_deref() == record.provider.as_deref()
+    }) {
+        *existing = record;
+    } else {
+        records.push(record);
+        records.sort_by(|left, right| {
+            left.scope.cmp(&right.scope).then_with(|| left.provider.cmp(&right.provider))
+        });
+    }
 }
 
 fn normalize_profile_set(values: &[String]) -> Result<BTreeSet<String>, AuthProfileError> {

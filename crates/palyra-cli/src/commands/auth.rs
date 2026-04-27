@@ -3,15 +3,22 @@ use palyra_control_plane as control_plane;
 
 pub(crate) fn run_auth(command: AuthCommand) -> Result<()> {
     match command {
-        AuthCommand::Profiles { .. } => {
-            let root_context = app::current_root_context()
-                .ok_or_else(|| anyhow!("CLI root context is unavailable for auth command"))?;
-            let connection = root_context.resolve_grpc_connection(
-                app::ConnectionOverrides::default(),
-                app::ConnectionDefaults::ADMIN,
-            )?;
+        AuthCommand::Profiles { command } => {
             let runtime = build_runtime()?;
-            runtime.block_on(run_auth_profiles_async(command, connection))
+            if auth_profiles_command_uses_control_plane(&command) {
+                runtime.block_on(run_auth_profiles_control_plane_async(command))
+            } else {
+                let root_context = app::current_root_context()
+                    .ok_or_else(|| anyhow!("CLI root context is unavailable for auth command"))?;
+                let connection = root_context.resolve_grpc_connection(
+                    app::ConnectionOverrides::default(),
+                    app::ConnectionDefaults::ADMIN,
+                )?;
+                runtime.block_on(run_auth_profiles_async(
+                    AuthCommand::Profiles { command },
+                    connection,
+                ))
+            }
         }
         AuthCommand::Access { .. } => {
             let runtime = build_runtime()?;
@@ -22,6 +29,17 @@ pub(crate) fn run_auth(command: AuthCommand) -> Result<()> {
             runtime.block_on(run_auth_openai_async(command))
         }
     }
+}
+
+fn auth_profiles_command_uses_control_plane(command: &AuthProfilesCommand) -> bool {
+    matches!(
+        command,
+        AuthProfilesCommand::Doctor { .. }
+            | AuthProfilesCommand::Audit { .. }
+            | AuthProfilesCommand::CooldownClear { .. }
+            | AuthProfilesCommand::OrderSet { .. }
+            | AuthProfilesCommand::ExplainSelection { .. }
+    )
 }
 
 pub(crate) async fn run_auth_profiles_async(
@@ -282,8 +300,100 @@ pub(crate) async fn run_auth_profiles_async(
                 }
             }
         }
+        AuthProfilesCommand::Doctor { .. }
+        | AuthProfilesCommand::Audit { .. }
+        | AuthProfilesCommand::CooldownClear { .. }
+        | AuthProfilesCommand::OrderSet { .. }
+        | AuthProfilesCommand::ExplainSelection { .. } => {
+            anyhow::bail!("auth profiles command requires control-plane dispatch")
+        }
     }
 
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
+async fn run_auth_profiles_control_plane_async(command: AuthProfilesCommand) -> Result<()> {
+    let context =
+        client::control_plane::connect_admin_console(app::ConnectionOverrides::default()).await?;
+    match command {
+        AuthProfilesCommand::Doctor { agent_id, json } => {
+            let payload = context
+                .client
+                .get_auth_doctor(agent_id.as_deref())
+                .await
+                .context("failed to fetch auth doctor")?;
+            emit_auth_runtime_payload(payload, json, "auth.profiles.doctor")?;
+        }
+        AuthProfilesCommand::Audit { agent_id, provider, provider_name, json } => {
+            let provider_kind = provider.map(auth_provider_arg_to_control_plane);
+            let payload = context
+                .client
+                .get_auth_audit(
+                    agent_id.as_deref(),
+                    provider_kind.as_deref(),
+                    provider_name.as_deref(),
+                )
+                .await
+                .context("failed to fetch auth audit")?;
+            emit_auth_runtime_payload(payload, json, "auth.profiles.audit")?;
+        }
+        AuthProfilesCommand::CooldownClear { profile_id, json } => {
+            let payload = context
+                .client
+                .clear_auth_profile_cooldown(profile_id.as_str())
+                .await
+                .with_context(|| {
+                    format!("failed to clear cooldown for auth profile {profile_id}")
+                })?;
+            emit_auth_runtime_payload(payload, json, "auth.profiles.cooldown_clear")?;
+        }
+        AuthProfilesCommand::OrderSet { provider, provider_name, agent_id, profile_id, json } => {
+            let payload = context
+                .client
+                .set_auth_profile_order(&json!({
+                    "agent_id": agent_id,
+                    "provider_kind": provider.map(auth_provider_arg_to_control_plane),
+                    "provider_custom_name": provider_name,
+                    "profile_ids": profile_id,
+                }))
+                .await
+                .context("failed to set auth profile order")?;
+            emit_auth_runtime_payload(payload, json, "auth.profiles.order_set")?;
+        }
+        AuthProfilesCommand::ExplainSelection {
+            provider,
+            provider_name,
+            agent_id,
+            profile_id,
+            credential,
+            policy_denied_profile_id,
+            json,
+        } => {
+            let payload = context
+                .client
+                .explain_auth_profile_selection(&json!({
+                    "agent_id": agent_id,
+                    "provider_kind": provider.map(auth_provider_arg_to_control_plane),
+                    "provider_custom_name": provider_name,
+                    "explicit_profile_order": profile_id,
+                    "allowed_credential_types": credential
+                        .into_iter()
+                        .map(auth_credential_arg_to_control_plane)
+                        .collect::<Vec<_>>(),
+                    "policy_denied_profile_ids": policy_denied_profile_id,
+                }))
+                .await
+                .context("failed to explain auth profile selection")?;
+            emit_auth_runtime_payload(payload, json, "auth.profiles.explain_selection")?;
+        }
+        AuthProfilesCommand::List { .. }
+        | AuthProfilesCommand::Show { .. }
+        | AuthProfilesCommand::Set { .. }
+        | AuthProfilesCommand::Delete { .. }
+        | AuthProfilesCommand::Health { .. } => {
+            anyhow::bail!("auth profiles command requires gRPC dispatch")
+        }
+    }
     std::io::stdout().flush().context("stdout flush failed")
 }
 
@@ -987,6 +1097,52 @@ fn build_control_plane_scope(
             agent_id: Some(agent_id.context("--agent-id is required when --scope=agent")?),
         }),
     }
+}
+
+fn auth_provider_arg_to_control_plane(value: AuthProviderArg) -> String {
+    match value {
+        AuthProviderArg::Openai => "openai",
+        AuthProviderArg::Anthropic => "anthropic",
+        AuthProviderArg::Telegram => "telegram",
+        AuthProviderArg::Slack => "slack",
+        AuthProviderArg::Discord => "discord",
+        AuthProviderArg::Webhook => "webhook",
+        AuthProviderArg::Custom => "custom",
+    }
+    .to_owned()
+}
+
+fn auth_credential_arg_to_control_plane(value: AuthCredentialArg) -> String {
+    match value {
+        AuthCredentialArg::ApiKey => "api_key",
+        AuthCredentialArg::Oauth => "oauth",
+    }
+    .to_owned()
+}
+
+fn emit_auth_runtime_payload(payload: Value, json_output: bool, label: &str) -> Result<()> {
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+    let status = payload.get("status").and_then(Value::as_str).unwrap_or("ok");
+    let profile_count = payload
+        .pointer("/summary/profile_count")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            payload.get("runtime_records").and_then(Value::as_array).map(|rows| rows.len() as u64)
+        })
+        .unwrap_or_default();
+    let selected_profile =
+        payload.pointer("/selection/selected_profile_id").and_then(Value::as_str).unwrap_or("none");
+    let event_count =
+        payload.get("events").and_then(Value::as_array).map(std::vec::Vec::len).unwrap_or_default();
+    println!(
+        "{label} status={} profiles={} selected_profile={} events={}",
+        status, profile_count, selected_profile, event_count
+    );
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    Ok(())
 }
 
 fn emit_access_payload(payload: Value, json_output: bool) -> Result<()> {

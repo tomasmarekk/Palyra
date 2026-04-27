@@ -313,7 +313,21 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/console/v1/auth/profiles/{profile_id}/delete",
             post(console::auth::console_auth_profile_delete_handler),
         )
+        .route(
+            "/console/v1/auth/profiles/{profile_id}/cooldown/clear",
+            post(console::auth::console_auth_profile_cooldown_clear_handler),
+        )
         .route("/console/v1/auth/health", get(console::auth::console_auth_health_handler))
+        .route("/console/v1/auth/doctor", get(console::auth::console_auth_doctor_handler))
+        .route("/console/v1/auth/audit", get(console::auth::console_auth_audit_handler))
+        .route(
+            "/console/v1/auth/selection/explain",
+            post(console::auth::console_auth_selection_explain_handler),
+        )
+        .route(
+            "/console/v1/auth/profile-order",
+            post(console::auth::console_auth_profile_order_set_handler),
+        )
         .route(
             "/console/v1/auth/providers/openai",
             get(console::auth::console_openai_provider_state_handler),

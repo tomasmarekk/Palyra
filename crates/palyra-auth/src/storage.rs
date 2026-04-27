@@ -13,7 +13,7 @@ use crate::{
         RUNTIME_STATE_FILE, RUNTIME_STATE_VERSION,
     },
     error::AuthProfileError,
-    models::{AuthProfileRecord, AuthProfileRuntimeRecord},
+    models::{AuthProfileOrderRecord, AuthProfileRecord, AuthProfileRuntimeRecord},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,11 +34,13 @@ pub(crate) struct RuntimeStateDocument {
     pub(crate) version: u32,
     #[serde(default)]
     pub(crate) records: Vec<AuthProfileRuntimeRecord>,
+    #[serde(default)]
+    pub(crate) profile_orders: Vec<AuthProfileOrderRecord>,
 }
 
 impl Default for RuntimeStateDocument {
     fn default() -> Self {
-        Self { version: RUNTIME_STATE_VERSION, records: Vec::new() }
+        Self { version: RUNTIME_STATE_VERSION, records: Vec::new(), profile_orders: Vec::new() }
     }
 }
 

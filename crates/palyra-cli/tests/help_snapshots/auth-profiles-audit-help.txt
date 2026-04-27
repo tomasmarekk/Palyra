@@ -1,19 +1,11 @@
-Usage: palyra auth profiles [OPTIONS] <COMMAND>
-
-Commands:
-  list
-  show
-  set
-  delete
-  health
-  doctor
-  audit
-  cooldown-clear
-  order-set
-  explain-selection
+Usage: palyra auth profiles audit [OPTIONS]
 
 Options:
-  -h, --help  Print help
+      --agent-id <AGENT_ID>
+      --provider <PROVIDER>            [possible values: openai, anthropic, telegram, slack, discord, webhook, custom]
+      --provider-name <PROVIDER_NAME>
+      --json
+  -h, --help                           Print help
 
 Global Options:
       --profile <PROFILE>

@@ -3015,6 +3015,240 @@ fn console_channel_operations_return_recovery_payloads() -> Result<()> {
 }
 
 #[test]
+fn console_auth_profile_ops_explain_selection_and_audit_runtime_state() -> Result<()> {
+    let (child, admin_port) = spawn_palyrad_with_bound_console_principal(CONSOLE_ADMIN_PRINCIPAL)?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(4))
+        .build()
+        .context("failed to build HTTP client")?;
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+
+    for (key, secret) in [
+        ("m051_openai_a", b"sk-m051-console-key-a".as_slice()),
+        ("m051_openai_b", b"sk-m051-console-key-b".as_slice()),
+    ] {
+        client
+            .post(format!("http://127.0.0.1:{admin_port}/console/v1/secrets"))
+            .header("Cookie", cookie.clone())
+            .header("x-palyra-csrf-token", csrf_token.clone())
+            .json(&json!({
+                "scope": "global",
+                "key": key,
+                "value_base64": BASE64_STANDARD.encode(secret),
+            }))
+            .send()
+            .with_context(|| format!("failed to seed secret {key} through console"))?
+            .error_for_status()
+            .with_context(|| format!("console secret set returned non-success status for {key}"))?;
+    }
+
+    for (profile_id, vault_ref) in
+        [("m051-openai-a", "global/m051_openai_a"), ("m051-openai-b", "global/m051_openai_b")]
+    {
+        let saved = client
+            .post(format!("http://127.0.0.1:{admin_port}/console/v1/auth/profiles"))
+            .header("Cookie", cookie.clone())
+            .header("x-palyra-csrf-token", csrf_token.clone())
+            .json(&json!({
+                "profile_id": profile_id,
+                "provider": { "kind": "openai" },
+                "profile_name": profile_id,
+                "scope": { "kind": "global" },
+                "credential": {
+                    "type": "api_key",
+                    "api_key_vault_ref": vault_ref,
+                },
+                "created_at_unix_ms": 0,
+                "updated_at_unix_ms": 0,
+            }))
+            .send()
+            .with_context(|| format!("failed to create auth profile {profile_id}"))?
+            .error_for_status()
+            .with_context(|| {
+                format!("auth profile set returned non-success status for {profile_id}")
+            })?
+            .json::<Value>()
+            .with_context(|| {
+                format!("failed to parse auth profile set response for {profile_id}")
+            })?;
+        assert_eq!(
+            saved.pointer("/profile/profile_id").and_then(Value::as_str),
+            Some(profile_id),
+            "auth profile set should echo the saved profile id"
+        );
+    }
+
+    let order_without_csrf = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/auth/profile-order"))
+        .header("Cookie", cookie.clone())
+        .json(&json!({
+            "provider_kind": "openai",
+            "profile_ids": ["m051-openai-b", "m051-openai-a"],
+        }))
+        .send()
+        .context("failed to call auth profile order without csrf")?;
+    assert_eq!(
+        order_without_csrf.status().as_u16(),
+        403,
+        "auth profile order mutation must enforce csrf"
+    );
+
+    let order = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/auth/profile-order"))
+        .header("Cookie", cookie.clone())
+        .header("x-palyra-csrf-token", csrf_token.clone())
+        .json(&json!({
+            "provider_kind": "openai",
+            "profile_ids": ["m051-openai-b", "m051-openai-a"],
+        }))
+        .send()
+        .context("failed to set auth profile order")?
+        .error_for_status()
+        .context("auth profile order returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse auth profile order response json")?;
+    assert_eq!(
+        order.pointer("/order/profile_ids/0").and_then(Value::as_str),
+        Some("m051-openai-b"),
+        "auth profile order response should preserve operator ordering"
+    );
+
+    let selection = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/auth/selection/explain"))
+        .header("Cookie", cookie.clone())
+        .json(&json!({
+            "provider_kind": "openai",
+            "allowed_credential_types": ["api_key"],
+        }))
+        .send()
+        .context("failed to explain auth profile selection")?
+        .error_for_status()
+        .context("auth profile selection explain returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse auth profile selection explain response json")?;
+    assert_eq!(
+        selection.pointer("/selection/selected_profile_id").and_then(Value::as_str),
+        Some("m051-openai-b"),
+        "selection explain should use persisted profile order when explicit order is absent"
+    );
+    assert!(
+        selection.pointer("/selection/candidates").and_then(Value::as_array).is_some_and(
+            |candidates| candidates.iter().any(|candidate| {
+                candidate.get("profile_id").and_then(Value::as_str) == Some("m051-openai-b")
+                    && candidate.get("selected").and_then(Value::as_bool) == Some(true)
+                    && candidate.get("reason_code").and_then(Value::as_str) == Some("eligible")
+            })
+        ),
+        "selection explain should include a selected eligible candidate"
+    );
+
+    let malformed_selection = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/auth/selection/explain"))
+        .header("Cookie", cookie.clone())
+        .json(&json!({
+            "provider_kind": "openai",
+            "allowed_credential_types": ["session_cookie"],
+        }))
+        .send()
+        .context("failed to call malformed auth selection explain")?;
+    assert_eq!(
+        malformed_selection.status().as_u16(),
+        400,
+        "unsupported selection credential type should be rejected"
+    );
+
+    let doctor = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/auth/doctor"))
+        .header("Cookie", cookie.clone())
+        .send()
+        .context("failed to fetch auth doctor")?
+        .error_for_status()
+        .context("auth doctor returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse auth doctor response json")?;
+    assert_eq!(
+        doctor.get("status").and_then(Value::as_str),
+        Some("ok"),
+        "doctor should report ok for two API-key profiles with readable vault refs"
+    );
+    assert!(
+        doctor.get("profiles").and_then(Value::as_array).is_some_and(|profiles| {
+            profiles.iter().any(|profile| {
+                profile.get("profile_id").and_then(Value::as_str) == Some("m051-openai-b")
+                    && profile.get("doctor_hint").is_none_or(Value::is_null)
+            })
+        }),
+        "doctor should expose redacted runtime records and null hints for healthy profiles"
+    );
+
+    let cleared = client
+        .post(format!(
+            "http://127.0.0.1:{admin_port}/console/v1/auth/profiles/m051-openai-b/cooldown/clear"
+        ))
+        .header("Cookie", cookie.clone())
+        .header("x-palyra-csrf-token", csrf_token)
+        .send()
+        .context("failed to clear auth profile cooldown")?
+        .error_for_status()
+        .context("auth profile cooldown clear returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse auth profile cooldown clear response json")?;
+    assert_eq!(
+        cleared.pointer("/runtime/profile_id").and_then(Value::as_str),
+        Some("m051-openai-b"),
+        "cooldown clear should return the runtime record it updated"
+    );
+    assert!(
+        cleared.pointer("/runtime/cooldown_until_unix_ms").is_none_or(Value::is_null),
+        "cooldown clear should leave no active cooldown"
+    );
+
+    let audit = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/auth/audit?provider_kind=openai"))
+        .header("Cookie", cookie)
+        .send()
+        .context("failed to fetch auth audit")?
+        .error_for_status()
+        .context("auth audit returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse auth audit response json")?;
+    assert_eq!(
+        audit.pointer("/profile_order/profile_ids/0").and_then(Value::as_str),
+        Some("m051-openai-b"),
+        "auth audit should include the persisted provider order"
+    );
+    let audit_events = audit
+        .get("events")
+        .and_then(Value::as_array)
+        .context("auth audit response missing events array")?;
+    assert!(
+        audit_events.iter().any(|event| {
+            event.pointer("/payload/event").and_then(Value::as_str)
+                == Some("auth.profile.order_set")
+        }),
+        "auth audit should include the order-set journal event"
+    );
+    assert!(
+        audit_events.iter().any(|event| {
+            event.pointer("/payload/event").and_then(Value::as_str)
+                == Some("auth.profile.cooldown_cleared")
+        }),
+        "auth audit should include the cooldown-clear journal event"
+    );
+    let redacted_audit = audit.to_string();
+    assert!(
+        !redacted_audit.contains("sk-m051-console-key-a")
+            && !redacted_audit.contains("sk-m051-console-key-b"),
+        "auth audit output must not include vault secret material"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn console_m52_control_plane_domains_publish_contract_metadata() -> Result<()> {
     let (child, admin_port) = spawn_palyrad_with_bound_console_principal(CONSOLE_ADMIN_PRINCIPAL)?;
     let mut daemon = ChildGuard::new(child);

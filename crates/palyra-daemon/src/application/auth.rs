@@ -480,3 +480,32 @@ pub(crate) async fn record_auth_refresh_journal_event(
         .await
         .map(|_| ())
 }
+
+#[allow(clippy::result_large_err)]
+pub(crate) async fn record_auth_runtime_operation_journal_event(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: &RequestContext,
+    event_name: &str,
+    payload: serde_json::Value,
+) -> Result<(), Status> {
+    runtime_state
+        .record_journal_event(JournalAppendRequest {
+            event_id: Ulid::new().to_string(),
+            session_id: Ulid::new().to_string(),
+            run_id: Ulid::new().to_string(),
+            kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
+            actor: common_v1::journal_event::EventActor::System as i32,
+            timestamp_unix_ms: current_unix_ms(),
+            payload_json: json!({
+                "event": event_name,
+                "details": payload,
+            })
+            .to_string()
+            .into_bytes(),
+            principal: context.principal.clone(),
+            device_id: context.device_id.clone(),
+            channel: context.channel.clone(),
+        })
+        .await
+        .map(|_| ())
+}
