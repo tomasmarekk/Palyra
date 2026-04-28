@@ -19,6 +19,7 @@ axum.workspace = true
 base64.workspace = true
 clap.workspace = true
 chrono.workspace = true
+futures.workspace = true
 palyra-auth = { version = "0.1.0", path = "../palyra-auth" }
 palyra-a2ui = { version = "0.1.0", path = "../palyra-a2ui" }
 palyra-common = { version = "0.1.0", path = "../palyra-common" }

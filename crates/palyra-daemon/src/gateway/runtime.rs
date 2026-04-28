@@ -28,9 +28,11 @@ use crate::journal::{
     OrchestratorUsageSummary, RecallArtifactCreateRequest, RecallArtifactListFilter,
     RecallArtifactRecord, RetrievalBranchDiagnostics, SessionProjectContextStateCopyRequest,
     SessionProjectContextStateRecord, SessionProjectContextStateUpsertRequest,
-    SessionSearchOutcome, SessionSearchRequest, ToolResultArtifactCreateRequest,
-    ToolResultArtifactReadRequest, WorkspaceBootstrapOutcome, WorkspaceBootstrapRequest,
-    WorkspaceCheckpointCreateRequest, WorkspaceCheckpointFilePayload,
+    SessionSearchOutcome, SessionSearchRequest, ToolJobAttachRequest, ToolJobCreateRequest,
+    ToolJobRecord, ToolJobRetryRequest, ToolJobTailAppendRequest, ToolJobTailPage,
+    ToolJobTailReadRequest, ToolJobTransitionRequest, ToolJobsListFilter,
+    ToolResultArtifactCreateRequest, ToolResultArtifactReadRequest, WorkspaceBootstrapOutcome,
+    WorkspaceBootstrapRequest, WorkspaceCheckpointCreateRequest, WorkspaceCheckpointFilePayload,
     WorkspaceCheckpointFileRecord, WorkspaceCheckpointListFilter,
     WorkspaceCheckpointPairLinkRequest, WorkspaceCheckpointRecord,
     WorkspaceCheckpointRestoreMarkRequest, WorkspaceDocumentDeleteRequest,
@@ -4313,6 +4315,243 @@ impl GatewayRuntimeState {
         tokio::task::spawn_blocking(move || state.read_tool_result_artifact_blocking(&request))
             .await
             .map_err(|_| Status::internal("tool result artifact read worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn create_tool_job_blocking(
+        &self,
+        request: &ToolJobCreateRequest,
+    ) -> Result<ToolJobRecord, Status> {
+        self.journal_store
+            .create_tool_job(request)
+            .map_err(|error| map_orchestrator_store_error("create tool job", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn create_tool_job(
+        self: &Arc<Self>,
+        request: ToolJobCreateRequest,
+    ) -> Result<ToolJobRecord, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.create_tool_job_blocking(&request))
+            .await
+            .map_err(|_| Status::internal("tool job create worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn get_tool_job_blocking(&self, job_id: &str) -> Result<Option<ToolJobRecord>, Status> {
+        self.journal_store
+            .get_tool_job(job_id)
+            .map_err(|error| map_orchestrator_store_error("get tool job", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn get_tool_job(
+        self: &Arc<Self>,
+        job_id: String,
+    ) -> Result<Option<ToolJobRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.get_tool_job_blocking(job_id.as_str()))
+            .await
+            .map_err(|_| Status::internal("tool job get worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn list_tool_jobs_blocking(
+        &self,
+        filter: &ToolJobsListFilter,
+    ) -> Result<Vec<ToolJobRecord>, Status> {
+        self.journal_store
+            .list_tool_jobs(filter)
+            .map_err(|error| map_orchestrator_store_error("list tool jobs", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn list_tool_jobs(
+        self: &Arc<Self>,
+        filter: ToolJobsListFilter,
+    ) -> Result<Vec<ToolJobRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.list_tool_jobs_blocking(&filter))
+            .await
+            .map_err(|_| Status::internal("tool job list worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn transition_tool_job_blocking(
+        &self,
+        request: &ToolJobTransitionRequest,
+    ) -> Result<ToolJobRecord, Status> {
+        self.journal_store
+            .transition_tool_job(request)
+            .map_err(|error| map_orchestrator_store_error("transition tool job", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn transition_tool_job(
+        self: &Arc<Self>,
+        request: ToolJobTransitionRequest,
+    ) -> Result<ToolJobRecord, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.transition_tool_job_blocking(&request))
+            .await
+            .map_err(|_| Status::internal("tool job transition worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn append_tool_job_tail_blocking(
+        &self,
+        request: &ToolJobTailAppendRequest,
+    ) -> Result<crate::journal::ToolJobTailEntry, Status> {
+        self.journal_store
+            .append_tool_job_tail(request)
+            .map_err(|error| map_orchestrator_store_error("append tool job tail", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn append_tool_job_tail(
+        self: &Arc<Self>,
+        request: ToolJobTailAppendRequest,
+    ) -> Result<crate::journal::ToolJobTailEntry, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.append_tool_job_tail_blocking(&request))
+            .await
+            .map_err(|_| Status::internal("tool job tail append worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn tail_tool_job_blocking(
+        &self,
+        request: &ToolJobTailReadRequest,
+    ) -> Result<ToolJobTailPage, Status> {
+        self.journal_store
+            .tail_tool_job(request)
+            .map_err(|error| map_orchestrator_store_error("tail tool job", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn tail_tool_job(
+        self: &Arc<Self>,
+        request: ToolJobTailReadRequest,
+    ) -> Result<ToolJobTailPage, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.tail_tool_job_blocking(&request))
+            .await
+            .map_err(|_| Status::internal("tool job tail worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn attach_tool_job_blocking(
+        &self,
+        request: &ToolJobAttachRequest,
+    ) -> Result<ToolJobRecord, Status> {
+        self.journal_store
+            .attach_tool_job(request)
+            .map_err(|error| map_orchestrator_store_error("attach tool job", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn attach_tool_job(
+        self: &Arc<Self>,
+        request: ToolJobAttachRequest,
+    ) -> Result<ToolJobRecord, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.attach_tool_job_blocking(&request))
+            .await
+            .map_err(|_| Status::internal("tool job attach worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn release_tool_job_attachment_blocking(&self, job_id: &str) -> Result<ToolJobRecord, Status> {
+        self.journal_store
+            .release_tool_job_attachment(job_id)
+            .map_err(|error| map_orchestrator_store_error("release tool job attachment", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn release_tool_job_attachment(
+        self: &Arc<Self>,
+        job_id: String,
+    ) -> Result<ToolJobRecord, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.release_tool_job_attachment_blocking(job_id.as_str())
+        })
+        .await
+        .map_err(|_| Status::internal("tool job attachment release worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn retry_tool_job_blocking(
+        &self,
+        request: &ToolJobRetryRequest,
+    ) -> Result<ToolJobRecord, Status> {
+        self.journal_store
+            .retry_tool_job(request)
+            .map_err(|error| map_orchestrator_store_error("retry tool job", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn retry_tool_job(
+        self: &Arc<Self>,
+        request: ToolJobRetryRequest,
+    ) -> Result<ToolJobRecord, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.retry_tool_job_blocking(&request))
+            .await
+            .map_err(|_| Status::internal("tool job retry worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn sweep_expired_tool_jobs_blocking(
+        &self,
+        now_unix_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<ToolJobRecord>, Status> {
+        self.journal_store
+            .sweep_expired_tool_jobs(now_unix_ms, limit)
+            .map_err(|error| map_orchestrator_store_error("sweep expired tool jobs", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn sweep_expired_tool_jobs(
+        self: &Arc<Self>,
+        now_unix_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<ToolJobRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.sweep_expired_tool_jobs_blocking(now_unix_ms, limit)
+        })
+        .await
+        .map_err(|_| Status::internal("tool job sweep worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn recover_stale_tool_jobs_blocking(
+        &self,
+        now_unix_ms: i64,
+        stale_after_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<ToolJobRecord>, Status> {
+        self.journal_store
+            .recover_stale_tool_jobs(now_unix_ms, stale_after_ms, limit)
+            .map_err(|error| map_orchestrator_store_error("recover stale tool jobs", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn recover_stale_tool_jobs(
+        self: &Arc<Self>,
+        now_unix_ms: i64,
+        stale_after_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<ToolJobRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.recover_stale_tool_jobs_blocking(now_unix_ms, stale_after_ms, limit)
+        })
+        .await
+        .map_err(|_| Status::internal("tool job recovery worker panicked"))?
     }
 
     #[allow(clippy::result_large_err)]

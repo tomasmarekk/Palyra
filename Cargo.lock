@@ -2989,6 +2989,7 @@ dependencies = [
  "base64",
  "chrono",
  "clap",
+ "futures",
  "hex",
  "libc",
  "lopdf",

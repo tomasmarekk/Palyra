@@ -221,10 +221,14 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
             "palyra.tool_program.run",
             "Execute a bounded ToolProgram DAG through nested tool policy gates.",
             object_schema(
-                &["schema_version", "program_id", "steps"],
+                &["schema_version", "program_id", "granted_tools", "steps"],
                 vec![
                     ("schema_version", json!({"type":"integer","enum":[1]})),
                     ("program_id", json!({"type":"string","maxLength":128})),
+                    (
+                        "granted_tools",
+                        json!({"type":"array","items":{"type":"string","maxLength":256},"minItems":1,"maxItems":64}),
+                    ),
                     (
                         "budgets",
                         json!({"type":"object","properties":{},"additionalProperties":true}),

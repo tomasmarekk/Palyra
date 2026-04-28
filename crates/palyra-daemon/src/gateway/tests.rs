@@ -2580,6 +2580,7 @@ async fn tool_program_runtime_executes_echo_and_emits_child_attestation() {
         br#"{
             "schema_version": 1,
             "program_id": "program-runtime",
+            "granted_tools": ["palyra.echo"],
             "steps": [
                 {"step_id": "echo", "tool": "palyra.echo", "input": {"text": "nested ok"}}
             ]
@@ -2630,6 +2631,7 @@ async fn tool_program_runtime_denies_sensitive_child_without_nested_approval() {
         br#"{
             "schema_version": 1,
             "program_id": "program-denied",
+            "granted_tools": ["palyra.process.run"],
             "steps": [
                 {"step_id": "process", "tool": "palyra.process.run", "input": {"command": "echo", "args": ["blocked"]}}
             ]

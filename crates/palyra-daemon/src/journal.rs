@@ -74,6 +74,10 @@ const MAX_WORKSPACE_SEARCH_CANDIDATES: usize = 256;
 const MAX_WORKSPACE_VECTOR_SCAN_CANDIDATES: usize = 1_024;
 const WORKSPACE_CHUNK_TARGET_BYTES: usize = 1_024;
 const WORKSPACE_CHUNK_OVERLAP_BYTES: usize = 160;
+const MAX_TOOL_JOBS_LIST_LIMIT: usize = 500;
+const MAX_TOOL_JOB_TAIL_LIMIT: usize = 1_000;
+const MAX_TOOL_JOB_TAIL_CHUNK_BYTES: usize = 64 * 1_024;
+const MAX_TOOL_JOB_TAIL_PREVIEW_BYTES: usize = 16 * 1_024;
 
 pub trait MemoryEmbeddingProvider: Send + Sync {
     fn model_name(&self) -> &str;
@@ -1555,6 +1559,301 @@ pub struct ToolResultArtifactReadRequest {
     pub text_preview: bool,
 }
 
+/// Durable lifecycle state for a long-running tool job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolJobState {
+    Queued,
+    Starting,
+    Running,
+    Draining,
+    Cancelling,
+    Completed,
+    Failed,
+    Cancelled,
+    Expired,
+    Orphaned,
+}
+
+impl ToolJobState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Draining => "draining",
+            Self::Cancelling => "cancelling",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Expired => "expired",
+            Self::Orphaned => "orphaned",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "queued" => Some(Self::Queued),
+            "starting" => Some(Self::Starting),
+            "running" => Some(Self::Running),
+            "draining" => Some(Self::Draining),
+            "cancelling" => Some(Self::Cancelling),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            "cancelled" => Some(Self::Cancelled),
+            "expired" => Some(Self::Expired),
+            "orphaned" => Some(Self::Orphaned),
+            _ => None,
+        }
+    }
+
+    pub fn is_active(self) -> bool {
+        matches!(
+            self,
+            Self::Queued | Self::Starting | Self::Running | Self::Draining | Self::Cancelling
+        )
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled | Self::Expired)
+    }
+
+    fn can_transition_to(self, next: Self) -> bool {
+        if self == next {
+            return true;
+        }
+        match self {
+            Self::Queued => matches!(
+                next,
+                Self::Starting | Self::Running | Self::Cancelled | Self::Failed | Self::Expired
+            ),
+            Self::Starting => matches!(
+                next,
+                Self::Running | Self::Cancelling | Self::Cancelled | Self::Failed | Self::Orphaned
+            ),
+            Self::Running => matches!(
+                next,
+                Self::Draining | Self::Cancelling | Self::Completed | Self::Failed | Self::Orphaned
+            ),
+            Self::Draining => matches!(
+                next,
+                Self::Completed
+                    | Self::Failed
+                    | Self::Cancelling
+                    | Self::Cancelled
+                    | Self::Orphaned
+            ),
+            Self::Cancelling => matches!(next, Self::Cancelled | Self::Failed | Self::Orphaned),
+            Self::Completed => matches!(next, Self::Expired),
+            Self::Failed => matches!(next, Self::Queued | Self::Expired),
+            Self::Cancelled => matches!(next, Self::Queued | Self::Expired),
+            Self::Expired => false,
+            Self::Orphaned => matches!(
+                next,
+                Self::Queued | Self::Cancelling | Self::Cancelled | Self::Failed | Self::Expired
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolJobTailStream {
+    Stdout,
+    Stderr,
+    Event,
+}
+
+impl ToolJobTailStream {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+            Self::Event => "event",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "stdout" => Some(Self::Stdout),
+            "stderr" => Some(Self::Stderr),
+            "event" => Some(Self::Event),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolJobRetryPolicy {
+    pub max_attempts: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+}
+
+impl Default for ToolJobRetryPolicy {
+    fn default() -> Self {
+        Self { max_attempts: 1, idempotency_key: None }
+    }
+}
+
+impl ToolJobRetryPolicy {
+    pub fn retry_allowed(&self) -> bool {
+        self.max_attempts > 1
+            && self.idempotency_key.as_deref().is_some_and(|value| !value.is_empty())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ToolJobRetentionPolicy {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix_ms: Option<i64>,
+    pub legal_hold: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolJobCreateRequest {
+    pub job_id: String,
+    pub owner_principal: String,
+    pub device_id: String,
+    pub channel: Option<String>,
+    pub session_id: String,
+    pub run_id: String,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub backend: String,
+    pub backend_reason_code: Option<String>,
+    pub command_sha256: String,
+    pub program_sha256: Option<String>,
+    pub state: ToolJobState,
+    pub retry_policy: ToolJobRetryPolicy,
+    pub cancellation_handle: Option<String>,
+    pub retention: ToolJobRetentionPolicy,
+    pub artifact_refs_json: Option<String>,
+    pub lease_expires_at_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolJobTransitionRequest {
+    pub job_id: String,
+    pub expected_state: Option<ToolJobState>,
+    pub next_state: ToolJobState,
+    pub reason: String,
+    pub last_error: Option<String>,
+    pub heartbeat_at_unix_ms: Option<i64>,
+    pub lease_expires_at_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolJobTailAppendRequest {
+    pub job_id: String,
+    pub stream: ToolJobTailStream,
+    pub chunk: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolJobTailReadRequest {
+    pub job_id: String,
+    pub owner_principal: Option<String>,
+    pub offset: i64,
+    pub limit: usize,
+    pub max_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ToolJobsListFilter {
+    pub owner_principal: Option<String>,
+    pub session_id: Option<String>,
+    pub run_id: Option<String>,
+    pub include_terminal: bool,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolJobRetryRequest {
+    pub job_id: String,
+    pub owner_principal: Option<String>,
+    pub idempotency_key: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolJobAttachRequest {
+    pub job_id: String,
+    pub owner_principal: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ToolJobRecord {
+    pub job_id: String,
+    pub owner_principal: String,
+    pub device_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    pub session_id: String,
+    pub run_id: String,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub backend: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend_reason_code: Option<String>,
+    pub command_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub program_sha256: Option<String>,
+    pub state: ToolJobState,
+    pub attempt_count: u32,
+    pub max_attempts: u32,
+    pub retry_allowed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancellation_handle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_refs_json: Option<String>,
+    pub tail_preview: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stdout_artifact_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stderr_artifact_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_reason: Option<String>,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heartbeat_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix_ms: Option<i64>,
+    pub legal_hold: bool,
+    pub active_ref_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_expires_at_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ToolJobTailEntry {
+    pub seq: i64,
+    pub job_id: String,
+    pub stream: ToolJobTailStream,
+    pub chunk_redacted: String,
+    pub chunk_sha256: String,
+    pub byte_len: usize,
+    pub created_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ToolJobTailPage {
+    pub job_id: String,
+    pub entries: Vec<ToolJobTailEntry>,
+    pub next_offset: i64,
+    pub eof: bool,
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct OrchestratorRunMetadataUpdateRequest {
     pub run_id: String,
@@ -2934,6 +3233,16 @@ pub enum JournalError {
     ToolResultArtifactScopeMismatch { artifact_id: String },
     #[error("tool result artifact is not readable: {artifact_id}: {reason}")]
     ToolResultArtifactReadDenied { artifact_id: String, reason: String },
+    #[error("tool job already exists: {job_id}")]
+    DuplicateToolJobId { job_id: String },
+    #[error("tool job not found: {job_id}")]
+    ToolJobNotFound { job_id: String },
+    #[error("tool job scope mismatch: {job_id}")]
+    ToolJobScopeMismatch { job_id: String },
+    #[error("invalid tool job transition for {job_id}: {from} -> {to}")]
+    InvalidToolJobTransition { job_id: String, from: String, to: String },
+    #[error("tool job retry denied for {job_id}: {reason}")]
+    ToolJobRetryDenied { job_id: String, reason: String },
     #[error("canvas state already exists for canvas {canvas_id} at version {state_version}")]
     DuplicateCanvasStateVersion { canvas_id: String, state_version: u64 },
     #[error("cron job not found: {job_id}")]
@@ -4403,6 +4712,80 @@ const MIGRATIONS: &[Migration] = &[
             END;
         "#,
     },
+    Migration {
+        version: 31,
+        name: "durable_tool_jobs",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS tool_jobs (
+                job_ulid TEXT PRIMARY KEY,
+                owner_principal TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                channel TEXT,
+                session_ulid TEXT NOT NULL,
+                run_ulid TEXT NOT NULL,
+                tool_call_ulid TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                backend TEXT NOT NULL,
+                backend_reason_code TEXT,
+                command_sha256 TEXT NOT NULL,
+                program_sha256 TEXT,
+                state TEXT NOT NULL,
+                attempt_count INTEGER NOT NULL,
+                max_attempts INTEGER NOT NULL,
+                retry_allowed INTEGER NOT NULL,
+                idempotency_key TEXT,
+                cancellation_handle TEXT,
+                artifact_refs_json TEXT,
+                tail_preview TEXT NOT NULL,
+                stdout_artifact_ulid TEXT,
+                stderr_artifact_ulid TEXT,
+                last_error TEXT,
+                state_reason TEXT,
+                created_at_unix_ms INTEGER NOT NULL,
+                updated_at_unix_ms INTEGER NOT NULL,
+                started_at_unix_ms INTEGER,
+                heartbeat_at_unix_ms INTEGER,
+                completed_at_unix_ms INTEGER,
+                expires_at_unix_ms INTEGER,
+                legal_hold INTEGER NOT NULL DEFAULT 0,
+                active_ref_count INTEGER NOT NULL DEFAULT 0,
+                lease_expires_at_unix_ms INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_tool_jobs_owner_updated
+                ON tool_jobs(owner_principal, updated_at_unix_ms DESC, job_ulid DESC);
+            CREATE INDEX IF NOT EXISTS idx_tool_jobs_session_run
+                ON tool_jobs(session_ulid, run_ulid, updated_at_unix_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_tool_jobs_state_updated
+                ON tool_jobs(state, updated_at_unix_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_tool_jobs_expiry
+                ON tool_jobs(expires_at_unix_ms, legal_hold, active_ref_count);
+            CREATE INDEX IF NOT EXISTS idx_tool_jobs_heartbeat
+                ON tool_jobs(state, heartbeat_at_unix_ms, lease_expires_at_unix_ms);
+
+            CREATE TABLE IF NOT EXISTS tool_job_tail_entries (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_ulid TEXT NOT NULL,
+                stream TEXT NOT NULL,
+                chunk_redacted TEXT NOT NULL,
+                chunk_sha256 TEXT NOT NULL,
+                byte_len INTEGER NOT NULL,
+                created_at_unix_ms INTEGER NOT NULL,
+                FOREIGN KEY(job_ulid) REFERENCES tool_jobs(job_ulid)
+            );
+            CREATE INDEX IF NOT EXISTS idx_tool_job_tail_entries_job
+                ON tool_job_tail_entries(job_ulid, seq ASC);
+            CREATE TRIGGER IF NOT EXISTS trg_tool_job_tail_entries_prevent_update
+            BEFORE UPDATE ON tool_job_tail_entries
+            BEGIN
+                SELECT RAISE(ABORT, 'tool_job_tail_entries is append-only');
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_tool_job_tail_entries_prevent_delete
+            BEFORE DELETE ON tool_job_tail_entries
+            BEGIN
+                SELECT RAISE(ABORT, 'tool_job_tail_entries is append-only');
+            END;
+        "#,
+    },
 ];
 
 fn serialize_json_field<T: Serialize>(
@@ -4581,6 +4964,174 @@ fn hydrate_idempotency_record(
         updated_at_unix_ms: row.get(8)?,
         expires_at_unix_ms: row.get(9)?,
     })
+}
+
+const TOOL_JOB_SELECT_COLUMNS: &str = r#"
+    job_ulid,
+    owner_principal,
+    device_id,
+    channel,
+    session_ulid,
+    run_ulid,
+    tool_call_ulid,
+    tool_name,
+    backend,
+    backend_reason_code,
+    command_sha256,
+    program_sha256,
+    state,
+    attempt_count,
+    max_attempts,
+    retry_allowed,
+    idempotency_key,
+    cancellation_handle,
+    artifact_refs_json,
+    tail_preview,
+    stdout_artifact_ulid,
+    stderr_artifact_ulid,
+    last_error,
+    state_reason,
+    created_at_unix_ms,
+    updated_at_unix_ms,
+    started_at_unix_ms,
+    heartbeat_at_unix_ms,
+    completed_at_unix_ms,
+    expires_at_unix_ms,
+    legal_hold,
+    active_ref_count,
+    lease_expires_at_unix_ms
+"#;
+
+fn hydrate_tool_job_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ToolJobRecord> {
+    let raw_state: String = row.get(12)?;
+    let attempt_count: i64 = row.get(13)?;
+    let max_attempts: i64 = row.get(14)?;
+    let active_ref_count: i64 = row.get(31)?;
+    Ok(ToolJobRecord {
+        job_id: row.get(0)?,
+        owner_principal: row.get(1)?,
+        device_id: row.get(2)?,
+        channel: row.get(3)?,
+        session_id: row.get(4)?,
+        run_id: row.get(5)?,
+        tool_call_id: row.get(6)?,
+        tool_name: row.get(7)?,
+        backend: row.get(8)?,
+        backend_reason_code: row.get(9)?,
+        command_sha256: row.get(10)?,
+        program_sha256: row.get(11)?,
+        state: ToolJobState::parse(raw_state.as_str()).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                12,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::other(format!("unknown tool job state: {raw_state}"))),
+            )
+        })?,
+        attempt_count: attempt_count.max(0) as u32,
+        max_attempts: max_attempts.max(0) as u32,
+        retry_allowed: row.get::<_, i64>(15)? == 1,
+        idempotency_key: row.get(16)?,
+        cancellation_handle: row.get(17)?,
+        artifact_refs_json: row.get(18)?,
+        tail_preview: row.get(19)?,
+        stdout_artifact_id: row.get(20)?,
+        stderr_artifact_id: row.get(21)?,
+        last_error: row.get(22)?,
+        state_reason: row.get(23)?,
+        created_at_unix_ms: row.get(24)?,
+        updated_at_unix_ms: row.get(25)?,
+        started_at_unix_ms: row.get(26)?,
+        heartbeat_at_unix_ms: row.get(27)?,
+        completed_at_unix_ms: row.get(28)?,
+        expires_at_unix_ms: row.get(29)?,
+        legal_hold: row.get::<_, i64>(30)? == 1,
+        active_ref_count: active_ref_count.max(0) as u32,
+        lease_expires_at_unix_ms: row.get(32)?,
+    })
+}
+
+fn hydrate_tool_job_tail_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<ToolJobTailEntry> {
+    let raw_stream: String = row.get(2)?;
+    let byte_len: i64 = row.get(5)?;
+    Ok(ToolJobTailEntry {
+        seq: row.get(0)?,
+        job_id: row.get(1)?,
+        stream: ToolJobTailStream::parse(raw_stream.as_str()).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                2,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::other(format!(
+                    "unknown tool job tail stream: {raw_stream}"
+                ))),
+            )
+        })?,
+        chunk_redacted: row.get(3)?,
+        chunk_sha256: row.get(4)?,
+        byte_len: byte_len.max(0) as usize,
+        created_at_unix_ms: row.get(6)?,
+    })
+}
+
+fn load_tool_job(
+    connection: &Connection,
+    job_id: &str,
+) -> Result<Option<ToolJobRecord>, JournalError> {
+    connection
+        .query_row(
+            format!("SELECT {TOOL_JOB_SELECT_COLUMNS} FROM tool_jobs WHERE job_ulid = ?1").as_str(),
+            params![job_id],
+            hydrate_tool_job_record,
+        )
+        .optional()
+        .map_err(JournalError::from)
+}
+
+fn require_tool_job_scope(
+    record: &ToolJobRecord,
+    owner_principal: &Option<String>,
+) -> Result<(), JournalError> {
+    if owner_principal.as_ref().is_some_and(|principal| principal != &record.owner_principal) {
+        return Err(JournalError::ToolJobScopeMismatch { job_id: record.job_id.clone() });
+    }
+    Ok(())
+}
+
+fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
+
+fn truncate_utf8_bytes_from_end(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let mut start = value.len().saturating_sub(max_bytes);
+    while start < value.len() && !value.is_char_boundary(start) {
+        start += 1;
+    }
+    value[start..].to_owned()
+}
+
+fn redact_tool_job_tail_chunk(chunk: &str) -> String {
+    let redacted = redact_error_text(chunk);
+    truncate_utf8_bytes(redacted.as_str(), MAX_TOOL_JOB_TAIL_CHUNK_BYTES)
+}
+
+fn append_tool_job_tail_preview(existing: &str, chunk_redacted: &str) -> String {
+    let mut preview =
+        String::with_capacity(existing.len().saturating_add(chunk_redacted.len() + 1));
+    if !existing.is_empty() {
+        preview.push_str(existing);
+        preview.push('\n');
+    }
+    preview.push_str(chunk_redacted);
+    truncate_utf8_bytes_from_end(preview.as_str(), MAX_TOOL_JOB_TAIL_PREVIEW_BYTES)
 }
 
 fn load_tool_result_artifact(
@@ -6905,6 +7456,567 @@ impl JournalStore {
                 .then(|| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, slice)),
             text,
         })
+    }
+
+    pub fn create_tool_job(
+        &self,
+        request: &ToolJobCreateRequest,
+    ) -> Result<ToolJobRecord, JournalError> {
+        if request.job_id.trim().is_empty() {
+            return Err(JournalError::InvalidArgument("tool job id cannot be empty".to_owned()));
+        }
+        if request.owner_principal.trim().is_empty() {
+            return Err(JournalError::InvalidArgument(
+                "tool job owner principal cannot be empty".to_owned(),
+            ));
+        }
+        if request.tool_name.trim().is_empty() {
+            return Err(JournalError::InvalidArgument(
+                "tool job tool name cannot be empty".to_owned(),
+            ));
+        }
+        if request.command_sha256.trim().is_empty() {
+            return Err(JournalError::InvalidArgument(
+                "tool job command hash cannot be empty".to_owned(),
+            ));
+        }
+        let now = current_unix_ms()?;
+        let retry_allowed = request.retry_policy.retry_allowed();
+        let started_at = request
+            .state
+            .is_active()
+            .then_some(now)
+            .filter(|_| request.state != ToolJobState::Queued);
+        let completed_at = request.state.is_terminal().then_some(now);
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        match guard.execute(
+            r#"
+                INSERT INTO tool_jobs (
+                    job_ulid,
+                    owner_principal,
+                    device_id,
+                    channel,
+                    session_ulid,
+                    run_ulid,
+                    tool_call_ulid,
+                    tool_name,
+                    backend,
+                    backend_reason_code,
+                    command_sha256,
+                    program_sha256,
+                    state,
+                    attempt_count,
+                    max_attempts,
+                    retry_allowed,
+                    idempotency_key,
+                    cancellation_handle,
+                    artifact_refs_json,
+                    tail_preview,
+                    stdout_artifact_ulid,
+                    stderr_artifact_ulid,
+                    last_error,
+                    state_reason,
+                    created_at_unix_ms,
+                    updated_at_unix_ms,
+                    started_at_unix_ms,
+                    heartbeat_at_unix_ms,
+                    completed_at_unix_ms,
+                    expires_at_unix_ms,
+                    legal_hold,
+                    active_ref_count,
+                    lease_expires_at_unix_ms
+                ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                    ?11, ?12, ?13, 1, ?14, ?15, ?16, ?17, ?18, '',
+                    NULL, NULL, NULL, NULL, ?19, ?20, ?21, ?22, ?23, ?24,
+                    ?25, 0, ?26
+                )
+            "#,
+            params![
+                request.job_id,
+                request.owner_principal,
+                request.device_id,
+                request.channel,
+                request.session_id,
+                request.run_id,
+                request.tool_call_id,
+                request.tool_name,
+                request.backend,
+                request.backend_reason_code,
+                request.command_sha256,
+                request.program_sha256,
+                request.state.as_str(),
+                i64::from(request.retry_policy.max_attempts.max(1)),
+                if retry_allowed { 1_i64 } else { 0_i64 },
+                request.retry_policy.idempotency_key,
+                request.cancellation_handle,
+                request.artifact_refs_json,
+                now,
+                now,
+                started_at,
+                request.state.is_active().then_some(now),
+                completed_at,
+                request.retention.expires_at_unix_ms,
+                if request.retention.legal_hold { 1_i64 } else { 0_i64 },
+                request.lease_expires_at_unix_ms,
+            ],
+        ) {
+            Ok(_) => load_tool_job(&guard, request.job_id.as_str())?
+                .ok_or_else(|| JournalError::ToolJobNotFound { job_id: request.job_id.clone() }),
+            Err(rusqlite::Error::SqliteFailure(error, message))
+                if error.code == ErrorCode::ConstraintViolation
+                    && (error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+                        || error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                        || message
+                            .as_deref()
+                            .map(|value| value.contains("tool_jobs"))
+                            .unwrap_or(false)) =>
+            {
+                Err(JournalError::DuplicateToolJobId { job_id: request.job_id.clone() })
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn get_tool_job(&self, job_id: &str) -> Result<Option<ToolJobRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        load_tool_job(&guard, job_id)
+    }
+
+    pub fn list_tool_jobs(
+        &self,
+        filter: &ToolJobsListFilter,
+    ) -> Result<Vec<ToolJobRecord>, JournalError> {
+        let limit = filter.limit.clamp(1, MAX_TOOL_JOBS_LIST_LIMIT);
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let mut sql = format!("SELECT {TOOL_JOB_SELECT_COLUMNS} FROM tool_jobs");
+        let mut conditions = Vec::<String>::new();
+        let mut params = Vec::<Box<dyn rusqlite::ToSql>>::new();
+        let push_condition = |conditions: &mut Vec<String>,
+                              params: &mut Vec<Box<dyn rusqlite::ToSql>>,
+                              column: &str,
+                              value: &Option<String>| {
+            if let Some(value) = value.as_ref() {
+                let placeholder = params.len() + 1;
+                conditions.push(format!("{column} = ?{placeholder}"));
+                params.push(Box::new(value.clone()));
+            }
+        };
+        push_condition(&mut conditions, &mut params, "owner_principal", &filter.owner_principal);
+        push_condition(&mut conditions, &mut params, "session_ulid", &filter.session_id);
+        push_condition(&mut conditions, &mut params, "run_ulid", &filter.run_id);
+        if !filter.include_terminal {
+            conditions.push(
+                "state IN ('queued', 'starting', 'running', 'draining', 'cancelling', 'orphaned')"
+                    .to_owned(),
+            );
+        }
+        if !conditions.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(conditions.join(" AND ").as_str());
+        }
+        let limit_placeholder = params.len() + 1;
+        sql.push_str(
+            format!(" ORDER BY updated_at_unix_ms DESC, job_ulid DESC LIMIT ?{limit_placeholder}")
+                .as_str(),
+        );
+        params.push(Box::new(limit as i64));
+
+        let mut statement = guard.prepare(sql.as_str())?;
+        let mut rows = statement.query(params_from_iter(
+            params.iter().map(|value| value.as_ref() as &dyn rusqlite::ToSql),
+        ))?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next()? {
+            records.push(hydrate_tool_job_record(row)?);
+        }
+        Ok(records)
+    }
+
+    pub fn transition_tool_job(
+        &self,
+        request: &ToolJobTransitionRequest,
+    ) -> Result<ToolJobRecord, JournalError> {
+        let now = current_unix_ms()?;
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let Some(current) = load_tool_job(&guard, request.job_id.as_str())? else {
+            return Err(JournalError::ToolJobNotFound { job_id: request.job_id.clone() });
+        };
+        if request.expected_state.is_some_and(|expected| expected != current.state) {
+            return Err(JournalError::InvalidToolJobTransition {
+                job_id: request.job_id.clone(),
+                from: current.state.as_str().to_owned(),
+                to: request.next_state.as_str().to_owned(),
+            });
+        }
+        if !current.state.can_transition_to(request.next_state) {
+            return Err(JournalError::InvalidToolJobTransition {
+                job_id: request.job_id.clone(),
+                from: current.state.as_str().to_owned(),
+                to: request.next_state.as_str().to_owned(),
+            });
+        }
+        let started_at = current
+            .started_at_unix_ms
+            .or_else(|| request.next_state.is_active().then_some(now))
+            .filter(|_| request.next_state != ToolJobState::Queued);
+        let heartbeat_at = request
+            .heartbeat_at_unix_ms
+            .or_else(|| request.next_state.is_active().then_some(now))
+            .or(current.heartbeat_at_unix_ms);
+        let completed_at = if request.next_state.is_terminal() {
+            current.completed_at_unix_ms.or(Some(now))
+        } else {
+            current.completed_at_unix_ms
+        };
+        guard.execute(
+            r#"
+                UPDATE tool_jobs
+                SET state = ?2,
+                    state_reason = ?3,
+                    last_error = ?4,
+                    updated_at_unix_ms = ?5,
+                    started_at_unix_ms = ?6,
+                    heartbeat_at_unix_ms = ?7,
+                    completed_at_unix_ms = ?8,
+                    lease_expires_at_unix_ms = ?9
+                WHERE job_ulid = ?1
+            "#,
+            params![
+                request.job_id,
+                request.next_state.as_str(),
+                request.reason,
+                request.last_error.as_ref().map(|value| redact_error_text(value)),
+                now,
+                started_at,
+                heartbeat_at,
+                completed_at,
+                request.lease_expires_at_unix_ms.or(current.lease_expires_at_unix_ms),
+            ],
+        )?;
+        load_tool_job(&guard, request.job_id.as_str())?
+            .ok_or_else(|| JournalError::ToolJobNotFound { job_id: request.job_id.clone() })
+    }
+
+    pub fn append_tool_job_tail(
+        &self,
+        request: &ToolJobTailAppendRequest,
+    ) -> Result<ToolJobTailEntry, JournalError> {
+        let chunk_bytes = request.chunk.len();
+        if chunk_bytes > self.config.max_payload_bytes {
+            return Err(JournalError::PayloadTooLarge {
+                payload_kind: "tool_job_tail",
+                actual_bytes: chunk_bytes,
+                max_bytes: self.config.max_payload_bytes,
+            });
+        }
+        let now = current_unix_ms()?;
+        let chunk_redacted = redact_tool_job_tail_chunk(request.chunk.as_str());
+        let chunk_sha256 = sha256_hex(chunk_redacted.as_bytes());
+        let byte_len = chunk_redacted.len();
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let Some(current) = load_tool_job(&guard, request.job_id.as_str())? else {
+            return Err(JournalError::ToolJobNotFound { job_id: request.job_id.clone() });
+        };
+        let tail_preview =
+            append_tool_job_tail_preview(current.tail_preview.as_str(), chunk_redacted.as_str());
+        guard.execute(
+            r#"
+                INSERT INTO tool_job_tail_entries (
+                    job_ulid,
+                    stream,
+                    chunk_redacted,
+                    chunk_sha256,
+                    byte_len,
+                    created_at_unix_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+            params![
+                request.job_id,
+                request.stream.as_str(),
+                chunk_redacted,
+                chunk_sha256,
+                byte_len as i64,
+                now,
+            ],
+        )?;
+        let seq = guard.last_insert_rowid();
+        guard.execute(
+            r#"
+                UPDATE tool_jobs
+                SET tail_preview = ?2,
+                    heartbeat_at_unix_ms = ?3,
+                    updated_at_unix_ms = ?3
+                WHERE job_ulid = ?1
+            "#,
+            params![request.job_id, tail_preview, now],
+        )?;
+        guard
+            .query_row(
+                r#"
+                SELECT
+                    seq,
+                    job_ulid,
+                    stream,
+                    chunk_redacted,
+                    chunk_sha256,
+                    byte_len,
+                    created_at_unix_ms
+                FROM tool_job_tail_entries
+                WHERE seq = ?1
+            "#,
+                params![seq],
+                hydrate_tool_job_tail_entry,
+            )
+            .map_err(JournalError::from)
+    }
+
+    pub fn tail_tool_job(
+        &self,
+        request: &ToolJobTailReadRequest,
+    ) -> Result<ToolJobTailPage, JournalError> {
+        let limit = request.limit.clamp(1, MAX_TOOL_JOB_TAIL_LIMIT);
+        let max_bytes = request.max_bytes.clamp(1, MAX_TOOL_JOB_TAIL_PREVIEW_BYTES);
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let Some(record) = load_tool_job(&guard, request.job_id.as_str())? else {
+            return Err(JournalError::ToolJobNotFound { job_id: request.job_id.clone() });
+        };
+        require_tool_job_scope(&record, &request.owner_principal)?;
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    seq,
+                    job_ulid,
+                    stream,
+                    chunk_redacted,
+                    chunk_sha256,
+                    byte_len,
+                    created_at_unix_ms
+                FROM tool_job_tail_entries
+                WHERE job_ulid = ?1 AND seq > ?2
+                ORDER BY seq ASC
+                LIMIT ?3
+            "#,
+        )?;
+        let mut rows = statement.query(params![request.job_id, request.offset, limit as i64])?;
+        let mut entries = Vec::new();
+        let mut used_bytes = 0_usize;
+        let mut truncated = false;
+        while let Some(row) = rows.next()? {
+            let entry = hydrate_tool_job_tail_entry(row)?;
+            let next_bytes = used_bytes.saturating_add(entry.chunk_redacted.len());
+            if next_bytes > max_bytes {
+                truncated = true;
+                break;
+            }
+            used_bytes = next_bytes;
+            entries.push(entry);
+        }
+        let next_offset = entries.last().map(|entry| entry.seq).unwrap_or(request.offset);
+        Ok(ToolJobTailPage {
+            job_id: request.job_id.clone(),
+            eof: entries.len() < limit && !truncated,
+            entries,
+            next_offset,
+            truncated,
+        })
+    }
+
+    pub fn attach_tool_job(
+        &self,
+        request: &ToolJobAttachRequest,
+    ) -> Result<ToolJobRecord, JournalError> {
+        let now = current_unix_ms()?;
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let Some(record) = load_tool_job(&guard, request.job_id.as_str())? else {
+            return Err(JournalError::ToolJobNotFound { job_id: request.job_id.clone() });
+        };
+        require_tool_job_scope(&record, &request.owner_principal)?;
+        guard.execute(
+            r#"
+                UPDATE tool_jobs
+                SET active_ref_count = active_ref_count + 1,
+                    updated_at_unix_ms = ?2
+                WHERE job_ulid = ?1
+            "#,
+            params![request.job_id, now],
+        )?;
+        load_tool_job(&guard, request.job_id.as_str())?
+            .ok_or_else(|| JournalError::ToolJobNotFound { job_id: request.job_id.clone() })
+    }
+
+    pub fn release_tool_job_attachment(&self, job_id: &str) -> Result<ToolJobRecord, JournalError> {
+        let now = current_unix_ms()?;
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let Some(record) = load_tool_job(&guard, job_id)? else {
+            return Err(JournalError::ToolJobNotFound { job_id: job_id.to_owned() });
+        };
+        let next_ref_count = record.active_ref_count.saturating_sub(1);
+        guard.execute(
+            r#"
+                UPDATE tool_jobs
+                SET active_ref_count = ?2,
+                    updated_at_unix_ms = ?3
+                WHERE job_ulid = ?1
+            "#,
+            params![job_id, next_ref_count as i64, now],
+        )?;
+        load_tool_job(&guard, job_id)?
+            .ok_or_else(|| JournalError::ToolJobNotFound { job_id: job_id.to_owned() })
+    }
+
+    pub fn retry_tool_job(
+        &self,
+        request: &ToolJobRetryRequest,
+    ) -> Result<ToolJobRecord, JournalError> {
+        let now = current_unix_ms()?;
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let Some(record) = load_tool_job(&guard, request.job_id.as_str())? else {
+            return Err(JournalError::ToolJobNotFound { job_id: request.job_id.clone() });
+        };
+        require_tool_job_scope(&record, &request.owner_principal)?;
+        if !matches!(
+            record.state,
+            ToolJobState::Failed | ToolJobState::Cancelled | ToolJobState::Orphaned
+        ) {
+            return Err(JournalError::ToolJobRetryDenied {
+                job_id: request.job_id.clone(),
+                reason: "job state is not retryable".to_owned(),
+            });
+        }
+        if !record.retry_allowed || record.attempt_count >= record.max_attempts {
+            return Err(JournalError::ToolJobRetryDenied {
+                job_id: request.job_id.clone(),
+                reason: "retry policy exhausted or disabled".to_owned(),
+            });
+        }
+        let Some(stored_key) = record.idempotency_key.as_deref() else {
+            return Err(JournalError::ToolJobRetryDenied {
+                job_id: request.job_id.clone(),
+                reason: "retry requires idempotency key".to_owned(),
+            });
+        };
+        if request.idempotency_key.as_deref().is_some_and(|key| key != stored_key) {
+            return Err(JournalError::ToolJobRetryDenied {
+                job_id: request.job_id.clone(),
+                reason: "idempotency key mismatch".to_owned(),
+            });
+        }
+        guard.execute(
+            r#"
+                UPDATE tool_jobs
+                SET state = 'queued',
+                    attempt_count = attempt_count + 1,
+                    state_reason = ?2,
+                    last_error = NULL,
+                    updated_at_unix_ms = ?3,
+                    completed_at_unix_ms = NULL,
+                    heartbeat_at_unix_ms = ?3,
+                    active_ref_count = 0
+                WHERE job_ulid = ?1
+            "#,
+            params![request.job_id, request.reason, now],
+        )?;
+        load_tool_job(&guard, request.job_id.as_str())?
+            .ok_or_else(|| JournalError::ToolJobNotFound { job_id: request.job_id.clone() })
+    }
+
+    pub fn sweep_expired_tool_jobs(
+        &self,
+        now_unix_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<ToolJobRecord>, JournalError> {
+        let limit = limit.clamp(1, MAX_TOOL_JOBS_LIST_LIMIT);
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let mut statement = guard.prepare(
+            format!(
+                "SELECT {TOOL_JOB_SELECT_COLUMNS} FROM tool_jobs \
+                 WHERE expires_at_unix_ms IS NOT NULL \
+                   AND expires_at_unix_ms <= ?1 \
+                   AND legal_hold = 0 \
+                   AND active_ref_count = 0 \
+                   AND state != 'expired' \
+                 ORDER BY expires_at_unix_ms ASC, job_ulid ASC \
+                 LIMIT ?2"
+            )
+            .as_str(),
+        )?;
+        let rows =
+            statement.query_map(params![now_unix_ms, limit as i64], hydrate_tool_job_record)?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row?);
+        }
+        drop(statement);
+        for record in &records {
+            guard.execute(
+                r#"
+                    UPDATE tool_jobs
+                    SET state = 'expired',
+                        state_reason = 'ttl_sweeper',
+                        updated_at_unix_ms = ?2,
+                        completed_at_unix_ms = COALESCE(completed_at_unix_ms, ?2)
+                    WHERE job_ulid = ?1
+                "#,
+                params![record.job_id, now_unix_ms],
+            )?;
+        }
+        let mut expired = Vec::new();
+        for record in records {
+            if let Some(updated) = load_tool_job(&guard, record.job_id.as_str())? {
+                expired.push(updated);
+            }
+        }
+        Ok(expired)
+    }
+
+    pub fn recover_stale_tool_jobs(
+        &self,
+        now_unix_ms: i64,
+        stale_after_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<ToolJobRecord>, JournalError> {
+        let limit = limit.clamp(1, MAX_TOOL_JOBS_LIST_LIMIT);
+        let stale_before = now_unix_ms.saturating_sub(stale_after_ms.max(1));
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let mut statement = guard.prepare(
+            format!(
+                "SELECT {TOOL_JOB_SELECT_COLUMNS} FROM tool_jobs \
+                 WHERE state IN ('starting', 'running', 'draining', 'cancelling') \
+                   AND (COALESCE(heartbeat_at_unix_ms, updated_at_unix_ms) <= ?1 \
+                        OR (lease_expires_at_unix_ms IS NOT NULL AND lease_expires_at_unix_ms <= ?2)) \
+                 ORDER BY updated_at_unix_ms ASC, job_ulid ASC \
+                 LIMIT ?3"
+            )
+            .as_str(),
+        )?;
+        let rows = statement
+            .query_map(params![stale_before, now_unix_ms, limit as i64], hydrate_tool_job_record)?;
+        let mut stale = Vec::new();
+        for row in rows {
+            stale.push(row?);
+        }
+        drop(statement);
+        for record in &stale {
+            guard.execute(
+                r#"
+                    UPDATE tool_jobs
+                    SET state = 'orphaned',
+                        state_reason = 'startup_recovery_stale_heartbeat',
+                        updated_at_unix_ms = ?2,
+                        completed_at_unix_ms = NULL
+                    WHERE job_ulid = ?1
+                "#,
+                params![record.job_id, now_unix_ms],
+            )?;
+        }
+        let mut recovered = Vec::new();
+        for record in stale {
+            if let Some(updated) = load_tool_job(&guard, record.job_id.as_str())? {
+                recovered.push(updated);
+            }
+        }
+        Ok(recovered)
     }
 
     pub fn orchestrator_run_status_snapshot(
@@ -17784,11 +18896,14 @@ mod tests {
         OrchestratorCancelRequest, OrchestratorRunStartRequest, OrchestratorSessionUpsertRequest,
         OrchestratorTapeAppendRequest, OrchestratorUsageDelta, RecallArtifactCreateRequest,
         RecallArtifactListFilter, SessionSearchRequest, SkillExecutionStatus,
-        SkillStatusUpsertRequest, ToolResultArtifactCreateRequest, ToolResultArtifactReadRequest,
-        WorkspaceBootstrapRequest, WorkspaceDocumentDeleteRequest, WorkspaceDocumentMoveRequest,
-        WorkspaceDocumentWriteRequest, WorkspaceSearchRequest, CURRENT_MEMORY_EMBEDDING_VERSION,
-        MEMORY_RETENTION_DAY_MS, MIGRATIONS, RECALL_ARTIFACT_KIND_PREVIEW,
-        RECALL_ARTIFACT_KIND_SESSION_SEARCH,
+        SkillStatusUpsertRequest, ToolJobAttachRequest, ToolJobCreateRequest,
+        ToolJobRetentionPolicy, ToolJobRetryPolicy, ToolJobRetryRequest, ToolJobState,
+        ToolJobTailAppendRequest, ToolJobTailReadRequest, ToolJobTailStream,
+        ToolJobTransitionRequest, ToolJobsListFilter, ToolResultArtifactCreateRequest,
+        ToolResultArtifactReadRequest, WorkspaceBootstrapRequest, WorkspaceDocumentDeleteRequest,
+        WorkspaceDocumentMoveRequest, WorkspaceDocumentWriteRequest, WorkspaceSearchRequest,
+        CURRENT_MEMORY_EMBEDDING_VERSION, MEMORY_RETENTION_DAY_MS, MIGRATIONS,
+        RECALL_ARTIFACT_KIND_PREVIEW, RECALL_ARTIFACT_KIND_SESSION_SEARCH,
     };
 
     static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -18308,6 +19423,208 @@ mod tests {
             .list_tool_result_artifacts_for_run(run_id)
             .expect("artifact refs should be listable for replay");
         assert_eq!(artifacts.len(), 2);
+    }
+
+    #[test]
+    fn durable_tool_jobs_persist_transitions_tail_and_scope() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+
+        let created = store
+            .create_tool_job(&ToolJobCreateRequest {
+                job_id: "01JOB000000000000000000001".to_owned(),
+                owner_principal: "user:ops".to_owned(),
+                device_id: "device:local".to_owned(),
+                channel: Some("cli".to_owned()),
+                session_id: "01SESSION00000000000000001".to_owned(),
+                run_id: "01RUN00000000000000000001".to_owned(),
+                tool_call_id: "01CALL000000000000000001".to_owned(),
+                tool_name: "palyra.process.run".to_owned(),
+                backend: "local_sandbox".to_owned(),
+                backend_reason_code: Some("workspace_local".to_owned()),
+                command_sha256: sha256_hex(b"echo hello"),
+                program_sha256: None,
+                state: ToolJobState::Queued,
+                retry_policy: ToolJobRetryPolicy {
+                    max_attempts: 2,
+                    idempotency_key: Some("idem:tool-job".to_owned()),
+                },
+                cancellation_handle: Some("cancel:01JOB".to_owned()),
+                retention: ToolJobRetentionPolicy {
+                    expires_at_unix_ms: Some(4_100_000_000_000),
+                    legal_hold: false,
+                },
+                artifact_refs_json: Some(r#"["artifact:stdout"]"#.to_owned()),
+                lease_expires_at_unix_ms: Some(4_000_000_060_000),
+            })
+            .expect("tool job should be created");
+        assert_eq!(created.state, ToolJobState::Queued);
+        assert!(created.retry_allowed);
+        assert_eq!(created.attempt_count, 1);
+
+        let running = store
+            .transition_tool_job(&ToolJobTransitionRequest {
+                job_id: created.job_id.clone(),
+                expected_state: Some(ToolJobState::Queued),
+                next_state: ToolJobState::Running,
+                reason: "worker_started".to_owned(),
+                last_error: None,
+                heartbeat_at_unix_ms: Some(4_000_000_000_001),
+                lease_expires_at_unix_ms: Some(4_000_000_060_001),
+            })
+            .expect("queued job should become running");
+        assert_eq!(running.state, ToolJobState::Running);
+        assert_eq!(running.state_reason.as_deref(), Some("worker_started"));
+
+        let tail = store
+            .append_tool_job_tail(&ToolJobTailAppendRequest {
+                job_id: created.job_id.clone(),
+                stream: ToolJobTailStream::Stdout,
+                chunk: "downloaded from https://example.com/path?api_key=secret-value".to_owned(),
+            })
+            .expect("tail should append");
+        assert_eq!(tail.stream, ToolJobTailStream::Stdout);
+        assert!(!tail.chunk_redacted.contains("secret-value"));
+
+        let page = store
+            .tail_tool_job(&ToolJobTailReadRequest {
+                job_id: created.job_id.clone(),
+                owner_principal: Some("user:ops".to_owned()),
+                offset: 0,
+                limit: 10,
+                max_bytes: 4096,
+            })
+            .expect("owner should tail job");
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.next_offset, tail.seq);
+
+        let scope_error = store
+            .tail_tool_job(&ToolJobTailReadRequest {
+                job_id: created.job_id.clone(),
+                owner_principal: Some("user:other".to_owned()),
+                offset: 0,
+                limit: 10,
+                max_bytes: 4096,
+            })
+            .expect_err("foreign owner should not tail job");
+        assert!(matches!(scope_error, JournalError::ToolJobScopeMismatch { .. }));
+
+        let completed = store
+            .transition_tool_job(&ToolJobTransitionRequest {
+                job_id: created.job_id.clone(),
+                expected_state: Some(ToolJobState::Running),
+                next_state: ToolJobState::Completed,
+                reason: "exit_zero".to_owned(),
+                last_error: None,
+                heartbeat_at_unix_ms: None,
+                lease_expires_at_unix_ms: None,
+            })
+            .expect("running job should complete");
+        assert_eq!(completed.state, ToolJobState::Completed);
+        assert!(completed.completed_at_unix_ms.is_some());
+
+        let listed = store
+            .list_tool_jobs(&ToolJobsListFilter {
+                owner_principal: Some("user:ops".to_owned()),
+                include_terminal: true,
+                ..ToolJobsListFilter::default()
+            })
+            .expect("jobs should list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].job_id, created.job_id);
+    }
+
+    #[test]
+    fn durable_tool_job_retry_sweep_and_recovery_are_policy_bound() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+
+        let job = store
+            .create_tool_job(&ToolJobCreateRequest {
+                job_id: "01JOB000000000000000000002".to_owned(),
+                owner_principal: "user:ops".to_owned(),
+                device_id: "device:local".to_owned(),
+                channel: None,
+                session_id: "01SESSION00000000000000002".to_owned(),
+                run_id: "01RUN00000000000000000002".to_owned(),
+                tool_call_id: "01CALL000000000000000002".to_owned(),
+                tool_name: "palyra.http.fetch".to_owned(),
+                backend: "networked_worker".to_owned(),
+                backend_reason_code: Some("strict_egress".to_owned()),
+                command_sha256: sha256_hex(b"fetch"),
+                program_sha256: Some(sha256_hex(br#"{"dag":[]}"#)),
+                state: ToolJobState::Running,
+                retry_policy: ToolJobRetryPolicy {
+                    max_attempts: 2,
+                    idempotency_key: Some("idem:fetch".to_owned()),
+                },
+                cancellation_handle: None,
+                retention: ToolJobRetentionPolicy {
+                    expires_at_unix_ms: Some(1_000),
+                    legal_hold: false,
+                },
+                artifact_refs_json: None,
+                lease_expires_at_unix_ms: Some(2_000),
+            })
+            .expect("tool job should be created");
+
+        let recovered = store
+            .recover_stale_tool_jobs(10_000, 1_000, 10)
+            .expect("stale heartbeat recovery should run");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].state, ToolJobState::Orphaned);
+
+        let retry = store
+            .retry_tool_job(&ToolJobRetryRequest {
+                job_id: job.job_id.clone(),
+                owner_principal: Some("user:ops".to_owned()),
+                idempotency_key: Some("idem:fetch".to_owned()),
+                reason: "operator_retry".to_owned(),
+            })
+            .expect("retry should require matching idempotency key");
+        assert_eq!(retry.state, ToolJobState::Queued);
+        assert_eq!(retry.attempt_count, 2);
+
+        let retry_error = store
+            .retry_tool_job(&ToolJobRetryRequest {
+                job_id: job.job_id.clone(),
+                owner_principal: Some("user:ops".to_owned()),
+                idempotency_key: Some("idem:fetch".to_owned()),
+                reason: "operator_retry_again".to_owned(),
+            })
+            .expect_err("exhausted retry should fail closed");
+        assert!(matches!(retry_error, JournalError::ToolJobRetryDenied { .. }));
+
+        let attached = store
+            .attach_tool_job(&ToolJobAttachRequest {
+                job_id: job.job_id.clone(),
+                owner_principal: Some("user:ops".to_owned()),
+            })
+            .expect("owner should attach");
+        assert_eq!(attached.active_ref_count, 1);
+        let not_expired =
+            store.sweep_expired_tool_jobs(10_000, 10).expect("sweeper should respect active refs");
+        assert!(not_expired.is_empty());
+
+        store.release_tool_job_attachment(job.job_id.as_str()).expect("attachment should release");
+        store
+            .transition_tool_job(&ToolJobTransitionRequest {
+                job_id: job.job_id.clone(),
+                expected_state: Some(ToolJobState::Queued),
+                next_state: ToolJobState::Failed,
+                reason: "retry_failed".to_owned(),
+                last_error: Some("Authorization: Bearer secret-token".to_owned()),
+                heartbeat_at_unix_ms: None,
+                lease_expires_at_unix_ms: None,
+            })
+            .expect("queued retry may fail");
+        let expired =
+            store.sweep_expired_tool_jobs(10_000, 10).expect("expired terminal job should sweep");
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].state, ToolJobState::Expired);
+        assert!(!expired[0].last_error.as_deref().unwrap_or_default().contains("secret-token"));
     }
 
     #[test]

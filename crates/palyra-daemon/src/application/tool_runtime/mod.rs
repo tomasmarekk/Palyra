@@ -6,4 +6,5 @@ pub(crate) mod networked_worker;
 pub(crate) mod process_registry;
 pub(crate) mod routines;
 pub(crate) mod tool_program;
+pub(crate) mod tool_rpc;
 pub(crate) mod workspace_patch;

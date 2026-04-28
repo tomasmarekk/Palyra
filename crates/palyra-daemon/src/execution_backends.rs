@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     config::{FeatureRolloutsConfig, NetworkedWorkersConfig},
+    journal::{ToolJobRecord, ToolJobState},
     node_runtime::RegisteredNodeRecord,
     sandbox_runner::{process_runner_executor_name, SandboxProcessRunnerPolicy},
 };
@@ -293,6 +294,60 @@ pub(crate) struct ExecutionBackendResolutionRequest {
     pub(crate) workspace_strategy: Option<WorkspaceStrategyKind>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub(crate) struct ExecutionEnvironmentCapabilities {
+    pub(crate) filesystem_read: bool,
+    pub(crate) filesystem_write: bool,
+    pub(crate) network_egress: bool,
+    pub(crate) secrets: bool,
+    pub(crate) process_spawn: bool,
+    pub(crate) persistent_workspace: bool,
+    pub(crate) gpu: bool,
+    pub(crate) timeout_ms: Option<u64>,
+    pub(crate) cpu_time_limit_ms: Option<u64>,
+    pub(crate) memory_limit_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ExecutionBackendHealthStatus {
+    Healthy,
+    Degraded,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ExecutionBackendPreflightRecord {
+    pub(crate) backend_id: String,
+    pub(crate) status: ExecutionBackendHealthStatus,
+    pub(crate) reason_code: String,
+    pub(crate) repair_hint: Option<String>,
+    pub(crate) checked_at_unix_ms: i64,
+    pub(crate) declared_capabilities: Vec<String>,
+    pub(crate) missing_capabilities: Vec<String>,
+    pub(crate) environment: ExecutionEnvironmentCapabilities,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StuckToolJobRecoveryAction {
+    Attach,
+    MarkFailed,
+    Cancel,
+    Cleanup,
+    RepairRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct StuckToolJobRecoveryPlan {
+    pub(crate) job_id: String,
+    pub(crate) backend_id: String,
+    pub(crate) action: StuckToolJobRecoveryAction,
+    pub(crate) reason_code: String,
+    pub(crate) repair_hint: Option<String>,
+    pub(crate) stale_for_ms: i64,
+}
+
 pub(crate) trait ExecutionBackend {
     fn backend_id(&self) -> &str;
     fn capabilities(&self) -> &[String];
@@ -303,6 +358,13 @@ pub(crate) trait ExecutionBackend {
     fn supports_cancellation(&self) -> bool;
     fn supports_cleanup(&self) -> bool;
     fn health_probe(&self) -> &str;
+    fn preflight(
+        &self,
+        request: &ExecutionBackendResolutionRequest,
+        now_unix_ms: i64,
+    ) -> ExecutionBackendPreflightRecord {
+        build_execution_backend_preflight(self, request, now_unix_ms)
+    }
 }
 
 impl ExecutionBackend for ExecutionBackendInventoryRecord {
@@ -340,6 +402,186 @@ impl ExecutionBackend for ExecutionBackendInventoryRecord {
 
     fn health_probe(&self) -> &str {
         self.health_probe.as_str()
+    }
+}
+
+pub(crate) fn build_execution_backend_preflight<B: ExecutionBackend + ?Sized>(
+    backend: &B,
+    request: &ExecutionBackendResolutionRequest,
+    now_unix_ms: i64,
+) -> ExecutionBackendPreflightRecord {
+    let missing_capabilities = request
+        .required_capabilities
+        .iter()
+        .filter(|required| !backend.capabilities().iter().any(|capability| capability == *required))
+        .cloned()
+        .collect::<Vec<_>>();
+    let workspace_mismatch = request
+        .workspace_strategy
+        .is_some_and(|required| backend.workspace_strategy().kind != required);
+    let status = if !missing_capabilities.is_empty() || workspace_mismatch {
+        ExecutionBackendHealthStatus::Unavailable
+    } else if backend.health_probe().contains("degraded") {
+        ExecutionBackendHealthStatus::Degraded
+    } else {
+        ExecutionBackendHealthStatus::Healthy
+    };
+    let reason_code = match status {
+        ExecutionBackendHealthStatus::Healthy => "backend.preflight.healthy",
+        ExecutionBackendHealthStatus::Degraded => "backend.preflight.degraded",
+        ExecutionBackendHealthStatus::Unavailable if !missing_capabilities.is_empty() => {
+            "backend.preflight.missing_capabilities"
+        }
+        ExecutionBackendHealthStatus::Unavailable => "backend.preflight.workspace_mismatch",
+    }
+    .to_owned();
+    let repair_hint = match status {
+        ExecutionBackendHealthStatus::Healthy => None,
+        ExecutionBackendHealthStatus::Degraded => {
+            Some(format!("Inspect backend health probe '{}'.", backend.health_probe()))
+        }
+        ExecutionBackendHealthStatus::Unavailable if !missing_capabilities.is_empty() => {
+            Some(format!("Select a backend that declares {:?}.", missing_capabilities))
+        }
+        ExecutionBackendHealthStatus::Unavailable => Some(format!(
+            "Select a backend with workspace strategy '{}'.",
+            request.workspace_strategy.map(WorkspaceStrategyKind::as_str).unwrap_or("unspecified")
+        )),
+    };
+    ExecutionBackendPreflightRecord {
+        backend_id: backend.backend_id().to_owned(),
+        status,
+        reason_code,
+        repair_hint,
+        checked_at_unix_ms: now_unix_ms,
+        declared_capabilities: backend.capabilities().to_vec(),
+        missing_capabilities,
+        environment: capabilities_to_environment(
+            backend.capabilities(),
+            backend.workspace_strategy(),
+            backend.supports_cancellation(),
+            backend.supports_cleanup(),
+        ),
+    }
+}
+
+pub(crate) fn build_execution_backend_preflight_report(
+    inventory: &[ExecutionBackendInventoryRecord],
+    request: &ExecutionBackendResolutionRequest,
+    now_unix_ms: i64,
+) -> Vec<ExecutionBackendPreflightRecord> {
+    inventory
+        .iter()
+        .map(|backend| {
+            let mut record = backend.preflight(request, now_unix_ms);
+            if !backend.selectable || backend.state == ExecutionBackendState::Disabled {
+                record.status = ExecutionBackendHealthStatus::Unavailable;
+                record.reason_code = "backend.preflight.disabled".to_owned();
+                record.repair_hint = Some(backend.operator_summary.clone());
+            } else if backend.state == ExecutionBackendState::Degraded
+                && record.status == ExecutionBackendHealthStatus::Healthy
+            {
+                record.status = ExecutionBackendHealthStatus::Degraded;
+                record.reason_code = "backend.preflight.inventory_degraded".to_owned();
+                record.repair_hint = Some(backend.operator_summary.clone());
+            }
+            record
+        })
+        .collect()
+}
+
+pub(crate) fn plan_stuck_tool_job_recovery(
+    job: &ToolJobRecord,
+    inventory: &[ExecutionBackendInventoryRecord],
+    now_unix_ms: i64,
+    heartbeat_timeout_ms: i64,
+) -> Option<StuckToolJobRecoveryPlan> {
+    if !matches!(
+        job.state,
+        ToolJobState::Starting
+            | ToolJobState::Running
+            | ToolJobState::Draining
+            | ToolJobState::Cancelling
+            | ToolJobState::Orphaned
+    ) {
+        return None;
+    }
+    let last_seen = job
+        .heartbeat_at_unix_ms
+        .unwrap_or(job.updated_at_unix_ms)
+        .min(job.lease_expires_at_unix_ms.unwrap_or(i64::MAX));
+    let stale_for_ms = now_unix_ms.saturating_sub(last_seen);
+    if job.state != ToolJobState::Orphaned && stale_for_ms < heartbeat_timeout_ms.max(1) {
+        return None;
+    }
+    let backend = inventory.iter().find(|record| record.backend_id == job.backend);
+    let (action, reason_code, repair_hint) = match backend {
+        Some(record) if !record.selectable || record.state == ExecutionBackendState::Disabled => (
+            StuckToolJobRecoveryAction::RepairRequired,
+            "tool_job.recovery.backend_unavailable",
+            Some(record.operator_summary.clone()),
+        ),
+        Some(record) if record.supports_cancellation && job.state == ToolJobState::Cancelling => {
+            (StuckToolJobRecoveryAction::Cancel, "tool_job.recovery.cancel_via_backend", None)
+        }
+        Some(record) if record.supports_cleanup && job.state == ToolJobState::Orphaned => {
+            (StuckToolJobRecoveryAction::Cleanup, "tool_job.recovery.cleanup_orphan", None)
+        }
+        Some(record) if record.state == ExecutionBackendState::Available => {
+            (StuckToolJobRecoveryAction::Attach, "tool_job.recovery.attach", None)
+        }
+        Some(record) => (
+            StuckToolJobRecoveryAction::MarkFailed,
+            "tool_job.recovery.mark_failed",
+            Some(record.operator_summary.clone()),
+        ),
+        None => (
+            StuckToolJobRecoveryAction::RepairRequired,
+            "tool_job.recovery.unknown_backend",
+            Some("Backend no longer exists in the runtime inventory.".to_owned()),
+        ),
+    };
+    Some(StuckToolJobRecoveryPlan {
+        job_id: job.job_id.clone(),
+        backend_id: job.backend.clone(),
+        action,
+        reason_code: reason_code.to_owned(),
+        repair_hint,
+        stale_for_ms,
+    })
+}
+
+fn capabilities_to_environment(
+    capabilities: &[String],
+    workspace_strategy: &WorkspaceStrategyDescriptor,
+    supports_cancellation: bool,
+    supports_cleanup: bool,
+) -> ExecutionEnvironmentCapabilities {
+    let has = |needle: &str| capabilities.iter().any(|capability| capability == needle);
+    ExecutionEnvironmentCapabilities {
+        filesystem_read: true,
+        filesystem_write: matches!(
+            workspace_strategy.writeback,
+            WorkspaceWritebackMode::PatchBundle
+                | WorkspaceWritebackMode::GitCommit
+                | WorkspaceWritebackMode::LeaseCommit
+        ),
+        network_egress: has("egress_proxy")
+            || has("proxy_mediated_egress")
+            || has("networked_worker_pool"),
+        secrets: has("vault_scoped_secret_delivery"),
+        process_spawn: has("sandbox_process_runner") || has("daemon_host_execution"),
+        persistent_workspace: matches!(
+            workspace_strategy.kind,
+            WorkspaceStrategyKind::DaemonWorkspaceRoot
+                | WorkspaceStrategyKind::GitWorktree
+                | WorkspaceStrategyKind::RemoteLeaseWorkspace
+                | WorkspaceStrategyKind::OperatorManagedRemote
+        ),
+        gpu: has("gpu"),
+        timeout_ms: supports_cancellation.then_some(30_000),
+        cpu_time_limit_ms: has("sandbox_process_runner").then_some(30_000),
+        memory_limit_bytes: supports_cleanup.then_some(512 * 1_024 * 1_024),
     }
 }
 
@@ -1174,17 +1416,20 @@ mod tests {
     use palyra_workerd::{WorkerFleetPolicy, WorkerFleetSnapshot};
 
     use crate::config::NetworkedWorkersConfig;
+    use crate::journal::{ToolJobRecord, ToolJobState};
     use crate::sandbox_runner::{
         EgressEnforcementMode, SandboxProcessRunnerPolicy, SandboxProcessRunnerTier,
     };
 
     use super::{
-        build_execution_backend_inventory_with_rollout, resolve_execution_backend,
+        build_execution_backend_inventory_with_rollout, build_execution_backend_preflight_report,
+        plan_stuck_tool_job_recovery, resolve_execution_backend,
         resolve_execution_backend_for_request, validate_execution_backend_selection,
         ContainerBackendProfile, ContainerEnvBinding, ContainerEnvSourceKind, ContainerMountPolicy,
         ContainerNetworkPolicy, ContainerResourceLimits, ContainerRuntimeKind, ExecutionBackend,
-        ExecutionBackendPreference, ExecutionBackendResolutionRequest, ExecutionBackendState,
-        FeatureRolloutSetting, SshWorkerBackendProfile, WorkspaceStrategyDescriptor,
+        ExecutionBackendHealthStatus, ExecutionBackendPreference,
+        ExecutionBackendResolutionRequest, ExecutionBackendState, FeatureRolloutSetting,
+        SshWorkerBackendProfile, StuckToolJobRecoveryAction, WorkspaceStrategyDescriptor,
         WorkspaceStrategyKind,
     };
 
@@ -1201,6 +1446,44 @@ mod tests {
             cpu_time_limit_ms: 1_000,
             memory_limit_bytes: 1_048_576,
             max_output_bytes: 1_048_576,
+        }
+    }
+
+    fn test_tool_job(state: ToolJobState, backend: ExecutionBackendPreference) -> ToolJobRecord {
+        ToolJobRecord {
+            job_id: "job-1".to_owned(),
+            owner_principal: "user:ops".to_owned(),
+            device_id: "device:local".to_owned(),
+            channel: Some("cli".to_owned()),
+            session_id: "session-1".to_owned(),
+            run_id: "run-1".to_owned(),
+            tool_call_id: "call-1".to_owned(),
+            tool_name: "palyra.process.run".to_owned(),
+            backend: backend.as_str().to_owned(),
+            backend_reason_code: Some("backend.test".to_owned()),
+            command_sha256: "sha256-command".to_owned(),
+            program_sha256: None,
+            state,
+            attempt_count: 1,
+            max_attempts: 1,
+            retry_allowed: false,
+            idempotency_key: None,
+            cancellation_handle: Some("cancel:job-1".to_owned()),
+            artifact_refs_json: None,
+            tail_preview: String::new(),
+            stdout_artifact_id: None,
+            stderr_artifact_id: None,
+            last_error: None,
+            state_reason: None,
+            created_at_unix_ms: 1_000,
+            updated_at_unix_ms: 2_000,
+            started_at_unix_ms: Some(1_500),
+            heartbeat_at_unix_ms: Some(2_000),
+            completed_at_unix_ms: None,
+            expires_at_unix_ms: None,
+            legal_hold: false,
+            active_ref_count: 0,
+            lease_expires_at_unix_ms: Some(2_500),
         }
     }
 
@@ -1486,6 +1769,112 @@ mod tests {
         assert_eq!(resolution.resolved, ExecutionBackendPreference::LocalSandbox);
         assert_eq!(resolution.reason_code, "backend.policy.unsatisfied.local_sandbox");
         assert!(resolution.reason.contains("workspace strategy"));
+    }
+
+    #[test]
+    fn backend_preflight_reports_missing_capabilities_and_environment() {
+        let networked_workers = NetworkedWorkersConfig {
+            mode: RuntimePreviewMode::PreviewOnly,
+            ..NetworkedWorkersConfig::default()
+        };
+        let inventory = build_execution_backend_inventory_with_rollout(
+            &test_policy(),
+            0,
+            &[],
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::from_config(true),
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            &networked_workers,
+            WorkerFleetSnapshot {
+                registered_workers: 1,
+                attested_workers: 1,
+                ..WorkerFleetSnapshot::default()
+            },
+            &WorkerFleetPolicy::default(),
+        );
+        let report = build_execution_backend_preflight_report(
+            &inventory,
+            &ExecutionBackendResolutionRequest {
+                preference: ExecutionBackendPreference::Automatic,
+                required_capabilities: vec!["scoped_artifact_transport".to_owned()],
+                workspace_strategy: Some(WorkspaceStrategyKind::RemoteLeaseWorkspace),
+            },
+            42_000,
+        );
+        let worker = report
+            .iter()
+            .find(|entry| entry.backend_id == ExecutionBackendPreference::NetworkedWorker.as_str())
+            .expect("worker preflight should exist");
+        assert_eq!(worker.status, ExecutionBackendHealthStatus::Healthy);
+        assert!(worker.environment.network_egress);
+        assert!(worker.environment.persistent_workspace);
+
+        let local = report
+            .iter()
+            .find(|entry| entry.backend_id == ExecutionBackendPreference::LocalSandbox.as_str())
+            .expect("local preflight should exist");
+        assert_eq!(local.status, ExecutionBackendHealthStatus::Unavailable);
+        assert!(local.missing_capabilities.contains(&"scoped_artifact_transport".to_owned()));
+    }
+
+    #[test]
+    fn stuck_tool_job_recovery_plans_attach_cancel_cleanup_and_repair() {
+        let networked_workers = NetworkedWorkersConfig {
+            mode: RuntimePreviewMode::PreviewOnly,
+            ..NetworkedWorkersConfig::default()
+        };
+        let inventory = build_execution_backend_inventory_with_rollout(
+            &test_policy(),
+            0,
+            &[],
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::from_config(true),
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            &networked_workers,
+            WorkerFleetSnapshot {
+                registered_workers: 1,
+                attested_workers: 1,
+                ..WorkerFleetSnapshot::default()
+            },
+            &WorkerFleetPolicy::default(),
+        );
+
+        let running =
+            test_tool_job(ToolJobState::Running, ExecutionBackendPreference::LocalSandbox);
+        let plan = plan_stuck_tool_job_recovery(&running, &inventory, 10_000, 1_000)
+            .expect("stale running job should plan recovery");
+        assert_eq!(plan.action, StuckToolJobRecoveryAction::Attach);
+
+        let cancelling =
+            test_tool_job(ToolJobState::Cancelling, ExecutionBackendPreference::LocalSandbox);
+        let plan = plan_stuck_tool_job_recovery(&cancelling, &inventory, 10_000, 1_000)
+            .expect("stale cancelling job should plan cancellation");
+        assert_eq!(plan.action, StuckToolJobRecoveryAction::Cancel);
+
+        let orphaned =
+            test_tool_job(ToolJobState::Orphaned, ExecutionBackendPreference::NetworkedWorker);
+        let plan = plan_stuck_tool_job_recovery(&orphaned, &inventory, 10_000, 1_000)
+            .expect("orphaned job should plan cleanup");
+        assert_eq!(plan.action, StuckToolJobRecoveryAction::Cleanup);
+
+        let unknown = test_tool_job(ToolJobState::Running, ExecutionBackendPreference::SshTunnel);
+        let disabled_inventory = build_execution_backend_inventory_with_rollout(
+            &test_policy(),
+            0,
+            &[],
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            &NetworkedWorkersConfig::default(),
+            WorkerFleetSnapshot::default(),
+            &WorkerFleetPolicy::default(),
+        );
+        let plan = plan_stuck_tool_job_recovery(&unknown, &disabled_inventory, 10_000, 1_000)
+            .expect("disabled backend should require repair");
+        assert_eq!(plan.action, StuckToolJobRecoveryAction::RepairRequired);
     }
 
     #[test]
