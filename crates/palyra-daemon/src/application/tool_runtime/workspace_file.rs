@@ -683,6 +683,40 @@ fn path_component_eq(left: &std::ffi::OsStr, right: &std::ffi::OsStr) -> bool {
     }
 }
 
+fn relative_workspace_path_candidates(path: &str, canonical_root: &Path) -> Vec<String> {
+    let mut candidates = Vec::with_capacity(2);
+    if let Some(stripped) = strip_duplicate_workspace_root_basename(path, canonical_root) {
+        candidates.push(stripped);
+    }
+    if !candidates.iter().any(|candidate| candidate == path) {
+        candidates.push(path.to_owned());
+    }
+    candidates
+}
+
+fn strip_duplicate_workspace_root_basename(path: &str, canonical_root: &Path) -> Option<String> {
+    if path.is_empty() || Path::new(path).is_absolute() {
+        return None;
+    }
+    let root_basename = canonical_root.file_name()?;
+    let mut components = Path::new(path).components();
+    let Some(Component::Normal(first)) = components.next() else {
+        return None;
+    };
+    if !path_component_eq(root_basename, first) {
+        return None;
+    }
+    let mut stripped = Vec::new();
+    for component in components {
+        match component {
+            Component::Normal(value) => stripped.push(value.to_string_lossy().into_owned()),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(stripped.join("/"))
+}
+
 fn canonicalize_workspace_root_override(
     tool_name: &str,
     candidate: &Path,
@@ -769,36 +803,43 @@ fn read_workspace_file_from_roots(
     }
 
     for (workspace_root_index, canonical_root) in &canonical_roots {
-        let candidate = canonical_root.join(Path::new(input.path.as_str()));
-        let canonical_target = match fs::canonicalize(&candidate) {
-            Ok(path) => path,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
+        for relative_path in relative_workspace_path_candidates(input.path.as_str(), canonical_root)
+        {
+            let candidate = if relative_path.is_empty() {
+                canonical_root.clone()
+            } else {
+                canonical_root.join(Path::new(relative_path.as_str()))
+            };
+            let canonical_target = match fs::canonicalize(&candidate) {
+                Ok(path) => path,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "{WORKSPACE_READ_FILE_TOOL_NAME} failed to resolve path in workspace root {workspace_root_index}: {error}"
+                    ));
+                }
+            };
+            if !canonical_target.starts_with(canonical_root.as_path()) {
                 return Err(format!(
-                    "{WORKSPACE_READ_FILE_TOOL_NAME} failed to resolve path in workspace root {workspace_root_index}: {error}"
+                    "{WORKSPACE_READ_FILE_TOOL_NAME} path escapes agent workspace roots"
                 ));
             }
-        };
-        if !canonical_target.starts_with(canonical_root.as_path()) {
-            return Err(format!(
-                "{WORKSPACE_READ_FILE_TOOL_NAME} path escapes agent workspace roots"
-            ));
-        }
-        if !canonical_target.is_file() {
-            return Err(read_file_not_regular_file_error(input.path.as_str()));
-        }
+            if !canonical_target.is_file() {
+                return Err(read_file_not_regular_file_error(input.path.as_str()));
+            }
 
-        let display_path = canonical_target
-            .strip_prefix(canonical_root)
-            .map(normalize_relative_path_display)
-            .unwrap_or_else(|_| input.path.clone());
-        return read_workspace_file_chunk(
-            *workspace_root_index,
-            canonical_root.as_path(),
-            canonical_target,
-            display_path,
-            input,
-        );
+            let display_path = canonical_target
+                .strip_prefix(canonical_root)
+                .map(normalize_relative_path_display)
+                .unwrap_or(relative_path);
+            return read_workspace_file_chunk(
+                *workspace_root_index,
+                canonical_root.as_path(),
+                canonical_target,
+                display_path,
+                input,
+            );
+        }
     }
 
     Err(format!(
@@ -916,39 +957,46 @@ fn list_workspace_dir_from_roots(
     }
 
     for (workspace_root_index, canonical_root) in &canonical_roots {
-        let candidate = canonical_root.join(Path::new(input.path.as_str()));
-        let canonical_target = match fs::canonicalize(&candidate) {
-            Ok(path) => path,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
+        for relative_path in relative_workspace_path_candidates(input.path.as_str(), canonical_root)
+        {
+            let candidate = if relative_path.is_empty() {
+                canonical_root.clone()
+            } else {
+                canonical_root.join(Path::new(relative_path.as_str()))
+            };
+            let canonical_target = match fs::canonicalize(&candidate) {
+                Ok(path) => path,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "{WORKSPACE_LIST_DIR_TOOL_NAME} failed to resolve path in workspace root {workspace_root_index}: {error}"
+                    ));
+                }
+            };
+            if !canonical_target.starts_with(canonical_root.as_path()) {
                 return Err(format!(
-                    "{WORKSPACE_LIST_DIR_TOOL_NAME} failed to resolve path in workspace root {workspace_root_index}: {error}"
+                    "{WORKSPACE_LIST_DIR_TOOL_NAME} path escapes agent workspace roots"
                 ));
             }
-        };
-        if !canonical_target.starts_with(canonical_root.as_path()) {
-            return Err(format!(
-                "{WORKSPACE_LIST_DIR_TOOL_NAME} path escapes agent workspace roots"
-            ));
-        }
-        if !canonical_target.is_dir() {
-            return Err(format!(
-                "{WORKSPACE_LIST_DIR_TOOL_NAME} target is not a directory: {}",
-                display_requested_path(input.path.as_str())
-            ));
-        }
+            if !canonical_target.is_dir() {
+                return Err(format!(
+                    "{WORKSPACE_LIST_DIR_TOOL_NAME} target is not a directory: {}",
+                    display_requested_path(input.path.as_str())
+                ));
+            }
 
-        let display_path = canonical_target
-            .strip_prefix(canonical_root)
-            .map(normalize_relative_path_display)
-            .unwrap_or_else(|_| display_requested_path(input.path.as_str()).to_owned());
-        return list_workspace_directory(
-            *workspace_root_index,
-            canonical_root.as_path(),
-            canonical_target,
-            display_path,
-            input,
-        );
+            let display_path = canonical_target
+                .strip_prefix(canonical_root)
+                .map(normalize_relative_path_display)
+                .unwrap_or(relative_path);
+            return list_workspace_directory(
+                *workspace_root_index,
+                canonical_root.as_path(),
+                canonical_target,
+                display_path,
+                input,
+            );
+        }
     }
 
     Err(format!(
@@ -1088,41 +1136,46 @@ fn search_workspace_from_roots(
     }
 
     for (workspace_root_index, canonical_root) in &canonical_roots {
-        let candidate = if input.path.is_empty() {
-            canonical_root.clone()
-        } else {
-            canonical_root.join(Path::new(input.path.as_str()))
-        };
-        let canonical_target = match fs::canonicalize(&candidate) {
-            Ok(path) => path,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
+        for relative_path in relative_workspace_path_candidates(input.path.as_str(), canonical_root)
+        {
+            let candidate = if relative_path.is_empty() {
+                canonical_root.clone()
+            } else {
+                canonical_root.join(Path::new(relative_path.as_str()))
+            };
+            let canonical_target = match fs::canonicalize(&candidate) {
+                Ok(path) => path,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "{WORKSPACE_SEARCH_TOOL_NAME} failed to resolve path in workspace root {workspace_root_index}: {error}"
+                    ));
+                }
+            };
+            if !canonical_target.starts_with(canonical_root.as_path()) {
                 return Err(format!(
-                    "{WORKSPACE_SEARCH_TOOL_NAME} failed to resolve path in workspace root {workspace_root_index}: {error}"
+                    "{WORKSPACE_SEARCH_TOOL_NAME} path escapes agent workspace roots"
                 ));
             }
-        };
-        if !canonical_target.starts_with(canonical_root.as_path()) {
-            return Err(format!("{WORKSPACE_SEARCH_TOOL_NAME} path escapes agent workspace roots"));
-        }
-        if !canonical_target.is_file() && !canonical_target.is_dir() {
-            return Err(format!(
-                "{WORKSPACE_SEARCH_TOOL_NAME} target is not a file or directory: {}",
-                display_requested_path(input.path.as_str())
-            ));
-        }
+            if !canonical_target.is_file() && !canonical_target.is_dir() {
+                return Err(format!(
+                    "{WORKSPACE_SEARCH_TOOL_NAME} target is not a file or directory: {}",
+                    display_requested_path(input.path.as_str())
+                ));
+            }
 
-        let display_path = canonical_target
-            .strip_prefix(canonical_root)
-            .map(normalize_relative_path_display)
-            .unwrap_or_else(|_| display_requested_path(input.path.as_str()).to_owned());
-        return search_workspace_path(
-            *workspace_root_index,
-            canonical_root.as_path(),
-            canonical_target,
-            display_path,
-            input,
-        );
+            let display_path = canonical_target
+                .strip_prefix(canonical_root)
+                .map(normalize_relative_path_display)
+                .unwrap_or(relative_path);
+            return search_workspace_path(
+                *workspace_root_index,
+                canonical_root.as_path(),
+                canonical_target,
+                display_path,
+                input,
+            );
+        }
     }
 
     Err(format!(
@@ -2522,6 +2575,48 @@ mod tests {
             .expect_err("directory read should fail");
 
         assert!(error.contains(WORKSPACE_LIST_DIR_TOOL_NAME), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn workspace_file_tools_strip_duplicate_root_basename_from_relative_paths() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let workspace = tempdir.path().join("S036_session_recall");
+        fs::create_dir_all(workspace.join("docs")).expect("workspace dirs should exist");
+        fs::write(workspace.join("docs").join("plan.md"), "ship it\n")
+            .expect("workspace file should be written");
+        let roots = [workspace.clone()];
+
+        let read_input =
+            parse_workspace_read_file_input(br#"{"path":"S036_session_recall/docs/plan.md"}"#)
+                .expect("read input should parse");
+        let read = read_workspace_file_from_roots(&roots, &read_input)
+            .expect("duplicated basename read path should resolve");
+        assert_eq!(read.path, "docs/plan.md");
+        assert_eq!(read.text.as_deref(), Some("ship it\n"));
+
+        let list_input = parse_workspace_list_dir_input(
+            br#"{"path":"S036_session_recall/docs","max_entries":10}"#,
+        )
+        .expect("list input should parse");
+        let listed = list_workspace_dir_from_roots(&roots, &list_input)
+            .expect("duplicated basename list path should resolve");
+        assert_eq!(listed.path, "docs");
+        assert_eq!(
+            listed.entries.iter().map(|entry| entry.path.as_str()).collect::<Vec<_>>(),
+            vec!["docs/plan.md"]
+        );
+
+        let search_input = parse_workspace_search_input(
+            br#"{"path":"S036_session_recall","query":"ship","max_matches":10}"#,
+        )
+        .expect("search input should parse");
+        let searched = search_workspace_from_roots(&roots, &search_input)
+            .expect("duplicated basename search path should resolve");
+        assert_eq!(searched.path, ".");
+        assert_eq!(
+            searched.matches.iter().map(|entry| entry.path.as_str()).collect::<Vec<_>>(),
+            vec!["docs/plan.md"]
+        );
     }
 
     #[test]

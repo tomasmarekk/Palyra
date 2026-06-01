@@ -250,6 +250,7 @@ pub(crate) async fn execute_workspace_patch_tool(
     let workspace_roots = resolved_workspace_roots.roots;
     let canonical_constraint_roots = resolved_workspace_roots.canonical_constraint_roots;
     let risk_path_prefixes = resolved_workspace_roots.risk_path_prefixes;
+    let patch = normalize_workspace_patch_header_paths(patch.as_str(), workspace_roots.as_slice());
 
     let planned_outcome = match apply_workspace_patch_with_resolved_roots(
         workspace_roots.as_slice(),
@@ -386,6 +387,141 @@ fn patch_operation_paths(patch: &str) -> Vec<String> {
         .filter(|path| !path.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn normalize_workspace_patch_header_paths(patch: &str, workspace_roots: &[PathBuf]) -> String {
+    let mut changed = false;
+    let mut lines = patch
+        .split('\n')
+        .map(|line| {
+            let Some(normalized) = normalize_workspace_patch_header_line(line, workspace_roots)
+            else {
+                return line.to_owned();
+            };
+            changed = true;
+            normalized
+        })
+        .collect::<Vec<_>>();
+    if !patch.ends_with('\n') && lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    if changed {
+        lines.join("\n")
+    } else {
+        patch.to_owned()
+    }
+}
+
+fn normalize_workspace_patch_header_line(
+    line: &str,
+    workspace_roots: &[PathBuf],
+) -> Option<String> {
+    const PATCH_PATH_PREFIXES: &[&str] = &[
+        "*** Add File: ",
+        "*** Replace File: ",
+        "*** Update File: ",
+        "*** Delete File: ",
+        "*** Move to: ",
+    ];
+    for prefix in PATCH_PATH_PREFIXES {
+        let Some(raw_path) = line.strip_prefix(prefix) else {
+            continue;
+        };
+        let normalized_path = normalize_workspace_patch_header_path(raw_path, workspace_roots)?;
+        return Some(format!("{prefix}{normalized_path}"));
+    }
+    None
+}
+
+fn normalize_workspace_patch_header_path(
+    path: &str,
+    workspace_roots: &[PathBuf],
+) -> Option<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let requested = Path::new(trimmed);
+    if requested.is_absolute() {
+        if requested.components().any(|component| matches!(component, Component::ParentDir)) {
+            return None;
+        }
+        return workspace_roots.iter().find_map(|root| {
+            if !path_stays_inside_workspace_root_lexical(requested, root.as_path()) {
+                return None;
+            }
+            absolute_workspace_path_relative_to_root(requested, root.as_path())
+        });
+    }
+    workspace_roots
+        .iter()
+        .find_map(|root| strip_duplicate_workspace_root_basename(trimmed, root.as_path()))
+}
+
+fn absolute_workspace_path_relative_to_root(path: &Path, root: &Path) -> Option<String> {
+    if let Ok(relative) = path.strip_prefix(root) {
+        return normalized_relative_path_display(relative);
+    }
+    #[cfg(windows)]
+    {
+        let path = comparable_windows_path(path);
+        let root = comparable_windows_path(root);
+        let suffix = path.strip_prefix(root.as_str()).map(|value| value.trim_start_matches('/'))?;
+        if suffix.is_empty() {
+            None
+        } else {
+            normalized_relative_path_display(Path::new(suffix))
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+fn strip_duplicate_workspace_root_basename(path: &str, root: &Path) -> Option<String> {
+    if path.is_empty() || Path::new(path).is_absolute() {
+        return None;
+    }
+    let root_basename = root.file_name()?;
+    let mut components = Path::new(path).components();
+    let Some(Component::Normal(first)) = components.next() else {
+        return None;
+    };
+    if !path_component_eq(root_basename, first) {
+        return None;
+    }
+    let mut stripped = Vec::new();
+    for component in components {
+        match component {
+            Component::Normal(value) => stripped.push(value.to_string_lossy().into_owned()),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(stripped.join("/"))
+}
+
+fn path_stays_inside_workspace_root_lexical(path: &Path, root: &Path) -> bool {
+    if path.starts_with(root) {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        let path = comparable_windows_path(path);
+        let root = comparable_windows_path(root);
+        path == root || path.starts_with(format!("{root}/").as_str())
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+#[cfg(windows)]
+fn comparable_windows_path(path: &Path) -> String {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    normalized.strip_prefix("//?/").unwrap_or(normalized.as_str()).to_ascii_lowercase()
 }
 
 fn resolve_workspace_root_override(
@@ -853,7 +989,8 @@ fn workspace_patch_tool_execution_outcome(
 #[cfg(test)]
 mod tests {
     use super::{
-        patch_operation_paths, patch_should_use_active_root, resolve_workspace_root_override,
+        normalize_workspace_patch_header_paths, patch_operation_paths,
+        patch_should_use_active_root, resolve_workspace_root_override,
         workspace_patch_error_outcome, workspace_patch_recovery_hint,
         workspace_patch_tool_execution_outcome, WORKSPACE_PATCH_GRAMMAR_HINT,
     };
@@ -1086,6 +1223,44 @@ mod tests {
             patch_should_use_active_root(report_patch, &active),
             "single-file writes without an explicit prefix should still target the active focus"
         );
+    }
+
+    #[test]
+    fn workspace_patch_header_paths_strip_duplicate_root_basename() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let workspace = tempdir.path().join("S036_session_recall");
+        std::fs::create_dir_all(workspace.as_path()).expect("workspace should exist");
+        let patch = concat!(
+            "*** Begin Patch\n",
+            "*** Add File: S036_session_recall/feature_flag.test.ts\n",
+            "+test\n",
+            "*** End Patch\n",
+        );
+
+        let normalized = normalize_workspace_patch_header_paths(patch, &[workspace]);
+
+        assert!(normalized.contains("*** Add File: feature_flag.test.ts"));
+        assert!(!normalized.contains("S036_session_recall/feature_flag.test.ts"));
+    }
+
+    #[test]
+    fn workspace_patch_header_paths_accept_absolute_paths_inside_workspace_root() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let workspace = tempdir.path().join("S038_shared_r2");
+        std::fs::create_dir_all(workspace.join("docs")).expect("workspace docs should exist");
+        let absolute_target = workspace.join("docs").join("user-guide.md");
+        let patch = format!(
+            "*** Begin Patch\n*** Add File: {}\n+guide\n*** End Patch\n",
+            absolute_target.display()
+        );
+
+        let normalized = normalize_workspace_patch_header_paths(
+            patch.as_str(),
+            &[std::fs::canonicalize(workspace.as_path()).expect("workspace canonical")],
+        );
+
+        assert!(normalized.contains("*** Add File: docs/user-guide.md"));
+        assert!(!normalized.contains(absolute_target.to_string_lossy().as_ref()));
     }
 
     #[test]
