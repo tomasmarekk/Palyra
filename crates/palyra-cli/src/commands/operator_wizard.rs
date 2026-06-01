@@ -2,10 +2,19 @@ use std::{
     collections::BTreeMap,
     io::IsTerminal,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
+use crate::commands::models::{
+    parse_discovered_provider_models, provider_models_endpoint, sanitize_provider_error,
+    select_preferred_discovered_model_id, DiscoveredProviderModel,
+};
 use palyra_common::runtime_preview::{
     RuntimePreviewCapability, RuntimePreviewMode, ALL_RUNTIME_PREVIEW_CAPABILITIES,
+};
+use reqwest::{
+    blocking::Client,
+    header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION},
 };
 use serde::Serialize;
 
@@ -29,7 +38,8 @@ const DEFAULT_EMBEDDINGS_MODEL: &str = "text-embedding-3-small";
 const DEFAULT_EMBEDDINGS_DIMS: u32 = 1536;
 const DEFAULT_ANTHROPIC_TEXT_MODEL: &str = "claude-3-5-sonnet-latest";
 const DEFAULT_MINIMAX_BASE_URL: &str = "https://api.minimax.io/anthropic";
-const DEFAULT_MINIMAX_TEXT_MODEL: &str = "MiniMax-M2.7";
+const MINIMAX_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_MINIMAX_BASE_URL";
+const MINIMAX_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const MINIMAX_AUTH_PROVIDER_KIND: &str = "minimax";
 
 #[derive(Debug, Clone)]
@@ -2836,9 +2846,9 @@ fn apply_model_provider_api_key(
     auth_method: &str,
     api_key: &str,
 ) -> Result<()> {
-    clear_model_provider_auth(document)?;
     match auth_method {
         "anthropic_api_key" => {
+            clear_model_provider_auth(document)?;
             let vault_ref = store_secret_in_vault("global", "anthropic_api_key", api_key)?;
             set_value_at_path(
                 document,
@@ -2866,6 +2876,8 @@ fn apply_model_provider_api_key(
             )?;
         }
         "minimax_api_key" => {
+            let selection = discover_minimax_model_selection(document, api_key)?;
+            clear_model_provider_auth(document)?;
             let vault_ref = store_secret_in_vault("global", "minimax_api_key", api_key)?;
             set_value_at_path(
                 document,
@@ -2880,13 +2892,20 @@ fn apply_model_provider_api_key(
             set_value_at_path(
                 document,
                 "model_provider.anthropic_base_url",
-                toml::Value::String(DEFAULT_MINIMAX_BASE_URL.to_owned()),
+                toml::Value::String(selection.base_url.clone()),
             )?;
             set_value_at_path(
                 document,
                 "model_provider.anthropic_model",
-                toml::Value::String(DEFAULT_MINIMAX_TEXT_MODEL.to_owned()),
+                toml::Value::String(selection.model_id),
             )?;
+            if minimax_base_url_requires_private_opt_in(selection.base_url.as_str()) {
+                set_value_at_path(
+                    document,
+                    "model_provider.allow_private_base_url",
+                    toml::Value::Boolean(true),
+                )?;
+            }
             unset_value_at_path(document, "model_provider.openai_base_url")?;
             unset_value_at_path(document, "model_provider.openai_model")?;
             unset_value_at_path(document, "model_provider.openai_embeddings_model")?;
@@ -2898,6 +2917,7 @@ fn apply_model_provider_api_key(
             )?;
         }
         _ => {
+            clear_model_provider_auth(document)?;
             let vault_ref = store_secret_in_vault("global", "openai_api_key", api_key)?;
             set_value_at_path(
                 document,
@@ -2939,6 +2959,149 @@ fn apply_model_provider_api_key(
         }
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct MinimaxModelSelection {
+    base_url: String,
+    model_id: String,
+}
+
+fn discover_minimax_model_selection(
+    document: &toml::Value,
+    api_key: &str,
+) -> Result<MinimaxModelSelection> {
+    let base_url = minimax_base_url_for_config(document)?;
+    let existing_model = existing_minimax_chat_model(document)?;
+    match discover_minimax_models(api_key, base_url.as_str()) {
+        Ok(models) => {
+            if let Some(model_id) = select_preferred_discovered_model_id(models.as_slice()) {
+                return Ok(MinimaxModelSelection { base_url, model_id });
+            }
+            if let Some(model_id) = existing_model {
+                return Ok(MinimaxModelSelection { base_url, model_id });
+            }
+            anyhow::bail!(
+                "MiniMax model discovery returned no selectable models; configure a model explicitly or retry after the provider exposes /v1/models"
+            );
+        }
+        Err(error) => {
+            if let Some(model_id) = existing_model {
+                return Ok(MinimaxModelSelection { base_url, model_id });
+            }
+            Err(error).context(
+                "failed to discover MiniMax models while configuring API-key auth; no model was written because the wizard no longer uses a hardcoded MiniMax default",
+            )
+        }
+    }
+}
+
+fn minimax_base_url_for_config(document: &toml::Value) -> Result<String> {
+    match env::var(MINIMAX_BASE_URL_ENV) {
+        Ok(raw) => return normalize_minimax_base_url(raw.as_str(), MINIMAX_BASE_URL_ENV),
+        Err(env::VarError::NotPresent) => {}
+        Err(error) => anyhow::bail!("{MINIMAX_BASE_URL_ENV} must contain valid Unicode: {error}"),
+    }
+
+    let configured_for_minimax =
+        get_string_value_at_path(document, "model_provider.kind")?.as_deref() == Some("anthropic")
+            && get_string_value_at_path(document, "model_provider.auth_provider_kind")?
+                .as_deref()
+                .is_some_and(|kind| kind.eq_ignore_ascii_case(MINIMAX_AUTH_PROVIDER_KIND));
+    if configured_for_minimax {
+        if let Some(base_url) =
+            get_string_value_at_path(document, "model_provider.anthropic_base_url")?
+        {
+            return normalize_minimax_base_url(
+                base_url.as_str(),
+                "model_provider.anthropic_base_url",
+            );
+        }
+    }
+
+    Ok(DEFAULT_MINIMAX_BASE_URL.to_owned())
+}
+
+fn normalize_minimax_base_url(raw: &str, source: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("{source} cannot be empty");
+    }
+    let parsed = reqwest::Url::parse(trimmed)
+        .with_context(|| format!("{source} must be a valid absolute URL"))?;
+    let host = parsed.host_str().ok_or_else(|| anyhow::anyhow!("{source} must include a host"))?;
+    if parsed.scheme() != "https" && !(parsed.scheme() == "http" && host_is_loopback(host)) {
+        anyhow::bail!("{source} must use https; http is only allowed for loopback hosts");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        anyhow::bail!("{source} must not embed credentials");
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        anyhow::bail!("{source} must not include query or fragment");
+    }
+    Ok(parsed.as_str().trim_end_matches('/').to_owned())
+}
+
+fn minimax_base_url_requires_private_opt_in(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| {
+            let is_loopback_http =
+                url.scheme() == "http" && url.host_str().is_some_and(host_is_loopback);
+            is_loopback_http.then_some(())
+        })
+        .is_some()
+}
+
+fn host_is_loopback(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+fn existing_minimax_chat_model(document: &toml::Value) -> Result<Option<String>> {
+    let provider_kind =
+        get_string_value_at_path(document, "model_provider.kind")?.unwrap_or_default();
+    let auth_provider_kind =
+        get_string_value_at_path(document, "model_provider.auth_provider_kind")?;
+    if provider_kind == "anthropic"
+        && auth_provider_kind
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case(MINIMAX_AUTH_PROVIDER_KIND))
+    {
+        return get_string_value_at_path(document, "model_provider.anthropic_model");
+    }
+    Ok(None)
+}
+
+fn discover_minimax_models(api_key: &str, base_url: &str) -> Result<Vec<DiscoveredProviderModel>> {
+    let endpoint = provider_models_endpoint(base_url)?;
+    let client = Client::builder()
+        .timeout(MINIMAX_MODEL_DISCOVERY_TIMEOUT)
+        .build()
+        .context("failed to initialize MiniMax model discovery client")?;
+    let mut headers = HeaderMap::new();
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    let bearer = format!("Bearer {api_key}");
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(bearer.as_str())
+            .context("MiniMax API key cannot be sent as an authorization header")?,
+    );
+
+    let response = client
+        .get(endpoint)
+        .headers(headers)
+        .send()
+        .context("failed to call MiniMax model discovery endpoint")?;
+    let status = response.status();
+    let body = response.text().unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!(
+            "MiniMax model discovery failed: {}",
+            sanitize_provider_error(body.as_str(), status.as_u16())
+        );
+    }
+    parse_discovered_provider_models(body.as_str())
 }
 
 fn store_secret_in_vault(scope_raw: &str, key: &str, value: &str) -> Result<String> {

@@ -3,8 +3,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::{
     ffi::OsString,
     fs,
+    io::{Read, Write},
+    net::TcpListener,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -560,6 +564,10 @@ fn setup_wizard_quickstart_supports_minimax_api_key() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let config_path = workdir.path().join("config").join("palyra.toml");
     let config_path_string = config_path.to_string_lossy().into_owned();
+    let model_server = MockProviderServer::spawn(
+        r#"{"data":[{"id":"MiniMax-M3"},{"id":"MiniMax-M2.7"},{"id":"MiniMax-M2.5"}]}"#,
+    )?;
+    let minimax_base_url = model_server.base_url.clone();
     let output = run_cli(
         &workdir,
         &[
@@ -582,8 +590,16 @@ fn setup_wizard_quickstart_supports_minimax_api_key() -> Result<()> {
             "--skip-skills",
             "--skip-health",
         ],
-        &[("MINIMAX_API_KEY", "sk-minimax-test-setup")],
+        &[
+            ("MINIMAX_API_KEY", "sk-minimax-test-setup"),
+            ("PALYRA_MODEL_PROVIDER_MINIMAX_BASE_URL", minimax_base_url.as_str()),
+        ],
     )?;
+    let discovery_request = model_server.finish()?;
+    assert!(
+        discovery_request.starts_with("GET /v1/models "),
+        "setup should discover MiniMax models before writing config: {discovery_request}"
+    );
     assert!(
         output.status.success(),
         "MiniMax quickstart should succeed: {}",
@@ -597,12 +613,16 @@ fn setup_wizard_quickstart_supports_minimax_api_key() -> Result<()> {
         "expected MiniMax auth provider kind"
     );
     assert!(
-        written.contains("anthropic_base_url = \"https://api.minimax.io/anthropic\""),
+        written.contains(format!("anthropic_base_url = \"{minimax_base_url}\"").as_str()),
         "expected MiniMax Anthropic-compatible endpoint"
     );
     assert!(
-        written.contains("anthropic_model = \"MiniMax-M2.7\""),
-        "expected MiniMax default model"
+        written.contains("anthropic_model = \"MiniMax-M3\""),
+        "expected MiniMax model selected from live discovery"
+    );
+    assert!(
+        written.contains("allow_private_base_url = true"),
+        "expected loopback discovery endpoint to opt into private base URLs"
     );
     assert!(
         written.contains("anthropic_api_key_vault_ref = \"global/minimax_api_key\""),
@@ -747,6 +767,9 @@ fn setup_wizard_stores_minimax_secret_in_state_root_vault_by_default() -> Result
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let config_path = workdir.path().join("config").join("palyra.toml");
     let config_path_string = config_path.to_string_lossy().into_owned();
+    let model_server =
+        MockProviderServer::spawn(r#"{"data":[{"id":"MiniMax-M3"},{"id":"MiniMax-M2.7"}]}"#)?;
+    let minimax_base_url = model_server.base_url.clone();
     let output = run_cli_without_explicit_vault_dir(
         &workdir,
         &[
@@ -769,8 +792,16 @@ fn setup_wizard_stores_minimax_secret_in_state_root_vault_by_default() -> Result
             "--skip-skills",
             "--skip-health",
         ],
-        &[("MINIMAX_API_KEY", "sk-minimax-state-root")],
+        &[
+            ("MINIMAX_API_KEY", "sk-minimax-state-root"),
+            ("PALYRA_MODEL_PROVIDER_MINIMAX_BASE_URL", minimax_base_url.as_str()),
+        ],
     )?;
+    let discovery_request = model_server.finish()?;
+    assert!(
+        discovery_request.starts_with("GET /v1/models "),
+        "setup should discover MiniMax models before storing the generated config: {discovery_request}"
+    );
     assert!(
         output.status.success(),
         "MiniMax quickstart should succeed without PALYRA_VAULT_DIR: {}",
@@ -1134,6 +1165,10 @@ fn configure_auth_model_backfills_admin_defaults_for_resume_path() -> Result<()>
     )?;
 
     let config_path_string = config_path.to_string_lossy().into_owned();
+    let model_server = MockProviderServer::spawn(
+        r#"{"data":[{"id":"MiniMax-M3"},{"id":"MiniMax-M2.7"},{"id":"MiniMax-M2.5"}]}"#,
+    )?;
+    let minimax_base_url = model_server.base_url.clone();
     let output = run_cli_with_stdin(
         &workdir,
         &[
@@ -1149,9 +1184,14 @@ fn configure_auth_model_backfills_admin_defaults_for_resume_path() -> Result<()>
             "--api-key-stdin",
             "--json",
         ],
-        &[],
+        &[("PALYRA_MODEL_PROVIDER_MINIMAX_BASE_URL", minimax_base_url.as_str())],
         Some(b"sk-minimax-resume\n"),
     )?;
+    let discovery_request = model_server.finish()?;
+    assert!(
+        discovery_request.starts_with("GET /v1/models "),
+        "configure auth-model should discover MiniMax models before persisting config: {discovery_request}"
+    );
     assert!(
         output.status.success(),
         "configure auth-model should complete resume repair: {}",
@@ -1194,6 +1234,10 @@ fn configure_auth_model_backfills_admin_defaults_for_resume_path() -> Result<()>
         after_values.iter().any(|value| value.as_str() == Some("provider_kind=anthropic")),
         "configure output should preserve the technical compatibility provider kind: {payload}"
     );
+    assert!(
+        after_values.iter().any(|value| value.as_str() == Some("chat_model=MiniMax-M3")),
+        "configure output should expose the MiniMax model selected from live discovery: {payload}"
+    );
     let follow_up_checks = payload
         .get("follow_up_checks")
         .and_then(Value::as_array)
@@ -1218,6 +1262,10 @@ fn configure_auth_model_backfills_admin_defaults_for_resume_path() -> Result<()>
     assert!(
         written.contains("auth_provider_kind = \"minimax\""),
         "expected MiniMax auth provider after configure: {written}"
+    );
+    assert!(
+        written.contains("anthropic_model = \"MiniMax-M3\""),
+        "expected discovered MiniMax model after configure: {written}"
     );
     assert!(
         written.contains("identity_store_dir = "),
@@ -1610,4 +1658,59 @@ openai_api_key_vault_ref = "global/missing_openai_key"
         .join("palyra.toml");
     assert!(imported_config.exists(), "expected imported config snapshot");
     Ok(())
+}
+
+struct MockProviderServer {
+    base_url: String,
+    handle: thread::JoinHandle<Result<String>>,
+}
+
+impl MockProviderServer {
+    fn spawn(response_body: &'static str) -> Result<Self> {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").context("failed to bind mock provider server")?;
+        listener.set_nonblocking(true).context("failed to configure mock provider listener")?;
+        let base_url = format!("http://{}", listener.local_addr().context("listener address")?);
+        let handle = thread::spawn(move || -> Result<String> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buffer = [0_u8; 4096];
+                        let read =
+                            stream.read(&mut buffer).context("failed to read provider request")?;
+                        let request_text = String::from_utf8_lossy(&buffer[..read]).to_string();
+                        if !request_text.starts_with("GET /v1/models ") {
+                            anyhow::bail!("unexpected provider request: {request_text}");
+                        }
+                        if !request_text.to_ascii_lowercase().contains("authorization: bearer ") {
+                            anyhow::bail!(
+                                "model discovery request should use bearer auth: {request_text}"
+                            );
+                        }
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            response_body.len(),
+                            response_body
+                        );
+                        stream
+                            .write_all(response.as_bytes())
+                            .context("failed to write provider response")?;
+                        return Ok(request_text);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => return Err(error).context("mock provider accept failed"),
+                }
+            }
+            anyhow::bail!("mock provider did not receive a model discovery request")
+        });
+
+        Ok(Self { base_url, handle })
+    }
+
+    fn finish(self) -> Result<String> {
+        self.handle.join().map_err(|_| anyhow::anyhow!("mock provider server panicked"))?
+    }
 }

@@ -132,6 +132,12 @@ pub(crate) struct ProviderConnectionCheckPayload {
     pub(crate) latency_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiscoveredProviderModel {
+    pub(crate) id: String,
+    recency_rank: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ModelsConnectionPayload {
     pub(crate) path: String,
@@ -2122,7 +2128,7 @@ fn load_vault_secret_utf8(vault: &palyra_vault::Vault, vault_ref: &str) -> Resul
     String::from_utf8(bytes).context("vault secret must contain valid UTF-8")
 }
 
-fn provider_models_endpoint(base_url: &str) -> Result<reqwest::Url> {
+pub(crate) fn provider_models_endpoint(base_url: &str) -> Result<reqwest::Url> {
     let trimmed = base_url.trim().trim_end_matches('/');
     let raw = if trimmed.ends_with("/v1") {
         format!("{trimmed}/models")
@@ -2133,21 +2139,105 @@ fn provider_models_endpoint(base_url: &str) -> Result<reqwest::Url> {
         .with_context(|| format!("invalid provider base_url: {base_url}"))
 }
 
-fn parse_discovered_model_ids(body: &str) -> Result<Vec<String>> {
+pub(crate) fn parse_discovered_provider_models(body: &str) -> Result<Vec<DiscoveredProviderModel>> {
     let value: serde_json::Value =
         serde_json::from_str(body).context("provider returned invalid JSON for model discovery")?;
     let discovered = value
         .get("data")
         .and_then(serde_json::Value::as_array)
         .map(|entries| {
-            entries
-                .iter()
-                .filter_map(|entry| entry.get("id").and_then(serde_json::Value::as_str))
-                .map(ToOwned::to_owned)
-                .collect::<Vec<_>>()
+            entries.iter().filter_map(parse_discovered_provider_model).collect::<Vec<_>>()
         })
         .unwrap_or_default();
     Ok(discovered)
+}
+
+pub(crate) fn parse_discovered_model_ids(body: &str) -> Result<Vec<String>> {
+    Ok(parse_discovered_provider_models(body)?.into_iter().map(|model| model.id).collect())
+}
+
+pub(crate) fn select_preferred_discovered_model_id(
+    models: &[DiscoveredProviderModel],
+) -> Option<String> {
+    let candidates = models
+        .iter()
+        .filter_map(|model| {
+            let id = model.id.trim();
+            (!id.is_empty()).then_some((id, model.recency_rank))
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Do not infer freshness from provider-specific model ID strings. Prefer provider metadata
+    // when it is complete; otherwise treat the discovery response order as authoritative.
+    if candidates.iter().all(|(_, recency_rank)| recency_rank.is_some()) {
+        let (mut selected_id, mut selected_rank) = (candidates[0].0, candidates[0].1?);
+        for (id, recency_rank) in candidates.iter().skip(1) {
+            let recency_rank = (*recency_rank)?;
+            if recency_rank > selected_rank {
+                selected_id = *id;
+                selected_rank = recency_rank;
+            }
+        }
+        return Some(selected_id.to_owned());
+    }
+
+    Some(candidates[0].0.to_owned())
+}
+
+fn parse_discovered_provider_model(entry: &serde_json::Value) -> Option<DiscoveredProviderModel> {
+    let id = entry
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())?;
+    Some(DiscoveredProviderModel {
+        id: id.to_owned(),
+        recency_rank: discovered_model_recency_rank(entry),
+    })
+}
+
+fn discovered_model_recency_rank(entry: &serde_json::Value) -> Option<i64> {
+    const RECENCY_FIELDS: &[&str] = &[
+        "created",
+        "created_at",
+        "createdAt",
+        "created_unix_ms",
+        "createdUnixMs",
+        "released_at",
+        "releasedAt",
+        "release_unix_ms",
+        "releaseUnixMs",
+    ];
+    RECENCY_FIELDS
+        .iter()
+        .find_map(|field| entry.get(*field).and_then(model_recency_rank_from_value))
+}
+
+fn model_recency_rank_from_value(value: &serde_json::Value) -> Option<i64> {
+    if let Some(raw) = value.as_i64() {
+        return normalize_numeric_recency_rank(raw);
+    }
+    if let Some(raw) = value.as_u64().and_then(|raw| i64::try_from(raw).ok()) {
+        return normalize_numeric_recency_rank(raw);
+    }
+    value
+        .as_str()
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .and_then(normalize_numeric_recency_rank)
+}
+
+fn normalize_numeric_recency_rank(raw: i64) -> Option<i64> {
+    const EPOCH_SECONDS_UPPER_BOUND: i64 = 100_000_000_000;
+    if raw <= 0 {
+        return None;
+    }
+    if raw < EPOCH_SECONDS_UPPER_BOUND {
+        return raw.checked_mul(1000);
+    }
+    Some(raw)
 }
 
 fn classify_provider_failure(status_code: u16) -> String {
@@ -2159,7 +2249,7 @@ fn classify_provider_failure(status_code: u16) -> String {
     }
 }
 
-fn sanitize_provider_error(body: &str, status_code: u16) -> String {
+pub(crate) fn sanitize_provider_error(body: &str, status_code: u16) -> String {
     let trimmed = redact_auth_error(body).trim().to_owned();
     if trimmed.is_empty() {
         format!("provider returned HTTP {status_code}")
@@ -2203,6 +2293,32 @@ mod tests {
             vault_ref: None,
             configured_model_ids: Vec::new(),
         }
+    }
+
+    #[test]
+    fn discovered_model_selection_uses_complete_provider_recency_metadata() {
+        let models = parse_discovered_provider_models(
+            r#"{"data":[{"id":"provider-stable","created":1700000000},{"id":"provider-current","created":1800000000}]}"#,
+        )
+        .expect("provider discovery payload should parse");
+
+        assert_eq!(
+            select_preferred_discovered_model_id(models.as_slice()).as_deref(),
+            Some("provider-current")
+        );
+    }
+
+    #[test]
+    fn discovered_model_selection_preserves_provider_order_without_complete_recency_metadata() {
+        let models = parse_discovered_provider_models(
+            r#"{"data":[{"id":"MiniMax-M3"},{"id":"MiniMax-M2.7","created":1700000000},{"id":"MiniMax-M2.5"}]}"#,
+        )
+        .expect("provider discovery payload should parse");
+
+        assert_eq!(
+            select_preferred_discovered_model_id(models.as_slice()).as_deref(),
+            Some("MiniMax-M3")
+        );
     }
 
     #[test]
