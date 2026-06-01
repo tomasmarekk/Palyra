@@ -165,6 +165,9 @@ run_fast_profile() {
   echo "Checking local-only tracked paths..."
   bash "$ROOT_DIR/scripts/check-local-only-tracked-files.sh"
 
+  echo "Running English source scan..."
+  bash "$ROOT_DIR/scripts/check-english-source.sh"
+
   echo "Running module budget and connector boundary ratchet..."
   bash "$ROOT_DIR/scripts/dev/report-module-budgets.sh" --strict
 
@@ -188,6 +191,9 @@ run_full_profile() {
 
   echo "Checking local-only tracked paths..."
   bash "$ROOT_DIR/scripts/check-local-only-tracked-files.sh"
+
+  echo "Running English source scan..."
+  bash "$ROOT_DIR/scripts/check-english-source.sh"
 
   echo "Running module budget and connector boundary ratchet..."
   bash "$ROOT_DIR/scripts/dev/report-module-budgets.sh" --strict

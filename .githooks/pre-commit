@@ -12,5 +12,8 @@ fi
 echo "Running gitleaks staged scan..."
 gitleaks protect --staged --redact
 
+echo "Running English source scan..."
+bash scripts/check-english-source.sh
+
 echo "Running high-risk pattern scan..."
 bash scripts/check-high-risk-patterns.sh
