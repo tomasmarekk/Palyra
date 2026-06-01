@@ -35,7 +35,7 @@ use crate::{
 
 use checkpoint_flow::WorkspacePatchMutationRequest;
 
-const WORKSPACE_PATCH_GRAMMAR_HINT: &str = "Use a complete Palyra patch document: begin with exactly '*** Begin Patch', then operation headers like '*** Add File: path', '*** Replace File: path', or '*** Update File: path', end with exactly one '*** End Patch'. Never send a partial or truncated patch. For large file creation or multi-file changes, split work into multiple smaller complete apply_patch calls. Add-file and replace-file content lines may start with '+', and a bare '+' or '+ ' writes a blank line. Use Add File only for missing files. If an Update File hunk fails with context not found, read the current file and retry with Replace File plus the full intended file content. Update-file hunks must start with '@@' and hunk lines must start with ' ', '+', or '-'. To edit file content that itself begins with '-' or '+', prefix it directly with the hunk marker, for example '-- markdown item' removes '- markdown item' and '++value' adds '+value'. JSON files are validated after patch planning; if JSON validation fails, retry with the complete valid JSON file content.";
+const WORKSPACE_PATCH_GRAMMAR_HINT: &str = "Use a complete Palyra patch document: begin with exactly '*** Begin Patch', then operation headers like '*** Add File: path', '*** Replace File: path', '*** Replace Line: path', or '*** Update File: path', end with exactly one '*** End Patch'. Never send a partial or truncated patch. For large file creation or multi-file changes, split work into multiple smaller complete apply_patch calls. Add-file and replace-file content lines may start with '+', and a bare '+' or '+ ' writes a blank line. Use Add File only for missing files. If search/read_file confirmed one exact target line, use Replace Line with exactly one '-' old line and one '+' new line. If an Update File hunk fails with context not found, read the current file and retry with Replace Line for a unique exact line, fresh context hunks, or Replace File plus the full intended file content. Update-file hunks must start with '@@' and hunk lines must start with ' ', '+', or '-'. To edit file content that itself begins with '-' or '+', prefix it directly with the hunk marker, for example '-- markdown item' removes '- markdown item' and '++value' adds '+value'. JSON files are validated after patch planning; if JSON validation fails, retry with the complete valid JSON file content.";
 
 pub(crate) struct WorkspacePatchToolRequest<'a> {
     pub(crate) principal: &'a str,
@@ -380,9 +380,15 @@ fn patch_operation_paths(patch: &str) -> Vec<String> {
     patch
         .lines()
         .filter_map(|line| {
-            ["*** Add File:", "*** Update File:", "*** Replace File:", "*** Delete File:"]
-                .iter()
-                .find_map(|prefix| line.strip_prefix(prefix).map(str::trim))
+            [
+                "*** Add File:",
+                "*** Update File:",
+                "*** Replace File:",
+                "*** Replace Line:",
+                "*** Delete File:",
+            ]
+            .iter()
+            .find_map(|prefix| line.strip_prefix(prefix).map(str::trim))
         })
         .filter(|path| !path.is_empty())
         .map(ToOwned::to_owned)
@@ -419,6 +425,7 @@ fn normalize_workspace_patch_header_line(
     const PATCH_PATH_PREFIXES: &[&str] = &[
         "*** Add File: ",
         "*** Replace File: ",
+        "*** Replace Line: ",
         "*** Update File: ",
         "*** Delete File: ",
         "*** Move to: ",
@@ -887,7 +894,7 @@ fn workspace_patch_recovery_hint(error: &WorkspacePatchError) -> &'static str {
             "Read or reconstruct the intended JSON and retry with Replace File or Add File containing complete valid JSON only."
         }
         WorkspacePatchError::HunkApplyFailed { .. } => {
-            "Read the current file and retry with either fresh context hunks or Replace File containing the full intended file content."
+            "Read or search the current file and retry with Replace Line for one unique exact line, fresh context hunks, or Replace File containing the full intended file content."
         }
         WorkspacePatchError::SuspiciousPartialReplace { .. } => {
             "Read the current file and retry with Update File hunks, or use Replace File with the complete intended file content."
@@ -1168,7 +1175,7 @@ mod tests {
     }
 
     #[test]
-    fn patch_operation_paths_extracts_add_update_replace_delete_targets() {
+    fn patch_operation_paths_extracts_add_update_replace_line_delete_targets() {
         let patch = concat!(
             "*** Begin Patch\n",
             "*** Add File: package.json\n",
@@ -1179,13 +1186,16 @@ mod tests {
             "+new\n",
             "*** Replace File: README.md\n",
             "+docs\n",
+            "*** Replace Line: public/app.js\n",
+            "-old\n",
+            "+new\n",
             "*** Delete File: tmp.txt\n",
             "*** End Patch\n",
         );
 
         assert_eq!(
             patch_operation_paths(patch),
-            vec!["package.json", "src/index.js", "README.md", "tmp.txt"]
+            vec!["package.json", "src/index.js", "README.md", "public/app.js", "tmp.txt"]
         );
     }
 

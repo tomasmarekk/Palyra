@@ -776,7 +776,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                         "patch",
                         json!({
                             "type":"string",
-                            "description":"A complete Palyra patch document. It must start with '*** Begin Patch', contain one or more '*** Add File:', '*** Replace File:', '*** Update File:', or '*** Delete File:' operations, and end with '*** End Patch'. The final non-whitespace line must be exactly '*** End Patch'; never send a partial or truncated patch. For large file creation or multi-file changes, split work into multiple smaller complete apply_patch calls. Add-file and replace-file body lines may start with '+'. For Add File, missing parent directories are created automatically; Replace File requires the target to exist and is the deterministic fallback after reading a file when update hunk context cannot be matched. Update-file operations require '@@' hunks whose lines start with ' ', '+', or '-'. Never write redaction placeholders such as [REDACTED], [REDACTED_SECRET], or <redacted> into secret-bearing files like .env; preserve existing secret lines or update example/template files instead. Use forward-slash relative paths only, such as reports/report.md; never use host absolute paths."
+                            "description":"A complete Palyra patch document. It must start with '*** Begin Patch', contain one or more '*** Add File:', '*** Replace File:', '*** Replace Line:', '*** Update File:', or '*** Delete File:' operations, and end with '*** End Patch'. The final non-whitespace line must be exactly '*** End Patch'; never send a partial or truncated patch. For large file creation or multi-file changes, split work into multiple smaller complete apply_patch calls. Add-file and replace-file body lines may start with '+'. For Add File, missing parent directories are created automatically. Replace Line requires the target to exist and accepts exactly one '-' old line followed by one '+' new line; use it after search/read_file confirms a unique exact target line. Replace File requires the target to exist and is the deterministic fallback after reading a file when update hunk context cannot be matched. Update-file operations require '@@' hunks whose lines start with ' ', '+', or '-'. Never write redaction placeholders such as [REDACTED], [REDACTED_SECRET], or <redacted> into secret-bearing files like .env; preserve existing secret lines or update example/template files instead. Use forward-slash relative paths only, such as reports/report.md; never use host absolute paths."
                         }),
                     ),
                     (
@@ -1270,6 +1270,9 @@ mod tests {
             .and_then(serde_json::Value::as_str)
             .expect("patch description should be visible to models");
         assert!(patch_description.contains("*** Replace File:"));
+        assert!(patch_description.contains("*** Replace Line:"));
+        assert!(patch_description.contains("one '-' old line"));
+        assert!(patch_description.contains("unique exact target line"));
         assert!(patch_description.contains("final non-whitespace line"));
         assert!(patch_description.contains("multiple smaller complete apply_patch calls"));
         assert!(patch_description.contains("context cannot be matched"));

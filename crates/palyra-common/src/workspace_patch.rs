@@ -177,6 +177,7 @@ impl WorkspacePatchError {
 enum PatchOperation {
     Add { path: String, lines: Vec<String> },
     Replace { path: String, lines: Vec<String> },
+    ReplaceLine { path: String, old: String, new: String },
     Update { path: String, move_to: Option<String>, hunks: Vec<PatchHunk> },
     Delete { path: String },
 }
@@ -417,6 +418,7 @@ fn replace_ascii_case_insensitive(haystack: &str, needle: &str, replacement: &st
 fn parse_patch_header_path(line: &str) -> Option<&str> {
     line.strip_prefix("*** Add File: ")
         .or_else(|| line.strip_prefix("*** Replace File: "))
+        .or_else(|| line.strip_prefix("*** Replace Line: "))
         .or_else(|| line.strip_prefix("*** Update File: "))
         .or_else(|| line.strip_prefix("*** Delete File: "))
         .or_else(|| line.strip_prefix("*** Move to: "))
@@ -589,6 +591,7 @@ fn operation_header_variant(line: &str) -> Option<String> {
     for prefix in [
         "*** Add File:",
         "*** Replace File:",
+        "*** Replace Line:",
         "*** Update File:",
         "*** Delete File:",
         "*** Move to:",
@@ -896,6 +899,59 @@ fn parse_patch_document(patch: &str) -> Result<Vec<PatchOperation>, WorkspacePat
             continue;
         }
 
+        if let Some(path) = control_line.strip_prefix("*** Replace Line: ") {
+            let header_line = index;
+            index = index.saturating_add(1);
+            if index.saturating_add(1) >= lines.len() {
+                return Err(parse_error(
+                    header_line + 1,
+                    1,
+                    "replace-line operation requires exactly one '-' old line followed by one '+' new line",
+                ));
+            }
+            let old_line = lines[index];
+            if is_patch_header_or_end(old_line) {
+                return Err(parse_error(
+                    index + 1,
+                    1,
+                    "replace-line operation requires a '-' old line",
+                ));
+            }
+            index = index.saturating_add(1);
+            let new_line = lines[index];
+            if is_patch_header_or_end(new_line) {
+                return Err(parse_error(
+                    index + 1,
+                    1,
+                    "replace-line operation requires a '+' new line",
+                ));
+            }
+            index = index.saturating_add(1);
+            let Some(old) = old_line.strip_prefix('-') else {
+                return Err(parse_error(
+                    index.saturating_sub(1),
+                    1,
+                    "replace-line old line must start with '-'",
+                ));
+            };
+            let Some(new) = new_line.strip_prefix('+') else {
+                return Err(parse_error(index, 1, "replace-line new line must start with '+'"));
+            };
+            if index < lines.len() && !is_patch_header_or_end(lines[index]) {
+                return Err(parse_error(
+                    index + 1,
+                    1,
+                    "replace-line operation accepts exactly one '-' line and one '+' line",
+                ));
+            }
+            operations.push(PatchOperation::ReplaceLine {
+                path: path.to_owned(),
+                old: old.to_owned(),
+                new: new.to_owned(),
+            });
+            continue;
+        }
+
         if let Some(path) = control_line.strip_prefix("*** Update File: ") {
             index = index.saturating_add(1);
             let mut move_to = None;
@@ -971,7 +1027,7 @@ fn parse_patch_document(patch: &str) -> Result<Vec<PatchOperation>, WorkspacePat
         return Err(parse_error(
             index + 1,
             1,
-            "expected patch operation header: *** Add File, *** Replace File, *** Update File, or *** Delete File",
+            "expected patch operation header: *** Add File, *** Replace File, *** Replace Line, *** Update File, or *** Delete File",
         ));
     }
 
@@ -1145,6 +1201,34 @@ fn build_patch_plan(
                     path: output_path,
                     workspace_root_index: target_root_index,
                     operation: "replace".to_owned(),
+                    moved_from: None,
+                    before_sha256: Some(sha256_hex(before_bytes.as_slice())),
+                    before_size_bytes: Some(before_bytes.len() as u64),
+                    after_sha256: Some(sha256_hex(after_bytes.as_slice())),
+                    after_size_bytes: Some(after_bytes.len() as u64),
+                });
+            }
+            PatchOperation::ReplaceLine { path, old, new } => {
+                let relative = parse_relative_patch_path(path)?;
+                let output_path = normalize_relative_path_display(&relative);
+                let (target, target_root_index) =
+                    resolve_existing_path(canonical_roots, &relative, path)?;
+                let before_bytes = read_file_capped(target.as_path(), path, limits.max_file_bytes)?;
+                let after_bytes =
+                    replace_exact_line_bytes(path, before_bytes.as_slice(), old, new)?;
+                ensure_file_size(path, after_bytes.len(), limits.max_file_bytes)?;
+                ensure_planned_file_content(output_path.as_str(), after_bytes.as_slice())?;
+
+                touched_paths.insert(target.clone());
+                actions.push(PlannedAction::Write {
+                    path: target,
+                    root: canonical_roots[target_root_index].clone(),
+                    bytes: after_bytes.clone(),
+                });
+                file_attestations.push(WorkspacePatchFileAttestation {
+                    path: output_path,
+                    workspace_root_index: target_root_index,
+                    operation: "line_replace".to_owned(),
                     moved_from: None,
                     before_sha256: Some(sha256_hex(before_bytes.as_slice())),
                     before_size_bytes: Some(before_bytes.len() as u64),
@@ -1572,6 +1656,53 @@ fn apply_hunks_to_bytes(
     Ok(output.into_bytes())
 }
 
+fn replace_exact_line_bytes(
+    path_label: &str,
+    before: &[u8],
+    old: &str,
+    new: &str,
+) -> Result<Vec<u8>, WorkspacePatchError> {
+    let text = std::str::from_utf8(before)
+        .map_err(|_| WorkspacePatchError::InvalidUtf8File { path: path_label.to_owned() })?;
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let had_trailing_newline = normalized.ends_with('\n');
+    let body = normalized.strip_suffix('\n').unwrap_or(normalized.as_str());
+    let mut lines = if body.is_empty() {
+        Vec::<String>::new()
+    } else {
+        body.split('\n').map(|line| line.to_owned()).collect::<Vec<_>>()
+    };
+
+    let matches = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| (line == old).then_some(index))
+        .collect::<Vec<_>>();
+    let Some(index) = matches.first().copied() else {
+        return Err(WorkspacePatchError::HunkApplyFailed {
+            path: path_label.to_owned(),
+            message: "replace-line exact target not found; use the exact line text returned by search/read_file or retry with an Update File hunk containing surrounding context"
+                .to_owned(),
+        });
+    };
+    if matches.len() > 1 {
+        return Err(WorkspacePatchError::HunkApplyFailed {
+            path: path_label.to_owned(),
+            message: format!(
+                "replace-line exact target matched {} lines; retry with an Update File hunk containing surrounding context",
+                matches.len()
+            ),
+        });
+    }
+
+    lines[index] = new.to_owned();
+    let mut output = lines.join("\n");
+    if had_trailing_newline {
+        output.push('\n');
+    }
+    Ok(output.into_bytes())
+}
+
 fn find_subsequence(haystack: &[String], needle: &[String], from: usize) -> Option<usize> {
     if needle.is_empty() {
         return Some(from.min(haystack.len()));
@@ -1925,6 +2056,70 @@ mod tests {
         assert_eq!(attestation.operation, "replace");
         assert!(attestation.before_sha256.is_some());
         assert!(attestation.after_sha256.is_some());
+    }
+
+    #[test]
+    fn apply_workspace_patch_replaces_unique_confirmed_line() {
+        let temp = tempdir().expect("tempdir should be created");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(workspace.join("public")).expect("workspace should exist");
+        fs::write(
+            workspace.join("public").join("app.js"),
+            "function boot() {\n  parseStoredSession();\n  render();\n}\n",
+        )
+        .expect("seed file should exist");
+
+        let patch = concat!(
+            "*** Begin Patch\n",
+            "*** Replace Line: public/app.js\n",
+            "-  parseStoredSession();\n",
+            "+  currentSession = parseStoredSession();\n",
+            "*** End Patch\n",
+        );
+        let outcome = apply_workspace_patch(
+            std::slice::from_ref(&workspace),
+            &default_request(patch, false),
+            &default_limits(),
+        )
+        .expect("replace-line patch should apply when the old line is unique");
+
+        assert_eq!(
+            fs::read_to_string(workspace.join("public").join("app.js"))
+                .expect("patched file should read"),
+            "function boot() {\n  currentSession = parseStoredSession();\n  render();\n}\n"
+        );
+        let attestation = attestation_by_path(&outcome, "public/app.js");
+        assert_eq!(attestation.operation, "line_replace");
+        assert!(attestation.before_sha256.is_some());
+        assert!(attestation.after_sha256.is_some());
+    }
+
+    #[test]
+    fn apply_workspace_patch_rejects_ambiguous_replace_line() {
+        let temp = tempdir().expect("tempdir should be created");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        fs::write(workspace.join("app.js"), "render();\nrender();\n")
+            .expect("seed file should exist");
+
+        let patch =
+            "*** Begin Patch\n*** Replace Line: app.js\n-render();\n+renderApp();\n*** End Patch\n";
+        let error = apply_workspace_patch(
+            std::slice::from_ref(&workspace),
+            &default_request(patch, false),
+            &default_limits(),
+        )
+        .expect_err("ambiguous replace-line targets should be rejected");
+
+        assert!(matches!(error, WorkspacePatchError::HunkApplyFailed { .. }));
+        assert!(
+            error.to_string().contains("matched 2 lines"),
+            "error should explain ambiguous line replacement: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("app.js")).expect("seed file should remain"),
+            "render();\nrender();\n"
+        );
     }
 
     #[test]
