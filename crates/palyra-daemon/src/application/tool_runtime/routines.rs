@@ -1497,7 +1497,10 @@ fn resolve_routine_schedule(
             .map_err(|error| format!("failed to encode file_watch trigger payload: {error}"))?;
         return Ok(ScheduleResolution {
             schedule_type: normalized.schedule_type,
-            schedule_payload_json: normalized.schedule_payload_json,
+            schedule_payload_json: schedule_payload_with_max_runs(
+                normalized.schedule_payload_json,
+                max_runs,
+            )?,
             next_run_at_unix_ms: normalized.next_run_at_unix_ms,
             trigger_payload_json_override: Some(trigger_payload_json),
         });
@@ -2359,7 +2362,8 @@ mod tests {
             "trigger_payload": {
                 "path": watched_path.to_string_lossy(),
                 "poll_interval_ms": 30_000,
-            }
+            },
+            "max_runs": 2,
         })
         .as_object()
         .expect("payload should be an object")
@@ -2384,6 +2388,7 @@ mod tests {
 
         assert_eq!(schedule.schedule_type, crate::journal::CronScheduleType::Every);
         assert_eq!(schedule_payload["interval_ms"], 30_000);
+        assert_eq!(schedule_payload["max_runs"], 2);
         assert_eq!(trigger_payload["last_observed"]["exists"], true);
 
         let _ = fs::remove_file(watched_path);
