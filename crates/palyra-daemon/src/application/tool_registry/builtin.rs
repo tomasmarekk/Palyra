@@ -482,7 +482,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                     ),
                     (
                         "target_path",
-                        json!({"type":"string","description":"Absolute OS destination path for copy or move operations."}),
+                        json!({"type":"string","description":"Destination path for copy or move operations. Use an absolute OS path for OS-to-OS moves, or a workspace-relative path such as data/imported/file.csv or /workspace/data/imported/file.csv to import an allowed OS file into the active workspace without guessing the workspace's absolute root."}),
                     ),
                     (
                         "content_text",
@@ -1287,6 +1287,14 @@ mod tests {
             .expect("os_file operation enum should be visible to models");
         assert!(operation_values.iter().any(|value| value.as_str() == Some("list_dir")));
         assert!(operation_values.iter().any(|value| value.as_str() == Some("search")));
+
+        let target_description = entry
+            .input_schema
+            .pointer("/properties/target_path/description")
+            .and_then(serde_json::Value::as_str)
+            .expect("os_file target_path description should be visible to models");
+        assert!(target_description.contains("workspace-relative"));
+        assert!(target_description.contains("/workspace/data/imported/file.csv"));
 
         let query_description = entry
             .input_schema

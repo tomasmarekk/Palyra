@@ -375,7 +375,7 @@ fn looks_like_large_full_file_shrink(existing_size_bytes: u64, new_size_bytes: u
 
 fn copy_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String> {
     let source = resolve_existing_os_path(input.path.as_str())?;
-    let target = resolve_target_os_path(required_target_path(input)?)?;
+    let target = resolve_copy_move_target_path(policy, required_target_path(input)?)?;
     ensure_os_path_allowed(policy, &source)?;
     ensure_os_path_allowed(policy, &target)?;
     let dry_run = input.dry_run.unwrap_or(false);
@@ -396,6 +396,7 @@ fn copy_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String
         "resolved_path": display_path(source.resolved_path.as_path()),
         "target_path": display_path(target.requested_path.as_path()),
         "resolved_target_path": display_path(target.resolved_path.as_path()),
+        "target_workspace_relative_path": workspace_relative_path(policy, target.resolved_path.as_path()),
         "source_size_bytes": source_size,
         "target_existed_before": target.existed,
         "dry_run": dry_run,
@@ -404,7 +405,7 @@ fn copy_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String
 
 fn move_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String> {
     let source = resolve_existing_os_path(input.path.as_str())?;
-    let target = resolve_target_os_path(required_target_path(input)?)?;
+    let target = resolve_copy_move_target_path(policy, required_target_path(input)?)?;
     ensure_os_path_allowed(policy, &source)?;
     ensure_os_path_allowed(policy, &target)?;
     let dry_run = input.dry_run.unwrap_or(false);
@@ -430,6 +431,7 @@ fn move_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String
         "resolved_path": display_path(source.resolved_path.as_path()),
         "target_path": display_path(target.requested_path.as_path()),
         "resolved_target_path": display_path(target.resolved_path.as_path()),
+        "target_workspace_relative_path": workspace_relative_path(policy, target.resolved_path.as_path()),
         "source_size_bytes": source_size,
         "target_existed_before": target.existed,
         "dry_run": dry_run,
@@ -884,6 +886,74 @@ fn required_target_path(input: &OsFileInput) -> Result<&str, String> {
         .ok_or_else(|| format!("{OS_FILE_TOOL_NAME} operation requires non-empty target_path"))
 }
 
+fn resolve_copy_move_target_path(
+    policy: &OsFilePolicy,
+    target_path: &str,
+) -> Result<ResolvedOsPath, String> {
+    let trimmed = target_path.trim();
+    if is_workspace_relative_target(trimmed) || !Path::new(trimmed).is_absolute() {
+        return resolve_workspace_relative_target_path(policy, trimmed);
+    }
+    resolve_target_os_path(trimmed)
+}
+
+fn resolve_workspace_relative_target_path(
+    policy: &OsFilePolicy,
+    target_path: &str,
+) -> Result<ResolvedOsPath, String> {
+    let root = policy.workspace_roots.first().ok_or_else(|| {
+        format!("{OS_FILE_TOOL_NAME} target_path cannot be workspace-relative without an active workspace root")
+    })?;
+    let relative = normalize_workspace_relative_target(target_path)?;
+    let requested_path = root.join(relative.as_path());
+    if requested_path.exists() {
+        let resolved_path = fs::canonicalize(requested_path.as_path()).map_err(|error| {
+            format!("{OS_FILE_TOOL_NAME} failed to resolve existing workspace target: {error}")
+        })?;
+        return Ok(ResolvedOsPath { requested_path, resolved_path, existed: true });
+    }
+    let (existing_ancestor, missing_suffix) = nearest_existing_ancestor(requested_path.as_path())?;
+    let canonical_ancestor = fs::canonicalize(existing_ancestor.as_path()).map_err(|error| {
+        format!("{OS_FILE_TOOL_NAME} failed to resolve workspace target ancestor: {error}")
+    })?;
+    let resolved_path = canonical_ancestor.join(missing_suffix);
+    Ok(ResolvedOsPath { requested_path, resolved_path, existed: false })
+}
+
+fn is_workspace_relative_target(target_path: &str) -> bool {
+    let normalized = target_path.trim().replace('\\', "/");
+    normalized == "workspace"
+        || normalized.starts_with("workspace/")
+        || normalized == "/workspace"
+        || normalized.starts_with("/workspace/")
+}
+
+fn normalize_workspace_relative_target(target_path: &str) -> Result<PathBuf, String> {
+    let normalized = target_path.trim().replace('\\', "/");
+    let relative = match normalized.as_str() {
+        "workspace" | "/workspace" => "",
+        _ => normalized
+            .strip_prefix("/workspace/")
+            .or_else(|| normalized.strip_prefix("workspace/"))
+            .unwrap_or(normalized.as_str())
+            .trim_matches('/'),
+    };
+    if relative.is_empty() {
+        return Err(format!(
+            "{OS_FILE_TOOL_NAME} workspace-relative target_path must include a file path"
+        ));
+    }
+    let path = PathBuf::from(relative);
+    for component in path.components() {
+        if !matches!(component, Component::Normal(_)) {
+            return Err(format!(
+                "{OS_FILE_TOOL_NAME} workspace-relative target_path must stay inside the active workspace"
+            ));
+        }
+    }
+    Ok(path)
+}
+
 fn resolve_existing_os_path(path: &str) -> Result<ResolvedOsPath, String> {
     let requested_path = parse_absolute_os_path(path)?;
     let resolved_path = fs::canonicalize(requested_path.as_path()).map_err(|error| {
@@ -1125,6 +1195,15 @@ fn display_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
+fn workspace_relative_path(policy: &OsFilePolicy, path: &Path) -> Option<String> {
+    policy.workspace_roots.iter().find_map(|root| {
+        path.strip_prefix(root.as_path())
+            .ok()
+            .filter(|relative| !relative.as_os_str().is_empty())
+            .map(display_path)
+    })
+}
+
 fn os_file_outcome(
     proposal_id: &str,
     input_json: &[u8],
@@ -1311,6 +1390,67 @@ mod tests {
             fs::read_to_string(target.as_path()).expect("replacement should be readable"),
             "<span>fragment</span>\n"
         );
+    }
+
+    #[test]
+    fn os_file_move_accepts_workspace_relative_target_path() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let workspace = tempdir.path().join("workspace");
+        let os_root = tempdir.path().join("os-root");
+        let inbox = os_root.join("downloads").join("inbox");
+        fs::create_dir_all(workspace.as_path()).expect("workspace should exist");
+        fs::create_dir_all(inbox.as_path()).expect("inbox should exist");
+        let source = inbox.join("orders-valid.csv");
+        fs::write(source.as_path(), "id,name,total\n1,Ada,42\n").expect("source should exist");
+        let policy = OsFilePolicy {
+            workspace_roots: vec![fs::canonicalize(workspace.as_path()).expect("workspace root")],
+            user_os_roots: vec![fs::canonicalize(os_root.as_path()).expect("os root")],
+        };
+
+        let moved = execute_os_file_operation(
+            &policy,
+            &OsFileInput {
+                operation: OsFileOperation::Move,
+                path: source.to_string_lossy().into_owned(),
+                target_path: Some("data/imported/orders-valid.csv".to_owned()),
+                content_text: None,
+                bytes_base64: None,
+                create_parent_dirs: Some(true),
+                overwrite: Some(false),
+                full_replace: None,
+                dry_run: Some(false),
+                offset_bytes: None,
+                max_bytes: None,
+                query: None,
+                case_sensitive: None,
+                max_entries: None,
+                max_matches: None,
+            },
+        )
+        .expect("workspace-relative move target should import an OS file into the workspace");
+
+        let imported = workspace.join("data").join("imported").join("orders-valid.csv");
+        assert!(!source.exists(), "move should remove the source file");
+        assert_eq!(
+            fs::read_to_string(imported.as_path()).expect("imported file should be readable"),
+            "id,name,total\n1,Ada,42\n"
+        );
+        assert_eq!(
+            moved.get("target_workspace_relative_path").and_then(Value::as_str),
+            Some("data/imported/orders-valid.csv")
+        );
+        assert_eq!(moved.get("target_existed_before").and_then(Value::as_bool), Some(false));
+    }
+
+    #[test]
+    fn os_file_workspace_target_alias_requires_relative_file_path() {
+        let error = normalize_workspace_relative_target("/workspace")
+            .expect_err("workspace alias alone should not name an import destination");
+        assert!(error.contains("must include a file path"));
+
+        let relative = normalize_workspace_relative_target("/workspace/data/file.txt")
+            .expect("workspace alias with relative suffix should be accepted");
+        assert_eq!(relative, PathBuf::from("data").join("file.txt"));
     }
 
     #[test]
