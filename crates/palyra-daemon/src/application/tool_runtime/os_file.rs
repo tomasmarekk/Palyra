@@ -27,7 +27,7 @@ const MAX_OS_FILE_WRITE_BYTES: usize = 256 * 1024;
 const MAX_OS_FILE_LIST_ENTRIES: usize = 200;
 const MAX_OS_FILE_SEARCH_QUERY_BYTES: usize = 512;
 const MAX_OS_FILE_SEARCH_MATCHES: usize = 100;
-const MAX_OS_FILE_SEARCH_FILES: usize = 1_000;
+const MAX_OS_FILE_SEARCH_FILES: usize = 10_000;
 const MAX_OS_FILE_SEARCH_DEPTH: usize = 8;
 const MAX_OS_FILE_SEARCH_FILE_BYTES: u64 = 128 * 1024;
 const MAX_OS_FILE_SEARCH_EXCERPT_CHARS: usize = 240;
@@ -1813,6 +1813,59 @@ mod tests {
                 .iter()
                 .any(|value| value.get("kind").and_then(Value::as_str) == Some("content")),
             "search should find matching cache contents: {searched}"
+        );
+    }
+
+    #[test]
+    fn os_file_search_default_budget_scans_past_one_thousand_files() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let policy = test_policy(tempdir.path());
+        for index in 0..1_050 {
+            fs::write(tempdir.path().join(format!("noise-{index:04}.txt")), "noise\n")
+                .expect("noise fixture should be written");
+        }
+        let target = tempdir.path().join("orders-valid.csv");
+        fs::write(target.as_path(), "id,name,total\n1,Ada,42\n").expect("target fixture");
+
+        let searched = execute_os_file_operation(
+            &policy,
+            &OsFileInput {
+                operation: OsFileOperation::Search,
+                path: tempdir.path().to_string_lossy().into_owned(),
+                target_path: None,
+                content_text: None,
+                bytes_base64: None,
+                create_parent_dirs: None,
+                overwrite: None,
+                full_replace: None,
+                dry_run: None,
+                offset_bytes: None,
+                max_bytes: None,
+                query: Some("orders-valid.csv".to_owned()),
+                case_sensitive: Some(false),
+                max_entries: None,
+                max_matches: Some(10),
+            },
+        )
+        .expect("broad OS search should scan past the previous 1000-file budget");
+
+        assert_eq!(searched.get("truncated").and_then(Value::as_bool), Some(false));
+        assert!(
+            searched.get("files_scanned").and_then(Value::as_u64).unwrap_or_default() > 1_000,
+            "search should scan past 1000 files: {searched}"
+        );
+        let matches = searched
+            .get("matches")
+            .and_then(Value::as_array)
+            .expect("search matches should be an array");
+        assert!(
+            matches.iter().any(|value| {
+                value
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .is_some_and(|path| path.ends_with("orders-valid.csv"))
+            }),
+            "search should find the target file path: {searched}"
         );
     }
 
