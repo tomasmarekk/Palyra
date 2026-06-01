@@ -1171,12 +1171,41 @@ fn normalize_open_action_item(raw: &str) -> Option<String> {
     if normalized.chars().filter(|ch| ch.is_alphabetic()).count() < 3 {
         return None;
     }
+    if looks_like_compaction_status_action_item(normalized.as_str()) {
+        return None;
+    }
     let redacted = redact_url_segments_in_text(redact_auth_error(normalized.as_str()).as_str());
     let content_scan = scan_workspace_content_for_prompt_injection(redacted.as_str());
     if content_scan.state.as_str() != "clean" {
         return None;
     }
     Some(compaction_prompt_text(redacted.as_str(), SESSION_COMPACTION_ACTION_ITEM_MAX_CHARS))
+}
+
+fn looks_like_compaction_status_action_item(normalized: &str) -> bool {
+    let lower = normalized.to_lowercase();
+    let Some((label, detail)) = lower.split_once(':') else {
+        return false;
+    };
+    let label = label.trim();
+    let detail = detail.trim();
+    if detail_describes_compaction_context_status(detail) {
+        return true;
+    }
+    match label {
+        "context loaded" | "context read" => true,
+        "workspace" => contains_any(
+            detail,
+            &["worked only", "stayed within", "remained within", "only in", "did not leave"],
+        ),
+        "status" => contains_any(detail, &["done", "complete", "completed"]),
+        _ => false,
+    }
+}
+
+fn detail_describes_compaction_context_status(detail: &str) -> bool {
+    contains_any(detail, &["helper doc", "helper docs"])
+        && contains_any(detail, &["background", "read", "loaded"])
 }
 
 fn strip_checkbox_marker(raw: &str) -> &str {
@@ -2695,7 +2724,7 @@ Idea 1-C: compare stale prototypes.
         })
         .to_string();
         let reply_payload = serde_json::json!({
-            "reply_text": "Open action items:\n1. Alice: Prepare the release checklist by Monday 09:00 Prague time.\n2. Bruno: Verify the billing retry alert and attach evidence to the QA report.\n3. Clara: Confirm the support handoff owner before the launch window."
+            "reply_text": "Open action items:\n1. Alice: Prepare the release checklist by Monday 09:00 Prague time.\n2. Bruno: Verify the billing retry alert and attach evidence to the QA report.\n3. Clara: Confirm the support handoff owner before the launch window.\n4. Context loaded: all 18 helper docs were read and confirmed as background only.\n5. Workspace: worked only in the AppData scenario workspace."
         })
         .to_string();
         let mut transcript = vec![
@@ -2734,6 +2763,14 @@ Idea 1-C: compare stale prototypes.
         assert!(
             plan.active_task_summary.open_action_items.iter().all(|item| !item.contains("Idea")),
             "helper ideas must not become action items: {:?}",
+            plan.active_task_summary.open_action_items
+        );
+        assert!(
+            plan.active_task_summary
+                .open_action_items
+                .iter()
+                .all(|item| !item.contains("Context loaded") && !item.starts_with("Workspace:")),
+            "completed context/workspace status lines must not become action items: {:?}",
             plan.active_task_summary.open_action_items
         );
         assert!(
