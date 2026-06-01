@@ -891,6 +891,9 @@ fn resolve_copy_move_target_path(
     target_path: &str,
 ) -> Result<ResolvedOsPath, String> {
     let trimmed = target_path.trim();
+    if path_env_prefix(trimmed)?.is_some() {
+        return resolve_target_os_path(trimmed);
+    }
     if is_workspace_relative_target(trimmed) || !Path::new(trimmed).is_absolute() {
         return resolve_workspace_relative_target_path(policy, trimmed);
     }
@@ -986,7 +989,7 @@ fn parse_absolute_os_path(path: &str) -> Result<PathBuf, String> {
     if trimmed.chars().any(char::is_control) {
         return Err(format!("{OS_FILE_TOOL_NAME} path contains unsupported characters"));
     }
-    let parsed = PathBuf::from(trimmed);
+    let parsed = expand_env_prefixed_os_path(trimmed)?;
     if !parsed.is_absolute() {
         return Err(format!("{OS_FILE_TOOL_NAME} path must be an absolute OS path"));
     }
@@ -998,6 +1001,89 @@ fn parse_absolute_os_path(path: &str) -> Result<PathBuf, String> {
         }
     }
     Ok(parsed)
+}
+
+fn expand_env_prefixed_os_path(path: &str) -> Result<PathBuf, String> {
+    let Some((key, suffix)) = path_env_prefix(path)? else {
+        return Ok(PathBuf::from(path));
+    };
+    let value = std::env::var_os(key).filter(|value| !value.is_empty()).ok_or_else(|| {
+        format!("{OS_FILE_TOOL_NAME} path references unset environment variable `{key}`")
+    })?;
+    append_env_path_suffix(PathBuf::from(value), suffix)
+}
+
+fn path_env_prefix(path: &str) -> Result<Option<(&str, &str)>, String> {
+    if let Some(rest) = path.strip_prefix('%') {
+        let Some(end) = rest.find('%') else {
+            return Err(format!("{OS_FILE_TOOL_NAME} path has malformed %VAR% environment prefix"));
+        };
+        let key = &rest[..end];
+        validate_path_env_key(key)?;
+        return Ok(Some((key, &rest[end + 1..])));
+    }
+    if let Some(rest) = path.strip_prefix("${") {
+        let Some(end) = rest.find('}') else {
+            return Err(format!(
+                "{OS_FILE_TOOL_NAME} path has malformed ${{VAR}} environment prefix"
+            ));
+        };
+        let key = &rest[..end];
+        validate_path_env_key(key)?;
+        return Ok(Some((key, &rest[end + 1..])));
+    }
+    if let Some(rest) = path.strip_prefix('$') {
+        let key_len = rest
+            .char_indices()
+            .take_while(|(_, ch)| ch.is_ascii_alphanumeric() || *ch == '_')
+            .map(|(index, ch)| index + ch.len_utf8())
+            .last()
+            .unwrap_or(0);
+        if key_len == 0 {
+            return Err(format!("{OS_FILE_TOOL_NAME} path has malformed $VAR environment prefix"));
+        }
+        let key = &rest[..key_len];
+        validate_path_env_key(key)?;
+        return Ok(Some((key, &rest[key_len..])));
+    }
+    Ok(None)
+}
+
+fn validate_path_env_key(key: &str) -> Result<(), String> {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return Err(format!("{OS_FILE_TOOL_NAME} path environment variable name is empty"));
+    };
+    if !(first.is_ascii_alphabetic() || first == '_')
+        || !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return Err(format!(
+            "{OS_FILE_TOOL_NAME} path environment variable name must use ASCII letters, digits, or underscores"
+        ));
+    }
+    Ok(())
+}
+
+fn append_env_path_suffix(mut base: PathBuf, suffix: &str) -> Result<PathBuf, String> {
+    let relative_suffix = suffix.trim_start_matches(|ch| ch == '/' || ch == '\\');
+    if relative_suffix.is_empty() {
+        return Ok(base);
+    }
+    for segment in relative_suffix.split(['/', '\\']) {
+        if segment.is_empty() {
+            continue;
+        }
+        if segment == "." || segment == ".." || segment.contains(':') {
+            return Err(format!(
+                "{OS_FILE_TOOL_NAME} environment path suffix must stay relative to the expanded root"
+            ));
+        }
+        if segment.chars().any(char::is_control) {
+            return Err(format!("{OS_FILE_TOOL_NAME} path contains unsupported characters"));
+        }
+        base.push(segment);
+    }
+    Ok(base)
 }
 
 fn nearest_existing_ancestor(path: &Path) -> Result<(PathBuf, PathBuf), String> {
@@ -1451,6 +1537,73 @@ mod tests {
         let relative = normalize_workspace_relative_target("/workspace/data/file.txt")
             .expect("workspace alias with relative suffix should be accepted");
         assert_eq!(relative, PathBuf::from("data").join("file.txt"));
+    }
+
+    #[test]
+    fn os_file_read_expands_leading_env_path_prefixes() {
+        let _guard =
+            OS_FILE_ENV_LOCK.get_or_init(|| Mutex::new(())).lock().expect("env lock poisoned");
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let os_root = tempdir.path().join("os-root");
+        let inbox = os_root.join("downloads").join("inbox");
+        fs::create_dir_all(inbox.as_path()).expect("inbox should exist");
+        let target = inbox.join("orders-valid.csv");
+        fs::write(target.as_path(), "id,name,total\n1,Ada,42\n").expect("fixture should exist");
+        let policy = OsFilePolicy {
+            workspace_roots: vec![fs::canonicalize(tempdir.path()).expect("workspace root")],
+            user_os_roots: vec![fs::canonicalize(os_root.as_path()).expect("os root")],
+        };
+        let _root = ScopedEnvVar::set("PALYRA_TEST_OS_ROOT", os_root.as_path());
+
+        for env_path in [
+            "%PALYRA_TEST_OS_ROOT%/downloads/inbox/orders-valid.csv",
+            "$PALYRA_TEST_OS_ROOT/downloads/inbox/orders-valid.csv",
+            "${PALYRA_TEST_OS_ROOT}/downloads/inbox/orders-valid.csv",
+        ] {
+            let read = execute_os_file_operation(
+                &policy,
+                &OsFileInput {
+                    operation: OsFileOperation::Read,
+                    path: env_path.to_owned(),
+                    target_path: None,
+                    content_text: None,
+                    bytes_base64: None,
+                    create_parent_dirs: None,
+                    overwrite: None,
+                    full_replace: None,
+                    dry_run: None,
+                    offset_bytes: None,
+                    max_bytes: None,
+                    query: None,
+                    case_sensitive: None,
+                    max_entries: None,
+                    max_matches: None,
+                },
+            )
+            .expect("leading environment path should expand before allowlist validation");
+            assert_eq!(read.get("text").and_then(Value::as_str), Some("id,name,total\n1,Ada,42\n"));
+            assert_eq!(
+                read.get("resolved_path").and_then(Value::as_str),
+                Some(
+                    display_path(
+                        fs::canonicalize(target.as_path()).expect("target canonical").as_path()
+                    )
+                    .as_str()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn os_file_env_path_suffix_must_stay_relative_to_expanded_root() {
+        let _guard =
+            OS_FILE_ENV_LOCK.get_or_init(|| Mutex::new(())).lock().expect("env lock poisoned");
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let _root = ScopedEnvVar::set("PALYRA_TEST_OS_ROOT", tempdir.path());
+
+        let error = parse_absolute_os_path("%PALYRA_TEST_OS_ROOT%/../escape.txt")
+            .expect_err("environment path suffix must not contain parent traversal");
+        assert!(error.contains("must stay relative to the expanded root"));
     }
 
     #[test]

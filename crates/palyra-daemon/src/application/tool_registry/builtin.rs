@@ -478,11 +478,11 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                     ),
                     (
                         "path",
-                        json!({"type":"string","description":"Absolute OS path to inspect or modify. Use this only for user-owned paths such as profile, temp, Downloads, or configured harness OS roots; protected system paths are denied."}),
+                        json!({"type":"string","description":"Absolute OS path to inspect or modify. A leading environment prefix such as $PALYRA_E2E_OS_ROOT, ${PALYRA_E2E_OS_ROOT}, or %PALYRA_E2E_OS_ROOT% is expanded before validation. Use this only for user-owned paths such as profile, temp, Downloads, or configured harness OS roots; protected system paths are denied."}),
                     ),
                     (
                         "target_path",
-                        json!({"type":"string","description":"Destination path for copy or move operations. Use an absolute OS path for OS-to-OS moves, or a workspace-relative path such as data/imported/file.csv or /workspace/data/imported/file.csv to import an allowed OS file into the active workspace without guessing the workspace's absolute root."}),
+                        json!({"type":"string","description":"Destination path for copy or move operations. Use an absolute OS path, optionally with a leading environment prefix such as %PALYRA_E2E_OS_ROOT%, for OS-to-OS moves. Use a workspace-relative path such as data/imported/file.csv or /workspace/data/imported/file.csv to import an allowed OS file into the active workspace without guessing the workspace's absolute root."}),
                     ),
                     (
                         "content_text",
@@ -1288,12 +1288,21 @@ mod tests {
         assert!(operation_values.iter().any(|value| value.as_str() == Some("list_dir")));
         assert!(operation_values.iter().any(|value| value.as_str() == Some("search")));
 
+        let path_description = entry
+            .input_schema
+            .pointer("/properties/path/description")
+            .and_then(serde_json::Value::as_str)
+            .expect("os_file path description should be visible to models");
+        assert!(path_description.contains("$PALYRA_E2E_OS_ROOT"));
+        assert!(path_description.contains("%PALYRA_E2E_OS_ROOT%"));
+
         let target_description = entry
             .input_schema
             .pointer("/properties/target_path/description")
             .and_then(serde_json::Value::as_str)
             .expect("os_file target_path description should be visible to models");
         assert!(target_description.contains("workspace-relative"));
+        assert!(target_description.contains("%PALYRA_E2E_OS_ROOT%"));
         assert!(target_description.contains("/workspace/data/imported/file.csv"));
 
         let query_description = entry
