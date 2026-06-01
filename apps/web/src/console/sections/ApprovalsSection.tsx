@@ -94,61 +94,12 @@ const APPROVAL_MESSAGES = {
 
 type ApprovalMessageKey = keyof typeof APPROVAL_MESSAGES;
 
-const APPROVAL_MESSAGES_CS: Readonly<Record<ApprovalMessageKey, string>> = {
-  "header.title": "Schválení",
-  "header.description":
-    "Centrum vysvětlitelných oprávnění pro posture jednotlivých nástrojů, tření, presety a approval inbox.",
-  "header.locked": "uzamčeno",
-  "header.pending": "čekajících schválení",
-  "header.refresh": "Obnovit",
-  "header.refreshing": "Obnovuji...",
-  "metric.toolsInScope": "Nástroje v rozsahu",
-  "metric.loadingScope": "Načítám scope",
-  "metric.requests14d": "Požadavky na schválení (14 d)",
-  "metric.requests14dDetail": "Nedávný friction signál používaný pro doporučení.",
-  "metric.highFriction": "Nástroje s vysokým třením",
-  "metric.highFrictionDetail": "Nástroje s opakovanými schváleními nebo čekajícím backlogem.",
-  "queue.title": "Fronta schválení",
-  "queue.description":
-    "Čekající práce zůstává snadno čitelná a vyřešené položky jsou stále dostupné pro navazující kontext.",
-  "queue.empty": "Nejsou načtené žádné záznamy schválení.",
-  "queue.unknownSubject": "neznámý subjekt",
-  "queue.pending": "čeká",
-  "detail.title": "Detail schválení",
-  "detail.description":
-    "Drž vybraný požadavek, kontext, vysvětlení a ovládání rozhodnutí na jedné ploše.",
-  "detail.empty": "Vyber schválení a zkontroluj kontext požadavku i rozhodnutí.",
-  "detail.selected": "Vybrané schválení",
-  "detail.noSummary": "Nebyl publikovaný žádný souhrn.",
-  "detail.subjectType": "Typ subjektu",
-  "detail.subjectId": "ID subjektu",
-  "detail.principal": "Principál",
-  "detail.requested": "Vyžádáno",
-  "detail.session": "Relace",
-  "detail.run": "Běh",
-  "detail.notAvailable": "n/a",
-  "detail.why": "Proč se toto schválení objevilo",
-  "detail.whyDescription":
-    "Inline explainability pro aktuální posture nástroje a další bezpečnou akci.",
-  "detail.openTool": "Otevřít detail nástroje",
-  "detail.tool": "Nástroj schválení",
-  "detail.approvalId": "ID schválení",
-  "detail.reason": "Důvod",
-  "detail.reasonPlaceholder": "Volitelná poznámka operátora",
-  "detail.scope": "Scope rozhodnutí",
-  "detail.approve": "Schválit",
-  "detail.deny": "Zamítnout",
-  "detail.previewPayload": "Preview payload schválení",
-  "detail.previewPayloadDescription":
-    "Strukturovaný preview kontext zůstává viditelný, aby operátoři odlišili preview-only akce od aplikovaných.",
-};
-
 function translateApproval(
   locale: ConsoleAppState["locale"],
   key: ApprovalMessageKey,
   variables?: Record<string, string | number>,
 ): string {
-  const template = (locale === "cs" ? APPROVAL_MESSAGES_CS : APPROVAL_MESSAGES)[key];
+  const template = APPROVAL_MESSAGES[key];
   const resolved =
     variables === undefined
       ? template

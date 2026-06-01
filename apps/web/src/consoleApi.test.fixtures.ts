@@ -45,6 +45,6 @@ export const MOBILE_BOOTSTRAP_RESPONSE: MobileBootstrapEnvelope = {
     safe_url_open_enabled: true,
     voice_notes_enabled: true,
   },
-  locales: ["en", "cs"],
+  locales: ["en", "qps-ploc"],
   default_locale: "en",
 };

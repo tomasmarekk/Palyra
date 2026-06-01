@@ -5,7 +5,7 @@ import type { JsonValue } from "../consoleApi";
 export * from "./runtimeContracts";
 
 export type ConsoleUiMode = "basic" | "advanced";
-export type ConsoleLocale = "en" | "cs" | "qps-ploc";
+export type ConsoleLocale = "en" | "qps-ploc";
 export type TelemetrySurface = "web" | "desktop" | "tui" | "mobile";
 
 export type HandoffIntent =

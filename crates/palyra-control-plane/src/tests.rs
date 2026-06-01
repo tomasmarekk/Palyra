@@ -139,7 +139,7 @@ fn mobile_bootstrap_envelope_round_trips() {
             safe_url_open_enabled: true,
             voice_notes_enabled: true,
         },
-        locales: vec!["en".to_owned(), "cs".to_owned()],
+        locales: vec!["en".to_owned(), "qps-ploc".to_owned()],
         default_locale: "en".to_owned(),
     };
 

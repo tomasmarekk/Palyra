@@ -16572,13 +16572,10 @@ fn session_search_term_matches_text(normalized_text: &str, term: &str) -> bool {
 
 fn session_search_term_aliases(term: &str) -> &'static [&'static str] {
     match term {
-        "temporary" | "temp" => &["dočas", "docas"],
-        "name" | "named" => &["jmenuje", "název", "nazev"],
-        "název" | "nazev" => &["name", "named"],
-        value if value.starts_with("dočas") || value.starts_with("docas") => {
-            &["temporary", "temp"]
-        }
-        value if value.starts_with("jmen") => &["name", "named"],
+        "temporary" => &["temp"],
+        "temp" => &["temporary"],
+        "name" => &["named"],
+        "named" => &["name"],
         _ => &[],
     }
 }
@@ -22230,7 +22227,7 @@ mod tests {
                 run_id: "01ARZ3NDEKTSV4RRFFQ69G5RE1".to_owned(),
                 seq: 0,
                 event_type: "message.received".to_owned(),
-                payload_json: r#"{"text":"Poznámka z předchozí session. Dočasný feature flag se jmenuje PALYRA_TRANSIENT_BETA. Neukládej to do trvalé memory."}"#.to_owned(),
+                payload_json: r#"{"text":"Note from the previous session. The temporary feature flag is named PALYRA_TRANSIENT_BETA. Do not store it in durable memory."}"#.to_owned(),
             })
             .expect("tape event should persist");
         upsert_orchestrator_session(&store, "01ARZ3NDEKTSV4RRFFQ69G5SE2");
@@ -22240,11 +22237,11 @@ mod tests {
                 run_id: "01ARZ3NDEKTSV4RRFFQ69G5RE2".to_owned(),
                 seq: 0,
                 event_type: "message.received".to_owned(),
-                payload_json: r#"{"text":"V aktuální session se ptám na název dočasného feature flagu, ale hodnota tu není."}"#.to_owned(),
+                payload_json: r#"{"text":"In the current session I am asking for the temporary feature flag name, but the value is absent."}"#.to_owned(),
             })
             .expect("current-session tape event should persist");
 
-        for query in ["název dočasného feature flagu", "feature flag temporary name dočasný"] {
+        for query in ["temporary feature flag name", "feature flag temporary name"] {
             let outcome = store
                 .search_orchestrator_session_windows(&SessionSearchRequest {
                     principal: "user:ops".to_owned(),
@@ -23747,7 +23744,7 @@ mod tests {
                 None,
                 None,
                 MemorySource::Manual,
-                "E2E durable preference: use TypeScript Vitest Czech reports.",
+                "E2E durable preference: use TypeScript Vitest reports.",
             ))
             .expect("principal memory item should be created");
         store
@@ -23776,7 +23773,7 @@ mod tests {
                 principal: "user:ops".to_owned(),
                 channel: Some("cli".to_owned()),
                 session_id: Some(session_id.to_owned()),
-                query: "TypeScript Vitest Czech reports".to_owned(),
+                query: "TypeScript Vitest reports".to_owned(),
                 top_k: 5,
                 min_score: 0.0,
                 tags: Vec::new(),

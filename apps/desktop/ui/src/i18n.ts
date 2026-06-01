@@ -19,7 +19,6 @@ const DESKTOP_MESSAGES = {
   "desktop.header.openDashboard": "Open dashboard",
   "desktop.header.locale.label": "Language: {locale}",
   "desktop.common.english": "English",
-  "desktop.common.czech": "Czech",
   "desktop.common.pseudo": "Pseudo",
   "desktop.notice.preview.title": "Preview data active",
   "desktop.notice.preview.body":
@@ -55,67 +54,14 @@ const DESKTOP_MESSAGES = {
 
 export type DesktopMessageKey = keyof typeof DESKTOP_MESSAGES;
 
-const DESKTOP_MESSAGES_CS: Readonly<Record<DesktopMessageKey, string>> = {
-  "desktop.header.eyebrow": "Desktop Companion",
-  "desktop.header.title": "Companion shell Palyry",
-  "desktop.header.description":
-    "Jedna desktopová plocha pro řízení runtime, aktivní relace, schválení, trust review a drafty odolné proti reconnectu.",
-  "desktop.controlCenter.eyebrow": "Desktop Control Center",
-  "desktop.controlCenter.title": "Spusť runtime, ověř postoj a pak otevři dashboard.",
-  "desktop.controlCenter.description":
-    "Desktop zůstává záměrně stručný: lifecycle ovládání, health runtime a nejrychlejší handoff do plné operátorské konzole.",
-  "desktop.controlCenter.snapshotRefreshing": "Obnovuji snapshot",
-  "desktop.controlCenter.snapshotReady": "Snapshot připraven",
-  "desktop.controlCenter.overallState": "Celkový stav",
-  "desktop.controlCenter.dashboardMode": "Režim dashboardu",
-  "desktop.controlCenter.lastSnapshot": "Poslední snapshot",
-  "desktop.header.refresh": "Obnovit",
-  "desktop.header.refreshing": "Obnovuji...",
-  "desktop.header.openDashboard": "Otevřít dashboard",
-  "desktop.header.locale.label": "Jazyk: {locale}",
-  "desktop.common.english": "Angličtina",
-  "desktop.common.czech": "Čeština",
-  "desktop.common.pseudo": "Pseudo",
-  "desktop.notice.preview.title": "Aktivní preview data",
-  "desktop.notice.preview.body":
-    "Bridge Tauri nebo lokální runtime data nejsou dostupná, takže companion shell vykresluje preview data.",
-  "desktop.notice.result.title": "Výsledek desktopové akce",
-  "desktop.notice.refreshFailed.title": "Obnovení companionu selhalo",
-  "desktop.notice.warnings.title": "Varování companionu",
-  "desktop.notice.profile.title": "Aktivní profil: {label}",
-  "desktop.notice.profile.body": "Prostředí {environment}, riziko {riskLevel}, režim {mode}.",
-  "desktop.common.never": "Nikdy",
-  "desktop.section.home": "Domů",
-  "desktop.section.chat": "Chat",
-  "desktop.section.approvals": "Schválení",
-  "desktop.section.access": "Přístup",
-  "desktop.section.onboarding": "Onboarding",
-  "desktop.onboarding.title": "Onboarding a rollout",
-  "desktop.onboarding.description":
-    "Desktop drží na jednom místě viditelný aktuální onboarding progress, auth připravenost a stav release rolloutu.",
-  "desktop.onboarding.browserHandoff": "Předání do prohlížeče",
-  "desktop.onboarding.toggleShell": "Přepnout shell",
-  "desktop.onboarding.recoveryHint": "Recovery hint",
-  "desktop.onboarding.readiness.title": "Připravenost",
-  "desktop.onboarding.readiness.description":
-    "Kritéria dokončení pro release cestu desktop companionu a handoff operátorského onboardingu.",
-  "desktop.onboarding.progress.label": "Průběh onboardingu",
-  "desktop.onboarding.auth.label": "OpenAI auth",
-  "desktop.onboarding.auth.ready": "Připraveno",
-  "desktop.onboarding.auth.attention": "Pozornost",
-  "desktop.onboarding.auth.emptyNote": "Není publikovaná žádná auth poznámka.",
-  "desktop.onboarding.completion.label": "Poslední dokončení",
-  "desktop.onboarding.completion.detail": "Uloženo lokálně, aby desktop mohl po restartu navázat.",
-};
-
-export const DESKTOP_LOCALES: readonly DesktopLocale[] = ["en", "cs", "qps-ploc"] as const;
+export const DESKTOP_LOCALES: readonly DesktopLocale[] = ["en", "qps-ploc"] as const;
 
 export function translateDesktopMessage(
   locale: DesktopLocale,
   key: DesktopMessageKey,
   variables?: Record<string, string | number>,
 ): string {
-  const template = (locale === "cs" ? DESKTOP_MESSAGES_CS : DESKTOP_MESSAGES)[key];
+  const template = DESKTOP_MESSAGES[key];
   const formatted = template.replaceAll(/\{(\w+)\}/g, (_, name: string) => {
     const value = variables?.[name];
     return value === undefined ? "" : String(value);
@@ -140,8 +86,6 @@ export function nextDesktopLocale(current: DesktopLocale): DesktopLocale {
 
 export function describeDesktopLocale(locale: DesktopLocale): string {
   switch (locale) {
-    case "cs":
-      return translateDesktopMessage(locale, "desktop.common.czech");
     case "qps-ploc":
       return translateDesktopMessage(locale, "desktop.common.pseudo");
     default:

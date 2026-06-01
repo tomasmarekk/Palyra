@@ -71,7 +71,7 @@ test("validateOpenTabUrl keeps scheme-only allowlist behavior", () => {
 });
 
 test("clampUtf8Bytes truncates without splitting UTF-8 scalars", () => {
-  const input = "alpha-žluťoučký-kůň";
+  const input = `alpha-${"\u{1F642}".repeat(4)}-omega`;
   const result = clampUtf8Bytes(input, 10);
   assert.equal(result.truncated, true);
   assert.ok(Buffer.byteLength(result.value, "utf8") <= 10);

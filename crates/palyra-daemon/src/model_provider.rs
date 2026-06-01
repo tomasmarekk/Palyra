@@ -6738,7 +6738,7 @@ Then I will continue."#;
 
     #[test]
     fn sanitize_remote_error_truncates_multibyte_text_without_panicking() {
-        let input = "é".repeat(300);
+        let input = "\u{1F642}".repeat(300);
         let sanitized = sanitize_remote_error(input.as_str());
         assert!(
             sanitized.ends_with('…'),

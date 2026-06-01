@@ -124,7 +124,7 @@ mod tests {
         let value = json!({
             "outer": {
                 "items": [
-                    {"name": "alpha", "body": "é".repeat(20)},
+                    {"name": "alpha", "body": "\u{1F642}".repeat(20)},
                     {"name": "beta", "body": "b".repeat(20)},
                     {"name": "gamma", "body": "c".repeat(20)}
                 ]
@@ -146,7 +146,7 @@ mod tests {
         serde_json::from_str::<serde_json::Value>(serialized.as_str())
             .expect("shrunk JSON must remain parseable");
         assert!(
-            serialized.contains("éééééééé..."),
+            serialized.contains(format!("{}...", "\u{1F642}".repeat(8)).as_str()),
             "Unicode strings should be shortened by char boundary"
         );
         assert!(serialized.contains("_palyra_truncated"));

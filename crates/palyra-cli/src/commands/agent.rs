@@ -918,7 +918,7 @@ mod tests {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let project = tempdir.path().join("todo-app");
         fs::create_dir_all(project.as_path()).expect("project directory should exist");
-        let prompt = format!("V projektu `{}` vytvoř Todo app.", project.display());
+        let prompt = format!("In project `{}` create a Todo app.", project.display());
         let parameter_delta =
             cli_launch_parameter_delta_json_for_cwd(tempdir.path(), prompt.as_str())
                 .expect("launch context should serialize")
@@ -949,7 +949,7 @@ mod tests {
         let nested = project.join("src");
         fs::create_dir_all(nested.as_path()).expect("nested directory should exist");
         let prompt = format!(
-            "Použij `{}` a pak znovu {}.",
+            "Use `{}` and then {} again.",
             project.display(),
             nested.join("missing.js").display()
         );

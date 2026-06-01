@@ -40,7 +40,7 @@ struct MobileApprovalSummary: Codable, Equatable {
 }
 
 struct MobileBootstrapContract: Codable, Equatable {
-    var localeOptions: [String] = ["en", "cs"]
+    var localeOptions: [String] = ["en", "qps-ploc"]
     var defaultLocale: String = "en"
     var releaseScope: Set<MobileReleaseCapability> = [
         .approvalsInbox,

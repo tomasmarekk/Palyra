@@ -1158,7 +1158,7 @@ async fn grpc_route_message_splits_reply_into_multiple_outputs_when_payload_limi
 
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_route_message_splits_multibyte_reply_by_utf8_bytes() -> Result<()> {
-    let long_reply = "žluťoučký kůň 😀 こんにちは世界 přináší zprávu o stavu";
+    let long_reply = format!("status update {} {}", "\u{1F642}".repeat(16), "done".repeat(64));
     let scripted_reply = serde_json::json!({
         "choices": [{
             "message": {
@@ -1235,7 +1235,7 @@ async fn grpc_route_message_splits_multibyte_reply_by_utf8_bytes() -> Result<()>
         "merged multibyte output chunks should preserve route response prefix"
     );
     assert!(
-        merged.contains(long_reply),
+        merged.contains(&long_reply),
         "merged multibyte output chunks should preserve the provider reply body"
     );
     assert_eq!(

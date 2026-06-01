@@ -4543,11 +4543,11 @@ mod prompt_stdin_decode_tests {
     use super::{decode_prompt_stdin_bytes, normalize_prompt_arg, normalize_prompt_stdin_bytes};
 
     #[test]
-    fn prompt_stdin_decode_accepts_utf8_czech_text() {
-        let decoded = decode_prompt_stdin_bytes("Nastav proveď\n".as_bytes())
+    fn prompt_stdin_decode_accepts_utf8_unicode_text() {
+        let decoded = decode_prompt_stdin_bytes("Set done \u{1F642}\n".as_bytes())
             .expect("UTF-8 prompt should decode");
 
-        assert_eq!(decoded, "Nastav proveď\n");
+        assert_eq!(decoded, "Set done \u{1F642}\n");
     }
 
     #[test]
@@ -4594,11 +4594,11 @@ mod prompt_stdin_decode_tests {
 
     #[cfg(windows)]
     #[test]
-    fn prompt_stdin_decode_accepts_windows_cmd_oem_czech_text() {
-        let decoded = super::decode_windows_code_page(852, b"Nastav prove\xD4\n")
+    fn prompt_stdin_decode_accepts_windows_cmd_oem_text() {
+        let decoded = super::decode_windows_code_page(852, b"Prompt \xD4\n")
             .expect("CP852 prompt should decode on Windows");
 
-        assert_eq!(decoded, "Nastav proveď\n");
+        assert_eq!(decoded, "Prompt \u{010F}\n");
     }
 }
 

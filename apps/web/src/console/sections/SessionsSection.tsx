@@ -201,172 +201,12 @@ const SESSION_MESSAGES = {
 
 type SessionMessageKey = keyof typeof SESSION_MESSAGES;
 
-const SESSION_MESSAGES_CS: Readonly<Record<SessionMessageKey, string>> = {
-  "header.title": "Relace",
-  "header.description":
-    "Procházej historii relací, kontroluj poslední stav běhu a spouštěj lifecycle akce bez opuštění operátorské konzole.",
-  "status.refreshing": "Obnovuji",
-  "status.catalogReady": "Katalog připraven",
-  "status.pendingApprovals": "čekajících schválení",
-  "status.noRunSelected": "Není vybraný běh",
-  "action.refresh": "Obnovit relace",
-  "action.refreshing": "Obnovuji...",
-  "action.rename": "Přejmenovat",
-  "action.reset": "Resetovat",
-  "action.archive": "Archivovat",
-  "action.abortRun": "Přerušit běh",
-  "action.createCheckpoint": "Vytvořit checkpoint",
-  "action.checkpointing": "Vytvářím checkpoint...",
-  "action.previewCompaction": "Preview kompakce",
-  "action.previewing": "Připravuji preview...",
-  "action.applyCompaction": "Aplikovat kompakci",
-  "action.applying": "Aplikuji...",
-  "action.openChat": "Otevřít v chatu",
-  "action.openObjective": "Otevřít objective",
-  "action.openInventory": "Otevřít inventář",
-  "metric.activeSessions": "Aktivní relace",
-  "metric.activeSessionsDetail": "Viditelné nearhivované relace v aktuálním scoped katalogu.",
-  "metric.archivedSessions": "Archivované relace",
-  "metric.archivedSessionsDetail":
-    "Archivované záznamy zůstávají dotazovatelné bez znovuotevření chat railu.",
-  "metric.pendingApprovals": "Čekající schválení",
-  "metric.pendingApprovalsDetail": "Relace, které právě čekají na rozhodnutí o citlivé akci.",
-  "metric.activeRuns": "Aktivní běhy",
-  "metric.activeRunsDetail": "Poslední známý běh je stále přijatý nebo probíhá.",
-  "metric.contextFiles": "Kontextové soubory",
-  "metric.contextFilesDetail":
-    "Relace nesoucí aktivní kontextové soubory nebo odkazy na workspace.",
-  "filters.title": "Filtry",
-  "filters.description":
-    "Filtry katalogu zůstávají server-backed, takže chat, web a budoucí operátorské surface nevymýšlejí oddělenou logiku relací.",
-  "filters.search": "Hledat",
-  "filters.searchPlaceholder": "název, rodina, agent, model, soubor nebo recap",
-  "filters.sort": "Řazení",
-  "filters.sort.updatedDesc": "Aktualizováno (nejnovější)",
-  "filters.sort.updatedAsc": "Aktualizováno (nejstarší)",
-  "filters.sort.createdDesc": "Vytvořeno (nejnovější)",
-  "filters.sort.createdAsc": "Vytvořeno (nejstarší)",
-  "filters.sort.titleAsc": "Název (A-Z)",
-  "filters.titleMode": "Režim názvu",
-  "filters.titleMode.all": "Libovolný režim názvu",
-  "filters.titleMode.ready": "Auto název připraven",
-  "filters.titleMode.pending": "Auto název čeká",
-  "filters.titleMode.failed": "Auto název selhal",
-  "filters.titleMode.idle": "Auto název nečinný",
-  "filters.titleSource": "Zdroj názvu",
-  "filters.titleSource.all": "Libovolný zdroj názvu",
-  "filters.titleSource.label": "Ruční štítek",
-  "filters.titleSource.semantic": "Sémantický název",
-  "filters.titleSource.auto": "Automatický název",
-  "filters.titleSource.sessionKey": "Fallback session key",
-  "filters.branchState": "Stav větve",
-  "filters.branchState.all": "Libovolná lineage",
-  "filters.branchState.root": "Kořenová relace",
-  "filters.branchState.active": "Aktivní větev",
-  "filters.branchState.source": "Zdroj větve",
-  "filters.pendingApprovals": "Čekající schválení",
-  "filters.pendingApprovals.all": "Libovolný stav schválení",
-  "filters.pendingApprovals.yes": "S čekajícími schváleními",
-  "filters.pendingApprovals.no": "Bez čekajících schválení",
-  "filters.contextFiles": "Kontextové soubory",
-  "filters.contextFiles.all": "Libovolná kontextová postura",
-  "filters.contextFiles.yes": "S kontextovými soubory",
-  "filters.contextFiles.no": "Bez kontextových souborů",
-  "filters.agent": "Agent",
-  "filters.agentPlaceholder": "id agenta",
-  "filters.modelProfile": "Profil modelu",
-  "filters.modelProfilePlaceholder": "profil modelu",
-  "filters.showArchived": "Zobrazit archivované",
-  "filters.showArchivedDescription": "Zahrnout archivované záznamy do aktuálního seznamu.",
-  "catalog.title": "Katalog",
-  "catalog.description":
-    "Vyber relaci a zkontroluj její poslední aktivitu, preview a lifecycle stav.",
-  "catalog.emptyTitle": "Aktuálnímu dotazu neodpovídají žádné relace",
-  "catalog.emptyDescription":
-    "Uprav filtry nebo vytvoř aktivitu v chatu, aby se katalog relací naplnil.",
-  "catalog.columns.title": "Název",
-  "catalog.columns.family": "Rodina",
-  "catalog.columns.updated": "Aktualizováno",
-  "catalog.columns.controls": "Ovládání",
-  "catalog.columns.recap": "Recap",
-  "catalog.archived": "archivováno",
-  "catalog.noRecap": "Žádný recap",
-  "detail.title": "Detail",
-  "detail.description":
-    "Lifecycle akce tady znovu používají stejné backendové mutace jako chat místo vymýšlení separátní control path.",
-  "detail.emptyTitle": "Není vybraná žádná relace",
-  "detail.emptyDescription": "Vyber řádek z katalogu relací a zkontroluj detaily i akce.",
-  "detail.selectedSession": "Vybraná relace",
-  "detail.noPreview": "Ze stávající historie běhů nešlo odvodit žádné preview.",
-  "detail.family": "Rodina {index}/{count}",
-  "detail.sessionLabel": "Štítek relace",
-  "detail.sessionLabelDescription":
-    "Ponech prázdné, pokud chceš relaci vrátit do automatického režimu názvu.",
-  "detail.sessionKey": "Session key",
-  "detail.titleSource": "Zdroj názvu",
-  "detail.familyRoot": "Kořen rodiny",
-  "detail.created": "Vytvořeno",
-  "detail.updated": "Aktualizováno",
-  "detail.runState": "Stav běhu",
-  "detail.lineage": "Lineage",
-  "detail.totalTokens": "Celkem tokenů",
-  "detail.contextFiles": "Kontextové soubory",
-  "detail.active": "{count} aktivních",
-  "detail.none": "žádné",
-  "detail.latestActivity": "Poslední aktivita",
-  "detail.lastIntent": "Poslední intent:",
-  "detail.lastSummary": "Poslední souhrn:",
-  "detail.missing": "Chybí",
-  "detail.resumeRecap": "Resume recap",
-  "detail.touchedFiles": "Dotčené soubory:",
-  "detail.activeContext": "Aktivní kontext:",
-  "detail.recentArtifacts": "Nedávné artefakty:",
-  "detail.objectiveLinkage": "Vazba na objective",
-  "detail.linkedObjective": "Navázaný objective",
-  "detail.loadingObjectiveLinkage": "Načítám vazbu objective pro vybranou relaci.",
-  "detail.noObjective": "Na tuto relaci momentálně neukazuje žádný objective.",
-  "detail.unnamedObjective": "Objective bez názvu",
-  "detail.currentFocus": "Aktuální fokus:",
-  "detail.noCurrentFocus": "Není zaznamenaný žádný aktuální fokus.",
-  "detail.nextAction": "Další akce:",
-  "detail.noNextAction": "Není zaznamenaná žádná další akce.",
-  "continuity.preview": "Preview kompakce",
-  "continuity.blocked": "Kompakce zablokována",
-  "continuity.summary": "Souhrn:",
-  "continuity.tokenDelta": "Rozdíl tokenů:",
-  "continuity.plannedWrites": "Plánované zápisy:",
-  "continuity.reviewCandidates": "Kandidáti k review:",
-  "continuity.reviewHelp":
-    "Použij compaction flow v chatu a kandidáty vyžadující review explicitně přijmi nebo zamítni.",
-  "continuity.loading": "Načítám kontinuitu",
-  "continuity.compactions": "{count} kompakcí",
-  "continuity.checkpoints": "{count} checkpointů",
-  "continuity.pendingReview": "{count} čeká na review",
-  "continuity.artifacts": "Artefakty kontinuity",
-  "continuity.recentCompactions": "Nedávné kompakce",
-  "continuity.recentCompactionsDescription":
-    "Zkontroluj poslední uložené kompakce a skoč rovnou do chat detail sidebaru pro raw diff a auditní kontext.",
-  "continuity.emptyCompactionsTitle": "Zatím žádné kompakce",
-  "continuity.emptyCompactionsDescription":
-    "Pro tuto relaci zatím nejsou uložené žádné artefakty kompakce.",
-  "continuity.review": "review",
-  "continuity.recoveryPoints": "Body obnovy",
-  "continuity.recentCheckpoints": "Nedávné checkpointy",
-  "continuity.recentCheckpointsDescription":
-    "Checkpointy zůstávají spárované s historií kompakce, takže rollback je viditelný i bez otevření raw journalu.",
-  "continuity.emptyCheckpointsTitle": "Zatím žádné checkpointy",
-  "continuity.emptyCheckpointsDescription":
-    "Vytvoř checkpoint nebo aplikuj kompakci a tím založ rollback historii.",
-  "continuity.restores": "obnovení",
-  "continuity.noCheckpointNote": "Pro tento checkpoint není zaznamenaná žádná poznámka.",
-};
-
 function translateSession(
   locale: ConsoleAppState["locale"],
   key: SessionMessageKey,
   variables?: Record<string, string | number>,
 ): string {
-  const template = (locale === "cs" ? SESSION_MESSAGES_CS : SESSION_MESSAGES)[key];
+  const template = SESSION_MESSAGES[key];
   const resolved =
     variables === undefined
       ? template
@@ -379,9 +219,6 @@ export function SessionsSection({ app }: SessionsSectionProps) {
     translateSession(app.locale, key, variables);
   const continuityCountLabel = (kind: "write", count: number): string => {
     if (kind === "write") {
-      if (app.locale === "cs") {
-        return `${count} zápis${count === 1 ? "" : count >= 2 && count <= 4 ? "y" : "ů"}`;
-      }
       return `${count} write${count === 1 ? "" : "s"}`;
     }
     return String(count);

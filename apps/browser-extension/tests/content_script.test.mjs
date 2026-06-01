@@ -138,7 +138,7 @@ test("content script captures capped snapshots without touching outerHTML or inn
         children: [
           createTextNode("alpha ".repeat(12)),
           createElement("section", {
-            children: [createTextNode("žluťoučký ".repeat(12))],
+            children: [createTextNode(`${"\u{1F642} ".repeat(12)}`)],
           }),
           createTextNode("omega ".repeat(12)),
         ],
@@ -186,8 +186,8 @@ test("content script preserves full snapshots when the page fits inside the budg
   const body = createElement("body", {
     children: [
       createElement("article", {
-        attributes: [createAttribute("lang", "cs")],
-        children: [createTextNode("Ahoj světe")],
+        attributes: [createAttribute("lang", "en")],
+        children: [createTextNode("Hello world")],
       }),
     ],
   });
@@ -204,7 +204,7 @@ test("content script preserves full snapshots when the page fits inside the budg
   assert.equal(response.ok, true);
   assert.equal(response.dom_truncated, false);
   assert.equal(response.visible_text_truncated, false);
-  assert.match(response.dom_snapshot, /<article lang="cs">Ahoj světe<\/article>/);
-  assert.equal(response.visible_text, "Ahoj světe");
+  assert.match(response.dom_snapshot, /<article lang="en">Hello world<\/article>/);
+  assert.equal(response.visible_text, "Hello world");
   assert.equal(response.title, "Full Snapshot");
 });

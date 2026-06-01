@@ -166,70 +166,12 @@ const OVERVIEW_MESSAGES = {
 
 type OverviewMessageKey = keyof typeof OVERVIEW_MESSAGES;
 
-const OVERVIEW_MESSAGES_CS: Readonly<Record<OverviewMessageKey, string>> = {
-  "header.title": "Přehled",
-  "header.description":
-    "Soustřeď se na produktovou posturu, operátorské blokery a dlouhodobé objective, které pohánějí automatizovanou práci. Hluboká diagnostika teď žije v Nastavení / Diagnostika.",
-  "status.attentionItems": "{count} položek vyžaduje pozornost",
-  "status.ready": "Připraveno",
-  "status.activeObjectives": "{count} aktivních objectives",
-  "status.deploymentWarnings": "{count} varování nasazení",
-  "action.refreshing": "Obnovuji...",
-  "action.refreshOverview": "Obnovit přehled",
-  "guidance.show": "Zobrazit guidance",
-  "guidance.hidden.title": "Guidance skryta",
-  "guidance.hidden.description":
-    "Starter prompty, onboarding karty a hinty pro opravu runtime jsou momentálně skryté.",
-  "guidance.hidden.body":
-    "Kdykoli chceš doporučený další krok, opravu blockerů nebo prompty pro první úspěch, znovu otevři guidance surface.",
-  "guidance.currentTrack": "Aktuální track",
-  "onboarding.nextStep": "Další onboarding krok",
-  "onboarding.noRecommendation": "Control plane zatím nepublikovala doporučený onboarding krok.",
-  "onboarding.flow": "Flow: {flow}. Stav: {status}.",
-  "onboarding.trackSummary": "{track} Povinné: {required}. Volitelné: {optional}.",
-  "onboarding.quickStart": "Quick Start",
-  "onboarding.advancedSetup": "Pokročilé nastavení",
-  "onboarding.hideGuidance": "Skrýt guidance",
-  "onboarding.checklist": "Onboarding checklist",
-  "troubleshooting.title": "Řešení problémů",
-  "scenario.firstSuccess": "První úspěch",
-  "scenario.openChat": "Otevřít chat",
-  "scenario.reviewNextStep": "Zkontrolovat další krok",
-  "scenario.readyDescription": "Otevři chat a ověř první end-to-end operátorský úkol.",
-  "scenario.finishSteps": "Dokonči zbývající guided kroky a potom starter promptem ověř workspace.",
-  "scenario.reviewApprovals": "Zkontrolovat schválení",
-  "scenario.inspectDiagnostics": "Zkontrolovat diagnostiku",
-  "scenario.openSessions": "Otevřít relace",
-  "scenario.toolRecommendation": "Doporučení pro posture nástroje",
-  "scenario.openToolPermissions": "Otevřít oprávnění nástrojů",
-  "scenario.completed": "Dokončeno",
-  "scenario.remaining": "Zbývá",
-  "scenario.telemetryFriction": "Tření v telemetrii",
-  "scenario.openDiagnostics": "Otevřít diagnostiku",
-  "scenario.switchAdvanced": "Přepnout na pokročilé",
-  "scenario.refreshBaseline": "Obnovit baseline",
-  "scenario.refreshingBaseline": "Obnovuji baseline...",
-  "metric.runtimePosture": "Postura runtime",
-  "metric.noImmediateBlockers": "Nejsou publikované žádné okamžité operátorské blokery.",
-  "metric.attentionRequired": "Vyžaduje pozornost",
-  "metric.accessPosture": "Postura přístupu",
-  "metric.remoteStable": "Postura vzdáleného přístupu vypadá stabilně.",
-  "metric.objectiveLayer": "Vrstva objectives",
-  "metric.noObjectives": "Zatím nejsou načtené žádné aktivní objective produkty.",
-  "metric.objectiveHealth": "Zdraví objectives",
-  "metric.objectiveHealthNeedsFollowUp":
-    "Zdraví heartbeat nebo objective vyžaduje navazující kontrolu.",
-  "metric.objectiveHealthClear": "Nejsou načtené žádné odchylky ve zdraví objectives.",
-  "metric.attention": "Pozornost",
-  "metric.healthy": "Zdravé",
-};
-
 function translateOverview(
   locale: ConsoleAppState["locale"],
   key: OverviewMessageKey,
   variables?: Record<string, string | number>,
 ): string {
-  const template = (locale === "cs" ? OVERVIEW_MESSAGES_CS : OVERVIEW_MESSAGES)[key];
+  const template = OVERVIEW_MESSAGES[key];
   const resolved =
     variables === undefined
       ? template

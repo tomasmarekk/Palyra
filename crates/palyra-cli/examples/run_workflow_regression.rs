@@ -443,12 +443,12 @@ mod tests {
 
     #[test]
     fn output_excerpt_truncates_multibyte_output_on_char_boundary() {
-        let stdout = "é".repeat(2500);
+        let stdout = "\u{1F642}".repeat(2500);
 
         let excerpt = build_output_excerpt(stdout.as_str(), "");
 
         assert!(excerpt.len() <= OUTPUT_EXCERPT_MAX_BYTES);
-        assert!(excerpt.starts_with('é'));
+        assert!(excerpt.starts_with('\u{1F642}'));
         assert!(excerpt.is_char_boundary(0));
     }
 }

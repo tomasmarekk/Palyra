@@ -8,18 +8,17 @@ import {
 } from "./i18n";
 
 describe("desktop i18n", () => {
-  it("cycles locales through english, czech, and pseudo-localization", () => {
-    expect(nextDesktopLocale("en")).toBe("cs");
-    expect(nextDesktopLocale("cs")).toBe("qps-ploc");
+  it("cycles locales through english and pseudo-localization", () => {
+    expect(nextDesktopLocale("en")).toBe("qps-ploc");
     expect(nextDesktopLocale("qps-ploc")).toBe("en");
   });
 
-  it("returns Czech translations for desktop shell labels", () => {
-    expect(translateDesktopMessage("cs", "desktop.header.refresh")).toBe("Obnovit");
-    expect(describeDesktopLocale("cs")).toBe("Čeština");
+  it("keeps english as the primary desktop locale", () => {
+    expect(translateDesktopMessage("en", "desktop.header.refresh")).toBe("Refresh");
+    expect(describeDesktopLocale("en")).toBe("English");
   });
 
   it("formats dates with the selected locale instead of forcing english", () => {
-    expect(formatDesktopDateTime("cs", 1_710_000_000_000)).toMatch(/\d/);
+    expect(formatDesktopDateTime("en", 1_710_000_000_000)).toMatch(/\d/);
   });
 });

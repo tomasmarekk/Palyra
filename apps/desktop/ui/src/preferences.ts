@@ -1,4 +1,4 @@
-export type DesktopLocale = "en" | "cs" | "qps-ploc";
+export type DesktopLocale = "en" | "qps-ploc";
 
 export const DESKTOP_LOCALE_STORAGE_KEY = "palyra.desktop.locale";
 
@@ -11,9 +11,6 @@ export function readStoredDesktopLocale(): DesktopLocale {
     stored = window.localStorage.getItem(DESKTOP_LOCALE_STORAGE_KEY);
   } catch {
     return "en";
-  }
-  if (stored === "cs") {
-    return "cs";
   }
   return stored === "qps-ploc" ? "qps-ploc" : "en";
 }

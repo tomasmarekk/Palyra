@@ -34,7 +34,7 @@ describe("desktop preferences", () => {
       },
     });
 
-    expect(() => writeStoredDesktopLocale("cs")).not.toThrow();
-    expect(setItem).toHaveBeenCalledWith(DESKTOP_LOCALE_STORAGE_KEY, "cs");
+    expect(() => writeStoredDesktopLocale("qps-ploc")).not.toThrow();
+    expect(setItem).toHaveBeenCalledWith(DESKTOP_LOCALE_STORAGE_KEY, "qps-ploc");
   });
 });

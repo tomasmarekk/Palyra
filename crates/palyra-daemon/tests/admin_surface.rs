@@ -1149,8 +1149,8 @@ fn console_mobile_endpoints_require_session_and_surface_cross_device_sessions() 
         bootstrap
             .get("locales")
             .and_then(Value::as_array)
-            .is_some_and(|values| values.iter().any(|value| value.as_str() == Some("cs"))),
-        "mobile bootstrap should expose Czech locale rollout"
+            .is_some_and(|values| values.iter().any(|value| value.as_str() == Some("qps-ploc"))),
+        "mobile bootstrap should expose pseudo-localization rollout"
     );
 
     let sessions = client

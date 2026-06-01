@@ -1001,10 +1001,10 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn decode_windows_process_output_preserves_localized_schtasks_text() {
-        let decoded = decode_windows_process_output(b"ERROR: P\xfd\xa1stup byl odep\xfden.");
+        let decoded = decode_windows_process_output(b"ERROR: X\xfd\xa1 Y\xfden.");
 
         assert!(
-            decoded.contains("Přístup byl odepřen"),
+            decoded.contains("X\u{0159}\u{00ED} Y\u{0159}en"),
             "localized schtasks output should not be mojibake: {decoded}"
         );
     }
@@ -1012,10 +1012,10 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn decode_windows_process_output_preserves_ansi_localized_schtasks_text() {
-        let decoded = decode_windows_process_output(b"ERROR: P\xf8\xedstup byl odep\xf8en.");
+        let decoded = decode_windows_process_output(b"ERROR: X\xf8\xed Y\xf8en.");
 
         assert!(
-            decoded.contains("Přístup byl odepřen"),
+            decoded.contains("X\u{0159}\u{00ED} Y\u{0159}en"),
             "localized ANSI output should not be mojibake: {decoded}"
         );
     }

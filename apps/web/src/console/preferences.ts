@@ -1,5 +1,5 @@
 export type ConsoleUiMode = "basic" | "advanced";
-export type ConsoleLocale = "en" | "cs" | "qps-ploc";
+export type ConsoleLocale = "en" | "qps-ploc";
 export type ThemeMode = "light" | "dark";
 
 export const CONSOLE_THEME_STORAGE_KEY = "palyra.console.theme";

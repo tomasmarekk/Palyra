@@ -40,7 +40,7 @@ data class MobileApprovalSummary(
 )
 
 data class MobileBootstrapContract(
-    val localeOptions: List<String> = listOf("en", "cs"),
+    val localeOptions: List<String> = listOf("en", "qps-ploc"),
     val defaultLocale: String = "en",
     val releaseScope: Set<MobileReleaseCapability> = setOf(
         MobileReleaseCapability.APPROVALS_INBOX,
