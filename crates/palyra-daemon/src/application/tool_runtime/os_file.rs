@@ -31,6 +31,9 @@ const MAX_OS_FILE_SEARCH_FILES: usize = 1_000;
 const MAX_OS_FILE_SEARCH_DEPTH: usize = 8;
 const MAX_OS_FILE_SEARCH_FILE_BYTES: u64 = 128 * 1024;
 const MAX_OS_FILE_SEARCH_EXCERPT_CHARS: usize = 240;
+const OS_FILE_LARGE_SHRINK_MIN_EXISTING_BYTES: u64 = 1024;
+const OS_FILE_LARGE_SHRINK_MAX_NEW_PERCENT: u64 = 50;
+const OS_FILE_LARGE_SHRINK_MIN_DELTA_BYTES: u64 = 512;
 const PALYRA_OS_FILE_ROOTS_ENV: &str = "PALYRA_OS_FILE_ROOTS";
 
 #[derive(Debug, Deserialize)]
@@ -47,6 +50,8 @@ struct OsFileInput {
     create_parent_dirs: Option<bool>,
     #[serde(default)]
     overwrite: Option<bool>,
+    #[serde(default)]
+    full_replace: Option<bool>,
     #[serde(default)]
     dry_run: Option<bool>,
     #[serde(default)]
@@ -269,6 +274,21 @@ fn write_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, Strin
             input.path.trim()
         ));
     }
+    let existing_size_bytes = if existed_before {
+        Some(
+            fs::metadata(path.resolved_path.as_path())
+                .map_err(|error| {
+                    format!(
+                        "{OS_FILE_TOOL_NAME} failed to inspect write target {}: {error}",
+                        input.path.trim()
+                    )
+                })?
+                .len(),
+        )
+    } else {
+        None
+    };
+    guard_large_full_file_shrink(input, existing_size_bytes, bytes.len())?;
     if !parent_existed_before && !create_parent_dirs {
         return Err(format!(
             "{OS_FILE_TOOL_NAME} parent directory does not exist for {}",
@@ -310,9 +330,47 @@ fn write_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, Strin
         "bytes_written": bytes.len(),
         "content_sha256": content_sha256,
         "existed_before": existed_before,
+        "existing_size_bytes": existing_size_bytes,
+        "full_replace": input.full_replace.unwrap_or(false),
         "created_parent_dirs": create_parent_dirs && !parent_existed_before,
         "dry_run": dry_run,
     }))
+}
+
+fn guard_large_full_file_shrink(
+    input: &OsFileInput,
+    existing_size_bytes: Option<u64>,
+    new_size_bytes: usize,
+) -> Result<(), String> {
+    let Some(existing_size_bytes) = existing_size_bytes else {
+        return Ok(());
+    };
+    if input.full_replace.unwrap_or(false) {
+        return Ok(());
+    }
+    if !looks_like_large_full_file_shrink(existing_size_bytes, new_size_bytes) {
+        return Ok(());
+    }
+    Err(format!(
+        "{OS_FILE_TOOL_NAME} refusing large full-file shrink for existing file {}: existing_size_bytes={} new_size_bytes={}. operation=write with overwrite=true replaces the entire file. Use palyra.fs.apply_patch for scoped workspace edits, or retry with full_replace=true only when replacing the whole file is intentional.",
+        input.path.trim(),
+        existing_size_bytes,
+        new_size_bytes
+    ))
+}
+
+fn looks_like_large_full_file_shrink(existing_size_bytes: u64, new_size_bytes: usize) -> bool {
+    if existing_size_bytes < OS_FILE_LARGE_SHRINK_MIN_EXISTING_BYTES {
+        return false;
+    }
+    let Ok(new_size_bytes) = u64::try_from(new_size_bytes) else {
+        return true;
+    };
+    if existing_size_bytes.saturating_sub(new_size_bytes) < OS_FILE_LARGE_SHRINK_MIN_DELTA_BYTES {
+        return false;
+    }
+    new_size_bytes.saturating_mul(100)
+        <= existing_size_bytes.saturating_mul(OS_FILE_LARGE_SHRINK_MAX_NEW_PERCENT)
 }
 
 fn copy_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String> {
@@ -1139,6 +1197,7 @@ mod tests {
                 bytes_base64: None,
                 create_parent_dirs: Some(true),
                 overwrite: Some(true),
+                full_replace: None,
                 dry_run: Some(false),
                 offset_bytes: None,
                 max_bytes: None,
@@ -1163,6 +1222,7 @@ mod tests {
                 bytes_base64: None,
                 create_parent_dirs: None,
                 overwrite: None,
+                full_replace: None,
                 dry_run: None,
                 offset_bytes: None,
                 max_bytes: None,
@@ -1176,6 +1236,81 @@ mod tests {
 
         assert_eq!(read.get("text").and_then(Value::as_str), Some("palyra-os-level-ok\n"));
         assert!(read.get("resolved_path").and_then(Value::as_str).is_some());
+    }
+
+    #[test]
+    fn os_file_write_rejects_large_shrink_without_full_replace_intent() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let policy = test_policy(tempdir.path());
+        let target = tempdir.path().join("public").join("index.html");
+        fs::create_dir_all(target.parent().expect("target parent")).expect("parent dir");
+        let original = format!("<!doctype html>\n<body>\n{}\n</body>\n", "x".repeat(4096));
+        fs::write(target.as_path(), original.as_bytes()).expect("fixture should be written");
+
+        let error = execute_os_file_operation(
+            &policy,
+            &OsFileInput {
+                operation: OsFileOperation::Write,
+                path: target.to_string_lossy().into_owned(),
+                target_path: None,
+                content_text: Some("<span>fragment</span>\n".to_owned()),
+                bytes_base64: None,
+                create_parent_dirs: Some(true),
+                overwrite: Some(true),
+                full_replace: None,
+                dry_run: Some(false),
+                offset_bytes: None,
+                max_bytes: None,
+                query: None,
+                case_sensitive: None,
+                max_entries: None,
+                max_matches: None,
+            },
+        )
+        .expect_err("large shrink full-file write should require explicit full_replace intent");
+
+        assert!(error.contains("large full-file shrink"), "unexpected error: {error}");
+        assert!(
+            error.contains("palyra.fs.apply_patch"),
+            "error should guide scoped edits: {error}"
+        );
+        assert!(
+            error.contains("full_replace=true"),
+            "error should explain explicit full replacement: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(target.as_path()).expect("target should remain readable"),
+            original,
+            "rejected fragment write must leave the existing file unchanged"
+        );
+
+        let replaced = execute_os_file_operation(
+            &policy,
+            &OsFileInput {
+                operation: OsFileOperation::Write,
+                path: target.to_string_lossy().into_owned(),
+                target_path: None,
+                content_text: Some("<span>fragment</span>\n".to_owned()),
+                bytes_base64: None,
+                create_parent_dirs: Some(true),
+                overwrite: Some(true),
+                full_replace: Some(true),
+                dry_run: Some(false),
+                offset_bytes: None,
+                max_bytes: None,
+                query: None,
+                case_sensitive: None,
+                max_entries: None,
+                max_matches: None,
+            },
+        )
+        .expect("explicit full_replace should allow intentional whole-file replacement");
+
+        assert_eq!(replaced.get("full_replace").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            fs::read_to_string(target.as_path()).expect("replacement should be readable"),
+            "<span>fragment</span>\n"
+        );
     }
 
     #[test]
@@ -1199,6 +1334,7 @@ mod tests {
                 bytes_base64: None,
                 create_parent_dirs: None,
                 overwrite: None,
+                full_replace: None,
                 dry_run: None,
                 offset_bytes: None,
                 max_bytes: None,
@@ -1241,6 +1377,7 @@ mod tests {
                 bytes_base64: None,
                 create_parent_dirs: Some(true),
                 overwrite: Some(true),
+                full_replace: None,
                 dry_run: Some(false),
                 offset_bytes: None,
                 max_bytes: None,
@@ -1297,6 +1434,7 @@ mod tests {
                 bytes_base64: None,
                 create_parent_dirs: Some(true),
                 overwrite: Some(true),
+                full_replace: None,
                 dry_run: Some(true),
                 offset_bytes: None,
                 max_bytes: None,
@@ -1333,6 +1471,7 @@ mod tests {
                 bytes_base64: None,
                 create_parent_dirs: None,
                 overwrite: None,
+                full_replace: None,
                 dry_run: None,
                 offset_bytes: None,
                 max_bytes: None,
@@ -1356,6 +1495,7 @@ mod tests {
                 bytes_base64: None,
                 create_parent_dirs: None,
                 overwrite: None,
+                full_replace: None,
                 dry_run: None,
                 offset_bytes: None,
                 max_bytes: None,

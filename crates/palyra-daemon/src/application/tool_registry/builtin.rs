@@ -468,7 +468,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
         ),
         entry(
             "palyra.fs.os_file",
-            "Perform an audited file operation on an absolute user-owned OS path. Use this for requested files outside the workspace, such as Downloads, user config files, configured local test harness OS roots, or user-cache cleanup. Protected system paths are denied, and paths are limited to workspace roots plus the runtime-approved OS roots.",
+            "Perform an audited file operation on an absolute user-owned OS path. Use this for requested files outside the workspace, such as Downloads, user config files, configured local test harness OS roots, or user-cache cleanup. Protected system paths are denied, and paths are limited to workspace roots plus the runtime-approved OS roots. For small edits to files inside a workspace, prefer palyra.fs.apply_patch; os_file write is a full-file replacement surface.",
             object_schema(
                 &["operation", "path"],
                 vec![
@@ -498,7 +498,11 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                     ),
                     (
                         "overwrite",
-                        json!({"type":"boolean","description":"Defaults to true for write/copy/move. Set false to fail if the target already exists."}),
+                        json!({"type":"boolean","description":"Defaults to true for write/copy/move. For operation=write, overwrite=true replaces the entire file; use palyra.fs.apply_patch for scoped edits."}),
+                    ),
+                    (
+                        "full_replace",
+                        json!({"type":"boolean","description":"Set true only when operation=write intentionally replaces the whole existing file. Without this flag, large shrink writes to an existing file are rejected with patch guidance."}),
                     ),
                     ("dry_run", json!({"type":"boolean"})),
                     ("offset_bytes", json!({"type":"integer","minimum":0})),
@@ -1290,6 +1294,13 @@ mod tests {
             .and_then(serde_json::Value::as_str)
             .expect("os_file query description should be visible to models");
         assert!(query_description.contains("filename/path/content"));
+        let full_replace_description = entry
+            .input_schema
+            .pointer("/properties/full_replace/description")
+            .and_then(serde_json::Value::as_str)
+            .expect("os_file full_replace description should be visible to models");
+        assert!(full_replace_description.contains("replaces the whole existing file"));
+        assert!(full_replace_description.contains("large shrink writes"));
         assert!(entry.input_schema.pointer("/properties/max_entries").is_some());
         assert!(entry.input_schema.pointer("/properties/max_matches").is_some());
     }
