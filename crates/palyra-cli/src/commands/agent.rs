@@ -146,6 +146,11 @@ fn ensure_agent_run_approval_flags(
             "--allow-sensitive-tools cannot be combined with --approval-mode deny; remove --allow-sensitive-tools to deny sensitive tool requests, or use --approval-mode allow-once after reviewing the requested tool risk"
         );
     }
+    if allow_sensitive_tools && approval_mode == AgentApprovalModeArg::Prompt {
+        anyhow::bail!(
+            "--allow-sensitive-tools cannot be combined with --approval-mode prompt because it auto-approves sensitive tool requests before an interactive prompt can be shown; remove --allow-sensitive-tools for manual approval prompts, or use --approval-mode allow-once after reviewing the requested tool risk"
+        );
+    }
     if prompt_stdin && approval_mode == AgentApprovalModeArg::Prompt {
         anyhow::bail!(
             "--approval-mode prompt cannot be combined with --prompt-stdin because stdin is consumed by the task prompt and cannot also receive tool approval decisions; use --approval-mode allow-once for unattended CLI runs, pass the task with --prompt from an interactive terminal, or use `palyra agent interactive`"
@@ -865,9 +870,17 @@ mod tests {
     }
 
     #[test]
-    fn allow_sensitive_tools_can_pair_with_prompt_or_allow_once() {
-        ensure_agent_run_approval_flags(true, AgentApprovalModeArg::Prompt, false)
-            .expect("prompt mode remains valid with explicit sensitive-tool opt-in");
+    fn allow_sensitive_tools_conflicts_with_approval_prompt() {
+        let error = ensure_agent_run_approval_flags(true, AgentApprovalModeArg::Prompt, false)
+            .expect_err("prompt approval mode must not be silently bypassed by auto-approval");
+
+        assert!(error.to_string().contains("--allow-sensitive-tools"), "{error}");
+        assert!(error.to_string().contains("--approval-mode prompt"), "{error}");
+        assert!(error.to_string().contains("manual approval prompts"), "{error}");
+    }
+
+    #[test]
+    fn allow_sensitive_tools_can_pair_with_allow_once() {
         ensure_agent_run_approval_flags(true, AgentApprovalModeArg::AllowOnce, false)
             .expect("allow-once remains valid with explicit sensitive-tool opt-in");
     }
