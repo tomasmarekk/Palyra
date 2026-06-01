@@ -474,7 +474,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                 vec![
                     (
                         "operation",
-                        json!({"type":"string","enum":["stat","read","write","copy","move","delete_file","mkdir","list_dir","search"],"description":"Operation to perform. Prefer list_dir/search/read/write for ordinary OS-level files; use copy/move/delete_file/mkdir only when explicitly requested. For privacy cleanup, use search to find exact matching cache files before delete_file."}),
+                        json!({"type":"string","enum":["stat","read","write","copy","move","delete_file","delete_empty_dir","mkdir","list_dir","search"],"description":"Operation to perform. Prefer list_dir/search/read/write for ordinary OS-level files; use copy/move/delete_file/delete_empty_dir/mkdir only when explicitly requested. Use delete_empty_dir for cleanup of an existing empty directory instead of shell builtins such as rmdir. For privacy cleanup, use search to find exact matching cache files before delete_file."}),
                     ),
                     (
                         "path",
@@ -1287,6 +1287,14 @@ mod tests {
             .expect("os_file operation enum should be visible to models");
         assert!(operation_values.iter().any(|value| value.as_str() == Some("list_dir")));
         assert!(operation_values.iter().any(|value| value.as_str() == Some("search")));
+        assert!(operation_values.iter().any(|value| value.as_str() == Some("delete_empty_dir")));
+        let operation_description = entry
+            .input_schema
+            .pointer("/properties/operation/description")
+            .and_then(serde_json::Value::as_str)
+            .expect("os_file operation description should be visible to models");
+        assert!(operation_description.contains("delete_empty_dir"));
+        assert!(operation_description.contains("rmdir"));
 
         let path_description = entry
             .input_schema

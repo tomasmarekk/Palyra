@@ -77,6 +77,7 @@ enum OsFileOperation {
     Copy,
     Move,
     DeleteFile,
+    DeleteEmptyDir,
     Mkdir,
     ListDir,
     Search,
@@ -190,6 +191,7 @@ fn execute_os_file_operation(policy: &OsFilePolicy, input: &OsFileInput) -> Resu
         OsFileOperation::Copy => copy_path(policy, input),
         OsFileOperation::Move => move_path(policy, input),
         OsFileOperation::DeleteFile => delete_file_path(policy, input),
+        OsFileOperation::DeleteEmptyDir => delete_empty_dir_path(policy, input),
         OsFileOperation::Mkdir => mkdir_path(policy, input),
         OsFileOperation::ListDir => list_dir_path(policy, input),
         OsFileOperation::Search => search_path(policy, input),
@@ -458,6 +460,32 @@ fn delete_file_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value,
         "path": display_path(path.requested_path.as_path()),
         "resolved_path": display_path(path.resolved_path.as_path()),
         "size_bytes": metadata.len(),
+        "dry_run": dry_run,
+    }))
+}
+
+fn delete_empty_dir_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String> {
+    let path = resolve_existing_os_path(input.path.as_str())?;
+    ensure_os_path_allowed(policy, &path)?;
+    let metadata = fs::metadata(path.resolved_path.as_path()).map_err(|error| {
+        format!("{OS_FILE_TOOL_NAME} failed to inspect {}: {error}", input.path.trim())
+    })?;
+    if !metadata.is_dir() {
+        return Err(format!("{OS_FILE_TOOL_NAME} delete_empty_dir only removes empty directories"));
+    }
+    let dry_run = input.dry_run.unwrap_or(false);
+    if !dry_run {
+        fs::remove_dir(path.resolved_path.as_path()).map_err(|error| {
+            format!(
+                "{OS_FILE_TOOL_NAME} failed to remove empty directory {}: {error}",
+                display_path(path.resolved_path.as_path())
+            )
+        })?;
+    }
+    Ok(json!({
+        "operation": "delete_empty_dir",
+        "path": display_path(path.requested_path.as_path()),
+        "resolved_path": display_path(path.resolved_path.as_path()),
         "dry_run": dry_run,
     }))
 }
@@ -1683,6 +1711,66 @@ mod tests {
         .expect_err("outside path should require an approved root");
 
         assert!(error.contains("approved user-owned OS roots"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn os_file_delete_empty_dir_removes_only_empty_directories() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let policy = test_policy(tempdir.path());
+        let non_empty = tempdir.path().join("scratch").join("non-empty");
+        fs::create_dir_all(non_empty.as_path()).expect("non-empty dir should exist");
+        fs::write(non_empty.join("keep.txt"), "keep\n").expect("nested file should exist");
+
+        let error = execute_os_file_operation(
+            &policy,
+            &OsFileInput {
+                operation: OsFileOperation::DeleteEmptyDir,
+                path: non_empty.to_string_lossy().into_owned(),
+                target_path: None,
+                content_text: None,
+                bytes_base64: None,
+                create_parent_dirs: None,
+                overwrite: None,
+                full_replace: None,
+                dry_run: None,
+                offset_bytes: None,
+                max_bytes: None,
+                query: None,
+                case_sensitive: None,
+                max_entries: None,
+                max_matches: None,
+            },
+        )
+        .expect_err("non-empty directories must not be removed");
+        assert!(error.contains("failed to remove empty directory"), "unexpected error: {error}");
+        assert!(non_empty.exists(), "non-empty directory should remain");
+
+        let empty = tempdir.path().join("scratch").join("empty");
+        fs::create_dir_all(empty.as_path()).expect("empty dir should exist");
+        let removed = execute_os_file_operation(
+            &policy,
+            &OsFileInput {
+                operation: OsFileOperation::DeleteEmptyDir,
+                path: empty.to_string_lossy().into_owned(),
+                target_path: None,
+                content_text: None,
+                bytes_base64: None,
+                create_parent_dirs: None,
+                overwrite: None,
+                full_replace: None,
+                dry_run: None,
+                offset_bytes: None,
+                max_bytes: None,
+                query: None,
+                case_sensitive: None,
+                max_entries: None,
+                max_matches: None,
+            },
+        )
+        .expect("empty directory cleanup should succeed");
+
+        assert_eq!(removed.get("operation").and_then(Value::as_str), Some("delete_empty_dir"));
+        assert!(!empty.exists(), "empty directory should be removed");
     }
 
     #[test]
