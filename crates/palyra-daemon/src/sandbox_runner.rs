@@ -2222,7 +2222,7 @@ fn resolve_scoped_path(
         });
     }
     let candidate = if let Some(suffix) = virtual_workspace_path_suffix(raw) {
-        workspace_root.join(suffix)
+        workspace_root.join(normalize_virtual_workspace_suffix(workspace_root, suffix))
     } else if Path::new(raw).is_absolute() {
         PathBuf::from(raw)
     } else {
@@ -2477,6 +2477,31 @@ fn virtual_workspace_path_suffix(raw: &str) -> Option<PathBuf> {
         .strip_prefix("/workspace/")
         .or_else(|| normalized.strip_prefix("workspace/"))
         .map(PathBuf::from)
+}
+
+fn normalize_virtual_workspace_suffix(workspace_root: &Path, suffix: PathBuf) -> PathBuf {
+    let mut components = suffix.components();
+    let Some(Component::Normal(first)) = components.next() else {
+        return suffix;
+    };
+    let Some(root_name) = workspace_root.file_name() else {
+        return suffix;
+    };
+    if !path_component_equals(first, root_name) {
+        return suffix;
+    }
+    components.as_path().to_path_buf()
+}
+
+fn path_component_equals(left: &std::ffi::OsStr, right: &std::ffi::OsStr) -> bool {
+    #[cfg(windows)]
+    {
+        left.to_string_lossy().eq_ignore_ascii_case(&right.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
 }
 
 fn named_virtual_workspace_path_suffix(raw: &str) -> Option<PathBuf> {
@@ -4215,7 +4240,7 @@ mod tests {
         build_process_command, builtin_list_directory_stdout, canonical_workspace_root,
         collect_requested_egress_hosts, cpu_rlimit_seconds_from_usage_micros, is_host_allowlisted,
         process_failure_message, redacted_process_output_preview, redacted_process_output_text,
-        resolve_host_working_directory, resolve_working_directory,
+        resolve_host_working_directory, resolve_scoped_path, resolve_working_directory,
         rewrite_arguments_to_scoped_paths, rewrite_host_virtual_workspace_args,
         run_constrained_process, validate_argument_workspace_scope, validate_cmd_invocation_shape,
         validate_host_argument_scope, validate_host_interpreter_argument_guardrails,
@@ -4564,6 +4589,35 @@ mod tests {
         assert_eq!(rewritten[4], "/not/a/path/pattern");
 
         let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    fn resolve_scoped_path_collapses_repeated_active_workspace_name() {
+        let parent = unique_temp_dir("workspace-virtual-active-parent");
+        let workspace = parent.join("S091_shell_profile");
+        fs::create_dir_all(workspace.join("scripts")).expect("workspace directory should exist");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+
+        let resolved_root = resolve_scoped_path(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            "/workspace/S091_shell_profile",
+            true,
+        )
+        .expect("virtual active workspace alias should resolve to the root itself");
+        assert_eq!(resolved_root, canonical_workspace);
+
+        let resolved_nested = resolve_scoped_path(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            "/workspace/S091_shell_profile/scripts/helper.ps1",
+            false,
+        )
+        .expect("virtual active workspace alias should preserve nested suffix");
+        assert_eq!(resolved_nested, canonical_workspace.join("scripts").join("helper.ps1"));
+
+        let _ = fs::remove_dir_all(parent.as_path());
     }
 
     #[test]
