@@ -566,14 +566,21 @@ pub(crate) fn mutate_model_defaults(
 
     match target {
         "text" => {
-            let key = if !has_registry {
-                let provider_kind = legacy_provider_kind_for_mutation(&document)?;
-                legacy_text_model_key(provider_kind.as_str())?
+            let legacy_provider_kind = if !has_registry {
+                Some(legacy_provider_kind_for_mutation(&document)?)
+            } else {
+                None
+            };
+            let key = if let Some(provider_kind) = legacy_provider_kind.as_deref() {
+                legacy_text_model_key(provider_kind)?
             } else {
                 "model_provider.default_chat_model_id"
             };
             set_value_at_path(&mut document, key, toml::Value::String(model.clone()))
                 .with_context(|| format!("invalid config key path: {key}"))?;
+            if let Some(provider_kind) = legacy_provider_kind.as_deref() {
+                clear_conflicting_legacy_text_model(&mut document, provider_kind)?;
+            }
         }
         "embeddings" => {
             let key = if !has_registry {
@@ -742,6 +749,22 @@ fn legacy_text_model_key(provider_kind: &str) -> Result<&'static str> {
             "model_provider.kind must be one of deterministic, openai_compatible, or anthropic"
         ),
     }
+}
+
+fn clear_conflicting_legacy_text_model(
+    document: &mut toml::Value,
+    provider_kind: &str,
+) -> Result<()> {
+    match provider_kind {
+        OPENAI_COMPATIBLE_PROVIDER_KIND | DETERMINISTIC_PROVIDER_KIND => {
+            unset_value_at_path(document, "model_provider.anthropic_model")?;
+        }
+        ANTHROPIC_PROVIDER_KIND => {
+            unset_value_at_path(document, "model_provider.openai_model")?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn legacy_embeddings_model_key(provider_kind: &str) -> Result<&'static str> {
@@ -1067,17 +1090,23 @@ fn load_models_overview(path: Option<String>) -> Result<ModelsOverview> {
         model_provider.default_embeddings_model_id.as_deref(),
     );
     let default_chat_model_id = effective_default_chat_model_id(&model_provider, models.as_slice());
-    let openai_base_url = model_provider.openai_base_url.clone();
+    let openai_base_url = if provider_kind == OPENAI_COMPATIBLE_PROVIDER_KIND {
+        model_provider.openai_base_url.clone()
+    } else {
+        None
+    };
     let text_model = model_provider
         .default_chat_model_id
         .clone()
-        .or_else(|| model_provider.openai_model.clone())
-        .or_else(|| model_provider.anthropic_model.clone());
-    let embeddings_model = model_provider
-        .default_embeddings_model_id
-        .clone()
-        .or_else(|| model_provider.openai_embeddings_model.clone());
-    let embeddings_dims = model_provider.openai_embeddings_dims;
+        .or_else(|| legacy_chat_model_for_kind(provider_kind.as_str(), &model_provider));
+    let embeddings_model = model_provider.default_embeddings_model_id.clone().or_else(|| {
+        (provider_kind == OPENAI_COMPATIBLE_PROVIDER_KIND)
+            .then(|| model_provider.openai_embeddings_model.clone())
+            .flatten()
+    });
+    let embeddings_dims = (provider_kind == OPENAI_COMPATIBLE_PROVIDER_KIND)
+        .then_some(model_provider.openai_embeddings_dims)
+        .flatten();
     let provider_id = default_provider_id(models.as_slice(), &model_provider)
         .map(str::to_owned)
         .or_else(|| providers.first().map(|entry| entry.provider_id.clone()))
@@ -1092,39 +1121,35 @@ fn load_models_overview(path: Option<String>) -> Result<ModelsOverview> {
         provider_entry.map(|entry| entry.protocol_compatibility.clone()).unwrap_or_else(|| {
             protocol_compatibility_for_kind(provider_kind_for_status.as_str()).to_owned()
         });
-    let auth_provider_kind = provider_entry
-        .and_then(|entry| entry.auth_provider_kind.clone())
-        .or_else(|| model_provider.auth_provider_kind.clone());
+    let auth_provider_kind =
+        provider_entry.and_then(|entry| entry.auth_provider_kind.clone()).or_else(|| {
+            (provider_kind_for_status != DETERMINISTIC_PROVIDER_KIND)
+                .then(|| model_provider.auth_provider_kind.clone())
+                .flatten()
+        });
     let endpoint_base_url = provider_entry
         .and_then(|entry| entry.base_url.clone())
         .or_else(|| default_base_url_for_kind(provider_kind_for_status.as_str(), &model_provider));
-    let auth_profile_id = model_provider.auth_profile_id.clone().or_else(|| {
-        providers
-            .iter()
-            .find(|entry| {
-                Some(entry.provider_id.as_str())
-                    == default_provider_id(models.as_slice(), &model_provider)
-            })
-            .and_then(|entry| entry.auth_profile_id.clone())
-    });
+    let auth_profile_id = provider_entry
+        .and_then(|entry| entry.auth_profile_id.clone())
+        .or_else(|| {
+            (provider_kind_for_status != DETERMINISTIC_PROVIDER_KIND)
+                .then(|| model_provider.auth_profile_id.clone())
+                .flatten()
+        })
+        .or_else(|| {
+            providers
+                .iter()
+                .find(|entry| {
+                    Some(entry.provider_id.as_str())
+                        == default_provider_id(models.as_slice(), &model_provider)
+                })
+                .and_then(|entry| entry.auth_profile_id.clone())
+        });
     let api_key_configured =
-        model_provider.openai_api_key.as_deref().filter(|value| !value.trim().is_empty()).is_some()
-            || model_provider
-                .openai_api_key_vault_ref
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-                .is_some()
-            || model_provider
-                .anthropic_api_key
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-                .is_some()
-            || model_provider
-                .anthropic_api_key_vault_ref
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-                .is_some()
-            || providers.iter().any(|entry| entry.api_key_configured);
+        provider_entry.map(|entry| entry.api_key_configured).unwrap_or_else(|| {
+            credential_configured_for_kind(provider_kind_for_status.as_str(), &model_provider)
+        });
     Ok(ModelsOverview {
         status: ModelsStatusPayload {
             path,
@@ -1408,31 +1433,16 @@ fn legacy_provider_entries(config: &FileModelProviderConfig) -> Vec<RegistryProv
         provider_id: provider_id.to_owned(),
         display_name: Some(display_name.to_owned()),
         protocol_compatibility: protocol_compatibility_for_kind(kind.as_str()).to_owned(),
-        kind,
-        base_url: config.openai_base_url.clone().or_else(|| config.anthropic_base_url.clone()),
+        kind: kind.clone(),
+        base_url: default_base_url_for_kind(kind.as_str(), config),
         enabled: true,
-        auth_profile_id: config.auth_profile_id.clone(),
-        auth_provider_kind: config.auth_provider_kind.clone(),
-        api_key_configured: config
-            .openai_api_key
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .is_some()
-            || config
-                .openai_api_key_vault_ref
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-                .is_some()
-            || config
-                .anthropic_api_key
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-                .is_some()
-            || config
-                .anthropic_api_key_vault_ref
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-                .is_some(),
+        auth_profile_id: (kind != DETERMINISTIC_PROVIDER_KIND)
+            .then(|| config.auth_profile_id.clone())
+            .flatten(),
+        auth_provider_kind: (kind != DETERMINISTIC_PROVIDER_KIND)
+            .then(|| config.auth_provider_kind.clone())
+            .flatten(),
+        api_key_configured: credential_configured_for_kind(kind.as_str(), config),
         source: "legacy",
     }]
 }
@@ -1442,12 +1452,7 @@ fn legacy_model_entries(config: &FileModelProviderConfig) -> Vec<RegistryModelEn
     let (provider_id, _) =
         legacy_provider_identity(kind.as_str(), config.auth_provider_kind.as_deref());
     let mut models = Vec::new();
-    if let Some(model_id) = config
-        .openai_model
-        .clone()
-        .or_else(|| config.anthropic_model.clone())
-        .or_else(|| Some("deterministic".to_owned()))
-    {
+    if let Some(model_id) = legacy_chat_model_for_kind(kind.as_str(), config) {
         models.push(legacy_registry_model(
             model_id,
             provider_id.to_owned(),
@@ -1466,6 +1471,39 @@ fn legacy_model_entries(config: &FileModelProviderConfig) -> Vec<RegistryModelEn
         ));
     }
     models
+}
+
+fn legacy_chat_model_for_kind(kind: &str, config: &FileModelProviderConfig) -> Option<String> {
+    match kind {
+        OPENAI_COMPATIBLE_PROVIDER_KIND => config.openai_model.clone(),
+        ANTHROPIC_PROVIDER_KIND => config.anthropic_model.clone(),
+        DETERMINISTIC_PROVIDER_KIND => {
+            config.openai_model.clone().or_else(|| Some(DETERMINISTIC_PROVIDER_KIND.to_owned()))
+        }
+        _ => None,
+    }
+}
+
+fn credential_configured_for_kind(kind: &str, config: &FileModelProviderConfig) -> bool {
+    match kind {
+        OPENAI_COMPATIBLE_PROVIDER_KIND => {
+            config.openai_api_key.as_deref().filter(|value| !value.trim().is_empty()).is_some()
+                || config
+                    .openai_api_key_vault_ref
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .is_some()
+        }
+        ANTHROPIC_PROVIDER_KIND => {
+            config.anthropic_api_key.as_deref().filter(|value| !value.trim().is_empty()).is_some()
+                || config
+                    .anthropic_api_key_vault_ref
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .is_some()
+        }
+        _ => false,
+    }
 }
 
 fn legacy_registry_model(

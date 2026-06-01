@@ -653,6 +653,71 @@ anthropic_api_key_vault_ref = "global/minimax_api_key"
 }
 
 #[test]
+fn models_status_does_not_mix_deterministic_provider_with_stale_minimax_auth() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let config_path = workdir.path().join("palyra.toml");
+    fs::write(
+        &config_path,
+        r#"
+version = 1
+[model_provider]
+kind = "deterministic"
+auth_provider_kind = "minimax"
+anthropic_base_url = "https://api.minimax.io/anthropic"
+anthropic_model = "MiniMax-M3"
+anthropic_api_key_vault_ref = "global/minimax_api_key"
+openai_model = "deterministic"
+"#,
+    )
+    .with_context(|| format!("failed to write {}", config_path.display()))?;
+    let config_path_string = config_path.to_string_lossy().into_owned();
+
+    let status_output =
+        run_cli(&workdir, &["models", "status", "--path", &config_path_string, "--json"])?;
+    assert!(
+        status_output.status.success(),
+        "models status should succeed for deterministic config: {}",
+        String::from_utf8_lossy(&status_output.stderr)
+    );
+    let status_stdout =
+        String::from_utf8(status_output.stdout).context("stdout was not valid UTF-8")?;
+    let status_payload: Value =
+        serde_json::from_str(status_stdout.as_str()).context("status stdout was not JSON")?;
+
+    assert_eq!(
+        status_payload.get("provider_id").and_then(Value::as_str),
+        Some("deterministic-primary"),
+        "status should report the deterministic provider identity: {status_payload}"
+    );
+    assert_eq!(
+        status_payload.get("provider_kind").and_then(Value::as_str),
+        Some("deterministic"),
+        "status should report deterministic provider kind: {status_payload}"
+    );
+    assert_eq!(
+        status_payload.get("auth_provider_kind"),
+        Some(&Value::Null),
+        "deterministic status must not inherit stale MiniMax auth kind: {status_payload}"
+    );
+    assert_eq!(
+        status_payload.get("endpoint_base_url"),
+        Some(&Value::Null),
+        "deterministic status must not inherit stale MiniMax endpoint: {status_payload}"
+    );
+    assert_eq!(
+        status_payload.get("api_key_configured").and_then(Value::as_bool),
+        Some(false),
+        "deterministic status must not report stale MiniMax API-key state: {status_payload}"
+    );
+    assert_eq!(
+        status_payload.get("default_chat_model_id").and_then(Value::as_str),
+        Some("deterministic"),
+        "status should keep the deterministic chat model explicit: {status_payload}"
+    );
+    Ok(())
+}
+
+#[test]
 fn models_set_preserves_minimax_legacy_anthropic_provider() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let config_path = workdir.path().join("palyra.toml");
@@ -666,6 +731,7 @@ auth_provider_kind = "minimax"
 anthropic_base_url = "https://api.minimax.io/anthropic"
 anthropic_model = "MiniMax-M2.7"
 anthropic_api_key_vault_ref = "global/minimax_api_key"
+openai_model = "deterministic"
 "#,
     )
     .with_context(|| format!("failed to write {}", config_path.display()))?;
@@ -708,7 +774,7 @@ anthropic_api_key_vault_ref = "global/minimax_api_key"
     );
     assert!(
         !config_body.contains("openai_model"),
-        "models set must not create an OpenAI text model key in MiniMax configs: {config_body}"
+        "models set must clear stale OpenAI text model keys from MiniMax configs: {config_body}"
     );
     Ok(())
 }
