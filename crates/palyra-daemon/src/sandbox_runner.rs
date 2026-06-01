@@ -507,15 +507,40 @@ fn process_failure_message(
     let stderr_preview = redacted_process_output_preview(stderr.bytes.as_slice())
         .map(|preview| format!(", stderr_preview={preview:?}"))
         .unwrap_or_default();
+    let diagnostic_hint = process_failure_diagnostic_hint(stdout, stderr)
+        .map(|hint| format!(", hint={hint:?}"))
+        .unwrap_or_default();
     format!(
-        "sandbox process exited unsuccessfully (code={exit_code}, stdout_bytes={}, stdout_truncated={}, stderr_bytes={}, stderr_truncated={}{}{})",
+        "sandbox process exited unsuccessfully (code={exit_code}, stdout_bytes={}, stdout_truncated={}, stderr_bytes={}, stderr_truncated={}{}{}{})",
         stdout.bytes.len(),
         stdout.truncated,
         stderr.bytes.len(),
         stderr.truncated,
         stdout_preview,
         stderr_preview,
+        diagnostic_hint,
     )
+}
+
+fn process_failure_diagnostic_hint(
+    stdout: &StreamCapture,
+    stderr: &StreamCapture,
+) -> Option<&'static str> {
+    let output = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(stdout.bytes.as_slice()),
+        String::from_utf8_lossy(stderr.bytes.as_slice())
+    )
+    .to_ascii_lowercase();
+    if (output.contains("windows subsystem for linux") || output.contains("wsl"))
+        && output.contains("no installed")
+        && output.contains("distribution")
+    {
+        return Some(
+            "WSL reports no installed Linux distributions; use a workspace script-file invocation such as command='pwsh', args=['-NoProfile','-File','scripts/check.ps1'] on Windows, or install and configure WSL before running bash scripts",
+        );
+    }
+    None
 }
 
 fn redacted_process_output_preview(output: &[u8]) -> Option<String> {
@@ -1484,13 +1509,7 @@ fn validate_interpreter_argument_guardrails(
     }
 
     if args.iter().any(|arg| is_blocked_eval_flag(arg.as_str())) {
-        return Err(SandboxProcessRunError {
-            kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
-            message: format!(
-                "sandbox denied: interpreter command '{}' cannot use shell-eval flags (-c/--command)",
-                command
-            ),
-        });
+        return Err(interpreter_shell_eval_denied_error(command));
     }
 
     for (index, argument) in args.iter().enumerate() {
@@ -1534,13 +1553,7 @@ fn validate_host_interpreter_argument_guardrails(
     }
 
     if args.iter().any(|arg| is_blocked_eval_flag(arg.as_str())) {
-        return Err(SandboxProcessRunError {
-            kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
-            message: format!(
-                "sandbox denied: interpreter command '{}' cannot use shell-eval flags (-c/--command)",
-                command
-            ),
-        });
+        return Err(interpreter_shell_eval_denied_error(command));
     }
 
     for (index, argument) in args.iter().enumerate() {
@@ -1720,6 +1733,16 @@ fn interpreter_path_list_components(raw: &str) -> Vec<&str> {
 fn is_interpreter_executable(command: &str) -> bool {
     let normalized = command.trim().to_ascii_lowercase();
     INTERPRETER_EXECUTABLE_DENYLIST.contains(&normalized.as_str())
+}
+
+fn interpreter_shell_eval_denied_error(command: &str) -> SandboxProcessRunError {
+    SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+        message: format!(
+            "sandbox denied: interpreter command '{}' cannot use shell-eval flags (-c/--command); write a workspace script and run it as a script file instead, for example command='pwsh', args=['-NoProfile','-File','scripts/check.ps1'] on Windows or command='bash', args=['scripts/check.sh'] when bash is available",
+            command
+        ),
+    }
 }
 
 fn is_blocked_eval_flag(arg: &str) -> bool {
@@ -2176,7 +2199,20 @@ fn option_compact_value(arg: &str) -> Option<&str> {
         return None;
     }
 
-    Some(&trimmed[value_index..])
+    let value = &trimmed[value_index..];
+    compact_option_value_looks_like_path(value).then_some(value)
+}
+
+fn compact_option_value_looks_like_path(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let normalized = trimmed.replace('\\', "/");
+    trimmed.starts_with('.')
+        || token_looks_like_absolute_path(trimmed)
+        || normalized.starts_with("workspace/")
+        || normalized.to_ascii_lowercase().starts_with("file://")
 }
 
 fn argument_requires_path_validation(arg: &str) -> bool {
@@ -6757,6 +6793,22 @@ mod tests {
     }
 
     #[test]
+    fn process_failure_message_adds_wsl_no_distribution_hint() {
+        let stdout = StreamCapture { bytes: Vec::new(), truncated: false, read_error: None };
+        let stderr = StreamCapture {
+            bytes: b"The Windows Subsystem for Linux has no installed distributions.\n".to_vec(),
+            truncated: false,
+            read_error: None,
+        };
+
+        let message = process_failure_message(1, &stdout, &stderr);
+
+        assert!(message.contains("WSL reports no installed Linux distributions"), "{message}");
+        assert!(message.contains("command='pwsh'"), "{message}");
+        assert!(message.contains("'-File'"), "{message}");
+    }
+
+    #[test]
     #[cfg(unix)]
     fn run_constrained_process_denies_interpreters_without_explicit_opt_in() {
         if Command::new("bash").arg("--version").output().is_err() {
@@ -6789,6 +6841,29 @@ mod tests {
     }
 
     #[test]
+    fn interpreter_guardrails_reject_shell_eval_flags_with_script_file_hint() {
+        let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
+        let workspace_root = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let args =
+            vec!["-NoProfile".to_owned(), "-Command".to_owned(), "Write-Output ok".to_owned()];
+
+        let error = validate_interpreter_argument_guardrails(
+            workspace_root.as_path(),
+            workspace_root.as_path(),
+            "pwsh",
+            args.as_slice(),
+        )
+        .expect_err("PowerShell inline shell eval must stay blocked");
+
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+        assert!(error.message.contains("shell-eval flags"), "{}", error.message);
+        assert!(error.message.contains("command='pwsh'"), "{}", error.message);
+        assert!(error.message.contains("'-File'"), "{}", error.message);
+        assert!(error.message.contains("scripts/check.ps1"), "{}", error.message);
+    }
+
+    #[test]
     fn interpreter_guardrails_allow_absolute_workspace_script_argument() {
         let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
         let workspace_root = canonical_workspace_root(workspace.as_path())
@@ -6804,6 +6879,50 @@ mod tests {
             args.as_slice(),
         )
         .expect("absolute script path inside workspace should be allowed");
+    }
+
+    #[test]
+    fn process_argument_scope_allows_powershell_file_workspace_script() {
+        let workspace = unique_temp_dir("workspace-powershell-file-script");
+        let script_dir = workspace.join("scripts");
+        fs::create_dir_all(script_dir.as_path()).expect("workspace scripts directory should exist");
+        fs::write(script_dir.join("check.ps1"), b"Write-Output 'ok'\n")
+            .expect("workspace PowerShell fixture should be written");
+        let workspace_root = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let args =
+            vec!["-NoProfile".to_owned(), "-File".to_owned(), "scripts/check.ps1".to_owned()];
+
+        validate_interpreter_argument_guardrails(
+            workspace_root.as_path(),
+            workspace_root.as_path(),
+            "pwsh",
+            args.as_slice(),
+        )
+        .expect("PowerShell script-file invocation should not be treated as shell eval");
+        validate_argument_workspace_scope(
+            workspace_root.as_path(),
+            workspace_root.as_path(),
+            "pwsh",
+            args.as_slice(),
+        )
+        .expect("PowerShell script file should stay inside workspace scope");
+
+        let rewritten = rewrite_arguments_to_scoped_paths(
+            workspace_root.as_path(),
+            workspace_root.as_path(),
+            "pwsh",
+            args.as_slice(),
+        )
+        .expect("PowerShell script path should rewrite to a scoped absolute path");
+        assert_eq!(rewritten[0], "-NoProfile");
+        assert_eq!(rewritten[1], "-File");
+        assert_eq!(
+            rewritten[2],
+            workspace_root.join("scripts").join("check.ps1").display().to_string()
+        );
+
+        let _ = fs::remove_dir_all(workspace.as_path());
     }
 
     #[test]

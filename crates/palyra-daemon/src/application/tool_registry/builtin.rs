@@ -649,7 +649,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
         ),
         entry(
             "palyra.process.run",
-            "Run a local process using the configured process posture. Local desktop defaults may allow host-wide execution; restrictive deployments can use executable allowlists, egress controls, and workspace scoping. Use palyra.fs.apply_patch, not this tool, for file writes. On Windows, prefer Palyra file tools or PowerShell/cmd-compatible commands over Unix-only discovery commands.",
+            "Run a local process using the configured process posture. Local desktop defaults may allow host-wide execution; restrictive deployments can use executable allowlists, egress controls, and workspace scoping. Use palyra.fs.apply_patch, not this tool, for file writes. On Windows, prefer Palyra file tools or PowerShell script-file execution over Unix-only discovery commands.",
             object_schema(
                 &["command"],
                 vec![
@@ -667,7 +667,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                             "type":"array",
                             "items":{"type":"string"},
                             "maxItems":64,
-                            "description":"Command arguments only. For `echo hello`, use command='echo' and args=['hello'], not args=['echo hello']. For `node script.js`, use command='node' and args=['script.js'], not args=['node','script.js']; the runtime normalizes a duplicated leading command token and leading --cwd PATH into the cwd field, but callers should not rely on that. For npm scripts, use command='npm' with args=['run','script'] and cwd set to the package directory, or args=['--prefix','project','run','script'] if cwd cannot be set; never run npm through node and never put --prefix on node. Portable workspace-scoped builtins include pwd, ls/dir, cat/type, and mkdir. Portable background lifecycle builtins include command='palyra.process.stop' and command='palyra.process.status' with args=[pid] for PIDs returned by a background process result. On Windows, Unix grep/find/xargs/sed/awk are not portable; Windows find is a text search command, not directory traversal, so use palyra.fs.list_dir/read_file/search for workspace discovery. Do not use mkdir, touch, echo redirection, or interpreter eval for file writes; use palyra.fs.apply_patch first, then use this tool only to verify."
+                            "description":"Command arguments only. For `echo hello`, use command='echo' and args=['hello'], not args=['echo hello']. For `node script.js`, use command='node' and args=['script.js'], not args=['node','script.js']; the runtime normalizes a duplicated leading command token and leading --cwd PATH into the cwd field, but callers should not rely on that. For npm scripts, use command='npm' with args=['run','script'] and cwd set to the package directory, or args=['--prefix','project','run','script'] if cwd cannot be set; never run npm through node and never put --prefix on node. Portable workspace-scoped builtins include pwd, ls/dir, cat/type, and mkdir. Portable background lifecycle builtins include command='palyra.process.stop' and command='palyra.process.status' with args=[pid] for PIDs returned by a background process result. On Windows, Unix grep/find/xargs/sed/awk are not portable; Windows find is a text search command, not directory traversal, so use palyra.fs.list_dir/read_file/search for workspace discovery. Inline shell-eval flags such as -c, /c, and -Command are blocked; to verify generated Windows scripts, write a workspace .ps1 file with palyra.fs.apply_patch and run command='pwsh' or command='powershell' with args=['-NoProfile','-File','scripts/check.ps1']. Do not use mkdir, touch, echo redirection, or interpreter eval for file writes; use palyra.fs.apply_patch first, then use this tool only to verify."
                         }),
                     ),
                     (
@@ -1199,7 +1199,7 @@ mod tests {
     fn process_runner_registry_steers_file_writes_to_patch_tool() {
         let entry = registry_entry("palyra.process.run").expect("process runner entry exists");
         assert!(entry.description.contains("not this tool"));
-        assert!(entry.description.contains("PowerShell/cmd-compatible commands"));
+        assert!(entry.description.contains("PowerShell script-file execution"));
 
         let args_description = entry
             .input_schema
@@ -1215,6 +1215,9 @@ mod tests {
         assert!(args_description.contains("Windows find is a text search command"));
         assert!(args_description.contains("palyra.fs.list_dir/read_file/search"));
         assert!(args_description.contains("cat/type"));
+        assert!(args_description.contains("command='pwsh'"));
+        assert!(args_description.contains("'-File','scripts/check.ps1'"));
+        assert!(args_description.contains("Inline shell-eval flags"));
 
         let cwd_description = entry
             .input_schema
