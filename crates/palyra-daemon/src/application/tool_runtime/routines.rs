@@ -463,6 +463,7 @@ async fn upsert_routine(
         .map_err(map_registry_error)?;
     let success_visibility =
         parse_success_visibility(optional_string_field(payload, "success_visibility").as_deref())?;
+    let delivery_mode_was_requested = optional_string_field(payload, "delivery_mode").is_some();
     let delivery = normalize_delivery_for_success_visibility(
         parse_delivery(
             optional_string_field(payload, "delivery_mode").as_deref(),
@@ -472,6 +473,7 @@ async fn upsert_routine(
             optional_string_field(payload, "silent_policy").as_deref(),
         )?,
         success_visibility,
+        delivery_mode_was_requested,
     );
     let quiet_hours = parse_quiet_hours(
         optional_string_field(payload, "quiet_hours_start").as_deref(),
@@ -1700,12 +1702,16 @@ enum RoutineSuccessVisibility {
 fn normalize_delivery_for_success_visibility(
     mut delivery: RoutineDeliveryConfig,
     success_visibility: Option<RoutineSuccessVisibility>,
+    delivery_mode_was_requested: bool,
 ) -> RoutineDeliveryConfig {
     match success_visibility {
         Some(RoutineSuccessVisibility::ArtifactOnly | RoutineSuccessVisibility::AuditOnly) => {
             return delivery;
         }
         Some(RoutineSuccessVisibility::Announce) => {}
+        None if delivery_mode_was_requested => {
+            return delivery;
+        }
         None if output_delivered_for_outcome(
             &delivery,
             RoutineRunOutcomeKind::SuccessWithOutput,
@@ -1989,7 +1995,7 @@ fn normalize_optional_workdir(value: Option<String>) -> Result<Option<String>, S
 }
 
 fn resolve_routine_workdir_from_launch_context(
-    trigger_kind: RoutineTriggerKind,
+    _trigger_kind: RoutineTriggerKind,
     existing_workdir: Option<String>,
     requested_workdir: Option<String>,
     workdir_was_requested: bool,
@@ -2006,12 +2012,6 @@ fn resolve_routine_workdir_from_launch_context(
 
     if let Some(workdir) = existing_workdir {
         return Ok(Some(workdir));
-    }
-
-    if matches!(trigger_kind, RoutineTriggerKind::Schedule | RoutineTriggerKind::FileWatch) {
-        if let Some(root) = launch_workspace_roots.first() {
-            return Ok(Some(root.to_string_lossy().into_owned()));
-        }
     }
 
     Ok(None)
@@ -2614,7 +2614,7 @@ mod tests {
             silent_policy: RoutineSilentPolicy::AuditOnly,
         };
 
-        let normalized = super::normalize_delivery_for_success_visibility(delivery, None);
+        let normalized = super::normalize_delivery_for_success_visibility(delivery, None, false);
 
         assert_eq!(normalized.mode, RoutineDeliveryMode::SameChannel);
         assert_eq!(normalized.silent_policy, RoutineSilentPolicy::Noisy);
@@ -2637,6 +2637,7 @@ mod tests {
         let normalized = super::normalize_delivery_for_success_visibility(
             delivery,
             Some(super::RoutineSuccessVisibility::ArtifactOnly),
+            false,
         );
 
         assert_eq!(normalized.mode, RoutineDeliveryMode::LogsOnly);
@@ -2656,9 +2657,26 @@ mod tests {
         let normalized = super::normalize_delivery_for_success_visibility(
             delivery,
             Some(super::RoutineSuccessVisibility::Announce),
+            false,
         );
 
         assert_eq!(normalized.mode, RoutineDeliveryMode::SameChannel);
+        assert_eq!(normalized.silent_policy, RoutineSilentPolicy::Noisy);
+    }
+
+    #[test]
+    fn explicit_logs_only_delivery_is_preserved_without_announce_visibility() {
+        let delivery = RoutineDeliveryConfig {
+            mode: RoutineDeliveryMode::LogsOnly,
+            channel: None,
+            failure_mode: None,
+            failure_channel: None,
+            silent_policy: RoutineSilentPolicy::Noisy,
+        };
+
+        let normalized = super::normalize_delivery_for_success_visibility(delivery, None, true);
+
+        assert_eq!(normalized.mode, RoutineDeliveryMode::LogsOnly);
         assert_eq!(normalized.silent_policy, RoutineSilentPolicy::Noisy);
     }
 
@@ -2683,7 +2701,7 @@ mod tests {
     }
 
     #[test]
-    fn schedule_workdir_defaults_to_launch_workspace_for_new_agent_routine() {
+    fn schedule_workdir_stays_unset_for_new_agent_routine_when_omitted() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let launch_root = std::fs::canonicalize(tempdir.path()).expect("launch root should exist");
 
@@ -2694,9 +2712,9 @@ mod tests {
             false,
             std::slice::from_ref(&launch_root),
         )
-        .expect("launch workspace should resolve as default workdir");
+        .expect("omitted workdir should remain unset");
 
-        assert_eq!(workdir, Some(launch_root.to_string_lossy().into_owned()));
+        assert_eq!(workdir, None);
     }
 
     #[test]
