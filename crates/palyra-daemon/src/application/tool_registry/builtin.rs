@@ -687,14 +687,17 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                         "background",
                         json!({
                             "type":"boolean",
-                            "description":"Start an allowlisted long-running local process and return immediately. Use this instead of shell background syntax or nohup for temporary dev servers. The runtime fails fast if the process exits during startup and returns bounded startup stdout/stderr snapshots, which may include a server URL or selected dynamic port. Background lifetime is bounded by the operator-configured tool execution timeout and the runtime hard cap. Stop it with the returned cleanup.portable_stop_command and verify cleanup with cleanup.portable_status_command. For local browser verification, prefer binding to 127.0.0.1 with an explicit port and set timeout_ms to a bounded verification window within that limit."
+                            "description":"Start an allowlisted long-running local process and return immediately. Use this instead of shell background syntax or nohup for temporary dev servers. The runtime fails fast if the process exits during startup and returns bounded startup stdout/stderr snapshots, which may include a server URL or selected dynamic port. Background lifetime is bounded by the operator-configured tool execution timeout and the runtime hard cap. Stop it with the returned cleanup.portable_stop_command and verify cleanup with cleanup.portable_status_command. For local browser verification, bind to 127.0.0.1 with an explicit port and omit timeout_ms unless a specific long lifetime is needed; short background timeout_ms values are raised to the safe minimum when the execution cap permits."
                         }),
                     ),
                     (
                         "requested_egress_hosts",
                         json!({"type":"array","items":{"type":"string"},"maxItems":64}),
                     ),
-                    ("timeout_ms", json!({"type":"integer","minimum":1})),
+                    (
+                        "timeout_ms",
+                        json!({"type":"integer","minimum":1,"description":"Foreground process timeout in milliseconds. For background=true this is the requested process lifetime, not just startup timeout; omit it for the default long-lived local-server window, or set a value of at least 120000 for browser/app verification loops. Shorter background values are raised to the safe minimum when the operator execution cap permits."}),
+                    ),
                 ],
                 false,
             ),
@@ -1218,6 +1221,23 @@ mod tests {
         assert!(args_description.contains("command='pwsh'"));
         assert!(args_description.contains("'-File','scripts/check.ps1'"));
         assert!(args_description.contains("Inline shell-eval flags"));
+
+        let background_description = entry
+            .input_schema
+            .pointer("/properties/background/description")
+            .and_then(serde_json::Value::as_str)
+            .expect("background description should be visible to models");
+        assert!(background_description.contains("omit timeout_ms"));
+        assert!(background_description.contains("safe minimum"));
+
+        let timeout_description = entry
+            .input_schema
+            .pointer("/properties/timeout_ms/description")
+            .and_then(serde_json::Value::as_str)
+            .expect("timeout_ms description should be visible to models");
+        assert!(timeout_description.contains("background=true"));
+        assert!(timeout_description.contains("120000"));
+        assert!(timeout_description.contains("safe minimum"));
 
         let cwd_description = entry
             .input_schema

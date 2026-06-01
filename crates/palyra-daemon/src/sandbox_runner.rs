@@ -63,6 +63,7 @@ const BACKGROUND_METADATA_RETURN_RESERVE_MS: u64 = 100;
 const BACKGROUND_MONITOR_POLL_MS: u64 = 50;
 const BACKGROUND_TERMINATION_WAIT_MS: u64 = 1_000;
 const DEFAULT_FOREGROUND_PROCESS_TIMEOUT_MS: u64 = 30_000;
+const MIN_BACKGROUND_PROCESS_LIFETIME_MS: u64 = 120_000;
 const DEFAULT_BACKGROUND_PROCESS_LIFETIME_MS: u64 = 10 * 60_000;
 const MAX_BACKGROUND_PROCESS_LIFETIME_MS: u64 = 30 * 60_000;
 const PALYRA_CLI_PROFILE_ENV: &str = "PALYRA_CLI_PROFILE";
@@ -2976,6 +2977,9 @@ fn spawn_background_process(
     let RedactedProcessOutputText { text: stderr_text, redacted: stderr_redacted } =
         redacted_process_output(stderr.bytes.as_slice());
     let max_lifetime_ms = max_lifetime.as_millis() as u64;
+    let requested_lifetime_ms = input.timeout_ms;
+    let background_lifetime_adjusted =
+        requested_lifetime_ms.is_some_and(|requested| lifetime_ms > requested);
     let output_json = serde_json::to_vec(&json!({
         "exit_code": Value::Null,
         "stdout": stdout_text,
@@ -2992,10 +2996,18 @@ fn spawn_background_process(
         "startup_success": true,
         "process_state": "running",
         "pid": pid,
+        "requested_lifetime_ms": requested_lifetime_ms,
         "lifetime_ms": lifetime_ms,
         "max_lifetime_ms": max_lifetime_ms,
+        "min_background_lifetime_ms": MIN_BACKGROUND_PROCESS_LIFETIME_MS,
+        "background_lifetime_adjusted": background_lifetime_adjusted,
         "background_lifetime_note": format!(
-            "Palyra will auto-terminate this background process after {lifetime_ms}ms; set timeout_ms up to {max_lifetime_ms}ms within the operator-configured tool execution timeout for long browser verification loops, and use cleanup.portable_stop_command when finished."
+            "{}Palyra will auto-terminate this background process after {lifetime_ms}ms; omit timeout_ms for the default long-lived background server window, set timeout_ms up to {max_lifetime_ms}ms within the operator-configured tool execution timeout for long browser verification loops, and use cleanup.portable_stop_command when finished.",
+            if background_lifetime_adjusted {
+                "Requested timeout_ms was below the safe background minimum and was raised for local app/browser reliability. "
+            } else {
+                ""
+            }
         ),
         "process_handle": {
             "kind": "pid",
@@ -3486,7 +3498,14 @@ fn background_cleanup_note() -> &'static str {
 fn background_process_lifetime(timeout_ms: Option<u64>, execution_timeout: Duration) -> Duration {
     let lifetime_limit = background_process_lifetime_limit(execution_timeout);
     let default_lifetime = Duration::from_millis(DEFAULT_BACKGROUND_PROCESS_LIFETIME_MS);
-    timeout_ms.map(Duration::from_millis).unwrap_or(default_lifetime).min(lifetime_limit)
+    let minimum_lifetime = Duration::from_millis(MIN_BACKGROUND_PROCESS_LIFETIME_MS);
+    match timeout_ms.map(Duration::from_millis) {
+        Some(requested) if requested < minimum_lifetime && lifetime_limit > requested => {
+            minimum_lifetime.min(lifetime_limit)
+        }
+        Some(requested) => requested.min(lifetime_limit),
+        None => default_lifetime.min(lifetime_limit),
+    }
 }
 
 fn foreground_process_timeout(timeout_ms: Option<u64>, execution_timeout: Duration) -> Duration {
@@ -5624,12 +5643,24 @@ mod tests {
             Some("running")
         );
         assert_eq!(
+            output.get("requested_lifetime_ms").and_then(serde_json::Value::as_u64),
+            Some(BACKGROUND_TEST_EXECUTION_TIMEOUT_MS)
+        );
+        assert_eq!(
             output.get("lifetime_ms").and_then(serde_json::Value::as_u64),
             Some(BACKGROUND_TEST_EXECUTION_TIMEOUT_MS)
         );
         assert_eq!(
             output.get("max_lifetime_ms").and_then(serde_json::Value::as_u64),
             Some(BACKGROUND_TEST_EXECUTION_TIMEOUT_MS)
+        );
+        assert_eq!(
+            output.get("min_background_lifetime_ms").and_then(serde_json::Value::as_u64),
+            Some(super::MIN_BACKGROUND_PROCESS_LIFETIME_MS)
+        );
+        assert_eq!(
+            output.get("background_lifetime_adjusted").and_then(serde_json::Value::as_bool),
+            Some(false)
         );
         assert!(output
             .get("background_lifetime_note")
@@ -6226,9 +6257,20 @@ mod tests {
         let capped =
             super::background_process_lifetime(Some(60 * 60_000), Duration::from_millis(750));
 
-        assert_eq!(short, Duration::from_millis(100));
+        assert_eq!(short, Duration::from_millis(750));
         assert_eq!(execution_capped, Duration::from_millis(750));
         assert_eq!(capped, Duration::from_millis(750));
+    }
+
+    #[test]
+    fn background_process_lifetime_raises_short_explicit_timeout_when_cap_permits() {
+        let raised =
+            super::background_process_lifetime(Some(15_000), Duration::from_millis(180_000));
+        let capped_by_execution =
+            super::background_process_lifetime(Some(15_000), Duration::from_millis(60_000));
+
+        assert_eq!(raised, Duration::from_millis(super::MIN_BACKGROUND_PROCESS_LIFETIME_MS));
+        assert_eq!(capped_by_execution, Duration::from_millis(60_000));
     }
 
     #[test]
