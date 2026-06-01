@@ -9408,6 +9408,7 @@ fn validate_daemon_compatible_document(document: &toml::Value) -> Result<()> {
     let parsed: RootFileConfig =
         toml::from_str(&content).context("invalid daemon config schema")?;
     validate_model_provider_secret_sources(&parsed)?;
+    validate_model_provider_registry_domains(&parsed)?;
     validate_browser_service_secret_sources(&parsed)?;
     validate_admin_secret_sources(&parsed)?;
     let bind_addr = parsed
@@ -9453,6 +9454,34 @@ fn validate_daemon_compatible_document(document: &toml::Value) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn validate_model_provider_registry_domains(parsed: &RootFileConfig) -> Result<()> {
+    let Some(models) = parsed.model_provider.as_ref().and_then(|provider| provider.models.as_ref())
+    else {
+        return Ok(());
+    };
+
+    for (index, model) in models.iter().enumerate() {
+        if let Some(metadata_source) = model.metadata_source.as_deref() {
+            validate_model_provider_metadata_source(
+                metadata_source,
+                format!("model_provider.models[{index}].metadata_source").as_str(),
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_model_provider_metadata_source(raw: &str, source_name: &str) -> Result<()> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "legacy_migration" | "legacy-migration" | "static" | "discovery" | "operator_override"
+        | "operator-override" => Ok(()),
+        _ => anyhow::bail!(
+            "{source_name} must be one of: legacy_migration, static, discovery, operator_override"
+        ),
+    }
 }
 
 fn validate_model_provider_secret_sources(parsed: &RootFileConfig) -> Result<()> {

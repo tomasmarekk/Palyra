@@ -244,6 +244,56 @@ anthropic_model = "MiniMax-M2.7"
 }
 
 #[test]
+fn config_validate_rejects_provider_registry_metadata_source_before_startup() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let config_path = workdir.path().join("invalid-registry-metadata-source.toml");
+    fs::write(
+        &config_path,
+        r#"
+version = 1
+
+[model_provider]
+kind = "anthropic"
+anthropic_model = "MiniMax-M3"
+
+[[model_provider.providers]]
+provider_id = "minimax-primary"
+kind = "anthropic"
+enabled = true
+auth_provider_kind = "minimax"
+api_key_vault_ref = "global/minimax_api_key"
+
+[[model_provider.models]]
+model_id = "MiniMax-M3"
+provider_id = "minimax-primary"
+role = "chat"
+metadata_source = "live_discovery"
+"#,
+    )
+    .with_context(|| format!("failed to write {}", config_path.display()))?;
+
+    let output = run_cli(
+        &workdir,
+        &["config", "validate", "--path", "invalid-registry-metadata-source.toml"],
+    )?;
+
+    assert!(
+        !output.status.success(),
+        "config validate must reject daemon-incompatible registry metadata_source"
+    );
+    let stderr = String::from_utf8(output.stderr).context("stderr was not UTF-8")?;
+    assert!(
+        stderr.contains("model_provider.models[0].metadata_source must be one of"),
+        "validation should point at the bad registry metadata_source before daemon startup: {stderr}"
+    );
+    assert!(
+        stderr.contains("legacy_migration, static, discovery, operator_override"),
+        "validation should list the daemon-compatible metadata_source values: {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
 fn config_validate_with_explicit_path_rejects_browser_state_key_secret_conflict() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let config_path = workdir.path().join("conflicting-browser-state-key.toml");
