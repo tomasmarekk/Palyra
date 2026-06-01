@@ -2120,6 +2120,7 @@ fn is_windows_command_switch(command: &str, arg: &str) -> bool {
         "tasklist" => {
             matches!(arg.as_str(), "/FI" | "/FO" | "/NH" | "/V" | "/SVC" | "/M" | "/APPS")
         }
+        "findstr" => is_findstr_windows_switch(arg.as_str()),
         "icacls" => matches!(
             arg.as_str(),
             "/C" | "/L" | "/Q" | "/T" | "/INHERITANCE:E" | "/INHERITANCE:D" | "/INHERITANCE:R"
@@ -2127,6 +2128,24 @@ fn is_windows_command_switch(command: &str, arg: &str) -> bool {
         "whoami" => matches!(arg.as_str(), "/ALL"),
         _ => false,
     }
+}
+
+fn is_findstr_windows_switch(arg: &str) -> bool {
+    matches!(
+        arg,
+        "/B" | "/E"
+            | "/L"
+            | "/R"
+            | "/S"
+            | "/I"
+            | "/X"
+            | "/V"
+            | "/N"
+            | "/M"
+            | "/P"
+            | "/OFFLINE"
+            | "/?"
+    ) || arg.starts_with("/C:")
 }
 
 fn option_assignment_value(arg: &str) -> Option<&str> {
@@ -4758,6 +4777,29 @@ mod tests {
             args.as_slice(),
         )
         .expect("tasklist filter switches should not be treated as absolute paths");
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn validate_argument_workspace_scope_allows_findstr_pattern_switches() {
+        let workspace = unique_temp_dir("workspace-findstr-switches");
+        fs::create_dir_all(workspace.join("docs")).expect("workspace directory should be created");
+        fs::write(workspace.join("docs").join("index.md"), "trailing space \n")
+            .expect("fixture file should be written");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let args =
+            vec!["/R".to_owned(), "/N".to_owned(), "/C: $".to_owned(), "docs\\index.md".to_owned()];
+
+        validate_argument_workspace_scope(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            "findstr",
+            args.as_slice(),
+        )
+        .expect("findstr pattern switches should not be treated as absolute paths");
 
         let _ = fs::remove_dir_all(workspace.as_path());
     }

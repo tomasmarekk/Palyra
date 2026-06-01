@@ -1031,11 +1031,23 @@ fn is_patch_header_or_end(line: &str) -> bool {
 
 fn full_file_body_content(line: &str) -> &str {
     if let Some(rest) = line.strip_prefix("+ ") {
-        if rest.chars().next().is_some_and(|character| !character.is_whitespace()) {
+        if rest.is_empty()
+            || rest.chars().next().is_some_and(|character| !character.is_whitespace())
+        {
             return rest;
         }
     }
     line.strip_prefix('+').unwrap_or(line)
+}
+
+fn hunk_context_not_found_message(index: usize, old_lines: &[String]) -> String {
+    let mut message = format!("hunk {index} context not found");
+    if old_lines.iter().any(|line| line.starts_with(" -") || line.starts_with(" +")) {
+        message.push_str(
+            "; if the target file line itself begins with '-' or '+', prefix that content directly with the hunk marker: use '-- markdown item' to remove a '- markdown item' line, or '++value' to add a '+value' line",
+        );
+    }
+    message
 }
 
 fn patch_control_line(line: &str) -> &str {
@@ -1543,7 +1555,7 @@ fn apply_hunks_to_bytes(
         else {
             return Err(WorkspacePatchError::HunkApplyFailed {
                 path: path_label.to_owned(),
-                message: format!("hunk {index} context not found"),
+                message: hunk_context_not_found_message(index, old_lines.as_slice()),
             });
         };
 
@@ -1922,7 +1934,7 @@ mod tests {
         fs::create_dir_all(&workspace).expect("workspace should exist");
         fs::write(workspace.join("script.sh"), "echo old\n").expect("seed file should exist");
 
-        let patch = "*** Begin Patch\n*** Add File: report.md\n+ # Report\n+\n+    indented body\n*** Replace File: script.sh\n+ export PALYRA_READY=1\n+    echo done\n*** End Patch\n";
+        let patch = "*** Begin Patch\n*** Add File: report.md\n+ # Report\n+ \n+    indented body\n*** Replace File: script.sh\n+ export PALYRA_READY=1\n+    echo done\n*** End Patch\n";
         let outcome = apply_workspace_patch(
             std::slice::from_ref(&workspace),
             &default_request(patch, false),
@@ -2448,6 +2460,48 @@ mod tests {
             fs::read_to_string(workspace.join("notes.txt")).expect("seed file should read"),
             "palyra patch e2e ok\n",
             "failed ambiguous patch must leave file unchanged"
+        );
+    }
+
+    #[test]
+    fn apply_workspace_patch_context_error_explains_markdown_list_prefixes() {
+        let temp = tempdir().expect("tempdir should be created");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(workspace.join("docs")).expect("workspace should exist");
+        fs::write(
+            workspace.join("docs").join("index.md"),
+            "- [Install guide](guides/install.md)\n",
+        )
+        .expect("seed file should exist");
+
+        let ambiguous_patch = "*** Begin Patch\n*** Update File: docs/index.md\n@@\n- - [Install guide](guides/install.md)\n+ - [Install guide](guides/setup.md)\n*** End Patch\n";
+        let error = apply_workspace_patch(
+            std::slice::from_ref(&workspace),
+            &default_request(ambiguous_patch, false),
+            &default_limits(),
+        )
+        .expect_err("extra space after the hunk marker should not match markdown list content");
+        let message = error.to_string();
+        assert!(
+            message.contains("-- markdown item"),
+            "error should show how to remove markdown list items: {message}"
+        );
+        assert!(
+            message.contains("++value"),
+            "error should show how to add content beginning with '+': {message}"
+        );
+
+        let exact_patch = "*** Begin Patch\n*** Update File: docs/index.md\n@@\n-- [Install guide](guides/install.md)\n+- [Install guide](guides/setup.md)\n*** End Patch\n";
+        apply_workspace_patch(
+            std::slice::from_ref(&workspace),
+            &default_request(exact_patch, false),
+            &default_limits(),
+        )
+        .expect("direct prefix syntax should edit markdown list content");
+        assert_eq!(
+            fs::read_to_string(workspace.join("docs").join("index.md"))
+                .expect("patched file should read"),
+            "- [Install guide](guides/setup.md)\n"
         );
     }
 
