@@ -90,6 +90,7 @@ use crate::application::{
             execute_memory_retain_tool, execute_memory_search_tool,
             memory_search_tool_output_payload,
         },
+        os_file::execute_os_file_tool,
         routines::execute_routines_tool,
         workspace_patch::{
             execute_workspace_patch_tool, extend_patch_string_defaults,
@@ -530,6 +531,28 @@ fn ensure_tool_context_session(
 
 fn parse_tool_output_json(outcome: &super::ToolExecutionOutcome) -> Value {
     serde_json::from_slice(&outcome.output_json).expect("tool output should parse as JSON")
+}
+
+struct ScopedEnvVar {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl ScopedEnvVar {
+    fn set(key: &'static str, value: &std::path::Path) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for ScopedEnvVar {
+    fn drop(&mut self) {
+        match self.previous.as_ref() {
+            Some(previous) => std::env::set_var(self.key, previous),
+            None => std::env::remove_var(self.key),
+        }
+    }
 }
 
 fn cleanup_test_tool_outcome(success: bool, output: Value) -> super::ToolExecutionOutcome {
@@ -5283,6 +5306,77 @@ async fn memory_delete_tool_deletes_workspace_document_id_from_search() {
     );
     let after_payload = parse_tool_output_json(&search_after_delete);
     assert_eq!(after_payload.get("hit_count").and_then(Value::as_u64), Some(0));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn os_file_allows_absolute_path_inside_launch_workspace_root() {
+    let state = build_test_runtime_state(false);
+    state
+        .create_agent(AgentCreateRequest {
+            agent_id: "os-file-launch-root".to_owned(),
+            display_name: "OS File Launch Root".to_owned(),
+            agent_dir: None,
+            workspace_roots: Vec::new(),
+            default_model_profile: None,
+            execution_backend_preference: None,
+            default_tool_allowlist: Vec::new(),
+            default_skill_allowlist: Vec::new(),
+            set_default: true,
+            allow_absolute_paths: false,
+        })
+        .await
+        .expect("default agent should be created");
+    let context = routines_tool_test_context();
+    ensure_tool_context_session(&state, &context);
+
+    let configured_root =
+        tempfile::tempdir().expect("configured OS root fixture should be created");
+    let _configured_os_roots = ScopedEnvVar::set("PALYRA_OS_FILE_ROOTS", configured_root.path());
+
+    let workspace_root = std::env::current_dir()
+        .expect("repo current_dir should resolve")
+        .join("target")
+        .join(format!("palyra-os-file-launch-root-{}", Ulid::new()));
+    let scenario_dir = workspace_root.join("e2e-workflows").join("agent-file-terminal");
+    fs::create_dir_all(scenario_dir.as_path()).expect("launch workspace should be created");
+    let target_file = scenario_dir.join("agent_math_test.js");
+    let workspace_root_text = workspace_root.to_string_lossy().into_owned();
+    state
+        .start_orchestrator_run(OrchestratorRunStartRequest {
+            run_id: context.run_id.to_owned(),
+            session_id: context.session_id.to_owned(),
+            origin_kind: "os_file_launch_workspace_test".to_owned(),
+            origin_run_id: None,
+            triggered_by_principal: Some(context.principal.to_owned()),
+            parameter_delta_json: Some(
+                json!({
+                    "cli_context": {
+                        "launch_cwd": workspace_root_text,
+                        "workspace_roots": [workspace_root_text],
+                    }
+                })
+                .to_string(),
+            ),
+        })
+        .await
+        .expect("orchestrator run should start with launch workspace metadata");
+
+    let input = json!({
+        "operation": "write",
+        "path": target_file.to_string_lossy(),
+        "content_text": "console.log('ok');\n",
+        "overwrite": true
+    })
+    .to_string();
+    let outcome =
+        execute_os_file_tool(&state, context, "01ARZ3NDEKTSV4RRFFQ69G5FE5", input.as_bytes()).await;
+    assert!(outcome.success, "os_file write should allow launch workspace path: {}", outcome.error);
+    assert_eq!(
+        fs::read_to_string(target_file.as_path()).expect("target file should be written"),
+        "console.log('ok');\n"
+    );
+
+    let _ = fs::remove_dir_all(workspace_root.as_path());
 }
 
 #[tokio::test(flavor = "multi_thread")]
