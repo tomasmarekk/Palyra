@@ -5285,7 +5285,11 @@ fn utf8_slice_by_byte_range(value: &str, offset: usize, max_bytes: usize) -> (St
 }
 
 fn can_read_redacted_text_preview(sensitivity: ToolResultSensitivity, text_preview: bool) -> bool {
-    text_preview && matches!(sensitivity, ToolResultSensitivity::ProviderRawPayload)
+    text_preview
+        && matches!(
+            sensitivity,
+            ToolResultSensitivity::ProviderRawPayload | ToolResultSensitivity::ApprovalRiskData
+        )
 }
 
 fn redact_artifact_content_for_text_preview(content: &[u8]) -> Result<String, JournalError> {
@@ -21087,6 +21091,25 @@ mod tests {
                 .expect("provider payload should serialize"),
             })
             .expect("provider raw artifact should be stored");
+        let approval_risk = store
+            .create_tool_result_artifact(&ToolResultArtifactCreateRequest {
+                artifact_id: "01ARZ3NDEKTSV4RRFFQ69G5P1A".to_owned(),
+                session_id: session_id.to_owned(),
+                run_id: run_id.to_owned(),
+                proposal_id: "01ARZ3NDEKTSV4RRFFQ69G5P1B".to_owned(),
+                tool_name: "palyra.fs.os_file".to_owned(),
+                mime_type: "application/json".to_owned(),
+                sensitivity: ToolResultSensitivity::ApprovalRiskData,
+                retention: ArtifactRetentionPolicy::keep(),
+                redacted_preview: "{\"operation\":\"read_file\"}".to_owned(),
+                content: serde_json::to_vec(&json!({
+                    "operation": "read_file",
+                    "path": "workspace/public/app.js",
+                    "content": "export function safe() { return true; }\n"
+                }))
+                .expect("approval-risk payload should serialize"),
+            })
+            .expect("approval-risk artifact should be stored");
         let stdout_stderr = store
             .create_tool_result_artifact(&ToolResultArtifactCreateRequest {
                 artifact_id: "01ARZ3NDEKTSV4RRFFQ69G5P20".to_owned(),
@@ -21136,6 +21159,46 @@ mod tests {
         assert!(!preview_text.contains("raw-token"));
         assert!(!preview_text.contains("DUMMY_SECRET_SHOULD_NOT_APPEAR"));
         assert!(provider_preview.bytes_base64.is_none());
+
+        let approval_preview = store
+            .read_tool_result_artifact(&ToolResultArtifactReadRequest {
+                artifact_id: approval_risk.artifact_id.clone(),
+                session_id: session_id.to_owned(),
+                run_id: run_id.to_owned(),
+                principal: "user:ops".to_owned(),
+                device_id: "device:local".to_owned(),
+                channel: Some("cli".to_owned()),
+                expected_digest_sha256: None,
+                offset_bytes: 0,
+                max_bytes: 4096,
+                text_preview: true,
+            })
+            .expect("approval-risk artifacts should allow redacted text preview");
+        assert_eq!(approval_preview.visibility, ToolResultVisibility::RedactedPreview);
+        assert!(
+            approval_preview
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains("export function safe")),
+            "approval-risk preview should return readable redacted text"
+        );
+        assert!(approval_preview.bytes_base64.is_none());
+
+        let approval_full_read = store
+            .read_tool_result_artifact(&ToolResultArtifactReadRequest {
+                artifact_id: approval_risk.artifact_id,
+                session_id: session_id.to_owned(),
+                run_id: run_id.to_owned(),
+                principal: "user:ops".to_owned(),
+                device_id: "device:local".to_owned(),
+                channel: Some("cli".to_owned()),
+                expected_digest_sha256: None,
+                offset_bytes: 0,
+                max_bytes: 4096,
+                text_preview: false,
+            })
+            .expect_err("approval-risk full read should stay gated");
+        assert!(matches!(approval_full_read, JournalError::ToolResultArtifactReadDenied { .. }));
 
         let provider_full_read = store
             .read_tool_result_artifact(&ToolResultArtifactReadRequest {
@@ -21204,7 +21267,7 @@ mod tests {
         let artifacts = store
             .list_tool_result_artifacts_for_run(run_id)
             .expect("artifact refs should be listable for replay");
-        assert_eq!(artifacts.len(), 5);
+        assert_eq!(artifacts.len(), 6);
     }
 
     #[test]
