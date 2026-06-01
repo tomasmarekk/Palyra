@@ -246,10 +246,11 @@ async fn execute_control_operation(
         "upsert" => upsert_routine(runtime_state, runtime, context, &payload).await,
         "pause" => set_routine_enabled(runtime_state, runtime, context, &payload, false).await,
         "resume" => set_routine_enabled(runtime_state, runtime, context, &payload, true).await,
+        "delete" => delete_routine(runtime_state, runtime, context, &payload).await,
         "run_now" => run_routine_now(runtime_state, runtime, context, &payload).await,
         "test_run" => test_run_routine(runtime_state, runtime, context, &payload).await,
         _ => Err(
-            "palyra.routines.control operation must be one of upsert|pause|resume|run_now|test_run"
+            "palyra.routines.control operation must be one of upsert|pause|resume|delete|run_now|test_run"
                 .to_owned(),
         ),
     }
@@ -649,6 +650,36 @@ async fn set_routine_enabled(
         "operation": if enabled { "resume" } else { "pause" },
         "routine": routine_view_from_parts(&updated, &routine.metadata),
         "approval": approval,
+    }))
+}
+
+async fn delete_routine(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    runtime: &crate::gateway::RoutinesRuntimeConfig,
+    context: &RoutinesToolContext,
+    payload: &Map<String, Value>,
+) -> Result<Value, String> {
+    let routine_id = required_string_field(payload, "routine_id")?;
+    let routine = load_routine_parts_for_owner(
+        runtime_state,
+        &runtime.registry,
+        routine_id.as_str(),
+        context.principal.as_str(),
+    )
+    .await?;
+    let deleted = runtime_state
+        .delete_cron_job(routine.job.job_id.clone())
+        .await
+        .map_err(sanitize_status_message)?;
+    let _ = runtime
+        .registry
+        .delete_routine(routine.metadata.routine_id.as_str())
+        .map_err(map_registry_error)?;
+    runtime.scheduler_wake.notify_one();
+    Ok(json!({
+        "operation": "delete",
+        "deleted": deleted,
+        "routine_id": routine.metadata.routine_id,
     }))
 }
 

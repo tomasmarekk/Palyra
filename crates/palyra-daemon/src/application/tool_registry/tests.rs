@@ -395,6 +395,18 @@ fn routines_control_schema_discourages_slug_ids_and_short_intervals() {
         .as_str()
         .unwrap_or_default()
         .contains("do not put human slugs here"));
+    assert!(
+        entry.description.contains("operation=delete"),
+        "description should expose cleanup deletion to agents"
+    );
+    assert!(
+        entry.input_schema["properties"]["operation"]["enum"]
+            .as_array()
+            .expect("operation enum should be an array")
+            .iter()
+            .any(|value| value.as_str() == Some("delete")),
+        "operation enum should include delete"
+    );
     assert_eq!(entry.input_schema["properties"]["every_interval_ms"]["minimum"], 30_000);
     assert!(entry.input_schema["properties"]["every_interval_ms"]["description"]
         .as_str()
