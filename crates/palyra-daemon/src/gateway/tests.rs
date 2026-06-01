@@ -337,6 +337,8 @@ fn build_test_runtime_state_with_runtime_overrides(
         max_events: 10_000,
     })
     .expect("journal store should initialize");
+    let model_provider_request_timeout_ms =
+        crate::model_provider::ModelProviderConfig::default().request_timeout_ms;
     GatewayRuntimeState::new(
         GatewayRuntimeConfigSnapshot {
             grpc_bind_addr: "127.0.0.1".to_owned(),
@@ -345,6 +347,7 @@ fn build_test_runtime_state_with_runtime_overrides(
             quic_port: 7444,
             quic_enabled: true,
             orchestrator_runloop_v1_enabled: true,
+            model_provider_request_timeout_ms,
             node_rpc_mtls_required: true,
             admin_auth_required: true,
             vault_get_approval_required_refs: vec!["global/openai_api_key".to_owned()],

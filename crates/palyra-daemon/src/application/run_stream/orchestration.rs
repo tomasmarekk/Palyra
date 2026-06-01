@@ -27,7 +27,7 @@ use crate::{
     gateway::{
         canonical_id, cleanup_run_resources, current_unix_ms, ingest_memory_best_effort, non_empty,
         record_message_router_journal_event, security_requests_json_mode, truncate_with_ellipsis,
-        GatewayRuntimeState, CANCELLED_REASON,
+        GatewayRuntimeConfigSnapshot, GatewayRuntimeState, CANCELLED_REASON,
     },
     journal::{
         MemorySource, OrchestratorCancelRequest, OrchestratorRunMetadataUpdateRequest,
@@ -148,6 +148,21 @@ fn run_stream_attachment_metadata(attachments: &[common_v1::MessageAttachment]) 
             })
         })
         .collect()
+}
+
+fn provider_request_timeout(config: &GatewayRuntimeConfigSnapshot) -> Duration {
+    Duration::from_millis(config.model_provider_request_timeout_ms.max(1))
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn provider_request_timeout_status(run_id: &str, timeout: Duration) -> Status {
+    let timeout_ms = duration_millis_u64(timeout);
+    Status::deadline_exceeded(format!(
+        "model provider turn timed out after {timeout_ms}ms for run {run_id}; no model tokens, tool proposals, or final answer arrived before the deadline. Retry the run, inspect provider connectivity, or increase model_provider.request_timeout_ms for providers that are expected to respond more slowly."
+    ))
 }
 
 fn background_run_budget_tokens(parameter_delta_json: Option<&str>) -> Option<u64> {
@@ -412,6 +427,10 @@ async fn execute_run_stream_provider_request(
             .execute_model_provider_with_lease(provider_request, lease_context)
             .instrument(provider_span),
     );
+    let provider_started_at = TokioInstant::now();
+    let provider_timeout = provider_request_timeout(&runtime_state.config);
+    let provider_deadline = tokio::time::sleep(provider_timeout);
+    tokio::pin!(provider_deadline);
     let mut cancel_poll = interval(Duration::from_millis(100));
     cancel_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut progress_heartbeat = interval_at(
@@ -426,6 +445,9 @@ async fn execute_run_stream_provider_request(
                 return provider_result
                     .map(Box::new)
                     .map(RunStreamProviderRequestOutcome::Completed);
+            }
+            _ = &mut provider_deadline => {
+                return Err(provider_request_timeout_status(run_id, provider_timeout));
             }
             _ = cancel_poll.tick() => {
                 match runtime_state.is_orchestrator_cancel_requested(run_id.to_owned()).await {
@@ -446,13 +468,18 @@ async fn execute_run_stream_provider_request(
             }
             _ = progress_heartbeat.tick() => {
                 if run_state.state() == RunLifecycleState::InProgress {
+                    let elapsed_ms = duration_millis_u64(provider_started_at.elapsed());
+                    let timeout_ms = duration_millis_u64(provider_timeout);
+                    let message = format!(
+                        "waiting for model provider response (elapsed_ms={elapsed_ms}, timeout_ms={timeout_ms})"
+                    );
                     send_status_with_tape(
                         sender,
                         runtime_state,
                         run_id,
                         tape_seq,
                         common_v1::stream_status::StatusKind::InProgress,
-                        "streaming heartbeat",
+                        message.as_str(),
                     )
                     .await?;
                 }
@@ -2296,9 +2323,10 @@ mod tests {
         contains_raw_provider_tool_call_markup, final_answer_recovery_prompt,
         incomplete_final_answer_without_tools, incomplete_terminal_final_answer,
         is_run_stream_response_channel_closed, length_recovery_prompt,
-        repeated_tool_failure_signature, terminal_tool_authorization_failure,
-        tool_result_to_provider_message, truncated_final_answer_without_tools,
-        RepeatedToolFailureTracker, RunStreamToolResultForModel,
+        provider_request_timeout_status, repeated_tool_failure_signature,
+        terminal_tool_authorization_failure, tool_result_to_provider_message,
+        truncated_final_answer_without_tools, RepeatedToolFailureTracker,
+        RunStreamToolResultForModel,
     };
     use super::{AgentLoopTerminationReason, AgentRunLoopState};
     use crate::application::run_stream::tape::RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE;
@@ -2308,6 +2336,7 @@ mod tests {
         ProviderUsage,
     };
     use serde_json::{json, Value};
+    use std::time::Duration;
     use tonic::{Code, Status};
 
     fn loop_state_after_tool(prompt: &str, tool_name: &str) -> AgentRunLoopState {
@@ -2342,6 +2371,19 @@ mod tests {
 
         let internal = Status::new(Code::Internal, RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE);
         assert!(!is_run_stream_response_channel_closed(&internal));
+    }
+
+    #[test]
+    fn provider_request_timeout_status_is_actionable_deadline() {
+        let status = provider_request_timeout_status(
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            Duration::from_millis(1_250),
+        );
+
+        assert_eq!(status.code(), Code::DeadlineExceeded);
+        assert!(status.message().contains("model provider turn timed out after 1250ms"));
+        assert!(status.message().contains("01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+        assert!(status.message().contains("model_provider.request_timeout_ms"));
     }
 
     #[test]

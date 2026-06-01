@@ -2170,6 +2170,7 @@ pub async fn run() -> Result<()> {
             quic_port: loaded.gateway.quic_port,
             quic_enabled: loaded.gateway.quic_enabled,
             orchestrator_runloop_v1_enabled: loaded.orchestrator.runloop_v1_enabled,
+            model_provider_request_timeout_ms: loaded.model_provider.request_timeout_ms,
             node_rpc_mtls_required,
             admin_auth_required: loaded.admin.require_auth,
             vault_get_approval_required_refs: loaded

@@ -89,6 +89,7 @@ pub struct GatewayRuntimeConfigSnapshot {
     pub quic_port: u16,
     pub quic_enabled: bool,
     pub orchestrator_runloop_v1_enabled: bool,
+    pub model_provider_request_timeout_ms: u64,
     pub node_rpc_mtls_required: bool,
     pub admin_auth_required: bool,
     pub vault_get_approval_required_refs: Vec<String>,
