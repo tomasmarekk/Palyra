@@ -45,6 +45,9 @@ use serde_json::{json, Value};
 const MAX_COMMAND_LENGTH: usize = 256;
 const MAX_ARGS_COUNT: usize = 128;
 const MAX_ARG_LENGTH: usize = 4_096;
+const MAX_ENV_COUNT: usize = 32;
+const MAX_ENV_KEY_LENGTH: usize = 128;
+const MAX_ENV_VALUE_LENGTH: usize = 4_096;
 const BUILTIN_LIST_MAX_ENTRIES: usize = 512;
 const BUILTIN_READ_FILE_MAX_BYTES: usize = 64 * 1024;
 const CAPTURE_POLL_INTERVAL_MS: u64 = 5;
@@ -1202,6 +1205,7 @@ fn validate_input_shape(input: &ProcessRunnerInput) -> Result<(), SandboxProcess
             message: format!("palyra.process.run arg exceeds {MAX_ARG_LENGTH} characters"),
         });
     }
+    validate_process_env_overrides(&input.env)?;
     if let Some(timeout_ms) = input.timeout_ms {
         if timeout_ms == 0 {
             return Err(SandboxProcessRunError {
@@ -1211,6 +1215,98 @@ fn validate_input_shape(input: &ProcessRunnerInput) -> Result<(), SandboxProcess
         }
     }
     Ok(())
+}
+
+fn validate_process_env_overrides(
+    env: &std::collections::BTreeMap<String, String>,
+) -> Result<(), SandboxProcessRunError> {
+    if env.len() > MAX_ENV_COUNT {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::InvalidInput,
+            message: format!("palyra.process.run env supports at most {MAX_ENV_COUNT} entries"),
+        });
+    }
+
+    for (key, value) in env {
+        validate_process_env_key(key)?;
+        if value.len() > MAX_ENV_VALUE_LENGTH {
+            return Err(SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::InvalidInput,
+                message: format!(
+                    "palyra.process.run env value for key '{}' exceeds {MAX_ENV_VALUE_LENGTH} characters",
+                    redact_env_key_for_error(key)
+                ),
+            });
+        }
+        if value.contains('\0') {
+            return Err(SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::InvalidInput,
+                message: format!(
+                    "palyra.process.run env value for key '{}' contains a NUL byte",
+                    redact_env_key_for_error(key)
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_process_env_key(key: &str) -> Result<(), SandboxProcessRunError> {
+    let trimmed = key.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > MAX_ENV_KEY_LENGTH
+        || trimmed != key
+        || !valid_process_env_key_shape(trimmed)
+    {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::InvalidInput,
+            message: "palyra.process.run env keys must match [A-Za-z_][A-Za-z0-9_]*".to_owned(),
+        });
+    }
+
+    if process_env_key_is_reserved(trimmed) {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::InvalidInput,
+            message: format!(
+                "palyra.process.run env key '{}' is reserved by the runtime; pass fixture values with a task-specific key such as PALYRA_E2E_HOME instead of overriding sandbox path, loader, or Palyra config variables",
+                redact_env_key_for_error(trimmed)
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+fn valid_process_env_key_shape(key: &str) -> bool {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn process_env_key_is_reserved(key: &str) -> bool {
+    matches!(
+        key.to_ascii_uppercase().as_str(),
+        "PATH"
+            | "PATHEXT"
+            | "LD_PRELOAD"
+            | "LD_LIBRARY_PATH"
+            | "DYLD_INSERT_LIBRARIES"
+            | "DYLD_LIBRARY_PATH"
+            | "PALYRA_CONFIG"
+            | "PALYRA_STATE_ROOT"
+            | "PALYRA_HOME"
+            | "PALYRA_CLI_PROFILE"
+            | "PALYRA_CLI_PROFILES_PATH"
+            | "PALYRA_VAULT_DIR"
+    )
+}
+
+fn redact_env_key_for_error(key: &str) -> String {
+    key.chars().take(MAX_ENV_KEY_LENGTH).collect()
 }
 
 fn process_runner_command_with_args_message(command: &str) -> String {
@@ -3409,6 +3505,7 @@ fn build_process_command(
             program.as_path(),
             workspace_root,
         );
+        apply_process_env_overrides(&mut command, input);
         return Ok(command);
     }
 
@@ -3442,6 +3539,7 @@ fn build_process_command(
             .env("PATH", sandbox_process_path())
             .env("LANG", "C")
             .env("LC_ALL", "C");
+        apply_process_env_overrides(&mut command, input);
         return Ok(command);
     }
 
@@ -3453,7 +3551,14 @@ fn build_process_command(
         program.as_path(),
         policy,
     );
+    apply_process_env_overrides(&mut command, input);
     Ok(command)
+}
+
+fn apply_process_env_overrides(command: &mut Command, input: &ProcessRunnerInput) {
+    for (key, value) in &input.env {
+        command.env(key, value);
+    }
 }
 
 fn build_tier_b_process_command(
@@ -4079,6 +4184,7 @@ fn reserve_output_budget(remaining_budget: &AtomicUsize, requested_bytes: usize)
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         fs, io,
         path::{Path, PathBuf},
         process::Command,
@@ -4095,10 +4201,10 @@ mod tests {
         run_constrained_process, validate_argument_workspace_scope, validate_cmd_invocation_shape,
         validate_host_argument_scope, validate_host_interpreter_argument_guardrails,
         validate_interpreter_argument_guardrails, validate_no_embedded_command_line_arg,
-        validate_process_termination_scope, validate_runtime_egress_enforcement,
-        EgressEnforcementMode, ProcessRunnerInput, SandboxProcessRunErrorKind,
-        SandboxProcessRunnerPolicy, SandboxProcessRunnerTier, StreamCapture,
-        BACKGROUND_MONITOR_POLL_MS, BACKGROUND_TERMINATION_WAIT_MS,
+        validate_process_env_overrides, validate_process_termination_scope,
+        validate_runtime_egress_enforcement, EgressEnforcementMode, ProcessRunnerInput,
+        SandboxProcessRunErrorKind, SandboxProcessRunnerPolicy, SandboxProcessRunnerTier,
+        StreamCapture, BACKGROUND_MONITOR_POLL_MS, BACKGROUND_TERMINATION_WAIT_MS,
     };
 
     const BACKGROUND_TEST_EXECUTION_TIMEOUT_MS: u64 = 10_000;
@@ -4505,6 +4611,7 @@ mod tests {
             command: "node".to_owned(),
             args: vec!["/".to_owned(), "--config=/workspace/e2e-file-workflow/test.js".to_owned()],
             cwd: None,
+            env: Default::default(),
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
@@ -4763,6 +4870,7 @@ mod tests {
             command: "node".to_owned(),
             args: vec!["node -e \"(() => console.log('ok'))()\"".to_owned()],
             cwd: None,
+            env: Default::default(),
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
@@ -4773,6 +4881,19 @@ mod tests {
 
         assert_eq!(error.kind, SandboxProcessRunErrorKind::InvalidInput);
         assert!(error.message.contains("split each argument"), "{}", error.message);
+    }
+
+    #[test]
+    fn process_runner_env_overrides_accept_fixture_keys_and_reject_reserved_runtime_keys() {
+        let mut env = BTreeMap::new();
+        env.insert("PALYRA_E2E_HOME".to_owned(), "/tmp/palyra-e2e-home".to_owned());
+        validate_process_env_overrides(&env).expect("fixture env keys should be accepted");
+
+        env.insert("PATH".to_owned(), "/tmp/bin".to_owned());
+        let error =
+            validate_process_env_overrides(&env).expect_err("PATH overrides must be reserved");
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::InvalidInput);
+        assert!(error.message.contains("reserved by the runtime"), "{}", error.message);
     }
 
     #[test]
@@ -6058,6 +6179,34 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
+    fn run_constrained_process_applies_explicit_env_without_shell_wrapper() {
+        if Command::new("node").arg("--version").output().is_err() {
+            return;
+        }
+        let workspace = unique_temp_dir("workspace-node-env");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        let mut policy =
+            sandbox_policy_with_allowed_executables(workspace.clone(), vec!["node".to_owned()]);
+        policy.allow_interpreters = true;
+        policy.egress_enforcement_mode = EgressEnforcementMode::None;
+        let input = br#"{"command":"node","args":["-e","console.log(process.env.PALYRA_E2E_HOME || 'missing')"],"env":{"PALYRA_E2E_HOME":"C:\\Users\\Palo\\AppData\\Local\\Palyra-TestHarness\\home\\S100"}}"#;
+
+        let result = run_constrained_process(&policy, input, Duration::from_millis(20_000))
+            .expect("explicit process env should be applied without shell syntax");
+        let output: serde_json::Value =
+            serde_json::from_slice(&result.output_json).expect("output should parse");
+
+        assert_eq!(output.get("exit_code").and_then(serde_json::Value::as_i64), Some(0));
+        assert_eq!(
+            output.get("stdout").and_then(serde_json::Value::as_str),
+            Some("C:\\Users\\Palo\\AppData\\Local\\Palyra-TestHarness\\home\\S100\n")
+        );
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn run_constrained_process_timeout_terminates_node_process_tree_when_available() {
         if Command::new("node").arg("--version").output().is_err() {
             return;
@@ -6367,6 +6516,7 @@ mod tests {
                 "README.md".to_owned(),
             ],
             cwd: None,
+            env: Default::default(),
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,

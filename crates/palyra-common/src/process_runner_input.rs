@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -10,6 +12,8 @@ pub struct ProcessRunnerToolInput {
     pub args: Vec<String>,
     #[serde(default)]
     pub cwd: Option<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub requested_egress_hosts: Vec<String>,
     #[serde(default)]
@@ -102,9 +106,20 @@ mod tests {
         assert_eq!(parsed.command, "uname");
         assert_eq!(parsed.args, vec!["-a"]);
         assert_eq!(parsed.cwd.as_deref(), Some("workspace"));
+        assert!(parsed.env.is_empty());
         assert_eq!(parsed.requested_egress_hosts, vec!["api.example.com"]);
         assert_eq!(parsed.timeout_ms, None);
         assert!(!parsed.background);
+    }
+
+    #[test]
+    fn parse_process_runner_tool_input_accepts_env_map() {
+        let input =
+            br#"{"command":"node","args":["server.mjs"],"env":{"PALYRA_E2E_HOME":"C:\\tmp\\home"}}"#;
+        let parsed = parse_process_runner_tool_input(input)
+            .expect("valid process-runner env payload should parse");
+
+        assert_eq!(parsed.env.get("PALYRA_E2E_HOME").map(String::as_str), Some("C:\\tmp\\home"));
     }
 
     #[test]

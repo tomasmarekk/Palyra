@@ -671,6 +671,15 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                         json!({"type":"string","description":"Workspace-confined working directory. Omit for the workspace root, or use /workspace and /workspace/subdir as virtual workspace aliases."}),
                     ),
                     (
+                        "env",
+                        json!({
+                            "type":"object",
+                            "additionalProperties":{"type":"string"},
+                            "maxProperties":32,
+                            "description":"Optional environment variables for this child process, for fixture and local app settings such as PALYRA_E2E_HOME. Values are applied without shell syntax, after the sandbox base environment. Reserved runtime/path keys such as PATH, PATHEXT, PALYRA_CONFIG, PALYRA_STATE_ROOT, PALYRA_HOME, PALYRA_CLI_PROFILE, PALYRA_CLI_PROFILES_PATH, PALYRA_VAULT_DIR, LD_PRELOAD, LD_LIBRARY_PATH, DYLD_INSERT_LIBRARIES, and DYLD_LIBRARY_PATH are rejected."
+                        }),
+                    ),
+                    (
                         "background",
                         json!({
                             "type":"boolean",
@@ -1209,6 +1218,15 @@ mod tests {
             .and_then(serde_json::Value::as_str)
             .expect("cwd description should be visible to models");
         assert!(cwd_description.contains("/workspace/subdir"));
+
+        let env_description = entry
+            .input_schema
+            .pointer("/properties/env/description")
+            .and_then(serde_json::Value::as_str)
+            .expect("env description should be visible to models");
+        assert!(env_description.contains("PALYRA_E2E_HOME"));
+        assert!(env_description.contains("without shell syntax"));
+        assert!(env_description.contains("PATH"));
 
         let background_description = entry
             .input_schema
