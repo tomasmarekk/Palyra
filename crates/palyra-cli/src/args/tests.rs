@@ -2364,6 +2364,26 @@ fn parse_memory_search_all_accepts_query_and_limit_aliases() {
 }
 
 #[test]
+fn parse_memory_search_all_requires_query_or_query_option() {
+    let missing = Cli::try_parse_from(["palyra", "memory", "search-all", "--json"])
+        .expect_err("search-all should require a positional query or --query");
+    let missing_text = missing.to_string();
+    assert!(
+        missing_text.contains("<QUERY>"),
+        "missing query error should show the required positional argument: {missing_text}"
+    );
+
+    let ambiguous =
+        Cli::try_parse_from(["palyra", "memory", "search-all", "positional", "--query", "flagged"])
+            .expect_err("search-all should reject ambiguous positional and --query inputs");
+    let ambiguous_text = ambiguous.to_string();
+    assert!(
+        ambiguous_text.contains("cannot be used with"),
+        "ambiguous query error should explain the conflict: {ambiguous_text}"
+    );
+}
+
+#[test]
 fn parse_memory_get_delete_replace() {
     let get = Cli::parse_from(["palyra", "memory", "get", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "--json"]);
     assert_eq!(

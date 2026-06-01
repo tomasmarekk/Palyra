@@ -153,9 +153,13 @@ pub enum MemoryCommand {
     },
     #[command(name = "search-all")]
     SearchAll {
-        #[arg(value_name = "QUERY")]
+        #[arg(
+            value_name = "QUERY",
+            required_unless_present = "query_option",
+            conflicts_with = "query_option"
+        )]
         query: Option<String>,
-        #[arg(long = "query", value_name = "QUERY")]
+        #[arg(long = "query", value_name = "QUERY", conflicts_with = "query")]
         query_option: Option<String>,
         #[arg(long)]
         session: Option<String>,
