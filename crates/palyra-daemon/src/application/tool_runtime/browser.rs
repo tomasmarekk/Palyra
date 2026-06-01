@@ -23,7 +23,11 @@ use ulid::Ulid;
 
 use crate::{
     agents::AgentResolveRequest,
-    application::tool_runtime::workspace_scope::workspace_roots_with_run_launch_context,
+    application::tool_runtime::workspace_scope::{
+        relative_path_already_targets_active_root, relative_path_should_use_active_root,
+        session_active_workspace_root, workspace_roots_with_run_launch_context,
+        ActiveWorkspaceRoot,
+    },
     gateway::{
         current_unix_ms, truncate_with_ellipsis, BrowserServiceRuntimeConfig, GatewayRuntimeState,
         ToolRuntimeExecutionContext, BROWSER_CLICK_TOOL_NAME, BROWSER_CONSOLE_LOG_TOOL_NAME,
@@ -436,10 +440,18 @@ async fn save_browser_output_file_from_payload(
     let workspace_roots = resolve_browser_agent_workspace_roots(runtime_state, context, tool_name)
         .await
         .map_err(|error| format!("{tool_name} failed to resolve output workspace: {error}"))?;
+    let active_workspace_root = session_active_workspace_root(
+        runtime_state,
+        context.session_id,
+        workspace_roots.as_slice(),
+    )
+    .await
+    .map_err(|error| format!("{tool_name} failed to resolve active output workspace: {error}"))?;
     let target = resolve_browser_output_path(
         tool_name,
         output_path,
         workspace_roots.as_slice(),
+        active_workspace_root.as_ref(),
         browser_user_owned_os_roots().as_slice(),
     )?;
     fs::write(target.as_path(), bytes).map_err(|error| {
@@ -458,6 +470,7 @@ fn resolve_browser_output_path(
     tool_name: &str,
     output_path: &str,
     workspace_roots: &[PathBuf],
+    active_workspace_root: Option<&ActiveWorkspaceRoot>,
     user_owned_roots: &[PathBuf],
 ) -> Result<PathBuf, String> {
     let requested = PathBuf::from(output_path);
@@ -469,7 +482,10 @@ fn resolve_browser_output_path(
             "output_path",
             &requested,
         )?;
-        let Some(root) = workspace_roots.first() else {
+        let Some(root) =
+            browser_relative_output_base_root(output_path, workspace_roots, active_workspace_root)
+                .or_else(|| workspace_roots.first().cloned())
+        else {
             return Err(format!("{tool_name} agent has no workspace root"));
         };
         return prepare_browser_output_target(
@@ -479,6 +495,38 @@ fn resolve_browser_output_path(
         );
     };
     prepare_browser_output_target(tool_name, requested.as_path(), allowed_roots.as_slice())
+}
+
+fn browser_relative_output_base_root(
+    output_path: &str,
+    workspace_roots: &[PathBuf],
+    active_workspace_root: Option<&ActiveWorkspaceRoot>,
+) -> Option<PathBuf> {
+    let active_workspace_root = active_workspace_root?;
+    if relative_path_should_use_active_root(output_path, active_workspace_root) {
+        return Some(active_workspace_root.root.clone());
+    }
+    if relative_path_already_targets_active_root(output_path, active_workspace_root) {
+        return workspace_root_for_active_relative_path(workspace_roots, active_workspace_root);
+    }
+    None
+}
+
+fn workspace_root_for_active_relative_path(
+    workspace_roots: &[PathBuf],
+    active_workspace_root: &ActiveWorkspaceRoot,
+) -> Option<PathBuf> {
+    let canonical_active = fs::canonicalize(active_workspace_root.root.as_path()).ok()?;
+    let active_relative_path = Path::new(active_workspace_root.relative_path.as_str());
+    workspace_roots.iter().find_map(|root| {
+        let candidate = root.join(active_relative_path);
+        let canonical_candidate = fs::canonicalize(candidate.as_path()).ok()?;
+        if canonical_candidate == canonical_active {
+            Some(root.clone())
+        } else {
+            None
+        }
+    })
 }
 
 fn prepare_browser_output_target(
@@ -4079,6 +4127,7 @@ mod tests {
         parse_browser_download_artifact_id, resolve_browser_output_path,
         validate_browser_workspace_relative_path, BROWSER_CALLER_PRINCIPAL_HEADER,
     };
+    use crate::application::tool_runtime::workspace_scope::ActiveWorkspaceRoot;
     use crate::gateway::{
         BROWSER_CLICK_TOOL_NAME, BROWSER_DOWNLOADS_GET_TOOL_NAME, BROWSER_NAVIGATE_TOOL_NAME,
         BROWSER_OBSERVE_TOOL_NAME, BROWSER_RELOAD_TOOL_NAME, BROWSER_SESSION_CLOSE_TOOL_NAME,
@@ -4350,6 +4399,7 @@ mod tests {
             "palyra.browser.screenshot",
             "artifacts/visual-smoke.png",
             std::slice::from_ref(&canonical_workspace),
+            None,
             &[],
         )
         .expect("relative browser output path should resolve");
@@ -4380,11 +4430,79 @@ mod tests {
             "palyra.browser.screenshot",
             "reports/visual-smoke.png",
             &[canonical_launch.clone(), canonical_default],
+            None,
             &[],
         )
         .expect("relative browser output path should resolve");
 
         assert!(output.starts_with(canonical_launch.as_path()));
+    }
+
+    #[test]
+    fn browser_output_path_uses_active_workspace_for_short_relative_artifact() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let repo_launch = temp.path().join("repo-launch");
+        let harness_root = temp.path().join("Palyra-TestHarness");
+        let active_workspace = harness_root.join("scenario-workspaces").join("S006_save_bug");
+        std::fs::create_dir_all(repo_launch.as_path()).expect("repo launch should exist");
+        std::fs::create_dir_all(active_workspace.as_path()).expect("active workspace should exist");
+        let canonical_repo = repo_launch.canonicalize().expect("repo should canonicalize");
+        let canonical_harness = harness_root.canonicalize().expect("harness should canonicalize");
+        let canonical_active =
+            active_workspace.canonicalize().expect("active workspace should canonicalize");
+        let active = ActiveWorkspaceRoot {
+            root: canonical_active.clone(),
+            relative_path: "scenario-workspaces/S006_save_bug".to_owned(),
+        };
+
+        let output = resolve_browser_output_path(
+            "palyra.browser.screenshot",
+            "evidence-after-fix.png",
+            &[canonical_repo, canonical_harness],
+            Some(&active),
+            &[],
+        )
+        .expect("short relative browser output path should resolve inside active workspace");
+
+        assert!(output.starts_with(canonical_active.as_path()));
+        assert_eq!(
+            output.file_name().and_then(|value| value.to_str()),
+            Some("evidence-after-fix.png")
+        );
+    }
+
+    #[test]
+    fn browser_output_path_keeps_active_relative_prefix_under_owning_workspace() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let repo_launch = temp.path().join("repo-launch");
+        let harness_root = temp.path().join("Palyra-TestHarness");
+        let active_workspace = harness_root.join("scenario-workspaces").join("S006_save_bug");
+        std::fs::create_dir_all(repo_launch.as_path()).expect("repo launch should exist");
+        std::fs::create_dir_all(active_workspace.as_path()).expect("active workspace should exist");
+        let canonical_repo = repo_launch.canonicalize().expect("repo should canonicalize");
+        let canonical_harness = harness_root.canonicalize().expect("harness should canonicalize");
+        let canonical_active =
+            active_workspace.canonicalize().expect("active workspace should canonicalize");
+        let active = ActiveWorkspaceRoot {
+            root: canonical_active.clone(),
+            relative_path: "scenario-workspaces/S006_save_bug".to_owned(),
+        };
+
+        let output = resolve_browser_output_path(
+            "palyra.browser.screenshot",
+            "scenario-workspaces/S006_save_bug/evidence-after-fix.png",
+            &[canonical_repo.clone(), canonical_harness],
+            Some(&active),
+            &[],
+        )
+        .expect("prefixed relative browser output path should resolve inside active workspace");
+
+        assert!(output.starts_with(canonical_active.as_path()));
+        assert!(!output.starts_with(canonical_repo.as_path()));
+        assert_eq!(
+            output.file_name().and_then(|value| value.to_str()),
+            Some("evidence-after-fix.png")
+        );
     }
 
     #[test]
@@ -4400,6 +4518,7 @@ mod tests {
             "palyra.browser.screenshot",
             "../outside/smoke.png",
             std::slice::from_ref(&canonical_workspace),
+            None,
             &[],
         )
         .expect_err("relative traversal should be rejected");
@@ -4410,6 +4529,7 @@ mod tests {
             "palyra.browser.screenshot",
             absolute_outside.to_string_lossy().as_ref(),
             &[canonical_workspace],
+            None,
             &[],
         )
         .expect_err("unapproved absolute path should be rejected");
