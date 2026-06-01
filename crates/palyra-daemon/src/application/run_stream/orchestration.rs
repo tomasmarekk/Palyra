@@ -1399,6 +1399,26 @@ pub(crate) async fn process_run_stream_message(
                     .await?;
                     return Ok(RunStreamMessageProcessingOutcome::Terminate);
                 }
+                if should_terminate_after_tool_budget_exhausted(&loop_state, tool_result_count) {
+                    let message = agent_loop_budget_exhausted_message(
+                        AgentLoopTerminationReason::MaxToolCalls,
+                        &loop_state,
+                        run_id.as_str(),
+                    );
+                    terminate_run_stream_with_agent_loop_reason(
+                        sender,
+                        runtime_state,
+                        run_state,
+                        run_id.as_str(),
+                        tape_seq,
+                        &loop_state,
+                        AgentLoopTerminationReason::MaxToolCalls,
+                        message.as_str(),
+                        provider_trace_ref,
+                    )
+                    .await?;
+                    return Ok(RunStreamMessageProcessingOutcome::Terminate);
+                }
                 maybe_compact_context_after_tool_results(
                     runtime_state,
                     request_context,
@@ -1831,6 +1851,7 @@ fn agent_loop_budget_exhausted_message(
     let snapshot = loop_state.snapshot(run_id, Some(reason));
     let base = match reason {
         AgentLoopTerminationReason::MaxTurns => "agent loop model turn limit reached",
+        AgentLoopTerminationReason::MaxToolCalls => "agent loop tool call limit reached",
         AgentLoopTerminationReason::WallClock => "agent loop wall-clock budget exhausted",
         _ => "agent loop budget exhausted",
     };
@@ -1840,6 +1861,13 @@ fn agent_loop_budget_exhausted_message(
         "{base} after {} model turns and {} {tool_result_label}; partial tool evidence is recorded on the run tape. Continue in the same session and ask to resume from run {run_id}; increase tool_call.max_calls_per_run for unusually large workflows.",
         snapshot.current_turn, snapshot.completed_tool_calls
     )
+}
+
+fn should_terminate_after_tool_budget_exhausted(
+    loop_state: &AgentRunLoopState,
+    tool_result_count: usize,
+) -> bool {
+    tool_result_count > 0 && loop_state.remaining_tool_calls() == 0
 }
 
 fn length_recovery_prompt(
@@ -2324,9 +2352,9 @@ mod tests {
         incomplete_final_answer_without_tools, incomplete_terminal_final_answer,
         is_run_stream_response_channel_closed, length_recovery_prompt,
         provider_request_timeout_status, repeated_tool_failure_signature,
-        terminal_tool_authorization_failure, tool_result_to_provider_message,
-        truncated_final_answer_without_tools, RepeatedToolFailureTracker,
-        RunStreamToolResultForModel,
+        should_terminate_after_tool_budget_exhausted, terminal_tool_authorization_failure,
+        tool_result_to_provider_message, truncated_final_answer_without_tools,
+        RepeatedToolFailureTracker, RunStreamToolResultForModel,
     };
     use super::{AgentLoopTerminationReason, AgentRunLoopState};
     use crate::application::run_stream::tape::RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE;
@@ -2548,6 +2576,33 @@ mod tests {
         assert!(message.contains("partial tool evidence"));
         assert!(message.contains("resume from run 01ARZ3NDEKTSV4RRFFQ69G5FAV"));
         assert!(message.contains("tool_call.max_calls_per_run"));
+    }
+
+    #[test]
+    fn tool_budget_exhausted_message_names_tool_call_limit() {
+        let state = loop_state_after_tool("clean up generated files", "palyra.fs.apply_patch");
+
+        let message = agent_loop_budget_exhausted_message(
+            AgentLoopTerminationReason::MaxToolCalls,
+            &state,
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        );
+
+        assert!(message.contains("tool call limit reached"));
+        assert!(message.contains("partial tool evidence"));
+        assert!(message.contains("resume from run 01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+    }
+
+    #[test]
+    fn tool_budget_exhaustion_after_result_batch_terminates_loop() {
+        let mut state = loop_state_after_tool("clean up generated files", "palyra.fs.apply_patch");
+        state.sync_remaining_tool_calls(0);
+
+        assert!(should_terminate_after_tool_budget_exhausted(&state, 1));
+        assert!(!should_terminate_after_tool_budget_exhausted(&state, 0));
+
+        state.sync_remaining_tool_calls(1);
+        assert!(!should_terminate_after_tool_budget_exhausted(&state, 1));
     }
 
     #[test]
