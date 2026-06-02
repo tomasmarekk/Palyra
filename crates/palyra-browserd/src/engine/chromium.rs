@@ -3939,6 +3939,18 @@ pub(crate) async fn set_viewport_with_chromium(
                     error,
                 };
             }
+            if let Some(error) =
+                chromium_viewport_mismatch_error(width, height, actual_width, actual_height, mobile)
+            {
+                return ChromiumViewportOutcome {
+                    success: false,
+                    width: actual_width,
+                    height: actual_height,
+                    device_scale_factor: actual_device_scale_factor,
+                    mobile,
+                    error,
+                };
+            }
             ChromiumViewportOutcome {
                 success: true,
                 width: actual_width,
@@ -3959,6 +3971,21 @@ pub(crate) async fn set_viewport_with_chromium(
     }
 }
 
+fn chromium_viewport_mismatch_error(
+    requested_width: u32,
+    requested_height: u32,
+    actual_width: u32,
+    actual_height: u32,
+    mobile: bool,
+) -> Option<String> {
+    if actual_width == requested_width && actual_height == requested_height {
+        return None;
+    }
+    Some(format!(
+        "Chromium viewport metrics did not match requested CSS viewport: requested_width={requested_width} requested_height={requested_height} actual_width={actual_width} actual_height={actual_height} mobile={mobile}. Retry without mobile emulation or inspect layout_metrics before relying on visual assertions."
+    ))
+}
+
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
@@ -3966,7 +3993,7 @@ mod tests {
         chromium_network_log_headers, chromium_read_document_cookies_script,
         chromium_read_local_storage_script, chromium_restore_local_storage_script,
         chromium_touch_emulation_max_touch_points, chromium_transport_idle_timeout,
-        chromium_upload_staging_path, clamp_chromium_snapshot,
+        chromium_upload_staging_path, chromium_viewport_mismatch_error, clamp_chromium_snapshot,
         decode_chromium_console_entries_value, decode_chromium_json_script_value,
         decode_chromium_network_entries_value, decode_chromium_observe_state_value,
         page_body_with_chromium_observe_state, parse_chromium_client_download_entries,
@@ -4373,6 +4400,22 @@ mod tests {
         assert_eq!(width, 375);
         assert_eq!(height, 667);
         assert_eq!(device_scale_factor, 2.0);
+    }
+
+    #[test]
+    fn chromium_viewport_mismatch_allows_exact_css_viewport() {
+        assert!(chromium_viewport_mismatch_error(375, 812, 375, 812, true).is_none());
+    }
+
+    #[test]
+    fn chromium_viewport_mismatch_reports_actual_css_viewport() {
+        let error = chromium_viewport_mismatch_error(375, 812, 1040, 2252, true)
+            .expect("mismatched mobile viewport must fail loudly");
+
+        assert!(error.contains("requested_width=375"));
+        assert!(error.contains("actual_width=1040"));
+        assert!(error.contains("mobile=true"));
+        assert!(error.contains("Retry without mobile emulation"));
     }
 
     #[test]
