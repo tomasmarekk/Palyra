@@ -581,11 +581,47 @@ async fn resolve_workspace_file_roots(
             if requested_path.is_empty()
                 || relative_path_should_use_active_root(requested_path, &active_root)
             {
-                return Ok(vec![active_root.root]);
+                return Ok(workspace_roots_with_active_first(
+                    active_root.root,
+                    agent_workspace_roots,
+                ));
             }
         }
     }
     Ok(agent_workspace_roots.to_vec())
+}
+
+fn workspace_roots_with_active_first(
+    active_root: PathBuf,
+    workspace_roots: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut roots = Vec::with_capacity(workspace_roots.len().saturating_add(1));
+    roots.push(active_root);
+    for root in workspace_roots {
+        if roots.iter().any(|existing| same_workspace_file_root(existing, root)) {
+            continue;
+        }
+        roots.push(root.clone());
+    }
+    roots
+}
+
+fn same_workspace_file_root(left: &Path, right: &Path) -> bool {
+    let left = fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
+    let right = fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
+    if left == right {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        left.to_string_lossy()
+            .replace('\\', "/")
+            .eq_ignore_ascii_case(&right.to_string_lossy().replace('\\', "/"))
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -2646,6 +2682,33 @@ mod tests {
         assert_eq!(output.entries[0].size_bytes, Some(5));
         assert_eq!(output.entries[2].kind, "directory");
         assert_eq!(output.entries[2].size_bytes, None);
+    }
+
+    #[test]
+    fn list_workspace_dir_falls_back_after_active_root_miss() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let launch_root = tempdir.path().join("S097_cross_boundary_audit");
+        let active_root = tempdir.path().join("home").join("S097").join(".config");
+        fs::create_dir_all(launch_root.join("config")).expect("launch config dir should exist");
+        fs::create_dir_all(active_root.join("palyra-e2e")).expect("active config dir should exist");
+        fs::write(launch_root.join("config").join("app.toml"), "mode = 'safe'\n")
+            .expect("workspace config should exist");
+        fs::write(active_root.join("palyra-e2e").join("settings.toml"), "mode = 'user'\n")
+            .expect("home config should exist");
+
+        let roots =
+            workspace_roots_with_active_first(active_root, std::slice::from_ref(&launch_root));
+        let input = parse_workspace_list_dir_input(br#"{"path":"config","max_entries":10}"#)
+            .expect("list input should parse");
+        let output = list_workspace_dir_from_roots(roots.as_slice(), &input)
+            .expect("list_dir should fall back to launch workspace");
+
+        assert_eq!(output.path, "config");
+        assert_eq!(output.workspace_root_index, 1);
+        assert_eq!(
+            output.entries.iter().map(|entry| entry.path.as_str()).collect::<Vec<_>>(),
+            vec!["config/app.toml"]
+        );
     }
 
     #[test]
