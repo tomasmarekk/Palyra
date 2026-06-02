@@ -41,6 +41,8 @@ const DEFAULT_ROUTINE_PAGE_LIMIT: usize = 100;
 const MAX_ROUTINE_PAGE_LIMIT: usize = 500;
 const ROUTINE_APPROVAL_TIMEOUT_SECONDS: u32 = 900;
 const ROUTINE_APPROVAL_DEVICE_ID: &str = "system:routines";
+const DEFAULT_ROUTINE_RETRY_MAX_ATTEMPTS: u32 = 2;
+const DEFAULT_ROUTINE_RETRY_BACKOFF_MS: u64 = 1_000;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleRoutineListQuery {
@@ -2558,8 +2560,8 @@ fn parse_retry_policy(
     backoff_ms: Option<u64>,
 ) -> Result<CronRetryPolicy, Response> {
     Ok(CronRetryPolicy {
-        max_attempts: max_attempts.unwrap_or(1).max(1),
-        backoff_ms: backoff_ms.unwrap_or(1_000).max(1),
+        max_attempts: max_attempts.unwrap_or(DEFAULT_ROUTINE_RETRY_MAX_ATTEMPTS).max(1),
+        backoff_ms: backoff_ms.unwrap_or(DEFAULT_ROUTINE_RETRY_BACKOFF_MS).max(1),
     })
 }
 

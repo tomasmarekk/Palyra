@@ -2462,7 +2462,7 @@ async fn run_job_with_retries(
                     .await?;
                 let cron_max_runs_exhausted =
                     disable_cron_if_max_runs_exhausted(Arc::clone(&state), &job).await?.is_some();
-                if cron_max_runs_exhausted || attempt >= max_attempts {
+                if cron_max_runs_exhausted || !failure.retryable || attempt >= max_attempts {
                     wake_signal.notify_one();
                     return Ok(());
                 }
@@ -2480,6 +2480,7 @@ async fn run_job_with_retries(
 struct SchedulerAttemptFailure {
     error_kind: String,
     error_message_redacted: String,
+    retryable: bool,
 }
 
 fn scheduler_attempt_failure(error: &Status, attempt: u32) -> SchedulerAttemptFailure {
@@ -2501,13 +2502,21 @@ fn scheduler_attempt_failure(error: &Status, attempt: u32) -> SchedulerAttemptFa
         || normalized.contains("max output tokens")
     {
         "provider_output_limited"
+    } else if normalized.contains("malformed_response")
+        || normalized.contains("model provider response invalid")
+        || normalized.contains("response json parsing failed")
+        || normalized.contains("json parsing failed")
+    {
+        "provider_malformed_response"
     } else {
         "scheduler_internal"
     };
+    let retryable = matches!(error_kind, "provider_unavailable" | "provider_malformed_response");
     let sanitized = crate::model_provider::sanitize_remote_error(raw_message);
     SchedulerAttemptFailure {
         error_kind: error_kind.to_owned(),
         error_message_redacted: format!("cron attempt {attempt} failed: {sanitized}"),
+        retryable,
     }
 }
 
@@ -3382,6 +3391,7 @@ mod tests {
         );
 
         assert_eq!(failure.error_kind, "provider_unavailable");
+        assert!(failure.retryable);
         assert!(failure.error_message_redacted.contains("HTTP 529"));
     }
 
@@ -3395,7 +3405,22 @@ mod tests {
         );
 
         assert_eq!(failure.error_kind, "provider_output_limited");
+        assert!(!failure.retryable);
         assert!(failure.error_message_redacted.contains("finish_reason=length"));
+    }
+
+    #[test]
+    fn scheduler_attempt_failure_surfaces_malformed_provider_response() {
+        let failure = scheduler_attempt_failure(
+            &Status::internal(
+                "model provider response invalid after 0 retries (class=malformed_response, action=fail_closed_no_retry): anthropic response JSON parsing failed",
+            ),
+            1,
+        );
+
+        assert_eq!(failure.error_kind, "provider_malformed_response");
+        assert!(failure.retryable);
+        assert!(failure.error_message_redacted.contains("malformed_response"));
     }
 
     fn sample_routine_metadata(routine_id: &str) -> RoutineMetadataRecord {

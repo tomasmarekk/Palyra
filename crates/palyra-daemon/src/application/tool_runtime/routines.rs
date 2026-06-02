@@ -54,6 +54,8 @@ const DEFAULT_ROUTINE_WAIT_POLL_INTERVAL_MS: u64 = 1_000;
 const MIN_ROUTINE_WAIT_POLL_INTERVAL_MS: u64 = 250;
 const MAX_ROUTINE_WAIT_POLL_INTERVAL_MS: u64 = 30_000;
 const ROUTINE_WAIT_RUN_LIMIT: usize = 100;
+const DEFAULT_ROUTINE_RETRY_MAX_ATTEMPTS: u32 = 2;
+const DEFAULT_ROUTINE_RETRY_BACKOFF_MS: u64 = 1_000;
 
 pub(crate) async fn execute_routines_tool(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -2166,8 +2168,8 @@ fn parse_retry_policy(
     backoff_ms: Option<u64>,
 ) -> Result<CronRetryPolicy, String> {
     Ok(CronRetryPolicy {
-        max_attempts: max_attempts.unwrap_or(1).max(1),
-        backoff_ms: backoff_ms.unwrap_or(1_000).max(1),
+        max_attempts: max_attempts.unwrap_or(DEFAULT_ROUTINE_RETRY_MAX_ATTEMPTS).max(1),
+        backoff_ms: backoff_ms.unwrap_or(DEFAULT_ROUTINE_RETRY_BACKOFF_MS).max(1),
     })
 }
 
@@ -2936,6 +2938,14 @@ mod tests {
 
         assert_eq!(execution.run_mode, RoutineRunMode::FreshSession);
         assert_eq!(execution.execution_posture, RoutineExecutionPosture::Standard);
+    }
+
+    #[test]
+    fn parse_retry_policy_defaults_to_one_recovery_attempt() {
+        let retry = super::parse_retry_policy(None, None).expect("default retry should parse");
+
+        assert_eq!(retry.max_attempts, 2);
+        assert_eq!(retry.backoff_ms, 1_000);
     }
 
     #[test]
