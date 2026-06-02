@@ -429,12 +429,19 @@ fn normalize_object(
     let Value::Object(input) = value else {
         return Err(format!("{path_label} must be an object"));
     };
+    if let Some(max_properties) = schema.get("maxProperties").and_then(Value::as_u64) {
+        if input.len() as u64 > max_properties {
+            return Err(format!("{path_label} exceeds maxProperties {max_properties}"));
+        }
+    }
     let allow_additional =
         schema.get("additionalProperties").and_then(Value::as_bool).unwrap_or(false);
+    let additional_schema = schema.get("additionalProperties").filter(|value| value.is_object());
     let empty_properties = Map::new();
     let properties = match schema.get("properties").and_then(Value::as_object) {
         Some(properties) => properties,
         None if allow_additional => &empty_properties,
+        None if additional_schema.is_some() => &empty_properties,
         None => return Err(format!("object schema at {path_label} is missing properties")),
     };
     let required = schema
@@ -449,10 +456,6 @@ fn normalize_object(
             return Err(format!("{path_label} missing required field '{required_field}'"));
         }
     }
-    let additional_schema = schema
-        .get("additionalProperties")
-        .and_then(Value::as_object)
-        .map(|_| schema.get("additionalProperties").expect("checked"));
     let mut normalized = Map::new();
     for (key, value) in input {
         let child_path = format!("{}/{}", path, escape_json_pointer(key.as_str()));

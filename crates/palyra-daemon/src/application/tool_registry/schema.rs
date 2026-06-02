@@ -103,6 +103,7 @@ fn validate_schema_subset(
         "maxLength",
         "minItems",
         "maxItems",
+        "maxProperties",
     ];
     for keyword in object.keys() {
         if !allowed_keywords.contains(&keyword.as_str()) {
@@ -140,6 +141,14 @@ fn validate_schema_subset(
             return Err(schema_error("schema.enum_invalid", "enum must not be empty"));
         }
     }
+    if let Some(max_properties) = object.get("maxProperties") {
+        if max_properties.as_u64().is_none() {
+            return Err(schema_error(
+                "schema.max_properties_invalid",
+                "maxProperties must be an unsigned integer",
+            ));
+        }
+    }
     if let Some(additional) = object.get("additionalProperties") {
         match additional {
             Value::Bool(_) => {}
@@ -162,11 +171,14 @@ fn validate_schema_subset(
     }
     if schema_type == "object" {
         let empty_properties = Map::new();
+        let has_additional_property_schema =
+            object.get("additionalProperties").is_some_and(Value::is_object);
         let properties = match object.get("properties").and_then(Value::as_object) {
             Some(properties) => properties,
             None if object.get("additionalProperties").and_then(Value::as_bool) == Some(true) => {
                 &empty_properties
             }
+            None if has_additional_property_schema => &empty_properties,
             None => {
                 return Err(schema_error(
                     "schema.properties_missing",

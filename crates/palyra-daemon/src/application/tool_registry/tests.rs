@@ -115,7 +115,15 @@ fn process_run_allowlist_exposes_lifecycle_controls() {
     });
     let tool_names = snapshot.tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>();
 
-    assert!(tool_names.contains(&"palyra.process.run"));
+    assert!(
+        tool_names.contains(&"palyra.process.run"),
+        "process tools should be visible, filtered={:?}",
+        snapshot
+            .filtered_tools
+            .iter()
+            .filter(|tool| tool.name.starts_with("palyra.process."))
+            .collect::<Vec<_>>()
+    );
     assert!(tool_names.contains(&"palyra.process.stop"));
     assert!(tool_names.contains(&"palyra.process.status"));
     assert!(tool_names.contains(&"palyra.process.list"));
