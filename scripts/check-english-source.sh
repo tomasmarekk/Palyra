@@ -42,10 +42,34 @@ git_grep_or_empty() {
   esac
 }
 
+build_ascii_term() {
+  printf '%b' "$1"
+}
+
+blocked_plain_terms=(
+  "$(build_ascii_term '\x6b\x6f\x6e\x74\x65\x78\x74\x20\x6e\x61\x63\x74\x65\x6e')"
+  "$(build_ascii_term '\x68\x6f\x74\x6f\x76\x6f')"
+  "$(build_ascii_term '\x64\x6f\x6b\x6f\x6e\x63\x65\x6e\x6f')"
+)
+blocked_plain_pattern="(^|[^[:alnum:]_])($(IFS='|'; echo "${blocked_plain_terms[*]}"))([^[:alnum:]_]|$)"
+
+blocked_escape_terms=(
+  "$(build_ascii_term '\x53\x79\x73\x74\\\x78\x63\x33\\\x78\x61\x39\x6d')"
+  "$(build_ascii_term '\x6e\x65\x6d\\\x78\x63\x35\\\x78\x61\x66\\\x78\x63\x35\\\x78\x62\x65\x65')"
+  "$(build_ascii_term '\x50\\\x78\x63\x35\\\x78\x39\x39\\\x78\x63\x33\\\x78\x61\x64\x73\x74\x75\x70')"
+  "$(build_ascii_term '\x75\x76\x65\x64\x65\x6e\\\x78\x63\x33\\\x78\x62\x64\x20\x73\x6f\x75\x62\x6f\x72')"
+)
+blocked_escape_args=()
+for term in "${blocked_escape_terms[@]}"; do
+  blocked_escape_args+=("-e" "$term")
+done
+
 diacritic_matches="$(git_grep_or_empty --perl-regexp -e "$diacritic_pattern")"
 locale_matches="$(git_grep_or_empty --extended-regexp -e "$locale_pattern")"
+blocked_plain_matches="$(git_grep_or_empty --perl-regexp --ignore-case -e "$blocked_plain_pattern")"
+blocked_escape_matches="$(git_grep_or_empty --fixed-strings "${blocked_escape_args[@]}")"
 
-matches="${diacritic_matches}"$'\n'"${locale_matches}"
+matches="${diacritic_matches}"$'\n'"${locale_matches}"$'\n'"${blocked_plain_matches}"$'\n'"${blocked_escape_matches}"
 if [[ -n "${matches//[[:space:]]/}" ]]; then
   echo "Non-English source text detected in tracked source files:" >&2
   echo "$matches" >&2

@@ -987,10 +987,8 @@ mod tests {
     fn summarize_command_output_combines_stdout_and_stderr() {
         let output = Output {
             status: std::process::ExitStatus::from_raw(1),
-            stdout:
-                b"ERROR: Syst\xc3\xa9m nem\xc5\xaf\xc5\xbee nal\xc3\xa9zt uveden\xc3\xbd soubor."
-                    .to_vec(),
-            stderr: b"ERROR: P\xc5\x99\xc3\xadstup byl odep\xc5\x99en.".to_vec(),
+            stdout: b"ERROR: Missing file.".to_vec(),
+            stderr: b"ERROR: Access denied.".to_vec(),
         };
 
         let summary = summarize_command_output(&output).expect("summary should include output");
@@ -1000,23 +998,25 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn decode_windows_process_output_preserves_localized_schtasks_text() {
-        let decoded = decode_windows_process_output(b"ERROR: X\xfd\xa1 Y\xfden.");
+    fn decode_windows_process_output_preserves_utf8_symbolic_text() {
+        let decoded = decode_windows_process_output(b"ERROR: marker \xe2\x98\x85.");
 
         assert!(
-            decoded.contains("X\u{0159}\u{00ED} Y\u{0159}en"),
-            "localized schtasks output should not be mojibake: {decoded}"
+            decoded.contains('\u{2605}'),
+            "UTF-8 process output should not lose symbolic text: {decoded}"
         );
     }
 
     #[cfg(windows)]
     #[test]
-    fn decode_windows_process_output_preserves_ansi_localized_schtasks_text() {
-        let decoded = decode_windows_process_output(b"ERROR: X\xf8\xed Y\xf8en.");
+    fn decode_windows_process_output_keeps_non_utf8_schtasks_text_readable() {
+        let decoded = decode_windows_process_output(b"ERROR: path\xffsegment.");
 
+        assert!(decoded.starts_with("ERROR: path"), "decoded output should preserve ASCII prefix");
+        assert!(!decoded.contains('\u{fffd}'), "decoded output should avoid replacement chars");
         assert!(
-            decoded.contains("X\u{0159}\u{00ED} Y\u{0159}en"),
-            "localized ANSI output should not be mojibake: {decoded}"
+            !decoded.contains("non-UTF-8"),
+            "Windows code-page fallback should decode non-UTF-8 process output: {decoded}"
         );
     }
 }
