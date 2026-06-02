@@ -54,6 +54,264 @@ function Resolve-WindowsCleanDesktopCliExposure {
     }
 }
 
+function Set-TextFileUtf8NoBom {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [Parameter(Mandatory = $true)]
+        [string]$Value
+    )
+
+    $parent = Split-Path -Parent $Path
+    if (-not [string]::IsNullOrWhiteSpace($parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+    [IO.File]::WriteAllText($Path, $Value, [Text.UTF8Encoding]::new($false))
+}
+
+function Get-GeneratedTomlScalar {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [Parameter(Mandatory = $true)]
+        [string]$Section,
+        [Parameter(Mandatory = $true)]
+        [string]$Key
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Generated config file is missing: $Path"
+    }
+
+    $currentSection = ""
+    $keyPattern = [regex]::Escape($Key)
+    foreach ($line in Get-Content -LiteralPath $Path) {
+        $trimmed = $line.Trim()
+        if ($trimmed -match '^\[(?<section>[^\]]+)\]$') {
+            $currentSection = $Matches.section.Trim()
+            continue
+        }
+        if ($currentSection -ne $Section) {
+            continue
+        }
+        if ($trimmed -match "^$keyPattern\s*=\s*(?<value>.+)$") {
+            $raw = $Matches.value.Trim()
+            if ($raw.StartsWith('"') -and $raw.EndsWith('"') -and $raw.Length -ge 2) {
+                return $raw.Substring(1, $raw.Length - 2)
+            }
+            return $raw
+        }
+    }
+
+    throw "Generated config file $Path does not contain [$Section].$Key"
+}
+
+function New-E2EHarnessInventorySkillFixture {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FixtureRoot
+    )
+
+    New-Item -ItemType Directory -Path $FixtureRoot -Force | Out-Null
+    $manifestPath = Join-Path $FixtureRoot "skill.toml"
+    $modulePath = Join-Path $FixtureRoot "inventory_lookup.wasm"
+    $sbomPath = Join-Path $FixtureRoot "sbom.cdx.json"
+    $provenancePath = Join-Path $FixtureRoot "provenance.json"
+
+    Set-TextFileUtf8NoBom -Path $manifestPath -Value @'
+manifest_version = 1
+skill_id = "inventory.lookup"
+name = "Inventory Lookup Schema Fixture"
+version = "1.0.0"
+publisher = "inventory"
+
+[entrypoints]
+[[entrypoints.tools]]
+id = "inventory.lookup"
+name = "lookup"
+description = "Returns a deterministic malformed inventory payload for E2E schema-validation fallback coverage."
+input_schema = { type = "object", properties = { sku = { type = "string" } }, required = ["sku"] }
+output_schema = { type = "object", properties = { sku = { type = "string" }, quantity = { type = "integer" }, source = { type = "string" } }, required = ["sku", "quantity", "source"] }
+risk = { default_sensitive = false, requires_approval = false }
+
+[capabilities.filesystem]
+read_roots = []
+write_roots = []
+
+[capabilities]
+http_egress_allowlist = []
+device_capabilities = []
+node_capabilities = []
+
+[capabilities.quotas]
+wall_clock_timeout_ms = 2000
+fuel_budget = 1000000
+max_memory_bytes = 16777216
+
+[compat]
+required_protocol_major = 1
+min_palyra_version = "0.1.0"
+'@
+
+    Set-TextFileUtf8NoBom -Path $modulePath -Value @'
+(module
+  (func (export "run") (result i32)
+    i32.const 42
+  )
+)
+'@
+
+    Set-TextFileUtf8NoBom -Path $sbomPath -Value @'
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.6",
+  "version": 1,
+  "metadata": {
+    "component": {
+      "name": "inventory.lookup",
+      "type": "application",
+      "version": "1.0.0"
+    }
+  },
+  "components": []
+}
+'@
+
+    Set-TextFileUtf8NoBom -Path $provenancePath -Value @'
+{
+  "builder": {
+    "id": "clean-desktop-e2e-harness"
+  },
+  "subject": [
+    {
+      "name": "inventory_lookup.wasm",
+      "digest": {
+        "sha256": "generated-at-package-build"
+      }
+    }
+  ]
+}
+'@
+
+    return [ordered]@{
+        manifest_path = $manifestPath
+        module_path = $modulePath
+        sbom_path = $sbomPath
+        provenance_path = $provenancePath
+    }
+}
+
+function Install-E2EHarnessInventorySkill {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$WorkspaceRoot,
+        [Parameter(Mandatory = $true)]
+        [string]$StateRoot,
+        [Parameter(Mandatory = $true)]
+        [string]$CliPath
+    )
+
+    if (-not (Test-Path -LiteralPath $CliPath -PathType Leaf)) {
+        throw "Installed Palyra CLI binary is missing: $CliPath"
+    }
+
+    $fixtureRoot = Join-Path $WorkspaceRoot "fixtures/skills/inventory-lookup"
+    $distRoot = Join-Path $WorkspaceRoot "artifacts/skills"
+    $artifactPath = Join-Path $distRoot "inventory.lookup.palyra-skill"
+    $skillsRoot = Join-Path $StateRoot "skills"
+    $trustStorePath = Join-Path $skillsRoot "trust-store.json"
+    New-Item -ItemType Directory -Path $distRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path $skillsRoot -Force | Out-Null
+
+    $fixture = New-E2EHarnessInventorySkillFixture -FixtureRoot $fixtureRoot
+    if (Test-Path -LiteralPath $artifactPath -PathType Leaf) {
+        Remove-Item -LiteralPath $artifactPath -Force
+    }
+
+    "0101010101010101010101010101010101010101010101010101010101010101" |
+        & $CliPath skills package build `
+            --manifest $fixture.manifest_path `
+            --module $fixture.module_path `
+            --sbom $fixture.sbom_path `
+            --provenance $fixture.provenance_path `
+            --output $artifactPath `
+            --signing-key-stdin `
+            --json | Out-Null
+
+    & $CliPath skills install `
+        --artifact $artifactPath `
+        --skills-dir $skillsRoot `
+        --trust-store $trustStorePath `
+        --allow-untrusted `
+        --non-interactive `
+        --json | Out-Null
+
+    return [ordered]@{
+        installed = "true"
+        skill_id = "inventory.lookup"
+        version = "1.0.0"
+        artifact_path = [IO.Path]::GetFullPath($artifactPath)
+        skills_root = [IO.Path]::GetFullPath($skillsRoot)
+        trust_store = [IO.Path]::GetFullPath($trustStorePath)
+    }
+}
+
+function Wait-E2EHarnessGatewayHealth {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DaemonUrl
+    )
+
+    $healthUrl = "$($DaemonUrl.TrimEnd('/'))/healthz"
+    $deadline = (Get-Date).AddSeconds(90)
+    $lastError = $null
+    do {
+        try {
+            $response = Invoke-RestMethod -Uri $healthUrl -TimeoutSec 2 -ErrorAction Stop
+            if ($null -eq $response -or $response.status -eq "ok") {
+                return
+            }
+            $lastError = "health status was '$($response.status)'"
+        } catch {
+            $lastError = $_.Exception.Message
+        }
+        Start-Sleep -Milliseconds 1000
+    } while ((Get-Date) -lt $deadline)
+
+    throw "Timed out waiting for Palyra gateway health at $healthUrl. Last error: $lastError"
+}
+
+function Enable-E2EHarnessInventorySkill {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ConfigPath,
+        [Parameter(Mandatory = $true)]
+        [string]$SkillsRoot,
+        [Parameter(Mandatory = $true)]
+        [string]$CliPath
+    )
+
+    $daemonPort = [int](Get-GeneratedTomlScalar -Path $ConfigPath -Section "daemon" -Key "port")
+    $adminToken = Get-GeneratedTomlScalar -Path $ConfigPath -Section "admin" -Key "auth_token"
+    $daemonUrl = "http://127.0.0.1:$daemonPort"
+    Wait-E2EHarnessGatewayHealth -DaemonUrl $daemonUrl
+
+    & $CliPath skills enable inventory.lookup `
+        --version 1.0.0 `
+        --skills-dir $SkillsRoot `
+        --override `
+        --reason "clean_desktop_e2e_inventory_fixture" `
+        --url $daemonUrl `
+        --token $adminToken `
+        --principal "admin:local" `
+        --json | Out-Null
+
+    return [ordered]@{
+        activated = "true"
+        daemon_url = $daemonUrl
+    }
+}
+
 $repoRoot = Get-RepoRoot
 $workspaceRoot =
     if ([string]::IsNullOrWhiteSpace($WorkspaceRoot)) {
@@ -251,6 +509,16 @@ if ($IsWindows) {
     }
 }
 
+$installedCliBinary = Join-Path $resolvedInstallRoot $cliExecutable
+$harnessInventorySkill = Install-E2EHarnessInventorySkill `
+    -WorkspaceRoot $workspaceRoot `
+    -StateRoot $stateRoot `
+    -CliPath $installedCliBinary
+$harnessInventorySkillActivation = [ordered]@{
+    activated = "not_attempted"
+    daemon_url = ""
+}
+
 $launcherFileName =
     if ($IsWindows) {
         "Launch-Palyra-Test.ps1"
@@ -356,6 +624,14 @@ if (-not $IsWindows) {
     Set-ExecutablePermissions -Path $launcherPath
 }
 
+if ($shouldLaunch) {
+    & $launcherPath
+    $harnessInventorySkillActivation = Enable-E2EHarnessInventorySkill `
+        -ConfigPath $configPath `
+        -SkillsRoot $harnessInventorySkill.skills_root `
+        -CliPath $installedCliBinary
+}
+
 $installSummary = [ordered]@{
     installed_at_utc = (Get-Date).ToUniversalTime().ToString("o")
     repo_root = $repoRoot
@@ -379,16 +655,17 @@ $installSummary = [ordered]@{
     cli_path_preflight_source = $cliPathPreflightSource
     cli_path_preflight_matches_command_root = $cliPathPreflightMatchesCommandRoot
     cli_path_preflight_matches_harness = $cliPathPreflightMatchesCommandRoot
+    harness_inventory_skill_installed = $harnessInventorySkill.installed
+    harness_inventory_skill_activated = $harnessInventorySkillActivation.activated
+    harness_inventory_skill_artifact_path = $harnessInventorySkill.artifact_path
+    harness_inventory_skill_skills_root = $harnessInventorySkill.skills_root
+    harness_inventory_skill_daemon_url = $harnessInventorySkillActivation.daemon_url
     launcher_path = $launcherPath
     launched = $shouldLaunch
 }
 $installSummary |
     ConvertTo-Json -Depth 4 |
     Set-Content -LiteralPath (Join-Path $workspaceRoot "clean-install-metadata.json")
-
-if ($shouldLaunch) {
-    & $launcherPath
-}
 
 Write-Output "workspace_root=$workspaceRoot"
 Write-Output "archive_path=$archivePath"
@@ -409,5 +686,10 @@ Write-Output "cli_parent_shell_note=$resolvedCliParentShellNote"
 Write-Output "cli_path_preflight_source=$cliPathPreflightSource"
 Write-Output "cli_path_preflight_matches_command_root=$cliPathPreflightMatchesCommandRoot"
 Write-Output "cli_path_preflight_matches_harness=$cliPathPreflightMatchesCommandRoot"
+Write-Output "harness_inventory_skill_installed=$($harnessInventorySkill.installed)"
+Write-Output "harness_inventory_skill_activated=$($harnessInventorySkillActivation.activated)"
+Write-Output "harness_inventory_skill_artifact_path=$($harnessInventorySkill.artifact_path)"
+Write-Output "harness_inventory_skill_skills_root=$($harnessInventorySkill.skills_root)"
+Write-Output "harness_inventory_skill_daemon_url=$($harnessInventorySkillActivation.daemon_url)"
 Write-Output "launcher_path=$launcherPath"
 Write-Output "launched=$shouldLaunch"
