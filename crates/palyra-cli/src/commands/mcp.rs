@@ -675,7 +675,7 @@ fn registered_tools(read_only: bool) -> Vec<Value> {
 }
 
 fn is_registered_mcp_tool(name: &str) -> bool {
-    REGISTERED_MCP_TOOLS.iter().any(|tool_name| *tool_name == name)
+    REGISTERED_MCP_TOOLS.contains(&name)
 }
 
 fn mcp_server_instructions(read_only: bool) -> String {

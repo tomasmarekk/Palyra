@@ -1093,7 +1093,7 @@ fn validate_path_env_key(key: &str) -> Result<(), String> {
 }
 
 fn append_env_path_suffix(mut base: PathBuf, suffix: &str) -> Result<PathBuf, String> {
-    let relative_suffix = suffix.trim_start_matches(|ch| ch == '/' || ch == '\\');
+    let relative_suffix = suffix.trim_start_matches(['/', '\\']);
     if relative_suffix.is_empty() {
         return Ok(base);
     }

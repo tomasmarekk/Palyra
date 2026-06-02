@@ -3197,8 +3197,8 @@ fn provider_request_has_tool_result(request: &ProviderRequest, tool_call_id: &st
     provider_request_tool_result_text(request, tool_call_id).is_some()
 }
 
-fn provider_request_tool_result_text<'a>(
-    request: &'a ProviderRequest,
+fn provider_request_tool_result_text(
+    request: &ProviderRequest,
     tool_call_id: &str,
 ) -> Option<String> {
     request
