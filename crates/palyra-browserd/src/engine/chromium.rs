@@ -1954,6 +1954,40 @@ pub(crate) async fn chromium_active_tab_for_session(
     Ok((active_tab_id, tab))
 }
 
+async fn chromium_selector_not_found_error(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+    tab_id: &str,
+    selector: &str,
+    action_name: &str,
+) -> String {
+    let sessions = runtime.sessions.lock().await;
+    let cached_tab = sessions.get(session_id).and_then(|session| session.tabs.get(tab_id));
+    let cached_body = cached_tab.map(|tab| tab.last_page_body.as_str()).unwrap_or_default();
+    let cached_url = cached_tab.and_then(|tab| tab.last_url.as_deref()).unwrap_or_default();
+    selector_not_found_error_from_cached_snapshot(selector, action_name, cached_body, cached_url)
+}
+
+fn selector_not_found_error_from_cached_snapshot(
+    selector: &str,
+    action_name: &str,
+    cached_page_body: &str,
+    cached_url: &str,
+) -> String {
+    if find_matching_html_tag(selector, cached_page_body).is_some() {
+        let page_url = normalize_url_with_redaction(cached_url);
+        let location = if page_url.is_empty() {
+            "the active tab".to_owned()
+        } else {
+            format!("active tab {page_url}")
+        };
+        return format!(
+            "selector '{selector}' was not found in the live Chromium DOM for {action_name}, but the last observe snapshot for {location} still contained it; call observe or reload to refresh the active tab, verify any local server is still running, and retry only if the selector is present in the current snapshot"
+        );
+    }
+    format!("selector '{selector}' was not found")
+}
+
 pub(crate) async fn chromium_observe_snapshot(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -2986,14 +3020,14 @@ pub(crate) async fn click_with_chromium(
                 let element = tab_for_attempt.find_element(selector_for_attempt.as_str()).map_err(
                     |error| {
                         format!(
-                            "failed to resolve selector '{}' on Chromium page: {error}",
+                            "selector '{}' was present in the live Chromium DOM, but Chromium could not resolve it for click: {error}; call observe to verify the active tab and retry with a current selector",
                             selector_for_attempt
                         )
                     },
                 )?;
                 element.click().map_err(|error| {
                     format!(
-                        "failed to click selector '{}' on Chromium page: {error}",
+                        "selector '{}' was present in the live Chromium DOM, but click did not complete before the actionability timeout: {error}; inspect visibility, disabled state, overlays, active tab, and viewport before retrying",
                         selector_for_attempt
                     )
                 })?;
@@ -3049,7 +3083,14 @@ pub(crate) async fn click_with_chromium(
     ChromiumActionOutcome {
         success: false,
         outcome: "selector_not_found".to_owned(),
-        error: format!("selector '{selector}' was not found"),
+        error: chromium_selector_not_found_error(
+            runtime,
+            session_id,
+            tab_id.as_str(),
+            selector,
+            "click",
+        )
+        .await,
         attempts,
     }
 }
@@ -3665,7 +3706,7 @@ pub(crate) async fn highlight_with_chromium(
     timeout_ms: u64,
     duration_ms: u64,
 ) -> ChromiumActionOutcome {
-    let (_tab_id, tab) = match chromium_active_tab_for_session(runtime, session_id).await {
+    let (tab_id, tab) = match chromium_active_tab_for_session(runtime, session_id).await {
         Ok(value) => value,
         Err(error) => {
             return ChromiumActionOutcome {
@@ -3750,7 +3791,14 @@ pub(crate) async fn highlight_with_chromium(
                 ChromiumActionOutcome {
                     success: false,
                     outcome: "selector_not_found".to_owned(),
-                    error: format!("selector '{selector}' was not found"),
+                    error: chromium_selector_not_found_error(
+                        runtime,
+                        session_id,
+                        tab_id.as_str(),
+                        selector,
+                        "highlight",
+                    )
+                    .await,
                     attempts: 1,
                 }
             }
@@ -3909,7 +3957,8 @@ mod tests {
         parse_chromium_console_entries, parse_chromium_document_cookie_snapshot,
         parse_chromium_layout_metrics, parse_chromium_local_storage_restore_status,
         parse_chromium_local_storage_snapshot, parse_chromium_page_network_entries,
-        parse_chromium_viewport_metrics, parse_key_press_spec, ChromiumLayoutMetrics,
+        parse_chromium_viewport_metrics, parse_key_press_spec,
+        selector_not_found_error_from_cached_snapshot, ChromiumLayoutMetrics,
         ChromiumObserveSnapshot, CHROMIUM_DRAIN_NETWORK_LOG_SCRIPT,
         CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT, CHROMIUM_READ_CONSOLE_LOG_SCRIPT,
         MAX_CHROMIUM_CONSOLE_JSON_BYTES, MAX_CHROMIUM_DOCUMENT_COOKIE_JSON_BYTES,
@@ -4016,6 +4065,34 @@ mod tests {
             !page_body.contains("supersecret"),
             "observe state summary must not leak sensitive values: {page_body}"
         );
+    }
+
+    #[test]
+    fn selector_not_found_error_mentions_cached_observe_mismatch() {
+        let error = selector_not_found_error_from_cached_snapshot(
+            "#save-user",
+            "highlight",
+            r#"<html><body><button id="save-user">Save user</button></body></html>"#,
+            "http://127.0.0.1:8790/?token=secret",
+        );
+
+        assert!(error.contains("live Chromium DOM for highlight"), "{error}");
+        assert!(error.contains("last observe snapshot"), "{error}");
+        assert!(error.contains("active tab http://127.0.0.1:8790/?token=<redacted>"), "{error}");
+        assert!(!error.contains("token=secret"), "{error}");
+        assert!(error.contains("verify any local server is still running"), "{error}");
+    }
+
+    #[test]
+    fn selector_not_found_error_stays_short_without_cached_match() {
+        let error = selector_not_found_error_from_cached_snapshot(
+            "#save-user",
+            "click",
+            r#"<html><body><button id="cancel">Cancel</button></body></html>"#,
+            "http://127.0.0.1:8790/",
+        );
+
+        assert_eq!(error, "selector '#save-user' was not found");
     }
 
     #[test]
