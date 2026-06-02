@@ -1697,9 +1697,7 @@ fn budgeted_cron_run_count(runs: &[CronRunRecord]) -> u32 {
 }
 
 fn is_budgeted_cron_run(run: &CronRunRecord) -> bool {
-    !run.status.is_active()
-        && run.orchestrator_run_id.is_some()
-        && run.error_kind.as_deref() != Some(CRON_MAX_RUNS_EXHAUSTED_ERROR_KIND)
+    !run.status.is_active() && run.error_kind.as_deref() != Some(CRON_MAX_RUNS_EXHAUSTED_ERROR_KIND)
 }
 
 async fn apply_cron_max_runs_exhaustion(
@@ -2012,9 +2010,9 @@ async fn enforce_scheduled_routine_approval(
         return Ok(None);
     }
     ensure_scheduled_routine_approval_requested(&state, job, &routine, mode).await?;
-    register_terminal(
+    register_terminal_and_disable_cron_if_max_runs_exhausted(
         Arc::clone(&state),
-        &job.job_id,
+        job,
         CronRunStatus::Denied,
         "approval_required",
         "routine approval is required before the first scheduled run",
@@ -2142,9 +2140,9 @@ async fn dispatch_job(
         disable_objective_if_budget_exhausted(Arc::clone(&state), &job).await?
     {
         let message = objective_budget_exhausted_message(&exhaustion);
-        return register_terminal(
+        return register_terminal_and_disable_cron_if_max_runs_exhausted(
             Arc::clone(&state),
-            &job.job_id,
+            &job,
             CronRunStatus::Skipped,
             OBJECTIVE_BUDGET_EXHAUSTED_ERROR_KIND,
             message.as_str(),
@@ -2174,9 +2172,9 @@ async fn dispatch_job(
     )
     .map_err(|error| Status::internal(format!("failed to evaluate cron run policy: {error}")))?;
     if let PolicyDecision::DenyByDefault { reason } = policy.decision {
-        return register_terminal(
+        return register_terminal_and_disable_cron_if_max_runs_exhausted(
             Arc::clone(&state),
-            &job.job_id,
+            &job,
             CronRunStatus::Denied,
             "policy_denied",
             reason.as_str(),
@@ -2194,9 +2192,9 @@ async fn dispatch_job(
     if let Some(active) = active_run {
         match decide_concurrency_policy(job.concurrency_policy, job.queued_run, manual_trigger) {
             ConcurrencyDecision::SkipForbid => {
-                return register_terminal(
+                return register_terminal_and_disable_cron_if_max_runs_exhausted(
                     Arc::clone(&state),
-                    &job.job_id,
+                    &job,
                     CronRunStatus::Skipped,
                     "concurrency_forbid",
                     "concurrency policy forbids overlapping runs",
@@ -2223,9 +2221,9 @@ async fn dispatch_job(
                 });
             }
             ConcurrencyDecision::SkipQueueFull => {
-                return register_terminal(
+                return register_terminal_and_disable_cron_if_max_runs_exhausted(
                     Arc::clone(&state),
-                    &job.job_id,
+                    &job,
                     CronRunStatus::Skipped,
                     "concurrency_queue_full",
                     "queue(1) already has one pending run",
@@ -2350,6 +2348,19 @@ async fn register_terminal(
     })
 }
 
+async fn register_terminal_and_disable_cron_if_max_runs_exhausted(
+    state: Arc<GatewayRuntimeState>,
+    job: &CronJobRecord,
+    status: CronRunStatus,
+    error_kind: &str,
+    message: &str,
+) -> Result<DispatchOutcome, Status> {
+    let outcome =
+        register_terminal(Arc::clone(&state), &job.job_id, status, error_kind, message).await?;
+    let _ = disable_cron_if_max_runs_exhausted(Arc::clone(&state), job).await?;
+    Ok(outcome)
+}
+
 async fn run_job_with_retries(
     state: Arc<GatewayRuntimeState>,
     auth: GatewayAuthConfig,
@@ -2449,7 +2460,9 @@ async fn run_job_with_retries(
                         session_id: None,
                     })
                     .await?;
-                if attempt >= max_attempts {
+                let cron_max_runs_exhausted =
+                    disable_cron_if_max_runs_exhausted(Arc::clone(&state), &job).await?.is_some();
+                if cron_max_runs_exhausted || attempt >= max_attempts {
                     wake_signal.notify_one();
                     return Ok(());
                 }
@@ -3259,20 +3272,28 @@ mod tests {
     }
 
     #[test]
-    fn budgeted_cron_run_count_excludes_cap_skip_records() {
+    fn budgeted_cron_run_count_includes_terminal_scheduler_attempts() {
         let mut succeeded = sample_cron_run(CronRunStatus::Succeeded, 10);
         succeeded.orchestrator_run_id = Some("orch-1".to_owned());
         let mut denied = sample_cron_run(CronRunStatus::Denied, 20);
         denied.orchestrator_run_id = Some("orch-2".to_owned());
         let active = sample_cron_run(CronRunStatus::Running, 30);
         let skipped_without_orchestrator = sample_cron_run(CronRunStatus::Skipped, 40);
+        let failed_without_orchestrator = sample_cron_run(CronRunStatus::Failed, 45);
         let mut cap_skip = sample_cron_run(CronRunStatus::Skipped, 50);
         cap_skip.orchestrator_run_id = Some("orch-3".to_owned());
         cap_skip.error_kind = Some(CRON_MAX_RUNS_EXHAUSTED_ERROR_KIND.to_owned());
 
-        let runs = vec![succeeded, denied, active, skipped_without_orchestrator, cap_skip];
+        let runs = vec![
+            succeeded,
+            denied,
+            active,
+            skipped_without_orchestrator,
+            failed_without_orchestrator,
+            cap_skip,
+        ];
 
-        assert_eq!(budgeted_cron_run_count(&runs), 2);
+        assert_eq!(budgeted_cron_run_count(&runs), 4);
     }
 
     #[test]
