@@ -23,8 +23,8 @@ use crate::{
         ApprovalCreateRequest, ApprovalDecision, ApprovalDecisionScope, ApprovalPolicySnapshot,
         ApprovalPromptOption, ApprovalPromptRecord, ApprovalRiskLevel, ApprovalSubjectType,
         CronConcurrencyPolicy, CronJobCreateRequest, CronJobRecord, CronJobUpdatePatch,
-        CronMisfirePolicy, CronRetryPolicy, CronRunFinalizeRequest, CronRunStartRequest,
-        CronRunStatus,
+        CronMisfirePolicy, CronRetryPolicy, CronRunFinalizeRequest, CronRunRecord,
+        CronRunStartRequest, CronRunStatus,
     },
     routines::{
         default_outcome_from_cron_status, join_run_metadata, natural_language_schedule_preview,
@@ -585,8 +585,6 @@ async fn upsert_routine(
         }
         None => Ulid::new().to_string(),
     };
-    let trigger_kind =
-        parse_trigger_kind(required_string_field(payload, "trigger_kind")?.as_str())?;
     let owner_principal = normalize_owner_principal(
         optional_string_field(payload, "owner_principal").as_deref(),
         context.principal.as_str(),
@@ -601,8 +599,29 @@ async fn upsert_routine(
     if let Some(job) = existing_job.as_ref() {
         ensure_job_owner(job, context.principal.as_str())?;
     }
+    let existing_metadata = if existing_job.is_some() {
+        Some(
+            runtime
+                .registry
+                .get_routine(routine_id.as_str())
+                .map_err(map_registry_error)?
+                .ok_or_else(|| "routine metadata not found for existing cron job".to_owned())?,
+        )
+    } else {
+        None
+    };
+    let (trigger_kind, trigger_kind_was_requested) =
+        resolve_upsert_trigger_kind(payload, existing_metadata.as_ref())?;
 
-    let schedule = resolve_routine_schedule(payload, trigger_kind, runtime.timezone_mode)?;
+    let preserve_existing_schedule =
+        existing_metadata.as_ref().is_some_and(|metadata| metadata.trigger_kind == trigger_kind);
+    let schedule = resolve_routine_schedule(
+        payload,
+        trigger_kind,
+        runtime.timezone_mode,
+        existing_job.as_ref(),
+        preserve_existing_schedule,
+    )?;
     let workdir_was_requested = payload.contains_key("workdir");
     let requested_workdir = if workdir_was_requested {
         normalize_optional_workdir(optional_string_field(payload, "workdir"))?
@@ -618,57 +637,103 @@ async fn upsert_routine(
         workdir_was_requested,
         launch_workspace_roots.as_slice(),
     )?;
-    let name = required_string_field(payload, "name")?;
-    let prompt = required_string_field(payload, "prompt")?;
+    let name = optional_string_field(payload, "name")
+        .or_else(|| existing_job.as_ref().map(|job| job.name.clone()))
+        .ok_or_else(|| "name is required and must be a non-empty string".to_owned())?;
+    let prompt = optional_string_field(payload, "prompt")
+        .or_else(|| existing_job.as_ref().map(|job| job.prompt.clone()))
+        .ok_or_else(|| "prompt is required and must be a non-empty string".to_owned())?;
     let requested_execution_posture = optional_string_field(payload, "execution_posture");
     let execution_posture_was_requested = requested_execution_posture.is_some();
-    let execution = parse_execution_config(
-        optional_string_field(payload, "run_mode").as_deref(),
-        default_run_mode_for_trigger_kind(trigger_kind),
-        default_execution_posture_for_trigger_kind(trigger_kind, workdir.as_deref()),
-        optional_string_field(payload, "procedure_profile_id"),
-        optional_string_field(payload, "skill_profile_id"),
-        optional_string_field(payload, "provider_profile_id"),
-        requested_execution_posture.as_deref(),
-    )?;
+    let execution_fields_requested = payload_has_any(
+        payload,
+        &[
+            "run_mode",
+            "procedure_profile_id",
+            "skill_profile_id",
+            "provider_profile_id",
+            "execution_posture",
+        ],
+    );
+    let execution = match (!execution_fields_requested, existing_metadata.as_ref()) {
+        (true, Some(metadata)) => metadata.execution.clone(),
+        _ => parse_execution_config(
+            optional_string_field(payload, "run_mode").as_deref(),
+            default_run_mode_for_trigger_kind(trigger_kind),
+            default_execution_posture_for_trigger_kind(trigger_kind, workdir.as_deref()),
+            optional_string_field(payload, "procedure_profile_id"),
+            optional_string_field(payload, "skill_profile_id"),
+            optional_string_field(payload, "provider_profile_id"),
+            requested_execution_posture.as_deref(),
+        )?,
+    };
     validate_routine_prompt_self_contained(prompt.as_str(), &execution)
         .map_err(map_registry_error)?;
     let success_visibility =
         parse_success_visibility(optional_string_field(payload, "success_visibility").as_deref())?;
     let delivery_mode_was_requested = optional_string_field(payload, "delivery_mode").is_some();
-    let delivery = normalize_delivery_for_success_visibility(
-        parse_delivery(
-            optional_string_field(payload, "delivery_mode").as_deref(),
-            optional_string_field(payload, "delivery_channel"),
-            optional_string_field(payload, "delivery_failure_mode").as_deref(),
-            optional_string_field(payload, "delivery_failure_channel"),
-            optional_string_field(payload, "silent_policy").as_deref(),
-        )?,
-        success_visibility,
-        delivery_mode_was_requested,
-    );
-    let quiet_hours = parse_quiet_hours(
-        optional_string_field(payload, "quiet_hours_start").as_deref(),
-        optional_string_field(payload, "quiet_hours_end").as_deref(),
-        optional_string_field(payload, "quiet_hours_timezone"),
-    )?;
-    let approval_mode_was_requested = payload.contains_key("approval_mode");
-    let requested_approval_policy =
-        parse_approval_policy(optional_string_field(payload, "approval_mode").as_deref())?;
-    let approval_policy = default_approval_policy_for_execution(
-        &execution,
-        requested_approval_policy,
-        approval_mode_was_requested,
-        execution_posture_was_requested,
-    );
-    let approval_policy = if trigger_kind == RoutineTriggerKind::FileWatch {
-        approval_policy
+    let delivery = if !payload_has_any(
+        payload,
+        &[
+            "delivery_mode",
+            "delivery_channel",
+            "delivery_failure_mode",
+            "delivery_failure_channel",
+            "silent_policy",
+            "success_visibility",
+        ],
+    ) {
+        existing_metadata.as_ref().map(|metadata| metadata.delivery.clone()).unwrap_or_default()
     } else {
-        routine_approval_policy_with_auto_enable_guard(
-            schedule.schedule_type,
-            schedule.schedule_payload_json.as_str(),
-            approval_policy,
+        normalize_delivery_for_success_visibility(
+            parse_delivery(
+                optional_string_field(payload, "delivery_mode").as_deref(),
+                optional_string_field(payload, "delivery_channel"),
+                optional_string_field(payload, "delivery_failure_mode").as_deref(),
+                optional_string_field(payload, "delivery_failure_channel"),
+                optional_string_field(payload, "silent_policy").as_deref(),
+            )?,
+            success_visibility,
+            delivery_mode_was_requested,
         )
+    };
+    let quiet_hours = if !payload_has_any(
+        payload,
+        &["quiet_hours_start", "quiet_hours_end", "quiet_hours_timezone"],
+    ) {
+        existing_metadata.as_ref().and_then(|metadata| metadata.quiet_hours.clone())
+    } else {
+        parse_quiet_hours(
+            optional_string_field(payload, "quiet_hours_start").as_deref(),
+            optional_string_field(payload, "quiet_hours_end").as_deref(),
+            optional_string_field(payload, "quiet_hours_timezone"),
+        )?
+    };
+    let approval_mode_was_requested = payload.contains_key("approval_mode");
+    let approval_policy = match (
+        !approval_mode_was_requested && !execution_posture_was_requested,
+        existing_metadata.as_ref(),
+    ) {
+        (true, Some(metadata)) => metadata.approval_policy.clone(),
+        _ => {
+            let requested_approval_policy =
+                parse_approval_policy(optional_string_field(payload, "approval_mode").as_deref())?;
+            let approval_policy = default_approval_policy_for_execution(
+                &execution,
+                requested_approval_policy,
+                approval_mode_was_requested,
+                execution_posture_was_requested,
+            );
+            if trigger_kind == RoutineTriggerKind::FileWatch {
+                approval_policy
+            } else {
+                routine_approval_policy_with_auto_enable_guard(
+                    schedule.schedule_type,
+                    schedule.schedule_payload_json.as_str(),
+                    approval_policy,
+                )
+            }
+        }
     };
     let concurrency_policy =
         parse_concurrency_policy(optional_string_field(payload, "concurrency_policy").as_deref())?;
@@ -704,7 +769,7 @@ async fn upsert_routine(
             retry_policy: retry_policy.clone(),
             misfire_policy,
             jitter_ms: optional_u64_field(payload, "jitter_ms")?.unwrap_or(0),
-            next_run_at_unix_ms: schedule.next_run_at_unix_ms,
+            next_run_at_unix_ms: enabled.then_some(schedule.next_run_at_unix_ms).flatten(),
         },
     )
     .await?;
@@ -716,6 +781,11 @@ async fn upsert_routine(
         trigger_payload_json
     } else if trigger_kind == RoutineTriggerKind::Schedule {
         build_schedule_trigger_payload(&job_record)
+    } else if !trigger_kind_was_requested && !payload.contains_key("trigger_payload") {
+        existing_metadata
+            .as_ref()
+            .map(|metadata| metadata.trigger_payload_json.clone())
+            .unwrap_or_else(|| Value::Object(Map::new()).to_string())
     } else {
         serde_json::to_string(payload.get("trigger_payload").unwrap_or(&Value::Object(Map::new())))
             .map_err(|error| format!("trigger payload must be valid JSON: {error}"))?
@@ -729,9 +799,13 @@ async fn upsert_routine(
             execution,
             delivery,
             quiet_hours,
-            cooldown_ms: optional_u64_field(payload, "cooldown_ms")?.unwrap_or(0),
+            cooldown_ms: optional_u64_field(payload, "cooldown_ms")?
+                .or_else(|| existing_metadata.as_ref().map(|metadata| metadata.cooldown_ms))
+                .unwrap_or(0),
             approval_policy,
-            template_id: optional_string_field(payload, "template_id"),
+            template_id: optional_string_field(payload, "template_id").or_else(|| {
+                existing_metadata.as_ref().and_then(|metadata| metadata.template_id.clone())
+            }),
         })
         .map_err(map_registry_error)?;
     let approval = if approval_required {
@@ -838,6 +912,17 @@ async fn delete_routine(
         context.principal.as_str(),
     )
     .await?;
+    if let Some(active_run) = runtime_state
+        .active_cron_run_for_job(routine.job.job_id.clone())
+        .await
+        .map_err(sanitize_status_message)?
+    {
+        return Err(active_routine_delete_error(&active_run));
+    }
+    let _ = runtime_state
+        .update_cron_job(routine.job.job_id.clone(), routine_delete_cleanup_patch())
+        .await
+        .map_err(sanitize_status_message)?;
     let deleted = runtime_state
         .delete_cron_job(routine.job.job_id.clone())
         .await
@@ -852,6 +937,23 @@ async fn delete_routine(
         "deleted": deleted,
         "routine_id": routine.metadata.routine_id,
     }))
+}
+
+fn active_routine_delete_error(active_run: &CronRunRecord) -> String {
+    format!(
+        "routine has an active run and cannot be deleted yet: run_id={} status={}",
+        active_run.run_id,
+        active_run.status.as_str()
+    )
+}
+
+fn routine_delete_cleanup_patch() -> CronJobUpdatePatch {
+    CronJobUpdatePatch {
+        enabled: Some(false),
+        next_run_at_unix_ms: Some(None),
+        queued_run: Some(false),
+        ..CronJobUpdatePatch::default()
+    }
 }
 
 async fn run_routine_now(
@@ -1679,10 +1781,39 @@ fn resolve_routine_schedule(
     payload: &Map<String, Value>,
     trigger_kind: RoutineTriggerKind,
     timezone_mode: CronTimezoneMode,
+    existing_job: Option<&CronJobRecord>,
+    preserve_existing_schedule: bool,
 ) -> Result<ScheduleResolution, String> {
     let schedule_timezone =
         parse_routine_timezone(optional_string_field(payload, "timezone"), timezone_mode)?;
     let max_runs = optional_u32_field(payload, "max_runs")?;
+    if preserve_existing_schedule
+        && !payload_has_any(
+            payload,
+            &[
+                "natural_language_schedule",
+                "schedule_type",
+                "every_interval_ms",
+                "cron_expression",
+                "at_timestamp_rfc3339",
+                "timezone",
+            ],
+        )
+    {
+        let existing_job = existing_job.ok_or_else(|| {
+            "existing routine schedule is unavailable for partial update".to_owned()
+        })?;
+        return Ok(ScheduleResolution {
+            schedule_type: existing_job.schedule_type,
+            schedule_payload_json: schedule_payload_with_max_runs(
+                existing_job.schedule_payload_json.clone(),
+                max_runs,
+                Some(existing_job),
+            )?,
+            next_run_at_unix_ms: existing_job.next_run_at_unix_ms,
+            trigger_payload_json_override: None,
+        });
+    }
     if trigger_kind == RoutineTriggerKind::FileWatch {
         let config = normalize_file_watch_trigger_payload(payload.get("trigger_payload"))
             .map_err(map_registry_error)?;
@@ -1704,6 +1835,7 @@ fn resolve_routine_schedule(
             schedule_payload_json: schedule_payload_with_max_runs(
                 normalized.schedule_payload_json,
                 max_runs,
+                existing_job,
             )?,
             next_run_at_unix_ms: normalized.next_run_at_unix_ms,
             trigger_payload_json_override: Some(trigger_payload_json),
@@ -1729,6 +1861,7 @@ fn resolve_routine_schedule(
             schedule_payload_json: schedule_payload_with_max_runs(
                 preview.schedule_payload_json,
                 max_runs,
+                existing_job,
             )?,
             next_run_at_unix_ms: preview.next_run_at_unix_ms,
             trigger_payload_json_override: None,
@@ -1743,6 +1876,7 @@ fn resolve_routine_schedule(
         schedule_payload_json: schedule_payload_with_max_runs(
             normalized.schedule_payload_json,
             max_runs,
+            existing_job,
         )?,
         next_run_at_unix_ms: normalized.next_run_at_unix_ms,
         trigger_payload_json_override: None,
@@ -1751,14 +1885,17 @@ fn resolve_routine_schedule(
 
 fn schedule_payload_with_max_runs(
     schedule_payload_json: String,
-    max_runs: Option<u32>,
+    requested_max_runs: Option<u32>,
+    existing_job: Option<&CronJobRecord>,
 ) -> Result<String, String> {
+    let max_runs = match requested_max_runs {
+        Some(0) => return Err("max_runs must be greater than zero".to_owned()),
+        Some(value) => Some(value),
+        None => existing_job.and_then(cron::max_runs_for_job),
+    };
     let Some(max_runs) = max_runs else {
         return Ok(schedule_payload_json);
     };
-    if max_runs == 0 {
-        return Err("max_runs must be greater than zero".to_owned());
-    }
     let mut payload = serde_json::from_str::<Value>(schedule_payload_json.as_str())
         .map_err(|error| format!("schedule payload must be valid JSON: {error}"))?;
     let Some(object) = payload.as_object_mut() else {
@@ -1970,6 +2107,18 @@ fn parse_trigger_kind(value: &str) -> Result<RoutineTriggerKind, String> {
         "trigger_kind must be one of schedule|hook|webhook|system_event|file_watch|manual"
             .to_owned()
     })
+}
+
+fn resolve_upsert_trigger_kind(
+    payload: &Map<String, Value>,
+    existing_metadata: Option<&RoutineMetadataRecord>,
+) -> Result<(RoutineTriggerKind, bool), String> {
+    if let Some(value) = optional_string_field(payload, "trigger_kind") {
+        return parse_trigger_kind(value.as_str()).map(|trigger_kind| (trigger_kind, true));
+    }
+    existing_metadata
+        .map(|metadata| (metadata.trigger_kind, false))
+        .ok_or_else(|| "trigger_kind is required and must be a non-empty string".to_owned())
 }
 
 fn default_run_mode_for_trigger_kind(trigger_kind: RoutineTriggerKind) -> RoutineRunMode {
@@ -2373,6 +2522,10 @@ fn optional_string_field(payload: &Map<String, Value>, key: &str) -> Option<Stri
         .map(ToOwned::to_owned)
 }
 
+fn payload_has_any(payload: &Map<String, Value>, keys: &[&str]) -> bool {
+    keys.iter().any(|key| payload.contains_key(*key))
+}
+
 fn optional_bool_field(payload: &Map<String, Value>, key: &str) -> Result<Option<bool>, String> {
     match payload.get(key) {
         None | Some(Value::Null) => Ok(None),
@@ -2491,8 +2644,8 @@ mod tests {
     };
     use crate::routines::{
         RoutineApprovalMode, RoutineApprovalPolicy, RoutineDeliveryConfig, RoutineDeliveryMode,
-        RoutineExecutionConfig, RoutineExecutionPosture, RoutineRunMode, RoutineRunOutcomeKind,
-        RoutineSilentPolicy, RoutineTriggerKind,
+        RoutineExecutionConfig, RoutineExecutionPosture, RoutineMetadataRecord, RoutineRunMode,
+        RoutineRunOutcomeKind, RoutineSilentPolicy, RoutineTriggerKind,
     };
     use chrono::{Datelike, TimeZone, Timelike};
     use serde_json::{json, Value};
@@ -2549,6 +2702,8 @@ mod tests {
             &payload,
             RoutineTriggerKind::Schedule,
             crate::cron::CronTimezoneMode::Utc,
+            None,
+            false,
         )
         .expect("schedule with max_runs should resolve");
         let schedule_payload: serde_json::Value =
@@ -2557,6 +2712,35 @@ mod tests {
 
         assert_eq!(schedule_payload["interval_ms"], 30_000);
         assert_eq!(schedule_payload["max_runs"], 2);
+    }
+
+    #[test]
+    fn resolve_routine_schedule_preserves_existing_schedule_for_partial_update() {
+        let existing_job = test_cron_job(true, Some(123_456), true);
+        let payload = json!({
+            "enabled": false,
+            "max_runs": 1,
+        })
+        .as_object()
+        .expect("payload should be an object")
+        .clone();
+
+        let schedule = super::resolve_routine_schedule(
+            &payload,
+            RoutineTriggerKind::Schedule,
+            crate::cron::CronTimezoneMode::Utc,
+            Some(&existing_job),
+            true,
+        )
+        .expect("partial update should preserve existing schedule");
+        let schedule_payload: serde_json::Value =
+            serde_json::from_str(schedule.schedule_payload_json.as_str())
+                .expect("schedule payload should parse");
+
+        assert_eq!(schedule.schedule_type, CronScheduleType::Every);
+        assert_eq!(schedule.next_run_at_unix_ms, Some(123_456));
+        assert_eq!(schedule_payload["interval_ms"], 60_000);
+        assert_eq!(schedule_payload["max_runs"], 1);
     }
 
     #[test]
@@ -2614,6 +2798,8 @@ mod tests {
             &payload,
             RoutineTriggerKind::FileWatch,
             crate::cron::CronTimezoneMode::Utc,
+            None,
+            false,
         )
         .expect("file_watch should build a poll schedule");
         let schedule_payload: serde_json::Value =
@@ -2678,6 +2864,8 @@ mod tests {
             &payload,
             RoutineTriggerKind::Schedule,
             crate::cron::CronTimezoneMode::Utc,
+            None,
+            false,
         )
         .expect("cron schedule with named timezone should resolve");
         let schedule_payload: serde_json::Value =
@@ -2695,6 +2883,41 @@ mod tests {
         assert_eq!(local.weekday().num_days_from_sunday(), 1);
         assert_eq!(local.hour(), 9);
         assert_eq!(local.minute(), 0);
+    }
+
+    #[test]
+    fn resolve_upsert_trigger_kind_reuses_existing_metadata_for_partial_update() {
+        let payload = json!({
+            "operation": "upsert",
+            "routine_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "enabled": false,
+        })
+        .as_object()
+        .expect("payload should be an object")
+        .clone();
+        let existing = test_routine_metadata();
+
+        let (trigger_kind, requested) =
+            super::resolve_upsert_trigger_kind(&payload, Some(&existing))
+                .expect("existing routine update should not require trigger_kind");
+
+        assert_eq!(trigger_kind, RoutineTriggerKind::Schedule);
+        assert!(!requested);
+        assert!(super::resolve_upsert_trigger_kind(&payload, None).is_err());
+    }
+
+    #[test]
+    fn routine_delete_cleanup_patch_clears_future_scheduler_state() {
+        let patch = super::routine_delete_cleanup_patch();
+        let active_run = test_cron_run("run-active", CronRunStatus::Running);
+        let active_error = super::active_routine_delete_error(&active_run);
+
+        assert_eq!(patch.enabled, Some(false));
+        assert_eq!(patch.next_run_at_unix_ms, Some(None));
+        assert_eq!(patch.queued_run, Some(false));
+        assert!(active_error.contains("run-active"));
+        assert!(active_error.contains("running"));
+        assert!(!active_error.contains("routine-01"));
     }
 
     #[test]
@@ -2885,6 +3108,22 @@ mod tests {
             tool_denies: 0,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 2,
+        }
+    }
+
+    fn test_routine_metadata() -> RoutineMetadataRecord {
+        RoutineMetadataRecord {
+            routine_id: "routine-01".to_owned(),
+            trigger_kind: RoutineTriggerKind::Schedule,
+            trigger_payload_json: json!({"schedule_type": "every"}).to_string(),
+            execution: RoutineExecutionConfig::default(),
+            delivery: RoutineDeliveryConfig::default(),
+            quiet_hours: None,
+            cooldown_ms: 0,
+            approval_policy: RoutineApprovalPolicy::default(),
+            template_id: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
         }
     }
 
