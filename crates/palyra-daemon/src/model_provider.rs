@@ -5680,13 +5680,21 @@ mod tests {
                     content: Vec::new(),
                     name: None,
                     tool_call_id: None,
-                    tool_calls: vec![ProviderMessageToolCall {
-                        proposal_id: "call_01".to_owned(),
-                        tool_name: "palyra.echo".to_owned(),
-                        input_json: serde_json::json!({"text":"hello"}),
-                    }],
+                    tool_calls: vec![
+                        ProviderMessageToolCall {
+                            proposal_id: "call_01".to_owned(),
+                            tool_name: "palyra.echo".to_owned(),
+                            input_json: serde_json::json!({"text":"hello"}),
+                        },
+                        ProviderMessageToolCall {
+                            proposal_id: "call_02".to_owned(),
+                            tool_name: "palyra.echo".to_owned(),
+                            input_json: serde_json::json!({"text":"world"}),
+                        },
+                    ],
                 },
                 ProviderMessage::tool_result("call_01", r#"{"echo":"hello"}"#),
+                ProviderMessage::tool_result("call_02", r#"{"echo":"world"}"#),
             ],
             json_mode: false,
             vision_inputs: Vec::new(),
@@ -5709,15 +5717,22 @@ mod tests {
         );
         assert_eq!(openai_payload["messages"][2]["role"], "tool");
         assert_eq!(openai_payload["messages"][2]["tool_call_id"], "call_01");
+        assert_eq!(openai_payload["messages"][3]["role"], "tool");
+        assert_eq!(openai_payload["messages"][3]["tool_call_id"], "call_02");
 
         let anthropic_payload =
             AnthropicCompatibleChatAdapter.request_payload(&request, "claude-contract-test");
         assert_eq!(anthropic_payload["messages"][1]["role"], "assistant");
         assert_eq!(anthropic_payload["messages"][1]["content"][0]["type"], "tool_use");
         assert_eq!(anthropic_payload["messages"][1]["content"][0]["id"], "call_01");
+        assert_eq!(anthropic_payload["messages"][1]["content"][1]["type"], "tool_use");
+        assert_eq!(anthropic_payload["messages"][1]["content"][1]["id"], "call_02");
         assert_eq!(anthropic_payload["messages"][2]["role"], "user");
         assert_eq!(anthropic_payload["messages"][2]["content"][0]["type"], "tool_result");
         assert_eq!(anthropic_payload["messages"][2]["content"][0]["tool_use_id"], "call_01");
+        assert_eq!(anthropic_payload["messages"][2]["content"][1]["type"], "tool_result");
+        assert_eq!(anthropic_payload["messages"][2]["content"][1]["tool_use_id"], "call_02");
+        assert_eq!(anthropic_payload["messages"].as_array().unwrap().len(), 3);
     }
 
     #[test]

@@ -102,12 +102,7 @@ pub(super) fn build_openai_messages(request: &ProviderRequest) -> Vec<Value> {
 
 fn build_anthropic_content_parts(message: &ProviderMessage) -> Vec<Value> {
     if message.role == ProviderMessageRole::Tool {
-        let content = message.text_content();
-        return vec![json!({
-            "type": "tool_result",
-            "tool_use_id": message.tool_call_id.as_deref().unwrap_or_default(),
-            "content": content,
-        })];
+        return vec![build_anthropic_tool_result_content_part(message)];
     }
 
     let mut parts = Vec::new();
@@ -144,6 +139,14 @@ fn build_anthropic_content_parts(message: &ProviderMessage) -> Vec<Value> {
     parts
 }
 
+fn build_anthropic_tool_result_content_part(message: &ProviderMessage) -> Value {
+    json!({
+        "type": "tool_result",
+        "tool_use_id": message.tool_call_id.as_deref().unwrap_or_default(),
+        "content": message.text_content(),
+    })
+}
+
 pub(super) fn build_anthropic_messages_and_system(
     request: &ProviderRequest,
 ) -> (Vec<Value>, Option<String>) {
@@ -159,6 +162,17 @@ pub(super) fn build_anthropic_messages_and_system(
         }
     }
     let mut provider_messages = Vec::new();
+    let mut pending_tool_result_parts = Vec::new();
+    let flush_pending_tool_result_parts =
+        |provider_messages: &mut Vec<Value>, pending_tool_result_parts: &mut Vec<Value>| {
+            if pending_tool_result_parts.is_empty() {
+                return;
+            }
+            provider_messages.push(json!({
+                "role": "user",
+                "content": std::mem::take(pending_tool_result_parts),
+            }));
+        };
     for message in &messages {
         match message.role {
             ProviderMessageRole::System | ProviderMessageRole::Developer => {
@@ -167,9 +181,14 @@ pub(super) fn build_anthropic_messages_and_system(
                     system_blocks.push(text);
                 }
             }
-            ProviderMessageRole::User
-            | ProviderMessageRole::Assistant
-            | ProviderMessageRole::Tool => {
+            ProviderMessageRole::Tool => {
+                pending_tool_result_parts.push(build_anthropic_tool_result_content_part(message));
+            }
+            ProviderMessageRole::User | ProviderMessageRole::Assistant => {
+                flush_pending_tool_result_parts(
+                    &mut provider_messages,
+                    &mut pending_tool_result_parts,
+                );
                 provider_messages.push(json!({
                     "role": message.role.as_anthropic_role(),
                     "content": build_anthropic_content_parts(message),
@@ -177,6 +196,7 @@ pub(super) fn build_anthropic_messages_and_system(
             }
         }
     }
+    flush_pending_tool_result_parts(&mut provider_messages, &mut pending_tool_result_parts);
     (provider_messages, (!system_blocks.is_empty()).then(|| system_blocks.join("\n\n")))
 }
 
