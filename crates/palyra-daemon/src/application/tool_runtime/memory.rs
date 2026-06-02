@@ -999,14 +999,16 @@ pub(crate) async fn execute_memory_replace_tool(
         Ok(Some(item)) => item,
         Ok(None) => {
             if let Some(outcome) = maybe_replace_workspace_document_by_id(
-                runtime_state,
                 context,
-                namespace,
-                proposal_id,
-                input_json,
-                memory_id.as_str(),
-                content_text.as_str(),
-                &parsed,
+                WorkspaceDocumentReplaceRequest {
+                    runtime_state,
+                    namespace,
+                    proposal_id,
+                    input_json,
+                    document_id: memory_id.as_str(),
+                    content_text: content_text.as_str(),
+                    parsed: &parsed,
+                },
             )
             .await
             {
@@ -1121,22 +1123,27 @@ pub(crate) async fn execute_memory_replace_tool(
     }
 }
 
-async fn maybe_replace_workspace_document_by_id(
-    runtime_state: &Arc<GatewayRuntimeState>,
-    context: ToolRuntimeExecutionContext<'_>,
+struct WorkspaceDocumentReplaceRequest<'a> {
+    runtime_state: &'a Arc<GatewayRuntimeState>,
     namespace: &'static [u8],
-    proposal_id: &str,
-    input_json: &[u8],
-    document_id: &str,
-    content_text: &str,
-    parsed: &Map<String, Value>,
+    proposal_id: &'a str,
+    input_json: &'a [u8],
+    document_id: &'a str,
+    content_text: &'a str,
+    parsed: &'a Map<String, Value>,
+}
+
+async fn maybe_replace_workspace_document_by_id(
+    context: ToolRuntimeExecutionContext<'_>,
+    request: WorkspaceDocumentReplaceRequest<'_>,
 ) -> Option<ToolExecutionOutcome> {
-    let document = match runtime_state
+    let document = match request
+        .runtime_state
         .workspace_document_by_id(
             context.principal.to_owned(),
             context.channel.map(str::to_owned),
-            optional_trimmed_string(parsed.get("agent_id")),
-            document_id.to_owned(),
+            optional_trimmed_string(request.parsed.get("agent_id")),
+            request.document_id.to_owned(),
             false,
         )
         .await
@@ -1145,9 +1152,9 @@ async fn maybe_replace_workspace_document_by_id(
         Ok(None) => return None,
         Err(error) => {
             return Some(memory_tool_execution_outcome(
-                namespace,
-                proposal_id,
-                input_json,
+                request.namespace,
+                request.proposal_id,
+                request.input_json,
                 false,
                 b"{}".to_vec(),
                 format!(
@@ -1163,16 +1170,17 @@ async fn maybe_replace_workspace_document_by_id(
         format!("memory:workspace_document:{}", document.document_id).as_str(),
     ) {
         return Some(memory_tool_execution_outcome(
-            namespace,
-            proposal_id,
-            input_json,
+            request.namespace,
+            request.proposal_id,
+            request.input_json,
             false,
             b"{}".to_vec(),
             format!("palyra.memory.replace {}", error.message()),
         ));
     }
     let previous_content_hash = document.content_hash.clone();
-    let updated_document = match runtime_state
+    let updated_document = match request
+        .runtime_state
         .upsert_workspace_document(WorkspaceDocumentWriteRequest {
             document_id: Some(document.document_id.clone()),
             principal: document.principal.clone(),
@@ -1181,7 +1189,7 @@ async fn maybe_replace_workspace_document_by_id(
             session_id: Some(context.session_id.to_owned()),
             path: document.path.clone(),
             title: Some(document.title.clone()),
-            content_text: content_text.to_owned(),
+            content_text: request.content_text.to_owned(),
             template_id: document.template_id.clone(),
             template_version: document.template_version,
             template_content_hash: None,
@@ -1193,9 +1201,9 @@ async fn maybe_replace_workspace_document_by_id(
         Ok(document) => document,
         Err(error) => {
             return Some(memory_tool_execution_outcome(
-                namespace,
-                proposal_id,
-                input_json,
+                request.namespace,
+                request.proposal_id,
+                request.input_json,
                 false,
                 b"{}".to_vec(),
                 format!(
@@ -1206,23 +1214,23 @@ async fn maybe_replace_workspace_document_by_id(
         }
     };
     let payload = workspace_memory_replace_payload(
-        document_id,
+        request.document_id,
         previous_content_hash.as_str(),
         &updated_document,
     );
     Some(match serde_json::to_vec(&payload) {
         Ok(output_json) => memory_tool_execution_outcome(
-            namespace,
-            proposal_id,
-            input_json,
+            request.namespace,
+            request.proposal_id,
+            request.input_json,
             true,
             output_json,
             String::new(),
         ),
         Err(error) => memory_tool_execution_outcome(
-            namespace,
-            proposal_id,
-            input_json,
+            request.namespace,
+            request.proposal_id,
+            request.input_json,
             false,
             b"{}".to_vec(),
             format!("palyra.memory.replace failed to serialize workspace output: {error}"),
