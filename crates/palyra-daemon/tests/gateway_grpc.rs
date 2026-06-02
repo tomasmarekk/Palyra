@@ -7511,65 +7511,62 @@ async fn grpc_run_stream_executes_sandbox_process_runner_within_workspace_scope(
                         .context("failed to send tool approval response")?;
                     saw_approval_request = true;
                 }
-                common_v1::run_stream_event::Body::ToolDecision(decision) => {
-                    if decision.kind == common_v1::tool_decision::DecisionKind::Allow as i32 {
-                        saw_allow_decision = true;
-                    }
+                common_v1::run_stream_event::Body::ToolDecision(decision)
+                    if decision.kind == common_v1::tool_decision::DecisionKind::Allow as i32 =>
+                {
+                    saw_allow_decision = true;
                 }
-                common_v1::run_stream_event::Body::ToolResult(result) => {
-                    if result.success {
-                        let output = serde_json::from_slice::<Value>(&result.output_json)
-                            .context("sandbox tool result output_json should be valid JSON")?;
-                        assert_eq!(
-                            output.get("visibility").and_then(Value::as_str),
-                            Some("redacted_preview")
-                        );
-                        let artifact = output.get("artifact").and_then(Value::as_object).context(
-                            "sandbox process result should expose a durable artifact ref",
-                        )?;
-                        assert_eq!(
-                            artifact.get("tool_name").and_then(Value::as_str),
-                            Some("palyra.process.run")
-                        );
-                        assert_eq!(
-                            artifact.get("sensitivity").and_then(Value::as_str),
-                            Some("stdout_stderr")
-                        );
-                        assert!(
-                            artifact.get("artifact_id").and_then(Value::as_str).is_some(),
-                            "sandbox process artifact ref should include an artifact id"
-                        );
-                        assert!(
-                            artifact.get("digest_sha256").and_then(Value::as_str).is_some(),
-                            "sandbox process artifact ref should include a digest"
-                        );
-                        let summary_json = output
-                            .get("summary")
+                common_v1::run_stream_event::Body::ToolResult(result) if result.success => {
+                    let output = serde_json::from_slice::<Value>(&result.output_json)
+                        .context("sandbox tool result output_json should be valid JSON")?;
+                    assert_eq!(
+                        output.get("visibility").and_then(Value::as_str),
+                        Some("redacted_preview")
+                    );
+                    let artifact = output
+                        .get("artifact")
+                        .and_then(Value::as_object)
+                        .context("sandbox process result should expose a durable artifact ref")?;
+                    assert_eq!(
+                        artifact.get("tool_name").and_then(Value::as_str),
+                        Some("palyra.process.run")
+                    );
+                    assert_eq!(
+                        artifact.get("sensitivity").and_then(Value::as_str),
+                        Some("stdout_stderr")
+                    );
+                    assert!(
+                        artifact.get("artifact_id").and_then(Value::as_str).is_some(),
+                        "sandbox process artifact ref should include an artifact id"
+                    );
+                    assert!(
+                        artifact.get("digest_sha256").and_then(Value::as_str).is_some(),
+                        "sandbox process artifact ref should include a digest"
+                    );
+                    let summary_json = output
+                        .get("summary")
+                        .and_then(Value::as_str)
+                        .context("sandbox process model-visible output should include a summary")
+                        .and_then(|summary| {
+                            serde_json::from_str::<Value>(summary)
+                                .context("sandbox process summary should be valid JSON")
+                        })?;
+                    assert_eq!(summary_json.get("exit_code").and_then(Value::as_i64), Some(0));
+                    assert!(
+                        summary_json
+                            .get("stdout")
                             .and_then(Value::as_str)
-                            .context(
-                                "sandbox process model-visible output should include a summary",
-                            )
-                            .and_then(|summary| {
-                                serde_json::from_str::<Value>(summary)
-                                    .context("sandbox process summary should be valid JSON")
-                            })?;
-                        assert_eq!(summary_json.get("exit_code").and_then(Value::as_i64), Some(0));
-                        assert!(
-                            summary_json
-                                .get("stdout")
-                                .and_then(Value::as_str)
-                                .map(|stdout| !stdout.trim().is_empty())
-                                .unwrap_or(false),
-                            "sandbox process stdout should include uname output"
-                        );
-                        saw_success_result = true;
-                    }
+                            .map(|stdout| !stdout.trim().is_empty())
+                            .unwrap_or(false),
+                        "sandbox process stdout should include uname output"
+                    );
+                    saw_success_result = true;
                 }
-                common_v1::run_stream_event::Body::ToolAttestation(attestation) => {
-                    if attestation.executor == "sandbox_tier_b" {
-                        assert!(!attestation.timed_out, "sandbox success path must not time out");
-                        saw_sandbox_attestation = true;
-                    }
+                common_v1::run_stream_event::Body::ToolAttestation(attestation)
+                    if attestation.executor == "sandbox_tier_b" =>
+                {
+                    assert!(!attestation.timed_out, "sandbox success path must not time out");
+                    saw_sandbox_attestation = true;
                 }
                 _ => {}
             }
@@ -7783,14 +7780,12 @@ async fn grpc_run_stream_blocks_sandbox_process_runner_path_traversal() -> Resul
                         .context("failed to send tool approval response")?;
                     saw_approval_request = true;
                 }
-                common_v1::run_stream_event::Body::ToolResult(result) => {
-                    if !result.success {
-                        assert!(
-                            result.error.contains("path traversal"),
-                            "sandbox denial should explain traversal block"
-                        );
-                        saw_failed_result = true;
-                    }
+                common_v1::run_stream_event::Body::ToolResult(result) if !result.success => {
+                    assert!(
+                        result.error.contains("path traversal"),
+                        "sandbox denial should explain traversal block"
+                    );
+                    saw_failed_result = true;
                 }
                 _ => {}
             }
@@ -7886,14 +7881,12 @@ async fn grpc_run_stream_blocks_sandbox_process_runner_non_allowlisted_egress_ho
                         .context("failed to send tool approval response")?;
                     saw_approval_request = true;
                 }
-                common_v1::run_stream_event::Body::ToolResult(result) => {
-                    if !result.success {
-                        assert!(
-                            result.error.contains("blocked.example"),
-                            "sandbox denial should include denied host context"
-                        );
-                        saw_failed_result = true;
-                    }
+                common_v1::run_stream_event::Body::ToolResult(result) if !result.success => {
+                    assert!(
+                        result.error.contains("blocked.example"),
+                        "sandbox denial should include denied host context"
+                    );
+                    saw_failed_result = true;
                 }
                 _ => {}
             }
@@ -8884,17 +8877,15 @@ async fn grpc_run_stream_admin_cancel_waits_for_inflight_process_runner_completi
                         .context("failed to send process runner approval response")?;
                     saw_approval_request = true;
                 }
-                common_v1::run_stream_event::Body::ToolDecision(decision) => {
-                    if decision.kind == common_v1::tool_decision::DecisionKind::Allow as i32 {
-                        break true;
-                    }
+                common_v1::run_stream_event::Body::ToolDecision(decision)
+                    if decision.kind == common_v1::tool_decision::DecisionKind::Allow as i32 =>
+                {
+                    break true;
                 }
-                common_v1::run_stream_event::Body::ToolResult(result) => {
-                    if result.success {
-                        anyhow::bail!(
-                            "process runner emitted a successful tool result before cancellation"
-                        );
-                    }
+                common_v1::run_stream_event::Body::ToolResult(result) if result.success => {
+                    anyhow::bail!(
+                        "process runner emitted a successful tool result before cancellation"
+                    );
                 }
                 _ => {}
             }
@@ -8949,10 +8940,8 @@ async fn grpc_run_stream_admin_cancel_waits_for_inflight_process_runner_completi
                         break;
                     }
                 }
-                common_v1::run_stream_event::Body::ToolResult(result) => {
-                    if result.success {
-                        saw_success_result = true;
-                    }
+                common_v1::run_stream_event::Body::ToolResult(result) if result.success => {
+                    saw_success_result = true;
                 }
                 _ => {}
             }
