@@ -39,8 +39,8 @@ use crate::journal::{
     WorkspaceDocumentListFilter, WorkspaceDocumentMoveRequest, WorkspaceDocumentRecord,
     WorkspaceDocumentVersionRecord, WorkspaceDocumentWriteRequest, WorkspaceRestoreActivityFilter,
     WorkspaceRestoreActivitySummary, WorkspaceRestoreReportCreateRequest,
-    WorkspaceRestoreReportListFilter, WorkspaceRestoreReportRecord, WorkspaceSearchHit,
-    WorkspaceSearchRequest,
+    WorkspaceRestoreReportListFilter, WorkspaceRestoreReportRecord, WorkspaceScoreBreakdown,
+    WorkspaceSearchHit, WorkspaceSearchRequest,
 };
 use crate::provider_leases::{
     ProviderCredentialFeedbackKind, ProviderCredentialFeedbackRequest, ProviderLeaseAcquireError,
@@ -48,8 +48,10 @@ use crate::provider_leases::{
     ProviderLeaseManagerSnapshot, ProviderLeasePreviewRequest, ProviderLeasePreviewSnapshot,
 };
 use crate::retrieval::{
-    score_memory_candidates, score_workspace_candidates, ExternalRetrievalRuntime,
-    RetrievalBackend, RetrievalBackendSnapshot, RetrievalRuntimeConfig,
+    lexical_overlap_score, recency_score as retrieval_recency_score, score_memory_candidates,
+    score_with_profile, score_workspace_candidates, workspace_source_quality,
+    ExternalRetrievalRuntime, RetrievalBackend, RetrievalBackendSnapshot, RetrievalRuntimeConfig,
+    RetrievalSourceProfileKind,
 };
 use crate::self_healing::{
     IncidentDomain, RemediationAttemptStatus, RuntimeIncidentHistoryEntry,
@@ -8283,11 +8285,32 @@ impl GatewayRuntimeState {
                 )
                 .map_err(|error| map_memory_store_error("search workspace documents", error))?;
             let fusion_started = Instant::now();
-            let hits = score_workspace_candidates(
+            let mut hits = score_workspace_candidates(
                 candidate_outcome.candidates,
                 request.min_score,
                 &retrieval_config,
             );
+            if hits.is_empty() {
+                let documents = state
+                    .journal_store
+                    .list_workspace_documents(&WorkspaceDocumentListFilter {
+                        principal: request.principal.clone(),
+                        channel: request.channel.clone(),
+                        agent_id: request.agent_id.clone(),
+                        prefix: request.prefix.clone(),
+                        include_deleted: false,
+                        limit: request.top_k.clamp(1, MAX_MEMORY_SEARCH_TOP_K),
+                    })
+                    .map_err(|error| {
+                        map_memory_store_error("fallback search workspace documents", error)
+                    })?;
+                hits = fallback_workspace_document_search_hits(
+                    documents,
+                    &request,
+                    &retrieval_config,
+                    current_unix_ms(),
+                );
+            }
             let diagnostics = complete_retrieval_diagnostics(
                 candidate_outcome.diagnostics,
                 elapsed_millis(fusion_started),
@@ -8319,6 +8342,113 @@ impl GatewayRuntimeState {
     pub fn record_cron_trigger_fired(&self) {
         self.counters.cron_triggers_fired.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+fn fallback_workspace_document_search_hits(
+    documents: Vec<WorkspaceDocumentRecord>,
+    request: &WorkspaceSearchRequest,
+    retrieval_config: &RetrievalRuntimeConfig,
+    now_unix_ms: i64,
+) -> Vec<WorkspaceSearchHit> {
+    let profile =
+        retrieval_config.scoring.profile_for(RetrievalSourceProfileKind::WorkspaceDocument);
+    let query_variants = vec![request.query.clone()];
+    let mut hits = documents
+        .into_iter()
+        .filter(|document| request.include_quarantined || document.risk_state != "quarantined")
+        .filter_map(|document| {
+            let searchable_text =
+                format!("{}\n{}\n{}", document.title, document.path, document.content_text);
+            let lexical_score = lexical_overlap_score(
+                searchable_text.as_str(),
+                query_variants.as_slice(),
+                retrieval_config.scoring.phrase_match_bonus_bps,
+            );
+            if lexical_score <= 0.0 {
+                return None;
+            }
+            let recency = retrieval_recency_score(
+                document.updated_at_unix_ms,
+                now_unix_ms,
+                profile.min_recency_bps,
+            );
+            let source_quality = workspace_source_quality(
+                document.pinned,
+                document.manual_override,
+                document.prompt_binding.as_str(),
+                document.risk_state.as_str(),
+                profile,
+            );
+            let breakdown = score_with_profile(
+                lexical_score,
+                0.0,
+                recency,
+                source_quality,
+                document.pinned,
+                profile,
+            );
+            if breakdown.final_score < request.min_score {
+                return None;
+            }
+            let snippet = fallback_workspace_document_snippet(
+                document.content_text.as_str(),
+                request.query.as_str(),
+            );
+            Some(WorkspaceSearchHit {
+                version: document.latest_version,
+                chunk_index: 0,
+                chunk_count: 1,
+                score: breakdown.final_score,
+                reason: format!(
+                    "journal_document_fallback(lexical={:.2},recency={:.2},quality={:.2})",
+                    breakdown.lexical_score,
+                    breakdown.recency_score,
+                    breakdown.source_quality_score,
+                ),
+                breakdown: WorkspaceScoreBreakdown {
+                    lexical_score: breakdown.lexical_score,
+                    vector_score: 0.0,
+                    recency_score: breakdown.recency_score,
+                    source_quality_score: breakdown.source_quality_score,
+                    final_score: breakdown.final_score,
+                },
+                snippet,
+                document,
+            })
+        })
+        .collect::<Vec<_>>();
+    hits.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| right.document.updated_at_unix_ms.cmp(&left.document.updated_at_unix_ms))
+            .then_with(|| left.document.document_id.cmp(&right.document.document_id))
+    });
+    hits.truncate(request.top_k.clamp(1, MAX_MEMORY_SEARCH_TOP_K));
+    hits
+}
+
+fn fallback_workspace_document_snippet(content: &str, query: &str) -> String {
+    const SNIPPET_CHARS: usize = 512;
+    let query_tokens = query
+        .split(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '-')
+        .map(str::trim)
+        .filter(|token| token.chars().count() >= 3)
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    let content_lower = content.to_ascii_lowercase();
+    let match_index = query_tokens
+        .iter()
+        .filter_map(|token| content_lower.find(token.as_str()))
+        .min()
+        .unwrap_or(0);
+    let start = content[..match_index.min(content.len())]
+        .char_indices()
+        .rev()
+        .nth(SNIPPET_CHARS / 4)
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    content[start..].chars().take(SNIPPET_CHARS).collect::<String>()
 }
 
 fn validate_memory_item_content_limits(
@@ -8365,11 +8495,12 @@ fn normalize_optional_agent_model_profile(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        provider_credential_attribution_for_provider, provider_lease_timeout_status,
-        request_may_failover_to_other_provider, select_default_agent_model_profile,
-        validate_memory_item_content_limits, GatewayRuntimeState, MemoryRuntimeConfig,
+        fallback_workspace_document_search_hits, provider_credential_attribution_for_provider,
+        provider_lease_timeout_status, request_may_failover_to_other_provider,
+        select_default_agent_model_profile, validate_memory_item_content_limits,
+        GatewayRuntimeState, MemoryRuntimeConfig,
     };
-    use crate::journal::CanvasStatePatchRecord;
+    use crate::journal::{CanvasStatePatchRecord, WorkspaceDocumentRecord, WorkspaceSearchRequest};
     use crate::model_provider::{
         ProviderCapabilitiesSnapshot, ProviderCircuitBreakerSnapshot, ProviderDiscoverySnapshot,
         ProviderHealthProbeSnapshot, ProviderRegistryModelSnapshot,
@@ -8381,6 +8512,7 @@ mod tests {
         LeasePreviewState, LeasePriority, ProviderLeaseExecutionContext,
         ProviderLeasePreviewSnapshot,
     };
+    use crate::retrieval::RetrievalRuntimeConfig;
     use tonic::Code;
 
     #[test]
@@ -8541,6 +8673,61 @@ mod tests {
             token_error.message().contains("exceeds token limit"),
             "unexpected token-limit error: {token_error}"
         );
+    }
+
+    #[test]
+    fn fallback_workspace_document_search_finds_unindexed_active_documents() {
+        let document = WorkspaceDocumentRecord {
+            document_id: "workspace-doc-1".to_owned(),
+            principal: "principal-1".to_owned(),
+            channel: None,
+            agent_id: None,
+            latest_session_id: Some("session-1".to_owned()),
+            path: "projects/S033/MEMORY.md".to_owned(),
+            parent_path: Some("projects/S033".to_owned()),
+            title: "Project Memory".to_owned(),
+            kind: "memory".to_owned(),
+            document_class: "workspace_memory".to_owned(),
+            state: "active".to_owned(),
+            prompt_binding: "system_candidate".to_owned(),
+            risk_state: "clean".to_owned(),
+            risk_reasons: Vec::new(),
+            pinned: false,
+            manual_override: false,
+            template_id: None,
+            template_version: None,
+            source_memory_id: None,
+            latest_version: 1,
+            content_text: "- remembered_at_unix_ms=1780430000000 source=manual\n  S033-PREF-20260602 prefers TypeScript, Vitest, and short Czech reports.".to_owned(),
+            content_hash: "hash-1".to_owned(),
+            created_at_unix_ms: 1_780_430_000_000,
+            updated_at_unix_ms: 1_780_430_000_000,
+            deleted_at_unix_ms: None,
+            last_recalled_at_unix_ms: None,
+        };
+        let request = WorkspaceSearchRequest {
+            principal: "principal-1".to_owned(),
+            channel: None,
+            agent_id: None,
+            query: "S033-PREF-20260602 Vitest".to_owned(),
+            prefix: Some("projects/S033".to_owned()),
+            top_k: 4,
+            min_score: 0.0,
+            include_historical: false,
+            include_quarantined: false,
+        };
+
+        let hits = fallback_workspace_document_search_hits(
+            vec![document],
+            &request,
+            &RetrievalRuntimeConfig::default(),
+            1_780_430_000_000,
+        );
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].document.path, "projects/S033/MEMORY.md");
+        assert!(hits[0].snippet.contains("S033-PREF-20260602"));
+        assert!(hits[0].reason.contains("journal_document_fallback"));
     }
 
     #[test]

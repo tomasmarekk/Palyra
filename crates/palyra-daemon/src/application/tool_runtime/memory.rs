@@ -998,6 +998,20 @@ pub(crate) async fn execute_memory_replace_tool(
     let existing_item = match runtime_state.memory_item(memory_id.clone()).await {
         Ok(Some(item)) => item,
         Ok(None) => {
+            if let Some(outcome) = maybe_replace_workspace_document_by_id(
+                runtime_state,
+                context,
+                namespace,
+                proposal_id,
+                input_json,
+                memory_id.as_str(),
+                content_text.as_str(),
+                &parsed,
+            )
+            .await
+            {
+                return outcome;
+            }
             return memory_tool_execution_outcome(
                 namespace,
                 proposal_id,
@@ -1105,6 +1119,131 @@ pub(crate) async fn execute_memory_replace_tool(
             format!("palyra.memory.replace failed to serialize output: {error}"),
         ),
     }
+}
+
+async fn maybe_replace_workspace_document_by_id(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: ToolRuntimeExecutionContext<'_>,
+    namespace: &'static [u8],
+    proposal_id: &str,
+    input_json: &[u8],
+    document_id: &str,
+    content_text: &str,
+    parsed: &Map<String, Value>,
+) -> Option<ToolExecutionOutcome> {
+    let document = match runtime_state
+        .workspace_document_by_id(
+            context.principal.to_owned(),
+            context.channel.map(str::to_owned),
+            optional_trimmed_string(parsed.get("agent_id")),
+            document_id.to_owned(),
+            false,
+        )
+        .await
+    {
+        Ok(Some(document)) => document,
+        Ok(None) => return None,
+        Err(error) => {
+            return Some(memory_tool_execution_outcome(
+                namespace,
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                format!(
+                    "palyra.memory.replace failed to inspect workspace document: {}",
+                    error.message()
+                ),
+            ));
+        }
+    };
+    if let Err(error) = authorize_memory_action(
+        context.principal,
+        "memory.ingest",
+        format!("memory:workspace_document:{}", document.document_id).as_str(),
+    ) {
+        return Some(memory_tool_execution_outcome(
+            namespace,
+            proposal_id,
+            input_json,
+            false,
+            b"{}".to_vec(),
+            format!("palyra.memory.replace {}", error.message()),
+        ));
+    }
+    let previous_content_hash = document.content_hash.clone();
+    let updated_document = match runtime_state
+        .upsert_workspace_document(WorkspaceDocumentWriteRequest {
+            document_id: Some(document.document_id.clone()),
+            principal: document.principal.clone(),
+            channel: document.channel.clone(),
+            agent_id: document.agent_id.clone(),
+            session_id: Some(context.session_id.to_owned()),
+            path: document.path.clone(),
+            title: Some(document.title.clone()),
+            content_text: content_text.to_owned(),
+            template_id: document.template_id.clone(),
+            template_version: document.template_version,
+            template_content_hash: None,
+            source_memory_id: document.source_memory_id.clone(),
+            manual_override: document.manual_override,
+        })
+        .await
+    {
+        Ok(document) => document,
+        Err(error) => {
+            return Some(memory_tool_execution_outcome(
+                namespace,
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                format!(
+                    "palyra.memory.replace failed to update workspace document: {}",
+                    error.message()
+                ),
+            ));
+        }
+    };
+    let payload = workspace_memory_replace_payload(
+        document_id,
+        previous_content_hash.as_str(),
+        &updated_document,
+    );
+    Some(match serde_json::to_vec(&payload) {
+        Ok(output_json) => memory_tool_execution_outcome(
+            namespace,
+            proposal_id,
+            input_json,
+            true,
+            output_json,
+            String::new(),
+        ),
+        Err(error) => memory_tool_execution_outcome(
+            namespace,
+            proposal_id,
+            input_json,
+            false,
+            b"{}".to_vec(),
+            format!("palyra.memory.replace failed to serialize workspace output: {error}"),
+        ),
+    })
+}
+
+fn workspace_memory_replace_payload(
+    memory_id: &str,
+    previous_content_hash: &str,
+    document: &WorkspaceDocumentRecord,
+) -> Value {
+    json!({
+        "memory_id": memory_id,
+        "workspace_document_id": document.document_id.as_str(),
+        "status": "workspace_document_replaced",
+        "durable_memory_write": true,
+        "previous_content_hash": previous_content_hash,
+        "document": workspace_document_output_payload(document),
+        "claim_boundary": "workspace memory document content was replaced in place; use the returned workspace document as the current durable project value",
+    })
 }
 
 pub(crate) async fn execute_memory_reflect_tool(
@@ -1693,21 +1832,32 @@ pub(crate) async fn execute_memory_recall_tool(
         device_id: context.device_id.to_owned(),
         channel: context.channel.map(str::to_owned),
     };
-    let raw_workspace_prefix = optional_trimmed_string(parsed.get("workspace_prefix"));
-    let workspace_prefix =
-        match workspace_memory_search_prefix(raw_workspace_prefix.as_deref(), "workspace", None) {
-            Ok(prefix) => prefix,
-            Err(error) => {
-                return memory_tool_execution_outcome(
-                    b"palyra.memory.recall.attestation.v1",
-                    proposal_id,
-                    input_json,
-                    false,
-                    b"{}".to_vec(),
-                    format!("palyra.memory.recall {error}"),
-                );
-            }
-        };
+    let raw_workspace_prefix = optional_trimmed_string(parsed.get("workspace_prefix"))
+        .or_else(|| optional_trimmed_string(parsed.get("prefix")));
+    let workspace_scope = memory_recall_workspace_scope_text(&parsed);
+    let inferred_project_prefix = if workspace_scope == "project" && raw_workspace_prefix.is_none()
+    {
+        infer_project_memory_prefix(runtime_state, context).await
+    } else {
+        None
+    };
+    let workspace_prefix = match workspace_memory_search_prefix(
+        raw_workspace_prefix.as_deref(),
+        workspace_scope.as_str(),
+        inferred_project_prefix.as_deref(),
+    ) {
+        Ok(prefix) => prefix,
+        Err(error) => {
+            return memory_tool_execution_outcome(
+                b"palyra.memory.recall.attestation.v1",
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                format!("palyra.memory.recall {error}"),
+            );
+        }
+    };
 
     let request = RecallRequest {
         query,
@@ -2961,7 +3111,22 @@ fn memory_retain_scope_text(parsed: &Map<String, Value>) -> String {
 }
 
 fn memory_search_scope_text(parsed: &Map<String, Value>) -> String {
+    if !parsed.contains_key("scope")
+        && (optional_trimmed_string(parsed.get("workspace_prefix")).is_some()
+            || optional_trimmed_string(parsed.get("prefix")).is_some())
+    {
+        return "workspace".to_owned();
+    }
     memory_scope_text(parsed, DEFAULT_MEMORY_SEARCH_SCOPE)
+}
+
+fn memory_recall_workspace_scope_text(parsed: &Map<String, Value>) -> String {
+    let scope = memory_scope_text(parsed, "workspace");
+    if scope == "project" {
+        "project".to_owned()
+    } else {
+        "workspace".to_owned()
+    }
 }
 
 fn memory_scope_text(parsed: &Map<String, Value>, default_scope: &str) -> String {
@@ -3142,12 +3307,39 @@ mod tests {
 
         assert_eq!(memory_retain_scope_text(&parsed), "principal");
         assert_eq!(memory_search_scope_text(&parsed), "principal");
+        assert_eq!(memory_recall_workspace_scope_text(&parsed), "workspace");
 
         let mut explicit = Map::new();
         explicit.insert("scope".to_owned(), serde_json::json!("session"));
 
         assert_eq!(memory_retain_scope_text(&explicit), "session");
         assert_eq!(memory_search_scope_text(&explicit), "session");
+
+        let mut workspace_prefix = Map::new();
+        workspace_prefix.insert("workspace_prefix".to_owned(), serde_json::json!("projects/S033"));
+        assert_eq!(memory_search_scope_text(&workspace_prefix), "workspace");
+
+        let mut project_recall = Map::new();
+        project_recall.insert("scope".to_owned(), serde_json::json!("project"));
+        assert_eq!(memory_recall_workspace_scope_text(&project_recall), "project");
+    }
+
+    #[test]
+    fn workspace_memory_replace_payload_marks_document_replaced_in_place() {
+        let document = workspace_document_record(
+            "S034-PREF-20260602 pro E2E testy UI v tomto projektu používáme Playwright.",
+        );
+
+        let payload = workspace_memory_replace_payload("workspace-doc-1", "old-hash", &document);
+
+        assert_eq!(payload["status"], "workspace_document_replaced");
+        assert_eq!(payload["durable_memory_write"], true);
+        assert_eq!(payload["workspace_document_id"].as_str(), Some(document.document_id.as_str()));
+        assert_eq!(payload["previous_content_hash"].as_str(), Some("old-hash"));
+        assert!(payload["claim_boundary"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("replaced in place"));
     }
 
     #[test]
