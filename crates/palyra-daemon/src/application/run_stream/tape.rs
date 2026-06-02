@@ -1059,13 +1059,45 @@ fn tool_result_tape_payload(
 ) -> String {
     let normalized_output = serde_json::from_slice::<Value>(output_json)
         .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(output_json).to_string() }));
-    json!({
+    let mut payload = json!({
         "proposal_id": proposal_id,
         "success": success,
         "output_json": normalized_output,
         "error": error,
-    })
-    .to_string()
+    });
+    if let Some(diagnostic) = tool_result_error_diagnostic(success, error) {
+        payload["diagnostic"] = diagnostic;
+    }
+    payload.to_string()
+}
+
+fn tool_result_error_diagnostic(success: bool, error: &str) -> Option<Value> {
+    let message = error.trim();
+    if success || message.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "error_kind": tool_result_error_kind(message),
+        "message": message,
+    }))
+}
+
+fn tool_result_error_kind(error: &str) -> &'static str {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("timeout") || lower.contains("timed out") {
+        "timeout"
+    } else if lower.contains("policy") || lower.contains("denied") {
+        "policy_denial"
+    } else if lower.contains("invalid")
+        || lower.contains("must be")
+        || lower.contains("requires")
+        || lower.contains("required")
+        || lower.contains("timestamp")
+    {
+        "validation_error"
+    } else {
+        "tool_error"
+    }
 }
 
 fn tool_attestation_tape_payload(
@@ -1095,7 +1127,7 @@ mod tests {
 
     use super::{
         redact_run_stream_text, redacted_run_stream_output_json,
-        should_attempt_tool_result_compaction,
+        should_attempt_tool_result_compaction, tool_result_tape_payload,
     };
 
     #[test]
@@ -1136,5 +1168,22 @@ mod tests {
 
         assert_eq!(value["token"], "<redacted>");
         assert_eq!(value["text"], "visible");
+    }
+
+    #[test]
+    fn failed_tool_result_tape_payload_includes_structured_diagnostic() {
+        let payload = tool_result_tape_payload(
+            "call_routines_control",
+            false,
+            br#"{}"#,
+            "at timestamp must be in the future",
+        );
+        let value: Value =
+            serde_json::from_str(payload.as_str()).expect("tool result payload should be json");
+
+        assert_eq!(value["success"], false);
+        assert_eq!(value["output_json"], serde_json::json!({}));
+        assert_eq!(value["diagnostic"]["error_kind"], "validation_error");
+        assert_eq!(value["diagnostic"]["message"], "at timestamp must be in the future");
     }
 }
