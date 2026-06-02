@@ -54,3 +54,33 @@ fn backup_verify_wrong_zip_reports_validation_error() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn backup_verify_missing_archive_reports_not_found() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let archive_path = workdir.path().join("missing-backup.zip");
+    let archive_arg = archive_path.display().to_string();
+    let output =
+        run_cli(&workdir, &["backup", "verify", "--archive", archive_arg.as_str(), "--json"])?;
+
+    assert_eq!(
+        output.status.code(),
+        Some(8),
+        "missing backup archive should fail as not_found; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).context("stderr was not UTF-8")?;
+    assert!(
+        stderr.contains("error[not_found]"),
+        "missing backup archive should be classified as not_found: {stderr}"
+    );
+    assert!(
+        stderr.contains("backup archive not found"),
+        "missing backup archive message should explain the wrong path: {stderr}"
+    );
+    assert!(
+        !stderr.contains("error[internal_error]"),
+        "missing backup archive must not look like an internal failure: {stderr}"
+    );
+    Ok(())
+}

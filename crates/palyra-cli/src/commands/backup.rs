@@ -227,8 +227,20 @@ fn run_backup_create(
 
 fn run_backup_verify(archive: String, json: bool) -> Result<()> {
     let archive_path = PathBuf::from(archive);
-    let file = fs::File::open(archive_path.as_path())
-        .with_context(|| format!("failed to open backup archive {}", archive_path.display()))?;
+    let file = match fs::File::open(archive_path.as_path()) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!(
+                "backup archive not found: {}; provide an existing Palyra backup archive path",
+                archive_path.display()
+            );
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to open backup archive {}", archive_path.display())
+            });
+        }
+    };
     let mut archive = ZipArchive::new(file)
         .with_context(|| format!("failed to parse {}", archive_path.display()))?;
     let manifest = read_backup_manifest(&mut archive)?;
