@@ -122,6 +122,49 @@ fn process_run_allowlist_exposes_lifecycle_controls() {
 }
 
 #[test]
+fn plugin_run_visibility_tracks_wasm_runtime_policy() {
+    let mut config = config(&["palyra.plugin.run"]);
+    let disabled_snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
+        config: &config,
+        browser_service_enabled: false,
+        request_context: &request_context(),
+        provider_kind: "openai_compatible",
+        provider_model_id: None,
+        surface: ToolExposureSurface::RunStream,
+        remaining_tool_budget: 1,
+        created_at_unix_ms: 42,
+    });
+
+    assert!(
+        disabled_snapshot.tools.iter().all(|tool| tool.name != "palyra.plugin.run"),
+        "plugin runner must not be model-visible when the WASM runtime is disabled"
+    );
+    assert!(
+        disabled_snapshot.filtered_tools.iter().any(|tool| {
+            tool.name == "palyra.plugin.run" && tool.reason_code.as_str() == "runtime_unavailable"
+        }),
+        "disabled WASM runtime should explain why plugin execution is hidden"
+    );
+
+    config.wasm_runtime.enabled = true;
+    let enabled_snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
+        config: &config,
+        browser_service_enabled: false,
+        request_context: &request_context(),
+        provider_kind: "openai_compatible",
+        provider_model_id: None,
+        surface: ToolExposureSurface::RunStream,
+        remaining_tool_budget: 1,
+        created_at_unix_ms: 43,
+    });
+
+    assert!(
+        enabled_snapshot.tools.iter().any(|tool| tool.name == "palyra.plugin.run"),
+        "plugin runner should be model-visible when allowlisted and enabled"
+    );
+}
+
+#[test]
 fn anthropic_catalog_exposes_http_fetch_with_boolean_additional_properties() {
     let config = config(&["palyra.http.fetch"]);
     let snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {

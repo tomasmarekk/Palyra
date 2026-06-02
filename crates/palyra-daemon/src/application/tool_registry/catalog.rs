@@ -209,6 +209,7 @@ fn runtime_available(
         | "palyra.process.stop"
         | "palyra.process.status"
         | "palyra.process.list" => config.process_runner.enabled,
+        "palyra.plugin.run" => config.wasm_runtime.enabled,
         tool if tool.starts_with("palyra.browser.") => browser_service_enabled,
         _ => true,
     }

@@ -707,6 +707,7 @@ const LOCAL_DESKTOP_DEFAULT_ALLOWED_TOOLS: &[&str] = &[
     "palyra.browser.permissions.set",
     "palyra.browser.downloads.list",
     "palyra.browser.downloads.get",
+    "palyra.plugin.run",
     "palyra.process.run",
     "palyra.process.stop",
     "palyra.process.status",
@@ -883,6 +884,12 @@ fn apply_local_desktop_tool_defaults(
     set_value_at_path(document, "tool_call.max_calls_per_run", toml::Value::Integer(96))?;
     set_value_at_path(document, "tool_call.execution_timeout_ms", toml::Value::Integer(120_000))?;
     set_value_at_path(document, "tool_call.process_runner.enabled", toml::Value::Boolean(true))?;
+    set_value_at_path(document, "tool_call.wasm_runtime.enabled", toml::Value::Boolean(true))?;
+    set_value_at_path(
+        document,
+        "tool_call.wasm_runtime.allow_inline_modules",
+        toml::Value::Boolean(true),
+    )?;
     set_value_at_path(
         document,
         "tool_call.process_runner.tier",
@@ -12247,7 +12254,13 @@ mod init_command_tests {
             allowed_tools.iter().any(|tool| tool == "palyra.browser.downloads.get"),
             "local init should allow gateway-mediated browser download retrieval when the service is enabled"
         );
+        assert!(
+            allowed_tools.iter().any(|tool| tool == "palyra.plugin.run"),
+            "local init should expose bounded plugin runtime for local extension testing"
+        );
         assert_eq!(read_bool(&document, "tool_call.process_runner.enabled"), Some(true));
+        assert_eq!(read_bool(&document, "tool_call.wasm_runtime.enabled"), Some(true));
+        assert_eq!(read_bool(&document, "tool_call.wasm_runtime.allow_inline_modules"), Some(true));
         assert_eq!(read_integer(&document, "tool_call.max_calls_per_run"), Some(96));
         assert_eq!(read_integer(&document, "tool_call.execution_timeout_ms"), Some(120_000));
         assert_eq!(read_bool(&document, "tool_call.process_runner.allow_interpreters"), Some(true));

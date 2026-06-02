@@ -810,20 +810,41 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
         ),
         entry(
             "palyra.plugin.run",
-            "Run a verified Palyra skill or bounded inline WASM module.",
+            "Run a verified installed Palyra skill module or a bounded inline WASM module. Use skill_id/tool_id for installed skill modules; use module_wat or module_base64 for inline modules when runtime policy permits them.",
             object_schema(
                 &[],
                 vec![
-                    ("skill_id", json!({"type":"string"})),
-                    ("skill_version", json!({"type":"string"})),
-                    ("module_path", json!({"type":"string"})),
-                    ("tool_id", json!({"type":"string"})),
-                    ("module_wat", json!({"type":"string"})),
-                    ("module_base64", json!({"type":"string"})),
-                    ("entrypoint", json!({"type":"string"})),
+                    (
+                        "skill_id",
+                        json!({"type":"string","description":"Installed skill identifier to resolve when no inline module payload is supplied."}),
+                    ),
+                    (
+                        "skill_version",
+                        json!({"type":"string","description":"Optional installed skill version; omit to use the current installed version."}),
+                    ),
+                    (
+                        "module_path",
+                        json!({"type":"string","description":"Optional modules/*.wasm path inside the installed skill artifact."}),
+                    ),
+                    (
+                        "tool_id",
+                        json!({"type":"string","description":"Optional tool identifier from the installed skill manifest, used to resolve the target module."}),
+                    ),
+                    (
+                        "module_wat",
+                        json!({"type":"string","description":"Inline WebAssembly text module for bounded local execution when inline modules are enabled."}),
+                    ),
+                    (
+                        "module_base64",
+                        json!({"type":"string","description":"Base64-encoded inline WebAssembly binary for bounded local execution when inline modules are enabled."}),
+                    ),
+                    (
+                        "entrypoint",
+                        json!({"type":"string","description":"Exported WebAssembly function to call; defaults to run."}),
+                    ),
                     (
                         "capabilities",
-                        json!({"type":"object","properties":{},"additionalProperties":true}),
+                        json!({"type":"object","description":"Optional requested host capabilities; each requested capability must be allowed by runtime policy.","properties":{},"additionalProperties":true}),
                     ),
                 ],
                 false,
