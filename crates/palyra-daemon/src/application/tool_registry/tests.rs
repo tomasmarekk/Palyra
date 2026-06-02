@@ -420,6 +420,29 @@ fn routines_control_schema_discourages_slug_ids_and_short_intervals() {
 }
 
 #[test]
+fn routines_query_schema_exposes_scheduler_wait_terminal_operation() {
+    let entry = registry_entry("palyra.routines.query").expect("routines query tool entry");
+    let operation_values = entry.input_schema["properties"]["operation"]["enum"]
+        .as_array()
+        .expect("operation enum should be an array");
+
+    assert!(
+        operation_values.iter().any(|value| value.as_str() == Some("wait_terminal")),
+        "operation enum should include scheduler wait"
+    );
+    assert!(
+        entry.description.contains("operation=wait_terminal"),
+        "description should guide models away from repeated scheduler polling"
+    );
+    assert_eq!(entry.input_schema["properties"]["timeout_ms"]["maximum"], 900_000);
+    assert_eq!(entry.input_schema["properties"]["poll_interval_ms"]["minimum"], 250);
+    assert!(entry.input_schema["properties"]["expected_successful_runs"]["description"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("max_runs"));
+}
+
+#[test]
 fn delegation_control_schema_does_not_expose_parent_run_id() {
     let control =
         registry_entry("palyra.delegation.control").expect("delegation control should register");

@@ -19,6 +19,8 @@ pub(crate) const DEFAULT_AGENT_LOOP_WALL_CLOCK_BUDGET_MS: u64 = 900_000;
 
 const BROWSER_SESSION_CREATE_TOOL_NAME: &str = "palyra.browser.session.create";
 const BROWSER_SESSION_CLOSE_TOOL_NAME: &str = "palyra.browser.session.close";
+const ROUTINES_QUERY_TOOL_NAME: &str = "palyra.routines.query";
+const ROUTINES_CONTROL_TOOL_NAME: &str = "palyra.routines.control";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -276,14 +278,16 @@ impl AgentRunLoopState {
     }
 
     fn cleanup_instructions(&self) -> Vec<String> {
-        pending_browser_session_ids(self.messages.as_slice())
+        let mut cleanup = pending_browser_session_ids(self.messages.as_slice())
             .into_iter()
             .map(|session_id| {
                 format!(
                     "browser session {session_id} may still be open; close it with `palyra browser session close {session_id} --json` or stop browserd with `palyra browser stop --json`."
                 )
             })
-            .collect()
+            .collect::<Vec<_>>();
+        cleanup.extend(pending_routine_cleanup_instructions(self.messages.as_slice()));
+        cleanup
     }
 
     fn elapsed(&self) -> Duration {
@@ -293,6 +297,12 @@ impl AgentRunLoopState {
 
 #[derive(Debug, Clone)]
 struct BrowserToolCallRef {
+    tool_name: String,
+    input_json: Value,
+}
+
+#[derive(Debug, Clone)]
+struct RoutineToolCallRef {
     tool_name: String,
     input_json: Value,
 }
@@ -350,6 +360,138 @@ fn pending_browser_session_ids(messages: &[ProviderMessage]) -> BTreeSet<String>
     }
 
     open_session_ids
+}
+
+fn pending_routine_cleanup_instructions(messages: &[ProviderMessage]) -> Vec<String> {
+    let mut tool_calls_by_id = BTreeMap::<String, RoutineToolCallRef>::new();
+    let mut created_routine_ids = BTreeSet::<String>::new();
+    let mut latest_routine_views = BTreeMap::<String, Value>::new();
+
+    for message in messages {
+        for tool_call in &message.tool_calls {
+            if matches!(
+                tool_call.tool_name.as_str(),
+                ROUTINES_QUERY_TOOL_NAME | ROUTINES_CONTROL_TOOL_NAME
+            ) {
+                tool_calls_by_id.insert(
+                    tool_call.proposal_id.clone(),
+                    RoutineToolCallRef {
+                        tool_name: tool_call.tool_name.clone(),
+                        input_json: tool_call.input_json.clone(),
+                    },
+                );
+            }
+        }
+
+        if message.role != crate::model_provider::ProviderMessageRole::Tool {
+            continue;
+        }
+        let Some(tool_call_id) = message.tool_call_id.as_deref() else {
+            continue;
+        };
+        let Some(tool_call) = tool_calls_by_id.get(tool_call_id) else {
+            continue;
+        };
+        let Ok(raw_output) = serde_json::from_str::<Value>(message.text_content().as_str()) else {
+            continue;
+        };
+        let output = routine_tool_output_payload(&raw_output);
+        let operation = routine_tool_operation(&tool_call.input_json, output);
+
+        if tool_call.tool_name == ROUTINES_CONTROL_TOOL_NAME
+            && operation == Some("delete")
+            && output.get("deleted").and_then(Value::as_bool).unwrap_or(false)
+        {
+            if let Some(routine_id) = routine_id_from_routine_payload(output) {
+                created_routine_ids.remove(routine_id);
+                latest_routine_views.remove(routine_id);
+            }
+            continue;
+        }
+
+        if tool_call.tool_name == ROUTINES_CONTROL_TOOL_NAME && operation == Some("upsert") {
+            let upsert_created_routine =
+                tool_call.input_json.get("routine_id").and_then(Value::as_str).is_none();
+            if upsert_created_routine {
+                if let Some(routine) = output.get("routine").and_then(Value::as_object) {
+                    if let Some(routine_id) = routine.get("routine_id").and_then(Value::as_str) {
+                        created_routine_ids.insert(routine_id.to_owned());
+                        latest_routine_views
+                            .insert(routine_id.to_owned(), Value::Object(routine.clone()));
+                    }
+                }
+            }
+            continue;
+        }
+
+        if let Some(routine) = output.get("routine").and_then(Value::as_object) {
+            if let Some(routine_id) = routine.get("routine_id").and_then(Value::as_str) {
+                if created_routine_ids.contains(routine_id) {
+                    latest_routine_views
+                        .insert(routine_id.to_owned(), Value::Object(routine.clone()));
+                }
+            }
+        }
+    }
+
+    created_routine_ids
+        .into_iter()
+        .map(|routine_id| {
+            routine_cleanup_instruction(
+                routine_id.as_str(),
+                latest_routine_views.get(routine_id.as_str()),
+            )
+        })
+        .collect()
+}
+
+fn routine_tool_output_payload(output: &Value) -> &Value {
+    output
+        .get("output")
+        .filter(|_| output.get("tool_name").and_then(Value::as_str).is_some())
+        .unwrap_or(output)
+}
+
+fn routine_tool_operation<'a>(input: &'a Value, output: &'a Value) -> Option<&'a str> {
+    output
+        .get("operation")
+        .and_then(Value::as_str)
+        .or_else(|| input.get("operation").and_then(Value::as_str))
+}
+
+fn routine_id_from_routine_payload(output: &Value) -> Option<&str> {
+    output
+        .get("routine_id")
+        .and_then(Value::as_str)
+        .or_else(|| output.get("routine")?.get("routine_id")?.as_str())
+}
+
+fn routine_cleanup_instruction(routine_id: &str, latest_view: Option<&Value>) -> String {
+    let enabled = latest_view
+        .and_then(|view| view.get("enabled"))
+        .map(json_value_label)
+        .unwrap_or_else(|| "unknown".to_owned());
+    let next_run_at_unix_ms = latest_view
+        .and_then(|view| view.get("next_run_at_unix_ms"))
+        .map(json_value_label)
+        .unwrap_or_else(|| "unknown".to_owned());
+    let last_outcome_kind = latest_view
+        .and_then(|view| view.get("last_outcome_kind"))
+        .map(json_value_label)
+        .unwrap_or_else(|| "unknown".to_owned());
+    format!(
+        "routine {routine_id} may still exist (enabled={enabled}, next_run_at_unix_ms={next_run_at_unix_ms}, last_outcome_kind={last_outcome_kind}); inspect it with `palyra routines show --id {routine_id} --json` or delete it with `palyra routines delete --id {routine_id} --json`."
+    )
+}
+
+fn json_value_label(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_owned(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::String(value) => value.clone(),
+        _ => "structured".to_owned(),
+    }
 }
 
 fn browser_session_close_confirmed(output: &Value) -> bool {
@@ -554,6 +696,120 @@ mod tests {
                         "closed": false,
                         "reason": "session_not_found"
                     }
+                })
+                .to_string(),
+            ),
+        ];
+        let state = AgentRunLoopState::new(messages, 2, 4, 10_000);
+
+        let message = state.message_with_cleanup_guidance("agent loop wall-clock budget exhausted");
+
+        assert_eq!(message, "agent loop wall-clock budget exhausted");
+    }
+
+    #[test]
+    fn loop_state_reports_created_routine_cleanup_guidance_on_failure() {
+        let routine_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let messages = vec![
+            ProviderMessage {
+                role: ProviderMessageRole::Assistant,
+                content: Vec::new(),
+                name: None,
+                tool_call_id: None,
+                tool_calls: vec![ProviderMessageToolCall {
+                    proposal_id: "call-upsert".to_owned(),
+                    tool_name: ROUTINES_CONTROL_TOOL_NAME.to_owned(),
+                    input_json: serde_json::json!({
+                        "operation": "upsert",
+                        "trigger_kind": "schedule",
+                        "name": "heartbeat",
+                        "prompt": "append heartbeat",
+                        "schedule_type": "every",
+                        "every_interval_ms": 60_000,
+                        "max_runs": 3,
+                    }),
+                }],
+            },
+            ProviderMessage::tool_result(
+                "call-upsert",
+                serde_json::json!({
+                    "operation": "upsert",
+                    "routine": {
+                        "routine_id": routine_id,
+                        "enabled": false,
+                        "next_run_at_unix_ms": null,
+                        "last_outcome_kind": "success_with_output"
+                    }
+                })
+                .to_string(),
+            ),
+        ];
+        let state = AgentRunLoopState::new(messages, 2, 4, 10_000);
+
+        let message = state.message_with_cleanup_guidance("agent loop wall-clock budget exhausted");
+
+        assert!(message.contains("agent loop wall-clock budget exhausted"));
+        assert!(message.contains("routine 01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+        assert!(message.contains("enabled=false"));
+        assert!(message.contains("next_run_at_unix_ms=null"));
+        assert!(message.contains("last_outcome_kind=success_with_output"));
+        assert!(message.contains("palyra routines delete --id 01ARZ3NDEKTSV4RRFFQ69G5FAV --json"));
+    }
+
+    #[test]
+    fn loop_state_omits_created_routine_cleanup_after_delete() {
+        let routine_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let messages = vec![
+            ProviderMessage {
+                role: ProviderMessageRole::Assistant,
+                content: Vec::new(),
+                name: None,
+                tool_call_id: None,
+                tool_calls: vec![ProviderMessageToolCall {
+                    proposal_id: "call-upsert".to_owned(),
+                    tool_name: ROUTINES_CONTROL_TOOL_NAME.to_owned(),
+                    input_json: serde_json::json!({
+                        "operation": "upsert",
+                        "trigger_kind": "schedule",
+                        "name": "heartbeat",
+                        "prompt": "append heartbeat",
+                        "schedule_type": "every",
+                        "every_interval_ms": 60_000,
+                    }),
+                }],
+            },
+            ProviderMessage::tool_result(
+                "call-upsert",
+                serde_json::json!({
+                    "operation": "upsert",
+                    "routine": {
+                        "routine_id": routine_id,
+                        "enabled": true,
+                        "next_run_at_unix_ms": 42,
+                    }
+                })
+                .to_string(),
+            ),
+            ProviderMessage {
+                role: ProviderMessageRole::Assistant,
+                content: Vec::new(),
+                name: None,
+                tool_call_id: None,
+                tool_calls: vec![ProviderMessageToolCall {
+                    proposal_id: "call-delete".to_owned(),
+                    tool_name: ROUTINES_CONTROL_TOOL_NAME.to_owned(),
+                    input_json: serde_json::json!({
+                        "operation": "delete",
+                        "routine_id": routine_id,
+                    }),
+                }],
+            },
+            ProviderMessage::tool_result(
+                "call-delete",
+                serde_json::json!({
+                    "operation": "delete",
+                    "deleted": true,
+                    "routine_id": routine_id,
                 })
                 .to_string(),
             ),

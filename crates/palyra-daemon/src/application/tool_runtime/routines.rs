@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     path::{Component, Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use chrono::{TimeZone, Timelike};
@@ -47,6 +48,12 @@ const ROUTINE_APPROVAL_TIMEOUT_SECONDS: u32 = 900;
 const ROUTINE_APPROVAL_DEVICE_ID: &str = "system:routines";
 const MAX_ROUTINES_QUERY_TOOL_INPUT_BYTES: usize = 64 * 1024;
 const MAX_ROUTINES_CONTROL_TOOL_INPUT_BYTES: usize = 128 * 1024;
+const DEFAULT_ROUTINE_WAIT_TIMEOUT_MS: u64 = 300_000;
+const MAX_ROUTINE_WAIT_TIMEOUT_MS: u64 = 900_000;
+const DEFAULT_ROUTINE_WAIT_POLL_INTERVAL_MS: u64 = 1_000;
+const MIN_ROUTINE_WAIT_POLL_INTERVAL_MS: u64 = 250;
+const MAX_ROUTINE_WAIT_POLL_INTERVAL_MS: u64 = 30_000;
+const ROUTINE_WAIT_RUN_LIMIT: usize = 100;
 
 pub(crate) async fn execute_routines_tool(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -227,9 +234,12 @@ async fn execute_query_operation(
         "list" => list_routines(runtime_state, registry, context, &payload).await,
         "get" => get_routine(runtime_state, registry, context, &payload).await,
         "list_runs" => list_routine_runs(runtime_state, registry, context, &payload).await,
+        "wait_terminal" => {
+            wait_for_terminal_routine(runtime_state, registry, context, &payload).await
+        }
         "schedule_preview" => preview_schedule(&payload, timezone_mode),
         _ => Err(
-            "palyra.routines.query operation must be one of list|get|list_runs|schedule_preview"
+            "palyra.routines.query operation must be one of list|get|list_runs|wait_terminal|schedule_preview"
                 .to_owned(),
         ),
     }
@@ -382,6 +392,167 @@ async fn list_routine_runs(
         "runs": mapped_runs,
         "next_after_run_id": next_after_run_id,
     }))
+}
+
+async fn wait_for_terminal_routine(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    registry: &Arc<RoutineRegistry>,
+    context: &RoutinesToolContext,
+    payload: &Map<String, Value>,
+) -> Result<Value, String> {
+    let routine_id = required_string_field(payload, "routine_id")?;
+    let timeout_ms =
+        optional_u64_field(payload, "timeout_ms")?.unwrap_or(DEFAULT_ROUTINE_WAIT_TIMEOUT_MS);
+    let timeout_ms = timeout_ms.clamp(1, MAX_ROUTINE_WAIT_TIMEOUT_MS);
+    let poll_interval_ms = optional_u64_field(payload, "poll_interval_ms")?
+        .unwrap_or(DEFAULT_ROUTINE_WAIT_POLL_INTERVAL_MS)
+        .clamp(MIN_ROUTINE_WAIT_POLL_INTERVAL_MS, MAX_ROUTINE_WAIT_POLL_INTERVAL_MS);
+    let expected_successful_runs = optional_u32_field(payload, "expected_successful_runs")?;
+    let started = Instant::now();
+    let timeout = Duration::from_millis(timeout_ms);
+    let poll_interval = Duration::from_millis(poll_interval_ms);
+
+    loop {
+        let observation = observe_routine_wait_state(
+            runtime_state,
+            registry,
+            context,
+            routine_id.as_str(),
+            expected_successful_runs,
+            started.elapsed(),
+        )
+        .await?;
+
+        let terminal = observation_is_terminal(&observation);
+        let timed_out = !terminal && started.elapsed() >= timeout;
+        if terminal || timed_out {
+            let mut observation = observation;
+            if let Some(object) = observation.as_object_mut() {
+                object.insert("timed_out".to_owned(), json!(timed_out));
+                if timed_out {
+                    object.insert("wait_status".to_owned(), json!("timeout"));
+                }
+            }
+            return Ok(observation);
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+async fn observe_routine_wait_state(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    registry: &Arc<RoutineRegistry>,
+    context: &RoutinesToolContext,
+    routine_id: &str,
+    expected_successful_runs: Option<u32>,
+    elapsed: Duration,
+) -> Result<Value, String> {
+    let routine = load_routine_parts_for_owner(
+        runtime_state,
+        registry,
+        routine_id,
+        context.principal.as_str(),
+    )
+    .await?;
+    let (runs, next_after_run_id) = runtime_state
+        .list_cron_runs(Some(routine.job.job_id.clone()), None, Some(ROUTINE_WAIT_RUN_LIMIT))
+        .await
+        .map_err(sanitize_status_message)?;
+    let mapped_runs = runs
+        .iter()
+        .map(|run| {
+            let metadata =
+                registry.find_run_metadata(run.run_id.as_str()).map_err(map_registry_error)?;
+            Ok::<_, String>(join_run_metadata(
+                routine.metadata.routine_id.as_str(),
+                run,
+                metadata.as_ref(),
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let summary = routine_wait_summary(
+        &routine.job,
+        runs.as_slice(),
+        expected_successful_runs,
+        next_after_run_id.is_some(),
+    );
+    let terminal = summary.get("terminal").and_then(Value::as_bool).unwrap_or(false);
+    let goal_met =
+        summary.get("terminal_success_goal_met").and_then(Value::as_bool).unwrap_or(false);
+    let wait_status = if terminal && goal_met {
+        "satisfied"
+    } else if terminal {
+        "terminal_mismatch"
+    } else {
+        "waiting"
+    };
+    Ok(json!({
+        "operation": "wait_terminal",
+        "routine_id": routine.metadata.routine_id,
+        "wait_status": wait_status,
+        "terminal": terminal,
+        "timed_out": false,
+        "elapsed_ms": elapsed.as_millis().try_into().unwrap_or(u64::MAX),
+        "routine": routine_view_from_parts(&routine.job, &routine.metadata),
+        "run_summary": summary,
+        "runs": mapped_runs,
+        "next_after_run_id": next_after_run_id,
+        "safe_cleanup_command": format!(
+            "palyra routines delete --id {} --json",
+            routine.metadata.routine_id
+        ),
+    }))
+}
+
+fn routine_wait_summary(
+    job: &CronJobRecord,
+    runs: &[crate::journal::CronRunRecord],
+    expected_successful_runs: Option<u32>,
+    has_more_runs: bool,
+) -> Value {
+    let total_runs = runs.len();
+    let active_runs =
+        runs.iter().filter(|run| run.status.is_active()).count().try_into().unwrap_or(u32::MAX);
+    let terminal_runs =
+        runs.iter().filter(|run| !run.status.is_active()).count().try_into().unwrap_or(u32::MAX);
+    let succeeded_runs =
+        runs.iter().filter(|run| matches!(run.status, CronRunStatus::Succeeded)).count();
+    let failed_runs = runs.iter().filter(|run| matches!(run.status, CronRunStatus::Failed)).count();
+    let skipped_runs =
+        runs.iter().filter(|run| matches!(run.status, CronRunStatus::Skipped)).count();
+    let denied_runs = runs.iter().filter(|run| matches!(run.status, CronRunStatus::Denied)).count();
+    let terminal = routine_job_is_terminal(job, active_runs);
+    let terminal_success_goal_met = expected_successful_runs
+        .map(|expected| succeeded_runs >= expected as usize)
+        .unwrap_or(true);
+    json!({
+        "total_runs": total_runs,
+        "terminal_runs": terminal_runs,
+        "active_runs": active_runs,
+        "succeeded_runs": succeeded_runs,
+        "failed_runs": failed_runs,
+        "skipped_runs": skipped_runs,
+        "denied_runs": denied_runs,
+        "expected_successful_runs": expected_successful_runs,
+        "terminal_success_goal_met": terminal_success_goal_met,
+        "terminal": terminal,
+        "enabled": cron::visible_cron_job_enabled(job),
+        "next_run_at_unix_ms": cron::visible_next_run_at_unix_ms(job),
+        "queued_run": job.queued_run,
+        "has_more_runs": has_more_runs,
+    })
+}
+
+fn routine_job_is_terminal(job: &CronJobRecord, active_runs: u32) -> bool {
+    active_runs == 0
+        && !job.queued_run
+        && !cron::visible_cron_job_enabled(job)
+        && cron::visible_next_run_at_unix_ms(job).is_none()
+}
+
+fn observation_is_terminal(observation: &Value) -> bool {
+    observation.get("terminal").and_then(Value::as_bool).unwrap_or(false)
 }
 
 fn preview_schedule(
@@ -2314,13 +2485,17 @@ fn routines_tool_execution_outcome(
 mod tests {
     use std::fs;
 
+    use crate::journal::{
+        CronConcurrencyPolicy, CronJobRecord, CronMisfirePolicy, CronRetryPolicy, CronRunRecord,
+        CronRunStatus, CronScheduleType,
+    };
     use crate::routines::{
         RoutineApprovalMode, RoutineApprovalPolicy, RoutineDeliveryConfig, RoutineDeliveryMode,
         RoutineExecutionConfig, RoutineExecutionPosture, RoutineRunMode, RoutineRunOutcomeKind,
         RoutineSilentPolicy, RoutineTriggerKind,
     };
     use chrono::{Datelike, TimeZone, Timelike};
-    use serde_json::json;
+    use serde_json::{json, Value};
     use ulid::Ulid;
 
     #[test]
@@ -2382,6 +2557,41 @@ mod tests {
 
         assert_eq!(schedule_payload["interval_ms"], 30_000);
         assert_eq!(schedule_payload["max_runs"], 2);
+    }
+
+    #[test]
+    fn routine_wait_summary_detects_terminal_capped_successful_schedule() {
+        let job = test_cron_job(false, None, false);
+        let runs = vec![
+            test_cron_run("run-01", CronRunStatus::Succeeded),
+            test_cron_run("run-02", CronRunStatus::Succeeded),
+            test_cron_run("run-03", CronRunStatus::Skipped),
+            test_cron_run("run-04", CronRunStatus::Succeeded),
+        ];
+
+        let summary = super::routine_wait_summary(&job, runs.as_slice(), Some(3), false);
+
+        assert_eq!(summary["terminal"], json!(true));
+        assert_eq!(summary["terminal_success_goal_met"], json!(true));
+        assert_eq!(summary["succeeded_runs"], json!(3));
+        assert_eq!(summary["skipped_runs"], json!(1));
+        assert_eq!(summary["next_run_at_unix_ms"], Value::Null);
+    }
+
+    #[test]
+    fn routine_wait_summary_keeps_active_or_queued_schedule_waiting() {
+        let active_job = test_cron_job(true, Some(42), false);
+        let queued_job = test_cron_job(false, None, true);
+        let active_runs = vec![test_cron_run("run-01", CronRunStatus::Running)];
+
+        let active_summary =
+            super::routine_wait_summary(&active_job, active_runs.as_slice(), Some(1), false);
+        let queued_summary = super::routine_wait_summary(&queued_job, &[], None, false);
+
+        assert_eq!(active_summary["terminal"], json!(false));
+        assert_eq!(active_summary["active_runs"], json!(1));
+        assert_eq!(queued_summary["terminal"], json!(false));
+        assert_eq!(queued_summary["queued_run"], json!(true));
     }
 
     #[test]
@@ -2622,6 +2832,60 @@ mod tests {
         );
 
         assert_eq!(approval_policy.mode, RoutineApprovalMode::None);
+    }
+
+    fn test_cron_job(
+        enabled: bool,
+        next_run_at_unix_ms: Option<i64>,
+        queued_run: bool,
+    ) -> CronJobRecord {
+        CronJobRecord {
+            job_id: "routine-01".to_owned(),
+            name: "heartbeat".to_owned(),
+            prompt: "append heartbeat".to_owned(),
+            owner_principal: "user:test".to_owned(),
+            channel: "system:routines".to_owned(),
+            session_key: None,
+            session_label: None,
+            workdir: None,
+            schedule_type: CronScheduleType::Every,
+            schedule_payload_json: json!({
+                "interval_ms": 60_000,
+                "max_runs": 3,
+            })
+            .to_string(),
+            enabled,
+            concurrency_policy: CronConcurrencyPolicy::Forbid,
+            retry_policy: CronRetryPolicy { max_attempts: 1, backoff_ms: 0 },
+            misfire_policy: CronMisfirePolicy::Skip,
+            jitter_ms: 0,
+            next_run_at_unix_ms,
+            last_run_at_unix_ms: None,
+            queued_run,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        }
+    }
+
+    fn test_cron_run(run_id: &str, status: CronRunStatus) -> CronRunRecord {
+        CronRunRecord {
+            run_id: run_id.to_owned(),
+            job_id: "routine-01".to_owned(),
+            attempt: 1,
+            session_id: Some(format!("session-{run_id}")),
+            orchestrator_run_id: None,
+            started_at_unix_ms: 1,
+            finished_at_unix_ms: (!status.is_active()).then_some(2),
+            status,
+            error_kind: None,
+            error_message_redacted: None,
+            model_tokens_in: 0,
+            model_tokens_out: 0,
+            tool_calls: 0,
+            tool_denies: 0,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 2,
+        }
     }
 
     #[test]

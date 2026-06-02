@@ -295,13 +295,13 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
         ),
         entry(
             "palyra.routines.query",
-            "Inspect routine definitions, run history, and schedule previews. Use operation=schedule_preview with phrase such as 'every 40 seconds' or a timezone such as Europe/Prague before creating scheduled monitors.",
+            "Inspect routine definitions, run history, schedule previews, and bounded scheduler completion. Use operation=schedule_preview with phrase such as 'every 40 seconds' or a timezone such as Europe/Prague before creating scheduled monitors. Use operation=wait_terminal with routine_id and expected_successful_runs for capped recurring routines instead of polling list_runs across many model turns.",
             object_schema(
                 &[],
                 vec![
                     (
                         "operation",
-                        json!({"type":"string","enum":["list","get","list_runs","schedule_preview"]}),
+                        json!({"type":"string","enum":["list","get","list_runs","wait_terminal","schedule_preview"]}),
                     ),
                     ("routine_id", json!({"type":"string"})),
                     ("phrase", json!({"type":"string"})),
@@ -310,6 +310,18 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                         json!({"type":"string","description":"local, utc, or an IANA timezone such as Europe/Prague."}),
                     ),
                     ("limit", json!({"type":"integer","minimum":1,"maximum":500})),
+                    (
+                        "expected_successful_runs",
+                        json!({"type":"integer","minimum":0,"description":"Optional success count to wait for when operation=wait_terminal, for example max_runs from a capped recurring schedule."}),
+                    ),
+                    (
+                        "timeout_ms",
+                        json!({"type":"integer","minimum":1,"maximum":900000,"description":"Maximum wait for operation=wait_terminal. Prefer enough time for capped scheduler intervals plus one safety poll."}),
+                    ),
+                    (
+                        "poll_interval_ms",
+                        json!({"type":"integer","minimum":250,"maximum":30000,"description":"Polling cadence for operation=wait_terminal inside one tool call."}),
+                    ),
                 ],
                 true,
             ),
