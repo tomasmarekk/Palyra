@@ -453,16 +453,33 @@ fn normalize_workspace_patch_header_path(
         if requested.components().any(|component| matches!(component, Component::ParentDir)) {
             return None;
         }
+        let comparable_requested =
+            canonicalize_existing_header_path(requested).unwrap_or_else(|| requested.to_path_buf());
         return workspace_roots.iter().find_map(|root| {
-            if !path_stays_inside_workspace_root_lexical(requested, root.as_path()) {
+            if !path_stays_inside_workspace_root_lexical(comparable_requested.as_path(), root) {
                 return None;
             }
-            absolute_workspace_path_relative_to_root(requested, root.as_path())
+            absolute_workspace_path_relative_to_root(comparable_requested.as_path(), root)
         });
     }
     workspace_roots
         .iter()
         .find_map(|root| strip_duplicate_workspace_root_basename(trimmed, root.as_path()))
+}
+
+fn canonicalize_existing_header_path(path: &Path) -> Option<PathBuf> {
+    let mut existing = path;
+    let mut missing_components = Vec::new();
+    while !existing.exists() {
+        missing_components.push(existing.file_name()?.to_owned());
+        existing = existing.parent()?;
+    }
+
+    let mut canonical = std::fs::canonicalize(existing).ok()?;
+    for component in missing_components.iter().rev() {
+        canonical.push(component);
+    }
+    Some(canonical)
 }
 
 fn absolute_workspace_path_relative_to_root(path: &Path, root: &Path) -> Option<String> {
