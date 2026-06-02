@@ -165,6 +165,13 @@ fn provider_request_timeout_status(run_id: &str, timeout: Duration) -> Status {
     ))
 }
 
+fn provider_model_override_for_routing(
+    routing_mode: &str,
+    actual_model_id: &str,
+) -> Option<String> {
+    (routing_mode == "enforced").then(|| actual_model_id.to_owned())
+}
+
 fn background_run_budget_tokens(parameter_delta_json: Option<&str>) -> Option<u64> {
     let parsed = serde_json::from_str::<Value>(parameter_delta_json?).ok()?;
     parsed
@@ -974,7 +981,10 @@ pub(crate) async fn process_run_stream_message(
     })
     .await?;
 
-    let provider_model_override = Some(routing_decision.actual_model_id.clone());
+    let provider_model_override = provider_model_override_for_routing(
+        routing_decision.mode.as_str(),
+        routing_decision.actual_model_id.as_str(),
+    );
     let lease_provider_id = routing_decision.provider_id.clone();
     let lease_provider_kind = routing_decision.provider_kind.clone();
     let lease_credential_id = routing_decision.credential_id.clone();
@@ -2351,10 +2361,11 @@ mod tests {
         contains_raw_provider_tool_call_markup, final_answer_recovery_prompt,
         incomplete_final_answer_without_tools, incomplete_terminal_final_answer,
         is_run_stream_response_channel_closed, length_recovery_prompt,
-        provider_request_timeout_status, repeated_tool_failure_signature,
-        should_terminate_after_tool_budget_exhausted, terminal_tool_authorization_failure,
-        tool_result_to_provider_message, truncated_final_answer_without_tools,
-        RepeatedToolFailureTracker, RunStreamToolResultForModel,
+        provider_model_override_for_routing, provider_request_timeout_status,
+        repeated_tool_failure_signature, should_terminate_after_tool_budget_exhausted,
+        terminal_tool_authorization_failure, tool_result_to_provider_message,
+        truncated_final_answer_without_tools, RepeatedToolFailureTracker,
+        RunStreamToolResultForModel,
     };
     use super::{AgentLoopTerminationReason, AgentRunLoopState};
     use crate::application::run_stream::tape::RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE;
@@ -2412,6 +2423,20 @@ mod tests {
         assert!(status.message().contains("model provider turn timed out after 1250ms"));
         assert!(status.message().contains("01ARZ3NDEKTSV4RRFFQ69G5FAV"));
         assert!(status.message().contains("model_provider.request_timeout_ms"));
+    }
+
+    #[test]
+    fn provider_model_override_is_unset_for_publish_only_routing() {
+        assert_eq!(provider_model_override_for_routing("suggest", "MiniMax-M3"), None);
+        assert_eq!(provider_model_override_for_routing("dry_run", "MiniMax-M3"), None);
+    }
+
+    #[test]
+    fn provider_model_override_is_set_for_enforced_routing() {
+        assert_eq!(
+            provider_model_override_for_routing("enforced", "MiniMax-M3"),
+            Some("MiniMax-M3".to_owned())
+        );
     }
 
     #[test]
