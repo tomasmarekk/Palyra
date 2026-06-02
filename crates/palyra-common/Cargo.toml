@@ -2,7 +2,7 @@
 name = "palyra-common"
 version.workspace = true
 edition.workspace = true
-license-file.workspace = true
+license.workspace = true
 rust-version.workspace = true
 
 [lints]

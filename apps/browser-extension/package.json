@@ -2,7 +2,7 @@
   "name": "@palyra/browser-extension",
   "version": "0.1.0",
   "private": true,
-  "license": "SEE LICENSE IN LICENSE",
+  "license": "AGPL-3.0-only",
   "type": "module",
   "scripts": {
     "lint": "vp run -w lint:browser-extension",

@@ -1,0 +1,22 @@
+Palyra
+======
+
+Copyright (c) 2026 tomasmarekk
+
+Palyra is licensed under the GNU Affero General Public License v3.0 only
+(`AGPL-3.0-only`). See `LICENSE` for the license text.
+
+This repository may include third-party dependencies, generated materials, and
+audited patched third-party source packages under their own license notices. Those
+notices remain with the relevant files or packages.
+
+Original project attribution:
+
+- Project name: Palyra
+- Original copyright holder: tomasmarekk
+- Repository: https://github.com/tomasmarekk/Palyra
+
+When conveying modified versions of Palyra, preserve applicable legal notices and
+mark your changes as required by the AGPL. Do not misrepresent the origin of the
+original Palyra code or imply endorsement by the Palyra project for modified
+versions, forks, products, or services.

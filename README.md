@@ -6,6 +6,6 @@ This repository is currently in the development phase.
 
 ## License
 
-Palyra is source-available under [PCSL v1.1](./LICENSE). Personal use, internal company use,
-forks, modifications, and paid implementation or customer-specific customization are allowed.
-Selling or hosting Palyra, or a derivative, as a competing standalone product or service is prohibited.
+Palyra is open source under the [GNU Affero General Public License v3.0 only](./LICENSE)
+(`AGPL-3.0-only`). Copyright and attribution notices are in [NOTICE](./NOTICE), and
+Palyra brand usage is governed separately by [TRADEMARKS.md](./TRADEMARKS.md).
