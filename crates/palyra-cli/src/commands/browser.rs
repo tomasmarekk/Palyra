@@ -1788,23 +1788,27 @@ async fn run_browser_tabs_command(session_id: String, command: BrowserTabsComman
             let error = envelope.error.clone();
             let value = serde_json::to_value(&envelope)
                 .context("failed to encode browser tab open output")?;
-            emit_browser_value(
-                &value,
-                format!(
-                    "browser.tabs.open session_id={} tab_id={} success={} status_code={} navigated={}",
-                    browser_session_handle_text(Some(session_id.as_str())),
-                    envelope
-                        .tab
-                        .as_ref()
-                        .and_then(|tab| tab.tab_id.as_deref())
-                        .map(|value| redacted_browser_identifier_text(Some(value), "tab"))
-                        .unwrap_or_else(|| "-".to_owned()),
-                    envelope.success,
-                    envelope.status_code,
-                    envelope.navigated,
-                ),
-                "failed to encode browser tab open output",
-            )?;
+            let mode = browser_output_mode();
+            if browser_command_payload_should_emit(mode, success) {
+                emit_browser_value_for_mode(
+                    &value,
+                    format!(
+                        "browser.tabs.open session_id={} tab_id={} success={} status_code={} navigated={}",
+                        browser_session_handle_text(Some(session_id.as_str())),
+                        envelope
+                            .tab
+                            .as_ref()
+                            .and_then(|tab| tab.tab_id.as_deref())
+                            .map(|value| redacted_browser_identifier_text(Some(value), "tab"))
+                            .unwrap_or_else(|| "-".to_owned()),
+                        envelope.success,
+                        envelope.status_code,
+                        envelope.navigated,
+                    ),
+                    "failed to encode browser tab open output",
+                    mode,
+                )?;
+            }
             ensure_browser_command_success("browser.tabs.open", success, error.as_str())
         }
         BrowserTabsCommand::Switch { tab_id } => {
@@ -1820,21 +1824,25 @@ async fn run_browser_tabs_command(session_id: String, command: BrowserTabsComman
             let error = envelope.error.clone();
             let value = serde_json::to_value(&envelope)
                 .context("failed to encode browser tab switch output")?;
-            emit_browser_value(
-                &value,
-                format!(
-                    "browser.tabs.switch session_id={} active_tab_id={} success={}",
-                    browser_session_handle_text(Some(session_id.as_str())),
-                    envelope
-                        .active_tab
-                        .as_ref()
-                        .and_then(|tab| tab.tab_id.as_deref())
-                        .map(|value| redacted_browser_identifier_text(Some(value), "tab"))
-                        .unwrap_or_else(|| "-".to_owned()),
-                    envelope.success,
-                ),
-                "failed to encode browser tab switch output",
-            )?;
+            let mode = browser_output_mode();
+            if browser_command_payload_should_emit(mode, success) {
+                emit_browser_value_for_mode(
+                    &value,
+                    format!(
+                        "browser.tabs.switch session_id={} active_tab_id={} success={}",
+                        browser_session_handle_text(Some(session_id.as_str())),
+                        envelope
+                            .active_tab
+                            .as_ref()
+                            .and_then(|tab| tab.tab_id.as_deref())
+                            .map(|value| redacted_browser_identifier_text(Some(value), "tab"))
+                            .unwrap_or_else(|| "-".to_owned()),
+                        envelope.success,
+                    ),
+                    "failed to encode browser tab switch output",
+                    mode,
+                )?;
+            }
             ensure_browser_command_success("browser.tabs.switch", success, error.as_str())
         }
         BrowserTabsCommand::Close { tab_id } => {
@@ -1850,22 +1858,26 @@ async fn run_browser_tabs_command(session_id: String, command: BrowserTabsComman
             let error = envelope.error.clone();
             let value = serde_json::to_value(&envelope)
                 .context("failed to encode browser tab close output")?;
-            emit_browser_value(
-                &value,
-                format!(
-                    "browser.tabs.close session_id={} closed_tab_id={} tabs_remaining={} active_tab_id={}",
-                    browser_session_handle_text(Some(session_id.as_str())),
-                    redacted_browser_identifier_text(envelope.closed_tab_id.as_deref(), "tab"),
-                    envelope.tabs_remaining,
-                    envelope
-                        .active_tab
-                        .as_ref()
-                        .and_then(|tab| tab.tab_id.as_deref())
-                        .map(|value| redacted_browser_identifier_text(Some(value), "tab"))
-                        .unwrap_or_else(|| "-".to_owned()),
-                ),
-                "failed to encode browser tab close output",
-            )?;
+            let mode = browser_output_mode();
+            if browser_command_payload_should_emit(mode, success) {
+                emit_browser_value_for_mode(
+                    &value,
+                    format!(
+                        "browser.tabs.close session_id={} closed_tab_id={} tabs_remaining={} active_tab_id={}",
+                        browser_session_handle_text(Some(session_id.as_str())),
+                        redacted_browser_identifier_text(envelope.closed_tab_id.as_deref(), "tab"),
+                        envelope.tabs_remaining,
+                        envelope
+                            .active_tab
+                            .as_ref()
+                            .and_then(|tab| tab.tab_id.as_deref())
+                            .map(|value| redacted_browser_identifier_text(Some(value), "tab"))
+                            .unwrap_or_else(|| "-".to_owned()),
+                    ),
+                    "failed to encode browser tab close output",
+                    mode,
+                )?;
+            }
             ensure_browser_command_success("browser.tabs.close", success, error.as_str())
         }
     }
@@ -4170,6 +4182,8 @@ fn browser_failure_class(error: &str) -> Option<&'static str> {
         Some("browser_proxy_failed")
     } else if lower.contains("chromium") || lower.contains("tab runtime") {
         Some("browser_runtime_failed")
+    } else if lower.contains("navigation returned http") {
+        Some("navigation_failed")
     } else if lower.contains("request failed") || lower.contains("error sending request") {
         Some("network_request_failed")
     } else {
@@ -5121,6 +5135,8 @@ mod tests {
         assert!(browser_failure_detail("blocked URL scheme file").starts_with("policy_blocked:"));
         assert!(browser_failure_detail("Chromium session SOCKS5 proxy request failed")
             .starts_with("browser_proxy_failed:"));
+        assert!(browser_failure_detail("navigation returned HTTP 403")
+            .starts_with("navigation_failed:"));
     }
 
     #[test]

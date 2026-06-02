@@ -259,6 +259,9 @@ pub(crate) fn classify_error(error: &anyhow::Error) -> CliExitCode {
         || lower.contains("connection refused")
         || lower.contains("deadline exceeded")
         || lower.contains("timed out")
+        || lower.contains("navigation_failed")
+        || lower.contains("network_request_failed")
+        || lower.contains("browser_runtime_failed")
     {
         return CliExitCode::Connectivity;
     }
@@ -417,6 +420,12 @@ mod tests {
     fn classify_error_maps_connectivity_failures() {
         assert_eq!(
             classify_error(&anyhow!("failed to connect to gateway: connection refused")),
+            CliExitCode::Connectivity
+        );
+        assert_eq!(
+            classify_error(&anyhow!(
+                "browser.tabs.open failed: navigation_failed: navigation returned HTTP 403"
+            )),
             CliExitCode::Connectivity
         );
     }
