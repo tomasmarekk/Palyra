@@ -69,6 +69,8 @@ const MAX_BACKGROUND_PROCESS_LIFETIME_MS: u64 = 30 * 60_000;
 const PALYRA_CLI_PROFILE_ENV: &str = "PALYRA_CLI_PROFILE";
 const PALYRA_CLI_PROFILES_PATH_ENV: &str = "PALYRA_CLI_PROFILES_PATH";
 const PALYRA_STATE_ROOT_ENV: &str = "PALYRA_STATE_ROOT";
+const HOST_ACCESS_SAFE_ENV_KEYS: &[&str] = &["HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TERM"];
+const HOST_ACCESS_SAFE_PALYRA_ENV_KEYS: &[&str] = &["PALYRA_E2E_HOME", "PALYRA_E2E_OS_ROOT"];
 const CLI_PROFILES_RELATIVE_PATH: &str = "cli/profiles.toml";
 const DESKTOP_CONTROL_CENTER_STATE_DIR: &str = "desktop-control-center";
 const DESKTOP_RUNTIME_STATE_DIR: &str = "runtime";
@@ -3717,6 +3719,7 @@ fn configure_host_access_process_environment(
     program: &Path,
     workspace_root: &Path,
 ) {
+    configure_host_access_safe_environment(command, workspace_root);
     configure_workspace_python_environment(command, process_command, workspace_root);
     if !is_palyra_cli_program(program) {
         return;
@@ -3736,6 +3739,64 @@ fn configure_host_access_process_environment(
     } else {
         command.env_remove(PALYRA_CLI_PROFILE_ENV);
     }
+}
+
+fn configure_host_access_safe_environment(command: &mut Command, workspace_root: &Path) {
+    command.env_clear();
+    for key in HOST_ACCESS_SAFE_ENV_KEYS {
+        copy_env_if_present(command, key);
+    }
+    for key in HOST_ACCESS_SAFE_PALYRA_ENV_KEYS {
+        copy_env_if_present(command, key);
+    }
+    #[cfg(windows)]
+    configure_windows_host_access_safe_environment(command, workspace_root);
+    #[cfg(not(windows))]
+    configure_unix_host_access_safe_environment(command, workspace_root);
+}
+
+fn copy_env_if_present(command: &mut Command, key: &str) {
+    if let Some(value) = std::env::var_os(key).filter(|value| !value.is_empty()) {
+        command.env(key, value);
+    }
+}
+
+#[cfg(windows)]
+fn configure_windows_host_access_safe_environment(command: &mut Command, workspace_root: &Path) {
+    for key in WINDOWS_HOST_ACCESS_SAFE_ENV_KEYS {
+        copy_env_if_present(command, key);
+    }
+    command.env("PATH", host_access_path()).env("TEMP", workspace_root).env("TMP", workspace_root);
+}
+
+#[cfg(windows)]
+const WINDOWS_HOST_ACCESS_SAFE_ENV_KEYS: &[&str] = &[
+    "APPDATA",
+    "COMSPEC",
+    "LOCALAPPDATA",
+    "PATHEXT",
+    "PROGRAMDATA",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "ProgramW6432",
+    "SystemDrive",
+    "SystemRoot",
+    "USERDOMAIN",
+    "USERNAME",
+    "USERPROFILE",
+    "WINDIR",
+];
+
+#[cfg(not(windows))]
+fn configure_unix_host_access_safe_environment(command: &mut Command, workspace_root: &Path) {
+    command.env("PATH", host_access_path()).env("TMPDIR", workspace_root);
+}
+
+fn host_access_path() -> String {
+    std::env::var_os("PATH")
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| sandbox_process_path().to_owned())
 }
 
 fn configure_workspace_python_environment(
@@ -4294,9 +4355,11 @@ fn reserve_output_budget(remaining_budget: &AtomicUsize, requested_bytes: usize)
 mod tests {
     use std::{
         collections::BTreeMap,
+        ffi::OsString,
         fs, io,
         path::{Path, PathBuf},
         process::Command,
+        sync::{Mutex, OnceLock},
         thread,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
@@ -4318,6 +4381,29 @@ mod tests {
 
     const BACKGROUND_TEST_EXECUTION_TIMEOUT_MS: u64 = 10_000;
     const BACKGROUND_TEST_SCRIPT_SLEEP_SECS: u64 = 8;
+    static PROCESS_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    struct ScopedEnvVar {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, value: impl Into<OsString>) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value.into());
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            match self.previous.as_ref() {
+                Some(previous) => std::env::set_var(self.key, previous),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     fn background_test_execution_timeout() -> Duration {
         Duration::from_millis(BACKGROUND_TEST_EXECUTION_TIMEOUT_MS)
@@ -5055,6 +5141,77 @@ mod tests {
             validate_process_env_overrides(&env).expect_err("PATH overrides must be reserved");
         assert_eq!(error.kind, SandboxProcessRunErrorKind::InvalidInput);
         assert!(error.message.contains("reserved by the runtime"), "{}", error.message);
+    }
+
+    #[test]
+    fn host_access_process_environment_drops_runtime_auth_and_profile_env() {
+        let _guard = PROCESS_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("process env lock should not be poisoned");
+        let workspace = unique_temp_dir("workspace-host-env");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        let e2e_home = workspace.join("fixture-home");
+        let e2e_os_root = workspace.join("fixture-os-root");
+        let _admin_token = ScopedEnvVar::set("PALYRA_ADMIN_TOKEN", "admin-secret");
+        let _browser_token =
+            ScopedEnvVar::set("PALYRA_BROWSER_SERVICE_AUTH_TOKEN", "browser-secret");
+        let _model_key =
+            ScopedEnvVar::set("PALYRA_MODEL_PROVIDER_OPENAI_API_KEY", "provider-secret");
+        let _cli_profile = ScopedEnvVar::set("PALYRA_CLI_PROFILE", "desktop-local");
+        let _cli_profiles_path =
+            ScopedEnvVar::set("PALYRA_CLI_PROFILES_PATH", workspace.join("profiles.toml"));
+        let _state_root = ScopedEnvVar::set("PALYRA_STATE_ROOT", workspace.join("state"));
+        let _e2e_home = ScopedEnvVar::set("PALYRA_E2E_HOME", e2e_home.as_os_str());
+        let _e2e_os_root = ScopedEnvVar::set("PALYRA_E2E_OS_ROOT", e2e_os_root.as_os_str());
+        let policy = host_access_policy(workspace.clone());
+        let input = ProcessRunnerInput {
+            command: "palyra-helper".to_owned(),
+            args: Vec::new(),
+            cwd: None,
+            env: BTreeMap::new(),
+            requested_egress_hosts: Vec::new(),
+            timeout_ms: None,
+            background: false,
+        };
+
+        let command =
+            build_process_command(&policy, &input, workspace.as_path(), workspace.as_path())
+                .expect("host access command should build");
+        let env = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        for key in [
+            "PALYRA_ADMIN_TOKEN",
+            "PALYRA_BROWSER_SERVICE_AUTH_TOKEN",
+            "PALYRA_MODEL_PROVIDER_OPENAI_API_KEY",
+            "PALYRA_CLI_PROFILE",
+            "PALYRA_CLI_PROFILES_PATH",
+            "PALYRA_STATE_ROOT",
+        ] {
+            assert!(
+                !env.contains_key(key),
+                "host-access process must not inherit runtime env key {key}"
+            );
+        }
+        assert_eq!(
+            env.get("PALYRA_E2E_HOME").and_then(Option::as_deref),
+            Some(e2e_home.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            env.get("PALYRA_E2E_OS_ROOT").and_then(Option::as_deref),
+            Some(e2e_os_root.to_string_lossy().as_ref())
+        );
+        assert!(env.contains_key("PATH"), "host-access process should keep a usable PATH");
+
+        let _ = fs::remove_dir_all(workspace.as_path());
     }
 
     #[test]
