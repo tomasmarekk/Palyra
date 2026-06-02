@@ -3571,6 +3571,18 @@ async fn run_cleanup_tape_event_records_background_process_outcomes() {
             pid: 4242,
             termination_attempted: true,
             alive_after: Some(false),
+            status_before: Some(super::BackgroundProcessCleanupStatus {
+                alive: true,
+                direct_pid_alive: true,
+                process_tree_alive: true,
+                tracked_process_count: Some(1),
+            }),
+            status_after: Some(super::BackgroundProcessCleanupStatus {
+                alive: false,
+                direct_pid_alive: false,
+                process_tree_alive: false,
+                tracked_process_count: Some(0),
+            }),
             error: None,
         }],
     )
@@ -3594,12 +3606,63 @@ async fn run_cleanup_tape_event_records_background_process_outcomes() {
         payload.pointer("/background_processes/outcomes/0/alive_after").and_then(Value::as_bool),
         Some(false)
     );
+    assert_eq!(
+        payload.pointer("/background_processes/outcomes/0/alive_before").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        payload
+            .pointer("/background_processes/outcomes/0/process_tree_alive_before_cleanup")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        payload
+            .pointer("/background_processes/outcomes/0/process_tree_alive_after_cleanup")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        payload
+            .pointer("/background_processes/outcomes/0/tracked_process_count_after_cleanup")
+            .and_then(Value::as_u64),
+        Some(0)
+    );
     assert!(
         payload
             .pointer("/background_processes/outcomes/0/process_artifact_note")
             .and_then(Value::as_str)
             .is_some_and(|note| note.contains("PID files")),
         "cleanup event should explain process-owned artifacts may remain: {payload}"
+    );
+}
+
+#[test]
+fn process_list_entry_reports_runtime_status_details() {
+    let payload = super::background_process_list_entry(
+        4242,
+        Ok(crate::sandbox_runner::BackgroundProcessRuntimeStatus {
+            direct_pid_alive: false,
+            process_tree_alive: true,
+            tracked_process_count: Some(2),
+        }),
+    );
+
+    assert_eq!(payload.get("pid").and_then(Value::as_u64), Some(4242));
+    assert_eq!(payload.get("alive").and_then(Value::as_bool), Some(true));
+    assert_eq!(payload.get("direct_pid_alive").and_then(Value::as_bool), Some(false));
+    assert_eq!(payload.get("process_tree_alive").and_then(Value::as_bool), Some(true));
+    assert_eq!(payload.get("tracked_process_count").and_then(Value::as_u64), Some(2));
+    assert_eq!(
+        payload.pointer("/portable_stop_command/tool").and_then(Value::as_str),
+        Some(super::PROCESS_STOP_TOOL_NAME)
+    );
+    assert!(
+        payload
+            .get("readiness_note")
+            .and_then(Value::as_str)
+            .is_some_and(|note| note.contains("HTTP readiness check")),
+        "{payload}"
     );
 }
 

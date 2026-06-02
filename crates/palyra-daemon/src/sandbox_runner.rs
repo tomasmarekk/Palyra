@@ -213,15 +213,27 @@ struct BackgroundOutputMonitor {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct BackgroundProcessRuntimeStatus {
-    direct_pid_alive: bool,
-    process_tree_alive: bool,
-    tracked_process_count: Option<u32>,
+pub(crate) struct BackgroundProcessRuntimeStatus {
+    pub(crate) direct_pid_alive: bool,
+    pub(crate) process_tree_alive: bool,
+    pub(crate) tracked_process_count: Option<u32>,
 }
 
 impl BackgroundProcessRuntimeStatus {
-    fn alive(self) -> bool {
+    pub(crate) fn alive(self) -> bool {
         self.process_tree_alive || self.direct_pid_alive
+    }
+
+    pub(crate) fn direct_pid_alive(self) -> bool {
+        self.direct_pid_alive
+    }
+
+    pub(crate) fn process_tree_alive(self) -> bool {
+        self.process_tree_alive
+    }
+
+    pub(crate) fn tracked_process_count(self) -> Option<u32> {
+        self.tracked_process_count
     }
 }
 
@@ -855,7 +867,9 @@ pub(crate) fn background_process_is_alive(pid: u32) -> io::Result<bool> {
     background_process_runtime_status(pid).map(BackgroundProcessRuntimeStatus::alive)
 }
 
-fn background_process_runtime_status(pid: u32) -> io::Result<BackgroundProcessRuntimeStatus> {
+pub(crate) fn background_process_runtime_status(
+    pid: u32,
+) -> io::Result<BackgroundProcessRuntimeStatus> {
     let direct_pid_alive = process_id_is_alive(pid)?;
     let (process_tree_alive, tracked_process_count) =
         background_process_tree_status(pid, direct_pid_alive)?;

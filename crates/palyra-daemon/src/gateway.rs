@@ -870,24 +870,9 @@ fn execute_process_list_tool(
     let processes = pids
         .into_iter()
         .map(|pid| {
-            let status = crate::sandbox_runner::background_process_is_alive(pid);
-            let (alive, status_error) = match status {
-                Ok(alive) => (Some(alive), None),
-                Err(error) => (None, Some(error.to_string())),
-            };
-            json!({
-                "pid": pid,
-                "alive": alive,
-                "status_error": status_error,
-                "portable_stop_command": {
-                    "tool": PROCESS_STOP_TOOL_NAME,
-                    "pid": pid,
-                },
-                "portable_status_command": {
-                    "tool": PROCESS_STATUS_TOOL_NAME,
-                    "pid": pid,
-                },
-            })
+            let status = crate::sandbox_runner::background_process_runtime_status(pid)
+                .map_err(|error| error.to_string());
+            background_process_list_entry(pid, status)
         })
         .collect::<Vec<_>>();
     let process_count = processes.len();
@@ -922,6 +907,40 @@ fn execute_process_list_tool(
                 .to_owned()
         },
     )
+}
+
+fn background_process_list_entry(
+    pid: u32,
+    status: Result<crate::sandbox_runner::BackgroundProcessRuntimeStatus, String>,
+) -> Value {
+    let (alive, direct_pid_alive, process_tree_alive, tracked_process_count, status_error) =
+        match status {
+            Ok(status) => (
+                Some(status.alive()),
+                Some(status.direct_pid_alive()),
+                Some(status.process_tree_alive()),
+                status.tracked_process_count(),
+                None,
+            ),
+            Err(error) => (None, None, None, None, Some(error)),
+        };
+    json!({
+        "pid": pid,
+        "alive": alive,
+        "direct_pid_alive": direct_pid_alive,
+        "process_tree_alive": process_tree_alive,
+        "tracked_process_count": tracked_process_count,
+        "status_error": status_error,
+        "readiness_note": "Process liveness is not an HTTP readiness check. For local servers, verify the exact 127.0.0.1 URL and port with an HTTP/browser probe before treating the server as ready.",
+        "portable_stop_command": {
+            "tool": PROCESS_STOP_TOOL_NAME,
+            "pid": pid,
+        },
+        "portable_status_command": {
+            "tool": PROCESS_STATUS_TOOL_NAME,
+            "pid": pid,
+        },
+    })
 }
 
 fn process_lifecycle_pid_from_tool_input(input_json: &[u8]) -> Option<u32> {
@@ -1378,13 +1397,17 @@ pub(crate) async fn cleanup_run_resources(
     }
 
     for pid in resources.background_process_pids {
+        let status_before = background_process_cleanup_status(pid);
         match terminate_run_background_process(pid).await {
             Ok(()) => {
-                let alive_after = crate::sandbox_runner::background_process_is_alive(pid).ok();
+                let status_after = background_process_cleanup_status(pid);
+                let alive_after = status_after.as_ref().map(|status| status.alive);
                 background_process_outcomes.push(BackgroundProcessCleanupOutcome {
                     pid,
                     termination_attempted: true,
                     alive_after,
+                    status_before,
+                    status_after,
                     error: None,
                 });
             }
@@ -1396,11 +1419,14 @@ pub(crate) async fn cleanup_run_resources(
                     error = %error,
                     "failed to clean up background process for terminal run"
                 );
-                let alive_after = crate::sandbox_runner::background_process_is_alive(pid).ok();
+                let status_after = background_process_cleanup_status(pid);
+                let alive_after = status_after.as_ref().map(|status| status.alive);
                 background_process_outcomes.push(BackgroundProcessCleanupOutcome {
                     pid,
                     termination_attempted: true,
                     alive_after,
+                    status_before,
+                    status_after,
                     error: Some(error),
                 });
             }
@@ -1439,7 +1465,34 @@ struct BackgroundProcessCleanupOutcome {
     pid: u32,
     termination_attempted: bool,
     alive_after: Option<bool>,
+    status_before: Option<BackgroundProcessCleanupStatus>,
+    status_after: Option<BackgroundProcessCleanupStatus>,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct BackgroundProcessCleanupStatus {
+    alive: bool,
+    direct_pid_alive: bool,
+    process_tree_alive: bool,
+    tracked_process_count: Option<u32>,
+}
+
+impl From<crate::sandbox_runner::BackgroundProcessRuntimeStatus>
+    for BackgroundProcessCleanupStatus
+{
+    fn from(status: crate::sandbox_runner::BackgroundProcessRuntimeStatus) -> Self {
+        Self {
+            alive: status.alive(),
+            direct_pid_alive: status.direct_pid_alive(),
+            process_tree_alive: status.process_tree_alive(),
+            tracked_process_count: status.tracked_process_count(),
+        }
+    }
+}
+
+fn background_process_cleanup_status(pid: u32) -> Option<BackgroundProcessCleanupStatus> {
+    crate::sandbox_runner::background_process_runtime_status(pid).ok().map(Into::into)
 }
 
 async fn append_run_cleanup_tape_event(
@@ -1518,7 +1571,14 @@ fn run_cleanup_tape_payload(
                 json!({
                     "pid": outcome.pid,
                     "termination_attempted": outcome.termination_attempted,
+                    "alive_before": outcome.status_before.as_ref().map(|status| status.alive),
+                    "direct_pid_alive_before_cleanup": outcome.status_before.as_ref().map(|status| status.direct_pid_alive),
+                    "process_tree_alive_before_cleanup": outcome.status_before.as_ref().map(|status| status.process_tree_alive),
+                    "tracked_process_count_before_cleanup": outcome.status_before.as_ref().and_then(|status| status.tracked_process_count),
                     "alive_after": outcome.alive_after,
+                    "direct_pid_alive_after_cleanup": outcome.status_after.as_ref().map(|status| status.direct_pid_alive),
+                    "process_tree_alive_after_cleanup": outcome.status_after.as_ref().map(|status| status.process_tree_alive),
+                    "tracked_process_count_after_cleanup": outcome.status_after.as_ref().and_then(|status| status.tracked_process_count),
                     "error": outcome.error,
                     "process_artifact_note": "Palyra stops run-owned process trees but does not remove files created by those processes, such as PID files, logs, or other workspace/OS artifacts.",
                 })
