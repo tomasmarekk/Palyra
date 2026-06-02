@@ -4326,6 +4326,10 @@ variable = "PALYRA_MODEL_PROVIDER_ANTHROPIC_API_KEY"
                     Ok((mut stream, _)) => {
                         let mut buffer = [0_u8; 4096];
                         let read = stream.read(&mut buffer).unwrap_or(0);
+                        if read == 0 {
+                            deadline = Instant::now() + Duration::from_millis(300);
+                            continue;
+                        }
                         let request = String::from_utf8_lossy(&buffer[..read]).to_string();
                         let body = if request.starts_with("GET /healthz ") {
                             r#"{"service":"palyrad","status":"ok","version":"test","git_hash":"test","build_profile":"test","uptime_seconds":1}"#
