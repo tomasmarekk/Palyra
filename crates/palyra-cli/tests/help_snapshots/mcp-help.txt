@@ -55,4 +55,5 @@ Examples:
   palyra mcp serve --allow-sensitive-tools
 
 Discoverability:
-  `mcp serve` exposes a stdio MCP facade over the same connection, access control, and approval model used by the rest of the CLI.
+  `mcp serve` exposes Palyra as a stdio MCP server facade over the same connection, access control, and approval model used by the rest of the CLI.
+  It does not import external MCP servers or register external MCP client tools such as `ticket.read` into Palyra agent runs.

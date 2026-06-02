@@ -22,6 +22,17 @@ const MCP_MEMORY_SEARCH_HITS_PRESENT_CLAIM_BOUNDARY: &str =
     "durable memory hits were returned; cite them as stored memory evidence";
 const MCP_MEMORY_SEARCH_HITS_ABSENT_CLAIM_BOUNDARY: &str =
     "no durable memory hits were returned by this memory search; this does not search prior session transcripts";
+const MCP_SERVER_SCOPE_NOTE: &str = "`palyra mcp serve` exposes Palyra as an MCP server facade for external MCP clients. It does not import external MCP servers or register external MCP client tools into Palyra agent runs.";
+const REGISTERED_MCP_TOOLS: &[&str] = &[
+    TOOL_SESSIONS_LIST,
+    TOOL_SESSION_TRANSCRIPT_READ,
+    TOOL_SESSION_EXPORT,
+    TOOL_MEMORY_SEARCH,
+    TOOL_APPROVALS_LIST,
+    TOOL_SESSION_CREATE,
+    TOOL_SESSION_PROMPT,
+    TOOL_APPROVAL_DECIDE,
+];
 
 pub(crate) fn run_mcp(command: McpCommand) -> Result<()> {
     match command.subcommand {
@@ -533,11 +544,7 @@ fn handle_mcp_request(backend: &mut dyn McpBackend, request: Value) -> Result<Op
                         "name": "palyra-cli",
                         "version": env!("CARGO_PKG_VERSION"),
                     },
-                    "instructions": if backend.read_only() {
-                        "Read-only MCP facade over Palyra sessions, transcripts, approvals, and memory."
-                    } else {
-                        "MCP facade over Palyra sessions, approvals, memory, and approval-aware mutations."
-                    },
+                    "instructions": mcp_server_instructions(backend.read_only()),
                 }
             })
         })),
@@ -580,6 +587,13 @@ fn handle_mcp_request(backend: &mut dyn McpBackend, request: Value) -> Result<Op
                 )));
             };
             let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            if !is_registered_mcp_tool(name) {
+                return Ok(Some(json!({
+                    "jsonrpc": JSONRPC_VERSION,
+                    "id": request_id,
+                    "result": tool_error_payload(unregistered_mcp_tool_message(name)),
+                })));
+            }
             if backend.read_only() && is_mutating_tool(name) {
                 return Ok(Some(json!({
                     "jsonrpc": JSONRPC_VERSION,
@@ -652,21 +666,29 @@ fn write_mcp_message(writer: &mut dyn Write, payload: &Value) -> Result<()> {
 }
 
 fn registered_tools(read_only: bool) -> Vec<Value> {
-    let tools = [
-        TOOL_SESSIONS_LIST,
-        TOOL_SESSION_TRANSCRIPT_READ,
-        TOOL_SESSION_EXPORT,
-        TOOL_MEMORY_SEARCH,
-        TOOL_APPROVALS_LIST,
-        TOOL_SESSION_CREATE,
-        TOOL_SESSION_PROMPT,
-        TOOL_APPROVAL_DECIDE,
-    ];
-    tools
-        .into_iter()
+    REGISTERED_MCP_TOOLS
+        .iter()
+        .copied()
         .filter(|name| !read_only || !is_mutating_tool(name))
         .map(tool_definition)
         .collect()
+}
+
+fn is_registered_mcp_tool(name: &str) -> bool {
+    REGISTERED_MCP_TOOLS.iter().any(|tool_name| *tool_name == name)
+}
+
+fn mcp_server_instructions(read_only: bool) -> String {
+    let mode = if read_only {
+        "Read-only MCP facade over Palyra sessions, transcripts, approvals, and memory."
+    } else {
+        "MCP facade over Palyra sessions, approvals, memory, and approval-aware mutations."
+    };
+    format!("{mode} {MCP_SERVER_SCOPE_NOTE}")
+}
+
+fn unregistered_mcp_tool_message(name: &str) -> String {
+    format!("tool `{name}` is not registered by this MCP server. {MCP_SERVER_SCOPE_NOTE}")
 }
 
 fn tool_definition(name: &str) -> Value {
@@ -1385,8 +1407,64 @@ mod tests {
         )
         .expect("request should succeed")
         .expect("response should be present");
+        let message = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool error text should be a string");
+
         assert_eq!(backend.last_call, None);
         assert_eq!(response["result"]["isError"], Value::Bool(true));
+        assert!(message.contains("--read-only mode"), "{message}");
+    }
+
+    #[test]
+    fn initialize_instructions_explain_mcp_server_scope() {
+        let mut backend =
+            TestBackend { read_only: false, last_call: None, response: json!({"ok": true}) };
+        let response = handle_mcp_request(
+            &mut backend,
+            json!({
+                "jsonrpc": JSONRPC_VERSION,
+                "id": 6,
+                "method": "initialize"
+            }),
+        )
+        .expect("request should succeed")
+        .expect("response should be present");
+        let instructions =
+            response["result"]["instructions"].as_str().expect("instructions should be a string");
+
+        assert!(instructions.contains("MCP server facade"), "{instructions}");
+        assert!(instructions.contains("does not import external MCP servers"), "{instructions}");
+        assert!(instructions.contains("Palyra agent runs"), "{instructions}");
+    }
+
+    #[test]
+    fn tools_call_rejects_unregistered_external_tool_with_scope_note() {
+        let mut backend =
+            TestBackend { read_only: false, last_call: None, response: json!({"ok": true}) };
+        let response = handle_mcp_request(
+            &mut backend,
+            json!({
+                "jsonrpc": JSONRPC_VERSION,
+                "id": 9,
+                "method": "tools/call",
+                "params": {
+                    "name": "ticket.read",
+                    "arguments": { "ticket_id": "TICKET-085" }
+                }
+            }),
+        )
+        .expect("request should succeed")
+        .expect("response should be present");
+        let message = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool error text should be a string");
+
+        assert_eq!(backend.last_call, None);
+        assert_eq!(response["result"]["isError"], Value::Bool(true));
+        assert!(message.contains("ticket.read"), "{message}");
+        assert!(message.contains("does not import external MCP servers"), "{message}");
+        assert!(message.contains("Palyra agent runs"), "{message}");
     }
 
     #[test]
