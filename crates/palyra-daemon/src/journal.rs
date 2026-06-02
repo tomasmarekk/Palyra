@@ -5014,6 +5014,95 @@ fn append_run_lifecycle_event_tx(
     Ok(())
 }
 
+fn append_startup_recovery_tape_event_tx(
+    connection: &Connection,
+    max_payload_bytes: usize,
+    run_id: &str,
+    session_id: &str,
+    previous_state: &str,
+    reason: &str,
+    now: i64,
+) -> Result<(), JournalError> {
+    let seq = next_orchestrator_tape_seq(connection, run_id)?;
+    append_orchestrator_tape_event_tx(
+        connection,
+        max_payload_bytes,
+        &OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq,
+            event_type: "run.recovery".to_owned(),
+            payload_json: json!({
+                "event": "run.recovery",
+                "recovery_kind": "startup_orphaned_active_run",
+                "recovery_state": "manual_resume_required",
+                "run_id": run_id,
+                "session_id": session_id,
+                "previous_state": previous_state,
+                "terminal_state": RunLifecycleState::Failed.as_str(),
+                "reason": reason,
+                "operator_guidance": "Inspect the failed run tape, then start a new run in the same session if continuation is required."
+            })
+            .to_string(),
+        },
+        now,
+    )
+}
+
+fn next_orchestrator_tape_seq(connection: &Connection, run_id: &str) -> Result<i64, JournalError> {
+    connection
+        .query_row(
+            "SELECT COALESCE(MAX(seq), -1) + 1 FROM orchestrator_tape WHERE run_ulid = ?1",
+            params![run_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(Into::into)
+}
+
+fn append_orchestrator_tape_event_tx(
+    connection: &Connection,
+    max_payload_bytes: usize,
+    request: &OrchestratorTapeAppendRequest,
+    now: i64,
+) -> Result<(), JournalError> {
+    if request.payload_json.len() > max_payload_bytes {
+        return Err(JournalError::PayloadTooLarge {
+            payload_kind: "orchestrator_tape",
+            actual_bytes: request.payload_json.len(),
+            max_bytes: max_payload_bytes,
+        });
+    }
+    let (payload_json, _) = sanitize_payload(request.payload_json.as_bytes())?;
+    match connection.execute(
+        r#"
+            INSERT INTO orchestrator_tape (
+                run_ulid,
+                seq,
+                event_type,
+                payload_json,
+                created_at_unix_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5)
+        "#,
+        params![request.run_id, request.seq, request.event_type, payload_json, now],
+    ) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(error, message))
+            if error.code == ErrorCode::ConstraintViolation
+                && (error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+                    || error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                    || message
+                        .as_deref()
+                        .map(|value| value.contains("orchestrator_tape"))
+                        .unwrap_or(false)) =>
+        {
+            Err(JournalError::DuplicateTapeSequence {
+                run_id: request.run_id.clone(),
+                seq: request.seq,
+            })
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn hydrate_run_lifecycle_record(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<RunLifecycleTransitionRecord> {
@@ -7223,7 +7312,7 @@ impl JournalStore {
                 &RunLifecycleEventAppendRequest {
                     event_id: Ulid::new().to_string(),
                     run_id: run_id.clone(),
-                    session_id,
+                    session_id: session_id.clone(),
                     from_state: RunLifecyclePhase::parse(previous_state.as_str()),
                     to_state: canonical_run_lifecycle_phase(RunLifecycleState::Failed),
                     actor: RuntimeActorRef {
@@ -7241,6 +7330,15 @@ impl JournalStore {
                     })
                     .to_string(),
                 },
+                now,
+            )?;
+            append_startup_recovery_tape_event_tx(
+                &guard,
+                self.config.max_payload_bytes,
+                &run_id,
+                &session_id,
+                previous_state.as_str(),
+                reason,
                 now,
             )?;
             terminalized_run_ids.push(run_id);
@@ -7287,45 +7385,9 @@ impl JournalStore {
         &self,
         request: &OrchestratorTapeAppendRequest,
     ) -> Result<(), JournalError> {
-        if request.payload_json.len() > self.config.max_payload_bytes {
-            return Err(JournalError::PayloadTooLarge {
-                payload_kind: "orchestrator_tape",
-                actual_bytes: request.payload_json.len(),
-                max_bytes: self.config.max_payload_bytes,
-            });
-        }
-        let (payload_json, _) = sanitize_payload(request.payload_json.as_bytes())?;
         let now = current_unix_ms()?;
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
-        match guard.execute(
-            r#"
-                INSERT INTO orchestrator_tape (
-                    run_ulid,
-                    seq,
-                    event_type,
-                    payload_json,
-                    created_at_unix_ms
-                ) VALUES (?1, ?2, ?3, ?4, ?5)
-            "#,
-            params![request.run_id, request.seq, request.event_type, payload_json, now,],
-        ) {
-            Ok(_) => Ok(()),
-            Err(rusqlite::Error::SqliteFailure(error, message))
-                if error.code == ErrorCode::ConstraintViolation
-                    && (error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
-                        || error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
-                        || message
-                            .as_deref()
-                            .map(|value| value.contains("orchestrator_tape"))
-                            .unwrap_or(false)) =>
-            {
-                Err(JournalError::DuplicateTapeSequence {
-                    run_id: request.run_id.clone(),
-                    seq: request.seq,
-                })
-            }
-            Err(error) => Err(error.into()),
-        }
+        append_orchestrator_tape_event_tx(&guard, self.config.max_payload_bytes, request, now)
     }
 
     pub fn request_orchestrator_cancel(
@@ -20389,6 +20451,19 @@ mod tests {
         store
             .update_orchestrator_run_state(in_progress_run_id, RunLifecycleState::InProgress, None)
             .expect("run should enter in_progress");
+        store
+            .append_orchestrator_tape_event(&OrchestratorTapeAppendRequest {
+                run_id: in_progress_run_id.to_owned(),
+                seq: 0,
+                event_type: "tool_decision".to_owned(),
+                payload_json: json!({
+                    "proposal_id": "sleep-1",
+                    "tool_name": "palyra.sleep",
+                    "allowed": true,
+                })
+                .to_string(),
+            })
+            .expect("pre-crash tape event should be recorded");
 
         upsert_orchestrator_session(&store, accepted_session_id);
         start_orchestrator_run(&store, accepted_session_id, accepted_run_id);
@@ -20414,6 +20489,7 @@ mod tests {
         assert_eq!(in_progress.state, RunLifecycleState::Failed.as_str());
         assert_eq!(in_progress.last_error.as_deref(), Some(reason));
         assert!(in_progress.completed_at_unix_ms.is_some());
+        assert_eq!(in_progress.tape_events, 2);
 
         let accepted = store
             .orchestrator_run_status_snapshot(accepted_run_id)
@@ -20422,6 +20498,7 @@ mod tests {
         assert_eq!(accepted.state, RunLifecycleState::Failed.as_str());
         assert_eq!(accepted.last_error.as_deref(), Some(reason));
         assert!(accepted.completed_at_unix_ms.is_some());
+        assert_eq!(accepted.tape_events, 1);
 
         let done = store
             .orchestrator_run_status_snapshot(done_run_id)
@@ -20436,6 +20513,30 @@ mod tests {
         assert_eq!(terminal.from_state, Some(RunLifecyclePhase::Running));
         assert_eq!(terminal.to_state, RunLifecyclePhase::Failed);
         assert_eq!(terminal.reason, reason);
+
+        let in_progress_tape = store
+            .orchestrator_tape(in_progress_run_id)
+            .expect("startup recovery tape should be readable");
+        let recovery =
+            in_progress_tape.last().expect("startup recovery should append a final tape event");
+        assert_eq!(recovery.seq, 1);
+        assert_eq!(recovery.event_type, "run.recovery");
+        let recovery_payload =
+            serde_json::from_str::<serde_json::Value>(recovery.payload_json.as_str())
+                .expect("recovery payload should be JSON");
+        assert_eq!(recovery_payload["event"], "run.recovery");
+        assert_eq!(recovery_payload["recovery_kind"], "startup_orphaned_active_run");
+        assert_eq!(recovery_payload["recovery_state"], "manual_resume_required");
+        assert_eq!(recovery_payload["previous_state"], RunLifecycleState::InProgress.as_str());
+        assert_eq!(recovery_payload["terminal_state"], RunLifecycleState::Failed.as_str());
+        assert_eq!(recovery_payload["reason"], reason);
+
+        let accepted_tape = store
+            .orchestrator_tape(accepted_run_id)
+            .expect("accepted recovery tape should be readable");
+        assert_eq!(accepted_tape.len(), 1);
+        assert_eq!(accepted_tape[0].seq, 0);
+        assert_eq!(accepted_tape[0].event_type, "run.recovery");
     }
 
     #[test]

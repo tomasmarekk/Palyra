@@ -2343,7 +2343,7 @@ pub async fn run() -> Result<()> {
 
     let startup_run_recovery = runtime
         .terminalize_orphaned_orchestrator_runs_on_startup(
-            "daemon startup detected an orphaned active run from a previous runtime; mark failed for explicit retry",
+            "daemon startup detected an orphaned active run from a previous runtime; marked failed and manual same-session resume is required",
         )
         .await
         .context("failed to terminalize orphaned orchestrator runs during startup")?;
