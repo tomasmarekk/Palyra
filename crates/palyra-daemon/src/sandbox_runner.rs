@@ -2990,8 +2990,11 @@ fn spawn_background_process(
         redacted_process_output(stderr.bytes.as_slice());
     let max_lifetime_ms = max_lifetime.as_millis() as u64;
     let requested_lifetime_ms = input.timeout_ms;
-    let background_lifetime_adjusted =
-        requested_lifetime_ms.is_some_and(|requested| lifetime_ms > requested);
+    let background_lifetime_adjustment_reason =
+        background_lifetime_adjustment_reason(requested_lifetime_ms, lifetime_ms);
+    let background_lifetime_adjusted = background_lifetime_adjustment_reason.is_some();
+    let background_lifetime_adjustment_note =
+        background_lifetime_adjustment_note(background_lifetime_adjustment_reason);
     let output_json = serde_json::to_vec(&json!({
         "exit_code": Value::Null,
         "stdout": stdout_text,
@@ -3013,13 +3016,10 @@ fn spawn_background_process(
         "max_lifetime_ms": max_lifetime_ms,
         "min_background_lifetime_ms": MIN_BACKGROUND_PROCESS_LIFETIME_MS,
         "background_lifetime_adjusted": background_lifetime_adjusted,
+        "background_lifetime_adjustment_reason": background_lifetime_adjustment_reason,
         "background_lifetime_note": format!(
             "{}Palyra will auto-terminate this background process after {lifetime_ms}ms; omit timeout_ms for the default long-lived background server window, set timeout_ms up to {max_lifetime_ms}ms within the operator-configured tool execution timeout for long browser verification loops, and use cleanup.portable_stop_command when finished.",
-            if background_lifetime_adjusted {
-                "Requested timeout_ms was below the safe background minimum and was raised for local app/browser reliability. "
-            } else {
-                ""
-            }
+            background_lifetime_adjustment_note
         ),
         "process_handle": {
             "kind": "pid",
@@ -3037,6 +3037,33 @@ fn spawn_background_process(
         message: format!("failed to serialize sandbox background process output JSON: {error}"),
     })?;
     Ok(SandboxProcessRunSuccess { output_json })
+}
+
+fn background_lifetime_adjustment_reason(
+    requested_lifetime_ms: Option<u64>,
+    lifetime_ms: u64,
+) -> Option<&'static str> {
+    let requested = requested_lifetime_ms?;
+    if lifetime_ms > requested {
+        Some("raised_to_minimum_background_lifetime")
+    } else if lifetime_ms < requested {
+        Some("capped_by_effective_background_max_lifetime")
+    } else {
+        None
+    }
+}
+
+fn background_lifetime_adjustment_note(reason: Option<&str>) -> &'static str {
+    match reason {
+        Some("raised_to_minimum_background_lifetime") => {
+            "Requested timeout_ms was below the safe background minimum and was raised for local app/browser reliability. "
+        }
+        Some("capped_by_effective_background_max_lifetime") => {
+            "Requested timeout_ms exceeded the effective background maximum and was capped by the operator-configured tool execution timeout or runtime hard cap. "
+        }
+        Some(_) => "Requested timeout_ms was normalized by background lifetime policy. ",
+        None => "",
+    }
 }
 
 fn wait_for_background_process_exit(
@@ -6427,6 +6454,24 @@ mod tests {
         assert_eq!(short, Duration::from_millis(750));
         assert_eq!(execution_capped, Duration::from_millis(750));
         assert_eq!(capped, Duration::from_millis(750));
+    }
+
+    #[test]
+    fn background_lifetime_adjustment_reason_reports_raise_and_cap() {
+        assert_eq!(
+            super::background_lifetime_adjustment_reason(Some(60_000), 120_000),
+            Some("raised_to_minimum_background_lifetime")
+        );
+        assert_eq!(
+            super::background_lifetime_adjustment_reason(Some(600_000), 120_000),
+            Some("capped_by_effective_background_max_lifetime")
+        );
+        assert_eq!(super::background_lifetime_adjustment_reason(Some(120_000), 120_000), None);
+        assert_eq!(super::background_lifetime_adjustment_reason(None, 120_000), None);
+        assert!(super::background_lifetime_adjustment_note(Some(
+            "capped_by_effective_background_max_lifetime"
+        ))
+        .contains("was capped"));
     }
 
     #[test]

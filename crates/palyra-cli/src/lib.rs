@@ -659,6 +659,7 @@ fn generate_admin_token() -> String {
 }
 
 const DEFAULT_ADMIN_BOUND_PRINCIPAL: &str = "admin:local";
+const LOCAL_DESKTOP_TOOL_EXECUTION_TIMEOUT_MS: i64 = 10 * 60_000;
 const LOCAL_DESKTOP_DEFAULT_ALLOWED_TOOLS: &[&str] = &[
     "palyra.echo",
     "palyra.sleep",
@@ -882,7 +883,11 @@ fn apply_local_desktop_tool_defaults(
         string_array_value(LOCAL_DESKTOP_DEFAULT_ALLOWED_TOOLS),
     )?;
     set_value_at_path(document, "tool_call.max_calls_per_run", toml::Value::Integer(96))?;
-    set_value_at_path(document, "tool_call.execution_timeout_ms", toml::Value::Integer(120_000))?;
+    set_value_at_path(
+        document,
+        "tool_call.execution_timeout_ms",
+        toml::Value::Integer(LOCAL_DESKTOP_TOOL_EXECUTION_TIMEOUT_MS),
+    )?;
     set_value_at_path(document, "tool_call.process_runner.enabled", toml::Value::Boolean(true))?;
     set_value_at_path(document, "tool_call.wasm_runtime.enabled", toml::Value::Boolean(true))?;
     set_value_at_path(
@@ -12262,7 +12267,10 @@ mod init_command_tests {
         assert_eq!(read_bool(&document, "tool_call.wasm_runtime.enabled"), Some(true));
         assert_eq!(read_bool(&document, "tool_call.wasm_runtime.allow_inline_modules"), Some(true));
         assert_eq!(read_integer(&document, "tool_call.max_calls_per_run"), Some(96));
-        assert_eq!(read_integer(&document, "tool_call.execution_timeout_ms"), Some(120_000));
+        assert_eq!(
+            read_integer(&document, "tool_call.execution_timeout_ms"),
+            Some(super::LOCAL_DESKTOP_TOOL_EXECUTION_TIMEOUT_MS)
+        );
         assert_eq!(read_bool(&document, "tool_call.process_runner.allow_interpreters"), Some(true));
         assert_eq!(
             read_string(&document, "tool_call.process_runner.egress_enforcement_mode").as_deref(),
