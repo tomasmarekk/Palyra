@@ -1965,27 +1965,38 @@ async fn chromium_selector_not_found_error(
     let cached_tab = sessions.get(session_id).and_then(|session| session.tabs.get(tab_id));
     let cached_body = cached_tab.map(|tab| tab.last_page_body.as_str()).unwrap_or_default();
     let cached_url = cached_tab.and_then(|tab| tab.last_url.as_deref()).unwrap_or_default();
-    selector_not_found_error_from_cached_snapshot(selector, action_name, cached_body, cached_url)
+    selector_not_found_error_from_cached_snapshot(
+        selector,
+        action_name,
+        tab_id,
+        cached_body,
+        cached_url,
+    )
 }
 
 fn selector_not_found_error_from_cached_snapshot(
     selector: &str,
     action_name: &str,
+    tab_id: &str,
     cached_page_body: &str,
     cached_url: &str,
 ) -> String {
     if find_matching_html_tag(selector, cached_page_body).is_some() {
-        let page_url = normalize_url_with_redaction(cached_url);
-        let location = if page_url.is_empty() {
-            "the active tab".to_owned()
-        } else {
-            format!("active tab {page_url}")
-        };
+        let location = chromium_action_context(tab_id, cached_url);
         return format!(
             "selector '{selector}' was not found in the live Chromium DOM for {action_name}, but the last observe snapshot for {location} still contained it; call observe or reload to refresh the active tab, verify any local server is still running, and retry only if the selector is present in the current snapshot"
         );
     }
     format!("selector '{selector}' was not found")
+}
+
+fn chromium_action_context(tab_id: &str, page_url: &str) -> String {
+    let page_url = normalize_url_with_redaction(page_url);
+    if page_url.is_empty() {
+        format!("active tab {tab_id}")
+    } else {
+        format!("active tab {tab_id} at {page_url}")
+    }
 }
 
 pub(crate) async fn chromium_observe_snapshot(
@@ -3006,6 +3017,7 @@ pub(crate) async fn click_with_chromium(
     loop {
         attempts = attempts.saturating_add(1);
         let selector_for_attempt = selector.to_owned();
+        let tab_id_for_attempt = tab_id.clone();
         let tab_for_attempt = Arc::clone(&tab);
         let attempt = run_chromium_blocking("chromium click", move || {
             let page_body = tab_for_attempt
@@ -3019,16 +3031,20 @@ pub(crate) async fn click_with_chromium(
                 }
                 let element = tab_for_attempt.find_element(selector_for_attempt.as_str()).map_err(
                     |error| {
+                        let action_context =
+                            chromium_action_context(tab_id_for_attempt.as_str(), tab_for_attempt.get_url().as_str());
                         format!(
-                            "selector '{}' was present in the live Chromium DOM, but Chromium could not resolve it for click: {error}; call observe to verify the active tab and retry with a current selector",
-                            selector_for_attempt
+                            "selector '{}' was present in the live Chromium DOM for {action_context}, but Chromium could not resolve it for click: {error}; call observe to verify the active tab and retry with a current selector",
+                            selector_for_attempt,
                         )
                     },
                 )?;
                 element.click().map_err(|error| {
+                    let action_context =
+                        chromium_action_context(tab_id_for_attempt.as_str(), tab_for_attempt.get_url().as_str());
                     format!(
-                        "selector '{}' was present in the live Chromium DOM, but click did not complete before the actionability timeout: {error}; inspect visibility, disabled state, overlays, active tab, and viewport before retrying",
-                        selector_for_attempt
+                        "selector '{}' was present in the live Chromium DOM for {action_context}, but click did not complete before the actionability timeout: {error}; inspect visibility, disabled state, overlays, active tab, and viewport before retrying",
+                        selector_for_attempt,
                     )
                 })?;
                 Ok(ClickAttempt::Clicked { download_like: is_download_like_tag(tag.as_str()) })
@@ -4072,13 +4088,17 @@ mod tests {
         let error = selector_not_found_error_from_cached_snapshot(
             "#save-user",
             "highlight",
+            "tab-active",
             r#"<html><body><button id="save-user">Save user</button></body></html>"#,
             "http://127.0.0.1:8790/?token=secret",
         );
 
         assert!(error.contains("live Chromium DOM for highlight"), "{error}");
         assert!(error.contains("last observe snapshot"), "{error}");
-        assert!(error.contains("active tab http://127.0.0.1:8790/?token=<redacted>"), "{error}");
+        assert!(
+            error.contains("active tab tab-active at http://127.0.0.1:8790/?token=<redacted>"),
+            "{error}"
+        );
         assert!(!error.contains("token=secret"), "{error}");
         assert!(error.contains("verify any local server is still running"), "{error}");
     }
@@ -4088,6 +4108,7 @@ mod tests {
         let error = selector_not_found_error_from_cached_snapshot(
             "#save-user",
             "click",
+            "tab-active",
             r#"<html><body><button id="cancel">Cancel</button></body></html>"#,
             "http://127.0.0.1:8790/",
         );
