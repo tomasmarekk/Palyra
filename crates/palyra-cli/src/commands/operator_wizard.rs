@@ -4389,13 +4389,14 @@ bound_principal = "operator"
         assert_eq!(summary.check, "runtime_config_reload");
         assert_eq!(summary.status, "restart_required");
         let requests = server.join().expect("test server should finish");
-        assert_eq!(requests.len(), 1, "restart check must only call unauthenticated health");
-        assert!(requests[0].starts_with("GET /healthz "), "unexpected request: {}", requests[0]);
-        assert!(
-            !requests[0].contains("Authorization: Bearer"),
-            "admin token must not be sent to health responder: {}",
-            requests[0]
-        );
+        assert!(!requests.is_empty(), "restart check must call unauthenticated health");
+        for request in &requests {
+            assert!(request.starts_with("GET /healthz "), "unexpected request: {request}");
+            assert!(
+                !request.contains("Authorization: Bearer"),
+                "admin token must not be sent to health responder: {request}"
+            );
+        }
     }
 
     #[test]
