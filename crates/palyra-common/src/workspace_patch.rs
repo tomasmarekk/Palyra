@@ -12,8 +12,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-const DEFAULT_REDACTION_PATTERNS: &[&str] =
-    &["api_key", "authorization", "bearer ", "secret", "token", "password"];
+const DEFAULT_REDACTION_PATTERNS: &[&str] = &["authorization", "bearer "];
 const DEFAULT_SECRET_FILE_MARKERS: &[&str] =
     &[".env", "id_rsa", "id_ed25519", "credentials", "secrets/", "secret/", ".pem", ".key"];
 const REDACTION_PLACEHOLDER_MARKERS: &[&str] =
@@ -2597,6 +2596,41 @@ mod tests {
         assert!(
             !preview.contains("Bearer "),
             "bearer marker should be redacted case-insensitively"
+        );
+    }
+
+    #[test]
+    fn redact_patch_preview_preserves_safe_source_identifiers() {
+        let patch = "*** Begin Patch\n*** Add File: scripts/rename-vite-secret.js\n+const SECRET_KEY = 'VITE_SECRET_TOKEN';\n+const PRIVATE_KEY = 'SERVER_PRIVATE_KEY';\n*** End Patch\n";
+        let preview =
+            redact_patch_preview(patch, &WorkspacePatchRedactionPolicy::default(), 16 * 1024);
+
+        assert!(preview.contains("*** Add File: scripts/rename-vite-secret.js"));
+        assert!(preview.contains("+const SECRET_KEY = 'VITE_SECRET_TOKEN';"));
+        assert!(preview.contains("+const PRIVATE_KEY = 'SERVER_PRIVATE_KEY';"));
+        assert!(!preview.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn apply_workspace_patch_preserves_safe_identifiers_in_artifact_and_preview() {
+        let temp = tempdir().expect("tempdir should be created");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        let patch = "*** Begin Patch\n*** Add File: scripts/rename-vite-secret.js\n+const SECRET_KEY = 'VITE_SECRET_TOKEN';\n+const PRIVATE_KEY = 'SERVER_PRIVATE_KEY';\n*** End Patch\n";
+
+        let outcome = apply_workspace_patch(
+            std::slice::from_ref(&workspace),
+            &default_request(patch, false),
+            &default_limits(),
+        )
+        .expect("patch should write source identifiers without preview redaction");
+        let written = fs::read_to_string(workspace.join("scripts/rename-vite-secret.js"))
+            .expect("written artifact should be readable");
+
+        assert!(outcome.redacted_preview.contains("+const SECRET_KEY = 'VITE_SECRET_TOKEN';"));
+        assert_eq!(
+            written,
+            "const SECRET_KEY = 'VITE_SECRET_TOKEN';\nconst PRIVATE_KEY = 'SERVER_PRIVATE_KEY';\n"
         );
     }
 
