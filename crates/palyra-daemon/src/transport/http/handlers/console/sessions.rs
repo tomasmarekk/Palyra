@@ -333,6 +333,7 @@ struct SessionCatalogContext {
     bindings_by_session: HashMap<String, SessionAgentBinding>,
     agents_by_id: HashMap<String, AgentRecord>,
     default_agent_id: Option<String>,
+    effective_model_profile: Option<String>,
 }
 
 pub(crate) async fn console_sessions_list_handler(
@@ -1073,6 +1074,9 @@ async fn load_session_catalog_context(
     let (bindings_by_session, agents_by_id, default_agent_id) =
         load_session_agent_metadata(state, context).await?;
     let family_by_session = build_session_family_metadata(base_sessions);
+    let effective_model_profile = effective_model_profile_from_provider_snapshot(
+        &state.runtime.model_provider_status_snapshot(),
+    );
 
     Ok(SessionCatalogContext {
         pending_approvals_by_session,
@@ -1082,7 +1086,25 @@ async fn load_session_catalog_context(
         bindings_by_session,
         agents_by_id,
         default_agent_id,
+        effective_model_profile,
     })
+}
+
+fn effective_model_profile_from_provider_snapshot(
+    snapshot: &crate::model_provider::ProviderStatusSnapshot,
+) -> Option<String> {
+    [
+        snapshot.registry.default_chat_model_id.as_deref(),
+        snapshot.model_id.as_deref(),
+        snapshot.openai_model.as_deref(),
+        snapshot.anthropic_model.as_deref(),
+    ]
+    .into_iter()
+    .find_map(normalize_effective_model_profile)
+}
+
+fn normalize_effective_model_profile(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim).filter(|value| !value.is_empty()).map(str::to_owned)
 }
 
 async fn load_session_workspace_summaries(
@@ -1539,6 +1561,10 @@ fn build_session_quick_controls(
 
     let inherited_model =
         bound_agent.or(inherited_agent).map(|agent| agent.default_model_profile.clone());
+    let runtime_model_profile = context
+        .effective_model_profile
+        .as_ref()
+        .filter(|runtime| inherited_model.as_ref() != Some(*runtime));
     let (model_value, model_display, model_source, model_override_active) =
         if let Some(model_profile_override) = session.model_profile_override.as_ref() {
             (
@@ -1549,6 +1575,13 @@ fn build_session_quick_controls(
                     .as_ref()
                     .map(|entry| entry != model_profile_override)
                     .unwrap_or(true),
+            )
+        } else if let Some(runtime_model_profile) = runtime_model_profile {
+            (
+                Some(runtime_model_profile.clone()),
+                runtime_model_profile.clone(),
+                "model_provider_runtime".to_owned(),
+                false,
             )
         } else {
             match (bound_agent, inherited_agent) {
@@ -1754,5 +1787,103 @@ fn preview_metadata_state(value: Option<&str>) -> &'static str {
         "computed"
     } else {
         "missing"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_agent(default_model_profile: &str) -> AgentRecord {
+        AgentRecord {
+            agent_id: "agent-default".to_owned(),
+            display_name: "Default Agent".to_owned(),
+            agent_dir: ".".to_owned(),
+            workspace_roots: Vec::new(),
+            default_model_profile: default_model_profile.to_owned(),
+            execution_backend_preference:
+                crate::execution_backends::ExecutionBackendPreference::Automatic,
+            default_tool_allowlist: Vec::new(),
+            default_skill_allowlist: Vec::new(),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        }
+    }
+
+    fn test_session(model_profile_override: Option<&str>) -> journal::OrchestratorSessionRecord {
+        journal::OrchestratorSessionRecord {
+            session_id: "session-1".to_owned(),
+            session_key: "scn-S025-cron-smoke".to_owned(),
+            session_label: None,
+            principal: "user:test".to_owned(),
+            device_id: "device-test".to_owned(),
+            channel: Some("cli".to_owned()),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 2,
+            last_run_id: None,
+            archived_at_unix_ms: None,
+            auto_title: None,
+            auto_title_source: None,
+            auto_title_generator_version: None,
+            auto_title_updated_at_unix_ms: None,
+            title_generation_state: "missing".to_owned(),
+            manual_title_locked: false,
+            manual_title_updated_at_unix_ms: None,
+            model_profile_override: model_profile_override.map(str::to_owned),
+            thinking_override: None,
+            trace_override: None,
+            verbose_override: None,
+            title: "Cron smoke".to_owned(),
+            title_source: "manual".to_owned(),
+            title_generator_version: None,
+            preview: None,
+            last_intent: None,
+            last_summary: None,
+            match_snippet: None,
+            branch_state: "root".to_owned(),
+            parent_session_id: None,
+            branch_origin_run_id: None,
+            last_run_state: None,
+        }
+    }
+
+    fn test_context(
+        agent: AgentRecord,
+        effective_model_profile: Option<&str>,
+    ) -> SessionCatalogContext {
+        SessionCatalogContext {
+            pending_approvals_by_session: HashMap::new(),
+            workspace_by_session: HashMap::new(),
+            project_context_by_session: HashMap::new(),
+            family_by_session: HashMap::new(),
+            bindings_by_session: HashMap::new(),
+            agents_by_id: HashMap::from([(agent.agent_id.clone(), agent)]),
+            default_agent_id: Some("agent-default".to_owned()),
+            effective_model_profile: effective_model_profile.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn session_quick_controls_prefer_runtime_model_over_legacy_agent_default() {
+        let context = test_context(test_agent("deterministic"), Some("MiniMax-M3"));
+        let controls = build_session_quick_controls(&context, &test_session(None));
+
+        assert_eq!(controls.model.value.as_deref(), Some("MiniMax-M3"));
+        assert_eq!(controls.model.display_value, "MiniMax-M3");
+        assert_eq!(controls.model.source, "model_provider_runtime");
+        assert_eq!(controls.model.inherited_value.as_deref(), Some("deterministic"));
+        assert!(!controls.model.override_active);
+    }
+
+    #[test]
+    fn session_quick_controls_keep_explicit_model_override() {
+        let context = test_context(test_agent("deterministic"), Some("MiniMax-M3"));
+        let controls = build_session_quick_controls(&context, &test_session(Some("gpt-4o-mini")));
+
+        assert_eq!(controls.model.value.as_deref(), Some("gpt-4o-mini"));
+        assert_eq!(controls.model.display_value, "gpt-4o-mini");
+        assert_eq!(controls.model.source, "session_override");
+        assert_eq!(controls.model.inherited_value.as_deref(), Some("deterministic"));
+        assert!(controls.model.override_active);
     }
 }
