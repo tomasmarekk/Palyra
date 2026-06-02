@@ -6642,7 +6642,7 @@ fn workspace_patch_redaction_policy_merge_adds_only_unique_values() {
 
     extend_patch_string_defaults(
         &mut policy.redaction_patterns,
-        vec!["token".to_owned(), "custom-pattern".to_owned(), "custom-pattern".to_owned()],
+        vec!["authorization".to_owned(), "custom-pattern".to_owned(), "custom-pattern".to_owned()],
     );
     extend_patch_string_defaults(
         &mut policy.secret_file_markers,
