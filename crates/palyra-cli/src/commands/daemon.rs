@@ -744,10 +744,17 @@ pub(crate) fn run_daemon(command: DaemonCommand) -> Result<()> {
                     "failed to encode daemon run cancel output as JSON",
                 )?;
             } else {
-                println!(
-                    "run.cancel run_id={} cancel_requested={} reason={}",
-                    response.run_id, response.cancel_requested, response.reason
-                );
+                if let Some(state) = response.state.as_deref() {
+                    println!(
+                        "run.cancel run_id={} state={} cancel_requested={} reason={}",
+                        response.run_id, state, response.cancel_requested, response.reason
+                    );
+                } else {
+                    println!(
+                        "run.cancel run_id={} cancel_requested={} reason={}",
+                        response.run_id, response.cancel_requested, response.reason
+                    );
+                }
             }
             std::io::stdout().flush().context("stdout flush failed")
         }

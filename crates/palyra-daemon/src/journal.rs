@@ -1541,6 +1541,14 @@ pub struct OrchestratorCancelRequest {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrchestratorCancelSnapshot {
+    pub run_id: String,
+    pub state: String,
+    pub cancel_requested: bool,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
 pub struct OrchestratorStartupRunRecoveryReport {
     pub terminalized_count: u64,
@@ -7393,7 +7401,7 @@ impl JournalStore {
     pub fn request_orchestrator_cancel(
         &self,
         request: &OrchestratorCancelRequest,
-    ) -> Result<(), JournalError> {
+    ) -> Result<OrchestratorCancelSnapshot, JournalError> {
         let now = current_unix_ms()?;
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let previous = guard
@@ -7417,65 +7425,59 @@ impl JournalStore {
             return Err(JournalError::RunNotFound { run_id: request.run_id.clone() });
         };
         let previous_lifecycle = RunLifecycleState::from_str(previous_state.as_str());
-        let terminal_cancel = !previous_lifecycle.is_some_and(RunLifecycleState::is_terminal);
-        let updated = if terminal_cancel {
-            guard.execute(
-                r#"
-                    UPDATE orchestrator_runs
-                    SET
-                        state = ?4,
-                        cancel_requested = 1,
-                        cancel_reason = ?2,
-                        completed_at_unix_ms = COALESCE(completed_at_unix_ms, ?3),
-                        updated_at_unix_ms = ?3,
-                        last_error = COALESCE(?2, last_error)
-                    WHERE run_ulid = ?1
-                "#,
-                params![request.run_id, request.reason, now, RunLifecycleState::Cancelled.as_str()],
-            )?
-        } else {
-            guard.execute(
-                r#"
-                    UPDATE orchestrator_runs
-                    SET
-                        cancel_requested = 1,
-                        cancel_reason = ?2,
-                        updated_at_unix_ms = ?3
-                    WHERE run_ulid = ?1
-                "#,
-                params![request.run_id, request.reason, now],
-            )?
-        };
+        let should_cancel = !previous_lifecycle.is_some_and(RunLifecycleState::is_terminal);
+        if !should_cancel {
+            return Ok(OrchestratorCancelSnapshot {
+                run_id: request.run_id.clone(),
+                state: previous_state.clone(),
+                cancel_requested: false,
+                reason: format!("run already terminal: {previous_state}"),
+            });
+        }
+        let updated = guard.execute(
+            r#"
+                UPDATE orchestrator_runs
+                SET
+                    state = ?4,
+                    cancel_requested = 1,
+                    cancel_reason = ?2,
+                    completed_at_unix_ms = COALESCE(completed_at_unix_ms, ?3),
+                    updated_at_unix_ms = ?3,
+                    last_error = COALESCE(?2, last_error)
+                WHERE run_ulid = ?1
+            "#,
+            params![request.run_id, request.reason, now, RunLifecycleState::Cancelled.as_str()],
+        )?;
         if updated == 0 {
             return Err(JournalError::RunNotFound { run_id: request.run_id.clone() });
         }
-        if terminal_cancel {
-            append_run_lifecycle_event_tx(
-                &guard,
-                &RunLifecycleEventAppendRequest {
-                    event_id: Ulid::new().to_string(),
-                    run_id: request.run_id.clone(),
-                    session_id,
-                    from_state: RunLifecyclePhase::parse(previous_state.as_str()),
-                    to_state: canonical_run_lifecycle_phase(RunLifecycleState::Cancelled),
-                    actor: RuntimeActorRef {
-                        kind: RuntimeActorKind::System,
-                        id: "system".to_owned(),
-                    },
-                    correlation_id: request.run_id.clone(),
-                    parent_run_id,
-                    idempotency_key: None,
-                    reason: request.reason.clone(),
-                    payload_json: json!({
-                        "legacy_state": RunLifecycleState::Cancelled.as_str(),
-                        "error": request.reason,
-                    })
-                    .to_string(),
-                },
-                now,
-            )?;
-        }
-        Ok(())
+        append_run_lifecycle_event_tx(
+            &guard,
+            &RunLifecycleEventAppendRequest {
+                event_id: Ulid::new().to_string(),
+                run_id: request.run_id.clone(),
+                session_id,
+                from_state: RunLifecyclePhase::parse(previous_state.as_str()),
+                to_state: canonical_run_lifecycle_phase(RunLifecycleState::Cancelled),
+                actor: RuntimeActorRef { kind: RuntimeActorKind::System, id: "system".to_owned() },
+                correlation_id: request.run_id.clone(),
+                parent_run_id,
+                idempotency_key: None,
+                reason: request.reason.clone(),
+                payload_json: json!({
+                    "legacy_state": RunLifecycleState::Cancelled.as_str(),
+                    "error": request.reason,
+                })
+                .to_string(),
+            },
+            now,
+        )?;
+        Ok(OrchestratorCancelSnapshot {
+            run_id: request.run_id.clone(),
+            state: RunLifecycleState::Cancelled.as_str().to_owned(),
+            cancel_requested: true,
+            reason: request.reason.clone(),
+        })
     }
 
     pub fn is_orchestrator_cancel_requested(&self, run_id: &str) -> Result<bool, JournalError> {
@@ -23124,6 +23126,44 @@ mod tests {
             .expect("cancelled run should still exist");
         assert_eq!(after_late_done.state, RunLifecycleState::Cancelled.as_str());
         assert_eq!(after_late_done.completed_at_unix_ms, cancelled.completed_at_unix_ms);
+    }
+
+    #[test]
+    fn orchestrator_cancel_after_terminal_run_is_noop() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+
+        upsert_orchestrator_session(&store, "01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        start_orchestrator_run(&store, "01ARZ3NDEKTSV4RRFFQ69G5FAW", "01ARZ3NDEKTSV4RRFFQ69G5FAX");
+        store
+            .update_orchestrator_run_state(
+                "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+                RunLifecycleState::Done,
+                None,
+            )
+            .expect("run should transition to done");
+
+        let cancel = store
+            .request_orchestrator_cancel(&OrchestratorCancelRequest {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+                reason: "operator_requested_after_done".to_owned(),
+            })
+            .expect("terminal cancel request should return a no-op snapshot");
+
+        assert_eq!(cancel.run_id, "01ARZ3NDEKTSV4RRFFQ69G5FAX");
+        assert_eq!(cancel.state, RunLifecycleState::Done.as_str());
+        assert!(!cancel.cancel_requested);
+        assert_eq!(cancel.reason, "run already terminal: done");
+
+        let snapshot = store
+            .orchestrator_run_status_snapshot("01ARZ3NDEKTSV4RRFFQ69G5FAX")
+            .expect("run snapshot query should succeed")
+            .expect("done run should still exist");
+        assert_eq!(snapshot.state, RunLifecycleState::Done.as_str());
+        assert!(!snapshot.cancel_requested);
+        assert_eq!(snapshot.cancel_reason, None);
+        assert_eq!(snapshot.last_error, None);
     }
 
     #[test]

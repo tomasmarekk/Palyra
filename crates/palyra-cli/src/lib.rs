@@ -10765,6 +10765,7 @@ struct RunTapeEvent {
 #[derive(Debug, Serialize, Deserialize)]
 struct RunCancelResponse {
     run_id: String,
+    state: Option<String>,
     cancel_requested: bool,
     reason: String,
 }

@@ -366,11 +366,13 @@ pub(crate) async fn admin_run_cancel_handler(
         .request_orchestrator_cancel(OrchestratorCancelRequest { run_id, reason })
         .await
         .map_err(runtime_status_response)?;
-    gateway::cleanup_run_resources(
-        &state.runtime,
-        response.run_id.as_str(),
-        response.reason.as_str(),
-    )
-    .await;
+    if response.cancel_requested {
+        gateway::cleanup_run_resources(
+            &state.runtime,
+            response.run_id.as_str(),
+            response.reason.as_str(),
+        )
+        .await;
+    }
     Ok(Json(response))
 }

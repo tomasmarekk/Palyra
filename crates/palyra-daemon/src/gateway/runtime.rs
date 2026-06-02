@@ -831,6 +831,7 @@ pub struct RunTapeSnapshot {
 #[derive(Debug, Clone, Serialize)]
 pub struct RunCancelSnapshot {
     pub run_id: String,
+    pub state: String,
     pub cancel_requested: bool,
     pub reason: String,
 }
@@ -4618,7 +4619,7 @@ impl GatewayRuntimeState {
     fn request_orchestrator_cancel_blocking(
         &self,
         request: &OrchestratorCancelRequest,
-    ) -> Result<(), Status> {
+    ) -> Result<crate::journal::OrchestratorCancelSnapshot, Status> {
         self.journal_store
             .request_orchestrator_cancel(request)
             .map_err(|error| map_orchestrator_store_error("request orchestrator cancel", error))
@@ -4630,13 +4631,18 @@ impl GatewayRuntimeState {
         request: OrchestratorCancelRequest,
     ) -> Result<RunCancelSnapshot, Status> {
         let state = Arc::clone(self);
-        let run_id = request.run_id.clone();
-        let reason = request.reason.clone();
-        tokio::task::spawn_blocking(move || state.request_orchestrator_cancel_blocking(&request))
-            .await
-            .map_err(|_| Status::internal("orchestrator cancel worker panicked"))??;
+        let snapshot = tokio::task::spawn_blocking(move || {
+            state.request_orchestrator_cancel_blocking(&request)
+        })
+        .await
+        .map_err(|_| Status::internal("orchestrator cancel worker panicked"))??;
         self.counters.orchestrator_cancel_requests.fetch_add(1, Ordering::Relaxed);
-        Ok(RunCancelSnapshot { run_id, cancel_requested: true, reason })
+        Ok(RunCancelSnapshot {
+            run_id: snapshot.run_id,
+            state: snapshot.state,
+            cancel_requested: snapshot.cancel_requested,
+            reason: snapshot.reason,
+        })
     }
 
     #[allow(clippy::result_large_err)]

@@ -252,8 +252,10 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                 reason: reason.clone(),
             })
             .await?;
-        cleanup_run_resources(&self.state, snapshot.run_id.as_str(), snapshot.reason.as_str())
-            .await;
+        if snapshot.cancel_requested {
+            cleanup_run_resources(&self.state, snapshot.run_id.as_str(), snapshot.reason.as_str())
+                .await;
+        }
         Ok(Response::new(gateway_v1::AbortRunResponse {
             v: CANONICAL_PROTOCOL_MAJOR,
             run_id: Some(common_v1::CanonicalId { ulid: snapshot.run_id }),
