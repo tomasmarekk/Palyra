@@ -863,10 +863,6 @@ pub(crate) fn background_process_status_by_pid(
     builtin_process_status_success("palyra.process.status", &args)
 }
 
-pub(crate) fn background_process_is_alive(pid: u32) -> io::Result<bool> {
-    background_process_runtime_status(pid).map(BackgroundProcessRuntimeStatus::alive)
-}
-
 pub(crate) fn background_process_runtime_status(
     pid: u32,
 ) -> io::Result<BackgroundProcessRuntimeStatus> {
