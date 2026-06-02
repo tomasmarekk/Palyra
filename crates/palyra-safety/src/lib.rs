@@ -853,6 +853,7 @@ fn is_safe_secret_reference_value(key: &str, value: &str) -> bool {
         || is_env_getter_reference(normalized, "os.getenv")
         || is_os_environ_index_reference(normalized)
         || is_env_identifier_reference_expression(key, normalized)
+        || is_standalone_env_identifier_literal(normalized)
         || is_obvious_placeholder_secret_value(normalized)
         || is_dom_input_value_reference(normalized)
 }
@@ -922,6 +923,21 @@ fn is_env_identifier_reference_expression(key: &str, value: &str) -> bool {
 
 fn is_env_reference_identifier_literal(value: &str) -> bool {
     is_env_identifier(value) && value.contains('_')
+}
+
+fn is_standalone_env_identifier_literal(value: &str) -> bool {
+    let normalized = value.trim().trim_end_matches([',', ';']).trim();
+    let literal = normalized
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .or_else(|| normalized.strip_prefix('\'').and_then(|rest| rest.strip_suffix('\'')))
+        .or_else(|| normalized.strip_prefix('`').and_then(|rest| rest.strip_suffix('`')));
+    let Some(literal) = literal else {
+        return false;
+    };
+    is_env_reference_identifier_literal(literal)
+        && literal.chars().any(|ch| ch == '_')
+        && literal.chars().all(|ch| !ch.is_ascii_lowercase())
 }
 
 fn assignment_key_describes_env_identifier(key: &str) -> bool {
@@ -1052,6 +1068,9 @@ fn bare_token_assignment_value_looks_secret(value: &str) -> bool {
         return false;
     }
     let lowered = normalized.to_ascii_lowercase();
+    if looks_like_application_identifier(lowered.as_str()) {
+        return false;
+    }
     lowered.contains("secret")
         || lowered.starts_with("bearer")
         || lowered.starts_with("sk-")
@@ -1059,6 +1078,17 @@ fn bare_token_assignment_value_looks_secret(value: &str) -> bool {
         || lowered.starts_with("github_pat_")
         || lowered.starts_with("xox")
         || normalized.len() >= 16
+}
+
+fn looks_like_application_identifier(value: &str) -> bool {
+    value.len() <= 128
+        && value.contains(':')
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ':' | '-' | '_' | '.' | '/'))
+        && !value.contains("secret")
+        && !value.contains("token")
+        && !value.contains("password")
 }
 
 fn detect_prefixed_secret_token(line: &str) -> Option<&'static str> {
@@ -1854,6 +1884,50 @@ mod tests {
         assert!(!outcome.redacted);
         assert_eq!(outcome.redacted_text, source);
         assert!(!outcome.redacted_text.contains("[REDACTED_SECRET]"));
+        assert!(!outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code.starts_with("secret_leak.assignment.")));
+    }
+
+    #[test]
+    fn local_storage_keys_are_not_redacted_as_secret_values() {
+        let source = "const STORAGE_KEY = \"todo-app:items:v1\";\n\
+                      const FILTER_KEY = \"todo-app:filter:v1\";";
+        let outcome = redact_text_for_export(
+            source,
+            SafetySourceKind::Workspace,
+            SafetyContentKind::WorkspaceDocument,
+            TrustLabel::TrustedLocal,
+        );
+
+        assert!(!outcome.redacted);
+        assert_eq!(outcome.redacted_text, source);
+        assert!(outcome.redacted_text.contains("todo-app:items:v1"));
+        assert!(outcome.redacted_text.contains("todo-app:filter:v1"));
+        assert!(!outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code.starts_with("secret_leak.assignment.")));
+    }
+
+    #[test]
+    fn env_identifier_literals_are_not_redacted_as_secret_values() {
+        let source = "const SECRET_KEY = 'VITE_SECRET_TOKEN';\n\
+                      const PRIVATE_KEY = 'SERVER_PRIVATE_KEY';";
+        let outcome = redact_text_for_export(
+            source,
+            SafetySourceKind::Workspace,
+            SafetyContentKind::WorkspaceDocument,
+            TrustLabel::TrustedLocal,
+        );
+
+        assert!(!outcome.redacted);
+        assert_eq!(outcome.redacted_text, source);
+        assert!(outcome.redacted_text.contains("VITE_SECRET_TOKEN"));
+        assert!(outcome.redacted_text.contains("SERVER_PRIVATE_KEY"));
         assert!(!outcome
             .scan
             .finding_codes()
