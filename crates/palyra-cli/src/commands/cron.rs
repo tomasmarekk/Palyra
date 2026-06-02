@@ -237,7 +237,7 @@ pub(crate) async fn run_cron_async(command: CronCommand) -> Result<()> {
                     json_optional_string_at(&payload, "/run_id").unwrap_or_default(),
                     json_optional_string_at(&payload, "/status")
                         .unwrap_or_else(|| "unknown".to_owned()),
-                    cron_run_session_key(&payload).unwrap_or_else(|| "none".to_owned()),
+                    cron_run_session_key_display(&payload),
                     json_optional_string_at(&payload, "/message").unwrap_or_default(),
                 );
                 std::io::stdout().flush().context("stdout flush failed")
@@ -663,7 +663,7 @@ fn emit_cron_runs(id: &str, payload: &Value, json: bool) -> Result<()> {
             "cron.run run_id={} status={} session_key={} workdir={} started_at_ms={} finished_at_ms={} tool_calls={} tool_denies={}",
             json_optional_string_at(run, "/run_id").unwrap_or_else(|| "unknown".to_owned()),
             json_optional_string_at(run, "/status").unwrap_or_else(|| "unknown".to_owned()),
-            cron_run_session_key(run).unwrap_or_else(|| "none".to_owned()),
+            cron_run_session_key_display(run),
             json_optional_string_at(run, "/trigger_payload/workdir")
                 .or_else(|| json_optional_string_at(run, "/workdir"))
                 .unwrap_or_else(|| "none".to_owned()),
@@ -679,6 +679,14 @@ fn emit_cron_runs(id: &str, payload: &Value, json: bool) -> Result<()> {
 fn cron_run_session_key(run: &Value) -> Option<String> {
     json_optional_string_at(run, "/session_key")
         .or_else(|| json_optional_string_at(run, "/output_lookup/session_key"))
+}
+
+fn cron_run_session_key_display(run: &Value) -> &'static str {
+    if cron_run_session_key(run).is_some() {
+        "<redacted>"
+    } else {
+        "none"
+    }
 }
 
 fn schedule_routine_array(payload: &Value) -> &[Value] {
@@ -836,7 +844,7 @@ mod tests {
 
     use super::{
         build_schedule_routine_payload, cron_mutation_json_payload, cron_run_session_key,
-        cron_update_only_changes_enabled, ScheduleRoutineConfig,
+        cron_run_session_key_display, cron_update_only_changes_enabled, ScheduleRoutineConfig,
     };
     use crate::cli::{
         CronConcurrencyPolicyArg, CronMisfirePolicyArg, CronScheduleTypeArg,
@@ -1044,5 +1052,20 @@ mod tests {
             }
         });
         assert_eq!(cron_run_session_key(&lookup).as_deref(), Some("cron:daily:run-2"));
+    }
+
+    #[test]
+    fn cron_run_session_key_display_redacts_present_keys() {
+        let top_level = json!({ "session_key": "cron:daily:run-1" });
+        assert_eq!(cron_run_session_key_display(&top_level), "<redacted>");
+
+        let lookup = json!({
+            "output_lookup": {
+                "session_key": "cron:daily:run-2"
+            }
+        });
+        assert_eq!(cron_run_session_key_display(&lookup), "<redacted>");
+
+        assert_eq!(cron_run_session_key_display(&json!({})), "none");
     }
 }
