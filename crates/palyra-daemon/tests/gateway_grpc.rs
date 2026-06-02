@@ -2201,12 +2201,22 @@ async fn grpc_route_message_denies_unknown_skill_before_approval_and_records_eve
     let (openai_base_url, _request_count, server_handle) =
         spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(200, response_body)])?;
     let (child, admin_port, grpc_port, journal_db_path, config_path) =
-        spawn_palyrad_with_openai_provider_and_channel_router_with_tool_policy(
-            openai_base_url.as_str(),
-            OPENAI_API_KEY,
-            "palyra.plugin.run",
-            2,
-            750,
+        spawn_palyrad_with_openai_provider_channel_router_tool_policy_and_wasm_runtime(
+            WasmRuntimeSpawnConfig {
+                openai_base_url: openai_base_url.as_str(),
+                openai_api_key: OPENAI_API_KEY,
+                allowed_tools: "palyra.plugin.run",
+                max_calls_per_run: 2,
+                execution_timeout_ms: 750,
+                allowed_http_hosts: "api.example.com",
+                allowed_secrets: "",
+                allowed_storage_prefixes: "",
+                allowed_channels: "cli",
+                fuel_budget: 10_000_000,
+                max_memory_bytes: 64 * 1024 * 1024,
+                max_table_elements: 100_000,
+                max_instances: 256,
+            },
         )?;
     let _config_guard = TempFileGuard::new(config_path);
     let mut daemon = ChildGuard::new(child);
@@ -2259,7 +2269,8 @@ async fn grpc_route_message_denies_unknown_skill_before_approval_and_records_eve
     );
     assert!(
         outbound.text.contains("skill execution blocked by security gate"),
-        "route output should include skill gate denial context"
+        "route output should include skill gate denial context: {}",
+        outbound.text
     );
     assert!(
         outbound.text.contains("status=missing"),
@@ -10673,7 +10684,29 @@ fn spawn_palyrad_with_openai_provider_tool_policy_and_wasm_runtime(
     config: WasmRuntimeSpawnConfig<'_>,
 ) -> Result<(Child, u16, u16, PathBuf, PathBuf)> {
     let config_path = write_wasm_runtime_config(&config)?;
+    spawn_palyrad_with_openai_provider_tool_policy_config(
+        config,
+        config_path,
+        "failed to start palyrad with wasm runtime policy",
+    )
+}
 
+fn spawn_palyrad_with_openai_provider_channel_router_tool_policy_and_wasm_runtime(
+    config: WasmRuntimeSpawnConfig<'_>,
+) -> Result<(Child, u16, u16, PathBuf, PathBuf)> {
+    let config_path = write_channel_router_config_with_wasm_runtime(&config)?;
+    spawn_palyrad_with_openai_provider_tool_policy_config(
+        config,
+        config_path,
+        "failed to start palyrad with channel-router + wasm runtime policy",
+    )
+}
+
+fn spawn_palyrad_with_openai_provider_tool_policy_config(
+    config: WasmRuntimeSpawnConfig<'_>,
+    config_path: PathBuf,
+    spawn_context: &'static str,
+) -> Result<(Child, u16, u16, PathBuf, PathBuf)> {
     let journal_db_path = unique_temp_journal_db_path();
     let identity_store_dir = unique_temp_identity_store_dir();
     let vault_dir = unique_temp_vault_dir();
@@ -10714,7 +10747,7 @@ fn spawn_palyrad_with_openai_provider_tool_policy_and_wasm_runtime(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .context("failed to start palyrad with wasm runtime policy")?;
+        .context(spawn_context)?;
     let stdout = child.stdout.take().context("failed to capture palyrad stdout")?;
     let (admin_port, grpc_port) = wait_for_listen_ports(stdout, &mut child)?;
     Ok((child, admin_port, grpc_port, journal_db_path, config_path))
@@ -10792,7 +10825,36 @@ fn apply_isolated_daemon_test_env<'a>(
 
 fn write_wasm_runtime_config(config: &WasmRuntimeSpawnConfig<'_>) -> Result<PathBuf> {
     let config_path = unique_temp_daemon_config_path();
-    let config_body = format!(
+    let config_body = wasm_runtime_config_body(config);
+    fs::write(&config_path, config_body).with_context(|| {
+        format!("failed to write wasm runtime test config at {}", config_path.display())
+    })?;
+    Ok(config_path)
+}
+
+fn write_channel_router_config_with_wasm_runtime(
+    config: &WasmRuntimeSpawnConfig<'_>,
+) -> Result<PathBuf> {
+    let config_path = write_channel_router_config()?;
+    let wasm_config_body = wasm_runtime_config_body(config);
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&config_path)
+        .with_context(|| {
+            format!(
+                "failed to open channel router test config for wasm runtime append at {}",
+                config_path.display()
+            )
+        })?
+        .write_all(format!("\n{wasm_config_body}").as_bytes())
+        .with_context(|| {
+            format!("failed to append wasm runtime test config at {}", config_path.display())
+        })?;
+    Ok(config_path)
+}
+
+fn wasm_runtime_config_body(config: &WasmRuntimeSpawnConfig<'_>) -> String {
+    format!(
         "\
 [tool_call.wasm_runtime]
 enabled = true
@@ -10814,11 +10876,7 @@ allowed_channels = {allowed_channels}
         allowed_secrets = toml_string_array(config.allowed_secrets),
         allowed_storage_prefixes = toml_string_array(config.allowed_storage_prefixes),
         allowed_channels = toml_string_array(config.allowed_channels),
-    );
-    fs::write(&config_path, config_body).with_context(|| {
-        format!("failed to write wasm runtime test config at {}", config_path.display())
-    })?;
-    Ok(config_path)
+    )
 }
 
 fn write_channel_router_config() -> Result<PathBuf> {
