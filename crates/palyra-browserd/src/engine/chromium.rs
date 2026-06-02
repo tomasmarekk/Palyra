@@ -2097,6 +2097,25 @@ async fn chromium_read_local_storage(
     parse_chromium_local_storage_snapshot(value)
 }
 
+pub(crate) async fn chromium_clear_active_origin_storage(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+) -> Result<u32, String> {
+    enforce_chromium_remote_ip_guard(runtime, session_id).await?;
+    let (_tab_id, tab) = chromium_active_tab_for_session(runtime, session_id).await?;
+    let value = run_chromium_blocking("chromium clear active origin storage", move || {
+        let value = tab
+            .evaluate(CHROMIUM_CLEAR_ACTIVE_ORIGIN_STORAGE_SCRIPT, false)
+            .map_err(|error| format!("failed to clear Chromium origin storage: {error}"))?
+            .value
+            .unwrap_or_else(|| serde_json::Value::String("{}".to_owned()));
+        Ok(decode_chromium_json_script_value(value))
+    })
+    .await?;
+    enforce_chromium_remote_ip_guard(runtime, session_id).await?;
+    parse_chromium_clear_storage_status(value)
+}
+
 async fn chromium_read_document_cookies(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -2264,6 +2283,39 @@ fn chromium_read_local_storage_script() -> String {
     )
 }
 
+const CHROMIUM_CLEAR_ACTIVE_ORIGIN_STORAGE_SCRIPT: &str = r#"
+(() => {
+  try {
+    const origin = String((window.location && window.location.origin) || "");
+    if (!origin || origin === "null") {
+      return JSON.stringify({ ok: true, origin: "", entries_cleared: 0 });
+    }
+    const local = window.localStorage;
+    const session = window.sessionStorage;
+    const localEntries = local ? Number(local.length || 0) : 0;
+    const sessionEntries = session ? Number(session.length || 0) : 0;
+    if (local) {
+      local.clear();
+    }
+    if (session) {
+      session.clear();
+    }
+    return JSON.stringify({
+      ok: true,
+      origin,
+      entries_cleared: Math.max(0, localEntries) + Math.max(0, sessionEntries)
+    });
+  } catch (error) {
+    return JSON.stringify({
+      ok: false,
+      origin: "",
+      entries_cleared: 0,
+      error: String((error && (error.message || error)) || "")
+    });
+  }
+})()
+"#;
+
 fn chromium_read_document_cookies_script() -> String {
     format!(
         r#"
@@ -2355,6 +2407,23 @@ fn parse_chromium_local_storage_snapshot(
         }
     }
     Ok(Some((origin, entries)))
+}
+
+fn parse_chromium_clear_storage_status(value: serde_json::Value) -> Result<u32, String> {
+    let object =
+        value.as_object().ok_or_else(|| "storage clear returned non-object payload".to_owned())?;
+    if !object.get("ok").and_then(serde_json::Value::as_bool).unwrap_or(false) {
+        let error = object
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown storage clear failure");
+        return Err(format!("storage clear failed: {error}"));
+    }
+    Ok(object
+        .get("entries_cleared")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(0))
 }
 
 fn parse_chromium_document_cookie_snapshot(
@@ -3996,16 +4065,17 @@ mod tests {
         chromium_upload_staging_path, chromium_viewport_mismatch_error, clamp_chromium_snapshot,
         decode_chromium_console_entries_value, decode_chromium_json_script_value,
         decode_chromium_network_entries_value, decode_chromium_observe_state_value,
-        page_body_with_chromium_observe_state, parse_chromium_client_download_entries,
-        parse_chromium_console_entries, parse_chromium_document_cookie_snapshot,
-        parse_chromium_layout_metrics, parse_chromium_local_storage_restore_status,
-        parse_chromium_local_storage_snapshot, parse_chromium_page_network_entries,
-        parse_chromium_viewport_metrics, parse_key_press_spec,
+        page_body_with_chromium_observe_state, parse_chromium_clear_storage_status,
+        parse_chromium_client_download_entries, parse_chromium_console_entries,
+        parse_chromium_document_cookie_snapshot, parse_chromium_layout_metrics,
+        parse_chromium_local_storage_restore_status, parse_chromium_local_storage_snapshot,
+        parse_chromium_page_network_entries, parse_chromium_viewport_metrics, parse_key_press_spec,
         selector_not_found_error_from_cached_snapshot, ChromiumLayoutMetrics,
-        ChromiumObserveSnapshot, CHROMIUM_DRAIN_NETWORK_LOG_SCRIPT,
-        CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT, CHROMIUM_READ_CONSOLE_LOG_SCRIPT,
-        MAX_CHROMIUM_CONSOLE_JSON_BYTES, MAX_CHROMIUM_DOCUMENT_COOKIE_JSON_BYTES,
-        MAX_CHROMIUM_LOCAL_STORAGE_JSON_BYTES, MAX_CHROMIUM_NETWORK_JSON_BYTES,
+        ChromiumObserveSnapshot, CHROMIUM_CLEAR_ACTIVE_ORIGIN_STORAGE_SCRIPT,
+        CHROMIUM_DRAIN_NETWORK_LOG_SCRIPT, CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT,
+        CHROMIUM_READ_CONSOLE_LOG_SCRIPT, MAX_CHROMIUM_CONSOLE_JSON_BYTES,
+        MAX_CHROMIUM_DOCUMENT_COOKIE_JSON_BYTES, MAX_CHROMIUM_LOCAL_STORAGE_JSON_BYTES,
+        MAX_CHROMIUM_NETWORK_JSON_BYTES,
     };
     use crate::{
         DEFAULT_SESSION_IDLE_TTL_MS, MAX_CONSOLE_MESSAGE_BYTES, MAX_CONSOLE_SOURCE_BYTES,
@@ -4301,6 +4371,41 @@ mod tests {
         assert_eq!(origin, "http://127.0.0.1:49152");
         assert_eq!(entries.get("cart").map(String::as_str), Some("1"));
         assert_eq!(entries.get("theme").map(String::as_str), Some("dark"));
+    }
+
+    #[test]
+    fn chromium_clear_active_origin_storage_script_clears_local_and_session_storage() {
+        assert!(CHROMIUM_CLEAR_ACTIVE_ORIGIN_STORAGE_SCRIPT.contains("window.localStorage"));
+        assert!(CHROMIUM_CLEAR_ACTIVE_ORIGIN_STORAGE_SCRIPT.contains("window.sessionStorage"));
+        assert!(CHROMIUM_CLEAR_ACTIVE_ORIGIN_STORAGE_SCRIPT.contains("local.clear()"));
+        assert!(CHROMIUM_CLEAR_ACTIVE_ORIGIN_STORAGE_SCRIPT.contains("session.clear()"));
+    }
+
+    #[test]
+    fn parse_chromium_clear_storage_status_accepts_entry_count() {
+        let raw = serde_json::json!({
+            "ok": true,
+            "origin": "http://127.0.0.1:8765",
+            "entries_cleared": 2
+        });
+
+        let entries_cleared =
+            parse_chromium_clear_storage_status(raw).expect("storage clear status should parse");
+
+        assert_eq!(entries_cleared, 2);
+    }
+
+    #[test]
+    fn parse_chromium_clear_storage_status_rejects_page_failure() {
+        let raw = serde_json::json!({
+            "ok": false,
+            "error": "localStorage unavailable"
+        });
+
+        let error = parse_chromium_clear_storage_status(raw)
+            .expect_err("page-side storage clear failure must be surfaced");
+
+        assert!(error.contains("localStorage unavailable"));
     }
 
     #[test]

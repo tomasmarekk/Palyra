@@ -3215,7 +3215,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         let clear_storage = payload.clear_storage || default_reset;
         let mut session_for_persist = None;
 
-        let response = {
+        let mut response = {
             let mut sessions = self.runtime.sessions.lock().await;
             let Some(session) = sessions.get_mut(session_id.as_str()) else {
                 return Ok(Response::new(browser_v1::ResetStateResponse {
@@ -3273,6 +3273,21 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                 error: String::new(),
             }
         };
+        if clear_storage && matches!(self.runtime.engine_mode, BrowserEngineMode::Chromium) {
+            match chromium_clear_active_origin_storage(self.runtime.as_ref(), session_id.as_str())
+                .await
+            {
+                Ok(entries_cleared) => {
+                    response.storage_entries_cleared =
+                        response.storage_entries_cleared.max(entries_cleared);
+                }
+                Err(error) => {
+                    response.success = false;
+                    response.error =
+                        format!("failed to clear active Chromium origin storage: {error}");
+                }
+            }
+        }
         persist_session_after_mutation(self.runtime.as_ref(), session_for_persist, "reset_state")
             .map_err(map_persist_error_to_status)?;
         Ok(Response::new(response))
