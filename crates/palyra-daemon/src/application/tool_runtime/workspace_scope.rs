@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Component, Path, PathBuf},
     sync::Arc,
@@ -23,7 +24,10 @@ struct RunLaunchParameterDelta {
 struct RunLaunchCliContext {
     launch_cwd: Option<String>,
     workspace_roots: Option<Vec<String>>,
+    env: Option<BTreeMap<String, String>>,
 }
+
+const RUN_LAUNCH_SAFE_PATH_ENV_KEYS: &[&str] = &["PALYRA_E2E_HOME", "PALYRA_E2E_OS_ROOT"];
 
 pub(crate) async fn session_active_workspace_root(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -48,6 +52,25 @@ pub(crate) async fn workspace_roots_with_run_launch_context(
     merge_launch_workspace_roots(workspace_roots, launch_roots)
 }
 
+pub(crate) async fn run_launch_context_path_env(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+) -> BTreeMap<String, PathBuf> {
+    let Some(run) =
+        runtime_state.orchestrator_run_status_snapshot(run_id.to_owned()).await.ok().flatten()
+    else {
+        return BTreeMap::new();
+    };
+    let Some(parameter_delta_json) = run.parameter_delta_json.as_deref() else {
+        return BTreeMap::new();
+    };
+    let Ok(parameter_delta) = serde_json::from_str::<RunLaunchParameterDelta>(parameter_delta_json)
+    else {
+        return BTreeMap::new();
+    };
+    parameter_delta.cli_context.map(launch_path_env_from_context).unwrap_or_default()
+}
+
 async fn run_launch_context_workspace_roots(
     runtime_state: &Arc<GatewayRuntimeState>,
     run_id: &str,
@@ -65,6 +88,20 @@ async fn run_launch_context_workspace_roots(
         return Vec::new();
     };
     parameter_delta.cli_context.map(launch_workspace_roots_from_context).unwrap_or_default()
+}
+
+fn launch_path_env_from_context(context: RunLaunchCliContext) -> BTreeMap<String, PathBuf> {
+    let mut env = BTreeMap::new();
+    for (key, value) in context.env.unwrap_or_default() {
+        if !RUN_LAUNCH_SAFE_PATH_ENV_KEYS.iter().any(|allowed| *allowed == key) {
+            continue;
+        }
+        let Some(root) = canonical_launch_workspace_root(value.as_str()) else {
+            continue;
+        };
+        env.insert(key, root);
+    }
+    env
 }
 
 fn launch_workspace_roots_from_context(context: RunLaunchCliContext) -> Vec<PathBuf> {
@@ -338,12 +375,12 @@ fn normalize_relative_workspace_path(path: &str) -> Option<String> {
 mod tests {
     use super::{
         active_workspace_root_from_focus_paths, canonical_launch_workspace_root,
-        launch_workspace_roots_from_context, merge_launch_workspace_roots,
-        relative_path_already_targets_active_root, relative_path_should_use_active_root,
-        same_workspace_root, workspace_root_override_targets_active_root, ActiveWorkspaceRoot,
-        RunLaunchCliContext,
+        launch_path_env_from_context, launch_workspace_roots_from_context,
+        merge_launch_workspace_roots, relative_path_already_targets_active_root,
+        relative_path_should_use_active_root, same_workspace_root,
+        workspace_root_override_targets_active_root, ActiveWorkspaceRoot, RunLaunchCliContext,
     };
-    use std::fs;
+    use std::{collections::BTreeMap, fs};
 
     #[test]
     fn active_workspace_root_uses_existing_session_focus_directory() {
@@ -504,6 +541,7 @@ mod tests {
                 explicit_root.to_string_lossy().into_owned(),
                 launch_cwd.to_string_lossy().into_owned(),
             ]),
+            env: None,
         });
         let roots = merge_launch_workspace_roots(std::slice::from_ref(&default_root), launch_roots);
 
@@ -511,5 +549,32 @@ mod tests {
         assert_eq!(roots.first(), Some(&explicit_root));
         assert_eq!(roots.get(1), Some(&launch_cwd));
         assert_eq!(roots.get(2), Some(&default_root));
+    }
+
+    #[test]
+    fn launch_path_env_accepts_safe_existing_user_roots_only() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let home = tempdir.path().join("home");
+        let os_root = tempdir.path().join("os-root");
+        fs::create_dir_all(home.as_path()).expect("home root should exist");
+        fs::create_dir_all(os_root.as_path()).expect("OS root should exist");
+        let env = launch_path_env_from_context(RunLaunchCliContext {
+            launch_cwd: None,
+            workspace_roots: None,
+            env: Some(BTreeMap::from([
+                ("PALYRA_E2E_HOME".to_owned(), home.to_string_lossy().into_owned()),
+                ("PALYRA_E2E_OS_ROOT".to_owned(), os_root.to_string_lossy().into_owned()),
+                ("PALYRA_ADMIN_TOKEN".to_owned(), "secret".to_owned()),
+                (
+                    "PALYRA_E2E_MISSING".to_owned(),
+                    tempdir.path().join("missing").to_string_lossy().into_owned(),
+                ),
+            ])),
+        });
+
+        assert_eq!(env.get("PALYRA_E2E_HOME"), Some(&fs::canonicalize(home).unwrap()));
+        assert_eq!(env.get("PALYRA_E2E_OS_ROOT"), Some(&fs::canonicalize(os_root).unwrap()));
+        assert!(!env.contains_key("PALYRA_ADMIN_TOKEN"));
+        assert!(!env.contains_key("PALYRA_E2E_MISSING"));
     }
 }

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
@@ -16,7 +17,9 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     agents::AgentResolveRequest,
-    application::tool_runtime::workspace_scope::workspace_roots_with_run_launch_context,
+    application::tool_runtime::workspace_scope::{
+        run_launch_context_path_env, workspace_roots_with_run_launch_context,
+    },
     gateway::{GatewayRuntimeState, ToolRuntimeExecutionContext, OS_FILE_TOOL_NAME},
     tool_protocol::{build_tool_execution_outcome, ToolExecutionOutcome},
 };
@@ -87,6 +90,7 @@ enum OsFileOperation {
 struct OsFilePolicy {
     workspace_roots: Vec<PathBuf>,
     user_os_roots: Vec<PathBuf>,
+    path_env: BTreeMap<String, PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -179,8 +183,12 @@ async fn resolve_os_file_policy(
     .iter()
     .filter_map(|root| canonicalize_existing_dir(root.as_path()).ok())
     .collect::<Vec<_>>();
-    let user_os_roots = user_owned_os_roots();
-    Ok(OsFilePolicy { workspace_roots, user_os_roots })
+    let path_env = run_launch_context_path_env(runtime_state, context.run_id).await;
+    let mut user_os_roots = user_owned_os_roots();
+    for root in path_env.values() {
+        push_canonical_root(&mut user_os_roots, root.clone());
+    }
+    Ok(OsFilePolicy { workspace_roots, user_os_roots, path_env })
 }
 
 fn execute_os_file_operation(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String> {
@@ -199,7 +207,7 @@ fn execute_os_file_operation(policy: &OsFilePolicy, input: &OsFileInput) -> Resu
 }
 
 fn stat_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String> {
-    let path = resolve_existing_os_path(input.path.as_str())?;
+    let path = resolve_existing_os_path(policy, input.path.as_str())?;
     ensure_os_path_allowed(policy, &path)?;
     let metadata = fs::metadata(path.resolved_path.as_path()).map_err(|error| {
         format!("{OS_FILE_TOOL_NAME} failed to inspect {}: {error}", input.path.trim())
@@ -217,7 +225,7 @@ fn stat_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String
 }
 
 fn read_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String> {
-    let path = resolve_existing_os_path(input.path.as_str())?;
+    let path = resolve_existing_os_path(policy, input.path.as_str())?;
     ensure_os_path_allowed(policy, &path)?;
     let mut file = File::open(path.resolved_path.as_path()).map_err(|error| {
         format!("{OS_FILE_TOOL_NAME} failed to open {}: {error}", input.path.trim())
@@ -260,7 +268,7 @@ fn read_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String
 
 fn write_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String> {
     let bytes = input_write_bytes(input)?;
-    let path = resolve_target_os_path(input.path.as_str())?;
+    let path = resolve_target_os_path(policy, input.path.as_str())?;
     ensure_os_path_allowed(policy, &path)?;
     let dry_run = input.dry_run.unwrap_or(false);
     let create_parent_dirs = input.create_parent_dirs.unwrap_or(true);
@@ -376,7 +384,7 @@ fn looks_like_large_full_file_shrink(existing_size_bytes: u64, new_size_bytes: u
 }
 
 fn copy_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String> {
-    let source = resolve_existing_os_path(input.path.as_str())?;
+    let source = resolve_existing_os_path(policy, input.path.as_str())?;
     let target = resolve_copy_move_target_path(policy, required_target_path(input)?)?;
     ensure_os_path_allowed(policy, &source)?;
     ensure_os_path_allowed(policy, &target)?;
@@ -406,7 +414,7 @@ fn copy_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String
 }
 
 fn move_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String> {
-    let source = resolve_existing_os_path(input.path.as_str())?;
+    let source = resolve_existing_os_path(policy, input.path.as_str())?;
     let target = resolve_copy_move_target_path(policy, required_target_path(input)?)?;
     ensure_os_path_allowed(policy, &source)?;
     ensure_os_path_allowed(policy, &target)?;
@@ -441,7 +449,7 @@ fn move_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String
 }
 
 fn delete_file_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String> {
-    let path = resolve_existing_os_path(input.path.as_str())?;
+    let path = resolve_existing_os_path(policy, input.path.as_str())?;
     ensure_os_path_allowed(policy, &path)?;
     let metadata = fs::metadata(path.resolved_path.as_path()).map_err(|error| {
         format!("{OS_FILE_TOOL_NAME} failed to inspect {}: {error}", input.path.trim())
@@ -465,7 +473,7 @@ fn delete_file_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value,
 }
 
 fn delete_empty_dir_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String> {
-    let path = resolve_existing_os_path(input.path.as_str())?;
+    let path = resolve_existing_os_path(policy, input.path.as_str())?;
     ensure_os_path_allowed(policy, &path)?;
     let metadata = fs::metadata(path.resolved_path.as_path()).map_err(|error| {
         format!("{OS_FILE_TOOL_NAME} failed to inspect {}: {error}", input.path.trim())
@@ -491,7 +499,7 @@ fn delete_empty_dir_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<V
 }
 
 fn mkdir_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String> {
-    let path = resolve_target_os_path(input.path.as_str())?;
+    let path = resolve_target_os_path(policy, input.path.as_str())?;
     ensure_os_path_allowed(policy, &path)?;
     let dry_run = input.dry_run.unwrap_or(false);
     if !dry_run {
@@ -509,7 +517,7 @@ fn mkdir_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, Strin
 }
 
 fn list_dir_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String> {
-    let path = resolve_existing_os_path(input.path.as_str())?;
+    let path = resolve_existing_os_path(policy, input.path.as_str())?;
     ensure_os_path_allowed(policy, &path)?;
     let metadata = fs::metadata(path.resolved_path.as_path()).map_err(|error| {
         format!("{OS_FILE_TOOL_NAME} failed to inspect {}: {error}", input.path.trim())
@@ -620,7 +628,7 @@ impl OsFileSearchState {
 }
 
 fn search_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String> {
-    let path = resolve_existing_os_path(input.path.as_str())?;
+    let path = resolve_existing_os_path(policy, input.path.as_str())?;
     ensure_os_path_allowed(policy, &path)?;
     let query = input
         .query
@@ -920,12 +928,12 @@ fn resolve_copy_move_target_path(
 ) -> Result<ResolvedOsPath, String> {
     let trimmed = target_path.trim();
     if path_env_prefix(trimmed)?.is_some() {
-        return resolve_target_os_path(trimmed);
+        return resolve_target_os_path(policy, trimmed);
     }
     if is_workspace_relative_target(trimmed) || !Path::new(trimmed).is_absolute() {
         return resolve_workspace_relative_target_path(policy, trimmed);
     }
-    resolve_target_os_path(trimmed)
+    resolve_target_os_path(policy, trimmed)
 }
 
 fn resolve_workspace_relative_target_path(
@@ -985,16 +993,16 @@ fn normalize_workspace_relative_target(target_path: &str) -> Result<PathBuf, Str
     Ok(path)
 }
 
-fn resolve_existing_os_path(path: &str) -> Result<ResolvedOsPath, String> {
-    let requested_path = parse_absolute_os_path(path)?;
+fn resolve_existing_os_path(policy: &OsFilePolicy, path: &str) -> Result<ResolvedOsPath, String> {
+    let requested_path = parse_absolute_os_path(policy, path)?;
     let resolved_path = fs::canonicalize(requested_path.as_path()).map_err(|error| {
         format!("{OS_FILE_TOOL_NAME} path does not resolve to an existing OS file target: {error}")
     })?;
     Ok(ResolvedOsPath { requested_path, resolved_path, existed: true })
 }
 
-fn resolve_target_os_path(path: &str) -> Result<ResolvedOsPath, String> {
-    let requested_path = parse_absolute_os_path(path)?;
+fn resolve_target_os_path(policy: &OsFilePolicy, path: &str) -> Result<ResolvedOsPath, String> {
+    let requested_path = parse_absolute_os_path(policy, path)?;
     if requested_path.exists() {
         let resolved_path = fs::canonicalize(requested_path.as_path()).map_err(|error| {
             format!("{OS_FILE_TOOL_NAME} failed to resolve existing target: {error}")
@@ -1009,7 +1017,7 @@ fn resolve_target_os_path(path: &str) -> Result<ResolvedOsPath, String> {
     Ok(ResolvedOsPath { requested_path, resolved_path, existed: false })
 }
 
-fn parse_absolute_os_path(path: &str) -> Result<PathBuf, String> {
+fn parse_absolute_os_path(policy: &OsFilePolicy, path: &str) -> Result<PathBuf, String> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
         return Err(format!("{OS_FILE_TOOL_NAME} path must be non-empty"));
@@ -1017,7 +1025,7 @@ fn parse_absolute_os_path(path: &str) -> Result<PathBuf, String> {
     if trimmed.chars().any(char::is_control) {
         return Err(format!("{OS_FILE_TOOL_NAME} path contains unsupported characters"));
     }
-    let parsed = expand_env_prefixed_os_path(trimmed)?;
+    let parsed = expand_env_prefixed_os_path(policy, trimmed)?;
     if !parsed.is_absolute() {
         return Err(format!("{OS_FILE_TOOL_NAME} path must be an absolute OS path"));
     }
@@ -1031,10 +1039,13 @@ fn parse_absolute_os_path(path: &str) -> Result<PathBuf, String> {
     Ok(parsed)
 }
 
-fn expand_env_prefixed_os_path(path: &str) -> Result<PathBuf, String> {
+fn expand_env_prefixed_os_path(policy: &OsFilePolicy, path: &str) -> Result<PathBuf, String> {
     let Some((key, suffix)) = path_env_prefix(path)? else {
         return Ok(PathBuf::from(path));
     };
+    if let Some(value) = policy.path_env.get(key) {
+        return append_env_path_suffix(value.clone(), suffix);
+    }
     let value = std::env::var_os(key).filter(|value| !value.is_empty()).ok_or_else(|| {
         format!("{OS_FILE_TOOL_NAME} path references unset environment variable `{key}`")
     })?;
@@ -1371,6 +1382,7 @@ mod tests {
         OsFilePolicy {
             workspace_roots: vec![fs::canonicalize(root).expect("root should canonicalize")],
             user_os_roots: vec![fs::canonicalize(root).expect("root should canonicalize")],
+            path_env: BTreeMap::new(),
         }
     }
 
@@ -1519,6 +1531,7 @@ mod tests {
         let policy = OsFilePolicy {
             workspace_roots: vec![fs::canonicalize(workspace.as_path()).expect("workspace root")],
             user_os_roots: vec![fs::canonicalize(os_root.as_path()).expect("os root")],
+            path_env: BTreeMap::new(),
         };
 
         let moved = execute_os_file_operation(
@@ -1580,6 +1593,7 @@ mod tests {
         let policy = OsFilePolicy {
             workspace_roots: vec![fs::canonicalize(tempdir.path()).expect("workspace root")],
             user_os_roots: vec![fs::canonicalize(os_root.as_path()).expect("os root")],
+            path_env: BTreeMap::new(),
         };
         let _root = ScopedEnvVar::set("PALYRA_TEST_OS_ROOT", os_root.as_path());
 
@@ -1629,9 +1643,56 @@ mod tests {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let _root = ScopedEnvVar::set("PALYRA_TEST_OS_ROOT", tempdir.path());
 
-        let error = parse_absolute_os_path("%PALYRA_TEST_OS_ROOT%/../escape.txt")
+        let policy = test_policy(tempdir.path());
+        let error = parse_absolute_os_path(&policy, "%PALYRA_TEST_OS_ROOT%/../escape.txt")
             .expect_err("environment path suffix must not contain parent traversal");
         assert!(error.contains("must stay relative to the expanded root"));
+    }
+
+    #[test]
+    fn os_file_read_expands_launch_context_path_env_without_process_env() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let e2e_home = tempdir.path().join("S090-home");
+        let config_dir = e2e_home.join(".config").join("palyra-e2e");
+        fs::create_dir_all(config_dir.as_path()).expect("config dir should be created");
+        let settings = config_dir.join("settings.toml");
+        fs::write(settings.as_path(), "default_model = \"MiniMax-M3\"\n")
+            .expect("settings should be written");
+        let canonical_home =
+            fs::canonicalize(e2e_home.as_path()).expect("home should canonicalize");
+        let policy = OsFilePolicy {
+            workspace_roots: vec![fs::canonicalize(tempdir.path()).expect("root canonicalizes")],
+            user_os_roots: vec![canonical_home.clone()],
+            path_env: BTreeMap::from([("PALYRA_E2E_HOME".to_owned(), canonical_home)]),
+        };
+
+        let read = execute_os_file_operation(
+            &policy,
+            &OsFileInput {
+                operation: OsFileOperation::Read,
+                path: "$PALYRA_E2E_HOME/.config/palyra-e2e/settings.toml".to_owned(),
+                target_path: None,
+                content_text: None,
+                bytes_base64: None,
+                create_parent_dirs: None,
+                overwrite: None,
+                full_replace: None,
+                dry_run: None,
+                offset_bytes: None,
+                max_bytes: None,
+                query: None,
+                case_sensitive: None,
+                max_entries: None,
+                max_matches: None,
+            },
+        )
+        .expect("launch-context env root should expand and pass allowlist validation");
+
+        assert_eq!(read.get("operation").and_then(Value::as_str), Some("read"));
+        assert_eq!(
+            read.get("text").and_then(Value::as_str),
+            Some("default_model = \"MiniMax-M3\"\n")
+        );
     }
 
     #[test]
@@ -1686,6 +1747,7 @@ mod tests {
             user_os_roots: vec![
                 fs::canonicalize(allowed_root.path()).expect("allowed root canonical")
             ],
+            path_env: BTreeMap::new(),
         };
 
         let error = execute_os_file_operation(

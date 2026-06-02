@@ -323,6 +323,7 @@ async fn run_agent_interactive_async(
 }
 
 const CLI_CONTEXT_MAX_PROMPT_WORKSPACE_ROOTS: usize = 8;
+const CLI_CONTEXT_SAFE_PATH_ENV_KEYS: &[&str] = &["PALYRA_E2E_HOME", "PALYRA_E2E_OS_ROOT"];
 
 fn cli_launch_parameter_delta_json(prompt: &str) -> Result<Option<String>> {
     let cwd = std::env::current_dir().context("failed to resolve CLI current working directory")?;
@@ -338,6 +339,7 @@ fn cli_launch_parameter_delta_json_for_cwd(
         "cli_context": {
             "launch_cwd": cwd.to_string_lossy(),
             "workspace_roots": workspace_roots,
+            "env": cli_launch_safe_path_env(),
         }
     });
     serde_json::to_string(&parameter_delta)
@@ -345,10 +347,20 @@ fn cli_launch_parameter_delta_json_for_cwd(
         .context("failed to serialize CLI launch context")
 }
 
+fn cli_launch_safe_path_env() -> serde_json::Map<String, serde_json::Value> {
+    let mut env = serde_json::Map::new();
+    for key in CLI_CONTEXT_SAFE_PATH_ENV_KEYS {
+        if let Some(value) = std::env::var_os(key).filter(|value| !value.is_empty()) {
+            env.insert((*key).to_owned(), value.to_string_lossy().into_owned().into());
+        }
+    }
+    env
+}
+
 fn prompt_absolute_workspace_roots(cwd: &std::path::Path, prompt: &str) -> Vec<String> {
-    let Some(canonical_cwd) = std::fs::canonicalize(cwd).ok().filter(|path| path.is_dir()) else {
+    if std::fs::canonicalize(cwd).ok().filter(|path| path.is_dir()).is_none() {
         return Vec::new();
-    };
+    }
     let mut roots = Vec::<std::path::PathBuf>::new();
     for token in prompt.split_whitespace() {
         let Some(candidate) = prompt_path_candidate(token) else {
@@ -357,9 +369,6 @@ fn prompt_absolute_workspace_roots(cwd: &std::path::Path, prompt: &str) -> Vec<S
         let Some(root) = prompt_workspace_root_from_candidate(candidate) else {
             continue;
         };
-        if !cli_path_starts_with(root.as_path(), canonical_cwd.as_path()) {
-            continue;
-        }
         if roots.iter().any(|existing| same_cli_path(existing.as_path(), root.as_path())) {
             continue;
         }
@@ -372,15 +381,15 @@ fn prompt_absolute_workspace_roots(cwd: &std::path::Path, prompt: &str) -> Vec<S
 }
 
 fn prompt_path_candidate(token: &str) -> Option<&str> {
-    let trimmed = token
-        .trim_matches(|character: char| {
-            matches!(
-                character,
-                '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';'
-            )
-        })
-        .trim_end_matches(['.', ',', ';']);
+    let trimmed = token.trim_matches(prompt_path_candidate_wrapper_char);
     (!trimmed.is_empty() && std::path::Path::new(trimmed).is_absolute()).then_some(trimmed)
+}
+
+fn prompt_path_candidate_wrapper_char(character: char) -> bool {
+    matches!(
+        character,
+        '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';' | '.'
+    )
 }
 
 fn prompt_workspace_root_from_candidate(candidate: &str) -> Option<std::path::PathBuf> {
@@ -817,7 +826,35 @@ mod tests {
     use crate::args::AgentApprovalModeArg;
     use crate::proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1};
     use serde_json::Value;
-    use std::fs;
+    use std::{
+        ffi::OsString,
+        fs,
+        sync::{Mutex, OnceLock},
+    };
+
+    static CLI_CONTEXT_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    struct ScopedEnvVar {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, value: impl Into<OsString>) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value.into());
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            match self.previous.as_ref() {
+                Some(previous) => std::env::set_var(self.key, previous),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     #[test]
     fn interactive_session_started_message_omits_session_identifier() {
@@ -946,6 +983,62 @@ mod tests {
     }
 
     #[test]
+    fn cli_launch_context_includes_user_owned_workspace_outside_launch_cwd() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let launch_cwd = tempdir.path().join("launch-cwd");
+        let external_project = tempdir.path().join("external-project");
+        fs::create_dir_all(launch_cwd.as_path()).expect("launch cwd should exist");
+        fs::create_dir_all(external_project.as_path()).expect("external project should exist");
+        let prompt = format!("Work only in `{}`.", external_project.display());
+
+        let roots = prompt_absolute_workspace_roots(launch_cwd.as_path(), prompt.as_str());
+        let expected_project = fs::canonicalize(external_project.as_path())
+            .expect("external project should canonicalize")
+            .to_string_lossy()
+            .into_owned();
+
+        assert_eq!(roots.first().map(String::as_str), Some(expected_project.as_str()));
+    }
+
+    #[test]
+    fn cli_launch_context_exports_only_safe_path_env_values() {
+        let _guard = CLI_CONTEXT_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("CLI context env lock should not be poisoned");
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let e2e_home = tempdir.path().join("home");
+        let e2e_os_root = tempdir.path().join("os-root");
+        let _home = ScopedEnvVar::set("PALYRA_E2E_HOME", e2e_home.as_os_str());
+        let _os_root = ScopedEnvVar::set("PALYRA_E2E_OS_ROOT", e2e_os_root.as_os_str());
+        let _admin_token = ScopedEnvVar::set("PALYRA_ADMIN_TOKEN", "secret");
+        let parameter_delta = cli_launch_parameter_delta_json_for_cwd(tempdir.path(), "")
+            .expect("launch context should serialize")
+            .expect("launch context should be present");
+        let value =
+            serde_json::from_str::<Value>(parameter_delta.as_str()).expect("JSON should parse");
+
+        let env = value
+            .get("cli_context")
+            .and_then(|context| context.get("env"))
+            .and_then(Value::as_object)
+            .expect("safe env should be encoded");
+
+        assert_eq!(
+            env.get("PALYRA_E2E_HOME").and_then(Value::as_str),
+            Some(e2e_home.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            env.get("PALYRA_E2E_OS_ROOT").and_then(Value::as_str),
+            Some(e2e_os_root.to_string_lossy().as_ref())
+        );
+        assert!(
+            !env.contains_key("PALYRA_ADMIN_TOKEN"),
+            "runtime tokens must not be serialized into launch context"
+        );
+    }
+
+    #[test]
     fn prompt_absolute_workspace_roots_preserves_nested_existing_roots() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let project = tempdir.path().join("todo-app");
@@ -968,7 +1061,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_absolute_workspace_roots_excludes_sibling_os_paths() {
+    fn prompt_absolute_workspace_roots_includes_user_owned_sibling_paths() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let workspace = tempdir.path().join("workspace");
         let project = workspace.join("scenario");
@@ -992,6 +1085,6 @@ mod tests {
             .into_owned();
 
         assert!(roots.iter().any(|root| root == &expected_project), "{roots:?}");
-        assert!(!roots.iter().any(|root| root == &excluded_os_root), "{roots:?}");
+        assert!(roots.iter().any(|root| root == &excluded_os_root), "{roots:?}");
     }
 }
