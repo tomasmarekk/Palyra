@@ -37,8 +37,8 @@ use crate::{
     model_provider::{
         bounded_provider_turn_output_for_persistence, provider_events_from_output, ProviderEvent,
         ProviderFinishReason, ProviderMessage, ProviderMessageContentPart, ProviderMessageRole,
-        ProviderRawProviderRefs, ProviderRequest, ProviderResponse, ProviderTurnOutput,
-        ProviderUsage,
+        ProviderOutputContentPart, ProviderRawProviderRefs, ProviderRequest, ProviderResponse,
+        ProviderTurnOutput, ProviderUsage,
     },
     orchestrator::{
         estimate_token_count, is_cancel_command, RunLifecycleState, RunStateMachine, RunTransition,
@@ -1600,6 +1600,13 @@ async fn process_run_stream_provider_response(
     }
 
     if !has_pending_tool_results {
+        if let Some(message) = tool_calls_finish_without_tool_payload(&provider_output) {
+            return Ok(RunStreamProviderResponseOutcome::Failed {
+                message,
+                provider_trace_ref: provider_output.raw_provider_refs.provider_trace_ref.clone(),
+                reason: AgentLoopTerminationReason::ProviderError,
+            });
+        }
         if let Some(message) = truncated_final_answer_without_tools(&provider_output) {
             return Ok(RunStreamProviderResponseOutcome::Failed {
                 message,
@@ -1849,6 +1856,19 @@ fn contains_raw_provider_tool_call_markup(text: &str) -> bool {
 fn truncated_final_answer_without_tools(output: &ProviderTurnOutput) -> Option<String> {
     matches!(output.finish_reason, ProviderFinishReason::Length).then(|| {
         "model provider stopped because of an output token limit before returning a complete final answer or structured tool call (finish_reason=length)"
+            .to_owned()
+    })
+}
+
+fn tool_calls_finish_without_tool_payload(output: &ProviderTurnOutput) -> Option<String> {
+    let provider_requested_tool_call =
+        matches!(output.finish_reason, ProviderFinishReason::ToolCalls);
+    let has_structured_tool_call = output
+        .content_parts
+        .iter()
+        .any(|part| matches!(part, ProviderOutputContentPart::ToolCall { .. }));
+    (provider_requested_tool_call && !has_structured_tool_call).then(|| {
+        "model provider reported finish_reason=tool_calls without a structured tool call payload"
             .to_owned()
     })
 }
@@ -2363,9 +2383,9 @@ mod tests {
         is_run_stream_response_channel_closed, length_recovery_prompt,
         provider_model_override_for_routing, provider_request_timeout_status,
         repeated_tool_failure_signature, should_terminate_after_tool_budget_exhausted,
-        terminal_tool_authorization_failure, tool_result_to_provider_message,
-        truncated_final_answer_without_tools, RepeatedToolFailureTracker,
-        RunStreamToolResultForModel,
+        terminal_tool_authorization_failure, tool_calls_finish_without_tool_payload,
+        tool_result_to_provider_message, truncated_final_answer_without_tools,
+        RepeatedToolFailureTracker, RunStreamToolResultForModel,
     };
     use super::{AgentLoopTerminationReason, AgentRunLoopState};
     use crate::application::run_stream::tape::RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE;
@@ -2871,6 +2891,52 @@ mod tests {
             .expect("length-finished output must not be accepted as final");
 
         assert!(message.contains("finish_reason=length"));
+    }
+
+    #[test]
+    fn tool_calls_finish_without_tool_payload_is_rejected() {
+        let output = ProviderTurnOutput::text(
+            "Workspace is empty. I will create the files next.".to_owned(),
+            ProviderFinishReason::ToolCalls,
+            ProviderUsage::new(10, 20, "test"),
+            ProviderRawProviderRefs::default(),
+        );
+
+        let message = tool_calls_finish_without_tool_payload(&output)
+            .expect("tool_calls finish without structured tool payload must be rejected");
+
+        assert!(message.contains("finish_reason=tool_calls"));
+        assert!(message.contains("without a structured tool call payload"));
+    }
+
+    #[test]
+    fn tool_calls_finish_guard_allows_plain_final_answer() {
+        let output = ProviderTurnOutput::text(
+            "No changes needed.".to_owned(),
+            ProviderFinishReason::Stop,
+            ProviderUsage::new(10, 20, "test"),
+            ProviderRawProviderRefs::default(),
+        );
+
+        assert!(tool_calls_finish_without_tool_payload(&output).is_none());
+    }
+
+    #[test]
+    fn tool_calls_finish_guard_allows_structured_tool_payload() {
+        let output = ProviderTurnOutput {
+            full_text: String::new(),
+            content_parts: vec![ProviderOutputContentPart::ToolCall {
+                proposal_id: "toolu_test_01".to_owned(),
+                tool_name: "palyra.fs.apply_patch".to_owned(),
+                input_json: json!({"patch":"*** Begin Patch\n*** End Patch"}),
+            }],
+            finish_reason: ProviderFinishReason::ToolCalls,
+            usage: ProviderUsage::new(10, 20, "test"),
+            raw_provider_refs: ProviderRawProviderRefs::default(),
+            redaction_state: Default::default(),
+        };
+
+        assert!(tool_calls_finish_without_tool_payload(&output).is_none());
     }
 
     #[test]
