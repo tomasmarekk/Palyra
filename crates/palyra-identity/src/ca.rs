@@ -258,11 +258,8 @@ mod tests {
         for general_name in &san_extension.value.general_names {
             match general_name {
                 GeneralName::DNSName(value) => dns_names.push((*value).to_owned()),
-                GeneralName::IPAddress(raw) => {
-                    if raw.len() == 4 {
-                        ip_addresses
-                            .push(IpAddr::V4(Ipv4Addr::new(raw[0], raw[1], raw[2], raw[3])));
-                    }
+                GeneralName::IPAddress(raw) if raw.len() == 4 => {
+                    ip_addresses.push(IpAddr::V4(Ipv4Addr::new(raw[0], raw[1], raw[2], raw[3])));
                 }
                 _ => {}
             }

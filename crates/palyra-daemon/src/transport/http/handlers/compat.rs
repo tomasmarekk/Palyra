@@ -653,14 +653,13 @@ async fn execute_compat_run(
                     )
                     .await;
                 }
-                Some(common_v1::run_stream_event::Body::Status(status)) => {
+                Some(common_v1::run_stream_event::Body::Status(status))
                     if common_v1::stream_status::StatusKind::try_from(status.kind)
                         .unwrap_or(common_v1::stream_status::StatusKind::Unspecified)
-                        == common_v1::stream_status::StatusKind::Failed
-                    {
-                        final_error =
-                            Some(sanitize_http_error_message(status.message.as_str()).to_owned());
-                    }
+                        == common_v1::stream_status::StatusKind::Failed =>
+                {
+                    final_error =
+                        Some(sanitize_http_error_message(status.message.as_str()).to_owned());
                 }
                 _ => {}
             },
@@ -845,7 +844,7 @@ fn build_compat_chat_streaming_response(state: AppState, prepared: CompatPrepare
         while let Some(item) = stream.next().await {
             match item {
                 Ok(event) => match event.body {
-                    Some(common_v1::run_stream_event::Body::ModelToken(token_event)) => {
+                    Some(common_v1::run_stream_event::Body::ModelToken(token_event))
                         if !send_sse_data(
                             &sender,
                             json!({
@@ -860,10 +859,9 @@ fn build_compat_chat_streaming_response(state: AppState, prepared: CompatPrepare
                                 }],
                             }),
                         )
-                        .await
-                        {
-                            return;
-                        }
+                        .await =>
+                    {
+                        return;
                     }
                     Some(common_v1::run_stream_event::Body::ToolProposal(proposal)) => {
                         finish_reason = "tool_calls";
@@ -911,16 +909,14 @@ fn build_compat_chat_streaming_response(state: AppState, prepared: CompatPrepare
                         )
                         .await;
                     }
-                    Some(common_v1::run_stream_event::Body::Status(status)) => {
+                    Some(common_v1::run_stream_event::Body::Status(status))
                         if common_v1::stream_status::StatusKind::try_from(status.kind)
                             .unwrap_or(common_v1::stream_status::StatusKind::Unspecified)
-                            == common_v1::stream_status::StatusKind::Failed
-                        {
-                            stream_error = Some(
-                                sanitize_http_error_message(status.message.as_str()).to_owned(),
-                            );
-                            break;
-                        }
+                            == common_v1::stream_status::StatusKind::Failed =>
+                    {
+                        stream_error =
+                            Some(sanitize_http_error_message(status.message.as_str()).to_owned());
+                        break;
                     }
                     _ => {}
                 },

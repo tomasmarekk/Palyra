@@ -138,7 +138,7 @@ jobs:
       - name: Install Rust toolchain
         uses: ./.github/actions/setup-rust-toolchain
         with:
-          toolchain: 1.92.0
+          toolchain: 1.95.0
 
       - name: Setup Vite+
         uses: ./.github/actions/setup-vp-safe
@@ -256,7 +256,7 @@ jobs:
       - name: Install Rust toolchain
         uses: ./.github/actions/setup-rust-toolchain
         with:
-          toolchain: 1.92.0
+          toolchain: 1.95.0
 
       - name: Setup Vite+
         uses: ./.github/actions/setup-vp-safe

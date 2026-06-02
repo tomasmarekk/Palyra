@@ -5079,18 +5079,16 @@ async fn grpc_run_stream_executes_allowlisted_tool_and_emits_attestation() -> Re
         let event = event.context("failed to read RunStream event")?;
         if let Some(body) = event.body {
             match body {
-                common_v1::run_stream_event::Body::ToolDecision(decision) => {
-                    if decision.kind == common_v1::tool_decision::DecisionKind::Allow as i32 {
-                        saw_allow_decision = true;
-                    }
+                common_v1::run_stream_event::Body::ToolDecision(decision)
+                    if decision.kind == common_v1::tool_decision::DecisionKind::Allow as i32 =>
+                {
+                    saw_allow_decision = true;
                 }
-                common_v1::run_stream_event::Body::ToolResult(result) => {
-                    if result.success {
-                        let output = serde_json::from_slice::<Value>(&result.output_json)
-                            .context("tool result output_json should be valid JSON")?;
-                        assert_eq!(output, serde_json::json!({ "echo": "hello tool" }));
-                        saw_success_result = true;
-                    }
+                common_v1::run_stream_event::Body::ToolResult(result) if result.success => {
+                    let output = serde_json::from_slice::<Value>(&result.output_json)
+                        .context("tool result output_json should be valid JSON")?;
+                    assert_eq!(output, serde_json::json!({ "echo": "hello tool" }));
+                    saw_success_result = true;
                 }
                 common_v1::run_stream_event::Body::ToolAttestation(attestation) => {
                     assert!(!attestation.timed_out, "echo tool should not time out");
@@ -5185,10 +5183,8 @@ async fn grpc_run_stream_refeeds_tool_result_and_continues_model_turn() -> Resul
                 common_v1::run_stream_event::Body::ModelToken(token) => {
                     model_tokens.push(token.token);
                 }
-                common_v1::run_stream_event::Body::ToolResult(result) => {
-                    if result.success {
-                        saw_tool_result = true;
-                    }
+                common_v1::run_stream_event::Body::ToolResult(result) if result.success => {
+                    saw_tool_result = true;
                 }
                 common_v1::run_stream_event::Body::Status(status)
                     if status.kind == common_v1::stream_status::StatusKind::Done as i32 =>
@@ -5477,10 +5473,8 @@ async fn grpc_run_stream_retries_provider_overload_during_finalization() -> Resu
                 common_v1::run_stream_event::Body::ModelToken(token) => {
                     model_tokens.push(token.token);
                 }
-                common_v1::run_stream_event::Body::ToolResult(result) => {
-                    if result.success {
-                        saw_tool_result = true;
-                    }
+                common_v1::run_stream_event::Body::ToolResult(result) if result.success => {
+                    saw_tool_result = true;
                 }
                 common_v1::run_stream_event::Body::Status(status)
                     if status.kind == common_v1::stream_status::StatusKind::Done as i32 =>
@@ -5785,34 +5779,32 @@ async fn grpc_run_stream_executes_memory_search_tool_and_emits_memory_attestatio
         let event = event.context("failed to read RunStream event")?;
         if let Some(body) = event.body {
             match body {
-                common_v1::run_stream_event::Body::ToolDecision(decision) => {
-                    if decision.kind == common_v1::tool_decision::DecisionKind::Allow as i32 {
-                        saw_allow_decision = true;
-                    }
+                common_v1::run_stream_event::Body::ToolDecision(decision)
+                    if decision.kind == common_v1::tool_decision::DecisionKind::Allow as i32 =>
+                {
+                    saw_allow_decision = true;
                 }
-                common_v1::run_stream_event::Body::ToolResult(result) => {
-                    if result.success {
-                        let output = serde_json::from_slice::<Value>(&result.output_json)
-                            .context("memory tool output_json should be valid JSON")?;
-                        let hits = output
-                            .get("hits")
-                            .and_then(Value::as_array)
-                            .context("memory tool output must contain hits array")?;
-                        let contains_ingested = hits.iter().any(|hit| {
-                            hit.get("memory_id").and_then(Value::as_str)
-                                == Some(ingested_memory_id.as_str())
-                        });
-                        assert!(
-                            contains_ingested,
-                            "memory search tool output should include the ingested memory item"
-                        );
-                        saw_memory_result = true;
-                    }
+                common_v1::run_stream_event::Body::ToolResult(result) if result.success => {
+                    let output = serde_json::from_slice::<Value>(&result.output_json)
+                        .context("memory tool output_json should be valid JSON")?;
+                    let hits = output
+                        .get("hits")
+                        .and_then(Value::as_array)
+                        .context("memory tool output must contain hits array")?;
+                    let contains_ingested = hits.iter().any(|hit| {
+                        hit.get("memory_id").and_then(Value::as_str)
+                            == Some(ingested_memory_id.as_str())
+                    });
+                    assert!(
+                        contains_ingested,
+                        "memory search tool output should include the ingested memory item"
+                    );
+                    saw_memory_result = true;
                 }
-                common_v1::run_stream_event::Body::ToolAttestation(attestation) => {
-                    if attestation.executor == "memory_runtime" {
-                        saw_memory_attestation = true;
-                    }
+                common_v1::run_stream_event::Body::ToolAttestation(attestation)
+                    if attestation.executor == "memory_runtime" =>
+                {
+                    saw_memory_attestation = true;
                 }
                 _ => {}
             }
@@ -5904,54 +5896,52 @@ async fn grpc_run_stream_executes_memory_recall_tool_and_emits_memory_attestatio
         let event = event.context("failed to read RunStream event")?;
         if let Some(body) = event.body {
             match body {
-                common_v1::run_stream_event::Body::ToolDecision(decision) => {
-                    if decision.kind == common_v1::tool_decision::DecisionKind::Allow as i32 {
-                        saw_allow_decision = true;
-                    }
+                common_v1::run_stream_event::Body::ToolDecision(decision)
+                    if decision.kind == common_v1::tool_decision::DecisionKind::Allow as i32 =>
+                {
+                    saw_allow_decision = true;
                 }
-                common_v1::run_stream_event::Body::ToolResult(result) => {
-                    if result.success {
-                        let output = serde_json::from_slice::<Value>(&result.output_json)
-                            .context("memory recall tool output_json should be valid JSON")?;
-                        let top_candidates = output
-                            .get("top_candidates")
-                            .and_then(Value::as_array)
-                            .context("memory recall tool output must contain top_candidates")?;
-                        let contains_ingested = top_candidates.iter().any(|candidate| {
-                            candidate.get("source_ref").and_then(Value::as_str)
-                                == Some(ingested_memory_id.as_str())
-                        });
-                        assert!(
+                common_v1::run_stream_event::Body::ToolResult(result) if result.success => {
+                    let output = serde_json::from_slice::<Value>(&result.output_json)
+                        .context("memory recall tool output_json should be valid JSON")?;
+                    let top_candidates = output
+                        .get("top_candidates")
+                        .and_then(Value::as_array)
+                        .context("memory recall tool output must contain top_candidates")?;
+                    let contains_ingested = top_candidates.iter().any(|candidate| {
+                        candidate.get("source_ref").and_then(Value::as_str)
+                            == Some(ingested_memory_id.as_str())
+                    });
+                    assert!(
                             contains_ingested,
                             "memory recall tool should surface the ingested memory item in top candidates: {output}"
                         );
-                        let facts = output
-                            .pointer("/structured_output/facts")
-                            .and_then(Value::as_array)
-                            .context("memory recall tool output must contain structured facts")?;
-                        assert!(
-                            !facts.is_empty(),
-                            "memory recall tool should produce structured facts"
-                        );
-                        let planner_sources = output
-                            .pointer("/plan/sources")
-                            .and_then(Value::as_array)
-                            .context("memory recall tool output must contain planner sources")?;
-                        assert!(
-                            planner_sources.iter().any(|source| {
-                                source.get("source_kind").and_then(Value::as_str) == Some("memory")
-                                    && source.get("decision").and_then(Value::as_str)
-                                        == Some("selected")
-                            }),
-                            "planner explain output should record selected memory source"
-                        );
-                        saw_recall_result = true;
-                    }
+                    let facts = output
+                        .pointer("/structured_output/facts")
+                        .and_then(Value::as_array)
+                        .context("memory recall tool output must contain structured facts")?;
+                    assert!(
+                        !facts.is_empty(),
+                        "memory recall tool should produce structured facts"
+                    );
+                    let planner_sources = output
+                        .pointer("/plan/sources")
+                        .and_then(Value::as_array)
+                        .context("memory recall tool output must contain planner sources")?;
+                    assert!(
+                        planner_sources.iter().any(|source| {
+                            source.get("source_kind").and_then(Value::as_str) == Some("memory")
+                                && source.get("decision").and_then(Value::as_str)
+                                    == Some("selected")
+                        }),
+                        "planner explain output should record selected memory source"
+                    );
+                    saw_recall_result = true;
                 }
-                common_v1::run_stream_event::Body::ToolAttestation(attestation) => {
-                    if attestation.executor == "memory_runtime" {
-                        saw_memory_attestation = true;
-                    }
+                common_v1::run_stream_event::Body::ToolAttestation(attestation)
+                    if attestation.executor == "memory_runtime" =>
+                {
+                    saw_memory_attestation = true;
                 }
                 _ => {}
             }
@@ -6402,28 +6392,26 @@ async fn grpc_run_stream_denies_non_allowlisted_tool_by_default() -> Result<()> 
         let event = event.context("failed to read RunStream event")?;
         if let Some(body) = event.body {
             match body {
-                common_v1::run_stream_event::Body::ToolDecision(decision) => {
-                    if decision.kind == common_v1::tool_decision::DecisionKind::Deny as i32 {
-                        assert!(
-                            decision.reason.contains("denied by default"),
-                            "deny decision should include policy reason"
-                        );
-                        saw_deny_decision = true;
-                    }
+                common_v1::run_stream_event::Body::ToolDecision(decision)
+                    if decision.kind == common_v1::tool_decision::DecisionKind::Deny as i32 =>
+                {
+                    assert!(
+                        decision.reason.contains("denied by default"),
+                        "deny decision should include policy reason"
+                    );
+                    saw_deny_decision = true;
                 }
-                common_v1::run_stream_event::Body::ToolResult(result) => {
-                    if !result.success {
-                        assert!(
-                            result.error.contains("denied by default"),
-                            "denied result should carry policy explanation"
-                        );
-                        saw_failed_result = true;
-                    }
+                common_v1::run_stream_event::Body::ToolResult(result) if !result.success => {
+                    assert!(
+                        result.error.contains("denied by default"),
+                        "denied result should carry policy explanation"
+                    );
+                    saw_failed_result = true;
                 }
-                common_v1::run_stream_event::Body::ToolAttestation(attestation) => {
-                    if attestation.executor == "policy" {
-                        saw_policy_attestation = true;
-                    }
+                common_v1::run_stream_event::Body::ToolAttestation(attestation)
+                    if attestation.executor == "policy" =>
+                {
+                    saw_policy_attestation = true;
                 }
                 _ => {}
             }
@@ -6559,23 +6547,21 @@ async fn grpc_run_stream_denies_allowlisted_unsupported_tool() -> Result<()> {
                         .context("failed to send unsupported-tool approval response")?;
                     saw_approval_request = true;
                 }
-                common_v1::run_stream_event::Body::ToolDecision(decision) => {
-                    if decision.kind == common_v1::tool_decision::DecisionKind::Deny as i32 {
-                        assert!(
-                            decision.reason.contains("unsupported by runtime executor"),
-                            "deny decision should describe unsupported runtime tool"
-                        );
-                        saw_deny_decision = true;
-                    }
+                common_v1::run_stream_event::Body::ToolDecision(decision)
+                    if decision.kind == common_v1::tool_decision::DecisionKind::Deny as i32 =>
+                {
+                    assert!(
+                        decision.reason.contains("unsupported by runtime executor"),
+                        "deny decision should describe unsupported runtime tool"
+                    );
+                    saw_deny_decision = true;
                 }
-                common_v1::run_stream_event::Body::ToolResult(result) => {
-                    if !result.success {
-                        assert!(
-                            result.error.contains("unsupported by runtime executor"),
-                            "denied result should carry unsupported runtime reason"
-                        );
-                        saw_failed_result = true;
-                    }
+                common_v1::run_stream_event::Body::ToolResult(result) if !result.success => {
+                    assert!(
+                        result.error.contains("unsupported by runtime executor"),
+                        "denied result should carry unsupported runtime reason"
+                    );
+                    saw_failed_result = true;
                 }
                 _ => {}
             }
@@ -6679,10 +6665,8 @@ async fn grpc_run_stream_reuses_timeboxed_approval_until_ttl_expiry() -> Result<
                         .context("failed to send first timeboxed approval response")?;
                     saw_first_approval_request = true;
                 }
-                common_v1::run_stream_event::Body::ToolResult(result) => {
-                    if !result.success {
-                        saw_first_failed_result = true;
-                    }
+                common_v1::run_stream_event::Body::ToolResult(result) if !result.success => {
+                    saw_first_failed_result = true;
                 }
                 _ => {}
             }
@@ -6735,10 +6719,8 @@ async fn grpc_run_stream_reuses_timeboxed_approval_until_ttl_expiry() -> Result<
                     saw_second_approval_request = true;
                     break;
                 }
-                common_v1::run_stream_event::Body::ToolResult(result) => {
-                    if !result.success {
-                        saw_second_failed_result = true;
-                    }
+                common_v1::run_stream_event::Body::ToolResult(result) if !result.success => {
+                    saw_second_failed_result = true;
                 }
                 _ => {}
             }
@@ -6813,10 +6795,8 @@ async fn grpc_run_stream_reuses_timeboxed_approval_until_ttl_expiry() -> Result<
                         .context("failed to send third approval response after ttl expiry")?;
                     saw_third_approval_request = true;
                 }
-                common_v1::run_stream_event::Body::ToolResult(result) => {
-                    if !result.success {
-                        saw_third_failed_result = true;
-                    }
+                common_v1::run_stream_event::Body::ToolResult(result) if !result.success => {
+                    saw_third_failed_result = true;
                 }
                 _ => {}
             }
@@ -6926,10 +6906,8 @@ async fn grpc_resolve_session_reset_clears_cached_tool_approval() -> Result<()> 
                         .context("failed to send first approval reset response")?;
                     saw_first_approval_request = true;
                 }
-                common_v1::run_stream_event::Body::ToolResult(result) => {
-                    if !result.success {
-                        saw_first_failed_result = true;
-                    }
+                common_v1::run_stream_event::Body::ToolResult(result) if !result.success => {
+                    saw_first_failed_result = true;
                 }
                 _ => {}
             }
@@ -7009,10 +6987,8 @@ async fn grpc_resolve_session_reset_clears_cached_tool_approval() -> Result<()> 
                         .context("failed to send second approval reset response")?;
                     saw_second_approval_request = true;
                 }
-                common_v1::run_stream_event::Body::ToolResult(result) => {
-                    if !result.success {
-                        saw_second_failed_result = true;
-                    }
+                common_v1::run_stream_event::Body::ToolResult(result) if !result.success => {
+                    saw_second_failed_result = true;
                 }
                 _ => {}
             }
@@ -7133,11 +7109,11 @@ async fn grpc_approvals_service_persists_and_exports_denied_tool_approval() -> R
                         .await
                         .context("failed to send deny approval response")?;
                 }
-                common_v1::run_stream_event::Body::ToolDecision(decision) => {
-                    if decision.kind == common_v1::tool_decision::DecisionKind::Deny as i32 {
-                        saw_deny_decision = true;
-                        break;
-                    }
+                common_v1::run_stream_event::Body::ToolDecision(decision)
+                    if decision.kind == common_v1::tool_decision::DecisionKind::Deny as i32 =>
+                {
+                    saw_deny_decision = true;
+                    break;
                 }
                 _ => {}
             }
@@ -7999,32 +7975,30 @@ async fn grpc_run_stream_denies_wasm_plugin_runtime_without_approval_channel() -
         let event = event.context("failed to read RunStream event")?;
         if let Some(body) = event.body {
             match body {
-                common_v1::run_stream_event::Body::ToolDecision(decision) => {
-                    if decision.kind == common_v1::tool_decision::DecisionKind::Deny as i32 {
-                        assert!(
-                            decision.approval_required,
-                            "sensitive wasm plugin tools must keep approval_required=true"
-                        );
-                        assert!(
-                            decision.reason.contains("approval required"),
-                            "decision reason should explain missing approval channel"
-                        );
-                        saw_deny_decision = true;
-                    }
+                common_v1::run_stream_event::Body::ToolDecision(decision)
+                    if decision.kind == common_v1::tool_decision::DecisionKind::Deny as i32 =>
+                {
+                    assert!(
+                        decision.approval_required,
+                        "sensitive wasm plugin tools must keep approval_required=true"
+                    );
+                    assert!(
+                        decision.reason.contains("approval required"),
+                        "decision reason should explain missing approval channel"
+                    );
+                    saw_deny_decision = true;
                 }
-                common_v1::run_stream_event::Body::ToolResult(result) => {
-                    if !result.success {
-                        assert!(
-                            result.error.contains("approval required"),
-                            "failed result should explain approval gating"
-                        );
-                        saw_failed_result = true;
-                    }
+                common_v1::run_stream_event::Body::ToolResult(result) if !result.success => {
+                    assert!(
+                        result.error.contains("approval required"),
+                        "failed result should explain approval gating"
+                    );
+                    saw_failed_result = true;
                 }
-                common_v1::run_stream_event::Body::ToolAttestation(attestation) => {
-                    if attestation.executor == "policy" {
-                        saw_policy_attestation = true;
-                    }
+                common_v1::run_stream_event::Body::ToolAttestation(attestation)
+                    if attestation.executor == "policy" =>
+                {
+                    saw_policy_attestation = true;
                 }
                 _ => {}
             }
@@ -8119,33 +8093,31 @@ async fn grpc_run_stream_denies_inline_wasm_with_skill_identity_before_approval(
                 common_v1::run_stream_event::Body::ToolApprovalRequest(_) => {
                     saw_approval_request = true;
                 }
-                common_v1::run_stream_event::Body::ToolDecision(decision) => {
-                    if decision.kind == common_v1::tool_decision::DecisionKind::Deny as i32 {
-                        assert!(
-                            decision.reason.contains("invalid skill context"),
-                            "deny reason should attribute rejection to invalid skill context"
-                        );
-                        assert!(
-                            decision.reason.contains(
-                                "skill_id cannot be combined with inline module payloads"
-                            ),
-                            "deny reason should explain why inline module identity is rejected"
-                        );
-                        assert!(
-                            !decision.approval_required,
-                            "invalid inline skill identity should short-circuit before approval"
-                        );
-                        saw_deny_decision = true;
-                    }
+                common_v1::run_stream_event::Body::ToolDecision(decision)
+                    if decision.kind == common_v1::tool_decision::DecisionKind::Deny as i32 =>
+                {
+                    assert!(
+                        decision.reason.contains("invalid skill context"),
+                        "deny reason should attribute rejection to invalid skill context"
+                    );
+                    assert!(
+                        decision
+                            .reason
+                            .contains("skill_id cannot be combined with inline module payloads"),
+                        "deny reason should explain why inline module identity is rejected"
+                    );
+                    assert!(
+                        !decision.approval_required,
+                        "invalid inline skill identity should short-circuit before approval"
+                    );
+                    saw_deny_decision = true;
                 }
-                common_v1::run_stream_event::Body::ToolResult(result) => {
-                    if !result.success {
-                        assert!(
-                            result.error.contains("invalid skill context"),
-                            "failed result should include invalid skill context rejection"
-                        );
-                        saw_failed_result = true;
-                    }
+                common_v1::run_stream_event::Body::ToolResult(result) if !result.success => {
+                    assert!(
+                        result.error.contains("invalid skill context"),
+                        "failed result should include invalid skill context rejection"
+                    );
+                    saw_failed_result = true;
                 }
                 _ => {}
             }
@@ -8219,23 +8191,21 @@ async fn grpc_run_stream_blocks_wasm_plugin_runtime_non_allowlisted_capability()
         let event = event.context("failed to read RunStream event")?;
         if let Some(body) = event.body {
             match body {
-                common_v1::run_stream_event::Body::ToolDecision(decision) => {
-                    if decision.kind == common_v1::tool_decision::DecisionKind::Deny as i32 {
-                        assert!(
-                            decision.reason.contains("approval required"),
-                            "approval gating should run before wasm capability evaluation"
-                        );
-                        saw_deny_decision = true;
-                    }
+                common_v1::run_stream_event::Body::ToolDecision(decision)
+                    if decision.kind == common_v1::tool_decision::DecisionKind::Deny as i32 =>
+                {
+                    assert!(
+                        decision.reason.contains("approval required"),
+                        "approval gating should run before wasm capability evaluation"
+                    );
+                    saw_deny_decision = true;
                 }
-                common_v1::run_stream_event::Body::ToolResult(result) => {
-                    if !result.success {
-                        assert!(
-                            result.error.contains("approval required"),
-                            "denied result should explain missing approval"
-                        );
-                        saw_failed_result = true;
-                    }
+                common_v1::run_stream_event::Body::ToolResult(result) if !result.success => {
+                    assert!(
+                        result.error.contains("approval required"),
+                        "denied result should explain missing approval"
+                    );
+                    saw_failed_result = true;
                 }
                 common_v1::run_stream_event::Body::ToolAttestation(attestation) => {
                     if attestation.executor == "policy" {
@@ -8338,31 +8308,29 @@ async fn grpc_run_stream_denies_unknown_skill_before_approval() -> Result<()> {
                         .context("failed to send tool approval response")?;
                     saw_approval_request = true;
                 }
-                common_v1::run_stream_event::Body::ToolDecision(decision) => {
-                    if decision.kind == common_v1::tool_decision::DecisionKind::Deny as i32 {
-                        assert!(
-                            decision.reason.contains("skill execution blocked by security gate"),
-                            "unknown skill denial should be attributed to skill security gate"
-                        );
-                        assert!(
-                            decision.reason.contains("status=missing"),
-                            "unknown skill denial should describe missing status record"
-                        );
-                        assert!(
-                            !decision.approval_required,
-                            "unknown skill denial should short-circuit before approval workflow"
-                        );
-                        saw_deny_decision = true;
-                    }
+                common_v1::run_stream_event::Body::ToolDecision(decision)
+                    if decision.kind == common_v1::tool_decision::DecisionKind::Deny as i32 =>
+                {
+                    assert!(
+                        decision.reason.contains("skill execution blocked by security gate"),
+                        "unknown skill denial should be attributed to skill security gate"
+                    );
+                    assert!(
+                        decision.reason.contains("status=missing"),
+                        "unknown skill denial should describe missing status record"
+                    );
+                    assert!(
+                        !decision.approval_required,
+                        "unknown skill denial should short-circuit before approval workflow"
+                    );
+                    saw_deny_decision = true;
                 }
-                common_v1::run_stream_event::Body::ToolResult(result) => {
-                    if !result.success {
-                        assert!(
-                            result.error.contains("skill execution blocked by security gate"),
-                            "failed result should include skill gate denial context"
-                        );
-                        saw_failed_result = true;
-                    }
+                common_v1::run_stream_event::Body::ToolResult(result) if !result.success => {
+                    assert!(
+                        result.error.contains("skill execution blocked by security gate"),
+                        "failed result should include skill gate denial context"
+                    );
+                    saw_failed_result = true;
                 }
                 _ => {}
             }
@@ -8476,27 +8444,25 @@ async fn grpc_run_stream_denies_quarantined_skill_before_approval_and_records_ev
                         .context("failed to send tool approval response")?;
                     saw_approval_request = true;
                 }
-                common_v1::run_stream_event::Body::ToolDecision(decision) => {
-                    if decision.kind == common_v1::tool_decision::DecisionKind::Deny as i32 {
-                        assert!(
-                            decision.reason.contains("skill execution blocked by security gate"),
-                            "deny decision should explain skill security gate denial"
-                        );
-                        assert!(
-                            !decision.approval_required,
-                            "quarantined skill denial should short-circuit before approval"
-                        );
-                        saw_deny_decision = true;
-                    }
+                common_v1::run_stream_event::Body::ToolDecision(decision)
+                    if decision.kind == common_v1::tool_decision::DecisionKind::Deny as i32 =>
+                {
+                    assert!(
+                        decision.reason.contains("skill execution blocked by security gate"),
+                        "deny decision should explain skill security gate denial"
+                    );
+                    assert!(
+                        !decision.approval_required,
+                        "quarantined skill denial should short-circuit before approval"
+                    );
+                    saw_deny_decision = true;
                 }
-                common_v1::run_stream_event::Body::ToolResult(result) => {
-                    if !result.success {
-                        assert!(
-                            result.error.contains("skill execution blocked by security gate"),
-                            "failed result should include skill gate denial context"
-                        );
-                        saw_failed_result = true;
-                    }
+                common_v1::run_stream_event::Body::ToolResult(result) if !result.success => {
+                    assert!(
+                        result.error.contains("skill execution blocked by security gate"),
+                        "failed result should include skill gate denial context"
+                    );
+                    saw_failed_result = true;
                 }
                 _ => {}
             }
@@ -8728,15 +8694,13 @@ async fn grpc_run_stream_admin_cancel_preempts_inflight_tool_execution() -> Resu
         let event = event.context("failed to read RunStream event before cancellation")?;
         if let Some(body) = event.body {
             match body {
-                common_v1::run_stream_event::Body::ToolDecision(decision) => {
-                    if decision.kind == common_v1::tool_decision::DecisionKind::Allow as i32 {
-                        break;
-                    }
+                common_v1::run_stream_event::Body::ToolDecision(decision)
+                    if decision.kind == common_v1::tool_decision::DecisionKind::Allow as i32 =>
+                {
+                    break;
                 }
-                common_v1::run_stream_event::Body::ToolResult(result) => {
-                    if result.success {
-                        saw_success_result = true;
-                    }
+                common_v1::run_stream_event::Body::ToolResult(result) if result.success => {
+                    saw_success_result = true;
                 }
                 _ => {}
             }
@@ -8780,10 +8744,8 @@ async fn grpc_run_stream_admin_cancel_preempts_inflight_tool_execution() -> Resu
                         break;
                     }
                 }
-                common_v1::run_stream_event::Body::ToolResult(result) => {
-                    if result.success {
-                        saw_success_result = true;
-                    }
+                common_v1::run_stream_event::Body::ToolResult(result) if result.success => {
+                    saw_success_result = true;
                 }
                 _ => {}
             }

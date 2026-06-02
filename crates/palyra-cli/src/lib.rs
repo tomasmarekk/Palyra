@@ -3336,13 +3336,12 @@ fn collect_error_strings(value: &Value, key_context: Option<&str>, output: &mut 
                 collect_error_strings(entry, key_context, output);
             }
         }
-        Value::String(raw) => {
+        Value::String(raw)
             if key_context
                 .map(|key| key_contains_any(key, &["error", "reason", "message", "failure"]))
-                .unwrap_or(false)
-            {
-                output.push(raw.clone());
-            }
+                .unwrap_or(false) =>
+        {
+            output.push(raw.clone());
         }
         _ => {}
     }

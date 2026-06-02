@@ -346,13 +346,11 @@ fn pending_browser_session_ids(messages: &[ProviderMessage]) -> BTreeSet<String>
                     open_session_ids.insert(session_id.to_owned());
                 }
             }
-            BROWSER_SESSION_CLOSE_TOOL_NAME => {
-                if browser_session_close_confirmed(&output) {
-                    if let Some(session_id) =
-                        tool_call.input_json.get("session_id").and_then(Value::as_str)
-                    {
-                        open_session_ids.remove(session_id);
-                    }
+            BROWSER_SESSION_CLOSE_TOOL_NAME if browser_session_close_confirmed(&output) => {
+                if let Some(session_id) =
+                    tool_call.input_json.get("session_id").and_then(Value::as_str)
+                {
+                    open_session_ids.remove(session_id);
                 }
             }
             _ => {}

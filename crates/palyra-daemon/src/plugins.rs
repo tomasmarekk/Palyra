@@ -474,13 +474,13 @@ fn normalize_plugin_capability_profile(
     profile: PluginCapabilityProfile,
 ) -> Result<PluginCapabilityProfile> {
     Ok(PluginCapabilityProfile {
-        http_hosts: dedupe_sorted(profile.http_hosts.into_iter(), normalize_host_capability)?,
-        secrets: dedupe_sorted(profile.secrets.into_iter(), normalize_identifier_capability)?,
+        http_hosts: dedupe_sorted(profile.http_hosts, normalize_host_capability)?,
+        secrets: dedupe_sorted(profile.secrets, normalize_identifier_capability)?,
         storage_prefixes: dedupe_sorted(
-            profile.storage_prefixes.into_iter(),
+            profile.storage_prefixes,
             normalize_storage_prefix_capability,
         )?,
-        channels: dedupe_sorted(profile.channels.into_iter(), normalize_identifier_capability)?,
+        channels: dedupe_sorted(profile.channels, normalize_identifier_capability)?,
     })
 }
 

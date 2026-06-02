@@ -9,7 +9,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-cedar-policy = "4.10.0"
+cedar-policy = "4.11.0"
 serde_json.workspace = true
 thiserror.workspace = true
 

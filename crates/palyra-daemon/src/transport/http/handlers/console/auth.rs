@@ -559,11 +559,10 @@ pub(crate) async fn console_auth_selection_explain_handler(
         payload.provider_kind.as_deref(),
         payload.provider_custom_name.as_deref(),
     )?;
-    let allowed_credential_types = payload
-        .allowed_credential_types
-        .iter()
-        .map(|value| parse_runtime_auth_credential_type(value.as_str()))
-        .collect::<Result<Vec<_>, Response>>()?;
+    let mut allowed_credential_types = Vec::with_capacity(payload.allowed_credential_types.len());
+    for value in &payload.allowed_credential_types {
+        allowed_credential_types.push(parse_runtime_auth_credential_type(value.as_str())?);
+    }
     let agent_id = normalize_optional_query_value(payload.agent_id.as_deref(), "agent_id")?;
     let request = palyra_auth::AuthProfileSelectionRequest {
         provider,

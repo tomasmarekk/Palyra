@@ -553,16 +553,16 @@ impl PalyraAcpAgent {
         let mut stop_reason = acp::StopReason::EndTurn;
         while let Some(event) = run_stream.next_event().await.map_err(acp_internal_error)? {
             match event.body {
-                Some(common_v1::run_stream_event::Body::ModelToken(token)) => {
-                    if !token.token.is_empty() {
-                        self.send_session_update(
-                            &arguments.session_id,
-                            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
-                                acp::ContentBlock::from(token.token),
-                            )),
-                        )
-                        .await?;
-                    }
+                Some(common_v1::run_stream_event::Body::ModelToken(token))
+                    if !token.token.is_empty() =>
+                {
+                    self.send_session_update(
+                        &arguments.session_id,
+                        acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                            acp::ContentBlock::from(token.token),
+                        )),
+                    )
+                    .await?;
                 }
                 Some(common_v1::run_stream_event::Body::ToolProposal(proposal)) => {
                     let tool_call_id = proposal

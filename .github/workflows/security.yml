@@ -65,7 +65,7 @@ jobs:
       - name: Install Rust toolchain
         uses: ./.github/actions/setup-rust-toolchain
         with:
-          toolchain: 1.92.0
+          toolchain: 1.95.0
 
       - name: Desktop glib patch governance
         run: bash scripts/check-desktop-glib-patch.sh

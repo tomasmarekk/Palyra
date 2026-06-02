@@ -481,21 +481,12 @@ impl ObservabilityState {
                 last_seen_at_unix_ms: guard.last_seen_at_unix_ms.get(event_type.as_str()).copied(),
             })
             .collect::<Vec<_>>();
-        let retrieval_branch_latency_avg_ms = if guard.retrieval_searches == 0 {
-            None
-        } else {
-            Some(guard.retrieval_branch_latency_total_ms / guard.retrieval_searches)
-        };
-        let queue_average_depth = if guard.queue_depth_samples == 0 {
-            0
-        } else {
-            guard.queue_depth_total / guard.queue_depth_samples
-        };
-        let pruning_average_savings_tokens = if guard.pruning_apply_events == 0 {
-            0
-        } else {
-            guard.pruning_tokens_saved / guard.pruning_apply_events
-        };
+        let retrieval_branch_latency_avg_ms =
+            guard.retrieval_branch_latency_total_ms.checked_div(guard.retrieval_searches);
+        let queue_average_depth =
+            guard.queue_depth_total.checked_div(guard.queue_depth_samples).unwrap_or(0);
+        let pruning_average_savings_tokens =
+            guard.pruning_tokens_saved.checked_div(guard.pruning_apply_events).unwrap_or(0);
         let guardrails =
             runtime_decision_guardrail_snapshot(&guard, PRUNING_LOW_SAVINGS_FALLBACK_TOKENS);
         RuntimeDecisionObservabilitySnapshot {

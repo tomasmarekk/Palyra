@@ -305,7 +305,7 @@ async fn session_replay(
         .await
         .map_err(AcpDispatchError::from_status)?;
     let total_records = records.len();
-    records.sort_by(|left, right| left.seq.cmp(&right.seq));
+    records.sort_by_key(|left| left.seq);
     if records.len() > cap.max_events {
         let start = records.len().saturating_sub(cap.max_events);
         records = records.split_off(start);

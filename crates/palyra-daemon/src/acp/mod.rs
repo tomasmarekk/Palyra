@@ -659,7 +659,7 @@ impl AcpRuntime {
             })
             .cloned()
             .collect::<Vec<_>>();
-        records.sort_by(|left, right| right.updated_at_unix_ms.cmp(&left.updated_at_unix_ms));
+        records.sort_by_key(|record| std::cmp::Reverse(record.updated_at_unix_ms));
         records.truncate(limit);
         Ok(records)
     }

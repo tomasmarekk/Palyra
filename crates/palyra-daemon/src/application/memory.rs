@@ -76,12 +76,8 @@ pub(crate) fn enforce_memory_item_scope(
         return Err(Status::permission_denied("memory item principal does not match context"));
     }
     match (channel, item.channel.as_deref()) {
-        (Some(context_channel), Some(item_channel)) => {
-            if context_channel != item_channel {
-                return Err(Status::permission_denied(
-                    "memory item channel does not match context",
-                ));
-            }
+        (Some(context_channel), Some(item_channel)) if context_channel != item_channel => {
+            return Err(Status::permission_denied("memory item channel does not match context"));
         }
         (None, Some(_)) => {
             return Err(Status::permission_denied(

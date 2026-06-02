@@ -327,18 +327,17 @@ pub(crate) async fn console_mobile_sessions_list_handler(
             )
         })
         .collect::<Vec<_>>();
+    let mut session_summaries = Vec::with_capacity(items.len());
+    for item in items {
+        session_summaries.push(control_plane::MobileSessionSummary {
+            session: serialize_value(&item.session)?,
+            recap: item.recap,
+            handoff: item.handoff,
+        });
+    }
     Ok(Json(control_plane::MobileSessionsEnvelope {
         contract: contract_descriptor(),
-        sessions: items
-            .into_iter()
-            .map(|item| {
-                Ok(control_plane::MobileSessionSummary {
-                    session: serialize_value(&item.session)?,
-                    recap: item.recap,
-                    handoff: item.handoff,
-                })
-            })
-            .collect::<Result<Vec<_>, Response>>()?,
+        sessions: session_summaries,
         page: build_page_info(limit, sessions.len(), next_cursor),
     }))
 }

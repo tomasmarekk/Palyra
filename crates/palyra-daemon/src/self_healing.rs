@@ -323,7 +323,7 @@ impl SelfHealingState {
             .filter(|incident| incident.state != IncidentState::Resolved)
             .cloned()
             .collect::<Vec<_>>();
-        incidents.sort_by(|left, right| right.updated_at_unix_ms.cmp(&left.updated_at_unix_ms));
+        incidents.sort_by_key(|incident| std::cmp::Reverse(incident.updated_at_unix_ms));
         incidents.truncate(limit);
         incidents
     }
@@ -359,7 +359,7 @@ impl SelfHealingState {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        heartbeats.sort_by(|left, right| right.updated_at_unix_ms.cmp(&left.updated_at_unix_ms));
+        heartbeats.sort_by_key(|heartbeat| std::cmp::Reverse(heartbeat.updated_at_unix_ms));
         heartbeats
     }
 

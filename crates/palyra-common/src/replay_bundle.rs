@@ -1180,13 +1180,11 @@ fn scan_for_unredacted_secrets(
                 );
             }
         }
-        Value::String(raw) => {
-            if string_contains_unredacted_secret(raw, key_context) {
-                issues.push(ReplayValidationIssue {
-                    path: path.to_owned(),
-                    reason: "string contains an unredacted credential pattern".to_owned(),
-                });
-            }
+        Value::String(raw) if string_contains_unredacted_secret(raw, key_context) => {
+            issues.push(ReplayValidationIssue {
+                path: path.to_owned(),
+                reason: "string contains an unredacted credential pattern".to_owned(),
+            });
         }
         _ => {}
     }

@@ -777,10 +777,8 @@ fn build_patch_candidates(
         }
         let payload = serde_json::from_str::<Value>(record.payload_json.as_str()).ok();
         match record.event_type.as_str() {
-            "message.received" => {
-                if run_evidence.message_evidence.len() < 4 {
-                    run_evidence.message_evidence.push(provenance_from_transcript(record));
-                }
+            "message.received" if run_evidence.message_evidence.len() < 4 => {
+                run_evidence.message_evidence.push(provenance_from_transcript(record));
             }
             "tool_proposal" => {
                 let Some(payload) = payload else {

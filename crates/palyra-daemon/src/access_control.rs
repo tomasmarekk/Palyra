@@ -947,7 +947,7 @@ impl AccessRegistry {
             })
             .map(|record| api_token_view(record, 0))
             .collect::<Vec<_>>();
-        visible.sort_by(|left, right| right.updated_at_unix_ms.cmp(&left.updated_at_unix_ms));
+        visible.sort_by_key(|entry| std::cmp::Reverse(entry.updated_at_unix_ms));
         visible
     }
 

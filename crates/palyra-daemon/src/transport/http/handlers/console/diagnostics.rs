@@ -2000,11 +2000,11 @@ pub(crate) async fn collect_console_browser_action_diagnostics(state: &AppState)
         "relay_actions": {
             "attempts": attempts,
             "failures": failures,
-            "failure_rate_bps": if attempts == 0 {
-                0
-            } else {
-                u32::try_from(failures.saturating_mul(10_000) / attempts).unwrap_or(u32::MAX)
-            },
+            "failure_rate_bps": failures
+                .saturating_mul(10_000)
+                .checked_div(attempts)
+                .map(|value| u32::try_from(value).unwrap_or(u32::MAX))
+                .unwrap_or(0),
         },
         "recent_failure_samples": samples,
     })
@@ -3691,7 +3691,7 @@ pub(crate) async fn run_support_bundle_job(
     }
 
     let mut finished = guard.values().cloned().collect::<Vec<_>>();
-    finished.sort_by(|left, right| left.requested_at_unix_ms.cmp(&right.requested_at_unix_ms));
+    finished.sort_by_key(|left| left.requested_at_unix_ms);
     while finished.len() > retain_jobs {
         if let Some(first) = finished.first() {
             guard.remove(first.job_id.as_str());
@@ -3806,7 +3806,7 @@ pub(crate) async fn run_doctor_job(
     }
 
     let mut finished = guard.values().cloned().collect::<Vec<_>>();
-    finished.sort_by(|left, right| left.requested_at_unix_ms.cmp(&right.requested_at_unix_ms));
+    finished.sort_by_key(|left| left.requested_at_unix_ms);
     while finished.len() > retain_jobs {
         if let Some(first) = finished.first() {
             guard.remove(first.job_id.as_str());

@@ -567,15 +567,13 @@ fn scan_value_for_unredacted_secrets(
                 );
             }
         }
-        Value::String(raw) => {
-            if string_contains_unredacted_secret(raw, key_context) {
-                issues.push(error_issue(
-                    "unredacted_secret_in_fixture",
-                    path,
-                    "eval fixture string contains an unredacted credential pattern",
-                    "Redact the fixture string or replace it with a non-secret marker.",
-                ));
-            }
+        Value::String(raw) if string_contains_unredacted_secret(raw, key_context) => {
+            issues.push(error_issue(
+                "unredacted_secret_in_fixture",
+                path,
+                "eval fixture string contains an unredacted credential pattern",
+                "Redact the fixture string or replace it with a non-secret marker.",
+            ));
         }
         _ => {}
     }

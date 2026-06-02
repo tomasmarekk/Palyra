@@ -1953,13 +1953,10 @@ fn build_operator_compaction_insight(
         (aggregation.compaction_total_token_delta / aggregation.compaction_samples.len() as i128)
             .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
     };
-    let avg_reduction_bps = if aggregation.compaction_total_input_tokens == 0 {
-        0
-    } else {
-        ((aggregation.compaction_total_token_delta.max(0) as u128) * 10_000
-            / aggregation.compaction_total_input_tokens)
-            .min(u128::from(u32::MAX)) as u32
-    };
+    let avg_reduction_bps = ((aggregation.compaction_total_token_delta.max(0) as u128) * 10_000)
+        .checked_div(aggregation.compaction_total_input_tokens)
+        .unwrap_or(0)
+        .min(u128::from(u32::MAX)) as u32;
     let (state, severity, recommended_action) = if aggregation.compaction_blocked_events > 0
         || (aggregation.compaction_preview_events > 0
             && aggregation.compaction_created_events == 0

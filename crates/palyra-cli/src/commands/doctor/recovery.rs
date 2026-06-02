@@ -2441,7 +2441,7 @@ fn collect_recovery_runs(state_root: &Path) -> Vec<DoctorRecoveryRunSummary> {
             completed: manifest.completed,
         });
     }
-    runs.sort_by(|left, right| right.created_at_unix_ms.cmp(&left.created_at_unix_ms));
+    runs.sort_by_key(|run| std::cmp::Reverse(run.created_at_unix_ms));
     runs
 }
 

@@ -2315,10 +2315,11 @@ fn redact_browser_console_event_details(value: &mut Value, key_context: Option<&
                 redact_browser_console_event_details(item, key_context);
             }
         }
-        Value::String(text) => {
-            if key_context.is_some_and(browser_console_identifier_key) && !text.trim().is_empty() {
-                *text = redact_browser_console_identifier(text.as_str());
-            }
+        Value::String(text)
+            if key_context.is_some_and(browser_console_identifier_key)
+                && !text.trim().is_empty() =>
+        {
+            *text = redact_browser_console_identifier(text.as_str());
         }
         _ => {}
     }

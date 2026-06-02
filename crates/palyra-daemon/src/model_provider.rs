@@ -2520,8 +2520,7 @@ impl ModelProvider for RegistryBackedModelProvider {
                 let cache_key = self.response_cache_key(&request, model);
                 if let Some(mut cached) = self.lookup_cached_response(cache_key.as_str(), model) {
                     cached.failover_count = failover_count;
-                    cached.attempts =
-                        attempts.into_iter().chain(cached.attempts.into_iter()).collect();
+                    cached.attempts = attempts.into_iter().chain(cached.attempts).collect();
                     self.record_runtime_metrics(
                         false,
                         cached.prompt_tokens,
@@ -5031,14 +5030,10 @@ impl ProviderRuntimeMetrics {
             ((u128::from(self.error_count) * 10_000_u128) / u128::from(self.request_count)) as u32
         };
         let avg_prompt_tokens_per_run =
-            if self.request_count == 0 { 0 } else { self.total_prompt_tokens / self.request_count };
-        let avg_completion_tokens_per_run = if self.request_count == 0 {
-            0
-        } else {
-            self.total_completion_tokens / self.request_count
-        };
-        let avg_latency_ms =
-            if self.request_count == 0 { 0 } else { self.total_latency_ms / self.request_count };
+            self.total_prompt_tokens.checked_div(self.request_count).unwrap_or(0);
+        let avg_completion_tokens_per_run =
+            self.total_completion_tokens.checked_div(self.request_count).unwrap_or(0);
+        let avg_latency_ms = self.total_latency_ms.checked_div(self.request_count).unwrap_or(0);
         ProviderRuntimeMetricsSnapshot {
             request_count: self.request_count,
             error_count: self.error_count,

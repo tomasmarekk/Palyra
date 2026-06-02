@@ -626,7 +626,7 @@ impl AgentRegistry {
             next.session_bindings.push(binding.clone());
             if next.session_bindings.len() > MAX_SESSION_BINDINGS {
                 next.session_bindings
-                    .sort_by(|left, right| right.updated_at_unix_ms.cmp(&left.updated_at_unix_ms));
+                    .sort_by_key(|binding| std::cmp::Reverse(binding.updated_at_unix_ms));
                 next.session_bindings.truncate(MAX_SESSION_BINDINGS);
             }
             binding

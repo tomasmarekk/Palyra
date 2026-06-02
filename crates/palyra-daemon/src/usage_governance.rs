@@ -1474,7 +1474,7 @@ pub(crate) fn build_scope_mix(runs: &[UsageEnrichedRun<'_>]) -> Vec<UsageScopeMi
         }
     }
     let mut rows = groups.into_values().collect::<Vec<_>>();
-    rows.sort_by(|left, right| right.runs.cmp(&left.runs));
+    rows.sort_by_key(|row| std::cmp::Reverse(row.runs));
     rows
 }
 

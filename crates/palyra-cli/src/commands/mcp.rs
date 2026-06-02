@@ -481,10 +481,10 @@ async fn collect_mcp_run_stream(
     while let Some(event) = stream.next_event().await? {
         events.push(mcp_run_stream_event_to_json(&event));
         match event.body.as_ref() {
-            Some(common_v1::run_stream_event::Body::ModelToken(token)) => {
-                if !token.token.is_empty() {
-                    assistant_text.push_str(token.token.as_str());
-                }
+            Some(common_v1::run_stream_event::Body::ModelToken(token))
+                if !token.token.is_empty() =>
+            {
+                assistant_text.push_str(token.token.as_str());
             }
             Some(common_v1::run_stream_event::Body::ToolApprovalRequest(request)) => {
                 approval_request = Some(tool_approval_request_to_json(request));

@@ -855,7 +855,7 @@ pub(crate) fn load_skill_builder_candidate_index(
             path.display()
         )))
     })?;
-    index.entries.sort_by(|left, right| left.generated_at_unix_ms.cmp(&right.generated_at_unix_ms));
+    index.entries.sort_by_key(|left| left.generated_at_unix_ms);
     Ok(index)
 }
 
@@ -878,9 +878,7 @@ fn save_skill_builder_candidate_index(
             "failed to read system clock: {error}"
         )))
     })?;
-    normalized
-        .entries
-        .sort_by(|left, right| left.generated_at_unix_ms.cmp(&right.generated_at_unix_ms));
+    normalized.entries.sort_by_key(|left| left.generated_at_unix_ms);
     let path = skill_builder_candidates_index_path(skills_root);
     let payload = serde_json::to_vec_pretty(&normalized).map_err(|error| {
         runtime_status_response(tonic::Status::internal(format!(

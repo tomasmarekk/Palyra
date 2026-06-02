@@ -4,7 +4,7 @@ use std::{
     time::Instant,
 };
 
-use quick_xml::{events::Event, Reader};
+use quick_xml::{events::Event, Reader, XmlVersion};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zip::ZipArchive;
@@ -626,11 +626,11 @@ fn extract_xml_attribute_values(
 }
 
 fn attribute_value(event: &quick_xml::events::BytesStart<'_>, name: &[u8]) -> Option<String> {
-    event
-        .attributes()
-        .flatten()
-        .find(|attribute| attribute.key.as_ref() == name)
-        .and_then(|attribute| attribute.unescape_value().ok().map(|value| value.into_owned()))
+    event.attributes().flatten().find(|attribute| attribute.key.as_ref() == name).and_then(
+        |attribute| {
+            attribute.normalized_value(XmlVersion::Implicit1_0).ok().map(|value| value.into_owned())
+        },
+    )
 }
 
 fn zip_archive(bytes: &[u8]) -> Result<ZipArchive<Cursor<&[u8]>>, String> {

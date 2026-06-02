@@ -275,10 +275,8 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
         if event::poll(Duration::from_millis(50)).context("failed to poll terminal events")? {
             let event = event::read().context("failed to read terminal event")?;
             match event {
-                CEvent::Key(key) => {
-                    if handle_key(app, key).await? {
-                        return Ok(());
-                    }
+                CEvent::Key(key) if handle_key(app, key).await? => {
+                    return Ok(());
                 }
                 CEvent::Paste(text)
                     if matches!(app.mode, Mode::Chat) && matches!(app.focus, Focus::Input) =>

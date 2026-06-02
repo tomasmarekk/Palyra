@@ -919,7 +919,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             .drain(..)
             .filter(|profile| profile.principal == principal)
             .collect::<Vec<_>>();
-        profiles.sort_by(|left, right| right.last_used_unix_ms.cmp(&left.last_used_unix_ms));
+        profiles.sort_by_key(|profile| std::cmp::Reverse(profile.last_used_unix_ms));
         Ok(Response::new(browser_v1::ListProfilesResponse {
             v: CANONICAL_PROTOCOL_MAJOR,
             profiles: profiles
