@@ -82,6 +82,7 @@ fn run_acp_shim(command: AcpShimArgs) -> Result<()> {
         run_id: command.run_id,
         prompt: input_prompt,
         allow_sensitive_tools: command.allow_sensitive_tools,
+        interrupt_active_run: false,
         approval_mode: AgentApprovalMode::Prompt,
         origin_kind: None,
         origin_run_id: None,

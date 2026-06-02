@@ -523,6 +523,7 @@ impl PalyraAcpAgent {
             run_id: None,
             prompt,
             allow_sensitive_tools: self.allow_sensitive_tools,
+            interrupt_active_run: false,
             approval_mode: AgentApprovalMode::Prompt,
             origin_kind: None,
             origin_run_id: None,

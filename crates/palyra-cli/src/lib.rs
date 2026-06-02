@@ -4385,6 +4385,7 @@ fn parse_acp_shim_input_line(
         allow_sensitive_tools: parsed
             .allow_sensitive_tools
             .unwrap_or(default_allow_sensitive_tools),
+        interrupt_active_run: false,
         approval_mode: AgentApprovalMode::Prompt,
         origin_kind: None,
         origin_run_id: None,
@@ -4611,6 +4612,7 @@ struct AgentRunInputArgs {
     run_id: Option<String>,
     prompt: String,
     allow_sensitive_tools: bool,
+    interrupt_active_run: bool,
     approval_mode: AgentApprovalMode,
     origin_kind: Option<String>,
     origin_run_id: Option<String>,
@@ -4627,6 +4629,7 @@ fn build_agent_run_input(input: AgentRunInputArgs) -> Result<AgentRunInput> {
         run_id: resolve_or_generate_canonical_id(input.run_id)?,
         prompt: input.prompt,
         allow_sensitive_tools: input.allow_sensitive_tools,
+        interrupt_active_run: input.interrupt_active_run,
         approval_mode: input.approval_mode,
         origin_kind: normalize_optional_owned_text(input.origin_kind),
         origin_run_id: normalize_optional_owned_text(input.origin_run_id),
@@ -4654,8 +4657,28 @@ impl From<AgentApprovalModeArg> for AgentApprovalMode {
 
 async fn prepare_agent_run_input(
     client: &mut client::runtime::GatewayRuntimeClient,
-    input: AgentRunInput,
+    mut input: AgentRunInput,
 ) -> Result<ResolvedAgentRunInput> {
+    let mut session = resolve_agent_run_session(client, &input).await?;
+    if let Some(interrupted_run_id) =
+        interrupt_or_reject_active_session_follow_up(client, &session, input.interrupt_active_run)
+            .await?
+    {
+        mark_interrupted_follow_up_origin(&mut input, interrupted_run_id.as_str());
+        session = resolve_agent_run_session(client, &input).await?;
+        reject_active_session_follow_up(&session).with_context(|| {
+            format!(
+                "interrupted active run {interrupted_run_id} but the selected session still has an active run"
+            )
+        })?;
+    }
+    Ok(ResolvedAgentRunInput { session, request: input })
+}
+
+async fn resolve_agent_run_session(
+    client: &mut client::runtime::GatewayRuntimeClient,
+    input: &AgentRunInput,
+) -> Result<gateway_v1::SessionSummary> {
     let response = client
         .resolve_session(SessionResolveInput {
             session_id: input.session_id.clone(),
@@ -4665,17 +4688,40 @@ async fn prepare_agent_run_input(
             reset_session: input.reset_session,
         })
         .await?;
-    let session = response.session.context("ResolveSession returned empty session payload")?;
-    reject_active_session_follow_up(&session)?;
-    Ok(ResolvedAgentRunInput { session, request: input })
+    response.session.context("ResolveSession returned empty session payload")
+}
+
+async fn interrupt_or_reject_active_session_follow_up(
+    client: &mut client::runtime::GatewayRuntimeClient,
+    session: &gateway_v1::SessionSummary,
+    interrupt_active_run: bool,
+) -> Result<Option<String>> {
+    if !is_active_session_follow_up(session) {
+        return Ok(None);
+    }
+    if !interrupt_active_run {
+        reject_active_session_follow_up(session)?;
+        return Ok(None);
+    }
+
+    let run_id = active_session_run_id(session).with_context(|| {
+        "cannot interrupt the active same-session run because the resolved session did not include last_run_id; run `palyra sessions list --json` to find the active run id, then run `palyra sessions abort <run-id>`"
+    })?;
+    let run_id = run_id.to_owned();
+    client
+        .abort_run(run_id.clone(), Some("cli_interrupt_active_run".to_owned()))
+        .await
+        .with_context(|| {
+            format!(
+                "failed to interrupt active run {run_id} before starting same-session agent run"
+            )
+        })?;
+    Ok(Some(run_id))
 }
 
 fn reject_active_session_follow_up(session: &gateway_v1::SessionSummary) -> Result<()> {
     let state = session.last_run_state.trim();
-    let Some(phase) = RunLifecyclePhase::parse(state) else {
-        return Ok(());
-    };
-    if phase.is_terminal() {
+    if !is_active_session_follow_up(session) {
         return Ok(());
     }
 
@@ -4701,6 +4747,28 @@ fn reject_active_session_follow_up(session: &gateway_v1::SessionSummary) -> Resu
     anyhow::bail!(
         "same-session `palyra agent run` cannot live-redirect a selected session while its previous run is {state}; Palyra will not queue this follow-up behind the active run. To redirect the task, {abort_hint}. For live steering, use `palyra agent interactive` and interrupt the active run."
     )
+}
+
+fn is_active_session_follow_up(session: &gateway_v1::SessionSummary) -> bool {
+    RunLifecyclePhase::parse(session.last_run_state.trim())
+        .is_some_and(|phase| !phase.is_terminal())
+}
+
+fn active_session_run_id(session: &gateway_v1::SessionSummary) -> Option<&str> {
+    session
+        .last_run_id
+        .as_ref()
+        .map(|run_id| run_id.ulid.trim())
+        .filter(|run_id| !run_id.is_empty())
+}
+
+fn mark_interrupted_follow_up_origin(request: &mut AgentRunInput, interrupted_run_id: &str) {
+    if request.origin_kind.is_none() {
+        request.origin_kind = Some("cli_interrupt".to_owned());
+    }
+    if request.origin_run_id.is_none() {
+        request.origin_run_id = Some(interrupted_run_id.to_owned());
+    }
 }
 
 fn normalize_optional_owned_text(value: Option<String>) -> Option<String> {
@@ -5743,6 +5811,32 @@ mod agent_stream_output_tests {
     }
 
     #[test]
+    fn interrupted_follow_up_marks_origin_for_audit() {
+        let interrupted_run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let mut request = build_agent_run_input(AgentRunInputArgs {
+            session_id: None,
+            session_key: Some("ops:triage".to_owned()),
+            session_label: None,
+            require_existing: true,
+            reset_session: false,
+            run_id: None,
+            prompt: "redirect active run".to_owned(),
+            allow_sensitive_tools: false,
+            interrupt_active_run: true,
+            approval_mode: AgentApprovalMode::AllowOnce,
+            origin_kind: None,
+            origin_run_id: None,
+            parameter_delta_json: None,
+        })
+        .expect("agent run input should build");
+
+        mark_interrupted_follow_up_origin(&mut request, interrupted_run_id);
+
+        assert_eq!(request.origin_kind.as_deref(), Some("cli_interrupt"));
+        assert_eq!(request.origin_run_id.as_deref(), Some(interrupted_run_id));
+    }
+
+    #[test]
     fn tool_stream_labels_preserve_safe_diagnostics() {
         assert_eq!(safe_stream_label_for_output("palyra.fs.apply_patch"), "palyra.fs.apply_patch");
         assert_eq!(
@@ -6441,6 +6535,7 @@ struct AgentRunInput {
     run_id: String,
     prompt: String,
     allow_sensitive_tools: bool,
+    interrupt_active_run: bool,
     approval_mode: AgentApprovalMode,
     origin_kind: Option<String>,
     origin_run_id: Option<String>,

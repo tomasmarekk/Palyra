@@ -610,6 +610,7 @@ fn parse_agent_run_with_prompt() {
                 prompt: Some("hello".to_owned()),
                 prompt_stdin: false,
                 allow_sensitive_tools: true,
+                interrupt_active_run: false,
                 approval_mode: AgentApprovalModeArg::AllowOnce,
                 ndjson: true,
             }
@@ -631,6 +632,20 @@ fn agent_run_help_documents_canonical_run_id_shape() {
         help.contains("Canonical 26-character ULID run id"),
         "agent run help should document canonical run id shape: {help}"
     );
+}
+
+#[test]
+fn parse_agent_run_interrupt_active_run_flag_and_alias() {
+    for flag in ["--interrupt-active-run", "--abort-active-run"] {
+        let parsed = Cli::parse_from(["palyra", "agent", "run", flag, "--prompt", "redirect"]);
+        let Command::Agent { command: AgentCommand::Run { interrupt_active_run, .. } } =
+            parsed.command
+        else {
+            panic!("expected agent run command for {flag}");
+        };
+
+        assert!(interrupt_active_run, "{flag} should enable active-run interrupt");
+    }
 }
 
 #[test]
@@ -685,6 +700,7 @@ fn parse_agent_run_with_approval_mode_allow_once() {
                 prompt: Some("inspect".to_owned()),
                 prompt_stdin: false,
                 allow_sensitive_tools: false,
+                interrupt_active_run: false,
                 approval_mode: AgentApprovalModeArg::AllowOnce,
                 ndjson: false,
             }
@@ -760,6 +776,7 @@ fn parse_agent_run_with_session_key_controls() {
                 prompt: Some("continue".to_owned()),
                 prompt_stdin: false,
                 allow_sensitive_tools: false,
+                interrupt_active_run: false,
                 approval_mode: AgentApprovalModeArg::AllowOnce,
                 ndjson: false,
             }

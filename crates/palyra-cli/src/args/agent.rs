@@ -36,6 +36,13 @@ pub enum AgentCommand {
         prompt_stdin: bool,
         #[arg(long, default_value_t = false)]
         allow_sensitive_tools: bool,
+        #[arg(
+            long,
+            visible_alias = "abort-active-run",
+            default_value_t = false,
+            help = "Abort the selected active run, then start this prompt in the same session."
+        )]
+        interrupt_active_run: bool,
         #[arg(long, value_enum, default_value_t = AgentApprovalModeArg::AllowOnce)]
         approval_mode: AgentApprovalModeArg,
         #[arg(long, default_value_t = false)]

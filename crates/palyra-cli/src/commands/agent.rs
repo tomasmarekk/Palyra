@@ -47,6 +47,7 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<()> {
             prompt,
             prompt_stdin,
             allow_sensitive_tools,
+            interrupt_active_run,
             approval_mode,
             ndjson,
         } => {
@@ -73,6 +74,7 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<()> {
                 run_id,
                 prompt: input_prompt,
                 allow_sensitive_tools,
+                interrupt_active_run,
                 approval_mode: approval_mode.into(),
                 origin_kind: None,
                 origin_run_id: None,
@@ -292,6 +294,7 @@ async fn run_agent_interactive_async(
             run_id: None,
             prompt: prompt.to_owned(),
             allow_sensitive_tools,
+            interrupt_active_run: false,
             approval_mode: AgentApprovalMode::Prompt,
             origin_kind: None,
             origin_run_id: None,
