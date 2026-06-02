@@ -238,6 +238,9 @@ pub(crate) fn classify_error(error: &anyhow::Error) -> CliExitCode {
     if is_provider_output_limit_stop(&lower) {
         return CliExitCode::Precondition;
     }
+    if is_provider_turn_timeout(&lower) {
+        return CliExitCode::Connectivity;
+    }
     if lower.contains("unauthorized")
         || lower.contains("forbidden")
         || lower.contains("authentication")
@@ -296,6 +299,13 @@ fn is_user_cancellation(lower_error: &str) -> bool {
     lower_error.contains("cancelled by request")
         || lower_error.contains("canceled by request")
         || lower_error.contains("run cancellation requested")
+}
+
+fn is_provider_turn_timeout(lower_error: &str) -> bool {
+    lower_error.contains("model provider turn timed out")
+        || (lower_error.contains("provider")
+            && lower_error.contains("timed out")
+            && lower_error.contains("no model tokens"))
 }
 
 fn classify_control_plane_error(cause: &(dyn std::error::Error + 'static)) -> Option<CliExitCode> {
@@ -390,6 +400,16 @@ mod tests {
                 "model provider stopped because of an output token limit before returning a complete final answer or structured tool call (finish_reason=length); provider=anthropic"
             )),
             CliExitCode::Precondition
+        );
+    }
+
+    #[test]
+    fn classify_error_maps_provider_turn_timeout_before_token_auth_match() {
+        assert_eq!(
+            classify_error(&anyhow!(
+                "agent run failed: model provider turn timed out after 60000ms for run 01ARZ3NDEKTSV4RRFFQ69G5FAV; no model tokens, tool proposals, or final answer arrived before the deadline."
+            )),
+            CliExitCode::Connectivity
         );
     }
 
