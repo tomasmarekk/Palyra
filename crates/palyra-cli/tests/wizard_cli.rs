@@ -1676,6 +1676,9 @@ impl MockProviderServer {
             while Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        stream
+                            .set_nonblocking(false)
+                            .context("failed to configure mock provider stream")?;
                         let mut buffer = [0_u8; 4096];
                         let read =
                             stream.read(&mut buffer).context("failed to read provider request")?;
