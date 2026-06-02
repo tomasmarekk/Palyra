@@ -61,6 +61,11 @@ const DEFAULT_PROVIDER_RESPONSE_CACHE_TTL_MS: u64 = 30_000;
 const DEFAULT_PROVIDER_RESPONSE_CACHE_MAX_ENTRIES: usize = 128;
 const DEFAULT_PROVIDER_DISCOVERY_TTL_MS: u64 = 5 * 60 * 1_000;
 const DEFAULT_PROVIDER_HEALTH_TTL_MS: u64 = 60_000;
+const DETERMINISTIC_TOOL_FIXTURE_ID: &str = "deterministic-provider-tool-call-v1";
+const DETERMINISTIC_TOOL_FIXTURE_REPORT_PATH: &str = "reports/deterministic-provider.md";
+const DETERMINISTIC_TOOL_FIXTURE_WRITE_CALL_ID: &str = "deterministic-fixture-write";
+const DETERMINISTIC_TOOL_FIXTURE_READ_CALL_ID: &str = "deterministic-fixture-read";
+const DETERMINISTIC_TOOL_FIXTURE_REPORT: &str = "# Deterministic Provider Fixture\n\nfixture_id: deterministic-provider-tool-call-v1\nstatus: passed\nprovider: deterministic\n";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -632,7 +637,7 @@ fn capability_defaults_for_kind(
         (ModelProviderKind::Deterministic, ProviderModelRole::Chat) => {
             ProviderCapabilitiesSnapshot {
                 streaming_tokens: true,
-                tool_calls: false,
+                tool_calls: true,
                 json_mode: true,
                 vision: false,
                 audio_transcribe: false,
@@ -642,9 +647,14 @@ fn capability_defaults_for_kind(
                 latency_tier: ProviderLatencyTier::Low.as_str().to_owned(),
                 recommended_use_cases: vec![
                     "offline testing".to_owned(),
+                    "scripted tool-call regression".to_owned(),
                     "deterministic smoke flows".to_owned(),
                 ],
-                known_limitations: vec!["no real provider auth".to_owned(), "no vision".to_owned()],
+                known_limitations: vec![
+                    "scripted fixture responses only".to_owned(),
+                    "no real provider auth".to_owned(),
+                    "no vision".to_owned(),
+                ],
                 operator_override: false,
                 metadata_source: ProviderMetadataSource::Static.as_str().to_owned(),
             }
@@ -3070,6 +3080,190 @@ impl DeterministicProvider {
     }
 }
 
+fn deterministic_tool_fixture_output(
+    request: &ProviderRequest,
+    prompt_tokens: u64,
+) -> Option<ProviderTurnOutput> {
+    if request.json_mode || !deterministic_tool_fixture_requested(request) {
+        return None;
+    }
+
+    if provider_request_has_tool_result(request, DETERMINISTIC_TOOL_FIXTURE_READ_CALL_ID) {
+        let readback_verified =
+            provider_request_tool_result_text(request, DETERMINISTIC_TOOL_FIXTURE_READ_CALL_ID)
+                .is_some_and(|text| text.contains(DETERMINISTIC_TOOL_FIXTURE_ID));
+        let final_text = if readback_verified {
+            format!(
+                "Deterministic provider fixture completed: wrote and read back {DETERMINISTIC_TOOL_FIXTURE_REPORT_PATH} with fixture_id={DETERMINISTIC_TOOL_FIXTURE_ID}."
+            )
+        } else {
+            format!(
+                "Deterministic provider fixture completed with an unexpected read-back payload for {DETERMINISTIC_TOOL_FIXTURE_REPORT_PATH}; inspect the read_file tool result."
+            )
+        };
+        return Some(deterministic_text_output(
+            final_text,
+            prompt_tokens,
+            request.model_override.clone(),
+            "deterministic:tool-fixture-final",
+        ));
+    }
+
+    if provider_request_has_tool_result(request, DETERMINISTIC_TOOL_FIXTURE_WRITE_CALL_ID) {
+        if !provider_request_tool_catalog_contains(request, "palyra.fs.read_file") {
+            return Some(deterministic_text_output(
+                format!(
+                    "Deterministic provider fixture wrote {DETERMINISTIC_TOOL_FIXTURE_REPORT_PATH}, but palyra.fs.read_file is not visible in the tool catalog for read-back verification."
+                ),
+                prompt_tokens,
+                request.model_override.clone(),
+                "deterministic:tool-fixture-read-unavailable",
+            ));
+        }
+        return Some(deterministic_tool_call_output(
+            DETERMINISTIC_TOOL_FIXTURE_READ_CALL_ID,
+            "palyra.fs.read_file",
+            json!({
+                "path": DETERMINISTIC_TOOL_FIXTURE_REPORT_PATH,
+                "max_bytes": 4096,
+            }),
+            prompt_tokens,
+            request.model_override.clone(),
+            "deterministic:tool-fixture-read",
+        ));
+    }
+
+    if !provider_request_tool_catalog_contains(request, "palyra.fs.apply_patch") {
+        return Some(deterministic_text_output(
+            format!(
+                "Deterministic provider tool-call fixture requested, but palyra.fs.apply_patch is not visible in the tool catalog; enable the workspace patch tool to run fixture {DETERMINISTIC_TOOL_FIXTURE_ID}."
+            ),
+            prompt_tokens,
+            request.model_override.clone(),
+            "deterministic:tool-fixture-write-unavailable",
+        ));
+    }
+
+    Some(deterministic_tool_call_output(
+        DETERMINISTIC_TOOL_FIXTURE_WRITE_CALL_ID,
+        "palyra.fs.apply_patch",
+        json!({
+            "patch": deterministic_tool_fixture_patch(),
+        }),
+        prompt_tokens,
+        request.model_override.clone(),
+        "deterministic:tool-fixture-write",
+    ))
+}
+
+fn deterministic_tool_fixture_requested(request: &ProviderRequest) -> bool {
+    let input = request
+        .user_visible_input_text
+        .as_deref()
+        .unwrap_or(request.input_text.as_str())
+        .to_ascii_lowercase();
+    input.contains(DETERMINISTIC_TOOL_FIXTURE_REPORT_PATH)
+        || input.contains("deterministic-provider.md")
+}
+
+fn deterministic_tool_fixture_patch() -> String {
+    let mut patch =
+        format!("*** Begin Patch\n*** Add File: {DETERMINISTIC_TOOL_FIXTURE_REPORT_PATH}\n");
+    for line in DETERMINISTIC_TOOL_FIXTURE_REPORT.lines() {
+        if line.is_empty() {
+            patch.push_str("+\n");
+        } else {
+            patch.push('+');
+            patch.push_str(line);
+            patch.push('\n');
+        }
+    }
+    patch.push_str("*** End Patch");
+    patch
+}
+
+fn provider_request_tool_catalog_contains(request: &ProviderRequest, tool_name: &str) -> bool {
+    request
+        .tool_catalog_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.get("tools"))
+        .and_then(Value::as_array)
+        .is_some_and(|tools| {
+            tools.iter().any(|tool| tool.get("name").and_then(Value::as_str) == Some(tool_name))
+        })
+}
+
+fn provider_request_has_tool_result(request: &ProviderRequest, tool_call_id: &str) -> bool {
+    provider_request_tool_result_text(request, tool_call_id).is_some()
+}
+
+fn provider_request_tool_result_text<'a>(
+    request: &'a ProviderRequest,
+    tool_call_id: &str,
+) -> Option<String> {
+    request
+        .messages
+        .iter()
+        .find(|message| {
+            message.role == ProviderMessageRole::Tool
+                && message.tool_call_id.as_deref() == Some(tool_call_id)
+        })
+        .map(ProviderMessage::text_content)
+}
+
+fn deterministic_tool_call_output(
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: Value,
+    prompt_tokens: u64,
+    provider_model_id: Option<String>,
+    provider_trace_ref: &str,
+) -> ProviderTurnOutput {
+    let completion_tokens = serde_json::to_string(&input_json)
+        .ok()
+        .map(|value| estimate_token_count(value.as_str()).max(1))
+        .unwrap_or(1);
+    ProviderTurnOutput {
+        full_text: String::new(),
+        content_parts: vec![ProviderOutputContentPart::ToolCall {
+            proposal_id: proposal_id.to_owned(),
+            tool_name: tool_name.to_owned(),
+            input_json,
+        }],
+        finish_reason: ProviderFinishReason::ToolCalls,
+        usage: ProviderUsage::new(prompt_tokens, completion_tokens, "estimated"),
+        raw_provider_refs: deterministic_raw_provider_refs(provider_model_id, provider_trace_ref),
+        redaction_state: contract::ProviderRedactionState::default(),
+    }
+}
+
+fn deterministic_text_output(
+    text: String,
+    prompt_tokens: u64,
+    provider_model_id: Option<String>,
+    provider_trace_ref: &str,
+) -> ProviderTurnOutput {
+    ProviderTurnOutput::text(
+        text.clone(),
+        ProviderFinishReason::Stop,
+        ProviderUsage::new(prompt_tokens, estimate_token_count(text.as_str()).max(1), "estimated"),
+        deterministic_raw_provider_refs(provider_model_id, provider_trace_ref),
+    )
+}
+
+fn deterministic_raw_provider_refs(
+    provider_model_id: Option<String>,
+    provider_trace_ref: &str,
+) -> ProviderRawProviderRefs {
+    ProviderRawProviderRefs {
+        provider_response_id: None,
+        provider_model_id,
+        system_fingerprint: None,
+        provider_trace_ref: Some(provider_trace_ref.to_owned()),
+        stream_spill_ref: None,
+    }
+}
+
 impl ModelProvider for DeterministicProvider {
     fn complete<'a>(
         &'a self,
@@ -3091,34 +3285,33 @@ impl ModelProvider for DeterministicProvider {
                 return Err(error);
             }
 
-            let completion_source = if request.json_mode {
-                r#"{"ack":"ok"}"#.to_owned()
-            } else if let Some(user_visible_input_text) =
-                request.user_visible_input_text.as_ref().filter(|value| !value.trim().is_empty())
-            {
-                user_visible_input_text.clone()
-            } else {
-                request.input_text.clone()
-            };
-
             let prompt_tokens = estimate_token_count(request.input_text.as_str());
-            let completion_tokens = estimate_token_count(completion_source.as_str()).max(1);
-            let output = ProviderTurnOutput::text(
-                if completion_source.trim().is_empty() {
-                    "ack".to_owned()
-                } else {
-                    completion_source
-                },
-                ProviderFinishReason::Stop,
-                ProviderUsage::new(prompt_tokens, completion_tokens, "estimated"),
-                ProviderRawProviderRefs {
-                    provider_response_id: None,
-                    provider_model_id: request.model_override.clone(),
-                    system_fingerprint: None,
-                    provider_trace_ref: Some("deterministic".to_owned()),
-                    stream_spill_ref: None,
-                },
-            );
+            let output =
+                deterministic_tool_fixture_output(&request, prompt_tokens).unwrap_or_else(|| {
+                    let completion_source = if request.json_mode {
+                        r#"{"ack":"ok"}"#.to_owned()
+                    } else if let Some(user_visible_input_text) = request
+                        .user_visible_input_text
+                        .as_ref()
+                        .filter(|value| !value.trim().is_empty())
+                    {
+                        user_visible_input_text.clone()
+                    } else {
+                        request.input_text.clone()
+                    };
+
+                    deterministic_text_output(
+                        if completion_source.trim().is_empty() {
+                            "ack".to_owned()
+                        } else {
+                            completion_source
+                        },
+                        prompt_tokens,
+                        request.model_override.clone(),
+                        "deterministic",
+                    )
+                });
+            let completion_tokens = output.usage.completion_tokens;
             let events = provider_events_from_output(&output);
             let actual_model_id =
                 request.model_override.clone().unwrap_or_else(|| "deterministic".to_owned());
@@ -3182,7 +3375,7 @@ impl ModelProvider for DeterministicProvider {
             model_id: Some("deterministic".to_owned()),
             capabilities: ProviderCapabilitiesSnapshot {
                 streaming_tokens: true,
-                tool_calls: false,
+                tool_calls: true,
                 json_mode: true,
                 vision: false,
                 audio_transcribe: false,
@@ -3192,9 +3385,13 @@ impl ModelProvider for DeterministicProvider {
                 latency_tier: ProviderLatencyTier::Low.as_str().to_owned(),
                 recommended_use_cases: vec![
                     "offline testing".to_owned(),
+                    "scripted tool-call regression".to_owned(),
                     "deterministic smoke flows".to_owned(),
                 ],
-                known_limitations: vec!["vision unsupported".to_owned()],
+                known_limitations: vec![
+                    "scripted fixture responses only".to_owned(),
+                    "vision unsupported".to_owned(),
+                ],
                 operator_override: false,
                 metadata_source: ProviderMetadataSource::Static.as_str().to_owned(),
             },
@@ -5317,12 +5514,12 @@ mod tests {
         EmbeddingsRequest, ModelProviderAuthProviderKind, ModelProviderConfig, ModelProviderKind,
         ModelProviderRegistryConfig, OpenAiCompatibleChatAdapter, ProviderChatAdapter,
         ProviderError, ProviderEvent, ProviderFailureAction, ProviderFailureClass,
-        ProviderImageInput, ProviderMessage, ProviderMessageContentPart, ProviderMessageRole,
-        ProviderMessageToolCall, ProviderMetadataSource, ProviderModelEntryConfig,
-        ProviderModelRole, ProviderOutputContentPart, ProviderRawProviderRefs,
-        ProviderRegistryEntryConfig, ProviderRequest, ProviderRetryability,
-        ProviderStreamAccumulator, ProviderStreamEvent, ProviderTurnOutput, ProviderUsage,
-        OPENAI_RETRYABLE_STATUS_CODES,
+        ProviderFinishReason, ProviderImageInput, ProviderMessage, ProviderMessageContentPart,
+        ProviderMessageRole, ProviderMessageToolCall, ProviderMetadataSource,
+        ProviderModelEntryConfig, ProviderModelRole, ProviderOutputContentPart,
+        ProviderRawProviderRefs, ProviderRegistryEntryConfig, ProviderRequest,
+        ProviderRetryability, ProviderStreamAccumulator, ProviderStreamEvent, ProviderTurnOutput,
+        ProviderUsage, OPENAI_RETRYABLE_STATUS_CODES,
     };
 
     #[test]
@@ -5851,6 +6048,100 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn deterministic_provider_replays_scripted_tool_call_fixture() {
+        let provider = build_model_provider(&ModelProviderConfig::default())
+            .expect("provider should build from defaults");
+        let mut request = ProviderRequest::from_input_text(
+            format!(
+                "Use the deterministic test response, create `{}` and verify the fixture.",
+                super::DETERMINISTIC_TOOL_FIXTURE_REPORT_PATH
+            ),
+            false,
+            Vec::new(),
+            None,
+        );
+        request.tool_catalog_snapshot = Some(serde_json::json!({
+            "tools": [
+                {"name": "palyra.fs.apply_patch"},
+                {"name": "palyra.fs.read_file"}
+            ]
+        }));
+
+        let write_response =
+            provider.complete(request.clone()).await.expect("write turn should succeed");
+        let write_proposal = write_response
+            .events
+            .iter()
+            .find_map(|event| match event {
+                ProviderEvent::ToolProposal { proposal_id, tool_name, input_json } => {
+                    Some((proposal_id, tool_name, input_json))
+                }
+                ProviderEvent::ModelToken { .. } => None,
+            })
+            .expect("write turn should propose a tool");
+        let write_input: serde_json::Value =
+            serde_json::from_slice(write_proposal.2).expect("write input should be json");
+        assert_eq!(write_proposal.0, super::DETERMINISTIC_TOOL_FIXTURE_WRITE_CALL_ID);
+        assert_eq!(write_proposal.1, "palyra.fs.apply_patch");
+        assert!(write_input["patch"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(super::DETERMINISTIC_TOOL_FIXTURE_REPORT_PATH));
+        assert!(write_input["patch"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(super::DETERMINISTIC_TOOL_FIXTURE_ID));
+
+        request.messages.push(ProviderMessage::assistant_from_output(&write_response.output));
+        request.messages.push(ProviderMessage::tool_result(
+            super::DETERMINISTIC_TOOL_FIXTURE_WRITE_CALL_ID,
+            r#"{"success":true,"files_touched":[{"path":"reports/deterministic-provider.md","operation":"create"}]}"#,
+        ));
+
+        let read_response =
+            provider.complete(request.clone()).await.expect("read turn should succeed");
+        let read_proposal = read_response
+            .events
+            .iter()
+            .find_map(|event| match event {
+                ProviderEvent::ToolProposal { proposal_id, tool_name, input_json } => {
+                    Some((proposal_id, tool_name, input_json))
+                }
+                ProviderEvent::ModelToken { .. } => None,
+            })
+            .expect("read turn should propose a tool");
+        let read_input: serde_json::Value =
+            serde_json::from_slice(read_proposal.2).expect("read input should be json");
+        assert_eq!(read_proposal.0, super::DETERMINISTIC_TOOL_FIXTURE_READ_CALL_ID);
+        assert_eq!(read_proposal.1, "palyra.fs.read_file");
+        assert_eq!(
+            read_input["path"].as_str(),
+            Some(super::DETERMINISTIC_TOOL_FIXTURE_REPORT_PATH)
+        );
+
+        request.messages.push(ProviderMessage::assistant_from_output(&read_response.output));
+        request.messages.push(ProviderMessage::tool_result(
+            super::DETERMINISTIC_TOOL_FIXTURE_READ_CALL_ID,
+            super::DETERMINISTIC_TOOL_FIXTURE_REPORT,
+        ));
+
+        let final_response = provider.complete(request).await.expect("final turn should succeed");
+
+        assert_eq!(final_response.output.finish_reason, ProviderFinishReason::Stop);
+        assert!(final_response
+            .events
+            .iter()
+            .all(|event| { !matches!(event, ProviderEvent::ToolProposal { .. }) }));
+        assert!(final_response.output.full_text.contains(super::DETERMINISTIC_TOOL_FIXTURE_ID));
+        assert!(final_response
+            .output
+            .raw_provider_refs
+            .provider_trace_ref
+            .as_deref()
+            .is_some_and(|trace_ref| trace_ref.contains("tool-fixture-final")));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn deterministic_provider_status_snapshot_reports_runtime_metrics() {
         let provider = build_model_provider(&ModelProviderConfig::default())
             .expect("provider should build from defaults");
@@ -5881,6 +6172,12 @@ mod tests {
         assert!(matches!(failed, Err(ProviderError::VisionUnsupported { .. })));
 
         let snapshot = provider.status_snapshot();
+        assert!(snapshot.capabilities.tool_calls);
+        assert!(snapshot
+            .capabilities
+            .recommended_use_cases
+            .iter()
+            .any(|use_case| use_case == "scripted tool-call regression"));
         assert_eq!(snapshot.runtime_metrics.request_count, 2);
         assert_eq!(snapshot.runtime_metrics.error_count, 1);
         assert_eq!(snapshot.runtime_metrics.error_rate_bps, 5_000);

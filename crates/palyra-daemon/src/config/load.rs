@@ -2535,7 +2535,7 @@ fn provider_capability_defaults(
         (ModelProviderKind::Deterministic, ProviderModelRole::Chat) => {
             ProviderCapabilitiesSnapshot {
                 streaming_tokens: true,
-                tool_calls: false,
+                tool_calls: true,
                 json_mode: true,
                 vision: false,
                 audio_transcribe: false,
@@ -2545,9 +2545,14 @@ fn provider_capability_defaults(
                 latency_tier: ProviderLatencyTier::Low.as_str().to_owned(),
                 recommended_use_cases: vec![
                     "offline testing".to_owned(),
+                    "scripted tool-call regression".to_owned(),
                     "deterministic smoke flows".to_owned(),
                 ],
-                known_limitations: vec!["no real provider auth".to_owned(), "no vision".to_owned()],
+                known_limitations: vec![
+                    "scripted fixture responses only".to_owned(),
+                    "no real provider auth".to_owned(),
+                    "no vision".to_owned(),
+                ],
                 operator_override: false,
                 metadata_source: ProviderMetadataSource::Static.as_str().to_owned(),
             }

@@ -1130,12 +1130,30 @@ fn build_patch_plan(
                 let output_path = normalize_relative_path_display(&relative);
                 let (target, target_root_index) =
                     resolve_new_path(canonical_roots, &relative, None, path)?;
-                if target.exists() {
-                    return Err(WorkspacePatchError::FileAlreadyExists { path: path.to_owned() });
-                }
                 let after_bytes = render_add_file_bytes(lines.as_slice());
                 ensure_file_size(path, after_bytes.len(), limits.max_file_bytes)?;
                 ensure_planned_file_content(output_path.as_str(), after_bytes.as_slice())?;
+                if target.exists() {
+                    let before_bytes =
+                        read_file_capped(target.as_path(), path, limits.max_file_bytes)?;
+                    if before_bytes != after_bytes {
+                        return Err(WorkspacePatchError::FileAlreadyExists {
+                            path: path.to_owned(),
+                        });
+                    }
+                    touched_paths.insert(target.clone());
+                    file_attestations.push(WorkspacePatchFileAttestation {
+                        path: output_path,
+                        workspace_root_index: target_root_index,
+                        operation: "create_idempotent".to_owned(),
+                        moved_from: None,
+                        before_sha256: Some(sha256_hex(before_bytes.as_slice())),
+                        before_size_bytes: Some(before_bytes.len() as u64),
+                        after_sha256: Some(sha256_hex(after_bytes.as_slice())),
+                        after_size_bytes: Some(after_bytes.len() as u64),
+                    });
+                    continue;
+                }
 
                 touched_paths.insert(target.clone());
                 actions.push(PlannedAction::Write {
@@ -2003,6 +2021,32 @@ mod tests {
             "error should explain zero-byte placeholder rejection: {error}"
         );
         assert!(!workspace.join("index.html").exists(), "rejected patch must not create a file");
+    }
+
+    #[test]
+    fn apply_workspace_patch_treats_identical_add_file_as_idempotent() {
+        let temp = tempdir().expect("tempdir should be created");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        fs::write(workspace.join("report.md"), "# Report\n\nstatus: passed\n")
+            .expect("seed file should exist");
+
+        let patch =
+            "*** Begin Patch\n*** Add File: report.md\n+# Report\n+\n+status: passed\n*** End Patch\n";
+        let outcome = apply_workspace_patch(
+            std::slice::from_ref(&workspace),
+            &default_request(patch, false),
+            &default_limits(),
+        )
+        .expect("identical add-file should be idempotent");
+        let attestation = attestation_by_path(&outcome, "report.md");
+
+        assert_eq!(outcome.files_touched.len(), 1);
+        assert_eq!(attestation.operation, "create_idempotent");
+        assert_eq!(
+            fs::read_to_string(workspace.join("report.md")).expect("report should read"),
+            "# Report\n\nstatus: passed\n"
+        );
     }
 
     #[test]
