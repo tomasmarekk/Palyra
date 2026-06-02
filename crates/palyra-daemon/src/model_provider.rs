@@ -61,6 +61,7 @@ const DEFAULT_PROVIDER_RESPONSE_CACHE_TTL_MS: u64 = 30_000;
 const DEFAULT_PROVIDER_RESPONSE_CACHE_MAX_ENTRIES: usize = 128;
 const DEFAULT_PROVIDER_DISCOVERY_TTL_MS: u64 = 5 * 60 * 1_000;
 const DEFAULT_PROVIDER_HEALTH_TTL_MS: u64 = 60_000;
+const DEFAULT_MODEL_PROVIDER_REQUEST_TIMEOUT_MS: u64 = 180_000;
 const DETERMINISTIC_TOOL_FIXTURE_ID: &str = "deterministic-provider-tool-call-v1";
 const DETERMINISTIC_TOOL_FIXTURE_REPORT_PATH: &str = "reports/deterministic-provider.md";
 const DETERMINISTIC_TOOL_FIXTURE_WRITE_CALL_ID: &str = "deterministic-fixture-write";
@@ -340,7 +341,7 @@ impl Default for ModelProviderConfig {
             auth_profile_id: None,
             auth_profile_provider_kind: None,
             credential_source: None,
-            request_timeout_ms: 60_000,
+            request_timeout_ms: DEFAULT_MODEL_PROVIDER_REQUEST_TIMEOUT_MS,
             max_retries: 2,
             retry_backoff_ms: 150,
             circuit_breaker_failure_threshold: 3,
