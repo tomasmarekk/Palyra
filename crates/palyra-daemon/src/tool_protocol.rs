@@ -188,7 +188,7 @@ pub fn decide_tool_call(
         return ToolDecision {
             allowed: false,
             reason: BUDGET_DENY_REASON.to_owned(),
-            approval_required,
+            approval_required: false,
             policy_enforced: true,
         };
     }
@@ -232,6 +232,8 @@ pub fn decide_tool_call(
             }
         };
     if let PolicyDecision::DenyByDefault { reason } = policy_evaluation.decision {
+        let approval_required =
+            approval_required && reason.contains("explicit user approval required");
         return ToolDecision {
             allowed: false,
             reason: format_policy_reason(
@@ -248,7 +250,7 @@ pub fn decide_tool_call(
         return ToolDecision {
             allowed: false,
             reason: UNSUPPORTED_TOOL_DENY_REASON.to_owned(),
-            approval_required,
+            approval_required: false,
             policy_enforced: true,
         };
     }
@@ -1339,8 +1341,23 @@ mod tests {
         let decision =
             decide_tool_call(&config, &mut budget, &request_context, "palyra.echo", false);
         assert!(!decision.allowed);
+        assert!(!decision.approval_required, "not-allowlisted denials cannot be fixed by approval");
         assert_eq!(budget, 2, "denied decisions must not consume budget");
         assert!(decision.reason.contains("denied by default"));
+
+        let unknown_browser_tool = decide_tool_call(
+            &config,
+            &mut budget,
+            &request_context,
+            "palyra.browser.evaluate",
+            false,
+        );
+        assert!(!unknown_browser_tool.allowed);
+        assert!(
+            !unknown_browser_tool.approval_required,
+            "unknown browser tools should fail without creating an approval prompt"
+        );
+        assert!(unknown_browser_tool.reason.contains("not allowlisted"));
     }
 
     #[test]
@@ -1359,6 +1376,7 @@ mod tests {
         assert_eq!(budget, 0);
         let third = decide_tool_call(&config, &mut budget, &request_context, "palyra.echo", false);
         assert!(!third.allowed, "third call should be denied by budget");
+        assert!(!third.approval_required, "budget exhaustion should not create an approval prompt");
     }
 
     #[test]
@@ -1535,6 +1553,10 @@ mod tests {
         let decision =
             decide_tool_call(&config, &mut budget, &request_context, "custom.noop", true);
         assert!(!decision.allowed, "unsupported runtime tool must be denied");
+        assert!(
+            !decision.approval_required,
+            "approval cannot make an unsupported runtime tool executable"
+        );
         assert_eq!(budget, 2, "denied decisions must not consume budget");
         assert!(decision.reason.contains("unsupported by runtime executor"));
     }
