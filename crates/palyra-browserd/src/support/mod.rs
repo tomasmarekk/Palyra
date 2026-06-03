@@ -35,6 +35,16 @@ pub(crate) fn append_network_log_entries(
     );
 }
 
+pub(crate) fn replace_network_log_entries_for_navigation(
+    tab: &mut BrowserTabRecord,
+    entries: &[NetworkLogEntryInternal],
+    max_entries: usize,
+    max_bytes: u64,
+) {
+    tab.network_log.clear();
+    append_network_log_entries(tab, entries, max_entries, max_bytes);
+}
+
 pub(crate) fn clamp_network_log_entries<I>(
     entries: I,
     max_entries: usize,

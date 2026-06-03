@@ -3467,7 +3467,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                         tab.scroll_y = 0;
                         tab.typed_inputs.clear();
                     }
-                    append_network_log_entries(
+                    replace_network_log_entries_for_navigation(
                         tab,
                         network_log_entries.as_slice(),
                         max_network_log_entries,

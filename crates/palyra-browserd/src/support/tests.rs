@@ -4035,6 +4035,43 @@ fn replace_storage_entries_for_origin_replaces_and_removes_deleted_keys() {
 }
 
 #[test]
+fn replace_network_log_entries_for_navigation_removes_stale_entries() {
+    let mut tab = BrowserTabRecord::new("tab-1".to_owned());
+    tab.network_log.push_back(NetworkLogEntryInternal {
+        request_url: "https://app.example.com/api/alerts?include=all".to_owned(),
+        status_code: 200,
+        timing_bucket: "gt_2s".to_owned(),
+        latency_ms: 21_000,
+        captured_at_unix_ms: 1_000,
+        headers: Vec::new(),
+    });
+
+    super::replace_network_log_entries_for_navigation(
+        &mut tab,
+        &[NetworkLogEntryInternal {
+            request_url: "https://app.example.com/api/alerts?include=summary".to_owned(),
+            status_code: 200,
+            timing_bucket: "lt_2s".to_owned(),
+            latency_ms: 1_450,
+            captured_at_unix_ms: 2_000,
+            headers: vec![NetworkLogHeaderInternal {
+                name: "content-type".to_owned(),
+                value: "application/json".to_owned(),
+            }],
+        }],
+        16,
+        16 * 1024,
+    );
+
+    assert_eq!(tab.network_log.len(), 1);
+    let entry = tab.network_log.front().expect("replacement entry should remain");
+    assert_eq!(
+        entry.request_url, "https://app.example.com/api/alerts?include=summary",
+        "navigation network log should be scoped to the latest navigation boundary"
+    );
+}
+
+#[test]
 fn apply_snapshot_clamps_cookie_and_storage_state() {
     let mut session = test_session_record();
     let mut cookie_jar = HashMap::new();
