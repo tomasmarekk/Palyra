@@ -259,6 +259,7 @@ pub(crate) async fn execute_http_fetch_tool(
     let allowed_content_types = match payload.get("allowed_content_types") {
         Some(Value::Array(values)) => {
             let mut parsed = Vec::new();
+            let mut rejected = Vec::new();
             for value in values {
                 let Some(content_type) = value.as_str() else {
                     return http_fetch_tool_execution_outcome(
@@ -281,22 +282,28 @@ pub(crate) async fn execute_http_fetch_tool(
                     .iter()
                     .any(|allowed| allowed == &normalized)
                 {
-                    return http_fetch_tool_execution_outcome(
-                        proposal_id,
-                        input_json,
-                        false,
-                        b"{}".to_vec(),
-                        format!(
-                            "palyra.http.fetch content type '{normalized}' is not allowed by policy"
-                        ),
-                    );
+                    rejected.push(normalized);
+                    continue;
                 }
                 if !parsed.iter().any(|existing| existing == &normalized) {
                     parsed.push(normalized);
                 }
             }
             if parsed.is_empty() {
-                runtime_state.config.http_fetch.allowed_content_types.clone()
+                if rejected.is_empty() {
+                    runtime_state.config.http_fetch.allowed_content_types.clone()
+                } else {
+                    return http_fetch_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        format!(
+                            "palyra.http.fetch no requested allowed_content_types are permitted by policy: {}",
+                            rejected.join(", ")
+                        ),
+                    );
+                }
             } else {
                 parsed
             }

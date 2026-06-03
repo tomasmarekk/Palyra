@@ -255,15 +255,23 @@ fn spawn_redirect_http_server(location: &str) -> (String, thread::JoinHandle<()>
 }
 
 fn spawn_static_http_server(body: &str) -> (String, thread::JoinHandle<()>) {
+    spawn_static_http_server_with_content_type(body, "text/plain")
+}
+
+fn spawn_static_http_server_with_content_type(
+    body: &str,
+    content_type: &str,
+) -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("static test listener should bind");
     let address = listener.local_addr().expect("static test listener address should resolve");
     let response_body = body.to_owned();
+    let response_content_type = content_type.to_owned();
     let handle = thread::spawn(move || {
         let (mut stream, _) =
             listener.accept().expect("static test listener should accept request");
         read_http_request(&mut stream);
         let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\nContent-Type: {response_content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 response_body.len(),
                 response_body
             );
@@ -1031,6 +1039,35 @@ async fn http_fetch_parity_fixture_exposes_deterministic_body_text() {
         "fixture body should include sensitive query token fixture payload"
     );
     handle.join().expect("static fixture server should complete after one request");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn http_fetch_ignores_disallowed_requested_content_type_when_json_is_allowed() {
+    let state = build_test_runtime_state_with_http_fetch_private_targets(false, true);
+    let (url, handle) =
+        spawn_static_http_server_with_content_type(r#"{"ready":true}"#, "application/json");
+    let input = serde_json::to_vec(&json!({
+        "url": url,
+        "allowed_content_types": ["application/json", "application/octet-stream"],
+        "max_response_bytes": 4096
+    }))
+    .expect("input should serialize");
+
+    let outcome =
+        execute_http_fetch_tool(&state, "proposal-http-fetch-json-content-type", input.as_slice())
+            .await;
+
+    assert!(
+        outcome.success,
+        "allowed JSON response should not fail because the request also listed a globally disallowed content type: {}",
+        outcome.error
+    );
+    let output: Value =
+        serde_json::from_slice(outcome.output_json.as_slice()).expect("output should parse");
+    assert_eq!(output["status_code"], 200);
+    assert_eq!(output["content_type"], "application/json");
+    assert_eq!(output["body_text"], r#"{"ready":true}"#);
+    handle.join().expect("static JSON server should complete after one request");
 }
 
 #[tokio::test(flavor = "multi_thread")]
