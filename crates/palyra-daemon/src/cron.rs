@@ -1697,7 +1697,7 @@ fn budgeted_cron_run_count(runs: &[CronRunRecord]) -> u32 {
 }
 
 fn is_budgeted_cron_run(run: &CronRunRecord) -> bool {
-    !run.status.is_active() && run.error_kind.as_deref() != Some(CRON_MAX_RUNS_EXHAUSTED_ERROR_KIND)
+    matches!(run.status, CronRunStatus::Succeeded | CronRunStatus::Failed | CronRunStatus::Denied)
 }
 
 async fn apply_cron_max_runs_exhaustion(
@@ -3311,13 +3311,15 @@ mod tests {
     }
 
     #[test]
-    fn budgeted_cron_run_count_includes_terminal_scheduler_attempts() {
+    fn budgeted_cron_run_count_excludes_skipped_scheduler_attempts() {
         let mut succeeded = sample_cron_run(CronRunStatus::Succeeded, 10);
         succeeded.orchestrator_run_id = Some("orch-1".to_owned());
         let mut denied = sample_cron_run(CronRunStatus::Denied, 20);
         denied.orchestrator_run_id = Some("orch-2".to_owned());
         let active = sample_cron_run(CronRunStatus::Running, 30);
         let skipped_without_orchestrator = sample_cron_run(CronRunStatus::Skipped, 40);
+        let mut skipped_with_orchestrator = sample_cron_run(CronRunStatus::Skipped, 42);
+        skipped_with_orchestrator.orchestrator_run_id = Some("orch-skipped".to_owned());
         let failed_without_orchestrator = sample_cron_run(CronRunStatus::Failed, 45);
         let mut cap_skip = sample_cron_run(CronRunStatus::Skipped, 50);
         cap_skip.orchestrator_run_id = Some("orch-3".to_owned());
@@ -3328,11 +3330,12 @@ mod tests {
             denied,
             active,
             skipped_without_orchestrator,
+            skipped_with_orchestrator,
             failed_without_orchestrator,
             cap_skip,
         ];
 
-        assert_eq!(budgeted_cron_run_count(&runs), 4);
+        assert_eq!(budgeted_cron_run_count(&runs), 3);
     }
 
     #[test]
