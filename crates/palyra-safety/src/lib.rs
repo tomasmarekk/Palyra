@@ -1229,13 +1229,12 @@ fn sanitize_external_markers(input: &str) -> String {
 fn redact_sensitive_material(input: &str) -> String {
     let mut output = String::new();
     let mut in_private_key_block = false;
-    for line in input.lines() {
+    for segment in input.split_inclusive('\n') {
+        let (line, line_ending) = split_line_ending(segment);
         let lowered = line.to_ascii_lowercase();
         if lowered.contains("-----begin ") && lowered.contains("private key-----") {
-            if !output.is_empty() {
-                output.push('\n');
-            }
             output.push_str(REDACTED_SECRET);
+            output.push_str(line_ending);
             in_private_key_block = true;
             continue;
         }
@@ -1258,12 +1257,21 @@ fn redact_sensitive_material(input: &str) -> String {
         });
         redacted_line = redact_bearer_token(redacted_line);
         redacted_line = redact_secret_like_markers(redacted_line.as_str());
-        if !output.is_empty() {
-            output.push('\n');
-        }
         output.push_str(redacted_line.as_str());
+        output.push_str(line_ending);
     }
     output
+}
+
+fn split_line_ending(segment: &str) -> (&str, &str) {
+    let Some(line_without_lf) = segment.strip_suffix('\n') else {
+        return (segment, "");
+    };
+    if let Some(line_without_crlf) = line_without_lf.strip_suffix('\r') {
+        (line_without_crlf, "\r\n")
+    } else {
+        (line_without_lf, "\n")
+    }
 }
 
 fn contains_secret_like_marker(input: &str) -> bool {
@@ -1611,6 +1619,20 @@ mod tests {
         assert!(outcome.redacted_text.contains("[REDACTED_SECRET]"));
         assert!(!outcome.redacted_text.contains("sk-test-secret-token-value"));
         assert_eq!(outcome.scan.recommended_action, SafetyAction::Redact);
+    }
+
+    #[test]
+    fn unchanged_export_redaction_preserves_line_endings() {
+        let source = "default_model = \"MiniMax-M3\"\r\nmode = \"test\"\n";
+        let outcome = redact_text_for_export(
+            source,
+            SafetySourceKind::Workspace,
+            SafetyContentKind::WorkspaceDocument,
+            TrustLabel::TrustedLocal,
+        );
+
+        assert!(!outcome.redacted);
+        assert_eq!(outcome.redacted_text, source);
     }
 
     #[test]
