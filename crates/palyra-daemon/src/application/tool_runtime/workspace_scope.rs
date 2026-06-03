@@ -106,11 +106,11 @@ fn launch_path_env_from_context(context: RunLaunchCliContext) -> BTreeMap<String
 
 fn launch_workspace_roots_from_context(context: RunLaunchCliContext) -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    for raw_root in context.workspace_roots.unwrap_or_default() {
-        push_launch_workspace_root(&mut roots, raw_root.as_str());
-    }
     if let Some(raw_cwd) = context.launch_cwd {
         push_launch_workspace_root(&mut roots, raw_cwd.as_str());
+    }
+    for raw_root in context.workspace_roots.unwrap_or_default() {
+        push_launch_workspace_root(&mut roots, raw_root.as_str());
     }
     roots
 }
@@ -522,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_workspace_roots_precede_launch_cwd() {
+    fn launch_cwd_precedes_prompt_workspace_roots() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let explicit_root = tempdir.path().join("explicit");
         let launch_cwd = tempdir.path().join("cwd");
@@ -546,8 +546,8 @@ mod tests {
         let roots = merge_launch_workspace_roots(std::slice::from_ref(&default_root), launch_roots);
 
         assert_eq!(roots.len(), 3);
-        assert_eq!(roots.first(), Some(&explicit_root));
-        assert_eq!(roots.get(1), Some(&launch_cwd));
+        assert_eq!(roots.first(), Some(&launch_cwd));
+        assert_eq!(roots.get(1), Some(&explicit_root));
         assert_eq!(roots.get(2), Some(&default_root));
     }
 
