@@ -7868,7 +7868,6 @@ impl JournalStore {
         let now = current_unix_ms()?;
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let Some(stored) = load_tool_result_artifact(&guard, request.artifact_id.as_str())? else {
-            record_tool_result_artifact_read(&guard, request, 0, true, "not_found", now)?;
             return Err(JournalError::ToolResultArtifactNotFound {
                 artifact_id: request.artifact_id.clone(),
             });
@@ -21104,6 +21103,22 @@ mod tests {
                 parameter_delta_json: None,
             })
             .expect("run should start");
+
+        let missing_error = store
+            .read_tool_result_artifact(&ToolResultArtifactReadRequest {
+                artifact_id: "01ARZ3NDEKTSV4RRFFQ69G5P10".to_owned(),
+                session_id: session_id.to_owned(),
+                run_id: run_id.to_owned(),
+                principal: "user:ops".to_owned(),
+                device_id: "device:local".to_owned(),
+                channel: Some("cli".to_owned()),
+                expected_digest_sha256: None,
+                offset_bytes: 0,
+                max_bytes: 9,
+                text_preview: true,
+            })
+            .expect_err("missing artifact IDs should return a domain not-found error");
+        assert!(matches!(missing_error, JournalError::ToolResultArtifactNotFound { .. }));
 
         let artifact = store
             .create_tool_result_artifact(&ToolResultArtifactCreateRequest {
