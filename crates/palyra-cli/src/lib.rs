@@ -4305,6 +4305,7 @@ where
     let mut request_stream_closed = false;
     let mut failed_message = None::<String>;
     let mut completed = false;
+    let mut cancelled = false;
     let mut approval_mode = resolved.request.approval_mode;
     while let Some(event) = stream.next_event().await? {
         let reached_terminal_status = matches!(
@@ -4314,7 +4315,12 @@ where
         );
         if let Some(common_v1::run_stream_event::Body::Status(status)) = event.body.as_ref() {
             if status.kind == common_v1::stream_status::StatusKind::Failed as i32 {
-                failed_message = Some(sanitize_agent_failure_message(status.message.as_str()));
+                let message = sanitize_agent_failure_message(status.message.as_str());
+                if is_agent_cancellation_message(message.as_str()) {
+                    cancelled = true;
+                } else {
+                    failed_message = Some(message);
+                }
             } else if status.kind == common_v1::stream_status::StatusKind::Done as i32 {
                 completed = true;
             }
@@ -4349,7 +4355,7 @@ where
             break;
         }
     }
-    Ok(AgentStreamOutcome { completed, failed_message })
+    Ok(AgentStreamOutcome { completed, cancelled, failed_message })
 }
 
 fn run_acp_shim_from_stdin(
@@ -5272,6 +5278,13 @@ fn sanitize_agent_failure_message(message: &str) -> String {
     }
 }
 
+fn is_agent_cancellation_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("cancelled by request")
+        || lower.contains("canceled by request")
+        || lower.contains("run cancellation requested")
+}
+
 fn quoted_text_field(value: &str) -> String {
     let escaped = value.replace('"', "'").replace(['\r', '\n'], " ");
     format!("\"{escaped}\"")
@@ -5765,6 +5778,7 @@ mod agent_stream_output_tests {
     fn failed_stream_outcome_is_command_error() {
         let outcome = AgentStreamOutcome {
             completed: false,
+            cancelled: false,
             failed_message: Some(
                 "model_provider_missing_auth: provider has no credential".to_owned(),
             ),
@@ -5779,11 +5793,20 @@ mod agent_stream_output_tests {
 
     #[test]
     fn unterminated_stream_outcome_is_command_error() {
-        let outcome = AgentStreamOutcome { completed: false, failed_message: None };
+        let outcome =
+            AgentStreamOutcome { completed: false, cancelled: false, failed_message: None };
 
         let error =
             outcome.ensure_success().expect_err("unterminated run stream must fail the command");
         assert!(error.to_string().contains("terminal status"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn cancelled_stream_outcome_is_controlled_success() {
+        let outcome =
+            AgentStreamOutcome { completed: false, cancelled: true, failed_message: None };
+
+        outcome.ensure_success().expect("requested cancellation should not fail the command");
     }
 
     #[test]
@@ -6562,6 +6585,7 @@ struct ResolvedAgentRunInput {
 
 struct AgentStreamOutcome {
     completed: bool,
+    cancelled: bool,
     failed_message: Option<String>,
 }
 
@@ -6571,6 +6595,9 @@ impl AgentStreamOutcome {
     }
 
     fn ensure_success(&self) -> Result<()> {
+        if self.cancelled {
+            return Ok(());
+        }
         if let Some(message) = self.failed_message.as_ref() {
             anyhow::bail!("agent run failed: {message}");
         }

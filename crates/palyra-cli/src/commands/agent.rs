@@ -580,6 +580,7 @@ async fn execute_interactive_agent_stream(
     let mut text_emitter = AgentTextEmitter::default();
     let mut failed_message = None::<String>;
     let mut completed = false;
+    let mut cancelled = false;
     let mut saw_terminal_status = false;
     let mut approval_mode = AgentApprovalMode::Prompt;
     let mut abort_requested = false;
@@ -678,7 +679,12 @@ async fn execute_interactive_agent_stream(
                 );
                 if let Some(common_v1::run_stream_event::Body::Status(status)) = event.body.as_ref() {
                     if status.kind == common_v1::stream_status::StatusKind::Failed as i32 {
-                        failed_message = Some(sanitize_agent_failure_message(status.message.as_str()));
+                        let message = sanitize_agent_failure_message(status.message.as_str());
+                        if is_agent_cancellation_message(message.as_str()) {
+                            cancelled = true;
+                        } else {
+                            failed_message = Some(message);
+                        }
                     } else if status.kind == common_v1::stream_status::StatusKind::Done as i32 {
                         completed = true;
                     }
@@ -717,7 +723,7 @@ async fn execute_interactive_agent_stream(
     if !ndjson {
         text_emitter.finish()?;
     }
-    let outcome = AgentStreamOutcome { completed, failed_message };
+    let outcome = AgentStreamOutcome { completed, cancelled, failed_message };
     if abort_requested {
         return Ok(InteractiveAgentStreamOutcome { stream: outcome, exit_requested });
     }
