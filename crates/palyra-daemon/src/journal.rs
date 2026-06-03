@@ -12294,8 +12294,9 @@ impl JournalStore {
 
     pub fn start_cron_run(&self, request: &CronRunStartRequest) -> Result<(), JournalError> {
         let now = current_unix_ms()?;
-        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
-        match guard.execute(
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction()?;
+        match transaction.execute(
             r#"
                 INSERT INTO cron_runs (
                     run_ulid,
@@ -12344,6 +12345,20 @@ impl JournalStore {
             }
             Err(error) => return Err(error.into()),
         }
+        let updated_job = transaction.execute(
+            r#"
+                UPDATE cron_jobs
+                SET
+                    last_run_at_unix_ms = ?2,
+                    updated_at_unix_ms = ?2
+                WHERE job_ulid = ?1
+            "#,
+            params![request.job_id, now],
+        )?;
+        if updated_job == 0 {
+            return Err(JournalError::CronJobNotFound { job_id: request.job_id.clone() });
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -23230,6 +23245,12 @@ mod tests {
                 error_message_redacted: None,
             })
             .expect("cron run start should persist");
+        let started_job = store
+            .cron_job(job.job_id.as_str())
+            .expect("cron job lookup should succeed")
+            .expect("cron job should exist after run start");
+        let started_last_run_at =
+            started_job.last_run_at_unix_ms.expect("cron run start should update job last_run_at");
 
         let active = store
             .active_cron_run_for_job(job.job_id.as_str())
@@ -23251,6 +23272,19 @@ mod tests {
                 session_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned()),
             })
             .expect("cron run finalize should persist");
+        store
+            .set_cron_job_next_run(job.job_id.as_str(), Some(1_730_000_180_000), None)
+            .expect("next run update without last-run timestamp should persist");
+        let next_only_job = store
+            .cron_job(job.job_id.as_str())
+            .expect("cron job lookup should succeed")
+            .expect("cron job should exist after next-run update");
+        assert_eq!(
+            next_only_job.last_run_at_unix_ms,
+            Some(started_last_run_at),
+            "schedule advancement alone must not synthesize a last-run timestamp"
+        );
+
         store
             .set_cron_job_next_run(
                 job.job_id.as_str(),

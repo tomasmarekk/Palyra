@@ -1419,9 +1419,7 @@ async fn process_due_jobs(
         let reference_unix_ms = job.next_run_at_unix_ms.unwrap_or(now_unix_ms);
         let recovery_plan = compute_misfire_recovery_plan(&job, reference_unix_ms, now_unix_ms)?;
         let next_run_at_unix_ms = recovery_plan.next_run_at_unix_ms;
-        state
-            .set_cron_job_next_run(job.job_id.clone(), next_run_at_unix_ms, Some(reference_unix_ms))
-            .await?;
+        state.set_cron_job_next_run(job.job_id.clone(), next_run_at_unix_ms, None).await?;
         if should_disable_exhausted_scheduled_one_shot(&job, next_run_at_unix_ms) {
             disable_exhausted_scheduled_one_shot(Arc::clone(&state), &job).await?;
         }
