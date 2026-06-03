@@ -34,6 +34,24 @@ fn run_cli(workdir: &TempDir, args: &[&str], envs: &[(&str, &str)]) -> Result<Ou
     run_cli_with_stdin(workdir, args, envs, None)
 }
 
+fn unused_loopback_ports(count: usize) -> Result<Vec<u16>> {
+    let mut listeners = Vec::with_capacity(count);
+    for _ in 0..count {
+        listeners.push(
+            TcpListener::bind("127.0.0.1:0").context("failed to reserve loopback test port")?,
+        );
+    }
+    listeners
+        .iter()
+        .map(|listener| {
+            listener
+                .local_addr()
+                .map(|addr| addr.port())
+                .context("failed to read reserved loopback test port")
+        })
+        .collect()
+}
+
 fn run_cli_without_explicit_vault_dir(
     workdir: &TempDir,
     args: &[&str],
@@ -137,6 +155,14 @@ fn setup_wizard_quickstart_emits_json_summary() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let config_path = workdir.path().join("config").join("palyra.toml");
     let config_path_string = config_path.to_string_lossy().into_owned();
+    let ports = unused_loopback_ports(3)?;
+    let daemon_port = ports[0];
+    let grpc_port = ports[1];
+    let quic_port = ports[2];
+    let daemon_port_arg = daemon_port.to_string();
+    let grpc_port_arg = grpc_port.to_string();
+    let quic_port_arg = quic_port.to_string();
+    let dashboard_url = format!("http://127.0.0.1:{daemon_port}/");
     let output = run_cli(
         &workdir,
         &[
@@ -156,11 +182,11 @@ fn setup_wizard_quickstart_emits_json_summary() -> Result<()> {
             "--api-key-env",
             "OPENAI_API_KEY",
             "--daemon-port",
-            "7152",
+            &daemon_port_arg,
             "--grpc-port",
-            "7452",
+            &grpc_port_arg,
             "--quic-port",
-            "7454",
+            &quic_port_arg,
             "--skip-channels",
             "--skip-skills",
             "--json",
@@ -180,10 +206,7 @@ fn setup_wizard_quickstart_emits_json_summary() -> Result<()> {
     );
     assert_eq!(payload.get("recommended_step_id").and_then(Value::as_str), Some("agent_identity"));
     assert_eq!(payload.get("flow").and_then(Value::as_str), Some("quickstart"));
-    assert_eq!(
-        payload.get("dashboard_url").and_then(Value::as_str),
-        Some("http://127.0.0.1:7152/")
-    );
+    assert_eq!(payload.get("dashboard_url").and_then(Value::as_str), Some(dashboard_url.as_str()));
     assert_eq!(
         payload.get("config_path").and_then(Value::as_str),
         Some(config_path_string.as_str())
@@ -219,21 +242,21 @@ fn setup_wizard_quickstart_emits_json_summary() -> Result<()> {
             .get("daemon")
             .and_then(|value| value.get("port"))
             .and_then(toml::Value::as_integer),
-        Some(7152)
+        Some(i64::from(daemon_port))
     );
     assert_eq!(
         config_document
             .get("gateway")
             .and_then(|value| value.get("grpc_port"))
             .and_then(toml::Value::as_integer),
-        Some(7452)
+        Some(i64::from(grpc_port))
     );
     assert_eq!(
         config_document
             .get("gateway")
             .and_then(|value| value.get("quic_port"))
             .and_then(toml::Value::as_integer),
-        Some(7454)
+        Some(i64::from(quic_port))
     );
     Ok(())
 }
