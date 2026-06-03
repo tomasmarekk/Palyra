@@ -227,6 +227,7 @@ pub(crate) fn apply_cookie_updates(session: &mut BrowserSessionRecord, updates: 
     }
 }
 
+#[cfg(test)]
 pub(crate) fn apply_storage_entry_update(
     session: &mut BrowserSessionRecord,
     origin: &str,

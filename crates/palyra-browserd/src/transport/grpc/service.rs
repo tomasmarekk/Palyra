@@ -1694,7 +1694,6 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         if success {
             let mut sessions = self.runtime.sessions.lock().await;
             if let Some(session) = sessions.get_mut(session_id.as_str()) {
-                let mut origin = None;
                 if let Some(tab) = session.active_tab_mut() {
                     let field = tab.typed_inputs.entry(selector.to_owned()).or_default();
                     if payload.clear_existing {
@@ -1702,16 +1701,6 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                     } else {
                         field.push_str(text.as_str());
                     }
-                    origin = tab.last_url.as_deref().and_then(url_origin_key);
-                }
-                if let Some(origin_key) = origin {
-                    apply_storage_entry_update(
-                        session,
-                        origin_key.as_str(),
-                        selector,
-                        text.as_str(),
-                        payload.clear_existing,
-                    );
                 }
             }
         }
@@ -2095,19 +2084,8 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         if success {
             let mut sessions = self.runtime.sessions.lock().await;
             if let Some(session) = sessions.get_mut(session_id.as_str()) {
-                let mut origin = None;
                 if let Some(tab) = session.active_tab_mut() {
                     tab.typed_inputs.insert(selector.clone(), value.clone());
-                    origin = tab.last_url.as_deref().and_then(url_origin_key);
-                }
-                if let Some(origin_key) = origin {
-                    apply_storage_entry_update(
-                        session,
-                        origin_key.as_str(),
-                        selector.as_str(),
-                        value.as_str(),
-                        true,
-                    );
                 }
             }
         }

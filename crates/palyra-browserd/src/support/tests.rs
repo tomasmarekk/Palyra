@@ -2000,6 +2000,20 @@ async fn browser_service_click_type_and_wait_for_on_fixture_page() {
     assert!(typed.success, "type action should succeed");
     assert_eq!(typed.typed_bytes, "agent@example.com".len() as u64);
     assert_eq!(typed.action_log.as_ref().map(|value| value.action_name.as_str()), Some("type"));
+    {
+        let sessions = service.runtime.sessions.lock().await;
+        let session = sessions.get(session_id.as_str()).expect("session should remain active");
+        let active_tab = session.active_tab().expect("active tab should remain available");
+        assert_eq!(
+            active_tab.typed_inputs.get("#email").map(String::as_str),
+            Some("agent@example.com"),
+            "typed control state should remain available as form interaction state"
+        );
+        assert!(
+            session.storage_entries.values().all(|entries| !entries.contains_key("#email")),
+            "typed control selectors must not be reported as page-owned storage entries"
+        );
+    }
 
     let viewport = service
         .set_viewport(Request::new(browser_v1::SetViewportRequest {

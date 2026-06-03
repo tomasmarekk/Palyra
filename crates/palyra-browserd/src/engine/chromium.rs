@@ -614,6 +614,8 @@ struct ChromiumObserveStatePayload {
     #[serde(default)]
     form_controls: Vec<ChromiumObservedFormControl>,
     #[serde(default)]
+    state_elements: Vec<ChromiumObservedStateElement>,
+    #[serde(default)]
     local_storage: ChromiumObservedStorage,
     #[serde(default)]
     session_storage: ChromiumObservedStorage,
@@ -640,6 +642,22 @@ struct ChromiumObservedFormControl {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct ChromiumObservedStateElement {
+    #[serde(default)]
+    tag: String,
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    selector: String,
+    #[serde(default)]
+    hidden: bool,
+    #[serde(default)]
+    visible: bool,
+    #[serde(default)]
+    reason: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct ChromiumObservedStorage {
     #[serde(default)]
     ok: bool,
@@ -656,6 +674,7 @@ fn chromium_observe_state_script() -> String {
         r#"
 (() => {{
   const MAX_FORM_CONTROLS = {max_form_controls};
+  const MAX_STATE_ELEMENTS = {max_state_elements};
   const MAX_FORM_VALUE_CHARS = {max_form_value_chars};
   const MAX_STORAGE_ENTRIES = {max_storage_entries};
   const MAX_STORAGE_KEY_CHARS = 512;
@@ -678,6 +697,17 @@ fn chromium_observe_state_script() -> String {
       return `[name="${{name.replace(/"/g, '\\"')}}"]`;
     }}
     return tag || "control";
+  }};
+  const selectorForStateElement = (element, tag) => {{
+    const id = clampScalar(element && element.id, 128).trim();
+    if (id) {{
+      return `#${{id}}`;
+    }}
+    const testId = clampScalar(element && element.getAttribute && element.getAttribute("data-testid"), 128).trim();
+    if (testId) {{
+      return `[data-testid="${{testId.replace(/"/g, '\\"')}}"]`;
+    }}
+    return tag || "element";
   }};
   const sensitiveHint = (value) => {{
     const text = clampScalar(value, 256).toLowerCase();
@@ -758,6 +788,54 @@ fn chromium_observe_state_script() -> String {
       selected_options: selectedOptions
     }});
   }});
+  const stateElements = [];
+  const seenStateSelectors = new Set();
+  const stateCandidates = Array.prototype.slice.call(
+    document.querySelectorAll("[hidden], [aria-hidden], section[id], dialog[id], form[id], [role='tabpanel'][id], [role='dialog'][id], [data-testid]"),
+    0,
+    MAX_STATE_ELEMENTS * 4
+  );
+  stateCandidates.forEach((element) => {{
+    if (stateElements.length >= MAX_STATE_ELEMENTS) {{
+      return;
+    }}
+    const tag = clampScalar((element.tagName || "").toLowerCase(), 32);
+    const selector = selectorForStateElement(element, tag);
+    if (!selector || seenStateSelectors.has(selector)) {{
+      return;
+    }}
+    seenStateSelectors.add(selector);
+    const hiddenAttr = Boolean(element.hidden) || Boolean(element.hasAttribute && element.hasAttribute("hidden"));
+    const ariaHidden = clampScalar(element.getAttribute && element.getAttribute("aria-hidden"), 16).toLowerCase() === "true";
+    let cssHidden = false;
+    let hasLayoutBox = true;
+    try {{
+      const style = window.getComputedStyle ? window.getComputedStyle(element) : null;
+      cssHidden = Boolean(style && (style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse"));
+      const rects = element.getClientRects ? Array.prototype.slice.call(element.getClientRects()) : [];
+      hasLayoutBox = rects.some((rect) => Number(rect.width || 0) > 0 && Number(rect.height || 0) > 0);
+    }} catch (_) {{
+      hasLayoutBox = true;
+    }}
+    const visible = !(hiddenAttr || ariaHidden || cssHidden) && hasLayoutBox;
+    const reason = hiddenAttr
+      ? "hidden_attribute"
+      : ariaHidden
+        ? "aria_hidden"
+        : cssHidden
+          ? "css_hidden"
+          : hasLayoutBox
+            ? "visible"
+            : "no_layout_box";
+    stateElements.push({{
+      tag,
+      id: clampScalar(element.id, 128),
+      selector,
+      hidden: hiddenAttr || ariaHidden || cssHidden || !hasLayoutBox,
+      visible,
+      reason
+    }});
+  }});
   const readStorage = (storageGetter) => {{
     try {{
       const storage = storageGetter();
@@ -803,12 +881,14 @@ fn chromium_observe_state_script() -> String {
     html: cloneRoot ? cloneRoot.outerHTML : (document.documentElement ? document.documentElement.outerHTML : ""),
     origin,
     form_controls: formControls,
+    state_elements: stateElements,
     local_storage: Object.assign({{ origin }}, readStorage(() => window.localStorage)),
     session_storage: Object.assign({{ origin }}, readStorage(() => window.sessionStorage))
   }});
 }})()
 "#,
         max_form_controls = MAX_CHROMIUM_OBSERVE_FORM_CONTROLS,
+        max_state_elements = MAX_CHROMIUM_OBSERVE_FORM_CONTROLS,
         max_form_value_chars = MAX_CHROMIUM_OBSERVE_FORM_VALUE_CHARS,
         max_storage_entries = MAX_STORAGE_ENTRIES_PER_ORIGIN,
         max_storage_value_chars = MAX_STORAGE_ENTRY_VALUE_BYTES,
@@ -840,6 +920,9 @@ fn build_chromium_observe_state_summary(payload: &ChromiumObserveStatePayload) -
     for control in payload.form_controls.iter().take(MAX_CHROMIUM_OBSERVE_FORM_CONTROLS) {
         lines.push(chromium_observed_form_control_line(control));
     }
+    for element in payload.state_elements.iter().take(MAX_CHROMIUM_OBSERVE_FORM_CONTROLS) {
+        lines.push(chromium_observed_state_element_line(element));
+    }
     append_chromium_observed_storage_lines(&mut lines, "localStorage", &payload.local_storage);
     append_chromium_observed_storage_lines(&mut lines, "sessionStorage", &payload.session_storage);
     truncate_utf8_bytes(lines.join("\n").as_str(), MAX_CHROMIUM_OBSERVE_STATE_TEXT_BYTES)
@@ -869,6 +952,17 @@ fn chromium_observed_form_control_line(control: &ChromiumObservedFormControl) ->
         "value={}",
         line_quote(sanitize_chromium_observed_form_value(control, control.value.as_str()).as_str())
     ));
+    parts.join(" ")
+}
+
+fn chromium_observed_state_element_line(element: &ChromiumObservedStateElement) -> String {
+    let mut parts = vec!["browser_state_element".to_owned()];
+    append_observe_part(&mut parts, "selector", element.selector.as_str(), 128);
+    append_observe_part(&mut parts, "tag", element.tag.as_str(), 32);
+    append_observe_part(&mut parts, "id", element.id.as_str(), 128);
+    parts.push(format!("hidden={}", element.hidden));
+    parts.push(format!("visible={}", element.visible));
+    append_observe_part(&mut parts, "reason", element.reason.as_str(), 64);
     parts.join(" ")
 }
 
@@ -1981,13 +2075,40 @@ fn selector_not_found_error_from_cached_snapshot(
     cached_page_body: &str,
     cached_url: &str,
 ) -> String {
-    if find_matching_html_tag(selector, cached_page_body).is_some() {
+    if let Some(cached_tag) = find_matching_html_tag(selector, cached_page_body) {
         let location = chromium_action_context(tab_id, cached_url);
+        let state_hint = cached_html_tag_actionability_hint(cached_tag.as_str())
+            .map(|hint| format!("; cached element appeared {hint}"));
         return format!(
-            "selector '{selector}' was not found in the live Chromium DOM for {action_name}, but the last observe snapshot for {location} still contained it; call observe or reload to refresh the active tab, verify any local server is still running, and retry only if the selector is present in the current snapshot"
+            "selector '{selector}' was not found in the live Chromium DOM for {action_name}, but the last observe snapshot for {location} still contained it{}; call observe or reload to refresh the active tab, verify visibility/actionability, any local server state, and retry only if the selector is present and actionable in the current snapshot",
+            state_hint.unwrap_or_default()
         );
     }
     format!("selector '{selector}' was not found")
+}
+
+fn cached_html_tag_actionability_hint(tag: &str) -> Option<&'static str> {
+    let lower = tag.to_ascii_lowercase();
+    if lower.contains(" hidden")
+        || lower.contains("\thidden")
+        || lower.contains("\nhidden")
+        || lower.contains("hidden=")
+        || lower.contains("aria-hidden=\"true\"")
+        || lower.contains("aria-hidden='true'")
+    {
+        return Some("hidden or aria-hidden");
+    }
+    if lower.contains("disabled") || lower.contains("aria-disabled=\"true\"") {
+        return Some("disabled");
+    }
+    if lower.contains("display:none")
+        || lower.contains("display: none")
+        || lower.contains("visibility:hidden")
+        || lower.contains("visibility: hidden")
+    {
+        return Some("hidden by inline style");
+    }
+    None
 }
 
 fn chromium_action_context(tab_id: &str, page_url: &str) -> String {
@@ -4146,6 +4267,36 @@ mod tests {
     }
 
     #[test]
+    fn chromium_observe_state_summary_exposes_hidden_state_elements() {
+        let raw = serde_json::json!({
+            "html": "<html><body><section id=\"stepTwo\" hidden>Step two</section></body></html>",
+            "origin": "http://127.0.0.1:8786",
+            "form_controls": [],
+            "state_elements": [{
+                "tag": "section",
+                "id": "stepTwo",
+                "selector": "#stepTwo",
+                "hidden": true,
+                "visible": false,
+                "reason": "hidden_attribute"
+            }],
+            "local_storage": {"ok": true, "origin": "http://127.0.0.1:8786", "entries": {}},
+            "session_storage": {"ok": true, "origin": "http://127.0.0.1:8786", "entries": {}}
+        });
+
+        let payload =
+            decode_chromium_observe_state_value(serde_json::Value::String(raw.to_string()))
+                .expect("observe state should parse");
+        let page_body = page_body_with_chromium_observe_state(payload);
+
+        assert!(page_body.contains("browser_state_element"), "{page_body}");
+        assert!(page_body.contains("selector=\"#stepTwo\""), "{page_body}");
+        assert!(page_body.contains("hidden=true"), "{page_body}");
+        assert!(page_body.contains("visible=false"), "{page_body}");
+        assert!(page_body.contains("reason=\"hidden_attribute\""), "{page_body}");
+    }
+
+    #[test]
     fn chromium_observe_state_summary_redacts_sensitive_values() {
         let raw = serde_json::json!({
             "html": "<html><body><input id=\"password\" type=\"password\" value=\"<redacted>\"></body></html>",
@@ -4197,7 +4348,21 @@ mod tests {
             "{error}"
         );
         assert!(!error.contains("token=secret"), "{error}");
-        assert!(error.contains("verify any local server is still running"), "{error}");
+        assert!(error.contains("verify visibility/actionability"), "{error}");
+    }
+
+    #[test]
+    fn selector_not_found_error_mentions_hidden_cached_match() {
+        let error = selector_not_found_error_from_cached_snapshot(
+            "#stepTwo",
+            "highlight",
+            "tab-active",
+            r#"<html><body><section id="stepTwo" hidden>Step two</section></body></html>"#,
+            "http://127.0.0.1:8790/",
+        );
+
+        assert!(error.contains("cached element appeared hidden or aria-hidden"), "{error}");
+        assert!(error.contains("present and actionable"), "{error}");
     }
 
     #[test]
