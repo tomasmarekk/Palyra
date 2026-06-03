@@ -38,7 +38,7 @@ use crate::{
         bounded_provider_turn_output_for_persistence, provider_events_from_output, ProviderEvent,
         ProviderFinishReason, ProviderMessage, ProviderMessageContentPart, ProviderMessageRole,
         ProviderOutputContentPart, ProviderRawProviderRefs, ProviderRequest, ProviderResponse,
-        ProviderTurnOutput, ProviderUsage,
+        ProviderRouteSelectionTrace, ProviderTurnOutput, ProviderUsage,
     },
     orchestrator::{
         estimate_token_count, is_cancel_command, RunLifecycleState, RunStateMachine, RunTransition,
@@ -62,6 +62,7 @@ use super::{
 };
 
 const PROVIDER_PROGRESS_HEARTBEAT_MS: u64 = 20_000;
+const PROVIDER_FAILOVER_DEADLINE_GRACE_MS: u64 = 5_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BackgroundBudgetGuardDecision {
@@ -152,6 +153,52 @@ fn run_stream_attachment_metadata(attachments: &[common_v1::MessageAttachment]) 
 
 fn provider_request_timeout(config: &GatewayRuntimeConfigSnapshot) -> Duration {
     Duration::from_millis(config.model_provider_request_timeout_ms.max(1))
+}
+
+fn provider_request_deadline_timeout(
+    base_timeout: Duration,
+    route_selection: &ProviderRouteSelectionTrace,
+    request: &ProviderRequest,
+) -> Duration {
+    let attempt_count = provider_request_deadline_attempt_count(route_selection, request);
+    let multiplier = attempt_count.min(u32::MAX as usize) as u32;
+    let mut deadline = base_timeout.saturating_mul(multiplier.max(1));
+    if attempt_count > 1 {
+        deadline =
+            deadline.saturating_add(Duration::from_millis(PROVIDER_FAILOVER_DEADLINE_GRACE_MS));
+    }
+    deadline
+}
+
+fn provider_request_deadline_attempt_count(
+    route_selection: &ProviderRouteSelectionTrace,
+    request: &ProviderRequest,
+) -> usize {
+    if !route_selection.failover_enabled || request.model_override.is_some() {
+        return 1;
+    }
+
+    let selected_provider_id = route_selection.selected_provider_id.as_deref().or_else(|| {
+        route_selection
+            .candidates
+            .iter()
+            .find(|candidate| candidate.selected)
+            .map(|candidate| candidate.provider_id.as_str())
+    });
+    let Some(selected_provider_id) = selected_provider_id else {
+        return 1;
+    };
+
+    let fallback_attempts = route_selection
+        .candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.role == "chat"
+                && candidate.capability_state == "eligible"
+                && candidate.provider_id != selected_provider_id
+        })
+        .count();
+    1 + fallback_attempts
 }
 
 fn duration_millis_u64(duration: Duration) -> u64 {
@@ -421,6 +468,13 @@ async fn execute_run_stream_provider_request(
     lease_context: ProviderLeaseExecutionContext,
     tape_seq: &mut i64,
 ) -> Result<RunStreamProviderRequestOutcome, Status> {
+    let provider_timeout = provider_request_timeout(&runtime_state.config);
+    let provider_status = runtime_state.model_provider_status_snapshot();
+    let provider_deadline_timeout = provider_request_deadline_timeout(
+        provider_timeout,
+        &provider_status.route_selection,
+        &provider_request,
+    );
     let provider_span = tracing::info_span!(
         "provider.call",
         run_id = %run_id,
@@ -435,8 +489,7 @@ async fn execute_run_stream_provider_request(
             .instrument(provider_span),
     );
     let provider_started_at = TokioInstant::now();
-    let provider_timeout = provider_request_timeout(&runtime_state.config);
-    let provider_deadline = tokio::time::sleep(provider_timeout);
+    let provider_deadline = tokio::time::sleep(provider_deadline_timeout);
     tokio::pin!(provider_deadline);
     let mut cancel_poll = interval(Duration::from_millis(100));
     cancel_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -454,7 +507,7 @@ async fn execute_run_stream_provider_request(
                     .map(RunStreamProviderRequestOutcome::Completed);
             }
             _ = &mut provider_deadline => {
-                return Err(provider_request_timeout_status(run_id, provider_timeout));
+                return Err(provider_request_timeout_status(run_id, provider_deadline_timeout));
             }
             _ = cancel_poll.tick() => {
                 match runtime_state.is_orchestrator_cancel_requested(run_id.to_owned()).await {
@@ -476,10 +529,17 @@ async fn execute_run_stream_provider_request(
             _ = progress_heartbeat.tick() => {
                 if run_state.state() == RunLifecycleState::InProgress {
                     let elapsed_ms = duration_millis_u64(provider_started_at.elapsed());
-                    let timeout_ms = duration_millis_u64(provider_timeout);
-                    let message = format!(
-                        "waiting for model provider response (elapsed_ms={elapsed_ms}, timeout_ms={timeout_ms})"
-                    );
+                    let timeout_ms = duration_millis_u64(provider_deadline_timeout);
+                    let message = if provider_deadline_timeout == provider_timeout {
+                        format!(
+                            "waiting for model provider response (elapsed_ms={elapsed_ms}, timeout_ms={timeout_ms})"
+                        )
+                    } else {
+                        let provider_attempt_timeout_ms = duration_millis_u64(provider_timeout);
+                        format!(
+                            "waiting for model provider response (elapsed_ms={elapsed_ms}, timeout_ms={timeout_ms}, provider_attempt_timeout_ms={provider_attempt_timeout_ms}, failover_deadline_extended=true)"
+                        )
+                    };
                     send_status_with_tape(
                         sender,
                         runtime_state,
@@ -2381,17 +2441,19 @@ mod tests {
         contains_raw_provider_tool_call_markup, final_answer_recovery_prompt,
         incomplete_final_answer_without_tools, incomplete_terminal_final_answer,
         is_run_stream_response_channel_closed, length_recovery_prompt,
-        provider_model_override_for_routing, provider_request_timeout_status,
-        repeated_tool_failure_signature, should_terminate_after_tool_budget_exhausted,
-        terminal_tool_authorization_failure, tool_calls_finish_without_tool_payload,
-        tool_result_to_provider_message, truncated_final_answer_without_tools,
-        RepeatedToolFailureTracker, RunStreamToolResultForModel,
+        provider_model_override_for_routing, provider_request_deadline_timeout,
+        provider_request_timeout_status, repeated_tool_failure_signature,
+        should_terminate_after_tool_budget_exhausted, terminal_tool_authorization_failure,
+        tool_calls_finish_without_tool_payload, tool_result_to_provider_message,
+        truncated_final_answer_without_tools, RepeatedToolFailureTracker,
+        RunStreamToolResultForModel,
     };
     use super::{AgentLoopTerminationReason, AgentRunLoopState};
     use crate::application::run_stream::tape::RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE;
     use crate::model_provider::{
         ProviderFinishReason, ProviderMessage, ProviderMessageContentPart,
-        ProviderOutputContentPart, ProviderRawProviderRefs, ProviderRequest, ProviderTurnOutput,
+        ProviderOutputContentPart, ProviderRawProviderRefs, ProviderRequest,
+        ProviderRouteCandidateTrace, ProviderRouteSelectionTrace, ProviderTurnOutput,
         ProviderUsage,
     };
     use serde_json::{json, Value};
@@ -2420,6 +2482,39 @@ mod tests {
         state
     }
 
+    fn route_selection_with_fallback(failover_enabled: bool) -> ProviderRouteSelectionTrace {
+        ProviderRouteSelectionTrace {
+            default_model_id: Some("gpt-4o-mini".to_owned()),
+            failover_enabled,
+            generated_at_unix_ms: 1,
+            selected_provider_id: Some("openai-primary".to_owned()),
+            selected_model_id: Some("gpt-4o-mini".to_owned()),
+            candidates: vec![
+                route_candidate("openai-primary", "gpt-4o-mini", true, "eligible"),
+                route_candidate("anthropic-primary", "claude-3-5-sonnet-latest", false, "eligible"),
+                route_candidate("disabled-provider", "disabled-chat", false, "provider_disabled"),
+            ],
+        }
+    }
+
+    fn route_candidate(
+        provider_id: &str,
+        model_id: &str,
+        selected: bool,
+        capability_state: &str,
+    ) -> ProviderRouteCandidateTrace {
+        ProviderRouteCandidateTrace {
+            provider_id: provider_id.to_owned(),
+            credential_id: format!("credential:{provider_id}"),
+            model_id: model_id.to_owned(),
+            role: "chat".to_owned(),
+            capability_state: capability_state.to_owned(),
+            health_state: "healthy".to_owned(),
+            selected,
+            reason_code: "test".to_owned(),
+        }
+    }
+
     #[test]
     fn run_stream_response_channel_closed_status_is_classified_narrowly() {
         let closed = Status::cancelled(RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE);
@@ -2443,6 +2538,35 @@ mod tests {
         assert!(status.message().contains("model provider turn timed out after 1250ms"));
         assert!(status.message().contains("01ARZ3NDEKTSV4RRFFQ69G5FAV"));
         assert!(status.message().contains("model_provider.request_timeout_ms"));
+    }
+
+    #[test]
+    fn provider_request_deadline_extends_for_failover_candidates() {
+        let request = ProviderRequest::from_input_text("hello".to_owned(), false, Vec::new(), None);
+        let deadline = provider_request_deadline_timeout(
+            Duration::from_millis(10_000),
+            &route_selection_with_fallback(true),
+            &request,
+        );
+
+        assert_eq!(deadline, Duration::from_millis(25_000));
+    }
+
+    #[test]
+    fn provider_request_deadline_does_not_extend_for_model_override() {
+        let request = ProviderRequest::from_input_text(
+            "hello".to_owned(),
+            false,
+            Vec::new(),
+            Some("gpt-4o-mini".to_owned()),
+        );
+        let deadline = provider_request_deadline_timeout(
+            Duration::from_millis(10_000),
+            &route_selection_with_fallback(true),
+            &request,
+        );
+
+        assert_eq!(deadline, Duration::from_millis(10_000));
     }
 
     #[test]
