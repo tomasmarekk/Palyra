@@ -793,7 +793,8 @@ fn search_file(path: &Path, size_bytes: u64, state: &mut OsFileSearchState) -> R
             SafetyContentKind::WorkspaceDocument,
             TrustLabel::TrustedLocal,
         );
-        let redacted = redaction.scan.has_category(SafetyFindingCategory::SecretLeak);
+        let redacted =
+            redaction.redacted || redaction.scan.has_category(SafetyFindingCategory::SecretLeak);
         state.push_match(json!({
             "path": display,
             "kind": "content",
@@ -905,7 +906,8 @@ fn visible_file_content(buffer: Vec<u8>) -> (Option<String>, Option<String>, boo
                 SafetyContentKind::WorkspaceDocument,
                 TrustLabel::TrustedLocal,
             );
-            let redacted = redaction.scan.has_category(SafetyFindingCategory::SecretLeak);
+            let redacted = redaction.redacted
+                || redaction.scan.has_category(SafetyFindingCategory::SecretLeak);
             let visible_text = if redacted { redaction.redacted_text } else { text };
             (Some(visible_text), None, redacted)
         }
