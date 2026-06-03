@@ -8829,7 +8829,7 @@ async fn grpc_run_stream_admin_cancel_preempts_inflight_tool_execution() -> Resu
 
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(all(unix, not(target_os = "macos")))]
-async fn grpc_run_stream_admin_cancel_waits_for_inflight_process_runner_completion() -> Result<()> {
+async fn grpc_run_stream_admin_cancel_preempts_inflight_process_runner() -> Result<()> {
     let response_body = openai_tool_call_response(
         "palyra.process.run",
         &serde_json::json!({ "command": "sleep", "args": ["2"] }),
@@ -8864,7 +8864,7 @@ async fn grpc_run_stream_admin_cancel_waits_for_inflight_process_runner_completi
     let (request_sender, request_receiver) = tokio_mpsc::channel(4);
     request_sender
         .send(sample_run_stream_request_with_text(
-            "cancel should wait for uncancellable process runner completion".to_owned(),
+            "cancel should preempt the inflight process runner".to_owned(),
         ))
         .await
         .context("failed to send initial process runner cancellation request")?;
@@ -8978,12 +8978,8 @@ async fn grpc_run_stream_admin_cancel_waits_for_inflight_process_runner_completi
 
     let cancellation_elapsed = cancel_started_at.elapsed();
     assert!(
-        cancellation_elapsed >= Duration::from_secs(1),
-        "process runner cancellation should wait for uncancellable execution to finish; elapsed={cancellation_elapsed:?}"
-    );
-    assert!(
-        cancellation_elapsed < Duration::from_secs(5),
-        "process runner cancellation should still finish within the tool timeout; elapsed={cancellation_elapsed:?}"
+        cancellation_elapsed < Duration::from_secs(1),
+        "process runner cancellation should preempt long-running foreground execution; elapsed={cancellation_elapsed:?}"
     );
     assert!(saw_failed, "cancelled process runner run should emit failed status");
     assert!(!saw_done, "cancelled process runner run must not emit done status");
