@@ -850,7 +850,6 @@ fn parse_patch_document(patch: &str) -> Result<Vec<PatchOperation>, WorkspacePat
                 if is_patch_header_or_end(body_line) {
                     break;
                 }
-                reject_structural_marker_in_full_file_body(body_line, index + 1, "add-file")?;
                 let content = full_file_body_content(body_line);
                 add_lines.push(content.to_owned());
                 index = index.saturating_add(1);
@@ -1100,6 +1099,16 @@ fn hunk_context_not_found_message(index: usize, old_lines: &[String]) -> String 
     if old_lines.iter().any(|line| line.starts_with(" -") || line.starts_with(" +")) {
         message.push_str(
             "; if the target file line itself begins with '-' or '+', prefix that content directly with the hunk marker: use '-- markdown item' to remove a '- markdown item' line, or '++value' to add a '+value' line",
+        );
+    }
+    message
+}
+
+fn replace_line_target_not_found_message(old_line: &str) -> String {
+    let mut message = "replace-line exact target not found; use the exact line text returned by search/read_file or retry with an Update File hunk containing surrounding context".to_owned();
+    if old_line.starts_with(' ') || old_line.starts_with('+') {
+        message.push_str(
+            "; if the real target line begins with '-' or '+', Replace Line also uses those characters as old/new markers: use '-- markdown item' to replace a '- markdown item' line, or '++value' to write a '+value' line",
         );
     }
     message
@@ -1698,8 +1707,7 @@ fn replace_exact_line_bytes(
     let Some(index) = matches.first().copied() else {
         return Err(WorkspacePatchError::HunkApplyFailed {
             path: path_label.to_owned(),
-            message: "replace-line exact target not found; use the exact line text returned by search/read_file or retry with an Update File hunk containing surrounding context"
-                .to_owned(),
+            message: replace_line_target_not_found_message(old),
         });
     };
     if matches.len() > 1 {
@@ -2244,6 +2252,29 @@ mod tests {
     }
 
     #[test]
+    fn apply_workspace_patch_allows_markdown_report_diff_snippet_in_add_file_body() {
+        let temp = tempdir().expect("tempdir should be created");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(workspace.join("reports")).expect("workspace should exist");
+
+        let patch = "*** Begin Patch\n*** Add File: reports/broken-links.md\n+# Broken links\n+\n+| File | Link |\n+|---|---|\n+| docs/index.md | guides/install.md |\n+\n+```diff\n+--- docs/index.md\n++++ docs/index.md\n+@@\n+-- [Install guide](guides/install.md)\n++- [Install guide](guides/installation.md)\n+```\n*** End Patch\n";
+
+        apply_workspace_patch(
+            std::slice::from_ref(&workspace),
+            &default_request(patch, false),
+            &default_limits(),
+        )
+        .expect("add-file should allow Markdown reports containing quoted diff snippets");
+
+        let report = fs::read_to_string(workspace.join("reports").join("broken-links.md"))
+            .expect("report should read");
+        assert!(report.contains("|---|---|"));
+        assert!(report.contains("```diff"));
+        assert!(report.contains("--- docs/index.md"));
+        assert!(report.contains("@@"));
+    }
+
+    #[test]
     fn apply_workspace_patch_allows_markdown_frontmatter_fences() {
         let temp = tempdir().expect("tempdir should be created");
         let workspace = temp.path().join("workspace");
@@ -2763,6 +2794,37 @@ mod tests {
             message.contains("++value"),
             "error should show how to add content beginning with '+': {message}"
         );
+
+        let ambiguous_replace_line = "*** Begin Patch\n*** Replace Line: docs/index.md\n- [Install guide](guides/install.md)\n+ [Install guide](guides/setup.md)\n*** End Patch\n";
+        let error = apply_workspace_patch(
+            std::slice::from_ref(&workspace),
+            &default_request(ambiguous_replace_line, false),
+            &default_limits(),
+        )
+        .expect_err("replace-line must explain markdown list escaping when target is missing");
+        let message = error.to_string();
+        assert!(
+            message.contains("-- markdown item"),
+            "replace-line error should show markdown list escaping: {message}"
+        );
+
+        let exact_replace_line = "*** Begin Patch\n*** Replace Line: docs/index.md\n-- [Install guide](guides/install.md)\n+- [Install guide](guides/installation.md)\n*** End Patch\n";
+        apply_workspace_patch(
+            std::slice::from_ref(&workspace),
+            &default_request(exact_replace_line, false),
+            &default_limits(),
+        )
+        .expect("direct prefix syntax should replace markdown list content");
+        assert_eq!(
+            fs::read_to_string(workspace.join("docs").join("index.md"))
+                .expect("patched file should read"),
+            "- [Install guide](guides/installation.md)\n"
+        );
+        fs::write(
+            workspace.join("docs").join("index.md"),
+            "- [Install guide](guides/install.md)\n",
+        )
+        .expect("seed file should reset");
 
         let exact_patch = "*** Begin Patch\n*** Update File: docs/index.md\n@@\n-- [Install guide](guides/install.md)\n+- [Install guide](guides/setup.md)\n*** End Patch\n";
         apply_workspace_patch(
