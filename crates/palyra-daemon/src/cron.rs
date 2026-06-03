@@ -2616,15 +2616,45 @@ fn routine_parameter_delta_json(record: &RoutineMetadataRecord, job: &CronJobRec
             "failure_delivery_mode": record.delivery.failure_mode.unwrap_or(record.delivery.mode).as_str(),
         }
     });
+    let mut cli_context = serde_json::Map::new();
+    let mut workspace_roots = Vec::new();
     if let Some(workdir) =
         job.workdir.as_deref().map(str::trim).filter(|workdir| !workdir.is_empty())
     {
-        parameter_delta["cli_context"] = json!({
-            "launch_cwd": workdir,
-            "workspace_roots": [workdir],
-        });
+        cli_context.insert("launch_cwd".to_owned(), json!(workdir));
+        push_unique_cli_context_workspace_root(&mut workspace_roots, workdir);
+    }
+    if let Some(watched_root) = file_watch_access_root(record) {
+        push_unique_cli_context_workspace_root(&mut workspace_roots, watched_root.as_str());
+    }
+    if !workspace_roots.is_empty() {
+        cli_context.insert("workspace_roots".to_owned(), Value::Array(workspace_roots));
+    }
+    if !cli_context.is_empty() {
+        parameter_delta["cli_context"] = Value::Object(cli_context);
     }
     parameter_delta.to_string()
+}
+
+fn push_unique_cli_context_workspace_root(roots: &mut Vec<Value>, root: &str) {
+    if roots.iter().any(|existing| existing.as_str() == Some(root)) {
+        return;
+    }
+    roots.push(json!(root));
+}
+
+fn file_watch_access_root(record: &RoutineMetadataRecord) -> Option<String> {
+    if record.trigger_kind != RoutineTriggerKind::FileWatch {
+        return None;
+    }
+    let config = parse_file_watch_config(record.trigger_payload_json.as_str()).ok()?;
+    let resolved_path = PathBuf::from(config.resolved_path);
+    let access_root = if resolved_path.is_dir() {
+        resolved_path
+    } else {
+        resolved_path.parent().map(Path::to_path_buf)?
+    };
+    Some(access_root.to_string_lossy().into_owned())
 }
 
 fn effective_cron_session_key(
@@ -3552,6 +3582,46 @@ mod tests {
             value.pointer("/cli_context/workspace_roots/0").and_then(serde_json::Value::as_str),
             Some("C:/workspaces/routine-workspace")
         );
+    }
+
+    #[test]
+    fn routine_parameter_delta_includes_file_watch_access_root_after_workdir() {
+        let temp = tempdir().expect("tempdir should be created");
+        let workdir = temp.path().join("workspace");
+        let watched_dir = temp.path().join("os-root").join("inbox");
+        fs::create_dir_all(workdir.as_path()).expect("workdir should exist");
+        fs::create_dir_all(watched_dir.as_path()).expect("watched directory should exist");
+        let watched_file = watched_dir.join("status.txt");
+        fs::write(watched_file.as_path(), "READY\n").expect("watched file should exist");
+
+        let mut job =
+            sample_every_job("01ARZ3NDEKTSV4RRFFQ69G5FAV", Some(1_000), CronMisfirePolicy::Skip);
+        job.workdir = Some(workdir.to_string_lossy().into_owned());
+        let mut routine = sample_routine_metadata(job.job_id.as_str());
+        routine.trigger_kind = RoutineTriggerKind::FileWatch;
+        routine.trigger_payload_json = json!({
+            "path": watched_file.to_string_lossy(),
+            "resolved_path": watched_file.to_string_lossy(),
+            "poll_interval_ms": 30_000_u64,
+            "fire_on_start": false
+        })
+        .to_string();
+
+        let value: serde_json::Value =
+            serde_json::from_str(routine_parameter_delta_json(&routine, &job).as_str())
+                .expect("routine parameter delta should be JSON");
+        let roots = value
+            .pointer("/cli_context/workspace_roots")
+            .and_then(serde_json::Value::as_array)
+            .expect("workspace roots should be present");
+
+        assert_eq!(
+            value.pointer("/cli_context/launch_cwd").and_then(serde_json::Value::as_str),
+            Some(workdir.to_string_lossy().as_ref())
+        );
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0].as_str(), Some(workdir.to_string_lossy().as_ref()));
+        assert_eq!(roots[1].as_str(), Some(watched_dir.to_string_lossy().as_ref()));
     }
 
     #[test]
