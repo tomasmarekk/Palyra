@@ -1116,7 +1116,7 @@ mod tests {
         });
 
         assert!(!outcome.decision.allowed);
-        assert!(outcome.decision.approval_required);
+        assert!(!outcome.decision.approval_required);
         assert_eq!(outcome.remaining_budget, 2);
         assert_eq!(outcome.report.final_reason_code, "policy.runtime.unsupported_tool");
         assert!(outcome
