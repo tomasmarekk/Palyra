@@ -345,7 +345,8 @@ fn background_snapshot_has_output_or_error(snapshot: &(StreamCapture, StreamCapt
         || stderr.read_error.is_some()
 }
 
-pub fn run_constrained_process(
+#[cfg(test)]
+pub(crate) fn run_constrained_process(
     policy: &SandboxProcessRunnerPolicy,
     input_json: &[u8],
     execution_timeout: Duration,
@@ -7111,13 +7112,17 @@ mod tests {
         for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
             let key = line.split_once('=').map(|(key, _)| key).unwrap_or(line);
             assert!(
-                matches!(key, "PATH" | "LANG" | "LC_ALL"),
+                matches!(key, "PATH" | "LANG" | "LC_ALL" | NODE_DISABLE_COMPILE_CACHE_ENV),
                 "unexpected environment variable leaked into sandbox process: {line}"
             );
         }
         assert!(stdout.contains("PATH="), "sandbox process should retain deterministic PATH");
         assert!(stdout.contains("LANG=C"), "sandbox process should set LANG=C");
         assert!(stdout.contains("LC_ALL=C"), "sandbox process should set LC_ALL=C");
+        assert!(
+            stdout.contains("NODE_DISABLE_COMPILE_CACHE=1"),
+            "sandbox process should disable Node compile cache"
+        );
     }
 
     #[test]
