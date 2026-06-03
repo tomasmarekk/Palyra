@@ -8698,7 +8698,7 @@ mod tests {
             template_version: None,
             source_memory_id: None,
             latest_version: 1,
-            content_text: "- remembered_at_unix_ms=1780430000000 source=manual\n  S033-PREF-20260602 prefers TypeScript, Vitest, and short Czech reports.".to_owned(),
+            content_text: "- remembered_at_unix_ms=1780430000000 source=manual\n  S033-PREF-20260602 prefers TypeScript, Vitest, and short concise reports.".to_owned(),
             content_hash: "hash-1".to_owned(),
             created_at_unix_ms: 1_780_430_000_000,
             updated_at_unix_ms: 1_780_430_000_000,

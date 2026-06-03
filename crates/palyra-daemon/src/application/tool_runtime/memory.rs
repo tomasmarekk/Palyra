@@ -3335,7 +3335,7 @@ mod tests {
     #[test]
     fn workspace_memory_replace_payload_marks_document_replaced_in_place() {
         let document = workspace_document_record(
-            "S034-PREF-20260602 pro E2E testy UI v tomto projektu používáme Playwright.",
+            "S034-PREF-20260602 use Playwright for UI E2E tests in this project.",
         );
 
         let payload = workspace_memory_replace_payload("workspace-doc-1", "old-hash", &document);
