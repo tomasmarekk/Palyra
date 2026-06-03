@@ -1068,7 +1068,10 @@ fn bare_token_assignment_value_looks_secret(value: &str) -> bool {
         return false;
     }
     let lowered = normalized.to_ascii_lowercase();
-    if looks_like_application_identifier(lowered.as_str()) {
+    if is_env_reference_identifier_literal(normalized)
+        || looks_like_application_identifier(lowered.as_str())
+        || looks_like_parser_fixture_value(lowered.as_str())
+    {
         return false;
     }
     lowered.contains("secret")
@@ -1082,13 +1085,38 @@ fn bare_token_assignment_value_looks_secret(value: &str) -> bool {
 
 fn looks_like_application_identifier(value: &str) -> bool {
     value.len() <= 128
-        && value.contains(':')
+        && (value.contains(':') || value.contains('/') || value.matches('.').count() >= 2)
         && value
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ':' | '-' | '_' | '.' | '/'))
+        && value.split([':', '/', '.', '-', '_']).any(|segment| {
+            matches!(
+                segment,
+                "app"
+                    | "auth"
+                    | "fixture"
+                    | "filter"
+                    | "items"
+                    | "local"
+                    | "mock"
+                    | "state"
+                    | "storage"
+                    | "todo"
+                    | "wizard"
+            )
+        })
         && !value.contains("secret")
         && !value.contains("token")
         && !value.contains("password")
+}
+
+fn looks_like_parser_fixture_value(value: &str) -> bool {
+    value.contains('=')
+        && value.len() <= 96
+        && value
+            .split('=')
+            .all(|segment| !segment.is_empty() && segment.chars().all(|ch| ch.is_ascii_lowercase()))
+        && value.split('=').any(|segment| matches!(segment, "value" | "equals" | "expected"))
 }
 
 fn detect_prefixed_secret_token(line: &str) -> Option<&'static str> {
@@ -1894,7 +1922,9 @@ mod tests {
     #[test]
     fn local_storage_keys_are_not_redacted_as_secret_values() {
         let source = "const STORAGE_KEY = \"todo-app:items:v1\";\n\
-                      const FILTER_KEY = \"todo-app:filter:v1\";";
+                      const FILTER_KEY = \"todo-app:filter:v1\";\n\
+                      const WIZARD_STORAGE_KEY = \"s024.wizard.state.v1\";\n\
+                      const AUTH_KEY = \"s062.mock.auth.v1\";";
         let outcome = redact_text_for_export(
             source,
             SafetySourceKind::Workspace,
@@ -1906,6 +1936,8 @@ mod tests {
         assert_eq!(outcome.redacted_text, source);
         assert!(outcome.redacted_text.contains("todo-app:items:v1"));
         assert!(outcome.redacted_text.contains("todo-app:filter:v1"));
+        assert!(outcome.redacted_text.contains("s024.wizard.state.v1"));
+        assert!(outcome.redacted_text.contains("s062.mock.auth.v1"));
         assert!(!outcome
             .scan
             .finding_codes()
@@ -1960,7 +1992,10 @@ mod tests {
     fn benign_bare_token_fixture_values_are_not_redacted() {
         let source = "const fixtureUrl = '/callback?token=a%3Db%3Dc';\n\
                       const params = 'token=a%3Db%3Dc';\n\
-                      const selector = '#password';";
+                      const selector = '#password';\n\
+                      token=value=with=equals\n\
+                      expected=token=value=with=equals\n\
+                      KEY=VITE_APP_LABEL";
         let outcome = redact_text_for_export(
             source,
             SafetySourceKind::Workspace,
@@ -1970,6 +2005,8 @@ mod tests {
 
         assert!(!outcome.redacted);
         assert_eq!(outcome.redacted_text, source);
+        assert!(outcome.redacted_text.contains("token=value=with=equals"));
+        assert!(outcome.redacted_text.contains("KEY=VITE_APP_LABEL"));
         assert!(!outcome
             .scan
             .finding_codes()
