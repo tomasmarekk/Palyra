@@ -69,6 +69,7 @@ const MAX_BACKGROUND_PROCESS_LIFETIME_MS: u64 = 30 * 60_000;
 const PALYRA_CLI_PROFILE_ENV: &str = "PALYRA_CLI_PROFILE";
 const PALYRA_CLI_PROFILES_PATH_ENV: &str = "PALYRA_CLI_PROFILES_PATH";
 const PALYRA_STATE_ROOT_ENV: &str = "PALYRA_STATE_ROOT";
+const NODE_DISABLE_COMPILE_CACHE_ENV: &str = "NODE_DISABLE_COMPILE_CACHE";
 const HOST_ACCESS_SAFE_ENV_KEYS: &[&str] = &["HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TERM"];
 const HOST_ACCESS_SAFE_PALYRA_ENV_KEYS: &[&str] = &["PALYRA_E2E_HOME", "PALYRA_E2E_OS_ROOT"];
 const CLI_PROFILES_RELATIVE_PATH: &str = "cli/profiles.toml";
@@ -3677,6 +3678,7 @@ fn build_process_command(
             .env("PATH", sandbox_process_path())
             .env("LANG", "C")
             .env("LC_ALL", "C");
+        configure_node_runtime_environment(&mut command);
         apply_process_env_overrides(&mut command, input);
         return Ok(command);
     }
@@ -3738,6 +3740,7 @@ fn configure_tier_b_process_environment(
         process_command,
         policy.workspace_root.as_path(),
     );
+    configure_node_runtime_environment(command);
 }
 
 fn configure_host_access_process_environment(
@@ -3780,6 +3783,11 @@ fn configure_host_access_safe_environment(command: &mut Command, workspace_root:
     configure_windows_host_access_safe_environment(command, workspace_root);
     #[cfg(not(windows))]
     configure_unix_host_access_safe_environment(command, workspace_root);
+    configure_node_runtime_environment(command);
+}
+
+fn configure_node_runtime_environment(command: &mut Command) {
+    command.env(NODE_DISABLE_COMPILE_CACHE_ENV, "1");
 }
 
 fn copy_env_if_present(command: &mut Command, key: &str) {
@@ -4404,6 +4412,7 @@ mod tests {
         validate_runtime_egress_enforcement, EgressEnforcementMode, ProcessRunnerInput,
         SandboxProcessRunErrorKind, SandboxProcessRunnerPolicy, SandboxProcessRunnerTier,
         StreamCapture, BACKGROUND_MONITOR_POLL_MS, BACKGROUND_TERMINATION_WAIT_MS,
+        NODE_DISABLE_COMPILE_CACHE_ENV,
     };
 
     const BACKGROUND_TEST_EXECUTION_TIMEOUT_MS: u64 = 10_000;
@@ -5236,7 +5245,50 @@ mod tests {
             env.get("PALYRA_E2E_OS_ROOT").and_then(Option::as_deref),
             Some(e2e_os_root.to_string_lossy().as_ref())
         );
+        assert_eq!(env.get(NODE_DISABLE_COMPILE_CACHE_ENV).and_then(Option::as_deref), Some("1"));
         assert!(env.contains_key("PATH"), "host-access process should keep a usable PATH");
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    fn sandboxed_process_environment_disables_node_compile_cache() {
+        let workspace = unique_temp_dir("workspace-node-compile-cache-env");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let policy = sandbox_policy_with_allowed_executables(
+            canonical_workspace.clone(),
+            vec!["node".to_owned()],
+        );
+        let input = ProcessRunnerInput {
+            command: "node".to_owned(),
+            args: vec!["--version".to_owned()],
+            cwd: None,
+            env: BTreeMap::new(),
+            requested_egress_hosts: Vec::new(),
+            timeout_ms: None,
+            background: false,
+        };
+
+        let command = build_process_command(
+            &policy,
+            &input,
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+        )
+        .expect("sandboxed node command should build");
+        let env = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(env.get(NODE_DISABLE_COMPILE_CACHE_ENV).and_then(Option::as_deref), Some("1"));
 
         let _ = fs::remove_dir_all(workspace.as_path());
     }
