@@ -1528,10 +1528,9 @@ fn validate_interpreter_argument_guardrails(
 
     for (index, argument) in args.iter().enumerate() {
         if argument_is_non_path_option_assignment(argument.as_str())
-            || index
-                .checked_sub(1)
-                .and_then(|previous| args.get(previous))
-                .is_some_and(|previous| option_consumes_non_path_value(previous.as_str()))
+            || index.checked_sub(1).and_then(|previous| args.get(previous)).is_some_and(
+                |previous| command_option_consumes_non_path_value(command, previous.as_str()),
+            )
         {
             continue;
         }
@@ -1572,10 +1571,9 @@ fn validate_host_interpreter_argument_guardrails(
 
     for (index, argument) in args.iter().enumerate() {
         if argument_is_non_path_option_assignment(argument.as_str())
-            || index
-                .checked_sub(1)
-                .and_then(|previous| args.get(previous))
-                .is_some_and(|previous| option_consumes_non_path_value(previous.as_str()))
+            || index.checked_sub(1).and_then(|previous| args.get(previous)).is_some_and(
+                |previous| command_option_consumes_non_path_value(command, previous.as_str()),
+            )
         {
             continue;
         }
@@ -4627,6 +4625,35 @@ mod tests {
     }
 
     #[test]
+    fn host_interpreter_guardrails_allow_inline_node_code_with_route_literals() {
+        let workspace = unique_temp_dir("workspace-host-node-inline-route");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let args = vec![
+            "-e".to_owned(),
+            "const fs = require('fs'); const route = '/settings'; const t = fs.readFileSync('app.js', 'utf8'); console.log(route, t.length);".to_owned(),
+        ];
+
+        validate_host_interpreter_argument_guardrails(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            "node",
+            args.as_slice(),
+        )
+        .expect("host node inline source should not be treated as a host filesystem path");
+        validate_host_argument_scope(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            "node",
+            args.as_slice(),
+        )
+        .expect("host node inline source should stay a non-path argument");
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
     fn host_access_rejects_relative_traversal_script_argument() {
         let workspace = unique_temp_dir("workspace-host-script-traversal");
         let outside = unique_temp_dir("outside-host-script-traversal");
@@ -7263,7 +7290,7 @@ mod tests {
             .expect("workspace root should canonicalize");
         let args = vec![
             "-e".to_owned(),
-            "const fs = require('fs'); const lines = fs.readFileSync('src/reporting.ts', 'utf8').split('\\n'); console.log('reporting.ts line count:', lines.length);".to_owned(),
+            "const fs = require('fs'); const route = '/settings'; const lines = fs.readFileSync('src/reporting.ts', 'utf8').split('\\n'); console.log(route, 'reporting.ts line count:', lines.length);".to_owned(),
         ];
 
         validate_interpreter_argument_guardrails(
