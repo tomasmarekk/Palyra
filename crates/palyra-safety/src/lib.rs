@@ -922,7 +922,9 @@ fn is_env_identifier_reference_expression(key: &str, value: &str) -> bool {
 }
 
 fn is_env_reference_identifier_literal(value: &str) -> bool {
-    is_env_identifier(value) && value.contains('_')
+    is_env_identifier(value)
+        && value.contains('_')
+        && value.chars().all(|ch| !ch.is_ascii_lowercase())
 }
 
 fn is_standalone_env_identifier_literal(value: &str) -> bool {
