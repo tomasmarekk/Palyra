@@ -4654,7 +4654,14 @@ async fn grpc_vault_get_blocks_selected_sensitive_ref_even_with_approval_header(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_abort_run_requests_cancellation() -> Result<()> {
-    let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
+    let (openai_base_url, request_count, server_handle) =
+        spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::delayed(
+            200,
+            r#"{"choices":[{"message":{"content":"slow provider response"}}]}"#.to_owned(),
+            Duration::from_secs(5),
+        )])?;
+    let (child, admin_port, grpc_port, _journal_db_path) =
+        spawn_palyrad_with_openai_provider(openai_base_url.as_str(), OPENAI_API_KEY)?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
 
@@ -4670,8 +4677,28 @@ async fn grpc_abort_run_requests_cancellation() -> Result<()> {
     authorize_metadata(stream_request.metadata_mut())?;
     let mut response_stream =
         client.run_stream(stream_request).await.context("failed to call RunStream")?.into_inner();
-    while let Some(event) = response_stream.next().await {
-        let _ = event.context("failed to read RunStream event")?;
+
+    let in_progress_kind = common_v1::stream_status::StatusKind::InProgress as i32;
+    loop {
+        let next_event = tokio::time::timeout(Duration::from_secs(2), response_stream.next())
+            .await
+            .context("run stream did not emit in-progress status before timeout")?;
+        let Some(event) = next_event else {
+            anyhow::bail!("run stream ended before entering in-progress state");
+        };
+        let event = event.context("failed to read RunStream event while waiting in-progress")?;
+        if let Some(common_v1::run_stream_event::Body::Status(status)) = event.body {
+            if status.kind == in_progress_kind {
+                break;
+            }
+        }
+    }
+    let provider_wait_deadline = Instant::now() + Duration::from_secs(2);
+    while request_count.load(Ordering::Relaxed) == 0 {
+        if Instant::now() > provider_wait_deadline {
+            anyhow::bail!("run stream did not start the provider call before abort");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
     let mut abort_request = tonic::Request::new(gateway_v1::AbortRunRequest {
@@ -4691,6 +4718,7 @@ async fn grpc_abort_run_requests_cancellation() -> Result<()> {
         Some(true),
         "run snapshot should expose cancel_requested after AbortRun"
     );
+    server_handle.join().expect("scripted openai server thread should exit");
     Ok(())
 }
 
