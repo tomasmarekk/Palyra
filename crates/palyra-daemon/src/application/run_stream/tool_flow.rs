@@ -1,6 +1,9 @@
 use std::{
     collections::BTreeMap,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -41,7 +44,8 @@ use crate::{
     },
     gateway::{
         await_tool_approval_response, best_effort_mark_approval_error,
-        build_and_ingest_tool_result_memory_summary, execute_tool_with_runtime_dispatch,
+        build_and_ingest_tool_result_memory_summary,
+        execute_tool_with_runtime_dispatch_with_cancellation,
         record_tool_execution_outcome_metrics, shared_tool_budget, shared_tool_budget_remaining,
         tool_cancellation_requires_execution_drain, GatewayRuntimeState,
         RunStreamToolExecutionOutcome, SharedToolBudget, ToolApprovalOutcome,
@@ -1217,6 +1221,7 @@ async fn execute_prepared_tool_runtime(
     cancel_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let must_drain_execution_after_cancel =
         tool_cancellation_requires_execution_drain(prepared.tool_name.as_str());
+    let cancellation_requested = Arc::new(AtomicBool::new(false));
     let tool_span = tracing::info_span!(
         "tool.call",
         run_id = %run_id,
@@ -1226,7 +1231,7 @@ async fn execute_prepared_tool_runtime(
         status = tracing::field::Empty,
     );
     let mut execution_future = Box::pin(
-        execute_tool_with_runtime_dispatch(
+        execute_tool_with_runtime_dispatch_with_cancellation(
             runtime_state,
             ToolRuntimeExecutionContext {
                 principal: request_context.principal.as_str(),
@@ -1241,6 +1246,7 @@ async fn execute_prepared_tool_runtime(
             prepared.tool_name.as_str(),
             prepared.input_json.as_slice(),
             remaining_tool_budget,
+            Some(Arc::clone(&cancellation_requested)),
         )
         .instrument(tool_span),
     );
@@ -1254,6 +1260,7 @@ async fn execute_prepared_tool_runtime(
                 match runtime_state.is_orchestrator_cancel_requested(run_id.to_owned()).await {
                     Ok(true) => {
                         if must_drain_execution_after_cancel {
+                            cancellation_requested.store(true, Ordering::Relaxed);
                             cancel_requested_during_execution = true;
                             break execution_future.await;
                         }

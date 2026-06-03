@@ -162,6 +162,7 @@ pub enum SandboxProcessRunErrorKind {
     Disabled,
     #[cfg_attr(all(unix, not(target_os = "macos")), allow(dead_code))]
     UnsupportedPlatform,
+    Cancelled,
     InvalidInput,
     WorkspaceScopeDenied,
     EgressDenied,
@@ -197,6 +198,7 @@ struct ProcessExecutionCapture {
     exit_status: ExitStatus,
     stdout: StreamCapture,
     stderr: StreamCapture,
+    cancelled: bool,
     timed_out: bool,
     quota_exceeded: bool,
     duration_ms: u64,
@@ -348,6 +350,15 @@ pub fn run_constrained_process(
     input_json: &[u8],
     execution_timeout: Duration,
 ) -> Result<SandboxProcessRunSuccess, SandboxProcessRunError> {
+    run_constrained_process_with_cancellation(policy, input_json, execution_timeout, None)
+}
+
+pub fn run_constrained_process_with_cancellation(
+    policy: &SandboxProcessRunnerPolicy,
+    input_json: &[u8],
+    execution_timeout: Duration,
+    cancellation_requested: Option<Arc<AtomicBool>>,
+) -> Result<SandboxProcessRunSuccess, SandboxProcessRunError> {
     if !policy.enabled {
         return Err(SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::Disabled,
@@ -443,7 +454,14 @@ pub fn run_constrained_process(
         workspace_root.as_path(),
         working_directory.as_path(),
         per_call_timeout,
+        cancellation_requested,
     )?;
+    if capture.cancelled {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::Cancelled,
+            message: "sandbox process cancelled by run cancellation request and process tree was terminated".to_owned(),
+        });
+    }
     if capture.timed_out {
         return Err(SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::TimedOut,
@@ -2865,6 +2883,7 @@ fn execute_process(
     workspace_root: &Path,
     cwd: &Path,
     timeout: Duration,
+    cancellation_requested: Option<Arc<AtomicBool>>,
 ) -> Result<ProcessExecutionCapture, SandboxProcessRunError> {
     let mut command = build_process_command(policy, input, workspace_root, cwd)?;
     configure_child_process_group(&mut command);
@@ -2878,7 +2897,12 @@ fn execute_process(
         message: format!("sandbox process spawn failed for command '{}': {error}", input.command),
     })?;
 
-    capture_child_output(&mut child, timeout, policy.max_output_bytes as usize)
+    capture_child_output(
+        &mut child,
+        timeout,
+        policy.max_output_bytes as usize,
+        cancellation_requested,
+    )
 }
 
 #[cfg(unix)]
@@ -4258,6 +4282,7 @@ fn capture_child_output(
     child: &mut Child,
     timeout: Duration,
     max_output_bytes: usize,
+    cancellation_requested: Option<Arc<AtomicBool>>,
 ) -> Result<ProcessExecutionCapture, SandboxProcessRunError> {
     let stdout = child.stdout.take().ok_or_else(|| SandboxProcessRunError {
         kind: SandboxProcessRunErrorKind::RuntimeFailure,
@@ -4278,8 +4303,19 @@ fn capture_child_output(
     let started_at = Instant::now();
     let mut timed_out = false;
     let mut quota_exceeded = false;
+    let mut cancelled = false;
     let mut termination_requested = false;
     let exit_status = loop {
+        if cancellation_requested
+            .as_ref()
+            .is_some_and(|requested| requested.load(Ordering::Relaxed))
+        {
+            cancelled = true;
+            if !termination_requested {
+                terminate_child_process_tree(child);
+                termination_requested = true;
+            }
+        }
         if quota_triggered.load(Ordering::Relaxed) {
             quota_exceeded = true;
             if !termination_requested {
@@ -4324,6 +4360,7 @@ fn capture_child_output(
         exit_status,
         stdout,
         stderr,
+        cancelled,
         timed_out,
         quota_exceeded,
         duration_ms: started_at.elapsed().as_millis() as u64,
@@ -4392,7 +4429,10 @@ mod tests {
         fs, io,
         path::{Path, PathBuf},
         process::Command,
-        sync::{Mutex, OnceLock},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex, OnceLock,
+        },
         thread,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
@@ -4403,7 +4443,8 @@ mod tests {
         process_failure_message, redacted_process_output_preview, redacted_process_output_text,
         resolve_host_working_directory, resolve_scoped_path, resolve_working_directory,
         rewrite_arguments_to_scoped_paths, rewrite_host_virtual_workspace_args,
-        run_constrained_process, validate_argument_workspace_scope, validate_cmd_invocation_shape,
+        run_constrained_process, run_constrained_process_with_cancellation,
+        validate_argument_workspace_scope, validate_cmd_invocation_shape,
         validate_host_argument_scope, validate_host_interpreter_argument_guardrails,
         validate_interpreter_argument_guardrails, validate_no_embedded_command_line_arg,
         validate_process_env_overrides, validate_process_termination_scope,
@@ -6150,6 +6191,55 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn run_constrained_process_cancels_foreground_process_tree() {
+        #[cfg(windows)]
+        let (command, args): (&str, Vec<&str>) = ("ping", vec!["-n", "30", "127.0.0.1"]);
+        #[cfg(not(windows))]
+        let (command, args): (&str, Vec<&str>) = ("sleep", vec!["30"]);
+
+        if Command::new(command).output().is_err() {
+            return;
+        }
+
+        let workspace = unique_temp_dir("workspace-foreground-cancel");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        let policy = host_access_policy(workspace.clone());
+        let cancellation_requested = Arc::new(AtomicBool::new(false));
+        let cancellation_for_runner = Arc::clone(&cancellation_requested);
+        let input = serde_json::to_vec(&serde_json::json!({
+            "command": command,
+            "args": args,
+            "timeout_ms": 30_000,
+        }))
+        .expect("input should serialize");
+
+        let started_at = Instant::now();
+        let handle = thread::spawn(move || {
+            run_constrained_process_with_cancellation(
+                &policy,
+                input.as_slice(),
+                Duration::from_millis(30_000),
+                Some(cancellation_for_runner),
+            )
+        });
+        thread::sleep(Duration::from_millis(300));
+        cancellation_requested.store(true, Ordering::Relaxed);
+
+        let error = handle
+            .join()
+            .expect("foreground cancellation worker should not panic")
+            .expect_err("cancelled foreground process should return an error");
+        let _ = fs::remove_dir_all(workspace.as_path());
+
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::Cancelled);
+        assert!(
+            started_at.elapsed() < Duration::from_secs(5),
+            "foreground cancellation should stop promptly instead of waiting for timeout"
+        );
     }
 
     #[test]

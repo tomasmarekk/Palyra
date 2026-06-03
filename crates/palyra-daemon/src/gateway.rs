@@ -7,7 +7,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, RwLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -92,8 +92,8 @@ use crate::{
     },
     orchestrator::{RunLifecycleState, RunStateMachine, RunTransition},
     tool_protocol::{
-        build_tool_execution_outcome, execute_tool_call, tool_policy_snapshot, ToolCallConfig,
-        ToolCallPolicySnapshot, ToolExecutionOutcome,
+        build_tool_execution_outcome, execute_tool_call, execute_tool_call_with_cancellation,
+        tool_policy_snapshot, ToolCallConfig, ToolCallPolicySnapshot, ToolExecutionOutcome,
     },
 };
 
@@ -590,6 +590,27 @@ pub(crate) async fn execute_tool_with_runtime_dispatch(
     input_json: &[u8],
     remaining_tool_budget: Option<SharedToolBudget>,
 ) -> ToolExecutionOutcome {
+    execute_tool_with_runtime_dispatch_with_cancellation(
+        runtime_state,
+        context,
+        proposal_id,
+        tool_name,
+        input_json,
+        remaining_tool_budget,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: ToolRuntimeExecutionContext<'_>,
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+    remaining_tool_budget: Option<SharedToolBudget>,
+    cancellation_requested: Option<Arc<AtomicBool>>,
+) -> ToolExecutionOutcome {
     if context.execution_backend == ExecutionBackendPreference::NetworkedWorker {
         crate::application::tool_runtime::networked_worker::execute_networked_worker_tool(
             runtime_state,
@@ -771,7 +792,14 @@ pub(crate) async fn execute_tool_with_runtime_dispatch(
     } else if tool_name == PROCESS_RUNNER_TOOL_NAME {
         let config =
             process_runner_tool_config_for_session(runtime_state, context, input_json).await;
-        let outcome = execute_tool_call(&config, proposal_id, tool_name, input_json).await;
+        let outcome = execute_tool_call_with_cancellation(
+            &config,
+            proposal_id,
+            tool_name,
+            input_json,
+            cancellation_requested,
+        )
+        .await;
         record_run_cleanup_resource_from_tool_outcome(
             runtime_state,
             context,

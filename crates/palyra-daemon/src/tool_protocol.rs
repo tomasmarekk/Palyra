@@ -1,5 +1,8 @@
-use std::collections::BTreeSet;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::BTreeSet,
+    sync::{atomic::AtomicBool, Arc},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use palyra_common::tool_catalog::{
     sensitive_allowlisted_tool_names, SENSITIVE_CAPABILITY_POLICY_NAMES,
@@ -18,9 +21,9 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::sandbox_runner::{
-    background_process_status_by_pid, process_runner_executor_name, run_constrained_process,
-    stop_background_process_by_pid, EgressEnforcementMode, SandboxProcessRunErrorKind,
-    SandboxProcessRunnerPolicy,
+    background_process_status_by_pid, process_runner_executor_name,
+    run_constrained_process_with_cancellation, stop_background_process_by_pid,
+    EgressEnforcementMode, SandboxProcessRunErrorKind, SandboxProcessRunnerPolicy,
 };
 use crate::wasm_plugin_runner::{run_wasm_plugin, WasmPluginRunErrorKind, WasmPluginRunnerPolicy};
 
@@ -364,16 +367,40 @@ pub async fn execute_tool_call(
     tool_name: &str,
     input_json: &[u8],
 ) -> ToolExecutionOutcome {
+    execute_tool_call_with_cancellation(config, proposal_id, tool_name, input_json, None).await
+}
+
+pub async fn execute_tool_call_with_cancellation(
+    config: &ToolCallConfig,
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+    cancellation_requested: Option<Arc<AtomicBool>>,
+) -> ToolExecutionOutcome {
     if let Some(raw) = reject_oversized_tool_input(config, tool_name, input_json) {
         return build_execution_outcome(proposal_id, tool_name, input_json, raw);
     }
 
     let raw = if tool_name == "palyra.plugin.run" {
-        run_allowlisted_tool(config, tool_name, input_json).await
+        run_allowlisted_tool_with_cancellation(
+            config,
+            tool_name,
+            input_json,
+            cancellation_requested,
+        )
+        .await
     } else {
         let timeout = Duration::from_millis(config.execution_timeout_ms);
-        match tokio::time::timeout(timeout, run_allowlisted_tool(config, tool_name, input_json))
-            .await
+        match tokio::time::timeout(
+            timeout,
+            run_allowlisted_tool_with_cancellation(
+                config,
+                tool_name,
+                input_json,
+                cancellation_requested,
+            ),
+        )
+        .await
         {
             Ok(raw) => raw,
             Err(_) => ToolExecutionRawResult {
@@ -508,10 +535,11 @@ fn tool_failure_recovery_hint(tool_name: &str, error: &str, timed_out: bool) -> 
     }
 }
 
-async fn run_allowlisted_tool(
+async fn run_allowlisted_tool_with_cancellation(
     config: &ToolCallConfig,
     tool_name: &str,
     input_json: &[u8],
+    cancellation_requested: Option<Arc<AtomicBool>>,
 ) -> ToolExecutionRawResult {
     match tool_name {
         "palyra.echo" => match execute_echo_tool(input_json) {
@@ -638,7 +666,9 @@ async fn run_allowlisted_tool(
             executor: "gateway_http_fetch".to_owned(),
             sandbox_enforcement: "ssrf_guard".to_owned(),
         },
-        "palyra.process.run" => execute_process_runner_tool(config, input_json).await,
+        "palyra.process.run" => {
+            execute_process_runner_tool(config, input_json, cancellation_requested).await
+        }
         "palyra.process.stop" | "palyra.process.status" => {
             execute_process_lifecycle_tool(config, tool_name, input_json).await
         }
@@ -984,6 +1014,7 @@ fn reject_oversized_tool_input(
 async fn execute_process_runner_tool(
     config: &ToolCallConfig,
     input_json: &[u8],
+    cancellation_requested: Option<Arc<AtomicBool>>,
 ) -> ToolExecutionRawResult {
     let policy = config.process_runner.clone();
     let executor = process_runner_executor_name(&policy);
@@ -1002,7 +1033,12 @@ async fn execute_process_runner_tool(
     let input = input_json.to_vec();
     let timeout = Duration::from_millis(config.execution_timeout_ms);
     match tokio::task::spawn_blocking(move || {
-        run_constrained_process(&policy, input.as_slice(), timeout)
+        run_constrained_process_with_cancellation(
+            &policy,
+            input.as_slice(),
+            timeout,
+            cancellation_requested,
+        )
     })
     .await
     {
