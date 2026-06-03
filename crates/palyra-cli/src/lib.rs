@@ -4307,7 +4307,17 @@ where
     let mut completed = false;
     let mut cancelled = false;
     let mut approval_mode = resolved.request.approval_mode;
-    while let Some(event) = stream.next_event().await? {
+    loop {
+        let event = match stream.next_event().await {
+            Ok(Some(event)) => event,
+            Ok(None) => break,
+            Err(error) => {
+                return Err(enrich_agent_stream_transport_error(
+                    error,
+                    resolved.request.run_id.as_str(),
+                ));
+            }
+        };
         let reached_terminal_status = matches!(
             event.body.as_ref(),
             Some(common_v1::run_stream_event::Body::Status(status))
@@ -4356,6 +4366,28 @@ where
         }
     }
     Ok(AgentStreamOutcome { completed, cancelled, failed_message })
+}
+
+fn enrich_agent_stream_transport_error(error: anyhow::Error, run_id: &str) -> anyhow::Error {
+    if !is_agent_stream_transport_reset_error(&error) {
+        return error;
+    }
+    error.context(format!(
+        "agent run stream disconnected while run {run_id} was active; if this happened during a gateway restart, update, or crash recovery, the daemon may terminalize the run with recovery_kind=startup_orphaned_active_run and recovery_state=manual_resume_required. Verify with `palyra gateway run-status --run-id {run_id} --json` and `palyra gateway run-tape --run-id {run_id} --json`, then start a new run in the same session if continuation is required"
+    ))
+}
+
+fn is_agent_stream_transport_reset_error(error: &anyhow::Error) -> bool {
+    let message = error
+        .chain()
+        .map(|cause| cause.to_string().to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ");
+    message.contains("failed to read runstream event")
+        && (message.contains("h2 protocol error")
+            || message.contains("connection reset")
+            || message.contains("broken pipe")
+            || message.contains("transport error"))
 }
 
 fn run_acp_shim_from_stdin(
@@ -5807,6 +5839,41 @@ mod agent_stream_output_tests {
             AgentStreamOutcome { completed: false, cancelled: true, failed_message: None };
 
         outcome.ensure_success().expect("requested cancellation should not fail the command");
+    }
+
+    #[test]
+    fn agent_stream_transport_reset_gets_gateway_restart_recovery_hint() {
+        let run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let error =
+            anyhow!("h2 protocol error: error reading a body from connection: connection reset")
+                .context("failed to read RunStream event");
+
+        let enriched = enrich_agent_stream_transport_error(error, run_id);
+        let message = format!("{enriched:#}");
+
+        assert!(message.contains("run 01ARZ3NDEKTSV4RRFFQ69G5FAV"), "{message}");
+        assert!(message.contains("startup_orphaned_active_run"), "{message}");
+        assert!(message.contains("manual_resume_required"), "{message}");
+        assert!(
+            message
+                .contains("palyra gateway run-status --run-id 01ARZ3NDEKTSV4RRFFQ69G5FAV --json"),
+            "{message}"
+        );
+        assert!(
+            message.contains("palyra gateway run-tape --run-id 01ARZ3NDEKTSV4RRFFQ69G5FAV --json"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn agent_stream_transport_enrichment_ignores_unrelated_errors() {
+        let error = anyhow!("model provider returned invalid response");
+
+        let enriched = enrich_agent_stream_transport_error(error, "01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let message = format!("{enriched:#}");
+
+        assert!(!message.contains("startup_orphaned_active_run"), "{message}");
+        assert_eq!(message, "model provider returned invalid response");
     }
 
     #[test]
