@@ -529,6 +529,11 @@ fn validate_workspace_path_syntax(path: &str, tool_name: &str) -> Result<(), Str
     if path.chars().any(char::is_control) {
         return Err(format!("{tool_name} path contains unsupported characters"));
     }
+    if looks_like_palyra_env_prefixed_os_path(path) {
+        return Err(format!(
+            "{tool_name} path starts with a Palyra OS environment prefix; use palyra.fs.os_file for OS-level paths or pass a workspace-relative path"
+        ));
+    }
     if path.contains(':') && !looks_like_windows_drive_path(path) {
         return Err(format!("{tool_name} path contains unsupported characters"));
     }
@@ -546,6 +551,10 @@ fn validate_workspace_path_syntax(path: &str, tool_name: &str) -> Result<(), Str
         ));
     }
     Ok(())
+}
+
+fn looks_like_palyra_env_prefixed_os_path(path: &str) -> bool {
+    path.starts_with("%PALYRA_") || path.starts_with("$PALYRA_") || path.starts_with("${PALYRA_")
 }
 
 async fn resolve_workspace_file_roots(
@@ -2432,6 +2441,24 @@ mod tests {
 
         assert_eq!(output.path, "scenarios/app.js");
         assert_eq!(output.text.as_deref(), Some("console.log('ok');\n"));
+    }
+
+    #[test]
+    fn workspace_file_path_rejects_palyra_env_prefixed_os_paths() {
+        for raw_path in [
+            "%PALYRA_E2E_OS_ROOT%/hosts.d/palyra-e2e.hosts",
+            "$PALYRA_E2E_HOME/Desktop/export.csv",
+            "${PALYRA_E2E_HOME}/Desktop/export.csv",
+        ] {
+            let input = serde_json::json!({ "path": raw_path }).to_string();
+            let error = parse_workspace_read_file_input(input.as_bytes())
+                .expect_err("workspace path parser should reject OS env-prefixed paths");
+
+            assert!(
+                error.contains("palyra.fs.os_file"),
+                "error should direct callers to the OS-file tool for {raw_path:?}: {error}"
+            );
+        }
     }
 
     #[test]

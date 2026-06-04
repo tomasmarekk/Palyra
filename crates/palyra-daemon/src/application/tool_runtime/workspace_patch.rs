@@ -131,6 +131,15 @@ pub(crate) async fn execute_workspace_patch_tool(
             );
         }
     };
+    if let Err(message) = reject_env_prefixed_workspace_patch_paths(patch.as_str()) {
+        return workspace_patch_tool_execution_outcome(
+            proposal_id,
+            input_json,
+            false,
+            b"{}".to_vec(),
+            message,
+        );
+    }
 
     let dry_run = match parsed.get("dry_run") {
         Some(Value::Bool(value)) => *value,
@@ -393,6 +402,41 @@ fn patch_operation_paths(patch: &str) -> Vec<String> {
         .filter(|path| !path.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn reject_env_prefixed_workspace_patch_paths(patch: &str) -> Result<(), String> {
+    for path in workspace_patch_header_paths(patch) {
+        if looks_like_palyra_env_prefixed_os_path(path.as_str()) {
+            return Err(format!(
+                "palyra.fs.apply_patch patch path `{path}` starts with a Palyra OS environment prefix; use palyra.fs.os_file for OS-level paths or pass a workspace-relative path"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn workspace_patch_header_paths(patch: &str) -> Vec<String> {
+    patch
+        .lines()
+        .filter_map(|line| {
+            [
+                "*** Add File:",
+                "*** Update File:",
+                "*** Replace File:",
+                "*** Replace Line:",
+                "*** Delete File:",
+                "*** Move to:",
+            ]
+            .iter()
+            .find_map(|prefix| line.strip_prefix(prefix).map(str::trim))
+        })
+        .filter(|path| !path.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn looks_like_palyra_env_prefixed_os_path(path: &str) -> bool {
+    path.starts_with("%PALYRA_") || path.starts_with("$PALYRA_") || path.starts_with("${PALYRA_")
 }
 
 fn normalize_workspace_patch_header_paths(patch: &str, workspace_roots: &[PathBuf]) -> String {
@@ -1014,9 +1058,10 @@ fn workspace_patch_tool_execution_outcome(
 mod tests {
     use super::{
         normalize_workspace_patch_header_paths, patch_operation_paths,
-        patch_should_use_active_root, resolve_workspace_root_override,
-        workspace_patch_error_outcome, workspace_patch_recovery_hint,
-        workspace_patch_tool_execution_outcome, WORKSPACE_PATCH_GRAMMAR_HINT,
+        patch_should_use_active_root, reject_env_prefixed_workspace_patch_paths,
+        resolve_workspace_root_override, workspace_patch_error_outcome,
+        workspace_patch_recovery_hint, workspace_patch_tool_execution_outcome,
+        WORKSPACE_PATCH_GRAMMAR_HINT,
     };
     use crate::application::tool_runtime::workspace_scope::ActiveWorkspaceRoot;
     use palyra_common::workspace_patch::{
@@ -1214,6 +1259,23 @@ mod tests {
             patch_operation_paths(patch),
             vec!["package.json", "src/index.js", "README.md", "public/app.js", "tmp.txt"]
         );
+    }
+
+    #[test]
+    fn workspace_patch_rejects_palyra_env_prefixed_os_paths() {
+        for patch in [
+            "*** Begin Patch\n*** Add File: %PALYRA_E2E_OS_ROOT%/hosts.d/palyra-e2e.hosts\n+127.0.0.1 palyra.test\n*** End Patch\n",
+            "*** Begin Patch\n*** Add File: $PALYRA_E2E_HOME/Desktop/export.csv\n+id,total\n*** End Patch\n",
+            "*** Begin Patch\n*** Update File: docs/source.txt\n*** Move to: ${PALYRA_E2E_HOME}/Desktop/source.txt\n*** End Patch\n",
+        ] {
+            let error = reject_env_prefixed_workspace_patch_paths(patch)
+                .expect_err("env-prefixed OS path should be rejected before patch parsing");
+
+            assert!(
+                error.contains("palyra.fs.os_file"),
+                "error should direct callers to OS-file tool: {error}"
+            );
+        }
     }
 
     #[test]

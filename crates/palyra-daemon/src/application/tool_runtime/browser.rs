@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     net::IpAddr,
     path::{Component, Path, PathBuf},
@@ -25,8 +26,8 @@ use crate::{
     agents::AgentResolveRequest,
     application::tool_runtime::workspace_scope::{
         relative_path_already_targets_active_root, relative_path_should_use_active_root,
-        session_active_workspace_root, workspace_roots_with_run_launch_context,
-        ActiveWorkspaceRoot,
+        run_launch_context_path_env, session_active_workspace_root,
+        workspace_roots_with_run_launch_context, ActiveWorkspaceRoot,
     },
     gateway::{
         current_unix_ms, truncate_with_ellipsis, BrowserServiceRuntimeConfig, GatewayRuntimeState,
@@ -447,11 +448,13 @@ async fn save_browser_output_file_from_payload(
     )
     .await
     .map_err(|error| format!("{tool_name} failed to resolve active output workspace: {error}"))?;
+    let path_env = run_launch_context_path_env(runtime_state, context.run_id).await;
     let target = resolve_browser_output_path(
         tool_name,
         output_path,
         workspace_roots.as_slice(),
         active_workspace_root.as_ref(),
+        &path_env,
         browser_user_owned_os_roots().as_slice(),
     )?;
     fs::write(target.as_path(), bytes).map_err(|error| {
@@ -471,11 +474,13 @@ fn resolve_browser_output_path(
     output_path: &str,
     workspace_roots: &[PathBuf],
     active_workspace_root: Option<&ActiveWorkspaceRoot>,
+    path_env: &BTreeMap<String, PathBuf>,
     user_owned_roots: &[PathBuf],
 ) -> Result<PathBuf, String> {
-    let requested = PathBuf::from(output_path);
+    let requested = expand_browser_env_prefixed_output_path(tool_name, output_path, path_env)?
+        .unwrap_or_else(|| PathBuf::from(output_path));
     let allowed_roots = if requested.is_absolute() {
-        workspace_roots.iter().chain(user_owned_roots.iter()).cloned().collect::<Vec<_>>()
+        browser_absolute_output_allowed_roots(workspace_roots, user_owned_roots, path_env)
     } else {
         let relative = validate_browser_workspace_relative_path_for_tool(
             tool_name,
@@ -495,6 +500,124 @@ fn resolve_browser_output_path(
         );
     };
     prepare_browser_output_target(tool_name, requested.as_path(), allowed_roots.as_slice())
+}
+
+fn browser_absolute_output_allowed_roots(
+    workspace_roots: &[PathBuf],
+    user_owned_roots: &[PathBuf],
+    path_env: &BTreeMap<String, PathBuf>,
+) -> Vec<PathBuf> {
+    let mut roots =
+        workspace_roots.iter().chain(user_owned_roots.iter()).cloned().collect::<Vec<_>>();
+    for root in path_env.values() {
+        if !roots.iter().any(|existing| existing == root) {
+            roots.push(root.clone());
+        }
+    }
+    roots
+}
+
+fn expand_browser_env_prefixed_output_path(
+    tool_name: &str,
+    output_path: &str,
+    path_env: &BTreeMap<String, PathBuf>,
+) -> Result<Option<PathBuf>, String> {
+    let Some((key, suffix)) = browser_path_env_prefix(tool_name, output_path)? else {
+        return Ok(None);
+    };
+    let base = if let Some(value) = path_env.get(key) {
+        value.clone()
+    } else {
+        std::env::var_os(key).filter(|value| !value.is_empty()).map(PathBuf::from).ok_or_else(
+            || format!("{tool_name} output_path references unset environment variable `{key}`"),
+        )?
+    };
+    if !base.is_absolute() {
+        return Err(format!(
+            "{tool_name} output_path environment variable `{key}` must resolve to an absolute OS path"
+        ));
+    }
+    append_browser_env_path_suffix(tool_name, base, suffix).map(Some)
+}
+
+fn browser_path_env_prefix<'a>(
+    tool_name: &str,
+    path: &'a str,
+) -> Result<Option<(&'a str, &'a str)>, String> {
+    if let Some(rest) = path.strip_prefix('%') {
+        let Some(end) = rest.find('%') else {
+            return Err(format!("{tool_name} output_path has malformed %VAR% environment prefix"));
+        };
+        let key = &rest[..end];
+        validate_browser_path_env_key(tool_name, key)?;
+        return Ok(Some((key, &rest[end + 1..])));
+    }
+    if let Some(rest) = path.strip_prefix("${") {
+        let Some(end) = rest.find('}') else {
+            return Err(format!(
+                "{tool_name} output_path has malformed ${{VAR}} environment prefix"
+            ));
+        };
+        let key = &rest[..end];
+        validate_browser_path_env_key(tool_name, key)?;
+        return Ok(Some((key, &rest[end + 1..])));
+    }
+    if let Some(rest) = path.strip_prefix('$') {
+        let key_len = rest
+            .char_indices()
+            .take_while(|(_, ch)| ch.is_ascii_alphanumeric() || *ch == '_')
+            .map(|(index, ch)| index + ch.len_utf8())
+            .last()
+            .unwrap_or(0);
+        if key_len == 0 {
+            return Err(format!("{tool_name} output_path has malformed $VAR environment prefix"));
+        }
+        let key = &rest[..key_len];
+        validate_browser_path_env_key(tool_name, key)?;
+        return Ok(Some((key, &rest[key_len..])));
+    }
+    Ok(None)
+}
+
+fn validate_browser_path_env_key(tool_name: &str, key: &str) -> Result<(), String> {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return Err(format!("{tool_name} output_path environment variable name is empty"));
+    };
+    if !(first.is_ascii_alphabetic() || first == '_')
+        || !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return Err(format!(
+            "{tool_name} output_path environment variable name must use ASCII letters, digits, or underscores"
+        ));
+    }
+    Ok(())
+}
+
+fn append_browser_env_path_suffix(
+    tool_name: &str,
+    mut base: PathBuf,
+    suffix: &str,
+) -> Result<PathBuf, String> {
+    let relative_suffix = suffix.trim_start_matches(['/', '\\']);
+    if relative_suffix.is_empty() {
+        return Ok(base);
+    }
+    for segment in relative_suffix.split(['/', '\\']) {
+        if segment.is_empty() {
+            continue;
+        }
+        if segment == "." || segment == ".." || segment.contains(':') {
+            return Err(format!(
+                "{tool_name} output_path environment suffix must stay relative to the expanded root"
+            ));
+        }
+        if segment.chars().any(char::is_control) {
+            return Err(format!("{tool_name} output_path contains unsupported characters"));
+        }
+        base.push(segment);
+    }
+    Ok(base)
 }
 
 fn browser_relative_output_base_root(
@@ -4117,6 +4240,8 @@ fn browser_tool_execution_outcome(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::{
         attach_browser_caller_principal_metadata, browser_console_entry_to_json,
         browser_file_url_to_path, browser_network_log_entry_to_json,
@@ -4400,6 +4525,7 @@ mod tests {
             "artifacts/visual-smoke.png",
             std::slice::from_ref(&canonical_workspace),
             None,
+            &BTreeMap::new(),
             &[],
         )
         .expect("relative browser output path should resolve");
@@ -4431,6 +4557,7 @@ mod tests {
             "reports/visual-smoke.png",
             &[canonical_launch.clone(), canonical_default],
             None,
+            &BTreeMap::new(),
             &[],
         )
         .expect("relative browser output path should resolve");
@@ -4460,6 +4587,7 @@ mod tests {
             "evidence-after-fix.png",
             &[canonical_repo, canonical_harness],
             Some(&active),
+            &BTreeMap::new(),
             &[],
         )
         .expect("short relative browser output path should resolve inside active workspace");
@@ -4493,6 +4621,7 @@ mod tests {
             "scenario-workspaces/S006_save_bug/evidence-after-fix.png",
             &[canonical_repo.clone(), canonical_harness],
             Some(&active),
+            &BTreeMap::new(),
             &[],
         )
         .expect("prefixed relative browser output path should resolve inside active workspace");
@@ -4502,6 +4631,39 @@ mod tests {
         assert_eq!(
             output.file_name().and_then(|value| value.to_str()),
             Some("evidence-after-fix.png")
+        );
+    }
+
+    #[test]
+    fn browser_output_path_expands_launch_env_prefix() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let harness_home = temp.path().join("Palyra-TestHarness");
+        std::fs::create_dir_all(harness_home.as_path()).expect("harness home should exist");
+        let canonical_home = harness_home.canonicalize().expect("harness home should canonicalize");
+        let path_env = BTreeMap::from([("PALYRA_E2E_HOME".to_owned(), canonical_home.clone())]);
+
+        let output = resolve_browser_output_path(
+            BROWSER_DOWNLOADS_GET_TOOL_NAME,
+            "%PALYRA_E2E_HOME%/Desktop/palyra-orders-export.csv",
+            &[],
+            None,
+            &path_env,
+            &[],
+        )
+        .expect("env-prefixed browser output path should resolve inside launch env root");
+
+        assert!(output.starts_with(canonical_home.as_path()));
+        assert_eq!(
+            output.parent().and_then(|parent| parent.file_name()).and_then(|value| value.to_str()),
+            Some("Desktop")
+        );
+        assert_eq!(
+            output.file_name().and_then(|value| value.to_str()),
+            Some("palyra-orders-export.csv")
+        );
+        assert!(
+            output.parent().is_some_and(|parent| parent.is_dir()),
+            "env-prefixed output parent should be created"
         );
     }
 
@@ -4519,6 +4681,7 @@ mod tests {
             "../outside/smoke.png",
             std::slice::from_ref(&canonical_workspace),
             None,
+            &BTreeMap::new(),
             &[],
         )
         .expect_err("relative traversal should be rejected");
@@ -4530,6 +4693,7 @@ mod tests {
             absolute_outside.to_string_lossy().as_ref(),
             &[canonical_workspace],
             None,
+            &BTreeMap::new(),
             &[],
         )
         .expect_err("unapproved absolute path should be rejected");
