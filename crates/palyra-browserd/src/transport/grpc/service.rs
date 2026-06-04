@@ -2194,7 +2194,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         let _timeout_ms =
             request_timeout_ms(payload.timeout_ms, context.budget.max_action_timeout_ms);
         let started_at_unix_ms = current_unix_ms();
-        let (success, width, height, device_scale_factor, mobile, outcome, error) =
+        let (success, width, height, device_scale_factor, mobile, metric_mismatch, error) =
             match self.runtime.engine_mode {
                 BrowserEngineMode::Simulated => (
                     true,
@@ -2202,7 +2202,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                     payload.height,
                     device_scale_factor,
                     payload.mobile,
-                    "viewport_set".to_owned(),
+                    false,
                     String::new(),
                 ),
                 BrowserEngineMode::Chromium => {
@@ -2221,15 +2221,18 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                         result.height,
                         result.device_scale_factor,
                         result.mobile,
-                        if result.success {
-                            "viewport_set".to_owned()
-                        } else {
-                            "viewport_failed".to_owned()
-                        },
+                        result.metric_mismatch,
                         result.error,
                     )
                 }
             };
+        let outcome = if success && metric_mismatch {
+            "viewport_set_metric_mismatch"
+        } else if success {
+            "viewport_set"
+        } else {
+            "viewport_failed"
+        };
 
         let (action_log, _, _) = finalize_session_action(
             self.runtime.as_ref(),
@@ -2238,7 +2241,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                 action_name: "viewport",
                 selector: "",
                 success,
-                outcome: outcome.as_str(),
+                outcome,
                 error: error.as_str(),
                 started_at_unix_ms,
                 attempts: 1,

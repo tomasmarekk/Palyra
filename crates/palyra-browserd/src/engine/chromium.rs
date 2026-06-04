@@ -28,6 +28,7 @@ pub(crate) struct ChromiumViewportOutcome {
     pub(crate) height: u32,
     pub(crate) device_scale_factor: f64,
     pub(crate) mobile: bool,
+    pub(crate) metric_mismatch: bool,
     pub(crate) error: String,
 }
 
@@ -4048,6 +4049,7 @@ pub(crate) async fn set_viewport_with_chromium(
             height: 0,
             device_scale_factor: 0.0,
             mobile,
+            metric_mismatch: false,
             error,
         };
     }
@@ -4060,6 +4062,7 @@ pub(crate) async fn set_viewport_with_chromium(
                 height: 0,
                 device_scale_factor: 0.0,
                 mobile,
+                metric_mismatch: false,
                 error,
             }
         }
@@ -4126,18 +4129,7 @@ pub(crate) async fn set_viewport_with_chromium(
                     height: actual_height,
                     device_scale_factor: actual_device_scale_factor,
                     mobile,
-                    error,
-                };
-            }
-            if let Some(error) =
-                chromium_viewport_mismatch_error(width, height, actual_width, actual_height, mobile)
-            {
-                return ChromiumViewportOutcome {
-                    success: false,
-                    width: actual_width,
-                    height: actual_height,
-                    device_scale_factor: actual_device_scale_factor,
-                    mobile,
+                    metric_mismatch: false,
                     error,
                 };
             }
@@ -4147,6 +4139,12 @@ pub(crate) async fn set_viewport_with_chromium(
                 height: actual_height,
                 device_scale_factor: actual_device_scale_factor,
                 mobile,
+                metric_mismatch: chromium_viewport_metrics_mismatch(
+                    width,
+                    height,
+                    actual_width,
+                    actual_height,
+                ),
                 error: String::new(),
             }
         }
@@ -4156,24 +4154,19 @@ pub(crate) async fn set_viewport_with_chromium(
             height: 0,
             device_scale_factor: 0.0,
             mobile,
+            metric_mismatch: false,
             error,
         },
     }
 }
 
-fn chromium_viewport_mismatch_error(
+fn chromium_viewport_metrics_mismatch(
     requested_width: u32,
     requested_height: u32,
     actual_width: u32,
     actual_height: u32,
-    mobile: bool,
-) -> Option<String> {
-    if actual_width == requested_width && actual_height == requested_height {
-        return None;
-    }
-    Some(format!(
-        "Chromium viewport metrics did not match requested CSS viewport: requested_width={requested_width} requested_height={requested_height} actual_width={actual_width} actual_height={actual_height} mobile={mobile}. Retry without mobile emulation or inspect layout_metrics before relying on visual assertions."
-    ))
+) -> bool {
+    actual_width != requested_width || actual_height != requested_height
 }
 
 #[cfg(test)]
@@ -4183,7 +4176,7 @@ mod tests {
         chromium_network_log_headers, chromium_read_document_cookies_script,
         chromium_read_local_storage_script, chromium_restore_local_storage_script,
         chromium_touch_emulation_max_touch_points, chromium_transport_idle_timeout,
-        chromium_upload_staging_path, chromium_viewport_mismatch_error, clamp_chromium_snapshot,
+        chromium_upload_staging_path, chromium_viewport_metrics_mismatch, clamp_chromium_snapshot,
         decode_chromium_console_entries_value, decode_chromium_json_script_value,
         decode_chromium_network_entries_value, decode_chromium_observe_state_value,
         page_body_with_chromium_observe_state, parse_chromium_clear_storage_status,
@@ -4674,18 +4667,12 @@ mod tests {
 
     #[test]
     fn chromium_viewport_mismatch_allows_exact_css_viewport() {
-        assert!(chromium_viewport_mismatch_error(375, 812, 375, 812, true).is_none());
+        assert!(!chromium_viewport_metrics_mismatch(375, 812, 375, 812));
     }
 
     #[test]
-    fn chromium_viewport_mismatch_reports_actual_css_viewport() {
-        let error = chromium_viewport_mismatch_error(375, 812, 1040, 2252, true)
-            .expect("mismatched mobile viewport must fail loudly");
-
-        assert!(error.contains("requested_width=375"));
-        assert!(error.contains("actual_width=1040"));
-        assert!(error.contains("mobile=true"));
-        assert!(error.contains("Retry without mobile emulation"));
+    fn chromium_viewport_mismatch_flags_actual_css_viewport() {
+        assert!(chromium_viewport_metrics_mismatch(375, 812, 1040, 2252));
     }
 
     #[test]
