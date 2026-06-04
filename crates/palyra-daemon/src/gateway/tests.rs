@@ -5119,10 +5119,10 @@ async fn memory_recall_tool_defaults_to_current_session_scope() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn memory_search_tool_defaults_to_principal_scope() {
+async fn memory_search_tool_defaults_to_all_durable_scopes() {
     let state = build_test_runtime_state(false);
     let context = routines_tool_test_context();
-    let marker = "PALYRA_DEFAULT_PRINCIPAL_MEMORY_MARKER";
+    let marker = "PALYRA_DEFAULT_ALL_MEMORY_MARKER";
     state
         .ingest_memory_item(MemoryItemCreateRequest {
             memory_id: "01ARZ3NDEKTSV4RRFFQ69G5FD3".to_owned(),
@@ -5151,17 +5151,44 @@ async fn memory_search_tool_defaults_to_principal_scope() {
         })
         .await
         .expect("manual memory ingest should seed cross-channel search noise");
+    state
+        .upsert_workspace_document(WorkspaceDocumentWriteRequest {
+            document_id: None,
+            principal: context.principal.to_owned(),
+            channel: context.channel.map(str::to_owned),
+            agent_id: None,
+            session_id: Some(context.session_id.to_owned()),
+            path: "projects/e2e/default-memory.md".to_owned(),
+            title: Some("Default Project Memory".to_owned()),
+            content_text: format!("Project workspace preference was {marker}"),
+            template_id: None,
+            template_version: None,
+            template_content_hash: None,
+            source_memory_id: None,
+            manual_override: false,
+        })
+        .await
+        .expect("workspace document should seed default all search");
 
     let outcome = execute_memory_search_tool(
         &state,
         context,
         "01ARZ3NDEKTSV4RRFFQ69G5FD5",
-        br#"{"query":"PALYRA_DEFAULT_PRINCIPAL_MEMORY_MARKER","top_k":4,"min_score":0.0}"#,
+        br#"{"query":"PALYRA_DEFAULT_ALL_MEMORY_MARKER","top_k":4,"min_score":0.0}"#,
     )
     .await;
 
     assert!(outcome.success, "search tool should succeed: {}", outcome.error);
     let payload = parse_tool_output_json(&outcome);
+    assert_eq!(payload.get("scope").and_then(Value::as_str), Some("all"));
+    assert!(
+        payload.get("memory_hit_count").and_then(Value::as_u64).unwrap_or(0) >= 1,
+        "default search should include lifecycle memory hits: {payload}"
+    );
+    assert!(
+        payload.get("workspace_hit_count").and_then(Value::as_u64).unwrap_or(0) >= 1,
+        "default search should include workspace/project memory hits: {payload}"
+    );
     let hits =
         payload.get("hits").and_then(Value::as_array).expect("search output should include hits");
     assert!(
@@ -5171,6 +5198,14 @@ async fn memory_search_tool_defaults_to_principal_scope() {
                 .is_some_and(|content| content.contains("Principal feature flag"))
         }),
         "default search should surface principal memory: {payload}"
+    );
+    assert!(
+        hits.iter().any(|hit| {
+            hit.get("hit_source").and_then(Value::as_str) == Some("workspace")
+                && hit.pointer("/document/path").and_then(Value::as_str)
+                    == Some("projects/e2e/default-memory.md")
+        }),
+        "default search should surface workspace/project memory: {payload}"
     );
     assert!(
         hits.iter().all(|hit| {

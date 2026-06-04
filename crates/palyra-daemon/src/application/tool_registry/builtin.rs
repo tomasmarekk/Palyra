@@ -35,14 +35,14 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
         ),
         entry(
             "palyra.memory.search",
-            "Search scoped Palyra memory or workspace/project documents and return redacted hits.",
+            "Search Palyra lifecycle memory and workspace/project documents by default, or narrow to one explicit scope, and return redacted hits.",
             object_schema(
                 &["query"],
                 vec![
                     ("query", json!({"type":"string","maxLength":8192})),
                     (
                         "scope",
-                        json!({"type":"string","enum":["principal","session","channel","workspace","project"],"description":"Defaults to principal for durable remembered preferences, facts, and corrections. Use session only for the current session, channel for authenticated channel memory, and workspace/project for indexed project documents."}),
+                        json!({"type":"string","enum":["all","principal","session","channel","workspace","project"],"description":"Defaults to all, which searches durable principal memory plus indexed workspace/project documents. Use principal, session, channel, workspace, or project to narrow the search."}),
                     ),
                     ("top_k", json!({"type":"integer","minimum":1,"maximum":20})),
                     ("min_score", json!({"type":"number","minimum":0.0,"maximum":1.0})),

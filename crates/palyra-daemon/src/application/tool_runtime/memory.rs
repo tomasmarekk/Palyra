@@ -49,8 +49,11 @@ const MEMORY_SOURCE_VALUES: &[&str] =
 const MEMORY_HITS_PRESENT_CLAIM_BOUNDARY: &str = "memory hits are retrieved evidence; do not claim no stored preference or prior fact exists unless the hits are irrelevant to the user's question";
 const MEMORY_HITS_ABSENT_CLAIM_BOUNDARY: &str =
     "no memory hits were returned; do not invent stored preferences or prior facts";
+const COMBINED_MEMORY_HITS_PRESENT_CLAIM_BOUNDARY: &str = "durable lifecycle or workspace memory hits are retrieved evidence; do not claim no stored preference or project fact exists unless the hits are irrelevant";
+const COMBINED_MEMORY_HITS_ABSENT_CLAIM_BOUNDARY: &str =
+    "no durable lifecycle or workspace memory hits were returned";
 const DEFAULT_MEMORY_RETAIN_SCOPE: &str = "principal";
-const DEFAULT_MEMORY_SEARCH_SCOPE: &str = "principal";
+const DEFAULT_MEMORY_SEARCH_SCOPE: &str = "all";
 const SESSION_SEARCH_HITS_PRESENT_CLAIM_BOUNDARY: &str = "session transcript hits are retrieved evidence from prior conversations; cite them as session recall, not durable memory";
 const SESSION_SEARCH_HITS_ABSENT_CLAIM_BOUNDARY: &str =
     "no session transcript hits were returned; do not substitute unrelated durable memory or workspace artifacts for prior-session evidence";
@@ -88,6 +91,50 @@ pub(crate) fn workspace_search_tool_output_payload(search_hits: &[WorkspaceSearc
     json!({
         "hit_count": search_hits.len(),
         "hits": workspace_search_tool_output_hits(search_hits),
+    })
+}
+
+fn combined_memory_search_tool_output_payload(
+    memory_hits: &[MemorySearchHit],
+    workspace_hits: &[WorkspaceSearchHit],
+    workspace_prefix: Option<&str>,
+) -> Value {
+    let memory_payload = memory_search_tool_output_payload(memory_hits);
+    let workspace_payload = workspace_search_tool_output_payload(workspace_hits);
+    let memory_hit_values =
+        memory_payload.get("hits").and_then(Value::as_array).cloned().unwrap_or_default();
+    let workspace_hit_values =
+        workspace_payload.get("hits").and_then(Value::as_array).cloned().unwrap_or_default();
+    let mut hits =
+        Vec::with_capacity(memory_hit_values.len().saturating_add(workspace_hit_values.len()));
+    hits.extend(memory_hit_values.iter().cloned().map(|mut hit| {
+        if let Some(object) = hit.as_object_mut() {
+            object.insert("hit_source".to_owned(), json!("lifecycle"));
+        }
+        hit
+    }));
+    hits.extend(workspace_hit_values.iter().cloned().map(|mut hit| {
+        if let Some(object) = hit.as_object_mut() {
+            object.insert("hit_source".to_owned(), json!("workspace"));
+        }
+        hit
+    }));
+    let hit_count = memory_hits.len().saturating_add(workspace_hits.len());
+
+    json!({
+        "scope": "all",
+        "hit_count": hit_count,
+        "memory_hit_count": memory_hits.len(),
+        "workspace_hit_count": workspace_hits.len(),
+        "workspace_prefix": workspace_prefix,
+        "claim_boundary": if hit_count == 0 {
+            COMBINED_MEMORY_HITS_ABSENT_CLAIM_BOUNDARY
+        } else {
+            COMBINED_MEMORY_HITS_PRESENT_CLAIM_BOUNDARY
+        },
+        "hits": hits,
+        "memory_hits": memory_payload.get("hits").cloned().unwrap_or_else(|| Value::Array(Vec::new())),
+        "workspace_hits": workspace_payload.get("hits").cloned().unwrap_or_else(|| Value::Array(Vec::new())),
     })
 }
 
@@ -1486,6 +1533,156 @@ pub(crate) async fn execute_memory_search_tool(
         };
     }
 
+    if scope == "all" {
+        if let Err(error) = authorize_memory_action(principal, "memory.search", "memory:principal")
+        {
+            return memory_tool_execution_outcome(
+                attestation_namespace,
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                format!("memory policy denied tool search request: {}", error.message()),
+            );
+        }
+        if let Err(error) = authorize_memory_action(principal, "memory.search", "memory:workspace")
+        {
+            return memory_tool_execution_outcome(
+                attestation_namespace,
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                format!("memory policy denied tool workspace search request: {}", error.message()),
+            );
+        }
+        let tags = match parse_memory_search_tags(&parsed) {
+            Ok(tags) => tags,
+            Err(error) => {
+                return memory_tool_execution_outcome(
+                    attestation_namespace,
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    error,
+                );
+            }
+        };
+        let sources = match parse_memory_search_sources(&parsed) {
+            Ok(sources) => sources,
+            Err(error) => {
+                return memory_tool_execution_outcome(
+                    attestation_namespace,
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    error,
+                );
+            }
+        };
+        let memory_hits = match runtime_state
+            .search_memory(MemorySearchRequest {
+                principal: principal.to_owned(),
+                channel: channel.map(str::to_owned),
+                session_id: None,
+                query: query.clone(),
+                top_k,
+                min_score,
+                tags,
+                sources,
+            })
+            .await
+        {
+            Ok(hits) => hits,
+            Err(error) => {
+                return memory_tool_execution_outcome(
+                    attestation_namespace,
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    format!("palyra.memory.search failed: {}", error.message()),
+                );
+            }
+        };
+        let explicit_workspace_prefix = optional_trimmed_string(parsed.get("workspace_prefix"))
+            .or_else(|| optional_trimmed_string(parsed.get("prefix")));
+        let workspace_prefix = match workspace_memory_search_prefix(
+            explicit_workspace_prefix.as_deref(),
+            "workspace",
+            None,
+        ) {
+            Ok(prefix) => prefix,
+            Err(error) => {
+                return memory_tool_execution_outcome(
+                    attestation_namespace,
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    format!("palyra.memory.search {error}"),
+                );
+            }
+        };
+        let workspace_hits = match runtime_state
+            .search_workspace_documents(WorkspaceSearchRequest {
+                principal: principal.to_owned(),
+                channel: channel.map(str::to_owned),
+                agent_id: optional_trimmed_string(parsed.get("agent_id")),
+                query,
+                prefix: workspace_prefix.clone(),
+                top_k,
+                min_score,
+                include_historical: parsed
+                    .get("include_workspace_historical")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                include_quarantined: parsed
+                    .get("include_workspace_quarantined")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            })
+            .await
+        {
+            Ok(hits) => hits,
+            Err(error) => {
+                return memory_tool_execution_outcome(
+                    attestation_namespace,
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    format!("palyra.memory.search workspace search failed: {}", error.message()),
+                );
+            }
+        };
+        let payload = combined_memory_search_tool_output_payload(
+            memory_hits.as_slice(),
+            workspace_hits.as_slice(),
+            workspace_prefix.as_deref(),
+        );
+        return match serde_json::to_vec(&payload) {
+            Ok(output_json) => memory_tool_execution_outcome(
+                attestation_namespace,
+                proposal_id,
+                input_json,
+                true,
+                output_json,
+                String::new(),
+            ),
+            Err(error) => memory_tool_execution_outcome(
+                attestation_namespace,
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                format!("palyra.memory.search failed to serialize output: {error}"),
+            ),
+        };
+    }
+
     let (channel_scope, session_scope, resource) = match scope.as_str() {
         "principal" => (channel.map(str::to_owned), None, "memory:principal".to_owned()),
         "channel" => {
@@ -1515,7 +1712,7 @@ pub(crate) async fn execute_memory_search_tool(
                 input_json,
                 false,
                 b"{}".to_vec(),
-                "palyra.memory.search scope must be one of: session|channel|principal|workspace|project"
+                "palyra.memory.search scope must be one of: all|session|channel|principal|workspace|project"
                     .to_owned(),
             );
         }
@@ -1532,87 +1729,31 @@ pub(crate) async fn execute_memory_search_tool(
         );
     }
 
-    let tags = match parsed.get("tags") {
-        Some(Value::Array(values)) => {
-            if values.len() > MAX_MEMORY_TOOL_TAGS {
-                return memory_tool_execution_outcome(
-                    attestation_namespace,
-                    proposal_id,
-                    input_json,
-                    false,
-                    b"{}".to_vec(),
-                    format!("palyra.memory.search tags exceeds limit ({})", MAX_MEMORY_TOOL_TAGS),
-                );
-            }
-            let mut parsed_tags = Vec::new();
-            for value in values {
-                let Some(tag) = value.as_str() else {
-                    return memory_tool_execution_outcome(
-                        attestation_namespace,
-                        proposal_id,
-                        input_json,
-                        false,
-                        b"{}".to_vec(),
-                        "palyra.memory.search tags must be strings".to_owned(),
-                    );
-                };
-                if !tag.trim().is_empty() {
-                    parsed_tags.push(tag.trim().to_owned());
-                }
-            }
-            parsed_tags
-        }
-        Some(_) => {
+    let tags = match parse_memory_search_tags(&parsed) {
+        Ok(tags) => tags,
+        Err(error) => {
             return memory_tool_execution_outcome(
                 attestation_namespace,
                 proposal_id,
                 input_json,
                 false,
                 b"{}".to_vec(),
-                "palyra.memory.search tags must be an array of strings".to_owned(),
+                error,
             );
         }
-        None => Vec::new(),
     };
-    let sources = match parsed.get("sources") {
-        Some(Value::Array(values)) => {
-            let mut parsed_sources = Vec::new();
-            for value in values {
-                let Some(source) = value.as_str() else {
-                    return memory_tool_execution_outcome(
-                        attestation_namespace,
-                        proposal_id,
-                        input_json,
-                        false,
-                        b"{}".to_vec(),
-                        "palyra.memory.search sources must be an array of strings".to_owned(),
-                    );
-                };
-                let Some(memory_source) = parse_memory_source_literal(source) else {
-                    return memory_tool_execution_outcome(
-                        attestation_namespace,
-                        proposal_id,
-                        input_json,
-                        false,
-                        b"{}".to_vec(),
-                        format!("palyra.memory.search unknown source value: {source}"),
-                    );
-                };
-                parsed_sources.push(memory_source);
-            }
-            parsed_sources
-        }
-        Some(_) => {
+    let sources = match parse_memory_search_sources(&parsed) {
+        Ok(sources) => sources,
+        Err(error) => {
             return memory_tool_execution_outcome(
                 attestation_namespace,
                 proposal_id,
                 input_json,
                 false,
                 b"{}".to_vec(),
-                "palyra.memory.search sources must be an array of strings".to_owned(),
+                error,
             );
         }
-        None => Vec::new(),
     };
 
     let search_hits = match runtime_state
@@ -1658,6 +1799,53 @@ pub(crate) async fn execute_memory_search_tool(
             b"{}".to_vec(),
             format!("palyra.memory.search failed to serialize output: {error}"),
         ),
+    }
+}
+
+fn parse_memory_search_tags(parsed: &Map<String, Value>) -> Result<Vec<String>, String> {
+    match parsed.get("tags") {
+        Some(Value::Array(values)) => {
+            if values.len() > MAX_MEMORY_TOOL_TAGS {
+                return Err(format!(
+                    "palyra.memory.search tags exceeds limit ({})",
+                    MAX_MEMORY_TOOL_TAGS
+                ));
+            }
+            let mut parsed_tags = Vec::new();
+            for value in values {
+                let Some(tag) = value.as_str() else {
+                    return Err("palyra.memory.search tags must be strings".to_owned());
+                };
+                if !tag.trim().is_empty() {
+                    parsed_tags.push(tag.trim().to_owned());
+                }
+            }
+            Ok(parsed_tags)
+        }
+        Some(_) => Err("palyra.memory.search tags must be an array of strings".to_owned()),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn parse_memory_search_sources(parsed: &Map<String, Value>) -> Result<Vec<MemorySource>, String> {
+    match parsed.get("sources") {
+        Some(Value::Array(values)) => {
+            let mut parsed_sources = Vec::new();
+            for value in values {
+                let Some(source) = value.as_str() else {
+                    return Err(
+                        "palyra.memory.search sources must be an array of strings".to_owned()
+                    );
+                };
+                let Some(memory_source) = parse_memory_source_literal(source) else {
+                    return Err(format!("palyra.memory.search unknown source value: {source}"));
+                };
+                parsed_sources.push(memory_source);
+            }
+            Ok(parsed_sources)
+        }
+        Some(_) => Err("palyra.memory.search sources must be an array of strings".to_owned()),
+        None => Ok(Vec::new()),
     }
 }
 
@@ -3310,11 +3498,11 @@ mod tests {
     }
 
     #[test]
-    fn memory_tool_scopes_default_to_principal_memory() {
+    fn memory_tool_scopes_default_to_all_memory_search() {
         let parsed = Map::new();
 
         assert_eq!(memory_retain_scope_text(&parsed), "principal");
-        assert_eq!(memory_search_scope_text(&parsed), "principal");
+        assert_eq!(memory_search_scope_text(&parsed), "all");
         assert_eq!(memory_recall_workspace_scope_text(&parsed), "workspace");
 
         let mut explicit = Map::new();
