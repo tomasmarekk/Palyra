@@ -5725,14 +5725,16 @@ mod tests {
         assert_eq!(anthropic_payload["messages"][1]["role"], "assistant");
         assert_eq!(anthropic_payload["messages"][1]["content"][0]["type"], "tool_use");
         assert_eq!(anthropic_payload["messages"][1]["content"][0]["id"], "call_01");
-        assert_eq!(anthropic_payload["messages"][1]["content"][1]["type"], "tool_use");
-        assert_eq!(anthropic_payload["messages"][1]["content"][1]["id"], "call_02");
         assert_eq!(anthropic_payload["messages"][2]["role"], "user");
         assert_eq!(anthropic_payload["messages"][2]["content"][0]["type"], "tool_result");
         assert_eq!(anthropic_payload["messages"][2]["content"][0]["tool_use_id"], "call_01");
-        assert_eq!(anthropic_payload["messages"][2]["content"][1]["type"], "tool_result");
-        assert_eq!(anthropic_payload["messages"][2]["content"][1]["tool_use_id"], "call_02");
-        assert_eq!(anthropic_payload["messages"].as_array().unwrap().len(), 3);
+        assert_eq!(anthropic_payload["messages"][3]["role"], "assistant");
+        assert_eq!(anthropic_payload["messages"][3]["content"][0]["type"], "tool_use");
+        assert_eq!(anthropic_payload["messages"][3]["content"][0]["id"], "call_02");
+        assert_eq!(anthropic_payload["messages"][4]["role"], "user");
+        assert_eq!(anthropic_payload["messages"][4]["content"][0]["type"], "tool_result");
+        assert_eq!(anthropic_payload["messages"][4]["content"][0]["tool_use_id"], "call_02");
+        assert_eq!(anthropic_payload["messages"].as_array().unwrap().len(), 5);
     }
 
     #[test]

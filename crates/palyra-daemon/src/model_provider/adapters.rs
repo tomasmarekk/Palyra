@@ -4,7 +4,7 @@ use crate::application::tool_registry::{provider_tools_from_catalog_snapshot, To
 
 use super::{
     ProviderImageInput, ProviderMessage, ProviderMessageContentPart, ProviderMessageRole,
-    ProviderRequest,
+    ProviderMessageToolCall, ProviderRequest,
 };
 
 const DEFAULT_ANTHROPIC_MAX_OUTPUT_TOKENS: u64 = 4_096;
@@ -105,6 +105,16 @@ fn build_anthropic_content_parts(message: &ProviderMessage) -> Vec<Value> {
         return vec![build_anthropic_tool_result_content_part(message)];
     }
 
+    let mut parts = build_anthropic_non_tool_content_parts(message);
+    if message.role == ProviderMessageRole::Assistant {
+        for tool_call in &message.tool_calls {
+            parts.push(build_anthropic_tool_use_content_part(tool_call));
+        }
+    }
+    parts
+}
+
+fn build_anthropic_non_tool_content_parts(message: &ProviderMessage) -> Vec<Value> {
     let mut parts = Vec::new();
     for content_part in &message.content {
         match content_part {
@@ -126,17 +136,16 @@ fn build_anthropic_content_parts(message: &ProviderMessage) -> Vec<Value> {
             }
         }
     }
-    if message.role == ProviderMessageRole::Assistant {
-        for tool_call in &message.tool_calls {
-            parts.push(json!({
-                "type": "tool_use",
-                "id": tool_call.proposal_id.as_str(),
-                "name": tool_call.tool_name.as_str(),
-                "input": &tool_call.input_json,
-            }));
-        }
-    }
     parts
+}
+
+fn build_anthropic_tool_use_content_part(tool_call: &ProviderMessageToolCall) -> Value {
+    json!({
+        "type": "tool_use",
+        "id": tool_call.proposal_id.as_str(),
+        "name": tool_call.tool_name.as_str(),
+        "input": &tool_call.input_json,
+    })
 }
 
 fn build_anthropic_tool_result_content_part(message: &ProviderMessage) -> Value {
@@ -145,6 +154,58 @@ fn build_anthropic_tool_result_content_part(message: &ProviderMessage) -> Value 
         "tool_use_id": message.tool_call_id.as_deref().unwrap_or_default(),
         "content": message.text_content(),
     })
+}
+
+// Some Anthropic-compatible endpoints validate flattened content block order and reject
+// `tool_use, tool_use, tool_result, tool_result`, even when official clients accept it.
+fn push_anthropic_expanded_multi_tool_exchange(
+    provider_messages: &mut Vec<Value>,
+    assistant_message: &ProviderMessage,
+    following_messages: &[ProviderMessage],
+) -> Option<usize> {
+    if assistant_message.role != ProviderMessageRole::Assistant
+        || assistant_message.tool_calls.len() < 2
+    {
+        return None;
+    }
+
+    let tool_result_count = following_messages
+        .iter()
+        .take_while(|message| message.role == ProviderMessageRole::Tool)
+        .count();
+    if tool_result_count != assistant_message.tool_calls.len() {
+        return None;
+    }
+
+    let tool_result_messages = &following_messages[..tool_result_count];
+    if !assistant_message.tool_calls.iter().zip(tool_result_messages).all(
+        |(tool_call, tool_result_message)| {
+            tool_result_message.tool_call_id.as_deref() == Some(tool_call.proposal_id.as_str())
+        },
+    ) {
+        return None;
+    }
+
+    for (index, (tool_call, tool_result_message)) in
+        assistant_message.tool_calls.iter().zip(tool_result_messages).enumerate()
+    {
+        let mut assistant_content = if index == 0 {
+            build_anthropic_non_tool_content_parts(assistant_message)
+        } else {
+            Vec::new()
+        };
+        assistant_content.push(build_anthropic_tool_use_content_part(tool_call));
+        provider_messages.push(json!({
+            "role": "assistant",
+            "content": assistant_content,
+        }));
+        provider_messages.push(json!({
+            "role": "user",
+            "content": [build_anthropic_tool_result_content_part(tool_result_message)],
+        }));
+    }
+
+    Some(tool_result_count)
 }
 
 pub(super) fn build_anthropic_messages_and_system(
@@ -173,7 +234,9 @@ pub(super) fn build_anthropic_messages_and_system(
                 "content": std::mem::take(pending_tool_result_parts),
             }));
         };
-    for message in &messages {
+    let mut index = 0;
+    while index < messages.len() {
+        let message = &messages[index];
         match message.role {
             ProviderMessageRole::System | ProviderMessageRole::Developer => {
                 let text = message.text_content();
@@ -189,12 +252,21 @@ pub(super) fn build_anthropic_messages_and_system(
                     &mut provider_messages,
                     &mut pending_tool_result_parts,
                 );
-                provider_messages.push(json!({
-                    "role": message.role.as_anthropic_role(),
-                    "content": build_anthropic_content_parts(message),
-                }));
+                if let Some(consumed_tool_results) = push_anthropic_expanded_multi_tool_exchange(
+                    &mut provider_messages,
+                    message,
+                    &messages[index + 1..],
+                ) {
+                    index = index.saturating_add(consumed_tool_results);
+                } else {
+                    provider_messages.push(json!({
+                        "role": message.role.as_anthropic_role(),
+                        "content": build_anthropic_content_parts(message),
+                    }));
+                }
             }
         }
+        index = index.saturating_add(1);
     }
     flush_pending_tool_result_parts(&mut provider_messages, &mut pending_tool_result_parts);
     (provider_messages, (!system_blocks.is_empty()).then(|| system_blocks.join("\n\n")))
