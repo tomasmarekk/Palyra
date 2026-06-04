@@ -533,17 +533,17 @@ fn memory_session_search_schema_targets_prior_transcripts() {
 }
 
 #[test]
-fn memory_search_schema_defaults_to_principal_scope() {
+fn memory_search_schema_defaults_to_all_scope() {
     let entry = registry_entry("palyra.memory.search").expect("memory search tool entry");
 
     assert_eq!(
         entry.input_schema["properties"]["scope"]["enum"],
-        serde_json::json!(["principal", "session", "channel", "workspace", "project"])
+        serde_json::json!(["all", "principal", "session", "channel", "workspace", "project"])
     );
     assert!(entry.input_schema["properties"]["scope"]["description"]
         .as_str()
         .unwrap_or_default()
-        .contains("Defaults to principal"));
+        .contains("Defaults to all"));
 }
 
 #[test]
