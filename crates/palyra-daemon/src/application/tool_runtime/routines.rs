@@ -634,6 +634,7 @@ async fn upsert_routine(
         workspace_roots_with_run_launch_context(runtime_state, context.run_id.as_str(), &[]).await;
     let workdir = resolve_routine_workdir_from_launch_context(
         trigger_kind,
+        existing_job.is_some(),
         existing_job.as_ref().and_then(|job| job.workdir.clone()),
         requested_workdir,
         workdir_was_requested,
@@ -2348,7 +2349,8 @@ fn normalize_optional_workdir(value: Option<String>) -> Result<Option<String>, S
 }
 
 fn resolve_routine_workdir_from_launch_context(
-    _trigger_kind: RoutineTriggerKind,
+    trigger_kind: RoutineTriggerKind,
+    existing_job_was_present: bool,
     existing_workdir: Option<String>,
     requested_workdir: Option<String>,
     workdir_was_requested: bool,
@@ -2363,8 +2365,18 @@ fn resolve_routine_workdir_from_launch_context(
         };
     }
 
+    if existing_job_was_present {
+        return Ok(existing_workdir);
+    }
+
     if let Some(workdir) = existing_workdir {
         return Ok(Some(workdir));
+    }
+
+    if trigger_kind == RoutineTriggerKind::Schedule {
+        if let Some(launch_root) = launch_workspace_roots.first() {
+            return Ok(Some(launch_root.to_string_lossy().into_owned()));
+        }
     }
 
     Ok(None)
@@ -3245,18 +3257,37 @@ mod tests {
     }
 
     #[test]
-    fn schedule_workdir_stays_unset_for_new_agent_routine_when_omitted() {
+    fn schedule_workdir_defaults_to_launch_workspace_for_new_agent_routine_when_omitted() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let launch_root = std::fs::canonicalize(tempdir.path()).expect("launch root should exist");
 
         let workdir = super::resolve_routine_workdir_from_launch_context(
             RoutineTriggerKind::Schedule,
+            false,
             None,
             None,
             false,
             std::slice::from_ref(&launch_root),
         )
-        .expect("omitted workdir should remain unset");
+        .expect("omitted schedule workdir should inherit launch root");
+
+        assert_eq!(workdir, Some(launch_root.to_string_lossy().into_owned()));
+    }
+
+    #[test]
+    fn explicit_empty_schedule_workdir_remains_unset() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let launch_root = std::fs::canonicalize(tempdir.path()).expect("launch root should exist");
+
+        let workdir = super::resolve_routine_workdir_from_launch_context(
+            RoutineTriggerKind::Schedule,
+            false,
+            None,
+            None,
+            true,
+            std::slice::from_ref(&launch_root),
+        )
+        .expect("explicit empty workdir should stay unset");
 
         assert_eq!(workdir, None);
     }
@@ -3268,6 +3299,7 @@ mod tests {
 
         let workdir = super::resolve_routine_workdir_from_launch_context(
             RoutineTriggerKind::Schedule,
+            true,
             Some("C:/existing/workspace".to_owned()),
             None,
             false,
@@ -3279,12 +3311,31 @@ mod tests {
     }
 
     #[test]
+    fn existing_schedule_without_workdir_stays_unset_when_omitted() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let launch_root = std::fs::canonicalize(tempdir.path()).expect("launch root should exist");
+
+        let workdir = super::resolve_routine_workdir_from_launch_context(
+            RoutineTriggerKind::Schedule,
+            true,
+            None,
+            None,
+            false,
+            std::slice::from_ref(&launch_root),
+        )
+        .expect("existing omitted workdir should preserve absent workdir");
+
+        assert_eq!(workdir, None);
+    }
+
+    #[test]
     fn explicit_workspace_alias_workdir_maps_to_launch_workspace() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let launch_root = std::fs::canonicalize(tempdir.path()).expect("launch root should exist");
 
         let workdir = super::resolve_routine_workdir_from_launch_context(
             RoutineTriggerKind::Schedule,
+            false,
             None,
             Some("/workspace".to_owned()),
             true,
@@ -3306,6 +3357,7 @@ mod tests {
 
         let workdir = super::resolve_routine_workdir_from_launch_context(
             RoutineTriggerKind::Schedule,
+            false,
             None,
             Some("/workspace/reports".to_owned()),
             true,
@@ -3327,6 +3379,7 @@ mod tests {
 
         let workdir = super::resolve_routine_workdir_from_launch_context(
             RoutineTriggerKind::Schedule,
+            false,
             None,
             Some("project".to_owned()),
             true,
