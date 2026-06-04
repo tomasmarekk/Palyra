@@ -2806,20 +2806,36 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         };
 
         if self.runtime.engine_mode == BrowserEngineMode::Chromium {
-            if let Ok(snapshot) = chromium_observe_snapshot(
+            match chromium_observe_snapshot(
                 self.runtime.as_ref(),
                 session_id.as_str(),
                 active_tab_id.as_str(),
             )
             .await
             {
-                let mut sessions = self.runtime.sessions.lock().await;
-                if let Some(session) = sessions.get_mut(session_id.as_str()) {
-                    if let Some(tab) = session.tabs.get_mut(active_tab_id.as_str()) {
-                        tab.last_page_body = snapshot.page_body;
-                        tab.last_title = snapshot.title;
-                        tab.last_url = Some(snapshot.page_url);
+                Ok(snapshot) => {
+                    let mut sessions = self.runtime.sessions.lock().await;
+                    if let Some(session) = sessions.get_mut(session_id.as_str()) {
+                        if let Some(tab) = session.tabs.get_mut(active_tab_id.as_str()) {
+                            tab.last_page_body = snapshot.page_body;
+                            tab.last_title = snapshot.title;
+                            tab.last_url = Some(snapshot.page_url);
+                        }
                     }
+                }
+                Err(error) => {
+                    return Ok(Response::new(browser_v1::ObserveResponse {
+                        v: CANONICAL_PROTOCOL_MAJOR,
+                        success: false,
+                        dom_snapshot: String::new(),
+                        accessibility_tree: String::new(),
+                        visible_text: String::new(),
+                        dom_truncated: false,
+                        accessibility_tree_truncated: false,
+                        visible_text_truncated: false,
+                        page_url: String::new(),
+                        error: format!("failed to observe live Chromium tab: {error}"),
+                    }));
                 }
             }
         }

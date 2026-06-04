@@ -1364,10 +1364,22 @@ async fn browser_service_chromium_engine_executes_real_dom_actions() {
     };
     let _guard = chromium_integration_test_guard().await;
     let (url, handle) = spawn_static_http_server_with_request_budget(
-            200,
-            "<html><head><title>Chromium Fixture</title><script>function markClicked(){document.getElementById('status').textContent='clicked';}function markTyped(value){document.getElementById('typed-status').textContent=value;}</script></head><body><input id='name-input' oninput='markTyped(this.value)' /><button id='submit-btn' onclick='markClicked()'>Submit</button><div id='typed-status'>empty</div><div id='status'>idle</div></body></html>",
-            8,
-        );
+        200,
+        r#"<html><head><title>Chromium Fixture</title><script>
+function markClicked(){document.getElementById('status').textContent='clicked';}
+function markTyped(value){document.getElementById('typed-status').textContent=value;}
+function markFiltered(){document.getElementById('filter-status').textContent='filtered:active';}
+</script></head><body>
+<input id='name-input' oninput='markTyped(this.value)' />
+<button id='submit-btn' onclick='markClicked()'>Submit</button>
+<button class='filter' data-filter='active' onclick='markFiltered()'>Active</button>
+<div id='current-user'>Ada</div>
+<div id='typed-status'>empty</div>
+<div id='filter-status'>filter:idle</div>
+<div id='status'>idle</div>
+</body></html>"#,
+        8,
+    );
     let runtime = std::sync::Arc::new(
         BrowserRuntimeState::new(&Args {
             bind: "127.0.0.1".to_owned(),
@@ -1462,6 +1474,80 @@ async fn browser_service_chromium_engine_executes_real_dom_actions() {
         "chromium wait_for should observe DOM input event after type: {}",
         typed_wait.error
     );
+
+    let filter_ready = service
+        .wait_for(Request::new(browser_v1::WaitForRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            selector: "button.filter[data-filter=\"active\"]".to_owned(),
+            text: String::new(),
+            timeout_ms: 5_000,
+            poll_interval_ms: 50,
+            capture_failure_screenshot: true,
+            max_failure_screenshot_bytes: 16 * 1024,
+        }))
+        .await
+        .expect("wait_for action selector should execute")
+        .into_inner();
+    assert!(
+        filter_ready.success,
+        "chromium wait_for should resolve the action selector before click: {}",
+        filter_ready.error
+    );
+
+    let filter_click = service
+        .click(Request::new(browser_v1::ClickRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            selector: "button.filter[data-filter=\"active\"]".to_owned(),
+            max_retries: 2,
+            timeout_ms: 3_000,
+            capture_failure_screenshot: true,
+            max_failure_screenshot_bytes: 16 * 1024,
+        }))
+        .await
+        .expect("CSS selector click should execute")
+        .into_inner();
+    assert!(
+        filter_click.success,
+        "chromium click should use the same live CSS selector semantics as wait_for: {}",
+        filter_click.error
+    );
+
+    let filter_wait = service
+        .wait_for(Request::new(browser_v1::WaitForRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            selector: "#filter-status".to_owned(),
+            text: "filtered:active".to_owned(),
+            timeout_ms: 5_000,
+            poll_interval_ms: 50,
+            capture_failure_screenshot: true,
+            max_failure_screenshot_bytes: 16 * 1024,
+        }))
+        .await
+        .expect("wait_for filter side-effect should execute")
+        .into_inner();
+    assert!(
+        filter_wait.success,
+        "chromium wait_for should observe DOM change after CSS selector click: {}",
+        filter_wait.error
+    );
+
+    let highlight = service
+        .highlight(Request::new(browser_v1::HighlightRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            selector: "#current-user".to_owned(),
+            timeout_ms: 3_000,
+            duration_ms: 500,
+            capture_failure_screenshot: true,
+            max_failure_screenshot_bytes: 16 * 1024,
+        }))
+        .await
+        .expect("highlight should execute")
+        .into_inner();
+    assert!(highlight.success, "chromium highlight should succeed: {}", highlight.error);
 
     let click = service
         .click(Request::new(browser_v1::ClickRequest {
@@ -1859,25 +1945,6 @@ window.addEventListener('DOMContentLoaded',render);
     assert!(second.state_restored, "second session should restore profile snapshot");
     let second_session_id = second.session_id.expect("second session id should be present");
 
-    let restored_navigate = service
-        .navigate(Request::new(browser_v1::NavigateRequest {
-            v: 1,
-            session_id: Some(second_session_id.clone()),
-            url,
-            timeout_ms: 8_000,
-            allow_redirects: true,
-            max_redirects: 3,
-            allow_private_targets: true,
-        }))
-        .await
-        .expect("second navigate should execute")
-        .into_inner();
-    assert!(
-        restored_navigate.success,
-        "second navigate should restore localStorage before page code runs: {}",
-        restored_navigate.error
-    );
-
     let restored = service
         .wait_for(Request::new(browser_v1::WaitForRequest {
             v: 1,
@@ -1894,7 +1961,7 @@ window.addEventListener('DOMContentLoaded',render);
         .into_inner();
     assert!(
         restored.success,
-        "restored persistent profile should expose localStorage-backed cart state: {}",
+        "restored persistent profile should expose live localStorage-backed cart state without manual navigation: {}",
         restored.error
     );
 

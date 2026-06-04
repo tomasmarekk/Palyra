@@ -1796,6 +1796,8 @@ pub(crate) async fn initialize_chromium_session_runtime(
     let allow_private_targets = session.allow_private_targets;
     let navigation_timeout = Duration::from_millis(session.budget.max_navigation_timeout_ms.max(1));
     let active_tab_id = session.active_tab_id.clone();
+    let restored_tabs = session.tabs.clone();
+    let storage_entries_by_origin = session.storage_entries.clone();
     let mut tab_order = session.tab_order.clone();
     if tab_order.is_empty() {
         tab_order.push(active_tab_id.clone());
@@ -1833,6 +1835,21 @@ pub(crate) async fn initialize_chromium_session_runtime(
                     Arc::clone(&security_incident),
                     "failed to create Chromium tab for session restore",
                 )?;
+                if let Some(restored_tab) = restored_tabs.get(tab_id.as_str()) {
+                    if let Err(error) = restore_chromium_tab_live_state(
+                        &tab,
+                        tab_id.as_str(),
+                        restored_tab,
+                        &storage_entries_by_origin,
+                        navigation_timeout,
+                    ) {
+                        warn!(
+                            tab_id = tab_id.as_str(),
+                            error = error.as_str(),
+                            "failed to restore live Chromium tab state from persisted snapshot"
+                        );
+                    }
+                }
                 tabs.insert(tab_id.clone(), tab);
                 network_logs.insert(tab_id.clone(), network_log);
                 download_captures.insert(tab_id.clone(), download_capture);
@@ -1857,6 +1874,67 @@ pub(crate) async fn initialize_chromium_session_runtime(
     );
     chromium_session._proxy = Some(proxy);
     runtime.chromium_sessions.lock().await.insert(session_id.to_owned(), chromium_session);
+    Ok(())
+}
+
+fn restore_chromium_tab_live_state(
+    tab: &Arc<HeadlessTab>,
+    tab_id: &str,
+    restored_tab: &BrowserTabRecord,
+    storage_entries_by_origin: &HashMap<String, HashMap<String, String>>,
+    navigation_timeout: Duration,
+) -> Result<(), String> {
+    let Some(raw_url) = restored_tab
+        .last_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty() && !url.eq_ignore_ascii_case("about:blank"))
+    else {
+        return Ok(());
+    };
+    tab.set_default_timeout(navigation_timeout);
+    tab.navigate_to(raw_url).map_err(|error| {
+        format!("failed to restore Chromium tab {tab_id} URL {raw_url}: {error}")
+    })?;
+    tab.wait_until_navigated().map_err(|error| {
+        format!("Chromium tab {tab_id} restore navigation timed out for {raw_url}: {error}")
+    })?;
+    let mut page_url = tab.get_url();
+    if let Some(origin) = url_origin_key(page_url.as_str()) {
+        if let Some(entries) =
+            storage_entries_by_origin.get(origin.as_str()).filter(|entries| !entries.is_empty())
+        {
+            let script = chromium_restore_local_storage_script(entries)?;
+            let raw_value = tab
+                .evaluate(script.as_str(), true)
+                .map_err(|error| {
+                    format!("failed to restore Chromium localStorage for {origin}: {error}")
+                })?
+                .value
+                .unwrap_or_else(|| serde_json::Value::String("{}".to_owned()));
+            parse_chromium_local_storage_restore_status(decode_chromium_json_script_value(
+                raw_value,
+            ))
+            .map_err(|error| format!("{error} for {origin}"))?;
+            tab.navigate_to(page_url.as_str()).map_err(|error| {
+                format!(
+                    "failed to reload Chromium tab {tab_id} after localStorage restore: {error}"
+                )
+            })?;
+            tab.wait_until_navigated().map_err(|error| {
+                format!(
+                    "Chromium tab {tab_id} reload after localStorage restore timed out: {error}"
+                )
+            })?;
+            page_url = tab.get_url();
+        }
+    }
+    if restored_tab.scroll_x != 0 || restored_tab.scroll_y != 0 {
+        let script =
+            format!("window.scrollTo({}, {}); true", restored_tab.scroll_x, restored_tab.scroll_y);
+        let _ = tab.evaluate(script.as_str(), true);
+    }
+    let _ = page_url;
     Ok(())
 }
 
@@ -3189,6 +3267,7 @@ pub(crate) async fn click_with_chromium(
     enum ClickAttempt {
         Clicked { download_like: bool },
         DownloadBlocked,
+        Disabled,
         NotFound,
     }
 
@@ -3208,39 +3287,32 @@ pub(crate) async fn click_with_chromium(
     loop {
         attempts = attempts.saturating_add(1);
         let selector_for_attempt = selector.to_owned();
-        let tab_id_for_attempt = tab_id.clone();
         let tab_for_attempt = Arc::clone(&tab);
         let attempt = run_chromium_blocking("chromium click", move || {
-            let page_body = tab_for_attempt
-                .get_content()
-                .map_err(|error| format!("failed to read Chromium DOM before click: {error}"))?;
-            if let Some(tag) =
-                find_matching_html_tag(selector_for_attempt.as_str(), page_body.as_str())
-            {
-                if is_download_like_tag(tag.as_str()) && !allow_downloads {
-                    return Ok(ClickAttempt::DownloadBlocked);
-                }
-                let element = tab_for_attempt.find_element(selector_for_attempt.as_str()).map_err(
-                    |error| {
-                        let action_context =
-                            chromium_action_context(tab_id_for_attempt.as_str(), tab_for_attempt.get_url().as_str());
-                        format!(
-                            "selector '{}' was present in the live Chromium DOM for {action_context}, but Chromium could not resolve it for click: {error}; call observe to verify the active tab and retry with a current selector",
-                            selector_for_attempt,
-                        )
-                    },
-                )?;
-                element.click().map_err(|error| {
-                    let action_context =
-                        chromium_action_context(tab_id_for_attempt.as_str(), tab_for_attempt.get_url().as_str());
+            let script = chromium_click_script(selector_for_attempt.as_str(), allow_downloads)?;
+            let raw_value = tab_for_attempt
+                .evaluate(script.as_str(), true)
+                .map_err(|error| {
                     format!(
-                        "selector '{}' was present in the live Chromium DOM for {action_context}, but click did not complete before the actionability timeout: {error}; inspect visibility, disabled state, overlays, active tab, and viewport before retrying",
-                        selector_for_attempt,
+                        "failed to execute Chromium click script for selector '{}': {error}",
+                        selector_for_attempt
                     )
-                })?;
-                Ok(ClickAttempt::Clicked { download_like: is_download_like_tag(tag.as_str()) })
-            } else {
-                Ok(ClickAttempt::NotFound)
+                })?
+                .value
+                .unwrap_or(serde_json::Value::Null);
+            let value = decode_chromium_json_script_value(raw_value);
+            let status =
+                value.get("status").and_then(serde_json::Value::as_str).unwrap_or_default();
+            match status {
+                "clicked" => Ok(ClickAttempt::Clicked { download_like: false }),
+                "download_allowed" => Ok(ClickAttempt::Clicked { download_like: true }),
+                "download_blocked" => Ok(ClickAttempt::DownloadBlocked),
+                "disabled" => Ok(ClickAttempt::Disabled),
+                "not_found" => Ok(ClickAttempt::NotFound),
+                _ => Err(format!(
+                    "Chromium click script returned unexpected status '{}' for selector '{}'",
+                    status, selector_for_attempt
+                )),
             }
         })
         .await;
@@ -3266,6 +3338,14 @@ pub(crate) async fn click_with_chromium(
                     error:
                         "download-like click is blocked by session policy (allow_downloads=false)"
                             .to_owned(),
+                    attempts,
+                };
+            }
+            Ok(ClickAttempt::Disabled) => {
+                return ChromiumActionOutcome {
+                    success: false,
+                    outcome: "selector_disabled".to_owned(),
+                    error: format!("selector '{selector}' is disabled"),
                     attempts,
                 };
             }
@@ -3300,6 +3380,47 @@ pub(crate) async fn click_with_chromium(
         .await,
         attempts,
     }
+}
+
+fn chromium_click_script(selector: &str, allow_downloads: bool) -> Result<String, String> {
+    let selector_json = serde_json::to_string(selector)
+        .map_err(|error| format!("failed to encode selector for Chromium click: {error}"))?;
+    let allow_downloads_json = if allow_downloads { "true" } else { "false" };
+    Ok(format!(
+        r#"
+(() => {{
+  const selector = {selector_json};
+  const allowDownloads = {allow_downloads_json};
+  const respond = (payload) => JSON.stringify(payload);
+  const element = document.querySelector(selector);
+  if (!element) {{
+    return respond({{ status: "not_found" }});
+  }}
+  const tagName = String(element.tagName || "").toLowerCase();
+  const href = String(element.getAttribute("href") || "").split("?")[0].toLowerCase();
+  const hasDownloadAttribute = element.hasAttribute("download");
+  const downloadLike = tagName === "a" && (
+    hasDownloadAttribute ||
+    [".zip", ".gz", ".tar", ".7z", ".rar", ".pdf", ".csv", ".json", ".txt", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".exe", ".msi"]
+      .some((suffix) => href.endsWith(suffix))
+  );
+  if (downloadLike && !allowDownloads) {{
+    return respond({{ status: "download_blocked" }});
+  }}
+  if (element.disabled || element.getAttribute("aria-disabled") === "true") {{
+    return respond({{ status: "disabled" }});
+  }}
+  if (typeof element.scrollIntoView === "function") {{
+    element.scrollIntoView({{ block: "center", inline: "center", behavior: "auto" }});
+  }}
+  if (typeof element.focus === "function") {{
+    try {{ element.focus({{ preventScroll: true }}); }} catch (_) {{ element.focus(); }}
+  }}
+  element.click();
+  return respond({{ status: downloadLike ? "download_allowed" : "clicked" }});
+}})()
+"#
+    ))
 }
 
 pub(crate) async fn type_with_chromium(
@@ -3941,9 +4062,10 @@ pub(crate) async fn highlight_with_chromium(
 (() => {{
   const selector = {selector_json};
   const durationMs = {duration_ms};
+  const respond = (payload) => JSON.stringify(payload);
   const element = document.querySelector(selector);
   if (!element) {{
-    return {{ status: "not_found" }};
+    return respond({{ status: "not_found" }});
   }}
   const rect = element.getBoundingClientRect();
   const existing = document.getElementById("__palyra-highlight-overlay");
@@ -3969,18 +4091,18 @@ pub(crate) async fn highlight_with_chromium(
       current.remove();
     }}
   }}, durationMs);
-  return {{ status: "highlighted" }};
+  return respond({{ status: "highlighted" }});
 }})()
 "#
     );
     let result = run_chromium_blocking("chromium highlight", move || {
         tab.set_default_timeout(Duration::from_millis(timeout_ms.max(1)));
         let value = tab
-            .evaluate(script.as_str(), false)
+            .evaluate(script.as_str(), true)
             .map_err(|error| format!("failed to execute Chromium highlight script: {error}"))?
             .value
             .unwrap_or(serde_json::Value::Null);
-        Ok(value)
+        Ok(decode_chromium_json_script_value(value))
     })
     .await;
     match result {
