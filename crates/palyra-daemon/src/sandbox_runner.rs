@@ -4014,16 +4014,22 @@ fn build_windows_tier_b_process_command(
     args: &[String],
     cwd: &Path,
 ) -> Result<Command, SandboxProcessRunError> {
+    let current_dir = windows_process_current_dir(cwd);
     if windows_program_requires_cmd_wrapper(program) {
         let mut command = Command::new(windows_command_processor());
         command.raw_arg(format!("/D /S /C {}", windows_cmd_wrapper_command_line(program, args)?));
-        command.current_dir(cwd);
+        command.current_dir(current_dir.as_path());
         return Ok(command);
     }
 
     let mut command = Command::new(program);
-    command.args(args).current_dir(cwd);
+    command.args(args).current_dir(current_dir.as_path());
     Ok(command)
+}
+
+#[cfg(windows)]
+fn windows_process_current_dir(cwd: &Path) -> PathBuf {
+    windows_deverbatim_path_string(cwd).map(PathBuf::from).unwrap_or_else(|| cwd.to_path_buf())
 }
 
 #[cfg(windows)]
@@ -5570,6 +5576,19 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
+    fn windows_process_current_dir_deverbatims_canonical_cwd() {
+        assert_eq!(
+            super::windows_process_current_dir(Path::new(r"\\?\C:\Users\Palo\fixture")),
+            PathBuf::from(r"C:\Users\Palo\fixture")
+        );
+        assert_eq!(
+            super::windows_process_current_dir(Path::new(r"\\?\UNC\server\share\fixture")),
+            PathBuf::from(r"\\server\share\fixture")
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn windows_cmd_wrapper_rejects_env_expansion_arguments() {
         let error = super::windows_cmd_wrapper_command_line(
             Path::new(r"C:\Tools\nodejs\npm.cmd"),
@@ -5601,6 +5620,60 @@ mod tests {
             .expect("stdout should be present in process output");
 
         assert!(stdout.contains("batch-wrapper:world"), "{stdout:?}");
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn host_access_process_runner_runs_pnpm_from_verbatim_workspace_cwd() {
+        let pnpm_version_output = match Command::new("pnpm").arg("--version").output() {
+            Ok(output) if output.status.success() => output,
+            _ => return,
+        };
+        let pnpm_version =
+            String::from_utf8_lossy(pnpm_version_output.stdout.as_slice()).trim().to_owned();
+        if pnpm_version.is_empty() {
+            return;
+        }
+
+        let workspace = unique_temp_dir("workspace-pnpm-verbatim");
+        fs::create_dir_all(workspace.join("scripts")).expect("workspace scripts should exist");
+        fs::write(
+            workspace.join("package.json"),
+            format!(
+                r#"{{
+  "name": "palyra-process-pnpm-smoke",
+  "private": true,
+  "packageManager": "pnpm@{pnpm_version}",
+  "scripts": {{
+    "test": "node scripts/verify-helper.mjs"
+  }}
+}}
+"#
+            ),
+        )
+        .expect("package.json should be written");
+        fs::write(
+            workspace.join("scripts").join("verify-helper.mjs"),
+            "console.log('S046_HELPER_OK');\n",
+        )
+        .expect("verify helper should be written");
+        let verbatim_workspace = PathBuf::from(format!(r"\\?\{}", workspace.to_string_lossy()));
+        let policy = host_access_policy(verbatim_workspace);
+        let input = br#"{"command":"pnpm","args":["test"],"timeout_ms":15000}"#;
+
+        let result = run_constrained_process(&policy, input, Duration::from_millis(20_000))
+            .expect("host-access process runner should execute pnpm from a verbatim workspace cwd");
+        let output: serde_json::Value =
+            serde_json::from_slice(&result.output_json).expect("output should parse");
+        let stdout = output.get("stdout").and_then(serde_json::Value::as_str).unwrap_or_default();
+        let stderr = output.get("stderr").and_then(serde_json::Value::as_str).unwrap_or_default();
+
+        assert!(
+            stdout.contains("S046_HELPER_OK") || stderr.contains("S046_HELPER_OK"),
+            "pnpm test should reach the package script, stdout={stdout:?}, stderr={stderr:?}"
+        );
 
         let _ = fs::remove_dir_all(workspace.as_path());
     }
