@@ -266,6 +266,85 @@ fn palyra_daemon_run_inspection_supports_json_output() -> Result<()> {
 }
 
 #[test]
+fn palyra_daemon_run_tape_compact_omits_large_tool_catalog_snapshot() -> Result<()> {
+    let run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAX";
+    let tool_catalog_payload = serde_json::json!({
+        "tools": [
+            {
+                "name": "palyra.fs.apply_patch",
+                "schema": {
+                    "description": "large schema details should remain available only in full mode"
+                }
+            }
+        ]
+    })
+    .to_string();
+    let fixture_body = serde_json::json!({
+        "run_id": run_id,
+        "returned_bytes": tool_catalog_payload.len() + 13,
+        "next_after_seq": 8,
+        "events": [
+            {
+                "seq": 7,
+                "event_type": "model_token",
+                "payload_json": "{\"text\":\"ok\"}"
+            },
+            {
+                "seq": 8,
+                "event_type": "tool_catalog_snapshot",
+                "payload_json": tool_catalog_payload
+            }
+        ]
+    })
+    .to_string();
+    let fixture = spawn_json_fixture(format!("/admin/v1/runs/{run_id}/tape"), fixture_body)?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .args([
+            "daemon",
+            "run-tape",
+            "--url",
+            fixture.base_url.as_str(),
+            "--run-id",
+            run_id,
+            "--limit",
+            "2",
+            "--compact",
+            "--json",
+        ])
+        .output()
+        .context("failed to execute palyra daemon run-tape with compact JSON output")?;
+    fixture.finish()?;
+
+    assert!(
+        output.status.success(),
+        "run-tape --compact --json should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).context("stdout was not valid UTF-8")?;
+    assert!(
+        !stdout.contains("large schema details"),
+        "compact output should not include full tool catalog schemas: {stdout}"
+    );
+    let payload: serde_json::Value =
+        serde_json::from_str(stdout.as_str()).context("compact run-tape stdout should be JSON")?;
+    assert_eq!(payload.get("projection").and_then(serde_json::Value::as_str), Some("compact"));
+    assert_eq!(
+        payload.pointer("/events/1/event_type").and_then(serde_json::Value::as_str),
+        Some("tool_catalog_snapshot")
+    );
+    assert_eq!(
+        payload.pointer("/events/1/payload_omitted").and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    assert!(payload
+        .pointer("/events/1/summary")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|summary| summary.contains("rerun without --compact")));
+    Ok(())
+}
+
+#[test]
 fn palyra_daemon_run_cancel_rejects_non_canonical_run_id() -> Result<()> {
     let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
         .args(["daemon", "run-cancel", "--run-id", "invalid-ulid"])

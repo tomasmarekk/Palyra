@@ -43,15 +43,97 @@ fn proto_enum_label(name: &str, prefix: &str) -> String {
     name.strip_prefix(prefix).unwrap_or(name).to_ascii_lowercase()
 }
 
+const RUN_TAPE_COMPACT_PREVIEW_BYTES: usize = 2048;
+const TOOL_CATALOG_SNAPSHOT_EVENT: &str = "tool_catalog_snapshot";
+
+#[derive(Debug, serde::Serialize)]
+struct CompactRunTapeResponse {
+    run_id: String,
+    returned_bytes: usize,
+    next_after_seq: Option<i64>,
+    projection: &'static str,
+    events: Vec<CompactRunTapeEvent>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct CompactRunTapeEvent {
+    seq: i64,
+    event_type: String,
+    payload_bytes: usize,
+    payload_truncated: bool,
+    payload_omitted: bool,
+    payload_preview: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+}
+
+fn compact_run_tape_response(response: RunTapeResponse) -> CompactRunTapeResponse {
+    CompactRunTapeResponse {
+        run_id: response.run_id,
+        returned_bytes: response.returned_bytes,
+        next_after_seq: response.next_after_seq,
+        projection: "compact",
+        events: response.events.into_iter().map(compact_run_tape_event).collect(),
+    }
+}
+
+fn compact_run_tape_event(event: RunTapeEvent) -> CompactRunTapeEvent {
+    let payload_bytes = event.payload_json.len();
+    if event.event_type == TOOL_CATALOG_SNAPSHOT_EVENT {
+        return CompactRunTapeEvent {
+            seq: event.seq,
+            event_type: event.event_type,
+            payload_bytes,
+            payload_truncated: true,
+            payload_omitted: true,
+            payload_preview: compact_tool_catalog_snapshot_preview(payload_bytes),
+            summary: Some(
+                "tool catalog snapshot omitted; rerun without --compact to inspect full schemas"
+                    .to_owned(),
+            ),
+        };
+    }
+
+    let (payload_preview, payload_truncated) =
+        truncate_utf8(event.payload_json.as_str(), RUN_TAPE_COMPACT_PREVIEW_BYTES);
+    CompactRunTapeEvent {
+        seq: event.seq,
+        event_type: event.event_type,
+        payload_bytes,
+        payload_truncated,
+        payload_omitted: false,
+        payload_preview,
+        summary: None,
+    }
+}
+
+fn compact_tool_catalog_snapshot_preview(payload_bytes: usize) -> String {
+    format!(
+        "{{\"omitted_event_type\":\"{TOOL_CATALOG_SNAPSHOT_EVENT}\",\"payload_bytes\":{payload_bytes}}}"
+    )
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> (String, bool) {
+    if value.len() <= max_bytes {
+        return (value.to_owned(), false);
+    }
+
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    (value[..end].to_owned(), true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        enrich_gateway_service_action_error, gateway_runtime_root_selection,
-        gateway_status_state_root_scope_note, is_desktop_runtime_state_root,
-        journal_event_actor_label, journal_event_kind_label, read_remote_dashboard_assist_payload,
-        request_desktop_managed_gateway_restart,
+        compact_run_tape_response, enrich_gateway_service_action_error,
+        gateway_runtime_root_selection, gateway_status_state_root_scope_note,
+        is_desktop_runtime_state_root, journal_event_actor_label, journal_event_kind_label,
+        read_remote_dashboard_assist_payload, request_desktop_managed_gateway_restart,
     };
-    use crate::common_v1;
+    use crate::{common_v1, RunTapeEvent, RunTapeResponse};
     use serde_json::json;
     use std::fs;
     use tempfile::tempdir;
@@ -76,6 +158,38 @@ mod tests {
             "remote_assist": { "trust_state": "verified" }
         }))
         .is_some());
+    }
+
+    #[test]
+    fn compact_run_tape_omits_tool_catalog_snapshot_payload() {
+        let response = compact_run_tape_response(RunTapeResponse {
+            run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+            returned_bytes: 5000,
+            next_after_seq: Some(12),
+            events: vec![
+                RunTapeEvent {
+                    seq: 11,
+                    event_type: "model_token".to_owned(),
+                    payload_json: "{\"text\":\"ok\"}".to_owned(),
+                },
+                RunTapeEvent {
+                    seq: 12,
+                    event_type: "tool_catalog_snapshot".to_owned(),
+                    payload_json: "{\"tools\":[{\"name\":\"palyra.fs.apply_patch\",\"schema\":{\"large\":\"value\"}}]}".repeat(64),
+                },
+            ],
+        });
+
+        assert_eq!(response.projection, "compact");
+        assert_eq!(response.events[0].payload_preview, "{\"text\":\"ok\"}");
+        assert!(!response.events[0].payload_omitted);
+        assert!(response.events[1].payload_omitted);
+        assert!(response.events[1].payload_truncated);
+        assert!(!response.events[1].payload_preview.contains("palyra.fs.apply_patch"));
+        assert!(response.events[1]
+            .summary
+            .as_deref()
+            .is_some_and(|summary| summary.contains("rerun without --compact")));
     }
 
     #[test]
@@ -634,6 +748,7 @@ pub(crate) fn run_daemon(command: DaemonCommand) -> Result<()> {
             run_id,
             after_seq,
             limit,
+            compact,
             json,
         } => {
             validate_canonical_id(run_id.as_str())
@@ -672,10 +787,48 @@ pub(crate) fn run_daemon(command: DaemonCommand) -> Result<()> {
                 .json()
                 .context("failed to parse daemon run tape payload")?;
             if output::preferred_json(json) {
-                output::print_json_pretty(
-                    &response,
-                    "failed to encode daemon run tape output as JSON",
-                )?;
+                if compact {
+                    let response = compact_run_tape_response(response);
+                    output::print_json_pretty(
+                        &response,
+                        "failed to encode compact daemon run tape output as JSON",
+                    )?;
+                } else {
+                    output::print_json_pretty(
+                        &response,
+                        "failed to encode daemon run tape output as JSON",
+                    )?;
+                }
+            } else if compact {
+                let response = compact_run_tape_response(response);
+                println!(
+                    "run.tape run_id={} events={} returned_bytes={} projection={} next_after_seq={}",
+                    response.run_id,
+                    response.events.len(),
+                    response.returned_bytes,
+                    response.projection,
+                    response
+                        .next_after_seq
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "none".to_owned())
+                );
+                for event in response.events {
+                    println!(
+                        "run.tape.event seq={} type={} payload_bytes={} payload_truncated={} payload_omitted={} payload_preview={}",
+                        event.seq,
+                        event.event_type,
+                        event.payload_bytes,
+                        event.payload_truncated,
+                        event.payload_omitted,
+                        event.payload_preview
+                    );
+                    if let Some(summary) = event.summary {
+                        println!(
+                            "run.tape.event.summary seq={} type={} summary={}",
+                            event.seq, event.event_type, summary
+                        );
+                    }
+                }
             } else {
                 println!(
                     "run.tape run_id={} events={} returned_bytes={} next_after_seq={}",

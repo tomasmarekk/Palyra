@@ -5142,6 +5142,7 @@ fn parse_daemon_run_tape_with_json() {
         "42",
         "--limit",
         "10",
+        "--compact",
         "--json",
     ]);
     assert_eq!(
@@ -5156,6 +5157,7 @@ fn parse_daemon_run_tape_with_json() {
                 run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
                 after_seq: Some(42),
                 limit: Some(10),
+                compact: true,
                 json: true,
             }
         }

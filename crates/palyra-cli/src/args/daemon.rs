@@ -187,6 +187,8 @@ pub enum DaemonCommand {
         #[arg(long)]
         limit: Option<usize>,
         #[arg(long, default_value_t = false)]
+        compact: bool,
+        #[arg(long, default_value_t = false)]
         json: bool,
     },
     RunCancel {
