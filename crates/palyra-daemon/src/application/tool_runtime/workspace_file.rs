@@ -96,6 +96,8 @@ struct WorkspaceReadFileOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     bytes_base64: Option<String>,
     #[serde(skip_serializing_if = "is_false")]
+    binary: bool,
+    #[serde(skip_serializing_if = "is_false")]
     redacted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     text_authoritative: Option<bool>,
@@ -1632,19 +1634,23 @@ fn read_workspace_file_chunk(
         u64::try_from(buffer.len()).expect("returned workspace file chunk size must fit u64");
     let eof = input.offset_bytes.saturating_add(returned_bytes) >= size_bytes;
     let chunk_sha256 = hex::encode(Sha256::digest(buffer.as_slice()));
-    let (text, bytes_base64, redacted) = match String::from_utf8(buffer) {
-        Ok(text) => {
-            let redaction = redact_text_for_export(
-                text.as_str(),
-                SafetySourceKind::Workspace,
-                SafetyContentKind::WorkspaceDocument,
-                TrustLabel::TrustedLocal,
-            );
-            let redacted = redaction.scan.has_category(SafetyFindingCategory::SecretLeak);
-            let visible_text = if redacted { redaction.redacted_text } else { text };
-            (Some(visible_text), None, redacted)
+    let (text, bytes_base64, binary, redacted) = if chunk_has_binary_control_bytes(&buffer) {
+        (None, Some(BASE64_STANDARD.encode(buffer.as_slice())), true, false)
+    } else {
+        match String::from_utf8(buffer) {
+            Ok(text) => {
+                let redaction = redact_text_for_export(
+                    text.as_str(),
+                    SafetySourceKind::Workspace,
+                    SafetyContentKind::WorkspaceDocument,
+                    TrustLabel::TrustedLocal,
+                );
+                let redacted = redaction.scan.has_category(SafetyFindingCategory::SecretLeak);
+                let visible_text = if redacted { redaction.redacted_text } else { text };
+                (Some(visible_text), None, false, redacted)
+            }
+            Err(error) => (None, Some(BASE64_STANDARD.encode(error.into_bytes())), true, false),
         }
-        Err(error) => (None, Some(BASE64_STANDARD.encode(error.into_bytes())), false),
     };
     let text_authoritative = redacted.then_some(false);
     let redaction_notice = redacted.then(|| {
@@ -1661,10 +1667,15 @@ fn read_workspace_file_chunk(
         chunk_sha256,
         text,
         bytes_base64,
+        binary,
         redacted,
         text_authoritative,
         redaction_notice,
     })
+}
+
+fn chunk_has_binary_control_bytes(bytes: &[u8]) -> bool {
+    bytes.iter().any(|byte| matches!(*byte, 0x00..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F | 0x7F))
 }
 
 fn path_stays_inside_workspace_root(candidate: &Path, root: &Path) -> bool {
@@ -2117,10 +2128,37 @@ mod tests {
         assert_eq!(output.text.as_deref(), Some(contents));
         assert_eq!(output.path, "agent-e2e-tool-test.js");
         assert_eq!(output.bytes_base64, None);
+        assert!(!output.binary);
         assert_eq!(output.returned_bytes, contents.len() as u64);
         assert!(output.eof);
         assert_eq!(output.workspace_root_index, 0);
         assert!(!output.redacted);
+    }
+
+    #[test]
+    fn read_workspace_file_returns_base64_for_binary_control_bytes() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let file_path = tempdir.path().join("app.wasm");
+        let contents = b"\0asm\x01\0\0\0\x01\x04\x01`\0\0";
+        fs::write(file_path, contents).expect("workspace binary file should be written");
+        let input = WorkspaceReadFileInput {
+            path: "app.wasm".to_owned(),
+            workspace_root: None,
+            offset_bytes: 0,
+            max_bytes: None,
+        };
+
+        let output = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
+            .expect("workspace binary file should be readable");
+
+        assert_eq!(output.text, None);
+        assert_eq!(output.bytes_base64, Some(BASE64_STANDARD.encode(contents)));
+        assert!(output.binary);
+        assert!(!output.redacted);
+        assert_eq!(output.text_authoritative, None);
+        assert_eq!(output.redaction_notice, None);
+        assert_eq!(output.returned_bytes, contents.len() as u64);
+        assert!(output.eof);
     }
 
     #[test]
