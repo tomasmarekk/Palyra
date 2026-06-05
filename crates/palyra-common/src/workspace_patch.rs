@@ -985,26 +985,26 @@ fn parse_patch_document(patch: &str) -> Result<Vec<PatchOperation>, WorkspacePat
                     {
                         break;
                     }
-                    let mut chars = candidate.chars();
-                    let Some(prefix) = chars.next() else {
-                        return Err(parse_error(
-                            index + 1,
-                            1,
-                            "hunk line cannot be empty; expected one of ' ', '+', '-'",
-                        ));
-                    };
-                    let text = chars.collect::<String>();
-                    let kind = match prefix {
-                        ' ' => HunkLineKind::Context,
-                        '+' => HunkLineKind::Add,
-                        '-' => HunkLineKind::Remove,
-                        _ => {
-                            return Err(parse_error(
-                                index + 1,
-                                1,
-                                "hunk line must start with ' ', '+', or '-'",
-                            ));
-                        }
+                    let (kind, text) = if candidate.is_empty() {
+                        (HunkLineKind::Context, String::new())
+                    } else {
+                        let mut chars = candidate.chars();
+                        let prefix =
+                            chars.next().expect("non-empty candidate should have first char");
+                        let text = chars.collect::<String>();
+                        let kind = match prefix {
+                            ' ' => HunkLineKind::Context,
+                            '+' => HunkLineKind::Add,
+                            '-' => HunkLineKind::Remove,
+                            _ => {
+                                return Err(parse_error(
+                                    index + 1,
+                                    1,
+                                    "hunk line must start with ' ', '+', '-', or be empty for blank context",
+                                ));
+                            }
+                        };
+                        (kind, text)
                     };
                     lines_in_hunk.push(HunkLine { kind, text });
                     index = index.saturating_add(1);
@@ -2104,6 +2104,34 @@ mod tests {
             fs::read_to_string(workspace.join("test/api.test.js")).expect("file should read"),
             "setTimeout(5);\n"
         );
+    }
+
+    #[test]
+    fn apply_workspace_patch_accepts_bare_blank_update_hunk_context_lines() {
+        let temp = tempdir().expect("tempdir should be created");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(workspace.join("tests")).expect("test directory should exist");
+        fs::write(
+            workspace.join("tests").join("flaky-save.test.ts"),
+            "test('saves setting', async () => {\n  saveSettingAsync('theme', 'dark');\n\n  expect(readSetting('theme')).toBe('dark');\n});\n",
+        )
+        .expect("seed file should exist");
+
+        let patch = "*** Begin Patch\n*** Update File: tests/flaky-save.test.ts\n@@\n-  saveSettingAsync('theme', 'dark');\n+  await saveSettingAsync('theme', 'dark');\n\n   expect(readSetting('theme')).toBe('dark');\n*** End Patch\n";
+        let outcome = apply_workspace_patch(
+            std::slice::from_ref(&workspace),
+            &default_request(patch, false),
+            &default_limits(),
+        )
+        .expect("update hunks should accept bare blank context lines");
+
+        assert_eq!(
+            fs::read_to_string(workspace.join("tests").join("flaky-save.test.ts"))
+                .expect("patched file should read"),
+            "test('saves setting', async () => {\n  await saveSettingAsync('theme', 'dark');\n\n  expect(readSetting('theme')).toBe('dark');\n});\n"
+        );
+        let attestation = attestation_by_path(&outcome, "tests/flaky-save.test.ts");
+        assert_eq!(attestation.operation, "update");
     }
 
     #[test]
