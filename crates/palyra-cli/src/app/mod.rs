@@ -1,6 +1,8 @@
 use std::{
     collections::BTreeMap,
-    env, fs,
+    env,
+    ffi::{OsStr, OsString},
+    fs,
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
@@ -45,6 +47,42 @@ pub(crate) struct RootCommandContext {
     profile: Option<CliConnectionProfile>,
     config_defaults: ConfigConnectionDefaults,
     pub(crate) allow_strict_profile_actions: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ErrorRenderContext {
+    pub(crate) output_format: OutputFormatArg,
+    pub(crate) log_level: LogLevelArg,
+    pub(crate) no_color: bool,
+    pub(crate) trace_id: String,
+    pub(crate) profile_name: Option<String>,
+    pub(crate) state_root: Option<PathBuf>,
+}
+
+impl ErrorRenderContext {
+    pub(crate) fn output_format(&self) -> OutputFormatArg {
+        self.output_format
+    }
+
+    pub(crate) fn log_level(&self) -> LogLevelArg {
+        self.log_level
+    }
+
+    pub(crate) fn no_color(&self) -> bool {
+        self.no_color
+    }
+
+    pub(crate) fn trace_id(&self) -> &str {
+        self.trace_id.as_str()
+    }
+
+    pub(crate) fn profile_name(&self) -> Option<&str> {
+        self.profile_name.as_deref()
+    }
+
+    pub(crate) fn state_root(&self) -> Option<&Path> {
+        self.state_root.as_deref()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -170,6 +208,12 @@ static ROOT_CONTEXT: OnceLock<Mutex<Option<RootCommandContext>>> = OnceLock::new
 fn context_cell() -> &'static Mutex<Option<RootCommandContext>> {
     ROOT_CONTEXT.get_or_init(|| Mutex::new(None))
 }
+
+static ERROR_RENDER_CONTEXT: OnceLock<Mutex<Option<ErrorRenderContext>>> = OnceLock::new();
+fn error_render_context_cell() -> &'static Mutex<Option<ErrorRenderContext>> {
+    ERROR_RENDER_CONTEXT.get_or_init(|| Mutex::new(None))
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) enum ExplicitConfigPathPolicy {
     #[default]
@@ -199,10 +243,61 @@ pub(crate) fn current_root_context() -> Option<RootCommandContext> {
     context_cell().lock().ok().and_then(|guard| guard.as_ref().cloned())
 }
 
+pub(crate) fn install_early_error_context_from_args(args: &[OsString]) -> Result<()> {
+    install_error_render_context(ErrorRenderContext {
+        output_format: resolve_output_format_from_raw_args(args),
+        log_level: resolve_log_level_from_raw_args(args),
+        no_color: raw_flag_present(args, "--no-color"),
+        trace_id: new_cli_trace_id(),
+        profile_name: raw_option_value(args, "--profile")
+            .and_then(|value| normalize_owned_text(Some(value))),
+        state_root: raw_option_value(args, "--state-root")
+            .and_then(|value| normalize_owned_text(Some(value)))
+            .map(PathBuf::from),
+    })
+}
+
+pub(crate) fn install_early_error_context(root: &RootOptions) -> Result<()> {
+    let existing_trace_id = current_error_render_context().map(|context| context.trace_id);
+    install_error_render_context(ErrorRenderContext {
+        output_format: resolve_output_format(root),
+        log_level: resolve_log_level(root),
+        no_color: root.no_color,
+        trace_id: existing_trace_id.unwrap_or_else(new_cli_trace_id),
+        profile_name: normalized_profile_text(root.profile.as_deref()),
+        state_root: normalized_profile_text(root.state_root.as_deref()).map(PathBuf::from),
+    })
+}
+
+pub(crate) fn current_error_render_context() -> Option<ErrorRenderContext> {
+    if let Some(context) = current_root_context() {
+        return Some(ErrorRenderContext {
+            output_format: context.output_format(),
+            log_level: context.log_level(),
+            no_color: context.no_color(),
+            trace_id: context.trace_id().to_owned(),
+            profile_name: context.profile_name().map(ToOwned::to_owned),
+            state_root: Some(context.state_root().to_path_buf()),
+        });
+    }
+    error_render_context_cell().lock().ok().and_then(|guard| guard.as_ref().cloned())
+}
+
+fn install_error_render_context(context: ErrorRenderContext) -> Result<()> {
+    let mut guard = error_render_context_cell()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("CLI error context lock poisoned"))?;
+    *guard = Some(context);
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) fn clear_root_context_for_tests() {
     [CLI_PROFILE_ENV, CLI_PROFILES_PATH_ENV].into_iter().for_each(|key| env::remove_var(key));
     if let Ok(mut guard) = context_cell().lock() {
+        *guard = None;
+    }
+    if let Ok(mut guard) = error_render_context_cell().lock() {
         *guard = None;
     }
 }
@@ -581,6 +676,12 @@ fn build_root_context(
     root: RootOptions,
     explicit_config_path_policy: ExplicitConfigPathPolicy,
 ) -> Result<RootCommandContext> {
+    let output_format = resolve_output_format(&root);
+    let log_level = resolve_log_level(&root);
+    let no_color = root.no_color;
+    let trace_id = current_error_render_context()
+        .map(|context| context.trace_id)
+        .unwrap_or_else(new_cli_trace_id);
     let bootstrap_state_root = resolve_cli_state_root(root.state_root.as_deref())?;
     let profiles_path = resolve_profiles_path(&bootstrap_state_root)?;
     let profiles = load_profiles_document(profiles_path.as_deref())?;
@@ -588,6 +689,14 @@ fn build_root_context(
     let expected_profile_name = normalize_owned_text(root.expect_profile.clone());
     let profile = resolve_profile(profile_name.as_deref(), &profiles)?;
     let state_root = resolve_final_state_root(&root, profile.as_ref())?;
+    install_error_render_context(ErrorRenderContext {
+        output_format,
+        log_level,
+        no_color,
+        trace_id: trace_id.clone(),
+        profile_name: profile_name.clone(),
+        state_root: Some(state_root.clone()),
+    })?;
     let config_path = resolve_config_path(
         &root,
         profile.as_ref(),
@@ -603,10 +712,10 @@ fn build_root_context(
 
     Ok(RootCommandContext {
         cli_state_root: bootstrap_state_root,
-        output_format: resolve_output_format(&root),
-        log_level: resolve_log_level(&root),
-        no_color: root.no_color,
-        trace_id: format!("cli:{}", Ulid::new()),
+        output_format,
+        log_level,
+        no_color,
+        trace_id,
         state_root,
         state_root_explicit: normalize_optional_text(root.state_root.as_deref()).is_some(),
         config_path,
@@ -631,6 +740,92 @@ fn resolve_log_level(root: &RootOptions) -> LogLevelArg {
         1 => LogLevelArg::Debug,
         _ => LogLevelArg::Trace,
     }
+}
+
+fn new_cli_trace_id() -> String {
+    format!("cli:{}", Ulid::new())
+}
+
+fn resolve_output_format_from_raw_args(args: &[OsString]) -> OutputFormatArg {
+    if raw_flag_present(args, "--plain") {
+        return OutputFormatArg::Text;
+    }
+    raw_option_value(args, "--output-format")
+        .and_then(|value| parse_output_format_value(value.as_str()))
+        .unwrap_or_default()
+}
+
+fn resolve_log_level_from_raw_args(args: &[OsString]) -> LogLevelArg {
+    if raw_count_flag(args, "-v") >= 2 {
+        return LogLevelArg::Trace;
+    }
+    if raw_count_flag(args, "-v") == 1 || raw_flag_present(args, "--verbose") {
+        return LogLevelArg::Debug;
+    }
+    raw_option_value(args, "--log-level")
+        .and_then(|value| parse_log_level_value(value.as_str()))
+        .unwrap_or_default()
+}
+
+fn parse_output_format_value(value: &str) -> Option<OutputFormatArg> {
+    match value {
+        "text" => Some(OutputFormatArg::Text),
+        "json" => Some(OutputFormatArg::Json),
+        "ndjson" => Some(OutputFormatArg::Ndjson),
+        _ => None,
+    }
+}
+
+fn parse_log_level_value(value: &str) -> Option<LogLevelArg> {
+    match value {
+        "error" => Some(LogLevelArg::Error),
+        "warn" => Some(LogLevelArg::Warn),
+        "info" => Some(LogLevelArg::Info),
+        "debug" => Some(LogLevelArg::Debug),
+        "trace" => Some(LogLevelArg::Trace),
+        _ => None,
+    }
+}
+
+fn raw_option_value(args: &[OsString], flag: &str) -> Option<String> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == OsStr::new(flag) {
+            return iter.next().and_then(os_string_to_owned_string);
+        }
+        if let Some(arg) = arg.to_str() {
+            if let Some((candidate_flag, value)) = arg.split_once('=') {
+                if candidate_flag == flag {
+                    return Some(value.to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn raw_flag_present(args: &[OsString], flag: &str) -> bool {
+    args.iter().any(|arg| arg == OsStr::new(flag))
+}
+
+fn raw_count_flag(args: &[OsString], short_flag: &str) -> usize {
+    args.iter()
+        .filter_map(|arg| arg.to_str())
+        .map(|arg| {
+            if arg == "--verbose" {
+                return 1;
+            }
+            arg.strip_prefix('-')
+                .filter(|value| !value.starts_with('-'))
+                .filter(|value| value.chars().all(|ch| ch == 'v'))
+                .map(str::len)
+                .unwrap_or_else(|| usize::from(arg == short_flag))
+        })
+        .sum()
+}
+
+fn os_string_to_owned_string(value: &OsString) -> Option<String> {
+    value.to_str().map(ToOwned::to_owned)
 }
 
 fn resolve_profiles_path(base_state_root: &Path) -> Result<Option<PathBuf>> {

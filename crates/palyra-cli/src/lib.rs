@@ -243,6 +243,7 @@ fn run_cli_entrypoint() -> Result<()> {
 
 fn run_cli() -> Result<()> {
     let args = normalize_profile_create_state_root_args(env::args_os().collect());
+    app::install_early_error_context_from_args(args.as_slice())?;
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
         Err(error)
@@ -256,6 +257,7 @@ fn run_cli() -> Result<()> {
         }
         Err(error) => return Err(error.into()),
     };
+    app::install_early_error_context(&cli.root)?;
     let _root_context = match root_context_config_path_policy(&cli.command) {
         app::ExplicitConfigPathPolicy::RequireExisting => {
             app::install_root_context(cli.root.clone())?

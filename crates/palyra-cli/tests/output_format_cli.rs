@@ -60,6 +60,63 @@ fn parse_stderr_json(output: &Output, label: &str) -> Result<Value> {
 }
 
 #[test]
+fn global_output_format_json_is_honored_for_early_cli_errors() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    bootstrap_local_config(&workdir)?;
+
+    let missing_config =
+        run_cli(&workdir, &["--config", "missing.toml", "status", "--output-format", "json"])?;
+    assert!(!missing_config.status.success(), "missing config should fail");
+    let missing_config_payload =
+        parse_stderr_json(&missing_config, "missing config --output-format json")?;
+    assert_eq!(
+        missing_config_payload.pointer("/error/kind").and_then(Value::as_str),
+        Some("not_found")
+    );
+    assert!(
+        missing_config_payload
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.contains("config file does not exist")),
+        "unexpected missing config envelope: {missing_config_payload}"
+    );
+
+    let profile_mismatch =
+        run_cli(&workdir, &["--expect-profile", "prod", "status", "--output-format", "json"])?;
+    assert!(!profile_mismatch.status.success(), "profile mismatch should fail");
+    let profile_mismatch_payload =
+        parse_stderr_json(&profile_mismatch, "profile mismatch --output-format json")?;
+    assert_eq!(
+        profile_mismatch_payload.pointer("/error/kind").and_then(Value::as_str),
+        Some("validation_error")
+    );
+    assert_eq!(
+        profile_mismatch_payload.pointer("/error/profile").and_then(Value::as_str),
+        Some("local")
+    );
+
+    let parser_error = run_cli(
+        &workdir,
+        &["config", "get", "tool_call.allowed_tools", "--output-format", "json"],
+    )?;
+    assert!(!parser_error.status.success(), "parser error should fail");
+    let parser_error_payload = parse_stderr_json(&parser_error, "parser --output-format json")?;
+    assert_eq!(
+        parser_error_payload.pointer("/error/kind").and_then(Value::as_str),
+        Some("validation_error")
+    );
+    assert!(
+        parser_error_payload
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.contains("unexpected argument")),
+        "unexpected parser error envelope: {parser_error_payload}"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn command_level_health_json_reports_unavailable_runtime_as_json() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let output = run_cli(

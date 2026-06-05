@@ -134,10 +134,12 @@ pub(crate) fn preferred_ndjson(explicit_json: bool, explicit_ndjson: bool) -> bo
 pub(crate) fn emit_error(error: &anyhow::Error) -> Result<CliExitCode> {
     let exit_code = classify_error(error);
     let kind = exit_code.kind();
-    let context = app::current_root_context();
+    let context = app::current_error_render_context();
     let trace_id = context.as_ref().map(|value| value.trace_id());
     let profile = context.as_ref().and_then(|value| value.profile_name());
-    let state_root = context.as_ref().map(|value| value.state_root().display().to_string());
+    let state_root = context
+        .as_ref()
+        .and_then(|value| value.state_root().map(|path| path.display().to_string()));
     let log_level =
         context.as_ref().map(|value| format!("{:?}", value.log_level()).to_ascii_lowercase());
     let no_color = context.as_ref().map(|value| value.no_color());
@@ -223,6 +225,15 @@ pub(crate) fn classify_error(error: &anyhow::Error) -> CliExitCode {
     }
     if is_user_cancellation(&lower) {
         return CliExitCode::Cancelled;
+    }
+    if lower.contains("active cli profile mismatch") {
+        return CliExitCode::Validation;
+    }
+    if lower.contains("config file does not exist")
+        || lower.contains("profile config file does not exist")
+        || lower.contains("cli profile not found")
+    {
+        return CliExitCode::NotFound;
     }
     if lower.contains("browser service is disabled")
         || lower.contains("tool_call.browser_service.enabled=false")
