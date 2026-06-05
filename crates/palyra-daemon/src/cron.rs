@@ -79,6 +79,7 @@ pub const MEMORY_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 pub const MEMORY_EMBEDDINGS_BACKFILL_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const MEMORY_EMBEDDINGS_BACKFILL_BATCH_SIZE: usize = 64;
 const CRON_MAX_RUNS_EXHAUSTED_ERROR_KIND: &str = "cron_max_runs_exhausted";
+const ROUTINE_APPROVAL_REQUIRED_ERROR_KIND: &str = "approval_required";
 const OBJECTIVE_BUDGET_EXHAUSTED_ERROR_KIND: &str = "objective_budget_exhausted";
 const OBJECTIVE_BUDGET_EXHAUSTED_ACTION: &str = "budget_exhausted";
 const ROUTINE_APPROVAL_TIMEOUT_SECONDS: u32 = 900;
@@ -1759,7 +1760,9 @@ fn budgeted_cron_run_count(runs: &[CronRunRecord]) -> u32 {
 }
 
 fn is_budgeted_cron_run(run: &CronRunRecord) -> bool {
-    matches!(run.status, CronRunStatus::Succeeded | CronRunStatus::Failed | CronRunStatus::Denied)
+    matches!(run.status, CronRunStatus::Succeeded | CronRunStatus::Failed)
+        || (matches!(run.status, CronRunStatus::Denied)
+            && !is_scheduler_approval_required_denial(run))
 }
 
 fn reserved_cron_run_slot_count(runs: &[CronRunRecord]) -> u32 {
@@ -1775,8 +1778,16 @@ fn is_reserved_cron_run_slot(run: &CronRunRecord) -> bool {
             | CronRunStatus::Running
             | CronRunStatus::Succeeded
             | CronRunStatus::Failed
-            | CronRunStatus::Denied
-    )
+    ) || (matches!(run.status, CronRunStatus::Denied)
+        && !is_scheduler_approval_required_denial(run))
+}
+
+fn is_scheduler_approval_required_denial(run: &CronRunRecord) -> bool {
+    matches!(run.status, CronRunStatus::Denied)
+        && run.error_kind.as_deref() == Some(ROUTINE_APPROVAL_REQUIRED_ERROR_KIND)
+        && run.orchestrator_run_id.is_none()
+        && run.tool_calls == 0
+        && run.tool_denies == 0
 }
 
 async fn apply_cron_max_runs_exhaustion(
@@ -2097,7 +2108,7 @@ async fn enforce_scheduled_routine_approval(
         Arc::clone(&state),
         job,
         CronRunStatus::Denied,
-        "approval_required",
+        ROUTINE_APPROVAL_REQUIRED_ERROR_KIND,
         "routine approval is required before the first scheduled run",
     )
     .await
@@ -3309,8 +3320,8 @@ mod tests {
         visible_cron_job_enabled, ConcurrencyDecision, CronMatcher, CronMisfireRecoveryAction,
         CronTimezoneMode, InstalledSkillRecord, InstalledSkillsIndex, SchedulerHealthInput,
         TriggerJobOptions, CRON_MAX_RUNS_EXHAUSTED_ERROR_KIND,
-        OBJECTIVE_BUDGET_EXHAUSTED_ERROR_KIND, SCHEDULER_STALE_RUN_AFTER_MS,
-        SKILLS_INDEX_FILE_NAME, SKILLS_LAYOUT_VERSION,
+        OBJECTIVE_BUDGET_EXHAUSTED_ERROR_KIND, ROUTINE_APPROVAL_REQUIRED_ERROR_KIND,
+        SCHEDULER_STALE_RUN_AFTER_MS, SKILLS_INDEX_FILE_NAME, SKILLS_LAYOUT_VERSION,
     };
     use crate::access_control::{AccessRegistry, FEATURE_ROUTINES_AUTOMATION};
     use crate::gateway::proto::palyra::cron::v1 as cron_v1;
@@ -3399,6 +3410,8 @@ mod tests {
         succeeded.orchestrator_run_id = Some("orch-1".to_owned());
         let mut denied = sample_cron_run(CronRunStatus::Denied, 20);
         denied.orchestrator_run_id = Some("orch-2".to_owned());
+        let mut approval_required_denied = sample_cron_run(CronRunStatus::Denied, 25);
+        approval_required_denied.error_kind = Some(ROUTINE_APPROVAL_REQUIRED_ERROR_KIND.to_owned());
         let active = sample_cron_run(CronRunStatus::Running, 30);
         let skipped_without_orchestrator = sample_cron_run(CronRunStatus::Skipped, 40);
         let mut skipped_with_orchestrator = sample_cron_run(CronRunStatus::Skipped, 42);
@@ -3411,6 +3424,7 @@ mod tests {
         let runs = vec![
             succeeded,
             denied,
+            approval_required_denied,
             active,
             skipped_without_orchestrator,
             skipped_with_orchestrator,
@@ -3426,11 +3440,22 @@ mod tests {
         let succeeded = sample_cron_run(CronRunStatus::Succeeded, 10);
         let running = sample_cron_run(CronRunStatus::Running, 20);
         let accepted = sample_cron_run(CronRunStatus::Accepted, 30);
+        let mut approval_required_denied = sample_cron_run(CronRunStatus::Denied, 35);
+        approval_required_denied.error_kind = Some(ROUTINE_APPROVAL_REQUIRED_ERROR_KIND.to_owned());
+        let mut tool_denied = sample_cron_run(CronRunStatus::Denied, 36);
+        tool_denied.orchestrator_run_id = Some("orch-denied".to_owned());
         let skipped_concurrency = sample_cron_run(CronRunStatus::Skipped, 40);
 
-        let runs = vec![succeeded, running, accepted, skipped_concurrency];
+        let runs = vec![
+            succeeded,
+            running,
+            accepted,
+            approval_required_denied,
+            tool_denied,
+            skipped_concurrency,
+        ];
 
-        assert_eq!(reserved_cron_run_slot_count(&runs), 3);
+        assert_eq!(reserved_cron_run_slot_count(&runs), 4);
     }
 
     #[test]
