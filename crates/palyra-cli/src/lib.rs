@@ -665,6 +665,7 @@ const LOCAL_DESKTOP_TOOL_EXECUTION_TIMEOUT_MS: i64 = 10 * 60_000;
 const LOCAL_DESKTOP_DEFAULT_ALLOWED_TOOLS: &[&str] = &[
     "palyra.echo",
     "palyra.sleep",
+    "palyra.memory.status",
     "palyra.memory.search",
     "palyra.memory.recall",
     "palyra.memory.session_search",

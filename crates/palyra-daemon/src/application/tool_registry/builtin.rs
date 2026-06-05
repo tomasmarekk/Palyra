@@ -34,6 +34,13 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
             ToolResultProjectionPolicy::InlineUnlessLarge,
         ),
         entry(
+            "palyra.memory.status",
+            "Inspect read-only memory usage, retention limits, maintenance timing, and capacity_state; use this before deciding whether memory is full or needs consolidation.",
+            object_schema(&[], Vec::new(), false),
+            ToolParallelismPolicy::ReadOnly,
+            ToolResultProjectionPolicy::InlineUnlessLarge,
+        ),
+        entry(
             "palyra.memory.search",
             "Search Palyra lifecycle memory and workspace/project documents by default, or narrow to one explicit scope, and return redacted hits.",
             object_schema(

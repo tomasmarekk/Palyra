@@ -513,6 +513,7 @@ pub(crate) fn classify_tool_parallelism(tool_name: &str, input_json: &[u8]) -> T
     match tool_name {
         "palyra.echo"
         | "palyra.sleep"
+        | "palyra.memory.status"
         | "palyra.memory.search"
         | "palyra.memory.recall"
         | "palyra.memory.session_search"

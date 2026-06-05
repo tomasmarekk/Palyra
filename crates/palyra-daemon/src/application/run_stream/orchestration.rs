@@ -2254,6 +2254,7 @@ fn has_action_tool_evidence(messages: &[ProviderMessage]) -> bool {
             "palyra.fs.list_dir"
                 | "palyra.fs.read_file"
                 | "palyra.fs.search"
+                | "palyra.memory.status"
                 | "palyra.memory.search"
                 | "palyra.memory.recall"
         )

@@ -118,6 +118,7 @@ const TOOL_MAX_SLEEP_MS: u64 = 30_000;
 const TOOL_INPUT_TOO_LARGE_ERROR_CODE: &str = "quota/tool_input_too_large";
 const MAX_ECHO_TOOL_INPUT_BYTES: usize = 16 * 1024;
 const MAX_SLEEP_TOOL_INPUT_BYTES: usize = 8 * 1024;
+const MAX_MEMORY_STATUS_TOOL_INPUT_BYTES: usize = 16 * 1024;
 const MAX_MEMORY_SEARCH_TOOL_INPUT_BYTES: usize = 64 * 1024;
 const MAX_MEMORY_RECALL_TOOL_INPUT_BYTES: usize = 64 * 1024;
 const MAX_MEMORY_SESSION_SEARCH_TOOL_INPUT_BYTES: usize = 64 * 1024;
@@ -578,6 +579,14 @@ async fn run_allowlisted_tool_with_cancellation(
                 sandbox_enforcement: "none".to_owned(),
             },
         },
+        "palyra.memory.status" => ToolExecutionRawResult {
+            success: false,
+            output_json: b"{}".to_vec(),
+            error: "palyra.memory.status requires gateway memory runtime context".to_owned(),
+            timed_out: false,
+            executor: "gateway_runtime".to_owned(),
+            sandbox_enforcement: "none".to_owned(),
+        },
         "palyra.memory.search" => ToolExecutionRawResult {
             success: false,
             output_json: b"{}".to_vec(),
@@ -783,6 +792,7 @@ fn is_runtime_supported_tool(tool_name: &str) -> bool {
         tool_name,
         "palyra.echo"
             | "palyra.sleep"
+            | "palyra.memory.status"
             | "palyra.memory.search"
             | "palyra.memory.recall"
             | "palyra.memory.session_search"
@@ -866,7 +876,8 @@ fn tool_executor_name(config: &ToolCallConfig, tool_name: &str) -> String {
         "browser_broker".to_owned()
     } else if matches!(
         tool_name,
-        "palyra.memory.search"
+        "palyra.memory.status"
+            | "palyra.memory.search"
             | "palyra.memory.recall"
             | "palyra.memory.session_search"
             | "palyra.session_search"
@@ -894,6 +905,7 @@ fn tool_input_limit_bytes(tool_name: &str) -> usize {
     match tool_name {
         "palyra.echo" => MAX_ECHO_TOOL_INPUT_BYTES,
         "palyra.sleep" => MAX_SLEEP_TOOL_INPUT_BYTES,
+        "palyra.memory.status" => MAX_MEMORY_STATUS_TOOL_INPUT_BYTES,
         "palyra.memory.search" => MAX_MEMORY_SEARCH_TOOL_INPUT_BYTES,
         "palyra.memory.recall" => MAX_MEMORY_RECALL_TOOL_INPUT_BYTES,
         "palyra.memory.session_search" | "palyra.session_search" => {

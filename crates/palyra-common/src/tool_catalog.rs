@@ -53,6 +53,9 @@ pub fn tool_metadata(tool_name: &str) -> Option<ToolMetadata> {
         "palyra.sleep" => {
             Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: false })
         }
+        "palyra.memory.status" => {
+            Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: false })
+        }
         "palyra.memory.search" => {
             Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: false })
         }
@@ -271,6 +274,12 @@ mod tests {
         assert!(!tool_requires_approval("palyra.memory.retain"));
         assert!(!tool_requires_approval("palyra.retain"));
         assert!(tool_policy_capability_names("palyra.retain").is_empty());
+    }
+
+    #[test]
+    fn memory_status_is_read_only_without_approval() {
+        assert!(!tool_requires_approval("palyra.memory.status"));
+        assert!(tool_policy_capability_names("palyra.memory.status").is_empty());
     }
 
     #[test]

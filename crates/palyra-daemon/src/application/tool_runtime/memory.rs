@@ -26,14 +26,14 @@ use crate::{
     },
     domain::workspace::{normalize_workspace_path, normalize_workspace_prefix},
     gateway::{
-        current_unix_ms, GatewayRuntimeState, ToolRuntimeExecutionContext, MAX_MEMORY_SEARCH_TOP_K,
-        MAX_MEMORY_TOOL_QUERY_BYTES, MAX_MEMORY_TOOL_TAGS,
+        current_unix_ms, GatewayRuntimeState, MemoryRuntimeConfig, ToolRuntimeExecutionContext,
+        MAX_MEMORY_SEARCH_TOP_K, MAX_MEMORY_TOOL_QUERY_BYTES, MAX_MEMORY_TOOL_TAGS,
     },
     journal::{
-        MemoryItemLifecycleUpdateRequest, MemoryItemRecord, MemorySearchHit, MemorySearchRequest,
-        MemorySource, SessionSearchOutcome, SessionSearchRequest, WorkspaceDocumentDeleteRequest,
-        WorkspaceDocumentRecord, WorkspaceDocumentWriteRequest, WorkspaceSearchHit,
-        WorkspaceSearchRequest,
+        MemoryItemLifecycleUpdateRequest, MemoryItemRecord, MemoryMaintenanceStatus,
+        MemorySearchHit, MemorySearchRequest, MemorySource, SessionSearchOutcome,
+        SessionSearchRequest, WorkspaceDocumentDeleteRequest, WorkspaceDocumentRecord,
+        WorkspaceDocumentWriteRequest, WorkspaceSearchHit, WorkspaceSearchRequest,
     },
     tool_protocol::{ToolAttestation, ToolExecutionOutcome},
     transport::grpc::auth::RequestContext,
@@ -57,6 +57,7 @@ const DEFAULT_MEMORY_SEARCH_SCOPE: &str = "all";
 const SESSION_SEARCH_HITS_PRESENT_CLAIM_BOUNDARY: &str = "session transcript hits are retrieved evidence from prior conversations; cite them as session recall, not durable memory";
 const SESSION_SEARCH_HITS_ABSENT_CLAIM_BOUNDARY: &str =
     "no session transcript hits were returned; do not substitute unrelated durable memory or workspace artifacts for prior-session evidence";
+const MEMORY_STATUS_CLAIM_BOUNDARY: &str = "memory status is usage and retention diagnostics; do not infer memory capacity from search hit_count, and treat no_hard_capacity_configured as no entries/bytes hard limit";
 const MAX_WORKSPACE_RECALL_TOOL_SNIPPET_CHARS: usize = 512;
 
 pub(crate) fn memory_search_tool_output_payload(search_hits: &[MemorySearchHit]) -> Value {
@@ -248,6 +249,183 @@ fn memory_search_claim_boundary(hit_count: usize) -> &'static str {
         MEMORY_HITS_ABSENT_CLAIM_BOUNDARY
     } else {
         MEMORY_HITS_PRESENT_CLAIM_BOUNDARY
+    }
+}
+
+pub(crate) fn memory_status_tool_output_payload(
+    status: &MemoryMaintenanceStatus,
+    config: &MemoryRuntimeConfig,
+) -> Value {
+    let entry_limit =
+        config.retention_max_entries.map(|limit| u64::try_from(limit).unwrap_or(u64::MAX));
+    let byte_limit = config.retention_max_bytes;
+    let entries_fraction = capacity_fraction(status.usage.entries, entry_limit);
+    let bytes_fraction = capacity_fraction(status.usage.approx_bytes, byte_limit);
+    let capacity_state = memory_capacity_state(
+        status.usage.entries,
+        status.usage.approx_bytes,
+        entry_limit,
+        byte_limit,
+        entries_fraction,
+        bytes_fraction,
+    );
+
+    json!({
+        "usage": &status.usage,
+        "capacity_state": capacity_state,
+        "capacity": {
+            "state": capacity_state,
+            "hard_limit_configured": entry_limit.is_some() || byte_limit.is_some(),
+            "max_entries": entry_limit,
+            "max_bytes": byte_limit,
+            "entries_used": status.usage.entries,
+            "approx_bytes_used": status.usage.approx_bytes,
+            "entries_fraction": entries_fraction,
+            "bytes_fraction": bytes_fraction,
+        },
+        "claim_boundary": MEMORY_STATUS_CLAIM_BOUNDARY,
+        "retention": {
+            "max_entries": entry_limit,
+            "max_bytes": byte_limit,
+            "ttl_days": config.retention_ttl_days,
+            "vacuum_schedule": config.retention_vacuum_schedule,
+        },
+        "maintenance": {
+            "last_run": &status.last_run,
+            "last_vacuum_at_unix_ms": status.last_vacuum_at_unix_ms,
+            "next_vacuum_due_at_unix_ms": status.next_vacuum_due_at_unix_ms,
+            "next_run_at_unix_ms": status.next_maintenance_run_at_unix_ms,
+        },
+        "auto_inject": {
+            "enabled": config.auto_inject_enabled,
+            "max_items": config.auto_inject_max_items,
+        },
+        "limits": {
+            "max_item_bytes": config.max_item_bytes,
+            "max_item_tokens": config.max_item_tokens,
+            "default_ttl_ms": config.default_ttl_ms,
+        },
+        "scope": "runtime_status_counts_only",
+    })
+}
+
+fn capacity_fraction(used: u64, limit: Option<u64>) -> Option<f64> {
+    limit.map(|limit| if limit == 0 { 1.0 } else { used as f64 / limit as f64 })
+}
+
+fn memory_capacity_state(
+    entries_used: u64,
+    bytes_used: u64,
+    entry_limit: Option<u64>,
+    byte_limit: Option<u64>,
+    entries_fraction: Option<f64>,
+    bytes_fraction: Option<f64>,
+) -> &'static str {
+    if entry_limit.is_none() && byte_limit.is_none() {
+        return "no_hard_capacity_configured";
+    }
+    if entry_limit.is_some_and(|limit| entries_used > limit)
+        || byte_limit.is_some_and(|limit| bytes_used > limit)
+    {
+        return "over_limit";
+    }
+    if entry_limit.is_some_and(|limit| entries_used == limit)
+        || byte_limit.is_some_and(|limit| bytes_used == limit)
+    {
+        return "at_limit";
+    }
+    if entries_fraction.is_some_and(|fraction| fraction >= 0.85)
+        || bytes_fraction.is_some_and(|fraction| fraction >= 0.85)
+    {
+        return "near_limit";
+    }
+    "within_limit"
+}
+
+pub(crate) async fn execute_memory_status_tool(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: ToolRuntimeExecutionContext<'_>,
+    proposal_id: &str,
+    input_json: &[u8],
+) -> ToolExecutionOutcome {
+    let namespace = b"palyra.memory.status.attestation.v1";
+    let parsed = match serde_json::from_slice::<Value>(input_json) {
+        Ok(Value::Object(map)) => map,
+        Ok(_) => {
+            return memory_tool_execution_outcome(
+                namespace,
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                "palyra.memory.status requires JSON object input".to_owned(),
+            );
+        }
+        Err(error) => {
+            return memory_tool_execution_outcome(
+                namespace,
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                format!("palyra.memory.status invalid JSON input: {error}"),
+            );
+        }
+    };
+    if !parsed.is_empty() {
+        return memory_tool_execution_outcome(
+            namespace,
+            proposal_id,
+            input_json,
+            false,
+            b"{}".to_vec(),
+            "palyra.memory.status does not accept input fields".to_owned(),
+        );
+    }
+
+    if let Err(error) = authorize_memory_action(context.principal, "memory.list", "memory:items") {
+        return memory_tool_execution_outcome(
+            namespace,
+            proposal_id,
+            input_json,
+            false,
+            b"{}".to_vec(),
+            format!("memory policy denied tool status request: {}", error.message()),
+        );
+    }
+
+    let status = match runtime_state.memory_maintenance_status().await {
+        Ok(status) => status,
+        Err(error) => {
+            return memory_tool_execution_outcome(
+                namespace,
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                format!("palyra.memory.status failed: {}", error.message()),
+            );
+        }
+    };
+    let config = runtime_state.memory_config_snapshot();
+    let payload = memory_status_tool_output_payload(&status, &config);
+    match serde_json::to_vec(&payload) {
+        Ok(output_json) => memory_tool_execution_outcome(
+            namespace,
+            proposal_id,
+            input_json,
+            true,
+            output_json,
+            String::new(),
+        ),
+        Err(error) => memory_tool_execution_outcome(
+            namespace,
+            proposal_id,
+            input_json,
+            false,
+            b"{}".to_vec(),
+            format!("palyra.memory.status failed to serialize output: {error}"),
+        ),
     }
 }
 
@@ -3340,8 +3518,68 @@ mod tests {
     use super::*;
     use crate::{
         application::recall::{RecallBudgetExplain, RecallPlan, StructuredRecallOutput},
-        journal::{WorkspaceDocumentRecord, WorkspaceScoreBreakdown, WorkspaceSearchHit},
+        journal::{
+            MemoryMaintenanceStatus, MemoryUsageSnapshot, WorkspaceDocumentRecord,
+            WorkspaceScoreBreakdown, WorkspaceSearchHit,
+        },
     };
+
+    #[test]
+    fn memory_status_payload_marks_missing_hard_limits_explicitly() {
+        let status = MemoryMaintenanceStatus {
+            usage: MemoryUsageSnapshot { entries: 24, approx_bytes: 301_226 },
+            last_run: None,
+            last_vacuum_at_unix_ms: None,
+            next_vacuum_due_at_unix_ms: Some(1_750_000_000_000),
+            next_maintenance_run_at_unix_ms: Some(1_750_000_060_000),
+        };
+        let config = MemoryRuntimeConfig::default();
+
+        let payload = memory_status_tool_output_payload(&status, &config);
+
+        assert_eq!(payload["usage"]["entries"], 24);
+        assert_eq!(payload["capacity_state"], "no_hard_capacity_configured");
+        assert_eq!(payload["capacity"]["hard_limit_configured"], false);
+        assert!(payload["claim_boundary"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("do not infer memory capacity from search hit_count"));
+    }
+
+    #[test]
+    fn memory_status_payload_reports_near_and_over_limit_states() {
+        let mut config = MemoryRuntimeConfig {
+            retention_max_entries: Some(100),
+            retention_max_bytes: Some(1_000),
+            ..MemoryRuntimeConfig::default()
+        };
+        let near_status = MemoryMaintenanceStatus {
+            usage: MemoryUsageSnapshot { entries: 86, approx_bytes: 120 },
+            last_run: None,
+            last_vacuum_at_unix_ms: None,
+            next_vacuum_due_at_unix_ms: None,
+            next_maintenance_run_at_unix_ms: None,
+        };
+
+        let near_payload = memory_status_tool_output_payload(&near_status, &config);
+
+        assert_eq!(near_payload["capacity_state"], "near_limit");
+        assert_eq!(near_payload["capacity"]["max_entries"], 100);
+
+        config.retention_max_entries = Some(200);
+        let over_status = MemoryMaintenanceStatus {
+            usage: MemoryUsageSnapshot { entries: 50, approx_bytes: 1_001 },
+            last_run: None,
+            last_vacuum_at_unix_ms: None,
+            next_vacuum_due_at_unix_ms: None,
+            next_maintenance_run_at_unix_ms: None,
+        };
+
+        let over_payload = memory_status_tool_output_payload(&over_status, &config);
+
+        assert_eq!(over_payload["capacity_state"], "over_limit");
+        assert_eq!(over_payload["capacity"]["max_bytes"], 1_000);
+    }
 
     #[test]
     fn parse_session_search_limits_match_schema_bounds() {
