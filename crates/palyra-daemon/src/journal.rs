@@ -5385,7 +5385,9 @@ fn can_read_redacted_text_preview(sensitivity: ToolResultSensitivity, text_previ
     text_preview
         && matches!(
             sensitivity,
-            ToolResultSensitivity::ProviderRawPayload | ToolResultSensitivity::ApprovalRiskData
+            ToolResultSensitivity::StdoutStderr
+                | ToolResultSensitivity::ProviderRawPayload
+                | ToolResultSensitivity::ApprovalRiskData
         )
 }
 
@@ -21346,9 +21348,9 @@ mod tests {
             .expect_err("provider raw full read should stay gated");
         assert!(matches!(provider_full_read, JournalError::ToolResultArtifactReadDenied { .. }));
 
-        let stdout_read = store
+        let stdout_preview = store
             .read_tool_result_artifact(&ToolResultArtifactReadRequest {
-                artifact_id: stdout_stderr.artifact_id,
+                artifact_id: stdout_stderr.artifact_id.clone(),
                 session_id: session_id.to_owned(),
                 run_id: run_id.to_owned(),
                 principal: "user:ops".to_owned(),
@@ -21359,8 +21361,32 @@ mod tests {
                 max_bytes: 4096,
                 text_preview: true,
             })
-            .expect_err("stdout/stderr artifacts should stay gated from artifact.read");
-        assert!(matches!(stdout_read, JournalError::ToolResultArtifactReadDenied { .. }));
+            .expect("stdout/stderr artifacts should allow redacted text preview");
+        assert_eq!(stdout_preview.visibility, ToolResultVisibility::RedactedPreview);
+        assert!(
+            stdout_preview
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains("INTERNAL_PROJECT_CODENAME")),
+            "stdout/stderr preview should return useful process output"
+        );
+        assert!(stdout_preview.bytes_base64.is_none());
+
+        let stdout_full_read = store
+            .read_tool_result_artifact(&ToolResultArtifactReadRequest {
+                artifact_id: stdout_stderr.artifact_id,
+                session_id: session_id.to_owned(),
+                run_id: run_id.to_owned(),
+                principal: "user:ops".to_owned(),
+                device_id: "device:local".to_owned(),
+                channel: Some("cli".to_owned()),
+                expected_digest_sha256: None,
+                offset_bytes: 0,
+                max_bytes: 4096,
+                text_preview: false,
+            })
+            .expect_err("stdout/stderr full read should stay gated");
+        assert!(matches!(stdout_full_read, JournalError::ToolResultArtifactReadDenied { .. }));
 
         let internal_path_read = store
             .read_tool_result_artifact(&ToolResultArtifactReadRequest {
