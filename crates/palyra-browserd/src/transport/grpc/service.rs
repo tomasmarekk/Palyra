@@ -107,9 +107,15 @@ fn normalize_observe_computed_style_properties(properties: &[String]) -> Vec<Str
     };
     let mut normalized = Vec::new();
     for property in source {
-        let trimmed = property.trim().to_ascii_lowercase();
+        let raw = property.trim();
+        let trimmed = raw.to_ascii_lowercase();
         if trimmed.is_empty()
             || trimmed.len() > 64
+            || raw.chars().any(char::is_whitespace)
+            || raw
+                .as_bytes()
+                .windows(2)
+                .any(|window| window[0].is_ascii_lowercase() && window[1].is_ascii_uppercase())
             || !trimmed.chars().all(|ch| ch.is_ascii_lowercase() || ch == '-')
             || normalized.iter().any(|existing: &String| existing == &trimmed)
         {
