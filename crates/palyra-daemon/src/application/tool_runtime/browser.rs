@@ -61,6 +61,7 @@ const BROWSER_TOOL_INPUT_RECOVERY_HINT: &str =
 const BROWSER_UPLOAD_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const BROWSER_DOWNLOAD_TOOL_DEFAULT_MAX_BYTES: u64 = 256 * 1024;
 const BROWSER_DOWNLOAD_TOOL_MAX_BYTES: u64 = 512 * 1024;
+const PALYRA_OS_FILE_ROOTS_ENV: &str = "PALYRA_OS_FILE_ROOTS";
 
 fn browser_text_entry_action_name(tool_name: &str) -> &'static str {
     if tool_name == BROWSER_FILL_TOOL_NAME {
@@ -718,17 +719,59 @@ fn nearest_existing_parent(path: &Path) -> Option<PathBuf> {
 
 fn browser_user_owned_os_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    for key in ["USERPROFILE", "HOME"] {
-        if let Some(value) = std::env::var_os(key) {
-            push_browser_canonical_root(&mut roots, PathBuf::from(value));
+    if let Some(configured_roots) = configured_browser_user_os_roots() {
+        for root in configured_roots {
+            push_browser_canonical_root(&mut roots, root);
+        }
+    } else {
+        for key in ["USERPROFILE", "HOME"] {
+            if let Some(value) = std::env::var_os(key) {
+                push_browser_canonical_root(&mut roots, PathBuf::from(value));
+            }
         }
     }
     push_browser_canonical_root(&mut roots, std::env::temp_dir());
+    #[cfg(windows)]
+    push_browser_windows_drive_temp_roots(&mut roots);
     #[cfg(unix)]
     {
         push_browser_canonical_root(&mut roots, PathBuf::from("/var/tmp"));
     }
     roots
+}
+
+fn configured_browser_user_os_roots() -> Option<Vec<PathBuf>> {
+    let value = std::env::var_os(PALYRA_OS_FILE_ROOTS_ENV)?;
+    let roots = std::env::split_paths(&value)
+        .filter(|path| !path.as_os_str().is_empty())
+        .collect::<Vec<_>>();
+    if roots.is_empty() {
+        None
+    } else {
+        Some(roots)
+    }
+}
+
+#[cfg(windows)]
+fn push_browser_windows_drive_temp_roots(roots: &mut Vec<PathBuf>) {
+    let Some(system_drive) = std::env::var_os("SystemDrive") else {
+        return;
+    };
+    for candidate in
+        browser_windows_drive_temp_root_candidates(system_drive.to_string_lossy().as_ref())
+    {
+        push_browser_canonical_root(roots, candidate);
+    }
+}
+
+#[cfg(windows)]
+fn browser_windows_drive_temp_root_candidates(system_drive: &str) -> Vec<PathBuf> {
+    let drive = system_drive.trim().trim_end_matches(['\\', '/']);
+    let bytes = drive.as_bytes();
+    if bytes.len() != 2 || bytes[1] != b':' || !bytes[0].is_ascii_alphabetic() {
+        return Vec::new();
+    }
+    vec![PathBuf::from(format!("{drive}\\var\\tmp"))]
 }
 
 fn push_browser_canonical_root(roots: &mut Vec<PathBuf>, root: PathBuf) {
@@ -4241,6 +4284,7 @@ fn browser_tool_execution_outcome(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::{Mutex, OnceLock};
 
     use super::{
         attach_browser_caller_principal_metadata, browser_console_entry_to_json,
@@ -4248,9 +4292,10 @@ mod tests {
         browser_observe_include_visible_text, browser_session_persistence_from_payload,
         browser_session_profile_id_from_payload, browser_tool_execution_outcome,
         browser_tool_requires_open_session, browser_url_targets_loopback,
-        canonical_file_path_is_inside_workspace_roots, normalize_browser_press_key_input,
-        parse_browser_download_artifact_id, resolve_browser_output_path,
-        validate_browser_workspace_relative_path, BROWSER_CALLER_PRINCIPAL_HEADER,
+        browser_user_owned_os_roots, canonical_file_path_is_inside_workspace_roots,
+        normalize_browser_press_key_input, parse_browser_download_artifact_id,
+        resolve_browser_output_path, validate_browser_workspace_relative_path,
+        BROWSER_CALLER_PRINCIPAL_HEADER, PALYRA_OS_FILE_ROOTS_ENV,
     };
     use crate::application::tool_runtime::workspace_scope::ActiveWorkspaceRoot;
     use crate::gateway::{
@@ -4262,6 +4307,30 @@ mod tests {
     use palyra_common::CANONICAL_PROTOCOL_MAJOR;
     use serde_json::json;
     use tonic::Request;
+
+    static BROWSER_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    struct ScopedEnvVar {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            match self.previous.as_ref() {
+                Some(previous) => std::env::set_var(self.key, previous),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     #[test]
     fn console_log_export_redacts_sensitive_message_content() {
@@ -4665,6 +4734,64 @@ mod tests {
             output.parent().is_some_and(|parent| parent.is_dir()),
             "env-prefixed output parent should be created"
         );
+    }
+
+    #[test]
+    fn browser_user_owned_roots_respect_configured_os_file_roots() {
+        let _guard = BROWSER_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("browser env lock should not be poisoned");
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let configured_root = temp.path().join("configured-os-root");
+        let implicit_home = temp.path().join("implicit-home");
+        std::fs::create_dir_all(configured_root.as_path())
+            .expect("configured root should be created");
+        std::fs::create_dir_all(implicit_home.as_path()).expect("implicit home should be created");
+        let _configured = ScopedEnvVar::set(PALYRA_OS_FILE_ROOTS_ENV, configured_root.as_path());
+        let _userprofile = ScopedEnvVar::set("USERPROFILE", implicit_home.as_path());
+        let _home = ScopedEnvVar::set("HOME", implicit_home.as_path());
+
+        let roots = browser_user_owned_os_roots();
+        let canonical_configured =
+            configured_root.canonicalize().expect("root should canonicalize");
+        let canonical_home = implicit_home.canonicalize().expect("home should canonicalize");
+
+        assert!(
+            roots.iter().any(|root| root == &canonical_configured),
+            "configured OS root should be included: {roots:?}"
+        );
+        assert!(
+            !roots.iter().any(|root| root == &canonical_home),
+            "implicit USERPROFILE/HOME roots must be suppressed when PALYRA_OS_FILE_ROOTS is set: {roots:?}"
+        );
+    }
+
+    #[test]
+    fn browser_output_path_rejects_absolute_path_outside_configured_roots() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let configured_root = temp.path().join("configured-os-root");
+        let outside_root = temp.path().join("Palyra-TestHarness");
+        let outside_desktop = outside_root.join("Desktop");
+        std::fs::create_dir_all(configured_root.as_path())
+            .expect("configured root should be created");
+        std::fs::create_dir_all(outside_desktop.as_path())
+            .expect("outside desktop should be created");
+        let canonical_configured =
+            configured_root.canonicalize().expect("configured root should canonicalize");
+        let outside_output = outside_desktop.join("palyra-orders-export.csv");
+
+        let error = resolve_browser_output_path(
+            BROWSER_DOWNLOADS_GET_TOOL_NAME,
+            outside_output.to_string_lossy().as_ref(),
+            &[],
+            None,
+            &BTreeMap::new(),
+            std::slice::from_ref(&canonical_configured),
+        )
+        .expect_err("browser downloads should reject paths outside configured OS roots");
+
+        assert!(error.contains("outside agent workspace roots"), "{error}");
     }
 
     #[test]
