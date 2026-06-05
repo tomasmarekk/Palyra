@@ -2175,13 +2175,24 @@ fn is_windows_command_switch(command: &str, arg: &str) -> bool {
             matches!(arg.as_str(), "/FI" | "/FO" | "/NH" | "/V" | "/SVC" | "/M" | "/APPS")
         }
         "findstr" => is_findstr_windows_switch(arg.as_str()),
+        "find" => is_find_windows_switch(arg.as_str()),
         "icacls" => matches!(
             arg.as_str(),
-            "/C" | "/L" | "/Q" | "/T" | "/INHERITANCE:E" | "/INHERITANCE:D" | "/INHERITANCE:R"
+            "/C" | "/L"
+                | "/Q"
+                | "/T"
+                | "/?"
+                | "/INHERITANCE:E"
+                | "/INHERITANCE:D"
+                | "/INHERITANCE:R"
         ),
         "whoami" => matches!(arg.as_str(), "/ALL"),
         _ => false,
     }
+}
+
+fn is_find_windows_switch(arg: &str) -> bool {
+    matches!(arg, "/C" | "/V" | "/N" | "/I" | "/OFFLINE" | "/?")
 }
 
 fn is_findstr_windows_switch(arg: &str) -> bool {
@@ -5116,6 +5127,63 @@ mod tests {
             args.as_slice(),
         )
         .expect("findstr pattern switches should not be treated as absolute paths");
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn validate_argument_scopes_allow_windows_find_text_search_switches() {
+        let workspace = unique_temp_dir("workspace-find-switches");
+        fs::create_dir_all(workspace.join("data")).expect("workspace directory should be created");
+        fs::write(workspace.join("data").join("events.jsonl"), "{}\n")
+            .expect("fixture file should be written");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let args =
+            vec!["/c".to_owned(), "/v".to_owned(), String::new(), "data\\events.jsonl".to_owned()];
+
+        validate_argument_workspace_scope(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            "find",
+            args.as_slice(),
+        )
+        .expect("Windows find switches should not be treated as absolute paths");
+        validate_host_argument_scope(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            "find",
+            args.as_slice(),
+        )
+        .expect("host access should also treat Windows find switches as non-path switches");
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn validate_argument_scopes_allow_icacls_help_switch() {
+        let workspace = unique_temp_dir("workspace-icacls-help");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let args = vec!["/?".to_owned()];
+
+        validate_argument_workspace_scope(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            "icacls",
+            args.as_slice(),
+        )
+        .expect("icacls help switch should not be treated as an absolute path");
+        validate_host_argument_scope(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            "icacls",
+            args.as_slice(),
+        )
+        .expect("host access should also treat icacls help as a switch");
 
         let _ = fs::remove_dir_all(workspace.as_path());
     }
