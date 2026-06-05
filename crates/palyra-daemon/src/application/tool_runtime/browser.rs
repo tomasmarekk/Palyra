@@ -323,33 +323,14 @@ async fn read_browser_upload_file(
     let workspace_roots =
         resolve_browser_agent_workspace_roots(runtime_state, context, BROWSER_UPLOAD_TOOL_NAME)
             .await?;
-    let requested = PathBuf::from(file_path);
-    let resolved = if requested.is_absolute() {
-        requested
-    } else {
-        let relative = validate_browser_workspace_relative_path(requested.as_path())?;
-        let Some(root) = workspace_roots.first() else {
-            return Err(format!("{BROWSER_UPLOAD_TOOL_NAME} agent has no workspace root"));
-        };
-        root.join(relative)
-    };
-    let canonical = fs::canonicalize(resolved.as_path()).map_err(|error| {
-        format!("{BROWSER_UPLOAD_TOOL_NAME} failed to resolve upload file {file_path}: {error}")
-    })?;
-    if browser_protected_os_path(canonical.as_path()) {
-        return Err(format!(
-            "{BROWSER_UPLOAD_TOOL_NAME} denied protected OS path {}",
-            canonical.display()
-        ));
-    }
-    if !canonical_file_path_is_inside_workspace_roots(canonical.as_path(), &workspace_roots)
-        && !browser_user_owned_os_roots().iter().any(|root| canonical.starts_with(root.as_path()))
-    {
-        return Err(format!(
-            "{BROWSER_UPLOAD_TOOL_NAME} upload file {} is outside agent workspace roots and approved user-owned OS roots",
-            canonical.display()
-        ));
-    }
+    let path_env = run_launch_context_path_env(runtime_state, context.run_id).await;
+    let user_owned_roots = browser_user_owned_os_roots();
+    let canonical = resolve_browser_upload_path(
+        file_path,
+        workspace_roots.as_slice(),
+        &path_env,
+        user_owned_roots.as_slice(),
+    )?;
     let metadata = fs::metadata(canonical.as_path()).map_err(|error| {
         format!(
             "{BROWSER_UPLOAD_TOOL_NAME} failed to inspect upload file {}: {error}",
@@ -382,6 +363,48 @@ async fn read_browser_upload_file(
         )
     })?;
     Ok((file_name, file_bytes))
+}
+
+fn resolve_browser_upload_path(
+    file_path: &str,
+    workspace_roots: &[PathBuf],
+    path_env: &BTreeMap<String, PathBuf>,
+    user_owned_roots: &[PathBuf],
+) -> Result<PathBuf, String> {
+    let requested = expand_browser_env_prefixed_path(
+        BROWSER_UPLOAD_TOOL_NAME,
+        "file_path",
+        file_path,
+        path_env,
+    )?
+    .unwrap_or_else(|| PathBuf::from(file_path));
+    let resolved = if requested.is_absolute() {
+        requested
+    } else {
+        let relative = validate_browser_workspace_relative_path(requested.as_path())?;
+        let Some(root) = workspace_roots.first() else {
+            return Err(format!("{BROWSER_UPLOAD_TOOL_NAME} agent has no workspace root"));
+        };
+        root.join(relative)
+    };
+    let canonical = fs::canonicalize(resolved.as_path()).map_err(|error| {
+        format!("{BROWSER_UPLOAD_TOOL_NAME} failed to resolve upload file {file_path}: {error}")
+    })?;
+    if browser_protected_os_path(canonical.as_path()) {
+        return Err(format!(
+            "{BROWSER_UPLOAD_TOOL_NAME} denied protected OS path {}",
+            canonical.display()
+        ));
+    }
+    let allowed_roots =
+        browser_absolute_path_allowed_roots(workspace_roots, user_owned_roots, path_env);
+    if !canonical_file_path_is_inside_workspace_roots(canonical.as_path(), &allowed_roots) {
+        return Err(format!(
+            "{BROWSER_UPLOAD_TOOL_NAME} upload file {} is outside agent workspace roots and approved user-owned OS roots",
+            canonical.display()
+        ));
+    }
+    Ok(canonical)
 }
 
 fn validate_browser_workspace_relative_path(path: &Path) -> Result<PathBuf, String> {
@@ -478,10 +501,11 @@ fn resolve_browser_output_path(
     path_env: &BTreeMap<String, PathBuf>,
     user_owned_roots: &[PathBuf],
 ) -> Result<PathBuf, String> {
-    let requested = expand_browser_env_prefixed_output_path(tool_name, output_path, path_env)?
-        .unwrap_or_else(|| PathBuf::from(output_path));
+    let requested =
+        expand_browser_env_prefixed_path(tool_name, "output_path", output_path, path_env)?
+            .unwrap_or_else(|| PathBuf::from(output_path));
     let allowed_roots = if requested.is_absolute() {
-        browser_absolute_output_allowed_roots(workspace_roots, user_owned_roots, path_env)
+        browser_absolute_path_allowed_roots(workspace_roots, user_owned_roots, path_env)
     } else {
         let relative = validate_browser_workspace_relative_path_for_tool(
             tool_name,
@@ -503,7 +527,7 @@ fn resolve_browser_output_path(
     prepare_browser_output_target(tool_name, requested.as_path(), allowed_roots.as_slice())
 }
 
-fn browser_absolute_output_allowed_roots(
+fn browser_absolute_path_allowed_roots(
     workspace_roots: &[PathBuf],
     user_owned_roots: &[PathBuf],
     path_env: &BTreeMap<String, PathBuf>,
@@ -518,49 +542,51 @@ fn browser_absolute_output_allowed_roots(
     roots
 }
 
-fn expand_browser_env_prefixed_output_path(
+fn expand_browser_env_prefixed_path(
     tool_name: &str,
-    output_path: &str,
+    field_name: &str,
+    path: &str,
     path_env: &BTreeMap<String, PathBuf>,
 ) -> Result<Option<PathBuf>, String> {
-    let Some((key, suffix)) = browser_path_env_prefix(tool_name, output_path)? else {
+    let Some((key, suffix)) = browser_path_env_prefix(tool_name, field_name, path)? else {
         return Ok(None);
     };
     let base = if let Some(value) = path_env.get(key) {
         value.clone()
     } else {
         std::env::var_os(key).filter(|value| !value.is_empty()).map(PathBuf::from).ok_or_else(
-            || format!("{tool_name} output_path references unset environment variable `{key}`"),
+            || format!("{tool_name} {field_name} references unset environment variable `{key}`"),
         )?
     };
     if !base.is_absolute() {
         return Err(format!(
-            "{tool_name} output_path environment variable `{key}` must resolve to an absolute OS path"
+            "{tool_name} {field_name} environment variable `{key}` must resolve to an absolute OS path"
         ));
     }
-    append_browser_env_path_suffix(tool_name, base, suffix).map(Some)
+    append_browser_env_path_suffix(tool_name, field_name, base, suffix).map(Some)
 }
 
 fn browser_path_env_prefix<'a>(
     tool_name: &str,
+    field_name: &str,
     path: &'a str,
 ) -> Result<Option<(&'a str, &'a str)>, String> {
     if let Some(rest) = path.strip_prefix('%') {
         let Some(end) = rest.find('%') else {
-            return Err(format!("{tool_name} output_path has malformed %VAR% environment prefix"));
+            return Err(format!("{tool_name} {field_name} has malformed %VAR% environment prefix"));
         };
         let key = &rest[..end];
-        validate_browser_path_env_key(tool_name, key)?;
+        validate_browser_path_env_key(tool_name, field_name, key)?;
         return Ok(Some((key, &rest[end + 1..])));
     }
     if let Some(rest) = path.strip_prefix("${") {
         let Some(end) = rest.find('}') else {
             return Err(format!(
-                "{tool_name} output_path has malformed ${{VAR}} environment prefix"
+                "{tool_name} {field_name} has malformed ${{VAR}} environment prefix"
             ));
         };
         let key = &rest[..end];
-        validate_browser_path_env_key(tool_name, key)?;
+        validate_browser_path_env_key(tool_name, field_name, key)?;
         return Ok(Some((key, &rest[end + 1..])));
     }
     if let Some(rest) = path.strip_prefix('$') {
@@ -571,25 +597,29 @@ fn browser_path_env_prefix<'a>(
             .last()
             .unwrap_or(0);
         if key_len == 0 {
-            return Err(format!("{tool_name} output_path has malformed $VAR environment prefix"));
+            return Err(format!("{tool_name} {field_name} has malformed $VAR environment prefix"));
         }
         let key = &rest[..key_len];
-        validate_browser_path_env_key(tool_name, key)?;
+        validate_browser_path_env_key(tool_name, field_name, key)?;
         return Ok(Some((key, &rest[key_len..])));
     }
     Ok(None)
 }
 
-fn validate_browser_path_env_key(tool_name: &str, key: &str) -> Result<(), String> {
+fn validate_browser_path_env_key(
+    tool_name: &str,
+    field_name: &str,
+    key: &str,
+) -> Result<(), String> {
     let mut chars = key.chars();
     let Some(first) = chars.next() else {
-        return Err(format!("{tool_name} output_path environment variable name is empty"));
+        return Err(format!("{tool_name} {field_name} environment variable name is empty"));
     };
     if !(first.is_ascii_alphabetic() || first == '_')
         || !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
     {
         return Err(format!(
-            "{tool_name} output_path environment variable name must use ASCII letters, digits, or underscores"
+            "{tool_name} {field_name} environment variable name must use ASCII letters, digits, or underscores"
         ));
     }
     Ok(())
@@ -597,6 +627,7 @@ fn validate_browser_path_env_key(tool_name: &str, key: &str) -> Result<(), Strin
 
 fn append_browser_env_path_suffix(
     tool_name: &str,
+    field_name: &str,
     mut base: PathBuf,
     suffix: &str,
 ) -> Result<PathBuf, String> {
@@ -610,11 +641,11 @@ fn append_browser_env_path_suffix(
         }
         if segment == "." || segment == ".." || segment.contains(':') {
             return Err(format!(
-                "{tool_name} output_path environment suffix must stay relative to the expanded root"
+                "{tool_name} {field_name} environment suffix must stay relative to the expanded root"
             ));
         }
         if segment.chars().any(char::is_control) {
-            return Err(format!("{tool_name} output_path contains unsupported characters"));
+            return Err(format!("{tool_name} {field_name} contains unsupported characters"));
         }
         base.push(segment);
     }
@@ -4294,8 +4325,9 @@ mod tests {
         browser_tool_requires_open_session, browser_url_targets_loopback,
         browser_user_owned_os_roots, canonical_file_path_is_inside_workspace_roots,
         normalize_browser_press_key_input, parse_browser_download_artifact_id,
-        resolve_browser_output_path, validate_browser_workspace_relative_path,
-        BROWSER_CALLER_PRINCIPAL_HEADER, PALYRA_OS_FILE_ROOTS_ENV,
+        resolve_browser_output_path, resolve_browser_upload_path,
+        validate_browser_workspace_relative_path, BROWSER_CALLER_PRINCIPAL_HEADER,
+        PALYRA_OS_FILE_ROOTS_ENV,
     };
     use crate::application::tool_runtime::workspace_scope::ActiveWorkspaceRoot;
     use crate::gateway::{
@@ -4580,6 +4612,52 @@ mod tests {
                 "unexpected validation error for {denied:?}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn browser_upload_path_expands_launch_env_prefix() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let os_root = temp.path().join("os-root");
+        let downloads = os_root.join("downloads");
+        std::fs::create_dir_all(downloads.as_path()).expect("downloads should exist");
+        let upload = downloads.join("upload-input.csv");
+        std::fs::write(upload.as_path(), "sku,qty\nE2E-WIDGET,1\n").expect("upload should exist");
+        let canonical_root = os_root.canonicalize().expect("OS root should canonicalize");
+        let canonical_upload = upload.canonicalize().expect("upload should canonicalize");
+        let path_env = BTreeMap::from([("PALYRA_E2E_OS_ROOT".to_owned(), canonical_root)]);
+
+        let resolved = resolve_browser_upload_path(
+            "$PALYRA_E2E_OS_ROOT/downloads/upload-input.csv",
+            &[],
+            &path_env,
+            &[],
+        )
+        .expect("env-prefixed upload file should resolve inside launch OS root");
+
+        assert_eq!(resolved, canonical_upload);
+    }
+
+    #[test]
+    fn browser_upload_path_accepts_absolute_path_inside_launch_env_root() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let os_root = temp.path().join("os-root");
+        let downloads = os_root.join("downloads");
+        std::fs::create_dir_all(downloads.as_path()).expect("downloads should exist");
+        let upload = downloads.join("upload-input.csv");
+        std::fs::write(upload.as_path(), "sku,qty\nE2E-WIDGET,1\n").expect("upload should exist");
+        let canonical_root = os_root.canonicalize().expect("OS root should canonicalize");
+        let canonical_upload = upload.canonicalize().expect("upload should canonicalize");
+        let path_env = BTreeMap::from([("PALYRA_E2E_OS_ROOT".to_owned(), canonical_root)]);
+
+        let resolved = resolve_browser_upload_path(
+            canonical_upload.to_string_lossy().as_ref(),
+            &[],
+            &path_env,
+            &[],
+        )
+        .expect("absolute upload file should resolve inside launch OS root");
+
+        assert_eq!(resolved, canonical_upload);
     }
 
     #[test]
