@@ -4671,7 +4671,7 @@ impl AnthropicProvider {
         }
 
         let parsed = response.json::<AnthropicMessagesResponse>().await.map_err(|error| {
-            AttemptError::invalid_response(
+            AttemptError::retryable_invalid_response(
                 format!("anthropic response JSON parsing failed: {error}"),
                 "anthropic_chat_response_json",
             )
@@ -6439,6 +6439,50 @@ mod tests {
             !requests[0].headers.iter().any(|(name, _)| name == "x-api-key"),
             "MiniMax Anthropic-compatible transport must not use Anthropic x-api-key auth"
         );
+        handle.join().expect("minimax scripted server thread should exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn minimax_anthropic_compatible_provider_retries_malformed_json_response() {
+        let (base_url, request_count, request_log, handle) =
+            spawn_inspecting_scripted_server(vec![
+                (200_u16, r#"{"content":["#.to_owned()),
+                (
+                    200_u16,
+                    r#"{"content":[{"type":"text","text":"recovered from malformed JSON"}],"stop_reason":"end_turn"}"#
+                        .to_owned(),
+                ),
+            ]);
+        let anthropic_base_url =
+            base_url.strip_suffix("/v1").unwrap_or(base_url.as_str()).to_owned();
+        let config = ModelProviderConfig {
+            kind: ModelProviderKind::Anthropic,
+            anthropic_base_url,
+            allow_private_base_url: true,
+            anthropic_model: "MiniMax-M3".to_owned(),
+            anthropic_api_key: Some("minimax-secret".to_owned()),
+            auth_profile_provider_kind: Some(ModelProviderAuthProviderKind::Minimax),
+            request_timeout_ms: 5_000,
+            max_retries: 1,
+            retry_backoff_ms: 1,
+            circuit_breaker_failure_threshold: 2,
+            circuit_breaker_cooldown_ms: 60_000,
+            ..ModelProviderConfig::default()
+        };
+        let provider = build_model_provider(&config).expect("minimax provider should build");
+
+        let response = provider
+            .complete(ProviderRequest::from_input_text("hello".to_owned(), false, Vec::new(), None))
+            .await
+            .expect("minimax-compatible provider should retry malformed JSON and recover");
+
+        assert_eq!(response.retry_count, 1);
+        assert_eq!(response.output.full_text, "recovered from malformed JSON");
+        assert_eq!(request_count.load(Ordering::Relaxed), 2);
+        let requests = request_log.lock().expect("request log lock should not be poisoned");
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| request.path == "/v1/messages"));
+        drop(requests);
         handle.join().expect("minimax scripted server thread should exit");
     }
 
