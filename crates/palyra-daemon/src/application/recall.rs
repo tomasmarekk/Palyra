@@ -10,7 +10,11 @@ use tonic::Status;
 
 use crate::{
     application::{
-        provider_input::{render_memory_augmented_prompt, sanitize_prompt_inline_value},
+        provider_input::{
+            build_memory_query_variants, merge_memory_search_hits_by_id,
+            render_memory_augmented_prompt, sanitize_prompt_inline_value,
+            sort_and_truncate_memory_search_hits,
+        },
         session_compaction::{extract_transcript_search_text, truncate_console_text},
     },
     gateway::{current_unix_ms, GatewayRuntimeState, MEMORY_AUTO_INJECT_MIN_SCORE},
@@ -659,20 +663,14 @@ async fn execute_recall(
 
     let (memory_hits, memory_diagnostics) =
         if plan_source_selected(plan.sources.as_slice(), RecallSourceKind::Memory) {
-            let memory_channel_scope = request.channel.clone().or_else(|| context.channel.clone());
-            let outcome = runtime_state
-                .search_memory_with_diagnostics(MemorySearchRequest {
-                    principal: context.principal.clone(),
-                    channel: memory_channel_scope,
-                    session_id: scoped_session_id.clone(),
-                    query: query.to_owned(),
-                    top_k: request.memory_top_k.max(1),
-                    min_score: request.min_score,
-                    tags: Vec::new(),
-                    sources: Vec::new(),
-                })
-                .await?;
-            (outcome.hits, vec![outcome.diagnostics])
+            search_memory_hits_for_recall(
+                runtime_state,
+                context,
+                request,
+                scoped_session_id.clone(),
+                query_variants.as_slice(),
+            )
+            .await?
         } else {
             (Vec::new(), Vec::new())
         };
@@ -1107,81 +1105,39 @@ fn build_recall_plan(
 }
 
 fn build_query_variants(query: &str) -> Vec<String> {
-    let trimmed = query.trim();
-    if trimmed.is_empty() {
-        return Vec::new();
-    }
-
-    let mut variants = Vec::new();
-    push_unique_variant(&mut variants, trimmed.to_owned());
-
-    let normalized = trimmed
-        .chars()
-        .map(|character| {
-            if character.is_alphanumeric() || matches!(character, '/' | '.' | '_' | '-') {
-                character.to_ascii_lowercase()
-            } else {
-                ' '
-            }
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    if normalized != trimmed {
-        push_unique_variant(&mut variants, normalized);
-    }
-
-    let keyword_variant = trimmed
-        .split_whitespace()
-        .filter(|token| {
-            let lowered = token
-                .trim_matches(|character: char| !character.is_alphanumeric())
-                .to_ascii_lowercase();
-            !matches!(
-                lowered.as_str(),
-                "the"
-                    | "a"
-                    | "an"
-                    | "and"
-                    | "or"
-                    | "to"
-                    | "for"
-                    | "of"
-                    | "in"
-                    | "on"
-                    | "with"
-                    | "about"
-                    | "from"
-                    | "how"
-                    | "what"
-                    | "why"
-                    | "where"
-                    | "when"
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    if keyword_variant != trimmed {
-        push_unique_variant(&mut variants, keyword_variant);
-    }
-
-    if contains_any(trimmed.to_ascii_lowercase().as_str(), &["checkpoint", "rollback", "restore"]) {
-        push_unique_variant(&mut variants, format!("{trimmed} restore checkpoint rollback"));
-    }
-    variants.truncate(MAX_RECALL_QUERY_VARIANTS);
-    variants
+    build_memory_query_variants(query)
 }
 
-fn push_unique_variant(variants: &mut Vec<String>, candidate: String) {
-    let trimmed = candidate.trim();
-    if trimmed.is_empty() {
-        return;
+#[allow(clippy::result_large_err)]
+async fn search_memory_hits_for_recall(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: &RequestContext,
+    request: &RecallRequest,
+    scoped_session_id: Option<String>,
+    query_variants: &[String],
+) -> Result<(Vec<MemorySearchHit>, Vec<RetrievalBranchDiagnostics>), Status> {
+    let memory_channel_scope = request.channel.clone().or_else(|| context.channel.clone());
+    let top_k = request.memory_top_k.max(1);
+    let mut merged_hits = Vec::new();
+    let mut diagnostics = Vec::new();
+    for query in query_variants.iter().take(MAX_RECALL_QUERY_VARIANTS) {
+        let outcome = runtime_state
+            .search_memory_with_diagnostics(MemorySearchRequest {
+                principal: context.principal.clone(),
+                channel: memory_channel_scope.clone(),
+                session_id: scoped_session_id.clone(),
+                query: query.to_owned(),
+                top_k,
+                min_score: request.min_score,
+                tags: Vec::new(),
+                sources: Vec::new(),
+            })
+            .await?;
+        diagnostics.push(outcome.diagnostics);
+        merge_memory_search_hits_by_id(&mut merged_hits, outcome.hits);
     }
-    if variants.iter().any(|existing| existing.eq_ignore_ascii_case(trimmed)) {
-        return;
-    }
-    variants.push(trimmed.to_owned());
+    sort_and_truncate_memory_search_hits(&mut merged_hits, top_k);
+    Ok((merged_hits, diagnostics))
 }
 
 fn build_transcript_hits(
@@ -2489,6 +2445,20 @@ mod tests {
         assert!(
             variants.iter().any(|variant| variant.contains("rollback checkpoint apps/web")),
             "keyword-compacted variant should be present: {variants:?}"
+        );
+    }
+
+    #[test]
+    fn query_variants_expand_sparse_ui_smoke_prompts_to_test_runner_terms() {
+        let variants = build_query_variants("Priprav smoke test pro UI.");
+
+        assert_eq!(variants[0], "Priprav smoke test pro UI.");
+        assert!(
+            variants.iter().any(|variant| variant.contains("e2e")
+                && variant.contains("test-runner")
+                && variant.contains("playwright")
+                && variant.contains("typescript")),
+            "UI smoke prompts should expand to durable test preference terms: {variants:?}"
         );
     }
 

@@ -66,6 +66,7 @@ const AUTO_SESSION_COMPACTION_DRY_RUN_ENV: &str = "PALYRA_SESSION_AUTO_COMPACTIO
 const AUTO_SESSION_COMPACTION_MIN_INPUT_TOKENS: u64 = 480;
 const AUTO_SESSION_COMPACTION_MIN_TOKEN_DELTA: u64 = 120;
 const AUTO_SESSION_COMPACTION_COOLDOWN_MS: i64 = 5 * 60 * 1_000;
+const MAX_MEMORY_QUERY_VARIANTS: usize = 4;
 
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedModelProviderInput {
@@ -201,18 +202,15 @@ pub(crate) async fn build_memory_augmented_prompt(
         return Ok(prompt_input_text.to_owned());
     }
 
-    let search_hits = match runtime_state
-        .search_memory(MemorySearchRequest {
-            principal: context.principal.clone(),
-            channel: context.channel.clone(),
-            session_id: Some(session_id.to_owned()),
-            query: memory_query_text.to_owned(),
-            top_k: memory_config.auto_inject_max_items,
-            min_score: MEMORY_AUTO_INJECT_MIN_SCORE,
-            tags: Vec::new(),
-            sources: curated_memory_sources_for_prompt_context(),
-        })
-        .await
+    let query_variants = build_memory_query_variants(memory_query_text);
+    let search_hits = match search_memory_for_auto_inject(
+        runtime_state,
+        context,
+        session_id,
+        query_variants.as_slice(),
+        memory_config.auto_inject_max_items,
+    )
+    .await
     {
         Ok(hits) => hits,
         Err(error) => {
@@ -287,6 +285,204 @@ pub(crate) async fn build_memory_augmented_prompt(
 
 pub(crate) fn curated_memory_sources_for_prompt_context() -> Vec<MemorySource> {
     vec![MemorySource::Manual, MemorySource::Import]
+}
+
+pub(crate) fn build_memory_query_variants(query: &str) -> Vec<String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let mut variants = Vec::new();
+    push_unique_memory_query_variant(&mut variants, trimmed.to_owned());
+
+    let normalized = normalize_memory_query_text(trimmed);
+    if normalized != trimmed {
+        push_unique_memory_query_variant(&mut variants, normalized.clone());
+    }
+
+    let keyword_variant = compact_memory_query_keywords(trimmed);
+    if keyword_variant != trimmed {
+        push_unique_memory_query_variant(&mut variants, keyword_variant);
+    }
+
+    if memory_query_mentions_ui_test_workflow(normalized.as_str()) {
+        push_unique_memory_query_variant(
+            &mut variants,
+            "ui frontend browser e2e end-to-end smoke regression test testing test-runner framework typescript playwright cypress selenium puppeteer vitest accessibility".to_owned(),
+        );
+    }
+
+    if contains_any(normalized.as_str(), &["checkpoint", "rollback", "restore"]) {
+        push_unique_memory_query_variant(
+            &mut variants,
+            format!("{trimmed} restore checkpoint rollback"),
+        );
+    }
+
+    variants.truncate(MAX_MEMORY_QUERY_VARIANTS);
+    variants
+}
+
+pub(crate) fn merge_memory_search_hits_by_id(
+    merged: &mut Vec<MemorySearchHit>,
+    hits: Vec<MemorySearchHit>,
+) {
+    for hit in hits {
+        if let Some(existing) =
+            merged.iter_mut().find(|existing| existing.item.memory_id == hit.item.memory_id)
+        {
+            if should_replace_memory_hit(existing, &hit) {
+                *existing = hit;
+            }
+        } else {
+            merged.push(hit);
+        }
+    }
+}
+
+pub(crate) fn sort_and_truncate_memory_search_hits(hits: &mut Vec<MemorySearchHit>, limit: usize) {
+    hits.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| right.item.created_at_unix_ms.cmp(&left.item.created_at_unix_ms))
+            .then_with(|| left.item.memory_id.cmp(&right.item.memory_id))
+    });
+    hits.truncate(limit.max(1));
+}
+
+fn should_replace_memory_hit(existing: &MemorySearchHit, candidate: &MemorySearchHit) -> bool {
+    candidate.score.total_cmp(&existing.score).is_gt()
+        || (candidate.score == existing.score
+            && candidate.item.created_at_unix_ms > existing.item.created_at_unix_ms)
+}
+
+fn normalize_memory_query_text(query: &str) -> String {
+    query
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() || matches!(character, '/' | '.' | '_' | '-') {
+                character.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn compact_memory_query_keywords(query: &str) -> String {
+    query
+        .split_whitespace()
+        .filter(|token| {
+            let lowered = token
+                .trim_matches(|character: char| !character.is_alphanumeric())
+                .to_ascii_lowercase();
+            !memory_query_stopword(lowered.as_str())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn memory_query_stopword(token: &str) -> bool {
+    matches!(
+        token,
+        "the"
+            | "a"
+            | "an"
+            | "and"
+            | "or"
+            | "to"
+            | "for"
+            | "of"
+            | "in"
+            | "on"
+            | "with"
+            | "about"
+            | "from"
+            | "how"
+            | "what"
+            | "why"
+            | "where"
+            | "when"
+            | "pro"
+            | "do"
+            | "na"
+            | "se"
+            | "si"
+            | "mi"
+            | "i"
+            | "ve"
+            | "v"
+            | "z"
+            | "ze"
+    )
+}
+
+fn contains_any(input: &str, patterns: &[&str]) -> bool {
+    patterns.iter().any(|pattern| input.contains(pattern))
+}
+
+fn memory_query_mentions_ui_test_workflow(normalized_query: &str) -> bool {
+    normalized_query.split_whitespace().any(|token| {
+        matches!(
+            token,
+            "ui" | "frontend"
+                | "browser"
+                | "smoke"
+                | "regression"
+                | "e2e"
+                | "end-to-end"
+                | "test"
+                | "tests"
+                | "testy"
+                | "testing"
+                | "accessibility"
+                | "a11y"
+        )
+    })
+}
+
+fn push_unique_memory_query_variant(variants: &mut Vec<String>, candidate: String) {
+    let trimmed = candidate.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if variants.iter().any(|existing| existing.eq_ignore_ascii_case(trimmed)) {
+        return;
+    }
+    variants.push(trimmed.to_owned());
+}
+
+#[allow(clippy::result_large_err)]
+async fn search_memory_for_auto_inject(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: &RequestContext,
+    session_id: &str,
+    query_variants: &[String],
+    top_k: usize,
+) -> Result<Vec<MemorySearchHit>, Status> {
+    let mut merged_hits = Vec::new();
+    for query in query_variants.iter().take(MAX_MEMORY_QUERY_VARIANTS) {
+        let hits = runtime_state
+            .search_memory(MemorySearchRequest {
+                principal: context.principal.clone(),
+                channel: context.channel.clone(),
+                session_id: Some(session_id.to_owned()),
+                query: query.to_owned(),
+                top_k,
+                min_score: MEMORY_AUTO_INJECT_MIN_SCORE,
+                tags: Vec::new(),
+                sources: curated_memory_sources_for_prompt_context(),
+            })
+            .await?;
+        merge_memory_search_hits_by_id(&mut merged_hits, hits);
+    }
+    sort_and_truncate_memory_search_hits(&mut merged_hits, top_k);
+    Ok(merged_hits)
 }
 
 #[allow(clippy::result_large_err)]
