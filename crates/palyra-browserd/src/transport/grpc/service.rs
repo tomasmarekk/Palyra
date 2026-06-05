@@ -12,6 +12,24 @@ const DEFAULT_DEVICE_SCALE_FACTOR: f64 = 1.0;
 const MAX_DEVICE_SCALE_FACTOR: f64 = 8.0;
 const MAX_VIEWPORT_CSS_PIXELS: u64 = 16_000_000;
 const MAX_VIEWPORT_EFFECTIVE_PIXELS: f64 = 33_177_600.0;
+const MAX_OBSERVE_CAPTURE_SELECTORS: usize = 8;
+const MAX_OBSERVE_COMPUTED_STYLE_PROPERTIES: usize = 16;
+const DEFAULT_OBSERVE_CAPTURE_TEXT_BYTES: u64 = 512;
+const DEFAULT_OBSERVE_COMPUTED_STYLE_PROPERTIES: &[&str] = &[
+    "display",
+    "visibility",
+    "opacity",
+    "position",
+    "z-index",
+    "overflow",
+    "pointer-events",
+    "font-size",
+    "line-height",
+    "margin-top",
+    "margin-bottom",
+    "padding-top",
+    "padding-bottom",
+];
 
 #[derive(Clone)]
 pub(crate) struct BrowserServiceImpl {
@@ -56,6 +74,70 @@ fn browser_layout_metrics_to_proto(
 fn observe_byte_limit(requested: u64, session_limit: u64) -> usize {
     let limit = if requested == 0 { session_limit } else { requested.min(session_limit) }.max(1);
     usize::try_from(limit).unwrap_or(usize::MAX)
+}
+
+fn observe_capture_text_limit(requested: u64, session_limit: u64) -> usize {
+    let requested = if requested == 0 { DEFAULT_OBSERVE_CAPTURE_TEXT_BYTES } else { requested };
+    observe_byte_limit(requested, session_limit)
+}
+
+fn normalize_observe_capture_selectors(selectors: &[String]) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for selector in selectors {
+        let trimmed = selector.trim();
+        if trimmed.is_empty() || normalized.iter().any(|existing: &String| existing == trimmed) {
+            continue;
+        }
+        normalized.push(truncate_utf8_bytes(trimmed, 512));
+        if normalized.len() >= MAX_OBSERVE_CAPTURE_SELECTORS {
+            break;
+        }
+    }
+    normalized
+}
+
+fn normalize_observe_computed_style_properties(properties: &[String]) -> Vec<String> {
+    let source = if properties.is_empty() {
+        DEFAULT_OBSERVE_COMPUTED_STYLE_PROPERTIES
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect::<Vec<_>>()
+    } else {
+        properties.to_vec()
+    };
+    let mut normalized = Vec::new();
+    for property in source {
+        let trimmed = property.trim().to_ascii_lowercase();
+        if trimmed.is_empty()
+            || trimmed.len() > 64
+            || !trimmed.chars().all(|ch| ch.is_ascii_lowercase() || ch == '-')
+            || normalized.iter().any(|existing: &String| existing == &trimmed)
+        {
+            continue;
+        }
+        normalized.push(trimmed);
+        if normalized.len() >= MAX_OBSERVE_COMPUTED_STYLE_PROPERTIES {
+            break;
+        }
+    }
+    normalized
+}
+
+fn observe_element_capture_error(selector: &str, error: &str) -> browser_v1::BrowserElementCapture {
+    browser_v1::BrowserElementCapture {
+        v: CANONICAL_PROTOCOL_MAJOR,
+        selector: selector.to_owned(),
+        found: false,
+        bounding_rect: None,
+        visible: false,
+        tag_name: String::new(),
+        id: String::new(),
+        class_name: String::new(),
+        text: String::new(),
+        text_truncated: false,
+        computed_styles: Vec::new(),
+        error: error.to_owned(),
+    }
 }
 
 fn request_timeout_ms(requested: u64, session_limit: u64) -> u64 {
@@ -2751,12 +2833,18 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         let include_dom_snapshot = inclusions.include_dom_snapshot;
         let include_accessibility_tree = inclusions.include_accessibility_tree;
         let include_visible_text = inclusions.include_visible_text;
+        let capture_selectors =
+            normalize_observe_capture_selectors(payload.capture_selectors.as_slice());
+        let computed_style_properties = normalize_observe_computed_style_properties(
+            payload.computed_style_properties.as_slice(),
+        );
 
         let (
             active_tab_id,
             max_dom_snapshot_bytes,
             max_accessibility_tree_bytes,
             max_visible_text_bytes,
+            max_capture_text_bytes,
         ) = {
             let mut sessions = self.runtime.sessions.lock().await;
             let Some(session) = sessions.get_mut(session_id.as_str()) else {
@@ -2771,6 +2859,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                     visible_text_truncated: false,
                     page_url: String::new(),
                     error: "session_not_found".to_owned(),
+                    element_captures: Vec::new(),
                 }));
             };
             session.last_active = Instant::now();
@@ -2786,6 +2875,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                     visible_text_truncated: false,
                     page_url: String::new(),
                     error: "active_tab_not_found".to_owned(),
+                    element_captures: Vec::new(),
                 }));
             };
             (
@@ -2800,6 +2890,10 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                 ),
                 observe_byte_limit(
                     payload.max_visible_text_bytes,
+                    session.budget.max_visible_text_bytes,
+                ),
+                observe_capture_text_limit(
+                    payload.max_capture_text_bytes,
                     session.budget.max_visible_text_bytes,
                 ),
             )
@@ -2835,6 +2929,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                         visible_text_truncated: false,
                         page_url: String::new(),
                         error: format!("failed to observe live Chromium tab: {error}"),
+                        element_captures: Vec::new(),
                     }));
                 }
             }
@@ -2854,6 +2949,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                     visible_text_truncated: false,
                     page_url: String::new(),
                     error: "session_not_found".to_owned(),
+                    element_captures: Vec::new(),
                 }));
             };
             let Some(tab) = session.tabs.get(active_tab_id.as_str()) else {
@@ -2868,6 +2964,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                     visible_text_truncated: false,
                     page_url: String::new(),
                     error: "active_tab_not_found".to_owned(),
+                    element_captures: Vec::new(),
                 }));
             };
             (tab.last_page_body.clone(), tab.last_url.clone().unwrap_or_default())
@@ -2884,8 +2981,40 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                 visible_text_truncated: false,
                 page_url: String::new(),
                 error: "navigate must succeed before observe".to_owned(),
+                element_captures: Vec::new(),
             }));
         }
+
+        let element_captures = if capture_selectors.is_empty() {
+            Vec::new()
+        } else if self.runtime.engine_mode == BrowserEngineMode::Chromium {
+            match chromium_capture_element_captures(
+                self.runtime.as_ref(),
+                session_id.as_str(),
+                active_tab_id.as_str(),
+                capture_selectors.as_slice(),
+                computed_style_properties.as_slice(),
+                max_capture_text_bytes,
+            )
+            .await
+            {
+                Ok(captures) => captures,
+                Err(error) => capture_selectors
+                    .iter()
+                    .map(|selector| observe_element_capture_error(selector, error.as_str()))
+                    .collect(),
+            }
+        } else {
+            capture_selectors
+                .iter()
+                .map(|selector| {
+                    observe_element_capture_error(
+                        selector,
+                        "element_capture_requires_chromium_engine",
+                    )
+                })
+                .collect()
+        };
 
         let (dom_snapshot, dom_truncated) = if include_dom_snapshot {
             build_dom_snapshot(page_body.as_str(), max_dom_snapshot_bytes)
@@ -2914,6 +3043,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             visible_text_truncated,
             page_url: normalize_url_with_redaction(page_url.as_str()),
             error: String::new(),
+            element_captures,
         }))
     }
 
@@ -3868,6 +3998,9 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                     max_dom_snapshot_bytes: snapshot_payload.max_dom_snapshot_bytes,
                     max_accessibility_tree_bytes: 0,
                     max_visible_text_bytes: snapshot_payload.max_visible_text_bytes,
+                    capture_selectors: Vec::new(),
+                    computed_style_properties: Vec::new(),
+                    max_capture_text_bytes: 0,
                 });
                 if let Some(value) = auth_header {
                     observe_request.metadata_mut().insert(AUTHORIZATION_HEADER, value);
@@ -4038,8 +4171,11 @@ fn normalize_press_key_input(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_press_key_input, observe_byte_limit, request_timeout_ms,
-        resolve_observe_inclusions, ObserveInclusions,
+        normalize_observe_capture_selectors, normalize_observe_computed_style_properties,
+        normalize_press_key_input, observe_byte_limit, observe_capture_text_limit,
+        request_timeout_ms, resolve_observe_inclusions, ObserveInclusions,
+        DEFAULT_OBSERVE_COMPUTED_STYLE_PROPERTIES, MAX_OBSERVE_CAPTURE_SELECTORS,
+        MAX_OBSERVE_COMPUTED_STYLE_PROPERTIES,
     };
 
     #[test]
@@ -4056,6 +4192,69 @@ mod tests {
     #[test]
     fn observe_byte_limit_remains_non_zero() {
         assert_eq!(observe_byte_limit(0, 0), 1);
+    }
+
+    #[test]
+    fn observe_capture_text_limit_uses_bounded_default() {
+        assert_eq!(observe_capture_text_limit(0, 2_048), 512);
+        assert_eq!(observe_capture_text_limit(0, 128), 128);
+    }
+
+    #[test]
+    fn observe_capture_text_limit_clamps_explicit_request_to_session_budget() {
+        assert_eq!(observe_capture_text_limit(4_096, 1_024), 1_024);
+        assert_eq!(observe_capture_text_limit(128, 1_024), 128);
+    }
+
+    #[test]
+    fn normalize_observe_capture_selectors_trims_dedupes_and_caps() {
+        let selectors = [
+            "  #hero  ",
+            "",
+            "#hero",
+            ".nav",
+            ".footer",
+            "main",
+            "[data-testid='save']",
+            ".modal",
+            ".toast",
+            ".extra",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+
+        let normalized = normalize_observe_capture_selectors(selectors.as_slice());
+
+        assert_eq!(normalized.len(), MAX_OBSERVE_CAPTURE_SELECTORS);
+        assert_eq!(normalized[0], "#hero");
+        assert_eq!(normalized[1], ".nav");
+        assert!(!normalized.iter().any(|selector| selector.is_empty()));
+    }
+
+    #[test]
+    fn normalize_observe_computed_style_properties_defaults_and_filters_invalid_names() {
+        let defaults = normalize_observe_computed_style_properties(&[]);
+        assert_eq!(
+            defaults,
+            DEFAULT_OBSERVE_COMPUTED_STYLE_PROPERTIES
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        );
+
+        let properties =
+            [" Display ", "display", "font-size", "backgroundColor", "--custom", "width1", ""]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+        let normalized = normalize_observe_computed_style_properties(properties.as_slice());
+
+        assert_eq!(
+            normalized,
+            vec!["display".to_owned(), "font-size".to_owned(), "--custom".to_owned()]
+        );
+        assert!(normalized.len() <= MAX_OBSERVE_COMPUTED_STYLE_PROPERTIES);
     }
 
     #[test]

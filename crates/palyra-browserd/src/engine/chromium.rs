@@ -62,6 +62,60 @@ pub(crate) struct ChromiumLayoutMetrics {
     pub(crate) vertical_overflow: bool,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct ChromiumElementCapturePayload {
+    #[serde(default)]
+    selector: String,
+    #[serde(default)]
+    found: bool,
+    #[serde(default)]
+    rect: ChromiumElementRectPayload,
+    #[serde(default)]
+    visible: bool,
+    #[serde(default)]
+    tag_name: String,
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    class_name: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    text_truncated: bool,
+    #[serde(default)]
+    computed_styles: Vec<ChromiumComputedStylePayload>,
+    #[serde(default)]
+    error: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ChromiumElementRectPayload {
+    #[serde(default)]
+    x: f64,
+    #[serde(default)]
+    y: f64,
+    #[serde(default)]
+    width: f64,
+    #[serde(default)]
+    height: f64,
+    #[serde(default)]
+    top: f64,
+    #[serde(default)]
+    right: f64,
+    #[serde(default)]
+    bottom: f64,
+    #[serde(default)]
+    left: f64,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ChromiumComputedStylePayload {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    value: String,
+}
+
 #[derive(Debug)]
 pub(crate) struct ChromiumClientDownload {
     pub(crate) source_url: String,
@@ -604,6 +658,7 @@ const MAX_CHROMIUM_CLIENT_DOWNLOAD_JSON_BYTES: usize =
 const MAX_CHROMIUM_DOCUMENT_COOKIE_JSON_BYTES: usize = (MAX_COOKIES_PER_DOMAIN * 1536) + 4096;
 const MAX_CHROMIUM_LOCAL_STORAGE_JSON_BYTES: usize =
     (MAX_STORAGE_ENTRY_VALUE_BYTES * MAX_STORAGE_ENTRIES_PER_ORIGIN * 2) + 4096;
+const MAX_CHROMIUM_ELEMENT_CAPTURE_JSON_BYTES: usize = 64 * 1024;
 const MAX_CHROMIUM_OBSERVE_FORM_CONTROLS: usize = 128;
 const MAX_CHROMIUM_OBSERVE_FORM_VALUE_CHARS: usize = 1024;
 const MAX_CHROMIUM_OBSERVE_STATE_TEXT_BYTES: usize = 16 * 1024;
@@ -2236,6 +2291,187 @@ pub(crate) async fn chromium_observe_snapshot(
     .await?;
     enforce_chromium_remote_ip_guard(runtime, session_id).await?;
     Ok(clamp_chromium_snapshot(snapshot, max_response_bytes, max_title_bytes))
+}
+
+pub(crate) async fn chromium_capture_element_captures(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+    tab_id: &str,
+    selectors: &[String],
+    computed_style_properties: &[String],
+    max_text_bytes: usize,
+) -> Result<Vec<browser_v1::BrowserElementCapture>, String> {
+    if selectors.is_empty() {
+        return Ok(Vec::new());
+    }
+    enforce_chromium_remote_ip_guard(runtime, session_id).await?;
+    let tab = chromium_tab_for_session(runtime, session_id, tab_id).await?;
+    let script =
+        chromium_element_capture_script(selectors, computed_style_properties, max_text_bytes)?;
+    let value = run_chromium_blocking("chromium observe element captures", move || {
+        let value = tab
+            .evaluate(script.as_str(), false)
+            .map_err(|error| format!("failed to read Chromium element captures: {error}"))?
+            .value
+            .unwrap_or_else(|| serde_json::Value::String("[]".to_owned()));
+        Ok(decode_chromium_json_array_string_value(value, MAX_CHROMIUM_ELEMENT_CAPTURE_JSON_BYTES))
+    })
+    .await?;
+    enforce_chromium_remote_ip_guard(runtime, session_id).await?;
+    parse_chromium_element_captures(value, max_text_bytes)
+}
+
+fn chromium_element_capture_script(
+    selectors: &[String],
+    computed_style_properties: &[String],
+    max_text_bytes: usize,
+) -> Result<String, String> {
+    let selectors_json = serde_json::to_string(selectors)
+        .map_err(|error| format!("failed to encode observe capture selectors: {error}"))?;
+    let styles_json = serde_json::to_string(computed_style_properties)
+        .map_err(|error| format!("failed to encode observe computed styles: {error}"))?;
+    let max_text_chars = max_text_bytes.clamp(1, 8 * 1024);
+    Ok(format!(
+        r#"
+(() => {{
+  const selectors = {selectors_json};
+  const styleNames = {styles_json};
+  const maxTextChars = {max_text_chars};
+  const clamp = (value, maxChars) => {{
+    const text = String(value || "");
+    return text.length > maxChars ? text.slice(0, maxChars) : text;
+  }};
+  const rectPayload = (rect) => ({{
+    x: Number(rect.x) || 0,
+    y: Number(rect.y) || 0,
+    width: Number(rect.width) || 0,
+    height: Number(rect.height) || 0,
+    top: Number(rect.top) || 0,
+    right: Number(rect.right) || 0,
+    bottom: Number(rect.bottom) || 0,
+    left: Number(rect.left) || 0
+  }});
+  const className = (element) => {{
+    const raw = element && element.className;
+    if (typeof raw === "string") return raw;
+    if (raw && typeof raw.baseVal === "string") return raw.baseVal;
+    return "";
+  }};
+  const elementText = (element) => {{
+    const raw = element ? (element.innerText || element.textContent || "") : "";
+    const normalized = String(raw).replace(/\s+/g, " ").trim();
+    return {{
+      text: clamp(normalized, maxTextChars),
+      truncated: normalized.length > maxTextChars
+    }};
+  }};
+  const visibleFrom = (rect, computed) => (
+    rect.width > 0 &&
+    rect.height > 0 &&
+    computed.display !== "none" &&
+    computed.visibility !== "hidden" &&
+    computed.opacity !== "0"
+  );
+  const capture = (selector) => {{
+    const rawSelector = String(selector || "").trim();
+    if (!rawSelector) {{
+      return {{ selector: rawSelector, found: false, error: "selector_empty" }};
+    }}
+    let element = null;
+    try {{
+      element = document.querySelector(rawSelector);
+    }} catch (error) {{
+      return {{ selector: rawSelector, found: false, error: "selector_invalid" }};
+    }}
+    if (!element) {{
+      return {{ selector: rawSelector, found: false, error: "selector_not_found" }};
+    }}
+    const rect = element.getBoundingClientRect();
+    const computed = window.getComputedStyle(element);
+    const text = elementText(element);
+    const styles = styleNames.map((name) => {{
+      const key = String(name || "").trim();
+      return {{ name: key, value: clamp(computed.getPropertyValue(key) || computed[key] || "", 512) }};
+    }});
+    return {{
+      selector: rawSelector,
+      found: true,
+      rect: rectPayload(rect),
+      visible: visibleFrom(rect, computed),
+      tag_name: clamp((element.tagName || "").toLowerCase(), 64),
+      id: clamp(element.id || "", 128),
+      class_name: clamp(className(element), 256),
+      text: text.text,
+      text_truncated: text.truncated,
+      computed_styles: styles,
+      error: ""
+    }};
+  }};
+  return JSON.stringify(selectors.map(capture));
+}})()
+"#
+    ))
+}
+
+fn parse_chromium_element_captures(
+    value: serde_json::Value,
+    max_text_bytes: usize,
+) -> Result<Vec<browser_v1::BrowserElementCapture>, String> {
+    let payloads = serde_json::from_value::<Vec<ChromiumElementCapturePayload>>(value)
+        .map_err(|error| format!("failed to parse Chromium element captures: {error}"))?;
+    Ok(payloads
+        .into_iter()
+        .map(|payload| chromium_element_capture_to_proto(payload, max_text_bytes))
+        .collect())
+}
+
+fn chromium_element_capture_to_proto(
+    payload: ChromiumElementCapturePayload,
+    max_text_bytes: usize,
+) -> browser_v1::BrowserElementCapture {
+    let (text, truncated_by_bytes) =
+        truncate_utf8_bytes_with_flag(payload.text.as_str(), max_text_bytes.max(1));
+    browser_v1::BrowserElementCapture {
+        v: CANONICAL_PROTOCOL_MAJOR,
+        selector: truncate_utf8_bytes(payload.selector.as_str(), 512),
+        found: payload.found,
+        bounding_rect: payload.found.then(|| browser_v1::BrowserRect {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            x: finite_browser_metric(payload.rect.x),
+            y: finite_browser_metric(payload.rect.y),
+            width: finite_browser_metric(payload.rect.width),
+            height: finite_browser_metric(payload.rect.height),
+            top: finite_browser_metric(payload.rect.top),
+            right: finite_browser_metric(payload.rect.right),
+            bottom: finite_browser_metric(payload.rect.bottom),
+            left: finite_browser_metric(payload.rect.left),
+        }),
+        visible: payload.visible,
+        tag_name: truncate_utf8_bytes(payload.tag_name.as_str(), 64),
+        id: truncate_utf8_bytes(payload.id.as_str(), 128),
+        class_name: truncate_utf8_bytes(payload.class_name.as_str(), 256),
+        text,
+        text_truncated: payload.text_truncated || truncated_by_bytes,
+        computed_styles: payload
+            .computed_styles
+            .into_iter()
+            .take(16)
+            .map(|style| browser_v1::BrowserComputedStyle {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                name: truncate_utf8_bytes(style.name.as_str(), 64),
+                value: truncate_utf8_bytes(style.value.as_str(), 512),
+            })
+            .collect(),
+        error: truncate_utf8_bytes(payload.error.as_str(), 256),
+    }
+}
+
+fn finite_browser_metric(value: f64) -> f64 {
+    if value.is_finite() {
+        value
+    } else {
+        0.0
+    }
 }
 
 async fn chromium_install_page_diagnostics(
@@ -4303,9 +4539,10 @@ mod tests {
         decode_chromium_network_entries_value, decode_chromium_observe_state_value,
         page_body_with_chromium_observe_state, parse_chromium_clear_storage_status,
         parse_chromium_client_download_entries, parse_chromium_console_entries,
-        parse_chromium_document_cookie_snapshot, parse_chromium_layout_metrics,
-        parse_chromium_local_storage_restore_status, parse_chromium_local_storage_snapshot,
-        parse_chromium_page_network_entries, parse_chromium_viewport_metrics, parse_key_press_spec,
+        parse_chromium_document_cookie_snapshot, parse_chromium_element_captures,
+        parse_chromium_layout_metrics, parse_chromium_local_storage_restore_status,
+        parse_chromium_local_storage_snapshot, parse_chromium_page_network_entries,
+        parse_chromium_viewport_metrics, parse_key_press_spec,
         selector_not_found_error_from_cached_snapshot, ChromiumLayoutMetrics,
         ChromiumObserveSnapshot, CHROMIUM_CLEAR_ACTIVE_ORIGIN_STORAGE_SCRIPT,
         CHROMIUM_DRAIN_NETWORK_LOG_SCRIPT, CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT,
@@ -4478,6 +4715,50 @@ mod tests {
 
         assert!(error.contains("cached element appeared hidden or aria-hidden"), "{error}");
         assert!(error.contains("present and actionable"), "{error}");
+    }
+
+    #[test]
+    fn parse_chromium_element_captures_preserves_geometry_and_styles() {
+        let raw = serde_json::json!([{
+            "selector": "#hero",
+            "found": true,
+            "rect": {
+                "x": 10.5,
+                "y": 20.0,
+                "width": 320.0,
+                "height": 64.0,
+                "top": 20.0,
+                "right": 330.5,
+                "bottom": 84.0,
+                "left": 10.5
+            },
+            "visible": true,
+            "tag_name": "section",
+            "id": "hero",
+            "class_name": "landing hero",
+            "text": "Primary CTA",
+            "text_truncated": false,
+            "computed_styles": [
+                {"name": "display", "value": "flex"},
+                {"name": "position", "value": "relative"}
+            ],
+            "error": ""
+        }]);
+
+        let captures =
+            parse_chromium_element_captures(raw, 64).expect("element captures should parse");
+
+        assert_eq!(captures.len(), 1);
+        let capture = &captures[0];
+        assert_eq!(capture.selector, "#hero");
+        assert!(capture.found);
+        assert!(capture.visible);
+        assert_eq!(capture.text, "Primary CTA");
+        let rect = capture.bounding_rect.as_ref().expect("rect should be present");
+        assert_eq!(rect.width, 320.0);
+        assert_eq!(rect.height, 64.0);
+        assert_eq!(capture.computed_styles[0].name, "display");
+        assert_eq!(capture.computed_styles[0].value, "flex");
     }
 
     #[test]

@@ -1104,6 +1104,9 @@ pub(crate) async fn console_browser_observe_handler(
         max_dom_snapshot_bytes: query.max_dom_snapshot_bytes.unwrap_or(0),
         max_accessibility_tree_bytes: query.max_accessibility_tree_bytes.unwrap_or(0),
         max_visible_text_bytes: query.max_visible_text_bytes.unwrap_or(0),
+        capture_selectors: Vec::new(),
+        computed_style_properties: Vec::new(),
+        max_capture_text_bytes: 0,
     });
     apply_browser_service_auth(&state, request.metadata_mut())?;
     let response = client.observe(request).await.map_err(runtime_status_response)?.into_inner();

@@ -1620,6 +1620,9 @@ function markFiltered(){document.getElementById('filter-status').textContent='fi
             max_dom_snapshot_bytes: 32 * 1024,
             max_accessibility_tree_bytes: 32 * 1024,
             max_visible_text_bytes: 8 * 1024,
+            capture_selectors: Vec::new(),
+            computed_style_properties: Vec::new(),
+            max_capture_text_bytes: 0,
         }))
         .await
         .expect("observe should execute")
@@ -2890,6 +2893,9 @@ async fn browser_service_observe_returns_stable_sanitized_snapshot() {
             max_dom_snapshot_bytes: 8 * 1024,
             max_accessibility_tree_bytes: 8 * 1024,
             max_visible_text_bytes: 2 * 1024,
+            capture_selectors: Vec::new(),
+            computed_style_properties: Vec::new(),
+            max_capture_text_bytes: 0,
         }))
         .await
         .expect("observe should execute")
@@ -3053,6 +3059,9 @@ async fn browser_service_observe_truncates_deterministically_when_oversized() {
         max_dom_snapshot_bytes: 64,
         max_accessibility_tree_bytes: 64,
         max_visible_text_bytes: 48,
+        capture_selectors: Vec::new(),
+        computed_style_properties: Vec::new(),
+        max_capture_text_bytes: 0,
     };
     let first = service
         .observe(Request::new(request.clone()))

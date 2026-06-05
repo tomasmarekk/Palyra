@@ -35,12 +35,15 @@ object PalyraAuthV1 {
 
 object PalyraBrowserV1 {
     data class BrowserActionLogEntry(val placeholder: Int = 0)
+    data class BrowserComputedStyle(val placeholder: Int = 0)
     data class BrowserConsoleEntry(val placeholder: Int = 0)
+    data class BrowserElementCapture(val placeholder: Int = 0)
     data class BrowserHealthRequest(val placeholder: Int = 0)
     data class BrowserHealthResponse(val placeholder: Int = 0)
     data class BrowserLayoutMetrics(val placeholder: Int = 0)
     data class BrowserPageDiagnostics(val placeholder: Int = 0)
     data class BrowserProfile(val placeholder: Int = 0)
+    data class BrowserRect(val placeholder: Int = 0)
     data class BrowserSessionDetail(val placeholder: Int = 0)
     data class BrowserSessionSummary(val placeholder: Int = 0)
     data class BrowserTab(val placeholder: Int = 0)

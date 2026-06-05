@@ -61,6 +61,8 @@ const BROWSER_TOOL_INPUT_RECOVERY_HINT: &str =
 const BROWSER_UPLOAD_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const BROWSER_DOWNLOAD_TOOL_DEFAULT_MAX_BYTES: u64 = 256 * 1024;
 const BROWSER_DOWNLOAD_TOOL_MAX_BYTES: u64 = 512 * 1024;
+const BROWSER_OBSERVE_MAX_CAPTURE_SELECTORS: usize = 8;
+const BROWSER_OBSERVE_MAX_COMPUTED_STYLE_PROPERTIES: usize = 16;
 const PALYRA_OS_FILE_ROOTS_ENV: &str = "PALYRA_OS_FILE_ROOTS";
 
 fn browser_text_entry_action_name(tool_name: &str) -> &'static str {
@@ -2500,6 +2502,38 @@ pub(crate) async fn execute_browser_tool(
                     );
                 }
             };
+            let capture_selectors = match parse_browser_observe_string_array(
+                &payload,
+                "capture_selectors",
+                BROWSER_OBSERVE_MAX_CAPTURE_SELECTORS,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    return browser_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        error,
+                    );
+                }
+            };
+            let computed_style_properties = match parse_browser_observe_string_array(
+                &payload,
+                "computed_style_properties",
+                BROWSER_OBSERVE_MAX_COMPUTED_STYLE_PROPERTIES,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    return browser_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        error,
+                    );
+                }
+            };
             let mut request = Request::new(browser_v1::ObserveRequest {
                 v: CANONICAL_PROTOCOL_MAJOR,
                 session_id: Some(common_v1::CanonicalId { ulid: session_id }),
@@ -2522,6 +2556,12 @@ pub(crate) async fn execute_browser_tool(
                     .unwrap_or(0),
                 max_visible_text_bytes: payload
                     .get("max_visible_text_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                capture_selectors,
+                computed_style_properties,
+                max_capture_text_bytes: payload
+                    .get("max_capture_text_bytes")
                     .and_then(Value::as_u64)
                     .unwrap_or(0),
             });
@@ -2552,22 +2592,27 @@ pub(crate) async fn execute_browser_tool(
                         response.visible_text.as_str(),
                         SafetyContentKind::BrowserObservation,
                     );
+                    let (element_captures, capture_scans, capture_redacted) =
+                        browser_element_captures_to_json(response.element_captures.as_slice());
                     let page_url = redact_url(response.page_url.as_str());
+                    let mut observation_scans = vec![
+                        dom_export.scan.clone(),
+                        accessibility_export.scan.clone(),
+                        visible_text_export.scan.clone(),
+                    ];
+                    observation_scans.extend(capture_scans);
                     let observation_scan = merge_scan_results(
                         SafetyPhase::Export,
                         SafetySourceKind::Browser,
                         SafetyContentKind::BrowserObservation,
-                        &[
-                            dom_export.scan.clone(),
-                            accessibility_export.scan.clone(),
-                            visible_text_export.scan.clone(),
-                        ],
+                        observation_scans.as_slice(),
                     );
                     let output = json!({
                         "success": response.success,
                         "dom_snapshot": dom_export.redacted_text,
                         "accessibility_tree": accessibility_export.redacted_text,
                         "visible_text": visible_text_export.redacted_text,
+                        "element_captures": element_captures,
                         "dom_truncated": response.dom_truncated,
                         "accessibility_tree_truncated": response.accessibility_tree_truncated,
                         "visible_text_truncated": response.visible_text_truncated,
@@ -2577,6 +2622,7 @@ pub(crate) async fn execute_browser_tool(
                             dom_export.redacted
                                 || accessibility_export.redacted
                                 || visible_text_export.redacted
+                                || capture_redacted
                                 || page_url != response.page_url,
                         ),
                         "error": response.error,
@@ -3760,6 +3806,36 @@ fn browser_observe_include_visible_text(payload: &serde_json::Map<String, Value>
     payload.get("include_visible_text").and_then(Value::as_bool).unwrap_or(true)
 }
 
+fn parse_browser_observe_string_array(
+    payload: &serde_json::Map<String, Value>,
+    field: &str,
+    max_items: usize,
+) -> Result<Vec<String>, String> {
+    let Some(value) = payload.get(field) else {
+        return Ok(Vec::new());
+    };
+    let Some(entries) = value.as_array() else {
+        return Err(format!("palyra.browser.observe field '{field}' must be an array of strings"));
+    };
+    let mut parsed = Vec::new();
+    for entry in entries {
+        let Some(raw) = entry.as_str() else {
+            return Err(format!(
+                "palyra.browser.observe field '{field}' must contain only strings"
+            ));
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || parsed.iter().any(|existing: &String| existing == trimmed) {
+            continue;
+        }
+        parsed.push(trimmed.to_owned());
+        if parsed.len() >= max_items {
+            break;
+        }
+    }
+    Ok(parsed)
+}
+
 fn parse_browser_tool_tab_id(payload: &serde_json::Map<String, Value>) -> Result<String, String> {
     let Some(tab_id) = payload.get("tab_id").and_then(Value::as_str).map(str::trim) else {
         return Err("palyra.browser.tabs.* requires non-empty string field 'tab_id'".to_owned());
@@ -3897,6 +3973,65 @@ fn browser_layout_metrics_to_json(metrics: browser_v1::BrowserLayoutMetrics) -> 
         "document_client_height": metrics.document_client_height,
         "horizontal_overflow": metrics.horizontal_overflow,
         "vertical_overflow": metrics.vertical_overflow,
+    })
+}
+
+fn browser_element_captures_to_json(
+    captures: &[browser_v1::BrowserElementCapture],
+) -> (Vec<Value>, Vec<SafetyScanResult>, bool) {
+    let mut scans = Vec::new();
+    let mut redacted = false;
+    let captures = captures
+        .iter()
+        .map(|capture| {
+            let text_export =
+                export_browser_text(capture.text.as_str(), SafetyContentKind::BrowserObservation);
+            redacted |= text_export.redacted;
+            scans.push(text_export.scan.clone());
+            let computed_styles = capture
+                .computed_styles
+                .iter()
+                .map(|style| {
+                    let value_export = export_browser_text(
+                        style.value.as_str(),
+                        SafetyContentKind::BrowserObservation,
+                    );
+                    redacted |= value_export.redacted;
+                    scans.push(value_export.scan.clone());
+                    json!({
+                        "name": style.name,
+                        "value": value_export.redacted_text,
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "selector": capture.selector,
+                "found": capture.found,
+                "bounding_rect": capture.bounding_rect.as_ref().map(browser_rect_to_json),
+                "visible": capture.visible,
+                "tag_name": capture.tag_name,
+                "id": capture.id,
+                "class_name": capture.class_name,
+                "text": text_export.redacted_text,
+                "text_truncated": capture.text_truncated,
+                "computed_styles": computed_styles,
+                "error": capture.error,
+            })
+        })
+        .collect::<Vec<_>>();
+    (captures, scans, redacted)
+}
+
+fn browser_rect_to_json(rect: &browser_v1::BrowserRect) -> Value {
+    json!({
+        "x": rect.x,
+        "y": rect.y,
+        "width": rect.width,
+        "height": rect.height,
+        "top": rect.top,
+        "right": rect.right,
+        "bottom": rect.bottom,
+        "left": rect.left,
     })
 }
 
@@ -4319,12 +4454,13 @@ mod tests {
 
     use super::{
         attach_browser_caller_principal_metadata, browser_console_entry_to_json,
-        browser_file_url_to_path, browser_network_log_entry_to_json,
-        browser_observe_include_visible_text, browser_session_persistence_from_payload,
-        browser_session_profile_id_from_payload, browser_tool_execution_outcome,
-        browser_tool_requires_open_session, browser_url_targets_loopback,
-        browser_user_owned_os_roots, canonical_file_path_is_inside_workspace_roots,
-        normalize_browser_press_key_input, parse_browser_download_artifact_id,
+        browser_element_captures_to_json, browser_file_url_to_path,
+        browser_network_log_entry_to_json, browser_observe_include_visible_text,
+        browser_session_persistence_from_payload, browser_session_profile_id_from_payload,
+        browser_tool_execution_outcome, browser_tool_requires_open_session,
+        browser_url_targets_loopback, browser_user_owned_os_roots,
+        canonical_file_path_is_inside_workspace_roots, normalize_browser_press_key_input,
+        parse_browser_download_artifact_id, parse_browser_observe_string_array,
         resolve_browser_output_path, resolve_browser_upload_path,
         validate_browser_workspace_relative_path, BROWSER_CALLER_PRINCIPAL_HEADER,
         PALYRA_OS_FILE_ROOTS_ENV,
@@ -4972,6 +5108,76 @@ mod tests {
         assert!(!browser_observe_include_visible_text(
             explicit_false.as_object().expect("object payload")
         ));
+    }
+
+    #[test]
+    fn browser_observe_string_array_parser_trims_dedupes_and_caps() {
+        let payload = json!({
+            "capture_selectors": ["  #hero  ", "", "#hero", ".nav", ".footer"]
+        });
+
+        let parsed = parse_browser_observe_string_array(
+            payload.as_object().expect("payload should be an object"),
+            "capture_selectors",
+            2,
+        )
+        .expect("string array should parse");
+
+        assert_eq!(parsed, vec!["#hero".to_owned(), ".nav".to_owned()]);
+    }
+
+    #[test]
+    fn browser_observe_string_array_parser_rejects_non_strings() {
+        let payload = json!({"capture_selectors": ["#hero", 42]});
+
+        let error = parse_browser_observe_string_array(
+            payload.as_object().expect("payload should be an object"),
+            "capture_selectors",
+            8,
+        )
+        .expect_err("non-string entry should fail");
+
+        assert!(error.contains("capture_selectors"));
+        assert!(error.contains("only strings"));
+    }
+
+    #[test]
+    fn browser_element_captures_to_json_redacts_untrusted_text_and_styles() {
+        let (captures, scans, redacted) =
+            browser_element_captures_to_json(&[browser_v1::BrowserElementCapture {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                selector: "#token".to_owned(),
+                found: true,
+                bounding_rect: Some(browser_v1::BrowserRect {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    x: 1.0,
+                    y: 2.0,
+                    width: 3.0,
+                    height: 4.0,
+                    top: 2.0,
+                    right: 4.0,
+                    bottom: 6.0,
+                    left: 1.0,
+                }),
+                visible: true,
+                tag_name: "div".to_owned(),
+                id: "token".to_owned(),
+                class_name: String::new(),
+                text: "Authorization: Bearer super-secret-token-value".to_owned(),
+                text_truncated: false,
+                computed_styles: vec![browser_v1::BrowserComputedStyle {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    name: "content".to_owned(),
+                    value: "token=super-secret-token-value".to_owned(),
+                }],
+                error: String::new(),
+            }]);
+
+        assert!(redacted);
+        assert!(!scans.is_empty());
+        assert_eq!(captures[0]["bounding_rect"]["width"], 3.0);
+        assert_eq!(captures[0]["text"], "Authorization: [REDACTED_SECRET]");
+        assert_eq!(captures[0]["computed_styles"][0]["value"], "token=[REDACTED_SECRET]");
     }
 
     #[test]

@@ -998,7 +998,7 @@ fn browser_tool_description(tool_name: &str) -> &'static str {
             "Capture a bounded browser PDF and optionally save it directly to a workspace or approved user-owned output_path."
         }
         "palyra.browser.observe" => {
-            "Observe visible browser state, bounded DOM/accessibility visible text evidence, and safe current form/storage state for page-content claims."
+            "Observe visible browser state, bounded DOM/accessibility visible text evidence, safe current form/storage state, and optional read-only selector geometry/computed-style captures for layout assertions."
         }
         "palyra.browser.storage" => "Inspect bounded visible cookies and localStorage for diagnostics.",
         "palyra.browser.network_log" => "Read bounded browser network logs.",
@@ -1242,6 +1242,18 @@ fn browser_tool_schema(tool_name: &str) -> Value {
             properties
                 .push(("max_accessibility_tree_bytes", json!({"type":"integer","minimum":0})));
             properties.push(("max_visible_text_bytes", json!({"type":"integer","minimum":0})));
+            properties.push((
+                "capture_selectors",
+                json!({"type":"array","items":{"type":"string"},"maxItems":8,"description":"Optional CSS selectors to inspect without mutating page code. Returns element_captures with bounding_rect, visible, text preview, and computed_styles; use this for responsive layout, overlap, visibility, and computed-style assertions instead of adding measurement code or console logs to the app."}),
+            ));
+            properties.push((
+                "computed_style_properties",
+                json!({"type":"array","items":{"type":"string"},"maxItems":16,"description":"Optional CSS property names to include for capture_selectors. Defaults include display, visibility, opacity, position, z-index, overflow, pointer-events, font-size, line-height, margin, and padding."}),
+            ));
+            properties.push((
+                "max_capture_text_bytes",
+                json!({"type":"integer","minimum":0,"description":"Maximum text preview bytes per captured selector. Defaults to a small bounded preview."}),
+            ));
         }
         _ => {}
     }
@@ -1548,10 +1560,20 @@ mod tests {
     fn browser_registry_marks_observe_as_visible_text_evidence() {
         let observe = registry_entry("palyra.browser.observe").expect("observe entry exists");
         assert!(observe.description.contains("visible text"));
+        assert!(observe.description.contains("selector geometry"));
         assert_eq!(
             observe.input_schema.pointer("/required/0").and_then(serde_json::Value::as_str),
             Some("session_id")
         );
+        let capture_description = observe
+            .input_schema
+            .pointer("/properties/capture_selectors/description")
+            .and_then(serde_json::Value::as_str)
+            .expect("observe capture selectors description should be visible to models");
+        assert!(capture_description.contains("bounding_rect"));
+        assert!(capture_description.contains("instead of adding measurement code"));
+        assert_eq!(observe.input_schema["properties"]["capture_selectors"]["maxItems"], 8);
+        assert_eq!(observe.input_schema["properties"]["computed_style_properties"]["maxItems"], 16);
         let storage = registry_entry("palyra.browser.storage").expect("storage entry exists");
         assert!(storage.description.contains("cookies"));
         assert_eq!(

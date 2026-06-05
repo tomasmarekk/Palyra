@@ -62,7 +62,11 @@ pub mod palyra_browser_v1 {
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct BrowserActionLogEntry;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct BrowserComputedStyle;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct BrowserConsoleEntry;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct BrowserElementCapture;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct BrowserHealthRequest;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -73,6 +77,8 @@ pub mod palyra_browser_v1 {
     pub struct BrowserPageDiagnostics;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct BrowserProfile;
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct BrowserRect;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct BrowserSessionDetail;
     #[derive(Debug, Clone, Default, PartialEq, Eq)]

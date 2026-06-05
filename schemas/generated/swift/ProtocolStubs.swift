@@ -80,7 +80,13 @@ public enum PalyraBrowserV1 {
     public struct BrowserActionLogEntry: Equatable {
         public init() {}
     }
+    public struct BrowserComputedStyle: Equatable {
+        public init() {}
+    }
     public struct BrowserConsoleEntry: Equatable {
+        public init() {}
+    }
+    public struct BrowserElementCapture: Equatable {
         public init() {}
     }
     public struct BrowserHealthRequest: Equatable {
@@ -96,6 +102,9 @@ public enum PalyraBrowserV1 {
         public init() {}
     }
     public struct BrowserProfile: Equatable {
+        public init() {}
+    }
+    public struct BrowserRect: Equatable {
         public init() {}
     }
     public struct BrowserSessionDetail: Equatable {
