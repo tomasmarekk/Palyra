@@ -1038,19 +1038,26 @@ fn collect_open_action_items(
 fn extract_open_action_items(raw: &str) -> Vec<String> {
     let mut items = Vec::new();
     let mut in_action_item_section = false;
+    let mut section_item_count = 0usize;
+    let mut blank_seen_in_section = false;
     for line in raw.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
-            in_action_item_section = false;
+            if in_action_item_section {
+                blank_seen_in_section = true;
+            }
             continue;
         }
 
         let lower = trimmed.to_ascii_lowercase();
         if opens_action_item_section(lower.as_str()) {
             in_action_item_section = true;
+            section_item_count = 0;
+            blank_seen_in_section = false;
             if let Some((_, inline_item)) = trimmed.split_once(':') {
                 if let Some(item) = normalize_open_action_item(inline_item) {
                     items.push(item);
+                    section_item_count += 1;
                 }
             }
             continue;
@@ -1064,12 +1071,26 @@ fn extract_open_action_items(raw: &str) -> Vec<String> {
         if in_action_item_section {
             if looks_like_section_break(trimmed) {
                 in_action_item_section = false;
+                section_item_count = 0;
+                blank_seen_in_section = false;
+                continue;
+            }
+            if blank_seen_in_section
+                && section_item_count > 0
+                && !looks_like_list_action_item_line(trimmed)
+            {
+                in_action_item_section = false;
+                section_item_count = 0;
+                blank_seen_in_section = false;
                 continue;
             }
             if let Some(item) = normalize_open_action_item(trimmed) {
                 items.push(item);
+                section_item_count += 1;
+                blank_seen_in_section = false;
                 continue;
             }
+            blank_seen_in_section = false;
             continue;
         }
     }
@@ -1122,6 +1143,10 @@ fn is_action_item_heading(lower: &str) -> bool {
             | "action items"
             | "action-item"
             | "action-items"
+            | "open action item"
+            | "open action items"
+            | "open action-item"
+            | "open action-items"
             | "todo"
             | "todos"
             | "follow up"
@@ -1217,6 +1242,15 @@ fn strip_checkbox_marker(raw: &str) -> &str {
         }
     }
     trimmed
+}
+
+fn looks_like_list_action_item_line(line: &str) -> bool {
+    strip_list_marker(line).is_some() || starts_with_checkbox_marker(line)
+}
+
+fn starts_with_checkbox_marker(raw: &str) -> bool {
+    let lower = raw.trim_start().to_ascii_lowercase();
+    ["[ ]", "[x]"].iter().any(|marker| lower.starts_with(marker))
 }
 
 fn strip_optional_item_number(raw: &str) -> &str {
@@ -2682,6 +2716,92 @@ TASK-103: Casey confirms the support rotation handoff.
                 .pointer("/active_task_summary/open_action_items/0")
                 .and_then(serde_json::Value::as_str),
             Some("TASK-101: Morgan publishes the deployment checklist by Tuesday.")
+        );
+    }
+
+    #[test]
+    fn active_task_summary_preserves_markdown_action_items_after_blank_heading() {
+        let notes = "\
+# Product Operations Sync
+
+Date: 2026-06-05
+Source: S078 fixture meeting notes
+
+## Decisions
+
+- Keep the beta release branch on `main`.
+- Use Prague time for the next customer-readiness review.
+- Do not change the incident escalation owner in this cycle.
+
+## Open action items
+
+1. Jana must finalize the billing migration checklist by 2026-06-12.
+2. Pavel must verify the staging rollback runbook owners by 2026-06-10.
+3. Lenka must send the customer beta invite copy for legal review by 2026-06-11.
+
+## Closed items
+
+- Ondrej already uploaded the May support metrics.
+- Marta already closed the mobile tooltip audit.
+";
+        let tool_result_payload = serde_json::json!({
+            "proposal_id": "proposal-s078",
+            "success": true,
+            "output_json": {
+                "path": "tasks/meeting-notes.md",
+                "content": notes,
+            },
+            "error": "",
+        })
+        .to_string();
+        let mut transcript = vec![
+            transcript_record(
+                0,
+                "message.received",
+                r#"{"text":"Track open action items from tasks/meeting-notes.md before reading reference docs."}"#,
+            ),
+            transcript_record(1, "tool_result", tool_result_payload.as_str()),
+        ];
+        transcript.extend((2..14).map(|seq| {
+            let payload = format!(r#"{{"text":"Reference filler context {seq} for compaction."}}"#);
+            transcript_record(seq, "message.received", payload.as_str())
+        }));
+
+        let plan = build_session_compaction_plan(
+            &session_record(),
+            transcript.as_slice(),
+            &[],
+            &[],
+            Some("test_compaction"),
+            Some("test_policy"),
+        );
+        let summary = serde_json::from_str::<serde_json::Value>(plan.summary_json.as_str())
+            .expect("summary JSON should decode");
+
+        assert!(plan.eligible);
+        assert_eq!(
+            plan.active_task_summary.open_action_items,
+            vec![
+                "Jana must finalize the billing migration checklist by 2026-06-12.",
+                "Pavel must verify the staging rollback runbook owners by 2026-06-10.",
+                "Lenka must send the customer beta invite copy for legal review by 2026-06-11.",
+            ]
+        );
+        assert!(
+            plan.active_task_summary.open_action_items.iter().all(|item| !item.contains("already")),
+            "closed items must not be captured as open action items: {:?}",
+            plan.active_task_summary.open_action_items
+        );
+        assert!(
+            plan.summary_text.contains("Lenka must send the customer beta invite copy"),
+            "summary text should preserve the third open action item: {}",
+            plan.summary_text
+        );
+        assert_eq!(
+            summary
+                .pointer("/active_task_summary/open_action_items/0")
+                .and_then(serde_json::Value::as_str),
+            Some("Jana must finalize the billing migration checklist by 2026-06-12.")
         );
     }
 
