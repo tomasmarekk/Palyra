@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chrono::{TimeZone, Timelike};
+use chrono::{TimeZone, Timelike, Utc};
 use palyra_common::validate_canonical_id;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -1799,6 +1799,7 @@ fn resolve_routine_schedule(
                 "every_interval_ms",
                 "cron_expression",
                 "at_timestamp_rfc3339",
+                "delay_ms",
                 "timezone",
             ],
         )
@@ -1870,10 +1871,10 @@ fn resolve_routine_schedule(
             trigger_payload_json_override: None,
         });
     }
-    let schedule = build_schedule(payload)?;
-    let normalized =
-        cron::normalize_schedule(Some(schedule), unix_ms_now_string_safe()?, schedule_timezone)
-            .map_err(sanitize_status_message)?;
+    let now_unix_ms = unix_ms_now_string_safe()?;
+    let schedule = build_schedule(payload, now_unix_ms)?;
+    let normalized = cron::normalize_schedule(Some(schedule), now_unix_ms, schedule_timezone)
+        .map_err(sanitize_status_message)?;
     Ok(ScheduleResolution {
         schedule_type: normalized.schedule_type,
         schedule_payload_json: schedule_payload_with_max_runs(
@@ -1922,7 +1923,10 @@ fn parse_routine_timezone(
     })
 }
 
-fn build_schedule(payload: &Map<String, Value>) -> Result<cron_v1::Schedule, String> {
+fn build_schedule(
+    payload: &Map<String, Value>,
+    now_unix_ms: i64,
+) -> Result<cron_v1::Schedule, String> {
     let schedule_type = required_string_field(payload, "schedule_type")?;
     match schedule_type.as_str() {
         "cron" => {
@@ -1950,7 +1954,25 @@ fn build_schedule(payload: &Map<String, Value>) -> Result<cron_v1::Schedule, Str
             })
         }
         "at" => {
-            let timestamp_rfc3339 = required_string_field(payload, "at_timestamp_rfc3339")?;
+            let timestamp_rfc3339 = if let Some(delay_ms) = optional_u64_field(payload, "delay_ms")?
+            {
+                let delay_ms = i64::try_from(delay_ms)
+                    .map_err(|_| "delay_ms is too large for schedule_type=at".to_owned())?;
+                if delay_ms <= 0 {
+                    return Err(
+                        "delay_ms must be greater than zero for schedule_type=at".to_owned()
+                    );
+                }
+                let at_unix_ms = now_unix_ms
+                    .checked_add(delay_ms)
+                    .ok_or_else(|| "delay_ms is too large for schedule_type=at".to_owned())?;
+                Utc.timestamp_millis_opt(at_unix_ms)
+                    .single()
+                    .ok_or_else(|| "delay_ms produced an invalid schedule timestamp".to_owned())?
+                    .to_rfc3339()
+            } else {
+                required_string_field(payload, "at_timestamp_rfc3339")?
+            };
             Ok(cron_v1::Schedule {
                 r#type: cron_v1::ScheduleType::At as i32,
                 spec: Some(cron_v1::schedule::Spec::At(cron_v1::AtSchedule { timestamp_rfc3339 })),
@@ -2675,7 +2697,7 @@ mod tests {
         .expect("payload should be an object")
         .clone();
 
-        let error = super::build_schedule(&payload)
+        let error = super::build_schedule(&payload, 0)
             .expect_err("short routines.control interval should be rejected");
         assert!(
             error.contains("at least 30000"),
@@ -2697,8 +2719,31 @@ mod tests {
         .expect("payload should be an object")
         .clone();
 
-        super::build_schedule(&payload)
+        super::build_schedule(&payload, 0)
             .expect("minimum routines.control interval should be accepted");
+    }
+
+    #[test]
+    fn build_schedule_accepts_relative_at_delay() {
+        let payload = json!({
+            "schedule_type": "at",
+            "delay_ms": 30_000,
+        })
+        .as_object()
+        .expect("payload should be an object")
+        .clone();
+
+        let schedule = super::build_schedule(&payload, 1_000)
+            .expect("relative one-shot delay should be accepted");
+        let Some(crate::transport::grpc::proto::palyra::cron::v1::schedule::Spec::At(at)) =
+            schedule.spec
+        else {
+            panic!("schedule should be an at schedule");
+        };
+        let parsed = chrono::DateTime::parse_from_rfc3339(at.timestamp_rfc3339.as_str())
+            .expect("relative at timestamp should parse");
+
+        assert_eq!(parsed.timestamp_millis(), 31_000);
     }
 
     #[test]
