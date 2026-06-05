@@ -4597,16 +4597,19 @@ mod tests {
         resolve_host_working_directory, resolve_scoped_path, resolve_working_directory,
         rewrite_arguments_to_scoped_paths, rewrite_host_virtual_workspace_args,
         run_constrained_process, run_constrained_process_with_cancellation,
-        validate_allowed_executable, validate_argument_workspace_scope,
-        validate_cmd_invocation_shape, validate_host_argument_scope,
-        validate_host_command_path_scope, validate_host_interpreter_argument_guardrails,
-        validate_input_shape, validate_interpreter_argument_guardrails,
-        validate_no_embedded_command_line_arg, validate_process_env_overrides,
-        validate_process_termination_scope, validate_runtime_egress_enforcement,
-        windows_program_files_path, EgressEnforcementMode, ProcessRunnerInput,
+        validate_argument_workspace_scope, validate_cmd_invocation_shape,
+        validate_host_argument_scope, validate_host_interpreter_argument_guardrails,
+        validate_interpreter_argument_guardrails, validate_no_embedded_command_line_arg,
+        validate_process_env_overrides, validate_process_termination_scope,
+        validate_runtime_egress_enforcement, EgressEnforcementMode, ProcessRunnerInput,
         SandboxProcessRunErrorKind, SandboxProcessRunnerPolicy, SandboxProcessRunnerTier,
         StreamCapture, BACKGROUND_MONITOR_POLL_MS, BACKGROUND_TERMINATION_WAIT_MS,
         NODE_DISABLE_COMPILE_CACHE_ENV,
+    };
+    #[cfg(windows)]
+    use super::{
+        validate_allowed_executable, validate_host_command_path_scope, validate_input_shape,
+        windows_program_files_path,
     };
 
     const BACKGROUND_TEST_EXECUTION_TIMEOUT_MS: u64 = 10_000;
