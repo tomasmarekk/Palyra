@@ -156,6 +156,14 @@ fn build_anthropic_tool_result_content_part(message: &ProviderMessage) -> Value 
     })
 }
 
+fn build_anthropic_orphan_tool_result_text_part(message: &ProviderMessage) -> Value {
+    let tool_call_id = message.tool_call_id.as_deref().unwrap_or("unknown");
+    json!({
+        "type": "text",
+        "text": format!("Tool result for {tool_call_id}:\n{}", message.text_content()),
+    })
+}
+
 // Some Anthropic-compatible endpoints validate flattened content block order and reject
 // `tool_use, tool_use, tool_result, tool_result`, even when official clients accept it.
 fn push_anthropic_expanded_multi_tool_exchange(
@@ -224,6 +232,7 @@ pub(super) fn build_anthropic_messages_and_system(
     }
     let mut provider_messages = Vec::new();
     let mut pending_tool_result_parts = Vec::new();
+    let mut expected_tool_result_ids = Vec::<String>::new();
     let flush_pending_tool_result_parts =
         |provider_messages: &mut Vec<Value>, pending_tool_result_parts: &mut Vec<Value>| {
             if pending_tool_result_parts.is_empty() {
@@ -245,13 +254,29 @@ pub(super) fn build_anthropic_messages_and_system(
                 }
             }
             ProviderMessageRole::Tool => {
-                pending_tool_result_parts.push(build_anthropic_tool_result_content_part(message));
+                let expected_id = expected_tool_result_ids.first().map(String::as_str);
+                if message.tool_call_id.as_deref() == expected_id {
+                    pending_tool_result_parts
+                        .push(build_anthropic_tool_result_content_part(message));
+                    expected_tool_result_ids.remove(0);
+                } else {
+                    flush_pending_tool_result_parts(
+                        &mut provider_messages,
+                        &mut pending_tool_result_parts,
+                    );
+                    expected_tool_result_ids.clear();
+                    provider_messages.push(json!({
+                        "role": "user",
+                        "content": [build_anthropic_orphan_tool_result_text_part(message)],
+                    }));
+                }
             }
             ProviderMessageRole::User | ProviderMessageRole::Assistant => {
                 flush_pending_tool_result_parts(
                     &mut provider_messages,
                     &mut pending_tool_result_parts,
                 );
+                expected_tool_result_ids.clear();
                 if let Some(consumed_tool_results) = push_anthropic_expanded_multi_tool_exchange(
                     &mut provider_messages,
                     message,
@@ -263,6 +288,13 @@ pub(super) fn build_anthropic_messages_and_system(
                         "role": message.role.as_anthropic_role(),
                         "content": build_anthropic_content_parts(message),
                     }));
+                    if message.role == ProviderMessageRole::Assistant {
+                        expected_tool_result_ids = message
+                            .tool_calls
+                            .iter()
+                            .map(|tool_call| tool_call.proposal_id.clone())
+                            .collect();
+                    }
                 }
             }
         }

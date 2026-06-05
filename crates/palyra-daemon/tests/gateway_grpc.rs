@@ -5430,6 +5430,220 @@ async fn grpc_run_stream_buffers_recoverable_final_answer_until_accepted() -> Re
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn grpc_run_stream_falls_back_after_recovery_final_answer_is_still_incomplete() -> Result<()>
+{
+    let first_response = serde_json::json!({
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "tool_calls": [{
+                    "id": "call_echo_fallback_01",
+                    "type": "function",
+                    "function": {
+                        "name": "palyra.echo",
+                        "arguments": "{\"text\":\"hello fallback\"}"
+                    }
+                }]
+            }
+        }]
+    })
+    .to_string();
+    let recoverable_final_response =
+        r#"{"choices":[{"finish_reason":"stop","message":{"content":"ack"}}]}"#.to_owned();
+    let second_incomplete_final_response =
+        r#"{"choices":[{"finish_reason":"stop","message":{"content":"Let me verify the tool output before I summarize it."}}]}"#
+            .to_owned();
+    let (openai_base_url, request_count, server_handle) = spawn_scripted_openai_server(vec![
+        ScriptedOpenAiResponse::immediate(200, first_response),
+        ScriptedOpenAiResponse::immediate(200, recoverable_final_response),
+        ScriptedOpenAiResponse::immediate(200, second_incomplete_final_response),
+    ])?;
+    let (child, admin_port, grpc_port, _journal_db_path) =
+        spawn_palyrad_with_openai_provider_and_tool_policy(
+            openai_base_url.as_str(),
+            OPENAI_API_KEY,
+            "palyra.echo",
+            2,
+            250,
+        )?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+
+    let mut stream_request =
+        tonic::Request::new(tokio_stream::iter(vec![sample_run_stream_request_with_text(
+            "call echo and summarize the result".to_owned(),
+        )]));
+    stream_request.metadata_mut().insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
+    stream_request.metadata_mut().insert("x-palyra-principal", "user:ops".parse()?);
+    stream_request.metadata_mut().insert("x-palyra-device-id", DEVICE_ID.parse()?);
+    stream_request.metadata_mut().insert("x-palyra-channel", "cli".parse()?);
+
+    let mut response_stream =
+        client.run_stream(stream_request).await.context("failed to call RunStream")?.into_inner();
+    let mut model_tokens = Vec::new();
+    let mut final_token_count = 0usize;
+    let mut progress_statuses = Vec::new();
+    let mut failed_messages = Vec::new();
+    let mut saw_done = false;
+    while let Some(event) = response_stream.next().await {
+        let event = event.context("failed to read RunStream event")?;
+        if let Some(body) = event.body {
+            match body {
+                common_v1::run_stream_event::Body::ModelToken(token) => {
+                    if token.is_final {
+                        final_token_count = final_token_count.saturating_add(1);
+                    }
+                    model_tokens.push(token.token);
+                }
+                common_v1::run_stream_event::Body::Status(status)
+                    if status.message.trim().starts_with("progress:") =>
+                {
+                    progress_statuses.push(status.message);
+                }
+                common_v1::run_stream_event::Body::Status(status)
+                    if status.kind == common_v1::stream_status::StatusKind::Done as i32 =>
+                {
+                    saw_done = true;
+                }
+                common_v1::run_stream_event::Body::Status(status)
+                    if status.kind == common_v1::stream_status::StatusKind::Failed as i32 =>
+                {
+                    failed_messages.push(status.message);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let rendered = model_tokens.concat();
+    assert!(
+        !rendered.contains("ack") && !rendered.contains("Let me verify"),
+        "invalid final answers must stay buffered: {rendered}"
+    );
+    assert!(rendered.contains("Partial result"), "fallback summary missing: {rendered}");
+    assert!(rendered.contains("1 tool call"), "tool evidence count missing: {rendered}");
+    assert_eq!(final_token_count, 1, "fallback summary should be the only final token");
+    assert!(
+        progress_statuses
+            .iter()
+            .any(|status| status == "progress:agent_loop.final_answer_fallback_used"),
+        "run should expose fallback progress status: {progress_statuses:?}"
+    );
+    assert!(saw_done, "run stream should finish with controlled fallback summary");
+    assert!(failed_messages.is_empty(), "fallback run should not fail: {failed_messages:?}");
+    assert_eq!(request_count.load(Ordering::Relaxed), 3);
+
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_run_stream_reports_partial_summary_when_recovery_provider_turn_fails() -> Result<()> {
+    let first_response = serde_json::json!({
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "tool_calls": [{
+                    "id": "call_echo_provider_error_01",
+                    "type": "function",
+                    "function": {
+                        "name": "palyra.echo",
+                        "arguments": "{\"text\":\"hello provider error\"}"
+                    }
+                }]
+            }
+        }]
+    })
+    .to_string();
+    let recoverable_final_response =
+        r#"{"choices":[{"finish_reason":"stop","message":{"content":"ack"}}]}"#.to_owned();
+    let provider_error_response = serde_json::json!({
+        "error": {
+            "type": "invalid_request_error",
+            "message": "tool call result does not follow tool call (2013)"
+        }
+    })
+    .to_string();
+    let (openai_base_url, request_count, server_handle) = spawn_scripted_openai_server(vec![
+        ScriptedOpenAiResponse::immediate(200, first_response),
+        ScriptedOpenAiResponse::immediate(200, recoverable_final_response),
+        ScriptedOpenAiResponse::immediate(400, provider_error_response),
+    ])?;
+    let (child, admin_port, grpc_port, _journal_db_path) =
+        spawn_palyrad_with_openai_provider_and_tool_policy(
+            openai_base_url.as_str(),
+            OPENAI_API_KEY,
+            "palyra.echo",
+            2,
+            250,
+        )?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+
+    let mut stream_request =
+        tonic::Request::new(tokio_stream::iter(vec![sample_run_stream_request_with_text(
+            "call echo and summarize the result".to_owned(),
+        )]));
+    stream_request.metadata_mut().insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
+    stream_request.metadata_mut().insert("x-palyra-principal", "user:ops".parse()?);
+    stream_request.metadata_mut().insert("x-palyra-device-id", DEVICE_ID.parse()?);
+    stream_request.metadata_mut().insert("x-palyra-channel", "cli".parse()?);
+
+    let mut response_stream =
+        client.run_stream(stream_request).await.context("failed to call RunStream")?.into_inner();
+    let mut model_tokens = Vec::new();
+    let mut failed_messages = Vec::new();
+    let mut saw_done = false;
+    while let Some(event) = response_stream.next().await {
+        let event = event.context("failed to read RunStream event")?;
+        if let Some(body) = event.body {
+            match body {
+                common_v1::run_stream_event::Body::ModelToken(token) => {
+                    model_tokens.push(token.token);
+                }
+                common_v1::run_stream_event::Body::Status(status)
+                    if status.kind == common_v1::stream_status::StatusKind::Done as i32 =>
+                {
+                    saw_done = true;
+                }
+                common_v1::run_stream_event::Body::Status(status)
+                    if status.kind == common_v1::stream_status::StatusKind::Failed as i32 =>
+                {
+                    failed_messages.push(status.message);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let rendered = model_tokens.concat();
+    assert!(rendered.contains("Partial result"), "partial summary missing: {rendered}");
+    assert!(rendered.contains("1 tool call"), "tool evidence count missing: {rendered}");
+    assert!(
+        failed_messages.iter().any(|message| {
+            message.contains("Partial result")
+                && message.contains("tool call result does not follow tool call")
+        }),
+        "failed status should carry provider recovery summary: {failed_messages:?}"
+    );
+    assert!(!saw_done, "provider recovery error should remain a failed run");
+    assert_eq!(request_count.load(Ordering::Relaxed), 3);
+
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn grpc_run_stream_retries_provider_overload_during_finalization() -> Result<()> {
     let first_response = serde_json::json!({
         "choices": [{

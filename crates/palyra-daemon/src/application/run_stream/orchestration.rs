@@ -1273,6 +1273,38 @@ pub(crate) async fn process_run_stream_message(
                 return Ok(RunStreamMessageProcessingOutcome::Terminate);
             }
             Err(error) => {
+                if final_answer_recovery_attempted && loop_state.completed_tool_calls() > 0 {
+                    let fallback_summary = final_answer_recovery_fallback_summary(
+                        error.message(),
+                        &loop_state,
+                        run_id.as_str(),
+                    );
+                    send_deferred_final_reply_tokens(
+                        sender,
+                        runtime_state,
+                        request_context,
+                        session_id_for_message.as_str(),
+                        run_id.as_str(),
+                        tape_seq,
+                        model_token_tape_events,
+                        model_token_compaction_emitted,
+                        fallback_summary.as_str(),
+                    )
+                    .await?;
+                    terminate_run_stream_with_agent_loop_reason(
+                        sender,
+                        runtime_state,
+                        run_state,
+                        run_id.as_str(),
+                        tape_seq,
+                        &loop_state,
+                        AgentLoopTerminationReason::ProviderError,
+                        fallback_summary.as_str(),
+                        None,
+                    )
+                    .await?;
+                    return Ok(RunStreamMessageProcessingOutcome::Terminate);
+                }
                 terminate_run_stream_with_agent_loop_reason(
                     sender,
                     runtime_state,
@@ -1378,6 +1410,75 @@ pub(crate) async fn process_run_stream_message(
                             )
                             .await?;
                             continue;
+                        }
+                        if loop_state.completed_tool_calls() > 0 {
+                            let fallback_summary = final_answer_recovery_fallback_summary(
+                                message.as_str(),
+                                &loop_state,
+                                run_id.as_str(),
+                            );
+                            append_agent_loop_tape_event(
+                                runtime_state,
+                                run_id.as_str(),
+                                tape_seq,
+                                "agent_loop.final_answer_fallback_used",
+                                loop_state.turn_payload(
+                                    run_id.as_str(),
+                                    "agent_loop.final_answer_fallback_used",
+                                ),
+                            )
+                            .await?;
+                            send_agent_loop_progress_status(
+                                sender,
+                                runtime_state,
+                                run_id.as_str(),
+                                tape_seq,
+                                "agent_loop.final_answer_fallback_used",
+                            )
+                            .await?;
+                            send_deferred_final_reply_tokens(
+                                sender,
+                                runtime_state,
+                                request_context,
+                                session_id_for_message.as_str(),
+                                run_id.as_str(),
+                                tape_seq,
+                                model_token_tape_events,
+                                model_token_compaction_emitted,
+                                fallback_summary.as_str(),
+                            )
+                            .await?;
+                            persist_accepted_final_reply(
+                                runtime_state,
+                                request_context,
+                                session_id_for_message.as_str(),
+                                run_id.as_str(),
+                                tape_seq,
+                                fallback_summary.as_str(),
+                            )
+                            .await?;
+                            append_agent_loop_tape_event(
+                                runtime_state,
+                                run_id.as_str(),
+                                tape_seq,
+                                "agent_loop.terminated",
+                                loop_state.termination_payload(
+                                    run_id.as_str(),
+                                    AgentLoopTerminationReason::FinalAnswer,
+                                    fallback_summary.as_str(),
+                                    provider_trace_ref,
+                                ),
+                            )
+                            .await?;
+                            send_terminal_agent_loop_progress_status(
+                                sender,
+                                runtime_state,
+                                run_id.as_str(),
+                                tape_seq,
+                                "agent_loop.terminated",
+                            )
+                            .await?;
+                            return Ok(RunStreamMessageProcessingOutcome::Continue);
                         }
                         terminate_run_stream_with_agent_loop_reason(
                             sender,
@@ -2014,6 +2115,19 @@ fn final_answer_recovery_prompt(
     )
 }
 
+fn final_answer_recovery_fallback_summary(
+    message: &str,
+    loop_state: &AgentRunLoopState,
+    run_id: &str,
+) -> String {
+    let tool_count = loop_state.completed_tool_calls();
+    let tool_label = if tool_count == 1 { "tool call" } else { "tool calls" };
+    format!(
+        "Partial result: I ran {tool_count} {tool_label}, but the model did not produce a usable final answer after recovery. Last recovery issue: {}. The run tape for {run_id} contains the exact tool evidence. Resume this same session and reference run {run_id} if any requested artifact, validation, or cleanup is still missing.",
+        truncate_with_ellipsis(message.trim().replace(['\r', '\n'], " "), 512)
+    )
+}
+
 fn incomplete_final_answer_without_tools(
     text: Option<&str>,
     messages: &[ProviderMessage],
@@ -2449,15 +2563,15 @@ mod tests {
     use super::{
         agent_loop_budget_exhausted_message, apply_background_budget_guard,
         background_budget_overrun_message, background_run_budget_tokens,
-        contains_raw_provider_tool_call_markup, final_answer_recovery_prompt,
-        incomplete_final_answer_without_tools, incomplete_terminal_final_answer,
-        is_run_stream_response_channel_closed, length_recovery_prompt,
-        provider_model_override_for_routing, provider_request_deadline_timeout,
-        provider_request_timeout_status, repeated_tool_failure_signature,
-        should_terminate_after_tool_budget_exhausted, terminal_tool_authorization_failure,
-        tool_calls_finish_without_tool_payload, tool_result_to_provider_message,
-        truncated_final_answer_without_tools, RepeatedToolFailureTracker,
-        RunStreamToolResultForModel, MAX_LENGTH_RECOVERY_ATTEMPTS,
+        contains_raw_provider_tool_call_markup, final_answer_recovery_fallback_summary,
+        final_answer_recovery_prompt, incomplete_final_answer_without_tools,
+        incomplete_terminal_final_answer, is_run_stream_response_channel_closed,
+        length_recovery_prompt, provider_model_override_for_routing,
+        provider_request_deadline_timeout, provider_request_timeout_status,
+        repeated_tool_failure_signature, should_terminate_after_tool_budget_exhausted,
+        terminal_tool_authorization_failure, tool_calls_finish_without_tool_payload,
+        tool_result_to_provider_message, truncated_final_answer_without_tools,
+        RepeatedToolFailureTracker, RunStreamToolResultForModel, MAX_LENGTH_RECOVERY_ATTEMPTS,
     };
     use super::{AgentLoopTerminationReason, AgentRunLoopState};
     use crate::application::run_stream::tape::RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE;
@@ -3072,6 +3186,22 @@ mod tests {
         };
 
         assert!(tool_calls_finish_without_tool_payload(&output).is_none());
+    }
+
+    #[test]
+    fn final_answer_recovery_fallback_summary_points_to_run_evidence() {
+        let state = loop_state_after_tool("Create a report", "palyra.fs.apply_patch");
+
+        let summary = final_answer_recovery_fallback_summary(
+            "model returned a planning or intent statement as the final answer after tool execution",
+            &state,
+            "01RUNFALLBACK000000000000",
+        );
+
+        assert!(summary.contains("Partial result"));
+        assert!(summary.contains("1 tool call"));
+        assert!(summary.contains("01RUNFALLBACK000000000000"));
+        assert!(summary.contains("Resume this same session"));
     }
 
     #[test]

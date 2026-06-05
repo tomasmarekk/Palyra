@@ -5738,6 +5738,95 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_adapter_converts_orphan_tool_results_to_text() {
+        let request = ProviderRequest {
+            input_text: "Continue from previous evidence.".to_owned(),
+            user_visible_input_text: None,
+            messages: vec![
+                ProviderMessage::user_text("Continue from previous evidence."),
+                ProviderMessage::tool_result("call_orphan_01", r#"{"status":"ok"}"#),
+                ProviderMessage::user_text("Summarize the result."),
+            ],
+            json_mode: false,
+            vision_inputs: Vec::new(),
+            model_override: None,
+            tool_catalog_snapshot: None,
+            instruction_hash: None,
+            context_trace_id: None,
+            budget_profile: None,
+            max_output_tokens: None,
+        };
+
+        let anthropic_payload =
+            AnthropicCompatibleChatAdapter.request_payload(&request, "claude-contract-test");
+
+        assert_eq!(anthropic_payload["messages"][1]["role"], "user");
+        assert_eq!(anthropic_payload["messages"][1]["content"][0]["type"], "text");
+        assert!(anthropic_payload["messages"][1]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Tool result for call_orphan_01"));
+        assert_eq!(anthropic_payload["messages"][2]["role"], "user");
+        assert_eq!(anthropic_payload["messages"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn anthropic_adapter_keeps_recovery_tool_result_adjacent_to_tool_use() {
+        let request = ProviderRequest {
+            input_text: "Use a tool then recover final answer.".to_owned(),
+            user_visible_input_text: None,
+            messages: vec![
+                ProviderMessage::user_text("Use a tool."),
+                ProviderMessage {
+                    role: ProviderMessageRole::Assistant,
+                    content: Vec::new(),
+                    name: None,
+                    tool_call_id: None,
+                    tool_calls: vec![ProviderMessageToolCall {
+                        proposal_id: "call_recovery_01".to_owned(),
+                        tool_name: "palyra.echo".to_owned(),
+                        input_json: serde_json::json!({"text":"hello"}),
+                    }],
+                },
+                ProviderMessage::tool_result("call_recovery_01", r#"{"echo":"hello"}"#),
+                ProviderMessage {
+                    role: ProviderMessageRole::Assistant,
+                    content: vec![ProviderMessageContentPart::text("ack")],
+                    name: None,
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                },
+                ProviderMessage::user_text(
+                    "The previous assistant turn did not provide a usable final answer.",
+                ),
+            ],
+            json_mode: false,
+            vision_inputs: Vec::new(),
+            model_override: None,
+            tool_catalog_snapshot: None,
+            instruction_hash: None,
+            context_trace_id: None,
+            budget_profile: None,
+            max_output_tokens: None,
+        };
+
+        let anthropic_payload =
+            AnthropicCompatibleChatAdapter.request_payload(&request, "claude-contract-test");
+
+        assert_eq!(anthropic_payload["messages"][1]["role"], "assistant");
+        assert_eq!(anthropic_payload["messages"][1]["content"][0]["type"], "tool_use");
+        assert_eq!(anthropic_payload["messages"][2]["role"], "user");
+        assert_eq!(anthropic_payload["messages"][2]["content"][0]["type"], "tool_result");
+        assert_eq!(
+            anthropic_payload["messages"][2]["content"][0]["tool_use_id"],
+            "call_recovery_01"
+        );
+        assert_eq!(anthropic_payload["messages"][3]["role"], "assistant");
+        assert_eq!(anthropic_payload["messages"][3]["content"][0]["text"], "ack");
+        assert_eq!(anthropic_payload["messages"][4]["role"], "user");
+    }
+
+    #[test]
     fn scripted_provider_stream_harness_accumulates_full_output_usage_and_tools() {
         let mut harness =
             ProviderStreamAccumulator::with_buffer_cap("fake-provider", "fake-model", 8);
