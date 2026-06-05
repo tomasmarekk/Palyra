@@ -670,7 +670,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                         json!({
                             "type":"string",
                             "maxLength":128,
-                            "description":"Bare executable or portable builtin name only. When process_runner.allowed_executables contains '*', any PATH-resolvable executable is permitted by policy. Do not include arguments, shell syntax, or repeat this value in args."
+                            "description":"Prefer a bare executable or portable builtin name. In host-access process runner mode, use an exact existing executable path when PATH lookup is insufficient, including Windows Program Files paths with spaces. When process_runner.allowed_executables contains '*', any PATH-resolvable executable is permitted by policy. Do not include arguments, shell syntax, or repeat this value in args; put executable arguments in args and do not split executable paths at spaces."
                         }),
                     ),
                     (
@@ -1242,6 +1242,13 @@ mod tests {
             .pointer("/properties/args/description")
             .and_then(serde_json::Value::as_str)
             .expect("args description should be visible to models");
+        let command_description = entry
+            .input_schema
+            .pointer("/properties/command/description")
+            .and_then(serde_json::Value::as_str)
+            .expect("command description should be visible to models");
+        assert!(command_description.contains("exact existing executable path"));
+        assert!(command_description.contains("do not split executable paths at spaces"));
         assert!(args_description.contains("Do not use mkdir, touch"));
         assert!(args_description.contains("palyra.fs.apply_patch first"));
         assert!(args_description.contains("not args=['node','script.js']"));

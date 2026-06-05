@@ -382,6 +382,11 @@ pub fn run_constrained_process_with_cancellation(
         resolve_working_directory(workspace_root.as_path(), input.cwd.as_deref())?
     };
     if host_access {
+        validate_host_command_path_scope(
+            workspace_root.as_path(),
+            working_directory.as_path(),
+            input.command.as_str(),
+        )?;
         validate_host_interpreter_argument_guardrails(
             workspace_root.as_path(),
             working_directory.as_path(),
@@ -1239,7 +1244,9 @@ fn validate_input_shape(input: &ProcessRunnerInput) -> Result<(), SandboxProcess
             message: "palyra.process.run requires non-empty field 'command'".to_owned(),
         });
     }
-    if input.command.chars().any(char::is_whitespace) {
+    if input.command.chars().any(char::is_whitespace)
+        && !command_is_existing_executable_path(input.command.as_str())
+    {
         return Err(SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::InvalidInput,
             message: process_runner_command_with_args_message(input.command.as_str()),
@@ -1368,6 +1375,11 @@ fn redact_env_key_for_error(key: &str) -> String {
 }
 
 fn process_runner_command_with_args_message(command: &str) -> String {
+    if command_has_path_separator(command) {
+        return format!(
+            "palyra.process.run command contains whitespace but does not resolve to an executable path: {command:?}. Use an exact executable path in command without quotes and put executable arguments in args. Do not split executable paths at spaces."
+        );
+    }
     let mut tokens = command.split_whitespace();
     let Some(executable) = tokens.next() else {
         return "palyra.process.run command must be a bare executable name; put arguments in args"
@@ -1383,6 +1395,14 @@ fn process_runner_command_with_args_message(command: &str) -> String {
             "palyra.process.run command must be a bare executable name without arguments; got {command:?}. Use command={executable:?} and args=[{args}]"
         )
     }
+}
+
+fn command_is_existing_executable_path(command: &str) -> bool {
+    command_has_path_separator(command) && Path::new(command.trim()).is_file()
+}
+
+fn command_has_path_separator(command: &str) -> bool {
+    command.contains('/') || command.contains('\\')
 }
 
 fn validate_no_embedded_command_line_arg(
@@ -1449,20 +1469,37 @@ fn validate_allowed_executable(
     policy: &SandboxProcessRunnerPolicy,
     command: &str,
 ) -> Result<(), SandboxProcessRunError> {
-    let normalized = command.trim().to_ascii_lowercase();
-    if normalized.contains('/') || normalized.contains('\\') {
+    let normalized = normalize_process_executable_token(command);
+    if command_has_path_separator(command) {
+        if !process_runner_allows_host_access(policy) {
+            return Err(SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+                message: "sandbox denied: executable paths require host-access process runner mode; use a bare executable name for sandboxed execution"
+                    .to_owned(),
+            });
+        }
+        validate_allowed_executable_name(policy, command, normalized.as_str())?;
+        validate_allowed_interpreter(policy, command, normalized.as_str())?;
+        return Ok(());
+    }
+    validate_allowed_executable_name(policy, command, normalized.as_str())?;
+    validate_allowed_interpreter(policy, command, normalized.as_str())
+}
+
+fn validate_allowed_executable_name(
+    policy: &SandboxProcessRunnerPolicy,
+    command: &str,
+    normalized: &str,
+) -> Result<(), SandboxProcessRunError> {
+    if normalized.is_empty() {
         return Err(SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
-            message:
-                "sandbox denied: command must be a bare executable name without path separators"
-                    .to_owned(),
+            message: "sandbox denied: command must resolve to an executable name".to_owned(),
         });
     }
-    if !policy
-        .allowed_executables
-        .iter()
-        .any(|allowed| allowed.eq_ignore_ascii_case(normalized.as_str()))
-        && !policy.allowed_executables.iter().any(|allowed| allowed.trim() == "*")
+    if !policy.allowed_executables.iter().any(|allowed| {
+        allowed.eq_ignore_ascii_case(command) || allowed.eq_ignore_ascii_case(normalized)
+    }) && !policy.allowed_executables.iter().any(|allowed| allowed.trim() == "*")
     {
         return Err(SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
@@ -1471,7 +1508,15 @@ fn validate_allowed_executable(
             ),
         });
     }
-    if is_interpreter_executable(normalized.as_str()) && !policy.allow_interpreters {
+    Ok(())
+}
+
+fn validate_allowed_interpreter(
+    policy: &SandboxProcessRunnerPolicy,
+    command: &str,
+    normalized: &str,
+) -> Result<(), SandboxProcessRunError> {
+    if is_interpreter_executable(normalized) && !policy.allow_interpreters {
         return Err(SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
             message: format!(
@@ -1510,13 +1555,7 @@ fn validate_process_termination_scope(
 }
 
 fn normalized_process_command_name(command: &str) -> String {
-    let trimmed = command.trim().to_ascii_lowercase();
-    trimmed
-        .strip_suffix(".exe")
-        .or_else(|| trimmed.strip_suffix(".cmd"))
-        .or_else(|| trimmed.strip_suffix(".bat"))
-        .unwrap_or(trimmed.as_str())
-        .to_owned()
+    normalize_process_executable_token(command)
 }
 
 fn args_contain_switch(args: &[String], switch: &str) -> bool {
@@ -1922,6 +1961,27 @@ fn validate_host_argument_scope(
         }
         validate_host_argument_path_scope(workspace_root, cwd, command, arg.as_str())?;
         index = index.saturating_add(1);
+    }
+    Ok(())
+}
+
+fn validate_host_command_path_scope(
+    workspace_root: &Path,
+    cwd: &Path,
+    command: &str,
+) -> Result<(), SandboxProcessRunError> {
+    if !command_has_path_separator(command) {
+        return Ok(());
+    }
+    let executable = resolve_host_executable_path(workspace_root, cwd, command)?;
+    if !executable.is_file() {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+            message: format!(
+                "host process runner executable path '{}' is not a regular file",
+                executable.display()
+            ),
+        });
     }
     Ok(())
 }
@@ -2455,6 +2515,40 @@ fn ensure_host_access_path_allowed(
     })
 }
 
+fn ensure_host_executable_path_allowed(
+    workspace_root: &Path,
+    inspected: &Path,
+) -> Result<(), SandboxProcessRunError> {
+    if path_starts_with_case_aware(inspected, workspace_root)
+        || user_owned_host_roots()
+            .iter()
+            .any(|root| path_starts_with_case_aware(inspected, root.as_path()))
+        || windows_program_files_path(inspected)
+    {
+        return Ok(());
+    }
+    Err(SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+        message: format!(
+            "host process runner executable path '{}' is outside workspace, approved user-owned OS roots, and installed-program roots",
+            inspected.display()
+        ),
+    })
+}
+
+fn windows_program_files_path(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let normalized = path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+        normalized.contains(":/program files/") || normalized.contains(":/program files (x86)/")
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 fn user_owned_host_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     for key in ["USERPROFILE", "HOME"] {
@@ -2697,6 +2791,46 @@ fn collect_hosts_from_token(
         push_normalized_host(hosts, host)?;
     }
     Ok(())
+}
+
+fn resolve_host_executable_path(
+    workspace_root: &Path,
+    base: &Path,
+    raw: &str,
+) -> Result<PathBuf, SandboxProcessRunError> {
+    if raw.contains('\0') {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+            message: "host process runner denied executable path with embedded NUL byte".to_owned(),
+        });
+    }
+    let raw_path = Path::new(raw);
+    if raw_path.components().any(|component| matches!(component, Component::ParentDir)) {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+            message: format!("host process runner denied executable path traversal for '{raw}'"),
+        });
+    }
+    let candidate = if raw_path.is_absolute() { PathBuf::from(raw) } else { base.join(raw) };
+    if !candidate.exists() {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+            message: format!(
+                "host process runner executable path '{}' does not exist",
+                candidate.display()
+            ),
+        });
+    }
+    let executable =
+        fs::canonicalize(candidate.as_path()).map_err(|error| SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+            message: format!(
+                "host process runner denied invalid executable path '{}': {error}",
+                candidate.display()
+            ),
+        })?;
+    ensure_host_executable_path_allowed(workspace_root, executable.as_path())?;
+    Ok(executable)
 }
 
 fn maybe_extract_bare_host(token: &str, host_context: bool) -> Option<&str> {
@@ -4458,15 +4592,18 @@ mod tests {
     use super::{
         build_process_command, builtin_list_directory_stdout, canonical_workspace_root,
         collect_requested_egress_hosts, cpu_rlimit_seconds_from_usage_micros, is_host_allowlisted,
-        process_failure_message, redacted_process_output_preview, redacted_process_output_text,
+        process_failure_message, process_runner_command_with_args_message,
+        redacted_process_output_preview, redacted_process_output_text,
         resolve_host_working_directory, resolve_scoped_path, resolve_working_directory,
         rewrite_arguments_to_scoped_paths, rewrite_host_virtual_workspace_args,
         run_constrained_process, run_constrained_process_with_cancellation,
-        validate_argument_workspace_scope, validate_cmd_invocation_shape,
-        validate_host_argument_scope, validate_host_interpreter_argument_guardrails,
-        validate_interpreter_argument_guardrails, validate_no_embedded_command_line_arg,
-        validate_process_env_overrides, validate_process_termination_scope,
-        validate_runtime_egress_enforcement, EgressEnforcementMode, ProcessRunnerInput,
+        validate_allowed_executable, validate_argument_workspace_scope,
+        validate_cmd_invocation_shape, validate_host_argument_scope,
+        validate_host_command_path_scope, validate_host_interpreter_argument_guardrails,
+        validate_input_shape, validate_interpreter_argument_guardrails,
+        validate_no_embedded_command_line_arg, validate_process_env_overrides,
+        validate_process_termination_scope, validate_runtime_egress_enforcement,
+        windows_program_files_path, EgressEnforcementMode, ProcessRunnerInput,
         SandboxProcessRunErrorKind, SandboxProcessRunnerPolicy, SandboxProcessRunnerTier,
         StreamCapture, BACKGROUND_MONITOR_POLL_MS, BACKGROUND_TERMINATION_WAIT_MS,
         NODE_DISABLE_COMPILE_CACHE_ENV,
@@ -5307,6 +5444,61 @@ mod tests {
 
         assert_eq!(error.kind, SandboxProcessRunErrorKind::InvalidInput);
         assert!(error.message.contains("split each argument"), "{}", error.message);
+    }
+
+    #[test]
+    fn process_runner_command_path_hint_does_not_split_program_files_paths() {
+        let message =
+            process_runner_command_with_args_message(r"C:\Program Files\Git\bin\bash.exe -lc");
+
+        assert!(message.contains("exact executable path"), "{message}");
+        assert!(message.contains("put executable arguments in args"), "{message}");
+        assert!(
+            !message.contains("command=\"C:\\Program\""),
+            "hint must not split a Program Files path: {message}"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn validate_host_command_scope_allows_executable_path_with_spaces() {
+        let workspace = unique_temp_dir("workspace-command-path-spaces");
+        let tools = workspace.join("tools with spaces");
+        fs::create_dir_all(tools.as_path()).expect("tools directory should be created");
+        let executable = tools.join("palyra-helper.exe");
+        fs::write(executable.as_path(), "fake exe").expect("executable fixture should be written");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let policy = host_access_policy(canonical_workspace.clone());
+        let input = ProcessRunnerInput {
+            command: executable.display().to_string(),
+            args: vec!["--version".to_owned()],
+            cwd: None,
+            env: BTreeMap::new(),
+            requested_egress_hosts: Vec::new(),
+            timeout_ms: None,
+            background: false,
+        };
+
+        validate_input_shape(&input)
+            .expect("existing executable path with spaces should not look like embedded args");
+        validate_allowed_executable(&policy, input.command.as_str())
+            .expect("wildcard host policy should allow executable path by basename");
+        validate_host_command_path_scope(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            input.command.as_str(),
+        )
+        .expect("host command executable path should be validated separately from args");
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_program_files_paths_are_allowed_for_command_executables() {
+        assert!(windows_program_files_path(Path::new(r"C:\Program Files\Git\bin\bash.exe")));
+        assert!(windows_program_files_path(Path::new(r"C:\Program Files (x86)\Example\tool.exe")));
     }
 
     #[test]
