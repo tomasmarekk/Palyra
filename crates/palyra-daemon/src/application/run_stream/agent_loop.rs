@@ -274,7 +274,10 @@ impl AgentRunLoopState {
         if cleanup.is_empty() {
             return message.to_owned();
         }
-        format!("{message} Cleanup required: {}", cleanup.join(" "))
+        format!(
+            "{message} Automatic cleanup will be attempted. If any resource remains: {}",
+            cleanup.join(" ")
+        )
     }
 
     fn cleanup_instructions(&self) -> Vec<String> {
@@ -282,7 +285,7 @@ impl AgentRunLoopState {
             .into_iter()
             .map(|session_id| {
                 format!(
-                    "browser session {session_id} may still be open; close it with `palyra browser session close {session_id} --json` or stop browserd with `palyra browser stop --json`."
+                    "browser session {session_id}; close it with `palyra browser session close {session_id} --json` or stop browserd with `palyra browser stop --json` if it remains open."
                 )
             })
             .collect::<Vec<_>>();
@@ -478,7 +481,7 @@ fn routine_cleanup_instruction(routine_id: &str, latest_view: Option<&Value>) ->
         .map(json_value_label)
         .unwrap_or_else(|| "unknown".to_owned());
     format!(
-        "routine {routine_id} may still exist (enabled={enabled}, next_run_at_unix_ms={next_run_at_unix_ms}, last_outcome_kind={last_outcome_kind}); inspect it with `palyra routines show --id {routine_id} --json` or delete it with `palyra routines delete --id {routine_id} --json`."
+        "routine {routine_id} (enabled={enabled}, next_run_at_unix_ms={next_run_at_unix_ms}, last_outcome_kind={last_outcome_kind}); inspect it with `palyra routines show --id {routine_id} --json` or delete it with `palyra routines delete --id {routine_id} --json` if it remains present."
     )
 }
 

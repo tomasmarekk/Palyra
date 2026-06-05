@@ -5543,6 +5543,115 @@ async fn grpc_run_stream_falls_back_after_recovery_final_answer_is_still_incompl
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn grpc_run_stream_reports_partial_summary_when_tool_budget_is_exhausted() -> Result<()> {
+    let first_response = serde_json::json!({
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "tool_calls": [{
+                    "id": "call_budget_summary_01",
+                    "type": "function",
+                    "function": {
+                        "name": "palyra.echo",
+                        "arguments": "{\"text\":\"hello budget\"}"
+                    }
+                }]
+            }
+        }]
+    })
+    .to_string();
+    let (openai_base_url, request_count, server_handle) =
+        spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(200, first_response)])?;
+    let (child, admin_port, grpc_port, _journal_db_path) =
+        spawn_palyrad_with_openai_provider_and_tool_policy(
+            openai_base_url.as_str(),
+            OPENAI_API_KEY,
+            "palyra.echo",
+            1,
+            250,
+        )?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+
+    let mut stream_request =
+        tonic::Request::new(tokio_stream::iter(vec![sample_run_stream_request_with_text(
+            "call echo and report what happened".to_owned(),
+        )]));
+    stream_request.metadata_mut().insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
+    stream_request.metadata_mut().insert("x-palyra-principal", "user:ops".parse()?);
+    stream_request.metadata_mut().insert("x-palyra-device-id", DEVICE_ID.parse()?);
+    stream_request.metadata_mut().insert("x-palyra-channel", "cli".parse()?);
+
+    let mut response_stream =
+        client.run_stream(stream_request).await.context("failed to call RunStream")?.into_inner();
+    let mut model_tokens = Vec::new();
+    let mut final_token_count = 0usize;
+    let mut failed_messages = Vec::new();
+    let mut saw_done = false;
+    while let Some(event) = response_stream.next().await {
+        let event = event.context("failed to read RunStream event")?;
+        if let Some(body) = event.body {
+            match body {
+                common_v1::run_stream_event::Body::ModelToken(token) if token.is_final => {
+                    final_token_count = final_token_count.saturating_add(1);
+                    model_tokens.push(token.token);
+                }
+                common_v1::run_stream_event::Body::ModelToken(token) => {
+                    model_tokens.push(token.token);
+                }
+                common_v1::run_stream_event::Body::Status(status)
+                    if status.kind == common_v1::stream_status::StatusKind::Failed as i32 =>
+                {
+                    failed_messages.push(status.message);
+                }
+                common_v1::run_stream_event::Body::Status(status)
+                    if status.kind == common_v1::stream_status::StatusKind::Done as i32 =>
+                {
+                    saw_done = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let rendered = model_tokens.concat();
+    assert!(
+        rendered.contains("tool call limit reached"),
+        "partial final token should explain tool budget exhaustion: {rendered}"
+    );
+    assert!(
+        rendered.contains("partial result summary"),
+        "partial final token should include a user-visible summary: {rendered}"
+    );
+    assert!(
+        rendered.contains("tool_call.max_calls_per_run"),
+        "tool budget exhaustion should keep the correct recovery hint: {rendered}"
+    );
+    assert_eq!(final_token_count, 1, "budget summary should close with one final model token");
+    assert!(
+        failed_messages.iter().any(|message| {
+            message.contains("tool call limit reached")
+                && message.contains("partial result summary")
+        }),
+        "failed status should carry the same partial summary: {failed_messages:?}"
+    );
+    assert!(!saw_done, "budget-exhausted run should remain failed");
+    assert_eq!(
+        request_count.load(Ordering::Relaxed),
+        1,
+        "run must not ask the provider for another turn after tool budget exhaustion"
+    );
+
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn grpc_run_stream_reports_partial_summary_when_recovery_provider_turn_fails() -> Result<()> {
     let first_response = serde_json::json!({
         "choices": [{

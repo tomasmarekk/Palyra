@@ -748,6 +748,39 @@ async fn terminate_run_stream_with_agent_loop_reason(
 
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
+async fn send_budget_exhausted_partial_summary_tokens(
+    sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
+    runtime_state: &Arc<GatewayRuntimeState>,
+    request_context: &RequestContext,
+    session_id: &str,
+    run_id: &str,
+    tape_seq: &mut i64,
+    model_token_tape_events: &mut usize,
+    model_token_compaction_emitted: &mut bool,
+    reason: AgentLoopTerminationReason,
+    loop_state: &AgentRunLoopState,
+    message: &str,
+) -> Result<(), Status> {
+    if !should_emit_budget_exhausted_partial_summary(reason, loop_state) {
+        return Ok(());
+    }
+    let summary = loop_state.message_with_cleanup_guidance(message);
+    send_deferred_final_reply_tokens(
+        sender,
+        runtime_state,
+        request_context,
+        session_id,
+        run_id,
+        tape_seq,
+        model_token_tape_events,
+        model_token_compaction_emitted,
+        summary.as_str(),
+    )
+    .await
+}
+
+#[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
 async fn send_deferred_final_reply_tokens(
     sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -1150,6 +1183,20 @@ pub(crate) async fn process_run_stream_message(
             Err(reason) => {
                 let message =
                     agent_loop_budget_exhausted_message(reason, &loop_state, run_id.as_str());
+                send_budget_exhausted_partial_summary_tokens(
+                    sender,
+                    runtime_state,
+                    request_context,
+                    session_id_for_message.as_str(),
+                    run_id.as_str(),
+                    tape_seq,
+                    model_token_tape_events,
+                    model_token_compaction_emitted,
+                    reason,
+                    &loop_state,
+                    message.as_str(),
+                )
+                .await?;
                 terminate_run_stream_with_agent_loop_reason(
                     sender,
                     runtime_state,
@@ -1577,6 +1624,20 @@ pub(crate) async fn process_run_stream_message(
                         &loop_state,
                         run_id.as_str(),
                     );
+                    send_budget_exhausted_partial_summary_tokens(
+                        sender,
+                        runtime_state,
+                        request_context,
+                        session_id_for_message.as_str(),
+                        run_id.as_str(),
+                        tape_seq,
+                        model_token_tape_events,
+                        model_token_compaction_emitted,
+                        AgentLoopTerminationReason::MaxToolCalls,
+                        &loop_state,
+                        message.as_str(),
+                    )
+                    .await?;
                     terminate_run_stream_with_agent_loop_reason(
                         sender,
                         runtime_state,
@@ -2050,10 +2111,38 @@ fn agent_loop_budget_exhausted_message(
     };
     let tool_result_label =
         if snapshot.completed_tool_calls == 1 { "tool result" } else { "tool results" };
+    let recovery_hint = match reason {
+        AgentLoopTerminationReason::MaxToolCalls => {
+            "Increase tool_call.max_calls_per_run only if the workflow genuinely needs more tool steps, or continue in the same session with a narrower resume prompt."
+        }
+        AgentLoopTerminationReason::WallClock => {
+            "The tool-call limit was not the terminal condition; continue in the same session with a narrower resume prompt or increase the agent loop wall-clock budget for long process/browser workflows."
+        }
+        AgentLoopTerminationReason::MaxTurns => {
+            "Continue in the same session with a narrower resume prompt or increase the model-turn budget for unusually long reasoning workflows."
+        }
+        _ => "Continue in the same session with a narrower resume prompt.",
+    };
     format!(
-        "{base} after {} model turns and {} {tool_result_label}; partial tool evidence is recorded on the run tape. Continue in the same session and ask to resume from run {run_id}; increase tool_call.max_calls_per_run for unusually large workflows.",
-        snapshot.current_turn, snapshot.completed_tool_calls
+        "{base} after {} model turns and {} {tool_result_label}; partial result summary: run tape for {run_id} contains the exact tool evidence, remaining_model_turns={}, remaining_tool_calls={}, elapsed_ms={}. Continue in the same session and ask to resume from run {run_id}. {recovery_hint}",
+        snapshot.current_turn,
+        snapshot.completed_tool_calls,
+        snapshot.remaining_model_turns,
+        snapshot.remaining_tool_calls,
+        snapshot.elapsed_ms
     )
+}
+
+fn should_emit_budget_exhausted_partial_summary(
+    reason: AgentLoopTerminationReason,
+    loop_state: &AgentRunLoopState,
+) -> bool {
+    matches!(
+        reason,
+        AgentLoopTerminationReason::MaxTurns
+            | AgentLoopTerminationReason::MaxToolCalls
+            | AgentLoopTerminationReason::WallClock
+    ) && loop_state.completed_tool_calls() > 0
 }
 
 fn should_terminate_after_tool_budget_exhausted(
@@ -2568,10 +2657,11 @@ mod tests {
         incomplete_terminal_final_answer, is_run_stream_response_channel_closed,
         length_recovery_prompt, provider_model_override_for_routing,
         provider_request_deadline_timeout, provider_request_timeout_status,
-        repeated_tool_failure_signature, should_terminate_after_tool_budget_exhausted,
-        terminal_tool_authorization_failure, tool_calls_finish_without_tool_payload,
-        tool_result_to_provider_message, truncated_final_answer_without_tools,
-        RepeatedToolFailureTracker, RunStreamToolResultForModel, MAX_LENGTH_RECOVERY_ATTEMPTS,
+        repeated_tool_failure_signature, should_emit_budget_exhausted_partial_summary,
+        should_terminate_after_tool_budget_exhausted, terminal_tool_authorization_failure,
+        tool_calls_finish_without_tool_payload, tool_result_to_provider_message,
+        truncated_final_answer_without_tools, RepeatedToolFailureTracker,
+        RunStreamToolResultForModel, MAX_LENGTH_RECOVERY_ATTEMPTS,
     };
     use super::{AgentLoopTerminationReason, AgentRunLoopState};
     use crate::application::run_stream::tape::RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE;
@@ -2867,9 +2957,9 @@ mod tests {
 
         assert!(message.contains("model turn limit reached"));
         assert!(message.contains("1 tool result"));
-        assert!(message.contains("partial tool evidence"));
+        assert!(message.contains("partial result summary"));
         assert!(message.contains("resume from run 01ARZ3NDEKTSV4RRFFQ69G5FAV"));
-        assert!(message.contains("tool_call.max_calls_per_run"));
+        assert!(message.contains("model-turn budget"));
     }
 
     #[test]
@@ -2883,8 +2973,52 @@ mod tests {
         );
 
         assert!(message.contains("tool call limit reached"));
-        assert!(message.contains("partial tool evidence"));
+        assert!(message.contains("partial result summary"));
         assert!(message.contains("resume from run 01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+        assert!(message.contains("tool_call.max_calls_per_run"));
+    }
+
+    #[test]
+    fn wall_clock_budget_exhausted_message_names_wall_clock_not_tool_limit() {
+        let mut state = loop_state_after_tool("debug a browser app", "palyra.browser.observe");
+        state.sync_remaining_tool_calls(16);
+
+        let message = agent_loop_budget_exhausted_message(
+            AgentLoopTerminationReason::WallClock,
+            &state,
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        );
+
+        assert!(message.contains("wall-clock budget exhausted"));
+        assert!(message.contains("partial result summary"));
+        assert!(message.contains("remaining_tool_calls=8"));
+        assert!(message.contains("elapsed_ms="));
+        assert!(message.contains("tool-call limit was not the terminal condition"));
+        assert!(!message.contains("tool_call.max_calls_per_run"));
+    }
+
+    #[test]
+    fn budget_partial_summary_requires_terminal_budget_with_tool_evidence() {
+        let state = loop_state_after_tool("build a browser app", "palyra.browser.observe");
+        let state_without_tools =
+            AgentRunLoopState::new(vec![ProviderMessage::user_text("hello")], 4, 8, 10_000);
+
+        assert!(should_emit_budget_exhausted_partial_summary(
+            AgentLoopTerminationReason::WallClock,
+            &state
+        ));
+        assert!(should_emit_budget_exhausted_partial_summary(
+            AgentLoopTerminationReason::MaxToolCalls,
+            &state
+        ));
+        assert!(!should_emit_budget_exhausted_partial_summary(
+            AgentLoopTerminationReason::ProviderError,
+            &state
+        ));
+        assert!(!should_emit_budget_exhausted_partial_summary(
+            AgentLoopTerminationReason::WallClock,
+            &state_without_tools
+        ));
     }
 
     #[test]
