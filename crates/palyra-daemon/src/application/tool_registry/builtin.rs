@@ -1041,6 +1041,16 @@ fn browser_tool_schema(tool_name: &str) -> Value {
             ));
             required.push("url");
         }
+        "palyra.browser.tabs.switch" => {
+            properties.push((
+                "tab_id",
+                json!({
+                    "type":"string",
+                    "description":"Required tab_id returned by palyra.browser.tabs.list or palyra.browser.tabs.open. Copy the exact tab_id value; do not use a tab index, URL, title, or session_id."
+                }),
+            ));
+            required.push("tab_id");
+        }
         "palyra.browser.reload" => {
             properties.push((
                 "allow_private_targets",
@@ -1230,6 +1240,30 @@ fn browser_tool_schema(tool_name: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::registry_entry;
+
+    #[test]
+    fn browser_tabs_switch_registry_exposes_required_tab_id() {
+        let entry = registry_entry("palyra.browser.tabs.switch").expect("tabs switch entry exists");
+        let required = entry
+            .input_schema
+            .pointer("/required")
+            .and_then(serde_json::Value::as_array)
+            .expect("required fields should be visible");
+        assert!(required.iter().any(|value| value.as_str() == Some("session_id")));
+        assert!(required.iter().any(|value| value.as_str() == Some("tab_id")));
+
+        let tab_id = entry
+            .input_schema
+            .pointer("/properties/tab_id")
+            .expect("tab_id property should be visible to models");
+        assert_eq!(tab_id.get("type").and_then(serde_json::Value::as_str), Some("string"));
+        let description = tab_id
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .expect("tab_id should explain where to get the value");
+        assert!(description.contains("palyra.browser.tabs.list"));
+        assert!(description.contains("exact tab_id"));
+    }
 
     #[test]
     fn process_runner_registry_steers_file_writes_to_patch_tool() {
