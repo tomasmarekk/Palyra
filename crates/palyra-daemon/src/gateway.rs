@@ -58,8 +58,9 @@ use crate::{
         conversation_bindings::ConversationBindingStore,
         inbound_coalescer::InboundCoalescer,
         tool_runtime::workspace_scope::{
-            relative_path_already_targets_active_root, session_active_workspace_root,
-            workspace_roots_with_run_launch_context, ActiveWorkspaceRoot,
+            relative_path_already_targets_active_root, run_launch_context_path_env,
+            session_active_workspace_root, workspace_roots_with_run_launch_context,
+            ActiveWorkspaceRoot,
         },
     },
     channel_router::{
@@ -801,11 +802,13 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation(
     } else if tool_name == PROCESS_RUNNER_TOOL_NAME {
         let config =
             process_runner_tool_config_for_session(runtime_state, context, input_json).await;
+        let execution_input_json =
+            process_runner_input_with_launch_context_env(runtime_state, context, input_json).await;
         let outcome = execute_tool_call_with_cancellation(
             &config,
             proposal_id,
             tool_name,
-            input_json,
+            execution_input_json.as_slice(),
             cancellation_requested,
         )
         .await;
@@ -1043,6 +1046,34 @@ async fn process_runner_tool_config_for_session(
         config.process_runner.workspace_root = workspace_root;
     }
     config
+}
+
+async fn process_runner_input_with_launch_context_env(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: ToolRuntimeExecutionContext<'_>,
+    input_json: &[u8],
+) -> Vec<u8> {
+    let path_env = run_launch_context_path_env(runtime_state, context.run_id).await;
+    process_runner_input_with_path_env(input_json, &path_env).unwrap_or_else(|| input_json.to_vec())
+}
+
+fn process_runner_input_with_path_env(
+    input_json: &[u8],
+    path_env: &BTreeMap<String, PathBuf>,
+) -> Option<Vec<u8>> {
+    if path_env.is_empty() {
+        return None;
+    }
+    let mut input = parse_process_runner_tool_input(input_json).ok()?;
+    let mut changed = false;
+    for (key, value) in path_env {
+        if input.env.contains_key(key) {
+            continue;
+        }
+        input.env.insert(key.clone(), value.to_string_lossy().into_owned());
+        changed = true;
+    }
+    changed.then(|| serde_json::to_vec(&input).ok()).flatten()
 }
 
 async fn process_runner_workspace_roots_for_session(

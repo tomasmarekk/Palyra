@@ -69,6 +69,7 @@ const MAX_BACKGROUND_PROCESS_LIFETIME_MS: u64 = 30 * 60_000;
 const PALYRA_CLI_PROFILE_ENV: &str = "PALYRA_CLI_PROFILE";
 const PALYRA_CLI_PROFILES_PATH_ENV: &str = "PALYRA_CLI_PROFILES_PATH";
 const PALYRA_STATE_ROOT_ENV: &str = "PALYRA_STATE_ROOT";
+const PALYRA_OS_FILE_ROOTS_ENV: &str = "PALYRA_OS_FILE_ROOTS";
 const NODE_DISABLE_COMPILE_CACHE_ENV: &str = "NODE_DISABLE_COMPILE_CACHE";
 const HOST_ACCESS_SAFE_ENV_KEYS: &[&str] = &["HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TERM"];
 const HOST_ACCESS_SAFE_PALYRA_ENV_KEYS: &[&str] = &["PALYRA_E2E_HOME", "PALYRA_E2E_OS_ROOT"];
@@ -2551,9 +2552,15 @@ fn windows_program_files_path(path: &Path) -> bool {
 
 fn user_owned_host_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    for key in ["USERPROFILE", "HOME"] {
-        if let Some(value) = std::env::var_os(key) {
-            push_canonical_host_root(&mut roots, PathBuf::from(value));
+    if let Some(configured_roots) = configured_user_host_roots() {
+        for root in configured_roots {
+            push_canonical_host_root(&mut roots, root);
+        }
+    } else {
+        for key in ["USERPROFILE", "HOME"] {
+            if let Some(value) = std::env::var_os(key) {
+                push_canonical_host_root(&mut roots, PathBuf::from(value));
+            }
         }
     }
     push_canonical_host_root(&mut roots, std::env::temp_dir());
@@ -2562,6 +2569,18 @@ fn user_owned_host_roots() -> Vec<PathBuf> {
         push_canonical_host_root(&mut roots, PathBuf::from("/var/tmp"));
     }
     roots
+}
+
+fn configured_user_host_roots() -> Option<Vec<PathBuf>> {
+    let value = std::env::var_os(PALYRA_OS_FILE_ROOTS_ENV)?;
+    let roots = std::env::split_paths(&value)
+        .filter(|path| !path.as_os_str().is_empty())
+        .collect::<Vec<_>>();
+    if roots.is_empty() {
+        None
+    } else {
+        Some(roots)
+    }
 }
 
 fn push_canonical_host_root(roots: &mut Vec<PathBuf>, root: PathBuf) {
@@ -4604,7 +4623,7 @@ mod tests {
         validate_runtime_egress_enforcement, EgressEnforcementMode, ProcessRunnerInput,
         SandboxProcessRunErrorKind, SandboxProcessRunnerPolicy, SandboxProcessRunnerTier,
         StreamCapture, BACKGROUND_MONITOR_POLL_MS, BACKGROUND_TERMINATION_WAIT_MS,
-        NODE_DISABLE_COMPILE_CACHE_ENV,
+        NODE_DISABLE_COMPILE_CACHE_ENV, PALYRA_OS_FILE_ROOTS_ENV,
     };
     #[cfg(windows)]
     use super::{
@@ -5587,6 +5606,63 @@ mod tests {
         assert!(env.contains_key("PATH"), "host-access process should keep a usable PATH");
 
         let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    fn host_access_path_policy_respects_configured_os_file_roots() {
+        let _guard = PROCESS_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("process env lock should not be poisoned");
+        let workspace = unique_temp_dir("workspace-host-configured-roots");
+        let configured_root = unique_temp_dir("configured-host-root");
+        let real_profile_root = std::env::current_dir()
+            .expect("current dir should resolve")
+            .join("target")
+            .join(format!(
+                "palyra-real-profile-host-root-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system time should be after unix epoch")
+                    .as_nanos()
+            ));
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        fs::create_dir_all(configured_root.as_path()).expect("configured root should be created");
+        fs::create_dir_all(real_profile_root.as_path()).expect("profile root should be created");
+        let configured_env =
+            std::env::join_paths([configured_root.as_os_str()]).expect("root path should join");
+        let _configured_roots = ScopedEnvVar::set(PALYRA_OS_FILE_ROOTS_ENV, configured_env);
+        let _userprofile = ScopedEnvVar::set("USERPROFILE", real_profile_root.as_os_str());
+        let _home = ScopedEnvVar::set("HOME", real_profile_root.as_os_str());
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let allowed_target = configured_root.join("Desktop").join("orders.csv");
+        let denied_target = real_profile_root.join("Desktop").join("orders.csv");
+
+        validate_host_argument_scope(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            "pwsh",
+            &[allowed_target.display().to_string()],
+        )
+        .expect("configured PALYRA_OS_FILE_ROOTS root should be allowed for host access paths");
+        let error = validate_host_argument_scope(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            "pwsh",
+            &[denied_target.display().to_string()],
+        )
+        .expect_err(
+            "implicit USERPROFILE root must be suppressed when PALYRA_OS_FILE_ROOTS is set",
+        );
+
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+        assert!(error.message.contains("outside approved host roots"), "{}", error.message);
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+        let _ = fs::remove_dir_all(configured_root.as_path());
+        let _ = fs::remove_dir_all(real_profile_root.as_path());
     }
 
     #[test]

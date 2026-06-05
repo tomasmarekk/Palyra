@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     io::{Read, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream},
@@ -44,13 +45,13 @@ use super::{
     best_effort_mark_approval_error, common_v1, constant_time_eq,
     enforce_vault_get_approval_policy, enforce_vault_scope_access, ingest_memory_best_effort,
     matching_tool_approval_response_id, process_runner_input_should_use_active_root,
-    process_runner_workspace_root_for_input, resolve_cron_job_channel_for_create,
-    tool_approval_response_proposal_id, workspace_patch_metrics_from_output,
-    CachedMemorySearchEntry, GatewayAuthConfig, GatewayJournalConfigSnapshot,
-    GatewayRuntimeConfigSnapshot, GatewayRuntimeState, MemoryRuntimeConfig, ProviderRequest,
-    RequestContext, ToolApprovalOutcome, APPROVAL_PROMPT_TIMEOUT_SECONDS,
-    CANVAS_PATCH_HISTORY_RESPONSE_ROW_LIMIT, HEADER_CHANNEL, HEADER_DEVICE_ID, HEADER_PRINCIPAL,
-    MAX_APPROVAL_PAGE_LIMIT, TOOL_APPROVAL_RESPONSE_TIMEOUT,
+    process_runner_input_with_path_env, process_runner_workspace_root_for_input,
+    resolve_cron_job_channel_for_create, tool_approval_response_proposal_id,
+    workspace_patch_metrics_from_output, CachedMemorySearchEntry, GatewayAuthConfig,
+    GatewayJournalConfigSnapshot, GatewayRuntimeConfigSnapshot, GatewayRuntimeState,
+    MemoryRuntimeConfig, ProviderRequest, RequestContext, ToolApprovalOutcome,
+    APPROVAL_PROMPT_TIMEOUT_SECONDS, CANVAS_PATCH_HISTORY_RESPONSE_ROW_LIMIT, HEADER_CHANNEL,
+    HEADER_DEVICE_ID, HEADER_PRINCIPAL, MAX_APPROVAL_PAGE_LIMIT, TOOL_APPROVAL_RESPONSE_TIMEOUT,
     VAULT_RATE_LIMIT_MAX_PRINCIPAL_BUCKETS, VAULT_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW,
 };
 use crate::application::run_stream::orchestration::{
@@ -158,6 +159,68 @@ fn process_runner_input_preserves_explicit_active_root_paths() {
         br#"{"command":"npm","args":["--prefix=notes-api","test"]}"#,
         &active_root,
     ));
+}
+
+#[test]
+fn process_runner_input_inherits_launch_path_env_when_missing() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let e2e_home = tempdir.path().join("home");
+    let e2e_os_root = tempdir.path().join("os-root");
+    fs::create_dir_all(e2e_home.as_path()).expect("home root should exist");
+    fs::create_dir_all(e2e_os_root.as_path()).expect("os root should exist");
+    let path_env = BTreeMap::from([
+        ("PALYRA_E2E_HOME".to_owned(), e2e_home.clone()),
+        ("PALYRA_E2E_OS_ROOT".to_owned(), e2e_os_root.clone()),
+    ]);
+
+    let normalized = process_runner_input_with_path_env(
+        br#"{"command":"pwsh","args":["-NoProfile","-File","scripts/export.ps1"]}"#,
+        &path_env,
+    )
+    .expect("launch path env should be injected");
+    let parsed =
+        palyra_common::process_runner_input::parse_process_runner_tool_input(normalized.as_slice())
+            .expect("normalized process input should parse");
+
+    assert_eq!(
+        parsed.env.get("PALYRA_E2E_HOME").map(String::as_str),
+        Some(e2e_home.to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        parsed.env.get("PALYRA_E2E_OS_ROOT").map(String::as_str),
+        Some(e2e_os_root.to_string_lossy().as_ref())
+    );
+}
+
+#[test]
+fn process_runner_input_keeps_explicit_env_over_launch_path_env() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let launch_home = tempdir.path().join("launch-home");
+    let explicit_home = tempdir.path().join("explicit-home");
+    fs::create_dir_all(launch_home.as_path()).expect("launch home root should exist");
+    fs::create_dir_all(explicit_home.as_path()).expect("explicit home root should exist");
+    let path_env = BTreeMap::from([("PALYRA_E2E_HOME".to_owned(), launch_home)]);
+    let input = serde_json::to_vec(&json!({
+        "command": "pwsh",
+        "args": ["-NoProfile", "-File", "scripts/export.ps1"],
+        "env": {
+            "PALYRA_E2E_HOME": explicit_home.to_string_lossy(),
+            "PALYRA_E2E_FIXTURE": "orders"
+        }
+    }))
+    .expect("process input should serialize");
+
+    let normalized =
+        process_runner_input_with_path_env(input.as_slice(), &path_env).unwrap_or(input);
+    let parsed =
+        palyra_common::process_runner_input::parse_process_runner_tool_input(normalized.as_slice())
+            .expect("normalized process input should parse");
+
+    assert_eq!(
+        parsed.env.get("PALYRA_E2E_HOME").map(String::as_str),
+        Some(explicit_home.to_string_lossy().as_ref())
+    );
+    assert_eq!(parsed.env.get("PALYRA_E2E_FIXTURE").map(String::as_str), Some("orders"));
 }
 
 #[test]
