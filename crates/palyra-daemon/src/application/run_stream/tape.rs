@@ -24,6 +24,25 @@ use crate::{
 
 pub(crate) const RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE: &str =
     "run stream response channel closed";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolResultCompactionOutcome {
+    Skipped,
+    Applied,
+    Blocked,
+}
+
+impl ToolResultCompactionOutcome {
+    #[must_use]
+    pub(crate) const fn progress_phase(self) -> Option<&'static str> {
+        match self {
+            Self::Skipped => None,
+            Self::Applied => Some("session.compaction.tool_results.applied"),
+            Self::Blocked => Some("session.compaction.tool_results.blocked"),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn append_tool_decision_tape_event(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -475,9 +494,9 @@ pub(crate) async fn maybe_compact_context_after_tool_results(
     tape_seq: &mut i64,
     tool_result_count: usize,
     compaction_emitted: &mut bool,
-) -> Result<(), Status> {
+) -> Result<ToolResultCompactionOutcome, Status> {
     if !should_attempt_tool_result_compaction(tool_result_count, *compaction_emitted) {
-        return Ok(());
+        return Ok(ToolResultCompactionOutcome::Skipped);
     }
 
     let trigger_reason = "agent_loop_tool_results";
@@ -502,7 +521,7 @@ pub(crate) async fn maybe_compact_context_after_tool_results(
         Some(trigger_policy),
     )
     .await?;
-    let payload_json = if preview.eligible {
+    let (payload_json, outcome) = if preview.eligible {
         let execution = apply_session_compaction(SessionCompactionApplyRequest {
             runtime_state,
             session: &session,
@@ -516,7 +535,7 @@ pub(crate) async fn maybe_compact_context_after_tool_results(
         })
         .await?;
         *compaction_emitted = true;
-        json!({
+        let payload_json = json!({
             "event": "session.compaction.tool_results.applied",
             "artifact_id": execution.artifact.artifact_id,
             "checkpoint_id": execution.checkpoint.checkpoint_id,
@@ -543,9 +562,10 @@ pub(crate) async fn maybe_compact_context_after_tool_results(
             "fallback_reason": "deterministic_context_compressor",
             "write_count": execution.writes.len(),
         })
-        .to_string()
+        .to_string();
+        (payload_json, ToolResultCompactionOutcome::Applied)
     } else {
-        json!({
+        let payload_json = json!({
             "event": "session.compaction.tool_results.blocked",
             "policy": trigger_policy,
             "trigger_reason": trigger_reason,
@@ -565,7 +585,8 @@ pub(crate) async fn maybe_compact_context_after_tool_results(
             "estimated_output_tokens": preview.estimated_output_tokens,
             "fallback_reason": "deterministic_context_compressor",
         })
-        .to_string()
+        .to_string();
+        (payload_json, ToolResultCompactionOutcome::Blocked)
     };
     runtime_state
         .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
@@ -576,7 +597,7 @@ pub(crate) async fn maybe_compact_context_after_tool_results(
         })
         .await?;
     *tape_seq += 1;
-    Ok(())
+    Ok(outcome)
 }
 
 #[must_use]

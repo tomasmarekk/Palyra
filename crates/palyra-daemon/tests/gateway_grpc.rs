@@ -5543,6 +5543,156 @@ async fn grpc_run_stream_falls_back_after_recovery_final_answer_is_still_incompl
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn grpc_run_stream_reports_partial_summary_when_provider_timeout_follows_tool_result(
+) -> Result<()> {
+    let first_response = serde_json::json!({
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "tool_calls": [{
+                    "id": "call_timeout_after_tool_01",
+                    "type": "function",
+                    "function": {
+                        "name": "palyra.echo",
+                        "arguments": "{\"text\":\"hello before timeout\"}"
+                    }
+                }]
+            }
+        }]
+    })
+    .to_string();
+    let delayed_final_response =
+        r#"{"choices":[{"finish_reason":"stop","message":{"content":"late final answer"}}]}"#
+            .to_owned();
+    let (openai_base_url, request_count, server_handle) = spawn_scripted_openai_server(vec![
+        ScriptedOpenAiResponse::immediate(200, first_response),
+        ScriptedOpenAiResponse::delayed(200, delayed_final_response, Duration::from_millis(1_000)),
+    ])?;
+    let (child, admin_port, grpc_port, _journal_db_path) =
+        spawn_palyrad_with_openai_provider_and_tool_policy_with_provider_timeout(
+            openai_base_url.as_str(),
+            OPENAI_API_KEY,
+            "palyra.echo",
+            2,
+            250,
+            250,
+        )?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+
+    let mut stream_request =
+        tonic::Request::new(tokio_stream::iter(vec![sample_run_stream_request_with_text(
+            "call echo, then summarize the result".to_owned(),
+        )]));
+    stream_request.metadata_mut().insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
+    stream_request.metadata_mut().insert("x-palyra-principal", "user:ops".parse()?);
+    stream_request.metadata_mut().insert("x-palyra-device-id", DEVICE_ID.parse()?);
+    stream_request.metadata_mut().insert("x-palyra-channel", "cli".parse()?);
+
+    let mut response_stream =
+        client.run_stream(stream_request).await.context("failed to call RunStream")?.into_inner();
+    let mut model_tokens = Vec::new();
+    let mut final_token_count = 0usize;
+    let mut failed_messages = Vec::new();
+    let mut progress_statuses = Vec::new();
+    let mut saw_done = false;
+    loop {
+        let Some(event) = tokio::time::timeout(Duration::from_secs(5), response_stream.next())
+            .await
+            .context("run stream hung after tool-result compaction and provider timeout")?
+        else {
+            break;
+        };
+        let event = event.context("run stream should end with status events, not a gRPC error")?;
+        if let Some(body) = event.body {
+            match body {
+                common_v1::run_stream_event::Body::ModelToken(token) if token.is_final => {
+                    final_token_count = final_token_count.saturating_add(1);
+                    model_tokens.push(token.token);
+                }
+                common_v1::run_stream_event::Body::ModelToken(token) => {
+                    model_tokens.push(token.token);
+                }
+                common_v1::run_stream_event::Body::Status(status)
+                    if status.kind == common_v1::stream_status::StatusKind::InProgress as i32 =>
+                {
+                    progress_statuses.push(status.message);
+                }
+                common_v1::run_stream_event::Body::Status(status)
+                    if status.kind == common_v1::stream_status::StatusKind::Failed as i32 =>
+                {
+                    failed_messages.push(status.message);
+                }
+                common_v1::run_stream_event::Body::Status(status)
+                    if status.kind == common_v1::stream_status::StatusKind::Done as i32 =>
+                {
+                    saw_done = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let rendered = model_tokens.concat();
+    let rendered_lower = rendered.to_ascii_lowercase();
+    assert!(
+        rendered.contains("Partial result"),
+        "provider timeout after tool evidence should produce a final partial summary: {rendered}"
+    );
+    assert!(
+        rendered_lower.contains("timed out") || rendered_lower.contains("timeout"),
+        "partial summary should preserve provider timeout diagnostics: {rendered}"
+    );
+    assert!(
+        rendered.contains("1 tool call"),
+        "partial summary should point to the completed tool evidence: {rendered}"
+    );
+    assert_eq!(final_token_count, 1, "timeout partial summary should close the model stream");
+    assert!(
+        failed_messages.iter().any(|message| {
+            let lower = message.to_ascii_lowercase();
+            message.contains("Partial result")
+                && (lower.contains("timed out") || lower.contains("timeout"))
+        }),
+        "failed status should carry the same actionable timeout summary: {failed_messages:?}"
+    );
+    assert!(
+        progress_statuses
+            .iter()
+            .any(|status| status == "progress:session.compaction.tool_results.started"),
+        "run should expose the post-tool compaction checkpoint in the stream: {progress_statuses:?}"
+    );
+    assert!(
+        progress_statuses.iter().any(|status| {
+            status == "progress:session.compaction.tool_results.applied"
+                || status == "progress:session.compaction.tool_results.blocked"
+        }),
+        "run should expose the compaction outcome before the next provider turn: {progress_statuses:?}"
+    );
+    assert!(!saw_done, "provider timeout after tool evidence should remain a failed run");
+
+    let run_snapshot = admin_get_json_async(admin_port, format!("/admin/v1/runs/{RUN_ID}")).await?;
+    assert_eq!(
+        run_snapshot.get("state").and_then(Value::as_str),
+        Some("failed"),
+        "run must not remain in_progress after provider timeout follows tool-result compaction"
+    );
+    assert_eq!(
+        request_count.load(Ordering::Relaxed),
+        2,
+        "run should make exactly one follow-up provider attempt after the tool result"
+    );
+
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn grpc_run_stream_reports_partial_summary_when_tool_budget_is_exhausted() -> Result<()> {
     let first_response = serde_json::json!({
         "choices": [{
@@ -10809,6 +10959,27 @@ fn spawn_palyrad_with_openai_provider_and_tool_policy_with_retries(
     )
 }
 
+fn spawn_palyrad_with_openai_provider_and_tool_policy_with_provider_timeout(
+    openai_base_url: &str,
+    openai_api_key: &str,
+    allowed_tools: &str,
+    max_calls_per_run: u32,
+    execution_timeout_ms: u64,
+    provider_request_timeout_ms: u64,
+) -> Result<(Child, u16, u16, PathBuf)> {
+    spawn_palyrad_with_openai_provider_and_tool_policy_with_execution_gate_rollout_retries_and_console(
+        openai_base_url,
+        openai_api_key,
+        allowed_tools,
+        max_calls_per_run,
+        execution_timeout_ms,
+        false,
+        0,
+        None,
+        Some(provider_request_timeout_ms),
+    )
+}
+
 fn spawn_palyrad_with_openai_provider_and_tool_policy_with_execution_gate_rollout_and_retries(
     openai_base_url: &str,
     openai_api_key: &str,
@@ -10826,6 +10997,7 @@ fn spawn_palyrad_with_openai_provider_and_tool_policy_with_execution_gate_rollou
         execution_timeout_ms,
         execution_gate_rollout_enabled,
         max_retries,
+        None,
         None,
     )
 }
@@ -10848,6 +11020,7 @@ fn spawn_palyrad_with_openai_provider_tool_policy_and_console_principal(
         false,
         0,
         Some(bound_console_principal),
+        None,
     )
 }
 
@@ -10861,6 +11034,7 @@ fn spawn_palyrad_with_openai_provider_and_tool_policy_with_execution_gate_rollou
     execution_gate_rollout_enabled: bool,
     max_retries: u32,
     bound_console_principal: Option<&str>,
+    provider_request_timeout_ms: Option<u64>,
 ) -> Result<(Child, u16, u16, PathBuf)> {
     let config_path = write_base_daemon_config()?;
     let journal_db_path = unique_temp_journal_db_path();
@@ -10908,6 +11082,9 @@ fn spawn_palyrad_with_openai_provider_and_tool_policy_with_execution_gate_rollou
         );
     if let Some(principal) = bound_console_principal {
         command.env("PALYRA_ADMIN_BOUND_PRINCIPAL", principal);
+    }
+    if let Some(timeout_ms) = provider_request_timeout_ms {
+        command.env("PALYRA_MODEL_PROVIDER_REQUEST_TIMEOUT_MS", timeout_ms.to_string());
     }
     let mut child = command
         .env("RUST_LOG", "info")
@@ -11365,6 +11542,7 @@ fn apply_isolated_daemon_test_env<'a>(
         .env_remove("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL")
         .env_remove("PALYRA_MODEL_PROVIDER_AUTH_PROFILE_ID")
         .env_remove("PALYRA_MODEL_PROVIDER_AUTH_PROVIDER")
+        .env_remove("PALYRA_MODEL_PROVIDER_REQUEST_TIMEOUT_MS")
         .env_remove("PALYRA_MODEL_PROVIDER_MAX_RETRIES")
         .env_remove("PALYRA_MODEL_PROVIDER_RETRY_BACKOFF_MS")
         .env_remove("PALYRA_MODEL_PROVIDER_CIRCUIT_BREAKER_FAILURE_THRESHOLD")

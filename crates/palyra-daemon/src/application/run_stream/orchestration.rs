@@ -1320,12 +1320,20 @@ pub(crate) async fn process_run_stream_message(
                 return Ok(RunStreamMessageProcessingOutcome::Terminate);
             }
             Err(error) => {
-                if final_answer_recovery_attempted && loop_state.completed_tool_calls() > 0 {
-                    let fallback_summary = final_answer_recovery_fallback_summary(
-                        error.message(),
-                        &loop_state,
-                        run_id.as_str(),
-                    );
+                if loop_state.completed_tool_calls() > 0 {
+                    let fallback_summary = if final_answer_recovery_attempted {
+                        final_answer_recovery_fallback_summary(
+                            error.message(),
+                            &loop_state,
+                            run_id.as_str(),
+                        )
+                    } else {
+                        provider_error_partial_summary(
+                            error.message(),
+                            &loop_state,
+                            run_id.as_str(),
+                        )
+                    };
                     send_deferred_final_reply_tokens(
                         sender,
                         runtime_state,
@@ -1652,7 +1660,18 @@ pub(crate) async fn process_run_stream_message(
                     .await?;
                     return Ok(RunStreamMessageProcessingOutcome::Terminate);
                 }
-                maybe_compact_context_after_tool_results(
+                let compaction_will_run = tool_result_count > 0 && !*tool_result_compaction_emitted;
+                if compaction_will_run {
+                    send_agent_loop_progress_status(
+                        sender,
+                        runtime_state,
+                        run_id.as_str(),
+                        tape_seq,
+                        "session.compaction.tool_results.started",
+                    )
+                    .await?;
+                }
+                let compaction_outcome = maybe_compact_context_after_tool_results(
                     runtime_state,
                     request_context,
                     session_id.as_str(),
@@ -1662,6 +1681,16 @@ pub(crate) async fn process_run_stream_message(
                     tool_result_compaction_emitted,
                 )
                 .await?;
+                if let Some(phase) = compaction_outcome.progress_phase() {
+                    send_agent_loop_progress_status(
+                        sender,
+                        runtime_state,
+                        run_id.as_str(),
+                        tape_seq,
+                        phase,
+                    )
+                    .await?;
+                }
                 append_agent_loop_tape_event(
                     runtime_state,
                     run_id.as_str(),
@@ -2213,6 +2242,19 @@ fn final_answer_recovery_fallback_summary(
     let tool_label = if tool_count == 1 { "tool call" } else { "tool calls" };
     format!(
         "Partial result: I ran {tool_count} {tool_label}, but the model did not produce a usable final answer after recovery. Last recovery issue: {}. The run tape for {run_id} contains the exact tool evidence. Resume this same session and reference run {run_id} if any requested artifact, validation, or cleanup is still missing.",
+        truncate_with_ellipsis(message.trim().replace(['\r', '\n'], " "), 512)
+    )
+}
+
+fn provider_error_partial_summary(
+    message: &str,
+    loop_state: &AgentRunLoopState,
+    run_id: &str,
+) -> String {
+    let tool_count = loop_state.completed_tool_calls();
+    let tool_label = if tool_count == 1 { "tool call" } else { "tool calls" };
+    format!(
+        "Partial result: I ran {tool_count} {tool_label}, but the next model provider turn failed before producing a final answer. Provider issue: {}. The run tape for {run_id} contains the exact tool evidence. Resume this same session and reference run {run_id} if any requested artifact, validation, or cleanup is still missing.",
         truncate_with_ellipsis(message.trim().replace(['\r', '\n'], " "), 512)
     )
 }
