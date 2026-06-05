@@ -63,6 +63,7 @@ use super::{
 
 const PROVIDER_PROGRESS_HEARTBEAT_MS: u64 = 20_000;
 const PROVIDER_FAILOVER_DEADLINE_GRACE_MS: u64 = 5_000;
+const MAX_LENGTH_RECOVERY_ATTEMPTS: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BackgroundBudgetGuardDecision {
@@ -1124,7 +1125,7 @@ pub(crate) async fn process_run_stream_message(
         "agent_loop.started",
     )
     .await?;
-    let mut length_recovery_attempted = false;
+    let mut length_recovery_attempts = 0u8;
     let mut final_answer_recovery_attempted = false;
     let mut repeated_tool_failure_tracker = RepeatedToolFailureTracker::default();
 
@@ -1334,7 +1335,6 @@ pub(crate) async fn process_run_stream_message(
         )
         .await?;
         loop_state.sync_remaining_tool_calls(*remaining_tool_budget);
-        loop_state.append_assistant_turn(&provider_output);
 
         match response_outcome {
             RunStreamProviderResponseOutcome::Completed {
@@ -1344,6 +1344,7 @@ pub(crate) async fn process_run_stream_message(
                 final_provider_output,
                 final_reply_tokens_deferred,
             } => {
+                loop_state.append_assistant_turn(&provider_output);
                 let should_refeed_tool_results = !tool_result_messages.is_empty()
                     && provider_output.finish_reason == ProviderFinishReason::ToolCalls;
                 if !should_refeed_tool_results {
@@ -1521,9 +1522,9 @@ pub(crate) async fn process_run_stream_message(
                     reason,
                     message.as_str(),
                     &loop_state,
-                    length_recovery_attempted,
+                    length_recovery_attempts,
                 ) {
-                    length_recovery_attempted = true;
+                    length_recovery_attempts = length_recovery_attempts.saturating_add(1);
                     loop_state.append_user_guidance(recovery_prompt);
                     append_agent_loop_tape_event(
                         runtime_state,
@@ -1544,6 +1545,7 @@ pub(crate) async fn process_run_stream_message(
                     .await?;
                     continue;
                 }
+                loop_state.append_assistant_turn(&provider_output);
                 terminate_run_stream_with_agent_loop_reason(
                     sender,
                     runtime_state,
@@ -1964,18 +1966,26 @@ fn length_recovery_prompt(
     reason: AgentLoopTerminationReason,
     message: &str,
     loop_state: &AgentRunLoopState,
-    already_attempted: bool,
+    attempt_count: u8,
 ) -> Option<&'static str> {
-    if already_attempted
+    if attempt_count >= MAX_LENGTH_RECOVERY_ATTEMPTS
         || reason != AgentLoopTerminationReason::IncompleteFinalAnswer
         || loop_state.remaining_model_turns() == 0
         || !message.contains("finish_reason=length")
     {
         return None;
     }
-    Some(
-        "The previous assistant output hit the provider output limit before a complete final answer or structured tool call. Continue now with no more explanatory prose. If the user requested files, code, tests, browser validation, research, or diagnostics, issue one concise tool call next using the available tool schema. Prefer palyra.fs.apply_patch for file writes and keep arguments minimal. If no tool is needed, answer in at most 120 words and do not claim unverified work.",
-    )
+    Some(match attempt_count {
+        0 => {
+            "The previous assistant output hit the provider output limit before a complete final answer or structured tool call. Continue now with no more explanatory prose. If the user requested files, code, tests, browser validation, research, or diagnostics, issue one concise tool call next using the available tool schema. Prefer palyra.fs.apply_patch for file writes and keep arguments minimal. If no tool is needed, answer in at most 120 words and do not claim unverified work."
+        }
+        1 => {
+            "The previous length recovery also hit the provider output limit. Do not explain or restate prior work. Issue exactly one small structured tool call now, preferably palyra.fs.apply_patch with a single file or hunk. If a final answer is unavoidable, keep it under 60 words and mark any unfinished work as partial."
+        }
+        _ => {
+            "Last length-recovery attempt. Produce only one minimal structured tool call with the smallest useful arguments. Do not include prose, file contents, markdown previews, or summaries before the tool call."
+        }
+    })
 }
 
 fn final_answer_recovery_prompt(
@@ -2446,7 +2456,7 @@ mod tests {
         should_terminate_after_tool_budget_exhausted, terminal_tool_authorization_failure,
         tool_calls_finish_without_tool_payload, tool_result_to_provider_message,
         truncated_final_answer_without_tools, RepeatedToolFailureTracker,
-        RunStreamToolResultForModel,
+        RunStreamToolResultForModel, MAX_LENGTH_RECOVERY_ATTEMPTS,
     };
     use super::{AgentLoopTerminationReason, AgentRunLoopState};
     use crate::application::run_stream::tape::RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE;
@@ -3064,7 +3074,7 @@ mod tests {
     }
 
     #[test]
-    fn length_finished_provider_output_gets_one_recovery_prompt() {
+    fn length_finished_provider_output_gets_bounded_recovery_prompts() {
         let mut loop_state = AgentRunLoopState::new(
             vec![ProviderMessage::user_text("Create app files".to_owned())],
             2,
@@ -3077,21 +3087,39 @@ mod tests {
             AgentLoopTerminationReason::IncompleteFinalAnswer,
             "model provider stopped because of an output token limit (finish_reason=length)",
             &loop_state,
-            false,
+            0,
         )
         .expect("first length failure with remaining turns should be recoverable");
         assert!(prompt.contains("one concise tool call next"));
         assert!(prompt.contains("palyra.fs.apply_patch"));
+
+        let second_prompt = length_recovery_prompt(
+            AgentLoopTerminationReason::IncompleteFinalAnswer,
+            "model provider stopped because of an output token limit (finish_reason=length)",
+            &loop_state,
+            1,
+        )
+        .expect("second length failure should still be recoverable");
+        assert!(second_prompt.contains("exactly one small structured tool call"));
+
+        let final_prompt = length_recovery_prompt(
+            AgentLoopTerminationReason::IncompleteFinalAnswer,
+            "model provider stopped because of an output token limit (finish_reason=length)",
+            &loop_state,
+            2,
+        )
+        .expect("third length failure should get a last-chance recovery prompt");
+        assert!(final_prompt.contains("Last length-recovery attempt"));
 
         assert!(
             length_recovery_prompt(
                 AgentLoopTerminationReason::IncompleteFinalAnswer,
                 "model provider stopped because of an output token limit (finish_reason=length)",
                 &loop_state,
-                true,
+                MAX_LENGTH_RECOVERY_ATTEMPTS,
             )
             .is_none(),
-            "length recovery must be attempted at most once per run"
+            "length recovery must be bounded per run"
         );
     }
 
