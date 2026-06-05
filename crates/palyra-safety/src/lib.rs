@@ -1087,7 +1087,10 @@ fn bare_token_assignment_value_looks_secret(value: &str) -> bool {
 
 fn looks_like_application_identifier(value: &str) -> bool {
     value.len() <= 128
-        && (value.contains(':') || value.contains('/') || value.matches('.').count() >= 2)
+        && (value.contains(':')
+            || value.contains('/')
+            || value.matches('.').count() >= 2
+            || looks_like_segmented_application_identifier(value))
         && value
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ':' | '-' | '_' | '.' | '/'))
@@ -1110,6 +1113,29 @@ fn looks_like_application_identifier(value: &str) -> bool {
         && !value.contains("secret")
         && !value.contains("token")
         && !value.contains("password")
+}
+
+fn looks_like_segmented_application_identifier(value: &str) -> bool {
+    let segments =
+        value.split(['-', '_']).filter(|segment| !segment.is_empty()).collect::<Vec<_>>();
+    segments.len() >= 3
+        && segments.iter().any(|segment| {
+            matches!(
+                *segment,
+                "app"
+                    | "auth"
+                    | "fixture"
+                    | "filter"
+                    | "items"
+                    | "local"
+                    | "mock"
+                    | "session"
+                    | "state"
+                    | "storage"
+                    | "todo"
+                    | "wizard"
+            )
+        })
 }
 
 fn looks_like_parser_fixture_value(value: &str) -> bool {
@@ -1962,6 +1988,30 @@ mod tests {
         assert!(outcome.redacted_text.contains("todo-app:filter:v1"));
         assert!(outcome.redacted_text.contains("s024.wizard.state.v1"));
         assert!(outcome.redacted_text.contains("s062.mock.auth.v1"));
+        assert!(!outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code.starts_with("secret_leak.assignment.")));
+    }
+
+    #[test]
+    fn segmented_auth_session_storage_keys_are_not_redacted_as_secret_values() {
+        let source = "const sessionKey = \"s058-auth-session\";\n\
+                      const authStorageKey = \"mock-auth-session\";\n\
+                      const routeGuardKey = \"app-auth-state\";";
+        let outcome = redact_text_for_export(
+            source,
+            SafetySourceKind::Workspace,
+            SafetyContentKind::WorkspaceDocument,
+            TrustLabel::TrustedLocal,
+        );
+
+        assert!(!outcome.redacted);
+        assert_eq!(outcome.redacted_text, source);
+        assert!(outcome.redacted_text.contains("s058-auth-session"));
+        assert!(outcome.redacted_text.contains("mock-auth-session"));
+        assert!(!outcome.redacted_text.contains("[REDACTED_SECRET]"));
         assert!(!outcome
             .scan
             .finding_codes()

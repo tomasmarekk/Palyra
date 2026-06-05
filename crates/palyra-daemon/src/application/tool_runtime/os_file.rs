@@ -1737,6 +1737,41 @@ mod tests {
     }
 
     #[test]
+    fn os_file_read_preserves_benign_auth_session_storage_key() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let policy = test_policy(tempdir.path());
+        let target = tempdir.path().join("app.js");
+        let contents = "const sessionKey = \"s058-auth-session\";\n\
+                        localStorage.setItem(sessionKey, JSON.stringify(state));\n";
+        fs::write(target.as_path(), contents).expect("OS file should be written");
+
+        let read = execute_os_file_operation(
+            &policy,
+            &OsFileInput {
+                operation: OsFileOperation::Read,
+                path: target.to_string_lossy().into_owned(),
+                target_path: None,
+                content_text: None,
+                bytes_base64: None,
+                create_parent_dirs: None,
+                overwrite: None,
+                full_replace: None,
+                dry_run: None,
+                offset_bytes: None,
+                max_bytes: None,
+                query: None,
+                case_sensitive: None,
+                max_entries: None,
+                max_matches: None,
+            },
+        )
+        .expect("absolute user path read should succeed");
+
+        assert_eq!(read.get("redacted").and_then(Value::as_bool), Some(false));
+        assert_eq!(read.get("text").and_then(Value::as_str), Some(contents));
+    }
+
+    #[test]
     fn os_file_rejects_path_outside_workspace_and_user_roots() {
         let allowed_root = tempfile::tempdir().expect("allowed root should be created");
         let outside_root = tempfile::tempdir().expect("outside root should be created");

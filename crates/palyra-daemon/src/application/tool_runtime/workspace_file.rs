@@ -2249,6 +2249,29 @@ mod tests {
     }
 
     #[test]
+    fn read_workspace_file_preserves_benign_auth_session_storage_key() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let file_path = tempdir.path().join("app.js");
+        let contents = "const sessionKey = \"s058-auth-session\";\n\
+                        localStorage.setItem(sessionKey, JSON.stringify(state));\n";
+        fs::write(file_path, contents).expect("workspace file should be written");
+        let input = WorkspaceReadFileInput {
+            path: "app.js".to_owned(),
+            workspace_root: None,
+            offset_bytes: 0,
+            max_bytes: None,
+        };
+
+        let output = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
+            .expect("workspace file should be readable");
+
+        assert!(!output.redacted);
+        assert_eq!(output.text.as_deref(), Some(contents));
+        assert_eq!(output.text_authoritative, None);
+        assert_eq!(output.redaction_notice, None);
+    }
+
+    #[test]
     fn read_workspace_file_preserves_env_reference_fallback_expressions() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let file_path = tempdir.path().join("config.js");
