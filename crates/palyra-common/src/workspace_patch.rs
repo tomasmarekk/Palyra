@@ -100,6 +100,8 @@ pub struct WorkspacePatchOutcome {
     pub patch_sha256: String,
     pub dry_run: bool,
     pub files_touched: Vec<WorkspacePatchFileAttestation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub no_op_files: Vec<WorkspacePatchFileAttestation>,
     pub rollback_performed: bool,
     pub redacted_preview: String,
 }
@@ -203,6 +205,7 @@ struct HunkLine {
 struct PatchPlan {
     actions: Vec<PlannedAction>,
     file_attestations: Vec<WorkspacePatchFileAttestation>,
+    no_op_attestations: Vec<WorkspacePatchFileAttestation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,6 +290,7 @@ fn apply_workspace_patch_with_canonical_roots(
             patch_sha256,
             dry_run: true,
             files_touched: plan.file_attestations,
+            no_op_files: plan.no_op_attestations,
             rollback_performed: false,
             redacted_preview,
         });
@@ -297,6 +301,7 @@ fn apply_workspace_patch_with_canonical_roots(
             patch_sha256,
             dry_run: false,
             files_touched: plan.file_attestations,
+            no_op_files: plan.no_op_attestations,
             rollback_performed: false,
             redacted_preview,
         }),
@@ -1129,6 +1134,7 @@ fn build_patch_plan(
 ) -> Result<PatchPlan, WorkspacePatchError> {
     let mut actions = Vec::new();
     let mut file_attestations = Vec::new();
+    let mut no_op_attestations = Vec::new();
     let mut touched_paths = HashSet::new();
 
     for operation in operations {
@@ -1305,6 +1311,20 @@ fn build_patch_plan(
                     output_path
                 };
 
+                if destination == source && before_bytes == after_bytes {
+                    no_op_attestations.push(WorkspacePatchFileAttestation {
+                        path: output_path,
+                        workspace_root_index: output_root_index,
+                        operation: "no_op".to_owned(),
+                        moved_from: None,
+                        before_sha256: Some(sha256_hex(before_bytes.as_slice())),
+                        before_size_bytes: Some(before_bytes.len() as u64),
+                        after_sha256: Some(sha256_hex(after_bytes.as_slice())),
+                        after_size_bytes: Some(after_bytes.len() as u64),
+                    });
+                    continue;
+                }
+
                 touched_paths.insert(destination.clone());
                 actions.push(PlannedAction::Write {
                     path: destination.clone(),
@@ -1342,7 +1362,7 @@ fn build_patch_plan(
         });
     }
 
-    Ok(PatchPlan { actions, file_attestations })
+    Ok(PatchPlan { actions, file_attestations, no_op_attestations })
 }
 
 fn parse_relative_patch_path(raw: &str) -> Result<PathBuf, WorkspacePatchError> {
@@ -2053,6 +2073,36 @@ mod tests {
         assert_eq!(
             fs::read_to_string(workspace.join("report.md")).expect("report should read"),
             "# Report\n\nstatus: passed\n"
+        );
+    }
+
+    #[test]
+    fn apply_workspace_patch_reports_identical_update_as_no_op() {
+        let temp = tempdir().expect("tempdir should be created");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        fs::create_dir_all(workspace.join("test")).expect("test directory should exist");
+        fs::write(workspace.join("test/api.test.js"), "setTimeout(5);\n")
+            .expect("seed file should exist");
+
+        let patch =
+            "*** Begin Patch\n*** Update File: test/api.test.js\n@@\n-setTimeout(5);\n+setTimeout(5);\n*** End Patch\n";
+        let outcome = apply_workspace_patch(
+            std::slice::from_ref(&workspace),
+            &default_request(patch, false),
+            &default_limits(),
+        )
+        .expect("identical update should be accepted as a no-op");
+
+        assert!(outcome.files_touched.is_empty(), "no-op update must not report mutations");
+        assert_eq!(outcome.no_op_files.len(), 1);
+        let attestation = &outcome.no_op_files[0];
+        assert_eq!(attestation.path, "test/api.test.js");
+        assert_eq!(attestation.operation, "no_op");
+        assert_eq!(attestation.before_sha256, attestation.after_sha256);
+        assert_eq!(
+            fs::read_to_string(workspace.join("test/api.test.js")).expect("file should read"),
+            "setTimeout(5);\n"
         );
     }
 
