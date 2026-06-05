@@ -1,5 +1,3 @@
-# Palyra
-
 This repository is currently in the development phase.
 
 ![Banner](https://i.imgur.com/PAdzSUI.png)
