@@ -1061,6 +1061,7 @@ async fn resolve_run_stream_tool_approval_outcome(
     let response = match timeout(
         TOOL_APPROVAL_RESPONSE_TIMEOUT,
         await_tool_approval_response(
+            runtime_state,
             stream,
             session_id,
             run_id,

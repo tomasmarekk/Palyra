@@ -6940,6 +6940,124 @@ async fn grpc_run_stream_denies_allowlisted_unsupported_tool() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn grpc_run_stream_accepts_external_decision_for_pending_tool_approval() -> Result<()> {
+    let response_body = openai_tool_call_response(
+        "custom.noop",
+        &serde_json::json!({
+            "payload": "external-approval-decision"
+        }),
+    )?;
+    let (openai_base_url, _request_count, server_handle) =
+        spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(200, response_body)])?;
+    let console_principal = "admin:web-console";
+    let (child, admin_port, grpc_port, _journal_db_path) =
+        spawn_palyrad_with_openai_provider_tool_policy_and_console_principal(
+            openai_base_url.as_str(),
+            OPENAI_API_KEY,
+            "custom.noop",
+            2,
+            250,
+            console_principal,
+        )?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+    let (console_cookie, csrf_token) =
+        login_console_session_async(admin_port, console_principal.to_owned())
+            .await
+            .context("failed to login console session for approval decision")?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+
+    let (request_sender, request_receiver) = tokio_mpsc::channel(4);
+    request_sender
+        .send(sample_run_stream_request_with_ids(
+            SESSION_ID,
+            RUN_ID,
+            "external approval should resume active tool call".to_owned(),
+        ))
+        .await
+        .context("failed to send external approval stream request")?;
+    let mut stream_request = tonic::Request::new(ReceiverStream::new(request_receiver));
+    authorize_metadata_with_principal(stream_request.metadata_mut(), console_principal)?;
+    let mut response_stream =
+        client.run_stream(stream_request).await.context("failed to call RunStream")?.into_inner();
+
+    let mut saw_approval_request = false;
+    let mut saw_external_approval_response = false;
+    let mut saw_tool_result = false;
+    loop {
+        let next_event = tokio::time::timeout(Duration::from_secs(8), response_stream.next())
+            .await
+            .context("external approval stream stalled before active tool call resumed")?;
+        let Some(event) = next_event else {
+            break;
+        };
+        let event = event.context("failed to read external approval RunStream event")?;
+        if let Some(body) = event.body {
+            match body {
+                common_v1::run_stream_event::Body::ToolApprovalRequest(approval_request) => {
+                    let approval_id = approval_request
+                        .approval_id
+                        .as_ref()
+                        .map(|approval_id| approval_id.ulid.as_str())
+                        .context("tool approval request missing approval_id")?;
+                    console_approval_decision_async(
+                        admin_port,
+                        approval_id.to_owned(),
+                        serde_json::json!({
+                            "approved": true,
+                            "decision_scope": "once",
+                            "reason": "approved_by_external_console_test",
+                        }),
+                        console_cookie.clone(),
+                        csrf_token.clone(),
+                    )
+                    .await
+                    .context("failed to resolve pending approval through console API")?;
+                    saw_approval_request = true;
+                }
+                common_v1::run_stream_event::Body::ToolApprovalResponse(response)
+                    if response.approved =>
+                {
+                    assert_eq!(response.reason, "approved_by_external_console_test");
+                    saw_external_approval_response = true;
+                }
+                common_v1::run_stream_event::Body::ToolResult(result) => {
+                    assert!(
+                        !result.success,
+                        "custom.noop should resume and then fail at unsupported runtime execution"
+                    );
+                    assert!(
+                        result.error.contains("unsupported by runtime executor"),
+                        "resumed custom tool should reach runtime execution: {}",
+                        result.error
+                    );
+                    saw_tool_result = true;
+                }
+                _ => {}
+            }
+        }
+        if saw_approval_request && saw_external_approval_response && saw_tool_result {
+            break;
+        }
+    }
+
+    assert!(saw_approval_request, "run should emit a pending tool approval request");
+    assert!(
+        saw_external_approval_response,
+        "external console decision should be reflected back into the active RunStream"
+    );
+    assert!(saw_tool_result, "externally approved tool call should continue to execution");
+
+    drop(request_sender);
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn grpc_run_stream_reuses_timeboxed_approval_until_ttl_expiry() -> Result<()> {
     let response_body = openai_tool_call_response(
         "custom.noop",
@@ -10383,6 +10501,97 @@ async fn admin_post_json_async(admin_port: u16, path: String, payload: Value) ->
         .context("admin JSON worker panicked")?
 }
 
+fn login_console_session(admin_port: u16, principal: &str) -> Result<(String, String)> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build console HTTP client")?;
+    let response = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/auth/login"))
+        .json(&serde_json::json!({
+            "admin_token": ADMIN_TOKEN,
+            "principal": principal,
+            "device_id": DEVICE_ID,
+            "channel": "web",
+        }))
+        .send()
+        .context("failed to call console login")?
+        .error_for_status()
+        .context("console login returned non-success status")?;
+    let set_cookie = response
+        .headers()
+        .get("set-cookie")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| anyhow::anyhow!("console login response missing set-cookie header"))?
+        .to_owned();
+    let cookie = set_cookie
+        .split(';')
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("console set-cookie header missing cookie pair"))?
+        .to_owned();
+    let body = response.json::<Value>().context("failed to parse console login response json")?;
+    let csrf_token = body
+        .get("csrf_token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("console login response missing csrf_token"))?
+        .to_owned();
+    Ok((cookie, csrf_token))
+}
+
+async fn login_console_session_async(
+    admin_port: u16,
+    principal: String,
+) -> Result<(String, String)> {
+    tokio::task::spawn_blocking(move || login_console_session(admin_port, principal.as_str()))
+        .await
+        .context("console login worker panicked")?
+}
+
+fn console_approval_decision(
+    admin_port: u16,
+    approval_id: &str,
+    payload: Value,
+    cookie: &str,
+    csrf_token: &str,
+) -> Result<Value> {
+    let endpoint =
+        format!("http://127.0.0.1:{admin_port}/console/v1/approvals/{approval_id}/decision");
+    Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build console HTTP client")?
+        .post(endpoint)
+        .header("Cookie", cookie)
+        .header("x-palyra-csrf-token", csrf_token)
+        .json(&payload)
+        .send()
+        .context("failed to call console approval decision endpoint")?
+        .error_for_status()
+        .context("console approval decision endpoint returned non-success status")?
+        .json()
+        .context("failed to parse console approval decision JSON response")
+}
+
+async fn console_approval_decision_async(
+    admin_port: u16,
+    approval_id: String,
+    payload: Value,
+    cookie: String,
+    csrf_token: String,
+) -> Result<Value> {
+    tokio::task::spawn_blocking(move || {
+        console_approval_decision(
+            admin_port,
+            approval_id.as_str(),
+            payload,
+            cookie.as_str(),
+            csrf_token.as_str(),
+        )
+    })
+    .await
+    .context("console approval decision worker panicked")?
+}
+
 fn load_golden_json(name: &str) -> Result<Value> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("golden").join(name);
     let content =
@@ -10609,13 +10818,58 @@ fn spawn_palyrad_with_openai_provider_and_tool_policy_with_execution_gate_rollou
     execution_gate_rollout_enabled: bool,
     max_retries: u32,
 ) -> Result<(Child, u16, u16, PathBuf)> {
+    spawn_palyrad_with_openai_provider_and_tool_policy_with_execution_gate_rollout_retries_and_console(
+        openai_base_url,
+        openai_api_key,
+        allowed_tools,
+        max_calls_per_run,
+        execution_timeout_ms,
+        execution_gate_rollout_enabled,
+        max_retries,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_palyrad_with_openai_provider_tool_policy_and_console_principal(
+    openai_base_url: &str,
+    openai_api_key: &str,
+    allowed_tools: &str,
+    max_calls_per_run: u32,
+    execution_timeout_ms: u64,
+    bound_console_principal: &str,
+) -> Result<(Child, u16, u16, PathBuf)> {
+    spawn_palyrad_with_openai_provider_and_tool_policy_with_execution_gate_rollout_retries_and_console(
+        openai_base_url,
+        openai_api_key,
+        allowed_tools,
+        max_calls_per_run,
+        execution_timeout_ms,
+        false,
+        0,
+        Some(bound_console_principal),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_palyrad_with_openai_provider_and_tool_policy_with_execution_gate_rollout_retries_and_console(
+    openai_base_url: &str,
+    openai_api_key: &str,
+    allowed_tools: &str,
+    max_calls_per_run: u32,
+    execution_timeout_ms: u64,
+    execution_gate_rollout_enabled: bool,
+    max_retries: u32,
+    bound_console_principal: Option<&str>,
+) -> Result<(Child, u16, u16, PathBuf)> {
     let config_path = write_base_daemon_config()?;
     let journal_db_path = unique_temp_journal_db_path();
     let identity_store_dir = unique_temp_identity_store_dir();
     let vault_dir = unique_temp_vault_dir();
     prepare_test_vault_dir(&vault_dir)?;
     let mut command = Command::new(env!("CARGO_BIN_EXE_palyrad"));
-    let mut child = apply_isolated_daemon_test_env(&mut command, &config_path)
+    let command = apply_isolated_daemon_test_env(&mut command, &config_path);
+    command
         .args([
             "--bind",
             "127.0.0.1",
@@ -10651,7 +10905,11 @@ fn spawn_palyrad_with_openai_provider_and_tool_policy_with_execution_gate_rollou
         .env(
             "PALYRA_EXPERIMENTAL_EXECUTION_GATE_PIPELINE_V2",
             if execution_gate_rollout_enabled { "true" } else { "false" },
-        )
+        );
+    if let Some(principal) = bound_console_principal {
+        command.env("PALYRA_ADMIN_BOUND_PRINCIPAL", principal);
+    }
+    let mut child = command
         .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

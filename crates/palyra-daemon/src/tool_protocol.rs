@@ -1560,7 +1560,7 @@ mod tests {
     }
 
     #[test]
-    fn decide_tool_call_workspace_read_tools_require_approval_when_allowlisted() {
+    fn decide_tool_call_allows_workspace_read_tools_when_allowlisted() {
         for tool_name in ["palyra.fs.read_file", "palyra.fs.list_dir", "palyra.fs.search"] {
             let config = ToolCallConfig {
                 allowed_tools: vec![tool_name.to_owned()],
@@ -1572,18 +1572,15 @@ mod tests {
             let request_context = tool_request_context("user:ops");
             let mut budget = 1;
 
-            let denied = decide_tool_call(&config, &mut budget, &request_context, tool_name, false);
+            let decision =
+                decide_tool_call(&config, &mut budget, &request_context, tool_name, false);
 
-            assert!(!denied.allowed, "allowlisted {tool_name} should still need approval");
-            assert!(denied.approval_required, "{tool_name} should require interactive approval");
-            assert_eq!(budget, 1, "denied approval must not consume budget");
-
-            let approved =
-                decide_tool_call(&config, &mut budget, &request_context, tool_name, true);
-
-            assert!(approved.allowed, "approved {tool_name} should be executable");
-            assert!(approved.approval_required, "sensitive metadata should remain visible");
-            assert_eq!(budget, 0, "approved tool should consume budget");
+            assert!(decision.allowed, "allowlisted read-only {tool_name} should execute");
+            assert!(
+                !decision.approval_required,
+                "{tool_name} should not need interactive approval"
+            );
+            assert_eq!(budget, 0, "allowed read-only tool should consume budget");
         }
     }
 
@@ -1754,9 +1751,9 @@ mod tests {
         assert!(!tool_requires_approval("palyra.memory.reflect"));
         assert!(!tool_requires_approval("palyra.routines.query"));
         assert!(!tool_requires_approval("palyra.artifact.read"));
-        assert!(tool_requires_approval("palyra.fs.read_file"));
-        assert!(tool_requires_approval("palyra.fs.list_dir"));
-        assert!(tool_requires_approval("palyra.fs.search"));
+        assert!(!tool_requires_approval("palyra.fs.read_file"));
+        assert!(!tool_requires_approval("palyra.fs.list_dir"));
+        assert!(!tool_requires_approval("palyra.fs.search"));
         assert!(tool_requires_approval("palyra.routines.control"));
         assert!(tool_requires_approval("palyra.http.fetch"));
         assert!(tool_requires_approval("palyra.process.run"));
@@ -1888,21 +1885,21 @@ mod tests {
     }
 
     #[test]
-    fn workspace_read_tools_expose_approval_gated_filesystem_read() {
+    fn workspace_read_tools_expose_read_only_filesystem_capability_without_approval() {
         let metadata = tool_metadata("palyra.fs.read_file").expect("workspace read metadata");
         assert_eq!(metadata.capabilities, &[ToolCapability::FilesystemRead]);
         assert!(!metadata.default_sensitive);
-        assert!(tool_requires_approval("palyra.fs.read_file"));
+        assert!(!tool_requires_approval("palyra.fs.read_file"));
 
         let metadata = tool_metadata("palyra.fs.list_dir").expect("workspace list metadata");
         assert_eq!(metadata.capabilities, &[ToolCapability::FilesystemRead]);
         assert!(!metadata.default_sensitive);
-        assert!(tool_requires_approval("palyra.fs.list_dir"));
+        assert!(!tool_requires_approval("palyra.fs.list_dir"));
 
         let metadata = tool_metadata("palyra.fs.search").expect("workspace search metadata");
         assert_eq!(metadata.capabilities, &[ToolCapability::FilesystemRead]);
         assert!(!metadata.default_sensitive);
-        assert!(tool_requires_approval("palyra.fs.search"));
+        assert!(!tool_requires_approval("palyra.fs.search"));
     }
 
     #[test]

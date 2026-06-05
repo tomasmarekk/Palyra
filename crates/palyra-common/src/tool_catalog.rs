@@ -42,7 +42,7 @@ const WASM_PLUGIN_CAPABILITIES: &[ToolCapability] =
     &[ToolCapability::Network, ToolCapability::SecretsRead, ToolCapability::FilesystemWrite];
 
 pub const SENSITIVE_CAPABILITY_POLICY_NAMES: &[&str] =
-    &["process_exec", "network", "secrets_read", "filesystem_read", "filesystem_write"];
+    &["process_exec", "network", "secrets_read", "filesystem_write"];
 
 #[must_use]
 pub fn tool_metadata(tool_name: &str) -> Option<ToolMetadata> {
@@ -223,7 +223,6 @@ pub fn tool_requires_approval(tool_name: &str) -> bool {
                 ToolCapability::ProcessExec
                     | ToolCapability::Network
                     | ToolCapability::SecretsRead
-                    | ToolCapability::FilesystemRead
                     | ToolCapability::FilesystemWrite
             )
         })
@@ -280,6 +279,14 @@ mod tests {
     fn memory_status_is_read_only_without_approval() {
         assert!(!tool_requires_approval("palyra.memory.status"));
         assert!(tool_policy_capability_names("palyra.memory.status").is_empty());
+    }
+
+    #[test]
+    fn workspace_read_tools_are_not_approval_required_by_default() {
+        for tool_name in ["palyra.fs.read_file", "palyra.fs.list_dir", "palyra.fs.search"] {
+            assert!(!tool_requires_approval(tool_name), "{tool_name} should be read-only");
+            assert_eq!(tool_policy_capability_names(tool_name), vec!["filesystem_read"]);
+        }
     }
 
     #[test]

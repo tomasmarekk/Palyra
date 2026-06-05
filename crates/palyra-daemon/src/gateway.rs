@@ -36,7 +36,7 @@ use palyra_vault::{SecretMetadata as VaultSecretMetadata, Vault, VaultError, Vau
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, time::sleep};
 use tokio_stream::StreamExt;
 use tonic::{Status, Streaming};
 use tracing::{info, warn};
@@ -177,6 +177,7 @@ pub(crate) const APPROVAL_PROMPT_TIMEOUT_SECONDS: u32 = 15 * 60;
 pub(crate) const APPROVAL_REQUEST_SUMMARY_MAX_BYTES: usize = 1024;
 pub(crate) const TOOL_APPROVAL_RESPONSE_TIMEOUT: Duration =
     Duration::from_secs(APPROVAL_PROMPT_TIMEOUT_SECONDS as u64);
+const TOOL_APPROVAL_EXTERNAL_DECISION_POLL_INTERVAL: Duration = Duration::from_millis(250);
 pub(crate) const SKILL_EXECUTION_DENY_REASON_PREFIX: &str =
     "skill execution blocked by security gate";
 pub(crate) const MEMORY_STATUS_TOOL_NAME: &str = "palyra.memory.status";
@@ -395,72 +396,112 @@ pub(crate) fn matching_tool_approval_response_id(
 
 #[allow(clippy::result_large_err)]
 pub(crate) async fn await_tool_approval_response(
+    runtime_state: &Arc<GatewayRuntimeState>,
     stream: &mut Streaming<common_v1::RunStreamRequest>,
     expected_session_id: &str,
     expected_run_id: &str,
     proposal_id: &str,
     approval_id: &str,
 ) -> Result<ToolApprovalOutcome, Status> {
-    while let Some(item) = stream.next().await {
-        let message = item.map_err(|error| {
-            Status::internal(format!("failed to read approval stream item: {error}"))
-        })?;
-        if message.v != CANONICAL_PROTOCOL_MAJOR {
-            return Err(Status::failed_precondition("unsupported protocol major version"));
-        }
-
-        let message_session_id = canonical_id(message.session_id, "session_id")?;
-        if message_session_id != expected_session_id {
-            return Err(Status::invalid_argument(
-                "run stream cannot switch session_id while awaiting tool approval response",
-            ));
-        }
-        let message_run_id = canonical_id(message.run_id, "run_id")?;
-        if message_run_id != expected_run_id {
-            return Err(Status::invalid_argument(
-                "run stream cannot switch run_id while awaiting tool approval response",
-            ));
-        }
-        if message.input.is_some() {
-            return Err(Status::invalid_argument(
-                "received prompt payload while waiting for tool approval response",
-            ));
-        }
-
-        let Some(response) = message.tool_approval_response else {
-            continue;
-        };
-        let Some(response_approval_id) =
-            matching_tool_approval_response_id(&response, proposal_id, approval_id)?
-        else {
-            continue;
-        };
-
-        let reason = non_empty(response.reason).unwrap_or_else(|| {
-            if response.approved {
-                "approved_by_client".to_owned()
-            } else {
-                "denied_by_client".to_owned()
+    loop {
+        tokio::select! {
+            item = stream.next() => {
+                let Some(item) = item else {
+                    return external_or_unavailable_tool_approval_outcome(runtime_state, approval_id).await;
+                };
+                let message = item.map_err(|error| {
+                    Status::internal(format!("failed to read approval stream item: {error}"))
+                })?;
+                if let Some(outcome) = tool_approval_outcome_from_stream_message(
+                    message,
+                    expected_session_id,
+                    expected_run_id,
+                    proposal_id,
+                    approval_id,
+                )? {
+                    return Ok(outcome);
+                }
             }
-        });
-        return Ok(ToolApprovalOutcome {
-            approval_id: response_approval_id,
-            approved: response.approved,
-            reason,
-            decision: if response.approved {
-                ApprovalDecision::Allow
-            } else {
-                ApprovalDecision::Deny
-            },
-            decision_scope: approval_scope_from_proto(response.decision_scope),
-            decision_scope_ttl_ms: if response.decision_scope_ttl_ms > 0 {
-                Some(response.decision_scope_ttl_ms)
-            } else {
-                None
-            },
-        });
+            () = sleep(TOOL_APPROVAL_EXTERNAL_DECISION_POLL_INTERVAL) => {
+                if let Some(outcome) =
+                    resolved_tool_approval_record_outcome(runtime_state, approval_id).await?
+                {
+                    return Ok(outcome);
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn tool_approval_outcome_from_stream_message(
+    message: common_v1::RunStreamRequest,
+    expected_session_id: &str,
+    expected_run_id: &str,
+    proposal_id: &str,
+    approval_id: &str,
+) -> Result<Option<ToolApprovalOutcome>, Status> {
+    if message.v != CANONICAL_PROTOCOL_MAJOR {
+        return Err(Status::failed_precondition("unsupported protocol major version"));
     }
 
+    let message_session_id = canonical_id(message.session_id, "session_id")?;
+    if message_session_id != expected_session_id {
+        return Err(Status::invalid_argument(
+            "run stream cannot switch session_id while awaiting tool approval response",
+        ));
+    }
+    let message_run_id = canonical_id(message.run_id, "run_id")?;
+    if message_run_id != expected_run_id {
+        return Err(Status::invalid_argument(
+            "run stream cannot switch run_id while awaiting tool approval response",
+        ));
+    }
+    if message.input.is_some() {
+        return Err(Status::invalid_argument(
+            "received prompt payload while waiting for tool approval response",
+        ));
+    }
+
+    let Some(response) = message.tool_approval_response else {
+        return Ok(None);
+    };
+    let Some(response_approval_id) =
+        matching_tool_approval_response_id(&response, proposal_id, approval_id)?
+    else {
+        return Ok(None);
+    };
+
+    let reason = non_empty(response.reason).unwrap_or_else(|| {
+        if response.approved {
+            "approved_by_client".to_owned()
+        } else {
+            "denied_by_client".to_owned()
+        }
+    });
+    Ok(Some(ToolApprovalOutcome {
+        approval_id: response_approval_id,
+        approved: response.approved,
+        reason,
+        decision: if response.approved { ApprovalDecision::Allow } else { ApprovalDecision::Deny },
+        decision_scope: approval_scope_from_proto(response.decision_scope),
+        decision_scope_ttl_ms: if response.decision_scope_ttl_ms > 0 {
+            Some(response.decision_scope_ttl_ms)
+        } else {
+            None
+        },
+    }))
+}
+
+#[allow(clippy::result_large_err)]
+async fn external_or_unavailable_tool_approval_outcome(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    approval_id: &str,
+) -> Result<ToolApprovalOutcome, Status> {
+    if let Some(outcome) = resolved_tool_approval_record_outcome(runtime_state, approval_id).await?
+    {
+        return Ok(outcome);
+    }
     Ok(ToolApprovalOutcome {
         approval_id: approval_id.to_owned(),
         approved: false,
@@ -469,6 +510,37 @@ pub(crate) async fn await_tool_approval_response(
         decision_scope: ApprovalDecisionScope::Once,
         decision_scope_ttl_ms: None,
     })
+}
+
+#[allow(clippy::result_large_err)]
+async fn resolved_tool_approval_record_outcome(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    approval_id: &str,
+) -> Result<Option<ToolApprovalOutcome>, Status> {
+    let Some(record) = runtime_state.approval_record(approval_id.to_owned()).await? else {
+        return Ok(None);
+    };
+    let Some(decision) = record.decision else {
+        return Ok(None);
+    };
+    let decision_scope = record.decision_scope.unwrap_or(ApprovalDecisionScope::Once);
+    let decision_scope_ttl_ms = record.decision_scope_ttl_ms.filter(|value| *value > 0);
+    let approved = matches!(decision, ApprovalDecision::Allow);
+    let reason = record.decision_reason.unwrap_or_else(|| {
+        if approved {
+            "approved_by_external_approval_record".to_owned()
+        } else {
+            "denied_by_external_approval_record".to_owned()
+        }
+    });
+    Ok(Some(ToolApprovalOutcome {
+        approval_id: record.approval_id,
+        approved,
+        reason,
+        decision,
+        decision_scope,
+        decision_scope_ttl_ms,
+    }))
 }
 
 pub(crate) fn map_provider_error(error: ProviderError) -> Status {

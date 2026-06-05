@@ -12586,6 +12586,7 @@ impl JournalStore {
                     resolved_at_unix_ms = COALESCE(resolved_at_unix_ms, ?6),
                     updated_at_unix_ms = ?6
                 WHERE approval_ulid = ?1
+                    AND decision IS NULL
             "#,
             params![
                 request.approval_id,
@@ -12596,14 +12597,16 @@ impl JournalStore {
                 now
             ],
         )?;
-        if updated == 0 {
+        let record =
+            load_approval_by_id(&guard, request.approval_id.as_str())?.ok_or_else(|| {
+                JournalError::ApprovalNotFound { approval_id: request.approval_id.clone() }
+            })?;
+        if updated == 0 && record.decision.is_none() {
             return Err(JournalError::ApprovalNotFound {
                 approval_id: request.approval_id.clone(),
             });
         }
-        load_approval_by_id(&guard, request.approval_id.as_str())?.ok_or_else(|| {
-            JournalError::ApprovalNotFound { approval_id: request.approval_id.clone() }
-        })
+        Ok(record)
     }
 
     pub fn approval(&self, approval_id: &str) -> Result<Option<ApprovalRecord>, JournalError> {
@@ -23612,6 +23615,41 @@ mod tests {
             .expect("approval lookup should succeed")
             .expect("approval should exist");
         assert_eq!(fetched.decision, Some(ApprovalDecision::Deny));
+    }
+
+    #[test]
+    fn approval_resolution_preserves_first_decision() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let approval_id = "01ARZ3NDEKTSV4RRFFQ69G5FBL";
+        store
+            .create_approval(&sample_approval_request(approval_id))
+            .expect("approval create should persist");
+
+        let allowed = store
+            .resolve_approval(&ApprovalResolveRequest {
+                approval_id: approval_id.to_owned(),
+                decision: ApprovalDecision::Allow,
+                decision_scope: ApprovalDecisionScope::Once,
+                decision_reason: "approved_by_external_console".to_owned(),
+                decision_scope_ttl_ms: None,
+            })
+            .expect("first approval resolve should persist");
+        assert_eq!(allowed.decision, Some(ApprovalDecision::Allow));
+
+        let denied = store
+            .resolve_approval(&ApprovalResolveRequest {
+                approval_id: approval_id.to_owned(),
+                decision: ApprovalDecision::Deny,
+                decision_scope: ApprovalDecisionScope::Once,
+                decision_reason: "denied_by_late_terminal_prompt".to_owned(),
+                decision_scope_ttl_ms: None,
+            })
+            .expect("late approval resolve should return the existing record");
+
+        assert_eq!(denied.decision, Some(ApprovalDecision::Allow));
+        assert_eq!(denied.decision_reason.as_deref(), Some("approved_by_external_console"));
     }
 
     #[test]
