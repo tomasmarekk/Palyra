@@ -1432,8 +1432,7 @@ pub(crate) async fn process_run_stream_message(
                 final_reply_tokens_deferred,
             } => {
                 loop_state.append_assistant_turn(&provider_output);
-                let should_refeed_tool_results = !tool_result_messages.is_empty()
-                    && provider_output.finish_reason == ProviderFinishReason::ToolCalls;
+                let should_refeed_tool_results = !tool_result_messages.is_empty();
                 if !should_refeed_tool_results {
                     if let Some(message) =
                         incomplete_terminal_final_answer(final_reply_text.as_deref(), &loop_state)
