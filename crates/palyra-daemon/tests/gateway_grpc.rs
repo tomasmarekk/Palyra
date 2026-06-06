@@ -1978,7 +1978,7 @@ async fn grpc_route_message_does_not_reuse_cached_tool_approval_from_run_stream(
             openai_base_url.as_str(),
             OPENAI_API_KEY,
             "palyra.process.run",
-            4,
+            1,
             750,
         )?;
     let _config_guard = TempFileGuard::new(config_path);
@@ -2034,6 +2034,7 @@ async fn grpc_route_message_does_not_reuse_cached_tool_approval_from_run_stream(
         first_outbound.text.to_ascii_lowercase().contains("approval required"),
         "first route attempt should fail-closed without cached approval"
     );
+    wait_for_run_terminal_state(admin_port, first_route_run_id.as_str()).await?;
 
     let (request_sender, request_receiver) = tokio_mpsc::channel(4);
     request_sender
@@ -2104,6 +2105,8 @@ async fn grpc_route_message_does_not_reuse_cached_tool_approval_from_run_stream(
         saw_tool_result,
         "approval seed run should execute palyra.process.run after approval response"
     );
+    drop(response_stream);
+    wait_for_run_terminal_state(admin_port, RUN_ID).await?;
 
     let status_before_second_route =
         admin_get_json_async(admin_port, "/admin/v1/status".to_owned()).await?;
@@ -7472,17 +7475,23 @@ async fn grpc_run_stream_reuses_timeboxed_approval_until_ttl_expiry() -> Result<
             "payload": "approval-cache-timeboxed"
         }),
     )?;
+    let final_response_body =
+        r#"{"choices":[{"finish_reason":"stop","message":{"content":"approval cache check complete"}}]}"#
+            .to_owned();
     let (openai_base_url, _request_count, server_handle) = spawn_scripted_openai_server(vec![
         ScriptedOpenAiResponse::immediate(200, response_body.clone()),
+        ScriptedOpenAiResponse::immediate(200, final_response_body.clone()),
         ScriptedOpenAiResponse::immediate(200, response_body.clone()),
+        ScriptedOpenAiResponse::immediate(200, final_response_body.clone()),
         ScriptedOpenAiResponse::immediate(200, response_body),
+        ScriptedOpenAiResponse::immediate(200, final_response_body),
     ])?;
     let (child, admin_port, grpc_port, _journal_db_path) =
         spawn_palyrad_with_openai_provider_and_tool_policy(
             openai_base_url.as_str(),
             OPENAI_API_KEY,
             "custom.noop",
-            4,
+            1,
             250,
         )?;
     let mut daemon = ChildGuard::new(child);
@@ -7714,16 +7723,21 @@ async fn grpc_resolve_session_reset_clears_cached_tool_approval() -> Result<()> 
             "payload": "approval-cache-reset"
         }),
     )?;
+    let final_response_body =
+        r#"{"choices":[{"finish_reason":"stop","message":{"content":"approval reset check complete"}}]}"#
+            .to_owned();
     let (openai_base_url, _request_count, server_handle) = spawn_scripted_openai_server(vec![
         ScriptedOpenAiResponse::immediate(200, response_body.clone()),
+        ScriptedOpenAiResponse::immediate(200, final_response_body.clone()),
         ScriptedOpenAiResponse::immediate(200, response_body),
+        ScriptedOpenAiResponse::immediate(200, final_response_body),
     ])?;
     let (child, admin_port, grpc_port, _journal_db_path) =
         spawn_palyrad_with_openai_provider_and_tool_policy(
             openai_base_url.as_str(),
             OPENAI_API_KEY,
             "custom.noop",
-            4,
+            1,
             250,
         )?;
     let mut daemon = ChildGuard::new(child);
@@ -10804,6 +10818,23 @@ async fn admin_get_json_async(admin_port: u16, path: String) -> Result<Value> {
     tokio::task::spawn_blocking(move || admin_get_json(admin_port, path.as_str()))
         .await
         .context("admin JSON worker panicked")?
+}
+
+async fn wait_for_run_terminal_state(admin_port: u16, run_id: &str) -> Result<String> {
+    let mut observed_state = None::<String>;
+    for _ in 0..40 {
+        let run_snapshot = admin_get_json_async(admin_port, format!("/admin/v1/runs/{run_id}"))
+            .await
+            .with_context(|| {
+                format!("failed to inspect run {run_id} while waiting for terminal state")
+            })?;
+        observed_state = run_snapshot.get("state").and_then(Value::as_str).map(str::to_owned);
+        if matches!(observed_state.as_deref(), Some("done" | "failed" | "cancelled")) {
+            return Ok(observed_state.expect("terminal state should be present"));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    anyhow::bail!("run {run_id} did not reach terminal state; last_state={observed_state:?}")
 }
 
 async fn admin_get_text_with_security_headers_async(
