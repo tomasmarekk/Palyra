@@ -1990,12 +1990,21 @@ pub(crate) async fn execute_browser_tool(
             match client.set_viewport(request).await {
                 Ok(response) => {
                     let response = response.into_inner();
-                    let success = response.success;
                     let response_width = response.width;
                     let response_height = response.height;
-                    let error = response.error.clone();
+                    let mismatch_error = response.success.then(|| {
+                        browser_viewport_metric_mismatch_error(
+                            width,
+                            height,
+                            response_width,
+                            response_height,
+                        )
+                    });
+                    let error = mismatch_error.flatten().unwrap_or_else(|| response.error.clone());
+                    let success = response.success && error.is_empty();
                     let mut output = json!({
-                        "success": response.success,
+                        "success": success,
+                        "browser_service_success": response.success,
                         "width": response.width,
                         "height": response.height,
                         "requested_width": width,
@@ -2006,9 +2015,10 @@ pub(crate) async fn execute_browser_tool(
                         "error": response.error,
                         "action_log": response.action_log.map(browser_action_log_to_json),
                     });
-                    if success && (response_width != width || response_height != height) {
-                        output["viewport_warning"] = json!(
-                            "reported viewport differs from requested viewport; use requested_width/requested_height for layout assertions and treat screenshot overflow metrics as authoritative"
+                    if !success && response.success {
+                        output["error"] = json!(error);
+                        output["viewport_error"] = json!(
+                            "reported viewport differs from requested viewport; mobile or responsive visual assertions are unverified"
                         );
                     }
                     (
@@ -3976,6 +3986,20 @@ fn browser_layout_metrics_to_json(metrics: browser_v1::BrowserLayoutMetrics) -> 
     })
 }
 
+fn browser_viewport_metric_mismatch_error(
+    requested_width: u32,
+    requested_height: u32,
+    actual_width: u32,
+    actual_height: u32,
+) -> Option<String> {
+    if requested_width == actual_width && requested_height == actual_height {
+        return None;
+    }
+    Some(format!(
+        "palyra.browser.viewport reported viewport {actual_width}x{actual_height} after requesting {requested_width}x{requested_height}; mobile or responsive visual assertions are unverified"
+    ))
+}
+
 fn browser_element_captures_to_json(
     captures: &[browser_v1::BrowserElementCapture],
 ) -> (Vec<Value>, Vec<SafetyScanResult>, bool) {
@@ -4459,11 +4483,11 @@ mod tests {
         browser_session_persistence_from_payload, browser_session_profile_id_from_payload,
         browser_tool_execution_outcome, browser_tool_requires_open_session,
         browser_url_targets_loopback, browser_user_owned_os_roots,
-        canonical_file_path_is_inside_workspace_roots, normalize_browser_press_key_input,
-        parse_browser_download_artifact_id, parse_browser_observe_string_array,
-        resolve_browser_output_path, resolve_browser_upload_path,
-        validate_browser_workspace_relative_path, BROWSER_CALLER_PRINCIPAL_HEADER,
-        PALYRA_OS_FILE_ROOTS_ENV,
+        browser_viewport_metric_mismatch_error, canonical_file_path_is_inside_workspace_roots,
+        normalize_browser_press_key_input, parse_browser_download_artifact_id,
+        parse_browser_observe_string_array, resolve_browser_output_path,
+        resolve_browser_upload_path, validate_browser_workspace_relative_path,
+        BROWSER_CALLER_PRINCIPAL_HEADER, PALYRA_OS_FILE_ROOTS_ENV,
     };
     use crate::application::tool_runtime::workspace_scope::ActiveWorkspaceRoot;
     use crate::gateway::{
@@ -4731,6 +4755,19 @@ mod tests {
             parse_browser_download_artifact_id(invalid.as_object().expect("object payload"))
                 .expect_err("non-canonical artifact id should fail");
         assert!(error.contains("artifact_id is invalid"));
+    }
+
+    #[test]
+    fn browser_viewport_metric_mismatch_is_agent_facing_failure() {
+        let matching = browser_viewport_metric_mismatch_error(375, 812, 375, 812);
+        assert!(matching.is_none());
+
+        let mismatch = browser_viewport_metric_mismatch_error(375, 812, 960, 2079)
+            .expect("viewport mismatch should produce an explicit failure message");
+
+        assert!(mismatch.contains("960x2079"));
+        assert!(mismatch.contains("375x812"));
+        assert!(mismatch.contains("visual assertions are unverified"));
     }
 
     #[test]
