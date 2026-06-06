@@ -874,15 +874,32 @@ fn parse_patch_document(patch: &str) -> Result<Vec<PatchOperation>, WorkspacePat
             let header_line = index;
             index = index.saturating_add(1);
             let mut replace_lines = Vec::new();
+            let mut first_diff_remove_line = None;
+            let mut has_patch_prefixed_content_line = false;
             while index < lines.len() {
                 let body_line = lines[index];
                 if is_patch_header_or_end(body_line) {
                     break;
                 }
                 reject_structural_marker_in_full_file_body(body_line, index + 1, "replace-file")?;
+                if first_diff_remove_line.is_none()
+                    && is_diff_remove_line_in_full_file_body(body_line)
+                {
+                    first_diff_remove_line = Some(index + 1);
+                }
+                has_patch_prefixed_content_line |= body_line.starts_with('+');
                 let content = full_file_body_content(body_line);
                 replace_lines.push(content.to_owned());
                 index = index.saturating_add(1);
+            }
+            if let Some(line_number) = first_diff_remove_line {
+                if has_patch_prefixed_content_line {
+                    return Err(parse_error(
+                        line_number,
+                        1,
+                        "replace-file body mixes '-' removal lines with '+' content lines; use an Update File hunk for diffs or provide only final file contents. To write a literal line beginning with '-', prefix it as '+-...'.",
+                    ));
+                }
             }
             if replace_lines.is_empty() {
                 return Err(parse_error(
@@ -1081,6 +1098,13 @@ fn is_unified_diff_file_header(trimmed_line: &str, prefix: &str) -> bool {
     };
 
     rest.starts_with([' ', '\t']) && !rest.trim().is_empty()
+}
+
+fn is_diff_remove_line_in_full_file_body(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix('-') else {
+        return false;
+    };
+    rest.chars().next().is_some_and(|character| !character.is_whitespace())
 }
 
 fn is_patch_header_or_end(line: &str) -> bool {
@@ -2326,6 +2350,37 @@ mod tests {
         assert_eq!(
             fs::read_to_string(workspace.join("public.txt")).expect("seed file should remain"),
             "alpha beta\n"
+        );
+    }
+
+    #[test]
+    fn apply_workspace_patch_rejects_diff_style_replace_file_body_without_headers() {
+        let temp = tempdir().expect("tempdir should be created");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(workspace.join("src")).expect("workspace should exist");
+        fs::write(
+            workspace.join("src").join("user-card.ts"),
+            "export interface User { id: string; }\n",
+        )
+        .expect("seed file should exist");
+
+        let patch = "*** Begin Patch\n*** Replace File: src/user-card.ts\n-export interface User { id: string; }\n+export interface User { id: string; name: string; }\n*** End Patch\n";
+        let error = apply_workspace_patch(
+            std::slice::from_ref(&workspace),
+            &default_request(patch, false),
+            &default_limits(),
+        )
+        .expect_err("replace-file bodies must reject diff-style removal lines");
+
+        assert!(matches!(error, WorkspacePatchError::Parse { .. }));
+        assert!(
+            error.to_string().contains("mixes '-' removal lines"),
+            "error should explain malformed replace body rejection: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("src").join("user-card.ts"))
+                .expect("seed file should remain"),
+            "export interface User { id: string; }\n"
         );
     }
 
