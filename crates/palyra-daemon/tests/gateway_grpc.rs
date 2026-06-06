@@ -5822,6 +5822,134 @@ async fn grpc_run_stream_reports_partial_summary_when_provider_timeout_follows_t
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn grpc_run_stream_stops_after_repeated_length_recovery_with_tool_evidence() -> Result<()> {
+    let first_response = serde_json::json!({
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "tool_calls": [{
+                    "id": "call_length_recovery_01",
+                    "type": "function",
+                    "function": {
+                        "name": "palyra.echo",
+                        "arguments": "{\"text\":\"hello before length\"}"
+                    }
+                }]
+            }
+        }]
+    })
+    .to_string();
+    let first_length_response =
+        r#"{"choices":[{"finish_reason":"length","message":{"content":"draft without a tool"}}]}"#
+            .to_owned();
+    let repeated_length_response =
+        r#"{"choices":[{"finish_reason":"length","message":{"content":"another oversized draft"}}]}"#
+            .to_owned();
+    let (openai_base_url, request_count, server_handle) = spawn_scripted_openai_server(vec![
+        ScriptedOpenAiResponse::immediate(200, first_response),
+        ScriptedOpenAiResponse::immediate(200, first_length_response),
+        ScriptedOpenAiResponse::immediate(200, repeated_length_response),
+    ])?;
+    let (child, admin_port, grpc_port, _journal_db_path) =
+        spawn_palyrad_with_openai_provider_and_tool_policy(
+            openai_base_url.as_str(),
+            OPENAI_API_KEY,
+            "palyra.echo",
+            2,
+            250,
+        )?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+
+    let mut stream_request =
+        tonic::Request::new(tokio_stream::iter(vec![sample_run_stream_request_with_text(
+            "call echo, then recover from repeated length output".to_owned(),
+        )]));
+    stream_request.metadata_mut().insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
+    stream_request.metadata_mut().insert("x-palyra-principal", "user:ops".parse()?);
+    stream_request.metadata_mut().insert("x-palyra-device-id", DEVICE_ID.parse()?);
+    stream_request.metadata_mut().insert("x-palyra-channel", "cli".parse()?);
+
+    let mut response_stream =
+        client.run_stream(stream_request).await.context("failed to call RunStream")?.into_inner();
+    let mut model_tokens = Vec::new();
+    let mut progress_statuses = Vec::new();
+    let mut failed_messages = Vec::new();
+    let mut saw_done = false;
+    while let Some(event) = response_stream.next().await {
+        let event = event.context("failed to read RunStream event")?;
+        if let Some(body) = event.body {
+            match body {
+                common_v1::run_stream_event::Body::ModelToken(token) => {
+                    model_tokens.push(token.token);
+                }
+                common_v1::run_stream_event::Body::Status(status)
+                    if status.message.trim().starts_with("progress:") =>
+                {
+                    progress_statuses.push(status.message);
+                }
+                common_v1::run_stream_event::Body::Status(status)
+                    if status.kind == common_v1::stream_status::StatusKind::Failed as i32 =>
+                {
+                    failed_messages.push(status.message);
+                }
+                common_v1::run_stream_event::Body::Status(status)
+                    if status.kind == common_v1::stream_status::StatusKind::Done as i32 =>
+                {
+                    saw_done = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let rendered = model_tokens.concat();
+    assert!(
+        rendered.contains("Partial result"),
+        "repeated length recovery should emit a partial summary token: {rendered}"
+    );
+    assert!(
+        rendered.contains("repeatedly hit the output token limit"),
+        "partial summary should explain the bounded length recovery: {rendered}"
+    );
+    assert!(
+        failed_messages
+            .iter()
+            .any(|message| message.contains("repeatedly hit the output token limit")),
+        "failed status should carry the same actionable summary: {failed_messages:?}"
+    );
+    assert_eq!(
+        progress_statuses
+            .iter()
+            .filter(|status| status.as_str() == "progress:agent_loop.length_recovery_requested")
+            .count(),
+        1,
+        "run should request one length recovery before falling back: {progress_statuses:?}"
+    );
+    assert!(!saw_done, "bounded repeated length recovery should remain a failed run");
+    assert_eq!(
+        request_count.load(Ordering::Relaxed),
+        3,
+        "run must not start another long provider turn after repeated length recovery"
+    );
+
+    let run_snapshot = admin_get_json_async(admin_port, format!("/admin/v1/runs/{RUN_ID}")).await?;
+    assert_eq!(
+        run_snapshot.get("state").and_then(Value::as_str),
+        Some("failed"),
+        "run must not remain in_progress after repeated length recovery"
+    );
+
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn grpc_run_stream_reports_partial_summary_when_tool_budget_is_exhausted() -> Result<()> {
     let first_response = serde_json::json!({
         "choices": [{

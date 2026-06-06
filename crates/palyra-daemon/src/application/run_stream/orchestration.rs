@@ -1708,6 +1708,43 @@ pub(crate) async fn process_run_stream_message(
                 .await?;
             }
             RunStreamProviderResponseOutcome::Failed { message, provider_trace_ref, reason } => {
+                if should_stop_after_repeated_length_recovery(
+                    reason,
+                    message.as_str(),
+                    &loop_state,
+                    length_recovery_attempts,
+                ) {
+                    let fallback_summary = length_recovery_fallback_summary(
+                        message.as_str(),
+                        &loop_state,
+                        run_id.as_str(),
+                    );
+                    send_deferred_final_reply_tokens(
+                        sender,
+                        runtime_state,
+                        request_context,
+                        session_id_for_message.as_str(),
+                        run_id.as_str(),
+                        tape_seq,
+                        model_token_tape_events,
+                        model_token_compaction_emitted,
+                        fallback_summary.as_str(),
+                    )
+                    .await?;
+                    terminate_run_stream_with_agent_loop_reason(
+                        sender,
+                        runtime_state,
+                        run_state,
+                        run_id.as_str(),
+                        tape_seq,
+                        &loop_state,
+                        reason,
+                        fallback_summary.as_str(),
+                        provider_trace_ref,
+                    )
+                    .await?;
+                    return Ok(RunStreamMessageProcessingOutcome::Terminate);
+                }
                 if let Some(recovery_prompt) = length_recovery_prompt(
                     reason,
                     message.as_str(),
@@ -2204,6 +2241,31 @@ fn length_recovery_prompt(
             "Last length-recovery attempt. Produce only one minimal structured tool call with the smallest useful arguments. Do not include prose, file contents, markdown previews, or summaries before the tool call."
         }
     })
+}
+
+fn should_stop_after_repeated_length_recovery(
+    reason: AgentLoopTerminationReason,
+    message: &str,
+    loop_state: &AgentRunLoopState,
+    attempt_count: u8,
+) -> bool {
+    attempt_count > 0
+        && loop_state.completed_tool_calls() > 0
+        && reason == AgentLoopTerminationReason::IncompleteFinalAnswer
+        && message.contains("finish_reason=length")
+}
+
+fn length_recovery_fallback_summary(
+    message: &str,
+    loop_state: &AgentRunLoopState,
+    run_id: &str,
+) -> String {
+    let tool_count = loop_state.completed_tool_calls();
+    let tool_label = if tool_count == 1 { "tool call" } else { "tool calls" };
+    format!(
+        "Partial result: I ran {tool_count} {tool_label}, but the model repeatedly hit the output token limit during length recovery before producing a structured tool call or usable final answer. Last recovery issue: {}. The run tape for {run_id} contains the exact tool evidence. Resume this same session and reference run {run_id} if any requested artifact, validation, or cleanup is still missing.",
+        truncate_with_ellipsis(message.trim().replace(['\r', '\n'], " "), 512)
+    )
 }
 
 fn final_answer_recovery_prompt(
