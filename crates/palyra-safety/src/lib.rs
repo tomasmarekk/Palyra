@@ -780,7 +780,7 @@ fn detect_sensitive_assignment(line: &str, _lowered: &str) -> Option<&'static st
 }
 
 fn sensitive_assignment_separator_index(line: &str) -> Option<usize> {
-    match (line.find('='), line.find(':')) {
+    match (find_assignment_equals(line), line.find(':')) {
         (Some(equals), Some(colon))
             if colon < equals && is_colon_style_assignment_key(&line[..colon]) =>
         {
@@ -790,6 +790,21 @@ fn sensitive_assignment_separator_index(line: &str) -> Option<usize> {
         (None, Some(colon)) => Some(colon),
         (None, None) => None,
     }
+}
+
+fn find_assignment_equals(line: &str) -> Option<usize> {
+    for (index, ch) in line.char_indices() {
+        if ch != '=' {
+            continue;
+        }
+        let previous = line[..index].chars().next_back();
+        let next = line[index + ch.len_utf8()..].chars().next();
+        if matches!(previous, Some('=' | '!' | '<' | '>')) || matches!(next, Some('=' | '>')) {
+            continue;
+        }
+        return Some(index);
+    }
+    None
 }
 
 fn is_colon_style_assignment_key(raw_key: &str) -> bool {
@@ -855,6 +870,7 @@ fn is_safe_secret_reference_value(key: &str, value: &str) -> bool {
         || is_env_identifier_reference_expression(key, normalized)
         || is_standalone_env_identifier_literal(normalized)
         || is_obvious_placeholder_secret_value(normalized)
+        || is_benign_mock_credential_fixture_value(normalized)
         || is_dom_input_value_reference(normalized)
 }
 
@@ -966,6 +982,17 @@ fn is_obvious_placeholder_secret_value(value: &str) -> bool {
             | "replace_with_your_api_key"
             | "insert_api_key_here"
     )
+}
+
+fn is_benign_mock_credential_fixture_value(value: &str) -> bool {
+    let normalized = value
+        .trim()
+        .trim_end_matches([',', ';'])
+        .trim()
+        .trim_matches(['"', '\'', '`'])
+        .to_ascii_lowercase()
+        .replace(['-', ' '], "_");
+    matches!(normalized.as_str(), "demo" | "demo/demo" | "test" | "test/test")
 }
 
 fn quoted_string_literals(value: &str) -> Vec<String> {
@@ -1086,33 +1113,55 @@ fn bare_token_assignment_value_looks_secret(value: &str) -> bool {
 }
 
 fn looks_like_application_identifier(value: &str) -> bool {
+    let looks_like_scenario_identifier = looks_like_scenario_application_identifier(value);
     value.len() <= 128
         && (value.contains(':')
             || value.contains('/')
             || value.matches('.').count() >= 2
-            || looks_like_segmented_application_identifier(value))
+            || looks_like_segmented_application_identifier(value)
+            || looks_like_scenario_identifier)
         && value
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ':' | '-' | '_' | '.' | '/'))
-        && value.split([':', '/', '.', '-', '_']).any(|segment| {
-            matches!(
-                segment,
-                "app"
-                    | "auth"
-                    | "fixture"
-                    | "filter"
-                    | "items"
-                    | "local"
-                    | "mock"
-                    | "state"
-                    | "storage"
-                    | "todo"
-                    | "wizard"
-            )
-        })
+        && (looks_like_scenario_identifier
+            || value.split([':', '/', '.', '-', '_']).any(|segment| {
+                matches!(
+                    segment,
+                    "app"
+                        | "auth"
+                        | "fixture"
+                        | "filter"
+                        | "items"
+                        | "local"
+                        | "mock"
+                        | "state"
+                        | "storage"
+                        | "todo"
+                        | "wizard"
+                )
+            }))
         && !value.contains("secret")
         && !value.contains("token")
         && !value.contains("password")
+}
+
+fn looks_like_scenario_application_identifier(value: &str) -> bool {
+    let Some((scenario, label)) = value.split_once('.') else {
+        return false;
+    };
+    let Some(digits) = scenario.strip_prefix('s') else {
+        return false;
+    };
+    !digits.is_empty()
+        && digits.chars().all(|ch| ch.is_ascii_digit())
+        && label.len() <= 48
+        && label.chars().all(|ch| ch.is_ascii_alphanumeric())
+        && (label.contains("auth")
+            || label.contains("fixture")
+            || label.contains("mock")
+            || label.contains("session")
+            || label.contains("state")
+            || label.contains("storage"))
 }
 
 fn looks_like_segmented_application_identifier(value: &str) -> bool {
@@ -2055,6 +2104,32 @@ mod tests {
 
         assert!(!outcome.redacted);
         assert_eq!(outcome.redacted_text, source);
+        assert!(!outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code.starts_with("secret_leak.assignment.")));
+    }
+
+    #[test]
+    fn mock_login_fixture_credentials_and_comparisons_are_not_redacted() {
+        let source = "const sessionKey = \"s058.mockSession\";\n\
+                      const credentials = { username: \"demo\", password: \"demo/demo\" };\n\
+                      if (username === \"demo\" && password === \"demo\") {\n\
+                      sessionStorage.setItem(sessionKey, JSON.stringify(credentials));\n\
+                      }";
+        let outcome = redact_text_for_export(
+            source,
+            SafetySourceKind::Workspace,
+            SafetyContentKind::WorkspaceDocument,
+            TrustLabel::TrustedLocal,
+        );
+
+        assert!(!outcome.redacted);
+        assert_eq!(outcome.redacted_text, source);
+        assert!(outcome.redacted_text.contains("demo/demo"));
+        assert!(outcome.redacted_text.contains("password === \"demo\""));
+        assert!(!outcome.redacted_text.contains("[REDACTED_SECRET]"));
         assert!(!outcome
             .scan
             .finding_codes()
