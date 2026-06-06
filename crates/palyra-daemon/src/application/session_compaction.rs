@@ -1192,6 +1192,7 @@ fn extract_explicit_action_item(line: &str) -> Option<String> {
 fn normalize_open_action_item(raw: &str) -> Option<String> {
     let item = strip_list_marker(raw).unwrap_or(raw);
     let item = strip_checkbox_marker(item);
+    let item = strip_memory_action_item_prefix(item);
     let normalized = item.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.chars().filter(|ch| ch.is_alphabetic()).count() < 3 {
         return None;
@@ -1205,6 +1206,33 @@ fn normalize_open_action_item(raw: &str) -> Option<String> {
         return None;
     }
     Some(compaction_prompt_text(redacted.as_str(), SESSION_COMPACTION_ACTION_ITEM_MAX_CHARS))
+}
+
+fn strip_memory_action_item_prefix(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if !trimmed.to_ascii_lowercase().starts_with("action item ")
+        && !starts_with_memory_action_item_ordinal(trimmed)
+    {
+        return trimmed;
+    }
+    trimmed
+        .rfind(": ")
+        .map(|index| trimmed[index + 2..].trim())
+        .filter(|candidate| !candidate.is_empty())
+        .unwrap_or(trimmed)
+}
+
+fn starts_with_memory_action_item_ordinal(raw: &str) -> bool {
+    let digit_end = leading_ascii_digit_end(raw);
+    if digit_end == 0 {
+        return false;
+    }
+    let rest = raw[digit_end..].trim_start();
+    let Some(after_slash) = rest.strip_prefix('/') else {
+        return false;
+    };
+    let denominator_end = leading_ascii_digit_end(after_slash);
+    denominator_end > 0 && after_slash[denominator_end..].trim_start().starts_with('(')
 }
 
 fn looks_like_compaction_status_action_item(normalized: &str) -> bool {
@@ -2318,16 +2346,43 @@ fn truncate_preserving_newlines(raw: &str, max_chars: usize) -> String {
 fn tool_result_json_key_is_noise(key: &str) -> bool {
     matches!(
         key,
-        "artifact"
+        "approval_state"
+            | "artifact"
             | "artifact_id"
+            | "category"
+            | "channel"
             | "checksum"
+            | "claim_boundary"
+            | "confidence"
             | "content_hash"
+            | "cross_session"
             | "digest"
+            | "durable_memory_write"
             | "execution_sha256"
             | "expires_at_unix_ms"
             | "id"
+            | "matched_memory_id"
+            | "memory_id"
+            | "owner_principal"
+            | "principal"
+            | "provenance"
+            | "reason_codes"
+            | "rollback_id"
+            | "scope"
+            | "sensitivity"
+            | "session_id"
             | "sha"
             | "sha256"
+            | "source"
+            | "source_hash"
+            | "source_id"
+            | "source_kind"
+            | "source_refs"
+            | "tags"
+            | "tags_json"
+            | "trust_label"
+            | "visibility"
+            | "write_classification"
     )
 }
 
@@ -2802,6 +2857,106 @@ Source: S078 fixture meeting notes
                 .pointer("/active_task_summary/open_action_items/0")
                 .and_then(serde_json::Value::as_str),
             Some("Jana must finalize the billing migration checklist by 2026-06-12.")
+        );
+    }
+
+    #[test]
+    fn active_task_summary_excludes_memory_tool_metadata_from_action_items() {
+        let notes = "\
+# Meeting Notes - S078
+
+## Open Action Items
+1. Alice must rotate the staging API token by 2026-06-10.
+2. Boris must update the Windows PATH onboarding note before the next installer test.
+3. Carla must verify the browser export archive checksum and post the result in the QA channel.
+";
+        let file_payload = serde_json::json!({
+            "proposal_id": "proposal-s078-read",
+            "success": true,
+            "output_json": {
+                "path": "tasks/meeting-notes.md",
+                "text": notes,
+            },
+            "error": "",
+        })
+        .to_string();
+        let memory_payload = serde_json::json!({
+            "proposal_id": "proposal-s078-memory",
+            "success": true,
+            "output_json": {
+                "status": "retained",
+                "reason": "memory retained in lifecycle store",
+                "write_classification": {
+                    "category": "transient_runtime_fact",
+                    "source_hash": "4c4f1945409cdc9ffdaa859ad3b6910e5ad5da08a64183548de4a697b4fe39c0",
+                    "reason_codes": ["category:transient_runtime_fact", "ttl:bounded"],
+                },
+                "provenance": {
+                    "source": "tool_call",
+                    "memory_write": {
+                        "category": "transient_runtime_fact",
+                        "source_hash": "4c4f1945409cdc9ffdaa859ad3b6910e5ad5da08a64183548de4a697b4fe39c0",
+                    },
+                },
+                "item": {
+                    "content_text": "Action item 1/3 (S078, source: tasks/meeting-notes.md): Alice must rotate the staging API token by 2026-06-10.",
+                    "tags": [
+                        "lifecycle:memory",
+                        "scope:session",
+                        "action-item",
+                        "s078",
+                        "meeting",
+                        "alice",
+                        "memory_write:transient_runtime_fact",
+                        "source_hash:4c4f1945409cdc9f",
+                    ],
+                },
+            },
+            "error": "",
+        })
+        .to_string();
+        let mut transcript = vec![
+            transcript_record(
+                0,
+                "message.received",
+                r#"{"text":"Track open action items from tasks/meeting-notes.md."}"#,
+            ),
+            transcript_record(1, "tool_result", file_payload.as_str()),
+            transcript_record(2, "tool_result", memory_payload.as_str()),
+        ];
+        transcript.extend((3..14).map(|seq| {
+            let payload = format!(r#"{{"text":"Reference filler context {seq} for compaction."}}"#);
+            transcript_record(seq, "message.received", payload.as_str())
+        }));
+
+        let plan = build_session_compaction_plan(
+            &session_record(),
+            transcript.as_slice(),
+            &[],
+            &[],
+            Some("test_compaction"),
+            Some("test_policy"),
+        );
+
+        assert!(plan.eligible);
+        assert_eq!(
+            plan.active_task_summary.open_action_items,
+            vec![
+                "Alice must rotate the staging API token by 2026-06-10.",
+                "Boris must update the Windows PATH onboarding note before the next installer test.",
+                "Carla must verify the browser export archive checksum and post the result in the QA channel.",
+            ]
+        );
+        assert!(
+            plan.active_task_summary.open_action_items.iter().all(|item| {
+                !item.contains("memory_write")
+                    && !item.contains("source_hash")
+                    && !item.eq_ignore_ascii_case("meeting")
+                    && !item.eq_ignore_ascii_case("alice")
+                    && !item.starts_with("Action item 1/3")
+            }),
+            "memory metadata and memory-write echoes must not become action items: {:?}",
+            plan.active_task_summary.open_action_items
         );
     }
 

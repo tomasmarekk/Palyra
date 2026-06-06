@@ -562,6 +562,10 @@ async fn find_lifecycle_duplicate(
                     classification.category,
                     &hit.item,
                 )
+                && lifecycle_near_duplicate_texts_compatible(
+                    request.content_text.as_str(),
+                    hit.item.content_text.as_str(),
+                )
             {
                 return Ok(Some(LifecycleDuplicate {
                     item: hit.item,
@@ -787,6 +791,28 @@ fn lifecycle_near_duplicate_categories_compatible(
     item: &MemoryItemRecord,
 ) -> bool {
     category == lifecycle_item_write_category(item)
+}
+
+fn lifecycle_near_duplicate_texts_compatible(
+    candidate_content: &str,
+    existing_content: &str,
+) -> bool {
+    let candidate_terms =
+        lifecycle_significant_terms(candidate_content).into_iter().collect::<BTreeSet<_>>();
+    let existing_terms =
+        lifecycle_significant_terms(existing_content).into_iter().collect::<BTreeSet<_>>();
+    if candidate_terms.is_empty() || existing_terms.is_empty() {
+        return false;
+    }
+
+    let intersection_count = candidate_terms.intersection(&existing_terms).count();
+    let smaller_count = candidate_terms.len().min(existing_terms.len());
+    let larger_count = candidate_terms.len().max(existing_terms.len());
+    if smaller_count <= 4 {
+        return intersection_count == smaller_count && larger_count <= smaller_count + 2;
+    }
+
+    intersection_count * 100 >= smaller_count * 75 && intersection_count * 100 >= larger_count * 60
 }
 
 fn memory_write_category_from_tags(tags: &[String]) -> Option<MemoryWriteCategory> {
@@ -1725,6 +1751,25 @@ mod tests {
             MemoryWriteCategory::Preference,
             &item
         ));
+    }
+
+    #[test]
+    fn lifecycle_near_duplicate_requires_strong_lexical_overlap() {
+        assert!(
+            lifecycle_near_duplicate_texts_compatible(
+                "Project preference: TypeScript Playwright reports should use concise summaries.",
+                "Preference: use TypeScript Playwright reports with concise summaries.",
+            ),
+            "same preference phrased slightly differently should still merge"
+        );
+
+        assert!(
+            !lifecycle_near_duplicate_texts_compatible(
+                "Action item 1/3 (S078, source: tasks/meeting-notes.md): Alice must rotate the staging API token by 2026-06-10.",
+                "Action item 2/3 (S078, source: tasks/meeting-notes.md): Boris must update the Windows PATH onboarding note before the next installer test.",
+            ),
+            "separate action items with shared source boilerplate must stay distinct"
+        );
     }
 
     #[test]
