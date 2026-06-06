@@ -292,6 +292,7 @@ pub(crate) fn classify_error(error: &anyhow::Error) -> CliExitCode {
         || lower.contains("must be")
         || lower.contains("cannot be")
         || lower.contains("cannot set")
+        || lower.contains("message commands require ")
         || lower.contains("requires")
         || lower.contains("required")
         || lower.contains("missing prompt")
@@ -462,6 +463,12 @@ mod tests {
         assert_eq!(
             classify_error(&anyhow!(
                 "prompt from stdin is empty; pipe text into stdin or use --prompt"
+            )),
+            CliExitCode::Validation
+        );
+        assert_eq!(
+            classify_error(&anyhow!(
+                "message commands require a routable connector id with provider and instance, such as `echo:default`; `echo` is a provider shorthand for channel filters, not a message connector id."
             )),
             CliExitCode::Validation
         );
