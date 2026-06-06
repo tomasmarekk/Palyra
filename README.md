@@ -1,6 +1,6 @@
 This repository is currently in the development phase.
 
-![Banner](https://i.imgur.com/PAdzSUI.png)
+![Banner](https://i.imgur.com/qy02cLe.gif)
 
 ## License
 
