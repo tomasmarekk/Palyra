@@ -54,6 +54,11 @@ message BrowserHealthResponse {
   string status = 2;
   uint64 uptime_seconds = 3;
   uint32 active_sessions = 4;
+  string engine_mode = 13;
+  bool javascript_execution_enabled = 14;
+  bool subresource_loading_enabled = 15;
+  bool dom_interaction_enabled = 16;
+
   reserved 5 to 12;
 }
 

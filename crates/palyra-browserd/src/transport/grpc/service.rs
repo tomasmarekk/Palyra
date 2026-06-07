@@ -287,6 +287,10 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             status: "ok".to_owned(),
             uptime_seconds: self.runtime.started_at.elapsed().as_secs(),
             active_sessions: u32::try_from(active_sessions).unwrap_or(u32::MAX),
+            engine_mode: self.runtime.engine_mode.as_str().to_owned(),
+            javascript_execution_enabled: self.runtime.engine_mode.executes_javascript(),
+            subresource_loading_enabled: self.runtime.engine_mode.loads_subresources(),
+            dom_interaction_enabled: self.runtime.engine_mode.supports_live_dom_interaction(),
         }))
     }
 

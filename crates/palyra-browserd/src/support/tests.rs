@@ -141,6 +141,24 @@ async fn create_test_session_with_private_targets(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn browser_service_health_reports_engine_capabilities() {
+    let runtime = simulated_runtime_for_tests();
+    let service = BrowserServiceImpl { runtime };
+
+    let health = service
+        .health(Request::new(browser_v1::BrowserHealthRequest { v: 1 }))
+        .await
+        .expect("health should execute")
+        .into_inner();
+
+    assert_eq!(health.status, "ok");
+    assert_eq!(health.engine_mode, "simulated");
+    assert!(!health.javascript_execution_enabled);
+    assert!(!health.subresource_loading_enabled);
+    assert!(!health.dom_interaction_enabled);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn browser_service_records_failed_navigation_in_action_log() {
     let runtime = simulated_runtime_for_tests();
     let service = BrowserServiceImpl { runtime };

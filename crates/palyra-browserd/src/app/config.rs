@@ -161,6 +161,25 @@ impl BrowserEngineMode {
             _ => default,
         }
     }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Chromium => "chromium",
+            Self::Simulated => "simulated",
+        }
+    }
+
+    pub(crate) fn executes_javascript(self) -> bool {
+        matches!(self, Self::Chromium)
+    }
+
+    pub(crate) fn loads_subresources(self) -> bool {
+        matches!(self, Self::Chromium)
+    }
+
+    pub(crate) fn supports_live_dom_interaction(self) -> bool {
+        matches!(self, Self::Chromium)
+    }
 }
 
 #[derive(Debug, Clone)]

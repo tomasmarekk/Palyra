@@ -58,6 +58,10 @@ const BROWSER_SESSION_CLOSED_RECOVERY_HINT: &str =
     "browser_session_closed: create a new browser session with palyra.browser.session.create and retry the browser operation with the new session_id";
 const BROWSER_RUNTIME_RECOVERY_HINT: &str =
     "browser_runtime_unavailable: inspect `palyra browser status`; if browserd was restarted, recreate the browser session and retry the browser operation";
+const BROWSER_STATIC_HTML_RUNTIME_WARNING: &str =
+    "simulated_browser_engine_static_html_only: this browserd engine fetches static HTML and does not execute JavaScript, module scripts, app hydration, or subresource-driven UI state; use a Chromium browserd engine before claiming JS UI validation";
+const BROWSER_UNKNOWN_RUNTIME_WARNING: &str =
+    "browser_runtime_capabilities_unknown: browserd did not report JavaScript/subresource capabilities; do not treat title, URL, or fetched HTML alone as JS UI validation";
 const BROWSER_TOOL_INPUT_RECOVERY_HINT: &str =
     "browser_tool_input_error: inspect the error field, fix the browser tool input or session state, and retry";
 const BROWSER_UPLOAD_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
@@ -66,6 +70,67 @@ const BROWSER_DOWNLOAD_TOOL_MAX_BYTES: u64 = 512 * 1024;
 const BROWSER_OBSERVE_MAX_CAPTURE_SELECTORS: usize = 8;
 const BROWSER_OBSERVE_MAX_COMPUTED_STYLE_PROPERTIES: usize = 16;
 const PALYRA_OS_FILE_ROOTS_ENV: &str = "PALYRA_OS_FILE_ROOTS";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserRuntimeCapabilities {
+    source: &'static str,
+    engine_mode: String,
+    javascript_execution: Option<bool>,
+    subresource_loading: Option<bool>,
+    dom_interaction: Option<bool>,
+    warning: Option<&'static str>,
+}
+
+impl BrowserRuntimeCapabilities {
+    fn from_health(response: &browser_v1::BrowserHealthResponse) -> Self {
+        let engine_mode = response.engine_mode.trim().to_ascii_lowercase();
+        match engine_mode.as_str() {
+            "chromium" => Self {
+                source: "browserd.health",
+                engine_mode,
+                javascript_execution: Some(response.javascript_execution_enabled),
+                subresource_loading: Some(response.subresource_loading_enabled),
+                dom_interaction: Some(response.dom_interaction_enabled),
+                warning: None,
+            },
+            "simulated" => Self {
+                source: "browserd.health",
+                engine_mode,
+                javascript_execution: Some(response.javascript_execution_enabled),
+                subresource_loading: Some(response.subresource_loading_enabled),
+                dom_interaction: Some(response.dom_interaction_enabled),
+                warning: Some(BROWSER_STATIC_HTML_RUNTIME_WARNING),
+            },
+            _ => Self::unknown("browserd.health", Some(BROWSER_UNKNOWN_RUNTIME_WARNING)),
+        }
+    }
+
+    fn unavailable() -> Self {
+        Self::unknown("browserd.health.unavailable", Some(BROWSER_UNKNOWN_RUNTIME_WARNING))
+    }
+
+    fn unknown(source: &'static str, warning: Option<&'static str>) -> Self {
+        Self {
+            source,
+            engine_mode: "unknown".to_owned(),
+            javascript_execution: None,
+            subresource_loading: None,
+            dom_interaction: None,
+            warning,
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "source": self.source,
+            "engine_mode": self.engine_mode,
+            "javascript_execution": self.javascript_execution,
+            "subresource_loading": self.subresource_loading,
+            "dom_interaction": self.dom_interaction,
+            "warning": self.warning,
+        })
+    }
+}
 
 fn browser_text_entry_action_name(tool_name: &str) -> &'static str {
     if tool_name == BROWSER_FILL_TOOL_NAME {
@@ -938,6 +1003,11 @@ pub(crate) async fn execute_browser_tool(
                 );
             }
         };
+    let browser_runtime_capabilities = fetch_browser_runtime_capabilities(
+        &mut client,
+        runtime_state.config.browser_service.auth_token.as_deref(),
+    )
+    .await;
 
     let outcome = match tool_name {
         BROWSER_SESSION_CREATE_TOOL_NAME => {
@@ -3726,6 +3796,8 @@ pub(crate) async fn execute_browser_tool(
     };
 
     let (success, mut output_json, mut error) = outcome;
+    output_json =
+        browser_output_with_runtime_capabilities(output_json, &browser_runtime_capabilities);
     if !success && browser_tool_reports_missing_session(output_json.as_slice(), error.as_str()) {
         if let Ok(session_id) = parse_browser_tool_session_id(&payload) {
             runtime_state.record_closed_browser_session(session_id.as_str());
@@ -3788,6 +3860,23 @@ async fn connect_browser_service(
         format!("failed to connect to browser service '{}': {error}", config.endpoint)
     })?;
     Ok(browser_v1::browser_service_client::BrowserServiceClient::new(channel))
+}
+
+async fn fetch_browser_runtime_capabilities(
+    client: &mut browser_v1::browser_service_client::BrowserServiceClient<
+        tonic::transport::Channel,
+    >,
+    auth_token: Option<&str>,
+) -> BrowserRuntimeCapabilities {
+    let mut request =
+        Request::new(browser_v1::BrowserHealthRequest { v: CANONICAL_PROTOCOL_MAJOR });
+    if attach_browser_auth_metadata(&mut request, auth_token).is_err() {
+        return BrowserRuntimeCapabilities::unavailable();
+    }
+    match client.health(request).await {
+        Ok(response) => BrowserRuntimeCapabilities::from_health(&response.into_inner()),
+        Err(_) => BrowserRuntimeCapabilities::unavailable(),
+    }
 }
 
 fn parse_browser_tool_session_id(
@@ -4503,6 +4592,24 @@ fn browser_output_with_recovery_hint(output_json: Vec<u8>, error: &str) -> Vec<u
     serde_json::to_vec(&output).unwrap_or(output_json)
 }
 
+fn browser_output_with_runtime_capabilities(
+    output_json: Vec<u8>,
+    capabilities: &BrowserRuntimeCapabilities,
+) -> Vec<u8> {
+    let mut output = match serde_json::from_slice::<Value>(output_json.as_slice()) {
+        Ok(value) => value,
+        Err(_) => return output_json,
+    };
+    let Some(object) = output.as_object_mut() else {
+        return output_json;
+    };
+    object.insert("browser_runtime".to_owned(), capabilities.to_json());
+    if let Some(warning) = capabilities.warning {
+        object.insert("browser_validation_warning".to_owned(), Value::String(warning.to_owned()));
+    }
+    serde_json::to_vec(&output).unwrap_or(output_json)
+}
+
 fn browser_tool_execution_outcome(
     proposal_id: &str,
     input_json: &[u8],
@@ -4552,16 +4659,16 @@ mod tests {
         attach_browser_caller_principal_metadata, browser_console_entry_to_json,
         browser_element_captures_to_json, browser_file_url_to_path,
         browser_network_log_entry_to_json, browser_observe_include_visible_text,
-        browser_session_closed_error_message, browser_session_closed_output_json,
-        browser_session_persistence_from_payload, browser_session_profile_id_from_payload,
-        browser_tool_execution_outcome, browser_tool_reports_missing_session,
-        browser_tool_requires_open_session, browser_url_targets_loopback,
-        browser_user_owned_os_roots, browser_viewport_metric_mismatch_error,
-        canonical_file_path_is_inside_workspace_roots, normalize_browser_press_key_input,
-        parse_browser_download_artifact_id, parse_browser_observe_string_array,
-        resolve_browser_output_path, resolve_browser_upload_path,
-        validate_browser_workspace_relative_path, BROWSER_CALLER_PRINCIPAL_HEADER,
-        PALYRA_OS_FILE_ROOTS_ENV,
+        browser_output_with_runtime_capabilities, browser_session_closed_error_message,
+        browser_session_closed_output_json, browser_session_persistence_from_payload,
+        browser_session_profile_id_from_payload, browser_tool_execution_outcome,
+        browser_tool_reports_missing_session, browser_tool_requires_open_session,
+        browser_url_targets_loopback, browser_user_owned_os_roots,
+        browser_viewport_metric_mismatch_error, canonical_file_path_is_inside_workspace_roots,
+        normalize_browser_press_key_input, parse_browser_download_artifact_id,
+        parse_browser_observe_string_array, resolve_browser_output_path,
+        resolve_browser_upload_path, validate_browser_workspace_relative_path,
+        BrowserRuntimeCapabilities, BROWSER_CALLER_PRINCIPAL_HEADER, PALYRA_OS_FILE_ROOTS_ENV,
     };
     use crate::application::tool_runtime::workspace_scope::ActiveWorkspaceRoot;
     use crate::gateway::{
@@ -4633,6 +4740,55 @@ mod tests {
         assert_eq!(exported.value["headers"][0]["value"], "<redacted>");
         assert_eq!(exported.value["safety"]["action"], "redact");
         assert!(exported.redacted);
+    }
+
+    #[test]
+    fn browser_runtime_capabilities_mark_simulated_engine_as_static_html_only() {
+        let capabilities =
+            BrowserRuntimeCapabilities::from_health(&browser_v1::BrowserHealthResponse {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                status: "ok".to_owned(),
+                uptime_seconds: 12,
+                active_sessions: 1,
+                engine_mode: "simulated".to_owned(),
+                javascript_execution_enabled: false,
+                subresource_loading_enabled: false,
+                dom_interaction_enabled: false,
+            });
+
+        assert_eq!(capabilities.engine_mode, "simulated");
+        assert_eq!(capabilities.javascript_execution, Some(false));
+        assert_eq!(capabilities.subresource_loading, Some(false));
+        assert_eq!(capabilities.dom_interaction, Some(false));
+        assert!(capabilities.warning.is_some_and(|warning| warning.contains("static_html_only")));
+    }
+
+    #[test]
+    fn browser_output_with_runtime_capabilities_includes_validation_warning() {
+        let capabilities =
+            BrowserRuntimeCapabilities::from_health(&browser_v1::BrowserHealthResponse {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                status: "ok".to_owned(),
+                uptime_seconds: 12,
+                active_sessions: 1,
+                engine_mode: "simulated".to_owned(),
+                javascript_execution_enabled: false,
+                subresource_loading_enabled: false,
+                dom_interaction_enabled: false,
+            });
+        let output = browser_output_with_runtime_capabilities(
+            br#"{"success":true,"title":"S020 Vite Env Demo","status_code":200}"#.to_vec(),
+            &capabilities,
+        );
+        let output: serde_json::Value =
+            serde_json::from_slice(output.as_slice()).expect("output should parse");
+
+        assert_eq!(output["browser_runtime"]["engine_mode"], "simulated");
+        assert_eq!(output["browser_runtime"]["javascript_execution"], false);
+        assert_eq!(output["browser_runtime"]["subresource_loading"], false);
+        assert!(output["browser_validation_warning"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("static_html_only")));
     }
 
     #[test]
