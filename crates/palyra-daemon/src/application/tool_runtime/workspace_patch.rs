@@ -608,6 +608,8 @@ fn resolve_workspace_root_override(
         return Err("palyra.fs.apply_patch agent has no accessible workspace roots".to_owned());
     }
 
+    let normalized_workspace_root = normalize_workspace_root_override_input(workspace_root);
+    let workspace_root = normalized_workspace_root.as_str();
     let requested = Path::new(workspace_root);
     if requested.is_absolute() {
         let root =
@@ -695,6 +697,19 @@ fn workspace_root_override_matching_existing_root_basename(
             root.file_name().is_some_and(|basename| path_component_eq(basename, component))
         })
         .cloned()
+}
+
+fn normalize_workspace_root_override_input(workspace_root: &str) -> String {
+    let normalized = workspace_root.trim().replace('\\', "/");
+    let without_current = normalized.strip_prefix("./").unwrap_or(normalized.as_str());
+    match without_current {
+        "." | "/workspace" | "/workspace/" | "workspace" | "workspace/" => String::new(),
+        _ => without_current
+            .strip_prefix("/workspace/")
+            .or_else(|| without_current.strip_prefix("workspace/"))
+            .unwrap_or(without_current)
+            .to_owned(),
+    }
 }
 
 fn path_component_eq(left: &std::ffi::OsStr, right: &std::ffi::OsStr) -> bool {
@@ -1137,6 +1152,42 @@ mod tests {
 
         assert!(project.join("calc.js").is_file());
         assert!(!workspace.join("calc.js").exists());
+    }
+
+    #[test]
+    fn workspace_root_override_accepts_virtual_workspace_root_alias() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let workspace = tempdir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace directory should exist");
+
+        let roots =
+            resolve_workspace_root_override(std::slice::from_ref(&workspace), "/workspace", false)
+                .expect("/workspace should resolve to the agent workspace root");
+
+        assert_eq!(
+            roots.roots,
+            vec![std::fs::canonicalize(&workspace).expect("workspace should canonicalize")]
+        );
+    }
+
+    #[test]
+    fn workspace_root_override_accepts_virtual_workspace_subdirectory_alias() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let workspace = tempdir.path().join("workspace");
+        let project = workspace.join("project");
+        std::fs::create_dir_all(&project).expect("project directory should exist");
+
+        let roots = resolve_workspace_root_override(
+            std::slice::from_ref(&workspace),
+            "/workspace/project",
+            false,
+        )
+        .expect("/workspace/project should resolve inside the agent workspace root");
+
+        assert_eq!(
+            roots.roots,
+            vec![std::fs::canonicalize(&project).expect("project should canonicalize")]
+        );
     }
 
     #[test]

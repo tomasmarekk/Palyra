@@ -809,7 +809,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                         "workspace_root",
                         json!({
                             "type":"string",
-                            "description":"Optional workspace subdirectory to treat as the patch root. For write calls, a missing relative subdirectory is created inside the active agent workspace root. Omit for the agent workspace root."
+                            "description":"Optional workspace subdirectory to treat as the patch root. Use /workspace for the current agent workspace root, /workspace/path or workspace/path for a subdirectory alias, or a plain relative subdirectory. For write calls, a missing relative subdirectory is created inside the active agent workspace root. Omit for the agent workspace root."
                         }),
                     ),
                     ("dry_run", json!({"type":"boolean"})),
