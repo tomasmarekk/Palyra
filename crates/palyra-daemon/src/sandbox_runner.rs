@@ -377,28 +377,36 @@ pub fn run_constrained_process_with_cancellation(
 
     let host_access = process_runner_allows_host_access(policy);
     let workspace_root = canonical_workspace_root(policy.workspace_root.as_path())?;
-    let working_directory = if host_access {
-        resolve_host_working_directory(workspace_root.as_path(), input.cwd.as_deref())?
+    let host_access_roots = host_access.then(|| host_access_roots_for_input(&input));
+    let working_directory = if let Some(host_access_roots) = host_access_roots.as_ref() {
+        resolve_host_working_directory_with_roots(
+            workspace_root.as_path(),
+            input.cwd.as_deref(),
+            host_access_roots.as_slice(),
+        )?
     } else {
         resolve_working_directory(workspace_root.as_path(), input.cwd.as_deref())?
     };
-    if host_access {
-        validate_host_command_path_scope(
+    if let Some(host_access_roots) = host_access_roots.as_ref() {
+        validate_host_command_path_scope_with_roots(
             workspace_root.as_path(),
             working_directory.as_path(),
             input.command.as_str(),
+            host_access_roots.as_slice(),
         )?;
-        validate_host_interpreter_argument_guardrails(
+        validate_host_interpreter_argument_guardrails_with_roots(
             workspace_root.as_path(),
             working_directory.as_path(),
             input.command.as_str(),
             input.args.as_slice(),
+            host_access_roots.as_slice(),
         )?;
-        validate_host_argument_scope(
+        validate_host_argument_scope_with_roots(
             workspace_root.as_path(),
             working_directory.as_path(),
             input.command.as_str(),
             input.args.as_slice(),
+            host_access_roots.as_slice(),
         )?;
     } else {
         validate_interpreter_argument_guardrails(
@@ -1620,6 +1628,23 @@ fn validate_host_interpreter_argument_guardrails(
     command: &str,
     args: &[String],
 ) -> Result<(), SandboxProcessRunError> {
+    let host_roots = user_owned_host_roots();
+    validate_host_interpreter_argument_guardrails_with_roots(
+        workspace_root,
+        cwd,
+        command,
+        args,
+        host_roots.as_slice(),
+    )
+}
+
+fn validate_host_interpreter_argument_guardrails_with_roots(
+    workspace_root: &Path,
+    cwd: &Path,
+    command: &str,
+    args: &[String],
+    host_roots: &[PathBuf],
+) -> Result<(), SandboxProcessRunError> {
     if !is_interpreter_executable(command.trim()) {
         return Ok(());
     }
@@ -1643,6 +1668,7 @@ fn validate_host_interpreter_argument_guardrails(
             workspace_root,
             cwd,
             argument.as_str(),
+            host_roots,
         )? {
             continue;
         }
@@ -1696,6 +1722,7 @@ fn interpreter_absolute_path_argument_stays_in_host_scope(
     workspace_root: &Path,
     cwd: &Path,
     argument: &str,
+    host_roots: &[PathBuf],
 ) -> Result<bool, SandboxProcessRunError> {
     let trimmed = argument.trim();
     if trimmed.is_empty() {
@@ -1703,22 +1730,40 @@ fn interpreter_absolute_path_argument_stays_in_host_scope(
     }
 
     if let Some(file_url_path) = parse_file_url_path(trimmed)? {
-        return Ok(
-            resolve_host_access_path(workspace_root, cwd, file_url_path.as_str(), false).is_ok()
-        );
+        return Ok(resolve_host_access_path_with_roots(
+            workspace_root,
+            cwd,
+            file_url_path.as_str(),
+            false,
+            host_roots,
+        )
+        .is_ok());
     }
 
     if let Some(value) = option_assignment_value(trimmed) {
-        return interpreter_absolute_path_argument_stays_in_host_scope(workspace_root, cwd, value);
+        return interpreter_absolute_path_argument_stays_in_host_scope(
+            workspace_root,
+            cwd,
+            value,
+            host_roots,
+        );
     }
 
     if let Some(value) = option_compact_value(trimmed) {
-        return interpreter_absolute_path_argument_stays_in_host_scope(workspace_root, cwd, value);
+        return interpreter_absolute_path_argument_stays_in_host_scope(
+            workspace_root,
+            cwd,
+            value,
+            host_roots,
+        );
     }
 
-    if let Some(stays_in_host_scope) =
-        interpreter_path_list_argument_stays_in_host_scope(workspace_root, cwd, trimmed)?
-    {
+    if let Some(stays_in_host_scope) = interpreter_path_list_argument_stays_in_host_scope(
+        workspace_root,
+        cwd,
+        trimmed,
+        host_roots,
+    )? {
         return Ok(stays_in_host_scope);
     }
 
@@ -1726,7 +1771,7 @@ fn interpreter_absolute_path_argument_stays_in_host_scope(
         return Ok(false);
     }
 
-    Ok(resolve_host_access_path(workspace_root, cwd, trimmed, false).is_ok())
+    Ok(resolve_host_access_path_with_roots(workspace_root, cwd, trimmed, false, host_roots).is_ok())
 }
 
 fn interpreter_path_list_argument_stays_in_workspace(
@@ -1765,6 +1810,7 @@ fn interpreter_path_list_argument_stays_in_host_scope(
     workspace_root: &Path,
     cwd: &Path,
     argument: &str,
+    host_roots: &[PathBuf],
 ) -> Result<Option<bool>, SandboxProcessRunError> {
     if argument.contains("://") {
         return Ok(None);
@@ -1781,9 +1827,15 @@ fn interpreter_path_list_argument_stays_in_host_scope(
         }
         saw_absolute_path = true;
         let resolved = if let Some(file_url_path) = parse_file_url_path(component)? {
-            resolve_host_access_path(workspace_root, cwd, file_url_path.as_str(), false)
+            resolve_host_access_path_with_roots(
+                workspace_root,
+                cwd,
+                file_url_path.as_str(),
+                false,
+                host_roots,
+            )
         } else {
-            resolve_host_access_path(workspace_root, cwd, component, false)
+            resolve_host_access_path_with_roots(workspace_root, cwd, component, false, host_roots)
         };
         if resolved.is_err() {
             return Ok(Some(false));
@@ -1892,6 +1944,15 @@ fn resolve_host_working_directory(
     workspace_root: &Path,
     cwd: Option<&str>,
 ) -> Result<PathBuf, SandboxProcessRunError> {
+    let host_roots = user_owned_host_roots();
+    resolve_host_working_directory_with_roots(workspace_root, cwd, host_roots.as_slice())
+}
+
+fn resolve_host_working_directory_with_roots(
+    workspace_root: &Path,
+    cwd: Option<&str>,
+    host_roots: &[PathBuf],
+) -> Result<PathBuf, SandboxProcessRunError> {
     let cwd_value = cwd.unwrap_or(".");
     if cwd_value.contains('\0') {
         return Err(SandboxProcessRunError {
@@ -1899,7 +1960,13 @@ fn resolve_host_working_directory(
             message: "host process runner denied cwd with embedded NUL byte".to_owned(),
         });
     }
-    let resolved = resolve_host_access_path(workspace_root, workspace_root, cwd_value, true)?;
+    let resolved = resolve_host_access_path_with_roots(
+        workspace_root,
+        workspace_root,
+        cwd_value,
+        true,
+        host_roots,
+    )?;
     if !resolved.is_dir() {
         return Err(SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
@@ -1943,6 +2010,23 @@ fn validate_host_argument_scope(
     command: &str,
     args: &[String],
 ) -> Result<(), SandboxProcessRunError> {
+    let host_roots = user_owned_host_roots();
+    validate_host_argument_scope_with_roots(
+        workspace_root,
+        cwd,
+        command,
+        args,
+        host_roots.as_slice(),
+    )
+}
+
+fn validate_host_argument_scope_with_roots(
+    workspace_root: &Path,
+    cwd: &Path,
+    command: &str,
+    args: &[String],
+    host_roots: &[PathBuf],
+) -> Result<(), SandboxProcessRunError> {
     let mut index = 0usize;
     while index < args.len() {
         let arg = &args[index];
@@ -1960,7 +2044,7 @@ fn validate_host_argument_scope(
             index = index.saturating_add(1);
             continue;
         }
-        validate_host_argument_path_scope(workspace_root, cwd, command, arg.as_str())?;
+        validate_host_argument_path_scope(workspace_root, cwd, command, arg.as_str(), host_roots)?;
         index = index.saturating_add(1);
     }
     Ok(())
@@ -1971,10 +2055,21 @@ fn validate_host_command_path_scope(
     cwd: &Path,
     command: &str,
 ) -> Result<(), SandboxProcessRunError> {
+    let host_roots = user_owned_host_roots();
+    validate_host_command_path_scope_with_roots(workspace_root, cwd, command, host_roots.as_slice())
+}
+
+fn validate_host_command_path_scope_with_roots(
+    workspace_root: &Path,
+    cwd: &Path,
+    command: &str,
+    host_roots: &[PathBuf],
+) -> Result<(), SandboxProcessRunError> {
     if !command_has_path_separator(command) {
         return Ok(());
     }
-    let executable = resolve_host_executable_path(workspace_root, cwd, command)?;
+    let executable =
+        resolve_host_executable_path_with_roots(workspace_root, cwd, command, host_roots)?;
     if !executable.is_file() {
         return Err(SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
@@ -1992,21 +2087,34 @@ fn validate_host_argument_path_scope(
     cwd: &Path,
     command: &str,
     arg: &str,
+    host_roots: &[PathBuf],
 ) -> Result<(), SandboxProcessRunError> {
     if let Some(file_url_path) = parse_file_url_path(arg)? {
-        let _ = resolve_host_access_path(workspace_root, cwd, file_url_path.as_str(), false)?;
+        let _ = resolve_host_access_path_with_roots(
+            workspace_root,
+            cwd,
+            file_url_path.as_str(),
+            false,
+            host_roots,
+        )?;
         return Ok(());
     }
     if let Some(value) = option_assignment_value(arg) {
-        return validate_host_argument_path_scope(workspace_root, cwd, command, value.trim());
+        return validate_host_argument_path_scope(
+            workspace_root,
+            cwd,
+            command,
+            value.trim(),
+            host_roots,
+        );
     }
     if let Some(value) = option_compact_value(arg) {
-        return validate_host_argument_path_scope(workspace_root, cwd, command, value);
+        return validate_host_argument_path_scope(workspace_root, cwd, command, value, host_roots);
     }
     if !argument_requires_path_validation(arg) {
         return Ok(());
     }
-    let _ = resolve_host_access_path(workspace_root, cwd, arg, false).map_err(|error| {
+    let _ = resolve_host_access_path_with_roots(workspace_root, cwd, arg, false, host_roots).map_err(|error| {
         SandboxProcessRunError {
             kind: error.kind,
             message: format!(
@@ -2423,6 +2531,23 @@ fn resolve_host_access_path(
     raw: &str,
     must_exist: bool,
 ) -> Result<PathBuf, SandboxProcessRunError> {
+    let host_roots = user_owned_host_roots();
+    resolve_host_access_path_with_roots(
+        workspace_root,
+        base,
+        raw,
+        must_exist,
+        host_roots.as_slice(),
+    )
+}
+
+fn resolve_host_access_path_with_roots(
+    workspace_root: &Path,
+    base: &Path,
+    raw: &str,
+    must_exist: bool,
+    host_roots: &[PathBuf],
+) -> Result<PathBuf, SandboxProcessRunError> {
     if let Some(suffix) = virtual_workspace_path_suffix(raw) {
         return resolve_scoped_path(
             workspace_root,
@@ -2479,7 +2604,7 @@ fn resolve_host_access_path(
         })?
     };
 
-    ensure_host_access_path_allowed(workspace_root, inspected.as_path())?;
+    ensure_host_access_path_allowed(workspace_root, inspected.as_path(), host_roots)?;
     if candidate.exists() {
         Ok(inspected)
     } else {
@@ -2490,6 +2615,7 @@ fn resolve_host_access_path(
 fn ensure_host_access_path_allowed(
     workspace_root: &Path,
     inspected: &Path,
+    host_roots: &[PathBuf],
 ) -> Result<(), SandboxProcessRunError> {
     if protected_host_path(inspected) {
         return Err(SandboxProcessRunError {
@@ -2501,9 +2627,7 @@ fn ensure_host_access_path_allowed(
         });
     }
     if path_starts_with_case_aware(inspected, workspace_root)
-        || user_owned_host_roots()
-            .iter()
-            .any(|root| path_starts_with_case_aware(inspected, root.as_path()))
+        || host_roots.iter().any(|root| path_starts_with_case_aware(inspected, root.as_path()))
     {
         return Ok(());
     }
@@ -2519,11 +2643,10 @@ fn ensure_host_access_path_allowed(
 fn ensure_host_executable_path_allowed(
     workspace_root: &Path,
     inspected: &Path,
+    host_roots: &[PathBuf],
 ) -> Result<(), SandboxProcessRunError> {
     if path_starts_with_case_aware(inspected, workspace_root)
-        || user_owned_host_roots()
-            .iter()
-            .any(|root| path_starts_with_case_aware(inspected, root.as_path()))
+        || host_roots.iter().any(|root| path_starts_with_case_aware(inspected, root.as_path()))
         || windows_program_files_path(inspected)
     {
         return Ok(());
@@ -2550,17 +2673,26 @@ fn windows_program_files_path(path: &Path) -> bool {
     }
 }
 
+fn host_access_roots_for_input(input: &ProcessRunnerInput) -> Vec<PathBuf> {
+    let mut roots = user_owned_host_roots();
+    for key in HOST_ACCESS_SAFE_PALYRA_ENV_KEYS {
+        if let Some(value) = input.env.get(*key).filter(|value| !value.trim().is_empty()) {
+            push_canonical_host_root(&mut roots, PathBuf::from(value));
+        }
+    }
+    roots
+}
+
 fn user_owned_host_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(configured_roots) = configured_user_host_roots() {
         for root in configured_roots {
             push_canonical_host_root(&mut roots, root);
         }
-    } else {
-        for key in ["USERPROFILE", "HOME"] {
-            if let Some(value) = std::env::var_os(key) {
-                push_canonical_host_root(&mut roots, PathBuf::from(value));
-            }
+    }
+    for key in ["USERPROFILE", "HOME"] {
+        if let Some(value) = std::env::var_os(key) {
+            push_canonical_host_root(&mut roots, PathBuf::from(value));
         }
     }
     push_canonical_host_root(&mut roots, std::env::temp_dir());
@@ -2817,6 +2949,16 @@ fn resolve_host_executable_path(
     base: &Path,
     raw: &str,
 ) -> Result<PathBuf, SandboxProcessRunError> {
+    let host_roots = user_owned_host_roots();
+    resolve_host_executable_path_with_roots(workspace_root, base, raw, host_roots.as_slice())
+}
+
+fn resolve_host_executable_path_with_roots(
+    workspace_root: &Path,
+    base: &Path,
+    raw: &str,
+    host_roots: &[PathBuf],
+) -> Result<PathBuf, SandboxProcessRunError> {
     if raw.contains('\0') {
         return Err(SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
@@ -2848,7 +2990,7 @@ fn resolve_host_executable_path(
                 candidate.display()
             ),
         })?;
-    ensure_host_executable_path_allowed(workspace_root, executable.as_path())?;
+    ensure_host_executable_path_allowed(workspace_root, executable.as_path(), host_roots)?;
     Ok(executable)
 }
 
@@ -4610,14 +4752,15 @@ mod tests {
 
     use super::{
         build_process_command, builtin_list_directory_stdout, canonical_workspace_root,
-        collect_requested_egress_hosts, cpu_rlimit_seconds_from_usage_micros, is_host_allowlisted,
-        process_failure_message, process_runner_command_with_args_message,
-        redacted_process_output_preview, redacted_process_output_text,
-        resolve_host_working_directory, resolve_scoped_path, resolve_working_directory,
-        rewrite_arguments_to_scoped_paths, rewrite_host_virtual_workspace_args,
-        run_constrained_process, run_constrained_process_with_cancellation,
-        validate_argument_workspace_scope, validate_cmd_invocation_shape,
-        validate_host_argument_scope, validate_host_interpreter_argument_guardrails,
+        collect_requested_egress_hosts, cpu_rlimit_seconds_from_usage_micros,
+        host_access_roots_for_input, is_host_allowlisted, process_failure_message,
+        process_runner_command_with_args_message, redacted_process_output_preview,
+        redacted_process_output_text, resolve_host_working_directory, resolve_scoped_path,
+        resolve_working_directory, rewrite_arguments_to_scoped_paths,
+        rewrite_host_virtual_workspace_args, run_constrained_process,
+        run_constrained_process_with_cancellation, validate_argument_workspace_scope,
+        validate_cmd_invocation_shape, validate_host_argument_scope,
+        validate_host_argument_scope_with_roots, validate_host_interpreter_argument_guardrails,
         validate_interpreter_argument_guardrails, validate_no_embedded_command_line_arg,
         validate_process_env_overrides, validate_process_termination_scope,
         validate_runtime_egress_enforcement, EgressEnforcementMode, ProcessRunnerInput,
@@ -5609,7 +5752,7 @@ mod tests {
     }
 
     #[test]
-    fn host_access_path_policy_respects_configured_os_file_roots() {
+    fn host_access_path_policy_extends_configured_os_file_roots_with_user_roots() {
         let _guard = PROCESS_ENV_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -5638,7 +5781,7 @@ mod tests {
         let canonical_workspace = canonical_workspace_root(workspace.as_path())
             .expect("workspace root should canonicalize");
         let allowed_target = configured_root.join("Desktop").join("orders.csv");
-        let denied_target = real_profile_root.join("Desktop").join("orders.csv");
+        let implicit_target = real_profile_root.join("Desktop").join("orders.csv");
 
         validate_host_argument_scope(
             canonical_workspace.as_path(),
@@ -5647,22 +5790,51 @@ mod tests {
             &[allowed_target.display().to_string()],
         )
         .expect("configured PALYRA_OS_FILE_ROOTS root should be allowed for host access paths");
-        let error = validate_host_argument_scope(
+        validate_host_argument_scope(
             canonical_workspace.as_path(),
             canonical_workspace.as_path(),
             "pwsh",
-            &[denied_target.display().to_string()],
+            &[implicit_target.display().to_string()],
         )
-        .expect_err(
-            "implicit USERPROFILE root must be suppressed when PALYRA_OS_FILE_ROOTS is set",
-        );
+        .expect("implicit user roots should remain allowed when PALYRA_OS_FILE_ROOTS adds roots");
 
-        assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
-        assert!(error.message.contains("outside approved host roots"), "{}", error.message);
+        let env_root = std::env::current_dir()
+            .expect("current dir should resolve")
+            .join("target")
+            .join(format!(
+                "palyra-safe-env-host-root-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system time should be after unix epoch")
+                    .as_nanos()
+            ));
+        fs::create_dir_all(env_root.as_path()).expect("safe env root should be created");
+        let mut input = ProcessRunnerInput {
+            command: "pwsh".to_owned(),
+            args: Vec::new(),
+            cwd: None,
+            env: Default::default(),
+            requested_egress_hosts: Vec::new(),
+            timeout_ms: None,
+            background: false,
+        };
+        input.env.insert("PALYRA_E2E_OS_ROOT".to_owned(), env_root.to_string_lossy().into_owned());
+        let host_roots = host_access_roots_for_input(&input);
+        let env_target = env_root.join("provider.toml");
+        validate_host_argument_scope_with_roots(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            "pwsh",
+            &[env_target.display().to_string()],
+            host_roots.as_slice(),
+        )
+        .expect("safe launch-context path env roots should be allowed for process args");
 
         let _ = fs::remove_dir_all(workspace.as_path());
         let _ = fs::remove_dir_all(configured_root.as_path());
         let _ = fs::remove_dir_all(real_profile_root.as_path());
+        let _ = fs::remove_dir_all(env_root.as_path());
     }
 
     #[test]
