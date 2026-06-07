@@ -1637,6 +1637,7 @@ fn validate_interpreter_argument_guardrails(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_host_interpreter_argument_guardrails(
     workspace_root: &Path,
     cwd: &Path,
@@ -1955,6 +1956,7 @@ fn canonical_workspace_root(root: &Path) -> Result<PathBuf, SandboxProcessRunErr
     Ok(canonical)
 }
 
+#[cfg(test)]
 fn resolve_host_working_directory(
     workspace_root: &Path,
     cwd: Option<&str>,
@@ -2019,6 +2021,7 @@ fn validate_argument_workspace_scope(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_host_argument_scope(
     workspace_root: &Path,
     cwd: &Path,
@@ -2065,6 +2068,7 @@ fn validate_host_argument_scope_with_roots(
     Ok(())
 }
 
+#[cfg(all(test, windows))]
 fn validate_host_command_path_scope(
     workspace_root: &Path,
     cwd: &Path,
@@ -2588,22 +2592,6 @@ fn resolve_scoped_path(
     }
 }
 
-fn resolve_host_access_path(
-    workspace_root: &Path,
-    base: &Path,
-    raw: &str,
-    must_exist: bool,
-) -> Result<PathBuf, SandboxProcessRunError> {
-    let host_roots = user_owned_host_roots();
-    resolve_host_access_path_with_roots(
-        workspace_root,
-        base,
-        raw,
-        must_exist,
-        host_roots.as_slice(),
-    )
-}
-
 fn resolve_host_access_path_with_roots(
     workspace_root: &Path,
     base: &Path,
@@ -3005,15 +2993,6 @@ fn collect_hosts_from_token(
         push_normalized_host(hosts, host)?;
     }
     Ok(())
-}
-
-fn resolve_host_executable_path(
-    workspace_root: &Path,
-    base: &Path,
-    raw: &str,
-) -> Result<PathBuf, SandboxProcessRunError> {
-    let host_roots = user_owned_host_roots();
-    resolve_host_executable_path_with_roots(workspace_root, base, raw, host_roots.as_slice())
 }
 
 fn resolve_host_executable_path_with_roots(
