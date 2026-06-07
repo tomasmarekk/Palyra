@@ -508,7 +508,7 @@ fn normalize_workspace_patch_header_path(
     }
     workspace_roots
         .iter()
-        .find_map(|root| strip_duplicate_workspace_root_basename(trimmed, root.as_path()))
+        .find_map(|root| strip_duplicate_workspace_root_prefix(trimmed, root.as_path()))
 }
 
 fn canonicalize_existing_header_path(path: &Path) -> Option<PathBuf> {
@@ -547,27 +547,55 @@ fn absolute_workspace_path_relative_to_root(path: &Path, root: &Path) -> Option<
     }
 }
 
-fn strip_duplicate_workspace_root_basename(path: &str, root: &Path) -> Option<String> {
+fn strip_duplicate_workspace_root_prefix(path: &str, root: &Path) -> Option<String> {
     if path.is_empty() || Path::new(path).is_absolute() {
         return None;
     }
-    let root_basename = root.file_name()?;
-    let mut components = Path::new(path).components();
-    let Some(Component::Normal(first)) = components.next() else {
-        return None;
-    };
-    if !path_component_eq(root_basename, first) {
-        return None;
-    }
-    let mut stripped = Vec::new();
-    for component in components {
-        match component {
-            Component::Normal(value) => stripped.push(value.to_string_lossy().into_owned()),
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+    let path_components = normalized_normal_components(Path::new(path))?;
+    let root_components = normalized_normal_components(root)?;
+    let max_prefix_len = path_components.len().min(root_components.len());
+    for prefix_len in (1..=max_prefix_len).rev() {
+        if path_components.len() <= prefix_len {
+            continue;
+        }
+        let root_suffix = &root_components[root_components.len() - prefix_len..];
+        let path_prefix = &path_components[..prefix_len];
+        if root_suffix
+            .iter()
+            .zip(path_prefix.iter())
+            .all(|(left, right)| path_segment_eq(left, right))
+        {
+            return Some(path_components[prefix_len..].join("/"));
         }
     }
-    Some(stripped.join("/"))
+    None
+}
+
+fn normalized_normal_components(path: &Path) -> Option<Vec<String>> {
+    let mut normalized = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(value) => normalized.push(value.to_string_lossy().into_owned()),
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+            Component::ParentDir => return None,
+        }
+    }
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn path_segment_eq(left: &str, right: &str) -> bool {
+    #[cfg(windows)]
+    {
+        left.eq_ignore_ascii_case(right)
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
 }
 
 fn path_stays_inside_workspace_root_lexical(path: &Path, root: &Path) -> bool {
@@ -1381,6 +1409,50 @@ mod tests {
 
         assert!(normalized.contains("*** Add File: feature_flag.test.ts"));
         assert!(!normalized.contains("S036_session_recall/feature_flag.test.ts"));
+    }
+
+    #[test]
+    fn workspace_patch_header_paths_strip_duplicate_active_root_tail_prefix() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let active_root = tempdir
+            .path()
+            .join("workspace")
+            .join("scenario-runs")
+            .join("S037_context_rules_project");
+        std::fs::create_dir_all(active_root.as_path()).expect("active root should exist");
+        let patch = concat!(
+            "*** Begin Patch\n",
+            "*** Add File: scenario-runs/S037_context_rules_project/src/slug.ts\n",
+            "+export const slug = 'ok';\n",
+            "*** Add File: scenario-runs/S037_context_rules_project/reports/S037-result.md\n",
+            "+done\n",
+            "*** End Patch\n",
+        );
+
+        let normalized = normalize_workspace_patch_header_paths(patch, &[active_root]);
+
+        assert!(normalized.contains("*** Add File: src/slug.ts"));
+        assert!(normalized.contains("*** Add File: reports/S037-result.md"));
+        assert!(!normalized.contains("scenario-runs/S037_context_rules_project/src/slug.ts"));
+        assert!(!normalized.contains("scenario-runs/S037_context_rules_project/reports"));
+    }
+
+    #[test]
+    fn workspace_patch_header_paths_keep_top_level_prefix_for_workspace_root() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let workspace = tempdir.path().join("workspace");
+        std::fs::create_dir_all(workspace.as_path()).expect("workspace should exist");
+        let patch = concat!(
+            "*** Begin Patch\n",
+            "*** Add File: scenario-runs/S037_context_rules_project/src/slug.ts\n",
+            "+export const slug = 'ok';\n",
+            "*** End Patch\n",
+        );
+
+        let normalized = normalize_workspace_patch_header_paths(patch, &[workspace]);
+
+        assert!(normalized
+            .contains("*** Add File: scenario-runs/S037_context_rules_project/src/slug.ts"));
     }
 
     #[test]
