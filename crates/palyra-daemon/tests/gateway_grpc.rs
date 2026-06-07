@@ -9678,7 +9678,10 @@ async fn grpc_run_stream_admin_cancel_preempts_inflight_tool_execution() -> Resu
         let Ok(payload) = serde_json::from_str::<Value>(payload_json) else {
             return false;
         };
-        payload.get("kind").and_then(Value::as_str) == Some("failed")
+        payload.get("kind").and_then(Value::as_str) == Some("cancelled")
+            && payload.get("wire_kind").and_then(Value::as_str) == Some("failed")
+            && payload.get("lifecycle_state").and_then(Value::as_str) == Some("cancelled")
+            && payload.get("reason_code").and_then(Value::as_str) == Some("cancelled_by_request")
             && payload
                 .get("message")
                 .and_then(Value::as_str)
