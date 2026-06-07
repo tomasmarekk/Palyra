@@ -5283,6 +5283,73 @@ async fn memory_recall_tool_defaults_to_current_session_scope() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn memory_session_search_tool_returns_session_fallback_when_windows_are_empty() {
+    let state = build_test_runtime_state(false);
+    let context = routines_tool_test_context();
+    ensure_tool_context_session(&state, &context);
+    let prior_session_id = "01ARZ3NDEKTSV4RRFFQ69G5FF1";
+
+    state
+        .journal_store
+        .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
+            session_id: prior_session_id.to_owned(),
+            session_key: "scenario-S036-session-A-20260606".to_owned(),
+            session_label: Some("Session A transient PALYRA_E2E_BETA handoff".to_owned()),
+            principal: context.principal.to_owned(),
+            device_id: context.device_id.to_owned(),
+            channel: context.channel.map(str::to_owned),
+        })
+        .expect("prior session should persist");
+
+    let outcome = super::execute_tool_with_runtime_dispatch(
+        &state,
+        context,
+        "01ARZ3NDEKTSV4RRFFQ69G5FF2",
+        "palyra.memory.session_search",
+        br#"{"query":"PALYRA_E2E_BETA","top_k":4,"window_before":0,"window_after":0}"#,
+        None,
+    )
+    .await;
+
+    assert!(outcome.success, "session search should succeed: {}", outcome.error);
+    let payload = parse_tool_output_json(&outcome);
+    assert_eq!(
+        payload.get("window_count").and_then(Value::as_u64),
+        Some(0),
+        "fixture should exercise session fallback without transcript windows: {payload}"
+    );
+    assert_eq!(
+        payload.get("session_hit_count").and_then(Value::as_u64),
+        Some(1),
+        "session fallback should surface the prior CLI-visible session: {payload}"
+    );
+    assert_eq!(
+        payload.pointer("/session_fallback/used").and_then(Value::as_bool),
+        Some(true),
+        "fallback diagnostics should describe why session metadata evidence was used: {payload}"
+    );
+    let session_hits = payload
+        .get("session_hits")
+        .and_then(Value::as_array)
+        .expect("session fallback hits should be present");
+    assert_eq!(session_hits[0].get("session_id").and_then(Value::as_str), Some(prior_session_id));
+    assert!(
+        session_hits[0]
+            .get("match_snippet")
+            .and_then(Value::as_str)
+            .is_some_and(|snippet| snippet.contains("PALYRA_E2E_BETA")),
+        "fallback session hit should carry the matched snippet: {payload}"
+    );
+    assert!(
+        payload
+            .get("claim_boundary")
+            .and_then(Value::as_str)
+            .is_some_and(|boundary| boundary.contains("session recall")),
+        "claim boundary should allow evidence-backed session recall without durable memory: {payload}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn memory_search_tool_defaults_to_all_durable_scopes() {
     let state = build_test_runtime_state(false);
     let context = routines_tool_test_context();

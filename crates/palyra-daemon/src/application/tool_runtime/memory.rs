@@ -26,14 +26,16 @@ use crate::{
     },
     domain::workspace::{normalize_workspace_path, normalize_workspace_prefix},
     gateway::{
-        current_unix_ms, GatewayRuntimeState, MemoryRuntimeConfig, ToolRuntimeExecutionContext,
-        MAX_MEMORY_SEARCH_TOP_K, MAX_MEMORY_TOOL_QUERY_BYTES, MAX_MEMORY_TOOL_TAGS,
+        current_unix_ms, GatewayRuntimeState, ListOrchestratorSessionsRequest, MemoryRuntimeConfig,
+        ToolRuntimeExecutionContext, MAX_MEMORY_SEARCH_TOP_K, MAX_MEMORY_TOOL_QUERY_BYTES,
+        MAX_MEMORY_TOOL_TAGS,
     },
     journal::{
         MemoryItemLifecycleUpdateRequest, MemoryItemRecord, MemoryMaintenanceStatus,
-        MemorySearchHit, MemorySearchRequest, MemorySource, SessionSearchOutcome,
-        SessionSearchRequest, WorkspaceDocumentDeleteRequest, WorkspaceDocumentRecord,
-        WorkspaceDocumentWriteRequest, WorkspaceSearchHit, WorkspaceSearchRequest,
+        MemorySearchHit, MemorySearchRequest, MemorySource, OrchestratorSessionRecord,
+        SessionSearchOutcome, SessionSearchRequest, WorkspaceDocumentDeleteRequest,
+        WorkspaceDocumentRecord, WorkspaceDocumentWriteRequest, WorkspaceSearchHit,
+        WorkspaceSearchRequest,
     },
     tool_protocol::{ToolAttestation, ToolExecutionOutcome},
     transport::grpc::auth::RequestContext,
@@ -54,7 +56,7 @@ const COMBINED_MEMORY_HITS_ABSENT_CLAIM_BOUNDARY: &str =
     "no durable lifecycle or workspace memory hits were returned";
 const DEFAULT_MEMORY_RETAIN_SCOPE: &str = "principal";
 const DEFAULT_MEMORY_SEARCH_SCOPE: &str = "all";
-const SESSION_SEARCH_HITS_PRESENT_CLAIM_BOUNDARY: &str = "session transcript hits are retrieved evidence from prior conversations; cite them as session recall, not durable memory";
+const SESSION_SEARCH_HITS_PRESENT_CLAIM_BOUNDARY: &str = "session transcript or session-level hits are retrieved evidence from prior conversations; cite them as session recall, not durable memory";
 const SESSION_SEARCH_HITS_ABSENT_CLAIM_BOUNDARY: &str =
     "no session transcript hits were returned; do not substitute unrelated durable memory or workspace artifacts for prior-session evidence";
 const MEMORY_STATUS_CLAIM_BOUNDARY: &str = "memory status is usage and retention diagnostics; do not infer memory capacity from search hit_count, and treat no_hard_capacity_configured as no entries/bytes hard limit";
@@ -213,17 +215,23 @@ pub(crate) fn memory_recall_tool_output_payload(preview: &RecallPreviewEnvelope)
     })
 }
 
-pub(crate) fn memory_session_search_tool_output_payload(outcome: &SessionSearchOutcome) -> Value {
+pub(crate) fn memory_session_search_tool_output_payload(
+    outcome: &SessionSearchOutcome,
+    session_hits: &[OrchestratorSessionRecord],
+) -> Value {
     let window_count = outcome.groups.iter().map(|group| group.windows.len()).sum::<usize>();
+    let evidence_count = window_count.saturating_add(session_hits.len());
     json!({
         "query": outcome.query,
         "group_count": outcome.groups.len(),
         "window_count": window_count,
-        "claim_boundary": if window_count == 0 {
+        "session_hit_count": session_hits.len(),
+        "claim_boundary": if evidence_count == 0 {
             SESSION_SEARCH_HITS_ABSENT_CLAIM_BOUNDARY
         } else {
             SESSION_SEARCH_HITS_PRESENT_CLAIM_BOUNDARY
         },
+        "session_hits": session_hits.iter().map(session_search_session_hit_payload).collect::<Vec<_>>(),
         "groups": outcome.groups.iter().map(|group| {
             json!({
                 "session": {
@@ -241,6 +249,36 @@ pub(crate) fn memory_session_search_tool_output_payload(outcome: &SessionSearchO
             })
         }).collect::<Vec<_>>(),
         "diagnostics": outcome.diagnostics,
+        "session_fallback": {
+            "source_kind": "session",
+            "candidate_count": session_hits.len(),
+            "used": window_count == 0 && !session_hits.is_empty(),
+            "reason": if window_count == 0 && !session_hits.is_empty() {
+                Some("bounded_session_windows_empty_but_session_metadata_matched")
+            } else {
+                None
+            },
+        },
+    })
+}
+
+fn session_search_session_hit_payload(session: &OrchestratorSessionRecord) -> Value {
+    json!({
+        "source_type": "session",
+        "session_id": session.session_id.as_str(),
+        "session_key": session.session_key.as_str(),
+        "title": session.title.as_str(),
+        "preview": session.preview.as_deref(),
+        "last_intent": session.last_intent.as_deref(),
+        "last_summary": session.last_summary.as_deref(),
+        "match_snippet": session.match_snippet.as_deref(),
+        "last_run_state": session.last_run_state.as_deref(),
+        "updated_at_unix_ms": session.updated_at_unix_ms,
+        "lineage": {
+            "branch_state": session.branch_state.as_str(),
+            "parent_session_id": session.parent_session_id.as_deref(),
+            "branch_origin_run_id": session.branch_origin_run_id.as_deref(),
+        },
     })
 }
 
@@ -2472,11 +2510,12 @@ pub(crate) async fn execute_memory_session_search_tool(
     };
     let include_current_session =
         parsed.get("include_current_session").and_then(Value::as_bool).unwrap_or(false);
+    let include_archived = parsed.get("include_archived").and_then(Value::as_bool).unwrap_or(false);
 
     let request = SessionSearchRequest {
         principal: context.principal.to_owned(),
         device_id: context.device_id.to_owned(),
-        channel,
+        channel: channel.clone(),
         session_id: None,
         exclude_session_id: if include_current_session {
             None
@@ -2489,7 +2528,7 @@ pub(crate) async fn execute_memory_session_search_tool(
         window_before,
         window_after,
         max_windows_per_session,
-        include_archived: parsed.get("include_archived").and_then(Value::as_bool).unwrap_or(false),
+        include_archived,
     };
 
     let outcome = match runtime_state.search_orchestrator_session_windows(request).await {
@@ -2505,7 +2544,40 @@ pub(crate) async fn execute_memory_session_search_tool(
             );
         }
     };
-    let payload = memory_session_search_tool_output_payload(&outcome);
+    let session_fallback_limit =
+        if include_current_session { top_k } else { top_k.saturating_add(1) };
+    let mut session_hits = match runtime_state
+        .list_orchestrator_sessions(ListOrchestratorSessionsRequest {
+            after_session_key: None,
+            principal: context.principal.to_owned(),
+            device_id: context.device_id.to_owned(),
+            channel,
+            include_archived,
+            requested_limit: Some(session_fallback_limit),
+            search_query: Some(outcome.query.clone()),
+        })
+        .await
+    {
+        Ok((sessions, _next_after_session_key)) => sessions
+            .into_iter()
+            .filter(|session| include_current_session || session.session_id != context.session_id)
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            return memory_tool_execution_outcome(
+                attestation_namespace,
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                format!(
+                    "palyra.memory.session_search session fallback failed: {}",
+                    error.message()
+                ),
+            );
+        }
+    };
+    session_hits.truncate(top_k);
+    let payload = memory_session_search_tool_output_payload(&outcome, session_hits.as_slice());
     match serde_json::to_vec(&payload) {
         Ok(output_json) => memory_tool_execution_outcome(
             attestation_namespace,
