@@ -3337,6 +3337,65 @@ async fn browser_service_reset_state_clears_cookie_jar_for_fixture_domain() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn browser_service_reset_state_clears_network_log_baseline() {
+    let runtime = simulated_runtime_for_tests();
+    let service = BrowserServiceImpl { runtime: Arc::clone(&runtime) };
+    let created = create_test_session(&service, "user:ops").await;
+    let session_id = created.session_id.expect("session id should be present");
+
+    {
+        let mut sessions = runtime.sessions.lock().await;
+        let session =
+            sessions.get_mut(session_id.ulid.as_str()).expect("session should exist for seeding");
+        let active_tab =
+            session.active_tab_mut().expect("session should retain an active tab for seeding");
+        active_tab.network_log.push_back(NetworkLogEntryInternal {
+            request_url: "https://example.com/api/stale".to_owned(),
+            status_code: 200,
+            timing_bucket: "lt_100ms".to_owned(),
+            latency_ms: 12,
+            captured_at_unix_ms: 1,
+            headers: Vec::new(),
+        });
+    }
+
+    let reset = service
+        .reset_state(Request::new(browser_v1::ResetStateRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            clear_cookies: false,
+            clear_storage: false,
+            reset_tabs: false,
+            reset_permissions: false,
+        }))
+        .await
+        .expect("reset_state should execute")
+        .into_inner();
+    assert!(reset.success, "reset_state should succeed");
+
+    let mut network_request = Request::new(browser_v1::NetworkLogRequest {
+        v: 1,
+        session_id: Some(session_id),
+        limit: 10,
+        include_headers: false,
+        max_payload_bytes: 8 * 1024,
+    });
+    insert_principal(&mut network_request, "user:ops");
+    let network_log = service
+        .network_log(network_request)
+        .await
+        .expect("network_log should execute")
+        .into_inner();
+
+    assert!(network_log.success, "network_log should succeed");
+    assert!(
+        network_log.entries.is_empty(),
+        "reset_state should clear stale network evidence: {:?}",
+        network_log.entries
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn browser_service_permissions_default_to_deny() {
     let runtime = std::sync::Arc::new(
         BrowserRuntimeState::new(&Args {
@@ -4229,7 +4288,7 @@ fn apply_snapshot_clamps_cookie_and_storage_state() {
 }
 
 #[test]
-fn apply_snapshot_clamps_network_log_and_preserves_missing_tab_append() {
+fn apply_snapshot_drops_network_log_and_preserves_missing_tab_append() {
     let mut session = test_session_record();
     session.budget.max_network_log_entries = 4;
     let first_tab_id = ulid::Ulid::new().to_string();
@@ -4298,13 +4357,9 @@ fn apply_snapshot_clamps_network_log_and_preserves_missing_tab_append() {
     let restored_first_tab =
         session.tabs.get(first_tab_id.as_str()).expect("first tab should be restored");
     assert_eq!(
-        restored_first_tab
-            .network_log
-            .iter()
-            .map(|entry| entry.request_url.as_str())
-            .collect::<Vec<_>>(),
-        vec![retained_entry.request_url.as_str(), newest_entry.request_url.as_str(),],
-        "snapshot restore should trim oldest network log entries first"
+        restored_first_tab.network_log.len(),
+        0,
+        "restored browser sessions should not replay historical network logs"
     );
     assert_eq!(
         session.tab_order,

@@ -113,6 +113,9 @@ pub(crate) fn persist_session_snapshot(
             tabs.push(tab.clone());
         }
     }
+    for tab in &mut tabs {
+        tab.network_log.clear();
+    }
     let state_revision = next_profile_state_revision(store, session.profile_id.as_deref())?;
     let snapshot = PersistedSessionSnapshot {
         v: CANONICAL_PROTOCOL_MAJOR,

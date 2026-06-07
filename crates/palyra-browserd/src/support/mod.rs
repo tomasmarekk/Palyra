@@ -45,24 +45,6 @@ pub(crate) fn replace_network_log_entries_for_navigation(
     append_network_log_entries(tab, entries, max_entries, max_bytes);
 }
 
-pub(crate) fn clamp_network_log_entries<I>(
-    entries: I,
-    max_entries: usize,
-    max_bytes: u64,
-) -> VecDeque<NetworkLogEntryInternal>
-where
-    I: IntoIterator<Item = NetworkLogEntryInternal>,
-{
-    let mut network_log = VecDeque::new();
-    let mut total_bytes = 0usize;
-    for entry in entries.into_iter().take(max_entries) {
-        total_bytes = total_bytes.saturating_add(estimate_network_log_entry_internal_bytes(&entry));
-        network_log.push_back(entry);
-    }
-    trim_network_log_to_budget(&mut network_log, &mut total_bytes, max_entries, max_bytes as usize);
-    network_log
-}
-
 fn trim_network_log_to_budget(
     network_log: &mut VecDeque<NetworkLogEntryInternal>,
     total_bytes: &mut usize,

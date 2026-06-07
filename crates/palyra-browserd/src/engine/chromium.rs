@@ -584,6 +584,16 @@ const CHROMIUM_DRAIN_NETWORK_LOG_SCRIPT: &str = r#"
 })()
 "#;
 
+const CHROMIUM_CLEAR_NETWORK_LOG_SCRIPT: &str = r#"
+(() => {
+  const state = window.__palyraDiagnostics;
+  if (state && Array.isArray(state.network_entries)) {
+    state.network_entries.length = 0;
+  }
+  return true;
+})()
+"#;
+
 const CHROMIUM_DRAIN_CLIENT_DOWNLOADS_SCRIPT: &str = r#"
 (async () => {
   const state = window.__palyraDiagnostics;
@@ -2128,6 +2138,51 @@ pub(crate) async fn chromium_drain_pending_network_log(
         .lock()
         .map_err(|_| "failed to inspect Chromium network log state".to_owned())?;
     Ok(guard.drain(..).collect())
+}
+
+pub(crate) async fn chromium_clear_network_diagnostics(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+) -> Result<(), String> {
+    let (tabs, network_logs) = {
+        let chromium_sessions = runtime.chromium_sessions.lock().await;
+        let Some(chromium_session) = chromium_sessions.get(session_id) else {
+            return Err("chromium_session_not_found".to_owned());
+        };
+        (
+            chromium_session
+                .tabs
+                .iter()
+                .map(|(tab_id, tab)| (tab_id.clone(), Arc::clone(tab)))
+                .collect::<Vec<_>>(),
+            chromium_session.network_logs.values().cloned().collect::<Vec<_>>(),
+        )
+    };
+
+    for network_log in network_logs {
+        let mut guard = network_log
+            .lock()
+            .map_err(|_| "failed to clear Chromium network log state".to_owned())?;
+        guard.clear();
+    }
+    for (tab_id, tab) in tabs {
+        if let Err(error) = run_chromium_blocking("chromium clear page network log", move || {
+            tab.evaluate(CHROMIUM_CLEAR_NETWORK_LOG_SCRIPT, false).map(|_| ()).map_err(|error| {
+                format!("failed to clear Chromium page network diagnostics: {error}")
+            })
+        })
+        .await
+        {
+            warn!(
+                session_id,
+                tab_id = tab_id.as_str(),
+                error = error.as_str(),
+                "failed to clear Chromium page network diagnostics"
+            );
+        }
+    }
+
+    Ok(())
 }
 
 async fn chromium_drain_response_downloads(
@@ -4545,10 +4600,10 @@ mod tests {
         parse_chromium_viewport_metrics, parse_key_press_spec,
         selector_not_found_error_from_cached_snapshot, ChromiumLayoutMetrics,
         ChromiumObserveSnapshot, CHROMIUM_CLEAR_ACTIVE_ORIGIN_STORAGE_SCRIPT,
-        CHROMIUM_DRAIN_NETWORK_LOG_SCRIPT, CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT,
-        CHROMIUM_READ_CONSOLE_LOG_SCRIPT, MAX_CHROMIUM_CONSOLE_JSON_BYTES,
-        MAX_CHROMIUM_DOCUMENT_COOKIE_JSON_BYTES, MAX_CHROMIUM_LOCAL_STORAGE_JSON_BYTES,
-        MAX_CHROMIUM_NETWORK_JSON_BYTES,
+        CHROMIUM_CLEAR_NETWORK_LOG_SCRIPT, CHROMIUM_DRAIN_NETWORK_LOG_SCRIPT,
+        CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT, CHROMIUM_READ_CONSOLE_LOG_SCRIPT,
+        MAX_CHROMIUM_CONSOLE_JSON_BYTES, MAX_CHROMIUM_DOCUMENT_COOKIE_JSON_BYTES,
+        MAX_CHROMIUM_LOCAL_STORAGE_JSON_BYTES, MAX_CHROMIUM_NETWORK_JSON_BYTES,
     };
     use crate::{
         DEFAULT_SESSION_IDLE_TTL_MS, MAX_CONSOLE_MESSAGE_BYTES, MAX_CONSOLE_SOURCE_BYTES,
@@ -4858,6 +4913,11 @@ mod tests {
         assert!(
             CHROMIUM_DRAIN_NETWORK_LOG_SCRIPT.contains("MAX_NETWORK_JSON_CHARS"),
             "network diagnostics reads should enforce a page-side aggregate JSON budget"
+        );
+        assert!(
+            CHROMIUM_CLEAR_NETWORK_LOG_SCRIPT.contains("network_entries")
+                && CHROMIUM_CLEAR_NETWORK_LOG_SCRIPT.contains("length = 0"),
+            "network reset should clear page-side diagnostics without exporting old entries"
         );
         assert!(
             CHROMIUM_READ_CONSOLE_LOG_SCRIPT.contains("clampScalar")

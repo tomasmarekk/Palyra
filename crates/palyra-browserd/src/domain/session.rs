@@ -353,15 +353,17 @@ impl BrowserSessionRecord {
         Ok((tab_id.to_owned(), switched_to))
     }
 
+    pub(crate) fn clear_network_logs(&mut self) {
+        for tab in self.tabs.values_mut() {
+            tab.network_log.clear();
+        }
+    }
+
     pub(crate) fn apply_snapshot(&mut self, snapshot: PersistedSessionSnapshot) {
         let mut tabs = HashMap::new();
         for mut tab in snapshot.tabs.into_iter().take(self.budget.max_tabs_per_session) {
             if validate_canonical_id(tab.tab_id.as_str()).is_ok() {
-                tab.network_log = clamp_network_log_entries(
-                    tab.network_log,
-                    self.budget.max_network_log_entries,
-                    self.budget.max_network_log_bytes,
-                );
+                tab.network_log.clear();
                 tab.console_log = clamp_console_log_entries(
                     tab.console_log,
                     DEFAULT_MAX_CONSOLE_LOG_ENTRIES,

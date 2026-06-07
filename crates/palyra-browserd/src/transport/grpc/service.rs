@@ -3393,6 +3393,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             if payload.reset_permissions {
                 session.permissions = SessionPermissionsInternal::default();
             }
+            session.clear_network_logs();
             if session.persistence.enabled {
                 session_for_persist = Some(session.clone());
             }
@@ -3419,6 +3420,17 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                     response.error =
                         format!("failed to clear active Chromium origin storage: {error}");
                 }
+            }
+        }
+        if matches!(self.runtime.engine_mode, BrowserEngineMode::Chromium) {
+            if let Err(error) =
+                chromium_clear_network_diagnostics(self.runtime.as_ref(), session_id.as_str()).await
+            {
+                warn!(
+                    session_id = session_id.as_str(),
+                    error = error.as_str(),
+                    "failed to clear Chromium network diagnostics during reset_state"
+                );
             }
         }
         persist_session_after_mutation(self.runtime.as_ref(), session_for_persist, "reset_state")
