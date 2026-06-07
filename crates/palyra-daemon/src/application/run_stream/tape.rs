@@ -16,7 +16,7 @@ use crate::{
     },
     gateway::{
         approval_prompt_message, approval_scope_to_proto, status_kind_name, GatewayRuntimeState,
-        MAX_MODEL_TOKEN_TAPE_EVENTS_PER_RUN,
+        CANCELLED_REASON, MAX_MODEL_TOKEN_TAPE_EVENTS_PER_RUN,
     },
     journal::{ApprovalDecisionScope, ApprovalPromptRecord, OrchestratorTapeAppendRequest},
     transport::grpc::{auth::RequestContext, proto::palyra::common::v1 as common_v1},
@@ -961,6 +961,17 @@ pub(crate) async fn send_tool_attestation_with_tape(
 }
 
 fn status_tape_payload(kind: common_v1::stream_status::StatusKind, message: &str) -> String {
+    if kind == common_v1::stream_status::StatusKind::Failed && message == CANCELLED_REASON {
+        return json!({
+            "kind": "cancelled",
+            "wire_kind": status_kind_name(kind),
+            "message": message,
+            "lifecycle_state": "cancelled",
+            "reason_code": "cancelled_by_request",
+            "controlled": true,
+        })
+        .to_string();
+    }
     json!({
         "kind": status_kind_name(kind),
         "message": message,
@@ -1148,7 +1159,10 @@ mod tests {
 
     use super::{
         redact_run_stream_text, redacted_run_stream_output_json,
-        should_attempt_tool_result_compaction, tool_result_tape_payload,
+        should_attempt_tool_result_compaction, status_tape_payload, tool_result_tape_payload,
+    };
+    use crate::{
+        gateway::CANCELLED_REASON, transport::grpc::proto::palyra::common::v1 as common_v1,
     };
 
     #[test]
@@ -1206,5 +1220,19 @@ mod tests {
         assert_eq!(value["output_json"], serde_json::json!({}));
         assert_eq!(value["diagnostic"]["error_kind"], "validation_error");
         assert_eq!(value["diagnostic"]["message"], "at timestamp must be in the future");
+    }
+
+    #[test]
+    fn cancellation_status_tape_payload_uses_cancelled_lifecycle_kind() {
+        let payload =
+            status_tape_payload(common_v1::stream_status::StatusKind::Failed, CANCELLED_REASON);
+        let value: Value =
+            serde_json::from_str(payload.as_str()).expect("status payload should be json");
+
+        assert_eq!(value["kind"], "cancelled");
+        assert_eq!(value["wire_kind"], "failed");
+        assert_eq!(value["lifecycle_state"], "cancelled");
+        assert_eq!(value["reason_code"], "cancelled_by_request");
+        assert_eq!(value["controlled"], true);
     }
 }
