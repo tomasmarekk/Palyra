@@ -54,6 +54,8 @@ const BROWSER_WAIT_FOR_INPUT_RECOVERY_HINT: &str =
     "wait_for_input_required: pass either selector or text; when unsure, call palyra.browser.observe first and wait for a visible text snippet or observed selector";
 const BROWSER_WAIT_FOR_TIMEOUT_RECOVERY_HINT: &str =
     "wait_for_timeout: call palyra.browser.observe to inspect the current step/state before retrying with a grounded selector or visible text";
+const BROWSER_SESSION_CLOSED_RECOVERY_HINT: &str =
+    "browser_session_closed: create a new browser session with palyra.browser.session.create and retry the browser operation with the new session_id";
 const BROWSER_RUNTIME_RECOVERY_HINT: &str =
     "browser_runtime_unavailable: inspect `palyra browser status`; if browserd was restarted, recreate the browser session and retry the browser operation";
 const BROWSER_TOOL_INPUT_RECOVERY_HINT: &str =
@@ -3723,7 +3725,17 @@ pub(crate) async fn execute_browser_tool(
         _ => (false, b"{}".to_vec(), "palyra.browser.* unsupported tool name".to_owned()),
     };
 
-    browser_tool_execution_outcome(proposal_id, input_json, outcome.0, outcome.1, outcome.2)
+    let (success, mut output_json, mut error) = outcome;
+    if !success && browser_tool_reports_missing_session(output_json.as_slice(), error.as_str()) {
+        if let Ok(session_id) = parse_browser_tool_session_id(&payload) {
+            runtime_state.record_closed_browser_session(session_id.as_str());
+            error = browser_session_closed_error_message(tool_name, session_id.as_str());
+            output_json =
+                browser_session_closed_output_json(session_id.as_str(), output_json.as_slice());
+        }
+    }
+
+    browser_tool_execution_outcome(proposal_id, input_json, success, output_json, error)
 }
 
 pub(crate) async fn close_browser_session_for_run_cleanup(
@@ -4321,8 +4333,66 @@ fn normalize_browser_press_key_input(raw: &str) -> String {
     }
 }
 
+fn browser_tool_reports_missing_session(output_json: &[u8], error: &str) -> bool {
+    if browser_session_closed_error(error.to_ascii_lowercase().as_str()) {
+        return true;
+    }
+
+    serde_json::from_slice::<Value>(output_json).ok().is_some_and(|value| {
+        browser_json_field_is_session_not_found(&value, "error")
+            || browser_json_field_is_session_not_found(&value, "reason")
+    })
+}
+
+fn browser_json_field_is_session_not_found(value: &Value, field: &str) -> bool {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.eq_ignore_ascii_case("session_not_found"))
+}
+
+fn browser_session_closed_error_message(tool_name: &str, session_id: &str) -> String {
+    format!(
+        "{tool_name} failed: browser session {session_id} is closed or no longer exists; create a new browser session before retrying"
+    )
+}
+
+fn browser_session_closed_output_json(session_id: &str, previous_output_json: &[u8]) -> Vec<u8> {
+    let previous_error = serde_json::from_slice::<Value>(previous_output_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .or_else(|| value.get("reason"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "session_not_found".to_owned());
+
+    serde_json::to_vec(&json!({
+        "success": false,
+        "session_id": session_id,
+        "error": "browser_session_closed",
+        "previous_error": previous_error,
+    }))
+    .unwrap_or_else(|_| br#"{"success":false,"error":"browser_session_closed"}"#.to_vec())
+}
+
+fn browser_session_closed_error(normalized_error: &str) -> bool {
+    normalized_error.contains("browser_session_closed")
+        || normalized_error.contains("session_not_found")
+        || (normalized_error.contains("browser session")
+            && (normalized_error.contains(" is closed")
+                || normalized_error.contains("no longer exists")
+                || normalized_error.contains("not found")))
+}
+
 fn browser_recovery_hint(error: &str) -> Option<&'static str> {
     let normalized = error.to_ascii_lowercase();
+    if browser_session_closed_error(normalized.as_str()) {
+        return Some(BROWSER_SESSION_CLOSED_RECOVERY_HINT);
+    }
     if browser_runtime_unavailable_error(&normalized) {
         return Some(BROWSER_RUNTIME_RECOVERY_HINT);
     }
@@ -4365,7 +4435,9 @@ fn browser_runtime_unavailable_error(normalized_error: &str) -> bool {
 
 fn browser_error_category(error: &str) -> &'static str {
     let normalized = error.to_ascii_lowercase();
-    if browser_runtime_unavailable_error(&normalized) {
+    if browser_session_closed_error(normalized.as_str()) {
+        "browser_session_closed"
+    } else if browser_runtime_unavailable_error(&normalized) {
         "browser_runtime_unavailable"
     } else if normalized.contains("selector") && normalized.contains("not found") {
         "selector_not_found"
@@ -4480,14 +4552,16 @@ mod tests {
         attach_browser_caller_principal_metadata, browser_console_entry_to_json,
         browser_element_captures_to_json, browser_file_url_to_path,
         browser_network_log_entry_to_json, browser_observe_include_visible_text,
+        browser_session_closed_error_message, browser_session_closed_output_json,
         browser_session_persistence_from_payload, browser_session_profile_id_from_payload,
-        browser_tool_execution_outcome, browser_tool_requires_open_session,
-        browser_url_targets_loopback, browser_user_owned_os_roots,
-        browser_viewport_metric_mismatch_error, canonical_file_path_is_inside_workspace_roots,
-        normalize_browser_press_key_input, parse_browser_download_artifact_id,
-        parse_browser_observe_string_array, resolve_browser_output_path,
-        resolve_browser_upload_path, validate_browser_workspace_relative_path,
-        BROWSER_CALLER_PRINCIPAL_HEADER, PALYRA_OS_FILE_ROOTS_ENV,
+        browser_tool_execution_outcome, browser_tool_reports_missing_session,
+        browser_tool_requires_open_session, browser_url_targets_loopback,
+        browser_user_owned_os_roots, browser_viewport_metric_mismatch_error,
+        canonical_file_path_is_inside_workspace_roots, normalize_browser_press_key_input,
+        parse_browser_download_artifact_id, parse_browser_observe_string_array,
+        resolve_browser_output_path, resolve_browser_upload_path,
+        validate_browser_workspace_relative_path, BROWSER_CALLER_PRINCIPAL_HEADER,
+        PALYRA_OS_FILE_ROOTS_ENV,
     };
     use crate::application::tool_runtime::workspace_scope::ActiveWorkspaceRoot;
     use crate::gateway::{
@@ -4621,6 +4695,54 @@ mod tests {
             .as_str()
             .is_some_and(|hint| hint.contains("palyra browser status")));
         assert!(outcome.error.contains("recovery_hint=browser_runtime_unavailable"));
+    }
+
+    #[test]
+    fn missing_browser_session_output_is_normalized_for_agent_recovery() {
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let output_json = browser_session_closed_output_json(
+            session_id,
+            br#"{"success":false,"error":"session_not_found"}"#,
+        );
+        let outcome = browser_tool_execution_outcome(
+            "proposal-1",
+            br#"{"session_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV"}"#,
+            false,
+            output_json,
+            browser_session_closed_error_message("palyra.browser.tabs.list", session_id),
+        );
+        let output: serde_json::Value =
+            serde_json::from_slice(outcome.output_json.as_slice()).expect("output should parse");
+
+        assert_eq!(output["success"], false);
+        assert_eq!(output["session_id"], session_id);
+        assert_eq!(output["error"], "browser_session_closed");
+        assert_eq!(output["previous_error"], "session_not_found");
+        assert_eq!(output["error_category"], "browser_session_closed");
+        assert!(output["recovery_hint"]
+            .as_str()
+            .is_some_and(|hint| hint.contains("palyra.browser.session.create")));
+        assert!(outcome.error.contains("recovery_hint=browser_session_closed"));
+    }
+
+    #[test]
+    fn browser_tool_missing_session_detection_accepts_error_or_reason_fields() {
+        assert!(browser_tool_reports_missing_session(
+            br#"{"success":false,"error":"session_not_found"}"#,
+            "browser session was not closed",
+        ));
+        assert!(browser_tool_reports_missing_session(
+            br#"{"closed":false,"reason":"session_not_found"}"#,
+            "browser session was not closed",
+        ));
+        assert!(browser_tool_reports_missing_session(
+            b"{}",
+            "palyra.browser.observe failed: browser session 01ARZ3NDEKTSV4RRFFQ69G5FAV no longer exists",
+        ));
+        assert!(!browser_tool_reports_missing_session(
+            br#"{"success":false,"error":"selector_not_found"}"#,
+            "selector '#missing' was not found",
+        ));
     }
 
     #[test]
