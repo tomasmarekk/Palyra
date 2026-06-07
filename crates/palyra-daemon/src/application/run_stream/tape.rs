@@ -972,11 +972,44 @@ fn status_tape_payload(kind: common_v1::stream_status::StatusKind, message: &str
         })
         .to_string();
     }
+    if kind == common_v1::stream_status::StatusKind::Failed
+        && is_needs_continuation_status_message(message)
+    {
+        return json!({
+            "kind": "needs_continuation",
+            "wire_kind": status_kind_name(kind),
+            "message": message,
+            "lifecycle_state": "needs_continuation",
+            "reason_code": needs_continuation_reason_code(message),
+            "partial": true,
+            "continuation_required": true,
+        })
+        .to_string();
+    }
     json!({
         "kind": status_kind_name(kind),
         "message": message,
     })
     .to_string()
+}
+
+fn is_needs_continuation_status_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("needs_continuation=true")
+}
+
+fn needs_continuation_reason_code(message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("reason_code=max_tool_calls") || lower.contains("tool call limit reached") {
+        return "max_tool_calls";
+    }
+    if lower.contains("reason_code=max_turns") || lower.contains("model turn limit reached") {
+        return "max_turns";
+    }
+    if lower.contains("reason_code=wall_clock") || lower.contains("wall-clock budget exhausted") {
+        return "wall_clock";
+    }
+    "agent_loop_budget_exhausted"
 }
 
 fn model_token_tape_payload(token: &str, is_final: bool) -> String {
@@ -1234,5 +1267,22 @@ mod tests {
         assert_eq!(value["lifecycle_state"], "cancelled");
         assert_eq!(value["reason_code"], "cancelled_by_request");
         assert_eq!(value["controlled"], true);
+    }
+
+    #[test]
+    fn budget_status_tape_payload_uses_needs_continuation_lifecycle_kind() {
+        let payload = status_tape_payload(
+            common_v1::stream_status::StatusKind::Failed,
+            "agent loop tool call limit reached after 95 model turns and 96 tool results; needs_continuation=true reason_code=max_tool_calls; partial result summary: continue in the same session",
+        );
+        let value: Value =
+            serde_json::from_str(payload.as_str()).expect("status payload should be json");
+
+        assert_eq!(value["kind"], "needs_continuation");
+        assert_eq!(value["wire_kind"], "failed");
+        assert_eq!(value["lifecycle_state"], "needs_continuation");
+        assert_eq!(value["reason_code"], "max_tool_calls");
+        assert_eq!(value["partial"], true);
+        assert_eq!(value["continuation_required"], true);
     }
 }

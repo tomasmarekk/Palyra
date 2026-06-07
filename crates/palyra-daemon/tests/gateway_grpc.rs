@@ -6039,6 +6039,10 @@ async fn grpc_run_stream_reports_partial_summary_when_tool_budget_is_exhausted()
         "partial final token should include a user-visible summary: {rendered}"
     );
     assert!(
+        rendered.contains("needs_continuation=true"),
+        "partial final token should expose the continuation lifecycle marker: {rendered}"
+    );
+    assert!(
         rendered.contains("tool_call.max_calls_per_run"),
         "tool budget exhaustion should keep the correct recovery hint: {rendered}"
     );
@@ -6046,9 +6050,10 @@ async fn grpc_run_stream_reports_partial_summary_when_tool_budget_is_exhausted()
     assert!(
         failed_messages.iter().any(|message| {
             message.contains("tool call limit reached")
+                && message.contains("needs_continuation=true")
                 && message.contains("partial result summary")
         }),
-        "failed status should carry the same partial summary: {failed_messages:?}"
+        "terminal status should carry the same needs-continuation summary: {failed_messages:?}"
     );
     assert!(!saw_done, "budget-exhausted run should remain failed");
     assert_eq!(

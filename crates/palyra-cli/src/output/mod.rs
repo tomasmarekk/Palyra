@@ -23,6 +23,7 @@ pub(crate) enum CliExitCode {
     Policy = 6,
     Precondition = 7,
     NotFound = 8,
+    NeedsContinuation = 9,
     Cancelled = 130,
     Internal = 1,
 }
@@ -42,6 +43,7 @@ impl CliExitCode {
             CliExitCode::Policy => "policy_denial",
             CliExitCode::Precondition => "precondition_failed",
             CliExitCode::NotFound => "not_found",
+            CliExitCode::NeedsContinuation => "needs_continuation",
             CliExitCode::Cancelled => "cancelled",
             CliExitCode::Internal => "internal_error",
         }
@@ -217,6 +219,9 @@ pub(crate) fn classify_error(error: &anyhow::Error) -> CliExitCode {
     if let Some(exit_code) = error.chain().find_map(classify_control_plane_error) {
         return exit_code;
     }
+    if is_agent_needs_continuation(&lower) {
+        return CliExitCode::NeedsContinuation;
+    }
     if let Some(exit_code) = error.chain().find_map(classify_tonic_status) {
         return exit_code;
     }
@@ -314,6 +319,12 @@ fn is_user_cancellation(lower_error: &str) -> bool {
     lower_error.contains("cancelled by request")
         || lower_error.contains("canceled by request")
         || lower_error.contains("run cancellation requested")
+}
+
+fn is_agent_needs_continuation(lower_error: &str) -> bool {
+    lower_error.contains("needs_continuation=true")
+        || lower_error.contains("needs continuation")
+        || lower_error.contains("agent run needs continuation")
 }
 
 fn is_provider_turn_timeout(lower_error: &str) -> bool {
@@ -426,6 +437,16 @@ mod tests {
             )),
             CliExitCode::Connectivity
         );
+    }
+
+    #[test]
+    fn classify_error_maps_agent_budget_handoff_without_internal_error() {
+        let error = anyhow!(
+            "agent run needs continuation: agent loop tool call limit reached after 95 model turns and 96 tool results; needs_continuation=true reason_code=max_tool_calls; partial result summary: continue in the same session"
+        );
+
+        assert_eq!(classify_error(&error), CliExitCode::NeedsContinuation);
+        assert_eq!(CliExitCode::NeedsContinuation.kind(), "needs_continuation");
     }
 
     #[test]

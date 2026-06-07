@@ -4307,6 +4307,7 @@ where
     let mut stream = client.open_run_stream(build_resolved_run_stream_request(&resolved)?).await?;
     let mut request_stream_closed = false;
     let mut failed_message = None::<String>;
+    let mut needs_continuation_message = None::<String>;
     let mut completed = false;
     let mut cancelled = false;
     let mut approval_mode = resolved.request.approval_mode;
@@ -4331,6 +4332,8 @@ where
                 let message = sanitize_agent_failure_message(status.message.as_str());
                 if is_agent_cancellation_message(message.as_str()) {
                     cancelled = true;
+                } else if is_agent_needs_continuation_message(message.as_str()) {
+                    needs_continuation_message = Some(message);
                 } else {
                     failed_message = Some(message);
                 }
@@ -4368,7 +4371,7 @@ where
             break;
         }
     }
-    Ok(AgentStreamOutcome { completed, cancelled, failed_message })
+    Ok(AgentStreamOutcome { completed, cancelled, needs_continuation_message, failed_message })
 }
 
 fn enrich_agent_stream_transport_error(error: anyhow::Error, run_id: &str) -> anyhow::Error {
@@ -5320,6 +5323,11 @@ fn is_agent_cancellation_message(message: &str) -> bool {
         || lower.contains("run cancellation requested")
 }
 
+fn is_agent_needs_continuation_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("needs_continuation=true") || lower.contains("needs continuation")
+}
+
 fn quoted_text_field(value: &str) -> String {
     let escaped = value.replace('"', "'").replace(['\r', '\n'], " ");
     format!("\"{escaped}\"")
@@ -5814,6 +5822,7 @@ mod agent_stream_output_tests {
         let outcome = AgentStreamOutcome {
             completed: false,
             cancelled: false,
+            needs_continuation_message: None,
             failed_message: Some(
                 "model_provider_missing_auth: provider has no credential".to_owned(),
             ),
@@ -5827,9 +5836,31 @@ mod agent_stream_output_tests {
     }
 
     #[test]
+    fn needs_continuation_stream_outcome_is_distinct_command_error() {
+        let outcome = AgentStreamOutcome {
+            completed: false,
+            cancelled: false,
+            needs_continuation_message: Some(
+                "agent loop tool call limit reached; needs_continuation=true reason_code=max_tool_calls; partial result summary: continue in the same session".to_owned(),
+            ),
+            failed_message: None,
+        };
+
+        let error = outcome
+            .ensure_success()
+            .expect_err("continuation handoff must be a distinct command error");
+        assert!(error.to_string().contains("needs continuation"), "unexpected error: {error}");
+        assert!(!error.to_string().contains("agent run failed"), "unexpected error: {error}");
+    }
+
+    #[test]
     fn unterminated_stream_outcome_is_command_error() {
-        let outcome =
-            AgentStreamOutcome { completed: false, cancelled: false, failed_message: None };
+        let outcome = AgentStreamOutcome {
+            completed: false,
+            cancelled: false,
+            needs_continuation_message: None,
+            failed_message: None,
+        };
 
         let error =
             outcome.ensure_success().expect_err("unterminated run stream must fail the command");
@@ -5838,8 +5869,12 @@ mod agent_stream_output_tests {
 
     #[test]
     fn cancelled_stream_outcome_is_controlled_success() {
-        let outcome =
-            AgentStreamOutcome { completed: false, cancelled: true, failed_message: None };
+        let outcome = AgentStreamOutcome {
+            completed: false,
+            cancelled: true,
+            needs_continuation_message: None,
+            failed_message: None,
+        };
 
         outcome.ensure_success().expect("requested cancellation should not fail the command");
     }
@@ -6656,6 +6691,7 @@ struct ResolvedAgentRunInput {
 struct AgentStreamOutcome {
     completed: bool,
     cancelled: bool,
+    needs_continuation_message: Option<String>,
     failed_message: Option<String>,
 }
 
@@ -6667,6 +6703,9 @@ impl AgentStreamOutcome {
     fn ensure_success(&self) -> Result<()> {
         if self.cancelled {
             return Ok(());
+        }
+        if let Some(message) = self.needs_continuation_message.as_ref() {
+            anyhow::bail!("agent run needs continuation: {message}");
         }
         if let Some(message) = self.failed_message.as_ref() {
             anyhow::bail!("agent run failed: {message}");

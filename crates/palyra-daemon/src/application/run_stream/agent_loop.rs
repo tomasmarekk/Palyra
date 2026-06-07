@@ -56,6 +56,11 @@ impl AgentLoopTerminationReason {
     pub(crate) const fn is_success(self) -> bool {
         matches!(self, Self::FinalAnswer)
     }
+
+    pub(crate) const fn needs_continuation(self, completed_tool_calls: u32) -> bool {
+        completed_tool_calls > 0
+            && matches!(self, Self::MaxTurns | Self::MaxToolCalls | Self::WallClock)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -93,6 +98,10 @@ pub(crate) struct AgentLoopFinalizationEnvelope {
     pub(crate) schema_version: u32,
     pub(crate) termination_reason: AgentLoopTerminationReason,
     pub(crate) status: String,
+    pub(crate) lifecycle_state: String,
+    pub(crate) reason_code: String,
+    pub(crate) partial: bool,
+    pub(crate) continuation_required: bool,
     pub(crate) user_visible_message: String,
     pub(crate) usage: AgentLoopUsageSnapshot,
     pub(crate) tool_count: u32,
@@ -212,16 +221,34 @@ impl AgentRunLoopState {
         }
     }
 
+    fn finalization_outcome(
+        &self,
+        reason: AgentLoopTerminationReason,
+    ) -> AgentLoopFinalizationOutcome {
+        if reason.is_success() {
+            return AgentLoopFinalizationOutcome::completed(reason);
+        }
+        if reason.needs_continuation(self.completed_tool_calls) {
+            return AgentLoopFinalizationOutcome::needs_continuation(reason);
+        }
+        AgentLoopFinalizationOutcome::failed(reason)
+    }
+
     pub(crate) fn finalization_envelope(
         &self,
         reason: AgentLoopTerminationReason,
         user_visible_message: impl Into<String>,
         provider_trace_ref: Option<String>,
     ) -> AgentLoopFinalizationEnvelope {
+        let outcome = self.finalization_outcome(reason);
         AgentLoopFinalizationEnvelope {
             schema_version: 1,
             termination_reason: reason,
-            status: if reason.is_success() { "completed" } else { "failed" }.to_owned(),
+            status: outcome.status.to_owned(),
+            lifecycle_state: outcome.lifecycle_state.to_owned(),
+            reason_code: outcome.reason_code.to_owned(),
+            partial: outcome.partial,
+            continuation_required: outcome.continuation_required,
             user_visible_message: user_visible_message.into(),
             usage: self.usage.clone(),
             tool_count: self.completed_tool_calls,
@@ -295,6 +322,47 @@ impl AgentRunLoopState {
 
     fn elapsed(&self) -> Duration {
         Instant::now().saturating_duration_since(self.started_at)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AgentLoopFinalizationOutcome {
+    status: &'static str,
+    lifecycle_state: &'static str,
+    reason_code: &'static str,
+    partial: bool,
+    continuation_required: bool,
+}
+
+impl AgentLoopFinalizationOutcome {
+    const fn completed(reason: AgentLoopTerminationReason) -> Self {
+        Self {
+            status: "completed",
+            lifecycle_state: "done",
+            reason_code: reason.as_str(),
+            partial: false,
+            continuation_required: false,
+        }
+    }
+
+    const fn failed(reason: AgentLoopTerminationReason) -> Self {
+        Self {
+            status: "failed",
+            lifecycle_state: "failed",
+            reason_code: reason.as_str(),
+            partial: false,
+            continuation_required: false,
+        }
+    }
+
+    const fn needs_continuation(reason: AgentLoopTerminationReason) -> Self {
+        Self {
+            status: "needs_continuation",
+            lifecycle_state: "needs_continuation",
+            reason_code: reason.as_str(),
+            partial: true,
+            continuation_required: true,
+        }
     }
 }
 
@@ -533,6 +601,33 @@ mod tests {
         assert_eq!(parsed["state"]["termination_reason"], "max_turns");
         assert_eq!(parsed["finalization"]["status"], "failed");
         assert_eq!(parsed["finalization"]["provider_trace_ref"], "provider-trace");
+    }
+
+    #[test]
+    fn loop_state_marks_budget_exhaustion_after_tools_as_needs_continuation() {
+        let mut state =
+            AgentRunLoopState::new(vec![ProviderMessage::user_text("hello")], 2, 1, 10_000);
+        state.append_tool_result_messages(vec![ProviderMessage::tool_result(
+            "call-01",
+            r#"{"ok":true}"#,
+        )]);
+
+        let payload = state.termination_payload(
+            "run-01",
+            AgentLoopTerminationReason::MaxToolCalls,
+            "agent loop tool call limit reached; needs_continuation=true",
+            None,
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(payload.as_str()).expect("termination payload should be JSON");
+
+        assert_eq!(parsed["termination_reason"], "max_tool_calls");
+        assert_eq!(parsed["finalization"]["status"], "needs_continuation");
+        assert_eq!(parsed["finalization"]["lifecycle_state"], "needs_continuation");
+        assert_eq!(parsed["finalization"]["reason_code"], "max_tool_calls");
+        assert_eq!(parsed["finalization"]["partial"], true);
+        assert_eq!(parsed["finalization"]["continuation_required"], true);
+        assert_eq!(parsed["finalization"]["tool_count"], 1);
     }
 
     #[test]

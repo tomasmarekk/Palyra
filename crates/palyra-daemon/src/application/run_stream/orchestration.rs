@@ -2188,8 +2188,13 @@ fn agent_loop_budget_exhausted_message(
         }
         _ => "Continue in the same session with a narrower resume prompt.",
     };
+    let continuation_marker = if reason.needs_continuation(snapshot.completed_tool_calls) {
+        format!("; needs_continuation=true reason_code={}", reason.as_str())
+    } else {
+        String::new()
+    };
     format!(
-        "{base} after {} model turns and {} {tool_result_label}; partial result summary: run tape for {run_id} contains the exact tool evidence, remaining_model_turns={}, remaining_tool_calls={}, elapsed_ms={}. Continue in the same session and ask to resume from run {run_id}. {recovery_hint}",
+        "{base} after {} model turns and {} {tool_result_label}{continuation_marker}; partial result summary: run tape for {run_id} contains the exact tool evidence, remaining_model_turns={}, remaining_tool_calls={}, elapsed_ms={}. Continue in the same session and ask to resume from run {run_id}. {recovery_hint}",
         snapshot.current_turn,
         snapshot.completed_tool_calls,
         snapshot.remaining_model_turns,
@@ -3060,6 +3065,8 @@ mod tests {
 
         assert!(message.contains("model turn limit reached"));
         assert!(message.contains("1 tool result"));
+        assert!(message.contains("needs_continuation=true"));
+        assert!(message.contains("reason_code=max_turns"));
         assert!(message.contains("partial result summary"));
         assert!(message.contains("resume from run 01ARZ3NDEKTSV4RRFFQ69G5FAV"));
         assert!(message.contains("model-turn budget"));
@@ -3076,6 +3083,8 @@ mod tests {
         );
 
         assert!(message.contains("tool call limit reached"));
+        assert!(message.contains("needs_continuation=true"));
+        assert!(message.contains("reason_code=max_tool_calls"));
         assert!(message.contains("partial result summary"));
         assert!(message.contains("resume from run 01ARZ3NDEKTSV4RRFFQ69G5FAV"));
         assert!(message.contains("tool_call.max_calls_per_run"));
@@ -3093,6 +3102,8 @@ mod tests {
         );
 
         assert!(message.contains("wall-clock budget exhausted"));
+        assert!(message.contains("needs_continuation=true"));
+        assert!(message.contains("reason_code=wall_clock"));
         assert!(message.contains("partial result summary"));
         assert!(message.contains("remaining_tool_calls=8"));
         assert!(message.contains("elapsed_ms="));
@@ -3122,6 +3133,21 @@ mod tests {
             AgentLoopTerminationReason::WallClock,
             &state_without_tools
         ));
+    }
+
+    #[test]
+    fn budget_exhausted_message_without_tool_evidence_omits_continuation_marker() {
+        let state = AgentRunLoopState::new(vec![ProviderMessage::user_text("hello")], 4, 8, 10_000);
+
+        let message = agent_loop_budget_exhausted_message(
+            AgentLoopTerminationReason::MaxTurns,
+            &state,
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        );
+
+        assert!(message.contains("model turn limit reached"));
+        assert!(!message.contains("needs_continuation=true"));
+        assert!(!message.contains("reason_code=max_turns"));
     }
 
     #[test]

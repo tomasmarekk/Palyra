@@ -579,6 +579,7 @@ async fn execute_interactive_agent_stream(
     })?;
     let mut text_emitter = AgentTextEmitter::default();
     let mut failed_message = None::<String>;
+    let mut needs_continuation_message = None::<String>;
     let mut completed = false;
     let mut cancelled = false;
     let mut saw_terminal_status = false;
@@ -682,6 +683,8 @@ async fn execute_interactive_agent_stream(
                         let message = sanitize_agent_failure_message(status.message.as_str());
                         if is_agent_cancellation_message(message.as_str()) {
                             cancelled = true;
+                        } else if is_agent_needs_continuation_message(message.as_str()) {
+                            needs_continuation_message = Some(message);
                         } else {
                             failed_message = Some(message);
                         }
@@ -723,7 +726,8 @@ async fn execute_interactive_agent_stream(
     if !ndjson {
         text_emitter.finish()?;
     }
-    let outcome = AgentStreamOutcome { completed, cancelled, failed_message };
+    let outcome =
+        AgentStreamOutcome { completed, cancelled, needs_continuation_message, failed_message };
     if abort_requested {
         return Ok(InteractiveAgentStreamOutcome { stream: outcome, exit_requested });
     }
