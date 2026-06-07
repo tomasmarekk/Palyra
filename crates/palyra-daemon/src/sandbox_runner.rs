@@ -458,6 +458,21 @@ pub fn run_constrained_process_with_cancellation(
             working_directory.as_path(),
             per_call_timeout,
             max_background_lifetime,
+            None,
+        );
+    }
+
+    if let Some(auto_background_reason) = auto_background_reason_for_foreground_dev_server(&input) {
+        let per_call_timeout = background_process_lifetime(input.timeout_ms, execution_timeout);
+        let max_background_lifetime = background_process_lifetime_limit(execution_timeout);
+        return spawn_background_process(
+            policy,
+            &input,
+            workspace_root.as_path(),
+            working_directory.as_path(),
+            per_call_timeout,
+            max_background_lifetime,
+            Some(auto_background_reason),
         );
     }
 
@@ -2039,7 +2054,7 @@ fn validate_host_argument_scope_with_roots(
             continue;
         }
         if is_windows_command_switch(command, arg.as_str())
-            || command_positional_arg_is_non_path_value(command, arg.as_str())
+            || command_arg_is_non_path_value(command, args, index)
         {
             index = index.saturating_add(1);
             continue;
@@ -2154,7 +2169,7 @@ fn rewrite_arguments_to_scoped_paths(
             index = index.saturating_add(1);
             continue;
         }
-        if command_positional_arg_is_non_path_value(command, arg.as_str()) {
+        if command_arg_is_non_path_value(command, args, index) {
             rewritten.push(arg.clone());
             index = index.saturating_add(1);
             continue;
@@ -2284,6 +2299,7 @@ fn option_consumes_non_path_value(arg: &str) -> bool {
 fn command_option_consumes_non_path_value(command: &str, arg: &str) -> bool {
     option_consumes_non_path_value(arg)
         || node_eval_option_consumes_non_path_value(command, arg)
+        || python_module_option_consumes_non_path_value(command, arg)
         || windows_acl_option_consumes_non_path_value(command, arg)
 }
 
@@ -2291,6 +2307,11 @@ fn node_eval_option_consumes_non_path_value(command: &str, arg: &str) -> bool {
     let command = normalize_process_executable_token(command);
     matches!(command.as_str(), "node" | "nodejs")
         && matches!(arg.trim().to_ascii_lowercase().as_str(), "-e" | "-p")
+}
+
+fn python_module_option_consumes_non_path_value(command: &str, arg: &str) -> bool {
+    let command = normalize_process_executable_token(command);
+    matches!(command.as_str(), "python" | "python3" | "py") && arg.trim().eq_ignore_ascii_case("-m")
 }
 
 fn windows_acl_option_consumes_non_path_value(command: &str, arg: &str) -> bool {
@@ -2308,6 +2329,48 @@ fn windows_acl_option_consumes_non_path_value(command: &str, arg: &str) -> bool 
 fn command_positional_arg_is_non_path_value(command: &str, arg: &str) -> bool {
     let command = normalize_process_executable_token(command);
     matches!(command.as_str(), "sleep") && is_sleep_duration_literal(arg)
+}
+
+fn command_arg_is_non_path_value(command: &str, args: &[String], index: usize) -> bool {
+    let Some(arg) = args.get(index) else {
+        return false;
+    };
+    command_positional_arg_is_non_path_value(command, arg.as_str())
+        || python_module_invocation_arg_is_non_path_value(command, args, index)
+}
+
+fn python_module_invocation_arg_is_non_path_value(
+    command: &str,
+    args: &[String],
+    index: usize,
+) -> bool {
+    let command = normalize_process_executable_token(command);
+    if !matches!(command.as_str(), "python" | "python3" | "py") {
+        return false;
+    }
+    let Some(module_flag_index) = args.iter().position(|arg| arg.trim().eq_ignore_ascii_case("-m"))
+    else {
+        return false;
+    };
+    if index == module_flag_index.saturating_add(1) {
+        return true;
+    }
+    let Some(module_name) = args.get(module_flag_index.saturating_add(1)).map(|arg| arg.trim())
+    else {
+        return false;
+    };
+    if !matches!(module_name, "http.server" | "http_server") {
+        return false;
+    }
+    let Some(arg) = args.get(index).map(|arg| arg.trim()) else {
+        return false;
+    };
+    if index == module_flag_index.saturating_add(2) && arg.parse::<u16>().is_ok() {
+        return true;
+    }
+    args.get(index.saturating_sub(1))
+        .map(|previous| previous.trim())
+        .is_some_and(|previous| matches!(previous, "--bind" | "-b" | "--protocol"))
 }
 
 fn is_sleep_duration_literal(arg: &str) -> bool {
@@ -3229,6 +3292,7 @@ fn spawn_background_process(
     cwd: &Path,
     lifetime: Duration,
     max_lifetime: Duration,
+    auto_background_reason: Option<&'static str>,
 ) -> Result<SandboxProcessRunSuccess, SandboxProcessRunError> {
     let mut command = build_process_command(policy, input, workspace_root, cwd)?;
     configure_child_process_group(&mut command);
@@ -3325,6 +3389,7 @@ fn spawn_background_process(
     let background_lifetime_adjusted = background_lifetime_adjustment_reason.is_some();
     let background_lifetime_adjustment_note =
         background_lifetime_adjustment_note(background_lifetime_adjustment_reason);
+    let auto_backgrounded = auto_background_reason.is_some();
     let output_json = serde_json::to_vec(&json!({
         "exit_code": Value::Null,
         "stdout": stdout_text,
@@ -3336,6 +3401,9 @@ fn spawn_background_process(
         "background_output_note": "stdout/stderr are bounded startup snapshots captured during the startup check, not command completion output; use an explicit fixed port if a dynamic port is not printed here",
         "duration_ms": 0,
         "background": true,
+        "auto_backgrounded": auto_backgrounded,
+        "auto_background_reason": auto_background_reason,
+        "foreground_request_backgrounded": auto_backgrounded,
         "started": true,
         "completed": false,
         "startup_success": true,
@@ -3880,6 +3948,160 @@ fn background_process_lifetime(timeout_ms: Option<u64>, execution_timeout: Durat
 fn foreground_process_timeout(timeout_ms: Option<u64>, execution_timeout: Duration) -> Duration {
     let default_timeout = Duration::from_millis(DEFAULT_FOREGROUND_PROCESS_TIMEOUT_MS);
     timeout_ms.map(Duration::from_millis).unwrap_or(default_timeout).min(execution_timeout)
+}
+
+fn auto_background_reason_for_foreground_dev_server(
+    input: &ProcessRunnerInput,
+) -> Option<&'static str> {
+    if input.background {
+        return None;
+    }
+
+    let command = normalize_process_executable_token(input.command.as_str());
+    let args = input.args.iter().map(String::as_str).collect::<Vec<_>>();
+    if package_manager_script_is_strong_dev_server(command.as_str(), args.as_slice()) {
+        return Some("recognized_dev_server_script");
+    }
+    if direct_command_is_strong_dev_server(command.as_str(), args.as_slice()) {
+        return Some("recognized_dev_server_command");
+    }
+    if !foreground_request_looks_long_running(input.timeout_ms) {
+        return None;
+    }
+    if package_manager_script_is_ambiguous_server(command.as_str(), args.as_slice()) {
+        return Some("recognized_long_timeout_server_script");
+    }
+    if direct_command_is_ambiguous_server(command.as_str(), args.as_slice()) {
+        return Some("recognized_long_timeout_server_command");
+    }
+    None
+}
+
+fn foreground_request_looks_long_running(timeout_ms: Option<u64>) -> bool {
+    timeout_ms.is_some_and(|timeout_ms| timeout_ms >= MIN_BACKGROUND_PROCESS_LIFETIME_MS)
+}
+
+fn package_manager_script_is_strong_dev_server(command: &str, args: &[&str]) -> bool {
+    let Some(script_name) = package_manager_script_name(command, args) else {
+        return false;
+    };
+    matches!(script_name, "dev" | "serve" | "preview")
+}
+
+fn package_manager_script_is_ambiguous_server(command: &str, args: &[&str]) -> bool {
+    let Some(script_name) = package_manager_script_name(command, args) else {
+        return false;
+    };
+    matches!(script_name, "start" | "server")
+}
+
+fn package_manager_script_name<'a>(command: &str, args: &'a [&'a str]) -> Option<&'a str> {
+    match command {
+        "npm" => npm_script_name(args),
+        "pnpm" | "yarn" | "bun" => javascript_package_runner_script_name(args),
+        "npx" => npx_dev_server_command(args).map(|_| "dev"),
+        _ => None,
+    }
+}
+
+fn npm_script_name<'a>(args: &'a [&'a str]) -> Option<&'a str> {
+    let args = skip_package_manager_options(args);
+    match args {
+        ["run", script, ..] | ["run-script", script, ..] => Some(normalized_script_name(script)),
+        ["start", ..] | ["serve", ..] => Some(normalized_script_name(args[0])),
+        _ => None,
+    }
+}
+
+fn javascript_package_runner_script_name<'a>(args: &'a [&'a str]) -> Option<&'a str> {
+    let args = skip_package_manager_options(args);
+    match args {
+        ["run", script, ..] => Some(normalized_script_name(script)),
+        [script, ..] => Some(normalized_script_name(script)),
+        _ => None,
+    }
+}
+
+fn skip_package_manager_options<'a>(args: &'a [&'a str]) -> &'a [&'a str] {
+    let mut remaining = args;
+    loop {
+        match remaining {
+            [flag, _value, rest @ ..]
+                if matches!(
+                    *flag,
+                    "--prefix" | "--cwd" | "--dir" | "--workspace" | "--filter" | "-C" | "-w"
+                ) =>
+            {
+                remaining = rest;
+            }
+            [flag, rest @ ..] if flag.starts_with("--prefix=") || flag.starts_with("--cwd=") => {
+                remaining = rest;
+            }
+            _ => return remaining,
+        }
+    }
+}
+
+fn normalized_script_name(script: &str) -> &str {
+    script.trim().trim_start_matches("run:").trim_start_matches("script:")
+}
+
+fn direct_command_is_strong_dev_server(command: &str, args: &[&str]) -> bool {
+    match command {
+        "vite" | "webpack-dev-server" | "http-server" | "serve" => true,
+        "next" | "nuxt" | "astro" | "remix" => first_non_option_arg(args) == Some("dev"),
+        "webpack" => first_non_option_arg(args) == Some("serve"),
+        "python" | "python3" | "py" => python_module_is_http_server(args),
+        "npx" => npx_dev_server_command(args).is_some(),
+        _ => false,
+    }
+}
+
+fn direct_command_is_ambiguous_server(command: &str, args: &[&str]) -> bool {
+    match command {
+        "node" | "deno" | "bun" | "tsx" => {
+            first_non_option_arg(args).map(script_path_looks_like_server).unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+fn first_non_option_arg<'a>(args: &'a [&'a str]) -> Option<&'a str> {
+    args.iter().copied().find(|arg| !arg.trim().starts_with('-')).map(str::trim)
+}
+
+fn python_module_is_http_server(args: &[&str]) -> bool {
+    args.windows(2).any(|window| {
+        matches!(window, ["-m", module] if matches!(*module, "http.server" | "http_server"))
+    })
+}
+
+fn npx_dev_server_command<'a>(args: &'a [&'a str]) -> Option<&'a str> {
+    let args = skip_package_manager_options(args);
+    let command = first_non_option_arg(args)?;
+    if matches!(command, "vite" | "webpack-dev-server" | "http-server" | "serve") {
+        return Some(command);
+    }
+    let command_index = args.iter().position(|arg| *arg == command)?;
+    let command_args = &args[command_index + 1..];
+    if matches!(command, "next" | "nuxt" | "astro" | "remix")
+        && first_non_option_arg(command_args) == Some("dev")
+    {
+        return Some(command);
+    }
+    None
+}
+
+fn script_path_looks_like_server(path: &str) -> bool {
+    let file_name = path.rsplit(['/', '\\']).next().unwrap_or(path).trim();
+    let stem = file_name
+        .strip_suffix(".mjs")
+        .or_else(|| file_name.strip_suffix(".cjs"))
+        .or_else(|| file_name.strip_suffix(".js"))
+        .or_else(|| file_name.strip_suffix(".ts"))
+        .or_else(|| file_name.strip_suffix(".tsx"))
+        .unwrap_or(file_name);
+    matches!(stem, "server" | "dev-server" | "app-server")
 }
 
 fn background_process_lifetime_limit(execution_timeout: Duration) -> Duration {
@@ -4836,6 +5058,22 @@ mod tests {
         }
     }
 
+    fn process_runner_input(
+        command: &str,
+        args: &[&str],
+        timeout_ms: Option<u64>,
+    ) -> ProcessRunnerInput {
+        ProcessRunnerInput {
+            command: command.to_owned(),
+            args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+            cwd: None,
+            env: BTreeMap::new(),
+            requested_egress_hosts: Vec::new(),
+            timeout_ms,
+            background: false,
+        }
+    }
+
     fn sandbox_policy(workspace_root: PathBuf) -> SandboxProcessRunnerPolicy {
         sandbox_policy_with_allowed_executables(workspace_root, vec!["uname".to_owned()])
     }
@@ -5210,6 +5448,27 @@ mod tests {
             args.as_slice(),
         )
         .expect("node eval code should remain a literal argument");
+
+        assert_eq!(rewritten, args);
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    fn rewrite_arguments_to_scoped_paths_preserves_python_module_names() {
+        let workspace = unique_temp_dir("workspace-python-module-arg-rewrite");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let args = vec!["-m".to_owned(), "http.server".to_owned(), "0".to_owned()];
+
+        let rewritten = rewrite_arguments_to_scoped_paths(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            "python",
+            args.as_slice(),
+        )
+        .expect("python module names after -m should remain literal arguments");
 
         assert_eq!(rewritten, args);
 
@@ -6013,6 +6272,62 @@ mod tests {
     }
 
     #[test]
+    fn foreground_dev_server_detection_promotes_common_dev_scripts() {
+        let input = process_runner_input("npm", &["run", "dev"], None);
+        assert_eq!(
+            super::auto_background_reason_for_foreground_dev_server(&input),
+            Some("recognized_dev_server_script")
+        );
+
+        let input = process_runner_input("pnpm", &["--dir", "app", "dev"], None);
+        assert_eq!(
+            super::auto_background_reason_for_foreground_dev_server(&input),
+            Some("recognized_dev_server_script")
+        );
+
+        let input = process_runner_input("python", &["-m", "http.server", "0"], None);
+        assert_eq!(
+            super::auto_background_reason_for_foreground_dev_server(&input),
+            Some("recognized_dev_server_command")
+        );
+    }
+
+    #[test]
+    fn foreground_dev_server_detection_keeps_tests_and_builds_foreground() {
+        for args in
+            [&["run", "test"][..], &["test"][..], &["run", "build"][..], &["run", "lint"][..]]
+        {
+            let input = process_runner_input("npm", args, Some(600_000));
+            assert_eq!(
+                super::auto_background_reason_for_foreground_dev_server(&input),
+                None,
+                "npm args {args:?} must stay foreground"
+            );
+        }
+
+        let input = process_runner_input("node", &["scripts/check.js"], Some(600_000));
+        assert_eq!(super::auto_background_reason_for_foreground_dev_server(&input), None);
+    }
+
+    #[test]
+    fn foreground_dev_server_detection_requires_long_timeout_for_ambiguous_servers() {
+        let input = process_runner_input("npm", &["start"], None);
+        assert_eq!(super::auto_background_reason_for_foreground_dev_server(&input), None);
+
+        let input = process_runner_input("npm", &["start"], Some(600_000));
+        assert_eq!(
+            super::auto_background_reason_for_foreground_dev_server(&input),
+            Some("recognized_long_timeout_server_script")
+        );
+
+        let input = process_runner_input("node", &["server.js"], Some(600_000));
+        assert_eq!(
+            super::auto_background_reason_for_foreground_dev_server(&input),
+            Some("recognized_long_timeout_server_command")
+        );
+    }
+
+    #[test]
     #[cfg(windows)]
     fn tier_b_resource_quota_check_allows_explicit_windows_local_processes() {
         let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
@@ -6606,6 +6921,62 @@ mod tests {
             Some("palyra.process.status")
         );
         assert!(output.pointer("/cleanup/manual_command/command").is_some());
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn run_constrained_process_auto_backgrounds_foreground_python_http_server_when_available() {
+        let Some(python) = ["python3", "python", "py"].into_iter().find(|command| {
+            Command::new(command)
+                .arg("--version")
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        }) else {
+            return;
+        };
+        let workspace = unique_temp_dir("workspace-python-http-server-auto-background");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        let mut policy =
+            sandbox_policy_with_allowed_executables(workspace.clone(), vec![python.to_owned()]);
+        policy.allow_interpreters = true;
+        policy.egress_enforcement_mode = EgressEnforcementMode::Preflight;
+        let input = serde_json::to_vec(&serde_json::json!({
+            "command": python,
+            "args": ["-m", "http.server", "0"]
+        }))
+        .expect("input should serialize");
+
+        let result =
+            run_constrained_process(&policy, input.as_slice(), background_test_execution_timeout())
+                .expect("foreground http.server should be auto-backgrounded");
+        let output: serde_json::Value =
+            serde_json::from_slice(&result.output_json).expect("output should parse");
+        let pid = output
+            .get("pid")
+            .and_then(serde_json::Value::as_u64)
+            .expect("auto-backgrounded process should return a pid") as u32;
+        let _ = super::stop_background_process_by_pid(pid);
+
+        assert_eq!(output.get("background").and_then(serde_json::Value::as_bool), Some(true));
+        assert_eq!(
+            output.get("auto_backgrounded").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            output.get("foreground_request_backgrounded").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            output.get("auto_background_reason").and_then(serde_json::Value::as_str),
+            Some("recognized_dev_server_command")
+        );
+        assert_eq!(
+            output.get("process_state").and_then(serde_json::Value::as_str),
+            Some("running")
+        );
 
         let _ = fs::remove_dir_all(workspace.as_path());
     }
