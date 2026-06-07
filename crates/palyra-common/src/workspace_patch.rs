@@ -530,22 +530,12 @@ fn normalize_palyra_patch_fences(patch: &str) -> Option<String> {
         return changed.then(|| lines.join("\n"));
     };
 
-    let mut tail_contains_duplicate_end = false;
     for line in lines.iter().skip(first_end_index + 1) {
         let control = patch_control_line(line.as_str());
         if control.is_empty() {
             continue;
         }
-        if control == "*** End Patch" {
-            tail_contains_duplicate_end = true;
-            continue;
-        }
         return changed.then(|| lines.join("\n"));
-    }
-
-    if tail_contains_duplicate_end {
-        lines.truncate(first_end_index + 1);
-        changed = true;
     }
 
     changed.then(|| {
@@ -3001,24 +2991,50 @@ mod tests {
     }
 
     #[test]
-    fn apply_workspace_patch_accepts_common_extra_patch_fence_markers() {
+    fn apply_workspace_patch_rejects_duplicate_trailing_patch_fence_markers() {
         let temp = tempdir().expect("tempdir should be created");
         let workspace = temp.path().join("workspace");
         fs::create_dir_all(&workspace).expect("workspace should exist");
         let patch = "*** Begin Patch ***\n*** Add File: reports/ready.md\n+READY detected\n*** End Patch ***\n*** End Patch\n";
 
-        let outcome = apply_workspace_patch(
+        let error = apply_workspace_patch(
             std::slice::from_ref(&workspace),
             &default_request(patch, false),
             &default_limits(),
         )
-        .expect("common duplicate/trailing patch fences should be normalized");
+        .expect_err("duplicate/trailing patch terminators should be rejected");
 
-        assert_eq!(outcome.files_touched.len(), 1);
-        assert_eq!(
-            fs::read_to_string(workspace.join("reports").join("ready.md"))
-                .expect("report should be created"),
-            "READY detected\n"
+        assert!(
+            error.to_string().contains("unexpected content after '*** End Patch'"),
+            "error should identify content after the first terminator: {error}"
+        );
+        assert!(
+            !workspace.join("reports").join("ready.md").exists(),
+            "rejected patches must not create files"
+        );
+    }
+
+    #[test]
+    fn apply_workspace_patch_rejects_multiple_duplicate_end_patch_markers() {
+        let temp = tempdir().expect("tempdir should be created");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        let patch = "*** Begin Patch\n*** Add File: reports/ready.md\n+READY detected\n*** End Patch\n*** End Patch\n*** End Patch\n*** End Patch\n*** End Patch\n";
+
+        let error = apply_workspace_patch(
+            std::slice::from_ref(&workspace),
+            &default_request(patch, false),
+            &default_limits(),
+        )
+        .expect_err("multiple duplicate patch terminators should be rejected");
+
+        assert!(
+            error.to_string().contains("unexpected content after '*** End Patch'"),
+            "error should identify content after the first terminator: {error}"
+        );
+        assert!(
+            !workspace.join("reports").join("ready.md").exists(),
+            "rejected patches must not create files"
         );
     }
 
