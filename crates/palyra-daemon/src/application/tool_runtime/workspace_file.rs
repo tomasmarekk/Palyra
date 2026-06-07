@@ -2368,6 +2368,29 @@ mod tests {
     }
 
     #[test]
+    fn read_workspace_file_preserves_vault_reference_assignments() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let file_path = tempdir.path().join(".env.template");
+        let contents = "PALYRA_E2E_API_KEY=${vault:PALYRA_E2E_API_KEY}\n\
+                        PROVIDER_KEY=${vault:providers/local/api_key}\n";
+        fs::write(file_path, contents).expect("workspace file should be written");
+        let input = WorkspaceReadFileInput {
+            path: ".env.template".to_owned(),
+            workspace_root: None,
+            offset_bytes: 0,
+            max_bytes: None,
+        };
+
+        let output = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
+            .expect("workspace file should be readable");
+
+        assert!(!output.redacted);
+        assert_eq!(output.text.as_deref(), Some(contents));
+        assert_eq!(output.text_authoritative, None);
+        assert_eq!(output.redaction_notice, None);
+    }
+
+    #[test]
     fn read_workspace_file_preserves_cookie_regex_and_benign_token_fixture() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let file_path = tempdir.path().join("app.js");

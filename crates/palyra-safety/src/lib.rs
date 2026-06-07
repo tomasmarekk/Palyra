@@ -869,9 +869,25 @@ fn is_safe_secret_reference_value(key: &str, value: &str) -> bool {
         || is_os_environ_index_reference(normalized)
         || is_env_identifier_reference_expression(key, normalized)
         || is_standalone_env_identifier_literal(normalized)
+        || is_vault_reference_value(normalized)
         || is_obvious_placeholder_secret_value(normalized)
         || is_benign_mock_credential_fixture_value(normalized)
         || is_dom_input_value_reference(normalized)
+}
+
+fn is_vault_reference_value(value: &str) -> bool {
+    let normalized =
+        value.trim().trim_end_matches([',', ';']).trim().trim_matches(['"', '\'', '`']).trim();
+    let reference = normalized
+        .strip_prefix("${vault:")
+        .and_then(|rest| rest.strip_suffix('}'))
+        .or_else(|| normalized.strip_prefix("vault:"));
+    let Some(reference) = reference.map(str::trim).filter(|reference| !reference.is_empty()) else {
+        return false;
+    };
+    reference
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | ':'))
 }
 
 fn is_env_member_reference(value: &str) -> bool {
@@ -1100,6 +1116,7 @@ fn bare_token_assignment_value_looks_secret(value: &str) -> bool {
     if is_env_reference_identifier_literal(normalized)
         || looks_like_application_identifier(lowered.as_str())
         || looks_like_parser_fixture_value(lowered.as_str())
+        || looks_like_palyra_e2e_fixture_marker(lowered.as_str())
     {
         return false;
     }
@@ -1110,6 +1127,15 @@ fn bare_token_assignment_value_looks_secret(value: &str) -> bool {
         || lowered.starts_with("github_pat_")
         || lowered.starts_with("xox")
         || normalized.len() >= 16
+}
+
+fn looks_like_palyra_e2e_fixture_marker(value: &str) -> bool {
+    let Some(suffix) = value.strip_prefix("palyra_e2e_") else {
+        return false;
+    };
+    !suffix.is_empty()
+        && !suffix.contains("secret")
+        && suffix.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
 }
 
 fn looks_like_application_identifier(value: &str) -> bool {
@@ -2091,6 +2117,33 @@ mod tests {
     }
 
     #[test]
+    fn vault_reference_assignment_values_are_not_redacted_as_secret_values() {
+        let source = "PALYRA_E2E_API_KEY=${vault:PALYRA_E2E_API_KEY}\n\
+                      provider_key = \"${vault:PALYRA_E2E_API_KEY}\"\n\
+                      secret_vault_ref = \"global/openai_key\"";
+        let outcome = redact_text_for_export(
+            source,
+            SafetySourceKind::Workspace,
+            SafetyContentKind::WorkspaceDocument,
+            TrustLabel::TrustedLocal,
+        );
+
+        assert!(!outcome.redacted);
+        assert_eq!(outcome.redacted_text, source);
+        assert!(outcome.redacted_text.contains("${vault:PALYRA_E2E_API_KEY}"));
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "credential_reference.secret_vault_ref"));
+        assert!(!outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code.starts_with("secret_leak.assignment.")));
+    }
+
+    #[test]
     fn source_dom_password_reads_are_not_redacted_as_secret_literals() {
         let source = "const password = document.querySelector('#password').value;\n\
                       const confirmPassword = document.getElementById('confirm-password')?.value;\n\
@@ -2144,7 +2197,9 @@ mod tests {
                       const selector = '#password';\n\
                       token=value=with=equals\n\
                       expected=token=value=with=equals\n\
-                      KEY=VITE_APP_LABEL";
+                      KEY=VITE_APP_LABEL\n\
+                      token=palyra_e2e_delete_me\n\
+                      token=palyra_e2e_keep_me";
         let outcome = redact_text_for_export(
             source,
             SafetySourceKind::Workspace,
@@ -2156,11 +2211,28 @@ mod tests {
         assert_eq!(outcome.redacted_text, source);
         assert!(outcome.redacted_text.contains("token=value=with=equals"));
         assert!(outcome.redacted_text.contains("KEY=VITE_APP_LABEL"));
+        assert!(outcome.redacted_text.contains("palyra_e2e_delete_me"));
+        assert!(outcome.redacted_text.contains("palyra_e2e_keep_me"));
         assert!(!outcome
             .scan
             .finding_codes()
             .iter()
             .any(|code| code.starts_with("secret_leak.assignment.")));
+    }
+
+    #[test]
+    fn palyra_e2e_secret_fixture_markers_are_still_redacted() {
+        let source = "token=palyra_e2e_secret_should_not_appear";
+        let outcome = redact_text_for_export(
+            source,
+            SafetySourceKind::Workspace,
+            SafetyContentKind::WorkspaceDocument,
+            TrustLabel::TrustedLocal,
+        );
+
+        assert!(outcome.redacted);
+        assert!(outcome.redacted_text.contains("[REDACTED_SECRET]"));
+        assert!(!outcome.redacted_text.contains("palyra_e2e_secret_should_not_appear"));
     }
 
     #[test]
