@@ -2267,32 +2267,36 @@ fn resolve_routine_schedule(
     }
     let schedule_timezone_mode =
         parse_optional_schedule_timezone_mode(payload.schedule_timezone.as_deref(), timezone_mode)?;
-    if let Some(phrase) = payload
-        .natural_language_schedule
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        let preview = natural_language_schedule_preview(
-            phrase,
-            schedule_timezone_mode,
-            unix_ms_now().map_err(internal_console_error)?,
-        )
-        .map_err(routine_registry_error_response)?;
-        let schedule_payload_json = schedule_payload_with_max_runs(
-            preview.schedule_payload_json,
-            payload.max_runs,
-            existing_job,
-        )?;
-        return Ok(ScheduleResolution {
-            schedule_type: parse_schedule_type(preview.schedule_type.as_str())?,
-            schedule_payload_json,
-            next_run_at_unix_ms: preview.next_run_at_unix_ms,
-            trigger_payload_json_override: None,
-        });
+    let explicit_schedule_type =
+        payload.schedule_type.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    if explicit_schedule_type.is_none() {
+        if let Some(phrase) = payload
+            .natural_language_schedule
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let preview = natural_language_schedule_preview(
+                phrase,
+                schedule_timezone_mode,
+                unix_ms_now().map_err(internal_console_error)?,
+            )
+            .map_err(routine_registry_error_response)?;
+            let schedule_payload_json = schedule_payload_with_max_runs(
+                preview.schedule_payload_json,
+                payload.max_runs,
+                existing_job,
+            )?;
+            return Ok(ScheduleResolution {
+                schedule_type: parse_schedule_type(preview.schedule_type.as_str())?,
+                schedule_payload_json,
+                next_run_at_unix_ms: preview.next_run_at_unix_ms,
+                trigger_payload_json_override: None,
+            });
+        }
     }
-    let schedule = build_console_schedule(payload.schedule_type.as_deref(), payload)
-        .map_err(runtime_status_response)?;
+    let schedule =
+        build_console_schedule(explicit_schedule_type, payload).map_err(runtime_status_response)?;
     let normalized = cron::normalize_schedule(
         Some(schedule),
         unix_ms_now().map_err(internal_console_error)?,
@@ -3105,6 +3109,30 @@ mod tests {
             serde_json::from_str(schedule.schedule_payload_json.as_str())
                 .expect("schedule payload should be valid json");
         assert_eq!(schedule_payload["interval_ms"], json!(60_000));
+        assert_eq!(schedule_payload["max_runs"], json!(2));
+    }
+
+    #[test]
+    fn routine_schedule_resolution_prefers_explicit_schedule_over_natural_language_phrase() {
+        let mut payload = schedule_upsert_payload();
+        payload.schedule_type = Some("every".to_owned());
+        payload.every_interval_ms = Some(30_000);
+        payload.natural_language_schedule = Some("in 1 second".to_owned());
+        payload.max_runs = Some(2);
+
+        let schedule = super::resolve_routine_schedule(
+            &payload,
+            RoutineTriggerKind::Schedule,
+            CronTimezoneMode::Utc,
+            None,
+        )
+        .expect("explicit every schedule should not be downgraded by natural language text");
+        let schedule_payload: serde_json::Value =
+            serde_json::from_str(schedule.schedule_payload_json.as_str())
+                .expect("schedule payload should be valid json");
+
+        assert_eq!(schedule.schedule_type, CronScheduleType::Every);
+        assert_eq!(schedule_payload["interval_ms"], json!(30_000));
         assert_eq!(schedule_payload["max_runs"], json!(2));
     }
 
