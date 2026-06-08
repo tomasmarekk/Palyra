@@ -2417,6 +2417,58 @@ mod tests {
     }
 
     #[test]
+    fn read_workspace_file_preserves_indexed_accumulator_source_expressions() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let file_path = tempdir.path().join("totals.ts");
+        let contents =
+            "function addToBucket(map: Record<string, number>, key: string, amount: number) {\n\
+                        const current = map[key] ?? 0;\n\
+                        map[key] = Math.round((current + amount) * 100) / 100;\n\
+                        }\n";
+        fs::write(file_path, contents).expect("workspace file should be written");
+        let input = WorkspaceReadFileInput {
+            path: "totals.ts".to_owned(),
+            workspace_root: None,
+            offset_bytes: 0,
+            max_bytes: None,
+        };
+
+        let output = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
+            .expect("workspace file should be readable");
+
+        assert!(!output.redacted);
+        assert_eq!(output.text.as_deref(), Some(contents));
+        assert_eq!(output.text_authoritative, None);
+        assert_eq!(output.redaction_notice, None);
+    }
+
+    #[test]
+    fn read_workspace_file_preserves_playwright_password_selectors() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let file_path = tempdir.path().join("login-form.spec.ts");
+        let contents = "import { test, expect } from '@playwright/test';\n\
+                        test('login form', async ({ page }) => {\n\
+                        await page.fill('input[name=\"password\"]', 'demo');\n\
+                        await expect(page.locator('input[name=\"password\"]')).toBeVisible();\n\
+                        });\n";
+        fs::write(file_path, contents).expect("workspace file should be written");
+        let input = WorkspaceReadFileInput {
+            path: "login-form.spec.ts".to_owned(),
+            workspace_root: None,
+            offset_bytes: 0,
+            max_bytes: None,
+        };
+
+        let output = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
+            .expect("workspace file should be readable");
+
+        assert!(!output.redacted);
+        assert_eq!(output.text.as_deref(), Some(contents));
+        assert_eq!(output.text_authoritative, None);
+        assert_eq!(output.redaction_notice, None);
+    }
+
+    #[test]
     fn read_workspace_file_returns_bounded_chunk() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         fs::write(tempdir.path().join("chunk.txt"), "abcdef").expect("workspace file should exist");

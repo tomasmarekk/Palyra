@@ -873,6 +873,7 @@ fn is_safe_secret_reference_value(key: &str, value: &str) -> bool {
         || is_obvious_placeholder_secret_value(normalized)
         || is_benign_mock_credential_fixture_value(normalized)
         || is_dom_input_value_reference(normalized)
+        || is_non_literal_source_expression_value(normalized)
 }
 
 fn is_vault_reference_value(value: &str) -> bool {
@@ -1073,6 +1074,42 @@ fn is_dom_input_value_reference(value: &str) -> bool {
         || compact.ends_with("?.textContent")
         || compact.ends_with(".innerText")
         || compact.ends_with("?.innerText")
+}
+
+fn is_non_literal_source_expression_value(value: &str) -> bool {
+    let normalized = value.trim().trim_end_matches([',', ';']).trim();
+    if normalized.is_empty()
+        || normalized.chars().next().is_some_and(|ch| matches!(ch, '"' | '\'' | '`'))
+        || contains_secret_like_marker(normalized)
+        || detect_prefixed_secret_token(normalized).is_some()
+    {
+        return false;
+    }
+    let lowered = normalized.to_ascii_lowercase();
+    if lowered.starts_with("bearer ")
+        || lowered.starts_with("sk-")
+        || lowered.starts_with("ghp_")
+        || lowered.starts_with("github_pat_")
+        || lowered.starts_with("xox")
+        || lowered.starts_with("akia")
+    {
+        return false;
+    }
+    normalized.contains('(')
+        || normalized.contains("=>")
+        || normalized.contains("?.")
+        || normalized.contains("??")
+        || normalized.contains("||")
+        || normalized.contains("&&")
+        || has_whitespace_bounded_source_operator(normalized)
+}
+
+fn has_whitespace_bounded_source_operator(value: &str) -> bool {
+    value.contains(" + ")
+        || value.contains(" - ")
+        || value.contains(" * ")
+        || value.contains(" / ")
+        || value.contains(" % ")
 }
 
 fn is_quoted_env_identifier(value: &str) -> bool {
@@ -2157,6 +2194,55 @@ mod tests {
 
         assert!(!outcome.redacted);
         assert_eq!(outcome.redacted_text, source);
+        assert!(!outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code.starts_with("secret_leak.assignment.")));
+    }
+
+    #[test]
+    fn source_indexed_accumulator_assignments_are_not_redacted_as_secrets() {
+        let source = "function addToBucket(map, key, amount) {\n\
+                      const current = map[key] ?? 0;\n\
+                      map[key] = Math.round((current + amount) * 100) / 100;\n\
+                      }";
+        let outcome = redact_text_for_export(
+            source,
+            SafetySourceKind::Workspace,
+            SafetyContentKind::WorkspaceDocument,
+            TrustLabel::TrustedLocal,
+        );
+
+        assert!(!outcome.redacted);
+        assert_eq!(outcome.redacted_text, source);
+        assert!(outcome.redacted_text.contains("map[key] = Math.round"));
+        assert!(!outcome.redacted_text.contains("[REDACTED_SECRET]"));
+        assert!(!outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code.starts_with("secret_leak.assignment.")));
+    }
+
+    #[test]
+    fn playwright_password_selectors_are_not_redacted_as_secret_values() {
+        let source = "import { test, expect } from '@playwright/test';\n\
+                      test('login form', async ({ page }) => {\n\
+                      await page.fill('input[name=\"password\"]', 'demo');\n\
+                      await expect(page.locator('input[name=\"password\"]')).toBeVisible();\n\
+                      });";
+        let outcome = redact_text_for_export(
+            source,
+            SafetySourceKind::Workspace,
+            SafetyContentKind::WorkspaceDocument,
+            TrustLabel::TrustedLocal,
+        );
+
+        assert!(!outcome.redacted);
+        assert_eq!(outcome.redacted_text, source);
+        assert!(outcome.redacted_text.contains("input[name=\"password\"]"));
+        assert!(!outcome.redacted_text.contains("[REDACTED_SECRET]"));
         assert!(!outcome
             .scan
             .finding_codes()
