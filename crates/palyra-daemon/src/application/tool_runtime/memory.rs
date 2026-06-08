@@ -22,7 +22,10 @@ use crate::{
         recall::{preview_recall, RecallPreviewEnvelope, RecallRequest},
         service_authorization::authorize_memory_action,
         session_compaction::truncate_console_text,
-        tool_runtime::workspace_scope::workspace_roots_with_run_launch_context_for_agent_source,
+        tool_runtime::workspace_scope::{
+            workspace_roots_with_run_launch_context,
+            workspace_roots_with_run_launch_context_for_agent_source,
+        },
     },
     domain::workspace::{normalize_workspace_path, normalize_workspace_prefix},
     gateway::{
@@ -1825,54 +1828,70 @@ pub(crate) async fn execute_memory_search_tool(
         };
         let explicit_workspace_prefix = optional_trimmed_string(parsed.get("workspace_prefix"))
             .or_else(|| optional_trimmed_string(parsed.get("prefix")));
-        let workspace_prefix = match workspace_memory_search_prefix(
-            explicit_workspace_prefix.as_deref(),
-            "workspace",
-            None,
-        ) {
-            Ok(prefix) => prefix,
-            Err(error) => {
-                return memory_tool_execution_outcome(
-                    attestation_namespace,
-                    proposal_id,
-                    input_json,
-                    false,
-                    b"{}".to_vec(),
-                    format!("palyra.memory.search {error}"),
-                );
-            }
+        let inferred_workspace_prefix = if explicit_workspace_prefix.is_none() {
+            infer_project_memory_prefix(runtime_state, context).await
+        } else {
+            None
         };
-        let workspace_hits = match runtime_state
-            .search_workspace_documents(WorkspaceSearchRequest {
-                principal: principal.to_owned(),
-                channel: channel.map(str::to_owned),
-                agent_id: optional_trimmed_string(parsed.get("agent_id")),
-                query,
-                prefix: workspace_prefix.clone(),
-                top_k,
-                min_score,
-                include_historical: parsed
-                    .get("include_workspace_historical")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                include_quarantined: parsed
-                    .get("include_workspace_quarantined")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-            })
-            .await
-        {
-            Ok(hits) => hits,
-            Err(error) => {
-                return memory_tool_execution_outcome(
-                    attestation_namespace,
-                    proposal_id,
-                    input_json,
-                    false,
-                    b"{}".to_vec(),
-                    format!("palyra.memory.search workspace search failed: {}", error.message()),
-                );
+        let workspace_prefix = if explicit_workspace_prefix.is_some() {
+            match workspace_memory_search_prefix(
+                explicit_workspace_prefix.as_deref(),
+                "workspace",
+                None,
+            ) {
+                Ok(prefix) => prefix,
+                Err(error) => {
+                    return memory_tool_execution_outcome(
+                        attestation_namespace,
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        format!("palyra.memory.search {error}"),
+                    );
+                }
             }
+        } else {
+            inferred_workspace_prefix
+        };
+        let workspace_hits = if let Some(prefix) = workspace_prefix.clone() {
+            match runtime_state
+                .search_workspace_documents(WorkspaceSearchRequest {
+                    principal: principal.to_owned(),
+                    channel: channel.map(str::to_owned),
+                    agent_id: optional_trimmed_string(parsed.get("agent_id")),
+                    query,
+                    prefix: Some(prefix),
+                    top_k,
+                    min_score,
+                    include_historical: parsed
+                        .get("include_workspace_historical")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    include_quarantined: parsed
+                        .get("include_workspace_quarantined")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                })
+                .await
+            {
+                Ok(hits) => hits,
+                Err(error) => {
+                    return memory_tool_execution_outcome(
+                        attestation_namespace,
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        format!(
+                            "palyra.memory.search workspace search failed: {}",
+                            error.message()
+                        ),
+                    );
+                }
+            }
+        } else {
+            Vec::new()
         };
         let payload = combined_memory_search_tool_output_payload(
             memory_hits.as_slice(),
@@ -2775,7 +2794,10 @@ async fn resolve_memory_agent_workspace_roots(
         .await
     {
         Ok(agent_outcome) => agent_outcome,
-        Err(_) => return Vec::new(),
+        Err(_) => {
+            return workspace_roots_with_run_launch_context(runtime_state, context.run_id, &[])
+                .await;
+        }
     };
     let workspace_roots =
         agent_outcome.agent.workspace_roots.iter().map(PathBuf::from).collect::<Vec<_>>();

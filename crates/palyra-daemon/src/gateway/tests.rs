@@ -5350,7 +5350,7 @@ async fn memory_session_search_tool_returns_session_fallback_when_windows_are_em
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn memory_search_tool_defaults_to_all_durable_scopes() {
+async fn memory_search_tool_defaults_to_all_durable_scopes_without_workspace_leak() {
     let state = build_test_runtime_state(false);
     let context = routines_tool_test_context();
     let marker = "PALYRA_DEFAULT_ALL_MEMORY_MARKER";
@@ -5417,8 +5417,8 @@ async fn memory_search_tool_defaults_to_all_durable_scopes() {
         "default search should include lifecycle memory hits: {payload}"
     );
     assert!(
-        payload.get("workspace_hit_count").and_then(Value::as_u64).unwrap_or(0) >= 1,
-        "default search should include workspace/project memory hits: {payload}"
+        payload.get("workspace_hit_count").and_then(Value::as_u64).unwrap_or(0) == 0,
+        "default search without an active project must not search every workspace document: {payload}"
     );
     let hits =
         payload.get("hits").and_then(Value::as_array).expect("search output should include hits");
@@ -5431,12 +5431,11 @@ async fn memory_search_tool_defaults_to_all_durable_scopes() {
         "default search should surface principal memory: {payload}"
     );
     assert!(
-        hits.iter().any(|hit| {
-            hit.get("hit_source").and_then(Value::as_str) == Some("workspace")
-                && hit.pointer("/document/path").and_then(Value::as_str)
-                    == Some("projects/e2e/default-memory.md")
+        hits.iter().all(|hit| {
+            hit.pointer("/document/path").and_then(Value::as_str)
+                != Some("projects/e2e/default-memory.md")
         }),
-        "default search should surface workspace/project memory: {payload}"
+        "default search must not surface workspace/project memory without an active project: {payload}"
     );
     assert!(
         hits.iter().all(|hit| {
@@ -5445,6 +5444,110 @@ async fn memory_search_tool_defaults_to_all_durable_scopes() {
                 .is_none_or(|content| !content.contains("Cross-channel feature flag"))
         }),
         "default search must not surface channel-scoped memory from another channel: {payload}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn memory_search_tool_all_scope_uses_active_project_workspace_prefix() {
+    let state = build_test_runtime_state(false);
+    let context = routines_tool_test_context();
+    ensure_tool_context_session(&state, &context);
+    let marker = "PALYRA_ACTIVE_PROJECT_ALL_SCOPE_MARKER";
+
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let project_root = tempdir.path().join("project-a");
+    fs::create_dir_all(project_root.as_path()).expect("project root should be created");
+    let project_root_text = project_root.to_string_lossy().into_owned();
+    state
+        .start_orchestrator_run(OrchestratorRunStartRequest {
+            run_id: context.run_id.to_owned(),
+            session_id: context.session_id.to_owned(),
+            origin_kind: "memory_all_scope_project_boundary_test".to_owned(),
+            origin_run_id: None,
+            triggered_by_principal: Some(context.principal.to_owned()),
+            parameter_delta_json: Some(
+                json!({
+                    "cli_context": {
+                        "launch_cwd": project_root_text,
+                        "workspace_roots": [project_root_text],
+                    }
+                })
+                .to_string(),
+            ),
+        })
+        .await
+        .expect("orchestrator run should start with launch workspace metadata");
+
+    let retain = execute_memory_retain_tool(
+        &state,
+        context,
+        "01ARZ3NDEKTSV4RRFFQ69G5F06",
+        format!(
+            r#"{{"content_text":"Project A build target is {marker}.","scope":"project","source":"manual","confidence":0.95}}"#
+        )
+        .as_bytes(),
+    )
+    .await;
+    assert!(retain.success, "project retain should succeed: {}", retain.error);
+    let retained_path = parse_tool_output_json(&retain)
+        .pointer("/document/path")
+        .and_then(Value::as_str)
+        .expect("project retain output should include document path")
+        .to_owned();
+
+    state
+        .upsert_workspace_document(WorkspaceDocumentWriteRequest {
+            document_id: None,
+            principal: context.principal.to_owned(),
+            channel: context.channel.map(str::to_owned),
+            agent_id: None,
+            session_id: Some(context.session_id.to_owned()),
+            path: "projects/project-b/MEMORY.md".to_owned(),
+            title: Some("Project B Memory".to_owned()),
+            content_text: format!(
+                "Project B build target should not leak into Project A: {marker}"
+            ),
+            template_id: None,
+            template_version: None,
+            template_content_hash: None,
+            source_memory_id: None,
+            manual_override: false,
+        })
+        .await
+        .expect("workspace noise document should be indexed");
+
+    let search = execute_memory_search_tool(
+        &state,
+        context,
+        "01ARZ3NDEKTSV4RRFFQ69G5F07",
+        format!(r#"{{"query":"{marker}","scope":"all","top_k":4,"min_score":0.0}}"#).as_bytes(),
+    )
+    .await;
+
+    assert!(search.success, "all-scope search should succeed: {}", search.error);
+    let payload = parse_tool_output_json(&search);
+    assert_eq!(payload.get("scope").and_then(Value::as_str), Some("all"));
+    assert_eq!(
+        payload.get("workspace_prefix").and_then(Value::as_str),
+        retained_path.strip_suffix("/MEMORY.md"),
+        "all-scope search should report the inferred active project prefix: {payload}"
+    );
+    let hits =
+        payload.get("hits").and_then(Value::as_array).expect("search output should include hits");
+    assert!(
+        hits.iter().any(|hit| {
+            hit.get("hit_source").and_then(Value::as_str) == Some("workspace")
+                && hit.pointer("/document/path").and_then(Value::as_str)
+                    == Some(retained_path.as_str())
+        }),
+        "all-scope search should surface active project memory: {payload}"
+    );
+    assert!(
+        hits.iter().all(|hit| {
+            hit.pointer("/document/path").and_then(Value::as_str)
+                != Some("projects/project-b/MEMORY.md")
+        }),
+        "all-scope search must not surface a different project workspace memory: {payload}"
     );
 }
 
