@@ -6431,54 +6431,38 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    fn host_access_process_runner_runs_pnpm_from_verbatim_workspace_cwd() {
-        let pnpm_version_output = match Command::new("pnpm").arg("--version").output() {
-            Ok(output) if output.status.success() => output,
-            _ => return,
-        };
-        let pnpm_version =
-            String::from_utf8_lossy(pnpm_version_output.stdout.as_slice()).trim().to_owned();
-        if pnpm_version.is_empty() {
-            return;
-        }
-
-        let workspace = unique_temp_dir("workspace-pnpm-verbatim");
-        fs::create_dir_all(workspace.join("scripts")).expect("workspace scripts should exist");
+    fn host_access_process_runner_resolves_virtual_workspace_cwd_for_workspace_script() {
+        let workspace = unique_temp_dir("workspace-script-verbatim");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        fs::write(workspace.join("marker.txt"), b"workspace marker\n")
+            .expect("workspace marker should be written");
         fs::write(
-            workspace.join("package.json"),
-            format!(
-                r#"{{
-  "name": "palyra-process-pnpm-smoke",
-  "private": true,
-  "packageManager": "pnpm@{pnpm_version}",
-  "scripts": {{
-    "test": "node scripts/verify-helper.mjs"
-  }}
-}}
-"#
-            ),
+            workspace.join("verify-helper.cmd"),
+            b"@echo off\r\nif not exist marker.txt exit /b 21\r\necho S046_HELPER_OK:%~1\r\n",
         )
-        .expect("package.json should be written");
-        fs::write(
-            workspace.join("scripts").join("verify-helper.mjs"),
-            "console.log('S046_HELPER_OK');\n",
-        )
-        .expect("verify helper should be written");
+        .expect("workspace helper script should be written");
         let verbatim_workspace = PathBuf::from(format!(r"\\?\{}", workspace.to_string_lossy()));
-        let policy = host_access_policy(verbatim_workspace);
-        let input = br#"{"command":"pnpm","args":["test"],"timeout_ms":15000}"#;
+        for input in [
+            br#"{"command":"verify-helper.cmd","args":["default"],"timeout_ms":5000}"#.as_slice(),
+            br#"{"command":"verify-helper.cmd","args":["alias"],"cwd":"/workspace","timeout_ms":5000}"#
+                .as_slice(),
+        ] {
+            let policy = host_access_policy(verbatim_workspace.clone());
+            let result = run_constrained_process(&policy, input, Duration::from_millis(10_000))
+                .expect("host-access process runner should resolve cwd before command dispatch");
+            let output: serde_json::Value =
+                serde_json::from_slice(&result.output_json).expect("output should parse");
+            let stdout =
+                output.get("stdout").and_then(serde_json::Value::as_str).unwrap_or_default();
+            let stderr =
+                output.get("stderr").and_then(serde_json::Value::as_str).unwrap_or_default();
 
-        let result = run_constrained_process(&policy, input, Duration::from_millis(20_000))
-            .expect("host-access process runner should execute pnpm from a verbatim workspace cwd");
-        let output: serde_json::Value =
-            serde_json::from_slice(&result.output_json).expect("output should parse");
-        let stdout = output.get("stdout").and_then(serde_json::Value::as_str).unwrap_or_default();
-        let stderr = output.get("stderr").and_then(serde_json::Value::as_str).unwrap_or_default();
-
-        assert!(
-            stdout.contains("S046_HELPER_OK") || stderr.contains("S046_HELPER_OK"),
-            "pnpm test should reach the package script, stdout={stdout:?}, stderr={stderr:?}"
-        );
+            assert!(
+                stdout.contains("S046_HELPER_OK") || stderr.contains("S046_HELPER_OK"),
+                "workspace script should run from the resolved cwd for input={}, stdout={stdout:?}, stderr={stderr:?}",
+                String::from_utf8_lossy(input),
+            );
+        }
 
         let _ = fs::remove_dir_all(workspace.as_path());
     }
