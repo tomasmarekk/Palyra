@@ -35,7 +35,8 @@ use crate::journal::{
     MemoryItemRecord, MemoryScoreBreakdown, MemorySearchHit, MemorySearchRequest, MemorySource,
     OrchestratorBackgroundTaskCreateRequest, OrchestratorBackgroundTaskUpdateRequest,
     OrchestratorRunStartRequest, OrchestratorSessionResolveRequest,
-    OrchestratorSessionUpsertRequest, OrchestratorTapeAppendRequest, WorkspaceDocumentWriteRequest,
+    OrchestratorSessionUpsertRequest, OrchestratorTapeAppendRequest,
+    SessionProjectContextStateUpsertRequest, WorkspaceDocumentWriteRequest,
 };
 use tonic::{transport::Server as TonicServer, Code};
 use ulid::Ulid;
@@ -6957,6 +6958,98 @@ async fn workspace_patch_tool_applies_patch_and_emits_attested_hashes() {
         created_file.get("after_sha256").and_then(Value::as_str),
         Some(created_file_hash.as_str()),
         "after hash should match newly created file"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_patch_tool_preserves_subdirectory_path_under_active_scenario_workspace() {
+    let state = build_test_runtime_state(false);
+    let harness_root = tempfile::tempdir().expect("harness root should be created");
+    let scenario_workspace =
+        harness_root.path().join("e2e-scenarios").join("S040").join("workspace");
+    let reports_dir = scenario_workspace.join("reports");
+    fs::create_dir_all(reports_dir.as_path()).expect("reports directory should exist");
+    state
+        .create_agent(AgentCreateRequest {
+            agent_id: "patcher-s040".to_owned(),
+            display_name: "Patcher S040".to_owned(),
+            agent_dir: None,
+            workspace_roots: vec![harness_root.path().to_string_lossy().into_owned()],
+            default_model_profile: None,
+            execution_backend_preference: None,
+            default_tool_allowlist: Vec::new(),
+            default_skill_allowlist: Vec::new(),
+            set_default: true,
+            allow_absolute_paths: true,
+        })
+        .await
+        .expect("agent should be created");
+    let context = super::ToolRuntimeExecutionContext {
+        principal: "user:ops",
+        device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAA",
+        channel: Some("cli"),
+        session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        run_id: "01ARZ3NDEKTSV4RRFFQ69G5FBA",
+        execution_backend: ExecutionBackendPreference::LocalSandbox,
+        backend_reason_code: "backend.default.local_sandbox",
+    };
+    ensure_tool_context_session(&state, &context);
+    state
+        .upsert_session_project_context_state(SessionProjectContextStateUpsertRequest {
+            session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            focus_paths: vec!["e2e-scenarios/S040/workspace".to_owned()],
+            disabled_entry_ids: Vec::new(),
+            approved_entry_ids: Vec::new(),
+            last_refreshed_at_unix_ms: None,
+        })
+        .await
+        .expect("session focus should be stored");
+
+    let patch = concat!(
+        "*** Begin Patch\n",
+        "*** Add File: reports/workspace-report.md\n",
+        "+palyra-os-level-ok\n",
+        "*** End Patch\n",
+    );
+    let input_json =
+        serde_json::to_vec(&json!({ "patch": patch })).expect("patch input should serialize");
+    let outcome = execute_workspace_patch_tool(
+        &state,
+        workspace_patch_test_request("01ARZ3NDEKTSV4RRFFQ69G5FB3", input_json.as_slice()),
+    )
+    .await;
+    assert!(outcome.success, "patch tool should apply nested report path: {}", outcome.error);
+
+    let expected = reports_dir.join("workspace-report.md");
+    let misplaced = scenario_workspace.join("workspace-report.md");
+    assert!(
+        expected.exists(),
+        "patch should create the requested reports/workspace-report.md path"
+    );
+    assert!(
+        !misplaced.exists(),
+        "patch must not drop reports/ and create a workspace-root report file"
+    );
+    let payload: Value =
+        serde_json::from_slice(&outcome.output_json).expect("output should parse as JSON");
+    let files = payload
+        .get("files_touched")
+        .and_then(Value::as_array)
+        .expect("files_touched must be present");
+    assert!(
+        files.iter().any(|entry| {
+            entry.get("path").and_then(Value::as_str) == Some("reports/workspace-report.md")
+        }),
+        "files_touched should preserve the subdirectory path: {payload}"
+    );
+    let preview = payload.get("redacted_preview").and_then(Value::as_str).unwrap_or_default();
+    assert!(
+        preview.contains("*** Add File: reports/workspace-report.md"),
+        "redacted preview should preserve the subdirectory path: {payload}"
+    );
+    assert!(
+        !preview.contains("*** Add File: workspace-report.md"),
+        "redacted preview must not show a dropped path prefix: {payload}"
     );
 }
 
