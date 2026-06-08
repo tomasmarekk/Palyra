@@ -5384,7 +5384,15 @@ async fn memory_session_search_tool_returns_session_fallback_when_windows_are_em
         .get("session_hits")
         .and_then(Value::as_array)
         .expect("session fallback hits should be present");
-    assert_eq!(session_hits[0].get("session_id").and_then(Value::as_str), Some(prior_session_id));
+    assert_eq!(session_hits[0].get("session_id").and_then(Value::as_str), Some("prior_session_1"));
+    assert_eq!(
+        session_hits[0].get("session_search_label").and_then(Value::as_str),
+        Some("prior_session_1")
+    );
+    assert!(
+        !session_hits[0].to_string().contains(prior_session_id),
+        "session fallback hit must not expose raw internal ids: {payload}"
+    );
     assert!(
         session_hits[0]
             .get("match_snippet")

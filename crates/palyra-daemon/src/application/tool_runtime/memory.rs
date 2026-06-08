@@ -38,9 +38,10 @@ use crate::{
     journal::{
         MemoryItemLifecycleUpdateRequest, MemoryItemRecord, MemoryMaintenanceStatus,
         MemorySearchHit, MemorySearchRequest, MemorySource, OrchestratorSessionRecord,
-        SessionSearchOutcome, SessionSearchRequest, WorkspaceDocumentDeleteRequest,
-        WorkspaceDocumentRecord, WorkspaceDocumentWriteRequest, WorkspaceSearchHit,
-        WorkspaceSearchRequest,
+        SessionSearchEvent, SessionSearchGroup, SessionSearchLineage, SessionSearchOutcome,
+        SessionSearchProvenanceRef, SessionSearchRequest, SessionSearchRunRef, SessionSearchWindow,
+        WorkspaceDocumentDeleteRequest, WorkspaceDocumentRecord, WorkspaceDocumentWriteRequest,
+        WorkspaceSearchHit, WorkspaceSearchRequest,
     },
     tool_protocol::{ToolAttestation, ToolExecutionOutcome},
     transport::grpc::auth::RequestContext,
@@ -406,33 +407,30 @@ pub(crate) fn memory_session_search_tool_output_payload(
 ) -> Value {
     let window_count = outcome.groups.iter().map(|group| group.windows.len()).sum::<usize>();
     let evidence_count = window_count.saturating_add(session_hits.len());
+    let labels = session_search_output_labels(outcome, session_hits);
     json!({
         "query": outcome.query,
         "group_count": outcome.groups.len(),
         "window_count": window_count,
         "session_hit_count": session_hits.len(),
+        "id_policy": {
+            "raw_internal_ids": "omitted",
+            "citation_style": "cite session_search_label values such as prior_session_1, not raw session_id or run_id values",
+        },
         "claim_boundary": if evidence_count == 0 {
             SESSION_SEARCH_HITS_ABSENT_CLAIM_BOUNDARY
         } else {
             SESSION_SEARCH_HITS_PRESENT_CLAIM_BOUNDARY
         },
-        "session_hits": session_hits.iter().map(session_search_session_hit_payload).collect::<Vec<_>>(),
-        "groups": outcome.groups.iter().map(|group| {
-            json!({
-                "session": {
-                    "session_id": group.session.session_id,
-                    "session_key": group.session.session_key,
-                    "title": group.session.title,
-                    "preview": group.session.preview,
-                    "last_run_state": group.session.last_run_state,
-                    "updated_at_unix_ms": group.session.updated_at_unix_ms,
-                },
-                "best_score": group.best_score,
-                "match_count": group.match_count,
-                "lineage": group.lineage,
-                "windows": group.windows,
-            })
-        }).collect::<Vec<_>>(),
+        "session_hits": session_hits
+            .iter()
+            .map(|session| session_search_session_hit_payload(session, &labels))
+            .collect::<Vec<_>>(),
+        "groups": outcome
+            .groups
+            .iter()
+            .map(|group| session_search_group_payload(group, &labels))
+            .collect::<Vec<_>>(),
         "diagnostics": outcome.diagnostics,
         "session_fallback": {
             "source_kind": "session",
@@ -447,10 +445,267 @@ pub(crate) fn memory_session_search_tool_output_payload(
     })
 }
 
-fn session_search_session_hit_payload(session: &OrchestratorSessionRecord) -> Value {
+#[derive(Debug, Default)]
+struct SessionSearchOutputLabels {
+    session_labels: BTreeMap<String, String>,
+    run_labels: BTreeMap<String, String>,
+}
+
+impl SessionSearchOutputLabels {
+    fn insert_session(&mut self, session_id: &str) {
+        if self.session_labels.contains_key(session_id) {
+            return;
+        }
+        let label = format!("prior_session_{}", self.session_labels.len().saturating_add(1));
+        self.session_labels.insert(session_id.to_owned(), label);
+    }
+
+    fn insert_run(&mut self, run_id: &str) {
+        if self.run_labels.contains_key(run_id) {
+            return;
+        }
+        let label = format!("prior_run_{}", self.run_labels.len().saturating_add(1));
+        self.run_labels.insert(run_id.to_owned(), label);
+    }
+
+    fn session_label(&self, session_id: &str) -> String {
+        self.session_labels
+            .get(session_id)
+            .cloned()
+            .unwrap_or_else(|| "prior_session_unknown".to_owned())
+    }
+
+    fn run_label(&self, run_id: &str) -> String {
+        self.run_labels.get(run_id).cloned().unwrap_or_else(|| "prior_run_unknown".to_owned())
+    }
+
+    fn optional_session_label(&self, session_id: Option<&str>) -> Option<String> {
+        session_id.map(|value| self.session_label(value))
+    }
+
+    fn optional_run_label(&self, run_id: Option<&str>) -> Option<String> {
+        run_id.map(|value| self.run_label(value))
+    }
+}
+
+fn session_search_output_labels(
+    outcome: &SessionSearchOutcome,
+    session_hits: &[OrchestratorSessionRecord],
+) -> SessionSearchOutputLabels {
+    let mut labels = SessionSearchOutputLabels::default();
+    for group in &outcome.groups {
+        labels.insert_session(group.session.session_id.as_str());
+        collect_session_record_refs(&mut labels, &group.session);
+        collect_session_lineage_refs(&mut labels, &group.lineage);
+        for window in &group.windows {
+            collect_session_window_refs(&mut labels, window);
+        }
+    }
+    for session in session_hits {
+        labels.insert_session(session.session_id.as_str());
+        collect_session_record_refs(&mut labels, session);
+    }
+    labels
+}
+
+fn collect_session_record_refs(
+    labels: &mut SessionSearchOutputLabels,
+    session: &OrchestratorSessionRecord,
+) {
+    if let Some(parent_session_id) = session.parent_session_id.as_deref() {
+        labels.insert_session(parent_session_id);
+    }
+    if let Some(run_id) = session.last_run_id.as_deref() {
+        labels.insert_run(run_id);
+    }
+    if let Some(run_id) = session.branch_origin_run_id.as_deref() {
+        labels.insert_run(run_id);
+    }
+}
+
+fn collect_session_lineage_refs(
+    labels: &mut SessionSearchOutputLabels,
+    lineage: &SessionSearchLineage,
+) {
+    if let Some(parent_session_id) = lineage.parent_session_id.as_deref() {
+        labels.insert_session(parent_session_id);
+    }
+    if let Some(run_id) = lineage.branch_origin_run_id.as_deref() {
+        labels.insert_run(run_id);
+    }
+    for run in &lineage.runs {
+        collect_session_run_ref_refs(labels, run);
+    }
+}
+
+fn collect_session_run_ref_refs(labels: &mut SessionSearchOutputLabels, run: &SessionSearchRunRef) {
+    labels.insert_run(run.run_id.as_str());
+    if let Some(run_id) = run.origin_run_id.as_deref() {
+        labels.insert_run(run_id);
+    }
+    if let Some(run_id) = run.parent_run_id.as_deref() {
+        labels.insert_run(run_id);
+    }
+}
+
+fn collect_session_window_refs(
+    labels: &mut SessionSearchOutputLabels,
+    window: &SessionSearchWindow,
+) {
+    labels.insert_session(window.session_id.as_str());
+    labels.insert_run(window.run_id.as_str());
+    collect_session_provenance_refs(labels, &window.provenance);
+    for event in &window.before {
+        collect_session_event_refs(labels, event);
+    }
+    collect_session_event_refs(labels, &window.matched);
+    for event in &window.after {
+        collect_session_event_refs(labels, event);
+    }
+}
+
+fn collect_session_event_refs(labels: &mut SessionSearchOutputLabels, event: &SessionSearchEvent) {
+    labels.insert_session(event.session_id.as_str());
+    labels.insert_run(event.run_id.as_str());
+    if let Some(run_id) = event.origin_run_id.as_deref() {
+        labels.insert_run(run_id);
+    }
+    if let Some(run_id) = event.parent_run_id.as_deref() {
+        labels.insert_run(run_id);
+    }
+}
+
+fn collect_session_provenance_refs(
+    labels: &mut SessionSearchOutputLabels,
+    provenance: &SessionSearchProvenanceRef,
+) {
+    labels.insert_session(provenance.session_id.as_str());
+    labels.insert_run(provenance.run_id.as_str());
+}
+
+fn session_search_group_payload(
+    group: &SessionSearchGroup,
+    labels: &SessionSearchOutputLabels,
+) -> Value {
+    json!({
+        "session": {
+            "session_id": labels.session_label(group.session.session_id.as_str()),
+            "session_search_label": labels.session_label(group.session.session_id.as_str()),
+            "session_key": group.session.session_key,
+            "title": group.session.title,
+            "preview": group.session.preview,
+            "last_run_state": group.session.last_run_state,
+            "updated_at_unix_ms": group.session.updated_at_unix_ms,
+        },
+        "best_score": group.best_score,
+        "match_count": group.match_count,
+        "lineage": session_search_lineage_payload(&group.lineage, labels),
+        "windows": group
+            .windows
+            .iter()
+            .map(|window| session_search_window_payload(window, labels))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn session_search_lineage_payload(
+    lineage: &SessionSearchLineage,
+    labels: &SessionSearchOutputLabels,
+) -> Value {
+    json!({
+        "branch_state": lineage.branch_state,
+        "parent_session_id": labels.optional_session_label(lineage.parent_session_id.as_deref()),
+        "branch_origin_run_id": labels.optional_run_label(lineage.branch_origin_run_id.as_deref()),
+        "runs": lineage
+            .runs
+            .iter()
+            .map(|run| session_search_run_ref_payload(run, labels))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn session_search_run_ref_payload(
+    run: &SessionSearchRunRef,
+    labels: &SessionSearchOutputLabels,
+) -> Value {
+    json!({
+        "run_id": labels.run_label(run.run_id.as_str()),
+        "origin_kind": run.origin_kind,
+        "origin_run_id": labels.optional_run_label(run.origin_run_id.as_deref()),
+        "parent_run_id": labels.optional_run_label(run.parent_run_id.as_deref()),
+    })
+}
+
+fn session_search_window_payload(
+    window: &SessionSearchWindow,
+    labels: &SessionSearchOutputLabels,
+) -> Value {
+    let session_label = labels.session_label(window.session_id.as_str());
+    let run_label = labels.run_label(window.run_id.as_str());
+    json!({
+        "window_id": format!("session:{session_label}:run:{run_label}:seq:{}", window.match_seq),
+        "session_id": session_label,
+        "run_id": run_label,
+        "match_seq": window.match_seq,
+        "match_event_type": window.match_event_type,
+        "match_created_at_unix_ms": window.match_created_at_unix_ms,
+        "score": window.score,
+        "snippet": window.snippet,
+        "before": window
+            .before
+            .iter()
+            .map(|event| session_search_event_payload(event, labels))
+            .collect::<Vec<_>>(),
+        "matched": session_search_event_payload(&window.matched, labels),
+        "after": window
+            .after
+            .iter()
+            .map(|event| session_search_event_payload(event, labels))
+            .collect::<Vec<_>>(),
+        "provenance": session_search_provenance_payload(&window.provenance, labels),
+    })
+}
+
+fn session_search_event_payload(
+    event: &SessionSearchEvent,
+    labels: &SessionSearchOutputLabels,
+) -> Value {
+    json!({
+        "session_id": labels.session_label(event.session_id.as_str()),
+        "run_id": labels.run_label(event.run_id.as_str()),
+        "seq": event.seq,
+        "event_type": event.event_type,
+        "created_at_unix_ms": event.created_at_unix_ms,
+        "origin_kind": event.origin_kind,
+        "origin_run_id": labels.optional_run_label(event.origin_run_id.as_deref()),
+        "parent_run_id": labels.optional_run_label(event.parent_run_id.as_deref()),
+        "text": event.text,
+        "is_match": event.is_match,
+    })
+}
+
+fn session_search_provenance_payload(
+    provenance: &SessionSearchProvenanceRef,
+    labels: &SessionSearchOutputLabels,
+) -> Value {
+    json!({
+        "source_type": provenance.source_type,
+        "session_id": labels.session_label(provenance.session_id.as_str()),
+        "run_id": labels.run_label(provenance.run_id.as_str()),
+        "tape_seq": provenance.tape_seq,
+        "event_type": provenance.event_type,
+        "created_at_unix_ms": provenance.created_at_unix_ms,
+    })
+}
+
+fn session_search_session_hit_payload(
+    session: &OrchestratorSessionRecord,
+    labels: &SessionSearchOutputLabels,
+) -> Value {
     json!({
         "source_type": "session",
-        "session_id": session.session_id.as_str(),
+        "session_id": labels.session_label(session.session_id.as_str()),
+        "session_search_label": labels.session_label(session.session_id.as_str()),
         "session_key": session.session_key.as_str(),
         "title": session.title.as_str(),
         "preview": session.preview.as_deref(),
@@ -461,8 +716,8 @@ fn session_search_session_hit_payload(session: &OrchestratorSessionRecord) -> Va
         "updated_at_unix_ms": session.updated_at_unix_ms,
         "lineage": {
             "branch_state": session.branch_state.as_str(),
-            "parent_session_id": session.parent_session_id.as_deref(),
-            "branch_origin_run_id": session.branch_origin_run_id.as_deref(),
+            "parent_session_id": labels.optional_session_label(session.parent_session_id.as_deref()),
+            "branch_origin_run_id": labels.optional_run_label(session.branch_origin_run_id.as_deref()),
         },
     })
 }
@@ -3830,8 +4085,8 @@ mod tests {
     use crate::{
         application::recall::{RecallBudgetExplain, RecallPlan, StructuredRecallOutput},
         journal::{
-            MemoryMaintenanceStatus, MemoryUsageSnapshot, WorkspaceDocumentRecord,
-            WorkspaceScoreBreakdown, WorkspaceSearchHit,
+            MemoryMaintenanceStatus, MemoryUsageSnapshot, RetrievalBranchDiagnostics,
+            WorkspaceDocumentRecord, WorkspaceScoreBreakdown, WorkspaceSearchHit,
         },
     };
 
@@ -3933,6 +4188,128 @@ mod tests {
         .expect_err("string limits should be rejected");
 
         assert!(error.contains("window_before must be an integer"));
+    }
+
+    #[test]
+    fn session_search_payload_uses_labels_instead_of_raw_internal_ids() {
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FAS";
+        let run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAT";
+        let origin_run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAU";
+        let session = OrchestratorSessionRecord {
+            session_id: session_id.to_owned(),
+            session_key: "s036-session-a".to_owned(),
+            session_label: None,
+            principal: "user:ops".to_owned(),
+            device_id: "device".to_owned(),
+            channel: Some("cli".to_owned()),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 2,
+            last_run_id: Some(run_id.to_owned()),
+            archived_at_unix_ms: None,
+            auto_title: None,
+            auto_title_source: None,
+            auto_title_generator_version: None,
+            auto_title_updated_at_unix_ms: None,
+            title_generation_state: "idle".to_owned(),
+            manual_title_locked: false,
+            manual_title_updated_at_unix_ms: None,
+            model_profile_override: None,
+            thinking_override: None,
+            trace_override: None,
+            verbose_override: None,
+            title: "Feature flag note".to_owned(),
+            title_source: "manual".to_owned(),
+            title_generator_version: None,
+            preview: Some("temporary flag was mentioned".to_owned()),
+            last_intent: Some("remember temporary flag".to_owned()),
+            last_summary: Some("temporary flag PALYRA_E2E_BETA".to_owned()),
+            match_snippet: Some("PALYRA_E2E_BETA".to_owned()),
+            branch_state: "root".to_owned(),
+            parent_session_id: None,
+            branch_origin_run_id: Some(origin_run_id.to_owned()),
+            last_run_state: Some("done".to_owned()),
+        };
+        let event = SessionSearchEvent {
+            session_id: session_id.to_owned(),
+            run_id: run_id.to_owned(),
+            seq: 4,
+            event_type: "assistant_final".to_owned(),
+            created_at_unix_ms: 2,
+            origin_kind: "model".to_owned(),
+            origin_run_id: Some(origin_run_id.to_owned()),
+            parent_run_id: None,
+            text: "docasny feature flag se jmenuje PALYRA_E2E_BETA".to_owned(),
+            is_match: true,
+        };
+        let outcome = SessionSearchOutcome {
+            query: "feature flag".to_owned(),
+            groups: vec![SessionSearchGroup {
+                session: session.clone(),
+                best_score: 0.97,
+                match_count: 1,
+                lineage: SessionSearchLineage {
+                    branch_state: "root".to_owned(),
+                    parent_session_id: None,
+                    branch_origin_run_id: Some(origin_run_id.to_owned()),
+                    runs: vec![SessionSearchRunRef {
+                        run_id: run_id.to_owned(),
+                        origin_kind: "model".to_owned(),
+                        origin_run_id: Some(origin_run_id.to_owned()),
+                        parent_run_id: None,
+                    }],
+                },
+                windows: vec![SessionSearchWindow {
+                    window_id: format!("session:{session_id}:run:{run_id}:seq:4"),
+                    session_id: session_id.to_owned(),
+                    run_id: run_id.to_owned(),
+                    match_seq: 4,
+                    match_event_type: "assistant_final".to_owned(),
+                    match_created_at_unix_ms: 2,
+                    score: 0.97,
+                    snippet: "PALYRA_E2E_BETA".to_owned(),
+                    before: Vec::new(),
+                    matched: event,
+                    after: Vec::new(),
+                    provenance: SessionSearchProvenanceRef {
+                        source_type: "orchestrator_tape".to_owned(),
+                        session_id: session_id.to_owned(),
+                        run_id: run_id.to_owned(),
+                        tape_seq: 4,
+                        event_type: "assistant_final".to_owned(),
+                        created_at_unix_ms: 2,
+                    },
+                }],
+            }],
+            diagnostics: RetrievalBranchDiagnostics {
+                source_kind: "session_transcript".to_owned(),
+                query_embedding_cache_hit: false,
+                lexical_latency_ms: 0,
+                vector_latency_ms: 0,
+                fusion_latency_ms: 0,
+                total_latency_ms: 0,
+                latency_budget_ms: 0,
+                latency_budget_exceeded: false,
+                candidate_count: 1,
+                lexical_candidate_count: 1,
+                vector_candidate_count: 0,
+                fused_hit_count: 1,
+                degraded_reason: None,
+                coverage_gap: None,
+            },
+        };
+
+        let payload = memory_session_search_tool_output_payload(&outcome, &[session]);
+        let serialized = payload.to_string();
+
+        assert_eq!(payload["groups"][0]["session"]["session_id"], "prior_session_1");
+        assert_eq!(payload["groups"][0]["lineage"]["runs"][0]["run_id"], "prior_run_1");
+        assert_eq!(
+            payload["groups"][0]["windows"][0]["window_id"],
+            "session:prior_session_1:run:prior_run_1:seq:4"
+        );
+        assert!(!serialized.contains(session_id), "{serialized}");
+        assert!(!serialized.contains(run_id), "{serialized}");
+        assert!(!serialized.contains(origin_run_id), "{serialized}");
     }
 
     #[test]

@@ -106,7 +106,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
         ),
         entry(
             "palyra.memory.session_search",
-            "Search prior session transcripts for facts that were not stored as durable memory.",
+            "Search prior session transcripts for facts that were not stored as durable memory. Results expose stable prior_session/prior_run labels, not raw internal session_id or run_id values.",
             object_schema(
                 &["query"],
                 vec![
@@ -130,7 +130,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
         ),
         entry(
             "palyra.session_search",
-            "Compatibility alias for palyra.memory.session_search; search prior session transcripts for facts that were not stored as durable memory.",
+            "Compatibility alias for palyra.memory.session_search; search prior session transcripts for facts that were not stored as durable memory. Results expose stable prior_session/prior_run labels, not raw internal session_id or run_id values.",
             object_schema(
                 &["query"],
                 vec![
