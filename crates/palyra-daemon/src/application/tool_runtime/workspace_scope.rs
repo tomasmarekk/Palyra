@@ -7,6 +7,7 @@ use std::{
 
 use serde::Deserialize;
 
+use crate::agents::AgentResolutionSource;
 use crate::gateway::GatewayRuntimeState;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +26,18 @@ struct RunLaunchCliContext {
     launch_cwd: Option<String>,
     workspace_roots: Option<Vec<String>>,
     env: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Default)]
+struct RunLaunchWorkspaceRoots {
+    prompt_roots: Vec<PathBuf>,
+    launch_cwd: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchCwdPrecedence {
+    BeforeAgentRoots,
+    AfterAgentRoots,
 }
 
 const RUN_LAUNCH_SAFE_PATH_ENV_KEYS: &[&str] = &["PALYRA_E2E_HOME", "PALYRA_E2E_OS_ROOT"];
@@ -49,7 +62,27 @@ pub(crate) async fn workspace_roots_with_run_launch_context(
     workspace_roots: &[PathBuf],
 ) -> Vec<PathBuf> {
     let launch_roots = run_launch_context_workspace_roots(runtime_state, run_id).await;
-    merge_launch_workspace_roots(workspace_roots, launch_roots)
+    merge_launch_workspace_roots(
+        workspace_roots,
+        launch_roots,
+        LaunchCwdPrecedence::BeforeAgentRoots,
+    )
+}
+
+pub(crate) async fn workspace_roots_with_run_launch_context_for_agent_source(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    workspace_roots: &[PathBuf],
+    source: AgentResolutionSource,
+) -> Vec<PathBuf> {
+    let launch_roots = run_launch_context_workspace_roots(runtime_state, run_id).await;
+    let launch_cwd_precedence = match source {
+        AgentResolutionSource::SessionBinding => LaunchCwdPrecedence::AfterAgentRoots,
+        AgentResolutionSource::Default | AgentResolutionSource::Fallback => {
+            LaunchCwdPrecedence::BeforeAgentRoots
+        }
+    };
+    merge_launch_workspace_roots(workspace_roots, launch_roots, launch_cwd_precedence)
 }
 
 pub(crate) async fn run_launch_context_path_env(
@@ -74,18 +107,18 @@ pub(crate) async fn run_launch_context_path_env(
 async fn run_launch_context_workspace_roots(
     runtime_state: &Arc<GatewayRuntimeState>,
     run_id: &str,
-) -> Vec<PathBuf> {
+) -> RunLaunchWorkspaceRoots {
     let Some(run) =
         runtime_state.orchestrator_run_status_snapshot(run_id.to_owned()).await.ok().flatten()
     else {
-        return Vec::new();
+        return RunLaunchWorkspaceRoots::default();
     };
     let Some(parameter_delta_json) = run.parameter_delta_json.as_deref() else {
-        return Vec::new();
+        return RunLaunchWorkspaceRoots::default();
     };
     let Ok(parameter_delta) = serde_json::from_str::<RunLaunchParameterDelta>(parameter_delta_json)
     else {
-        return Vec::new();
+        return RunLaunchWorkspaceRoots::default();
     };
     parameter_delta.cli_context.map(launch_workspace_roots_from_context).unwrap_or_default()
 }
@@ -104,13 +137,20 @@ fn launch_path_env_from_context(context: RunLaunchCliContext) -> BTreeMap<String
     env
 }
 
-fn launch_workspace_roots_from_context(context: RunLaunchCliContext) -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    if let Some(raw_cwd) = context.launch_cwd {
-        push_launch_workspace_root(&mut roots, raw_cwd.as_str());
-    }
+fn launch_workspace_roots_from_context(context: RunLaunchCliContext) -> RunLaunchWorkspaceRoots {
+    let mut roots = RunLaunchWorkspaceRoots::default();
     for raw_root in context.workspace_roots.unwrap_or_default() {
-        push_launch_workspace_root(&mut roots, raw_root.as_str());
+        push_launch_workspace_root(&mut roots.prompt_roots, raw_root.as_str());
+    }
+    roots.launch_cwd =
+        context.launch_cwd.and_then(|raw_cwd| canonical_launch_workspace_root(raw_cwd.as_str()));
+    if roots.launch_cwd.as_ref().is_some_and(|launch_cwd| {
+        roots
+            .prompt_roots
+            .iter()
+            .any(|root| same_workspace_root(root.as_path(), launch_cwd.as_path()))
+    }) {
+        roots.launch_cwd = None;
     }
     roots
 }
@@ -148,28 +188,44 @@ fn canonical_launch_workspace_root(raw_root: &str) -> Option<PathBuf> {
 
 fn merge_launch_workspace_roots(
     workspace_roots: &[PathBuf],
-    launch_roots: Vec<PathBuf>,
+    launch_roots: RunLaunchWorkspaceRoots,
+    launch_cwd_precedence: LaunchCwdPrecedence,
 ) -> Vec<PathBuf> {
-    if launch_roots.is_empty() {
+    if launch_roots.prompt_roots.is_empty() && launch_roots.launch_cwd.is_none() {
         return workspace_roots.to_vec();
     }
-    let mut merged: Vec<PathBuf> =
-        Vec::with_capacity(workspace_roots.len().saturating_add(launch_roots.len()));
-    for launch_root in launch_roots {
-        if !merged
-            .iter()
-            .any(|existing| same_workspace_root(existing.as_path(), launch_root.as_path()))
-        {
-            merged.push(launch_root);
+    let mut merged: Vec<PathBuf> = Vec::with_capacity(
+        workspace_roots.len().saturating_add(launch_roots.prompt_roots.len() + 1),
+    );
+    push_unique_workspace_roots(&mut merged, launch_roots.prompt_roots);
+    if launch_cwd_precedence == LaunchCwdPrecedence::BeforeAgentRoots {
+        if let Some(launch_cwd) = launch_roots.launch_cwd.clone() {
+            push_unique_workspace_root(&mut merged, launch_cwd);
         }
     }
-    for root in workspace_roots {
-        if merged.iter().any(|existing| same_workspace_root(existing.as_path(), root.as_path())) {
-            continue;
+    push_unique_workspace_roots(&mut merged, workspace_roots.iter().cloned());
+    if launch_cwd_precedence == LaunchCwdPrecedence::AfterAgentRoots {
+        if let Some(launch_cwd) = launch_roots.launch_cwd {
+            push_unique_workspace_root(&mut merged, launch_cwd);
         }
-        merged.push(root.clone());
     }
     merged
+}
+
+fn push_unique_workspace_roots(
+    roots: &mut Vec<PathBuf>,
+    candidates: impl IntoIterator<Item = PathBuf>,
+) {
+    for candidate in candidates {
+        push_unique_workspace_root(roots, candidate);
+    }
+}
+
+fn push_unique_workspace_root(roots: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if roots.iter().any(|existing| same_workspace_root(existing.as_path(), candidate.as_path())) {
+        return;
+    }
+    roots.push(candidate);
 }
 
 fn same_workspace_root(left: &Path, right: &Path) -> bool {
@@ -378,7 +434,8 @@ mod tests {
         launch_path_env_from_context, launch_workspace_roots_from_context,
         merge_launch_workspace_roots, relative_path_already_targets_active_root,
         relative_path_should_use_active_root, same_workspace_root,
-        workspace_root_override_targets_active_root, ActiveWorkspaceRoot, RunLaunchCliContext,
+        workspace_root_override_targets_active_root, ActiveWorkspaceRoot, LaunchCwdPrecedence,
+        RunLaunchCliContext,
     };
     use std::{collections::BTreeMap, fs};
 
@@ -501,7 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn launch_cwd_workspace_root_is_prepended_without_duplicates() {
+    fn default_agent_launch_cwd_precedes_agent_roots_without_duplicates() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let default_root = tempdir.path().join("default");
         let launch_root = tempdir.path().join("launch");
@@ -510,9 +567,15 @@ mod tests {
         let canonical_launch =
             fs::canonicalize(launch_root.as_path()).expect("launch root should canonicalize");
 
+        let launch_roots = launch_workspace_roots_from_context(RunLaunchCliContext {
+            launch_cwd: Some(canonical_launch.to_string_lossy().into_owned()),
+            workspace_roots: None,
+            env: None,
+        });
         let roots = merge_launch_workspace_roots(
             &[default_root.clone(), launch_root.clone()],
-            vec![canonical_launch.clone()],
+            launch_roots,
+            LaunchCwdPrecedence::BeforeAgentRoots,
         );
 
         assert_eq!(roots.len(), 2);
@@ -522,7 +585,7 @@ mod tests {
     }
 
     #[test]
-    fn launch_cwd_precedes_prompt_workspace_roots() {
+    fn prompt_workspace_roots_precede_launch_cwd_and_agent_roots() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let explicit_root = tempdir.path().join("explicit");
         let launch_cwd = tempdir.path().join("cwd");
@@ -543,12 +606,42 @@ mod tests {
             ]),
             env: None,
         });
-        let roots = merge_launch_workspace_roots(std::slice::from_ref(&default_root), launch_roots);
+        let roots = merge_launch_workspace_roots(
+            std::slice::from_ref(&default_root),
+            launch_roots,
+            LaunchCwdPrecedence::BeforeAgentRoots,
+        );
 
         assert_eq!(roots.len(), 3);
-        assert_eq!(roots.first(), Some(&launch_cwd));
-        assert_eq!(roots.get(1), Some(&explicit_root));
+        assert_eq!(roots.first(), Some(&explicit_root));
+        assert_eq!(roots.get(1), Some(&launch_cwd));
         assert_eq!(roots.get(2), Some(&default_root));
+    }
+
+    #[test]
+    fn session_bound_agent_roots_precede_launch_cwd_without_prompt_roots() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let bound_root = tempdir.path().join("bound-agent");
+        let launch_cwd = tempdir.path().join("cwd");
+        fs::create_dir_all(bound_root.as_path()).expect("bound root should exist");
+        fs::create_dir_all(launch_cwd.as_path()).expect("launch cwd should exist");
+        let bound_root = fs::canonicalize(bound_root.as_path()).expect("bound root canonical");
+        let launch_cwd = fs::canonicalize(launch_cwd.as_path()).expect("launch cwd canonical");
+
+        let launch_roots = launch_workspace_roots_from_context(RunLaunchCliContext {
+            launch_cwd: Some(launch_cwd.to_string_lossy().into_owned()),
+            workspace_roots: None,
+            env: None,
+        });
+        let roots = merge_launch_workspace_roots(
+            std::slice::from_ref(&bound_root),
+            launch_roots,
+            LaunchCwdPrecedence::AfterAgentRoots,
+        );
+
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots.first(), Some(&bound_root));
+        assert_eq!(roots.get(1), Some(&launch_cwd));
     }
 
     #[test]

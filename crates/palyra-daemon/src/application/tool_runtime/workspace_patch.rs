@@ -20,7 +20,8 @@ use crate::{
     agents::AgentResolveRequest,
     application::tool_runtime::workspace_scope::{
         relative_path_should_use_active_root, session_active_workspace_root,
-        workspace_root_override_targets_active_root, workspace_roots_with_run_launch_context,
+        workspace_root_override_targets_active_root,
+        workspace_roots_with_run_launch_context_for_agent_source,
     },
     gateway::{
         current_unix_ms, GatewayRuntimeState, MAX_PATCH_TOOL_MARKER_BYTES,
@@ -223,10 +224,11 @@ pub(crate) async fn execute_workspace_patch_tool(
     };
     let agent_workspace_roots =
         agent_outcome.agent.workspace_roots.iter().map(PathBuf::from).collect::<Vec<_>>();
-    let agent_workspace_roots = workspace_roots_with_run_launch_context(
+    let agent_workspace_roots = workspace_roots_with_run_launch_context_for_agent_source(
         runtime_state,
         run_id,
         agent_workspace_roots.as_slice(),
+        agent_outcome.source,
     )
     .await;
     let resolved_workspace_roots = match resolve_workspace_patch_roots(

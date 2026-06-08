@@ -27,7 +27,7 @@ use crate::{
     application::tool_runtime::workspace_scope::{
         relative_path_already_targets_active_root, relative_path_should_use_active_root,
         run_launch_context_path_env, session_active_workspace_root,
-        workspace_roots_with_run_launch_context, ActiveWorkspaceRoot,
+        workspace_roots_with_run_launch_context_for_agent_source, ActiveWorkspaceRoot,
     },
     gateway::{
         current_unix_ms, truncate_with_ellipsis, BrowserServiceRuntimeConfig, GatewayRuntimeState,
@@ -355,9 +355,13 @@ async fn resolve_browser_agent_workspace_roots(
         })?;
     let workspace_roots =
         agent_outcome.agent.workspace_roots.iter().map(PathBuf::from).collect::<Vec<_>>();
-    let workspace_roots =
-        workspace_roots_with_run_launch_context(runtime_state, context.run_id, &workspace_roots)
-            .await;
+    let workspace_roots = workspace_roots_with_run_launch_context_for_agent_source(
+        runtime_state,
+        context.run_id,
+        &workspace_roots,
+        agent_outcome.source,
+    )
+    .await;
     let workspace_roots =
         workspace_roots.iter().map(|root| root.to_string_lossy().to_string()).collect::<Vec<_>>();
     canonicalize_browser_workspace_roots(workspace_roots.as_slice())

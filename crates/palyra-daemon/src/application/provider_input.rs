@@ -36,7 +36,10 @@ use crate::{
     application::tool_registry::ModelVisibleToolCatalogSnapshot,
     application::tool_runtime::{
         memory::project_memory_prefix_candidates_from_workspace_root,
-        workspace_scope::workspace_roots_with_run_launch_context,
+        workspace_scope::{
+            workspace_roots_with_run_launch_context,
+            workspace_roots_with_run_launch_context_for_agent_source,
+        },
     },
     gateway::{
         ingest_memory_best_effort, non_empty, truncate_with_ellipsis, GatewayRuntimeState,
@@ -647,7 +650,7 @@ async fn workspace_memory_auto_inject_prefixes(
     run_id: &str,
     session_id: &str,
 ) -> Result<Vec<String>, Status> {
-    let agent_roots = match runtime_state
+    let resolved_agent = match runtime_state
         .resolve_agent_for_context(AgentResolveRequest {
             principal: context.principal.clone(),
             channel: context.channel.clone(),
@@ -657,9 +660,7 @@ async fn workspace_memory_auto_inject_prefixes(
         })
         .await
     {
-        Ok(resolved) => {
-            resolved.agent.workspace_roots.iter().map(PathBuf::from).collect::<Vec<_>>()
-        }
+        Ok(resolved) => Some(resolved),
         Err(error) => {
             warn!(
                 run_id,
@@ -669,11 +670,22 @@ async fn workspace_memory_auto_inject_prefixes(
                 status_message = %error.message(),
                 "workspace memory auto-inject could not resolve agent roots; falling back to run launch context"
             );
-            Vec::new()
+            None
         }
     };
-    let workspace_roots =
-        workspace_roots_with_run_launch_context(runtime_state, run_id, &agent_roots).await;
+    let workspace_roots = if let Some(resolved_agent) = resolved_agent {
+        let agent_roots =
+            resolved_agent.agent.workspace_roots.iter().map(PathBuf::from).collect::<Vec<_>>();
+        workspace_roots_with_run_launch_context_for_agent_source(
+            runtime_state,
+            run_id,
+            &agent_roots,
+            resolved_agent.source,
+        )
+        .await
+    } else {
+        workspace_roots_with_run_launch_context(runtime_state, run_id, &[]).await
+    };
     let mut prefixes = Vec::new();
     for root in workspace_roots {
         for prefix in project_memory_prefix_candidates_from_workspace_root(root.as_path()) {

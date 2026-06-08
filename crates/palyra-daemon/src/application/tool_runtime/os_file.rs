@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     agents::AgentResolveRequest,
     application::tool_runtime::workspace_scope::{
-        run_launch_context_path_env, workspace_roots_with_run_launch_context,
+        run_launch_context_path_env, workspace_roots_with_run_launch_context_for_agent_source,
     },
     gateway::{GatewayRuntimeState, ToolRuntimeExecutionContext, OS_FILE_TOOL_NAME},
     tool_protocol::{build_tool_execution_outcome, ToolExecutionOutcome},
@@ -174,10 +174,11 @@ async fn resolve_os_file_policy(
         })?;
     let agent_workspace_roots =
         agent_outcome.agent.workspace_roots.iter().map(PathBuf::from).collect::<Vec<_>>();
-    let workspace_roots = workspace_roots_with_run_launch_context(
+    let workspace_roots = workspace_roots_with_run_launch_context_for_agent_source(
         runtime_state,
         context.run_id,
         agent_workspace_roots.as_slice(),
+        agent_outcome.source,
     )
     .await
     .iter()

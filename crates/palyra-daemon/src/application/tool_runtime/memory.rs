@@ -22,7 +22,7 @@ use crate::{
         recall::{preview_recall, RecallPreviewEnvelope, RecallRequest},
         service_authorization::authorize_memory_action,
         session_compaction::truncate_console_text,
-        tool_runtime::workspace_scope::workspace_roots_with_run_launch_context,
+        tool_runtime::workspace_scope::workspace_roots_with_run_launch_context_for_agent_source,
     },
     domain::workspace::{normalize_workspace_path, normalize_workspace_prefix},
     gateway::{
@@ -2764,7 +2764,7 @@ async fn resolve_memory_agent_workspace_roots(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
 ) -> Vec<PathBuf> {
-    let workspace_roots = match runtime_state
+    let agent_outcome = match runtime_state
         .resolve_agent_for_context(AgentResolveRequest {
             principal: context.principal.to_owned(),
             channel: context.channel.map(str::to_owned),
@@ -2774,12 +2774,18 @@ async fn resolve_memory_agent_workspace_roots(
         })
         .await
     {
-        Ok(agent_outcome) => {
-            agent_outcome.agent.workspace_roots.iter().map(PathBuf::from).collect::<Vec<_>>()
-        }
-        Err(_) => Vec::new(),
+        Ok(agent_outcome) => agent_outcome,
+        Err(_) => return Vec::new(),
     };
-    workspace_roots_with_run_launch_context(runtime_state, context.run_id, &workspace_roots).await
+    let workspace_roots =
+        agent_outcome.agent.workspace_roots.iter().map(PathBuf::from).collect::<Vec<_>>();
+    workspace_roots_with_run_launch_context_for_agent_source(
+        runtime_state,
+        context.run_id,
+        &workspace_roots,
+        agent_outcome.source,
+    )
+    .await
 }
 
 pub(crate) fn project_memory_prefix_candidates_from_workspace_root(root: &Path) -> Vec<String> {
