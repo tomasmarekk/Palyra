@@ -55,11 +55,11 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                     ("min_score", json!({"type":"number","minimum":0.0,"maximum":1.0})),
                     (
                         "workspace_prefix",
-                        json!({"type":"string","description":"Optional workspace/project document path prefix used with scope=workspace or scope=project."}),
+                        json!({"type":"string","description":"Optional workspace/project document path prefix used with scope=workspace or scope=project. When omitted, scope=project searches indexed project memory under projects/."}),
                     ),
                     (
                         "prefix",
-                        json!({"type":"string","description":"Alias for workspace_prefix used with scope=workspace or scope=project."}),
+                        json!({"type":"string","description":"Alias for workspace_prefix used with scope=workspace or scope=project. When omitted, scope=project searches indexed project memory under projects/."}),
                     ),
                     ("include_workspace_historical", json!({"type":"boolean"})),
                     ("include_workspace_quarantined", json!({"type":"boolean"})),

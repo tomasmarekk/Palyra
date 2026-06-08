@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
@@ -6,6 +7,7 @@ use std::{
 use palyra_common::validate_canonical_id;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+use tonic::Status;
 use ulid::Ulid;
 
 use crate::{
@@ -59,6 +61,7 @@ const COMBINED_MEMORY_HITS_ABSENT_CLAIM_BOUNDARY: &str =
     "no durable lifecycle or workspace memory hits were returned";
 const DEFAULT_MEMORY_RETAIN_SCOPE: &str = "principal";
 const DEFAULT_MEMORY_SEARCH_SCOPE: &str = "all";
+const DEFAULT_PROJECT_MEMORY_SEARCH_PREFIX: &str = "projects/default";
 const SESSION_SEARCH_HITS_PRESENT_CLAIM_BOUNDARY: &str = "session transcript or session-level hits are retrieved evidence from prior conversations; cite them as session recall, not durable memory";
 const SESSION_SEARCH_HITS_ABSENT_CLAIM_BOUNDARY: &str =
     "no session transcript hits were returned; do not substitute unrelated durable memory or workspace artifacts for prior-session evidence";
@@ -190,6 +193,185 @@ fn workspace_search_hit_tool_output_payload(hit: &WorkspaceSearchHit) -> Value {
             "final_score": hit.breakdown.final_score,
         },
     })
+}
+
+#[derive(Debug, Clone, Default)]
+struct InferredProjectMemorySearchScope {
+    prefixes: Vec<String>,
+    basename: Option<String>,
+}
+
+impl InferredProjectMemorySearchScope {
+    fn primary_prefix(&self) -> Option<&str> {
+        self.prefixes.first().map(String::as_str)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceMemorySearchFallback {
+    prefix: String,
+    project_basename_filter: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceMemorySearchPlan {
+    primary_prefix: Option<String>,
+    search_primary_without_prefix: bool,
+    fallbacks: Vec<WorkspaceMemorySearchFallback>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceMemorySearchParameters {
+    principal: String,
+    channel: Option<String>,
+    agent_id: Option<String>,
+    query: String,
+    top_k: usize,
+    min_score: f64,
+    include_historical: bool,
+    include_quarantined: bool,
+}
+
+impl WorkspaceMemorySearchParameters {
+    fn request(&self, prefix: Option<String>, top_k: usize) -> WorkspaceSearchRequest {
+        WorkspaceSearchRequest {
+            principal: self.principal.clone(),
+            channel: self.channel.clone(),
+            agent_id: self.agent_id.clone(),
+            query: self.query.clone(),
+            prefix,
+            top_k,
+            min_score: self.min_score,
+            include_historical: self.include_historical,
+            include_quarantined: self.include_quarantined,
+        }
+    }
+}
+
+async fn search_workspace_documents_for_memory(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    parameters: &WorkspaceMemorySearchParameters,
+    plan: WorkspaceMemorySearchPlan,
+) -> Result<Vec<WorkspaceSearchHit>, Status> {
+    let mut hits = Vec::new();
+    let mut seen = BTreeSet::new();
+    if plan.primary_prefix.is_some() || plan.search_primary_without_prefix {
+        append_workspace_memory_search_hits(
+            runtime_state,
+            parameters,
+            plan.primary_prefix.as_deref(),
+            None,
+            &mut hits,
+            &mut seen,
+        )
+        .await?;
+    }
+    if hits.is_empty() {
+        for fallback in &plan.fallbacks {
+            append_workspace_memory_search_hits(
+                runtime_state,
+                parameters,
+                Some(fallback.prefix.as_str()),
+                fallback.project_basename_filter.as_deref(),
+                &mut hits,
+                &mut seen,
+            )
+            .await?;
+            if !hits.is_empty() {
+                break;
+            }
+        }
+    }
+    hits.truncate(parameters.top_k);
+    Ok(hits)
+}
+
+async fn append_workspace_memory_search_hits(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    parameters: &WorkspaceMemorySearchParameters,
+    prefix: Option<&str>,
+    project_basename_filter: Option<&str>,
+    hits: &mut Vec<WorkspaceSearchHit>,
+    seen: &mut BTreeSet<String>,
+) -> Result<(), Status> {
+    let search_top_k =
+        if project_basename_filter.is_some() { MAX_MEMORY_SEARCH_TOP_K } else { parameters.top_k };
+    let mut found = runtime_state
+        .search_workspace_documents(parameters.request(prefix.map(str::to_owned), search_top_k))
+        .await?;
+    if let Some(project_basename) = project_basename_filter {
+        found.retain(|hit| workspace_search_hit_matches_project_basename(hit, project_basename));
+    }
+    for hit in found {
+        let key = format!("{}:{}:{}", hit.document.document_id, hit.version, hit.chunk_index);
+        if seen.insert(key) {
+            hits.push(hit);
+        }
+        if hits.len() >= parameters.top_k {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn workspace_memory_search_plan(
+    primary_prefix: Option<String>,
+    search_primary_without_prefix: bool,
+    explicit_prefix_present: bool,
+    inferred_project_scope: &InferredProjectMemorySearchScope,
+) -> WorkspaceMemorySearchPlan {
+    let mut fallbacks = Vec::new();
+    if !explicit_prefix_present && !inferred_project_scope.prefixes.is_empty() {
+        for prefix in inferred_project_scope.prefixes.iter().skip(1) {
+            if primary_prefix.as_deref() != Some(prefix.as_str()) {
+                fallbacks.push(WorkspaceMemorySearchFallback {
+                    prefix: prefix.clone(),
+                    project_basename_filter: None,
+                });
+            }
+        }
+        if let Some(basename) = inferred_project_scope.basename.as_deref() {
+            fallbacks.push(WorkspaceMemorySearchFallback {
+                prefix: "projects".to_owned(),
+                project_basename_filter: Some(basename.to_owned()),
+            });
+        }
+    }
+    WorkspaceMemorySearchPlan { primary_prefix, search_primary_without_prefix, fallbacks }
+}
+
+fn workspace_search_hit_matches_project_basename(hit: &WorkspaceSearchHit, basename: &str) -> bool {
+    let Some(parent_path) = workspace_search_hit_parent_path(hit) else {
+        return false;
+    };
+    let Some(segment) = parent_path.rsplit('/').next().filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    project_memory_segment_matches_basename(segment, basename)
+}
+
+fn workspace_search_hit_parent_path(hit: &WorkspaceSearchHit) -> Option<&str> {
+    hit.document.parent_path.as_deref().or_else(|| {
+        hit.document
+            .path
+            .rsplit_once('/')
+            .map(|(parent_path, _)| parent_path)
+            .filter(|parent_path| !parent_path.is_empty())
+    })
+}
+
+fn project_memory_segment_matches_basename(segment: &str, basename: &str) -> bool {
+    let basename_slug = project_memory_slug(basename);
+    let segment_slug = project_memory_slug(segment);
+    if segment_slug == basename_slug {
+        return true;
+    }
+    if basename_slug.len() < 3 {
+        return segment_slug == format!("project-{basename_slug}");
+    }
+    segment_slug.starts_with(format!("{basename_slug}-").as_str())
+        || segment_slug.ends_with(format!("-{basename_slug}").as_str())
+        || segment_slug.contains(format!("-{basename_slug}-").as_str())
 }
 
 pub(crate) fn memory_recall_tool_output_payload(preview: &RecallPreviewEnvelope) -> Value {
@@ -1673,15 +1855,15 @@ pub(crate) async fn execute_memory_search_tool(
         }
         let explicit_workspace_prefix = optional_trimmed_string(parsed.get("workspace_prefix"))
             .or_else(|| optional_trimmed_string(parsed.get("prefix")));
-        let inferred_project_prefix = if scope == "project" && explicit_workspace_prefix.is_none() {
-            infer_project_memory_prefix(runtime_state, context).await
+        let inferred_project_scope = if scope == "project" && explicit_workspace_prefix.is_none() {
+            infer_project_memory_search_scope(runtime_state, context).await
         } else {
-            None
+            InferredProjectMemorySearchScope::default()
         };
         let workspace_prefix = match workspace_memory_search_prefix(
             explicit_workspace_prefix.as_deref(),
             scope.as_str(),
-            inferred_project_prefix.as_deref(),
+            inferred_project_scope.primary_prefix(),
         ) {
             Ok(prefix) => prefix,
             Err(error) => {
@@ -1695,13 +1877,19 @@ pub(crate) async fn execute_memory_search_tool(
                 );
             }
         };
-        let search_hits = match runtime_state
-            .search_workspace_documents(WorkspaceSearchRequest {
+        let search_plan = workspace_memory_search_plan(
+            workspace_prefix.clone(),
+            workspace_prefix.is_none(),
+            explicit_workspace_prefix.is_some(),
+            &inferred_project_scope,
+        );
+        let search_hits = match search_workspace_documents_for_memory(
+            runtime_state,
+            &WorkspaceMemorySearchParameters {
                 principal: principal.to_owned(),
                 channel: channel.map(str::to_owned),
                 agent_id: optional_trimmed_string(parsed.get("agent_id")),
                 query,
-                prefix: workspace_prefix.clone(),
                 top_k,
                 min_score,
                 include_historical: parsed
@@ -1712,8 +1900,10 @@ pub(crate) async fn execute_memory_search_tool(
                     .get("include_workspace_quarantined")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
-            })
-            .await
+            },
+            search_plan,
+        )
+        .await
         {
             Ok(hits) => hits,
             Err(error) => {
@@ -1828,10 +2018,10 @@ pub(crate) async fn execute_memory_search_tool(
         };
         let explicit_workspace_prefix = optional_trimmed_string(parsed.get("workspace_prefix"))
             .or_else(|| optional_trimmed_string(parsed.get("prefix")));
-        let inferred_workspace_prefix = if explicit_workspace_prefix.is_none() {
-            infer_project_memory_prefix(runtime_state, context).await
+        let inferred_project_scope = if explicit_workspace_prefix.is_none() {
+            infer_project_memory_search_scope(runtime_state, context).await
         } else {
-            None
+            InferredProjectMemorySearchScope::default()
         };
         let workspace_prefix = if explicit_workspace_prefix.is_some() {
             match workspace_memory_search_prefix(
@@ -1852,16 +2042,22 @@ pub(crate) async fn execute_memory_search_tool(
                 }
             }
         } else {
-            inferred_workspace_prefix
+            inferred_project_scope.primary_prefix().map(str::to_owned)
         };
-        let workspace_hits = if let Some(prefix) = workspace_prefix.clone() {
-            match runtime_state
-                .search_workspace_documents(WorkspaceSearchRequest {
+        let workspace_hits = if workspace_prefix.is_some() {
+            let search_plan = workspace_memory_search_plan(
+                workspace_prefix.clone(),
+                false,
+                explicit_workspace_prefix.is_some(),
+                &inferred_project_scope,
+            );
+            match search_workspace_documents_for_memory(
+                runtime_state,
+                &WorkspaceMemorySearchParameters {
                     principal: principal.to_owned(),
                     channel: channel.map(str::to_owned),
                     agent_id: optional_trimmed_string(parsed.get("agent_id")),
                     query,
-                    prefix: Some(prefix),
                     top_k,
                     min_score,
                     include_historical: parsed
@@ -1872,8 +2068,10 @@ pub(crate) async fn execute_memory_search_tool(
                         .get("include_workspace_quarantined")
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
-                })
-                .await
+                },
+                search_plan,
+            )
+            .await
             {
                 Ok(hits) => hits,
                 Err(error) => {
@@ -2266,16 +2464,15 @@ pub(crate) async fn execute_memory_recall_tool(
     let raw_workspace_prefix = optional_trimmed_string(parsed.get("workspace_prefix"))
         .or_else(|| optional_trimmed_string(parsed.get("prefix")));
     let workspace_scope = memory_recall_workspace_scope_text(&parsed);
-    let inferred_project_prefix = if workspace_scope == "project" && raw_workspace_prefix.is_none()
-    {
-        infer_project_memory_prefix(runtime_state, context).await
+    let inferred_project_scope = if workspace_scope == "project" && raw_workspace_prefix.is_none() {
+        infer_project_memory_search_scope(runtime_state, context).await
     } else {
-        None
+        InferredProjectMemorySearchScope::default()
     };
     let workspace_prefix = match workspace_memory_search_prefix(
         raw_workspace_prefix.as_deref(),
         workspace_scope.as_str(),
-        inferred_project_prefix.as_deref(),
+        inferred_project_scope.primary_prefix(),
     ) {
         Ok(prefix) => prefix,
         Err(error) => {
@@ -2773,10 +2970,24 @@ async fn infer_project_memory_prefix(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
 ) -> Option<String> {
+    infer_project_memory_search_scope(runtime_state, context)
+        .await
+        .primary_prefix()
+        .map(str::to_owned)
+}
+
+async fn infer_project_memory_search_scope(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: ToolRuntimeExecutionContext<'_>,
+) -> InferredProjectMemorySearchScope {
     let workspace_roots = resolve_memory_agent_workspace_roots(runtime_state, context).await;
-    workspace_roots
-        .first()
-        .and_then(|root| project_memory_prefix_from_workspace_root(root.as_path()))
+    let Some(root) = workspace_roots.first() else {
+        return InferredProjectMemorySearchScope::default();
+    };
+    InferredProjectMemorySearchScope {
+        prefixes: project_memory_prefix_candidates_from_workspace_root(root.as_path()),
+        basename: last_normal_path_segment(root.as_path()),
+    }
 }
 
 async fn resolve_memory_agent_workspace_roots(
@@ -2938,7 +3149,7 @@ fn workspace_memory_search_prefix(
             return Ok(Some(
                 inferred_project_prefix
                     .map(str::to_owned)
-                    .unwrap_or_else(|| "projects/default".to_owned()),
+                    .unwrap_or_else(|| DEFAULT_PROJECT_MEMORY_SEARCH_PREFIX.to_owned()),
             ));
         }
         return Ok(None);
@@ -3946,12 +4157,17 @@ mod tests {
     #[test]
     fn workspace_memory_search_prefix_maps_project_inputs() {
         assert_eq!(
+            workspace_memory_search_prefix(None, "project", None)
+                .expect("omitted project prefix should use legacy default project memory"),
+            Some("projects/default".to_owned())
+        );
+        assert_eq!(
             workspace_memory_search_prefix(
                 None,
                 "project",
                 Some("projects/project-client-portal-deadbeef00"),
             )
-            .expect("inferred project prefix should be accepted"),
+            .expect("callers may still supply a narrower inferred prefix"),
             Some("projects/project-client-portal-deadbeef00".to_owned())
         );
         assert_eq!(
@@ -3968,6 +4184,16 @@ mod tests {
             workspace_memory_search_prefix(Some("MEMORY.md"), "project", None).is_err(),
             "project search must not widen to root workspace memory"
         );
+    }
+
+    #[test]
+    fn project_memory_fallback_matches_launch_basename_without_cross_project_leak() {
+        assert!(project_memory_segment_matches_basename("s033-memory-project", "memory-project"));
+        assert!(project_memory_segment_matches_basename(
+            "project-client-portal-deadbeef00",
+            "client-portal"
+        ));
+        assert!(!project_memory_segment_matches_basename("project-b", "project-a"));
     }
 
     #[test]
