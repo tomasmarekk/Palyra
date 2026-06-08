@@ -322,7 +322,6 @@ async fn run_agent_interactive_async(
     Ok(())
 }
 
-const CLI_CONTEXT_MAX_PROMPT_WORKSPACE_ROOTS: usize = 8;
 const CLI_CONTEXT_SAFE_PATH_ENV_KEYS: &[&str] = &["PALYRA_E2E_HOME", "PALYRA_E2E_OS_ROOT"];
 
 fn cli_launch_parameter_delta_json(prompt: &str) -> Result<Option<String>> {
@@ -332,13 +331,12 @@ fn cli_launch_parameter_delta_json(prompt: &str) -> Result<Option<String>> {
 
 fn cli_launch_parameter_delta_json_for_cwd(
     cwd: &std::path::Path,
-    prompt: &str,
+    _prompt: &str,
 ) -> Result<Option<String>> {
-    let workspace_roots = prompt_absolute_workspace_roots(cwd, prompt);
     let parameter_delta = serde_json::json!({
         "cli_context": {
             "launch_cwd": cwd.to_string_lossy(),
-            "workspace_roots": workspace_roots,
+            "workspace_roots": Vec::<String>::new(),
             "env": cli_launch_safe_path_env(),
         }
     });
@@ -355,158 +353,6 @@ fn cli_launch_safe_path_env() -> serde_json::Map<String, serde_json::Value> {
         }
     }
     env
-}
-
-fn prompt_absolute_workspace_roots(cwd: &std::path::Path, prompt: &str) -> Vec<String> {
-    if std::fs::canonicalize(cwd).ok().filter(|path| path.is_dir()).is_none() {
-        return Vec::new();
-    }
-    let mut roots = Vec::<std::path::PathBuf>::new();
-    for token in prompt.split_whitespace() {
-        let Some(candidate) = prompt_path_candidate(token) else {
-            continue;
-        };
-        let Some(root) = prompt_workspace_root_from_candidate(candidate) else {
-            continue;
-        };
-        if roots.iter().any(|existing| same_cli_path(existing.as_path(), root.as_path())) {
-            continue;
-        }
-        roots.push(root);
-        if roots.len() >= CLI_CONTEXT_MAX_PROMPT_WORKSPACE_ROOTS {
-            break;
-        }
-    }
-    roots.into_iter().map(|root| root.to_string_lossy().into_owned()).collect()
-}
-
-fn prompt_path_candidate(token: &str) -> Option<&str> {
-    let trimmed = token.trim_matches(prompt_path_candidate_wrapper_char);
-    (!trimmed.is_empty() && std::path::Path::new(trimmed).is_absolute()).then_some(trimmed)
-}
-
-fn prompt_path_candidate_wrapper_char(character: char) -> bool {
-    matches!(
-        character,
-        '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';' | '.'
-    )
-}
-
-fn prompt_workspace_root_from_candidate(candidate: &str) -> Option<std::path::PathBuf> {
-    if candidate.chars().any(char::is_control) {
-        return None;
-    }
-    let requested = std::path::PathBuf::from(candidate);
-    if requested.components().any(|component| {
-        matches!(component, std::path::Component::CurDir | std::path::Component::ParentDir)
-    }) {
-        return None;
-    }
-    let existing = nearest_existing_prompt_path(requested.as_path())?;
-    let directory = if existing.is_dir() {
-        existing
-    } else {
-        existing.parent().map(std::path::Path::to_path_buf)?
-    };
-    let canonical = std::fs::canonicalize(directory).ok()?;
-    if !canonical.is_dir() || protected_cli_workspace_root(canonical.as_path()) {
-        return None;
-    }
-    cli_user_owned_roots()
-        .iter()
-        .any(|root| cli_path_starts_with(canonical.as_path(), root.as_path()))
-        .then_some(canonical)
-}
-
-fn nearest_existing_prompt_path(path: &std::path::Path) -> Option<std::path::PathBuf> {
-    let mut cursor = path.to_path_buf();
-    loop {
-        if cursor.exists() {
-            return Some(cursor);
-        }
-        if !cursor.pop() {
-            return None;
-        }
-    }
-}
-
-fn cli_user_owned_roots() -> Vec<std::path::PathBuf> {
-    let mut roots = Vec::new();
-    for key in ["USERPROFILE", "HOME"] {
-        if let Some(value) = std::env::var_os(key) {
-            push_cli_root(&mut roots, std::path::PathBuf::from(value));
-        }
-    }
-    push_cli_root(&mut roots, std::env::temp_dir());
-    #[cfg(unix)]
-    {
-        push_cli_root(&mut roots, std::path::PathBuf::from("/var/tmp"));
-    }
-    roots
-}
-
-fn push_cli_root(roots: &mut Vec<std::path::PathBuf>, root: std::path::PathBuf) {
-    if let Ok(canonical) = std::fs::canonicalize(root) {
-        if canonical.is_dir()
-            && !roots.iter().any(|existing| same_cli_path(existing.as_path(), canonical.as_path()))
-        {
-            roots.push(canonical);
-        }
-    }
-}
-
-fn protected_cli_workspace_root(path: &std::path::Path) -> bool {
-    #[cfg(windows)]
-    {
-        let normalized = path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
-        normalized.ends_with(":/")
-            || normalized.contains(":/windows")
-            || normalized.contains(":/program files")
-            || normalized.contains(":/program files (x86)")
-            || normalized.contains(":/system volume information")
-    }
-    #[cfg(not(windows))]
-    {
-        let normalized = path.to_string_lossy().replace('\\', "/");
-        if normalized == "/" {
-            return true;
-        }
-        for prefix in ["/etc", "/bin", "/sbin", "/usr", "/lib", "/lib64", "/System", "/Library"] {
-            if normalized == prefix || normalized.starts_with(format!("{prefix}/").as_str()) {
-                return true;
-            }
-        }
-        false
-    }
-}
-
-fn cli_path_starts_with(path: &std::path::Path, root: &std::path::Path) -> bool {
-    if path.starts_with(root) {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        let path = path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
-        let root = root.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
-        path == root || path.starts_with(format!("{root}/").as_str())
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
-}
-
-fn same_cli_path(left: &std::path::Path, right: &std::path::Path) -> bool {
-    #[cfg(windows)]
-    {
-        left.to_string_lossy()
-            .replace('\\', "/")
-            .eq_ignore_ascii_case(&right.to_string_lossy().replace('\\', "/"))
-    }
-    #[cfg(not(windows))]
-    {
-        left == right
-    }
 }
 
 fn spawn_interactive_stdin_reader() -> mpsc::UnboundedReceiver<Result<String, String>> {
@@ -831,7 +677,7 @@ mod tests {
     use super::{
         cli_launch_parameter_delta_json_for_cwd, ensure_agent_run_approval_flags,
         interactive_interrupt_message, interactive_session_started_message,
-        normalize_interactive_prompt_line, prompt_absolute_workspace_roots,
+        normalize_interactive_prompt_line,
     };
     use crate::args::AgentApprovalModeArg;
     use crate::proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1};
@@ -964,7 +810,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_launch_context_includes_prompt_absolute_workspace_roots() {
+    fn cli_launch_context_does_not_infer_workspace_roots_from_prompt_paths() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let project = tempdir.path().join("todo-app");
         fs::create_dir_all(project.as_path()).expect("project directory should exist");
@@ -975,11 +821,6 @@ mod tests {
                 .expect("launch context should be present");
         let value =
             serde_json::from_str::<Value>(parameter_delta.as_str()).expect("JSON should parse");
-        let expected_project = fs::canonicalize(project.as_path())
-            .expect("project should canonicalize")
-            .to_string_lossy()
-            .into_owned();
-
         let roots = value
             .get("cli_context")
             .and_then(|context| context.get("workspace_roots"))
@@ -987,27 +828,9 @@ mod tests {
             .expect("workspace roots should be encoded");
 
         assert!(
-            roots.iter().filter_map(Value::as_str).any(|root| root == expected_project),
-            "workspace roots should include user prompt project: {roots:?}"
+            roots.is_empty(),
+            "harness must not infer workspace roots from prompt paths: {roots:?}"
         );
-    }
-
-    #[test]
-    fn cli_launch_context_includes_user_owned_workspace_outside_launch_cwd() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
-        let launch_cwd = tempdir.path().join("launch-cwd");
-        let external_project = tempdir.path().join("external-project");
-        fs::create_dir_all(launch_cwd.as_path()).expect("launch cwd should exist");
-        fs::create_dir_all(external_project.as_path()).expect("external project should exist");
-        let prompt = format!("Work only in `{}`.", external_project.display());
-
-        let roots = prompt_absolute_workspace_roots(launch_cwd.as_path(), prompt.as_str());
-        let expected_project = fs::canonicalize(external_project.as_path())
-            .expect("external project should canonicalize")
-            .to_string_lossy()
-            .into_owned();
-
-        assert_eq!(roots.first().map(String::as_str), Some(expected_project.as_str()));
     }
 
     #[test]
@@ -1046,55 +869,5 @@ mod tests {
             !env.contains_key("PALYRA_ADMIN_TOKEN"),
             "runtime tokens must not be serialized into launch context"
         );
-    }
-
-    #[test]
-    fn prompt_absolute_workspace_roots_preserves_nested_existing_roots() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
-        let project = tempdir.path().join("todo-app");
-        let nested = project.join("src");
-        fs::create_dir_all(nested.as_path()).expect("nested directory should exist");
-        let prompt = format!(
-            "Use `{}` and then {} again.",
-            project.display(),
-            nested.join("missing.js").display()
-        );
-
-        let roots = prompt_absolute_workspace_roots(tempdir.path(), prompt.as_str());
-        let expected_project = fs::canonicalize(project.as_path())
-            .expect("project should canonicalize")
-            .to_string_lossy()
-            .into_owned();
-
-        assert_eq!(roots.first().map(String::as_str), Some(expected_project.as_str()));
-        assert_eq!(roots.len(), 2);
-    }
-
-    #[test]
-    fn prompt_absolute_workspace_roots_includes_user_owned_sibling_paths() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
-        let workspace = tempdir.path().join("workspace");
-        let project = workspace.join("scenario");
-        let os_root = tempdir.path().join("os-root");
-        fs::create_dir_all(project.as_path()).expect("project directory should exist");
-        fs::create_dir_all(os_root.as_path()).expect("os fixture directory should exist");
-        let prompt = format!(
-            "Write workspace report in `{}` and approved OS file in `{}`.",
-            project.display(),
-            os_root.display()
-        );
-
-        let roots = prompt_absolute_workspace_roots(workspace.as_path(), prompt.as_str());
-        let expected_project = fs::canonicalize(project.as_path())
-            .expect("project should canonicalize")
-            .to_string_lossy()
-            .into_owned();
-        let excluded_os_root = fs::canonicalize(os_root.as_path())
-            .expect("os root should canonicalize")
-            .to_string_lossy()
-            .into_owned();
-
-        assert!(roots.iter().any(|root| root == &expected_project), "{roots:?}");
-        assert!(roots.iter().any(|root| root == &excluded_os_root), "{roots:?}");
     }
 }
