@@ -59,7 +59,10 @@ impl AgentLoopTerminationReason {
 
     pub(crate) const fn needs_continuation(self, completed_tool_calls: u32) -> bool {
         completed_tool_calls > 0
-            && matches!(self, Self::MaxTurns | Self::MaxToolCalls | Self::WallClock)
+            && matches!(
+                self,
+                Self::MaxTurns | Self::MaxToolCalls | Self::WallClock | Self::IncompleteFinalAnswer
+            )
     }
 }
 
@@ -628,6 +631,53 @@ mod tests {
         assert_eq!(parsed["finalization"]["partial"], true);
         assert_eq!(parsed["finalization"]["continuation_required"], true);
         assert_eq!(parsed["finalization"]["tool_count"], 1);
+    }
+
+    #[test]
+    fn loop_state_marks_incomplete_final_answer_after_tools_as_needs_continuation() {
+        let mut state =
+            AgentRunLoopState::new(vec![ProviderMessage::user_text("hello")], 2, 1, 10_000);
+        state.append_tool_result_messages(vec![ProviderMessage::tool_result(
+            "call-01",
+            r#"{"ok":true}"#,
+        )]);
+
+        let payload = state.termination_payload(
+            "run-01",
+            AgentLoopTerminationReason::IncompleteFinalAnswer,
+            "Partial result: model hit finish_reason=length after tool work.",
+            None,
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(payload.as_str()).expect("termination payload should be JSON");
+
+        assert_eq!(parsed["termination_reason"], "incomplete_final_answer");
+        assert_eq!(parsed["finalization"]["status"], "needs_continuation");
+        assert_eq!(parsed["finalization"]["lifecycle_state"], "needs_continuation");
+        assert_eq!(parsed["finalization"]["partial"], true);
+        assert_eq!(parsed["finalization"]["continuation_required"], true);
+        assert_eq!(parsed["finalization"]["tool_count"], 1);
+    }
+
+    #[test]
+    fn loop_state_keeps_incomplete_final_answer_without_tools_as_failure() {
+        let state = AgentRunLoopState::new(vec![ProviderMessage::user_text("hello")], 2, 1, 10_000);
+
+        let payload = state.termination_payload(
+            "run-01",
+            AgentLoopTerminationReason::IncompleteFinalAnswer,
+            "model returned no usable answer before any tool evidence",
+            None,
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(payload.as_str()).expect("termination payload should be JSON");
+
+        assert_eq!(parsed["termination_reason"], "incomplete_final_answer");
+        assert_eq!(parsed["finalization"]["status"], "failed");
+        assert_eq!(parsed["finalization"]["lifecycle_state"], "failed");
+        assert_eq!(parsed["finalization"]["partial"], false);
+        assert_eq!(parsed["finalization"]["continuation_required"], false);
+        assert_eq!(parsed["finalization"]["tool_count"], 0);
     }
 
     #[test]
