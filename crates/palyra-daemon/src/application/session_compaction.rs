@@ -1022,7 +1022,7 @@ fn collect_open_action_items(
     let mut seen = HashSet::new();
     for record in condensed_records.iter().chain(protected_records.iter()) {
         for item in extract_open_action_items(record.text.as_str()) {
-            let signature = item.to_ascii_lowercase();
+            let signature = open_action_item_signature(item.as_str());
             if !seen.insert(signature) {
                 continue;
             }
@@ -1033,6 +1033,15 @@ fn collect_open_action_items(
         }
     }
     items
+}
+
+fn open_action_item_signature(item: &str) -> String {
+    item.chars()
+        .map(|ch| if ch.is_alphanumeric() { ch.to_ascii_lowercase() } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn extract_open_action_items(raw: &str) -> Vec<String> {
@@ -1084,7 +1093,8 @@ fn extract_open_action_items(raw: &str) -> Vec<String> {
                 blank_seen_in_section = false;
                 continue;
             }
-            if let Some(item) = normalize_open_action_item(trimmed) {
+            if let Some(item) = normalize_section_open_action_item(trimmed, section_item_count > 0)
+            {
                 items.push(item);
                 section_item_count += 1;
                 blank_seen_in_section = false;
@@ -1190,7 +1200,19 @@ fn extract_explicit_action_item(line: &str) -> Option<String> {
 }
 
 fn normalize_open_action_item(raw: &str) -> Option<String> {
+    normalize_open_action_item_candidate(raw, false)
+}
+
+fn normalize_section_open_action_item(raw: &str, prior_items_seen: bool) -> Option<String> {
+    normalize_open_action_item_candidate(raw, prior_items_seen)
+}
+
+fn normalize_open_action_item_candidate(
+    raw: &str,
+    reject_orphaned_fragments: bool,
+) -> Option<String> {
     let item = strip_list_marker(raw).unwrap_or(raw);
+    let has_checkbox_marker = starts_with_checkbox_marker(item);
     let item = strip_checkbox_marker(item);
     let item = strip_memory_action_item_prefix(item);
     let normalized = item.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1198,6 +1220,11 @@ fn normalize_open_action_item(raw: &str) -> Option<String> {
         return None;
     }
     if looks_like_compaction_status_action_item(normalized.as_str()) {
+        return None;
+    }
+    if reject_orphaned_fragments
+        && looks_like_orphaned_action_item_fragment(normalized.as_str(), has_checkbox_marker)
+    {
         return None;
     }
     let redacted = redact_url_segments_in_text(redact_auth_error(normalized.as_str()).as_str());
@@ -1236,15 +1263,12 @@ fn starts_with_memory_action_item_ordinal(raw: &str) -> bool {
 }
 
 fn looks_like_compaction_status_action_item(normalized: &str) -> bool {
-    let lower = normalized.to_lowercase();
+    let lower = normalized.to_ascii_lowercase();
     let Some((label, detail)) = lower.split_once(':') else {
         return false;
     };
     let label = label.trim();
     let detail = detail.trim();
-    if detail_describes_compaction_context_status(detail) {
-        return true;
-    }
     match label {
         "context loaded" | "context read" => true,
         "workspace" => contains_any(
@@ -1256,9 +1280,41 @@ fn looks_like_compaction_status_action_item(normalized: &str) -> bool {
     }
 }
 
-fn detail_describes_compaction_context_status(detail: &str) -> bool {
-    contains_any(detail, &["helper doc", "helper docs"])
-        && contains_any(detail, &["background", "read", "loaded"])
+fn looks_like_orphaned_action_item_fragment(normalized: &str, has_checkbox_marker: bool) -> bool {
+    if has_checkbox_marker || has_assignment_separator(normalized) {
+        return false;
+    }
+    let Some(first_word) = first_alphabetic_word(normalized) else {
+        return false;
+    };
+    first_word.chars().count() <= 1
+        && first_word.chars().all(char::is_lowercase)
+        && normalized.ends_with('.')
+}
+
+fn has_assignment_separator(normalized: &str) -> bool {
+    if normalized.split_once(':').is_some() {
+        return true;
+    }
+    let trimmed = normalized.trim_start();
+    if !trimmed.starts_with("**") {
+        return false;
+    }
+    let Some(end) = trimmed[2..].find("**") else {
+        return false;
+    };
+    let rest = trimmed[end + 4..].trim_start();
+    rest.starts_with('-') || rest.starts_with(':')
+}
+
+fn first_alphabetic_word(raw: &str) -> Option<&str> {
+    let start = raw.char_indices().find(|(_, ch)| ch.is_alphabetic()).map(|(index, _)| index)?;
+    let end = raw[start..]
+        .char_indices()
+        .find(|(_, ch)| !ch.is_alphabetic())
+        .map(|(index, _)| start + index)
+        .unwrap_or(raw.len());
+    Some(&raw[start..end])
 }
 
 fn strip_checkbox_marker(raw: &str) -> &str {
@@ -3055,6 +3111,74 @@ Idea 1-C: compare stale prototypes.
                 .all(|decision| !decision.contains("helper") && !decision.contains("Idea")),
             "helper docs must not become open decisions: {:?}",
             plan.active_task_summary.open_decisions
+        );
+    }
+
+    #[test]
+    fn active_task_summary_deduplicates_reformatted_action_items_and_filters_status_fragments() {
+        let meeting_notes = "\
+# Meeting Notes
+
+## Open Action Items
+- Dana: update the release checklist before Friday.
+- Marek: verify billing webhook retry metrics.
+- Aisha: draft the customer migration notice.
+";
+        let meeting_payload = serde_json::json!({
+            "proposal_id": "proposal-s078-meeting",
+            "success": true,
+            "output_json": {
+                "path": "tasks/meeting-notes.md",
+                "content": meeting_notes,
+            },
+            "error": "",
+        })
+        .to_string();
+        let reply_text = "\
+Open action items:
+1. Dana: update the release checklist before Friday.
+2. Marek: verify billing webhook retry metrics.
+3. Aisha: draft the customer migration notice.
+4. a context-only fragment from the preceding sentence.
+5. **Dana** - update the release checklist before Friday.
+6. **Marek** - verify billing webhook retry metrics.
+7. **Aisha** - draft the customer migration notice."
+            .to_owned();
+        let reply_payload = serde_json::json!({
+            "reply_text": reply_text
+        })
+        .to_string();
+        let mut transcript = vec![
+            transcript_record(
+                0,
+                "message.received",
+                r#"{"text":"Track open action items from tasks/meeting-notes.md before reading reference docs."}"#,
+            ),
+            transcript_record(1, "tool_result", meeting_payload.as_str()),
+            transcript_record(2, "message.replied", reply_payload.as_str()),
+        ];
+        transcript.extend((3..14).map(|seq| {
+            let payload = format!(r#"{{"text":"Filler context {seq} for compaction."}}"#);
+            transcript_record(seq, "message.received", payload.as_str())
+        }));
+
+        let plan = build_session_compaction_plan(
+            &session_record(),
+            transcript.as_slice(),
+            &[],
+            &[],
+            Some("test_compaction"),
+            Some("test_policy"),
+        );
+
+        assert!(plan.eligible);
+        assert_eq!(
+            plan.active_task_summary.open_action_items,
+            vec![
+                "Dana: update the release checklist before Friday.",
+                "Marek: verify billing webhook retry metrics.",
+                "Aisha: draft the customer migration notice.",
+            ]
         );
     }
 
