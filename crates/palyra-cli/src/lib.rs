@@ -5818,6 +5818,24 @@ mod agent_stream_output_tests {
     }
 
     #[test]
+    fn ndjson_events_include_run_id_for_diagnostics() {
+        let run_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let event = common_v1::RunStreamEvent {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            run_id: Some(common_v1::CanonicalId { ulid: run_id.to_owned() }),
+            body: Some(common_v1::run_stream_event::Body::Status(status(
+                common_v1::stream_status::StatusKind::Accepted,
+                "accepted",
+            ))),
+        };
+
+        let value = agent_event_json_value(&event);
+
+        assert_eq!(value["run_id"], Value::String(run_id.to_owned()));
+        assert_ne!(value["run_id"], Value::String(REDACTED.to_owned()));
+    }
+
+    #[test]
     fn failed_stream_outcome_is_command_error() {
         let outcome = AgentStreamOutcome {
             completed: false,
@@ -6409,8 +6427,12 @@ mod agent_stream_output_tests {
     }
 }
 
+fn run_stream_event_run_id_json_value(event: &common_v1::RunStreamEvent) -> Value {
+    event.run_id.as_ref().map(|run_id| Value::String(run_id.ulid.clone())).unwrap_or(Value::Null)
+}
+
 fn agent_event_json_value(event: &common_v1::RunStreamEvent) -> serde_json::Value {
-    let run_id = redacted_presence_for_output(event.run_id.is_some());
+    let run_id = run_stream_event_run_id_json_value(event);
     match event.body.as_ref() {
         Some(common_v1::run_stream_event::Body::ModelToken(token)) => json!({
             "type": "model.token",
