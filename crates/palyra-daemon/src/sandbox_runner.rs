@@ -4201,9 +4201,10 @@ fn build_process_command(
         let plan = build_tier_c_command_plan(&tier_c_policy, &tier_c_request)
             .map_err(map_tier_c_backend_error)?;
         let mut command = Command::new(plan.program);
+        let current_dir = child_process_path(cwd);
         command
             .args(plan.args)
-            .current_dir(cwd)
+            .current_dir(current_dir.as_path())
             .env_clear()
             .env("PATH", sandbox_process_path())
             .env("LANG", "C")
@@ -4320,6 +4321,17 @@ fn configure_node_runtime_environment(command: &mut Command) {
     command.env(NODE_DISABLE_COMPILE_CACHE_ENV, "1");
 }
 
+fn child_process_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        windows_process_current_dir(path)
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_path_buf()
+    }
+}
+
 fn copy_env_if_present(command: &mut Command, key: &str) {
     if let Some(value) = std::env::var_os(key).filter(|value| !value.is_empty()) {
         command.env(key, value);
@@ -4331,7 +4343,11 @@ fn configure_windows_host_access_safe_environment(command: &mut Command, workspa
     for key in WINDOWS_HOST_ACCESS_SAFE_ENV_KEYS {
         copy_env_if_present(command, key);
     }
-    command.env("PATH", host_access_path()).env("TEMP", workspace_root).env("TMP", workspace_root);
+    let temp_root = child_process_path(workspace_root);
+    command
+        .env("PATH", host_access_path())
+        .env("TEMP", temp_root.as_path())
+        .env("TMP", temp_root.as_path());
 }
 
 #[cfg(windows)]
@@ -4392,12 +4408,16 @@ fn workspace_python_environment(
         return None;
     }
 
+    let workspace_root = child_process_path(workspace_root);
     Some(WorkspacePythonEnvironment {
         user_base: join_relative_components(
-            workspace_root,
+            workspace_root.as_path(),
             WORKSPACE_PYTHON_USER_BASE_RELATIVE_PATH,
         ),
-        pip_cache: join_relative_components(workspace_root, WORKSPACE_PIP_CACHE_RELATIVE_PATH),
+        pip_cache: join_relative_components(
+            workspace_root.as_path(),
+            WORKSPACE_PIP_CACHE_RELATIVE_PATH,
+        ),
     })
 }
 
@@ -4622,10 +4642,11 @@ fn configure_windows_tier_b_process_environment(
             command.env(key, value);
         }
     }
+    let temp_root = child_process_path(policy.workspace_root.as_path());
     command
         .env("PATH", windows_tier_b_process_path(program, policy))
-        .env("TEMP", policy.workspace_root.as_path())
-        .env("TMP", policy.workspace_root.as_path())
+        .env("TEMP", temp_root.as_path())
+        .env("TMP", temp_root.as_path())
         .env("LANG", "C")
         .env("LC_ALL", "C");
 }
@@ -6390,6 +6411,36 @@ mod tests {
             super::windows_process_current_dir(Path::new(r"\\?\UNC\server\share\fixture")),
             PathBuf::from(r"\\server\share\fixture")
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_tier_b_process_environment_deverbatims_temp_dirs() {
+        let workspace = PathBuf::from(
+            r"\\?\C:\Users\Palo\AppData\Local\Palyra-TestHarness\S033\memory-project",
+        );
+        let policy = sandbox_policy_with_allowed_executables(workspace, vec!["node".to_owned()]);
+        let mut command = Command::new("node");
+
+        super::configure_windows_tier_b_process_environment(
+            &mut command,
+            Path::new(r"C:\Tools\node.exe"),
+            &policy,
+        );
+
+        let env = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let expected = r"C:\Users\Palo\AppData\Local\Palyra-TestHarness\S033\memory-project";
+        assert_eq!(env.get("TEMP").and_then(Option::as_deref), Some(expected));
+        assert_eq!(env.get("TMP").and_then(Option::as_deref), Some(expected));
     }
 
     #[test]
