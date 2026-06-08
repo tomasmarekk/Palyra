@@ -267,6 +267,21 @@ struct CachedToolApprovalDecision {
     expires_at_unix_ms: Option<i64>,
 }
 
+#[derive(Debug, Default)]
+struct ToolApprovalCacheState {
+    decisions: HashMap<String, CachedToolApprovalDecision>,
+    generations: HashMap<String, u64>,
+}
+
+fn tool_approval_cache_generation(cache: &ToolApprovalCacheState, key_prefix: &str) -> u64 {
+    cache.generations.get(key_prefix).copied().unwrap_or(0)
+}
+
+fn bump_tool_approval_cache_generation(cache: &mut ToolApprovalCacheState, key_prefix: &str) {
+    let generation = cache.generations.entry(key_prefix.to_owned()).or_insert(0);
+    *generation = generation.saturating_add(1);
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct CachedHttpFetchEntry {
     pub(crate) expires_at_unix_ms: i64,
@@ -526,7 +541,7 @@ pub struct GatewayRuntimeState {
     pub(crate) memory_search_cache: Mutex<HashMap<String, CachedMemorySearchEntry>>,
     pub(crate) http_fetch_cache: Mutex<HashMap<String, CachedHttpFetchEntry>>,
     recent_context_assembly_traces: Mutex<Vec<Value>>,
-    tool_approval_cache: Mutex<HashMap<String, CachedToolApprovalDecision>>,
+    tool_approval_cache: Mutex<ToolApprovalCacheState>,
     run_cleanup_resources: Mutex<HashMap<String, RunCleanupResources>>,
     closed_browser_sessions: Mutex<ClosedBrowserSessionLedger>,
     worker_fleet: RwLock<WorkerFleetManager>,
@@ -1485,7 +1500,7 @@ impl GatewayRuntimeState {
             memory_search_cache: Mutex::new(HashMap::new()),
             http_fetch_cache: Mutex::new(HashMap::new()),
             recent_context_assembly_traces: Mutex::new(Vec::new()),
-            tool_approval_cache: Mutex::new(HashMap::new()),
+            tool_approval_cache: Mutex::new(ToolApprovalCacheState::default()),
             run_cleanup_resources: Mutex::new(HashMap::new()),
             closed_browser_sessions: Mutex::new(ClosedBrowserSessionLedger::default()),
             worker_fleet: RwLock::new(WorkerFleetManager::default()),
@@ -7585,12 +7600,30 @@ impl GatewayRuntimeState {
         let key_prefix = tool_approval_cache_key_prefix(context, session_id);
         match self.tool_approval_cache.lock() {
             Ok(mut cache) => {
-                cache.retain(|key, _| !key.starts_with(key_prefix.as_str()));
+                cache.decisions.retain(|key, _| !key.starts_with(key_prefix.as_str()));
+                bump_tool_approval_cache_generation(&mut cache, key_prefix.as_str());
             }
             Err(poisoned) => {
                 warn!("tool approval cache lock poisoned while clearing session cache");
                 let mut cache = poisoned.into_inner();
-                cache.retain(|key, _| !key.starts_with(key_prefix.as_str()));
+                cache.decisions.retain(|key, _| !key.starts_with(key_prefix.as_str()));
+                bump_tool_approval_cache_generation(&mut cache, key_prefix.as_str());
+            }
+        }
+    }
+
+    pub(crate) fn tool_approval_cache_generation_for_session(
+        &self,
+        context: &RequestContext,
+        session_id: &str,
+    ) -> u64 {
+        let key_prefix = tool_approval_cache_key_prefix(context, session_id);
+        match self.tool_approval_cache.lock() {
+            Ok(cache) => tool_approval_cache_generation(&cache, key_prefix.as_str()),
+            Err(poisoned) => {
+                warn!("tool approval cache lock poisoned while reading session cache generation");
+                let cache = poisoned.into_inner();
+                tool_approval_cache_generation(&cache, key_prefix.as_str())
             }
         }
     }
@@ -7604,12 +7637,12 @@ impl GatewayRuntimeState {
         let now_unix_ms = current_unix_ms();
         let cache_key = tool_approval_cache_key(context, session_id, subject_id);
         let resolve_from_cache =
-            |cache: &mut HashMap<String, CachedToolApprovalDecision>| -> Option<ToolApprovalOutcome> {
-                cache.retain(|_, entry| match entry.expires_at_unix_ms {
+            |cache: &mut ToolApprovalCacheState| -> Option<ToolApprovalOutcome> {
+                cache.decisions.retain(|_, entry| match entry.expires_at_unix_ms {
                     Some(expires_at_unix_ms) => expires_at_unix_ms > now_unix_ms,
                     None => true,
                 });
-                let cached = cache.get(cache_key.as_str())?.clone();
+                let cached = cache.decisions.get(cache_key.as_str())?.clone();
                 let remaining_ttl_ms = cached
                     .expires_at_unix_ms
                     .map(|expires_at_unix_ms| expires_at_unix_ms.saturating_sub(now_unix_ms))
@@ -7644,12 +7677,24 @@ impl GatewayRuntimeState {
         subject_id: &str,
         outcome: &ToolApprovalOutcome,
     ) {
+        let _remembered = self
+            .remember_tool_approval_if_generation(context, session_id, subject_id, outcome, None);
+    }
+
+    pub(crate) fn remember_tool_approval_if_generation(
+        &self,
+        context: &RequestContext,
+        session_id: &str,
+        subject_id: &str,
+        outcome: &ToolApprovalOutcome,
+        expected_generation: Option<u64>,
+    ) -> bool {
         if !matches!(outcome.decision, ApprovalDecision::Allow | ApprovalDecision::Deny) {
-            return;
+            return false;
         }
         let now_unix_ms = current_unix_ms();
         let expires_at_unix_ms = match outcome.decision_scope {
-            ApprovalDecisionScope::Once => return,
+            ApprovalDecisionScope::Once => return false,
             ApprovalDecisionScope::Session => outcome
                 .decision_scope_ttl_ms
                 .filter(|ttl_ms| *ttl_ms > 0)
@@ -7661,12 +7706,13 @@ impl GatewayRuntimeState {
                         approval_id = %outcome.approval_id,
                         "ignoring timeboxed approval memory entry without positive ttl"
                     );
-                    return;
+                    return false;
                 };
                 Some(now_unix_ms.saturating_add(ttl_ms))
             }
         };
         let cache_key = tool_approval_cache_key(context, session_id, subject_id);
+        let generation_key = tool_approval_cache_key_prefix(context, session_id);
         let cache_entry = CachedToolApprovalDecision {
             approval_id: outcome.approval_id.clone(),
             approved: outcome.approved,
@@ -7675,24 +7721,32 @@ impl GatewayRuntimeState {
             decision_scope: outcome.decision_scope,
             expires_at_unix_ms,
         };
-        let remember_in_cache = |cache: &mut HashMap<String, CachedToolApprovalDecision>| {
-            cache.retain(|_, entry| match entry.expires_at_unix_ms {
+        let remember_in_cache = |cache: &mut ToolApprovalCacheState| -> bool {
+            if let Some(expected_generation) = expected_generation {
+                let current_generation =
+                    tool_approval_cache_generation(cache, generation_key.as_str());
+                if current_generation != expected_generation {
+                    return false;
+                }
+            }
+            cache.decisions.retain(|_, entry| match entry.expires_at_unix_ms {
                 Some(entry_expires_at_unix_ms) => entry_expires_at_unix_ms > now_unix_ms,
                 None => true,
             });
-            if cache.len() >= APPROVAL_DECISION_CACHE_CAPACITY {
-                if let Some(first_key) = cache.keys().next().cloned() {
-                    cache.remove(first_key.as_str());
+            if cache.decisions.len() >= APPROVAL_DECISION_CACHE_CAPACITY {
+                if let Some(first_key) = cache.decisions.keys().next().cloned() {
+                    cache.decisions.remove(first_key.as_str());
                 }
             }
-            cache.insert(cache_key.clone(), cache_entry.clone());
+            cache.decisions.insert(cache_key.clone(), cache_entry.clone());
+            true
         };
         match self.tool_approval_cache.lock() {
             Ok(mut cache) => remember_in_cache(&mut cache),
             Err(poisoned) => {
                 warn!("tool approval cache lock poisoned while recording decision");
                 let mut cache = poisoned.into_inner();
-                remember_in_cache(&mut cache);
+                remember_in_cache(&mut cache)
             }
         }
     }

@@ -4420,6 +4420,57 @@ fn tool_approval_cache_reuses_session_scope_and_clears_on_session_reset() {
 }
 
 #[test]
+fn tool_approval_cache_rejects_stale_generation_after_session_reset() {
+    let state = build_test_runtime_state(false);
+    let context = RequestContext {
+        principal: "user:ops".to_owned(),
+        device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+        channel: Some("cli".to_owned()),
+    };
+    let outcome = ToolApprovalOutcome {
+        approval_id: "01ARZ3NDEKTSV4RRFFQ69G5FB3".to_owned(),
+        approved: true,
+        reason: "allow_session_before_reset".to_owned(),
+        decision: ApprovalDecision::Allow,
+        decision_scope: ApprovalDecisionScope::Session,
+        decision_scope_ttl_ms: None,
+    };
+    let stale_generation = state.tool_approval_cache_generation_for_session(&context, "session-1");
+
+    state.clear_tool_approval_cache_for_session(&context, "session-1");
+    let remembered_stale = state.remember_tool_approval_if_generation(
+        &context,
+        "session-1",
+        "tool:custom.noop",
+        &outcome,
+        Some(stale_generation),
+    );
+    assert!(
+        !remembered_stale,
+        "stale in-flight approval decisions must not be remembered after reset"
+    );
+    assert!(
+        state.resolve_cached_tool_approval(&context, "session-1", "tool:custom.noop").is_none(),
+        "stale generation must leave the cache empty"
+    );
+
+    let current_generation =
+        state.tool_approval_cache_generation_for_session(&context, "session-1");
+    let remembered_current = state.remember_tool_approval_if_generation(
+        &context,
+        "session-1",
+        "tool:custom.noop",
+        &outcome,
+        Some(current_generation),
+    );
+    assert!(remembered_current, "current generation should still allow cache reuse");
+    assert!(
+        state.resolve_cached_tool_approval(&context, "session-1", "tool:custom.noop").is_some(),
+        "current generation should store the approval decision"
+    );
+}
+
+#[test]
 fn tool_approval_cache_expires_timeboxed_scope_entries() {
     let state = build_test_runtime_state(false);
     let context = RequestContext {

@@ -154,6 +154,7 @@ pub(crate) async fn process_run_stream_tool_proposal_event(
     tool_catalog_snapshot: &ModelVisibleToolCatalogSnapshot,
     remaining_tool_budget: &mut u32,
     allow_sensitive_tools: bool,
+    approval_cache_generation: Option<u64>,
     tape_seq: &mut i64,
 ) -> Result<RunStreamToolExecutionOutcome, Status> {
     match prepare_run_stream_tool_proposal_event(
@@ -170,6 +171,7 @@ pub(crate) async fn process_run_stream_tool_proposal_event(
         tool_catalog_snapshot,
         remaining_tool_budget,
         allow_sensitive_tools,
+        approval_cache_generation,
         tape_seq,
     )
     .await?
@@ -209,6 +211,7 @@ pub(crate) async fn prepare_run_stream_tool_proposal_event(
     tool_catalog_snapshot: &ModelVisibleToolCatalogSnapshot,
     remaining_tool_budget: &mut u32,
     allow_sensitive_tools: bool,
+    approval_cache_generation: Option<u64>,
     tape_seq: &mut i64,
 ) -> Result<RunStreamToolProposalPreparationOutcome, Status> {
     let NormalizedToolCall { input_json: normalized_input_json, audit } =
@@ -260,6 +263,7 @@ pub(crate) async fn prepare_run_stream_tool_proposal_event(
             normalized_input_json.as_slice(),
             remaining_tool_budget,
             allow_sensitive_tools,
+            approval_cache_generation,
             tape_seq,
         )
         .await?;
@@ -807,6 +811,7 @@ async fn prepare_run_stream_tool_proposal_execution(
     input_json: &[u8],
     remaining_tool_budget: &mut u32,
     allow_sensitive_tools: bool,
+    approval_cache_generation: Option<u64>,
     tape_seq: &mut i64,
 ) -> Result<RunStreamToolProposalPreparation, Status> {
     let resolved_session_id = active_session_id.ok_or_else(|| {
@@ -858,6 +863,7 @@ async fn prepare_run_stream_tool_proposal_execution(
         proposal_approval_required,
         &backend_selection,
         allow_sensitive_tools,
+        approval_cache_generation,
         tape_seq,
     )
     .await?;
@@ -931,6 +937,7 @@ async fn resolve_run_stream_tool_approval_outcome(
     proposal_approval_required: bool,
     backend_selection: &ToolProposalBackendSelection,
     allow_sensitive_tools: bool,
+    approval_cache_generation: Option<u64>,
     tape_seq: &mut i64,
 ) -> Result<Option<ToolApprovalOutcome>, Status> {
     if proposal_approval_required && allow_sensitive_tools {
@@ -1136,11 +1143,12 @@ async fn resolve_run_stream_tool_approval_outcome(
     )
     .await?;
 
-    runtime_state.remember_tool_approval(
+    runtime_state.remember_tool_approval_if_generation(
         request_context,
         session_id,
         approval_subject_id,
         &response,
+        approval_cache_generation,
     );
     Ok(Some(response))
 }

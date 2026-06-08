@@ -1475,6 +1475,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
             let mut remaining_tool_budget = state_for_stream.config.tool_call.max_calls_per_run;
             let mut previous_session_run_id = None::<String>;
             let mut background_budget_tokens = None::<u64>;
+            let mut active_approval_cache_generation = None::<u64>;
 
             let mut pending_item = None::<Result<common_v1::RunStreamRequest, Status>>;
             loop {
@@ -1538,6 +1539,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     &mut remaining_tool_budget,
                     &mut previous_session_run_id,
                     &mut background_budget_tokens,
+                    &mut active_approval_cache_generation,
                     message,
                 )
                 .await

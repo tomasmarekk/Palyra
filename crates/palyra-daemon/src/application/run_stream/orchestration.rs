@@ -889,6 +889,7 @@ pub(crate) async fn process_run_stream_message(
     remaining_tool_budget: &mut u32,
     previous_session_run_id: &mut Option<String>,
     active_background_budget_tokens: &mut Option<u64>,
+    active_approval_cache_generation: &mut Option<u64>,
     message: common_v1::RunStreamRequest,
 ) -> Result<RunStreamMessageProcessingOutcome, Status> {
     let session_id = canonical_id(message.session_id, "session_id")?;
@@ -960,6 +961,10 @@ pub(crate) async fn process_run_stream_message(
         )
         .await?;
 
+        *active_approval_cache_generation = Some(
+            runtime_state
+                .tool_approval_cache_generation_for_session(request_context, session_id.as_str()),
+        );
         *active_session_id = Some(session_id.clone());
         *active_run_id = Some(run_id.clone());
         runtime_state.record_self_healing_heartbeat(WorkHeartbeatUpdate {
@@ -1416,6 +1421,7 @@ pub(crate) async fn process_run_stream_message(
             &tool_catalog_snapshot,
             remaining_tool_budget,
             message.allow_sensitive_tools,
+            *active_approval_cache_generation,
             tape_seq,
             model_token_tape_events,
             model_token_compaction_emitted,
@@ -1809,6 +1815,7 @@ async fn process_run_stream_provider_response(
     tool_catalog_snapshot: &ModelVisibleToolCatalogSnapshot,
     remaining_tool_budget: &mut u32,
     allow_sensitive_tools: bool,
+    approval_cache_generation: Option<u64>,
     tape_seq: &mut i64,
     model_token_tape_events: &mut usize,
     model_token_compaction_emitted: &mut bool,
@@ -1839,6 +1846,7 @@ async fn process_run_stream_provider_response(
         tool_catalog_snapshot,
         remaining_tool_budget,
         allow_sensitive_tools,
+        approval_cache_generation,
         tape_seq,
         model_token_tape_events,
         model_token_compaction_emitted,
