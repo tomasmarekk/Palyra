@@ -63,6 +63,7 @@ use super::{
 
 const PROVIDER_PROGRESS_HEARTBEAT_MS: u64 = 20_000;
 const PROVIDER_FAILOVER_DEADLINE_GRACE_MS: u64 = 5_000;
+const BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS: u64 = 60_000;
 const MAX_LENGTH_RECOVERY_ATTEMPTS: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,7 +98,26 @@ pub(crate) enum RunStreamPostProviderOutcome {
 #[derive(Debug, Clone)]
 pub(crate) enum RunStreamProviderRequestOutcome {
     Completed(Box<ProviderResponse>),
+    TimedOut { reason: ProviderRequestTimeoutReason, message: String },
     Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderRequestTimeoutReason {
+    Provider,
+    BrowserFollowup,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProviderRequestDeadlineOverride {
+    timeout: Duration,
+    reason: ProviderRequestTimeoutReason,
+}
+
+struct RunStreamProviderRequestExecution {
+    provider_request: ProviderRequest,
+    lease_context: ProviderLeaseExecutionContext,
+    deadline_override: Option<ProviderRequestDeadlineOverride>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +130,7 @@ pub(crate) enum RunStreamMessageProcessingOutcome {
 pub(crate) enum RunStreamProviderResponseOutcome {
     Completed {
         tool_result_messages: Vec<ProviderMessage>,
+        completed_tool_names: Vec<String>,
         provider_trace_ref: Option<String>,
         final_reply_text: Option<String>,
         final_provider_output: Option<Box<ProviderTurnOutput>>,
@@ -171,6 +192,33 @@ fn provider_request_deadline_timeout(
     deadline
 }
 
+fn effective_provider_request_deadline(
+    base_timeout: Duration,
+    route_selection: &ProviderRouteSelectionTrace,
+    request: &ProviderRequest,
+    deadline_override: Option<ProviderRequestDeadlineOverride>,
+) -> (Duration, ProviderRequestTimeoutReason) {
+    let default_deadline =
+        provider_request_deadline_timeout(base_timeout, route_selection, request);
+    match deadline_override {
+        Some(deadline_override) => {
+            (deadline_override.timeout.min(default_deadline), deadline_override.reason)
+        }
+        None => (default_deadline, ProviderRequestTimeoutReason::Provider),
+    }
+}
+
+fn browser_followup_deadline_override(
+    enabled: bool,
+    config: &GatewayRuntimeConfigSnapshot,
+) -> Option<ProviderRequestDeadlineOverride> {
+    enabled.then(|| ProviderRequestDeadlineOverride {
+        timeout: provider_request_timeout(config)
+            .min(Duration::from_millis(BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS)),
+        reason: ProviderRequestTimeoutReason::BrowserFollowup,
+    })
+}
+
 fn provider_request_deadline_attempt_count(
     route_selection: &ProviderRouteSelectionTrace,
     request: &ProviderRequest,
@@ -211,6 +259,51 @@ fn provider_request_timeout_status(run_id: &str, timeout: Duration) -> Status {
     Status::deadline_exceeded(format!(
         "model provider turn timed out after {timeout_ms}ms for run {run_id}; no model tokens, tool proposals, or final answer arrived before the deadline. Retry the run, inspect provider connectivity, or increase model_provider.request_timeout_ms for providers that are expected to respond more slowly."
     ))
+}
+
+fn browser_followup_timeout_message(run_id: &str, timeout: Duration) -> String {
+    let timeout_ms = duration_millis_u64(timeout);
+    format!(
+        "browser follow-up model turn timed out after {timeout_ms}ms for run {run_id}; browser tool results were already recorded, but the model did not produce the next browser diagnostic, tool proposal, or final answer before the follow-up deadline"
+    )
+}
+
+fn provider_request_timeout_message(
+    run_id: &str,
+    timeout: Duration,
+    reason: ProviderRequestTimeoutReason,
+) -> String {
+    match reason {
+        ProviderRequestTimeoutReason::Provider => {
+            provider_request_timeout_status(run_id, timeout).message().to_owned()
+        }
+        ProviderRequestTimeoutReason::BrowserFollowup => {
+            browser_followup_timeout_message(run_id, timeout)
+        }
+    }
+}
+
+fn provider_waiting_status_message(
+    reason: ProviderRequestTimeoutReason,
+    elapsed_ms: u64,
+    timeout_ms: u64,
+    provider_attempt_timeout_ms: u64,
+    effective_timeout: Duration,
+    provider_timeout: Duration,
+) -> String {
+    match reason {
+        ProviderRequestTimeoutReason::BrowserFollowup => format!(
+            "waiting for browser follow-up model response (elapsed_ms={elapsed_ms}, timeout_ms={timeout_ms}, provider_attempt_timeout_ms={provider_attempt_timeout_ms}, followup_deadline=true)"
+        ),
+        ProviderRequestTimeoutReason::Provider if effective_timeout == provider_timeout => {
+            format!(
+                "waiting for model provider response (elapsed_ms={elapsed_ms}, timeout_ms={timeout_ms})"
+            )
+        }
+        ProviderRequestTimeoutReason::Provider => format!(
+            "waiting for model provider response (elapsed_ms={elapsed_ms}, timeout_ms={timeout_ms}, provider_attempt_timeout_ms={provider_attempt_timeout_ms}, failover_deadline_extended=true)"
+        ),
+    }
 }
 
 fn provider_model_override_for_routing(
@@ -465,16 +558,18 @@ async fn execute_run_stream_provider_request(
     runtime_state: &Arc<GatewayRuntimeState>,
     run_state: &mut RunStateMachine,
     run_id: &str,
-    provider_request: ProviderRequest,
-    lease_context: ProviderLeaseExecutionContext,
+    execution: RunStreamProviderRequestExecution,
     tape_seq: &mut i64,
 ) -> Result<RunStreamProviderRequestOutcome, Status> {
+    let RunStreamProviderRequestExecution { provider_request, lease_context, deadline_override } =
+        execution;
     let provider_timeout = provider_request_timeout(&runtime_state.config);
     let provider_status = runtime_state.model_provider_status_snapshot();
-    let provider_deadline_timeout = provider_request_deadline_timeout(
+    let (provider_deadline_timeout, timeout_reason) = effective_provider_request_deadline(
         provider_timeout,
         &provider_status.route_selection,
         &provider_request,
+        deadline_override,
     );
     let provider_span = tracing::info_span!(
         "provider.call",
@@ -508,7 +603,10 @@ async fn execute_run_stream_provider_request(
                     .map(RunStreamProviderRequestOutcome::Completed);
             }
             _ = &mut provider_deadline => {
-                return Err(provider_request_timeout_status(run_id, provider_deadline_timeout));
+                return Ok(RunStreamProviderRequestOutcome::TimedOut {
+                    reason: timeout_reason,
+                    message: provider_request_timeout_message(run_id, provider_deadline_timeout, timeout_reason),
+                });
             }
             _ = cancel_poll.tick() => {
                 match runtime_state.is_orchestrator_cancel_requested(run_id.to_owned()).await {
@@ -531,16 +629,15 @@ async fn execute_run_stream_provider_request(
                 if run_state.state() == RunLifecycleState::InProgress {
                     let elapsed_ms = duration_millis_u64(provider_started_at.elapsed());
                     let timeout_ms = duration_millis_u64(provider_deadline_timeout);
-                    let message = if provider_deadline_timeout == provider_timeout {
-                        format!(
-                            "waiting for model provider response (elapsed_ms={elapsed_ms}, timeout_ms={timeout_ms})"
-                        )
-                    } else {
-                        let provider_attempt_timeout_ms = duration_millis_u64(provider_timeout);
-                        format!(
-                            "waiting for model provider response (elapsed_ms={elapsed_ms}, timeout_ms={timeout_ms}, provider_attempt_timeout_ms={provider_attempt_timeout_ms}, failover_deadline_extended=true)"
-                        )
-                    };
+                    let provider_attempt_timeout_ms = duration_millis_u64(provider_timeout);
+                    let message = provider_waiting_status_message(
+                        timeout_reason,
+                        elapsed_ms,
+                        timeout_ms,
+                        provider_attempt_timeout_ms,
+                        provider_deadline_timeout,
+                        provider_timeout,
+                    );
                     send_status_with_tape(
                         sender,
                         runtime_state,
@@ -1166,6 +1263,7 @@ pub(crate) async fn process_run_stream_message(
     let mut length_recovery_attempts = 0u8;
     let mut final_answer_recovery_attempted = false;
     let mut repeated_tool_failure_tracker = RepeatedToolFailureTracker::default();
+    let mut pending_browser_followup_deadline = false;
 
     loop {
         match runtime_state.is_orchestrator_cancel_requested(run_id.clone()).await {
@@ -1301,26 +1399,90 @@ pub(crate) async fn process_run_stream_message(
                 }
             }
         }
+        let deadline_override = browser_followup_deadline_override(
+            pending_browser_followup_deadline,
+            &runtime_state.config,
+        );
+        pending_browser_followup_deadline = false;
         let provider_response = match execute_run_stream_provider_request(
             sender,
             runtime_state,
             run_state,
             run_id.as_str(),
-            provider_request,
-            ProviderLeaseExecutionContext {
-                provider_id: lease_provider_id.clone(),
-                credential_id: lease_credential_id.clone(),
-                priority: RoutingTaskClass::PrimaryInteractive.lease_priority(),
-                task_label: RoutingTaskClass::PrimaryInteractive.as_str().to_owned(),
-                max_wait_ms: RoutingTaskClass::PrimaryInteractive.max_lease_wait_ms(),
-                session_id: Some(session_id_for_message.clone()),
-                run_id: Some(run_id.clone()),
+            RunStreamProviderRequestExecution {
+                provider_request,
+                lease_context: ProviderLeaseExecutionContext {
+                    provider_id: lease_provider_id.clone(),
+                    credential_id: lease_credential_id.clone(),
+                    priority: RoutingTaskClass::PrimaryInteractive.lease_priority(),
+                    task_label: RoutingTaskClass::PrimaryInteractive.as_str().to_owned(),
+                    max_wait_ms: RoutingTaskClass::PrimaryInteractive.max_lease_wait_ms(),
+                    session_id: Some(session_id_for_message.clone()),
+                    run_id: Some(run_id.clone()),
+                },
+                deadline_override,
             },
             tape_seq,
         )
         .await
         {
             Ok(RunStreamProviderRequestOutcome::Completed(response)) => *response,
+            Ok(RunStreamProviderRequestOutcome::TimedOut { reason, message }) => {
+                if loop_state.completed_tool_calls() > 0 {
+                    let fallback_summary = match reason {
+                        ProviderRequestTimeoutReason::BrowserFollowup => {
+                            browser_followup_timeout_partial_summary(
+                                message.as_str(),
+                                &loop_state,
+                                run_id.as_str(),
+                            )
+                        }
+                        ProviderRequestTimeoutReason::Provider => provider_error_partial_summary(
+                            message.as_str(),
+                            &loop_state,
+                            run_id.as_str(),
+                        ),
+                    };
+                    send_deferred_final_reply_tokens(
+                        sender,
+                        runtime_state,
+                        request_context,
+                        session_id_for_message.as_str(),
+                        run_id.as_str(),
+                        tape_seq,
+                        model_token_tape_events,
+                        model_token_compaction_emitted,
+                        fallback_summary.as_str(),
+                    )
+                    .await?;
+                    terminate_run_stream_with_agent_loop_reason(
+                        sender,
+                        runtime_state,
+                        run_state,
+                        run_id.as_str(),
+                        tape_seq,
+                        &loop_state,
+                        provider_timeout_termination_reason(reason),
+                        fallback_summary.as_str(),
+                        None,
+                    )
+                    .await?;
+                    return Ok(RunStreamMessageProcessingOutcome::Terminate);
+                }
+                terminate_run_stream_with_agent_loop_reason(
+                    sender,
+                    runtime_state,
+                    run_state,
+                    run_id.as_str(),
+                    tape_seq,
+                    &loop_state,
+                    provider_timeout_termination_reason(reason),
+                    message.as_str(),
+                    None,
+                )
+                .await?;
+                return Err(Status::deadline_exceeded(message));
+            }
             Ok(RunStreamProviderRequestOutcome::Cancelled) => {
                 return Ok(RunStreamMessageProcessingOutcome::Terminate);
             }
@@ -1432,6 +1594,7 @@ pub(crate) async fn process_run_stream_message(
         match response_outcome {
             RunStreamProviderResponseOutcome::Completed {
                 tool_result_messages,
+                completed_tool_names,
                 provider_trace_ref,
                 final_reply_text,
                 final_provider_output,
@@ -1615,6 +1778,8 @@ pub(crate) async fn process_run_stream_message(
                 let repeated_tool_failure =
                     repeated_tool_failure_tracker.observe(tool_result_messages.as_slice());
                 let tool_result_count = tool_result_messages.len();
+                pending_browser_followup_deadline =
+                    completed_tool_names.iter().any(|tool_name| is_browser_tool_name(tool_name));
                 loop_state.append_tool_result_messages(tool_result_messages);
                 if let Some(failure) = repeated_tool_failure {
                     terminate_run_stream_with_agent_loop_reason(
@@ -1871,6 +2036,8 @@ async fn process_run_stream_provider_response(
     } else {
         tool_results.iter().map(tool_result_to_provider_message).collect::<Result<Vec<_>, _>>()?
     };
+    let completed_tool_names =
+        tool_results.iter().map(|result| result.tool_name.clone()).collect::<Vec<_>>();
     let has_pending_tool_results = !tool_result_messages.is_empty();
     let reply_text = if provider_output.full_text.trim().is_empty() {
         summary_tokens.concat()
@@ -1944,6 +2111,7 @@ async fn process_run_stream_provider_response(
 
     Ok(RunStreamProviderResponseOutcome::Completed {
         tool_result_messages,
+        completed_tool_names,
         provider_trace_ref: provider_output.raw_provider_refs.provider_trace_ref.clone(),
         final_reply_text: (!has_pending_tool_results).then_some(reply_text),
         final_provider_output: (!has_pending_tool_results && !stream_model_tokens_immediately)
@@ -2331,6 +2499,34 @@ fn provider_error_partial_summary(
         "Partial result: I ran {tool_count} {tool_label}, but the next model provider turn failed before producing a final answer. Provider issue: {}. The run tape for {run_id} contains the exact tool evidence. Resume this same session and reference run {run_id} if any requested artifact, validation, or cleanup is still missing.",
         truncate_with_ellipsis(message.trim().replace(['\r', '\n'], " "), 512)
     )
+}
+
+fn browser_followup_timeout_partial_summary(
+    message: &str,
+    loop_state: &AgentRunLoopState,
+    run_id: &str,
+) -> String {
+    let tool_count = loop_state.completed_tool_calls();
+    let tool_label = if tool_count == 1 { "tool call" } else { "tool calls" };
+    format!(
+        "Partial result: I ran {tool_count} {tool_label}, including browser work, but the next model turn did not continue after the browser result before the follow-up timeout. Last issue: {}. The run tape for {run_id} contains the exact browser tool evidence. Resume this same session and reference run {run_id} if any requested browser validation, screenshot, console check, artifact, or final summary is still missing.",
+        truncate_with_ellipsis(message.trim().replace(['\r', '\n'], " "), 512)
+    )
+}
+
+fn provider_timeout_termination_reason(
+    reason: ProviderRequestTimeoutReason,
+) -> AgentLoopTerminationReason {
+    match reason {
+        ProviderRequestTimeoutReason::Provider => AgentLoopTerminationReason::ProviderError,
+        ProviderRequestTimeoutReason::BrowserFollowup => {
+            AgentLoopTerminationReason::BrowserFollowupTimeout
+        }
+    }
+}
+
+fn is_browser_tool_name(tool_name: &str) -> bool {
+    tool_name.starts_with("palyra.browser.")
 }
 
 fn incomplete_final_answer_without_tools(
@@ -2768,16 +2964,20 @@ mod tests {
     use super::{
         agent_loop_budget_exhausted_message, apply_background_budget_guard,
         background_budget_overrun_message, background_run_budget_tokens,
-        contains_raw_provider_tool_call_markup, final_answer_recovery_fallback_summary,
+        browser_followup_timeout_partial_summary, contains_raw_provider_tool_call_markup,
+        effective_provider_request_deadline, final_answer_recovery_fallback_summary,
         final_answer_recovery_prompt, incomplete_final_answer_without_tools,
-        incomplete_terminal_final_answer, is_run_stream_response_channel_closed,
-        length_recovery_prompt, provider_model_override_for_routing,
-        provider_request_deadline_timeout, provider_request_timeout_status,
+        incomplete_terminal_final_answer, is_browser_tool_name,
+        is_run_stream_response_channel_closed, length_recovery_prompt,
+        provider_model_override_for_routing, provider_request_deadline_timeout,
+        provider_request_timeout_message, provider_request_timeout_status,
+        provider_timeout_termination_reason, provider_waiting_status_message,
         repeated_tool_failure_signature, should_emit_budget_exhausted_partial_summary,
         should_terminate_after_tool_budget_exhausted, terminal_tool_authorization_failure,
         tool_calls_finish_without_tool_payload, tool_result_to_provider_message,
-        truncated_final_answer_without_tools, RepeatedToolFailureTracker,
-        RunStreamToolResultForModel, MAX_LENGTH_RECOVERY_ATTEMPTS,
+        truncated_final_answer_without_tools, ProviderRequestDeadlineOverride,
+        ProviderRequestTimeoutReason, RepeatedToolFailureTracker, RunStreamToolResultForModel,
+        BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS, MAX_LENGTH_RECOVERY_ATTEMPTS,
     };
     use super::{AgentLoopTerminationReason, AgentRunLoopState};
     use crate::application::run_stream::tape::RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE;
@@ -2898,6 +3098,80 @@ mod tests {
         );
 
         assert_eq!(deadline, Duration::from_millis(10_000));
+    }
+
+    #[test]
+    fn browser_followup_deadline_caps_failover_deadline() {
+        let request = ProviderRequest::from_input_text(
+            "summarize browser result".to_owned(),
+            false,
+            Vec::new(),
+            None,
+        );
+        let (deadline, reason) = effective_provider_request_deadline(
+            Duration::from_millis(180_000),
+            &route_selection_with_fallback(true),
+            &request,
+            Some(ProviderRequestDeadlineOverride {
+                timeout: Duration::from_millis(BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS),
+                reason: ProviderRequestTimeoutReason::BrowserFollowup,
+            }),
+        );
+
+        assert_eq!(deadline, Duration::from_millis(BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS));
+        assert_eq!(reason, ProviderRequestTimeoutReason::BrowserFollowup);
+    }
+
+    #[test]
+    fn browser_followup_deadline_respects_smaller_provider_timeout() {
+        let request = ProviderRequest::from_input_text(
+            "summarize browser result".to_owned(),
+            false,
+            Vec::new(),
+            None,
+        );
+        let (deadline, reason) = effective_provider_request_deadline(
+            Duration::from_millis(5_000),
+            &route_selection_with_fallback(false),
+            &request,
+            Some(ProviderRequestDeadlineOverride {
+                timeout: Duration::from_millis(BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS),
+                reason: ProviderRequestTimeoutReason::BrowserFollowup,
+            }),
+        );
+
+        assert_eq!(deadline, Duration::from_millis(5_000));
+        assert_eq!(reason, ProviderRequestTimeoutReason::BrowserFollowup);
+    }
+
+    #[test]
+    fn browser_followup_timeout_status_is_actionable() {
+        let message = provider_request_timeout_message(
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            Duration::from_millis(60_000),
+            ProviderRequestTimeoutReason::BrowserFollowup,
+        );
+
+        assert!(message.contains("browser follow-up model turn timed out after 60000ms"));
+        assert!(message.contains("browser tool results were already recorded"));
+        assert!(message.contains("01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+        assert!(!message.contains("model_provider.request_timeout_ms"));
+    }
+
+    #[test]
+    fn browser_followup_waiting_status_names_followup_deadline() {
+        let message = provider_waiting_status_message(
+            ProviderRequestTimeoutReason::BrowserFollowup,
+            20_000,
+            60_000,
+            180_000,
+            Duration::from_millis(60_000),
+            Duration::from_millis(180_000),
+        );
+
+        assert!(message.contains("waiting for browser follow-up model response"));
+        assert!(message.contains("followup_deadline=true"));
+        assert!(message.contains("provider_attempt_timeout_ms=180000"));
     }
 
     #[test]
@@ -3117,6 +3391,29 @@ mod tests {
         assert!(message.contains("elapsed_ms="));
         assert!(message.contains("tool-call limit was not the terminal condition"));
         assert!(!message.contains("tool_call.max_calls_per_run"));
+    }
+
+    #[test]
+    fn browser_followup_timeout_partial_summary_includes_resume_context() {
+        let state =
+            loop_state_after_tool("click the local checkout button", "palyra.browser.click");
+        let message = browser_followup_timeout_partial_summary(
+            "browser follow-up model turn timed out after 60000ms",
+            &state,
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        );
+
+        assert!(is_browser_tool_name("palyra.browser.click"));
+        assert_eq!(
+            provider_timeout_termination_reason(ProviderRequestTimeoutReason::BrowserFollowup),
+            AgentLoopTerminationReason::BrowserFollowupTimeout
+        );
+        assert!(message.contains("Partial result: I ran 1 tool call"));
+        assert!(message.contains("including browser work"));
+        assert!(message.contains("follow-up timeout"));
+        assert!(message.contains("exact browser tool evidence"));
+        assert!(message.contains("Resume this same session"));
+        assert!(message.contains("01ARZ3NDEKTSV4RRFFQ69G5FAV"));
     }
 
     #[test]
