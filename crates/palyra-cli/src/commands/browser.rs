@@ -2339,7 +2339,8 @@ async fn run_browser_snapshot(args: BrowserSnapshotArgs) -> Result<()> {
         written.is_some(),
         "failed to encode browser snapshot output",
         json,
-    )
+    )?;
+    ensure_browser_value_success("browser.snapshot", &value)
 }
 
 async fn run_browser_screenshot(
@@ -4198,6 +4199,12 @@ fn ensure_browser_command_success(command: &str, success: bool, error: &str) -> 
     anyhow::bail!("{command} failed: {}", browser_failure_detail(error))
 }
 
+fn ensure_browser_value_success(command: &str, value: &Value) -> Result<()> {
+    let success = value.get("success").and_then(Value::as_bool).unwrap_or(true);
+    let error = value.get("error").and_then(Value::as_str).unwrap_or("");
+    ensure_browser_command_success(command, success, error)
+}
+
 fn browser_command_payload_should_emit(mode: BrowserOutputMode, success: bool) -> bool {
     success || matches!(mode, BrowserOutputMode::Text)
 }
@@ -4909,10 +4916,11 @@ mod tests {
         browser_status_warnings, effective_browser_lifecycle_running,
         ensure_browser_command_success, ensure_browser_gateway_auth_token_alignment,
         ensure_browser_service_enabled, ensure_browser_start_preflight,
-        format_browser_console_text, format_browser_session_summary_text,
-        normalize_session_scoped_output, redact_browser_output_value, session_summary_value,
-        BrowserControlPlaneSnapshot, BrowserOutputMode, BrowserPolicySnapshot,
-        BrowserResolvedConfig, BrowserServiceConnection, BrowserServiceMetadata,
+        ensure_browser_value_success, format_browser_console_text,
+        format_browser_session_summary_text, normalize_session_scoped_output,
+        redact_browser_output_value, session_summary_value, BrowserControlPlaneSnapshot,
+        BrowserOutputMode, BrowserPolicySnapshot, BrowserResolvedConfig, BrowserServiceConnection,
+        BrowserServiceMetadata,
     };
     use crate::{args::BrowserCommand, browser_v1, common_v1};
     use palyra_control_plane as control_plane;
@@ -5100,6 +5108,21 @@ mod tests {
         assert!(
             error.to_string().contains("browser.screenshot failed: tab crashed"),
             "failure should include command and browser service error: {error}"
+        );
+    }
+
+    #[test]
+    fn browser_snapshot_success_false_is_a_command_failure() {
+        let payload = json!({
+            "success": false,
+            "error": "session_not_found",
+        });
+        let error = ensure_browser_value_success("browser.snapshot", &payload)
+            .expect_err("success=false snapshot envelopes must fail the CLI command");
+
+        assert!(
+            error.to_string().contains("browser.snapshot failed: session_not_found"),
+            "snapshot failure should include command and browser service error: {error}"
         );
     }
 
