@@ -64,6 +64,7 @@ use super::{
 const PROVIDER_PROGRESS_HEARTBEAT_MS: u64 = 20_000;
 const PROVIDER_FAILOVER_DEADLINE_GRACE_MS: u64 = 5_000;
 const BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS: u64 = 60_000;
+const MAX_BROWSER_FOLLOWUP_RECOVERY_ATTEMPTS: u8 = 1;
 const MAX_LENGTH_RECOVERY_ATTEMPTS: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1288,6 +1289,7 @@ pub(crate) async fn process_run_stream_message(
     .await?;
     let mut length_recovery_attempts = 0u8;
     let mut final_answer_recovery_attempted = false;
+    let mut browser_followup_recovery_attempts = 0u8;
     let mut repeated_tool_failure_tracker = RepeatedToolFailureTracker::default();
     let mut pending_browser_followup_deadline = false;
 
@@ -1455,6 +1457,36 @@ pub(crate) async fn process_run_stream_message(
             Ok(RunStreamProviderRequestOutcome::Completed(response)) => *response,
             Ok(RunStreamProviderRequestOutcome::TimedOut { reason, message }) => {
                 if loop_state.completed_tool_calls() > 0 {
+                    if let Some(recovery_prompt) = browser_followup_timeout_recovery_prompt(
+                        reason,
+                        message.as_str(),
+                        &loop_state,
+                        browser_followup_recovery_attempts,
+                    ) {
+                        browser_followup_recovery_attempts =
+                            browser_followup_recovery_attempts.saturating_add(1);
+                        loop_state.append_user_guidance(recovery_prompt);
+                        append_agent_loop_tape_event(
+                            runtime_state,
+                            run_id.as_str(),
+                            tape_seq,
+                            "agent_loop.browser_followup_recovery_requested",
+                            loop_state.turn_payload(
+                                run_id.as_str(),
+                                "agent_loop.browser_followup_recovery_requested",
+                            ),
+                        )
+                        .await?;
+                        send_agent_loop_progress_status(
+                            sender,
+                            runtime_state,
+                            run_id.as_str(),
+                            tape_seq,
+                            "agent_loop.browser_followup_recovery_requested",
+                        )
+                        .await?;
+                        continue;
+                    }
                     let fallback_summary = match reason {
                         ProviderRequestTimeoutReason::BrowserFollowup => {
                             browser_followup_timeout_partial_summary(
@@ -2501,6 +2533,26 @@ fn final_answer_recovery_prompt(
     )
 }
 
+fn browser_followup_timeout_recovery_prompt(
+    reason: ProviderRequestTimeoutReason,
+    message: &str,
+    loop_state: &AgentRunLoopState,
+    attempt_count: u8,
+) -> Option<String> {
+    if reason != ProviderRequestTimeoutReason::BrowserFollowup
+        || attempt_count >= MAX_BROWSER_FOLLOWUP_RECOVERY_ATTEMPTS
+        || loop_state.completed_tool_calls() == 0
+        || loop_state.remaining_model_turns() == 0
+    {
+        return None;
+    }
+
+    Some(format!(
+        "The previous browser follow-up model turn timed out after browser tool results were recorded. Continue from the existing browser evidence now; do not recapture screenshots unless the evidence is missing or stale. If the requested patch, report, validation, or final summary is still missing, issue exactly one minimal tool call next. If the work is complete, answer concisely with changed files and validation status. Last issue: {}",
+        truncate_with_ellipsis(message.trim().replace(['\r', '\n'], " "), 512)
+    ))
+}
+
 fn final_answer_recovery_fallback_summary(
     message: &str,
     loop_state: &AgentRunLoopState,
@@ -2991,10 +3043,11 @@ mod tests {
         agent_loop_budget_exhausted_message, agent_loop_terminal_status_message,
         apply_background_budget_guard, background_budget_overrun_message,
         background_run_budget_tokens, browser_followup_timeout_partial_summary,
-        contains_raw_provider_tool_call_markup, effective_provider_request_deadline,
-        final_answer_recovery_fallback_summary, final_answer_recovery_prompt,
-        incomplete_final_answer_without_tools, incomplete_terminal_final_answer,
-        is_browser_tool_name, is_run_stream_response_channel_closed, length_recovery_prompt,
+        browser_followup_timeout_recovery_prompt, contains_raw_provider_tool_call_markup,
+        effective_provider_request_deadline, final_answer_recovery_fallback_summary,
+        final_answer_recovery_prompt, incomplete_final_answer_without_tools,
+        incomplete_terminal_final_answer, is_browser_tool_name,
+        is_run_stream_response_channel_closed, length_recovery_prompt,
         provider_error_partial_summary, provider_model_override_for_routing,
         provider_request_deadline_timeout, provider_request_timeout_message,
         provider_request_timeout_status, provider_timeout_termination_reason,
@@ -3441,6 +3494,46 @@ mod tests {
         assert!(message.contains("exact browser tool evidence"));
         assert!(message.contains("Resume this same session"));
         assert!(message.contains("01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+    }
+
+    #[test]
+    fn browser_followup_timeout_gets_one_recovery_prompt_after_tool_evidence() {
+        let state = loop_state_after_tool(
+            "Open a local marketing page, capture screenshots, write a report, and patch CSS.",
+            "palyra.browser.screenshot",
+        );
+
+        let prompt = browser_followup_timeout_recovery_prompt(
+            ProviderRequestTimeoutReason::BrowserFollowup,
+            "browser follow-up model turn timed out after 60000ms for run 01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            &state,
+            0,
+        )
+        .expect("first browser follow-up timeout after tool evidence should be recoverable");
+
+        assert!(prompt.contains("Continue from the existing browser evidence"));
+        assert!(prompt.contains("issue exactly one minimal tool call next"));
+        assert!(prompt.contains("patch, report, validation, or final summary"));
+        assert!(
+            browser_followup_timeout_recovery_prompt(
+                ProviderRequestTimeoutReason::BrowserFollowup,
+                "browser follow-up model turn timed out after 60000ms",
+                &state,
+                1,
+            )
+            .is_none(),
+            "browser follow-up timeout recovery must be attempted at most once per run"
+        );
+        assert!(
+            browser_followup_timeout_recovery_prompt(
+                ProviderRequestTimeoutReason::Provider,
+                "model provider turn timed out after 60000ms",
+                &state,
+                0,
+            )
+            .is_none(),
+            "generic provider timeouts should keep the existing partial-continuation path"
+        );
     }
 
     #[test]
