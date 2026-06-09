@@ -1508,12 +1508,11 @@ mod tests {
     }
 
     #[test]
-    fn decide_tool_call_allows_memory_lifecycle_tools_when_allowlisted() {
+    fn decide_tool_call_requires_approval_for_memory_retain_when_allowlisted() {
         for (tool_name, allowlisted_tool) in [
             ("palyra.memory.retain", "palyra.memory.retain"),
             ("palyra.retain", "palyra.memory.retain"),
             ("palyra.memory.retain", "palyra.retain"),
-            ("palyra.memory.reflect", "palyra.memory.reflect"),
         ] {
             let config = ToolCallConfig {
                 allowed_tools: vec![allowlisted_tool.to_owned()],
@@ -1524,15 +1523,44 @@ mod tests {
             };
             let mut budget = 1;
             let request_context = tool_request_context("user:ops");
-            let decision =
-                decide_tool_call(&config, &mut budget, &request_context, tool_name, false);
-            assert!(decision.allowed, "allowlisted {tool_name} should be executable");
-            assert!(
-                !decision.approval_required,
-                "{tool_name} should return structured lifecycle status instead of approval gating"
-            );
-            assert_eq!(budget, 0, "allowed tool should consume budget");
+            let denied = decide_tool_call(&config, &mut budget, &request_context, tool_name, false);
+
+            assert!(!denied.allowed, "allowlisted {tool_name} should still need approval");
+            assert!(denied.approval_required, "{tool_name} should require interactive approval");
+            assert_eq!(budget, 1, "denied approval must not consume budget");
+
+            let approved =
+                decide_tool_call(&config, &mut budget, &request_context, tool_name, true);
+
+            assert!(approved.allowed, "approved {tool_name} should be executable");
+            assert!(approved.approval_required, "sensitive metadata should remain visible");
+            assert_eq!(budget, 0, "approved tool should consume budget");
         }
+    }
+
+    #[test]
+    fn decide_tool_call_allows_memory_reflect_when_allowlisted() {
+        let config = ToolCallConfig {
+            allowed_tools: vec!["palyra.memory.reflect".to_owned()],
+            max_calls_per_run: 1,
+            execution_timeout_ms: 250,
+            process_runner: default_process_runner_policy(),
+            wasm_runtime: default_wasm_runtime_policy(),
+        };
+        let mut budget = 1;
+        let request_context = tool_request_context("user:ops");
+
+        let decision = decide_tool_call(
+            &config,
+            &mut budget,
+            &request_context,
+            "palyra.memory.reflect",
+            false,
+        );
+
+        assert!(decision.allowed, "memory.reflect should remain executable without approval");
+        assert!(!decision.approval_required, "memory.reflect should not write durable memory");
+        assert_eq!(budget, 0, "allowed tool should consume budget");
     }
 
     #[test]
@@ -1744,8 +1772,8 @@ mod tests {
         assert!(tool_requires_approval("palyra.memory.recall"));
         assert!(tool_requires_approval("palyra.memory.session_search"));
         assert!(tool_requires_approval("palyra.session_search"));
-        assert!(!tool_requires_approval("palyra.memory.retain"));
-        assert!(!tool_requires_approval("palyra.retain"));
+        assert!(tool_requires_approval("palyra.memory.retain"));
+        assert!(tool_requires_approval("palyra.retain"));
         assert!(tool_requires_approval("palyra.memory.delete"));
         assert!(tool_requires_approval("palyra.memory.replace"));
         assert!(!tool_requires_approval("palyra.memory.reflect"));

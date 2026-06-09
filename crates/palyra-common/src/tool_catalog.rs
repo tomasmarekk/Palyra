@@ -66,7 +66,7 @@ pub fn tool_metadata(tool_name: &str) -> Option<ToolMetadata> {
             Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: true })
         }
         "palyra.memory.retain" | "palyra.retain" => {
-            Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: false })
+            Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: true })
         }
         "palyra.memory.delete" => {
             Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: true })
@@ -270,8 +270,8 @@ mod tests {
 
     #[test]
     fn memory_retain_alias_matches_canonical_sensitivity() {
-        assert!(!tool_requires_approval("palyra.memory.retain"));
-        assert!(!tool_requires_approval("palyra.retain"));
+        assert!(tool_requires_approval("palyra.memory.retain"));
+        assert!(tool_requires_approval("palyra.retain"));
         assert!(tool_policy_capability_names("palyra.retain").is_empty());
     }
 
