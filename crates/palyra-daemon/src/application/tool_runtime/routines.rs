@@ -24,7 +24,7 @@ use crate::{
         ApprovalPromptOption, ApprovalPromptRecord, ApprovalRiskLevel, ApprovalSubjectType,
         CronConcurrencyPolicy, CronJobCreateRequest, CronJobRecord, CronJobUpdatePatch,
         CronMisfirePolicy, CronRetryPolicy, CronRunFinalizeRequest, CronRunRecord,
-        CronRunStartRequest, CronRunStatus,
+        CronRunStartRequest, CronRunStatus, CronScheduleType,
     },
     routines::{
         default_outcome_from_cron_status, join_run_metadata, natural_language_schedule_preview,
@@ -1811,6 +1811,7 @@ fn resolve_routine_schedule(
             schedule_type: existing_job.schedule_type,
             schedule_payload_json: schedule_payload_with_max_runs(
                 existing_job.schedule_payload_json.clone(),
+                existing_job.schedule_type,
                 max_runs,
                 Some(existing_job),
             )?,
@@ -1838,6 +1839,7 @@ fn resolve_routine_schedule(
             schedule_type: normalized.schedule_type,
             schedule_payload_json: schedule_payload_with_max_runs(
                 normalized.schedule_payload_json,
+                normalized.schedule_type,
                 max_runs,
                 existing_job,
             )?,
@@ -1860,10 +1862,12 @@ fn resolve_routine_schedule(
             unix_ms_now_string_safe()?,
         )
         .map_err(map_registry_error)?;
+        let schedule_type = parse_schedule_type(preview.schedule_type.as_str())?;
         return Ok(ScheduleResolution {
-            schedule_type: parse_schedule_type(preview.schedule_type.as_str())?,
+            schedule_type,
             schedule_payload_json: schedule_payload_with_max_runs(
                 preview.schedule_payload_json,
+                schedule_type,
                 max_runs,
                 existing_job,
             )?,
@@ -1879,6 +1883,7 @@ fn resolve_routine_schedule(
         schedule_type: normalized.schedule_type,
         schedule_payload_json: schedule_payload_with_max_runs(
             normalized.schedule_payload_json,
+            normalized.schedule_type,
             max_runs,
             existing_job,
         )?,
@@ -1889,6 +1894,7 @@ fn resolve_routine_schedule(
 
 fn schedule_payload_with_max_runs(
     schedule_payload_json: String,
+    schedule_type: CronScheduleType,
     requested_max_runs: Option<u32>,
     existing_job: Option<&CronJobRecord>,
 ) -> Result<String, String> {
@@ -1900,6 +1906,12 @@ fn schedule_payload_with_max_runs(
     let Some(max_runs) = max_runs else {
         return Ok(schedule_payload_json);
     };
+    if schedule_type == CronScheduleType::At && max_runs > 1 {
+        return Err(
+            "max_runs greater than 1 is not supported for schedule_type=at; use schedule_type=every for repeated runs"
+                .to_owned(),
+        );
+    }
     let mut payload = serde_json::from_str::<Value>(schedule_payload_json.as_str())
         .map_err(|error| format!("schedule payload must be valid JSON: {error}"))?;
     let Some(object) = payload.as_object_mut() else {
@@ -2771,6 +2783,32 @@ mod tests {
 
         assert_eq!(schedule_payload["interval_ms"], 30_000);
         assert_eq!(schedule_payload["max_runs"], 2);
+    }
+
+    #[test]
+    fn resolve_routine_schedule_rejects_repeated_one_shot_delay() {
+        let payload = json!({
+            "schedule_type": "at",
+            "delay_ms": 30_000,
+            "max_runs": 2,
+        })
+        .as_object()
+        .expect("payload should be an object")
+        .clone();
+
+        let error = super::resolve_routine_schedule(
+            &payload,
+            RoutineTriggerKind::Schedule,
+            crate::cron::CronTimezoneMode::Utc,
+            None,
+            false,
+        )
+        .expect_err("one-shot schedules should reject repeated max_runs");
+
+        assert!(
+            error.contains("schedule_type=at") && error.contains("schedule_type=every"),
+            "error should explain that repeated one-shot routines must use every: {error}"
+        );
     }
 
     #[test]

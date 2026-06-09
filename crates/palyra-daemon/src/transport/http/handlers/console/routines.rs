@@ -2237,6 +2237,7 @@ fn resolve_routine_schedule(
         .map_err(runtime_status_response)?;
         let schedule_payload_json = schedule_payload_with_max_runs(
             normalized.schedule_payload_json,
+            normalized.schedule_type,
             payload.max_runs,
             existing_job,
         )?;
@@ -2282,13 +2283,15 @@ fn resolve_routine_schedule(
                 unix_ms_now().map_err(internal_console_error)?,
             )
             .map_err(routine_registry_error_response)?;
+            let schedule_type = parse_schedule_type(preview.schedule_type.as_str())?;
             let schedule_payload_json = schedule_payload_with_max_runs(
                 preview.schedule_payload_json,
+                schedule_type,
                 payload.max_runs,
                 existing_job,
             )?;
             return Ok(ScheduleResolution {
-                schedule_type: parse_schedule_type(preview.schedule_type.as_str())?,
+                schedule_type,
                 schedule_payload_json,
                 next_run_at_unix_ms: preview.next_run_at_unix_ms,
                 trigger_payload_json_override: None,
@@ -2305,6 +2308,7 @@ fn resolve_routine_schedule(
     .map_err(runtime_status_response)?;
     let schedule_payload_json = schedule_payload_with_max_runs(
         normalized.schedule_payload_json,
+        normalized.schedule_type,
         payload.max_runs,
         existing_job,
     )?;
@@ -2319,6 +2323,7 @@ fn resolve_routine_schedule(
 #[allow(clippy::result_large_err)]
 fn schedule_payload_with_max_runs(
     schedule_payload_json: String,
+    schedule_type: CronScheduleType,
     requested_max_runs: Option<u32>,
     existing_job: Option<&CronJobRecord>,
 ) -> Result<String, Response> {
@@ -2334,6 +2339,11 @@ fn schedule_payload_with_max_runs(
     let Some(max_runs) = max_runs else {
         return Ok(schedule_payload_json);
     };
+    if schedule_type == CronScheduleType::At && max_runs > 1 {
+        return Err(runtime_status_response(tonic::Status::invalid_argument(
+            "max_runs greater than 1 is not supported for schedule_type=at; use schedule_type=every for repeated runs",
+        )));
+    }
     let mut schedule_payload = serde_json::from_str::<Value>(schedule_payload_json.as_str())
         .map_err(|error| internal_console_error(anyhow::Error::new(error)))?;
     let Some(object) = schedule_payload.as_object_mut() else {
@@ -3110,6 +3120,24 @@ mod tests {
                 .expect("schedule payload should be valid json");
         assert_eq!(schedule_payload["interval_ms"], json!(60_000));
         assert_eq!(schedule_payload["max_runs"], json!(2));
+    }
+
+    #[test]
+    fn routine_schedule_resolution_rejects_repeated_one_shot_at_schedule() {
+        let mut payload = schedule_upsert_payload();
+        payload.schedule_type = Some("at".to_owned());
+        payload.at_timestamp_rfc3339 = Some("2100-01-01T00:00:00Z".to_owned());
+        payload.max_runs = Some(2);
+
+        let response = super::resolve_routine_schedule(
+            &payload,
+            RoutineTriggerKind::Schedule,
+            CronTimezoneMode::Utc,
+            None,
+        )
+        .expect_err("one-shot schedules should reject repeated max_runs");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
