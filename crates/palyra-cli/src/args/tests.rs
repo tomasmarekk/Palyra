@@ -1314,6 +1314,8 @@ fn parse_sessions_retry_branch_search_and_export() {
         Command::Sessions {
             command: SessionsCommand::Retry {
                 session_id: "01ARZ3NDEKTSV4RRFFQ69G5FB2".to_owned(),
+                allow_sensitive_tools: false,
+                approval_mode: AgentApprovalModeArg::AllowOnce,
                 json: true,
             }
         }

@@ -457,7 +457,7 @@ pub(crate) async fn run_sessions_async(
             )
             .await?;
         }
-        SessionsCommand::Retry { session_id, json: _ } => {
+        SessionsCommand::Retry { session_id, allow_sensitive_tools, approval_mode, json: _ } => {
             let context = connect_sessions_admin_console(&connection).await?;
             let payload = context
                 .client
@@ -469,29 +469,12 @@ pub(crate) async fn run_sessions_async(
                     &json!({}),
                 )
                 .await?;
-            let prompt = json_required_string(&payload, "/text")?;
-            let origin_kind = json_optional_string(&payload, "/origin_kind");
-            let origin_run_id = json_optional_string(&payload, "/origin_run_id");
-            let parameter_delta_json = payload
-                .pointer("/parameter_delta")
-                .filter(|value| !value.is_null())
-                .map(serde_json::to_string)
-                .transpose()?;
-            let request = build_agent_run_input(AgentRunInputArgs {
-                session_id: Some(resolve_required_canonical_id(session_id.clone())?),
-                session_key: None,
-                session_label: None,
-                require_existing: true,
-                reset_session: false,
-                run_id: None,
-                prompt,
-                allow_sensitive_tools: false,
-                interrupt_active_run: false,
-                approval_mode: AgentApprovalMode::Prompt,
-                origin_kind,
-                origin_run_id,
-                parameter_delta_json,
-            })?;
+            let request = build_session_retry_agent_run_input(
+                session_id,
+                &payload,
+                allow_sensitive_tools,
+                approval_mode,
+            )?;
             let mut client = client::runtime::GatewayRuntimeClient::connect(connection).await?;
             let outcome = stream_agent_events_async(&mut client, request, |event| {
                 if json {
@@ -1033,6 +1016,42 @@ fn resolve_background_task_text(text: Option<String>, text_stdin: bool) -> Resul
     Ok(text)
 }
 
+fn build_session_retry_agent_run_input(
+    session_id: String,
+    payload: &Value,
+    allow_sensitive_tools: bool,
+    approval_mode: AgentApprovalModeArg,
+) -> Result<AgentRunInput> {
+    crate::commands::agent::ensure_agent_run_approval_flags(
+        allow_sensitive_tools,
+        approval_mode,
+        false,
+    )?;
+    let prompt = json_required_string(payload, "/text")?;
+    let origin_kind = json_optional_string(payload, "/origin_kind");
+    let origin_run_id = json_optional_string(payload, "/origin_run_id");
+    let parameter_delta_json = payload
+        .pointer("/parameter_delta")
+        .filter(|value| !value.is_null())
+        .map(serde_json::to_string)
+        .transpose()?;
+    build_agent_run_input(AgentRunInputArgs {
+        session_id: Some(resolve_required_canonical_id(session_id)?),
+        session_key: None,
+        session_label: None,
+        require_existing: true,
+        reset_session: false,
+        run_id: None,
+        prompt,
+        allow_sensitive_tools,
+        interrupt_active_run: false,
+        approval_mode: approval_mode.into(),
+        origin_kind,
+        origin_run_id,
+        parameter_delta_json,
+    })
+}
+
 fn build_resolve_session_request(
     session_id: Option<String>,
     session_key: Option<String>,
@@ -1509,8 +1528,13 @@ mod render_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_cleanup_session_request, build_resolve_session_request, session_to_json};
+    use super::{
+        build_cleanup_session_request, build_resolve_session_request,
+        build_session_retry_agent_run_input, session_to_json,
+    };
+    use crate::args::AgentApprovalModeArg;
     use crate::proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1};
+    use crate::AgentApprovalMode;
 
     #[test]
     fn resolve_session_request_requires_identifier() {
@@ -1538,6 +1562,43 @@ mod tests {
         assert_eq!(request.session_label, "Ops Triage");
         assert!(request.require_existing);
         assert!(!request.reset_session);
+    }
+
+    #[test]
+    fn retry_agent_run_input_restores_payload_context_with_allow_once_default() {
+        let payload = serde_json::json!({
+            "text": "retry the failed workspace task",
+            "origin_kind": "retry",
+            "origin_run_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+            "parameter_delta": {
+                "cli_context": {
+                    "launch_cwd": "C:/work/project",
+                    "workspace_roots": ["C:/work/project"]
+                }
+            }
+        });
+
+        let request = build_session_retry_agent_run_input(
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            &payload,
+            false,
+            AgentApprovalModeArg::AllowOnce,
+        )
+        .expect("retry run input should build");
+
+        assert_eq!(request.prompt, "retry the failed workspace task");
+        assert_eq!(request.approval_mode, AgentApprovalMode::AllowOnce);
+        assert!(!request.allow_sensitive_tools);
+        assert_eq!(request.origin_kind.as_deref(), Some("retry"));
+        assert_eq!(request.origin_run_id.as_deref(), Some("01ARZ3NDEKTSV4RRFFQ69G5FAW"));
+        let parameter_delta: serde_json::Value = serde_json::from_str(
+            request.parameter_delta_json.as_deref().expect("retry should carry a launch context"),
+        )
+        .expect("parameter delta should be valid JSON");
+        assert_eq!(
+            parameter_delta.pointer("/cli_context/launch_cwd").and_then(serde_json::Value::as_str),
+            Some("C:/work/project")
+        );
     }
 
     #[test]

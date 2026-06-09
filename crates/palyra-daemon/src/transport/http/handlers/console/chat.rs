@@ -1271,14 +1271,36 @@ pub(crate) async fn console_chat_retry_prepare_handler(
                 "retry requires a persisted user turn in the latest run",
             ))
         })?;
+    let parameter_delta = retry_parameter_delta_from_payload_or_run(payload.parameter_delta, &run)
+        .map_err(|error| {
+            runtime_status_response(tonic::Status::internal(format!(
+                "failed to prepare retry parameter_delta for run {last_run_id}: {error}"
+            )))
+        })?;
     Ok(Json(json!({
         "session": base_session,
         "text": text,
         "origin_kind": "retry",
         "origin_run_id": last_run_id,
-        "parameter_delta": payload.parameter_delta,
+        "parameter_delta": parameter_delta,
         "contract": contract_descriptor(),
     })))
+}
+
+fn retry_parameter_delta_from_payload_or_run(
+    payload_parameter_delta: Option<Value>,
+    run: &journal::OrchestratorRunStatusSnapshot,
+) -> Result<Option<Value>, serde_json::Error> {
+    if payload_parameter_delta.as_ref().is_some_and(|value| !value.is_null()) {
+        return Ok(payload_parameter_delta);
+    }
+    let Some(raw_parameter_delta) =
+        run.parameter_delta_json.as_deref().map(str::trim).filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let parameter_delta = serde_json::from_str::<Value>(raw_parameter_delta)?;
+    Ok((!parameter_delta.is_null()).then_some(parameter_delta))
 }
 
 pub(crate) async fn console_chat_branch_handler(
@@ -5806,7 +5828,8 @@ mod tests {
         build_background_task_cancelled_result_json, console_attachment_workspace_path,
         console_background_task_budget_tokens, derive_canvas_transcript_reference,
         derived_artifact_index_content, derived_artifact_matches_console_context,
-        extract_canvas_id_from_frame_reference, run_matches_console_context,
+        extract_canvas_id_from_frame_reference, retry_parameter_delta_from_payload_or_run,
+        run_matches_console_context,
     };
     use crate::{domain::workspace::normalize_workspace_path, gateway, journal, media};
 
@@ -5962,6 +5985,64 @@ mod tests {
         assert_eq!(reference.origin_kind.as_deref(), Some("retry"));
         assert_eq!(reference.origin_run_id.as_deref(), Some("01ARZ3NDEKTSV4RRFFQ69G5FA2"));
         assert_eq!(reference.last_referenced_at_unix_ms, Some(20));
+    }
+
+    #[test]
+    fn retry_parameter_delta_falls_back_to_persisted_run_context() {
+        let mut run = sample_run_status();
+        run.parameter_delta_json = Some(
+            serde_json::json!({
+                "cli_context": {
+                    "launch_cwd": "C:/work/project",
+                    "workspace_roots": ["C:/work/project"]
+                }
+            })
+            .to_string(),
+        );
+
+        let parameter_delta = retry_parameter_delta_from_payload_or_run(None, &run)
+            .expect("persisted retry parameter_delta should parse")
+            .expect("persisted retry parameter_delta should be present");
+
+        assert_eq!(
+            parameter_delta.pointer("/cli_context/launch_cwd").and_then(serde_json::Value::as_str),
+            Some("C:/work/project")
+        );
+        assert_eq!(
+            parameter_delta
+                .pointer("/cli_context/workspace_roots/0")
+                .and_then(serde_json::Value::as_str),
+            Some("C:/work/project")
+        );
+    }
+
+    #[test]
+    fn retry_parameter_delta_prefers_explicit_payload_override() {
+        let mut run = sample_run_status();
+        run.parameter_delta_json = Some(
+            serde_json::json!({
+                "cli_context": {
+                    "launch_cwd": "C:/old/project",
+                    "workspace_roots": ["C:/old/project"]
+                }
+            })
+            .to_string(),
+        );
+        let override_delta = serde_json::json!({
+            "cli_context": {
+                "launch_cwd": "C:/new/project",
+                "workspace_roots": ["C:/new/project"]
+            }
+        });
+
+        let parameter_delta = retry_parameter_delta_from_payload_or_run(Some(override_delta), &run)
+            .expect("override retry parameter_delta should parse")
+            .expect("override retry parameter_delta should be present");
+
+        assert_eq!(
+            parameter_delta.pointer("/cli_context/launch_cwd").and_then(serde_json::Value::as_str),
+            Some("C:/new/project")
+        );
     }
 
     #[test]

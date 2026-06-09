@@ -138,7 +138,7 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<()> {
     }
 }
 
-fn ensure_agent_run_approval_flags(
+pub(crate) fn ensure_agent_run_approval_flags(
     allow_sensitive_tools: bool,
     approval_mode: AgentApprovalModeArg,
     prompt_stdin: bool,

@@ -1,5 +1,7 @@
 use clap::{ArgGroup, Subcommand};
 
+use super::AgentApprovalModeArg;
+
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum SessionsCommand {
     List {
@@ -130,6 +132,10 @@ pub enum SessionsCommand {
     },
     Retry {
         session_id: String,
+        #[arg(long, default_value_t = false)]
+        allow_sensitive_tools: bool,
+        #[arg(long, value_enum, default_value_t = AgentApprovalModeArg::AllowOnce)]
+        approval_mode: AgentApprovalModeArg,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
