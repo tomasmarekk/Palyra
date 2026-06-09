@@ -251,6 +251,9 @@ pub(crate) fn classify_error(error: &anyhow::Error) -> CliExitCode {
     {
         return CliExitCode::Precondition;
     }
+    if is_active_same_session_follow_up_precondition(&lower) {
+        return CliExitCode::Precondition;
+    }
     if is_provider_output_limit_stop(&lower) {
         return CliExitCode::Precondition;
     }
@@ -313,6 +316,12 @@ fn is_provider_output_limit_stop(lower_error: &str) -> bool {
         || lower_error.contains("finish reason length")
         || lower_error.contains("output token limit")
         || lower_error.contains("max output tokens")
+}
+
+fn is_active_same_session_follow_up_precondition(lower_error: &str) -> bool {
+    lower_error.contains("same-session `palyra agent run`")
+        && lower_error.contains("cannot live-redirect")
+        && lower_error.contains("active run")
 }
 
 fn is_user_cancellation(lower_error: &str) -> bool {
@@ -533,6 +542,16 @@ mod tests {
             )),
             CliExitCode::Precondition
         );
+    }
+
+    #[test]
+    fn classify_error_maps_active_same_session_follow_up_as_precondition() {
+        let error = anyhow!(
+            "same-session `palyra agent run` cannot live-redirect a selected session while its previous run is in_progress; Palyra will not queue this follow-up behind the active run. To redirect the task, run `palyra sessions abort 01ARZ3NDEKTSV4RRFFQ69G5FAV` and start a new `palyra agent run`."
+        );
+
+        assert_eq!(classify_error(&error), CliExitCode::Precondition);
+        assert_eq!(CliExitCode::Precondition.kind(), "precondition_failed");
     }
 
     #[test]

@@ -1225,6 +1225,10 @@ async fn execute_prepared_tool_runtime(
         )));
     }
 
+    if runtime_state.is_orchestrator_cancel_requested(run_id.to_owned()).await? {
+        return Ok(None);
+    }
+
     runtime_state.record_tool_execution_attempt();
     let started_at = Instant::now();
     let mut cancel_poll = interval(Duration::from_millis(100));
@@ -1724,6 +1728,22 @@ mod tests {
         assert!(
             sibling_completed.load(Ordering::SeqCst),
             "parallel cancellation must wait instead of aborting sibling tasks"
+        );
+    }
+
+    #[test]
+    fn cancelled_workspace_write_tools_do_not_drain_execution() {
+        assert!(
+            !crate::gateway::tool_cancellation_requires_execution_drain(
+                crate::gateway::WORKSPACE_PATCH_TOOL_NAME
+            ),
+            "cancelled run-stream apply_patch calls must be skipped before workspace mutation"
+        );
+        assert!(
+            !crate::gateway::tool_cancellation_requires_execution_drain(
+                crate::gateway::OS_FILE_TOOL_NAME
+            ),
+            "cancelled run-stream os_file writes must be skipped before OS mutation"
         );
     }
 
