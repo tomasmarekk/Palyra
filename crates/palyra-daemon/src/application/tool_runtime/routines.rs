@@ -579,7 +579,9 @@ async fn upsert_routine(
     context: &RoutinesToolContext,
     payload: &Map<String, Value>,
 ) -> Result<Value, String> {
-    let routine_id = match optional_string_field(payload, "routine_id") {
+    let requested_routine_id = optional_string_field(payload, "routine_id");
+    let routine_id_was_requested = requested_routine_id.is_some();
+    let routine_id = match requested_routine_id {
         Some(value) => {
             validate_canonical_id(value.as_str())
                 .map_err(|_| "routine_id must be a canonical ULID when provided".to_owned())?;
@@ -643,6 +645,16 @@ async fn upsert_routine(
     let name = optional_string_field(payload, "name")
         .or_else(|| existing_job.as_ref().map(|job| job.name.clone()))
         .ok_or_else(|| "name is required and must be a non-empty string".to_owned())?;
+    if !routine_id_was_requested {
+        reject_ambiguous_active_routine_create(
+            runtime_state,
+            &runtime.registry,
+            owner_principal.as_str(),
+            name.as_str(),
+            trigger_kind,
+        )
+        .await?;
+    }
     let prompt = optional_string_field(payload, "prompt")
         .or_else(|| existing_job.as_ref().map(|job| job.prompt.clone()))
         .ok_or_else(|| "prompt is required and must be a non-empty string".to_owned())?;
@@ -1413,6 +1425,70 @@ async fn routine_views_for_principal(
         read_string_value(left, "routine_id").cmp(&read_string_value(right, "routine_id"))
     });
     Ok(routines)
+}
+
+async fn reject_ambiguous_active_routine_create(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    registry: &Arc<RoutineRegistry>,
+    owner_principal: &str,
+    name: &str,
+    trigger_kind: RoutineTriggerKind,
+) -> Result<(), String> {
+    let (jobs, _) = runtime_state
+        .list_cron_jobs(
+            None,
+            Some(MAX_ROUTINE_PAGE_LIMIT),
+            Some(true),
+            Some(owner_principal.to_owned()),
+            None,
+        )
+        .await
+        .map_err(sanitize_status_message)?;
+    let metadata = registry.list_routines().map_err(map_registry_error)?;
+    let Some(routine_id) = matching_active_routine_id_for_create(
+        jobs.as_slice(),
+        metadata.as_slice(),
+        name,
+        trigger_kind,
+    ) else {
+        return Ok(());
+    };
+    Err(ambiguous_routine_create_error(routine_id.as_str(), name, trigger_kind))
+}
+
+fn matching_active_routine_id_for_create(
+    jobs: &[CronJobRecord],
+    metadata: &[RoutineMetadataRecord],
+    name: &str,
+    trigger_kind: RoutineTriggerKind,
+) -> Option<String> {
+    let metadata_by_id =
+        metadata.iter().map(|entry| (entry.routine_id.as_str(), entry)).collect::<HashMap<_, _>>();
+    jobs.iter().filter(|job| job.enabled && routine_name_matches(job.name.as_str(), name)).find_map(
+        |job| {
+            metadata_by_id
+                .get(job.job_id.as_str())
+                .filter(|entry| entry.trigger_kind == trigger_kind)
+                .map(|_| job.job_id.clone())
+        },
+    )
+}
+
+fn routine_name_matches(left: &str, right: &str) -> bool {
+    left.trim().eq_ignore_ascii_case(right.trim())
+}
+
+fn ambiguous_routine_create_error(
+    routine_id: &str,
+    name: &str,
+    trigger_kind: RoutineTriggerKind,
+) -> String {
+    format!(
+        "upsert without routine_id would create a parallel active {} routine named {:?}; pass routine_id={} to update the existing routine, or delete/pause it before creating a separate routine",
+        trigger_kind.as_str(),
+        name,
+        routine_id
+    )
 }
 
 async fn load_routine_view_for_owner(
@@ -3001,6 +3077,49 @@ mod tests {
         assert_eq!(trigger_kind, RoutineTriggerKind::Schedule);
         assert!(!requested);
         assert!(super::resolve_upsert_trigger_kind(&payload, None).is_err());
+    }
+
+    #[test]
+    fn matching_active_routine_id_for_create_rejects_implicit_same_name_update() {
+        let active_job = test_cron_job(true, Some(123_456), false);
+        let metadata = test_routine_metadata();
+
+        let conflict = super::matching_active_routine_id_for_create(
+            &[active_job],
+            &[metadata],
+            " Heartbeat ",
+            RoutineTriggerKind::Schedule,
+        );
+
+        assert_eq!(conflict.as_deref(), Some("routine-01"));
+    }
+
+    #[test]
+    fn matching_active_routine_id_for_create_ignores_disabled_or_different_trigger_routines() {
+        let disabled_job = test_cron_job(false, Some(123_456), false);
+        let schedule_metadata = test_routine_metadata();
+        let mut file_watch_metadata = test_routine_metadata();
+        file_watch_metadata.trigger_kind = RoutineTriggerKind::FileWatch;
+        let active_file_watch_job = test_cron_job(true, Some(123_456), false);
+
+        assert_eq!(
+            super::matching_active_routine_id_for_create(
+                &[disabled_job],
+                &[schedule_metadata.clone()],
+                "heartbeat",
+                RoutineTriggerKind::Schedule,
+            ),
+            None
+        );
+        assert_eq!(
+            super::matching_active_routine_id_for_create(
+                &[active_file_watch_job],
+                &[file_watch_metadata],
+                "heartbeat",
+                RoutineTriggerKind::Schedule,
+            ),
+            None
+        );
     }
 
     #[test]
