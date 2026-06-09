@@ -1401,6 +1401,7 @@ async fn project_tool_result_for_model(
 
     let sensitivity = tool_result_sensitivity(tool_name, default_sensitive);
     let preview = redacted_tool_result_preview(
+        tool_name,
         outcome.output_json.as_slice(),
         budget.max_artifact_preview_bytes,
     );
@@ -1426,6 +1427,7 @@ async fn project_tool_result_for_model(
         .await?;
 
     let summary = summarize_tool_result_for_model(
+        tool_name,
         outcome.output_json.as_slice(),
         budget.max_model_summary_bytes,
     );
@@ -1518,8 +1520,12 @@ fn tool_result_sensitivity(tool_name: &str, default_sensitive: bool) -> ToolResu
     }
 }
 
-fn summarize_tool_result_for_model(output_json: &[u8], max_bytes: usize) -> String {
-    let preview = redacted_tool_result_preview(output_json, max_bytes);
+fn summarize_tool_result_for_model(
+    tool_name: &str,
+    output_json: &[u8],
+    max_bytes: usize,
+) -> String {
+    let preview = redacted_tool_result_preview(tool_name, output_json, max_bytes);
     if preview.len() <= max_bytes {
         preview
     } else {
@@ -1527,10 +1533,20 @@ fn summarize_tool_result_for_model(output_json: &[u8], max_bytes: usize) -> Stri
     }
 }
 
-fn redacted_tool_result_preview(output_json: &[u8], max_bytes: usize) -> String {
+#[derive(Clone, Copy)]
+struct ToolResultPreviewRedaction {
+    preserve_workspace_read_text: bool,
+}
+
+fn redacted_tool_result_preview(tool_name: &str, output_json: &[u8], max_bytes: usize) -> String {
     let redacted = match serde_json::from_slice::<Value>(output_json) {
         Ok(mut value) => {
-            redact_sensitive_json_value(&mut value);
+            let redaction = ToolResultPreviewRedaction {
+                preserve_workspace_read_text: workspace_read_text_already_sanitized(
+                    tool_name, &value,
+                ),
+            };
+            redact_sensitive_json_value(&mut value, redaction);
             serde_json::to_string(&value).unwrap_or_else(|_| REDACTED.to_owned())
         }
         Err(_) => {
@@ -1541,12 +1557,19 @@ fn redacted_tool_result_preview(output_json: &[u8], max_bytes: usize) -> String 
     truncate_utf8(redacted.as_str(), max_bytes)
 }
 
-fn redact_sensitive_json_value(value: &mut Value) {
+fn workspace_read_text_already_sanitized(tool_name: &str, value: &Value) -> bool {
+    tool_name == crate::gateway::WORKSPACE_READ_FILE_TOOL_NAME
+        && value.get("text").is_some_and(Value::is_string)
+        && value.get("redacted").and_then(Value::as_bool) == Some(false)
+        && !value.get("binary").and_then(Value::as_bool).unwrap_or(false)
+}
+
+fn redact_sensitive_json_value(value: &mut Value, redaction: ToolResultPreviewRedaction) {
     match value {
-        Value::Object(map) => redact_sensitive_json_object(map),
+        Value::Object(map) => redact_sensitive_json_object(map, redaction),
         Value::Array(values) => {
             for value in values {
-                redact_sensitive_json_value(value);
+                redact_sensitive_json_value(value, redaction);
             }
         }
         Value::String(text) => {
@@ -1556,14 +1579,21 @@ fn redact_sensitive_json_value(value: &mut Value) {
     }
 }
 
-fn redact_sensitive_json_object(map: &mut Map<String, Value>) {
+fn redact_sensitive_json_object(
+    map: &mut Map<String, Value>,
+    redaction: ToolResultPreviewRedaction,
+) {
     for (key, value) in map.iter_mut() {
         if is_sensitive_key(key.as_str()) {
             *value = Value::String(REDACTED.to_owned());
         } else if is_stream_binary_payload_key(key.as_str()) {
             *value = stream_binary_payload_placeholder(value);
+        } else if redaction.preserve_workspace_read_text && key == "text" {
+            if let Value::String(text) = value {
+                *text = redact_url_segments_in_text(text.as_str());
+            }
         } else {
-            redact_sensitive_json_value(value);
+            redact_sensitive_json_value(value, redaction);
         }
     }
 }
@@ -1715,7 +1745,11 @@ mod tests {
         }))
         .expect("test payload should serialize");
 
-        let preview = super::redacted_tool_result_preview(output_json.as_slice(), 1024);
+        let preview = super::redacted_tool_result_preview(
+            "palyra.browser.screenshot",
+            output_json.as_slice(),
+            1024,
+        );
 
         assert!(preview.contains("\"horizontal_overflow\":true"), "{preview}");
         assert!(preview.contains("\"document_scroll_width\":980"), "{preview}");
@@ -1729,20 +1763,56 @@ mod tests {
     fn tool_result_projection_preview_preserves_benign_source_structure() {
         let source = "const match = document.cookie.match(/(?:^|; )theme=([^;]*)/);\n\
                       const fixture = 'token=a%3Db%3Dc';\n\
-                      const selector = '#password';\n";
+                      const selector = '#password';\n\
+                      const password=document.querySelector('#password').value;\n\
+                      const saved=localStorage.getItem('mock-session');\n\
+                      if (username !== 'demo' || password !== 'demo') throw new Error('bad login');\n\
+                      localStorage.setItem('mock-session', JSON.stringify({ username: 'demo', password: 'demo/demo' }));\n";
         let output_json = serde_json::to_vec(&json!({
             "path": "app.js",
             "text": source,
+            "binary": false,
             "redacted": false,
         }))
         .expect("test payload should serialize");
 
-        let preview = super::redacted_tool_result_preview(output_json.as_slice(), 2048);
+        let preview = super::redacted_tool_result_preview(
+            crate::gateway::WORKSPACE_READ_FILE_TOOL_NAME,
+            output_json.as_slice(),
+            4096,
+        );
 
         assert!(preview.contains("document.cookie.match(/(?:^|; )theme=([^;]*)/)"), "{preview}");
         assert!(preview.contains("token=a%3Db%3Dc"), "{preview}");
         assert!(preview.contains("#password"), "{preview}");
+        assert!(
+            preview.contains("password=document.querySelector('#password').value"),
+            "{preview}"
+        );
+        assert!(preview.contains("localStorage.getItem('mock-session')"), "{preview}");
+        assert!(preview.contains("password !== 'demo'"), "{preview}");
+        assert!(preview.contains("demo/demo"), "{preview}");
         assert!(!preview.contains("<redacted>"), "{preview}");
+    }
+
+    #[test]
+    fn tool_result_projection_preview_still_redacts_workspace_text_when_read_file_did() {
+        let output_json = serde_json::to_vec(&json!({
+            "path": ".env",
+            "text": "APP_SECRET=[REDACTED_SECRET]\n",
+            "binary": false,
+            "redacted": true,
+        }))
+        .expect("test payload should serialize");
+
+        let preview = super::redacted_tool_result_preview(
+            crate::gateway::WORKSPACE_READ_FILE_TOOL_NAME,
+            output_json.as_slice(),
+            1024,
+        );
+
+        assert!(preview.contains("APP_SECRET=<redacted>"), "{preview}");
+        assert!(!preview.contains("[REDACTED_SECRET]"), "{preview}");
     }
 
     #[test]
@@ -1774,7 +1844,11 @@ mod tests {
             &outcome,
             &ToolTurnBudget::default()
         ));
-        let preview = super::redacted_tool_result_preview(outcome.output_json.as_slice(), 1024);
+        let preview = super::redacted_tool_result_preview(
+            "palyra.browser.click",
+            outcome.output_json.as_slice(),
+            1024,
+        );
         assert!(
             preview.contains("\"failure_screenshot_base64\":\"<redacted:base64 chars=4096>\""),
             "{preview}"
