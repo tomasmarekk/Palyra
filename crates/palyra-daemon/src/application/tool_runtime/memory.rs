@@ -3490,13 +3490,13 @@ fn workspace_memory_path_has_allowed_extension(path: &str) -> bool {
 
 fn workspace_memory_document_base_content(
     existing_content: Option<&str>,
-    category_hint: Option<MemoryWriteCategory>,
+    _category_hint: Option<MemoryWriteCategory>,
     replaces_terms: &[String],
 ) -> (Option<String>, usize) {
     let Some(existing_content) = existing_content else {
         return (None, 0);
     };
-    if category_hint != Some(MemoryWriteCategory::Correction) || replaces_terms.is_empty() {
+    if replaces_terms.is_empty() {
         return (Some(existing_content.to_owned()), 0);
     }
     let (content, replaced_entries) =
@@ -4717,6 +4717,34 @@ mod tests {
         assert!(appended);
         assert!(updated.contains("Use Playwright for browser checks."));
         assert!(!updated.contains("Use Mocha for browser checks."));
+    }
+
+    #[test]
+    fn workspace_memory_document_base_content_uses_replaces_terms_without_category() {
+        let existing = "# Project Memory\n\n- remembered_at_unix_ms=1 source=manual\n  UI E2E tests prefer Vitest and concise reports.\n\n- remembered_at_unix_ms=2 source=manual\n  Keep reports concise.\n";
+        let replaces_terms =
+            vec!["Vitest".to_owned(), "Vitest pro E2E".to_owned(), "E2E Vitest".to_owned()];
+        let (base, replaced_entries) =
+            workspace_memory_document_base_content(Some(existing), None, replaces_terms.as_slice());
+        let base = base.expect("existing content should remain present");
+
+        assert_eq!(replaced_entries, 1);
+        assert!(!base.contains("Vitest"), "{base}");
+        assert!(base.contains("Keep reports concise."), "{base}");
+
+        let (updated, appended) = workspace_memory_document_content(
+            Some(base.as_str()),
+            "Project Memory",
+            "UI E2E tests in this project use Playwright.",
+            MemorySource::Manual,
+            &[],
+            Some(0.9),
+            None,
+            3,
+        );
+        assert!(appended);
+        assert!(updated.contains("Playwright"));
+        assert!(!updated.contains("Vitest"));
     }
 
     fn workspace_document_record(content_text: &str) -> WorkspaceDocumentRecord {
