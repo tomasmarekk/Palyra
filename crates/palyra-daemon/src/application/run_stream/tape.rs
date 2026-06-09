@@ -1009,6 +1009,11 @@ fn needs_continuation_reason_code(message: &str) -> &'static str {
     if lower.contains("reason_code=wall_clock") || lower.contains("wall-clock budget exhausted") {
         return "wall_clock";
     }
+    if lower.contains("reason_code=provider_error")
+        || (lower.contains("model provider") && lower.contains("failed"))
+    {
+        return "provider_error";
+    }
     "agent_loop_budget_exhausted"
 }
 
@@ -1282,6 +1287,23 @@ mod tests {
         assert_eq!(value["wire_kind"], "failed");
         assert_eq!(value["lifecycle_state"], "needs_continuation");
         assert_eq!(value["reason_code"], "max_tool_calls");
+        assert_eq!(value["partial"], true);
+        assert_eq!(value["continuation_required"], true);
+    }
+
+    #[test]
+    fn provider_error_status_tape_payload_uses_needs_continuation_reason() {
+        let payload = status_tape_payload(
+            common_v1::stream_status::StatusKind::Failed,
+            "Partial result: I ran 1 tool call, but the next model provider turn failed; needs_continuation=true reason_code=provider_error; partial result summary: continue in the same session",
+        );
+        let value: Value =
+            serde_json::from_str(payload.as_str()).expect("status payload should be json");
+
+        assert_eq!(value["kind"], "needs_continuation");
+        assert_eq!(value["wire_kind"], "failed");
+        assert_eq!(value["lifecycle_state"], "needs_continuation");
+        assert_eq!(value["reason_code"], "provider_error");
         assert_eq!(value["partial"], true);
         assert_eq!(value["continuation_required"], true);
     }

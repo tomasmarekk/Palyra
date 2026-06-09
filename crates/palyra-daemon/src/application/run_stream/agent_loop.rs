@@ -66,6 +66,7 @@ impl AgentLoopTerminationReason {
                 Self::MaxTurns
                     | Self::MaxToolCalls
                     | Self::WallClock
+                    | Self::ProviderError
                     | Self::IncompleteFinalAnswer
                     | Self::BrowserFollowupTimeout
             )
@@ -689,6 +690,57 @@ mod tests {
         assert_eq!(parsed["finalization"]["partial"], true);
         assert_eq!(parsed["finalization"]["continuation_required"], true);
         assert_eq!(parsed["finalization"]["tool_count"], 1);
+    }
+
+    #[test]
+    fn loop_state_marks_provider_error_after_tools_as_needs_continuation() {
+        let mut state = AgentRunLoopState::new(
+            vec![ProviderMessage::user_text("create app files")],
+            2,
+            1,
+            10_000,
+        );
+        state.append_tool_result_messages(vec![ProviderMessage::tool_result(
+            "call-01",
+            r#"{"ok":true}"#,
+        )]);
+
+        let payload = state.termination_payload(
+            "run-01",
+            AgentLoopTerminationReason::ProviderError,
+            "Partial result: provider failed after tool work.",
+            None,
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(payload.as_str()).expect("termination payload should be JSON");
+
+        assert_eq!(parsed["termination_reason"], "provider_error");
+        assert_eq!(parsed["finalization"]["status"], "needs_continuation");
+        assert_eq!(parsed["finalization"]["lifecycle_state"], "needs_continuation");
+        assert_eq!(parsed["finalization"]["reason_code"], "provider_error");
+        assert_eq!(parsed["finalization"]["partial"], true);
+        assert_eq!(parsed["finalization"]["continuation_required"], true);
+        assert_eq!(parsed["finalization"]["tool_count"], 1);
+    }
+
+    #[test]
+    fn loop_state_keeps_provider_error_without_tools_as_failure() {
+        let state = AgentRunLoopState::new(vec![ProviderMessage::user_text("hello")], 2, 1, 10_000);
+
+        let payload = state.termination_payload(
+            "run-01",
+            AgentLoopTerminationReason::ProviderError,
+            "provider failed before any tool evidence",
+            None,
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(payload.as_str()).expect("termination payload should be JSON");
+
+        assert_eq!(parsed["termination_reason"], "provider_error");
+        assert_eq!(parsed["finalization"]["status"], "failed");
+        assert_eq!(parsed["finalization"]["lifecycle_state"], "failed");
+        assert_eq!(parsed["finalization"]["partial"], false);
+        assert_eq!(parsed["finalization"]["continuation_required"], false);
     }
 
     #[test]

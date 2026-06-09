@@ -802,7 +802,7 @@ async fn terminate_run_stream_with_agent_loop_reason(
     message: &str,
     provider_trace_ref: Option<String>,
 ) -> Result<(), Status> {
-    let message = loop_state.message_with_cleanup_guidance(message);
+    let message = agent_loop_terminal_status_message(reason, loop_state, run_id, message);
     append_agent_loop_tape_event(
         runtime_state,
         run_id,
@@ -841,6 +841,32 @@ async fn terminate_run_stream_with_agent_loop_reason(
     .await;
     cleanup_run_resources(runtime_state, run_id, message.as_str()).await;
     status_result
+}
+
+fn agent_loop_terminal_status_message(
+    reason: AgentLoopTerminationReason,
+    loop_state: &AgentRunLoopState,
+    run_id: &str,
+    message: &str,
+) -> String {
+    let message = loop_state.message_with_cleanup_guidance(message);
+    if !reason.needs_continuation(loop_state.completed_tool_calls())
+        || message.to_ascii_lowercase().contains("needs_continuation=true")
+    {
+        return message;
+    }
+
+    let snapshot = loop_state.snapshot(run_id, Some(reason));
+    format!(
+        "{}; needs_continuation=true reason_code={}; partial result summary: run tape for {} contains the exact tool evidence, completed_tool_calls={}, remaining_model_turns={}, remaining_tool_calls={}. Continue in the same session and ask to resume from run {}.",
+        message.trim_end(),
+        reason.as_str(),
+        run_id,
+        snapshot.completed_tool_calls,
+        snapshot.remaining_model_turns,
+        snapshot.remaining_tool_calls,
+        run_id
+    )
 }
 
 #[allow(clippy::result_large_err)]
@@ -2962,22 +2988,23 @@ async fn persist_run_stream_provider_turn_output(
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_loop_budget_exhausted_message, apply_background_budget_guard,
-        background_budget_overrun_message, background_run_budget_tokens,
-        browser_followup_timeout_partial_summary, contains_raw_provider_tool_call_markup,
-        effective_provider_request_deadline, final_answer_recovery_fallback_summary,
-        final_answer_recovery_prompt, incomplete_final_answer_without_tools,
-        incomplete_terminal_final_answer, is_browser_tool_name,
-        is_run_stream_response_channel_closed, length_recovery_prompt,
-        provider_model_override_for_routing, provider_request_deadline_timeout,
-        provider_request_timeout_message, provider_request_timeout_status,
-        provider_timeout_termination_reason, provider_waiting_status_message,
-        repeated_tool_failure_signature, should_emit_budget_exhausted_partial_summary,
-        should_terminate_after_tool_budget_exhausted, terminal_tool_authorization_failure,
-        tool_calls_finish_without_tool_payload, tool_result_to_provider_message,
-        truncated_final_answer_without_tools, ProviderRequestDeadlineOverride,
-        ProviderRequestTimeoutReason, RepeatedToolFailureTracker, RunStreamToolResultForModel,
-        BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS, MAX_LENGTH_RECOVERY_ATTEMPTS,
+        agent_loop_budget_exhausted_message, agent_loop_terminal_status_message,
+        apply_background_budget_guard, background_budget_overrun_message,
+        background_run_budget_tokens, browser_followup_timeout_partial_summary,
+        contains_raw_provider_tool_call_markup, effective_provider_request_deadline,
+        final_answer_recovery_fallback_summary, final_answer_recovery_prompt,
+        incomplete_final_answer_without_tools, incomplete_terminal_final_answer,
+        is_browser_tool_name, is_run_stream_response_channel_closed, length_recovery_prompt,
+        provider_error_partial_summary, provider_model_override_for_routing,
+        provider_request_deadline_timeout, provider_request_timeout_message,
+        provider_request_timeout_status, provider_timeout_termination_reason,
+        provider_waiting_status_message, repeated_tool_failure_signature,
+        should_emit_budget_exhausted_partial_summary, should_terminate_after_tool_budget_exhausted,
+        terminal_tool_authorization_failure, tool_calls_finish_without_tool_payload,
+        tool_result_to_provider_message, truncated_final_answer_without_tools,
+        ProviderRequestDeadlineOverride, ProviderRequestTimeoutReason, RepeatedToolFailureTracker,
+        RunStreamToolResultForModel, BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS,
+        MAX_LENGTH_RECOVERY_ATTEMPTS,
     };
     use super::{AgentLoopTerminationReason, AgentRunLoopState};
     use crate::application::run_stream::tape::RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE;
@@ -3414,6 +3441,44 @@ mod tests {
         assert!(message.contains("exact browser tool evidence"));
         assert!(message.contains("Resume this same session"));
         assert!(message.contains("01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+    }
+
+    #[test]
+    fn provider_error_after_tool_work_gets_needs_continuation_status_marker() {
+        let state = loop_state_after_tool("create a landing page", "palyra.fs.apply_patch");
+        let partial = provider_error_partial_summary(
+            "model provider response invalid after 2 retries (class=malformed_response)",
+            &state,
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        );
+
+        let message = agent_loop_terminal_status_message(
+            AgentLoopTerminationReason::ProviderError,
+            &state,
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            partial.as_str(),
+        );
+
+        assert!(message.contains("Partial result: I ran 1 tool call"));
+        assert!(message.contains("needs_continuation=true"));
+        assert!(message.contains("reason_code=provider_error"));
+        assert!(message.contains("Resume this same session"));
+        assert!(message.contains("resume from run 01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+    }
+
+    #[test]
+    fn provider_error_without_tool_work_omits_needs_continuation_status_marker() {
+        let state = AgentRunLoopState::new(vec![ProviderMessage::user_text("hello")], 4, 8, 10_000);
+
+        let message = agent_loop_terminal_status_message(
+            AgentLoopTerminationReason::ProviderError,
+            &state,
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "model provider failed before a tool call",
+        );
+
+        assert!(!message.contains("needs_continuation=true"));
+        assert!(!message.contains("reason_code=provider_error"));
     }
 
     #[test]
