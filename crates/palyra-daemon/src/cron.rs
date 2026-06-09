@@ -2949,14 +2949,20 @@ async fn execute_single_job_attempt(
     let mut tool_calls = 0_u64;
     let mut tool_denies = 0_u64;
     let mut successful_completion_tools = 0_u64;
-    let mut tool_names_by_proposal = HashMap::<String, String>::new();
+    let mut completion_candidates_by_proposal = HashMap::<String, CronCompletionCandidate>::new();
     while let Some(event) = stream.next().await {
         let event =
             event.map_err(|error| Status::internal(format!("run stream read failed: {error}")))?;
         match event.body {
             Some(common_v1::run_stream_event::Body::ToolProposal(proposal)) => {
                 if let Some(proposal_id) = proposal.proposal_id.as_ref() {
-                    tool_names_by_proposal.insert(proposal_id.ulid.clone(), proposal.tool_name);
+                    completion_candidates_by_proposal.insert(
+                        proposal_id.ulid.clone(),
+                        cron_completion_candidate_for_tool_proposal(
+                            proposal.tool_name.as_str(),
+                            proposal.input_json.as_slice(),
+                        ),
+                    );
                 }
             }
             Some(common_v1::run_stream_event::Body::ToolResult(result)) => {
@@ -2966,9 +2972,11 @@ async fn execute_single_job_attempt(
                         .proposal_id
                         .as_ref()
                         .and_then(|proposal_id| {
-                            tool_names_by_proposal.get(proposal_id.ulid.as_str())
+                            completion_candidates_by_proposal.get(proposal_id.ulid.as_str())
                         })
-                        .is_some_and(|tool_name| cron_successful_completion_tool(tool_name))
+                        .is_some_and(|candidate| {
+                            candidate.is_confirmed_by_output(result.output_json.as_slice())
+                        })
                 {
                     successful_completion_tools = successful_completion_tools.saturating_add(1);
                 }
@@ -3103,8 +3111,24 @@ fn cron_prompt_mentions_file_or_workspace_target(prompt: &str) -> bool {
     .any(|needle| prompt.contains(needle))
 }
 
-fn cron_successful_completion_tool(tool_name: &str) -> bool {
-    matches!(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CronCompletionCandidate {
+    completion_surface: bool,
+    reject_background_output: bool,
+}
+
+impl CronCompletionCandidate {
+    fn is_confirmed_by_output(self, output_json: &[u8]) -> bool {
+        self.completion_surface
+            && (!self.reject_background_output || !cron_tool_output_is_background(output_json))
+    }
+}
+
+fn cron_completion_candidate_for_tool_proposal(
+    tool_name: &str,
+    input_json: &[u8],
+) -> CronCompletionCandidate {
+    if matches!(
         tool_name,
         "palyra.fs.apply_patch"
             | "palyra.fs.os_file"
@@ -3114,7 +3138,53 @@ fn cron_successful_completion_tool(tool_name: &str) -> bool {
             | "palyra.memory.replace"
             | "palyra.routines.control"
             | "palyra.secrets.put"
-    )
+    ) {
+        return CronCompletionCandidate {
+            completion_surface: true,
+            reject_background_output: false,
+        };
+    }
+    if tool_name == crate::gateway::PROCESS_RUNNER_TOOL_NAME
+        && cron_process_run_is_foreground_side_effect_candidate(input_json)
+    {
+        return CronCompletionCandidate {
+            completion_surface: true,
+            reject_background_output: true,
+        };
+    }
+    CronCompletionCandidate { completion_surface: false, reject_background_output: false }
+}
+
+fn cron_process_run_is_foreground_side_effect_candidate(input_json: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<Value>(input_json) else {
+        return false;
+    };
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if object.get("background").and_then(Value::as_bool).unwrap_or(false) {
+        return false;
+    }
+    let Some(command) = object.get("command").and_then(Value::as_str).map(str::trim) else {
+        return false;
+    };
+    !cron_process_run_command_is_read_only(command)
+}
+
+fn cron_process_run_command_is_read_only(command: &str) -> bool {
+    const READ_ONLY_COMMANDS: &[&str] = &[
+        "cat", "dir", "env", "find", "grep", "head", "id", "ls", "pwd", "rg", "stat", "tail",
+        "type", "uname", "wc", "where", "which", "whoami",
+    ];
+
+    READ_ONLY_COMMANDS.iter().any(|candidate| candidate.eq_ignore_ascii_case(command.trim()))
+}
+
+fn cron_tool_output_is_background(output_json: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(output_json)
+        .ok()
+        .and_then(|value| value.get("background").and_then(Value::as_bool))
+        .unwrap_or(false)
 }
 
 fn build_cron_prompt(
@@ -3356,9 +3426,9 @@ mod tests {
     use super::{
         budgeted_cron_run_count, budgeted_objective_run_count, build_cron_prompt,
         build_scheduler_health_snapshot, compute_misfire_recovery_plan, compute_next_run_after,
-        cron_job_requires_completion_tool, cron_misfire_audit_payload,
-        cron_successful_completion_tool, cron_terminal_status_from_stream,
-        decide_concurrency_policy, effective_cron_session_key, effective_cron_session_label,
+        cron_completion_candidate_for_tool_proposal, cron_job_requires_completion_tool,
+        cron_misfire_audit_payload, cron_terminal_status_from_stream, decide_concurrency_policy,
+        effective_cron_session_key, effective_cron_session_label,
         load_periodic_reaudit_skills_index, max_runs_for_job, normalize_schedule,
         now_unix_ms_or_fallback, parse_skill_reaudit_interval, periodic_reaudit_targets,
         reserved_cron_run_slot_count, routine_approval_subject_id, routine_parameter_delta_json,
@@ -3917,12 +3987,36 @@ mod tests {
 
     #[test]
     fn cron_completion_tools_are_explicit_mutation_surfaces() {
-        assert!(cron_successful_completion_tool("palyra.fs.apply_patch"));
-        assert!(cron_successful_completion_tool("palyra.fs.os_file"));
-        assert!(cron_successful_completion_tool("palyra.memory.retain"));
-        assert!(cron_successful_completion_tool("palyra.retain"));
-        assert!(!cron_successful_completion_tool("palyra.fs.read_file"));
-        assert!(!cron_successful_completion_tool("palyra.process.run"));
+        assert!(cron_completion_candidate_for_tool_proposal("palyra.fs.apply_patch", b"{}")
+            .is_confirmed_by_output(b"{}"));
+        assert!(cron_completion_candidate_for_tool_proposal("palyra.fs.os_file", b"{}")
+            .is_confirmed_by_output(b"{}"));
+        assert!(cron_completion_candidate_for_tool_proposal("palyra.memory.retain", b"{}")
+            .is_confirmed_by_output(b"{}"));
+        assert!(cron_completion_candidate_for_tool_proposal("palyra.retain", b"{}")
+            .is_confirmed_by_output(b"{}"));
+        assert!(!cron_completion_candidate_for_tool_proposal("palyra.fs.read_file", b"{}")
+            .is_confirmed_by_output(b"{}"));
+
+        let process_script =
+            br#"{"command":"node","args":["scripts/update-feed.js"],"background":false}"#;
+        assert!(cron_completion_candidate_for_tool_proposal("palyra.process.run", process_script)
+            .is_confirmed_by_output(br#"{"background":false,"exit_code":0}"#));
+
+        let read_only = br#"{"command":"rg","args":["feed-001","reports/feed.md"]}"#;
+        assert!(!cron_completion_candidate_for_tool_proposal("palyra.process.run", read_only)
+            .is_confirmed_by_output(br#"{"background":false,"exit_code":0}"#));
+
+        let background = br#"{"command":"node","args":["server.js"],"background":true}"#;
+        assert!(!cron_completion_candidate_for_tool_proposal("palyra.process.run", background)
+            .is_confirmed_by_output(br#"{"background":false,"exit_code":0}"#));
+
+        let auto_backgrounded = br#"{"command":"python","args":["-m","http.server"]}"#;
+        assert!(!cron_completion_candidate_for_tool_proposal(
+            "palyra.process.run",
+            auto_backgrounded
+        )
+        .is_confirmed_by_output(br#"{"background":true,"pid":1234}"#));
     }
 
     #[test]
