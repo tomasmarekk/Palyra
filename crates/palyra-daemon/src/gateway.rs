@@ -1543,12 +1543,20 @@ pub(crate) async fn cleanup_run_resources(
             Ok(()) => {
                 let status_after = background_process_cleanup_status(pid);
                 let alive_after = status_after.as_ref().map(|status| status.alive);
+                let pid_artifact_outcomes = cleanup_stale_pid_artifacts_after_status(
+                    runtime_state,
+                    run_id,
+                    pid,
+                    status_after.as_ref(),
+                )
+                .await;
                 background_process_outcomes.push(BackgroundProcessCleanupOutcome {
                     pid,
                     termination_attempted: true,
                     alive_after,
                     status_before,
                     status_after,
+                    pid_artifact_outcomes,
                     error: None,
                 });
             }
@@ -1562,12 +1570,20 @@ pub(crate) async fn cleanup_run_resources(
                 );
                 let status_after = background_process_cleanup_status(pid);
                 let alive_after = status_after.as_ref().map(|status| status.alive);
+                let pid_artifact_outcomes = cleanup_stale_pid_artifacts_after_status(
+                    runtime_state,
+                    run_id,
+                    pid,
+                    status_after.as_ref(),
+                )
+                .await;
                 background_process_outcomes.push(BackgroundProcessCleanupOutcome {
                     pid,
                     termination_attempted: true,
                     alive_after,
                     status_before,
                     status_after,
+                    pid_artifact_outcomes,
                     error: Some(error),
                 });
             }
@@ -1608,6 +1624,7 @@ struct BackgroundProcessCleanupOutcome {
     alive_after: Option<bool>,
     status_before: Option<BackgroundProcessCleanupStatus>,
     status_after: Option<BackgroundProcessCleanupStatus>,
+    pid_artifact_outcomes: Vec<PidArtifactCleanupOutcome>,
     error: Option<String>,
 }
 
@@ -1617,6 +1634,13 @@ struct BackgroundProcessCleanupStatus {
     direct_pid_alive: bool,
     process_tree_alive: bool,
     tracked_process_count: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct PidArtifactCleanupOutcome {
+    path: Option<String>,
+    removed: bool,
+    error: Option<String>,
 }
 
 impl From<crate::sandbox_runner::BackgroundProcessRuntimeStatus>
@@ -1634,6 +1658,179 @@ impl From<crate::sandbox_runner::BackgroundProcessRuntimeStatus>
 
 fn background_process_cleanup_status(pid: u32) -> Option<BackgroundProcessCleanupStatus> {
     crate::sandbox_runner::background_process_runtime_status(pid).ok().map(Into::into)
+}
+
+const PID_ARTIFACT_MAX_SCAN_DEPTH: usize = 4;
+const PID_ARTIFACT_MAX_SCAN_ENTRIES: usize = 512;
+const PID_ARTIFACT_MAX_FILE_BYTES: u64 = 1024;
+
+async fn cleanup_stale_pid_artifacts_after_status(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    pid: u32,
+    status_after: Option<&BackgroundProcessCleanupStatus>,
+) -> Vec<PidArtifactCleanupOutcome> {
+    if !matches!(status_after, Some(status) if !status.alive) {
+        return Vec::new();
+    }
+
+    let roots =
+        run_launch_context_path_env(runtime_state, run_id).await.into_values().collect::<Vec<_>>();
+    if roots.is_empty() {
+        return Vec::new();
+    }
+
+    match tokio::task::spawn_blocking(move || cleanup_stale_pid_files_in_roots(&roots, pid)).await {
+        Ok(outcomes) => outcomes,
+        Err(error) => vec![PidArtifactCleanupOutcome {
+            path: None,
+            removed: false,
+            error: Some(format!("PID artifact cleanup task failed: {error}")),
+        }],
+    }
+}
+
+fn cleanup_stale_pid_files_in_roots(roots: &[PathBuf], pid: u32) -> Vec<PidArtifactCleanupOutcome> {
+    let mut outcomes = Vec::new();
+    let mut seen_roots = HashSet::new();
+    let pid_text = pid.to_string();
+
+    for root in roots {
+        let Ok(canonical_root) = fs::canonicalize(root) else {
+            continue;
+        };
+        let Ok(metadata) = fs::metadata(canonical_root.as_path()) else {
+            continue;
+        };
+        if !metadata.is_dir() || !seen_roots.insert(path_dedup_key(canonical_root.as_path())) {
+            continue;
+        }
+
+        cleanup_stale_pid_files_under_root(
+            canonical_root.as_path(),
+            pid_text.as_str(),
+            &mut outcomes,
+        );
+    }
+
+    outcomes
+}
+
+fn cleanup_stale_pid_files_under_root(
+    root: &Path,
+    pid_text: &str,
+    outcomes: &mut Vec<PidArtifactCleanupOutcome>,
+) {
+    let mut stack = VecDeque::from([(root.to_path_buf(), 0usize)]);
+    let mut seen_dirs = HashSet::new();
+    let mut scanned_entries = 0usize;
+
+    while let Some((dir, depth)) = stack.pop_front() {
+        if !seen_dirs.insert(path_dedup_key(dir.as_path())) {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(dir.as_path()) else {
+            continue;
+        };
+
+        for entry in entries {
+            if scanned_entries >= PID_ARTIFACT_MAX_SCAN_ENTRIES {
+                return;
+            }
+            scanned_entries = scanned_entries.saturating_add(1);
+
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+
+            let path = entry.path();
+            if file_type.is_dir() {
+                if depth < PID_ARTIFACT_MAX_SCAN_DEPTH {
+                    stack.push_back((path, depth.saturating_add(1)));
+                }
+                continue;
+            }
+
+            if file_type.is_file() && path_looks_like_pid_file(path.as_path()) {
+                if let Some(outcome) = cleanup_stale_pid_file_if_matches(path.as_path(), pid_text) {
+                    outcomes.push(outcome);
+                }
+            }
+        }
+    }
+}
+
+fn cleanup_stale_pid_file_if_matches(
+    path: &Path,
+    pid_text: &str,
+) -> Option<PidArtifactCleanupOutcome> {
+    match pid_file_contains_pid(path, pid_text) {
+        Ok(true) => match fs::remove_file(path) {
+            Ok(()) => Some(PidArtifactCleanupOutcome {
+                path: Some(path.display().to_string()),
+                removed: true,
+                error: None,
+            }),
+            Err(error) => Some(PidArtifactCleanupOutcome {
+                path: Some(path.display().to_string()),
+                removed: false,
+                error: Some(format!("failed to remove stale PID file: {error}")),
+            }),
+        },
+        Ok(false) => None,
+        Err(error) => Some(PidArtifactCleanupOutcome {
+            path: Some(path.display().to_string()),
+            removed: false,
+            error: Some(error),
+        }),
+    }
+}
+
+fn pid_file_contains_pid(path: &Path, pid_text: &str) -> Result<bool, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("failed to inspect PID file metadata: {error}"))?;
+    if !metadata.file_type().is_file() || metadata.len() > PID_ARTIFACT_MAX_FILE_BYTES {
+        return Ok(false);
+    }
+
+    let bytes =
+        fs::read(path).map_err(|error| format!("failed to read PID file candidate: {error}"))?;
+    if bytes.len() as u64 > PID_ARTIFACT_MAX_FILE_BYTES {
+        return Ok(false);
+    }
+    let Ok(content) = String::from_utf8(bytes) else {
+        return Ok(false);
+    };
+    Ok(content.trim() == pid_text)
+}
+
+fn path_looks_like_pid_file(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|file_name| file_name.to_str()) else {
+        return false;
+    };
+    if file_name.eq_ignore_ascii_case("pid") {
+        return true;
+    }
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("pid"))
+}
+
+fn path_dedup_key(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        path.to_string_lossy().replace('\\', "/").to_ascii_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_string_lossy().into_owned()
+    }
 }
 
 async fn append_run_cleanup_tape_event(
@@ -1721,7 +1918,18 @@ fn run_cleanup_tape_payload(
                     "process_tree_alive_after_cleanup": outcome.status_after.as_ref().map(|status| status.process_tree_alive),
                     "tracked_process_count_after_cleanup": outcome.status_after.as_ref().and_then(|status| status.tracked_process_count),
                     "error": outcome.error,
-                    "process_artifact_note": "Palyra stops run-owned process trees but does not remove files created by those processes, such as PID files, logs, or other workspace/OS artifacts.",
+                    "pid_artifacts": {
+                        "safe_roots_source": "run_launch_context_path_env",
+                        "matching_rule": "regular .pid files up to 1024 bytes whose trimmed content equals the terminated pid",
+                        "outcomes": outcome.pid_artifact_outcomes.iter().map(|artifact| {
+                            json!({
+                                "path": artifact.path,
+                                "removed": artifact.removed,
+                                "error": artifact.error,
+                            })
+                        }).collect::<Vec<_>>(),
+                    },
+                    "process_artifact_note": "Palyra stops run-owned process trees and removes matching small PID files under safe run launch path roots; logs and other process-created files remain unless an explicit tool removes them.",
                 })
             }).collect::<Vec<_>>(),
         },
