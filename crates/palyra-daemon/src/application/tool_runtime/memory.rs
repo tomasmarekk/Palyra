@@ -62,6 +62,7 @@ const COMBINED_MEMORY_HITS_ABSENT_CLAIM_BOUNDARY: &str =
     "no durable lifecycle or workspace memory hits were returned";
 const DEFAULT_MEMORY_RETAIN_SCOPE: &str = "principal";
 const DEFAULT_MEMORY_SEARCH_SCOPE: &str = "all";
+const DEFAULT_WORKSPACE_MEMORY_SEARCH_PREFIX: &str = "MEMORY.md";
 const DEFAULT_PROJECT_MEMORY_SEARCH_PREFIX: &str = "projects/default";
 const SESSION_SEARCH_HITS_PRESENT_CLAIM_BOUNDARY: &str = "session transcript or session-level hits are retrieved evidence from prior conversations; cite them as session recall, not durable memory";
 const SESSION_SEARCH_HITS_ABSENT_CLAIM_BOUNDARY: &str =
@@ -1191,11 +1192,7 @@ async fn execute_workspace_memory_retain_tool(
             "palyra.memory.retain memory content is empty after normalization".to_owned(),
         );
     }
-    let inferred_project_path = if scope == WorkspaceMemoryRetainScope::Project {
-        infer_project_memory_document_path(runtime_state, context).await
-    } else {
-        None
-    };
+    let inferred_project_path = infer_project_memory_document_path(runtime_state, context).await;
     let path = match workspace_memory_retain_path(parsed, scope, inferred_project_path.as_deref()) {
         Ok(path) => path,
         Err(error) => {
@@ -2110,7 +2107,7 @@ pub(crate) async fn execute_memory_search_tool(
         }
         let explicit_workspace_prefix = optional_trimmed_string(parsed.get("workspace_prefix"))
             .or_else(|| optional_trimmed_string(parsed.get("prefix")));
-        let inferred_project_scope = if scope == "project" && explicit_workspace_prefix.is_none() {
+        let inferred_project_scope = if explicit_workspace_prefix.is_none() {
             infer_project_memory_search_scope(runtime_state, context).await
         } else {
             InferredProjectMemorySearchScope::default()
@@ -2719,7 +2716,7 @@ pub(crate) async fn execute_memory_recall_tool(
     let raw_workspace_prefix = optional_trimmed_string(parsed.get("workspace_prefix"))
         .or_else(|| optional_trimmed_string(parsed.get("prefix")));
     let workspace_scope = memory_recall_workspace_scope_text(&parsed);
-    let inferred_project_scope = if workspace_scope == "project" && raw_workspace_prefix.is_none() {
+    let inferred_project_scope = if raw_workspace_prefix.is_none() {
         infer_project_memory_search_scope(runtime_state, context).await
     } else {
         InferredProjectMemorySearchScope::default()
@@ -3400,14 +3397,19 @@ fn workspace_memory_search_prefix(
     inferred_project_prefix: Option<&str>,
 ) -> Result<Option<String>, String> {
     let Some(raw_prefix) = explicit_prefix else {
-        if scope == "project" {
-            return Ok(Some(
+        return match scope {
+            "project" => Ok(Some(
                 inferred_project_prefix
                     .map(str::to_owned)
                     .unwrap_or_else(|| DEFAULT_PROJECT_MEMORY_SEARCH_PREFIX.to_owned()),
-            ));
-        }
-        return Ok(None);
+            )),
+            "workspace" => Ok(Some(
+                inferred_project_prefix
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| DEFAULT_WORKSPACE_MEMORY_SEARCH_PREFIX.to_owned()),
+            )),
+            _ => Ok(None),
+        };
     };
 
     let normalized = match normalize_workspace_prefix(raw_prefix) {
@@ -4509,6 +4511,15 @@ mod tests {
             .expect("inferred project path should be valid"),
             "projects/project-client-portal-deadbeef00/MEMORY.md"
         );
+        assert_eq!(
+            workspace_memory_retain_path(
+                &parsed,
+                WorkspaceMemoryRetainScope::Workspace,
+                Some("projects/project-client-portal-deadbeef00/MEMORY.md"),
+            )
+            .expect("workspace scope should bind to inferred project path"),
+            "projects/project-client-portal-deadbeef00/MEMORY.md"
+        );
     }
 
     #[test]
@@ -4533,6 +4544,20 @@ mod tests {
 
     #[test]
     fn workspace_memory_search_prefix_maps_project_inputs() {
+        assert_eq!(
+            workspace_memory_search_prefix(None, "workspace", None)
+                .expect("omitted workspace prefix should stay bounded to root workspace memory"),
+            Some("MEMORY.md".to_owned())
+        );
+        assert_eq!(
+            workspace_memory_search_prefix(
+                None,
+                "workspace",
+                Some("projects/project-client-portal-deadbeef00"),
+            )
+            .expect("workspace search should bind to active project prefix when available"),
+            Some("projects/project-client-portal-deadbeef00".to_owned())
+        );
         assert_eq!(
             workspace_memory_search_prefix(None, "project", None)
                 .expect("omitted project prefix should use legacy default project memory"),

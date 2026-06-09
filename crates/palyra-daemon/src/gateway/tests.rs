@@ -5801,6 +5801,113 @@ async fn memory_search_tool_workspace_scope_returns_project_prefix_hits() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn memory_search_tool_workspace_scope_uses_active_project_prefix_by_default() {
+    let state = build_test_runtime_state(false);
+    let context = routines_tool_test_context();
+    ensure_tool_context_session(&state, &context);
+    let marker = "PALYRA_ACTIVE_PROJECT_WORKSPACE_SCOPE_MARKER";
+
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let project_root = tempdir.path().join("project-a");
+    fs::create_dir_all(project_root.as_path()).expect("project root should be created");
+    let project_root_text = project_root.to_string_lossy().into_owned();
+    state
+        .start_orchestrator_run(OrchestratorRunStartRequest {
+            run_id: context.run_id.to_owned(),
+            session_id: context.session_id.to_owned(),
+            origin_kind: "memory_workspace_scope_project_boundary_test".to_owned(),
+            origin_run_id: None,
+            triggered_by_principal: Some(context.principal.to_owned()),
+            parameter_delta_json: Some(
+                json!({
+                    "cli_context": {
+                        "launch_cwd": project_root_text,
+                        "workspace_roots": [project_root_text],
+                    }
+                })
+                .to_string(),
+            ),
+        })
+        .await
+        .expect("orchestrator run should start with launch workspace metadata");
+
+    let retain = execute_memory_retain_tool(
+        &state,
+        context,
+        "01ARZ3NDEKTSV4RRFFQ69G5F16",
+        format!(
+            r#"{{"content_text":"Project A workspace target is {marker}.","scope":"workspace","source":"manual","confidence":0.95}}"#
+        )
+        .as_bytes(),
+    )
+    .await;
+    assert!(retain.success, "workspace retain should succeed: {}", retain.error);
+    let retained_path = parse_tool_output_json(&retain)
+        .pointer("/document/path")
+        .and_then(Value::as_str)
+        .expect("workspace retain output should include document path")
+        .to_owned();
+    assert!(
+        retained_path.starts_with("projects/project-project-a-"),
+        "workspace retain should bind to active launch project identity: {retained_path}"
+    );
+
+    state
+        .upsert_workspace_document(WorkspaceDocumentWriteRequest {
+            document_id: None,
+            principal: context.principal.to_owned(),
+            channel: context.channel.map(str::to_owned),
+            agent_id: None,
+            session_id: Some(context.session_id.to_owned()),
+            path: "projects/project-b/MEMORY.md".to_owned(),
+            title: Some("Project B Memory".to_owned()),
+            content_text: format!(
+                "Project B workspace target must not leak into Project A: {marker}"
+            ),
+            template_id: None,
+            template_version: None,
+            template_content_hash: None,
+            source_memory_id: None,
+            manual_override: false,
+        })
+        .await
+        .expect("workspace noise document should be indexed");
+
+    let search = execute_memory_search_tool(
+        &state,
+        context,
+        "01ARZ3NDEKTSV4RRFFQ69G5F17",
+        format!(r#"{{"query":"{marker}","scope":"workspace","top_k":4,"min_score":0.0}}"#)
+            .as_bytes(),
+    )
+    .await;
+
+    assert!(search.success, "workspace search should succeed: {}", search.error);
+    let payload = parse_tool_output_json(&search);
+    assert_eq!(payload.get("scope").and_then(Value::as_str), Some("workspace"));
+    assert_eq!(
+        payload.get("workspace_prefix").and_then(Value::as_str),
+        retained_path.strip_suffix("/MEMORY.md"),
+        "workspace search should report the inferred active project prefix: {payload}"
+    );
+    let hits =
+        payload.get("hits").and_then(Value::as_array).expect("search output should include hits");
+    assert!(
+        hits.iter().any(|hit| {
+            hit.pointer("/document/path").and_then(Value::as_str) == Some(retained_path.as_str())
+        }),
+        "workspace search should surface active project memory: {payload}"
+    );
+    assert!(
+        hits.iter().all(|hit| {
+            hit.pointer("/document/path").and_then(Value::as_str)
+                != Some("projects/project-b/MEMORY.md")
+        }),
+        "workspace search must not surface a different project memory: {payload}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn memory_delete_tool_deletes_workspace_document_id_from_search() {
     let state = build_test_runtime_state(false);
     let context = routines_tool_test_context();

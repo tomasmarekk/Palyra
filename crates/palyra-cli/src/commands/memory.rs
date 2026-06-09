@@ -10,6 +10,67 @@ const MEMORY_SEARCH_HITS_PRESENT_CLAIM_BOUNDARY: &str =
 const MEMORY_SEARCH_HITS_ABSENT_CLAIM_BOUNDARY: &str =
     "no durable memory hits were returned by this memory search; this does not search prior session transcripts; use memory search-all or memory session-search for transcript recall";
 
+fn cli_inferred_workspace_memory_prefix() -> Option<String> {
+    let current_dir = std::env::current_dir().ok()?;
+    cli_project_memory_prefix_from_workspace_root(current_dir.as_path())
+}
+
+fn cli_project_memory_prefix_from_workspace_root(root: &std::path::Path) -> Option<String> {
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let name = cli_last_normal_path_segment(canonical.as_path())?;
+    let slug = cli_project_memory_slug(name.as_str());
+    let fingerprint = cli_project_memory_root_fingerprint(canonical.as_path());
+    let digest = sha256_hex(fingerprint.as_bytes());
+    let hash = digest.get(..10)?;
+    Some(format!("projects/project-{slug}-{hash}"))
+}
+
+fn cli_last_normal_path_segment(path: &std::path::Path) -> Option<String> {
+    path.components().rev().find_map(|component| match component {
+        std::path::Component::Normal(value) => {
+            value.to_str().map(str::trim).filter(|value| !value.is_empty()).map(str::to_owned)
+        }
+        _ => None,
+    })
+}
+
+fn cli_project_memory_slug(name: &str) -> String {
+    const MAX_SLUG_CHARS: usize = 80;
+
+    let mut slug = String::new();
+    let mut previous_separator = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            previous_separator = false;
+        } else if !previous_separator && !slug.is_empty() {
+            slug.push('-');
+            previous_separator = true;
+        }
+        if slug.chars().count() >= MAX_SLUG_CHARS {
+            break;
+        }
+    }
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "workspace".to_owned()
+    } else {
+        slug.to_owned()
+    }
+}
+
+fn cli_project_memory_root_fingerprint(root: &std::path::Path) -> String {
+    let normalized = root.to_string_lossy().replace('\\', "/").trim_end_matches('/').to_owned();
+    #[cfg(windows)]
+    {
+        normalized.to_ascii_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        normalized
+    }
+}
+
 pub(crate) fn run_memory(command: MemoryCommand) -> Result<()> {
     let root_context = app::current_root_context()
         .ok_or_else(|| anyhow!("CLI root context is unavailable for memory command"))?;
@@ -757,6 +818,7 @@ async fn run_memory_admin_async(command: MemoryCommand) -> Result<()> {
                     1.0,
                     Some(0.0),
                 )?;
+                let prefix = prefix.or_else(cli_inferred_workspace_memory_prefix);
                 let path = build_console_query_path(
                     "console/v1/memory/workspace/search",
                     vec![
@@ -794,6 +856,7 @@ async fn run_memory_admin_async(command: MemoryCommand) -> Result<()> {
         } => {
             let min_score =
                 parse_float_arg(min_score, "memory recall --min-score", 0.0, 1.0, Some(0.0))?;
+            let workspace_prefix = workspace_prefix.or_else(cli_inferred_workspace_memory_prefix);
             let request = json!({
                 "query": query,
                 "session_id": session,
@@ -843,6 +906,7 @@ async fn run_memory_admin_async(command: MemoryCommand) -> Result<()> {
             let query = resolve_optional_query_arg(query, query_option, "memory search-all")?;
             let min_score =
                 parse_float_arg(min_score, "memory search-all --min-score", 0.0, 1.0, Some(0.0))?;
+            let workspace_prefix = workspace_prefix.or_else(cli_inferred_workspace_memory_prefix);
             let path = build_console_query_path(
                 "console/v1/memory/search-all",
                 vec![
@@ -1656,6 +1720,17 @@ mod tests {
         )
         .expect_err("ambiguous query should fail");
         assert!(ambiguous.to_string().contains("either a positional query or --query"));
+    }
+
+    #[test]
+    fn cli_project_memory_prefix_uses_workspace_root_identity() {
+        let prefix = super::cli_project_memory_prefix_from_workspace_root(std::path::Path::new(
+            "/tmp/Client Portal",
+        ))
+        .expect("workspace root should produce a project prefix");
+
+        assert!(prefix.starts_with("projects/project-client-portal-"), "{prefix}");
+        assert_eq!(prefix.len(), "projects/project-client-portal-".len() + 10);
     }
 
     #[test]

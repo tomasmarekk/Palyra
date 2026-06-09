@@ -55,11 +55,11 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                     ("min_score", json!({"type":"number","minimum":0.0,"maximum":1.0})),
                     (
                         "workspace_prefix",
-                        json!({"type":"string","description":"Optional workspace/project document path prefix used with scope=workspace or scope=project. When omitted, scope=project searches indexed project memory under projects/."}),
+                        json!({"type":"string","description":"Optional workspace/project document path prefix used with scope=workspace or scope=project. When omitted, scope=workspace and scope=project bind to the active launch workspace project memory; without an active root, workspace searches MEMORY.md and project searches projects/default."}),
                     ),
                     (
                         "prefix",
-                        json!({"type":"string","description":"Alias for workspace_prefix used with scope=workspace or scope=project. When omitted, scope=project searches indexed project memory under projects/."}),
+                        json!({"type":"string","description":"Alias for workspace_prefix used with scope=workspace or scope=project. When omitted, scope=workspace and scope=project bind to the active launch workspace project memory; without an active root, workspace searches MEMORY.md and project searches projects/default."}),
                     ),
                     ("include_workspace_historical", json!({"type":"boolean"})),
                     ("include_workspace_quarantined", json!({"type":"boolean"})),
@@ -170,7 +170,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                     ("scope", json!({"type":"string","enum":["principal","session","channel","workspace","project"],"description":"Defaults to principal. Use session only for current-session scratch memory, channel for authenticated channel memory, and workspace or project to write indexed workspace/project memory documents."})),
                     (
                         "workspace_path",
-                        json!({"type":"string","description":"Exact workspace document path for scope=workspace or scope=project. Defaults to MEMORY.md for workspace and to the active launch workspace's project memory for project scope, with projects/default/MEMORY.md as a fallback. Bare project/workspace names and absolute workspace roots map to projects/<name>/MEMORY.md."}),
+                        json!({"type":"string","description":"Exact workspace document path for scope=workspace or scope=project. Defaults to the active launch workspace's project memory for workspace/project scope; without an active root, workspace falls back to MEMORY.md and project falls back to projects/default/MEMORY.md. Bare project/workspace names and absolute workspace roots map to projects/<name>/MEMORY.md."}),
                     ),
                     (
                         "workspace_prefix",
@@ -216,7 +216,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                     ("scope", json!({"type":"string","enum":["principal","session","channel","workspace","project"],"description":"Defaults to principal. Use session only for current-session scratch memory, channel for authenticated channel memory, and workspace or project to write indexed workspace/project memory documents."})),
                     (
                         "workspace_path",
-                        json!({"type":"string","description":"Exact workspace document path for scope=workspace or scope=project. Defaults to MEMORY.md for workspace and to the active launch workspace's project memory for project scope, with projects/default/MEMORY.md as a fallback. Bare project/workspace names and absolute workspace roots map to projects/<name>/MEMORY.md."}),
+                        json!({"type":"string","description":"Exact workspace document path for scope=workspace or scope=project. Defaults to the active launch workspace's project memory for workspace/project scope; without an active root, workspace falls back to MEMORY.md and project falls back to projects/default/MEMORY.md. Bare project/workspace names and absolute workspace roots map to projects/<name>/MEMORY.md."}),
                     ),
                     (
                         "workspace_prefix",
