@@ -3105,7 +3105,7 @@ mod tests {
         assert_eq!(
             super::matching_active_routine_id_for_create(
                 &[disabled_job],
-                &[schedule_metadata.clone()],
+                std::slice::from_ref(&schedule_metadata),
                 "heartbeat",
                 RoutineTriggerKind::Schedule,
             ),
