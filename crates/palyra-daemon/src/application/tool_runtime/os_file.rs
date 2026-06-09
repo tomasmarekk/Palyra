@@ -34,9 +34,6 @@ const MAX_OS_FILE_SEARCH_FILES: usize = 10_000;
 const MAX_OS_FILE_SEARCH_DEPTH: usize = 8;
 const MAX_OS_FILE_SEARCH_FILE_BYTES: u64 = 128 * 1024;
 const MAX_OS_FILE_SEARCH_EXCERPT_CHARS: usize = 240;
-const OS_FILE_LARGE_SHRINK_MIN_EXISTING_BYTES: u64 = 1024;
-const OS_FILE_LARGE_SHRINK_MAX_NEW_PERCENT: u64 = 50;
-const OS_FILE_LARGE_SHRINK_MIN_DELTA_BYTES: u64 = 512;
 const PALYRA_OS_FILE_ROOTS_ENV: &str = "PALYRA_OS_FILE_ROOTS";
 
 #[derive(Debug, Deserialize)]
@@ -299,7 +296,7 @@ fn write_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, Strin
     } else {
         None
     };
-    guard_large_full_file_shrink(input, existing_size_bytes, bytes.len())?;
+    guard_existing_file_write_intent(input, existing_size_bytes, bytes.len())?;
     if !parent_existed_before && !create_parent_dirs {
         return Err(format!(
             "{OS_FILE_TOOL_NAME} parent directory does not exist for {}",
@@ -348,7 +345,7 @@ fn write_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, Strin
     }))
 }
 
-fn guard_large_full_file_shrink(
+fn guard_existing_file_write_intent(
     input: &OsFileInput,
     existing_size_bytes: Option<u64>,
     new_size_bytes: usize,
@@ -359,29 +356,12 @@ fn guard_large_full_file_shrink(
     if input.full_replace.unwrap_or(false) {
         return Ok(());
     }
-    if !looks_like_large_full_file_shrink(existing_size_bytes, new_size_bytes) {
-        return Ok(());
-    }
     Err(format!(
-        "{OS_FILE_TOOL_NAME} refusing large full-file shrink for existing file {}: existing_size_bytes={} new_size_bytes={}. operation=write with overwrite=true replaces the entire file. Use palyra.fs.apply_patch for scoped workspace edits, or retry with full_replace=true only when replacing the whole file is intentional.",
+        "{OS_FILE_TOOL_NAME} refusing write to existing file {} without full_replace=true: existing_size_bytes={} new_size_bytes={}. operation=write replaces the entire file; append/partial-edit semantics are unsupported. Use palyra.fs.apply_patch for scoped workspace edits, or read the original content and retry with full_replace=true only when replacing the whole file is intentional.",
         input.path.trim(),
         existing_size_bytes,
         new_size_bytes
     ))
-}
-
-fn looks_like_large_full_file_shrink(existing_size_bytes: u64, new_size_bytes: usize) -> bool {
-    if existing_size_bytes < OS_FILE_LARGE_SHRINK_MIN_EXISTING_BYTES {
-        return false;
-    }
-    let Ok(new_size_bytes) = u64::try_from(new_size_bytes) else {
-        return true;
-    };
-    if existing_size_bytes.saturating_sub(new_size_bytes) < OS_FILE_LARGE_SHRINK_MIN_DELTA_BYTES {
-        return false;
-    }
-    new_size_bytes.saturating_mul(100)
-        <= existing_size_bytes.saturating_mul(OS_FILE_LARGE_SHRINK_MAX_NEW_PERCENT)
 }
 
 fn copy_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String> {
@@ -1447,12 +1427,12 @@ mod tests {
     }
 
     #[test]
-    fn os_file_write_rejects_large_shrink_without_full_replace_intent() {
+    fn os_file_write_rejects_existing_file_without_full_replace_intent() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let policy = test_policy(tempdir.path());
-        let target = tempdir.path().join("public").join("index.html");
+        let target = tempdir.path().join("notes").join("customer-note.md");
         fs::create_dir_all(target.parent().expect("target parent")).expect("parent dir");
-        let original = format!("<!doctype html>\n<body>\n{}\n</body>\n", "x".repeat(4096));
+        let original = "Customer: Ada Lovelace\nStatus: pending review\nNotes:\n- Keep original terms.\n- Confirm support window before renewal.\n";
         fs::write(target.as_path(), original.as_bytes()).expect("fixture should be written");
 
         let error = execute_os_file_operation(
@@ -1461,7 +1441,7 @@ mod tests {
                 operation: OsFileOperation::Write,
                 path: target.to_string_lossy().into_owned(),
                 target_path: None,
-                content_text: Some("<span>fragment</span>\n".to_owned()),
+                content_text: Some("Reviewed by Palyra E2E\n".to_owned()),
                 bytes_base64: None,
                 create_parent_dirs: Some(true),
                 overwrite: Some(true),
@@ -1475,9 +1455,10 @@ mod tests {
                 max_matches: None,
             },
         )
-        .expect_err("large shrink full-file write should require explicit full_replace intent");
+        .expect_err("existing-file write should require explicit full_replace intent");
 
-        assert!(error.contains("large full-file shrink"), "unexpected error: {error}");
+        assert!(error.contains("refusing write to existing file"), "unexpected error: {error}");
+        assert!(error.contains("append/partial-edit semantics are unsupported"), "{error}");
         assert!(
             error.contains("palyra.fs.apply_patch"),
             "error should guide scoped edits: {error}"
@@ -1498,7 +1479,7 @@ mod tests {
                 operation: OsFileOperation::Write,
                 path: target.to_string_lossy().into_owned(),
                 target_path: None,
-                content_text: Some("<span>fragment</span>\n".to_owned()),
+                content_text: Some(format!("{original}Reviewed by Palyra E2E\n")),
                 bytes_base64: None,
                 create_parent_dirs: Some(true),
                 overwrite: Some(true),
@@ -1517,7 +1498,7 @@ mod tests {
         assert_eq!(replaced.get("full_replace").and_then(Value::as_bool), Some(true));
         assert_eq!(
             fs::read_to_string(target.as_path()).expect("replacement should be readable"),
-            "<span>fragment</span>\n"
+            format!("{original}Reviewed by Palyra E2E\n")
         );
     }
 

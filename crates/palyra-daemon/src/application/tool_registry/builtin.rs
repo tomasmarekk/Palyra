@@ -525,7 +525,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                     ),
                     (
                         "full_replace",
-                        json!({"type":"boolean","description":"Set true only when operation=write intentionally replaces the whole existing file. Without this flag, large shrink writes to an existing file are rejected with patch guidance."}),
+                        json!({"type":"boolean","description":"Set true only when operation=write intentionally replaces the whole existing file. Without this flag, writes to an existing file are rejected because append/partial-edit semantics are unsupported; read the original content first and provide the full replacement body when intentional."}),
                     ),
                     ("dry_run", json!({"type":"boolean"})),
                     ("offset_bytes", json!({"type":"integer","minimum":0})),
@@ -1449,7 +1449,7 @@ mod tests {
             .and_then(serde_json::Value::as_str)
             .expect("os_file full_replace description should be visible to models");
         assert!(full_replace_description.contains("replaces the whole existing file"));
-        assert!(full_replace_description.contains("large shrink writes"));
+        assert!(full_replace_description.contains("append/partial-edit semantics are unsupported"));
         assert!(entry.input_schema.pointer("/properties/max_entries").is_some());
         assert!(entry.input_schema.pointer("/properties/max_matches").is_some());
     }
