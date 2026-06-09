@@ -1475,7 +1475,7 @@ fn should_project_tool_result_for_model(
     outcome: &ToolExecutionOutcome,
     budget: &ToolTurnBudget,
 ) -> bool {
-    if os_file_list_dir_result_can_stay_inline(tool_name, outcome.output_json.as_slice(), budget) {
+    if os_file_result_can_stay_inline(tool_name, outcome.output_json.as_slice(), budget) {
         return false;
     }
     match projection_policy_for_tool(tool_name) {
@@ -1487,7 +1487,7 @@ fn should_project_tool_result_for_model(
     }
 }
 
-fn os_file_list_dir_result_can_stay_inline(
+fn os_file_result_can_stay_inline(
     tool_name: &str,
     output_json: &[u8],
     budget: &ToolTurnBudget,
@@ -1497,10 +1497,19 @@ fn os_file_list_dir_result_can_stay_inline(
     {
         return false;
     }
-    serde_json::from_slice::<Value>(output_json)
-        .ok()
-        .and_then(|value| value.get("operation").and_then(Value::as_str).map(str::to_owned))
-        .is_some_and(|operation| operation == "list_dir")
+    let Ok(value) = serde_json::from_slice::<Value>(output_json) else {
+        return false;
+    };
+    match value.get("operation").and_then(Value::as_str) {
+        Some("list_dir") => true,
+        Some("read") => os_file_read_result_has_model_visible_text(&value),
+        _ => false,
+    }
+}
+
+fn os_file_read_result_has_model_visible_text(value: &Value) -> bool {
+    value.get("text").is_some_and(Value::is_string)
+        && value.get("bytes_base64").is_none_or(Value::is_null)
 }
 
 fn tool_result_sensitivity(tool_name: &str, default_sensitive: bool) -> ToolResultSensitivity {
@@ -1921,6 +1930,44 @@ mod tests {
                 &ToolTurnBudget::default()
             ),
             "small OS list_dir metadata must remain fully model-visible for cleanup workflows"
+        );
+    }
+
+    #[test]
+    fn os_file_redacted_read_text_results_stay_inline_when_under_model_budget() {
+        let output_json = serde_json::to_vec(&json!({
+            "operation": "read",
+            "path": "/home/example/.config/palyra-e2e/settings.toml",
+            "resolved_path": "/home/example/.config/palyra-e2e/settings.toml",
+            "text": "[auth]\nrefresh_token = \"[REDACTED_SECRET]\"\nmode = \"local\"\n",
+            "text_authoritative": false,
+            "redaction_notice": "text contains redacted secret placeholders; use it for structure only and do not write the redacted text back verbatim",
+            "bytes_base64": null,
+            "redacted": true,
+            "size_bytes": 96,
+        }))
+        .expect("test payload should serialize");
+        let outcome = ToolExecutionOutcome {
+            success: true,
+            output_json,
+            error: String::new(),
+            attestation: ToolAttestation {
+                attestation_id: "01ARZ3NDEKTSV4RRFFQ69G5FAC".to_owned(),
+                execution_sha256: "0".repeat(64),
+                executed_at_unix_ms: 0,
+                timed_out: false,
+                executor: "test".to_owned(),
+                sandbox_enforcement: "n/a".to_owned(),
+            },
+        };
+
+        assert!(
+            !super::should_project_tool_result_for_model(
+                crate::gateway::OS_FILE_TOOL_NAME,
+                &outcome,
+                &ToolTurnBudget::default()
+            ),
+            "small redacted OS read text must stay model-visible for config audits"
         );
     }
 }

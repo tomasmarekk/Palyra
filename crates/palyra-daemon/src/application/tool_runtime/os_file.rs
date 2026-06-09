@@ -248,6 +248,10 @@ fn read_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String
     let eof = offset_bytes.saturating_add(returned_bytes) >= size_bytes;
     let chunk_sha256 = hex::encode(Sha256::digest(buffer.as_slice()));
     let (text, bytes_base64, redacted) = visible_file_content(buffer);
+    let text_authoritative = text.as_ref().map(|_| !redacted);
+    let redaction_notice = redacted.then(|| {
+        "text contains redacted secret placeholders; use it for structure only and do not write the redacted text back verbatim".to_owned()
+    });
     Ok(json!({
         "operation": "read",
         "path": display_path(path.requested_path.as_path()),
@@ -258,6 +262,8 @@ fn read_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String
         "eof": eof,
         "chunk_sha256": chunk_sha256,
         "text": text,
+        "text_authoritative": text_authoritative,
+        "redaction_notice": redaction_notice,
         "bytes_base64": bytes_base64,
         "redacted": redacted,
         "dry_run": false,
@@ -1714,6 +1720,11 @@ mod tests {
 
         let text = read.get("text").and_then(Value::as_str).expect("read text should be present");
         assert_eq!(read.get("redacted").and_then(Value::as_bool), Some(true));
+        assert_eq!(read.get("text_authoritative").and_then(Value::as_bool), Some(false));
+        assert!(read
+            .get("redaction_notice")
+            .and_then(Value::as_str)
+            .is_some_and(|notice| notice.contains("structure only")));
         assert!(text.contains("provider_key = \"[REDACTED_SECRET]\""));
         assert!(!text.contains("palyra_os_secret_abcdef"));
     }
@@ -1750,6 +1761,7 @@ mod tests {
         .expect("absolute user path read should succeed");
 
         assert_eq!(read.get("redacted").and_then(Value::as_bool), Some(false));
+        assert_eq!(read.get("text_authoritative").and_then(Value::as_bool), Some(true));
         assert_eq!(read.get("text").and_then(Value::as_str), Some(contents));
     }
 
