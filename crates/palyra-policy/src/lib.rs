@@ -1,3 +1,10 @@
+//! Deny-by-default policy evaluation core built on Cedar.
+//!
+//! Every authorization request is denied unless an explicit Cedar permit in the embedded
+//! baseline policy matches, and sensitive actions additionally require an explicit approval
+//! flag. Consumed by the daemon (gateway, tool security, service authorization), the CLI, and
+//! the skills runtime; all callers must treat any engine error as a deny (fail closed).
+
 use std::{str::FromStr, sync::OnceLock};
 
 use cedar_policy::{
@@ -7,33 +14,62 @@ use cedar_policy::{
 use serde_json::json;
 use thiserror::Error;
 
+/// An authorization request: which principal wants to perform which action on which resource.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyRequest {
+    /// Requesting identity, e.g. `user:ops`.
     pub principal: String,
+    /// Dotted action name, e.g. `tool.execute`; matched case-insensitively.
     pub action: String,
+    /// Target resource identifier, e.g. `tool:filesystem`.
     pub resource: String,
 }
 
+/// Optional caller-supplied context attached to a [`PolicyRequest`].
+///
+/// All identifiers are trimmed before evaluation; empty values are treated as absent.
+/// `tool_name` and `skill_id`, when present, take precedence over names derived from the
+/// request resource.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PolicyRequestContext {
+    /// Device the request originated from.
     pub device_id: Option<String>,
+    /// Originating channel; matched against the `tool.execute` channel allowlist.
     pub channel: Option<String>,
+    /// Session correlation identifier.
     pub session_id: Option<String>,
+    /// Run correlation identifier.
     pub run_id: Option<String>,
+    /// Explicit tool name; overrides the tool name parsed from the resource.
     pub tool_name: Option<String>,
+    /// Explicit skill identifier; overrides the skill name parsed from the resource.
     pub skill_id: Option<String>,
+    /// Capabilities requested for this call; matched against sensitive capability names.
     pub capabilities: Vec<String>,
 }
 
+/// Allowlists and approval flags applied during policy evaluation.
+///
+/// The default configuration allowlists nothing and marks `cron.delete` and `memory.purge`
+/// as sensitive, so `tool.execute` and `skill.execute` are denied until explicitly granted.
+/// All name matching is ASCII case-insensitive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyEvaluationConfig {
+    /// Tools permitted for `tool.execute`.
     pub allowlisted_tools: Vec<String>,
+    /// Skills permitted for `skill.execute`.
     pub allowlisted_skills: Vec<String>,
+    /// Explicit approval flag that unlocks sensitive actions, tools, and capabilities.
     pub allow_sensitive_tools: bool,
+    /// Tool names whose execution counts as a sensitive action.
     pub sensitive_tool_names: Vec<String>,
+    /// Action names that always count as sensitive.
     pub sensitive_actions: Vec<String>,
+    /// Requested capabilities that mark the request as sensitive.
     pub sensitive_capability_names: Vec<String>,
+    /// Principals permitted to run `tool.execute`; empty disables this gate.
     pub tool_execute_principal_allowlist: Vec<String>,
+    /// Channels permitted to run `tool.execute`; empty disables this gate.
     pub tool_execute_channel_allowlist: Vec<String>,
 }
 
@@ -57,45 +93,73 @@ impl Default for PolicyEvaluationConfig {
     }
 }
 
+/// Final outcome of a policy evaluation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyDecision {
+    /// An explicit Cedar permit matched and no forbid overrode it.
     Allow,
+    /// No permit matched, or a forbid fired; `reason` is a redaction-safe summary.
     DenyByDefault { reason: String },
 }
 
+/// Detailed account of how a [`PolicyDecision`] was reached.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyExplanation {
+    /// Always `true` for decisions produced by this engine; distinguishes Cedar-backed
+    /// evaluations from decisions synthesized elsewhere.
     pub evaluated_with_cedar: bool,
+    /// Human-readable summary mirroring the deny reason or describing the matched permit.
     pub reason: String,
+    /// Identifiers of the Cedar policies that determined the decision, sorted.
     pub matched_policy_ids: Vec<String>,
+    /// Cedar evaluation diagnostics; any entry forces a deny.
     pub diagnostics_errors: Vec<String>,
+    /// Whether the request matched a sensitive action, tool, or capability.
     pub is_sensitive_action: bool,
+    /// Whether the requested tool was on the tool allowlist.
     pub is_allowlisted_tool: bool,
+    /// Whether the requested skill was on the skill allowlist.
     pub is_allowlisted_skill: bool,
+    /// Whether the principal passed the `tool.execute` principal gate.
     pub is_tool_execute_principal_allowed: bool,
+    /// Whether the channel passed the `tool.execute` channel gate.
     pub is_tool_execute_channel_allowed: bool,
+    /// Normalized tool name resolved from context or resource, if any.
     pub requested_tool: Option<String>,
+    /// Normalized skill identifier resolved from context or resource, if any.
     pub requested_skill: Option<String>,
+    /// Normalized (trimmed, lowercased, deduplicated) capabilities from the request context.
     pub request_capabilities: Vec<String>,
+    /// UIDs of the Cedar entities constructed for the evaluation, sorted.
     pub constructed_entities: Vec<String>,
 }
 
+/// A [`PolicyDecision`] together with its [`PolicyExplanation`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyEvaluation {
+    /// The allow/deny outcome.
     pub decision: PolicyDecision,
+    /// How the outcome was reached.
     pub explanation: PolicyExplanation,
 }
 
+/// Failure to set up or run a Cedar evaluation; callers must treat it as a deny.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum PolicyEngineError {
+    /// The embedded policy set, schema, or an entity could not be constructed.
     #[error("failed to initialize Cedar policy engine: {message}")]
     EngineInitialization { message: String },
+    /// The request context could not be converted into a Cedar context.
     #[error("failed to build Cedar request context: {message}")]
     InvalidContext { message: String },
+    /// The principal/action/resource tuple was rejected by Cedar.
     #[error("failed to construct Cedar authorization request: {message}")]
     InvalidRequest { message: String },
 }
 
+// Baseline Cedar policy: Cedar denies unless a permit matches, so any action absent from this
+// list is denied by default, and the single forbid overrides every permit for sensitive
+// actions without explicit approval.
 const DEFAULT_POLICY_SRC: &str = r#"
 @id("deny_sensitive_without_approval")
 forbid(principal, action, resource)
@@ -199,6 +263,9 @@ when {
 };
 "#;
 
+// INTENTIONAL: these reason strings are mapped to stable reason codes in
+// `policy_reason_code` and may be pinned by golden fixtures in consuming crates —
+// keep them byte-identical when editing.
 const POLICY_DENY_REASON: &str = "tool execution denied by default: tool is not allowlisted";
 const SKILL_POLICY_DENY_REASON: &str =
     "skill execution denied by default: skill is not active/allowlisted";
@@ -210,6 +277,10 @@ const TOOL_EXECUTE_CHANNEL_DENY_REASON: &str =
     "tool execution denied by default: channel is not allowlisted for tool.execute";
 const BASELINE_DENY_REASON: &str = "deny-by-default baseline policy";
 
+/// Evaluates `request` against the default configuration, failing closed.
+///
+/// Any [`PolicyEngineError`] is converted into [`PolicyDecision::DenyByDefault`] so an engine
+/// failure can never be observed as an allow.
 #[must_use]
 pub fn evaluate(request: &PolicyRequest) -> PolicyDecision {
     match evaluate_with_config(request, &PolicyEvaluationConfig::default()) {
@@ -220,6 +291,11 @@ pub fn evaluate(request: &PolicyRequest) -> PolicyDecision {
     }
 }
 
+/// Evaluates `request` against `config` with an empty request context.
+///
+/// # Errors
+/// Returns [`PolicyEngineError`] when the Cedar policy set, schema, entities, context, or
+/// request cannot be constructed. Callers must treat any error as a deny.
 pub fn evaluate_with_config(
     request: &PolicyRequest,
     config: &PolicyEvaluationConfig,
@@ -227,6 +303,15 @@ pub fn evaluate_with_config(
     evaluate_with_context(request, &PolicyRequestContext::default(), config)
 }
 
+/// Evaluates `request` with full caller context against `config`.
+///
+/// The action is lowercased and the context identifiers are normalized before the allowlist
+/// and sensitivity gates are computed; the gate results are then passed into Cedar as context
+/// attributes for the baseline policy to act on.
+///
+/// # Errors
+/// Returns [`PolicyEngineError`] when the Cedar policy set, schema, entities, context, or
+/// request cannot be constructed. Callers must treat any error as a deny.
 pub fn evaluate_with_context(
     request: &PolicyRequest,
     request_context: &PolicyRequestContext,
@@ -234,6 +319,9 @@ pub fn evaluate_with_context(
 ) -> Result<PolicyEvaluation, PolicyEngineError> {
     let normalized_action = request.action.to_ascii_lowercase();
     let normalized_request_context = normalize_request_context(request_context);
+    // AIDEV-NOTE: a context-supplied tool_name/skill_id overrides the name parsed from the
+    // resource, and the allowlist and sensitivity gates trust it. Callers are trusted daemon
+    // code and must keep the context consistent with the resource they execute.
     let requested_tool = normalized_request_context
         .tool_name
         .clone()
@@ -273,24 +361,22 @@ pub fn evaluate_with_context(
         requested_tool.as_deref(),
         requested_skill.as_deref(),
         normalized_request_context.channel.as_deref(),
-    );
-    let entities = entities?;
+    )?;
     let mut constructed_entities =
         entities.iter().map(|entity| entity.uid().to_string()).collect::<Vec<_>>();
     constructed_entities.sort();
-    let request_capabilities = normalized_request_context.capabilities.clone();
     let context = Context::from_json_value(
         json!({
             "action": normalized_action,
             "resource": request.resource,
             "principal": request.principal,
-            "device_id": normalized_request_context.device_id.clone().unwrap_or_default(),
-            "channel": normalized_request_context.channel.clone().unwrap_or_default(),
-            "session_id": normalized_request_context.session_id.clone().unwrap_or_default(),
+            "device_id": normalized_request_context.device_id.as_deref().unwrap_or_default(),
+            "channel": normalized_request_context.channel.as_deref().unwrap_or_default(),
+            "session_id": normalized_request_context.session_id.as_deref().unwrap_or_default(),
             "run_id": normalized_request_context.run_id.as_deref().unwrap_or_default(),
-            "tool_name": requested_tool.clone().unwrap_or_default(),
-            "skill_id": requested_skill.clone().unwrap_or_default(),
-            "capabilities": &request_capabilities,
+            "tool_name": requested_tool.as_deref().unwrap_or_default(),
+            "skill_id": requested_skill.as_deref().unwrap_or_default(),
+            "capabilities": &normalized_request_context.capabilities,
             "is_sensitive_action": is_sensitive_action,
             "is_allowlisted_tool": is_allowlisted_tool,
             "is_allowlisted_skill": is_allowlisted_skill,
@@ -301,6 +387,7 @@ pub fn evaluate_with_context(
         None,
     )
     .map_err(|error| PolicyEngineError::InvalidContext { message: error.to_string() })?;
+    let request_capabilities = normalized_request_context.capabilities;
 
     let cedar_request = Request::new(principal_uid, action_uid, resource_uid, context, None)
         .map_err(|error| PolicyEngineError::InvalidRequest { message: error.to_string() })?;
@@ -351,6 +438,10 @@ pub fn evaluate_with_context(
     })
 }
 
+/// Builds a redaction-safe JSON diagnostics value for a completed evaluation.
+///
+/// Raw principal and resource identifiers are reduced to coarse classes and the internal
+/// policy source is never included, so the value is safe to log or surface to operators.
 #[must_use]
 pub fn policy_explain_diagnostics_value(
     request: &PolicyRequest,
@@ -382,6 +473,9 @@ pub fn policy_explain_diagnostics_value(
     })
 }
 
+// This and the cached statics below store a `Result` (instead of using `LazyLock`) so that a
+// broken embedded policy or schema surfaces as a deny-producing error on every call rather
+// than a panic.
 fn default_policy_set() -> Result<&'static PolicySet, PolicyEngineError> {
     static POLICY_SET: OnceLock<Result<PolicySet, PolicyEngineError>> = OnceLock::new();
     match POLICY_SET.get_or_init(|| {
@@ -459,7 +553,10 @@ fn build_request_entities(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "flags are individually computed booleans; grouping them adds no clarity"
+)]
 fn decision_reason(
     decision: Decision,
     normalized_action: &str,
@@ -471,6 +568,8 @@ fn decision_reason(
     allow_sensitive_tools: bool,
     diagnostics_errors: &[String],
 ) -> String {
+    // INTENTIONAL: allow reasons must keep the "allowed by Cedar" phrasing —
+    // `policy_reason_code` matches on it to emit the stable "policy.allow" code.
     if decision == Decision::Allow {
         if normalized_action == "tool.execute" {
             return "tool execution allowed by Cedar policy (allowlisted tool)".to_owned();
@@ -504,6 +603,9 @@ fn decision_reason(
         return format!("policy evaluation diagnostics triggered deny-by-default: {first_error}");
     }
 
+    // Deny reasons follow gate precedence (diagnostics, principal, channel, sensitivity,
+    // allowlists, baseline); only the first failing gate is reported even when several
+    // failed, and consumers rely on that ordering for stable reason codes.
     if normalized_action == "tool.execute" && !is_tool_execute_principal_allowed {
         return TOOL_EXECUTE_PRINCIPAL_DENY_REASON.to_owned();
     }
@@ -647,6 +749,8 @@ fn normalize_request_context(
         .collect::<Vec<_>>();
     capabilities.sort();
     capabilities.dedup();
+    // Tool and skill names are case-insensitive identifiers, so they are lowercased; the
+    // remaining identifiers keep their casing because they are opaque correlation values.
     NormalizedPolicyRequestContext {
         device_id: normalize_context_identifier(request_context.device_id.as_deref(), false),
         channel: normalize_context_identifier(request_context.channel.as_deref(), false),
@@ -732,6 +836,8 @@ fn is_tool_execute_principal_allowed(
     principal: &str,
     allowlisted_principals: &[String],
 ) -> bool {
+    // An empty allowlist disables this gate rather than denying every principal;
+    // tool.execute is still gated by the tool allowlist itself.
     if normalized_action != "tool.execute" || allowlisted_principals.is_empty() {
         return true;
     }
@@ -743,6 +849,8 @@ fn is_tool_execute_channel_allowed(
     channel: Option<&str>,
     allowlisted_channels: &[String],
 ) -> bool {
+    // An empty allowlist disables this gate; once configured, a request without a channel in
+    // its context fails the gate (fail closed).
     if normalized_action != "tool.execute" || allowlisted_channels.is_empty() {
         return true;
     }
@@ -883,7 +991,8 @@ mod tests {
             ..PolicyEvaluationConfig::default()
         };
 
-        let evaluation = evaluate_with_config(&request, &config).expect("evaluation");
+        let evaluation = evaluate_with_config(&request, &config)
+            .expect("well-formed request evaluates without engine error");
 
         assert_eq!(
             evaluation.decision,
@@ -907,7 +1016,8 @@ mod tests {
             ..PolicyEvaluationConfig::default()
         };
 
-        let evaluation = evaluate_with_config(&request, &config).expect("evaluation");
+        let evaluation = evaluate_with_config(&request, &config)
+            .expect("well-formed request evaluates without engine error");
 
         assert_eq!(
             evaluation.decision,
@@ -925,8 +1035,8 @@ mod tests {
             resource: "tool:daemon".to_owned(),
         };
 
-        let evaluation =
-            evaluate_with_config(&request, &PolicyEvaluationConfig::default()).expect("evaluation");
+        let evaluation = evaluate_with_config(&request, &PolicyEvaluationConfig::default())
+            .expect("well-formed request evaluates without engine error");
 
         assert_eq!(evaluation.decision, PolicyDecision::Allow);
         assert!(!evaluation.explanation.matched_policy_ids.is_empty());
@@ -940,8 +1050,8 @@ mod tests {
             resource: "cron:job".to_owned(),
         };
 
-        let evaluation =
-            evaluate_with_config(&request, &PolicyEvaluationConfig::default()).expect("evaluation");
+        let evaluation = evaluate_with_config(&request, &PolicyEvaluationConfig::default())
+            .expect("well-formed request evaluates without engine error");
 
         assert_eq!(evaluation.decision, PolicyDecision::Allow);
         assert!(!evaluation.explanation.matched_policy_ids.is_empty());
@@ -955,8 +1065,8 @@ mod tests {
             resource: "cron:job".to_owned(),
         };
 
-        let evaluation =
-            evaluate_with_config(&request, &PolicyEvaluationConfig::default()).expect("evaluation");
+        let evaluation = evaluate_with_config(&request, &PolicyEvaluationConfig::default())
+            .expect("well-formed request evaluates without engine error");
 
         assert_eq!(
             evaluation.decision,
@@ -976,8 +1086,8 @@ mod tests {
             resource: "memory:session".to_owned(),
         };
 
-        let evaluation =
-            evaluate_with_config(&request, &PolicyEvaluationConfig::default()).expect("evaluation");
+        let evaluation = evaluate_with_config(&request, &PolicyEvaluationConfig::default())
+            .expect("well-formed request evaluates without engine error");
 
         assert_eq!(evaluation.decision, PolicyDecision::Allow);
         assert!(
@@ -994,8 +1104,8 @@ mod tests {
             resource: "memory:item".to_owned(),
         };
 
-        let evaluation =
-            evaluate_with_config(&request, &PolicyEvaluationConfig::default()).expect("evaluation");
+        let evaluation = evaluate_with_config(&request, &PolicyEvaluationConfig::default())
+            .expect("well-formed request evaluates without engine error");
 
         assert_eq!(evaluation.decision, PolicyDecision::Allow);
         assert!(
@@ -1012,8 +1122,8 @@ mod tests {
             resource: "memory:session".to_owned(),
         };
 
-        let evaluation =
-            evaluate_with_config(&request, &PolicyEvaluationConfig::default()).expect("evaluation");
+        let evaluation = evaluate_with_config(&request, &PolicyEvaluationConfig::default())
+            .expect("well-formed request evaluates without engine error");
 
         assert_eq!(
             evaluation.decision,
@@ -1033,8 +1143,8 @@ mod tests {
             resource: "secrets:global:openai_api_key".to_owned(),
         };
 
-        let evaluation =
-            evaluate_with_config(&request, &PolicyEvaluationConfig::default()).expect("evaluation");
+        let evaluation = evaluate_with_config(&request, &PolicyEvaluationConfig::default())
+            .expect("well-formed request evaluates without engine error");
 
         assert_eq!(evaluation.decision, PolicyDecision::Allow);
         assert!(
@@ -1051,8 +1161,8 @@ mod tests {
             resource: "channel:slack".to_owned(),
         };
 
-        let evaluation =
-            evaluate_with_config(&request, &PolicyEvaluationConfig::default()).expect("evaluation");
+        let evaluation = evaluate_with_config(&request, &PolicyEvaluationConfig::default())
+            .expect("well-formed request evaluates without engine error");
 
         assert_eq!(evaluation.decision, PolicyDecision::Allow);
         assert!(
@@ -1069,8 +1179,8 @@ mod tests {
             resource: "channel:discord:default:message:123:456".to_owned(),
         };
 
-        let evaluation =
-            evaluate_with_config(&request, &PolicyEvaluationConfig::default()).expect("evaluation");
+        let evaluation = evaluate_with_config(&request, &PolicyEvaluationConfig::default())
+            .expect("well-formed request evaluates without engine error");
 
         assert_eq!(evaluation.decision, PolicyDecision::Allow);
         assert!(
@@ -1091,7 +1201,8 @@ mod tests {
             ..PolicyEvaluationConfig::default()
         };
 
-        let evaluation = evaluate_with_config(&request, &config).expect("evaluation");
+        let evaluation = evaluate_with_config(&request, &config)
+            .expect("well-formed request evaluates without engine error");
 
         assert_eq!(
             evaluation.decision,
@@ -1108,8 +1219,8 @@ mod tests {
             resource: "channel:slack".to_owned(),
         };
 
-        let evaluation =
-            evaluate_with_config(&request, &PolicyEvaluationConfig::default()).expect("evaluation");
+        let evaluation = evaluate_with_config(&request, &PolicyEvaluationConfig::default())
+            .expect("well-formed request evaluates without engine error");
 
         assert_eq!(evaluation.decision, PolicyDecision::Allow);
     }
@@ -1122,8 +1233,8 @@ mod tests {
             resource: "channel:discord:default".to_owned(),
         };
 
-        let evaluation =
-            evaluate_with_config(&request, &PolicyEvaluationConfig::default()).expect("evaluation");
+        let evaluation = evaluate_with_config(&request, &PolicyEvaluationConfig::default())
+            .expect("well-formed request evaluates without engine error");
 
         assert_eq!(evaluation.decision, PolicyDecision::Allow);
         assert!(
@@ -1149,7 +1260,7 @@ mod tests {
             };
 
             let evaluation = evaluate_with_config(&request, &PolicyEvaluationConfig::default())
-                .expect("evaluation");
+                .expect("well-formed request evaluates without engine error");
 
             assert_eq!(evaluation.decision, PolicyDecision::Allow, "{action} should be allowed");
             assert!(
@@ -1167,8 +1278,8 @@ mod tests {
             resource: "channel:discord:default".to_owned(),
         };
 
-        let evaluation =
-            evaluate_with_config(&request, &PolicyEvaluationConfig::default()).expect("evaluation");
+        let evaluation = evaluate_with_config(&request, &PolicyEvaluationConfig::default())
+            .expect("well-formed request evaluates without engine error");
 
         assert_eq!(evaluation.decision, PolicyDecision::Allow);
         assert!(
@@ -1185,8 +1296,8 @@ mod tests {
             resource: "channel:discord:default".to_owned(),
         };
 
-        let evaluation =
-            evaluate_with_config(&request, &PolicyEvaluationConfig::default()).expect("evaluation");
+        let evaluation = evaluate_with_config(&request, &PolicyEvaluationConfig::default())
+            .expect("well-formed request evaluates without engine error");
 
         assert_eq!(
             evaluation.decision,
@@ -1202,8 +1313,8 @@ mod tests {
             resource: "channel:discord:default".to_owned(),
         };
 
-        let evaluation =
-            evaluate_with_config(&request, &PolicyEvaluationConfig::default()).expect("evaluation");
+        let evaluation = evaluate_with_config(&request, &PolicyEvaluationConfig::default())
+            .expect("well-formed request evaluates without engine error");
 
         assert_eq!(
             evaluation.decision,
@@ -1219,8 +1330,8 @@ mod tests {
             resource: "channel:discord:default".to_owned(),
         };
 
-        let evaluation =
-            evaluate_with_config(&request, &PolicyEvaluationConfig::default()).expect("evaluation");
+        let evaluation = evaluate_with_config(&request, &PolicyEvaluationConfig::default())
+            .expect("well-formed request evaluates without engine error");
 
         assert_eq!(
             evaluation.decision,
@@ -1240,7 +1351,8 @@ mod tests {
             ..PolicyEvaluationConfig::default()
         };
 
-        let evaluation = evaluate_with_config(&request, &config).expect("evaluation");
+        let evaluation = evaluate_with_config(&request, &config)
+            .expect("well-formed request evaluates without engine error");
 
         assert_eq!(
             evaluation.decision,
@@ -1257,8 +1369,8 @@ mod tests {
             resource: "custom:resource".to_owned(),
         };
 
-        let evaluation =
-            evaluate_with_config(&request, &PolicyEvaluationConfig::default()).expect("evaluation");
+        let evaluation = evaluate_with_config(&request, &PolicyEvaluationConfig::default())
+            .expect("well-formed request evaluates without engine error");
 
         assert_eq!(
             evaluation.decision,
@@ -1277,8 +1389,8 @@ mod tests {
             action: "tool.execute".to_owned(),
             resource: "tool:palyra.echo".to_owned(),
         };
-        let denied =
-            evaluate_with_config(&request, &PolicyEvaluationConfig::default()).expect("evaluation");
+        let denied = evaluate_with_config(&request, &PolicyEvaluationConfig::default())
+            .expect("well-formed request evaluates without engine error");
         assert_eq!(
             denied.decision,
             PolicyDecision::DenyByDefault { reason: POLICY_DENY_REASON.to_owned() }
@@ -1290,7 +1402,8 @@ mod tests {
             sensitive_tool_names: Vec::new(),
             ..PolicyEvaluationConfig::default()
         };
-        let allowed = evaluate_with_config(&request, &allowed_config).expect("evaluation");
+        let allowed = evaluate_with_config(&request, &allowed_config)
+            .expect("well-formed request evaluates without engine error");
         assert_eq!(allowed.decision, PolicyDecision::Allow);
         assert!(allowed.explanation.is_allowlisted_tool);
     }
@@ -1302,8 +1415,8 @@ mod tests {
             action: "skill.execute".to_owned(),
             resource: "skill:acme.echo_http".to_owned(),
         };
-        let denied =
-            evaluate_with_config(&request, &PolicyEvaluationConfig::default()).expect("evaluation");
+        let denied = evaluate_with_config(&request, &PolicyEvaluationConfig::default())
+            .expect("well-formed request evaluates without engine error");
         assert_eq!(
             denied.decision,
             PolicyDecision::DenyByDefault { reason: SKILL_POLICY_DENY_REASON.to_owned() }
@@ -1315,7 +1428,8 @@ mod tests {
             sensitive_tool_names: Vec::new(),
             ..PolicyEvaluationConfig::default()
         };
-        let allowed = evaluate_with_config(&request, &allowed_config).expect("evaluation");
+        let allowed = evaluate_with_config(&request, &allowed_config)
+            .expect("well-formed request evaluates without engine error");
         assert_eq!(allowed.decision, PolicyDecision::Allow);
         assert!(allowed.explanation.is_allowlisted_skill);
     }
@@ -1334,7 +1448,7 @@ mod tests {
         };
 
         let evaluation = evaluate_with_context(&request, &PolicyRequestContext::default(), &config)
-            .expect("evaluation");
+            .expect("well-formed request evaluates without engine error");
         assert_eq!(
             evaluation.decision,
             PolicyDecision::DenyByDefault { reason: TOOL_EXECUTE_PRINCIPAL_DENY_REASON.to_owned() }
@@ -1355,7 +1469,8 @@ mod tests {
             ..PolicyEvaluationConfig::default()
         };
 
-        let evaluation = evaluate_with_config(&request, &config).expect("evaluation");
+        let evaluation = evaluate_with_config(&request, &config)
+            .expect("well-formed request evaluates without engine error");
         let diagnostics = super::policy_explain_diagnostics_value(&request, &evaluation);
 
         assert_eq!(diagnostics["schema_version"], 1);
@@ -1382,7 +1497,7 @@ mod tests {
             ..PolicyEvaluationConfig::default()
         };
         let denied = evaluate_with_context(&request, &PolicyRequestContext::default(), &config)
-            .expect("evaluation");
+            .expect("well-formed request evaluates without engine error");
         assert_eq!(
             denied.decision,
             PolicyDecision::DenyByDefault { reason: TOOL_EXECUTE_CHANNEL_DENY_REASON.to_owned() }
@@ -1395,7 +1510,7 @@ mod tests {
             },
             &config,
         )
-        .expect("evaluation");
+        .expect("well-formed request evaluates without engine error");
         assert_eq!(allowed.decision, PolicyDecision::Allow);
         assert!(allowed.explanation.is_tool_execute_channel_allowed);
     }
@@ -1417,7 +1532,8 @@ mod tests {
             allow_sensitive_tools: false,
             ..PolicyEvaluationConfig::default()
         };
-        let denied = evaluate_with_context(&request, &context, &config).expect("evaluation");
+        let denied = evaluate_with_context(&request, &context, &config)
+            .expect("well-formed request evaluates without engine error");
         assert_eq!(
             denied.decision,
             PolicyDecision::DenyByDefault { reason: SENSITIVE_DENY_REASON.to_owned() }
@@ -1428,7 +1544,7 @@ mod tests {
             &context,
             &PolicyEvaluationConfig { allow_sensitive_tools: true, ..config },
         )
-        .expect("evaluation");
+        .expect("well-formed request evaluates without engine error");
         assert_eq!(allowed.decision, PolicyDecision::Allow);
     }
 
@@ -1452,7 +1568,7 @@ mod tests {
                 ..PolicyEvaluationConfig::default()
             },
         )
-        .expect("evaluation");
+        .expect("well-formed request evaluates without engine error");
 
         assert_eq!(evaluation.decision, PolicyDecision::Allow);
         assert!(

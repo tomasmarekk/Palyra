@@ -1,3 +1,5 @@
+//! Criterion benchmark for the deny-by-default hot path of `palyra_policy::evaluate`.
+
 use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, Criterion};
