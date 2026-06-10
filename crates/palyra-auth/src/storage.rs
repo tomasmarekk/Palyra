@@ -1,3 +1,9 @@
+//! TOML persistence for the registry and runtime-state documents.
+//!
+//! Writes are serialized across processes with a `.lock` sentinel file and applied via
+//! write-temp-then-rename so a crash never leaves a half-written registry. Documents
+//! contain vault references and bookkeeping only — never secret values.
+
 use std::{
     env, fs,
     path::{Component, Path, PathBuf},
@@ -16,6 +22,7 @@ use crate::{
     models::{AuthProfileOrderRecord, AuthProfileRecord, AuthProfileRuntimeRecord},
 };
 
+/// On-disk shape of `auth_profiles.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RegistryDocument {
     pub(crate) version: u32,
@@ -29,6 +36,7 @@ impl Default for RegistryDocument {
     }
 }
 
+/// On-disk shape of `auth_profile_runtime_state.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RuntimeStateDocument {
     pub(crate) version: u32,
@@ -44,6 +52,7 @@ impl Default for RuntimeStateDocument {
     }
 }
 
+/// Resolves the state root from `PALYRA_STATE_ROOT`, defaulting next to the identity store.
 pub(crate) fn resolve_state_root(identity_store_root: &Path) -> Result<PathBuf, AuthProfileError> {
     if let Ok(raw) = env::var(ENV_STATE_ROOT) {
         let state_root = normalize_configured_path(raw.as_str(), ENV_STATE_ROOT)?;
@@ -53,12 +62,14 @@ pub(crate) fn resolve_state_root(identity_store_root: &Path) -> Result<PathBuf, 
             identity_store_root.join(state_root)
         });
     }
+    // Default places auth state beside, not inside, the identity store directory.
     Ok(identity_store_root
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| identity_store_root.to_path_buf()))
 }
 
+/// Resolves the registry file path, honoring the `PALYRA_AUTH_PROFILES_PATH` override.
 pub(crate) fn resolve_registry_path(state_root: &Path) -> Result<PathBuf, AuthProfileError> {
     if let Ok(raw) = env::var(ENV_REGISTRY_PATH) {
         let configured = normalize_configured_path(raw.as_str(), ENV_REGISTRY_PATH)?;
@@ -71,6 +82,8 @@ pub(crate) fn resolve_runtime_state_path(state_root: &Path) -> PathBuf {
     state_root.join(RUNTIME_STATE_FILE)
 }
 
+/// Validates an env-configured path, rejecting `..` so a relative override cannot
+/// silently escape the root it is joined onto.
 fn normalize_configured_path(raw: &str, field: &'static str) -> Result<PathBuf, AuthProfileError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -91,6 +104,7 @@ fn normalize_configured_path(raw: &str, field: &'static str) -> Result<PathBuf, 
     Ok(path)
 }
 
+/// Serializes and atomically persists the registry document under the cross-process lock.
 pub(crate) fn persist_registry(
     path: &Path,
     document: &RegistryDocument,
@@ -109,6 +123,7 @@ pub(crate) fn persist_registry(
     Ok(())
 }
 
+/// Serializes and atomically persists runtime state under the cross-process lock.
 pub(crate) fn persist_runtime_state(
     path: &Path,
     document: &RuntimeStateDocument,
@@ -127,20 +142,29 @@ pub(crate) fn persist_runtime_state(
     Ok(())
 }
 
+/// Guard owning the `.lock` sentinel file; releasing removes the file.
 struct RegistryLock {
     lock_path: PathBuf,
 }
 
 impl Drop for RegistryLock {
     fn drop(&mut self) {
+        // Best effort: a leaked lock file is reclaimed by the staleness check.
         let _ = fs::remove_file(&self.lock_path);
     }
 }
 
+/// Acquires the cross-process write lock for `path` by atomically creating a sentinel.
+///
+/// Stale sentinels (older than `REGISTRY_LOCK_STALE_AFTER_SECS`) are reclaimed so a
+/// crashed process cannot block writers forever — a deliberate availability-over-strictness
+/// tradeoff: a writer stalled past the stale window can race a reclaiming writer, and the
+/// atomic rename below keeps the file intact (last writer wins) in that case.
 fn acquire_registry_lock(path: &Path) -> Result<RegistryLock, std::io::Error> {
     let lock_path = registry_lock_path(path);
     let stale_after = Duration::from_secs(REGISTRY_LOCK_STALE_AFTER_SECS);
     for attempt in 0..=REGISTRY_LOCK_MAX_ATTEMPTS {
+        // `create_new` fails when the file exists, making creation the atomic mutex.
         match fs::OpenOptions::new().create_new(true).write(true).open(&lock_path) {
             Ok(_) => return Ok(RegistryLock { lock_path }),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -186,6 +210,8 @@ fn reclaim_stale_registry_lock(lock_path: &Path, stale_after: Duration) -> bool 
     fs::remove_file(lock_path).is_ok()
 }
 
+/// Replaces `path` with `payload` via write-temp-then-rename so readers never observe a
+/// partially written file.
 fn write_registry_atomically(path: &Path, payload: &str) -> Result<(), std::io::Error> {
     let timestamp_ns = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
     let mut temporary_name = path.as_os_str().to_os_string();
@@ -198,6 +224,9 @@ fn write_registry_atomically(path: &Path, payload: &str) -> Result<(), std::io::
             let _ = fs::remove_file(&temporary_path);
             return Err(rename_error);
         }
+        // Windows can refuse rename-over-existing (e.g. the target is open without
+        // FILE_SHARE_DELETE), so swap the old file aside, install the new one, and
+        // roll back the original if installation fails.
         let mut rollback_name = path.as_os_str().to_os_string();
         rollback_name.push(format!(".swap.{}.{}", std::process::id(), timestamp_ns));
         let rollback_path = PathBuf::from(rollback_name);
@@ -212,7 +241,13 @@ fn write_registry_atomically(path: &Path, payload: &str) -> Result<(), std::io::
     Ok(())
 }
 
+/// Returns the current wall-clock time as unix milliseconds.
+///
+/// # Errors
+/// Returns [`AuthProfileError::InvalidSystemTime`] when the clock reads before the epoch.
 pub(crate) fn unix_ms_now() -> Result<i64, AuthProfileError> {
     let elapsed = SystemTime::now().duration_since(UNIX_EPOCH)?;
+    // Truncating u128 -> i64 cast is unreachable in practice: i64 milliseconds cover
+    // roughly 292 million years past the epoch.
     Ok(elapsed.as_millis() as i64)
 }

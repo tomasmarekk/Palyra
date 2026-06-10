@@ -1,3 +1,10 @@
+//! Auth profile registry, credential descriptors, OAuth refresh, and provider health.
+//!
+//! Profiles never store secret material inline: every credential field holds a vault
+//! reference (`scope/key`) resolved through `palyra-vault` at use time. The registry and
+//! its runtime state persist as TOML under the daemon state root and are shared with the
+//! daemon's model/provider orchestration via [`AuthProfileRegistry`].
+
 mod constants;
 mod error;
 mod models;

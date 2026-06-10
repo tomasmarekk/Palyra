@@ -1,3 +1,10 @@
+//! Input normalization and validation for profiles, identifiers, and token endpoints.
+//!
+//! Token endpoints are validated in two phases: a syntactic/literal check at write time
+//! (`normalize_token_endpoint`) and a DNS-resolving network-policy check at refresh time
+//! (`validate_runtime_token_endpoint`), so a hostname cannot be re-pointed at a private
+//! address after registration (DNS rebinding).
+
 use std::{
     collections::BTreeMap,
     net::{IpAddr, ToSocketAddrs},
@@ -18,7 +25,11 @@ use crate::{
     storage::{unix_ms_now, RegistryDocument},
 };
 
+/// Normalizes a loaded registry document in place: version check, per-profile
+/// normalization, de-duplication by profile id (later entries win), and size limit.
 pub(crate) fn normalize_document(document: &mut RegistryDocument) -> Result<(), AuthProfileError> {
+    // Version 0 cannot be produced by this crate's serializer; treat it as "unset"
+    // from a hand-edited file and upgrade to the current version.
     if document.version == 0 {
         document.version = REGISTRY_VERSION;
     }
@@ -40,6 +51,7 @@ pub(crate) fn normalize_document(document: &mut RegistryDocument) -> Result<(), 
     Ok(())
 }
 
+/// Normalizes every field of an incoming set request before it touches the registry.
 pub(crate) fn normalize_set_request(
     request: AuthProfileSetRequest,
 ) -> Result<AuthProfileSetRequest, AuthProfileError> {
@@ -52,6 +64,7 @@ pub(crate) fn normalize_set_request(
     })
 }
 
+/// Normalizes a stored profile record, repairing absent or inverted timestamps.
 pub(crate) fn normalize_profile_record(
     mut record: AuthProfileRecord,
     fallback_now: i64,
@@ -99,6 +112,7 @@ pub(crate) fn normalize_agent_id(raw: &str) -> Result<String, AuthProfileError> 
     normalize_identifier(raw, "scope.agent_id", 128)
 }
 
+/// Trims, lowercases, and restricts an identifier to `[a-z0-9._-]` within `max_len`.
 fn normalize_identifier(
     raw: &str,
     field: &'static str,
@@ -210,12 +224,15 @@ fn normalize_refresh_state(mut value: OAuthRefreshState) -> OAuthRefreshState {
     value
 }
 
+/// Trims free-form text, mapping blank input to `None` and truncating to `max_len` bytes.
 pub(crate) fn normalize_optional_text(value: Option<String>, max_len: usize) -> Option<String> {
     value.and_then(|raw| {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             None
         } else if trimmed.len() > max_len {
+            // Walk back to a UTF-8 char boundary so the byte-length cut cannot panic
+            // or split a multi-byte character.
             let mut end = max_len.min(trimmed.len());
             while end > 0 && !trimmed.is_char_boundary(end) {
                 end = end.saturating_sub(1);
@@ -241,6 +258,7 @@ fn normalize_optional_vault_ref(
     Ok(None)
 }
 
+/// Validates a vault reference and re-renders it in canonical `scope/key` form.
 fn normalize_vault_ref(raw: &str, field: &'static str) -> Result<String, AuthProfileError> {
     let trimmed = raw.trim();
     let parsed = VaultRef::parse(trimmed).map_err(|error| AuthProfileError::InvalidField {
@@ -250,8 +268,9 @@ fn normalize_vault_ref(raw: &str, field: &'static str) -> Result<String, AuthPro
     Ok(format!("{}/{}", parsed.scope, parsed.key))
 }
 
+/// Write-time token endpoint validation; see the module docs for the two-phase scheme.
 pub(crate) fn normalize_token_endpoint(raw: &str) -> Result<String, AuthProfileError> {
-    parse_oauth_token_endpoint_url(raw, "oauth.token_endpoint")
+    parse_oauth_token_endpoint_url(raw)
         .map_err(|message| AuthProfileError::InvalidField {
             field: "oauth.token_endpoint",
             message,
@@ -263,6 +282,7 @@ fn is_loopback_endpoint(parsed: &Url) -> bool {
     let Some(host) = parsed.host_str() else {
         return false;
     };
+    // Url keeps IPv6 literals bracketed (`[::1]`); strip brackets before IpAddr parsing.
     let normalized_host = host.trim_start_matches('[').trim_end_matches(']');
     if normalized_host.eq_ignore_ascii_case("localhost") {
         return true;
@@ -270,7 +290,12 @@ fn is_loopback_endpoint(parsed: &Url) -> bool {
     normalized_host.parse::<IpAddr>().is_ok_and(|address| address.is_loopback())
 }
 
-fn parse_oauth_token_endpoint_url(raw: &str, _field_name: &'static str) -> Result<Url, String> {
+/// Syntactic and literal-host policy for OAuth token endpoints.
+///
+/// Userinfo, query, and fragment components are rejected because refresh credentials
+/// travel in the POST body only; https endpoints must not target localhost/private
+/// literals (SSRF), while plain http is permitted solely for loopback development flows.
+fn parse_oauth_token_endpoint_url(raw: &str) -> Result<Url, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err("value cannot be empty".to_owned());
@@ -315,10 +340,16 @@ fn resolve_token_endpoint_addresses(host: &str, port: u16) -> std::io::Result<Ve
     (host, port).to_socket_addrs().map(|resolved| resolved.map(|address| address.ip()).collect())
 }
 
+/// Refresh-time token endpoint validation; see the module docs for the two-phase scheme.
 pub(crate) fn validate_runtime_token_endpoint(url: &str) -> Result<Url, OAuthRefreshError> {
     validate_runtime_token_endpoint_with_resolver(url, resolve_token_endpoint_addresses)
 }
 
+/// Like [`validate_runtime_token_endpoint`] with an injectable resolver for tests.
+///
+/// # Errors
+/// Returns [`OAuthRefreshError::Transport`] when the URL fails syntactic policy, the host
+/// cannot be resolved, or any resolved address violates the private-network guard.
 pub(crate) fn validate_runtime_token_endpoint_with_resolver<F>(
     url: &str,
     resolver: F,
@@ -326,8 +357,9 @@ pub(crate) fn validate_runtime_token_endpoint_with_resolver<F>(
 where
     F: Fn(&str, u16) -> std::io::Result<Vec<IpAddr>>,
 {
-    let parsed = parse_oauth_token_endpoint_url(url, "oauth refresh request token_endpoint")
-        .map_err(OAuthRefreshError::Transport)?;
+    let parsed = parse_oauth_token_endpoint_url(url).map_err(OAuthRefreshError::Transport)?;
+    // http already passed the loopback-only check above; DNS policy applies to https,
+    // where a public hostname could be re-pointed at a private address (DNS rebinding).
     if parsed.scheme() == "http" {
         return Ok(parsed);
     }
@@ -351,10 +383,16 @@ where
     Ok(parsed)
 }
 
+/// Returns a strictly increasing `updated_at` for a profile mutation.
+///
+/// The +1 floor guarantees the timestamp advances even when the wall clock has not,
+/// which the stale-refresh guard in `persist_refresh_failure` relies on to detect
+/// concurrent profile changes by comparing observed vs. current `updated_at`.
 pub(crate) fn next_profile_updated_at(previous_updated_at_unix_ms: i64, now_unix_ms: i64) -> i64 {
     previous_updated_at_unix_ms.saturating_add(1).max(now_unix_ms)
 }
 
+/// Trims, drops empties, de-duplicates, and sorts OAuth scopes.
 fn normalize_scopes(input: Vec<String>) -> Vec<String> {
     let mut deduped = BTreeMap::<String, ()>::new();
     for raw in input {
@@ -388,6 +426,8 @@ pub(crate) fn profile_matches_filter(
     true
 }
 
+/// Returns the provider+name key under which agent-scoped profiles shadow global ones
+/// in `merged_profiles_for_agent`.
 pub(crate) fn profile_merge_key(profile: &AuthProfileRecord) -> String {
     format!("{}:{}", profile.provider.canonical_key(), profile.profile_name.to_ascii_lowercase())
 }

@@ -1,3 +1,9 @@
+//! Behavior tests for the registry, validation, refresh flow, and selection logic.
+//!
+//! Refresh tests run against local loopback HTTP servers and stub adapters — never live
+//! providers. Several assertions pin security behavior (no secret leakage into reports,
+//! runtime state, or refresh reasons; no redirect following); keep those when refactoring.
+
 use crate::{
     compute_backoff_ms, load_secret_utf8, normalize_optional_text, normalize_token_endpoint,
     persist_secret_utf8, validate_runtime_token_endpoint_with_resolver, AuthCredential,

@@ -1,3 +1,9 @@
+//! The auth profile registry: CRUD, health, runtime state, selection, and OAuth refresh.
+//!
+//! Every mutation follows clone-document -> persist-to-disk -> swap-in-memory, so a failed
+//! write leaves the in-memory view and the on-disk file consistent with each other.
+//! Secrets are only ever moved between the vault and refresh adapters, never stored here.
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -38,6 +44,10 @@ use crate::{
     },
 };
 
+/// Thread-safe store of auth profiles and their runtime state, persisted as TOML.
+///
+/// Methods come in pairs: a wall-clock variant for production callers and a
+/// `*_with_clock` variant taking `now_unix_ms` for deterministic tests and replay.
 #[derive(Debug)]
 pub struct AuthProfileRegistry {
     registry_path: PathBuf,
@@ -47,6 +57,12 @@ pub struct AuthProfileRegistry {
 }
 
 impl AuthProfileRegistry {
+    /// Opens (creating if needed) the registry and runtime-state files for a state root
+    /// derived from `identity_store_root`, normalizing and re-persisting both documents.
+    ///
+    /// # Errors
+    /// Returns an error when paths cannot be resolved or created, a document cannot be
+    /// read, parsed, or persisted, or a document declares an unsupported version.
     pub fn open(identity_store_root: &Path) -> Result<Self, AuthProfileError> {
         let state_root = resolve_state_root(identity_store_root)?;
         let registry_path = resolve_registry_path(state_root.as_path())?;
@@ -98,6 +114,11 @@ impl AuthProfileRegistry {
         })
     }
 
+    /// Lists profiles matching `filter`, paginated by profile-id cursor.
+    ///
+    /// # Errors
+    /// Returns [`AuthProfileError::InvalidField`] when `after_profile_id` does not exist
+    /// in the filtered result set, and [`AuthProfileError::LockPoisoned`] on lock failure.
     pub fn list_profiles(
         &self,
         filter: AuthProfileListFilter,
@@ -137,6 +158,10 @@ impl AuthProfileRegistry {
         })
     }
 
+    /// Looks up a profile by id, returning `None` when it does not exist.
+    ///
+    /// # Errors
+    /// Returns an error when `profile_id` fails normalization or the lock is poisoned.
     pub fn get_profile(
         &self,
         profile_id: &str,
@@ -146,6 +171,12 @@ impl AuthProfileRegistry {
         Ok(guard.profiles.iter().find(|profile| profile.profile_id == profile_id).cloned())
     }
 
+    /// Creates or replaces a profile, preserving `created_at` on replacement.
+    ///
+    /// # Errors
+    /// Returns an error when the request fails validation, the registry is full
+    /// ([`AuthProfileError::RegistryLimitExceeded`]), or persisting to disk fails — in
+    /// which case the in-memory state is left unchanged.
     pub fn set_profile(
         &self,
         request: AuthProfileSetRequest,
@@ -154,6 +185,8 @@ impl AuthProfileRegistry {
         let now = unix_ms_now()?;
 
         let mut guard = self.state.lock().map_err(|_| AuthProfileError::LockPoisoned)?;
+        // Mutate a clone and swap it in only after the disk write succeeds, so a failed
+        // persist cannot leave memory ahead of disk (pinned by tests).
         let mut next = guard.clone();
         let mut record = AuthProfileRecord {
             profile_id: normalized.profile_id,
@@ -181,6 +214,11 @@ impl AuthProfileRegistry {
         Ok(record)
     }
 
+    /// Deletes a profile and its runtime record, returning whether anything was removed.
+    ///
+    /// # Errors
+    /// Returns an error when `profile_id` fails normalization, a lock is poisoned, or
+    /// persisting either document fails.
     pub fn delete_profile(&self, profile_id: &str) -> Result<bool, AuthProfileError> {
         let profile_id = normalize_profile_id(profile_id)?;
         let mut guard = self.state.lock().map_err(|_| AuthProfileError::LockPoisoned)?;
@@ -196,6 +234,12 @@ impl AuthProfileRegistry {
         Ok(deleted)
     }
 
+    /// Returns the profiles visible to an agent: all profiles when `agent_id` is `None`,
+    /// otherwise global profiles overlaid with the agent's own, where an agent-scoped
+    /// profile shadows a global one sharing the same provider + profile name.
+    ///
+    /// # Errors
+    /// Returns an error when `agent_id` fails normalization or the lock is poisoned.
     pub fn merged_profiles_for_agent(
         &self,
         agent_id: Option<&str>,
@@ -222,6 +266,11 @@ impl AuthProfileRegistry {
         Ok(guard.profiles.clone())
     }
 
+    /// Builds a credential health report for the agent's visible profiles using the
+    /// current wall clock and default expiring window.
+    ///
+    /// # Errors
+    /// See [`Self::health_report_with_clock`].
     pub fn health_report(
         &self,
         vault: &Vault,
@@ -230,6 +279,12 @@ impl AuthProfileRegistry {
         self.health_report_with_clock(vault, agent_id, unix_ms_now()?, DEFAULT_EXPIRING_WINDOW_MS)
     }
 
+    /// Builds a credential health report with an injected clock and expiring window.
+    ///
+    /// The report carries states, reasons, and expiry timestamps only — never secrets.
+    ///
+    /// # Errors
+    /// Returns an error when `agent_id` fails normalization or the lock is poisoned.
     pub fn health_report_with_clock(
         &self,
         vault: &Vault,
@@ -276,6 +331,10 @@ impl AuthProfileRegistry {
         Ok(report)
     }
 
+    /// Materializes and persists up-to-date runtime records for the agent's profiles.
+    ///
+    /// # Errors
+    /// See [`Self::runtime_records_for_agent_with_clock`].
     pub fn runtime_records_for_agent(
         &self,
         vault: &Vault,
@@ -289,6 +348,12 @@ impl AuthProfileRegistry {
         )
     }
 
+    /// Like [`Self::runtime_records_for_agent`] with an injected clock and window;
+    /// persists runtime state only when the materialization actually changed it.
+    ///
+    /// # Errors
+    /// Returns an error when normalization fails, a lock is poisoned, or persisting the
+    /// updated runtime state fails.
     pub fn runtime_records_for_agent_with_clock(
         &self,
         vault: &Vault,
@@ -318,6 +383,11 @@ impl AuthProfileRegistry {
         Ok(records)
     }
 
+    /// Computes the same records as [`Self::runtime_records_for_agent`] without
+    /// persisting anything — for audit/explain surfaces that must not mutate state.
+    ///
+    /// # Errors
+    /// See [`Self::runtime_records_for_agent_readonly_with_clock`].
     pub fn runtime_records_for_agent_readonly(
         &self,
         vault: &Vault,
@@ -331,6 +401,10 @@ impl AuthProfileRegistry {
         )
     }
 
+    /// Read-only variant of [`Self::runtime_records_for_agent_with_clock`].
+    ///
+    /// # Errors
+    /// Returns an error when normalization fails or a lock is poisoned.
     pub fn runtime_records_for_agent_readonly_with_clock(
         &self,
         vault: &Vault,
@@ -352,10 +426,22 @@ impl AuthProfileRegistry {
         Ok(records)
     }
 
+    /// Records a successful use of the profile, clearing failure and cooldown state.
+    ///
+    /// # Errors
+    /// See [`Self::record_profile_success_with_clock`].
     pub fn record_profile_success(&self, profile_id: &str) -> Result<(), AuthProfileError> {
         self.record_profile_success_with_clock(profile_id, unix_ms_now()?)
     }
 
+    /// Like [`Self::record_profile_success`] with an injected clock.
+    ///
+    /// Eligibility is restored only when the token is not `Missing`/`Expired`; a success
+    /// does not paper over a credential the health check still considers unusable.
+    ///
+    /// # Errors
+    /// Returns [`AuthProfileError::ProfileNotFound`] for unknown ids, plus lock and
+    /// persistence errors.
     pub fn record_profile_success_with_clock(
         &self,
         profile_id: &str,
@@ -385,6 +471,11 @@ impl AuthProfileRegistry {
         Ok(())
     }
 
+    /// Records a failed use of the profile, incrementing the failure count and applying
+    /// the cooldown policy for `kind`.
+    ///
+    /// # Errors
+    /// See [`Self::record_profile_failure_with_clock`].
     pub fn record_profile_failure(
         &self,
         profile_id: &str,
@@ -393,6 +484,12 @@ impl AuthProfileRegistry {
         self.record_profile_failure_with_clock(profile_id, kind, unix_ms_now()?)
     }
 
+    /// Like [`Self::record_profile_failure`] with an injected clock; returns the
+    /// updated runtime record.
+    ///
+    /// # Errors
+    /// Returns [`AuthProfileError::ProfileNotFound`] for unknown ids, plus lock and
+    /// persistence errors.
     pub fn record_profile_failure_with_clock(
         &self,
         profile_id: &str,
@@ -403,6 +500,10 @@ impl AuthProfileRegistry {
         self.record_profile_failure_from_profile(&profile, kind, now_unix_ms, None)
     }
 
+    /// Clears failure count and cooldown for the profile (operator override).
+    ///
+    /// # Errors
+    /// See [`Self::clear_profile_cooldown_with_clock`].
     pub fn clear_profile_cooldown(
         &self,
         profile_id: &str,
@@ -410,6 +511,12 @@ impl AuthProfileRegistry {
         self.clear_profile_cooldown_with_clock(profile_id, unix_ms_now()?)
     }
 
+    /// Like [`Self::clear_profile_cooldown`] with an injected clock; eligibility is
+    /// recomputed from the token expiry state rather than reset blindly.
+    ///
+    /// # Errors
+    /// Returns [`AuthProfileError::ProfileNotFound`] for unknown ids, plus lock and
+    /// persistence errors.
     pub fn clear_profile_cooldown_with_clock(
         &self,
         profile_id: &str,
@@ -439,6 +546,10 @@ impl AuthProfileRegistry {
         Ok(record)
     }
 
+    /// Returns the persisted profile order for a scope/provider pair, if one exists.
+    ///
+    /// # Errors
+    /// Returns an error when `agent_id` fails normalization or the lock is poisoned.
     pub fn profile_order(
         &self,
         provider: Option<&AuthProvider>,
@@ -456,6 +567,10 @@ impl AuthProfileRegistry {
             .cloned())
     }
 
+    /// Persists an operator-defined profile order for a scope/provider pair.
+    ///
+    /// # Errors
+    /// See [`Self::set_profile_order_with_clock`].
     pub fn set_profile_order(
         &self,
         provider: Option<AuthProvider>,
@@ -465,6 +580,13 @@ impl AuthProfileRegistry {
         self.set_profile_order_with_clock(provider, agent_id, profile_ids, unix_ms_now()?)
     }
 
+    /// Like [`Self::set_profile_order`] with an injected clock; every id must name an
+    /// existing visible profile, and when `provider` is given each profile must belong
+    /// to it.
+    ///
+    /// # Errors
+    /// Returns [`AuthProfileError::ProfileNotFound`] or [`AuthProfileError::InvalidField`]
+    /// for inconsistent orders, plus normalization, lock, and persistence errors.
     pub fn set_profile_order_with_clock(
         &self,
         provider: Option<AuthProvider>,
@@ -510,6 +632,11 @@ impl AuthProfileRegistry {
         Ok(record)
     }
 
+    /// Selects the best eligible profile for the request; see
+    /// [`Self::select_auth_profile_with_clock`].
+    ///
+    /// # Errors
+    /// Returns normalization, lock, and persistence errors.
     pub fn select_auth_profile(
         &self,
         vault: &Vault,
@@ -519,6 +646,12 @@ impl AuthProfileRegistry {
     }
 
     /// Selects an auth profile and materializes runtime health records for future decisions.
+    ///
+    /// Candidates are ranked explicit order first, then eligible-before-ineligible, then
+    /// least-recently-used; the result lists every candidate with its reason code.
+    ///
+    /// # Errors
+    /// Returns normalization, lock, and persistence errors.
     pub fn select_auth_profile_with_clock(
         &self,
         vault: &Vault,
@@ -528,6 +661,10 @@ impl AuthProfileRegistry {
         self.select_auth_profile_with_runtime_materialization(vault, request, now_unix_ms, true)
     }
 
+    /// Read-only selection explain; see [`Self::select_auth_profile_readonly_with_clock`].
+    ///
+    /// # Errors
+    /// Returns normalization and lock errors.
     pub fn select_auth_profile_readonly(
         &self,
         vault: &Vault,
@@ -537,6 +674,9 @@ impl AuthProfileRegistry {
     }
 
     /// Computes the same selection explanation without persisting runtime health materialization.
+    ///
+    /// # Errors
+    /// Returns normalization and lock errors.
     pub fn select_auth_profile_readonly_with_clock(
         &self,
         vault: &Vault,
@@ -574,6 +714,8 @@ impl AuthProfileRegistry {
             .into_iter()
             .map(|record| (record.profile_id.clone(), record))
             .collect::<BTreeMap<_, _>>();
+        // A request-supplied order wins outright; otherwise fall back to the persisted
+        // operator-defined order for this scope/provider, if any.
         let explicit_order = if request.explicit_profile_order.is_empty() {
             self.profile_order(request.provider.as_ref(), agent_id)?
                 .map(|record| record.profile_ids)
@@ -654,6 +796,11 @@ impl AuthProfileRegistry {
         })
     }
 
+    /// Sweeps the agent's OAuth profiles and refreshes those due, returning one outcome
+    /// per OAuth profile (skips included).
+    ///
+    /// # Errors
+    /// See [`Self::refresh_due_oauth_profiles_with_clock`].
     pub fn refresh_due_oauth_profiles(
         &self,
         vault: &Vault,
@@ -669,6 +816,12 @@ impl AuthProfileRegistry {
         )
     }
 
+    /// Like [`Self::refresh_due_oauth_profiles`] with an injected clock and refresh
+    /// window. Individual refresh failures become `Failed` outcomes with cooldowns; only
+    /// registry-level problems (locks, persistence) abort the sweep.
+    ///
+    /// # Errors
+    /// Returns normalization, lock, and persistence errors.
     pub fn refresh_due_oauth_profiles_with_clock(
         &self,
         vault: &Vault,
@@ -709,6 +862,10 @@ impl AuthProfileRegistry {
         Ok(outcomes)
     }
 
+    /// Forces a refresh attempt for one profile (cooldown still respected).
+    ///
+    /// # Errors
+    /// See [`Self::refresh_oauth_profile_with_clock`].
     pub fn refresh_oauth_profile(
         &self,
         profile_id: &str,
@@ -718,6 +875,12 @@ impl AuthProfileRegistry {
         self.refresh_oauth_profile_with_clock(profile_id, vault, adapter, unix_ms_now()?)
     }
 
+    /// Like [`Self::refresh_oauth_profile`] with an injected clock. A refresh that the
+    /// provider rejects is reported as a `Failed` outcome, not an `Err`.
+    ///
+    /// # Errors
+    /// Returns [`AuthProfileError::ProfileNotFound`] for unknown ids, plus
+    /// normalization, lock, and persistence errors.
     pub fn refresh_oauth_profile_with_clock(
         &self,
         profile_id: &str,
@@ -743,6 +906,8 @@ impl AuthProfileRegistry {
         }
     }
 
+    /// Runs one refresh from a prepared snapshot: loads secrets, calls the adapter
+    /// without holding any lock, then persists tokens and registry/runtime state.
     fn refresh_oauth_profile_snapshot_with_clock(
         &self,
         snapshot: OAuthRefreshSnapshot,
@@ -788,6 +953,9 @@ impl AuthProfileRegistry {
         });
         match response {
             Ok(payload) => {
+                // Persist a rotated refresh token before the access token: providers may
+                // invalidate the old refresh token on rotation, so losing the new one to
+                // a later write failure would leave the profile unrecoverable.
                 if let Some(refresh_token) = payload.refresh_token.as_deref() {
                     if persist_secret_utf8(
                         vault,
@@ -816,6 +984,9 @@ impl AuthProfileRegistry {
                         "failed to persist refreshed access token into vault".to_owned(),
                     );
                 }
+                // The u64 -> i64 cast wraps only for expires_in beyond i64::MAX seconds;
+                // such a value would land in the past and merely mark the token expired,
+                // which fails safe (the token gets refreshed again).
                 let computed_expires_at = payload
                     .expires_in_seconds
                     .map(|seconds| {
@@ -861,6 +1032,8 @@ impl AuthProfileRegistry {
                 };
                 persist_registry(self.registry_path.as_path(), &next)?;
                 *guard = next;
+                // Release the registry lock before taking the runtime-state lock so the
+                // two locks are never held together.
                 drop(guard);
                 self.record_profile_success_from_profile(&profile_for_runtime, now_unix_ms)?;
                 Ok(OAuthRefreshOutcome {
@@ -878,6 +1051,8 @@ impl AuthProfileRegistry {
         }
     }
 
+    /// Persists a refresh failure: bumps the failure count, applies backoff cooldown,
+    /// and updates the runtime record. `reason` must already be sanitized.
     fn persist_refresh_failure(
         &self,
         snapshot: OAuthRefreshSnapshot,
@@ -907,6 +1082,10 @@ impl AuthProfileRegistry {
                     expires_at_unix_ms: None,
                 });
             };
+            // Optimistic-concurrency guard: if the profile changed since the snapshot
+            // was taken (e.g. a concurrent refresh succeeded), this failure is stale and
+            // must not clobber the newer state. `next_profile_updated_at` guarantees
+            // updated_at moves on every mutation, so the comparison is reliable.
             if profile.updated_at_unix_ms != snapshot.observed_updated_at_unix_ms {
                 return Ok(OAuthRefreshOutcome {
                     profile_id,
@@ -953,6 +1132,7 @@ impl AuthProfileRegistry {
         })
     }
 
+    /// Drops the runtime record of a deleted profile, persisting only when present.
     fn remove_runtime_record(&self, profile_id: &str) -> Result<(), AuthProfileError> {
         let mut guard = self.runtime_state.lock().map_err(|_| AuthProfileError::LockPoisoned)?;
         let mut next = guard.clone();
@@ -965,6 +1145,7 @@ impl AuthProfileRegistry {
         Ok(())
     }
 
+    /// Looks up a profile, converting absence into [`AuthProfileError::ProfileNotFound`].
     fn profile_or_not_found(
         &self,
         profile_id: &str,
@@ -973,6 +1154,13 @@ impl AuthProfileRegistry {
         self.get_profile(profile_id.as_str())?.ok_or(AuthProfileError::ProfileNotFound(profile_id))
     }
 
+    /// Records a success against an already-resolved profile (post-refresh path).
+    ///
+    /// AIDEV-NOTE: this intentionally diverges from `record_profile_success_with_clock`:
+    /// here eligibility is recomputed (Expired/MissingCredential/Eligible) and the doctor
+    /// hint refreshed, while the public method preserves prior eligibility for
+    /// Missing/Expired tokens. Consolidating the two would change observable runtime
+    /// records — do not unify without a behavior decision.
     fn record_profile_success_from_profile(
         &self,
         profile: &AuthProfileRecord,
@@ -1003,6 +1191,11 @@ impl AuthProfileRegistry {
         Ok(())
     }
 
+    /// Records a failure against an already-resolved profile.
+    ///
+    /// `override_state` carries `(failure_count, cooldown_until)` from the OAuth refresh
+    /// path, which tracks its own count in the credential's refresh state; when absent,
+    /// the runtime record's own count is incremented and the per-kind cooldown applies.
     fn record_profile_failure_from_profile(
         &self,
         profile: &AuthProfileRecord,
@@ -1047,6 +1240,7 @@ impl AuthProfileRegistry {
     }
 }
 
+/// Normalizes a loaded runtime-state document: version check and id de-duplication.
 fn normalize_runtime_document(document: &mut RuntimeStateDocument) -> Result<(), AuthProfileError> {
     if document.version != RUNTIME_STATE_VERSION {
         return Err(AuthProfileError::UnsupportedVersion(document.version));
@@ -1060,6 +1254,7 @@ fn normalize_runtime_document(document: &mut RuntimeStateDocument) -> Result<(),
     Ok(())
 }
 
+/// Builds a runtime record from a fresh health evaluation merged onto existing state.
 fn runtime_record_from_health(
     profile: &AuthProfileRecord,
     health: &AuthProfileHealthRecord,
@@ -1068,6 +1263,8 @@ fn runtime_record_from_health(
 ) -> AuthProfileRuntimeRecord {
     let mut record = runtime_record_from_profile(profile, existing, now_unix_ms);
     record.token_expiry_state = token_expiry_state_from_health(health.state);
+    // A cooldown recorded from a usage failure takes precedence; the OAuth refresh
+    // cooldown only fills the gap when no failure cooldown is active.
     let refresh_cooldown = oauth_refresh_cooldown_until(profile);
     if record.cooldown_until_unix_ms.is_none() {
         record.cooldown_until_unix_ms = refresh_cooldown;
@@ -1083,6 +1280,7 @@ fn runtime_record_from_health(
     record
 }
 
+/// Builds a runtime record for a profile, carrying usage history over from `existing`.
 fn runtime_record_from_profile(
     profile: &AuthProfileRecord,
     existing: Option<&AuthProfileRuntimeRecord>,
@@ -1108,6 +1306,7 @@ fn runtime_record_from_profile(
     }
 }
 
+/// Replaces or appends a runtime record keyed by profile id.
 fn upsert_runtime_record(
     records: &mut Vec<AuthProfileRuntimeRecord>,
     record: AuthProfileRuntimeRecord,
@@ -1131,6 +1330,7 @@ fn token_expiry_state_from_health(state: AuthProfileHealthState) -> AuthTokenExp
     }
 }
 
+/// Returns the OAuth refresh-failure cooldown deadline, or `None` for api-key profiles.
 fn oauth_refresh_cooldown_until(profile: &AuthProfileRecord) -> Option<i64> {
     let AuthCredential::Oauth { refresh_state, .. } = &profile.credential else {
         return None;
@@ -1138,6 +1338,7 @@ fn oauth_refresh_cooldown_until(profile: &AuthProfileRecord) -> Option<i64> {
     refresh_state.next_allowed_refresh_unix_ms
 }
 
+/// Derives eligibility from health state; an active cooldown overrides everything.
 fn eligibility_from_health(
     state: AuthProfileHealthState,
     cooldown_until_unix_ms: Option<i64>,
@@ -1155,6 +1356,8 @@ fn eligibility_from_health(
     }
 }
 
+/// Produces the operator hint for a runtime state, or `None` when nothing needs action.
+/// Hint codes and messages are stable identifiers surfaced in console/CLI doctor output.
 fn doctor_hint_for_state(
     eligibility: AuthProfileEligibility,
     expiry: AuthTokenExpiryState,
@@ -1200,6 +1403,8 @@ fn doctor_hint_for_state(
     Some(AuthProfileDoctorHint { code, severity, message: message.to_owned() })
 }
 
+/// Cooldown policy per failure kind. `ConfigMissing` gets none: retrying cannot succeed
+/// until configuration changes, so the profile is marked ineligible instead of cooled down.
 fn failure_cooldown_ms(
     kind: AuthProfileFailureKind,
     provider: &AuthProvider,
@@ -1216,6 +1421,7 @@ fn failure_cooldown_ms(
     }
 }
 
+/// Normalizes an ordered id list, dropping duplicates while keeping first occurrence.
 fn normalize_profile_order(values: &[String]) -> Result<Vec<String>, AuthProfileError> {
     let mut normalized = Vec::with_capacity(values.len());
     let mut seen = BTreeSet::<String>::new();
@@ -1228,6 +1434,7 @@ fn normalize_profile_order(values: &[String]) -> Result<Vec<String>, AuthProfile
     Ok(normalized)
 }
 
+/// Maps an optional agent id to the order-record scope key (`global` or `agent:<id>`).
 fn profile_order_scope_key(agent_id: Option<&str>) -> Result<String, AuthProfileError> {
     match agent_id.map(str::trim).filter(|value| !value.is_empty()) {
         Some(agent_id) => {
@@ -1238,6 +1445,7 @@ fn profile_order_scope_key(agent_id: Option<&str>) -> Result<String, AuthProfile
     }
 }
 
+/// Replaces or inserts an order record keyed by scope+provider, keeping records sorted.
 fn upsert_profile_order(records: &mut Vec<AuthProfileOrderRecord>, record: AuthProfileOrderRecord) {
     if let Some(existing) = records.iter_mut().find(|existing| {
         existing.scope == record.scope && existing.provider.as_deref() == record.provider.as_deref()
@@ -1251,10 +1459,13 @@ fn upsert_profile_order(records: &mut Vec<AuthProfileOrderRecord>, record: AuthP
     }
 }
 
+/// Normalizes a list of profile ids into a deduplicated set.
 fn normalize_profile_set(values: &[String]) -> Result<BTreeSet<String>, AuthProfileError> {
     values.iter().map(|value| normalize_profile_id(value.as_str())).collect()
 }
 
+/// Maps exclusion checks (in precedence order) and eligibility to the candidate's
+/// stable reason code; only `eligible` candidates may be selected.
 fn selection_reason_code(
     provider_matches: bool,
     credential_allowed: bool,
@@ -1285,6 +1496,8 @@ fn selection_reason_code(
     }
 }
 
+/// Orders candidates: explicit-order entries first (by position), then eligible before
+/// ineligible, then least-recently-used, with profile id as the deterministic tiebreak.
 fn sort_selection_candidates(
     candidates: &mut [AuthProfileSelectionCandidate],
     explicit_positions: &BTreeMap<String, usize>,

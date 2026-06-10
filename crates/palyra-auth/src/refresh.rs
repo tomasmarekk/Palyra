@@ -1,3 +1,9 @@
+//! OAuth token refresh: HTTP adapter, backoff policy, health evaluation, vault I/O.
+//!
+//! Refresh secrets are loaded from the vault just-in-time and exist in memory only for
+//! the duration of one refresh call; failure reasons persisted to disk pass through
+//! [`sanitize_refresh_error`] so provider response text never reaches stored state.
+
 use std::time::Duration;
 
 use palyra_vault::{Vault, VaultError, VaultRef};
@@ -15,19 +21,33 @@ use crate::{
     validation::validate_runtime_token_endpoint,
 };
 
+/// Exchanges a refresh token for a new access token at a provider's token endpoint.
+///
+/// Implementations receive raw secret material in the request and must not log it.
 pub trait OAuthRefreshAdapter: Send + Sync {
+    /// Performs one `refresh_token` grant against the request's token endpoint.
+    ///
+    /// # Errors
+    /// Returns [`OAuthRefreshError`] on transport failure, a non-success HTTP status,
+    /// or a response body missing a usable `access_token`.
     fn refresh_access_token(
         &self,
         request: &OAuthRefreshRequest,
     ) -> Result<OAuthRefreshResponse, OAuthRefreshError>;
 }
 
+/// Production [`OAuthRefreshAdapter`] performing blocking HTTPS form-POST refreshes.
 #[derive(Debug)]
 pub struct HttpOAuthRefreshAdapter {
     timeout: Duration,
 }
 
 impl HttpOAuthRefreshAdapter {
+    /// Creates an adapter with the given request timeout.
+    ///
+    /// # Errors
+    /// Returns [`AuthProfileError::InvalidField`] when `timeout` is zero, which would
+    /// disable the timeout entirely.
     pub fn with_timeout(timeout: Duration) -> Result<Self, AuthProfileError> {
         if timeout.is_zero() {
             return Err(AuthProfileError::InvalidField {
@@ -42,7 +62,7 @@ impl HttpOAuthRefreshAdapter {
 impl Default for HttpOAuthRefreshAdapter {
     fn default() -> Self {
         Self::with_timeout(Duration::from_secs(DEFAULT_REFRESH_TIMEOUT_SECS))
-            .expect("default oauth refresh adapter should initialize")
+            .expect("DEFAULT_REFRESH_TIMEOUT_SECS is non-zero, so construction cannot fail")
     }
 }
 
@@ -51,7 +71,12 @@ impl OAuthRefreshAdapter for HttpOAuthRefreshAdapter {
         &self,
         request: &OAuthRefreshRequest,
     ) -> Result<OAuthRefreshResponse, OAuthRefreshError> {
+        // Re-validate at request time even though the registry validated at write time:
+        // DNS may have been re-pointed at a private address since registration.
         let token_endpoint = validate_runtime_token_endpoint(request.token_endpoint.as_str())?;
+        // Redirects are refused so credentials in the POST body cannot be replayed to an
+        // attacker-chosen Location; the proxy bypass keeps token traffic off egress
+        // proxies that this crate cannot vet.
         let client = Client::builder()
             .timeout(self.timeout)
             .redirect(reqwest::redirect::Policy::none())
@@ -104,6 +129,8 @@ impl OAuthRefreshAdapter for HttpOAuthRefreshAdapter {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned);
+        // Some providers ship the non-standard `expired_in` spelling; accept it as an
+        // alias rather than treating their tokens as never-expiring.
         let expires_in_seconds = parse_oauth_expires_in(&parsed, "expires_in")
             .or_else(|| parse_oauth_expires_in(&parsed, "expired_in"));
 
@@ -111,6 +138,7 @@ impl OAuthRefreshAdapter for HttpOAuthRefreshAdapter {
     }
 }
 
+/// Reads an expiry field that providers send as either a JSON number or a numeric string.
 fn parse_oauth_expires_in(parsed: &Value, field: &str) -> Option<u64> {
     match parsed.get(field) {
         Some(Value::Number(value)) => value.as_u64(),
@@ -119,43 +147,53 @@ fn parse_oauth_expires_in(parsed: &Value, field: &str) -> Option<u64> {
     }
 }
 
+/// How a refresh attempt for one profile concluded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OAuthRefreshOutcomeKind {
+    /// Profile uses api-key credentials; there is nothing to refresh.
     SkippedNotOauth,
+    /// Token is not within the refresh window yet.
     SkippedNotDue,
+    /// A failure cooldown is still active for this profile.
     SkippedCooldown,
     Succeeded,
     Failed,
 }
 
 impl OAuthRefreshOutcomeKind {
+    /// Returns whether a refresh request was actually sent (succeeded or failed).
     #[must_use]
     pub const fn attempted(self) -> bool {
         matches!(self, Self::Succeeded | Self::Failed)
     }
 
+    /// Returns whether the refresh attempt succeeded.
     #[must_use]
     pub const fn success(self) -> bool {
         matches!(self, Self::Succeeded)
     }
 }
 
+/// Result of one refresh attempt, with a sanitized human-readable reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OAuthRefreshOutcome {
     pub profile_id: String,
     pub provider: String,
     pub kind: OAuthRefreshOutcomeKind,
+    /// Sanitized explanation; never contains provider response text or secrets.
     pub reason: String,
     pub next_allowed_refresh_unix_ms: Option<i64>,
     pub expires_at_unix_ms: Option<i64>,
 }
 
+/// Exponential-backoff bounds applied to refresh failures for one provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderBackoffPolicy {
     pub base_backoff_ms: u64,
     pub max_backoff_ms: u64,
 }
 
+/// Returns the per-provider backoff bounds for refresh failures.
 pub fn provider_backoff_policy(provider: &AuthProvider) -> ProviderBackoffPolicy {
     match provider.kind {
         AuthProviderKind::Openai => {
@@ -174,16 +212,26 @@ pub fn provider_backoff_policy(provider: &AuthProvider) -> ProviderBackoffPolicy
     }
 }
 
+/// Computes the cooldown after `failure_count` consecutive refresh failures: base
+/// backoff doubled per failure, capped at the provider's maximum.
 pub fn compute_backoff_ms(provider: &AuthProvider, failure_count: u32) -> u64 {
     let policy = provider_backoff_policy(provider);
     if failure_count == 0 {
         return policy.base_backoff_ms;
     }
+    // Cap the exponent so the shift itself cannot overflow; saturating_mul plus the
+    // max_backoff_ms clamp bound the result regardless.
     let shift = failure_count.saturating_sub(1).min(20);
     let factor = 1_u64 << shift;
     policy.base_backoff_ms.saturating_mul(factor).min(policy.max_backoff_ms)
 }
 
+/// Copy of the OAuth fields needed for one refresh, taken under the registry lock so the
+/// network call can run without holding it.
+///
+/// `observed_updated_at_unix_ms` records the profile's `updated_at` at snapshot time;
+/// `persist_refresh_failure` compares it against the live value so a stale failure from a
+/// lost race cannot overwrite a concurrent successful refresh.
 #[derive(Debug, Clone)]
 pub(crate) struct OAuthRefreshSnapshot {
     pub(crate) profile_id: String,
@@ -199,11 +247,13 @@ pub(crate) struct OAuthRefreshSnapshot {
     pub(crate) observed_updated_at_unix_ms: i64,
 }
 
+/// Either a snapshot ready for the network call, or an early skip outcome.
 pub(crate) enum PreparedOAuthRefresh {
     Snapshot(OAuthRefreshSnapshot),
     Outcome(OAuthRefreshOutcome),
 }
 
+/// Decides whether a profile may be refreshed now and snapshots it if so.
 pub(crate) fn prepare_oauth_refresh_snapshot(
     profile: &AuthProfileRecord,
     now_unix_ms: i64,
@@ -256,6 +306,10 @@ pub(crate) fn prepare_oauth_refresh_snapshot(
     })
 }
 
+/// Maps a refresh error to a category string safe to persist and display.
+///
+/// `Transport` and `InvalidResponse` payloads can quote provider response bodies, which
+/// may embed token material — only the category (plus the bare HTTP status) survives.
 pub(crate) fn sanitize_refresh_error(error: &OAuthRefreshError) -> String {
     match error {
         OAuthRefreshError::Transport(_) => "oauth refresh transport failure".to_owned(),
@@ -266,6 +320,7 @@ pub(crate) fn sanitize_refresh_error(error: &OAuthRefreshError) -> String {
     }
 }
 
+/// Stores a UTF-8 secret value under a `scope/key` vault reference.
 pub(crate) fn persist_secret_utf8(
     vault: &Vault,
     vault_ref: &str,
@@ -276,6 +331,10 @@ pub(crate) fn persist_secret_utf8(
     Ok(())
 }
 
+/// Loads a secret by vault reference, requiring valid UTF-8 and non-blank content.
+///
+/// Blank values are reported as `NotFound` so callers treat an empty placeholder
+/// exactly like an absent credential (e.g. trigger a refresh instead of using it).
 pub(crate) fn load_secret_utf8(vault: &Vault, vault_ref: &str) -> Result<String, VaultError> {
     let parsed = VaultRef::parse(vault_ref)?;
     let raw = vault.get_secret(&parsed.scope, parsed.key.as_str())?;
@@ -287,6 +346,9 @@ pub(crate) fn load_secret_utf8(vault: &Vault, vault_ref: &str) -> Result<String,
     Ok(decoded)
 }
 
+/// Returns whether an OAuth profile is due for refresh: always when either token secret
+/// is missing from the vault, otherwise only when a known expiry falls inside the
+/// refresh window (an unknown expiry is never proactively refreshed).
 pub(crate) fn should_attempt_oauth_refresh(
     profile: &AuthProfileRecord,
     vault: &Vault,
@@ -316,6 +378,7 @@ pub(crate) fn should_attempt_oauth_refresh(
     *expires_at_unix_ms <= now_unix_ms.saturating_add(refresh_window_ms)
 }
 
+/// Returns the OAuth access-token expiry, or `None` for api-key profiles.
 pub(crate) fn oauth_expires_at(profile: &AuthProfileRecord) -> Option<i64> {
     let AuthCredential::Oauth { expires_at_unix_ms, .. } = &profile.credential else {
         return None;
@@ -323,6 +386,7 @@ pub(crate) fn oauth_expires_at(profile: &AuthProfileRecord) -> Option<i64> {
     *expires_at_unix_ms
 }
 
+/// Classifies a profile's credential health from vault presence and token expiry.
 pub(crate) fn evaluate_profile_health(
     profile: &AuthProfileRecord,
     vault: &Vault,
@@ -445,6 +509,8 @@ pub(crate) fn evaluate_profile_health(
     }
 }
 
+/// Returns whether a vault reference resolves to a non-empty secret; any vault error
+/// counts as "missing" because health checks must not fail on unreadable backends.
 fn vault_secret_exists(vault: &Vault, vault_ref: &str) -> bool {
     let parsed = match VaultRef::parse(vault_ref) {
         Ok(value) => value,
@@ -456,6 +522,7 @@ fn vault_secret_exists(vault: &Vault, vault_ref: &str) -> bool {
     }
 }
 
+/// Adds one profile's health result to the expiry histogram.
 pub(crate) fn update_expiry_distribution(
     distribution: &mut AuthExpiryDistribution,
     state: AuthProfileHealthState,
