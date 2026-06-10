@@ -68,4 +68,6 @@ TechStack_Architecture.md
 /code-review/
 /current-docs/
 AGENTS.md
+CLAUDE.md
 .agents/
+.claude/
