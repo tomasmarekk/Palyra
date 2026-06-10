@@ -1,3 +1,9 @@
+//! Filesystem hardening and path-boundary helpers for vault storage.
+//!
+//! Enforces owner-only permissions (POSIX modes on Unix, owner-SID ACLs on Windows) and rejects
+//! parent-traversal/boundary-escaping paths before any vault file is touched. Every on-disk
+//! artifact the crate creates goes through these helpers.
+
 #[cfg(windows)]
 use palyra_common::windows_security;
 #[cfg(windows)]
@@ -17,6 +23,10 @@ static WINDOWS_CURRENT_USER_SID: OnceLock<String> = OnceLock::new();
 #[cfg(windows)]
 static HARDENED_WINDOWS_PATHS: OnceLock<Mutex<HashSet<(PathBuf, bool)>>> = OnceLock::new();
 
+/// Derives the default vault root from the identity store root.
+///
+/// The identity store conventionally lives at `<state_root>/identity`; in that layout the vault
+/// becomes a sibling `<state_root>/vault` rather than nesting secrets under identity state.
 pub(crate) fn default_vault_root(identity_store_root: &Path) -> PathBuf {
     if identity_store_root.file_name().is_some_and(|name| name == "identity") {
         if let Some(parent) = identity_store_root.parent() {
@@ -26,6 +36,7 @@ pub(crate) fn default_vault_root(identity_store_root: &Path) -> PathBuf {
     identity_store_root.join("vault")
 }
 
+/// Absolutizes and component-normalizes a caller-supplied vault root before it is created.
 pub(crate) fn normalize_vault_root_path(raw: PathBuf) -> Result<PathBuf, VaultError> {
     if raw.as_os_str().is_empty() {
         return Err(VaultError::InvalidKey("vault root path cannot be empty".to_owned()));
@@ -41,6 +52,7 @@ pub(crate) fn normalize_vault_root_path(raw: PathBuf) -> Result<PathBuf, VaultEr
     normalize_path_components(normalized.as_path(), "vault root path")
 }
 
+/// Canonicalizes `path` (resolving symlinks) and verifies it is an existing directory.
 pub(crate) fn canonicalize_existing_dir(
     path: &Path,
     label: &'static str,
@@ -54,6 +66,7 @@ pub(crate) fn canonicalize_existing_dir(
     Ok(canonical)
 }
 
+/// Rejects paths containing `..` components (see [`normalize_path_components`]).
 pub(crate) fn validate_no_parent_components(
     path: &Path,
     label: &'static str,
@@ -61,6 +74,10 @@ pub(crate) fn validate_no_parent_components(
     normalize_path_components(path, label).map(|_| ())
 }
 
+/// Rebuilds `path` without `.` components, rejecting any `..` outright.
+///
+/// `..` is rejected rather than resolved because lexically collapsing it ignores symlinks and
+/// would let crafted inputs sidestep the [`ensure_path_within_root`] boundary check.
 fn normalize_path_components(path: &Path, label: &'static str) -> Result<PathBuf, VaultError> {
     if path.as_os_str().is_empty() {
         return Err(VaultError::Io(format!("{label} cannot be empty")));
@@ -86,6 +103,10 @@ fn normalize_path_components(path: &Path, label: &'static str) -> Result<PathBuf
     Ok(normalized)
 }
 
+/// Verifies `path` stays inside `root` after both are checked for traversal components.
+///
+/// The check is lexical (`starts_with`), so callers must pass pre-canonicalized paths for it to
+/// also defeat symlink escapes — vault call sites canonicalize the root first.
 pub(crate) fn ensure_path_within_root(
     root: &Path,
     path: &Path,
@@ -99,6 +120,14 @@ pub(crate) fn ensure_path_within_root(
     Ok(())
 }
 
+/// Creates `path` (and parents) if needed and restricts it to the current user.
+///
+/// Applies mode `0o700` on Unix and an owner-SID-only ACL on Windows (the Windows ACL pass is
+/// cached per process; see `harden_windows_path_permissions`).
+///
+/// # Errors
+/// Returns [`VaultError::Io`] when the path contains traversal components or creation,
+/// canonicalization, or permission enforcement fails.
 pub fn ensure_owner_only_dir(path: &Path) -> Result<(), VaultError> {
     let normalized = normalize_path_components(path, "owner-only directory path")?;
     fs::create_dir_all(normalized.as_path()).map_err(|error| {
@@ -125,6 +154,12 @@ pub fn ensure_owner_only_dir(path: &Path) -> Result<(), VaultError> {
     Ok(())
 }
 
+/// Restricts an existing file to the current user (mode `0o600` on Unix, owner-SID ACL on
+/// Windows).
+///
+/// # Errors
+/// Returns [`VaultError::Io`] when the path contains traversal components, does not point at an
+/// existing regular file, or permission enforcement fails.
 pub fn ensure_owner_only_file(path: &Path) -> Result<(), VaultError> {
     validate_no_parent_components(path, "owner-only file path")?;
     let canonical = fs::canonicalize(path).map_err(|error| {
@@ -159,12 +194,14 @@ pub fn ensure_owner_only_file(path: &Path) -> Result<(), VaultError> {
     Ok(())
 }
 
+/// Returns the current user's SID, cached for the process lifetime (it cannot change mid-run).
 #[cfg(windows)]
 pub(crate) fn current_user_sid() -> Result<String, VaultError> {
     if let Some(value) = WINDOWS_CURRENT_USER_SID.get() {
         return Ok(value.clone());
     }
     let resolved = current_user_sid_uncached()?;
+    // A racing `set` just means another thread resolved the same SID first; ignore the result.
     let _ = WINDOWS_CURRENT_USER_SID.set(resolved.clone());
     Ok(resolved)
 }
@@ -176,6 +213,11 @@ fn current_user_sid_uncached() -> Result<String, VaultError> {
     })
 }
 
+/// Extracts the SID column from `whoami /user /fo csv` output (quoted, comma-separated).
+///
+/// Retained as the parsing reference for the `whoami` fallback path exercised by tests; only
+/// test code calls it, hence the `dead_code` allow (an `expect` would warn in test builds where
+/// the lint does not fire).
 #[cfg(windows)]
 #[allow(dead_code)]
 pub(crate) fn parse_whoami_sid_csv(raw: &str) -> Option<String> {
@@ -204,6 +246,11 @@ pub(crate) fn parse_whoami_sid_csv(raw: &str) -> Option<String> {
     }
 }
 
+/// Applies an owner-SID-only ACL to `path`, deduplicated per process.
+///
+/// Vault operations re-touch the same few paths constantly, so paths already hardened by this
+/// process are cached and the Win32 DACL rewrite is skipped on later calls. Trade-off:
+/// permissions loosened out-of-band are not re-hardened until the process restarts.
 #[cfg(windows)]
 pub(crate) fn harden_windows_path_permissions(
     path: &Path,

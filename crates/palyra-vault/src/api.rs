@@ -1,3 +1,8 @@
+//! Public vault API: open a device-bound vault and put/get/list/delete scoped secrets.
+//!
+//! Coordinates the blob backend, envelope crypto, and the metadata index under a single
+//! file-based metadata lock, with blob/metadata rollback so the two stores never diverge.
+
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -14,46 +19,78 @@ use crate::{
 
 const DEFAULT_MAX_SECRET_BYTES: usize = 64 * 1024;
 
+/// Failure modes surfaced by vault operations.
+///
+/// Display strings are user-visible and pinned by downstream fixtures; messages never contain
+/// secret material.
 #[derive(Debug, thiserror::Error)]
 pub enum VaultError {
+    /// No secret exists for the requested scope/key (or backend object).
     #[error("secret not found")]
     NotFound,
+    /// A scope string failed parsing or segment validation.
     #[error("invalid scope: {0}")]
     InvalidScope(String),
+    /// A secret key (or vault reference) failed validation.
     #[error("invalid secret key: {0}")]
     InvalidKey(String),
+    /// A backend object id is not in canonical `obj_<hex>` form.
     #[error("invalid object id: {0}")]
     InvalidObjectId(String),
+    /// A secret value exceeds the configured size limit.
     #[error("secret value exceeds max bytes ({actual} > {max})")]
-    ValueTooLarge { actual: usize, max: usize },
+    ValueTooLarge {
+        /// Size of the rejected value in bytes.
+        actual: usize,
+        /// Configured maximum in bytes.
+        max: usize,
+    },
+    /// The pinned or requested blob backend cannot be used on this system.
     #[error("vault backend unavailable: {0}")]
     BackendUnavailable(String),
+    /// Key derivation, sealing, or envelope authentication/decryption failed.
     #[error("vault crypto failure: {0}")]
     Crypto(String),
+    /// Filesystem, locking, process, or serialization I/O failed.
     #[error("vault I/O failure: {0}")]
     Io(String),
 }
 
+/// Redacted descriptor of a stored secret: identity, timestamps, and size — never the value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretMetadata {
+    /// Scope the secret belongs to.
     pub scope: VaultScope,
+    /// Secret key within the scope.
     pub key: String,
+    /// Creation time in unix milliseconds.
     pub created_at_unix_ms: i64,
+    /// Last-update time in unix milliseconds.
     pub updated_at_unix_ms: i64,
+    /// Plaintext size of the stored value in bytes.
     pub value_bytes: usize,
 }
 
+/// Parsed `<scope>/<key>` reference addressing a single vault secret.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VaultRef {
+    /// Scope the reference addresses.
     pub scope: VaultScope,
+    /// Validated secret key within the scope.
     pub key: String,
 }
 
+/// Configuration for [`Vault::open_with_config`].
 #[derive(Debug, Clone)]
 pub struct VaultConfig {
+    /// Vault root directory; `None` falls back to `PALYRA_VAULT_DIR`, then the default location
+    /// next to the identity store.
     pub root: Option<PathBuf>,
+    /// Identity store root used for KEK derivation; `None` uses the platform default.
     pub identity_store_root: Option<PathBuf>,
+    /// Backend selection strategy (OS-native first or encrypted file only).
     pub backend_preference: BackendPreference,
+    /// Maximum plaintext size accepted by [`Vault::put_secret`]; must be greater than zero.
     pub max_secret_bytes: usize,
 }
 
@@ -68,18 +105,40 @@ impl Default for VaultConfig {
     }
 }
 
+/// Handle to an opened vault: a blob backend plus a metadata index, keyed by a device-bound KEK.
+///
+/// All mutating operations serialize on a per-vault file lock, so concurrent processes sharing
+/// one vault root cannot corrupt the metadata index.
 pub struct Vault {
     pub(crate) root: PathBuf,
     pub(crate) backend: Box<dyn BlobBackend>,
     pub(crate) max_secret_bytes: usize,
+    // AIDEV-NOTE: the KEK is held in plain memory for the vault's lifetime and is not zeroized
+    // on drop; wrapping it (e.g. zeroize/secrecy) needs a dependency decision. See the related
+    // note on SensitiveBytes in crypto.rs.
     pub(crate) kek: [u8; 32],
 }
 
 impl Vault {
+    /// Opens the vault using [`VaultConfig::default`].
+    ///
+    /// # Errors
+    /// Same failure modes as [`Vault::open_with_config`].
     pub fn open_default() -> Result<Self, VaultError> {
         Self::open_with_config(VaultConfig::default())
     }
 
+    /// Opens (creating if needed) the vault described by `config`.
+    ///
+    /// Resolves the root directory (explicit config, then `PALYRA_VAULT_DIR`, then the default
+    /// next to the identity store), enforces owner-only permissions on it, selects or re-attaches
+    /// the blob backend, and derives the device KEK from the identity store.
+    ///
+    /// # Errors
+    /// Returns [`VaultError::Io`] for path/permission/identity-store failures,
+    /// [`VaultError::BackendUnavailable`] when a previously pinned backend cannot be used,
+    /// [`VaultError::Crypto`] when KEK derivation fails, and [`VaultError::InvalidKey`] when
+    /// `max_secret_bytes` is zero.
     pub fn open_with_config(config: VaultConfig) -> Result<Self, VaultError> {
         let identity_store_root = if let Some(path) = config.identity_store_root {
             path
@@ -111,16 +170,27 @@ impl Vault {
         Ok(vault)
     }
 
+    /// Returns the kind of blob backend this vault is bound to.
     #[must_use]
     pub fn backend_kind(&self) -> BackendKind {
         self.backend.kind()
     }
 
+    /// Returns the canonicalized vault root directory.
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
     }
 
+    /// Stores or overwrites a secret value under `scope`/`key` and returns its metadata.
+    ///
+    /// The value is sealed with a fresh data-encryption key before it reaches the backend; the
+    /// backend only ever sees ciphertext (the OS keystore backends add their own layer on top).
+    ///
+    /// # Errors
+    /// Returns [`VaultError::InvalidKey`] for malformed keys, [`VaultError::ValueTooLarge`] when
+    /// the value exceeds the configured limit, and [`VaultError::Crypto`]/[`VaultError::Io`] for
+    /// sealing, backend, or metadata persistence failures (metadata failures roll the blob back).
     pub fn put_secret(
         &self,
         scope: &VaultScope,
@@ -146,6 +216,11 @@ impl Vault {
         let mut index = self.read_metadata()?;
         let existing_entry_index =
             index.entries.iter().position(|entry| entry.scope == *scope && entry.key == key);
+        // Captured before the overwrite so a failed metadata write below can restore the
+        // previous ciphertext instead of leaving blob and index out of sync.
+        // AIDEV-NOTE: if the index lists an entry whose blob is gone, this surfaces NotFound and
+        // the overwrite is rejected; recovering (treating NotFound as "no previous blob") would
+        // be a behavior change.
         let previous_blob = if existing_entry_index.is_some() {
             Some(self.backend.get_blob(object_id.as_str())?)
         } else {
@@ -189,6 +264,12 @@ impl Vault {
         Ok(entry.into())
     }
 
+    /// Decrypts and returns the plaintext secret stored under `scope`/`key`.
+    ///
+    /// # Errors
+    /// Returns [`VaultError::NotFound`] when no entry matches, [`VaultError::InvalidKey`] for
+    /// malformed keys, and [`VaultError::Crypto`]/[`VaultError::Io`] when the envelope cannot be
+    /// read or authenticated (including AAD scope/key mismatch and wrong device KEK).
     pub fn get_secret(&self, scope: &VaultScope, key: &str) -> Result<Vec<u8>, VaultError> {
         validate_secret_key(key)?;
         let _lock = self.acquire_metadata_lock()?;
@@ -208,6 +289,14 @@ impl Vault {
         open(&envelope, &self.kek, aad.as_slice())
     }
 
+    /// Deletes the secret under `scope`/`key`; returns `false` when no entry existed.
+    ///
+    /// Metadata is updated before the blob is removed; if the backend delete fails, the metadata
+    /// entry is restored so the secret stays addressable.
+    ///
+    /// # Errors
+    /// Returns [`VaultError::InvalidKey`] for malformed keys and [`VaultError::Io`] for metadata
+    /// or backend failures.
     pub fn delete_secret(&self, scope: &VaultScope, key: &str) -> Result<bool, VaultError> {
         validate_secret_key(key)?;
         let _lock = self.acquire_metadata_lock()?;
@@ -238,6 +327,10 @@ impl Vault {
         Ok(deleted)
     }
 
+    /// Lists metadata for the secrets in `scope`, sorted by key, without decrypting any values.
+    ///
+    /// # Errors
+    /// Returns [`VaultError::Io`] when the metadata index cannot be locked, read, or parsed.
     pub fn list_secrets(&self, scope: &VaultScope) -> Result<Vec<SecretMetadata>, VaultError> {
         let _lock = self.acquire_metadata_lock()?;
         let index = self.read_metadata()?;
@@ -255,7 +348,11 @@ impl Vault {
     /// Lists metadata for every local vault secret without reading or decrypting secret values.
     ///
     /// The returned records include scope, key, timestamps, and stored byte counts so callers can
-    /// build redacted inventory views without exposing secret material.
+    /// build redacted inventory views without exposing secret material. Results are sorted by
+    /// scope, then key.
+    ///
+    /// # Errors
+    /// Returns [`VaultError::Io`] when the metadata index cannot be locked, read, or parsed.
     pub fn list_all_secrets(&self) -> Result<Vec<SecretMetadata>, VaultError> {
         let _lock = self.acquire_metadata_lock()?;
         let index = self.read_metadata()?;
@@ -285,6 +382,13 @@ impl Vault {
 }
 
 impl VaultRef {
+    /// Parses a `<scope>/<key>` reference (for example `global/openai_api_key`).
+    ///
+    /// Only the first `/` separates scope from key; the key itself may not contain `/`.
+    ///
+    /// # Errors
+    /// Returns [`VaultError::InvalidKey`] when the separator is missing or the key is malformed,
+    /// and [`VaultError::InvalidScope`] when the scope segment does not parse.
     pub fn parse(raw: &str) -> Result<Self, VaultError> {
         let normalized = raw.trim();
         let (scope_raw, key_raw) = normalized.split_once('/').ok_or_else(|| {

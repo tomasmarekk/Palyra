@@ -1,3 +1,7 @@
+//! Crate-level vault tests: put/get/list/delete roundtrips, blob/metadata rollback on injected
+//! backend failures, metadata-lock staleness reclaim, owner-only permission enforcement, and
+//! KEK derivation stability across identity-state rewrites.
+
 use crate::{
     backend::{BackendKind, BackendPreference, BlobBackend},
     crypto::{derive_device_kek, derive_kek_from_seed_material, extract_kek_seed_material},
@@ -19,6 +23,7 @@ use std::{
 };
 use tempfile::tempdir;
 
+/// In-memory backend whose `delete_blob` always fails, to exercise delete rollback.
 #[derive(Default)]
 struct FailingDeleteBackend {
     objects: Mutex<HashMap<String, Vec<u8>>>,
@@ -51,6 +56,8 @@ impl BlobBackend for FailingDeleteBackend {
     }
 }
 
+/// In-memory backend whose `put_blob` sabotages the vault's next metadata write by replacing
+/// `metadata.json` with a directory, to exercise put rollback paths.
 struct MetadataWriteFailureBackend {
     root: PathBuf,
     objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,

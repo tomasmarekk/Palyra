@@ -1,3 +1,11 @@
+//! Scoped secret storage with envelope encryption and OS-native backends.
+//!
+//! [`Vault`] stores secrets per [`VaultScope`], sealed with a device-bound KEK derived from the
+//! `palyra-identity` CA key, in an OS keystore (Keychain, Secret Service, DPAPI) or an
+//! encrypted-file fallback. [`SecretResolver`] resolves `palyra-common` `SecretRef` sources
+//! (vault/env/file/exec) into exposure-controlled [`SensitiveBytes`]. Consumed by the daemon and
+//! CLI; error/message strings are pinned by downstream fixtures — keep them byte-identical.
+
 mod api;
 mod backend;
 mod crypto;

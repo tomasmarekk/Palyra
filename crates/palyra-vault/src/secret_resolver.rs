@@ -1,3 +1,9 @@
+//! Resolves `palyra-common` `SecretRef` sources (vault, env, file, exec) into secret bytes.
+//!
+//! Each resolution enforces the reference's policy — trusted-dir and symlink checks for files,
+//! env allowlisting and timeouts for exec — and yields [`SensitiveBytes`] plus redacted
+//! [`SecretResolutionMetadata`] that is safe to log and serialize.
+
 use std::{
     collections::BTreeSet,
     env, fs,
@@ -23,44 +29,74 @@ use crate::{
 const DEFAULT_EXEC_TIMEOUT_MS: u64 = 1_000;
 const EXEC_POLL_INTERVAL_MS: u64 = 10;
 
+/// Outcome of a resolution attempt; serde representation is pinned by telemetry contracts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SecretResolutionStatus {
+    /// A value was obtained and passed all policy checks.
     Resolved,
+    /// The source had no value; only an error when the reference is required.
     Missing,
+    /// Policy (trusted dirs, symlinks, missing vault runtime, ...) refused the resolution.
     Blocked,
+    /// The source existed but resolution failed (I/O, exec, decoding, size, timeout).
     Failed,
 }
 
+/// Classifies a [`SecretResolveError`] so callers can branch without parsing messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretResolveErrorKind {
+    /// A required secret had no value.
     Missing,
+    /// The reference itself failed validation or parsing.
     InvalidReference,
+    /// A policy check refused the resolution.
     PolicyBlocked,
+    /// Filesystem, vault, or process I/O failed.
     Io,
+    /// The resolved value exceeded the reference's byte limit.
     TooLarge,
+    /// The exec source did not finish within its timeout.
     Timeout,
+    /// The exec source exited unsuccessfully.
     ExecFailed,
+    /// The value could not be decoded as required (e.g. not valid UTF-8).
     DecodeFailed,
 }
 
+/// Redacted record of a resolution attempt — safe to log and serialize.
+///
+/// Carries the reference fingerprint and source description, never the secret value itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SecretResolutionMetadata {
+    /// Final status of the attempt.
     pub status: SecretResolutionStatus,
+    /// Stable fingerprint of the secret reference, for correlation across logs.
     pub fingerprint: String,
+    /// Source kind label (`vault`, `env`, `file`, `exec`).
     pub source_kind: String,
+    /// Whether the reference demands a value.
     pub required: bool,
+    /// Resolution wall-clock time in unix milliseconds.
     pub resolved_at_unix_ms: i64,
+    /// Size of the resolved value in bytes, when one was obtained.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value_bytes: Option<usize>,
+    /// Redacted description of the source configuration.
     pub source: SecretRefRedactedView,
 }
 
+/// A resolved secret: redacted metadata plus the value when one was obtained.
+///
+/// `value` is `None` for optional references whose source was empty or absent.
 pub struct SecretResolution {
+    /// Redacted resolution record.
     pub metadata: SecretResolutionMetadata,
+    /// The secret bytes; absent for optional-and-missing references.
     pub value: Option<SensitiveBytes>,
 }
 
+// Manual impl: only reports whether a value is present, keeping secret bytes out of Debug.
 impl std::fmt::Debug for SecretResolution {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SecretResolution")
@@ -71,6 +107,10 @@ impl std::fmt::Debug for SecretResolution {
 }
 
 impl SecretResolution {
+    /// Consumes the resolution, returning the secret bytes.
+    ///
+    /// # Errors
+    /// Returns a [`SecretResolveErrorKind::Missing`] error when no value is present.
     pub fn require_bytes(self) -> Result<SensitiveBytes, SecretResolveError> {
         let SecretResolution { metadata, value } = self;
         match value {
@@ -86,6 +126,15 @@ impl SecretResolution {
         }
     }
 
+    /// Consumes the resolution, returning the value as a non-empty UTF-8 string.
+    ///
+    /// `context` names the secret in error messages (e.g. `"discord token"`). The returned
+    /// `String` is a plain copy outside [`SensitiveBytes`] zeroization — only decode when the
+    /// consumer genuinely needs text.
+    ///
+    /// # Errors
+    /// Returns [`SecretResolveErrorKind::Missing`] when no value is present or it is
+    /// empty/whitespace, and [`SecretResolveErrorKind::DecodeFailed`] for invalid UTF-8.
     pub fn decode_utf8(self, context: &str) -> Result<String, SecretResolveError> {
         let SecretResolution { metadata, value } = self;
         let Some(value) = value else {
@@ -123,10 +172,16 @@ impl SecretResolution {
     }
 }
 
+/// Resolution failure with a machine-matchable kind and the redacted attempt metadata.
+///
+/// Messages describe the failure without ever embedding secret material.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretResolveError {
+    /// Machine-matchable failure category.
     pub kind: SecretResolveErrorKind,
+    /// Human-readable description; safe to log.
     pub message: String,
+    /// Redacted metadata for the failed attempt (boxed to keep the error small).
     pub metadata: Box<SecretResolutionMetadata>,
 }
 
@@ -138,6 +193,10 @@ impl std::fmt::Display for SecretResolveError {
 
 impl std::error::Error for SecretResolveError {}
 
+/// Resolves `SecretRef`s against an optional vault and a working directory.
+///
+/// The working directory anchors relative file paths, trusted directories, and exec working
+/// directories. Without a vault, vault-backed references resolve as policy-blocked.
 pub struct SecretResolver<'a> {
     vault: Option<&'a Vault>,
     working_dir: PathBuf,
@@ -145,6 +204,7 @@ pub struct SecretResolver<'a> {
 }
 
 impl<'a> SecretResolver<'a> {
+    /// Creates a resolver anchored at `working_dir`, optionally backed by `vault`.
     pub fn with_working_dir(vault: Option<&'a Vault>, working_dir: impl Into<PathBuf>) -> Self {
         Self {
             vault,
@@ -153,6 +213,15 @@ impl<'a> SecretResolver<'a> {
         }
     }
 
+    /// Validates `secret_ref` and resolves it according to its source and policy.
+    ///
+    /// An absent value is only an `Err` for required references; optional references yield
+    /// `Ok` with [`SecretResolutionStatus::Missing`] and no value.
+    ///
+    /// # Errors
+    /// Returns a [`SecretResolveError`] whose [`SecretResolveErrorKind`] distinguishes invalid
+    /// references, policy blocks, missing required values, size/timeout violations, and
+    /// I/O/exec/decode failures.
     pub fn resolve(&self, secret_ref: &SecretRef) -> Result<SecretResolution, SecretResolveError> {
         secret_ref.validate().map_err(|error| {
             self.invalid_reference(secret_ref, format!("invalid secret reference: {error}"))
@@ -271,6 +340,9 @@ impl<'a> SecretResolver<'a> {
                 "file-backed secret path escapes the configured trusted directories",
             ));
         }
+        // Checked in addition to canonicalization: a symlink whose target stays inside a
+        // trusted root passes the containment check above, so the component walk is what
+        // actually enforces the no-symlink policy.
         if !allow_symlinks
             && path_contains_symlink(path.as_path()).map_err(|error| {
                 self.io_error(
@@ -314,6 +386,9 @@ impl<'a> SecretResolver<'a> {
             ));
         }
 
+        // stdout is captured to an owner-only temp file instead of a pipe so the size limit can
+        // be enforced from file metadata before any bytes are loaded into memory, and so a
+        // wedged child cannot deadlock the resolver on a full pipe buffer.
         let (stdout_path, stdout) = create_temp_exec_output_file("stdout").map_err(|error| {
             self.io_error(
                 secret_ref,
@@ -337,6 +412,9 @@ impl<'a> SecretResolver<'a> {
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
             .env_clear();
+        // Deny-by-default environment: the child sees only platform-baseline variables plus the
+        // reference's explicit allowlist, so ambient credentials in the daemon's environment
+        // cannot leak into secret-producing commands.
         for variable in default_exec_inherited_env()
             .into_iter()
             .chain(inherited_env.iter().map(String::as_str))
@@ -354,6 +432,7 @@ impl<'a> SecretResolver<'a> {
                 format!("failed to spawn exec-backed secret command: {error}"),
             )
         })?;
+        // std::process has no wait-with-timeout, so poll try_wait and kill on deadline.
         let start = Instant::now();
         let status = loop {
             match child.try_wait() {
@@ -421,11 +500,14 @@ impl<'a> SecretResolver<'a> {
         self.resolved(secret_ref, stdout_bytes)
     }
 
+    /// Applies the byte limit and wraps a successfully obtained value.
     fn resolved(
         &self,
         secret_ref: &SecretRef,
         value: Vec<u8>,
     ) -> Result<SecretResolution, SecretResolveError> {
+        // A u64 limit above usize::MAX (32-bit targets) cannot be exceeded by an in-memory
+        // value, so saturating is exact here.
         let max_bytes = usize::try_from(secret_ref.effective_max_bytes()).unwrap_or(usize::MAX);
         if value.len() > max_bytes {
             return Err(self.failed(
@@ -444,6 +526,7 @@ impl<'a> SecretResolver<'a> {
         Ok(SecretResolution { metadata, value: Some(SensitiveBytes::new(value)) })
     }
 
+    /// Maps an absent value to `Err` for required references, `Ok(Missing)` otherwise.
     fn missing_or_error(
         &self,
         secret_ref: &SecretRef,
@@ -524,6 +607,7 @@ impl<'a> SecretResolver<'a> {
         }
     }
 
+    /// Anchors relative paths at the resolver's working directory.
     fn resolve_relative_path(&self, raw: &str) -> PathBuf {
         let path = PathBuf::from(raw.trim());
         if path.is_absolute() {
@@ -539,6 +623,7 @@ enum ReadLimitedFileError {
     TooLarge { actual_bytes: u64, max_bytes: u64 },
 }
 
+/// Reads a file fully, rejecting it from metadata size before allocating anything.
 fn read_limited_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, ReadLimitedFileError> {
     let metadata = fs::metadata(path).map_err(ReadLimitedFileError::Io)?;
     if metadata.len() > max_bytes {
@@ -552,6 +637,11 @@ fn cleanup_temp_exec_outputs(stdout_path: &Path, stderr_path: &Path) {
     let _ = fs::remove_file(stderr_path);
 }
 
+/// Creates a unique capture file for child output.
+///
+/// `create_new` defeats symlink/pre-creation races on the predictable temp path, and the
+/// `0o600` mode keeps captured secret output unreadable to other local users (Windows relies on
+/// per-user temp directory ACLs instead).
 fn create_temp_exec_output_file(label: &str) -> std::io::Result<(PathBuf, fs::File)> {
     let path = temp_output_path(label);
     let mut options = OpenOptions::new();
@@ -572,6 +662,8 @@ fn render_exit_status(status: ExitStatus) -> String {
     status.code().map(|value| value.to_string()).unwrap_or_else(|| "terminated".to_owned())
 }
 
+/// Walks every component of `path` with `symlink_metadata`, reporting whether any is a symlink
+/// (plain `metadata` would silently follow links and hide them).
 fn path_contains_symlink(path: &Path) -> std::io::Result<bool> {
     let absolute =
         if path.is_absolute() { path.to_path_buf() } else { env::current_dir()?.join(path) };
@@ -588,6 +680,8 @@ fn path_contains_symlink(path: &Path) -> std::io::Result<bool> {
     Ok(false)
 }
 
+/// Baseline environment variables every exec source inherits: just enough to locate binaries
+/// and temp space on the platform, nothing credential-bearing.
 fn default_exec_inherited_env() -> Vec<&'static str> {
     #[cfg(windows)]
     {

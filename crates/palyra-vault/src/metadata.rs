@@ -1,3 +1,9 @@
+//! Vault metadata index (`metadata.json`) and its cross-process file lock (`metadata.lock`).
+//!
+//! The index maps (scope, key) to backend object ids and timestamps and is shared across
+//! processes, so every access happens under the lock — a `create_new` file with a pid/timestamp
+//! marker, reclaimable when stale and its owner process is dead.
+
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -23,6 +29,7 @@ const METADATA_LOCK_TIMEOUT: Duration = Duration::from_secs(3);
 const METADATA_LOCK_RETRY: Duration = Duration::from_millis(20);
 const METADATA_LOCK_STALE_AGE: Duration = Duration::from_secs(30);
 
+/// On-disk shape of `metadata.json`; field names are serde-pinned format.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct MetadataFile {
     pub(crate) version: u32,
@@ -35,6 +42,7 @@ impl Default for MetadataFile {
     }
 }
 
+/// One indexed secret: scope/key identity, the backend object id, timestamps, and value size.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct MetadataEntry {
     pub(crate) scope: VaultScope,
@@ -45,16 +53,20 @@ pub(crate) struct MetadataEntry {
     pub(crate) value_bytes: usize,
 }
 
+/// Holds the metadata lock; dropping it deletes the lock file to release the lock.
 pub(crate) struct MetadataLockGuard {
     path: PathBuf,
 }
 
 impl Drop for MetadataLockGuard {
     fn drop(&mut self) {
+        // Failure to remove is tolerated: the stale-lock reclaim path cleans it up later, and
+        // panicking in Drop would abort during unwinding.
         let _ = fs::remove_file(&self.path);
     }
 }
 
+/// Parsed owner information from a lock file's `pid=... ts_ms=...` marker line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MetadataLockMarker {
     pid: u32,
@@ -64,6 +76,7 @@ pub(crate) fn metadata_path(root: &Path) -> PathBuf {
     root.join(METADATA_FILE)
 }
 
+/// Creates an empty metadata index under `root` if none exists yet.
 pub(crate) fn ensure_metadata_exists(root: &Path) -> Result<(), VaultError> {
     let _lock = acquire_metadata_lock(root)?;
     let metadata_path = metadata_path(root);
@@ -74,6 +87,11 @@ pub(crate) fn ensure_metadata_exists(root: &Path) -> Result<(), VaultError> {
     write_metadata(root, &MetadataFile::default())
 }
 
+/// Acquires the cross-process metadata lock for the vault at `root`.
+///
+/// `create_new` makes acquisition atomic: exactly one process can create the lock file. On
+/// contention the caller polls, reclaiming locks whose owner died, until
+/// `METADATA_LOCK_TIMEOUT` elapses.
 pub(crate) fn acquire_metadata_lock(root: &Path) -> Result<MetadataLockGuard, VaultError> {
     let lock_parent = canonicalize_existing_dir(root, "vault root directory")?;
     let lock_path = lock_parent.join(METADATA_LOCK_FILE);
@@ -91,6 +109,8 @@ pub(crate) fn acquire_metadata_lock(root: &Path) -> Result<MetadataLockGuard, Va
                 if maybe_reclaim_stale_lock(lock_path.as_path())? {
                     continue;
                 }
+                // `elapsed` errors when the wall clock moved backwards; treat that as timed out
+                // rather than extending the wait unboundedly.
                 if started.elapsed().unwrap_or(METADATA_LOCK_TIMEOUT) >= METADATA_LOCK_TIMEOUT {
                     return Err(VaultError::Io(format!(
                         "timed out waiting for metadata lock {}",
@@ -109,6 +129,7 @@ pub(crate) fn acquire_metadata_lock(root: &Path) -> Result<MetadataLockGuard, Va
     }
 }
 
+/// Reads and validates the metadata index; a missing file is an empty index, not an error.
 pub(crate) fn read_metadata(root: &Path) -> Result<MetadataFile, VaultError> {
     let root = canonicalize_existing_dir(root, "vault root directory")?;
     let path = root.join(METADATA_FILE);
@@ -132,6 +153,8 @@ pub(crate) fn read_metadata(root: &Path) -> Result<MetadataFile, VaultError> {
     Ok(parsed)
 }
 
+/// Persists the metadata index atomically (unique temp file + rename) with owner-only
+/// permissions, so readers never observe a torn index.
 pub(crate) fn write_metadata(root: &Path, metadata: &MetadataFile) -> Result<(), VaultError> {
     let root = canonicalize_existing_dir(root, "vault root directory")?;
     let path = root.join(METADATA_FILE);
@@ -167,6 +190,10 @@ fn initialize_metadata_lock_marker(
     })
 }
 
+/// Writes the owner marker into a freshly created lock file (writer injected for tests).
+///
+/// On write failure the lock file is removed so the failed acquisition does not stall other
+/// processes until the stale-age reclaim window (30s) expires.
 pub(crate) fn initialize_metadata_lock_marker_with_writer(
     lock_path: &Path,
     marker: &str,
@@ -186,6 +213,13 @@ fn maybe_reclaim_stale_lock(lock_path: &Path) -> Result<bool, VaultError> {
     maybe_reclaim_stale_lock_with_policy(lock_path, SystemTime::now(), METADATA_LOCK_STALE_AGE)
 }
 
+/// Removes the lock file when it is older than `stale_age` and its owner is gone; returns
+/// whether the caller may immediately retry acquisition.
+///
+/// Reclaim requires both conditions: age alone would steal the lock from a live-but-slow
+/// holder, and any liveness ambiguity (recycled pid, permission-denied probe) keeps the lock —
+/// failing safe toward an acquisition timeout rather than double-acquisition. Unparseable
+/// markers fall back to age-only reclaim.
 pub(crate) fn maybe_reclaim_stale_lock_with_policy(
     lock_path: &Path,
     now: SystemTime,
@@ -241,6 +275,8 @@ pub(crate) fn maybe_reclaim_stale_lock_with_policy(
     }
 }
 
+/// Parses a `pid=<u32> ts_ms=<u64>` marker; both fields must be present and well-formed so
+/// arbitrary file content cannot masquerade as a valid lock owner.
 fn parse_metadata_lock_marker(raw: &str) -> Option<MetadataLockMarker> {
     let mut pid = None;
     let mut ts_ms_seen = false;
@@ -259,17 +295,21 @@ fn parse_metadata_lock_marker(raw: &str) -> Option<MetadataLockMarker> {
     Some(MetadataLockMarker { pid: pid? })
 }
 
+/// Probes whether `pid` is still running; ambiguity reports "alive" so locks are never stolen.
 #[cfg(unix)]
 fn metadata_lock_owner_is_alive(pid: u32) -> bool {
     let Ok(pid_i32) = i32::try_from(pid) else {
         return true;
     };
+    // SAFETY: kill(2) with signal 0 delivers nothing — it only checks pid existence and
+    // permissions. No pointers or shared state are involved, so the call is sound for any pid.
     let result = unsafe { libc::kill(pid_i32, 0) };
     if result == 0 {
         return true;
     }
     match std::io::Error::last_os_error().raw_os_error() {
         Some(code) if code == libc::ESRCH => false,
+        // EPERM: the process exists but belongs to another user — still alive.
         Some(code) if code == libc::EPERM => true,
         _ => true,
     }
@@ -277,6 +317,10 @@ fn metadata_lock_owner_is_alive(pid: u32) -> bool {
 
 #[cfg(windows)]
 fn metadata_lock_owner_is_alive(pid: u32) -> bool {
+    // AIDEV-NOTE: `unwrap_or(false)` treats an errored probe as "dead", permitting reclaim of a
+    // stale-aged lock — the opposite bias of the Unix path, which treats ambiguity as "alive".
+    // (Access-denied and invalid-pid are already mapped to Ok inside `process_is_alive`; only
+    // unexpected probe failures hit this.) Aligning the bias would change reclaim behavior.
     palyra_common::windows_security::process_is_alive(pid).unwrap_or(false)
 }
 

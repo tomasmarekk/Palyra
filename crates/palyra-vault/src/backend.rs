@@ -1,3 +1,10 @@
+//! Blob storage backends for sealed envelopes: OS-native keystores (macOS Keychain, Linux
+//! Secret Service, Windows DPAPI) with an encrypted-file store as the portable fallback.
+//!
+//! The first successful selection is pinned in a `backend.kind` marker file so a vault never
+//! silently switches backends (which would strand previously stored blobs). Backends only ever
+//! see envelope ciphertext produced by `envelope.rs`.
+
 use std::{
     collections::BTreeMap,
     fs,
@@ -26,6 +33,7 @@ const BACKEND_MARKER_FILE: &str = "backend.kind";
 const OBJECTS_DIR: &str = "objects";
 const OBJECTS_STORE_FILE: &str = "objects.store.json";
 const MAX_OBJECTS_STORE_BYTES: u64 = 32 * 1024 * 1024;
+// serde_json renders Vec<u8> as a number array; the widest element is `255,` = 4 bytes.
 const JSON_U8_WORST_CASE_BYTES: u64 = 4;
 #[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE_NAME: &str = "palyra.vault.v1";
@@ -38,19 +46,28 @@ const SECRET_TOOL_KEY_ATTR: &str = "key";
 #[cfg(windows)]
 const WINDOWS_DPAPI_OBJECTS_DIR: &str = "objects_dpapi";
 
+/// Concrete blob backend a vault is bound to; persisted in the `backend.kind` marker file.
+///
+/// OS-specific variants only exist on their platform, so a vault directory moved across
+/// operating systems fails closed instead of decoding foreign blobs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendKind {
+    /// Portable JSON object store under the vault root, available everywhere.
     EncryptedFile,
+    /// macOS `security` keychain items.
     #[cfg(target_os = "macos")]
     MacosKeychain,
+    /// freedesktop Secret Service via `secret-tool`.
     #[cfg(target_os = "linux")]
     LinuxSecretService,
+    /// Per-user DPAPI-protected files under the vault root.
     #[cfg(windows)]
     WindowsDpapi,
 }
 
 impl BackendKind {
+    /// Returns the stable marker-file/serde identifier for this backend.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -64,6 +81,11 @@ impl BackendKind {
         }
     }
 
+    /// Parses a marker-file value back into a backend kind.
+    ///
+    /// # Errors
+    /// Returns [`VaultError::BackendUnavailable`] for unknown markers, including markers written
+    /// by another operating system's backend.
     pub fn parse(raw: &str) -> Result<Self, VaultError> {
         let normalized = raw.trim().to_ascii_lowercase();
         match normalized.as_str() {
@@ -81,19 +103,32 @@ impl BackendKind {
     }
 }
 
+/// Backend selection strategy used when a vault is created for the first time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendPreference {
+    /// Prefer the platform keystore, falling back to the encrypted-file store.
     Auto,
+    /// Always use the portable encrypted-file store.
     EncryptedFile,
 }
 
+/// Storage interface for sealed envelope blobs, keyed by normalized object id.
 pub(crate) trait BlobBackend: Send + Sync {
+    /// Identifies which concrete backend this is.
     fn kind(&self) -> BackendKind;
+    /// Stores or overwrites the blob for `object_id`.
     fn put_blob(&self, object_id: &str, payload: &[u8]) -> Result<(), VaultError>;
+    /// Loads the blob for `object_id`, or [`VaultError::NotFound`].
     fn get_blob(&self, object_id: &str) -> Result<Vec<u8>, VaultError>;
+    /// Removes the blob for `object_id`; missing blobs are not an error.
     fn delete_blob(&self, object_id: &str) -> Result<(), VaultError>;
 }
 
+/// Selects the backend for `root`, honoring an existing marker before `preference`.
+///
+/// The marker takes priority so a vault keeps the backend its blobs were written to even if the
+/// caller's preference (or keystore availability) changes later; the marker is written
+/// atomically via temp-file + rename.
 pub(crate) fn select_backend(
     root: &Path,
     preference: BackendPreference,
@@ -134,6 +169,7 @@ pub(crate) fn select_backend(
     Ok(backend)
 }
 
+/// Picks the best available backend: OS keystore first, encrypted file as the last resort.
 fn choose_auto_backend(root: &Path) -> Result<Box<dyn BlobBackend>, VaultError> {
     #[cfg(target_os = "macos")]
     {
@@ -159,6 +195,7 @@ fn choose_auto_backend(root: &Path) -> Result<Box<dyn BlobBackend>, VaultError> 
     backend_for_kind(BackendKind::EncryptedFile, root)
 }
 
+/// Instantiates a specific backend kind, failing closed when it is not currently available.
 fn backend_for_kind(kind: BackendKind, root: &Path) -> Result<Box<dyn BlobBackend>, VaultError> {
     match kind {
         BackendKind::EncryptedFile => Ok(Box::new(EncryptedFileBackend::new(root)?)),
@@ -192,12 +229,17 @@ fn backend_for_kind(kind: BackendKind, root: &Path) -> Result<Box<dyn BlobBacken
     }
 }
 
+/// Portable fallback backend: all blobs live in one size-capped JSON file under `objects/`.
+///
+/// The blobs are already envelope-encrypted, so this file adds availability, not secrecy; it is
+/// still owner-only and written atomically.
 #[derive(Debug, Clone)]
 struct EncryptedFileBackend {
     objects_root: PathBuf,
 }
 
 impl EncryptedFileBackend {
+    /// Opens the objects store, migrating any legacy one-file-per-object blobs into it.
     fn new(root: &Path) -> Result<Self, VaultError> {
         let objects_root = root.join(OBJECTS_DIR);
         ensure_owner_only_dir(&objects_root)?;
@@ -213,6 +255,8 @@ impl EncryptedFileBackend {
         if !store_path.exists() {
             Self::write_store_at_path(objects_root.as_path(), &legacy_store)?;
         } else if !legacy_store.is_empty() {
+            // Consolidated-store entries win over legacy per-object files: the store is the
+            // newer format, so a duplicate id means the legacy file is the stale copy.
             let mut merged_store = Self::read_store_at_path(objects_root.as_path())?;
             let mut changed = false;
             for (object_id, payload) in legacy_store {
@@ -329,8 +373,11 @@ impl EncryptedFileBackend {
         Ok(())
     }
 
+    /// Collects legacy one-file-per-object blobs, enforcing the consolidated-store size budget
+    /// up front so a directory of oversized files cannot balloon memory during migration.
     fn read_legacy_store(objects_root: &Path) -> Result<BTreeMap<String, Vec<u8>>, VaultError> {
         let mut legacy_store = BTreeMap::new();
+        // Starts at 2 for the serialized store's surrounding `{}`.
         let mut estimated_store_bytes = 2_u64;
         for entry in fs::read_dir(objects_root).map_err(|error| {
             VaultError::Io(format!(
@@ -361,9 +408,10 @@ impl EncryptedFileBackend {
             {
                 continue;
             }
-            let object_id = match normalize_storage_object_id(name) {
-                Ok(object_id) => object_id,
-                Err(_) => continue,
+            // Files that are not valid object ids are foreign artifacts; skip them rather than
+            // failing the whole migration.
+            let Ok(object_id) = normalize_storage_object_id(name) else {
+                continue;
             };
             let object_path = entry.path();
             ensure_path_within_root(
@@ -390,6 +438,8 @@ impl EncryptedFileBackend {
     }
 }
 
+/// Adds one legacy object's worst-case serialized size to the running migration budget,
+/// rejecting the migration before any read once it would exceed [`MAX_OBJECTS_STORE_BYTES`].
 fn checked_legacy_store_budget(
     current_estimated_bytes: u64,
     object_id: &str,
@@ -420,12 +470,16 @@ fn checked_legacy_store_budget(
     Ok(next_estimated)
 }
 
+/// Upper-bounds one `"<id>":[bytes...],` JSON entry: quoted key + colon, bracketed worst-case
+/// number array, trailing comma. `None` signals u64 overflow (treated as over budget).
 fn estimate_legacy_object_json_bytes(object_id: &str, payload_len: u64) -> Option<u64> {
     let key_budget = object_id.len() as u64 + 3;
     let value_budget = payload_len.checked_mul(JSON_U8_WORST_CASE_BYTES)?.checked_add(2)?;
     key_budget.checked_add(value_budget)?.checked_add(1)
 }
 
+/// Reads a legacy object file, failing if it grew past its inspected size mid-read (TOCTOU
+/// guard: the size was budget-checked from metadata before this call).
 fn read_legacy_object_limited(path: &Path, max_bytes: u64) -> Result<Vec<u8>, VaultError> {
     let file = fs::File::open(path).map_err(|error| {
         VaultError::Io(format!(
@@ -489,6 +543,11 @@ impl BlobBackend for EncryptedFileBackend {
     }
 }
 
+/// Stores blobs as generic passwords in the user keychain via the `security` CLI.
+///
+/// Payloads are base64-wrapped because keychain passwords are strings, and they are piped via
+/// stdin (trailing bare `-w`) so secret bytes never appear in argv, where any local process
+/// could read them from the process table.
 #[cfg(target_os = "macos")]
 #[derive(Debug, Default, Clone)]
 struct MacosKeychainBackend;
@@ -508,6 +567,8 @@ impl MacosKeychainBackend {
     }
 }
 
+/// Builds `security add-generic-password` argv; the trailing bare `-w` makes `security` read
+/// the password from stdin (pinned by `keychain_add_args_keep_password_out_of_argv`).
 #[cfg(target_os = "macos")]
 fn keychain_add_args<'a>(object_id: &'a str) -> [&'a str; 7] {
     ["add-generic-password", "-U", "-a", object_id, "-s", KEYCHAIN_SERVICE_NAME, "-w"]
@@ -622,6 +683,10 @@ mod macos_tests {
     }
 }
 
+/// Stores blobs in the freedesktop Secret Service via `secret-tool`.
+///
+/// Payloads are base64-wrapped (binary-safe transport through a text CLI) and piped via stdin
+/// so secret bytes never appear in argv.
 #[cfg(target_os = "linux")]
 #[derive(Debug, Default, Clone)]
 struct LinuxSecretServiceBackend;
@@ -641,6 +706,11 @@ impl LinuxSecretServiceBackend {
     }
 }
 
+/// Heuristically detects "item does not exist" stderr output.
+///
+/// `secret-tool` exits non-zero for both missing items and real failures, and its phrasing
+/// varies across versions/locales, so several known phrases are matched (pinned by the tests
+/// below); anything unrecognized is treated as a real error.
 #[cfg(target_os = "linux")]
 fn secret_tool_stderr_is_not_found(stderr: &[u8]) -> bool {
     let normalized = String::from_utf8_lossy(stderr).to_ascii_lowercase();
@@ -772,6 +842,10 @@ mod linux_tests {
     }
 }
 
+/// Stores blobs as per-user DPAPI-protected files under `objects_dpapi/`.
+///
+/// DPAPI binds the ciphertext to the Windows user account, so copying the files to another
+/// user or machine cannot recover them.
 #[cfg(windows)]
 #[derive(Debug, Clone)]
 struct WindowsDpapiBackend {
@@ -786,10 +860,13 @@ impl WindowsDpapiBackend {
         Ok(Self { objects_root })
     }
 
+    // DPAPI ships with every supported Windows version, so availability is unconditional.
     fn is_available() -> bool {
         true
     }
 
+    /// Maps an object id to its file path, re-validating the charset so an id can never carry
+    /// path separators into the join.
     fn object_path(&self, object_id: &str) -> Result<PathBuf, VaultError> {
         if object_id.is_empty()
             || !object_id
