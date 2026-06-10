@@ -1,3 +1,10 @@
+//! Replays the shared critical-attack corpus against the safety boundary.
+//!
+//! The corpus lives in `fixtures/security/critical_attack_scenarios.json` and
+//! is also exercised by CI's attack-scenario gate; expected actions, finding
+//! codes, and transform/redaction outcomes are pinned there — update the
+//! fixture and this crate together, never one side alone.
+
 use std::{fs, path::PathBuf};
 
 use palyra_safety::{
