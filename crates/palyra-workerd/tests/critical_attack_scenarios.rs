@@ -1,3 +1,9 @@
+//! Replays the shared critical-attack corpus against worker attestation checks.
+//!
+//! Scenarios load from `fixtures/security/critical_attack_scenarios.json` (shared
+//! with the other security-gate suites); every entry must fail closed during
+//! registration with its expected attestation error.
+
 use std::{fs, path::PathBuf};
 
 use palyra_workerd::{

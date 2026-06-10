@@ -1,5 +1,13 @@
+//! Fail-closed worker fleet contracts: attestation, leases, lifecycle, and cleanup.
+//!
+//! [`WorkerFleetManager`] is the in-memory ledger the daemon drives: workers must
+//! present a valid [`WorkerAttestation`] to register, every lease is bounded by
+//! [`WorkerFleetPolicy`], and quarantined or orphaned workers stay unassignable
+//! until they re-register with a fresh attestation.
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+/// Canonical worker lifecycle states, re-exported from `palyra-common` runtime contracts.
 pub use palyra_common::runtime_contracts::WorkerLifecycleState;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -19,27 +27,44 @@ fn default_worker_wit_abi_version() -> String {
     DEFAULT_WORKER_WIT_ABI_VERSION.to_owned()
 }
 
+/// Identity, integrity, and compatibility claims a worker presents to join the fleet.
+///
+/// Digest and version fields are checked against [`WorkerAttestationExpectation`] and
+/// [`WorkerFleetPolicy`] at registration and revalidated on heartbeat and assignment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerAttestation {
+    /// Fleet-unique worker identifier; must be non-blank and at most 128 bytes.
     pub worker_id: String,
     pub image_digest_sha256: String,
     pub build_digest_sha256: String,
     pub artifact_digest_sha256: String,
+    /// Whether the worker booted bound to an attested egress proxy (required by default).
     pub egress_proxy_attested: bool,
+    /// Capabilities the worker self-reports; granting one additionally requires policy trust.
     #[serde(default)]
     pub supported_capabilities: Vec<String>,
+    /// Digest of the capability authority the worker was provisioned with, when reported.
     #[serde(default)]
     pub capability_authority_sha256: Option<String>,
+    /// Worker SDK protocol version; payloads that omit it default to version 1.
     #[serde(default = "default_worker_sdk_protocol_version")]
     pub sdk_protocol_version: u32,
+    /// Worker WIT ABI identifier; payloads that omit it default to `palyra-worker-abi/v1`.
     #[serde(default = "default_worker_wit_abi_version")]
     pub wit_abi_version: String,
+    /// Last worker-reported heartbeat in unix ms; `0` (the serde default) means unreported.
     #[serde(default)]
     pub heartbeat_unix_ms: i64,
+    /// Start of the attestation validity window in unix ms.
     pub issued_at_unix_ms: i64,
+    /// End of the attestation validity window in unix ms; expired once `now >= expires_at`.
     pub expires_at_unix_ms: i64,
 }
 
+/// Verifier-side requirements a [`WorkerAttestation`] must satisfy.
+///
+/// `None` digest fields leave that digest unpinned. The default expectation requires
+/// an attested egress proxy, keeping the fail-closed baseline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerAttestationExpectation {
     pub require_egress_proxy: bool,
@@ -59,6 +84,7 @@ impl Default for WorkerAttestationExpectation {
     }
 }
 
+/// Reasons a [`WorkerAttestation`] fails validation.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum WorkerAttestationError {
     #[error("worker attestation missing worker identifier")]
@@ -74,6 +100,16 @@ pub enum WorkerAttestationError {
 }
 
 impl WorkerAttestation {
+    /// Validates this attestation against `expected` as of `now_unix_ms`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerAttestationError::MissingWorkerId`] for a blank or oversized
+    /// worker id, [`WorkerAttestationError::NotYetValid`] or
+    /// [`WorkerAttestationError::Expired`] outside the validity window,
+    /// [`WorkerAttestationError::MissingEgressProxyBinding`] when the expectation
+    /// requires an attested egress proxy, and
+    /// [`WorkerAttestationError::DigestMismatch`] when a pinned digest differs.
     pub fn validate(
         &self,
         expected: &WorkerAttestationExpectation,
@@ -116,6 +152,7 @@ impl WorkerAttestation {
     }
 }
 
+/// Filesystem scope a leased worker may operate in during a run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerWorkspaceScope {
     pub workspace_root: String,
@@ -124,6 +161,7 @@ pub struct WorkerWorkspaceScope {
     pub read_only: bool,
 }
 
+/// Digest-pinned artifact manifests and stream identifiers for a single run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerArtifactTransport {
     pub input_manifest_sha256: String,
@@ -132,6 +170,10 @@ pub struct WorkerArtifactTransport {
     pub scratch_directory_id: String,
 }
 
+/// Approval grant authorizing a single tool run.
+///
+/// At assignment the grant must be unexpired and its `run_id` must match the lease
+/// request's `run_id`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerRunGrant {
     pub grant_id: String,
@@ -140,6 +182,9 @@ pub struct WorkerRunGrant {
     pub expires_at_unix_ms: i64,
 }
 
+/// Parameters for leasing a worker to execute one run.
+///
+/// `ttl_ms` must be positive and at most [`WorkerFleetPolicy::max_ttl_ms`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerLeaseRequest {
     pub run_id: String,
@@ -151,6 +196,10 @@ pub struct WorkerLeaseRequest {
     pub grant: WorkerRunGrant,
 }
 
+/// An active lease binding one run to one attested worker.
+///
+/// `lease_id` is a generated ULID and `expires_at_unix_ms` is the assignment time
+/// plus the requested ttl.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerLease {
     pub lease_id: String,
@@ -163,6 +212,10 @@ pub struct WorkerLease {
     pub grant: WorkerRunGrant,
 }
 
+/// Post-run cleanup results reported for a worker.
+///
+/// Cleanup counts as verified only when all three removals succeeded and
+/// `failure_reason` is `None`; anything else drives the worker fail-closed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerCleanupReport {
     pub removed_workspace_scope: bool,
@@ -172,6 +225,9 @@ pub struct WorkerCleanupReport {
     pub failure_reason: Option<String>,
 }
 
+/// Audit record of a single worker lifecycle transition.
+///
+/// `reason_code` is a stable machine-readable code (for example `worker.registered`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerLifecycleEvent {
     pub worker_id: String,
@@ -181,6 +237,7 @@ pub struct WorkerLifecycleEvent {
     pub timestamp_unix_ms: i64,
 }
 
+/// Outcome of finalizing a run: the lifecycle event plus the cleanup verification verdict.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerCleanupOutcome {
     pub event: WorkerLifecycleEvent,
@@ -188,6 +245,10 @@ pub struct WorkerCleanupOutcome {
     pub cleanup_succeeded: bool,
 }
 
+/// Point-in-time aggregate counts over the fleet.
+///
+/// Counts are independent filters and may overlap: a failed worker is counted in both
+/// `degraded_workers` and `failed_closed_workers`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct WorkerFleetSnapshot {
     pub registered_workers: usize,
@@ -202,6 +263,10 @@ pub struct WorkerFleetSnapshot {
     pub failed_closed_workers: usize,
 }
 
+/// Operator policy bounding leases and gating attestation, compatibility, and trust.
+///
+/// The `required_*` fields disable their check when `None`. Capability trust is
+/// matched ASCII case-insensitively.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerFleetPolicy {
     pub max_ttl_ms: u64,
@@ -230,6 +295,7 @@ impl Default for WorkerFleetPolicy {
     }
 }
 
+/// Errors returned by [`WorkerFleetManager`] lifecycle operations.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum WorkerLifecycleError {
     #[error(transparent)]
@@ -266,6 +332,11 @@ struct WorkerRecord {
     last_heartbeat_unix_ms: i64,
 }
 
+/// In-memory fleet ledger enforcing fail-closed worker lifecycle transitions.
+///
+/// Every mutating operation revalidates attestation and policy compatibility before
+/// granting work, and emits a [`WorkerLifecycleEvent`] into a bounded recent-event
+/// buffer for audit surfaces. `Default` starts an empty fleet.
 #[derive(Debug, Default)]
 pub struct WorkerFleetManager {
     workers: BTreeMap<String, WorkerRecord>,
@@ -273,6 +344,7 @@ pub struct WorkerFleetManager {
 }
 
 impl WorkerFleetManager {
+    /// Returns aggregate fleet counts for the current in-memory state.
     #[must_use]
     pub fn snapshot(&self) -> WorkerFleetSnapshot {
         let registered_workers = self.workers.len();
@@ -355,11 +427,21 @@ impl WorkerFleetManager {
         }
     }
 
+    /// Returns retained lifecycle events, most recent first (capped at 64 entries).
     #[must_use]
     pub fn recent_events(&self) -> Vec<WorkerLifecycleEvent> {
         self.recent_events.iter().cloned().collect()
     }
 
+    /// Registers a new worker after validating its attestation and compatibility.
+    ///
+    /// A worker that did not report a heartbeat is seeded with `now_unix_ms`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerLifecycleError::Attestation`] or
+    /// [`WorkerLifecycleError::CompatibilityMismatch`] when validation fails, and
+    /// [`WorkerLifecycleError::AlreadyRegistered`] when the worker id is already known.
     pub fn register_worker(
         &mut self,
         attestation: WorkerAttestation,
@@ -372,6 +454,8 @@ impl WorkerFleetManager {
             return Err(WorkerLifecycleError::AlreadyRegistered(attestation.worker_id));
         }
         let worker_id = attestation.worker_id.clone();
+        // `0` is the serde default for payloads that omitted the heartbeat field; seed
+        // those with `now` so a fresh worker is not instantly considered stale.
         let last_heartbeat_unix_ms = if attestation.heartbeat_unix_ms > 0 {
             attestation.heartbeat_unix_ms
         } else {
@@ -397,6 +481,23 @@ impl WorkerFleetManager {
         Ok(event)
     }
 
+    /// Leases the named worker for `request` after full revalidation.
+    ///
+    /// Revalidates attestation, compatibility, lifecycle state, heartbeat freshness,
+    /// and capability trust before issuing the lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerLifecycleError::InvalidLeaseRequest`] or
+    /// [`WorkerLifecycleError::TtlExceeded`] for a malformed request,
+    /// [`WorkerLifecycleError::UnknownWorker`] for an unregistered id, and otherwise
+    /// the first failing worker gate: [`WorkerLifecycleError::Attestation`],
+    /// [`WorkerLifecycleError::CompatibilityMismatch`],
+    /// [`WorkerLifecycleError::LeaseAlreadyActive`],
+    /// [`WorkerLifecycleError::WorkerFailClosed`],
+    /// [`WorkerLifecycleError::WorkerDraining`],
+    /// [`WorkerLifecycleError::WorkerOffline`], or
+    /// [`WorkerLifecycleError::NoAvailableWorker`] when capabilities do not match.
     pub fn assign_work(
         &mut self,
         worker_id: &str,
@@ -414,6 +515,14 @@ impl WorkerFleetManager {
         Ok((lease, event))
     }
 
+    /// Leases the first worker (in ascending worker-id order) able to accept `request`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerLifecycleError::InvalidLeaseRequest`] or
+    /// [`WorkerLifecycleError::TtlExceeded`] for a malformed request, and
+    /// [`WorkerLifecycleError::NoAvailableWorker`] when no registered worker passes
+    /// the attestation, compatibility, state, heartbeat, and capability gates.
     pub fn assign_next_work(
         &mut self,
         request: WorkerLeaseRequest,
@@ -437,6 +546,13 @@ impl WorkerFleetManager {
         Ok((lease, event))
     }
 
+    /// Finalizes the worker's current run, requiring verified cleanup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerLifecycleError::UnknownWorker`] for an unregistered id and
+    /// [`WorkerLifecycleError::CleanupFailed`] when the cleanup report is unverified;
+    /// the worker is then left fail-closed.
     pub fn complete_work(
         &mut self,
         worker_id: &str,
@@ -451,6 +567,16 @@ impl WorkerFleetManager {
         }
     }
 
+    /// Finalizes the worker's current run, recording the cleanup outcome.
+    ///
+    /// Unlike [`Self::complete_work`] this does not treat unverified cleanup as an
+    /// error: the worker is driven fail-closed and the outcome is returned so callers
+    /// can journal it. Verified cleanup on an already fail-closed worker keeps the
+    /// fail-closed state and only records that cleanup was verified.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerLifecycleError::UnknownWorker`] for an unregistered id.
     pub fn finalize_work(
         &mut self,
         worker_id: &str,
@@ -467,6 +593,9 @@ impl WorkerFleetManager {
             && cleanup.removed_artifacts
             && cleanup.removed_logs;
         let event = if cleanup_succeeded {
+            // Verified cleanup must not lift a fail-closed (failed/orphaned) worker
+            // back into rotation: it stays unassignable until it re-registers with a
+            // fresh attestation.
             let requires_fresh_attestation =
                 worker_fail_closed_state_requires_fresh_attestation(worker.state)
                     && worker.lease.is_none();
@@ -500,6 +629,13 @@ impl WorkerFleetManager {
         Ok(WorkerCleanupOutcome { event, cleanup_report: cleanup, cleanup_succeeded })
     }
 
+    /// Quarantines the worker: revokes any lease and marks it `Failed`.
+    ///
+    /// Non-conforming reason codes fall back to `worker.quarantined_by_operator`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerLifecycleError::UnknownWorker`] for an unregistered id.
     pub fn quarantine_worker(
         &mut self,
         worker_id: &str,
@@ -527,6 +663,10 @@ impl WorkerFleetManager {
         Ok(event)
     }
 
+    /// Quarantines every worker, returning the emitted lifecycle events.
+    ///
+    /// Workers that are already `Failed` and hold no lease are skipped. Non-conforming
+    /// reason codes fall back to `worker.drained_by_operator`.
     pub fn quarantine_all_workers(
         &mut self,
         reason_code: &str,
@@ -555,6 +695,15 @@ impl WorkerFleetManager {
         events
     }
 
+    /// Revalidates an idle worker's stored attestation and returns it to `Registered`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerLifecycleError::UnknownWorker`] for an unregistered id,
+    /// [`WorkerLifecycleError::LeaseAlreadyActive`] while a lease is held,
+    /// [`WorkerLifecycleError::WorkerFailClosed`] for failed or orphaned workers
+    /// (those require fresh registration), and any attestation or compatibility
+    /// rejection.
     pub fn reverify_worker(
         &mut self,
         worker_id: &str,
@@ -586,6 +735,15 @@ impl WorkerFleetManager {
         Ok(event)
     }
 
+    /// Records a worker heartbeat after revalidating attestation and compatibility.
+    ///
+    /// Only an idle `Offline` worker recovers to `Registered`; fail-closed workers
+    /// keep their state even though the heartbeat is recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerLifecycleError::UnknownWorker`] for an unregistered id and any
+    /// attestation or compatibility rejection.
     pub fn heartbeat_worker(
         &mut self,
         worker_id: &str,
@@ -613,6 +771,13 @@ impl WorkerFleetManager {
         Ok(event)
     }
 
+    /// Marks the worker `Draining`: it keeps any current lease but accepts no new work.
+    ///
+    /// Non-conforming reason codes fall back to `worker.draining`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerLifecycleError::UnknownWorker`] for an unregistered id.
     pub fn drain_worker(
         &mut self,
         worker_id: &str,
@@ -635,6 +800,14 @@ impl WorkerFleetManager {
         Ok(event)
     }
 
+    /// Revokes any active lease and marks the worker `Orphaned` pending cleanup and
+    /// re-registration.
+    ///
+    /// Non-conforming reason codes fall back to `worker.lease_revoked`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerLifecycleError::UnknownWorker`] for an unregistered id.
     pub fn revoke_lease(
         &mut self,
         worker_id: &str,
@@ -659,6 +832,12 @@ impl WorkerFleetManager {
         Ok(event)
     }
 
+    /// Operator entry point for recording a cleanup report; alias of
+    /// [`Self::finalize_work`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerLifecycleError::UnknownWorker`] for an unregistered id.
     pub fn force_cleanup_worker(
         &mut self,
         worker_id: &str,
@@ -668,6 +847,7 @@ impl WorkerFleetManager {
         self.finalize_work(worker_id, cleanup, now_unix_ms)
     }
 
+    /// Orphans every worker whose lease ttl has elapsed, returning the emitted events.
     pub fn reap_expired_workers(&mut self, now_unix_ms: i64) -> Vec<WorkerLifecycleEvent> {
         let mut events = Vec::new();
         for (worker_id, worker) in &mut self.workers {
@@ -692,6 +872,10 @@ impl WorkerFleetManager {
         events
     }
 
+    /// Transitions workers with stale heartbeats, returning the emitted events.
+    ///
+    /// A stale worker holding a lease is orphaned (its lease is revoked); a stale idle
+    /// worker goes `Offline` and may recover via [`Self::heartbeat_worker`].
     pub fn mark_stale_heartbeat_workers(
         &mut self,
         policy: &WorkerFleetPolicy,
@@ -740,6 +924,11 @@ impl WorkerFleetManager {
     }
 }
 
+/// Sanitizes an operator-supplied reason code, substituting `fallback` when it is
+/// empty, longer than 128 bytes, or contains characters outside `[A-Za-z0-9._-]`.
+///
+/// Reason codes flow verbatim into audit events, so unconstrained operator input is
+/// replaced rather than escaped.
 fn normalize_operator_reason_code(raw: &str, fallback: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.len() > 128 {
@@ -752,6 +941,7 @@ fn normalize_operator_reason_code(raw: &str, fallback: &str) -> String {
     }
 }
 
+/// Rejects malformed lease requests before any worker state is touched.
 fn validate_lease_request(
     request: &WorkerLeaseRequest,
     policy: &WorkerFleetPolicy,
@@ -787,6 +977,7 @@ fn validate_lease_request(
     Ok(())
 }
 
+/// Checks the policy-required capability authority, SDK protocol, and WIT ABI pins.
 fn validate_worker_compatibility(
     attestation: &WorkerAttestation,
     policy: &WorkerFleetPolicy,
@@ -831,10 +1022,12 @@ fn worker_heartbeat_is_fresh(
         <= i64::try_from(policy.heartbeat_timeout_ms).unwrap_or(i64::MAX)
 }
 
+/// States that must never return to rotation without a fresh registration/attestation.
 fn worker_fail_closed_state_requires_fresh_attestation(state: WorkerLifecycleState) -> bool {
     matches!(state, WorkerLifecycleState::Failed | WorkerLifecycleState::Orphaned)
 }
 
+/// Issues a lease on `worker` after revalidating every fail-closed assignment gate.
 fn assign_worker_record(
     worker_id: &str,
     worker: &mut WorkerRecord,
@@ -864,26 +1057,30 @@ fn assign_worker_record(
         lease_id: Ulid::new().to_string(),
         worker_id: worker_id.to_owned(),
         run_id: request.run_id.clone(),
+        // AIDEV-NOTE: `ttl_ms as i64` can wrap only when `policy.max_ttl_ms` is
+        // configured above i64::MAX milliseconds; the wrapped (negative) ttl yields an
+        // already-expired lease that fails closed at the next reap, rather than
+        // granting unbounded time, so the cast is kept as-is.
         expires_at_unix_ms: now_unix_ms.saturating_add(request.ttl_ms as i64),
         required_capabilities: request.required_capabilities,
         workspace_scope: request.workspace_scope,
         artifact_transport: request.artifact_transport,
         grant: request.grant,
     };
+    let event = WorkerLifecycleEvent {
+        worker_id: worker_id.to_owned(),
+        state: WorkerLifecycleState::Assigned,
+        run_id: Some(lease.run_id.clone()),
+        reason_code: "worker.assigned".to_owned(),
+        timestamp_unix_ms: now_unix_ms,
+    };
     worker.state = WorkerLifecycleState::Assigned;
     worker.lease = Some(lease.clone());
-    Ok((
-        lease.clone(),
-        WorkerLifecycleEvent {
-            worker_id: worker_id.to_owned(),
-            state: WorkerLifecycleState::Assigned,
-            run_id: Some(lease.run_id.clone()),
-            reason_code: "worker.assigned".to_owned(),
-            timestamp_unix_ms: now_unix_ms,
-        },
-    ))
+    Ok((lease, event))
 }
 
+/// Read-only mirror of the gates enforced by `assign_worker_record`, used to pick an
+/// assignment candidate without mutating worker state.
 fn worker_record_can_accept(
     worker: &WorkerRecord,
     request: &WorkerLeaseRequest,
@@ -899,6 +1096,9 @@ fn worker_record_can_accept(
         && worker_supports_capabilities(worker, request.required_capabilities.as_slice(), policy)
 }
 
+/// A capability is grantable only when the policy trusts it *and* the worker
+/// self-reports it (both compared ASCII case-insensitively); neither side alone may
+/// widen access.
 fn worker_supports_capabilities(
     worker: &WorkerRecord,
     required_capabilities: &[String],
