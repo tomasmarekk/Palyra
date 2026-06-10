@@ -1,3 +1,9 @@
+//! Attack-corpus regression tests for egress private-target blocking.
+//!
+//! Replays the shared `fixtures/security/critical_attack_scenarios.json` corpus against
+//! `validate_resolved_addrs` to pin fail-closed behavior for private-address and
+//! DNS-rebinding resolutions; the corpus is also exercised by the security CI gate.
+
 use std::{fs, net::SocketAddr, path::PathBuf};
 
 use palyra_egress_proxy::{validate_resolved_addrs, EgressPolicyError};

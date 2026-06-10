@@ -1,3 +1,10 @@
+//! Outbound egress policy evaluation for proxied HTTP requests.
+//!
+//! [`EgressProxyPolicyService`] validates scheme, host allowlists, resolved addresses
+//! (blocking private/local targets, including mixed DNS-rebinding answers), and vault-only
+//! credential bindings before `palyra-daemon`'s HTTP fetch tool performs any network I/O.
+//! Every check fails closed: a request is sendable only when evaluation returns a verdict.
+
 use std::net::SocketAddr;
 
 use palyra_common::{
@@ -9,72 +16,126 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+/// Plan for injecting one vault-backed credential header into a proxied request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CredentialBindingPlan {
+    /// Header that will carry the secret; must be credential-shaped, otherwise evaluation
+    /// fails with [`EgressPolicyError::InvalidCredentialHeader`].
     pub header_name: String,
     /// Secret source to inject into the header. Egress policy only permits vault-backed refs.
     pub secret_ref: SecretRef,
+    /// Whether the proxied request must fail when the secret cannot be resolved.
     pub required: bool,
 }
 
+/// Borrowed view of an outbound request to evaluate against egress policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EgressProxyRequest<'a> {
+    /// HTTP method; policy-neutral but part of the request fingerprint.
     pub method: &'a str,
+    /// Absolute target URL; only `http` and `https` schemes pass evaluation.
     pub url: &'a str,
+    /// Operator opt-in permitting resolution to private/loopback/link-local addresses.
     pub allow_private_targets: bool,
+    /// Exact-match host allowlist; empty together with `allowed_dns_suffixes` means any host.
     pub allowed_hosts: &'a [String],
+    /// DNS-suffix allowlist (`example.com` also matches `api.example.com`).
     pub allowed_dns_suffixes: &'a [String],
+    /// Response body budget in bytes; must be greater than zero.
     pub max_response_bytes: usize,
+    /// Credential headers to inject; every binding must be vault-backed.
     pub credential_bindings: &'a [CredentialBindingPlan],
 }
 
+/// Outcome of a successful egress policy evaluation.
+///
+/// Only produced for allowed requests; every denial surfaces as an [`EgressPolicyError`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EgressPolicyVerdict {
+    /// Always `true` today, because denials are returned as errors instead of verdicts.
     pub allowed: bool,
+    /// Stable machine-readable reason (`egress.allowed`).
     pub reason_code: String,
+    /// Human-readable summary for audit logs.
     pub message: String,
+    /// Hex SHA-256 over the policy-relevant request fields, for audit correlation.
     pub request_fingerprint_sha256: String,
+    /// Lowercased target host.
     pub host: String,
+    /// Resolved socket addresses for connection pinning; runtime-only, never serialized.
     #[serde(skip_serializing, skip_deserializing, default)]
     pub resolved_addresses: Vec<SocketAddr>,
+    /// String form of [`Self::resolved_addresses`] that survives serialization.
     pub resolved_socket_addrs: Vec<String>,
+    /// Lowercased names of headers approved for credential injection.
     pub injected_credential_headers: Vec<String>,
 }
 
+/// Policy denials and validation failures for an egress request.
+///
+/// Every variant is fail-closed: any error means the request must not be sent.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum EgressPolicyError {
+    /// URL scheme is neither `http` nor `https`.
     #[error("unsupported URL scheme '{0}'")]
     UnsupportedScheme(String),
+    /// URL embeds userinfo credentials (`user:pass@host`), which policy never allows.
     #[error("URL credentials are not allowed")]
     CredentialsForbidden,
+    /// URL has no host component.
     #[error("URL host is required")]
     MissingHost,
+    /// URL has no explicit port and the scheme has no known default.
     #[error("URL port could not be resolved")]
     MissingPort,
+    /// DNS resolution succeeded but returned an empty address set.
     #[error("DNS resolution returned no addresses for host '{host}'")]
     EmptyResolution { host: String },
+    /// DNS resolution (or URL/IP-literal parsing, see
+    /// [`EgressProxyPolicyService::evaluate_request`]) failed.
     #[error("DNS resolution failed for host '{host}': {message}")]
     DnsResolution { host: String, message: String },
+    /// Host matched neither the exact-host nor the DNS-suffix allowlist.
     #[error("host '{host}' is not present in the egress allowlist")]
     HostNotAllowlisted { host: String },
+    /// At least one resolved address is private/local and the request did not opt in.
     #[error("target resolves to private/local address and is blocked by policy")]
     PrivateTargetBlocked,
+    /// `max_response_bytes` was zero.
     #[error("response budget must be greater than zero")]
     InvalidResponseBudget,
+    /// Credential header name is not credential-shaped.
     #[error("credential binding '{header_name}' uses a disallowed header name")]
     InvalidCredentialHeader { header_name: String },
+    /// Credential binding references an exec-backed secret source.
     #[error("credential binding '{header_name}' cannot use exec-backed secret sources")]
     ExecCredentialSourceForbidden { header_name: String },
+    /// Credential binding references a non-vault, non-exec secret source (e.g. env).
     #[error("credential binding '{header_name}' cannot use {source_kind}-backed secret sources")]
     CredentialSourceForbidden { header_name: String, source_kind: String },
+    /// Credential binding's vault reference failed its own validation.
     #[error("credential binding '{header_name}' has invalid secret reference: {message}")]
     InvalidCredentialSecretRef { header_name: String, message: String },
 }
 
+/// Stateless evaluator applying the deny-by-default egress policy to outbound requests.
 #[derive(Debug, Default)]
 pub struct EgressProxyPolicyService;
 
 impl EgressProxyPolicyService {
+    /// Evaluates an outbound request against the egress policy and returns an allow verdict.
+    ///
+    /// Performs blocking DNS resolution for non-IP-literal hosts; on an async runtime,
+    /// call this from a blocking-capable context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`EgressPolicyError`] (fail closed) when the response budget is zero, the
+    /// URL is malformed, non-HTTP(S), credentialed, or hostless, the host is not
+    /// allowlisted, resolution fails or yields a private/local address without
+    /// `allow_private_targets`, or any credential binding is not a valid vault-backed
+    /// reference. Malformed URLs are reported as [`EgressPolicyError::DnsResolution`] with
+    /// the full URL in the `host` field.
     pub fn evaluate_request(
         &self,
         request: &EgressProxyRequest<'_>,
@@ -83,6 +144,9 @@ impl EgressProxyPolicyService {
             return Err(EgressPolicyError::InvalidResponseBudget);
         }
 
+        // AIDEV-NOTE: URL parse failures reuse the DnsResolution variant with the full URL
+        // in `host`. Misleading, but the error surface is pinned by callers/fixtures; do
+        // not change the variant or message without coordinating that contract.
         let url = Url::parse(request.url).map_err(|error| EgressPolicyError::DnsResolution {
             host: request.url.to_owned(),
             message: error.to_string(),
@@ -105,6 +169,7 @@ impl EgressProxyPolicyService {
         validate_resolved_addrs(resolved.as_slice(), request.allow_private_targets)?;
         validate_credential_bindings(request.credential_bindings)?;
 
+        let resolved_socket_addrs = resolved.iter().map(ToString::to_string).collect();
         Ok(EgressPolicyVerdict {
             allowed: true,
             reason_code: "egress.allowed".to_owned(),
@@ -114,8 +179,8 @@ impl EgressProxyPolicyService {
             ),
             request_fingerprint_sha256: request_fingerprint(request),
             host,
-            resolved_addresses: resolved.clone(),
-            resolved_socket_addrs: resolved.iter().map(ToString::to_string).collect(),
+            resolved_addresses: resolved,
+            resolved_socket_addrs,
             injected_credential_headers: request
                 .credential_bindings
                 .iter()
@@ -125,6 +190,17 @@ impl EgressProxyPolicyService {
     }
 }
 
+/// Validates already-resolved socket addresses against the private-target policy.
+///
+/// A single private/local address rejects the whole set: mixed public/private answers are
+/// treated as DNS rebinding. Exposed so callers with their own resolution step (and the
+/// security attack-scenario suite) can re-check addresses directly.
+///
+/// # Errors
+///
+/// Returns [`EgressPolicyError::PrivateTargetBlocked`] when `addrs` is empty, or when it
+/// contains a private, loopback, or otherwise non-public address while
+/// `allow_private_targets` is `false`.
 pub fn validate_resolved_addrs(
     addrs: &[SocketAddr],
     allow_private_targets: bool,
@@ -145,6 +221,8 @@ fn validate_host_allowlist(
     let host_allowed = allowed_hosts.iter().any(|candidate| candidate.eq_ignore_ascii_case(host));
     let suffix_allowed = allowed_dns_suffixes.iter().any(|suffix| {
         let normalized = suffix.trim().trim_start_matches('.').to_ascii_lowercase();
+        // Suffixes match only on label boundaries: "example.com" must not allow
+        // "notexample.com", hence the required '.' before the suffix.
         !normalized.is_empty()
             && (host == normalized
                 || host
@@ -181,6 +259,8 @@ fn validate_credential_bindings(
 ) -> Result<(), EgressPolicyError> {
     for binding in bindings {
         let normalized = binding.header_name.trim().to_ascii_lowercase();
+        // Only credential-shaped header names may carry injected secrets; this blocks
+        // smuggling secrets into arbitrary headers such as Host or User-Agent.
         if normalized.is_empty()
             || !(normalized.starts_with("authorization")
                 || normalized.starts_with("x-")
@@ -218,6 +298,11 @@ fn validate_credential_bindings(
 }
 
 fn request_fingerprint(request: &EgressProxyRequest<'_>) -> String {
+    // AIDEV-NOTE: method/url and the flag/budget bytes are concatenated without length
+    // prefixes, so distinct requests can in principle share a fingerprint (the list
+    // separators below only disambiguate within each list). Fixing this would change
+    // every emitted fingerprint, which audit tooling may pin — do not alter the framing
+    // without versioning the domain tag.
     let mut hasher = Sha256::new();
     hasher.update(b"palyra.egress.proxy.v1");
     hasher.update(request.method.as_bytes());
