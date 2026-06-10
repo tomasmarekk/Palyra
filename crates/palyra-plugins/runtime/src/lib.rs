@@ -1,3 +1,10 @@
+//! Sandboxed Wasm execution for Palyra plugins.
+//!
+//! Wraps a wasmtime [`Engine`] with hard execution limits (fuel, memory, tables,
+//! instances, and an optional wall-clock timeout) and links the Tier A
+//! host-capability imports defined by `palyra-plugins-sdk`. Also hosts the typed
+//! plugin contract negotiation performed against daemon adapters.
+
 use std::{collections::BTreeSet, sync::mpsc, time::Duration};
 
 use palyra_plugins_sdk::{
@@ -15,18 +22,32 @@ use wasmtime::{
     TypedFunc,
 };
 
+// Handle bases keep each capability class in a disjoint numeric range, so a raw
+// handle value alone identifies its class. Plugins and tests rely on these values.
 const HTTP_HANDLE_BASE: i32 = 10_000;
 const SECRET_HANDLE_BASE: i32 = 20_000;
 const STORAGE_HANDLE_BASE: i32 = 30_000;
 const CHANNEL_HANDLE_BASE: i32 = 40_000;
+// With a timeout, a single epoch increment from the watchdog thread must interrupt
+// execution. Without one, nothing increments the epoch, so the deadline is placed
+// far enough away that epoch interruption can never fire.
 const EPOCH_DEADLINE_TICKS_WITH_TIMEOUT: u64 = 1;
 const EPOCH_DEADLINE_TICKS_WITHOUT_TIMEOUT: u64 = 1_000_000_000;
 
+/// Hard per-execution resource limits enforced on plugin modules.
+///
+/// Limits fail closed: exceeding any of them aborts the execution with
+/// [`RuntimeError::ExecutionLimitExceeded`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeLimits {
+    /// Wasmtime fuel budget for the whole invocation, roughly proportional to
+    /// the number of executed instructions.
     pub fuel_budget: u64,
+    /// Maximum linear memory the store may grow to, in bytes.
     pub max_memory_bytes: usize,
+    /// Maximum number of table elements across all tables in the store.
     pub max_table_elements: usize,
+    /// Maximum number of module instances the store may host.
     pub max_instances: usize,
 }
 
@@ -41,15 +62,26 @@ impl Default for RuntimeLimits {
     }
 }
 
+/// Capability grants requested for one plugin invocation, grouped by Tier A
+/// capability class.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CapabilityGrantSet {
+    /// HTTP hosts the plugin may reach.
     pub http_hosts: Vec<String>,
+    /// Secret keys the plugin may resolve.
     pub secret_keys: Vec<String>,
+    /// Storage key prefixes the plugin may read and write under.
     pub storage_prefixes: Vec<String>,
+    /// Channels the plugin may address.
     pub channels: Vec<String>,
 }
 
 impl CapabilityGrantSet {
+    /// Returns a copy with every list trimmed, stripped of empty entries,
+    /// sorted, and deduplicated.
+    ///
+    /// Handle derivation in [`CapabilityHandles::from_grants`] depends on this
+    /// canonical order being deterministic.
     #[must_use]
     pub fn canonicalized(&self) -> Self {
         Self {
@@ -61,15 +93,25 @@ impl CapabilityGrantSet {
     }
 }
 
+/// Opaque integer handles issued to a plugin for its granted capabilities.
+///
+/// Handle values are deterministic for a given canonical grant order and sit in
+/// a disjoint numeric range per capability class.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CapabilityHandles {
+    /// Handles for granted HTTP hosts.
     pub http_handles: Vec<i32>,
+    /// Handles for granted secret keys.
     pub secret_handles: Vec<i32>,
+    /// Handles for granted storage prefixes.
     pub storage_handles: Vec<i32>,
+    /// Handles for granted channels.
     pub channel_handles: Vec<i32>,
 }
 
 impl CapabilityHandles {
+    /// Derives handles from `grants` after canonicalization; each handle's
+    /// index matches the index of its grant in the canonical list.
     #[must_use]
     pub fn from_grants(grants: &CapabilityGrantSet) -> Self {
         let grants = grants.canonicalized();
@@ -82,48 +124,70 @@ impl CapabilityHandles {
     }
 }
 
+/// A daemon adapter's declared support for one typed plugin contract kind.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TypedPluginContractAdapterSupport {
+    /// Contract kind the adapter serves.
     pub kind: TypedPluginContractKind,
+    /// Stable identifier of the daemon-side adapter.
     pub adapter: String,
+    /// Contract versions the adapter accepts.
     #[serde(default)]
     pub supported_versions: Vec<u32>,
+    /// Capability classes plugins bound to this adapter may request.
     #[serde(default)]
     pub allowed_capability_classes: Vec<TypedPluginCapabilityClass>,
 }
 
+/// Negotiation mode a plugin runs under.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TypedPluginContractMode {
+    /// Plugin declared no typed contracts and runs through the legacy untyped path.
     #[default]
     UntypedLegacy,
+    /// Plugin declared typed contracts and went through negotiation.
     Typed,
 }
 
+/// Outcome of negotiating a single typed contract declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TypedPluginContractStatus {
+    /// The declaration is supported by the host and a daemon adapter.
     Accepted,
+    /// The declaration cannot be served; see the entry's rejection reasons.
     Rejected,
 }
 
+/// Negotiation result for one declared typed contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TypedPluginContractNegotiationEntry {
+    /// Contract kind that was declared.
     pub kind: TypedPluginContractKind,
+    /// Contract version the plugin asked for.
     pub requested_version: u32,
+    /// Whether the declaration was accepted or rejected.
     pub status: TypedPluginContractStatus,
+    /// Daemon adapter matched for the kind, if one exists.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub adapter: Option<String>,
+    /// Host-published descriptor for the requested kind/version, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub descriptor: Option<TypedPluginContractDescriptor>,
+    /// Human-readable rejection reasons; empty when accepted.
     #[serde(default)]
     pub reasons: Vec<String>,
 }
 
+/// Aggregate outcome of typed plugin contract negotiation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TypedPluginContractNegotiationReport {
+    /// Mode the plugin will run under.
     pub mode: TypedPluginContractMode,
+    /// True when every declared contract was accepted; legacy mode is always ready.
     pub ready: bool,
+    /// Per-declaration results; empty in legacy mode.
     #[serde(default)]
     pub entries: Vec<TypedPluginContractNegotiationEntry>,
 }
@@ -134,12 +198,24 @@ impl Default for TypedPluginContractNegotiationReport {
     }
 }
 
+/// Borrowed inputs for [`negotiate_typed_plugin_contracts`].
 pub struct TypedPluginContractNegotiationInput<'a> {
+    /// Typed contracts the plugin declares it implements.
     pub declarations: &'a [TypedPluginContractDeclaration],
+    /// Capability classes the plugin requests across all contracts.
     pub capability_classes: &'a [TypedPluginCapabilityClass],
+    /// Typed adapters the daemon currently exposes.
     pub adapters: &'a [TypedPluginContractAdapterSupport],
 }
 
+/// Negotiates a plugin's declared typed contracts against host descriptors and
+/// daemon adapters.
+///
+/// With no declarations the plugin is treated as a legacy untyped plugin and
+/// the report is immediately ready. Otherwise each declaration is checked
+/// against the host-published descriptor, the matching daemon adapter, the
+/// adapter's supported versions, and its allowed capability classes; the
+/// report is ready only if every declaration is accepted.
 #[must_use]
 pub fn negotiate_typed_plugin_contracts(
     input: TypedPluginContractNegotiationInput<'_>,
@@ -161,9 +237,9 @@ pub fn negotiate_typed_plugin_contracts(
             ));
         }
 
-        let adapter = input.adapters.iter().find(|candidate| candidate.kind == declaration.kind);
-        let adapter_name = adapter.map(|candidate| candidate.adapter.clone());
-        let Some(adapter) = adapter else {
+        let Some(adapter) =
+            input.adapters.iter().find(|candidate| candidate.kind == declaration.kind)
+        else {
             reasons.push(format!(
                 "daemon does not expose a typed adapter for {}",
                 declaration.kind.as_str()
@@ -172,7 +248,7 @@ pub fn negotiate_typed_plugin_contracts(
                 kind: declaration.kind,
                 requested_version: declaration.version,
                 status: TypedPluginContractStatus::Rejected,
-                adapter: adapter_name,
+                adapter: None,
                 descriptor,
                 reasons,
             });
@@ -226,38 +302,62 @@ pub fn negotiate_typed_plugin_contracts(
     }
 }
 
+/// Result of a successful plugin entrypoint invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WasmExecutionResult {
+    /// Value returned by the plugin's `() -> i32` entrypoint.
     pub exit_code: i32,
+    /// Capability handles that were issued to the plugin for this invocation.
     pub capability_handles: CapabilityHandles,
 }
 
+/// Errors produced while compiling, linking, or executing a plugin module.
 #[derive(Debug, Error)]
 pub enum RuntimeError {
+    /// Module bytes failed to compile or validate (also covers engine setup).
     #[error("failed to compile wasm module: {0}")]
     Compile(#[from] wasmtime::Error),
+    /// Host capability imports could not be registered, or module imports
+    /// failed to link during instantiation.
     #[error("failed to link wasm host capability interface: {0}")]
     Linker(wasmtime::Error),
+    /// The module trapped or faulted during execution.
     #[error("wasm execution failed: {0}")]
     Execution(wasmtime::Error),
+    /// The wall-clock timeout elapsed before the entrypoint returned.
     #[error("wasm execution timed out")]
     ExecutionTimedOut,
+    /// The requested entrypoint is not exported or does not have the expected
+    /// `() -> i32` signature.
     #[error("failed to resolve exported function '{0}'")]
     MissingExport(String),
+    /// A fuel, memory, table, or instance limit from [`RuntimeLimits`] was hit.
     #[error("wasm execution exceeded runtime limits")]
     ExecutionLimitExceeded,
 }
 
+/// Reusable wasmtime engine that executes plugin modules under [`RuntimeLimits`].
+///
+/// Fuel metering and epoch interruption are always enabled, so every execution
+/// stays bounded even for hostile modules.
 pub struct WasmRuntime {
     engine: Engine,
     limits: RuntimeLimits,
 }
 
 impl WasmRuntime {
+    /// Creates a runtime with [`RuntimeLimits::default`].
+    ///
+    /// # Errors
+    /// Returns [`RuntimeError::Compile`] if the wasmtime engine cannot be built.
     pub fn new() -> Result<Self, RuntimeError> {
         Self::new_with_limits(RuntimeLimits::default())
     }
 
+    /// Creates a runtime that enforces the given `limits` on every execution.
+    ///
+    /// # Errors
+    /// Returns [`RuntimeError::Compile`] if the wasmtime engine cannot be built.
     pub fn new_with_limits(limits: RuntimeLimits) -> Result<Self, RuntimeError> {
         let mut config = Config::new();
         config.consume_fuel(true);
@@ -266,6 +366,11 @@ impl WasmRuntime {
         Ok(Self { engine, limits })
     }
 
+    /// Compiles `module_bytes` and calls the `() -> i32` export `export_name`
+    /// with no capability grants.
+    ///
+    /// # Errors
+    /// Same failure modes as [`WasmRuntime::execute_i32_entrypoint`].
     pub fn call_noarg_i32_export(
         &self,
         module_bytes: &[u8],
@@ -276,6 +381,20 @@ impl WasmRuntime {
         Ok(result.exit_code)
     }
 
+    /// Compiles `module_bytes` and invokes the `() -> i32` export `entrypoint`
+    /// with capability handles derived from `capabilities`.
+    ///
+    /// Execution is bounded by the runtime's fuel budget and store limits, but
+    /// not by wall-clock time; use
+    /// [`WasmRuntime::execute_i32_entrypoint_with_timeout`] for that.
+    ///
+    /// # Errors
+    /// Returns [`RuntimeError::Compile`] for invalid module bytes,
+    /// [`RuntimeError::Linker`] when imports cannot be satisfied,
+    /// [`RuntimeError::MissingExport`] when `entrypoint` is absent or has the
+    /// wrong signature, [`RuntimeError::ExecutionLimitExceeded`] when a
+    /// [`RuntimeLimits`] bound is hit, and [`RuntimeError::Execution`] for any
+    /// other trap.
     pub fn execute_i32_entrypoint(
         &self,
         module_bytes: &[u8],
@@ -285,6 +404,15 @@ impl WasmRuntime {
         self.execute_i32_entrypoint_internal(module_bytes, entrypoint, capabilities, None)
     }
 
+    /// Like [`WasmRuntime::execute_i32_entrypoint`], but additionally aborts
+    /// the execution once `timeout` of wall-clock time has elapsed.
+    ///
+    /// On targets without 64-bit atomics the timeout cannot be armed and only
+    /// fuel and store limits bound the execution.
+    ///
+    /// # Errors
+    /// Same as [`WasmRuntime::execute_i32_entrypoint`], plus
+    /// [`RuntimeError::ExecutionTimedOut`] when the timeout elapses first.
     pub fn execute_i32_entrypoint_with_timeout(
         &self,
         module_bytes: &[u8],
@@ -319,6 +447,8 @@ impl WasmRuntime {
         store.limiter(|state| &mut state.limits);
         store.set_fuel(self.limits.fuel_budget)?;
         configure_epoch_deadline(&mut store, timeout.is_some());
+        // The named binding keeps the watchdog armed until this function returns;
+        // `let _ = ...` would drop the guard (cancelling the timeout) immediately.
         let _timeout_guard =
             timeout.map(|duration| arm_epoch_timeout_guard(self.engine.clone(), duration));
         let instance = self.instantiate_with_linker(&module, &mut store)?;
@@ -407,6 +537,9 @@ fn register_capability_bindings(
     Ok(())
 }
 
+// Tier A host imports. The `len() as i32` casts cannot truncate in practice:
+// handle tables are bounded by per-invocation grant lists, which stay far below
+// `i32::MAX` entries.
 fn host_http_count(caller: Caller<'_, RuntimeStoreState>) -> i32 {
     caller.data().capability_handles.http_handles.len() as i32
 }
@@ -439,6 +572,8 @@ fn host_channel_handle(caller: Caller<'_, RuntimeStoreState>, index: i32) -> i32
     resolve_capability_handle(caller.data().capability_handles.channel_handles.as_slice(), index)
 }
 
+/// Maps a plugin-supplied index to a granted handle; `-1` signals a negative or
+/// out-of-range index, as specified by the WIT host-capabilities contract.
 fn resolve_capability_handle(handles: &[i32], index: i32) -> i32 {
     if index < 0 {
         return -1;
@@ -446,6 +581,8 @@ fn resolve_capability_handle(handles: &[i32], index: i32) -> i32 {
     handles.get(index as usize).copied().unwrap_or(-1)
 }
 
+// Epoch interruption requires 64-bit atomics; on targets without them the
+// deadline cannot be armed and bounded execution relies on fuel metering alone.
 fn configure_epoch_deadline(store: &mut Store<RuntimeStoreState>, timeout_enabled: bool) {
     #[cfg(target_has_atomic = "64")]
     {
@@ -460,6 +597,7 @@ fn configure_epoch_deadline(store: &mut Store<RuntimeStoreState>, timeout_enable
     let _ = (store, timeout_enabled);
 }
 
+/// Cancels the timeout watchdog when dropped, before it can bump the epoch.
 struct EpochTimeoutGuard {
     cancel_tx: Option<mpsc::Sender<()>>,
 }
@@ -472,9 +610,16 @@ impl Drop for EpochTimeoutGuard {
     }
 }
 
+/// Spawns a watchdog thread that bumps the engine epoch after `timeout`,
+/// interrupting the store that was armed with a one-tick deadline.
 fn arm_epoch_timeout_guard(engine: Engine, timeout: Duration) -> EpochTimeoutGuard {
     #[cfg(target_has_atomic = "64")]
     {
+        // AIDEV-NOTE: `Engine::increment_epoch` is engine-global. Concurrent timed
+        // executions on the same `WasmRuntime` share one engine, so a watchdog
+        // firing for one execution can interrupt another in-flight timed execution
+        // before its own deadline. Fixing this needs per-execution engines or
+        // deadline bookkeeping — a behavioral change deliberately not made here.
         let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
         std::thread::spawn(move || match cancel_rx.recv_timeout(timeout) {
             Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {}
@@ -520,6 +665,9 @@ fn is_timeout_error(error: &wasmtime::Error) -> bool {
 }
 
 fn is_execution_limit_error(error: &wasmtime::Error, store: &Store<RuntimeStoreState>) -> bool {
+    // An exhausted fuel budget counts as a limit violation even when the failure
+    // surfaces as a different trap first, and store-limit violations raised during
+    // instantiation are only identifiable by their message text.
     store.get_fuel().ok() == Some(0)
         || matches!(
             error.downcast_ref::<wasmtime::Trap>(),
@@ -529,12 +677,14 @@ fn is_execution_limit_error(error: &wasmtime::Error, store: &Store<RuntimeStoreS
 }
 
 fn error_chain_contains_any(error: &wasmtime::Error, needles: &[&str]) -> bool {
-    if needles.iter().any(|needle| error.to_string().contains(needle)) {
+    let message = error.to_string();
+    if needles.iter().any(|needle| message.contains(needle)) {
         return true;
     }
     let mut source = error.source();
     while let Some(current) = source {
-        if needles.iter().any(|needle| current.to_string().contains(needle)) {
+        let message = current.to_string();
+        if needles.iter().any(|needle| message.contains(needle)) {
             return true;
         }
         source = current.source();

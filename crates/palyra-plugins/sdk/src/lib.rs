@@ -1,6 +1,10 @@
-//! Bootstrap SDK placeholder for Palyra plugin authors.
+//! Stable contract identifiers and typed plugin contracts for the Palyra plugin SDK.
 //!
-//! The initial WIT contract is defined in `wit/palyra-sdk.wit`.
+//! Defines the WIT/ABI identifier constants shared by the host and plugins, the
+//! host-published typed plugin contract descriptors, and a fixture-driven
+//! negotiation simulator used by contract tests. The WIT source of truth lives
+//! in `wit/palyra-sdk.wit`; identifier strings in this module are wire contract
+//! and are pinned by a golden ABI fingerprint test.
 
 use serde::{Deserialize, Serialize};
 
@@ -19,14 +23,23 @@ pub const WIT_WORLD_NAME: &str = "palyra-plugin";
 /// Core Wasm import module that exposes Tier A capability handles.
 pub const HOST_CAPABILITIES_IMPORT_MODULE: &str = "palyra:plugins/host-capabilities@0.1.0";
 
-/// Host function names defined by the Tier A capability contract.
+// Function names below are the Tier A capability contract exposed through
+// `HOST_CAPABILITIES_IMPORT_MODULE`.
+/// Host import returning the number of granted HTTP host handles.
 pub const HOST_CAPABILITY_HTTP_COUNT_FN: &str = "http-count";
+/// Host import resolving an HTTP host handle by index.
 pub const HOST_CAPABILITY_HTTP_HANDLE_FN: &str = "http-handle";
+/// Host import returning the number of granted secret handles.
 pub const HOST_CAPABILITY_SECRET_COUNT_FN: &str = "secret-count";
+/// Host import resolving a secret handle by index.
 pub const HOST_CAPABILITY_SECRET_HANDLE_FN: &str = "secret-handle";
+/// Host import returning the number of granted storage-prefix handles.
 pub const HOST_CAPABILITY_STORAGE_COUNT_FN: &str = "storage-count";
+/// Host import resolving a storage-prefix handle by index.
 pub const HOST_CAPABILITY_STORAGE_HANDLE_FN: &str = "storage-handle";
+/// Host import returning the number of granted channel handles.
 pub const HOST_CAPABILITY_CHANNEL_COUNT_FN: &str = "channel-count";
+/// Host import resolving a channel handle by index.
 pub const HOST_CAPABILITY_CHANNEL_HANDLE_FN: &str = "channel-handle";
 
 /// Default plugin entrypoint exported by the runtime interface.
@@ -38,6 +51,10 @@ pub const DEFAULT_TYPED_PLUGIN_CONTRACT_VERSION: u32 = 1;
 /// Default per-invocation timeout for typed plugin contracts.
 pub const DEFAULT_TYPED_PLUGIN_CONTRACT_TIMEOUT_MS: u64 = 2_000;
 
+/// Typed plugin extension points the host can negotiate.
+///
+/// Wire identifiers come from [`TypedPluginContractKind::as_str`] and are
+/// stable contract surface.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum TypedPluginContractKind {
@@ -56,6 +73,7 @@ pub enum TypedPluginContractKind {
 }
 
 impl TypedPluginContractKind {
+    /// Returns the stable snake_case wire identifier for this contract kind.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -75,6 +93,7 @@ impl TypedPluginContractKind {
     }
 }
 
+/// Capability classes a typed contract may be allowed to request.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum TypedPluginCapabilityClass {
@@ -85,6 +104,7 @@ pub enum TypedPluginCapabilityClass {
 }
 
 impl TypedPluginCapabilityClass {
+    /// Returns the stable snake_case wire identifier for this capability class.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -96,6 +116,7 @@ impl TypedPluginCapabilityClass {
     }
 }
 
+/// Sensitivity classification applied to a contract's payload data.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TypedPluginDataSensitivity {
@@ -107,6 +128,7 @@ pub enum TypedPluginDataSensitivity {
 }
 
 impl TypedPluginDataSensitivity {
+    /// Returns the stable snake_case wire identifier for this sensitivity level.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -118,6 +140,7 @@ impl TypedPluginDataSensitivity {
     }
 }
 
+/// Lifecycle phases a typed plugin contract moves through on the host.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum TypedPluginContractLifecyclePhase {
@@ -129,6 +152,7 @@ pub enum TypedPluginContractLifecyclePhase {
 }
 
 impl TypedPluginContractLifecyclePhase {
+    /// Returns the stable snake_case wire identifier for this lifecycle phase.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -141,6 +165,7 @@ impl TypedPluginContractLifecyclePhase {
     }
 }
 
+/// Operations a typed plugin contract can be invoked with.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum TypedPluginContractOperation {
@@ -164,6 +189,7 @@ pub enum TypedPluginContractOperation {
 }
 
 impl TypedPluginContractOperation {
+    /// Returns the stable snake_case wire identifier for this operation.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -188,73 +214,111 @@ impl TypedPluginContractOperation {
     }
 }
 
+/// A plugin's declaration that it implements one typed contract kind and version.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TypedPluginContractDeclaration {
+    /// Contract kind being declared.
     pub kind: TypedPluginContractKind,
+    /// Contract version; defaults to [`DEFAULT_TYPED_PLUGIN_CONTRACT_VERSION`]
+    /// when omitted.
     #[serde(default = "default_typed_plugin_contract_version")]
     pub version: u32,
 }
 
+/// Test fixture pairing typed contract declarations with the negotiation
+/// outcome they are expected to produce.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SdkContractSimulationFixture {
+    /// Unique fixture name; must not be blank.
     pub name: String,
+    /// Whether the simulated negotiation is expected to accept the fixture.
     pub expected_accepted: bool,
+    /// Typed contracts the simulated plugin declares.
     pub declarations: Vec<TypedPluginContractDeclaration>,
+    /// Capability classes the simulated plugin requests.
     #[serde(default)]
     pub requested_capability_classes: Vec<TypedPluginCapabilityClass>,
 }
 
+/// Result of simulating one fixture against the SDK's host negotiation rules.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SdkContractSimulationReport {
+    /// Name of the fixture that was simulated.
     pub fixture_name: String,
+    /// Whether the simulated negotiation accepted the fixture.
     pub accepted: bool,
+    /// Number of declared contracts the host publishes a descriptor for.
     pub supported_contract_count: usize,
+    /// Human-readable rejection reasons; empty when accepted.
     pub rejected_reasons: Vec<String>,
 }
 
+/// Host-published descriptor for one supported typed contract version.
+///
+/// Every field is ABI surface: the golden fingerprint test in this crate pins
+/// descriptor contents, so any change here is a contract change.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TypedPluginContractDescriptor {
+    /// Contract kind the descriptor applies to.
     pub kind: TypedPluginContractKind,
+    /// Contract version the descriptor applies to.
     pub version: u32,
+    /// SDK ABI major version the descriptor was authored against.
     #[serde(default = "default_sdk_abi_major")]
     pub sdk_abi_major: u32,
+    /// Versioned identifier of the input payload schema.
     #[serde(default)]
     pub input_schema: String,
+    /// Versioned identifier of the output payload schema.
     #[serde(default)]
     pub output_schema: String,
+    /// Default per-invocation timeout in milliseconds.
     #[serde(default = "default_typed_plugin_contract_timeout_ms")]
     pub default_timeout_ms: u64,
+    /// Default sensitivity classification of contract payloads.
     #[serde(default)]
     pub sensitivity: TypedPluginDataSensitivity,
+    /// Lifecycle phases the host drives for this contract.
     #[serde(default)]
     pub lifecycle: Vec<TypedPluginContractLifecyclePhase>,
+    /// Operations the contract can be invoked with.
     #[serde(default)]
     pub operations: Vec<TypedPluginContractOperation>,
+    /// Capability classes plugins of this contract may request; empty means none.
     #[serde(default)]
     pub allowed_capability_classes: Vec<TypedPluginCapabilityClass>,
+    /// Stable error codes the contract may surface.
     #[serde(default)]
     pub error_codes: Vec<String>,
+    /// Payload field paths that must be redacted from logs and audit output.
     #[serde(default)]
     pub redacted_fields: Vec<String>,
+    /// Audit event hooks emitted around contract invocations.
     #[serde(default)]
     pub audit_hooks: Vec<String>,
+    /// Observability/metric hooks emitted for the contract.
     #[serde(default)]
     pub observability_hooks: Vec<String>,
 }
 
+/// Inclusive range of SDK ABI major versions accepted by a host.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SdkAbiCompatibility {
+    /// ABI major version the host itself targets.
     pub abi_major: u32,
+    /// Oldest ABI major version the host accepts.
     pub min_abi_major: u32,
+    /// Newest ABI major version the host accepts.
     pub max_abi_major: u32,
 }
 
 impl SdkAbiCompatibility {
+    /// Returns `true` when `abi_major` falls inside the accepted inclusive range.
     #[must_use]
     pub const fn accepts(self, abi_major: u32) -> bool {
         abi_major >= self.min_abi_major && abi_major <= self.max_abi_major
@@ -327,6 +391,10 @@ pub fn all_typed_plugin_contract_kinds() -> Vec<TypedPluginContractKind> {
 }
 
 /// Returns the built-in descriptor for a typed plugin contract version supported by the host.
+///
+/// Returns `None` for any version other than
+/// [`DEFAULT_TYPED_PLUGIN_CONTRACT_VERSION`], which is the only version this
+/// SDK ABI publishes.
 #[must_use]
 pub fn typed_plugin_contract_descriptor(
     kind: TypedPluginContractKind,
@@ -607,6 +675,10 @@ pub fn typed_plugin_contract_descriptor(
 }
 
 /// Runs a typed-contract fixture against the SDK's simulated host negotiation rules.
+///
+/// A fixture is rejected when its name is blank, it declares no contracts, a
+/// declared kind/version has no host descriptor, or it requests a capability
+/// class that none of its declared contracts allow.
 #[must_use]
 pub fn simulate_sdk_contract_fixture(
     fixture: &SdkContractSimulationFixture,
@@ -713,6 +785,9 @@ fn default_lifecycle() -> Vec<TypedPluginContractLifecyclePhase> {
     ]
 }
 
+// Data-plane classes shared by contracts that fetch, authenticate, and persist
+// data. Channels are deliberately excluded: channel access is granted only to
+// contracts that address channels explicitly.
 fn default_data_capabilities() -> Vec<TypedPluginCapabilityClass> {
     vec![
         TypedPluginCapabilityClass::HttpHosts,
@@ -721,7 +796,10 @@ fn default_data_capabilities() -> Vec<TypedPluginCapabilityClass> {
     ]
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "descriptor fields are passed positionally once per contract kind"
+)]
 fn build_descriptor(
     kind: TypedPluginContractKind,
     version: u32,
