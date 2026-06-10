@@ -1,11 +1,21 @@
+//! A2UI document validation and patch protocol.
+//!
+//! Validates full A2UI JSON documents (version, surface, components, and
+//! experimental-governance rules) and implements the A2UI patch wire format:
+//! a JSON Patch subset (`add`/`replace`/`remove` with RFC 6901 pointers)
+//! wrapped in a `{"v": <version>, "ops": [...]}` envelope. Patch application
+//! is deterministic and fails closed on any conflict.
+
 use serde_json::{Map, Value};
 use thiserror::Error;
 
+/// Wire-format version accepted in the `"v"` field of patch envelopes.
 pub const A2UI_PATCH_PROTOCOL_VERSION: u64 = 1;
 
 const KNOWN_GOOD_JSON: &str =
     include_str!("../../../schemas/json/a2ui-placeholder-known-good.json");
 
+/// Reasons a full A2UI document fails validation.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum A2uiValidationError {
     #[error("document must be valid JSON")]
@@ -26,6 +36,7 @@ pub enum A2uiValidationError {
     AmbientConsentRequired,
 }
 
+/// Supported patch operations; mirrors the `"op"` field on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PatchOperationKind {
     Add,
@@ -33,6 +44,10 @@ pub enum PatchOperationKind {
     Remove,
 }
 
+/// One parsed patch operation targeting `path` (an RFC 6901 pointer).
+///
+/// `value` is `Some` for `Add`/`Replace` and `None` for `Remove`; parsing
+/// rejects any other combination.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PatchOperation {
     pub kind: PatchOperationKind,
@@ -40,12 +55,17 @@ pub struct PatchOperation {
     pub value: Option<Value>,
 }
 
+/// A parsed patch envelope: protocol version plus a non-empty operation list.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PatchDocument {
     pub version: u64,
     pub operations: Vec<PatchOperation>,
 }
 
+/// Reasons a patch envelope fails to parse or apply.
+///
+/// `index` fields refer to the operation's position in the `"ops"` array so
+/// callers can pinpoint the offending operation.
 #[derive(Debug, Error)]
 pub enum A2uiPatchError {
     #[error("patch payload must be valid JSON")]
@@ -76,11 +96,18 @@ pub enum A2uiPatchError {
     SerializePatch(#[from] serde_json::Error),
 }
 
+/// Returns the bundled known-good A2UI document used as a validation fixture.
 #[must_use]
 pub fn known_good_document() -> Value {
     serde_json::from_str(KNOWN_GOOD_JSON).expect("known-good A2UI fixture must stay valid JSON")
 }
 
+/// Parses raw bytes as JSON and validates the result as an A2UI document.
+///
+/// # Errors
+///
+/// Returns [`A2uiValidationError`] when the bytes are not valid JSON or the
+/// document violates any rule checked by [`validate_document`].
 pub fn parse_and_validate_document(input: &[u8]) -> Result<Value, A2uiValidationError> {
     let document: Value =
         serde_json::from_slice(input).map_err(|_| A2uiValidationError::InvalidJson)?;
@@ -88,6 +115,13 @@ pub fn parse_and_validate_document(input: &[u8]) -> Result<Value, A2uiValidation
     Ok(document)
 }
 
+/// Validates an A2UI document: version `1`, non-empty `surface` string,
+/// non-empty `components` array, and experimental-governance rules when an
+/// `experimental` block is present.
+///
+/// # Errors
+///
+/// Returns the first [`A2uiValidationError`] encountered, in field order.
 pub fn validate_document(document: &Value) -> Result<(), A2uiValidationError> {
     let object = document.as_object().ok_or(A2uiValidationError::NotAnObject)?;
 
@@ -98,11 +132,24 @@ pub fn validate_document(document: &Value) -> Result<(), A2uiValidationError> {
     Ok(())
 }
 
+/// Parses raw bytes as a patch envelope.
+///
+/// # Errors
+///
+/// Returns [`A2uiPatchError`] when the bytes are not valid JSON or the value
+/// violates any rule checked by [`parse_patch_value`].
 pub fn parse_patch_document(input: &[u8]) -> Result<PatchDocument, A2uiPatchError> {
     let value: Value = serde_json::from_slice(input).map_err(|_| A2uiPatchError::InvalidJson)?;
     parse_patch_value(&value)
 }
 
+/// Parses a JSON value as a patch envelope, validating the protocol version,
+/// operation shapes, pointer syntax, and value presence per operation kind.
+///
+/// # Errors
+///
+/// Returns the first [`A2uiPatchError`] encountered while walking the
+/// envelope and its operations in order.
 pub fn parse_patch_value(value: &Value) -> Result<PatchDocument, A2uiPatchError> {
     let object = value.as_object().ok_or(A2uiPatchError::NotAnObject)?;
     let version = object
@@ -159,6 +206,9 @@ pub fn parse_patch_value(value: &Value) -> Result<PatchDocument, A2uiPatchError>
     Ok(PatchDocument { version, operations })
 }
 
+/// Builds a single-operation patch that replaces the entire document root
+/// with `state`. Used to resynchronize a client from scratch.
+#[must_use]
 pub fn build_replace_root_patch(state: &Value) -> PatchDocument {
     PatchDocument {
         version: A2UI_PATCH_PROTOCOL_VERSION,
@@ -170,6 +220,8 @@ pub fn build_replace_root_patch(state: &Value) -> PatchDocument {
     }
 }
 
+/// Serializes a patch document back into its wire-format JSON envelope.
+#[must_use]
 pub fn patch_document_to_value(document: &PatchDocument) -> Value {
     let operations: Vec<Value> = document
         .operations
@@ -196,10 +248,22 @@ pub fn patch_document_to_value(document: &PatchDocument) -> Value {
     Value::Object(patch)
 }
 
+/// Serializes a patch document to wire-format JSON bytes.
+///
+/// # Errors
+///
+/// Returns [`A2uiPatchError::SerializePatch`] when JSON serialization fails.
 pub fn patch_document_to_bytes(document: &PatchDocument) -> Result<Vec<u8>, A2uiPatchError> {
     Ok(serde_json::to_vec(&patch_document_to_value(document))?)
 }
 
+/// Applies a patch to `state` and returns the patched copy; `state` itself is
+/// never modified, so a failed application cannot leave partial edits behind.
+///
+/// # Errors
+///
+/// Returns [`A2uiPatchError`] on version mismatch, an empty operation list,
+/// or the first operation that conflicts with the current document shape.
 pub fn apply_patch_document(state: &Value, patch: &PatchDocument) -> Result<Value, A2uiPatchError> {
     if patch.version != A2UI_PATCH_PROTOCOL_VERSION {
         return Err(A2uiPatchError::UnsupportedVersion(patch.version));
