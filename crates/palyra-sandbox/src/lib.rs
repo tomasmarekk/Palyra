@@ -1,18 +1,32 @@
+//! Tier C process-sandbox backend planners for Linux, macOS, and Windows.
+//!
+//! Each compile-time-selected backend turns a [`TierCPolicy`] plus a command request into a
+//! launchable [`TierCCommandPlan`] (e.g. a `bwrap` or `sandbox-exec` argv) without spawning the
+//! sandboxed process itself; `palyra-daemon`'s sandbox runner executes the plan. Backends that
+//! cannot enforce the requested isolation fail closed instead of degrading silently.
+
 use std::path::PathBuf;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::{Command, Stdio};
 
 use thiserror::Error;
 
+/// Platform-specific Tier C sandbox backend selected at compile time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TierCBackendKind {
+    /// Linux backend isolating via Bubblewrap (`bwrap`) namespaces.
     LinuxBubblewrap,
+    /// macOS backend isolating via `sandbox-exec` SBPL profiles.
     MacosSandboxExec,
+    /// Windows Job Object backend; currently fails closed because filesystem and token
+    /// isolation are not yet OS-enforced.
     WindowsJobObject,
+    /// Targets without any Tier C backend implementation.
     Unsupported,
 }
 
 impl TierCBackendKind {
+    /// Returns the stable backend identifier used in error messages and configuration.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -23,6 +37,10 @@ impl TierCBackendKind {
         }
     }
 
+    /// Returns the stable executor label recorded in tool attestations.
+    ///
+    /// These labels are part of the attestation contract; renaming one invalidates
+    /// previously recorded attestations.
     #[must_use]
     pub const fn executor_label(self) -> &'static str {
         match self {
@@ -34,55 +52,94 @@ impl TierCBackendKind {
     }
 }
 
+/// Isolation policy for a single Tier C sandboxed command execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TierCPolicy {
+    /// Directory tree the sandboxed process may read and write.
     pub workspace_root: PathBuf,
+    /// Working directory for the sandboxed process; expected to live under `workspace_root`.
     pub cwd: PathBuf,
+    /// When `true`, the backend must deny all network access at the OS level.
     pub enforce_network_isolation: bool,
+    /// Host-level egress allowlist; no current backend can enforce it at the OS level, so
+    /// planning fails closed with [`TierCBackendError::HostAllowlistUnsupported`] when non-empty.
     pub allowed_egress_hosts: Vec<String>,
+    /// DNS-suffix egress allowlist; same enforcement status as `allowed_egress_hosts`.
     pub allowed_dns_suffixes: Vec<String>,
 }
 
+/// Command and arguments to run inside the Tier C sandbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TierCCommandRequest {
+    /// Program to execute inside the sandbox.
     pub command: String,
+    /// Arguments passed to `command` unchanged.
     pub args: Vec<String>,
 }
 
+/// Fully resolved sandbox invocation: spawn `program` with `args`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TierCCommandPlan {
+    /// Backend that produced this plan.
     pub backend: TierCBackendKind,
+    /// Sandbox wrapper binary to spawn (e.g. `bwrap`, `sandbox-exec`).
     pub program: String,
+    /// Complete argument list for `program`, including the wrapped command.
     pub args: Vec<String>,
 }
 
+/// Isolation features a Tier C backend can enforce at runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TierCBackendCapabilities {
+    /// Backend can deny all network access at the OS level.
     pub runtime_network_isolation: bool,
+    /// Backend can enforce per-host egress allowlists at the OS level.
     pub host_allowlists: bool,
 }
 
+/// Failures while planning a Tier C sandboxed command; every variant means the command
+/// must not run, because no backend degrades to weaker isolation.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum TierCBackendError {
+    /// The backend cannot run on this host or is deliberately disabled.
     #[error("tier-c backend '{backend}' is unavailable: {reason}")]
     BackendUnavailable { backend: &'static str, reason: String },
+    /// The helper binary the backend wraps could not be spawned from `PATH`.
     #[error("tier-c backend '{backend}' requires binary '{binary}' in PATH")]
     BackendBinaryMissing { backend: &'static str, binary: String },
+    /// The policy contains host/DNS egress allowlists, which no current backend can
+    /// enforce at the OS level.
     #[error(
         "tier-c backend '{backend}' cannot enforce host-level egress allowlists; use preflight mode or clear allowlists"
     )]
     HostAllowlistUnsupported { backend: &'static str },
+    /// Reserved for backends that cannot satisfy [`TierCPolicy::enforce_network_isolation`];
+    /// no in-crate backend emits it today (such platforms fail earlier with
+    /// [`TierCBackendError::BackendUnavailable`]), but `palyra-daemon` maps it.
     #[error(
         "tier-c backend '{backend}' cannot enforce runtime network isolation on this platform"
     )]
     NetworkIsolationUnsupported { backend: &'static str },
 }
 
+/// Planner for one platform's Tier C sandbox mechanism.
+///
+/// Implementations only plan the sandboxed invocation; apart from probing for required
+/// helper binaries they never spawn processes and never mutate host state.
 pub trait TierCBackend {
+    /// Identifies which platform backend this is.
     fn kind(&self) -> TierCBackendKind;
 
+    /// Reports which isolation features this backend can enforce at runtime.
     fn capabilities(&self) -> TierCBackendCapabilities;
 
+    /// Builds a launchable command plan for `request` under `policy`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TierCBackendError`] when the backend is unavailable on this host, a
+    /// required helper binary is missing, or `policy` requests isolation the backend
+    /// cannot enforce; planning fails closed rather than weakening the sandbox.
     fn build_command_plan(
         &self,
         policy: &TierCPolicy,
@@ -92,6 +149,8 @@ pub trait TierCBackend {
 
 #[cfg(target_os = "linux")]
 mod platform {
+    //! Linux Tier C backend planning `bwrap` invocations with namespace isolation.
+
     use std::path::{Component, Path, PathBuf};
 
     use super::{
@@ -119,14 +178,16 @@ mod platform {
             request: &TierCCommandRequest,
         ) -> Result<TierCCommandPlan, TierCBackendError> {
             ensure_binary_available("bwrap", self.kind().as_str())?;
+            // bwrap can only unshare the network namespace entirely; it cannot filter
+            // egress per host, so non-empty allowlists must fail closed.
             if !policy.allowed_egress_hosts.is_empty() || !policy.allowed_dns_suffixes.is_empty() {
                 return Err(TierCBackendError::HostAllowlistUnsupported {
                     backend: self.kind().as_str(),
                 });
             }
 
-            let workspace = policy.workspace_root.to_string_lossy().to_string();
-            let cwd = policy.cwd.to_string_lossy().to_string();
+            let workspace = policy.workspace_root.to_string_lossy().into_owned();
+            let cwd = policy.cwd.to_string_lossy().into_owned();
             let mut args = vec![
                 "--die-with-parent".to_owned(),
                 "--new-session".to_owned(),
@@ -183,6 +244,8 @@ mod platform {
         }
     }
 
+    /// Binds `source` read-only only when it exists on the host; bwrap aborts on missing
+    /// bind sources, and paths like `/lib64` are distribution-specific.
     fn append_ro_bind_if_exists(args: &mut Vec<String>, source: &str, destination: &str) {
         if !Path::new(source).exists() {
             return;
@@ -190,6 +253,8 @@ mod platform {
         args.extend(["--ro-bind".to_owned(), source.to_owned(), destination.to_owned()]);
     }
 
+    /// Emits `--dir` entries for each ancestor of the workspace root so the later
+    /// `--bind` has a mount point inside the otherwise-empty sandbox filesystem.
     fn append_workspace_path_scaffold(args: &mut Vec<String>, workspace_root: &Path) {
         let mut current = PathBuf::from("/");
         for component in workspace_root.components() {
@@ -197,16 +262,19 @@ mod platform {
                 continue;
             }
             current.push(component.as_os_str());
+            // The workspace root itself is created by `--bind`; only ancestors need `--dir`.
             if current == workspace_root {
                 break;
             }
-            args.extend(["--dir".to_owned(), current.to_string_lossy().to_string()]);
+            args.extend(["--dir".to_owned(), current.to_string_lossy().into_owned()]);
         }
     }
 }
 
 #[cfg(target_os = "macos")]
 mod platform {
+    //! macOS Tier C backend planning `sandbox-exec` invocations with SBPL profiles.
+
     use super::{
         ensure_binary_available, TierCBackend, TierCBackendCapabilities, TierCBackendError,
         TierCBackendKind, TierCCommandPlan, TierCCommandRequest, TierCPolicy,
@@ -232,6 +300,8 @@ mod platform {
             request: &TierCCommandRequest,
         ) -> Result<TierCCommandPlan, TierCBackendError> {
             ensure_binary_available("sandbox-exec", self.kind().as_str())?;
+            // SBPL network rules are all-or-nothing here; per-host allowlists cannot be
+            // enforced, so they must fail closed.
             if !policy.allowed_egress_hosts.is_empty() || !policy.allowed_dns_suffixes.is_empty() {
                 return Err(TierCBackendError::HostAllowlistUnsupported {
                     backend: self.kind().as_str(),
@@ -245,7 +315,11 @@ mod platform {
         }
     }
 
+    /// Renders the deny-by-default SBPL profile: read access to the OS runtime, read/write
+    /// limited to the workspace and temp directories, network per policy.
     fn render_sandbox_profile(policy: &TierCPolicy) -> String {
+        // Escape backslashes before quotes so a hostile workspace path cannot terminate
+        // the SBPL string literal and inject profile rules.
         let workspace =
             policy.workspace_root.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
         let network_clause = if policy.enforce_network_isolation {
@@ -281,6 +355,8 @@ mod platform {
 
 #[cfg(windows)]
 mod platform {
+    //! Windows Tier C backend; deliberately fails closed until OS-enforced isolation lands.
+
     use super::{
         TierCBackend, TierCBackendCapabilities, TierCBackendError, TierCBackendKind,
         TierCCommandPlan, TierCCommandRequest, TierCPolicy,
@@ -315,6 +391,8 @@ mod platform {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 mod platform {
+    //! Fallback Tier C backend for targets without a sandbox implementation; fails closed.
+
     use super::{
         TierCBackend, TierCBackendCapabilities, TierCBackendError, TierCBackendKind,
         TierCCommandPlan, TierCCommandRequest, TierCPolicy,
@@ -351,21 +429,32 @@ fn backend() -> &'static dyn TierCBackend {
     &platform::BACKEND
 }
 
+/// Returns the Tier C backend kind compiled for this target.
 #[must_use]
 pub fn current_backend_kind() -> TierCBackendKind {
     backend().kind()
 }
 
+/// Returns the stable executor label of the compiled backend, for tool attestations.
 #[must_use]
 pub fn current_backend_executor() -> &'static str {
     current_backend_kind().executor_label()
 }
 
+/// Returns the runtime isolation capabilities of the compiled backend.
 #[must_use]
 pub fn current_backend_capabilities() -> TierCBackendCapabilities {
     backend().capabilities()
 }
 
+/// Builds a launchable sandbox command plan for `request` under `policy` using the
+/// backend compiled for this target.
+///
+/// # Errors
+///
+/// Returns a [`TierCBackendError`] when the backend is unavailable, its helper binary is
+/// missing, or `policy` requests isolation the backend cannot enforce (fail closed); see
+/// [`TierCBackend::build_command_plan`].
 pub fn build_tier_c_command_plan(
     policy: &TierCPolicy,
     request: &TierCCommandRequest,
@@ -373,6 +462,8 @@ pub fn build_tier_c_command_plan(
     backend().build_command_plan(policy, request)
 }
 
+/// Probes availability by spawning `binary --help`; only a spawn failure (typically
+/// not-found) counts as missing — a non-zero exit still proves the binary is runnable.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn ensure_binary_available(binary: &str, backend: &'static str) -> Result<(), TierCBackendError> {
     let status = Command::new(binary)
