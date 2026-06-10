@@ -1,3 +1,8 @@
+//! End-to-end tests for the QUIC transport: mTLS roundtrip with stream resume,
+//! rejection of untrusted and expired server certificates, structured
+//! protocol-mismatch responses, and explicit (never silent) TCP fallback.
+//! Runs a minimal in-process QUIC server against throwaway PKI material.
+
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
@@ -266,7 +271,7 @@ async fn quic_transport_protocol_mismatch_returns_structured_error_response() {
     assert!(!response.ok, "protocol mismatch should return explicit error response");
     assert_eq!(response.kind, "error");
     assert!(
-        response.error.as_deref().map(|value| value.contains("protocol_mismatch")).unwrap_or(false),
+        response.error.as_deref().is_some_and(|value| value.contains("protocol_mismatch")),
         "error response should include protocol_mismatch marker"
     );
 }
@@ -471,15 +476,15 @@ fn build_test_pki() -> TestPki {
         .issue_server_certificate("localhost", Duration::from_secs(3_600))
         .expect("untrusted server cert should issue");
 
-    let expired_server = build_expired_server_cert(&trusted_ca);
+    let (expired_server_cert_pem, expired_server_key_pem) = build_expired_server_cert(&trusted_ca);
     TestPki {
         ca_cert_pem: trusted_ca.certificate_pem.clone(),
         server_cert_pem: server.certificate_pem,
         server_key_pem: server.private_key_pem,
         untrusted_server_cert_pem: untrusted_server.certificate_pem,
         untrusted_server_key_pem: untrusted_server.private_key_pem,
-        expired_server_cert_pem: expired_server.0,
-        expired_server_key_pem: expired_server.1,
+        expired_server_cert_pem,
+        expired_server_key_pem,
         client_cert_pem: client.certificate_pem,
         client_key_pem: client.private_key_pem,
     }
