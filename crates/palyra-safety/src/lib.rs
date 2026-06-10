@@ -773,7 +773,7 @@ fn push_unique_finding(findings: &mut Vec<SafetyFinding>, finding: SafetyFinding
 
 fn scan_secret_material(text: &str, normalized: &str, findings: &mut Vec<SafetyFinding>) {
     // Two separate needles instead of one so every PEM label variant matches
-    // ("BEGIN RSA PRIVATE KEY", "BEGIN OPENSSH PRIVATE KEY", ...).
+    // (the RSA, OPENSSH, EC, ... qualifiers between the two needles).
     if normalized.contains("-----begin ") && normalized.contains("private key-----") {
         push_unique_finding(
             findings,
