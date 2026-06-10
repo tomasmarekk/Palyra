@@ -1,3 +1,10 @@
+//! Manifest parsing and validation: identifier/host/path grammar, wildcard
+//! opt-in enforcement, semver compatibility, and non-fatal warning collection.
+//!
+//! Everything here treats manifest text as hostile input: validation rejects
+//! anything the grammar does not explicitly allow, and all rules run before an
+//! artifact can reach trust or runtime decisions.
+
 use std::collections::BTreeSet;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -13,6 +20,17 @@ use crate::models::{
     SkillConfigValueType, SkillManifest, SkillManifestWarning, SkillManifestWarningSeverity,
 };
 
+/// Parses and fully validates a `skill.toml` manifest.
+///
+/// Unknown fields are rejected (`deny_unknown_fields`), and all semantic rules
+/// (identifier grammar, tool namespacing, wildcard opt-ins, quota floors,
+/// builder/operator metadata) are enforced before the manifest is returned.
+///
+/// # Errors
+/// Returns [`SkillPackagingError::ManifestParse`] when the TOML does not
+/// deserialize, and [`SkillPackagingError::ManifestValidation`] (or
+/// [`SkillPackagingError::InvalidArtifactPath`] for path fields) when a
+/// semantic rule fails.
 pub fn parse_manifest_toml(raw: &str) -> Result<SkillManifest, SkillPackagingError> {
     let manifest = toml::from_str::<SkillManifest>(raw)
         .map_err(|error| SkillPackagingError::ManifestParse(error.to_string()))?;
@@ -20,13 +38,23 @@ pub fn parse_manifest_toml(raw: &str) -> Result<SkillManifest, SkillPackagingErr
     Ok(manifest)
 }
 
+/// Decodes an Ed25519 signing key from raw bytes, hex, or base64 input.
+///
+/// Accepted encodings, tried in order: exact 32 raw bytes, 32 raw bytes after
+/// ASCII-whitespace trimming, then (as trimmed UTF-8 text) hex and standard
+/// base64 decoding to 32 bytes. Raw bytes win deliberately: a 32-byte value
+/// that happens to also be valid hex/base64 text is treated as the key itself.
+///
+/// # Errors
+/// Returns [`SkillPackagingError::InvalidSigningKeyLength`] when no accepted
+/// encoding yields exactly 32 bytes.
 pub fn parse_ed25519_signing_key(secret: &[u8]) -> Result<[u8; 32], SkillPackagingError> {
     if secret.len() == 32 {
         let mut key = [0_u8; 32];
         key.copy_from_slice(secret);
         return Ok(key);
     }
-    let trimmed = trim_ascii_whitespace(secret);
+    let trimmed = secret.trim_ascii();
     if trimmed.len() == 32 {
         let mut key = [0_u8; 32];
         key.copy_from_slice(trimmed);
@@ -166,6 +194,9 @@ fn validate_manifest(manifest: &SkillManifest) -> Result<(), SkillPackagingError
     Ok(())
 }
 
+/// Fails when the declared compatibility range excludes the current host
+/// (protocol major above the canonical one, or host version outside
+/// `min..=max`); used as a hard gate on both build and verify paths.
 pub(crate) fn assert_runtime_compatibility(
     compat: &SkillCompat,
 ) -> Result<(), SkillPackagingError> {
@@ -375,6 +406,8 @@ fn validate_operator_metadata(
     Ok(())
 }
 
+/// Collects non-fatal findings (legacy version, missing/weak operator
+/// metadata) for an already-validated manifest; never blocks verification.
 pub(crate) fn collect_manifest_warnings(manifest: &SkillManifest) -> Vec<SkillManifestWarning> {
     let mut warnings = Vec::new();
     if manifest.manifest_version == LEGACY_SKILL_MANIFEST_VERSION {
@@ -699,6 +732,10 @@ fn normalize_skill_id(value: &str) -> Result<String, SkillPackagingError> {
     Ok(normalized)
 }
 
+/// Validates and trims a lowercase identifier (`a-z 0-9 . _ - :` after trim).
+///
+/// This is the loosest identifier grammar in the crate; callers with stricter
+/// needs (e.g. `normalize_skill_id`) layer extra checks on top.
 pub(crate) fn normalize_identifier(
     value: &str,
     field: &str,
@@ -717,6 +754,8 @@ pub(crate) fn normalize_identifier(
     Ok(normalized.to_owned())
 }
 
+/// Normalizes a trust-store key to lowercase hex and requires a 32-byte
+/// (Ed25519 public key sized) decoding, so stored keys compare canonically.
 pub(crate) fn normalize_public_key_hex(value: &str) -> Result<String, SkillPackagingError> {
     let normalized = value.trim().to_ascii_lowercase();
     let decoded = hex::decode(normalized.as_str()).map_err(|_| {
@@ -730,6 +769,9 @@ pub(crate) fn normalize_public_key_hex(value: &str) -> Result<String, SkillPacka
     Ok(normalized)
 }
 
+// Deliberately minimal: the manifest grammar only permits numeric
+// `major.minor.patch` triples, so pre-release/build-metadata suffixes are
+// rejected rather than parsed.
 fn parse_semver(value: &str, field: &str) -> Result<(u32, u32, u32), SkillPackagingError> {
     let parts = value.trim().split('.').collect::<Vec<_>>();
     if parts.len() != 3 {
@@ -747,11 +789,4 @@ fn parse_semver(value: &str, field: &str) -> Result<(u32, u32, u32), SkillPackag
         .parse::<u32>()
         .map_err(|_| SkillPackagingError::ManifestValidation(format!("{field} patch invalid")))?;
     Ok((major, minor, patch))
-}
-
-fn trim_ascii_whitespace(raw: &[u8]) -> &[u8] {
-    let start = raw.iter().position(|value| !value.is_ascii_whitespace()).unwrap_or(raw.len());
-    let end =
-        raw.iter().rposition(|value| !value.is_ascii_whitespace()).map_or(start, |index| index + 1);
-    &raw[start..end]
 }

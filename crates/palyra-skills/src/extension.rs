@@ -1,3 +1,11 @@
+//! Extension lifecycle layer above raw skill artifacts: registry records,
+//! capability grant diffs, compatibility/doctor preflight, enable/eval gates,
+//! and self-improvement rollback planning.
+//!
+//! Lifecycle transitions are an explicit allowlisted state machine
+//! (`is_lifecycle_transition_allowed`), and quarantine release requires a
+//! reviewer distinct from the acting principal (four-eyes rule).
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use palyra_common::{build_metadata, CANONICAL_PROTOCOL_MAJOR};
@@ -91,6 +99,7 @@ pub enum ExtensionCapabilityClass {
 }
 
 impl ExtensionCapabilityClass {
+    /// Returns the policy action string evaluated for grants of this class.
     #[must_use]
     pub fn policy_action(self) -> &'static str {
         match self {
@@ -116,6 +125,7 @@ pub struct ExtensionCapabilityGrant {
 }
 
 impl ExtensionCapabilityGrant {
+    /// Builds a grant with `policy_action` derived from the capability class.
     #[must_use]
     pub fn new(
         class: ExtensionCapabilityClass,
@@ -174,6 +184,11 @@ pub trait ExtensionPackageRegistry {
     fn upsert_package(&mut self, record: ExtensionPackageRegistryRecord);
 
     /// Applies a validated lifecycle transition and returns the updated record.
+    ///
+    /// # Errors
+    /// Returns [`SkillPackagingError::ExtensionLifecycle`] when the package is
+    /// unknown or the transition is rejected by
+    /// [`apply_extension_lifecycle_transition`].
     fn transition_package(
         &mut self,
         request: ExtensionLifecycleTransitionRequest,
@@ -539,6 +554,15 @@ pub fn extension_record_from_skill_artifact(
 }
 
 /// Runs read-only package integrity, manifest, ABI, grants and security preflight.
+///
+/// An empty `explicit_grants` slice means "grant exactly what the manifest
+/// requests"; otherwise the supplied grants are diffed against the manifest.
+///
+/// # Errors
+/// Returns any verification, trust, or audit error from
+/// [`inspect_skill_artifact`] and [`audit_skill_artifact_security`]; policy
+/// failures that produce a report are encoded in `status`/`reason_codes`
+/// rather than returned as errors.
 pub fn extension_doctor_for_skill_artifact(
     artifact_bytes: &[u8],
     source: ExtensionPackageSource,
@@ -576,6 +600,8 @@ pub fn extension_doctor_for_skill_artifact(
         accepted: audit.accepted,
         passed: audit.passed,
         should_quarantine: audit.should_quarantine,
+        // Unsigned or signature-invalid artifacts error out of the audit above,
+        // so any report that reaches this point describes a signed artifact.
         signed: true,
         failed_checks: audit
             .checks
@@ -612,6 +638,15 @@ pub fn extension_doctor_for_skill_artifact(
 }
 
 /// Applies a lifecycle transition without losing audit context.
+///
+/// Gate order: identity and audit fields (package id, reason, principals)
+/// first, then the transition allowlist, then the enable-specific checks
+/// (compatibility, and the four-eyes rule for quarantined packages — the
+/// approving reviewer must differ from the acting principal).
+///
+/// # Errors
+/// Returns [`SkillPackagingError::ExtensionLifecycle`] when any of the gates
+/// above rejects the request.
 pub fn apply_extension_lifecycle_transition(
     current: &ExtensionPackageRegistryRecord,
     request: &ExtensionLifecycleTransitionRequest,
@@ -681,26 +716,19 @@ fn normalize_lifecycle_principal(
 }
 
 /// Runs extension ABI fixture checks against the current host.
+///
+/// A fixture passes when the observed compatibility reason codes match its
+/// `expected_reason_codes` exactly (including order).
 #[must_use]
 pub fn evaluate_extension_contract_fixture(
     fixture: &ExtensionContractFixture,
 ) -> ExtensionContractTestOutcome {
-    let compat = ExtensionCompatibilityResult {
-        compatible: true,
-        manifest_version: fixture.manifest_version,
-        required_protocol_major: fixture.required_protocol_major,
-        current_protocol_major: CANONICAL_PROTOCOL_MAJOR,
-        min_host_version: fixture.min_host_version.clone(),
-        max_host_version: fixture.max_host_version.clone(),
-        current_host_version: build_metadata().version.to_owned(),
-        issues: compatibility_issues_for_raw_ranges(
-            fixture.required_protocol_major,
-            fixture.min_host_version.as_str(),
-            fixture.max_host_version.as_deref(),
-        ),
-    };
-    let observed_reason_codes =
-        compat.issues.iter().map(|issue| issue.code.clone()).collect::<Vec<_>>();
+    let issues = compatibility_issues_for_raw_ranges(
+        fixture.required_protocol_major,
+        fixture.min_host_version.as_str(),
+        fixture.max_host_version.as_deref(),
+    );
+    let observed_reason_codes = issues.iter().map(|issue| issue.code.clone()).collect::<Vec<_>>();
     ExtensionContractTestOutcome {
         fixture_id: fixture.fixture_id.clone(),
         passed: observed_reason_codes == fixture.expected_reason_codes,
@@ -740,6 +768,11 @@ pub fn evaluate_skill_fixture(
 }
 
 /// Records deterministic eval outcomes and aggregates provider usage/artifact refs.
+///
+/// Run status precedence: no outcomes -> `missing`, any flaky signal ->
+/// `flaky` (even if everything passed), all passed -> `passed`, otherwise
+/// `failed`. Flakiness outranks success because a flaky eval cannot gate a
+/// rollout.
 #[must_use]
 pub fn skill_eval_run_record(
     eval_run_id: impl Into<String>,
@@ -866,6 +899,15 @@ pub fn plan_self_improvement_rollback(
 }
 
 /// Builds self-improvement metadata from a generic review payload.
+///
+/// `source_refs` and `tests` are deduplicated and sorted; expected
+/// capabilities are canonicalized like manifest-derived grants.
+///
+/// # Errors
+/// Returns [`SkillPackagingError::ManifestValidation`] when a required text
+/// field (`rationale`, `risk`, `sensitivity`) is missing or empty, and
+/// [`SkillPackagingError::ExtensionLifecycle`] when an expected-capability
+/// entry is malformed.
 pub fn extract_self_improvement_candidate(
     candidate_id: impl Into<String>,
     payload: &Value,
@@ -930,10 +972,12 @@ pub fn extension_grants_from_skill_snapshot(
         ));
     }
     for secret in &snapshot.secret_keys {
-        let (scope, key) = secret
-            .split_once('/')
-            .map(|(scope, key)| (Some(scope.to_owned()), key.to_owned()))
-            .unwrap_or((None, secret.clone()));
+        // Snapshot secret keys are encoded as "<scope>/<key>"; entries without
+        // a separator are treated as unscoped keys.
+        let (scope, key) = match secret.split_once('/') {
+            Some((scope, key)) => (Some(scope.to_owned()), key.to_owned()),
+            None => (None, secret.clone()),
+        };
         grants.push(ExtensionCapabilityGrant::new(ExtensionCapabilityClass::Secret, key, scope));
     }
     for prefix in &snapshot.storage_prefixes {
@@ -1042,6 +1086,10 @@ fn doctor_reason_codes_and_hints(
     (reason_codes.into_iter().collect(), repair_hints.into_iter().collect())
 }
 
+// Allowlisted state machine: any pair missing here is rejected, so new states
+// or edges must be added deliberately. Note the deliberate asymmetries —
+// Removed and Failed are near-terminal, and quarantine release still passes
+// the four-eyes check in `apply_extension_lifecycle_transition`.
 fn is_lifecycle_transition_allowed(
     current: ExtensionPackageStatus,
     target: ExtensionPackageStatus,
@@ -1071,6 +1119,9 @@ fn is_lifecycle_transition_allowed(
     )
 }
 
+// Trims values/scopes, re-derives policy_action from the class (so a
+// deserialized grant cannot smuggle a mismatched action), drops empty values,
+// and sort-deduplicates via BTreeSet for deterministic output.
 fn canonicalize_grants(grants: Vec<ExtensionCapabilityGrant>) -> Vec<ExtensionCapabilityGrant> {
     grants
         .into_iter()
@@ -1133,6 +1184,12 @@ fn required_payload_text(
 }
 
 /// Provides a stable JSON snapshot for registry contract tests.
+///
+/// Records are sorted by `package_id` so the snapshot is order-independent.
+///
+/// # Errors
+/// Returns [`SkillPackagingError::Serialization`] when a record fails JSON
+/// serialization.
 pub fn extension_registry_snapshot(
     records: &[ExtensionPackageRegistryRecord],
 ) -> Result<Value, SkillPackagingError> {

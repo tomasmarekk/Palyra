@@ -1,3 +1,9 @@
+//! Projection of validated manifests into runtime capability grants and
+//! deny-by-default policy bindings/requests.
+//!
+//! Outputs are sorted and deduplicated so downstream policy evaluation and
+//! contract snapshots stay deterministic.
+
 use std::collections::BTreeMap;
 
 use palyra_plugins_runtime::CapabilityGrantSet;
@@ -5,6 +11,10 @@ use palyra_policy::PolicyRequest;
 
 use crate::models::{SkillCapabilityGrantSnapshot, SkillManifest, SkillPolicyBinding};
 
+/// Flattens manifest capabilities into the runtime grant snapshot.
+///
+/// Secret keys are emitted as `<scope>/<key>`; only filesystem *write* roots
+/// become storage prefixes (read roots are not part of the runtime grant set).
 pub fn capability_grants_from_manifest(manifest: &SkillManifest) -> SkillCapabilityGrantSnapshot {
     let mut secret_keys = manifest
         .capabilities
@@ -21,10 +31,20 @@ pub fn capability_grants_from_manifest(manifest: &SkillManifest) -> SkillCapabil
         http_hosts: dedupe_sorted(manifest.capabilities.http_egress_allowlist.as_slice()),
         secret_keys,
         storage_prefixes: dedupe_sorted(manifest.capabilities.filesystem.write_roots.as_slice()),
+        // AIDEV-NOTE: channels are intentionally never derived from the
+        // manifest here, while `extension_capability_grants_from_skill_manifest`
+        // maps `node_capabilities` to Channel grants. Snapshot-based grant
+        // conversion therefore drops node/channel capabilities; populating
+        // this field would change persisted grant snapshots.
         channels: Vec::new(),
     }
 }
 
+/// Derives deduplicated policy bindings: one `tool.execute` binding per tool
+/// plus one approval-required binding per used capability class.
+///
+/// Capability bindings always set `requires_approval = true`; tool bindings
+/// inherit the tool's risk flags.
 #[must_use]
 pub fn policy_bindings_from_manifest(manifest: &SkillManifest) -> Vec<SkillPolicyBinding> {
     let mut bindings = manifest
@@ -80,6 +100,8 @@ pub fn policy_bindings_from_manifest(manifest: &SkillManifest) -> Vec<SkillPolic
     deduped.into_values().collect()
 }
 
+/// Converts the manifest's policy bindings into evaluable policy requests
+/// with the skill itself (`skill:<id>`) as principal.
 #[must_use]
 pub fn policy_requests_from_manifest(manifest: &SkillManifest) -> Vec<PolicyRequest> {
     let principal = format!("skill:{}", manifest.skill_id);
@@ -94,6 +116,7 @@ pub fn policy_requests_from_manifest(manifest: &SkillManifest) -> Vec<PolicyRequ
 }
 
 impl SkillCapabilityGrantSnapshot {
+    /// Converts the snapshot into the plugin runtime's canonicalized grant set.
     #[must_use]
     pub fn to_runtime_capability_grants(&self) -> CapabilityGrantSet {
         CapabilityGrantSet {

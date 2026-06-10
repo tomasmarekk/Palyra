@@ -1,3 +1,13 @@
+//! Skill artifact contract: manifest parsing, signed `.palyra-skill` packaging,
+//! signature/integrity verification, publisher trust (allowlist + TOFU), security
+//! audit, and extension lifecycle gates.
+//!
+//! The packaging path is [`build_signed_skill_artifact`]; the install path is
+//! [`verify_skill_artifact`] / [`inspect_skill_artifact`] followed by
+//! [`audit_skill_artifact_security`]. Verification is fail-closed: any signature,
+//! integrity, trust, or compatibility failure is an error, never a degraded report.
+//! Error/message strings and serde field names are pinned by CLI golden fixtures.
+
 mod artifact;
 mod audit;
 mod constants;

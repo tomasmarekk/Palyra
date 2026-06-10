@@ -1,3 +1,8 @@
+//! Behavior tests for manifest validation, build/verify/TOFU flows, package
+//! guardrails, trust-store handling, security audit, and lifecycle gates.
+//! Several assertions pin error precedence and serialized field names that
+//! external golden fixtures depend on.
+
 use super::ExtensionPackageRegistry;
 use super::{
     audit_skill_artifact_security, build_signed_skill_artifact, builder_manifest_requires_review,

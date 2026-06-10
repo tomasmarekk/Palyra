@@ -1,3 +1,10 @@
+//! Post-verification security audit: manifest capability guardrails, Wasm
+//! module structural checks, and quarantine recommendation.
+//!
+//! The audit only runs on artifacts that already passed signature, integrity,
+//! and trust verification; its job is policy posture, and its verdict is
+//! fail-closed (`should_quarantine` whenever any check fails).
+
 use serde_json::{json, Value};
 use wasmtime::{Engine, ExternType, Module};
 
@@ -9,6 +16,18 @@ use crate::models::{
 };
 use crate::verify::{inspect_skill_artifact, verify_skill_artifact};
 
+/// Runs the full security audit for an artifact and returns the check report.
+///
+/// Verification (signature, integrity, trust) gates the audit: untrusted or
+/// tampered artifacts error out instead of producing a failing report, so a
+/// report always describes a cryptographically verified artifact. The
+/// vulnerability-feed check reads the `PALYRA_SKILL_AUDIT_VULN_FEED_HOOK`
+/// environment variable and warns — never fails — when it is unset or blank.
+///
+/// # Errors
+/// Returns any error from [`verify_skill_artifact`] or
+/// [`inspect_skill_artifact`]; audit-policy violations are reported as failed
+/// checks in the returned report, not as errors.
 pub fn audit_skill_artifact_security(
     artifact_bytes: &[u8],
     trust_store: &mut SkillTrustStore,
@@ -84,6 +103,8 @@ pub fn audit_skill_artifact_security(
         let Some(module_bytes) = inspected.entries.get(module_path.as_str()) else {
             continue;
         };
+        // Size gate first: an oversized module is rejected before its bytes
+        // ever reach the wasmtime compiler.
         if module_bytes.len() as u64 > policy.max_module_bytes {
             push_fail_check(
                 &mut checks,
@@ -229,6 +250,9 @@ pub fn audit_skill_artifact_security(
     })
 }
 
+// Records the declared capability surface as informational pass checks, then
+// fails device and wildcard capabilities unless the audit policy explicitly
+// allows them — those two classes bypass the sandbox's least-privilege story.
 fn audit_manifest_capability_guardrails(
     manifest: &SkillManifest,
     policy: &SkillSecurityAuditPolicy,
@@ -321,6 +345,9 @@ fn wildcard_opt_in_names(manifest: &SkillManifest) -> Vec<&'static str> {
     .collect()
 }
 
+// Prefix match catches every wasi:filesystem interface version (e.g.
+// "wasi:filesystem/types@0.2.0"); trim/lowercase is defensive normalization
+// against cosmetic variations in the import namespace.
 fn module_imports_wasi_filesystem(module: &Module) -> bool {
     module.imports().any(|import| {
         let namespace = import.module().trim().to_ascii_lowercase();

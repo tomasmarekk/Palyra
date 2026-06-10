@@ -1,6 +1,13 @@
+//! Signed `.palyra-skill` ZIP packaging and the matching parse/verify path:
+//! canonical payload hashing, Ed25519 signing, integrity cross-checks, and
+//! zip-bomb-resistant decoding.
+//!
+//! The payload digest covers every entry except `signature.json` using a
+//! length-prefixed, domain-separated encoding; both the build and verify sides
+//! must keep that encoding bit-identical or every existing artifact breaks.
+
 use std::{
     collections::BTreeMap,
-    convert::TryInto,
     io::{Cursor, Read, Write},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -24,6 +31,18 @@ use crate::models::{
     SkillIntegrityEntry,
 };
 
+/// Validates inputs, assembles the payload, signs it, and encodes the final
+/// `.palyra-skill` ZIP artifact.
+///
+/// The manifest's `integrity.files` section is regenerated from the actual
+/// payload, so any caller-supplied integrity entries are replaced. Output is
+/// deterministic apart from `signed_at_unix_ms` in `signature.json`.
+///
+/// # Errors
+/// Returns manifest parse/validation errors, runtime-compatibility errors,
+/// SBOM/provenance validation errors, size/entry-count limit errors, and
+/// [`SkillPackagingError::Zip`]/[`SkillPackagingError::Io`] on encoding
+/// failures.
 pub fn build_signed_skill_artifact(
     request: SkillArtifactBuildRequest,
 ) -> Result<SkillArtifactBuildOutput, SkillPackagingError> {
@@ -80,6 +99,8 @@ pub fn build_signed_skill_artifact(
     );
     let signing_key = SigningKey::from_bytes(&request.signing_key);
     let verifying_key = VerifyingKey::from(&signing_key);
+    // The Ed25519 message is the ASCII hex digest string, not the raw hash
+    // bytes; `verify_signature` must keep using the same representation.
     let signature = signing_key.sign(payload_sha256.as_bytes());
     let signature_payload = SkillArtifactSignature {
         algorithm: SIGNATURE_ALGORITHM.to_owned(),
@@ -129,6 +150,15 @@ pub fn build_signed_skill_artifact(
     })
 }
 
+/// Checks required entries, payload hash, signature, publisher binding, and
+/// the manifest integrity table for already-decoded artifact entries.
+///
+/// AIDEV-NOTE: manifest/SBOM/provenance parsing runs BEFORE the signature is
+/// verified, so those parsers see unauthenticated input (bounded by the
+/// `decode_zip` size limits). Reordering to verify-first would change the
+/// error precedence pinned by tests (e.g. a missing SBOM must surface as
+/// `MissingArtifactEntry`, not as a signature failure) — do not reorder
+/// without a deliberate contract change.
 pub(crate) fn parse_and_verify_artifact(
     entries: &BTreeMap<String, Vec<u8>>,
 ) -> Result<ParsedArtifact, SkillPackagingError> {
@@ -170,6 +200,9 @@ pub(crate) fn parse_and_verify_artifact(
     }
 
     verify_signature(&signature, payload_sha256.as_str())?;
+    // Bind the signature document to the manifest publisher so a valid
+    // signature from publisher A cannot ship a manifest claiming publisher B
+    // (the trust store is keyed by the manifest publisher).
     if signature.publisher != manifest.publisher {
         return Err(SkillPackagingError::SignatureVerificationFailed);
     }
@@ -194,6 +227,10 @@ pub(crate) fn parse_and_verify_artifact(
     Ok(ParsedArtifact { manifest, signature, payload_sha256 })
 }
 
+// Verifies the Ed25519 signature over the ASCII hex digest string — the same
+// message representation `build_signed_skill_artifact` signs. All decode and
+// verify failures collapse into `SignatureVerificationFailed` on purpose so
+// the error cannot act as a parsing oracle.
 fn verify_signature(
     payload: &SkillArtifactSignature,
     payload_sha256: &str,
@@ -212,6 +249,11 @@ fn verify_signature(
         .map_err(|_| SkillPackagingError::SignatureVerificationFailed)
 }
 
+/// Decodes the self-asserted public key from a signature document and checks
+/// algorithm and `key_id` consistency.
+///
+/// This proves only internal consistency of the signature document; whether
+/// the key is *trusted* is decided separately against the trust store.
 pub(crate) fn parse_verifying_key(
     payload: &SkillArtifactSignature,
 ) -> Result<VerifyingKey, SkillPackagingError> {
@@ -233,6 +275,12 @@ pub(crate) fn parse_verifying_key(
     Ok(key)
 }
 
+/// Decodes an artifact ZIP into normalized-path entries while enforcing the
+/// entry-count, per-entry, and total-uncompressed budgets (zip-bomb guard).
+///
+/// Declared entry sizes from the ZIP header are treated as untrusted hints:
+/// they pre-filter obvious oversizes, but the real enforcement happens on the
+/// bytes actually decompressed.
 pub(crate) fn decode_zip(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, SkillPackagingError> {
     if bytes.len() > MAX_ARTIFACT_BYTES {
         return Err(SkillPackagingError::ArtifactTooLarge {
@@ -280,13 +328,20 @@ pub(crate) fn decode_zip(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, Skil
             });
         }
         let entry_limit = remaining_total.min(MAX_ENTRY_BYTES);
+        // Capacity is capped by the limit so a forged declared size cannot
+        // force a huge allocation before any byte is read.
         let mut payload = Vec::with_capacity(declared_size.min(entry_limit));
+        // Read one byte past the limit: landing exactly on `entry_limit + 1`
+        // proves the entry over-ran its declared/allowed size.
         let read_limit = u64::try_from(entry_limit).unwrap_or(u64::MAX).saturating_add(1);
         let mut limited_reader = file.take(read_limit);
         limited_reader
             .read_to_end(&mut payload)
             .map_err(|error| SkillPackagingError::Io(format!("zip read failed: {error}")))?;
         if payload.len() > entry_limit {
+            // Attribute the overflow to whichever budget was actually binding:
+            // the shared artifact total when it shrank the limit, otherwise
+            // the per-entry cap.
             if entry_limit < MAX_ENTRY_BYTES {
                 return Err(SkillPackagingError::ArtifactTooLarge {
                     actual: total_uncompressed.saturating_add(payload.len()),
@@ -313,6 +368,10 @@ pub(crate) fn decode_zip(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, Skil
     Ok(entries)
 }
 
+/// Encodes entries into ZIP bytes with deterministic metadata.
+///
+/// A fixed timestamp and permissions keep the archive byte-reproducible for
+/// identical inputs; entry order is the caller's (BTreeMap) sorted order.
 pub(crate) fn encode_zip<'a>(
     entries: impl Iterator<Item = (&'a String, &'a Vec<u8>)>,
 ) -> Result<Vec<u8>, SkillPackagingError> {
@@ -354,6 +413,11 @@ fn insert_entry(
     Ok(())
 }
 
+// Canonical payload digest: domain-separation context, then each (path,
+// payload) pair length-prefixed. The prefixes make the encoding injective —
+// without them, byte shuffles across a path/payload boundary could collide.
+// Callers must pass entries in a deterministic (BTreeMap) order and exclude
+// `signature.json`. This encoding is the signed message contract; never alter.
 fn compute_payload_hash_hex<'a>(
     entries: impl Iterator<Item = (&'a String, &'a Vec<u8>)>,
 ) -> String {
@@ -367,10 +431,15 @@ fn compute_payload_hash_hex<'a>(
 }
 
 fn hash_len_prefixed(hasher: &mut Sha256, value: &[u8]) {
+    // usize -> u64 is lossless on all supported targets; big-endian width-8
+    // prefix is part of the frozen digest encoding.
     hasher.update((value.len() as u64).to_be_bytes());
     hasher.update(value);
 }
 
+/// Normalizes an artifact-relative path: backslashes become `/`; empty,
+/// absolute, drive-qualified (`:`), NUL-containing, and `.`/`..`-segment
+/// paths are rejected to prevent traversal out of the artifact root.
 pub(crate) fn normalize_artifact_path(raw: &str) -> Result<String, SkillPackagingError> {
     let normalized = raw.trim().replace('\\', "/");
     if normalized.is_empty() || normalized.starts_with('/') || normalized.contains('\0') {
@@ -388,6 +457,8 @@ pub(crate) fn normalize_artifact_path(raw: &str) -> Result<String, SkillPackagin
     Ok(segments.join("/"))
 }
 
+// Truncated (8-byte) key digest used purely as a display/lookup identifier;
+// trust decisions always compare the full 32-byte key, never this id.
 fn key_id_for(key: &VerifyingKey) -> String {
     let digest = Sha256::digest(key.as_bytes());
     format!("ed25519:{}", hex::encode(&digest[..8]))
@@ -397,6 +468,11 @@ fn sha256_hex(payload: &[u8]) -> String {
     hex::encode(Sha256::digest(payload))
 }
 
+/// Current wall-clock time as milliseconds since the Unix epoch (0 if the
+/// clock reads before the epoch). Timestamps are informational metadata, not
+/// security inputs.
 pub(crate) fn now_unix_ms() -> i64 {
+    // `as i64` cannot truncate here: millisecond counts stay below 2^63 for
+    // hundreds of millions of years.
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64
 }

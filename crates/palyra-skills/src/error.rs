@@ -1,5 +1,17 @@
+//! Typed error surface for skill packaging, verification, trust, and lifecycle.
+//!
+//! Display strings are user-visible through the CLI and pinned by golden
+//! fixtures; treat every `#[error(...)]` message as frozen.
+
 use thiserror::Error;
 
+/// Failure modes of skill manifest parsing, artifact packaging, signature and
+/// trust verification, runtime compatibility checks, and lifecycle transitions.
+///
+/// The `#[error]` attribute on each variant documents the user-visible message;
+/// signature and trust failures intentionally carry no cryptographic detail
+/// beyond the publisher identity, so verification errors cannot leak key
+/// material or oracle information.
 #[derive(Debug, Error)]
 pub enum SkillPackagingError {
     #[error("manifest parse failed: {0}")]

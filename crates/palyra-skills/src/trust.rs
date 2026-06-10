@@ -1,3 +1,10 @@
+//! Trust-store persistence and normalization (publisher allowlist + TOFU
+//! pins), plus the builder-output review gate.
+//!
+//! Every load/save path funnels through [`SkillTrustStore::normalize`] so
+//! publishers and keys are always in canonical form before any trust
+//! comparison happens.
+
 use std::{collections::BTreeMap, fs, path::Path};
 
 use crate::error::SkillPackagingError;
@@ -5,6 +12,17 @@ use crate::manifest::{normalize_identifier, normalize_public_key_hex};
 use crate::models::{SkillManifest, SkillTrustStore};
 
 impl SkillTrustStore {
+    /// Loads and normalizes a trust store from a JSON file.
+    ///
+    /// A missing or whitespace-only file yields an empty store (the
+    /// uninitialized state, in which nothing is trusted yet); any other
+    /// unreadable or malformed content is an error rather than an empty
+    /// store, so corruption can never silently widen or reset trust.
+    ///
+    /// # Errors
+    /// Returns [`SkillPackagingError::Io`] when the file cannot be read and
+    /// [`SkillPackagingError::Serialization`] when the JSON does not parse or
+    /// contains invalid publishers/keys.
     pub fn load(path: &Path) -> Result<Self, SkillPackagingError> {
         if !path.exists() {
             return Ok(Self::default());
@@ -29,6 +47,19 @@ impl SkillTrustStore {
         Ok(trust_store)
     }
 
+    /// Writes the normalized trust store as pretty-printed JSON, creating
+    /// parent directories as needed.
+    ///
+    /// AIDEV-NOTE: the write is not atomic (no temp-file + rename), so a crash
+    /// mid-write can leave a truncated file. `load` then fails closed with a
+    /// parse error rather than returning partial trust, so the impact is
+    /// availability, not trust widening. Making it atomic would change
+    /// filesystem behavior — coordinate before fixing.
+    ///
+    /// # Errors
+    /// Returns [`SkillPackagingError::Io`] on directory-creation or write
+    /// failures and [`SkillPackagingError::Serialization`] when the store
+    /// contains entries that fail normalization.
     pub fn save(&self, path: &Path) -> Result<(), SkillPackagingError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|error| {
@@ -51,6 +82,14 @@ impl SkillTrustStore {
         })
     }
 
+    /// Adds a key to the publisher's allowlist (idempotent; keys stay sorted).
+    ///
+    /// Allowlisting takes precedence over any TOFU pin for the same publisher
+    /// during verification.
+    ///
+    /// # Errors
+    /// Returns [`SkillPackagingError::ManifestValidation`] when the publisher
+    /// identifier or the hex key fails normalization.
     pub fn add_trusted_key(
         &mut self,
         publisher: &str,
@@ -67,6 +106,12 @@ impl SkillTrustStore {
         Ok(())
     }
 
+    /// Re-canonicalizes all publishers and keys, rejecting invalid entries.
+    ///
+    /// Distinct raw map keys can collapse to one canonical publisher (e.g.
+    /// only differing by surrounding whitespace), which is why the merge logic
+    /// below deduplicates allowlist keys and treats colliding TOFU pins with
+    /// different keys as an error instead of silently keeping one.
     pub(crate) fn normalize(&mut self) -> Result<(), SkillPackagingError> {
         let mut trusted_publishers = BTreeMap::<String, Vec<String>>::new();
         for (publisher_raw, keys_raw) in &self.trusted_publishers {
@@ -123,6 +168,11 @@ impl SkillTrustStore {
     }
 }
 
+/// Returns `true` when a builder-generated skill still needs human review.
+///
+/// Experimental builder outputs are held until `review_status` reads
+/// `approved` or `signed` (case-insensitive); manifests without builder
+/// metadata never require this gate.
 #[must_use]
 pub fn builder_manifest_requires_review(manifest: &SkillManifest) -> bool {
     manifest.builder.as_ref().is_some_and(|builder| {
