@@ -1,3 +1,9 @@
+//! Long-lived cryptographic identity of a single device.
+//!
+//! Bundles an Ed25519 signing key (pairing challenge signatures) with an X25519 static
+//! secret (pairing key agreement) under a canonical device ID. Secrets round-trip
+//! through a [`SecretStore`]; the `Debug` impl deliberately exposes public keys only.
+
 use std::fmt;
 
 use anyhow::Context;
@@ -13,8 +19,13 @@ use crate::{
     store::SecretStore,
 };
 
+/// A device's long-lived key material plus its canonical device ID.
+///
+/// Holds private keys; never derive `Debug`/`Serialize` on this type directly — the
+/// manual impls and [`DeviceIdentity::store`] control exactly what leaves the process.
 #[derive(Clone)]
 pub struct DeviceIdentity {
+    /// Canonical (26-character Crockford) device identifier.
     pub device_id: String,
     signing_key: SigningKey,
     x25519_secret: StaticSecret,
@@ -28,6 +39,11 @@ struct StoredDeviceIdentity {
 }
 
 impl DeviceIdentity {
+    /// Generates a fresh identity for `device_id` from OS randomness.
+    ///
+    /// # Errors
+    /// Returns [`IdentityError::InvalidCanonicalDeviceId`] for a malformed ID and
+    /// [`IdentityError::Cryptographic`] if OS randomness is unavailable.
     pub fn generate(device_id: &str) -> IdentityResult<Self> {
         validate_canonical_id(device_id)
             .map_err(|error| IdentityError::InvalidCanonicalDeviceId(error.to_string()))?;
@@ -39,37 +55,50 @@ impl DeviceIdentity {
         Ok(Self { device_id: device_id.to_owned(), signing_key, x25519_secret })
     }
 
+    /// Returns the Ed25519 signing key used for pairing challenge signatures.
     #[must_use]
     pub fn signing_key(&self) -> &SigningKey {
         &self.signing_key
     }
 
+    /// Returns the raw Ed25519 public key bytes.
     #[must_use]
     pub fn signing_public_key(&self) -> [u8; 32] {
         self.signing_key.verifying_key().to_bytes()
     }
 
+    /// Returns the Ed25519 verifying key matching [`Self::signing_key`].
     #[must_use]
     pub fn verifying_key(&self) -> VerifyingKey {
         self.signing_key.verifying_key()
     }
 
+    /// Returns the X25519 static secret used for pairing key agreement.
     #[must_use]
     pub fn x25519_secret(&self) -> &StaticSecret {
         &self.x25519_secret
     }
 
+    /// Returns the raw X25519 public key bytes.
     #[must_use]
     pub fn x25519_public_key(&self) -> [u8; 32] {
         X25519PublicKey::from(&self.x25519_secret).to_bytes()
     }
 
+    /// Returns the hex-encoded SHA-256 of the signing public key.
+    ///
+    /// This is the identity fingerprint operators compare during pairing confirmation.
     #[must_use]
     pub fn fingerprint(&self) -> String {
         let hash = Sha256::digest(self.signing_public_key());
         hex::encode(hash)
     }
 
+    /// Persists this identity (including private keys) under `device/<id>/identity.json`.
+    ///
+    /// # Errors
+    /// Returns [`IdentityError::Internal`] on serialization failure and propagates store
+    /// write errors.
     pub fn store(&self, store: &dyn SecretStore) -> IdentityResult<()> {
         let payload = StoredDeviceIdentity {
             device_id: self.device_id.clone(),
@@ -82,6 +111,13 @@ impl DeviceIdentity {
         store.write_secret(&key, &data)
     }
 
+    /// Loads a previously stored identity for `device_id`.
+    ///
+    /// # Errors
+    /// Returns [`IdentityError::InvalidCanonicalDeviceId`] for a malformed ID,
+    /// [`IdentityError::SecretNotFound`] when no identity is stored, and
+    /// [`IdentityError::Internal`] for corrupt payloads or a device-ID mismatch between
+    /// the store key and the stored record.
     pub fn load(store: &dyn SecretStore, device_id: &str) -> IdentityResult<Self> {
         validate_canonical_id(device_id)
             .map_err(|error| IdentityError::InvalidCanonicalDeviceId(error.to_string()))?;
@@ -102,6 +138,8 @@ impl DeviceIdentity {
     }
 }
 
+// INTENTIONAL: manual Debug exposes only public key material so identities can appear
+// in logs and error context without leaking secrets. Do not switch to derive(Debug).
 impl fmt::Debug for DeviceIdentity {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter

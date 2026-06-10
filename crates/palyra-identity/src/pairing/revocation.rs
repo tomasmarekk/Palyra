@@ -1,3 +1,10 @@
+//! Certificate rotation and device revocation on [`IdentityManager`].
+//!
+//! Revocation is two-layered: revoked device IDs can never pair again, and revoked
+//! certificate fingerprints feed the mTLS verifier's revocation index so superseded or
+//! revoked leaves stop connecting immediately. Rotation always revokes every prior
+//! fingerprint of the device — there is never more than one valid leaf per device.
+
 use std::{collections::HashSet, time::SystemTime};
 
 use crate::{
@@ -12,6 +19,13 @@ use super::{
 };
 
 impl IdentityManager {
+    /// Rotates a device's certificate unconditionally, revoking all of its previous
+    /// certificate fingerprints.
+    ///
+    /// # Errors
+    /// Returns [`IdentityError::DeviceRevoked`] / [`IdentityError::DeviceNotPaired`]
+    /// for ineligible devices, [`IdentityError::Cryptographic`] on issuance failure,
+    /// plus lock and persistence failure modes.
     pub fn force_rotate_device_certificate(
         &mut self,
         device_id: &str,
@@ -49,6 +63,14 @@ impl IdentityManager {
         Ok(rotated)
     }
 
+    /// Returns the device's current certificate, rotating first if it is near expiry
+    /// or if its private key is unavailable.
+    ///
+    /// State is reloaded under the cross-process lock before deciding, so a revocation
+    /// written by another process wins over a cached certificate.
+    ///
+    /// # Errors
+    /// Same failure modes as [`Self::force_rotate_device_certificate`].
     pub fn rotate_device_certificate_if_due(
         &mut self,
         device_id: &str,
@@ -61,6 +83,8 @@ impl IdentityManager {
         }
         let paired =
             self.paired_devices.get(device_id).cloned().ok_or(IdentityError::DeviceNotPaired)?;
+        // Private keys are never persisted, so after a reload the stored certificate
+        // is unusable by the device — reissue regardless of remaining lifetime.
         if paired.current_certificate.private_key_pem.is_empty() {
             let rotated = self.force_rotate_device_certificate_inner(device_id)?;
             self.persist_identity_state_bundle()?;
@@ -74,6 +98,14 @@ impl IdentityManager {
         Ok(paired.current_certificate)
     }
 
+    /// Revokes a device: removes its pairing, revokes all of its certificates, and
+    /// records a tombstone that permanently blocks re-pairing under this ID.
+    ///
+    /// Idempotent for already-revoked or never-paired IDs (the tombstone is refreshed
+    /// with the new reason and timestamp).
+    ///
+    /// # Errors
+    /// Returns certificate-parsing, lock, and persistence failure modes.
     pub fn revoke_device(
         &mut self,
         device_id: &str,
@@ -94,11 +126,13 @@ impl IdentityManager {
         })
     }
 
+    /// Returns the pairing record for `device_id`, if currently paired.
     #[must_use]
     pub fn paired_device(&self, device_id: &str) -> Option<&PairedDevice> {
         self.paired_devices.get(device_id)
     }
 
+    /// Returns all paired devices, sorted by device ID for deterministic output.
     #[must_use]
     pub fn paired_devices(&self) -> Vec<PairedDevice> {
         let mut devices = self.paired_devices.values().cloned().collect::<Vec<_>>();
@@ -106,11 +140,13 @@ impl IdentityManager {
         devices
     }
 
+    /// Returns the revocation tombstone for `device_id`, if revoked.
     #[must_use]
     pub fn revoked_device_record(&self, device_id: &str) -> Option<&RevokedDevice> {
         self.revoked_devices.get(device_id)
     }
 
+    /// Returns all revocation tombstones, sorted by device ID for deterministic output.
     #[must_use]
     pub fn revoked_device_records(&self) -> Vec<RevokedDevice> {
         let mut devices = self.revoked_devices.values().cloned().collect::<Vec<_>>();
@@ -118,21 +154,27 @@ impl IdentityManager {
         devices
     }
 
+    /// Returns the set of revoked device IDs.
     #[must_use]
     pub fn revoked_devices(&self) -> HashSet<String> {
         self.revoked_devices.keys().cloned().collect()
     }
 
+    /// Returns all revoked certificate fingerprints — the payload for refreshing a
+    /// [`RevocationIndex`](crate::RevocationIndex).
     #[must_use]
     pub fn revoked_certificate_fingerprints(&self) -> HashSet<String> {
         self.revoked_certificate_fingerprints.clone()
     }
 
+    /// Returns whether the given hex SHA-256 certificate fingerprint is revoked.
     #[must_use]
     pub fn is_revoked_certificate_fingerprint(&self, fingerprint: &str) -> bool {
         self.revoked_certificate_fingerprints.contains(fingerprint)
     }
 
+    /// Finds which paired device a certificate fingerprint belongs to (current or
+    /// historic), e.g. to attribute an mTLS connection to a device.
     #[must_use]
     pub fn device_id_for_certificate_fingerprint(&self, fingerprint: &str) -> Option<String> {
         self.paired_devices.iter().find_map(|(device_id, paired)| {
@@ -150,6 +192,11 @@ impl IdentityManager {
         })
     }
 
+    /// Unpairs a device and revokes its certificates without leaving a tombstone, so
+    /// the same device ID may pair again later. Returns whether the device was paired.
+    ///
+    /// # Errors
+    /// Returns certificate-parsing, lock, and persistence failure modes.
     pub fn remove_paired_device(&mut self, device_id: &str) -> IdentityResult<bool> {
         self.mutate_persisted_state(|manager| {
             let Some(paired) = manager.paired_devices.remove(device_id) else {
@@ -160,12 +207,21 @@ impl IdentityManager {
         })
     }
 
+    /// Removes a revocation tombstone, allowing the device ID to pair again. Returns
+    /// whether a tombstone existed.
+    ///
+    /// Certificate fingerprints revoked alongside the device stay revoked — clearing
+    /// re-admits the ID, never previously issued certificates.
+    ///
+    /// # Errors
+    /// Returns lock and persistence failure modes.
     pub fn clear_revoked_device(&mut self, device_id: &str) -> IdentityResult<bool> {
         self.mutate_persisted_state(|manager| {
             Ok(manager.revoked_devices.remove(device_id).is_some())
         })
     }
 
+    /// Marks every certificate fingerprint of `paired` (historic and current) revoked.
     pub(super) fn revoke_superseded_certificates(
         &mut self,
         paired: &PairedDevice,

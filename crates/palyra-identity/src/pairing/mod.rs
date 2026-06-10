@@ -1,3 +1,10 @@
+//! Device pairing, certificate rotation, and revocation around [`IdentityManager`].
+//!
+//! Submodules split the lifecycle: `handshake` runs the challenge/proof protocol,
+//! `revocation` handles rotation and revocation, `persistence` keeps state consistent
+//! across processes via a generation-counted bundle and a filesystem lock, and
+//! `models`/`helpers` hold the shared types and crypto primitives.
+
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
@@ -22,6 +29,12 @@ pub use models::{
     PairingSession, RevokedDevice, VerifiedPairing,
 };
 
+/// Gateway-side owner of the CA, pairing sessions, paired devices, and revocations.
+///
+/// Durable state (CA, paired devices, revocations) is persisted through the configured
+/// [`SecretStore`] and reloaded under a cross-process lock before every mutation, so
+/// multiple manager instances over one store stay consistent. Active pairing sessions
+/// and the rate-limit history are in-memory only and die with the process.
 pub struct IdentityManager {
     store: Arc<dyn SecretStore>,
     pairing_window: Duration,

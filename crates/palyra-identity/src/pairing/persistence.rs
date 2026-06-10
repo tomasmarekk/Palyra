@@ -1,3 +1,10 @@
+//! Durable identity state: load/persist of the generation-counted state bundle and the
+//! two-level mutation lock (in-process mutex + on-disk lock file) that keeps multiple
+//! threads and processes from clobbering each other's writes.
+//!
+//! The CA (with its private key) is persisted separately from the public bundle so key
+//! material never rides along with routinely replicated state.
+
 use std::{
     fs,
     io::Write,
@@ -38,6 +45,7 @@ const IDENTITY_STATE_STALE_LOCK_AGE: Duration = Duration::from_secs(30);
 
 static IDENTITY_STATE_PROCESS_LOCK: Mutex<()> = Mutex::new(());
 
+/// Owns the on-disk lock file; dropping it releases the cross-process lock.
 struct FilesystemStateLockGuard {
     path: PathBuf,
 }
@@ -48,12 +56,19 @@ impl Drop for FilesystemStateLockGuard {
     }
 }
 
+/// Holds both lock levels for the duration of a state mutation. The filesystem level
+/// is `None` for non-filesystem stores, where the process mutex alone suffices.
 pub(super) struct StateMutationGuard {
     _process: MutexGuard<'static, ()>,
     _filesystem: Option<FilesystemStateLockGuard>,
 }
 
 impl IdentityManager {
+    /// Runs `operation` as a locked read-modify-write: acquire both locks, reload the
+    /// persisted state (so concurrent writers' changes are visible), mutate, persist.
+    ///
+    /// If `operation` fails, nothing is persisted; in-memory state may then be ahead of
+    /// disk, but the next mutation's reload discards it.
     pub(super) fn mutate_persisted_state<T>(
         &mut self,
         operation: impl FnOnce(&mut Self) -> IdentityResult<T>,
@@ -80,6 +95,8 @@ impl IdentityManager {
         let lock_path = store.root_path().join(IDENTITY_STATE_LOCK_FILENAME);
         let start = Instant::now();
         loop {
+            // create_new is the atomic acquisition; the pid/timestamp marker written
+            // afterwards exists only so stale-lock reclaim can identify dead owners.
             match fs::OpenOptions::new().create_new(true).write(true).open(&lock_path) {
                 Ok(mut file) => {
                     let marker = format!(
@@ -136,6 +153,8 @@ impl IdentityManager {
 
     pub(super) fn persist_identity_state_bundle(&mut self) -> IdentityResult<()> {
         let next_generation = self.state_generation.saturating_add(1);
+        // CA state (with private key) is written first: if the bundle write fails, a
+        // bundle must never reference CA material that was not persisted.
         write_sealed_json(self.store.as_ref(), GATEWAY_CA_STATE_KEY, &self.ca.to_stored())?;
         let state = PersistedIdentityStateBundle {
             generation: next_generation,
@@ -160,6 +179,8 @@ fn initialize_filesystem_state_lock_marker(
     })
 }
 
+/// Writes the lock marker, removing the lock file on failure so a half-initialized
+/// lock cannot wedge later acquisitions until the stale-age timeout.
 pub(super) fn initialize_filesystem_state_lock_marker_with_writer(
     lock_path: &Path,
     marker: &str,
@@ -181,6 +202,13 @@ struct FilesystemLockMarker {
     ts_ms: u64,
 }
 
+/// Attempts to remove an abandoned lock file; returns whether the caller may retry
+/// acquisition immediately.
+///
+/// Reclaim is deliberately conservative — a lock is removed only when its marker is
+/// older than `stale_age` AND its owner process is provably dead (or, for unreadable
+/// markers, when the file itself is old). Anything ambiguous keeps the lock, and the
+/// caller falls through to the acquisition timeout instead of risking a stolen lock.
 pub(super) fn try_reclaim_stale_filesystem_lock(
     lock_path: &Path,
     now: SystemTime,
@@ -188,10 +216,12 @@ pub(super) fn try_reclaim_stale_filesystem_lock(
 ) -> IdentityResult<bool> {
     let marker_raw = match fs::read_to_string(lock_path) {
         Ok(raw) => raw,
+        // The owner released it between our failed create and this read.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
         Err(_) => return Ok(false),
     };
     let Some(marker) = parse_filesystem_lock_marker(&marker_raw) else {
+        // No usable pid/timestamp: fall back to file age as the only staleness signal.
         if !lock_file_age_is_stale(lock_path, now, stale_age)? {
             return Ok(false);
         }
@@ -260,6 +290,7 @@ fn remove_filesystem_lock_file(lock_path: &Path) -> IdentityResult<bool> {
 
 #[cfg(unix)]
 fn process_is_alive(pid: u32) -> bool {
+    // Unprobeable pid: claim "alive" so the lock is never reclaimed on uncertainty.
     let Ok(pid_i32) = i32::try_from(pid) else {
         return true;
     };
@@ -271,6 +302,7 @@ fn process_is_alive(pid: u32) -> bool {
     }
     match std::io::Error::last_os_error().raw_os_error() {
         Some(code) if code == libc::ESRCH => false,
+        // EPERM: the process exists but belongs to another user.
         Some(code) if code == libc::EPERM => true,
         _ => true,
     }
@@ -278,6 +310,10 @@ fn process_is_alive(pid: u32) -> bool {
 
 #[cfg(windows)]
 fn process_is_alive(pid: u32) -> bool {
+    // AIDEV-NOTE: `unwrap_or(false)` treats a failed liveness probe as "dead", letting
+    // a stale lock be reclaimed on uncertainty — the opposite of the Unix branch, which
+    // assumes "alive" when it cannot probe. Aligning this to fail-safe (`true`) would
+    // change lock-recovery behavior on Windows, so it is left as-is and only flagged.
     palyra_common::windows_security::process_is_alive(pid).unwrap_or(false)
 }
 
@@ -286,6 +322,8 @@ fn process_is_alive(_pid: u32) -> bool {
     true
 }
 
+/// Loads the gateway CA from its sealed state document, creating and persisting a new
+/// CA on first run.
 fn load_or_init_gateway_ca(store: &dyn SecretStore) -> IdentityResult<CertificateAuthority> {
     match store.read_secret(GATEWAY_CA_STATE_KEY) {
         Ok(raw) => {
@@ -302,6 +340,9 @@ fn load_or_init_gateway_ca(store: &dyn SecretStore) -> IdentityResult<Certificat
     }
 }
 
+/// Loads full identity state, preferring the bundle and falling back to the original
+/// per-document layout. The `bool` reports whether the bundle existed, so the caller
+/// knows to rewrite legacy layouts into bundle form.
 pub(super) fn load_identity_state(
     store: &dyn SecretStore,
 ) -> IdentityResult<(PersistedIdentityState, bool)> {
@@ -332,6 +373,10 @@ fn load_identity_state_bundle(
 ) -> IdentityResult<Option<PersistedIdentityState>> {
     match store.read_secret(IDENTITY_STATE_BUNDLE_KEY) {
         Ok(raw) => {
+            // The legacy shape is tried first because the current shape is a strict
+            // subset of it — a legacy bundle would also parse as current, silently
+            // dropping the embedded CA. On match, copy the CA into its own sealed
+            // document; the bundle itself loses the CA on its next rewrite.
             if let Ok(legacy) = serde_json::from_slice::<LegacyPersistedIdentityStateBundle>(&raw) {
                 write_sealed_json(store, GATEWAY_CA_STATE_KEY, &legacy.ca)?;
                 return Ok(Some(PersistedIdentityState {

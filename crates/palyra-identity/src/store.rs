@@ -1,3 +1,11 @@
+//! Secret-at-rest storage backends for identity state.
+//!
+//! [`FilesystemSecretStore`] encrypts every payload with ChaCha20-Poly1305 under a
+//! per-store key (DPAPI-wrapped on Windows, mode-0600 file elsewhere), hardens file
+//! permissions, and writes atomically via temp-file + rename. [`InMemorySecretStore`]
+//! backs tests and ephemeral managers. Keys are hex-encoded into flat file names, so
+//! logical key strings can never traverse outside the store root.
+
 #[cfg(windows)]
 use palyra_common::windows_security;
 #[cfg(windows)]
@@ -17,25 +25,56 @@ use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 
 use crate::error::{IdentityError, IdentityResult};
 
+// "IDS1" = identity store format v1. Doubles as the discriminator that separates
+// encrypted payloads from legacy plaintext ones in decrypt_secret_payload.
 const SECRET_STORE_ENCRYPTION_MAGIC: &[u8; 4] = b"IDS1";
 const SECRET_STORE_ENCRYPTION_KEY_BYTES: usize = 32;
 const SECRET_STORE_ENCRYPTION_NONCE_BYTES: usize = 12;
 const SECRET_STORE_KEY_FILE: &str = ".store-key.v1";
 
+/// Keyed storage for identity secrets and sealed state documents.
+///
+/// Keys are logical slash-separated paths (e.g. `identity/ca/state.json`); backends
+/// decide how they map to physical storage. Both built-in stores treat `write_secret`
+/// and `write_sealed_value` identically — the split exists so alternative backends can
+/// apply different protection to raw key material versus sealed state documents.
 pub trait SecretStore: Send + Sync {
+    /// Writes raw secret material (private keys, identity blobs) under `key`.
+    ///
+    /// # Errors
+    /// Returns [`IdentityError::InvalidSecretStoreKey`] for malformed keys and
+    /// [`IdentityError::Internal`] / [`IdentityError::Cryptographic`] on storage or
+    /// encryption failure.
     fn write_secret(&self, key: &str, value: &[u8]) -> IdentityResult<()>;
+    /// Writes a sealed state document (CA state, identity bundle) under `key`.
+    ///
+    /// # Errors
+    /// Same failure modes as [`Self::write_secret`].
     fn write_sealed_value(&self, key: &str, value: &[u8]) -> IdentityResult<()>;
+    /// Reads the value stored under `key`.
+    ///
+    /// # Errors
+    /// Returns [`IdentityError::SecretNotFound`] when the key has no value, plus the
+    /// storage/decryption failure modes of the backend.
     fn read_secret(&self, key: &str) -> IdentityResult<Vec<u8>>;
+    /// Deletes the value under `key`; deleting an absent key is not an error.
+    ///
+    /// # Errors
+    /// Returns [`IdentityError::InvalidSecretStoreKey`] for malformed keys and
+    /// [`IdentityError::Internal`] on storage failure.
     fn delete_secret(&self, key: &str) -> IdentityResult<()>;
+    /// Enables backend-specific downcasting (e.g. to find the filesystem lock root).
     fn as_any(&self) -> &dyn Any;
 }
 
+/// Process-local [`SecretStore`] used by tests and ephemeral identity managers.
 #[derive(Default)]
 pub struct InMemorySecretStore {
     state: Mutex<HashMap<String, Vec<u8>>>,
 }
 
 impl InMemorySecretStore {
+    /// Creates an empty in-memory store.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -84,6 +123,7 @@ impl InMemorySecretStore {
     }
 }
 
+/// [`SecretStore`] backed by an owner-only directory with encrypted-at-rest payloads.
 pub struct FilesystemSecretStore {
     root: PathBuf,
     encryption_key: [u8; SECRET_STORE_ENCRYPTION_KEY_BYTES],
@@ -92,6 +132,15 @@ pub struct FilesystemSecretStore {
 }
 
 impl FilesystemSecretStore {
+    /// Opens (or initializes) a store rooted at `root`.
+    ///
+    /// Creates the directory, restricts it to the current user (ACL hardening on
+    /// Windows, mode 0700 elsewhere), and loads or creates the store encryption key.
+    ///
+    /// # Errors
+    /// Returns [`IdentityError::Internal`] on filesystem/permission failure and
+    /// [`IdentityError::Cryptographic`] if the encryption key cannot be created or
+    /// unwrapped.
     pub fn new(root: impl Into<PathBuf>) -> IdentityResult<Self> {
         let root = root.into();
         fs::create_dir_all(&root).map_err(|error| IdentityError::Internal(error.to_string()))?;
@@ -115,6 +164,9 @@ impl FilesystemSecretStore {
     }
 
     fn key_path(&self, key: &str) -> IdentityResult<PathBuf> {
+        // Hex-encoding the whole key yields a flat, collision-free file name, so the
+        // rejection list below is defense in depth against traversal-looking keys
+        // rather than the actual safety mechanism.
         if key.is_empty()
             || key.contains("..")
             || key.contains('\\')
@@ -126,6 +178,7 @@ impl FilesystemSecretStore {
         Ok(self.root.join(hex::encode(key.as_bytes())))
     }
 
+    /// Returns the store's root directory (also hosts the cross-process state lock).
     #[must_use]
     pub fn root_path(&self) -> &Path {
         &self.root
@@ -167,6 +220,9 @@ impl SecretStore for FilesystemSecretStore {
 }
 
 impl FilesystemSecretStore {
+    // Writes are atomic: encrypt, write to a fresh ULID-named temp file (so concurrent
+    // writers of the same key never share a temp path), fsync, then rename over the
+    // destination. Readers therefore always observe a complete payload.
     fn write_value(&self, key: &str, value: &[u8]) -> IdentityResult<()> {
         let encrypted = encrypt_secret_payload(&self.encryption_key, value)?;
         #[cfg(windows)]
@@ -277,6 +333,11 @@ fn decrypt_secret_payload(
     encryption_key: &[u8; SECRET_STORE_ENCRYPTION_KEY_BYTES],
     encoded: &[u8],
 ) -> IdentityResult<Vec<u8>> {
+    // Legacy compatibility: stores written before at-rest encryption hold plaintext
+    // payloads without the magic header, so anything unprefixed is returned verbatim.
+    // AIDEV-NOTE: this fallback also means a payload whose header bytes were corrupted
+    // or stripped is silently treated as plaintext instead of failing decryption.
+    // Removing it requires a one-time migration of legacy stores (behavior change).
     if !encoded.starts_with(SECRET_STORE_ENCRYPTION_MAGIC) {
         return Ok(encoded.to_vec());
     }
@@ -324,6 +385,11 @@ enum StoreEncryptionKeyWriteOutcome {
     AlreadyExists,
 }
 
+/// Loads the per-store encryption key, generating and persisting one on first use.
+///
+/// First-writer-wins: if a concurrent initializer publishes a key between our existence
+/// check and write, the freshly generated key is discarded and the published key is
+/// read back, so every store instance ends up with the same key.
 fn load_or_create_store_encryption_key(
     root: &Path,
     #[cfg(windows)] owner_sid: Option<&str>,
@@ -376,6 +442,11 @@ fn read_store_encryption_key(
     Ok(key_bytes)
 }
 
+/// Atomically publishes the key file unless one already exists.
+///
+/// Uses `hard_link` (not `rename`) for the final step because rename silently replaces
+/// an existing file, while hard-linking fails with `AlreadyExists` — giving an atomic
+/// create-if-absent that concurrent initializers cannot clobber.
 fn write_store_encryption_key_if_absent(
     path: &Path,
     raw_key: &[u8; SECRET_STORE_ENCRYPTION_KEY_BYTES],
@@ -465,6 +536,8 @@ fn write_store_encryption_key_if_absent(
                 Err(error) => Err(IdentityError::Internal(error.to_string())),
             };
         }
+        // Unreachable: both cfg branches above return. Kept so the closure type-checks
+        // on every target without a trailing-expression gap.
         #[allow(unreachable_code)]
         Ok(StoreEncryptionKeyWriteOutcome::Created)
     })();
@@ -480,6 +553,8 @@ static WINDOWS_CURRENT_USER_SID: OnceLock<Mutex<Option<String>>> = OnceLock::new
 #[cfg(windows)]
 static HARDENED_WINDOWS_PATHS: OnceLock<Mutex<HashSet<(PathBuf, bool)>>> = OnceLock::new();
 
+// Cached as OnceLock<Mutex<Option<_>>> rather than OnceLock<String> so a failed SID
+// resolution is retried on the next call instead of being latched forever.
 #[cfg(windows)]
 fn current_user_sid() -> IdentityResult<String> {
     let cache = WINDOWS_CURRENT_USER_SID.get_or_init(|| Mutex::new(None));
@@ -506,6 +581,8 @@ fn current_user_sid_uncached() -> IdentityResult<String> {
     })
 }
 
+// AIDEV-NOTE: dead code — no test references this helper (it predates the move to
+// windows_security::current_user_sid). Safe to delete in a dedicated cleanup change.
 #[cfg(all(test, windows))]
 #[allow(dead_code)]
 fn parse_whoami_sid_csv(raw: &str) -> Option<String> {
@@ -534,6 +611,8 @@ fn parse_whoami_sid_csv(raw: &str) -> Option<String> {
     }
 }
 
+// ACL hardening is comparatively expensive and runs on every write, so successfully
+// hardened canonical paths are cached for the lifetime of the process.
 #[cfg(windows)]
 fn harden_windows_path_permissions(
     path: &Path,
@@ -565,6 +644,8 @@ fn harden_windows_path_permissions(
     Ok(())
 }
 
+/// Returns the conventional identity-store location under a state root:
+/// `<root>/.palyra/identity`.
 pub fn default_identity_storage_path(root: impl AsRef<Path>) -> PathBuf {
     root.as_ref().join(".palyra").join("identity")
 }

@@ -1,3 +1,10 @@
+//! rustls configuration builders for node-RPC mutual TLS.
+//!
+//! Wraps the standard WebPKI client verifier with a revocation check keyed by the
+//! SHA-256 fingerprint of the end-entity certificate DER. Fingerprints must stay in
+//! sync with `pairing::helpers::certificate_fingerprint_hex`, which feeds the
+//! revocation index from the PEM side.
+
 use std::{
     collections::HashSet,
     sync::{Arc, RwLock},
@@ -20,21 +27,32 @@ use crate::{
     error::{IdentityError, IdentityResult},
 };
 
+/// Lookup of revoked client certificates consulted on every mTLS handshake.
+///
+/// Implementations must fail closed: when revocation state cannot be determined,
+/// report the certificate as revoked rather than admitting it.
 pub trait RevocationIndex: Send + Sync {
+    /// Returns whether the certificate with this hex SHA-256 DER fingerprint is revoked.
     fn is_revoked(&self, certificate_fingerprint_hex: &str) -> bool;
 }
 
+/// In-memory [`RevocationIndex`] refreshed wholesale from persisted identity state.
 #[derive(Default)]
 pub struct MemoryRevocationIndex {
     revoked_fingerprints: RwLock<HashSet<String>>,
 }
 
 impl MemoryRevocationIndex {
+    /// Creates an index pre-populated with the given revoked fingerprints.
     #[must_use]
     pub fn from_fingerprints(fingerprints: HashSet<String>) -> Self {
         Self { revoked_fingerprints: RwLock::new(fingerprints) }
     }
 
+    /// Replaces the entire revocation set, e.g. after a rotation or revocation event.
+    ///
+    /// # Errors
+    /// Returns [`IdentityError::Internal`] if the lock is poisoned.
     pub fn replace_all(&self, fingerprints: HashSet<String>) -> IdentityResult<()> {
         let mut guard = self
             .revoked_fingerprints
@@ -53,6 +71,8 @@ impl std::fmt::Debug for MemoryRevocationIndex {
 
 impl RevocationIndex for MemoryRevocationIndex {
     fn is_revoked(&self, certificate_fingerprint_hex: &str) -> bool {
+        // Fail closed: a poisoned lock means revocation state is unknown, so treat the
+        // certificate as revoked instead of admitting a possibly revoked client.
         self.revoked_fingerprints
             .read()
             .map(|fingerprints| fingerprints.contains(certificate_fingerprint_hex))
@@ -60,6 +80,8 @@ impl RevocationIndex for MemoryRevocationIndex {
     }
 }
 
+/// [`ClientCertVerifier`] that delegates chain validation to `base` and then rejects
+/// end-entity certificates listed in the revocation index.
 struct RevocationAwareClientVerifier {
     base: Arc<dyn ClientCertVerifier>,
     revocation_index: Arc<dyn RevocationIndex>,
@@ -96,6 +118,8 @@ impl ClientCertVerifier for RevocationAwareClientVerifier {
         intermediates: &[CertificateDer<'_>],
         now: UnixTime,
     ) -> Result<ClientCertVerified, RustlsError> {
+        // Chain validation runs first so revocation only applies to certificates that
+        // are otherwise trusted; an unrelated forged cert still fails as untrusted.
         let verified = self.base.verify_client_cert(end_entity, intermediates, now)?;
         let fingerprint = certificate_fingerprint_hex(end_entity);
         if self.revocation_index.is_revoked(&fingerprint) {
@@ -131,6 +155,13 @@ impl ClientCertVerifier for RevocationAwareClientVerifier {
     }
 }
 
+/// Builds a client-certificate verifier that trusts the gateway CA and enforces the
+/// revocation index after standard WebPKI chain validation.
+///
+/// # Errors
+/// Returns [`IdentityError::CertificateParsingFailed`] if the CA PEM cannot be parsed
+/// or added to the root store, and [`IdentityError::Internal`] if the underlying WebPKI
+/// verifier cannot be constructed.
 pub fn build_revocation_aware_client_verifier(
     gateway_ca_certificate_pem: &str,
     revocation_index: Arc<dyn RevocationIndex>,
@@ -146,6 +177,12 @@ pub fn build_revocation_aware_client_verifier(
     Ok(Arc::new(RevocationAwareClientVerifier::new(base_verifier, revocation_index)))
 }
 
+/// Builds the node-RPC server config: client certificates are mandatory, must chain to
+/// the gateway CA, and must not be revoked.
+///
+/// # Errors
+/// Returns certificate/key parsing variants of [`IdentityError`] for malformed PEM
+/// inputs and [`IdentityError::Internal`] if rustls rejects the server configuration.
 pub fn build_node_rpc_server_mtls_config(
     gateway_ca_certificate_pem: &str,
     server_certificate: &IssuedCertificate,
@@ -163,6 +200,12 @@ pub fn build_node_rpc_server_mtls_config(
         .map_err(|error| IdentityError::Internal(error.to_string()))
 }
 
+/// Builds the client config a paired device uses to dial the gateway: the gateway CA is
+/// the sole trust root and the device's leaf certificate is presented for client auth.
+///
+/// # Errors
+/// Returns certificate/key parsing variants of [`IdentityError`] for malformed PEM
+/// inputs and [`IdentityError::Internal`] if rustls rejects the client configuration.
 pub fn build_paired_device_client_mtls_config(
     gateway_ca_certificate_pem: &str,
     device_certificate: &IssuedCertificate,
@@ -181,6 +224,14 @@ pub fn build_paired_device_client_mtls_config(
         .map_err(|error| IdentityError::Internal(error.to_string()))
 }
 
+/// Builds a TLS-only client config (no client certificate) for not-yet-paired devices.
+///
+/// Servers built by [`build_node_rpc_server_mtls_config`] will reject this config; it
+/// exists for pre-pairing endpoints that only need to authenticate the gateway.
+///
+/// # Errors
+/// Returns [`IdentityError::CertificateParsingFailed`] if the CA PEM cannot be parsed
+/// or added to the root store.
 pub fn build_unpaired_client_config(
     gateway_ca_certificate_pem: &str,
 ) -> IdentityResult<ClientConfig> {
@@ -202,6 +253,10 @@ fn parse_private_key(pem: &str) -> IdentityResult<PrivateKeyDer<'static>> {
         .map_err(|_| IdentityError::PrivateKeyParsingFailed)
 }
 
+/// Hex SHA-256 over the raw certificate DER.
+///
+/// Must stay byte-compatible with `pairing::helpers::certificate_fingerprint_hex`
+/// (PEM input), which produces the fingerprints stored in the revocation index.
 fn certificate_fingerprint_hex(certificate: &CertificateDer<'_>) -> String {
     hex::encode(Sha256::digest(certificate.as_ref()))
 }

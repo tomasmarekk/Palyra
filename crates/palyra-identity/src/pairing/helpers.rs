@@ -1,3 +1,8 @@
+//! Crypto and policy primitives shared by the pairing handshake and rotation logic.
+//!
+//! The byte layouts produced by `pairing_signature_payload` and `transcript_context`
+//! are protocol-v1 wire contracts: changing them invalidates every existing client.
+
 use std::time::{Duration, SystemTime};
 
 use hkdf::Hkdf;
@@ -12,6 +17,14 @@ use crate::{
 
 use super::{PairingClientKind, PairingMethod};
 
+/// Returns whether `certificate` expires within `threshold` of `now`.
+///
+/// Rotation is proactive: a certificate is "due" while still valid so the replacement
+/// is in place before the old one expires. Already-expired certificates are also due.
+///
+/// # Errors
+/// Returns [`IdentityError::Internal`] if `now` precedes the Unix epoch or the
+/// threshold overflows the millisecond range.
 pub fn should_rotate_certificate(
     certificate: &IssuedCertificate,
     now: SystemTime,
@@ -26,9 +39,12 @@ pub fn should_rotate_certificate(
 }
 
 pub(super) fn duration_to_millis_u64(value: Duration) -> u64 {
+    // Saturating conversion: the value is clamped to u64::MAX first, so the cast is
+    // provably lossless.
     value.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
+/// Validates the shape of the pairing proof before a session may be opened.
 pub(super) fn validate_pairing_method(method: &PairingMethod) -> IdentityResult<()> {
     match method {
         PairingMethod::Pin { code } => {
@@ -46,6 +62,15 @@ pub(super) fn validate_pairing_method(method: &PairingMethod) -> IdentityResult<
     Ok(())
 }
 
+/// Canonical byte payload signed by the device's Ed25519 key (protocol v1).
+///
+/// The `palyra-pairing-v1` prefix domain-separates this signature from any other use
+/// of the device key.
+///
+/// AIDEV-NOTE: variable-length fields are concatenated without length framing. This is
+/// unambiguous today only because session_id is a fixed-length ULID, device_id is a
+/// fixed 26-char canonical ID, and client_kind is a closed label set. Any new or
+/// loosened field needs length prefixes — which means a protocol version bump.
 pub(super) fn pairing_signature_payload(
     protocol_version: u32,
     session_id: &str,
@@ -67,6 +92,8 @@ pub(super) fn pairing_signature_payload(
     payload
 }
 
+/// HKDF `info` input binding the transcript MAC to this session's identity fields
+/// (protocol v1 wire layout — see the framing note on [`pairing_signature_payload`]).
 pub(super) fn transcript_context(
     session_id: &str,
     protocol_version: u32,
@@ -82,6 +109,11 @@ pub(super) fn transcript_context(
     context
 }
 
+/// Derives the 32-byte transcript MAC: HKDF-SHA256 with the session challenge as salt,
+/// the X25519 shared secret as input keying material, and the transcript as `info`.
+///
+/// Symmetric by construction — gateway and device derive identical values, so the
+/// gateway compares its derivation against the one the device sent.
 pub(super) fn derive_transcript_mac(
     shared_secret: &[u8; 32],
     challenge: &[u8; 32],
@@ -94,6 +126,15 @@ pub(super) fn derive_transcript_mac(
     Ok(output)
 }
 
+/// Best-effort constant-time equality for secret comparisons (proofs, MACs).
+///
+/// No early exit: the loop always runs over the longer input, padding the shorter one
+/// with zeros, and the length difference is folded into the accumulator up front.
+///
+/// AIDEV-NOTE: hand-rolled because `subtle` is not a workspace dependency. The
+/// accumulate-then-compare shape is the standard pattern, but it carries no
+/// compiler-barrier guarantees; if `subtle` is ever added to the workspace, replace
+/// this with `ConstantTimeEq`.
 pub(super) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     let mut diff = left.len() ^ right.len();
     let max_len = left.len().max(right.len());
@@ -107,6 +148,10 @@ pub(super) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     diff == 0
 }
 
+/// Hex SHA-256 over the certificate's DER bytes.
+///
+/// Must stay byte-compatible with the DER-side fingerprint in `crate::mtls`, which is
+/// what the revocation-aware verifier computes during handshakes.
 pub(super) fn certificate_fingerprint_hex(certificate_pem: &str) -> IdentityResult<String> {
     let der = CertificateDer::from_pem_slice(certificate_pem.as_bytes())
         .map_err(|_| IdentityError::CertificateParsingFailed)?;

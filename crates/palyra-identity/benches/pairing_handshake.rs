@@ -1,3 +1,6 @@
+//! Criterion benchmark for a full pairing round trip (start, hello, complete) against
+//! an in-memory store — tracks the cost of the handshake crypto end to end.
+
 use criterion::{criterion_group, criterion_main, Criterion};
 use palyra_identity::{DeviceIdentity, IdentityManager, PairingClientKind, PairingMethod};
 use std::time::SystemTime;

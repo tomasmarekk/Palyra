@@ -1,3 +1,9 @@
+//! In-process certificate authority for the gateway trust domain.
+//!
+//! Issues short-lived client (device) and server leaf certificates signed by a
+//! self-signed gateway CA. Leaf private keys are returned to the caller but are never
+//! serialized with the certificate metadata — rotation reissues instead of reusing keys.
+
 use std::{
     net::IpAddr,
     time::{Duration, SystemTime},
@@ -13,31 +19,58 @@ use crate::{
     unix_ms,
 };
 
+/// A leaf certificate issued by the gateway [`CertificateAuthority`].
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct IssuedCertificate {
+    /// Monotonic issuance counter of the issuing CA; later issuances have higher values.
     pub sequence: u64,
+    /// Logical subject label (`device:<id>` or `server:<common name>`), not the X.509 DN.
     pub subject: String,
+    /// PEM-encoded leaf certificate.
     pub certificate_pem: String,
+    /// PEM-encoded leaf private key.
+    ///
+    /// INTENTIONAL: excluded from serde so persisted device records never contain key
+    /// material. After a reload this field is empty, which forces a fresh reissue on the
+    /// next rotation check instead of reusing a key the store never held.
     #[serde(skip_serializing, skip_deserializing, default)]
     pub private_key_pem: String,
+    /// Issuance time in milliseconds since the Unix epoch.
     pub issued_at_unix_ms: u64,
+    /// Expiry time in milliseconds since the Unix epoch.
     pub expires_at_unix_ms: u64,
 }
 
+/// Serializable snapshot of a [`CertificateAuthority`], including its private key.
+///
+/// This is the only place CA key material is serialized; it must be written exclusively
+/// through sealed secret-store paths.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredCertificateAuthority {
+    /// PEM-encoded self-signed CA certificate.
     pub certificate_pem: String,
+    /// PEM-encoded CA private key.
     pub private_key_pem: String,
+    /// Issuance counter to restore so sequence numbers keep advancing after reload.
     pub sequence: u64,
 }
 
+/// Self-signed certificate authority that anchors the gateway's mTLS trust domain.
 pub struct CertificateAuthority {
+    /// PEM-encoded self-signed CA certificate distributed to clients as their root.
     pub certificate_pem: String,
     key_pair: KeyPair,
     sequence: u64,
 }
 
 impl CertificateAuthority {
+    /// Creates a new CA with a freshly generated key pair and self-signed certificate.
+    ///
+    /// The CA certificate keeps rcgen's default (effectively non-expiring) validity
+    /// window; lifetime control lives in the short-lived leaf certificates instead.
+    ///
+    /// # Errors
+    /// Returns [`IdentityError::Cryptographic`] if key generation or self-signing fails.
     pub fn new(common_name: &str) -> IdentityResult<Self> {
         let mut params = CertificateParams::new(Vec::<String>::new())
             .map_err(|error| IdentityError::Cryptographic(error.to_string()))?;
@@ -61,6 +94,11 @@ impl CertificateAuthority {
         Ok(Self { certificate_pem, key_pair, sequence: 0 })
     }
 
+    /// Issues a client-auth leaf certificate for a paired device.
+    ///
+    /// # Errors
+    /// Returns [`IdentityError::Cryptographic`] if key generation or signing fails, and
+    /// [`IdentityError::Internal`] if the validity window cannot be timestamped.
     pub fn issue_client_certificate(
         &mut self,
         device_id: &str,
@@ -77,6 +115,11 @@ impl CertificateAuthority {
         self.issue_leaf_certificate(params, validity, format!("device:{device_id}"))
     }
 
+    /// Issues a server-auth leaf certificate with the default SAN set (`localhost` plus
+    /// the common name).
+    ///
+    /// # Errors
+    /// Same failure modes as [`Self::issue_server_certificate_with_sans`].
     pub fn issue_server_certificate(
         &mut self,
         common_name: &str,
@@ -85,6 +128,15 @@ impl CertificateAuthority {
         self.issue_server_certificate_with_sans(common_name, validity, &[], &[])
     }
 
+    /// Issues a server-auth leaf certificate with additional DNS and IP SANs.
+    ///
+    /// `localhost` and the common name are always included as DNS SANs; supplied names
+    /// are deduplicated case-insensitively and blank entries are dropped, so callers can
+    /// pass operator-provided lists verbatim.
+    ///
+    /// # Errors
+    /// Returns [`IdentityError::Cryptographic`] if certificate parameters are rejected
+    /// or signing fails, and [`IdentityError::Internal`] on timestamp conversion failure.
     pub fn issue_server_certificate_with_sans(
         &mut self,
         common_name: &str,
@@ -115,9 +167,16 @@ impl CertificateAuthority {
         self.issue_leaf_certificate(params, validity, format!("server:{common_name}"))
     }
 
+    /// Restores a CA from its persisted snapshot.
+    ///
+    /// # Errors
+    /// Returns [`IdentityError::Cryptographic`] if the stored key or certificate cannot
+    /// be parsed, or if they do not form a usable issuer.
     pub fn from_stored(state: &StoredCertificateAuthority) -> IdentityResult<Self> {
         let key_pair = KeyPair::from_pem(&state.private_key_pem)
             .map_err(|error| IdentityError::Cryptographic(error.to_string()))?;
+        // Probe issuer construction up front so a corrupt snapshot fails at load time
+        // rather than on the first issuance.
         rcgen::Issuer::from_ca_cert_pem(&state.certificate_pem, &key_pair)
             .map_err(|error| IdentityError::Cryptographic(error.to_string()))?;
 
@@ -128,6 +187,7 @@ impl CertificateAuthority {
         })
     }
 
+    /// Captures the CA (including its private key) for persistence via sealed storage.
     #[must_use]
     pub fn to_stored(&self) -> StoredCertificateAuthority {
         StoredCertificateAuthority {
@@ -172,6 +232,10 @@ impl CertificateAuthority {
     }
 }
 
+/// Appends `candidate` unless it is blank or already present.
+///
+/// Deduplication is case-insensitive because DNS names are; otherwise operator input
+/// like `NODE1.LAN` would produce duplicate SAN entries.
 fn push_unique_dns_name(target: &mut Vec<String>, candidate: &str) {
     let trimmed = candidate.trim();
     if trimmed.is_empty() {

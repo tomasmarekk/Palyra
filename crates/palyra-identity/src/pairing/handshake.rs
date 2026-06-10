@@ -1,3 +1,10 @@
+//! The pairing handshake: challenge issuance, device hello, and gateway verification.
+//!
+//! Security shape: the device signs a domain-separated payload (session, challenge,
+//! proof) with its long-lived Ed25519 key, and both sides derive a transcript MAC from
+//! an ephemeral X25519 agreement. A failed proof, signature, or MAC check consumes the
+//! session, so the low-entropy proof cannot be brute-forced within one window.
+
 use std::time::SystemTime;
 
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
@@ -56,6 +63,9 @@ fn record_pairing_start(history: &mut std::collections::VecDeque<u64>, started_a
 }
 
 impl IdentityManager {
+    // `retain_session_id` keeps the session currently being completed alive even when
+    // expired, so its expiry surfaces as PairingSessionExpired instead of the less
+    // precise PairingSessionNotFound.
     fn prune_expired_sessions(
         &mut self,
         now: SystemTime,
@@ -80,6 +90,14 @@ impl IdentityManager {
         }
     }
 
+    /// Opens a pairing session: validates the proof shape, generates an ephemeral DH
+    /// key and challenge, and registers the session until the pairing window closes.
+    ///
+    /// # Errors
+    /// Returns [`IdentityError::InvalidPairingProof`] for a malformed PIN/QR value,
+    /// [`IdentityError::PairingSessionRateLimited`] when the start budget is exhausted,
+    /// [`IdentityError::PairingSessionCapacityExceeded`] at the active-session cap, and
+    /// [`IdentityError::Cryptographic`] if OS randomness is unavailable.
     pub fn start_pairing(
         &mut self,
         client_kind: PairingClientKind,
@@ -108,6 +126,10 @@ impl IdentityManager {
         Ok(session)
     }
 
+    /// Convenience wrapper over [`build_device_pairing_hello`] (the device-side step).
+    ///
+    /// # Errors
+    /// Same failure modes as [`build_device_pairing_hello`].
     pub fn build_device_hello(
         &self,
         session: &PairingSession,
@@ -117,6 +139,13 @@ impl IdentityManager {
         build_device_pairing_hello(session, device, proof)
     }
 
+    /// Verifies a device hello and immediately issues its certificate.
+    ///
+    /// Equivalent to [`Self::verify_pairing`] followed by
+    /// [`Self::finalize_verified_pairing`] with no approval step in between.
+    ///
+    /// # Errors
+    /// Union of the failure modes of the two underlying steps.
     pub fn complete_pairing(
         &mut self,
         hello: DevicePairingHello,
@@ -126,6 +155,16 @@ impl IdentityManager {
         self.finalize_verified_pairing(verified)
     }
 
+    /// Cryptographically verifies a device hello without persisting anything, so a
+    /// caller can interpose an approval decision before finalizing.
+    ///
+    /// Reloads persisted state under the cross-process lock first, so a revocation
+    /// written by another process is honored.
+    ///
+    /// # Errors
+    /// Returns the pairing rejection variants of [`IdentityError`] (session not
+    /// found/expired, version/kind mismatch, proof/signature/transcript failure,
+    /// device revoked, invalid device ID) plus lock and store failure modes.
     pub fn verify_pairing(
         &mut self,
         hello: DevicePairingHello,
@@ -136,10 +175,20 @@ impl IdentityManager {
         self.complete_pairing_inner(hello, now)
     }
 
+    /// Issues a certificate for a verified pairing and persists the device record,
+    /// revoking any certificates from a previous pairing of the same device ID.
+    ///
+    /// # Errors
+    /// Returns [`IdentityError::Cryptographic`] on issuance failure plus lock and
+    /// persistence failure modes.
     pub fn finalize_verified_pairing(
         &mut self,
         verified: VerifiedPairing,
     ) -> IdentityResult<PairingResult> {
+        // AIDEV-NOTE: this step reloads state but does not re-check revoked_devices, so
+        // a device revoked between verify_pairing and finalize_verified_pairing (the
+        // approval gap) would still be re-paired. Re-checking here would be a behavior
+        // change; callers holding a VerifiedPairing across time should re-verify policy.
         let _guard = self.acquire_state_mutation_guard()?;
         self.reload_persisted_state()?;
         let result = self.persist_verified_pairing(verified)?;
@@ -177,6 +226,9 @@ impl IdentityManager {
         if hello.client_kind != active.public.client_kind {
             return Err(IdentityError::PairingClientKindMismatch);
         }
+        // Constant-time comparison: the proof is a low-entropy secret (six-digit PIN),
+        // so a timing oracle here would make it guessable. From this point on, every
+        // failure consumes the session — one verification attempt per session.
         if !constant_time_eq(hello.proof.as_bytes(), active.public.method.proof().as_bytes()) {
             self.active_sessions.remove(&hello.session_id);
             return Err(IdentityError::InvalidPairingProof);
@@ -202,6 +254,8 @@ impl IdentityManager {
             IdentityError::SignatureVerificationFailed
         })?;
 
+        // The transcript MAC proves the device actually holds the X25519 secret for
+        // the public key it sent, binding the DH exchange to this exact session.
         let device_public = X25519PublicKey::from(hello.device_x25519_public);
         let shared_secret = active.gateway_ephemeral_secret.diffie_hellman(&device_public);
         let transcript_context = transcript_context(
@@ -248,6 +302,8 @@ impl IdentityManager {
             current_certificate: certificate.clone(),
             certificate_fingerprints: vec![certificate_fingerprint],
         };
+        // Re-pairing the same device ID supersedes its old trust: every certificate
+        // from the previous pairing is revoked so only the new leaf can connect.
         if let Some(previous) = self.paired_devices.get(&verified.device_id).cloned() {
             self.revoke_superseded_certificates(&previous)?;
         }
@@ -263,6 +319,13 @@ impl IdentityManager {
     }
 }
 
+/// Builds the device-side hello for a pairing session: derives the transcript MAC from
+/// an X25519 agreement with the gateway's ephemeral key and signs the challenge payload
+/// with the device's long-lived Ed25519 key.
+///
+/// # Errors
+/// Returns [`IdentityError::InvalidCanonicalDeviceId`] for a malformed device ID and
+/// [`IdentityError::Cryptographic`] if MAC derivation fails.
 pub fn build_device_pairing_hello(
     session: &PairingSession,
     device: &DeviceIdentity,

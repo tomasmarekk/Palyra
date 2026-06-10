@@ -1,3 +1,7 @@
+//! Unit tests for the pairing lifecycle: handshake rejections, session hygiene, rate
+//! limiting, persistence/reload consistency, rotation/revocation, lock reclaim, and
+//! redaction of secret material in Debug output.
+
 #[cfg(not(windows))]
 use std::time::Instant;
 use std::{

@@ -1,3 +1,7 @@
+//! End-to-end mTLS flow over the public API: pair a device, connect through a real
+//! TLS echo server, then prove rotation and revocation cut off superseded/revoked
+//! certificates at the handshake.
+
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,

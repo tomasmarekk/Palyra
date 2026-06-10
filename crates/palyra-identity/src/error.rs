@@ -1,9 +1,20 @@
+//! Error contract for the identity crate.
+//!
+//! Pairing rejections are deliberately split into distinct variants (proof, signature,
+//! transcript, version, revocation) so callers can audit-log the exact denial reason
+//! without parsing message strings.
+
 use thiserror::Error;
 
+/// Failure modes of identity, pairing, certificate, and secret-store operations.
+///
+/// `Display` messages are stable and may be pinned by golden fixtures; change them only
+/// as a deliberate contract update. Crypto-adjacent variants never embed secret material.
 #[derive(Debug, Error)]
 pub enum IdentityError {
     #[error("invalid canonical device ID: {0}")]
     InvalidCanonicalDeviceId(String),
+    /// The pairing proof was malformed at session start or did not match at completion.
     #[error("invalid pairing proof")]
     InvalidPairingProof,
     #[error("pairing session not found")]
@@ -34,10 +45,13 @@ pub enum IdentityError {
     CertificateParsingFailed,
     #[error("private key parsing failed")]
     PrivateKeyParsingFailed,
+    /// A key, cipher, certificate-signing, or randomness operation failed.
     #[error("cryptographic operation failed: {0}")]
     Cryptographic(String),
+    /// Catch-all for storage, serialization, locking, and other infrastructure failures.
     #[error("{0}")]
     Internal(String),
 }
 
+/// Convenience alias used by every fallible operation in this crate.
 pub type IdentityResult<T> = Result<T, IdentityError>;

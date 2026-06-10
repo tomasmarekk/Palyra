@@ -1,3 +1,11 @@
+//! Device identity, pairing, certificate rotation, and mTLS trust for Palyra.
+//!
+//! [`IdentityManager`] owns the gateway certificate authority and the paired-device
+//! lifecycle (pairing handshake, certificate rotation, revocation). [`DeviceIdentity`]
+//! holds a device's long-lived key material, and the `build_*` helpers produce rustls
+//! configurations that enforce the gateway's revocation index during mTLS handshakes.
+//! State persists through a [`SecretStore`] so multiple daemon processes stay consistent.
+
 mod ca;
 mod device;
 mod error;
@@ -24,12 +32,21 @@ pub use store::{
     default_identity_storage_path, FilesystemSecretStore, InMemorySecretStore, SecretStore,
 };
 
+/// Pairing protocol version embedded in every signed handshake payload.
+///
+/// A [`DevicePairingHello`] carrying any other version is rejected with
+/// [`IdentityError::PairingVersionMismatch`] to prevent downgrade attempts.
 pub const PAIRING_PROTOCOL_VERSION: u32 = 1;
+/// Policy flag: node RPC surfaces must always require mutual TLS.
 pub const NODE_RPC_MTLS_REQUIRED: bool = true;
+/// Default lifetime of a pairing session before the challenge expires.
 pub const DEFAULT_PAIRING_WINDOW: Duration = Duration::from_secs(5 * 60);
+/// Default validity period for issued leaf certificates (24 hours).
 pub const DEFAULT_CERT_VALIDITY: Duration = Duration::from_secs(24 * 60 * 60);
+/// Default remaining-lifetime threshold below which a certificate is due for rotation.
 pub const DEFAULT_ROTATION_THRESHOLD: Duration = Duration::from_secs(10 * 60);
 
+/// Converts a [`SystemTime`] to milliseconds since the Unix epoch.
 fn unix_ms(value: SystemTime) -> IdentityResult<u64> {
     let duration = value
         .duration_since(UNIX_EPOCH)
