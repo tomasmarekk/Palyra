@@ -1,9 +1,18 @@
+//! Wire models for the `/console/v1` control-plane API.
+//!
+//! Every type here is a serde DTO whose serialized shape is the protocol shared
+//! by the daemon, operator CLI, web console, and desktop app. Field names,
+//! optionality, and `#[serde]` attributes are wire contract: changing them
+//! breaks cross-surface compatibility, so additions must stay
+//! backward-decodable (`#[serde(default)]` / `skip_serializing_if`).
+
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::contract::{ContractDescriptor, PageInfo};
 
+/// Active CLI/console profile context attached to a console session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsoleProfileContext {
     pub name: String,
@@ -15,6 +24,7 @@ pub struct ConsoleProfileContext {
     pub mode: String,
 }
 
+/// Authenticated console session, including the CSRF token required for mutations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsoleSession {
     pub principal: String,
@@ -28,6 +38,7 @@ pub struct ConsoleSession {
     pub expires_at_unix_ms: i64,
 }
 
+/// Admin, gRPC, and QUIC bind addresses reported by the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeploymentBindAddresses {
     pub admin: String,
@@ -35,11 +46,13 @@ pub struct DeploymentBindAddresses {
     pub quic: String,
 }
 
+/// TLS posture summary for the deployment gateway.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeploymentTlsSummary {
     pub gateway_enabled: bool,
 }
 
+/// Acknowledgement state for the dangerous remote-bind override (config and env).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DangerousRemoteBindAckSummary {
     pub config: bool,
@@ -47,6 +60,7 @@ pub struct DangerousRemoteBindAckSummary {
     pub env_name: String,
 }
 
+/// Onboarding flow selected by the operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OnboardingFlow {
@@ -54,6 +68,7 @@ pub enum OnboardingFlow {
     AdvancedSetup,
 }
 
+/// Overall progress state of the onboarding flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OnboardingPostureState {
@@ -64,6 +79,7 @@ pub enum OnboardingPostureState {
     Complete,
 }
 
+/// Progress status of a single onboarding step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OnboardingStepStatus {
@@ -74,6 +90,7 @@ pub enum OnboardingStepStatus {
     Skipped,
 }
 
+/// Kind of operator action attached to an onboarding step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OnboardingActionKind {
@@ -83,6 +100,7 @@ pub enum OnboardingActionKind {
     ReadDocs,
 }
 
+/// Suggested operator action that advances an onboarding step.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OnboardingStepAction {
     pub label: String,
@@ -91,6 +109,7 @@ pub struct OnboardingStepAction {
     pub target: String,
 }
 
+/// Why an onboarding step is blocked, with a repair hint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OnboardingBlockedReason {
     pub code: String,
@@ -98,6 +117,7 @@ pub struct OnboardingBlockedReason {
     pub repair_hint: String,
 }
 
+/// One onboarding step with its status and optional action or blocker.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OnboardingStepView {
     pub step_id: String,
@@ -114,6 +134,7 @@ pub struct OnboardingStepView {
     pub action: Option<OnboardingStepAction>,
 }
 
+/// Per-status step counts for an onboarding flow.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct OnboardingStepCounts {
     pub todo: usize,
@@ -123,6 +144,7 @@ pub struct OnboardingStepCounts {
     pub skipped: usize,
 }
 
+/// Response envelope for `GET console/v1/onboarding/posture`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OnboardingPostureEnvelope {
     pub contract: ContractDescriptor,
@@ -143,6 +165,7 @@ pub struct OnboardingPostureEnvelope {
     pub steps: Vec<OnboardingStepView>,
 }
 
+/// Record of the most recent remote admin access attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteAdminAccessAttempt {
     pub observed_at_unix_ms: i64,
@@ -153,6 +176,7 @@ pub struct RemoteAdminAccessAttempt {
     pub outcome: String,
 }
 
+/// Response envelope for `GET console/v1/deployment/posture`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeploymentPostureSummary {
     pub contract: ContractDescriptor,
@@ -171,6 +195,7 @@ pub struct DeploymentPostureSummary {
     pub warnings: Vec<String>,
 }
 
+/// Request body deciding an approval (approve/deny with optional scope).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalDecisionRequest {
     pub approved: bool,
@@ -182,6 +207,7 @@ pub struct ApprovalDecisionRequest {
     pub decision_scope_ttl_ms: Option<i64>,
 }
 
+/// Response envelope returned after deciding an approval.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ApprovalDecisionEnvelope {
     pub approval: Value,
@@ -189,6 +215,7 @@ pub struct ApprovalDecisionEnvelope {
     pub dm_pairing: Option<String>,
 }
 
+/// Metadata for one stored secret (never the value itself).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecretMetadata {
     pub scope: String,
@@ -198,6 +225,7 @@ pub struct SecretMetadata {
     pub value_bytes: u32,
 }
 
+/// Response envelope listing secret metadata within a scope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecretMetadataList {
     pub contract: ContractDescriptor,
@@ -207,12 +235,14 @@ pub struct SecretMetadataList {
     pub page: PageInfo,
 }
 
+/// Response envelope wrapping a single secret's metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecretMetadataEnvelope {
     pub contract: ContractDescriptor,
     pub secret: SecretMetadata,
 }
 
+/// Response envelope for a secret reveal; the value travels base64-encoded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecretRevealEnvelope {
     pub contract: ContractDescriptor,
@@ -225,12 +255,17 @@ pub struct SecretRevealEnvelope {
 }
 
 impl SecretRevealEnvelope {
+    /// Decodes the revealed secret value from its base64 wire encoding.
+    ///
+    /// Returns `None` when the payload is not valid base64.
     #[must_use]
     pub fn decode_value(&self) -> Option<Vec<u8>> {
         BASE64_STANDARD.decode(self.value_base64.as_bytes()).ok()
     }
 }
 
+// Empty strings decode to `None` so "field present but blank" behaves the same
+// as "field absent" for all base64 payload accessors below.
 fn decode_optional_base64(raw: Option<&str>) -> Option<Vec<u8>> {
     raw.and_then(|value| {
         if value.is_empty() {
@@ -241,6 +276,7 @@ fn decode_optional_base64(raw: Option<&str>) -> Option<Vec<u8>> {
     })
 }
 
+/// One numbered config backup slot and whether it exists on disk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigBackupRecord {
     pub index: usize,
@@ -248,6 +284,7 @@ pub struct ConfigBackupRecord {
     pub exists: bool,
 }
 
+/// Response envelope with the (optionally redacted) TOML config document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigDocumentSnapshot {
     pub contract: ContractDescriptor,
@@ -261,6 +298,7 @@ pub struct ConfigDocumentSnapshot {
     pub backups: Vec<ConfigBackupRecord>,
 }
 
+/// Response envelope for config validation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigValidationEnvelope {
     pub contract: ContractDescriptor,
@@ -271,6 +309,7 @@ pub struct ConfigValidationEnvelope {
     pub migrated_from_version: Option<u32>,
 }
 
+/// Response envelope describing an applied config mutation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigMutationEnvelope {
     pub contract: ContractDescriptor,
@@ -284,6 +323,7 @@ pub struct ConfigMutationEnvelope {
     pub changed_key: Option<String>,
 }
 
+/// Inventory entry describing one execution backend and its rollout state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionBackendInventoryRecord {
     pub backend_id: String,
@@ -311,6 +351,7 @@ pub struct ExecutionBackendInventoryRecord {
     pub total_node_count: usize,
 }
 
+/// Stored agent definition (workspace roots, model profile, allowlists).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentRecord {
     pub agent_id: String,
@@ -329,6 +370,7 @@ pub struct AgentRecord {
     pub updated_at_unix_ms: i64,
 }
 
+/// Response envelope listing agents and available execution backends.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentListEnvelope {
     pub contract: ContractDescriptor,
@@ -341,6 +383,7 @@ pub struct AgentListEnvelope {
     pub page: PageInfo,
 }
 
+/// Response envelope for a single agent with its resolved execution backend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentEnvelope {
     pub contract: ContractDescriptor,
@@ -355,6 +398,7 @@ pub struct AgentEnvelope {
     pub execution_backend_reason: String,
 }
 
+/// Request body for creating an agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentCreateRequest {
     pub agent_id: String,
@@ -377,6 +421,7 @@ pub struct AgentCreateRequest {
     pub allow_absolute_paths: bool,
 }
 
+/// Response envelope returned after creating an agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentCreateEnvelope {
     pub contract: ContractDescriptor,
@@ -393,6 +438,7 @@ pub struct AgentCreateEnvelope {
     pub default_agent_id: Option<String>,
 }
 
+/// Response envelope returned after changing the default agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSetDefaultEnvelope {
     pub contract: ContractDescriptor,
@@ -401,6 +447,7 @@ pub struct AgentSetDefaultEnvelope {
     pub default_agent_id: String,
 }
 
+/// Provider identity of an auth profile (kind plus optional custom name).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthProfileProvider {
     pub kind: String,
@@ -408,6 +455,7 @@ pub struct AuthProfileProvider {
     pub custom_name: Option<String>,
 }
 
+/// Scope an auth profile applies to (global or a specific agent).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthProfileScope {
     pub kind: String,
@@ -415,6 +463,9 @@ pub struct AuthProfileScope {
     pub agent_id: Option<String>,
 }
 
+/// Credential material of an auth profile; secrets are vault references, never raw values.
+// `Oauth` dwarfs `ApiKey`, but boxing fields would change the public field
+// types shared by every consumer, so the size-variance lint stays allowed.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -439,6 +490,7 @@ pub enum AuthCredentialView {
     },
 }
 
+/// Full auth profile as exchanged with the daemon.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuthProfileView {
     pub profile_id: String,
@@ -450,6 +502,7 @@ pub struct AuthProfileView {
     pub updated_at_unix_ms: i64,
 }
 
+/// Response envelope listing auth profiles.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuthProfileListEnvelope {
     pub contract: ContractDescriptor,
@@ -458,12 +511,14 @@ pub struct AuthProfileListEnvelope {
     pub page: PageInfo,
 }
 
+/// Response envelope wrapping a single auth profile.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuthProfileEnvelope {
     pub contract: ContractDescriptor,
     pub profile: AuthProfileView,
 }
 
+/// Response envelope returned after deleting an auth profile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthProfileDeleteEnvelope {
     pub contract: ContractDescriptor,
@@ -471,6 +526,7 @@ pub struct AuthProfileDeleteEnvelope {
     pub deleted: bool,
 }
 
+/// Response envelope for `GET console/v1/auth/health`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuthHealthEnvelope {
     pub contract: ContractDescriptor,
@@ -481,6 +537,7 @@ pub struct AuthHealthEnvelope {
     pub refresh_metrics: Value,
 }
 
+/// Response envelope describing a provider's auth capabilities and state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderAuthStateEnvelope {
     pub contract: ContractDescriptor,
@@ -500,6 +557,7 @@ pub struct ProviderAuthStateEnvelope {
     pub note: Option<String>,
 }
 
+/// Response envelope returned after a provider auth action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderAuthActionEnvelope {
     pub contract: ContractDescriptor,
@@ -511,6 +569,7 @@ pub struct ProviderAuthActionEnvelope {
     pub profile_id: Option<String>,
 }
 
+/// Active channel pairing code.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairingCodeRecord {
     pub code: String,
@@ -520,6 +579,7 @@ pub struct PairingCodeRecord {
     pub expires_at_unix_ms: i64,
 }
 
+/// Pending channel pairing request awaiting approval.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairingPendingRecord {
     pub channel: String,
@@ -531,6 +591,7 @@ pub struct PairingPendingRecord {
     pub approval_id: Option<String>,
 }
 
+/// Approved channel pairing grant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairingGrantRecord {
     pub channel: String,
@@ -542,6 +603,7 @@ pub struct PairingGrantRecord {
     pub approval_id: Option<String>,
 }
 
+/// Pending, paired, and active-code pairing state for one channel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairingChannelSnapshot {
     pub channel: String,
@@ -553,6 +615,7 @@ pub struct PairingChannelSnapshot {
     pub active_codes: Vec<PairingCodeRecord>,
 }
 
+/// Response envelope for `GET console/v1/pairing`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairingSummaryEnvelope {
     pub contract: ContractDescriptor,
@@ -560,6 +623,7 @@ pub struct PairingSummaryEnvelope {
     pub channels: Vec<PairingChannelSnapshot>,
 }
 
+/// Related session (parent, sibling, or child) within a session family.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCatalogFamilyRelative {
     pub session_id: String,
@@ -568,6 +632,7 @@ pub struct SessionCatalogFamilyRelative {
     pub relation: String,
 }
 
+/// Branch-family metadata for a session (root, parent, relatives).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCatalogFamilyRecord {
     pub root_title: String,
@@ -581,6 +646,7 @@ pub struct SessionCatalogFamilyRecord {
     pub relatives: Vec<SessionCatalogFamilyRelative>,
 }
 
+/// Artifact reference attached to a session recap.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCatalogArtifactRecord {
     pub artifact_id: String,
@@ -588,12 +654,14 @@ pub struct SessionCatalogArtifactRecord {
     pub label: String,
 }
 
+/// Focus path inside a session's project context.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionProjectContextFocusRecord {
     pub path: String,
     pub reason: String,
 }
 
+/// One project-context file entry with discovery and approval state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionProjectContextEntryRecord {
     pub entry_id: String,
@@ -620,6 +688,7 @@ pub struct SessionProjectContextEntryRecord {
     pub preview_text: String,
 }
 
+/// Aggregated project-context state for a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionProjectContextRecord {
     pub generated_at_unix_ms: i64,
@@ -636,6 +705,7 @@ pub struct SessionProjectContextRecord {
     pub entries: Vec<SessionProjectContextEntryRecord>,
 }
 
+/// Recap block of a session (touched files, context, artifacts, CTAs).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCatalogRecapRecord {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -650,6 +720,7 @@ pub struct SessionCatalogRecapRecord {
     pub ctas: Vec<String>,
 }
 
+/// Value-style quick control (agent/model) with override provenance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCatalogQuickControlRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -661,6 +732,7 @@ pub struct SessionCatalogQuickControlRecord {
     pub override_active: bool,
 }
 
+/// Toggle-style quick control (thinking/trace/verbose) with override provenance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCatalogToggleControlRecord {
     pub value: bool,
@@ -669,6 +741,7 @@ pub struct SessionCatalogToggleControlRecord {
     pub override_active: bool,
 }
 
+/// All quick controls of a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCatalogQuickControlsRecord {
     pub agent: SessionCatalogQuickControlRecord,
@@ -679,6 +752,7 @@ pub struct SessionCatalogQuickControlsRecord {
     pub reset_to_default_available: bool,
 }
 
+/// Full session catalog entry as listed by the console.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCatalogRecord {
     pub session_id: String,
@@ -739,6 +813,7 @@ pub struct SessionCatalogRecord {
     pub quick_controls: SessionCatalogQuickControlsRecord,
 }
 
+/// Aggregate counts across the session catalog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCatalogSummary {
     pub active_sessions: usize,
@@ -748,6 +823,7 @@ pub struct SessionCatalogSummary {
     pub sessions_with_context_files: usize,
 }
 
+/// Echo of the session catalog query the daemon actually applied.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCatalogQueryEcho {
     pub limit: usize,
@@ -774,6 +850,7 @@ pub struct SessionCatalogQueryEcho {
     pub title_state: Option<String>,
 }
 
+/// Response envelope for `GET console/v1/sessions`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCatalogListEnvelope {
     pub contract: ContractDescriptor,
@@ -784,12 +861,14 @@ pub struct SessionCatalogListEnvelope {
     pub page: PageInfo,
 }
 
+/// Response envelope for a single session catalog entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCatalogDetailEnvelope {
     pub contract: ContractDescriptor,
     pub session: SessionCatalogRecord,
 }
 
+/// Response envelope returned after mutating a session catalog entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCatalogMutationEnvelope {
     pub contract: ContractDescriptor,
@@ -797,6 +876,11 @@ pub struct SessionCatalogMutationEnvelope {
     pub action: String,
 }
 
+/// Request body updating a session's quick controls.
+///
+/// Each field uses double-`Option` semantics: outer `None` leaves the control
+/// untouched, `Some(None)` clears the per-session override, and
+/// `Some(Some(value))` sets it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionQuickControlsUpdateRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -813,6 +897,7 @@ pub struct SessionQuickControlsUpdateRequest {
     pub reset_to_default: Option<bool>,
 }
 
+/// Query parameters for `GET console/v1/logs`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogListQuery {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -833,6 +918,7 @@ pub struct LogListQuery {
     pub end_at_unix_ms: Option<i64>,
 }
 
+/// Echo of the log query the daemon actually applied.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogQueryEcho {
     pub limit: usize,
@@ -851,6 +937,7 @@ pub struct LogQueryEcho {
     pub end_at_unix_ms: Option<i64>,
 }
 
+/// One log record with optional correlation IDs and structured payload.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LogRecord {
     pub cursor: String,
@@ -873,6 +960,7 @@ pub struct LogRecord {
     pub structured_payload: Option<Value>,
 }
 
+/// Response envelope for `GET console/v1/logs`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LogListEnvelope {
     pub contract: ContractDescriptor,
@@ -886,6 +974,7 @@ pub struct LogListEnvelope {
     pub available_sources: Vec<String>,
 }
 
+/// Method used to mint a node pairing code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodePairingMethod {
@@ -893,6 +982,7 @@ pub enum NodePairingMethod {
     Qr,
 }
 
+/// Lifecycle state of a node pairing request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodePairingRequestState {
@@ -903,6 +993,7 @@ pub enum NodePairingRequestState {
     Expired,
 }
 
+/// Active node pairing code.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodePairingCodeView {
     pub code: String,
@@ -912,6 +1003,7 @@ pub struct NodePairingCodeView {
     pub expires_at_unix_ms: i64,
 }
 
+/// Node pairing request with identity fingerprints and decision state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodePairingRequestView {
     pub request_id: String,
@@ -934,6 +1026,7 @@ pub struct NodePairingRequestView {
     pub cert_expires_at_unix_ms: Option<i64>,
 }
 
+/// Response envelope listing node pairing codes and requests.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodePairingListEnvelope {
     pub contract: ContractDescriptor,
@@ -944,18 +1037,21 @@ pub struct NodePairingListEnvelope {
     pub page: PageInfo,
 }
 
+/// Response envelope wrapping a single node pairing request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodePairingRequestEnvelope {
     pub contract: ContractDescriptor,
     pub request: NodePairingRequestView,
 }
 
+/// Response envelope wrapping a freshly minted node pairing code.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodePairingCodeEnvelope {
     pub contract: ContractDescriptor,
     pub code: NodePairingCodeView,
 }
 
+/// Paired device with certificate and revocation history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceRecord {
     pub device_id: String,
@@ -981,6 +1077,7 @@ pub struct DeviceRecord {
     pub removed_at_unix_ms: Option<i64>,
 }
 
+/// Response envelope for `GET console/v1/devices`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceListEnvelope {
     pub contract: ContractDescriptor,
@@ -989,18 +1086,21 @@ pub struct DeviceListEnvelope {
     pub page: PageInfo,
 }
 
+/// Response envelope wrapping a single device.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceEnvelope {
     pub contract: ContractDescriptor,
     pub device: DeviceRecord,
 }
 
+/// Response envelope reporting how many devices were cleared.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceClearEnvelope {
     pub contract: ContractDescriptor,
     pub deleted: usize,
 }
 
+/// One capability advertised by a node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeCapabilityView {
     pub name: String,
@@ -1008,6 +1108,7 @@ pub struct NodeCapabilityView {
     pub execution_mode: String,
 }
 
+/// Registered node with its platform, capabilities, and last-seen data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeRecord {
     pub device_id: String,
@@ -1022,6 +1123,7 @@ pub struct NodeRecord {
     pub last_event_at_unix_ms: Option<i64>,
 }
 
+/// Response envelope for `GET console/v1/nodes`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeListEnvelope {
     pub contract: ContractDescriptor,
@@ -1030,12 +1132,14 @@ pub struct NodeListEnvelope {
     pub page: PageInfo,
 }
 
+/// Response envelope wrapping a single node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeEnvelope {
     pub contract: ContractDescriptor,
     pub node: NodeRecord,
 }
 
+/// Response envelope for a node capability invocation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeInvokeEnvelope {
     pub contract: ContractDescriptor,
@@ -1048,6 +1152,7 @@ pub struct NodeInvokeEnvelope {
     pub error: String,
 }
 
+/// Lifecycle state of a node capability request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeCapabilityRequestState {
@@ -1060,6 +1165,7 @@ pub enum NodeCapabilityRequestState {
     Rejected,
 }
 
+/// Node capability request with timing and outcome summaries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeCapabilityRequestView {
     pub request_id: String,
@@ -1081,6 +1187,7 @@ pub struct NodeCapabilityRequestView {
     pub error: Option<String>,
 }
 
+/// Presence health of an inventory device or instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InventoryPresenceState {
@@ -1090,6 +1197,7 @@ pub enum InventoryPresenceState {
     Offline,
 }
 
+/// Trust state of an inventory device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InventoryTrustState {
@@ -1101,6 +1209,7 @@ pub enum InventoryTrustState {
     Unknown,
 }
 
+/// Capability availability counts for an inventory entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InventoryCapabilitySummary {
     pub total: usize,
@@ -1108,6 +1217,7 @@ pub struct InventoryCapabilitySummary {
     pub unavailable: usize,
 }
 
+/// Which device actions the console may offer for an inventory entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InventoryActionAvailability {
     pub can_rotate: bool,
@@ -1116,6 +1226,7 @@ pub struct InventoryActionAvailability {
     pub can_invoke: bool,
 }
 
+/// Combined device-plus-node inventory view with trust, presence, and actions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InventoryDeviceRecord {
     pub device_id: String,
@@ -1160,6 +1271,7 @@ pub struct InventoryDeviceRecord {
     pub actions: InventoryActionAvailability,
 }
 
+/// Non-device runtime instance (e.g. daemon component) in the inventory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InventoryInstanceRecord {
     pub instance_id: String,
@@ -1173,6 +1285,7 @@ pub struct InventoryInstanceRecord {
     pub capability_summary: InventoryCapabilitySummary,
 }
 
+/// Aggregate counts across the inventory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InventorySummary {
     pub devices: usize,
@@ -1188,6 +1301,7 @@ pub struct InventorySummary {
     pub offline_instances: usize,
 }
 
+/// Response envelope for `GET console/v1/inventory`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InventoryListEnvelope {
     pub contract: ContractDescriptor,
@@ -1202,6 +1316,7 @@ pub struct InventoryListEnvelope {
     pub page: PageInfo,
 }
 
+/// Response envelope for a single inventory device with related activity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InventoryDeviceDetailEnvelope {
     pub contract: ContractDescriptor,
@@ -1215,6 +1330,7 @@ pub struct InventoryDeviceDetailEnvelope {
     pub workspace_activity: Option<InventoryWorkspaceActivity>,
 }
 
+/// Aggregate workspace checkpoint/restore counters for a device.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct InventoryWorkspaceRestoreSummary {
     pub checkpoint_count: u64,
@@ -1225,6 +1341,7 @@ pub struct InventoryWorkspaceRestoreSummary {
     pub failed_restore_count: u64,
 }
 
+/// Workspace checkpoint recorded for a device.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InventoryWorkspaceCheckpointRecord {
     pub checkpoint_id: String,
@@ -1249,6 +1366,7 @@ pub struct InventoryWorkspaceCheckpointRecord {
     pub latest_restore_report_id: Option<String>,
 }
 
+/// Workspace restore report recorded for a device.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InventoryWorkspaceRestoreReportRecord {
     pub report_id: String,
@@ -1269,6 +1387,7 @@ pub struct InventoryWorkspaceRestoreReportRecord {
     pub created_at_unix_ms: i64,
 }
 
+/// Recent workspace checkpoint and restore activity for a device.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InventoryWorkspaceActivity {
     pub summary: InventoryWorkspaceRestoreSummary,
@@ -1278,6 +1397,7 @@ pub struct InventoryWorkspaceActivity {
     pub recent_restore_reports: Vec<InventoryWorkspaceRestoreReportRecord>,
 }
 
+/// Lifecycle state of a support bundle job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SupportBundleJobState {
@@ -1287,6 +1407,7 @@ pub enum SupportBundleJobState {
     Failed,
 }
 
+/// Support bundle collection job with timing and output.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SupportBundleJob {
     pub job_id: String,
@@ -1304,12 +1425,14 @@ pub struct SupportBundleJob {
     pub error: Option<String>,
 }
 
+/// Response envelope wrapping a single support bundle job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SupportBundleJobEnvelope {
     pub contract: ContractDescriptor,
     pub job: SupportBundleJob,
 }
 
+/// Response envelope listing support bundle jobs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SupportBundleJobListEnvelope {
     pub contract: ContractDescriptor,
@@ -1318,6 +1441,7 @@ pub struct SupportBundleJobListEnvelope {
     pub page: PageInfo,
 }
 
+/// Lifecycle state of a doctor recovery job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DoctorRecoveryJobState {
@@ -1327,6 +1451,7 @@ pub enum DoctorRecoveryJobState {
     Failed,
 }
 
+/// Doctor recovery job with its command, report, and output.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DoctorRecoveryJob {
     pub job_id: String,
@@ -1355,12 +1480,14 @@ pub struct DoctorRecoveryJob {
     pub error: Option<String>,
 }
 
+/// Response envelope wrapping a single doctor recovery job.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DoctorRecoveryJobEnvelope {
     pub contract: ContractDescriptor,
     pub job: DoctorRecoveryJob,
 }
 
+/// Response envelope listing doctor recovery jobs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DoctorRecoveryJobListEnvelope {
     pub contract: ContractDescriptor,
@@ -1369,6 +1496,7 @@ pub struct DoctorRecoveryJobListEnvelope {
     pub page: PageInfo,
 }
 
+/// Response envelope for `GET console/v1/control-plane/capabilities`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityCatalog {
     pub contract: ContractDescriptor,
@@ -1380,6 +1508,7 @@ pub struct CapabilityCatalog {
     pub migration_notes: Vec<CapabilityMigrationNote>,
 }
 
+/// How a capability is exposed on the dashboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CapabilityDashboardExposure {
@@ -1388,6 +1517,7 @@ pub enum CapabilityDashboardExposure {
     InternalOnly,
 }
 
+/// One capability catalog entry with ownership, surfaces, and contract paths.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityEntry {
     pub id: String,
@@ -1413,12 +1543,14 @@ pub struct CapabilityEntry {
     pub notes: Option<String>,
 }
 
+/// Migration note attached to the capability catalog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityMigrationNote {
     pub id: String,
     pub message: String,
 }
 
+/// Request body for `POST console/v1/auth/login`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsoleLoginRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1429,18 +1561,21 @@ pub struct ConsoleLoginRequest {
     pub channel: Option<String>,
 }
 
+/// Request body for creating a browser handoff URL.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsoleBrowserHandoffRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redirect_path: Option<String>,
 }
 
+/// Response envelope carrying a one-shot browser handoff URL.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsoleBrowserHandoffEnvelope {
     pub handoff_url: String,
     pub expires_at_unix_ms: i64,
 }
 
+/// Feature surface enabled for the mobile companion release.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MobileReleaseScope {
     pub approvals_inbox: bool,
@@ -1450,6 +1585,7 @@ pub struct MobileReleaseScope {
     pub voice_note: bool,
 }
 
+/// Notification delivery policy advertised to the mobile companion.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MobileNotificationPolicy {
     pub delivery_mode: String,
@@ -1460,6 +1596,7 @@ pub struct MobileNotificationPolicy {
     pub max_alerts_per_poll: usize,
 }
 
+/// Pairing and trust policy advertised to the mobile companion.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MobilePairingPolicy {
     pub auth_flow: String,
@@ -1469,6 +1606,7 @@ pub struct MobilePairingPolicy {
     pub offline_state_visible: bool,
 }
 
+/// Cross-surface handoff policy advertised to the mobile companion.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MobileHandoffPolicy {
     pub contract: String,
@@ -1477,6 +1615,7 @@ pub struct MobileHandoffPolicy {
     pub browser_automation_exposed: bool,
 }
 
+/// Cache/queue key names the mobile companion must use for local storage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MobileLocalStoreContract {
     pub approvals_cache_key: String,
@@ -1486,6 +1625,7 @@ pub struct MobileLocalStoreContract {
     pub revoke_marker_key: String,
 }
 
+/// Rollout flags for mobile companion features.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MobileRolloutStatus {
     pub mobile_companion_enabled: bool,
@@ -1496,6 +1636,7 @@ pub struct MobileRolloutStatus {
     pub voice_notes_enabled: bool,
 }
 
+/// Response envelope for `GET console/v1/mobile/bootstrap`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MobileBootstrapEnvelope {
     pub contract: ContractDescriptor,
@@ -1509,6 +1650,7 @@ pub struct MobileBootstrapEnvelope {
     pub default_locale: String,
 }
 
+/// Approval counts for the mobile inbox.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MobileApprovalInboxSummary {
     pub pending: usize,
@@ -1516,6 +1658,7 @@ pub struct MobileApprovalInboxSummary {
     pub handoff_recommended: usize,
 }
 
+/// Response envelope for `GET console/v1/mobile/approvals`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MobileApprovalsEnvelope {
     pub contract: ContractDescriptor,
@@ -1524,6 +1667,7 @@ pub struct MobileApprovalsEnvelope {
     pub page: PageInfo,
 }
 
+/// Human-readable explanation attached to a mobile approval.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MobileApprovalExplainability {
     pub evaluation_summary: String,
@@ -1533,6 +1677,7 @@ pub struct MobileApprovalExplainability {
     pub web_handoff_path: Option<String>,
 }
 
+/// Response envelope for a single mobile approval.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MobileApprovalDetailEnvelope {
     pub contract: ContractDescriptor,
@@ -1540,6 +1685,7 @@ pub struct MobileApprovalDetailEnvelope {
     pub explainability: MobileApprovalExplainability,
 }
 
+/// Console path the mobile companion should hand off to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MobileHandoffTarget {
     pub path: String,
@@ -1548,6 +1694,7 @@ pub struct MobileHandoffTarget {
     pub requires_full_console: bool,
 }
 
+/// Compact session recap rendered by the mobile companion.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MobileSessionRecap {
     pub title: String,
@@ -1563,6 +1710,7 @@ pub struct MobileSessionRecap {
     pub handoff_recommended: bool,
 }
 
+/// Session summary with recap and handoff target for mobile listings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MobileSessionSummary {
     pub session: Value,
@@ -1570,6 +1718,7 @@ pub struct MobileSessionSummary {
     pub handoff: MobileHandoffTarget,
 }
 
+/// Response envelope for `GET console/v1/mobile/sessions`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MobileSessionsEnvelope {
     pub contract: ContractDescriptor,
@@ -1577,6 +1726,7 @@ pub struct MobileSessionsEnvelope {
     pub page: PageInfo,
 }
 
+/// Response envelope for a single mobile session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MobileSessionDetailEnvelope {
     pub contract: ContractDescriptor,
@@ -1585,6 +1735,7 @@ pub struct MobileSessionDetailEnvelope {
     pub actions: Vec<String>,
 }
 
+/// Kind of a mobile inbox alert.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MobileInboxItemKind {
@@ -1593,6 +1744,7 @@ pub enum MobileInboxItemKind {
     Support,
 }
 
+/// Priority of a mobile inbox alert.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MobileInboxPriority {
@@ -1602,6 +1754,7 @@ pub enum MobileInboxPriority {
     Low,
 }
 
+/// One mobile inbox alert with correlation IDs and optional handoff.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MobileInboxItem {
     pub alert_id: String,
@@ -1623,6 +1776,7 @@ pub struct MobileInboxItem {
     pub handoff: Option<MobileHandoffTarget>,
 }
 
+/// Aggregate task/approval counts for the mobile inbox.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MobileInboxSummary {
     pub pending_approvals: usize,
@@ -1631,6 +1785,7 @@ pub struct MobileInboxSummary {
     pub failed_tasks: usize,
 }
 
+/// Response envelope for `GET console/v1/mobile/inbox`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MobileInboxEnvelope {
     pub contract: ContractDescriptor,
@@ -1640,11 +1795,13 @@ pub struct MobileInboxEnvelope {
     pub alerts: Vec<MobileInboxItem>,
 }
 
+/// Request body for the mediated safe-URL-open flow.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MobileSafeUrlOpenRequest {
     pub target: String,
 }
 
+/// Response envelope describing the safe-URL-open decision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MobileSafeUrlOpenEnvelope {
     pub contract: ContractDescriptor,
@@ -1658,6 +1815,7 @@ pub struct MobileSafeUrlOpenEnvelope {
     pub reason: Option<String>,
 }
 
+/// Request body creating a voice note (transcript already reviewed on device).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MobileVoiceNoteCreateRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1674,6 +1832,7 @@ pub struct MobileVoiceNoteCreateRequest {
     pub notification_target: Option<Value>,
 }
 
+/// Response envelope returned after creating a voice note.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MobileVoiceNoteEnvelope {
     pub contract: ContractDescriptor,
@@ -1682,12 +1841,14 @@ pub struct MobileVoiceNoteEnvelope {
     pub queued_for_existing_session: bool,
 }
 
+/// Query parameters for listing browser profiles.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserProfilesQuery {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub principal: Option<String>,
 }
 
+/// Resource/time budget limits for a browser session; unset fields use daemon defaults.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserSessionBudget {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1720,6 +1881,7 @@ pub struct BrowserSessionBudget {
     pub max_network_log_bytes: Option<u64>,
 }
 
+/// Tri-state browser permission value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BrowserPermissionSetting {
@@ -1728,6 +1890,7 @@ pub enum BrowserPermissionSetting {
     Allow,
 }
 
+/// Camera/microphone/location permission state of a browser session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserSessionPermissions {
     pub camera: BrowserPermissionSetting,
@@ -1735,6 +1898,7 @@ pub struct BrowserSessionPermissions {
     pub location: BrowserPermissionSetting,
 }
 
+/// Action log entry recorded for a browser session action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserActionLogEntry {
     pub action_id: String,
@@ -1749,12 +1913,14 @@ pub struct BrowserActionLogEntry {
     pub page_url: String,
 }
 
+/// Single header captured in the browser network log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserNetworkLogHeader {
     pub name: String,
     pub value: String,
 }
 
+/// One captured browser network request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserNetworkLogEntry {
     pub request_url: String,
@@ -1766,6 +1932,7 @@ pub struct BrowserNetworkLogEntry {
     pub headers: Vec<BrowserNetworkLogHeader>,
 }
 
+/// Severity of a browser console/diagnostic entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BrowserDiagnosticSeverity {
@@ -1775,6 +1942,7 @@ pub enum BrowserDiagnosticSeverity {
     Error,
 }
 
+/// One captured browser console message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserConsoleEntry {
     pub severity: BrowserDiagnosticSeverity,
@@ -1786,6 +1954,7 @@ pub struct BrowserConsoleEntry {
     pub page_url: String,
 }
 
+/// Per-page console diagnostics counters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserPageDiagnostics {
     pub page_url: String,
@@ -1796,6 +1965,7 @@ pub struct BrowserPageDiagnostics {
     pub last_event_unix_ms: u64,
 }
 
+/// One browser tab with its URL, title, and active flag.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserTabRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1805,6 +1975,7 @@ pub struct BrowserTabRecord {
     pub active: bool,
 }
 
+/// Stored browser profile with persistence and privacy flags.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserProfileRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1820,6 +1991,7 @@ pub struct BrowserProfileRecord {
     pub active: bool,
 }
 
+/// Download artifact captured by the browser service, with quarantine state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserDownloadArtifactRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1838,6 +2010,7 @@ pub struct BrowserDownloadArtifactRecord {
     pub quarantine_reason: String,
 }
 
+/// Request body creating a browser profile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserCreateProfileRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1851,6 +2024,7 @@ pub struct BrowserCreateProfileRequest {
     pub private_profile: Option<bool>,
 }
 
+/// Request body renaming a browser profile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserRenameProfileRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1858,12 +2032,14 @@ pub struct BrowserRenameProfileRequest {
     pub name: String,
 }
 
+/// Request body scoping a profile action to a principal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserProfileScopeRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub principal: Option<String>,
 }
 
+/// Response envelope listing browser profiles.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserProfileListEnvelope {
     pub contract: ContractDescriptor,
@@ -1875,12 +2051,14 @@ pub struct BrowserProfileListEnvelope {
     pub page: PageInfo,
 }
 
+/// Response envelope wrapping a single browser profile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserProfileEnvelope {
     pub contract: ContractDescriptor,
     pub profile: BrowserProfileRecord,
 }
 
+/// Response envelope returned after deleting a browser profile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserProfileDeleteEnvelope {
     pub contract: ContractDescriptor,
@@ -1891,6 +2069,7 @@ pub struct BrowserProfileDeleteEnvelope {
     pub active_profile_id: Option<String>,
 }
 
+/// Query parameters for listing browser download artifacts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserDownloadArtifactsQuery {
     pub session_id: String,
@@ -1900,6 +2079,7 @@ pub struct BrowserDownloadArtifactsQuery {
     pub quarantined_only: bool,
 }
 
+/// Response envelope listing browser download artifacts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserDownloadArtifactListEnvelope {
     pub contract: ContractDescriptor,
@@ -1912,6 +2092,7 @@ pub struct BrowserDownloadArtifactListEnvelope {
     pub page: PageInfo,
 }
 
+/// Request body creating a browser session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserSessionCreateRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1938,6 +2119,7 @@ pub struct BrowserSessionCreateRequest {
     pub private_profile: Option<bool>,
 }
 
+/// Response envelope returned after creating a browser session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserSessionCreateEnvelope {
     pub contract: ContractDescriptor,
@@ -1960,6 +2142,7 @@ pub struct BrowserSessionCreateEnvelope {
     pub private_profile: bool,
 }
 
+/// Response envelope returned after closing a browser session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserSessionCloseEnvelope {
     pub contract: ContractDescriptor,
@@ -1969,6 +2152,7 @@ pub struct BrowserSessionCloseEnvelope {
     pub reason: String,
 }
 
+/// Request body for a browser navigation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserNavigateRequest {
     pub url: String,
@@ -1982,6 +2166,7 @@ pub struct BrowserNavigateRequest {
     pub allow_private_targets: Option<bool>,
 }
 
+/// Response envelope for a browser navigation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserNavigateEnvelope {
     pub contract: ContractDescriptor,
@@ -1996,6 +2181,7 @@ pub struct BrowserNavigateEnvelope {
     pub error: String,
 }
 
+/// Request body for a browser click action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserClickRequest {
     pub selector: String,
@@ -2009,6 +2195,7 @@ pub struct BrowserClickRequest {
     pub max_failure_screenshot_bytes: Option<u64>,
 }
 
+/// Response envelope for a browser click action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserClickEnvelope {
     pub contract: ContractDescriptor,
@@ -2027,12 +2214,16 @@ pub struct BrowserClickEnvelope {
 }
 
 impl BrowserClickEnvelope {
+    /// Decodes the failure screenshot from base64, if one was captured.
+    ///
+    /// Returns `None` when the field is absent, empty, or not valid base64.
     #[must_use]
     pub fn decode_failure_screenshot(&self) -> Option<Vec<u8>> {
         decode_optional_base64(self.failure_screenshot_base64.as_deref())
     }
 }
 
+/// Request body for typing text into a browser session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserTypeRequest {
     pub selector: String,
@@ -2048,6 +2239,7 @@ pub struct BrowserTypeRequest {
     pub max_failure_screenshot_bytes: Option<u64>,
 }
 
+/// Response envelope for a browser type action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserTypeEnvelope {
     pub contract: ContractDescriptor,
@@ -2065,12 +2257,16 @@ pub struct BrowserTypeEnvelope {
 }
 
 impl BrowserTypeEnvelope {
+    /// Decodes the failure screenshot from base64, if one was captured.
+    ///
+    /// Returns `None` when the field is absent, empty, or not valid base64.
     #[must_use]
     pub fn decode_failure_screenshot(&self) -> Option<Vec<u8>> {
         decode_optional_base64(self.failure_screenshot_base64.as_deref())
     }
 }
 
+/// Request body for a browser key press.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserPressRequest {
     pub key: String,
@@ -2082,6 +2278,7 @@ pub struct BrowserPressRequest {
     pub max_failure_screenshot_bytes: Option<u64>,
 }
 
+/// Response envelope for a browser key press.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserPressEnvelope {
     pub contract: ContractDescriptor,
@@ -2099,12 +2296,16 @@ pub struct BrowserPressEnvelope {
 }
 
 impl BrowserPressEnvelope {
+    /// Decodes the failure screenshot from base64, if one was captured.
+    ///
+    /// Returns `None` when the field is absent, empty, or not valid base64.
     #[must_use]
     pub fn decode_failure_screenshot(&self) -> Option<Vec<u8>> {
         decode_optional_base64(self.failure_screenshot_base64.as_deref())
     }
 }
 
+/// Request body for selecting an option in a browser session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserSelectRequest {
     pub selector: String,
@@ -2117,6 +2318,7 @@ pub struct BrowserSelectRequest {
     pub max_failure_screenshot_bytes: Option<u64>,
 }
 
+/// Response envelope for a browser select action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserSelectEnvelope {
     pub contract: ContractDescriptor,
@@ -2134,12 +2336,16 @@ pub struct BrowserSelectEnvelope {
 }
 
 impl BrowserSelectEnvelope {
+    /// Decodes the failure screenshot from base64, if one was captured.
+    ///
+    /// Returns `None` when the field is absent, empty, or not valid base64.
     #[must_use]
     pub fn decode_failure_screenshot(&self) -> Option<Vec<u8>> {
         decode_optional_base64(self.failure_screenshot_base64.as_deref())
     }
 }
 
+/// Request body for highlighting an element in a browser session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserHighlightRequest {
     pub selector: String,
@@ -2153,6 +2359,7 @@ pub struct BrowserHighlightRequest {
     pub max_failure_screenshot_bytes: Option<u64>,
 }
 
+/// Response envelope for a browser highlight action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserHighlightEnvelope {
     pub contract: ContractDescriptor,
@@ -2170,12 +2377,16 @@ pub struct BrowserHighlightEnvelope {
 }
 
 impl BrowserHighlightEnvelope {
+    /// Decodes the failure screenshot from base64, if one was captured.
+    ///
+    /// Returns `None` when the field is absent, empty, or not valid base64.
     #[must_use]
     pub fn decode_failure_screenshot(&self) -> Option<Vec<u8>> {
         decode_optional_base64(self.failure_screenshot_base64.as_deref())
     }
 }
 
+/// Request body for scrolling a browser session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserScrollRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2188,6 +2399,7 @@ pub struct BrowserScrollRequest {
     pub max_failure_screenshot_bytes: Option<u64>,
 }
 
+/// Response envelope for a browser scroll action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserScrollEnvelope {
     pub contract: ContractDescriptor,
@@ -2206,12 +2418,16 @@ pub struct BrowserScrollEnvelope {
 }
 
 impl BrowserScrollEnvelope {
+    /// Decodes the failure screenshot from base64, if one was captured.
+    ///
+    /// Returns `None` when the field is absent, empty, or not valid base64.
     #[must_use]
     pub fn decode_failure_screenshot(&self) -> Option<Vec<u8>> {
         decode_optional_base64(self.failure_screenshot_base64.as_deref())
     }
 }
 
+/// Request body waiting for a selector or text to appear.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserWaitForRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2228,6 +2444,7 @@ pub struct BrowserWaitForRequest {
     pub max_failure_screenshot_bytes: Option<u64>,
 }
 
+/// Response envelope for a browser wait-for action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserWaitForEnvelope {
     pub contract: ContractDescriptor,
@@ -2247,18 +2464,23 @@ pub struct BrowserWaitForEnvelope {
 }
 
 impl BrowserWaitForEnvelope {
+    /// Decodes the failure screenshot from base64, if one was captured.
+    ///
+    /// Returns `None` when the field is absent, empty, or not valid base64.
     #[must_use]
     pub fn decode_failure_screenshot(&self) -> Option<Vec<u8>> {
         decode_optional_base64(self.failure_screenshot_base64.as_deref())
     }
 }
 
+/// Query parameters for reading a browser page title.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserTitleQuery {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_title_bytes: Option<u64>,
 }
 
+/// Response envelope carrying a browser page title.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserTitleEnvelope {
     pub contract: ContractDescriptor,
@@ -2269,6 +2491,7 @@ pub struct BrowserTitleEnvelope {
     pub error: String,
 }
 
+/// Query parameters for capturing a browser screenshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserScreenshotQuery {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2277,6 +2500,7 @@ pub struct BrowserScreenshotQuery {
     pub format: Option<String>,
 }
 
+/// Response envelope carrying a base64-encoded browser screenshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserScreenshotEnvelope {
     pub contract: ContractDescriptor,
@@ -2291,18 +2515,23 @@ pub struct BrowserScreenshotEnvelope {
 }
 
 impl BrowserScreenshotEnvelope {
+    /// Decodes the screenshot image bytes from base64, if present.
+    ///
+    /// Returns `None` when the field is absent, empty, or not valid base64.
     #[must_use]
     pub fn decode_image(&self) -> Option<Vec<u8>> {
         decode_optional_base64(self.image_base64.as_deref())
     }
 }
 
+/// Query parameters for rendering a browser page to PDF.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserPdfQuery {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_bytes: Option<u64>,
 }
 
+/// Response envelope carrying a base64-encoded page PDF or download artifact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserPdfEnvelope {
     pub contract: ContractDescriptor,
@@ -2322,12 +2551,16 @@ pub struct BrowserPdfEnvelope {
 }
 
 impl BrowserPdfEnvelope {
+    /// Decodes the rendered PDF bytes from base64, if present.
+    ///
+    /// Returns `None` when the field is absent, empty, or not valid base64.
     #[must_use]
     pub fn decode_pdf(&self) -> Option<Vec<u8>> {
         decode_optional_base64(self.pdf_base64.as_deref())
     }
 }
 
+/// Query parameters selecting which browser observations to include.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserObserveQuery {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2344,6 +2577,7 @@ pub struct BrowserObserveQuery {
     pub max_visible_text_bytes: Option<u64>,
 }
 
+/// Response envelope with DOM, accessibility, and visible-text observations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserObserveEnvelope {
     pub contract: ContractDescriptor,
@@ -2360,6 +2594,7 @@ pub struct BrowserObserveEnvelope {
     pub error: String,
 }
 
+/// Query parameters for reading the browser network log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserNetworkLogQuery {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2370,6 +2605,7 @@ pub struct BrowserNetworkLogQuery {
     pub max_payload_bytes: Option<u64>,
 }
 
+/// Response envelope listing captured browser network entries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserNetworkLogEnvelope {
     pub contract: ContractDescriptor,
@@ -2383,6 +2619,7 @@ pub struct BrowserNetworkLogEnvelope {
     pub page: PageInfo,
 }
 
+/// Query parameters for reading the browser console log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserConsoleLogQuery {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2395,6 +2632,7 @@ pub struct BrowserConsoleLogQuery {
     pub max_payload_bytes: Option<u64>,
 }
 
+/// Response envelope listing captured browser console entries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserConsoleLogEnvelope {
     pub contract: ContractDescriptor,
@@ -2410,6 +2648,7 @@ pub struct BrowserConsoleLogEnvelope {
     pub page: PageInfo,
 }
 
+/// Response envelope listing browser tabs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserTabListEnvelope {
     pub contract: ContractDescriptor,
@@ -2424,6 +2663,7 @@ pub struct BrowserTabListEnvelope {
     pub page: PageInfo,
 }
 
+/// Request body opening a new browser tab.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserOpenTabRequest {
     pub url: String,
@@ -2439,6 +2679,7 @@ pub struct BrowserOpenTabRequest {
     pub allow_private_targets: Option<bool>,
 }
 
+/// Response envelope returned after opening a browser tab.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserOpenTabEnvelope {
     pub contract: ContractDescriptor,
@@ -2452,17 +2693,20 @@ pub struct BrowserOpenTabEnvelope {
     pub error: String,
 }
 
+/// Request body targeting a specific browser tab.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserTabMutationRequest {
     pub tab_id: String,
 }
 
+/// Request body closing a browser tab (the active tab when `tab_id` is unset).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserTabCloseRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tab_id: Option<String>,
 }
 
+/// Response envelope returned after switching browser tabs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserSwitchTabEnvelope {
     pub contract: ContractDescriptor,
@@ -2474,6 +2718,7 @@ pub struct BrowserSwitchTabEnvelope {
     pub error: String,
 }
 
+/// Response envelope returned after closing a browser tab.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserCloseTabEnvelope {
     pub contract: ContractDescriptor,
@@ -2488,6 +2733,7 @@ pub struct BrowserCloseTabEnvelope {
     pub error: String,
 }
 
+/// Response envelope carrying browser session permissions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserPermissionsEnvelope {
     pub contract: ContractDescriptor,
@@ -2499,6 +2745,7 @@ pub struct BrowserPermissionsEnvelope {
     pub error: String,
 }
 
+/// Request body updating browser session permissions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserSetPermissionsRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2511,6 +2758,7 @@ pub struct BrowserSetPermissionsRequest {
     pub reset_to_default: Option<bool>,
 }
 
+/// Request body selecting which browser session state to reset.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserResetStateRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2523,6 +2771,7 @@ pub struct BrowserResetStateRequest {
     pub reset_permissions: Option<bool>,
 }
 
+/// Response envelope reporting what browser state was reset.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserResetStateEnvelope {
     pub contract: ContractDescriptor,
@@ -2537,6 +2786,7 @@ pub struct BrowserResetStateEnvelope {
     pub error: String,
 }
 
+/// Request body for `POST console/v1/config/inspect`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigInspectRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2547,12 +2797,14 @@ pub struct ConfigInspectRequest {
     pub backups: usize,
 }
 
+/// Request body for `POST console/v1/config/validate`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigValidateRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
 }
 
+/// Request body for `POST console/v1/config/mutate`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigMutationRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2564,6 +2816,7 @@ pub struct ConfigMutationRequest {
     pub backups: usize,
 }
 
+/// Request body restoring the config from a numbered backup.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigRecoverRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2574,6 +2827,7 @@ pub struct ConfigRecoverRequest {
     pub backups: usize,
 }
 
+/// Request body storing a secret value (base64-encoded).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecretSetRequest {
     pub scope: String,
@@ -2581,6 +2835,7 @@ pub struct SecretSetRequest {
     pub value_base64: String,
 }
 
+/// Request body revealing a secret value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecretRevealRequest {
     pub scope: String,
@@ -2589,12 +2844,14 @@ pub struct SecretRevealRequest {
     pub reveal: bool,
 }
 
+/// Request body deleting a secret.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecretDeleteRequest {
     pub scope: String,
     pub key: String,
 }
 
+/// Source definition of a configured secret (kind, policies, limits).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfiguredSecretSourceView {
     pub kind: String,
@@ -2619,6 +2876,7 @@ pub struct ConfiguredSecretSourceView {
     pub allow_symlinks: Option<bool>,
 }
 
+/// Resolution state of one secret configured in the daemon config.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfiguredSecretRecord {
     pub secret_id: String,
@@ -2641,6 +2899,7 @@ pub struct ConfiguredSecretRecord {
     pub value_bytes: Option<u32>,
 }
 
+/// Response envelope listing configured secrets.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfiguredSecretListEnvelope {
     pub contract: ContractDescriptor,
@@ -2651,6 +2910,7 @@ pub struct ConfiguredSecretListEnvelope {
     pub page: PageInfo,
 }
 
+/// Response envelope wrapping a single configured secret.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfiguredSecretEnvelope {
     pub contract: ContractDescriptor,
@@ -2659,17 +2919,20 @@ pub struct ConfiguredSecretEnvelope {
     pub secret: ConfiguredSecretRecord,
 }
 
+/// Query parameters identifying a configured secret.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfiguredSecretQuery {
     pub secret_id: String,
 }
 
+/// Request body planning a config reload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigReloadPlanRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
 }
 
+/// Per-category step counts of a config reload plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigReloadPlanSummary {
     pub hot_safe: u32,
@@ -2678,6 +2941,7 @@ pub struct ConfigReloadPlanSummary {
     pub manual_review: u32,
 }
 
+/// One step of a config reload plan with its category and redacted diff.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigReloadPlanStep {
     pub component: String,
@@ -2698,6 +2962,7 @@ pub struct ConfigReloadPlanStep {
     pub redacted_diff: String,
 }
 
+/// Response envelope for `POST console/v1/config/reload/plan`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigReloadPlanEnvelope {
     pub contract: ContractDescriptor,
@@ -2712,6 +2977,7 @@ pub struct ConfigReloadPlanEnvelope {
     pub steps: Vec<ConfigReloadPlanStep>,
 }
 
+/// Request body applying a config reload plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigReloadApplyRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2726,6 +2992,7 @@ pub struct ConfigReloadApplyRequest {
     pub force: bool,
 }
 
+/// Response envelope for `POST console/v1/config/reload/apply`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigReloadApplyEnvelope {
     pub contract: ContractDescriptor,
@@ -2738,6 +3005,7 @@ pub struct ConfigReloadApplyEnvelope {
     pub skipped_steps: Vec<ConfigReloadPlanStep>,
 }
 
+/// Webhook integration with its policy and last test outcome.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebhookIntegrationView {
     pub integration_id: String,
@@ -2763,6 +3031,7 @@ pub struct WebhookIntegrationView {
     pub last_test_at_unix_ms: Option<i64>,
 }
 
+/// Response envelope listing webhook integrations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebhookIntegrationListEnvelope {
     pub contract: ContractDescriptor,
@@ -2771,12 +3040,14 @@ pub struct WebhookIntegrationListEnvelope {
     pub page: PageInfo,
 }
 
+/// Response envelope wrapping a single webhook integration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebhookIntegrationEnvelope {
     pub contract: ContractDescriptor,
     pub integration: WebhookIntegrationView,
 }
 
+/// Response envelope returned after deleting a webhook integration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebhookIntegrationDeleteEnvelope {
     pub contract: ContractDescriptor,
@@ -2784,6 +3055,7 @@ pub struct WebhookIntegrationDeleteEnvelope {
     pub deleted: bool,
 }
 
+/// Request body creating or updating a webhook integration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebhookIntegrationUpsertRequest {
     pub integration_id: String,
@@ -2803,16 +3075,19 @@ pub struct WebhookIntegrationUpsertRequest {
     pub max_payload_bytes: Option<u64>,
 }
 
+/// Request body toggling a webhook integration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebhookIntegrationEnabledRequest {
     pub enabled: bool,
 }
 
+/// Request body test-delivering a base64 payload to a webhook integration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebhookIntegrationTestRequest {
     pub payload_base64: String,
 }
 
+/// Outcome of a webhook integration test, including safety findings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebhookIntegrationTestResult {
     pub integration_id: String,
@@ -2832,6 +3107,7 @@ pub struct WebhookIntegrationTestResult {
     pub secret_present: bool,
 }
 
+/// Response envelope for a webhook integration test.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebhookIntegrationTestEnvelope {
     pub contract: ContractDescriptor,
@@ -2839,6 +3115,7 @@ pub struct WebhookIntegrationTestEnvelope {
     pub result: WebhookIntegrationTestResult,
 }
 
+/// Query parameters filtering plugin bindings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PluginBindingsQuery {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2847,6 +3124,7 @@ pub struct PluginBindingsQuery {
     pub skill_id: Option<String>,
 }
 
+/// Capabilities granted to a plugin (hosts, secrets, storage, channels).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PluginCapabilityProfile {
     #[serde(default)]
@@ -2859,6 +3137,7 @@ pub struct PluginCapabilityProfile {
     pub channels: Vec<String>,
 }
 
+/// Operator-maintained metadata on a plugin binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PluginOperatorMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2873,6 +3152,7 @@ pub struct PluginOperatorMetadata {
     pub tags: Vec<String>,
 }
 
+/// Plugin binding with capability profile and discovery/check data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginBindingView {
     pub plugin_id: String,
@@ -2900,12 +3180,14 @@ pub struct PluginBindingView {
     pub updated_at_unix_ms: i64,
 }
 
+/// Plugin binding paired with its latest check result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PluginBindingListEntry {
     pub binding: PluginBindingView,
     pub check: Value,
 }
 
+/// Response envelope for `GET console/v1/plugins`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PluginBindingListEnvelope {
     pub contract: ContractDescriptor,
@@ -2917,6 +3199,7 @@ pub struct PluginBindingListEnvelope {
     pub page: PageInfo,
 }
 
+/// Response envelope wrapping a single plugin binding.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PluginBindingEnvelope {
     pub contract: ContractDescriptor,
@@ -2927,6 +3210,7 @@ pub struct PluginBindingEnvelope {
     pub installed_skill: Option<Value>,
 }
 
+/// Response envelope returned after deleting a plugin binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginBindingDeleteEnvelope {
     pub contract: ContractDescriptor,
@@ -2934,6 +3218,7 @@ pub struct PluginBindingDeleteEnvelope {
     pub binding: PluginBindingView,
 }
 
+/// Request body installing or binding a plugin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginBindingUpsertRequest {
     pub plugin_id: String,
@@ -2965,6 +3250,7 @@ pub struct PluginBindingUpsertRequest {
     pub clear_config: Option<bool>,
 }
 
+/// Query parameters filtering hook bindings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct HookBindingsQuery {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2975,6 +3261,7 @@ pub struct HookBindingsQuery {
     pub event: Option<String>,
 }
 
+/// Operator-maintained metadata on a hook binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct HookOperatorMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2987,6 +3274,7 @@ pub struct HookOperatorMetadata {
     pub updated_by: Option<String>,
 }
 
+/// Hook binding tying a plugin to a lifecycle event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HookBindingView {
     pub hook_id: String,
@@ -2999,12 +3287,14 @@ pub struct HookBindingView {
     pub updated_at_unix_ms: i64,
 }
 
+/// Hook binding paired with its latest check result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HookBindingListEntry {
     pub binding: HookBindingView,
     pub check: Value,
 }
 
+/// Response envelope for `GET console/v1/hooks`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HookBindingListEnvelope {
     pub contract: ContractDescriptor,
@@ -3015,6 +3305,7 @@ pub struct HookBindingListEnvelope {
     pub page: PageInfo,
 }
 
+/// Response envelope wrapping a single hook binding.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HookBindingEnvelope {
     pub contract: ContractDescriptor,
@@ -3022,6 +3313,7 @@ pub struct HookBindingEnvelope {
     pub check: Value,
 }
 
+/// Response envelope returned after deleting a hook binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HookBindingDeleteEnvelope {
     pub contract: ContractDescriptor,
@@ -3029,6 +3321,7 @@ pub struct HookBindingDeleteEnvelope {
     pub binding: HookBindingView,
 }
 
+/// Request body creating or updating a hook binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HookBindingUpsertRequest {
     pub hook_id: String,
@@ -3040,6 +3333,7 @@ pub struct HookBindingUpsertRequest {
     pub operator: Option<HookOperatorMetadata>,
 }
 
+/// Request body minting a channel pairing code.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairingCodeMintRequest {
     pub channel: String,
@@ -3049,6 +3343,7 @@ pub struct PairingCodeMintRequest {
     pub ttl_ms: Option<u64>,
 }
 
+/// Request body minting a node pairing code.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodePairingCodeMintRequest {
     pub method: NodePairingMethod,
@@ -3058,6 +3353,7 @@ pub struct NodePairingCodeMintRequest {
     pub ttl_ms: Option<u64>,
 }
 
+/// Query parameters filtering node pairing requests.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct NodePairingListQuery {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3066,24 +3362,28 @@ pub struct NodePairingListQuery {
     pub state: Option<NodePairingRequestState>,
 }
 
+/// Request body approving or rejecting a node pairing request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodePairingDecisionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
 
+/// Request body for a device action (revoke/remove) with optional reason.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceActionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
 
+/// Request body clearing devices, optionally only revoked ones.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct DeviceClearRequest {
     #[serde(default)]
     pub revoked_only: bool,
 }
 
+/// Request body invoking a capability on a node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeInvokeRequest {
     pub capability: String,
@@ -3093,12 +3393,14 @@ pub struct NodeInvokeRequest {
     pub max_payload_bytes: Option<u64>,
 }
 
+/// Request body creating a support bundle job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SupportBundleCreateRequest {
     #[serde(default = "default_support_bundle_backups")]
     pub retain_jobs: usize,
 }
 
+/// Request body creating a doctor recovery job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DoctorRecoveryCreateRequest {
     #[serde(default = "default_doctor_recovery_jobs")]
@@ -3119,12 +3421,14 @@ pub struct DoctorRecoveryCreateRequest {
     pub rollback_run: Option<String>,
 }
 
+/// Request body for a provider auth action, optionally targeting a profile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderAuthActionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
 }
 
+/// Request body storing a provider API key as an auth profile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderApiKeyUpsertRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3136,6 +3440,7 @@ pub struct ProviderApiKeyUpsertRequest {
     pub set_default: bool,
 }
 
+/// Request body storing an OpenAI API key as an auth profile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenAiApiKeyUpsertRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3147,6 +3452,7 @@ pub struct OpenAiApiKeyUpsertRequest {
     pub set_default: bool,
 }
 
+/// Request body starting the OpenAI OAuth bootstrap flow.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenAiOAuthBootstrapRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3165,6 +3471,7 @@ pub struct OpenAiOAuthBootstrapRequest {
     pub set_default: bool,
 }
 
+/// Response envelope with the OpenAI OAuth authorization URL and attempt ID.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenAiOAuthBootstrapEnvelope {
     pub contract: ContractDescriptor,
@@ -3177,6 +3484,7 @@ pub struct OpenAiOAuthBootstrapEnvelope {
     pub message: String,
 }
 
+/// Response envelope reporting OpenAI OAuth callback progress for an attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenAiOAuthCallbackStateEnvelope {
     pub contract: ContractDescriptor,
@@ -3192,6 +3500,8 @@ pub struct OpenAiOAuthCallbackStateEnvelope {
     pub expires_at_unix_ms: Option<i64>,
 }
 
+// serde default providers; values mirror the daemon's documented defaults and
+// must stay in sync with them.
 const fn default_config_backups() -> usize {
     5
 }

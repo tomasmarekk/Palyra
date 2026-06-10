@@ -1,3 +1,8 @@
+//! Crate-level tests pinning serde wire shapes and transport helper behavior.
+//!
+//! These assertions guard byte-compatibility of the `/console/v1` contract;
+//! a failure here usually signals a wire-breaking change, not a test bug.
+
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde_json::Value;
 

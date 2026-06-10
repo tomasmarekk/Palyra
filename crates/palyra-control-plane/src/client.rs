@@ -1,3 +1,10 @@
+//! Async HTTP client for the `/console/v1` control-plane API.
+//!
+//! Wraps `reqwest` with cookie-based session state, CSRF-token propagation for
+//! mutating endpoints, and bounded retries for safe (GET) reads. Each public
+//! method maps one-to-one onto a daemon console endpoint and decodes into the
+//! typed envelopes from `crate::models`.
+
 use std::time::Duration;
 
 use reqwest::{Client, Method, Url};
@@ -11,14 +18,20 @@ use crate::transport::{fallback_error_message, urlencoding};
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_SAFE_READ_RETRIES: usize = 1;
 
+/// Configuration for constructing a [`ControlPlaneClient`].
 #[derive(Debug, Clone)]
 pub struct ControlPlaneClientConfig {
+    /// Base URL of the daemon console API, e.g. `http://127.0.0.1:8787/`.
     pub base_url: String,
+    /// Per-request timeout applied to the underlying HTTP client.
     pub request_timeout: Duration,
+    /// Extra attempts for GET requests after transport failures (HTTP errors are
+    /// never retried).
     pub safe_read_retries: usize,
 }
 
 impl ControlPlaneClientConfig {
+    /// Creates a config with the default timeout (10 s) and one safe-read retry.
     #[must_use]
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
@@ -29,6 +42,18 @@ impl ControlPlaneClientConfig {
     }
 }
 
+/// Asynchronous client for the daemon's `/console/v1` API.
+///
+/// Holds the session cookie store plus the CSRF token captured by
+/// [`get_session`](Self::get_session) or [`login`](Self::login). All request
+/// methods share one error contract: [`ControlPlaneClientError::Transport`]
+/// when the request cannot be sent, [`ControlPlaneClientError::Http`] for
+/// non-success statuses (with the parsed [`ErrorEnvelope`] when available), and
+/// [`ControlPlaneClientError::Decode`] when the response body does not match
+/// the expected envelope. GET requests are retried immediately, without
+/// backoff, up to `safe_read_retries` extra times on transport failures only.
+// INTENTIONAL: no `Debug` derive — `csrf_token` is a session credential and a
+// derived impl would leak it into logs.
 #[derive(Clone)]
 pub struct ControlPlaneClient {
     base_url: Url,
@@ -38,6 +63,12 @@ pub struct ControlPlaneClient {
 }
 
 impl ControlPlaneClient {
+    /// Creates a client with a cookie-enabled HTTP client and the configured timeout.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError::ClientInit`] if the HTTP client cannot
+    /// be built, or [`ControlPlaneClientError::InvalidBaseUrl`] if the base URL
+    /// does not parse.
     pub fn new(config: ControlPlaneClientConfig) -> Result<Self, ControlPlaneClientError> {
         let client = Client::builder()
             .cookie_store(true)
@@ -47,6 +78,14 @@ impl ControlPlaneClient {
         Self::with_client(config, client)
     }
 
+    /// Creates a client on top of a caller-provided `reqwest` client.
+    ///
+    /// The base URL path is normalized to end with `/` so endpoint paths join
+    /// under it instead of replacing its final segment.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError::InvalidBaseUrl`] if the base URL does
+    /// not parse.
     pub fn with_client(
         config: ControlPlaneClientConfig,
         client: Client,
@@ -60,10 +99,16 @@ impl ControlPlaneClient {
         Ok(Self { base_url, client, csrf_token: None, safe_read_retries: config.safe_read_retries })
     }
 
+    /// Overrides the CSRF token sent with mutating requests (`None` clears it).
     pub fn set_csrf_token(&mut self, csrf_token: Option<String>) {
         self.csrf_token = csrf_token;
     }
 
+    /// Fetches the current session via `GET console/v1/auth/session` and stores
+    /// its CSRF token for subsequent mutations.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_session(&mut self) -> Result<ConsoleSession, ControlPlaneClientError> {
         let session: ConsoleSession = self
             .request_json(Method::GET, "console/v1/auth/session", None::<&Value>, false)
@@ -72,6 +117,11 @@ impl ControlPlaneClient {
         Ok(session)
     }
 
+    /// Logs in via `POST console/v1/auth/login` and stores the session's CSRF
+    /// token for subsequent mutations.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn login(
         &mut self,
         request: &ConsoleLoginRequest,
@@ -82,6 +132,10 @@ impl ControlPlaneClient {
         Ok(session)
     }
 
+    /// Creates a one-shot browser handoff URL via `POST console/v1/auth/browser-handoff`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn create_browser_handoff(
         &self,
         request: &ConsoleBrowserHandoffRequest,
@@ -90,16 +144,28 @@ impl ControlPlaneClient {
             .await
     }
 
+    /// Fetches the mobile companion bootstrap contract via `GET console/v1/mobile/bootstrap`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_mobile_bootstrap(
         &self,
     ) -> Result<MobileBootstrapEnvelope, ControlPlaneClientError> {
         self.request_json(Method::GET, "console/v1/mobile/bootstrap", None::<&Value>, false).await
     }
 
+    /// Fetches the mobile inbox via `GET console/v1/mobile/inbox`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_mobile_inbox(&self) -> Result<MobileInboxEnvelope, ControlPlaneClientError> {
         self.request_json(Method::GET, "console/v1/mobile/inbox", None::<&Value>, false).await
     }
 
+    /// Lists pending mobile approvals via `GET console/v1/mobile/approvals`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn list_mobile_approvals(
         &self,
         limit: Option<usize>,
@@ -116,6 +182,12 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Fetches one mobile approval with explainability.
+    ///
+    /// Calls `GET console/v1/mobile/approvals/{approval_id}`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_mobile_approval(
         &self,
         approval_id: &str,
@@ -129,6 +201,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Decides a mobile approval via `POST console/v1/mobile/approvals/{approval_id}/decision`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn decide_mobile_approval(
         &self,
         approval_id: &str,
@@ -143,6 +219,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Lists recent sessions for the mobile companion via `GET console/v1/mobile/sessions`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn list_mobile_sessions(
         &self,
         limit: Option<usize>,
@@ -159,6 +239,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Fetches one mobile session detail via `GET console/v1/mobile/sessions/{session_id}`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_mobile_session(
         &self,
         session_id: &str,
@@ -172,6 +256,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Prepares a mediated safe-URL open via `POST console/v1/mobile/safe-url-open`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn prepare_mobile_safe_url_open(
         &self,
         request: &MobileSafeUrlOpenRequest,
@@ -180,6 +268,10 @@ impl ControlPlaneClient {
             .await
     }
 
+    /// Creates a voice note via `POST console/v1/mobile/voice-notes`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn create_mobile_voice_note(
         &self,
         request: &MobileVoiceNoteCreateRequest,
@@ -187,6 +279,10 @@ impl ControlPlaneClient {
         self.request_json(Method::POST, "console/v1/mobile/voice-notes", Some(request), true).await
     }
 
+    /// Lists browser profiles via `GET console/v1/browser/profiles`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn list_browser_profiles(
         &self,
         query: &BrowserProfilesQuery,
@@ -203,6 +299,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Creates a browser profile via `POST console/v1/browser/profiles/create`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn create_browser_profile(
         &self,
         request: &BrowserCreateProfileRequest,
@@ -211,6 +311,10 @@ impl ControlPlaneClient {
             .await
     }
 
+    /// Renames a browser profile via `POST console/v1/browser/profiles/{profile_id}/rename`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn rename_browser_profile(
         &self,
         profile_id: &str,
@@ -225,6 +329,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Deletes a browser profile via `POST console/v1/browser/profiles/{profile_id}/delete`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn delete_browser_profile(
         &self,
         profile_id: &str,
@@ -239,6 +347,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Activates a browser profile via `POST console/v1/browser/profiles/{profile_id}/activate`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn activate_browser_profile(
         &self,
         profile_id: &str,
@@ -253,6 +365,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Lists download artifacts of a browser session via `GET console/v1/browser/downloads`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn list_browser_download_artifacts(
         &self,
         query: &BrowserDownloadArtifactsQuery,
@@ -273,6 +389,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Creates a browser session via `POST console/v1/browser/sessions`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn create_browser_session(
         &self,
         request: &BrowserSessionCreateRequest,
@@ -280,6 +400,10 @@ impl ControlPlaneClient {
         self.request_json(Method::POST, "console/v1/browser/sessions", Some(request), true).await
     }
 
+    /// Closes a browser session via `POST console/v1/browser/sessions/{session_id}/close`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn close_browser_session(
         &self,
         session_id: &str,
@@ -293,6 +417,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Navigates a browser session via `POST console/v1/browser/sessions/{session_id}/navigate`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn navigate_browser_session(
         &self,
         session_id: &str,
@@ -307,6 +435,12 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Clicks an element in a browser session.
+    ///
+    /// Calls `POST console/v1/browser/sessions/{session_id}/click`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn click_browser_session(
         &self,
         session_id: &str,
@@ -321,6 +455,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Types text into a browser session via `POST console/v1/browser/sessions/{session_id}/type`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn type_browser_session(
         &self,
         session_id: &str,
@@ -335,6 +473,12 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Presses a key in a browser session.
+    ///
+    /// Calls `POST console/v1/browser/sessions/{session_id}/press`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn press_browser_session(
         &self,
         session_id: &str,
@@ -349,6 +493,12 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Selects an option in a browser session.
+    ///
+    /// Calls `POST console/v1/browser/sessions/{session_id}/select`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn select_browser_session(
         &self,
         session_id: &str,
@@ -363,6 +513,12 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Highlights an element in a browser session.
+    ///
+    /// Calls `POST console/v1/browser/sessions/{session_id}/highlight`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn highlight_browser_session(
         &self,
         session_id: &str,
@@ -377,6 +533,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Scrolls a browser session via `POST console/v1/browser/sessions/{session_id}/scroll`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn scroll_browser_session(
         &self,
         session_id: &str,
@@ -391,6 +551,12 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Waits for a selector or text in a browser session.
+    ///
+    /// Calls `POST console/v1/browser/sessions/{session_id}/wait-for`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn wait_for_browser_session(
         &self,
         session_id: &str,
@@ -405,6 +571,12 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Reads the page title of a browser session.
+    ///
+    /// Calls `GET console/v1/browser/sessions/{session_id}/title`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_browser_title(
         &self,
         session_id: &str,
@@ -422,6 +594,12 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Captures a screenshot of a browser session.
+    ///
+    /// Calls `GET console/v1/browser/sessions/{session_id}/screenshot`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_browser_screenshot(
         &self,
         session_id: &str,
@@ -443,6 +621,12 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Renders a browser session page to PDF.
+    ///
+    /// Calls `GET console/v1/browser/sessions/{session_id}/pdf`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_browser_pdf(
         &self,
         session_id: &str,
@@ -460,6 +644,12 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Observes DOM, accessibility, and visible text of a browser session.
+    ///
+    /// Calls `GET console/v1/browser/sessions/{session_id}/observe`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn observe_browser_session(
         &self,
         session_id: &str,
@@ -502,6 +692,12 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Reads the network log of a browser session.
+    ///
+    /// Calls `GET console/v1/browser/sessions/{session_id}/network-log`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_browser_network_log(
         &self,
         session_id: &str,
@@ -524,6 +720,12 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Reads the console log of a browser session.
+    ///
+    /// Calls `GET console/v1/browser/sessions/{session_id}/console`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_browser_console_log(
         &self,
         session_id: &str,
@@ -537,6 +739,8 @@ impl ControlPlaneClient {
                     ("limit", query.limit.map(|value| value.to_string())),
                     (
                         "minimum_severity",
+                        // Round-trip through serde_json so the query value always
+                        // matches the enum's snake_case wire encoding.
                         query.minimum_severity.map(|value| {
                             serde_json::to_string(&value)
                                 .unwrap_or_default()
@@ -557,6 +761,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Lists tabs of a browser session via `GET console/v1/browser/sessions/{session_id}/tabs`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn list_browser_tabs(
         &self,
         session_id: &str,
@@ -570,6 +778,12 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Opens a tab in a browser session.
+    ///
+    /// Calls `POST console/v1/browser/sessions/{session_id}/tabs/open`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn open_browser_tab(
         &self,
         session_id: &str,
@@ -584,6 +798,12 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Switches the active tab of a browser session.
+    ///
+    /// Calls `POST console/v1/browser/sessions/{session_id}/tabs/switch`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn switch_browser_tab(
         &self,
         session_id: &str,
@@ -598,6 +818,12 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Closes a tab of a browser session.
+    ///
+    /// Calls `POST console/v1/browser/sessions/{session_id}/tabs/close`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn close_browser_tab(
         &self,
         session_id: &str,
@@ -612,6 +838,12 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Reads permissions of a browser session.
+    ///
+    /// Calls `GET console/v1/browser/sessions/{session_id}/permissions`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_browser_permissions(
         &self,
         session_id: &str,
@@ -625,6 +857,12 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Updates permissions of a browser session.
+    ///
+    /// Calls `POST console/v1/browser/sessions/{session_id}/permissions`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn set_browser_permissions(
         &self,
         session_id: &str,
@@ -639,6 +877,12 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Resets selected state of a browser session.
+    ///
+    /// Calls `POST console/v1/browser/sessions/{session_id}/reset-state`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn reset_browser_state(
         &self,
         session_id: &str,
@@ -653,10 +897,20 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Fetches raw daemon diagnostics via `GET console/v1/diagnostics`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_diagnostics(&self) -> Result<Value, ControlPlaneClientError> {
         self.request_json(Method::GET, "console/v1/diagnostics", None::<&Value>, false).await
     }
 
+    /// Lists the session catalog via `GET console/v1/sessions`.
+    ///
+    /// Caller-supplied query pairs are appended; `None` or blank values are dropped.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn list_session_catalog(
         &self,
         query: Vec<(&str, Option<String>)>,
@@ -670,6 +924,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Fetches one session catalog entry via `GET console/v1/sessions/{session_id}`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_session_catalog_entry(
         &self,
         session_id: &str,
@@ -683,6 +941,12 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Updates a session's quick controls.
+    ///
+    /// Calls `POST console/v1/sessions/{session_id}/quick-controls`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn update_session_quick_controls(
         &self,
         session_id: &str,
@@ -697,6 +961,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Fetches an arbitrary console path and returns the raw JSON value.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_json_value(
         &self,
         path: impl AsRef<str>,
@@ -704,6 +972,10 @@ impl ControlPlaneClient {
         self.request_json(Method::GET, path, None::<&Value>, false).await
     }
 
+    /// Posts a JSON body to an arbitrary console path and returns the raw JSON value.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn post_json_value<T: Serialize + ?Sized>(
         &self,
         path: impl AsRef<str>,
@@ -712,12 +984,20 @@ impl ControlPlaneClient {
         self.request_json(Method::POST, path, Some(request), true).await
     }
 
+    /// Fetches the deployment posture summary via `GET console/v1/deployment/posture`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_deployment_posture(
         &self,
     ) -> Result<DeploymentPostureSummary, ControlPlaneClientError> {
         self.request_json(Method::GET, "console/v1/deployment/posture", None::<&Value>, false).await
     }
 
+    /// Fetches the capability catalog via `GET console/v1/control-plane/capabilities`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_capability_catalog(
         &self,
     ) -> Result<CapabilityCatalog, ControlPlaneClientError> {
@@ -730,6 +1010,12 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Fetches onboarding posture via `GET console/v1/onboarding/posture`.
+    ///
+    /// Caller-supplied query pairs are appended; `None` or blank values are dropped.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_onboarding_posture(
         &self,
         query: Vec<(&str, Option<String>)>,
@@ -743,6 +1029,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Inspects the config document via `POST console/v1/config/inspect`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn inspect_config(
         &self,
         request: &ConfigInspectRequest,
@@ -750,6 +1040,10 @@ impl ControlPlaneClient {
         self.request_json(Method::POST, "console/v1/config/inspect", Some(request), false).await
     }
 
+    /// Validates the config document via `POST console/v1/config/validate`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn validate_config(
         &self,
         request: &ConfigValidateRequest,
@@ -757,6 +1051,10 @@ impl ControlPlaneClient {
         self.request_json(Method::POST, "console/v1/config/validate", Some(request), false).await
     }
 
+    /// Mutates one config key via `POST console/v1/config/mutate`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn mutate_config(
         &self,
         request: &ConfigMutationRequest,
@@ -764,6 +1062,10 @@ impl ControlPlaneClient {
         self.request_json(Method::POST, "console/v1/config/mutate", Some(request), true).await
     }
 
+    /// Migrates the config document to the current version via `POST console/v1/config/migrate`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn migrate_config(
         &self,
         request: &ConfigInspectRequest,
@@ -771,6 +1073,10 @@ impl ControlPlaneClient {
         self.request_json(Method::POST, "console/v1/config/migrate", Some(request), true).await
     }
 
+    /// Restores the config from a numbered backup via `POST console/v1/config/recover`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn recover_config(
         &self,
         request: &ConfigRecoverRequest,
@@ -778,6 +1084,10 @@ impl ControlPlaneClient {
         self.request_json(Method::POST, "console/v1/config/recover", Some(request), true).await
     }
 
+    /// Plans a config reload via `POST console/v1/config/reload/plan`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn plan_config_reload(
         &self,
         request: &ConfigReloadPlanRequest,
@@ -785,6 +1095,10 @@ impl ControlPlaneClient {
         self.request_json(Method::POST, "console/v1/config/reload/plan", Some(request), false).await
     }
 
+    /// Applies a config reload plan via `POST console/v1/config/reload/apply`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn apply_config_reload(
         &self,
         request: &ConfigReloadApplyRequest,
@@ -792,6 +1106,10 @@ impl ControlPlaneClient {
         self.request_json(Method::POST, "console/v1/config/reload/apply", Some(request), true).await
     }
 
+    /// Lists secret metadata in a scope via `GET console/v1/secrets`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn list_secrets(
         &self,
         scope: &str,
@@ -805,6 +1123,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Fetches metadata for one secret via `GET console/v1/secrets/metadata`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_secret_metadata(
         &self,
         scope: &str,
@@ -823,6 +1145,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Stores a secret value via `POST console/v1/secrets`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn set_secret(
         &self,
         request: &SecretSetRequest,
@@ -830,6 +1156,10 @@ impl ControlPlaneClient {
         self.request_json(Method::POST, "console/v1/secrets", Some(request), true).await
     }
 
+    /// Reveals a secret value via `POST console/v1/secrets/reveal`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn reveal_secret(
         &self,
         request: &SecretRevealRequest,
@@ -837,6 +1167,10 @@ impl ControlPlaneClient {
         self.request_json(Method::POST, "console/v1/secrets/reveal", Some(request), true).await
     }
 
+    /// Deletes a secret via `POST console/v1/secrets/delete`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn delete_secret(
         &self,
         request: &SecretDeleteRequest,
@@ -844,12 +1178,20 @@ impl ControlPlaneClient {
         self.request_json(Method::POST, "console/v1/secrets/delete", Some(request), true).await
     }
 
+    /// Lists secrets configured in the daemon config via `GET console/v1/secrets/configured`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn list_configured_secrets(
         &self,
     ) -> Result<ConfiguredSecretListEnvelope, ControlPlaneClientError> {
         self.request_json(Method::GET, "console/v1/secrets/configured", None::<&Value>, false).await
     }
 
+    /// Fetches one configured secret via `GET console/v1/secrets/configured/detail`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_configured_secret(
         &self,
         secret_id: &str,
@@ -863,6 +1205,12 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Lists webhook integrations via `GET console/v1/webhooks`.
+    ///
+    /// `query` is appended verbatim as the raw query string when non-blank.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn list_webhooks(
         &self,
         query: &str,
@@ -875,6 +1223,10 @@ impl ControlPlaneClient {
         self.request_json(Method::GET, path, None::<&Value>, false).await
     }
 
+    /// Fetches one webhook integration via `GET console/v1/webhooks/{integration_id}`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_webhook(
         &self,
         integration_id: &str,
@@ -888,6 +1240,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Creates or updates a webhook integration via `POST console/v1/webhooks`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn upsert_webhook(
         &self,
         request: &WebhookIntegrationUpsertRequest,
@@ -895,6 +1251,12 @@ impl ControlPlaneClient {
         self.request_json(Method::POST, "console/v1/webhooks", Some(request), true).await
     }
 
+    /// Enables or disables a webhook integration.
+    ///
+    /// Calls `POST console/v1/webhooks/{integration_id}/enabled`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn set_webhook_enabled(
         &self,
         integration_id: &str,
@@ -909,6 +1271,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Deletes a webhook integration via `POST console/v1/webhooks/{integration_id}/delete`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn delete_webhook(
         &self,
         integration_id: &str,
@@ -922,6 +1288,12 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Test-delivers a payload to a webhook integration.
+    ///
+    /// Calls `POST console/v1/webhooks/{integration_id}/test`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn test_webhook(
         &self,
         integration_id: &str,
@@ -936,6 +1308,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Lists plugin bindings via `GET console/v1/plugins`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn list_plugins(
         &self,
         query: &PluginBindingsQuery,
@@ -952,6 +1328,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Fetches one plugin binding via `GET console/v1/plugins/{plugin_id}`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_plugin(
         &self,
         plugin_id: &str,
@@ -965,6 +1345,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Installs or binds a plugin via `POST console/v1/plugins/install-or-bind`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn upsert_plugin(
         &self,
         request: &PluginBindingUpsertRequest,
@@ -973,6 +1357,10 @@ impl ControlPlaneClient {
             .await
     }
 
+    /// Re-checks a plugin binding via `GET console/v1/plugins/{plugin_id}/check`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn check_plugin(
         &self,
         plugin_id: &str,
@@ -986,6 +1374,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Enables a plugin binding via `POST console/v1/plugins/{plugin_id}/enable`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn enable_plugin(
         &self,
         plugin_id: &str,
@@ -999,6 +1391,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Disables a plugin binding via `POST console/v1/plugins/{plugin_id}/disable`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn disable_plugin(
         &self,
         plugin_id: &str,
@@ -1012,6 +1408,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Deletes a plugin binding via `POST console/v1/plugins/{plugin_id}/delete`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn delete_plugin(
         &self,
         plugin_id: &str,
@@ -1025,6 +1425,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Lists hook bindings via `GET console/v1/hooks`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn list_hooks(
         &self,
         query: &HookBindingsQuery,
@@ -1045,6 +1449,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Fetches one hook binding via `GET console/v1/hooks/{hook_id}`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_hook(
         &self,
         hook_id: &str,
@@ -1058,6 +1466,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Creates or updates a hook binding via `POST console/v1/hooks/bind`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn upsert_hook(
         &self,
         request: &HookBindingUpsertRequest,
@@ -1065,6 +1477,10 @@ impl ControlPlaneClient {
         self.request_json(Method::POST, "console/v1/hooks/bind", Some(request), true).await
     }
 
+    /// Re-checks a hook binding via `GET console/v1/hooks/{hook_id}/check`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn check_hook(
         &self,
         hook_id: &str,
@@ -1078,6 +1494,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Enables a hook binding via `POST console/v1/hooks/{hook_id}/enable`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn enable_hook(
         &self,
         hook_id: &str,
@@ -1091,6 +1511,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Disables a hook binding via `POST console/v1/hooks/{hook_id}/disable`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn disable_hook(
         &self,
         hook_id: &str,
@@ -1104,6 +1528,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Deletes a hook binding via `POST console/v1/hooks/{hook_id}/delete`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn delete_hook(
         &self,
         hook_id: &str,
@@ -1117,6 +1545,12 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Lists auth profiles via `GET console/v1/auth/profiles`.
+    ///
+    /// `query` is appended verbatim as the raw query string when non-blank.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn list_auth_profiles(
         &self,
         query: &str,
@@ -1129,6 +1563,10 @@ impl ControlPlaneClient {
         self.request_json(Method::GET, path, None::<&Value>, false).await
     }
 
+    /// Fetches one auth profile via `GET console/v1/auth/profiles/{profile_id}`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_auth_profile(
         &self,
         profile_id: &str,
@@ -1142,6 +1580,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Decides an approval via `POST console/v1/approvals/{approval_id}/decision`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn decide_approval(
         &self,
         approval_id: &str,
@@ -1156,6 +1598,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Creates or updates an auth profile via `POST console/v1/auth/profiles`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn upsert_auth_profile(
         &self,
         profile: &AuthProfileView,
@@ -1163,6 +1609,10 @@ impl ControlPlaneClient {
         self.request_json(Method::POST, "console/v1/auth/profiles", Some(profile), true).await
     }
 
+    /// Deletes an auth profile via `POST console/v1/auth/profiles/{profile_id}/delete`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn delete_auth_profile(
         &self,
         profile_id: &str,
@@ -1176,6 +1626,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Fetches auth health via `GET console/v1/auth/health`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_auth_health(
         &self,
         include_profiles: bool,
@@ -1194,6 +1648,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Fetches the raw auth doctor report via `GET console/v1/auth/doctor`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_auth_doctor(
         &self,
         agent_id: Option<&str>,
@@ -1210,6 +1668,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Fetches the raw auth audit report via `GET console/v1/auth/audit`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_auth_audit(
         &self,
         agent_id: Option<&str>,
@@ -1232,6 +1694,12 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Clears an auth profile's cooldown.
+    ///
+    /// Calls `POST console/v1/auth/profiles/{profile_id}/cooldown/clear`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn clear_auth_profile_cooldown(
         &self,
         profile_id: &str,
@@ -1245,6 +1713,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Sets the auth profile selection order via `POST console/v1/auth/profile-order`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn set_auth_profile_order<T: Serialize + ?Sized>(
         &self,
         request: &T,
@@ -1252,6 +1724,10 @@ impl ControlPlaneClient {
         self.request_json(Method::POST, "console/v1/auth/profile-order", Some(request), true).await
     }
 
+    /// Explains which auth profile would be selected via `POST console/v1/auth/selection/explain`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn explain_auth_profile_selection<T: Serialize + ?Sized>(
         &self,
         request: &T,
@@ -1260,6 +1736,10 @@ impl ControlPlaneClient {
             .await
     }
 
+    /// Fetches the OpenAI provider auth state via `GET console/v1/auth/providers/openai`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_openai_provider_state(
         &self,
     ) -> Result<ProviderAuthStateEnvelope, ControlPlaneClientError> {
@@ -1267,6 +1747,10 @@ impl ControlPlaneClient {
             .await
     }
 
+    /// Stores an OpenAI API key via `POST console/v1/auth/providers/openai/api-key`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn connect_openai_api_key(
         &self,
         request: &OpenAiApiKeyUpsertRequest,
@@ -1280,6 +1764,12 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Starts the OpenAI OAuth bootstrap flow.
+    ///
+    /// Calls `POST console/v1/auth/providers/openai/bootstrap`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn start_openai_oauth_bootstrap(
         &self,
         request: &OpenAiOAuthBootstrapRequest,
@@ -1293,6 +1783,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Polls OpenAI OAuth callback state via `GET console/v1/auth/providers/openai/callback-state`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_openai_oauth_callback_state(
         &self,
         attempt_id: &str,
@@ -1309,6 +1803,12 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Restarts the OpenAI OAuth flow for an existing profile.
+    ///
+    /// Calls `POST console/v1/auth/providers/openai/reconnect`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn reconnect_openai_oauth(
         &self,
         request: &ProviderAuthActionRequest,
@@ -1322,6 +1822,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Runs a named OpenAI provider action via `POST console/v1/auth/providers/openai/{action}`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn run_openai_provider_action(
         &self,
         action: &str,
@@ -1336,10 +1840,18 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Fetches the raw access-control snapshot via `GET console/v1/access`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_access_snapshot(&self) -> Result<Value, ControlPlaneClientError> {
         self.request_json(Method::GET, "console/v1/access", None::<&Value>, false).await
     }
 
+    /// Runs an access-control backfill via `POST console/v1/access/backfill`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn run_access_backfill(
         &self,
         request: &Value,
@@ -1347,6 +1859,10 @@ impl ControlPlaneClient {
         self.request_json(Method::POST, "console/v1/access/backfill", Some(request), true).await
     }
 
+    /// Sets an access feature flag via `POST console/v1/access/features/{feature_key}`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn set_access_feature_flag(
         &self,
         feature_key: &str,
@@ -1361,10 +1877,18 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Lists access API tokens via `GET console/v1/access/api-tokens`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn list_access_api_tokens(&self) -> Result<Value, ControlPlaneClientError> {
         self.request_json(Method::GET, "console/v1/access/api-tokens", None::<&Value>, false).await
     }
 
+    /// Creates an access API token via `POST console/v1/access/api-tokens`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn create_access_api_token(
         &self,
         request: &Value,
@@ -1372,6 +1896,10 @@ impl ControlPlaneClient {
         self.request_json(Method::POST, "console/v1/access/api-tokens", Some(request), true).await
     }
 
+    /// Rotates an access API token via `POST console/v1/access/api-tokens/{token_id}/rotate`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn rotate_access_api_token(
         &self,
         token_id: &str,
@@ -1385,6 +1913,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Revokes an access API token via `POST console/v1/access/api-tokens/{token_id}/revoke`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn revoke_access_api_token(
         &self,
         token_id: &str,
@@ -1398,6 +1930,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Creates a workspace via `POST console/v1/access/workspaces`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn create_access_workspace(
         &self,
         request: &Value,
@@ -1405,6 +1941,10 @@ impl ControlPlaneClient {
         self.request_json(Method::POST, "console/v1/access/workspaces", Some(request), true).await
     }
 
+    /// Creates a workspace invitation via `POST console/v1/access/invitations`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn create_access_invitation(
         &self,
         request: &Value,
@@ -1412,6 +1952,10 @@ impl ControlPlaneClient {
         self.request_json(Method::POST, "console/v1/access/invitations", Some(request), true).await
     }
 
+    /// Accepts a workspace invitation via `POST console/v1/access/invitations/accept`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn accept_access_invitation(
         &self,
         request: &Value,
@@ -1420,6 +1964,10 @@ impl ControlPlaneClient {
             .await
     }
 
+    /// Updates a membership role via `POST console/v1/access/memberships/role`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn update_access_membership_role(
         &self,
         request: &Value,
@@ -1428,6 +1976,10 @@ impl ControlPlaneClient {
             .await
     }
 
+    /// Removes a workspace membership via `POST console/v1/access/memberships/remove`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn remove_access_membership(
         &self,
         request: &Value,
@@ -1436,6 +1988,10 @@ impl ControlPlaneClient {
             .await
     }
 
+    /// Creates or updates an access share via `POST console/v1/access/shares`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn upsert_access_share(
         &self,
         request: &Value,
@@ -1443,12 +1999,20 @@ impl ControlPlaneClient {
         self.request_json(Method::POST, "console/v1/access/shares", Some(request), true).await
     }
 
+    /// Fetches the channel pairing summary via `GET console/v1/pairing`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_pairing_summary(
         &self,
     ) -> Result<PairingSummaryEnvelope, ControlPlaneClientError> {
         self.request_json(Method::GET, "console/v1/pairing", None::<&Value>, false).await
     }
 
+    /// Mints a channel pairing code via `POST console/v1/pairing/codes`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn mint_pairing_code(
         &self,
         request: &PairingCodeMintRequest,
@@ -1456,6 +2020,10 @@ impl ControlPlaneClient {
         self.request_json(Method::POST, "console/v1/pairing/codes", Some(request), true).await
     }
 
+    /// Lists node pairing codes and requests via `GET console/v1/pairing/requests`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn list_node_pairing_requests(
         &self,
         query: Option<&NodePairingListQuery>,
@@ -1466,6 +2034,9 @@ impl ControlPlaneClient {
                 pairs.push(format!("client_kind={}", urlencoding(client_kind)));
             }
             if let Some(state) = query.state {
+                // Serialize through serde_json so the query value matches the
+                // enum's snake_case wire encoding; the fallback is unreachable
+                // for this fieldless enum.
                 let state = serde_json::to_string(&state)
                     .unwrap_or_else(|_| "\"pending_approval\"".to_owned())
                     .trim_matches('"')
@@ -1483,6 +2054,10 @@ impl ControlPlaneClient {
         self.request_json(Method::GET, path, None::<&Value>, false).await
     }
 
+    /// Mints a node pairing code via `POST console/v1/pairing/requests/code`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn mint_node_pairing_code(
         &self,
         request: &NodePairingCodeMintRequest,
@@ -1491,6 +2066,10 @@ impl ControlPlaneClient {
             .await
     }
 
+    /// Approves a node pairing request via `POST console/v1/pairing/requests/{request_id}/approve`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn approve_node_pairing_request(
         &self,
         request_id: &str,
@@ -1505,6 +2084,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Rejects a node pairing request via `POST console/v1/pairing/requests/{request_id}/reject`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn reject_node_pairing_request(
         &self,
         request_id: &str,
@@ -1519,6 +2102,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Lists log records via `GET console/v1/logs`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn list_logs(
         &self,
         query: &LogListQuery,
@@ -1544,10 +2131,20 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Fetches the device and instance inventory via `GET console/v1/inventory`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn list_inventory(&self) -> Result<InventoryListEnvelope, ControlPlaneClientError> {
         self.request_json(Method::GET, "console/v1/inventory", None::<&Value>, false).await
     }
 
+    /// Fetches one inventory device with related activity.
+    ///
+    /// Calls `GET console/v1/inventory/{device_id}`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_inventory_device(
         &self,
         device_id: &str,
@@ -1561,10 +2158,18 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Lists paired devices via `GET console/v1/devices`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn list_devices(&self) -> Result<DeviceListEnvelope, ControlPlaneClientError> {
         self.request_json(Method::GET, "console/v1/devices", None::<&Value>, false).await
     }
 
+    /// Fetches one device via `GET console/v1/devices/{device_id}`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_device(
         &self,
         device_id: &str,
@@ -1578,6 +2183,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Rotates a device certificate via `POST console/v1/devices/{device_id}/rotate`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn rotate_device(
         &self,
         device_id: &str,
@@ -1591,6 +2200,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Revokes a device via `POST console/v1/devices/{device_id}/revoke`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn revoke_device(
         &self,
         device_id: &str,
@@ -1605,6 +2218,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Removes a device via `POST console/v1/devices/{device_id}/remove`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn remove_device(
         &self,
         device_id: &str,
@@ -1619,6 +2236,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Clears devices via `POST console/v1/devices/clear`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn clear_devices(
         &self,
         request: &DeviceClearRequest,
@@ -1626,16 +2247,28 @@ impl ControlPlaneClient {
         self.request_json(Method::POST, "console/v1/devices/clear", Some(request), true).await
     }
 
+    /// Lists registered nodes via `GET console/v1/nodes`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn list_nodes(&self) -> Result<NodeListEnvelope, ControlPlaneClientError> {
         self.request_json(Method::GET, "console/v1/nodes", None::<&Value>, false).await
     }
 
+    /// Lists pending node pairings via `GET console/v1/nodes/pending`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn list_pending_nodes(
         &self,
     ) -> Result<NodePairingListEnvelope, ControlPlaneClientError> {
         self.request_json(Method::GET, "console/v1/nodes/pending", None::<&Value>, false).await
     }
 
+    /// Fetches one node via `GET console/v1/nodes/{device_id}`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_node(&self, device_id: &str) -> Result<NodeEnvelope, ControlPlaneClientError> {
         self.request_json(
             Method::GET,
@@ -1646,6 +2279,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Invokes a capability on a node via `POST console/v1/nodes/{device_id}/invoke`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn invoke_node(
         &self,
         device_id: &str,
@@ -1660,6 +2297,10 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Lists support bundle jobs via `GET console/v1/support-bundle/jobs`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn list_support_bundle_jobs(
         &self,
     ) -> Result<SupportBundleJobListEnvelope, ControlPlaneClientError> {
@@ -1667,6 +2308,10 @@ impl ControlPlaneClient {
             .await
     }
 
+    /// Creates a support bundle job via `POST console/v1/support-bundle/jobs`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn create_support_bundle_job(
         &self,
         request: &SupportBundleCreateRequest,
@@ -1674,6 +2319,10 @@ impl ControlPlaneClient {
         self.request_json(Method::POST, "console/v1/support-bundle/jobs", Some(request), true).await
     }
 
+    /// Fetches one support bundle job via `GET console/v1/support-bundle/jobs/{job_id}`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_support_bundle_job(
         &self,
         job_id: &str,
@@ -1687,12 +2336,20 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Lists doctor recovery jobs via `GET console/v1/doctor/jobs`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn list_doctor_recovery_jobs(
         &self,
     ) -> Result<DoctorRecoveryJobListEnvelope, ControlPlaneClientError> {
         self.request_json(Method::GET, "console/v1/doctor/jobs", None::<&Value>, false).await
     }
 
+    /// Creates a doctor recovery job via `POST console/v1/doctor/jobs`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn create_doctor_recovery_job(
         &self,
         request: &DoctorRecoveryCreateRequest,
@@ -1700,6 +2357,10 @@ impl ControlPlaneClient {
         self.request_json(Method::POST, "console/v1/doctor/jobs", Some(request), true).await
     }
 
+    /// Fetches one doctor recovery job via `GET console/v1/doctor/jobs/{job_id}`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
     pub async fn get_doctor_recovery_job(
         &self,
         job_id: &str,
@@ -1713,6 +2374,9 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Shared request path: joins `path` onto the base URL, attaches the CSRF
+    /// header for mutations, retries GETs on transport errors, and maps
+    /// non-success statuses to [`ControlPlaneClientError::Http`].
     async fn request_json<T, B>(
         &self,
         method: Method,
@@ -1729,11 +2393,14 @@ impl ControlPlaneClient {
             .base_url
             .join(relative)
             .map_err(|error| ControlPlaneClientError::InvalidBaseUrl(error.to_string()))?;
+        // Only idempotent reads are retried; mutations get exactly one attempt.
         let mut attempts_remaining =
             if method == Method::GET { self.safe_read_retries + 1 } else { 1 };
         loop {
             let mut request = self.client.request(method.clone(), url.clone());
             if require_csrf {
+                // A missing token is not a client-side error: the daemon enforces
+                // CSRF and rejects unauthenticated mutations server-side.
                 if let Some(token) = self.csrf_token.as_deref() {
                     request = request.header("x-palyra-csrf-token", token);
                 }
@@ -1753,6 +2420,9 @@ impl ControlPlaneClient {
                             .text()
                             .await
                             .map_err(|error| ControlPlaneClientError::Decode(error.to_string()))?;
+                        // Prefer the daemon's structured envelope message; fall back
+                        // to a bounded slice of the raw body only when the envelope
+                        // shape is absent.
                         let envelope = serde_json::from_str::<ErrorEnvelope>(body.as_str()).ok();
                         let message = envelope
                             .as_ref()
@@ -1776,6 +2446,8 @@ impl ControlPlaneClient {
     }
 }
 
+/// Joins non-empty query pairs onto `path`, percent-encoding values and
+/// dropping `None` or blank entries entirely.
 fn build_query_path(path: &str, pairs: Vec<(&str, Option<String>)>) -> String {
     let query = pairs
         .into_iter()
