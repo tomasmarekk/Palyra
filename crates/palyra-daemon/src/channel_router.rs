@@ -1,3 +1,14 @@
+//! Policy-driven router for inbound channel messages.
+//!
+//! [`ChannelRouter`] decides whether an inbound message (Discord, Slack,
+//! webhook relays, ...) may start a run: per-channel rules gate mention
+//! matches, sender allow/deny lists, direct-message policy (including the
+//! code-plus-approval DM pairing flow), broadcast strategy, and per-channel
+//! concurrency. All gates fail closed. Accepted messages get deterministic
+//! route/session keys; overload goes to a bounded retry queue and poison
+//! messages to a bounded quarantine. State is in-memory only; the channels
+//! module and gateway own adapters and persistence.
+
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt::Write as _,
@@ -23,6 +34,7 @@ const MAX_DM_PAIRING_SESSION_TTL_MS: u64 = 30 * 24 * 60 * 60_000;
 const MASS_MENTION_EVERYONE: &str = "@everyone";
 const MASS_MENTION_HERE: &str = "@here";
 
+/// How broadcast (fan-out) requests are gated per channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BroadcastStrategy {
@@ -32,6 +44,7 @@ pub enum BroadcastStrategy {
 }
 
 impl BroadcastStrategy {
+    /// Returns the canonical snake_case strategy name.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -41,6 +54,8 @@ impl BroadcastStrategy {
         }
     }
 
+    /// Parses a strategy name case-insensitively; returns `None` for
+    /// unsupported values.
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
@@ -52,6 +67,8 @@ impl BroadcastStrategy {
     }
 }
 
+/// How direct messages are gated per channel: denied, allowed only for
+/// paired (operator-approved) senders, or open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DirectMessagePolicy {
@@ -61,6 +78,7 @@ pub enum DirectMessagePolicy {
 }
 
 impl DirectMessagePolicy {
+    /// Returns the canonical snake_case policy name.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -70,6 +88,8 @@ impl DirectMessagePolicy {
         }
     }
 
+    /// Parses a policy name case-insensitively; returns `None` for
+    /// unsupported values.
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
@@ -81,6 +101,8 @@ impl DirectMessagePolicy {
     }
 }
 
+/// Operator-minted, time-limited code a DM sender presents to request
+/// pairing; consumed on first use.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PairingCodeRecord {
     pub code: String,
@@ -90,6 +112,8 @@ pub struct PairingCodeRecord {
     pub expires_at_unix_ms: i64,
 }
 
+/// Pairing request awaiting operator approval after a valid code was
+/// consumed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PairingPendingRecord {
     pub channel: String,
@@ -100,6 +124,7 @@ pub struct PairingPendingRecord {
     pub approval_id: Option<String>,
 }
 
+/// Active DM pairing grant; `expires_at_unix_ms = None` means no expiry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PairingGrantRecord {
     pub channel: String,
@@ -109,6 +134,7 @@ pub struct PairingGrantRecord {
     pub approval_id: Option<String>,
 }
 
+/// Per-channel view of the live pairing state for operator inspection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ChannelPairingSnapshot {
     pub channel: String,
@@ -117,6 +143,7 @@ pub struct ChannelPairingSnapshot {
     pub active_codes: Vec<PairingCodeRecord>,
 }
 
+/// Why minting or consuming a pairing code was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PairingConsumeReason {
     ChannelMissing,
@@ -129,6 +156,8 @@ pub enum PairingConsumeReason {
 }
 
 impl PairingConsumeReason {
+    /// Returns the stable rejection-reason string used in route outcomes
+    /// and journal events.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -143,12 +172,15 @@ impl PairingConsumeReason {
     }
 }
 
+/// Result of presenting a pairing code: a pending approval request, or a
+/// rejection with its reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PairingConsumeOutcome {
     Pending(PairingPendingRecord),
     Rejected(PairingConsumeReason),
 }
 
+/// Result of resolving a pairing approval decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PairingApprovalOutcome {
     Approved(PairingGrantRecord),
@@ -157,6 +189,8 @@ pub enum PairingApprovalOutcome {
     PairingDisabled,
 }
 
+/// Per-channel routing policy; channels without an explicit rule fall back
+/// to the `default_*` fields of [`ChannelRouterConfig`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ChannelRoutingRule {
     pub channel: String,
@@ -174,6 +208,11 @@ pub struct ChannelRoutingRule {
     pub concurrency_limit: Option<usize>,
 }
 
+/// Router-wide configuration: global enablement, size and retry budgets,
+/// per-channel defaults, and the explicit channel rules.
+///
+/// The defaults deny everything; routing must be opted into per
+/// deployment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ChannelRouterConfig {
     pub enabled: bool,
@@ -213,6 +252,8 @@ impl Default for ChannelRouterConfig {
     }
 }
 
+/// Debounce policy for coalescing rapid-fire inbound messages from the
+/// same key; commands and media can bypass the debounce window.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct InboundCoalescingPolicy {
     pub enabled: bool,
@@ -235,12 +276,16 @@ impl Default for InboundCoalescingPolicy {
 }
 
 impl InboundCoalescingPolicy {
+    /// Reports whether coalescing actually takes effect (enabled with a
+    /// non-zero debounce window).
     #[must_use]
     pub const fn active(&self) -> bool {
         self.enabled && self.debounce_ms > 0
     }
 }
 
+/// Normalized inbound message as delivered by a channel adapter, before
+/// any routing policy has been applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboundMessage {
     pub envelope_id: String,
@@ -258,6 +303,8 @@ pub struct InboundMessage {
     pub retry_attempt: u32,
 }
 
+/// Accepted route: deterministic route/session keys plus the response
+/// decorations (prefix, ack, reaction) the channel rule prescribes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RoutePlan {
     pub channel: String,
@@ -277,12 +324,16 @@ pub struct RoutePlan {
     pub reply_thread_id: Option<String>,
 }
 
+/// Rejected route with a stable reason string and whether the message was
+/// kept in quarantine for inspection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RouteRejection {
     pub reason: String,
     pub quarantined: bool,
 }
 
+/// Route deferred by backpressure; the caller should retry after
+/// `retry_after_ms`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RouteQueued {
     pub reason: String,
@@ -290,6 +341,8 @@ pub struct RouteQueued {
     pub queue_depth: usize,
 }
 
+/// Side-effect-free routing verdict for diagnostics; carries the config
+/// hash so operators can tell which configuration produced it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RoutePreview {
     pub accepted: bool,
@@ -303,12 +356,15 @@ pub struct RoutePreview {
     pub config_hash: String,
 }
 
+/// Accepted route bundled with the concurrency lease that must stay alive
+/// while the message is being processed.
 #[derive(Debug)]
 pub struct RoutedMessage {
     pub plan: RoutePlan,
     pub lease: ChannelConcurrencyLease,
 }
 
+/// Tri-state result of [`ChannelRouter::begin_route`].
 #[derive(Debug)]
 pub enum RouteOutcome {
     Routed(Box<RoutedMessage>),
@@ -316,6 +372,7 @@ pub enum RouteOutcome {
     Rejected(RouteRejection),
 }
 
+/// Message waiting in the bounded per-channel retry queue.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RetryQueueEntry {
     pub envelope_id: String,
@@ -326,6 +383,8 @@ pub struct RetryQueueEntry {
     pub queued_at_unix_ms: i64,
 }
 
+/// Message parked in the bounded per-channel quarantine after rejection or
+/// retry exhaustion; oldest entries are evicted first.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct QuarantinedMessage {
     pub envelope_id: String,
@@ -335,6 +394,8 @@ pub struct QuarantinedMessage {
     pub quarantined_at_unix_ms: i64,
 }
 
+/// Where a failed message ended up: requeued for retry, quarantined, or
+/// dropped because neither was possible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryDisposition {
     Queued,
@@ -365,6 +426,12 @@ struct RouteCandidate {
     reply_thread_id: Option<String>,
 }
 
+/// Stateless-config, stateful-runtime router shared across adapter tasks.
+///
+/// The configuration is immutable after construction; mutable runtime
+/// state (in-flight counts, retry queues, quarantine, pairing) lives
+/// behind one mutex keyed by channel. Lock poisoning is handled fail-
+/// closed: lookups report empty and gates reject.
 #[derive(Debug)]
 pub struct ChannelRouter {
     config: ChannelRouterConfig,
@@ -372,17 +439,24 @@ pub struct ChannelRouter {
 }
 
 impl ChannelRouter {
+    /// Creates a router with empty runtime state for `config`.
     #[must_use]
     pub fn new(config: ChannelRouterConfig) -> Self {
         Self { config, state: Arc::new(Mutex::new(HashMap::new())) }
     }
 
+    /// Returns the SHA-256 hex digest of the serialized configuration,
+    /// used to correlate previews and journal events with a config
+    /// revision.
     #[must_use]
     pub fn config_hash(&self) -> String {
         let payload = serde_json::to_vec(&self.config).unwrap_or_default();
         sha256_hex(payload.as_slice())
     }
 
+    /// Lints the configuration for risky or contradictory settings (open
+    /// DM policies, unreachable rules, allow/deny overlaps) and returns
+    /// operator-facing warnings; never fails.
     #[must_use]
     pub fn validation_warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
@@ -459,6 +533,8 @@ impl ChannelRouter {
         warnings
     }
 
+    /// Evaluates the full routing policy without consuming a concurrency
+    /// slot, touching the retry queue, or quarantining anything.
     #[must_use]
     pub fn preview_route(&self, message: &InboundMessage) -> RoutePreview {
         let config_hash = self.config_hash();
@@ -524,6 +600,9 @@ impl ChannelRouter {
         }
     }
 
+    /// Returns the live pairing state (codes, pending requests, grants),
+    /// pruning expired entries first; pass `channel` to filter to one
+    /// channel. Channels with no pairing state are omitted.
     #[must_use]
     pub fn pairing_snapshot(&self, channel: Option<&str>) -> Vec<ChannelPairingSnapshot> {
         let filter = channel.and_then(normalize_non_empty);
@@ -572,6 +651,15 @@ impl ChannelRouter {
         snapshots
     }
 
+    /// Mints a single-use DM pairing code for `channel`; the TTL is
+    /// clamped to the supported range.
+    ///
+    /// # Errors
+    /// Returns [`PairingConsumeReason::ChannelMissing`] for a blank
+    /// channel, [`PairingConsumeReason::PairingDisabled`] when the channel
+    /// rule does not use the pairing DM policy (or the state lock is
+    /// poisoned), and [`PairingConsumeReason::InvalidCode`] in the
+    /// unlikely event a collision-free code could not be generated.
     pub fn mint_pairing_code(
         &self,
         channel: &str,
@@ -618,6 +706,12 @@ impl ChannelRouter {
         Ok(record)
     }
 
+    /// Redeems a pairing code on behalf of a DM sender, producing a
+    /// pending record that awaits operator approval.
+    ///
+    /// Codes are single-use: a successful (and an expired) redemption
+    /// removes the code. Senders that are already paired or already
+    /// pending are rejected without consuming the code.
     #[must_use]
     pub fn consume_pairing_code(
         &self,
@@ -679,6 +773,9 @@ impl ChannelRouter {
         PairingConsumeOutcome::Pending(pending)
     }
 
+    /// Links a pending pairing request to the approval-system id that will
+    /// resolve it, replacing any previously attached id. Returns `None`
+    /// when no matching pending request exists.
     #[must_use]
     pub fn attach_pairing_pending_approval(
         &self,
@@ -705,6 +802,12 @@ impl ChannelRouter {
         Some(pending.clone())
     }
 
+    /// Resolves the pending pairing request attached to `approval_id`.
+    ///
+    /// The pending record is consumed regardless of outcome: approval
+    /// creates a time-limited grant, denial (or a channel whose policy no
+    /// longer allows pairing) drops the request so the sender must start
+    /// over with a fresh code.
     #[must_use]
     pub fn apply_pairing_approval(
         &self,
@@ -757,6 +860,14 @@ impl ChannelRouter {
         PairingApprovalOutcome::MissingPending
     }
 
+    /// Routes one inbound message: policy evaluation plus concurrency
+    /// admission.
+    ///
+    /// Size and emptiness violations quarantine the message; policy
+    /// rejections do not. When the channel's concurrency limit is reached
+    /// the message is enqueued for retry while the queue has room, and
+    /// quarantined as poison once it does not. On success the returned
+    /// lease holds the channel slot until dropped.
     #[must_use]
     pub fn begin_route(&self, message: &InboundMessage) -> RouteOutcome {
         if !self.config.enabled {
@@ -776,7 +887,9 @@ impl ChannelRouter {
                 ),
             });
         }
-        let channel = normalized_channel.expect("checked above");
+        let channel = normalized_channel.expect("is_none() was rejected just above");
+        // A message being (re)routed must leave the retry queue first so it
+        // is never counted twice against the queue budget.
         self.dequeue_retry(channel.as_str(), message.envelope_id.as_str());
         if message.text.trim().is_empty() {
             return RouteOutcome::Rejected(RouteRejection {
@@ -788,6 +901,11 @@ impl ChannelRouter {
                 ),
             });
         }
+        // AIDEV-NOTE: `max_payload_bytes as usize` truncates on 32-bit
+        // targets, so an adapter-declared payload size above u32::MAX could
+        // slip past this oversize gate there. Lossless on the 64-bit
+        // targets CI builds; fix by comparing in u64 (also in
+        // preview_route, which mirrors this expression).
         if message.text.len() > self.config.max_message_bytes
             || (message.max_payload_bytes as usize) > self.config.max_message_bytes
         {
@@ -867,6 +985,10 @@ impl ChannelRouter {
         }))
     }
 
+    /// Records a downstream processing failure for a message that had
+    /// already routed: requeues it while retry budget remains, otherwise
+    /// quarantines it, and reports `Dropped` only when both fail (for
+    /// example an unidentifiable channel).
     #[must_use]
     pub fn record_processing_failure(
         &self,
@@ -897,6 +1019,8 @@ impl ChannelRouter {
         }
     }
 
+    /// Returns the total retry-queue depth across all channels (zero when
+    /// the state lock is poisoned).
     #[must_use]
     pub fn queue_depth(&self) -> usize {
         match self.state.lock() {
@@ -935,6 +1059,8 @@ impl ChannelRouter {
         }
     }
 
+    /// Returns the explicit rule for `channel` (matched case-insensitively)
+    /// or a synthetic rule assembled from the config defaults.
     fn resolve_rule(&self, channel: &str) -> ChannelRoutingRule {
         self.config
             .channels
@@ -958,6 +1084,9 @@ impl ChannelRouter {
             })
     }
 
+    /// Applies the routing policy in fixed precedence order: channel
+    /// enablement, deny list (deny always beats allow), strict allowlist,
+    /// then DM policy or mention match, then broadcast strategy.
     fn evaluate_route_policy(
         &self,
         channel: &str,
@@ -982,6 +1111,10 @@ impl ChannelRouter {
         let sender_allowlisted = normalized_sender
             .as_deref()
             .is_some_and(|sender| self.sender_is_allowlisted(&rule, sender));
+        // The allowlist is enforced strictly unless it is empty (nothing to
+        // enforce) or the message is a DM under the pairing policy, where
+        // the pairing grant -- not the allowlist -- authenticates the
+        // sender (allowlisted senders still short-circuit pairing below).
         let strict_allowlist = !(rule.allow_from.is_empty()
             || message.is_direct_message
                 && matches!(rule.direct_message_policy, DirectMessagePolicy::Pairing));
@@ -1113,6 +1246,8 @@ impl ChannelRouter {
     }
 
     fn generate_pairing_code() -> String {
+        // Take the ULID tail: its trailing characters come from the random
+        // section, while a prefix would be timestamp-derived and guessable.
         let raw = Ulid::new().to_string();
         raw[raw.len().saturating_sub(DM_PAIRING_CODE_LENGTH)..].to_owned()
     }
@@ -1130,6 +1265,9 @@ impl ChannelRouter {
         Some(sanitized)
     }
 
+    /// Drops expired codes, pending requests, and grants, plus approval
+    /// links whose pending record disappeared; called before every read or
+    /// write of pairing state so expiry never needs a background task.
     fn prune_pairing_state(state: &mut ChannelRuntimeState, now_unix_ms: i64) {
         state.pairing_codes.retain(|_, record| record.expires_at_unix_ms > now_unix_ms);
         state.pairing_pending_by_sender.retain(|_, record| record.expires_at_unix_ms > now_unix_ms);
@@ -1155,6 +1293,9 @@ impl ChannelRouter {
         value.clamp(MIN_DM_PAIRING_CODE_TTL_MS, MAX_DM_PAIRING_SESSION_TTL_MS)
     }
 
+    /// Tries to take one in-flight slot for `channel`; on contention
+    /// returns the projected retry-queue depth (current depth plus this
+    /// message) so the caller can decide between queueing and quarantine.
     fn acquire_channel_slot(
         &self,
         channel: &str,
@@ -1173,6 +1314,8 @@ impl ChannelRouter {
         })
     }
 
+    /// Adds (or refreshes, keyed by envelope id) a retry entry; returns
+    /// `false` when the bounded queue is full or the lock is poisoned.
     fn enqueue_retry(&self, message: &InboundMessage, channel: &str, reason: String) -> bool {
         let Ok(mut guard) = self.state.lock() else {
             return false;
@@ -1211,6 +1354,9 @@ impl ChannelRouter {
         state.retry_queue.retain(|entry| entry.envelope_id != envelope_id);
     }
 
+    /// Parks the message in the bounded quarantine ring (oldest evicted);
+    /// returns `false` when the channel is blank or the lock is poisoned,
+    /// in which case the message is effectively dropped.
     fn quarantine_message(
         &self,
         message: &InboundMessage,
@@ -1238,6 +1384,9 @@ impl ChannelRouter {
     }
 }
 
+/// RAII guard for one in-flight slot of a channel; the slot is returned
+/// when the lease drops, so processing failures and panics cannot leak
+/// concurrency capacity.
 #[derive(Debug)]
 pub struct ChannelConcurrencyLease {
     state: Arc<Mutex<HashMap<String, ChannelRuntimeState>>>,
@@ -1293,6 +1442,8 @@ fn normalize_text_for_mention_matching(text: &str, mention_patterns: &[String]) 
     if mention_patterns_allow_mass_mentions(mention_patterns) {
         return normalized;
     }
+    // Mass mentions are stripped unless a rule opts in explicitly, so an
+    // "@everyone" blast can never satisfy a wildcard mention pattern.
     normalized.replace(MASS_MENTION_EVERYONE, " ").replace(MASS_MENTION_HERE, " ")
 }
 
@@ -1309,6 +1460,8 @@ fn is_identifier_continuation(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
 }
 
+/// Matches `pattern` only at identifier boundaries so handle-like tokens
+/// ("@palyra-prod") and email local parts never trigger a "@palyra" rule.
 fn contains_boundary_delimited_pattern(text: &str, pattern: &str) -> bool {
     text.match_indices(pattern).any(|(start, _)| {
         let left_boundary = start == 0 || !is_identifier_continuation(text.as_bytes()[start - 1]);
@@ -1322,6 +1475,8 @@ fn normalize_identifier_match(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }
 
+/// Resolves the sender identity used for allow/deny and pairing checks:
+/// the stable handle when present, falling back to the display name.
 fn sender_identity(message: &InboundMessage) -> Option<String> {
     normalize_non_empty(message.sender_handle.as_deref().unwrap_or_default())
         .or_else(|| normalize_non_empty(message.sender_display.as_deref().unwrap_or_default()))
@@ -1336,6 +1491,10 @@ fn normalize_non_empty(value: &str) -> Option<String> {
     }
 }
 
+/// Encodes a route/session key component: ASCII alphanumerics and `.-_`
+/// pass through, every other byte becomes a `~hh` escape. The encoding is
+/// injective, so distinct conversation or sender ids can never collide
+/// into one session key.
 fn normalize_session_component(value: &str) -> String {
     let trimmed = value.trim();
     if trimmed.is_empty() {

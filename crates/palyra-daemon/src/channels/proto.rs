@@ -1,3 +1,7 @@
+//! Mapping between connector attachment/A2UI types and the gateway proto
+//! representation. Proto uses empty strings/zeroes where the connector
+//! types use `Option`; these helpers translate in both directions.
+
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use palyra_connectors::{
     AttachmentKind, AttachmentRef, OutboundA2uiUpdate as ConnectorA2uiUpdate, OutboundAttachment,
@@ -5,6 +9,7 @@ use palyra_connectors::{
 
 use crate::gateway::proto::palyra::common::v1 as common_v1;
 
+/// Converts a proto string field to `Option`, treating blank as absent.
 pub(super) fn non_empty(raw: String) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -14,6 +19,7 @@ pub(super) fn non_empty(raw: String) -> Option<String> {
     }
 }
 
+/// Converts a proto bytes field to `Option`, treating empty as absent.
 pub(super) fn non_empty_bytes(raw: Vec<u8>) -> Option<Vec<u8>> {
     if raw.is_empty() {
         None
@@ -22,6 +28,9 @@ pub(super) fn non_empty_bytes(raw: Vec<u8>) -> Option<Vec<u8>> {
     }
 }
 
+/// Maps inbound attachment references to proto message attachments,
+/// decoding inline base64 payloads to raw bytes (undecodable payloads are
+/// dropped to empty rather than failing the whole envelope).
 pub(super) fn to_proto_message_attachments(
     attachments: &[AttachmentRef],
 ) -> Vec<common_v1::MessageAttachment> {
@@ -58,6 +67,8 @@ pub(super) fn to_proto_message_attachments(
         .collect()
 }
 
+/// Maps proto message attachments back to outbound connector attachments,
+/// re-encoding inline bytes as base64.
 pub(super) fn from_proto_message_attachments(
     attachments: &[common_v1::MessageAttachment],
 ) -> Vec<OutboundAttachment> {
@@ -86,6 +97,8 @@ pub(super) fn from_proto_message_attachments(
         .collect()
 }
 
+/// Maps a proto A2UI update to the connector type; updates without a
+/// surface or patch payload are discarded as no-ops.
 pub(super) fn from_proto_a2ui_update(
     update: Option<common_v1::A2uiUpdate>,
 ) -> Option<ConnectorA2uiUpdate> {

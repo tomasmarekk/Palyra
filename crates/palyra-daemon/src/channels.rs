@@ -1,3 +1,14 @@
+//! Channel platform facade over the connector runtime.
+//!
+//! [`ChannelPlatform`] wires the connector supervisor, the media artifact
+//! store, and a gRPC gateway router into one operator-facing surface:
+//! connector inventory and lifecycle, queue/dead-letter management, message
+//! read/search/mutation operations, test ingestion, and the background
+//! worker that polls inbound traffic and drains the outbox. Deferred
+//! connectors are hidden and rejected at this boundary (Discord-first
+//! runtime). Submodules own attachments, default inventory, Discord
+//! canonicalization, gateway auth resolution, and proto mapping.
+
 use std::{
     path::PathBuf,
     sync::Arc,
@@ -65,6 +76,8 @@ const CHANNEL_WORKER_DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const DEFAULT_CHANNEL_WORKER_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_LOG_PAGE_LIMIT: usize = 100;
 
+/// Failure modes of channel-platform operations; supervisor, store, and
+/// media errors pass through transparently.
 #[derive(Debug, Error)]
 pub enum ChannelPlatformError {
     #[error(transparent)]
@@ -81,6 +94,9 @@ pub enum ChannelPlatformError {
     UnsupportedConnector(String),
 }
 
+/// Synthetic inbound message injected by operators to exercise a connector
+/// end to end; `simulate_crash_once` plants the crash marker the echo
+/// connector honors for retry testing.
 #[derive(Debug, Clone)]
 pub struct ChannelTestMessageRequest {
     pub text: String,
@@ -92,31 +108,38 @@ pub struct ChannelTestMessageRequest {
     pub requested_broadcast: bool,
 }
 
+/// Wrapper for a validated connector message-read request.
 #[derive(Debug, Clone)]
 pub struct ChannelMessageReadOperation {
     pub request: ConnectorMessageReadRequest,
 }
 
+/// Wrapper for a validated connector message-search request.
 #[derive(Debug, Clone)]
 pub struct ChannelMessageSearchOperation {
     pub request: ConnectorMessageSearchRequest,
 }
 
+/// Wrapper for a validated connector message-edit request.
 #[derive(Debug, Clone)]
 pub struct ChannelMessageEditOperation {
     pub request: ConnectorMessageEditRequest,
 }
 
+/// Wrapper for a validated connector message-delete request.
 #[derive(Debug, Clone)]
 pub struct ChannelMessageDeleteOperation {
     pub request: ConnectorMessageDeleteRequest,
 }
 
+/// Wrapper for a validated connector reaction add/remove request.
 #[derive(Debug, Clone)]
 pub struct ChannelMessageReactionOperation {
     pub request: ConnectorMessageReactionRequest,
 }
 
+/// Approval-surface preview of a pending message mutation: the targeted
+/// message (when still readable) and the governance decision so far.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ChannelMessageMutationPreview {
     pub locator: ConnectorMessageLocator,
@@ -126,6 +149,8 @@ pub struct ChannelMessageMutationPreview {
     pub approval_id: Option<String>,
 }
 
+/// Borrowed view of a console chat attachment upload, converted into a
+/// [`ConsoleAttachmentStoreRequest`] by [`ChannelPlatform`] helpers.
 pub struct ConsoleChatAttachmentStoreRequestView<'a> {
     pub session_id: &'a str,
     pub principal: &'a str,
@@ -136,6 +161,8 @@ pub struct ConsoleChatAttachmentStoreRequestView<'a> {
     pub bytes: &'a [u8],
 }
 
+/// Operator-facing channel runtime: connector supervisor plus media store,
+/// routing inbound traffic to the daemon gateway over gRPC.
 pub struct ChannelPlatform {
     supervisor: Arc<ConnectorSupervisor>,
     media_store: Arc<MediaArtifactStore>,
@@ -143,6 +170,13 @@ pub struct ChannelPlatform {
 }
 
 impl ChannelPlatform {
+    /// Opens the connector and media stores next to `db_path`, wires the
+    /// gRPC gateway router, and registers the default connector inventory.
+    ///
+    /// # Errors
+    /// Returns a store or media error when the backing databases cannot be
+    /// opened, and a supervisor error when default connectors fail to
+    /// register.
     pub fn initialize(
         grpc_url: String,
         auth: GatewayAuthConfig,
@@ -172,6 +206,11 @@ impl ChannelPlatform {
         Ok(platform)
     }
 
+    /// Lists connector statuses, hiding deferred connectors from the
+    /// operator surface.
+    ///
+    /// # Errors
+    /// Returns a supervisor error when status enumeration fails.
     pub fn list(&self) -> Result<Vec<ConnectorStatusSnapshot>, ChannelPlatformError> {
         let visible = self
             .supervisor
@@ -183,6 +222,11 @@ impl ChannelPlatform {
         Ok(visible)
     }
 
+    /// Returns the status of one operator-visible connector.
+    ///
+    /// # Errors
+    /// Returns [`ChannelPlatformError::InvalidInput`] for deferred
+    /// connectors and a supervisor error for unknown ids.
     pub fn status(
         &self,
         connector_id: &str,
@@ -190,6 +234,13 @@ impl ChannelPlatform {
         self.ensure_operator_visible(connector_id)
     }
 
+    /// Returns the Discord connector for `account_id`, registering it
+    /// (disabled) when it does not exist yet.
+    ///
+    /// # Errors
+    /// Returns [`ChannelPlatformError::InvalidInput`] for malformed account
+    /// ids or when the id is already taken by a non-Discord connector, and
+    /// a supervisor error when registration fails.
     pub fn ensure_discord_connector(
         &self,
         account_id: &str,
@@ -211,6 +262,13 @@ impl ChannelPlatform {
         self.supervisor.status(spec.connector_id.as_str()).map_err(ChannelPlatformError::from)
     }
 
+    /// Returns the connector's runtime diagnostics merged with its media
+    /// pipeline snapshot under a `media` key.
+    ///
+    /// # Errors
+    /// Returns visibility/supervisor errors and
+    /// [`ChannelPlatformError::InvalidInput`] when the media snapshot does
+    /// not serialize.
     pub fn runtime_snapshot(
         &self,
         connector_id: &str,
@@ -237,6 +295,10 @@ impl ChannelPlatform {
         }))
     }
 
+    /// Enables or disables an operator-visible connector.
+    ///
+    /// # Errors
+    /// Returns visibility or supervisor errors.
     pub fn set_enabled(
         &self,
         connector_id: &str,
@@ -246,11 +308,20 @@ impl ChannelPlatform {
         self.supervisor.set_enabled(connector_id, enabled).map_err(ChannelPlatformError::from)
     }
 
+    /// Removes an operator-visible connector and its stored state.
+    ///
+    /// # Errors
+    /// Returns visibility or supervisor errors.
     pub fn remove_connector(&self, connector_id: &str) -> Result<(), ChannelPlatformError> {
         self.ensure_operator_visible(connector_id)?;
         self.supervisor.remove_connector(connector_id).map_err(ChannelPlatformError::from)
     }
 
+    /// Returns the most recent connector event records (default page
+    /// limit when `limit` is `None`).
+    ///
+    /// # Errors
+    /// Returns visibility or supervisor errors.
     pub fn logs(
         &self,
         connector_id: &str,
@@ -262,6 +333,11 @@ impl ChannelPlatform {
             .map_err(ChannelPlatformError::from)
     }
 
+    /// Returns the most recent dead-letter records (default page limit
+    /// when `limit` is `None`).
+    ///
+    /// # Errors
+    /// Returns visibility or supervisor errors.
     pub fn dead_letters(
         &self,
         connector_id: &str,
@@ -273,6 +349,10 @@ impl ChannelPlatform {
             .map_err(ChannelPlatformError::from)
     }
 
+    /// Returns the connector's outbox/dead-letter queue snapshot.
+    ///
+    /// # Errors
+    /// Returns visibility or supervisor errors.
     pub fn queue_snapshot(
         &self,
         connector_id: &str,
@@ -281,6 +361,11 @@ impl ChannelPlatform {
         self.supervisor.queue_snapshot(connector_id).map_err(ChannelPlatformError::from)
     }
 
+    /// Pauses or resumes the connector's outbound queue, recording the
+    /// operator-supplied reason.
+    ///
+    /// # Errors
+    /// Returns visibility or supervisor errors.
     pub fn set_queue_paused(
         &self,
         connector_id: &str,
@@ -293,6 +378,10 @@ impl ChannelPlatform {
             .map_err(ChannelPlatformError::from)
     }
 
+    /// Requeues one dead letter for delivery.
+    ///
+    /// # Errors
+    /// Returns visibility or supervisor errors (including unknown ids).
     pub fn replay_dead_letter(
         &self,
         connector_id: &str,
@@ -304,6 +393,10 @@ impl ChannelPlatform {
             .map_err(ChannelPlatformError::from)
     }
 
+    /// Discards one dead letter permanently.
+    ///
+    /// # Errors
+    /// Returns visibility or supervisor errors (including unknown ids).
     pub fn discard_dead_letter(
         &self,
         connector_id: &str,
@@ -315,6 +408,12 @@ impl ChannelPlatform {
             .map_err(ChannelPlatformError::from)
     }
 
+    /// Returns the stored instance record for an operator-visible
+    /// connector.
+    ///
+    /// # Errors
+    /// Returns visibility/store errors, and a supervisor `NotFound` when
+    /// the status exists but the instance row is missing.
     pub fn connector_instance(
         &self,
         connector_id: &str,
@@ -331,6 +430,12 @@ impl ChannelPlatform {
             })
     }
 
+    /// Reads messages from the connector's conversation history.
+    ///
+    /// # Errors
+    /// Returns visibility errors, [`ChannelPlatformError::InvalidInput`]
+    /// when the request fails validation, and supervisor errors from the
+    /// adapter call.
     pub async fn read_messages(
         &self,
         connector_id: &str,
@@ -347,6 +452,10 @@ impl ChannelPlatform {
             .map_err(ChannelPlatformError::from)
     }
 
+    /// Searches the connector's messages.
+    ///
+    /// # Errors
+    /// Same shape as [`Self::read_messages`].
     pub async fn search_messages(
         &self,
         connector_id: &str,
@@ -363,6 +472,11 @@ impl ChannelPlatform {
             .map_err(ChannelPlatformError::from)
     }
 
+    /// Edits a message through the connector adapter; governance and
+    /// approval gating happen in the calling layer.
+    ///
+    /// # Errors
+    /// Same shape as [`Self::read_messages`].
     pub async fn edit_message(
         &self,
         connector_id: &str,
@@ -379,6 +493,11 @@ impl ChannelPlatform {
             .map_err(ChannelPlatformError::from)
     }
 
+    /// Deletes a message through the connector adapter; governance and
+    /// approval gating happen in the calling layer.
+    ///
+    /// # Errors
+    /// Same shape as [`Self::read_messages`].
     pub async fn delete_message(
         &self,
         connector_id: &str,
@@ -395,6 +514,10 @@ impl ChannelPlatform {
             .map_err(ChannelPlatformError::from)
     }
 
+    /// Adds a reaction through the connector adapter.
+    ///
+    /// # Errors
+    /// Same shape as [`Self::read_messages`].
     pub async fn add_reaction(
         &self,
         connector_id: &str,
@@ -411,6 +534,10 @@ impl ChannelPlatform {
             .map_err(ChannelPlatformError::from)
     }
 
+    /// Removes a reaction through the connector adapter.
+    ///
+    /// # Errors
+    /// Same shape as [`Self::read_messages`].
     pub async fn remove_reaction(
         &self,
         connector_id: &str,
@@ -427,6 +554,11 @@ impl ChannelPlatform {
             .map_err(ChannelPlatformError::from)
     }
 
+    /// Fetches the single message a mutation targets, for approval
+    /// previews; `None` when the message is no longer readable.
+    ///
+    /// # Errors
+    /// Same shape as [`Self::read_messages`].
     pub async fn fetch_message_preview(
         &self,
         connector_id: &str,
@@ -453,6 +585,14 @@ impl ChannelPlatform {
         Ok(result.messages.into_iter().next())
     }
 
+    /// Ingests a synthetic inbound message as if the connector had
+    /// received it, exercising the full routing path.
+    ///
+    /// # Errors
+    /// Returns [`ChannelPlatformError::UnsupportedConnector`] for
+    /// internal-test-only connectors,
+    /// [`ChannelPlatformError::InvalidInput`] for empty fields, and
+    /// visibility/supervisor errors from ingestion.
     pub async fn submit_test_message(
         &self,
         connector_id: &str,
@@ -500,6 +640,11 @@ impl ChannelPlatform {
         self.supervisor.ingest_inbound(event).await.map_err(ChannelPlatformError::from)
     }
 
+    /// Drains due outbound messages across all connectors with the
+    /// background batch size.
+    ///
+    /// # Errors
+    /// Returns supervisor errors from the drain.
     pub async fn drain_due(&self) -> Result<palyra_connectors::DrainOutcome, ChannelPlatformError> {
         self.supervisor
             .drain_due_outbox(self.supervisor_config().background_drain_batch_size)
@@ -507,6 +652,11 @@ impl ChannelPlatform {
             .map_err(ChannelPlatformError::from)
     }
 
+    /// Force-drains the outbox of one connector, bypassing its pause
+    /// state.
+    ///
+    /// # Errors
+    /// Returns visibility or supervisor errors.
     pub async fn drain_due_for_connector(
         &self,
         connector_id: &str,
@@ -521,6 +671,11 @@ impl ChannelPlatform {
             .map_err(ChannelPlatformError::from)
     }
 
+    /// Polls connectors for inbound messages and returns how many were
+    /// ingested.
+    ///
+    /// # Errors
+    /// Returns supervisor errors from the poll.
     pub async fn poll_inbound(&self) -> Result<usize, ChannelPlatformError> {
         self.supervisor
             .poll_inbound(self.supervisor_config().immediate_drain_batch_size)
@@ -528,11 +683,16 @@ impl ChannelPlatform {
             .map_err(ChannelPlatformError::from)
     }
 
+    /// Returns the background worker tick interval.
     #[must_use]
     pub fn worker_interval(&self) -> Duration {
         self.worker_interval
     }
 
+    /// Spawns the background worker that polls inbound traffic and drains
+    /// the outbox every tick; errors are logged and the loop continues.
+    /// The task runs for the daemon's lifetime; dropping the handle leaves
+    /// it running.
     pub fn spawn_worker(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut ticker = interval(self.worker_interval());
@@ -553,6 +713,9 @@ impl ChannelPlatform {
         ConnectorSupervisorConfig::default()
     }
 
+    /// Recovers the provider-native message id of a delivered envelope by
+    /// scanning recent `outbox.delivered` log events; `None` when delivery
+    /// happened outside the scanned window.
     fn find_native_message_id(
         &self,
         connector_id: &str,
@@ -577,6 +740,8 @@ impl ChannelPlatform {
         }))
     }
 
+    /// Visibility gate shared by every operator entry point: deferred
+    /// connectors stay in storage but are rejected here.
     fn ensure_operator_visible(
         &self,
         connector_id: &str,
@@ -591,6 +756,8 @@ impl ChannelPlatform {
         Ok(status)
     }
 
+    /// Registers any default connectors missing from storage; existing
+    /// rows (and their operator-set state) are left untouched.
     fn ensure_default_connector_inventory(&self) -> Result<(), ChannelPlatformError> {
         for spec in default_connector_specs() {
             let exists =
@@ -603,6 +770,10 @@ impl ChannelPlatform {
     }
 }
 
+/// Connector-to-gateway bridge: canonicalizes Discord identities,
+/// preprocesses attachments through the media store, and forwards the
+/// envelope to the daemon gateway's RouteMessage RPC under the connector
+/// principal.
 struct GrpcChannelRouter {
     grpc_url: String,
     auth: GatewayAuthConfig,
@@ -657,6 +828,9 @@ impl ConnectorRouter for GrpcChannelRouter {
                     conversation_id,
                     sender_display: event.sender_display.clone().unwrap_or_default(),
                     sender_handle,
+                    // Only Discord identities are platform-authenticated;
+                    // test/echo senders must stay unverified so allowlist
+                    // gates that require verification reject them.
                     sender_verified: discord_connector,
                 }),
                 content: Some(common_v1::MessageContent {

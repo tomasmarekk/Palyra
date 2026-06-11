@@ -1,6 +1,16 @@
+//! Media-store pass-throughs on [`ChannelPlatform`]: console chat
+//! attachments and the derived-artifact lifecycle (upsert, listing,
+//! linking, quarantine, purge, stats). Each method delegates to
+//! [`MediaArtifactStore`], converting errors to [`ChannelPlatformError`].
+
 use super::*;
 
 impl ChannelPlatform {
+    /// Returns the global media diagnostics snapshot as JSON.
+    ///
+    /// # Errors
+    /// Returns media-store errors and
+    /// [`ChannelPlatformError::InvalidInput`] when serialization fails.
     pub fn media_snapshot(&self) -> Result<Value, ChannelPlatformError> {
         serde_json::to_value(self.media_store.build_global_snapshot()?).map_err(|error| {
             ChannelPlatformError::InvalidInput(format!(
@@ -9,6 +19,11 @@ impl ChannelPlatform {
         })
     }
 
+    /// Stores a console chat upload under a fresh attachment id, scoped to
+    /// the session/principal/device identity in the request.
+    ///
+    /// # Errors
+    /// Propagates media-store policy and IO errors.
     pub fn store_console_chat_attachment(
         &self,
         request: ConsoleChatAttachmentStoreRequestView<'_>,
@@ -29,6 +44,11 @@ impl ChannelPlatform {
             .map_err(ChannelPlatformError::from)
     }
 
+    /// Loads one console chat attachment; the identity arguments must
+    /// match the stored scope or the lookup returns `None`.
+    ///
+    /// # Errors
+    /// Propagates media-store errors.
     pub fn load_console_chat_attachment(
         &self,
         artifact_id: &str,
@@ -42,6 +62,11 @@ impl ChannelPlatform {
             .map_err(ChannelPlatformError::from)
     }
 
+    /// Lists the console chat attachments visible to one
+    /// session/principal/device scope.
+    ///
+    /// # Errors
+    /// Propagates media-store errors.
     pub fn list_console_chat_attachments(
         &self,
         session_id: &str,
@@ -54,6 +79,11 @@ impl ChannelPlatform {
             .map_err(ChannelPlatformError::from)
     }
 
+    /// Records (or refreshes) a successful derived artifact for a source
+    /// attachment.
+    ///
+    /// # Errors
+    /// Propagates media-store errors.
     pub fn upsert_console_chat_derived_artifact(
         &self,
         request: MediaDerivedArtifactUpsertRequest<'_>,
@@ -61,6 +91,11 @@ impl ChannelPlatform {
         self.media_store.upsert_derived_artifact(request).map_err(ChannelPlatformError::from)
     }
 
+    /// Records a failed derivation attempt so the failure is visible and
+    /// retryable.
+    ///
+    /// # Errors
+    /// Propagates media-store errors.
     pub fn upsert_console_chat_failed_derived_artifact(
         &self,
         request: MediaFailedDerivedArtifactUpsertRequest<'_>,
@@ -68,6 +103,10 @@ impl ChannelPlatform {
         self.media_store.upsert_failed_derived_artifact(request).map_err(ChannelPlatformError::from)
     }
 
+    /// Lists derived artifacts for one session scope.
+    ///
+    /// # Errors
+    /// Propagates media-store errors.
     pub fn list_console_chat_derived_artifacts(
         &self,
         session_id: &str,
@@ -80,6 +119,10 @@ impl ChannelPlatform {
             .map_err(ChannelPlatformError::from)
     }
 
+    /// Lists derived artifacts produced from one source attachment.
+    ///
+    /// # Errors
+    /// Propagates media-store errors.
     pub fn list_attachment_derived_artifacts(
         &self,
         source_artifact_id: &str,
@@ -89,6 +132,10 @@ impl ChannelPlatform {
             .map_err(ChannelPlatformError::from)
     }
 
+    /// Returns one derived artifact by id, `None` when unknown.
+    ///
+    /// # Errors
+    /// Propagates media-store errors.
     pub fn get_derived_artifact(
         &self,
         derived_artifact_id: &str,
@@ -98,6 +145,11 @@ impl ChannelPlatform {
             .map_err(ChannelPlatformError::from)
     }
 
+    /// Lists derived artifacts linked to a workspace document and/or
+    /// memory item.
+    ///
+    /// # Errors
+    /// Propagates media-store errors.
     pub fn list_linked_derived_artifacts(
         &self,
         workspace_document_id: Option<&str>,
@@ -109,6 +161,11 @@ impl ChannelPlatform {
             .map_err(ChannelPlatformError::from)
     }
 
+    /// Links a derived artifact to a workspace document and/or memory
+    /// item.
+    ///
+    /// # Errors
+    /// Propagates media-store errors.
     pub fn link_derived_artifact_targets(
         &self,
         derived_artifact_id: &str,
@@ -124,6 +181,11 @@ impl ChannelPlatform {
             .map_err(ChannelPlatformError::from)
     }
 
+    /// Selects derived text chunks relevant to `query` for prompt
+    /// assembly, within an optional character budget.
+    ///
+    /// # Errors
+    /// Propagates media-store errors.
     pub fn select_console_chat_derived_chunks(
         &self,
         source_artifact_ids: &[String],
@@ -135,6 +197,11 @@ impl ChannelPlatform {
             .map_err(ChannelPlatformError::from)
     }
 
+    /// Quarantines a derived artifact so it is excluded from prompt
+    /// selection; `None` when unknown.
+    ///
+    /// # Errors
+    /// Propagates media-store errors.
     pub fn quarantine_derived_artifact(
         &self,
         derived_artifact_id: &str,
@@ -145,6 +212,11 @@ impl ChannelPlatform {
             .map_err(ChannelPlatformError::from)
     }
 
+    /// Releases a quarantined derived artifact back into use; `None` when
+    /// unknown.
+    ///
+    /// # Errors
+    /// Propagates media-store errors.
     pub fn release_derived_artifact(
         &self,
         derived_artifact_id: &str,
@@ -154,6 +226,11 @@ impl ChannelPlatform {
             .map_err(ChannelPlatformError::from)
     }
 
+    /// Flags (or clears) a derived artifact as needing recomputation;
+    /// `None` when unknown.
+    ///
+    /// # Errors
+    /// Propagates media-store errors.
     pub fn mark_derived_artifact_recompute_required(
         &self,
         derived_artifact_id: &str,
@@ -164,6 +241,11 @@ impl ChannelPlatform {
             .map_err(ChannelPlatformError::from)
     }
 
+    /// Permanently deletes a derived artifact and its stored content;
+    /// `None` when unknown.
+    ///
+    /// # Errors
+    /// Propagates media-store errors.
     pub fn purge_derived_artifact(
         &self,
         derived_artifact_id: &str,
@@ -173,6 +255,10 @@ impl ChannelPlatform {
             .map_err(ChannelPlatformError::from)
     }
 
+    /// Returns aggregate derived-artifact statistics.
+    ///
+    /// # Errors
+    /// Propagates media-store errors.
     pub fn derived_stats(&self) -> Result<MediaDerivedStatsSnapshot, ChannelPlatformError> {
         self.media_store.derived_stats().map_err(ChannelPlatformError::from)
     }

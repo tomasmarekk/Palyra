@@ -1,3 +1,17 @@
+//! File-backed access-control registry for the daemon's external API surface.
+//!
+//! [`AccessRegistry`] persists staged-rollout feature flags, scoped API
+//! tokens, teams/workspaces/memberships, invitations, resource shares, and a
+//! bounded feature-telemetry tape in one JSON document under the daemon state
+//! root. Gating is deny-by-default: unknown feature flags evaluate as
+//! disabled and every workspace permission requires an explicit membership
+//! role.
+//!
+//! Token and invitation secrets are returned to the caller exactly once at
+//! mint time; only SHA-256 digests and short display prefixes are persisted.
+//! Consumed by the console/compat HTTP surfaces and the operator CLI
+//! `auth access` commands.
+
 use std::{
     collections::BTreeSet,
     fs,
@@ -12,18 +26,30 @@ use ulid::Ulid;
 
 const ACCESS_REGISTRY_FILE_NAME: &str = "access_registry.json";
 const ACCESS_REGISTRY_VERSION: u32 = 1;
+/// Retention cap for the persisted telemetry tape; oldest events drop first.
 const TELEMETRY_EVENT_LIMIT: usize = 256;
 const DEFAULT_TOKEN_RATE_LIMIT_PER_MINUTE: u32 = 120;
 
+/// Feature flag gating the OpenAI-compatible HTTP facade.
 pub(crate) const FEATURE_COMPAT_API: &str = "compat_api";
+/// Feature flag gating `POST /v1/embeddings` on the compat facade.
 pub(crate) const FEATURE_COMPAT_EMBEDDINGS_API: &str = "compat_embeddings_api";
+/// Feature flag gating the conservative `/v1/tools/invoke` compat skeleton.
 pub(crate) const FEATURE_COMPAT_TOOLS_INVOKE: &str = "compat_tools_invoke";
+/// Feature flag gating issuance and use of scoped external API tokens.
 pub(crate) const FEATURE_API_TOKENS: &str = "api_tokens";
+/// Feature flag gating shared teams, workspaces, and invitations.
 pub(crate) const FEATURE_TEAM_MODE: &str = "team_mode";
+/// Feature flag gating role-based access checks and explicit resource shares.
 pub(crate) const FEATURE_RBAC: &str = "rbac";
+/// Feature flag gating staged rollout controls and feature telemetry.
 pub(crate) const FEATURE_STAGED_ROLLOUT: &str = "staged_rollout";
+/// Feature flag gating unattended routine scheduler automation.
 pub(crate) const FEATURE_ROUTINES_AUTOMATION: &str = "routines_automation";
 
+// Permission identifiers. Roles expand to permission sets via
+// `WorkspaceRole::permissions`; API-token scopes and workspace authorization
+// checks are matched against these exact strings.
 pub(crate) const PERMISSION_COMPAT_MODELS_READ: &str = "compat.models.read";
 pub(crate) const PERMISSION_COMPAT_CHAT_CREATE: &str = "compat.chat.create";
 pub(crate) const PERMISSION_COMPAT_EMBEDDINGS_CREATE: &str = "compat.embeddings.create";
@@ -40,6 +66,11 @@ pub(crate) const PERMISSION_MEMORY_USE: &str = "memory.use";
 pub(crate) const PERMISSION_ROUTINES_USE: &str = "routines.use";
 pub(crate) const PERMISSION_ROLLOUT_MANAGE: &str = "rollout.manage";
 
+/// Failure modes of [`AccessRegistry`] persistence, validation, and gating.
+///
+/// `AccessDenied`, `FeatureDisabled`, `InvalidApiToken`, and `MissingScope`
+/// are authorization outcomes; the remaining variants signal registry IO or
+/// input validation problems.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AccessRegistryError {
     #[error("failed to read access registry {path}: {error}")]
@@ -76,6 +107,8 @@ pub(crate) enum AccessRegistryError {
     MissingScope(String),
 }
 
+/// Membership role inside a workspace, ordered from widest to narrowest
+/// authority: `Owner` > `Admin` > `Operator`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum WorkspaceRole {
@@ -85,6 +118,10 @@ pub(crate) enum WorkspaceRole {
 }
 
 impl WorkspaceRole {
+    /// Parses a role name case-insensitively.
+    ///
+    /// # Errors
+    /// Returns [`AccessRegistryError::InvalidField`] for unsupported names.
     pub(crate) fn parse(value: &str) -> Result<Self, AccessRegistryError> {
         match value.trim().to_ascii_lowercase().as_str() {
             "owner" => Ok(Self::Owner),
@@ -97,6 +134,7 @@ impl WorkspaceRole {
         }
     }
 
+    /// Returns the canonical lowercase role name.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Owner => "owner",
@@ -105,6 +143,11 @@ impl WorkspaceRole {
         }
     }
 
+    /// Expands the role into its full permission set.
+    ///
+    /// Every role carries the baseline compat/session permissions; `Admin`
+    /// adds token, membership, and sharing management, and `Owner` adds
+    /// workspace, trust, and rollout management on top.
     pub(crate) fn permissions(self) -> Vec<String> {
         let mut permissions = vec![
             PERMISSION_COMPAT_MODELS_READ.to_owned(),
@@ -141,6 +184,7 @@ impl WorkspaceRole {
     }
 }
 
+/// Persisted state of one staged-rollout feature flag.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct FeatureFlagRecord {
     pub(crate) key: String,
@@ -154,6 +198,8 @@ pub(crate) struct FeatureFlagRecord {
     pub(crate) updated_by_principal: String,
 }
 
+/// Persisted API token metadata; stores only the SHA-256 digest and a short
+/// display prefix of the secret, never the secret itself.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ApiTokenRecord {
     pub(crate) token_id: String,
@@ -179,6 +225,7 @@ pub(crate) struct ApiTokenRecord {
     pub(crate) rotated_from_token_id: Option<String>,
 }
 
+/// Persisted team record; teams group workspaces for display purposes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct TeamRecord {
     pub(crate) team_id: String,
@@ -189,6 +236,8 @@ pub(crate) struct TeamRecord {
     pub(crate) updated_at_unix_ms: i64,
 }
 
+/// Persisted workspace record, including the derived runtime principal and
+/// device identity that workspace-scoped traffic executes under.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct WorkspaceRecord {
     pub(crate) workspace_id: String,
@@ -202,6 +251,7 @@ pub(crate) struct WorkspaceRecord {
     pub(crate) updated_at_unix_ms: i64,
 }
 
+/// Persisted binding of a principal to a workspace with a single role.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct MembershipRecord {
     pub(crate) membership_id: String,
@@ -213,6 +263,8 @@ pub(crate) struct MembershipRecord {
     pub(crate) updated_at_unix_ms: i64,
 }
 
+/// Persisted workspace invitation; the acceptance secret is stored only as a
+/// SHA-256 digest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct InvitationRecord {
     pub(crate) invitation_id: String,
@@ -229,6 +281,7 @@ pub(crate) struct InvitationRecord {
     pub(crate) accepted_at_unix_ms: Option<i64>,
 }
 
+/// Persisted grant exposing one resource (by kind and id) to a workspace.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ResourceShareRecord {
     pub(crate) share_id: String,
@@ -241,6 +294,7 @@ pub(crate) struct ResourceShareRecord {
     pub(crate) updated_at_unix_ms: i64,
 }
 
+/// One privacy-aware feature telemetry event on the bounded registry tape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct TelemetryEventRecord {
     pub(crate) event_id: String,
@@ -258,6 +312,7 @@ pub(crate) struct TelemetryEventRecord {
     pub(crate) recorded_at_unix_ms: i64,
 }
 
+/// On-disk shape of the access registry document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AccessRegistryFile {
     version: u32,
@@ -298,6 +353,8 @@ impl Default for AccessRegistryFile {
     }
 }
 
+/// Membership joined with its workspace/team metadata and expanded
+/// role permissions, for console and CLI display.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct WorkspaceMembershipView {
     pub(crate) membership_id: String,
@@ -315,6 +372,8 @@ pub(crate) struct WorkspaceMembershipView {
     pub(crate) updated_at_unix_ms: i64,
 }
 
+/// Secret-free projection of an [`ApiTokenRecord`] with a derived
+/// `state` of `active`, `expired`, or `revoked`.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ApiTokenView {
     pub(crate) token_id: String,
@@ -339,12 +398,16 @@ pub(crate) struct ApiTokenView {
     pub(crate) rotated_from_token_id: Option<String>,
 }
 
+/// One-time response envelope carrying the freshly minted token secret;
+/// the secret is never persisted and cannot be retrieved again.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ApiTokenSecretEnvelope {
     pub(crate) token: String,
     pub(crate) token_record: ApiTokenView,
 }
 
+/// Result of creating a workspace: the new team, workspace, and the
+/// creator's owner membership.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct WorkspaceCreateEnvelope {
     pub(crate) team: TeamRecord,
@@ -352,12 +415,15 @@ pub(crate) struct WorkspaceCreateEnvelope {
     pub(crate) membership: WorkspaceMembershipView,
 }
 
+/// One-time response envelope carrying the invitation acceptance secret;
+/// only its SHA-256 digest is persisted.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct InvitationSecretEnvelope {
     pub(crate) invitation_token: String,
     pub(crate) invitation: InvitationRecord,
 }
 
+/// Per-feature aggregation of the telemetry tape for operator dashboards.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct FeatureTelemetrySummary {
     pub(crate) feature_key: String,
@@ -367,6 +433,8 @@ pub(crate) struct FeatureTelemetrySummary {
     pub(crate) latest_at_unix_ms: Option<i64>,
 }
 
+/// One migration health check with `state` of `ready`, `warning`,
+/// `backfill_required`, or `blocked`, plus a remediation hint.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct AccessMigrationCheck {
     pub(crate) key: String,
@@ -375,6 +443,8 @@ pub(crate) struct AccessMigrationCheck {
     pub(crate) remediation: String,
 }
 
+/// Aggregated migration posture of the registry, derived from
+/// [`AccessMigrationCheck`] states.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct AccessMigrationStatus {
     pub(crate) registry_path: String,
@@ -387,6 +457,8 @@ pub(crate) struct AccessMigrationStatus {
     pub(crate) checks: Vec<AccessMigrationCheck>,
 }
 
+/// Outcome of a registry repair pass; all counters refer to records
+/// actually changed (zero on an already-clean registry).
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct AccessBackfillReport {
     pub(crate) dry_run: bool,
@@ -400,6 +472,8 @@ pub(crate) struct AccessBackfillReport {
     pub(crate) notes: Vec<String>,
 }
 
+/// Rollout posture of a single feature flag, including unmet dependencies
+/// and the CLI kill-switch command operators can run.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct AccessRolloutPackageStatus {
     pub(crate) feature_key: String,
@@ -412,6 +486,8 @@ pub(crate) struct AccessRolloutPackageStatus {
     pub(crate) kill_switch_command: String,
 }
 
+/// Overall rollout posture; the `*_safe_mode` flags report whether the
+/// external API and team mode are still gated off.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct AccessRolloutStatus {
     pub(crate) staged_rollout_enabled: bool,
@@ -422,6 +498,8 @@ pub(crate) struct AccessRolloutStatus {
     pub(crate) operator_notes: Vec<String>,
 }
 
+/// Principal-scoped view of the whole registry: only workspaces, teams,
+/// tokens, invitations, and shares visible to the requesting principal.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct AccessRegistrySnapshot {
     pub(crate) version: u32,
@@ -437,6 +515,8 @@ pub(crate) struct AccessRegistrySnapshot {
     pub(crate) rollout: AccessRolloutStatus,
 }
 
+/// Identity material of a successfully authenticated API token, handed to
+/// request handlers for rate limiting and workspace resolution.
 #[derive(Debug, Clone)]
 pub(crate) struct AuthenticatedApiToken {
     pub(crate) token_id: String,
@@ -446,6 +526,8 @@ pub(crate) struct AuthenticatedApiToken {
     pub(crate) rate_limit_per_minute: u32,
 }
 
+/// Successful workspace authorization: the runtime identity traffic should
+/// execute under, plus the granting role and an auditable reason string.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct WorkspaceAccessResolution {
     pub(crate) workspace_id: String,
@@ -457,12 +539,18 @@ pub(crate) struct WorkspaceAccessResolution {
     pub(crate) reason: String,
 }
 
+/// In-memory access registry bound to its JSON backing file.
+///
+/// Mutating methods authorize the acting principal first, then persist the
+/// full document back to disk before returning, so the file always reflects
+/// the last successful mutation.
 #[derive(Debug, Clone)]
 pub(crate) struct AccessRegistry {
     path: PathBuf,
     data: AccessRegistryFile,
 }
 
+/// Parameters for [`AccessRegistry::create_api_token`].
 #[derive(Debug, Clone)]
 pub(crate) struct ApiTokenCreateRequest {
     pub(crate) label: String,
@@ -474,12 +562,14 @@ pub(crate) struct ApiTokenCreateRequest {
     pub(crate) rate_limit_per_minute: Option<u32>,
 }
 
+/// Parameters for [`AccessRegistry::create_workspace_bundle`].
 #[derive(Debug, Clone)]
 pub(crate) struct WorkspaceCreateRequest {
     pub(crate) team_name: String,
     pub(crate) workspace_name: String,
 }
 
+/// Parameters for [`AccessRegistry::create_invitation`].
 #[derive(Debug, Clone)]
 pub(crate) struct InvitationCreateRequest {
     pub(crate) workspace_id: String,
@@ -488,6 +578,7 @@ pub(crate) struct InvitationCreateRequest {
     pub(crate) expires_at_unix_ms: i64,
 }
 
+/// Parameters for [`AccessRegistry::upsert_resource_share`].
 #[derive(Debug, Clone)]
 pub(crate) struct ResourceShareUpsertRequest {
     pub(crate) resource_kind: String,
@@ -497,6 +588,13 @@ pub(crate) struct ResourceShareUpsertRequest {
 }
 
 impl AccessRegistry {
+    /// Opens (or initializes) the registry under `state_root`, applying
+    /// non-destructive schema repairs and persisting the result.
+    ///
+    /// # Errors
+    /// Returns a read/parse/write variant on IO or JSON failure, and
+    /// [`AccessRegistryError::InvalidField`] for an unsupported on-disk
+    /// schema version.
     pub(crate) fn open(state_root: &Path) -> Result<Self, AccessRegistryError> {
         fs::create_dir_all(state_root).map_err(|error| AccessRegistryError::WriteRegistry {
             path: state_root.display().to_string(),
@@ -525,6 +623,9 @@ impl AccessRegistry {
         Ok(registry)
     }
 
+    /// Builds the registry view visible to `principal`: their memberships,
+    /// the workspaces/teams/shares those memberships reach, tokens they own
+    /// or can manage, and invitations addressed to or manageable by them.
     pub(crate) fn snapshot(&self, principal: &str) -> AccessRegistrySnapshot {
         let memberships = self.list_visible_workspace_memberships(principal);
         let visible_workspace_ids = memberships
@@ -581,6 +682,8 @@ impl AccessRegistry {
         }
     }
 
+    /// Evaluates the registry against the current schema contract and
+    /// reports per-check readiness plus aggregate blocking/warning counts.
     pub(crate) fn migration_status(&self) -> AccessMigrationStatus {
         let missing_feature_flags = missing_feature_flag_keys(&self.data.feature_flags);
         let workspaces_missing_runtime = self
@@ -736,6 +839,12 @@ impl AccessRegistry {
         }
     }
 
+    /// Runs the registry repair pass; with `dry_run` the staged changes are
+    /// discarded and only the would-be report is returned.
+    ///
+    /// # Errors
+    /// Returns [`AccessRegistryError::WriteRegistry`] or
+    /// [`AccessRegistryError::SerializeRegistry`] if persisting fails.
     pub(crate) fn run_backfill(
         &mut self,
         actor_principal: &str,
@@ -764,6 +873,8 @@ impl AccessRegistry {
         Ok(AccessBackfillReport { dry_run: false, ..report })
     }
 
+    /// Summarizes rollout posture: per-package dependency blockers, safe-mode
+    /// flags, and operator guidance notes.
     pub(crate) fn rollout_status(&self) -> AccessRolloutStatus {
         let compat_api_enabled = self.is_feature_enabled(FEATURE_COMPAT_API);
         let api_tokens_enabled = self.is_feature_enabled(FEATURE_API_TOKENS);
@@ -827,15 +938,23 @@ impl AccessRegistry {
         }
     }
 
+    /// Reports whether `feature_key` is enabled.
+    ///
+    /// Deny-by-default: a flag missing from the registry is treated as
+    /// disabled rather than an error.
     pub(crate) fn is_feature_enabled(&self, feature_key: &str) -> bool {
         self.data
             .feature_flags
             .iter()
             .find(|flag| flag.key == feature_key)
-            .map(|flag| flag.enabled)
-            .unwrap_or(false)
+            .is_some_and(|flag| flag.enabled)
     }
 
+    /// Gate helper returning `Ok(())` only when `feature_key` is enabled.
+    ///
+    /// # Errors
+    /// Returns [`AccessRegistryError::FeatureDisabled`] when the flag is
+    /// disabled or unknown.
     pub(crate) fn require_feature_enabled(
         &self,
         feature_key: &str,
@@ -847,6 +966,15 @@ impl AccessRegistry {
         }
     }
 
+    /// Enables or disables `feature_key`, optionally moving its rollout
+    /// stage, and persists the change.
+    ///
+    /// The acting principal is recorded on the flag for audit; authorizing
+    /// the actor is the caller's responsibility.
+    ///
+    /// # Errors
+    /// Returns [`AccessRegistryError::FeatureFlagNotFound`] for unknown keys
+    /// and a persistence variant if writing the registry fails.
     pub(crate) fn set_feature_flag(
         &mut self,
         feature_key: &str,
@@ -874,6 +1002,18 @@ impl AccessRegistry {
         Ok(updated_flag)
     }
 
+    /// Mints a scoped API token and returns the secret exactly once.
+    ///
+    /// Workspace-bound tokens require the actor to hold
+    /// [`PERMISSION_API_TOKENS_MANAGE`] in that workspace; personal tokens
+    /// can only be minted for the actor itself. An empty scope list defaults
+    /// to the requested role's full permission set.
+    ///
+    /// # Errors
+    /// Returns [`AccessRegistryError::FeatureDisabled`] when token issuance
+    /// is gated off, [`AccessRegistryError::AccessDenied`] on authorization
+    /// failure, [`AccessRegistryError::InvalidField`] for malformed fields,
+    /// and a persistence variant if writing fails.
     pub(crate) fn create_api_token(
         &mut self,
         actor_principal: &str,
@@ -934,6 +1074,8 @@ impl AccessRegistry {
         Ok(ApiTokenSecretEnvelope { token, token_record: api_token_view(&record, now) })
     }
 
+    /// Lists tokens visible to `principal` (their personal tokens plus
+    /// tokens of workspaces they belong to), most recently updated first.
     pub(crate) fn list_api_tokens(&self, principal: &str) -> Vec<ApiTokenView> {
         let mut visible = self
             .data
@@ -945,12 +1087,25 @@ impl AccessRegistry {
                         self.workspace_role_for_principal(principal, workspace_id).is_ok()
                     })
             })
+            // now = 0 disables expiry-state derivation, so list views report
+            // only "active"/"revoked" without needing a clock.
             .map(|record| api_token_view(record, 0))
             .collect::<Vec<_>>();
         visible.sort_by_key(|entry| std::cmp::Reverse(entry.updated_at_unix_ms));
         visible
     }
 
+    /// Revokes `token_id` and mints a replacement with identical label,
+    /// scopes, principal, workspace, role, expiry, and rate limit.
+    ///
+    /// The new secret is returned exactly once and the replacement is linked
+    /// back to the old token via `rotated_from_token_id`.
+    ///
+    /// # Errors
+    /// Returns [`AccessRegistryError::FeatureDisabled`] when token issuance
+    /// is gated off, [`AccessRegistryError::ApiTokenNotFound`] for unknown
+    /// ids, [`AccessRegistryError::AccessDenied`] on authorization failure,
+    /// and a persistence variant if writing fails.
     pub(crate) fn rotate_api_token(
         &mut self,
         actor_principal: &str,
@@ -976,6 +1131,9 @@ impl AccessRegistry {
                 "personal API token rotation requires the owning principal".to_owned(),
             ));
         }
+        // Revoke in memory first: create_api_token persists on success, so
+        // the revocation and the replacement commit to disk together and the
+        // old secret never outlives the new one.
         if let Some(record) =
             self.data.api_tokens.iter_mut().find(|record| record.token_id == token_id)
         {
@@ -1015,6 +1173,14 @@ impl AccessRegistry {
         Ok(rotated)
     }
 
+    /// Permanently revokes `token_id`; revocation cannot be undone, only
+    /// replaced by minting a new token.
+    ///
+    /// # Errors
+    /// Returns [`AccessRegistryError::FeatureDisabled`] when the token
+    /// feature is gated off, [`AccessRegistryError::ApiTokenNotFound`] for
+    /// unknown ids, [`AccessRegistryError::AccessDenied`] on authorization
+    /// failure, and a persistence variant if writing fails.
     pub(crate) fn revoke_api_token(
         &mut self,
         actor_principal: &str,
@@ -1065,6 +1231,17 @@ impl AccessRegistry {
         Ok(revoked_view)
     }
 
+    /// Validates a presented token secret and checks that it grants
+    /// `required_scope`.
+    ///
+    /// Lookup is by SHA-256 digest of the secret. Unknown, revoked, and
+    /// expired tokens all fail with the same opaque error so callers cannot
+    /// probe token state.
+    ///
+    /// # Errors
+    /// Returns [`AccessRegistryError::InvalidApiToken`] for unknown,
+    /// revoked, or expired tokens and [`AccessRegistryError::MissingScope`]
+    /// when the token authenticates but lacks the required scope.
     pub(crate) fn authenticate_api_token(
         &self,
         raw_token: &str,
@@ -1098,6 +1275,12 @@ impl AccessRegistry {
         })
     }
 
+    /// Records a token usage event: bumps `last_used_at` and appends a
+    /// telemetry event attributed to the token's principal and workspace.
+    ///
+    /// # Errors
+    /// Returns [`AccessRegistryError::ApiTokenNotFound`] for unknown ids
+    /// and a persistence variant if writing fails.
     pub(crate) fn touch_api_token(
         &mut self,
         token_id: &str,
@@ -1132,6 +1315,13 @@ impl AccessRegistry {
         Ok(())
     }
 
+    /// Creates a team, a workspace inside it, and an owner membership for
+    /// the acting principal in one persisted step.
+    ///
+    /// # Errors
+    /// Returns [`AccessRegistryError::FeatureDisabled`] when team mode is
+    /// gated off, [`AccessRegistryError::InvalidField`] for empty names,
+    /// and a persistence variant if writing fails.
     pub(crate) fn create_workspace_bundle(
         &mut self,
         actor_principal: &str,
@@ -1186,13 +1376,13 @@ impl AccessRegistry {
             now,
         );
         self.persist()?;
-        Ok(WorkspaceCreateEnvelope {
-            team: team.clone(),
-            workspace: workspace.clone(),
-            membership: workspace_membership_view(&team, &workspace, &membership),
-        })
+        let membership_view = workspace_membership_view(&team, &workspace, &membership);
+        Ok(WorkspaceCreateEnvelope { team, workspace, membership: membership_view })
     }
 
+    /// Lists every membership of every workspace `principal` belongs to
+    /// (not just the principal's own rows), sorted by workspace name and
+    /// then principal for stable display.
     pub(crate) fn list_visible_workspace_memberships(
         &self,
         principal: &str,
@@ -1233,6 +1423,15 @@ impl AccessRegistry {
         memberships
     }
 
+    /// Issues a workspace invitation and returns the acceptance secret
+    /// exactly once; only its SHA-256 digest is persisted.
+    ///
+    /// # Errors
+    /// Returns [`AccessRegistryError::FeatureDisabled`] when team mode is
+    /// gated off, [`AccessRegistryError::AccessDenied`] when the actor
+    /// cannot manage memberships, [`AccessRegistryError::InvalidField`] for
+    /// malformed input or a non-future expiry, and a persistence variant if
+    /// writing fails.
     pub(crate) fn create_invitation(
         &mut self,
         actor_principal: &str,
@@ -1282,6 +1481,20 @@ impl AccessRegistry {
         Ok(InvitationSecretEnvelope { invitation_token: token, invitation })
     }
 
+    /// Redeems an invitation secret and creates the promised membership.
+    ///
+    /// Invitations are single-use, expire at their deadline, and may only
+    /// be accepted by the invited identity (compared ASCII
+    /// case-insensitively).
+    ///
+    /// # Errors
+    /// Returns [`AccessRegistryError::FeatureDisabled`] when team mode is
+    /// gated off, [`AccessRegistryError::InvitationNotFound`] for unknown
+    /// secrets, [`AccessRegistryError::InvitationAlreadyAccepted`] or
+    /// [`AccessRegistryError::InvitationExpired`] for spent or stale
+    /// invitations, [`AccessRegistryError::AccessDenied`] when the acceptor
+    /// does not match the invited identity, and a persistence variant if
+    /// writing fails.
     pub(crate) fn accept_invitation(
         &mut self,
         actor_principal: &str,
@@ -1355,6 +1568,15 @@ impl AccessRegistry {
         Ok(workspace_membership_view(&team, &workspace, &membership))
     }
 
+    /// Changes a member's role while enforcing the owner boundary: only
+    /// owners may grant or revoke the owner role, members cannot
+    /// self-promote to owner, and the last owner cannot be demoted.
+    ///
+    /// # Errors
+    /// Returns [`AccessRegistryError::AccessDenied`] on any authorization
+    /// or owner-boundary violation, [`AccessRegistryError::InvalidField`]
+    /// for unknown role names, not-found variants for dangling workspace or
+    /// team references, and a persistence variant if writing fails.
     pub(crate) fn update_membership_role(
         &mut self,
         actor_principal: &str,
@@ -1439,6 +1661,13 @@ impl AccessRegistry {
         Ok(workspace_membership_view(team, workspace, membership))
     }
 
+    /// Removes a member from a workspace; only owners may remove owner
+    /// memberships and the last owner can never be removed.
+    ///
+    /// # Errors
+    /// Returns [`AccessRegistryError::AccessDenied`] on authorization or
+    /// owner-boundary violations or when no matching membership exists, and
+    /// a persistence variant if writing fails.
     pub(crate) fn remove_membership(
         &mut self,
         actor_principal: &str,
@@ -1486,6 +1715,14 @@ impl AccessRegistry {
         Ok(())
     }
 
+    /// Creates or updates the share exposing one resource to a workspace,
+    /// keyed by `(workspace_id, resource_kind, resource_id)`.
+    ///
+    /// # Errors
+    /// Returns [`AccessRegistryError::FeatureDisabled`] when RBAC is gated
+    /// off, [`AccessRegistryError::AccessDenied`] when the actor cannot
+    /// manage sharing, [`AccessRegistryError::InvalidField`] for empty
+    /// fields, and a persistence variant if writing fails.
     pub(crate) fn upsert_resource_share(
         &mut self,
         actor_principal: &str,
@@ -1528,6 +1765,17 @@ impl AccessRegistry {
         Ok(share)
     }
 
+    /// Authorizes `principal` to exercise `permission` inside
+    /// `workspace_id` and resolves the runtime identity to execute under.
+    ///
+    /// Deny-by-default: a missing membership and a role that does not
+    /// expand to the permission both fail closed.
+    ///
+    /// # Errors
+    /// Returns [`AccessRegistryError::AccessDenied`] when membership or
+    /// permission is missing and
+    /// [`AccessRegistryError::WorkspaceNotFound`] for a dangling workspace
+    /// reference.
     pub(crate) fn authorize_workspace_permission(
         &self,
         principal: &str,
@@ -1576,6 +1824,15 @@ impl AccessRegistry {
         })
     }
 
+    /// Resolves the workspace runtime identity for an authenticated token.
+    ///
+    /// Personal tokens (no workspace binding) resolve to `Ok(None)` and run
+    /// under the caller's own identity; workspace-bound tokens must pass
+    /// the full membership and permission check.
+    ///
+    /// # Errors
+    /// Propagates [`Self::authorize_workspace_permission`] failures for
+    /// workspace-bound tokens.
     pub(crate) fn resolve_workspace_access_for_token(
         &self,
         token: &AuthenticatedApiToken,
@@ -1653,6 +1910,8 @@ impl AccessRegistry {
             .collect()
     }
 
+    /// Appends a telemetry event in memory, dropping the oldest events
+    /// beyond [`TELEMETRY_EVENT_LIMIT`]; callers persist afterwards.
     #[allow(clippy::too_many_arguments)]
     fn record_telemetry(
         &mut self,
@@ -1707,6 +1966,8 @@ impl AccessRegistry {
     }
 }
 
+/// Authoritative flag inventory; backfill restores any record missing from
+/// disk with these defaults (everything off except routine automation).
 fn default_feature_flags() -> Vec<FeatureFlagRecord> {
     vec![
         FeatureFlagRecord {
@@ -1825,6 +2086,10 @@ fn missing_feature_flag_keys(feature_flags: &[FeatureFlagRecord]) -> Vec<String>
         .collect()
 }
 
+/// Non-destructive schema repair shared by `open` and `run_backfill`:
+/// restores missing flags, regenerates empty slugs/runtime bindings,
+/// normalizes token scopes and limits, and trims telemetry to budget.
+/// Idempotent; the returned report's `dry_run` is overridden by callers.
 fn repair_access_registry_data(data: &mut AccessRegistryFile) -> AccessBackfillReport {
     let feature_flags_before = data.feature_flags.len();
     backfill_missing_feature_flags(&mut data.feature_flags);
@@ -1952,6 +2217,8 @@ fn trim_to_option(raw: String) -> Option<String> {
     }
 }
 
+/// Trims, lowercases, sorts, and dedups scope names; an empty request
+/// falls back to `defaults` (the role's permission set).
 fn normalize_scopes(requested: Vec<String>, defaults: Vec<String>) -> Vec<String> {
     let mut scopes = if requested.is_empty() { defaults } else { requested };
     scopes = scopes
@@ -1964,6 +2231,8 @@ fn normalize_scopes(requested: Vec<String>, defaults: Vec<String>) -> Vec<String
     scopes
 }
 
+/// Mints a fresh secret: 24 bytes from the OS-seeded CSPRNG, URL-safe
+/// base64, behind a fixed product prefix that identifies the token kind.
 fn mint_access_token_secret() -> String {
     let mut bytes = [0_u8; 24];
     rand::rng().fill_bytes(&mut bytes);
@@ -2002,6 +2271,8 @@ fn workspace_runtime_device_id(workspace_id: &str) -> String {
     workspace_id.to_owned()
 }
 
+/// Projects a token record into its secret-free view, deriving `state`;
+/// `now <= 0` skips expiry derivation for clockless list views.
 fn api_token_view(record: &ApiTokenRecord, now: i64) -> ApiTokenView {
     let state = if record.revoked_at_unix_ms.is_some() {
         "revoked"

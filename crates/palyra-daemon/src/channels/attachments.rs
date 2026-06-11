@@ -1,3 +1,10 @@
+//! Attachment handling for the channel platform.
+//!
+//! Ingests inbound Discord attachments into the media store, enforces the
+//! outbound upload policy (enablement, content-type allowlist, size cap)
+//! by neutralizing -- never erroring on -- violating attachments, and
+//! renders the attachment-metadata context block appended to inbound text.
+
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -5,6 +12,8 @@ use palyra_connectors::{AttachmentKind, AttachmentRef, InboundMessageEvent, Outb
 
 use crate::media::{InboundAttachmentIngestRequest, MediaArtifactStore};
 
+/// Ingests every inbound attachment into the media store and returns the
+/// store-backed references that replace the adapter-provided ones.
 pub(super) async fn preprocess_discord_inbound_attachments(
     media_store: &Arc<MediaArtifactStore>,
     event: &InboundMessageEvent,
@@ -31,6 +40,13 @@ pub(super) async fn preprocess_discord_inbound_attachments(
     Ok(prepared)
 }
 
+/// Resolves and policy-checks outbound upload attachments.
+///
+/// Artifact-backed attachments are inlined from the media store; uploads
+/// violating policy (disabled uploads, missing content, blocked content
+/// type, oversize payload) are kept in the output but downgraded via
+/// [`block_outbound_upload_attachment`] so the message still sends
+/// without the upload.
 pub(super) fn prepare_outbound_attachments(
     media_store: &Arc<MediaArtifactStore>,
     connector_id: &str,
@@ -117,6 +133,8 @@ pub(super) fn prepare_outbound_attachments(
             prepared.push(attachment);
             continue;
         }
+        // Undecodable base64 counts as usize::MAX so it always trips the
+        // size gate below -- fail closed instead of sending garbage.
         let decoded_size = attachment
             .inline_base64
             .as_deref()
@@ -141,6 +159,9 @@ pub(super) fn prepare_outbound_attachments(
     Ok(prepared)
 }
 
+/// Downgrades a policy-violating upload in place (clears the payload,
+/// records the reason as policy context) and logs the failure to the media
+/// store; the surrounding message is still delivered.
 fn block_outbound_upload_attachment(
     media_store: &Arc<MediaArtifactStore>,
     connector_id: &str,
@@ -158,6 +179,9 @@ fn block_outbound_upload_attachment(
     )
 }
 
+/// Appends the attachment-metadata block to the message text so the model
+/// sees what was attached; returns the text unchanged when there are no
+/// attachments.
 pub(super) fn with_attachment_context(text: &str, attachments: &[AttachmentRef]) -> String {
     let Some(summary) = render_attachment_context(attachments) else {
         return text.to_owned();
@@ -170,6 +194,8 @@ pub(super) fn with_attachment_context(text: &str, attachments: &[AttachmentRef])
     }
 }
 
+/// Renders the `[attachment-metadata]` summary block, one line per
+/// attachment; `None` for an empty slice.
 pub(super) fn render_attachment_context(attachments: &[AttachmentRef]) -> Option<String> {
     if attachments.is_empty() {
         return None;

@@ -1,3 +1,13 @@
+//! Operator-managed inbound webhook integration registry.
+//!
+//! [`WebhookRegistry`] persists integrations in an owner-only TOML document
+//! under the daemon state root and validates test payloads end to end:
+//! envelope structure, source/event allowlists, payload-size budget,
+//! HMAC-SHA256 signature against a vault-held secret, single-use replay
+//! nonces, and the safety-boundary scan for untrusted content. Signing
+//! secrets are referenced by vault ref only and never stored here. Consumed
+//! by the control-plane console surfaces and the operator CLI.
+
 use std::{
     collections::BTreeMap,
     fs,
@@ -34,12 +44,17 @@ const MAX_WEBHOOK_PAYLOAD_BYTES: u64 = 1_048_576;
 const MAX_REPLAY_NONCES: usize = 8_192;
 const HMAC_SHA256_BLOCK_BYTES: usize = 64;
 
+/// Optional provider/enabled filters for listing integrations; `None`
+/// fields match everything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebhookIntegrationListFilter {
     pub provider: Option<String>,
     pub enabled: Option<bool>,
 }
 
+/// Create-or-update request for one integration; normalized and validated
+/// before it touches the registry. `max_payload_bytes = 0` selects the
+/// default budget.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebhookIntegrationSetRequest {
     pub integration_id: String,
@@ -53,12 +68,16 @@ pub struct WebhookIntegrationSetRequest {
     pub max_payload_bytes: u64,
 }
 
+/// Result of a webhook test: the refreshed integration view plus the
+/// detailed per-gate validation result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebhookIntegrationTestOutcome {
     pub integration: control_plane::WebhookIntegrationView,
     pub result: control_plane::WebhookIntegrationTestResult,
 }
 
+/// Persisted integration row; holds only the vault reference to the
+/// signing secret, never the secret itself.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct WebhookIntegrationRecord {
     integration_id: String,
@@ -82,6 +101,8 @@ struct WebhookIntegrationRecord {
     last_test_at_unix_ms: Option<i64>,
 }
 
+/// Snapshot of whether an integration's signing secret is resolvable; an
+/// integration may only be enabled while ready.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WebhookReadiness {
     secret_status: WebhookSecretStatus,
@@ -103,6 +124,11 @@ enum WebhookSecretStatus {
     Present,
 }
 
+/// In-memory single-use nonce ledger for webhook test verification.
+///
+/// Process-local by design: it backs operator-triggered tests, not the
+/// production ingest path, so nonces resetting on daemon restart is
+/// acceptable.
 #[derive(Debug, Default)]
 struct WebhookReplayNonceStore {
     consumed: Mutex<BTreeMap<String, u64>>,
@@ -118,6 +144,8 @@ impl ReplayNonceStore for WebhookReplayNonceStore {
             return Err(WebhookPayloadError::InvalidValue("replay_protection.nonce"));
         }
         consumed.insert(nonce.to_owned(), timestamp_unix_ms);
+        // Evict the oldest-timestamped nonce to bound memory; the freshest
+        // nonces (the ones still worth replaying) stay protected longest.
         if consumed.len() > MAX_REPLAY_NONCES {
             let oldest_nonce = consumed
                 .iter()
@@ -131,6 +159,8 @@ impl ReplayNonceStore for WebhookReplayNonceStore {
     }
 }
 
+/// HMAC-SHA256 verifier bound to a secret loaded from the vault for the
+/// duration of one verification.
 #[derive(Debug, Clone)]
 struct VaultHmacSha256WebhookVerifier {
     secret: Vec<u8>,
@@ -149,6 +179,8 @@ impl WebhookSignatureVerifier for VaultHmacSha256WebhookVerifier {
     }
 }
 
+/// Aggregate registry posture for diagnostics surfaces: counts by enabled
+/// state and secret readiness, plus the sorted provider list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WebhookDiagnosticsSnapshot {
     pub total: usize,
@@ -160,6 +192,10 @@ pub struct WebhookDiagnosticsSnapshot {
     pub providers: Vec<String>,
 }
 
+/// File-backed registry of webhook integrations.
+///
+/// The TOML document and its long-lived file handle live behind separate
+/// mutexes; every mutation rewrites the whole document before returning.
 #[derive(Debug)]
 pub struct WebhookRegistry {
     registry_path: RegistryPath,
@@ -196,6 +232,7 @@ impl RegistryPath {
     }
 }
 
+/// Failure modes of webhook registry IO, parsing, and validation.
 #[derive(Debug, Error)]
 pub enum WebhookRegistryError {
     #[error("webhook registry lock poisoned")]
@@ -233,6 +270,14 @@ pub enum WebhookRegistryError {
 }
 
 impl WebhookRegistry {
+    /// Opens (or creates) the registry document under `state_root`,
+    /// enforcing owner-only permissions on the directory and file.
+    ///
+    /// # Errors
+    /// Returns read/parse/write variants on IO or TOML failure,
+    /// [`WebhookRegistryError::UnsupportedVersion`] for unknown document
+    /// versions, and [`WebhookRegistryError::RegistryLimitExceeded`] for
+    /// oversized documents.
     pub fn open(state_root: &Path) -> Result<Self, WebhookRegistryError> {
         let registry_path = resolve_registry_path(state_root)?;
         let mut registry_file = open_registry_file(&registry_path)?;
@@ -245,6 +290,13 @@ impl WebhookRegistry {
         })
     }
 
+    /// Lists integration views matching `filter`, with secret readiness
+    /// evaluated against `vault`.
+    ///
+    /// # Errors
+    /// Returns [`WebhookRegistryError::LockPoisoned`] or
+    /// [`WebhookRegistryError::InvalidField`] for a malformed provider
+    /// filter.
     pub fn list_views(
         &self,
         filter: WebhookIntegrationListFilter,
@@ -274,6 +326,11 @@ impl WebhookRegistry {
         Ok(views)
     }
 
+    /// Returns one integration view, `None` when the id is unknown.
+    ///
+    /// # Errors
+    /// Returns [`WebhookRegistryError::LockPoisoned`] or
+    /// [`WebhookRegistryError::InvalidField`] for a malformed id.
     pub fn get_view(
         &self,
         integration_id: &str,
@@ -288,6 +345,16 @@ impl WebhookRegistry {
         Ok(Some(self.view_from_record(record, vault)?))
     }
 
+    /// Creates or updates an integration and persists the registry.
+    ///
+    /// An integration cannot be enabled (or stay enabled) unless its
+    /// signing secret resolves in the vault -- enabling fails closed.
+    ///
+    /// # Errors
+    /// Returns [`WebhookRegistryError::InvalidField`] for malformed input
+    /// or an unready integration being enabled,
+    /// [`WebhookRegistryError::RegistryLimitExceeded`] at the registry
+    /// cap, and lock/persistence variants otherwise.
     pub fn set_integration(
         &self,
         request: WebhookIntegrationSetRequest,
@@ -364,6 +431,13 @@ impl WebhookRegistry {
         Ok(view)
     }
 
+    /// Enables or disables an integration; enabling requires the signing
+    /// secret to be resolvable (disabling always succeeds).
+    ///
+    /// # Errors
+    /// Returns [`WebhookRegistryError::IntegrationNotFound`] for unknown
+    /// ids, [`WebhookRegistryError::InvalidField`] when enabling an
+    /// unready integration, and lock/persistence variants otherwise.
     pub fn set_enabled(
         &self,
         integration_id: &str,
@@ -396,6 +470,12 @@ impl WebhookRegistry {
         Ok(view)
     }
 
+    /// Deletes an integration; returns `false` when nothing matched (the
+    /// registry is only rewritten on an actual deletion).
+    ///
+    /// # Errors
+    /// Returns [`WebhookRegistryError::InvalidField`] for a malformed id
+    /// and lock/persistence variants otherwise.
     pub fn delete_integration(&self, integration_id: &str) -> Result<bool, WebhookRegistryError> {
         let normalized = normalize_identifier(integration_id, "integration_id")?;
         let mut state = self.state.lock().map_err(|_| WebhookRegistryError::LockPoisoned)?;
@@ -408,6 +488,16 @@ impl WebhookRegistry {
         Ok(deleted)
     }
 
+    /// Runs a payload through every acceptance gate the integration would
+    /// apply (structure, safety scan, allowlists, size budget, signature,
+    /// replay nonce) and records the outcome on the integration.
+    ///
+    /// The test never errors on a bad payload -- gate failures are
+    /// reported inside the returned result with a stable `outcome` string.
+    ///
+    /// # Errors
+    /// Returns [`WebhookRegistryError::IntegrationNotFound`] for unknown
+    /// ids and lock/clock/persistence variants otherwise.
     pub fn test_integration(
         &self,
         integration_id: &str,
@@ -475,6 +565,9 @@ impl WebhookRegistry {
                 if record.signature_required {
                     if !signature_present {
                         issues.push("payload signature is required but missing".to_owned());
+                    // Verification consumes the single-use nonce, so it only
+                    // runs once every cheaper gate has passed; a payload that
+                    // would be rejected anyway must not burn its nonce.
                     } else if record.enabled
                         && readiness.is_ready()
                         && source_allowed
@@ -581,6 +674,12 @@ impl WebhookRegistry {
         Ok(WebhookIntegrationTestOutcome { integration, result })
     }
 
+    /// Aggregates registry posture: enabled/ready/disabled counts, secret
+    /// failure counts, and the provider inventory.
+    ///
+    /// # Errors
+    /// Returns [`WebhookRegistryError::LockPoisoned`] when the state lock
+    /// is poisoned.
     pub fn summary(
         &self,
         vault: &Vault,
@@ -624,6 +723,10 @@ impl WebhookRegistry {
         })
     }
 
+    /// Alias of [`Self::summary`] used by the diagnostics surface.
+    ///
+    /// # Errors
+    /// Same as [`Self::summary`].
     pub fn diagnostics_snapshot(
         &self,
         vault: &Vault,
@@ -674,6 +777,9 @@ impl WebhookRegistry {
     }
 }
 
+/// Checks whether the record's signing secret resolves in the vault; any
+/// vault error other than not-found is reported as a missing secret so
+/// readiness still fails closed.
 fn evaluate_readiness(record: &WebhookIntegrationRecord, vault: &Vault) -> WebhookReadiness {
     let parsed = match VaultRef::parse(record.secret_vault_ref.as_str()) {
         Ok(value) => value,
@@ -704,6 +810,9 @@ fn evaluate_readiness(record: &WebhookIntegrationRecord, vault: &Vault) -> Webho
     }
 }
 
+/// Verifies signature and replay protection for a test payload using the
+/// vault-held secret; errors are stringly because they feed operator-facing
+/// issue lists, not control flow.
 fn verify_webhook_test_payload(
     record: &WebhookIntegrationRecord,
     payload_bytes: &[u8],
@@ -736,6 +845,12 @@ fn read_webhook_signing_secret(
     Ok(secret)
 }
 
+/// Produces the byte sequence the HMAC covers: the payload re-serialized
+/// with `replay_protection.signature` removed.
+///
+/// Verification therefore depends on serde_json's canonical object
+/// ordering (sorted keys), not on the sender's raw byte layout -- senders
+/// must sign the same canonical form.
 fn webhook_signature_payload(payload_bytes: &[u8]) -> Result<Vec<u8>, WebhookPayloadError> {
     let mut value = serde_json::from_slice::<Value>(payload_bytes)
         .map_err(|_| WebhookPayloadError::InvalidJson)?;
@@ -747,6 +862,11 @@ fn webhook_signature_payload(payload_bytes: &[u8]) -> Result<Vec<u8>, WebhookPay
     serde_json::to_vec(&value).map_err(|_| WebhookPayloadError::InvalidJson)
 }
 
+/// RFC 2104 HMAC-SHA256 over `payload` with `secret`.
+// AIDEV-NOTE: hand-rolled HMAC (block-sized key pad, inner/outer hash).
+// The construction is the standard one and is pinned by the signature
+// tests, but if the workspace ever adopts the `hmac` crate this should be
+// replaced rather than maintained -- do not "optimize" the XOR loops.
 fn hmac_sha256(secret: &[u8], payload: &[u8]) -> Vec<u8> {
     let mut key_block = [0_u8; HMAC_SHA256_BLOCK_BYTES];
     if secret.len() > HMAC_SHA256_BLOCK_BYTES {
@@ -774,6 +894,9 @@ fn hmac_sha256(secret: &[u8], payload: &[u8]) -> Vec<u8> {
     outer.finalize().to_vec()
 }
 
+/// Decodes a hex signature, tolerating the common `sha256=`/`hmac-sha256=`
+/// (and `:`) prefixes providers use; anything but 32 decoded bytes is
+/// rejected.
 fn decode_webhook_signature(signature: &str) -> Result<Vec<u8>, WebhookPayloadError> {
     let trimmed = signature.trim();
     let encoded = trimmed
@@ -790,6 +913,9 @@ fn decode_webhook_signature(signature: &str) -> Result<Vec<u8>, WebhookPayloadEr
     Ok(decoded)
 }
 
+/// Compares two MACs without short-circuiting on the first mismatching
+/// byte; a plain `==` would leak the matching prefix length through
+/// timing. The early length check is safe because MAC length is public.
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
         return false;
@@ -1024,6 +1150,11 @@ fn persist_registry(
     write_registry_document(registry_path, &mut registry_file, document)
 }
 
+// AIDEV-NOTE: the document is rewritten in place (set_len(0) + write +
+// sync on the long-lived handle), matching the registry pattern used by
+// objectives.rs and routines.rs. A crash between truncate and sync leaves
+// a partial document; switching to atomic temp-file rename would also
+// change the owner-only permission and file-handle locking flow.
 fn write_registry_document(
     registry_path: &RegistryPath,
     registry_file: &mut fs::File,
@@ -1053,6 +1184,8 @@ fn write_registry_document(
     Ok(())
 }
 
+/// Canonicalizes the state root and confirms the registry file resolves
+/// directly inside it, rejecting symlink or traversal escapes.
 fn resolve_registry_path(state_root: &Path) -> Result<RegistryPath, WebhookRegistryError> {
     ensure_owner_only_dir(state_root).map_err(|source| WebhookRegistryError::WriteRegistry {
         path: state_root.to_path_buf(),

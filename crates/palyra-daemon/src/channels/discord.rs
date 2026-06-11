@@ -1,3 +1,10 @@
+//! Discord-specific channel-platform behavior.
+//!
+//! Wraps the shared Discord provider helpers with daemon error types, adds
+//! the confirmed operator test-send flow, and classifies message-mutation
+//! risk (edit/delete/reaction) into approval requirements based on channel
+//! visibility, connector scope, and message age.
+
 use palyra_connectors::{
     providers::discord as shared, ConnectorInstanceRecord, ConnectorInstanceSpec, ConnectorKind,
     ConnectorLiveness, ConnectorMessageRecord, ConnectorReadiness, ConnectorStatusSnapshot,
@@ -15,23 +22,41 @@ pub use shared::{
     is_discord_connector,
 };
 
+/// Normalizes a Discord account id to the supported charset.
+///
+/// # Errors
+/// Returns [`ChannelPlatformError::InvalidInput`] for empty ids or
+/// unsupported characters.
 #[allow(clippy::result_large_err)]
 pub fn normalize_discord_account_id(raw: &str) -> Result<String, ChannelPlatformError> {
     shared::normalize_discord_account_id(raw)
         .map_err(|error| ChannelPlatformError::InvalidInput(error.to_string()))
 }
 
+/// Builds the connector spec for a Discord account.
+///
+/// # Panics
+/// Panics when `account_id` was not produced by
+/// [`normalize_discord_account_id`]; callers validate first.
 pub(super) fn discord_connector_spec(account_id: &str, enabled: bool) -> ConnectorInstanceSpec {
     shared::discord_connector_spec(account_id, enabled)
         .expect("daemon should only construct Discord connector specs from validated account ids")
 }
 
+/// Normalizes a Discord send target (`channel:<id>` or raw id) to the
+/// plain target id.
+///
+/// # Errors
+/// Returns [`ChannelPlatformError::InvalidInput`] for empty or unsupported
+/// targets.
 #[allow(clippy::result_large_err)]
 pub(super) fn normalize_discord_target(raw: &str) -> Result<String, ChannelPlatformError> {
     shared::normalize_discord_target(raw)
         .map_err(|error| ChannelPlatformError::InvalidInput(error.to_string()))
 }
 
+/// Operator request for a real outbound Discord test message; `confirm`
+/// must be set explicitly because the send leaves the local runtime.
 #[derive(Debug, Clone)]
 pub struct ChannelDiscordTestSendRequest {
     pub target: String,
@@ -42,6 +67,8 @@ pub struct ChannelDiscordTestSendRequest {
     pub reply_to_message_id: Option<String>,
 }
 
+/// Delivery report of a Discord test send: enqueue/drain counters plus the
+/// provider-native message id when delivery could be confirmed.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ChannelDiscordTestSendOutcome {
     pub envelope_id: String,
@@ -60,6 +87,15 @@ pub struct ChannelDiscordTestSendOutcome {
 }
 
 impl ChannelPlatform {
+    /// Enqueues and immediately drains one confirmed outbound Discord test
+    /// message, reporting delivery counters and the native message id.
+    ///
+    /// # Errors
+    /// Returns [`ChannelPlatformError::InvalidInput`] for missing
+    /// confirmation, empty fields, or non-Discord connectors;
+    /// [`ChannelPlatformError::Precondition`] when the connector is not
+    /// enabled, ready, and running; and supervisor errors from enqueue or
+    /// drain.
     pub async fn submit_discord_test_send(
         &self,
         connector_id: &str,
@@ -154,6 +190,8 @@ impl ChannelPlatform {
     }
 }
 
+/// Rejects test sends up front (before enqueueing) unless the connector is
+/// enabled, ready, and running, listing every failed precondition.
 fn ensure_discord_test_send_dispatchable(
     status: &ConnectorStatusSnapshot,
 ) -> Result<(), ChannelPlatformError> {
@@ -185,6 +223,7 @@ const LOW_RISK_EDIT_WINDOW_MS: i64 = 15 * 60 * 1_000;
 const LOW_RISK_REACTION_WINDOW_MS: i64 = 6 * 60 * 60 * 1_000;
 const HIGH_RISK_MUTATION_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 
+/// Kind of Discord message mutation being risk-classified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DiscordMessageMutationKind {
     Edit,
@@ -194,6 +233,7 @@ pub(crate) enum DiscordMessageMutationKind {
 }
 
 impl DiscordMessageMutationKind {
+    /// Returns the snake_case operation name used in governance reasons.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Edit => "edit",
@@ -204,6 +244,8 @@ impl DiscordMessageMutationKind {
     }
 }
 
+/// Risk posture of one mutation: level, whether an approval gate is
+/// required, and an auditable reason string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DiscordMessageMutationGovernance {
     pub risk_level: ApprovalRiskLevel,
@@ -211,6 +253,14 @@ pub(crate) struct DiscordMessageMutationGovernance {
     pub reason: String,
 }
 
+/// Classifies a Discord message mutation into risk level and approval
+/// requirement.
+///
+/// Risk escalates with exposure: mutations on the shared default
+/// connector profile or in public (guild) channels, mutations of messages
+/// the connector did not author, and older messages all push toward
+/// approval. Only fresh, connector-authored activity in DMs on a scoped
+/// connector profile can skip approval.
 pub(crate) fn classify_discord_message_mutation_governance(
     instance: &ConnectorInstanceRecord,
     message: &ConnectorMessageRecord,

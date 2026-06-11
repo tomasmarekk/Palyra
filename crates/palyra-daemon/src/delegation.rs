@@ -1,3 +1,13 @@
+//! Pure delegation contract logic: profiles, templates, scopes, and records.
+//!
+//! Resolves operator delegation requests against the built-in catalog and
+//! the parent run's context, enforcing scope containment (child tool and
+//! skill allowlists must be subsets of the parent's), budget and limit
+//! ceilings, and serial-mode concurrency clamps. Also builds the redacted
+//! [`DelegatedRunRecord`] snapshots that journal and console surfaces
+//! persist. No I/O happens here; callers in the tool runtime and gateway
+//! own persistence and execution.
+
 use palyra_common::redaction::{redact_auth_error, redact_url_segments_in_text};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -35,6 +45,7 @@ const fn default_max_budget_share_bps() -> u64 {
     DEFAULT_MAX_BUDGET_SHARE_BPS
 }
 
+/// Functional role a delegated child run plays for its parent.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DelegationRole {
@@ -45,6 +56,8 @@ pub enum DelegationRole {
     Triage,
 }
 
+/// Whether sibling children run one at a time or concurrently; serial mode
+/// clamps the runtime concurrency limits to one.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DelegationExecutionMode {
@@ -52,6 +65,8 @@ pub enum DelegationExecutionMode {
     Parallel,
 }
 
+/// Which memory a delegated child may read, from nothing up to the parent
+/// session plus the workspace.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DelegationMemoryScopeKind {
@@ -61,6 +76,7 @@ pub enum DelegationMemoryScopeKind {
     WorkspaceOnly,
 }
 
+/// How child outputs are folded back into the parent run.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DelegationMergeStrategy {
@@ -70,12 +86,16 @@ pub enum DelegationMergeStrategy {
     Triage,
 }
 
+/// Merge strategy plus whether the merge needs operator approval.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DelegationMergeContract {
     pub strategy: DelegationMergeStrategy,
     pub approval_required: bool,
 }
 
+/// Concurrency, fan-out, depth, budget-share, and timeout ceilings for one
+/// delegation; validated against the hard `MAX_DELEGATION_*` caps before a
+/// snapshot is produced.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DelegationRuntimeLimits {
     pub max_concurrent_children: u64,
@@ -107,6 +127,9 @@ impl Default for DelegationRuntimeLimits {
     }
 }
 
+/// Fully resolved, validated delegation contract for one child run; the
+/// output of [`resolve_delegation_request`] after catalog, template,
+/// manifest, and parent-context constraints are applied.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DelegationSnapshot {
     pub profile_id: String,
@@ -131,6 +154,7 @@ pub struct DelegationSnapshot {
     pub agent_id: Option<String>,
 }
 
+/// Lifecycle state of a delegated child run as observed by the parent.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DelegatedRunState {
@@ -148,6 +172,7 @@ pub enum DelegatedRunState {
 }
 
 impl DelegatedRunState {
+    /// Returns the canonical snake_case state name used in journal records.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -165,6 +190,11 @@ impl DelegatedRunState {
         }
     }
 
+    /// Maps a raw child runtime state string onto the delegated-run state
+    /// machine.
+    ///
+    /// Unknown strings map to `Failed` (fail-closed) so a child reporting a
+    /// state this build does not understand never looks healthy.
     #[must_use]
     pub fn from_child_state(value: &str) -> Self {
         match value {
@@ -184,6 +214,7 @@ impl DelegatedRunState {
     }
 }
 
+/// Progress of folding a child's output back into the parent run.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DelegationMergeStatus {
@@ -197,6 +228,7 @@ pub enum DelegationMergeStatus {
 }
 
 impl DelegationMergeStatus {
+    /// Returns the canonical snake_case status name used in journal records.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -211,6 +243,8 @@ impl DelegationMergeStatus {
     }
 }
 
+/// Reference handed to a child run (context, memory, or artifact) with the
+/// reason it was shared and its sensitivity label.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DelegatedRunReference {
     pub ref_id: String,
@@ -219,6 +253,8 @@ pub struct DelegatedRunReference {
 }
 
 impl DelegatedRunReference {
+    /// Returns a JSON projection with every field passed through the shared
+    /// redaction transforms, safe to journal or display.
     #[must_use]
     pub fn safe_snapshot_json(&self) -> Value {
         json!({
@@ -229,6 +265,8 @@ impl DelegatedRunReference {
     }
 }
 
+/// Everything a child run is allowed to touch: allowlists, memory scope,
+/// shared references, and the generated child prompt.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DelegatedRunScope {
     pub tool_allowlist: Vec<String>,
@@ -241,6 +279,8 @@ pub struct DelegatedRunScope {
 }
 
 impl DelegatedRunScope {
+    /// Returns a JSON projection with free-text fields redacted, safe to
+    /// journal or display.
     #[must_use]
     pub fn safe_snapshot_json(&self) -> Value {
         json!({
@@ -255,6 +295,8 @@ impl DelegatedRunScope {
     }
 }
 
+/// Flattened budget and limit ceilings recorded on a delegated run; derived
+/// from the snapshot's budget plus its runtime limits.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DelegatedRunBudgets {
     pub budget_tokens: u64,
@@ -284,6 +326,7 @@ impl From<&DelegationSnapshot> for DelegatedRunBudgets {
     }
 }
 
+/// One observed state transition on a delegated run's lifecycle tape.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DelegatedRunLifecycleEvent {
     pub event_type: String,
@@ -292,6 +335,8 @@ pub struct DelegatedRunLifecycleEvent {
     pub observed_at_unix_ms: i64,
 }
 
+/// Persisted record of one delegated child run: identity, redacted scope,
+/// budgets, state, merge status, and lifecycle events.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DelegatedRunRecord {
     pub schema_version: u32,
@@ -313,6 +358,8 @@ pub struct DelegatedRunRecord {
 }
 
 impl DelegatedRunRecord {
+    /// Returns the full record as JSON with free-text fields redacted, safe
+    /// to journal or display.
     #[must_use]
     pub fn safe_snapshot_json(&self) -> Value {
         json!({
@@ -333,6 +380,8 @@ impl DelegatedRunRecord {
         })
     }
 
+    /// Returns the compact "why does this child exist" view (reason, scope,
+    /// limits, state) used by explain surfaces.
     #[must_use]
     pub fn explain_json(&self) -> Value {
         json!({
@@ -353,6 +402,7 @@ impl DelegatedRunRecord {
     }
 }
 
+/// All delegated children of one parent run with active/terminal counts.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DelegatedRunGraphSnapshot {
     pub parent_run_id: String,
@@ -362,6 +412,8 @@ pub struct DelegatedRunGraphSnapshot {
 }
 
 impl DelegatedRunGraphSnapshot {
+    /// Returns the graph with each child rendered through
+    /// [`DelegatedRunRecord::explain_json`].
     #[must_use]
     pub fn explain_json(&self) -> Value {
         json!({
@@ -373,6 +425,9 @@ impl DelegatedRunGraphSnapshot {
     }
 }
 
+/// Assembles the child-run graph for `parent_run_id`, counting children in
+/// terminal states (merged/failed/cancelled/timed-out/rejected) as done and
+/// everything else as active.
 #[must_use]
 pub fn build_delegated_run_graph(
     parent_run_id: String,
@@ -399,6 +454,7 @@ const fn delegated_run_state_terminal(state: DelegatedRunState) -> bool {
     )
 }
 
+/// Parameters for [`build_delegated_run_record`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DelegatedRunRecordBuildRequest {
     pub parent_run_id: String,
@@ -414,6 +470,12 @@ pub struct DelegatedRunRecordBuildRequest {
     pub observed_at_unix_ms: i64,
 }
 
+/// Builds the initial persisted record for a delegated run, redacting
+/// free-text fields and seeding the lifecycle tape with the first event.
+///
+/// The run id is derived deterministically from the parent run and the
+/// child run (or task) id, so re-building for the same pair yields the
+/// same record identity.
 #[must_use]
 pub fn build_delegated_run_record(request: DelegatedRunRecordBuildRequest) -> DelegatedRunRecord {
     let delegated_run_id = stable_delegated_run_id(
@@ -444,6 +506,8 @@ pub fn build_delegated_run_record(request: DelegatedRunRecordBuildRequest) -> De
     }
 }
 
+/// Unvalidated reference input destined for a child scope; normalized and
+/// redacted by [`build_delegated_scope`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DelegatedReferenceInput {
     pub ref_id: String,
@@ -451,6 +515,7 @@ pub struct DelegatedReferenceInput {
     pub sensitivity: String,
 }
 
+/// Parameters for [`build_delegated_scope`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DelegatedScopeBuildRequest {
     pub objective: String,
@@ -462,6 +527,17 @@ pub struct DelegatedScopeBuildRequest {
     pub artifact_refs: Vec<DelegatedReferenceInput>,
 }
 
+/// Builds the validated, redacted scope handed to a child run.
+///
+/// Re-checks scope containment against the parent allowlists even though
+/// [`resolve_delegation_request`] already did, so a snapshot mutated
+/// between resolution and spawn cannot escalate.
+///
+/// # Errors
+/// Returns `Status::invalid_argument` for an empty objective, empty
+/// reference fields, or allowlist entries outside the parent's, and
+/// `Status::failed_precondition` when a child requests tools or skills
+/// while the parent allowlist is empty.
 pub fn build_delegated_scope(
     request: DelegatedScopeBuildRequest,
 ) -> Result<DelegatedRunScope, Status> {
@@ -495,6 +571,8 @@ pub fn build_delegated_scope(
     })
 }
 
+/// Validates, redacts, sorts, and dedups reference inputs; the stable order
+/// keeps record snapshots deterministic for replay comparison.
 fn normalize_refs(
     field: &str,
     values: Vec<DelegatedReferenceInput>,
@@ -529,6 +607,8 @@ fn normalize_refs(
     Ok(output)
 }
 
+/// Renders the fixed containment preamble handed to every child run; the
+/// wording is asserted by scope tests, so change both together.
 fn build_child_prompt(
     objective: &str,
     profile_id: &str,
@@ -545,13 +625,20 @@ fn stable_delegated_run_id(
     child_run_id: Option<&str>,
     task_id: Option<&str>,
 ) -> String {
+    // Deterministic over (parent, child-or-task) so the same delegation
+    // always resolves to one record id; "pending" covers runs recorded
+    // before a child id exists.
     format!("dr_{}_{}", parent_run_id, child_run_id.or(task_id).unwrap_or("pending"))
 }
 
+/// Applies the shared auth and URL redaction transforms to free text before
+/// it is persisted or displayed.
 fn safe_text(value: &str) -> String {
     redact_url_segments_in_text(&redact_auth_error(value))
 }
 
+/// One piece of evidence backing a merge result (message, tool call, or
+/// artifact excerpt) attributed to the child run that produced it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DelegationMergeProvenanceRecord {
     pub child_run_id: String,
@@ -563,6 +650,7 @@ pub struct DelegationMergeProvenanceRecord {
     pub requires_approval: bool,
 }
 
+/// Coarse classification of why a delegated merge failed.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DelegationMergeFailureCategory {
@@ -575,6 +663,7 @@ pub enum DelegationMergeFailureCategory {
     Unknown,
 }
 
+/// Aggregated token usage and timing of the child runs behind one merge.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DelegationMergeUsageSummary {
     pub prompt_tokens: u64,
@@ -588,6 +677,8 @@ pub struct DelegationMergeUsageSummary {
     pub duration_ms: Option<i64>,
 }
 
+/// Approval posture of one merge: whether approval is required and how the
+/// observed approval events resolved.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DelegationMergeApprovalSummary {
     pub approval_required: bool,
@@ -596,6 +687,7 @@ pub struct DelegationMergeApprovalSummary {
     pub approval_denied: bool,
 }
 
+/// Artifact produced by a child run and surfaced with the merge result.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DelegationMergeArtifactReference {
     pub artifact_id: String,
@@ -603,6 +695,8 @@ pub struct DelegationMergeArtifactReference {
     pub label: String,
 }
 
+/// Condensed view of one tool invocation a child run performed, kept for
+/// merge review.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DelegationToolTraceSummary {
     pub child_run_id: String,
@@ -614,6 +708,8 @@ pub struct DelegationToolTraceSummary {
     pub requires_approval: bool,
 }
 
+/// Outcome of merging child outputs: summary text, warnings, approval and
+/// usage posture, and the provenance trail backing the result.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DelegationMergeResult {
     pub status: String,
@@ -636,6 +732,8 @@ pub struct DelegationMergeResult {
     pub merged_at_unix_ms: Option<i64>,
 }
 
+/// Catalog entry describing a reusable delegation profile (role, scope,
+/// budgets, merge contract) that requests resolve against.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DelegationProfileDefinition {
     pub profile_id: String,
@@ -654,6 +752,8 @@ pub struct DelegationProfileDefinition {
     pub runtime_limits: DelegationRuntimeLimits,
 }
 
+/// Catalog entry bundling a primary profile with execution mode, merge
+/// strategy, and optional limit overrides for a named workflow pattern.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DelegationTemplateDefinition {
     pub template_id: String,
@@ -668,12 +768,16 @@ pub struct DelegationTemplateDefinition {
     pub examples: Vec<String>,
 }
 
+/// The set of delegation profiles and templates available to operators.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DelegationCatalog {
     pub profiles: Vec<DelegationProfileDefinition>,
     pub templates: Vec<DelegationTemplateDefinition>,
 }
 
+/// Raw operator delegation request: at most one of `profile_id` or
+/// `template_id`, plus optional execution-mode, group, and manifest
+/// overrides. Validated by [`resolve_delegation_request`].
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
 pub struct DelegationRequestInput {
     #[serde(default)]
@@ -688,6 +792,8 @@ pub struct DelegationRequestInput {
     pub manifest: Option<DelegationManifestInput>,
 }
 
+/// Per-request manifest overriding individual fields of the resolved
+/// profile; every override is re-validated against the hard caps.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
 pub struct DelegationManifestInput {
     #[serde(default)]
@@ -732,6 +838,8 @@ pub struct DelegationManifestInput {
     pub child_timeout_ms: Option<u64>,
 }
 
+/// The parent run's identity, allowlists, and budget ceiling; every child
+/// scope and budget is validated to stay within this envelope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DelegationParentContext {
     pub parent_run_id: Option<String>,
@@ -785,6 +893,10 @@ fn default_runtime_limits_for_execution_mode(
     limits
 }
 
+/// Returns the built-in profile and template catalog.
+///
+/// This is the only catalog source today; ids referenced by templates must
+/// resolve against the profiles defined here.
 pub fn built_in_delegation_catalog() -> DelegationCatalog {
     let profiles = vec![
         profile_definition(
@@ -1163,6 +1275,9 @@ fn validate_allowlist_subset(
     requested: &[String],
     parent_allowlist: &[String],
 ) -> Result<(), Status> {
+    // Deny-by-default: an empty parent allowlist means the parent itself has
+    // no grants, so any child entry would be an escalation -- it is never
+    // treated as "allow everything".
     if parent_allowlist.is_empty() {
         if requested.is_empty() {
             return Ok(());
@@ -1182,6 +1297,22 @@ fn validate_allowlist_subset(
     Ok(())
 }
 
+/// Resolves a raw delegation request into a validated
+/// [`DelegationSnapshot`].
+///
+/// Layering order: catalog profile (or the template's primary profile with
+/// template overrides), then manifest field overrides, then the request's
+/// execution mode. Serial mode clamps concurrency to one before the limits
+/// are validated; the child budget must fit both the parent's absolute
+/// budget and the configured budget share.
+///
+/// # Errors
+/// Returns `Status::invalid_argument` for conflicting profile/template
+/// ids, out-of-cap overrides, budget escalation, or allowlist entries
+/// outside the parent's; `Status::not_found` for unknown profile or
+/// template ids; `Status::failed_precondition` when the parent allowlist
+/// is empty but the child requests grants; and `Status::internal` for a
+/// template referencing a missing profile.
 pub fn resolve_delegation_request(
     request: &DelegationRequestInput,
     parent: &DelegationParentContext,
@@ -1294,6 +1425,8 @@ pub fn resolve_delegation_request(
                 "delegation budget_tokens exceeds the parent budget ceiling",
             ));
         }
+        // max(1) keeps tiny parent budgets from rounding the share down to
+        // zero, which would reject every child regardless of its budget.
         let allowed_share = parent_budget_tokens
             .saturating_mul(runtime_limits.max_budget_share_bps)
             .saturating_div(10_000)
