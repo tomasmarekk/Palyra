@@ -1,3 +1,9 @@
+//! gRPC, node RPC, and QUIC server bootstrap for `palyrad`.
+//!
+//! The bootstrap wires every tonic service with the same message-size limits
+//! and shared shutdown signal, then optionally starts the QUIC node transport
+//! from the same identity runtime.
+
 use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::{Context, Result};
@@ -22,7 +28,12 @@ use crate::{
     transport::grpc::auth::GatewayAuthConfig,
 };
 
-#[allow(clippy::too_many_arguments)]
+/// Starts the gateway gRPC server, node RPC server, and optional QUIC listener.
+///
+/// # Errors
+/// Returns an error when TLS setup, listener serving, QUIC binding, verifier
+/// construction, or any joined server task fails.
+#[expect(clippy::too_many_arguments, reason = "server bootstrap wires existing daemon runtimes")]
 pub(crate) async fn serve(
     loaded: &LoadedConfig,
     identity_runtime: &crate::IdentityRuntime,

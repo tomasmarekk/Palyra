@@ -1,3 +1,8 @@
+//! Canvas gRPC service implementation.
+//!
+//! This service owns signed canvas creation, state updates, and patch
+//! subscriptions for runtime-generated interactive canvas bundles.
+
 use std::sync::Arc;
 
 use palyra_common::CANONICAL_PROTOCOL_MAJOR;
@@ -18,6 +23,7 @@ use crate::{
     },
 };
 
+/// Tonic service adapter for canvas lifecycle and streaming operations.
 #[derive(Clone)]
 pub struct CanvasServiceImpl {
     state: Arc<GatewayRuntimeState>,
@@ -25,12 +31,12 @@ pub struct CanvasServiceImpl {
 }
 
 impl CanvasServiceImpl {
+    /// Creates a canvas service bound to shared gateway state and auth.
     #[must_use]
     pub fn new(state: Arc<GatewayRuntimeState>, auth: GatewayAuthConfig) -> Self {
         Self { state, auth }
     }
 
-    #[allow(clippy::result_large_err)]
     fn authorize_rpc(
         &self,
         metadata: &MetadataMap,

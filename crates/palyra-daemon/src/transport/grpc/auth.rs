@@ -1,44 +1,73 @@
+//! Authentication and request-context extraction for daemon gRPC services.
+//!
+//! Admin tokens authorize general gateway methods; the connector token is
+//! intentionally narrower and can only route messages for its bound channel.
+
 use axum::http::{header::AUTHORIZATION, HeaderMap};
 use palyra_common::validate_canonical_id;
 use serde::{Deserialize, Serialize};
 use tonic::metadata::MetadataMap;
 
+/// Metadata/header key carrying the authenticated runtime principal.
 pub const HEADER_PRINCIPAL: &str = "x-palyra-principal";
+/// Metadata/header key carrying the authenticated runtime device id.
 pub const HEADER_DEVICE_ID: &str = "x-palyra-device-id";
+/// Metadata/header key carrying the optional originating channel.
 pub const HEADER_CHANNEL: &str = "x-palyra-channel";
 
+/// gRPC and gateway HTTP authentication settings loaded from daemon config.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GatewayAuthConfig {
+    /// Whether bearer-token authentication is enforced.
     pub require_auth: bool,
+    /// Admin bearer token for privileged gateway calls.
     pub admin_token: Option<String>,
+    /// Connector bearer token for `RouteMessage` calls from channel adapters.
     pub connector_token: Option<String>,
+    /// Optional principal that the admin token is allowed to impersonate.
     pub bound_principal: Option<String>,
 }
 
+/// Runtime caller context extracted from authenticated request metadata.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RequestContext {
+    /// Principal used for authorization and journal attribution.
     pub principal: String,
+    /// Canonical device id used for runtime attribution.
     pub device_id: String,
+    /// Optional channel scope attached by channel adapters and console flows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel: Option<String>,
 }
 
+/// Authentication or metadata validation failure.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum AuthError {
+    /// Auth is required but no admin token is configured.
     #[error("admin auth token is required but no token is configured")]
     MissingConfiguredToken,
+    /// The bearer authorization header is missing or malformed.
     #[error("authorization header is missing or malformed")]
     InvalidAuthorizationHeader,
+    /// The supplied bearer token did not match an accepted token.
     #[error("authorization token is invalid")]
     InvalidToken,
+    /// Required request-context metadata was not present.
     #[error("request context field '{0}' is required")]
     MissingContext(&'static str),
+    /// Required request-context metadata was present but blank.
     #[error("request context field '{0}' cannot be empty")]
     EmptyContext(&'static str),
+    /// The device id metadata was not a canonical ULID.
     #[error("request context device_id must be a canonical ULID")]
     InvalidDeviceId,
 }
 
+/// Authorizes HTTP headers against the gateway admin token.
+///
+/// # Errors
+/// Returns an auth error when auth is required and the bearer token is missing,
+/// invalid, not configured, or bound to a different principal.
 pub fn authorize_headers(headers: &HeaderMap, auth: &GatewayAuthConfig) -> Result<(), AuthError> {
     if !auth.require_auth {
         return Ok(());
@@ -58,12 +87,22 @@ pub fn authorize_headers(headers: &HeaderMap, auth: &GatewayAuthConfig) -> Resul
     }
 }
 
+/// Extracts a validated request context from HTTP headers.
+///
+/// # Errors
+/// Returns an auth error when required context fields are missing, blank, or
+/// the device id is not canonical.
 pub fn request_context_from_headers(headers: &HeaderMap) -> Result<RequestContext, AuthError> {
     request_context_from_header_resolver(|name| {
         headers.get(name).and_then(|value| value.to_str().ok()).map(ToOwned::to_owned)
     })
 }
 
+/// Authorizes gRPC metadata and returns the validated request context.
+///
+/// # Errors
+/// Returns an auth error when bearer auth fails, when the connector token is
+/// used outside `RouteMessage`, or when required context metadata is invalid.
 pub(crate) fn authorize_metadata(
     metadata: &MetadataMap,
     auth: &GatewayAuthConfig,
@@ -196,6 +235,7 @@ fn extract_bearer_token(raw: Option<&str>) -> Option<&str> {
     Some(token)
 }
 
+/// Compares byte slices without content-dependent early return.
 pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     let max_len = left.len().max(right.len());
     let mut diff = left.len() ^ right.len();

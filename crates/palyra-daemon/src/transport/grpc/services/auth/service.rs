@@ -1,3 +1,8 @@
+//! Auth-profile gRPC service implementation.
+//!
+//! Registry calls are run through blocking workers where needed so the tonic
+//! async runtime stays responsive while preserving profile authorization gates.
+
 use std::sync::Arc;
 
 use palyra_common::CANONICAL_PROTOCOL_MAJOR;
@@ -22,6 +27,7 @@ use crate::{
     },
 };
 
+/// Tonic service adapter for auth profile and provider health operations.
 #[derive(Clone)]
 pub struct AuthServiceImpl {
     state: Arc<GatewayRuntimeState>,
@@ -30,6 +36,7 @@ pub struct AuthServiceImpl {
 }
 
 impl AuthServiceImpl {
+    /// Creates an auth service bound to gateway state, auth, and auth runtime.
     #[must_use]
     pub fn new(
         state: Arc<GatewayRuntimeState>,
@@ -39,7 +46,6 @@ impl AuthServiceImpl {
         Self { state, auth, auth_runtime }
     }
 
-    #[allow(clippy::result_large_err)]
     fn authorize_rpc(
         &self,
         metadata: &MetadataMap,

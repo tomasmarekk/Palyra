@@ -1,3 +1,8 @@
+//! Memory gRPC service implementation.
+//!
+//! The service validates memory scope at the protobuf boundary and delegates
+//! storage/search/purge operations to the runtime journal-backed memory layer.
+
 use std::sync::Arc;
 
 use palyra_common::{validate_canonical_id, CANONICAL_PROTOCOL_MAJOR};
@@ -24,6 +29,7 @@ use crate::{
     },
 };
 
+/// Tonic service adapter for memory ingest, search, get, and purge operations.
 #[derive(Clone)]
 pub struct MemoryServiceImpl {
     state: Arc<GatewayRuntimeState>,
@@ -31,12 +37,12 @@ pub struct MemoryServiceImpl {
 }
 
 impl MemoryServiceImpl {
+    /// Creates a memory service bound to shared gateway state and auth.
     #[must_use]
     pub fn new(state: Arc<GatewayRuntimeState>, auth: GatewayAuthConfig) -> Self {
         Self { state, auth }
     }
 
-    #[allow(clippy::result_large_err)]
     fn authorize_rpc(
         &self,
         metadata: &MetadataMap,

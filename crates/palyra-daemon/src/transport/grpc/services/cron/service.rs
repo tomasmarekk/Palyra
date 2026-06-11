@@ -1,3 +1,8 @@
+//! Cron gRPC service implementation.
+//!
+//! Methods validate schedule payloads at the transport boundary, enforce owner
+//! and authorization rules, then wake the scheduler when job state changes.
+
 use std::sync::Arc;
 
 use palyra_common::CANONICAL_PROTOCOL_MAJOR;
@@ -25,6 +30,7 @@ use crate::{
     },
 };
 
+/// Tonic service adapter for cron job and run operations.
 #[derive(Clone)]
 pub struct CronServiceImpl {
     state: Arc<GatewayRuntimeState>,
@@ -35,6 +41,7 @@ pub struct CronServiceImpl {
 }
 
 impl CronServiceImpl {
+    /// Creates a cron service bound to scheduler state and timezone policy.
     #[must_use]
     pub fn new(
         state: Arc<GatewayRuntimeState>,
@@ -46,7 +53,6 @@ impl CronServiceImpl {
         Self { state, auth, grpc_url, scheduler_wake, cron_timezone_mode }
     }
 
-    #[allow(clippy::result_large_err)]
     fn authorize_rpc(
         &self,
         metadata: &MetadataMap,

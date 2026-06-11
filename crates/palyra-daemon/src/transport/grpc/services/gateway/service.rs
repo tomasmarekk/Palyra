@@ -1,3 +1,9 @@
+//! Core gateway gRPC service implementation.
+//!
+//! This adapter is the daemon's primary protocol boundary: it validates
+//! protobuf messages, authorizes callers, routes channel input, and streams
+//! orchestrator run events without changing the runtime wire contract.
+
 use std::{
     sync::{atomic::Ordering, Arc},
     time::Duration,
@@ -63,6 +69,7 @@ use crate::{
 
 const RUN_STREAM_TRAILING_MESSAGE_GRACE: Duration = Duration::from_millis(10);
 
+/// Tonic service adapter for the main Palyra gateway protocol.
 #[derive(Clone)]
 pub struct GatewayServiceImpl {
     state: Arc<GatewayRuntimeState>,
@@ -102,6 +109,7 @@ fn command_route_response(
 }
 
 impl GatewayServiceImpl {
+    /// Creates a gateway service bound to runtime state, auth, and node state.
     #[must_use]
     pub fn new(
         state: Arc<GatewayRuntimeState>,
@@ -111,7 +119,6 @@ impl GatewayServiceImpl {
         Self { state, auth, node_runtime }
     }
 
-    #[allow(clippy::result_large_err)]
     fn authorize_rpc(
         &self,
         metadata: &MetadataMap,

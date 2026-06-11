@@ -1,3 +1,8 @@
+//! Vault gRPC service implementation.
+//!
+//! Vault calls enforce per-principal rate limits and scope access before any
+//! secret value is read, written, listed, or deleted.
+
 use std::sync::Arc;
 
 use palyra_common::CANONICAL_PROTOCOL_MAJOR;
@@ -17,6 +22,7 @@ use crate::{
     },
 };
 
+/// Tonic service adapter for scoped secret operations.
 #[derive(Clone)]
 pub struct VaultServiceImpl {
     state: Arc<GatewayRuntimeState>,
@@ -24,12 +30,12 @@ pub struct VaultServiceImpl {
 }
 
 impl VaultServiceImpl {
+    /// Creates a vault service bound to shared gateway state and auth.
     #[must_use]
     pub fn new(state: Arc<GatewayRuntimeState>, auth: GatewayAuthConfig) -> Self {
         Self { state, auth }
     }
 
-    #[allow(clippy::result_large_err)]
     fn authorize_rpc(
         &self,
         metadata: &MetadataMap,

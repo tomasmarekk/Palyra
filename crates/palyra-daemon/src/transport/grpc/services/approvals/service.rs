@@ -1,3 +1,8 @@
+//! Approvals gRPC service implementation.
+//!
+//! Methods authorize the caller before exposing approval records or streaming
+//! export chunks, preserving the audit chain semantics from the runtime layer.
+
 use std::sync::Arc;
 
 use serde_json::to_vec;
@@ -22,6 +27,7 @@ use crate::{
 };
 use palyra_common::CANONICAL_PROTOCOL_MAJOR;
 
+/// Tonic service adapter for approval record operations.
 #[derive(Clone)]
 pub struct ApprovalsServiceImpl {
     state: Arc<GatewayRuntimeState>,
@@ -29,12 +35,12 @@ pub struct ApprovalsServiceImpl {
 }
 
 impl ApprovalsServiceImpl {
+    /// Creates an approvals service bound to shared gateway state and auth.
     #[must_use]
     pub fn new(state: Arc<GatewayRuntimeState>, auth: GatewayAuthConfig) -> Self {
         Self { state, auth }
     }
 
-    #[allow(clippy::result_large_err)]
     fn authorize_rpc(
         &self,
         metadata: &MetadataMap,
