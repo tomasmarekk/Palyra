@@ -1,4 +1,7 @@
-Usage: palyra cron delete [OPTIONS] --id <ID>
+Usage: palyra cron delete [OPTIONS] [ID]
+
+Arguments:
+  [ID]  Command identifier; positional alternative to --id
 
 Options:
       --id <ID>

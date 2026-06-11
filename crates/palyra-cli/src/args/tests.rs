@@ -21,14 +21,15 @@ use super::{
     ObjectiveUpsertCommandArgs, ObjectivesCommand, OnboardingAuthMethodArg, OnboardingCommand,
     OnboardingFlowArg, PairingClientKindArg, PairingCommand, PairingMethodArg, PairingStateArg,
     PatchCommand, PluginsCommand, PolicyCommand, ProfileCommand, ProfileExportModeArg,
-    ProfileModeArg, ProfileRiskLevelArg, ProtocolCommand, RemoteVerificationModeArg, ResetCommand,
-    ResetScopeArg, RoutineApprovalModeArg, RoutineDeliveryModeArg, RoutineExecutionPostureArg,
-    RoutinePreviewTimezoneArg, RoutineRunModeArg, RoutineSilentPolicyArg, RoutineTriggerKindArg,
-    RoutineUpsertCommand, RoutinesCommand, SandboxCommand, SandboxRuntimeArg, SecretsCommand,
-    SecretsConfigureCommand, SecurityCommand, SessionsCommand, SetupWizardOverridesArg,
-    SkillsCommand, SkillsPackageCommand, SkillsProcedureCommand, SupportBundleCommand,
-    SystemCommand, SystemEventCommand, SystemEventSeverityArg, TuiCommand, UninstallCommand,
-    UpdateCommand, WebhooksCommand, WizardOverridesArg, WorkspaceRoleArg,
+    ProfileModeArg, ProfileRiskLevelArg, ProtocolCommand, RemoteVerificationModeArg,
+    RequiredCommandIdArg, ResetCommand, ResetScopeArg, RoutineApprovalModeArg,
+    RoutineDeliveryModeArg, RoutineExecutionPostureArg, RoutinePreviewTimezoneArg,
+    RoutineRunModeArg, RoutineSilentPolicyArg, RoutineTriggerKindArg, RoutineUpsertCommand,
+    RoutinesCommand, SandboxCommand, SandboxRuntimeArg, SecretsCommand, SecretsConfigureCommand,
+    SecurityCommand, SessionsCommand, SetupWizardOverridesArg, SkillsCommand, SkillsPackageCommand,
+    SkillsProcedureCommand, SupportBundleCommand, SystemCommand, SystemEventCommand,
+    SystemEventSeverityArg, TuiCommand, UninstallCommand, UpdateCommand, WebhooksCommand,
+    WizardOverridesArg, WorkspaceRoleArg,
 };
 
 mod parser_stability_plugin_tests;
@@ -1801,7 +1802,7 @@ fn parse_cron_update() {
         parsed.command,
         Command::Cron {
             command: CronCommand::Update {
-                id: "01ARZ3NDEKTSV4RRFFQ69G5FB0".to_owned(),
+                id: RequiredCommandIdArg::from_flag("01ARZ3NDEKTSV4RRFFQ69G5FB0"),
                 name: Some("Health summary v2".to_owned()),
                 prompt: None,
                 prompt_stdin: false,
@@ -1867,11 +1868,59 @@ fn parse_cron_delete() {
         parsed.command,
         Command::Cron {
             command: CronCommand::Delete {
-                id: "01ARZ3NDEKTSV4RRFFQ69G5FB0".to_owned(),
+                id: RequiredCommandIdArg::from_flag("01ARZ3NDEKTSV4RRFFQ69G5FB0"),
                 json: true,
             }
         }
     );
+}
+
+#[test]
+fn parse_id_commands_accept_positional_and_flag_forms() {
+    let cron = Cli::parse_from(["palyra", "cron", "show", "01ARZ3NDEKTSV4RRFFQ69G5FB0"]);
+    let Command::Cron { command: CronCommand::Show { id: cron_id, .. } } = cron.command else {
+        panic!("expected cron show command");
+    };
+    assert_eq!(cron_id, RequiredCommandIdArg::from_positional("01ARZ3NDEKTSV4RRFFQ69G5FB0"));
+    assert_eq!(cron_id.value(), "01ARZ3NDEKTSV4RRFFQ69G5FB0");
+
+    let routine = Cli::parse_from(["palyra", "routines", "run-now", "routine-a"]);
+    let Command::Routines { command: RoutinesCommand::RunNow { id: routine_id, .. } } =
+        routine.command
+    else {
+        panic!("expected routines run-now command");
+    };
+    assert_eq!(routine_id.value(), "routine-a");
+
+    let objective = Cli::parse_from(["palyra", "objectives", "show", "objective-a"]);
+    let Command::Objectives { command: ObjectivesCommand::Show { id: objective_id, .. } } =
+        objective.command
+    else {
+        panic!("expected objectives show command");
+    };
+    assert_eq!(objective_id.value(), "objective-a");
+
+    let objective_flag = Cli::parse_from(["palyra", "objectives", "show", "--id", "objective-a"]);
+    let Command::Objectives { command: ObjectivesCommand::Show { id: objective_flag_id, .. } } =
+        objective_flag.command
+    else {
+        panic!("expected objectives show command with --id");
+    };
+    assert_eq!(objective_flag_id.value(), "objective-a");
+}
+
+#[test]
+fn parse_id_commands_reject_duplicate_id_forms() {
+    let result = Cli::try_parse_from([
+        "palyra",
+        "cron",
+        "show",
+        "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+        "--id",
+        "01ARZ3NDEKTSV4RRFFQ69G5FB1",
+    ]);
+
+    assert!(result.is_err(), "positional ID and --id must be mutually exclusive");
 }
 
 #[test]
@@ -2055,7 +2104,7 @@ fn parse_routines_test_run() {
         parsed.command,
         Command::Routines {
             command: RoutinesCommand::TestRun {
-                id: "01ARZ3NDEKTSV4RRFFQ69G5FB0".to_owned(),
+                id: RequiredCommandIdArg::from_flag("01ARZ3NDEKTSV4RRFFQ69G5FB0"),
                 source_run_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FC0".to_owned()),
                 trigger_reason: Some("replay after failure".to_owned()),
                 trigger_payload: Some("{\"event\":\"push\"}".to_owned()),

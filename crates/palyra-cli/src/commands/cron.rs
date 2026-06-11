@@ -71,7 +71,7 @@ pub(crate) async fn run_cron_async(command: CronCommand) -> Result<()> {
             emit_cron_list(&payload, output::preferred_json(json))
         }
         CronCommand::Show { id, json } => {
-            let payload = get_routine_value(&context.client, id.as_str()).await?;
+            let payload = get_routine_value(&context.client, id.value()).await?;
             emit_cron_show(&payload, output::preferred_json(json))
         }
         CronCommand::Add {
@@ -150,6 +150,7 @@ pub(crate) async fn run_cron_async(command: CronCommand) -> Result<()> {
             approval_mode,
             json,
         } => {
+            let routine_id = id.value();
             let any_other_field = name.is_some()
                 || prompt.is_some()
                 || prompt_stdin
@@ -175,10 +176,10 @@ pub(crate) async fn run_cron_async(command: CronCommand) -> Result<()> {
                 let enabled =
                     enabled.expect("cron_update_only_changes_enabled guarantees enabled is set");
                 let response =
-                    set_routine_enabled_value(&context.client, id.as_str(), enabled).await?;
+                    set_routine_enabled_value(&context.client, routine_id, enabled).await?;
                 return emit_cron_mutation("cron.update", &response, output::preferred_json(json));
             }
-            let existing = get_routine_value(&context.client, id.as_str()).await?;
+            let existing = get_routine_value(&context.client, routine_id).await?;
             let routine = existing
                 .pointer("/routine")
                 .ok_or_else(|| anyhow!("routine response is missing the routine payload"))?;
@@ -241,21 +242,22 @@ pub(crate) async fn run_cron_async(command: CronCommand) -> Result<()> {
             emit_cron_mutation("cron.update", &response, output::preferred_json(json))
         }
         CronCommand::Enable { id, json } => {
-            let payload = set_routine_enabled_value(&context.client, id.as_str(), true).await?;
+            let payload = set_routine_enabled_value(&context.client, id.value(), true).await?;
             emit_cron_mutation("cron.enable", &payload, output::preferred_json(json))
         }
         CronCommand::Disable { id, json } => {
-            let payload = set_routine_enabled_value(&context.client, id.as_str(), false).await?;
+            let payload = set_routine_enabled_value(&context.client, id.value(), false).await?;
             emit_cron_mutation("cron.disable", &payload, output::preferred_json(json))
         }
         CronCommand::RunNow { id, json } => {
-            let payload = run_routine_now_value(&context.client, id.as_str()).await?;
+            let routine_id = id.value();
+            let payload = run_routine_now_value(&context.client, routine_id).await?;
             if output::preferred_json(json) {
                 output::print_json_pretty(&payload, "failed to encode cron run-now output as JSON")
             } else {
                 println!(
                     "cron.run_now id={} run_id={} status={} session_key={} message={}",
-                    id,
+                    routine_id,
                     json_optional_string_at(&payload, "/run_id").unwrap_or_default(),
                     json_optional_string_at(&payload, "/status")
                         .unwrap_or_else(|| "unknown".to_owned()),
@@ -266,23 +268,25 @@ pub(crate) async fn run_cron_async(command: CronCommand) -> Result<()> {
             }
         }
         CronCommand::Delete { id, json } => {
-            let payload = delete_routine_value(&context.client, id.as_str()).await?;
+            let routine_id = id.value();
+            let payload = delete_routine_value(&context.client, routine_id).await?;
             if output::preferred_json(json) {
                 output::print_json_pretty(&payload, "failed to encode cron delete output as JSON")
             } else {
                 println!(
                     "cron.delete id={} deleted={}",
-                    id,
+                    routine_id,
                     json_bool_at(&payload, "/deleted").unwrap_or(false)
                 );
                 std::io::stdout().flush().context("stdout flush failed")
             }
         }
         CronCommand::Logs { id, after, limit, json } => {
+            let routine_id = id.value();
             let payload =
-                list_routine_runs_value(&context.client, id.as_str(), after.as_deref(), limit)
+                list_routine_runs_value(&context.client, routine_id, after.as_deref(), limit)
                     .await?;
-            emit_cron_runs(id.as_str(), &payload, output::preferred_json(json))
+            emit_cron_runs(routine_id, &payload, output::preferred_json(json))
         }
     }
 }

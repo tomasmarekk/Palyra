@@ -9,6 +9,7 @@ use std::{fmt, str::FromStr};
 use clap::{ArgGroup, Args, Subcommand, ValueEnum};
 
 use super::cron::{CronConcurrencyPolicyArg, CronMisfirePolicyArg, CronScheduleTypeArg};
+use super::RequiredCommandIdArg;
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum RoutinesCommand {
@@ -45,8 +46,8 @@ pub enum RoutinesCommand {
         json: bool,
     },
     Show {
-        #[arg(long, value_name = "ULID", help = "Routine ULID")]
-        id: String,
+        #[command(flatten)]
+        id: RequiredCommandIdArg,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -87,27 +88,27 @@ pub enum RoutinesCommand {
         json: bool,
     },
     Enable {
-        #[arg(long, value_name = "ULID", help = "Routine ULID")]
-        id: String,
+        #[command(flatten)]
+        id: RequiredCommandIdArg,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
     Disable {
-        #[arg(long, value_name = "ULID", help = "Routine ULID")]
-        id: String,
+        #[command(flatten)]
+        id: RequiredCommandIdArg,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
     RunNow {
-        #[arg(long, value_name = "ULID", help = "Routine ULID")]
-        id: String,
+        #[command(flatten)]
+        id: RequiredCommandIdArg,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
     #[command(visible_alias = "replay")]
     TestRun {
-        #[arg(long, value_name = "ULID", help = "Routine ULID")]
-        id: String,
+        #[command(flatten)]
+        id: RequiredCommandIdArg,
         #[arg(long)]
         source_run_id: Option<String>,
         #[arg(long)]
@@ -121,8 +122,8 @@ pub enum RoutinesCommand {
     },
     #[command(visible_alias = "runs")]
     Logs {
-        #[arg(long, value_name = "ULID", help = "Routine ULID")]
-        id: String,
+        #[command(flatten)]
+        id: RequiredCommandIdArg,
         #[arg(long)]
         after: Option<String>,
         #[arg(long)]
@@ -131,8 +132,8 @@ pub enum RoutinesCommand {
         json: bool,
     },
     Dispatch {
-        #[arg(long, value_name = "ULID", help = "Routine ULID")]
-        id: String,
+        #[command(flatten)]
+        id: RequiredCommandIdArg,
         #[arg(long, value_enum)]
         trigger_kind: Option<RoutineTriggerKindArg>,
         #[arg(long)]
@@ -148,8 +149,8 @@ pub enum RoutinesCommand {
     },
     #[command(visible_alias = "rm")]
     Delete {
-        #[arg(long, value_name = "ULID", help = "Routine ULID")]
-        id: String,
+        #[command(flatten)]
+        id: RequiredCommandIdArg,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -165,8 +166,8 @@ pub enum RoutinesCommand {
         json: bool,
     },
     Export {
-        #[arg(long, value_name = "ULID", help = "Routine ULID")]
-        id: String,
+        #[command(flatten)]
+        id: RequiredCommandIdArg,
         #[arg(long, default_value_t = false)]
         json: bool,
     },

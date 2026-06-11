@@ -8,6 +8,7 @@ use clap::{ArgGroup, Subcommand, ValueEnum};
 use super::routines::{
     RoutineApprovalModeArg, RoutineExecutionPostureArg, RoutinePreviewTimezoneArg,
 };
+use super::RequiredCommandIdArg;
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum CronCommand {
@@ -40,8 +41,8 @@ pub enum CronCommand {
         json: bool,
     },
     Show {
-        #[arg(long)]
-        id: String,
+        #[command(flatten)]
+        id: RequiredCommandIdArg,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -126,8 +127,8 @@ pub enum CronCommand {
     },
     #[command(visible_alias = "edit")]
     Update {
-        #[arg(long)]
-        id: String,
+        #[command(flatten)]
+        id: RequiredCommandIdArg,
         #[arg(long)]
         name: Option<String>,
         #[arg(
@@ -187,34 +188,34 @@ pub enum CronCommand {
         json: bool,
     },
     Enable {
-        #[arg(long)]
-        id: String,
+        #[command(flatten)]
+        id: RequiredCommandIdArg,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
     Disable {
-        #[arg(long)]
-        id: String,
+        #[command(flatten)]
+        id: RequiredCommandIdArg,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
     RunNow {
-        #[arg(long)]
-        id: String,
+        #[command(flatten)]
+        id: RequiredCommandIdArg,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
     #[command(visible_alias = "rm")]
     Delete {
-        #[arg(long)]
-        id: String,
+        #[command(flatten)]
+        id: RequiredCommandIdArg,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
     #[command(visible_alias = "runs")]
     Logs {
-        #[arg(long)]
-        id: String,
+        #[command(flatten)]
+        id: RequiredCommandIdArg,
         #[arg(long)]
         after: Option<String>,
         #[arg(long)]

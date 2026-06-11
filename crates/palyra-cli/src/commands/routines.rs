@@ -84,7 +84,7 @@ pub(crate) async fn run_routines_async(command: RoutinesCommand) -> Result<()> {
             emit_routines_list(&payload, output::preferred_json(json))
         }
         RoutinesCommand::Show { id, json } => {
-            let payload = get_routine_value(&context.client, id.as_str()).await?;
+            let payload = get_routine_value(&context.client, id.value()).await?;
             emit_routine_envelope("routines.show", &payload, output::preferred_json(json))
         }
         RoutinesCommand::Upsert(args) => {
@@ -227,18 +227,19 @@ pub(crate) async fn run_routines_async(command: RoutinesCommand) -> Result<()> {
             )
         }
         RoutinesCommand::Enable { id, json } => {
-            let payload = set_routine_enabled_value(&context.client, id.as_str(), true).await?;
+            let payload = set_routine_enabled_value(&context.client, id.value(), true).await?;
             emit_routine_envelope("routines.enable", &payload, output::preferred_json(json))
         }
         RoutinesCommand::Disable { id, json } => {
-            let payload = set_routine_enabled_value(&context.client, id.as_str(), false).await?;
+            let payload = set_routine_enabled_value(&context.client, id.value(), false).await?;
             emit_routine_envelope("routines.disable", &payload, output::preferred_json(json))
         }
         RoutinesCommand::RunNow { id, json } => {
-            let payload = run_routine_now_value(&context.client, id.as_str()).await?;
+            let routine_id = id.value();
+            let payload = run_routine_now_value(&context.client, routine_id).await?;
             emit_routine_run_action(
                 "routines.run_now",
-                id.as_str(),
+                routine_id,
                 &payload,
                 output::preferred_json(json),
             )
@@ -251,6 +252,7 @@ pub(crate) async fn run_routines_async(command: RoutinesCommand) -> Result<()> {
             trigger_payload_stdin,
             json,
         } => {
+            let routine_id = id.value();
             let trigger_payload = read_optional_json_object(
                 "routine test-run payload",
                 trigger_payload,
@@ -258,7 +260,7 @@ pub(crate) async fn run_routines_async(command: RoutinesCommand) -> Result<()> {
             )?;
             let payload = test_run_routine_value(
                 &context.client,
-                id.as_str(),
+                routine_id,
                 source_run_id,
                 trigger_reason,
                 trigger_payload,
@@ -266,16 +268,17 @@ pub(crate) async fn run_routines_async(command: RoutinesCommand) -> Result<()> {
             .await?;
             emit_routine_run_action(
                 "routines.test_run",
-                id.as_str(),
+                routine_id,
                 &payload,
                 output::preferred_json(json),
             )
         }
         RoutinesCommand::Logs { id, after, limit, json } => {
+            let routine_id = id.value();
             let payload =
-                list_routine_runs_value(&context.client, id.as_str(), after.as_deref(), limit)
+                list_routine_runs_value(&context.client, routine_id, after.as_deref(), limit)
                     .await?;
-            emit_routine_runs(id.as_str(), &payload, output::preferred_json(json))
+            emit_routine_runs(routine_id, &payload, output::preferred_json(json))
         }
         RoutinesCommand::Dispatch {
             id,
@@ -286,6 +289,7 @@ pub(crate) async fn run_routines_async(command: RoutinesCommand) -> Result<()> {
             trigger_dedupe_key,
             json,
         } => {
+            let routine_id = id.value();
             let trigger_payload = read_optional_json_object(
                 "routine dispatch payload",
                 trigger_payload,
@@ -294,7 +298,7 @@ pub(crate) async fn run_routines_async(command: RoutinesCommand) -> Result<()> {
             .unwrap_or_else(|| Value::Object(Map::new()));
             let payload = dispatch_routine_value(
                 &context.client,
-                id.as_str(),
+                routine_id,
                 trigger_kind.map(RoutineTriggerKindArg::as_str),
                 trigger_reason,
                 trigger_payload,
@@ -303,13 +307,14 @@ pub(crate) async fn run_routines_async(command: RoutinesCommand) -> Result<()> {
             .await?;
             emit_routine_run_action(
                 "routines.dispatch",
-                id.as_str(),
+                routine_id,
                 &payload,
                 output::preferred_json(json),
             )
         }
         RoutinesCommand::Delete { id, json } => {
-            let payload = delete_routine_value(&context.client, id.as_str()).await?;
+            let routine_id = id.value();
+            let payload = delete_routine_value(&context.client, routine_id).await?;
             if output::preferred_json(json) {
                 output::print_json_pretty(
                     &payload,
@@ -318,7 +323,7 @@ pub(crate) async fn run_routines_async(command: RoutinesCommand) -> Result<()> {
             } else {
                 println!(
                     "routines.delete id={} deleted={}",
-                    id,
+                    routine_id,
                     json_bool_at(&payload, "/deleted").unwrap_or(false)
                 );
                 std::io::stdout().flush().context("stdout flush failed")
@@ -335,7 +340,7 @@ pub(crate) async fn run_routines_async(command: RoutinesCommand) -> Result<()> {
             emit_routine_schedule_preview(&payload, output::preferred_json(json))
         }
         RoutinesCommand::Export { id, json: _ } => {
-            let payload = export_routine_value(&context.client, id.as_str()).await?;
+            let payload = export_routine_value(&context.client, id.value()).await?;
             let export = payload.pointer("/export").cloned().unwrap_or(payload);
             output::print_json_pretty(&export, "failed to encode routine export bundle as JSON")
         }

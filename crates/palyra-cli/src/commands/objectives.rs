@@ -48,11 +48,11 @@ pub(crate) async fn run_objectives_async(command: ObjectivesCommand) -> Result<(
             emit_objectives_list(&payload, output::preferred_json(json))
         }
         ObjectivesCommand::Show { id, json } => {
-            let payload = get_objective_value(&context.client, id.as_str()).await?;
+            let payload = get_objective_value(&context.client, id.value()).await?;
             emit_objective_envelope("objectives.show", &payload, output::preferred_json(json))
         }
         ObjectivesCommand::Summary { id, json } => {
-            let payload = get_objective_summary_value(&context.client, id.as_str()).await?;
+            let payload = get_objective_summary_value(&context.client, id.value()).await?;
             if output::preferred_json(json) {
                 output::print_json_pretty(&payload, "failed to encode objective summary as JSON")
             } else {
@@ -135,27 +135,27 @@ pub(crate) async fn run_objectives_async(command: ObjectivesCommand) -> Result<(
         }
         ObjectivesCommand::Fire { id, reason, json } => {
             let payload =
-                objective_lifecycle_value(&context.client, id.as_str(), "fire", reason).await?;
+                objective_lifecycle_value(&context.client, id.value(), "fire", reason).await?;
             emit_objective_envelope("objectives.fire", &payload, output::preferred_json(json))
         }
         ObjectivesCommand::Pause { id, reason, json } => {
             let payload =
-                objective_lifecycle_value(&context.client, id.as_str(), "pause", reason).await?;
+                objective_lifecycle_value(&context.client, id.value(), "pause", reason).await?;
             emit_objective_envelope("objectives.pause", &payload, output::preferred_json(json))
         }
         ObjectivesCommand::Resume { id, reason, json } => {
             let payload =
-                objective_lifecycle_value(&context.client, id.as_str(), "resume", reason).await?;
+                objective_lifecycle_value(&context.client, id.value(), "resume", reason).await?;
             emit_objective_envelope("objectives.resume", &payload, output::preferred_json(json))
         }
         ObjectivesCommand::Cancel { id, reason, json } => {
             let payload =
-                objective_lifecycle_value(&context.client, id.as_str(), "cancel", reason).await?;
+                objective_lifecycle_value(&context.client, id.value(), "cancel", reason).await?;
             emit_objective_envelope("objectives.cancel", &payload, output::preferred_json(json))
         }
         ObjectivesCommand::Archive { id, reason, json } => {
             let payload =
-                objective_lifecycle_value(&context.client, id.as_str(), "archive", reason).await?;
+                objective_lifecycle_value(&context.client, id.value(), "archive", reason).await?;
             emit_objective_envelope("objectives.archive", &payload, output::preferred_json(json))
         }
     }

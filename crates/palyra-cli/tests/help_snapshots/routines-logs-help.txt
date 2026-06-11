@@ -1,7 +1,10 @@
-Usage: palyra routines logs [OPTIONS] --id <ULID>
+Usage: palyra routines logs [OPTIONS] [ID]
+
+Arguments:
+  [ID]  Command identifier; positional alternative to --id
 
 Options:
-      --id <ULID>      Routine ULID
+      --id <ID>
       --after <AFTER>
       --limit <LIMIT>
       --json

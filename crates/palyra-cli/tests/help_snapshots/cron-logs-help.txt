@@ -1,4 +1,7 @@
-Usage: palyra cron logs [OPTIONS] --id <ID>
+Usage: palyra cron logs [OPTIONS] [ID]
+
+Arguments:
+  [ID]  Command identifier; positional alternative to --id
 
 Options:
       --id <ID>

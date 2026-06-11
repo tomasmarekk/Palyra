@@ -9,6 +9,7 @@ use super::routines::{
     RoutineApprovalModeArg, RoutineDeliveryModeArg, RoutineExecutionPostureArg,
     RoutinePreviewTimezoneArg,
 };
+use super::RequiredCommandIdArg;
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum ObjectivesCommand {
@@ -37,54 +38,54 @@ pub enum ObjectivesCommand {
         json: bool,
     },
     Show {
-        #[arg(long, value_name = "ULID", help = "Objective ULID")]
-        id: String,
+        #[command(flatten)]
+        id: RequiredCommandIdArg,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
     Summary {
-        #[arg(long, value_name = "ULID", help = "Objective ULID")]
-        id: String,
+        #[command(flatten)]
+        id: RequiredCommandIdArg,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
     #[command(visible_alias = "apply")]
     Upsert(Box<ObjectiveUpsertCommandArgs>),
     Fire {
-        #[arg(long, value_name = "ULID", help = "Objective ULID")]
-        id: String,
+        #[command(flatten)]
+        id: RequiredCommandIdArg,
         #[arg(long)]
         reason: Option<String>,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
     Pause {
-        #[arg(long, value_name = "ULID", help = "Objective ULID")]
-        id: String,
+        #[command(flatten)]
+        id: RequiredCommandIdArg,
         #[arg(long)]
         reason: Option<String>,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
     Resume {
-        #[arg(long, value_name = "ULID", help = "Objective ULID")]
-        id: String,
+        #[command(flatten)]
+        id: RequiredCommandIdArg,
         #[arg(long)]
         reason: Option<String>,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
     Cancel {
-        #[arg(long, value_name = "ULID", help = "Objective ULID")]
-        id: String,
+        #[command(flatten)]
+        id: RequiredCommandIdArg,
         #[arg(long)]
         reason: Option<String>,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
     Archive {
-        #[arg(long, value_name = "ULID", help = "Objective ULID")]
-        id: String,
+        #[command(flatten)]
+        id: RequiredCommandIdArg,
         #[arg(long)]
         reason: Option<String>,
         #[arg(long, default_value_t = false)]

@@ -1,4 +1,7 @@
-Usage: palyra cron update [OPTIONS] --id <ID>
+Usage: palyra cron update [OPTIONS] [ID]
+
+Arguments:
+  [ID]  Command identifier; positional alternative to --id
 
 Options:
       --id <ID>
