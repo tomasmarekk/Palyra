@@ -443,8 +443,8 @@ impl RootCommandContext {
         })
     }
 
-    /// Resolves a daemon HTTP connection from overrides, profile, config,
-    /// environment, and defaults, in that precedence order.
+    /// Resolves a daemon HTTP connection from overrides, environment,
+    /// profile, config, and defaults, in that precedence order.
     ///
     /// # Errors
     /// Currently infallible in practice; kept fallible to mirror
@@ -503,6 +503,13 @@ impl RootCommandContext {
                 source: ConnectionEndpointSource::Explicit,
             });
         }
+        let connection_env = ConnectionEnvironment::read(self.profile.as_ref());
+        if let Some(url) = connection_env.daemon_url.as_deref() {
+            return Ok(ResolvedConnectionEndpoint {
+                url: url.to_owned(),
+                source: ConnectionEndpointSource::Environment,
+            });
+        }
         if let Some(url) = self
             .profile
             .as_ref()
@@ -517,13 +524,6 @@ impl RootCommandContext {
             return Ok(ResolvedConnectionEndpoint {
                 url: url.to_owned(),
                 source: ConnectionEndpointSource::Config,
-            });
-        }
-        let connection_env = ConnectionEnvironment::read(self.profile.as_ref());
-        if let Some(url) = connection_env.daemon_url.as_deref() {
-            return Ok(ResolvedConnectionEndpoint {
-                url: url.to_owned(),
-                source: ConnectionEndpointSource::Environment,
             });
         }
         Ok(ResolvedConnectionEndpoint {
@@ -542,6 +542,13 @@ impl RootCommandContext {
                 source: ConnectionEndpointSource::Explicit,
             });
         }
+        let connection_env = ConnectionEnvironment::read(self.profile.as_ref());
+        if let Some(url) = connection_env.grpc_url.as_deref() {
+            return Ok(ResolvedConnectionEndpoint {
+                url: url.to_owned(),
+                source: ConnectionEndpointSource::Environment,
+            });
+        }
         if let Some(url) = self
             .profile
             .as_ref()
@@ -556,13 +563,6 @@ impl RootCommandContext {
             return Ok(ResolvedConnectionEndpoint {
                 url: url.to_owned(),
                 source: ConnectionEndpointSource::Config,
-            });
-        }
-        let connection_env = ConnectionEnvironment::read(self.profile.as_ref());
-        if let Some(url) = connection_env.grpc_url.as_deref() {
-            return Ok(ResolvedConnectionEndpoint {
-                url: url.to_owned(),
-                source: ConnectionEndpointSource::Environment,
             });
         }
         let socket = parse_daemon_bind_socket(
@@ -1668,6 +1668,63 @@ channel = "staging"
         assert_eq!(http.principal, "admin:staging");
         assert_eq!(grpc.device_id, "01ARZ3NDEKTSV4RRFFQ69G5FB2");
         assert_eq!(grpc.channel, "staging");
+        Ok(())
+    }
+
+    #[test]
+    fn environment_endpoints_override_profile_and_config_defaults() -> Result<()> {
+        let _guard = super::test_env_lock_for_tests().lock().expect("env lock");
+        clear_env();
+        let temp = tempdir()?;
+        let profile_path = temp.path().join("profiles.toml");
+        let config_path = temp.path().join("profile-config").join("palyra.toml");
+        let config_path_literal = config_path.display().to_string().replace('\\', "\\\\");
+        fs::create_dir_all(config_path.parent().expect("profile config parent"))?;
+        fs::write(
+            &config_path,
+            r#"
+[daemon]
+bind_addr = "127.0.0.1"
+port = 7142
+
+[gateway]
+grpc_bind_addr = "127.0.0.1"
+grpc_port = 50051
+
+[admin]
+auth_token = "config-token"
+"#,
+        )?;
+        fs::write(
+            &profile_path,
+            format!(
+                r#"
+version = 1
+default_profile = "ops"
+[profiles.ops]
+config_path = "{}"
+daemon_url = "http://127.0.0.1:8100"
+grpc_url = "http://127.0.0.1:8101"
+admin_token = "profile-token"
+"#,
+                config_path_literal
+            ),
+        )?;
+        env::set_var(CLI_PROFILES_PATH_ENV, &profile_path);
+        env::set_var("PALYRA_DAEMON_URL", "http://127.0.0.1:9999");
+        env::set_var("PALYRA_GATEWAY_GRPC_URL", "http://127.0.0.1:9998");
+
+        let context =
+            build_root_context(RootOptions::default(), ExplicitConfigPathPolicy::RequireExisting)?;
+        let http = context
+            .resolve_http_connection(ConnectionOverrides::default(), ConnectionDefaults::ADMIN)?;
+        let grpc = context
+            .resolve_grpc_connection(ConnectionOverrides::default(), ConnectionDefaults::ADMIN)?;
+
+        assert_eq!(http.base_url, "http://127.0.0.1:9999");
+        assert_eq!(grpc.grpc_url, "http://127.0.0.1:9998");
+        assert_eq!(http.token, None);
+        assert_eq!(grpc.token, None);
         Ok(())
     }
 
