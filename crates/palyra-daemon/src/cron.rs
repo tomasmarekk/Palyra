@@ -2932,10 +2932,8 @@ fn build_effective_cron_execution_request(
         .model_profile_override
         .clone()
         .or_else(|| execution.and_then(|config| config.provider_profile_id.clone()));
-    let parameter_delta_json = options
-        .parameter_delta_json
-        .clone()
-        .or_else(|| routine.as_ref().map(|record| routine_parameter_delta_json(record, job)));
+    let parameter_delta_json =
+        merged_parameter_delta_json(routine.as_ref(), job, options.parameter_delta_json.as_deref());
     let session_key = effective_cron_session_key(job, run_id, run_mode);
     let session_label = effective_cron_session_label(job, options, run_mode);
     Ok(EffectiveCronExecutionRequest {
@@ -2982,6 +2980,49 @@ fn routine_parameter_delta_json(record: &RoutineMetadataRecord, job: &CronJobRec
         parameter_delta["cli_context"] = Value::Object(cli_context);
     }
     parameter_delta.to_string()
+}
+
+fn merged_parameter_delta_json(
+    routine: Option<&RoutineMetadataRecord>,
+    job: &CronJobRecord,
+    options_parameter_delta_json: Option<&str>,
+) -> Option<String> {
+    let Some(routine_delta_json) = routine.map(|record| routine_parameter_delta_json(record, job))
+    else {
+        return options_parameter_delta_json.map(str::to_owned);
+    };
+    let Some(options_delta_json) = options_parameter_delta_json else {
+        return Some(routine_delta_json);
+    };
+    Some(
+        merge_parameter_delta_json(routine_delta_json.as_str(), options_delta_json)
+            .unwrap_or_else(|| options_delta_json.to_owned()),
+    )
+}
+
+fn merge_parameter_delta_json(base_json: &str, overlay_json: &str) -> Option<String> {
+    let mut base = serde_json::from_str::<Value>(base_json).ok()?;
+    let overlay = serde_json::from_str::<Value>(overlay_json).ok()?;
+    merge_parameter_delta_value(&mut base, overlay);
+    Some(base.to_string())
+}
+
+fn merge_parameter_delta_value(base: &mut Value, overlay: Value) {
+    match (base, overlay) {
+        (Value::Object(base), Value::Object(overlay)) => {
+            for (key, value) in overlay {
+                match base.get_mut(&key) {
+                    Some(existing) => merge_parameter_delta_value(existing, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, overlay) => {
+            *base = overlay;
+        }
+    }
 }
 
 fn push_unique_cli_context_workspace_root(roots: &mut Vec<Value>, root: &str) {
@@ -3716,12 +3757,12 @@ mod tests {
         cron_completion_candidate_for_tool_proposal, cron_job_requires_completion_tool,
         cron_misfire_audit_payload, cron_terminal_status_from_stream, decide_concurrency_policy,
         effective_cron_session_key, effective_cron_session_label,
-        load_periodic_reaudit_skills_index, max_runs_for_job, normalize_schedule,
-        now_unix_ms_or_fallback, parse_skill_reaudit_interval, periodic_reaudit_targets,
-        reserved_cron_run_slot_count, routine_approval_subject_id, routine_parameter_delta_json,
-        routines_automation_enabled, scheduled_routine_requires_first_run_approval,
-        scheduled_routine_run_metadata_upsert, scheduler_attempt_failure,
-        should_disable_exhausted_scheduled_one_shot,
+        load_periodic_reaudit_skills_index, max_runs_for_job, merged_parameter_delta_json,
+        normalize_schedule, now_unix_ms_or_fallback, parse_skill_reaudit_interval,
+        periodic_reaudit_targets, reserved_cron_run_slot_count, routine_approval_subject_id,
+        routine_parameter_delta_json, routines_automation_enabled,
+        scheduled_routine_requires_first_run_approval, scheduled_routine_run_metadata_upsert,
+        scheduler_attempt_failure, should_disable_exhausted_scheduled_one_shot,
         should_pause_recurring_cron_after_policy_denied, should_repair_stale_cron_run,
         visible_cron_job_enabled, ConcurrencyDecision, CronMatcher, CronMisfireRecoveryAction,
         CronTimezoneMode, InstalledSkillRecord, InstalledSkillsIndex, SchedulerHealthInput,
@@ -4151,6 +4192,69 @@ mod tests {
         assert_eq!(roots.len(), 2);
         assert_eq!(roots[0].as_str(), Some(workdir.to_string_lossy().as_ref()));
         assert_eq!(roots[1].as_str(), Some(watched_dir.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn routine_parameter_delta_options_preserve_workspace_binding() {
+        let temp = tempdir().expect("tempdir should be created");
+        let workdir = temp.path().join("workspace");
+        let watched_dir = temp.path().join("os-root").join("inbox");
+        fs::create_dir_all(workdir.as_path()).expect("workdir should exist");
+        fs::create_dir_all(watched_dir.as_path()).expect("watched directory should exist");
+        let watched_file = watched_dir.join("status.txt");
+        fs::write(watched_file.as_path(), "READY\n").expect("watched file should exist");
+
+        let mut job =
+            sample_every_job("01ARZ3NDEKTSV4RRFFQ69G5FAV", Some(1_000), CronMisfirePolicy::Skip);
+        job.workdir = Some(workdir.to_string_lossy().into_owned());
+        let mut routine = sample_routine_metadata(job.job_id.as_str());
+        routine.trigger_kind = RoutineTriggerKind::FileWatch;
+        routine.trigger_payload_json = json!({
+            "path": watched_file.to_string_lossy(),
+            "resolved_path": watched_file.to_string_lossy(),
+            "poll_interval_ms": 30_000_u64,
+            "fire_on_start": false
+        })
+        .to_string();
+        let options_delta = json!({
+            "routine": {
+                "run_mode": "fresh_session",
+                "execution_posture": "sensitive_tools",
+            },
+            "dispatch_mode": "normal",
+            "source_run_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        })
+        .to_string();
+
+        let value: serde_json::Value = serde_json::from_str(
+            merged_parameter_delta_json(Some(&routine), &job, Some(options_delta.as_str()))
+                .expect("merged parameter delta should exist")
+                .as_str(),
+        )
+        .expect("merged parameter delta should parse");
+        let roots = value
+            .pointer("/cli_context/workspace_roots")
+            .and_then(serde_json::Value::as_array)
+            .expect("workspace roots should be preserved");
+
+        assert_eq!(
+            value.pointer("/cli_context/launch_cwd").and_then(serde_json::Value::as_str),
+            Some(workdir.to_string_lossy().as_ref())
+        );
+        assert_eq!(roots[0].as_str(), Some(workdir.to_string_lossy().as_ref()));
+        assert_eq!(roots[1].as_str(), Some(watched_dir.to_string_lossy().as_ref()));
+        assert_eq!(
+            value.pointer("/routine/routine_id").and_then(serde_json::Value::as_str),
+            Some("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+        );
+        assert_eq!(
+            value.pointer("/routine/run_mode").and_then(serde_json::Value::as_str),
+            Some("fresh_session")
+        );
+        assert_eq!(
+            value.pointer("/dispatch_mode").and_then(serde_json::Value::as_str),
+            Some("normal")
+        );
     }
 
     #[test]
