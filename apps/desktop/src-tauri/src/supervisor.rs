@@ -330,6 +330,24 @@ impl DesktopConfigReloadWatchState {
             ConfigReloadWatchOutcome::Idle
         }
     }
+
+    fn record_supervisor_write(&mut self, path: &Path) {
+        if self.path.as_deref() != Some(path) {
+            return;
+        }
+        match config_file_signature(path) {
+            Ok(signature) => {
+                self.last_error = None;
+                self.observed_once = true;
+                self.last_signature = Some(signature);
+            }
+            Err(error) => {
+                self.last_error = Some(sanitize_log_line(error.to_string().as_str()));
+                self.observed_once = true;
+                self.last_signature = None;
+            }
+        }
+    }
 }
 
 fn desktop_config_reload_mode_from_env() -> DesktopConfigReloadMode {
@@ -1342,15 +1360,15 @@ impl ControlCenter {
         }
     }
 
-    fn persist_runtime_port_selection(&self, kind: ServiceKind) -> Result<()> {
-        let Some(config_path) = self.active_profile.config_path.as_deref() else {
+    fn persist_runtime_port_selection(&mut self, kind: ServiceKind) -> Result<()> {
+        let Some(config_path) = self.active_profile.config_path.clone() else {
             return Ok(());
         };
         if !config_path.is_file() {
             return Ok(());
         }
 
-        let raw = fs::read_to_string(config_path)
+        let raw = fs::read_to_string(config_path.as_path())
             .with_context(|| format!("failed to read daemon config {}", config_path.display()))?;
         let mut document: toml::Value = toml::from_str(raw.as_str())
             .with_context(|| format!("failed to parse daemon config {}", config_path.display()))?;
@@ -1402,8 +1420,10 @@ impl ControlCenter {
         }
         let rendered =
             toml::to_string_pretty(&document).context("failed to serialize daemon config")?;
-        fs::write(config_path, rendered)
-            .with_context(|| format!("failed to persist daemon config {}", config_path.display()))
+        fs::write(config_path.as_path(), rendered)
+            .with_context(|| format!("failed to persist daemon config {}", config_path.display()))?;
+        self.config_reload_watch.record_supervisor_write(config_path.as_path());
+        Ok(())
     }
 
     fn spawn_service(&mut self, kind: ServiceKind) -> Result<()> {
@@ -2303,6 +2323,39 @@ bound_principal = "admin:local"
         let mut watch = DesktopConfigReloadWatchState::from_profile(&profile);
 
         assert!(matches!(watch.observe(), ConfigReloadWatchOutcome::Idle));
+        let _ = fs::remove_dir_all(fixture.as_path());
+    }
+
+    #[test]
+    fn config_reload_watch_ignores_supervisor_owned_config_write() {
+        let fixture =
+            env::temp_dir().join(format!("palyra-desktop-config-watch-test-{}", ulid::Ulid::new()));
+        fs::create_dir_all(fixture.as_path()).expect("fixture dir should be created");
+        let config_path = fixture.join("palyra.toml");
+        fs::write(config_path.as_path(), "version = 1\n")
+            .expect("config fixture should be written");
+        let mut profile = implicit_profile("desktop-local");
+        profile.config_path = Some(config_path.clone());
+        let mut watch = DesktopConfigReloadWatchState::from_profile(&profile);
+
+        assert!(matches!(watch.observe(), ConfigReloadWatchOutcome::Idle));
+
+        fs::write(config_path.as_path(), "version = 1\n[daemon]\nport = 7350\n")
+            .expect("supervisor-owned port persistence should be written");
+        watch.record_supervisor_write(config_path.as_path());
+
+        assert!(
+            matches!(watch.observe(), ConfigReloadWatchOutcome::Idle),
+            "supervisor-owned config writes must not trigger a full supervised-runtime restart"
+        );
+
+        fs::write(config_path.as_path(), "version = 1\n[daemon]\nport = 7350\n[memory]\n")
+            .expect("external config edit should be written");
+
+        match watch.observe() {
+            ConfigReloadWatchOutcome::Changed { path } => assert_eq!(path, config_path),
+            ConfigReloadWatchOutcome::Idle => panic!("external config edit should trigger reload"),
+        }
         let _ = fs::remove_dir_all(fixture.as_path());
     }
 }
