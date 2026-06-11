@@ -1,3 +1,10 @@
+//! `palyra memory` command handlers.
+//!
+//! User-scoped item operations (search/get/ingest/replace/delete/purge) go over the
+//! gateway gRPC memory service; admin operations (status, indexing, workspace docs,
+//! recall previews, learning) go over the `/console/v1/memory/*` admin HTTP surface.
+//! All plain-text output is pinned by CLI parity tests.
+
 use crate::args::MemoryWorkspaceCommand;
 use crate::commands::memory_external_index::{
     emit_memory_index_drift, emit_memory_index_reconcile, memory_external_index_payload,
@@ -5,16 +12,22 @@ use crate::commands::memory_external_index::{
 };
 use crate::*;
 
+// Pinned claim-boundary strings tell the calling agent exactly what a durable memory
+// search result does and does not prove (it never covers session transcripts).
 const MEMORY_SEARCH_HITS_PRESENT_CLAIM_BOUNDARY: &str =
     "durable memory hits were returned; cite them as stored memory evidence";
 const MEMORY_SEARCH_HITS_ABSENT_CLAIM_BOUNDARY: &str =
     "no durable memory hits were returned by this memory search; this does not search prior session transcripts; use memory search-all or memory session-search for transcript recall";
 
+/// Derives the project workspace-memory prefix from the current directory, if possible.
 fn cli_inferred_workspace_memory_prefix() -> Option<String> {
     let current_dir = std::env::current_dir().ok()?;
     cli_project_memory_prefix_from_workspace_root(current_dir.as_path())
 }
 
+/// Builds the `projects/project-<slug>-<hash>` prefix that scopes workspace memory to
+/// one workspace root; the hash pins the root identity so equally named directories in
+/// different locations do not share memory.
 fn cli_project_memory_prefix_from_workspace_root(root: &std::path::Path) -> Option<String> {
     let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let name = cli_last_normal_path_segment(canonical.as_path())?;
@@ -61,6 +74,8 @@ fn cli_project_memory_slug(name: &str) -> String {
 
 fn cli_project_memory_root_fingerprint(root: &std::path::Path) -> String {
     let normalized = root.to_string_lossy().replace('\\', "/").trim_end_matches('/').to_owned();
+    // Windows paths are case-insensitive; lowercase before hashing so the same root
+    // yields the same memory prefix regardless of how the path was typed.
     #[cfg(windows)]
     {
         normalized.to_ascii_lowercase()
@@ -71,6 +86,12 @@ fn cli_project_memory_root_fingerprint(root: &std::path::Path) -> String {
     }
 }
 
+/// Entry point for `palyra memory`, dispatching admin commands to the console API and
+/// user-scoped item commands to the gateway gRPC memory service.
+///
+/// # Errors
+/// Returns an error when the CLI root context is missing, connections cannot be
+/// resolved, or the dispatched subcommand fails.
 pub(crate) fn run_memory(command: MemoryCommand) -> Result<()> {
     let root_context = app::current_root_context()
         .ok_or_else(|| anyhow!("CLI root context is unavailable for memory command"))?;
@@ -96,6 +117,8 @@ pub(crate) fn run_memory(command: MemoryCommand) -> Result<()> {
     }
 }
 
+/// Minimal RPC surface needed by [`replace_memory_item`]; exists as a trait so tests
+/// can exercise the replace ordering contract without a live gateway.
 #[async_trait::async_trait]
 trait MemoryReplaceRpc {
     async fn get_memory_item(
@@ -143,6 +166,8 @@ impl MemoryReplaceRpc for GrpcMemoryReplaceRpc<'_> {
     }
 }
 
+/// Inputs for a memory replace; `None`/empty optional fields inherit the existing
+/// item's values.
 #[derive(Debug)]
 struct MemoryReplaceOptions {
     memory_id: String,
@@ -160,6 +185,15 @@ struct MemoryReplaceOutcome {
     deleted_original: bool,
 }
 
+/// Replaces a memory item by ingesting a new item and deleting the original.
+///
+/// The original is fetched first so unspecified fields carry over, and it is deleted
+/// only after the replacement ingest succeeds, so a failed ingest never loses data.
+///
+/// # Errors
+/// Returns an error for empty content, a non-canonical memory id, any failed RPC, or
+/// when the original item cannot be deleted after the replacement was ingested (the
+/// message then names both ids so the operator can clean up the duplicate).
 async fn replace_memory_item(
     client: &mut dyn MemoryReplaceRpc,
     connection: &AgentConnection,
@@ -247,6 +281,11 @@ async fn replace_memory_item(
     })
 }
 
+/// Executes user-scoped memory item commands against the gateway gRPC memory service.
+///
+/// # Errors
+/// Returns an error when the gRPC connection fails, arguments are invalid, an RPC
+/// fails, or output encoding/flushing fails.
 pub(crate) async fn run_memory_async(
     command: MemoryCommand,
     connection: AgentConnection,
@@ -593,6 +632,7 @@ pub(crate) async fn run_memory_async(
     std::io::stdout().flush().context("stdout flush failed")
 }
 
+/// Executes admin memory commands against the `/console/v1/memory/*` admin API.
 async fn run_memory_admin_async(command: MemoryCommand) -> Result<()> {
     let context =
         client::control_plane::connect_admin_console(app::ConnectionOverrides::default()).await?;
@@ -1159,6 +1199,8 @@ async fn run_memory_admin_async(command: MemoryCommand) -> Result<()> {
     }
 }
 
+/// Prints an admin payload either as pretty JSON or as the label line followed by one
+/// `pointer=<compact json>` line per present pointer.
 fn emit_admin_payload(
     label: &str,
     payload: &Value,
@@ -1177,6 +1219,8 @@ fn emit_admin_payload(
     std::io::stdout().flush().context("stdout flush failed")
 }
 
+/// Resolves a query that may arrive positionally or via `--query`, rejecting both
+/// missing and duplicated forms.
 fn resolve_optional_query_arg(
     positional: Option<String>,
     option: Option<String>,
@@ -1191,6 +1235,7 @@ fn resolve_optional_query_arg(
     }
 }
 
+/// Appends the present `params` to `base` as a percent-encoded query string.
 fn build_console_query_path(base: &str, params: Vec<(&str, Option<String>)>) -> String {
     let parts = params
         .into_iter()
@@ -1209,6 +1254,7 @@ fn build_console_query_path(base: &str, params: Vec<(&str, Option<String>)>) -> 
     format!("{base}?{}", parts.join("&"))
 }
 
+/// Percent-encodes every byte outside the RFC 3986 unreserved set.
 fn percent_encode_component(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.as_bytes() {
@@ -1313,6 +1359,8 @@ fn emit_memory_status(payload: &Value, json_output: bool) -> Result<()> {
     std::io::stdout().flush().context("stdout flush failed")
 }
 
+/// Builds the `memory.embeddings.degraded` diagnostic line when embeddings run on the
+/// hash fallback or a degraded provider; returns `None` for a healthy production setup.
 fn memory_embeddings_degraded_line(payload: &Value) -> Option<String> {
     let embeddings = payload.get("embeddings")?;
     let mode = embeddings.get("mode").and_then(Value::as_str).unwrap_or("unknown");
@@ -1456,6 +1504,8 @@ fn emit_memory_index(payload: &Value, json_output: bool) -> Result<()> {
     std::io::stdout().flush().context("stdout flush failed")
 }
 
+/// Labels whether a hit is session-scoped without printing the session id itself
+/// (metadata lines must not leak session identifiers).
 fn memory_session_scope_label(has_session_scope: bool) -> &'static str {
     if has_session_scope {
         "present"
@@ -1473,6 +1523,7 @@ fn memory_search_output_payload(hits: &[memory_v1::MemorySearchHit]) -> Value {
     })
 }
 
+/// Picks the pinned claim-boundary text for a durable memory search result.
 fn memory_search_claim_boundary(hit_count: usize) -> &'static str {
     if hit_count == 0 {
         MEMORY_SEARCH_HITS_ABSENT_CLAIM_BOUNDARY
@@ -1481,6 +1532,8 @@ fn memory_search_claim_boundary(hit_count: usize) -> &'static str {
     }
 }
 
+/// Adds the `agent_visibility` block to a manual-ingest JSON payload so agents know the
+/// stored memory is searchable but was not attached to the current run.
 fn attach_manual_ingest_visibility(payload: &mut Value) {
     let Some(object) = payload.as_object_mut() else {
         return;

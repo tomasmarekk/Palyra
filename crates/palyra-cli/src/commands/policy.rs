@@ -1,9 +1,21 @@
+//! Offline policy explanation against the deny-by-default Cedar engine.
+//!
+//! Evaluates locally with the same tool allowlist the daemon would load
+//! (env override first, then config), and overlays the runtime tool
+//! catalog's approval requirements so output mirrors live enforcement.
+
 use crate::*;
 use palyra_common::tool_catalog::{
     sensitive_allowlisted_tool_names, tool_policy_capability_names, tool_requires_approval,
     SENSITIVE_CAPABILITY_POLICY_NAMES,
 };
 
+/// Runs `palyra policy explain`, emitting the decision in JSON, NDJSON, or
+/// the pinned text form.
+///
+/// # Errors
+/// Fails when policy config loading, Cedar evaluation, or output encoding
+/// fails.
 pub(crate) fn run_policy(command: PolicyCommand) -> Result<()> {
     match command {
         PolicyCommand::Explain { principal, action, resource, json } => {
@@ -28,11 +40,8 @@ pub(crate) fn run_policy(command: PolicyCommand) -> Result<()> {
             };
             let diagnostics =
                 palyra_policy::policy_explain_diagnostics_value(&request, &evaluation);
-            let runtime_tool_approval_required = policy_context
-                .requested_tool
-                .as_deref()
-                .map(tool_requires_approval)
-                .unwrap_or(false);
+            let runtime_tool_approval_required =
+                policy_context.requested_tool.as_deref().is_some_and(tool_requires_approval);
             if output::preferred_json(json) {
                 return output::print_json_pretty(
                     &json!({
@@ -129,6 +138,8 @@ pub(crate) fn run_policy(command: PolicyCommand) -> Result<()> {
     }
 }
 
+/// Evaluation inputs assembled for one explain request, with the provenance
+/// of the tool allowlist for the output's `policy_config_source` field.
 struct PolicyExplainContext {
     config: PolicyEvaluationConfig,
     request_context: palyra_policy::PolicyRequestContext,
@@ -162,6 +173,8 @@ fn load_policy_explain_context(request: &PolicyRequest) -> Result<PolicyExplainC
     })
 }
 
+// Extracts the lowercased tool name from a tool.execute resource, accepting
+// both bare names and the "tool:" prefixed form.
 fn requested_tool_for_policy_explain(request: &PolicyRequest) -> Option<String> {
     if !request.action.eq_ignore_ascii_case("tool.execute") {
         return None;

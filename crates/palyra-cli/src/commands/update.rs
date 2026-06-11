@@ -1,3 +1,9 @@
+//! Update planning for portable installs: inspects the current install and
+//! an optional candidate archive, then emits manual next steps.
+//!
+//! In-place self-update is intentionally unimplemented; applying with
+//! `--yes` fails closed so the trust chain stays a manual operator action.
+
 use std::{fs, io::Read, path::PathBuf};
 
 use anyhow::{anyhow, Context, Result};
@@ -7,6 +13,7 @@ use zip::read::ZipArchive;
 use crate::cli::UpdateCommand;
 use crate::*;
 
+/// Manifest and release-note details read from a candidate update archive.
 #[derive(Debug, Clone, Serialize)]
 struct UpdateArchiveSnapshot {
     archive_path: String,
@@ -17,6 +24,8 @@ struct UpdateArchiveSnapshot {
     migration_notes: Option<String>,
 }
 
+/// Full update plan emitted to the operator; field names are part of the
+/// pinned JSON output shape.
 #[derive(Debug, Clone, Serialize)]
 struct UpdateReport {
     mode: String,
@@ -33,6 +42,13 @@ struct UpdateReport {
     next_steps: Vec<String>,
 }
 
+/// Runs `palyra update`, producing a status check, plan, or candidate plan
+/// without modifying the installation.
+///
+/// # Errors
+/// Fails when the install root cannot be resolved, the candidate archive is
+/// unreadable, `--yes` requests the unimplemented in-place apply, or output
+/// encoding fails.
 pub(crate) fn run_update(command: UpdateCommand) -> Result<()> {
     let install_root = support::lifecycle::resolve_install_root(command.install_root)?;
     let metadata = support::lifecycle::load_install_metadata(install_root.as_path())?;
@@ -176,6 +192,8 @@ fn read_optional_zip_json<T>(archive: &mut ZipArchive<fs::File>, path: &str) -> 
 where
     T: for<'de> serde::Deserialize<'de>,
 {
+    // Manifests and release notes are optional archive members; a lookup
+    // failure means the candidate simply does not ship that file.
     let Ok(mut file) = archive.by_name(path) else {
         return Ok(None);
     };

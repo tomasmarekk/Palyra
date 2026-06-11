@@ -1,3 +1,8 @@
+//! `palyra system`: operator views over the daemon's heartbeat, subsystem
+//! presence, insights, and the append-only system event feed.
+//! All data comes from the `console/v1/system` admin endpoints; `event emit`
+//! validates event names locally before posting.
+
 use crate::*;
 
 #[derive(Debug, Serialize)]
@@ -7,6 +12,11 @@ struct SystemPresenceEntry {
     detail: String,
 }
 
+/// Runs a `palyra system` subcommand on a dedicated Tokio runtime.
+///
+/// # Errors
+/// Returns an error when the admin console connection fails, the console API
+/// call fails, or an emitted event name is invalid.
 pub(crate) fn run_system(command: SystemCommand) -> Result<()> {
     let runtime = build_runtime()?;
     runtime.block_on(run_system_async(command))
@@ -422,6 +432,9 @@ fn build_system_presence_entry(subsystem: &str, payload: Option<&Value>) -> Syst
     SystemPresenceEntry { subsystem: subsystem.to_owned(), state, detail }
 }
 
+// Event names land in the hash-chained journal, so the strict ASCII allowlist
+// keeps operator-supplied names from injecting separators or control bytes
+// into downstream log lines and queries.
 fn validate_system_event_name(event: &str) -> Result<()> {
     let trimmed = event.trim();
     if trimmed.is_empty() {

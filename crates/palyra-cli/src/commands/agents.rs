@@ -1,3 +1,8 @@
+//! `palyra agents`: agent registry CRUD, context bindings, default selection,
+//! and identity resolution against the gateway runtime API.
+//! Model routing is read from the local models status so output can label
+//! whether the registry `default_model_profile` is still authoritative.
+
 use std::path::Path;
 
 use anyhow::bail;
@@ -5,6 +10,11 @@ use anyhow::bail;
 use super::models::{load_models_status, ModelsStatusPayload};
 use crate::*;
 
+/// Runs a `palyra agents` subcommand on a dedicated Tokio runtime.
+///
+/// # Errors
+/// Returns an error when the gateway connection cannot be resolved or the
+/// runtime call fails.
 pub(crate) fn run_agents(command: AgentsCommand) -> Result<()> {
     let root_context = app::current_root_context()
         .ok_or_else(|| anyhow!("CLI root context is unavailable for agents command"))?;
@@ -16,6 +26,11 @@ pub(crate) fn run_agents(command: AgentsCommand) -> Result<()> {
     runtime.block_on(run_agents_async(command, connection))
 }
 
+/// Executes an agents subcommand against an already-resolved gateway connection.
+///
+/// # Errors
+/// Returns an error when argument normalization or the gateway runtime call
+/// fails, or when `agents delete` is invoked without `--yes`/`--dry-run`.
 pub(crate) async fn run_agents_async(
     command: AgentsCommand,
     connection: AgentConnection,
@@ -557,6 +572,8 @@ fn agent_to_json_with_model_routing(
     })
 }
 
+// Session ids are redacted (presence-only) so binding listings cannot be used
+// to hijack or correlate live sessions.
 fn agent_binding_to_json(binding: &gateway_v1::AgentBinding) -> Value {
     json!({
         "agent_id": binding.agent_id,
@@ -609,18 +626,17 @@ fn prepare_workspace_roots_for_create(
         if trimmed.is_empty() {
             bail!("workspace root cannot be empty");
         }
-        if is_cli_absolute_path(trimmed) {
-            if !allow_absolute_paths {
-                bail!("absolute workspace root `{trimmed}` requires --allow-absolute-paths");
-            }
-            normalized.push(trimmed.to_owned());
-        } else {
-            normalized.push(trimmed.to_owned());
+        if is_cli_absolute_path(trimmed) && !allow_absolute_paths {
+            bail!("absolute workspace root `{trimmed}` requires --allow-absolute-paths");
         }
+        normalized.push(trimmed.to_owned());
     }
     Ok((normalized, allow_absolute_paths))
 }
 
+// Checks Windows drive-letter and UNC forms explicitly because the daemon may
+// run on a different OS than this CLI; Path::is_absolute alone only reflects
+// the local platform's path rules.
 fn is_cli_absolute_path(value: &str) -> bool {
     Path::new(value).is_absolute()
         || value.starts_with(r"\\")

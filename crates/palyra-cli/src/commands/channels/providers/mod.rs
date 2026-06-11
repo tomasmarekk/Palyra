@@ -10,6 +10,12 @@ use serde_json::{json, Value};
 
 use crate::args::{ChannelProviderArg, ChannelResolveEntityArg};
 
+/// Routes a lifecycle upsert to the provider implementation, reporting an
+/// unsupported action for providers without one.
+///
+/// # Errors
+/// Propagates provider failures; in text mode an unsupported provider is
+/// also an error.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_channel_lifecycle_upsert(
     action: &'static str,
@@ -76,6 +82,13 @@ pub(super) fn run_channel_lifecycle_upsert(
     }
 }
 
+/// Routes a lifecycle disable (logout/remove) to the provider
+/// implementation, reporting an unsupported action for providers without
+/// one.
+///
+/// # Errors
+/// Propagates provider failures; in text mode an unsupported provider is
+/// also an error.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_channel_lifecycle_disable(
     action: &'static str,
@@ -112,6 +125,11 @@ pub(super) fn run_channel_lifecycle_disable(
     }
 }
 
+/// Builds the entity-resolution payload, marking providers without
+/// resolution support as `supported: false` instead of failing.
+///
+/// # Errors
+/// Fails when the input value is blank or provider normalization rejects it.
 pub(super) fn build_channel_resolution_payload(
     provider: ChannelProviderArg,
     account_id: String,
@@ -137,6 +155,12 @@ pub(super) fn build_channel_resolution_payload(
     }
 }
 
+/// Derives the canonical `provider:account_id` connector id, applying
+/// provider-specific account-id normalization.
+///
+/// # Errors
+/// Fails when the account id does not pass the provider's normalization
+/// rules.
 pub(super) fn connector_id_for_provider(
     provider: ChannelProviderArg,
     account_id: &str,
@@ -160,6 +184,8 @@ pub(super) fn connector_id_for_provider(
     }
 }
 
+/// Infers the provider from a connector id prefix; `None` for unknown
+/// prefixes.
 pub(super) fn infer_provider_from_connector_id(connector_id: &str) -> Option<ChannelProviderArg> {
     let prefix = connector_id.trim().split(':').next()?.to_ascii_lowercase();
     match prefix.as_str() {
@@ -172,6 +198,8 @@ pub(super) fn infer_provider_from_connector_id(connector_id: &str) -> Option<Cha
     }
 }
 
+/// Returns the lifecycle actions a provider supports, as advertised by the
+/// capabilities command.
 pub(super) fn supported_lifecycle_actions(provider: ChannelProviderArg) -> Vec<&'static str> {
     match provider {
         ChannelProviderArg::Discord => vec![
@@ -195,6 +223,8 @@ pub(super) fn supported_lifecycle_actions(provider: ChannelProviderArg) -> Vec<&
     }
 }
 
+/// Returns the entity kinds a provider can resolve; empty when resolution is
+/// unsupported.
 pub(super) fn supported_resolve_entities(provider: ChannelProviderArg) -> Vec<&'static str> {
     match provider {
         ChannelProviderArg::Discord => vec!["channel", "conversation", "thread", "user"],
@@ -205,10 +235,12 @@ pub(super) fn supported_resolve_entities(provider: ChannelProviderArg) -> Vec<&'
     }
 }
 
+/// Reports whether the provider supports router pairing flows.
 pub(super) fn pairing_supported(provider: ChannelProviderArg) -> bool {
     matches!(provider, ChannelProviderArg::Discord)
 }
 
+/// Returns human-oriented notes included in the capabilities payload.
 pub(super) fn capability_notes(provider: ChannelProviderArg) -> Vec<&'static str> {
     match provider {
         ChannelProviderArg::Discord => vec![
@@ -226,6 +258,8 @@ pub(super) fn capability_notes(provider: ChannelProviderArg) -> Vec<&'static str
     }
 }
 
+/// Returns the canonical lowercase provider label used in connector ids and
+/// pinned output.
 pub(super) const fn label(provider: ChannelProviderArg) -> &'static str {
     match provider {
         ChannelProviderArg::Discord => "discord",

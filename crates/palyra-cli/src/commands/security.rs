@@ -1,3 +1,8 @@
+//! `palyra security audit`: aggregates doctor checks, local config inspection,
+//! live runtime posture, and the secrets audit into severity-ranked findings.
+//! Runtime posture from the daemon admin surface takes precedence over the
+//! local doctor snapshot whenever it is reachable.
+
 use crate::*;
 use palyra_common::secret_refs::SecretRef;
 use palyra_control_plane as control_plane;
@@ -92,6 +97,11 @@ impl LocalProcessRunnerConfigSnapshot {
     }
 }
 
+/// Runs a `palyra security` subcommand.
+///
+/// # Errors
+/// Returns an error when local config or doctor snapshots cannot be built, and
+/// in `--strict` mode when the audit reports blocking findings.
 pub(crate) fn run_security(command: SecurityCommand) -> Result<()> {
     match command {
         SecurityCommand::Audit { path, offline, strict, json } => {
@@ -190,6 +200,8 @@ fn build_security_findings(
         });
     }
 
+    // Prefer live runtime posture over the local doctor snapshot: a reachable
+    // daemon reports the binds and TLS state actually in effect.
     let deployment = runtime.deployment.as_ref();
     let remote_bind_detected = deployment
         .map(|value| value.remote_bind_detected)
@@ -507,6 +519,10 @@ fn map_secret_finding_to_security_finding(finding: &SecretAuditFinding) -> Secur
     }
 }
 
+// Runtime posture failures degrade the audit to local-only signals (recorded
+// as a `runtime_posture_unavailable` warning) instead of aborting it, so the
+// audit stays usable while the daemon is down. Connection errors pass through
+// redact_auth_error before being surfaced.
 fn load_runtime_security_snapshot(offline: bool) -> Result<RuntimeSecuritySnapshot> {
     if offline {
         return Ok(RuntimeSecuritySnapshot {

@@ -1,3 +1,9 @@
+//! `palyra agent` command: one-shot runs and the interactive terminal loop.
+//!
+//! Streams gateway run events to stdout, mediates tool-approval decisions, and
+//! lets stdin input interrupt an active interactive run by queueing the new
+//! prompt for replay once the current run stops.
+
 use std::collections::VecDeque;
 
 use tokio::sync::mpsc;
@@ -28,6 +34,12 @@ fn interactive_session_started_message(
     parts.join(" ")
 }
 
+/// Dispatches `palyra agent` subcommands (run, interactive, ACP shims).
+///
+/// # Errors
+/// Returns an error when the CLI root context is unavailable, approval flags
+/// conflict, the gateway connection cannot be resolved, or the run stream
+/// fails before reaching a successful terminal status.
 pub(crate) fn run_agent(command: AgentCommand) -> Result<()> {
     let root_context = app::current_root_context()
         .ok_or_else(|| anyhow!("CLI root context is unavailable for agent command"))?;
@@ -138,6 +150,12 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<()> {
     }
 }
 
+/// Rejects `agent run` flag combinations that would bypass or deadlock tool approval.
+///
+/// # Errors
+/// Returns an error when `--allow-sensitive-tools` contradicts the requested
+/// approval mode, or when `--approval-mode prompt` competes with
+/// `--prompt-stdin` for stdin.
 pub(crate) fn ensure_agent_run_approval_flags(
     allow_sensitive_tools: bool,
     approval_mode: AgentApprovalModeArg,
@@ -223,9 +241,9 @@ async fn run_agent_interactive_async(
             let resolved_session = ensure_interactive_session(
                 &runtime,
                 &mut session,
-                initial_session_id.as_ref(),
-                initial_session_key.as_ref(),
-                initial_session_label.as_ref(),
+                initial_session_id.as_deref(),
+                initial_session_key.as_deref(),
+                initial_session_label.as_deref(),
                 require_existing,
                 false,
             )
@@ -244,9 +262,9 @@ async fn run_agent_interactive_async(
             let _ = ensure_interactive_session(
                 &runtime,
                 &mut session,
-                initial_session_id.as_ref(),
-                initial_session_key.as_ref(),
-                initial_session_label.as_ref(),
+                initial_session_id.as_deref(),
+                initial_session_key.as_deref(),
+                initial_session_label.as_deref(),
                 require_existing,
                 true,
             )
@@ -278,9 +296,9 @@ async fn run_agent_interactive_async(
         let resolved_session = ensure_interactive_session(
             &runtime,
             &mut session,
-            initial_session_id.as_ref(),
-            initial_session_key.as_ref(),
-            initial_session_label.as_ref(),
+            initial_session_id.as_deref(),
+            initial_session_key.as_deref(),
+            initial_session_label.as_deref(),
             require_existing,
             false,
         )
@@ -322,6 +340,8 @@ async fn run_agent_interactive_async(
     Ok(())
 }
 
+// Allowlist of path-only env vars safe to forward in the launch context;
+// anything else (tokens, credentials) must never be serialized into it.
 const CLI_CONTEXT_SAFE_PATH_ENV_KEYS: &[&str] = &["PALYRA_E2E_HOME", "PALYRA_E2E_OS_ROOT"];
 
 fn cli_launch_parameter_delta_json(prompt: &str) -> Result<Option<String>> {
@@ -329,6 +349,8 @@ fn cli_launch_parameter_delta_json(prompt: &str) -> Result<Option<String>> {
     cli_launch_parameter_delta_json_for_cwd(cwd.as_path(), prompt)
 }
 
+// The prompt is accepted but deliberately unused: workspace roots must never
+// be inferred from prompt contents (pinned by the tests below).
 fn cli_launch_parameter_delta_json_for_cwd(
     cwd: &std::path::Path,
     _prompt: &str,
@@ -355,6 +377,8 @@ fn cli_launch_safe_path_env() -> serde_json::Map<String, serde_json::Value> {
     env
 }
 
+// Stdin reads block, so they run on a dedicated thread; the async loop can
+// then select between user input and run-stream events without stalling.
 fn spawn_interactive_stdin_reader() -> mpsc::UnboundedReceiver<Result<String, String>> {
     let (tx, rx) = mpsc::unbounded_channel();
     std::thread::spawn(move || {
@@ -407,6 +431,7 @@ fn interactive_exit_after_interrupt_message(cancel_requested: bool) -> String {
     )
 }
 
+/// Stream outcome plus whether the user requested `/exit` during the run.
 struct InteractiveAgentStreamOutcome {
     stream: AgentStreamOutcome,
     exit_requested: bool,
@@ -435,6 +460,9 @@ async fn execute_interactive_agent_stream(
     let mut input_closed = false;
 
     loop {
+        // Stdin stays live during an active run: slash commands act
+        // immediately, while any other input interrupts the run and queues the
+        // prompt for replay once the stream stops.
         tokio::select! {
             maybe_prompt = read_next_interactive_prompt(input_rx), if !input_closed => {
                 match maybe_prompt? {
@@ -574,6 +602,9 @@ async fn execute_interactive_agent_stream(
     }
     let outcome =
         AgentStreamOutcome { completed, cancelled, needs_continuation_message, failed_message };
+    // An interrupted run is expected to end without a successful terminal
+    // status; the queued prompt (or exit) decides what happens next, so the
+    // terminal-status and success checks are intentionally skipped.
     if abort_requested {
         return Ok(InteractiveAgentStreamOutcome { stream: outcome, exit_requested });
     }
@@ -640,9 +671,9 @@ fn redacted_text_presence(value: &str) -> &'static str {
 async fn ensure_interactive_session(
     runtime: &client::operator::OperatorRuntime,
     session: &mut Option<gateway_v1::SessionSummary>,
-    initial_session_id: Option<&String>,
-    initial_session_key: Option<&String>,
-    initial_session_label: Option<&String>,
+    initial_session_id: Option<&str>,
+    initial_session_key: Option<&str>,
+    initial_session_label: Option<&str>,
     require_existing: bool,
     reset_session: bool,
 ) -> Result<gateway_v1::SessionSummary> {
@@ -656,9 +687,9 @@ async fn ensure_interactive_session(
         }
     } else {
         SessionResolveInput {
-            session_id: resolve_optional_canonical_id(initial_session_id.cloned())?,
-            session_key: initial_session_key.cloned().unwrap_or_default(),
-            session_label: initial_session_label.cloned().unwrap_or_default(),
+            session_id: resolve_optional_canonical_id(initial_session_id.map(str::to_owned))?,
+            session_key: initial_session_key.map(str::to_owned).unwrap_or_default(),
+            session_label: initial_session_label.map(str::to_owned).unwrap_or_default(),
             require_existing,
             reset_session,
         }

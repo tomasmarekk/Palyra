@@ -1,3 +1,10 @@
+//! Doctor diagnostics, repair planning, and apply/rollback execution.
+//!
+//! Every applied repair is journaled into a per-run recovery manifest with
+//! pre-change backups so `palyra doctor --rollback-run <id>` can restore the
+//! prior state. Secret-bearing files and their backups are written with
+//! owner-only permissions.
+
 use crate::*;
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -44,6 +51,7 @@ const DOCTOR_ACCESS_REGISTRY_VERSION: u32 = 1;
 const DOCTOR_ROUTINE_REGISTRY_VERSION: u32 = 1;
 const DOCTOR_SUPPORT_BUNDLE_MANIFEST_LIMIT: usize = 5;
 
+/// Parsed `palyra doctor` invocation flags shared by diagnostics, repair, and rollback.
 #[derive(Clone, Debug)]
 pub(crate) struct DoctorCommandRequest {
     pub(crate) strict: bool,
@@ -56,6 +64,7 @@ pub(crate) struct DoctorCommandRequest {
     pub(crate) rollback_run: Option<String>,
 }
 
+/// Resolved state root, config path, and report timestamp for one doctor invocation.
 #[derive(Clone, Debug)]
 struct DoctorEnvironment {
     state_root: PathBuf,
@@ -73,6 +82,7 @@ enum DoctorExecutionMode {
     RollbackApply,
 }
 
+/// Top-level `doctor --json` document combining diagnostics and recovery results.
 #[derive(Debug, Serialize)]
 pub(crate) struct DoctorExecutionReport {
     schema_version: u32,
@@ -126,6 +136,7 @@ struct DoctorAppliedStep {
     warnings: Vec<String>,
 }
 
+/// Listing entry for a persisted recovery run, including its rollback command.
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct DoctorRecoveryRunSummary {
     run_id: String,
@@ -168,12 +179,14 @@ struct DoctorRecoveryManifestEntry {
     secret_aware: bool,
 }
 
+/// A reportable repair step paired with its executable action.
 #[derive(Clone, Debug)]
 struct DoctorRepairPlan {
     step: DoctorRepairStep,
     kind: DoctorRepairKind,
 }
 
+/// Concrete, pre-validated apply action for a planned repair step.
 #[derive(Clone, Debug)]
 enum DoctorRepairKind {
     InitializeMissingConfig {
@@ -254,6 +267,11 @@ enum DoctorRepairKind {
     },
 }
 
+/// Executes the doctor command and renders the execution report as text or JSON.
+///
+/// # Errors
+/// Returns an error when diagnostics or repair/rollback execution fails, or
+/// when `strict` is set and a blocking check is failing.
 pub(crate) fn run_doctor(request: DoctorCommandRequest) -> Result<()> {
     let execution = build_doctor_execution(&request)?;
     if output::preferred_json(request.json) {
@@ -276,6 +294,10 @@ pub(crate) fn run_doctor(request: DoctorCommandRequest) -> Result<()> {
     std::io::stdout().flush().context("stdout flush failed")
 }
 
+/// Builds a repair dry-run execution report as JSON for embedding in other payloads.
+///
+/// # Errors
+/// Returns an error when diagnostics cannot be collected or encoding fails.
 pub(crate) fn build_doctor_execution_preview_value() -> Result<JsonValue> {
     let execution = build_doctor_execution(&DoctorCommandRequest {
         strict: false,
@@ -290,6 +312,11 @@ pub(crate) fn build_doctor_execution_preview_value() -> Result<JsonValue> {
     serde_json::to_value(execution).context("failed to encode doctor execution preview")
 }
 
+/// Builds the doctor section of a support bundle: a dry-run repair preview
+/// plus recent recovery runs and their manifests.
+///
+/// # Errors
+/// Returns an error when the dry-run preview cannot be built or encoded.
 pub(crate) fn build_doctor_support_bundle_value() -> Result<JsonValue> {
     let preview = build_doctor_execution_preview_value()?;
     let environment = resolve_doctor_environment()?;
@@ -600,11 +627,8 @@ fn evaluate_auth_registry_repairs(
     };
 
     let allowed_keys = BTreeSet::from(["version".to_owned(), "profiles".to_owned()]);
-    let unknown_root_keys = root
-        .keys()
-        .filter(|key| !allowed_keys.contains((*key).to_owned().as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
+    let unknown_root_keys =
+        root.keys().filter(|key| !allowed_keys.contains(key.as_str())).cloned().collect::<Vec<_>>();
     let quarantine_unknown_root_keys = unknown_root_keys
         .into_iter()
         .filter_map(|key| root.remove(key.as_str()).map(|value| (key, value)))
@@ -827,11 +851,8 @@ fn evaluate_cli_profiles_repairs(environment: &DoctorEnvironment) -> Result<Vec<
     };
     let allowed_keys =
         BTreeSet::from(["version".to_owned(), "default_profile".to_owned(), "profiles".to_owned()]);
-    let unknown_root_keys = root
-        .keys()
-        .filter(|key| !allowed_keys.contains((*key).to_owned().as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
+    let unknown_root_keys =
+        root.keys().filter(|key| !allowed_keys.contains(key.as_str())).cloned().collect::<Vec<_>>();
     let quarantine_unknown_root_keys = unknown_root_keys
         .into_iter()
         .filter_map(|key| root.remove(key.as_str()).map(|value| (key, value)))
@@ -896,7 +917,7 @@ fn evaluate_routine_registry_repairs(
         let needs_rewrite = match serde_json::from_str::<JsonValue>(raw.as_str()) {
             Ok(JsonValue::Object(ref object)) => !matches!(
                 object.get("schema_version").and_then(JsonValue::as_u64),
-                Some(value) if value == DOCTOR_ROUTINE_REGISTRY_VERSION as u64
+                Some(value) if value == u64::from(DOCTOR_ROUTINE_REGISTRY_VERSION)
             ),
             _ => true,
         };
@@ -1736,6 +1757,9 @@ fn execute_rollback(
     })
 }
 
+/// Journals every file change of a repair run into a recovery manifest with
+/// pre-change backups; the manifest is re-persisted after each recorded entry
+/// so a crash mid-run still leaves a usable rollback record.
 struct DoctorRecoveryRunWriter {
     manifest_path: PathBuf,
     manifest: Mutex<DoctorRecoveryManifest>,
@@ -1770,7 +1794,7 @@ impl DoctorRecoveryRunWriter {
     }
 
     fn run_id(&self) -> String {
-        self.manifest.lock().expect("manifest lock").run_id.clone()
+        self.manifest.lock().expect("recovery manifest mutex poisoned").run_id.clone()
     }
 
     fn manifest_path(&self) -> &Path {
@@ -1861,7 +1885,11 @@ impl DoctorRecoveryRunWriter {
         let Some(snapshot) = snapshot else {
             return Ok(None);
         };
-        let backup_dir = self.manifest_path.parent().expect("manifest path parent").join("backups");
+        let backup_dir = self
+            .manifest_path
+            .parent()
+            .expect("manifest path is always nested inside a run directory")
+            .join("backups");
         fs::create_dir_all(backup_dir.as_path())
             .with_context(|| format!("failed to create backup dir {}", backup_dir.display()))?;
         if secret_aware {
@@ -1945,6 +1973,8 @@ fn hash_file(path: &Path) -> Result<String> {
     Ok(sha256_hex(bytes.as_slice()))
 }
 
+/// Installs `content` at `path` through a temp file so readers never observe
+/// partial writes, hardening permissions first when `secret_aware` is set.
 fn write_bytes_atomic(path: &Path, content: &[u8], secret_aware: bool) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -1953,6 +1983,9 @@ fn write_bytes_atomic(path: &Path, content: &[u8], secret_aware: bool) -> Result
     let tmp_path = path.with_extension(format!("{}.tmp", Ulid::new()));
     write_atomic_temp_file(tmp_path.as_path(), content, secret_aware)?;
     if path.exists() {
+        // Windows rename fails when the destination exists, so stage the
+        // current file aside first and restore it if installing the new bytes
+        // fails partway through.
         let rollback_path = path.with_extension(format!("{}.rollback", Ulid::new()));
         fs::rename(path, rollback_path.as_path()).with_context(|| {
             format!("failed to stage existing file {} for atomic write", path.display())
@@ -2108,7 +2141,7 @@ struct NormalizedAccessRegistry {
 fn normalize_access_registry_json(value: JsonValue, now_unix_ms: i64) -> NormalizedAccessRegistry {
     let mut changed = false;
     let mut object = value.as_object().cloned().unwrap_or_default();
-    if !matches!(object.get("version").and_then(JsonValue::as_u64), Some(value) if value == DOCTOR_ACCESS_REGISTRY_VERSION as u64)
+    if !matches!(object.get("version").and_then(JsonValue::as_u64), Some(value) if value == u64::from(DOCTOR_ACCESS_REGISTRY_VERSION))
     {
         object.insert(
             "version".to_owned(),
@@ -2187,7 +2220,7 @@ fn normalize_browser_profile_registry_json(value: JsonValue) -> NormalizedBrowse
     let mut repaired_profile_records = 0;
     let mut removed_active_pointers = 0;
     let mut object = value.as_object().cloned().unwrap_or_default();
-    if !matches!(object.get("v").and_then(JsonValue::as_u64), Some(value) if value == DOCTOR_BROWSER_PROFILE_REGISTRY_VERSION as u64)
+    if !matches!(object.get("v").and_then(JsonValue::as_u64), Some(value) if value == u64::from(DOCTOR_BROWSER_PROFILE_REGISTRY_VERSION))
     {
         object.insert(
             "v".to_owned(),
@@ -2220,7 +2253,7 @@ fn normalize_browser_profile_registry_json(value: JsonValue) -> NormalizedBrowse
                 continue;
             }
             if record.get("state_schema_version").and_then(JsonValue::as_u64).unwrap_or(0)
-                < DOCTOR_BROWSER_PROFILE_RECORD_VERSION as u64
+                < u64::from(DOCTOR_BROWSER_PROFILE_RECORD_VERSION)
             {
                 record.insert(
                     "state_schema_version".to_owned(),
@@ -2297,6 +2330,8 @@ fn resolve_browser_state_dir(state_root: &Path) -> Result<PathBuf> {
     Ok(state_root.join(DOCTOR_BROWSER_STATE_DIR_RELATIVE_PATH))
 }
 
+// Blob layout (shared with browserd state files): 4-byte magic || 12-byte
+// random nonce || ChaCha20-Poly1305 ciphertext with appended tag.
 fn encrypt_browser_state_blob(
     key: &[u8; DOCTOR_BROWSER_STATE_KEY_LEN],
     plaintext: &[u8],
@@ -2372,6 +2407,8 @@ fn scan_stale_artifacts(root: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn scan_nested_stale_artifacts(root: &Path, depth: usize) -> Result<Vec<PathBuf>> {
+    // The depth cap keeps the stale-artifact scan from walking large user
+    // data trees under the state root.
     if depth > 2 || !root.is_dir() {
         return Ok(Vec::new());
     }
@@ -2471,6 +2508,8 @@ fn resolve_auth_registry_path(environment: &DoctorEnvironment) -> PathBuf {
 }
 
 fn step_selected(id: &str, only: &[String], skip: &[String]) -> bool {
+    // Filters match loosely (exact, prefix, or substring) so operators can
+    // pass full step ids or family prefixes like "config." to --only/--skip.
     let matches_filter = |candidate: &str, filter: &str| {
         candidate == filter || candidate.starts_with(filter) || candidate.contains(filter)
     };

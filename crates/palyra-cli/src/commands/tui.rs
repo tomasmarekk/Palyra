@@ -1,5 +1,15 @@
+//! Launch adapter for the interactive operator TUI.
+//!
+//! Resolves the gRPC connection from CLI overrides, then hands control to
+//! the `tui` module for the whole interactive session.
+
 use crate::{app, args::TuiCommand, resolve_optional_canonical_id, tui, Result};
 
+/// Resolves the connection and launches the TUI session.
+///
+/// # Errors
+/// Fails when the root context or connection cannot be resolved, the
+/// session id is not canonical, or the TUI session fails.
 pub(crate) fn run_tui(command: TuiCommand) -> Result<()> {
     let root_context = app::current_root_context()
         .ok_or_else(|| anyhow::anyhow!("CLI root context is unavailable for tui command"))?;

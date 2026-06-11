@@ -1,3 +1,9 @@
+//! Guided interactive setup flow for the Discord connector.
+//!
+//! Runs the daemon onboarding probe first so the credential and permissions
+//! are validated before any inbound-scope decisions are gathered and the
+//! apply request persists configuration.
+
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::io::IsTerminal;
@@ -6,6 +12,14 @@ use crate::{client::channels as channels_client, output, prompt_yes_no, prompt_y
 
 use super::{emit, prompt, request};
 
+/// Runs the interactive probe-then-apply setup flow for a Discord account.
+///
+/// Requires stdin, stdout, and stderr to all be TTYs because the flow mixes
+/// hidden credential input with diagnostic output.
+///
+/// # Errors
+/// Fails when no interactive terminal is available, a prompt is rejected,
+/// or either onboarding endpoint call fails.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
     account_id: String,
@@ -64,6 +78,8 @@ pub(crate) fn run(
     )?;
     let broadcast_strategy = prompt::broadcast_strategy()?;
     let concurrency_limit = prompt::concurrency_limit()?;
+    // Open guild channels accept inbound from arbitrary senders, so the scope
+    // needs its own explicit confirmation beyond the earlier selection.
     let confirm_open = if inbound_scope == "open_guild_channels" {
         prompt_yes_no("Open guild channels are high-risk. Confirm open scope? [y/N]: ")?
     } else {
@@ -96,6 +112,11 @@ pub(crate) fn run(
     emit_apply_response(connector_id.as_str(), response, output::preferred_json(json_output))
 }
 
+/// Emits the onboarding apply response as pretty JSON or the pinned setup
+/// success line plus stderr diagnostics.
+///
+/// # Errors
+/// Fails when JSON encoding fails.
 pub(crate) fn emit_apply_response(
     connector_id: &str,
     response: Value,

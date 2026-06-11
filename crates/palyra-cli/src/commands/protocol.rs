@@ -1,5 +1,15 @@
+//! Protocol introspection: version constants, runtime validation summary,
+//! and canonical ID validation.
+//!
+//! Full protocol contract validation needs a source checkout; the validate
+//! output therefore includes the handoff commands for the host platform.
+
 use crate::*;
 
+/// Dispatches a `palyra protocol` subcommand.
+///
+/// # Errors
+/// Fails when a canonical ID is invalid or output encoding fails.
 pub(crate) fn run_protocol(command: ProtocolCommand) -> Result<()> {
     match command {
         ProtocolCommand::Version { json } => {

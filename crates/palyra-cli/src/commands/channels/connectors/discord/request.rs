@@ -1,12 +1,23 @@
+//! Payload builders for Discord onboarding probe/apply and verify requests.
+//!
+//! The credential travels only inside the request body to the daemon, which
+//! validates it and stores it in the vault; it is never echoed in output.
+
 use crate::*;
 use palyra_connectors::providers::discord::{discord_connector_id, normalize_discord_account_id};
 
+/// Derives the canonical Discord connector id for a raw account id.
+///
+/// # Errors
+/// Fails when Discord account-id normalization rejects the value.
 pub(crate) fn connector_id(account_id: &str) -> Result<String> {
     let normalized = normalize_discord_account_id(account_id)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     Ok(discord_connector_id(normalized.as_str()))
 }
 
+/// Builds the onboarding probe payload that validates the credential without
+/// persisting configuration.
 pub(crate) fn probe_payload(
     account_id: &str,
     token: &str,
@@ -21,6 +32,8 @@ pub(crate) fn probe_payload(
     })
 }
 
+/// Builds the onboarding apply payload that persists the connector
+/// configuration and vaults the credential.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_payload(
     account_id: &str,
@@ -54,6 +67,8 @@ pub(crate) fn apply_payload(
     })
 }
 
+/// Builds the test-send payload; `confirm` is always true because the CLI
+/// requires the explicit `--confirm` flag before reaching this point.
 pub(crate) fn verify_payload(
     target: &str,
     text: &str,

@@ -1,3 +1,9 @@
+//! Discord connector CLI surface: guided setup, status, health refresh, and
+//! confirmed verify sends.
+//!
+//! Split by concern: `prompt` gathers interactive input, `request` builds
+//! payloads, `emit` renders responses, `setup`/`verify` drive the flows.
+
 mod emit;
 mod prompt;
 mod request;
@@ -15,6 +21,11 @@ use crate::{
     output::channels as channels_output,
 };
 
+/// Dispatches a `palyra channels discord` subcommand to its handler.
+///
+/// # Errors
+/// Propagates handler failures (argument validation, daemon transport, or
+/// output encoding).
 pub(crate) fn run(command: ChannelsDiscordCommand) -> Result<()> {
     match command {
         ChannelsDiscordCommand::Setup {

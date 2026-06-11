@@ -1,3 +1,10 @@
+//! Webhook integration administration: list, show, add, enable/disable,
+//! remove, and signed test deliveries.
+//!
+//! Test payloads are base64-encoded into the console request so arbitrary
+//! bytes survive the JSON transport; secrets are referenced by vault ref
+//! and never passed inline.
+
 use std::{
     fs,
     io::{Read, Write},
@@ -9,6 +16,10 @@ use palyra_control_plane as control_plane;
 
 use crate::*;
 
+/// Runs a `palyra webhooks` subcommand on a fresh Tokio runtime.
+///
+/// # Errors
+/// Fails when the runtime cannot be built or the async handler fails.
 pub(crate) fn run_webhooks(command: WebhooksCommand) -> Result<()> {
     let runtime = build_runtime()?;
     runtime.block_on(run_webhooks_async(command))
@@ -197,6 +208,8 @@ fn emit_webhook_envelope(
     std::io::stdout().flush().context("stdout flush failed")
 }
 
+// Reads the raw test payload from exactly one source (stdin or file),
+// rejecting empty payloads and conflicting flags.
 fn read_test_payload(payload_stdin: bool, payload_file: Option<&str>) -> Result<Vec<u8>> {
     match (payload_stdin, payload_file) {
         (true, None) => {

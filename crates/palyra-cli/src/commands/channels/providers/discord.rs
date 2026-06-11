@@ -1,3 +1,9 @@
+//! Discord implementation of the generic channel lifecycle surface.
+//!
+//! Upserts reuse the daemon's onboarding probe/apply endpoints so the
+//! credential is validated before any configuration is persisted; account
+//! ids are normalized by `palyra-connectors` rules before any request.
+
 use anyhow::{bail, Result};
 use palyra_connectors::providers::discord::{
     canonical_discord_channel_identity, canonical_discord_sender_identity,
@@ -12,10 +18,23 @@ use crate::{
     normalize_required_text_arg,
 };
 
+/// Derives the canonical Discord connector id for a raw account id.
+///
+/// # Errors
+/// Fails when Discord account-id normalization rejects the value.
 pub(super) fn connector_id(account_id: &str) -> Result<String> {
     connectors::discord::connector_id(account_id)
 }
 
+/// Adds or updates a Discord channel connector.
+///
+/// Interactive mode hands off to the guided setup flow; otherwise the
+/// credential is probed against the daemon before the apply request
+/// persists configuration.
+///
+/// # Errors
+/// Fails when credential intake, argument normalization, or either
+/// onboarding endpoint call fails.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_channel_lifecycle_upsert(
     action: &'static str,
@@ -122,6 +141,12 @@ pub(super) fn run_channel_lifecycle_upsert(
     connectors::discord::emit_apply_response(connector_id.as_str(), response, json_output)
 }
 
+/// Logs out or removes a Discord channel connector, optionally keeping the
+/// vaulted credential.
+///
+/// # Errors
+/// Fails when account-id normalization or the account action endpoint call
+/// fails.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_channel_lifecycle_disable(
     action: &'static str,
@@ -166,6 +191,12 @@ pub(super) fn run_channel_lifecycle_disable(
     )
 }
 
+/// Builds the resolution payload for Discord entities: users canonicalize as
+/// sender identities, channel-like entities normalize then canonicalize as
+/// channel identities.
+///
+/// # Errors
+/// Fails when account-id or target normalization rejects the input.
 pub(super) fn build_channel_resolution_payload(
     account_id: String,
     entity: ChannelResolveEntityArg,

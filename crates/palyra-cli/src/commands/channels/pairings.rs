@@ -1,3 +1,9 @@
+//! Channel pairing commands: listing router pairings, minting pairing codes,
+//! and emitting QR-ready pairing text.
+//!
+//! Pairing codes bind an unverified channel sender to an operator identity;
+//! they are minted by the daemon router and expire server-side.
+
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::fs;
@@ -7,6 +13,11 @@ use crate::{
     output::channels as channels_output,
 };
 
+/// Lists active router pairings for the selected connector.
+///
+/// # Errors
+/// Fails when selector resolution, the endpoint call, or output encoding
+/// fails.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_pairings(
     connector_id: Option<String>,
@@ -26,6 +37,11 @@ pub(super) fn run_pairings(
     channels_output::emit_router_pairings(response, json_output)
 }
 
+/// Mints a new pairing code for the selected connector.
+///
+/// # Errors
+/// Fails when selector resolution, the mint endpoint call, or output
+/// encoding fails.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_pairing_code(
     connector_id: Option<String>,
@@ -55,6 +71,12 @@ pub(super) fn run_pairing_code(
     channels_output::emit_router_pairing_code(response, json_output)
 }
 
+/// Mints a pairing code and renders it as QR-encodable text, optionally
+/// writing the text to an artifact file for external QR generation.
+///
+/// # Errors
+/// Fails when selector resolution, the mint endpoint call, the artifact
+/// write, or output encoding fails.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_qr(
     connector_id: Option<String>,

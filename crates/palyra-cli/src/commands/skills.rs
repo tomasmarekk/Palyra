@@ -1,8 +1,19 @@
-use sha2::{Digest, Sha256};
+//! `palyra skills` command handlers for the signed-skill lifecycle.
+//!
+//! Covers packaging/verification of signed artifacts, trust-gated install/update from
+//! registries, inventory and security-audit commands, daemon-backed quarantine/enable,
+//! and markdown "procedure" skills with a destructive-command safety gate. Trust and
+//! signature primitives live in `palyra-skills`; this module wires them to the CLI and
+//! the local skills root plus audit log.
 
 use crate::cli::SkillsProcedureCommand;
 use crate::{client::skills as skills_client, output::skills as skills_output, *};
 
+/// Entry point for `palyra skills`, dispatching to the per-subcommand handlers.
+///
+/// # Errors
+/// Returns an error when argument validation, trust evaluation, filesystem access, or
+/// the dispatched subcommand fails.
 pub(crate) fn run_skills(command: SkillsCommand) -> Result<()> {
     match command {
         SkillsCommand::Package { command } => match command {
@@ -351,6 +362,7 @@ pub(crate) fn run_skills(command: SkillsCommand) -> Result<()> {
     }
 }
 
+/// Parsed arguments of `skills procedure save`.
 #[derive(Debug)]
 struct SkillsProcedureSaveCommand {
     path: Option<String>,
@@ -364,6 +376,8 @@ struct SkillsProcedureSaveCommand {
     json: bool,
 }
 
+/// One destructive-pattern hit in a procedure body; the line is identified by hash so
+/// audit events never reproduce the unsafe command text itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProcedureUnsafeFinding {
     pattern: &'static str,
@@ -371,6 +385,7 @@ struct ProcedureUnsafeFinding {
     line_sha256: String,
 }
 
+/// Resolved destination of a procedure skill save.
 #[derive(Debug)]
 struct ProcedureSkillPaths {
     skills_root: PathBuf,
@@ -378,6 +393,8 @@ struct ProcedureSkillPaths {
     slug: String,
 }
 
+/// Inventory row for a markdown procedure skill, parsed from its frontmatter; field
+/// names are part of the pinned JSON output contract.
 #[derive(Debug, Clone, Serialize)]
 struct ProcedureSkillInventoryEntry {
     entry_kind: &'static str,
@@ -395,6 +412,9 @@ struct ProcedureSkillInventoryEntry {
     quarantine_path: Option<String>,
 }
 
+/// Saves a markdown procedure skill, routing bodies with destructive commands through
+/// the safety gate: the raw recipe goes to `.quarantine/` and only a dry-run variant
+/// (flagged lines replaced with audit notes) is stored as the active skill.
 fn run_skills_procedure_save(command: SkillsProcedureSaveCommand) -> Result<()> {
     let body = read_procedure_skill_body(command.body, command.body_file.as_deref())?;
     let paths = resolve_procedure_skill_paths(
@@ -507,6 +527,9 @@ fn read_procedure_skill_body(body: Option<String>, body_file: Option<&str>) -> R
     Ok(trimmed.to_owned())
 }
 
+/// Resolves the target file, skills root, and slug for a procedure save; an explicit
+/// `--path` wins over the `--skills-dir`/slug-derived default, and the slug falls back
+/// to the file stem and finally the display name.
 fn resolve_procedure_skill_paths(
     path: Option<&str>,
     skills_dir: Option<&str>,
@@ -544,6 +567,8 @@ fn resolve_procedure_skills_root(skills_dir: Option<&str>) -> Result<PathBuf> {
     Ok(resolve_user_home_dir()?.join(".palyra").join("skills"))
 }
 
+/// Resolves the user home with the precedence PALYRA_HOME, then HOME, then USERPROFILE
+/// so explicit Palyra configuration always wins over platform defaults.
 fn resolve_user_home_dir() -> Result<PathBuf> {
     for key in ["PALYRA_HOME", "HOME", "USERPROFILE"] {
         if let Some(value) =
@@ -563,6 +588,7 @@ fn resolve_cli_path(path: &str) -> Result<PathBuf> {
     Ok(if path.is_absolute() { path } else { std::env::current_dir()?.join(path) })
 }
 
+/// Normalizes free-form input to a lowercase dash-separated slug of at most 96 chars.
 fn normalize_procedure_skill_slug(value: &str) -> Result<String> {
     let mut slug = String::new();
     for ch in value.trim().chars() {
@@ -585,6 +611,8 @@ fn normalize_procedure_skill_slug(value: &str) -> Result<String> {
     Ok(slug)
 }
 
+/// Scans a procedure body line by line for destructive-command patterns; at most one
+/// finding is recorded per line (the first matching pattern wins).
 fn scan_procedure_skill_body(body: &str) -> Vec<ProcedureUnsafeFinding> {
     body.lines()
         .enumerate()
@@ -598,6 +626,8 @@ fn scan_procedure_skill_body(body: &str) -> Vec<ProcedureUnsafeFinding> {
         .collect()
 }
 
+/// Classifies one line against the destructive-pattern denylist (shell, PowerShell,
+/// cmd, and natural-language phrasings), returning the matched pattern id.
 fn unsafe_procedure_pattern(line: &str) -> Option<&'static str> {
     let normalized = line.trim().to_ascii_lowercase();
     if normalized.contains("rm -rf") || normalized.contains("rm -fr") {
@@ -645,6 +675,8 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
 
+/// Writes the raw (unsafe) recipe under `.quarantine/`, named by slug and content
+/// hash so re-saving the identical body is idempotent rather than an overwrite.
 fn write_quarantined_procedure_recipe(
     skills_root: &Path,
     slug: &str,
@@ -693,6 +725,8 @@ fn render_quarantined_procedure_recipe(
     )
 }
 
+/// Rewrites a quarantined body into the storable dry-run variant: flagged lines become
+/// audit notes referencing the pattern and line hash, never the original command text.
 fn render_safe_dry_run_procedure_body(body: &str, findings: &[ProcedureUnsafeFinding]) -> String {
     let mut rendered = String::from(
         "> Safety gate: the submitted raw recipe was quarantined. This saved variant is dry-run only; destructive commands were replaced with audit notes.\n\n",
@@ -711,6 +745,7 @@ fn render_safe_dry_run_procedure_body(body: &str, findings: &[ProcedureUnsafeFin
     rendered.trim_end().to_owned()
 }
 
+/// Field set rendered into a procedure skill's markdown frontmatter.
 struct ProcedureSkillDocument<'a> {
     slug: &'a str,
     name: &'a str,
@@ -772,6 +807,8 @@ fn collect_procedure_skill_inventory(
     Ok(entries)
 }
 
+/// Parses one markdown file into an inventory entry; returns `Ok(None)` for files
+/// without the procedure-skill frontmatter schema so foreign markdown is ignored.
 fn parse_procedure_skill_document(
     path: PathBuf,
     content: &str,
@@ -822,6 +859,8 @@ fn parse_procedure_skill_document(
     }))
 }
 
+// Frontmatter scalars use JSON string syntax for quoting/escaping, so free-form names
+// and summaries round-trip without a YAML dependency.
 fn parse_markdown_frontmatter_scalar(value: &str) -> Result<String> {
     let trimmed = value.trim();
     if trimmed.starts_with('"') {
@@ -835,6 +874,12 @@ fn markdown_frontmatter_scalar(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_owned())
 }
 
+/// Writes the rendered procedure document, returning `"created"`, `"updated"`, or
+/// `"unchanged"` for the status field of the command output.
+///
+/// # Errors
+/// Returns an error when the target exists with different content and `force` is not
+/// set, or when directory creation or the atomic write fails.
 fn write_procedure_skill_document(
     path: &Path,
     payload: &[u8],
@@ -864,10 +909,9 @@ fn write_procedure_skill_document(
     Ok("created")
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
+/// Installs a skill from an artifact file or registry after hash, structural, trust,
+/// and security-audit gates all pass; a failed audit records the quarantine in the
+/// audit log and aborts before anything is written to the skills root.
 fn run_skills_install(command: SkillsInstallCommand) -> Result<()> {
     let skills_root = resolve_skills_root(command.skills_dir.as_deref())?;
     fs::create_dir_all(skills_root.as_path()).with_context(|| {
@@ -876,8 +920,7 @@ fn run_skills_install(command: SkillsInstallCommand) -> Result<()> {
 
     let trust_store_path = resolve_skills_trust_store_path(command.trust_store.as_deref())?;
     let mut trust_store = load_trust_store_with_integrity(trust_store_path.as_path())?;
-    let trusted_publishers = command.trusted_publishers.clone();
-    for trusted in &trusted_publishers {
+    for trusted in &command.trusted_publishers {
         let (publisher, key) = parse_trusted_publisher_arg(trusted.as_str())?;
         trust_store.add_trusted_key(publisher, key)?;
     }
@@ -1033,6 +1076,9 @@ fn run_skills_install(command: SkillsInstallCommand) -> Result<()> {
     std::io::stdout().flush().context("stdout flush failed")
 }
 
+/// Updates an installed skill from a registry: a no-op when the resolved version is
+/// already current, otherwise delegated to [`run_skills_install`] for the full gate
+/// sequence.
 fn run_skills_update(command: SkillsUpdateCommand) -> Result<()> {
     if command.registry_dir.is_some() == command.registry_url.is_some() {
         anyhow::bail!(
@@ -1110,6 +1156,8 @@ fn run_skills_update(command: SkillsUpdateCommand) -> Result<()> {
     run_skills_install(install_command)
 }
 
+/// Removes one version (or the current version) of an installed skill, then repairs
+/// the index and the optional current-version pointer.
 fn run_skills_remove(
     skill_id: String,
     version: Option<String>,
@@ -1214,6 +1262,7 @@ fn run_skills_remove(
     std::io::stdout().flush().context("stdout flush failed")
 }
 
+/// Lists installed signed skills and markdown procedure skills under one inventory.
 fn run_skills_list(
     skills_dir: Option<String>,
     publisher: Option<String>,
@@ -1239,6 +1288,8 @@ fn run_skills_list(
     }
 
     let mut procedures = collect_procedure_skill_inventory(skills_root.as_path())?;
+    // Procedure skills have no publisher or version history, so publisher/current
+    // filters exclude them entirely instead of matching vacuously.
     if publisher.is_some() || current_only {
         procedures.clear();
     }
@@ -1332,6 +1383,8 @@ fn emit_skills_list_with_procedures(
     Ok(())
 }
 
+/// Shows the inventory record, manifest, signature, and archive listing of one
+/// installed skill version.
 fn run_skills_info(
     skill_id: String,
     version: Option<String>,
@@ -1364,6 +1417,9 @@ fn run_skills_info(
     std::io::stdout().flush().context("stdout flush failed")
 }
 
+/// Re-runs trust verification and the security audit for installed skills (or one
+/// skill/version) and reports a ready/blocked status per entry; a skill id with no
+/// installed record falls back to procedure skills with a matching slug.
 fn run_skills_check(
     skill_id: Option<String>,
     version: Option<String>,
@@ -1546,6 +1602,8 @@ fn emit_procedure_check_results(
     Ok(())
 }
 
+/// Maps a procedure skill's frontmatter status onto the shared check-result shape;
+/// procedures carry no signature, so trust is reported as accepted by definition.
 fn procedure_check_result_value(entry: &ProcedureSkillInventoryEntry) -> Value {
     let mut reasons = Vec::new();
     let check_status = if entry.status == "active" {
@@ -1573,6 +1631,8 @@ fn procedure_check_result_value(entry: &ProcedureSkillInventoryEntry) -> Value {
     })
 }
 
+/// Re-verifies one installed artifact against the trust store and refreshes the
+/// index's trust decision and payload hash with the result.
 fn run_skills_verify(
     skill_id: String,
     version: Option<String>,
@@ -1639,6 +1699,8 @@ fn run_skills_verify(
     std::io::stdout().flush().context("stdout flush failed")
 }
 
+/// One artifact selected for a security audit, either a loose file or an installed
+/// skill version.
 #[derive(Debug, Clone)]
 struct SkillAuditTarget {
     artifact_path: PathBuf,
@@ -1647,6 +1709,9 @@ struct SkillAuditTarget {
     version: Option<String>,
 }
 
+/// Runs the static security audit over an explicit artifact or installed skills and
+/// exits non-zero when any audited skill requires quarantine, so CI gates can rely on
+/// the exit code.
 fn run_skills_audit(command: SkillsAuditCommand) -> Result<()> {
     let json_output = output::preferred_json(command.json);
     let trust_store_path = resolve_skills_trust_store_path(command.trust_store.as_deref())?;
@@ -1812,16 +1877,8 @@ fn run_skills_audit(command: SkillsAuditCommand) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&output_payload)?);
     } else {
         for (target, report) in &reports {
-            let skill_label = target
-                .skill_id
-                .as_deref()
-                .map(|value| value.to_owned())
-                .unwrap_or_else(|| "unknown".to_owned());
-            let version_label = target
-                .version
-                .as_deref()
-                .map(|value| value.to_owned())
-                .unwrap_or_else(|| "unknown".to_owned());
+            let skill_label = target.skill_id.as_deref().unwrap_or("unknown");
+            let version_label = target.version.as_deref().unwrap_or("unknown");
             println!(
                 "skill.audit skill_id={} version={} source={} artifact={} passed={} should_quarantine={} failed_checks={} warnings={}",
                 skill_label,
@@ -1858,6 +1915,8 @@ fn run_skills_audit(command: SkillsAuditCommand) -> Result<()> {
     Ok(())
 }
 
+/// Asks the daemon to quarantine a skill version and mirrors the decision into the
+/// local audit log.
 fn run_skills_quarantine(command: SkillsQuarantineCommand) -> Result<()> {
     let skills_root = resolve_skills_root(command.skills_dir.as_deref())?;
     let version = resolve_skills_status_version(
@@ -1896,6 +1955,8 @@ fn run_skills_quarantine(command: SkillsQuarantineCommand) -> Result<()> {
     std::io::stdout().flush().context("stdout flush failed")
 }
 
+/// Asks the daemon to re-enable a quarantined skill; `--override` is mandatory so
+/// lifting a quarantine is always an explicit operator decision.
 fn run_skills_enable(command: SkillsEnableCommand) -> Result<()> {
     if !command.override_enabled {
         anyhow::bail!("skills enable requires --override");

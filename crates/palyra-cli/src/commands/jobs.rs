@@ -1,3 +1,10 @@
+//! Background-job operations over the daemon console API: list, show, tail,
+//! lifecycle actions (cancel/drain/resume/retry/attach/release), and
+//! maintenance sweeps.
+//!
+//! All payloads stay as raw JSON values so the CLI tolerates console schema
+//! additions without churn.
+
 use palyra_control_plane as control_plane;
 use serde_json::{json, Value};
 
@@ -5,11 +12,20 @@ use crate::cli::JobsCommand;
 use crate::commands::routines::{json_optional_string_at, json_value_at};
 use crate::*;
 
+/// Runs a `palyra jobs` subcommand on a fresh Tokio runtime.
+///
+/// # Errors
+/// Fails when the runtime cannot be built or the async handler fails.
 pub(crate) fn run_jobs(command: JobsCommand) -> Result<()> {
     let runtime = build_runtime()?;
     runtime.block_on(run_jobs_async(command))
 }
 
+/// Dispatches a `palyra jobs` subcommand against the admin console API.
+///
+/// # Errors
+/// Fails when the console connection, the endpoint call, or output encoding
+/// fails.
 pub(crate) async fn run_jobs_async(command: JobsCommand) -> Result<()> {
     let context =
         client::control_plane::connect_admin_console(app::ConnectionOverrides::default()).await?;

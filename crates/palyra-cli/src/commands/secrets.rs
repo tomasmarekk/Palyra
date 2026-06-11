@@ -1,3 +1,10 @@
+//! Secrets commands: local vault CRUD, vault-reference audit, runtime reload
+//! plan/apply, inventory, and secret-backed config writers.
+//!
+//! Output discipline matters here: secret values are read only via stdin/env/prompt,
+//! and text output plus audit findings must never echo raw vault references or
+//! values (see secret_audit_output_findings and sanitize_secret_error).
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{args::SecretsConfigureCommand, *};
@@ -5,6 +12,9 @@ use palyra_control_plane as control_plane;
 use palyra_vault::SecretMetadata;
 use serde_json::Value;
 
+/// Full result of a secrets audit: every discovered vault reference, the findings
+/// derived from them, and aggregate counts. Holds raw references; route it through
+/// [`secret_audit_output_findings`] before printing.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct SecretAuditPayload {
     pub(crate) path: String,
@@ -16,6 +26,7 @@ pub(crate) struct SecretAuditPayload {
     pub(crate) summary: SecretAuditSummary,
 }
 
+/// Resolution status of one configured vault reference (resolved/missing/invalid).
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct SecretReferenceAudit {
     pub(crate) component: String,
@@ -27,6 +38,8 @@ pub(crate) struct SecretReferenceAudit {
     pub(crate) detail: String,
 }
 
+/// One actionable audit finding with severity `blocking`, `warning`, or `info`;
+/// blocking findings fail `--strict` runs.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct SecretAuditFinding {
     pub(crate) severity: String,
@@ -38,6 +51,7 @@ pub(crate) struct SecretAuditFinding {
     pub(crate) remediation: String,
 }
 
+/// Aggregate audit counts used for strict-mode gating and one-line text summaries.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct SecretAuditSummary {
     pub(crate) total_references: usize,
@@ -53,6 +67,8 @@ struct SecretsApplyMode {
     affected_components: usize,
 }
 
+// Output twin of SecretAuditFinding: the reference and any reference-derived text
+// are replaced with <redacted> markers so findings can be printed or piped safely.
 #[derive(Debug, Serialize)]
 struct SecretAuditFindingOutput {
     severity: String,
@@ -96,6 +112,12 @@ struct SecretReferenceCandidate {
     reference: String,
 }
 
+/// Dispatches a `palyra secrets` subcommand.
+///
+/// # Errors
+/// Returns an error when vault access, config IO, or a daemon request fails, when
+/// input validation rejects the arguments, or when `--strict` audits find blocking
+/// findings.
 pub(crate) fn run_secrets(command: SecretsCommand) -> Result<()> {
     match command {
         SecretsCommand::Set { scope, key, value_stdin } => {
@@ -308,6 +330,16 @@ pub(crate) fn run_secrets(command: SecretsCommand) -> Result<()> {
     }
 }
 
+/// Audits every vault reference reachable from the config file, runtime auth
+/// profiles, and runtime webhooks against the local vault.
+///
+/// With `offline` set, runtime inspection is skipped instead of being reported as
+/// a warning finding. Unreachable runtime surfaces degrade to warnings rather than
+/// failing the audit.
+///
+/// # Errors
+/// Returns an error when the vault cannot be opened or the config file cannot be
+/// read or parsed; runtime connectivity problems are reported inside the payload.
 pub(crate) fn build_secrets_audit_payload(
     path: Option<String>,
     offline: bool,
@@ -687,6 +719,12 @@ fn run_secrets_configure(command: SecretsConfigureCommand) -> Result<()> {
 
 type SecretValueValidator = fn(&[u8]) -> Result<()>;
 
+/// Stores a stdin-provided secret in the vault, then rewrites the config file to
+/// reference it via `<scope>/<key>`.
+///
+/// The vault write happens first on purpose: if the config mutation or schema
+/// validation fails afterwards, the config never points at a missing secret (at
+/// worst the vault holds an unreferenced entry, which `secrets audit` reports).
 fn configure_secret_backed_setting<F>(
     scope_raw: String,
     key: String,
@@ -852,6 +890,8 @@ fn secret_audit_reference_redaction_terms(reference: &str) -> Vec<String> {
         push_secret_audit_redaction_term(&mut terms, stripped);
         add_parsed_vault_ref_redaction_terms(&mut terms, stripped);
     }
+    // Replace longest terms first; otherwise a shorter substring term would split a
+    // longer one and leave recognizable fragments of the reference in the output.
     terms.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
     terms.dedup();
     terms
@@ -900,6 +940,8 @@ fn build_secrets_apply_modes(audit: &SecretAuditPayload) -> Vec<SecretsApplyMode
         .collect()
 }
 
+/// Reads raw secret bytes from stdin; `--value-stdin` is mandatory so secret
+/// values never appear in process arguments or shell history.
 fn read_secret_bytes_from_stdin(value_stdin: bool) -> Result<Vec<u8>> {
     if !value_stdin {
         anyhow::bail!(
@@ -1106,6 +1148,8 @@ fn local_vault_inventory_payload(backend: &str, entries: &[SecretMetadata]) -> V
     })
 }
 
+// A '/' marks a `<scope>/<key>` vault reference (resolved locally); anything else
+// is treated as a configured-secret id and resolved through the daemon console.
 fn run_secret_explain(secret_id: &str, json: bool) -> Result<()> {
     if secret_id.contains('/') {
         let vault_ref = VaultRef::parse(secret_id)
@@ -1271,6 +1315,8 @@ fn emit_reload_plan_summary(plan: &control_plane::ConfigReloadPlanEnvelope) -> R
     Ok(())
 }
 
+/// Scrubs URL path segments and auth material from error text before it can reach
+/// any output channel.
 fn sanitize_secret_error(raw: &str) -> String {
     redact_auth_error(redact_url_segments_in_text(raw).as_str())
 }

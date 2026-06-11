@@ -1,5 +1,15 @@
+//! `palyra sandbox`: read-only list/explain views of the runtime tool policy
+//! for the process-runner and Wasm runtimes.
+//! The policy snapshot comes from the daemon admin status payload and goes
+//! through the standard secret-redaction pass before rendering.
+
 use crate::*;
 
+/// Runs a `palyra sandbox` subcommand against the live runtime tool policy.
+///
+/// # Errors
+/// Returns an error when the daemon admin surface is unreachable or its status
+/// payload lacks a tool policy section.
 pub(crate) fn run_sandbox(command: SandboxCommand) -> Result<()> {
     let policy = load_runtime_tool_policy_snapshot()?;
     match command {
@@ -45,6 +55,10 @@ fn sandbox_tool_policy_from_admin_status_payload(payload: &Value) -> Result<Valu
     Ok(policy)
 }
 
+// The generic redaction pass blanks anything under a "secrets" key, but the
+// Wasm allowlist holds secret *handles* (names operators must be able to
+// audit), not secret values, so the pre-redaction copy is restored here; a
+// unit test pins this behavior.
 fn restore_wasm_allowed_secret_handles(policy: &mut Value, allowed_secret_handles: Option<Value>) {
     let Some(handles) = allowed_secret_handles.filter(is_json_string_array) else {
         return;

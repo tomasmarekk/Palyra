@@ -1,3 +1,9 @@
+//! Destructive uninstall of a portable install root and, optionally, its
+//! state root.
+//!
+//! Refuses to remove the install root the running binary lives in, and only
+//! removes paths that pass the shared safe-removal-target checks.
+
 use std::{fs, path::PathBuf};
 
 use anyhow::{anyhow, Context, Result};
@@ -6,6 +12,7 @@ use serde::Serialize;
 use crate::cli::UninstallCommand;
 use crate::*;
 
+/// Uninstall outcome; field names are part of the pinned JSON output shape.
 #[derive(Debug, Clone, Serialize)]
 struct UninstallReport {
     dry_run: bool,
@@ -20,6 +27,13 @@ struct UninstallReport {
     next_steps: Vec<String>,
 }
 
+/// Runs `palyra uninstall`, removing the install root (and state root with
+/// `--remove-state`) or previewing in dry-run mode.
+///
+/// # Errors
+/// Fails when the destructive run lacks `--yes`, the active binary lives
+/// inside the target install root, a removal target is unsafe, or a
+/// filesystem removal fails.
 pub(crate) fn run_uninstall(command: UninstallCommand) -> Result<()> {
     if !command.dry_run && !command.yes {
         anyhow::bail!("uninstall is destructive; re-run with --yes or use --dry-run");
@@ -54,6 +68,8 @@ pub(crate) fn run_uninstall(command: UninstallCommand) -> Result<()> {
 
     if !command.dry_run {
         if let Some(state_root) = state_root.as_ref() {
+            // Best effort: a missing or already-removed service must not
+            // block removal of the install root itself.
             let _ = support::service::uninstall_gateway_service(state_root.as_path());
         }
         support::lifecycle::ensure_safe_removal_target(install_root.as_path(), "install_root")?;

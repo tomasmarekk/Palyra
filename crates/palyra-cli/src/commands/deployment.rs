@@ -1,3 +1,8 @@
+//! `palyra deployment`: profile discovery, manifest and recipe generation,
+//! preflight and promotion gating, rollback planning, and upgrade smoke runs.
+//! Profile manifests come from `palyra_common::deployment_profiles`; rendered
+//! recipes (env, Docker, Compose, systemd) are written verbatim to disk.
+
 use std::{collections::BTreeMap, path::PathBuf};
 
 use palyra_common::deployment_profiles::{
@@ -8,6 +13,11 @@ use serde::Serialize;
 
 use crate::*;
 
+/// Runs a `palyra deployment` subcommand.
+///
+/// # Errors
+/// Returns an error when config parsing, gate-file parsing, or writing
+/// generated manifests/recipes/plans to disk fails.
 pub(crate) fn run_deployment(command: DeploymentCommand) -> Result<()> {
     match command {
         DeploymentCommand::Profiles { json } => run_profiles(json),
@@ -502,6 +512,8 @@ fn build_promotion_report(
     let gates_source =
         gates_path.unwrap_or_else(|| "infra/release/deployment-promotion-gates.json".to_owned());
     let mut gates = built_in_promotion_gates(profile_id);
+    // An on-disk gates file replaces the built-in gate set wholesale (filtered
+    // to the selected profile); it is not merged with the defaults.
     if PathBuf::from(gates_source.as_str()).exists() {
         let raw = fs::read_to_string(gates_source.as_str())
             .with_context(|| format!("failed to read promotion gates {gates_source}"))?;
@@ -542,6 +554,8 @@ fn build_promotion_report(
     })
 }
 
+// A gate without a `profiles` selector (or with a malformed one) applies to
+// every profile, so externally-authored gates fail toward broader coverage.
 fn promotion_gate_applies_to_profile(
     item: &serde_json::Value,
     profile_id: DeploymentProfileId,

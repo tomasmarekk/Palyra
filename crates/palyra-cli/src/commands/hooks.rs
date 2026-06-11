@@ -1,8 +1,18 @@
+//! Hook binding administration: list, info, readiness check, bind,
+//! enable/disable, and remove.
+//!
+//! Readiness comes from the daemon-side check document attached to each
+//! binding; list filters apply client-side after the fetch.
+
 use palyra_control_plane as control_plane;
 use serde_json::Value;
 
 use crate::*;
 
+/// Runs a `palyra hooks` subcommand on a fresh Tokio runtime.
+///
+/// # Errors
+/// Fails when the runtime cannot be built or the async handler fails.
 pub(crate) fn run_hooks(command: HooksCommand) -> Result<()> {
     let runtime = build_runtime()?;
     runtime.block_on(run_hooks_async(command))

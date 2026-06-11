@@ -1,8 +1,19 @@
+//! Channel lifecycle entry points (add/login/logout/remove) shared by the
+//! generic `channels` surface.
+//!
+//! These wrappers keep `mod.rs` dispatch provider-neutral; the actual
+//! per-provider behavior lives under `providers`.
+
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 use crate::args::ChannelProviderArg;
 
+/// Runs an add/login lifecycle upsert by delegating to the provider dispatch.
+///
+/// # Errors
+/// Propagates provider validation, credential intake, and daemon transport
+/// failures.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_channel_lifecycle_upsert(
     action: &'static str,
@@ -60,6 +71,11 @@ pub(super) fn run_channel_lifecycle_upsert(
     )
 }
 
+/// Runs a logout/remove lifecycle disable by delegating to the provider
+/// dispatch.
+///
+/// # Errors
+/// Propagates provider validation and daemon transport failures.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_channel_lifecycle_disable(
     action: &'static str,
@@ -87,6 +103,11 @@ pub(super) fn run_channel_lifecycle_disable(
     )
 }
 
+/// Emits the result of a lifecycle disable as pretty JSON or the pinned
+/// `channels.<action>` text lines.
+///
+/// # Errors
+/// Fails when JSON encoding fails.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_channel_lifecycle_disable(
     action: &str,

@@ -1,3 +1,8 @@
+//! `palyra docs`: list, search, and show committed help snapshots.
+//! The index uses source-tree help snapshots in development checkouts and the
+//! bundled `docs/help_snapshots` directory next to the installed binary
+//! otherwise; `docs show` only resolves paths inside those roots.
+
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -66,6 +71,11 @@ struct ShowResult<'a> {
     content: &'a str,
 }
 
+/// Runs a `palyra docs` subcommand against the committed docs index.
+///
+/// # Errors
+/// Returns an error when no docs root is available, the query is empty or
+/// unmatched, or a requested entry cannot be resolved unambiguously.
 pub(crate) fn run_docs(command: DocsCommand) -> Result<()> {
     let index = build_docs_index()?;
     match command {
@@ -214,6 +224,8 @@ fn index_tree(
         let file_type = entry.file_type().with_context(|| {
             format!("failed to inspect docs entry type in {}", current.display())
         })?;
+        // Symlinks are skipped (not followed) so a planted link cannot pull
+        // files from outside the docs roots into the index; a test pins this.
         if file_type.is_symlink() {
             continue;
         }
@@ -379,6 +391,9 @@ fn resolve_requested_doc<'a>(index: &'a [IndexedDoc], requested: &str) -> Result
     }
 }
 
+// Filesystem-path lookups are canonicalized and then containment-checked
+// against the docs root so `docs show <path>` can never read arbitrary files
+// that merely exist on disk; a test pins this boundary.
 fn resolve_requested_doc_by_path<'a>(
     index: &'a [IndexedDoc],
     requested: &str,
@@ -402,6 +417,8 @@ fn resolve_requested_doc_by_path<'a>(
     Ok(index.iter().find(|entry| entry.absolute_path == canonical))
 }
 
+// Weights favor identifier-like fields (slug, title, path) over incidental
+// body hits so command-name queries rank their own page first.
 fn score_doc_match(entry: &IndexedDoc, query: &str) -> usize {
     let query = query.to_ascii_lowercase();
     let slug_hits = match_count(entry.slug.as_str(), query.as_str()) * 8;

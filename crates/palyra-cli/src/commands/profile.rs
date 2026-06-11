@@ -1,3 +1,10 @@
+//! `palyra profile` command handlers for the CLI connection-profile registry.
+//!
+//! Manages named profiles (list/show/create/clone/use/rename/delete) with isolated
+//! per-profile state roots and config snapshots, plus portability bundles for
+//! export/import. Bundles are either secret-redacted JSON or AES-256-GCM encrypted
+//! with a PBKDF2-derived key; raw secrets never leave the machine unencrypted.
+
 use std::{
     fs,
     io::{Read, Write},
@@ -32,6 +39,8 @@ const PROFILE_REDACTED_VALUE: &str = "<redacted>";
 const PROFILE_CONFIG_WRITE_BACKUPS: usize = 1;
 const PROFILE_AEAD_AAD: &[u8] = b"palyra.cli.profile_bundle.v1";
 
+/// JSON-facing view of one registry profile; field names are part of the pinned CLI
+/// output contract.
 #[derive(Debug, Clone, Serialize)]
 struct ProfileListRecord {
     name: String,
@@ -63,6 +72,7 @@ struct ProfileListPayload {
     profiles: Vec<ProfileListRecord>,
 }
 
+/// Shared JSON envelope for every mutating profile action (`action` names which one).
 #[derive(Debug, Clone, Serialize)]
 struct ProfileMutationPayload {
     action: &'static str,
@@ -104,6 +114,8 @@ struct ProfileValidationReport {
     summary: ProfileValidationSummary,
 }
 
+/// Profile metadata carried in a portability bundle; deliberately excludes machine
+/// paths (state root) and inline secrets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PortableProfileRecord {
     name: String,
@@ -122,6 +134,8 @@ struct PortableProfileRecord {
     source_config_path: Option<String>,
 }
 
+/// Config snapshot embedded in a bundle; `sha256` covers `content` so imports can be
+/// integrity-checked.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PortableProfileConfig {
     source_path: String,
@@ -130,6 +144,8 @@ struct PortableProfileConfig {
     content: String,
 }
 
+/// One `*_vault_ref` occurrence found in a profile config; bundles carry references
+/// instead of secret values so the importing machine repairs its own vault.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProfileSecretReference {
     component_path: String,
@@ -138,6 +154,8 @@ struct ProfileSecretReference {
     key: String,
 }
 
+/// Plaintext (redacted-mode) export bundle; the encrypted mode wraps this JSON inside
+/// [`EncryptedProfileBundle`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProfilePortabilityBundle {
     schema_version: u32,
@@ -149,6 +167,9 @@ struct ProfilePortabilityBundle {
     secret_references: Vec<ProfileSecretReference>,
 }
 
+/// Self-describing AES-256-GCM envelope around a serialized
+/// [`ProfilePortabilityBundle`]; the `kind` discriminator is how imports detect
+/// encrypted bundles.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct EncryptedProfileBundle {
     schema_version: u32,
@@ -205,6 +226,8 @@ struct LoadedProfileConfig {
     secret_references: Vec<ProfileSecretReference>,
 }
 
+/// Result of trying to load a profile's config file; non-`Loaded` outcomes become
+/// warnings or validation findings rather than hard errors.
 #[derive(Debug)]
 enum ProfileConfigLoadOutcome {
     Unconfigured,
@@ -213,6 +236,11 @@ enum ProfileConfigLoadOutcome {
     Loaded(LoadedProfileConfig),
 }
 
+/// Entry point for `palyra profile`, dispatching to the per-subcommand handlers.
+///
+/// # Errors
+/// Returns an error when the registry cannot be loaded/persisted or the dispatched
+/// subcommand fails.
 pub(crate) fn run_profile(command: ProfileCommand) -> Result<()> {
     match command {
         ProfileCommand::List { json, ndjson } => run_profile_list(json, ndjson),
@@ -774,6 +802,8 @@ fn run_profile_rename(name: String, new_name: String, json: bool) -> Result<()> 
         .profiles
         .remove(name.as_str())
         .ok_or_else(|| anyhow!("CLI profile not found: {name}"))?;
+    // Follow the rename only for the derived default paths; operator-chosen custom
+    // state roots and config paths must stay untouched.
     if let Some(state_root) =
         profile.state_root.as_deref().and_then(|value| app::normalized_profile_text(Some(value)))
     {
@@ -959,6 +989,11 @@ fn emit_mutation_payload(payload: &ProfileMutationPayload, json: bool) -> Result
     std::io::stdout().flush().context("stdout flush failed")
 }
 
+/// Resolves the profile a command targets: explicit name, then active profile, then
+/// the registry default.
+///
+/// # Errors
+/// Returns an error for an invalid explicit name or when no profile can be inferred.
 fn resolve_requested_profile_name(
     name: Option<String>,
     active_profile: Option<&str>,
@@ -1052,6 +1087,7 @@ fn profile_uses_remote_admin_surface(profile: &CliConnectionProfile) -> bool {
     profile.daemon_url.as_deref().is_some_and(is_non_loopback_url)
 }
 
+/// Treats unparseable URLs as non-loopback so the admin-token warning fails safe.
 fn is_non_loopback_url(raw: &str) -> bool {
     match profile_url_host(raw) {
         Some(host) => !is_loopback_host(host),
@@ -1059,6 +1095,8 @@ fn is_non_loopback_url(raw: &str) -> bool {
     }
 }
 
+/// Best-effort host extraction that tolerates scheme-less and userinfo-bearing URLs;
+/// used only for loopback classification, not for connecting.
 fn profile_url_host(raw: &str) -> Option<&str> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -1087,6 +1125,12 @@ fn is_loopback_host(host: &str) -> bool {
         || normalized.parse::<IpAddr>().is_ok_and(|address| address.is_loopback())
 }
 
+/// Loads, validates, and renders a profile's config file, capturing both the full and
+/// secret-redacted serializations plus any vault references it contains.
+///
+/// # Errors
+/// Returns an error only for I/O failures on an existing file or serialization bugs;
+/// missing/invalid configs are reported through [`ProfileConfigLoadOutcome`].
 fn load_profile_config(config_path: Option<&str>) -> Result<ProfileConfigLoadOutcome> {
     let Some(config_path) = config_path.and_then(|value| app::normalized_profile_text(Some(value)))
     else {
@@ -1129,6 +1173,11 @@ fn load_profile_config(config_path: Option<&str>) -> Result<ProfileConfigLoadOut
     }))
 }
 
+/// Validates `content` against the daemon schema and persists it as the named
+/// profile's isolated config snapshot, returning the snapshot path.
+///
+/// # Errors
+/// Returns an error when the snapshot fails parsing/validation or cannot be written.
 fn write_profile_config_snapshot(profile_name: &str, content: &str) -> Result<PathBuf> {
     let path = app::default_profile_config_path(profile_name)?;
     let (document, _) = parse_document_with_migration(content)
@@ -1234,18 +1283,9 @@ fn append_admin_token_env_finding(
     else {
         return;
     };
-    if std::env::var(&admin_token_env)
-        .ok()
-        .and_then(|value| {
-            let trimmed = value.trim().to_owned();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed)
-            }
-        })
-        .is_none()
-    {
+    let admin_token_present =
+        std::env::var(&admin_token_env).is_ok_and(|value| !value.trim().is_empty());
+    if !admin_token_present {
         findings.push(ProfileValidationFinding {
             severity: "warning".to_owned(),
             code: "missing_admin_token_env".to_owned(),
@@ -1256,6 +1296,8 @@ fn append_admin_token_env_finding(
     }
 }
 
+/// Audits bundle secret references against the local vault, appending a blocking
+/// finding per unresolvable reference (or a single warning when the vault is closed).
 fn append_secret_reference_findings(
     secret_references: &[ProfileSecretReference],
     findings: &mut Vec<ProfileValidationFinding>,
@@ -1361,6 +1403,9 @@ fn build_validation_report(
     }
 }
 
+/// Walks the config document and collects every populated `*_vault_ref` value;
+/// unparseable references are kept with `invalid` scope/key so import validation can
+/// flag them instead of dropping them silently.
 fn collect_secret_references(document: &toml::Value) -> Vec<ProfileSecretReference> {
     let mut references = Vec::new();
     collect_secret_references_inner(document, "", &mut references);
@@ -1417,9 +1462,16 @@ fn collect_secret_references_inner(
     }
 }
 
+/// Reads an export bundle from disk, decrypting it first when it is the encrypted kind.
+///
+/// # Errors
+/// Returns an error for unreadable files, decryption failures, malformed bundles, or a
+/// `--password-stdin` flag supplied for a plaintext bundle.
 fn read_profile_bundle(path: &Path, password_stdin: bool) -> Result<ProfilePortabilityBundle> {
     let bytes = fs::read(path)
         .with_context(|| format!("failed to read profile bundle {}", path.display()))?;
+    // Both bundle kinds are JSON, so encryption is detected by the `kind` discriminator
+    // rather than by parse success alone.
     if let Ok(encrypted) = serde_json::from_slice::<EncryptedProfileBundle>(bytes.as_slice()) {
         if encrypted.kind == PROFILE_EXPORT_ENCRYPTED_KIND {
             let password = read_password_from_stdin(password_stdin)?;
@@ -1435,9 +1487,16 @@ fn read_profile_bundle(path: &Path, password_stdin: bool) -> Result<ProfilePorta
         .context("failed to parse profile bundle")
 }
 
+/// Encrypts a serialized bundle with AES-256-GCM under a PBKDF2-derived key.
+///
+/// The single-use `LessSafeKey` nonce is sound here: every export derives a fresh key
+/// from a newly random salt, so a (key, nonce) pair can never repeat across bundles.
+///
+/// # Errors
+/// Returns an error when randomness generation or sealing fails.
 fn encrypt_profile_bundle(plaintext: &[u8], password: &[u8]) -> Result<EncryptedProfileBundle> {
-    let iterations =
-        NonZeroU32::new(PROFILE_EXPORT_PBKDF2_ITERATIONS).expect("iterations are non-zero");
+    let iterations = NonZeroU32::new(PROFILE_EXPORT_PBKDF2_ITERATIONS)
+        .expect("PROFILE_EXPORT_PBKDF2_ITERATIONS is a non-zero constant");
     let mut salt = [0_u8; PROFILE_EXPORT_SALT_LEN];
     let mut nonce_bytes = [0_u8; PROFILE_EXPORT_NONCE_LEN];
     let rng = SystemRandom::new();
@@ -1466,6 +1525,11 @@ fn encrypt_profile_bundle(plaintext: &[u8], password: &[u8]) -> Result<Encrypted
     })
 }
 
+/// Decrypts an encrypted bundle envelope back to the serialized plaintext bundle.
+///
+/// # Errors
+/// Returns an error for unsupported schema/cipher/KDF parameters, malformed base64
+/// fields, or an authentication failure (wrong password or corrupted data).
 fn decrypt_profile_bundle(envelope: &EncryptedProfileBundle, password: &[u8]) -> Result<Vec<u8>> {
     if envelope.schema_version != PROFILE_EXPORT_SCHEMA_VERSION {
         anyhow::bail!(
@@ -1509,6 +1573,11 @@ fn decrypt_profile_bundle(envelope: &EncryptedProfileBundle, password: &[u8]) ->
     Ok(plaintext.to_vec())
 }
 
+/// Reads the bundle passphrase from stdin, stripping trailing newlines.
+///
+/// # Errors
+/// Returns an error when `--password-stdin` was not passed (passphrases must never be
+/// process arguments), when stdin cannot be read, or when it contains no bytes.
 fn read_password_from_stdin(password_stdin: bool) -> Result<Vec<u8>> {
     if !password_stdin {
         anyhow::bail!(
@@ -1561,6 +1630,12 @@ fn parse_profile_path(raw: &str, label: &str) -> Result<PathBuf> {
     palyra_common::parse_config_path(raw).with_context(|| format!("{label} is invalid: {raw}"))
 }
 
+/// Guards `--delete-state-root` so it can only remove directories inside the CLI
+/// state-root namespace, never arbitrary filesystem locations.
+///
+/// # Errors
+/// Returns an error when the path fails the generic removal-target checks or resolves
+/// outside the CLI state root.
 fn ensure_safe_profile_state_root_removal(path: &Path) -> Result<()> {
     crate::support::lifecycle::ensure_safe_removal_target(path, "profile state root")?;
     let canonical = crate::support::lifecycle::canonicalize_lossy(path)?;
@@ -1618,6 +1693,10 @@ fn profile_risk_level_label(level: ProfileRiskLevelArg) -> String {
     .to_owned()
 }
 
+/// Returns the current UNIX time in milliseconds.
+///
+/// # Errors
+/// Returns an error when the system clock predates the UNIX epoch or overflows `i64`.
 fn now_unix_ms() -> Result<i64> {
     let duration = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1625,6 +1704,8 @@ fn now_unix_ms() -> Result<i64> {
     i64::try_from(duration.as_millis()).context("system clock exceeds supported timestamp range")
 }
 
+/// Compares two paths after lossy canonicalization; on Windows separators and casing
+/// are normalized because the filesystem treats them as equivalent.
 fn paths_equivalent(left: &Path, right: &Path) -> bool {
     let left =
         crate::support::lifecycle::canonicalize_lossy(left).unwrap_or_else(|_| left.to_path_buf());

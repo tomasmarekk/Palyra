@@ -1,3 +1,8 @@
+//! `palyra plugins`: manage plugin bindings (list, inspect, check, install,
+//! update, enable/disable, remove) through the daemon control plane.
+//! Plugin config JSON is parsed and size-capped locally before any daemon
+//! connection, and inline `--config-json` must not carry plain secret values.
+
 use palyra_control_plane as control_plane;
 use serde_json::{json, Value};
 
@@ -5,12 +10,19 @@ use crate::*;
 
 const MAX_PLUGIN_CONFIG_JSON_BYTES: usize = 128 * 1024;
 
+/// Runs a `palyra plugins` subcommand on a dedicated Tokio runtime.
+///
+/// # Errors
+/// Returns an error when plugin config input is invalid or secret-bearing
+/// inline, or when the daemon control-plane call fails.
 pub(crate) fn run_plugins(command: PluginsCommand) -> Result<()> {
     let runtime = build_runtime()?;
     runtime.block_on(run_plugins_async(command))
 }
 
 async fn run_plugins_async(command: PluginsCommand) -> Result<()> {
+    // Parse and validate config input before dialing the daemon so malformed
+    // or secret-bearing input fails fast without opening a connection.
     let prevalidated_config = match &command {
         PluginsCommand::Install { config_json, config_json_file, config_json_stdin, .. }
         | PluginsCommand::Update { config_json, config_json_file, config_json_stdin, .. } => {
@@ -103,7 +115,7 @@ async fn run_plugins_async(command: PluginsCommand) -> Result<()> {
                         channels: capability_channels,
                     }),
                     config: prevalidated_config
-                        .expect("plugin install config should be parsed before daemon connection"),
+                        .expect("install config is prevalidated before the daemon connection"),
                     clear_config: clear_config.then_some(true),
                     operator: Some(control_plane::PluginOperatorMetadata {
                         display_name,
@@ -161,7 +173,7 @@ async fn run_plugins_async(command: PluginsCommand) -> Result<()> {
                         channels: capability_channels,
                     }),
                     config: prevalidated_config
-                        .expect("plugin update config should be parsed before daemon connection"),
+                        .expect("update config is prevalidated before the daemon connection"),
                     clear_config: clear_config.then_some(true),
                     operator: Some(control_plane::PluginOperatorMetadata {
                         display_name,
@@ -603,6 +615,8 @@ fn read_config_json_file(path_raw: &str) -> Result<String> {
     let file = fs::File::open(path)
         .with_context(|| format!("failed to open --config-json-file {}", path.display()))?;
     let mut raw = String::new();
+    // take(max + 1) re-checks the size during the read so a file growing after
+    // the metadata check above still cannot exceed the cap.
     let mut reader = file.take(MAX_PLUGIN_CONFIG_JSON_BYTES as u64 + 1);
     reader
         .read_to_string(&mut raw)
@@ -631,6 +645,9 @@ fn ensure_config_json_size(raw: &str, source: &str) -> Result<()> {
     Ok(())
 }
 
+// Inline --config-json travels through argv and shell history, so plain secret
+// values are rejected there; files, stdin, and vault references remain the
+// supported secret-bearing paths.
 fn reject_inline_config_secrets(value: &Value) -> Result<()> {
     let mut rejected_paths = Vec::new();
     collect_inline_config_secret_paths(value, "$", &mut rejected_paths);
@@ -711,6 +728,8 @@ fn contains_plain_inline_secret_value(value: &Value) -> bool {
     }
 }
 
+// Only known vault-reference metadata keys are allowed so an object cannot
+// smuggle a plain secret value in an extra field next to a valid vault_ref.
 fn is_structured_vault_reference(fields: &serde_json::Map<String, Value>) -> bool {
     const ALLOWED_KEYS: &[&str] = &[
         "kind",

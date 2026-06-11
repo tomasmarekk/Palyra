@@ -1,7 +1,21 @@
+//! SSH local-forward helper for reaching a remote daemon dashboard.
+//!
+//! Shells out to the system `ssh` binary and blocks until the tunnel
+//! process exits; the experimental backend flag only changes the reported
+//! preview status, not behavior.
+
 use crate::*;
 
 const SSH_TUNNEL_BACKEND_FLAG: &str = "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_SSH_TUNNEL";
 
+/// Runs `palyra tunnel`, forwarding a local port to the remote daemon over
+/// ssh and optionally opening the local dashboard URL first.
+///
+/// Blocks for the lifetime of the ssh process.
+///
+/// # Errors
+/// Fails when arguments are blank, the browser open fails, ssh cannot be
+/// launched, or ssh exits unsuccessfully.
 pub(crate) fn run_tunnel(
     ssh: String,
     remote_port: u16,
@@ -12,12 +26,9 @@ pub(crate) fn run_tunnel(
     let ssh = normalize_required_text_arg(ssh, "--ssh")?;
     let identity_file = identity_file.and_then(normalize_optional_text_arg);
     let local_dashboard_url = format!("http://127.0.0.1:{local_port}/");
-    let preview_enabled = std::env::var(SSH_TUNNEL_BACKEND_FLAG)
-        .ok()
-        .map(|value| {
-            matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-        })
-        .unwrap_or(false);
+    let preview_enabled = std::env::var(SSH_TUNNEL_BACKEND_FLAG).is_ok_and(|value| {
+        matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+    });
     println!(
         "tunnel.backend_profile=ssh_tunnel preview_enabled={} rollout_flag={} manual_forward_required=true",
         preview_enabled, SSH_TUNNEL_BACKEND_FLAG

@@ -1,6 +1,15 @@
+//! Shell completion script generation.
+//!
+//! Broken pipes are tolerated because completion output is routinely piped
+//! into pagers or truncating consumers during shell initialization.
+
 use crate::*;
 use std::io::{self, ErrorKind, Write};
 
+/// Generates the completion script for the requested shell on stdout.
+///
+/// # Errors
+/// Fails on stdout write or flush errors other than a broken pipe.
 pub(crate) fn run_completion(shell: CompletionShell) -> Result<()> {
     let mut command = Cli::command();
     let mut completion = Vec::new();

@@ -1,8 +1,18 @@
+//! Paired-device administration: list, show, certificate rotation, revoke,
+//! remove, and bulk clear.
+//!
+//! Revocation and removal are trust-removal operations executed by the
+//! daemon through the admin console; the CLI only renders the envelopes.
+
 use palyra_control_plane as control_plane;
 
 use crate::args::DevicesCommand;
 use crate::*;
 
+/// Runs a `palyra devices` subcommand on a fresh Tokio runtime.
+///
+/// # Errors
+/// Fails when the runtime cannot be built or the async handler fails.
 pub(crate) fn run_devices(command: DevicesCommand) -> Result<()> {
     let runtime = build_runtime()?;
     runtime.block_on(run_devices_async(command))

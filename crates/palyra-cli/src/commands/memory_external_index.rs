@@ -1,6 +1,16 @@
+//! Output emitters for memory external-index console payloads.
+//!
+//! Renders drift, reconciliation, and diagnostics sections of `/console/v1/memory/*`
+//! responses as stable key=value lines; shared by the `memory` command emitters in
+//! `commands::memory`. All printed text is pinned by CLI parity tests.
+
 use crate::*;
 use serde_json::Value;
 
+/// Prints the external-index drift payload as pinned key=value lines, or as pretty JSON.
+///
+/// # Errors
+/// Returns an error if JSON encoding or the final stdout flush fails.
 pub(crate) fn emit_memory_index_drift(payload: &Value, json_output: bool) -> Result<()> {
     if json_output {
         return output::print_json_pretty(
@@ -21,6 +31,10 @@ pub(crate) fn emit_memory_index_drift(payload: &Value, json_output: bool) -> Res
     std::io::stdout().flush().context("stdout flush failed")
 }
 
+/// Prints the external-index reconciliation summary plus index/diagnostics follow-up lines.
+///
+/// # Errors
+/// Returns an error if JSON encoding or the final stdout flush fails.
 pub(crate) fn emit_memory_index_reconcile(payload: &Value, json_output: bool) -> Result<()> {
     if json_output {
         return output::print_json_pretty(
@@ -52,6 +66,10 @@ pub(crate) fn emit_memory_index_reconcile(payload: &Value, json_output: bool) ->
     std::io::stdout().flush().context("stdout flush failed")
 }
 
+/// Locates the external-index object inside a memory console payload, if present.
+///
+/// Console endpoints nest the external-index block at different depths depending on
+/// the route (status vs. index vs. drift), so all known locations are probed in order.
 pub(crate) fn memory_external_index_payload(payload: &Value) -> Option<&Value> {
     payload
         .pointer("/external_index")
@@ -62,6 +80,7 @@ pub(crate) fn memory_external_index_payload(payload: &Value) -> Option<&Value> {
         })
 }
 
+/// Prints one pinned key=value summary line for an external-index object.
 pub(crate) fn print_external_index_line(label: &str, external_index: &Value) {
     let state = external_index.get("state").and_then(Value::as_str).unwrap_or("unknown");
     let reason = external_index.get("reason").and_then(Value::as_str).unwrap_or("unknown");
@@ -90,6 +109,7 @@ pub(crate) fn print_external_index_line(label: &str, external_index: &Value) {
     );
 }
 
+/// Prints one pinned key=value summary line for an external-index drift object.
 pub(crate) fn print_external_drift_line(label: &str, drift: &Value) {
     let drift_count = drift.get("drift_count").and_then(Value::as_u64).unwrap_or(0);
     let memory_drift = drift.get("memory_drift").and_then(Value::as_i64).unwrap_or(0);
@@ -111,6 +131,7 @@ pub(crate) fn print_external_drift_line(label: &str, drift: &Value) {
     );
 }
 
+/// Prints one pinned key=value summary line for external-index retrieval diagnostics.
 pub(crate) fn print_external_index_diagnostics_line(label: &str, diagnostics: &Value) {
     let retrieval_mode =
         diagnostics.get("retrieval_mode").and_then(Value::as_str).unwrap_or("unknown");

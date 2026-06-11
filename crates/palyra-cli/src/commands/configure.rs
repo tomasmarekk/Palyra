@@ -1,7 +1,17 @@
+//! Thin adapter from the `palyra configure` argument surface to the
+//! operator configure wizard.
+//!
+//! After the wizard finishes, the active CLI profile is repointed at the
+//! configured paths so subsequent commands use them.
+
 use std::path::PathBuf;
 
 use crate::*;
 
+/// Runs the configure wizard and updates the active profile paths.
+///
+/// # Errors
+/// Propagates wizard failures and profile-update failures.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_configure(
     path: Option<String>,

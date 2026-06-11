@@ -1,3 +1,10 @@
+//! Backend-agnostic step engine for guided CLI wizards.
+//!
+//! `WizardSession` drives typed steps (text, select, confirm, ...) against a
+//! `WizardBackend`: interactive stdin/stdout prompting, non-interactive flag-driven
+//! answers, or scripted answers in tests. Onboarding and setup flows build on this
+//! so the same step sequence works across all three modes.
+
 #[cfg(test)]
 use std::collections::VecDeque;
 use std::{
@@ -7,6 +14,7 @@ use std::{
     io::{self, Write},
 };
 
+/// Input modality of a single wizard step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StepKind {
     Note,
@@ -18,6 +26,7 @@ pub(crate) enum StepKind {
     Action,
 }
 
+/// One selectable option of a select/multi-select step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StepChoice {
     pub(crate) value: String,
@@ -25,6 +34,8 @@ pub(crate) struct StepChoice {
     pub(crate) hint: Option<String>,
 }
 
+/// Declarative description of a single wizard step; `id` keys prefilled and scripted
+/// answers, so it must stay stable across releases.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WizardStep {
     pub(crate) id: &'static str,
@@ -39,6 +50,7 @@ pub(crate) struct WizardStep {
 }
 
 impl WizardStep {
+    /// Builds an informational step that prints text and expects no input.
     pub(crate) fn note(
         id: &'static str,
         title: impl Into<String>,
@@ -57,6 +69,7 @@ impl WizardStep {
         }
     }
 
+    /// Builds a step that pauses for an explicit Enter/cancel acknowledgement.
     pub(crate) fn action(
         id: &'static str,
         title: impl Into<String>,
@@ -75,6 +88,7 @@ impl WizardStep {
         }
     }
 
+    /// Builds a step that announces a long-running operation before it executes.
     pub(crate) fn progress(
         id: &'static str,
         title: impl Into<String>,
@@ -94,6 +108,7 @@ impl WizardStep {
     }
 }
 
+/// Typed answer produced by a wizard step.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) enum WizardValue {
     None,
@@ -104,6 +119,8 @@ pub(crate) enum WizardValue {
     Multi(Vec<String>),
 }
 
+// INTENTIONAL: manual Debug impl so sensitive input is never leaked through the
+// `{other:?}` interpolation in validation error messages. Do not derive Debug.
 impl fmt::Debug for WizardValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -117,6 +134,7 @@ impl fmt::Debug for WizardValue {
     }
 }
 
+/// Failure modes of a wizard run; every variant carries the offending step id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WizardError {
     Cancelled { step_id: String },
@@ -144,14 +162,21 @@ impl fmt::Display for WizardError {
 
 impl Error for WizardError {}
 
+/// Answer source for wizard steps (interactive prompts, flag defaults, or test scripts).
 pub(crate) trait WizardBackend {
+    /// Resolves one step to a value, prompting or looking up answers as needed.
     fn execute_step(&mut self, step: &WizardStep) -> Result<WizardValue, WizardError>;
 
+    /// Reports a validation failure; backends either surface it and allow a retry
+    /// or convert it into a terminal [`WizardError::Validation`].
     fn on_validation_error(&mut self, step: &WizardStep, message: &str) -> Result<(), WizardError>;
 
+    /// Returns true when the backend can re-prompt after a validation failure.
     fn retries_on_validation_error(&self) -> bool;
 }
 
+/// Drives a sequence of typed steps against a [`WizardBackend`], enforcing that each
+/// answer matches the step kind and re-running validation according to backend policy.
 pub(crate) struct WizardSession<'a, B: ?Sized> {
     backend: &'a mut B,
 }
@@ -164,16 +189,28 @@ where
         Self { backend }
     }
 
+    /// Shows an informational step; never produces a value.
+    ///
+    /// # Errors
+    /// Propagates backend I/O or cancellation errors.
     pub(crate) fn note(&mut self, step: WizardStep) -> Result<(), WizardError> {
         let _ = self.backend.execute_step(&step)?;
         Ok(())
     }
 
+    /// Runs an acknowledgement step.
+    ///
+    /// # Errors
+    /// Returns [`WizardError::Cancelled`] when the operator aborts, or backend I/O errors.
     pub(crate) fn action(&mut self, step: WizardStep) -> Result<(), WizardError> {
         let _ = self.backend.execute_step(&step)?;
         Ok(())
     }
 
+    /// Announces `step`, then runs `op` and returns its result.
+    ///
+    /// # Errors
+    /// Propagates backend errors from the announcement and any error returned by `op`.
     pub(crate) fn progress<T, F>(&mut self, step: WizardStep, op: F) -> Result<T, WizardError>
     where
         F: FnOnce() -> Result<T, WizardError>,
@@ -182,15 +219,20 @@ where
         op()
     }
 
+    /// Collects a text answer, re-prompting on validation failures when the backend allows.
+    ///
+    /// # Errors
+    /// Returns [`WizardError::Validation`] for non-text answers or terminal validation
+    /// failures, and propagates cancellation and I/O errors from the backend.
     pub(crate) fn text<F>(&mut self, step: WizardStep, validator: F) -> Result<String, WizardError>
     where
         F: Fn(&str) -> Result<(), String>,
     {
         loop {
             let value = match self.backend.execute_step(&step)? {
-                WizardValue::Text(value) => value,
-                WizardValue::SensitiveText(value) => value,
-                WizardValue::Choice(value) => value,
+                WizardValue::Text(value)
+                | WizardValue::SensitiveText(value)
+                | WizardValue::Choice(value) => value,
                 WizardValue::None if step.allow_empty => String::new(),
                 other => {
                     return Err(WizardError::Validation {
@@ -211,6 +253,11 @@ where
         }
     }
 
+    /// Collects a yes/no answer.
+    ///
+    /// # Errors
+    /// Returns [`WizardError::Validation`] for non-boolean answers and propagates
+    /// backend errors.
     pub(crate) fn confirm(&mut self, step: WizardStep) -> Result<bool, WizardError> {
         match self.backend.execute_step(&step)? {
             WizardValue::Bool(value) => Ok(value),
@@ -221,11 +268,16 @@ where
         }
     }
 
+    /// Collects a single-choice answer (text-like answers are accepted as choice values).
+    ///
+    /// # Errors
+    /// Returns [`WizardError::Validation`] for incompatible answers and propagates
+    /// backend errors.
     pub(crate) fn select(&mut self, step: WizardStep) -> Result<String, WizardError> {
         match self.backend.execute_step(&step)? {
-            WizardValue::Choice(value) => Ok(value),
-            WizardValue::Text(value) => Ok(value),
-            WizardValue::SensitiveText(value) => Ok(value),
+            WizardValue::Choice(value)
+            | WizardValue::Text(value)
+            | WizardValue::SensitiveText(value) => Ok(value),
             other => Err(WizardError::Validation {
                 step_id: step.id.to_owned(),
                 message: format!("expected selection input, received {other:?}"),
@@ -233,6 +285,11 @@ where
         }
     }
 
+    /// Collects a multi-choice answer.
+    ///
+    /// # Errors
+    /// Returns [`WizardError::Validation`] for non-multi answers and propagates
+    /// backend errors.
     pub(crate) fn multiselect(&mut self, step: WizardStep) -> Result<Vec<String>, WizardError> {
         match self.backend.execute_step(&step)? {
             WizardValue::Multi(values) => Ok(values),
@@ -244,6 +301,8 @@ where
     }
 }
 
+/// Terminal backend that prompts on stdout/stdin; CLI flags may prefill answers,
+/// each consumed at most once before falling back to a live prompt.
 pub(crate) struct InteractiveWizardBackend {
     answers: BTreeMap<String, WizardValue>,
 }
@@ -298,6 +357,8 @@ impl InteractiveWizardBackend {
 
 impl WizardBackend for InteractiveWizardBackend {
     fn execute_step(&mut self, step: &WizardStep) -> Result<WizardValue, WizardError> {
+        // Prefilled answers only short-circuit input steps; notes, progress, and action
+        // steps must still render so the operator sees the full narrative.
         if !matches!(step.kind, StepKind::Note | StepKind::Progress | StepKind::Action) {
             if let Some(value) = self.answers.remove(step.id) {
                 return Ok(value);
@@ -455,6 +516,8 @@ impl WizardBackend for InteractiveWizardBackend {
     }
 }
 
+/// Prompt-free backend for `--non-interactive` runs: answers come only from provided
+/// values or step defaults, and any gap fails fast instead of blocking on stdin.
 pub(crate) struct NonInteractiveWizardBackend {
     answers: BTreeMap<String, WizardValue>,
 }
@@ -503,6 +566,7 @@ impl WizardBackend for NonInteractiveWizardBackend {
     }
 }
 
+/// Maps a step id to the actionable error text shown when non-interactive input is missing.
 fn missing_non_interactive_input_message(step: &WizardStep) -> &'static str {
     match step.id {
         "accept_risk_ack" => {
@@ -512,6 +576,7 @@ fn missing_non_interactive_input_message(step: &WizardStep) -> &'static str {
     }
 }
 
+/// Test backend that replays scripted per-step answers and records validation messages.
 #[cfg(test)]
 pub(crate) struct ScriptedWizardBackend {
     scripted: BTreeMap<String, VecDeque<Result<WizardValue, WizardError>>>,

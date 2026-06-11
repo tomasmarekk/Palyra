@@ -1,24 +1,30 @@
+//! Renderers for Discord onboarding and verify responses.
+//!
+//! Diagnostics go to stderr so stdout stays reserved for the pinned
+//! machine-readable success lines; helpers tolerate both top-level and
+//! `preflight`-nested payload shapes returned by the daemon.
+
 use serde_json::Value;
 
 use crate::read_json_string;
 
+/// Prints onboarding warnings and policy warnings to stderr.
 pub(crate) fn onboarding_warnings(payload: &Value) {
     let preflight = payload.get("preflight").unwrap_or(payload);
-    let warnings = preflight.get("warnings").and_then(Value::as_array).cloned().unwrap_or_default();
-    for warning in warnings {
+    for warning in preflight.get("warnings").and_then(Value::as_array).into_iter().flatten() {
         if let Some(text) = warning.as_str() {
             eprintln!("warning: {text}");
         }
     }
-    let policy_warnings =
-        preflight.get("policy_warnings").and_then(Value::as_array).cloned().unwrap_or_default();
-    for warning in policy_warnings {
+    for warning in preflight.get("policy_warnings").and_then(Value::as_array).into_iter().flatten()
+    {
         if let Some(text) = warning.as_str() {
             eprintln!("policy-warning: {text}");
         }
     }
 }
 
+/// Prints the inbound-monitor preflight summary to stderr when present.
 pub(crate) fn inbound_monitor_summary(payload: &Value) {
     let inbound_monitor = payload.get("inbound_monitor").or_else(|| {
         payload.get("preflight").and_then(|preflight| preflight.get("inbound_monitor"))
@@ -45,6 +51,7 @@ pub(crate) fn inbound_monitor_summary(payload: &Value) {
     );
 }
 
+/// Prints the verify-channel permission check result to stderr when present.
 pub(crate) fn channel_permission_check(payload: &Value) {
     let permission_check = payload.get("channel_permission_check").or_else(|| {
         payload.get("preflight").and_then(|preflight| preflight.get("channel_permission_check"))
@@ -76,6 +83,8 @@ pub(crate) fn channel_permission_check(payload: &Value) {
     );
 }
 
+/// Prints the egress allowlist and security defaults applied by onboarding
+/// to stderr.
 pub(crate) fn onboarding_defaults(payload: &Value) {
     let preflight = payload.get("preflight").unwrap_or(payload);
     if let Some(allowlist) = preflight.get("egress_allowlist").and_then(Value::as_array) {
@@ -94,6 +103,7 @@ pub(crate) fn onboarding_defaults(payload: &Value) {
     }
 }
 
+/// Prints the pinned setup success line to stdout.
 pub(crate) fn emit_setup_success(connector_id: &str, response: &Value) {
     let token_vault_ref =
         read_json_string(response, &["applied", "token_vault_ref"]).unwrap_or("unknown");
@@ -113,6 +123,7 @@ pub(crate) fn emit_setup_success(connector_id: &str, response: &Value) {
     );
 }
 
+/// Prints the pinned verify dispatch summary line to stdout.
 pub(crate) fn emit_verify_success(connector_id: &str, response: &Value) {
     let delivered = response
         .get("dispatch")

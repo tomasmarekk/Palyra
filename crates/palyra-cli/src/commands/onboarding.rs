@@ -1,3 +1,10 @@
+//! `palyra onboarding` command handlers.
+//!
+//! Computes the onboarding posture by combining config-file signals with live runtime
+//! probes (gateway, browserd, agent registry) and renders it as the shared
+//! control-plane `OnboardingPostureEnvelope`, so CLI, desktop, and web surfaces agree
+//! on step status and the recommended next action.
+
 use std::{
     fs,
     net::{TcpStream, ToSocketAddrs},
@@ -12,11 +19,15 @@ use serde_json::{json, Value};
 use crate::*;
 
 const CLI_FIRST_SUCCESS_MARKER_RELATIVE_PATH: &str = "onboarding/first-success.json";
+// Probe timeouts are deliberately short: `onboarding status` must stay responsive even
+// when the gateway and browserd are down, which is the common state during onboarding.
 const BROWSER_RUNTIME_CONNECT_TIMEOUT_MS: u64 = 350;
 const AUTHENTICATED_RUNTIME_PROBE_TIMEOUT_MS: u64 = 1_000;
 const DEFAULT_BROWSER_SERVICE_ENDPOINT: &str = "http://127.0.0.1:7543";
 const BROWSER_AUTH_PROBE_PRINCIPAL: &str = "admin:onboarding-browser-probe";
 
+/// Selected onboarding flow; manual and remote share the advanced control-plane flow
+/// but differ in which posture signals are required.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OnboardingVariant {
     Quickstart,
@@ -49,6 +60,8 @@ impl OnboardingVariant {
     }
 }
 
+/// Snapshot of every config and runtime signal the step builder consumes; collected
+/// once per status invocation so all steps reason over a consistent view.
 #[derive(Debug, Clone)]
 struct OnboardingSignals {
     config_exists: bool,
@@ -92,6 +105,8 @@ struct AgentRegistryStatusRecord {
     agent_id: String,
 }
 
+/// Presentation flags attached to a step view (required/optional, verification state,
+/// optional blocked reason).
 #[derive(Debug)]
 struct StepPresentation {
     blocked: Option<control_plane::OnboardingBlockedReason>,
@@ -114,6 +129,10 @@ impl StepPresentation {
     }
 }
 
+/// Entry point for `palyra onboarding`, dispatching to the wizard or status handler.
+///
+/// # Errors
+/// Returns an error when config loading, signal collection, or output emission fails.
 pub(crate) fn run_onboarding(command: OnboardingCommand) -> Result<()> {
     match command {
         OnboardingCommand::Wizard { path, force, options } => {
@@ -168,6 +187,9 @@ fn run_onboarding_status(
     emit_onboarding_status(&payload, output::preferred_json(json))
 }
 
+/// Loads the config document for onboarding inspection, falling back to an empty
+/// document (with `"defaults"` as the path label) when no config exists yet so the
+/// status command works before setup has run.
 fn load_onboarding_document(path: Option<String>) -> Result<(toml::Value, String)> {
     if let Some(explicit) = path {
         let resolved = resolve_config_path(Some(explicit), false)?;
@@ -204,6 +226,9 @@ fn load_onboarding_document(path: Option<String>) -> Result<(toml::Value, String
     Ok((document, "defaults".to_owned()))
 }
 
+/// Evaluates all config-derived and probe-derived signals for the given flow variant.
+/// Runtime probes (gateway, browserd, agent registry) run here, so this is the only
+/// step of `onboarding status` that touches the network.
 fn collect_onboarding_signals(
     document: &toml::Value,
     config_path: String,
@@ -314,6 +339,9 @@ fn collect_onboarding_signals(
     })
 }
 
+/// Maps collected signals to the ordered step views for the requested flow variant.
+/// Step ids are a cross-surface contract (desktop and web key on them); ordering
+/// drives the recommended-next-step computation.
 fn build_onboarding_steps(
     variant: OnboardingVariant,
     signals: &OnboardingSignals,
@@ -624,6 +652,9 @@ fn build_onboarding_steps(
         )
     };
 
+    // The first-success gate intentionally skips the optional memory-embeddings step
+    // (hash fallback keeps memory usable) and the workspace step, which only gates the
+    // overall posture via onboarding_prerequisites_ready in manual/remote flows.
     let first_success_ready = [
         config_step.status,
         remote_step.status,
@@ -713,6 +744,9 @@ fn emit_onboarding_status(
         return Ok(());
     }
 
+    // AIDEV-NOTE: flow= and variant= both print flow_variant; payload.flow (the
+    // control-plane flow enum) is only visible in JSON output. Correcting flow= to the
+    // flow label would change pinned CLI output, so it must ship with a parity update.
     println!(
         "onboarding.status flow={} variant={} status={} config_path={} ready_for_first_success={}",
         payload.flow_variant,
@@ -776,6 +810,7 @@ fn build_onboarding_counts(
     counts
 }
 
+/// Returns the first required step that is not yet done or skipped, in display order.
 fn recommended_onboarding_step_id(steps: &[control_plane::OnboardingStepView]) -> Option<String> {
     steps
         .iter()
@@ -810,6 +845,7 @@ fn derive_posture_status(
     control_plane::OnboardingPostureState::InProgress
 }
 
+/// True when every required step except `first_success` itself is done.
 fn onboarding_prerequisites_ready(steps: &[control_plane::OnboardingStepView]) -> bool {
     steps
         .iter()
@@ -823,6 +859,11 @@ fn onboarding_step_done(steps: &[control_plane::OnboardingStepView], step_id: &s
     })
 }
 
+/// Persists the first-success marker after a real agent run completes; its presence
+/// flips the `first_success` onboarding step to done on later status invocations.
+///
+/// # Errors
+/// Returns an error when the marker directory or file cannot be written.
 pub(crate) fn record_cli_first_success(state_root: &Path, run_id: &str) -> Result<()> {
     let marker_path = cli_first_success_marker_path(state_root);
     if let Some(parent) = marker_path.parent() {
@@ -863,6 +904,9 @@ fn cli_first_success_marker_path(state_root: &Path) -> PathBuf {
     state_root.join(CLI_FIRST_SUCCESS_MARKER_RELATIVE_PATH)
 }
 
+/// Determines whether a default agent exists, preferring the live gateway registry and
+/// falling back to the local `agents.toml`. A gateway probe failure still reports a
+/// positive local result so a stopped gateway does not hide an already-created agent.
 fn default_agent_status() -> Result<(bool, String)> {
     match default_agent_status_from_gateway_runtime() {
         Ok(Some(status)) => return Ok(status),
@@ -1017,6 +1061,9 @@ fn browser_prerequisites_status(document: &toml::Value) -> (bool, String) {
     )
 }
 
+/// Probes browserd reachability: an authenticated gRPC call when the token is inline
+/// in the config, otherwise a plain TCP connect (vault-stored tokens are not resolved
+/// by the status command).
 fn browser_runtime_status(document: &toml::Value) -> (bool, String) {
     let endpoint = get_string_at_path(document, "tool_call.browser_service.endpoint")
         .unwrap_or_else(|| DEFAULT_BROWSER_SERVICE_ENDPOINT.to_owned());
@@ -1093,6 +1140,9 @@ async fn browser_runtime_auth_probe(endpoint: String, auth_token: String) -> Res
     Ok(())
 }
 
+/// Detects a MiniMax chat setup, which rides the Anthropic-compatible provider kind
+/// and is identified by its auth provider kind or a MiniMax model name; such setups
+/// get a dedicated embeddings hint because MiniMax offers no embeddings endpoint here.
 fn minimax_chat_provider_configured(
     document: &toml::Value,
     provider_kind: &str,
@@ -1160,6 +1210,8 @@ where
     run_blocking_probe(probe)
 }
 
+/// Runs an async probe on a fresh runtime with the shared probe timeout so a hung
+/// endpoint cannot stall the synchronous status command.
 fn run_blocking_probe<F, T>(probe: F) -> Result<T>
 where
     F: std::future::Future<Output = Result<T>>,
@@ -1181,6 +1233,15 @@ fn diagnostic_endpoint_url(raw_url: &str) -> String {
     redact_url_strict(raw_url)
 }
 
+/// Checks whether any resolved socket address of `raw_url` accepts a TCP connection
+/// within `timeout`.
+///
+/// # Errors
+/// Returns an error for invalid URLs, DNS failures, or when no address connects.
+// AIDEV-NOTE: the final two error messages hardcode "gateway gRPC endpoint" even though
+// callers pass other endpoint_label values (e.g. the browser service probe). Fixing
+// them to use {endpoint_label} changes user-visible error text, so it needs a
+// coordinated parity/snapshot update.
 fn tcp_url_reachable(raw_url: &str, timeout: Duration, endpoint_label: &str) -> Result<()> {
     let url = reqwest::Url::parse(raw_url)
         .with_context(|| format!("{endpoint_label} URL is invalid: {raw_url}"))?;
@@ -1290,11 +1351,18 @@ fn default_agent_create_command(signals: &OnboardingSignals) -> String {
 }
 
 fn looks_absolute_path(value: &str) -> bool {
+    // Recognize Windows drive ("C:...") and UNC ("\\server") forms explicitly so the
+    // suggested command stays correct even when this CLI build runs on a non-Windows
+    // host inspecting a Windows-style configured workspace root.
     Path::new(value).is_absolute()
         || value.starts_with(r"\\")
         || value.as_bytes().get(1).is_some_and(|byte| *byte == b':')
 }
 
+/// Quotes a config-derived value for inclusion in a suggested shell command.
+///
+/// Single quotes (never double quotes) are used so `$()`, backticks, and variable
+/// expansion cannot execute if the operator pastes the command into a POSIX shell.
 fn quote_cli_arg(value: &str) -> String {
     let safe = !value.is_empty()
         && value.chars().all(|ch| {

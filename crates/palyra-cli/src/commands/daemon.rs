@@ -1,3 +1,9 @@
+//! `palyra gateway` daemon commands: lifecycle, health, journal, and run inspection.
+//!
+//! Talks to a running `palyrad` over its admin HTTP and gRPC surfaces, manages
+//! the installed gateway service, and special-cases desktop-control-center
+//! managed runtimes whose state lives under `desktop-control-center/runtime`.
+
 use crate::*;
 
 fn root_context() -> Result<app::RootCommandContext> {
@@ -113,6 +119,8 @@ fn compact_tool_catalog_snapshot_preview(payload_bytes: usize) -> String {
     )
 }
 
+/// Truncates to at most `max_bytes` on a char boundary; the flag reports
+/// whether truncation occurred.
 fn truncate_utf8(value: &str, max_bytes: usize) -> (String, bool) {
     if value.len() <= max_bytes {
         return (value.to_owned(), false);
@@ -306,6 +314,11 @@ mod tests {
     }
 }
 
+/// Dispatches `palyra gateway` daemon subcommands.
+///
+/// # Errors
+/// Returns an error when the root context or connection cannot be resolved, a
+/// daemon endpoint or service action fails, or output encoding fails.
 pub(crate) fn run_daemon(command: DaemonCommand) -> Result<()> {
     match command {
         DaemonCommand::Run { bin_path } => run_gateway_foreground(bin_path),
@@ -935,6 +948,11 @@ struct GatewayRuntimeRootSelection {
     note: Option<String>,
 }
 
+/// Resolves the `palyrad` binary from an explicit override or next to the CLI executable.
+///
+/// # Errors
+/// Returns an error when the explicit path is not a file or no sibling
+/// `palyrad` binary can be located.
 pub(crate) fn resolve_palyrad_binary(bin_path: Option<String>) -> Result<PathBuf> {
     if let Some(path) = bin_path {
         let path = PathBuf::from(path);
@@ -1029,6 +1047,9 @@ fn request_desktop_managed_gateway_restart(
     requested_state_root: &Path,
     config_path: Option<&Path>,
 ) -> Result<Option<support::service::GatewayServiceStatus>> {
+    // Only desktop-managed runtimes without their own installed service are
+    // restarted by touching the config; the desktop supervisor watches that
+    // file and reloads the runtime. Anything else takes the service-manager path.
     if !desktop_runtime_state_root(requested_state_root).is_dir()
         || support::service::load_service_metadata(requested_state_root)?.is_some()
     {
@@ -1064,6 +1085,8 @@ fn request_desktop_managed_gateway_restart(
     }))
 }
 
+/// Bumps the file's mtime by rewriting its current bytes; std offers no
+/// portable utimes API, and the contents must stay identical.
 fn touch_file(path: &Path) -> Result<()> {
     let contents = fs::read(path)
         .with_context(|| format!("failed to read file before touching {}", path.display()))?;
@@ -1255,6 +1278,8 @@ fn gateway_status_state_root_scope_note(
     ))
 }
 
+/// Prefers an existing `desktop-control-center/runtime` child as the effective
+/// state root so gateway commands target the desktop-managed runtime.
 fn gateway_runtime_root_selection(requested: &Path) -> GatewayRuntimeRootSelection {
     if is_desktop_runtime_state_root(requested) {
         return GatewayRuntimeRootSelection {
@@ -1822,6 +1847,8 @@ fn run_gateway_call(
             params.get("verify_remote").and_then(Value::as_bool).unwrap_or(false),
             params.get("identity_store_dir").and_then(Value::as_str).map(str::to_owned),
         )?,
+        // Truncating cast is acceptable: build_gateway_usage_cost_value clamps
+        // days to 1..=365.
         "usage.cost" => build_gateway_usage_cost_value(
             params.get("db_path").and_then(Value::as_str).map(str::to_owned),
             params.get("days").and_then(Value::as_u64).unwrap_or(30) as u32,
@@ -1933,7 +1960,6 @@ fn build_gateway_usage_cost_value(db_path: Option<String>, days: u32) -> Result<
     let mut totals_estimated_cost = 0.0_f64;
     let mut total_estimated_runs = 0_i64;
     let mut daily_map = std::collections::BTreeMap::<String, (i64, i64, i64, i64, f64, i64)>::new();
-    let mut daily = Vec::new();
     while let Some(row) = rows.next()? {
         let run_id = row.get::<_, String>(0)?;
         let started_at_unix_ms = row.get::<_, i64>(1)?;
@@ -1949,7 +1975,6 @@ fn build_gateway_usage_cost_value(db_path: Option<String>, days: u32) -> Result<
                 date_row.get::<_, String>(0)
             })
             .context("failed to derive run date for usage-cost output")?;
-        let mut estimated_cost = Value::Null;
         let mut estimated_cost_raw = 0.0_f64;
         let mut estimated_count = 0_i64;
         if let Some(model_id) = routing_map.get(run_id.as_str()) {
@@ -1957,7 +1982,6 @@ fn build_gateway_usage_cost_value(db_path: Option<String>, days: u32) -> Result<
                 let cost = input_rate.unwrap_or(0.0) * (prompt_tokens as f64 / 1_000_000.0)
                     + output_rate.unwrap_or(0.0) * (completion_tokens as f64 / 1_000_000.0);
                 estimated_cost_raw = cost;
-                estimated_cost = json!(cost);
                 totals_estimated_cost += cost;
                 total_estimated_runs += 1;
                 estimated_count = 1;
@@ -1970,19 +1994,8 @@ fn build_gateway_usage_cost_value(db_path: Option<String>, days: u32) -> Result<
         entry.3 += total_tokens;
         entry.4 += estimated_cost_raw;
         entry.5 += estimated_count;
-        daily.push(json!({
-            "date": connection
-                .query_row("SELECT date(?1 / 1000, 'unixepoch')", [started_at_unix_ms], |date_row| {
-                    date_row.get::<_, String>(0)
-                })?,
-            "runs": 1,
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens,
-            "estimated_cost_usd": estimated_cost,
-        }));
     }
-    daily = daily_map
+    let daily = daily_map
         .into_iter()
         .map(|(date, (runs, prompt_tokens, completion_tokens, total_tokens, estimated_cost, estimated_runs))| {
             json!({

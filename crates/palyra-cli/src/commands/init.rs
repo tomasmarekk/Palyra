@@ -1,5 +1,21 @@
+//! Non-interactive initialization of a fresh Palyra installation.
+//!
+//! Writes a daemon-compatible config with a generated admin token, creates
+//! the state root (identity, vault, and local workspace directories), and
+//! activates the new paths in the CLI profile.
+
 use crate::*;
 
+/// Runs `palyra init`, scaffolding config, state directories, and optional
+/// TLS material for the selected deployment profile.
+///
+/// The effective mode follows the deployment profile rather than the raw
+/// mode argument so profile defaults stay authoritative.
+///
+/// # Errors
+/// Fails when the target config exists without `--force`, a directory or
+/// file cannot be created, the generated config fails daemon schema
+/// validation, or output encoding fails.
 pub(crate) fn run_init(
     mode: InitModeArg,
     deployment_profile: Option<DeploymentProfileArg>,

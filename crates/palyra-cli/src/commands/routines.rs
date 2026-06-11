@@ -1,3 +1,9 @@
+//! Routines command surface over the daemon `/console/v1/routines` API.
+//!
+//! Hosts the shared request helpers (`*_value` functions) and JSON pointer accessors
+//! that the cron command module reuses; cron jobs are just schedule-triggered routines.
+//! Text output lines are pinned by CLI parity tests.
+
 use std::{
     fs,
     io::{Read, Write},
@@ -14,13 +20,23 @@ use crate::cli::{
 };
 use crate::*;
 
+// Keep in sync with CRON_DUE_SOON_WINDOW_MS in cron.rs.
 const ROUTINE_DUE_SOON_WINDOW_MS: i64 = 15 * 60 * 1_000;
 
+/// Runs a `palyra routines` subcommand on a fresh Tokio runtime.
+///
+/// # Errors
+/// Returns an error when the runtime cannot be built or the subcommand fails.
 pub(crate) fn run_routines(command: RoutinesCommand) -> Result<()> {
     let runtime = build_runtime()?;
     runtime.block_on(run_routines_async(command))
 }
 
+/// Dispatches a `palyra routines` subcommand against the daemon admin console.
+///
+/// # Errors
+/// Returns an error when the admin-console connection, the request, or output
+/// encoding fails, or when subcommand input validation rejects the arguments.
 pub(crate) async fn run_routines_async(command: RoutinesCommand) -> Result<()> {
     let context =
         client::control_plane::connect_admin_console(app::ConnectionOverrides::default()).await?;
@@ -331,6 +347,10 @@ pub(crate) async fn run_routines_async(command: RoutinesCommand) -> Result<()> {
     }
 }
 
+/// Lists routines as a raw console JSON page, applying the given optional filters.
+///
+/// # Errors
+/// Returns an error when the console request fails.
 pub(crate) async fn list_routines_value(
     client: &control_plane::ControlPlaneClient,
     after: Option<&str>,
@@ -354,6 +374,10 @@ pub(crate) async fn list_routines_value(
     client.get_json_value(path).await.map_err(Into::into)
 }
 
+/// Fetches a single routine envelope by id.
+///
+/// # Errors
+/// Returns an error when the console request fails.
 pub(crate) async fn get_routine_value(
     client: &control_plane::ControlPlaneClient,
     routine_id: &str,
@@ -364,6 +388,10 @@ pub(crate) async fn get_routine_value(
         .map_err(Into::into)
 }
 
+/// Creates or replaces a routine from a fully built upsert payload.
+///
+/// # Errors
+/// Returns an error when the console request fails.
 pub(crate) async fn upsert_routine_value(
     client: &control_plane::ControlPlaneClient,
     payload: &Map<String, Value>,
@@ -371,6 +399,10 @@ pub(crate) async fn upsert_routine_value(
     client.post_json_value("console/v1/routines", payload).await.map_err(Into::into)
 }
 
+/// Deletes a routine by id.
+///
+/// # Errors
+/// Returns an error when the console request fails.
 pub(crate) async fn delete_routine_value(
     client: &control_plane::ControlPlaneClient,
     routine_id: &str,
@@ -384,6 +416,10 @@ pub(crate) async fn delete_routine_value(
         .map_err(Into::into)
 }
 
+/// Toggles a routine's enabled flag without touching other fields.
+///
+/// # Errors
+/// Returns an error when the console request fails.
 pub(crate) async fn set_routine_enabled_value(
     client: &control_plane::ControlPlaneClient,
     routine_id: &str,
@@ -398,6 +434,10 @@ pub(crate) async fn set_routine_enabled_value(
         .map_err(Into::into)
 }
 
+/// Requests an immediate out-of-schedule run of a routine.
+///
+/// # Errors
+/// Returns an error when the console request fails.
 pub(crate) async fn run_routine_now_value(
     client: &control_plane::ControlPlaneClient,
     routine_id: &str,
@@ -411,6 +451,10 @@ pub(crate) async fn run_routine_now_value(
         .map_err(Into::into)
 }
 
+/// Starts a diagnostic test run, optionally replaying a previous run's trigger.
+///
+/// # Errors
+/// Returns an error when the console request fails.
 pub(crate) async fn test_run_routine_value(
     client: &control_plane::ControlPlaneClient,
     routine_id: &str,
@@ -433,6 +477,10 @@ pub(crate) async fn test_run_routine_value(
         .map_err(Into::into)
 }
 
+/// Lists run history for a routine as a raw console JSON page.
+///
+/// # Errors
+/// Returns an error when the console request fails.
 pub(crate) async fn list_routine_runs_value(
     client: &control_plane::ControlPlaneClient,
     routine_id: &str,
@@ -449,6 +497,10 @@ pub(crate) async fn list_routine_runs_value(
     client.get_json_value(path).await.map_err(Into::into)
 }
 
+/// Dispatches an external trigger event into a routine.
+///
+/// # Errors
+/// Returns an error when the console request fails.
 pub(crate) async fn dispatch_routine_value(
     client: &control_plane::ControlPlaneClient,
     routine_id: &str,
@@ -471,12 +523,20 @@ pub(crate) async fn dispatch_routine_value(
         .map_err(Into::into)
 }
 
+/// Fetches the daemon's routine template catalog.
+///
+/// # Errors
+/// Returns an error when the console request fails.
 pub(crate) async fn list_routine_templates_value(
     client: &control_plane::ControlPlaneClient,
 ) -> Result<Value> {
     client.get_json_value("console/v1/routines/templates").await.map_err(Into::into)
 }
 
+/// Previews how the daemon parses a natural-language schedule phrase.
+///
+/// # Errors
+/// Returns an error when the console request fails.
 pub(crate) async fn preview_routine_schedule_value(
     client: &control_plane::ControlPlaneClient,
     phrase: &str,
@@ -494,6 +554,10 @@ pub(crate) async fn preview_routine_schedule_value(
         .map_err(Into::into)
 }
 
+/// Fetches a routine's portable export bundle.
+///
+/// # Errors
+/// Returns an error when the console request fails.
 pub(crate) async fn export_routine_value(
     client: &control_plane::ControlPlaneClient,
     routine_id: &str,
@@ -507,6 +571,10 @@ pub(crate) async fn export_routine_value(
         .map_err(Into::into)
 }
 
+/// Imports a routine export bundle, optionally overriding its id and enabled state.
+///
+/// # Errors
+/// Returns an error when the console request fails.
 pub(crate) async fn import_routine_value(
     client: &control_plane::ControlPlaneClient,
     export: Value,
@@ -520,18 +588,22 @@ pub(crate) async fn import_routine_value(
     client.post_json_value("console/v1/routines/import", &payload).await.map_err(Into::into)
 }
 
+/// Returns the owned string at a JSON pointer, or `None` if absent or not a string.
 pub(crate) fn json_optional_string_at(value: &Value, pointer: &str) -> Option<String> {
     value.pointer(pointer).and_then(Value::as_str).map(ToOwned::to_owned)
 }
 
+/// Returns the boolean at a JSON pointer, or `None` if absent or not a boolean.
 pub(crate) fn json_bool_at(value: &Value, pointer: &str) -> Option<bool> {
     value.pointer(pointer).and_then(Value::as_bool)
 }
 
+/// Returns the integer at a JSON pointer, or `None` if absent or not an `i64`.
 pub(crate) fn json_i64_at(value: &Value, pointer: &str) -> Option<i64> {
     value.pointer(pointer).and_then(Value::as_i64)
 }
 
+/// Returns the raw JSON value at a pointer, or `None` if absent.
 pub(crate) fn json_value_at<'a>(value: &'a Value, pointer: &str) -> Option<&'a Value> {
     value.pointer(pointer)
 }
@@ -1173,6 +1245,8 @@ fn insert_schedule_fields(
     {
         payload.insert("schedule_timezone".to_owned(), Value::String(timezone.to_owned()));
     }
+    // A natural-language phrase wins over explicit --schedule-type/--schedule;
+    // the daemon derives the concrete schedule from the phrase.
     if let Some(phrase) =
         natural_language_schedule.as_deref().map(str::trim).filter(|value| !value.is_empty())
     {
@@ -1207,6 +1281,8 @@ fn insert_schedule_fields(
     Ok(())
 }
 
+/// Overlays `--watch-path`/`--watch-poll-interval-ms` onto an optional user-supplied
+/// trigger payload object; a non-empty `path` must be present from one of the sources.
 fn build_file_watch_trigger_payload(
     trigger_payload: Option<Value>,
     watch_path: Option<String>,
@@ -1236,6 +1312,12 @@ fn build_file_watch_trigger_payload(
     Ok(Value::Object(object))
 }
 
+/// Parses a `schedule-type=every` interval: either raw milliseconds (`300000`) or a
+/// duration with a unit suffix (`30s`, `5m`, `2h`, `1d`).
+///
+/// # Errors
+/// Returns a validation error for empty, zero, malformed, unknown-unit, or
+/// overflowing intervals so bad input fails before reaching the daemon.
 pub(crate) fn parse_every_schedule_interval_ms(schedule: &str) -> Result<u64> {
     let value = schedule.trim();
     if value.is_empty() {
@@ -1358,6 +1440,8 @@ fn build_query_path(path: &str, pairs: Vec<(&str, Option<String>)>) -> String {
     }
 }
 
+// Percent-encodes everything outside the RFC 3986 unreserved set so caller-supplied
+// ids and filters embed safely into console URL paths and query strings.
 fn percent_encode_component(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.as_bytes() {
@@ -1475,6 +1559,7 @@ fn milliseconds_summary(value: Option<i64>) -> String {
 fn compact_json(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned())
 }
+
 fn bump_counter(map: &mut Map<String, Value>, key: &str) {
     let current = map.get(key).and_then(Value::as_u64).unwrap_or(0);
     map.insert(key.to_owned(), Value::from(current.saturating_add(1)));

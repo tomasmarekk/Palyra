@@ -1,7 +1,19 @@
+//! Session lifecycle commands: list/resolve/rename/reset/cleanup, queue control,
+//! retry/branch, transcript search/export, compaction, checkpoints, and background tasks.
+//!
+//! Mixes the gateway gRPC operator runtime (session resolution, runs) with the admin
+//! console HTTP API (queue, compaction, checkpoints, background tasks). Text output
+//! redacts session keys, labels, and run ids; `--json` output preserves them.
+
 use crate::*;
 use palyra_common::runtime_contracts::{AuxiliaryTaskKind, AuxiliaryTaskState};
 use std::io::Read as _;
 
+/// Runs a `palyra sessions` subcommand on a fresh Tokio runtime.
+///
+/// # Errors
+/// Returns an error when the CLI root context is unavailable, the gRPC connection
+/// cannot be resolved, the runtime cannot be built, or the subcommand fails.
 pub(crate) fn run_sessions(command: SessionsCommand) -> Result<()> {
     let root_context = app::current_root_context()
         .ok_or_else(|| anyhow!("CLI root context is unavailable for sessions command"))?;
@@ -13,6 +25,11 @@ pub(crate) fn run_sessions(command: SessionsCommand) -> Result<()> {
     runtime.block_on(run_sessions_async(command, connection))
 }
 
+/// Dispatches a `palyra sessions` subcommand over an already-resolved connection.
+///
+/// # Errors
+/// Returns an error when a daemon request fails, a response payload is missing
+/// required fields, or subcommand input validation rejects the arguments.
 pub(crate) async fn run_sessions_async(
     command: SessionsCommand,
     connection: AgentConnection,
@@ -988,6 +1005,7 @@ pub(crate) async fn run_sessions_async(
     std::io::stdout().flush().context("stdout flush failed")
 }
 
+/// Reads non-empty background-task text from exactly one of `--text` or `--text-stdin`.
 fn resolve_background_task_text(text: Option<String>, text_stdin: bool) -> Result<String> {
     if text_stdin {
         if text.is_some() {
@@ -1016,6 +1034,8 @@ fn resolve_background_task_text(text: Option<String>, text_stdin: bool) -> Resul
     Ok(text)
 }
 
+/// Turns the console retry payload (original prompt, origin metadata, parameter
+/// delta) into an agent run input replayed against the same session.
 fn build_session_retry_agent_run_input(
     session_id: String,
     payload: &Value,
@@ -1071,6 +1091,9 @@ fn build_resolve_session_request(
     })
 }
 
+/// Finds a session summary by id and/or key by paging through `list_sessions`;
+/// the gateway exposes no direct summary lookup. When both selectors are given,
+/// they must resolve to the same session.
 async fn load_session_summary_for_show(
     runtime: &client::operator::OperatorRuntime,
     session_id: Option<String>,
@@ -1098,6 +1121,8 @@ async fn load_session_summary_for_show(
             if selector_matches {
                 return Ok(session);
             }
+            // Reaching this point with a partial match means both selectors were
+            // provided but point at different sessions.
             if id_matches || key_matches {
                 anyhow::bail!(
                     "invalid session selector: session_id and session_key resolve to different sessions"
@@ -1106,6 +1131,7 @@ async fn load_session_summary_for_show(
         }
 
         let next_after_session_key = normalize_optional_text(Some(response.next_after_session_key));
+        // A repeated cursor would loop forever; treat it as the end of the listing.
         if next_after_session_key.is_none() || next_after_session_key == after_session_key {
             break;
         }
@@ -1157,6 +1183,9 @@ fn optional_canonical_id_json_value(value: &Option<common_v1::CanonicalId>) -> V
         .unwrap_or(Value::Null)
 }
 
+// Session keys, labels, and run ids may carry user-identifying routing data, so the
+// text renderers below print only `<redacted>`/`none` presence markers. JSON output
+// keeps the raw identifiers for scripting (pinned by session_to_json tests).
 fn redacted_text_or_none(present: bool) -> String {
     redacted_presence_for_output(present)
 }
@@ -1291,6 +1320,9 @@ async fn handle_session_queue_action(
     print_session_queue_payload(action, &payload, json_output)
 }
 
+// Cap for queued-input lines in text output; `--json` returns the full queue.
+const QUEUED_INPUT_TEXT_LINE_LIMIT: usize = 12;
+
 fn print_session_queue_payload(action: &str, payload: &Value, json_output: bool) -> Result<()> {
     if json_output {
         println!("{}", serde_json::to_string_pretty(payload)?);
@@ -1310,7 +1342,7 @@ fn print_session_queue_payload(action: &str, payload: &Value, json_output: bool)
         metrics.pointer("/total_count").and_then(Value::as_u64).unwrap_or_default(),
         redacted_optional_identifier_for_output(queue.pointer("/active_run_id").and_then(Value::as_str))
     );
-    for queued in queued_inputs.iter().rev().take(12) {
+    for queued in queued_inputs.iter().rev().take(QUEUED_INPUT_TEXT_LINE_LIMIT) {
         println!(
             "queued_input id={} state={} mode={} lane={} run_id={} reason={}",
             redacted_optional_identifier_for_output(
@@ -1364,6 +1396,8 @@ async fn handle_background_task_action(
     Ok(())
 }
 
+// The renderers below map daemon compatibility aliases (e.g. legacy state names)
+// to canonical runtime-contract values; unknown values pass through unchanged.
 fn render_auxiliary_task_kind(value: Option<&str>) -> String {
     match value {
         Some(raw) => AuxiliaryTaskKind::from_str(raw)
@@ -1491,6 +1525,8 @@ fn parse_json_string(value: Option<&str>) -> Option<Value> {
     value.and_then(|raw| serde_json::from_str::<Value>(raw).ok())
 }
 
+// Percent-encodes everything outside the RFC 3986 unreserved set so caller-supplied
+// ids and queries embed safely into console URL paths.
 fn percent_encode_component(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.as_bytes() {

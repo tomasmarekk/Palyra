@@ -27,6 +27,12 @@ use common::{
 pub(crate) use common::{post_connector_action, resolve_connector_status};
 use lifecycle::emit_channel_lifecycle_disable;
 
+/// Dispatches a `palyra channels` subcommand to its handler and flushes
+/// stdout so pinned output is fully emitted before exit.
+///
+/// # Errors
+/// Propagates handler failures (argument validation, daemon transport, or
+/// output encoding) and stdout flush failures.
 pub(crate) fn run(command: ChannelsCommand) -> Result<()> {
     match command {
         ChannelsCommand::Add {

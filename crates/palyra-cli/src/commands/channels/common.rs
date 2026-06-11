@@ -1,3 +1,9 @@
+//! Shared helpers for channel CLI commands: credential intake, connector
+//! selector resolution, and admin-endpoint transport wrappers.
+//!
+//! Provider-neutral by design; provider-specific behavior stays in the
+//! sibling `providers` and `connectors` modules.
+
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Map, Value};
 use std::io::{IsTerminal, Read};
@@ -8,6 +14,17 @@ use crate::{
     normalize_optional_text_arg, normalize_required_text_arg, prompt_secret_value,
 };
 
+/// Resolves a channel credential from exactly one of argv, stdin, or an
+/// interactive prompt, returning the trimmed non-empty value.
+///
+/// Passing the credential on argv is refused unless the caller explicitly
+/// acknowledged the risk, because command-line arguments leak through
+/// process lists.
+///
+/// # Errors
+/// Fails when zero or multiple sources are selected, when the argv source
+/// lacks the insecure-arg acknowledgement, when the prompt source runs
+/// without a TTY, when stdin cannot be read, or when the input is empty.
 pub(super) fn load_channel_credential(
     explicit: Option<String>,
     from_stdin: bool,
@@ -48,6 +65,11 @@ pub(super) fn load_channel_credential(
     Ok(normalized)
 }
 
+/// Resolves a connector id like [`resolve_optional_connector_selector`] but
+/// rejects the all-connectors (no selector) case.
+///
+/// # Errors
+/// Fails when no selector is provided or when the selector input is invalid.
 pub(super) fn resolve_connector_selector(
     connector_id: Option<String>,
     provider: Option<ChannelProviderArg>,
@@ -59,13 +81,22 @@ pub(super) fn resolve_connector_selector(
     }
 }
 
+/// Resolves an explicit connector id or a `--provider`/`--account-id` pair to
+/// a connector id; `Ok(None)` means the caller selected all connectors.
+///
+/// An explicit connector id wins over a provider selector when both are set.
+///
+/// # Errors
+/// Fails when the connector id is blank, when `--account-id` is given without
+/// `--provider`, or when provider-specific account-id normalization rejects
+/// the value.
 pub(super) fn resolve_optional_connector_selector(
     connector_id: Option<String>,
     provider: Option<ChannelProviderArg>,
     account_id: Option<String>,
 ) -> Result<Option<String>> {
     match (connector_id, provider) {
-        (Some(connector_id), None) | (Some(connector_id), Some(_)) => {
+        (Some(connector_id), _) => {
             normalize_required_text_arg(connector_id, "connector_id").map(Some)
         }
         (None, Some(provider)) => {
@@ -79,6 +110,12 @@ pub(super) fn resolve_optional_connector_selector(
     }
 }
 
+/// Validates and lowercases an account id for providers without their own
+/// normalization rules.
+///
+/// # Errors
+/// Fails when the value is empty or contains characters outside the
+/// alphanumeric and `-_.:@` set.
 pub(super) fn normalize_generic_account_id(raw: &str, label: &str) -> Result<String> {
     let value = raw.trim();
     if value.is_empty() {
@@ -93,6 +130,13 @@ pub(super) fn normalize_generic_account_id(raw: &str, label: &str) -> Result<Str
     Ok(value.to_ascii_lowercase())
 }
 
+/// Reports that a provider does not implement the requested action.
+///
+/// JSON mode emits a structured `supported: false` payload and succeeds so
+/// scripted callers can branch on the field; text mode fails the command.
+///
+/// # Errors
+/// Fails in text mode (by design) and when JSON encoding fails.
 pub(super) fn unsupported_provider_action(
     surface: &str,
     action: &str,
@@ -128,6 +172,8 @@ pub(super) fn unsupported_provider_action(
     }
 }
 
+/// Trims, lowercases, and deduplicates list arguments, dropping blanks while
+/// preserving first-seen order.
 pub(super) fn normalize_string_list(values: Vec<String>) -> Vec<String> {
     let mut normalized = Vec::new();
     for value in values {
@@ -141,10 +187,12 @@ pub(super) fn normalize_string_list(values: Vec<String>) -> Vec<String> {
     normalized
 }
 
+/// Returns the canonical lowercase label for a channel provider.
 pub(super) fn provider_label(provider: ChannelProviderArg) -> &'static str {
     super::providers::label(provider)
 }
 
+/// Returns the canonical lowercase label for a resolvable channel entity.
 pub(super) fn resolve_entity_label(entity: ChannelResolveEntityArg) -> &'static str {
     match entity {
         ChannelResolveEntityArg::Channel => "channel",
@@ -154,6 +202,11 @@ pub(super) fn resolve_entity_label(entity: ChannelResolveEntityArg) -> &'static 
     }
 }
 
+/// Fetches the daemon-side status document for a single connector.
+///
+/// # Errors
+/// Fails when the request context cannot be resolved or the admin endpoint
+/// call fails.
 pub(crate) fn resolve_connector_status(
     connector_id: &str,
     url: Option<String>,
@@ -174,6 +227,12 @@ pub(crate) fn resolve_connector_status(
     channels_client::send_request(client.get(endpoint), request_context, error_context)
 }
 
+/// Posts a connector-scoped admin action (for example queue or health
+/// operations) and returns the response document.
+///
+/// # Errors
+/// Fails when the request context cannot be resolved or the admin endpoint
+/// call fails.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn post_connector_action(
     connector_id: &str,
@@ -203,6 +262,12 @@ pub(crate) fn post_connector_action(
     channels_client::send_request(request, request_context, error_context)
 }
 
+/// Posts a Discord account-level action, injecting `account_id` into the
+/// payload so callers only supply action-specific fields.
+///
+/// # Errors
+/// Fails when the request context cannot be resolved or the admin endpoint
+/// call fails.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn post_discord_account_action(
     account_id: &str,

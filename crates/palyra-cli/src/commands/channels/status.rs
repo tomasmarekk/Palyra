@@ -1,3 +1,10 @@
+//! Connector observability and operations commands: list, status, health
+//! refresh, enable/disable, queue control, dead letters, logs, and test
+//! ingestion.
+//!
+//! All handlers call daemon admin endpoints and emit through the pinned
+//! `output::channels` renderers.
+
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
@@ -6,6 +13,11 @@ use crate::{
     output::channels as channels_output,
 };
 
+/// Lists all connectors known to the daemon.
+///
+/// # Errors
+/// Fails when the request context cannot be resolved, the endpoint call
+/// fails, or output encoding fails.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_list(
     url: Option<String>,
@@ -27,6 +39,12 @@ pub(super) fn run_list(
     channels_output::emit_list(response, json_output)
 }
 
+/// Shows status for one connector, or falls back to the list view when no
+/// selector was provided.
+///
+/// # Errors
+/// Fails when selector resolution, the endpoint call, or output encoding
+/// fails.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_status(
     connector_id: Option<String>,
@@ -56,6 +74,11 @@ pub(super) fn run_status(
     }
 }
 
+/// Triggers a daemon-side health refresh for one connector.
+///
+/// # Errors
+/// Fails when selector resolution, the endpoint call, or output encoding
+/// fails.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_health_refresh(
     connector_id: Option<String>,
@@ -85,6 +108,10 @@ pub(super) fn run_health_refresh(
     channels_output::emit_status(response, json_output)
 }
 
+/// Enables or disables a connector through the shared `/enabled` action.
+///
+/// # Errors
+/// Fails when the endpoint call or output encoding fails.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_enable_toggle(
     connector_id: String,
@@ -114,6 +141,10 @@ pub(super) fn run_enable_toggle(
     channels_output::emit_status(response, json_output)
 }
 
+/// Runs a payload-less queue operation (pause/resume/drain) on a connector.
+///
+/// # Errors
+/// Fails when the endpoint call or output encoding fails.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_queue_action(
     connector_id: String,
@@ -140,6 +171,10 @@ pub(super) fn run_queue_action(
     channels_output::emit_status(response, json_output)
 }
 
+/// Replays or discards one dead-lettered outbound message.
+///
+/// # Errors
+/// Fails when the endpoint call or output encoding fails.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_dead_letter_action(
     connector_id: String,
@@ -171,6 +206,12 @@ pub(super) fn run_dead_letter_action(
     channels_output::emit_status(response, json_output)
 }
 
+/// Queries recent connector events and dead letters, fanning out across all
+/// connectors when no selector was provided.
+///
+/// # Errors
+/// Fails when selector resolution, any endpoint call, or output encoding
+/// fails.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_logs(
     connector_id: Option<String>,
@@ -184,15 +225,10 @@ pub(super) fn run_logs(
     limit: Option<usize>,
     json_output: bool,
 ) -> Result<()> {
-    let connector_id = match super::common::resolve_optional_connector_selector(
-        connector_id,
-        provider,
-        account_id,
-    )? {
-        Some(connector_id) => connector_id,
-        None => {
-            return run_all_logs(url, token, principal, device_id, channel, limit, json_output);
-        }
+    let Some(connector_id) =
+        super::common::resolve_optional_connector_selector(connector_id, provider, account_id)?
+    else {
+        return run_all_logs(url, token, principal, device_id, channel, limit, json_output);
     };
     let request_context =
         channels_client::resolve_request_context(url, token, principal, device_id, channel)?;
@@ -231,12 +267,11 @@ fn run_all_logs(
         request_context.clone(),
         "failed to call channels list endpoint",
     )?;
-    let connectors =
-        list_response.get("connectors").and_then(Value::as_array).cloned().unwrap_or_default();
     let mut events = Vec::<Value>::new();
     let mut dead_letters = Vec::<Value>::new();
     let mut connector_logs = Vec::<Value>::new();
-    for connector in connectors {
+    for connector in list_response.get("connectors").and_then(Value::as_array).into_iter().flatten()
+    {
         let Some(connector_id) =
             connector.get("connector_id").and_then(Value::as_str).filter(|value| !value.is_empty())
         else {
@@ -279,6 +314,11 @@ fn run_all_logs(
     )
 }
 
+/// Injects a synthetic inbound message into a connector for end-to-end
+/// pipeline testing.
+///
+/// # Errors
+/// Fails when the endpoint call or output encoding fails.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_test(
     connector_id: String,

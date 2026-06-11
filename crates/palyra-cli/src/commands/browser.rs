@@ -1,3 +1,9 @@
+//! CLI command family for `palyra browser ...`: browserd lifecycle, setup, and page actions.
+//!
+//! Action commands route through the gateway control plane or call browserd gRPC directly;
+//! policy preflights fail closed before any daemon contact. Text output redacts runtime
+//! identifiers while JSON keeps reusable handles (both shapes are pinned by CLI tests).
+
 use std::{
     collections::BTreeSet,
     fs::{self, File},
@@ -84,6 +90,7 @@ const DETACHED_PROCESS: u32 = 0x0000_0008;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+/// Resolved browserd endpoints plus the auth token used for direct gRPC calls.
 #[derive(Debug, Clone)]
 struct BrowserServiceConnection {
     grpc_url: String,
@@ -91,6 +98,7 @@ struct BrowserServiceConnection {
     auth_token: Option<String>,
 }
 
+/// Effective gateway browser-service policy resolved from config and environment.
 #[derive(Debug, Clone, Serialize)]
 struct BrowserPolicySnapshot {
     configured_enabled: bool,
@@ -108,6 +116,7 @@ struct BrowserPolicySnapshot {
     profiles_ready: bool,
 }
 
+/// Connection, policy snapshot, and token provenance resolved for one browser command.
 #[derive(Debug, Clone)]
 struct BrowserResolvedConfig {
     connection: BrowserServiceConnection,
@@ -118,6 +127,7 @@ struct BrowserResolvedConfig {
     token_conflicts_with_gateway_config: bool,
 }
 
+/// Persisted lifecycle record for a CLI-managed browserd process.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BrowserServiceMetadata {
     schema_version: u32,
@@ -134,6 +144,7 @@ struct BrowserServiceMetadata {
     state_encryption_key_configured: bool,
 }
 
+/// Output payload for `browser start` and `browser stop`.
 #[derive(Debug, Clone, Serialize)]
 struct BrowserLifecyclePayload {
     action: String,
@@ -147,6 +158,7 @@ struct BrowserLifecyclePayload {
     warnings: Vec<String>,
 }
 
+/// Output payload for `browser setup`.
 #[derive(Debug, Clone, Serialize)]
 struct BrowserSetupPayload {
     config_path: String,
@@ -163,6 +175,7 @@ struct BrowserSetupPayload {
     migrated: bool,
 }
 
+/// Output payload for `browser status`.
 #[derive(Debug, Clone, Serialize)]
 struct BrowserStatusPayload {
     service: &'static str,
@@ -181,6 +194,7 @@ struct BrowserStatusPayload {
     warnings: Vec<String>,
 }
 
+/// Bind-availability probe result for one configured browser port.
 #[derive(Debug, Clone, Serialize)]
 struct BrowserPortDiagnostic {
     label: &'static str,
@@ -191,6 +205,7 @@ struct BrowserPortDiagnostic {
     bind_error: Option<String>,
 }
 
+/// Gateway-side browser policy view included in `browser status` output.
 #[derive(Debug, Clone, Serialize)]
 struct BrowserControlPlaneSnapshot {
     reachable: bool,
@@ -269,6 +284,7 @@ struct BrowserSnapshotArgs {
     json: bool,
 }
 
+/// Output rendering mode resolved from `--json` flags and root output preferences.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BrowserOutputMode {
     Text,
@@ -276,6 +292,11 @@ enum BrowserOutputMode {
     Ndjson,
 }
 
+/// Entry point for the `palyra browser` command family.
+///
+/// # Errors
+/// Returns an error when policy preflights fail, browserd or the gateway is
+/// unreachable, or the requested browser action reports failure.
 pub(crate) fn run_browser(command: BrowserCommand) -> Result<()> {
     let runtime = build_runtime()?;
     runtime.block_on(run_browser_async(command))
@@ -568,6 +589,10 @@ async fn run_browser_async(command: BrowserCommand) -> Result<()> {
     }
 }
 
+/// Maps a command to the action name used in policy preflight errors.
+///
+/// Returns `None` for lifecycle/setup commands, which must stay usable before
+/// the browser service is enabled in config.
 fn browser_command_policy_action(command: &BrowserCommand) -> Option<&'static str> {
     match command {
         BrowserCommand::Status { .. }
@@ -641,6 +666,7 @@ fn browser_permissions_policy_action(command: &BrowserPermissionsCommand) -> &'s
     }
 }
 
+/// Fail-closed preflight run before any browser action command contacts the daemon.
 fn ensure_browser_cli_policy_enabled(action: &str) -> Result<()> {
     let resolved = resolve_browser_config(None, None, None)?;
     ensure_browser_service_enabled(&resolved.policy, action, resolved.config_path.as_deref())?;
@@ -752,6 +778,9 @@ fn run_browser_setup(
     )
 }
 
+/// Enables the gateway browser service in config: endpoints, auth token,
+/// vault-backed state key, and the browser tool allowlist. `force` regenerates
+/// the token and state key even when already configured.
 fn configure_browser_setup(
     path: Option<String>,
     token: Option<&str>,
@@ -891,6 +920,13 @@ fn should_write_browser_setup_auth_token(
     force || explicit_token || (existing_auth_token.is_none() && !existing_auth_token_secret_ref)
 }
 
+/// Applies the non-interactive `browser setup` defaults to the config at `path`.
+///
+/// Used by the onboarding wizard to provision browser prerequisites without
+/// emitting setup output.
+///
+/// # Errors
+/// Returns an error when the config cannot be loaded, mutated, validated, or persisted.
 pub(crate) fn configure_local_browser_prerequisites(path: Option<String>) -> Result<()> {
     configure_browser_setup(path, None, false).map(|_| ())
 }
@@ -1934,6 +1970,8 @@ async fn run_browser_navigate(
     ensure_browser_command_success("browser.navigate", success, error.as_str())
 }
 
+// The control-plane deadline gets headroom beyond the browser action timeout so the
+// daemon, not the CLI transport, is the layer that reports action timeouts.
 fn browser_control_plane_request_timeout(action_timeout_ms: Option<u64>) -> Option<Duration> {
     action_timeout_ms.map(|timeout_ms| {
         Duration::from_millis(
@@ -3176,6 +3214,8 @@ async fn probe_browser_profile_readiness(connection: &BrowserServiceConnection) 
         .await;
     match response {
         Ok(_) => Ok(true),
+        // browserd reports a missing state encryption key as FailedPrecondition naming the
+        // env var; that means "profiles not ready", not a probe failure.
         Err(status)
             if status.code() == Code::FailedPrecondition
                 && status.message().contains(BROWSERD_STATE_ENCRYPTION_KEY_ENV) =>
@@ -3269,6 +3309,8 @@ async fn fetch_browser_health(health_base_url: &str) -> Result<Value> {
     response.json::<Value>().await.context("failed to decode browser health response")
 }
 
+/// Resolves connection endpoints, policy snapshot, and token provenance with the
+/// precedence CLI flag > environment variable > config file > built-in default.
 fn resolve_browser_config(
     endpoint: Option<String>,
     health_url: Option<String>,
@@ -3725,6 +3767,11 @@ fn resolve_browserd_state_encryption_key_for_start(
     Ok(Some(trimmed.to_owned()))
 }
 
+/// Validates that `value` is a base64-encoded 32-byte browser state encryption key.
+///
+/// # Errors
+/// Returns an error naming `source` when the value is not valid base64 or does
+/// not decode to exactly 32 bytes.
 pub(crate) fn validate_browserd_state_encryption_key(value: &str, source: &str) -> Result<()> {
     let decoded = BASE64_STANDARD.decode(value.trim()).with_context(|| {
         format!("{source} must contain a base64-encoded 32-byte browser state key")
@@ -3894,6 +3941,8 @@ fn derive_browser_health_base_url(grpc_url: &str) -> String {
         .ok()
         .and_then(|mut url| {
             let grpc_port = url.port_or_known_default().unwrap_or(DEFAULT_BROWSER_GRPC_PORT);
+            // The well-known default pair maps explicitly; custom gRPC ports fall back to
+            // the browserd convention of serving health on the adjacent lower port.
             let health_port = if grpc_port == DEFAULT_BROWSER_GRPC_PORT {
                 DEFAULT_BROWSER_HEALTH_PORT
             } else {
@@ -4175,6 +4224,7 @@ fn browser_failure_detail(error: &str) -> String {
     }
 }
 
+/// Best-effort classification of browserd error text into actionable failure classes.
 fn browser_failure_class(error: &str) -> Option<&'static str> {
     let lower = error.to_ascii_lowercase();
     if lower.contains("private/local") || lower.contains("blocked url scheme") {
@@ -4205,6 +4255,8 @@ fn ensure_browser_value_success(command: &str, value: &Value) -> Result<()> {
     ensure_browser_command_success(command, success, error)
 }
 
+// Structured modes (json/ndjson) suppress the failure payload so the root error envelope
+// stays the only machine-readable output; text mode still prints the human-readable line.
 fn browser_command_payload_should_emit(mode: BrowserOutputMode, success: bool) -> bool {
     success || matches!(mode, BrowserOutputMode::Text)
 }
@@ -4416,6 +4468,8 @@ fn write_optional_binary_output_for_mode(
     let Some(payload) = payload else {
         return Ok(None);
     };
+    // Default (unrequested) artifact paths apply only in text mode; structured modes must
+    // not silently persist binary payloads to disk without an explicit --output.
     let Some(path) = resolve_output_path(
         output,
         session_id,
@@ -4487,10 +4541,14 @@ fn strip_large_binary_fields(value: &mut Value, wrote_artifact: bool, fields: &[
     }
 }
 
+/// Maps `false` to `None` so optional request flags are sent as "unspecified",
+/// letting daemon-side defaults apply instead of an explicit `false`.
 fn bool_option(value: bool) -> Option<bool> {
     value.then_some(true)
 }
 
+/// Replaces a raw runtime identifier with a stable hash-derived handle so text
+/// output, logs, and artifact paths never expose raw session material.
 fn browser_identifier_scope(kind: &'static str, value: &str) -> String {
     if value.trim().is_empty() {
         return format!("{kind}-none");
@@ -4525,6 +4583,8 @@ fn browser_session_handle_text(value: Option<&str>) -> String {
         .unwrap_or_else(|| "-".to_owned())
 }
 
+/// Keeps the operator-supplied id in `session_id` so output stays reusable in
+/// follow-up commands; a differing daemon-side handle moves to `runtime_session_id`.
 fn normalize_session_scoped_output(value: &mut Value, requested_session_id: &str) {
     let requested = requested_session_id.trim();
     if requested.is_empty() {
@@ -4606,6 +4666,8 @@ fn quoted_browser_text_field(value: &str) -> String {
     }
 }
 
+// INTENTIONAL: plain `session_id` is absent so the operator-supplied reusable handle
+// survives redaction; only daemon-issued identifiers are hashed.
 fn browser_identifier_kind_for_key(key: &str) -> Option<&'static str> {
     match key {
         "runtime_session_id" => Some("session"),

@@ -1,16 +1,33 @@
+//! Operator approvals commands: list, show, export, and decide.
+//!
+//! Read paths go through the gateway gRPC approvals service; the decide
+//! path goes through the operator control-plane runtime because decisions
+//! share validation and pairing semantics with the interactive TUI.
+
 use std::borrow::Cow;
 
 use crate::args::{ApprovalDecisionScopeArg, ApprovalResolveDecisionArg, ApprovalSubjectTypeArg};
 use crate::{output::approvals as approvals_output, *};
 use palyra_control_plane as control_plane;
 
+/// Runs a `palyra approvals` subcommand on a fresh Tokio runtime.
+///
+/// # Errors
+/// Fails when the runtime cannot be built or the async handler fails.
 pub(crate) fn run_approvals(command: ApprovalsCommand) -> Result<()> {
     let runtime = build_runtime()?;
     runtime.block_on(run_approvals_async(command))
 }
 
+/// Dispatches a `palyra approvals` subcommand to the decide or gRPC handler.
+///
+/// # Errors
+/// Propagates argument validation, transport, and output encoding failures.
 pub(crate) async fn run_approvals_async(command: ApprovalsCommand) -> Result<()> {
     match command {
+        // Decide rides the operator control-plane runtime instead of the
+        // gateway gRPC service so CLI decisions reuse the same scope/TTL and
+        // DM-pairing semantics as interactive approval surfaces.
         ApprovalsCommand::Decide { approval_id, decision, scope, ttl_ms, reason, json } => {
             run_approval_decide(approval_id, decision, scope, ttl_ms, reason, json).await
         }
@@ -215,6 +232,8 @@ fn approval_field<'a>(
     payload: &'a control_plane::ApprovalDecisionEnvelope,
     field: &str,
 ) -> Option<&'a Value> {
+    // Older daemons nested the approval document under an extra "approval"
+    // key; keep the legacy pointer fallback until those envelopes are gone.
     let current_pointer = format!("/{field}");
     payload.approval.pointer(&current_pointer).or_else(|| {
         let legacy_pointer = format!("/approval/{field}");

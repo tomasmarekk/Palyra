@@ -1,3 +1,8 @@
+//! `palyra message`: connector-bridged message actions (send, read, search,
+//! edit, delete, react) plus per-connector capability discovery.
+//! Mutations may return an `approval_required` payload instead of a final
+//! result; text output compacts message bodies into one-line key=value form.
+
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::io::Write;
@@ -10,6 +15,14 @@ use crate::{
     normalize_optional_text_arg, normalize_required_text_arg, output,
 };
 
+/// Runs a `palyra message` subcommand on a dedicated Tokio runtime.
+///
+/// `message status` is answered locally; every other subcommand requires a
+/// resolvable gateway gRPC connection.
+///
+/// # Errors
+/// Returns an error when required arguments are empty, the gateway connection
+/// cannot be resolved, or the connector dispatch fails.
 pub(crate) fn run_message(command: MessageCommand) -> Result<()> {
     if let MessageCommand::Status { json } = &command {
         emit_status(output::preferred_json(*json))?;
@@ -653,6 +666,9 @@ fn ensure_positive_limit(action: &str, limit: usize) -> Result<()> {
     Ok(())
 }
 
+// Collapses whitespace and swaps double quotes for single quotes so message
+// bodies stay parseable inside one-line key="value" text output; long bodies
+// are capped at 160 chars.
 fn compact_text(value: &str) -> String {
     let collapsed = value.split_whitespace().collect::<Vec<_>>().join(" ");
     let sanitized = collapsed.replace('"', "'");

@@ -1,3 +1,9 @@
+//! Destructive reset of config, state, workspace, and service scopes.
+//!
+//! Resets move paths aside with a timestamped suffix instead of deleting
+//! them, so every action stays manually reversible; the gateway service
+//! must be included when runtime scopes are reset while it is installed.
+
 use std::{fs, path::PathBuf};
 
 use anyhow::{anyhow, Context, Result};
@@ -6,6 +12,8 @@ use serde::Serialize;
 use crate::cli::{ResetCommand, ResetScopeArg};
 use crate::*;
 
+/// Outcome of one reset scope; field names are part of the pinned JSON
+/// output shape.
 #[derive(Debug, Clone, Serialize)]
 struct ResetActionReport {
     scope: String,
@@ -16,6 +24,8 @@ struct ResetActionReport {
     detail: Option<String>,
 }
 
+/// Aggregate reset report with rollback guidance; field names are part of
+/// the pinned JSON output shape.
 #[derive(Debug, Clone, Serialize)]
 struct ResetReport {
     dry_run: bool,
@@ -24,6 +34,13 @@ struct ResetReport {
     next_steps: Vec<String>,
 }
 
+/// Runs `palyra reset`, moving the selected scopes aside (or previewing in
+/// dry-run mode) and emitting a rollback-oriented report.
+///
+/// # Errors
+/// Fails when no scope is given, the destructive run lacks `--yes`, a
+/// runtime scope is reset while the installed service scope is omitted, a
+/// move target is unsafe or already exists, or a rename fails.
 pub(crate) fn run_reset(command: ResetCommand) -> Result<()> {
     let context = app::current_root_context()
         .ok_or_else(|| anyhow!("CLI root context is unavailable for reset command"))?;
@@ -40,6 +57,9 @@ pub(crate) fn run_reset(command: ResetCommand) -> Result<()> {
     });
     let includes_service =
         command.scopes.iter().any(|scope| matches!(scope, ResetScopeArg::Service));
+    // An installed service would keep running against moved-aside paths;
+    // force the operator to include the service scope so it is removed
+    // first.
     if resets_runtime
         && service_status.as_ref().is_some_and(|value| value.installed)
         && !includes_service
@@ -142,6 +162,8 @@ pub(crate) fn run_reset(command: ResetCommand) -> Result<()> {
     emit_reset_report(&report)
 }
 
+// Moves one scope path aside (never deletes), reporting a non-applied action
+// when the source is missing or in dry-run mode.
 fn apply_move_action(
     scope: &str,
     source: PathBuf,

@@ -1,8 +1,19 @@
+//! Interactive prompts for the Discord guided setup flow.
+//!
+//! Prompts write to stderr and read from stdin so stdout stays reserved for
+//! the pinned machine-readable result lines; defaults favor the most
+//! restrictive inbound scope.
+
 use anyhow::{bail, Context, Result};
 use std::io::Write;
 
 use crate::{prompt_secret_value, prompt_yes_no};
 
+/// Asks whether the deployment is remote/VPS and returns the setup mode
+/// keyword.
+///
+/// # Errors
+/// Fails when the prompt cannot be read.
 pub(crate) fn setup_mode() -> Result<String> {
     if prompt_yes_no("Deployment mode remote/VPS? [y/N]: ")? {
         Ok("remote_vps".to_owned())
@@ -11,6 +22,10 @@ pub(crate) fn setup_mode() -> Result<String> {
     }
 }
 
+/// Prompts for the bot credential with hidden input.
+///
+/// # Errors
+/// Fails when the hidden prompt cannot be read or the input is empty.
 pub(crate) fn setup_token() -> Result<String> {
     let value = prompt_secret_value("Discord bot token (input hidden, paste and press Enter): ")?;
     if value.trim().is_empty() {
@@ -19,6 +34,11 @@ pub(crate) fn setup_token() -> Result<String> {
     Ok(value)
 }
 
+/// Prompts for the inbound scope; the empty default selects DM-only, the
+/// most restrictive option.
+///
+/// # Errors
+/// Fails when the selection cannot be read or is not a known scope.
 pub(crate) fn inbound_scope() -> Result<String> {
     eprint!(
         "Inbound scope: [1] DM only, [2] Allowlisted guild senders (recommended), [3] Open guild channels: "
@@ -41,6 +61,12 @@ pub(crate) fn inbound_scope() -> Result<String> {
     }
 }
 
+/// Prompts for a comma-separated sender filter list, validating, lowercasing,
+/// and deduplicating the entries.
+///
+/// # Errors
+/// Fails when input cannot be read or an entry contains characters outside
+/// the allowed identifier set.
 pub(crate) fn sender_filters(prompt: &str) -> Result<Vec<String>> {
     eprint!("{prompt}");
     std::io::stderr().flush().context("stderr flush failed")?;
@@ -61,6 +87,10 @@ pub(crate) fn sender_filters(prompt: &str) -> Result<Vec<String>> {
     Ok(values)
 }
 
+/// Prompts for the broadcast strategy; the empty default selects deny.
+///
+/// # Errors
+/// Fails when the selection cannot be read or is not a known strategy.
 pub(crate) fn broadcast_strategy() -> Result<String> {
     eprint!("Broadcast strategy [deny|mention_only|allow] (default deny): ");
     std::io::stderr().flush().context("stderr flush failed")?;
@@ -75,6 +105,10 @@ pub(crate) fn broadcast_strategy() -> Result<String> {
     }
 }
 
+/// Prompts for the per-channel concurrency limit (1-32, default 2).
+///
+/// # Errors
+/// Fails when the input cannot be read, does not parse, or is out of range.
 pub(crate) fn concurrency_limit() -> Result<u64> {
     eprint!("Concurrency limit per channel (1-32, default 2): ");
     std::io::stderr().flush().context("stderr flush failed")?;

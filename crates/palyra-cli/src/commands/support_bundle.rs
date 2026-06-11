@@ -1,9 +1,20 @@
+//! `palyra support-bundle`: export size-capped diagnostics bundles and manage
+//! offline replay bundles (journal export, import, run, baseline).
+//! Replay exports read the daemon's SQLite journal directly and redact
+//! embedded config/journal payloads before anything is written to disk.
+
 use crate::{output::support_bundle as support_bundle_output, *};
 use palyra_common::runtime_contracts::{
     IdempotencyOperationState, IdempotencyRecordSnapshot, RunLifecyclePhase,
     RunLifecycleTransitionRecord, RuntimeActorKind, RuntimeActorRef, StableErrorEnvelope,
 };
 
+/// Runs a `palyra support-bundle` subcommand.
+///
+/// # Errors
+/// Returns an error when limits are out of range, the journal database or
+/// replay bundle cannot be read, offline replay fails, or artifacts cannot be
+/// written.
 pub(crate) fn run_support_bundle(command: SupportBundleCommand) -> Result<()> {
     match command {
         SupportBundleCommand::Export {
@@ -133,6 +144,9 @@ fn run_replay_import(input: String, output_dir: String) -> Result<()> {
     std::io::stdout().flush().context("stdout flush failed")
 }
 
+// INTENTIONAL: the artifact name is derived from a locally recomputed hash of
+// the raw bytes, never from any hash or path the bundle itself supplies, so a
+// malicious bundle cannot steer where the import lands; a unit test pins this.
 fn replay_import_artifact_path(output_dir: &Path, bundle_bytes: &[u8]) -> PathBuf {
     let hash = sha256_hex(bundle_bytes);
     output_dir.join(format!("{}.replay.json", hash.chars().take(16).collect::<String>()))
@@ -194,6 +208,8 @@ fn build_replay_bundle_from_journal(
     let lifecycle_transitions = read_replay_lifecycle_transitions(&connection, run_id)?;
     let idempotency_records = read_replay_idempotency_records(&connection, run_id)?;
     let artifact_refs = read_replay_tool_result_artifact_refs(&connection, run_id)?;
+    // The tape query fetches max_events + 1 rows precisely so truncation can be
+    // detected here and recorded as a capture warning.
     let truncated = tape_events.len() > max_events;
     let tape_events = tape_events.into_iter().take(max_events).collect::<Vec<_>>();
     let mut config_snapshot = json!({
@@ -204,6 +220,8 @@ fn build_replay_bundle_from_journal(
             "source": "sqlite_orchestrator_tape",
         }
     });
+    // Config values may embed tokens or credentialed URLs; redact before the
+    // snapshot is serialized into a shareable bundle.
     redact_json_value_tree(&mut config_snapshot, None);
 
     build_replay_bundle(ReplayBundleBuildInput {
@@ -457,6 +475,8 @@ fn read_replay_idempotency_records(
     if !sqlite_table_exists(connection, "idempotency_records")? {
         return Ok(Vec::new());
     }
+    // idempotency_records has no run_ulid column, so rows are matched
+    // heuristically by run-id substring across the key and payload columns.
     let run_pattern = format!("%{run_id}%");
     let mut statement = connection
         .prepare(

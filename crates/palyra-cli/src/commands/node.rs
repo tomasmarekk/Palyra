@@ -1,3 +1,8 @@
+//! Node host lifecycle commands: pairing bootstrap, install/start/stop/uninstall,
+//! and the foreground capability loop that serves gateway dispatches over mTLS.
+//! Local node-host state (config, process metadata, identity store) lives under
+//! the CLI state root in the `node-host` directory.
+
 use std::{
     fs::{self, File},
     io::{Read, Write},
@@ -124,6 +129,11 @@ const NODE_CAPABILITY_DESCRIPTORS: [NodeCapabilityDescriptor; 5] = [
     NodeCapabilityDescriptor { name: "desktop.open_path", requires_local_mediation: true },
 ];
 
+/// Runs a `palyra node` subcommand on a dedicated Tokio runtime.
+///
+/// # Errors
+/// Returns an error when pairing, gateway connectivity, or local node-host
+/// state operations fail.
 pub(crate) fn run_node(command: NodeCommand) -> Result<()> {
     let runtime = build_runtime()?;
     runtime.block_on(run_node_async(command))
@@ -222,12 +232,13 @@ async fn run_node_foreground(config: &NodeHostConfig, json_output: bool) -> Resu
             available: true,
         })
         .collect::<Vec<_>>();
+    let capability_count = capabilities.len();
     let response = client
         .register_node(Request::new(node_v1::RegisterNodeRequest {
             v: RUN_STREAM_REQUEST_VERSION,
             device_id: Some(canonical_id(config.device_id.as_str())),
             platform: node_platform_label(),
-            capabilities: capabilities.clone(),
+            capabilities,
             replay: None,
         }))
         .await
@@ -244,7 +255,7 @@ async fn run_node_foreground(config: &NodeHostConfig, json_output: bool) -> Resu
             grpc_url: config.grpc_url.clone(),
             poll_interval_ms: config.poll_interval_ms,
             paired: true,
-            capability_count: capabilities.len(),
+            capability_count,
         },
         json_output,
     )?;
@@ -385,6 +396,8 @@ fn run_node_start(json_output: bool) -> Result<()> {
         started_at_unix_ms: now_unix_ms(),
     };
     write_node_host_process_metadata(&metadata)?;
+    // Give the detached child a short window to fail fast so startup crashes
+    // surface here with log paths instead of silently backgrounding.
     std::thread::sleep(Duration::from_millis(NODE_HOST_START_POLL_MS));
 
     if !process_is_running(metadata.pid) {
@@ -744,6 +757,8 @@ fn resolve_node_rpc_grpc_url(explicit: Option<String>) -> Result<String> {
         return Ok(parsed.to_string());
     }
 
+    // By convention the gateway exposes the node RPC listener one port above
+    // its admin gRPC port, always over TLS.
     let admin_grpc_url = client::grpc::resolve_url(None)?;
     let mut parsed = reqwest::Url::parse(admin_grpc_url.as_str())
         .with_context(|| format!("invalid gateway gRPC URL {admin_grpc_url}"))?;
@@ -805,6 +820,8 @@ fn execute_dispatched_capability(
         execute_local_capability(dispatch.capability.as_str(), &input_json, config, device);
     let payload_limit = usize::try_from(dispatch.max_payload_bytes).unwrap_or(usize::MAX).max(1);
     let had_output = !result.output_json.is_null();
+    // Oversized outputs are dropped rather than truncated so the gateway never
+    // receives partial JSON; the error field below explains the omission.
     let output_json = if result.success {
         let encoded = serde_json::to_vec(&result.output_json)
             .context("failed to encode local capability output")?;
@@ -1183,6 +1200,9 @@ fn emit_node_lifecycle_payload(payload: NodeLifecyclePayload, json_output: bool)
     std::io::stdout().flush().context("stdout flush failed")
 }
 
+// INTENTIONAL: text mode emits only boolean presence flags. Device ids, URLs,
+// filesystem paths, PIDs, and timestamps stay JSON-only (`--json`) so terminal
+// logs cannot leak them; a unit test pins this redaction contract.
 fn render_node_lifecycle_text(payload: &NodeLifecyclePayload) -> Vec<String> {
     let mut lines = vec![format!(
         "node.{} installed={} paired={} running={} device_configured={} grpc_configured={} identity_store_configured={} cert_present={} pid_present={} logs_present={}",

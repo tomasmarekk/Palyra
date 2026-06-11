@@ -1,5 +1,18 @@
+//! Workspace patch application with rollback and redacted previews.
+//!
+//! Patches are confined to resolved workspace roots and applied through the
+//! shared `palyra-common` workspace-patch engine; failures report a
+//! redacted preview and a validation exit code instead of partial writes.
+
 use crate::*;
 
+/// Runs `palyra patch apply`, reading a patch from stdin and applying it
+/// (or validating it in dry-run mode) inside the resolved workspace roots.
+///
+/// # Errors
+/// Fails when stdin is missing or empty, workspace-root resolution fails,
+/// or the patch is invalid; invalid patches exit with the validation code
+/// after emitting the failure payload.
 pub(crate) fn run_patch(command: PatchCommand) -> Result<()> {
     match command {
         PatchCommand::Apply { workspace_root, stdin, dry_run, json } => {
@@ -96,6 +109,8 @@ pub(crate) fn run_patch(command: PatchCommand) -> Result<()> {
     }
 }
 
+// Resolution order: explicit --workspace-root, then the configured process
+// runner workspace, then <state_root>/workspace, then the current directory.
 fn resolve_patch_workspace_roots(explicit_workspace_root: Option<&str>) -> Result<Vec<PathBuf>> {
     if let Some(explicit_workspace_root) =
         explicit_workspace_root.map(str::trim).filter(|value| !value.is_empty())

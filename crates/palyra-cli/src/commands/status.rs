@@ -1,3 +1,8 @@
+//! `palyra status`: one-shot health report combining HTTP/gRPC liveness
+//! probes, background service state, deployment posture, and authenticated
+//! runtime diagnostics. Admin data is fetched opportunistically when a token
+//! is present, but the raw admin payload is echoed only under `--admin`.
+
 use crate::*;
 use palyra_control_plane as control_plane;
 
@@ -56,6 +61,7 @@ struct StatusRuntimeSnapshot {
     diagnostics_error: Option<String>,
 }
 
+/// Resolved arguments for `palyra status`, decoupled from the clap surface.
 pub(crate) struct StatusCommandArgs {
     pub(crate) url: Option<String>,
     pub(crate) grpc_url: Option<String>,
@@ -67,6 +73,11 @@ pub(crate) struct StatusCommandArgs {
     pub(crate) json: bool,
 }
 
+/// Builds and emits the gateway status report.
+///
+/// # Errors
+/// Returns an error when connection settings cannot be resolved, output
+/// encoding fails, or `--admin` was requested and the admin probe fails.
 pub(crate) fn run_status(args: StatusCommandArgs) -> Result<()> {
     let root_context = app::current_root_context()
         .ok_or_else(|| anyhow!("CLI root context is unavailable for status command"))?;
@@ -419,6 +430,9 @@ fn build_status_report(
     })
 }
 
+// The admin payload may be fetched opportunistically (token present) to feed
+// the overall verdict, but it is echoed back only when --admin was explicit so
+// default status output stays free of admin-only detail; a unit test pins this.
 fn status_admin_payload_for_output(
     force_admin: bool,
     admin_payload: Option<Value>,

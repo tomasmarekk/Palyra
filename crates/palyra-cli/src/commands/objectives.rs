@@ -1,3 +1,8 @@
+//! `palyra objectives`: list, show, upsert, and drive lifecycle actions for
+//! long-running objectives through the daemon's `console/v1` HTTP API.
+//! Shares routine argument enums and the natural-language schedule parser
+//! with the routines command surface.
+
 use palyra_control_plane as control_plane;
 use serde_json::{json, Map, Value};
 
@@ -9,11 +14,21 @@ use crate::cli::{
 use crate::commands::routines::json_optional_string_at;
 use crate::*;
 
+/// Runs a `palyra objectives` subcommand on a dedicated Tokio runtime.
+///
+/// # Errors
+/// Returns an error when the admin console connection or the console API call
+/// fails, or when schedule arguments are ambiguous.
 pub(crate) fn run_objectives(command: ObjectivesCommand) -> Result<()> {
     let runtime = build_runtime()?;
     runtime.block_on(run_objectives_async(command))
 }
 
+/// Executes an objectives subcommand against the daemon admin console.
+///
+/// # Errors
+/// Returns an error when the console connection, payload construction, or the
+/// console API call fails.
 pub(crate) async fn run_objectives_async(command: ObjectivesCommand) -> Result<()> {
     let context =
         client::control_plane::connect_admin_console(app::ConnectionOverrides::default()).await?;
@@ -144,6 +159,10 @@ pub(crate) async fn run_objectives_async(command: ObjectivesCommand) -> Result<(
     }
 }
 
+/// Fetches a filtered objectives page from the console API.
+///
+/// # Errors
+/// Returns an error when the console request fails.
 pub(crate) async fn list_objectives_value(
     client: &control_plane::ControlPlaneClient,
     after: Option<&str>,
@@ -163,6 +182,10 @@ pub(crate) async fn list_objectives_value(
     client.get_json_value(path).await.map_err(Into::into)
 }
 
+/// Fetches a single objective envelope from the console API.
+///
+/// # Errors
+/// Returns an error when the console request fails.
 pub(crate) async fn get_objective_value(
     client: &control_plane::ControlPlaneClient,
     objective_id: &str,
@@ -173,6 +196,10 @@ pub(crate) async fn get_objective_value(
         .map_err(Into::into)
 }
 
+/// Fetches the rendered summary for an objective from the console API.
+///
+/// # Errors
+/// Returns an error when the console request fails.
 pub(crate) async fn get_objective_summary_value(
     client: &control_plane::ControlPlaneClient,
     objective_id: &str,
@@ -186,6 +213,10 @@ pub(crate) async fn get_objective_summary_value(
         .map_err(Into::into)
 }
 
+/// Creates or updates an objective via the console API.
+///
+/// # Errors
+/// Returns an error when the console request fails.
 pub(crate) async fn upsert_objective_value(
     client: &control_plane::ControlPlaneClient,
     payload: &Map<String, Value>,
@@ -193,6 +224,11 @@ pub(crate) async fn upsert_objective_value(
     client.post_json_value("console/v1/objectives", payload).await.map_err(Into::into)
 }
 
+/// Posts a lifecycle action (fire, pause, resume, cancel, archive) for an
+/// objective via the console API.
+///
+/// # Errors
+/// Returns an error when the console request fails.
 pub(crate) async fn objective_lifecycle_value(
     client: &control_plane::ControlPlaneClient,
     objective_id: &str,
@@ -270,6 +306,9 @@ fn build_objective_upsert_payload(args: ObjectiveUpsertArgs) -> Result<Map<Strin
     insert_optional_string(&mut payload, "next_recommended_step", args.next_recommended_step);
     insert_optional_string(&mut payload, "standing_order", args.standing_order);
     insert_optional_bool(&mut payload, "enabled", args.enabled);
+    // A bare --schedule without --schedule-type is treated as natural language
+    // input; combining it with --natural-language-schedule would make the
+    // intended source ambiguous, so that combination is rejected.
     let mut natural_language_schedule = args.natural_language_schedule;
     if args.schedule_type.is_none() {
         if let Some(schedule) =
@@ -407,6 +446,8 @@ fn build_query_path(path: &str, pairs: Vec<(&str, Option<String>)>) -> String {
     }
 }
 
+// Percent-encodes everything outside the RFC 3986 unreserved set so caller
+// supplied ids cannot inject path separators or query syntax into the URL.
 fn percent_encode_component(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.as_bytes() {

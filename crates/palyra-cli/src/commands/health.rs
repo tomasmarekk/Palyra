@@ -1,5 +1,18 @@
+//! Daemon health probe over both transports.
+//!
+//! Probes the HTTP `/healthz` endpoint and the gateway gRPC health service
+//! so transport-specific outages are distinguishable; JSON mode reports
+//! partial failures as a structured unavailable payload on stderr.
+
 use crate::*;
 
+/// Runs `palyra health`, probing HTTP and gRPC health and emitting the
+/// combined result.
+///
+/// # Errors
+/// Fails when connection resolution fails, a probe fails (text mode), or
+/// output encoding fails. In JSON mode probe failures exit through a
+/// classified already-emitted error after printing the payload.
 pub(crate) fn run_health(url: Option<String>, grpc_url: Option<String>, json: bool) -> Result<()> {
     let root_context = app::current_root_context()
         .ok_or_else(|| anyhow!("CLI root context is unavailable for health command"))?;
@@ -105,6 +118,9 @@ pub(crate) fn run_health(url: Option<String>, grpc_url: Option<String>, json: bo
     std::io::stdout().flush().context("stdout flush failed")
 }
 
+// Prints the structured unavailable payload to stderr, then returns an
+// already-emitted error so main sets the classified exit code without
+// printing the failure a second time.
 fn emit_unavailable_health_json(
     daemon_url: &str,
     grpc_url: &str,

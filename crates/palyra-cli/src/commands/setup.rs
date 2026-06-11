@@ -1,5 +1,17 @@
+//! `palyra setup` entry point: plain init by default, or the guided
+//! operator wizard with `--wizard`.
+//!
+//! Both paths finish by activating the resulting config/state paths and
+//! ensuring a bootstrap local profile exists.
+
 use crate::*;
 
+/// Runs setup via init or the wizard, then activates the resulting paths in
+/// the CLI profile.
+///
+/// # Errors
+/// Propagates init/wizard failures, path resolution failures, and profile
+/// bootstrap failures.
 pub(crate) fn run_setup(
     mode: InitModeArg,
     path: Option<String>,

@@ -1,9 +1,21 @@
+//! Confirmed verify send for the Discord connector.
+//!
+//! Sends a real message through the connector's test-send endpoint; the
+//! explicit `--confirm` gate keeps channel egress an intentional operator
+//! action.
+
 use anyhow::{bail, Context, Result};
 
 use crate::{client::channels as channels_client, output};
 
 use super::{emit, request};
 
+/// Sends a confirmed test message to a Discord target and reports dispatch
+/// counters.
+///
+/// # Errors
+/// Fails when `--confirm` is missing, account-id normalization fails, or the
+/// test-send endpoint call fails.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
     account_id: String,

@@ -1,3 +1,8 @@
+//! `palyra logs`: tail recent gateway activity with a source fallback chain --
+//! console log API first, then the SQLite journal, then service stdout/stderr
+//! files, and finally a diagnostic notice when no source exists yet.
+//! Follow mode polls its source; local sources reject `--follow --json`.
+
 use std::{
     collections::VecDeque,
     fs::File,
@@ -45,6 +50,12 @@ enum LogInput {
     Unavailable { message: String },
 }
 
+/// Emits recent log records, optionally following the selected source.
+///
+/// # Errors
+/// Returns an error when `--follow --json` is combined on the local fallback
+/// path, or when the fallback sources (journal database, service log files)
+/// fail to open or read.
 pub(crate) fn run_logs(
     db_path: Option<String>,
     lines: usize,
@@ -53,6 +64,12 @@ pub(crate) fn run_logs(
     json: bool,
 ) -> Result<()> {
     let runtime = build_runtime()?;
+    // Console API errors are intentionally swallowed: the console requires an
+    // authenticated, running daemon, and `logs` must keep working from local
+    // journal/service files precisely when the daemon is down.
+    // AIDEV-NOTE: if the console path fails *after* emitting records (for
+    // example the daemon restarts mid-follow), the fallback below re-emits the
+    // most recent lines, so followers can see duplicates across the switch.
     if let Ok(()) = runtime.block_on(run_console_logs(lines, follow, poll_interval_ms, json)) {
         return Ok(());
     }

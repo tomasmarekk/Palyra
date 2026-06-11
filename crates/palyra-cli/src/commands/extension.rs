@@ -1,5 +1,15 @@
+//! Extension package preflight (`extension doctor`).
+//!
+//! Verifies a local skill/extension artifact against the signature trust
+//! store and security audit policy, failing the command whenever the
+//! package is not ready to install.
+
 use crate::*;
 
+/// Dispatches a `palyra extension` subcommand.
+///
+/// # Errors
+/// Propagates doctor failures, including a blocked (non-ready) package.
 pub(crate) fn run_extension(command: ExtensionCommand) -> Result<()> {
     match command {
         ExtensionCommand::Doctor {
@@ -79,6 +89,8 @@ fn run_extension_doctor(
     Ok(())
 }
 
+// Parses a --grant argument of the form class=value (or class:value);
+// secret grants additionally split an optional scope/key form.
 fn parse_extension_grant(raw: &str) -> Result<palyra_skills::ExtensionCapabilityGrant> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {

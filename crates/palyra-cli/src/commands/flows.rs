@@ -1,3 +1,9 @@
+//! Flow orchestration commands over the daemon console API: list, show,
+//! pause/resume/cancel, and per-step retry/skip/compensate actions.
+//!
+//! Payloads stay as raw JSON values so the CLI tolerates console schema
+//! additions; the fetch helpers are shared with other command surfaces.
+
 use palyra_control_plane as control_plane;
 use serde_json::{json, Value};
 
@@ -5,11 +11,20 @@ use crate::cli::{FlowStateArg, FlowsCommand};
 use crate::commands::routines::{json_optional_string_at, json_value_at};
 use crate::*;
 
+/// Runs a `palyra flows` subcommand on a fresh Tokio runtime.
+///
+/// # Errors
+/// Fails when the runtime cannot be built or the async handler fails.
 pub(crate) fn run_flows(command: FlowsCommand) -> Result<()> {
     let runtime = build_runtime()?;
     runtime.block_on(run_flows_async(command))
 }
 
+/// Dispatches a `palyra flows` subcommand against the admin console API.
+///
+/// # Errors
+/// Fails when the console connection, the endpoint call, or output encoding
+/// fails.
 pub(crate) async fn run_flows_async(command: FlowsCommand) -> Result<()> {
     let context =
         client::control_plane::connect_admin_console(app::ConnectionOverrides::default()).await?;
@@ -60,6 +75,10 @@ pub(crate) async fn run_flows_async(command: FlowsCommand) -> Result<()> {
     }
 }
 
+/// Fetches the flows list document with optional limit and state filters.
+///
+/// # Errors
+/// Fails when the console request fails.
 pub(crate) async fn list_flows_value(
     client: &control_plane::ControlPlaneClient,
     limit: Option<u32>,
@@ -77,6 +96,10 @@ pub(crate) async fn list_flows_value(
     client.get_json_value(path).await.map_err(Into::into)
 }
 
+/// Fetches one flow document by id.
+///
+/// # Errors
+/// Fails when the console request fails.
 pub(crate) async fn get_flow_value(
     client: &control_plane::ControlPlaneClient,
     flow_id: &str,
@@ -87,6 +110,10 @@ pub(crate) async fn get_flow_value(
         .map_err(Into::into)
 }
 
+/// Posts a flow-level action (pause/resume/cancel) with an optional reason.
+///
+/// # Errors
+/// Fails when the console request fails.
 pub(crate) async fn flow_action_value(
     client: &control_plane::ControlPlaneClient,
     flow_id: &str,
@@ -107,6 +134,11 @@ pub(crate) async fn flow_action_value(
         .map_err(Into::into)
 }
 
+/// Posts a step-level action (retry/skip/compensate) with an optional
+/// reason.
+///
+/// # Errors
+/// Fails when the console request fails.
 pub(crate) async fn step_action_value(
     client: &control_plane::ControlPlaneClient,
     flow_id: &str,

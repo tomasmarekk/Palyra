@@ -1,8 +1,19 @@
+//! Agent Client Protocol (ACP) entry points: the long-lived editor bridge
+//! and the one-shot shim that replays a single agent run as ACP output.
+//!
+//! The bridge derives its control-plane principal from the resolved gRPC
+//! connection so editor sessions act under the operator's admin identity.
+
 use anyhow::{anyhow, Result};
 
 use crate::cli::{AcpBridgeArgs, AcpShimArgs, AcpSubcommand};
 use crate::*;
 
+/// Dispatches `palyra acp`, defaulting to the bridge when no subcommand is
+/// given.
+///
+/// # Errors
+/// Propagates connection resolution and bridge/shim runtime failures.
 pub(crate) fn run_acp(command: AcpCommand) -> Result<()> {
     match command.subcommand {
         Some(AcpSubcommand::Shim { command }) => run_acp_shim(command),
@@ -10,10 +21,18 @@ pub(crate) fn run_acp(command: AcpCommand) -> Result<()> {
     }
 }
 
+/// Runs the ACP bridge for the deprecated `agent acp` spelling.
+///
+/// # Errors
+/// Propagates connection resolution and bridge runtime failures.
 pub(crate) fn run_legacy_agent_acp(command: AcpBridgeArgs) -> Result<()> {
     run_acp_bridge(command)
 }
 
+/// Runs the ACP shim for the deprecated `agent acp-shim` spelling.
+///
+/// # Errors
+/// Propagates connection resolution and shim runtime failures.
 pub(crate) fn run_legacy_agent_acp_shim(command: AcpShimArgs) -> Result<()> {
     run_acp_shim(command)
 }

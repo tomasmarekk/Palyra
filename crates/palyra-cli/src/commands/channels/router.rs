@@ -1,3 +1,9 @@
+//! Channel router admin commands: rules, warnings, routing preview, and
+//! pairing inspection/minting.
+//!
+//! These surface the daemon router's deny-by-default routing decisions so
+//! operators can preview how an inbound message would be handled.
+
 use anyhow::Result;
 use serde_json::json;
 
@@ -6,6 +12,12 @@ use crate::{
     normalize_required_text_arg, output, output::channels as channels_output,
 };
 
+/// Dispatches a `palyra channels router` subcommand against the daemon
+/// router admin endpoints.
+///
+/// # Errors
+/// Fails when argument normalization, the endpoint call, or output encoding
+/// fails.
 pub(crate) fn run(command: ChannelsRouterCommand) -> Result<()> {
     match command {
         ChannelsRouterCommand::Rules { url, token, principal, device_id, channel, json } => {

@@ -1,3 +1,9 @@
+//! Channel capability and entity-resolution commands.
+//!
+//! Capability output merges the static provider contract (lifecycle actions,
+//! resolvable entities, pairing support) with live message capabilities
+//! fetched from the daemon.
+
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
@@ -6,6 +12,11 @@ use crate::{
     client::message,
 };
 
+/// Reports the merged capability surface for the selected connector.
+///
+/// # Errors
+/// Fails when selector resolution, the message capability fetch, or output
+/// encoding fails.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_capabilities(
     connector_id: Option<String>,
@@ -31,6 +42,12 @@ pub(super) fn run_capabilities(
     emit_channel_capabilities(payload, json_output)
 }
 
+/// Normalizes and canonicalizes a provider entity reference (channel,
+/// conversation, thread, or user).
+///
+/// # Errors
+/// Fails when the input value is blank, provider normalization rejects it,
+/// or output encoding fails.
 pub(super) fn run_resolution(
     provider: ChannelProviderArg,
     account_id: String,

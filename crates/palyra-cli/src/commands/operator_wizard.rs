@@ -1,3 +1,9 @@
+//! Operator wizards behind `palyra onboarding`, `palyra setup`, and `palyra configure`.
+//!
+//! Wizard steps collect a mutation plan that is applied through the shared safe config
+//! mutation layer (daemon-schema validation plus backups). API keys land in the vault;
+//! configs that carry inline secrets are persisted with owner-only file semantics.
+
 use std::{
     collections::BTreeMap,
     io::IsTerminal,
@@ -42,6 +48,7 @@ const MINIMAX_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_MINIMAX_BASE_URL";
 const MINIMAX_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const MINIMAX_AUTH_PROVIDER_KIND: &str = "minimax";
 
+/// Parameters for the onboarding/setup wizard, assembled from CLI arguments.
 #[derive(Debug, Clone)]
 pub(crate) struct OnboardingWizardRequest {
     pub(crate) path: Option<String>,
@@ -51,6 +58,7 @@ pub(crate) struct OnboardingWizardRequest {
     pub(crate) options: WizardOverridesArg,
 }
 
+/// Parameters for the section-based configure wizard, assembled from CLI arguments.
 #[derive(Debug, Clone)]
 pub(crate) struct ConfigureWizardRequest {
     pub(crate) path: Option<String>,
@@ -84,6 +92,7 @@ pub(crate) struct ConfigureWizardRequest {
     pub(crate) skip_skills: bool,
 }
 
+/// Top-level onboarding flow selected by the operator or CLI flags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WizardFlowKind {
     Quickstart,
@@ -122,6 +131,7 @@ enum RemoteAccessPattern {
     VerifiedHttps,
 }
 
+/// Aggregate post-apply health outcome reported in the onboarding summary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 enum HealthStatus {
@@ -133,6 +143,7 @@ enum HealthStatus {
     ManualFollowUpRequired,
 }
 
+/// How the wizard handled background gateway service installation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 enum ServiceInstallMode {
@@ -173,6 +184,7 @@ struct HealthCheckReport {
     checks: Vec<HealthCheckSummary>,
 }
 
+/// Filesystem locations prepared before the onboarding plan is applied.
 #[derive(Debug, Clone)]
 struct ApplyContext {
     config_path: PathBuf,
@@ -191,6 +203,7 @@ struct BindProfileConfig {
     accept_risk: bool,
 }
 
+/// Accumulated wizard decisions, applied to disk in one pass by `apply_onboarding_plan`.
 #[derive(Debug, Default, Clone)]
 struct OnboardingMutationPlan {
     flow: String,
@@ -267,6 +280,10 @@ struct ConfigureSummary {
     warnings: Vec<String>,
 }
 
+/// Runs `palyra setup` by delegating to the onboarding wizard with an explicit init mode.
+///
+/// # Errors
+/// Returns an error when the operator cancels or any onboarding step fails.
 pub(crate) fn run_setup_wizard(
     mode: InitModeArg,
     path: Option<String>,
@@ -283,6 +300,12 @@ pub(crate) fn run_setup_wizard(
     })
 }
 
+/// Drives the full onboarding flow: collect a mutation plan, apply it to disk,
+/// run post-apply health checks, and emit the operator summary.
+///
+/// # Errors
+/// Returns an error when the operator cancels, secret sources are misused,
+/// config mutation or validation fails, or the summary cannot be emitted.
 pub(crate) fn run_onboarding_wizard(request: OnboardingWizardRequest) -> Result<()> {
     let flow = resolve_onboarding_flow(request.setup_mode, request.options.flow);
     let config_path = match request.setup_mode {
@@ -342,6 +365,12 @@ pub(crate) fn run_onboarding_wizard(request: OnboardingWizardRequest) -> Result<
     emit_onboarding_summary(&summary, output::preferred_json(request.options.json))
 }
 
+/// Reconfigures selected sections of an existing config and emits a per-section
+/// change summary; the file is rewritten only when a section actually changed.
+///
+/// # Errors
+/// Returns an error when the config is missing or invalid, the operator cancels,
+/// or the mutated document fails daemon-schema validation or persistence.
 pub(crate) fn run_configure_wizard(request: ConfigureWizardRequest) -> Result<()> {
     let config_path = resolve_config_path(request.path.clone(), true)?;
     let path_ref = Path::new(&config_path);
@@ -643,16 +672,13 @@ pub(crate) fn run_configure_wizard(request: ConfigureWizardRequest) -> Result<()
                     ),
                 ))?;
                 unchanged_sections.push("skills".to_owned());
-                warnings.push(
-                    format!(
-                        "skills inventory snapshot: installed={} eligible={} quarantined={} runtime_unknown={}; use `palyra skills info|check|list` for concrete actions.",
-                        skills_snapshot.installed_total,
-                        skills_snapshot.eligible_total,
-                        skills_snapshot.quarantined_total,
-                        skills_snapshot.runtime_unknown_total
-                    )
-                        .to_owned(),
-                );
+                warnings.push(format!(
+                    "skills inventory snapshot: installed={} eligible={} quarantined={} runtime_unknown={}; use `palyra skills info|check|list` for concrete actions.",
+                    skills_snapshot.installed_total,
+                    skills_snapshot.eligible_total,
+                    skills_snapshot.quarantined_total,
+                    skills_snapshot.runtime_unknown_total
+                ));
                 continue;
             }
             ConfigureSectionArg::HealthSecurity => {
@@ -695,7 +721,7 @@ pub(crate) fn run_configure_wizard(request: ConfigureWizardRequest) -> Result<()
         } else {
             unchanged_sections.push(section.slug().to_owned());
         }
-        let mut section_follow_up_checks = section_follow_up_checks(section, &document)?;
+        let section_follow_up_checks = section_follow_up_checks(section, &document)?;
         follow_up_checks.extend(section_follow_up_checks.iter().cloned());
         section_changes.push(ConfigureSectionChange {
             section: section.slug().to_owned(),
@@ -703,7 +729,7 @@ pub(crate) fn run_configure_wizard(request: ConfigureWizardRequest) -> Result<()
             before: before_snapshot,
             after: describe_configure_section(&document, section)?,
             restart_required: section_restart_required,
-            follow_up_checks: std::mem::take(&mut section_follow_up_checks),
+            follow_up_checks: section_follow_up_checks,
         });
     }
 
@@ -732,6 +758,8 @@ pub(crate) fn run_configure_wizard(request: ConfigureWizardRequest) -> Result<()
     emit_configure_summary(&summary, output::preferred_json(request.json))
 }
 
+/// Persists the config with backups, switching to owner-only secret-file semantics
+/// when the document carries an inline secret value.
 fn write_operator_document_with_backups(path: &Path, document: &toml::Value) -> Result<()> {
     if document_contains_inline_secret(document)? {
         write_secret_document_with_backups(path, document, CONFIGURE_BACKUPS)?;
@@ -741,6 +769,7 @@ fn write_operator_document_with_backups(path: &Path, document: &toml::Value) -> 
     Ok(())
 }
 
+/// Reports whether any known secret-bearing config path holds an inline string value.
 fn document_contains_inline_secret(document: &toml::Value) -> Result<bool> {
     for path in INLINE_SECRET_CONFIG_PATHS {
         if get_string_value_at_path(document, path)?.is_some() {
@@ -1016,6 +1045,7 @@ fn build_configure_answers(
     Ok(answers)
 }
 
+/// Runs the wizard step sequence and collects the onboarding mutation plan.
 fn execute_onboarding_flow(
     wizard: &mut WizardSession<'_, dyn WizardBackend>,
     request: &OnboardingWizardRequest,
@@ -1637,6 +1667,7 @@ fn resolve_existing_config_action(
     if !config_path.exists() {
         return Ok(None);
     }
+    // Zero-length files are placeholders, not real configs; skip the reuse/overwrite prompt.
     if config_path.metadata().map(|metadata| metadata.len() == 0).unwrap_or(false) {
         return Ok(None);
     }
@@ -1669,6 +1700,8 @@ fn resolve_existing_config_action(
     }))
 }
 
+/// Creates the config directory, state root, identity store, and vault directory
+/// before any document mutation, bailing out on an operator abort.
 fn prepare_apply_context(
     config_path: &Path,
     force: bool,
@@ -1715,6 +1748,8 @@ fn prepare_apply_context(
     })
 }
 
+/// Applies the collected plan to the config document and filesystem; returns the
+/// dashboard URL used in the onboarding summary.
 fn apply_onboarding_plan(
     context: &ApplyContext,
     plan: &mut OnboardingMutationPlan,
@@ -1764,12 +1799,8 @@ fn apply_onboarding_plan(
         apply_model_provider_api_key(&mut document, plan.auth_method.as_str(), api_key.as_str())?;
     }
 
-    set_value_at_path(
-        &mut document,
-        "deployment.profile",
-        toml::Value::String(plan.deployment_profile.as_str().to_owned()),
-    )?;
     apply_deployment_profile_defaults(&mut document, plan.deployment_profile)?;
+    // Set the profile after applying defaults so a manifest default cannot override it.
     set_value_at_path(
         &mut document,
         "deployment.profile",
@@ -1952,6 +1983,10 @@ fn ensure_admin_auth_defaults(document: &mut toml::Value) -> Result<bool> {
     ensure_admin_auth_defaults_with_token(document, None)
 }
 
+/// Backfills admin auth defaults and returns `true` when the document changed.
+///
+/// An existing `admin.auth_token_secret_ref` counts as a configured token source,
+/// so no inline token is generated over it.
 fn ensure_admin_auth_defaults_with_token(
     document: &mut toml::Value,
     admin_token: Option<&str>,
@@ -1979,6 +2014,8 @@ fn admin_auth_token_source_configured(document: &toml::Value) -> Result<bool> {
         || get_value_at_path(document, "admin.auth_token_secret_ref")?.is_some())
 }
 
+/// Backfills identity-store, vault, and runloop defaults; returns `true` when the
+/// document changed.
 fn ensure_runtime_defaults(document: &mut toml::Value, context: &ApplyContext) -> Result<bool> {
     let before = document.clone();
     if get_string_value_at_path(document, "gateway.identity_store_dir")?.is_none() {
@@ -2001,6 +2038,8 @@ fn ensure_runtime_defaults(document: &mut toml::Value, context: &ApplyContext) -
     Ok(document != &before)
 }
 
+/// Applies manifest defaults only for keys that are not already present; returns
+/// `true` when the document changed.
 fn ensure_missing_deployment_profile_defaults(
     document: &mut toml::Value,
     deployment_profile: palyra_common::deployment_profiles::DeploymentProfileId,
@@ -2160,6 +2199,9 @@ fn run_post_apply_health_check(
     }
 }
 
+// INTENTIONAL: probe only the unauthenticated /healthz endpoint and never attach admin
+// credentials -- whatever process currently owns the port would receive them. Pinned by
+// running_gateway_restart_check_does_not_send_admin_token_to_health_responder.
 fn running_gateway_restart_check(
     context: &ApplyContext,
     _document: &toml::Value,
@@ -2186,6 +2228,8 @@ fn running_gateway_restart_check(
     }))
 }
 
+/// Picks the summary status, recommended step id, and next-step guidance from the
+/// flow outcome.
 fn onboarding_summary_next_step(
     flow: WizardFlowKind,
     service_install_mode: ServiceInstallMode,
@@ -2876,6 +2920,8 @@ fn apply_model_provider_api_key(
             )?;
         }
         "minimax_api_key" => {
+            // Discovery must run before clearing auth: it reads the currently configured
+            // MiniMax base URL and chat model from the document as fallbacks.
             let selection = discover_minimax_model_selection(document, api_key)?;
             clear_model_provider_auth(document)?;
             let vault_ref = store_secret_in_vault("global", "minimax_api_key", api_key)?;
@@ -2967,6 +3013,9 @@ struct MinimaxModelSelection {
     model_id: String,
 }
 
+/// Resolves the MiniMax base URL and chat model, preferring live model discovery
+/// and falling back to an already-configured MiniMax model when discovery fails
+/// or returns nothing selectable.
 fn discover_minimax_model_selection(
     document: &toml::Value,
     api_key: &str,
@@ -3022,6 +3071,8 @@ fn minimax_base_url_for_config(document: &toml::Value) -> Result<String> {
     Ok(DEFAULT_MINIMAX_BASE_URL.to_owned())
 }
 
+/// Validates and canonicalizes a MiniMax base URL; https is required except for
+/// loopback http endpoints.
 fn normalize_minimax_base_url(raw: &str, source: &str) -> Result<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -3042,15 +3093,11 @@ fn normalize_minimax_base_url(raw: &str, source: &str) -> Result<String> {
     Ok(parsed.as_str().trim_end_matches('/').to_owned())
 }
 
+// Loopback http endpoints (local proxies and test rigs) need the explicit
+// private-base-url opt-in because the daemon rejects private model endpoints by default.
 fn minimax_base_url_requires_private_opt_in(base_url: &str) -> bool {
     reqwest::Url::parse(base_url)
-        .ok()
-        .and_then(|url| {
-            let is_loopback_http =
-                url.scheme() == "http" && url.host_str().is_some_and(host_is_loopback);
-            is_loopback_http.then_some(())
-        })
-        .is_some()
+        .is_ok_and(|url| url.scheme() == "http" && url.host_str().is_some_and(host_is_loopback))
 }
 
 fn host_is_loopback(host: &str) -> bool {
@@ -3137,6 +3184,8 @@ fn collect_secret_inputs(
     })
 }
 
+/// Loads a secret from exactly one of env/stdin/prompt; `Ok(None)` when no source
+/// was selected.
 fn load_secret_input_optional(
     env_name: Option<String>,
     from_stdin: bool,
@@ -3275,6 +3324,7 @@ fn join_section_state(values: &[String]) -> String {
     }
 }
 
+/// Removes duplicates in place while preserving first-occurrence order.
 fn dedupe_strings(values: &mut Vec<String>) {
     let mut deduped = Vec::with_capacity(values.len());
     for value in values.drain(..) {
@@ -3439,21 +3489,18 @@ fn describe_configure_section(
             ),
             "discord_setup=manual_follow_up".to_owned(),
         ]),
-        ConfigureSectionArg::Skills => Ok(vec![
-            format!(
-                "skills_trust_store={}",
-                env::var("PALYRA_SKILLS_TRUST_STORE").unwrap_or_else(|_| "default".to_owned())
-            ),
-            format!(
-                "installed_total={}",
-                build_default_skills_inventory_snapshot().installed_total
-            ),
-            format!("eligible_total={}", build_default_skills_inventory_snapshot().eligible_total),
-            format!(
-                "quarantined_total={}",
-                build_default_skills_inventory_snapshot().quarantined_total
-            ),
-        ]),
+        ConfigureSectionArg::Skills => {
+            let snapshot = build_default_skills_inventory_snapshot();
+            Ok(vec![
+                format!(
+                    "skills_trust_store={}",
+                    env::var("PALYRA_SKILLS_TRUST_STORE").unwrap_or_else(|_| "default".to_owned())
+                ),
+                format!("installed_total={}", snapshot.installed_total),
+                format!("eligible_total={}", snapshot.eligible_total),
+                format!("quarantined_total={}", snapshot.quarantined_total),
+            ])
+        }
         ConfigureSectionArg::HealthSecurity => Ok(vec![
             format!(
                 "admin_auth_required={}",
@@ -3729,6 +3776,7 @@ fn runtime_preview_step_id(capability: RuntimePreviewCapability) -> &'static str
     }
 }
 
+/// Derives the wizard's default auth-method choice from the existing provider config.
 fn current_auth_method(document: &toml::Value) -> String {
     let provider_kind = get_string_value_at_path(document, "model_provider.kind")
         .ok()

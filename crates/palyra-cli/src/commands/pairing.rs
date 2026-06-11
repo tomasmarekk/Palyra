@@ -1,9 +1,20 @@
+//! Device pairing commands: listing requests/codes, minting codes, and
+//! approving or rejecting pending requests via the admin console.
+//!
+//! Also hosts the legacy local pairing flow that drives the identity
+//! manager directly against an on-disk store, including fail-closed
+//! rollback when the paired identity cannot be persisted.
+
 use palyra_control_plane as control_plane;
 use palyra_identity::{IdentityManager, DEFAULT_CERT_VALIDITY};
 
 use crate::args::PairingStateArg;
 use crate::*;
 
+/// Runs a `palyra pairing` subcommand on a fresh Tokio runtime.
+///
+/// # Errors
+/// Fails when the runtime cannot be built or the async handler fails.
 pub(crate) fn run_pairing(command: PairingCommand) -> Result<()> {
     let runtime = build_runtime()?;
     runtime.block_on(run_pairing_async(command))
@@ -144,6 +155,8 @@ async fn run_pairing_async(command: PairingCommand) -> Result<()> {
     }
 }
 
+/// Arguments for the legacy local pairing flow, grouped so the handler keeps
+/// a single-parameter signature.
 struct LegacyPairingArgs {
     device_id: String,
     client_kind: PairingClientKindArg,
@@ -156,6 +169,9 @@ struct LegacyPairingArgs {
     simulate_rotation: bool,
 }
 
+// Drives the local identity-manager pairing handshake end to end; requires
+// the explicit --approve acknowledgement because it mints trusted device
+// material on this machine.
 fn run_legacy_pairing(args: LegacyPairingArgs) -> Result<()> {
     if !args.approve {
         anyhow::bail!(
@@ -184,6 +200,10 @@ fn run_legacy_pairing(args: LegacyPairingArgs) -> Result<()> {
     let result = manager
         .complete_pairing(hello, completed_at)
         .context("failed to complete pairing handshake")?;
+    // Fail closed: if the paired identity cannot be persisted, revoke the
+    // device so no half-paired identity remains trusted. The underlying
+    // errors are intentionally not interpolated; persisted identity material
+    // must never leak into diagnostics and the messages are pinned by tests.
     if let Err(store_error) = device.store(store.as_ref()) {
         let rollback = manager.revoke_device(
             &args.device_id,

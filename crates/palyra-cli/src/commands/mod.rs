@@ -1,3 +1,6 @@
+//! One module per operator-facing CLI command surface; the crate root
+//! dispatches parsed commands into the matching `run_*` entry points here.
+
 pub mod acp;
 pub mod agent;
 pub mod agents;

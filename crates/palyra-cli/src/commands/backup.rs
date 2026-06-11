@@ -1,3 +1,8 @@
+//! `palyra backup`: create and verify portable ZIP archives of config, state,
+//! optional workspace, and an embedded support bundle.
+//! Safety rules: the archive must live outside the live state root, symlinked
+//! sources are rejected, and every entry is hash-pinned in `manifest.json`.
+
 use std::{
     env, fs,
     io::{Read, Write},
@@ -64,6 +69,11 @@ struct BackupVerifyReport {
     ok: bool,
 }
 
+/// Runs a `palyra backup` subcommand.
+///
+/// # Errors
+/// Returns an error when source paths are missing or unsafe, the archive
+/// cannot be written, or verification finds hash/size mismatches.
 pub(crate) fn run_backup(command: BackupCommand) -> Result<()> {
     match command {
         BackupCommand::Create {
@@ -397,6 +407,8 @@ fn add_directory_to_zip(
         children.sort_by_key(|entry| entry.path());
         for child in children {
             let path = child.path();
+            // Never archive the archive itself; the output file may live
+            // inside the workspace tree being captured.
             if path == output_path {
                 continue;
             }
@@ -406,6 +418,9 @@ fn add_directory_to_zip(
             let file_type = child
                 .file_type()
                 .with_context(|| format!("failed to inspect backup entry {}", path.display()))?;
+            // Symlinks are rejected outright (not followed) so a planted link
+            // cannot pull files from outside the selected source root into the
+            // archive; a unit test pins this behavior.
             if file_type.is_symlink() {
                 anyhow::bail!(
                     "backup source contains unsupported symlink entry: {}",
@@ -442,6 +457,9 @@ fn add_directory_to_zip(
     Ok(())
 }
 
+// Vault metadata lock and temp files are transient and may be mid-write while
+// the daemon runs; capturing them would embed torn or stale vault metadata in
+// the archive.
 fn should_skip_state_backup_entry(path: &Path, archive_prefix: &str) -> bool {
     if archive_prefix != "state" {
         return false;
@@ -565,6 +583,9 @@ fn emit_backup_verify_report(report: &BackupVerifyReport, json: bool) -> Result<
     std::io::stdout().flush().context("stdout flush failed")
 }
 
+// An archive written into the live state root would be swept up by later
+// backups and destroyed by state-root recovery/uninstall flows, so it is
+// rejected up front rather than silently skipped.
 fn reject_live_state_root_backup_output(output_path: &Path, state_root: &Path) -> Result<()> {
     let normalized_output = normalize_backup_comparison_path(output_path)?;
     let normalized_state_root = normalize_backup_comparison_path(state_root)?;

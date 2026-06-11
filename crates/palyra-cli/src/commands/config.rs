@@ -1,5 +1,15 @@
+//! `palyra config`: status, path resolution, validation, and key-level
+//! get/set/unset/migrate/recover operations on the daemon TOML config.
+//! Every mutation revalidates the document against the daemon schema before
+//! persisting; secret values are redacted in output unless `--show-secrets`.
+
 use crate::*;
 
+/// Runs a `palyra config` subcommand; a missing subcommand defaults to status.
+///
+/// # Errors
+/// Returns an error when the config cannot be resolved or parsed, a key path
+/// is invalid or missing, or a mutated document fails daemon-schema validation.
 pub(crate) fn run_config(command: Option<ConfigCommand>) -> Result<()> {
     let command = command
         .unwrap_or(ConfigCommand::Status { path: None, json: output::preferred_json(false) });
@@ -232,6 +242,8 @@ pub(crate) fn run_config(command: Option<ConfigCommand>) -> Result<()> {
         ConfigCommand::Recover { path, backup, backups } => {
             let path = resolve_config_path(path, false)?;
             let path_ref = Path::new(&path);
+            // The backup is parsed and schema-validated before any swap so a
+            // recover can never replace the active config with a broken one.
             let candidate_backup = backup_path(path_ref, backup);
             let (backup_document, _) = load_document_from_existing_path(&candidate_backup)
                 .with_context(|| {
@@ -276,6 +288,9 @@ fn build_config_get_output_value(
         return Ok((value.clone(), false));
     }
 
+    // Redaction rules are defined over whole documents, so redact a copy and
+    // re-resolve the key in it rather than re-implementing per-key secret
+    // classification here.
     let mut redacted_document = document.clone();
     redact_secret_config_values(&mut redacted_document);
     let redacted_value = get_value_at_path(&redacted_document, key)
@@ -427,6 +442,10 @@ fn validate_config_set_value(key: &str, value: &toml::Value) -> Result<()> {
     Ok(())
 }
 
+// Lets operators write `config set key plain-text` without TOML quoting. The
+// first-byte exclusions keep inputs that look like quoted strings, arrays,
+// tables, comments, or assignments on the strict TOML-literal path so a typo
+// there fails loudly instead of being stored as a string.
 fn can_treat_config_set_value_as_bare_string(raw: &str) -> bool {
     let trimmed = raw.trim();
     !trimmed.is_empty()

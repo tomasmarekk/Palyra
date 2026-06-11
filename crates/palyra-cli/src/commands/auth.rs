@@ -1,3 +1,10 @@
+//! Auth commands: profile registry CRUD/health, runtime auth diagnostics, access
+//! control (tokens, workspaces, invitations), and OpenAI provider auth flows.
+//!
+//! Credentials are handled as vault references only; raw secrets enter exclusively
+//! through load_secret_input (env/stdin/prompt) and OAuth authorization URLs are
+//! kept out of text output. Output lines are pinned by CLI parity tests.
+
 use crate::*;
 use palyra_control_plane as control_plane;
 
@@ -8,6 +15,11 @@ const AUTH_PROFILES_MODEL_PROVIDER_SOURCES: &[&str] = &[
     "palyra secrets inventory --json",
 ];
 
+/// Runs a `palyra auth` subcommand on a fresh Tokio runtime.
+///
+/// # Errors
+/// Returns an error when the runtime cannot be built, connection resolution
+/// fails, or the dispatched subcommand fails.
 pub(crate) fn run_auth(command: AuthCommand) -> Result<()> {
     match command {
         AuthCommand::Profiles { command } => {
@@ -38,6 +50,9 @@ pub(crate) fn run_auth(command: AuthCommand) -> Result<()> {
     }
 }
 
+// Registry CRUD and health ride the auth gRPC service; the newer runtime
+// diagnostics (doctor/audit/cooldown/order/selection) only exist on the daemon
+// admin-console HTTP API, hence the split dispatch.
 fn auth_profiles_command_uses_control_plane(command: &AuthProfilesCommand) -> bool {
     matches!(
         command,
@@ -49,6 +64,14 @@ fn auth_profiles_command_uses_control_plane(command: &AuthProfilesCommand) -> bo
     )
 }
 
+/// Dispatches registry-backed `auth profiles` subcommands over the auth gRPC service.
+///
+/// Accepts the full [`AuthCommand`] because callers share dispatch plumbing; any
+/// non-`Profiles` command is rejected.
+///
+/// # Errors
+/// Returns an error when the gRPC connection or call fails, a response is missing
+/// its payload, or the command is not a gRPC-backed profiles subcommand.
 pub(crate) async fn run_auth_profiles_async(
     command: AuthCommand,
     connection: AgentConnection,
@@ -599,6 +622,8 @@ async fn run_auth_access_async(command: AuthCommand) -> Result<()> {
     std::io::stdout().flush().context("stdout flush failed")
 }
 
+// Serde views over loosely typed console JSON payloads. Every field carries
+// #[serde(default)] so older daemons that omit fields still deserialize cleanly.
 #[derive(Debug, Deserialize, Serialize, Default)]
 struct OpenAiAuthHealthSummary {
     #[serde(default)]
@@ -927,6 +952,8 @@ async fn run_auth_openai_async(command: AuthOpenAiCommand) -> Result<()> {
     }
 }
 
+/// Merges three console endpoints (provider state, auth health, profile list) into
+/// the single status payload shown by `auth openai status`.
 fn build_openai_status_payload(
     provider_state: control_plane::ProviderAuthStateEnvelope,
     auth_health: control_plane::AuthHealthEnvelope,
@@ -1078,6 +1105,9 @@ fn emit_openai_oauth_launch(payload: OpenAiOAuthLaunchPayload, json_output: bool
     std::io::stdout().flush().context("stdout flush failed")
 }
 
+// Text output reports only authorization_url_present, never the URL itself: the
+// URL carries the OAuth state token and would leak via terminal history or logs.
+// Pinned by openai_oauth_launch_text_output_omits_authorization_url.
 fn openai_oauth_launch_text_lines(payload: &OpenAiOAuthLaunchPayload) -> [String; 2] {
     [
         format!(
@@ -1276,10 +1306,19 @@ fn normalize_openai_health_state(raw: &str) -> String {
     }
 }
 
+// Daemon messages can be multi-line; flatten them so the line-oriented
+// `key=value` text output stays parseable.
 fn sanitize_auth_message(raw: &str) -> String {
     raw.trim().replace(['\n', '\r'], " ")
 }
 
+/// Reads a credential from exactly one source: a named environment variable,
+/// stdin, or a hidden interactive prompt. Secrets are never accepted as plain
+/// command-line arguments, which would leak via shell history and process lists.
+///
+/// # Errors
+/// Returns an error when zero or multiple sources are selected, the source cannot
+/// be read, or the value is empty after trimming.
 fn load_secret_input(
     env_name: Option<String>,
     from_stdin: bool,

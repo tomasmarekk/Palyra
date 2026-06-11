@@ -1,3 +1,10 @@
+//! `palyra models` command: provider/model registry status, selection, and probes.
+//!
+//! Reads the daemon config in either the provider-registry or legacy
+//! single-provider layout, mutates default model selections with rotated
+//! backups, and probes provider endpoints behind a private-network guard with
+//! a TTL cache for connection and discovery checks.
+
 use crate::*;
 use palyra_auth::{AuthCredential, AuthProfileRegistry, AuthProviderKind};
 use palyra_common::daemon_config_schema::FileModelProviderConfig;
@@ -25,6 +32,7 @@ const PROVIDER_CHECKS_CACHE_PATH: &str = "models/provider_checks.json";
 const CURATED_TEXT_MODELS: &[&str] = &["gpt-4o-mini", "gpt-4.1-mini"];
 const CURATED_EMBEDDING_MODELS: &[&str] = &["text-embedding-3-small", "text-embedding-3-large"];
 
+/// Snapshot of the effective model-provider configuration for `models status`.
 #[derive(Debug, Serialize)]
 pub(crate) struct ModelsStatusPayload {
     pub(crate) path: String,
@@ -51,6 +59,7 @@ pub(crate) struct ModelsStatusPayload {
     pub(crate) migrated: bool,
 }
 
+/// Curated or operator-configured model entry surfaced by `models list`.
 #[derive(Debug, Serialize)]
 pub(crate) struct ModelCatalogEntry<'a> {
     pub(crate) target: &'a str,
@@ -60,6 +69,7 @@ pub(crate) struct ModelCatalogEntry<'a> {
     pub(crate) source: &'a str,
 }
 
+/// Provider row resolved from the registry or the legacy single-provider config.
 #[derive(Debug, Serialize)]
 pub(crate) struct RegistryProviderEntry {
     pub(crate) provider_id: String,
@@ -74,6 +84,7 @@ pub(crate) struct RegistryProviderEntry {
     pub(crate) source: &'static str,
 }
 
+/// Model row with capability metadata, resolved from the registry or legacy config.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct RegistryModelEntry {
     pub(crate) model_id: String,
@@ -95,6 +106,7 @@ pub(crate) struct RegistryModelEntry {
     pub(crate) source: &'static str,
 }
 
+/// Aggregate payload for `models list`: status plus catalog, provider, and model views.
 #[derive(Debug, Serialize)]
 pub(crate) struct ModelsListPayload {
     pub(crate) status: ModelsStatusPayload,
@@ -103,6 +115,7 @@ pub(crate) struct ModelsListPayload {
     pub(crate) registry_models: Vec<RegistryModelEntry>,
 }
 
+/// Result payload for `models set` and `models set-embeddings` mutations.
 #[derive(Debug, Serialize)]
 pub(crate) struct ModelsMutationPayload {
     pub(crate) path: String,
@@ -113,6 +126,7 @@ pub(crate) struct ModelsMutationPayload {
     pub(crate) backups: usize,
 }
 
+/// Outcome of one provider connection/discovery probe; also the cached entry shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ProviderConnectionCheckPayload {
     pub(crate) provider_id: String,
@@ -132,12 +146,14 @@ pub(crate) struct ProviderConnectionCheckPayload {
     pub(crate) latency_ms: Option<u64>,
 }
 
+/// Model id advertised by a provider discovery endpoint, with optional recency metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DiscoveredProviderModel {
     pub(crate) id: String,
     recency_rank: Option<i64>,
 }
 
+/// Aggregate payload for `models test-connection` and `models discover`.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ModelsConnectionPayload {
     pub(crate) path: String,
@@ -148,6 +164,7 @@ pub(crate) struct ModelsConnectionPayload {
     pub(crate) providers: Vec<ProviderConnectionCheckPayload>,
 }
 
+/// One routing candidate (primary or fallback) in the `models explain` output.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ModelsExplainCandidatePayload {
     pub(crate) order: usize,
@@ -167,6 +184,7 @@ pub(crate) struct ModelsExplainCandidatePayload {
     pub(crate) vision: bool,
 }
 
+/// Aggregate payload for `models explain`: resolved routing plus its rationale.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ModelsExplainPayload {
     pub(crate) path: String,
@@ -191,6 +209,7 @@ struct CachedProviderCheckEntry {
     payload: ProviderConnectionCheckPayload,
 }
 
+/// Provider candidate flattened from config for connection/discovery probing.
 #[derive(Debug, Clone)]
 struct ProbeableProvider {
     provider_id: String,
@@ -205,12 +224,19 @@ struct ProbeableProvider {
     configured_model_ids: Vec<String>,
 }
 
+/// API credential resolved from an auth profile, inline config, or vault reference.
 #[derive(Debug, Clone)]
 enum ResolvedCredential {
     ApiKey { token: String, source: String },
     Bearer { token: String, source: String },
 }
 
+/// Dispatches `palyra models` subcommands.
+///
+/// # Errors
+/// Returns an error when the config cannot be loaded or parsed, a mutation is
+/// rejected by validation, provider probing cannot start, or output encoding
+/// fails.
 pub(crate) fn run_models(command: ModelsCommand) -> Result<()> {
     match command {
         ModelsCommand::Status { path, json } => {
@@ -449,6 +475,10 @@ fn emit_models_explain(payload: &ModelsExplainPayload, json_output: bool) -> Res
     std::io::stdout().flush().context("stdout flush failed")
 }
 
+/// Builds the `models list` payload from curated entries plus the configured registry.
+///
+/// # Errors
+/// Returns an error when the config cannot be loaded or parsed.
 pub(crate) fn build_models_list(path: Option<String>) -> Result<ModelsListPayload> {
     let overview = load_models_overview(path)?;
     let status = overview.status;
@@ -523,6 +553,15 @@ fn append_ad_hoc_entry(
     });
 }
 
+/// Sets the default text or embeddings model in the config, keeping rotated backups.
+///
+/// Unless `allow_custom` is set, the model id must be configured in the
+/// registry, curated, or verified by cached live discovery.
+///
+/// # Errors
+/// Returns an error when the config cannot be parsed, the model id fails
+/// validation, the mutated document no longer matches the daemon schema, or
+/// the file cannot be persisted.
 pub(crate) fn mutate_model_defaults(
     path: Option<String>,
     backups: usize,
@@ -661,6 +700,12 @@ fn validate_model_mutation_selection(
     );
 }
 
+/// Checks a model id against cached live-discovery results.
+///
+/// Returns `Ok(None)` when no verified discovery data exists (the caller
+/// falls back to its generic error), `Ok(Some(Ok(())))` when the model was
+/// seen in live discovery, and `Ok(Some(Err(_)))` when verified discovery
+/// data exists but does not include the model.
 fn validate_model_against_discovery_cache(
     path: &str,
     target: &'static str,
@@ -672,9 +717,9 @@ fn validate_model_against_discovery_cache(
     let now_unix_ms = unix_timestamp_ms()?;
     let mut verified_models = Vec::new();
 
-    for target in provider_targets {
+    for provider in provider_targets {
         for mode in ["discover", "test_connection"] {
-            let cache_key = provider_check_cache_key(mode, &target);
+            let cache_key = provider_check_cache_key(mode, &provider);
             let Some(cached) = read_cached_provider_check(&cache, cache_key.as_str(), now_unix_ms)
             else {
                 continue;
@@ -781,6 +826,10 @@ fn legacy_embeddings_model_key(provider_kind: &str) -> Result<&'static str> {
     }
 }
 
+/// Loads the `models status` payload for the given (or default) config path.
+///
+/// # Errors
+/// Returns an error when the config cannot be located, read, or parsed.
 pub(crate) fn load_models_status(path: Option<String>) -> Result<ModelsStatusPayload> {
     Ok(load_models_overview(path)?.status)
 }
@@ -1696,6 +1745,8 @@ fn effective_default_chat_model_id(
 
 fn provider_check_ttl_ms(overview: &ModelsOverview, discover: bool) -> i64 {
     let path_ref = Path::new(overview.status.path.as_str());
+    // An unreadable config disables caching (TTL 0) instead of failing the
+    // probe: the probe result is still useful, it just will not be reused.
     let Ok((document, _)) = load_document_from_existing_path(path_ref) else {
         return 0;
     };
@@ -1788,6 +1839,11 @@ fn write_cached_provider_check(
     );
 }
 
+/// Probes one provider's models endpoint and classifies the outcome into a
+/// stable state string without ever surfacing credential material.
+///
+/// Endpoint policy is validated before credentials are resolved so an unsafe
+/// base_url can never trigger auth-registry or vault access (pinned by test).
 fn probe_provider(
     target: &ProbeableProvider,
     timeout_ms: u64,
@@ -1872,6 +1928,8 @@ fn probe_provider(
     };
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    // Native Anthropic endpoints expect x-api-key plus anthropic-version;
+    // MiniMax's Anthropic-compatible endpoint authenticates with Bearer instead.
     match &credential {
         ResolvedCredential::ApiKey { token, .. }
             if target.kind == ANTHROPIC_PROVIDER_KIND && !target_uses_minimax_auth(target) =>
@@ -2166,6 +2224,11 @@ fn load_vault_secret_utf8(vault: &palyra_vault::Vault, vault_ref: &str) -> Resul
     String::from_utf8(bytes).context("vault secret must contain valid UTF-8")
 }
 
+/// Builds the `/v1/models` discovery endpoint URL for a provider base URL,
+/// avoiding a doubled version segment when the base URL already ends in `/v1`.
+///
+/// # Errors
+/// Returns an error when the resulting URL cannot be parsed.
 pub(crate) fn provider_models_endpoint(base_url: &str) -> Result<reqwest::Url> {
     let trimmed = base_url.trim().trim_end_matches('/');
     let raw = if trimmed.ends_with("/v1") {
@@ -2177,6 +2240,11 @@ pub(crate) fn provider_models_endpoint(base_url: &str) -> Result<reqwest::Url> {
         .with_context(|| format!("invalid provider base_url: {base_url}"))
 }
 
+/// Parses an OpenAI-style `{"data": [...]}` discovery response into model entries.
+///
+/// # Errors
+/// Returns an error when the body is not valid JSON; a JSON body without the
+/// expected shape yields an empty list instead.
 pub(crate) fn parse_discovered_provider_models(body: &str) -> Result<Vec<DiscoveredProviderModel>> {
     let value: serde_json::Value =
         serde_json::from_str(body).context("provider returned invalid JSON for model discovery")?;
@@ -2190,10 +2258,18 @@ pub(crate) fn parse_discovered_provider_models(body: &str) -> Result<Vec<Discove
     Ok(discovered)
 }
 
+/// Parses a discovery response and keeps only the advertised model ids.
+///
+/// # Errors
+/// Returns an error when the body is not valid JSON.
 pub(crate) fn parse_discovered_model_ids(body: &str) -> Result<Vec<String>> {
     Ok(parse_discovered_provider_models(body)?.into_iter().map(|model| model.id).collect())
 }
 
+/// Selects the preferred model id from a discovery response.
+///
+/// Prefers the newest entry when every model carries recency metadata;
+/// otherwise preserves the provider's response order and takes the first id.
 pub(crate) fn select_preferred_discovered_model_id(
     models: &[DiscoveredProviderModel],
 ) -> Option<String> {
@@ -2268,6 +2344,9 @@ fn model_recency_rank_from_value(value: &serde_json::Value) -> Option<i64> {
 }
 
 fn normalize_numeric_recency_rank(raw: i64) -> Option<i64> {
+    // Providers report timestamps in either epoch seconds or milliseconds.
+    // Any value below this bound (~year 5138 in seconds) is treated as
+    // seconds and scaled so all ranks compare on a millisecond axis.
     const EPOCH_SECONDS_UPPER_BOUND: i64 = 100_000_000_000;
     if raw <= 0 {
         return None;
@@ -2287,6 +2366,7 @@ fn classify_provider_failure(status_code: u16) -> String {
     }
 }
 
+/// Formats a provider HTTP error body into a redacted, single-line message.
 pub(crate) fn sanitize_provider_error(body: &str, status_code: u16) -> String {
     let trimmed = redact_auth_error(body).trim().to_owned();
     if trimmed.is_empty() {

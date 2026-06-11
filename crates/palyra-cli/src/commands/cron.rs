@@ -1,3 +1,9 @@
+//! Cron command surface: a schedule-focused view over daemon routines.
+//!
+//! Every cron job is a `trigger_kind=schedule` routine on the `/console/v1/routines` API;
+//! this module reuses the request helpers in [`super::routines`] and only adds cron-flavored
+//! payload shaping and output. Text output lines are pinned by CLI parity tests.
+
 use std::{
     fs,
     io::Write,
@@ -18,11 +24,24 @@ use super::routines::{
     run_routine_now_value, set_routine_enabled_value, upsert_routine_value,
 };
 
+// Mirrors ROUTINE_DUE_SOON_WINDOW_MS in routines.rs so `cron status` and
+// `routines status` agree on what counts as due soon.
+const CRON_DUE_SOON_WINDOW_MS: i64 = 15 * 60 * 1_000;
+
+/// Runs a `palyra cron` subcommand on a fresh Tokio runtime.
+///
+/// # Errors
+/// Returns an error when the runtime cannot be built or the subcommand fails.
 pub(crate) fn run_cron(command: CronCommand) -> Result<()> {
     let runtime = build_runtime()?;
     runtime.block_on(run_cron_async(command))
 }
 
+/// Dispatches a `palyra cron` subcommand against the daemon admin console.
+///
+/// # Errors
+/// Returns an error when the admin-console connection, the request, or output
+/// encoding fails, or when subcommand input validation rejects the arguments.
 pub(crate) async fn run_cron_async(command: CronCommand) -> Result<()> {
     let context =
         client::control_plane::connect_admin_console(app::ConnectionOverrides::default()).await?;
@@ -150,8 +169,11 @@ pub(crate) async fn run_cron_async(command: CronCommand) -> Result<()> {
                 || workdir.is_some()
                 || execution_posture.is_some()
                 || approval_mode.is_some();
+            // Enabled-only updates use the dedicated enabled endpoint instead of the full
+            // upsert, so no other routine fields are read back and rewritten.
             if cron_update_only_changes_enabled(enabled, any_other_field) {
-                let enabled = enabled.expect("enabled-only update requires an enabled value");
+                let enabled =
+                    enabled.expect("cron_update_only_changes_enabled guarantees enabled is set");
                 let response =
                     set_routine_enabled_value(&context.client, id.as_str(), enabled).await?;
                 return emit_cron_mutation("cron.update", &response, output::preferred_json(json));
@@ -275,6 +297,8 @@ async fn schedule_routines_payload(
 ) -> Result<Value> {
     let mut payload =
         list_routines_value(client, after, limit, Some("schedule"), enabled, channel, None).await?;
+    // The routines list endpoint has no owner filter, so the owner constraint is
+    // applied client-side on the returned page.
     if let Some(owner) = owner.map(str::trim).filter(|value| !value.is_empty()) {
         if let Some(routines) = payload.get_mut("routines").and_then(Value::as_array_mut) {
             routines.retain(|routine| {
@@ -286,6 +310,10 @@ async fn schedule_routines_payload(
     Ok(payload)
 }
 
+/// Builds the routine upsert payload for `cron add`/`cron update`.
+///
+/// `existing` is the current routine value during updates; routine fields that the
+/// cron CLI does not expose are carried over from it so the upsert does not reset them.
 fn build_schedule_routine_payload(
     existing: Option<&Value>,
     config: ScheduleRoutineConfig,
@@ -355,6 +383,10 @@ fn build_schedule_routine_payload(
     Ok(payload)
 }
 
+/// Normalizes `--workdir` to an existing canonical directory path.
+///
+/// Validation happens CLI-side so a bad path is rejected before the routine is
+/// stored, rather than surfacing later as a failed scheduled run.
 fn resolve_cron_workdir(workdir: Option<String>) -> Result<Option<String>> {
     let Some(raw) = workdir.map(|value| value.trim().to_owned()).filter(|value| !value.is_empty())
     else {
@@ -384,6 +416,9 @@ fn display_path(path: &Path) -> String {
     path.display().to_string()
 }
 
+/// Carries routine fields the cron CLI has no flags for (delivery, quiet hours,
+/// cooldown, template) from the existing routine into an update payload.
+/// Without this, a `cron update` upsert would reset them to daemon defaults.
 fn preserve_existing_routine_fields(existing: &Value, payload: &mut Map<String, Value>) {
     payload.insert(
         "delivery_mode".to_owned(),
@@ -461,7 +496,7 @@ fn emit_cron_status(payload: &Value, json: bool) -> Result<()> {
         let overdue = enabled && next_run_at_unix_ms > 0 && next_run_at_unix_ms <= now_unix_ms;
         let due_soon = enabled
             && next_run_at_unix_ms > now_unix_ms
-            && next_run_at_unix_ms.saturating_sub(now_unix_ms) <= 15 * 60 * 1_000;
+            && next_run_at_unix_ms.saturating_sub(now_unix_ms) <= CRON_DUE_SOON_WINDOW_MS;
         let late_by_ms = overdue.then_some(now_unix_ms.saturating_sub(next_run_at_unix_ms));
 
         if enabled {
@@ -681,6 +716,8 @@ fn cron_run_session_key(run: &Value) -> Option<String> {
         .or_else(|| json_optional_string_at(run, "/output_lookup/session_key"))
 }
 
+// Session keys can encode private routing/identity details, so text output only
+// reports their presence; `--json` consumers receive the raw payload instead.
 fn cron_run_session_key_display(run: &Value) -> &'static str {
     if cron_run_session_key(run).is_some() {
         "<redacted>"

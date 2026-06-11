@@ -1,9 +1,19 @@
+//! Companion node administration: listing registered and pending nodes,
+//! approving or rejecting pairing requests, and invoking node capabilities.
+//!
+//! All operations go through the admin console; pairing decisions share the
+//! node pairing request model with the `pairing` command surface.
+
 use palyra_control_plane as control_plane;
 use serde_json::Value;
 
 use crate::args::NodesCommand;
 use crate::*;
 
+/// Runs a `palyra nodes` subcommand on a fresh Tokio runtime.
+///
+/// # Errors
+/// Fails when the runtime cannot be built or the async handler fails.
 pub(crate) fn run_nodes(command: NodesCommand) -> Result<()> {
     let runtime = build_runtime()?;
     runtime.block_on(run_nodes_async(command))
@@ -188,6 +198,8 @@ fn emit_node_pairing_request(
     std::io::stdout().flush().context("stdout flush failed")
 }
 
+// Resolves capability input from --input-json, stdin, or defaults to null;
+// empty stdin is treated as null rather than a parse error.
 fn resolve_optional_json_input(input_json: Option<String>, input_stdin: bool) -> Result<Value> {
     if let Some(input_json) = input_json {
         return serde_json::from_str(input_json.as_str())

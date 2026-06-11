@@ -1,3 +1,9 @@
+//! `palyra mcp serve`: a stdio MCP server facade over Palyra sessions, transcripts,
+//! memory, and approvals, speaking Content-Length framed JSON-RPC.
+//!
+//! This is server-only: it exposes Palyra to external MCP clients and never imports
+//! external MCP tools into agent runs. Mutating tools are gated by `--read-only`.
+
 use std::io::{self, BufRead, BufReader, Write};
 
 use anyhow::{anyhow, Context, Result};
@@ -34,6 +40,11 @@ const REGISTERED_MCP_TOOLS: &[&str] = &[
     TOOL_APPROVAL_DECIDE,
 ];
 
+/// Runs a `palyra mcp` subcommand; `serve` blocks on stdio until the client disconnects.
+///
+/// # Errors
+/// Returns an error when connection resolution fails or the stdio message loop
+/// hits an IO/framing error.
 pub(crate) fn run_mcp(command: McpCommand) -> Result<()> {
     match command.subcommand {
         McpSubcommand::Serve { connection, session_defaults, read_only, allow_sensitive_tools } => {
@@ -86,6 +97,8 @@ fn run_mcp_serve(
     Ok(())
 }
 
+/// Tool-execution seam between JSON-RPC request handling and the live daemon
+/// clients, so `handle_mcp_request` can be tested with fake backends.
 trait McpBackend {
     fn read_only(&self) -> bool;
 
@@ -314,6 +327,8 @@ impl LiveMcpBackend {
         if prompt.trim().is_empty() {
             anyhow::bail!("session_prompt prompt cannot be empty");
         }
+        // Per-call escalation is honored only when the server itself was started
+        // with --allow-sensitive-tools; an MCP client cannot widen that grant.
         let allow_sensitive_tools = self.allow_sensitive_tools
             && opt_bool_arg(args, "allow_sensitive_tools")?.unwrap_or(false);
         let resolved = self.resolve_session_with_defaults(args, false)?;
@@ -421,6 +436,10 @@ impl LiveMcpBackend {
     }
 
     fn lookup_read_session_id(&mut self, selector: SessionReadSelector) -> Result<String> {
+        // AIDEV-NOTE: unlike load_session_summary_for_show in sessions.rs, this
+        // pagination loop has no repeated-cursor guard; a daemon that returns a
+        // non-advancing next_after_session_key would loop forever. Fixing it changes
+        // control flow, so it is left as-is for now.
         let mut after_session_key = None::<String>;
         loop {
             let response = self.runtime.block_on(async {
@@ -455,6 +474,8 @@ impl SessionReadSelector {
     fn matches(&self, session: &gateway_v1::SessionSummary) -> bool {
         match self {
             Self::Key(expected) => session.session_key == *expected,
+            // Labels are not unique across a session's archived predecessors, so
+            // label lookup only matches live (unarchived) sessions.
             Self::Label(expected) => {
                 session.session_label == *expected && session.archived_at_unix_ms == 0
             }
@@ -469,6 +490,11 @@ impl SessionReadSelector {
     }
 }
 
+/// Drains a run stream into a single MCP tool result.
+///
+/// A stdio tool call cannot block on interactive approval, so the stream is cut at
+/// the first tool-approval request and reported as `approval_required`; the client
+/// is expected to decide via the `approval_decide` tool and re-prompt.
 async fn collect_mcp_run_stream(
     session: &gateway_v1::SessionSummary,
     resolved: &gateway_v1::ResolveSessionResponse,
@@ -520,6 +546,8 @@ async fn collect_mcp_run_stream(
     }))
 }
 
+/// Handles one MCP JSON-RPC request; `Ok(None)` means no response is owed
+/// (notifications). Tool failures become in-band `isError` results, not RPC errors.
 fn handle_mcp_request(backend: &mut dyn McpBackend, request: Value) -> Result<Option<Value>> {
     let Some(method) = request.get("method").and_then(Value::as_str) else {
         return Ok(request
@@ -566,6 +594,8 @@ fn handle_mcp_request(backend: &mut dyn McpBackend, request: Value) -> Result<Op
             })
         })),
         "tools/call" => {
+            // A tools/call without an id is a JSON-RPC notification; the spec
+            // forbids responding to it.
             let Some(request_id) = id else {
                 return Ok(None);
             };
@@ -624,6 +654,11 @@ fn handle_mcp_request(backend: &mut dyn McpBackend, request: Value) -> Result<Op
     }
 }
 
+/// Reads one Content-Length framed JSON-RPC message; returns `Ok(None)` on clean EOF.
+///
+/// # Errors
+/// Returns a validation error for malformed headers, a missing Content-Length,
+/// a truncated body, or an unparsable JSON payload.
 fn read_mcp_message(reader: &mut dyn BufRead) -> Result<Option<Value>> {
     let mut content_length = None::<usize>;
     loop {
@@ -656,6 +691,7 @@ fn read_mcp_message(reader: &mut dyn BufRead) -> Result<Option<Value>> {
         .map(Some)
 }
 
+/// Writes one Content-Length framed JSON-RPC message and flushes the writer.
 fn write_mcp_message(writer: &mut dyn Write, payload: &Value) -> Result<()> {
     let encoded =
         serde_json::to_vec(payload).context("failed to serialize MCP response payload")?;
@@ -1013,6 +1049,8 @@ fn opt_string_vec_arg(args: &Map<String, Value>, key: &str) -> Result<Vec<String
                 }
                 _ => anyhow::bail!("argument `{key}[{index}]` must be a string"),
             })
+            // Drop entries normalized to empty, but keep Err entries so collect()
+            // still surfaces type errors instead of silently filtering them away.
             .filter(|entry| match entry {
                 Ok(value) => !value.is_empty(),
                 Err(_) => true,
@@ -1286,6 +1324,8 @@ fn mcp_run_stream_event_to_json(event: &common_v1::RunStreamEvent) -> Value {
     }
 }
 
+// Percent-encodes everything outside the RFC 3986 unreserved set so caller-supplied
+// ids embed safely into console URL paths.
 fn percent_encode_component(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
