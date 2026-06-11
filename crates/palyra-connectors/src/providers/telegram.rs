@@ -1,3 +1,8 @@
+//! Telegram connector stub for the deferred-provider roadmap slot.
+//!
+//! Publishes deferred capability metadata so the registry and console can describe Telegram
+//! truthfully, while every outbound send permanently fails until a real adapter ships.
+
 use async_trait::async_trait;
 
 use crate::{
@@ -11,9 +16,11 @@ use crate::{
 
 use super::ConnectorProviderDescriptor;
 
+/// Placeholder Telegram adapter; reports all message capabilities as unsupported.
 #[derive(Debug, Default)]
 pub struct TelegramConnectorAdapter;
 
+/// Registry hook publishing the deferred Telegram provider's runtime metadata.
 pub(crate) fn provider_descriptor() -> ConnectorProviderDescriptor {
     let reason =
         "telegram connector is deferred in the roadmap and unavailable in the current runtime";

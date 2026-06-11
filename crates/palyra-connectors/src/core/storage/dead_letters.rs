@@ -1,9 +1,23 @@
+//! Dead-letter queue operations: replaying entries into the outbox and
+//! discarding them.
+//!
+//! A dead letter preserves the original outbox payload verbatim; replay
+//! re-arms the matching `dead` outbox row (resetting its attempt budget) and
+//! removes the dead letter in the same transaction.
+
 use rusqlite::{params, OptionalExtension};
 
 use super::records::parse_dead_letter_row;
 use super::{ConnectorStore, ConnectorStoreError, DeadLetterRecord};
 
 impl ConnectorStore {
+    /// Replays one dead letter back into the outbox with a fresh attempt
+    /// budget and returns the consumed record.
+    ///
+    /// # Errors
+    /// Returns [`ConnectorStoreError::DeadLetterNotFound`] when the id does
+    /// not exist for `connector_id`, and a storage error when the transaction
+    /// or payload decoding fails.
     pub fn replay_dead_letter(
         &self,
         connector_id: &str,
@@ -35,7 +49,8 @@ impl ConnectorStore {
                     )
                     .optional()?
                     .ok_or(ConnectorStoreError::DeadLetterNotFound(dead_letter_id))?;
-                let payload_json = dead_letter.4.clone();
+                // Re-arm the existing `dead` outbox row first; the envelope id
+                // stays reserved there, preserving outbox idempotency.
                 let updated = transaction.execute(
                     r#"
                     UPDATE outbox
@@ -56,12 +71,19 @@ impl ConnectorStore {
                     params![
                         dead_letter.1,
                         dead_letter.2,
-                        payload_json,
+                        dead_letter.4,
                         i64::from(max_attempts.max(1)),
                         now_unix_ms,
                     ],
                 )?;
                 if updated == 0 {
+                    // AIDEV-NOTE: if the dead outbox row is gone but a *live*
+                    // row for the same (connector_id, envelope_id) exists
+                    // (e.g. the envelope was re-enqueued after dead-lettering),
+                    // this INSERT hits the UNIQUE constraint and the replay
+                    // fails with a raw sqlite error instead of a typed
+                    // conflict. Fixing it changes observable behavior; left
+                    // as-is deliberately.
                     transaction.execute(
                         r#"
                         INSERT INTO outbox (
@@ -74,7 +96,7 @@ impl ConnectorStore {
                         params![
                             dead_letter.1,
                             dead_letter.2,
-                            payload_json,
+                            dead_letter.4,
                             i64::from(max_attempts.max(1)),
                             now_unix_ms,
                         ],
@@ -99,6 +121,12 @@ impl ConnectorStore {
         })
     }
 
+    /// Deletes one dead letter and returns the removed record.
+    ///
+    /// # Errors
+    /// Returns [`ConnectorStoreError::DeadLetterNotFound`] when the id does
+    /// not exist for `connector_id`, and a storage error when the transaction
+    /// or payload decoding fails.
     pub fn discard_dead_letter(
         &self,
         connector_id: &str,
@@ -147,6 +175,11 @@ impl ConnectorStore {
         })
     }
 
+    /// Lists up to `limit` dead letters for a connector, newest first.
+    ///
+    /// # Errors
+    /// Returns a storage error when the query fails or a stored payload no
+    /// longer decodes as JSON.
     pub fn list_dead_letters(
         &self,
         connector_id: &str,

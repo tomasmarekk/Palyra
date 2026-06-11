@@ -1,3 +1,10 @@
+//! Discord gateway (websocket) client: connect, identify/resume, heartbeat, and inbound
+//! message intake for one connector instance.
+//!
+//! The monitor loop reconnects forever with jittered exponential backoff; it only stops when
+//! its task is aborted via `stop_inbound_monitor`. All egress targets (REST probe and the
+//! websocket URL Discord hands back) are validated against the connector's net guard first.
+
 use std::{
     net::{IpAddr, ToSocketAddrs},
     sync::{Arc, Mutex},
@@ -34,6 +41,7 @@ use super::{
     DISCORD_GATEWAY_ZLIB_SYNC_FLUSH_SUFFIX,
 };
 
+/// Everything one gateway monitor task needs to run sessions for a connector instance.
 #[derive(Clone)]
 pub(super) struct DiscordGatewayMonitorContext {
     pub(super) connector_id: String,
@@ -45,6 +53,10 @@ pub(super) struct DiscordGatewayMonitorContext {
     pub(super) sender: mpsc::Sender<InboundMessageEvent>,
 }
 
+/// Reconnect-forever supervisor for one connector's gateway sessions.
+///
+/// `resume_state` outlives individual sessions so the next connect can RESUME instead of
+/// re-identifying, which avoids replaying or losing dispatched events.
 pub(super) async fn run_discord_gateway_monitor(context: DiscordGatewayMonitorContext) {
     let mut resume_state = DiscordGatewayResumeState::default();
     let mut attempts = 0_u32;
@@ -58,6 +70,8 @@ pub(super) async fn run_discord_gateway_monitor(context: DiscordGatewayMonitorCo
         }
 
         match result {
+            // A clean session end resets backoff; the short pause keeps reconnects from
+            // spinning hot.
             Ok(()) => {
                 attempts = 0;
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -140,6 +154,10 @@ async fn run_discord_gateway_session(
     .await
 }
 
+/// Drives one established gateway websocket until it errors or closes.
+///
+/// Generic over sink/stream so tests can run it against in-memory transports. Returns only
+/// `Err`: a healthy gateway session has no normal end from our side.
 pub(super) async fn run_discord_gateway_transport_loop<S, St>(
     sink: &mut S,
     stream: &mut St,
@@ -159,6 +177,8 @@ where
 
     loop {
         tokio::select! {
+            // Heartbeats start only after HELLO supplies the real interval; sending earlier
+            // would use the fallback cadence and risk an immediate disconnect.
             _ = heartbeat.tick(), if hello_received => {
                 let heartbeat_payload = resume_state.seq.map(Value::from).unwrap_or(Value::Null);
                 send_gateway_op(sink, 1, heartbeat_payload).await?;
@@ -214,6 +234,10 @@ where
     }
 }
 
+/// Applies one decoded gateway envelope to the session state machine.
+///
+/// Errors signal "tear the session down and let the monitor reconnect" — that is the
+/// protocol-prescribed reaction to RECONNECT and INVALID_SESSION, not a fault.
 pub(super) async fn handle_gateway_envelope<S>(
     sink: &mut S,
     envelope: DiscordGatewayEnvelope,
@@ -237,6 +261,8 @@ where
     }
 
     match envelope.op {
+        // HELLO: adopt the server-provided heartbeat interval, then RESUME if we still hold
+        // a session, otherwise IDENTIFY a fresh one.
         10 => {
             let heartbeat_interval_ms = envelope
                 .data
@@ -251,6 +277,7 @@ where
             if let (Some(session_id), Some(seq)) =
                 (resume_state.session_id.clone(), resume_state.seq)
             {
+                // RESUME replays events after `seq` instead of starting over.
                 send_gateway_op(
                     sink,
                     6,
@@ -262,6 +289,7 @@ where
                 )
                 .await?;
             } else {
+                // IDENTIFY starts a new session with the configured intents.
                 send_gateway_op(
                     sink,
                     2,
@@ -278,16 +306,21 @@ where
                 .await?;
             }
         }
+        // HEARTBEAT_ACK: nothing to do.
         11 => {}
+        // HEARTBEAT request: the server demands an immediate heartbeat outside the cadence.
         1 => {
             let heartbeat_payload = resume_state.seq.map(Value::from).unwrap_or(Value::Null);
             send_gateway_op(sink, 1, heartbeat_payload).await?;
         }
+        // RECONNECT: drop the socket and reconnect; resume state is kept so we can RESUME.
         7 => {
             return Err(ConnectorAdapterError::Backend(
                 "discord gateway requested reconnect".to_owned(),
             ));
         }
+        // INVALID_SESSION: `d` says whether the session is resumable; if not, clear resume
+        // state so the next connect re-identifies from scratch.
         9 => {
             let resumable = envelope.data.as_bool().unwrap_or(false);
             if !resumable {
@@ -298,6 +331,7 @@ where
                 "discord gateway invalidated session".to_owned(),
             ));
         }
+        // DISPATCH: actual events; only READY and MESSAGE_CREATE matter to this connector.
         0 => {
             let event_type = envelope.event_type.unwrap_or_default();
             match event_type.as_str() {
@@ -324,6 +358,9 @@ where
                         if let Ok(mut state) = context.runtime_state.lock() {
                             state.last_inbound_unix_ms = Some(event.received_at_unix_ms);
                         }
+                        // try_send keeps the gateway read loop non-blocking: when the bounded
+                        // queue is full the event is dropped (and recorded as last_error)
+                        // rather than stalling heartbeats behind a slow consumer.
                         match context.sender.try_send(event) {
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -363,6 +400,12 @@ where
     })
 }
 
+/// Decodes a binary gateway frame under zlib-stream transport compression.
+///
+/// Returns `Ok(None)` while a logical message is still accumulating: zlib-stream splits one
+/// message across frames and terminates it with a sync-flush suffix. The shared inflater
+/// must persist across frames because the compression context spans the whole connection.
+/// Size caps bound both buffers so a hostile stream cannot exhaust memory.
 pub(super) fn decode_gateway_binary_payload(
     payload: &[u8],
     inflater: &mut DiscordGatewayInflater,
@@ -370,6 +413,8 @@ pub(super) fn decode_gateway_binary_payload(
     if payload.is_empty() {
         return Ok(None);
     }
+    // A binary frame that is already valid UTF-8 is treated as uncompressed text; zlib
+    // output virtually never decodes as UTF-8, so this cheap check sorts the two apart.
     if let Ok(raw_text) = std::str::from_utf8(payload) {
         return Ok(Some(raw_text.to_owned()));
     }
@@ -382,6 +427,8 @@ pub(super) fn decode_gateway_binary_payload(
         )));
     }
     inflater.compressed_buffer.extend_from_slice(payload);
+    // zlib-stream marks the end of one logical message with a sync-flush suffix; until it
+    // arrives, keep buffering frames.
     if !inflater.compressed_buffer.ends_with(&DISCORD_GATEWAY_ZLIB_SYNC_FLUSH_SUFFIX) {
         return Ok(None);
     }
@@ -451,11 +498,14 @@ pub(super) fn decode_gateway_binary_payload(
     })
 }
 
+/// Discards the shared compression context after a decode failure; the stream is corrupt
+/// beyond recovery, so the session must restart with a fresh inflater.
 fn reset_gateway_inflater(inflater: &mut DiscordGatewayInflater) {
     inflater.compressed_buffer.clear();
     inflater.decompressor = Decompress::new(true);
 }
 
+/// One decoded gateway frame: opcode, payload (`d`), sequence (`s`), and event type (`t`).
 pub(super) struct DiscordGatewayEnvelope {
     pub(super) op: i64,
     pub(super) data: Value,
@@ -485,6 +535,8 @@ fn parse_gateway_envelope(raw: &str) -> Result<DiscordGatewayEnvelope, Connector
     })
 }
 
+/// Builds the egress guard for `instance`, falling back to the Discord default allowlist
+/// when the instance does not pin its own.
 pub(super) fn build_discord_net_guard(
     instance: &ConnectorInstanceRecord,
 ) -> Result<ConnectorNetGuard, ConnectorAdapterError> {
@@ -498,6 +550,7 @@ pub(super) fn build_discord_net_guard(
     })
 }
 
+/// Validates that `url` resolves only to addresses the connector's egress guard permits.
 pub(super) fn validate_discord_url_target(
     guard: &ConnectorNetGuard,
     url: &Url,
@@ -505,6 +558,12 @@ pub(super) fn validate_discord_url_target(
     validate_discord_url_target_with_resolver(guard, url, resolve_discord_target_addresses)
 }
 
+/// Resolver-injectable form of [`validate_discord_url_target`] for tests.
+///
+/// AIDEV-NOTE: validation resolves DNS separately from the actual connection (reqwest and
+/// tungstenite re-resolve when connecting), leaving a TOCTOU window a DNS-rebinding attacker
+/// could exploit. Closing it requires pinning the validated addresses into the connectors'
+/// transports — a behavioral change deferred to the egress hardening work.
 pub(super) fn validate_discord_url_target_with_resolver<F>(
     guard: &ConnectorNetGuard,
     url: &Url,
@@ -578,6 +637,11 @@ fn parse_gateway_ws_url(raw_body: &str) -> Result<Url, ConnectorAdapterError> {
     })
 }
 
+/// Forces a websocket scheme on the gateway URL and replaces its query with the version,
+/// encoding, and compression parameters this client speaks.
+///
+/// # Errors
+/// Returns [`ConnectorAdapterError::Backend`] for schemes that cannot map to `ws`/`wss`.
 pub(super) fn normalize_gateway_ws_url(mut url: Url) -> Result<Url, ConnectorAdapterError> {
     let normalized_scheme = match url.scheme() {
         "https" => "wss".to_owned(),
@@ -607,6 +671,7 @@ pub(super) fn normalize_gateway_ws_url(mut url: Url) -> Result<Url, ConnectorAda
     Ok(url)
 }
 
+/// Capped exponential backoff with jitter for gateway reconnect attempts.
 fn monitor_backoff_ms(attempts: u32) -> u64 {
     let exponent = attempts.min(6);
     let base = DISCORD_GATEWAY_MONITOR_MIN_BACKOFF_MS
@@ -615,6 +680,8 @@ fn monitor_backoff_ms(attempts: u32) -> u64 {
     base.saturating_add(monitor_jitter_ms()).min(DISCORD_GATEWAY_MONITOR_MAX_BACKOFF_MS)
 }
 
+// Clock-derived jitter is enough to de-synchronize reconnect storms across connectors
+// without pulling a RNG dependency into the crate.
 fn monitor_jitter_ms() -> u64 {
     if DISCORD_GATEWAY_MONITOR_JITTER_MAX_MS <= 1 {
         return 0;
@@ -622,6 +689,8 @@ fn monitor_jitter_ms() -> u64 {
     unix_ms_now().unsigned_abs() % DISCORD_GATEWAY_MONITOR_JITTER_MAX_MS
 }
 
+/// Derives a stable ULID-shaped envelope id from the connector and native message ids, so
+/// re-delivered gateway events deduplicate in the inbound pipeline.
 pub(super) fn deterministic_inbound_envelope_id(connector_id: &str, message_id: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(connector_id.as_bytes());

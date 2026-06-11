@@ -1,13 +1,25 @@
+//! Egress guard for connector network targets.
+//!
+//! Combines a per-connector host allowlist with the shared
+//! `palyra_common::netguard` checks so adapters can only dial allowlisted
+//! public hosts; localhost, private, and unresolvable targets are rejected
+//! fail-closed before any connection is attempted.
+
 use std::net::IpAddr;
 
 use palyra_common::netguard;
 use thiserror::Error;
 
+/// Host allowlist guard applied to connector egress targets before any dial.
+///
+/// Allowlist entries are exact hostnames or `*.suffix` wildcard patterns;
+/// a wildcard matches subdomains only, never the apex domain itself.
 #[derive(Debug, Clone)]
 pub struct ConnectorNetGuard {
     allowlist: Vec<String>,
 }
 
+/// Reasons an allowlist pattern or runtime target host is rejected.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ConnectorNetGuardError {
     #[error("target host must be non-empty")]
@@ -25,6 +37,12 @@ pub enum ConnectorNetGuardError {
 }
 
 impl ConnectorNetGuard {
+    /// Builds a guard from raw allowlist patterns, normalizing and deduplicating them.
+    ///
+    /// # Errors
+    /// Returns [`ConnectorNetGuardError::EmptyHost`] or
+    /// [`ConnectorNetGuardError::MalformedHost`] when a pattern is empty or
+    /// contains characters outside the supported hostname alphabet.
     pub fn new(allowlist: &[String]) -> Result<Self, ConnectorNetGuardError> {
         let mut normalized = Vec::new();
         for host in allowlist {
@@ -36,11 +54,21 @@ impl ConnectorNetGuard {
         Ok(Self { allowlist: normalized })
     }
 
+    /// Returns the normalized allowlist patterns in first-seen order.
     #[must_use]
     pub fn allowlist(&self) -> &[String] {
         self.allowlist.as_slice()
     }
 
+    /// Validates a target host together with the addresses DNS resolved for it.
+    ///
+    /// IP-literal hosts are checked directly; hostname targets are checked
+    /// against `resolved_addrs`, so callers must pass the exact addresses they
+    /// will dial to keep DNS-rebinding out of the trust path.
+    ///
+    /// # Errors
+    /// Returns an error when the host is malformed, not allowlisted, points at
+    /// localhost, or resolves only to private/local addresses.
     pub fn validate_target(
         &self,
         host: &str,
@@ -63,12 +91,15 @@ impl ConnectorNetGuard {
             }
             return Ok(());
         }
+        // Fail closed: an empty resolution set is treated like a private
+        // address so a connector can never dial a host it could not resolve.
         if netguard::validate_resolved_ip_addrs(resolved_addrs, false).is_err() {
             return Err(ConnectorNetGuardError::PrivateAddressBlocked(normalized_host));
         }
         Ok(())
     }
 
+    /// Returns whether the host matches any allowlist entry after normalization.
     #[must_use]
     pub fn is_allowlisted(&self, host: &str) -> bool {
         let normalized = host.trim().trim_end_matches('.').to_ascii_lowercase();
@@ -110,7 +141,9 @@ fn normalize_runtime_host(raw: &str) -> Result<String, ConnectorNetGuardError> {
 
 fn host_matches_pattern(host: &str, pattern: &str) -> bool {
     if let Some(suffix) = pattern.strip_prefix("*.") {
-        return host.ends_with(format!(".{suffix}").as_str());
+        // `*.suffix` requires at least one subdomain label; the apex domain
+        // must be allowlisted explicitly.
+        return host.strip_suffix(suffix).is_some_and(|head| head.ends_with('.'));
     }
     host == pattern
 }

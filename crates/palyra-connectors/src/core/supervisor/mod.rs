@@ -1,3 +1,10 @@
+//! Connector supervisor: routes inbound events, drains the durable outbox,
+//! and exposes admin/status operations over registered provider adapters.
+//!
+//! The supervisor owns no background tasks itself; the daemon calls the
+//! ingest/drain/poll entry points and all durable state lives in
+//! [`ConnectorStore`], so every loop is restart-safe.
+
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -21,6 +28,8 @@ pub use types::{
     ConnectorSupervisorError, DrainOutcome, InboundIngestOutcome,
 };
 
+/// Orchestrates connector instances: one router, one adapter per
+/// [`ConnectorKind`], and a shared durable store.
 pub struct ConnectorSupervisor {
     store: Arc<ConnectorStore>,
     router: Arc<dyn ConnectorRouter>,
@@ -29,6 +38,8 @@ pub struct ConnectorSupervisor {
 }
 
 impl ConnectorSupervisor {
+    /// Builds a supervisor; when several adapters report the same kind, the
+    /// last one in `adapters` wins.
     #[must_use]
     pub fn new(
         store: Arc<ConnectorStore>,
@@ -43,12 +54,14 @@ impl ConnectorSupervisor {
         Self { store, router, adapters, config }
     }
 
+    /// Returns the shared connector store backing this supervisor.
     #[must_use]
     pub fn store(&self) -> &Arc<ConnectorStore> {
         &self.store
     }
 }
 
+/// Returns the current unix time in milliseconds, saturating at `i64::MAX`.
 pub(super) fn unix_ms_now() -> Result<i64, ConnectorSupervisorError> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)

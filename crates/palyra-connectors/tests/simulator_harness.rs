@@ -1,3 +1,6 @@
+//! Deterministic simulator harness exercising the public connector API end to end against a
+//! mock provider, with golden expectations in `tests/fixtures/channel_simulator_expected.json`.
+
 use std::{
     collections::{BTreeMap, HashMap},
     fs,

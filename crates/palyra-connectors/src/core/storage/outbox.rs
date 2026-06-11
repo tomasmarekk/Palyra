@@ -1,3 +1,11 @@
+//! Durable outbox: idempotent enqueue, claim-based draining, and delivery
+//! status transitions.
+//!
+//! Drains claim due entries under a short lease (see `OUTBOX_CLAIM_LEASE_MS`)
+//! and every later transition re-checks the claim token, so a crashed worker's
+//! entries become reclaimable after the lease expires without ever being
+//! processed concurrently. Entries are always served oldest-deadline-first.
+
 use rusqlite::{params, OptionalExtension};
 
 use super::super::protocol::OutboundMessageRequest;
@@ -8,6 +16,12 @@ use super::{
 };
 
 impl ConnectorStore {
+    /// Enqueues the payload unless its `(connector_id, envelope_id)` pair is
+    /// already present, making enqueue retries idempotent.
+    ///
+    /// # Errors
+    /// Returns [`ConnectorStoreError::Serde`] when the payload cannot be
+    /// encoded and [`ConnectorStoreError::Sqlite`] when the insert fails.
     pub fn enqueue_outbox_if_absent(
         &self,
         payload: &OutboundMessageRequest,
@@ -38,6 +52,15 @@ impl ConnectorStore {
         Ok(OutboxEnqueueOutcome { created: inserted > 0 })
     }
 
+    /// Claims and returns up to `limit` due pending entries under a fresh
+    /// claim token, ordered by `next_attempt_unix_ms` then insertion order.
+    ///
+    /// Entries whose previous claim lease has expired are reclaimed. Unless
+    /// `ignore_queue_pause` is set, paused connectors are skipped.
+    ///
+    /// # Errors
+    /// Returns a storage error when the claim transaction fails or a claimed
+    /// payload no longer deserializes.
     pub fn load_due_outbox(
         &self,
         now_unix_ms: i64,
@@ -54,6 +77,9 @@ impl ConnectorStore {
         let claim_expires_unix_ms = now_unix_ms.saturating_add(OUTBOX_CLAIM_LEASE_MS);
 
         self.with_transaction(|transaction| {
+            // Four static statements instead of dynamically composed SQL: the
+            // filter/pause combinations are few and keeping each statement
+            // literal keeps them parameterized and individually reviewable.
             if let Some(connector_id) = connector_filter {
                 if ignore_queue_pause {
                     transaction.execute(
@@ -172,6 +198,11 @@ impl ConnectorStore {
         })
     }
 
+    /// Marks a claimed entry delivered and releases its claim.
+    ///
+    /// # Errors
+    /// Returns [`ConnectorStoreError::OutboxNotFound`] when the entry is not
+    /// pending under `claim_token` (already resolved or reclaimed elsewhere).
     pub fn mark_outbox_delivered(
         &self,
         outbox_id: i64,
@@ -203,6 +234,12 @@ impl ConnectorStore {
         Ok(())
     }
 
+    /// Releases a claimed entry back to pending with an updated attempt count
+    /// and next-attempt deadline.
+    ///
+    /// # Errors
+    /// Returns [`ConnectorStoreError::OutboxNotFound`] when the entry is not
+    /// pending under `claim_token` (already resolved or reclaimed elsewhere).
     pub fn schedule_outbox_retry(
         &self,
         outbox_id: i64,
@@ -236,6 +273,15 @@ impl ConnectorStore {
         Ok(())
     }
 
+    /// Copies a claimed entry into `dead_letters` and marks it dead, in one
+    /// transaction.
+    ///
+    /// The outbox row is kept (status `dead`) so the envelope id stays
+    /// reserved; replay flips it back to pending instead of inserting anew.
+    ///
+    /// # Errors
+    /// Returns [`ConnectorStoreError::OutboxNotFound`] when the entry is not
+    /// pending under `claim_token` (already resolved or reclaimed elsewhere).
     pub fn move_outbox_to_dead_letter(
         &self,
         outbox_id: i64,

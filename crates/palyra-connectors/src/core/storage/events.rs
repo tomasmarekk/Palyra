@@ -1,3 +1,9 @@
+//! Append-only connector event log used for operator logs and derived
+//! runtime metrics.
+//!
+//! Event type strings double as metric keys (see `supervisor::metrics`), so
+//! existing values must stay stable.
+
 use rusqlite::params;
 use serde_json::Value;
 
@@ -5,6 +11,11 @@ use super::records::parse_event_row;
 use super::{ConnectorEventRecord, ConnectorStore, ConnectorStoreError};
 
 impl ConnectorStore {
+    /// Appends one event with optional structured details.
+    ///
+    /// # Errors
+    /// Returns [`ConnectorStoreError::Serde`] when `details` cannot be encoded
+    /// and [`ConnectorStoreError::Sqlite`] when the insert fails.
     pub fn record_event(
         &self,
         connector_id: &str,
@@ -30,6 +41,11 @@ impl ConnectorStore {
         Ok(())
     }
 
+    /// Lists up to `limit` events for a connector, newest first.
+    ///
+    /// # Errors
+    /// Returns a storage error when the query fails or stored details no
+    /// longer decode as JSON.
     pub fn list_events(
         &self,
         connector_id: &str,

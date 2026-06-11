@@ -1,3 +1,10 @@
+//! Connector instance rows: registration upserts, runtime-state updates, and
+//! the inbound dedupe window.
+//!
+//! Upserts preserve runtime bookkeeping (readiness, liveness, restart count,
+//! last-seen timestamps) so re-registering a connector never resets its
+//! operational history.
+
 use rusqlite::params;
 
 use super::super::protocol::{ConnectorInstanceSpec, ConnectorLiveness, ConnectorReadiness};
@@ -5,11 +12,19 @@ use super::records::parse_instance_row;
 use super::{ConnectorInstanceRecord, ConnectorStore, ConnectorStoreError};
 
 impl ConnectorStore {
+    /// Inserts the instance or updates its spec columns if it already exists.
+    ///
+    /// # Errors
+    /// Returns [`ConnectorStoreError::Sqlite`] when the spec fails protocol
+    /// validation or the statement fails, and [`ConnectorStoreError::Serde`]
+    /// when the allowlist cannot be encoded.
     pub fn upsert_instance(
         &self,
         spec: &ConnectorInstanceSpec,
         now_unix_ms: i64,
     ) -> Result<(), ConnectorStoreError> {
+        // Boxed into rusqlite's catch-all variant so validation failures flow
+        // through the single Sqlite error path.
         spec.validate()
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         let allowlist_json = serde_json::to_string(&spec.egress_allowlist)?;
@@ -49,6 +64,11 @@ impl ConnectorStore {
         })
     }
 
+    /// Lists all instances ordered by connector id.
+    ///
+    /// # Errors
+    /// Returns a storage error when the query fails or a row holds unknown
+    /// kind/readiness/liveness labels.
     pub fn list_instances(&self) -> Result<Vec<ConnectorInstanceRecord>, ConnectorStoreError> {
         let connection = self.connection.lock().map_err(|_| ConnectorStoreError::PoisonedLock)?;
         let mut statement = connection.prepare(
@@ -69,6 +89,11 @@ impl ConnectorStore {
         Ok(records)
     }
 
+    /// Fetches one instance; `Ok(None)` when the connector id is unknown.
+    ///
+    /// # Errors
+    /// Returns a storage error when the query fails or the row holds unknown
+    /// kind/readiness/liveness labels.
     pub fn get_instance(
         &self,
         connector_id: &str,
@@ -92,6 +117,10 @@ impl ConnectorStore {
         }
     }
 
+    /// Sets the enabled flag, switching liveness to running/stopped to match.
+    ///
+    /// # Errors
+    /// Returns [`ConnectorStoreError::NotFound`] for unknown connector ids.
     pub fn set_instance_enabled(
         &self,
         connector_id: &str,
@@ -126,6 +155,13 @@ impl ConnectorStore {
         Ok(())
     }
 
+    /// Deletes the instance plus its dedupe and outbox rows in one transaction.
+    ///
+    /// Dead letters and events are intentionally retained for post-removal
+    /// auditability.
+    ///
+    /// # Errors
+    /// Returns [`ConnectorStoreError::NotFound`] for unknown connector ids.
     pub fn delete_instance(&self, connector_id: &str) -> Result<(), ConnectorStoreError> {
         let deleted = self.with_transaction(|transaction| {
             transaction.execute(
@@ -146,6 +182,10 @@ impl ConnectorStore {
         Ok(())
     }
 
+    /// Overwrites readiness, liveness, and last error in one update.
+    ///
+    /// # Errors
+    /// Returns [`ConnectorStoreError::NotFound`] for unknown connector ids.
     pub fn set_instance_runtime_state(
         &self,
         connector_id: &str,
@@ -180,6 +220,10 @@ impl ConnectorStore {
         Ok(())
     }
 
+    /// Stamps the last accepted inbound time.
+    ///
+    /// # Errors
+    /// Returns [`ConnectorStoreError::NotFound`] for unknown connector ids.
     pub fn record_last_inbound(
         &self,
         connector_id: &str,
@@ -203,6 +247,11 @@ impl ConnectorStore {
         Ok(())
     }
 
+    /// Stamps the last successful delivery and resets the instance to a
+    /// healthy ready/running state, clearing any stored error.
+    ///
+    /// # Errors
+    /// Returns [`ConnectorStoreError::NotFound`] for unknown connector ids.
     pub fn record_last_outbound(
         &self,
         connector_id: &str,
@@ -234,6 +283,10 @@ impl ConnectorStore {
         Ok(())
     }
 
+    /// Bumps the restart counter and marks the instance as restarting.
+    ///
+    /// # Errors
+    /// Returns [`ConnectorStoreError::NotFound`] for unknown connector ids.
     pub fn increment_restart_count(
         &self,
         connector_id: &str,
@@ -265,6 +318,11 @@ impl ConnectorStore {
         Ok(())
     }
 
+    /// Atomically records an inbound envelope id, returning `true` when it was
+    /// new and `false` when it is a duplicate inside the dedupe window.
+    ///
+    /// # Errors
+    /// Returns [`ConnectorStoreError::Sqlite`] when the transaction fails.
     pub fn record_inbound_dedupe_if_new(
         &self,
         connector_id: &str,
@@ -273,6 +331,8 @@ impl ConnectorStore {
         dedupe_window_ms: i64,
     ) -> Result<bool, ConnectorStoreError> {
         self.with_transaction(|transaction| {
+            // Expired entries are purged opportunistically on every check so
+            // the table stays bounded without a separate sweeper task.
             transaction.execute(
                 "DELETE FROM inbound_dedupe WHERE expires_at_unix_ms <= ?1",
                 params![now_unix_ms],

@@ -1,3 +1,6 @@
+//! Unit tests for the Discord adapter: outbound delivery, chunking, rate limits, gateway
+//! envelope handling, and zlib-stream decoding, all against fake transports.
+
 use std::{
     collections::VecDeque,
     convert::Infallible,

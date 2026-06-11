@@ -1,3 +1,9 @@
+//! Inbound/outbound message envelopes, routing results, and delivery receipts.
+//!
+//! `envelope_id` is the unit of idempotency end to end: inbound dedupe, outbox
+//! uniqueness, and delivery receipts all key on `connector_id` + `envelope_id`,
+//! so identifiers here must stay stable across retries.
+
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -12,18 +18,26 @@ use super::{
     },
 };
 
+/// Desired configuration of one connector instance as registered with the
+/// supervisor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectorInstanceSpec {
     pub connector_id: String,
     pub kind: ConnectorKind,
+    /// Channel principal the instance acts as (access-control subject).
     pub principal: String,
     pub auth_profile_ref: Option<String>,
     pub token_vault_ref: Option<String>,
+    /// Hosts the instance may dial; enforced by `core::net::ConnectorNetGuard`.
     pub egress_allowlist: Vec<String>,
     pub enabled: bool,
 }
 
 impl ConnectorInstanceSpec {
+    /// Validates identifiers and every egress allowlist host pattern.
+    ///
+    /// # Errors
+    /// Returns a protocol error naming the first invalid field.
     pub fn validate(&self) -> Result<(), ProtocolError> {
         validate_non_empty_identifier(
             self.connector_id.as_str(),
@@ -42,8 +56,11 @@ impl ConnectorInstanceSpec {
     }
 }
 
+/// Normalized inbound message as produced by a provider adapter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InboundMessageEvent {
+    /// Stable per-message identifier; reused on provider redelivery so the
+    /// supervisor's dedupe window can drop duplicates.
     pub envelope_id: String,
     pub connector_id: String,
     pub conversation_id: String,
@@ -61,6 +78,10 @@ pub struct InboundMessageEvent {
 }
 
 impl InboundMessageEvent {
+    /// Validates identifiers, the body against `max_body_bytes`, and attachments.
+    ///
+    /// # Errors
+    /// Returns a protocol error naming the first invalid field.
     pub fn validate(&self, max_body_bytes: usize) -> Result<(), ProtocolError> {
         validate_non_empty_identifier(
             self.envelope_id.as_str(),
@@ -84,6 +105,10 @@ impl InboundMessageEvent {
     }
 }
 
+/// One outbound message produced by the router for an inbound event.
+///
+/// The supervisor turns each output into an [`OutboundMessageRequest`] with a
+/// derived envelope id before enqueueing it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoutedOutboundMessage {
     pub text: String,
@@ -100,9 +125,12 @@ pub struct RoutedOutboundMessage {
     pub a2ui_update: Option<OutboundA2uiUpdate>,
 }
 
+/// Router verdict for one inbound event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteInboundResult {
     pub accepted: bool,
+    /// True when the router queued the event for its own retry; the connector
+    /// does not re-ingest it (the dedupe window would drop it anyway).
     pub queued_for_retry: bool,
     pub decision_reason: String,
     pub outputs: Vec<RoutedOutboundMessage>,
@@ -112,8 +140,11 @@ pub struct RouteInboundResult {
     pub route_message_latency_ms: Option<u64>,
 }
 
+/// Outbound message persisted in the outbox and handed to a provider adapter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutboundMessageRequest {
+    /// Idempotency identifier; the outbox enforces uniqueness per
+    /// `(connector_id, envelope_id)`, so retries must reuse the same value.
     pub envelope_id: String,
     pub connector_id: String,
     pub conversation_id: String,
@@ -130,15 +161,22 @@ pub struct OutboundMessageRequest {
     #[serde(default)]
     pub a2ui_update: Option<OutboundA2uiUpdate>,
     pub timeout_ms: u64,
+    /// Upper bound for structured/A2UI payload bytes; further clamped by the
+    /// supervisor's configured outbound limit during validation.
     pub max_payload_bytes: usize,
 }
 
 impl OutboundMessageRequest {
+    /// Returns the receipt idempotency key (`connector_id:envelope_id`).
     #[must_use]
     pub fn delivery_idempotency_key(&self) -> String {
         format!("{}:{}", self.connector_id, self.envelope_id)
     }
 
+    /// Validates identifiers, text size, attachments, timeout, and payload limits.
+    ///
+    /// # Errors
+    /// Returns a protocol error naming the first invalid field.
     pub fn validate(&self, max_text_bytes: usize) -> Result<(), ProtocolError> {
         validate_non_empty_identifier(
             self.envelope_id.as_str(),
@@ -184,6 +222,8 @@ impl OutboundMessageRequest {
     }
 }
 
+/// Why an adapter asked for a delivery retry; drives backoff and runtime-state
+/// bookkeeping (`ConnectorRestarting` increments the restart counter).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RetryClass {
@@ -193,6 +233,7 @@ pub enum RetryClass {
 }
 
 impl RetryClass {
+    /// Returns the stable snake_case label matching the serde encoding.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -203,6 +244,7 @@ impl RetryClass {
     }
 }
 
+/// Adapter verdict for one delivery attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DeliveryOutcome {
@@ -212,12 +254,16 @@ pub enum DeliveryOutcome {
 }
 
 impl DeliveryOutcome {
+    /// Converts this outcome into the receipt for `request`.
+    ///
+    /// See [`DeliveryReceipt::from_outcome`] for the state mapping.
     #[must_use]
     pub fn to_receipt(&self, request: &OutboundMessageRequest) -> DeliveryReceipt {
         DeliveryReceipt::from_outcome(request, self)
     }
 }
 
+/// Final disposition of a delivery attempt as reported upstream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryReceiptState {
@@ -226,6 +272,7 @@ pub enum DeliveryReceiptState {
     Unknown,
 }
 
+/// Receipt emitted for a delivery attempt, keyed for idempotent consumption.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeliveryReceipt {
     pub state: DeliveryReceiptState,
@@ -239,6 +286,9 @@ pub struct DeliveryReceipt {
 }
 
 impl DeliveryReceipt {
+    /// Builds the receipt for an outcome: `Delivered` maps to `Ack`,
+    /// `PermanentFailure` to `Nack`, and `Retry` to `Unknown` because the
+    /// message may still be delivered by a later attempt.
     #[must_use]
     pub fn from_outcome(request: &OutboundMessageRequest, outcome: &DeliveryOutcome) -> Self {
         match outcome {
@@ -267,12 +317,14 @@ impl DeliveryReceipt {
     }
 }
 
+/// Compact queue totals surfaced in status snapshots.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectorQueueDepth {
     pub pending_outbox: u64,
     pub dead_letters: u64,
 }
 
+/// Point-in-time operator view of one connector instance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectorStatusSnapshot {
     pub connector_id: String,

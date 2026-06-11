@@ -1,3 +1,9 @@
+//! Shared mutable runtime state for the Discord adapter.
+//!
+//! Owns the bounded delivery idempotency cache, per-route and global rate-limit windows,
+//! cached bot identity, gateway monitor lifecycle, and best-effort auto-reactions. All state
+//! lives behind one `std::sync::Mutex` and locks are never held across `.await`.
+
 use std::{
     collections::{HashMap, VecDeque},
     sync::Arc,
@@ -29,12 +35,14 @@ use super::{
     MAX_DELIVERY_CACHE, MAX_ROUTE_LIMIT_CACHE,
 };
 
+/// Cached identity of the authenticated bot user (`/users/@me`).
 #[derive(Debug, Clone)]
 pub(super) struct DiscordBotIdentity {
     pub(super) id: String,
     pub(super) username: String,
 }
 
+/// Rate-limit budget and delivery counters for one REST route key.
 #[derive(Debug, Clone, Default)]
 pub(super) struct RouteRateLimitWindow {
     pub(super) bucket_id: Option<String>,
@@ -49,6 +57,8 @@ pub(super) struct RouteRateLimitWindow {
     pub(super) last_error: Option<String>,
 }
 
+/// Aggregate adapter state shared between outbound sends, admin operations, the gateway
+/// monitor, and runtime snapshots.
 #[derive(Debug, Clone, Default)]
 pub(super) struct DiscordRuntimeState {
     pub(super) delivered_native_ids: HashMap<DeliveryCacheKey, String>,
@@ -68,6 +78,7 @@ pub(super) struct DiscordRuntimeState {
     pub(super) last_error: Option<String>,
 }
 
+/// Idempotency cache key: one entry per (connector, outbound envelope) pair.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct DeliveryCacheKey {
     connector_id: String,
@@ -80,6 +91,7 @@ impl DeliveryCacheKey {
     }
 }
 
+/// Rate-limit signals parsed from one REST response (headers plus body fields).
 #[derive(Debug, Clone, Default)]
 pub(super) struct RateLimitSnapshot {
     pub(super) retry_after_ms: Option<u64>,
@@ -89,6 +101,7 @@ pub(super) struct RateLimitSnapshot {
     pub(super) global: bool,
 }
 
+/// Gateway session continuity carried across reconnects to enable RESUME.
 #[derive(Debug, Default)]
 pub(super) struct DiscordGatewayResumeState {
     pub(super) session_id: Option<String>,
@@ -96,6 +109,7 @@ pub(super) struct DiscordGatewayResumeState {
     pub(super) bot_user_id: Option<String>,
 }
 
+/// Connection-scoped zlib-stream decompression context (see `decode_gateway_binary_payload`).
 #[derive(Debug)]
 pub(super) struct DiscordGatewayInflater {
     pub(super) compressed_buffer: Vec<u8>,
@@ -108,12 +122,21 @@ impl Default for DiscordGatewayInflater {
     }
 }
 
+/// Owning handle for one connector's gateway monitor task and its inbound event queue.
 pub(super) struct DiscordInboundMonitorHandle {
     pub(super) receiver: mpsc::Receiver<InboundMessageEvent>,
     pub(super) task: tokio::task::JoinHandle<()>,
 }
 
 impl DiscordConnectorAdapter {
+    /// Starts the gateway monitor task for `instance` if one is not already registered.
+    ///
+    /// AIDEV-NOTE: the existence check and the insert below take the registry lock
+    /// separately (the spawn between them must not hold a sync lock). Two concurrent
+    /// callers for the same connector could therefore both spawn; the second insert would
+    /// drop the first handle, leaking a monitor task that can no longer be aborted. Fixing
+    /// it requires re-checking under the second lock and aborting the redundant task —
+    /// a control-flow change deliberately not made during the comment/quality pass.
     pub(super) async fn ensure_inbound_monitor(
         &self,
         instance: &ConnectorInstanceRecord,
@@ -153,6 +176,7 @@ impl DiscordConnectorAdapter {
         Ok(())
     }
 
+    /// Aborts and deregisters the monitor for `connector_id`; returns whether one existed.
     pub(super) fn stop_inbound_monitor(
         &self,
         connector_id: &str,
@@ -169,6 +193,8 @@ impl DiscordConnectorAdapter {
         Ok(true)
     }
 
+    /// Drains up to `max_events` queued inbound events without blocking; a disconnected
+    /// queue means the monitor died, so its registration is removed for a later restart.
     pub(super) fn drain_inbound_events(
         &self,
         connector_id: &str,
@@ -231,6 +257,8 @@ impl DiscordConnectorAdapter {
         Ok(state.delivered_native_ids.get(&key).cloned())
     }
 
+    /// Records a delivered envelope in the idempotency cache, evicting oldest-inserted
+    /// entries beyond the cap so memory stays bounded under sustained traffic.
     pub(super) fn remember_delivery(
         &self,
         connector_id: &str,
@@ -251,6 +279,8 @@ impl DiscordConnectorAdapter {
         Ok(())
     }
 
+    /// Mutates the route window for `route_key`, maintaining the bounded insertion-order
+    /// index used to evict the oldest routes.
     fn with_route_window_mut<F>(
         &self,
         route_key: &str,
@@ -260,10 +290,7 @@ impl DiscordConnectorAdapter {
         F: FnOnce(&mut RouteRateLimitWindow),
     {
         let mut state = self.lock_state()?;
-        let entry = state
-            .route_limits
-            .entry(route_key.to_owned())
-            .or_insert_with(RouteRateLimitWindow::default);
+        let entry = state.route_limits.entry(route_key.to_owned()).or_default();
         callback(entry);
         if !state.route_limit_order.iter().any(|item| item == route_key) {
             state.route_limit_order.push_back(route_key.to_owned());
@@ -371,6 +398,9 @@ impl DiscordConnectorAdapter {
         }
     }
 
+    /// Checks the local rate-limit budget before a request: returns the wait in ms when the
+    /// global window or this route's window is still blocked, recording the deferral; an
+    /// expired route window is dropped on the way through.
     pub(super) fn preflight_retry_after_ms(
         &self,
         route_key: &str,
@@ -380,10 +410,7 @@ impl DiscordConnectorAdapter {
         if state.global_blocked_until_unix_ms > now_unix_ms {
             let wait = state.global_blocked_until_unix_ms.saturating_sub(now_unix_ms);
             let wait_ms = wait.max(1).try_into().unwrap_or(u64::MAX);
-            let entry = state
-                .route_limits
-                .entry(route_key.to_owned())
-                .or_insert_with(RouteRateLimitWindow::default);
+            let entry = state.route_limits.entry(route_key.to_owned()).or_default();
             entry.local_deferrals_total = entry.local_deferrals_total.saturating_add(1);
             entry.last_retry_after_ms = Some(wait_ms);
             entry.last_error = Some(
@@ -405,10 +432,7 @@ impl DiscordConnectorAdapter {
             if blocked_until_unix_ms > now_unix_ms {
                 let wait = blocked_until_unix_ms.saturating_sub(now_unix_ms);
                 let wait_ms = wait.max(1).try_into().unwrap_or(u64::MAX);
-                let entry = state
-                    .route_limits
-                    .entry(route_key.to_owned())
-                    .or_insert_with(RouteRateLimitWindow::default);
+                let entry = state.route_limits.entry(route_key.to_owned()).or_default();
                 entry.local_deferrals_total = entry.local_deferrals_total.saturating_add(1);
                 entry.last_retry_after_ms = Some(wait_ms);
                 entry.last_error = Some(
@@ -431,6 +455,10 @@ impl DiscordConnectorAdapter {
         Ok(None)
     }
 
+    /// Folds a response's rate-limit signals into the global and per-route windows.
+    ///
+    /// Block windows only ever extend (`max`), never shrink, so an out-of-order response
+    /// cannot reopen a budget another response already closed.
     pub(super) fn apply_rate_limit_snapshot(
         &self,
         route_key: &str,
@@ -469,10 +497,7 @@ impl DiscordConnectorAdapter {
             .map(|value| now_unix_ms.saturating_add(i64::try_from(value).unwrap_or(i64::MAX)))
             .unwrap_or(now_unix_ms);
 
-        let entry = state
-            .route_limits
-            .entry(route_key.to_owned())
-            .or_insert_with(RouteRateLimitWindow::default);
+        let entry = state.route_limits.entry(route_key.to_owned()).or_default();
         if let Some(bucket_id) = snapshot.bucket_id.clone() {
             entry.bucket_id = Some(bucket_id);
         }
@@ -498,6 +523,11 @@ impl DiscordConnectorAdapter {
         Ok(())
     }
 
+    /// Ensures a fresh bot identity is cached, refreshing via `/users/@me` past the TTL.
+    ///
+    /// Returns `Ok(None)` when the identity is usable, and `Ok(Some(outcome))` when the
+    /// lookup could not complete — the caller forwards that outcome (retry or permanent
+    /// failure) for the in-flight delivery instead of proceeding unauthenticated.
     pub(super) async fn ensure_bot_identity(
         &self,
         guard: &ConnectorNetGuard,
@@ -636,6 +666,10 @@ impl DiscordConnectorAdapter {
         Ok(None)
     }
 
+    /// Best-effort acknowledgement reaction after a successful delivery.
+    ///
+    /// Deliberately infallible: the message is already delivered, so reaction failures are
+    /// only recorded as `last_error` and must never turn the delivery into a retry.
     pub(super) async fn send_auto_reaction(
         &self,
         guard: &ConnectorNetGuard,
@@ -714,6 +748,8 @@ impl DiscordConnectorAdapter {
         }
     }
 
+    /// Resolves the cached bot identity, returning `None` (with `last_error` recorded) when
+    /// the identity lookup is deferred or failed; admin flows then deny their preflight.
     pub(super) async fn resolve_bot_identity(
         &self,
         guard: &ConnectorNetGuard,

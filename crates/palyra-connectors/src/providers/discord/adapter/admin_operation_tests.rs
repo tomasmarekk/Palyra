@@ -1,3 +1,6 @@
+//! Unit tests for Discord admin operations (read, search, edit, react) covering preflight
+//! permission verdicts and denial paths against a scripted fake transport.
+
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex},

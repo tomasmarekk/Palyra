@@ -1,3 +1,9 @@
+//! Queue introspection (depths, deadlines, pause state) and the per-connector
+//! outbox pause switch.
+//!
+//! Pausing only stops `load_due_outbox` from claiming entries; enqueueing and
+//! already-claimed deliveries are unaffected.
+
 use rusqlite::{params, OptionalExtension};
 
 use super::super::protocol::ConnectorQueueDepth;
@@ -5,14 +11,25 @@ use super::records::to_queue_depth;
 use super::{ConnectorQueueSnapshot, ConnectorStore, ConnectorStoreError};
 
 impl ConnectorStore {
+    /// Returns the compact pending/dead-letter totals for one connector.
+    ///
+    /// # Errors
+    /// Returns a storage error when the underlying queries fail.
     pub fn queue_depth(
         &self,
         connector_id: &str,
     ) -> Result<ConnectorQueueDepth, ConnectorStoreError> {
+        // now=0 is safe here: only the time-independent totals survive the
+        // conversion; due/claimed counters are discarded.
         let snapshot = self.queue_snapshot(connector_id, 0)?;
         Ok(to_queue_depth(&snapshot))
     }
 
+    /// Builds the full queue snapshot, evaluating due/claimed counters
+    /// against `now_unix_ms`.
+    ///
+    /// # Errors
+    /// Returns a storage error when any of the aggregate queries fail.
     pub fn queue_snapshot(
         &self,
         connector_id: &str,
@@ -112,6 +129,10 @@ impl ConnectorStore {
         })
     }
 
+    /// Sets or clears the outbox pause flag for an existing connector.
+    ///
+    /// # Errors
+    /// Returns [`ConnectorStoreError::NotFound`] for unknown connector ids.
     pub fn set_queue_paused(
         &self,
         connector_id: &str,

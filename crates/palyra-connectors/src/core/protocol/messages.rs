@@ -1,3 +1,9 @@
+//! Message read, search, edit, delete, and reaction request/result contracts.
+//!
+//! Every result carries a [`ConnectorOperationPreflight`] so policy and audit
+//! metadata travel with the data; all requests and results are validated on
+//! both sides of the adapter boundary.
+
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -11,6 +17,7 @@ use super::{
     },
 };
 
+/// Conversation (and optional thread) a message operation targets.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectorConversationTarget {
     pub conversation_id: String,
@@ -19,6 +26,10 @@ pub struct ConnectorConversationTarget {
 }
 
 impl ConnectorConversationTarget {
+    /// Validates the conversation and optional thread identifiers.
+    ///
+    /// # Errors
+    /// Returns a protocol error naming the first invalid field.
     pub fn validate(&self) -> Result<(), ProtocolError> {
         validate_non_empty_identifier(
             self.conversation_id.as_str(),
@@ -34,6 +45,7 @@ impl ConnectorConversationTarget {
     }
 }
 
+/// Fully-qualified reference to one message within a conversation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectorMessageLocator {
     #[serde(flatten)]
@@ -42,6 +54,10 @@ pub struct ConnectorMessageLocator {
 }
 
 impl ConnectorMessageLocator {
+    /// Validates the target and the message identifier.
+    ///
+    /// # Errors
+    /// Returns a protocol error naming the first invalid field.
     pub fn validate(&self) -> Result<(), ProtocolError> {
         self.target.validate()?;
         validate_non_empty_identifier(
@@ -53,6 +69,10 @@ impl ConnectorMessageLocator {
     }
 }
 
+/// Request to read messages, either one exact message or a cursored page.
+///
+/// `message_id` selects an exact fetch and is mutually exclusive with the
+/// `before`/`after`/`around` pagination cursors.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectorMessageReadRequest {
     #[serde(flatten)]
@@ -69,6 +89,10 @@ pub struct ConnectorMessageReadRequest {
 }
 
 impl ConnectorMessageReadRequest {
+    /// Validates identifiers, the non-zero limit, and cursor exclusivity.
+    ///
+    /// # Errors
+    /// Returns a protocol error naming the first invalid field.
     pub fn validate(&self) -> Result<(), ProtocolError> {
         self.target.validate()?;
         validate_optional_field(self.message_id.as_deref(), "message_id", MAX_CURSOR_ID_BYTES)?;
@@ -107,6 +131,7 @@ impl ConnectorMessageReadRequest {
     }
 }
 
+/// Request to search messages; at least one filter must be provided.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectorMessageSearchRequest {
     #[serde(flatten)]
@@ -123,6 +148,11 @@ pub struct ConnectorMessageSearchRequest {
 }
 
 impl ConnectorMessageSearchRequest {
+    /// Validates identifiers, the non-zero limit, and that at least one of
+    /// `query`, `author_id`, or `has_attachments` filters the search.
+    ///
+    /// # Errors
+    /// Returns a protocol error naming the first invalid field.
     pub fn validate(&self) -> Result<(), ProtocolError> {
         self.target.validate()?;
         validate_optional_field(self.query.as_deref(), "query", MAX_SEARCH_QUERY_BYTES)?;
@@ -151,6 +181,7 @@ impl ConnectorMessageSearchRequest {
     }
 }
 
+/// Request to replace the body of an existing message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectorMessageEditRequest {
     pub locator: ConnectorMessageLocator,
@@ -158,6 +189,10 @@ pub struct ConnectorMessageEditRequest {
 }
 
 impl ConnectorMessageEditRequest {
+    /// Validates the locator and the replacement body.
+    ///
+    /// # Errors
+    /// Returns a protocol error naming the first invalid field.
     pub fn validate(&self) -> Result<(), ProtocolError> {
         self.locator.validate()?;
         validate_message_body(self.body.as_str(), MAX_MESSAGE_BYTES, "body")?;
@@ -165,6 +200,7 @@ impl ConnectorMessageEditRequest {
     }
 }
 
+/// Request to delete a message, optionally carrying an audit reason.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectorMessageDeleteRequest {
     pub locator: ConnectorMessageLocator,
@@ -173,6 +209,10 @@ pub struct ConnectorMessageDeleteRequest {
 }
 
 impl ConnectorMessageDeleteRequest {
+    /// Validates the locator and the optional reason length.
+    ///
+    /// # Errors
+    /// Returns a protocol error naming the first invalid field.
     pub fn validate(&self) -> Result<(), ProtocolError> {
         self.locator.validate()?;
         validate_optional_field(self.reason.as_deref(), "reason", MAX_OPERATION_REASON_BYTES)?;
@@ -180,6 +220,7 @@ impl ConnectorMessageDeleteRequest {
     }
 }
 
+/// Request to add or remove a reaction on a message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectorMessageReactionRequest {
     pub locator: ConnectorMessageLocator,
@@ -187,6 +228,10 @@ pub struct ConnectorMessageReactionRequest {
 }
 
 impl ConnectorMessageReactionRequest {
+    /// Validates the locator and the emoji identifier.
+    ///
+    /// # Errors
+    /// Returns a protocol error naming the first invalid field.
     pub fn validate(&self) -> Result<(), ProtocolError> {
         self.locator.validate()?;
         validate_non_empty_identifier(self.emoji.as_str(), "emoji", MAX_EMOJI_BYTES)?;
@@ -194,6 +239,7 @@ impl ConnectorMessageReactionRequest {
     }
 }
 
+/// Aggregated reaction state on a returned message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ConnectorMessageReactionRecord {
     pub emoji: String,
@@ -210,6 +256,7 @@ impl ConnectorMessageReactionRecord {
     }
 }
 
+/// One message as returned by read or search operations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectorMessageRecord {
     pub locator: ConnectorMessageLocator,
@@ -233,6 +280,10 @@ pub struct ConnectorMessageRecord {
 }
 
 impl ConnectorMessageRecord {
+    /// Validates identifiers, body size, attachments, and reactions.
+    ///
+    /// # Errors
+    /// Returns a protocol error naming the first invalid field.
     pub fn validate(&self) -> Result<(), ProtocolError> {
         self.locator.validate()?;
         validate_non_empty_identifier(self.sender_id.as_str(), "sender_id", MAX_IDENTITY_BYTES)?;
@@ -256,6 +307,7 @@ impl ConnectorMessageRecord {
     }
 }
 
+/// Result page for a read request, including continuation cursors.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectorMessageReadResult {
     pub preflight: ConnectorOperationPreflight,
@@ -272,6 +324,10 @@ pub struct ConnectorMessageReadResult {
 }
 
 impl ConnectorMessageReadResult {
+    /// Validates the preflight, target, cursors, and every returned message.
+    ///
+    /// # Errors
+    /// Returns a protocol error naming the first invalid field.
     pub fn validate(&self) -> Result<(), ProtocolError> {
         self.preflight.validate()?;
         self.target.validate()?;
@@ -297,6 +353,7 @@ impl ConnectorMessageReadResult {
     }
 }
 
+/// Result page for a search request, echoing the effective filters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectorMessageSearchResult {
     pub preflight: ConnectorOperationPreflight,
@@ -315,6 +372,10 @@ pub struct ConnectorMessageSearchResult {
 }
 
 impl ConnectorMessageSearchResult {
+    /// Validates the preflight, target, filters, cursor, and every match.
+    ///
+    /// # Errors
+    /// Returns a protocol error naming the first invalid field.
     pub fn validate(&self) -> Result<(), ProtocolError> {
         self.preflight.validate()?;
         self.target.validate()?;
@@ -332,6 +393,7 @@ impl ConnectorMessageSearchResult {
     }
 }
 
+/// Effect a mutation request had, including policy denial and no-op cases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectorMessageMutationStatus {
@@ -343,6 +405,7 @@ pub enum ConnectorMessageMutationStatus {
     Noop,
 }
 
+/// Before/after body pair recorded for auditable edits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ConnectorMessageMutationDiff {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -363,6 +426,7 @@ impl ConnectorMessageMutationDiff {
     }
 }
 
+/// Result of an edit, delete, or reaction mutation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectorMessageMutationResult {
     pub preflight: ConnectorOperationPreflight,
@@ -377,6 +441,10 @@ pub struct ConnectorMessageMutationResult {
 }
 
 impl ConnectorMessageMutationResult {
+    /// Validates the preflight, locator, and any embedded message or diff.
+    ///
+    /// # Errors
+    /// Returns a protocol error naming the first invalid field.
     pub fn validate(&self) -> Result<(), ProtocolError> {
         self.preflight.validate()?;
         self.locator.validate()?;

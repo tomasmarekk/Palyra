@@ -1,3 +1,6 @@
+//! Unit tests for `ConnectorStore`: instance lifecycle, inbound dedupe,
+//! outbox claim transitions, dead-letter replay/discard, and queue snapshots.
+
 use tempfile::TempDir;
 
 use super::super::protocol::{ConnectorInstanceSpec, ConnectorKind, OutboundMessageRequest};

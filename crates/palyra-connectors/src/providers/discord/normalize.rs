@@ -1,10 +1,21 @@
+//! Normalization of Discord identities and conversation targets.
+//!
+//! Maps the many shapes operators and the wire produce (prefixed ids, `<@...>`/`<#...>`
+//! mentions, raw snowflakes) onto canonical lowercase identities shared with memory and
+//! routing.
+
 use super::DiscordSemanticsError;
 
+/// Returns `true` when `connector_id` belongs to the Discord provider namespace.
 #[must_use]
 pub fn is_discord_connector(connector_id: &str) -> bool {
     connector_id.trim().to_ascii_lowercase().starts_with("discord:")
 }
 
+/// Canonicalizes a sender reference into `discord:user:<id>` form.
+///
+/// Accepts already-canonical ids, `user:` prefixes, and `<@...>` mention syntax; blank input
+/// maps to the sentinel `discord:user:unknown`.
 #[must_use]
 pub fn canonical_discord_sender_identity(raw: &str) -> String {
     let trimmed = raw.trim();
@@ -21,6 +32,10 @@ pub fn canonical_discord_sender_identity(raw: &str) -> String {
     format!("discord:user:{normalized}")
 }
 
+/// Canonicalizes a channel or thread reference into `discord:channel:<id>` form.
+///
+/// Accepts already-canonical ids, `channel:`/`thread:` prefixes, and `<#...>` mention syntax;
+/// blank input maps to the sentinel `discord:channel:unknown`.
 #[must_use]
 pub fn canonical_discord_channel_identity(raw: &str) -> String {
     let trimmed = raw.trim();
@@ -38,6 +53,11 @@ pub fn canonical_discord_channel_identity(raw: &str) -> String {
     format!("discord:channel:{normalized}")
 }
 
+/// Strips `channel:`/`thread:` prefixes from an outbound target and validates the remainder.
+///
+/// # Errors
+/// Returns [`DiscordSemanticsError::EmptyTarget`] for blank input and
+/// [`DiscordSemanticsError::InvalidTarget`] when characters outside the supported set remain.
 pub fn normalize_discord_target(raw: &str) -> Result<String, DiscordSemanticsError> {
     let trimmed = raw.trim();
     let normalized = trimmed
@@ -59,6 +79,7 @@ pub fn normalize_discord_target(raw: &str) -> Result<String, DiscordSemanticsErr
 
 fn parse_discord_user_mention(raw: &str) -> Option<&str> {
     let body = raw.strip_prefix("<@")?.strip_suffix('>')?;
+    // `<@!id>` is Discord's legacy nickname-mention form; the `!` carries no identity.
     body.strip_prefix('!').or(Some(body))
 }
 

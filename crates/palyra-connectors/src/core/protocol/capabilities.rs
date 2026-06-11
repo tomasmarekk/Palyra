@@ -1,3 +1,9 @@
+//! Connector capability declarations and operation preflight contracts.
+//!
+//! Each provider advertises a [`ConnectorCapabilitySet`] so the daemon can gate
+//! operations, attach policy actions, and surface approval/risk metadata
+//! without provider-specific knowledge.
+
 use serde::{Deserialize, Serialize};
 
 use super::validation::{
@@ -5,6 +11,8 @@ use super::validation::{
     ProtocolError, MAX_AUDIT_EVENT_TYPE_BYTES, MAX_OPERATION_REASON_BYTES, MAX_POLICY_ACTION_BYTES,
 };
 
+/// Support declaration for a single connector capability, with optional policy
+/// metadata (action, approval mode, risk level, audit type, permissions).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectorCapabilitySupport {
     pub supported: bool,
@@ -23,6 +31,7 @@ pub struct ConnectorCapabilitySupport {
 }
 
 impl ConnectorCapabilitySupport {
+    /// Creates a supported capability with no extra policy metadata.
     #[must_use]
     pub fn supported() -> Self {
         Self {
@@ -36,6 +45,7 @@ impl ConnectorCapabilitySupport {
         }
     }
 
+    /// Creates an unsupported capability carrying the operator-facing reason.
     #[must_use]
     pub fn unsupported(reason: impl Into<String>) -> Self {
         Self {
@@ -49,30 +59,35 @@ impl ConnectorCapabilitySupport {
         }
     }
 
+    /// Sets the policy action evaluated before this capability is exercised.
     #[must_use]
     pub fn with_policy_action(mut self, policy_action: impl Into<String>) -> Self {
         self.policy_action = Some(policy_action.into());
         self
     }
 
+    /// Sets the approval mode required for this capability.
     #[must_use]
     pub fn with_approval_mode(mut self, approval_mode: ConnectorApprovalMode) -> Self {
         self.approval_mode = Some(approval_mode);
         self
     }
 
+    /// Sets the risk level surfaced to operators and policy.
     #[must_use]
     pub fn with_risk_level(mut self, risk_level: ConnectorRiskLevel) -> Self {
         self.risk_level = Some(risk_level);
         self
     }
 
+    /// Sets the audit event type recorded when this capability is used.
     #[must_use]
     pub fn with_audit_event_type(mut self, audit_event_type: impl Into<String>) -> Self {
         self.audit_event_type = Some(audit_event_type.into());
         self
     }
 
+    /// Sets the provider-side permissions required for this capability.
     #[must_use]
     pub fn with_required_permissions<I, S>(mut self, required_permissions: I) -> Self
     where
@@ -84,6 +99,7 @@ impl ConnectorCapabilitySupport {
     }
 }
 
+/// Whether exercising a capability requires operator approval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectorApprovalMode {
@@ -92,6 +108,7 @@ pub enum ConnectorApprovalMode {
     Required,
 }
 
+/// Risk classification attached to a capability or operation preflight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectorRiskLevel {
@@ -101,6 +118,7 @@ pub enum ConnectorRiskLevel {
     Conditional,
 }
 
+/// Per-operation support matrix for message-level capabilities.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectorMessageCapabilitySet {
     pub send: ConnectorCapabilitySupport,
@@ -114,6 +132,7 @@ pub struct ConnectorMessageCapabilitySet {
     pub react_remove: ConnectorCapabilitySupport,
 }
 
+/// Full capability surface a provider advertises to the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectorCapabilitySet {
     pub lifecycle: ConnectorCapabilitySupport,
@@ -127,6 +146,10 @@ pub struct ConnectorCapabilitySet {
     pub message: ConnectorMessageCapabilitySet,
 }
 
+/// Policy decision an adapter reports alongside a message operation result.
+///
+/// `allowed == false` means the operation was denied by provider-side policy;
+/// the result then carries the denial metadata instead of an effect.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectorOperationPreflight {
     pub allowed: bool,
@@ -141,6 +164,10 @@ pub struct ConnectorOperationPreflight {
 }
 
 impl ConnectorOperationPreflight {
+    /// Validates identifier fields and size limits.
+    ///
+    /// # Errors
+    /// Returns a protocol error naming the first invalid field.
     pub fn validate(&self) -> Result<(), ProtocolError> {
         validate_non_empty_identifier(
             self.policy_action.as_str(),

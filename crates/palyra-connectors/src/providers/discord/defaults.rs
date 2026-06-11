@@ -1,3 +1,8 @@
+//! Default wiring for Discord connector instances.
+//!
+//! Owns the baseline egress allowlist (Discord-operated domains only) and the spec builder
+//! that ties account identity, vault, and auth references together.
+
 use crate::core::{ConnectorInstanceSpec, ConnectorKind};
 
 use super::{
@@ -16,11 +21,18 @@ const DISCORD_DEFAULT_EGRESS_ALLOWLIST: [&str; 8] = [
     "*.discordapp.net",
 ];
 
+/// Returns the baseline egress allowlist restricting Discord connectors to Discord-operated
+/// domains.
 #[must_use]
 pub fn discord_default_egress_allowlist() -> Vec<String> {
     DISCORD_DEFAULT_EGRESS_ALLOWLIST.iter().map(|entry| (*entry).to_owned()).collect()
 }
 
+/// Builds a fully wired Discord connector instance spec for `account_id`.
+///
+/// # Errors
+/// Returns [`DiscordSemanticsError`] when `account_id` is blank or contains unsupported
+/// characters.
 pub fn discord_connector_spec(
     account_id: &str,
     enabled: bool,

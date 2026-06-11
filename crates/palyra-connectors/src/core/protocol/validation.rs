@@ -1,3 +1,9 @@
+//! Shared validation helpers and size limits for protocol types.
+//!
+//! All limits are byte counts on the raw UTF-8 representation, sized to bound
+//! sqlite row growth and console payloads rather than to match any single
+//! provider's limits (adapters enforce stricter provider caps themselves).
+
 use serde_json::Value;
 use thiserror::Error;
 
@@ -28,12 +34,14 @@ pub(super) const MAX_MESSAGE_LINK_BYTES: usize = 2_048;
 pub(super) const MAX_EMOJI_BYTES: usize = 128;
 pub(super) const MAX_OPERATION_REASON_BYTES: usize = 512;
 
+/// Validation failure naming the offending field and a static reason.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ProtocolError {
     #[error("invalid field '{field}': {reason}")]
     InvalidField { field: &'static str, reason: &'static str },
 }
 
+/// Rejects identifiers that are empty after trimming or exceed `max_bytes`.
 pub(super) fn validate_non_empty_identifier(
     raw: &str,
     field: &'static str,
@@ -49,6 +57,7 @@ pub(super) fn validate_non_empty_identifier(
     Ok(())
 }
 
+/// Rejects empty bodies and bodies larger than the caller-provided cap.
 pub(super) fn validate_message_body(
     raw: &str,
     max_bytes: usize,
@@ -57,6 +66,7 @@ pub(super) fn validate_message_body(
     if raw.trim().is_empty() {
         return Err(ProtocolError::InvalidField { field, reason: "cannot be empty" });
     }
+    // Caller-supplied caps can never relax the protocol-wide message ceiling.
     let max_bytes = max_bytes.clamp(1, MAX_MESSAGE_BYTES);
     if raw.len() > max_bytes {
         return Err(ProtocolError::InvalidField {
@@ -67,6 +77,7 @@ pub(super) fn validate_message_body(
     Ok(())
 }
 
+/// Validates an egress allowlist entry: a hostname or `*.suffix` wildcard.
 pub(super) fn validate_host_pattern(raw: &str) -> Result<(), ProtocolError> {
     let trimmed = raw.trim().to_ascii_lowercase();
     if trimmed.is_empty() {
@@ -93,6 +104,7 @@ pub(super) fn validate_host_pattern(raw: &str) -> Result<(), ProtocolError> {
     Ok(())
 }
 
+/// Enforces `max_bytes` on an optional field; absent or blank values pass.
 pub(super) fn validate_optional_field(
     raw: Option<&str>,
     field: &'static str,
@@ -107,6 +119,7 @@ pub(super) fn validate_optional_field(
     Ok(())
 }
 
+/// Requires non-empty bytes within `max_bytes` that parse as JSON.
 pub(super) fn validate_json_bytes(
     raw: &[u8],
     field: &'static str,
@@ -123,6 +136,7 @@ pub(super) fn validate_json_bytes(
     Ok(())
 }
 
+/// Validates every permission label as a bounded non-empty identifier.
 pub(super) fn validate_permission_labels(
     values: &[String],
     field: &'static str,

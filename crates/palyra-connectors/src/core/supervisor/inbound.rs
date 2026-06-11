@@ -1,3 +1,9 @@
+//! Inbound ingestion path: validation, dedupe, routing, response enqueueing,
+//! and the immediate post-ingest drain.
+//!
+//! Every routed output is persisted to the outbox before any delivery is
+//! attempted, so responses survive a crash between routing and delivery.
+
 use serde_json::json;
 
 use super::super::{
@@ -6,7 +12,17 @@ use super::super::{
 };
 use super::{unix_ms_now, ConnectorSupervisor, ConnectorSupervisorError};
 
+/// Delivery timeout stamped onto outbound requests derived from routed
+/// inbound events.
+const ROUTED_OUTBOUND_TIMEOUT_MS: u64 = 30_000;
+
 impl ConnectorSupervisor {
+    /// Validates and enqueues an externally constructed outbound request;
+    /// duplicates of an already queued envelope are a no-op.
+    ///
+    /// # Errors
+    /// Returns validation errors, [`ConnectorSupervisorError::NotFound`] for
+    /// unknown connectors, and store errors when persistence fails.
     pub fn enqueue_outbound(
         &self,
         request: &OutboundMessageRequest,
@@ -37,6 +53,14 @@ impl ConnectorSupervisor {
         Ok(outcome)
     }
 
+    /// Runs the full inbound pipeline for one event: validate, drop if the
+    /// connector is disabled, dedupe, route, enqueue routed outputs, then
+    /// immediately drain this connector's due outbox once.
+    ///
+    /// # Errors
+    /// Returns validation, not-found, router, adapter, or store errors; soft
+    /// rejections (disabled, duplicate, not routed) are reported through the
+    /// returned [`super::InboundIngestOutcome`] instead.
     pub async fn ingest_inbound(
         &self,
         event: InboundMessageEvent,
@@ -70,6 +94,12 @@ impl ConnectorSupervisor {
             });
         }
 
+        // AIDEV-NOTE: the envelope is marked in the dedupe window *before*
+        // routing. If `route_inbound` then fails with an error, a provider
+        // redelivery of the same envelope is dropped as a duplicate — recovery
+        // relies on router-side retries, not connector re-ingestion. Moving
+        // the dedupe after routing would change delivery semantics
+        // (at-most-once -> at-least-once), so it is left as designed.
         let is_new = self.store.record_inbound_dedupe_if_new(
             instance.connector_id.as_str(),
             event.envelope_id.as_str(),
@@ -159,6 +189,9 @@ impl ConnectorSupervisor {
         let mut enqueued_outbound = 0usize;
         for (index, output) in routed.outputs.iter().enumerate() {
             let base_request = OutboundMessageRequest {
+                // Deriving the outbound envelope id from the inbound one plus
+                // the output index keeps re-routing of the same inbound event
+                // idempotent against the outbox uniqueness constraint.
                 envelope_id: format!("{}:{index}", event.envelope_id),
                 connector_id: instance.connector_id.clone(),
                 conversation_id: event.conversation_id.clone(),
@@ -171,7 +204,7 @@ impl ConnectorSupervisor {
                 attachments: output.attachments.clone(),
                 structured_json: output.structured_json.clone(),
                 a2ui_update: output.a2ui_update.clone(),
-                timeout_ms: 30_000,
+                timeout_ms: ROUTED_OUTBOUND_TIMEOUT_MS,
                 max_payload_bytes: self.config.max_outbound_body_bytes,
             };
             base_request
@@ -231,6 +264,14 @@ impl ConnectorSupervisor {
         })
     }
 
+    /// Polls every enabled connector's adapter for inbound events and ingests
+    /// them, returning the number of events processed.
+    ///
+    /// A poll failure on one connector is logged as an event and skipped so
+    /// the remaining connectors still make progress.
+    ///
+    /// # Errors
+    /// Returns store/clock errors, or any error from ingesting a polled event.
     pub async fn poll_inbound(
         &self,
         per_connector_limit: usize,

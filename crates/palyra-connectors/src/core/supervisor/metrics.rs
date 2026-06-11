@@ -1,3 +1,10 @@
+//! Runtime metrics derived from the persisted connector event log, plus the
+//! queue saturation classifier.
+//!
+//! Metrics are reconstructed on demand by replaying the most recent events
+//! rather than kept as in-memory counters, so they survive restarts and need
+//! no extra synchronization; the window size bounds the cost per snapshot.
+
 use std::collections::HashMap;
 
 use serde::Serialize;
@@ -6,9 +13,13 @@ use serde_json::Value;
 use super::super::storage::{ConnectorEventRecord, ConnectorQueueSnapshot};
 use super::{ConnectorSupervisor, ConnectorSupervisorError};
 
+/// Number of most-recent events replayed per metrics snapshot.
 pub(super) const CONNECTOR_METRICS_EVENT_WINDOW: usize = 2_048;
 const CONNECTOR_POLICY_DENIAL_REASON_LIMIT: usize = 16;
+/// Due-entry backlog at which the queue is reported saturated.
+const SATURATED_DUE_OUTBOX_THRESHOLD: u64 = 8;
 
+/// Aggregate routing latency over the sampled event window.
 #[derive(Debug, Clone, Default, Serialize)]
 pub(super) struct RouteMessageLatencySnapshot {
     sample_count: u64,
@@ -16,12 +27,14 @@ pub(super) struct RouteMessageLatencySnapshot {
     max_ms: u64,
 }
 
+/// One policy denial reason with its occurrence count.
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct PolicyDenialReasonCount {
     reason: String,
     count: u64,
 }
 
+/// Event-derived counters exposed in runtime snapshots.
 #[derive(Debug, Clone, Default, Serialize)]
 pub(super) struct ConnectorRuntimeMetricsSnapshot {
     event_window_size: u64,
@@ -34,6 +47,7 @@ pub(super) struct ConnectorRuntimeMetricsSnapshot {
     policy_denials: Vec<PolicyDenialReasonCount>,
 }
 
+/// Coarse queue-health classification with the contributing reasons.
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct ConnectorSaturationSnapshot {
     state: &'static str,
@@ -41,6 +55,7 @@ pub(super) struct ConnectorSaturationSnapshot {
 }
 
 impl ConnectorSupervisor {
+    /// Builds the metrics snapshot by replaying the connector's recent events.
     pub(super) fn build_runtime_metrics(
         &self,
         connector_id: &str,
@@ -137,6 +152,8 @@ fn parse_route_message_latency_ms(details: &Value) -> Option<u64> {
     details.get("route_message_latency_ms").and_then(Value::as_u64)
 }
 
+/// Backpressure rejections are capacity signals, not policy denials, so they
+/// are excluded from the denial-reason breakdown.
 fn is_policy_denial_reason(reason: &str) -> bool {
     !matches!(
         reason.trim(),
@@ -146,6 +163,9 @@ fn is_policy_denial_reason(reason: &str) -> bool {
     )
 }
 
+/// Classifies queue health: paused beats everything; dead letters, claimed
+/// (in-flight) entries, or a due backlog count as saturated; any other
+/// pending work is merely backlogged.
 pub(super) fn build_saturation_snapshot(
     queue: &ConnectorQueueSnapshot,
 ) -> ConnectorSaturationSnapshot {
@@ -167,7 +187,10 @@ pub(super) fn build_saturation_snapshot(
     }
     let state = if queue.paused {
         "paused"
-    } else if queue.dead_letters > 0 || queue.claimed_outbox > 0 || queue.due_outbox >= 8 {
+    } else if queue.dead_letters > 0
+        || queue.claimed_outbox > 0
+        || queue.due_outbox >= SATURATED_DUE_OUTBOX_THRESHOLD
+    {
         "saturated"
     } else if queue.pending_outbox > 0 || queue.due_outbox > 0 {
         "backlogged"

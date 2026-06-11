@@ -1,5 +1,9 @@
 //! Provider-neutral connector runtime and storage primitives owned by
 //! `palyra-connectors`.
+//!
+//! Providers integrate exclusively through the [`supervisor::ConnectorAdapter`]
+//! and [`supervisor::ConnectorRouter`] traits; the only provider knowledge the
+//! core consumes is the capability/availability registry in `crate::providers`.
 
 pub mod net;
 pub mod protocol;

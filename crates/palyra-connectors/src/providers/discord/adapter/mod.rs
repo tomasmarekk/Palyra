@@ -1,3 +1,9 @@
+//! Discord connector adapter: outbound REST delivery plus gateway-based inbound intake.
+//!
+//! Expected provider failures (bad target, missing credential, rate limits, upstream errors)
+//! are returned as classified [`DeliveryOutcome`] values rather than `Err`, so the supervisor
+//! can schedule retries; `Err` is reserved for adapter-internal faults such as poisoned locks.
+
 mod admin;
 mod gateway;
 mod outbound;
@@ -73,6 +79,8 @@ const DISCORD_MAX_MESSAGE_LINES: usize = 17;
 const DISCORD_GATEWAY_VERSION: &str = "10";
 const DISCORD_GATEWAY_ENCODING: &str = "json";
 const DISCORD_GATEWAY_COMPRESSION: &str = "zlib-stream";
+// Gateway intents: GUILDS | GUILD_MESSAGES | DIRECT_MESSAGES | MESSAGE_CONTENT — the minimum
+// needed to receive readable channel and DM messages; presence/member intents stay off.
 const DISCORD_GATEWAY_INTENTS: u64 = (1 << 0) | (1 << 9) | (1 << 12) | (1 << 15);
 const DISCORD_GATEWAY_HEARTBEAT_FALLBACK_MS: u64 = 45_000;
 const DISCORD_GATEWAY_MONITOR_MIN_BACKOFF_MS: u64 = 1_000;
@@ -91,14 +99,25 @@ const DISCORD_MAX_UPLOAD_BYTES: usize = 4 * 1024 * 1024;
 const DISCORD_UPLOAD_ALLOWED_CONTENT_TYPES: &[&str] =
     &["image/png", "image/jpeg", "image/webp", "image/gif", "text/plain", "application/json"];
 
+/// Tunable runtime configuration for the Discord adapter.
+///
+/// Defaults target the public Discord v10 API; tests override the base URL and feature
+/// toggles to run against fake transports.
 #[derive(Debug, Clone)]
 pub struct DiscordAdapterConfig {
+    /// Base URL for Discord REST calls (default: public v10 API).
     pub api_base_url: Url,
+    /// Per-request timeout applied to every REST call.
     pub request_timeout_ms: u64,
+    /// Maximum characters per outbound message chunk.
     pub max_chunk_chars: usize,
+    /// Maximum lines per outbound message chunk.
     pub max_chunk_lines: usize,
+    /// Whether delivered messages get the requested acknowledgement reaction.
     pub enable_auto_reactions: bool,
+    /// Whether the inbound gateway monitor may be started by `poll_inbound`.
     pub enable_inbound_gateway: bool,
+    /// Capacity of the bounded inbound event queue per connector.
     pub inbound_buffer_capacity: usize,
 }
 
@@ -117,6 +136,7 @@ impl Default for DiscordAdapterConfig {
     }
 }
 
+/// Current wall-clock time in unix milliseconds; clamps instead of failing on clock skew.
 fn unix_ms_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -165,6 +185,9 @@ impl ConnectorAdapter for DiscordConnectorAdapter {
         for (index, chunk) in chunks.into_iter().enumerate() {
             let mut next = request.clone();
             next.text = chunk;
+            // Only the first chunk keeps the original envelope id, attachments, and
+            // structured payloads; continuation chunks get derived ids so idempotency
+            // tracking stays per-chunk and side payloads are not delivered twice.
             if index > 0 {
                 next.envelope_id = format!("{}:chunk{index}", request.envelope_id);
                 next.attachments.clear();
@@ -840,6 +863,8 @@ impl ConnectorAdapter for DiscordConnectorAdapter {
     }
 }
 
+/// Supported Discord adapter handling outbound REST delivery, message administration, and
+/// gateway-based inbound intake for all Discord connector instances.
 pub struct DiscordConnectorAdapter {
     config: DiscordAdapterConfig,
     transport: Arc<dyn DiscordTransport>,
@@ -863,6 +888,8 @@ impl Default for DiscordConnectorAdapter {
 }
 
 impl DiscordConnectorAdapter {
+    /// Creates an adapter with the default config, live HTTP transport, and
+    /// environment-based credential resolution.
     #[must_use]
     pub fn new() -> Self {
         Self::with_dependencies(
@@ -872,6 +899,8 @@ impl DiscordConnectorAdapter {
         )
     }
 
+    /// Creates an adapter with default config and transport but a custom credential resolver
+    /// (e.g. vault-backed resolution in the daemon).
     #[must_use]
     pub fn with_credential_resolver(
         credential_resolver: Arc<dyn DiscordCredentialResolver>,

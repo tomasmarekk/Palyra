@@ -1,8 +1,16 @@
+//! Sqlite schema creation and in-place column migrations for the connector
+//! store.
+//!
+//! `initialize_schema` is idempotent and runs on every open; statements here
+//! are the storage contract, so column or constraint changes need a matching
+//! migration for databases created by older builds.
+
 use rusqlite::Connection;
 
 use super::{ConnectorStore, ConnectorStoreError};
 
 impl ConnectorStore {
+    /// Creates all tables/indexes if missing and applies column migrations.
     pub(super) fn initialize_schema(&self) -> Result<(), ConnectorStoreError> {
         let connection = self.connection.lock().map_err(|_| ConnectorStoreError::PoisonedLock)?;
         connection.execute_batch(
@@ -90,6 +98,8 @@ impl ConnectorStore {
                 ON connector_events(connector_id, event_id DESC);
             "#,
         )?;
+        // The reclaim index can only be created after the claim columns exist
+        // on databases that predate the claim-lease migration.
         ensure_outbox_claim_columns(&connection)?;
         connection.execute_batch(
             r#"
@@ -101,6 +111,7 @@ impl ConnectorStore {
     }
 }
 
+/// Adds the claim-lease columns to `outbox` tables created before they existed.
 fn ensure_outbox_claim_columns(connection: &Connection) -> Result<(), ConnectorStoreError> {
     if !outbox_column_exists(connection, "claim_token")? {
         connection.execute("ALTER TABLE outbox ADD COLUMN claim_token TEXT", [])?;

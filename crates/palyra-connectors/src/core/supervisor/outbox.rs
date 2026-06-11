@@ -1,3 +1,11 @@
+//! Outbox drain loop: claims due entries, dispatches them through adapters,
+//! and applies the delivered/retry/dead-letter transitions.
+//!
+//! Retry budget: an entry is dead-lettered once its attempt count reaches
+//! `min(entry.max_attempts, config.max_retry_attempts)`; delays grow
+//! exponentially from `base_retry_delay_ms`, clamped between the configured
+//! min and max, with adapter-provided `retry_after_ms` taking precedence.
+
 use serde_json::json;
 
 use super::super::{
@@ -10,6 +18,10 @@ use super::types::{classify_permanent_failure, retry_class_label, DispatchResult
 use super::{unix_ms_now, ConnectorSupervisor, ConnectorSupervisorError, DrainOutcome};
 
 impl ConnectorSupervisor {
+    /// Drains up to `limit` due entries across all unpaused connectors.
+    ///
+    /// # Errors
+    /// Returns clock, store, or supervisor errors raised while dispatching.
     pub async fn drain_due_outbox(
         &self,
         limit: usize,
@@ -19,6 +31,11 @@ impl ConnectorSupervisor {
         self.process_due_entries(entries).await
     }
 
+    /// Drains up to `limit` due entries for one connector, honoring its pause
+    /// flag.
+    ///
+    /// # Errors
+    /// Returns clock, store, or supervisor errors raised while dispatching.
     pub async fn drain_due_outbox_for_connector(
         &self,
         connector_id: &str,
@@ -29,6 +46,11 @@ impl ConnectorSupervisor {
         self.process_due_entries(entries).await
     }
 
+    /// Drains one connector even while its queue is paused; operator escape
+    /// hatch for flushing a paused backlog.
+    ///
+    /// # Errors
+    /// Returns clock, store, or supervisor errors raised while dispatching.
     pub async fn drain_due_outbox_for_connector_force(
         &self,
         connector_id: &str,
@@ -61,12 +83,15 @@ impl ConnectorSupervisor {
         Ok(outcome)
     }
 
+    /// Delivers one claimed entry and applies the resulting state transition.
     async fn dispatch_outbox_entry(
         &self,
         entry: OutboxEntryRecord,
     ) -> Result<DispatchResult, ConnectorSupervisorError> {
         let now = unix_ms_now()?;
         let Some(instance) = self.store.get_instance(entry.connector_id.as_str())? else {
+            // The instance was removed after this entry was enqueued; there is
+            // no adapter to deliver through, so park the message immediately.
             self.store.move_outbox_to_dead_letter(
                 entry.outbox_id,
                 entry.claim_token.as_str(),
@@ -110,6 +135,9 @@ impl ConnectorSupervisor {
             return Ok(DispatchResult::DeadLettered);
         };
 
+        // Transport-level adapter errors are not terminal: treat them as a
+        // transient-network retry so the normal backoff/dead-letter budget
+        // applies instead of failing the whole drain pass.
         let delivery = match adapter.send_outbound(&instance, &entry.payload).await {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -209,6 +237,10 @@ impl ConnectorSupervisor {
                         reason.as_str(),
                     )?;
                 } else {
+                    // INTENTIONAL: a transient retry keeps the connector
+                    // reported Ready/Running — only the failure reason is
+                    // surfaced via last_error so operators see flapping
+                    // deliveries without the connector appearing unhealthy.
                     self.store.set_instance_runtime_state(
                         instance.connector_id.as_str(),
                         ConnectorReadiness::Ready,
@@ -266,6 +298,10 @@ impl ConnectorSupervisor {
         }
     }
 
+    /// Computes the next retry delay: an adapter-requested `retry_after_ms`
+    /// wins over the exponential schedule, but both are clamped to the
+    /// configured min/max bounds. The exponent is capped so the shift cannot
+    /// overflow regardless of the attempt count.
     fn retry_delay_ms(&self, attempts: u32, requested_retry_after_ms: Option<u64>) -> u64 {
         let exponent = attempts.saturating_sub(1).min(10);
         let exponential = self

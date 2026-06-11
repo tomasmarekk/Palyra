@@ -1,3 +1,9 @@
+//! Outbound payload construction for the Discord adapter.
+//!
+//! Builds message JSON and multipart uploads, enforces upload content-type/size policy, and
+//! splits long text into Discord-sized chunks while keeping Markdown code fences balanced so
+//! each chunk renders correctly on its own.
+
 use base64::Engine as _;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -6,6 +12,7 @@ use crate::protocol::{AttachmentKind, AttachmentRef, OutboundMessageRequest};
 
 use super::{DISCORD_MAX_UPLOAD_BYTES, DISCORD_UPLOAD_ALLOWED_CONTENT_TYPES};
 
+/// Percent-encodes a URL path component using the RFC 3986 unreserved set.
 pub(super) fn percent_encode_component(raw: &str) -> String {
     let mut encoded = String::with_capacity(raw.len());
     for byte in raw.bytes() {
@@ -19,6 +26,7 @@ pub(super) fn percent_encode_component(raw: &str) -> String {
     encoded
 }
 
+/// One validated file destined for a multipart upload part.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct DiscordMultipartAttachment {
     pub filename: String,
@@ -26,6 +34,11 @@ pub(super) struct DiscordMultipartAttachment {
     pub bytes: Vec<u8>,
 }
 
+/// Validates and decodes the upload-requested attachments of an outbound request.
+///
+/// # Errors
+/// Returns a user-visible reason string when an attachment is missing required fields, has a
+/// policy-blocked content type, carries invalid base64, or exceeds the upload size cap.
 pub(super) fn collect_discord_upload_files(
     request: &OutboundMessageRequest,
 ) -> Result<Vec<DiscordMultipartAttachment>, String> {
@@ -39,7 +52,7 @@ pub(super) fn collect_discord_upload_files(
         else {
             return Err("discord upload attachment requires content_type".to_owned());
         };
-        if !DISCORD_UPLOAD_ALLOWED_CONTENT_TYPES.iter().any(|allowed| allowed == &content_type) {
+        if !DISCORD_UPLOAD_ALLOWED_CONTENT_TYPES.contains(&content_type) {
             return Err(format!(
                 "discord upload content type '{content_type}' is blocked by policy"
             ));
@@ -70,10 +83,14 @@ pub(super) fn collect_discord_upload_files(
     Ok(files)
 }
 
+/// Builds the JSON body for a message create call (also used as `payload_json` in multipart
+/// uploads).
 pub(super) fn build_discord_message_payload(
     request: &OutboundMessageRequest,
     upload_files: &[DiscordMultipartAttachment],
 ) -> Value {
+    // The deterministic nonce plus enforce_nonce makes Discord itself deduplicate resends of
+    // the same envelope, backstopping the adapter's local idempotency cache.
     let mut payload = json!({
         "content": request.text,
         "nonce": discord_message_nonce(request),
@@ -96,6 +113,8 @@ pub(super) fn build_discord_message_payload(
     if let Some(in_reply_to_message_id) =
         request.in_reply_to_message_id.as_deref().map(str::trim).filter(|value| !value.is_empty())
     {
+        // fail_if_not_exists=false degrades a reply to a plain message when the referenced
+        // message was deleted, instead of failing the whole delivery.
         payload["message_reference"] = json!({
             "message_id": in_reply_to_message_id,
             "fail_if_not_exists": false,
@@ -104,6 +123,8 @@ pub(super) fn build_discord_message_payload(
     payload
 }
 
+/// Derives a stable per-envelope nonce from the request's routing identity (not its text, so
+/// edits to retry payloads still dedupe).
 fn discord_message_nonce(request: &OutboundMessageRequest) -> String {
     stable_fingerprint_hex(
         json!({
@@ -117,6 +138,8 @@ fn discord_message_nonce(request: &OutboundMessageRequest) -> String {
     )
 }
 
+/// Reduces a filename to a safe ASCII subset, falling back to a content-type-derived default
+/// when nothing usable remains.
 fn sanitize_discord_upload_filename(raw: Option<&str>, content_type: &str) -> String {
     let mut sanitized = raw
         .unwrap_or_default()
@@ -141,12 +164,15 @@ fn sanitize_discord_upload_filename(raw: Option<&str>, content_type: &str) -> St
     sanitized
 }
 
+/// Extracts the message id from a message create/edit response body.
 pub(super) fn parse_discord_message_id(raw_body: &str) -> Option<String> {
     serde_json::from_str::<Value>(raw_body)
         .ok()
         .and_then(|payload| payload.get("id").and_then(Value::as_str).map(ToOwned::to_owned))
 }
 
+/// Builds a deterministic stand-in message id when the API response carried none, so the
+/// idempotency cache and receipts still get a stable identifier.
 pub(super) fn fallback_native_message_id(request: &OutboundMessageRequest) -> String {
     let fingerprint = json!({
         "envelope_id": request.envelope_id,
@@ -163,6 +189,7 @@ fn stable_fingerprint_hex(payload: &[u8]) -> String {
     digest[..16].iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// A Markdown code fence opened earlier in the text and not yet closed.
 #[derive(Debug, Clone)]
 pub(super) struct OpenFence {
     pub(super) indent: String,
@@ -171,6 +198,9 @@ pub(super) struct OpenFence {
     pub(super) open_line: String,
 }
 
+/// Splits `text` into chunks within the char and line budgets, closing any open code fence
+/// at each chunk boundary and reopening it in the next chunk so every chunk renders as valid
+/// Markdown on its own.
 pub(super) fn chunk_discord_text(text: &str, max_chars: usize, max_lines: usize) -> Vec<String> {
     let body = text.trim_end_matches('\r');
     if body.trim().is_empty() {
@@ -183,13 +213,12 @@ pub(super) fn chunk_discord_text(text: &str, max_chars: usize, max_lines: usize)
         return vec![body.to_owned()];
     }
 
-    let lines = body.split('\n').collect::<Vec<_>>();
     let mut chunks = Vec::new();
     let mut current = String::new();
     let mut current_lines = 0_usize;
     let mut open_fence: Option<OpenFence> = None;
 
-    for line in lines {
+    for line in body.split('\n') {
         let fence_info = parse_fence_line(line);
         let was_inside_fence = open_fence.is_some();
         let mut next_open_fence = open_fence.clone();
@@ -205,6 +234,8 @@ pub(super) fn chunk_discord_text(text: &str, max_chars: usize, max_lines: usize)
             }
         }
 
+        // Reserve room for the synthetic closing fence line that flush_chunk may append, so
+        // appending it never pushes a chunk over the limits.
         let reserve_chars = next_open_fence
             .as_ref()
             .map(|fence| char_len(close_fence_line(fence).as_str()) + 1)
@@ -252,6 +283,8 @@ pub(super) fn chunk_discord_text(text: &str, max_chars: usize, max_lines: usize)
     chunks
 }
 
+/// Finalizes `current` into `chunks`, closing an open fence in the emitted chunk and
+/// reopening it as the seed of the next chunk.
 fn flush_chunk(
     current: &mut String,
     current_lines: &mut usize,
@@ -273,6 +306,8 @@ fn flush_chunk(
     }
 }
 
+/// Parses a line as a CommonMark fence opener (up to three spaces of indent, then three or
+/// more backticks or tildes).
 pub(super) fn parse_fence_line(line: &str) -> Option<OpenFence> {
     let mut chars = line.chars().peekable();
     let mut indent = String::new();
@@ -353,6 +388,8 @@ fn ensure_balanced_fences(chunk: String) -> String {
     }
 }
 
+/// Splits an over-long line into segments of at most `limit` chars, preferring whitespace
+/// break points outside code fences (`preserve_whitespace` keeps fenced content verbatim).
 fn split_long_line(line: &str, limit: usize, preserve_whitespace: bool) -> Vec<String> {
     let limit = limit.max(1);
     if char_len(line) <= limit {
@@ -399,6 +436,9 @@ fn count_lines(text: &str) -> usize {
 fn char_len(text: &str) -> usize {
     text.chars().count()
 }
+
+/// Appends an attachment-metadata summary block to the outbound text for attachments that
+/// are referenced but not uploaded.
 pub(super) fn with_attachment_context(text: &str, attachments: &[AttachmentRef]) -> String {
     let Some(summary) = render_attachment_context(attachments) else {
         return text.to_owned();

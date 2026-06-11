@@ -1,3 +1,8 @@
+//! Conversion of raw Discord message JSON into connector protocol records.
+//!
+//! Handles both REST responses (message records for read/search/admin flows) and gateway
+//! `MESSAGE_CREATE` dispatches (inbound events), tolerating partially populated payloads.
+
 use serde_json::Value;
 
 use crate::protocol::{
@@ -7,6 +12,8 @@ use crate::protocol::{
 
 use super::{effective_channel_id, gateway::deterministic_inbound_envelope_id, unix_ms_now};
 
+/// Parses one Discord message payload into a [`ConnectorMessageRecord`], returning `None`
+/// when mandatory identity fields (message id, author id) are missing.
 pub(super) fn parse_discord_message_record(
     payload: &Value,
     bot_user_id: &str,
@@ -59,6 +66,7 @@ pub(super) fn parse_discord_message_record(
             .to_owned(),
         created_at_unix_ms: parse_discord_snowflake_unix_ms(message_id).unwrap_or_else(unix_ms_now),
         edited_at_unix_ms: None,
+        // Discord omits guild_id on direct-message payloads.
         is_direct_message: payload.get("guild_id").and_then(Value::as_str).is_none(),
         is_connector_authored: sender_id.eq_ignore_ascii_case(bot_user_id),
         link,
@@ -118,6 +126,11 @@ fn build_discord_message_permalink(
     ))
 }
 
+/// Normalizes a gateway `MESSAGE_CREATE` payload into an [`InboundMessageEvent`].
+///
+/// Returns `None` for payloads that must not enter the inbound pipeline: missing identity
+/// fields, messages authored by the bot itself (prevents echo loops), and messages with
+/// neither body text nor attachments.
 pub(super) fn normalize_discord_message_create(
     connector_id: &str,
     payload: &Value,
@@ -150,6 +163,7 @@ pub(super) fn normalize_discord_message_create(
     if body_text.is_empty() && attachments.is_empty() {
         return None;
     }
+    // Attachment-only messages get a placeholder body so downstream routing always sees text.
     let normalized_body = if body_text.is_empty() { "[attachment]".to_owned() } else { body_text };
     let is_direct_message = payload.get("guild_id").and_then(Value::as_str).is_none();
     let thread_id = parse_discord_thread_id(payload, channel_id);
@@ -173,6 +187,7 @@ pub(super) fn normalize_discord_message_create(
     })
 }
 
+/// Picks the best display name available: guild nickname, then global name, then username.
 fn resolve_discord_sender_display(payload: &Value) -> Option<String> {
     payload
         .get("member")
@@ -201,6 +216,11 @@ fn resolve_discord_sender_display(payload: &Value) -> Option<String> {
         })
 }
 
+/// Infers whether the message lives in a thread.
+///
+/// Discord does not flag thread messages directly: either the payload embeds a `thread`
+/// object, or the message references a parent in a different channel — in both cases the
+/// message's own channel id is the thread id.
 fn parse_discord_thread_id(payload: &Value, channel_id: &str) -> Option<String> {
     if payload.get("thread").and_then(|value| value.get("id")).and_then(Value::as_str).is_some() {
         return Some(channel_id.to_owned());
@@ -219,6 +239,8 @@ fn parse_discord_thread_id(payload: &Value, channel_id: &str) -> Option<String> 
     None
 }
 
+/// Converts Discord attachment entries into [`AttachmentRef`]s, skipping entries with no
+/// usable metadata at all.
 pub(super) fn parse_discord_attachments(raw: Option<&Value>) -> Vec<AttachmentRef> {
     let Some(entries) = raw.and_then(Value::as_array) else {
         return Vec::new();
@@ -252,6 +274,8 @@ pub(super) fn parse_discord_attachments(raw: Option<&Value>) -> Vec<AttachmentRe
             let filename_lower = filename.as_deref().map(|value| value.to_ascii_lowercase());
             let content_type_lower =
                 content_type.as_deref().map(|value| value.to_ascii_lowercase());
+            // SVG is deliberately classified as a plain file, not an image: it can embed
+            // scripts, so it must not enter image-rendering paths downstream.
             let is_svg = content_type_lower.as_deref() == Some("image/svg+xml")
                 || filename_lower.as_deref().is_some_and(|value| value.ends_with(".svg"));
             let is_image_like = content_type_lower
@@ -288,6 +312,10 @@ pub(super) fn parse_discord_attachments(raw: Option<&Value>) -> Vec<AttachmentRe
         .collect()
 }
 
+/// Extracts the creation time embedded in a Discord snowflake id.
+///
+/// The top 42 bits of a snowflake are milliseconds since the Discord epoch
+/// (2015-01-01T00:00:00Z).
 fn parse_discord_snowflake_unix_ms(raw: &str) -> Option<i64> {
     let parsed = raw.trim().parse::<u64>().ok()?;
     let discord_epoch_ms = 1_420_070_400_000_u64;

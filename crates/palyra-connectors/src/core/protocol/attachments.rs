@@ -1,3 +1,10 @@
+//! Attachment references and A2UI update payloads carried by connector
+//! messages.
+//!
+//! Attachments are references (URL, artifact ref, or inline base64), never raw
+//! media bytes; per-field size limits are enforced by `validate` before any
+//! payload is persisted or handed to an adapter.
+
 use serde::{Deserialize, Serialize};
 
 use super::validation::{
@@ -8,6 +15,7 @@ use super::validation::{
     MAX_ATTACHMENT_POLICY_CONTEXT_BYTES, MAX_ATTACHMENT_REF_BYTES,
 };
 
+/// Broad attachment classification used for rendering and policy decisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AttachmentKind {
@@ -16,6 +24,10 @@ pub enum AttachmentKind {
     File,
 }
 
+/// Reference to one attachment on an inbound or outbound message.
+///
+/// All fields are optional on the wire; which locator (`url`, `artifact_ref`,
+/// or `inline_base64`) is populated depends on the direction and provider.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct AttachmentRef {
     #[serde(default)]
@@ -38,6 +50,8 @@ pub struct AttachmentRef {
     pub origin: Option<String>,
     #[serde(default)]
     pub policy_context: Option<String>,
+    /// When set, the adapter must upload the media itself; `inline_base64`
+    /// is then required to carry the bytes.
     #[serde(default)]
     pub upload_requested: bool,
     #[serde(default)]
@@ -108,6 +122,7 @@ impl AttachmentRef {
     }
 }
 
+/// Validates attachment count and every attachment's per-field limits.
 pub(super) fn validate_attachments(attachments: &[AttachmentRef]) -> Result<(), ProtocolError> {
     if attachments.len() > MAX_ATTACHMENTS_PER_MESSAGE {
         return Err(ProtocolError::InvalidField {
@@ -121,11 +136,14 @@ pub(super) fn validate_attachments(attachments: &[AttachmentRef]) -> Result<(), 
     Ok(())
 }
 
+/// Alias kept so outbound call sites read naturally; the wire shape is identical.
 pub type OutboundAttachment = AttachmentRef;
 
+/// A2UI surface patch attached to an outbound message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutboundA2uiUpdate {
     pub surface: String,
+    /// JSON patch document as raw bytes; validated for well-formedness and size.
     #[serde(default)]
     pub patch_json: Vec<u8>,
 }

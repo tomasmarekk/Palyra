@@ -1,3 +1,10 @@
+//! Sqlite-backed durable state for connectors: instances, inbound dedupe,
+//! outbox, dead letters, queue pause state, and operational events.
+//!
+//! [`ConnectorStore`] serializes all access through one mutex-guarded
+//! connection; the outbox uses claim-token leases so concurrent drains never
+//! deliver the same entry twice. Per-table operations live in sibling modules.
+
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -26,12 +33,14 @@ pub use records::{
     OutboxEnqueueOutcome, OutboxEntryRecord,
 };
 
+/// Handle to the connector sqlite database; cheap to share behind an `Arc`.
 #[derive(Debug)]
 pub struct ConnectorStore {
     db_path: PathBuf,
     connection: Mutex<Connection>,
 }
 
+/// Failure modes of connector storage operations.
 #[derive(Debug, Error)]
 pub enum ConnectorStoreError {
     #[error("sqlite operation failed: {0}")]
@@ -56,14 +65,23 @@ pub enum ConnectorStoreError {
     DeadLetterNotFound(i64),
 }
 
+/// How long a claimed outbox entry stays invisible to other drains before the
+/// claim is considered abandoned and the entry becomes reclaimable.
 pub(super) const OUTBOX_CLAIM_LEASE_MS: i64 = 60_000;
 static OUTBOX_CLAIM_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 impl ConnectorStore {
+    /// Opens (creating if necessary) the database at `path` and applies the schema.
+    ///
+    /// # Errors
+    /// Returns [`ConnectorStoreError::Sqlite`] when the parent directory cannot
+    /// be created, the database cannot be opened, or schema setup fails.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ConnectorStoreError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
+                // Boxed into rusqlite's catch-all variant so directory-creation
+                // failures flow through the single Sqlite error path.
                 fs::create_dir_all(parent)
                     .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
             }
@@ -75,11 +93,13 @@ impl ConnectorStore {
         Ok(store)
     }
 
+    /// Returns the path of the backing sqlite database file.
     #[must_use]
     pub fn db_path(&self) -> &Path {
         self.db_path.as_path()
     }
 
+    /// Runs `callback` inside one transaction, committing only on `Ok`.
     fn with_transaction<T, F>(&self, callback: F) -> Result<T, ConnectorStoreError>
     where
         F: FnOnce(&Transaction<'_>) -> Result<T, ConnectorStoreError>,
@@ -93,6 +113,8 @@ impl ConnectorStore {
     }
 }
 
+/// Returns a claim token unique within this process; the timestamp prefix
+/// keeps tokens from distinct runs distinguishable in stored rows.
 pub(super) fn next_outbox_claim_token(now_unix_ms: i64) -> String {
     let sequence = OUTBOX_CLAIM_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     format!("claim-{now_unix_ms}-{sequence}")

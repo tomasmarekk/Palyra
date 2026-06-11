@@ -1,7 +1,14 @@
+//! Closed enumerations describing connector identity and health.
+//!
+//! The snake_case labels produced by `as_str`/`parse` are persisted in sqlite
+//! and exposed over console APIs, so they must stay stable; `parse` accepts
+//! the same labels case-insensitively.
+
 use std::fmt::{Display, Formatter};
 
 use serde::{Deserialize, Serialize};
 
+/// Supported connector provider families.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectorKind {
@@ -12,6 +19,7 @@ pub enum ConnectorKind {
 }
 
 impl ConnectorKind {
+    /// Returns the stable snake_case label matching the serde encoding.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -22,6 +30,7 @@ impl ConnectorKind {
         }
     }
 
+    /// Parses a stored label back into the enum; `None` for unknown values.
     #[must_use]
     pub fn parse(input: &str) -> Option<Self> {
         match input.trim().to_ascii_lowercase().as_str() {
@@ -40,6 +49,7 @@ impl Display for ConnectorKind {
     }
 }
 
+/// Product-level support tier of a connector kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectorAvailability {
@@ -49,6 +59,7 @@ pub enum ConnectorAvailability {
 }
 
 impl ConnectorAvailability {
+    /// Returns the stable snake_case label matching the serde encoding.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -58,6 +69,7 @@ impl ConnectorAvailability {
         }
     }
 
+    /// Parses a stored label back into the enum; `None` for unknown values.
     #[must_use]
     pub fn parse(input: &str) -> Option<Self> {
         match input.trim().to_ascii_lowercase().as_str() {
@@ -75,6 +87,7 @@ impl Display for ConnectorAvailability {
     }
 }
 
+/// Whether a connector instance is configured well enough to deliver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectorReadiness {
@@ -85,6 +98,7 @@ pub enum ConnectorReadiness {
 }
 
 impl ConnectorReadiness {
+    /// Returns the stable snake_case label matching the serde encoding.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -95,6 +109,7 @@ impl ConnectorReadiness {
         }
     }
 
+    /// Parses a stored label back into the enum; `None` for unknown values.
     #[must_use]
     pub fn parse(input: &str) -> Option<Self> {
         match input.trim().to_ascii_lowercase().as_str() {
@@ -107,6 +122,7 @@ impl ConnectorReadiness {
     }
 }
 
+/// Runtime lifecycle state of a connector instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectorLiveness {
@@ -117,6 +133,7 @@ pub enum ConnectorLiveness {
 }
 
 impl ConnectorLiveness {
+    /// Returns the stable snake_case label matching the serde encoding.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -127,6 +144,7 @@ impl ConnectorLiveness {
         }
     }
 
+    /// Parses a stored label back into the enum; `None` for unknown values.
     #[must_use]
     pub fn parse(input: &str) -> Option<Self> {
         match input.trim().to_ascii_lowercase().as_str() {

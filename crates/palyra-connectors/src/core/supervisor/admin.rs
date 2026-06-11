@@ -1,3 +1,10 @@
+//! Operator-facing supervisor surface: connector registration and lifecycle,
+//! status/runtime snapshots, message read/search/mutation passthrough, queue
+//! pause control, and dead-letter administration.
+//!
+//! Every operation here records an audit event in the connector event log;
+//! message operations additionally validate adapter results before returning.
+
 use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
@@ -19,6 +26,10 @@ use super::metrics::build_saturation_snapshot;
 use super::{unix_ms_now, ConnectorAdapter, ConnectorSupervisor, ConnectorSupervisorError};
 
 impl ConnectorSupervisor {
+    /// Registers (or re-registers) a connector instance and records the event.
+    ///
+    /// # Errors
+    /// Returns a store error when the spec is invalid or persistence fails.
     pub fn register_connector(
         &self,
         spec: &ConnectorInstanceSpec,
@@ -41,6 +52,12 @@ impl ConnectorSupervisor {
         Ok(())
     }
 
+    /// Enables or disables a connector, stopping its adapter runtime first
+    /// when disabling, and returns the resulting status.
+    ///
+    /// # Errors
+    /// Returns [`ConnectorSupervisorError::NotFound`] for unknown ids, and
+    /// adapter/store errors when runtime shutdown or persistence fails.
     pub fn set_enabled(
         &self,
         connector_id: &str,
@@ -65,6 +82,11 @@ impl ConnectorSupervisor {
         self.status(connector_id)
     }
 
+    /// Stops the adapter runtime and deletes the instance with its queue rows.
+    ///
+    /// # Errors
+    /// Returns [`ConnectorSupervisorError::NotFound`] for unknown ids, and
+    /// adapter/store errors when shutdown or deletion fails.
     pub fn remove_connector(&self, connector_id: &str) -> Result<(), ConnectorSupervisorError> {
         let Some(instance) = self.store.get_instance(connector_id)? else {
             return Err(ConnectorSupervisorError::NotFound(connector_id.to_owned()));
@@ -74,6 +96,11 @@ impl ConnectorSupervisor {
         Ok(())
     }
 
+    /// Returns the status snapshot for one connector.
+    ///
+    /// # Errors
+    /// Returns [`ConnectorSupervisorError::NotFound`] for unknown ids and a
+    /// store error when reads fail.
     pub fn status(
         &self,
         connector_id: &str,
@@ -81,7 +108,27 @@ impl ConnectorSupervisor {
         let Some(instance) = self.store.get_instance(connector_id)? else {
             return Err(ConnectorSupervisorError::NotFound(connector_id.to_owned()));
         };
-        let queue_depth = self.store.queue_depth(connector_id)?;
+        self.status_snapshot_for(instance)
+    }
+
+    /// Returns status snapshots for all registered connectors.
+    ///
+    /// # Errors
+    /// Returns a store error when reads fail.
+    pub fn list_status(&self) -> Result<Vec<ConnectorStatusSnapshot>, ConnectorSupervisorError> {
+        let instances = self.store.list_instances()?;
+        let mut snapshots = Vec::with_capacity(instances.len());
+        for instance in instances {
+            snapshots.push(self.status_snapshot_for(instance)?);
+        }
+        Ok(snapshots)
+    }
+
+    fn status_snapshot_for(
+        &self,
+        instance: ConnectorInstanceRecord,
+    ) -> Result<ConnectorStatusSnapshot, ConnectorSupervisorError> {
+        let queue_depth = self.store.queue_depth(instance.connector_id.as_str())?;
         Ok(ConnectorStatusSnapshot {
             connector_id: instance.connector_id,
             kind: instance.kind,
@@ -100,31 +147,12 @@ impl ConnectorSupervisor {
         })
     }
 
-    pub fn list_status(&self) -> Result<Vec<ConnectorStatusSnapshot>, ConnectorSupervisorError> {
-        let instances = self.store.list_instances()?;
-        let mut snapshots = Vec::with_capacity(instances.len());
-        for instance in instances {
-            let queue_depth = self.store.queue_depth(instance.connector_id.as_str())?;
-            snapshots.push(ConnectorStatusSnapshot {
-                connector_id: instance.connector_id,
-                kind: instance.kind,
-                availability: self.connector_availability(instance.kind),
-                capabilities: self.connector_capabilities(instance.kind),
-                principal: instance.principal,
-                enabled: instance.enabled,
-                readiness: instance.readiness,
-                liveness: instance.liveness,
-                restart_count: instance.restart_count,
-                queue_depth,
-                last_error: instance.last_error,
-                last_inbound_unix_ms: instance.last_inbound_unix_ms,
-                last_outbound_unix_ms: instance.last_outbound_unix_ms,
-                updated_at_unix_ms: instance.updated_at_unix_ms,
-            });
-        }
-        Ok(snapshots)
-    }
-
+    /// Builds the runtime JSON snapshot: adapter state (when provided) merged
+    /// with queue, metrics, and saturation views.
+    ///
+    /// # Errors
+    /// Returns [`ConnectorSupervisorError::NotFound`] for unknown ids and a
+    /// store error when reads fail.
     pub fn runtime_snapshot(
         &self,
         connector_id: &str,
@@ -155,6 +183,11 @@ impl ConnectorSupervisor {
         Ok(Some(runtime))
     }
 
+    /// Reads messages through the connector's adapter, validating the request
+    /// and result and recording an audit event.
+    ///
+    /// # Errors
+    /// Returns validation, not-found, missing-adapter, or adapter errors.
     pub async fn read_messages(
         &self,
         connector_id: &str,
@@ -192,6 +225,11 @@ impl ConnectorSupervisor {
         Ok(result)
     }
 
+    /// Searches messages through the connector's adapter, validating the
+    /// request and result and recording an audit event.
+    ///
+    /// # Errors
+    /// Returns validation, not-found, missing-adapter, or adapter errors.
     pub async fn search_messages(
         &self,
         connector_id: &str,
@@ -230,6 +268,11 @@ impl ConnectorSupervisor {
         Ok(result)
     }
 
+    /// Edits a message through the connector's adapter, validating the
+    /// request and result and recording an audit event.
+    ///
+    /// # Errors
+    /// Returns validation, not-found, missing-adapter, or adapter errors.
     pub async fn edit_message(
         &self,
         connector_id: &str,
@@ -251,6 +294,11 @@ impl ConnectorSupervisor {
         Ok(result)
     }
 
+    /// Deletes a message through the connector's adapter, validating the
+    /// request and result and recording an audit event.
+    ///
+    /// # Errors
+    /// Returns validation, not-found, missing-adapter, or adapter errors.
     pub async fn delete_message(
         &self,
         connector_id: &str,
@@ -272,6 +320,11 @@ impl ConnectorSupervisor {
         Ok(result)
     }
 
+    /// Adds a reaction through the connector's adapter, validating the
+    /// request and result and recording an audit event.
+    ///
+    /// # Errors
+    /// Returns validation, not-found, missing-adapter, or adapter errors.
     pub async fn add_reaction(
         &self,
         connector_id: &str,
@@ -293,6 +346,11 @@ impl ConnectorSupervisor {
         Ok(result)
     }
 
+    /// Removes a reaction through the connector's adapter, validating the
+    /// request and result and recording an audit event.
+    ///
+    /// # Errors
+    /// Returns validation, not-found, missing-adapter, or adapter errors.
     pub async fn remove_reaction(
         &self,
         connector_id: &str,
@@ -314,6 +372,10 @@ impl ConnectorSupervisor {
         Ok(result)
     }
 
+    /// Lists up to `limit` connector log events, newest first.
+    ///
+    /// # Errors
+    /// Returns a store error when the read fails.
     pub fn list_logs(
         &self,
         connector_id: &str,
@@ -322,6 +384,10 @@ impl ConnectorSupervisor {
         self.store.list_events(connector_id, limit).map_err(ConnectorSupervisorError::from)
     }
 
+    /// Lists up to `limit` dead letters, newest first.
+    ///
+    /// # Errors
+    /// Returns a store error when the read fails.
     pub fn list_dead_letters(
         &self,
         connector_id: &str,
@@ -330,6 +396,10 @@ impl ConnectorSupervisor {
         self.store.list_dead_letters(connector_id, limit).map_err(ConnectorSupervisorError::from)
     }
 
+    /// Returns the full queue snapshot evaluated at the current time.
+    ///
+    /// # Errors
+    /// Returns clock or store errors when the snapshot cannot be built.
     pub fn queue_snapshot(
         &self,
         connector_id: &str,
@@ -338,6 +408,12 @@ impl ConnectorSupervisor {
         self.store.queue_snapshot(connector_id, now).map_err(ConnectorSupervisorError::from)
     }
 
+    /// Pauses or resumes the connector's outbox, records the event, and
+    /// returns the updated queue snapshot.
+    ///
+    /// # Errors
+    /// Returns [`ConnectorSupervisorError::NotFound`] for unknown ids and a
+    /// store error when persistence fails.
     pub fn set_queue_paused(
         &self,
         connector_id: &str,
@@ -360,6 +436,11 @@ impl ConnectorSupervisor {
         self.queue_snapshot(connector_id)
     }
 
+    /// Replays one dead letter into the outbox with a fresh retry budget and
+    /// records the event.
+    ///
+    /// # Errors
+    /// Returns a store error when the dead letter is missing or replay fails.
     pub fn replay_dead_letter(
         &self,
         connector_id: &str,
@@ -386,6 +467,10 @@ impl ConnectorSupervisor {
         Ok(replayed)
     }
 
+    /// Discards one dead letter permanently and records the event.
+    ///
+    /// # Errors
+    /// Returns a store error when the dead letter is missing or deletion fails.
     pub fn discard_dead_letter(
         &self,
         connector_id: &str,
@@ -407,6 +492,8 @@ impl ConnectorSupervisor {
         Ok(discarded)
     }
 
+    // Status remains reportable for kinds without a registered adapter by
+    // falling back to the static provider registry.
     fn connector_availability(&self, kind: ConnectorKind) -> ConnectorAvailability {
         self.adapters
             .get(&kind)

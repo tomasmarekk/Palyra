@@ -1,3 +1,6 @@
+//! Unit tests for `ConnectorSupervisor`: inbound ingestion and dedupe, outbox
+//! draining, retry/dead-letter rules, and admin operations via stub adapters.
+
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},

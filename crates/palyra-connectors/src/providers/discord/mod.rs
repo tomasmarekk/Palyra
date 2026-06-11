@@ -62,6 +62,7 @@ pub use permissions::{
     DISCORD_PERMISSION_VIEW_CHANNEL,
 };
 
+/// Registry hook publishing the Discord provider's runtime metadata.
 pub(crate) fn provider_descriptor() -> ConnectorProviderDescriptor {
     ConnectorProviderDescriptor {
         kind: ConnectorKind::Discord,

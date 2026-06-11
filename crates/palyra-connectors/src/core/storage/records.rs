@@ -1,3 +1,8 @@
+//! Typed row representations of connector storage tables and their parsers.
+//!
+//! The `parse_*_row` helpers expect column order to match the SELECT lists in
+//! the sibling query modules; keep both sides in sync when columns change.
+
 use rusqlite::Row;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -8,6 +13,7 @@ use super::super::protocol::{
 };
 use super::ConnectorStoreError;
 
+/// Persisted state of one connector instance (spec plus runtime bookkeeping).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectorInstanceRecord {
     pub connector_id: String,
@@ -27,11 +33,14 @@ pub struct ConnectorInstanceRecord {
     pub updated_at_unix_ms: i64,
 }
 
+/// One claimed outbox entry handed to the supervisor for delivery.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutboxEntryRecord {
     pub outbox_id: i64,
     pub connector_id: String,
     pub envelope_id: String,
+    /// Lease token proving claim ownership; every status mutation must present
+    /// it so an expired-and-reclaimed entry cannot be completed twice.
     pub claim_token: String,
     pub payload: OutboundMessageRequest,
     pub attempts: u32,
@@ -41,21 +50,26 @@ pub struct OutboxEntryRecord {
     pub updated_at_unix_ms: i64,
 }
 
+/// Whether an enqueue inserted a new entry (`false` means the envelope was
+/// already present and the call was an idempotent no-op).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutboxEnqueueOutcome {
     pub created: bool,
 }
 
+/// Outbound message parked after permanent failure or retry exhaustion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeadLetterRecord {
     pub dead_letter_id: i64,
     pub connector_id: String,
     pub envelope_id: String,
     pub reason: String,
+    /// Original outbox payload preserved verbatim for replay.
     pub payload: Value,
     pub created_at_unix_ms: i64,
 }
 
+/// Aggregated queue counters and pause state for one connector.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectorQueueSnapshot {
     pub pending_outbox: u64,
@@ -70,6 +84,7 @@ pub struct ConnectorQueueSnapshot {
     pub pause_updated_at_unix_ms: Option<i64>,
 }
 
+/// Operational event row used for connector logs and derived metrics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectorEventRecord {
     pub event_id: i64,
@@ -166,7 +181,6 @@ pub(super) fn parse_event_row(row: &Row<'_>) -> Result<ConnectorEventRecord, Con
     })
 }
 
-#[allow(dead_code)]
 pub(super) fn to_queue_depth(snapshot: &ConnectorQueueSnapshot) -> ConnectorQueueDepth {
     ConnectorQueueDepth {
         pending_outbox: snapshot.pending_outbox,

@@ -1,3 +1,9 @@
+//! HTTP transport layer and credential resolution for the Discord adapter.
+//!
+//! Defines the [`DiscordTransport`] seam the adapter calls (faked in tests, reqwest-backed in
+//! production), URL builders for the REST routes in use, rate-limit header parsing, and
+//! environment-based bot-token resolution.
+
 use std::{collections::HashMap, env, time::Duration};
 
 use async_trait::async_trait;
@@ -27,6 +33,10 @@ fn sanitize_env_suffix(raw: &str) -> String {
         .collect()
 }
 
+/// Returns the last four characters of the token for runtime diagnostics.
+///
+/// Only this suffix is ever surfaced (runtime snapshots, console); the full token must never
+/// leave the credential resolver.
 pub(super) fn token_suffix(token: &str) -> Option<String> {
     let trimmed = token.trim();
     if trimmed.is_empty() {
@@ -39,6 +49,12 @@ pub(super) fn token_suffix(token: &str) -> Option<String> {
     Some(chars[chars.len().saturating_sub(4)..].iter().collect())
 }
 
+/// Adapter-level wrapper around [`super::super::normalize_discord_target`] that rewrites the
+/// semantic error into the adapter's outbound-facing wording.
+///
+/// # Errors
+/// Returns [`ConnectorAdapterError::Backend`] when the target is blank or contains
+/// unsupported characters.
 pub(super) fn normalize_discord_target(raw: &str) -> Result<String, ConnectorAdapterError> {
     super::super::normalize_discord_target(raw).map_err(|error| {
         let message = match error {
@@ -117,6 +133,10 @@ pub(super) fn build_reaction_url(
     })
 }
 
+/// Extracts Discord's rate-limit signals from response headers and body.
+///
+/// The body `retry_after` wins over the `retry-after` header because Discord reports
+/// sub-second precision only in the body; the global flag may arrive via either channel.
 pub(super) fn parse_rate_limit_snapshot(response: &DiscordTransportResponse) -> RateLimitSnapshot {
     let retry_after_ms_from_body = parse_retry_after_ms_from_body(response.body.as_str());
     let retry_after_ms_from_header =
@@ -164,7 +184,7 @@ fn parse_retry_after_ms_from_body(raw_body: &str) -> Option<u64> {
 }
 
 fn parse_global_flag_from_body(raw_body: &str) -> (bool, Option<String>) {
-    let Some(payload) = serde_json::from_str::<Value>(raw_body).ok() else {
+    let Ok(payload) = serde_json::from_str::<Value>(raw_body) else {
         return (false, None);
     };
     let global = payload.get("global").and_then(Value::as_bool).unwrap_or(false);
@@ -185,9 +205,12 @@ fn seconds_to_ms(seconds: f64) -> Option<u64> {
     if !millis.is_finite() || millis < 0.0 {
         return None;
     }
+    // Float-to-int `as` saturates; after the finite/non-negative checks above the only edge
+    // left is an absurdly large wait, which clamping to u64::MAX handles correctly.
     Some(millis as u64)
 }
 
+/// Summarizes a Discord error response body into a single redacted line for diagnostics.
 pub(super) fn parse_discord_error_summary(raw_body: &str) -> Option<String> {
     let trimmed = raw_body.trim();
     if trimmed.is_empty() {
@@ -232,20 +255,34 @@ async fn response_to_transport(
     Ok(DiscordTransportResponse { status, headers, body })
 }
 
+/// Resolved bot credential plus a non-sensitive label describing where it came from.
 #[derive(Debug, Clone)]
 pub struct DiscordCredential {
+    /// The bot token; must never be logged or surfaced beyond the transport layer.
     pub token: String,
+    /// Diagnostic label of the resolution source (e.g. vault reference or env variable).
     pub source: String,
 }
 
+/// Resolves the bot credential for a Discord connector instance.
 #[async_trait]
 pub trait DiscordCredentialResolver: Send + Sync {
+    /// Resolves the credential for `instance`.
+    ///
+    /// # Errors
+    /// Returns [`ConnectorAdapterError::Backend`] when no usable credential can be found;
+    /// the message must already be redaction-safe.
     async fn resolve_credential(
         &self,
         instance: &ConnectorInstanceRecord,
     ) -> Result<DiscordCredential, ConnectorAdapterError>;
 }
 
+/// Default resolver reading bot tokens from `PALYRA_DISCORD_TOKEN*` environment variables.
+///
+/// Resolution order: vault-reference-specific variable, then account-specific variable, then
+/// the global `PALYRA_DISCORD_TOKEN` — most specific wins so multi-account setups can
+/// override the shared default.
 #[derive(Debug, Default)]
 pub struct EnvDiscordCredentialResolver;
 
@@ -298,12 +335,18 @@ impl DiscordCredentialResolver for EnvDiscordCredentialResolver {
         )))
     }
 }
+
+/// Raw HTTP response surface the adapter needs: status, lowercased headers, and body text.
 pub(super) struct DiscordTransportResponse {
     pub status: u16,
     pub headers: HashMap<String, String>,
     pub body: String,
 }
 
+/// HTTP verbs the adapter issues against the Discord REST API.
+///
+/// Implementations return `Ok` for any HTTP status; `Err` is reserved for transport-level
+/// failures (connect, timeout, body read), which callers classify as transient.
 #[async_trait]
 pub(super) trait DiscordTransport: Send + Sync {
     async fn get(
@@ -353,6 +396,7 @@ pub(super) trait DiscordTransport: Send + Sync {
     ) -> Result<DiscordTransportResponse, ConnectorAdapterError>;
 }
 
+/// Production transport backed by a shared reqwest client.
 #[derive(Clone)]
 pub struct ReqwestDiscordTransport {
     client: Client,
@@ -360,6 +404,8 @@ pub struct ReqwestDiscordTransport {
 
 impl Default for ReqwestDiscordTransport {
     fn default() -> Self {
+        // Redirects are disabled so a redirecting response can never re-route a request
+        // (with its bot token) outside the egress-validated target.
         let client = Client::builder()
             .redirect(Policy::none())
             .build()

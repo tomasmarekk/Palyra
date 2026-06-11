@@ -1,3 +1,9 @@
+//! Discord message administration: read, search, edit, delete, and reaction flows.
+//!
+//! Every operation runs a permission preflight against the target channel first; denied or
+//! unavailable targets produce structured denied results rather than errors, and 404/401/403
+//! responses are mapped to "missing/no access" outcomes so callers can report them safely.
+
 use palyra_common::redaction::redact_auth_error;
 use reqwest::Url;
 use serde_json::Value;
@@ -25,6 +31,8 @@ use super::{
     unix_ms_now, DiscordConnectorAdapter,
 };
 
+/// Resolves the channel id REST calls must address: the thread id when present (threads are
+/// channels in Discord's API), otherwise the conversation id.
 pub(super) fn effective_channel_id(target: &ConnectorConversationTarget) -> String {
     target
         .thread_id
@@ -35,6 +43,8 @@ pub(super) fn effective_channel_id(target: &ConnectorConversationTarget) -> Stri
         .to_owned()
 }
 
+// Discord serializes the permissions bitfield as a decimal string (it exceeds the safe JSON
+// integer range), but tolerate a plain number too.
 fn parse_discord_permissions_mask(payload: &Value) -> Option<u64> {
     payload.get("permissions").and_then(|value| {
         value.as_str().and_then(|raw| raw.trim().parse::<u64>().ok()).or_else(|| value.as_u64())
@@ -66,6 +76,7 @@ fn operation_name(operation: DiscordMessageOperation) -> &'static str {
     }
 }
 
+/// Builds a denied preflight verdict for `operation` with the given reason.
 pub(super) fn denied_operation_preflight(
     operation: DiscordMessageOperation,
     reason: String,
@@ -73,6 +84,7 @@ pub(super) fn denied_operation_preflight(
     permissions::discord_operation_preflight(operation, false, Some(reason), None, None)
 }
 
+/// Builds a denied mutation result carrying the preflight verdict and reason.
 pub(super) fn denied_mutation_result(
     operation: DiscordMessageOperation,
     locator: ConnectorMessageLocator,
@@ -88,6 +100,8 @@ pub(super) fn denied_mutation_result(
     }
 }
 
+/// Applies the client-side search filters (Discord has no message-search REST endpoint for
+/// bots, so pages are fetched and filtered locally). Absent filters always match.
 pub(super) fn search_message_matches(
     message: &ConnectorMessageRecord,
     request: &ConnectorMessageSearchRequest,
@@ -102,11 +116,14 @@ pub(super) fn search_message_matches(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .is_none_or(|author_id| message.sender_id.eq_ignore_ascii_case(author_id));
+    // `required != is_empty()`: has_attachments=true matches non-empty attachment lists,
+    // has_attachments=false matches empty ones.
     let attachment_match =
         request.has_attachments.is_none_or(|required| required != message.attachments.is_empty());
     query_match && author_match && attachment_match
 }
 
+/// Parameters for one message-history page fetch.
 pub(super) struct DiscordMessagePageRequest<'a> {
     pub(super) channel_id: &'a str,
     pub(super) before_message_id: Option<&'a str>,
@@ -116,6 +133,8 @@ pub(super) struct DiscordMessagePageRequest<'a> {
     pub(super) operation: DiscordMessageOperation,
 }
 
+/// Interprets a mutation response: `Ok(None)` for missing/no-access statuses (the caller
+/// reports a denied result), the parsed message record on success, `Err` otherwise.
 pub(super) fn handle_mutation_message_response(
     context: &DiscordAdminContext,
     operation: DiscordMessageOperation,
@@ -142,6 +161,8 @@ pub(super) fn handle_mutation_message_response(
     Ok(parse_discord_message_record(&payload, context.bot_identity.id.as_str(), &locator.target))
 }
 
+/// Prepared per-operation context: resolved credential, egress guard, bot identity, the
+/// effective target channel, and the permission-preflight verdict.
 pub(super) struct DiscordAdminContext {
     pub(super) operation: DiscordMessageOperation,
     pub(super) credential: DiscordCredential,
@@ -153,6 +174,7 @@ pub(super) struct DiscordAdminContext {
 }
 
 impl DiscordAdminContext {
+    /// Materializes the preflight verdict for inclusion in operation results.
     pub(super) fn preflight(&self) -> crate::protocol::ConnectorOperationPreflight {
         permissions::discord_operation_preflight(
             self.operation,
@@ -165,6 +187,11 @@ impl DiscordAdminContext {
 }
 
 impl DiscordConnectorAdapter {
+    /// Resolves credential, identity, and channel permissions for an admin operation.
+    ///
+    /// Returns `Ok(None)` when the target channel does not exist (404); otherwise a context
+    /// whose `preflight_allowed`/`preflight_reason` carry the permission verdict — including
+    /// denied contexts for unresolved identity or access failures.
     pub(super) async fn prepare_admin_context(
         &self,
         instance: &ConnectorInstanceRecord,
@@ -180,6 +207,8 @@ impl DiscordConnectorAdapter {
         self.validate_url_target(&guard, &self.config.api_base_url)?;
 
         let Some(bot_identity) = self.resolve_bot_identity(&guard, &credential).await? else {
+            // Identity could not be resolved: return a denied context with placeholder
+            // identity so callers still get a structured preflight verdict to report.
             return Ok(Some(DiscordAdminContext {
                 operation,
                 credential,
@@ -277,6 +306,7 @@ impl DiscordConnectorAdapter {
         }))
     }
 
+    /// Fetches one message by id; `Ok(None)` covers both deleted messages and access loss.
     pub(super) async fn fetch_single_message(
         &self,
         context: &DiscordAdminContext,
@@ -324,6 +354,8 @@ impl DiscordConnectorAdapter {
         Ok(parse_discord_message_record(&payload, context.bot_identity.id.as_str(), target))
     }
 
+    /// Fetches one page of channel history, newest first, honoring the before/after/around
+    /// cursors and Discord's 1..=100 page-size bounds.
     pub(super) async fn fetch_message_page(
         &self,
         context: &DiscordAdminContext,
@@ -388,6 +420,7 @@ impl DiscordConnectorAdapter {
             .collect())
     }
 
+    /// Issues a guarded PATCH and folds the response's rate-limit signals into `route_key`.
     pub(super) async fn patch_discord_json(
         &self,
         context: &DiscordAdminContext,
@@ -413,13 +446,15 @@ impl DiscordConnectorAdapter {
         Ok(response)
     }
 
+    /// Issues a guarded DELETE; returns `false` for missing/no-access statuses, `true` on
+    /// success.
     pub(super) async fn delete_discord_request(
         &self,
         context: &DiscordAdminContext,
         route_key: &str,
         url: &Url,
         operation: DiscordMessageOperation,
-        locator: &ConnectorMessageLocator,
+        _locator: &ConnectorMessageLocator,
     ) -> Result<bool, ConnectorAdapterError> {
         self.validate_url_target(&context.guard, url)?;
         let response = self
@@ -446,10 +481,10 @@ impl DiscordConnectorAdapter {
                     .unwrap_or_else(|| "unexpected response".to_owned())
             )));
         }
-        let _ = locator;
         Ok(true)
     }
 
+    /// Shared implementation for adding and removing the bot's reaction on a message.
     pub(super) async fn apply_reaction_mutation(
         &self,
         instance: &ConnectorInstanceRecord,
@@ -558,6 +593,8 @@ impl DiscordConnectorAdapter {
                     .unwrap_or_else(|| "unexpected response".to_owned())
             )));
         }
+        // Re-fetch to reflect the updated reaction set; fall back to the pre-mutation record
+        // if the message vanished between the mutation and the re-read.
         let message = self
             .fetch_single_message(
                 &context,

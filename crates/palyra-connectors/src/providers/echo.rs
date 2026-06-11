@@ -1,3 +1,9 @@
+//! Internal-test-only echo connector used by deterministic suites and the simulator harness.
+//!
+//! Delivers outbound messages in-memory with per-envelope idempotency and can simulate a
+//! one-time connector restart via an in-band text marker, so supervisor retry paths stay
+//! testable without a live provider.
+
 use std::{
     collections::{HashMap, HashSet},
     sync::Mutex,
@@ -19,8 +25,13 @@ use crate::{
 
 use super::ConnectorProviderDescriptor;
 
+/// In-band marker that makes the adapter report a simulated restart on first delivery.
 const CRASH_ONCE_MARKER: &str = "[connector-crash-once]";
 
+/// In-memory echo adapter for internal diagnostics and deterministic tests.
+///
+/// Repeated sends of the same envelope return the originally assigned native message id, so
+/// callers can exercise outbox idempotency without external state.
 #[derive(Debug, Default)]
 pub struct EchoConnectorAdapter {
     delivered_native_ids: Mutex<HashMap<String, String>>,
@@ -28,12 +39,14 @@ pub struct EchoConnectorAdapter {
 }
 
 impl EchoConnectorAdapter {
+    /// Returns the number of distinct envelopes delivered so far.
     #[must_use]
     pub fn delivery_count(&self) -> usize {
         self.delivered_native_ids.lock().map(|guard| guard.len()).unwrap_or_default()
     }
 }
 
+/// Registry hook publishing the echo provider's runtime metadata.
 pub(crate) fn provider_descriptor() -> ConnectorProviderDescriptor {
     ConnectorProviderDescriptor {
         kind: ConnectorKind::Echo,
@@ -120,6 +133,8 @@ impl ConnectorAdapter for EchoConnectorAdapter {
         _instance: &ConnectorInstanceRecord,
         request: &OutboundMessageRequest,
     ) -> Result<DeliveryOutcome, ConnectorAdapterError> {
+        // First sighting of the marker per envelope simulates a connector restart; the retry
+        // that follows is expected to succeed, mirroring a real connector recovering mid-send.
         if request.text.contains(CRASH_ONCE_MARKER) {
             let mut seen = self.crash_once_seen.lock().map_err(|_| {
                 ConnectorAdapterError::Backend(
