@@ -1,3 +1,18 @@
+//! Console provider-auth handlers for OpenAI, Anthropic, and MiniMax:
+//! API-key connect, OAuth flows (PKCE authorization-code for OpenAI, device
+//! user-code polling for MiniMax), refresh, revoke, and default-profile
+//! selection.
+//!
+//! Credentials are validated against the live provider before anything is
+//! persisted; raw secrets go only into the vault (profiles carry vault refs),
+//! profiles into the auth registry via the in-process console `AuthService`,
+//! and the default selection into the daemon config file. In-flight OAuth
+//! attempts for all providers share the in-memory
+//! `AppState::openai_oauth_attempts` map and expire after
+//! `OPENAI_OAUTH_ATTEMPT_TTL_MS`. Builds on the primitives in `openai_auth`;
+//! compiled as a crate-root submodule, so `use super::*` pulls in the lib.rs
+//! imports.
+
 use std::env;
 
 use super::*;
@@ -22,6 +37,14 @@ const MINIMAX_OAUTH_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:user_co
 const MINIMAX_RESOURCE_URL_ALLOWED_DOMAINS: &[&str] = &["minimax.io", "minimaxi.com"];
 const OPENAI_OAUTH_CALLBACK_PATH: &str = "console/v1/auth/providers/openai/callback";
 
+/// Validates an OpenAI API key against the provider's models endpoint, then
+/// stores it as an auth profile (key in the vault, profile via the console
+/// auth service), optionally selecting it as the default provider profile.
+///
+/// # Errors
+/// Returns a validation error response for malformed fields or a rejected
+/// key, and an internal/unavailable error response when validation transport,
+/// vault storage, profile persistence, or config persistence fails.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn connect_openai_api_key(
     state: &AppState,
@@ -85,6 +108,14 @@ pub(crate) async fn connect_openai_api_key(
     Ok(openai_provider_action_envelope("api_key", state_name, message, Some(profile_id)))
 }
 
+/// Validates an Anthropic API key against the provider's models endpoint,
+/// then stores it as an auth profile, optionally selecting it as the default
+/// provider profile.
+///
+/// # Errors
+/// Returns a validation error response for malformed fields or a rejected
+/// key, and an internal/unavailable error response when validation transport,
+/// vault storage, profile persistence, or config persistence fails.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn connect_anthropic_api_key(
     state: &AppState,
@@ -149,6 +180,14 @@ pub(crate) async fn connect_anthropic_api_key(
     Ok(provider_action_envelope("anthropic", "api_key", state_name, message, Some(profile_id)))
 }
 
+/// Validates a MiniMax API key with a minimal completion probe, then stores
+/// it as an auth profile (MiniMax profiles use the custom-provider kind),
+/// optionally selecting it as the default provider profile.
+///
+/// # Errors
+/// Returns a validation error response for malformed fields or a rejected
+/// key, and an internal/unavailable error response when validation transport,
+/// vault storage, profile persistence, or config persistence fails.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn connect_minimax_api_key(
     state: &AppState,
@@ -209,6 +248,13 @@ pub(crate) async fn connect_minimax_api_key(
     Ok(provider_action_envelope("minimax", "api_key", state_name, message, Some(profile_id)))
 }
 
+/// Normalizes an OAuth bootstrap request and starts a PKCE authorization-code
+/// attempt for OpenAI, returning the authorization URL the user must open.
+///
+/// # Errors
+/// Returns a validation error response for malformed identifiers or a missing
+/// `client_id`, and a precondition/internal error response when the callback
+/// URL cannot be derived or the OAuth endpoint config is invalid.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn start_openai_oauth_attempt_from_request(
     state: &AppState,
@@ -256,6 +302,17 @@ pub(crate) async fn start_openai_oauth_attempt_from_request(
     )
 }
 
+/// Normalizes an OAuth bootstrap request and starts a MiniMax device
+/// user-code attempt, returning the verification URL and user code.
+///
+/// The client id falls back from the request to `PALYRA_MINIMAX_OAUTH_CLIENT_ID`
+/// and finally to the built-in public MiniMax client id; `client_secret` is
+/// ignored because the device flow uses PKCE only.
+///
+/// # Errors
+/// Returns a validation error response for malformed identifiers and an
+/// unavailable/internal error response when the MiniMax code endpoint cannot
+/// be reached or the endpoint config is invalid.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn start_minimax_oauth_attempt_from_request(
     state: &AppState,
@@ -303,6 +360,15 @@ pub(crate) async fn start_minimax_oauth_attempt_from_request(
     .await
 }
 
+/// Returns the current state of a MiniMax OAuth attempt, driving one poll of
+/// the MiniMax token endpoint first when the attempt is pending and its poll
+/// interval has elapsed (the device flow has no callback, so polling this
+/// endpoint is what advances the attempt).
+///
+/// # Errors
+/// Returns not-found for unknown or purged attempt ids, failed-precondition
+/// when the attempt belongs to another provider, and propagates vault,
+/// profile-persistence, and config errors from a successful poll.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn load_minimax_oauth_callback_state(
     state: &AppState,
@@ -338,6 +404,9 @@ pub(crate) async fn load_minimax_oauth_callback_state(
         if matches!(attempt.state, OpenAiOAuthAttemptStateRecord::Pending { .. })
             && attempt.next_poll_after_unix_ms <= now
         {
+            // Bump the next-poll deadline while still under the lock so
+            // concurrent state requests cannot stampede the MiniMax token
+            // endpoint with parallel polls for the same attempt.
             attempt.next_poll_after_unix_ms =
                 now.saturating_add(attempt.poll_interval_ms.try_into().unwrap_or(i64::MAX));
             Some(attempt.clone())
@@ -346,6 +415,8 @@ pub(crate) async fn load_minimax_oauth_callback_state(
         }
     };
 
+    // The attempt map is behind a std Mutex, so the guard is dropped before
+    // the async poll and the result is applied under a fresh lock.
     if let Some(attempt) = attempt_to_poll {
         apply_minimax_oauth_poll_result(state, attempt, now).await?;
     }
@@ -359,6 +430,13 @@ pub(crate) async fn load_minimax_oauth_callback_state(
     Ok(oauth_callback_state_envelope(attempt))
 }
 
+/// Starts a fresh MiniMax device-flow attempt that reuses the client id and
+/// scopes stored on an existing MiniMax OAuth profile.
+///
+/// # Errors
+/// Returns a validation error response when `profile_id` is missing or
+/// malformed, not-found/failed-precondition when the profile does not exist
+/// or is not a MiniMax OAuth profile, and propagates attempt-start failures.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn reconnect_minimax_oauth_attempt(
     state: &AppState,
@@ -401,6 +479,14 @@ pub(crate) async fn reconnect_minimax_oauth_attempt(
     .await
 }
 
+/// Triggers an OAuth token refresh for a MiniMax profile through the auth
+/// runtime and journals the outcome; skip outcomes (not due, cooldown, not
+/// OAuth) are reported in the envelope state rather than as errors.
+///
+/// # Errors
+/// Returns a validation error response when `profile_id` is missing or
+/// malformed, not-found/failed-precondition for unknown or non-MiniMax
+/// profiles, and propagates auth-runtime and journaling failures.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn refresh_minimax_oauth_profile(
     state: &AppState,
@@ -443,6 +529,14 @@ pub(crate) async fn refresh_minimax_oauth_profile(
     ))
 }
 
+/// Returns the current state of an OpenAI OAuth attempt for UI polling,
+/// flipping a pending attempt to failed once its deadline has passed. Unlike
+/// the MiniMax variant this never contacts the provider: the attempt is
+/// advanced by the browser callback, not by polling.
+///
+/// # Errors
+/// Returns not-found for unknown or purged attempt ids and
+/// failed-precondition when the attempt belongs to another provider.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn load_openai_oauth_callback_state(
     state: &AppState,
@@ -477,6 +571,20 @@ pub(crate) async fn load_openai_oauth_callback_state(
     Ok(oauth_callback_state_envelope(attempt))
 }
 
+/// Handles the browser redirect of the OpenAI authorization-code flow:
+/// exchanges the code (with the stored PKCE verifier), validates the issued
+/// access token, stores the tokens in the vault, persists the auth profile,
+/// and returns the HTML callback page for the user's browser.
+///
+/// Flow failures (denied authorization, expired attempt, failed exchange or
+/// validation) are reported by marking the attempt failed and returning a
+/// renderable failure page, not as error responses.
+///
+/// # Errors
+/// Returns not-found for unknown or purged attempt ids, failed-precondition
+/// when the attempt belongs to another provider, a validation error response
+/// when `code` is absent, and internal error responses for vault, profile, or
+/// config persistence failures after a successful exchange.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn complete_openai_oauth_callback(
     state: &AppState,
@@ -507,6 +615,11 @@ pub(crate) async fn complete_openai_oauth_callback(
         }
         attempt.clone()
     };
+    // AIDEV-NOTE: the attempt is cloned and the map lock released across the
+    // token exchange below, so two concurrent callbacks for the same attempt
+    // can both pass the terminal-state check above and race the exchange.
+    // Authorization codes are single-use at the provider, so the loser fails
+    // there; serializing would require a per-attempt in-progress marker.
 
     if let Some(error) = query.error.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
         let description = query
@@ -559,6 +672,8 @@ pub(crate) async fn complete_openai_oauth_callback(
         }
     };
 
+    // Validate the issued token before any secret is persisted so a broken
+    // grant never lands in the vault or the auth registry.
     let (document, _, _) = load_openai_console_config_snapshot()?;
     let validation_base_url = load_openai_validation_base_url(Some(&document));
     if let Err(error) = validate_openai_bearer_token(
@@ -604,6 +719,8 @@ pub(crate) async fn complete_openai_oauth_callback(
             attempt.client_secret.as_bytes(),
         )?)
     };
+    // `expires_in` is a short relative duration; the `as` cast cannot
+    // truncate realistic values, and saturating math caps pathological ones.
     let expires_at_unix_ms = token_result
         .expires_in_seconds
         .map(|seconds| now.saturating_add((seconds as i64).saturating_mul(1_000)));
@@ -660,6 +777,9 @@ pub(crate) async fn complete_openai_oauth_callback(
             };
             callback_payload_json(stored, None, Some(now))
         } else {
+            // TTL cleanup can purge the attempt while the exchange was in
+            // flight; the profile was still persisted above, so synthesize
+            // the success payload for the opener window.
             json!({
                 "type": OPENAI_OAUTH_CALLBACK_EVENT_TYPE,
                 "attempt_id": attempt_id,
@@ -674,6 +794,15 @@ pub(crate) async fn complete_openai_oauth_callback(
     Ok(render_callback_page("OpenAI Connected", message, Some(payload_json.as_str())))
 }
 
+/// Starts a fresh OpenAI authorization-code attempt that reuses the client
+/// id, client secret (loaded from the vault), and scopes stored on an
+/// existing OpenAI OAuth profile.
+///
+/// # Errors
+/// Returns a validation error response when `profile_id` is missing or
+/// malformed, not-found/failed-precondition when the profile does not exist,
+/// is not an OAuth profile, or lacks a stored client id, and propagates
+/// vault-read and attempt-start failures.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn reconnect_openai_oauth_attempt(
     state: &AppState,
@@ -729,6 +858,13 @@ pub(crate) async fn reconnect_openai_oauth_attempt(
     )
 }
 
+/// Triggers an OAuth token refresh for an OpenAI profile through the auth
+/// runtime and journals the outcome; skip outcomes (not due, cooldown, not
+/// OAuth) are reported in the envelope state rather than as errors.
+///
+/// # Errors
+/// Returns a validation error response when `profile_id` is missing or
+/// malformed and propagates auth-runtime and journaling failures.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn refresh_openai_oauth_profile(
     state: &AppState,
@@ -769,6 +905,17 @@ pub(crate) async fn refresh_openai_oauth_profile(
     ))
 }
 
+/// Revokes an OpenAI auth profile: OAuth profiles have their refresh token
+/// revoked at the provider first, API-key profiles are removed locally only
+/// (the message tells the operator to revoke the key in the OpenAI console).
+/// Deletes the profile, clears it as the configured default if selected, and
+/// journals the revocation.
+///
+/// # Errors
+/// Returns a validation error response when `profile_id` is missing or
+/// malformed, not-found/failed-precondition for unknown or non-OpenAI
+/// profiles, unavailable when remote revocation fails, and propagates vault,
+/// deletion, config, and journaling failures.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn revoke_openai_auth_profile(
     state: &AppState,
@@ -788,6 +935,9 @@ pub(crate) async fn revoke_openai_auth_profile(
         .and_then(|value| normalize_openai_identifier(value, "profile_id"))?;
     let profile = load_openai_auth_profile_record(state, profile_id.as_str())?;
     let mut remote_revocation = false;
+    // Remote revocation runs before local deletion: a failed revoke leaves
+    // the profile intact for retry, while the inverse order could orphan
+    // live provider tokens with no local record of them.
     let message = match &profile.credential {
         AuthCredential::Oauth {
             refresh_token_vault_ref,
@@ -870,6 +1020,13 @@ pub(crate) async fn revoke_openai_auth_profile(
     Ok(openai_provider_action_envelope("revoke", "revoked", message.as_str(), Some(profile_id)))
 }
 
+/// Marks an existing OpenAI auth profile as the default model-provider
+/// profile by rewriting the daemon config.
+///
+/// # Errors
+/// Returns a validation error response when `profile_id` is missing or
+/// malformed, not-found/failed-precondition for unknown or non-OpenAI
+/// profiles, and propagates config persistence failures.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn select_default_openai_auth_profile(
     state: &AppState,
@@ -903,6 +1060,14 @@ pub(crate) async fn select_default_openai_auth_profile(
     ))
 }
 
+/// Removes an Anthropic auth profile locally (Anthropic API keys have no
+/// remote revocation endpoint), clears it as the configured default if
+/// selected, and journals the revocation.
+///
+/// # Errors
+/// Returns a validation error response when `profile_id` is missing or
+/// malformed, not-found/failed-precondition for unknown or non-Anthropic
+/// profiles, and propagates deletion, config, and journaling failures.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn revoke_anthropic_auth_profile(
     state: &AppState,
@@ -961,6 +1126,13 @@ pub(crate) async fn revoke_anthropic_auth_profile(
     ))
 }
 
+/// Marks an existing Anthropic auth profile as the default model-provider
+/// profile by rewriting the daemon config.
+///
+/// # Errors
+/// Returns a validation error response when `profile_id` is missing or
+/// malformed, not-found/failed-precondition for unknown or non-Anthropic
+/// profiles, and propagates config persistence failures.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn select_default_anthropic_auth_profile(
     state: &AppState,
@@ -999,6 +1171,14 @@ pub(crate) async fn select_default_anthropic_auth_profile(
     ))
 }
 
+/// Removes a MiniMax auth profile locally (no remote revocation is attempted
+/// for either credential type), clears it as the configured default if
+/// selected, and journals the revocation.
+///
+/// # Errors
+/// Returns a validation error response when `profile_id` is missing or
+/// malformed, not-found/failed-precondition for unknown or non-MiniMax
+/// profiles, and propagates deletion, config, and journaling failures.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn revoke_minimax_auth_profile(
     state: &AppState,
@@ -1056,6 +1236,13 @@ pub(crate) async fn revoke_minimax_auth_profile(
     ))
 }
 
+/// Marks an existing MiniMax auth profile as the default model-provider
+/// profile by rewriting the daemon config.
+///
+/// # Errors
+/// Returns a validation error response when `profile_id` is missing or
+/// malformed, not-found/failed-precondition for unknown or non-MiniMax
+/// profiles, and propagates config persistence failures.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn select_default_minimax_auth_profile(
     state: &AppState,
@@ -1090,6 +1277,9 @@ pub(crate) async fn select_default_minimax_auth_profile(
     ))
 }
 
+/// Registers a pending OpenAI authorization-code attempt (fresh PKCE
+/// verifier, attempt-id-as-state) in the shared attempt map and returns the
+/// envelope with the authorization URL.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::result_large_err)]
 fn start_openai_oauth_attempt(
@@ -1179,6 +1369,9 @@ struct MinimaxOAuthEndpointConfig {
     token_endpoint: Url,
 }
 
+/// Wire shape of the MiniMax device-flow code response; `expired_in` and
+/// `interval` come in OpenClaw-compatible mixed units (see the normalize
+/// helpers below).
 #[derive(Debug, Clone, Deserialize)]
 struct MinimaxOAuthCodeResponse {
     user_code: String,
@@ -1190,6 +1383,9 @@ struct MinimaxOAuthCodeResponse {
     state: Option<String>,
 }
 
+/// Wire shape of the MiniMax device-flow token poll response: every field is
+/// optional because pending, success, and failure replies populate different
+/// subsets.
 #[derive(Debug, Clone, Deserialize)]
 struct MinimaxOAuthTokenResponse {
     #[serde(default)]
@@ -1210,6 +1406,8 @@ struct MinimaxOAuthTokenResponse {
     message: Option<String>,
 }
 
+/// Classified result of one MiniMax token poll; messages are already
+/// sanitized for client display.
 enum MinimaxOAuthPollOutcome {
     Pending(String),
     Succeeded {
@@ -1221,6 +1419,9 @@ enum MinimaxOAuthPollOutcome {
     Failed(String),
 }
 
+/// Requests a MiniMax device user code and registers the pending attempt in
+/// the shared attempt map; the user authorizes by entering the code in the
+/// MiniMax portal while the daemon polls the token endpoint.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::result_large_err)]
 async fn start_minimax_oauth_attempt(
@@ -1308,6 +1509,11 @@ async fn start_minimax_oauth_attempt(
     })
 }
 
+/// Polls the MiniMax token endpoint once for `attempt` and applies the
+/// outcome to the stored attempt: pending updates the message, failure marks
+/// the attempt failed, and success stores tokens in the vault, persists the
+/// auth profile, and optionally adopts the returned resource URL as the
+/// configured base URL.
 async fn apply_minimax_oauth_poll_result(
     state: &AppState,
     attempt: OpenAiOAuthAttempt,
@@ -1318,6 +1524,9 @@ async fn apply_minimax_oauth_poll_result(
             "MiniMax OAuth attempt is missing a user_code",
         ))
     })?;
+    // Transport-level poll errors are mapped to Pending rather than Failed:
+    // a transient network hiccup must not kill an attempt the user may still
+    // be in the middle of authorizing.
     let outcome = poll_minimax_oauth_token(
         &attempt.token_endpoint,
         attempt.client_id.as_str(),
@@ -1428,6 +1637,8 @@ async fn apply_minimax_oauth_poll_result(
     }
 }
 
+/// Trims the requested scopes, substituting the MiniMax defaults when nothing
+/// non-empty remains; unlike OpenAI scopes these are case-preserving.
 fn normalize_minimax_scopes(scopes: &[String]) -> Vec<String> {
     let normalized = scopes
         .iter()
@@ -1440,6 +1651,12 @@ fn normalize_minimax_scopes(scopes: &[String]) -> Vec<String> {
     normalized
 }
 
+/// Resolves the MiniMax OAuth endpoints from `PALYRA_MINIMAX_OAUTH_BASE_URL`
+/// (falling back to the production base URL), enforcing https and rejecting
+/// embedded credentials, query, and fragment.
+///
+/// # Errors
+/// Returns an error when the configured base URL fails any of those checks.
 fn minimax_oauth_endpoint_config_from_env() -> Result<MinimaxOAuthEndpointConfig> {
     let base_url = env::var("PALYRA_MINIMAX_OAUTH_BASE_URL")
         .ok()
@@ -1465,6 +1682,13 @@ fn minimax_oauth_endpoint_config_from_env() -> Result<MinimaxOAuthEndpointConfig
     })
 }
 
+/// Requests a device user code from the MiniMax code endpoint, verifying the
+/// echoed `state` (when present) matches the attempt id to keep the response
+/// bound to this attempt.
+///
+/// # Errors
+/// Returns an error on transport failure, a non-success status, invalid JSON,
+/// a mismatched `state`, or a payload missing the user code or URI.
 async fn request_minimax_user_code(
     code_endpoint: &Url,
     client_id: &str,
@@ -1510,6 +1734,17 @@ async fn request_minimax_user_code(
     Ok(payload)
 }
 
+/// Performs one MiniMax device-flow token poll and classifies the reply.
+///
+/// MiniMax does not use the standard RFC 8628 error codes consistently, so
+/// pending-vs-failed is decided by substring matching on the error text
+/// ("pending"/"slow_down" means keep polling); anything else on a success
+/// status without tokens is treated as a terminal failure.
+///
+/// # Errors
+/// Returns an error only for transport failures, invalid JSON, or a success
+/// payload missing one of the two tokens; provider-side rejections come back
+/// as [`MinimaxOAuthPollOutcome::Failed`] instead.
 async fn poll_minimax_oauth_token(
     token_endpoint: &Url,
     client_id: &str,
@@ -1580,6 +1815,10 @@ async fn poll_minimax_oauth_token(
     }
 }
 
+// MiniMax/OpenClaw clients send `expired_in` in three formats; the magnitude
+// disambiguates: >= 1e12 is an absolute unix-millisecond timestamp, >= 1e9 an
+// absolute unix-second timestamp, anything smaller a standard OAuth relative
+// duration in seconds.
 fn normalize_minimax_expired_in_to_unix_ms(expired_in: i64, now_unix_ms: i64) -> i64 {
     let normalized = expired_in.max(1);
     if normalized >= 1_000_000_000_000 {
@@ -1591,6 +1830,8 @@ fn normalize_minimax_expired_in_to_unix_ms(expired_in: i64, now_unix_ms: i64) ->
     now_unix_ms.saturating_add(normalized.saturating_mul(1_000))
 }
 
+// Same mixed-unit compatibility as `expired_in`: values below 100 are
+// RFC 8628-style seconds, larger values are already milliseconds (OpenClaw).
 fn normalize_minimax_poll_interval_ms(interval: Option<u64>) -> u64 {
     let raw = interval.unwrap_or(2_000).max(1);
     if raw < 100 {
@@ -1599,6 +1840,12 @@ fn normalize_minimax_poll_interval_ms(interval: Option<u64>) -> u64 {
     raw
 }
 
+/// Validates the provider-supplied `resource_url` and normalizes it onto the
+/// anthropic-compatible path, returning `None` for anything suspicious.
+///
+/// The value ends up persisted as the daemon's model-provider base URL, so it
+/// is treated as untrusted input: https only, host restricted to the trusted
+/// MiniMax domain allowlist, and no credentials, query, or fragment.
 fn normalize_minimax_resource_url(raw: &str) -> Option<String> {
     let trimmed = normalize_optional_text(raw)?;
     let mut url = Url::parse(trimmed).ok()?;
@@ -1625,11 +1872,17 @@ fn minimax_resource_url_host_allowed(url: &Url) -> bool {
         return false;
     };
     let host = host.to_ascii_lowercase();
+    // The suffix match requires a '.' boundary so lookalike registrations
+    // (e.g. a domain merely ending in an allowed name) cannot pass.
     MINIMAX_RESOURCE_URL_ALLOWED_DOMAINS.iter().any(|domain| {
         host == *domain || host.strip_suffix(domain).is_some_and(|prefix| prefix.ends_with('.'))
     })
 }
 
+/// Persists a normalized MiniMax resource URL as
+/// `model_provider.anthropic_base_url` in the daemon config, re-running the
+/// network policy check (private targets need an explicit opt-in) before the
+/// write, and journals the update.
 #[allow(clippy::result_large_err)]
 async fn persist_minimax_resource_base_url(
     state: &AppState,
@@ -1690,6 +1943,9 @@ fn normalize_optional_text(raw: &str) -> Option<&str> {
     }
 }
 
+// MiniMax has no first-class kind in the auth-profile contract, so its
+// profiles are stored as a custom provider with a fixed custom name; lookups
+// must match on that pair (see load_minimax_auth_profile_record).
 fn minimax_auth_profile_provider() -> control_plane::AuthProfileProvider {
     control_plane::AuthProfileProvider {
         kind: "custom".to_owned(),
@@ -1778,6 +2034,9 @@ fn request_context_from_console_action(context: &ConsoleActionContext) -> Reques
     }
 }
 
+/// Normalizes a caller-supplied identifier (profile id, attempt id, agent id)
+/// to lowercase and validates the `[a-z0-9._-]{1,128}` charset; identifiers
+/// feed vault key derivation and config values, so the alphabet is strict.
 #[allow(clippy::result_large_err)]
 fn normalize_openai_identifier(raw: &str, field: &'static str) -> Result<String, Response> {
     let trimmed = raw.trim();
@@ -1884,6 +2143,8 @@ fn vault_scope_for_openai_profile_scope(
     }
 }
 
+// The profile id is hashed into the vault key so key length stays bounded
+// and the key format is independent of the (user-influenced) id format.
 fn provider_secret_key(provider_slug: &str, profile_id: &str, suffix: &str) -> String {
     let digest = sha256_hex(profile_id.as_bytes());
     format!("auth_{provider_slug}_{}_{}", &digest[..16], suffix)
@@ -1904,6 +2165,12 @@ fn store_openai_secret(
     store_provider_secret(vault, scope, profile_id, "openai", suffix, value)
 }
 
+/// Stores one provider secret in the vault under a derived key and returns
+/// the vault ref (`scope/key`) that auth profiles carry instead of the value.
+///
+/// # Errors
+/// Returns a validation error response for an unsupported scope and an
+/// internal error response when the vault write fails.
 #[allow(clippy::result_large_err)]
 fn store_provider_secret(
     vault: &Vault,
@@ -1924,6 +2191,8 @@ fn store_provider_secret(
     Ok(openai_secret_vault_ref(&vault_scope, key.as_str()))
 }
 
+/// Loads a vault secret by ref and decodes it as UTF-8; `field` only labels
+/// error messages, the secret value itself never reaches them.
 #[allow(clippy::result_large_err)]
 fn load_vault_secret_utf8(vault: &Vault, vault_ref: &str, field: &str) -> Result<String, Response> {
     let vault_ref = VaultRef::parse(vault_ref).map_err(|error| {
@@ -1947,6 +2216,8 @@ fn generate_openai_profile_id(profile_name: &str) -> String {
     generate_provider_profile_id("openai", profile_name)
 }
 
+/// Derives a profile id from the display name: an ASCII slug plus a ULID
+/// suffix so repeated connects with the same name stay unique.
 fn generate_provider_profile_id(provider_slug: &str, profile_name: &str) -> String {
     let slug = profile_name
         .chars()
@@ -1962,6 +2233,9 @@ fn generate_provider_profile_id(provider_slug: &str, profile_name: &str) -> Stri
     format!("{base}-{suffix}")
 }
 
+// Validation base URLs resolve env override > config document > built-in
+// default, mirroring how the model-provider runtime resolves them so the
+// credential is probed against the endpoint it will actually be used with.
 fn load_openai_validation_base_url(document: Option<&toml::Value>) -> String {
     env::var("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL")
         .ok()
@@ -2045,6 +2319,9 @@ fn anthropic_validation_base_url_from_document(document: &toml::Value) -> Option
         .map(str::to_owned)
 }
 
+// MiniMax shares the anthropic_base_url config key, so that key is only
+// trusted as a MiniMax URL when auth_provider_kind says minimax; otherwise it
+// would probe MiniMax keys against an Anthropic endpoint.
 fn minimax_validation_base_url_from_document(document: &toml::Value) -> Option<String> {
     let configured_auth_provider = get_value_at_path(document, "model_provider.auth_provider_kind")
         .ok()
@@ -2063,6 +2340,9 @@ fn openai_callback_base_url_from_document(document: &toml::Value) -> Option<Stri
         .map(str::to_owned)
 }
 
+/// Resolves the config path used for mutations, falling back to the first
+/// default search location when no config file exists yet (selecting a
+/// default profile may create the file).
 #[allow(clippy::result_large_err)]
 fn resolve_console_config_mutation_path(path: Option<&str>) -> Result<String, Response> {
     if let Some(resolved) = resolve_openai_console_config_path(path, false)? {
@@ -2129,6 +2409,8 @@ fn load_openai_auth_profile_record(
     load_auth_profile_record_for_provider(state, profile_id, AuthProviderKind::Openai)
 }
 
+/// Loads an auth profile and verifies it is a MiniMax profile (custom
+/// provider kind with the MiniMax custom name, matched case-insensitively).
 #[allow(clippy::result_large_err)]
 fn load_minimax_auth_profile_record(
     state: &AppState,
@@ -2182,6 +2464,9 @@ fn load_auth_profile_record_for_provider(
     Ok(record)
 }
 
+// Profile writes and deletes are routed through the in-process console
+// AuthService (not the registry directly) so they hit the same validation,
+// authorization context, and persistence path as external console calls.
 #[allow(clippy::result_large_err)]
 async fn persist_openai_auth_profile(
     state: &AppState,
@@ -2246,6 +2531,8 @@ async fn delete_auth_profile_via_console_service(
     Ok(response.deleted)
 }
 
+/// Appends an auth audit event to the journal; auth actions are not tied to
+/// a chat run, so fresh ULIDs stand in for the session/run identifiers.
 #[allow(clippy::result_large_err)]
 async fn append_console_auth_journal_event(
     state: &AppState,
@@ -2275,6 +2562,14 @@ async fn append_console_auth_journal_event(
     Ok(())
 }
 
+/// Rewrites the daemon config so `profile_id` becomes the active
+/// model-provider auth profile: sets the auth profile/provider keys, switches
+/// `model_provider.kind`, seeds provider base-URL/model defaults, removes
+/// legacy plaintext key fields, and journals the selection.
+///
+/// # Errors
+/// Returns an internal error response when the config path cannot be
+/// resolved, read, validated, or written, and propagates journaling failures.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn persist_model_provider_auth_profile_selection(
     state: &AppState,
@@ -2286,6 +2581,8 @@ pub(crate) async fn persist_model_provider_auth_profile_selection(
     let path_ref = FsPath::new(path.as_str());
     ensure_console_config_parent_dir(path_ref)?;
     let (mut document, _) = load_console_document_for_mutation(path_ref)?;
+    // MiniMax rides the anthropic-compatible provider runtime, so both map to
+    // the same model_provider.kind; auth_provider_kind keeps them distinct.
     let provider_kind_value = match provider_kind {
         ModelProviderAuthProviderKind::Openai => "openai_compatible",
         ModelProviderAuthProviderKind::Anthropic | ModelProviderAuthProviderKind::Minimax => {
@@ -2322,6 +2619,10 @@ pub(crate) async fn persist_model_provider_auth_profile_selection(
             "failed to set model_provider.kind: {error}"
         )))
     })?;
+    // OpenAI/Anthropic only seed defaults when the keys are missing (ensure_*)
+    // so operator-configured endpoints survive reselection; MiniMax force-sets
+    // (set_*) because switching to MiniMax must repoint the shared anthropic
+    // keys away from whatever provider used them before.
     match provider_kind {
         ModelProviderAuthProviderKind::Openai => {
             ensure_string_value_at_path(
@@ -2360,6 +2661,9 @@ pub(crate) async fn persist_model_provider_auth_profile_selection(
             )?;
         }
     }
+    // Once an auth profile is selected, credentials come from the vault via
+    // the profile; legacy inline key fields are dropped so the config file
+    // can never carry a raw key alongside the selection.
     let _ = unset_value_at_path(&mut document, "model_provider.openai_api_key");
     let _ = unset_value_at_path(&mut document, "model_provider.openai_api_key_vault_ref");
     let _ = unset_value_at_path(&mut document, "model_provider.anthropic_api_key");
@@ -2386,6 +2690,13 @@ pub(crate) async fn persist_model_provider_auth_profile_selection(
     .await
 }
 
+/// Clears the configured default auth profile when it points at
+/// `profile_id` (used after that profile is revoked or deleted); returns
+/// whether anything was cleared. A missing config file is a no-op.
+///
+/// # Errors
+/// Returns an internal error response when the config cannot be read,
+/// validated, or written, and propagates journaling failures.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn clear_model_provider_auth_profile_selection_if_matches(
     state: &AppState,
@@ -2425,6 +2736,8 @@ pub(crate) async fn clear_model_provider_auth_profile_selection_if_matches(
     Ok(true)
 }
 
+/// Sets `path` to `default_value` only when it is currently missing or blank
+/// (the keep-operator-overrides counterpart of [`set_string_value_at_path`]).
 #[allow(clippy::result_large_err)]
 fn ensure_string_value_at_path(
     document: &mut toml::Value,
@@ -2461,6 +2774,9 @@ fn set_string_value_at_path(
     })
 }
 
+/// Validation outcome classification shared by the Anthropic and MiniMax
+/// probes; `Unexpected` may carry a raw provider body, which the `map_*`
+/// response builders sanitize before it can reach a client or log.
 enum AnthropicCredentialValidationError {
     InvalidCredential,
     RateLimited,
@@ -2468,6 +2784,9 @@ enum AnthropicCredentialValidationError {
     Unexpected(String),
 }
 
+/// Probes `GET {base}/v1/models` with the Anthropic headers to confirm the
+/// key is accepted; only `ProviderUnavailable` outcomes (5xx, timeouts) are
+/// retried, since other statuses are deterministic answers.
 #[allow(clippy::result_large_err)]
 async fn validate_anthropic_api_key(
     base_url: &str,
@@ -2535,6 +2854,10 @@ async fn validate_anthropic_api_key(
     Err(AnthropicCredentialValidationError::ProviderUnavailable)
 }
 
+/// Validates a MiniMax key by sending a one-token message to the
+/// anthropic-compatible messages endpoint: the MiniMax surface has no cheap
+/// authenticated listing to probe, and `max_tokens: 1` keeps the probe cost
+/// negligible. Retry semantics match [`validate_anthropic_api_key`].
 #[allow(clippy::result_large_err)]
 async fn validate_minimax_api_key(
     base_url: &str,
@@ -2687,6 +3010,9 @@ fn map_openai_validation_error(field: &str, error: OpenAiCredentialValidationErr
     }
 }
 
+/// Validates a configured callback base URL (https, host present, no
+/// credentials/query/fragment) and normalizes it to a trailing slash so
+/// `Url::join` keeps the full path.
 #[allow(clippy::result_large_err)]
 fn normalize_openai_callback_base_url(raw: &str, source_name: &str) -> Result<Url, Response> {
     let trimmed = raw.trim();
@@ -2726,6 +3052,14 @@ fn normalize_openai_callback_base_url(raw: &str, source_name: &str) -> Result<Ur
     Ok(parsed)
 }
 
+/// Derives an `http://` callback origin from the request's Host header,
+/// accepting only bare loopback origins.
+///
+/// The redirect URI is security-sensitive (the provider sends the
+/// authorization code there), so a Host header is never trusted beyond
+/// loopback: any forwarded-* header means a proxy is in front and the
+/// operator must configure `gateway_access.remote_base_url` explicitly
+/// instead of letting a spoofable header pick the callback host.
 #[allow(clippy::result_large_err)]
 fn openai_loopback_callback_base_url(headers: &HeaderMap) -> Result<Url, Response> {
     if headers.contains_key("x-forwarded-host")
@@ -2776,6 +3110,9 @@ fn openai_loopback_callback_base_url(headers: &HeaderMap) -> Result<Url, Respons
     Ok(parsed)
 }
 
+/// Builds the OAuth redirect URI: the configured
+/// `gateway_access.remote_base_url` wins, otherwise the loopback origin from
+/// the Host header is used for local flows.
 #[allow(clippy::result_large_err)]
 fn build_openai_oauth_callback_url(
     document: Option<&toml::Value>,
@@ -2808,6 +3145,10 @@ fn lock_openai_oauth_attempts(
     })
 }
 
+/// Prunes stale attempts from the shared map. Both pending and terminal
+/// attempts stay addressable for one extra TTL window (past expiry or
+/// completion respectively) so a polling UI can still read the final state
+/// before the entry disappears.
 fn cleanup_openai_oauth_attempts(attempts: &mut HashMap<String, OpenAiOAuthAttempt>, now: i64) {
     attempts.retain(|_, attempt| match &attempt.state {
         OpenAiOAuthAttemptStateRecord::Pending { .. } => {
@@ -2881,6 +3222,8 @@ fn callback_validation_failure_message(error: OpenAiCredentialValidationError) -
     }
 }
 
+/// Serializes the JSON payload the rendered callback page posts to
+/// `window.opener` so the console UI can finish the flow without polling.
 fn callback_payload_json(
     attempt: &OpenAiOAuthAttempt,
     override_message: Option<&str>,
@@ -2898,6 +3241,10 @@ fn callback_payload_json(
     .to_string()
 }
 
+/// Returns the (title, body) for the callback page when the attempt is
+/// already terminal, flipping an expired pending attempt to failed as a side
+/// effect; `None` means the attempt is still live and the callback should
+/// proceed with the code exchange.
 fn callback_terminal_page(attempt: &mut OpenAiOAuthAttempt, now: i64) -> Option<(String, String)> {
     match &attempt.state {
         OpenAiOAuthAttemptStateRecord::Succeeded { message, .. } => {
@@ -2918,6 +3265,9 @@ fn callback_terminal_page(attempt: &mut OpenAiOAuthAttempt, now: i64) -> Option<
     }
 }
 
+/// Marks an attempt failed with a sanitized message and renders the failure
+/// page for the browser; used for every recoverable callback failure so the
+/// user always gets a page instead of a bare error response.
 #[allow(clippy::result_large_err)]
 fn fail_openai_oauth_attempt(
     state: &AppState,

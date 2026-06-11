@@ -1,3 +1,14 @@
+//! TOML-backed agent registry: agent records, the default-agent selection,
+//! and per-session agent bindings.
+//!
+//! State lives in `agents.toml` under the resolved state root (owner-only
+//! permissions), guarded by a lock file and replaced via atomic temp-file
+//! rename so concurrent daemons cannot interleave writes. All ids and paths
+//! are normalized/canonicalized on the way in; relative workspace roots must
+//! stay inside the agent dir. Consumed by the console/gateway agent handlers
+//! (`transport::http::handlers::console::agents`) and daemon startup
+//! (`ensure_local_default_agent`).
+
 use std::{
     collections::HashSet,
     env, fs,
@@ -24,6 +35,9 @@ const REGISTRY_LOCK_MAX_ATTEMPTS: u32 = 40;
 const REGISTRY_LOCK_RETRY_DELAY_MS: u64 = 25;
 const REGISTRY_LOCK_STALE_AFTER_SECS: u64 = 30;
 
+/// Persisted agent profile: identity, canonical directories, default model
+/// profile, and default tool/skill allowlists. All paths are stored in
+/// canonicalized form.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentRecord {
     pub agent_id: String,
@@ -39,6 +53,8 @@ pub struct AgentRecord {
     pub updated_at_unix_ms: i64,
 }
 
+/// Pins one `(principal, channel, session_id)` context to an agent so later
+/// resolutions in the same session stay sticky.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionAgentBinding {
     pub principal: String,
@@ -49,6 +65,8 @@ pub struct SessionAgentBinding {
     pub updated_at_unix_ms: i64,
 }
 
+/// Bookkeeping for OpenClaw registry imports (source path and resume
+/// cursor); kept in the document so partial imports survive restarts.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct OpenClawImportCompat {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -57,6 +75,9 @@ pub struct OpenClawImportCompat {
     pub cursor: Option<String>,
 }
 
+/// Inputs for [`AgentRegistry::create_agent`]. `agent_dir` and
+/// `workspace_roots` default to registry-relative locations; absolute paths
+/// require `allow_absolute_paths` to opt in explicitly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentCreateRequest {
     pub agent_id: String,
@@ -71,6 +92,7 @@ pub struct AgentCreateRequest {
     pub allow_absolute_paths: bool,
 }
 
+/// Result of agent creation, including how the default-agent selection moved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentCreateOutcome {
     pub agent: AgentRecord,
@@ -79,12 +101,15 @@ pub struct AgentCreateOutcome {
     pub default_changed: bool,
 }
 
+/// Result of an explicit default-agent change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSetDefaultOutcome {
     pub previous_default_agent_id: Option<String>,
     pub default_agent_id: String,
 }
 
+/// Result of agent deletion: removed bindings, default reassignment, and the
+/// (already canonical) agent dir so callers can clean up on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentDeleteOutcome {
     pub deleted_agent_id: String,
@@ -95,6 +120,8 @@ pub struct AgentDeleteOutcome {
     pub agent_dir: String,
 }
 
+/// Inputs for [`AgentRegistry::bind_agent_for_context`]: pin `agent_id` for
+/// the `(principal, channel, session_id)` context.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentBindingRequest {
     pub agent_id: String,
@@ -103,12 +130,16 @@ pub struct AgentBindingRequest {
     pub session_id: String,
 }
 
+/// Result of a bind: the stored binding and whether it was newly created
+/// (`false` means an existing binding was updated in place).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentBindingOutcome {
     pub binding: SessionAgentBinding,
     pub created: bool,
 }
 
+/// Filter for [`AgentRegistry::list_bindings`]; `None` fields match
+/// everything, `limit` defaults to 500 (clamped to 1..=5000).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentBindingQuery {
     pub agent_id: Option<String>,
@@ -118,6 +149,8 @@ pub struct AgentBindingQuery {
     pub limit: Option<usize>,
 }
 
+/// Inputs for [`AgentRegistry::unbind_agent_for_context`]; identifies a
+/// binding by its full `(principal, channel, session_id)` key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentUnbindRequest {
     pub principal: String,
@@ -125,12 +158,17 @@ pub struct AgentUnbindRequest {
     pub session_id: String,
 }
 
+/// Result of an unbind: whether a binding existed and which agent it pointed
+/// at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentUnbindOutcome {
     pub removed: bool,
     pub removed_agent_id: Option<String>,
 }
 
+/// Inputs for [`AgentRegistry::resolve_agent_for_context`];
+/// `persist_session_binding` makes the resolved choice sticky for the
+/// session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentResolveRequest {
     pub principal: String,
@@ -140,6 +178,9 @@ pub struct AgentResolveRequest {
     pub persist_session_binding: bool,
 }
 
+/// Which rule of the resolution precedence picked the agent. An explicit
+/// `preferred_agent_id` reports `Fallback` (it bypasses the lookup chain),
+/// as does the first-agent fallback when no default is configured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentResolutionSource {
     SessionBinding,
@@ -147,6 +188,9 @@ pub enum AgentResolutionSource {
     Fallback,
 }
 
+/// Result of agent resolution. `binding_created` is `true` when a session
+/// binding was created or repointed at a different agent; it doubles as the
+/// signal that the registry was persisted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentResolveOutcome {
     pub agent: AgentRecord,
@@ -155,6 +199,7 @@ pub struct AgentResolveOutcome {
     pub is_default: bool,
 }
 
+/// Point-in-time view of the registry for status surfaces.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentStatusSnapshot {
     pub default_agent_id: Option<String>,
@@ -162,6 +207,8 @@ pub struct AgentStatusSnapshot {
     pub session_bindings: Vec<SessionAgentBinding>,
 }
 
+/// One page of agents ordered by agent id; `next_after_agent_id` is the
+/// cursor for the following page (`None` on the last page).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentListPage {
     pub agents: Vec<AgentRecord>,
@@ -169,6 +216,8 @@ pub struct AgentListPage {
     pub next_after_agent_id: Option<String>,
 }
 
+/// How [`AgentRegistry::ensure_local_default_agent`] satisfied (or declined)
+/// the request for a usable default agent at daemon startup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AgentDefaultEnsureOutcome {
     AlreadyConfigured { agent_id: String },
@@ -178,6 +227,13 @@ pub(crate) enum AgentDefaultEnsureOutcome {
     SkippedMultipleAgents { observed_agent_count: usize },
 }
 
+/// Thread-safe handle over the persisted agent registry.
+///
+/// Every mutation follows clone-validate-persist-swap: the in-memory document
+/// is cloned, the clone is mutated and written to disk, and only after a
+/// successful write does it replace the in-memory state - so memory never
+/// diverges from disk on a failed write (pinned by
+/// `create_agent_keeps_in_memory_state_when_registry_write_fails`).
 #[derive(Debug)]
 pub struct AgentRegistry {
     registry_path: PathBuf,
@@ -185,6 +241,8 @@ pub struct AgentRegistry {
     state: Mutex<RegistryDocument>,
 }
 
+/// On-disk shape of `agents.toml`; all collections default so older or
+/// hand-edited documents still parse.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RegistryDocument {
     version: u32,
@@ -210,6 +268,8 @@ impl Default for RegistryDocument {
     }
 }
 
+/// Failure modes of the agent registry; `InvalidPath` covers all field
+/// validation (ids, names, paths), not just filesystem paths.
 #[derive(Debug, Error)]
 pub enum AgentRegistryError {
     #[error("agent registry lock poisoned")]
@@ -259,6 +319,15 @@ pub enum AgentRegistryError {
 }
 
 impl AgentRegistry {
+    /// Opens (or initializes) the registry under the state root resolved from
+    /// `PALYRA_STATE_ROOT`, the identity store's parent, or the built-in
+    /// default, normalizing and re-persisting the loaded document so on-disk
+    /// state is canonical after every open.
+    ///
+    /// # Errors
+    /// Returns an error when the state root or registry path cannot be
+    /// resolved or created, the document cannot be read/parsed/persisted, its
+    /// version is unsupported, or any stored record fails normalization.
     pub fn open(identity_store_root: &Path) -> Result<Self, AgentRegistryError> {
         let state_root = resolve_state_root(identity_store_root)?;
         let registry_path = resolve_registry_path(state_root.as_path())?;
@@ -288,6 +357,12 @@ impl AgentRegistry {
         Ok(Self { registry_path, state_root, state: Mutex::new(document) })
     }
 
+    /// Lists agents in id order as a cursor page: entries strictly after
+    /// `after_agent_id`, up to `limit` (default 100, clamped to 1..=500).
+    ///
+    /// # Errors
+    /// Returns [`AgentRegistryError::LockPoisoned`] when the registry lock is
+    /// poisoned.
     pub fn list_agents(
         &self,
         after_agent_id: Option<&str>,
@@ -320,6 +395,11 @@ impl AgentRegistry {
         })
     }
 
+    /// Returns the agent record plus whether it is the current default.
+    ///
+    /// # Errors
+    /// Returns [`AgentRegistryError::AgentNotFound`] for unknown ids,
+    /// `InvalidPath` for a malformed id, and `LockPoisoned` on lock failure.
     pub fn get_agent(&self, agent_id: &str) -> Result<(AgentRecord, bool), AgentRegistryError> {
         let agent_id = normalize_agent_id(agent_id)?;
         let guard = self.state.lock().map_err(|_| AgentRegistryError::LockPoisoned)?;
@@ -332,6 +412,16 @@ impl AgentRegistry {
         Ok((agent, guard.default_agent_id.as_deref() == Some(agent_id.as_str())))
     }
 
+    /// Creates an agent after normalizing all fields and canonicalizing its
+    /// directories; the new agent becomes the default when `set_default` is
+    /// requested or no default exists yet.
+    ///
+    /// # Errors
+    /// Returns `DuplicateAgentId`/`AgentDirCollision` for conflicts with
+    /// existing agents, `InvalidPath`/`WorkspaceRootEscape`/
+    /// `DuplicateWorkspaceRoot` for invalid inputs, `RegistryLimitExceeded`
+    /// at capacity, and `WriteRegistry` when persistence fails (in which
+    /// case in-memory state is left unchanged).
     pub fn create_agent(
         &self,
         request: AgentCreateRequest,
@@ -403,6 +493,13 @@ impl AgentRegistry {
         })
     }
 
+    /// Makes `agent_id` the default agent; a no-op (without a disk write)
+    /// when it already is.
+    ///
+    /// # Errors
+    /// Returns `AgentNotFound` for unknown ids, `InvalidPath` for malformed
+    /// ids, `LockPoisoned` on lock failure, and `WriteRegistry` when
+    /// persistence fails.
     pub fn set_default_agent(
         &self,
         agent_id: &str,
@@ -422,6 +519,15 @@ impl AgentRegistry {
         Ok(AgentSetDefaultOutcome { previous_default_agent_id, default_agent_id: agent_id })
     }
 
+    /// Startup helper that guarantees a usable default agent: keeps an
+    /// existing default (re-syncing the managed `local-default` agent's
+    /// workspace root to the current checkout), creates `local-default` for
+    /// an empty registry, promotes a sole agent, and deliberately does
+    /// nothing when several agents exist but none is default - that is an
+    /// operator decision.
+    ///
+    /// # Errors
+    /// Propagates the underlying list/create/set-default/persist failures.
     pub(crate) fn ensure_local_default_agent(
         &self,
         workspace_root: &Path,
@@ -476,6 +582,9 @@ impl AgentRegistry {
         }
     }
 
+    /// Repoints the managed `local-default` agent at `workspace_root`,
+    /// returning whether anything changed; any other agent id is left
+    /// untouched (operator-created agents own their workspace roots).
     fn sync_local_default_agent_workspace_root(
         &self,
         agent_id: &str,
@@ -513,6 +622,14 @@ impl AgentRegistry {
         Ok(true)
     }
 
+    /// Deletes an agent together with its session bindings; when the deleted
+    /// agent was the default, the first remaining agent (id order) becomes
+    /// the new default.
+    ///
+    /// # Errors
+    /// Returns `AgentNotFound` for unknown ids, `InvalidPath` for malformed
+    /// ids, `LockPoisoned` on lock failure, and `WriteRegistry` when
+    /// persistence fails.
     pub fn delete_agent(&self, agent_id: &str) -> Result<AgentDeleteOutcome, AgentRegistryError> {
         let agent_id = normalize_agent_id(agent_id)?;
         let mut guard = self.state.lock().map_err(|_| AgentRegistryError::LockPoisoned)?;
@@ -543,6 +660,12 @@ impl AgentRegistry {
         })
     }
 
+    /// Lists session bindings matching `query`, newest first (ties broken by
+    /// agent id, then session id, for a stable order).
+    ///
+    /// # Errors
+    /// Returns `InvalidPath`/`InvalidSessionId` for malformed filter values
+    /// and `LockPoisoned` on lock failure.
     pub fn list_bindings(
         &self,
         query: AgentBindingQuery,
@@ -587,6 +710,14 @@ impl AgentRegistry {
         Ok(bindings)
     }
 
+    /// Creates or updates the session binding for the request's
+    /// `(principal, channel, session_id)` context, evicting the oldest
+    /// bindings when the cap is exceeded.
+    ///
+    /// # Errors
+    /// Returns `AgentNotFound` for unknown agents, `InvalidPath`/
+    /// `InvalidSessionId` for malformed fields, `LockPoisoned` on lock
+    /// failure, and `WriteRegistry` when persistence fails.
     pub fn bind_agent_for_context(
         &self,
         request: AgentBindingRequest,
@@ -636,6 +767,13 @@ impl AgentRegistry {
         Ok(AgentBindingOutcome { binding, created })
     }
 
+    /// Removes the session binding for the request's context; a missing
+    /// binding is reported as `removed: false`, not an error.
+    ///
+    /// # Errors
+    /// Returns `InvalidPath`/`InvalidSessionId` for malformed fields,
+    /// `LockPoisoned` on lock failure, and `WriteRegistry` when persistence
+    /// fails.
     pub fn unbind_agent_for_context(
         &self,
         request: AgentUnbindRequest,
@@ -660,6 +798,17 @@ impl AgentRegistry {
         Ok(AgentUnbindOutcome { removed: true, removed_agent_id })
     }
 
+    /// Resolves which agent handles a request. Precedence: an explicit
+    /// `preferred_agent_id` (an error if unknown) over the session binding
+    /// for the context, over the default agent, over the first agent in id
+    /// order. With `persist_session_binding` the choice is written back as a
+    /// session binding so later resolutions stay sticky.
+    ///
+    /// # Errors
+    /// Returns `DefaultAgentNotConfigured` for an empty registry,
+    /// `AgentNotFound` for an unknown preferred id, `InvalidPath`/
+    /// `InvalidSessionId` for malformed fields, `LockPoisoned` on lock
+    /// failure, and `WriteRegistry` when binding persistence fails.
     pub fn resolve_agent_for_context(
         &self,
         request: AgentResolveRequest,
@@ -762,6 +911,12 @@ impl AgentRegistry {
         Ok(AgentResolveOutcome { is_default, agent, source, binding_created })
     }
 
+    /// Returns a consistent snapshot of the default selection, agent count,
+    /// and all session bindings.
+    ///
+    /// # Errors
+    /// Returns [`AgentRegistryError::LockPoisoned`] when the registry lock is
+    /// poisoned.
     pub fn status_snapshot(&self) -> Result<AgentStatusSnapshot, AgentRegistryError> {
         let guard = self.state.lock().map_err(|_| AgentRegistryError::LockPoisoned)?;
         Ok(AgentStatusSnapshot {
@@ -798,6 +953,11 @@ fn resolve_registry_path(state_root: &Path) -> Result<PathBuf, AgentRegistryErro
     Ok(state_root.join(REGISTRY_FILE))
 }
 
+/// Brings a loaded document into canonical form: normalizes ids/text,
+/// canonicalizes directories (rejecting duplicates and relative workspace
+/// roots that escape their agent dir), sorts agents by id, drops bindings
+/// whose session id is invalid or whose agent no longer exists, and clears a
+/// dangling default selection.
 fn normalize_document(
     document: &mut RegistryDocument,
     state_root: &Path,
@@ -881,6 +1041,10 @@ fn normalize_document(
     Ok(())
 }
 
+// AIDEV-NOTE: the lock file only serializes the write itself; the surrounding
+// read-modify-write cycle is guarded by the in-process Mutex, not across
+// processes. Two daemons sharing one registry can therefore lose each other's
+// updates (last writer wins) even though no write is ever torn.
 fn persist_registry(path: &Path, document: &RegistryDocument) -> Result<(), AgentRegistryError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| AgentRegistryError::WriteRegistry {
@@ -898,6 +1062,8 @@ fn persist_registry(path: &Path, document: &RegistryDocument) -> Result<(), Agen
         .map_err(|source| AgentRegistryError::WriteRegistry { path: path.to_path_buf(), source })
 }
 
+/// RAII guard for the cross-process lock file; dropping removes the file
+/// (best effort - a leaked file is reclaimed as stale by later writers).
 struct RegistryLock {
     lock_path: PathBuf,
 }
@@ -908,6 +1074,10 @@ impl Drop for RegistryLock {
     }
 }
 
+// Lock acquisition relies on create_new (O_EXCL) for atomicity. Locks older
+// than the staleness window are deleted so a crashed writer cannot wedge the
+// registry; the remove/create race between contenders is benign because only
+// one create_new can win afterwards.
 fn acquire_registry_lock(path: &Path) -> Result<RegistryLock, std::io::Error> {
     let lock_path = registry_lock_path(path);
     let stale_after = Duration::from_secs(REGISTRY_LOCK_STALE_AFTER_SECS);
@@ -970,6 +1140,9 @@ fn write_registry_atomically(path: &Path, payload: &str) -> Result<(), std::io::
             let _ = fs::remove_file(&temporary_path);
             return Err(rename_error);
         }
+        // On Windows, rename can fail when the destination exists and is held
+        // open. Fall back to a swap: move the live file aside, install the
+        // new one, and restore the original if the install fails.
         let mut rollback_name = path.as_os_str().to_os_string();
         rollback_name.push(format!(".swap.{}.{}", std::process::id(), timestamp_ns));
         let rollback_path = PathBuf::from(rollback_name);
@@ -1059,6 +1232,9 @@ fn resolve_workspace_roots(
             agent_dir.join(parsed)
         };
         let canonical = ensure_canonical_dir(candidate.as_path(), "workspace_root")?;
+        // Containment is checked after canonicalization so a symlink inside
+        // the agent dir cannot smuggle a relative root outside it (pinned by
+        // create_agent_rejects_workspace_symlink_escape).
         if !parsed_absolute && !canonical.starts_with(agent_dir) {
             return Err(AgentRegistryError::WorkspaceRootEscape(
                 canonical.to_string_lossy().into_owned(),
@@ -1075,6 +1251,8 @@ fn resolve_workspace_roots(
     Ok(roots)
 }
 
+// Parent traversal is rejected up front (before joining onto trusted roots)
+// so '..' segments can never steer a path outside the registry layout.
 fn parse_path_literal(raw: &str, field: &'static str) -> Result<PathBuf, AgentRegistryError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -1099,6 +1277,8 @@ fn parse_path_literal(raw: &str, field: &'static str) -> Result<PathBuf, AgentRe
     Ok(path)
 }
 
+// Canonicalization requires the path to exist, so the directory is created
+// (and hardened to owner-only) before fs::canonicalize resolves it.
 fn ensure_canonical_dir(path: &Path, field: &'static str) -> Result<PathBuf, AgentRegistryError> {
     fs::create_dir_all(path)
         .map_err(|source| AgentRegistryError::WriteRegistry { path: path.to_path_buf(), source })?;
@@ -1171,6 +1351,9 @@ fn normalize_allowlist(values: Vec<String>) -> Vec<String> {
     normalized
 }
 
+// Collision-detection key for canonical paths: separators are unified and,
+// on Windows only, case is folded because its filesystems are
+// case-insensitive while typical Unix filesystems are not.
 fn canonical_path_key(path: &Path) -> String {
     let normalized = path
         .components()
@@ -1188,6 +1371,8 @@ fn canonical_path_key(path: &Path) -> String {
 }
 
 fn current_unix_ms() -> Result<i64, AgentRegistryError> {
+    // Millisecond epoch timestamps fit i64 for any realistic clock; the `as`
+    // cast from u128 is intentional.
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64)
 }
 

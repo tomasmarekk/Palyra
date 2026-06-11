@@ -1,3 +1,13 @@
+//! Executor for bounded auxiliary model tasks (summary, recall search,
+//! classification, extraction, vision) that run beside the main orchestrator
+//! loop.
+//!
+//! Each task type carries a fixed [`AuxiliaryTaskContract`] (input/output
+//! shape, token-budget ceiling, model preference, fallback posture) that is
+//! also surfaced verbatim in lifecycle events and results. Execution routes
+//! through `usage_governance` planning and provider leases, and every phase
+//! (started/completed/failed) is recorded as a runtime decision event.
+
 use std::sync::Arc;
 
 use palyra_common::runtime_contracts::AuxiliaryTaskKind;
@@ -25,6 +35,8 @@ const CLASSIFICATION_DEFAULT_BUDGET_TOKENS: u64 = 600;
 const EXTRACTION_DEFAULT_BUDGET_TOKENS: u64 = 1_200;
 const VISION_DEFAULT_BUDGET_TOKENS: u64 = 2_000;
 
+/// Auxiliary task families this executor can run; a strict subset of
+/// `AuxiliaryTaskKind` (queue-only kinds are handled elsewhere).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AuxiliaryTaskType {
@@ -36,6 +48,9 @@ pub(crate) enum AuxiliaryTaskType {
 }
 
 impl AuxiliaryTaskType {
+    /// Maps a runtime-contract task-kind string (including aliases) to an
+    /// executor task type; returns `None` for kinds this executor does not
+    /// run (background/delegation prompts, attachment work, reflection).
     pub(crate) fn from_task_kind_str(value: &str) -> Option<Self> {
         match AuxiliaryTaskKind::from_str(value)? {
             AuxiliaryTaskKind::Summary => Some(Self::Summary),
@@ -51,6 +66,8 @@ impl AuxiliaryTaskType {
         }
     }
 
+    /// Returns the stable wire identifier used in lifecycle events and
+    /// result JSON.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Summary => "summary",
@@ -61,6 +78,9 @@ impl AuxiliaryTaskType {
         }
     }
 
+    /// Returns the fixed execution contract for this task type. Contracts
+    /// are compile-time constants: budgets, fallback posture, and routing
+    /// class are policy, not caller-tunable knobs.
     pub(crate) const fn contract(self) -> AuxiliaryTaskContract {
         match self {
             Self::Summary => AuxiliaryTaskContract {
@@ -122,6 +142,7 @@ impl AuxiliaryTaskType {
     }
 }
 
+/// Model-selection hint advertised by a task contract to routing.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AuxiliaryModelPreference {
@@ -140,6 +161,8 @@ impl AuxiliaryModelPreference {
     }
 }
 
+/// What happens when the preferred model is unavailable: degrade to the
+/// default model, or fail the task outright (for correctness-critical kinds).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AuxiliaryFallbackPolicy {
@@ -156,6 +179,11 @@ impl AuxiliaryFallbackPolicy {
     }
 }
 
+/// Immutable execution contract for one auxiliary task type.
+///
+/// Serialized into lifecycle events and results, so field names are part of
+/// the observable event shape. `default_budget_tokens` is both the default
+/// and the ceiling for caller-supplied budgets.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 pub(crate) struct AuxiliaryTaskContract {
     pub task_type: AuxiliaryTaskType,
@@ -170,6 +198,8 @@ pub(crate) struct AuxiliaryTaskContract {
     pub accepts_vision: bool,
 }
 
+/// One auxiliary task to execute; `run_id` is optional because tasks may be
+/// triggered outside an orchestrator run (the task id then keys routing).
 #[derive(Debug, Clone)]
 pub(crate) struct AuxiliaryExecutionRequest {
     pub task_id: String,
@@ -183,6 +213,8 @@ pub(crate) struct AuxiliaryExecutionRequest {
     pub vision_inputs: Vec<ProviderImageInput>,
 }
 
+/// Successful task outcome: provider output plus usage, provenance, and the
+/// contract/routing decision that produced it.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct AuxiliaryExecutionResult {
     pub task_id: String,
@@ -201,6 +233,8 @@ pub(crate) struct AuxiliaryExecutionResult {
 }
 
 impl AuxiliaryExecutionResult {
+    /// Serializes the result into the stable JSON shape consumed by task
+    /// records and lifecycle event details.
     pub(crate) fn to_result_json(&self) -> Value {
         json!({
             "status": "succeeded",
@@ -225,6 +259,13 @@ impl AuxiliaryExecutionResult {
     }
 }
 
+/// Validates, routes, and executes one auxiliary task end to end, recording
+/// started/completed/failed lifecycle events along the way.
+///
+/// # Errors
+/// Returns `Status::invalid_argument` for empty input text or vision inputs
+/// on a non-vision task, and propagates routing, lifecycle-recording, and
+/// provider execution errors unchanged.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn execute_auxiliary_task(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -241,11 +282,12 @@ pub(crate) async fn execute_auxiliary_task(
     if input_text.is_empty() {
         return Err(Status::invalid_argument("auxiliary task input_text cannot be empty"));
     }
+    // The contract budget is a ceiling, not just a default: callers may only
+    // shrink the spend, never raise it above the per-task-type policy.
     let effective_budget = request
         .token_budget
         .unwrap_or(contract.default_budget_tokens)
-        .max(1)
-        .min(contract.default_budget_tokens);
+        .clamp(1, contract.default_budget_tokens);
     let routing_run_id = request.run_id.as_deref().unwrap_or(request.task_id.as_str());
     let provider_snapshot = runtime_state.model_provider_status_snapshot();
     let routing = plan_usage_routing(UsageRoutingPlanRequest {
@@ -285,6 +327,9 @@ pub(crate) async fn execute_auxiliary_task(
     )
     .await?;
 
+    // Only an "enforced" routing decision pins the model; advisory modes let
+    // the provider runtime pick, so the lease binding falls back to the
+    // routing plan's provider/credential pair below.
     let provider_model_override =
         (routing.mode == "enforced").then(|| routing.actual_model_id.clone());
     let (lease_provider_id, _lease_provider_kind, lease_credential_id) =
@@ -344,6 +389,9 @@ pub(crate) async fn execute_auxiliary_task(
             Ok(result)
         }
         Err(error) => {
+            // Best-effort by design: surfacing the provider error to the
+            // caller matters more than the failure journal entry, so a
+            // journaling error here is deliberately discarded.
             let _ = record_auxiliary_lifecycle_event(
                 runtime_state,
                 &request.context,
@@ -375,11 +423,10 @@ fn build_execution_result(
     routing: RoutingDecision,
     response: ProviderResponse,
 ) -> AuxiliaryExecutionResult {
-    let output_text = response.output.full_text.clone();
     AuxiliaryExecutionResult {
         task_id,
         task_type,
-        output_text,
+        output_text: response.output.full_text,
         prompt_tokens: response.prompt_tokens,
         completion_tokens: response.completion_tokens,
         total_tokens: response.prompt_tokens.saturating_add(response.completion_tokens),
@@ -393,6 +440,8 @@ fn build_execution_result(
     }
 }
 
+/// Borrowed inputs for one auxiliary lifecycle event
+/// (phase: `started`, `completed`, or `failed`).
 pub(crate) struct AuxiliaryLifecycleEventInput<'a> {
     pub task_id: &'a str,
     pub task_type: &'a str,
@@ -402,6 +451,11 @@ pub(crate) struct AuxiliaryLifecycleEventInput<'a> {
     pub details: Value,
 }
 
+/// Records an auxiliary-task lifecycle phase as a runtime decision event so
+/// task progress is observable in the journal/preview surfaces.
+///
+/// # Errors
+/// Propagates the runtime's decision-event recording failure unchanged.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn record_auxiliary_lifecycle_event(
     runtime_state: &Arc<GatewayRuntimeState>,

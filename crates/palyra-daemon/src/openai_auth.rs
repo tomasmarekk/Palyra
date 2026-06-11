@@ -1,3 +1,14 @@
+//! OpenAI OAuth and credential-validation primitives.
+//!
+//! Provides PKCE material, authorization-URL construction, authorization-code
+//! exchange, bearer-token validation, token revocation, OAuth endpoint
+//! resolution from env, and the HTML callback page served to the user's
+//! browser. Consumed by `openai_surface` (console provider-auth handlers).
+//!
+//! Every remote response body passes through `sanitize_remote_error` before
+//! it can reach an error message, so raw provider payloads (which may echo
+//! credentials) never leak into logs or client-visible errors.
+
 use std::{env, time::Duration};
 
 use anyhow::{anyhow, Context, Result};
@@ -8,9 +19,13 @@ use sha2::{Digest, Sha256};
 
 use crate::model_provider::sanitize_remote_error;
 
+/// How long an OAuth attempt stays addressable after creation or completion.
 pub(crate) const OPENAI_OAUTH_ATTEMPT_TTL_MS: i64 = 10 * 60 * 1_000;
+/// `audience` sent in the authorization request; pins issued tokens to the OpenAI API.
 pub(crate) const OPENAI_OAUTH_AUDIENCE: &str = "https://api.openai.com/v1";
+/// `type` discriminator of the `postMessage` payload emitted by the rendered callback page.
 pub(crate) const OPENAI_OAUTH_CALLBACK_EVENT_TYPE: &str = "palyra-openai-oauth-complete";
+/// Scopes requested when the caller does not supply any non-empty scope.
 pub(crate) const OPENAI_OAUTH_DEFAULT_SCOPES: &[&str] =
     &["openid", "profile", "email", "offline_access"];
 const OPENAI_VALIDATION_RETRY_ATTEMPTS: usize = 5;
@@ -26,6 +41,8 @@ const OPENAI_TOKEN_ENDPOINT: &str = "https://auth0.openai.com/oauth/token";
 const OPENAI_REVOCATION_ENDPOINT: &str = "https://auth0.openai.com/oauth/revoke";
 const MODELS_PATH: &str = "models";
 
+/// Resolved OAuth endpoint set, each URL validated for scheme, host, and
+/// absence of embedded credentials, query, or fragment.
 #[derive(Debug, Clone)]
 pub(crate) struct OpenAiOAuthEndpointConfig {
     pub(crate) authorization_endpoint: Url,
@@ -33,6 +50,10 @@ pub(crate) struct OpenAiOAuthEndpointConfig {
     pub(crate) revocation_endpoint: Url,
 }
 
+/// Tokens returned by a successful authorization-code exchange.
+///
+/// `refresh_token` is mandatory: the daemon refreshes unattended, so a grant
+/// without one is rejected during the exchange.
 #[derive(Debug, Clone)]
 pub(crate) struct OAuthTokenExchangeResult {
     pub(crate) access_token: String,
@@ -40,14 +61,22 @@ pub(crate) struct OAuthTokenExchangeResult {
     pub(crate) expires_in_seconds: Option<u64>,
 }
 
+/// Outcome classification for OpenAI bearer-token validation, mapped from the
+/// HTTP status of the models-endpoint probe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OpenAiCredentialValidationError {
+    /// 401/403: the credential is rejected by the provider.
     InvalidCredential,
+    /// 429: the validation probe itself was rate limited.
     RateLimited,
+    /// 5xx or repeated transport failures.
     ProviderUnavailable,
+    /// Any other status or setup failure; carries a sanitized description.
     Unexpected(String),
 }
 
+/// Lifecycle state of an in-memory OAuth attempt as exposed to polling
+/// clients via the callback-state endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OpenAiOAuthAttemptStateRecord {
     Pending { message: String },
@@ -64,6 +93,12 @@ struct OAuthTokenExchangePayload {
     expires_in: Option<u64>,
 }
 
+/// Resolves the OAuth endpoint set from `PALYRA_OPENAI_OAUTH_*` env overrides,
+/// falling back to the production OpenAI endpoints.
+///
+/// # Errors
+/// Returns an error if any configured endpoint is empty, relative, carries
+/// embedded credentials/query/fragment, or uses `http` on a non-loopback host.
 pub(crate) fn oauth_endpoint_config_from_env() -> Result<OpenAiOAuthEndpointConfig> {
     Ok(OpenAiOAuthEndpointConfig {
         authorization_endpoint: load_openai_oauth_endpoint_from_env(
@@ -84,6 +119,8 @@ pub(crate) fn oauth_endpoint_config_from_env() -> Result<OpenAiOAuthEndpointConf
     })
 }
 
+/// Trims and lowercases the requested scopes, substituting
+/// [`OPENAI_OAUTH_DEFAULT_SCOPES`] when nothing non-empty remains.
 pub(crate) fn normalize_scopes(scopes: &[String]) -> Vec<String> {
     let normalized = scopes
         .iter()
@@ -96,16 +133,27 @@ pub(crate) fn normalize_scopes(scopes: &[String]) -> Vec<String> {
     normalized
 }
 
+/// Generates a PKCE code verifier: 32 random bytes, base64url-encoded without
+/// padding per RFC 7636 section 4.1 (43 characters, within the 43-128 range).
 pub(crate) fn generate_pkce_verifier() -> String {
     let bytes: [u8; 32] = rand::random();
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// Derives the `S256` PKCE code challenge for `verifier` (RFC 7636 section 4.2).
 pub(crate) fn pkce_challenge(verifier: &str) -> String {
     let digest = Sha256::digest(verifier.as_bytes());
     URL_SAFE_NO_PAD.encode(digest)
 }
 
+/// Builds the user-facing authorization URL for the PKCE code flow.
+///
+/// `state` carries the attempt id and is round-tripped by the provider so the
+/// callback can be matched to its pending attempt.
+///
+/// # Errors
+/// Currently infallible; the `Result` is kept so URL-construction failures
+/// can surface later without a signature change.
 pub(crate) fn build_authorization_url(
     endpoint: &Url,
     client_id: &str,
@@ -129,6 +177,14 @@ pub(crate) fn build_authorization_url(
     Ok(url.to_string())
 }
 
+/// Exchanges an authorization code (plus PKCE verifier) for access and
+/// refresh tokens at `token_endpoint`.
+///
+/// # Errors
+/// Returns an error when the HTTP client cannot be built, the request fails,
+/// the provider responds with a non-success status (body sanitized before it
+/// reaches the message), the response is not valid JSON, or the payload lacks
+/// a usable `access_token` or `refresh_token`.
 pub(crate) async fn exchange_authorization_code(
     token_endpoint: &Url,
     redirect_uri: &str,
@@ -150,6 +206,8 @@ pub(crate) async fn exchange_authorization_code(
         ("code_verifier", code_verifier.to_owned()),
         ("code", code.to_owned()),
     ];
+    // Public PKCE clients have no client_secret; only confidential clients
+    // send one, so an empty secret is omitted rather than sent blank.
     if !client_secret.trim().is_empty() {
         form_fields.push(("client_secret", client_secret.to_owned()));
     }
@@ -186,6 +244,17 @@ pub(crate) async fn exchange_authorization_code(
     })
 }
 
+/// Probes `GET {base_url}/models` with `bearer_token` to confirm the
+/// credential is accepted by the provider.
+///
+/// Only transport-level failures are retried (the provider was never
+/// reached); HTTP statuses are treated as deterministic answers and mapped
+/// immediately.
+///
+/// # Errors
+/// Returns [`OpenAiCredentialValidationError::InvalidCredential`] on 401/403,
+/// `RateLimited` on 429, `ProviderUnavailable` on 5xx or exhausted transport
+/// retries, and `Unexpected` for any other status or setup failure.
 pub(crate) async fn validate_openai_bearer_token(
     base_url: &str,
     bearer_token: &str,
@@ -235,6 +304,13 @@ pub(crate) async fn validate_openai_bearer_token(
     Err(OpenAiCredentialValidationError::ProviderUnavailable)
 }
 
+/// Revokes `token` (RFC 7009) at `revocation_endpoint`, retrying transient
+/// 5xx responses and transport failures a bounded number of times.
+///
+/// # Errors
+/// Returns an error when the HTTP client cannot be built, the provider
+/// responds with a persistent non-success status (body sanitized), or the
+/// retry budget is exhausted without reaching the endpoint.
 pub(crate) async fn revoke_openai_token(
     revocation_endpoint: &Url,
     client_id: &str,
@@ -294,6 +370,12 @@ pub(crate) async fn revoke_openai_token(
     Err(anyhow!("OpenAI OAuth revocation failed after exhausting retries"))
 }
 
+/// Renders the self-contained HTML page returned to the browser after an
+/// OAuth callback or device-flow poll.
+///
+/// When `payload_json` is provided, the page posts it to `window.opener`
+/// (same-origin only) so the console UI can finish the flow, then closes
+/// itself.
 pub(crate) fn render_callback_page(title: &str, body: &str, payload_json: Option<&str>) -> String {
     let escaped_title = html_escape(title);
     let escaped_body = html_escape(body);
@@ -308,6 +390,10 @@ pub(crate) fn render_callback_page(title: &str, body: &str, payload_json: Option
     )
 }
 
+// The payload is inlined inside a <script> element, so `<`, `>`, and `&` must
+// become \u escapes to block `</script>` breakout, and U+2028/U+2029 must be
+// escaped because they are line terminators in JavaScript source but not in
+// JSON.
 fn escape_json_for_script_tag(raw_json: &str) -> String {
     raw_json
         .chars()
@@ -372,6 +458,9 @@ fn parse_openai_oauth_endpoint(raw: &str, label: &str) -> Result<Url> {
     if parsed.query().is_some() || parsed.fragment().is_some() {
         anyhow::bail!("OpenAI OAuth {label} must not include query or fragment");
     }
+    // Plain http is tolerated only for loopback hosts (RFC 8252 native-app
+    // guidance), which keeps local test servers usable without weakening the
+    // https requirement for real endpoints.
     let loopback_http_allowed = host.eq_ignore_ascii_case("localhost")
         || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
     if parsed.scheme() != "https" && !(parsed.scheme() == "http" && loopback_http_allowed) {
@@ -384,6 +473,8 @@ fn parse_openai_oauth_endpoint(raw: &str, label: &str) -> Result<Url> {
 
 fn openai_models_endpoint(base_url: &str) -> Result<Url> {
     let mut normalized = base_url.trim().to_owned();
+    // Url::join drops the last path segment of a base without a trailing
+    // slash, which would turn ".../v1" + "models" into ".../models".
     if !normalized.ends_with('/') {
         normalized.push('/');
     }
