@@ -1,20 +1,28 @@
 //! Browserd inspection, diagnostics, and redaction helpers.
+//!
+//! All text leaving the daemon through proto responses (URLs, headers, console/network logs,
+//! DOM/accessibility snapshots) must pass through the redaction and byte-budget helpers here.
 
 use crate::*;
 
+/// Extracts the trimmed `<title>` content from an HTML body, if present.
 pub(crate) fn extract_html_title(body: &str) -> Option<&str> {
+    // ASCII lowercasing preserves byte offsets, so indices found in the lowered copy slice the
+    // original body correctly.
     let lower = body.to_ascii_lowercase();
     let start = lower.find("<title>")?;
     let end = lower[start + 7..].find("</title>")?;
     Some(body[start + 7..start + 7 + end].trim())
 }
 
+/// Like [`truncate_utf8_bytes`], additionally reporting whether truncation happened.
 pub(crate) fn truncate_utf8_bytes_with_flag(raw: &str, max_bytes: usize) -> (String, bool) {
     let truncated = truncate_utf8_bytes(raw, max_bytes);
     let was_truncated = truncated.len() < raw.len();
     (truncated, was_truncated)
 }
 
+/// Appends entries to a tab's network log, then trims oldest-first to the entry/byte budgets.
 pub(crate) fn append_network_log_entries(
     tab: &mut BrowserTabRecord,
     entries: &[NetworkLogEntryInternal],
@@ -35,6 +43,7 @@ pub(crate) fn append_network_log_entries(
     );
 }
 
+/// Resets a tab's network log to the entries captured by a fresh navigation.
 pub(crate) fn replace_network_log_entries_for_navigation(
     tab: &mut BrowserTabRecord,
     entries: &[NetworkLogEntryInternal],
@@ -69,6 +78,8 @@ fn trim_network_log_to_budget(
     }
 }
 
+/// Rough memory footprint of one network log entry; the fixed offsets overestimate per-field
+/// overhead so byte budgets err on the small side.
 pub(crate) fn estimate_network_log_entry_internal_bytes(entry: &NetworkLogEntryInternal) -> usize {
     let headers_bytes = entry
         .headers
@@ -78,6 +89,8 @@ pub(crate) fn estimate_network_log_entry_internal_bytes(entry: &NetworkLogEntryI
     entry.request_url.len() + entry.timing_bucket.len() + headers_bytes + 64
 }
 
+/// Builds a console log from `entries` capped to the entry and byte budgets (oldest dropped
+/// first once over the byte budget).
 pub(crate) fn clamp_console_log_entries<I>(
     entries: I,
     max_entries: usize,
@@ -129,6 +142,7 @@ fn estimate_console_entry_internal_bytes(entry: &BrowserConsoleEntryInternal) ->
         + 64
 }
 
+/// Appends one console entry to a tab, then trims oldest-first to the entry/byte budgets.
 pub(crate) fn append_console_log_entry(
     tab: &mut BrowserTabRecord,
     entry: BrowserConsoleEntryInternal,
@@ -147,6 +161,10 @@ pub(crate) fn append_console_log_entry(
     );
 }
 
+/// Converts a network log entry into its redacted proto form.
+///
+/// Header values are re-sanitized on the way out and the request URL is query-redacted;
+/// headers are omitted entirely unless `include_headers` is set.
 pub(crate) fn network_log_entry_to_proto(
     entry: NetworkLogEntryInternal,
     include_headers: bool,
@@ -191,6 +209,9 @@ fn estimate_network_log_proto_header_bytes(header: &browser_v1::NetworkLogHeader
     header.name.len() + header.value.len() + 8
 }
 
+/// Drops the oldest proto network entries until the estimated payload fits the byte budget.
+///
+/// Returns `true` if anything was removed.
 pub(crate) fn truncate_network_log_payload(
     entries: &mut Vec<browser_v1::NetworkLogEntry>,
     max_payload_bytes: usize,
@@ -205,6 +226,7 @@ pub(crate) fn truncate_network_log_payload(
     truncated
 }
 
+/// Converts a console entry into its redacted, byte-capped proto form.
 pub(crate) fn console_entry_to_proto(
     entry: &BrowserConsoleEntryInternal,
 ) -> browser_v1::BrowserConsoleEntry {
@@ -233,6 +255,9 @@ fn estimate_console_log_proto_entry_bytes(entry: &browser_v1::BrowserConsoleEntr
         + 64
 }
 
+/// Drops the oldest proto console entries until the estimated payload fits the byte budget.
+///
+/// Returns `true` if anything was removed.
 pub(crate) fn truncate_console_log_payload(
     entries: &mut Vec<browser_v1::BrowserConsoleEntry>,
     max_payload_bytes: usize,
@@ -247,6 +272,7 @@ pub(crate) fn truncate_console_log_payload(
     truncated
 }
 
+/// Buckets a request latency into the coarse timing labels used by the network log.
 pub(crate) fn timing_bucket_for_latency(latency_ms: u64) -> &'static str {
     if latency_ms <= 100 {
         "lt_100ms"
@@ -259,6 +285,7 @@ pub(crate) fn timing_bucket_for_latency(latency_ms: u64) -> &'static str {
     }
 }
 
+/// Converts response headers into sanitized log entries, sorted by name and count-capped.
 pub(crate) fn sanitize_network_headers(
     headers: &reqwest::header::HeaderMap,
 ) -> Vec<NetworkLogHeaderInternal> {
@@ -276,6 +303,8 @@ pub(crate) fn sanitize_network_headers(
     output
 }
 
+/// Sanitizes one header value: URL-shaped values get URL redaction, sensitive names or values
+/// are replaced wholesale, and the rest is byte-capped.
 pub(crate) fn sanitize_single_network_header(name: &str, raw_value: &str) -> String {
     if name.eq_ignore_ascii_case("location")
         || raw_value.starts_with("http://")
@@ -304,6 +333,7 @@ fn is_sensitive_header_name(name: &str) -> bool {
         || name.contains("password")
 }
 
+/// Reports whether free text contains credential-shaped substrings and must be redacted.
 pub(crate) fn contains_sensitive_material(raw: &str) -> bool {
     let lower = raw.to_ascii_lowercase();
     [
@@ -346,6 +376,8 @@ fn is_sensitive_debug_key(raw_key: &str) -> bool {
         || key.contains("token")
 }
 
+/// Sanitizes free-form diagnostic text: redacted wholesale when credential-shaped content is
+/// detected, byte-capped otherwise.
 pub(crate) fn sanitize_debug_text(raw: &str, max_bytes: usize) -> String {
     if raw.trim().is_empty() {
         return String::new();
@@ -356,6 +388,8 @@ pub(crate) fn sanitize_debug_text(raw: &str, max_bytes: usize) -> String {
     truncate_utf8_bytes(raw, max_bytes)
 }
 
+/// Sanitizes a key/value diagnostic pair, also redacting when the key itself looks sensitive
+/// (cookie names, storage keys, ...).
 pub(crate) fn sanitize_debug_map_value(key: &str, raw_value: &str, max_bytes: usize) -> String {
     if raw_value.trim().is_empty() {
         return String::new();
@@ -366,6 +400,10 @@ pub(crate) fn sanitize_debug_map_value(key: &str, raw_value: &str, max_bytes: us
     truncate_utf8_bytes(raw_value, max_bytes)
 }
 
+/// Normalizes a URL for logging/protos: credentials and fragments are dropped, default ports
+/// omitted, sensitive query values redacted, and the result byte-capped.
+///
+/// Unparseable input still gets best-effort query redaction rather than passing through raw.
 pub(crate) fn normalize_url_with_redaction(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -415,6 +453,8 @@ fn redact_query_from_raw(raw: &str) -> String {
     }
 }
 
+/// Rebuilds a query string, redacting values whose key is sensitive or whose content looks
+/// credential-shaped; remaining values are byte-capped.
 pub(crate) fn redact_query_pairs(query: &str) -> String {
     query
         .split('&')
@@ -445,6 +485,10 @@ pub(crate) fn redact_query_pairs(query: &str) -> String {
         .join("&")
 }
 
+/// Renders a numbered, one-line-per-element DOM outline of the page's opening tags.
+///
+/// Only a fixed allowlist of attributes is emitted, each value sanitized; returns the snapshot
+/// plus whether it was truncated to `max_bytes`.
 pub(crate) fn build_dom_snapshot(page_body: &str, max_bytes: usize) -> (String, bool) {
     let lines = collect_opening_tags(page_body)
         .iter()
@@ -528,6 +572,10 @@ fn snapshot_form_value_is_sensitive(tag: &str) -> bool {
         .any(|value| is_sensitive_debug_key(value.as_str()))
 }
 
+/// Renders a flat accessibility outline (role, name, tag, selector per line) of the page.
+///
+/// Roles come from explicit `role` attributes or per-tag inference; names prefer ARIA/label
+/// attributes over inner text. Returns the snapshot plus whether it was truncated.
 pub(crate) fn build_accessibility_tree_snapshot(
     page_body: &str,
     max_bytes: usize,
@@ -687,6 +735,8 @@ fn accessibility_selector_for_tag(tag: &str) -> String {
     "-".to_owned()
 }
 
+/// Extracts whitespace-collapsed visible text from HTML (scripts, styles, and comments
+/// stripped); returns the text plus whether it was truncated to `max_bytes`.
 pub(crate) fn build_visible_text_snapshot(page_body: &str, max_bytes: usize) -> (String, bool) {
     let without_scripts = strip_tag_block_case_insensitive(page_body, "script");
     let without_styles = strip_tag_block_case_insensitive(without_scripts.as_str(), "style");

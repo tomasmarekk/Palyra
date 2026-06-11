@@ -1,3 +1,8 @@
+//! Session snapshot hashing, persistence triggers, and cookie/storage mutation rules.
+//!
+//! Snapshot hashes are computed over a canonical sorted-map form so they stay stable across
+//! `HashMap` iteration orders; network logs are intentionally never persisted.
+
 use crate::*;
 
 fn map_to_sorted_map(map: &HashMap<String, String>) -> BTreeMap<String, String> {
@@ -23,6 +28,12 @@ fn tab_record_for_hash(tab: &BrowserTabRecord) -> BrowserTabRecordForHash {
     }
 }
 
+/// Computes the canonical SHA-256 hash of a snapshot, stable across map iteration orders.
+///
+/// This hash is what gets recorded in the profile registry and re-checked on restore.
+///
+/// # Errors
+/// Fails when the canonical form does not serialize.
 pub(crate) fn persisted_snapshot_hash(snapshot: &PersistedSessionSnapshot) -> Result<String> {
     let canonical = PersistedSessionSnapshotForHash {
         v: snapshot.v,
@@ -42,6 +53,12 @@ pub(crate) fn persisted_snapshot_hash(snapshot: &PersistedSessionSnapshot) -> Re
     Ok(sha256_hex(bytes.as_slice()))
 }
 
+/// Computes the hash in the pre-`state_revision` layout for backward-compatible validation.
+///
+/// Only consulted for revision-0 snapshots; see [`validate_restored_snapshot_against_profile`].
+///
+/// # Errors
+/// Fails when the legacy form does not serialize.
 pub(crate) fn persisted_snapshot_legacy_hash(
     snapshot: &PersistedSessionSnapshot,
 ) -> Result<String> {
@@ -62,6 +79,15 @@ pub(crate) fn persisted_snapshot_legacy_hash(
     Ok(sha256_hex(bytes.as_slice()))
 }
 
+/// Verifies a restored snapshot against the profile's recorded revision and state hash.
+///
+/// Acceptance order: raw plaintext hash, canonical hash, then — only for revision-0
+/// (pre-revision) snapshots — the legacy hash layout. A profile without a recorded hash
+/// accepts any snapshot at or above its revision.
+///
+/// # Errors
+/// Fails when the snapshot revision is older than the profile's (rollback) or no hash form
+/// matches (tampering or corruption).
 pub(crate) fn validate_restored_snapshot_against_profile(
     snapshot: &PersistedSessionSnapshot,
     raw_hash_sha256: Option<&str>,
@@ -93,6 +119,15 @@ pub(crate) fn validate_restored_snapshot_against_profile(
     anyhow::bail!("snapshot hash mismatch for profile '{}'", profile.profile_id);
 }
 
+/// Writes the session's encrypted snapshot and bumps the profile state revision.
+///
+/// No-op when persistence is disabled. Tab order is preserved and tabs missing from
+/// `tab_order` are appended so no tab state is silently lost; network logs are stripped before
+/// writing. A failed profile-metadata update is logged but does not fail the persist.
+///
+/// # Errors
+/// Fails when the persistence id is missing, revision lookup fails, or hashing/encryption/
+/// writing of the snapshot fails.
 pub(crate) fn persist_session_snapshot(
     store: &PersistedStateStore,
     session: &BrowserSessionRecord,
@@ -140,6 +175,8 @@ pub(crate) fn persist_session_snapshot(
             state_revision,
             snapshot_hash.as_str(),
         ) {
+            // Best-effort: the snapshot itself is already persisted; a stale profile hash will
+            // surface at restore validation rather than losing the newer state here.
             warn!(
                 profile_id = profile_id.as_str(),
                 error = %error,
@@ -150,6 +187,14 @@ pub(crate) fn persist_session_snapshot(
     Ok(())
 }
 
+/// Persists a session copy taken after a state mutation, if persistence applies.
+///
+/// No-op when there is no state store, no session copy, or persistence is disabled for the
+/// session.
+///
+/// # Errors
+/// Fails when [`persist_session_snapshot`] fails; `operation` names the mutation in the error
+/// context.
 pub(crate) fn persist_session_after_mutation(
     runtime: &BrowserRuntimeState,
     session_for_persist: Option<BrowserSessionRecord>,
@@ -164,10 +209,16 @@ pub(crate) fn persist_session_after_mutation(
     Ok(())
 }
 
+/// Maps a persistence failure to a gRPC internal-error status.
 pub(crate) fn map_persist_error_to_status(error: anyhow::Error) -> Status {
     Status::internal(error.to_string())
 }
 
+/// Builds a Cookie header value for a URL from the session jar, or `None` when no cookies
+/// apply.
+///
+/// Only cookies stored under the URL's exact host are included (no parent-domain matching);
+/// pairs are sorted for deterministic output.
 pub(crate) fn cookie_header_for_url(
     session: &BrowserSessionRecord,
     raw_url: &str,
@@ -183,6 +234,10 @@ pub(crate) fn cookie_header_for_url(
     Some(pairs.join("; "))
 }
 
+/// Parses a Set-Cookie header into a [`CookieUpdate`] for `domain`.
+///
+/// Only the leading name=value pair is kept; cookie attributes (Path, Expires, ...) are
+/// ignored, the name is lowercased, and the value is capped at 1024 bytes.
 pub(crate) fn parse_set_cookie_update(domain: &str, raw_set_cookie: &str) -> Option<CookieUpdate> {
     let normalized_domain = domain.trim().trim_matches('.').to_ascii_lowercase();
     if normalized_domain.is_empty() {
@@ -201,6 +256,10 @@ pub(crate) fn parse_set_cookie_update(domain: &str, raw_set_cookie: &str) -> Opt
     })
 }
 
+/// Applies cookie updates to the session jar under the per-session/per-domain caps.
+///
+/// An empty value deletes the cookie (and the domain once empty). When a cap is reached, new
+/// entries are dropped rather than evicting existing ones.
 pub(crate) fn apply_cookie_updates(session: &mut BrowserSessionRecord, updates: &[CookieUpdate]) {
     for update in updates {
         if update.domain.is_empty() || update.name.is_empty() {
@@ -230,6 +289,10 @@ pub(crate) fn apply_cookie_updates(session: &mut BrowserSessionRecord, updates: 
     }
 }
 
+/// Test-only helper: mutates one storage entry, either replacing or appending to its value.
+///
+/// Mirrors the cap-and-truncate rules of [`replace_storage_entries_for_origin`] at single-entry
+/// granularity.
 #[cfg(test)]
 pub(crate) fn apply_storage_entry_update(
     session: &mut BrowserSessionRecord,
@@ -263,6 +326,10 @@ pub(crate) fn apply_storage_entry_update(
     *existing = truncate_utf8_bytes(combined.as_str(), MAX_STORAGE_ENTRY_VALUE_BYTES);
 }
 
+/// Replaces an origin's storage entries wholesale, clamping to the per-origin caps.
+///
+/// An empty (or fully-clamped-away) entry map removes the origin. New origins are dropped when
+/// the per-session origin cap is reached.
 pub(crate) fn replace_storage_entries_for_origin(
     session: &mut BrowserSessionRecord,
     origin: &str,
@@ -304,6 +371,10 @@ pub(crate) fn replace_storage_entries_for_origin(
     }
 }
 
+/// Clamps a restored cookie jar to current domain/cookie caps and value byte limits.
+///
+/// Which entries survive when over a cap is arbitrary (`HashMap` iteration order); restored
+/// snapshots are untrusted input, so the caps matter more than the selection.
 pub(crate) fn clamp_cookie_jar(
     cookie_jar: HashMap<String, HashMap<String, String>>,
 ) -> HashMap<String, HashMap<String, String>> {
@@ -332,6 +403,9 @@ pub(crate) fn clamp_cookie_jar(
     clamped
 }
 
+/// Clamps restored storage state to current origin/entry caps and value byte limits.
+///
+/// Same arbitrary-survivor caveat as [`clamp_cookie_jar`].
 pub(crate) fn clamp_storage_entries(
     storage_entries: HashMap<String, HashMap<String, String>>,
 ) -> HashMap<String, HashMap<String, String>> {
@@ -361,6 +435,7 @@ pub(crate) fn clamp_storage_entries(
     clamped
 }
 
+/// Normalizes a URL to its storage-origin key (`scheme://host[:port]`, default ports omitted).
 pub(crate) fn url_origin_key(raw_url: &str) -> Option<String> {
     let url = Url::parse(raw_url).ok()?;
     let host = url.host_str()?.to_ascii_lowercase();

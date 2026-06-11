@@ -1,5 +1,12 @@
+//! Browser session domain state: tabs, budgets, permissions, and HTML selector helpers.
+//!
+//! [`BrowserSessionRecord`] is the in-memory source of truth for a session, guarded by
+//! [`BrowserRuntimeState::sessions`]. Several types here are serialized verbatim inside
+//! [`PersistedSessionSnapshot`], so their serde shapes are on-disk format.
+
 use crate::*;
 
+/// Per-capability permission state for a session; defaults to deny.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub(crate) enum PermissionSettingInternal {
     #[default]
@@ -7,24 +14,16 @@ pub(crate) enum PermissionSettingInternal {
     Allow,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Camera/microphone/location grants for a session; the default denies everything.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub(crate) struct SessionPermissionsInternal {
     pub(crate) camera: PermissionSettingInternal,
     pub(crate) microphone: PermissionSettingInternal,
     pub(crate) location: PermissionSettingInternal,
 }
 
-impl Default for SessionPermissionsInternal {
-    fn default() -> Self {
-        Self {
-            camera: PermissionSettingInternal::Deny,
-            microphone: PermissionSettingInternal::Deny,
-            location: PermissionSettingInternal::Deny,
-        }
-    }
-}
-
 impl SessionPermissionsInternal {
+    /// Converts the permission set into its proto form.
     pub(crate) fn to_proto(&self) -> browser_v1::SessionPermissions {
         browser_v1::SessionPermissions {
             v: CANONICAL_PROTOCOL_MAJOR,
@@ -34,6 +33,9 @@ impl SessionPermissionsInternal {
         }
     }
 
+    /// Applies a proto permission update; unrecognized values leave fields unchanged.
+    ///
+    /// `reset_to_default` wins over the individual fields and restores deny-all.
     pub(crate) fn apply_update(
         &mut self,
         camera: i32,
@@ -57,11 +59,16 @@ impl SessionPermissionsInternal {
     }
 }
 
+/// Approximates the wall-clock unix-millisecond timestamp at which `instant` was captured.
+///
+/// Computed as "now minus elapsed", so the result shifts if the system clock is adjusted
+/// between capture and conversion.
 pub(crate) fn instant_to_unix_ms(instant: Instant) -> u64 {
     current_unix_ms()
         .saturating_sub(u64::try_from(instant.elapsed().as_millis()).unwrap_or(u64::MAX))
 }
 
+/// Builds the redacted proto summary of a session (URLs and titles are sanitized/capped).
 pub(crate) fn session_summary_to_proto(
     session_id: &str,
     session: &BrowserSessionRecord,
@@ -105,6 +112,7 @@ pub(crate) fn session_summary_to_proto(
     }
 }
 
+/// Builds the proto session detail: summary plus effective budget and the tab list.
 pub(crate) fn session_detail_to_proto(
     session_id: &str,
     session: &BrowserSessionRecord,
@@ -117,6 +125,7 @@ pub(crate) fn session_detail_to_proto(
     }
 }
 
+/// One executed action in a session's bounded action log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct BrowserActionLogEntryInternal {
     pub(crate) action_id: String,
@@ -131,12 +140,14 @@ pub(crate) struct BrowserActionLogEntryInternal {
     pub(crate) page_url: String,
 }
 
+/// A single already-sanitized header captured in the network log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct NetworkLogHeaderInternal {
     pub(crate) name: String,
     pub(crate) value: String,
 }
 
+/// One captured network request/response in a tab's bounded network log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct NetworkLogEntryInternal {
     pub(crate) request_url: String,
@@ -147,6 +158,7 @@ pub(crate) struct NetworkLogEntryInternal {
     pub(crate) headers: Vec<NetworkLogHeaderInternal>,
 }
 
+/// Console/diagnostic severity, ordered from least to most severe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum BrowserDiagnosticSeverityInternal {
     Debug,
@@ -156,6 +168,7 @@ pub(crate) enum BrowserDiagnosticSeverityInternal {
 }
 
 impl BrowserDiagnosticSeverityInternal {
+    /// Converts the severity into its proto enum tag.
     pub(crate) fn to_proto(self) -> i32 {
         match self {
             Self::Debug => browser_v1::BrowserDiagnosticSeverity::Debug as i32,
@@ -165,6 +178,7 @@ impl BrowserDiagnosticSeverityInternal {
         }
     }
 
+    /// Converts a proto severity tag; unknown or unspecified values map to `Info`.
     pub(crate) fn from_proto(value: i32) -> Self {
         match browser_v1::BrowserDiagnosticSeverity::try_from(value)
             .unwrap_or(browser_v1::BrowserDiagnosticSeverity::Unspecified)
@@ -177,6 +191,7 @@ impl BrowserDiagnosticSeverityInternal {
     }
 }
 
+/// One console/diagnostic event in a tab's bounded console log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct BrowserConsoleEntryInternal {
     pub(crate) severity: BrowserDiagnosticSeverityInternal,
@@ -188,6 +203,11 @@ pub(crate) struct BrowserConsoleEntryInternal {
     pub(crate) page_url: String,
 }
 
+/// In-memory and persisted state for one tab.
+///
+/// Serialized verbatim inside [`PersistedSessionSnapshot`], so field names are on-disk format.
+/// `console_log` defaults on deserialize so snapshots written before console capture still
+/// load.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct BrowserTabRecord {
     pub(crate) tab_id: String,
@@ -203,6 +223,7 @@ pub(crate) struct BrowserTabRecord {
 }
 
 impl BrowserTabRecord {
+    /// Creates an empty tab record with the given id.
     pub(crate) fn new(tab_id: String) -> Self {
         Self {
             tab_id,
@@ -218,6 +239,7 @@ impl BrowserTabRecord {
     }
 }
 
+/// Whether and under which id a session's state is persisted, and whether a restore happened.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SessionPersistenceState {
     pub(crate) enabled: bool,
@@ -225,6 +247,7 @@ pub(crate) struct SessionPersistenceState {
     pub(crate) state_restored: bool,
 }
 
+/// Construction parameters for [`BrowserSessionRecord::with_defaults`].
 #[derive(Debug, Clone)]
 pub(crate) struct BrowserSessionInit {
     pub(crate) principal: String,
@@ -240,6 +263,10 @@ pub(crate) struct BrowserSessionInit {
     pub(crate) persistence: SessionPersistenceState,
 }
 
+/// In-memory state of one browser session, guarded by [`BrowserRuntimeState::sessions`].
+///
+/// Invariants: a session always has at least one tab, and `active_tab_id` is kept pointing at
+/// an existing tab by every tab mutation. `last_active` drives idle-TTL expiry.
 #[derive(Debug, Clone)]
 pub(crate) struct BrowserSessionRecord {
     pub(crate) principal: String,
@@ -266,6 +293,7 @@ pub(crate) struct BrowserSessionRecord {
 }
 
 impl BrowserSessionRecord {
+    /// Creates a fresh session with one empty tab and zeroed action counters.
     pub(crate) fn with_defaults(init: BrowserSessionInit) -> Self {
         let initial_tab_id = Ulid::new().to_string();
         let mut tabs = HashMap::new();
@@ -295,14 +323,19 @@ impl BrowserSessionRecord {
         }
     }
 
+    /// Returns the currently active tab, if it still exists.
     pub(crate) fn active_tab(&self) -> Option<&BrowserTabRecord> {
         self.tabs.get(self.active_tab_id.as_str())
     }
 
+    /// Returns the currently active tab mutably, if it still exists.
     pub(crate) fn active_tab_mut(&mut self) -> Option<&mut BrowserTabRecord> {
         self.tabs.get_mut(self.active_tab_id.as_str())
     }
 
+    /// Creates a new empty tab and returns its id without activating it.
+    ///
+    /// Does not enforce the tab budget; callers must check [`Self::can_create_tab`] first.
     pub(crate) fn create_tab(&mut self) -> String {
         let tab_id = Ulid::new().to_string();
         self.tabs.insert(tab_id.clone(), BrowserTabRecord::new(tab_id.clone()));
@@ -310,10 +343,12 @@ impl BrowserSessionRecord {
         tab_id
     }
 
+    /// Reports whether the session is still under its tab budget.
     pub(crate) fn can_create_tab(&self) -> bool {
         self.tabs.len() < self.budget.max_tabs_per_session
     }
 
+    /// Converts one tab into its redacted proto form, or `None` for unknown tab ids.
     pub(crate) fn tab_to_proto(&self, tab_id: &str) -> Option<browser_v1::BrowserTab> {
         self.tabs.get(tab_id).map(|tab| browser_v1::BrowserTab {
             v: CANONICAL_PROTOCOL_MAJOR,
@@ -327,10 +362,18 @@ impl BrowserSessionRecord {
         })
     }
 
+    /// Lists all tabs in creation order as redacted protos.
     pub(crate) fn list_tabs(&self) -> Vec<browser_v1::BrowserTab> {
         self.tab_order.iter().filter_map(|tab_id| self.tab_to_proto(tab_id)).collect()
     }
 
+    /// Closes a tab, refusing to close the last remaining one.
+    ///
+    /// Returns the closed tab id plus the id of the tab switched to when the active tab was the
+    /// one closed.
+    ///
+    /// # Errors
+    /// Returns an error string when the tab id is unknown or it is the last remaining tab.
     pub(crate) fn close_tab(&mut self, tab_id: &str) -> Result<(String, Option<String>), String> {
         if self.tabs.len() <= 1 {
             return Err("cannot close the last remaining tab".to_owned());
@@ -353,12 +396,18 @@ impl BrowserSessionRecord {
         Ok((tab_id.to_owned(), switched_to))
     }
 
+    /// Clears the network log of every tab.
     pub(crate) fn clear_network_logs(&mut self) {
         for tab in self.tabs.values_mut() {
             tab.network_log.clear();
         }
     }
 
+    /// Restores tabs, permissions, cookies, and storage from a persisted snapshot.
+    ///
+    /// Restore rules: tabs beyond the current budget or with invalid ids are dropped, network
+    /// logs are never restored, console logs are re-clamped, cookie/storage maps are re-clamped
+    /// against current limits, and a fresh tab is created when no tab survives.
     pub(crate) fn apply_snapshot(&mut self, snapshot: PersistedSessionSnapshot) {
         let mut tabs = HashMap::new();
         for mut tab in snapshot.tabs.into_iter().take(self.budget.max_tabs_per_session) {
@@ -403,6 +452,10 @@ impl BrowserSessionRecord {
     }
 }
 
+/// Process-wide daemon state shared across gRPC/HTTP handlers.
+///
+/// The three session maps have independent mutexes; guards must be dropped before awaiting
+/// engine or network operations (see `consume_action_budget_and_snapshot` for the pattern).
 pub(crate) struct BrowserRuntimeState {
     pub(crate) started_at: Instant,
     pub(crate) auth_token: Option<String>,
@@ -419,6 +472,11 @@ pub(crate) struct BrowserRuntimeState {
 }
 
 impl BrowserRuntimeState {
+    /// Builds runtime state from CLI args plus environment overrides.
+    ///
+    /// # Errors
+    /// Fails when `session_idle_ttl_ms`, `max_sessions`, or `chromium_startup_timeout_ms` is
+    /// zero, or when the persisted state store cannot be initialized.
     pub(crate) fn new(args: &Args) -> Result<Self> {
         if args.session_idle_ttl_ms == 0
             || args.max_sessions == 0
@@ -487,6 +545,7 @@ impl BrowserRuntimeState {
     }
 }
 
+/// A single cookie mutation; an empty `value` deletes the cookie (see `apply_cookie_updates`).
 #[derive(Debug, Clone)]
 pub(crate) struct CookieUpdate {
     pub(crate) domain: String,
@@ -494,6 +553,7 @@ pub(crate) struct CookieUpdate {
     pub(crate) value: String,
 }
 
+/// Result of a navigation attempt, including captured logs and cookie updates to apply.
 #[derive(Debug, Clone)]
 pub(crate) struct NavigateOutcome {
     pub(crate) success: bool,
@@ -508,6 +568,7 @@ pub(crate) struct NavigateOutcome {
     pub(crate) cookie_updates: Vec<CookieUpdate>,
 }
 
+/// Truncates `raw` to at most `max_bytes` bytes, backing up to the nearest char boundary.
 pub(crate) fn truncate_utf8_bytes(raw: &str, max_bytes: usize) -> String {
     if raw.len() <= max_bytes {
         return raw.to_owned();
@@ -519,6 +580,10 @@ pub(crate) fn truncate_utf8_bytes(raw: &str, max_bytes: usize) -> String {
     raw[..boundary].to_owned()
 }
 
+/// Parses and validates a request session id.
+///
+/// # Errors
+/// Returns an error string when the id is missing, empty, or not a canonical id.
 pub(crate) fn parse_session_id(raw: Option<&str>) -> Result<String, String> {
     let value = raw.unwrap_or_default().trim();
     if value.is_empty() {
@@ -528,6 +593,10 @@ pub(crate) fn parse_session_id(raw: Option<&str>) -> Result<String, String> {
     Ok(value.to_owned())
 }
 
+/// Parses a session id from its proto wrapper; see [`parse_session_id`] for the rules.
+///
+/// # Errors
+/// Same conditions as [`parse_session_id`].
 pub(crate) fn parse_session_id_from_proto(
     raw: Option<proto::palyra::common::v1::CanonicalId>,
 ) -> Result<String, String> {
@@ -537,6 +606,10 @@ pub(crate) fn parse_session_id_from_proto(
     }
 }
 
+/// Parses and validates a request tab id.
+///
+/// # Errors
+/// Returns an error string when the id is missing, empty, or not a canonical id.
 pub(crate) fn parse_tab_id(raw: Option<&str>) -> Result<String, String> {
     let value = raw.unwrap_or_default().trim();
     if value.is_empty() {
@@ -546,6 +619,10 @@ pub(crate) fn parse_tab_id(raw: Option<&str>) -> Result<String, String> {
     Ok(value.to_owned())
 }
 
+/// Parses a tab id from its proto wrapper; see [`parse_tab_id`] for the rules.
+///
+/// # Errors
+/// Same conditions as [`parse_tab_id`].
 pub(crate) fn parse_tab_id_from_proto(
     raw: Option<proto::palyra::common::v1::CanonicalId>,
 ) -> Result<String, String> {
@@ -555,6 +632,7 @@ pub(crate) fn parse_tab_id_from_proto(
     }
 }
 
+/// Current wall-clock time in unix milliseconds; returns 0 if the clock is before the epoch.
 pub(crate) fn current_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -562,6 +640,7 @@ pub(crate) fn current_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Trims `raw` and converts whitespace-only input to `None`.
 pub(crate) fn normalize_optional_string(raw: &str) -> Option<String> {
     let value = raw.trim();
     if value.is_empty() {
@@ -571,6 +650,9 @@ pub(crate) fn normalize_optional_string(raw: &str) -> Option<String> {
     }
 }
 
+/// Validates a caller-supplied persistence id (max 128 bytes of `A-Z a-z 0-9 . _ -`).
+///
+/// The id becomes an on-disk state file name, so anything else is rejected rather than escaped.
 pub(crate) fn sanitize_persistence_id(raw: &str) -> Option<String> {
     let value = raw.trim();
     if value.is_empty() {
@@ -587,6 +669,7 @@ pub(crate) fn sanitize_persistence_id(raw: &str) -> Option<String> {
     }
 }
 
+/// Maps a permission setting to its proto enum tag (1 = deny, 2 = allow).
 pub(crate) fn permission_setting_to_proto(value: PermissionSettingInternal) -> i32 {
     match value {
         PermissionSettingInternal::Deny => 1,
@@ -594,6 +677,7 @@ pub(crate) fn permission_setting_to_proto(value: PermissionSettingInternal) -> i
     }
 }
 
+/// Maps a proto permission tag back; unspecified/unknown tags yield `None` ("leave unchanged").
 pub(crate) fn permission_setting_from_proto(value: i32) -> Option<PermissionSettingInternal> {
     match value {
         1 => Some(PermissionSettingInternal::Deny),
@@ -602,10 +686,12 @@ pub(crate) fn permission_setting_from_proto(value: i32) -> Option<PermissionSett
     }
 }
 
+/// Reports whether `port` is the default for `scheme` (and can be omitted from origins).
 pub(crate) fn is_default_port(scheme: &str, port: u16) -> bool {
     matches!((scheme, port), ("http", 80) | ("https", 443))
 }
 
+/// Reports whether a URL query key likely carries credential material and must be redacted.
 pub(crate) fn is_sensitive_query_key(raw_key: &str) -> bool {
     let key = raw_key.to_ascii_lowercase();
     matches!(
@@ -633,6 +719,10 @@ pub(crate) fn is_sensitive_query_key(raw_key: &str) -> bool {
         || key.contains("password")
 }
 
+/// Finds the first opening tag in `html` matching a simplified CSS selector.
+///
+/// Supported selector forms: `#id`, `.class`, bare tag names, and single attribute selectors
+/// (`tag[attr]`, `[attr=value]`). Combinators and pseudo-classes are not supported.
 pub(crate) fn find_matching_html_tag(selector: &str, html: &str) -> Option<String> {
     let selector = selector.trim();
     if selector.is_empty() {
@@ -691,11 +781,10 @@ fn html_tag_matches_selector(tag: &str, selector: &str, selector_lower: &str) ->
         }
         return has_attr(tag_lower.as_str(), attribute_selector.name.to_ascii_lowercase().as_str());
     }
-    html_tag_name(tag_lower.as_str())
-        .map(|name| name.eq_ignore_ascii_case(selector_lower))
-        .unwrap_or(false)
+    html_tag_name(tag_lower.as_str()).is_some_and(|name| name.eq_ignore_ascii_case(selector_lower))
 }
 
+/// Parsed `tag[attr]` / `[attr=value]` selector parts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SimpleAttributeSelector<'a> {
     tag_name: Option<&'a str>,
@@ -755,6 +844,7 @@ fn has_attr(tag_lower: &str, attr_name_lower: &str) -> bool {
     if extract_attr_value(tag_lower, attr_name_lower).is_some() {
         return true;
     }
+    // Boundary checks keep e.g. a `data-href` attribute from satisfying a search for `href`.
     let mut cursor = 0usize;
     while let Some(relative_start) = tag_lower[cursor..].find(attr_name_lower) {
         let start = cursor + relative_start;
@@ -774,19 +864,23 @@ fn has_attr(tag_lower: &str, attr_name_lower: &str) -> bool {
 
 fn has_attr_value(tag_lower: &str, attr_name: &str, expected_value_lower: &str) -> bool {
     extract_attr_value(tag_lower, attr_name)
-        .map(|value| value.eq_ignore_ascii_case(expected_value_lower))
-        .unwrap_or(false)
+        .is_some_and(|value| value.eq_ignore_ascii_case(expected_value_lower))
 }
 
+/// Extracts an attribute value from an already-lowercased opening tag.
 pub(crate) fn extract_attr_value(tag_lower: &str, attr_name: &str) -> Option<String> {
     let attr_name_lower = attr_name.to_ascii_lowercase();
     let value_start = find_attr_value_start(tag_lower, attr_name_lower.as_str())?;
     parse_attr_value(&tag_lower[value_start..])
 }
 
+/// Extracts an attribute value matching the name case-insensitively while preserving the
+/// original value casing.
 pub(crate) fn extract_attr_value_case_insensitive(tag: &str, attr_name: &str) -> Option<String> {
     let tag_lower = tag.to_ascii_lowercase();
     let attr_name_lower = attr_name.to_ascii_lowercase();
+    // ASCII lowercasing preserves byte offsets, so an index found in the lowered copy slices
+    // the original tag correctly.
     let value_start = find_attr_value_start(tag_lower.as_str(), attr_name_lower.as_str())?;
     parse_attr_value(&tag[value_start..])
 }
@@ -831,6 +925,7 @@ fn parse_attr_value(raw_value: &str) -> Option<String> {
     Some(value[..end].to_owned())
 }
 
+/// Returns the element name of an already-lowercased opening tag, if any.
 pub(crate) fn html_tag_name(tag_lower: &str) -> Option<&str> {
     let trimmed = tag_lower.trim_start_matches('<').trim_start();
     let end = trimmed
@@ -843,17 +938,21 @@ pub(crate) fn html_tag_name(tag_lower: &str) -> Option<&str> {
     }
 }
 
+/// Reports whether a tag is a text-entry element (`input` or `textarea`).
 pub(crate) fn is_typable_tag(tag: &str) -> bool {
     let tag_lower = tag.to_ascii_lowercase();
     matches!(html_tag_name(tag_lower.as_str()), Some("input" | "textarea"))
 }
 
+/// Reports whether a tag is a file-upload input.
 pub(crate) fn is_file_input_tag(tag: &str) -> bool {
     let tag_lower = tag.to_ascii_lowercase();
     html_tag_name(tag_lower.as_str()) == Some("input")
         && has_attr_value(tag_lower.as_str(), "type", "file")
 }
 
+/// Heuristically detects anchors that trigger downloads: an explicit `download` attribute or an
+/// href ending in a known file extension.
 pub(crate) fn is_download_like_tag(tag: &str) -> bool {
     let tag_lower = tag.to_ascii_lowercase();
     if html_tag_name(tag_lower.as_str()) != Some("a") {

@@ -1,3 +1,10 @@
+//! Chromium-backed browser engine driven over CDP via `headless_chrome`.
+//!
+//! Owns per-session browser processes, tabs, page-side diagnostics hooks, the
+//! per-session SOCKS5 egress proxy, and the remote-IP security guard. The CDP
+//! client is fully synchronous, so every browser call in this module must run
+//! through [`run_chromium_blocking`].
+
 use crate::*;
 use headless_chrome::protocol::cdp::Emulation;
 use headless_chrome::{
@@ -5,6 +12,9 @@ use headless_chrome::{
     types::{Bounds, PrintToPdfOptions},
 };
 
+/// Outcome of a Chromium DOM action (click, type, press, select, highlight, file input).
+///
+/// `outcome` is a stable machine-readable status label; `error` is empty on success.
 #[derive(Debug)]
 pub(crate) struct ChromiumActionOutcome {
     pub(crate) success: bool,
@@ -13,6 +23,7 @@ pub(crate) struct ChromiumActionOutcome {
     pub(crate) attempts: u32,
 }
 
+/// Scroll positions reported by the page after a Chromium scroll action.
 #[derive(Debug)]
 pub(crate) struct ChromiumScrollOutcome {
     pub(crate) success: bool,
@@ -21,6 +32,10 @@ pub(crate) struct ChromiumScrollOutcome {
     pub(crate) error: String,
 }
 
+/// Result of applying device-metrics emulation to the active tab.
+///
+/// `metric_mismatch` flags when the page reports a viewport different from the
+/// requested dimensions.
 #[derive(Debug)]
 pub(crate) struct ChromiumViewportOutcome {
     pub(crate) success: bool,
@@ -32,6 +47,7 @@ pub(crate) struct ChromiumViewportOutcome {
     pub(crate) error: String,
 }
 
+/// Result of polling the active tab for a selector and/or text condition.
 #[derive(Debug)]
 pub(crate) struct ChromiumWaitOutcome {
     pub(crate) success: bool,
@@ -42,6 +58,7 @@ pub(crate) struct ChromiumWaitOutcome {
     pub(crate) error: String,
 }
 
+/// Raw page snapshot (HTML body, title, URL) read from a live tab.
 #[derive(Debug)]
 pub(crate) struct ChromiumObserveSnapshot {
     pub(crate) page_body: String,
@@ -49,6 +66,7 @@ pub(crate) struct ChromiumObserveSnapshot {
     pub(crate) page_url: String,
 }
 
+/// Layout and visual viewport metrics with derived overflow flags.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ChromiumLayoutMetrics {
     pub(crate) viewport_width: u32,
@@ -116,6 +134,7 @@ struct ChromiumComputedStylePayload {
     value: String,
 }
 
+/// A captured download (blob anchor click or attachment response) with decoded bytes.
 #[derive(Debug)]
 pub(crate) struct ChromiumClientDownload {
     pub(crate) source_url: String,
@@ -126,6 +145,7 @@ pub(crate) struct ChromiumClientDownload {
 
 type ChromiumLocalStorageSnapshot = Option<(String, HashMap<String, String>)>;
 
+/// Parameters for a guarded Chromium navigation.
 #[derive(Debug, Clone)]
 pub(crate) struct ChromiumNavigateParams {
     pub(crate) raw_url: String,
@@ -149,6 +169,10 @@ fn clamp_chromium_snapshot(
     }
 }
 
+/// Page-side hook installed on every new document: wraps console, fetch, XHR,
+/// object-URL creation, and anchor clicks to buffer bounded console, network,
+/// and client-download (blob) entries under a window global that the
+/// drain/read scripts below read back.
 const CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT: &str = r#"
 (() => {
   const rootKey = "__palyraDiagnostics";
@@ -455,6 +479,7 @@ const CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT: &str = r#"
 })()
 "#;
 
+/// Reads buffered console entries back as bounded JSON (newest entries win the budget).
 const CHROMIUM_READ_CONSOLE_LOG_SCRIPT: &str = r#"
 (() => {
   const state = window.__palyraDiagnostics;
@@ -510,6 +535,7 @@ const CHROMIUM_READ_CONSOLE_LOG_SCRIPT: &str = r#"
 })()
 "#;
 
+/// Drains buffered page network entries as bounded JSON, clearing the page-side buffer.
 const CHROMIUM_DRAIN_NETWORK_LOG_SCRIPT: &str = r#"
 (() => {
   const state = window.__palyraDiagnostics;
@@ -594,6 +620,8 @@ const CHROMIUM_CLEAR_NETWORK_LOG_SCRIPT: &str = r#"
 })()
 "#;
 
+/// Drains captured client-side (blob) downloads, waiting up to 750ms for
+/// in-flight blob reads started by recent anchor clicks to settle.
 const CHROMIUM_DRAIN_CLIENT_DOWNLOADS_SCRIPT: &str = r#"
 (async () => {
   const state = window.__palyraDiagnostics;
@@ -661,6 +689,8 @@ const CHROMIUM_DRAIN_CLIENT_DOWNLOADS_SCRIPT: &str = r#"
 })()
 "#;
 
+// Page-side JSON budgets get headroom over the decoded-entry budgets because
+// the raw JSON also carries field names and escaping overhead before parsing.
 const MAX_CHROMIUM_CONSOLE_JSON_BYTES: usize = (DEFAULT_MAX_CONSOLE_LOG_BYTES as usize) * 4;
 const MAX_CHROMIUM_NETWORK_JSON_BYTES: usize = (DEFAULT_MAX_NETWORK_LOG_BYTES as usize) * 4;
 const MAX_CHROMIUM_CLIENT_DOWNLOAD_JSON_BYTES: usize =
@@ -735,6 +765,9 @@ struct ChromiumObservedStorage {
     error: String,
 }
 
+/// Builds the observe-state script: clones the DOM with live form values
+/// (sensitive controls redacted) and collects bounded form-control,
+/// hidden-state, and storage summaries alongside the serialized HTML.
 fn chromium_observe_state_script() -> String {
     format!(
         r#"
@@ -970,8 +1003,8 @@ fn decode_chromium_observe_state_value(
 }
 
 fn page_body_with_chromium_observe_state(payload: ChromiumObserveStatePayload) -> String {
-    let page_body = payload.html.clone();
     let summary = build_chromium_observe_state_summary(&payload);
+    let page_body = payload.html;
     if summary.trim().is_empty() {
         return page_body;
     }
@@ -1130,6 +1163,14 @@ fn escape_html_text(value: &str) -> String {
     output
 }
 
+/// Runs a synchronous `headless_chrome` operation on the blocking thread pool.
+///
+/// The CDP client blocks on its transport, so every browser call must hop off
+/// the async runtime through this helper to avoid stalling executor threads.
+///
+/// # Errors
+/// Returns the task's own error, or a join-failure message when the blocking
+/// task panicked or was cancelled.
 pub(crate) async fn run_chromium_blocking<T, F>(operation: &str, task: F) -> Result<T, String>
 where
     T: Send + 'static,
@@ -1140,6 +1181,10 @@ where
         .map_err(|error| format!("{operation} task join failure: {error}"))?
 }
 
+/// Per-session loopback SOCKS5 proxy that enforces private-target policy on
+/// all Chromium egress before a CONNECT succeeds.
+///
+/// Dropping the proxy signals shutdown and aborts the accept-loop task.
 #[derive(Debug)]
 pub(crate) struct ChromiumSessionProxy {
     pub(crate) proxy_uri: String,
@@ -1149,6 +1194,11 @@ pub(crate) struct ChromiumSessionProxy {
 }
 
 impl ChromiumSessionProxy {
+    /// Binds a loopback listener and spawns the SOCKS5 accept loop.
+    ///
+    /// # Errors
+    /// Returns an error string when the listener cannot be bound or its local
+    /// address cannot be resolved.
     pub(crate) async fn spawn(allow_private_targets: bool) -> Result<Self, String> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1172,6 +1222,7 @@ impl ChromiumSessionProxy {
         })
     }
 
+    /// Returns the policy handle shared with request interception and response guards.
     pub(crate) fn private_target_policy(&self) -> Arc<ChromiumPrivateTargetPolicy> {
         Arc::clone(&self.private_target_policy)
     }
@@ -1186,18 +1237,26 @@ impl Drop for ChromiumSessionProxy {
     }
 }
 
+/// Target host parsed from a SOCKS5 CONNECT request.
 #[derive(Debug)]
 pub(crate) enum Socks5TargetHost {
     Ip(IpAddr),
     Domain(String),
 }
 
+/// A normalized private target (network host:port, or a canonicalized local
+/// file) that a session can be explicitly allowed to reach.
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub(crate) enum ChromiumPrivateTargetScope {
     Network { host: String, port: u16 },
     File(PathBuf),
 }
 
+/// Tracks which private/local targets a session may reach.
+///
+/// Deny-by-default: unless the whole session allows private targets, a private
+/// destination is reachable only while a scoped allowance is alive or after it
+/// has been retained for the rest of the session.
 #[derive(Debug)]
 pub(crate) struct ChromiumPrivateTargetPolicy {
     allow_session_private_targets: bool,
@@ -1205,6 +1264,7 @@ pub(crate) struct ChromiumPrivateTargetPolicy {
     retained_targets: std::sync::Mutex<HashSet<ChromiumPrivateTargetScope>>,
 }
 
+/// RAII allowance for one private target; the allowance is released on drop.
 #[derive(Debug)]
 pub(crate) struct ChromiumScopedPrivateTarget {
     policy: Arc<ChromiumPrivateTargetPolicy>,
@@ -1212,6 +1272,7 @@ pub(crate) struct ChromiumScopedPrivateTarget {
 }
 
 impl ChromiumPrivateTargetPolicy {
+    /// Creates a policy; `allow_session_private_targets` bypasses all scoping.
     pub(crate) fn new(allow_session_private_targets: bool) -> Self {
         Self {
             allow_session_private_targets,
@@ -1220,6 +1281,10 @@ impl ChromiumPrivateTargetPolicy {
         }
     }
 
+    /// Returns whether the URL's target is currently allowed.
+    ///
+    /// Unparseable URLs are denied (fail closed) when the session does not
+    /// allow private targets wholesale.
     pub(crate) fn allows_url(&self, raw_url: &str) -> bool {
         if self.allow_session_private_targets {
             return true;
@@ -1230,6 +1295,7 @@ impl ChromiumPrivateTargetPolicy {
         self.allows_scope(&scope)
     }
 
+    /// Returns whether the host/port pair is currently allowed; invalid hosts are denied.
     pub(crate) fn allows_host_port(&self, host: &str, port: u16) -> bool {
         if self.allow_session_private_targets {
             return true;
@@ -1240,6 +1306,13 @@ impl ChromiumPrivateTargetPolicy {
         self.allows_scope(&scope)
     }
 
+    /// Grants a temporary allowance for the URL's target, released when the
+    /// returned guard drops. Returns `None` when no allowance is needed
+    /// (session-wide allow, or a non-private target such as `about:blank`).
+    ///
+    /// # Errors
+    /// Returns an error string when the URL cannot be normalized into a scope
+    /// or the policy lock is poisoned.
     pub(crate) fn scoped_url_allowance(
         self: &Arc<Self>,
         raw_url: &str,
@@ -1259,6 +1332,12 @@ impl ChromiumPrivateTargetPolicy {
         Ok(Some(ChromiumScopedPrivateTarget { policy: Arc::clone(self), scope }))
     }
 
+    /// Permanently retains an allowance for the URL's target for the rest of
+    /// the session, e.g. after a navigation has already been approved.
+    ///
+    /// # Errors
+    /// Returns an error string when the URL cannot be normalized into a scope
+    /// or the policy lock is poisoned.
     pub(crate) fn retain_url_allowance(&self, raw_url: &str) -> Result<(), String> {
         if self.allow_session_private_targets {
             return Ok(());
@@ -1338,6 +1417,10 @@ impl Drop for ChromiumScopedPrivateTarget {
     }
 }
 
+/// Accept loop for the per-session SOCKS5 proxy.
+///
+/// Exits on the shutdown signal or on a listener accept failure; individual
+/// client failures are logged and do not stop the loop.
 pub(crate) async fn run_chromium_session_socks5_proxy(
     listener: tokio::net::TcpListener,
     private_target_policy: Arc<ChromiumPrivateTargetPolicy>,
@@ -1375,10 +1458,16 @@ pub(crate) async fn run_chromium_session_socks5_proxy(
     }
 }
 
+/// Builds a SOCKS5 reply with the given status code and a zeroed IPv4 bind address.
 pub(crate) fn socks5_reply(status: u8) -> [u8; 10] {
     [0x05, status, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
 }
 
+/// Reads the SOCKS5 CONNECT target host for the given address type byte.
+///
+/// # Errors
+/// Returns an error string on read failures, unsupported address types, and
+/// empty or non-UTF-8 domain targets.
 pub(crate) async fn read_socks5_target_host(
     stream: &mut tokio::net::TcpStream,
     atyp: u8,
@@ -1426,6 +1515,13 @@ pub(crate) async fn read_socks5_target_host(
     }
 }
 
+/// Serves one SOCKS5 client: no-auth handshake, CONNECT-only command parsing,
+/// resolved-host policy enforcement, then bidirectional byte relay.
+///
+/// # Errors
+/// Returns an error string on protocol violations, policy denials (after a
+/// failure reply has been sent best-effort), connect failures, and relay IO
+/// errors.
 pub(crate) async fn handle_chromium_session_socks5_client(
     mut stream: tokio::net::TcpStream,
     private_target_policy: Arc<ChromiumPrivateTargetPolicy>,
@@ -1520,12 +1616,20 @@ pub(crate) async fn handle_chromium_session_socks5_client(
     Ok(())
 }
 
+/// Builds hardened launch options for a per-session Chromium process.
+///
+/// # Errors
+/// Returns an error string when the launch options builder rejects the
+/// configuration.
 pub(crate) fn build_chromium_launch_options<'a>(
     chromium: &ChromiumEngineConfig,
     profile_dir: &TempDir,
     proxy_server: Option<&'a str>,
 ) -> Result<headless_chrome::LaunchOptions<'a>, String> {
     let chromium_path = chromium.executable_path.clone();
+    // `--disable-dev-shm-usage` avoids tiny /dev/shm limits in containers;
+    // `--disable-blink-features=AutomationControlled` keeps pages from
+    // trivially fingerprinting the session as automated.
     let mut chromium_args = vec![
         OsStr::new("--disable-dev-shm-usage"),
         OsStr::new("--disable-gpu"),
@@ -1535,6 +1639,9 @@ pub(crate) fn build_chromium_launch_options<'a>(
         OsStr::new("--disable-blink-features=AutomationControlled"),
     ];
     if proxy_server.is_some() {
+        // Chromium bypasses proxies for loopback by default; `<-loopback>`
+        // forces loopback traffic through the per-session SOCKS5 proxy so
+        // NetGuard policy also covers local targets.
         chromium_args.push(OsStr::new("--proxy-bypass-list=<-loopback>"));
     }
     let mut builder = LaunchOptionsBuilder::default();
@@ -1553,15 +1660,23 @@ pub(crate) fn build_chromium_launch_options<'a>(
     builder.build().map_err(|error| format!("failed to build Chromium launch options: {error}"))
 }
 
+// The CDP websocket must stay alive at least as long as an idle session may be
+// resumed, otherwise headless_chrome tears down the transport mid-session.
 fn chromium_transport_idle_timeout(startup_timeout: Duration) -> Duration {
     startup_timeout.max(Duration::from_millis(DEFAULT_SESSION_IDLE_TTL_MS))
 }
 
+/// Parses an IP literal as reported by CDP, tolerating bracketed IPv6 forms.
 pub(crate) fn parse_chromium_remote_ip_literal(raw: &str) -> Option<IpAddr> {
     let trimmed = raw.trim().trim_start_matches('[').trim_end_matches(']');
     trimmed.parse::<IpAddr>().ok()
 }
 
+/// Records a security incident when a response was served from a private or
+/// local IP that the session's policy does not allow.
+///
+/// Only the first incident is kept; loopback hits matching the expected
+/// per-session proxy hop are ignored.
 pub(crate) fn record_chromium_remote_ip_incident(
     response_url: Option<&str>,
     remote_ip: Option<&str>,
@@ -1595,6 +1710,8 @@ pub(crate) fn record_chromium_remote_ip_incident(
     }
 }
 
+/// Returns true when a loopback remote IP is just the local SOCKS5 proxy hop
+/// for an otherwise policy-clean response URL.
 pub(crate) fn chromium_loopback_remote_ip_is_expected_proxy_hop(
     response_url: Option<&str>,
     allow_private_targets: bool,
@@ -1609,6 +1726,12 @@ pub(crate) fn chromium_loopback_remote_ip_is_expected_proxy_hop(
     validate_target_url_blocking(response_url, allow_private_targets).is_ok()
 }
 
+/// Wires a fresh tab with policy and diagnostics: request interception that
+/// fails disallowed targets, network log capture, attachment download capture,
+/// page diagnostics hooks, and the remote-IP response guard.
+///
+/// # Errors
+/// Returns an error string when any CDP registration call fails.
 pub(crate) fn configure_chromium_tab(
     tab: &Arc<HeadlessTab>,
     private_target_policy: Arc<ChromiumPrivateTargetPolicy>,
@@ -1799,6 +1922,7 @@ fn chromium_header_value(headers: &Network::Headers, target_name: &str) -> Optio
     })
 }
 
+/// Returns true for transient `new_tab` failures seen during Chromium startup races.
 pub(crate) fn chromium_new_tab_error_is_retryable(message: &str) -> bool {
     let normalized = message.to_ascii_lowercase();
     normalized.contains("event waited for never came")
@@ -1807,6 +1931,15 @@ pub(crate) fn chromium_new_tab_error_is_retryable(message: &str) -> bool {
         || normalized.contains("underlying connection is closed")
 }
 
+/// Creates and configures a tab, retrying transient startup-race failures.
+///
+/// Runs synchronously and must be called from a blocking context (see
+/// [`run_chromium_blocking`]); the retry delay is a blocking sleep on purpose.
+///
+/// # Errors
+/// Returns `{failure_prefix}: ...` when tab creation fails terminally or
+/// exhausts its retry budget, or the configuration error from
+/// [`configure_chromium_tab`].
 pub(crate) fn create_configured_chromium_tab_with_retry(
     browser: &Arc<HeadlessBrowser>,
     private_target_policy: Arc<ChromiumPrivateTargetPolicy>,
@@ -1840,6 +1973,8 @@ pub(crate) fn create_configured_chromium_tab_with_retry(
                         error = error_message.as_str(),
                         "chromium new_tab reported retryable startup race; retrying"
                     );
+                    // Blocking sleep is correct: this helper always runs
+                    // inside spawn_blocking (see run_chromium_blocking).
                     std::thread::sleep(Duration::from_millis(CHROMIUM_NEW_TAB_RETRY_DELAY_MS));
                     continue;
                 }
@@ -1852,6 +1987,12 @@ pub(crate) fn create_configured_chromium_tab_with_retry(
     ))
 }
 
+/// Launches the per-session Chromium process and restores persisted tabs.
+///
+/// # Errors
+/// Returns an error string when the proxy spawn, profile-dir allocation,
+/// browser launch, or tab creation fails; per-tab live-state restore failures
+/// are logged and skipped.
 pub(crate) async fn initialize_chromium_session_runtime(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -1869,6 +2010,9 @@ pub(crate) async fn initialize_chromium_session_runtime(
     } else if !tab_order.iter().any(|tab_id| tab_id == &active_tab_id) {
         tab_order.insert(0, active_tab_id.clone());
     }
+    // `proxy` stays owned here until the launch succeeds so a failed launch
+    // still shuts the SOCKS5 task down via Drop; it is attached to the session
+    // state only afterwards.
     let proxy = ChromiumSessionProxy::spawn(allow_private_targets).await?;
     let proxy_uri = proxy.proxy_uri.clone();
     let private_target_policy = proxy.private_target_policy();
@@ -1964,11 +2108,15 @@ fn restore_chromium_tab_live_state(
     tab.wait_until_navigated().map_err(|error| {
         format!("Chromium tab {tab_id} restore navigation timed out for {raw_url}: {error}")
     })?;
-    let mut page_url = tab.get_url();
+    let page_url = tab.get_url();
     if let Some(origin) = url_origin_key(page_url.as_str()) {
         if let Some(entries) =
             storage_entries_by_origin.get(origin.as_str()).filter(|entries| !entries.is_empty())
         {
+            // localStorage can only be written from a document on the target
+            // origin, and scripts that already ran will not see the restored
+            // values; navigate first, write storage, then reload so the app
+            // boots with the restored state.
             let script = chromium_restore_local_storage_script(entries)?;
             let raw_value = tab
                 .evaluate(script.as_str(), true)
@@ -1991,7 +2139,6 @@ fn restore_chromium_tab_live_state(
                     "Chromium tab {tab_id} reload after localStorage restore timed out: {error}"
                 )
             })?;
-            page_url = tab.get_url();
         }
     }
     if restored_tab.scroll_x != 0 || restored_tab.scroll_y != 0 {
@@ -1999,10 +2146,14 @@ fn restore_chromium_tab_live_state(
             format!("window.scrollTo({}, {}); true", restored_tab.scroll_x, restored_tab.scroll_y);
         let _ = tab.evaluate(script.as_str(), true);
     }
-    let _ = page_url;
     Ok(())
 }
 
+/// Allocates and configures a new live Chromium tab for an existing session.
+///
+/// # Errors
+/// Returns the `session_not_found`/`chromium_session_not_found` sentinels when
+/// the session is gone, or a descriptive message when tab allocation fails.
 pub(crate) async fn chromium_open_tab_runtime(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -2026,22 +2177,22 @@ pub(crate) async fn chromium_open_tab_runtime(
             Arc::clone(&chromium_session.security_incident),
         )
     };
-    let tab = run_chromium_blocking("chromium open tab", move || {
-        let network_log = Arc::new(std::sync::Mutex::new(VecDeque::new()));
-        let download_capture = Arc::new(std::sync::Mutex::new(VecDeque::new()));
-        let tab = create_configured_chromium_tab_with_retry(
-            &browser,
-            private_target_policy,
-            Arc::clone(&network_log),
-            Arc::clone(&download_capture),
-            Duration::from_millis(timeout_ms),
-            security_incident,
-            "failed to allocate Chromium tab",
-        )?;
-        Ok((tab, network_log, download_capture))
-    })
-    .await?;
-    let (tab, network_log, download_capture) = tab;
+    let (tab, network_log, download_capture) =
+        run_chromium_blocking("chromium open tab", move || {
+            let network_log = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+            let download_capture = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+            let tab = create_configured_chromium_tab_with_retry(
+                &browser,
+                private_target_policy,
+                Arc::clone(&network_log),
+                Arc::clone(&download_capture),
+                Duration::from_millis(timeout_ms),
+                security_incident,
+                "failed to allocate Chromium tab",
+            )?;
+            Ok((tab, network_log, download_capture))
+        })
+        .await?;
     let mut chromium_sessions = runtime.chromium_sessions.lock().await;
     let Some(chromium_session) = chromium_sessions.get_mut(session_id) else {
         return Err("chromium_session_not_found".to_owned());
@@ -2052,6 +2203,11 @@ pub(crate) async fn chromium_open_tab_runtime(
     Ok(())
 }
 
+/// Removes a tab's runtime state and closes the live tab best-effort.
+///
+/// # Errors
+/// Returns the `chromium_session_not_found` sentinel when the session is gone;
+/// failures while closing the already-detached tab are ignored.
 pub(crate) async fn chromium_close_tab_runtime(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -2076,6 +2232,16 @@ pub(crate) async fn chromium_close_tab_runtime(
     Ok(())
 }
 
+/// Fails closed when the response guard recorded a private/local remote-IP
+/// incident, tearing down the entire browser session.
+///
+/// Callers invoke this both before and after each Chromium operation so an
+/// incident observed by the response handler mid-operation still fails the
+/// call that triggered it.
+///
+/// # Errors
+/// Returns the incident reason after terminating the session, or a lock
+/// failure message when the incident state cannot be inspected.
 pub(crate) async fn enforce_chromium_remote_ip_guard(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -2106,6 +2272,10 @@ pub(crate) async fn enforce_chromium_remote_ip_guard(
     Err(format!("chromium remote IP guard blocked request: {reason}"))
 }
 
+/// Looks up the live tab handle for a session/tab pair.
+///
+/// # Errors
+/// Returns the `chromium_session_not_found`/`chromium_tab_not_found` sentinels.
 pub(crate) async fn chromium_tab_for_session(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -2118,6 +2288,11 @@ pub(crate) async fn chromium_tab_for_session(
     chromium_session.tabs.get(tab_id).cloned().ok_or_else(|| "chromium_tab_not_found".to_owned())
 }
 
+/// Drains the CDP-captured network log buffered for a tab.
+///
+/// # Errors
+/// Returns lookup sentinels when the session/log is gone, or a lock failure
+/// message.
 pub(crate) async fn chromium_drain_pending_network_log(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -2140,6 +2315,11 @@ pub(crate) async fn chromium_drain_pending_network_log(
     Ok(guard.drain(..).collect())
 }
 
+/// Clears all buffered network diagnostics for a session, both the Rust-side
+/// CDP buffers and the page-side hook buffers (the latter best-effort).
+///
+/// # Errors
+/// Returns the `chromium_session_not_found` sentinel or a lock failure message.
 pub(crate) async fn chromium_clear_network_diagnostics(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -2207,6 +2387,10 @@ async fn chromium_drain_response_downloads(
     Ok(guard.drain(..).collect())
 }
 
+/// Looks up a live tab together with the session's private-target policy.
+///
+/// # Errors
+/// Returns the `chromium_session_not_found`/`chromium_tab_not_found` sentinels.
 pub(crate) async fn chromium_tab_and_private_target_policy_for_session(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -2222,6 +2406,11 @@ pub(crate) async fn chromium_tab_and_private_target_policy_for_session(
     Ok((Arc::clone(tab), Arc::clone(&chromium_session.private_target_policy)))
 }
 
+/// Resolves the session's active tab ID and its live tab handle.
+///
+/// # Errors
+/// Returns the `session_not_found` sentinel or the lookup sentinels of
+/// [`chromium_tab_for_session`].
 pub(crate) async fn chromium_active_tab_for_session(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -2309,6 +2498,14 @@ fn chromium_action_context(tab_id: &str, page_url: &str) -> String {
     }
 }
 
+/// Captures a tab's page body, title, and URL, clamped to session budgets.
+///
+/// The body includes the observed-state summary section when the observe-state
+/// script succeeds; otherwise it degrades to the raw DOM content.
+///
+/// # Errors
+/// Returns lookup sentinels, remote-IP guard incidents, or a message when even
+/// the raw DOM content cannot be read.
 pub(crate) async fn chromium_observe_snapshot(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -2348,6 +2545,12 @@ pub(crate) async fn chromium_observe_snapshot(
     Ok(clamp_chromium_snapshot(snapshot, max_response_bytes, max_title_bytes))
 }
 
+/// Captures geometry, visibility, text, and computed styles for the given
+/// selectors on a live tab. Returns an empty list for an empty selector set.
+///
+/// # Errors
+/// Returns lookup sentinels, remote-IP guard incidents, script encoding or
+/// evaluation failures, and payload parse failures.
 pub(crate) async fn chromium_capture_element_captures(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -2588,6 +2791,12 @@ async fn chromium_read_local_storage(
     parse_chromium_local_storage_snapshot(value)
 }
 
+/// Clears localStorage and sessionStorage for the active tab's origin and
+/// returns the number of entries removed.
+///
+/// # Errors
+/// Returns lookup sentinels, remote-IP guard incidents, or a page-side storage
+/// failure message.
 pub(crate) async fn chromium_clear_active_origin_storage(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -2648,6 +2857,12 @@ async fn chromium_drain_page_network_log(
     Ok(parse_chromium_page_network_entries(value))
 }
 
+/// Drains all captured downloads for a tab: page-captured blob downloads
+/// merged with attachment responses captured via CDP interception.
+///
+/// # Errors
+/// Returns lookup sentinels, remote-IP guard incidents, or script evaluation
+/// failures.
 pub(crate) async fn chromium_drain_client_downloads(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -3232,6 +3447,16 @@ fn parse_chromium_console_entries(value: serde_json::Value) -> Vec<BrowserConsol
         .collect()
 }
 
+/// Refreshes the persisted tab snapshot from the live page: body, title, URL,
+/// console log, localStorage, document cookies, and network logs from both the
+/// CDP buffers and the page hooks.
+///
+/// Diagnostics reads degrade to empty data on failure; only the core snapshot
+/// and session/tab lookups are fatal.
+///
+/// # Errors
+/// Returns lookup sentinels, remote-IP guard incidents, or the observe
+/// snapshot failure.
 pub(crate) async fn chromium_refresh_tab_snapshot(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -3303,6 +3528,10 @@ pub(crate) async fn chromium_refresh_tab_snapshot(
     Ok(())
 }
 
+/// Reads the live page title of a tab.
+///
+/// # Errors
+/// Returns lookup sentinels, remote-IP guard incidents, or a CDP read failure.
 pub(crate) async fn chromium_get_title(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -3318,6 +3547,10 @@ pub(crate) async fn chromium_get_title(
     Ok(title)
 }
 
+/// Captures a PNG screenshot of the active tab's full surface.
+///
+/// # Errors
+/// Returns lookup sentinels, remote-IP guard incidents, or a capture failure.
 pub(crate) async fn chromium_screenshot(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -3333,6 +3566,11 @@ pub(crate) async fn chromium_screenshot(
     Ok(screenshot)
 }
 
+/// Reads layout/visual viewport metrics and overflow flags from the active tab.
+///
+/// # Errors
+/// Returns lookup sentinels, remote-IP guard incidents, or a script evaluation
+/// failure.
 pub(crate) async fn chromium_layout_metrics(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -3382,6 +3620,7 @@ pub(crate) async fn chromium_layout_metrics(
     Ok(value)
 }
 
+/// Navigates the session's active tab; see [`navigate_tab_with_chromium`].
 pub(crate) async fn navigate_with_chromium(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -3407,12 +3646,20 @@ pub(crate) async fn navigate_with_chromium(
     navigate_tab_with_chromium(runtime, session_id, tab_id.as_str(), &params).await
 }
 
+/// Drives a guarded navigation on a specific tab; failures are reported via
+/// the outcome's `success`/`error` fields rather than `Err`.
+///
+/// `body_bytes` reports the pre-truncation body size, so it can exceed the
+/// length of the (possibly truncated) `page_body`.
 pub(crate) async fn navigate_tab_with_chromium(
     runtime: &BrowserRuntimeState,
     session_id: &str,
     tab_id: &str,
     params: &ChromiumNavigateParams,
 ) -> NavigateOutcome {
+    // The guarded HTTP fetch validates the target first (redirect policy,
+    // private-target checks, response budget); Chromium then navigates to the
+    // vetted final URL only when that pre-flight succeeded.
     let mut outcome = navigate_with_guards(
         params.raw_url.as_str(),
         params.timeout_ms,
@@ -3460,6 +3707,9 @@ pub(crate) async fn navigate_tab_with_chromium(
             .map_err(|error| format!("failed to issue Chromium navigation command: {error}"))?;
         tab.wait_until_navigated()
             .map_err(|error| format!("Chromium navigation timeout or failure: {error}"))?;
+        // Best-effort probe that the pre-registered diagnostics hook survived
+        // the navigation; failures are non-fatal because the hooks are
+        // reinstalled via chromium_install_page_diagnostics afterwards.
         tab.evaluate(
             r#"
 (() => {
@@ -3478,6 +3728,9 @@ pub(crate) async fn navigate_tab_with_chromium(
             if let Some(entries) =
                 storage_entries_by_origin.get(origin.as_str()).filter(|entries| !entries.is_empty())
             {
+                // Restored storage is only visible to scripts that run after
+                // the write, so restore then reload (see
+                // restore_chromium_tab_live_state for the same dance).
                 let script = chromium_restore_local_storage_script(entries)?;
                 let raw_value = tab
                     .evaluate(script.as_str(), false)
@@ -3547,6 +3800,10 @@ pub(crate) async fn navigate_tab_with_chromium(
     outcome
 }
 
+/// Clicks the first element matching `selector` on the active tab.
+///
+/// Retries only `not_found` results until `timeout_ms`/`max_attempts` runs
+/// out; download-like anchors are blocked unless `allow_downloads` is set.
 pub(crate) async fn click_with_chromium(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -3673,6 +3930,8 @@ pub(crate) async fn click_with_chromium(
     }
 }
 
+/// Builds the click script; anchors with a download attribute or a known
+/// file-extension href are reported as download-like so policy can block them.
 fn chromium_click_script(selector: &str, allow_downloads: bool) -> Result<String, String> {
     let selector_json = serde_json::to_string(selector)
         .map_err(|error| format!("failed to encode selector for Chromium click: {error}"))?;
@@ -3714,6 +3973,8 @@ fn chromium_click_script(selector: &str, allow_downloads: bool) -> Result<String
     ))
 }
 
+/// Types text into an input-like or content-editable element on the active
+/// tab, retrying `not_found` results until `timeout_ms` runs out.
 pub(crate) async fn type_with_chromium(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -3841,6 +4102,9 @@ pub(crate) async fn type_with_chromium(
     }
 }
 
+/// Stages `file_bytes` inside the session profile dir and attaches the staged
+/// file to a file input on the active tab, retrying `not_found` results until
+/// `timeout_ms` runs out.
 pub(crate) async fn set_file_input_with_chromium(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -4091,6 +4355,7 @@ fn chromium_type_script(
     ))
 }
 
+/// Parses a key spec such as `Ctrl+Shift+K` into the terminal key and modifiers.
 fn parse_key_press_spec(raw: &str) -> Result<(String, Vec<ModifierKey>), String> {
     if raw == " " {
         return Ok((" ".to_owned(), Vec::new()));
@@ -4132,6 +4397,7 @@ fn normalize_key_press_terminal_key(key: &str) -> String {
     }
 }
 
+/// Presses a key (with optional modifiers) on the active tab.
 pub(crate) async fn press_with_chromium(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -4191,6 +4457,7 @@ pub(crate) async fn press_with_chromium(
     }
 }
 
+/// Selects an option by value on a `<select>` element of the active tab.
 pub(crate) async fn select_with_chromium(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -4318,6 +4585,8 @@ pub(crate) async fn select_with_chromium(
     }
 }
 
+/// Draws a temporary overlay around the first element matching `selector` on
+/// the active tab; the overlay removes itself after `duration_ms` (clamped).
 pub(crate) async fn highlight_with_chromium(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -4432,6 +4701,10 @@ pub(crate) async fn highlight_with_chromium(
     }
 }
 
+/// Exports the active tab as a PDF using Chromium print defaults.
+///
+/// # Errors
+/// Returns lookup sentinels, remote-IP guard incidents, or a print failure.
 pub(crate) async fn export_pdf_with_chromium(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -4447,6 +4720,8 @@ pub(crate) async fn export_pdf_with_chromium(
     Ok(pdf)
 }
 
+/// Applies device-metrics and touch emulation to the active tab and verifies
+/// the page-visible viewport against the requested dimensions.
 pub(crate) async fn set_viewport_with_chromium(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -4481,6 +4756,8 @@ pub(crate) async fn set_viewport_with_chromium(
         }
     };
     let result = run_chromium_blocking("chromium set viewport", move || {
+        // Window bounds (and SetVisibleSize below, deprecated in CDP) are
+        // best-effort; the authoritative sizing is SetDeviceMetricsOverride.
         let _ = tab.set_bounds(Bounds::Normal {
             left: None,
             top: None,
@@ -5292,6 +5569,8 @@ mod tests {
     }
 }
 
+/// Scrolls the active tab by the given deltas and records the resulting
+/// scroll position on the persisted tab record.
 pub(crate) async fn scroll_with_chromium(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -5334,6 +5613,9 @@ pub(crate) async fn scroll_with_chromium(
     }
 }
 
+/// Polls the active tab until `selector` matches or the page text contains
+/// `text`, refreshing the tab snapshot on success. The selector match wins
+/// when both conditions hit in the same probe.
 pub(crate) async fn wait_for_with_chromium(
     runtime: &BrowserRuntimeState,
     session_id: &str,

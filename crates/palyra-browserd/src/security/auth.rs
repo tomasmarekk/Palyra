@@ -1,6 +1,20 @@
+//! Shared-token authorization for the browserd gRPC surface.
+//!
+//! Verifies the request authorization metadata against the daemon's optional
+//! auth token using a constant-time comparison. When no token is configured,
+//! bootstrap restricts the listeners to loopback instead.
+
 use crate::*;
 
 impl BrowserRuntimeState {
+    /// Authorizes a gRPC request against the daemon's optional shared auth token.
+    ///
+    /// When no token is configured every request is accepted; that mode is only
+    /// reachable on loopback binds (enforced at startup).
+    ///
+    /// # Errors
+    /// Returns `Status::unauthenticated` when a token is configured and the
+    /// request's authorization metadata is missing or does not match.
     pub(crate) async fn authorize(
         &self,
         metadata: &tonic::metadata::MetadataMap,
@@ -20,6 +34,11 @@ impl BrowserRuntimeState {
     }
 }
 
+/// Compares two byte slices in time independent of where they first differ.
+///
+/// Both inputs are always scanned to the longer length and a length mismatch
+/// only flips bits in the accumulator, so there is no early return an attacker
+/// could time to recover the expected token byte by byte.
 pub(crate) fn constant_time_eq_bytes(left: &[u8], right: &[u8]) -> bool {
     let max_len = left.len().max(right.len());
     let mut difference = left.len() ^ right.len();

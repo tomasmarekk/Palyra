@@ -1,8 +1,18 @@
+//! Encrypted on-disk store for persisted browser session state and the profile registry.
+//!
+//! Blobs are sealed with ChaCha20-Poly1305 (layout: magic, nonce, ciphertext+tag) and written
+//! atomically (create-new tmp file, fsync, rename) into an owner-only directory; symlinks are
+//! rejected at every filesystem touchpoint.
+
 use crate::*;
 
 #[cfg(windows)]
 use palyra_common::windows_security;
 
+/// On-disk (encrypted) browser session snapshot.
+///
+/// Serde field names are the persisted format — do not rename. `state_revision` defaults to 0
+/// so snapshots written before revision tracking still deserialize.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PersistedSessionSnapshot {
     pub(crate) v: u32,
@@ -19,6 +29,9 @@ pub(crate) struct PersistedSessionSnapshot {
     pub(crate) saved_at_unix_ms: u64,
 }
 
+/// Canonical tab form for snapshot hashing: sorted `typed_inputs`, console log excluded.
+///
+/// Excluding the console log keeps diagnostic noise from invalidating state hashes.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct BrowserTabRecordForHash {
     pub(crate) tab_id: String,
@@ -31,6 +44,10 @@ pub(crate) struct BrowserTabRecordForHash {
     pub(crate) network_log: VecDeque<NetworkLogEntryInternal>,
 }
 
+/// Hash payload matching the pre-`state_revision` snapshot layout.
+///
+/// Kept so profiles written by older builds still pass restore validation (see
+/// `validate_restored_snapshot_against_profile`).
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct PersistedSessionSnapshotLegacyForHash {
     pub(crate) v: u32,
@@ -45,12 +62,14 @@ pub(crate) struct PersistedSessionSnapshotLegacyForHash {
     pub(crate) saved_at_unix_ms: u64,
 }
 
+/// A decrypted snapshot plus the SHA-256 of its plaintext for cheap integrity comparison.
 #[derive(Debug, Clone)]
 pub(crate) struct LoadedPersistedSessionSnapshot {
     pub(crate) snapshot: PersistedSessionSnapshot,
     pub(crate) raw_hash_sha256: String,
 }
 
+/// Canonical (sorted-map) snapshot form so hashes are stable across `HashMap` iteration orders.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct PersistedSessionSnapshotForHash {
     pub(crate) v: u32,
@@ -66,12 +85,21 @@ pub(crate) struct PersistedSessionSnapshotForHash {
     pub(crate) saved_at_unix_ms: u64,
 }
 
+/// Handle to the encrypted browserd state directory (session snapshots and profile registry).
 #[derive(Debug, Clone)]
 pub(crate) struct PersistedStateStore {
     pub(crate) root_dir: PathBuf,
     pub(crate) key: [u8; STATE_KEY_LEN],
 }
 
+/// Builds the persisted state store from environment configuration.
+///
+/// Returns `Ok(None)` — persistence disabled — when the state key env var (`STATE_KEY_ENV`) is
+/// unset or empty.
+///
+/// # Errors
+/// Fails when the key does not decode, the configured state dir is invalid, or store
+/// initialization (dir creation/hardening) fails.
 pub(crate) fn build_state_store_from_env() -> Result<Option<PersistedStateStore>> {
     let key_raw = match std::env::var(STATE_KEY_ENV) {
         Ok(value) => value.trim().to_owned(),
@@ -81,6 +109,9 @@ pub(crate) fn build_state_store_from_env() -> Result<Option<PersistedStateStore>
         return Ok(None);
     }
     let key = decode_state_key(key_raw.as_str())?;
+    // AIDEV-NOTE: `unwrap_or` evaluates `default_browserd_state_dir()?` eagerly, so an
+    // unresolvable default dir (e.g. APPDATA unset) fails startup even when STATE_DIR_ENV is
+    // explicitly configured. Fixing this would change observable behavior; left as-is.
     let state_dir = std::env::var(STATE_DIR_ENV)
         .ok()
         .map(|value| value.trim().to_owned())
@@ -91,6 +122,13 @@ pub(crate) fn build_state_store_from_env() -> Result<Option<PersistedStateStore>
     Ok(Some(PersistedStateStore::new(state_dir, key)?))
 }
 
+/// Validates an operator-configured state path.
+///
+/// Parent (`..`) segments are rejected so a configured path can never escape upward out of the
+/// directory the operator pointed at.
+///
+/// # Errors
+/// Fails when the path is empty or contains a parent segment.
 pub(crate) fn normalize_configured_state_path(raw: &str, field: &'static str) -> Result<PathBuf> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -105,6 +143,11 @@ pub(crate) fn normalize_configured_state_path(raw: &str, field: &'static str) ->
     Ok(path)
 }
 
+/// Resolves the default browserd state directory from the process environment.
+///
+/// # Errors
+/// Fails when no suitable base directory variable is set; see
+/// [`default_browserd_state_dir_from_env`].
 pub(crate) fn default_browserd_state_dir() -> Result<PathBuf> {
     default_browserd_state_dir_from_env(
         std::env::var_os(STATE_ROOT_ENV),
@@ -115,6 +158,14 @@ pub(crate) fn default_browserd_state_dir() -> Result<PathBuf> {
     )
 }
 
+/// Resolves the state directory from explicit environment values (injectable for tests).
+///
+/// Resolution order: the Palyra state root, then the platform convention — `APPDATA`/
+/// `LOCALAPPDATA` on Windows, `~/Library/Application Support` on macOS, `XDG_STATE_HOME` or
+/// `~/.local/state` elsewhere.
+///
+/// # Errors
+/// Fails when none of the applicable variables is set or the state root is invalid.
 pub(crate) fn default_browserd_state_dir_from_env(
     state_root: Option<OsString>,
     appdata: Option<OsString>,
@@ -175,6 +226,12 @@ pub(crate) fn default_browserd_state_dir_from_env(
     }
 }
 
+/// Creates `path` (if needed) and restricts it to the owning user.
+///
+/// Mode 0700 on unix; owner-only ACLs on Windows.
+///
+/// # Errors
+/// Fails when the directory cannot be created or permissions cannot be applied.
 pub(crate) fn ensure_owner_only_dir(path: &Path) -> Result<()> {
     fs::create_dir_all(path)
         .with_context(|| format!("failed to create browserd state dir '{}'", path.display()))?;
@@ -196,6 +253,10 @@ pub(crate) fn ensure_owner_only_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Restricts an existing file to the owning user (0600 on unix, owner-only ACLs on Windows).
+///
+/// # Errors
+/// Fails when permissions cannot be applied.
 pub(crate) fn ensure_owner_only_file(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -215,11 +276,19 @@ pub(crate) fn ensure_owner_only_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Resolves the current user's SID for state-dir ACL hardening.
+///
+/// # Errors
+/// Fails when the SID cannot be resolved from the process token.
 #[cfg(windows)]
 pub(crate) fn current_user_sid() -> Result<String> {
     windows_security::current_user_sid().with_context(|| "failed to resolve browserd state ACL SID")
 }
 
+/// Applies owner-only Windows ACLs to a state path.
+///
+/// # Errors
+/// Fails when the ACLs cannot be applied.
 #[cfg(windows)]
 pub(crate) fn harden_windows_path_permissions(
     path: &Path,
@@ -230,6 +299,11 @@ pub(crate) fn harden_windows_path_permissions(
         .with_context(|| format!("failed to harden browserd state path '{}'", path.display()))
 }
 
+/// Decodes the base64 master state key from its env-var value.
+///
+/// # Errors
+/// Fails when the value is not valid base64 or does not decode to exactly `STATE_KEY_LEN`
+/// bytes.
 pub(crate) fn decode_state_key(raw: &str) -> Result<[u8; STATE_KEY_LEN]> {
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(raw)
@@ -245,6 +319,12 @@ pub(crate) fn decode_state_key(raw: &str) -> Result<[u8; STATE_KEY_LEN]> {
 }
 
 impl PersistedStateStore {
+    /// Opens (creating and hardening if needed) the state directory and sweeps stale tmp files
+    /// left behind by interrupted atomic writes.
+    ///
+    /// # Errors
+    /// Fails when the directory is a symlink, cannot be created/hardened, or the tmp sweep
+    /// fails.
     pub(crate) fn new(root_dir: PathBuf, key: [u8; STATE_KEY_LEN]) -> Result<Self> {
         ensure_path_is_not_symlink(root_dir.as_path(), "browserd state dir")?;
         ensure_owner_only_dir(root_dir.as_path())?;
@@ -254,18 +334,26 @@ impl PersistedStateStore {
         Ok(store)
     }
 
+    /// Path of the encrypted snapshot file for `state_id`.
     pub(crate) fn snapshot_path(&self, state_id: &str) -> PathBuf {
         self.root_dir.join(format!("{state_id}.enc"))
     }
 
+    /// Fresh tmp path for an atomic snapshot write; the ULID suffix keeps concurrent writers
+    /// from colliding.
     pub(crate) fn tmp_snapshot_path(&self, state_id: &str) -> PathBuf {
         self.root_dir.join(format!("{state_id}.{}.{}", Ulid::new(), STATE_TMP_EXTENSION))
     }
 
+    /// Path of the encrypted profile registry file.
     pub(crate) fn profile_registry_path(&self) -> PathBuf {
         self.root_dir.join(PROFILE_REGISTRY_FILE_NAME)
     }
 
+    /// Removes tmp files left behind by interrupted atomic writes; a missing dir is fine.
+    ///
+    /// # Errors
+    /// Fails when the directory cannot be enumerated or contains a symlink entry.
     pub(crate) fn cleanup_tmp_files(&self) -> Result<()> {
         let entries = match fs::read_dir(self.root_dir.as_path()) {
             Ok(value) => value,
@@ -297,8 +385,7 @@ impl PersistedStateStore {
             if path
                 .extension()
                 .and_then(|value| value.to_str())
-                .map(|value| value.eq_ignore_ascii_case(STATE_TMP_EXTENSION))
-                .unwrap_or(false)
+                .is_some_and(|value| value.eq_ignore_ascii_case(STATE_TMP_EXTENSION))
             {
                 let _ = fs::remove_file(path.as_path());
             }
@@ -306,6 +393,13 @@ impl PersistedStateStore {
         Ok(())
     }
 
+    /// Loads and decrypts a session snapshot; `Ok(None)` when no snapshot exists.
+    ///
+    /// `profile_id` selects the per-profile derived key and must match the one used to save.
+    ///
+    /// # Errors
+    /// Fails when the file cannot be read, decryption fails (wrong key or tampering), or the
+    /// plaintext does not deserialize.
     pub(crate) fn load_snapshot(
         &self,
         state_id: &str,
@@ -330,6 +424,10 @@ impl PersistedStateStore {
         }))
     }
 
+    /// Encrypts and atomically writes a session snapshot under `state_id`.
+    ///
+    /// # Errors
+    /// Fails when serialization, encryption, or the hardened atomic write fails.
     pub(crate) fn save_snapshot(
         &self,
         state_id: &str,
@@ -353,6 +451,10 @@ impl PersistedStateStore {
         Ok(())
     }
 
+    /// Deletes the snapshot for `state_id`; missing snapshots are not an error.
+    ///
+    /// # Errors
+    /// Fails when the path is a symlink or removal fails.
     pub(crate) fn delete_snapshot(&self, state_id: &str) -> Result<()> {
         let path = self.snapshot_path(state_id);
         if !path.exists() {
@@ -365,6 +467,14 @@ impl PersistedStateStore {
         Ok(())
     }
 
+    /// Loads, decrypts, and normalizes the profile registry; missing file yields the default.
+    ///
+    /// The registry is always encrypted with the master key (not a per-profile key) because it
+    /// must be readable before any profile is selected.
+    ///
+    /// # Errors
+    /// Fails when the file cannot be read, decryption fails, or the plaintext does not
+    /// deserialize.
     pub(crate) fn load_profile_registry(&self) -> Result<BrowserProfileRegistryDocument> {
         let path = self.profile_registry_path();
         if !path.exists() {
@@ -382,6 +492,11 @@ impl PersistedStateStore {
         Ok(registry)
     }
 
+    /// Encrypts and atomically writes the profile registry, enforcing its size cap.
+    ///
+    /// # Errors
+    /// Fails when serialization or encryption fails, the serialized registry exceeds
+    /// `MAX_PROFILE_REGISTRY_BYTES`, or the hardened atomic write fails.
     pub(crate) fn save_profile_registry(
         &self,
         registry: &BrowserProfileRegistryDocument,
@@ -415,6 +530,10 @@ impl PersistedStateStore {
     }
 }
 
+/// Rejects symlinks at `path`; a missing path passes.
+///
+/// # Errors
+/// Fails when the path is a symlink or its metadata cannot be inspected.
 pub(crate) fn ensure_path_is_not_symlink(path: &Path, context: &str) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -430,6 +549,10 @@ pub(crate) fn ensure_path_is_not_symlink(path: &Path, context: &str) -> Result<(
     }
 }
 
+/// Requires `path` to exist as a real (non-symlink) directory.
+///
+/// # Errors
+/// Fails when the path is missing, a symlink, or not a directory.
 pub(crate) fn ensure_path_is_secure_directory(path: &Path, context: &str) -> Result<()> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect {context} '{}'", path.display()))?;
@@ -442,6 +565,11 @@ pub(crate) fn ensure_path_is_secure_directory(path: &Path, context: &str) -> Res
     Ok(())
 }
 
+/// Reads a state file with symlink rejection (and `O_NOFOLLOW` on unix to close the
+/// check-then-open race).
+///
+/// # Errors
+/// Fails when the path is a symlink or the open/read fails.
 pub(crate) fn read_hardened_file(path: &Path, context: &str) -> Result<Vec<u8>> {
     ensure_path_is_not_symlink(path, context)?;
     #[cfg(unix)]
@@ -465,6 +593,14 @@ pub(crate) fn read_hardened_file(path: &Path, context: &str) -> Result<Vec<u8>> 
     }
 }
 
+/// Writes `payload` via create-new tmp file, fsync, rename, then directory fsync.
+///
+/// `create_new` plus the symlink checks ensure the write can never follow an attacker-placed
+/// link, and the rename makes the visible update atomic on the same filesystem.
+///
+/// # Errors
+/// Fails when any of the checks, the tmp write/fsync, the rename, or permission hardening
+/// fails.
 pub(crate) fn write_hardened_file_atomic(
     root_dir: &Path,
     target_path: &Path,
@@ -515,6 +651,10 @@ pub(crate) fn write_hardened_file_atomic(
     Ok(())
 }
 
+/// Fsyncs a directory so a completed rename survives power loss; no-op on non-unix.
+///
+/// # Errors
+/// Fails when the directory cannot be opened or synced (unix only).
 pub(crate) fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -531,6 +671,14 @@ pub(crate) fn sync_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Seals `plaintext` with ChaCha20-Poly1305 into the state blob layout (magic, nonce,
+/// ciphertext+tag).
+///
+/// A fresh random 96-bit nonce is generated per call; `LessSafeKey` is ring's API for
+/// caller-managed nonces, and uniqueness comes from that per-seal randomness.
+///
+/// # Errors
+/// Fails when key initialization, nonce generation, or sealing fails.
 pub(crate) fn encrypt_state_blob(key: &[u8; STATE_KEY_LEN], plaintext: &[u8]) -> Result<Vec<u8>> {
     let unbound_key = UnboundKey::new(&CHACHA20_POLY1305, key)
         .map_err(|_| anyhow::anyhow!("failed to initialize state cipher key"))?;
@@ -550,6 +698,11 @@ pub(crate) fn encrypt_state_blob(key: &[u8; STATE_KEY_LEN], plaintext: &[u8]) ->
     Ok(output)
 }
 
+/// Opens a state blob produced by [`encrypt_state_blob`].
+///
+/// # Errors
+/// Fails when the blob is too short, the magic header does not match, or authenticated
+/// decryption fails (wrong key or tampered data).
 pub(crate) fn decrypt_state_blob(key: &[u8; STATE_KEY_LEN], encrypted: &[u8]) -> Result<Vec<u8>> {
     if encrypted.len() < STATE_FILE_MAGIC.len() + STATE_NONCE_LEN {
         anyhow::bail!("state payload is too short");
@@ -571,6 +724,11 @@ pub(crate) fn decrypt_state_blob(key: &[u8; STATE_KEY_LEN], encrypted: &[u8]) ->
     Ok(plaintext.to_vec())
 }
 
+/// Derives a per-profile data-encryption key from the master key; profile-less state uses the
+/// master key directly.
+///
+/// SHA-256 over (namespace, master key, profile id) — deterministic by design so existing
+/// profile blobs stay decryptable across restarts.
 pub(crate) fn derive_state_encryption_key(
     master_key: &[u8; STATE_KEY_LEN],
     profile_id: Option<&str>,
@@ -588,12 +746,14 @@ pub(crate) fn derive_state_encryption_key(
     key
 }
 
+/// SHA-256 of `bytes` as a lowercase hex string.
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let mut context = DigestContext::new(&SHA256);
     context.update(bytes);
     encode_hex(context.finish().as_ref())
 }
 
+/// Encodes bytes as lowercase hex.
 pub(crate) fn encode_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|value| format!("{value:02x}")).collect::<String>()
 }

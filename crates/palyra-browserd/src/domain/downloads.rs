@@ -1,5 +1,15 @@
+//! Download capture, sandboxing, and quarantine for browser sessions.
+//!
+//! Artifacts live in a per-session temp sandbox split into allowlist and quarantine
+//! directories. Quarantined artifacts stay listable, but their content is never released to
+//! callers; quarantine is decided by the extension/MIME allowlists at store time.
+
 use crate::*;
 
+/// Metadata for one captured download stored in the session sandbox.
+///
+/// When `quarantined` is set, [`get_download_artifact_content`] refuses to return the bytes and
+/// `quarantine_reason` carries pipe-joined machine-readable reasons.
 #[derive(Debug, Clone)]
 pub(crate) struct DownloadArtifactRecord {
     pub(crate) artifact_id: String,
@@ -16,6 +26,9 @@ pub(crate) struct DownloadArtifactRecord {
     pub(crate) storage_path: PathBuf,
 }
 
+/// Per-session temp-dir sandbox holding download artifacts under a total byte budget.
+///
+/// Dropping the session removes the backing [`TempDir`] and with it every stored artifact.
 #[derive(Debug)]
 pub(crate) struct DownloadSandboxSession {
     pub(crate) root_dir: TempDir,
@@ -25,6 +38,10 @@ pub(crate) struct DownloadSandboxSession {
 }
 
 impl DownloadSandboxSession {
+    /// Allocates a fresh sandbox temp dir with allowlist and quarantine subdirectories.
+    ///
+    /// # Errors
+    /// Returns an error string when the temp dir or its subdirectories cannot be created.
     pub(crate) fn new() -> Result<Self, String> {
         let root_dir = tempfile::Builder::new()
             .prefix("palyra-browserd-downloads-")
@@ -43,6 +60,7 @@ impl DownloadSandboxSession {
     }
 }
 
+/// Converts an artifact record into its proto form; the source URL is query-redacted.
 pub(crate) fn download_artifact_to_proto(
     record: &DownloadArtifactRecord,
 ) -> browser_v1::DownloadArtifact {
@@ -69,6 +87,14 @@ pub(crate) fn download_artifact_to_proto(
     }
 }
 
+/// Loads a stored artifact's bytes, enforcing quarantine and byte caps.
+///
+/// A `max_bytes` of 0 means "use the global cap"; the effective cap never exceeds
+/// `DOWNLOAD_MAX_FILE_BYTES`.
+///
+/// # Errors
+/// Returns an error string when the sandbox or artifact is missing, the artifact is
+/// quarantined, the content exceeds the cap (before or after reading), or the file read fails.
 pub(crate) async fn get_download_artifact_content(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -107,6 +133,7 @@ pub(crate) async fn get_download_artifact_content(
     let content = fs::read(artifact.storage_path.as_path()).map_err(|error| {
         format!("failed to read download artifact '{}' from storage: {error}", artifact.artifact_id)
     })?;
+    // Re-check after the read: the on-disk file is authoritative, not the recorded size.
     if content.len() as u64 > max_bytes {
         return Err(format!(
             "download artifact exceeds max_bytes after read ({} > {})",
@@ -117,6 +144,14 @@ pub(crate) async fn get_download_artifact_content(
     Ok((artifact, content))
 }
 
+/// Captures the download a click on `selector` would trigger, based on the page snapshot.
+///
+/// Private-profile sessions fetch without profile attribution so the artifact is not linked to
+/// the profile.
+///
+/// # Errors
+/// Returns an error string when the selector does not resolve to a download source tag, the
+/// target cannot be resolved, or the fetch/storage pipeline fails.
 pub(crate) async fn capture_download_artifact_for_click(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -141,6 +176,14 @@ pub(crate) async fn capture_download_artifact_for_click(
     .await
 }
 
+/// Fetches `source_url` and stores it only when the response is an HTTP attachment.
+///
+/// Returns `Ok(None)` when the response lacks an attachment Content-Disposition, so callers
+/// can fall back to regular navigation handling.
+///
+/// # Errors
+/// Returns an error string when URL validation, the request, byte limits, or sandbox storage
+/// fail.
 pub(crate) async fn fetch_http_attachment_download_artifact(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -163,6 +206,15 @@ pub(crate) async fn fetch_http_attachment_download_artifact(
     .await
 }
 
+/// Stores an in-memory payload (e.g. a rendered PDF) as a download artifact.
+///
+/// Creates the session sandbox on demand; the same quarantine and size rules apply as for
+/// fetched downloads, and the oldest artifacts are evicted when the per-session count cap is
+/// reached.
+///
+/// # Errors
+/// Returns an error string when the payload exceeds the file byte cap, the sandbox byte budget
+/// would be exceeded, or sandbox allocation/writing fails.
 pub(crate) async fn store_generated_artifact(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -239,6 +291,14 @@ pub(crate) async fn store_generated_artifact(
     Ok(artifact)
 }
 
+/// Resolves a download anchor tag's href (absolute or relative) and target file name.
+///
+/// An explicit `download` attribute names the file; otherwise the name is inferred from the
+/// resolved URL's last path segment.
+///
+/// # Errors
+/// Returns an error string when the href is missing/empty or relative resolution fails (no or
+/// invalid current page URL).
 pub(crate) fn resolve_download_target(
     tag: &str,
     current_url: Option<&str>,
@@ -270,8 +330,9 @@ pub(crate) fn resolve_download_target(
     Ok((resolved_url, file_name))
 }
 
+/// Derives a sanitized file name from a URL's last path segment, with a fixed fallback.
 pub(crate) fn infer_download_file_name(raw_url: &str) -> String {
-    let Some(url) = Url::parse(raw_url).ok() else {
+    let Ok(url) = Url::parse(raw_url) else {
         return DOWNLOAD_FILE_NAME_FALLBACK.to_owned();
     };
     let Some(value) = url
@@ -284,13 +345,15 @@ pub(crate) fn infer_download_file_name(raw_url: &str) -> String {
     sanitize_download_file_name(value)
 }
 
+/// Reports whether a Content-Disposition header declares an attachment.
 pub(crate) fn content_disposition_is_attachment(raw: &str) -> bool {
-    raw.split(';')
-        .next()
-        .map(|value| value.trim().eq_ignore_ascii_case("attachment"))
-        .unwrap_or(false)
+    raw.split(';').next().is_some_and(|value| value.trim().eq_ignore_ascii_case("attachment"))
 }
 
+/// Extracts a sanitized file name from an attachment Content-Disposition header.
+///
+/// Prefers the RFC 5987 `filename*` form over plain `filename`; returns `None` for
+/// non-attachment dispositions or when no usable name is present.
 pub(crate) fn content_disposition_attachment_file_name(raw: &str) -> Option<String> {
     if !content_disposition_is_attachment(raw) {
         return None;
@@ -371,6 +434,10 @@ fn hex_value(value: u8) -> Option<u8> {
     }
 }
 
+/// Reduces a file name to a safe ASCII subset, falling back to a fixed name when empty.
+///
+/// Leading/trailing dots and underscores are stripped so the result can never be a dotfile or
+/// a traversal component; the result is capped at 96 bytes.
 pub(crate) fn sanitize_download_file_name(raw: &str) -> String {
     let mut sanitized = raw
         .chars()
@@ -389,6 +456,10 @@ pub(crate) fn sanitize_download_file_name(raw: &str) -> String {
     truncate_utf8_bytes(sanitized.as_str(), 96)
 }
 
+/// Determines a download's MIME type from the response header, magic bytes, then extension.
+///
+/// A non-empty declared Content-Type always wins; magic-byte sniffing only runs without one.
+/// Container formats (ZIP, MP4 `ftyp`) defer to the extension mapping for the specific subtype.
 pub(crate) fn sniff_download_mime_type(
     header_content_type: Option<&str>,
     file_name: &str,
@@ -439,6 +510,7 @@ pub(crate) fn sniff_download_mime_type(
         .to_owned()
 }
 
+/// Reports whether a file name's extension is on the download allowlist.
 pub(crate) fn extension_is_allowed(file_name: &str) -> bool {
     let extension = Path::new(file_name)
         .extension()
@@ -448,6 +520,10 @@ pub(crate) fn extension_is_allowed(file_name: &str) -> bool {
     DOWNLOAD_ALLOWED_EXTENSIONS.iter().any(|candidate| candidate == &extension)
 }
 
+/// Reports whether a MIME type is allowlisted for downloads.
+///
+/// Whole media families (audio, font, image, text, video) are allowed; application types must
+/// be individually allowlisted.
 pub(crate) fn mime_type_is_allowed(mime_type: &str) -> bool {
     let normalized = normalize_mime_type(mime_type);
     if normalized.starts_with("audio/")
@@ -461,6 +537,8 @@ pub(crate) fn mime_type_is_allowed(mime_type: &str) -> bool {
     DOWNLOAD_ALLOWED_MIME_TYPES.contains(&normalized.as_str())
 }
 
+// Generic binary MIME types are trusted only when the extension is already allowlisted; the
+// returned reasons are pipe-joined stable tokens consumed by clients and tests.
 fn download_quarantine_reason(file_name: &str, mime_type: &str) -> Option<String> {
     let extension_allowed = extension_is_allowed(file_name);
     let mime_allowed = mime_type_is_allowed(mime_type)
@@ -553,6 +631,11 @@ fn mime_type_for_download_extension(extension: &str) -> Option<&'static str> {
     }
 }
 
+/// Fetches `source_url` and stores any successful response as a download artifact.
+///
+/// # Errors
+/// Returns an error string when URL validation, the request, redirect handling, byte limits,
+/// or sandbox storage fail.
 pub(crate) async fn fetch_download_artifact(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -576,6 +659,7 @@ pub(crate) async fn fetch_download_artifact(
     .ok_or_else(|| "download response was not captured".to_owned())
 }
 
+/// Controls which HTTP responses `fetch_download_artifact_inner` is allowed to capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DownloadCaptureMode {
     AnySuccessfulResponse,
@@ -610,6 +694,9 @@ async fn fetch_download_artifact_inner(
     let mut current_url =
         Url::parse(source_url).map_err(|error| format!("invalid download URL: {error}"))?;
     let mut redirects = 0_u32;
+    // Redirects are followed manually (capped at 3) so every hop is re-validated against the
+    // private-target policy and fetched with a freshly pinned client: a redirect must not be
+    // able to steer the download into a private address space.
     let response = loop {
         let allow_current_private_targets = download_request_allows_private_target(
             runtime,
@@ -750,6 +837,8 @@ async fn fetch_download_artifact_inner(
     Ok(Some(artifact))
 }
 
+// Chromium sessions may have retained an allowance for a specific local origin (e.g. a page the
+// browser itself was permitted to reach); downloads from that same origin reuse it.
 async fn download_request_allows_private_target(
     runtime: &BrowserRuntimeState,
     session_id: &str,

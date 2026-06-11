@@ -1,3 +1,7 @@
+//! Build script: compiles the browser and common protobuf contracts into tonic
+//! server/client stubs. Uses the vendored `protoc` binary so builds do not
+//! depend on a system protobuf installation.
+
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

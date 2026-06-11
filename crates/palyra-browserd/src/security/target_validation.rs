@@ -1,5 +1,14 @@
+//! SSRF-hardened target validation and guarded navigation for browserd.
+//!
+//! Every outbound navigation target is resolved and checked against the
+//! private/local address policy here before any connection is made. Validated
+//! DNS answers are pinned into the HTTP client (no re-resolution at connect
+//! time) so a host cannot rebind to a private address between validation and
+//! connect, and redirects are re-validated hop by hop.
+
 use crate::*;
 
+/// DNS resolution result pre-classified against the deny-private default policy.
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedHostAddresses {
     pub(crate) addresses: Vec<IpAddr>,
@@ -7,6 +16,14 @@ pub(crate) struct ResolvedHostAddresses {
 }
 
 impl ResolvedHostAddresses {
+    /// Classifies resolved addresses against the deny-private default policy.
+    ///
+    /// A single private/local address in the answer marks the whole result as
+    /// blocked: mixed public+private answers are a common DNS rebinding shape,
+    /// so partial matches must not slip through.
+    ///
+    /// # Errors
+    /// Returns an error when the address list is empty.
     pub(crate) fn from_addresses(addresses: Vec<IpAddr>) -> Result<Self, String> {
         if addresses.is_empty() {
             return Err("DNS resolution returned no addresses".to_owned());
@@ -17,12 +34,19 @@ impl ResolvedHostAddresses {
     }
 }
 
+/// Negative-cache entry: expiry deadline plus last-touch tick for LRU pruning.
 #[derive(Debug, Clone)]
 pub(crate) struct DnsValidationCacheEntry {
     expires_at: Instant,
     last_access_tick: u64,
 }
 
+/// Bounded negative (NXDOMAIN-only) DNS cache.
+///
+/// Only failed resolutions are cached, to absorb repeated lookups of
+/// nonexistent hosts; successful answers are never cached, so the private
+/// address policy always evaluates a fresh resolution. Eviction is LRU via a
+/// monotonically increasing access tick.
 #[derive(Debug)]
 pub(crate) struct DnsValidationCache {
     entries: HashMap<String, DnsValidationCacheEntry>,
@@ -32,6 +56,7 @@ pub(crate) struct DnsValidationCache {
 }
 
 impl DnsValidationCache {
+    /// Creates a cache enforcing a floor of one entry and a one-second TTL.
     pub(crate) fn new(max_entries: usize, negative_ttl: Duration) -> Self {
         Self {
             entries: HashMap::new(),
@@ -45,6 +70,10 @@ impl DnsValidationCache {
         self.entries.len()
     }
 
+    /// Returns whether `key` has an unexpired entry, refreshing its LRU tick.
+    ///
+    /// Deliberately mutating: an expired entry found here is removed on the
+    /// way out so dead keys do not occupy capacity until the next insert.
     pub(crate) fn contains(&mut self, key: &str, now: Instant) -> bool {
         let mut should_remove = false;
         let mut found = false;
@@ -63,6 +92,7 @@ impl DnsValidationCache {
         found
     }
 
+    /// Records a fresh NXDOMAIN observation, evicting expired then LRU entries.
     pub(crate) fn insert_nxdomain(&mut self, key: String, now: Instant) {
         self.remove_expired(now);
         let last_access_tick = self.next_access_tick();
@@ -97,6 +127,7 @@ impl DnsValidationCache {
     }
 }
 
+/// Process-wide counters for DNS validation outcomes, logged periodically.
 #[derive(Debug, Default)]
 pub(crate) struct DnsValidationMetrics {
     cache_hits: AtomicU64,
@@ -109,6 +140,7 @@ pub(crate) struct DnsValidationMetrics {
     observations: AtomicU64,
 }
 
+/// Point-in-time copy of the DNS validation counters plus current cache size.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct DnsValidationMetricsSnapshot {
     cache_hits: u64,
@@ -175,12 +207,25 @@ static DNS_VALIDATION_CACHE: LazyLock<std::sync::Mutex<DnsValidationCache>> = La
 static DNS_VALIDATION_METRICS: LazyLock<DnsValidationMetrics> =
     LazyLock::new(DnsValidationMetrics::default);
 
+/// A target that passed policy checks, carrying the exact addresses to pin.
+///
+/// `host` is `None` when the URL host was an IP literal (nothing to pin).
+/// Otherwise `resolved_socket_addrs` must be installed into the HTTP client so
+/// the connection reuses the validated answer instead of re-resolving — the
+/// DNS rebinding defense (see `build_pinned_http_client`).
 #[derive(Debug, Clone)]
 pub(crate) struct ValidatedTargetUrl {
     pub(crate) host: Option<String>,
     pub(crate) resolved_socket_addrs: Vec<SocketAddr>,
 }
 
+/// Validates a raw URL string against target policy using blocking DNS resolution.
+///
+/// `about:blank` is always allowed. Intended for non-async callers; async
+/// paths use `validate_target_url`, which additionally returns pinning data.
+///
+/// # Errors
+/// Returns a human-readable reason when the URL is malformed or blocked.
 pub(crate) fn validate_target_url_blocking(
     raw_url: &str,
     allow_private_targets: bool,
@@ -192,6 +237,13 @@ pub(crate) fn validate_target_url_blocking(
     validate_target_url_parts_blocking(&url, allow_private_targets)
 }
 
+/// Validates an already-parsed URL against target policy (blocking variant).
+///
+/// `file` URLs go through the local-file gate; everything else must pass
+/// scheme/credential checks, DNS resolution, and the private-address policy.
+///
+/// # Errors
+/// Returns the policy or resolution failure reason.
 pub(crate) fn validate_target_url_parts_blocking(
     url: &Url,
     allow_private_targets: bool,
@@ -200,6 +252,8 @@ pub(crate) fn validate_target_url_parts_blocking(
         validate_local_file_url_target(url, allow_private_targets)?;
         return Ok(());
     }
+    // Immediately-invoked closure keeps `?` local so the metrics observation
+    // below runs on the failure path too.
     let result = (|| {
         let (host, port) = extract_target_host_port(url)?;
         let resolved = resolve_host_addresses_blocking(host, port)?;
@@ -209,14 +263,26 @@ pub(crate) fn validate_target_url_parts_blocking(
     result
 }
 
+/// Locks the global negative DNS cache, recovering from lock poisoning.
+///
+/// The cache is purely advisory (worst case: one extra DNS lookup), so a panic
+/// in another thread must not take navigation down with it.
 pub(crate) fn lock_dns_validation_cache() -> std::sync::MutexGuard<'static, DnsValidationCache> {
     DNS_VALIDATION_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Canonicalizes a host for cache keying: trims whitespace and the FQDN
+/// trailing dot, then lowercases.
 pub(crate) fn normalize_dns_host_cache_key(host: &str) -> String {
     host.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
+/// Heuristically detects name-not-found resolver failures.
+///
+/// `std::io::Error` from the system resolver carries no structured NXDOMAIN
+/// code, so this matches the known message shapes for Windows, glibc, and
+/// macOS/BSD in addition to `ErrorKind::NotFound`. Only these failures are
+/// negative-cached; transient resolver errors must stay immediately retryable.
 pub(crate) fn is_nxdomain_lookup_error(error: &std::io::Error) -> bool {
     if error.kind() == std::io::ErrorKind::NotFound {
         return true;
@@ -228,14 +294,18 @@ pub(crate) fn is_nxdomain_lookup_error(error: &std::io::Error) -> bool {
         || message.contains("nodename nor servname provided")
 }
 
+/// Formats a live DNS failure for `host`; keep wording aligned with
+/// `dns_cached_nxdomain_error_for_host` so callers see one message family.
 pub(crate) fn dns_resolution_error_for_host(host: &str, error: &std::io::Error) -> String {
     format!("DNS resolution failed for host '{host}': {error}")
 }
 
+/// Formats the failure reported when a cached NXDOMAIN entry short-circuits lookup.
 pub(crate) fn dns_cached_nxdomain_error_for_host(host: &str) -> String {
     format!("DNS resolution failed for host '{host}': cached NXDOMAIN")
 }
 
+/// Returns whether `host` has a live cached NXDOMAIN entry, counting hit/miss.
 pub(crate) fn lookup_cached_nxdomain(host: &str) -> bool {
     let key = normalize_dns_host_cache_key(host);
     let now = Instant::now();
@@ -249,6 +319,7 @@ pub(crate) fn lookup_cached_nxdomain(host: &str) -> bool {
     cached
 }
 
+/// Caches an NXDOMAIN observation for `host` in the global negative cache.
 pub(crate) fn store_dns_nxdomain_cache(host: &str) {
     let key = normalize_dns_host_cache_key(host);
     let now = Instant::now();
@@ -256,6 +327,15 @@ pub(crate) fn store_dns_nxdomain_cache(host: &str) {
     cache.insert_nxdomain(key, now);
 }
 
+/// Extracts host and effective port after scheme and credential checks.
+///
+/// Only `http`/`https` may reach DNS validation (`file` is gated separately,
+/// every other scheme is blocked), and URLs with embedded credentials are
+/// rejected outright so secrets cannot ride along in navigation targets.
+///
+/// # Errors
+/// Returns the policy reason when the scheme is blocked, credentials are
+/// present, or the host/port cannot be determined.
 pub(crate) fn extract_target_host_port(url: &Url) -> Result<(&str, u16), String> {
     if !matches!(url.scheme(), "http" | "https") {
         return Err(format!("blocked URL scheme '{}'", url.scheme()));
@@ -269,6 +349,7 @@ pub(crate) fn extract_target_host_port(url: &Url) -> Result<(&str, u16), String>
     Ok((host, port))
 }
 
+/// Records one DNS lookup and its elapsed milliseconds in the metrics counters.
 pub(crate) fn track_dns_lookup_latency(lookup_started: Instant) {
     let lookup_latency_ms = lookup_started.elapsed().as_millis() as u64;
     DNS_VALIDATION_METRICS.dns_lookups.fetch_add(1, Ordering::Relaxed);
@@ -277,6 +358,14 @@ pub(crate) fn track_dns_lookup_latency(lookup_started: Instant) {
         .fetch_add(lookup_latency_ms, Ordering::Relaxed);
 }
 
+/// Resolves `host` to IP addresses with negative caching and metrics applied
+/// (blocking variant; keep in sync with `resolve_host_addresses_async`).
+///
+/// IP literals bypass DNS entirely. NXDOMAIN-shaped failures are negative
+/// cached; every failure increments the blocked counters.
+///
+/// # Errors
+/// Returns the resolution failure reason; never yields an empty address list.
 pub(crate) fn resolve_host_addresses_blocking(
     host: &str,
     port: u16,
@@ -314,6 +403,10 @@ pub(crate) fn resolve_host_addresses_blocking(
     Ok(resolved)
 }
 
+/// Async twin of `resolve_host_addresses_blocking`; behavior must stay identical.
+///
+/// # Errors
+/// Returns the resolution failure reason; never yields an empty address list.
 pub(crate) async fn resolve_host_addresses_async(
     host: &str,
     port: u16,
@@ -351,12 +444,19 @@ pub(crate) async fn resolve_host_addresses_async(
     Ok(resolved)
 }
 
+/// Applies the deny-private default policy to a resolution result.
+///
+/// # Errors
+/// Returns a blocked-by-policy message when private targets are not allowed
+/// and the answer contained a private/local address.
 pub(crate) fn enforce_resolved_host_policy(
     host: &str,
     resolved: ResolvedHostAddresses,
     allow_private_targets: bool,
 ) -> Result<(), String> {
     if !allow_private_targets && resolved.blocked_for_default_policy {
+        // Cap the address preview so a hostile resolver returning hundreds of
+        // records cannot inflate error messages and logs.
         let preview = resolved
             .addresses
             .iter()
@@ -373,11 +473,14 @@ pub(crate) fn enforce_resolved_host_policy(
     Ok(())
 }
 
+/// Captures the current DNS validation counters together with the cache size.
 pub(crate) fn dns_validation_metrics_snapshot() -> DnsValidationMetricsSnapshot {
     let cache_entries = lock_dns_validation_cache().len();
     DNS_VALIDATION_METRICS.snapshot(cache_entries)
 }
 
+/// Emits a metrics snapshot every `DNS_VALIDATION_METRICS_LOG_INTERVAL`
+/// validations, keeping steady-state log volume bounded.
 pub(crate) fn maybe_log_dns_validation_metrics() {
     let observations = DNS_VALIDATION_METRICS.observations.fetch_add(1, Ordering::Relaxed) + 1;
     if !observations.is_multiple_of(DNS_VALIDATION_METRICS_LOG_INTERVAL) {
@@ -398,6 +501,7 @@ pub(crate) fn maybe_log_dns_validation_metrics() {
     );
 }
 
+/// Clears the global cache and counters so tests stay order-independent.
 #[cfg(test)]
 pub(crate) fn reset_dns_validation_tracking_for_tests() {
     let mut cache = lock_dns_validation_cache();
@@ -407,6 +511,13 @@ pub(crate) fn reset_dns_validation_tracking_for_tests() {
     DNS_VALIDATION_METRICS.reset_for_tests();
 }
 
+/// Performs a guarded HTTP(S) or local-file navigation with manual redirect handling.
+///
+/// Each redirect hop is independently policy-validated and fetched with a
+/// client pinned to that hop's resolved addresses; the body is streamed and
+/// truncated at `max_response_bytes`. Failures are reported inside the
+/// returned `NavigateOutcome` (never as `Err`) so callers always receive the
+/// network log and cookie updates accumulated up to the failure.
 pub(crate) async fn navigate_with_guards(
     raw_url: &str,
     timeout_ms: u64,
@@ -436,6 +547,7 @@ pub(crate) async fn navigate_with_guards(
             }
         }
     };
+    // Hard ceiling of 10 hops no matter what the caller requests.
     let redirect_limit = max_redirects.clamp(1, 10);
     let mut redirects = 0_u32;
     let initial_scheme = current_url.scheme().to_owned();
@@ -488,6 +600,11 @@ pub(crate) async fn navigate_with_guards(
 
         let request_started = Instant::now();
         let mut request_builder = client.get(current_url.clone());
+        // AIDEV-NOTE: cookie_header is built once for the original URL and
+        // re-attached on every redirect hop, including cross-origin ones, so
+        // cookies scoped to the initial host can leak to redirect targets.
+        // Fixing this changes observable request behavior - coordinate before
+        // changing.
         if let Some(value) = cookie_header.filter(|value| !value.trim().is_empty()) {
             request_builder = request_builder.header(COOKIE_HEADER, value);
         }
@@ -617,6 +734,8 @@ pub(crate) async fn navigate_with_guards(
                     }
                 }
             };
+            // A remote response must never steer navigation onto the local
+            // filesystem, even when the session may read files directly.
             if initial_scheme != "file" && current_url.scheme() == "file" {
                 return NavigateOutcome {
                     success: false,
@@ -709,6 +828,8 @@ pub(crate) async fn navigate_with_guards(
     }
 }
 
+/// Serves a `file://` navigation after the local-file gate passes, enforcing
+/// the response byte cap against the file size before reading it.
 fn navigate_local_file_with_guards(
     url: &Url,
     allow_private_targets: bool,
@@ -800,6 +921,15 @@ fn navigate_local_file_with_guards(
     }
 }
 
+/// Gate for `file://` targets, only open to sessions allowed private targets.
+///
+/// Credentials and query strings are rejected, the path is canonicalized so
+/// reads operate on the resolved real file (symlinks and `..` collapse here),
+/// and the target must be a regular file - directories and special files are
+/// refused.
+///
+/// # Errors
+/// Returns the policy reason or the filesystem failure for invalid targets.
 fn validate_local_file_url_target(
     url: &Url,
     allow_private_targets: bool,
@@ -827,6 +957,16 @@ fn validate_local_file_url_target(
     Ok(canonical)
 }
 
+/// Post-connect re-check that the connected peer is not private/local.
+///
+/// Defense in depth behind DNS pinning: the actual peer address is verified
+/// again before the response is consumed, so anything that changes the
+/// effective peer after validation still fails closed. Skipped only when the
+/// transport exposes no peer address.
+///
+/// # Errors
+/// Returns the policy violation when the peer IP is private/local and private
+/// targets are not allowed.
 pub(crate) fn enforce_remote_response_ip_policy(
     remote_addr: Option<SocketAddr>,
     allow_private_targets: bool,
@@ -848,6 +988,14 @@ pub(crate) fn enforce_remote_response_ip_policy(
     ))
 }
 
+/// Validates an HTTP(S) URL and returns the exact addresses to pin for it.
+///
+/// Resolution, policy enforcement, and pinning data are produced in one step
+/// so callers cannot accidentally connect using a second, unvalidated DNS
+/// answer.
+///
+/// # Errors
+/// Returns the policy or resolution failure reason.
 pub(crate) async fn validate_target_url(
     url: &Url,
     allow_private_targets: bool,
@@ -869,6 +1017,15 @@ pub(crate) async fn validate_target_url(
     result
 }
 
+/// Builds a reqwest client locked to the validated target.
+///
+/// Redirects are disabled because the caller re-validates every hop itself,
+/// and for named hosts resolution is overridden with the already-validated
+/// socket addresses so the connection cannot follow a fresh - possibly
+/// rebound - DNS answer.
+///
+/// # Errors
+/// Returns the underlying client construction error.
 pub(crate) fn build_pinned_http_client(
     timeout_ms: u64,
     validated_target: &ValidatedTargetUrl,

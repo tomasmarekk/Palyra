@@ -1,3 +1,9 @@
+//! Operator CLI arguments, the session budget model, and crate-wide limit constants.
+//!
+//! The constants here are the single source of truth for browserd resource
+//! caps, wire header names, env variable names, and persisted-state format
+//! identifiers; the rest of the crate must not restate these values.
+
 use crate::*;
 
 pub(crate) const DEFAULT_GRPC_PORT: u16 = 7543;
@@ -49,10 +55,14 @@ pub(crate) const CHROMIUM_STARTUP_TIMEOUT_ENV: &str = "PALYRA_BROWSERD_CHROMIUM_
 pub(crate) const DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS: u64 = 20_000;
 pub(crate) const CHROMIUM_NEW_TAB_MAX_ATTEMPTS: usize = 6;
 pub(crate) const CHROMIUM_NEW_TAB_RETRY_DELAY_MS: u64 = 400;
+/// Magic prefix identifying encrypted browserd state files (format version 1).
 pub(crate) const STATE_FILE_MAGIC: &[u8; 4] = b"PBS1";
+/// ChaCha20-Poly1305 nonce length used by the state-file envelope.
 pub(crate) const STATE_NONCE_LEN: usize = 12;
+/// ChaCha20-Poly1305 key length required of the state encryption key.
 pub(crate) const STATE_KEY_LEN: usize = 32;
 pub(crate) const STATE_TMP_EXTENSION: &str = "tmp";
+/// Domain-separation label for deriving per-profile data-encryption keys.
 pub(crate) const STATE_PROFILE_DEK_NAMESPACE: &[u8] = b"palyra.browser.profile.dek.v1";
 pub(crate) const COOKIE_HEADER: &str = "cookie";
 pub(crate) const SET_COOKIE_HEADER: &str = "set-cookie";
@@ -63,7 +73,9 @@ pub(crate) const MAX_PROFILE_NAME_BYTES: usize = 96;
 pub(crate) const MAX_PROFILE_THEME_BYTES: usize = 24;
 pub(crate) const MAX_PROFILES_PER_PRINCIPAL: usize = 16;
 pub(crate) const MAX_PROFILE_REGISTRY_BYTES: usize = 512 * 1024;
+/// Domain-separation label for profile-record integrity hashes (schema v2).
 pub(crate) const PROFILE_RECORD_HASH_NAMESPACE: &[u8] = b"palyra.browser.profile.record.v2";
+/// Retained so records hashed under schema v1 still verify after upgrade.
 pub(crate) const PROFILE_RECORD_HASH_NAMESPACE_LEGACY: &[u8] = b"palyra.browser.profile.record.v1";
 pub(crate) const DOWNLOAD_MAX_TOTAL_BYTES_PER_SESSION: u64 = 32 * 1024 * 1024;
 pub(crate) const DOWNLOAD_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
@@ -71,6 +83,8 @@ pub(crate) const MAX_DOWNLOAD_ARTIFACTS_PER_SESSION: usize = 128;
 pub(crate) const DOWNLOADS_DIR_ALLOWLIST: &str = "allowlist";
 pub(crate) const DOWNLOADS_DIR_QUARANTINE: &str = "quarantine";
 pub(crate) const DOWNLOAD_FILE_NAME_FALLBACK: &str = "download.bin";
+/// File extensions eligible for the download allowlist directory; artifacts
+/// failing both this and the MIME allowlist are routed to quarantine instead.
 pub(crate) const DOWNLOAD_ALLOWED_EXTENSIONS: &[&str] = &[
     "7z", "aac", "avif", "bmp", "br", "bz2", "cjs", "conf", "css", "csv", "doc", "docx", "eot",
     "flac", "gif", "gz", "heic", "heif", "htm", "html", "ico", "ini", "jpeg", "jpg", "js", "json",
@@ -135,21 +149,29 @@ pub(crate) const CHROMIUM_DOWNLOAD_CAPTURE_HANDLER_NAME: &str = "palyra.download
 pub(crate) const CHROMIUM_PENDING_NETWORK_LOG_MAX_ENTRIES: usize = 512;
 pub(crate) const CHROMIUM_PENDING_DOWNLOAD_CAPTURE_MAX_ENTRIES: usize = 32;
 pub(crate) const DNS_VALIDATION_CACHE_MAX_ENTRIES: usize = 512;
+/// How long a cached NXDOMAIN answer suppresses repeat lookups for a host.
 pub(crate) const DNS_VALIDATION_NEGATIVE_TTL: Duration = Duration::from_secs(10);
 pub(crate) const DNS_VALIDATION_METRICS_LOG_INTERVAL: u64 = 256;
+/// Pre-encoded 1x1 transparent PNG returned by simulated-engine screenshots.
 pub(crate) const ONE_BY_ONE_PNG: &[u8] = &[
     137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0,
     0, 0, 31, 21, 196, 137, 0, 0, 0, 10, 73, 68, 65, 84, 120, 156, 99, 96, 0, 0, 0, 2, 0, 1, 229,
     39, 212, 138, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
 ];
 
+/// Which backend executes browser sessions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum BrowserEngineMode {
+    /// Real headless Chromium with JavaScript, subresources, and live DOM.
     Chromium,
+    /// Guarded HTTP-fetch emulation without JavaScript; used for tests and
+    /// environments without a Chromium binary.
     Simulated,
 }
 
 impl BrowserEngineMode {
+    /// Resolves the engine mode from the env override, falling back to `default`
+    /// for unset or unrecognized values.
     pub(crate) fn from_env_or_default(default: Self) -> Self {
         match std::env::var(CHROMIUM_ENGINE_MODE_ENV)
             .ok()
@@ -182,12 +204,18 @@ impl BrowserEngineMode {
     }
 }
 
+/// Launch settings for the Chromium engine backend.
 #[derive(Debug, Clone)]
 pub(crate) struct ChromiumEngineConfig {
+    /// Explicit Chromium binary path; `None` lets the launcher auto-discover one.
     pub(crate) executable_path: Option<PathBuf>,
     pub(crate) startup_timeout: Duration,
 }
 
+/// Operator CLI flags for the browserd daemon.
+///
+/// Both listeners default to loopback; binding elsewhere requires `auth_token`
+/// (see `enforce_non_loopback_bind_auth`).
 #[derive(Debug, Clone, Parser)]
 #[command(name = "palyra-browserd", about = "Palyra browser service v1")]
 pub(crate) struct Args {
@@ -223,6 +251,10 @@ pub(crate) struct Args {
     pub(crate) chromium_startup_timeout_ms: u64,
 }
 
+/// Per-session resource caps enforced on every request touching the session.
+///
+/// Daemon defaults come from `Args`; create_session may tailor most fields
+/// per session, after which they are immutable for the session's lifetime.
 #[derive(Debug, Clone)]
 pub(crate) struct SessionBudget {
     pub(crate) max_navigation_timeout_ms: u64,
@@ -243,6 +275,10 @@ pub(crate) struct SessionBudget {
     pub(crate) max_tabs_per_session: usize,
 }
 
+/// Converts a session budget into its wire representation.
+///
+/// `max_title_bytes` and `max_tabs_per_session` are internal-only limits and
+/// intentionally absent from the proto message.
 pub(crate) fn session_budget_to_proto(budget: &SessionBudget) -> browser_v1::SessionBudget {
     browser_v1::SessionBudget {
         max_navigation_timeout_ms: budget.max_navigation_timeout_ms,

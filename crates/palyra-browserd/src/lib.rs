@@ -1,3 +1,10 @@
+//! Palyra browser daemon (`palyra-browserd`) crate root.
+//!
+//! Exposes [`run`] as the daemon entry point and wires the browser service
+//! modules (app, domain, engine, persistence, security, transport) together.
+//! The `pub(crate)` re-exports below form a shared prelude that every module
+//! imports via `use crate::*`.
+
 pub mod app;
 pub mod domain;
 pub mod engine;
@@ -64,6 +71,7 @@ pub(crate) use tracing::{info, warn};
 pub(crate) use tracing_subscriber::EnvFilter;
 pub(crate) use ulid::Ulid;
 
+/// Generated tonic/prost stubs for the `palyra.common.v1` and `palyra.browser.v1` packages.
 pub mod proto {
     pub mod palyra {
         pub mod common {

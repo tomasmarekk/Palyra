@@ -1,5 +1,14 @@
+//! Browser action budgeting, allowlist enforcement, and action-log proto mapping.
+//!
+//! Every session action passes through [`consume_action_budget_and_snapshot`] before execution
+//! and [`finalize_session_action`] afterwards; together they enforce per-session action caps,
+//! sliding-window rate limits, and the optional per-session domain allowlist.
+
 use crate::*;
 
+/// Converts an internal action-log entry into its redacted proto form.
+///
+/// Free-text fields are sanitized and byte-capped; URLs go through query redaction.
 pub(crate) fn action_log_entry_to_proto(
     entry: &BrowserActionLogEntryInternal,
 ) -> browser_v1::BrowserActionLogEntry {
@@ -18,6 +27,8 @@ pub(crate) fn action_log_entry_to_proto(
     }
 }
 
+/// Redacts a selector for the action log: URL-shaped selectors (e.g. download hrefs) can carry
+/// secrets in query strings, so they get URL redaction instead of plain text sanitization.
 fn action_log_selector_to_proto(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -30,6 +41,7 @@ fn action_log_selector_to_proto(raw: &str) -> String {
     sanitize_debug_text(trimmed, MAX_INSPECT_ACTION_SELECTOR_BYTES)
 }
 
+/// Summarizes a tab's console log into per-severity counts for the diagnostics proto.
 pub(crate) fn page_diagnostics_to_proto(
     tab: &BrowserTabRecord,
 ) -> browser_v1::BrowserPageDiagnostics {
@@ -56,6 +68,10 @@ pub(crate) fn page_diagnostics_to_proto(
     }
 }
 
+/// Converts the session cookie jar into proto domains with redacted cookie values.
+///
+/// Domains and cookie names are sorted so output is deterministic across `HashMap` iteration
+/// orders; domains with no cookies are omitted.
 pub(crate) fn cookie_jar_to_proto(
     cookie_jar: &HashMap<String, HashMap<String, String>>,
 ) -> Vec<browser_v1::SessionCookieDomain> {
@@ -91,6 +107,9 @@ pub(crate) fn cookie_jar_to_proto(
         .collect()
 }
 
+/// Converts session storage state into proto origins with redacted values.
+///
+/// Origins and keys are sorted for deterministic output; origins with no entries are omitted.
 pub(crate) fn storage_entries_to_proto(
     storage_entries: &HashMap<String, HashMap<String, String>>,
 ) -> Vec<browser_v1::SessionStorageOrigin> {
@@ -126,6 +145,8 @@ pub(crate) fn storage_entries_to_proto(
         .collect()
 }
 
+// The fixed per-entry/per-domain offsets approximate proto framing overhead; they deliberately
+// overestimate so payload truncation errs on the small side.
 fn estimate_cookie_payload_bytes(domains: &[browser_v1::SessionCookieDomain]) -> usize {
     domains
         .iter()
@@ -142,6 +163,9 @@ fn estimate_cookie_payload_bytes(domains: &[browser_v1::SessionCookieDomain]) ->
         + 2
 }
 
+/// Drops cookies from the trailing domain until the estimated payload fits the byte budget.
+///
+/// Returns `true` if anything was removed.
 pub(crate) fn truncate_cookie_payload(
     domains: &mut Vec<browser_v1::SessionCookieDomain>,
     max_payload_bytes: usize,
@@ -161,6 +185,7 @@ pub(crate) fn truncate_cookie_payload(
     truncated
 }
 
+// Same overestimating framing heuristic as estimate_cookie_payload_bytes.
 fn estimate_storage_payload_bytes(origins: &[browser_v1::SessionStorageOrigin]) -> usize {
     origins
         .iter()
@@ -177,6 +202,9 @@ fn estimate_storage_payload_bytes(origins: &[browser_v1::SessionStorageOrigin]) 
         + 2
 }
 
+/// Drops storage entries from the trailing origin until the estimated payload fits the budget.
+///
+/// Returns `true` if anything was removed.
 pub(crate) fn truncate_storage_payload(
     origins: &mut Vec<browser_v1::SessionStorageOrigin>,
     max_payload_bytes: usize,
@@ -196,6 +224,8 @@ pub(crate) fn truncate_storage_payload(
     truncated
 }
 
+/// Point-in-time copy of the session fields an action handler needs after the sessions lock is
+/// released.
 #[derive(Debug, Clone)]
 pub(crate) struct ActionSessionSnapshot {
     pub(crate) budget: SessionBudget,
@@ -207,6 +237,7 @@ pub(crate) struct ActionSessionSnapshot {
     pub(crate) private_profile: bool,
 }
 
+/// Outcome data recorded for a completed (successful or failed) browser action.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FinalizeActionRequest<'a> {
     pub(crate) action_name: &'a str,
@@ -220,12 +251,24 @@ pub(crate) struct FinalizeActionRequest<'a> {
     pub(crate) max_failure_screenshot_bytes: u64,
 }
 
+/// Validates and charges one action against the session's budget, returning a snapshot.
+///
+/// Enforces the domain allowlist, the per-session action cap, and the sliding-window rate
+/// limit, then records the action. In Chromium mode the active tab snapshot is refreshed first
+/// so the allowlist check sees the real current URL.
+///
+/// # Errors
+/// Returns an error string when the session or active tab is missing, the allowlist or an
+/// action budget/rate limit blocks the action, or (with `require_page_body`) no page has been
+/// loaded yet.
 pub(crate) async fn consume_action_budget_and_snapshot(
     runtime: &BrowserRuntimeState,
     session_id: &str,
     require_page_body: bool,
 ) -> Result<ActionSessionSnapshot, String> {
     if matches!(runtime.engine_mode, BrowserEngineMode::Chromium) {
+        // The sessions lock must not be held across the Chromium refresh await: grab the tab
+        // id, release, refresh, then re-validate the session below (it may expire meanwhile).
         let active_tab_id = {
             let sessions = runtime.sessions.lock().await;
             let Some(session) = sessions.get(session_id) else {
@@ -285,6 +328,14 @@ pub(crate) async fn consume_action_budget_and_snapshot(
     })
 }
 
+/// Checks the active tab's host against the session's action domain allowlist.
+///
+/// An empty allowlist permits everything. Matching is exact or dot-suffix, so allowing
+/// `example.com` also allows `sub.example.com`.
+///
+/// # Errors
+/// Returns an error string when the session has no active URL, the host cannot be resolved,
+/// or the host is not allowlisted.
 pub(crate) fn enforce_action_domain_allowlist(
     session: &BrowserSessionRecord,
 ) -> Result<(), String> {
@@ -308,6 +359,8 @@ pub(crate) fn enforce_action_domain_allowlist(
     Err(format!("current page host '{current_host}' is blocked by action domain allowlist"))
 }
 
+/// Normalizes, sorts, and dedupes a raw allowlist; entries that cannot become a valid host are
+/// silently dropped.
 pub(crate) fn normalize_action_allowed_domains(values: &[String]) -> Vec<String> {
     let mut domains = values
         .iter()
@@ -318,6 +371,10 @@ pub(crate) fn normalize_action_allowed_domains(values: &[String]) -> Vec<String>
     domains
 }
 
+/// Normalizes one allowlist entry to a bare lowercase host, or `None` if it cannot be one.
+///
+/// Accepts full URLs (the host is extracted) or bare `host[:port][/path]` strings; the result
+/// must consist of ASCII alphanumerics, `.`, and `-`.
 pub(crate) fn normalize_single_allowed_domain(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -345,6 +402,11 @@ pub(crate) fn normalize_single_allowed_domain(raw: &str) -> Option<String> {
     }
 }
 
+/// Records an action's outcome in the session log and optionally captures a failure screenshot.
+///
+/// Failures are mirrored into the tab console log. Returns the proto log entry plus screenshot
+/// bytes and MIME type (entry is `None` and the rest empty when the session is gone; screenshot
+/// fields are empty when none was captured).
 pub(crate) async fn finalize_session_action(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -426,6 +488,8 @@ pub(crate) async fn finalize_session_action(
             screenshot_max_bytes,
         )
     };
+    // Screenshot capture awaits the Chromium engine, so it must run after the sessions lock is
+    // released; the byte cap was resolved above while the lock was still held.
     let (failure_screenshot_bytes, failure_screenshot_mime_type) =
         if let Some(max_bytes) = screenshot_max_bytes {
             capture_action_failure_screenshot(runtime, session_id, max_bytes).await
@@ -435,6 +499,7 @@ pub(crate) async fn finalize_session_action(
     (action_log, failure_screenshot_bytes, failure_screenshot_mime_type)
 }
 
+// Simulated mode returns a fixed 1x1 PNG so callers exercise the same payload path as Chromium.
 async fn capture_action_failure_screenshot(
     runtime: &BrowserRuntimeState,
     session_id: &str,

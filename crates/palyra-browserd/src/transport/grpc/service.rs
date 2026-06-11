@@ -1,8 +1,23 @@
+//! gRPC implementation of the `palyra.browser.v1` BrowserService contract.
+//!
+//! Every RPC authorizes the caller, resolves the session, delegates to the
+//! simulated or Chromium engine, then records the action log and persists the
+//! session snapshot when persistence is enabled. Most failures are reported
+//! in the response payload (`success`/`error`) so clients keep receiving
+//! session context; `Status` errors are reserved for auth, argument
+//! validation, and infrastructure faults.
+
 use crate::*;
 
+/// Request-extension marker that forces `allow_private_targets = false` for
+/// relay-initiated `open_tab` calls regardless of session settings.
+///
+/// Relay requests originate from browser-extension content, which must never
+/// be able to point the daemon at private/internal addresses.
 #[derive(Debug, Clone, Copy)]
 struct RelayPrivateTargetBlock;
 
+/// Smallest well-formed-enough PDF, returned by the simulated engine's export.
 const MINIMAL_SIMULATED_PDF: &[u8] = b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n";
 const MIN_VIEWPORT_WIDTH: u32 = 50;
 const MAX_VIEWPORT_WIDTH: u32 = 10_000;
@@ -10,11 +25,15 @@ const MIN_VIEWPORT_HEIGHT: u32 = 50;
 const MAX_VIEWPORT_HEIGHT: u32 = 10_000;
 const DEFAULT_DEVICE_SCALE_FACTOR: f64 = 1.0;
 const MAX_DEVICE_SCALE_FACTOR: f64 = 8.0;
+/// Caps width x height before scaling (16 MP).
 const MAX_VIEWPORT_CSS_PIXELS: u64 = 16_000_000;
+/// 8K UHD (7680 x 4320) - ceiling for width x height x scale^2.
 const MAX_VIEWPORT_EFFECTIVE_PIXELS: f64 = 33_177_600.0;
 const MAX_OBSERVE_CAPTURE_SELECTORS: usize = 8;
 const MAX_OBSERVE_COMPUTED_STYLE_PROPERTIES: usize = 16;
 const DEFAULT_OBSERVE_CAPTURE_TEXT_BYTES: u64 = 512;
+/// Styles captured when the caller requests none, chosen to explain the most
+/// common "element exists but is not visible/clickable" diagnoses.
 const DEFAULT_OBSERVE_COMPUTED_STYLE_PROPERTIES: &[&str] = &[
     "display",
     "visibility",
@@ -31,11 +50,17 @@ const DEFAULT_OBSERVE_COMPUTED_STYLE_PROPERTIES: &[&str] = &[
     "padding-bottom",
 ];
 
+/// gRPC handler for the browser service; all state lives in the shared runtime.
 #[derive(Clone)]
 pub(crate) struct BrowserServiceImpl {
     pub(crate) runtime: Arc<BrowserRuntimeState>,
 }
 
+/// Maps a navigation result to a stable action-log outcome label.
+///
+/// `NavigateOutcome` carries only free-text errors, so classification sniffs
+/// known substrings; keep them in sync with the error strings produced by
+/// `navigate_with_guards` and the Chromium engine.
 fn navigate_action_outcome(outcome: &NavigateOutcome) -> &'static str {
     if outcome.success {
         return "navigated";
@@ -71,16 +96,21 @@ fn browser_layout_metrics_to_proto(
     }
 }
 
+/// Effective observe byte cap: zero means the session limit, anything else is
+/// clamped to it, with a floor of one byte.
 fn observe_byte_limit(requested: u64, session_limit: u64) -> usize {
     let limit = if requested == 0 { session_limit } else { requested.min(session_limit) }.max(1);
     usize::try_from(limit).unwrap_or(usize::MAX)
 }
 
+/// Like `observe_byte_limit`, but an unspecified request gets a small bounded
+/// default instead of the full session limit (captures multiply per selector).
 fn observe_capture_text_limit(requested: u64, session_limit: u64) -> usize {
     let requested = if requested == 0 { DEFAULT_OBSERVE_CAPTURE_TEXT_BYTES } else { requested };
     observe_byte_limit(requested, session_limit)
 }
 
+/// Trims, dedupes, length-caps, and count-caps requested capture selectors.
 fn normalize_observe_capture_selectors(selectors: &[String]) -> Vec<String> {
     let mut normalized = Vec::new();
     for selector in selectors {
@@ -96,6 +126,8 @@ fn normalize_observe_capture_selectors(selectors: &[String]) -> Vec<String> {
     normalized
 }
 
+/// Sanitizes requested computed-style property names to kebab-case CSS names,
+/// substituting the default capture set when none are requested.
 fn normalize_observe_computed_style_properties(properties: &[String]) -> Vec<String> {
     let source = if properties.is_empty() {
         DEFAULT_OBSERVE_COMPUTED_STYLE_PROPERTIES
@@ -109,6 +141,9 @@ fn normalize_observe_computed_style_properties(properties: &[String]) -> Vec<Str
     for property in source {
         let raw = property.trim();
         let trimmed = raw.to_ascii_lowercase();
+        // The windows(2) scan rejects camelCase spellings (e.g. a JS-style
+        // property name): silently lowercasing one would capture a different
+        // property than the caller asked for.
         if trimmed.is_empty()
             || trimmed.len() > 64
             || raw.chars().any(char::is_whitespace)
@@ -129,6 +164,7 @@ fn normalize_observe_computed_style_properties(properties: &[String]) -> Vec<Str
     normalized
 }
 
+/// Builds the not-found/error capture shape returned per failing selector.
 fn observe_element_capture_error(selector: &str, error: &str) -> browser_v1::BrowserElementCapture {
     browser_v1::BrowserElementCapture {
         v: CANONICAL_PROTOCOL_MAJOR,
@@ -146,6 +182,8 @@ fn observe_element_capture_error(selector: &str, error: &str) -> browser_v1::Bro
     }
 }
 
+/// Effective timeout: zero means the session limit; anything else is clamped
+/// between one millisecond and the session limit.
 fn request_timeout_ms(requested: u64, session_limit: u64) -> u64 {
     let limit = session_limit.max(1);
     if requested == 0 {
@@ -155,11 +193,16 @@ fn request_timeout_ms(requested: u64, session_limit: u64) -> u64 {
     }
 }
 
+/// True when a navigation failure looks like Chromium aborting because the
+/// response turned into a download (ERR_ABORTED); callers may then convert the
+/// failure into a successful download capture.
 fn navigation_error_may_be_download_abort(error: &str) -> bool {
     let normalized = error.to_ascii_lowercase();
     normalized.contains("err_aborted") || normalized.contains("net::err_aborted")
 }
 
+/// Extracts (url, file name) from a successful response whose
+/// Content-Disposition marks it as an attachment.
 fn http_attachment_candidate_from_network_entry(
     entry: &NetworkLogEntryInternal,
 ) -> Option<(String, String)> {
@@ -179,6 +222,11 @@ fn http_attachment_candidate_from_network_entry(
     Some((entry.request_url.clone(), file_name))
 }
 
+/// Re-fetches the most recent attachment-like response from the active tab's
+/// network log and stores it through the download pipeline.
+///
+/// # Errors
+/// Returns `session_not_found` or the download pipeline failure reason.
 async fn capture_latest_http_attachment_from_network_log(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -210,6 +258,11 @@ async fn capture_latest_http_attachment_from_network_log(
     .await
 }
 
+/// Drains downloads captured by the Chromium engine for the active tab and
+/// stores each through the quarantine pipeline, returning the first record.
+///
+/// # Errors
+/// Returns the drain or storage failure reason.
 async fn store_chromium_captured_downloads(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -248,6 +301,7 @@ async fn store_chromium_captured_downloads(
     Ok(first_record)
 }
 
+/// Which sections an observe response should include.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ObserveInclusions {
     include_dom_snapshot: bool,
@@ -255,6 +309,9 @@ struct ObserveInclusions {
     include_visible_text: bool,
 }
 
+/// Resolves the include flags: all-false (the proto3 default) means the
+/// caller selected nothing, so everything is included; any explicit selection
+/// is honored as-is.
 fn resolve_observe_inclusions(
     include_dom_snapshot: bool,
     include_accessibility_tree: bool,
@@ -370,12 +427,22 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             Duration::from_millis(payload.idle_ttl_ms)
         };
         let requested_budget = payload.budget.as_ref();
+        // Clamp helpers: zero/absent means "use the daemon default"; explicit
+        // requests are capped at the default so sessions cannot raise limits.
         let clamp_u64_budget = |requested: Option<u64>, default: u64| {
             requested.filter(|value| *value > 0).map(|value| value.min(default)).unwrap_or(default)
         };
         let clamp_usize_budget = |requested: Option<usize>, default: usize| {
             requested.filter(|value| *value > 0).map(|value| value.min(default)).unwrap_or(default)
         };
+        // AIDEV-NOTE: budget fields are inconsistently capped. The clamp_*
+        // helpers limit requested values to the daemon default, but the
+        // .filter(>0).unwrap_or(default) fields below (e.g.
+        // max_navigation_timeout_ms, max_screenshot_bytes,
+        // max_observe_snapshot_bytes) accept any requested value, including
+        // ones above the operator-configured default. If that is not
+        // intentional, aligning them changes effective session budgets -
+        // coordinate before fixing.
         let budget = SessionBudget {
             max_navigation_timeout_ms: payload
                 .budget
@@ -716,6 +783,8 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         let include_console_log = payload.include_console_log || default_include;
         let include_page_diagnostics = payload.include_page_diagnostics || default_include;
 
+        // Pull a fresh snapshot from the live Chromium tab first so the
+        // cookie/storage/page reads below reflect current browser state.
         if (include_cookies
             || include_storage
             || include_page_snapshot
@@ -1315,6 +1384,10 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                 .await
             }
         };
+        // Chromium reports navigations that turn into downloads as aborted
+        // failures. When downloads are allowed, try to recover the artifact
+        // (engine capture first, then a direct HTTP fetch fallback below) and
+        // rewrite the outcome as a successful download instead.
         let captured_download = if allow_downloads
             && matches!(self.runtime.engine_mode, BrowserEngineMode::Chromium)
         {
@@ -1380,8 +1453,8 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                 }
             }
         }
-        let network_log_entries = outcome.network_log.clone();
-        let cookie_updates = outcome.cookie_updates.clone();
+        let network_log_entries = std::mem::take(&mut outcome.network_log);
+        let cookie_updates = std::mem::take(&mut outcome.cookie_updates);
         let mut session_for_persist = None;
 
         let mut sessions = self.runtime.sessions.lock().await;
@@ -1501,7 +1574,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                 let mut attempts = 0_u32;
                 let mut success = false;
                 let mut outcome = "selector_not_found".to_owned();
-                let mut error = format!("selector '{}' was not found", selector);
+                let mut error = format!("selector '{selector}' was not found");
                 loop {
                     attempts = attempts.saturating_add(1);
                     if let Some(tag) = find_matching_html_tag(selector, context.page_body.as_str())
@@ -1741,7 +1814,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                 let mut attempts = 0_u32;
                 let mut success = false;
                 let mut outcome = "selector_not_found".to_owned();
-                let mut error = format!("selector '{}' was not found", selector);
+                let mut error = format!("selector '{selector}' was not found");
                 loop {
                     attempts = attempts.saturating_add(1);
                     if let Some(tag) = find_matching_html_tag(selector, context.page_body.as_str())
@@ -1749,8 +1822,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                         if !is_typable_tag(tag.as_str()) {
                             outcome = "selector_not_typable".to_owned();
                             error = format!(
-                                "selector '{}' does not target an input-like element",
-                                selector
+                                "selector '{selector}' does not target an input-like element"
                             );
                             break;
                         }
@@ -1915,7 +1987,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                 let mut attempts = 0_u32;
                 let mut success = false;
                 let mut outcome = "selector_not_found".to_owned();
-                let mut error = format!("selector '{}' was not found", selector);
+                let mut error = format!("selector '{selector}' was not found");
                 loop {
                     attempts = attempts.saturating_add(1);
                     if let Some(tag) = find_matching_html_tag(selector, context.page_body.as_str())
@@ -1923,8 +1995,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                         if !is_file_input_tag(tag.as_str()) {
                             outcome = "selector_not_file_input".to_owned();
                             error = format!(
-                                "selector '{}' does not target an input[type=file] element",
-                                selector
+                                "selector '{selector}' does not target an input[type=file] element"
                             );
                             break;
                         }
@@ -3312,6 +3383,8 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
 
         let source_url =
             current_url.unwrap_or_else(|| format!("browser://session/{}/export.pdf", session_id));
+        // session_id is a validated 26-char ASCII ULID, so this prefix slice
+        // cannot panic.
         let artifact = store_generated_artifact(
             self.runtime.as_ref(),
             session_id.as_str(),
@@ -3324,13 +3397,15 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         .await
         .map_err(Status::internal)?;
 
+        let size_bytes = pdf_bytes.len() as u64;
+        let sha256 = sha256_hex(pdf_bytes.as_slice());
         Ok(Response::new(browser_v1::ExportPdfResponse {
             v: CANONICAL_PROTOCOL_MAJOR,
             success: true,
-            pdf_bytes: pdf_bytes.clone(),
+            pdf_bytes,
             mime_type: "application/pdf".to_owned(),
-            size_bytes: pdf_bytes.len() as u64,
-            sha256: sha256_hex(pdf_bytes.as_slice()),
+            size_bytes,
+            sha256,
             artifact: Some(download_artifact_to_proto(&artifact)),
             error: String::new(),
         }))
@@ -3530,6 +3605,8 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             )
             .await
             {
+                // Roll back the tab registered above so a failed engine init
+                // does not leak a zombie tab; keep a usable active tab.
                 let mut sessions = self.runtime.sessions.lock().await;
                 if let Some(session) = sessions.get_mut(session_id.as_str()) {
                     if session.tabs.remove(created_tab_id.as_str()).is_some() {
@@ -3561,7 +3638,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         let mut error = String::new();
         if !url.is_empty() {
             navigated = true;
-            let outcome = match self.runtime.engine_mode {
+            let mut outcome = match self.runtime.engine_mode {
                 BrowserEngineMode::Simulated => {
                     navigate_with_guards(
                         url.as_str(),
@@ -3596,13 +3673,13 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                     .await
                 }
             };
-            status_code = outcome.status_code as u32;
+            status_code = u32::from(outcome.status_code);
             success = outcome.success;
             if !success {
                 error = outcome.error.clone();
             }
-            let network_log_entries = outcome.network_log.clone();
-            let cookie_updates = outcome.cookie_updates.clone();
+            let network_log_entries = std::mem::take(&mut outcome.network_log);
+            let cookie_updates = std::mem::take(&mut outcome.cookie_updates);
             let mut sessions = self.runtime.sessions.lock().await;
             if let Some(session) = sessions.get_mut(session_id.as_str()) {
                 let max_network_log_entries = session.budget.max_network_log_entries;
@@ -3879,8 +3956,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         }
         if payload.max_payload_bytes > MAX_RELAY_PAYLOAD_BYTES {
             return Err(Status::invalid_argument(format!(
-                "relay max_payload_bytes exceeds {} bytes",
-                MAX_RELAY_PAYLOAD_BYTES
+                "relay max_payload_bytes exceeds {MAX_RELAY_PAYLOAD_BYTES} bytes"
             )));
         }
 
@@ -3911,9 +3987,13 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                     max_redirects: 3,
                     allow_private_targets: false,
                 });
+                // The nested open_tab call re-runs authorization, so the
+                // caller's authorization metadata must be forwarded verbatim.
                 if let Some(value) = auth_header.clone() {
                     open_request.metadata_mut().insert(AUTHORIZATION_HEADER, value);
                 }
+                // Marker consumed by open_tab: relay-initiated tabs may never
+                // reach private targets, whatever the session allows.
                 open_request.extensions_mut().insert(RelayPrivateTargetBlock);
                 let open_response = self.open_tab(open_request).await?;
                 let output = open_response.into_inner();
@@ -3921,7 +4001,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                     v: CANONICAL_PROTOCOL_MAJOR,
                     success: output.success,
                     action: browser_v1::RelayActionKind::OpenTab as i32,
-                    error: output.error.clone(),
+                    error: output.error,
                     result: output.tab.map(browser_v1::relay_action_response::Result::OpenedTab),
                 }))
             }
@@ -4024,6 +4104,8 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                     computed_style_properties: Vec::new(),
                     max_capture_text_bytes: 0,
                 });
+                // The nested observe call re-runs authorization, so the
+                // caller's authorization metadata must be forwarded verbatim.
                 if let Some(value) = auth_header {
                     observe_request.metadata_mut().insert(AUTHORIZATION_HEADER, value);
                 }
@@ -4033,7 +4115,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                     v: CANONICAL_PROTOCOL_MAJOR,
                     success: observe.success,
                     action: browser_v1::RelayActionKind::SendPageSnapshot as i32,
-                    error: observe.error.clone(),
+                    error: observe.error,
                     result: if observe.success {
                         Some(browser_v1::relay_action_response::Result::Snapshot(
                             browser_v1::RelayPageSnapshotResult {
@@ -4080,6 +4162,8 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             let Some(session) = sessions.get_mut(session_id.as_str()) else {
                 return Err(Status::not_found("browser session not found"));
             };
+            // Deliberately not_found rather than permission_denied: do not
+            // reveal whether a foreign session ID exists.
             if session.principal != caller_principal {
                 return Err(Status::not_found("browser session not found"));
             }
@@ -4131,6 +4215,8 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             let Some(session) = sessions.get_mut(session_id.as_str()) else {
                 return Err(Status::not_found("browser session not found"));
             };
+            // Deliberately not_found rather than permission_denied: do not
+            // reveal whether a foreign session ID exists.
             if session.principal != caller_principal {
                 return Err(Status::not_found("browser session not found"));
             }
@@ -4162,6 +4248,11 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
     }
 }
 
+/// Extracts the trimmed caller principal from request metadata.
+///
+/// # Errors
+/// Returns `Status::unauthenticated` when the principal header is missing,
+/// empty, or not valid ASCII.
 fn request_principal(metadata: &tonic::metadata::MetadataMap) -> Result<&str, Status> {
     let Some(value) = metadata.get(PRINCIPAL_HEADER) else {
         return Err(Status::unauthenticated("missing caller principal"));
@@ -4182,6 +4273,7 @@ fn viewport_effective_pixels(css_pixels: u64, device_scale_factor: f64) -> f64 {
     css_pixels as f64 * device_scale_factor * device_scale_factor
 }
 
+/// Trims key names while preserving a literal single space, a valid key.
 fn normalize_press_key_input(raw: &str) -> String {
     if raw == " " {
         " ".to_owned()

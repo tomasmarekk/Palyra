@@ -1,3 +1,6 @@
+//! Crate-internal integration tests for browserd: gRPC service flows, persistence, downloads,
+//! navigation guards, and redaction. Compiled via `#[path]` from `lib.rs`; uses parity fixtures.
+
 use super::{
     action_log_entry_to_proto, browser_v1, build_accessibility_tree_snapshot, build_dom_snapshot,
     chromium_active_tab_for_session, chromium_new_tab_error_is_retryable,

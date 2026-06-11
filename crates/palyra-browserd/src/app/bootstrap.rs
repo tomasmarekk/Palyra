@@ -1,5 +1,21 @@
+//! Daemon bootstrap: tracing setup, bind policy enforcement, and server startup.
+//!
+//! Runs the HTTP health listener and the gRPC browser service side by side
+//! and refuses non-loopback binds unless request authentication is enabled.
+
 use crate::{transport, *};
 
+/// Runs the browserd daemon until both servers stop (normally via Ctrl+C).
+///
+/// Parses CLI arguments, initializes JSON tracing, spawns the background
+/// session-cleanup loop, and serves the HTTP health endpoint and the gRPC
+/// browser service concurrently. Call at most once per process: tracing
+/// initialization panics if a global subscriber is already installed.
+///
+/// # Errors
+/// Returns an error when a bind address fails to parse or bind, when a
+/// non-loopback bind is requested without an auth token, or when either
+/// server terminates with a failure.
 pub async fn run() -> Result<()> {
     init_tracing();
     let args = Args::parse();
@@ -58,6 +74,15 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
+/// Rejects non-loopback bind addresses unless request authentication is enabled.
+///
+/// Fail-closed startup guard: without a shared auth token every gRPC call is
+/// accepted, so exposing the listeners beyond loopback would hand full browser
+/// control to anyone on the network.
+///
+/// # Errors
+/// Returns an error naming both bind addresses when either one is non-loopback
+/// while auth is disabled.
 pub(crate) fn enforce_non_loopback_bind_auth(
     admin_address: SocketAddr,
     grpc_address: SocketAddr,
@@ -78,11 +103,21 @@ pub(crate) fn enforce_non_loopback_bind_auth(
     Ok(())
 }
 
+/// Installs the global JSON tracing subscriber, honoring `RUST_LOG`-style env filters.
+///
+/// # Panics
+/// Panics if a global tracing subscriber is already installed.
 pub(crate) fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().json().with_env_filter(filter).init();
 }
 
+/// Spawns the detached background task that evicts idle and over-lifetime sessions.
+///
+/// Deliberately a process-lifetime daemon with no shutdown handle: it owns no
+/// resources that outlive process exit. Expired sessions with persistence
+/// enabled get a best-effort final snapshot; persistence failures are logged
+/// and do not stop eviction.
 pub(crate) fn spawn_cleanup_loop(runtime: Arc<BrowserRuntimeState>) {
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_millis(CLEANUP_INTERVAL_MS));
@@ -90,6 +125,9 @@ pub(crate) fn spawn_cleanup_loop(runtime: Arc<BrowserRuntimeState>) {
         loop {
             ticker.tick().await;
             let now = Instant::now();
+            // Scan and removal take the sessions lock separately to keep hold
+            // times short; a session touched in between is still evicted,
+            // which is acceptable at TTL granularity.
             let expired_ids = {
                 let sessions = runtime.sessions.lock().await;
                 sessions
@@ -147,6 +185,11 @@ pub(crate) fn spawn_cleanup_loop(runtime: Arc<BrowserRuntimeState>) {
     });
 }
 
+/// Resolves when Ctrl+C is received, triggering graceful server shutdown.
+///
+/// If the signal handler cannot be registered this future stays pending
+/// forever: the daemon keeps serving rather than shutting down spuriously,
+/// and must then be stopped by terminating the process.
 pub(crate) async fn shutdown_signal() {
     if let Err(error) = tokio::signal::ctrl_c().await {
         tracing::error!(error = %error, "failed to register Ctrl+C handler");
