@@ -1,3 +1,12 @@
+//! Pure budget and message state for the run-stream agent loop.
+//!
+//! [`AgentRunLoopState`] tracks model-turn, tool-call, and wall-clock budgets
+//! plus the growing provider message history; `orchestration` drives the
+//! actual loop. Termination reasons map to the lifecycle/tape contract:
+//! budget exhaustion after real tool work becomes `needs_continuation`
+//! (partial, resumable) rather than a plain failure. This module performs no
+//! I/O, which keeps every budget rule unit-testable.
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     time::{Duration, Instant},
@@ -14,7 +23,9 @@ use crate::{
 // The local setup configures a larger tool budget for app/browser workflows.
 // Keep extra model-turn headroom for recovery, final verification, and concise
 // partial summaries instead of failing immediately after the last tool batch.
+/// Hard ceiling on model turns per run; requested budgets are clamped to it.
 pub(crate) const DEFAULT_AGENT_LOOP_MAX_MODEL_TURNS: u32 = 128;
+/// Default wall-clock budget per run (15 minutes) covering long browser workflows.
 pub(crate) const DEFAULT_AGENT_LOOP_WALL_CLOCK_BUDGET_MS: u64 = 900_000;
 
 const BROWSER_SESSION_CREATE_TOOL_NAME: &str = "palyra.browser.session.create";
@@ -22,6 +33,7 @@ const BROWSER_SESSION_CLOSE_TOOL_NAME: &str = "palyra.browser.session.close";
 const ROUTINES_QUERY_TOOL_NAME: &str = "palyra.routines.query";
 const ROUTINES_CONTROL_TOOL_NAME: &str = "palyra.routines.control";
 
+/// Why the agent loop stopped; serialized into tape payloads as `snake_case`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AgentLoopTerminationReason {
@@ -39,6 +51,8 @@ pub(crate) enum AgentLoopTerminationReason {
 }
 
 impl AgentLoopTerminationReason {
+    /// Returns the stable `snake_case` reason code used in tape payloads and
+    /// `reason_code=` status markers.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::FinalAnswer => "final_answer",
@@ -55,10 +69,15 @@ impl AgentLoopTerminationReason {
         }
     }
 
+    /// Returns `true` only for a clean final answer.
     pub(crate) const fn is_success(self) -> bool {
         matches!(self, Self::FinalAnswer)
     }
 
+    /// Returns `true` when the run should be surfaced as a resumable partial.
+    ///
+    /// Requires at least one completed tool call: without tool evidence there
+    /// is nothing to continue from, so the same reasons stay plain failures.
     pub(crate) const fn needs_continuation(self, completed_tool_calls: u32) -> bool {
         completed_tool_calls > 0
             && matches!(
@@ -73,6 +92,7 @@ impl AgentLoopTerminationReason {
     }
 }
 
+/// Accumulated provider token usage across all turns of one run.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct AgentLoopUsageSnapshot {
     pub(crate) prompt_tokens: u64,
@@ -88,6 +108,7 @@ impl AgentLoopUsageSnapshot {
     }
 }
 
+/// Point-in-time view of loop budgets, serialized into agent-loop tape events.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct AgentLoopSnapshot {
     pub(crate) schema_version: u32,
@@ -103,6 +124,8 @@ pub(crate) struct AgentLoopSnapshot {
     pub(crate) termination_reason: Option<AgentLoopTerminationReason>,
 }
 
+/// Terminal envelope written to the `agent_loop.terminated` tape event,
+/// carrying the status/lifecycle/continuation contract consumers replay.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct AgentLoopFinalizationEnvelope {
     pub(crate) schema_version: u32,
@@ -119,6 +142,12 @@ pub(crate) struct AgentLoopFinalizationEnvelope {
     pub(crate) provider_trace_ref: Option<String>,
 }
 
+/// Mutable budget and message state for one agent-loop run.
+///
+/// Owns the provider message history (user input, assistant turns, tool
+/// results, recovery guidance) and enforces the model-turn, tool-call, and
+/// wall-clock budgets. All methods are synchronous and side-effect free
+/// beyond `self`.
 #[derive(Debug, Clone)]
 pub(crate) struct AgentRunLoopState {
     messages: Vec<ProviderMessage>,
@@ -135,6 +164,11 @@ pub(crate) struct AgentRunLoopState {
 }
 
 impl AgentRunLoopState {
+    /// Creates loop state seeded with the initial provider messages.
+    ///
+    /// `max_model_turns` is clamped to `1..=DEFAULT_AGENT_LOOP_MAX_MODEL_TURNS`
+    /// and `wall_clock_budget_ms` is raised to at least 1 ms, so the loop can
+    /// never start with an already-exhausted budget.
     pub(crate) fn new(
         messages: Vec<ProviderMessage>,
         max_model_turns: u32,
@@ -157,10 +191,22 @@ impl AgentRunLoopState {
         }
     }
 
+    /// Derives the model-turn budget from the tool budget plus recovery headroom.
+    ///
+    /// The +8 turns leave room for length/final-answer recovery and a closing
+    /// summary after the last tool batch instead of failing on the next turn.
     pub(crate) fn default_model_turn_budget(max_tool_calls: u32) -> u32 {
         max_tool_calls.saturating_add(8).clamp(1, DEFAULT_AGENT_LOOP_MAX_MODEL_TURNS)
     }
 
+    /// Consumes one model turn and returns its 1-based turn id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentLoopTerminationReason::WallClock`] when the wall-clock
+    /// budget is spent (checked first, so a stalled run terminates even with
+    /// turns left) or [`AgentLoopTerminationReason::MaxTurns`] when no model
+    /// turns remain.
     pub(crate) fn start_model_turn(&mut self) -> Result<u32, AgentLoopTerminationReason> {
         if self.elapsed() > Duration::from_millis(self.wall_clock_budget_ms) {
             return Err(AgentLoopTerminationReason::WallClock);
@@ -173,44 +219,55 @@ impl AgentRunLoopState {
         Ok(self.current_turn)
     }
 
+    /// Accumulates token usage reported by a provider turn.
     pub(crate) fn record_provider_response(&mut self, response: &ProviderResponse) {
         self.usage.add(response.prompt_tokens, response.completion_tokens);
     }
 
+    /// Appends the assistant turn (text and tool calls) to the history.
     pub(crate) fn append_assistant_turn(&mut self, output: &ProviderTurnOutput) {
         self.messages.push(ProviderMessage::assistant_from_output(output));
     }
 
+    /// Appends a synthetic user message used for recovery guidance prompts.
     pub(crate) fn append_user_guidance(&mut self, text: impl Into<String>) {
         self.messages.push(ProviderMessage::user_text(text.into()));
     }
 
+    /// Appends tool-result messages and counts them as completed tool calls.
     pub(crate) fn append_tool_result_messages(&mut self, messages: Vec<ProviderMessage>) {
         let added = messages.len().try_into().unwrap_or(u32::MAX);
         self.completed_tool_calls = self.completed_tool_calls.saturating_add(added);
         self.messages.extend(messages);
     }
 
+    /// Returns an owned copy of the message history for the next provider request.
     pub(crate) fn messages(&self) -> Vec<ProviderMessage> {
         self.messages.clone()
     }
 
+    /// Remaining tool-call budget as last synced from the shared budget.
     pub(crate) fn remaining_tool_calls(&self) -> u32 {
         self.remaining_tool_calls
     }
 
+    /// Remaining model-turn budget.
     pub(crate) fn remaining_model_turns(&self) -> u32 {
         self.remaining_model_turns
     }
 
+    /// Number of tool results appended so far in this run.
     pub(crate) fn completed_tool_calls(&self) -> u32 {
         self.completed_tool_calls
     }
 
+    /// Syncs the tool budget after tool execution; the shared run-stream
+    /// budget is authoritative, capped at this loop's configured maximum.
     pub(crate) fn sync_remaining_tool_calls(&mut self, remaining_tool_calls: u32) {
         self.remaining_tool_calls = remaining_tool_calls.min(self.max_tool_calls);
     }
 
+    /// Builds the serializable budget snapshot embedded in tape payloads.
     pub(crate) fn snapshot(
         &self,
         run_id: &str,
@@ -244,6 +301,8 @@ impl AgentRunLoopState {
         AgentLoopFinalizationOutcome::failed(reason)
     }
 
+    /// Builds the terminal envelope for `reason`, classifying the run as
+    /// completed, resumable partial (`needs_continuation`), or failed.
     pub(crate) fn finalization_envelope(
         &self,
         reason: AgentLoopTerminationReason,
@@ -267,6 +326,10 @@ impl AgentRunLoopState {
         }
     }
 
+    /// Serializes the `agent_loop.started` tape payload.
+    ///
+    /// Serialization failures degrade to `"{}"` instead of erroring: tape
+    /// telemetry must never abort a live run.
     pub(crate) fn start_payload(&self, run_id: &str) -> String {
         serde_json::to_string(&json!({
             "event": "agent_loop.started",
@@ -278,6 +341,7 @@ impl AgentRunLoopState {
         .unwrap_or_else(|_| "{}".to_owned())
     }
 
+    /// Serializes a per-turn tape payload for the given agent-loop event name.
     pub(crate) fn turn_payload(&self, run_id: &str, event: &str) -> String {
         serde_json::to_string(&json!({
             "event": event,
@@ -286,6 +350,8 @@ impl AgentRunLoopState {
         .unwrap_or_else(|_| "{}".to_owned())
     }
 
+    /// Serializes the `agent_loop.terminated` tape payload, embedding the
+    /// finalization envelope replay consumers rely on.
     pub(crate) fn termination_payload(
         &self,
         run_id: &str,
@@ -306,6 +372,9 @@ impl AgentRunLoopState {
         .unwrap_or_else(|_| "{}".to_owned())
     }
 
+    /// Appends operator cleanup instructions for resources the run may have
+    /// leaked (open browser sessions, routines it created), derived from the
+    /// tool-call/tool-result pairs in the message history.
     pub(crate) fn message_with_cleanup_guidance(&self, message: &str) -> String {
         let cleanup = self.cleanup_instructions();
         if cleanup.is_empty() {
@@ -388,6 +457,9 @@ struct RoutineToolCallRef {
     input_json: Value,
 }
 
+// Replays browser session create/close tool pairs from the message history to
+// find sessions the run opened but never confirmably closed. BTree containers
+// keep the cleanup guidance deterministically ordered.
 fn pending_browser_session_ids(messages: &[ProviderMessage]) -> BTreeSet<String> {
     let mut tool_calls_by_id = BTreeMap::<String, BrowserToolCallRef>::new();
     let mut open_session_ids = BTreeSet::<String>::new();
@@ -441,6 +513,9 @@ fn pending_browser_session_ids(messages: &[ProviderMessage]) -> BTreeSet<String>
     open_session_ids
 }
 
+// Flags only routines this run itself created (an upsert without a
+// routine_id) and still left behind; pre-existing routines the run touched
+// are deliberately not reported as leaks.
 fn pending_routine_cleanup_instructions(messages: &[ProviderMessage]) -> Vec<String> {
     let mut tool_calls_by_id = BTreeMap::<String, RoutineToolCallRef>::new();
     let mut created_routine_ids = BTreeSet::<String>::new();
@@ -573,6 +648,8 @@ fn json_value_label(value: &Value) -> String {
     }
 }
 
+// A close counts as confirmed when it succeeded or when browserd reports the
+// session as already absent; in both cases there is nothing left to clean up.
 fn browser_session_close_confirmed(output: &Value) -> bool {
     output.get("closed").and_then(Value::as_bool).unwrap_or(false)
         || output.get("reason").and_then(Value::as_str).is_some_and(browser_session_absent_reason)

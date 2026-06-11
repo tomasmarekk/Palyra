@@ -1,3 +1,14 @@
+//! Tool-proposal flow for run streams: intake, approval gates, execution.
+//!
+//! A proposal moves through catalog validation/normalization, security
+//! evaluation, the approval gate (sensitive-tool bypass, cached decision, or
+//! interactive prompt with timeout), the policy decision, and finally runtime
+//! dispatch. Every stage emits its wire event plus tape row through the
+//! `tape` helpers so the run stays replayable. Allowed proposals may execute
+//! in bounded parallel groups when classified side-effect safe; cancellation
+//! is polled during execution, with drain semantics for tools that must not
+//! be dropped mid-flight.
+
 use std::{
     collections::BTreeMap,
     sync::{
@@ -72,6 +83,7 @@ use super::{
 const MAX_PARALLEL_TOOL_CALLS_PER_GROUP: usize = 4;
 const TOOL_PARALLELISM_ENABLED_ENV: &str = "PALYRA_TOOL_PARALLELISM_ENABLED";
 
+/// Decision context produced by the proposal preparation pipeline.
 #[derive(Debug, Clone)]
 pub(crate) struct RunStreamToolProposalPreparation {
     decision: crate::tool_protocol::ToolDecision,
@@ -79,6 +91,10 @@ pub(crate) struct RunStreamToolProposalPreparation {
     backend_selection: ToolProposalBackendSelection,
 }
 
+/// A fully gated tool proposal that is ready for runtime dispatch.
+///
+/// Carries the normalized input plus the approval/policy decision; denied
+/// proposals are still "executed" to produce a structured denial outcome.
 #[derive(Debug, Clone)]
 pub(crate) struct RunStreamPreparedToolExecution {
     proposal_id: String,
@@ -89,23 +105,35 @@ pub(crate) struct RunStreamPreparedToolExecution {
     backend_selection: ToolProposalBackendSelection,
 }
 
+/// Result of preparing one tool proposal.
 #[derive(Debug, Clone)]
 pub(crate) enum RunStreamToolProposalPreparationOutcome {
+    /// The proposal passed intake and is ready for execution.
     Prepared(RunStreamPreparedToolExecution),
+    /// Intake rejected the call; the synthetic failure outcome was already
+    /// streamed and taped.
     Completed(RunStreamToolExecutionOutcome),
 }
 
+/// Result of executing a batch of prepared tool proposals.
 #[derive(Debug, Clone)]
 pub(crate) enum RunStreamPreparedToolExecutionBatchOutcome {
+    /// Outcomes for every proposal, in the original proposal order.
     Completed(Vec<RunStreamToolExecutionOutcome>),
+    /// The run was cancelled mid-batch; the cancel transition already ran.
     Cancelled,
 }
 
+/// Side-effect classification deciding whether a tool may run in parallel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolParallelism {
+    /// Mutating or unknown tools; always executed sequentially.
     Never,
+    /// Read-only tools safe to run alongside anything.
     ReadOnlySafe,
+    /// Read-only process commands; parallel only across disjoint path scopes.
     PathScoped,
+    /// Idempotent network fetches (GET/HEAD).
     IdempotentNetwork,
 }
 
@@ -135,6 +163,17 @@ enum ParallelToolExecutionTaskOutcome {
     Cancelled,
 }
 
+/// Prepares and executes a single tool proposal end to end.
+///
+/// Convenience wrapper over [`prepare_run_stream_tool_proposal_event`]
+/// followed by sequential execution; batched callers prepare first and then
+/// use [`execute_prepared_run_stream_tool_proposals_ordered`].
+///
+/// # Errors
+///
+/// Returns `Status::cancelled` when the client stream drops, journal errors
+/// from tape/approval persistence, or internal errors from the runtime
+/// dispatch path.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_run_stream_tool_proposal_event(
@@ -193,6 +232,18 @@ pub(crate) async fn process_run_stream_tool_proposal_event(
     }
 }
 
+/// Validates, normalizes, and gates a tool proposal without executing it.
+///
+/// Catalog rejections consume one unit of tool budget and complete the
+/// proposal immediately with a synthetic failure result so the model still
+/// receives structured feedback. Otherwise the proposal runs through the
+/// security evaluation and approval gate and comes back ready to execute.
+///
+/// # Errors
+///
+/// Returns `Status::cancelled` when the client stream drops, an internal
+/// invariant error when the active session is missing, or journal errors
+/// from tape and approval persistence.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn prepare_run_stream_tool_proposal_event(
@@ -383,6 +434,19 @@ async fn reject_run_stream_tool_call(
     })
 }
 
+/// Executes prepared proposals, preserving the model's proposal order.
+///
+/// Adjacent parallel-safe proposals are grouped (up to
+/// `MAX_PARALLEL_TOOL_CALLS_PER_GROUP`) and run concurrently when the
+/// `PALYRA_TOOL_PARALLELISM_ENABLED` switch is not disabled; everything else
+/// runs sequentially. Result events are always finalized in proposal order so
+/// the wire stream and tape stay deterministic regardless of task scheduling.
+///
+/// # Errors
+///
+/// Returns `Status::cancelled` when the client stream drops, internal errors
+/// when a parallel task panics or fails to join, or journal errors from the
+/// tape path.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_prepared_run_stream_tool_proposals_ordered(
@@ -474,6 +538,9 @@ fn split_parallel_tool_groups(
             classify_tool_parallelism(prepared.tool_name.as_str(), prepared.input_json.as_slice());
         let path_scope =
             path_scope_key(prepared.tool_name.as_str(), prepared.input_json.as_slice());
+        // Path-scoped tools without a derivable scope key are treated as
+        // conflicting (unwrap_or(true)): when we cannot prove disjoint paths,
+        // the call must run sequentially.
         let has_path_conflict = matches!(parallelism, ToolParallelism::PathScoped)
             && path_scope
                 .as_ref()
@@ -513,6 +580,11 @@ fn split_parallel_tool_groups(
     groups
 }
 
+/// Classifies a tool call's parallel safety from its name and input.
+///
+/// Deny-by-default: anything not explicitly listed is [`ToolParallelism::Never`].
+/// HTTP fetches qualify only for idempotent methods, and process runs only for
+/// an allowlist of read-only commands.
 pub(crate) fn classify_tool_parallelism(tool_name: &str, input_json: &[u8]) -> ToolParallelism {
     match tool_name {
         "palyra.echo"
@@ -544,6 +616,8 @@ pub(crate) fn classify_tool_parallelism(tool_name: &str, input_json: &[u8]) -> T
     }
 }
 
+// Builds a normalized "command:path|path" key for read-only process runs so
+// two commands touching the same paths never share a parallel group.
 fn path_scope_key(tool_name: &str, input_json: &[u8]) -> Option<String> {
     if tool_name != "palyra.process.run" {
         return None;
@@ -630,6 +704,8 @@ async fn execute_parallel_prepared_tool_group(
     .await?;
 
     let mut join_set = JoinSet::new();
+    // One shared budget across the group: concurrent executions draw from the
+    // same pool, and the caller's counter is re-synced after the group joins.
     let nested_tool_budget = shared_tool_budget(*remaining_tool_budget);
     for (order, prepared) in prepared_tools.into_iter().enumerate() {
         let runtime_state = Arc::clone(runtime_state);
@@ -654,6 +730,8 @@ async fn execute_parallel_prepared_tool_group(
         });
     }
 
+    // Keyed by proposal order: tasks join in completion order, but result
+    // events and tape rows must be finalized in the model's proposal order.
     let mut completed =
         BTreeMap::<usize, (RunStreamPreparedToolExecution, ToolExecutionOutcome)>::new();
     while let Some(joined) = join_set.join_next().await {
@@ -684,6 +762,12 @@ async fn execute_parallel_prepared_tool_group(
                 .await?;
                 return Ok(RunStreamPreparedToolExecutionBatchOutcome::Cancelled);
             }
+            // AIDEV-NOTE: unlike the cancel path above (which drains), the
+            // internal-error path aborts sibling tasks, dropping their tool
+            // executions mid-flight. For tools that require execution drain
+            // (see tool_cancellation_requires_execution_drain) this can leave
+            // external state half-mutated. Fixing it means draining here too,
+            // which is a behavior change; left as-is deliberately.
             Ok(Err(error)) => {
                 join_set.abort_all();
                 return Err(error);
@@ -728,6 +812,9 @@ async fn execute_parallel_prepared_tool_group(
     Ok(RunStreamPreparedToolExecutionBatchOutcome::Completed(finalized))
 }
 
+// INTENTIONAL: waits for sibling tasks instead of aborting them. Aborting
+// would drop tool executions mid-flight (half-applied side effects, leaked
+// browser/process state); a pinning test asserts this drain behavior.
 #[allow(clippy::result_large_err)]
 async fn drain_parallel_tool_group_after_cancel(
     join_set: &mut JoinSet<Result<ParallelToolExecutionTaskOutcome, Status>>,
@@ -940,6 +1027,10 @@ async fn resolve_run_stream_tool_approval_outcome(
     approval_cache_generation: Option<u64>,
     tape_seq: &mut i64,
 ) -> Result<Option<ToolApprovalOutcome>, Status> {
+    // Approval gate precedence: (1) explicit allow-sensitive-tools bypass,
+    // (2) cached session-scoped decision, (3) no approval needed, (4)
+    // interactive prompt with a hard response timeout. Every resolved outcome
+    // is echoed to the stream and tape so replay shows who allowed what.
     if proposal_approval_required && allow_sensitive_tools {
         let outcome = allow_sensitive_tools_approval_outcome();
         send_tool_approval_response_with_tape(
@@ -1087,6 +1178,8 @@ async fn resolve_run_stream_tool_approval_outcome(
             decision_scope: crate::journal::ApprovalDecisionScope::Once,
             decision_scope_ttl_ms: None,
         },
+        // Fail closed: an expired approval window denies the tool call rather
+        // than leaving the proposal pending forever.
         Err(_) => ToolApprovalOutcome {
             approval_id: pending_approval.approval_id.clone(),
             approved: false,
@@ -1143,6 +1236,8 @@ async fn resolve_run_stream_tool_approval_outcome(
     )
     .await?;
 
+    // Generation-guarded cache write: if the session approval cache was reset
+    // while this prompt was pending, the stale decision must not be cached.
     runtime_state.remember_tool_approval_if_generation(
         request_context,
         session_id,
@@ -1265,6 +1360,9 @@ async fn execute_prepared_tool_runtime(
         .instrument(tool_span),
     );
     let mut cancel_requested_during_execution = false;
+    // The execution future is created once and pinned outside the select
+    // loop, so losing a select race to the cancel poll never drops execution
+    // progress (cancel-safe polling of `&mut future`).
     let outcome = loop {
         tokio::select! {
             result = &mut execution_future => {
@@ -1274,10 +1372,15 @@ async fn execute_prepared_tool_runtime(
                 match runtime_state.is_orchestrator_cancel_requested(run_id.to_owned()).await {
                     Ok(true) => {
                         if must_drain_execution_after_cancel {
+                            // Drain tools whose execution must not be dropped
+                            // mid-flight: signal cooperative cancellation and
+                            // await completion before reporting Cancelled.
                             cancellation_requested.store(true, Ordering::Relaxed);
                             cancel_requested_during_execution = true;
                             break execution_future.await;
                         }
+                        // Safe to abandon: dropping the pinned future here
+                        // skips the tool before it mutates external state.
                         return Ok(None);
                     }
                     Ok(false) => {}
@@ -1299,6 +1402,8 @@ async fn execute_prepared_tool_runtime(
         &outcome,
     );
     if cancel_requested_during_execution {
+        // The drained outcome is recorded in metrics above but not surfaced:
+        // the run is terminating as cancelled, not completing this tool.
         return Ok(None);
     }
     Ok(Some(outcome))
@@ -1487,6 +1592,9 @@ fn should_project_tool_result_for_model(
     }
 }
 
+// Small OS-file list_dir and text-only read results bypass artifact
+// projection: cleanup and config-audit workflows need the full payload
+// model-visible, and the read tool has already redacted any secrets.
 fn os_file_result_can_stay_inline(
     tool_name: &str,
     output_json: &[u8],
@@ -1570,6 +1678,9 @@ fn redacted_tool_result_preview(tool_name: &str, output_json: &[u8], max_bytes: 
     truncate_utf8(redacted.as_str(), max_bytes)
 }
 
+// Workspace read results that the read tool already scanned and marked clean
+// (redacted=false, non-binary) keep their text mostly intact in previews;
+// re-running the aggressive secret heuristics would mangle benign source code.
 fn workspace_read_text_already_sanitized(tool_name: &str, value: &Value) -> bool {
     tool_name == crate::gateway::WORKSPACE_READ_FILE_TOOL_NAME
         && value.get("text").is_some_and(Value::is_string)

@@ -1,3 +1,18 @@
+//! Run-stream orchestration core: the agent loop driving provider turns.
+//!
+//! [`process_run_stream_message`] accepts one client message on the gateway
+//! `RunStream` and runs the full agent loop: resolve session, plan usage
+//! routing, build the tool catalog, then alternate provider turns and tool
+//! batches (via `tool_flow`) until a final answer or a budget/termination
+//! reason from `agent_loop`. Every observable step is mirrored to the
+//! orchestrator tape through `tape` so runs replay deterministically.
+//!
+//! Failure handling favors resumable partials: provider timeouts (including
+//! the shorter browser follow-up deadline), length-truncated answers, and
+//! unusable final answers each get bounded in-loop recovery prompts before
+//! the run terminates with a `needs_continuation` summary that points back at
+//! the run tape.
+
 use std::{sync::Arc, time::Duration};
 
 use serde_json::{json, Value};
@@ -63,6 +78,10 @@ use super::{
 
 const PROVIDER_PROGRESS_HEARTBEAT_MS: u64 = 20_000;
 const PROVIDER_FAILOVER_DEADLINE_GRACE_MS: u64 = 5_000;
+// Turns directly after browser tool results get a much shorter deadline than
+// the general provider timeout: a model that stalls on browser evidence
+// should fail fast into the follow-up recovery path instead of pinning the
+// browser session for the full provider deadline.
 const BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS: u64 = 60_000;
 const MAX_BROWSER_FOLLOWUP_RECOVERY_ATTEMPTS: u8 = 1;
 const MAX_LENGTH_RECOVERY_ATTEMPTS: u8 = 3;
@@ -90,22 +109,32 @@ impl BackgroundBudgetGuardDecision {
     }
 }
 
+/// Outcome of finalizing a run after the provider produced a final answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunStreamPostProviderOutcome {
+    /// The run reached the done state (or was already terminal).
     Completed,
+    /// A cancel request won the race; the cancelled transition was applied.
     Cancelled,
 }
 
+/// Outcome of one deadline-guarded provider request.
 #[derive(Debug, Clone)]
 pub(crate) enum RunStreamProviderRequestOutcome {
+    /// The provider answered within the deadline (boxed: the response is large).
     Completed(Box<ProviderResponse>),
+    /// The deadline elapsed first; `message` is the operator-facing diagnosis.
     TimedOut { reason: ProviderRequestTimeoutReason, message: String },
+    /// A cancel request was observed; the cancelled transition was applied.
     Cancelled,
 }
 
+/// Which deadline expired for a provider request; selects the recovery path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProviderRequestTimeoutReason {
+    /// The general (possibly failover-extended) provider deadline.
     Provider,
+    /// The shorter browser follow-up deadline after browser tool results.
     BrowserFollowup,
 }
 
@@ -121,27 +150,41 @@ struct RunStreamProviderRequestExecution {
     deadline_override: Option<ProviderRequestDeadlineOverride>,
 }
 
+/// Whether the gateway should keep reading client messages after this one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunStreamMessageProcessingOutcome {
+    /// The run finished cleanly; the stream may accept follow-up messages.
     Continue,
+    /// The run reached a terminal state; the stream loop must stop.
     Terminate,
 }
 
+/// Classified result of one provider turn after its events were processed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RunStreamProviderResponseOutcome {
+    /// The turn produced either tool results to re-feed or a final answer.
     Completed {
+        /// Tool results to append to the loop history; empty means the turn
+        /// ended with a final answer instead of tool work.
         tool_result_messages: Vec<ProviderMessage>,
+        /// Names of the tools that completed, used for follow-up deadlines.
         completed_tool_names: Vec<String>,
         provider_trace_ref: Option<String>,
+        /// Final reply text; `Some` only when no tool results are pending.
         final_reply_text: Option<String>,
+        /// Final output still needing tape persistence (deferred-token path).
         final_provider_output: Option<Box<ProviderTurnOutput>>,
+        /// True when final tokens were withheld during streaming and must be
+        /// emitted by the caller once the reply is accepted as final.
         final_reply_tokens_deferred: bool,
     },
+    /// The turn is unusable; the loop decides between recovery and termination.
     Failed {
         message: String,
         provider_trace_ref: Option<String>,
         reason: AgentLoopTerminationReason,
     },
+    /// A cancel request was observed while processing provider events.
     Cancelled,
 }
 
@@ -202,6 +245,8 @@ fn effective_provider_request_deadline(
     let default_deadline =
         provider_request_deadline_timeout(base_timeout, route_selection, request);
     match deadline_override {
+        // An override can only tighten the deadline, never extend it past the
+        // failover-aware default the operator configured.
         Some(deadline_override) => {
             (deadline_override.timeout.min(default_deadline), deadline_override.reason)
         }
@@ -220,6 +265,10 @@ fn browser_followup_deadline_override(
     })
 }
 
+// Counts the provider attempts the lease layer may make for one logical turn
+// (selected provider plus eligible chat fallbacks). The outer deadline must
+// cover all of them, otherwise failover would be cut off mid-attempt. An
+// explicit model override pins routing to a single provider.
 fn provider_request_deadline_attempt_count(
     route_selection: &ProviderRouteSelectionTrace,
     request: &ProviderRequest,
@@ -395,6 +444,8 @@ fn estimate_provider_message_input_tokens(message: &ProviderMessage) -> u64 {
     content_tokens.saturating_add(tool_call_tokens).saturating_add(4)
 }
 
+// Conservative token estimate: the larger of the whitespace-based count and
+// a chars/4 floor, so dense text without spaces still charges the budget.
 fn estimate_background_budget_text_tokens(value: &str) -> u64 {
     if value.is_empty() {
         return 0;
@@ -504,6 +555,17 @@ async fn persist_run_stream_delegation_metadata(
         .await
 }
 
+/// Completes a run after its final provider response, honoring late cancels.
+///
+/// Checks for a pending cancel before transitioning, persists the done state,
+/// emits the terminal `Done` status with tape row, and releases run
+/// resources. Already-terminal runs pass through unchanged.
+///
+/// # Errors
+///
+/// Returns `Status::internal` when the state machine rejects the `Complete`
+/// transition, `Status::cancelled` when the client stream drops during the
+/// terminal status, or journal errors from state persistence.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn finalize_run_stream_after_provider_response(
     sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
@@ -529,6 +591,9 @@ pub(crate) async fn finalize_run_stream_after_provider_response(
         runtime_state
             .update_orchestrator_run_state(run_id.to_owned(), RunLifecycleState::Done, None)
             .await?;
+        // Re-read the persisted state: a concurrent cancel may have landed
+        // between the cancel check above and the Done write. Cancelled wins,
+        // so the client must not see a spurious Done status.
         if matches!(
             runtime_state.orchestrator_run_status_snapshot(run_id.to_owned()).await,
             Ok(Some(snapshot)) if snapshot.state == RunLifecycleState::Cancelled.as_str()
@@ -553,6 +618,10 @@ pub(crate) async fn finalize_run_stream_after_provider_response(
     Ok(RunStreamPostProviderOutcome::Completed)
 }
 
+// Runs one provider request under a deadline while polling for cancellation
+// (100 ms) and emitting waiting-status heartbeats (20 s). The provider future
+// is created once and pinned, so losing select races to the timers never
+// drops provider progress.
 #[allow(clippy::result_large_err)]
 async fn execute_run_stream_provider_request(
     sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
@@ -844,6 +913,10 @@ async fn terminate_run_stream_with_agent_loop_reason(
     status_result
 }
 
+// Appends cleanup guidance and, for resumable partials, the
+// "needs_continuation=true reason_code=..." marker that the tape layer parses
+// back into the lifecycle payload. Skips the marker when the message already
+// carries one to avoid double-tagging.
 fn agent_loop_terminal_status_message(
     reason: AgentLoopTerminationReason,
     loop_state: &AgentRunLoopState,
@@ -903,6 +976,10 @@ async fn send_budget_exhausted_partial_summary_tokens(
     .await
 }
 
+// Replays a final reply as model-token events when streaming was deferred
+// (no tool proposals in the turn) or when a synthetic partial summary stands
+// in for the model's answer. Always emits at least one final token so clients
+// waiting on `is_final` are released.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 async fn send_deferred_final_reply_tokens(
@@ -995,6 +1072,28 @@ async fn persist_accepted_final_reply(
     Ok(())
 }
 
+/// Processes one client `RunStreamRequest` by running the full agent loop.
+///
+/// The first message of a stream accepts the run (session resolution, run
+/// start, delegation metadata, heartbeat); every message then enters the
+/// loop: build the tool catalog, issue a deadline-guarded provider turn,
+/// process its events (streaming tokens and executing tool proposals), and
+/// either re-feed tool results or finalize on a usable final answer.
+/// Session and run identity are pinned to the first message; switching
+/// either mid-stream is rejected.
+///
+/// Returns [`RunStreamMessageProcessingOutcome::Continue`] when the run
+/// finished cleanly and the stream may accept another message, or
+/// `Terminate` when the run reached a terminal state (cancelled, failed, or
+/// needs-continuation).
+///
+/// # Errors
+///
+/// Returns `Status::invalid_argument` for malformed or mid-stream-switched
+/// ids, `Status::deadline_exceeded` for provider timeouts without resumable
+/// tool evidence, `Status::cancelled` when the client stream drops, plus
+/// journal/provider errors from the underlying layers. Terminal status
+/// events and cleanup are emitted before the error is returned.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_run_stream_message(
@@ -1427,6 +1526,9 @@ pub(crate) async fn process_run_stream_message(
                 }
             }
         }
+        // The follow-up deadline applies to exactly one turn: the turn right
+        // after a batch that completed browser tools. Reset before the
+        // request so recovery turns fall back to the normal deadline.
         let deadline_override = browser_followup_deadline_override(
             pending_browser_followup_deadline,
             &runtime_state.config,
@@ -1456,6 +1558,10 @@ pub(crate) async fn process_run_stream_message(
         {
             Ok(RunStreamProviderRequestOutcome::Completed(response)) => *response,
             Ok(RunStreamProviderRequestOutcome::TimedOut { reason, message }) => {
+                // With tool evidence on the tape the run is worth resuming:
+                // try one browser follow-up recovery turn, else emit a
+                // partial summary and terminate as needs_continuation.
+                // Without tool evidence the timeout is a plain failure.
                 if loop_state.completed_tool_calls() > 0 {
                     if let Some(recovery_prompt) = browser_followup_timeout_recovery_prompt(
                         reason,
@@ -1836,6 +1942,8 @@ pub(crate) async fn process_run_stream_message(
                 let repeated_tool_failure =
                     repeated_tool_failure_tracker.observe(tool_result_messages.as_slice());
                 let tool_result_count = tool_result_messages.len();
+                // Arm the shorter follow-up deadline for the next turn when
+                // this batch ran any browser tool (see the constant above).
                 pending_browser_followup_deadline =
                     completed_tool_names.iter().any(|tool_name| is_browser_tool_name(tool_name));
                 loop_state.append_tool_result_messages(tool_result_messages);
@@ -1974,6 +2082,10 @@ pub(crate) async fn process_run_stream_message(
                     .await?;
                     return Ok(RunStreamMessageProcessingOutcome::Terminate);
                 }
+                // On a recovery turn the truncated assistant output is
+                // deliberately NOT appended to the history: re-feeding it
+                // would waste context and bias the model toward repeating the
+                // overlong answer. Only the corrective guidance is added.
                 if let Some(recovery_prompt) = length_recovery_prompt(
                     reason,
                     message.as_str(),
@@ -2044,10 +2156,18 @@ async fn process_run_stream_provider_response(
     model_token_compaction_emitted: &mut bool,
 ) -> Result<RunStreamProviderResponseOutcome, Status> {
     let provider_output = bounded_provider_turn_output_for_persistence(&provider_response.output);
+    // Turns with tool proposals stream their text immediately (it is progress
+    // narration). Turns without tool proposals defer token emission: the text
+    // is a candidate final answer that may still be rejected by the
+    // incomplete-final-answer guards, and a rejected answer must never reach
+    // the client as streamed tokens.
     let stream_model_tokens_immediately = provider_response
         .events
         .iter()
         .any(|event| matches!(event, ProviderEvent::ToolProposal { .. }));
+    // Prompt usage is recorded up front so it is never lost if event
+    // processing terminates early; completion usage follows below once the
+    // events have been handled.
     runtime_state
         .add_orchestrator_usage(OrchestratorUsageDelta {
             run_id: run_id.to_owned(),
@@ -2089,6 +2209,8 @@ async fn process_run_stream_provider_response(
             .await?;
     }
     let terminal_tool_failure = tool_results.iter().find_map(terminal_tool_authorization_failure);
+    // A terminal authorization failure stops the loop, so no tool results are
+    // re-fed to the model: nothing in this batch may influence further turns.
     let tool_result_messages = if terminal_tool_failure.is_some() {
         Vec::new()
     } else {
@@ -2219,6 +2341,9 @@ fn failed_tool_claim_boundary(tool_name: &str) -> Option<&'static str> {
 
 const REPEATED_TOOL_FAILURE_LIMIT: u32 = 3;
 
+// Detects a model stuck re-sending the same malformed workspace patch:
+// after three consecutive identical parse-failure signatures the run stops
+// instead of burning the remaining tool budget on the same mistake.
 #[derive(Debug, Clone, Default)]
 struct RepeatedToolFailureTracker {
     last_signature: Option<RepeatedToolFailureSignature>,
@@ -2326,6 +2451,10 @@ fn repeated_tool_failure_message(
     )
 }
 
+// Classifies approval/authorization failures that cannot be cured by another
+// model turn (protocol errors, timeouts, noninteractive/deny-mode CLIs).
+// Explicit operator denials are deliberately not terminal: the model can
+// observe the denial and adapt its plan.
 fn terminal_tool_authorization_failure(result: &RunStreamToolResultForModel) -> Option<String> {
     let error = result.outcome.error.trim();
     if result.outcome.success || error.is_empty() || !is_terminal_tool_authorization_error(error) {
@@ -2897,6 +3026,10 @@ fn has_tool_name_prefix(messages: &[ProviderMessage], prefix: &str) -> bool {
         .any(|call| call.tool_name.starts_with(prefix))
 }
 
+// Heuristic phrase tables backing the incomplete-final-answer guards. They
+// only ever convert a would-be final answer into a recovery turn or partial
+// failure, never silently rewrite content; extend them with care because
+// false positives force unnecessary recovery turns.
 const UNSUPPORTED_TOOL_WORK_CLAIMS: &[&str] = &[
     "i applied the patch",
     "i created the file",

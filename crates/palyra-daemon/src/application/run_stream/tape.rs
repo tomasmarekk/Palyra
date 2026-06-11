@@ -1,3 +1,13 @@
+//! Paired wire-event emission and orchestrator tape persistence.
+//!
+//! Every observable run-stream event (status, model token, tool proposal,
+//! approval request/response, decision, result, attestation) is sent to the
+//! client and appended to the orchestrator tape so deterministic replay can
+//! reconstruct the run. The `send_*_with_tape` helpers enforce the ordering
+//! invariant: the wire event is delivered first, then the tape row is
+//! appended, and `tape_seq` only advances after a successful append. All
+//! model- and client-visible text passes redaction before either sink.
+
 use std::sync::Arc;
 
 use palyra_common::CANONICAL_PROTOCOL_MAJOR;
@@ -22,17 +32,27 @@ use crate::{
     transport::grpc::{auth::RequestContext, proto::palyra::common::v1 as common_v1},
 };
 
+/// Status message used when the client side of the run stream has dropped.
+///
+/// Paired with `Code::Cancelled` so callers can classify this exact condition
+/// (see `is_run_stream_response_channel_closed` in `orchestration`); do not
+/// reuse the text for other cancellation causes.
 pub(crate) const RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE: &str =
     "run stream response channel closed";
 
+/// Result of the once-per-run context compaction attempted after a tool-result batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolResultCompactionOutcome {
+    /// Compaction was not attempted (no results, or already emitted this run).
     Skipped,
+    /// Compaction ran and a checkpoint artifact was written.
     Applied,
+    /// Compaction was attempted but the preview declared it ineligible.
     Blocked,
 }
 
 impl ToolResultCompactionOutcome {
+    /// Returns the progress phase to stream for this outcome, if any.
     #[must_use]
     pub(crate) const fn progress_phase(self) -> Option<&'static str> {
         match self {
@@ -43,6 +63,15 @@ impl ToolResultCompactionOutcome {
     }
 }
 
+/// Appends a tool-decision tape event without emitting a wire event.
+///
+/// Used when the decision was already delivered to the client through another
+/// surface and only the replay record is missing.
+///
+/// # Errors
+///
+/// Returns the journal error when the tape append fails; `tape_seq` is not
+/// advanced in that case.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn append_tool_decision_tape_event(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -306,6 +335,15 @@ fn tool_attestation_event(
     }
 }
 
+/// Appends a runtime-decision tape event when replay capture is enabled.
+///
+/// A no-op unless the replay-capture preview capability is active and
+/// runtime-decision capture is switched on, so ordinary runs pay nothing.
+///
+/// # Errors
+///
+/// Returns `Status::internal` when the payload fails to serialize, or the
+/// journal error when the tape append fails.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn append_runtime_decision_tape_event(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -335,6 +373,14 @@ pub(crate) async fn append_runtime_decision_tape_event(
     Ok(())
 }
 
+/// Sends a status event to the client and appends the matching tape row.
+///
+/// # Errors
+///
+/// Returns `Status::cancelled` with
+/// [`RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE`] when the client stream has
+/// dropped, or the journal error when the tape append fails (the wire event
+/// has already been delivered in that case).
 #[allow(clippy::result_large_err)]
 pub(crate) async fn send_status_with_tape(
     sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
@@ -361,6 +407,18 @@ pub(crate) async fn send_status_with_tape(
     Ok(())
 }
 
+/// Streams a redacted model token to the client and records it on the tape.
+///
+/// Tokens are always streamed live. Tape persistence is capped at
+/// `MAX_MODEL_TOKEN_TAPE_EVENTS_PER_RUN` non-final tokens per run: once the
+/// cap is hit, an automatic session compaction runs exactly once and further
+/// non-final tokens are streamed without tape rows, keeping replay tapes
+/// bounded for very long generations.
+///
+/// # Errors
+///
+/// Returns `Status::cancelled` when the client stream has dropped, or any
+/// journal/compaction error from the tape and compaction paths.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_model_token_with_tape(
@@ -411,6 +469,16 @@ pub(crate) async fn send_model_token_with_tape(
     Ok(())
 }
 
+/// Runs the token-tape-cap compaction lifecycle and records its outcome.
+///
+/// Previews session compaction under the `token_tape_cap_v1` policy and
+/// applies it when eligible; either way a `session.compaction` tape event is
+/// appended so replay sees the decision.
+///
+/// # Errors
+///
+/// Returns journal errors from session resolution, compaction preview/apply,
+/// or the tape append.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn compact_model_token_tape(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -485,6 +553,17 @@ pub(crate) async fn compact_model_token_tape(
     Ok(())
 }
 
+/// Attempts at most one tool-result-driven context compaction per run.
+///
+/// Guarded by `compaction_emitted` (run-scoped cooldown): only the first
+/// non-empty tool-result batch can trigger an applied compaction. The
+/// preview/apply decision is recorded as a `session.compaction` tape event in
+/// both the applied and blocked cases.
+///
+/// # Errors
+///
+/// Returns journal errors from session resolution, compaction preview/apply,
+/// or the tape append.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn maybe_compact_context_after_tool_results(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -615,6 +694,12 @@ fn compaction_quality_gates(summary_json: &str) -> Value {
         .unwrap_or(Value::Null)
 }
 
+/// Appends a `tool_proposal` tape row without emitting a wire event.
+///
+/// # Errors
+///
+/// Returns the journal error when the tape append fails; `tape_seq` is not
+/// advanced in that case.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn append_tool_proposal_tape_event(
@@ -643,6 +728,12 @@ pub(crate) async fn append_tool_proposal_tape_event(
     Ok(())
 }
 
+/// Appends a `tool_approval_request` tape row without emitting a wire event.
+///
+/// # Errors
+///
+/// Returns the journal error when the tape append fails; `tape_seq` is not
+/// advanced in that case.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn append_tool_approval_request_tape_event(
@@ -677,6 +768,12 @@ pub(crate) async fn append_tool_approval_request_tape_event(
     Ok(())
 }
 
+/// Appends a `tool_approval_response` tape row without emitting a wire event.
+///
+/// # Errors
+///
+/// Returns the journal error when the tape append fails; `tape_seq` is not
+/// advanced in that case.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn append_tool_approval_response_tape_event(
@@ -709,6 +806,12 @@ pub(crate) async fn append_tool_approval_response_tape_event(
     Ok(())
 }
 
+/// Sends a tool-proposal event to the client and appends the tape row.
+///
+/// # Errors
+///
+/// Returns `Status::cancelled` when the client stream has dropped, or the
+/// journal error when the tape append fails.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_tool_proposal_with_tape(
@@ -744,6 +847,12 @@ pub(crate) async fn send_tool_proposal_with_tape(
     .await
 }
 
+/// Sends a tool-approval-request event to the client and appends the tape row.
+///
+/// # Errors
+///
+/// Returns `Status::cancelled` when the client stream has dropped, or the
+/// journal error when the tape append fails.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_tool_approval_request_with_tape(
@@ -788,6 +897,12 @@ pub(crate) async fn send_tool_approval_request_with_tape(
     .await
 }
 
+/// Sends a tool-approval-response event to the client and appends the tape row.
+///
+/// # Errors
+///
+/// Returns `Status::cancelled` when the client stream has dropped, or the
+/// journal error when the tape append fails.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_tool_approval_response_with_tape(
@@ -829,6 +944,12 @@ pub(crate) async fn send_tool_approval_response_with_tape(
     .await
 }
 
+/// Sends a tool-decision (allow/deny) event to the client and appends the tape row.
+///
+/// # Errors
+///
+/// Returns `Status::cancelled` when the client stream has dropped, or the
+/// journal error when the tape append fails.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_tool_decision_with_tape(
@@ -870,6 +991,16 @@ pub(crate) async fn send_tool_decision_with_tape(
     .await
 }
 
+/// Sends a redacted tool-result event to the client and appends the tape row.
+///
+/// The raw output and error are redacted once and the same redacted bytes
+/// feed both the wire event and the tape payload, so replay matches what the
+/// client saw.
+///
+/// # Errors
+///
+/// Returns `Status::cancelled` when the client stream has dropped, or the
+/// journal error when the tape append fails.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_tool_result_with_tape(
@@ -884,12 +1015,20 @@ pub(crate) async fn send_tool_result_with_tape(
 ) -> Result<(), Status> {
     let safe_output_json = redacted_run_stream_output_json(output_json);
     let safe_error = redact_run_stream_text(error);
+    // Build the tape payload before the buffers move into the wire event;
+    // tool outputs can be large and cloning them here is pure waste.
+    let payload_json = tool_result_tape_payload(
+        proposal_id,
+        success,
+        safe_output_json.as_slice(),
+        safe_error.as_str(),
+    );
     let event = tool_result_event(
         run_id.to_owned(),
         proposal_id.to_owned(),
         success,
-        safe_output_json.clone(),
-        safe_error.clone(),
+        safe_output_json,
+        safe_error,
     );
     sender
         .send(Ok(event))
@@ -900,18 +1039,19 @@ pub(crate) async fn send_tool_result_with_tape(
             run_id: run_id.to_owned(),
             seq: *tape_seq,
             event_type: "tool_result".to_owned(),
-            payload_json: tool_result_tape_payload(
-                proposal_id,
-                success,
-                safe_output_json.as_slice(),
-                safe_error.as_str(),
-            ),
+            payload_json,
         })
         .await?;
     *tape_seq += 1;
     Ok(())
 }
 
+/// Sends a tool-attestation event to the client and appends the tape row.
+///
+/// # Errors
+///
+/// Returns `Status::cancelled` when the client stream has dropped, or the
+/// journal error when the tape append fails.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_tool_attestation_with_tape(
@@ -960,6 +1100,10 @@ pub(crate) async fn send_tool_attestation_with_tape(
     Ok(())
 }
 
+// The wire protocol only carries Failed for both cancellations and partial
+// budget exhaustion, so the tape payload re-derives the real lifecycle kind
+// from the message. These payload shapes are pinned by replay fixtures; keep
+// field names and values stable.
 fn status_tape_payload(kind: common_v1::stream_status::StatusKind, message: &str) -> String {
     if kind == common_v1::stream_status::StatusKind::Failed && message == CANCELLED_REASON {
         return json!({
@@ -998,6 +1142,9 @@ fn is_needs_continuation_status_message(message: &str) -> bool {
     lower.contains("needs_continuation=true")
 }
 
+// Recovers the machine reason code from the human status message. The
+// `reason_code=` markers are written by the agent-loop termination messages
+// in `orchestration`; the prose fallbacks cover older message shapes.
 fn needs_continuation_reason_code(message: &str) -> &'static str {
     let lower = message.to_ascii_lowercase();
     if lower.contains("reason_code=max_tool_calls") || lower.contains("tool call limit reached") {
