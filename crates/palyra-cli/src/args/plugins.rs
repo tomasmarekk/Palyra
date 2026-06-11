@@ -1,3 +1,9 @@
+//! Arguments for `palyra plugins`: trusted WASM plugin discovery, binding
+//! (install/update with capability grants), and lifecycle control. Plugin
+//! config JSON may carry secrets, so file and stdin input variants exist
+//! alongside the inline form. Help text is pinned by snapshot tests; see the
+//! doc-comment rules in `mod.rs`.
+
 use clap::Subcommand;
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]

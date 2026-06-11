@@ -1,3 +1,9 @@
+//! Arguments for `palyra routines`: the unified automation surface over
+//! schedule, hook, webhook, system-event, file-watch, and manual triggers.
+//! Schedule/concurrency/misfire enums come from the `cron` compatibility family
+//! (`cron.rs`), and several value enums here are reused by `objectives.rs`.
+//! Help text is pinned by snapshot tests; see the doc-comment rules in `mod.rs`.
+
 use std::{fmt, str::FromStr};
 
 use clap::{ArgGroup, Args, Subcommand, ValueEnum};
@@ -312,6 +318,8 @@ pub enum RoutineTriggerKindArg {
 }
 
 impl RoutineTriggerKindArg {
+    /// Returns the daemon contract identifier (snake_case, unlike the
+    /// kebab-case CLI value).
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -334,6 +342,7 @@ pub enum RoutineDeliveryModeArg {
 }
 
 impl RoutineDeliveryModeArg {
+    /// Returns the daemon contract identifier for this delivery mode.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -353,6 +362,7 @@ pub enum RoutineSilentPolicyArg {
 }
 
 impl RoutineSilentPolicyArg {
+    /// Returns the daemon contract identifier for this silent policy.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -370,6 +380,7 @@ pub enum RoutineRunModeArg {
 }
 
 impl RoutineRunModeArg {
+    /// Returns the daemon contract identifier for this run mode.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -386,6 +397,7 @@ pub enum RoutineExecutionPostureArg {
 }
 
 impl RoutineExecutionPostureArg {
+    /// Returns the daemon contract identifier for this execution posture.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -403,6 +415,7 @@ pub enum RoutineApprovalModeArg {
 }
 
 impl RoutineApprovalModeArg {
+    /// Returns the daemon contract identifier for this approval mode.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -413,20 +426,29 @@ impl RoutineApprovalModeArg {
     }
 }
 
+/// Schedule/preview timezone accepted as `local`, `utc`, or an IANA name such
+/// as `Europe/Prague`.
+///
+/// A validated newtype rather than a `ValueEnum` because arbitrary IANA
+/// identifiers must be accepted; only shape validation happens at parse time
+/// and full timezone resolution is performed downstream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutinePreviewTimezoneArg(String);
 
 impl RoutinePreviewTimezoneArg {
+    /// Builds the `local` sentinel value.
     #[must_use]
     pub fn local() -> Self {
         Self("local".to_owned())
     }
 
+    /// Builds the `utc` sentinel value.
     #[must_use]
     pub fn utc() -> Self {
         Self("utc".to_owned())
     }
 
+    /// Returns the raw timezone string as entered (trimmed).
     #[must_use]
     pub fn as_str(&self) -> &str {
         self.0.as_str()
@@ -436,6 +458,12 @@ impl RoutinePreviewTimezoneArg {
 impl FromStr for RoutinePreviewTimezoneArg {
     type Err = String;
 
+    /// Parses a timezone argument, trimming surrounding whitespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the trimmed value is empty or contains control
+    /// characters.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let trimmed = value.trim();
         if trimmed.is_empty() {

@@ -1,3 +1,9 @@
+//! Arguments for `palyra auth`: auth profile registry CRUD and diagnostics,
+//! access control (tokens, workspaces, invitations), and OpenAI API-key/OAuth
+//! flows. Secret material is referenced via vault refs or read through
+//! env/stdin/prompt selector flags, never passed as raw argument values.
+//! Help text is pinned by snapshot tests; see the doc-comment rules in `mod.rs`.
+
 use clap::{Subcommand, ValueEnum};
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]

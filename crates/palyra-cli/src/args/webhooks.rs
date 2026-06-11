@@ -1,3 +1,7 @@
+//! Arguments for `palyra webhooks`: webhook-backed integration management with
+//! vault-referenced signing secrets and event/source allowlists. Help text is
+//! pinned by snapshot tests; see the doc-comment rules in `mod.rs`.
+
 use clap::Subcommand;
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]

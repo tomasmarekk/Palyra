@@ -1,3 +1,7 @@
+//! Arguments for `palyra extension`: package preflight diagnostics (`doctor`)
+//! over artifact trust, publishers, and grants. Help text is pinned by snapshot
+//! tests; see the doc-comment rules in `mod.rs`.
+
 use clap::Subcommand;
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]

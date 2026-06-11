@@ -1,7 +1,15 @@
+//! Parser stability tests pinning skills and plugin argument shapes against
+//! accidental flag, default, or value-name changes.
+
 use clap::Parser;
 
 use super::*;
 
+/// Runs `test` on a thread with an 8 MiB stack.
+///
+/// Constructing and comparing the deeply nested `Cli`/`Command` values for the
+/// large plugin variants can exceed the default test-thread stack in debug
+/// builds, so these parse tests run with extra headroom.
 fn run_cli_parse_test_with_large_stack(test: impl FnOnce() + Send + 'static) {
     let handle = std::thread::Builder::new()
         .name("cli-parse-test".to_owned())

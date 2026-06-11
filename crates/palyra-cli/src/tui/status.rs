@@ -1,6 +1,19 @@
+//! Session status, context-budget, and recap summaries for the TUI.
+//!
+//! Aggregates usage and transcript metadata from the console API into
+//! `SessionRuntimeSnapshot` and renders the `/status` summary blocks shown
+//! in the header, footer, and status-detail popup.
+
 use super::*;
 
 impl App {
+    /// Refreshes [`SessionRuntimeSnapshot`] from the usage and transcript APIs.
+    ///
+    /// Partial data is still applied so the UI degrades gracefully.
+    ///
+    /// # Errors
+    /// Returns an error describing whichever of the two fetches failed; the
+    /// snapshot built from the surviving source is applied regardless.
     pub(super) async fn refresh_session_runtime_snapshot(&mut self) -> Result<()> {
         let session_id = self.active_session_id()?;
         let context = self.connect_admin_console().await?;
@@ -28,6 +41,8 @@ impl App {
         let transcript_result = context.client.get_json_value(transcript_path).await;
 
         if let Ok(usage) = usage_result.as_ref() {
+            // Session, totals, and catalog counters can trail each other while
+            // a run streams; take the max so the display never goes backwards.
             snapshot.session_total_tokens = read_json_u64(usage, "/session/total_tokens")
                 .max(read_json_u64(usage, "/totals/total_tokens"))
                 .max(snapshot.session_total_tokens);
@@ -89,6 +104,8 @@ impl App {
         }
     }
 
+    /// Estimates the context budget from session tokens, the current draft,
+    /// project context, and queued attachments.
     pub(super) fn context_budget_summary(&self) -> ContextBudgetSummary {
         let baseline_tokens = self
             .current_session_catalog
@@ -147,6 +164,8 @@ impl App {
         }
     }
 
+    /// Appends a "Recap" transcript entry for the active session, using the
+    /// catalog entry when loaded and `fallback` otherwise.
     pub(super) fn push_session_recap(&mut self, fallback: Option<TuiSlashSessionRecord>) {
         if let Some(session) = self.current_session_catalog.as_ref() {
             let mut lines = Vec::new();
@@ -235,6 +254,7 @@ impl App {
         }
     }
 
+    /// Mirrors the session quick-control toggles into the local view flags.
     pub(super) fn sync_session_quick_controls_from_catalog(&mut self) {
         let Some(session) = self.current_session_catalog.as_ref() else {
             return;
@@ -244,6 +264,7 @@ impl App {
         self.show_verbose = session.quick_controls.verbose.value;
     }
 
+    /// Display label for the effective session model (override or inherited).
     pub(super) fn current_session_model_display(&self) -> String {
         let quick_control_display = self
             .current_session_catalog
@@ -258,6 +279,7 @@ impl App {
         .unwrap_or_else(|| "none".to_owned())
     }
 
+    /// Display label for the effective session agent (override or resolved).
     pub(super) fn current_session_agent_display(&self) -> String {
         self.current_session_catalog
             .as_ref()
@@ -268,20 +290,24 @@ impl App {
             .unwrap_or_else(|| "none".to_owned())
     }
 
+    /// Whether the session carries an explicit model override.
     pub(super) fn current_session_model_override_active(&self) -> bool {
         self.current_session_catalog
             .as_ref()
-            .map(|session| session.quick_controls.model.override_active)
-            .unwrap_or(false)
+            .is_some_and(|session| session.quick_controls.model.override_active)
     }
 
+    /// Whether the session carries an explicit agent override.
     pub(super) fn current_session_agent_override_active(&self) -> bool {
         self.current_session_catalog
             .as_ref()
-            .map(|session| session.quick_controls.agent.override_active)
-            .unwrap_or(false)
+            .is_some_and(|session| session.quick_controls.agent.override_active)
     }
 
+    /// Re-resolves the agent bound to this session context.
+    ///
+    /// # Errors
+    /// Returns an error when the gateway agent resolution call fails.
     pub(super) async fn refresh_agent_identity(
         &mut self,
         preferred_agent_id: Option<String>,
@@ -302,6 +328,11 @@ impl App {
         Ok(())
     }
 
+    /// Reloads agent, model, and catalog state (Ctrl+R).
+    ///
+    /// # Errors
+    /// Returns an error when agent, model, or catalog refreshes fail; the
+    /// runtime-snapshot refresh is best-effort and never fails the reload.
     pub(super) async fn reload_runtime_state(&mut self) -> Result<()> {
         self.refresh_agent_identity(None, false).await?;
         self.models = Some(self.runtime.list_models(None)?);
@@ -312,11 +343,13 @@ impl App {
         Ok(())
     }
 
+    /// Drops cached browser profiles/sessions when browserd is unavailable.
     pub(super) fn clear_browser_catalog(&mut self) {
         self.slash_entity_catalog.browser_profiles.clear();
         self.slash_entity_catalog.browser_sessions.clear();
     }
 
+    /// Multi-line `/status` summary block (session, budget, run, profile).
     pub(super) fn status_summary(&self) -> String {
         let handoff = build_console_handoff_path(&TuiCrossSurfaceHandoff {
             section: "chat".to_owned(),
@@ -401,6 +434,8 @@ impl App {
         .join("\n")
     }
 
+    /// [`Self::status_summary`] extended with context/workspace/attachment detail
+    /// for `/status detail`.
     pub(super) fn status_detail_summary(&self) -> String {
         let budget = self.context_budget_summary();
         let workspace_artifacts = self.slash_entity_catalog.workspace_artifacts.len().max(
@@ -454,6 +489,7 @@ impl App {
     }
 }
 
+/// Runtime-level model label: the default chat model, then the text model.
 pub(super) fn effective_runtime_model_display(models: Option<&ModelsListPayload>) -> Option<&str> {
     models.and_then(|models| {
         models
@@ -466,6 +502,9 @@ pub(super) fn effective_runtime_model_display(models: Option<&ModelsListPayload>
     })
 }
 
+/// Picks the model label to display: an active session override wins;
+/// otherwise the runtime default is preferred over the legacy quick-control
+/// value.
 pub(super) fn model_display_from_sources(
     override_active: bool,
     quick_control_display: Option<&str>,
@@ -483,6 +522,11 @@ pub(super) fn model_display_from_sources(
         .map(ToOwned::to_owned)
 }
 
+/// Whether a browser-catalog refresh failure is expected when browserd is
+/// disabled or unreachable, so the TUI degrades instead of erroring.
+///
+/// Console errors arrive untyped over HTTP, so message substrings are the
+/// only signal available here.
 pub(super) fn browser_catalog_optional_error(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}").to_ascii_lowercase();
     message.contains("browser service is disabled")

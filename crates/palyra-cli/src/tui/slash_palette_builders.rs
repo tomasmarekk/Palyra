@@ -1,5 +1,12 @@
+//! Suggestion builders for the TUI slash-command palette.
+//!
+//! Each builder filters one entity catalog (sessions, objectives, profiles,
+//! checkpoints, workspace artifacts, ...) against the active input token and
+//! emits ready-to-insert `TuiSlashSuggestion` replacements.
+
 use super::*;
 
+/// Suggests command names matching `query` against names, aliases, and keywords.
 pub(super) fn build_command_name_suggestions(query: &str) -> Vec<TuiSlashSuggestion> {
     let normalized_query = query.trim().to_ascii_lowercase();
     shared_chat_commands_for_surface(SharedChatCommandSurface::Tui)
@@ -17,6 +24,9 @@ pub(super) fn build_command_name_suggestions(query: &str) -> Vec<TuiSlashSuggest
         })
         .take(8)
         .map(|command| {
+            // Commands that take arguments (multi-word synopsis) get a
+            // trailing space so accepting the suggestion keeps the palette
+            // open for argument completion.
             let replacement = if command.synopsis.contains(' ') {
                 format!("/{} ", command.name)
             } else {
@@ -34,6 +44,7 @@ pub(super) fn build_command_name_suggestions(query: &str) -> Vec<TuiSlashSuggest
         .collect()
 }
 
+/// Routes a resolved command to its catalog-specific suggestion builder.
 pub(super) fn build_entity_suggestions(
     command: &'static SharedChatCommandDefinition,
     catalog: &TuiSlashEntityCatalog,
@@ -81,6 +92,7 @@ pub(super) fn build_entity_suggestions(
     }
 }
 
+/// Suggests sessions for `/resume` and `/history` argument completion.
 pub(super) fn build_session_suggestions(
     command: &SharedChatCommandDefinition,
     catalog: &TuiSlashEntityCatalog,
@@ -100,8 +112,7 @@ pub(super) fn build_session_suggestions(
                 || session
                     .parent_title
                     .as_ref()
-                    .map(|title| title.to_ascii_lowercase().contains(query.as_str()))
-                    .unwrap_or(false)
+                    .is_some_and(|title| title.to_ascii_lowercase().contains(query.as_str()))
                 || session.relatives.iter().any(|relative| {
                     relative.title.to_ascii_lowercase().contains(query.as_str())
                         || relative.relation.to_ascii_lowercase().contains(query.as_str())
@@ -164,6 +175,8 @@ pub(super) fn build_session_suggestions(
                 },
                 detail: detail_parts.join(" · "),
                 example: format!("/{} {}", command.name, session.session_id),
+                // /history searches by title text while /resume targets one
+                // session, so the inserted argument differs per command.
                 replacement: if command.name == "history" {
                     format!("/{} {}", command.name, session.title)
                 } else {
@@ -181,6 +194,7 @@ pub(super) fn build_session_suggestions(
         .collect()
 }
 
+/// Suggests objectives for `/objective` argument completion.
 pub(super) fn build_objective_suggestions(
     command: &SharedChatCommandDefinition,
     catalog: &TuiSlashEntityCatalog,
@@ -212,6 +226,7 @@ pub(super) fn build_objective_suggestions(
         .collect()
 }
 
+/// Suggests auth profiles for `/profile` argument completion.
 pub(super) fn build_profile_suggestions(
     command: &SharedChatCommandDefinition,
     catalog: &TuiSlashEntityCatalog,
@@ -239,6 +254,7 @@ pub(super) fn build_profile_suggestions(
         .collect()
 }
 
+/// Suggests browser profiles for `/browser` argument completion.
 pub(super) fn build_browser_profile_suggestions(
     command: &SharedChatCommandDefinition,
     catalog: &TuiSlashEntityCatalog,
@@ -269,6 +285,7 @@ pub(super) fn build_browser_profile_suggestions(
         .collect()
 }
 
+/// Suggests browser sessions for `/browser` argument completion.
 pub(super) fn build_browser_session_suggestions(
     command: &SharedChatCommandDefinition,
     catalog: &TuiSlashEntityCatalog,
@@ -295,6 +312,7 @@ pub(super) fn build_browser_session_suggestions(
         .collect()
 }
 
+/// Suggests delegation templates and profiles for `/delegate` completion.
 pub(super) fn build_delegation_suggestions(
     command: &SharedChatCommandDefinition,
     active_token: &str,
@@ -319,6 +337,7 @@ pub(super) fn build_delegation_suggestions(
         .collect()
 }
 
+/// Suggests `/checkpoint` subcommands, or checkpoints once `restore` is typed.
 pub(super) fn build_checkpoint_suggestions(
     command: &SharedChatCommandDefinition,
     catalog: &TuiSlashEntityCatalog,
@@ -357,6 +376,8 @@ pub(super) fn build_checkpoint_suggestions(
         .collect()
 }
 
+/// Suggests `/rollback` subcommands, or workspace checkpoints once `diff` or
+/// `restore` is typed.
 pub(super) fn build_workspace_rollback_suggestions(
     command: &SharedChatCommandDefinition,
     catalog: &TuiSlashEntityCatalog,
@@ -399,6 +420,7 @@ pub(super) fn build_workspace_rollback_suggestions(
     ]
 }
 
+/// Suggests `/workspace` subcommands, or artifacts once `show`/`open` is typed.
 pub(super) fn build_workspace_suggestions(
     command: &SharedChatCommandDefinition,
     catalog: &TuiSlashEntityCatalog,
@@ -479,6 +501,7 @@ pub(super) fn build_workspace_suggestions(
     ]
 }
 
+/// Suggests workspace artifacts for the given `/workspace <action>` form.
 pub(super) fn build_workspace_artifact_suggestions(
     command: &SharedChatCommandDefinition,
     catalog: &TuiSlashEntityCatalog,
@@ -518,6 +541,7 @@ pub(super) fn build_workspace_artifact_suggestions(
         .collect()
 }
 
+/// Suggests workspace checkpoints (newest first) for `/rollback <action>`.
 pub(super) fn build_workspace_checkpoint_suggestions(
     command: &SharedChatCommandDefinition,
     catalog: &TuiSlashEntityCatalog,
@@ -594,6 +618,7 @@ fn shorten_palette_id(value: &str) -> String {
     value.chars().take(8).collect()
 }
 
+/// Suggests the default `/undo` target first, then explicit checkpoints.
 pub(super) fn build_undo_suggestions(
     command: &SharedChatCommandDefinition,
     catalog: &TuiSlashEntityCatalog,
@@ -652,6 +677,7 @@ pub(super) fn build_undo_suggestions(
     suggestions
 }
 
+/// Suggests `/interrupt` modes with phrasing tuned to the streaming state.
 pub(super) fn build_interrupt_suggestions(
     command: &SharedChatCommandDefinition,
     active_token: &str,
@@ -683,6 +709,7 @@ pub(super) fn build_interrupt_suggestions(
         .collect()
 }
 
+/// Suggests `/doctor` subcommands.
 pub(super) fn build_doctor_suggestions(
     command: &SharedChatCommandDefinition,
     active_token: &str,
@@ -709,6 +736,7 @@ pub(super) fn build_doctor_suggestions(
     .collect()
 }
 
+/// Suggests a fixed set of literal argument values for a command.
 pub(super) fn build_static_suggestions(
     command: &SharedChatCommandDefinition,
     active_token: &str,
@@ -729,6 +757,12 @@ pub(super) fn build_static_suggestions(
         .collect()
 }
 
+/// Compresses long entity ids to a head-and-tail form for palette rows.
+// AIDEV-NOTE: the head/tail slices are byte-indexed, so a value containing a
+// multi-byte UTF-8 character within the first 6 or last 4 bytes panics on a
+// char boundary. Safe for the ASCII ULIDs passed today; switch to
+// char_indices-based slicing (like shorten_palette_id) before feeding it
+// user-controlled text.
 pub(super) fn shorten_entity_id(value: &str) -> String {
     let trimmed = value.trim();
     if trimmed.len() <= 12 {

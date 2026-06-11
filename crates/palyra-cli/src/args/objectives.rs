@@ -1,3 +1,8 @@
+//! Arguments for `palyra objectives`: durable objectives, heartbeats, standing
+//! orders, and programs, including the shared upsert payload. Delivery,
+//! posture, and approval enums are reused from `routines.rs`. Help text is
+//! pinned by snapshot tests; see the doc-comment rules in `mod.rs`.
+
 use clap::{Args, Subcommand, ValueEnum};
 
 use super::routines::{
@@ -164,6 +169,8 @@ pub enum ObjectiveKindArg {
 }
 
 impl ObjectiveKindArg {
+    /// Returns the daemon contract identifier (snake_case, unlike the
+    /// kebab-case CLI value).
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -185,6 +192,7 @@ pub enum ObjectiveStateArg {
 }
 
 impl ObjectiveStateArg {
+    /// Returns the daemon contract identifier for this state.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -206,6 +214,7 @@ pub enum ObjectivePriorityArg {
 }
 
 impl ObjectivePriorityArg {
+    /// Returns the daemon contract identifier for this priority.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -225,6 +234,7 @@ pub enum ObjectiveScheduleTypeArg {
 }
 
 impl ObjectiveScheduleTypeArg {
+    /// Returns the daemon contract identifier for this schedule type.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {

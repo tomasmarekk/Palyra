@@ -1,3 +1,8 @@
+//! Arguments for `palyra mcp serve`: the stdio MCP server facade. Connection
+//! and session defaults reuse the shared ACP structs from `acp.rs`; the facade
+//! never imports external MCP servers. Help text is pinned by snapshot tests;
+//! see the doc-comment rules in `mod.rs`.
+
 use clap::{Args, Subcommand};
 
 use super::{AcpConnectionArgs, AcpSessionDefaultsArgs};

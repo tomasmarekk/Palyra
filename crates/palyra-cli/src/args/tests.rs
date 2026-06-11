@@ -1,3 +1,6 @@
+//! Parser round-trip tests for the full `palyra` CLI argument surface; help
+//! output itself is pinned separately by the `help_snapshots` suite.
+
 use clap::{CommandFactory as _, Parser};
 
 use super::{

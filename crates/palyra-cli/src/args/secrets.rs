@@ -1,3 +1,8 @@
+//! Arguments for `palyra secrets`: scoped vault secret CRUD, configuration
+//! audits/plans, and guided secret configuration. Secret values are never
+//! accepted on argv; `--value-stdin` selects stdin input. Help text is pinned
+//! by snapshot tests; see the doc-comment rules in `mod.rs`.
+
 use clap::Subcommand;
 
 const VAULT_SCOPE_HELP: &str =

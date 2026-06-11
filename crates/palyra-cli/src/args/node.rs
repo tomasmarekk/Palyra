@@ -1,3 +1,8 @@
+//! Arguments for `palyra node`: local node runtime pairing, service
+//! install/lifecycle, and status. Pairing codes are read from stdin by default;
+//! passing one on argv requires the explicit insecure-arg acknowledgement flag.
+//! Help text is pinned by snapshot tests; see the doc-comment rules in `mod.rs`.
+
 use clap::Subcommand;
 
 use super::PairingMethodArg;

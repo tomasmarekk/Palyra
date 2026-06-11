@@ -1,3 +1,8 @@
+//! Arguments for `palyra approvals`: listing, inspecting, deciding, and
+//! exporting pending tool approvals. The value enums mirror the control-plane
+//! approval contract. Help text is pinned by snapshot tests; see the
+//! doc-comment rules in `mod.rs`.
+
 use clap::{Subcommand, ValueEnum};
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]

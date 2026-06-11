@@ -1,13 +1,25 @@
+//! Multiline text composer backing the TUI input box.
+//!
+//! Tracks draft text, cursor, selection, and preferred column as byte offsets
+//! into a UTF-8 buffer (always kept on char boundaries), and renders a
+//! bottom-anchored viewport of the lines around the cursor for the input pane.
+
 use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
 };
 
+// Characters treated as word boundaries by Ctrl+Left/Ctrl+Right navigation.
 const WORD_SEPARATORS: &[char] = &[
     ' ', '\t', '\n', '\r', '/', '\\', ':', ';', ',', '.', '!', '?', '(', ')', '[', ']', '{', '}',
     '<', '>', '-', '_', '"', '\'', '`',
 ];
 
+/// Editable multiline draft with cursor, selection, and column memory.
+///
+/// `cursor` and `selection_anchor` are byte offsets into `text`;
+/// `preferred_column` remembers the visual column across vertical moves so
+/// passing through a short line does not lose horizontal position.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct TuiComposer {
     text: String,
@@ -16,14 +28,20 @@ pub(crate) struct TuiComposer {
     preferred_column: Option<usize>,
 }
 
+/// Render-ready snapshot of the composer viewport.
 #[derive(Debug, Clone)]
 pub(crate) struct TuiComposerView {
+    /// Visible lines, selection highlighting already applied.
     pub(crate) lines: Vec<Line<'static>>,
+    /// Cursor column in characters, relative to the rendered lines.
     pub(crate) cursor_x: u16,
+    /// Cursor row relative to the first rendered line.
     pub(crate) cursor_y: u16,
+    /// Total line count of the full draft, not just the viewport.
     pub(crate) total_lines: usize,
 }
 
+// Byte range of a single line, exclusive of its trailing '\n'.
 #[derive(Debug, Clone, Copy)]
 struct LineInfo {
     start: usize,
@@ -31,10 +49,12 @@ struct LineInfo {
 }
 
 impl TuiComposer {
+    /// Current draft text.
     pub(crate) fn text(&self) -> &str {
         self.text.as_str()
     }
 
+    /// Replaces the draft, moving the cursor to the end and dropping selection.
     pub(crate) fn set_text(&mut self, text: impl Into<String>) {
         self.text = text.into();
         self.cursor = self.text.len();
@@ -42,10 +62,12 @@ impl TuiComposer {
         self.preferred_column = None;
     }
 
+    /// Returns true when the draft contains no text at all.
     pub(crate) fn is_empty(&self) -> bool {
         self.text.is_empty()
     }
 
+    /// Empties the draft and resets cursor, selection, and column memory.
     pub(crate) fn clear(&mut self) {
         self.text.clear();
         self.cursor = 0;
@@ -53,24 +75,29 @@ impl TuiComposer {
         self.preferred_column = None;
     }
 
+    /// Draft text with surrounding whitespace trimmed.
     pub(crate) fn trimmed_text(&self) -> &str {
         self.text.trim()
     }
 
+    /// Returns true when a non-empty selection is active.
     pub(crate) fn has_selection(&self) -> bool {
         self.selected_range().is_some()
     }
 
+    /// Drops the selection without moving the cursor.
     pub(crate) fn clear_selection(&mut self) {
         self.selection_anchor = None;
     }
 
+    /// Selects the entire draft, placing the cursor at the end.
     pub(crate) fn select_all(&mut self) {
         self.selection_anchor = Some(0);
         self.cursor = self.text.len();
         self.preferred_column = None;
     }
 
+    /// Inserts `text` at the cursor, replacing the active selection if any.
     pub(crate) fn insert_text(&mut self, text: &str) {
         if text.is_empty() {
             return;
@@ -86,10 +113,12 @@ impl TuiComposer {
         self.preferred_column = None;
     }
 
+    /// Inserts a newline at the cursor, replacing the active selection if any.
     pub(crate) fn insert_newline(&mut self) {
         self.insert_text("\n");
     }
 
+    /// Deletes the selection, or the character before the cursor.
     pub(crate) fn backspace(&mut self) {
         if let Some(range) = self.take_selected_range() {
             self.text.replace_range(range.clone(), "");
@@ -106,6 +135,7 @@ impl TuiComposer {
         self.preferred_column = None;
     }
 
+    /// Deletes the selection, or the character after the cursor.
     pub(crate) fn delete(&mut self) {
         if let Some(range) = self.take_selected_range() {
             self.text.replace_range(range.clone(), "");
@@ -121,8 +151,12 @@ impl TuiComposer {
         self.preferred_column = None;
     }
 
+    /// Moves the cursor one character (or word) left, extending the selection
+    /// when `selecting` is set.
     pub(crate) fn move_left(&mut self, selecting: bool, by_word: bool) {
         if !selecting {
+            // A plain arrow with an active selection collapses to its edge
+            // instead of moving, matching common editor behavior.
             if let Some(range) = self.take_selected_range() {
                 self.cursor = range.start;
                 self.preferred_column = None;
@@ -137,6 +171,8 @@ impl TuiComposer {
         self.move_cursor(target, selecting);
     }
 
+    /// Moves the cursor one character (or word) right, extending the selection
+    /// when `selecting` is set.
     pub(crate) fn move_right(&mut self, selecting: bool, by_word: bool) {
         if !selecting {
             if let Some(range) = self.take_selected_range() {
@@ -153,6 +189,7 @@ impl TuiComposer {
         self.move_cursor(target, selecting);
     }
 
+    /// Moves the cursor to the start of the current line.
     pub(crate) fn move_to_line_start(&mut self, selecting: bool) {
         let (line_index, _) = self.cursor_line_col();
         let lines = line_infos(self.text.as_str());
@@ -160,6 +197,7 @@ impl TuiComposer {
         self.move_cursor(target, selecting);
     }
 
+    /// Moves the cursor to the end of the current line.
     pub(crate) fn move_to_line_end(&mut self, selecting: bool) {
         let (line_index, _) = self.cursor_line_col();
         let lines = line_infos(self.text.as_str());
@@ -167,14 +205,17 @@ impl TuiComposer {
         self.move_cursor(target, selecting);
     }
 
+    /// Moves the cursor to the very beginning of the draft.
     pub(crate) fn move_to_start(&mut self, selecting: bool) {
         self.move_cursor(0, selecting);
     }
 
+    /// Moves the cursor to the very end of the draft.
     pub(crate) fn move_to_end(&mut self, selecting: bool) {
         self.move_cursor(self.text.len(), selecting);
     }
 
+    /// Moves the cursor `delta` lines up or down, keeping the preferred column.
     pub(crate) fn move_vertical(&mut self, delta: isize, selecting: bool) {
         let lines = line_infos(self.text.as_str());
         if lines.is_empty() {
@@ -187,14 +228,20 @@ impl TuiComposer {
         let desired_column = self.preferred_column.unwrap_or(column);
         let target = byte_index_for_line_column(self.text.as_str(), target_line, desired_column);
         self.move_cursor(target, selecting);
+        // Re-arm the column memory: move_cursor clears it for non-selecting
+        // moves, but consecutive vertical moves must keep the original column.
         self.preferred_column = Some(desired_column);
     }
 
+    /// Builds the viewport of up to `max_visible_lines` lines ending at the
+    /// cursor line, with the selection styled for the given focus state.
     pub(crate) fn render(&self, max_visible_lines: usize, focused: bool) -> TuiComposerView {
         let lines = line_infos(self.text.as_str());
         let total_lines = lines.len().max(1);
         let max_visible_lines = max_visible_lines.max(1);
         let (cursor_line, cursor_col) = self.cursor_line_col();
+        // Anchor the viewport so the cursor line is always the bottom-most
+        // visible line once the draft outgrows the viewport.
         let start_line = cursor_line.saturating_add(1).saturating_sub(max_visible_lines);
         let end_line = (start_line + max_visible_lines).min(total_lines);
         let selected = self.selected_range();
@@ -217,10 +264,12 @@ impl TuiComposer {
         }
     }
 
+    /// Cursor position as (line index, column in characters).
     pub(crate) fn cursor_line_col(&self) -> (usize, usize) {
         cursor_line_col(self.text.as_str(), self.cursor)
     }
 
+    /// Normalized selection byte range, or `None` when the selection is empty.
     pub(crate) fn selected_range(&self) -> Option<std::ops::Range<usize>> {
         let anchor = self.selection_anchor?;
         if anchor == self.cursor {
@@ -327,12 +376,10 @@ fn next_char_boundary(text: &str, cursor: usize) -> usize {
 }
 
 fn prev_word_boundary(text: &str, cursor: usize) -> usize {
+    // Two-phase scan: first skip separators left of the cursor to land on the
+    // last word character, then walk to that word's first character.
     let mut boundary = 0usize;
-    let chars = text[..cursor].char_indices().collect::<Vec<_>>();
-    let mut index = chars.len();
-    while index > 0 {
-        index -= 1;
-        let (byte_index, ch) = chars[index];
+    for (byte_index, ch) in text[..cursor].char_indices().rev() {
         if !WORD_SEPARATORS.contains(&ch) {
             boundary = byte_index;
             break;
@@ -350,6 +397,7 @@ fn prev_word_boundary(text: &str, cursor: usize) -> usize {
 }
 
 fn next_word_boundary(text: &str, cursor: usize) -> usize {
+    // Mirror of prev_word_boundary: skip separators, then skip the word.
     let mut index = cursor;
     while index < text.len() {
         let next = next_char_boundary(text, index);

@@ -1,5 +1,12 @@
+//! Cross-surface handoff links from the TUI into the web console.
+//!
+//! Builds `/#/<section>?key=value` fragment paths with a fixed parameter
+//! order so handoff URLs stay deterministic across runs; the parsing half is
+//! test-only round-trip support.
+
 use super::percent_encode_component;
 
+/// Context payload encoded into a web-console handoff URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TuiCrossSurfaceHandoff {
     pub(crate) section: String,
@@ -30,6 +37,8 @@ impl Default for TuiCrossSurfaceHandoff {
 type HandoffParamResolver = fn(&TuiCrossSurfaceHandoff) -> Option<&str>;
 type HandoffParamOrderEntry = (&'static str, HandoffParamResolver);
 
+// Query parameters are emitted in exactly this order; tests pin the resulting
+// URLs, so reordering entries is a breaking change.
 const HANDOFF_PARAM_ORDER: &[HandoffParamOrderEntry] = &[
     ("sessionId", |payload| payload.session_id.as_deref()),
     ("runId", |payload| payload.run_id.as_deref()),
@@ -40,6 +49,8 @@ const HANDOFF_PARAM_ORDER: &[HandoffParamOrderEntry] = &[
     ("source", |payload| payload.source.as_deref()),
 ];
 
+/// Builds the console fragment path (`/#/<section>?...`) for `payload`,
+/// percent-encoding values and skipping empty context fields.
 pub(crate) fn build_console_handoff_path(payload: &TuiCrossSurfaceHandoff) -> String {
     let base_path = match normalize_section(payload.section.as_str()) {
         "chat" => "/#/chat",
@@ -64,6 +75,7 @@ pub(crate) fn build_console_handoff_path(payload: &TuiCrossSurfaceHandoff) -> St
     }
 }
 
+/// Test-only inverse of [`build_console_handoff_path`] for round-trip checks.
 #[cfg(test)]
 pub(crate) fn parse_console_handoff(raw: &str) -> TuiCrossSurfaceHandoff {
     let candidate = raw.split_once("/#").map(|(_, fragment)| fragment).unwrap_or(raw).trim();
@@ -122,6 +134,9 @@ fn section_from_path(path: &str) -> Option<&'static str> {
     }
 }
 
+// Test-only decoder: decodes each %XX escape to a single char and does not
+// reassemble multi-byte UTF-8 sequences, which is sufficient for the ASCII
+// identifiers used in the round-trip tests.
 #[cfg(test)]
 fn percent_decode_component(value: &str) -> String {
     let bytes = value.as_bytes();

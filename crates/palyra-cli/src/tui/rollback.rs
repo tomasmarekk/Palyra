@@ -1,9 +1,20 @@
+//! `/rollback` slash-command handling for workspace checkpoints.
+//!
+//! Lists checkpoints, previews diffs, and restores workspace state through
+//! the `/console/v1` chat workspace endpoints; restores stay branch-safe
+//! unless `--in-place` is passed and always require `--confirm`.
+
 use anyhow::{anyhow, Context, Result};
 
 use super::{
     percent_encode_component, read_json_string, shorten_id, App, EntryKind, TuiUxMetricKey,
 };
 
+/// Executes a `/rollback` invocation (summary, detail, `diff`, or `restore`).
+///
+/// # Errors
+/// Returns an error when no run context is available, the arguments do not
+/// parse, or the backing console API calls fail.
 pub(super) async fn handle_rollback_command(app: &mut App, arguments: Vec<String>) -> Result<()> {
     let context = app.connect_admin_console().await?;
     let Some(first) = arguments.first().map(String::as_str) else {
@@ -206,6 +217,8 @@ pub(super) async fn handle_rollback_command(app: &mut App, arguments: Vec<String
             .last_run_id
             .clone()
             .context("/rollback diff requires a previous run in this session")?;
+        // The target may be a run id or a checkpoint id; try the run-id
+        // comparison first and fall back to the checkpoint form on failure.
         let response = match context
             .client
             .post_json_value(
@@ -270,6 +283,7 @@ pub(super) async fn handle_rollback_command(app: &mut App, arguments: Vec<String
         return Ok(());
     }
 
+    // Bare target: try it as a checkpoint id first, then as a run id.
     let target = first;
     match context
         .client
@@ -372,6 +386,8 @@ struct RestoreRequest {
     branch_session: bool,
 }
 
+// Parses `/rollback restore` flags; branch-safe restore is the default and
+// `--confirm` must be explicit so a restore can never happen by accident.
 fn parse_restore_request(arguments: &[String]) -> Result<RestoreRequest> {
     let mut checkpoint_id = None;
     let mut confirmed = false;

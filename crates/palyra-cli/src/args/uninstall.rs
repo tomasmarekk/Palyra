@@ -1,3 +1,8 @@
+//! Arguments for `palyra uninstall`: installer-aware package removal with
+//! optional state cleanup. `--dry-run` and `--yes` are mutually exclusive so a
+//! preview can never double as confirmation. Help text is pinned by snapshot
+//! tests; see the doc-comment rules in `mod.rs`.
+
 use clap::Args;
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]

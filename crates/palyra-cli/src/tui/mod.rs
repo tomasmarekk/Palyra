@@ -1,3 +1,10 @@
+//! Interactive ratatui-based TUI for the operator CLI.
+//!
+//! Owns the terminal lifecycle, the crossterm event loop, the central `App`
+//! state (session, composer, transcript, overlays, catalogs), and slash
+//! command dispatch. Rendering, palette building, status summaries, and the
+//! `/workspace`/`/rollback` handlers live in the sibling submodules.
+
 use std::{
     collections::BTreeMap,
     fs,
@@ -57,6 +64,7 @@ use crate::{
     *,
 };
 
+/// Connection and session parameters for launching the TUI via [`run`].
 #[derive(Clone)]
 pub(crate) struct LaunchOptions {
     pub(crate) connection: AgentConnection,
@@ -68,12 +76,15 @@ pub(crate) struct LaunchOptions {
     pub(crate) include_archived_sessions: bool,
 }
 
+// Which base pane currently receives navigation and text input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Transcript,
     Input,
 }
 
+// Active overlay; `Chat` is the base mode and every other variant routes key
+// events to its own handler until the overlay closes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Chat,
@@ -139,12 +150,14 @@ struct ShellResult {
     stderr: String,
 }
 
+// Per-session draft snapshot so switching sessions never loses typed input.
 #[derive(Debug, Clone, Default)]
 struct ComposerDraftState {
     composer: TuiComposer,
     attachments: Vec<TuiPendingAttachment>,
 }
 
+// An uploaded attachment queued for the next prompt submission.
 #[derive(Debug, Clone)]
 struct TuiPendingAttachment {
     local_id: String,
@@ -161,6 +174,7 @@ struct TuiPendingAttachment {
     derived_artifacts: usize,
 }
 
+// Usage/transcript metadata cached for header, footer, and /status display.
 #[derive(Debug, Clone, Default)]
 struct SessionRuntimeSnapshot {
     session_total_tokens: u64,
@@ -175,6 +189,7 @@ struct SessionRuntimeSnapshot {
     active_background_task_count: usize,
 }
 
+// Estimated context-budget breakdown rendered in the composer and footer.
 #[derive(Debug, Clone)]
 struct ContextBudgetSummary {
     draft_tokens: u64,
@@ -196,6 +211,8 @@ enum StatusTone {
     Danger,
 }
 
+// Central TUI state. One instance lives for the whole TUI session; the event
+// loop, key handlers, and submodules all mutate it directly.
 struct App {
     runtime: OperatorRuntime,
     session: gateway_v1::SessionSummary,
@@ -236,6 +253,8 @@ struct App {
     force_clear_next_frame: bool,
 }
 
+// Prompt queued by `/interrupt <mode> <text>`; it starts automatically once
+// the interrupted run's stream closes cleanly.
 #[derive(Debug, Clone)]
 struct PendingRedirectPrompt {
     prompt: String,
@@ -247,10 +266,20 @@ const BUILT_IN_DELEGATION_PROFILES: &[&str] =
     &["research", "synthesis", "review", "patching", "triage"];
 const BUILT_IN_DELEGATION_TEMPLATES: &[&str] =
     &["compare_variants", "research_then_synthesize", "review_and_patch", "multi_source_triage"];
+// Soft limit drives the warning tone; the hard limit drives the danger tone
+// and the displayed budget denominator.
 const CONTEXT_BUDGET_SOFT_LIMIT: u64 = 12_000;
 const CONTEXT_BUDGET_HARD_LIMIT: u64 = 16_000;
 const MAX_COMPOSER_VISIBLE_LINES: usize = 6;
 
+/// Runs the interactive TUI until the user exits.
+///
+/// Blocks on a fresh Tokio runtime, takes over the terminal (raw mode plus
+/// alternate screen), and always restores it before returning.
+///
+/// # Errors
+/// Returns an error when session bootstrap, terminal setup/restore, or an
+/// unrecoverable event-loop failure occurs.
 pub(crate) fn run(options: LaunchOptions) -> Result<()> {
     let runtime = build_runtime()?;
     runtime.block_on(async move {
@@ -262,6 +291,9 @@ pub(crate) fn run(options: LaunchOptions) -> Result<()> {
     })
 }
 
+// Frame cadence: drain pending stream events first so each draw reflects the
+// newest run state, then draw, then poll input with a 50ms timeout. The
+// timeout doubles as the redraw tick while a run is streaming.
 async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
     loop {
         app.drain_stream_events().await?;
@@ -391,12 +423,17 @@ impl App {
         Ok(app)
     }
 
+    // INTENTIONAL: "__exit__" written to status_line is the exit sentinel
+    // shared by /exit, /quit, q, and Ctrl+C handling. It renders for at most
+    // one frame before run_loop returns, so users never see it.
     fn should_exit(&self) -> bool {
         matches!(self.mode, Mode::Chat) && self.status_line == "__exit__"
     }
 
     fn close_overlay(&mut self) {
         self.mode = Mode::Chat;
+        // Popups draw over the base layout without invalidating it, so the
+        // next frame must clear the terminal to drop their leftovers.
         self.force_clear_next_frame = true;
     }
 
@@ -404,6 +441,8 @@ impl App {
         std::mem::take(&mut self.force_clear_next_frame)
     }
 
+    // Pulls every immediately available stream event without blocking the
+    // frame: the 1ms timeout turns the await into a non-blocking poll.
     async fn drain_stream_events(&mut self) -> Result<()> {
         loop {
             let next = {
@@ -621,6 +660,8 @@ impl App {
         Ok(())
     }
 
+    // Streams tokens into the trailing assistant entry for the same run;
+    // any interleaved entry (tool card, status) starts a new bubble.
     fn append_assistant_token(&mut self, run_id: &str, token: &str) {
         let title = format!("Assistant ({})", shorten_id(run_id));
         let token = sanitize_terminal_text(token);
@@ -633,6 +674,8 @@ impl App {
         self.transcript.push(TranscriptEntry { kind: EntryKind::Assistant, title, body: token });
     }
 
+    // Single choke point for transcript writes: everything is sanitized here
+    // so no caller can push raw escape sequences into the terminal.
     fn push_entry<T: AsRef<str>, U: AsRef<str>>(&mut self, kind: EntryKind, title: T, body: U) {
         self.transcript.push(TranscriptEntry {
             kind,
@@ -781,6 +824,8 @@ impl App {
         if let Some(shell_command) = value.strip_prefix('!') {
             return self.handle_shell_request(shell_command.trim().to_owned()).await;
         }
+        // Snapshot the draft so a failed run start can restore exactly what
+        // the user had typed and attached.
         let draft_before_submit = self.current_draft_state();
         let attachments = self.prompt_attachments();
         self.create_undo_checkpoint("send").await?;
@@ -876,6 +921,8 @@ impl App {
             self.status_line = format!("Unknown slash command: /{raw_name}");
             return Ok(false);
         };
+        // While a run streams, only read-only and run-control commands stay
+        // available; everything else would race the active run's state.
         if self.active_stream.is_some()
             && !matches!(name, "help" | "status" | "usage" | "queue" | "interrupt")
         {
@@ -1418,6 +1465,8 @@ impl App {
                 Ok(())
             }
             Err(error) => {
+                // Undo checkpoints are best-effort: a checkpoint failure must
+                // never block sending the prompt itself.
                 self.ux_metrics.record(TuiUxMetricKey::Errors);
                 self.status_line =
                     sanitize_terminal_text(format!("Undo checkpoint skipped: {error}").as_str());
@@ -1455,6 +1504,8 @@ impl App {
         let trimmed = arguments.join(" ");
         let mut parts = trimmed.split_whitespace();
         let first = parts.next().unwrap_or_default();
+        // `/interrupt [soft|force] [redirect text]`: without an explicit mode
+        // token, everything is treated as a soft-interrupt redirect prompt.
         let (mode, redirect_prompt) = if matches!(first, "soft" | "force") {
             (first, parts.collect::<Vec<_>>().join(" ").trim().to_owned())
         } else {
@@ -1641,12 +1692,9 @@ impl App {
     }
 
     async fn queue_follow_up(&mut self, queued_text: Option<String>) -> Result<()> {
-        let text = match queued_text {
-            Some(text) => text,
-            None => {
-                self.status_line = "Usage: /queue <follow-up text>".to_owned();
-                return Ok(());
-            }
+        let Some(text) = queued_text else {
+            self.status_line = "Usage: /queue <follow-up text>".to_owned();
+            return Ok(());
         };
         let Some(run_id) = self.active_stream.as_ref().map(|stream| stream.run_id().to_owned())
         else {
@@ -1927,6 +1975,9 @@ impl App {
             .context("active TUI session is missing a session_id")
     }
 
+    // Rebuilds palette state from the composer text. The `dismissed` flag
+    // keeps an Esc-closed palette shut until the input stops being a slash
+    // command or the next edit re-arms it.
     fn sync_slash_palette(&mut self) {
         if !self.composer.text().trim_start().starts_with('/') {
             self.pending_slash_palette = None;
@@ -1950,6 +2001,7 @@ impl App {
             .as_ref()
             .map(|palette| palette.suggestions.len())
             .unwrap_or(0);
+        // Clamp the selection: rebuilding can shrink the suggestion list.
         self.slash_palette_selected =
             self.slash_palette_selected.min(suggestion_count.saturating_sub(1));
     }
@@ -1979,6 +2031,9 @@ impl App {
             .map(|suggestion| suggestion.replacement.clone())
     }
 
+    // Enter while the palette shows suggestions accepts the selected row;
+    // read-only bare commands then execute immediately, anything else waits
+    // in the composer for arguments. Without suggestions, Enter submits.
     async fn submit_or_accept_slash_palette(&mut self) -> Result<()> {
         if let Some(replacement) = self.selected_slash_suggestion_replacement() {
             self.apply_selected_slash_suggestion(true);
@@ -1995,6 +2050,8 @@ impl App {
         self.refresh_session_catalog().await?;
         self.refresh_objective_catalog().await?;
         self.refresh_auth_profile_catalog().await?;
+        // The browser catalog is optional: browserd being disabled or down
+        // must not break chat, so its known failure modes only clear it.
         if let Err(error) = self.refresh_browser_catalog().await {
             if status::browser_catalog_optional_error(&error) {
                 self.clear_browser_catalog();
@@ -3224,7 +3281,9 @@ impl App {
                     items,
                 }
             }
-            PickerKind::Session => unreachable!(),
+            PickerKind::Session => {
+                unreachable!("session pickers are routed to open_session_history_picker above")
+            }
             PickerKind::Model => {
                 let models = self.runtime.list_models(None)?;
                 let current_model = self
@@ -3490,6 +3549,8 @@ impl App {
     }
 }
 
+// Routes a key event to the handler for the current mode. Returns `Ok(true)`
+// only for Ctrl+C, which exits immediately regardless of mode.
 async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
     if !should_handle_key_event(key) {
         return Ok(false);
@@ -3511,10 +3572,15 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
     Ok(false)
 }
 
+// Windows terminals deliver Release events too; only Press/Repeat may act,
+// otherwise every keystroke would be applied twice.
 fn should_handle_key_event(key: KeyEvent) -> bool {
     matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
 
+// Whether a Char key should insert text. CONTROL+ALT together is accepted
+// because Windows terminals report AltGr that way (e.g. backslash on
+// non-US layouts); lone CONTROL or ALT stay reserved for shortcuts.
 fn is_text_input_modifier(modifiers: KeyModifiers) -> bool {
     if modifiers.intersects(KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META) {
         return false;
@@ -3523,6 +3589,8 @@ fn is_text_input_modifier(modifiers: KeyModifiers) -> bool {
     without_shift.is_empty() || without_shift == (KeyModifiers::CONTROL | KeyModifiers::ALT)
 }
 
+// Only argument-free, read-only commands are safe to auto-run when accepted
+// from the palette; mutating commands must wait for an explicit Enter.
 fn slash_replacement_is_bare_command(replacement: &str) -> bool {
     let trimmed = replacement.trim();
     let Some(command) = trimmed.strip_prefix('/') else {
@@ -3535,15 +3603,18 @@ fn slash_replacement_is_bare_command(replacement: &str) -> bool {
     parts.next().is_none() && matches!(name, "help" | "status" | "usage")
 }
 
+// Chat-mode key dispatch. Arm order matters: palette interactions and
+// shortcut chords are matched before the catch-all text-insertion arm.
 async fn handle_chat_key(app: &mut App, key: KeyEvent) -> Result<()> {
     match key.code {
         KeyCode::Tab => {
+            // Tab accepts the palette selection when one is showing;
+            // otherwise it toggles focus between transcript and composer.
             if matches!(app.focus, Focus::Input)
                 && app
                     .pending_slash_palette
                     .as_ref()
-                    .map(|palette| !palette.suggestions.is_empty())
-                    .unwrap_or(false)
+                    .is_some_and(|palette| !palette.suggestions.is_empty())
             {
                 app.apply_selected_slash_suggestion(true);
             } else {
@@ -3566,6 +3637,10 @@ async fn handle_chat_key(app: &mut App, key: KeyEvent) -> Result<()> {
             app.composer.clear_selection();
             app.status_line = "Composer selection cleared".to_owned();
         }
+        // AIDEV-NOTE: this arm matches before the text-insertion arm below,
+        // so a literal '?' can never be typed into the composer (it always
+        // opens Help). Guarding it like the 'q' arm (e.g. only when the
+        // composer is empty) is a behavior change left to a follow-up.
         KeyCode::Char('?') => app.mode = Mode::Help,
         KeyCode::F(2) => app.open_picker(PickerKind::Agent).await?,
         KeyCode::F(3) => app.open_picker(PickerKind::Session).await?,
@@ -3635,6 +3710,8 @@ async fn handle_chat_key(app: &mut App, key: KeyEvent) -> Result<()> {
         {
             app.composer.select_all();
         }
+        // Bare 'q' exits only from an empty composer so drafts containing
+        // the letter q keep working; Ctrl+C remains the universal exit.
         KeyCode::Char('q') if key.modifiers.is_empty() && app.composer.is_empty() => {
             app.status_line = "__exit__".to_owned();
         }
@@ -3644,6 +3721,8 @@ async fn handle_chat_key(app: &mut App, key: KeyEvent) -> Result<()> {
             app.composer.insert_text(ch.to_string().as_str());
             app.sync_composer_after_edit();
         }
+        // Up/Down priority in the composer: palette navigation first, then
+        // multiline cursor movement; in the transcript they scroll.
         KeyCode::Up => {
             if matches!(app.focus, Focus::Input) && app.pending_slash_palette.is_some() {
                 app.slash_palette_selected = app.slash_palette_selected.saturating_sub(1);
@@ -3698,6 +3777,8 @@ async fn handle_chat_key(app: &mut App, key: KeyEvent) -> Result<()> {
     Ok(())
 }
 
+// Approval overlay: y/Enter approves once, n/Esc denies; the decision is
+// sent back over the active run stream when one is still open.
 async fn handle_approval_key(app: &mut App, key: KeyEvent) -> Result<()> {
     let Some(approval) = app.pending_approval.clone() else {
         app.close_overlay();
@@ -3769,9 +3850,13 @@ async fn handle_approval_key(app: &mut App, key: KeyEvent) -> Result<()> {
     Ok(())
 }
 
+// Shell opt-in overlay: confirming enables the local shell for this TUI
+// session and replays the command that triggered the prompt, if any.
 async fn handle_shell_confirm_key(app: &mut App, key: KeyEvent) -> Result<()> {
     match key.code {
         KeyCode::Char('y') | KeyCode::Enter => {
+            // Re-check the strict posture at confirmation time; it may have
+            // changed since the prompt opened.
             if strict_profile_blocks_local_shell() {
                 app.pending_shell_command = None;
                 app.close_overlay();

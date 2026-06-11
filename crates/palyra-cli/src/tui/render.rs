@@ -1,5 +1,12 @@
+//! Frame layout and top-level widget rendering for the TUI.
+//!
+//! Splits each frame into header, transcript, composer, and footer, then
+//! overlays the popup matching the current `Mode`. Pure drawing only: all
+//! state lives on `App` in the parent module.
+
 use super::*;
 
+/// Renders one full frame: base layout first, then the active popup overlay.
 pub(super) fn render(frame: &mut Frame<'_>, app: &App) {
     let composer_view =
         app.composer.render(MAX_COMPOSER_VISIBLE_LINES, matches!(app.focus, Focus::Input));
@@ -24,6 +31,7 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &App) {
     render_input(frame, input, app, &composer_view);
     render_footer(frame, footer, app);
 
+    // Popups draw after the base layout so they sit on top of it.
     match app.mode {
         Mode::Help => render_help_popup(frame, frame.area(), app),
         Mode::StatusDetail => render_status_detail_popup(frame, frame.area(), app),
@@ -39,6 +47,8 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &App) {
     }
 }
 
+/// Renders the three header rows: connection/session, agent/model/status,
+/// and the active profile banner.
 pub(super) fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let profile = app::current_root_context().and_then(|context| context.active_profile_context());
     let rows = Layout::default()
@@ -70,13 +80,18 @@ pub(super) fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(profile_line), banner);
 }
 
+// Width consumed by the literal "Agent "/"Model "/"Status " labels.
 const HEADER_STATUS_FIXED_WIDTH: usize = "Agent ".len() + "  Model ".len() + "  Status ".len();
 
+// Header status row, either fully labelled or collapsed to the status text
+// when the terminal is too narrow for the labels.
 enum HeaderStatusFields {
     StatusOnly(String),
     Fields { agent: String, model: String, status: String },
 }
 
+// Fits agent/model/status into `width` columns, truncating fields only when
+// the full line does not fit.
 fn header_status_fields(
     agent: &str,
     model: &str,
@@ -94,6 +109,8 @@ fn header_status_fields(
         return HeaderStatusFields::Fields { agent, model, status };
     }
 
+    // Reserve up to 16 columns for the status first (it carries the most
+    // recent feedback), then split what remains between agent and model.
     let value_budget = width - HEADER_STATUS_FIXED_WIDTH;
     let status_floor = value_budget.min(16);
     let shared_budget = value_budget.saturating_sub(status_floor);
@@ -137,6 +154,8 @@ fn header_status_line(agent: &str, model: &str, status: &str, width: usize) -> L
     }
 }
 
+/// Renders the transcript pane, honoring the tool/thinking/verbose filters
+/// and the current scroll offset.
 pub(super) fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut lines = Vec::new();
     for entry in &app.transcript {
@@ -172,6 +191,8 @@ pub(super) fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(transcript, area);
 }
 
+/// Renders the composer pane: budget row, optional attachment preview, the
+/// composer viewport, and an optional budget warning.
 pub(super) fn render_input(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -268,6 +289,8 @@ pub(super) fn render_input(
     }
     frame.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), inner);
     if matches!(app.focus, Focus::Input) && matches!(app.mode, Mode::Chat) {
+        // Offset the terminal cursor past the budget row (+1) and the
+        // attachment preview row when present, into the composer viewport.
         let cursor_y = inner
             .y
             .saturating_add(1)
@@ -277,6 +300,7 @@ pub(super) fn render_input(
     }
 }
 
+/// Renders the footer: status bar, shortcut line, and optional tip row.
 pub(super) fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -298,12 +322,15 @@ pub(super) fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 }
 
+/// Whether the strict profile posture forbids the local-shell escape hatch.
 pub(super) fn strict_profile_blocks_local_shell() -> bool {
-    app::current_root_context()
-        .map(|context| context.strict_profile_mode() && !context.allow_strict_profile_actions)
-        .unwrap_or(false)
+    app::current_root_context().is_some_and(|context| {
+        context.strict_profile_mode() && !context.allow_strict_profile_actions
+    })
 }
 
+/// Computes the composer pane height: borders plus the budget row, viewport
+/// lines, and optional attachment/warning rows, clamped to 4..=10.
 pub(super) fn estimate_input_height(app: &App, composer_view: &TuiComposerView) -> u16 {
     let mut height = 2 + composer_view.lines.len() as u16 + 1;
     if !app.pending_attachments.is_empty() {
@@ -315,6 +342,8 @@ pub(super) fn estimate_input_height(app: &App, composer_view: &TuiComposerView) 
     height.clamp(4, 10)
 }
 
+/// Builds the single-line footer status bar, dropping trailing segments that
+/// do not fit into `width`.
 pub(super) fn compact_status_bar_line(app: &App, width: usize) -> String {
     let budget = app.context_budget_summary();
     let context_fill = (budget.ratio * 100.0).round().clamp(0.0, 999.0);
@@ -353,6 +382,8 @@ pub(super) fn compact_status_bar_line(app: &App, width: usize) -> String {
     fit_segments_to_width(width, segments)
 }
 
+/// Builds the footer shortcut line, swapping in palette navigation hints
+/// while the slash palette is open.
 pub(super) fn compact_shortcut_line(app: &App, width: usize) -> String {
     let slash_hint =
         if app.pending_slash_palette.is_some() { "slash Up/Down + Tab" } else { "/ commands" };
@@ -366,6 +397,8 @@ fn compact_shortcut_line_for_hint(slash_hint: &str, width: usize) -> String {
     truncate_text(line, width.max(8))
 }
 
+/// Picks the most relevant contextual tip, ordered by urgency: pending
+/// approval, queued attachments, session family, rollback, then defaults.
 pub(super) fn discoverability_tip_line(app: &App, width: usize) -> String {
     let raw = if app.pending_approval.is_some() {
         "Tip: a pending approval is waiting; use y / n or Esc to resolve it."
@@ -374,8 +407,7 @@ pub(super) fn discoverability_tip_line(app: &App, width: usize) -> String {
     } else if app
         .current_session_catalog
         .as_ref()
-        .map(|session| session.family.family_size > 1)
-        .unwrap_or(false)
+        .is_some_and(|session| session.family.family_size > 1)
     {
         "Tip: use /resume parent, /resume sibling, /resume child, or /history <family> to move around the current title family."
     } else if !app.slash_entity_catalog.workspace_checkpoints.is_empty() {
@@ -388,8 +420,11 @@ pub(super) fn discoverability_tip_line(app: &App, width: usize) -> String {
     truncate_text(raw.to_owned(), width.max(8))
 }
 
+/// Duration of the latest run in milliseconds, or `None` when no run started.
 pub(super) fn current_run_duration_ms(app: &App) -> Option<i64> {
     let started_at = app.session_runtime.latest_started_at_unix_ms?;
+    // While a run streams, measure against the wall clock so the footer
+    // ticks live; afterwards use the recorded completion timestamp.
     let finished_at = if app.active_stream.is_some() {
         now_unix_ms_i64().ok()
     } else {
@@ -398,6 +433,7 @@ pub(super) fn current_run_duration_ms(app: &App) -> Option<i64> {
     Some(finished_at.unwrap_or(started_at) - started_at)
 }
 
+/// Classifies the gateway endpoint as `local` (loopback) or `remote`.
 pub(super) fn connection_posture_label(grpc_url: &str) -> &'static str {
     let normalized = grpc_url.to_ascii_lowercase();
     if normalized.contains("127.0.0.1")
@@ -410,6 +446,8 @@ pub(super) fn connection_posture_label(grpc_url: &str) -> &'static str {
     }
 }
 
+/// Reduces the gateway URL to a `host:port` label (IPv6 hosts bracketed),
+/// falling back to the sanitized raw value when it does not parse.
 pub(super) fn display_gateway_grpc_endpoint(grpc_url: &str) -> String {
     let sanitized = sanitize_terminal_text(grpc_url);
     let Ok(parsed) = reqwest::Url::parse(sanitized.as_str()) else {
@@ -426,6 +464,8 @@ pub(super) fn display_gateway_grpc_endpoint(grpc_url: &str) -> String {
     parsed.port_or_known_default().map(|port| format!("{host_label}:{port}")).unwrap_or(host_label)
 }
 
+/// Formats the profile banner line, with a `direct` fallback when no CLI
+/// profile is active.
 pub(super) fn profile_header_summary(profile: Option<&app::ActiveProfileContext>) -> String {
     let (label, environment, risk_level, strict_mode) = match profile {
         Some(profile) => (
@@ -445,6 +485,8 @@ pub(super) fn profile_header_summary(profile: Option<&app::ActiveProfileContext>
     )
 }
 
+/// Joins segments with two-space separators, stopping at the first segment
+/// that would overflow `width` so leading segments keep priority.
 pub(super) fn fit_segments_to_width(width: usize, segments: Vec<String>) -> String {
     let mut line = String::new();
     for segment in segments.into_iter().filter(|segment| !segment.trim().is_empty()) {

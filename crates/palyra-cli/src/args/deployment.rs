@@ -1,3 +1,7 @@
+//! Arguments for `palyra deployment`: profile listing, manifests, preflights,
+//! deploy recipes, upgrade smoke checks, promotion checks, and rollback plans.
+//! Help text is pinned by snapshot tests; see the doc-comment rules in `mod.rs`.
+
 use clap::{Subcommand, ValueEnum};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

@@ -1,3 +1,7 @@
+//! Arguments for `palyra flows`: inspecting and steering durable orchestration
+//! flows (pause/resume/cancel plus per-step retry/skip/compensate). Help text
+//! is pinned by snapshot tests; see the doc-comment rules in `mod.rs`.
+
 use clap::{Subcommand, ValueEnum};
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -92,6 +96,8 @@ pub enum FlowStateArg {
 }
 
 impl FlowStateArg {
+    /// Returns the control-plane state identifier (snake_case, unlike the
+    /// kebab-case CLI value).
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {

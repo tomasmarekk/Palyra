@@ -1,3 +1,9 @@
+//! Arguments for `palyra pairing`: pairing-code minting, request listing, and
+//! the approval workflow for device trust bootstrap. Pairing proofs are read
+//! from stdin by default; passing one on argv requires the explicit
+//! insecure-arg acknowledgement flag. Help text is pinned by snapshot tests;
+//! see the doc-comment rules in `mod.rs`.
+
 use clap::{Subcommand, ValueEnum};
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -87,6 +93,7 @@ pub enum PairingStateArg {
 }
 
 impl PairingMethodArg {
+    /// Returns the pairing contract identifier for this method.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -97,6 +104,8 @@ impl PairingMethodArg {
 }
 
 impl PairingStateArg {
+    /// Returns the pairing contract identifier (snake_case, unlike the
+    /// kebab-case CLI value).
     #[must_use]
     pub const fn as_contract_str(self) -> &'static str {
         match self {

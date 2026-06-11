@@ -1,3 +1,14 @@
+//! Clap argument surface for the `palyra` operator CLI: the root parser, global
+//! options, and the top-level `Command` tree that fans out into the per-family
+//! modules in this directory.
+//!
+//! AIDEV-NOTE: clap derive renders `///` doc comments on parser structs, fields,
+//! and variants as help text, and help output is pinned byte-for-byte by the
+//! `help_snapshots` and `cli_parity` test suites. Never add, change, or remove
+//! `///` docs on clap items anywhere under `args/`; use plain `//` comments
+//! instead. Defaults, value parsers, possible values, and the `*_AFTER_HELP`
+//! strings below are part of the same pinned contract.
+
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
@@ -850,6 +861,8 @@ pub enum Command {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    // Hidden compatibility spelling of `dashboard`; both variants must keep
+    // identical fields so either form resolves the same way.
     #[command(name = "dashboard-url", hide = true)]
     DashboardUrl {
         #[arg(long)]

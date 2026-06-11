@@ -1,3 +1,8 @@
+//! Arguments for `palyra sessions`: chat session listing and history, session
+//! resolution, queue control, retry/branch, transcript search and export,
+//! compaction, checkpoints, and background task management. Help text is pinned
+//! by snapshot tests; see the doc-comment rules in `mod.rs`.
+
 use clap::{ArgGroup, Subcommand};
 
 use super::AgentApprovalModeArg;

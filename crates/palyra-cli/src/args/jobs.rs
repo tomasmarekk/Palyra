@@ -1,3 +1,8 @@
+//! Arguments for `palyra jobs`: durable long-running tool job inspection and
+//! control (tail, cancel/drain/resume/retry, attach/release, and stale/expired
+//! sweeps). Help text is pinned by snapshot tests; see the doc-comment rules in
+//! `mod.rs`.
+
 use clap::Subcommand;
 
 #[derive(Debug, Clone, Subcommand, PartialEq, Eq)]

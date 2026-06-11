@@ -1,6 +1,13 @@
+//! Shared rendering and formatting helpers for the TUI.
+//!
+//! Hosts popup renderers, terminal-output sanitization, token/size/duration
+//! formatting, JSON pointer readers, small argument parsers, and the local
+//! shell runner used by the parent `tui` module and its render path.
+
 use super::slash_palette::{TuiSlashPreview, TuiSlashSuggestion};
 use super::*;
 
+/// Parsed form of a `/compact` invocation.
 #[derive(Debug, Default)]
 pub(super) struct TuiCompactionCommand {
     pub(super) apply: bool,
@@ -9,6 +16,11 @@ pub(super) struct TuiCompactionCommand {
     pub(super) reject_candidate_ids: Vec<String>,
 }
 
+/// Parses `/compact` arguments.
+///
+/// # Errors
+/// Returns an error for unknown arguments, a missing candidate id after
+/// `--accept`/`--reject`, or `history` combined with mutating flags.
 pub(super) fn parse_tui_compaction_arguments(arguments: &[String]) -> Result<TuiCompactionCommand> {
     let mut command = TuiCompactionCommand::default();
     let mut index = 0usize;
@@ -49,10 +61,12 @@ pub(super) fn parse_tui_compaction_arguments(arguments: &[String]) -> Result<Tui
     Ok(command)
 }
 
+/// Parses a JSON document embedded in a string field, `None` when malformed.
 pub(super) fn parse_tui_json_string(value: &str) -> Option<serde_json::Value> {
     serde_json::from_str::<serde_json::Value>(value).ok()
 }
 
+/// Rough token estimate for budget display, using ~4 bytes per token.
 pub(super) fn estimate_text_tokens(text: &str) -> u64 {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -61,6 +75,7 @@ pub(super) fn estimate_text_tokens(text: &str) -> u64 {
     (trimmed.len() as u64).div_ceil(4)
 }
 
+/// Formats a token count compactly, e.g. `512 tok`, `1.5k tok`, `12k tok`.
 pub(super) fn format_approx_tokens(value: u64) -> String {
     if value >= 1_000 {
         if value >= 10_000 {
@@ -73,6 +88,7 @@ pub(super) fn format_approx_tokens(value: u64) -> String {
     }
 }
 
+/// Formats a byte count with binary units, e.g. `1.5 MiB`.
 pub(super) fn format_size_bytes(value: u64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = KIB * 1024.0;
@@ -89,6 +105,7 @@ pub(super) fn format_size_bytes(value: u64) -> String {
     }
 }
 
+/// Formats a millisecond duration, e.g. `850ms`, `2.5s`, `1m 05s`.
 pub(super) fn format_duration_ms(value: i64) -> String {
     let value = value.max(0);
     if value >= 60_000 {
@@ -102,6 +119,7 @@ pub(super) fn format_duration_ms(value: i64) -> String {
     }
 }
 
+/// Formats a USD cost with extra precision below one dollar.
 pub(super) fn format_cost_usd(value: f64) -> String {
     if value >= 1.0 {
         format!("${value:.2}")
@@ -110,6 +128,8 @@ pub(super) fn format_cost_usd(value: f64) -> String {
     }
 }
 
+/// Guesses an upload MIME type from the file extension, defaulting to
+/// `application/octet-stream`.
 pub(super) fn guess_content_type(path: &Path) -> &'static str {
     match path
         .extension()
@@ -138,6 +158,7 @@ pub(super) fn guess_content_type(path: &Path) -> &'static str {
     }
 }
 
+/// Buckets a MIME type into the coarse attachment kind shown in the UI.
 pub(super) fn attachment_kind_label(content_type: &str) -> &'static str {
     if content_type.starts_with("image/") {
         "image"
@@ -150,6 +171,7 @@ pub(super) fn attachment_kind_label(content_type: &str) -> &'static str {
     }
 }
 
+/// Maps an attachment kind label onto the protobuf enum.
 pub(super) fn attachment_kind_to_proto(
     kind: &str,
 ) -> common_v1::message_attachment::AttachmentKind {
@@ -162,14 +184,17 @@ pub(super) fn attachment_kind_to_proto(
     }
 }
 
+/// Reads an i64 at a JSON pointer, `None` when absent or mistyped.
 pub(super) fn read_json_optional_i64(value: &serde_json::Value, pointer: &str) -> Option<i64> {
     value.pointer(pointer).and_then(serde_json::Value::as_i64)
 }
 
+/// Reads a u64 at a JSON pointer, defaulting to zero when absent.
 pub(super) fn read_json_u64(value: &serde_json::Value, pointer: &str) -> u64 {
     value.pointer(pointer).and_then(serde_json::Value::as_u64).unwrap_or_default()
 }
 
+/// Reads a numeric value at a JSON pointer as f64, accepting integer JSON.
 pub(super) fn read_json_f64(value: &serde_json::Value, pointer: &str) -> Option<f64> {
     value.pointer(pointer).and_then(|entry| {
         entry
@@ -179,6 +204,10 @@ pub(super) fn read_json_f64(value: &serde_json::Value, pointer: &str) -> Option<
     })
 }
 
+/// Whether a background-task state string counts as still running.
+///
+/// New server-side states default to active so in-flight work is never
+/// hidden from the counters.
 pub(super) fn background_task_is_active(state: &str) -> bool {
     !matches!(
         state.trim().to_ascii_lowercase().as_str(),
@@ -186,6 +215,7 @@ pub(super) fn background_task_is_active(state: &str) -> bool {
     )
 }
 
+/// Flattens a control-plane session catalog record into the TUI record shape.
 pub(super) fn map_session_catalog_record(session: SessionCatalogRecord) -> TuiSlashSessionRecord {
     TuiSlashSessionRecord {
         session_id: session.session_id,
@@ -217,12 +247,18 @@ pub(super) fn map_session_catalog_record(session: SessionCatalogRecord) -> TuiSl
     }
 }
 
+/// Parsed form of `/objective create <kind> <name> :: <prompt>`.
 pub(super) struct TuiObjectiveCreateSpec {
     pub(super) kind: &'static str,
     pub(super) name: String,
     pub(super) prompt: String,
 }
 
+/// Resolves the objective id to act on: explicit argument first, then the
+/// currently selected objective.
+///
+/// # Errors
+/// Returns an error when neither source provides an id.
 pub(super) fn resolve_tui_objective_reference(
     explicit: Option<String>,
     selected: Option<&String>,
@@ -232,6 +268,12 @@ pub(super) fn resolve_tui_objective_reference(
         .context("Select an objective first or pass an explicit objective_id")
 }
 
+/// Parses an objective create spec; `fixed_kind` skips the kind token for
+/// kind-specific commands like `/heartbeat create`.
+///
+/// # Errors
+/// Returns a usage error when the `::` separator, kind, name, or prompt is
+/// missing or empty.
 pub(super) fn parse_tui_objective_create_spec(
     fixed_kind: Option<&'static str>,
     arguments: &[String],
@@ -259,6 +301,10 @@ pub(super) fn parse_tui_objective_create_spec(
     Ok(TuiObjectiveCreateSpec { kind, name, prompt: prompt.to_owned() })
 }
 
+/// Normalizes an objective kind token to its canonical form.
+///
+/// # Errors
+/// Returns an error naming the accepted kinds when the token is unknown.
 pub(super) fn parse_tui_objective_kind(value: &str) -> Result<&'static str> {
     match value.to_ascii_lowercase().as_str() {
         "objective" => Ok("objective"),
@@ -271,6 +317,7 @@ pub(super) fn parse_tui_objective_kind(value: &str) -> Result<&'static str> {
     }
 }
 
+/// Renders the `?`/`/help` popup with commands, shortcuts, and examples.
 pub(super) fn render_help_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut lines = vec![Line::from("Slash commands")];
     for line in render_shared_chat_command_synopsis_lines(SharedChatCommandSurface::Tui, 84) {
@@ -325,6 +372,7 @@ pub(super) fn render_help_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
+/// Renders the `/status detail` popup.
 pub(super) fn render_status_detail_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let lines = status_detail_popup_lines(app.status_detail_summary().as_str());
     let popup_height = area.height.saturating_sub(2).min(lines.len() as u16 + 2).max(10);
@@ -343,6 +391,8 @@ fn status_detail_popup_lines(summary: &str) -> Vec<Line<'static>> {
     sanitize_terminal_text(summary).lines().map(|line| Line::from(line.to_owned())).collect()
 }
 
+/// Percent-encodes everything outside the RFC 3986 unreserved set, for URL
+/// path segments and query values.
 pub(super) fn percent_encode_component(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.as_bytes() {
@@ -359,6 +409,7 @@ pub(super) fn percent_encode_component(value: &str) -> String {
     encoded
 }
 
+/// Renders the tool-approval popup for the pending approval request.
 pub(super) fn render_approval_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let popup = centered_rect(88, 14, area);
     let body = if let Some(approval) = app.pending_approval.as_ref() {
@@ -406,6 +457,7 @@ pub(super) fn render_approval_popup(frame: &mut Frame<'_>, area: Rect, app: &App
     );
 }
 
+/// Maps the protobuf approval risk level to its display label.
 pub(super) fn approval_risk_level_to_text(raw: i32) -> &'static str {
     match common_v1::ApprovalRiskLevel::try_from(raw)
         .unwrap_or(common_v1::ApprovalRiskLevel::Unspecified)
@@ -418,6 +470,7 @@ pub(super) fn approval_risk_level_to_text(raw: i32) -> &'static str {
     }
 }
 
+/// Renders the agent/session/model picker popup.
 pub(super) fn render_picker_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let popup = centered_rect(88, 18, area);
     frame.render_widget(Clear, popup);
@@ -445,6 +498,7 @@ pub(super) fn render_picker_popup(frame: &mut Frame<'_>, area: Rect, app: &App) 
     }
 }
 
+/// Renders the slash palette popup: selection preview, then suggestion rows.
 pub(super) fn render_slash_palette_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(palette) = app.pending_slash_palette.as_ref() else {
         return;
@@ -519,6 +573,7 @@ fn slash_palette_suggestion_lines(
     ]
 }
 
+/// Renders the F5 settings popup with the current toggle states.
 pub(super) fn render_settings_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let popup = centered_rect(56, 12, area);
     let items = settings_items();
@@ -550,6 +605,7 @@ pub(super) fn render_settings_popup(frame: &mut Frame<'_>, area: Rect, app: &App
     );
 }
 
+/// Renders the local-shell opt-in confirmation popup.
 pub(super) fn render_shell_confirm_popup(frame: &mut Frame<'_>, area: Rect) {
     let popup = centered_rect(64, 8, area);
     frame.render_widget(Clear, popup);
@@ -566,6 +622,7 @@ pub(super) fn render_shell_confirm_popup(frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
+/// Centers a popup rectangle of at most `width` x `height` inside `area`.
 pub(super) fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let horizontal = Layout::default()
         .direction(Direction::Horizontal)
@@ -586,6 +643,7 @@ pub(super) fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     vertical[1]
 }
 
+/// Settings popup rows in display order.
 pub(super) fn settings_items() -> [SettingsItem; 4] {
     [
         SettingsItem::ShowTools,
@@ -595,6 +653,7 @@ pub(super) fn settings_items() -> [SettingsItem; 4] {
     ]
 }
 
+/// Transcript color per entry kind.
 pub(super) fn entry_style(kind: &EntryKind) -> Style {
     match kind {
         EntryKind::User => Style::default().fg(Color::Cyan),
@@ -606,6 +665,8 @@ pub(super) fn entry_style(kind: &EntryKind) -> Style {
     }
 }
 
+/// Best human label for a session: title, then label, then key, then a
+/// generic fallback.
 pub(super) fn display_session_identity(session: &gateway_v1::SessionSummary) -> String {
     if !session.title.trim().is_empty() {
         return session.title.clone();
@@ -623,6 +684,7 @@ pub(super) fn display_session_identity(session: &gateway_v1::SessionSummary) -> 
     }
 }
 
+/// Trims `value`, returning `None` when nothing remains.
 pub(super) fn normalize_owned_optional_text(value: String) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -632,10 +694,15 @@ pub(super) fn normalize_owned_optional_text(value: String) -> Option<String> {
     }
 }
 
+/// Shortens an identifier for display using the shared redaction helper.
 pub(super) fn shorten_id(value: &str) -> String {
     redacted_identifier_for_output(value)
 }
 
+/// Parses an on/off/toggle argument; `None` means toggle `current`.
+///
+/// # Errors
+/// Returns an error for values outside on/true/yes, off/false/no, toggle.
 pub(super) fn parse_toggle(value: Option<&str>, current: bool) -> Result<bool> {
     match value.unwrap_or("toggle") {
         "toggle" => Ok(!current),
@@ -645,18 +712,22 @@ pub(super) fn parse_toggle(value: Option<&str>, current: bool) -> Result<bool> {
     }
 }
 
+/// Whether a quick-control argument asks to clear the session override.
 pub(super) fn quick_control_reset_requested(value: &str) -> bool {
     matches!(value.trim().to_ascii_lowercase().as_str(), "default" | "reset" | "inherit")
 }
 
+/// Cheap shape check for a 26-character ULID-like identifier.
 pub(super) fn looks_like_canonical_ulid(value: &str) -> bool {
     value.len() == 26 && value.chars().all(|ch| ch.is_ascii_alphanumeric())
 }
 
+/// Case-insensitive equality that never matches an empty candidate.
 pub(super) fn session_reference_equals(candidate: &str, reference: &str) -> bool {
     !candidate.trim().is_empty() && candidate.eq_ignore_ascii_case(reference)
 }
 
+/// Whether `reference` names this session by id, key, title, or root title.
 pub(super) fn session_reference_matches(session: &TuiSlashSessionRecord, reference: &str) -> bool {
     session_reference_equals(session.session_id.as_str(), reference)
         || session_reference_equals(session.session_key.as_str(), reference)
@@ -664,6 +735,7 @@ pub(super) fn session_reference_matches(session: &TuiSlashSessionRecord, referen
         || session_reference_equals(session.root_title.as_str(), reference)
 }
 
+/// Human-readable label for a session branch state.
 pub(super) fn describe_branch_state_label(branch_state: &str) -> String {
     match branch_state {
         "root" => "root".to_owned(),
@@ -674,6 +746,7 @@ pub(super) fn describe_branch_state_label(branch_state: &str) -> String {
     }
 }
 
+/// Maps the protobuf agent resolution source to its display label.
 pub(super) fn agent_resolution_source_label(raw: i32) -> &'static str {
     match gateway_v1::AgentResolutionSource::try_from(raw)
         .unwrap_or(gateway_v1::AgentResolutionSource::Unspecified)
@@ -685,6 +758,11 @@ pub(super) fn agent_resolution_source_label(raw: i32) -> &'static str {
     }
 }
 
+/// Runs an opted-in `!` command via the platform shell (`ComSpec` on Windows,
+/// `sh -lc` elsewhere) on a blocking worker, capturing truncated output.
+///
+/// # Errors
+/// Returns an error when the shell cannot be spawned or the worker panics.
 pub(super) async fn run_local_shell(command: String) -> Result<ShellResult> {
     tokio::task::spawn_blocking(move || {
         #[cfg(windows)]
@@ -712,6 +790,7 @@ pub(super) async fn run_local_shell(command: String) -> Result<ShellResult> {
     .context("local shell worker failed")?
 }
 
+/// Truncates to `limit` characters, appending `...` when room allows.
 pub(super) fn truncate_text(value: String, limit: usize) -> String {
     if limit == 0 {
         return String::new();
@@ -727,6 +806,12 @@ pub(super) fn truncate_text(value: String, limit: usize) -> String {
     truncated
 }
 
+/// Neutralizes control characters in untrusted text before terminal display.
+///
+/// Model, tool, and server output may carry escape sequences (cursor moves,
+/// screen clears, OSC 52 clipboard writes); ESC and other control characters
+/// are rendered as visible placeholders so they cannot execute, while CR/LF
+/// variants collapse to plain newlines.
 pub(super) fn sanitize_terminal_text(value: &str) -> String {
     let mut sanitized = String::with_capacity(value.len());
     let mut just_saw_carriage_return = false;
@@ -761,6 +846,7 @@ pub(super) fn sanitize_terminal_text(value: &str) -> String {
     sanitized
 }
 
+/// Formats a shell result as an exit-code line plus stdout/stderr sections.
 pub(super) fn format_shell_result(result: &ShellResult) -> String {
     let mut body = format!(
         "exit_code={}\n",

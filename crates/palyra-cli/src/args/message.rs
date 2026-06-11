@@ -1,3 +1,7 @@
+//! Arguments for `palyra message`: routed channel messaging through a connector
+//! id (send, threads, read/search, edit/delete, reactions). Help text is pinned
+//! by snapshot tests; see the doc-comment rules in `mod.rs`.
+
 use clap::Subcommand;
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]

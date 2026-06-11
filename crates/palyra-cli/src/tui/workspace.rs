@@ -1,3 +1,9 @@
+//! `/workspace` slash-command handling for run workspace artifacts.
+//!
+//! Summarizes changed paths, previews or opens individual artifacts (with the
+//! resolved path confined to the agent workspace root), and builds web-console
+//! handoff links for richer inspection.
+
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -29,6 +35,11 @@ struct WorkspaceCommandRequest {
     run_id: Option<String>,
 }
 
+/// Executes a `/workspace` invocation against the resolved run id.
+///
+/// # Errors
+/// Returns an error when the arguments do not parse, no run id can be
+/// resolved, or the backing console API calls fail.
 pub(super) async fn handle_workspace_command(app: &mut App, arguments: Vec<String>) -> Result<()> {
     let request = parse_workspace_command(arguments.as_slice())?;
     let run_id = resolve_workspace_run_id(app, request.run_id.clone())
@@ -98,12 +109,11 @@ fn parse_workspace_command(arguments: &[String]) -> Result<WorkspaceCommandReque
         },
         "handoff" => WorkspaceCommandAction::Handoff {
             open_browser: open_browser
-                || positionals
-                    .get(1)
-                    .map(|value| value.eq_ignore_ascii_case("open"))
-                    .unwrap_or(false),
+                || positionals.get(1).is_some_and(|value| value.eq_ignore_ascii_case("open")),
         },
         _ => {
+            // A single unrecognized positional is treated as a run id so
+            // `/workspace <run-id>` works without an explicit --run flag.
             if run_id.is_none() && positionals.len() == 1 {
                 run_id = Some(positionals[0].clone());
                 WorkspaceCommandAction::Summary
@@ -118,6 +128,8 @@ fn parse_workspace_command(arguments: &[String]) -> Result<WorkspaceCommandReque
     Ok(WorkspaceCommandRequest { action, run_id })
 }
 
+// Resolution order: explicit argument, then the run started in this TUI
+// session, then the catalog's last run, then the gateway session summary.
 fn resolve_workspace_run_id(app: &App, explicit: Option<String>) -> Option<String> {
     explicit
         .and_then(|value| (!value.trim().is_empty()).then_some(value))
@@ -435,6 +447,7 @@ async fn resolve_workspace_artifact_id(
     Ok(read_json_string(&artifact, "/artifact_id"))
 }
 
+// Accepts a 1-based list index, an artifact id, or a display/storage path.
 fn resolve_workspace_artifact_value(
     artifacts: &[serde_json::Value],
     artifact_ref: &str,
@@ -453,18 +466,15 @@ fn resolve_workspace_artifact_value(
             artifact
                 .pointer("/artifact_id")
                 .and_then(serde_json::Value::as_str)
-                .map(|value| value.eq_ignore_ascii_case(trimmed))
-                .unwrap_or(false)
+                .is_some_and(|value| value.eq_ignore_ascii_case(trimmed))
                 || artifact
                     .pointer("/display_path")
                     .and_then(serde_json::Value::as_str)
-                    .map(|value| value.to_ascii_lowercase() == normalized)
-                    .unwrap_or(false)
+                    .is_some_and(|value| value.to_ascii_lowercase() == normalized)
                 || artifact
                     .pointer("/path")
                     .and_then(serde_json::Value::as_str)
-                    .map(|value| value.to_ascii_lowercase() == normalized)
-                    .unwrap_or(false)
+                    .is_some_and(|value| value.to_ascii_lowercase() == normalized)
         })
         .cloned()
 }
@@ -495,6 +505,8 @@ fn resolve_workspace_artifact_path(app: &App, artifact: &serde_json::Value) -> R
     let canonical_candidate = fs::canonicalize(candidate.as_path()).with_context(|| {
         format!("workspace path {} does not exist locally", candidate.display())
     })?;
+    // Canonicalizing both sides defeats `..`/symlink escapes: a server-supplied
+    // relative path must never open files outside the agent workspace root.
     if !canonical_candidate.starts_with(canonical_root.as_path()) {
         anyhow::bail!(
             "workspace artifact path escaped the configured workspace root: {}",
@@ -505,6 +517,11 @@ fn resolve_workspace_artifact_path(app: &App, artifact: &serde_json::Value) -> R
 }
 
 fn open_path_in_default_app(path: &Path) -> Result<()> {
+    // AIDEV-NOTE: explorer.exe commonly exits with code 1 even when it opens
+    // the target successfully, so the success() check below can report a
+    // spurious "failed to open" error on Windows although the file opened.
+    // Fixing this needs a behavior change (e.g. `cmd /C start` or treating
+    // explorer's exit code as advisory).
     #[cfg(target_os = "windows")]
     let mut commands = vec![{
         let mut command = Command::new("explorer");
@@ -542,6 +559,8 @@ fn build_console_handoff_url(path: &str) -> Result<String> {
     Ok(format!("{}{}", http.base_url.trim_end_matches('/'), path))
 }
 
+// Bounds inline previews to 28 lines of at most 160 chars so a large artifact
+// cannot flood the transcript.
 fn truncate_workspace_preview(value: &str) -> String {
     let bounded = value
         .lines()

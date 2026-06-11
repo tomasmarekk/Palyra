@@ -1,3 +1,7 @@
+//! Arguments for `palyra browser`: browserd lifecycle and setup, session,
+//! profile, and tab management, page actions, and local artifact transfers.
+//! Help text is pinned by snapshot tests; see the doc-comment rules in `mod.rs`.
+
 use clap::Subcommand;
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]

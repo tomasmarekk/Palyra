@@ -1,3 +1,6 @@
+//! Parser stability tests pinning profile and memory-learning argument shapes
+//! against accidental flag, default, or value-name changes.
+
 use clap::Parser;
 
 use super::*;

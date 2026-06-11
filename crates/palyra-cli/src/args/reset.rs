@@ -1,3 +1,8 @@
+//! Arguments for `palyra reset`: destructive local recovery with explicit scope
+//! selection. `--dry-run` and `--yes` are mutually exclusive so a preview can
+//! never double as confirmation. Help text is pinned by snapshot tests; see the
+//! doc-comment rules in `mod.rs`.
+
 use clap::{Args, ValueEnum};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

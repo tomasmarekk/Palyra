@@ -1,3 +1,9 @@
+//! Arguments for `palyra channels`: connector lifecycle and queue control plus
+//! the Discord and router subfamilies. Connector credentials are read from
+//! stdin or an interactive prompt; passing `--credential` on argv additionally
+//! requires the explicit insecure-arg acknowledgement flag. Help text is pinned
+//! by snapshot tests; see the doc-comment rules in `mod.rs`.
+
 use clap::{ArgGroup, Subcommand, ValueEnum};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

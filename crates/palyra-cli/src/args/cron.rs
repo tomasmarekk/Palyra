@@ -1,3 +1,8 @@
+//! Arguments for `palyra cron`: the schedule-only compatibility surface backed
+//! by unified routines. The schedule/concurrency/misfire enums defined here are
+//! shared with `routines.rs`, which is the first-class automation family.
+//! Help text is pinned by snapshot tests; see the doc-comment rules in `mod.rs`.
+
 use clap::{ArgGroup, Subcommand, ValueEnum};
 
 use super::routines::{

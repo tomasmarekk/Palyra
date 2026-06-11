@@ -1,3 +1,8 @@
+//! Arguments for `palyra agent`: one-off runs and interactive sessions, plus the
+//! `agent acp`/`agent acp-shim` compatibility entry points that reuse the
+//! bridge/shim structs from `acp.rs`. Help text is pinned by snapshot tests; see
+//! the doc-comment rules in `mod.rs`.
+
 use clap::{Subcommand, ValueEnum};
 
 use super::{AcpBridgeArgs, AcpShimArgs};

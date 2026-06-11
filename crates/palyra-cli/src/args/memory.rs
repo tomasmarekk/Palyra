@@ -1,3 +1,8 @@
+//! Arguments for `palyra memory`: durable memory items, indexing and drift
+//! reconciliation, recall and cross-surface search, curated workspace
+//! documents, and learning candidate review. Help text is pinned by snapshot
+//! tests; see the doc-comment rules in `mod.rs`.
+
 use clap::{Subcommand, ValueEnum};
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -369,6 +374,11 @@ pub enum MemoryWorkspaceCommand {
     },
     Pin {
         path: String,
+        // AIDEV-NOTE: `bool` with `default_value_t = true` derives clap's SetTrue
+        // action, so `--pinned` always parses as true and unpinning is currently
+        // unreachable from the CLI even though the handler forwards the value.
+        // Exposing false is a behavior change (ArgAction::Set or a --no-* flag)
+        // and would re-pin help snapshots.
         #[arg(long, default_value_t = true)]
         pinned: bool,
         #[arg(long)]

@@ -1,3 +1,9 @@
+//! Arguments for `palyra profile`: CLI connection profile lifecycle (create,
+//! clone, export/import, use, rename, delete) and environment selection.
+//! The value enums here serialize into the local profile registry, so their
+//! snake_case serde names are part of the on-disk format. Help text is pinned
+//! by snapshot tests; see the doc-comment rules in `mod.rs`.
+
 use clap::{Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 

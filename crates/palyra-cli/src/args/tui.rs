@@ -1,3 +1,7 @@
+//! Arguments for `palyra tui`: the terminal operator client, covering
+//! connection identity, session selection, and sensitive-tool opt-in. Help text
+//! is pinned by snapshot tests; see the doc-comment rules in `mod.rs`.
+
 use clap::Args;
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]

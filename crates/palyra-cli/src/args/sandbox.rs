@@ -1,3 +1,7 @@
+//! Arguments for `palyra sandbox`: listing and explaining the effective
+//! process-runner and WASM runtime isolation policy. Help text is pinned by
+//! snapshot tests; see the doc-comment rules in `mod.rs`.
+
 use clap::{Subcommand, ValueEnum};
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]

@@ -1,3 +1,7 @@
+//! Arguments for `palyra system`: runtime heartbeat, subsystem presence,
+//! operator insights, and system-event listing/emission. Help text is pinned by
+//! snapshot tests; see the doc-comment rules in `mod.rs`.
+
 use clap::{Subcommand, ValueEnum};
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]

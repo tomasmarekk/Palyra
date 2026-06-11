@@ -1,3 +1,10 @@
+//! Arguments for `palyra acp`: the ACP stdio bridge plus the legacy NDJSON shim.
+//!
+//! The connection and session-default structs here are also flattened into the
+//! `agent acp`/`agent acp-shim` aliases (`agent.rs`) and the MCP facade
+//! (`mcp.rs`), so every entry point parses identically. Help text is pinned by
+//! snapshot tests; see the doc-comment rules in `mod.rs`.
+
 use clap::{Args, Subcommand};
 
 #[derive(Debug, Clone, PartialEq, Eq, Args, Default)]
@@ -72,6 +79,9 @@ pub enum AcpSubcommand {
     },
 }
 
+// `palyra acp` is both the bridge invocation (top-level flags) and a subcommand
+// router (`acp shim`); the two command attributes make those forms mutually
+// exclusive instead of mixing bridge flags into the shim parse.
 #[derive(Debug, Clone, PartialEq, Eq, Args, Default)]
 #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 pub struct AcpCommand {

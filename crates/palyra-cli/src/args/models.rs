@@ -1,3 +1,8 @@
+//! Arguments for `palyra models`: model-provider status, catalog listing,
+//! connectivity tests, live discovery, routing explanation, and default chat or
+//! embeddings model selection. Help text is pinned by snapshot tests; see the
+//! doc-comment rules in `mod.rs`.
+
 use clap::Subcommand;
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]

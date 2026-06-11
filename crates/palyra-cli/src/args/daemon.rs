@@ -1,3 +1,8 @@
+//! Arguments for `palyra gateway` (compatibility alias `daemon`): runtime
+//! lifecycle and service management, health/probe/discovery, admin status,
+//! journal maintenance, run inspection, and dashboard URL resolution.
+//! Help text is pinned by snapshot tests; see the doc-comment rules in `mod.rs`.
+
 use clap::{Subcommand, ValueEnum};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

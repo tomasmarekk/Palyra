@@ -1,3 +1,10 @@
+//! Arguments for `palyra onboarding` (alias `onboard`) wizard runs and status.
+//!
+//! `WizardOverridesArg` and `SetupWizardOverridesArg` differ deliberately:
+//! `setup` exposes `--tls-scaffold` as a top-level flag, so its wizard override
+//! set omits that field to avoid a duplicate argument. Help text is pinned by
+//! snapshot tests; see the doc-comment rules in `mod.rs`.
+
 use clap::{Args, Subcommand, ValueEnum};
 
 use super::{DeploymentProfileArg, InitTlsScaffoldArg};

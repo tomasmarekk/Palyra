@@ -1,3 +1,9 @@
+//! Slash-command palette state and entity catalogs for the TUI composer.
+//!
+//! Resolves the typed `/command` against the shared chat-command registry and
+//! produces ranked suggestions plus a selection preview; per-command
+//! suggestion construction lives in the `builders` submodule.
+
 use serde_json::Value;
 
 use crate::shared_chat_commands::{
@@ -10,6 +16,7 @@ mod builders;
 
 use builders::*;
 
+/// Cached entity catalogs that feed slash-palette argument suggestions.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TuiSlashEntityCatalog {
     pub(crate) sessions: Vec<TuiSlashSessionRecord>,
@@ -22,6 +29,7 @@ pub(crate) struct TuiSlashEntityCatalog {
     pub(crate) workspace_checkpoints: Vec<TuiSlashWorkspaceCheckpointRecord>,
 }
 
+/// Family relation (parent, sibling, child) of a catalogued session.
 #[derive(Debug, Clone)]
 pub(crate) struct TuiSlashSessionRelative {
     pub(crate) session_id: String,
@@ -30,6 +38,7 @@ pub(crate) struct TuiSlashSessionRelative {
     pub(crate) relation: String,
 }
 
+/// Session catalog entry surfaced by `/resume`, `/history`, and recaps.
 #[derive(Debug, Clone)]
 pub(crate) struct TuiSlashSessionRecord {
     pub(crate) session_id: String,
@@ -50,6 +59,7 @@ pub(crate) struct TuiSlashSessionRecord {
     pub(crate) relatives: Vec<TuiSlashSessionRelative>,
 }
 
+/// Objective catalog entry surfaced by `/objective` suggestions.
 #[derive(Debug, Clone)]
 pub(crate) struct TuiSlashObjectiveRecord {
     pub(crate) objective_id: String,
@@ -58,6 +68,7 @@ pub(crate) struct TuiSlashObjectiveRecord {
     pub(crate) focus: String,
 }
 
+/// Auth profile catalog entry surfaced by `/profile` suggestions.
 #[derive(Debug, Clone)]
 pub(crate) struct TuiSlashAuthProfileRecord {
     pub(crate) profile_id: String,
@@ -66,6 +77,7 @@ pub(crate) struct TuiSlashAuthProfileRecord {
     pub(crate) scope_kind: String,
 }
 
+/// Browser profile catalog entry surfaced by `/browser` suggestions.
 #[derive(Debug, Clone)]
 pub(crate) struct TuiSlashBrowserProfileRecord {
     pub(crate) profile_id: String,
@@ -74,12 +86,14 @@ pub(crate) struct TuiSlashBrowserProfileRecord {
     pub(crate) private_profile: bool,
 }
 
+/// Browser session catalog entry surfaced by `/browser` suggestions.
 #[derive(Debug, Clone)]
 pub(crate) struct TuiSlashBrowserSessionRecord {
     pub(crate) session_id: String,
     pub(crate) title: String,
 }
 
+/// Conversation checkpoint entry used by `/checkpoint` and `/undo`.
 #[derive(Debug, Clone)]
 pub(crate) struct TuiSlashCheckpointRecord {
     pub(crate) checkpoint_id: String,
@@ -89,6 +103,7 @@ pub(crate) struct TuiSlashCheckpointRecord {
     pub(crate) tags: Vec<String>,
 }
 
+/// Workspace artifact entry used by `/workspace show|open` suggestions.
 #[derive(Debug, Clone)]
 pub(crate) struct TuiSlashWorkspaceArtifactRecord {
     pub(crate) artifact_id: String,
@@ -101,6 +116,7 @@ pub(crate) struct TuiSlashWorkspaceArtifactRecord {
     pub(crate) deleted: bool,
 }
 
+/// Workspace checkpoint entry used by `/rollback diff|restore` suggestions.
 #[derive(Debug, Clone)]
 pub(crate) struct TuiSlashWorkspaceCheckpointRecord {
     pub(crate) checkpoint_id: String,
@@ -114,6 +130,7 @@ pub(crate) struct TuiSlashWorkspaceCheckpointRecord {
     pub(crate) created_at_unix_ms: i64,
 }
 
+/// In-session interaction counters reported by `/usage`.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TuiUxMetrics {
     pub(crate) slash_commands: u64,
@@ -124,6 +141,7 @@ pub(crate) struct TuiUxMetrics {
     pub(crate) errors: u64,
 }
 
+/// Selector for the [`TuiUxMetrics`] counter to bump.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TuiUxMetricKey {
     SlashCommands,
@@ -135,6 +153,7 @@ pub(crate) enum TuiUxMetricKey {
 }
 
 impl TuiUxMetrics {
+    /// Increments the counter selected by `key`.
     pub(crate) fn record(&mut self, key: TuiUxMetricKey) {
         match key {
             TuiUxMetricKey::SlashCommands => self.slash_commands += 1,
@@ -147,6 +166,8 @@ impl TuiUxMetrics {
     }
 }
 
+/// One palette row; `replacement` is the full composer text to insert when
+/// the suggestion is accepted.
 #[derive(Debug, Clone)]
 pub(crate) struct TuiSlashSuggestion {
     pub(crate) title: String,
@@ -157,12 +178,14 @@ pub(crate) struct TuiSlashSuggestion {
     pub(crate) badge: String,
 }
 
+/// Current palette contents: the resolved command (if any) and its rows.
 #[derive(Debug, Clone)]
 pub(crate) struct TuiSlashPaletteState {
     pub(crate) active_command: Option<&'static SharedChatCommandDefinition>,
     pub(crate) suggestions: Vec<TuiSlashSuggestion>,
 }
 
+/// Preview block rendered above the suggestion list for the selected row.
 #[derive(Debug, Clone)]
 pub(crate) struct TuiSlashPreview {
     pub(crate) title: String,
@@ -172,6 +195,7 @@ pub(crate) struct TuiSlashPreview {
     pub(crate) badge: String,
 }
 
+/// Inputs for [`build_tui_slash_palette`].
 pub(crate) struct BuildTuiSlashPaletteArgs<'a> {
     pub(crate) input: &'a str,
     pub(crate) catalog: &'a TuiSlashEntityCatalog,
@@ -180,6 +204,9 @@ pub(crate) struct BuildTuiSlashPaletteArgs<'a> {
     pub(crate) delegation_templates: &'a [&'a str],
 }
 
+/// Builds palette state for the composer input, or `None` when the input is
+/// not a slash command. Unresolved command tokens yield command-name matches;
+/// resolved commands yield argument suggestions for the trailing token.
 pub(crate) fn build_tui_slash_palette(
     args: BuildTuiSlashPaletteArgs<'_>,
 ) -> Option<TuiSlashPaletteState> {
@@ -189,7 +216,7 @@ pub(crate) fn build_tui_slash_palette(
     }
 
     let body = trimmed.trim_start_matches('/');
-    let has_trailing_whitespace = trimmed.chars().last().map(char::is_whitespace).unwrap_or(false);
+    let has_trailing_whitespace = trimmed.chars().last().is_some_and(char::is_whitespace);
     let raw_parts = body.split_whitespace().collect::<Vec<_>>();
     let raw_command_token = raw_parts.first().copied().unwrap_or_default();
     let normalized_command_token = raw_command_token.trim().to_ascii_lowercase();
@@ -212,6 +239,8 @@ pub(crate) fn build_tui_slash_palette(
     }
 
     let normalized_rest = raw_parts.iter().skip(1).copied().collect::<Vec<_>>().join(" ");
+    // Trailing whitespace means the user finished the previous token, so the
+    // palette should suggest fresh values instead of filtering by it.
     let active_token = if has_trailing_whitespace || normalized_rest.trim().is_empty() {
         String::new()
     } else {
@@ -232,6 +261,8 @@ pub(crate) fn build_tui_slash_palette(
     })
 }
 
+/// Preview for the suggestion at `selected`, falling back to the active
+/// command's own synopsis when no suggestion row exists.
 pub(crate) fn preview_for_selection(
     palette: &TuiSlashPaletteState,
     selected: usize,
@@ -254,6 +285,8 @@ pub(crate) fn preview_for_selection(
     })
 }
 
+/// Picks the checkpoint `/undo` should restore: the newest `undo_safe`-tagged
+/// checkpoint, falling back to the newest checkpoint of any kind.
 pub(crate) fn select_undo_checkpoint(
     checkpoints: &[TuiSlashCheckpointRecord],
 ) -> Option<&TuiSlashCheckpointRecord> {
@@ -267,24 +300,29 @@ pub(crate) fn select_undo_checkpoint(
     checkpoints.iter().max_by_key(|checkpoint| checkpoint.created_at_unix_ms)
 }
 
+/// Case-insensitive tag membership test for a checkpoint record.
 pub(crate) fn checkpoint_has_tag(checkpoint: &TuiSlashCheckpointRecord, tag: &str) -> bool {
     let normalized = tag.trim().to_ascii_lowercase();
     !normalized.is_empty()
         && checkpoint.tags.iter().any(|entry| entry.trim().to_ascii_lowercase() == normalized)
 }
 
+/// Reads a string at a JSON pointer, defaulting to empty when absent.
 pub(crate) fn read_json_string(value: &Value, pointer: &str) -> String {
     value.pointer(pointer).and_then(Value::as_str).unwrap_or_default().to_owned()
 }
 
+/// Reads an i64 at a JSON pointer, defaulting to zero when absent.
 pub(crate) fn read_json_i64(value: &Value, pointer: &str) -> i64 {
     value.pointer(pointer).and_then(Value::as_i64).unwrap_or_default()
 }
 
+/// Reads a bool at a JSON pointer, defaulting to false when absent.
 pub(crate) fn read_json_bool(value: &Value, pointer: &str) -> bool {
     value.pointer(pointer).and_then(Value::as_bool).unwrap_or(false)
 }
 
+/// Reads a string array at a JSON pointer, skipping non-string entries.
 pub(crate) fn read_json_tags(value: &Value, pointer: &str) -> Vec<String> {
     value
         .pointer(pointer)
