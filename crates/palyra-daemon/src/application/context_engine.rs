@@ -1,3 +1,22 @@
+//! Context engine: assembles the model-provider prompt for a run turn from
+//! prioritized, trust-labeled segments under an explicit token budget.
+//!
+//! Assembly model: every candidate block (compiled instructions, preference
+//! and project context, compaction/checkpoint summaries, context references,
+//! recall, session tail, user input) becomes a [`ContextSegment`] carrying a
+//! priority, stability/protection flags, and a safety-scan result.
+//! [`assemble_segments`] evicts the lowest-priority unprotected segments
+//! (whole groups at a time) until the selection fits the provider input
+//! budget derived in [`resolve_provider_context_budget`], then emits the
+//! prompt text plus a deterministic [`ContextEngineExplain`] trace journaled
+//! as [`CONTEXT_ENGINE_PLAN_EVENT`].
+//!
+//! Relationships: instruction text comes from
+//! `application::instruction_compiler`, reference resolution from
+//! `application::context_references`, and recall/summary blocks from
+//! `application::provider_input`, whose `prepare_model_provider_input`
+//! delegates here whenever the context-engine feature rollout is enabled.
+
 use std::sync::Arc;
 
 use palyra_safety::{
@@ -40,6 +59,9 @@ use crate::{
     transport::grpc::auth::RequestContext,
 };
 
+// Conservative fallbacks/reserves used when the provider registry does not
+// advertise model capabilities; all values are estimated tokens, and the
+// estimator deliberately overcounts so the real provider limit is never hit.
 const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 8_192;
 const MIN_CONTEXT_WINDOW_TOKENS: u64 = 2_048;
 const MAX_RESERVED_COMPLETION_TOKENS: u64 = 8_192;
@@ -50,16 +72,25 @@ const CONTEXT_BUDGET_SAFETY_MARGIN_TOKENS: u64 = 256;
 const TOOL_SCHEMA_BASE_OVERHEAD_TOKENS: u64 = 24;
 const TOOL_SCHEMA_PER_TOOL_OVERHEAD_TOKENS: u64 = 12;
 const SEGMENT_PREVIEW_CHARS: usize = 180;
+/// Orchestrator tape event type under which the assembly trace is journaled.
 pub(crate) const CONTEXT_ENGINE_PLAN_EVENT: &str = "context.engine.plan";
+/// Schema version stamped into [`ContextEngineExplain`] and its trace hash.
 pub(crate) const CONTEXT_ASSEMBLY_TRACE_SCHEMA_VERSION: u32 = 1;
 
+/// High-level plan label chosen by [`select_strategy`] and surfaced in the
+/// assembly trace; it describes why the prompt was shaped the way it was.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ContextEngineStrategy {
+    /// Everything fits; no compression or cache shaping was needed.
     Noop,
+    /// A checkpoint summary stands in for a rejected/fallback compaction.
     CheckpointAware,
+    /// A compaction summary is carrying the session under budget pressure.
     Summarizing,
+    /// Over budget without a summary; low-priority segments were dropped.
     CostAware,
+    /// Under budget with a cacheable stable prefix on a caching provider.
     ProviderAware,
 }
 
@@ -75,6 +106,8 @@ impl ContextEngineStrategy {
     }
 }
 
+/// What a prompt segment contains; drives ordering labels, source-kind
+/// mapping, and the assembly-step grouping in the trace.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ContextSegmentKind {
@@ -94,7 +127,6 @@ pub(crate) enum ContextSegmentKind {
 }
 
 impl ContextSegmentKind {
-    #[allow(dead_code)]
     fn as_str(self) -> &'static str {
         match self {
             Self::SystemInstructions => "system_instructions",
@@ -114,8 +146,12 @@ impl ContextSegmentKind {
     }
 }
 
+/// Alias kept so explain/trace consumers can name the trust label without
+/// importing `palyra_safety` directly.
 pub(crate) type ContextTrustLabel = TrustLabel;
 
+/// Provenance bucket for a segment, derived from its kind by
+/// [`source_kind_for_segment`]; serialized into the assembly trace.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ContextSourceKind {
@@ -129,6 +165,8 @@ pub(crate) enum ContextSourceKind {
     ToolResult,
 }
 
+/// Trace entry for one segment that survived budgeting. The `preview` field
+/// is already shrunk/redacted; raw segment content never enters the trace.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ContextEngineSegmentExplain {
     pub(crate) kind: ContextSegmentKind,
@@ -149,6 +187,8 @@ pub(crate) struct ContextEngineSegmentExplain {
     pub(crate) preview: String,
 }
 
+/// Trace entry for a segment evicted by budgeting (metadata only, no
+/// content); `reason` distinguishes single drops from group drops.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ContextEngineDroppedSegmentExplain {
     pub(crate) kind: ContextSegmentKind,
@@ -157,6 +197,8 @@ pub(crate) struct ContextEngineDroppedSegmentExplain {
     pub(crate) reason: String,
 }
 
+/// Flattened included/excluded view of the assembly pipeline, one entry per
+/// segment, grouped by the pipeline step that produced it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct PromptAssemblyStepExplain {
     pub(crate) step: String,
@@ -169,6 +211,9 @@ pub(crate) struct PromptAssemblyStepExplain {
     pub(crate) source_refs: Vec<String>,
 }
 
+/// Token accounting snapshot for the turn: the resolved budget profile, every
+/// reserve subtracted from the context window, and the selected/dropped/
+/// overflow totals after budgeting.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ContextEngineBudgetExplain {
     pub(crate) profile_id: String,
@@ -189,6 +234,8 @@ pub(crate) struct ContextEngineBudgetExplain {
     pub(crate) overflow_tokens: u64,
 }
 
+/// Provider prompt-cache view: hash and size of the stable segment prefix
+/// plus the identity-bearing scope key (redacted to a hash in diagnostics).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ContextEngineCacheExplain {
     pub(crate) provider_cache_supported: bool,
@@ -200,6 +247,8 @@ pub(crate) struct ContextEngineCacheExplain {
     pub(crate) trust_scope: String,
 }
 
+/// Outcome of the compaction-summary quality gate; `verdict` is `allow`,
+/// `fallback` (use checkpoint instead), or `reject` (drop the summary).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct SummaryQualityGateExplain {
     pub(crate) verdict: String,
@@ -209,6 +258,8 @@ pub(crate) struct SummaryQualityGateExplain {
     pub(crate) reasons: Vec<String>,
 }
 
+/// Identity of the compiled instruction set used for the turn (version,
+/// content hash, and the provider/model/surface it was compiled for).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ContextEngineInstructionExplain {
     pub(crate) version: u32,
@@ -218,6 +269,10 @@ pub(crate) struct ContextEngineInstructionExplain {
     pub(crate) surface: ToolExposureSurface,
 }
 
+/// Full deterministic trace of one prompt assembly: strategy, budget and
+/// cache accounting, quality-gate verdicts, and per-segment include/drop
+/// decisions. Serialized verbatim into the [`CONTEXT_ENGINE_PLAN_EVENT`]
+/// tape event; its serde shape is pinned by snapshot tests.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ContextEngineExplain {
     pub(crate) schema_version: u32,
@@ -235,8 +290,15 @@ pub(crate) struct ContextEngineExplain {
     pub(crate) dropped_segments: Vec<ContextEngineDroppedSegmentExplain>,
 }
 
+/// Alias used where the explain payload is consumed as a journaled trace
+/// rather than as a live planning result.
 pub(crate) type ContextAssemblyTrace = ContextEngineExplain;
 
+/// One candidate prompt block before budgeting. `priority` decides eviction
+/// order (higher survives longer), `stable` marks cache-prefix-eligible
+/// content, `protected` exempts the segment from eviction entirely, and
+/// `group_id` ties segments that must be dropped as a unit (for example a
+/// tool call and its result).
 #[derive(Debug, Clone)]
 struct ContextSegment {
     kind: ContextSegmentKind,
@@ -306,6 +368,9 @@ impl ContextSegment {
             content,
             provider_role: Some(provider_role),
             estimated_tokens,
+            // Compiled instructions outrank everything except the live user
+            // input (priority 100) and can never be evicted; the shared group
+            // id keeps system/developer segments traceable as one unit.
             priority: 99,
             stable: true,
             protected: true,
@@ -317,6 +382,9 @@ impl ContextSegment {
     }
 }
 
+/// Identity-bearing summary of the budget inputs for one turn. `profile_id`
+/// is a content hash of the other fields, so identical provider/model/limit
+/// combinations always produce the same id in traces and journals.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ProviderBudgetProfile {
     pub(crate) profile_id: String,
@@ -332,6 +400,8 @@ pub(crate) struct ProviderBudgetProfile {
     pub(crate) failover_budget_model_id: Option<String>,
 }
 
+/// Working budget for one assembly: the context window plus every reserve
+/// that must be subtracted before prompt segments may claim tokens.
 #[derive(Debug, Clone)]
 struct ProviderContextBudget {
     profile: ProviderBudgetProfile,
@@ -345,6 +415,9 @@ struct ProviderContextBudget {
 }
 
 impl ProviderContextBudget {
+    /// Tokens available to prompt segments after all reserves. Clamped to at
+    /// least 1 so budgeting code never divides by or loops on a zero budget
+    /// even when reserves exceed a tiny context window.
     fn input_budget_tokens(&self) -> u64 {
         self.max_context_tokens
             .saturating_sub(self.reserved_completion_tokens)
@@ -356,6 +429,9 @@ impl ProviderContextBudget {
     }
 }
 
+/// Resolution of the session-summary question for this turn: at most one
+/// summary segment (compaction or checkpoint fallback), the quality-gate
+/// verdict that picked it, and whether the pick was a checkpoint.
 #[derive(Debug, Clone)]
 struct CompactionContextDecision {
     segment: Option<ContextSegment>,
@@ -363,12 +439,28 @@ struct CompactionContextDecision {
     checkpoint_summary_present: bool,
 }
 
+/// Minimal view of the run parameter delta: only the optional
+/// `context_references` preview is read here; all other keys are ignored.
 #[derive(Debug, Clone, Deserialize)]
 struct ContextReferenceParameterDelta {
     #[serde(default)]
     context_references: Option<ContextReferencePreviewEnvelope>,
 }
 
+/// Assembles the full model-provider input for one run turn using the
+/// context engine: collects candidate segments, compiles instructions,
+/// budgets and orders them, journals the assembly trace, and records the
+/// pruning decision.
+///
+/// Mutates `tape_seq` for every orchestrator tape event appended on the way
+/// (context references, assembly plan).
+///
+/// # Errors
+/// Returns `Status::resource_exhausted("context_budget_exhausted")` when even
+/// after eviction the protected segments exceed the input budget, and
+/// propagates journal, memory, recall, and tape-append failures. Memory
+/// recall failures are downgraded to a warning when the caller selected
+/// [`MemoryPromptFailureMode::FallbackToRawInput`].
 #[allow(clippy::result_large_err)]
 pub(crate) async fn prepare_model_provider_input_with_context_engine(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -522,7 +614,8 @@ pub(crate) async fn prepare_model_provider_input_with_context_engine(
     )
     .await?
     .and_then(clean_segment_content);
-    if let Some(block) = explicit_recall_block.clone() {
+    let explicit_recall_present = explicit_recall_block.is_some();
+    if let Some(block) = explicit_recall_block {
         push_segment(
             &mut segments,
             ContextSegment::trusted(
@@ -537,7 +630,10 @@ pub(crate) async fn prepare_model_provider_input_with_context_engine(
         );
     }
 
-    if explicit_recall_block.is_none() {
+    // Automatic memory injection is suppressed when the user explicitly
+    // recalled memory: the explicit block already covers the same need at a
+    // higher priority and auto-injection would duplicate content.
+    if !explicit_recall_present {
         match build_memory_augmented_prompt(
             runtime_state,
             context,
@@ -602,7 +698,7 @@ pub(crate) async fn prepare_model_provider_input_with_context_engine(
         ContextSegment::trusted(
             ContextSegmentKind::UserInput,
             "user_input",
-            normalized_input_text.clone(),
+            normalized_input_text,
             100,
             false,
             true,
@@ -610,6 +706,10 @@ pub(crate) async fn prepare_model_provider_input_with_context_engine(
         ),
     );
 
+    // Instructions are compiled only after every other segment exists: the
+    // developer message embeds a trust summary of the actually selected
+    // blocks. They are then prepended so the stable instruction prefix leads
+    // the prompt, which is what makes provider prompt caching effective.
     let compiled_instructions = InstructionCompiler.compile(InstructionCompilerInput {
         provider_kind: provider_budget.profile.provider_kind.as_str(),
         model_family: provider_budget.profile.model_id.as_str(),
@@ -689,18 +789,24 @@ pub(crate) async fn prepare_model_provider_input_with_context_engine(
     })
 }
 
+/// Final budgeted prompt text plus the trace explaining how it was built.
 #[derive(Debug)]
 struct AssembledPrompt {
     prompt_text: String,
     explain: ContextEngineExplain,
 }
 
+/// Segment paired with its original insertion index so the prompt can be
+/// re-emitted in pipeline order after eviction shuffles the working set.
 #[derive(Debug, Clone)]
 struct IndexedContextSegment {
     order: usize,
     segment: ContextSegment,
 }
 
+/// Evicts unprotected segments until the selection fits the input budget,
+/// then renders the surviving segments (in original order) and the full
+/// deterministic explain trace.
 fn assemble_segments(
     segments: &[ContextSegment],
     strategy: ContextEngineStrategy,
@@ -721,6 +827,11 @@ fn assemble_segments(
         selected.iter().map(|entry| entry.segment.estimated_tokens).sum::<u64>();
 
     while selected_tokens > budget_tokens {
+        // Eviction order: lowest priority first; among equals prefer
+        // unstable segments (preserves the cacheable prefix), then the
+        // largest segment (frees the most budget per drop), then the most
+        // recently appended one. If only protected segments remain the loop
+        // exits and the residual is reported as overflow.
         let Some(drop_index) = selected
             .iter()
             .enumerate()
@@ -740,6 +851,13 @@ fn assemble_segments(
             break;
         };
 
+        // Grouped segments fall together so a tool call never survives
+        // without its result (and vice versa).
+        // AIDEV-NOTE: group eviction ignores the `protected` flag of group
+        // members; it is sound today only because groups are homogeneous
+        // (instruction segments are all protected, tool-exchange groups all
+        // unprotected). A mixed group would let an unprotected seed drag a
+        // protected member out of the prompt.
         let drop_group_id = selected[drop_index].segment.group_id.clone();
         let mut removed_indexes = selected
             .iter()
@@ -755,6 +873,7 @@ fn assemble_segments(
             removed_indexes.push(drop_index);
         }
 
+        // Remove from the back so earlier indexes stay valid.
         removed_indexes.sort_unstable();
         while let Some(index) = removed_indexes.pop() {
             let removed = selected.remove(index);
@@ -773,6 +892,8 @@ fn assemble_segments(
     }
 
     selected.sort_by_key(|entry| entry.order);
+    // Instruction segments (those with a provider role) are delivered as
+    // structured provider messages, not inlined into the plain prompt text.
     let prompt_text = selected
         .iter()
         .filter(|entry| entry.segment.provider_role.is_none())
@@ -780,10 +901,12 @@ fn assemble_segments(
         .collect::<Vec<_>>()
         .join("\n\n");
     let dropped_tokens = dropped.iter().map(|segment| segment.estimated_tokens).sum::<u64>();
+    // The cacheable prefix is the run of stable segments at the head of the
+    // prompt; the first unstable segment ends it.
     let stable_prefix = selected
         .iter()
         .take_while(|entry| entry.segment.stable)
-        .map(|entry| entry.segment.clone())
+        .map(|entry| &entry.segment)
         .collect::<Vec<_>>();
     let stable_prefix_tokens =
         stable_prefix.iter().map(|segment| segment.estimated_tokens).sum::<u64>();
@@ -813,6 +936,9 @@ fn assemble_segments(
         } else {
             "trusted".to_owned()
         };
+    // The cache scope key binds the prefix hash to session, principal,
+    // channel, and trust posture so a provider cache entry can never be
+    // shared across identities or across trusted/mixed prompts.
     let cache_scope_key = stable_prefix_hash.as_ref().map(|hash| {
         format!(
             "session={session_id};principal={};channel={};strategy={};trust={trust_scope};prefix={hash}",
@@ -930,6 +1056,12 @@ fn assemble_segments(
     }
 }
 
+/// Derives the token budget for a turn from the provider registry snapshot.
+///
+/// Resolution precedence for the model: explicit hint, registry default chat
+/// model, then the snapshot's active model. The context window may be shrunk
+/// to the smallest credible failover model so an assembled prompt still fits
+/// after a mid-run provider failover.
 fn resolve_provider_context_budget(
     snapshot: &crate::model_provider::ProviderStatusSnapshot,
     provider_kind_hint: Option<&str>,
@@ -971,6 +1103,8 @@ fn resolve_provider_context_budget(
         .unwrap_or(selected_context_tokens);
     let failover_budget_model_id =
         failover_budget_constraint.as_ref().map(|constraint| constraint.model_id.clone());
+    // Reserve roughly 20% of the window for the completion, bounded so tiny
+    // windows still leave room to answer and huge windows do not over-reserve.
     let reserved_completion_tokens = (max_context_tokens / 5)
         .clamp(MIN_RESERVED_COMPLETION_TOKENS, MAX_RESERVED_COMPLETION_TOKENS);
     let tool_schema_overhead_tokens = estimate_tool_schema_overhead_tokens(tool_catalog_snapshot);
@@ -1020,12 +1154,15 @@ fn resolve_provider_context_budget(
     }
 }
 
+/// Failover target whose smaller context window caps this turn's budget.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FailoverBudgetConstraint {
     model_id: String,
     context_window_tokens: u64,
 }
 
+/// Context window for a model, falling back to the provider snapshot and
+/// then the conservative default; never below the configured minimum.
 fn model_context_window_tokens(
     model: Option<&crate::model_provider::ProviderRegistryModelSnapshot>,
     snapshot: &crate::model_provider::ProviderStatusSnapshot,
@@ -1038,6 +1175,11 @@ fn model_context_window_tokens(
         .max(MIN_CONTEXT_WINDOW_TOKENS)
 }
 
+/// Finds the enabled chat model with the smallest context window that is
+/// both different from the selected model and smaller than it. Budgeting to
+/// that worst-case target guarantees the assembled prompt survives a
+/// registry failover without re-assembly. Returns `None` when failover is
+/// disabled or no alternative model exists.
 fn failover_context_budget_constraint(
     snapshot: &crate::model_provider::ProviderStatusSnapshot,
     selected_model_id: &str,
@@ -1060,9 +1202,13 @@ fn failover_context_budget_constraint(
             context_window_tokens: model_context_window_tokens(Some(model), snapshot),
         })
         .collect::<Vec<_>>();
+    // The candidate list includes the selected model itself, so fewer than
+    // two entries means there is no alternative to fail over to.
     if candidates.len() < 2 {
         return None;
     }
+    // Sort window-then-id so the constraint is deterministic when several
+    // models share the same context window.
     candidates.sort_by(|left, right| {
         left.context_window_tokens
             .cmp(&right.context_window_tokens)
@@ -1074,6 +1220,9 @@ fn failover_context_budget_constraint(
     })
 }
 
+/// Whether a provider id is usable for failover. An id missing from the
+/// registry counts as enabled only for legacy single-provider snapshots
+/// (empty registry) or when it is the snapshot's own active provider.
 fn registry_provider_enabled(
     snapshot: &crate::model_provider::ProviderStatusSnapshot,
     provider_id: &str,
@@ -1084,6 +1233,8 @@ fn registry_provider_enabled(
     }
 }
 
+/// Estimates the prompt-token cost of exposing the tool catalog (per-tool
+/// description plus JSON schema, plus fixed wrapping overhead).
 fn estimate_tool_schema_overhead_tokens(
     tool_catalog_snapshot: Option<&ModelVisibleToolCatalogSnapshot>,
 ) -> u64 {
@@ -1106,6 +1257,9 @@ fn estimate_tool_schema_overhead_tokens(
         .saturating_add(TOOL_SCHEMA_BASE_OVERHEAD_TOKENS)
 }
 
+/// Hashes a JSON value deterministically. Serializing an in-memory `Value`
+/// cannot realistically fail (keys are always strings); the `null` fallback
+/// only keeps hashing total instead of panicking.
 fn stable_sha256_json(value: &Value) -> String {
     let payload = serde_json::to_vec(value).unwrap_or_else(|_| b"null".to_vec());
     crate::sha256_hex(payload.as_slice())
@@ -1115,6 +1269,9 @@ fn cache_scope_hash(value: &str) -> String {
     crate::sha256_hex(value.as_bytes())
 }
 
+/// Builds the sorted, deduplicated reason-code list summarizing why the
+/// prompt was shaped this way (strategy, drops, trust posture, injection
+/// signals, summary-gate verdicts).
 fn context_assembly_reason_codes(
     strategy: ContextEngineStrategy,
     selected: &[ContextEngineSegmentExplain],
@@ -1147,6 +1304,8 @@ fn context_assembly_reason_codes(
     reasons
 }
 
+/// Condenses the trust posture of all candidate segments into the summary
+/// the instruction compiler embeds in the developer message.
 fn instruction_trust_summary(segments: &[ContextSegment]) -> InstructionTrustSummary {
     if segments.is_empty() {
         return InstructionTrustSummary::trusted();
@@ -1169,6 +1328,9 @@ fn instruction_trust_summary(segments: &[ContextSegment]) -> InstructionTrustSum
     }
 }
 
+/// Converts compiled instructions into protected prompt segments. Only
+/// system/developer roles participate in budgeting; other roles would be
+/// conversation content, which the compiler never emits.
 fn instruction_segments(compiled: &CompiledInstructions) -> Vec<ContextSegment> {
     compiled
         .segments
@@ -1192,6 +1354,10 @@ fn instruction_segments(compiled: &CompiledInstructions) -> Vec<ContextSegment> 
         .collect()
 }
 
+/// Picks the assembly strategy label. Precedence: summarizing (compaction
+/// summary under budget pressure), checkpoint-aware (checkpoint stands in
+/// for a rejected summary), cost-aware (pressure without a summary),
+/// provider-aware (cacheable prefix on a caching provider), then noop.
 fn select_strategy(
     segments: &[ContextSegment],
     budget: ProviderContextBudget,
@@ -1219,6 +1385,9 @@ fn select_strategy(
     ContextEngineStrategy::Noop
 }
 
+/// Decides which session-summary segment (if any) joins the prompt: the
+/// latest compaction summary when it passes the quality gate, otherwise the
+/// latest checkpoint as a fallback, otherwise nothing.
 async fn collect_compaction_context_decision(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: &RequestContext,
@@ -1277,10 +1446,14 @@ async fn collect_compaction_context_decision(
     })
 }
 
+/// Renders the newest checkpoint as a stable prompt segment, optionally
+/// annotated with a preview of the compaction artifact it replaces.
 fn latest_checkpoint_segment(
     checkpoints: &[OrchestratorCheckpointRecord],
     artifact: Option<&OrchestratorCompactionArtifactRecord>,
 ) -> Option<ContextSegment> {
+    // The journal returns checkpoints newest-first, so `first()` is the
+    // most recent one.
     let checkpoint = checkpoints.first()?;
     let workspace_paths =
         serde_json::from_str::<Vec<String>>(checkpoint.workspace_paths_json.as_str())
@@ -1319,6 +1492,11 @@ fn latest_checkpoint_segment(
     ))
 }
 
+/// Quality-gates a compaction summary before it may carry session context.
+/// Verdict precedence: `reject` (poisoned candidates or contradiction
+/// signals -- the summary is unsafe to trust), `fallback` (shallow coverage,
+/// pending review, sensitive content, repeated-compaction drift, or budget
+/// overrun -- prefer a checkpoint), otherwise `allow`.
 fn evaluate_summary_quality(
     artifact: &OrchestratorCompactionArtifactRecord,
     checkpoints: &[OrchestratorCheckpointRecord],
@@ -1388,6 +1566,14 @@ fn evaluate_summary_quality(
     }
 }
 
+/// Counts opposing-directive pairs both present in a summary, a coarse
+/// signal that compaction merged contradictory instructions.
+///
+/// AIDEV-NOTE: matching is plain substring containment, so it can fire on
+/// embedded words ("house" contains "use") and ("must", "must not") always
+/// fires whenever "must not" appears. Tightening to word-boundary matching
+/// would change reject/fallback verdicts and the deterministic fixtures, so
+/// it must be a deliberate behavior change.
 fn count_contradiction_signals(summary_text: &str) -> usize {
     const CONTRADICTION_PAIRS: &[(&str, &str)] = &[
         ("enable", "disable"),
@@ -1405,6 +1591,10 @@ fn count_contradiction_signals(summary_text: &str) -> usize {
         .count()
 }
 
+/// Turns the pre-resolved context-reference preview from the parameter
+/// delta into a protected prompt segment. Journals a `context_references`
+/// tape event for auditability before rendering, so the event exists even
+/// when the rendered block ends up empty.
 #[allow(clippy::result_large_err)]
 async fn build_context_reference_segment(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -1480,6 +1670,8 @@ async fn build_context_reference_segment(
     }))
 }
 
+/// Extracts the optional context-reference preview from the parameter delta;
+/// malformed JSON is treated as "no references" rather than an error.
 fn parse_context_reference_preview(
     parameter_delta_json: Option<&str>,
 ) -> Option<ContextReferencePreviewEnvelope> {
@@ -1492,6 +1684,9 @@ fn parse_context_reference_preview(
         .and_then(|value| value.context_references)
 }
 
+/// Prefers the reference-stripped clean prompt over the raw input text so
+/// `@file:`/`@url:` markers do not appear twice (once as markers, once as
+/// resolved reference blocks).
 fn normalized_input_text(parameter_delta_json: Option<&str>, input_text: &str) -> String {
     parse_context_reference_preview(parameter_delta_json)
         .map(|preview| preview.clean_prompt.trim().to_owned())
@@ -1499,6 +1694,8 @@ fn normalized_input_text(parameter_delta_json: Option<&str>, input_text: &str) -
         .unwrap_or_else(|| input_text.to_owned())
 }
 
+/// Journals the assembly trace as a [`CONTEXT_ENGINE_PLAN_EVENT`] tape event
+/// and mirrors a privacy-reduced copy into runtime diagnostics.
 async fn record_context_engine_plan(
     runtime_state: &Arc<GatewayRuntimeState>,
     run_id: &str,
@@ -1520,6 +1717,10 @@ async fn record_context_engine_plan(
     Ok(())
 }
 
+/// Privacy-reduced trace for runtime diagnostics: segment previews and
+/// source refs are omitted entirely (only their redaction state is
+/// disclosed) and the identity-bearing cache scope key is replaced by a
+/// non-reversible hash. Pinned by the diagnostics redaction tests.
 fn context_assembly_diagnostics_payload(explain: &ContextAssemblyTrace) -> Value {
     json!({
         "schema_version": explain.schema_version,
@@ -1580,6 +1781,8 @@ fn context_assembly_diagnostics_payload(explain: &ContextAssemblyTrace) -> Value
     })
 }
 
+/// Appends a segment unless its content is blank; empty segments would only
+/// add separator noise to the prompt and the trace.
 fn push_segment(segments: &mut Vec<ContextSegment>, segment: ContextSegment) {
     if segment.content.trim().is_empty() {
         return;
@@ -1592,12 +1795,16 @@ fn clean_segment_content(raw: String) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
+/// Trace-safe segment preview plus the redaction label describing how it
+/// was sanitized.
 #[derive(Debug, Clone)]
 struct ExplainPreview {
     text: String,
     redaction_status: String,
 }
 
+/// Flattens selected and dropped segments into the per-step assembly view
+/// of the trace (included entries first, then drops with metadata only).
 fn build_prompt_assembly_steps(
     selected: &[IndexedContextSegment],
     dropped: &[ContextEngineDroppedSegmentExplain],
@@ -1690,6 +1897,8 @@ fn source_kind_for_segment(segment: &ContextSegment) -> ContextSourceKind {
 }
 
 fn explain_preview_for_segment(segment: &ContextSegment) -> ExplainPreview {
+    // Compiled instruction text never enters traces or journals, only a
+    // fixed marker; the instruction hash is the auditable identity instead.
     if segment.provider_role.is_some() {
         return ExplainPreview {
             text: "<instruction_redacted>".to_owned(),
@@ -1699,6 +1908,8 @@ fn explain_preview_for_segment(segment: &ContextSegment) -> ExplainPreview {
     explain_preview_text(segment.content.as_str(), SEGMENT_PREVIEW_CHARS)
 }
 
+/// Builds a trace-safe preview: whitespace-normalized, JSON shrunk when the
+/// content parses as JSON, secret-redacted, then length-capped.
 fn explain_preview_text(raw: &str, max_chars: usize) -> ExplainPreview {
     let normalized = raw.replace(['\r', '\n'], " ");
     let trimmed = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1730,6 +1941,9 @@ fn shrink_json_preview_if_possible(raw: &str) -> (String, bool) {
     (rendered, outcome.truncated)
 }
 
+/// Runs the preview through the journal's secret redaction by wrapping it in
+/// a one-field JSON document, reusing the exact redaction rules journaled
+/// payloads get instead of maintaining a second pattern list here.
 fn redact_explain_preview(raw: &str) -> String {
     let payload = json!({ "preview": raw }).to_string();
     let redacted = match crate::journal::redact_payload_json(payload.as_bytes()) {
@@ -1753,11 +1967,14 @@ fn preview_text(raw: &str, max_chars: usize) -> String {
     truncated
 }
 
+/// Provider-agnostic token estimate: ~4 characters per token, rounded up so
+/// the budget overcounts rather than undercounts.
 fn estimate_tokens(text: &str) -> u64 {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return 0;
     }
+    // usize -> u64 cannot truncate on any supported target.
     trimmed.chars().count().div_ceil(4) as u64
 }
 

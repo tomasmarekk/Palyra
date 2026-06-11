@@ -1,3 +1,14 @@
+//! Deterministic compiler for the system/developer instruction messages
+//! sent with every provider turn.
+//!
+//! The compiled output layers, in order: runtime context (clock, host OS),
+//! the tool availability and approval contracts, the trust posture of the
+//! selected context blocks, per-tool grammar contracts, the project-context
+//! and completion/temporal evidence contracts. The result carries a content
+//! hash so journals and traces can prove which instruction set governed a
+//! turn. Consumed by `application::context_engine`, which prepends the
+//! segments to the prompt and forwards them as provider messages.
+
 use chrono::{SecondsFormat, Utc};
 use palyra_safety::SafetyAction;
 use serde::{Deserialize, Serialize};
@@ -8,8 +19,15 @@ use crate::{
     model_provider::{ProviderMessage, ProviderMessageContentPart, ProviderMessageRole},
 };
 
+/// Version stamped into [`CompiledInstructions`] and mixed into its hash.
+/// Bump it whenever any contract text below changes so downstream hash
+/// comparisons (caching, journaled identity) see the change; the unit tests
+/// pin the current value.
 pub(crate) const INSTRUCTION_COMPILER_VERSION: u32 = 27;
 
+/// Aggregated trust posture of the context blocks selected for the turn,
+/// embedded into the developer message so the model is told how much of its
+/// context is untrusted.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct InstructionTrustSummary {
     pub(crate) selected_blocks: usize,
@@ -20,6 +38,7 @@ pub(crate) struct InstructionTrustSummary {
 }
 
 impl InstructionTrustSummary {
+    /// Summary for a turn with no supplemental context blocks at all.
     pub(crate) fn trusted() -> Self {
         Self {
             selected_blocks: 0,
@@ -31,6 +50,9 @@ impl InstructionTrustSummary {
     }
 }
 
+/// Everything the compiler needs to know about the turn: target provider
+/// and model, exposure surface, visible tools, approval mode, and the trust
+/// posture of the selected context.
 #[derive(Debug, Clone)]
 pub(crate) struct InstructionCompilerInput<'a> {
     pub(crate) provider_kind: &'a str,
@@ -41,6 +63,8 @@ pub(crate) struct InstructionCompilerInput<'a> {
     pub(crate) trust_summary: InstructionTrustSummary,
 }
 
+/// One compiled instruction message (system or developer) with its label
+/// and pre-computed token estimate.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct CompiledInstructionSegment {
     pub(crate) role: ProviderMessageRole,
@@ -49,6 +73,9 @@ pub(crate) struct CompiledInstructionSegment {
     pub(crate) estimated_tokens: u64,
 }
 
+/// Compiled instruction set for one turn. `hash` covers the version, all
+/// inputs, and the full segment contents, making equal hashes proof of
+/// byte-identical instructions.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct CompiledInstructions {
     pub(crate) version: u32,
@@ -60,6 +87,8 @@ pub(crate) struct CompiledInstructions {
 }
 
 impl CompiledInstructions {
+    /// Renders the segments as plain-text provider messages in compile
+    /// order (system first, then developer).
     pub(crate) fn provider_messages(&self) -> Vec<ProviderMessage> {
         self.segments
             .iter()
@@ -74,14 +103,20 @@ impl CompiledInstructions {
     }
 }
 
+/// Stateless compiler; a unit struct so call sites read as a named
+/// component rather than a free function.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct InstructionCompiler;
 
 impl InstructionCompiler {
+    /// Compiles the instruction set for one turn using the live clock and
+    /// host facts. Deterministic for fixed inputs and runtime context.
     pub(crate) fn compile(&self, input: InstructionCompilerInput<'_>) -> CompiledInstructions {
         self.compile_with_runtime_context(input, RuntimeInstructionContext::current())
     }
 
+    // Seam for tests: injecting the runtime context keeps hashes
+    // reproducible without freezing the real clock.
     fn compile_with_runtime_context(
         &self,
         input: InstructionCompilerInput<'_>,
@@ -177,6 +212,8 @@ impl InstructionCompiler {
     }
 }
 
+/// Trusted runtime facts (clock and host platform) surfaced to the model so
+/// it never has to guess the date or pick OS-incompatible commands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeInstructionContext {
     current_utc: String,
@@ -204,6 +241,12 @@ impl RuntimeInstructionContext {
     }
 }
 
+/// Concatenates the grammar contracts for whichever known tools are visible
+/// this turn, so the prompt only spends tokens on tools the model can call.
+///
+/// INTENTIONAL: every contract string below is pinned phrase-by-phrase in
+/// the unit tests, and changed text changes instruction hashes. Edit a
+/// contract, its test, and [`INSTRUCTION_COMPILER_VERSION`] together.
 fn tool_specific_contract(tool_names: &[String]) -> String {
     let mut contracts = Vec::new();
     if tool_names.iter().any(|tool| tool == "palyra.fs.apply_patch") {
@@ -259,6 +302,8 @@ fn tool_specific_contract(tool_names: &[String]) -> String {
     }
 }
 
+/// Sorted, deduplicated tool names; the ordering keeps the rendered
+/// contract (and therefore the instruction hash) deterministic.
 fn visible_tool_names(snapshot: Option<&ModelVisibleToolCatalogSnapshot>) -> Vec<String> {
     let mut tools = snapshot
         .into_iter()
@@ -270,16 +315,18 @@ fn visible_tool_names(snapshot: Option<&ModelVisibleToolCatalogSnapshot>) -> Vec
     tools
 }
 
+/// Names of visible tools whose posture requires explicit approval.
 fn approval_required_tool_names(snapshot: Option<&ModelVisibleToolCatalogSnapshot>) -> Vec<String> {
     let mut tools = snapshot
         .into_iter()
         .flat_map(|snapshot| snapshot.tools.iter())
         .filter(|tool| {
+            // Compare via the serialized wire name so this stays correct if
+            // the posture enum's Rust shape changes but its serde names
+            // do not.
             serde_json::to_value(tool.approval_posture)
                 .ok()
-                .and_then(|value| value.as_str().map(ToOwned::to_owned))
-                .as_deref()
-                == Some("approval_required")
+                .is_some_and(|value| value.as_str() == Some("approval_required"))
         })
         .map(|tool| tool.name.clone())
         .collect::<Vec<_>>();
@@ -288,6 +335,8 @@ fn approval_required_tool_names(snapshot: Option<&ModelVisibleToolCatalogSnapsho
     tools
 }
 
+/// Renders the trust-posture paragraph of the developer message; wording
+/// escalates only when untrusted blocks or injection findings are present.
 fn trust_contract(summary: &InstructionTrustSummary) -> String {
     if summary.selected_blocks == 0 {
         return "No supplemental context blocks were selected.".to_owned();
@@ -307,11 +356,13 @@ fn trust_contract(summary: &InstructionTrustSummary) -> String {
     )
 }
 
+/// Provider-agnostic token estimate: ~4 characters per token, rounded up.
 fn estimate_instruction_tokens(text: &str) -> u64 {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return 0;
     }
+    // usize -> u64 cannot truncate on any supported target.
     trimmed.chars().count().div_ceil(4) as u64
 }
 

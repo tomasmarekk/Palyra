@@ -1,3 +1,15 @@
+//! Resolution of inline `@file:`/`@folder:`/`@diff:`/`@staged:`/`@url:`/
+//! `@memory:` context references found in a user prompt.
+//!
+//! Each parsed reference (from `palyra_common::context_references`) is
+//! resolved into bounded, safety-scanned text under a shared character
+//! budget: workspace paths are canonicalized and confined to the agent's
+//! workspace roots, URLs go through the policy-gated `palyra.http.fetch`
+//! tool, and memory queries go through the journal search API. The resulting
+//! [`ContextReferencePreviewEnvelope`] travels in the run parameter delta
+//! and is consumed by `application::context_engine` when assembling the
+//! prompt.
+
 use std::{
     collections::VecDeque,
     fs,
@@ -28,6 +40,10 @@ use crate::{
     transport::grpc::auth::RequestContext,
 };
 
+// Per-kind and total budgets keeping reference resolution bounded: the
+// total character budget is shared across all references in prompt order,
+// so earlier references can starve later ones (by design -- the user listed
+// them first).
 const MAX_REFERENCE_COUNT: usize = 8;
 const MAX_TOTAL_REFERENCE_CHARS: usize = 24_000;
 const MAX_FILE_REFERENCE_CHARS: usize = 8_000;
@@ -39,8 +55,12 @@ const MAX_MEMORY_REFERENCE_ITEMS: usize = 4;
 const MAX_PREVIEW_TEXT_CHARS: usize = 320;
 const ALLOWED_URL_CONTENT_TYPES: &[&str] =
     &["text/plain", "text/markdown", "text/html", "application/json", "application/xml"];
+// Directory names that must never be readable through references, on top of
+// the `.env*` prefix check, because they typically hold credentials.
 const BLOCKED_PATH_COMPONENTS: &[&str] = &[".git", ".ssh", ".aws"];
 
+/// Where a reference's content actually came from (file path, git root,
+/// redacted URL, memory id), surfaced in previews and tape events.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ContextReferenceProvenance {
     pub(crate) kind: String,
@@ -48,6 +68,9 @@ pub(crate) struct ContextReferenceProvenance {
     pub(crate) note: String,
 }
 
+/// One reference resolved to bounded text plus its trust label, safety scan
+/// outcome, warnings, and provenance. `resolved_text` is the full (already
+/// truncated) content; `preview_text` is a short single-line excerpt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ResolvedContextReference {
     pub(crate) reference_id: String,
@@ -68,6 +91,10 @@ pub(crate) struct ResolvedContextReference {
     pub(crate) resolved_text: String,
 }
 
+/// Complete resolution result for one prompt: the reference-stripped clean
+/// prompt, every resolved reference, and the aggregated trust/safety
+/// posture. Serialized into the run parameter delta, so its serde shape is
+/// a cross-component contract.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ContextReferencePreviewEnvelope {
     pub(crate) clean_prompt: String,
@@ -81,6 +108,17 @@ pub(crate) struct ContextReferencePreviewEnvelope {
     pub(crate) errors: Vec<ContextReferenceParseError>,
 }
 
+/// Parses and resolves every context reference in `input_text` (capped at
+/// [`MAX_REFERENCE_COUNT`]) into a preview envelope.
+///
+/// Workspace roots are resolved only when at least one reference needs the
+/// filesystem or git, so URL/memory-only prompts work without an agent
+/// workspace.
+///
+/// # Errors
+/// Propagates agent resolution failures and per-reference resolution errors
+/// (invalid targets, workspace escapes, blocked paths, git/fetch/memory
+/// failures) as the corresponding `Status`.
 pub(crate) async fn preview_context_references(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: &RequestContext,
@@ -150,6 +188,10 @@ pub(crate) async fn preview_context_references(
     })
 }
 
+/// Renders the resolved references as the `<context_references>` prompt
+/// block, annotating untrusted entries with their trust label and safety
+/// findings so the model treats them as data. Returns `None` when there is
+/// nothing to render.
 pub(crate) fn render_context_reference_block(
     preview: &ContextReferencePreviewEnvelope,
 ) -> Option<String> {
@@ -198,6 +240,9 @@ pub(crate) fn render_context_reference_block(
     Some(block)
 }
 
+/// Combines the rendered reference block with the user's prompt, falling
+/// back to the clean prompt (or a generic instruction) when the caller
+/// supplies no prompt text of its own.
 pub(crate) fn render_context_reference_prompt(
     preview: &ContextReferencePreviewEnvelope,
     prompt_input_text: &str,
@@ -218,6 +263,8 @@ pub(crate) fn render_context_reference_prompt(
     Some(format!("{block}\n\n{final_prompt}"))
 }
 
+/// Dispatches one parsed reference to its kind-specific resolver;
+/// `total_chars` carries the shared budget across the whole prompt.
 async fn resolve_context_reference(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: &RequestContext,
@@ -258,6 +305,9 @@ async fn resolve_context_reference(
     }
 }
 
+/// Resolves the workspace roots of the agent bound to this session without
+/// persisting a new binding; filesystem-backed references are confined to
+/// these roots.
 async fn resolve_workspace_roots(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: &RequestContext,
@@ -330,6 +380,8 @@ fn resolve_folder_reference(
     build_resolved_reference(reference, index, resolved.display_target, body, warnings, provenance)
 }
 
+/// Resolves `@diff:`/`@staged:` by running `git diff` in the first workspace
+/// root that contains a `.git` directory.
 async fn resolve_git_reference(
     workspace_roots: &[PathBuf],
     reference: ParsedContextReference,
@@ -343,6 +395,9 @@ async fn resolve_git_reference(
         .cloned()
         .or_else(|| workspace_roots.first().cloned())
         .ok_or_else(|| Status::failed_precondition("no workspace roots are available"))?;
+    // Targets are validated as workspace-relative (no traversal, no blocked
+    // components) and passed after `--` so they can never be parsed as git
+    // options.
     let target =
         reference.target.as_deref().map(validate_workspace_relative_git_target).transpose()?;
 
@@ -394,6 +449,10 @@ async fn resolve_git_reference(
     )
 }
 
+/// Resolves `@url:` through the `palyra.http.fetch` tool so reference
+/// fetches get the same egress policy, redirect limits, content-type
+/// allowlist, and redaction as model-initiated fetches -- never a direct
+/// HTTP client.
 async fn resolve_url_reference(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: &RequestContext,
@@ -454,6 +513,10 @@ async fn resolve_url_reference(
     )
 }
 
+/// Fail-closed gate for `@url:` fetches: the fetch must be allowed by tool
+/// policy *without* approval, because reference resolution happens before
+/// any approval flow exists for this run -- an approval-gated fetch would
+/// otherwise silently bypass its gate.
 fn authorize_url_reference_fetch(
     tool_call_config: &crate::tool_protocol::ToolCallConfig,
     context: &RequestContext,
@@ -483,6 +546,8 @@ fn authorize_url_reference_fetch(
     Ok(())
 }
 
+/// Resolves `@memory:` by searching the principal's memory store and
+/// rendering the top hits as a `<memory_reference>` block.
 async fn resolve_memory_reference(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: &RequestContext,
@@ -533,6 +598,8 @@ async fn resolve_memory_reference(
     build_resolved_reference(reference, index, query, rendered, warnings, provenance)
 }
 
+/// Finalizes a resolved reference: assigns the kind-based trust label, runs
+/// the pre-prompt safety scan, and derives token/preview metadata.
 fn build_resolved_reference(
     reference: ParsedContextReference,
     index: usize,
@@ -573,6 +640,8 @@ fn build_resolved_reference(
     })
 }
 
+/// URL content is the only externally authored input here; everything else
+/// originates from the local workspace or the operator's own memory store.
 fn trust_label_for_reference_kind(kind: ContextReferenceKind) -> TrustLabel {
     match kind {
         ContextReferenceKind::Url => TrustLabel::ExternalUntrusted,
@@ -584,6 +653,9 @@ fn trust_label_for_reference_kind(kind: ContextReferenceKind) -> TrustLabel {
     }
 }
 
+/// Folds per-reference trust labels into one envelope label: any mix of
+/// trusted and external content degrades the whole envelope to `Mixed`, and
+/// an empty reference list stays `TrustedLocal`.
 fn aggregate_reference_trust_label(references: &[ResolvedContextReference]) -> TrustLabel {
     let mut saw_trusted = false;
     let mut saw_external = false;
@@ -614,6 +686,10 @@ fn aggregate_reference_findings(references: &[ResolvedContextReference]) -> Vec<
     findings
 }
 
+/// Truncates `text` to the remaining shared budget and charges the result
+/// against it. The charge uses byte length, a conservative upper bound on
+/// the character count, so multibyte content depletes the budget faster
+/// rather than overshooting it.
 fn consume_reference_budget(
     text: String,
     total_chars: &mut usize,
@@ -639,6 +715,7 @@ fn truncate_reference_text(text: String, max_chars: usize, warnings: &mut Vec<St
     text.chars().take(max_chars).collect::<String>()
 }
 
+/// Provider-agnostic token estimate: ~4 characters per token, rounded up.
 fn estimate_text_tokens(text: &str) -> usize {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -648,12 +725,16 @@ fn estimate_text_tokens(text: &str) -> usize {
     }
 }
 
+/// Workspace target validated against one of the agent's roots.
 struct ResolvedWorkspacePath {
     canonical_path: PathBuf,
     matched_root: PathBuf,
     display_target: String,
 }
 
+/// Resolves a relative target against the workspace roots in order, taking
+/// the first root where it exists. Canonicalization plus the `starts_with`
+/// check rejects symlinks that point outside the matched root.
 fn resolve_existing_workspace_path(
     workspace_roots: &[PathBuf],
     raw_target: &str,
@@ -699,6 +780,9 @@ fn resolve_existing_workspace_path(
     )))
 }
 
+/// Validates a workspace-relative target: non-empty, relative, no
+/// parent-directory traversal, no blocked or `.env*` components. Despite
+/// the name it guards file and folder references as well as git targets.
 fn validate_workspace_relative_git_target(raw_target: &str) -> Result<PathBuf, Status> {
     let trimmed = raw_target.trim();
     if trimmed.is_empty() {
@@ -747,6 +831,8 @@ fn contains_blocked_path_component(path: &Path) -> bool {
     })
 }
 
+/// Reads a file as UTF-8 text truncated to `max_chars`; rejecting non-UTF-8
+/// content keeps binary files out of prompts.
 fn read_text_file_limited(
     path: &Path,
     max_chars: usize,
@@ -760,6 +846,16 @@ fn read_text_file_limited(
     Ok(truncate_reference_text(raw_text, max_chars, warnings))
 }
 
+/// Breadth-first folder walk rendering up to [`MAX_FOLDER_REFERENCE_FILES`]
+/// text files as `<folder_file>` blocks. Symlinked entries are skipped so
+/// the walk can never follow a link outside the workspace root.
+///
+/// AIDEV-NOTE: the char-cap `break` below only exits the current
+/// directory's entry loop; queued subdirectories are still visited (and
+/// read) until the file cap hits. The final `consume_reference_budget`
+/// bounds the output either way, so this only wastes reads -- but making the
+/// break terminate the walk would change the emitted warnings and is a
+/// behavior change.
 fn collect_folder_reference_text(
     folder: &Path,
     matched_root: &Path,

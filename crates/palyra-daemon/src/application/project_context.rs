@@ -1,3 +1,17 @@
+//! Discovery and gating of repo-local project context files (AGENTS.md,
+//! PALYRA.md, scoped `.palyra/context/*.md`) for prompt injection.
+//!
+//! For each turn the engine derives "focus paths" from the prompt (explicit
+//! `@file:`/`@folder:` references plus absolute/relative workspace paths in
+//! prose), walks from each focus directory up to its workspace root, and
+//! loads context files in precedence order (compatibility files before the
+//! preferred PALYRA.md, parents before deeper directories). Every file is
+//! risk-scanned; risky entries require explicit per-session approval and
+//! blocked entries never inject. Session state (focus paths, disabled and
+//! approved entry ids) persists in the journal. The rendered block is
+//! consumed by `application::context_engine` and the project-context
+//! console APIs.
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -27,10 +41,15 @@ use crate::{
     transport::grpc::auth::RequestContext,
 };
 
+// Budgets keeping the project-context stack bounded regardless of how many
+// context files a workspace accumulates.
 const MAX_PROJECT_CONTEXT_FILE_CHARS: usize = 24 * 1_024;
 const MAX_PROJECT_CONTEXT_TOTAL_CHARS: usize = 64 * 1_024;
 const MAX_PROJECT_CONTEXT_STACK_ENTRIES: usize = 24;
 
+/// Injection state of one context file. Only `Active`, `ActiveWithApproval`,
+/// and `Warning` entries reach the prompt; the rest are surfaced to the
+/// console for operator action.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ProjectContextEntryStatus {
@@ -43,6 +62,7 @@ pub(crate) enum ProjectContextEntryStatus {
 }
 
 impl ProjectContextEntryStatus {
+    /// Wire name of the status as stored in [`ProjectContextStackEntry`].
     #[must_use]
     pub const fn as_str(&self) -> &'static str {
         match *self {
@@ -56,12 +76,17 @@ impl ProjectContextEntryStatus {
     }
 }
 
+/// Workspace-relative directory the session is focused on, plus the signal
+/// that selected it (reference marker, prompt path, or persisted state).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ProjectContextFocusPath {
     pub(crate) path: String,
     pub(crate) reason: String,
 }
 
+/// Snapshot of the whole project-context stack for one session: per-status
+/// counts, aggregated warnings, the focus paths, and every discovered entry
+/// in precedence order. Serialized to the console APIs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ProjectContextPreviewEnvelope {
     pub(crate) generated_at_unix_ms: i64,
@@ -75,6 +100,10 @@ pub(crate) struct ProjectContextPreviewEnvelope {
     pub(crate) entries: Vec<ProjectContextStackEntry>,
 }
 
+/// One discovered context file with its precedence position, risk scan,
+/// session gating flags, and (possibly truncated) content. `entry_id`
+/// hashes root + directory + filename -- not the content -- so disable and
+/// approve decisions survive file edits.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ProjectContextStackEntry {
     pub(crate) entry_id: String,
@@ -104,6 +133,7 @@ pub(crate) struct ProjectContextStackEntry {
     pub(crate) resolved_text: String,
 }
 
+/// Result of scaffolding a fresh PALYRA.md into the workspace root.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ProjectContextScaffoldOutcome {
     pub(crate) path: String,
@@ -113,6 +143,14 @@ pub(crate) struct ProjectContextScaffoldOutcome {
     pub(crate) overwritten: bool,
 }
 
+/// Builds the project-context preview for a session, deriving fresh focus
+/// paths from `input_text` and merging them with the persisted ones. With
+/// `persist_focus_paths` the merged set is written back to session state
+/// (skipped when nothing changed to avoid a journal write per turn).
+///
+/// # Errors
+/// Fails with `failed_precondition` when the resolved agent has no
+/// workspace roots, and propagates journal and filesystem read failures.
 pub(crate) async fn preview_project_context(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: &RequestContext,
@@ -155,6 +193,11 @@ pub(crate) async fn preview_project_context(
     )
 }
 
+/// Re-reads the stack from disk and stamps `last_refreshed_at_unix_ms` in
+/// session state, preserving focus/disable/approve decisions.
+///
+/// # Errors
+/// Same failure modes as [`preview_project_context`].
 pub(crate) async fn refresh_project_context(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: &RequestContext,
@@ -178,6 +221,11 @@ pub(crate) async fn refresh_project_context(
     preview_project_context(runtime_state, context, session_id, "", false).await
 }
 
+/// Disables one entry for the session (idempotent) and returns the updated
+/// preview.
+///
+/// # Errors
+/// Same failure modes as [`preview_project_context`].
 pub(crate) async fn disable_project_context_entry(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: &RequestContext,
@@ -204,6 +252,11 @@ pub(crate) async fn disable_project_context_entry(
     preview_project_context(runtime_state, context, session_id, "", false).await
 }
 
+/// Removes one entry from the session's disabled set and returns the
+/// updated preview.
+///
+/// # Errors
+/// Same failure modes as [`preview_project_context`].
 pub(crate) async fn enable_project_context_entry(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: &RequestContext,
@@ -231,6 +284,11 @@ pub(crate) async fn enable_project_context_entry(
     preview_project_context(runtime_state, context, session_id, "", false).await
 }
 
+/// Marks one approval-gated entry as approved for the session (idempotent)
+/// and returns the updated preview. Approval does not override `Blocked`.
+///
+/// # Errors
+/// Same failure modes as [`preview_project_context`].
 pub(crate) async fn approve_project_context_entry(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: &RequestContext,
@@ -257,6 +315,11 @@ pub(crate) async fn approve_project_context_entry(
     preview_project_context(runtime_state, context, session_id, "", false).await
 }
 
+/// Copies focus/disable/approve state to another session, used when a
+/// session is forked or handed off so its gating decisions carry over.
+///
+/// # Errors
+/// Propagates journal failures from the copy.
 pub(crate) async fn copy_project_context_state(
     runtime_state: &Arc<GatewayRuntimeState>,
     source_session_id: &str,
@@ -271,6 +334,13 @@ pub(crate) async fn copy_project_context_state(
         .map(|_| ())
 }
 
+/// Writes the PALYRA.md starter template into the first workspace root,
+/// naming the project after `project_name` or the root directory.
+///
+/// # Errors
+/// Fails with `failed_precondition` when the file already exists and
+/// `force` is not set or when no workspace root is configured, and with
+/// `internal` on clock or write failures.
 pub(crate) async fn scaffold_project_context_file(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: &RequestContext,
@@ -311,6 +381,9 @@ pub(crate) async fn scaffold_project_context_file(
     })
 }
 
+/// Renders the active entries as the `<project_context>` prompt block
+/// followed by `fallback_prompt`. Returns `None` when nothing is active so
+/// callers skip the block entirely.
 pub(crate) fn render_project_context_prompt(
     preview: &ProjectContextPreviewEnvelope,
     fallback_prompt: &str,
@@ -352,6 +425,9 @@ pub(crate) fn render_project_context_prompt(
     Some(block)
 }
 
+/// Core stack builder: walks the candidate directories in precedence order,
+/// loads and risk-scans each context file under the shared budgets, and
+/// applies the session's disable/approve decisions.
 fn build_project_context_preview(
     workspace_roots: &[PathBuf],
     focus_paths: &[ProjectContextFocusPath],
@@ -360,6 +436,8 @@ fn build_project_context_preview(
     now_unix_ms: i64,
 ) -> Result<ProjectContextPreviewEnvelope, Status> {
     let mut candidate_directories = discover_candidate_directories(workspace_roots, focus_paths)?;
+    // Discovery never returns empty in practice (each root seeds itself),
+    // but fall back to the bare roots so the preview cannot go blank.
     if candidate_directories.is_empty() {
         candidate_directories = workspace_roots
             .iter()
@@ -385,6 +463,8 @@ fn build_project_context_preview(
             if !path.is_file() {
                 continue;
             }
+            // Canonicalize both sides so a symlinked context file cannot
+            // smuggle content from outside the workspace boundary.
             let canonical_path = path.canonicalize().unwrap_or_else(|_| path.clone());
             let canonical_root =
                 candidate.root.canonicalize().unwrap_or_else(|_| candidate.root.clone());
@@ -424,6 +504,8 @@ fn build_project_context_preview(
             }
             total_chars = total_chars.saturating_add(truncated_text.len());
 
+            // The id hashes location, not content, so a session's disable
+            // and approve decisions survive edits to the file.
             let entry_id = crate::sha256_hex(
                 format!(
                     "{}\n{}\n{}",
@@ -434,6 +516,8 @@ fn build_project_context_preview(
                 .as_bytes(),
             );
             let metadata = fs::metadata(path.as_path()).ok();
+            // Combine the project-context scanner with the shared workspace
+            // prompt-injection scanner; the stricter verdict wins via merge.
             let mut risk = scan_project_context_content(raw.as_str());
             risk = risk.merge(&workspace_risk_as_project_context(raw.as_str()));
             let disabled = disabled_ids.contains(entry_id.as_str());
@@ -523,6 +607,10 @@ fn truncate_project_context_text(input: &str, max_chars: usize) -> (String, bool
     (input.chars().take(max_chars).collect::<String>(), true)
 }
 
+/// Derives focus directories from a prompt: explicit workspace-flavored
+/// `@` references first, then absolute and relative paths mentioned in
+/// prose. First reason wins per path (`BTreeMap::entry` keeps the earliest),
+/// so an explicit reference outranks a prose mention of the same path.
 fn derive_focus_paths_from_prompt(
     input_text: &str,
     workspace_roots: &[PathBuf],
@@ -559,6 +647,9 @@ fn derive_focus_paths_from_prompt(
         .collect()
 }
 
+/// Maps absolute paths mentioned in the prompt to workspace-relative focus
+/// directories. Paths outside every workspace root are ignored; the
+/// workspace root itself is not a focus (it is always scanned anyway).
 fn derive_absolute_workspace_focus_paths(
     input_text: &str,
     workspace_roots: &[PathBuf],
@@ -577,6 +668,9 @@ fn derive_absolute_workspace_focus_paths(
         if !parsed.is_absolute() {
             continue;
         }
+        // The prompt may name a file that does not exist yet ("create
+        // project/notes.md"); walking up to the nearest existing ancestor
+        // still yields a useful focus directory.
         let existing = nearest_existing_path(parsed.as_path());
         let Some(existing) = existing else {
             continue;
@@ -601,6 +695,9 @@ fn derive_absolute_workspace_focus_paths(
     focus_paths.into_iter().collect()
 }
 
+/// Like the absolute variant, but for relative paths in prose
+/// ("fixtures/scope-limited-replace"): each candidate is joined onto every
+/// workspace root and kept only where something exists under that root.
 fn derive_relative_workspace_focus_paths(
     input_text: &str,
     workspace_roots: &[PathBuf],
@@ -642,6 +739,7 @@ fn derive_relative_workspace_focus_paths(
     focus_paths.into_iter().collect()
 }
 
+/// Walks up the ancestor chain to the closest path that exists on disk.
 fn nearest_existing_path(path: &Path) -> Option<PathBuf> {
     let mut cursor = path.to_path_buf();
     loop {
@@ -654,6 +752,11 @@ fn nearest_existing_path(path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Scans prose for absolute path candidates: `/unix/style` and
+/// `C:\windows\style` starts at a word boundary, terminated by whitespace
+/// or quote characters (a leading quote extends the path until its closing
+/// quote, allowing embedded spaces). Cursor arithmetic steps by
+/// `len_utf8`, so every slice index stays on a char boundary.
 fn extract_absolute_prompt_paths(input_text: &str) -> Vec<String> {
     let mut paths = Vec::new();
     let mut cursor = 0usize;
@@ -684,6 +787,9 @@ fn extract_absolute_prompt_paths(input_text: &str) -> Vec<String> {
     paths
 }
 
+/// Companion to [`extract_absolute_prompt_paths`] for relative candidates;
+/// a token only counts as a path once it contains a separator, so ordinary
+/// words are never treated as focus paths.
 fn extract_relative_prompt_paths(input_text: &str) -> Vec<String> {
     let mut paths = Vec::new();
     let mut cursor = 0usize;
@@ -764,6 +870,9 @@ fn trim_prompt_path_candidate(candidate: &str) -> &str {
     candidate.trim().trim_matches(['.', ',', ';', ':', '!', '?', ')', ']', '}'])
 }
 
+/// Normalizes a relative prose path to forward slashes. Rejects URLs and
+/// anything with a colon (drive letters, schemes), absolute paths, bare
+/// single-segment names, and any traversal component.
 fn normalize_relative_prompt_path(path: &str) -> Option<String> {
     let normalized = path.trim().replace('\\', "/");
     if normalized.is_empty()
@@ -792,6 +901,8 @@ fn normalize_relative_prompt_path(path: &str) -> Option<String> {
     (!components.is_empty()).then(|| components.join("/"))
 }
 
+/// Merges persisted focus paths with newly derived ones; persisted entries
+/// keep their original reason and derived ones never displace them.
 fn merge_focus_paths(
     existing: &[String],
     derived: &[ProjectContextFocusPath],
@@ -827,6 +938,8 @@ fn normalize_focus_path(path: &str) -> Option<String> {
     }
 }
 
+/// Directory that may contribute context files, with the discovery reasons
+/// that selected it.
 #[derive(Debug, Clone)]
 struct CandidateDirectory {
     root: PathBuf,
@@ -836,6 +949,11 @@ struct CandidateDirectory {
     reasons: Vec<String>,
 }
 
+/// Collects every directory whose context files apply: each workspace root
+/// plus, for each focus path, the focus directory and all of its ancestors
+/// up to the root -- a deeper file inherits its parents' conventions. The
+/// final root/depth/name sort yields the injection order (broader context
+/// before more specific context).
 fn discover_candidate_directories(
     workspace_roots: &[PathBuf],
     focus_paths: &[ProjectContextFocusPath],
@@ -901,6 +1019,8 @@ fn discover_candidate_directories(
     Ok(sorted)
 }
 
+/// Inserts or merges a candidate, accumulating discovery reasons when the
+/// same directory is reached through several focus paths.
 fn upsert_candidate_directory(
     directories: &mut BTreeMap<(String, String), CandidateDirectory>,
     candidate: CandidateDirectory,
@@ -912,6 +1032,9 @@ fn upsert_candidate_directory(
     entry.reasons = normalize_string_set(reasons);
 }
 
+/// Resolves a focus path inside `root` to `(canonical directory, display
+/// path, depth)`. A focus naming a file resolves to its parent directory;
+/// traversal, absolute components, and canonicalized escapes are rejected.
 fn resolve_focus_directory(
     root: &Path,
     relative_focus_path: &str,
@@ -957,6 +1080,8 @@ fn resolve_focus_directory(
     Ok(Some((canonical, display, depth)))
 }
 
+/// Renders a relative directory with forward slashes, using "." for the
+/// root itself.
 fn normalize_directory_display(path: &Path) -> String {
     let rendered = path
         .components()
@@ -973,6 +1098,9 @@ fn normalize_directory_display(path: &Path) -> String {
     }
 }
 
+/// Known context filenames sorted by precedence rank, so compatibility
+/// files (AGENTS.md) load before the preferred PALYRA.md within a
+/// directory and later entries win on conflict.
 fn ordered_project_context_kinds() -> Vec<ProjectContextFileKind> {
     let mut kinds = project_context_filenames()
         .iter()
@@ -982,6 +1110,7 @@ fn ordered_project_context_kinds() -> Vec<ProjectContextFileKind> {
     kinds
 }
 
+/// Context file that may exist in a candidate directory, with its labels.
 #[derive(Debug, Clone)]
 struct ProjectContextFileCandidate {
     relative_path: PathBuf,
@@ -991,6 +1120,9 @@ struct ProjectContextFileCandidate {
     precedence_label: String,
 }
 
+/// Lists the well-known context filenames plus any scoped
+/// `.palyra/context/*.md` documents (sorted for deterministic order) found
+/// in this directory.
 fn project_context_file_candidates(
     directory_path: &Path,
 ) -> Result<Vec<ProjectContextFileCandidate>, Status> {
@@ -1038,6 +1170,10 @@ fn project_context_file_candidates(
     Ok(candidates)
 }
 
+/// Maps session flags and the risk verdict to `(active, status, warnings)`.
+/// Precedence: a session disable beats everything; then the risk action
+/// decides, with `ApprovalRequired` activating only when the session
+/// explicitly approved the entry. `Blocked` cannot be approved around.
 fn evaluate_entry_status(
     disabled: bool,
     approved: bool,
@@ -1076,6 +1212,9 @@ fn evaluate_entry_status(
     }
 }
 
+/// Translates the shared workspace prompt-injection scanner's verdict into
+/// project-context risk vocabulary (warning stays warning, quarantine
+/// becomes blocked) so both scanners can be merged.
 fn workspace_risk_as_project_context(content: &str) -> ProjectContextRiskScan {
     let workspace_scan = scan_workspace_content_for_prompt_injection(content);
     match workspace_scan.state {
@@ -1122,13 +1261,19 @@ fn metadata_modified_at_unix_ms(metadata: fs::Metadata) -> Option<i64> {
         .modified()
         .ok()
         .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        // Millisecond timestamps fit i64 for any realistic clock; the cast
+        // is intentional narrowing from u128.
         .map(|duration| duration.as_millis() as i64)
 }
 
+/// Token heuristic for context files: the larger of the word count and a
+/// bytes/4 floor, so both prose and dense markup are bounded from above.
 fn estimate_text_tokens(text: &str) -> usize {
     text.split_whitespace().count().max(text.len() / 4)
 }
 
+/// Trims, drops empties, deduplicates, and sorts -- the canonical form for
+/// persisted id/warning lists so comparisons are order-insensitive.
 fn normalize_string_set(values: Vec<String>) -> Vec<String> {
     values
         .into_iter()
@@ -1139,12 +1284,15 @@ fn normalize_string_set(values: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+/// Starter PALYRA.md content used by [`scaffold_project_context_file`].
 fn render_project_context_template(project_name: &str) -> String {
     format!(
         "# PALYRA.md\n\n## Purpose\n- Summarize what `{project_name}` does and what outcome matters most for changes in this repo.\n\n## Working Agreements\n- Describe repo-specific guardrails, release expectations, and quality bars.\n- Call out the canonical commands or checks that must pass before a change is considered done.\n\n## Architecture Notes\n- Explain where the primary modules live and where new code should usually go.\n- Mention integration boundaries, generated files, or other areas that require extra care.\n\n## Definition of Done\n- List the tests, lint, typecheck, or manual verifications expected for normal changes.\n- Mention any security, migration, or rollout checks that cannot be skipped.\n\n## Out Of Scope\n- Record changes that should not be made casually in this repository.\n- Capture known anti-patterns or compatibility constraints.\n"
     )
 }
 
+/// Resolves the session agent's workspace roots, canonicalized up front so
+/// every later `starts_with` boundary check compares canonical forms.
 async fn resolve_workspace_roots(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: &RequestContext,
