@@ -4,70 +4,103 @@ Usage: palyra configure [OPTIONS]
 
 Options:
       --path <PATH>
+          Edit this palyra.toml path
 
       --section <SECTIONS>
+          Limit reconfiguration to this section; repeat for multiple sections
+
           [possible values: deployment-profile, workspace, auth-model, gateway, runtime-controls, daemon-service, channels, skills, health-security]
 
       --deployment-profile <DEPLOYMENT_PROFILE>
+          Set the deployment profile
+
           [possible values: local, single-vm, worker-enabled]
 
       --non-interactive
+          Run without interactive prompts
 
       --accept-risk
+          Accept risk gates required by the selected changes
 
       --json
+          Print reconfiguration results as JSON
 
       --workspace-root <WORKSPACE_ROOT>
+          Set the workspace root
 
       --auth-method <AUTH_METHOD>
+          Choose how model-provider credentials are configured
+
           [possible values: api-key, anthropic-api-key, minimax-api-key, skip, existing-config]
 
       --api-key-env <API_KEY_ENV>
+          Read the model-provider API key from this environment variable name
 
       --api-key-stdin
           Read one model-provider API key from stdin; requires --non-interactive for scripted configure runs
 
       --api-key-prompt
+          Prompt securely for the model-provider API key
 
       --bind-profile <BIND_PROFILE>
+          Select loopback-only or public TLS gateway binding
+
           [possible values: loopback-only, public-tls]
 
       --daemon-port <DAEMON_PORT>
+          Set the daemon HTTP port
 
       --grpc-port <GRPC_PORT>
+          Set the daemon gRPC port
 
       --quic-port <QUIC_PORT>
+          Set the daemon QUIC port
 
       --tls-scaffold <TLS_SCAFFOLD>
+          Choose TLS scaffold handling for gateway setup
+
           [possible values: none, bring-your-own, self-signed]
 
       --tls-cert-path <TLS_CERT_PATH>
+          Use this TLS certificate path for public gateway binding
 
       --tls-key-path <TLS_KEY_PATH>
+          Use this TLS private-key path for public gateway binding
 
       --remote-base-url <REMOTE_BASE_URL>
+          Record this remote dashboard or gateway base URL
 
       --admin-token-env <ADMIN_TOKEN_ENV>
+          Read the admin token from this environment variable name
 
       --admin-token-stdin
           Read one admin token from stdin; requires --non-interactive for scripted configure runs
 
       --admin-token-prompt
+          Prompt securely for the admin token
 
       --remote-verification <REMOTE_VERIFICATION>
+          Choose how remote gateway identity is verified
+
           [possible values: none, server-cert, gateway-ca]
 
       --pinned-server-cert-sha256 <PINNED_SERVER_CERT_SHA256>
+          Pin the remote server certificate SHA-256 digest
 
       --pinned-gateway-ca-sha256 <PINNED_GATEWAY_CA_SHA256>
+          Pin the gateway CA SHA-256 digest
 
       --ssh-target <SSH_TARGET>
+          Record the SSH target used for remote administration
 
       --skip-health
+          Skip post-reconfiguration health checks
 
       --skip-channels
+          Skip channel reconfiguration
 
       --skip-skills
+          Skip skill reconfiguration
 
   -h, --help
           Print help (see a summary with '-h')

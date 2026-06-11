@@ -638,6 +638,106 @@ fn agent_run_help_documents_canonical_run_id_shape() {
     );
 }
 
+fn render_help_for_path(path: &[&str]) -> String {
+    let mut command = Cli::command();
+    let mut current = &mut command;
+    for name in path {
+        current = current
+            .find_subcommand_mut(name)
+            .unwrap_or_else(|| panic!("{} subcommand should be registered", path.join(" ")));
+    }
+    current.render_long_help().to_string()
+}
+
+#[test]
+fn e2e_reported_help_surfaces_describe_commands_and_flags() {
+    let cases: &[(&[&str], &[&str])] = &[
+        (&["agent"], &["Start a one-off agent run", "Open an interactive terminal agent session"]),
+        (
+            &["agent", "run"],
+            &[
+                "Override the daemon gRPC endpoint",
+                "Read the prompt text from stdin",
+                "Permit tools classified as sensitive",
+                "Stream run events as newline-delimited JSON",
+            ],
+        ),
+        (&["onboarding"], &["Run the guided onboarding wizard", "Inspect onboarding state"]),
+        (
+            &["onboarding", "wizard"],
+            &[
+                "Write or read this palyra.toml path",
+                "Overwrite existing onboarding output",
+                "Run without interactive prompts",
+                "Accept the risk gates",
+                "Print the onboarding result as JSON",
+            ],
+        ),
+        (
+            &["configure"],
+            &[
+                "Edit this palyra.toml path",
+                "Limit reconfiguration to this section",
+                "Run without interactive prompts",
+                "Accept risk gates",
+                "Print reconfiguration results as JSON",
+            ],
+        ),
+        (
+            &["sessions"],
+            &[
+                "List known chat sessions",
+                "Show one session by id or key",
+                "Enqueue background work for a session",
+            ],
+        ),
+        (&["backup"], &["Create a portable backup archive", "Verify a portable backup archive"]),
+        (
+            &["protocol"],
+            &[
+                "Show protocol and schema contract versions",
+                "Validate committed protocol contract artifacts",
+                "Validate a protocol identifier string",
+            ],
+        ),
+        (
+            &["config"],
+            &[
+                "Show effective configuration status",
+                "Read one configuration key",
+                "Set one configuration key",
+            ],
+        ),
+        (
+            &["system"],
+            &[
+                "Show runtime heartbeat state",
+                "Show subsystem presence and availability",
+                "List or emit system events",
+            ],
+        ),
+        (
+            &["logs"],
+            &[
+                "Read journal entries from this SQLite database path",
+                "Number of recent log lines to print",
+                "Keep polling and print new log entries",
+            ],
+        ),
+    ];
+
+    for (path, expected_fragments) in cases {
+        let help = render_help_for_path(path);
+        for expected in *expected_fragments {
+            assert!(
+                help.contains(expected),
+                "{} help should include {expected:?}: {help}",
+                path.join(" ")
+            );
+        }
+    }
+}
+
 #[test]
 fn parse_agent_run_interrupt_active_run_flag_and_alias() {
     for flag in ["--interrupt-active-run", "--abort-active-run"] {

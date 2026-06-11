@@ -1,9 +1,11 @@
+List effective configuration values
+
 Usage: palyra config list [OPTIONS]
 
 Options:
-      --path <PATH>
-      --show-secrets
-      --json
+      --path <PATH>   List values from this palyra.toml path
+      --show-secrets  Include secret values instead of redacting them
+      --json          Print configuration values as JSON
   -h, --help          Print help
 
 Global Options:

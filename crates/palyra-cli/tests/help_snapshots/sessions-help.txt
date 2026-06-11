@@ -3,37 +3,37 @@ List, inspect, and manage chat sessions
 Usage: palyra sessions [OPTIONS] <COMMAND>
 
 Commands:
-  list
-  history                [aliases: search]
-  show                   [aliases: resume]
-  resolve
-  rename
-  reset
-  cleanup
-  abort
-  queue-policy
-  queue-pause
-  queue-resume
-  queue-drain
-  queue-collect-summary
-  queue-cancel
-  retry
-  branch
-  transcript-search
-  export
-  compact-preview
-  compact-apply
-  compaction-show
-  checkpoint-create
-  checkpoint-show
-  checkpoint-restore
-  background-enqueue
-  background-list
-  background-show
-  background-pause
-  background-resume
-  background-retry
-  background-cancel
+  list                   List known chat sessions
+  history                Search or summarize session history [aliases: search]
+  show                   Show one session by id or key [aliases: resume]
+  resolve                Resolve a session selector into a concrete session
+  rename                 Rename a session label
+  reset                  Reset a session
+  cleanup                Clean up session state after confirmation
+  abort                  Abort a running session run
+  queue-policy           Show queue policy for a session
+  queue-pause            Pause queued work for a session
+  queue-resume           Resume queued work for a session
+  queue-drain            Drain queued work for a session
+  queue-collect-summary  Collect a summary from queued work
+  queue-cancel           Cancel one queued input
+  retry                  Retry the latest failed or interrupted turn
+  branch                 Branch a session into a new label
+  transcript-search      Search within a session transcript
+  export                 Export a session transcript
+  compact-preview        Preview session compaction candidates
+  compact-apply          Apply session compaction decisions
+  compaction-show        Show a compaction artifact
+  checkpoint-create      Create a session checkpoint
+  checkpoint-show        Show a session checkpoint
+  checkpoint-restore     Restore a session checkpoint
+  background-enqueue     Enqueue background work for a session
+  background-list        List background tasks
+  background-show        Show one background task
+  background-pause       Pause one background task
+  background-resume      Resume one background task
+  background-retry       Retry one background task
+  background-cancel      Cancel one background task
 
 Options:
   -h, --help  Print help

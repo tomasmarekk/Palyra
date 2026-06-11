@@ -544,15 +544,19 @@ pub enum Command {
         after_long_help = LOGS_AFTER_HELP
     )]
     Logs {
-        #[arg(long)]
+        #[arg(long, help = "Read journal entries from this SQLite database path")]
         db_path: Option<String>,
-        #[arg(long, default_value_t = 50)]
+        #[arg(long, default_value_t = 50, help = "Number of recent log lines to print")]
         lines: usize,
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, help = "Keep polling and print new log entries")]
         follow: bool,
-        #[arg(long, default_value_t = 1000)]
+        #[arg(
+            long,
+            default_value_t = 1000,
+            help = "Polling interval in milliseconds when following"
+        )]
         poll_interval_ms: u64,
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, help = "Print log entries as JSON")]
         json: bool,
     },
     #[command(about = "Show transport and admin status across HTTP/gRPC surfaces")]
@@ -753,7 +757,11 @@ pub enum Command {
         #[arg(long = "shell", value_enum, value_name = "SHELL", conflicts_with = "shell")]
         shell_flag: Option<CompletionShell>,
     },
-    #[command(visible_alias = "onboard", after_long_help = ONBOARDING_AFTER_HELP)]
+    #[command(
+        visible_alias = "onboard",
+        about = "Run guided onboarding workflows",
+        after_long_help = ONBOARDING_AFTER_HELP
+    )]
     Onboarding {
         #[command(subcommand)]
         command: OnboardingCommand,
@@ -771,23 +779,31 @@ pub enum Command {
         after_long_help = CONFIGURE_AFTER_HELP
     )]
     Configure {
-        #[arg(long)]
+        #[arg(long, help = "Edit this palyra.toml path")]
         path: Option<String>,
-        #[arg(long = "section", value_enum)]
+        #[arg(
+            long = "section",
+            value_enum,
+            help = "Limit reconfiguration to this section; repeat for multiple sections"
+        )]
         sections: Vec<ConfigureSectionArg>,
-        #[arg(long = "deployment-profile", value_enum)]
+        #[arg(long = "deployment-profile", value_enum, help = "Set the deployment profile")]
         deployment_profile: Option<DeploymentProfileArg>,
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, help = "Run without interactive prompts")]
         non_interactive: bool,
-        #[arg(long, default_value_t = false)]
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Accept risk gates required by the selected changes"
+        )]
         accept_risk: bool,
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, help = "Print reconfiguration results as JSON")]
         json: bool,
-        #[arg(long)]
+        #[arg(long, help = "Set the workspace root")]
         workspace_root: Option<String>,
-        #[arg(long, value_enum)]
+        #[arg(long, value_enum, help = "Choose how model-provider credentials are configured")]
         auth_method: Option<OnboardingAuthMethodArg>,
-        #[arg(long)]
+        #[arg(long, help = "Read the model-provider API key from this environment variable name")]
         api_key_env: Option<String>,
         #[arg(
             long,
@@ -795,25 +811,29 @@ pub enum Command {
             help = "Read one model-provider API key from stdin; requires --non-interactive for scripted configure runs"
         )]
         api_key_stdin: bool,
-        #[arg(long, default_value_t = false)]
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Prompt securely for the model-provider API key"
+        )]
         api_key_prompt: bool,
-        #[arg(long, value_enum)]
+        #[arg(long, value_enum, help = "Select loopback-only or public TLS gateway binding")]
         bind_profile: Option<GatewayBindProfileArg>,
-        #[arg(long)]
+        #[arg(long, help = "Set the daemon HTTP port")]
         daemon_port: Option<u16>,
-        #[arg(long)]
+        #[arg(long, help = "Set the daemon gRPC port")]
         grpc_port: Option<u16>,
-        #[arg(long)]
+        #[arg(long, help = "Set the daemon QUIC port")]
         quic_port: Option<u16>,
-        #[arg(long, value_enum)]
+        #[arg(long, value_enum, help = "Choose TLS scaffold handling for gateway setup")]
         tls_scaffold: Option<InitTlsScaffoldArg>,
-        #[arg(long)]
+        #[arg(long, help = "Use this TLS certificate path for public gateway binding")]
         tls_cert_path: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Use this TLS private-key path for public gateway binding")]
         tls_key_path: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Record this remote dashboard or gateway base URL")]
         remote_base_url: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Read the admin token from this environment variable name")]
         admin_token_env: Option<String>,
         #[arg(
             long,
@@ -821,21 +841,21 @@ pub enum Command {
             help = "Read one admin token from stdin; requires --non-interactive for scripted configure runs"
         )]
         admin_token_stdin: bool,
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, help = "Prompt securely for the admin token")]
         admin_token_prompt: bool,
-        #[arg(long, value_enum)]
+        #[arg(long, value_enum, help = "Choose how remote gateway identity is verified")]
         remote_verification: Option<RemoteVerificationModeArg>,
-        #[arg(long)]
+        #[arg(long, help = "Pin the remote server certificate SHA-256 digest")]
         pinned_server_cert_sha256: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Pin the gateway CA SHA-256 digest")]
         pinned_gateway_ca_sha256: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Record the SSH target used for remote administration")]
         ssh_target: Option<String>,
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, help = "Skip post-reconfiguration health checks")]
         skip_health: bool,
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, help = "Skip channel reconfiguration")]
         skip_channels: bool,
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, help = "Skip skill reconfiguration")]
         skip_skills: bool,
     },
     #[command(

@@ -6,18 +6,21 @@ use clap::Subcommand;
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum ProtocolCommand {
+    #[command(about = "Show protocol and schema contract versions")]
     Version {
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, help = "Print protocol version data as JSON")]
         json: bool,
     },
+    #[command(about = "Validate committed protocol contract artifacts")]
     Validate {
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, help = "Print protocol validation results as JSON")]
         json: bool,
     },
+    #[command(about = "Validate a protocol identifier string")]
     ValidateId {
-        #[arg(long)]
+        #[arg(long, help = "Protocol identifier to validate")]
         id: String,
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, help = "Print identifier validation results as JSON")]
         json: bool,
     },
 }

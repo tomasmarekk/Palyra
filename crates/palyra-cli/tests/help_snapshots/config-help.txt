@@ -3,15 +3,15 @@ Inspect and validate local configuration
 Usage: palyra config [OPTIONS] [COMMAND]
 
 Commands:
-  status
-  path
-  validate
-  list      [aliases: show]
-  get
-  set
-  unset
-  migrate
-  recover
+  status    Show effective configuration status
+  path      Resolve the active configuration file path
+  validate  Validate the local configuration file
+  list      List effective configuration values [aliases: show]
+  get       Read one configuration key
+  set       Set one configuration key
+  unset     Remove one configuration key
+  migrate   Migrate configuration to the current schema
+  recover   Recover configuration from a retained backup
 
 Options:
   -h, --help  Print help

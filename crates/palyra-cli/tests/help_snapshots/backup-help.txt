@@ -3,8 +3,8 @@ Create or verify portable operator backups
 Usage: palyra backup [OPTIONS] <COMMAND>
 
 Commands:
-  create
-  verify
+  create  Create a portable backup archive
+  verify  Verify a portable backup archive
 
 Options:
   -h, --help

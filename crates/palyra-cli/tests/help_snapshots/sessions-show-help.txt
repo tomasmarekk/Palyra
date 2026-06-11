@@ -1,9 +1,11 @@
+Show one session by id or key
+
 Usage: palyra sessions show [OPTIONS]
 
 Options:
-      --session-id <SESSION_ID>
-      --session-key <SESSION_KEY>
-      --json
+      --session-id <SESSION_ID>    Show this exact session id
+      --session-key <SESSION_KEY>  Show the session resolved from this stable key
+      --json                       Print the session as JSON
   -h, --help                       Print help
 
 Global Options:

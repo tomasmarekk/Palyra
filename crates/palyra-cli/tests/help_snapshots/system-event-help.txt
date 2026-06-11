@@ -1,8 +1,10 @@
+List or emit system events
+
 Usage: palyra system event [OPTIONS] <COMMAND>
 
 Commands:
-  list
-  emit
+  list  List recent system events
+  emit  Emit a synthetic system event
 
 Options:
   -h, --help  Print help

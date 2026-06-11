@@ -9,26 +9,35 @@ use super::{AcpBridgeArgs, AcpShimArgs};
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum AgentCommand {
+    #[command(about = "Start a one-off agent run and stream its events")]
     Run {
-        #[arg(long)]
+        #[arg(long, help = "Override the daemon gRPC endpoint for this run")]
         grpc_url: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Use this bearer token for daemon authentication")]
         token: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Send the request as this principal")]
         principal: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Attach this operator device id to the request")]
         device_id: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Route the run through this channel id")]
         channel: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Resume or target this exact session id")]
         session_id: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Resolve the target session by stable session key")]
         session_key: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Create or rename the session with this label")]
         session_label: Option<String>,
-        #[arg(long, default_value_t = false)]
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Fail if the selected session does not already exist"
+        )]
         require_existing: bool,
-        #[arg(long, default_value_t = false)]
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Clear prior session state before starting the run"
+        )]
         reset_session: bool,
         #[arg(long, help = "Canonical 26-character ULID run id. Omit to generate one.")]
         run_id: Option<String>,
@@ -37,9 +46,13 @@ pub enum AgentCommand {
             help = "Single-line prompt text. Use --prompt-stdin for multi-line or blank-line separated prompts."
         )]
         prompt: Option<String>,
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, help = "Read the prompt text from stdin")]
         prompt_stdin: bool,
-        #[arg(long, default_value_t = false)]
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Permit tools classified as sensitive for this run"
+        )]
         allow_sensitive_tools: bool,
         #[arg(
             long,
@@ -48,39 +61,54 @@ pub enum AgentCommand {
             help = "Abort the selected active run, then start this prompt in the same session."
         )]
         interrupt_active_run: bool,
-        #[arg(long, value_enum, default_value_t = AgentApprovalModeArg::AllowOnce)]
+        #[arg(long, value_enum, default_value_t = AgentApprovalModeArg::AllowOnce, help = "Select how tool approval requests are handled")]
         approval_mode: AgentApprovalModeArg,
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, help = "Stream run events as newline-delimited JSON")]
         ndjson: bool,
     },
+    #[command(about = "Open an interactive terminal agent session")]
     Interactive {
-        #[arg(long)]
+        #[arg(long, help = "Override the daemon gRPC endpoint for this session")]
         grpc_url: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Use this bearer token for daemon authentication")]
         token: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Send the session request as this principal")]
         principal: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Attach this operator device id to the request")]
         device_id: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Route the session through this channel id")]
         channel: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Resume or target this exact session id")]
         session_id: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Resolve the target session by stable session key")]
         session_key: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Create or rename the session with this label")]
         session_label: Option<String>,
-        #[arg(long, default_value_t = false)]
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Fail if the selected session does not already exist"
+        )]
         require_existing: bool,
-        #[arg(long, default_value_t = false)]
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Permit tools classified as sensitive for this session"
+        )]
         allow_sensitive_tools: bool,
-        #[arg(long, default_value_t = false)]
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Stream interactive events as newline-delimited JSON"
+        )]
         ndjson: bool,
     },
+    #[command(about = "Run the legacy ACP compatibility shim")]
     AcpShim {
         #[command(flatten)]
         command: AcpShimArgs,
     },
+    #[command(about = "Run the ACP stdio bridge")]
     Acp {
         #[command(flatten)]
         command: AcpBridgeArgs,

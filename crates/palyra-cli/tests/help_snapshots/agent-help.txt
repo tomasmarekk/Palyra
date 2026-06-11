@@ -3,10 +3,10 @@ Run one-off or interactive agent sessions
 Usage: palyra agent [OPTIONS] <COMMAND>
 
 Commands:
-  run
-  interactive
-  acp-shim
-  acp
+  run          Start a one-off agent run and stream its events
+  interactive  Open an interactive terminal agent session
+  acp-shim     Run the legacy ACP compatibility shim
+  acp          Run the ACP stdio bridge
 
 Options:
   -h, --help  Print help

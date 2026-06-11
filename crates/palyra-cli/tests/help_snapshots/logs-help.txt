@@ -4,16 +4,23 @@ Usage: palyra logs [OPTIONS]
 
 Options:
       --db-path <DB_PATH>
+          Read journal entries from this SQLite database path
 
       --lines <LINES>
+          Number of recent log lines to print
+
           [default: 50]
 
       --follow
+          Keep polling and print new log entries
 
       --poll-interval-ms <POLL_INTERVAL_MS>
+          Polling interval in milliseconds when following
+
           [default: 1000]
 
       --json
+          Print log entries as JSON
 
   -h, --help
           Print help (see a summary with '-h')

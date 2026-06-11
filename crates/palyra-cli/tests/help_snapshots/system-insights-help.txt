@@ -3,7 +3,7 @@ Inspect aggregated operator insights and hotspots
 Usage: palyra system insights [OPTIONS]
 
 Options:
-      --json
+      --json  Print operator insights as JSON
   -h, --help  Print help
 
 Global Options:

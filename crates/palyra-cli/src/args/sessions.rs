@@ -9,6 +9,7 @@ use super::AgentApprovalModeArg;
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum SessionsCommand {
+    #[command(about = "List known chat sessions")]
     List {
         #[arg(long)]
         after: Option<String>,
@@ -21,7 +22,7 @@ pub enum SessionsCommand {
         #[arg(long, default_value_t = false, conflicts_with = "json")]
         ndjson: bool,
     },
-    #[command(visible_alias = "search")]
+    #[command(visible_alias = "search", about = "Search or summarize session history")]
     History {
         #[arg(long)]
         query: Option<String>,
@@ -36,15 +37,16 @@ pub enum SessionsCommand {
         #[arg(long, default_value_t = false, conflicts_with = "json")]
         ndjson: bool,
     },
-    #[command(visible_alias = "resume")]
+    #[command(visible_alias = "resume", about = "Show one session by id or key")]
     Show {
-        #[arg(long)]
+        #[arg(long, help = "Show this exact session id")]
         session_id: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Show the session resolved from this stable key")]
         session_key: Option<String>,
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, help = "Print the session as JSON")]
         json: bool,
     },
+    #[command(about = "Resolve a session selector into a concrete session")]
     Resolve {
         #[arg(long)]
         session_id: Option<String>,
@@ -59,6 +61,7 @@ pub enum SessionsCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Rename a session label")]
     Rename {
         #[arg(value_name = "SESSION_ID", required_unless_present = "session_key")]
         session_id: Option<String>,
@@ -69,11 +72,13 @@ pub enum SessionsCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Reset a session")]
     Reset {
         session_id: String,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Clean up session state after confirmation")]
     Cleanup {
         #[arg(long)]
         session_id: Option<String>,
@@ -86,6 +91,7 @@ pub enum SessionsCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Abort a running session run")]
     Abort {
         run_id: String,
         #[arg(long)]
@@ -93,6 +99,7 @@ pub enum SessionsCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Show queue policy for a session")]
     QueuePolicy {
         #[arg(value_name = "SESSION_ID", required_unless_present = "session_key")]
         session_id: Option<String>,
@@ -101,6 +108,7 @@ pub enum SessionsCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Pause queued work for a session")]
     QueuePause {
         session_id: String,
         #[arg(long)]
@@ -108,11 +116,13 @@ pub enum SessionsCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Resume queued work for a session")]
     QueueResume {
         session_id: String,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Drain queued work for a session")]
     QueueDrain {
         session_id: String,
         #[arg(long)]
@@ -120,6 +130,7 @@ pub enum SessionsCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Collect a summary from queued work")]
     QueueCollectSummary {
         session_id: String,
         #[arg(long)]
@@ -127,6 +138,7 @@ pub enum SessionsCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Cancel one queued input")]
     QueueCancel {
         session_id: String,
         queued_input_id: String,
@@ -135,6 +147,7 @@ pub enum SessionsCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Retry the latest failed or interrupted turn")]
     Retry {
         session_id: String,
         #[arg(long, default_value_t = false)]
@@ -144,6 +157,7 @@ pub enum SessionsCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Branch a session into a new label")]
     Branch {
         session_id: String,
         #[arg(long)]
@@ -151,6 +165,7 @@ pub enum SessionsCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Search within a session transcript")]
     TranscriptSearch {
         session_id: String,
         #[arg(long)]
@@ -158,6 +173,7 @@ pub enum SessionsCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Export a session transcript")]
     Export {
         session_id: String,
         #[arg(long, default_value = "json")]
@@ -165,6 +181,7 @@ pub enum SessionsCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Preview session compaction candidates")]
     CompactPreview {
         #[arg(value_name = "SESSION_ID", required_unless_present = "session_key")]
         session_id: Option<String>,
@@ -177,6 +194,7 @@ pub enum SessionsCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Apply session compaction decisions")]
     CompactApply {
         session_id: String,
         #[arg(long)]
@@ -190,11 +208,13 @@ pub enum SessionsCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Show a compaction artifact")]
     CompactionShow {
         artifact_id: String,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Create a session checkpoint")]
     CheckpointCreate {
         session_id: String,
         #[arg(long)]
@@ -206,11 +226,13 @@ pub enum SessionsCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Show a session checkpoint")]
     CheckpointShow {
         checkpoint_id: String,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Restore a session checkpoint")]
     CheckpointRestore {
         checkpoint_id: String,
         #[arg(long)]
@@ -218,6 +240,7 @@ pub enum SessionsCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Enqueue background work for a session")]
     #[command(group(
         ArgGroup::new("background_enqueue_text_source")
             .required(true)
@@ -245,6 +268,7 @@ pub enum SessionsCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "List background tasks")]
     BackgroundList {
         #[arg(long)]
         session_id: Option<String>,
@@ -255,26 +279,31 @@ pub enum SessionsCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Show one background task")]
     BackgroundShow {
         task_id: String,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Pause one background task")]
     BackgroundPause {
         task_id: String,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Resume one background task")]
     BackgroundResume {
         task_id: String,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Retry one background task")]
     BackgroundRetry {
         task_id: String,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Cancel one background task")]
     BackgroundCancel {
         task_id: String,
         #[arg(long, default_value_t = false)]

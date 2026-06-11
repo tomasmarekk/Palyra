@@ -38,7 +38,7 @@ Commands:
   system          Inspect runtime heartbeat, subsystem presence, operator insights, and recent system events
   sandbox         Inspect effective process-runner and WASM sandbox policy surfaces
   completion      Generate shell completion scripts
-  onboarding      [aliases: onboard]
+  onboarding      Run guided onboarding workflows [aliases: onboard]
   deployment      Inspect deployment profiles, run preflights, and generate deploy recipes
   configure       Safely reconfigure an existing installation
   gateway         Gateway and runtime diagnostics surface [aliases: daemon]

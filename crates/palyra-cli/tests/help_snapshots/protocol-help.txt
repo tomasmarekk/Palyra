@@ -3,9 +3,9 @@ Validate schema and protocol contract artifacts
 Usage: palyra protocol [OPTIONS] <COMMAND>
 
 Commands:
-  version
-  validate
-  validate-id
+  version      Show protocol and schema contract versions
+  validate     Validate committed protocol contract artifacts
+  validate-id  Validate a protocol identifier string
 
 Options:
   -h, --help  Print help

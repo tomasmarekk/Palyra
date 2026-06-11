@@ -1,8 +1,10 @@
+Run guided onboarding workflows
+
 Usage: palyra onboarding [OPTIONS] <COMMAND>
 
 Commands:
-  wizard
-  status
+  wizard  Run the guided onboarding wizard
+  status  Inspect onboarding state and detected setup posture
 
 Options:
   -h, --help
