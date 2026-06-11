@@ -1,3 +1,22 @@
+//! Console chat HTTP handlers for the `/console/v1/chat/*` route surface.
+//!
+//! Implements the web console's chat workflows: session lifecycle
+//! (list/resolve/rename/reset/branch), message submission with NDJSON
+//! streaming, attachments and derived artifacts, run status/tape/workspace
+//! inspection, retry/checkpoint/compaction, background tasks, the session
+//! input queue, canvases, transcript search/export, and pins.
+//!
+//! Message streaming bridges HTTP to the gateway gRPC `run_stream` RPC: the
+//! handler opens a client-side request stream, registers it in
+//! `AppState::console_chat_streams` keyed by run id, and relays
+//! `RunStreamEvent`s back to the browser as newline-delimited JSON. Follow-up
+//! queue submissions and approval decisions are injected into the same gRPC
+//! stream while the run is active.
+//!
+//! Response JSON shapes are a wire contract consumed by `apps/web`
+//! (`consoleApi*`); field names, status codes, and error strings must stay
+//! stable.
+
 use crate::{
     application::session_compaction::{
         apply_session_compaction, preview_session_compaction, SessionCompactionApplyRequest,
@@ -20,10 +39,15 @@ use palyra_common::{
 };
 use serde::Serialize;
 
+// Placeholder body for workspace/memory index documents derived from
+// attachments: the extracted text itself stays in the device-scoped derived
+// artifact store so cross-device surfaces never receive attachment content.
 const ATTACHMENT_DERIVED_INDEX_OMITTED_MESSAGE: &str =
     "attachment-derived content omitted; use device-scoped derived artifact endpoints";
 const DEFAULT_CONSOLE_BACKGROUND_TASK_BUDGET_TOKENS: u64 = 4_096;
 
+/// Transcript provenance for a canvas: the latest tape event that referenced
+/// the canvas frame URL, if any.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
 struct ConsoleChatCanvasTranscriptReference {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -40,6 +64,7 @@ struct ConsoleChatCanvasTranscriptReference {
     last_referenced_at_unix_ms: Option<i64>,
 }
 
+/// Wire-facing canvas summary returned by the canvas list/detail handlers.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct ConsoleChatCanvasSummary {
     canvas_id: String,
@@ -56,6 +81,14 @@ struct ConsoleChatCanvasSummary {
     reference: ConsoleChatCanvasTranscriptReference,
 }
 
+// --- Session lifecycle handlers ---
+
+/// `GET /console/v1/chat/sessions` - lists chat sessions visible to the
+/// authenticated console context, with cursor pagination.
+///
+/// # Errors
+/// Returns an error `Response` when console authorization fails or the
+/// runtime listing fails.
 pub(crate) async fn console_chat_sessions_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -83,6 +116,13 @@ pub(crate) async fn console_chat_sessions_list_handler(
     })))
 }
 
+/// `POST /console/v1/chat/sessions` - resolves (and optionally creates or
+/// resets) a chat session by id, key, or label.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails, `session_id` is not
+/// a canonical ULID, or session resolution fails (for example
+/// `require_existing` on a missing session).
 pub(crate) async fn console_chat_session_resolve_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -118,6 +158,13 @@ pub(crate) async fn console_chat_session_resolve_handler(
     })))
 }
 
+/// `POST /console/v1/chat/sessions/{session_id}/rename` - updates the session
+/// label/title and the manual-title lock, then journals the rename.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails, the id is malformed,
+/// the session is not visible to this context, or an empty label is combined
+/// with `manual_title_locked = true`.
 pub(crate) async fn console_chat_session_rename_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -173,6 +220,12 @@ pub(crate) async fn console_chat_session_rename_handler(
     })))
 }
 
+/// `POST /console/v1/chat/sessions/{session_id}/reset` - resets an existing
+/// session's conversational state in place.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails, the id is malformed,
+/// or the session does not exist for this context.
 pub(crate) async fn console_chat_session_reset_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -205,6 +258,22 @@ pub(crate) async fn console_chat_session_reset_handler(
     })))
 }
 
+// --- Message submission and run-stream bridging ---
+
+/// `POST /console/v1/chat/sessions/{session_id}/messages/stream` - submits a
+/// user message and streams the run back as NDJSON
+/// (`application/x-ndjson`) lines of `{"type": "meta"|"event"|"error"|"complete", ...}`.
+///
+/// The handler enriches the message with attachment recall, project context,
+/// and `@`-reference parameter deltas, then proxies the gateway `run_stream`
+/// RPC. The run is registered in `console_chat_streams` so the queue and
+/// approval endpoints can inject follow-up requests while it is active.
+///
+/// # Errors
+/// Returns an error `Response` (before streaming starts) when authorization
+/// fails, ids or text are invalid, attachments cannot be resolved, or
+/// parameter-delta enrichment fails. Failures after the response starts are
+/// reported in-band as `error`/`complete` NDJSON lines.
 pub(crate) async fn console_chat_message_stream_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -259,6 +328,9 @@ pub(crate) async fn console_chat_message_stream_handler(
     })?;
     let run_id = Ulid::new().to_string();
 
+    // Register the run before sending anything so queue/approval endpoints can
+    // find it as soon as the client learns the run id from the "meta" line.
+    // Every exit path below must remove this entry again.
     let (request_sender, request_receiver) = mpsc::channel::<common_v1::RunStreamRequest>(16);
     let pending_approvals = Arc::new(Mutex::new(HashMap::new()));
     {
@@ -321,6 +393,10 @@ pub(crate) async fn console_chat_message_stream_handler(
         return Err(error_response);
     }
 
+    // The gRPC relay runs in a detached task: it owns the gateway stream and
+    // pushes encoded NDJSON lines into a bounded channel that backs the HTTP
+    // response body. A `false` return from send_console_chat_line means the
+    // client disconnected (receiver dropped), which ends the relay.
     let (line_sender, line_receiver) = mpsc::channel::<Result<Bytes, Infallible>>(32);
     let run_id_for_task = run_id.clone();
     let session_id_for_task = session_id.clone();
@@ -331,8 +407,8 @@ pub(crate) async fn console_chat_message_stream_handler(
             &line_sender,
             json!({
                 "type": "meta",
-                "run_id": run_id_for_task.clone(),
-                "session_id": session_id_for_task.clone(),
+                "run_id": run_id_for_task,
+                "session_id": session_id_for_task,
             }),
         )
         .await
@@ -350,7 +426,7 @@ pub(crate) async fn console_chat_message_stream_handler(
                     &line_sender,
                     json!({
                         "type": "error",
-                        "run_id": run_id_for_task.clone(),
+                        "run_id": run_id_for_task,
                         "error": error,
                     }),
                 )
@@ -359,8 +435,8 @@ pub(crate) async fn console_chat_message_stream_handler(
                     &line_sender,
                     json!({
                         "type": "complete",
-                        "run_id": run_id_for_task.clone(),
-                        "status": final_status.clone(),
+                        "run_id": run_id_for_task,
+                        "status": final_status,
                     }),
                 )
                 .await;
@@ -378,7 +454,7 @@ pub(crate) async fn console_chat_message_stream_handler(
                     &line_sender,
                     json!({
                         "type": "error",
-                        "run_id": run_id_for_task.clone(),
+                        "run_id": run_id_for_task,
                         "error": sanitize_http_error_message(error.message()),
                     }),
                 )
@@ -387,8 +463,8 @@ pub(crate) async fn console_chat_message_stream_handler(
                     &line_sender,
                     json!({
                         "type": "complete",
-                        "run_id": run_id_for_task.clone(),
-                        "status": final_status.clone(),
+                        "run_id": run_id_for_task,
+                        "status": final_status,
                     }),
                 )
                 .await;
@@ -401,6 +477,9 @@ pub(crate) async fn console_chat_message_stream_handler(
         while let Some(item) = stream.next().await {
             match item {
                 Ok(event) => {
+                    // Track approval_id -> proposal_id so a later console
+                    // approval decision can be translated back into the
+                    // ToolApprovalResponse this gRPC stream expects.
                     if let Some((approval_id, proposal_id)) =
                         run_stream_event_approval_mapping(&event)
                     {
@@ -437,7 +516,7 @@ pub(crate) async fn console_chat_message_stream_handler(
                         &line_sender,
                         json!({
                             "type": "error",
-                            "run_id": run_id_for_task.clone(),
+                            "run_id": run_id_for_task,
                             "error": sanitize_http_error_message(error.message()),
                         }),
                     )
@@ -451,8 +530,8 @@ pub(crate) async fn console_chat_message_stream_handler(
             &line_sender,
             json!({
                 "type": "complete",
-                "run_id": run_id_for_task.clone(),
-                "status": final_status.clone(),
+                "run_id": run_id_for_task,
+                "status": final_status,
             }),
         )
         .await;
@@ -460,6 +539,8 @@ pub(crate) async fn console_chat_message_stream_handler(
         streams.remove(run_id_for_task.as_str());
     });
 
+    // no-store keeps intermediaries from buffering or replaying the
+    // incremental NDJSON body.
     let mut response = Response::new(Body::from_stream(ReceiverStream::new(line_receiver)));
     response
         .headers_mut()
@@ -468,6 +549,14 @@ pub(crate) async fn console_chat_message_stream_handler(
     Ok(response)
 }
 
+// --- Prompt enrichment previews and delegation catalog ---
+
+/// `POST /console/v1/chat/sessions/{session_id}/references/preview` - resolves
+/// `@`-style context references in a draft message without sending it.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails, ids or text are
+/// invalid, or reference resolution fails.
 pub(crate) async fn console_chat_context_reference_preview_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -503,6 +592,13 @@ pub(crate) async fn console_chat_context_reference_preview_handler(
     })))
 }
 
+/// `POST /console/v1/chat/sessions/{session_id}/project-context/preview` -
+/// previews the project context entries and rendered prompt for a draft
+/// message.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails, the id is malformed,
+/// or the preview computation fails.
 pub(crate) async fn console_chat_project_context_preview_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -534,6 +630,11 @@ pub(crate) async fn console_chat_project_context_preview_handler(
     })))
 }
 
+/// `GET /console/v1/chat/delegation/catalog` - returns the built-in delegation
+/// profile catalog.
+///
+/// # Errors
+/// Returns an error `Response` when console authorization fails.
 pub(crate) async fn console_chat_delegation_catalog_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -545,6 +646,17 @@ pub(crate) async fn console_chat_delegation_catalog_handler(
     })))
 }
 
+// --- Attachments and derived artifacts ---
+
+/// `POST /console/v1/chat/sessions/{session_id}/attachments` - stores a
+/// base64-encoded attachment and synchronously derives its artifacts
+/// (metadata summary, extracted text, transcript) under a tracked background
+/// task record.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails, inputs are empty or
+/// not valid base64, the attachment store rejects the payload (size/type
+/// caps), or derivation bookkeeping fails.
 pub(crate) async fn console_chat_attachment_upload_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -696,6 +808,12 @@ pub(crate) async fn console_chat_attachment_upload_handler(
     })))
 }
 
+/// `GET /console/v1/chat/sessions/{session_id}/derived-artifacts` - lists the
+/// session's derived artifacts, optionally filtered by `kind` and `state`.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails or the session/store
+/// lookup fails.
 pub(crate) async fn console_chat_derived_artifacts_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -737,6 +855,13 @@ pub(crate) async fn console_chat_derived_artifacts_handler(
     })))
 }
 
+/// `GET /console/v1/chat/attachments/{artifact_id}/derived-artifacts` - lists
+/// derived artifacts for one source attachment, enforcing the device
+/// boundary.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails, the id is malformed,
+/// or no derived artifacts are visible to this context (`not_found`).
 pub(crate) async fn console_chat_attachment_derived_artifacts_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -768,6 +893,13 @@ pub(crate) async fn console_chat_attachment_derived_artifacts_handler(
     })))
 }
 
+/// `GET /console/v1/chat/derived-artifacts/{derived_artifact_id}` - returns a
+/// single derived artifact, including extracted content, for the owning
+/// device.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails, the id is malformed,
+/// or the artifact is not visible to this context (`not_found`).
 pub(crate) async fn console_chat_derived_artifact_detail_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -788,6 +920,12 @@ pub(crate) async fn console_chat_derived_artifact_detail_handler(
     })))
 }
 
+/// `POST /console/v1/chat/derived-artifacts/{derived_artifact_id}/quarantine`
+/// - marks a derived artifact quarantined with an optional reason.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails or the artifact is
+/// not visible to this context.
 pub(crate) async fn console_chat_derived_artifact_quarantine_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -815,6 +953,12 @@ pub(crate) async fn console_chat_derived_artifact_quarantine_handler(
     })))
 }
 
+/// `POST /console/v1/chat/derived-artifacts/{derived_artifact_id}/release` -
+/// releases a quarantined derived artifact back into normal use.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails or the artifact is
+/// not visible to this context.
 pub(crate) async fn console_chat_derived_artifact_release_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -840,6 +984,13 @@ pub(crate) async fn console_chat_derived_artifact_release_handler(
     })))
 }
 
+/// `POST /console/v1/chat/derived-artifacts/{derived_artifact_id}/recompute` -
+/// re-runs derivation from the source attachment under a new background task.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails, the artifact has no
+/// session or source attachment, or recompute/derivation fails (the
+/// recompute-required flag stays set so the artifact can be retried).
 pub(crate) async fn console_chat_derived_artifact_recompute_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -996,6 +1147,13 @@ pub(crate) async fn console_chat_derived_artifact_recompute_handler(
     })))
 }
 
+/// `POST /console/v1/chat/derived-artifacts/{derived_artifact_id}/purge` -
+/// purges a derived artifact and best-effort deletes its linked memory item
+/// and workspace index document.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails or the purge itself
+/// fails; linked memory/workspace cleanup failures are intentionally ignored.
 pub(crate) async fn console_chat_derived_artifact_purge_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1047,6 +1205,15 @@ pub(crate) async fn console_chat_derived_artifact_purge_handler(
     })))
 }
 
+// --- Run inspection (status, tape events, workspace) ---
+
+/// `GET /console/v1/chat/runs/{run_id}/status` - returns a run snapshot and
+/// lineage, optionally long-polling (`wait=true`) until the run reaches a
+/// terminal or waiting state.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails, the id is malformed,
+/// the run is unknown, or it belongs to a different console context.
 pub(crate) async fn console_chat_run_status_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1101,6 +1268,7 @@ pub(crate) async fn console_chat_run_status_handler(
     })))
 }
 
+/// Query parameters for [`console_chat_run_status_handler`].
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub(crate) struct ConsoleChatRunStatusQuery {
     #[serde(default)]
@@ -1111,6 +1279,12 @@ pub(crate) struct ConsoleChatRunStatusQuery {
     return_on_waiting: bool,
 }
 
+/// `GET /console/v1/chat/runs/{run_id}/events` - returns a paged tape
+/// snapshot (`after_seq`/`limit`) plus the run and its lineage.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails, the id is malformed,
+/// the run is unknown, or it belongs to a different console context.
 pub(crate) async fn console_chat_run_events_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1149,6 +1323,12 @@ pub(crate) async fn console_chat_run_events_handler(
     })))
 }
 
+/// `GET /console/v1/chat/runs/{run_id}/workspace` - lists workspace artifacts
+/// produced by a run, with optional substring query and limit.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails, the run is unknown
+/// or foreign, or the workspace listing fails.
 pub(crate) async fn console_chat_run_workspace_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1174,6 +1354,12 @@ pub(crate) async fn console_chat_run_workspace_handler(
     })))
 }
 
+/// `GET /console/v1/chat/runs/{run_id}/workspace/artifacts/{artifact_id}` -
+/// returns one workspace artifact, optionally including its content.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails, ids are malformed,
+/// or the run/artifact lookup fails.
 pub(crate) async fn console_chat_run_workspace_artifact_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1202,6 +1388,12 @@ pub(crate) async fn console_chat_run_workspace_artifact_handler(
     })))
 }
 
+/// `POST /console/v1/chat/workspace/compare` - diffs two workspace anchors
+/// (run or checkpoint per side), authorizing each anchor independently.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails, an anchor is
+/// ambiguous or missing, or the diff computation fails.
 pub(crate) async fn console_chat_workspace_compare_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1230,6 +1422,16 @@ pub(crate) async fn console_chat_workspace_compare_handler(
     })))
 }
 
+// --- Retry, branch, compaction, and checkpoints ---
+
+/// `POST /console/v1/chat/sessions/{session_id}/retry` - prepares (without
+/// starting) a retry of the latest terminal run: returns the original user
+/// text plus the parameter delta to resubmit through the stream endpoint.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails, the session has no
+/// terminal latest run, no persisted user turn exists, or the stored
+/// parameter delta cannot be parsed.
 pub(crate) async fn console_chat_retry_prepare_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1287,6 +1489,9 @@ pub(crate) async fn console_chat_retry_prepare_handler(
     })))
 }
 
+/// Prefers an explicit non-null payload delta; otherwise falls back to the
+/// parameter delta persisted on the run being retried, so retries keep the
+/// original CLI/workspace context.
 fn retry_parameter_delta_from_payload_or_run(
     payload_parameter_delta: Option<Value>,
     run: &journal::OrchestratorRunStatusSnapshot,
@@ -1303,6 +1508,14 @@ fn retry_parameter_delta_from_payload_or_run(
     Ok((!parameter_delta.is_null()).then_some(parameter_delta))
 }
 
+/// `POST /console/v1/chat/sessions/{session_id}/branch` - forks a new session
+/// off the source session's latest terminal run, wiring lineage on both
+/// sides, appending a `rollback.marker` tape event, and copying project
+/// context.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails, the source session
+/// has no run, or the latest run is not terminal.
 pub(crate) async fn console_chat_branch_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1414,6 +1627,12 @@ pub(crate) async fn console_chat_branch_handler(
     })))
 }
 
+/// `POST /console/v1/chat/sessions/{session_id}/compactions/preview` -
+/// computes a compaction plan for the session without applying it.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails or plan computation
+/// fails.
 pub(crate) async fn console_chat_compaction_preview_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1438,6 +1657,13 @@ pub(crate) async fn console_chat_compaction_preview_handler(
     })))
 }
 
+/// `POST /console/v1/chat/sessions/{session_id}/compactions` - applies a
+/// manual session compaction (with per-candidate accept/reject overrides) and
+/// records the pruning decision event.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails, the pruning preview
+/// capability is disabled, or the compaction/decision write fails.
 pub(crate) async fn console_chat_compaction_apply_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1533,6 +1759,13 @@ pub(crate) async fn console_chat_compaction_apply_handler(
     })))
 }
 
+/// `GET /console/v1/chat/compactions/{artifact_id}` - returns one compaction
+/// artifact plus the checkpoints that reference it. Session visibility is
+/// enforced by loading the owning session in the caller's context.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails, the artifact is
+/// unknown, or the owning session is not visible to this context.
 pub(crate) async fn console_chat_compaction_detail_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1574,6 +1807,13 @@ pub(crate) async fn console_chat_compaction_detail_handler(
     })))
 }
 
+/// `POST /console/v1/chat/sessions/{session_id}/checkpoints` - creates a
+/// named conversation checkpoint referencing recent compactions and the
+/// session's pinned/owned workspace documents.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails, the auxiliary
+/// executor capability is disabled, the name is empty, or persistence fails.
 pub(crate) async fn console_chat_checkpoint_create_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1659,6 +1899,12 @@ pub(crate) async fn console_chat_checkpoint_create_handler(
     })))
 }
 
+/// `GET /console/v1/chat/checkpoints/{checkpoint_id}` - returns one
+/// conversation checkpoint plus its session record.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails, the checkpoint is
+/// unknown, or its session is not visible to this context.
 pub(crate) async fn console_chat_checkpoint_detail_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1685,6 +1931,12 @@ pub(crate) async fn console_chat_checkpoint_detail_handler(
     })))
 }
 
+/// `GET /console/v1/chat/workspace-checkpoints/{checkpoint_id}` - returns a
+/// workspace checkpoint with its captured files and recent restore reports.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails or the checkpoint or
+/// its session is not visible to this context.
 pub(crate) async fn console_chat_workspace_checkpoint_detail_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1722,6 +1974,13 @@ pub(crate) async fn console_chat_workspace_checkpoint_detail_handler(
     })))
 }
 
+/// `GET /console/v1/chat/workspace-restore-reports/{report_id}` - returns one
+/// workspace restore report, re-authorizing both the session and the
+/// checkpoint it points at.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails, the id is malformed,
+/// or the report/checkpoint/session chain is not visible to this context.
 pub(crate) async fn console_chat_workspace_restore_report_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1760,6 +2019,14 @@ pub(crate) async fn console_chat_workspace_restore_report_handler(
     })))
 }
 
+/// `POST /console/v1/chat/checkpoints/{checkpoint_id}/restore` - restores a
+/// conversation checkpoint into a new branched session (lineage update, tape
+/// marker on the anchor run, project-context copy) and marks the checkpoint
+/// restored.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails, the checkpoint or
+/// its anchor run is unknown, or any lineage/journal write fails.
 pub(crate) async fn console_chat_checkpoint_restore_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1891,6 +2158,15 @@ pub(crate) async fn console_chat_checkpoint_restore_handler(
     })))
 }
 
+/// `POST /console/v1/chat/workspace-checkpoints/{checkpoint_id}/restore` -
+/// restores workspace files from a checkpoint, by default into a new branched
+/// session (`branch_session=false` restores in place). Emits start/complete
+/// (or failure) journal events and refreshes project context afterwards.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails, `session_label` is
+/// supplied without branching, or the restore itself fails. Project-context
+/// copy/refresh failures are reported in the response body, not as errors.
 pub(crate) async fn console_chat_workspace_checkpoint_restore_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2106,6 +2382,16 @@ pub(crate) async fn console_chat_workspace_checkpoint_restore_handler(
     })))
 }
 
+// --- Background tasks ---
+
+/// `POST /console/v1/chat/sessions/{session_id}/background-tasks` - enqueues
+/// an auxiliary background task (plain prompt or delegation) for the session
+/// and records a runtime-preview lifecycle event.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails, text is empty, a
+/// delegation is requested without a parent run, the task kind is reserved or
+/// inconsistent with delegation, or persistence fails.
 pub(crate) async fn console_chat_background_task_create_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2221,6 +2507,8 @@ pub(crate) async fn console_chat_background_task_create_handler(
     })))
 }
 
+/// Tells the web client that background-enqueue never live-redirects an
+/// active run, so it can label the action accurately.
 fn background_task_live_steering_status(
     session: &journal::OrchestratorSessionRecord,
 ) -> serde_json::Value {
@@ -2240,6 +2528,8 @@ fn background_task_live_steering_status(
     })
 }
 
+/// Validates the task kind for a delegated background task; only
+/// `delegation_prompt` (or omitted) is accepted.
 fn resolve_console_delegation_task_kind(value: Option<&str>) -> Result<String, tonic::Status> {
     match value {
         None => Ok(AuxiliaryTaskKind::DelegationPrompt.as_str().to_owned()),
@@ -2257,6 +2547,9 @@ fn resolve_console_delegation_task_kind(value: Option<&str>) -> Result<String, t
     }
 }
 
+/// Validates the task kind for a non-delegated background task, rejecting
+/// kinds reserved for internal runtime use (attachment derivation/recompute,
+/// post-run reflection).
 fn resolve_console_background_task_kind(value: Option<&str>) -> Result<String, tonic::Status> {
     let Some(raw) = value else {
         return Ok(AuxiliaryTaskKind::BackgroundPrompt.as_str().to_owned());
@@ -2284,6 +2577,11 @@ fn resolve_console_background_task_kind(value: Option<&str>) -> Result<String, t
     }
 }
 
+/// `GET /console/v1/chat/background-tasks` - lists background tasks owned by
+/// the console context, optionally filtered by session.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails or the listing fails.
 pub(crate) async fn console_chat_background_tasks_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2308,6 +2606,12 @@ pub(crate) async fn console_chat_background_tasks_list_handler(
     })))
 }
 
+/// `GET /console/v1/chat/background-tasks/{task_id}` - returns one background
+/// task and, if it spawned a run, that run's snapshot.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails or the task is not
+/// visible to this context (`not_found`).
 pub(crate) async fn console_chat_background_task_detail_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2331,6 +2635,12 @@ pub(crate) async fn console_chat_background_task_detail_handler(
     })))
 }
 
+/// `POST /console/v1/chat/background-tasks/{task_id}/pause` - pauses a queued
+/// or failed background task.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails, the capability is
+/// disabled, or the task is not in a pausable state.
 pub(crate) async fn console_chat_background_task_pause_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2373,6 +2683,12 @@ pub(crate) async fn console_chat_background_task_pause_handler(
     })))
 }
 
+/// `POST /console/v1/chat/background-tasks/{task_id}/resume` - re-queues a
+/// paused background task.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails, the capability is
+/// disabled, or the task is not paused.
 pub(crate) async fn console_chat_background_task_resume_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2413,6 +2729,12 @@ pub(crate) async fn console_chat_background_task_resume_handler(
     })))
 }
 
+/// `POST /console/v1/chat/background-tasks/{task_id}/retry` - re-queues a
+/// failed, cancelled, or expired task, clearing its previous outcome fields.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails, the capability is
+/// disabled, or the task is not in a retryable state.
 pub(crate) async fn console_chat_background_task_retry_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2464,6 +2786,14 @@ pub(crate) async fn console_chat_background_task_retry_handler(
     })))
 }
 
+/// `POST /console/v1/chat/background-tasks/{task_id}/cancel` - cancels a
+/// background task. A running task with a target run transitions to
+/// `cancel_requested` (the run is asked to cancel asynchronously); anything
+/// else is cancelled immediately.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails, the capability is
+/// disabled, or a state update fails.
 pub(crate) async fn console_chat_background_task_cancel_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2567,6 +2897,20 @@ fn build_background_task_cancelled_result_json(task_id: &str) -> String {
     .to_string()
 }
 
+// --- Session input queue (admission and operator controls) ---
+
+/// `POST /console/v1/chat/runs/{run_id}/queue` - submits a follow-up message
+/// while a run is still streaming. The session queue policy decides whether
+/// the input is forwarded into the live run stream immediately
+/// (followup/steer/interrupt), deferred/collected as backlog, merged into a
+/// collect summary, or rejected as overflow; every decision is journaled as a
+/// queued-input record plus runtime-decision and tape events.
+///
+/// # Errors
+/// Returns an error `Response` when authorization or capability checks fail,
+/// the run has no active stream, the run belongs to another context, or
+/// persistence fails. A forward attempt to a closed stream marks the input
+/// `delivery_failed` and returns `failed_precondition`.
 pub(crate) async fn console_chat_queue_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2609,6 +2953,9 @@ pub(crate) async fn console_chat_queue_handler(
             "chat run does not belong to the authenticated console session context",
         )));
     }
+    // A pending tool approval is an unsafe boundary: forwarding a follow-up
+    // mid-approval could race the approval response, so the decision below
+    // degrades to enqueue/collect while any approval is outstanding.
     let pending_approval =
         !lock_console_chat_pending_approvals(&stream.pending_approvals).is_empty();
     let timestamp_unix_ms = unix_ms_now().map_err(|error| {
@@ -2644,6 +2991,8 @@ pub(crate) async fn console_chat_queue_handler(
         safe_boundary,
         current_depth,
     );
+    // Operator pause overrides everything except overflow: inputs are still
+    // accepted (collect mode) but never forwarded until the queue resumes.
     if queue_control.paused && queue_decision.decision != QueueDecision::Overflow {
         queue_decision.decision = QueueDecision::Defer;
         queue_decision.mode = QueueMode::Collect;
@@ -2658,6 +3007,9 @@ pub(crate) async fn console_chat_queue_handler(
         })
         .cloned()
         .collect::<Vec<_>>();
+    // Overflow and collect-with-backlog both coalesce the pending group into
+    // one summary input; the merged originals are marked overflowed/merged
+    // below so only the summary remains pending.
     let should_collect_summary = queue_decision.decision == QueueDecision::Overflow
         || (queue_decision.mode == QueueMode::Collect && !pending_group_inputs.is_empty());
     let mut effective_text = text.clone();
@@ -2810,6 +3162,8 @@ pub(crate) async fn console_chat_queue_handler(
     )
     .await
     .map_err(runtime_status_response)?;
+    // Only live-delivery modes reach the gRPC stream, and never while an
+    // approval is pending; everything else stays queued for a later run.
     if !matches!(
         queue_decision.mode,
         QueueMode::Followup | QueueMode::Steer | QueueMode::SteerBacklog | QueueMode::Interrupt
@@ -2972,6 +3326,8 @@ pub(crate) async fn console_chat_queue_handler(
     })))
 }
 
+/// Queue depth as the operator will observe it after the decision: overflow
+/// clears the group, merge leaves exactly the summary input.
 fn observed_queue_depth_after_decision(
     current_depth: usize,
     queue_decision: &crate::application::session_queue::SessionQueueDecision,
@@ -2984,6 +3340,13 @@ fn observed_queue_depth_after_decision(
     }
 }
 
+/// `GET /console/v1/chat/sessions/{session_id}/queue/policy` - returns the
+/// session queue snapshot: control state, policy, pending inputs, analysis,
+/// and a preview of the next admission decision.
+///
+/// # Errors
+/// Returns an error `Response` when authorization or capability checks fail
+/// or the snapshot cannot be loaded.
 pub(crate) async fn console_chat_queue_policy_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3000,6 +3363,12 @@ pub(crate) async fn console_chat_queue_policy_handler(
     Ok(Json(session_queue_snapshot_json(snapshot)))
 }
 
+/// `POST /console/v1/chat/sessions/{session_id}/queue/pause` - pauses queue
+/// forwarding for the session and records the operator decision.
+///
+/// # Errors
+/// Returns an error `Response` when authorization or capability checks fail
+/// or the control update fails.
 pub(crate) async fn console_chat_queue_pause_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3062,6 +3431,12 @@ pub(crate) async fn console_chat_queue_pause_handler(
     })))
 }
 
+/// `POST /console/v1/chat/sessions/{session_id}/queue/resume` - resumes a
+/// paused session queue and records the operator decision.
+///
+/// # Errors
+/// Returns an error `Response` when authorization or capability checks fail
+/// or the control update fails.
 pub(crate) async fn console_chat_queue_resume_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3119,6 +3494,12 @@ pub(crate) async fn console_chat_queue_resume_handler(
     })))
 }
 
+/// `POST /console/v1/chat/sessions/{session_id}/queue/drain` - cancels every
+/// pending queued input for the session and records the operator decision.
+///
+/// # Errors
+/// Returns an error `Response` when authorization or capability checks fail
+/// or a queued-input update fails.
 pub(crate) async fn console_chat_queue_drain_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3184,6 +3565,12 @@ pub(crate) async fn console_chat_queue_drain_handler(
     })))
 }
 
+/// `POST /console/v1/chat/sessions/{session_id}/queue/items/{queued_input_id}/cancel`
+/// - cancels one pending queued input.
+///
+/// # Errors
+/// Returns an error `Response` when authorization or capability checks fail,
+/// the input is unknown, or it is no longer pending.
 pub(crate) async fn console_chat_queue_cancel_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3265,6 +3652,13 @@ pub(crate) async fn console_chat_queue_cancel_handler(
     })))
 }
 
+/// `POST /console/v1/chat/sessions/{session_id}/queue/items/{queued_input_id}/reject`
+/// - rejects one pending queued input (terminal, distinct from cancel for
+///   audit purposes).
+///
+/// # Errors
+/// Returns an error `Response` when authorization or capability checks fail,
+/// the input is unknown, or it is no longer pending.
 pub(crate) async fn console_chat_queue_reject_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3346,6 +3740,13 @@ pub(crate) async fn console_chat_queue_reject_handler(
     })))
 }
 
+/// `POST /console/v1/chat/sessions/{session_id}/queue/items/{queued_input_id}/prioritize`
+/// - moves one pending queued input into a different priority lane.
+///
+/// # Errors
+/// Returns an error `Response` when authorization or capability checks fail,
+/// the lane name is invalid, the input is unknown, or it is no longer
+/// pending.
 pub(crate) async fn console_chat_queue_prioritize_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3427,6 +3828,13 @@ pub(crate) async fn console_chat_queue_prioritize_handler(
     })))
 }
 
+/// `POST /console/v1/chat/sessions/{session_id}/queue/collect-summary` -
+/// forces all pending queued inputs to be merged into a single collect
+/// summary input.
+///
+/// # Errors
+/// Returns an error `Response` when authorization or capability checks fail,
+/// the queue has no pending inputs, or persistence fails.
 pub(crate) async fn console_chat_queue_collect_summary_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3540,6 +3948,16 @@ pub(crate) async fn console_chat_queue_collect_summary_handler(
     })))
 }
 
+// --- Transcript, canvases, export, and pins ---
+
+/// `GET /console/v1/chat/sessions/{session_id}/transcript` - returns the full
+/// session view used to hydrate the chat UI: transcript records plus
+/// attachments, derived artifacts, pins, compactions, checkpoints, queued
+/// inputs, runs, and background tasks.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails or any of the
+/// underlying listings fail.
 pub(crate) async fn console_chat_transcript_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3626,6 +4044,12 @@ pub(crate) async fn console_chat_transcript_handler(
     })))
 }
 
+/// `GET /console/v1/chat/sessions/{session_id}/canvases` - lists the
+/// session's canvases with transcript provenance.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails or the canvas or
+/// transcript listing fails.
 pub(crate) async fn console_chat_canvas_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3653,6 +4077,13 @@ pub(crate) async fn console_chat_canvas_list_handler(
     })))
 }
 
+/// `GET /console/v1/chat/sessions/{session_id}/canvases/{canvas_id}` -
+/// returns one canvas: summary, current state JSON, patch history, and a
+/// runtime frame descriptor when the canvas host is available.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails, the canvas belongs
+/// to a different session, or persisted state cannot be decoded.
 pub(crate) async fn console_chat_canvas_detail_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3703,6 +4134,13 @@ pub(crate) async fn console_chat_canvas_detail_handler(
     })))
 }
 
+/// `POST /console/v1/chat/sessions/{session_id}/canvases/{canvas_id}/restore`
+/// - restores a canvas to an earlier `state_version` and journals the
+///   restore.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails, the canvas belongs
+/// to a different session, the version is unknown, or the restore fails.
 pub(crate) async fn console_chat_canvas_restore_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3775,6 +4213,12 @@ pub(crate) async fn console_chat_canvas_restore_handler(
     })))
 }
 
+/// `GET /console/v1/chat/sessions/{session_id}/transcript/search` - performs
+/// a case-insensitive substring search over the textual transcript events.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails, `q` is empty, or the
+/// transcript listing fails.
 pub(crate) async fn console_chat_transcript_search_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3821,6 +4265,13 @@ pub(crate) async fn console_chat_transcript_search_handler(
     })))
 }
 
+/// `GET /console/v1/chat/sessions/{session_id}/export` - exports the session
+/// as structured JSON (default) or a rendered Markdown document
+/// (`format=markdown`).
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails or any underlying
+/// listing fails.
 pub(crate) async fn console_chat_export_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3901,6 +4352,11 @@ pub(crate) async fn console_chat_export_handler(
     })))
 }
 
+/// `GET /console/v1/chat/sessions/{session_id}/pins` - lists the session's
+/// transcript pins.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails or the listing fails.
 pub(crate) async fn console_chat_pins_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3921,6 +4377,12 @@ pub(crate) async fn console_chat_pins_list_handler(
     })))
 }
 
+/// `POST /console/v1/chat/sessions/{session_id}/pins` - pins a tape position
+/// (run id + sequence) with a title and optional note.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails, the run id is
+/// malformed, the title is empty, or persistence fails.
 pub(crate) async fn console_chat_pin_create_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3954,6 +4416,12 @@ pub(crate) async fn console_chat_pin_create_handler(
     })))
 }
 
+/// `POST /console/v1/chat/sessions/{session_id}/pins/{pin_id}` - deletes a
+/// transcript pin; `deleted` reports whether it existed.
+///
+/// # Errors
+/// Returns an error `Response` when authorization fails, the session is not
+/// visible to this context, or the delete fails.
 pub(crate) async fn console_chat_pin_delete_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3962,6 +4430,11 @@ pub(crate) async fn console_chat_pin_delete_handler(
     let session = authorize_console_session(&state, &headers, true)?;
     let _session_record =
         load_console_chat_session(&state, &session.context, session_id.as_str(), true).await?;
+    // AIDEV-NOTE: the delete below is keyed by pin_id alone; nothing checks
+    // that the pin actually belongs to the authorized {session_id}, so a
+    // valid console session can delete pins of sessions outside its
+    // principal/device/channel scope by supplying a foreign pin ULID. Fix
+    // requires loading the pin and comparing pin.session_id before deleting.
     let deleted = state
         .runtime
         .delete_orchestrator_session_pin(pin_id)
@@ -3973,6 +4446,10 @@ pub(crate) async fn console_chat_pin_delete_handler(
     })))
 }
 
+// --- Authorization and loader helpers ---
+
+/// Returns whether a run belongs to the console context: principal, device,
+/// and channel must all match (channel `None` only matches `None`).
 pub(super) fn run_matches_console_context(
     run: &journal::OrchestratorRunStatusSnapshot,
     context: &gateway::RequestContext,
@@ -3987,6 +4464,10 @@ pub(super) fn run_matches_console_context(
     }
 }
 
+/// Resolves attachment references into protocol `MessageAttachment`s with
+/// inline bytes, enforcing session/context ownership per artifact.
+///
+/// The error is boxed to keep the `Result` small (`clippy::result_large_err`).
 fn load_console_chat_message_attachments(
     state: &AppState,
     context: &gateway::RequestContext,
@@ -4040,6 +4521,9 @@ fn load_console_chat_message_attachments(
     Ok(resolved)
 }
 
+/// Injects an `attachment_recall` block (query-relevant derived chunks) into
+/// the parameter delta when the message references attachments. A non-object
+/// delta is preserved under `prior_parameter_delta` rather than overwritten.
 fn build_console_attachment_parameter_delta(
     state: &AppState,
     parameter_delta: Option<&Value>,
@@ -4081,6 +4565,8 @@ fn build_console_attachment_parameter_delta(
     Ok(Some(next_delta))
 }
 
+/// Injects the `project_context` preview into the parameter delta when the
+/// session has project context entries or warnings.
 async fn build_console_project_context_parameter_delta(
     state: &AppState,
     context: &gateway::RequestContext,
@@ -4112,6 +4598,9 @@ async fn build_console_project_context_parameter_delta(
     Ok(Some(next_delta))
 }
 
+/// Injects resolved `@`-style `context_references` into the parameter delta;
+/// any reference resolution error rejects the whole message so the user can
+/// fix the reference instead of silently dropping it.
 async fn build_console_context_reference_parameter_delta(
     state: &AppState,
     context: &gateway::RequestContext,
@@ -4142,6 +4631,9 @@ async fn build_console_context_reference_parameter_delta(
     Ok(Some(next_delta))
 }
 
+/// Ownership check for derived artifacts. `require_device_match` is true for
+/// detail/lifecycle endpoints (attachment content stays device-scoped) and
+/// false for cross-device listings.
 fn derived_artifact_matches_console_context(
     record: &media::MediaDerivedArtifactRecord,
     context: &gateway::RequestContext,
@@ -4172,6 +4664,7 @@ fn filter_console_derived_artifact_records(
         .collect()
 }
 
+/// Loads a run snapshot after validating the id and console ownership.
 async fn load_console_chat_run(
     state: &AppState,
     context: &gateway::RequestContext,
@@ -4198,6 +4691,8 @@ async fn load_console_chat_run(
     Ok(run)
 }
 
+/// Loads a workspace checkpoint and authorizes it by loading its owning
+/// session in the caller's context.
 async fn load_console_workspace_checkpoint(
     state: &AppState,
     context: &gateway::RequestContext,
@@ -4225,6 +4720,8 @@ async fn load_console_workspace_checkpoint(
     Ok(checkpoint)
 }
 
+/// Parses one side of a workspace compare request into a run or checkpoint
+/// anchor; exactly one of the two ids must be set.
 fn parse_workspace_compare_anchor(
     run_id: Option<String>,
     checkpoint_id: Option<String>,
@@ -4258,6 +4755,8 @@ fn parse_workspace_compare_anchor(
     }
 }
 
+/// Authorizes a compare anchor by loading the referenced run or checkpoint
+/// in the caller's context.
 async fn authorize_workspace_compare_anchor(
     state: &AppState,
     context: &gateway::RequestContext,
@@ -4278,6 +4777,12 @@ async fn authorize_workspace_compare_anchor(
     Ok(())
 }
 
+/// Loads a session after validating the id and console ownership.
+///
+/// Read paths use a cheap snapshot lookup with an explicit
+/// principal/device/channel check; write paths go through session resolution
+/// (`require_existing`) so the runtime applies its own ownership and
+/// liveness rules before the handler mutates anything.
 async fn load_console_chat_session(
     state: &AppState,
     context: &gateway::RequestContext,
@@ -4328,6 +4833,9 @@ async fn load_console_chat_session(
     Ok(response.session)
 }
 
+/// Consistent view of a session's queue used by the queue handlers: session
+/// record, queued inputs, operator control, effective policy, and the safe
+/// boundary derived from the live stream registry.
 #[derive(Debug, Clone)]
 struct ConsoleSessionQueueSnapshot {
     session_record: journal::OrchestratorSessionRecord,
@@ -4386,6 +4894,8 @@ async fn load_console_session_queue_snapshot(
     })
 }
 
+/// Returns (active stream exists, approval pending, active run id) for a
+/// session by inspecting the in-process run-stream registry.
 fn active_session_queue_boundary(
     state: &AppState,
     session_id: &str,
@@ -4416,6 +4926,8 @@ fn default_session_queue_control(
     }
 }
 
+/// Records a `QueueControl` runtime-decision event for an operator queue
+/// action (pause/resume/drain/cancel/reject/prioritize/collect_summary).
 #[allow(clippy::too_many_arguments)]
 async fn record_session_queue_operator_event(
     state: &AppState,
@@ -4469,6 +4981,8 @@ async fn record_session_queue_operator_event(
         .map_err(runtime_status_response)
 }
 
+/// Validates an operator-supplied priority lane name (1..=32 chars of ASCII
+/// alphanumerics, `_`, `-`), defaulting to `operator_priority`.
 #[allow(clippy::result_large_err)]
 fn normalize_priority_lane(raw: Option<String>) -> Result<String, Response> {
     let lane = raw.and_then(trim_to_option).unwrap_or_else(|| "operator_priority".to_owned());
@@ -4484,6 +4998,8 @@ fn normalize_priority_lane(raw: Option<String>) -> Result<String, Response> {
     Ok(lane)
 }
 
+/// Serializes a queue snapshot to the wire shape shared by all queue
+/// endpoints, including analysis metrics and a preview admission decision.
 fn session_queue_snapshot_json(snapshot: ConsoleSessionQueueSnapshot) -> Value {
     let pending_depth = pending_queue_depth(
         snapshot.queued_inputs.as_slice(),
@@ -4523,6 +5039,10 @@ fn session_queue_snapshot_json(snapshot: ConsoleSessionQueueSnapshot) -> Value {
     })
 }
 
+// --- Canvas helpers ---
+
+/// Builds canvas summaries for a session, attaching transcript provenance to
+/// each canvas.
 fn load_console_chat_canvas_summaries(
     state: &AppState,
     context: &gateway::RequestContext,
@@ -4544,6 +5064,8 @@ fn load_console_chat_canvas_summaries(
         .collect())
 }
 
+/// Loads a canvas in the caller's context and rejects canvases that belong
+/// to a different session than the request path claims.
 async fn load_console_chat_canvas(
     state: &AppState,
     context: &gateway::RequestContext,
@@ -4559,6 +5081,9 @@ async fn load_console_chat_canvas(
     Ok(canvas)
 }
 
+/// Issues a canvas runtime frame descriptor. `failed_precondition` (canvas
+/// host disabled/expired) is reported as a soft `runtime_error` string so the
+/// detail endpoints still return canvas state; other errors propagate.
 fn resolve_console_chat_canvas_runtime_descriptor(
     state: &AppState,
     context: &gateway::RequestContext,
@@ -4598,6 +5123,8 @@ fn build_console_chat_canvas_summary(
     }
 }
 
+/// Finds the most recent transcript event whose payload references the
+/// canvas frame URL and converts it into provenance metadata.
 fn derive_canvas_transcript_reference(
     transcript: &[journal::OrchestratorSessionTranscriptRecord],
     canvas_id: &str,
@@ -4641,6 +5168,8 @@ fn json_value_references_canvas(value: &Value, canvas_id: &str) -> bool {
     }
 }
 
+/// Extracts a canonical canvas id from a `/canvas/v1/frame/<id>` URL embedded
+/// anywhere in a string (absolute or relative form).
 fn extract_canvas_id_from_frame_reference(raw: &str) -> Option<&str> {
     const CANVAS_FRAME_MARKER: &str = "/canvas/v1/frame/";
     let start = raw.find(CANVAS_FRAME_MARKER)?;
@@ -4651,11 +5180,16 @@ fn extract_canvas_id_from_frame_reference(raw: &str) -> Option<&str> {
     Some(candidate)
 }
 
+// --- Session lineage title helpers ---
+
+/// Suggested auto-title for a branched/restored session, e.g. `Root #3`.
 #[derive(Debug, Clone)]
 struct LineageTitleSeed {
     suggested_title: String,
 }
 
+/// Derives a branch title seed by walking the session family to its root
+/// title and counting existing family members.
 async fn load_lineage_title_seed(
     state: &AppState,
     context: &gateway::RequestContext,
@@ -4680,6 +5214,8 @@ async fn load_lineage_title_seed(
     Ok(LineageTitleSeed { suggested_title })
 }
 
+/// Pages through every session (including archived) visible to the console
+/// context; lineage walks need the complete family, not one page.
 async fn load_console_chat_scoped_sessions(
     state: &AppState,
     context: &gateway::RequestContext,
@@ -4709,6 +5245,8 @@ async fn load_console_chat_scoped_sessions(
     Ok(sessions)
 }
 
+/// Walks `parent_session_id` links to the family root and returns its
+/// normalized title (falling back to label, then session key).
 fn session_family_root<'a>(
     session_id: &str,
     sessions_by_id: &std::collections::HashMap<&'a str, &'a journal::OrchestratorSessionRecord>,
@@ -4728,6 +5266,8 @@ fn session_family_root<'a>(
     }
 }
 
+/// Strips a trailing `#<digits>` branch counter so `Title #2` and `Title #3`
+/// share the family root `Title`.
 fn normalize_title_family_root(raw: &str) -> Option<String> {
     let normalized = trim_to_option(raw.to_owned())?;
     let Some((prefix, suffix)) = normalized.rsplit_once('#') else {
@@ -4740,6 +5280,10 @@ fn normalize_title_family_root(raw: &str) -> Option<String> {
     }
 }
 
+// --- Background-task and capability helpers ---
+
+/// Loads a background task; ownership mismatches are reported as `not_found`
+/// (not `permission_denied`) so foreign task ids are not enumerable.
 async fn load_console_background_task(
     state: &AppState,
     context: &gateway::RequestContext,
@@ -4766,6 +5310,8 @@ async fn load_console_background_task(
     Ok(task)
 }
 
+/// Records an `AuxiliaryTaskLifecycle` runtime-decision event for a
+/// background-task transition (created/paused/resumed/requeued/cancelled).
 #[allow(clippy::result_large_err)]
 async fn record_background_task_runtime_preview(
     state: &AppState,
@@ -4820,6 +5366,9 @@ async fn record_background_task_runtime_preview(
         .await
         .map_err(runtime_status_response)
 }
+/// Gates preview-stage features: rejects the request when the capability is
+/// disabled by config, or when the session-queue rollout guardrail has
+/// auto-disabled queueing after repeated delivery failures.
 #[allow(clippy::result_large_err)]
 fn ensure_console_runtime_preview_capability(
     state: &AppState,
@@ -4841,6 +5390,8 @@ fn ensure_console_runtime_preview_capability(
     Ok(())
 }
 
+/// Loads a derived artifact; context mismatches are reported as `not_found`
+/// so foreign artifact ids are not enumerable.
 fn load_console_derived_artifact(
     state: &AppState,
     context: &gateway::RequestContext,
@@ -4864,10 +5415,16 @@ fn load_console_derived_artifact(
     Ok(record)
 }
 
+/// Returns whether a run state string is terminal (retry/branch anchors must
+/// not target in-flight runs).
 fn is_terminal_run_state(state: &str) -> bool {
     matches!(state, "done" | "failed" | "cancelled")
 }
 
+// --- Transcript extraction and export rendering ---
+
+/// Finds the newest persisted `message.received` text, optionally restricted
+/// to one run; used to rebuild the prompt for retry.
 async fn load_last_user_turn_text(
     state: &AppState,
     session_id: &str,
@@ -4899,6 +5456,9 @@ fn extract_transcript_text(
         .map(ToOwned::to_owned)
 }
 
+/// Pulls the human-searchable text out of a transcript record, keyed by
+/// event type; non-textual events yield `None` and are skipped by
+/// search/export.
 fn extract_transcript_search_text(
     record: &journal::OrchestratorSessionTranscriptRecord,
 ) -> Option<String> {
@@ -4914,6 +5474,8 @@ fn extract_transcript_search_text(
     }
 }
 
+/// Renders the Markdown export document: header metadata, pins, compactions,
+/// checkpoints, and the textual transcript.
 fn render_session_export_markdown(
     session: &journal::OrchestratorSessionRecord,
     transcript: &[journal::OrchestratorSessionTranscriptRecord],
@@ -4992,6 +5554,8 @@ fn render_session_export_markdown(
     document
 }
 
+/// Lowercases, trims, sorts, and dedupes checkpoint tags so stored tag sets
+/// are canonical and comparable.
 fn normalize_checkpoint_tags(tags: &[String]) -> Vec<String> {
     let mut normalized = tags
         .iter()
@@ -5003,6 +5567,11 @@ fn normalize_checkpoint_tags(tags: &[String]) -> Vec<String> {
     normalized
 }
 
+// --- NDJSON streaming plumbing ---
+
+/// Sends one NDJSON line to the HTTP response stream. Returns `false` only
+/// when the client disconnected; an unencodable payload is skipped (returns
+/// `true`) so a single bad event does not kill the stream.
 async fn send_console_chat_line(
     sender: &mpsc::Sender<Result<Bytes, Infallible>>,
     payload: Value,
@@ -5019,6 +5588,8 @@ fn encode_console_chat_line(payload: Value) -> Option<Bytes> {
     Some(Bytes::from(encoded))
 }
 
+/// Extracts the `(approval_id, proposal_id)` pair from a tool approval
+/// request event, if both ids are present and non-empty.
 fn run_stream_event_approval_mapping(
     event: &common_v1::RunStreamEvent,
 ) -> Option<(String, String)> {
@@ -5034,6 +5605,8 @@ fn run_stream_event_approval_mapping(
     Some((approval_id, proposal_id))
 }
 
+/// Returns the status label of a status event; the relay task tracks the
+/// last one seen as the run's final NDJSON `complete` status.
 fn run_stream_status_kind(event: &common_v1::RunStreamEvent) -> Option<&'static str> {
     let common_v1::run_stream_event::Body::Status(status) = event.body.as_ref()? else {
         return None;
@@ -5041,6 +5614,8 @@ fn run_stream_status_kind(event: &common_v1::RunStreamEvent) -> Option<&'static 
     Some(stream_status_kind_label(status.kind))
 }
 
+/// Converts a protobuf `RunStreamEvent` into the JSON event shape consumed by
+/// the web console. Field names and enum labels here are wire contract.
 fn console_run_stream_event_to_json(event: &common_v1::RunStreamEvent) -> Value {
     let run_id = event.run_id.as_ref().map(|value| value.ulid.clone()).unwrap_or_default();
     match event.body.as_ref() {
@@ -5153,6 +5728,8 @@ fn console_run_stream_event_to_json(event: &common_v1::RunStreamEvent) -> Value 
             "event_type": "journal_event",
             "journal_event": {
                 "event_id": journal_event.event_id.as_ref().map(|value| value.ulid.clone()),
+                // INTENTIONAL: the journal session id is withheld from the
+                // browser payload; clients correlate via run_id instead.
                 "session_id": "<redacted>",
                 "run_id": journal_event.run_id.as_ref().map(|value| value.ulid.clone()),
                 "kind": journal_event_kind_label(journal_event.kind),
@@ -5177,6 +5754,10 @@ fn console_run_stream_event_to_json(event: &common_v1::RunStreamEvent) -> Value 
         }),
     }
 }
+
+// Proto-enum to wire-label mappings. The string labels below are part of the
+// /console/v1 wire contract; unknown enum values map to "unspecified" rather
+// than erroring so newer daemons stay readable by older consoles.
 
 fn stream_status_kind_label(raw: i32) -> &'static str {
     match common_v1::stream_status::StatusKind::try_from(raw)
@@ -5250,6 +5831,9 @@ fn journal_event_actor_label(raw: i32) -> &'static str {
     }
 }
 
+/// Decodes opaque payload bytes for the console: JSON when parseable, then a
+/// UTF-8 string, then a `{"base64": ...}` wrapper so binary payloads survive
+/// the JSON transport.
 fn decode_json_bytes_for_console(bytes: &[u8]) -> Value {
     if bytes.is_empty() {
         return Value::Null;
@@ -5265,6 +5849,9 @@ fn decode_json_bytes_for_console(bytes: &[u8]) -> Value {
     })
 }
 
+/// Locks the run-stream registry, recovering from poisoning instead of
+/// panicking: the map only tracks active streams, so stale state after a
+/// panicked holder is preferable to taking down every chat handler.
 pub(crate) fn lock_console_chat_streams<'a>(
     streams: &'a Arc<Mutex<HashMap<String, ConsoleChatRunStream>>>,
 ) -> std::sync::MutexGuard<'a, HashMap<String, ConsoleChatRunStream>> {
@@ -5277,6 +5864,8 @@ pub(crate) fn lock_console_chat_streams<'a>(
     }
 }
 
+/// Locks a stream's pending-approval map with the same poison-recovery policy
+/// as [`lock_console_chat_streams`].
 fn lock_console_chat_pending_approvals<'a>(
     approvals: &'a Arc<Mutex<HashMap<String, String>>>,
 ) -> std::sync::MutexGuard<'a, HashMap<String, String>> {
@@ -5289,6 +5878,8 @@ fn lock_console_chat_pending_approvals<'a>(
     }
 }
 
+/// Connects a gateway gRPC client (self-dial to the daemon's own gateway
+/// endpoint) with explicit connect and request timeouts.
 async fn build_console_gateway_client(
     state: &AppState,
 ) -> Result<
@@ -5305,6 +5896,12 @@ async fn build_console_gateway_client(
     Ok(gateway_v1::gateway_service_client::GatewayServiceClient::new(channel))
 }
 
+// --- Attachment derivation pipeline ---
+
+/// Derives artifacts for an uploaded attachment: always a metadata summary,
+/// plus extracted text for documents and a transcript for audio when
+/// supported. Per-kind extraction failures are persisted as failed derived
+/// artifact records rather than failing the upload.
 async fn derive_console_attachment_artifacts(
     state: &AppState,
     session: &ConsoleSession,
@@ -5501,6 +6098,10 @@ async fn derive_console_attachment_artifacts(
     Ok(persisted)
 }
 
+/// Indexes a derived artifact for retrieval by upserting a workspace document
+/// and a memory item, then linking them to the artifact record. Both targets
+/// receive only provenance metadata (see
+/// [`ATTACHMENT_DERIVED_INDEX_OMITTED_MESSAGE`]), never the extracted text.
 async fn index_derived_artifact_targets(
     state: &AppState,
     session: &ConsoleSession,
@@ -5508,10 +6109,14 @@ async fn index_derived_artifact_targets(
     artifact: &media::MediaArtifactPayload,
     record: &media::MediaDerivedArtifactRecord,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Only artifacts with extracted text are worth indexing; the text itself
+    // is still never copied into the index targets.
     let Some(_content_text) = record.content_text.as_deref() else {
         return Ok(());
     };
 
+    // Drop the previous memory item (recompute path) before re-ingesting so
+    // stale provenance does not accumulate; absence is not an error.
     if let Some(memory_item_id) = record.memory_item_id.as_deref() {
         let _ = state
             .runtime
@@ -5585,6 +6190,9 @@ fn console_attachment_workspace_path(session_id: &str, artifact_id: &str, kind: 
     format!("projects/attachments/{session_id}/{artifact_id}/{kind}.md")
 }
 
+/// Builds the provenance-only body stored in workspace/memory indexes for an
+/// attachment-derived artifact; the test suite pins that extracted text never
+/// appears here.
 fn derived_artifact_index_content(
     artifact_id: &str,
     kind: &str,
@@ -5596,6 +6204,10 @@ fn derived_artifact_index_content(
     )
 }
 
+// --- Envelope, attachment, and approval bridging helpers ---
+
+/// Builds the canonical `MessageEnvelope` for a console-submitted message;
+/// the console always reports a verified web origin.
 fn build_console_chat_message_envelope(
     session: &ConsoleSession,
     session_id: &str,
@@ -5621,6 +6233,7 @@ fn build_console_chat_message_envelope(
     }
 }
 
+/// Serializes an attachment to its wire shape (metadata only, no bytes).
 fn console_chat_attachment_payload_to_json(payload: &media::MediaArtifactPayload) -> Value {
     json!({
         "artifact_id": payload.artifact_id,
@@ -5636,6 +6249,8 @@ fn console_chat_attachment_payload_to_json(payload: &media::MediaArtifactPayload
     })
 }
 
+/// Maps a declared content type onto the protocol attachment kind by
+/// top-level MIME family, defaulting to `File`.
 fn console_chat_attachment_kind(
     content_type: &str,
 ) -> common_v1::message_attachment::AttachmentKind {
@@ -5660,6 +6275,9 @@ fn console_chat_attachment_kind_label(content_type: &str) -> &'static str {
     }
 }
 
+/// Coarse token-budget heuristic for attachment processing: a flat estimate
+/// for images (vision-model tile cost), otherwise the usual ~4 bytes/token
+/// approximation on the raw size.
 fn estimate_console_chat_attachment_tokens(payload: &media::MediaArtifactPayload) -> u64 {
     if payload.content_type.starts_with("image/") {
         850
@@ -5668,6 +6286,13 @@ fn estimate_console_chat_attachment_tokens(payload: &media::MediaArtifactPayload
     }
 }
 
+/// Forwards a console approval decision into the matching active run stream
+/// as a `ToolApprovalResponse`, consuming the pending approval mapping.
+///
+/// Returns `false` (without error) whenever the decision cannot be delivered:
+/// no decision yet, no active stream for the run, session mismatch, unknown
+/// approval id, or a closed stream. Called from the approvals handler, which
+/// treats delivery as best-effort.
 pub(crate) async fn sync_console_chat_approval_to_stream(
     state: &AppState,
     record: &journal::ApprovalRecord,
@@ -5739,6 +6364,8 @@ pub(crate) async fn sync_console_chat_approval_to_stream(
     true
 }
 
+/// Converts a stored approval scope to its protobuf value; an unset scope
+/// conservatively means a one-time approval.
 fn approval_scope_to_proto(scope: Option<ApprovalDecisionScope>) -> i32 {
     match scope.unwrap_or(ApprovalDecisionScope::Once) {
         ApprovalDecisionScope::Once => common_v1::ApprovalDecisionScope::Once as i32,
@@ -5747,6 +6374,9 @@ fn approval_scope_to_proto(scope: Option<ApprovalDecisionScope>) -> i32 {
     }
 }
 
+/// Effective token budget for a console background task: the requested value
+/// verbatim, or the default floor raised to at least the prompt's own
+/// estimated size.
 fn console_background_task_budget_tokens(requested: Option<u64>, text: &str) -> u64 {
     requested.unwrap_or_else(|| {
         DEFAULT_CONSOLE_BACKGROUND_TASK_BUDGET_TOKENS
@@ -5755,6 +6385,8 @@ fn console_background_task_budget_tokens(requested: Option<u64>, text: &str) -> 
     })
 }
 
+/// Encodes the optional background-task payload (`parameter_delta` and/or
+/// `delegation`) as a JSON string; `None` when neither is present.
 #[allow(clippy::result_large_err)]
 fn build_console_background_task_payload_json(
     parameter_delta: Option<&Value>,
@@ -5778,6 +6410,8 @@ fn build_console_background_task_payload_json(
     Ok(Some(Value::Object(payload).to_string()))
 }
 
+/// Loads the run lineage payload for a session, refusing to reveal it if any
+/// run in the session belongs to a different console context.
 async fn load_console_run_lineage(
     state: &AppState,
     context: &gateway::RequestContext,
@@ -5796,6 +6430,8 @@ async fn load_console_run_lineage(
     Ok(build_console_run_lineage_payload(run.run_id.as_str(), runs.as_slice()))
 }
 
+/// Walks `parent_run_id` links from the focus run to find the lineage root;
+/// the `seen` set guards against parent cycles in persisted data.
 fn build_console_run_lineage_payload(
     focus_run_id: &str,
     runs: &[journal::OrchestratorRunStatusSnapshot],
@@ -5821,6 +6457,9 @@ fn build_console_run_lineage_payload(
     })
 }
 
+/// Unit tests for the pure helpers: ownership checks, canvas frame parsing,
+/// budget defaults, retry parameter-delta selection, and the privacy
+/// guarantee that attachment index content omits extracted text.
 #[cfg(test)]
 mod tests {
     use super::{
