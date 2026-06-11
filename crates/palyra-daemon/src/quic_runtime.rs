@@ -1,3 +1,14 @@
+//! QUIC runtime endpoint hosted by the daemon: an mTLS-gated service that
+//! answers `node.health` and a resumable `node.stream_events` stream over
+//! length-prefixed JSON frames (framing and TLS primitives come from
+//! `palyra-transport-quic`).
+//!
+//! Security posture: TLS material always includes the gateway CA, and client
+//! authentication plus revocation are delegated to the `client_cert_verifier`
+//! built by `palyra-identity`; this module forwards that verifier unchanged.
+//! Acceptance is capped by a global semaphore that sheds excess connections
+//! instead of queueing them, so a connection flood cannot grow memory.
+
 use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::{anyhow, Context, Result};
@@ -12,18 +23,33 @@ use tracing::{debug, warn};
 
 const METHOD_HEALTH: &str = "node.health";
 const METHOD_STREAM_EVENTS: &str = "node.stream_events";
+// The event stream is a bounded stub: sequences 1..=5 exist so transport tests
+// can exercise resume semantics (`resume_from` continues at the next sequence).
 const MAX_STREAM_SEQUENCE: u64 = 5;
 const MAX_CONCURRENT_CONNECTIONS: usize = 256;
 
+/// PEM-encoded TLS material plus client-auth policy for the QUIC runtime endpoint.
+///
+/// Invariant: when `require_client_auth` is `true` the endpoint refuses
+/// handshakes without a client certificate chained to `ca_cert_pem`; a custom
+/// `client_cert_verifier` (revocation-aware, built by `palyra-identity`)
+/// replaces the default CA-only verifier when present.
 #[derive(Clone)]
 pub struct QuicRuntimeTlsMaterial {
+    /// Gateway CA certificate used to verify client certificates.
     pub ca_cert_pem: String,
+    /// Server certificate presented to connecting clients.
     pub cert_pem: String,
+    /// Private key for `cert_pem`.
     pub key_pem: String,
+    /// Whether the endpoint demands mTLS client authentication.
     pub require_client_auth: bool,
+    /// Optional revocation-aware verifier overriding the default CA check.
     pub client_cert_verifier: Option<Arc<dyn ClientCertVerifier>>,
 }
 
+// Manual impl so accidental `{:?}` logging cannot leak the private key or
+// certificate bytes; only non-sensitive policy flags are printed.
 impl std::fmt::Debug for QuicRuntimeTlsMaterial {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -59,6 +85,15 @@ struct QuicRuntimeResponse {
     error: Option<String>,
 }
 
+/// Binds a QUIC server endpoint on `bind_addr` using the provided TLS material
+/// and transport limits.
+///
+/// The returned endpoint is not serving yet; pass it to [`serve`] to accept
+/// connections.
+///
+/// # Errors
+/// Returns an error when the TLS material does not parse (invalid PEM, key
+/// mismatch) or the UDP socket cannot be bound on `bind_addr`.
 pub fn bind_endpoint(
     bind_addr: SocketAddr,
     tls_material: &QuicRuntimeTlsMaterial,
@@ -79,6 +114,18 @@ pub fn bind_endpoint(
     .with_context(|| format!("failed to initialize QUIC endpoint on {bind_addr}"))
 }
 
+/// Runs the accept loop for a bound QUIC runtime endpoint until the endpoint
+/// is closed.
+///
+/// Each accepted connection is handled on its own task; per-connection and
+/// per-stream failures are logged and never abort the accept loop.
+/// `node_rpc_mtls_required` is only echoed back in `node.health` responses so
+/// clients can discover the gRPC node RPC transport policy.
+///
+/// # Errors
+/// Currently always returns `Ok(())` once the endpoint stops accepting; the
+/// `Result` is kept so the accept loop can surface fatal errors later without
+/// a signature change.
 pub async fn serve(endpoint: quinn::Endpoint, node_rpc_mtls_required: bool) -> Result<()> {
     serve_with_connection_limit(endpoint, node_rpc_mtls_required, MAX_CONCURRENT_CONNECTIONS).await
 }

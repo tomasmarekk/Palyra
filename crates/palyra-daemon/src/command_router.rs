@@ -1,3 +1,16 @@
+//! Realtime command router: dispatches authenticated realtime commands (run,
+//! approval, node, and config operations) to the daemon runtime.
+//!
+//! Every command passes the same gate sequence before its handler runs:
+//! authorization (`realtime::authorize_realtime_command`), per-connection rate
+//! limiting, then idempotency replay for side-effecting commands. Handlers
+//! enforce ownership (principal + device + channel must match the resource)
+//! so a realtime session can only touch its own runs and approvals; `admin:`
+//! principals may list/read across principals. Results are returned as
+//! [`RealtimeCommandResultEnvelope`] and mirrored onto the realtime event bus.
+//! Used by the websocket transport in `transport::http::handlers::realtime`
+//! and the ACP console surface.
+
 use std::sync::Arc;
 
 use palyra_common::{
@@ -26,6 +39,7 @@ use crate::{
     realtime::{authorize_realtime_command, descriptor_for_command, RealtimeConnectionContext},
 };
 
+/// Identity and connection context a realtime command executes under.
 #[derive(Debug, Clone)]
 pub(crate) struct CommandRouterContext {
     pub(crate) request_context: RequestContext,
@@ -38,6 +52,12 @@ struct CommandIdempotencyOutcome {
     result: Option<Value>,
 }
 
+/// Executes one realtime command envelope and returns its result envelope.
+///
+/// Runs the authorization, rate-limit, and idempotency gates before the
+/// handler; on success it persists the idempotency result, publishes a
+/// realtime event, and records a console journal event. Failures are returned
+/// in the envelope (`ok = false`), never as a transport error.
 pub(crate) async fn dispatch_realtime_command(
     state: &AppState,
     context: &CommandRouterContext,
@@ -63,6 +83,8 @@ pub(crate) async fn dispatch_realtime_command(
         Ok(outcome) => outcome,
         Err(error) => return command_error(envelope, error, false),
     };
+    // Replays return the stored result without re-publishing events or
+    // journal entries: the side effects already happened on the first run.
     if idempotency.replayed {
         let fallback = json!({
             "replayed": true,
@@ -247,6 +269,8 @@ async fn approval_list(
     context: &CommandRouterContext,
     envelope: &RealtimeCommandEnvelope,
 ) -> Result<Value, StableErrorEnvelope> {
+    // Admin principals may filter across principals (or omit the filter to
+    // see everything); everyone else is pinned to their own approvals.
     let principal_filter = if context.request_context.principal.starts_with("admin:") {
         optional_str(&envelope.params, "principal").map(str::to_owned)
     } else {
@@ -297,6 +321,8 @@ async fn approval_decide(
         ensure_expected_approval_version(existing.updated_at_unix_ms, expected_version)?;
     }
     let approved = envelope.params.get("approved").and_then(Value::as_bool).unwrap_or(false);
+    // Allowing an approval whose run already has a pending abort would let
+    // work start on a dying run; denials are always safe to record.
     if approved {
         let run = load_owned_run(state, &context.request_context, existing.run_id.as_str()).await?;
         ensure_approval_not_racing_abort(approved, run.cancel_requested)?;
@@ -324,6 +350,8 @@ async fn approval_decide(
 
 async fn node_presence(state: &AppState) -> Result<Value, StableErrorEnvelope> {
     let now = crate::unix_ms_now().unwrap_or(0);
+    // A node is "online" until it has missed four heartbeats; one or two
+    // missed beats are routine over flaky links and must not flap presence.
     let ttl_ms = REALTIME_DEFAULT_HEARTBEAT_INTERVAL_MS.saturating_mul(4);
     let nodes = state
         .node_runtime
@@ -398,6 +426,8 @@ async fn node_capability_revoke(
 ) -> Result<Value, StableErrorEnvelope> {
     let device_id = required_str(&envelope.params, "device_id")?;
     let capability = required_str(&envelope.params, "capability")?;
+    // Unlike grant, revoke deliberately skips the staleness gate: removing a
+    // capability must always be possible, including from unreachable nodes.
     let node = state
         .node_runtime
         .set_node_capability_availability(device_id, capability, false)
@@ -500,6 +530,9 @@ async fn load_owned_run(
     Ok(run)
 }
 
+// Ownership requires principal, device, and channel to all match: channel is
+// part of the identity so a run started from one channel context cannot be
+// driven from another, even by the same principal and device.
 fn ensure_run_owned(
     run: &journal::OrchestratorRunStatusSnapshot,
     context: &RequestContext,
@@ -783,6 +816,9 @@ async fn begin_command_idempotency(
             "send JSON-safe command params",
         )
     })?;
+    // The stored key is namespaced per command so reusing a raw client key
+    // across different commands can never replay the wrong result. The
+    // journal store is synchronous (SQLite), hence spawn_blocking.
     let key = format!("realtime:{}:{raw_key}", envelope.command.as_str());
     let runtime = Arc::clone(&state.runtime);
     let command = envelope.command;
@@ -989,6 +1025,8 @@ fn parse_decision_scope(value: Option<&str>) -> Result<ApprovalDecisionScope, St
     })
 }
 
+// Approvals have no dedicated version column; the updated_at timestamp serves
+// as the optimistic-concurrency token clients echo back as expected_version.
 fn ensure_expected_approval_version(
     actual_updated_at_unix_ms: i64,
     expected_version: u64,

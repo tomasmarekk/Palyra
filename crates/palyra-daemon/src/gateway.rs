@@ -1,3 +1,17 @@
+//! Gateway core: shared constants, tool runtime dispatch, approval plumbing,
+//! and run lifecycle/cleanup helpers used by every daemon transport surface.
+//!
+//! This module is the hub between transports (gRPC/HTTP in `transport::*`),
+//! the tool runtime implementations in `application::tool_runtime`, and the
+//! journal/approval stores. It re-exports its submodules (`approvals`,
+//! `canvas`, `common`, `cron_support`, `messages`, `runtime`, `util`,
+//! `vault`), so most gateway items are reachable as `crate::gateway::*`.
+//! Security-relevant invariants live here: tool execution limits, the
+//! deny-by-default approval prompt flow, and terminal-run resource cleanup
+//! (browser sessions, background processes, stale PID files).
+
+// Several helpers are exercised only by unit/integration tests; silence the
+// resulting dead-code noise in test builds instead of cfg-gating each item.
 #![cfg_attr(test, allow(dead_code, private_interfaces))]
 
 #[cfg(not(windows))]
@@ -100,9 +114,16 @@ use crate::{
 
 use proto::palyra::{common::v1 as common_v1, cron::v1 as cron_v1, gateway::v1 as gateway_v1};
 
+/// Request header carrying the authenticated principal identity.
 pub const HEADER_PRINCIPAL: &str = "x-palyra-principal";
+/// Request header carrying the caller's device id.
 pub const HEADER_DEVICE_ID: &str = "x-palyra-device-id";
+/// Request header carrying the optional channel context.
 pub const HEADER_CHANNEL: &str = "x-palyra-channel";
+
+// Paging, payload, TTL, and latency-budget limits shared across transports.
+// Grouped here (rather than documented per item) because each name states its
+// own unit and subject; changing one is a contract change for every surface.
 pub(crate) const MAX_JOURNAL_RECENT_EVENTS: usize = 100;
 pub(crate) const MAX_SESSIONS_PAGE_LIMIT: usize = 500;
 pub(crate) const MAX_AGENTS_PAGE_LIMIT: usize = 500;
@@ -180,6 +201,10 @@ pub(crate) const TOOL_APPROVAL_RESPONSE_TIMEOUT: Duration =
 const TOOL_APPROVAL_EXTERNAL_DECISION_POLL_INTERVAL: Duration = Duration::from_millis(250);
 pub(crate) const SKILL_EXECUTION_DENY_REASON_PREFIX: &str =
     "skill execution blocked by security gate";
+
+// Canonical tool names dispatched by execute_tool_with_runtime_dispatch.
+// These strings are wire/policy contract (allowlists, approvals, journal
+// payloads, fixtures) - never edit an existing value, only append new ones.
 pub(crate) const MEMORY_STATUS_TOOL_NAME: &str = "palyra.memory.status";
 pub(crate) const MEMORY_SEARCH_TOOL_NAME: &str = "palyra.memory.search";
 pub(crate) const MEMORY_RECALL_TOOL_NAME: &str = "palyra.memory.recall";
@@ -255,6 +280,9 @@ pub(crate) use runtime::*;
 pub(crate) use util::*;
 pub(crate) use vault::*;
 
+/// Ingests a memory item without ever failing the caller: policy denials and
+/// store errors are logged (and counted) but swallowed, because memory
+/// capture must never break the run or message flow that produced it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn ingest_memory_best_effort(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -311,6 +339,9 @@ pub(crate) async fn ingest_memory_best_effort(
     }
 }
 
+/// Gate for automatic memory capture: operator-driven sources are always
+/// allowed, while tape/summary-derived items must carry an explicit promotion
+/// or lifecycle tag so raw conversation traffic is not hoovered into memory.
 pub(crate) fn best_effort_memory_ingest_allowed(source: MemorySource, tags: &[String]) -> bool {
     match source {
         MemorySource::Manual | MemorySource::Import => true,
@@ -323,10 +354,16 @@ pub(crate) fn best_effort_memory_ingest_allowed(source: MemorySource, tags: &[St
     }
 }
 
+/// Whether cancelling this tool must wait for the execution to drain instead
+/// of dropping it: these tools spawn OS processes or nested tool programs
+/// whose teardown must finish, or they would leak past the cancelled run.
 pub(crate) fn tool_cancellation_requires_execution_drain(tool_name: &str) -> bool {
     matches!(tool_name, PROCESS_RUNNER_TOOL_NAME | TOOL_PROGRAM_RUN_TOOL_NAME | "palyra.plugin.run")
 }
 
+/// Folds an approval outcome into a tool decision: a missing approval channel
+/// or an explicit denial flips `allowed` to false (fail closed); reasons are
+/// chained so the journal preserves the full decision provenance.
 #[cfg(test)]
 pub(crate) fn apply_tool_approval_outcome(
     mut decision: crate::tool_protocol::ToolDecision,
@@ -362,6 +399,10 @@ pub(crate) fn apply_tool_approval_outcome(
     decision
 }
 
+/// Extracts the non-empty proposal id from a tool approval response.
+///
+/// # Errors
+/// Returns `Status::invalid_argument` when the id is missing or empty.
 pub(crate) fn tool_approval_response_proposal_id(
     proposal_id: Option<common_v1::CanonicalId>,
 ) -> Result<String, Status> {
@@ -370,6 +411,14 @@ pub(crate) fn tool_approval_response_proposal_id(
         .ok_or_else(|| Status::invalid_argument("tool_approval_response.proposal_id is required"))
 }
 
+/// Checks whether `response` answers the approval identified by
+/// `proposal_id`/`approval_id`; returns the effective approval id on match,
+/// `None` when the response targets a different proposal or approval. A
+/// response without an approval id matches by proposal alone (older clients).
+///
+/// # Errors
+/// Returns `Status::invalid_argument` for a missing proposal id or a
+/// non-canonical approval id.
 pub(crate) fn matching_tool_approval_response_id(
     response: &common_v1::ToolApprovalResponse,
     proposal_id: &str,
@@ -394,6 +443,18 @@ pub(crate) fn matching_tool_approval_response_id(
     }
 }
 
+/// Waits for a tool approval decision from either of the two valid sources:
+/// an inline response on the run stream, or an external resolution of the
+/// approval record (console/web), discovered by polling.
+///
+/// Loops until a decision exists; the overall deadline is owned by the
+/// caller. If the client stream ends first, the outcome falls back to the
+/// approval record or a fail-closed "channel unavailable" denial.
+///
+/// # Errors
+/// Returns `Status` errors for protocol violations on the stream (wrong
+/// version, switched session/run ids, unexpected prompt payloads) and for
+/// approval-record lookup failures.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn await_tool_approval_response(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -404,6 +465,8 @@ pub(crate) async fn await_tool_approval_response(
     approval_id: &str,
 ) -> Result<ToolApprovalOutcome, Status> {
     loop {
+        // Both branches are cancel-safe: `Streaming::next` yields whole
+        // messages and the sleep branch only triggers a fresh record poll.
         tokio::select! {
             item = stream.next() => {
                 let Some(item) = item else {
@@ -493,6 +556,8 @@ fn tool_approval_outcome_from_stream_message(
     }))
 }
 
+// Fail closed: when the client stream is gone and no external decision
+// exists, the approval is treated as an error-denial, never an allow.
 #[allow(clippy::result_large_err)]
 async fn external_or_unavailable_tool_approval_outcome(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -543,6 +608,8 @@ async fn resolved_tool_approval_record_outcome(
     }))
 }
 
+/// Maps a model-provider failure onto the closest gRPC status so clients can
+/// distinguish retryable outages from auth, quota, and request-shape errors.
 pub(crate) fn map_provider_error(error: ProviderError) -> Status {
     match error {
         ProviderError::CircuitOpen { retry_after_ms } => Status::unavailable(format!(
@@ -603,12 +670,15 @@ pub(crate) fn map_provider_error(error: ProviderError) -> Status {
     }
 }
 
+/// Whether the request's security context labels ask for provider JSON mode.
 pub(crate) fn security_requests_json_mode(security: Option<&common_v1::SecurityContext>) -> bool {
     security
         .map(|value| value.labels.iter().any(|label| label.eq_ignore_ascii_case("json_mode")))
         .unwrap_or(false)
 }
 
+/// Renders a single-line, size-capped summary of a tool result for memory
+/// ingestion (output capped at 512 chars, error at 256, newlines flattened).
 pub(crate) fn build_tool_result_memory_text(
     tool_name: &str,
     success: bool,
@@ -627,6 +697,7 @@ pub(crate) fn build_tool_result_memory_text(
     }
 }
 
+/// Borrowed identity, session, and backend context for one tool execution.
 #[derive(Clone, Copy)]
 pub(crate) struct ToolRuntimeExecutionContext<'a> {
     pub(crate) principal: &'a str,
@@ -638,16 +709,22 @@ pub(crate) struct ToolRuntimeExecutionContext<'a> {
     pub(crate) backend_reason_code: &'a str,
 }
 
+/// Remaining tool-call budget shared between a run loop and nested tool
+/// programs, so child calls draw down the same per-run allowance.
 pub(crate) type SharedToolBudget = Arc<Mutex<u32>>;
 
+/// Wraps an initial remaining budget in the shared handle.
 pub(crate) fn shared_tool_budget(remaining_tool_budget: u32) -> SharedToolBudget {
     Arc::new(Mutex::new(remaining_tool_budget))
 }
 
+/// Reads the current remaining budget (recovering from a poisoned lock, since
+/// a plain counter cannot be left inconsistent).
 pub(crate) fn shared_tool_budget_remaining(budget: &SharedToolBudget) -> u32 {
     *budget.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Borrowed identifiers used when recording tool execution metrics and logs.
 #[derive(Clone, Copy)]
 pub(crate) struct ToolExecutionTraceContext<'a> {
     pub(crate) run_id: &'a str,
@@ -656,6 +733,9 @@ pub(crate) struct ToolExecutionTraceContext<'a> {
     pub(crate) execution_surface: &'a str,
 }
 
+/// Convenience wrapper over
+/// [`execute_tool_with_runtime_dispatch_with_cancellation`] for call sites
+/// without a cancellation flag.
 pub(crate) async fn execute_tool_with_runtime_dispatch(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -676,6 +756,17 @@ pub(crate) async fn execute_tool_with_runtime_dispatch(
     .await
 }
 
+/// Routes one approved tool call to its implementation.
+///
+/// Routing precedence is deliberate and ordered: a `NetworkedWorker` backend
+/// preference overrides every local handler; then exact tool-name matches
+/// (tool program, memory, routines, delegation, artifacts, workspace, HTTP
+/// fetch), then the `palyra.browser.*` prefix family, then the process
+/// runner tools, and finally the generic `execute_tool_call` fallback for
+/// externally configured tools. Side-effectful tools additionally register
+/// their resources (browser sessions, background PIDs) for terminal-run
+/// cleanup. Failures are reported inside [`ToolExecutionOutcome`], never as
+/// a panic or transport error.
 pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -909,6 +1000,8 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation(
     }
 }
 
+// Tracks run-owned resources (background PIDs, browser sessions) so
+// cleanup_run_resources can reap them when the run reaches a terminal state.
 fn record_run_cleanup_resource_from_tool_outcome(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -1081,6 +1174,11 @@ fn browser_session_id_from_tool_input(input_json: &[u8]) -> Option<String> {
     Some(session_id.to_owned())
 }
 
+// Workspace-root selection precedence for a process run: the session's active
+// project root wins when the input does not already target a specific root;
+// otherwise the root containing the input's cwd/path arguments; otherwise the
+// statically configured workspace root. Resolution failures fall back rather
+// than fail so a broken agent binding cannot brick process execution.
 async fn process_runner_tool_config_for_session(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -1139,6 +1237,7 @@ fn process_runner_input_with_path_env(
     let mut input = parse_process_runner_tool_input(input_json).ok()?;
     let mut changed = false;
     for (key, value) in path_env {
+        // Caller-provided env always wins; launch-context paths only fill gaps.
         if input.env.contains_key(key) {
             continue;
         }
@@ -1314,6 +1413,9 @@ fn process_runner_argument_targets_active_root(
         .is_some_and(|(_, value)| relative_path_already_targets_active_root(value, active_root))
 }
 
+/// Records post-execution metrics for one tool call: the latency-budget
+/// breach warning, failure/timeout counters, and the process-runner and
+/// workspace-patch specific counters.
 pub(crate) fn record_tool_execution_outcome_metrics(
     runtime_state: &Arc<GatewayRuntimeState>,
     trace: ToolExecutionTraceContext<'_>,
@@ -1362,6 +1464,7 @@ pub(crate) fn record_tool_execution_outcome_metrics(
     }
 }
 
+/// Counts a tool policy decision (allow/deny) into the runtime counters.
 #[cfg(test)]
 pub(crate) fn record_tool_decision_metrics(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -1380,6 +1483,10 @@ pub(crate) fn record_tool_decision_metrics(
     }
 }
 
+/// Builds the one-line tool result summary and best-effort ingests it into
+/// memory (only for allowed decisions or successful outcomes, so denied and
+/// failed probes do not pollute recall). Returns the summary for reuse in
+/// journal/tape payloads.
 pub(crate) async fn build_and_ingest_tool_result_memory_summary(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -1411,6 +1518,9 @@ pub(crate) async fn build_and_ingest_tool_result_memory_summary(
     summary
 }
 
+/// Marks an approval record as `Error` (e.g. the prompt could not be
+/// delivered); resolution failures are logged, not propagated, because this
+/// runs on paths that are already failing.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn best_effort_mark_approval_error(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -1431,6 +1541,7 @@ pub(crate) async fn best_effort_mark_approval_error(
     }
 }
 
+/// Everything [`finalize_run_failure`] needs to drive a run into `Failed`.
 pub(crate) struct RunFailureFinalization<'a> {
     pub(crate) sender: &'a mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
     pub(crate) runtime_state: &'a Arc<GatewayRuntimeState>,
@@ -1442,6 +1553,13 @@ pub(crate) struct RunFailureFinalization<'a> {
     pub(crate) reason: &'a str,
 }
 
+/// Drives a run to the `Failed` terminal state: persists the state change,
+/// emits the failure status on the stream and tape, records the journal
+/// event, and cleans up run-owned resources.
+///
+/// Idempotent by construction: it returns early when there is no active run,
+/// the run is already terminal, or the state machine rejects the transition,
+/// so racing failure paths cannot double-finalize.
 pub(crate) async fn finalize_run_failure(input: RunFailureFinalization<'_>) {
     let Some(run_id) = input.active_run_id else {
         return;
@@ -1480,6 +1598,10 @@ pub(crate) async fn finalize_run_failure(input: RunFailureFinalization<'_>) {
     cleanup_run_resources(input.runtime_state, run_id, input.reason).await;
 }
 
+/// Reaps resources a terminal run left behind: closes its browser sessions,
+/// terminates its background process trees, and removes matching stale PID
+/// files. Per-resource failures are logged and reported in the `run.cleanup`
+/// tape event but never abort the remaining cleanup.
 pub(crate) async fn cleanup_run_resources(
     runtime_state: &Arc<GatewayRuntimeState>,
     run_id: &str,
@@ -1660,10 +1782,15 @@ fn background_process_cleanup_status(pid: u32) -> Option<BackgroundProcessCleanu
     crate::sandbox_runner::background_process_runtime_status(pid).ok().map(Into::into)
 }
 
+// Hard caps for the PID-file sweep: the scan must stay cheap and bounded even
+// inside a pathological workspace tree (deep nesting, huge directories).
 const PID_ARTIFACT_MAX_SCAN_DEPTH: usize = 4;
 const PID_ARTIFACT_MAX_SCAN_ENTRIES: usize = 512;
 const PID_ARTIFACT_MAX_FILE_BYTES: u64 = 1024;
 
+// Runs only after the process is confirmed dead: deleting a PID file for a
+// live process would let a second instance start on top of it. The blocking
+// filesystem walk is moved off the runtime via spawn_blocking.
 async fn cleanup_stale_pid_artifacts_after_status(
     runtime_state: &Arc<GatewayRuntimeState>,
     run_id: &str,
@@ -1801,6 +1928,8 @@ fn pid_file_contains_pid(path: &Path, pid_text: &str) -> Result<bool, String> {
 
     let bytes =
         fs::read(path).map_err(|error| format!("failed to read PID file candidate: {error}"))?;
+    // Re-check after the read: the file may have grown between the metadata
+    // probe and the read, and oversized files are never PID files.
     if bytes.len() as u64 > PID_ARTIFACT_MAX_FILE_BYTES {
         return Ok(false);
     }
@@ -2080,6 +2209,7 @@ mod run_failure_diagnostic_tests {
     }
 }
 
+/// Test shim over the run-stream tape compaction entry point.
 #[allow(clippy::result_large_err)]
 #[cfg(test)]
 pub(crate) async fn compact_model_token_tape_stub(
@@ -2099,6 +2229,7 @@ pub(crate) async fn compact_model_token_tape_stub(
     .await
 }
 
+/// Expected tape payload emitted when the model-token cap triggers compaction.
 #[cfg(test)]
 pub(crate) fn model_token_compaction_tape_payload(max_model_token_events: usize) -> String {
     json!({
@@ -2109,6 +2240,8 @@ pub(crate) fn model_token_compaction_tape_payload(max_model_token_events: usize)
     .to_string()
 }
 
+/// Standard allow-once / allow-session / deny option set; deny is the
+/// default selection so an absent-minded confirm stays safe.
 #[cfg(test)]
 pub(crate) fn default_approval_prompt_options() -> Vec<ApprovalPromptOption> {
     vec![
@@ -2139,6 +2272,9 @@ pub(crate) fn default_approval_prompt_options() -> Vec<ApprovalPromptOption> {
     ]
 }
 
+/// Truncates `input` to at most `max_bytes` bytes (UTF-8 safe, never splits a
+/// character), appending `"..."` when anything was cut. Callers pass budgets
+/// well above 3 bytes; tiny budgets degrade to just the ellipsis.
 pub(crate) fn truncate_with_ellipsis(input: String, max_bytes: usize) -> String {
     if input.len() <= max_bytes {
         return input;
@@ -2155,6 +2291,7 @@ pub(crate) fn truncate_with_ellipsis(input: String, max_bytes: usize) -> String 
     output
 }
 
+/// Builds the size-capped JSON summary shown to approvers for a tool request.
 #[cfg(test)]
 pub(crate) fn build_tool_request_summary(
     tool_name: &str,
@@ -2175,6 +2312,7 @@ pub(crate) fn build_tool_request_summary(
     )
 }
 
+/// Snapshots the active tool policy (id + content hash) for approval records.
 #[cfg(test)]
 pub(crate) fn build_tool_policy_snapshot(
     config: &ToolCallConfig,
@@ -2194,6 +2332,8 @@ pub(crate) fn build_tool_policy_snapshot(
     }
 }
 
+/// Clones a request context with its channel replaced by the resolved route
+/// channel, so downstream journal events carry the actual delivery channel.
 pub(crate) fn request_context_with_resolved_route_channel(
     request_context: &RequestContext,
     route_channel: &str,
@@ -2205,6 +2345,8 @@ pub(crate) fn request_context_with_resolved_route_channel(
     }
 }
 
+/// Assembles the full pending approval (prompt, summary, policy snapshot)
+/// for a sensitive tool call.
 #[cfg(test)]
 pub(crate) fn build_pending_tool_approval(
     tool_name: &str,
@@ -2243,6 +2385,8 @@ pub(crate) fn build_pending_tool_approval(
     }
 }
 
+/// Approval risk shown to operators: everything defaults to `High`; only a
+/// read-only command under the Tier C sandbox is downgraded to `Medium`.
 #[cfg(test)]
 pub(crate) fn approval_risk_for_tool(
     tool_name: &str,
@@ -2262,6 +2406,8 @@ pub(crate) fn approval_risk_for_tool(
     }
 }
 
+/// Whether the process-runner input invokes one of the known read-only
+/// commands; anything unparseable or unknown counts as not read-only.
 #[cfg(test)]
 pub(crate) fn process_runner_command_is_read_only(input_json: &[u8]) -> bool {
     const READ_ONLY_COMMANDS: &[&str] = &[
@@ -2282,6 +2428,7 @@ pub(crate) fn process_runner_command_is_read_only(input_json: &[u8]) -> bool {
     READ_ONLY_COMMANDS.iter().any(|candidate| candidate.eq_ignore_ascii_case(command))
 }
 
+/// Journals an `approval.requested` event for a proposed tool call.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
@@ -2323,6 +2470,7 @@ pub(crate) async fn record_approval_requested_journal_event(
         .map(|_| ())
 }
 
+/// Serializes the `approval.requested` journal payload (prompt included).
 #[cfg(test)]
 pub(crate) fn approval_requested_journal_payload(
     proposal_id: &str,
@@ -2366,6 +2514,7 @@ pub(crate) fn approval_requested_journal_payload(
     .into_bytes()
 }
 
+/// Journals an `approval.resolved` event for a decided tool approval.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
@@ -2405,6 +2554,7 @@ pub(crate) async fn record_approval_resolved_journal_event(
         .map(|_| ())
 }
 
+/// Serializes the `approval.resolved` journal payload.
 #[cfg(test)]
 pub(crate) fn approval_resolved_journal_payload(
     proposal_id: &str,
@@ -2427,6 +2577,11 @@ pub(crate) fn approval_resolved_journal_payload(
     .into_bytes()
 }
 
+/// Appends a message-router journal event, injecting `event_name` into the
+/// payload's `event` field when the caller did not set one.
+///
+/// # Errors
+/// Propagates journal append failures as `Status`.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn record_message_router_journal_event(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -2458,6 +2613,11 @@ pub(crate) async fn record_message_router_journal_event(
         .map(|_| ())
 }
 
+/// Appends a vault access audit event (key and size only -- secret values
+/// never reach the journal) and bumps the vault audit counter.
+///
+/// # Errors
+/// Propagates journal append failures as `Status`.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn record_vault_journal_event(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -2495,6 +2655,10 @@ pub(crate) async fn record_vault_journal_event(
     Ok(())
 }
 
+/// Appends an agent lifecycle journal event with a caller-provided payload.
+///
+/// # Errors
+/// Propagates journal append failures as `Status`.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn record_agent_journal_event(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -2518,6 +2682,7 @@ pub(crate) async fn record_agent_journal_event(
         .map(|_| ())
 }
 
+/// Journals an `auth.profile.saved` event (credential type only, no secret).
 #[allow(clippy::result_large_err)]
 #[cfg(test)]
 pub(crate) async fn record_auth_profile_saved_journal_event(
@@ -2553,6 +2718,7 @@ pub(crate) async fn record_auth_profile_saved_journal_event(
         .map(|_| ())
 }
 
+/// Journals an `auth.profile.deleted` event for an auth profile removal.
 #[allow(clippy::result_large_err)]
 #[cfg(test)]
 pub(crate) async fn record_auth_profile_deleted_journal_event(
@@ -2589,6 +2755,8 @@ pub(crate) async fn record_auth_profile_deleted_journal_event(
         .map(|_| ())
 }
 
+/// Journals an OAuth refresh outcome (reason redacted); refreshes that were
+/// never attempted are skipped entirely.
 #[allow(clippy::result_large_err)]
 #[cfg(test)]
 pub(crate) async fn record_auth_refresh_journal_event(
@@ -2628,6 +2796,8 @@ pub(crate) async fn record_auth_refresh_journal_event(
         .map(|_| ())
 }
 
+/// Extracts `(files_touched, rollback_performed)` from a workspace patch tool
+/// output; unparseable output counts as zero activity.
 pub(crate) fn workspace_patch_metrics_from_output(output_json: &[u8]) -> (usize, bool) {
     let parsed = serde_json::from_slice::<Value>(output_json).ok();
     let Some(Value::Object(payload)) = parsed else {
@@ -2640,6 +2810,9 @@ pub(crate) fn workspace_patch_metrics_from_output(output_json: &[u8]) -> (usize,
     (files_touched, rollback_performed)
 }
 
+/// Records sandbox launch, backend selection, policy-deny, and blocked-escape
+/// counters for one process-runner execution (no-op when the policy decision
+/// already denied the call, since nothing was launched).
 pub(crate) fn record_process_runner_execution_metrics(
     counters: &RuntimeCounters,
     decision_allowed: bool,
@@ -2691,6 +2864,7 @@ pub(crate) fn record_process_runner_execution_metrics(
     }
 }
 
+/// Which sandbox boundary a failed process-runner execution tried to cross.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SandboxEscapeAttemptType {
     Workspace,
@@ -2698,6 +2872,9 @@ pub(crate) enum SandboxEscapeAttemptType {
     Executable,
 }
 
+/// Heuristically classifies a sandbox error message as a blocked escape
+/// attempt for metrics. Marker substrings must stay aligned with the error
+/// strings produced by `sandbox_runner`; `None` means "ordinary failure".
 pub(crate) fn classify_sandbox_escape_attempt(error: &str) -> Option<SandboxEscapeAttemptType> {
     let normalized = error.to_ascii_lowercase();
     if normalized.contains("path traversal")
@@ -2723,6 +2900,7 @@ pub(crate) fn classify_sandbox_escape_attempt(error: &str) -> Option<SandboxEsca
     None
 }
 
+/// Opens a throwaway encrypted-file vault under a unique temp directory.
 #[cfg(test)]
 pub(crate) fn build_test_vault() -> Arc<Vault> {
     let nonce = Ulid::new();

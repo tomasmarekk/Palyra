@@ -1,3 +1,15 @@
+//! gRPC `NodeService` implementation: device pairing, certificate lifecycle,
+//! node registration, and capability dispatch over the node event stream.
+//!
+//! Every device-scoped RPC is certificate-bound: when mTLS is required, the
+//! request's client certificate must map to the exact `device_id` it claims,
+//! and revoked fingerprints are rejected before any state is touched. Pairing
+//! is deny-by-default: completion only records a pending request whose
+//! approval is resolved through the journal approval flow, and the device
+//! private key is sealed via `palyra-identity` rather than persisted in node
+//! runtime state. State and queues live in [`node_runtime::NodeRuntimeState`];
+//! transport wiring happens in `transport::grpc::server`.
+
 use std::{
     pin::Pin,
     sync::{Arc, Mutex},
@@ -34,6 +46,12 @@ const NODE_PAIRING_PRINCIPAL: &str = "system:node-pairing";
 const NODE_PAIRING_CHANNEL: &str = "node";
 const NODE_CAPABILITY_TIMEOUT_MS: u64 = 30 * 1_000;
 
+/// gRPC handler state for the node service.
+///
+/// Cloning is cheap (all fields are shared handles). `require_mtls` controls
+/// whether device-scoped RPCs fail closed when transport metadata or a client
+/// certificate is missing; with it disabled (loopback/dev deployments) the
+/// certificate checks degrade to no-ops.
 #[derive(Clone)]
 pub struct NodeRpcServiceImpl {
     identity_manager: Arc<Mutex<IdentityManager>>,
@@ -43,6 +61,7 @@ pub struct NodeRpcServiceImpl {
 }
 
 impl NodeRpcServiceImpl {
+    /// Creates the service from shared daemon state handles.
     #[must_use]
     pub fn new(
         identity_manager: Arc<Mutex<IdentityManager>>,
@@ -53,6 +72,11 @@ impl NodeRpcServiceImpl {
         Self { identity_manager, node_runtime, runtime, require_mtls }
     }
 
+    /// Extracts and screens the peer client-certificate fingerprint.
+    ///
+    /// Returns `Ok(None)` only when mTLS is not required and the transport
+    /// carried no usable certificate; with `require_mtls` every missing-cert
+    /// path fails closed, and a revoked fingerprint is always rejected.
     fn peer_certificate_fingerprint<B>(
         &self,
         request: &Request<B>,
@@ -96,6 +120,8 @@ impl NodeRpcServiceImpl {
         Ok(Some(fingerprint))
     }
 
+    /// Requires that the request's client certificate is bound to exactly the
+    /// claimed `device_id`, so one paired device cannot act for another.
     fn enforce_cert_bound_device<B>(
         &self,
         request: &Request<B>,
@@ -305,6 +331,9 @@ impl NodeRpcServiceImpl {
         if let Some(private_key_pem) = sealed_private_key {
             return Ok(private_key_pem);
         }
+        // Legacy fallback: older node runtime state persisted the private key
+        // inline in the pairing material. Migrate it into sealed identity
+        // storage on first read; new records never carry the inline key.
         if !material.mtls_client_private_key_pem.is_empty() {
             identity
                 .persist_pending_pairing_private_key(
@@ -391,6 +420,10 @@ impl node_v1::node_service_server::NodeService for NodeRpcServiceImpl {
                         protocol_version: payload.v.max(1),
                         device_id: device_id.clone(),
                         client_kind,
+                        // Both arms are intentionally identical: the pairing
+                        // proof is the raw code for PIN and QR alike. The
+                        // exhaustive match stays so a new method variant
+                        // forces a decision about its proof material here.
                         proof: match reserved_code.method {
                             PairingCodeMethod::Pin => reserved_code.code.clone(),
                             PairingCodeMethod::Qr => reserved_code.code.clone(),
@@ -644,6 +677,10 @@ impl node_v1::node_service_server::NodeService for NodeRpcServiceImpl {
                             break;
                         }
                     };
+                // The certificate-to-device binding is re-resolved per message
+                // (not just at stream open): revoking a device removes it from
+                // the paired set, so a long-lived stream fails closed on its
+                // next message instead of staying authorized until reconnect.
                 if require_mtls {
                     let Some(fingerprint) = peer_fingerprint.as_ref() else {
                         let _ = sender
@@ -746,6 +783,9 @@ impl node_v1::node_service_server::NodeService for NodeRpcServiceImpl {
             request.get_ref().max_payload_bytes,
             Some(NODE_CAPABILITY_TIMEOUT_MS),
         )?;
+        // The deadline is enforced here, not inside the queue: the dispatch
+        // record stays addressable so a late node result can still be journaled
+        // after this RPC has already returned DEADLINE_EXCEEDED.
         let result =
             tokio::time::timeout(Duration::from_millis(NODE_CAPABILITY_TIMEOUT_MS), receiver)
                 .await

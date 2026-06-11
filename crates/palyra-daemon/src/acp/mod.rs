@@ -1,3 +1,16 @@
+//! ACP (Agent Client Protocol) runtime: durable session/conversation bindings
+//! between external ACP clients and Palyra sessions, plus pending prompts and
+//! binding conflict repair.
+//!
+//! [`AcpRuntime`] owns a single owner-only `bindings.json` index under the
+//! daemon state root and rewrites it atomically (temp file + persist) on every
+//! mutation. Security posture: binding configs that carry secret-bearing keys
+//! are rejected outright, reloaded session bindings are marked
+//! `stale_permissions` until the client re-presents its scopes/capabilities,
+//! and repair actions that would widen access across principals or workspaces
+//! are planned but never auto-applied. Consumed by the console ACP handlers in
+//! `transport::http::handlers::console::acp`.
+
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
@@ -37,6 +50,8 @@ const MAX_CONFIG_BYTES: usize = 16 * 1024;
 const RATE_LIMIT_WINDOW_MS: i64 = 60_000;
 const RATE_LIMIT_MAX_REQUESTS_PER_WINDOW: u32 = 120;
 
+/// Failure modes of the ACP runtime; each maps to a stable error code via
+/// [`AcpRuntimeError::stable_code`] for transport-facing envelopes.
 #[derive(Debug, Error)]
 pub(crate) enum AcpRuntimeError {
     #[error("failed to {operation} ACP state at {path}: {source}")]
@@ -66,6 +81,8 @@ pub(crate) enum AcpRuntimeError {
 }
 
 impl AcpRuntimeError {
+    /// Stable `acp/*` error code; part of the console API contract, so codes
+    /// must never change for an existing variant.
     pub(crate) fn stable_code(&self) -> &'static str {
         match self {
             Self::Io { .. } | Self::Json { .. } | Self::VersionedJson { .. } => "acp/storage_error",
@@ -81,6 +98,8 @@ impl AcpRuntimeError {
         }
     }
 
+    /// Converts the error into the transport envelope, attaching a
+    /// per-variant recovery hint for the client.
     pub(crate) fn to_stable_error(&self) -> StableErrorEnvelope {
         let recovery_hint = match self {
             Self::UnsupportedProtocolVersion { .. } => {
@@ -104,8 +123,11 @@ impl AcpRuntimeError {
     }
 }
 
+/// Shorthand result type for ACP runtime operations.
 pub(crate) type AcpRuntimeResult<T> = Result<T, AcpRuntimeError>;
 
+/// On-disk shape of `bindings.json`: every binding and pending prompt the ACP
+/// runtime knows about, versioned by `schema_version`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AcpBindingsIndex {
@@ -131,6 +153,8 @@ impl Default for AcpBindingsIndex {
     }
 }
 
+/// Request to create or refresh the binding between an ACP client session and
+/// a Palyra session.
 #[derive(Debug, Clone)]
 pub(crate) struct AcpSessionBindingUpsert {
     pub(crate) context: AcpClientContext,
@@ -143,6 +167,8 @@ pub(crate) struct AcpSessionBindingUpsert {
     pub(crate) cursor: AcpCursor,
 }
 
+/// Request to remember a prompt (approval/permission ask) that must survive a
+/// short client disconnect; `ttl_ms` is clamped to the disconnect grace window.
 #[derive(Debug, Clone)]
 pub(crate) struct AcpPendingPromptUpsert {
     pub(crate) prompt_id: String,
@@ -156,6 +182,8 @@ pub(crate) struct AcpPendingPromptUpsert {
     pub(crate) ttl_ms: i64,
 }
 
+/// What a reconnecting ACP client gets back: its refreshed binding, prompts
+/// still inside the grace window, and the ids of prompts that expired.
 #[derive(Debug, Clone)]
 pub(crate) struct AcpReconnectOutcome {
     pub(crate) binding: AcpSessionBindingRecord,
@@ -163,6 +191,8 @@ pub(crate) struct AcpReconnectOutcome {
     pub(crate) expired_prompt_ids: Vec<String>,
 }
 
+/// Optional filters for [`AcpRuntime::list_conversation_bindings`]; unset
+/// fields match everything, and detached bindings are hidden by default.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ConversationBindingFilter {
     pub(crate) owner_principal: Option<String>,
@@ -173,6 +203,8 @@ pub(crate) struct ConversationBindingFilter {
     pub(crate) limit: Option<usize>,
 }
 
+/// Request to bind an external connector conversation (e.g. a chat thread) to
+/// a Palyra session under a single owner principal.
 #[derive(Debug, Clone)]
 pub(crate) struct ConversationBindingUpsert {
     pub(crate) connector_kind: String,
@@ -188,12 +220,17 @@ pub(crate) struct ConversationBindingUpsert {
     pub(crate) last_event_id: Option<String>,
 }
 
+/// Ordered set of repair actions for binding conflicts; serialized as-is into
+/// console responses (and pinned by a golden fixture test).
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct BindingRepairPlan {
     pub(crate) dry_run: bool,
     pub(crate) actions: Vec<BindingRepairAction>,
 }
 
+/// One planned repair step. `automatic_apply == false` marks actions that
+/// would widen access (principal/workspace conflicts) and therefore require
+/// an explicit operator decision.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct BindingRepairAction {
     pub(crate) action: String,
@@ -206,6 +243,8 @@ pub(crate) struct BindingRepairAction {
     pub(crate) automatic_apply: bool,
 }
 
+/// Diagnostic view of one binding (session or conversation) with its conflict
+/// state and the repair actions that currently target it.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct BindingExplainSnapshot {
     pub(crate) binding_id: String,
@@ -224,6 +263,11 @@ pub(crate) struct BindingExplainSnapshot {
     pub(crate) delivery_cursor: u64,
 }
 
+/// Thread-safe owner of the ACP bindings index and per-client rate limits.
+///
+/// All reads and writes go through the `index` mutex; mutations call
+/// `save_locked_index` while still holding the guard so the file on disk can
+/// never get ahead of (or behind) the in-memory state.
 #[derive(Debug)]
 pub(crate) struct AcpRuntime {
     root: PathBuf,
@@ -232,6 +276,7 @@ pub(crate) struct AcpRuntime {
     rate_limits: Mutex<BTreeMap<String, RateLimitBucket>>,
 }
 
+// Fixed-window counter; coarse but sufficient for a local console surface.
 #[derive(Debug, Clone)]
 struct RateLimitBucket {
     window_started_at_unix_ms: i64,
@@ -239,6 +284,16 @@ struct RateLimitBucket {
 }
 
 impl AcpRuntime {
+    /// Opens (or initializes) the ACP state directory rooted at `root`.
+    ///
+    /// On load, every session binding is flagged `stale_permissions`: a
+    /// daemon restart must not silently trust scopes granted before it, so
+    /// clients re-assert them on their next reconnect.
+    ///
+    /// # Errors
+    /// Fails on an invalid root path (empty or traversal components), on
+    /// directory/permission hardening failures, or when an existing index
+    /// cannot be read, parsed, or validated.
     pub(crate) fn open(root: PathBuf) -> AcpRuntimeResult<Self> {
         let root = normalize_state_root(root.as_path())?;
         create_state_dir(root.as_path())?;
@@ -265,18 +320,30 @@ impl AcpRuntime {
         })
     }
 
+    /// Canonicalized ACP state root directory.
     pub(crate) fn root(&self) -> &Path {
         self.root.as_path()
     }
 
+    /// ACP protocol versions this daemon accepts.
     pub(crate) fn protocol_range(&self) -> AcpProtocolVersionRange {
         AcpProtocolVersionRange::default()
     }
 
+    /// Returns a point-in-time copy of the full bindings index.
+    ///
+    /// # Errors
+    /// Returns a conflict error when the index lock is poisoned.
     pub(crate) fn snapshot(&self) -> AcpRuntimeResult<AcpBindingsIndex> {
         Ok(self.lock_index()?.clone())
     }
 
+    /// Counts one request against the per-client, per-command fixed window.
+    ///
+    /// # Errors
+    /// Returns `RateLimited` once the window budget is exhausted, an invalid
+    /// field error for an unusable `client_id`, or a conflict error when the
+    /// rate-limit lock is poisoned.
     pub(crate) fn check_rate_limit(
         &self,
         client_id: &str,
@@ -302,6 +369,13 @@ impl AcpRuntime {
         Ok(())
     }
 
+    /// Creates or replaces the binding for `(client_id, acp_session_id)`,
+    /// validating the protocol version, scopes, ids, and config first.
+    ///
+    /// # Errors
+    /// Fails closed on unsupported protocol versions, empty scope/capability
+    /// sets, non-canonical session ids, secret-bearing or oversized configs,
+    /// and storage errors.
     pub(crate) fn upsert_session_binding(
         &self,
         request: AcpSessionBindingUpsert,
@@ -374,6 +448,10 @@ impl AcpRuntime {
         Ok(record)
     }
 
+    /// Looks up a session binding by its `binding_id`.
+    ///
+    /// # Errors
+    /// Returns `NotFound` for unknown ids, plus validation/lock errors.
     pub(crate) fn get_session_binding(
         &self,
         binding_id: &str,
@@ -387,6 +465,10 @@ impl AcpRuntime {
             .ok_or(AcpRuntimeError::NotFound { kind: "session_binding", id: binding_id })
     }
 
+    /// Looks up a session binding by its client-facing identity pair.
+    ///
+    /// # Errors
+    /// Returns `NotFound` for unknown pairs, plus validation/lock errors.
     pub(crate) fn session_binding_for_acp(
         &self,
         client_id: &str,
@@ -407,6 +489,11 @@ impl AcpRuntime {
             })
     }
 
+    /// Lists session bindings, optionally restricted to one owner principal.
+    ///
+    /// # Errors
+    /// Returns validation errors for an unusable principal filter or a
+    /// conflict error when the index lock is poisoned.
     pub(crate) fn list_session_bindings(
         &self,
         owner_principal: Option<&str>,
@@ -426,6 +513,17 @@ impl AcpRuntime {
         Ok(records)
     }
 
+    /// Re-attaches a returning client to its session binding: refreshes the
+    /// cursor, scopes, and capabilities (clearing `stale_permissions`) and
+    /// returns prompts still pending inside the disconnect grace window.
+    ///
+    /// Only the binding's recorded owner principal may reconnect; this is the
+    /// permission boundary that stops a different ACP client identity from
+    /// adopting someone else's session.
+    ///
+    /// # Errors
+    /// Fails on unsupported protocol versions, empty scope/capability sets,
+    /// unknown bindings, owner mismatch, and storage errors.
     pub(crate) fn reconnect(
         &self,
         context: &AcpClientContext,
@@ -477,6 +575,12 @@ impl AcpRuntime {
         Ok(AcpReconnectOutcome { binding, pending_prompts, expired_prompt_ids })
     }
 
+    /// Persists (or refreshes) a pending prompt so it can be re-delivered if
+    /// the client reconnects within the grace window; the stored summary is
+    /// expected to be pre-redacted by the caller.
+    ///
+    /// # Errors
+    /// Fails on invalid ids or text fields and on storage errors.
     pub(crate) fn remember_pending_prompt(
         &self,
         request: AcpPendingPromptUpsert,
@@ -523,6 +627,12 @@ impl AcpRuntime {
         Ok(record)
     }
 
+    /// Creates or updates a conversation binding, then re-derives conflict
+    /// states across all bindings sharing the same external conversation.
+    ///
+    /// # Errors
+    /// Fails on invalid identifiers/scopes and on storage errors; a state
+    /// invariant error means the record vanished during normalization.
     pub(crate) fn upsert_conversation_binding(
         &self,
         request: ConversationBindingUpsert,
@@ -602,6 +712,12 @@ impl AcpRuntime {
         Ok(saved)
     }
 
+    /// Lists conversation bindings matching `filter`, newest first, capped at
+    /// the clamped limit (1..=500, default 100).
+    ///
+    /// # Errors
+    /// Returns validation errors for unusable filter values or a conflict
+    /// error when the index lock is poisoned.
     pub(crate) fn list_conversation_bindings(
         &self,
         filter: ConversationBindingFilter,
@@ -664,6 +780,10 @@ impl AcpRuntime {
         Ok(records)
     }
 
+    /// Looks up a conversation binding by its `binding_id`.
+    ///
+    /// # Errors
+    /// Returns `NotFound` for unknown ids, plus validation/lock errors.
     pub(crate) fn get_conversation_binding(
         &self,
         binding_id: &str,
@@ -677,6 +797,11 @@ impl AcpRuntime {
             .ok_or(AcpRuntimeError::NotFound { kind: "conversation_binding", id: binding_id })
     }
 
+    /// Detaches a conversation binding (soft delete): the record is kept for
+    /// audit but stops routing and is excluded from conflict grouping.
+    ///
+    /// # Errors
+    /// Returns `NotFound` for unknown ids, plus validation/storage errors.
     pub(crate) fn detach_conversation_binding(
         &self,
         binding_id: &str,
@@ -701,11 +826,22 @@ impl AcpRuntime {
         Ok(record)
     }
 
+    /// Builds a dry-run repair plan for current binding conflicts without
+    /// changing any state.
+    ///
+    /// # Errors
+    /// Returns a conflict error when the index lock is poisoned.
     pub(crate) fn plan_conversation_binding_repair(&self) -> AcpRuntimeResult<BindingRepairPlan> {
         let index = self.lock_index()?;
         Ok(build_repair_plan(&index, true))
     }
 
+    /// Builds the repair plan and applies only its `automatic_apply` actions;
+    /// access-widening actions (principal/workspace conflicts) stay manual
+    /// and are returned in the plan untouched.
+    ///
+    /// # Errors
+    /// Fails on clock, lock, or storage errors.
     pub(crate) fn apply_conversation_binding_repair(&self) -> AcpRuntimeResult<BindingRepairPlan> {
         let now = unix_ms_now().map_err(|error| AcpRuntimeError::InvalidField {
             field: "system_time",
@@ -758,6 +894,12 @@ impl AcpRuntime {
         Ok(plan)
     }
 
+    /// Explains one binding (session bindings are checked first) including
+    /// its conflict kinds and the repair actions that currently target it.
+    ///
+    /// # Errors
+    /// Returns `NotFound` when no binding of either kind matches, plus
+    /// validation/lock errors.
     pub(crate) fn explain_binding(
         &self,
         binding_id: &str,
@@ -819,6 +961,7 @@ impl AcpRuntime {
         Err(AcpRuntimeError::NotFound { kind: "binding", id: binding_id })
     }
 
+    /// Builds the success result envelope for an ACP console command.
     pub(crate) fn success_envelope(
         request_id: String,
         command: AcpCommand,
@@ -843,10 +986,19 @@ impl AcpRuntime {
     }
 }
 
+/// Conventional ACP state directory under the daemon state root.
 pub(crate) fn acp_root_from_state_root(state_root: &Path) -> PathBuf {
     state_root.join("acp")
 }
 
+/// Maps an internal transcript event type to its ACP wire event name.
+///
+/// The mapping is a closed allowlist on purpose: only event types with a
+/// defined ACP meaning may leave the daemon, so new internal event types fail
+/// here until they get an explicit translation.
+///
+/// # Errors
+/// Returns a `Compatibility` error for any event type without a mapping.
 pub(crate) fn translate_palyra_event_type(event_type: &str) -> AcpRuntimeResult<&'static str> {
     match event_type.trim() {
         "status" => Ok("run.status"),
@@ -946,6 +1098,9 @@ fn validate_acp_state_child_path(
     Ok(())
 }
 
+// Write-to-temp + fsync + rename so a crash mid-write can never leave a
+// truncated bindings index; the temp file lives in `root` to keep the rename
+// on one filesystem.
 fn write_atomically(root: &Path, path: &Path, payload: &[u8]) -> AcpRuntimeResult<()> {
     validate_acp_state_child_path(root, path, "bindings index")?;
     let mut temporary_file =
@@ -1007,6 +1162,8 @@ fn normalize_loaded_index(index: &mut AcpBindingsIndex) -> AcpRuntimeResult<()> 
     Ok(())
 }
 
+// Restart hygiene: scopes/capabilities recorded before this process started
+// are treated as unverified until the client reconnects and re-asserts them.
 fn mark_loaded_permissions_stale(index: &mut AcpBindingsIndex, now_unix_ms: i64) -> bool {
     let mut changed = false;
     for binding in &mut index.session_bindings {
@@ -1147,6 +1304,9 @@ fn value_contains_sensitive_key(value: &Value, path: &mut VecDeque<String>) -> b
     }
 }
 
+// Substring matching is intentionally aggressive: a false positive only makes
+// the client rename a config key, while a false negative would persist a
+// secret to disk in plaintext.
 fn is_sensitive_key(key: &str) -> bool {
     let normalized = key.to_ascii_lowercase();
     normalized.contains("secret")
@@ -1171,6 +1331,11 @@ fn prune_expired_pending_prompts(index: &mut AcpBindingsIndex, now_unix_ms: i64)
     expired
 }
 
+// Re-derives duplicate-style conflict states from scratch for every binding
+// group sharing one external conversation. Operator-set terminal states
+// (detached, stale, mismatch, expired, parent-missing) are sticky and skipped;
+// only the duplicate family is recomputed, so resolving a duplicate clears
+// the flag automatically on the next save.
 fn normalize_conversation_conflicts(index: &mut AcpBindingsIndex) {
     let mut grouped: BTreeMap<(String, String, String), Vec<usize>> = BTreeMap::new();
     for (position, entry) in index.conversation_bindings.iter_mut().enumerate() {
@@ -1228,6 +1393,10 @@ fn normalize_conversation_conflicts(index: &mut AcpBindingsIndex) {
     }
 }
 
+// Conflict precedence per external conversation: principal mismatch (manual,
+// never widened automatically) > workspace mismatch (manual split) > plain
+// duplicates (auto-detach everything but the most recently updated binding).
+// Orphaned parent-required bindings and expired prompts are auto-repairable.
 fn build_repair_plan(index: &AcpBindingsIndex, dry_run: bool) -> BindingRepairPlan {
     let mut grouped: BTreeMap<(String, String, String), Vec<&ConversationBindingRecord>> =
         BTreeMap::new();
@@ -1365,6 +1534,9 @@ fn session_exists(index: &AcpBindingsIndex, session_id: &str) -> bool {
     index.session_bindings.iter().any(|binding| binding.palyra_session_id == session_id)
 }
 
+// Best-effort workspace attribution: explicit config keys win, then the
+// `repo:`/`cwd:` session-key prefix heuristic. `None` means "unknown", which
+// deliberately never counts as a workspace mismatch.
 fn workspace_key_for_session(index: &AcpBindingsIndex, session_id: &str) -> Option<String> {
     index.session_bindings.iter().find(|binding| binding.palyra_session_id == session_id).and_then(
         |binding| {

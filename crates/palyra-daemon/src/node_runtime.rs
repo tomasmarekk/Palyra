@@ -1,3 +1,14 @@
+//! Persistent node runtime state: pairing codes, device pairing requests,
+//! registered nodes, and the per-device capability dispatch queue.
+//!
+//! [`NodeRuntimeState`] is the single owner of `node-runtime.v1.json` under
+//! the daemon state root; every mutation is written back synchronously so a
+//! daemon restart cannot resurrect consumed pairing codes or lose request
+//! states. Volatile coordination (reserved codes mid-handshake, queued
+//! dispatches, oneshot result waiters) deliberately lives only in memory.
+//! Consumed by `node_rpc` (gRPC surface) and the realtime `command_router`.
+//! Summaries persisted from payloads are redacted before storage.
+
 use std::{
     collections::{HashMap, VecDeque},
     fs,
@@ -22,6 +33,7 @@ const DEFAULT_PAIRING_CODE_TTL_MS: u64 = 10 * 60 * 1_000;
 const MIN_PAIRING_CODE_TTL_MS: u64 = 30 * 1_000;
 const MAX_PAIRING_CODE_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 
+/// How a pairing code is presented to the device being paired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PairingCodeMethod {
@@ -30,6 +42,7 @@ pub(crate) enum PairingCodeMethod {
 }
 
 impl PairingCodeMethod {
+    /// Stable lowercase label used in journal payloads and RPC responses.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Pin => "pin",
@@ -37,6 +50,7 @@ impl PairingCodeMethod {
         }
     }
 
+    /// Wraps the raw `code` in the matching `palyra-identity` pairing method.
     pub(crate) fn to_pairing_method(self, code: String) -> PairingMethod {
         match self {
             Self::Pin => PairingMethod::Pin { code },
@@ -45,6 +59,8 @@ impl PairingCodeMethod {
     }
 }
 
+/// A single-use pairing code minted by an operator; expires at
+/// `expires_at_unix_ms` and is consumed by [`NodeRuntimeState::reserve_pairing_code`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct DevicePairingCodeRecord {
     pub(crate) code: String,
@@ -54,6 +70,8 @@ pub(crate) struct DevicePairingCodeRecord {
     pub(crate) expires_at_unix_ms: i64,
 }
 
+/// Lifecycle of a verified pairing request awaiting and following operator
+/// approval; only `PendingApproval` and `Approved` can still expire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum DevicePairingRequestState {
@@ -65,6 +83,7 @@ pub(crate) enum DevicePairingRequestState {
 }
 
 impl DevicePairingRequestState {
+    /// Stable snake_case label exposed through RPC status responses.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::PendingApproval => "pending_approval",
@@ -76,6 +95,12 @@ impl DevicePairingRequestState {
     }
 }
 
+/// Certificate material handed to a device after pairing completes.
+///
+/// Invariant: `mtls_client_private_key_pem` is `skip_serializing` so the
+/// private key is never written into node runtime state. It deserializes only
+/// to migrate legacy records into sealed identity storage (see
+/// `node_rpc::resolve_pairing_private_key`); a unit test pins this.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct DevicePairingMaterialRecord {
     pub(crate) identity_fingerprint: String,
@@ -103,6 +128,8 @@ impl DevicePairingMaterialRecord {
     }
 }
 
+/// Persisted pairing request keyed by `request_id` (the pairing session id),
+/// carrying the verified handshake plus the operator decision trail.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DevicePairingRequestRecord {
     pub(crate) request_id: String,
@@ -121,12 +148,15 @@ pub(crate) struct DevicePairingRequestRecord {
     pub(crate) material: Option<DevicePairingMaterialRecord>,
 }
 
+/// One advertised node capability and whether it is currently available.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct DeviceCapabilityView {
     pub(crate) name: String,
     pub(crate) available: bool,
 }
 
+/// A node that has registered with the daemon, including its capability set
+/// and last-seen/last-event presence data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RegisteredNodeRecord {
     pub(crate) device_id: String,
@@ -150,6 +180,8 @@ struct PersistedNodeRuntimeState {
     capability_requests: HashMap<String, CapabilityRequestRecord>,
 }
 
+/// Work item handed to a node over the event stream; the raw `input_json`
+/// stays in memory only (the persisted record keeps a redacted summary).
 #[derive(Debug, Clone)]
 pub(crate) struct CapabilityDispatchRecord {
     pub(crate) request_id: String,
@@ -158,6 +190,7 @@ pub(crate) struct CapabilityDispatchRecord {
     pub(crate) max_payload_bytes: u64,
 }
 
+/// Result a node reports back for a dispatched capability request.
 #[derive(Debug, Clone)]
 pub(crate) struct CapabilityExecutionResult {
     pub(crate) success: bool,
@@ -165,6 +198,7 @@ pub(crate) struct CapabilityExecutionResult {
     pub(crate) error: String,
 }
 
+/// Lifecycle of a capability request from enqueue to terminal outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CapabilityRequestState {
@@ -177,6 +211,7 @@ pub(crate) enum CapabilityRequestState {
     Rejected,
 }
 
+/// Persisted, payload-redacted audit record for one capability request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CapabilityRequestRecord {
     pub(crate) request_id: String,
@@ -193,6 +228,8 @@ pub(crate) struct CapabilityRequestRecord {
     pub(crate) error: Option<String>,
 }
 
+// In-memory only: queues and waiters reference live oneshot channels and raw
+// payload bytes, neither of which would survive (or should reach) disk.
 #[derive(Default)]
 struct CapabilityRuntimeState {
     queued_by_device: HashMap<String, VecDeque<CapabilityDispatchRecord>>,
@@ -205,6 +242,13 @@ struct ReservedPairingCodeState {
     by_session_id: HashMap<String, DevicePairingCodeRecord>,
 }
 
+/// Thread-safe owner of node runtime state.
+///
+/// Persistent data (`persisted`) is flushed to `node-runtime.v1.json` on every
+/// mutation; `reserved_codes` and `capabilities` are volatile coordination
+/// state. Lock discipline: methods take at most one of the three mutexes at a
+/// time (or release the first before taking the second), so there is no
+/// cross-mutex ordering to violate.
 pub(crate) struct NodeRuntimeState {
     state_root: PathBuf,
     persisted: Mutex<PersistedNodeRuntimeState>,
@@ -219,6 +263,11 @@ impl std::fmt::Debug for NodeRuntimeState {
 }
 
 impl NodeRuntimeState {
+    /// Loads (or initializes) node runtime state under `state_root`.
+    ///
+    /// # Errors
+    /// Fails when the state root is empty or cannot be created/canonicalized,
+    /// or when an existing state file cannot be read or parsed.
     pub(crate) fn load(state_root: &Path) -> Result<Self> {
         let state_root = resolve_canonical_state_root(state_root)?;
         let state_path = state_root.join(NODE_RUNTIME_STATE_FILE_NAME);
@@ -240,6 +289,11 @@ impl NodeRuntimeState {
         })
     }
 
+    /// Mints and persists a new single-use pairing code; `ttl_ms` is clamped
+    /// to the supported window (30s..=24h, default 10min).
+    ///
+    /// # Errors
+    /// Returns `Status::internal` on clock, lock, or persistence failure.
     pub(crate) fn mint_pairing_code(
         &self,
         method: PairingCodeMethod,
@@ -262,6 +316,10 @@ impl NodeRuntimeState {
         Ok(record)
     }
 
+    /// Lists active (unexpired, unconsumed) pairing codes, oldest first.
+    ///
+    /// # Errors
+    /// Returns `Status::internal` on clock, lock, or persistence failure.
     pub(crate) fn pairing_codes(&self) -> Result<Vec<DevicePairingCodeRecord>, Status> {
         let now = current_unix_ms()?;
         let mut persisted = lock_mutex(&self.persisted, "node runtime state")?;
@@ -276,6 +334,14 @@ impl NodeRuntimeState {
         Ok(records)
     }
 
+    /// Atomically consumes an active pairing code so two concurrent pairing
+    /// sessions can never share one code; use [`Self::restore_pairing_code`]
+    /// to put it back if the session fails to start.
+    ///
+    /// # Errors
+    /// Returns `Status::failed_precondition` when the code is missing,
+    /// expired, or was minted for a different method; `Status::internal` on
+    /// clock, lock, or persistence failure.
     pub(crate) fn reserve_pairing_code(
         &self,
         method: PairingCodeMethod,
@@ -295,6 +361,11 @@ impl NodeRuntimeState {
         Ok(record)
     }
 
+    /// Returns a reserved code to the active pool after a failed session
+    /// start; silently drops it when it has already expired.
+    ///
+    /// # Errors
+    /// Returns `Status::internal` on clock, lock, or persistence failure.
     pub(crate) fn restore_pairing_code(
         &self,
         record: DevicePairingCodeRecord,
@@ -308,6 +379,11 @@ impl NodeRuntimeState {
         self.persist_locked(&persisted)
     }
 
+    /// Associates a reserved code with a pairing session so the completion
+    /// RPC can recover it (in memory only; a restart aborts the handshake).
+    ///
+    /// # Errors
+    /// Returns `Status::internal` when the reserved-code lock is poisoned.
     pub(crate) fn bind_reserved_pairing_code(
         &self,
         session_id: &str,
@@ -318,6 +394,10 @@ impl NodeRuntimeState {
         Ok(())
     }
 
+    /// Removes and returns the code bound to `session_id`, if any.
+    ///
+    /// # Errors
+    /// Returns `Status::internal` when the reserved-code lock is poisoned.
     pub(crate) fn take_reserved_pairing_code(
         &self,
         session_id: &str,
@@ -326,6 +406,11 @@ impl NodeRuntimeState {
         Ok(reserved.by_session_id.remove(session_id))
     }
 
+    /// Persists a verified pairing handshake as a `PendingApproval` request
+    /// that inherits the consumed code's expiry deadline.
+    ///
+    /// # Errors
+    /// Returns `Status::internal` on clock, lock, or persistence failure.
     pub(crate) fn create_pairing_request(
         &self,
         session_id: &str,
@@ -356,6 +441,11 @@ impl NodeRuntimeState {
         Ok(record)
     }
 
+    /// Lists pairing requests, newest first; expired ones are marked (not
+    /// removed) so the decision trail stays auditable.
+    ///
+    /// # Errors
+    /// Returns `Status::internal` on clock, lock, or persistence failure.
     pub(crate) fn pairing_requests(&self) -> Result<Vec<DevicePairingRequestRecord>, Status> {
         let now = current_unix_ms()?;
         let mut persisted = lock_mutex(&self.persisted, "node runtime state")?;
@@ -371,6 +461,10 @@ impl NodeRuntimeState {
         Ok(records)
     }
 
+    /// Returns the pairing request with `request_id` after expiry pruning.
+    ///
+    /// # Errors
+    /// Returns `Status::internal` on clock, lock, or persistence failure.
     pub(crate) fn pairing_request(
         &self,
         request_id: &str,
@@ -382,6 +476,12 @@ impl NodeRuntimeState {
         Ok(persisted.pairing_requests.get(request_id).cloned())
     }
 
+    /// Applies an operator approval decision to the pairing request bound to
+    /// `approval_id`; returns `None` when no live request references it
+    /// (already expired or never created).
+    ///
+    /// # Errors
+    /// Returns `Status::internal` on clock, lock, or persistence failure.
     pub(crate) fn apply_pairing_approval(
         &self,
         approval_id: &str,
@@ -412,6 +512,11 @@ impl NodeRuntimeState {
         Ok(Some(updated))
     }
 
+    /// Marks an approved request `Completed` and attaches the issued
+    /// certificate material (private key excluded; it is sealed separately).
+    ///
+    /// # Errors
+    /// Returns `Status::internal` on clock, lock, or persistence failure.
     pub(crate) fn complete_pairing_request(
         &self,
         request_id: &str,
@@ -431,6 +536,11 @@ impl NodeRuntimeState {
         Ok(Some(updated))
     }
 
+    /// Registers (or re-registers) a node; platform and capability set are
+    /// replaced wholesale and presence is refreshed.
+    ///
+    /// # Errors
+    /// Returns `Status::internal` on clock, lock, or persistence failure.
     pub(crate) fn register_node(
         &self,
         device_id: &str,
@@ -458,6 +568,11 @@ impl NodeRuntimeState {
         Ok(updated)
     }
 
+    /// Updates node presence from an inbound event; returns `None` for nodes
+    /// that never registered.
+    ///
+    /// # Errors
+    /// Returns `Status::internal` on clock, lock, or persistence failure.
     pub(crate) fn touch_node_event(
         &self,
         device_id: &str,
@@ -476,6 +591,10 @@ impl NodeRuntimeState {
         Ok(Some(updated))
     }
 
+    /// Lists registered nodes ordered by device id.
+    ///
+    /// # Errors
+    /// Returns `Status::internal` when the state lock is poisoned.
     pub(crate) fn nodes(&self) -> Result<Vec<RegisteredNodeRecord>, Status> {
         let persisted = lock_mutex(&self.persisted, "node runtime state")?;
         let mut nodes = persisted.nodes.values().cloned().collect::<Vec<_>>();
@@ -483,11 +602,22 @@ impl NodeRuntimeState {
         Ok(nodes)
     }
 
+    /// Returns the registered node with `device_id`, if any.
+    ///
+    /// # Errors
+    /// Returns `Status::internal` when the state lock is poisoned.
     pub(crate) fn node(&self, device_id: &str) -> Result<Option<RegisteredNodeRecord>, Status> {
         let persisted = lock_mutex(&self.persisted, "node runtime state")?;
         Ok(persisted.nodes.get(device_id).cloned())
     }
 
+    /// Grants or revokes a single capability on a registered node, recording
+    /// the change as the node's last event.
+    ///
+    /// # Errors
+    /// Returns `Status::invalid_argument` for an empty capability name,
+    /// `Status::not_found` for unknown nodes, and `Status::internal` on
+    /// clock, lock, or persistence failure.
     pub(crate) fn set_node_capability_availability(
         &self,
         device_id: &str,
@@ -524,6 +654,10 @@ impl NodeRuntimeState {
         Ok(updated)
     }
 
+    /// Removes a registered node; returns whether anything was removed.
+    ///
+    /// # Errors
+    /// Returns `Status::internal` on lock or persistence failure.
     pub(crate) fn remove_node(&self, device_id: &str) -> Result<bool, Status> {
         let mut persisted = lock_mutex(&self.persisted, "node runtime state")?;
         let removed = persisted.nodes.remove(device_id).is_some();
@@ -533,6 +667,15 @@ impl NodeRuntimeState {
         Ok(removed)
     }
 
+    /// Queues a capability request for `device_id` and returns its id plus a
+    /// oneshot receiver that resolves when the node reports a result.
+    ///
+    /// `_timeout_ms` is accepted for API symmetry but deliberately unused:
+    /// the deadline is enforced by the caller racing the receiver (see
+    /// `node_rpc::execute_capability`), which keeps the queue free of timers.
+    ///
+    /// # Errors
+    /// Returns `Status::internal` on clock, lock, or persistence failure.
     pub(crate) fn enqueue_capability_request(
         &self,
         device_id: &str,
@@ -575,6 +718,11 @@ impl NodeRuntimeState {
         Ok((request_id, receiver))
     }
 
+    /// Pops the next queued dispatch for `device_id` (FIFO), moving it to the
+    /// in-flight set and marking the persisted record `Dispatched`.
+    ///
+    /// # Errors
+    /// Returns `Status::internal` on clock, lock, or persistence failure.
     pub(crate) fn next_capability_dispatch(
         &self,
         device_id: &str,
@@ -599,6 +747,16 @@ impl NodeRuntimeState {
         Ok(Some(dispatch))
     }
 
+    /// Records a node-reported result and wakes the waiting caller; returns
+    /// `false` when no waiter remained (caller timed out or disconnected).
+    ///
+    /// AIDEV-NOTE: a late result deliberately overwrites a `TimedOut` record
+    /// with the real Succeeded/Failed outcome for audit accuracy, even though
+    /// the original caller already received DEADLINE_EXCEEDED. Do not "fix"
+    /// this by guarding on state without revisiting node_rpc timeout handling.
+    ///
+    /// # Errors
+    /// Returns `Status::internal` on clock, lock, or persistence failure.
     pub(crate) fn complete_capability_request(
         &self,
         request_id: &str,
@@ -629,6 +787,12 @@ impl NodeRuntimeState {
         Ok(true)
     }
 
+    /// Marks a request `TimedOut` in the persisted ledger; the in-memory
+    /// queue/waiter entries are left for the dispatch and completion paths to
+    /// reconcile (see [`Self::complete_capability_request`]).
+    ///
+    /// # Errors
+    /// Returns `Status::internal` on clock, lock, or persistence failure.
     pub(crate) fn mark_capability_timeout(&self, request_id: &str) -> Result<bool, Status> {
         let now = current_unix_ms()?;
         let mut persisted = lock_mutex(&self.persisted, "node runtime state")?;
@@ -643,6 +807,11 @@ impl NodeRuntimeState {
         Ok(true)
     }
 
+    /// Marks a dispatched request as blocked on local (on-device) mediation,
+    /// e.g. a user prompt the node must resolve before reporting a result.
+    ///
+    /// # Errors
+    /// Returns `Status::internal` on clock, lock, or persistence failure.
     pub(crate) fn mark_capability_awaiting_local_mediation(
         &self,
         request_id: &str,
@@ -659,6 +828,11 @@ impl NodeRuntimeState {
         Ok(true)
     }
 
+    /// Lists capability request audit records (optionally filtered by
+    /// device), newest first.
+    ///
+    /// # Errors
+    /// Returns `Status::internal` when the state lock is poisoned.
     pub(crate) fn capability_requests(
         &self,
         device_id: Option<&str>,
@@ -681,6 +855,9 @@ impl NodeRuntimeState {
         Ok(requests)
     }
 
+    // Re-canonicalizes the root and rejects any join that escapes it on every
+    // write: defense in depth against the state root being swapped for a
+    // symlink between load and persist.
     fn persist_locked(&self, persisted: &PersistedNodeRuntimeState) -> Result<(), Status> {
         let encoded = serde_json::to_vec_pretty(persisted).map_err(|error| {
             Status::internal(format!("failed to encode node runtime state: {error}"))
@@ -725,6 +902,9 @@ fn resolve_canonical_state_root(state_root: &Path) -> Result<PathBuf> {
 fn generate_pairing_code(method: PairingCodeMethod) -> String {
     match method {
         PairingCodeMethod::Pin => {
+            // Six digits derived by hashing a fresh random ULID; the modulo
+            // bias of 2^32 % 1_000_000 is negligible for a short-lived,
+            // single-use code that still requires operator approval.
             let digest = sha2::Sha256::digest(Ulid::new().to_string().as_bytes());
             let value =
                 u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) % 1_000_000;
@@ -740,6 +920,8 @@ fn normalize_pairing_code_ttl_ms(value: Option<u64>) -> u64 {
         .clamp(MIN_PAIRING_CODE_TTL_MS, MAX_PAIRING_CODE_TTL_MS)
 }
 
+// Expired codes are deleted, but expired pairing requests are only flipped to
+// `Expired` so the operator-facing decision trail remains auditable.
 fn prune_persisted_state(state: &mut PersistedNodeRuntimeState, now_unix_ms: i64) {
     state.active_pairing_codes.retain(|_, record| record.expires_at_unix_ms > now_unix_ms);
     for request in state.pairing_requests.values_mut() {
@@ -764,6 +946,11 @@ fn lock_mutex<'a, T>(
     mutex.lock().map_err(|_| Status::internal(format!("{label} lock poisoned")))
 }
 
+/// Current wall-clock time as Unix milliseconds.
+///
+/// # Errors
+/// Returns `Status::internal` when the system clock reports a time before the
+/// Unix epoch or the value overflows `i64`.
 pub(crate) fn current_unix_ms() -> Result<i64, Status> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -771,6 +958,8 @@ pub(crate) fn current_unix_ms() -> Result<i64, Status> {
     i64::try_from(duration.as_millis()).map_err(|_| Status::internal("timestamp overflow"))
 }
 
+// Persisted summaries pass through auth/URL redaction and are capped at 240
+// chars so node payloads can never leak credentials into runtime state.
 fn normalize_summary_text(raw: &str) -> Option<String> {
     let trimmed = redact_url_segments_in_text(&redact_auth_error(raw)).trim().to_owned();
     if trimmed.is_empty() {
@@ -791,6 +980,13 @@ fn summarize_payload_bytes(payload_json: &[u8]) -> Option<String> {
     normalize_summary_text(redacted.as_str())
 }
 
+/// Parses a `capability.result` node event payload into its request id and
+/// execution result; absent `success`/`error`/`output_json` fields default to
+/// a failed, empty result.
+///
+/// # Errors
+/// Returns `Status::invalid_argument` for malformed JSON or a missing/empty
+/// `request_id`.
 pub(crate) fn parse_capability_result_payload(
     payload_json: &[u8],
 ) -> Result<(String, CapabilityExecutionResult), Status> {
@@ -807,6 +1003,11 @@ pub(crate) fn parse_capability_result_payload(
     Ok((request_id, CapabilityExecutionResult { success, output_json, error }))
 }
 
+/// Extracts the `request_id` from a capability lifecycle event payload.
+///
+/// # Errors
+/// Returns `Status::invalid_argument` for malformed JSON or a missing/empty
+/// `request_id`.
 pub(crate) fn parse_capability_request_id_payload(payload_json: &[u8]) -> Result<String, Status> {
     let value: Value = serde_json::from_slice(payload_json).map_err(|error| {
         Status::invalid_argument(format!("invalid capability lifecycle payload: {error}"))
