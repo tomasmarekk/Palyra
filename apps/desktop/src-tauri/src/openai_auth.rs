@@ -1,3 +1,9 @@
+//! OpenAI provider-auth bridge for the desktop app.
+//!
+//! The desktop UI uses this module to summarize provider-auth state, connect
+//! API-key profiles, launch OAuth handoff, and trigger profile lifecycle
+//! actions through the console control-plane API.
+
 use std::collections::BTreeMap;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -16,6 +22,7 @@ use super::{normalize_optional_text, ControlCenter, RuntimeConfig};
 
 const OPENAI_PROVIDER: &str = "openai";
 
+/// Captured control-plane inputs required for OpenAI provider-auth calls.
 #[derive(Debug, Clone)]
 pub(crate) struct OpenAiControlPlaneInputs {
     pub(crate) runtime: RuntimeConfig,
@@ -25,6 +32,7 @@ pub(crate) struct OpenAiControlPlaneInputs {
 }
 
 impl OpenAiControlPlaneInputs {
+    /// Captures OpenAI control-plane inputs from the running control center.
     pub(crate) fn capture(control_center: &ControlCenter) -> Self {
         Self {
             runtime: control_center.runtime.clone(),
@@ -35,6 +43,7 @@ impl OpenAiControlPlaneInputs {
     }
 }
 
+/// Provider-auth scope selected by the desktop UI.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OpenAiScopeInput {
@@ -43,6 +52,7 @@ pub(crate) struct OpenAiScopeInput {
     pub(crate) agent_id: Option<String>,
 }
 
+/// Request body for connecting or rotating an OpenAI API-key profile.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OpenAiApiKeyConnectRequest {
@@ -58,6 +68,7 @@ pub(crate) struct OpenAiApiKeyConnectRequest {
     pub(crate) set_default: bool,
 }
 
+/// Request body for starting OpenAI OAuth bootstrap.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OpenAiOAuthBootstrapRequest {
@@ -77,18 +88,21 @@ pub(crate) struct OpenAiOAuthBootstrapRequest {
     pub(crate) set_default: bool,
 }
 
+/// Request body for actions that target one OpenAI auth profile.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OpenAiProfileActionRequest {
     pub(crate) profile_id: String,
 }
 
+/// Request body for polling an OpenAI OAuth callback attempt.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OpenAiOAuthCallbackStateRequest {
     pub(crate) attempt_id: String,
 }
 
+/// Aggregate health counters for OpenAI auth profiles.
 #[derive(Debug, Clone, Default, Serialize)]
 pub(crate) struct OpenAiProfileHealthSummary {
     pub(crate) total: u64,
@@ -99,6 +113,7 @@ pub(crate) struct OpenAiProfileHealthSummary {
     pub(crate) static_count: u64,
 }
 
+/// Provider refresh metrics for OpenAI OAuth profiles.
 #[derive(Debug, Clone, Default, Serialize)]
 pub(crate) struct OpenAiRefreshMetricsSnapshot {
     pub(crate) attempts: u64,
@@ -106,6 +121,7 @@ pub(crate) struct OpenAiRefreshMetricsSnapshot {
     pub(crate) failures: u64,
 }
 
+/// Refresh state for one OpenAI OAuth profile.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct OpenAiProfileRefreshStateSnapshot {
     pub(crate) failure_count: u64,
@@ -115,6 +131,7 @@ pub(crate) struct OpenAiProfileRefreshStateSnapshot {
     pub(crate) next_allowed_refresh_unix_ms: Option<i64>,
 }
 
+/// Desktop-safe OpenAI profile view.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct OpenAiProfileSnapshot {
     pub(crate) profile_id: String,
@@ -139,6 +156,7 @@ pub(crate) struct OpenAiProfileSnapshot {
     pub(crate) can_rotate_api_key: bool,
 }
 
+/// Full OpenAI provider-auth status snapshot returned to the desktop UI.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct OpenAiAuthStatusSnapshot {
     pub(crate) available: bool,
@@ -159,6 +177,7 @@ pub(crate) struct OpenAiAuthStatusSnapshot {
 }
 
 impl OpenAiAuthStatusSnapshot {
+    /// Builds an unavailable provider-auth snapshot with a sanitized message.
     pub(crate) fn unavailable(message: String) -> Self {
         Self {
             available: false,
@@ -180,6 +199,7 @@ impl OpenAiAuthStatusSnapshot {
     }
 }
 
+/// Result returned after starting or reconnecting OpenAI OAuth.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct OpenAiOAuthLaunchResult {
     pub(crate) ok: bool,
@@ -192,6 +212,7 @@ pub(crate) struct OpenAiOAuthLaunchResult {
 }
 
 impl OpenAiOAuthLaunchResult {
+    /// Converts a control-plane OAuth bootstrap envelope into a desktop result.
     pub(crate) fn from_envelope(envelope: control_plane::OpenAiOAuthBootstrapEnvelope) -> Self {
         Self {
             ok: true,
@@ -204,18 +225,21 @@ impl OpenAiOAuthLaunchResult {
         }
     }
 
+    /// Marks that the desktop successfully opened the system browser.
     pub(crate) fn mark_browser_opened(mut self) -> Self {
         self.browser_opened = true;
         self.message = format!("{} Default browser handoff opened.", self.message);
         self
     }
 
+    /// Appends a browser-open warning without failing OAuth bootstrap.
     pub(crate) fn mark_browser_pending(mut self, warning: &str) -> Self {
         self.message = format!("{} {warning}", self.message);
         self
     }
 }
 
+/// Poll result for an OpenAI OAuth callback attempt.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct OpenAiOAuthCallbackStateSnapshot {
     pub(crate) provider: String,
@@ -302,6 +326,12 @@ struct OAuthRefreshStateValue {
     next_allowed_refresh_unix_ms: Option<i64>,
 }
 
+/// Loads OpenAI provider-auth status for the desktop UI.
+///
+/// # Errors
+/// Returns an error when control-plane client construction, console session
+/// bootstrap, provider state lookup, auth health lookup, or profile listing
+/// fails.
 pub(crate) async fn load_openai_auth_status(
     inputs: OpenAiControlPlaneInputs,
 ) -> Result<OpenAiAuthStatusSnapshot> {
@@ -393,6 +423,11 @@ pub(crate) async fn load_openai_auth_status(
     })
 }
 
+/// Connects or rotates an OpenAI API-key profile.
+///
+/// # Errors
+/// Returns an error when control-plane client construction, console session
+/// bootstrap, scope normalization, or provider connection fails.
 pub(crate) async fn connect_openai_api_key(
     inputs: OpenAiControlPlaneInputs,
     request: OpenAiApiKeyConnectRequest,
@@ -422,6 +457,12 @@ pub(crate) async fn connect_openai_api_key(
     Ok(ActionResult { ok: true, message: response.message })
 }
 
+/// Starts OpenAI OAuth bootstrap and returns the authorization handoff payload.
+///
+/// # Errors
+/// Returns an error when control-plane client construction, console session
+/// bootstrap, required OAuth credentials, scope normalization, or bootstrap
+/// request execution fails.
 pub(crate) async fn start_openai_oauth_bootstrap(
     inputs: OpenAiControlPlaneInputs,
     request: OpenAiOAuthBootstrapRequest,
@@ -456,6 +497,11 @@ pub(crate) async fn start_openai_oauth_bootstrap(
     Ok(OpenAiOAuthLaunchResult::from_envelope(response))
 }
 
+/// Starts an OpenAI OAuth reconnect flow for an existing profile.
+///
+/// # Errors
+/// Returns an error when console session bootstrap, profile-id normalization,
+/// HTTP dispatch, or response decoding fails.
 pub(crate) async fn reconnect_openai_oauth(
     inputs: OpenAiControlPlaneInputs,
     request: OpenAiProfileActionRequest,
@@ -482,6 +528,11 @@ pub(crate) async fn reconnect_openai_oauth(
     Ok(OpenAiOAuthLaunchResult::from_envelope(response))
 }
 
+/// Loads callback state for an OpenAI OAuth bootstrap attempt.
+///
+/// # Errors
+/// Returns an error when control-plane client construction, console session
+/// bootstrap, or callback-state lookup fails.
 pub(crate) async fn get_openai_oauth_callback_state(
     inputs: OpenAiControlPlaneInputs,
     request: OpenAiOAuthCallbackStateRequest,
@@ -503,6 +554,11 @@ pub(crate) async fn get_openai_oauth_callback_state(
     Ok(OpenAiOAuthCallbackStateSnapshot::from_envelope(envelope))
 }
 
+/// Refreshes one OpenAI OAuth profile.
+///
+/// # Errors
+/// Returns an error when console session bootstrap, profile-id normalization,
+/// or provider action execution fails.
 pub(crate) async fn refresh_openai_profile(
     inputs: OpenAiControlPlaneInputs,
     request: OpenAiProfileActionRequest,
@@ -510,6 +566,11 @@ pub(crate) async fn refresh_openai_profile(
     run_provider_action(inputs, "refresh", request).await
 }
 
+/// Revokes one OpenAI auth profile.
+///
+/// # Errors
+/// Returns an error when console session bootstrap, profile-id normalization,
+/// or provider action execution fails.
 pub(crate) async fn revoke_openai_profile(
     inputs: OpenAiControlPlaneInputs,
     request: OpenAiProfileActionRequest,
@@ -517,6 +578,11 @@ pub(crate) async fn revoke_openai_profile(
     run_provider_action(inputs, "revoke", request).await
 }
 
+/// Sets one OpenAI profile as the default profile.
+///
+/// # Errors
+/// Returns an error when console session bootstrap, profile-id normalization,
+/// or provider action execution fails.
 pub(crate) async fn set_openai_default_profile(
     inputs: OpenAiControlPlaneInputs,
     request: OpenAiProfileActionRequest,
@@ -524,6 +590,10 @@ pub(crate) async fn set_openai_default_profile(
     run_provider_action(inputs, "default-profile", request).await
 }
 
+/// Opens a validated OpenAI browser handoff URL with the supplied opener.
+///
+/// # Errors
+/// Returns an error when the URL is not absolute HTTP(S) or the opener fails.
 pub(crate) fn open_external_browser<E>(
     raw_url: &str,
     opener: impl FnOnce(&str) -> std::result::Result<(), E>,

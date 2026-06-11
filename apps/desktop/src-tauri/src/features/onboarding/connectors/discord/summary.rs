@@ -1,7 +1,13 @@
+//! Discord onboarding summary derivation for desktop snapshots.
+//!
+//! The UI consumes this compact view to decide whether Discord setup still
+//! needs preflight, apply, or verification work.
+
 use crate::snapshot::ControlCenterSnapshot;
 
 use super::state::DesktopDiscordOnboardingState;
 
+/// Derived Discord onboarding state displayed by the desktop UI.
 #[derive(Debug, Clone)]
 pub(crate) struct DesktopDiscordOnboardingSummary {
     pub(crate) ready: bool,
@@ -11,6 +17,7 @@ pub(crate) struct DesktopDiscordOnboardingSummary {
     pub(crate) defaults: DesktopDiscordOnboardingState,
 }
 
+/// Builds a Discord onboarding summary from the latest control-center snapshot.
 pub(crate) fn derive_discord_onboarding_summary(
     snapshot: &ControlCenterSnapshot,
     defaults: &DesktopDiscordOnboardingState,
@@ -32,14 +39,12 @@ pub(crate) fn derive_discord_onboarding_summary(
     }
 }
 
+/// Returns the operator-facing Discord connection detail line.
 pub(crate) fn discord_connect_detail(summary: &DesktopDiscordOnboardingSummary) -> String {
     if summary.verified {
         return format!(
             "Discord verification last succeeded for {}.",
-            summary
-                .last_verified_target
-                .as_deref()
-                .unwrap_or("the configured target")
+            summary.last_verified_target.as_deref().unwrap_or("the configured target")
         );
     }
     if summary.ready {

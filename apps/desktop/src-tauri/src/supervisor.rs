@@ -1,3 +1,9 @@
+//! Desktop control-center supervisor for local Palyra sidecars.
+//!
+//! The supervisor owns process lifecycle, runtime configuration, profile
+//! activation, config reload watching, log buffering, and the single-instance
+//! guard used by the Tauri desktop shell.
+
 use std::{
     collections::VecDeque,
     env, fs,
@@ -39,6 +45,7 @@ const NODE_HOST_CONFIG_FILE_NAME: &str = "node-host.json";
 const DESKTOP_CONFIG_RELOAD_MODE_ENV: &str = "PALYRA_DESKTOP_CONFIG_RELOAD_MODE";
 const BROWSERD_STATE_ENCRYPTION_KEY_ENV: &str = "PALYRA_BROWSERD_STATE_ENCRYPTION_KEY";
 
+/// Supervised service kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ServiceKind {
@@ -48,6 +55,7 @@ pub(crate) enum ServiceKind {
 }
 
 impl ServiceKind {
+    /// Returns the stable machine-readable service name.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Gateway => "gateway",
@@ -56,6 +64,7 @@ impl ServiceKind {
         }
     }
 
+    /// Returns the human-facing sidecar name.
     pub(crate) const fn display_name(self) -> &'static str {
         match self {
             Self::Gateway => "palyrad",
@@ -77,6 +86,7 @@ impl ServiceKind {
     }
 }
 
+/// Origin stream for one buffered service log line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum LogStream {
@@ -86,6 +96,7 @@ pub(crate) enum LogStream {
 }
 
 impl LogStream {
+    /// Returns the stable machine-readable stream name.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Stdout => "stdout",
@@ -95,6 +106,7 @@ impl LogStream {
     }
 }
 
+/// Sanitized log line stored for desktop diagnostics.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct LogLine {
     pub(crate) unix_ms: i64,
@@ -103,6 +115,7 @@ pub(crate) struct LogLine {
     pub(crate) line: String,
 }
 
+/// Internal log event sent from async process readers to the supervisor loop.
 #[derive(Debug)]
 pub(crate) struct LogEvent {
     pub(crate) unix_ms: i64,
@@ -111,6 +124,7 @@ pub(crate) struct LogEvent {
     pub(crate) line: String,
 }
 
+/// Mutable lifecycle state for one supervised process.
 #[derive(Debug)]
 pub(crate) struct ManagedService {
     pub(crate) desired_running: bool,
@@ -124,6 +138,7 @@ pub(crate) struct ManagedService {
     pub(crate) bound_ports: Vec<u16>,
 }
 
+/// Config file reload mode for the desktop supervisor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DesktopConfigReloadMode {
     Auto,
@@ -136,6 +151,7 @@ struct ConfigFileSignature {
     len: u64,
 }
 
+/// Watched root config state used to restart supervised sidecars safely.
 #[derive(Debug, Clone)]
 pub(crate) struct DesktopConfigReloadWatchState {
     mode: DesktopConfigReloadMode,
@@ -151,6 +167,7 @@ enum ConfigReloadWatchOutcome {
 }
 
 impl ManagedService {
+    /// Creates a stopped service with known bound ports.
     pub(crate) fn new(bound_ports: Vec<u16>) -> Self {
         Self {
             desired_running: false,
@@ -165,6 +182,7 @@ impl ManagedService {
         }
     }
 
+    /// Returns whether a child process handle is currently attached.
     pub(crate) fn running(&self) -> bool {
         self.child.is_some()
     }
@@ -180,6 +198,7 @@ impl ManagedService {
     }
 }
 
+/// Runtime ports used by the supervised gateway and browser daemon.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RuntimeConfig {
     pub(crate) gateway_admin_port: u16,
@@ -211,6 +230,7 @@ impl Default for RuntimeConfig {
     }
 }
 
+/// Process snapshot returned to the desktop UI.
 #[derive(Debug, Serialize)]
 pub(crate) struct ServiceProcessSnapshot {
     pub(crate) service: String,
@@ -225,6 +245,7 @@ pub(crate) struct ServiceProcessSnapshot {
     pub(crate) bound_ports: Vec<u16>,
 }
 
+/// Health endpoint payload returned by supervised sidecars.
 #[derive(Debug, Deserialize)]
 pub(crate) struct HealthEndpointPayload {
     pub(crate) status: String,
@@ -233,6 +254,7 @@ pub(crate) struct HealthEndpointPayload {
     pub(crate) uptime_seconds: u64,
 }
 
+/// Main desktop supervisor state.
 #[derive(Debug)]
 pub(crate) struct ControlCenter {
     pub(crate) desktop_state_root: PathBuf,
@@ -264,6 +286,7 @@ pub(crate) struct ControlCenter {
 }
 
 impl DesktopConfigReloadWatchState {
+    /// Creates a watch state for the active desktop profile.
     pub(crate) fn from_profile(profile: &DesktopResolvedProfile) -> Self {
         let last_signature =
             profile.config_path.as_ref().and_then(|path| config_file_signature(path).ok());
@@ -348,10 +371,12 @@ struct DesktopRuntimeAuthConfig {
     browser_state_encryption_key: Option<BrowserStateEncryptionKey>,
 }
 
+/// Browserd state encryption key wrapper that redacts debug output.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct BrowserStateEncryptionKey(String);
 
 impl BrowserStateEncryptionKey {
+    /// Parses a non-empty browser state encryption key from config or env.
     pub(crate) fn parse(raw: impl Into<String>, source: &str) -> Result<Self> {
         let raw = raw.into();
         let value = normalize_optional_text(raw.as_str())
@@ -424,9 +449,7 @@ fn runtime_secrets_with_config_overrides(
     })
 }
 
-fn config_runtime_port_overrides(
-    config_path: Option<&Path>,
-) -> Result<ConfigRuntimePortOverrides> {
+fn config_runtime_port_overrides(config_path: Option<&Path>) -> Result<ConfigRuntimePortOverrides> {
     let Some(config_path) = config_path else {
         return Ok(ConfigRuntimePortOverrides::default());
     };
@@ -438,12 +461,10 @@ fn config_runtime_port_overrides(
         .with_context(|| format!("failed to read daemon config {}", config_path.display()))?;
     let document: toml::Value = toml::from_str(raw.as_str())
         .with_context(|| format!("failed to parse daemon config {}", config_path.display()))?;
-    let browser_grpc_port =
-        toml_url_port_at_path(&document, "tool_call.browser_service.endpoint");
+    let browser_grpc_port = toml_url_port_at_path(&document, "tool_call.browser_service.endpoint");
     let browser_health_port =
-        toml_url_port_at_path(&document, "tool_call.browser_service.health_base_url").or_else(
-            || browser_grpc_port.map(derive_browser_health_port_from_grpc_port),
-        );
+        toml_url_port_at_path(&document, "tool_call.browser_service.health_base_url")
+            .or_else(|| browser_grpc_port.map(derive_browser_health_port_from_grpc_port));
     Ok(ConfigRuntimePortOverrides {
         gateway_admin_port: toml_u16_at_path(&document, "daemon.port"),
         gateway_grpc_port: toml_u16_at_path(&document, "gateway.grpc_port"),
@@ -554,11 +575,7 @@ fn format_port_availability_summary(
     unavailable
         .iter()
         .map(|port| {
-            format!(
-                "{}: {}",
-                port.port,
-                port.error.as_deref().unwrap_or("port is not bindable")
-            )
+            format!("{}: {}", port.port, port.error.as_deref().unwrap_or("port is not bindable"))
         })
         .collect::<Vec<_>>()
         .join("; ")
@@ -590,6 +607,7 @@ fn browserd_env_values(
 }
 
 impl ControlCenter {
+    /// Initializes desktop state, profile, secrets, runtime ports, and sidecar state.
     pub(crate) fn new() -> Result<Self> {
         let state_root = super::resolve_desktop_state_root()?;
         let state_dir = state_root.join("desktop-control-center");
@@ -670,6 +688,7 @@ impl ControlCenter {
         })
     }
 
+    /// Persists the current desktop state file.
     pub(crate) fn save_state_file(&self) -> Result<()> {
         let encoded = serde_json::to_string_pretty(&self.persisted)
             .context("failed to encode desktop state file")?;
@@ -678,6 +697,7 @@ impl ControlCenter {
         })
     }
 
+    /// Records a bounded onboarding event in the active profile.
     pub(crate) fn record_onboarding_event(
         &mut self,
         kind: impl Into<String>,
@@ -689,6 +709,7 @@ impl ControlCenter {
         self.save_state_file()
     }
 
+    /// Clears the last onboarding failure when one is present.
     pub(crate) fn clear_onboarding_failure(&mut self) -> Result<()> {
         if self.persisted.active_onboarding().last_failure.is_none() {
             return Ok(());
@@ -697,6 +718,7 @@ impl ControlCenter {
         self.save_state_file()
     }
 
+    /// Records an onboarding failure with sanitized UI-facing detail.
     pub(crate) fn record_onboarding_failure(
         &mut self,
         step: DesktopOnboardingStep,
@@ -719,6 +741,7 @@ impl ControlCenter {
         self.save_state_file()
     }
 
+    /// Records the outcome of a support-bundle export attempt.
     pub(crate) fn record_support_bundle_export_result(
         &mut self,
         success: bool,
@@ -739,6 +762,7 @@ impl ControlCenter {
         self.save_state_file()
     }
 
+    /// Marks the welcome step acknowledged for the active profile.
     pub(crate) fn mark_onboarding_welcome_acknowledged(&mut self) -> Result<()> {
         let onboarding = self.persisted.active_onboarding_mut();
         if onboarding.welcome_acknowledged_at_unix_ms.is_none() {
@@ -753,6 +777,7 @@ impl ControlCenter {
         self.save_state_file()
     }
 
+    /// Applies and persists a runtime state-root override.
     pub(crate) fn set_runtime_state_root_override(
         &mut self,
         candidate: Option<&str>,
@@ -784,6 +809,7 @@ impl ControlCenter {
         Ok(runtime_root)
     }
 
+    /// Records successful OpenAI provider onboarding.
     pub(crate) fn mark_openai_connected(
         &mut self,
         preferred_method: Option<&str>,
@@ -806,6 +832,7 @@ impl ControlCenter {
         self.save_state_file()
     }
 
+    /// Stores Discord onboarding request metadata in active profile state.
     pub(crate) fn update_discord_onboarding_metadata(
         &mut self,
         request: &super::DiscordOnboardingRequest,
@@ -834,6 +861,7 @@ impl ControlCenter {
         self.save_state_file()
     }
 
+    /// Marks Discord onboarding preflight as completed.
     pub(crate) fn mark_discord_preflight(
         &mut self,
         request: &super::DiscordOnboardingRequest,
@@ -849,6 +877,7 @@ impl ControlCenter {
         self.save_state_file()
     }
 
+    /// Marks Discord connector settings as applied.
     pub(crate) fn mark_discord_applied(
         &mut self,
         request: &super::DiscordOnboardingRequest,
@@ -864,6 +893,7 @@ impl ControlCenter {
         self.save_state_file()
     }
 
+    /// Marks Discord verification as completed.
     pub(crate) fn mark_discord_verified(&mut self, connector_id: &str, target: &str) -> Result<()> {
         let onboarding = self.persisted.active_onboarding_mut();
         onboarding.discord.last_connector_id =
@@ -880,6 +910,7 @@ impl ControlCenter {
         self.save_state_file()
     }
 
+    /// Marks the dashboard handoff step as completed.
     pub(crate) fn mark_dashboard_handoff_complete(&mut self) -> Result<()> {
         let onboarding = self.persisted.active_onboarding_mut();
         if onboarding.dashboard_handoff_at_unix_ms.is_none() {
@@ -894,6 +925,7 @@ impl ControlCenter {
         self.save_state_file()
     }
 
+    /// Marks desktop onboarding completed for the active profile.
     pub(crate) fn mark_onboarding_complete(&mut self) -> Result<()> {
         let onboarding = self.persisted.active_onboarding_mut();
         if onboarding.completed_at_unix_ms.is_none() {
@@ -908,6 +940,7 @@ impl ControlCenter {
         self.save_state_file()
     }
 
+    /// Returns the active profile row for companion UI.
     pub(crate) fn current_profile_record(&self) -> DesktopCompanionProfileRecord {
         DesktopCompanionProfileRecord::from_resolved_profile(
             &self.active_profile,
@@ -917,6 +950,7 @@ impl ControlCenter {
         )
     }
 
+    /// Returns ordered profile rows for the companion profile switcher.
     pub(crate) fn profile_records(&self) -> Vec<DesktopCompanionProfileRecord> {
         let active_name = self.persisted.active_profile_name();
         let recent_names = self.persisted.recent_profile_names();
@@ -942,6 +976,7 @@ impl ControlCenter {
             .collect()
     }
 
+    /// Switches the active desktop profile and resets profile-bound runtime state.
     pub(crate) fn switch_active_profile(
         &mut self,
         profile_name: &str,
@@ -1004,6 +1039,7 @@ impl ControlCenter {
         ))
     }
 
+    /// Requests all enabled supervised services to start.
     pub(crate) fn start_all(&mut self) {
         self.gateway.desired_running = true;
         self.browserd.desired_running = self.persisted.browser_service_enabled;
@@ -1027,12 +1063,14 @@ impl ControlCenter {
         }
     }
 
+    /// Stops all supervised services in dependency order.
     pub(crate) fn stop_all(&mut self) {
         self.stop_service(ServiceKind::NodeHost);
         self.stop_service(ServiceKind::Browserd);
         self.stop_service(ServiceKind::Gateway);
     }
 
+    /// Restarts all supervised services.
     pub(crate) fn restart_all(&mut self) {
         self.stop_all();
         self.start_all();
@@ -1059,6 +1097,7 @@ impl ControlCenter {
         }
     }
 
+    /// Enables or disables the browser sidecar and persists the setting.
     pub(crate) fn set_browser_service_enabled(&mut self, enabled: bool) -> Result<()> {
         if self.persisted.browser_service_enabled == enabled {
             return Ok(());
@@ -1076,6 +1115,7 @@ impl ControlCenter {
         Ok(())
     }
 
+    /// Advances process lifecycle, log drains, config reloads, and restarts.
     pub(crate) fn refresh_runtime_state(&mut self) {
         self.drain_log_events();
         self.check_process_exit(ServiceKind::Gateway);
@@ -1087,6 +1127,7 @@ impl ControlCenter {
         self.reconcile_service(ServiceKind::NodeHost);
     }
 
+    /// Restarts supervised runtime when the watched config file changes.
     pub(crate) fn reconcile_config_reload_watch(&mut self) {
         let ConfigReloadWatchOutcome::Changed { path } = self.config_reload_watch.observe() else {
             return;
@@ -1608,6 +1649,7 @@ impl ControlCenter {
         }
     }
 
+    /// Builds a process snapshot for one supervised service.
     pub(crate) fn process_snapshot(&self, kind: ServiceKind) -> ServiceProcessSnapshot {
         let service = self.service_ref(kind);
         ServiceProcessSnapshot {
@@ -1624,16 +1666,18 @@ impl ControlCenter {
         }
     }
 
+    /// Returns recent logs across all supervised services.
     pub(crate) fn collect_logs(&self) -> Vec<LogLine> {
         let mut combined = Vec::new();
         combined.extend(self.gateway.logs.iter().cloned());
         combined.extend(self.browserd.logs.iter().cloned());
         combined.extend(self.node_host.logs.iter().cloned());
-        combined.sort_by(|left, right| right.unix_ms.cmp(&left.unix_ms));
+        combined.sort_by_key(|entry| std::cmp::Reverse(entry.unix_ms));
         combined.truncate(250);
         combined
     }
 
+    /// Synchronizes node-host desired state with gateway and enrollment state.
     pub(crate) fn sync_node_host_desired_state(&mut self) {
         let should_run = self.gateway.desired_running && self.node_host_installed();
         self.node_host.desired_running = should_run;
@@ -1645,26 +1689,31 @@ impl ControlCenter {
         }
     }
 
+    /// Returns whether desktop node-host enrollment config exists.
     pub(crate) fn node_host_installed(&self) -> bool {
         self.runtime_root.join(NODE_HOST_STATE_DIR).join(NODE_HOST_CONFIG_FILE_NAME).is_file()
     }
 
+    /// Stops only the desktop node-host sidecar.
     pub(crate) fn stop_node_host(&mut self) {
         self.stop_service(ServiceKind::NodeHost);
     }
 
+    /// Opens a validated dashboard URL in the default browser.
     pub(crate) fn open_dashboard(&self, url: &str) -> Result<String> {
         open_url_in_default_browser(url)?;
         Ok(url.to_owned())
     }
 }
 
+/// File-based guard that prevents multiple desktop instances per state dir.
 #[derive(Debug)]
 pub(crate) struct DesktopInstanceLock {
     path: PathBuf,
 }
 
 impl DesktopInstanceLock {
+    /// Acquires the single-instance lock, recovering stale locks when possible.
     pub(crate) fn acquire(state_dir: &Path) -> Result<Self> {
         let path = state_dir.join("instance.lock");
         let mut file = match create_instance_lock_file(path.as_path()) {
@@ -1842,6 +1891,7 @@ impl Drop for ControlCenter {
     }
 }
 
+/// Returns trimmed text when it is non-empty.
 pub(crate) fn normalize_optional_text(raw: &str) -> Option<&str> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -1878,6 +1928,7 @@ fn normalize_browser_open_url(raw: &str) -> Result<String> {
     Ok(parsed.to_string())
 }
 
+/// Computes capped exponential restart backoff in milliseconds.
 pub(crate) fn compute_backoff_ms(attempt: u32) -> u64 {
     let exponent = attempt.min(5);
     let scaled = 1_000_u64.saturating_mul(1_u64 << exponent);
@@ -1956,9 +2007,9 @@ mod tests {
         runtime_config_with_config_overrides, runtime_secrets_with_config_overrides,
         BrowserStateEncryptionKey, ConfigReloadWatchOutcome, DesktopConfigReloadWatchState,
     };
-    use crate::RuntimeConfig;
     use crate::desktop_state::DesktopRuntimeSecrets;
     use crate::profile_registry::implicit_profile;
+    use crate::RuntimeConfig;
 
     const TEST_BROWSER_STATE_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 
@@ -2107,11 +2158,8 @@ state_key_vault_ref = "global/browser_state_key"
             BrowserStateEncryptionKey::parse(TEST_BROWSER_STATE_KEY, "fixture browser state key")
                 .expect("fixture browser state key should parse");
 
-        let env = browserd_env_values(
-            fixture.as_path(),
-            "browser-auth-token",
-            Some(&browser_state_key),
-        );
+        let env =
+            browserd_env_values(fixture.as_path(), "browser-auth-token", Some(&browser_state_key));
 
         assert_eq!(
             env.iter()
@@ -2146,9 +2194,11 @@ health_base_url = "http://127.0.0.1:7313"
         )
         .expect("config fixture should be written");
 
-        let effective =
-            runtime_config_with_config_overrides(RuntimeConfig::default(), Some(config_path.as_path()))
-                .expect("config port overrides should load");
+        let effective = runtime_config_with_config_overrides(
+            RuntimeConfig::default(),
+            Some(config_path.as_path()),
+        )
+        .expect("config port overrides should load");
 
         assert_eq!(effective.gateway_admin_port, 7310);
         assert_eq!(effective.gateway_grpc_port, 7311);
@@ -2257,6 +2307,7 @@ bound_principal = "admin:local"
     }
 }
 
+/// Resolves a sidecar binary from an explicit env override or local build paths.
 pub(crate) fn resolve_binary_path(binary_name: &str, env_override: &str) -> Result<PathBuf> {
     if let Ok(value) = env::var(env_override) {
         let trimmed = value.trim();
@@ -2321,6 +2372,7 @@ fn canonicalize_binary_candidate(candidate: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Returns the platform-specific executable file name.
 pub(crate) fn executable_file_name(base: &str) -> String {
     if cfg!(windows) {
         format!("{base}.exe")
@@ -2329,6 +2381,7 @@ pub(crate) fn executable_file_name(base: &str) -> String {
     }
 }
 
+/// Returns the current Unix time in milliseconds.
 pub(crate) fn unix_ms_now() -> i64 {
     system_time_to_unix_ms(SystemTime::now())
 }
@@ -2374,6 +2427,7 @@ fn spawn_log_reader(
     });
 }
 
+/// Enqueues a log event or records an overflow without blocking readers.
 pub(crate) fn try_enqueue_log_event(
     sender: &mpsc::Sender<LogEvent>,
     dropped_counter: &AtomicU64,

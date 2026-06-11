@@ -1,3 +1,9 @@
+//! Companion console data fetcher and cache bridge.
+//!
+//! The desktop companion uses this module to load a compact subset of console
+//! data with short-lived cache fallback so the UI can degrade gracefully during
+//! transient daemon or network failures.
+
 use anyhow::{anyhow, Result};
 use palyra_control_plane::{self as control_plane};
 use reqwest::Client;
@@ -24,6 +30,7 @@ struct ApprovalsEnvelope {
     approvals: Vec<Value>,
 }
 
+/// Console data bundle consumed by desktop companion snapshot building.
 #[derive(Debug)]
 pub(crate) struct FetchedCompanionConsoleData {
     pub(crate) console_session: control_plane::ConsoleSession,
@@ -50,6 +57,12 @@ impl CompanionPayloadKind {
     }
 }
 
+/// Fetches companion console data, using stale cache entries on refresh errors.
+///
+/// # Errors
+/// Returns an error when console session bootstrap fails, uncached required
+/// payloads cannot be fetched, or fetched payloads do not match expected
+/// contracts.
 pub(crate) async fn fetch_companion_console_data(
     http_client: &Client,
     runtime: &RuntimeConfig,
@@ -185,10 +198,7 @@ where
     if now.saturating_sub(fetched_at_unix_ms) > max_age_ms {
         return None;
     }
-    cached
-        .payload
-        .clone()
-        .and_then(|payload| serde_json::from_value::<T>(payload).ok())
+    cached.payload.clone().and_then(|payload| serde_json::from_value::<T>(payload).ok())
 }
 
 fn store_cached_companion_payload<T>(
@@ -281,9 +291,7 @@ mod tests {
         .expect("stale companion cache should satisfy the request");
 
         assert_eq!(
-            payload
-                .pointer("/summary/total_sessions")
-                .and_then(serde_json::Value::as_i64),
+            payload.pointer("/summary/total_sessions").and_then(serde_json::Value::as_i64),
             Some(1)
         );
         assert!(

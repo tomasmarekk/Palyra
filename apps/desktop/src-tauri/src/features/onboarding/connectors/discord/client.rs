@@ -1,3 +1,9 @@
+//! Discord onboarding control-plane client for the desktop app.
+//!
+//! The desktop command layer calls these helpers to authenticate a console
+//! session, POST onboarding requests, and sanitize returned status details
+//! before they reach the UI.
+
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::Client;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -8,6 +14,7 @@ use crate::snapshot::{
 };
 use crate::{normalize_optional_text, ControlCenter, RuntimeConfig};
 
+/// Captured control-plane inputs required for Discord onboarding requests.
 #[derive(Debug, Clone)]
 pub(crate) struct DiscordControlPlaneInputs {
     pub(crate) runtime: RuntimeConfig,
@@ -16,6 +23,7 @@ pub(crate) struct DiscordControlPlaneInputs {
 }
 
 impl DiscordControlPlaneInputs {
+    /// Captures Discord control-plane inputs from the running control center.
     pub(crate) fn capture(control_center: &ControlCenter) -> Self {
         Self {
             runtime: control_center.runtime.clone(),
@@ -25,6 +33,7 @@ impl DiscordControlPlaneInputs {
     }
 }
 
+/// Desktop request body for Discord onboarding preflight and apply actions.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DiscordOnboardingRequest {
@@ -105,6 +114,7 @@ impl From<DiscordOnboardingRequest> for DiscordOnboardingConsoleRequest {
     }
 }
 
+/// Desktop request body for sending a Discord verification test.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DiscordVerificationRequest {
@@ -114,6 +124,7 @@ pub(crate) struct DiscordVerificationRequest {
     pub(crate) text: Option<String>,
 }
 
+/// Sanitized Discord onboarding preflight result returned to the desktop UI.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct DiscordOnboardingPreflightSnapshot {
     pub(crate) connector_id: String,
@@ -128,6 +139,7 @@ pub(crate) struct DiscordOnboardingPreflightSnapshot {
     pub(crate) security_defaults: Vec<String>,
 }
 
+/// Sanitized Discord onboarding apply result returned to the desktop UI.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct DiscordOnboardingApplySnapshot {
     pub(crate) connector_id: String,
@@ -143,6 +155,7 @@ pub(crate) struct DiscordOnboardingApplySnapshot {
     pub(crate) policy_warnings: Vec<String>,
 }
 
+/// Result of dispatching a Discord verification test message.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct DiscordVerificationResult {
     pub(crate) connector_id: String,
@@ -151,6 +164,11 @@ pub(crate) struct DiscordVerificationResult {
     pub(crate) message: String,
 }
 
+/// Runs Discord onboarding preflight through the console API.
+///
+/// # Errors
+/// Returns an error when control-plane client construction, console session
+/// bootstrap, HTTP dispatch, or response parsing fails.
 pub(crate) async fn run_discord_onboarding_preflight(
     inputs: DiscordControlPlaneInputs,
     request: DiscordOnboardingRequest,
@@ -171,6 +189,11 @@ pub(crate) async fn run_discord_onboarding_preflight(
     parse_preflight_snapshot(payload)
 }
 
+/// Applies Discord onboarding through the console API.
+///
+/// # Errors
+/// Returns an error when control-plane client construction, console session
+/// bootstrap, HTTP dispatch, or response parsing fails.
 pub(crate) async fn apply_discord_onboarding(
     inputs: DiscordControlPlaneInputs,
     request: DiscordOnboardingRequest,
@@ -191,6 +214,11 @@ pub(crate) async fn apply_discord_onboarding(
     parse_apply_snapshot(payload)
 }
 
+/// Sends a Discord connector verification message through the console API.
+///
+/// # Errors
+/// Returns an error when control-plane client construction, console session
+/// bootstrap, request validation, HTTP dispatch, or response parsing fails.
 pub(crate) async fn verify_discord_connector(
     inputs: DiscordControlPlaneInputs,
     request: DiscordVerificationRequest,

@@ -11,8 +11,8 @@ use std::{
 };
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use serde_json::json;
 use palyra_control_plane as control_plane;
+use serde_json::json;
 
 mod dashboard_access;
 mod support;
@@ -164,10 +164,7 @@ fn config_reload_watch_restarts_desired_runtime_on_config_change() {
     assert_eq!(control_center.gateway.next_restart_unix_ms, Some(i64::MAX));
 
     std::thread::sleep(Duration::from_millis(100));
-    write_file(
-        config_path.as_path(),
-        "version = 1\n[memory]\nauto_inject_enabled = true\n",
-    );
+    write_file(config_path.as_path(), "version = 1\n[memory]\nauto_inject_enabled = true\n");
     control_center.reconcile_config_reload_watch();
 
     assert_ne!(control_center.gateway.next_restart_unix_ms, Some(i64::MAX));
@@ -224,7 +221,12 @@ fn desktop_node_pairing_selection_requires_fresh_desktop_request() {
         vec![
             desktop_node_pairing_request("old", "device-a", "admin:desktop-control-center", 999),
             desktop_node_pairing_request("other", "device-a", "operator:other", 1_100),
-            desktop_node_pairing_request("selected", "device-a", "admin:desktop-control-center", 1_100),
+            desktop_node_pairing_request(
+                "selected",
+                "device-a",
+                "admin:desktop-control-center",
+                1_100,
+            ),
         ],
         "device-a",
         1_000,
@@ -238,8 +240,18 @@ fn desktop_node_pairing_selection_requires_fresh_desktop_request() {
 fn desktop_node_pairing_selection_rejects_ambiguous_fresh_requests() {
     let result = select_desktop_node_pairing_request_id(
         vec![
-            desktop_node_pairing_request("first", "device-a", "admin:desktop-control-center", 1_100),
-            desktop_node_pairing_request("second", "device-a", "admin:desktop-control-center", 1_101),
+            desktop_node_pairing_request(
+                "first",
+                "device-a",
+                "admin:desktop-control-center",
+                1_100,
+            ),
+            desktop_node_pairing_request(
+                "second",
+                "device-a",
+                "admin:desktop-control-center",
+                1_101,
+            ),
         ],
         "device-a",
         1_000,
@@ -398,25 +410,18 @@ fn companion_voice_state_persists_audio_preferences_and_audit() {
     assert!(voice.tts_muted);
     assert!(voice.silence_detection_enabled);
     assert_eq!(voice.silence_timeout_ms, 2_400);
-    assert_eq!(
-        voice.lifecycle_state,
-        crate::desktop_state::DesktopVoiceLifecycleState::Review
-    );
+    assert_eq!(voice.lifecycle_state, crate::desktop_state::DesktopVoiceLifecycleState::Review);
     assert_eq!(voice.draft_session_id.as_deref(), Some("session-voice"));
     assert_eq!(voice.draft_text.as_deref(), Some("Edited transcript"));
     assert_eq!(voice.draft_summary.as_deref(), Some("Voice summary"));
     assert_eq!(voice.audit_log.len(), 1);
     assert_eq!(voice.audit_log[0].kind, "transcript_ready");
     assert_eq!(voice.audit_log[0].session_id.as_deref(), Some("session-voice"));
-    assert_eq!(
-        voice.audit_log[0].input_device_label.as_deref(),
-        Some("Desk microphone")
-    );
+    assert_eq!(voice.audit_log[0].input_device_label.as_deref(), Some("Desk microphone"));
     assert!(!voice.audit_log[0].tts_playback);
 
-    let persisted_state =
-        std::fs::read_to_string(control_center.state_file_path.as_path())
-            .expect("desktop state should be written");
+    let persisted_state = std::fs::read_to_string(control_center.state_file_path.as_path())
+        .expect("desktop state should be written");
     assert!(
         !persisted_state.contains("Edited transcript"),
         "pre-send voice draft text must not be persisted to state.json"
@@ -425,9 +430,8 @@ fn companion_voice_state_persists_audio_preferences_and_audit() {
         !persisted_state.contains("Voice summary"),
         "derived voice draft summaries must not be persisted to state.json"
     );
-    let reloaded =
-        load_or_initialize_state_file(control_center.state_file_path.as_path())
-            .expect("desktop state should reload without voice draft content");
+    let reloaded = load_or_initialize_state_file(control_center.state_file_path.as_path())
+        .expect("desktop state should reload without voice draft content");
     let reloaded_voice = &reloaded.active_companion().voice;
     assert_eq!(reloaded_voice.microphone_device_id.as_deref(), Some("desk-mic"));
     assert_eq!(reloaded_voice.draft_session_id.as_deref(), Some("session-voice"));
@@ -1746,6 +1750,10 @@ async fn companion_snapshot_polling_does_not_rebootstrap_console_auth_after_firs
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[expect(
+    clippy::await_holding_lock,
+    reason = "test holds the process-env guard across awaits to serialize global env overrides"
+)]
 async fn onboarding_preflight_accepts_healthy_runtime_already_bound_to_expected_ports() {
     fn write_http_response(
         stream: &mut std::net::TcpStream,

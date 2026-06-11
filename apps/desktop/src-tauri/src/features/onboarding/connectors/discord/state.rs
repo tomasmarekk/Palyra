@@ -1,7 +1,10 @@
+//! Persisted Discord onboarding defaults for the desktop app.
+
 use serde::{Deserialize, Serialize};
 
 use crate::normalize_optional_text;
 
+/// Per-profile Discord onboarding defaults and verification state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct DesktopDiscordOnboardingState {
@@ -41,6 +44,7 @@ impl Default for DesktopDiscordOnboardingState {
 }
 
 impl DesktopDiscordOnboardingState {
+    /// Returns the connector id derived from the configured account id.
     pub(crate) fn connector_id(&self) -> String {
         let account_id = normalize_optional_text(self.account_id.as_str()).unwrap_or("default");
         format!("discord:{account_id}")

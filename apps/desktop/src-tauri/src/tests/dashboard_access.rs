@@ -8,8 +8,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::super::snapshot::{build_dashboard_open_url, OverallStatus};
 use super::super::build_snapshot_from_inputs;
+use super::super::snapshot::{build_dashboard_open_url, OverallStatus};
 use super::support::{build_test_control_center, write_json_response, TempFixtureDir};
 
 #[tokio::test(flavor = "current_thread")]

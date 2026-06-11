@@ -1,9 +1,13 @@
+//! Ambient desktop companion runtime.
+//!
+//! This module owns the tray icon, global shortcut, companion windows, and
+//! start-on-login synchronization around the persisted companion state.
+
 use anyhow::{anyhow, Context, Result};
 use tauri::{
     menu::{CheckMenuItem, Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
-    App, AppHandle, Manager, Runtime, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
-    WindowEvent,
+    App, AppHandle, Manager, Runtime, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_autostart::ManagerExt as AutostartExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutEvent};
@@ -29,11 +33,13 @@ const MENU_TOGGLE_GLOBAL_HOTKEY: &str = "companion.toggle-global-hotkey";
 const MENU_OPEN_DASHBOARD: &str = "companion.open-dashboard";
 const MENU_QUIT: &str = "companion.quit";
 
+/// Result of synchronizing tray and shortcut state from companion settings.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AmbientSyncOutcome {
     pub(crate) hotkey_registration_error: Option<String>,
 }
 
+/// Tauri-managed ambient UI handles that must stay alive for the app lifetime.
 pub(crate) struct AmbientRuntimeState<R: Runtime> {
     #[allow(dead_code)]
     tray: TrayIcon<R>,
@@ -44,25 +50,21 @@ pub(crate) struct AmbientRuntimeState<R: Runtime> {
     toggle_global_hotkey: CheckMenuItem<R>,
 }
 
+/// Creates the tray menu, tray icon, and managed ambient runtime state.
+///
+/// # Errors
+/// Returns an error when Tauri menu, tray, or runtime-state initialization
+/// fails.
 pub(crate) fn setup_ambient_runtime<R: Runtime>(app: &mut App<R>) -> Result<()> {
-    let open_main = MenuItem::with_id(app, MENU_OPEN_MAIN, "Open Control Center", true, None::<&str>)
-        .context("failed to create ambient main window menu item")?;
-    let open_quick_panel = MenuItem::with_id(
-        app,
-        MENU_OPEN_QUICK_PANEL,
-        "Open Quick Panel",
-        true,
-        None::<&str>,
-    )
-    .context("failed to create ambient quick panel menu item")?;
-    let open_voice_overlay = MenuItem::with_id(
-        app,
-        MENU_OPEN_VOICE_OVERLAY,
-        "Open Voice Overlay",
-        true,
-        None::<&str>,
-    )
-    .context("failed to create ambient voice overlay menu item")?;
+    let open_main =
+        MenuItem::with_id(app, MENU_OPEN_MAIN, "Open Control Center", true, None::<&str>)
+            .context("failed to create ambient main window menu item")?;
+    let open_quick_panel =
+        MenuItem::with_id(app, MENU_OPEN_QUICK_PANEL, "Open Quick Panel", true, None::<&str>)
+            .context("failed to create ambient quick panel menu item")?;
+    let open_voice_overlay =
+        MenuItem::with_id(app, MENU_OPEN_VOICE_OVERLAY, "Open Voice Overlay", true, None::<&str>)
+            .context("failed to create ambient voice overlay menu item")?;
     let toggle_start_on_login = CheckMenuItem::with_id(
         app,
         MENU_TOGGLE_START_ON_LOGIN,
@@ -81,14 +83,9 @@ pub(crate) fn setup_ambient_runtime<R: Runtime>(app: &mut App<R>) -> Result<()> 
         None::<&str>,
     )
     .context("failed to create ambient global hotkey menu item")?;
-    let open_dashboard = MenuItem::with_id(
-        app,
-        MENU_OPEN_DASHBOARD,
-        "Open Dashboard",
-        true,
-        None::<&str>,
-    )
-    .context("failed to create ambient dashboard menu item")?;
+    let open_dashboard =
+        MenuItem::with_id(app, MENU_OPEN_DASHBOARD, "Open Dashboard", true, None::<&str>)
+            .context("failed to create ambient dashboard menu item")?;
     let quit = MenuItem::with_id(app, MENU_QUIT, "Quit", true, None::<&str>)
         .context("failed to create ambient quit menu item")?;
 
@@ -137,6 +134,11 @@ pub(crate) fn setup_ambient_runtime<R: Runtime>(app: &mut App<R>) -> Result<()> 
     Ok(())
 }
 
+/// Synchronizes tray labels, menu states, and shortcuts from a fresh snapshot.
+///
+/// # Errors
+/// Returns an error when menu state, autostart, or shortcut synchronization
+/// fails.
 pub(crate) fn sync_ambient_runtime_from_snapshot<R: Runtime>(
     app: &AppHandle<R>,
     snapshot: &DesktopCompanionSnapshot,
@@ -157,6 +159,11 @@ pub(crate) fn sync_ambient_runtime_from_snapshot<R: Runtime>(
     )
 }
 
+/// Synchronizes tray labels, menu states, and shortcuts from persisted state.
+///
+/// # Errors
+/// Returns an error when menu state, autostart, or shortcut synchronization
+/// fails.
 pub(crate) fn sync_ambient_runtime_from_state<R: Runtime>(
     app: &AppHandle<R>,
     companion: &DesktopCompanionState,
@@ -177,12 +184,18 @@ pub(crate) fn sync_ambient_runtime_from_state<R: Runtime>(
     )
 }
 
+/// Shows the requested companion surface and hides the other surfaces.
+///
+/// # Errors
+/// Returns an error when state loading, window creation, window focus, or state
+/// persistence fails.
 pub(crate) fn show_surface<R: Runtime>(
     app: &AppHandle<R>,
     requested: DesktopCompanionSurfaceMode,
 ) -> Result<DesktopCompanionSurfaceMode> {
     let companion = load_companion_state(app)?;
-    let surface = resolve_supported_surface(requested, &companion.rollout, companion.ambient.last_surface);
+    let surface =
+        resolve_supported_surface(requested, &companion.rollout, companion.ambient.last_surface);
     let window = ensure_surface_window(app, surface)?;
     hide_other_surfaces(app, surface)?;
     window.show().context("failed to show companion surface")?;
@@ -191,6 +204,10 @@ pub(crate) fn show_surface<R: Runtime>(
     Ok(surface)
 }
 
+/// Hides one companion surface or all companion surfaces.
+///
+/// # Errors
+/// Returns an error when a present Tauri window cannot be hidden.
 pub(crate) fn hide_surface<R: Runtime>(
     app: &AppHandle<R>,
     requested: Option<DesktopCompanionSurfaceMode>,
@@ -206,10 +223,18 @@ pub(crate) fn hide_surface<R: Runtime>(
     Ok(())
 }
 
+/// Toggles visibility for the preferred companion surface.
+///
+/// # Errors
+/// Returns an error when state loading, window creation, or window visibility
+/// mutation fails.
 pub(crate) fn toggle_preferred_surface<R: Runtime>(app: &AppHandle<R>) -> Result<()> {
     let companion = load_companion_state(app)?;
-    let preferred =
-        resolve_supported_surface(companion.ambient.last_surface, &companion.rollout, companion.ambient.last_surface);
+    let preferred = resolve_supported_surface(
+        companion.ambient.last_surface,
+        &companion.rollout,
+        companion.ambient.last_surface,
+    );
     let window = ensure_surface_window(app, preferred)?;
     let visible = window.is_visible().unwrap_or(false);
     if visible {
@@ -220,6 +245,10 @@ pub(crate) fn toggle_preferred_surface<R: Runtime>(app: &AppHandle<R>) -> Result
     Ok(())
 }
 
+/// Applies ambient window-close and auto-hide behavior.
+///
+/// # Errors
+/// Returns an error when a window hide operation fails.
 pub(crate) fn handle_window_event<R: Runtime>(
     window: &tauri::Window<R>,
     event: &WindowEvent,
@@ -242,6 +271,11 @@ pub(crate) fn handle_window_event<R: Runtime>(
     Ok(())
 }
 
+/// Handles tray menu commands for companion surfaces and dashboard handoff.
+///
+/// # Errors
+/// Returns an error when the selected command cannot update state, windows,
+/// autostart, shortcuts, or dashboard handoff.
 pub(crate) fn handle_tray_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str) -> Result<()> {
     match id {
         MENU_OPEN_MAIN => {
@@ -291,6 +325,10 @@ fn handle_tray_icon_event<R: Runtime>(tray: &TrayIcon<R>, event: &TrayIconEvent)
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "ambient sync takes already-captured UI state without owning a serialized DTO"
+)]
 fn sync_ambient_runtime<R: Runtime>(
     app: &AppHandle<R>,
     rollout: &DesktopCompanionRolloutState,
@@ -306,7 +344,8 @@ fn sync_ambient_runtime<R: Runtime>(
     queued_offline_drafts: usize,
 ) -> Result<AmbientSyncOutcome> {
     let ambient = app.state::<AmbientRuntimeState<R>>();
-    let quick_panel_available = rollout.companion_shell_enabled && rollout.ambient_companion_enabled;
+    let quick_panel_available =
+        rollout.companion_shell_enabled && rollout.ambient_companion_enabled;
     let voice_overlay_available = rollout.companion_shell_enabled
         && rollout.ambient_companion_enabled
         && rollout.voice_capture_enabled
@@ -345,11 +384,8 @@ fn sync_ambient_runtime<R: Runtime>(
     ambient
         .toggle_global_hotkey
         .set_text(
-            format!(
-                "Enable Global Hotkey{}",
-                hotkey_suffix(global_hotkey, global_hotkey_enabled)
-            )
-            .as_str(),
+            format!("Enable Global Hotkey{}", hotkey_suffix(global_hotkey, global_hotkey_enabled))
+                .as_str(),
         )
         .context("failed to update global hotkey tray label")?;
     ambient
@@ -371,9 +407,8 @@ fn sync_ambient_runtime<R: Runtime>(
     refresh_autostart(app, start_on_login_enabled)?;
     let hotkey_registration_error =
         refresh_global_hotkey(app, rollout, global_hotkey_enabled, global_hotkey)?;
-    let tray = app
-        .tray_by_id(TRAY_ID)
-        .ok_or_else(|| anyhow!("ambient tray icon is unavailable"))?;
+    let tray =
+        app.tray_by_id(TRAY_ID).ok_or_else(|| anyhow!("ambient tray icon is unavailable"))?;
     tray.set_tooltip(Some(tray_tooltip(
         connection_state,
         unread_notifications,
@@ -395,26 +430,22 @@ fn ensure_surface_window<R: Runtime>(
         return Ok(window);
     }
 
-    let mut builder = WebviewWindowBuilder::new(
-        app,
-        label,
-        WebviewUrl::App(surface_window_path(surface).into()),
-    )
-        .title(surface_window_title(surface))
-        .visible(false)
-        .focused(true)
-        .skip_taskbar(matches!(
-            surface,
-            DesktopCompanionSurfaceMode::QuickPanel | DesktopCompanionSurfaceMode::VoiceOverlay
-        ));
+    let mut builder =
+        WebviewWindowBuilder::new(app, label, WebviewUrl::App(surface_window_path(surface).into()))
+            .title(surface_window_title(surface))
+            .visible(false)
+            .focused(true)
+            .skip_taskbar(matches!(
+                surface,
+                DesktopCompanionSurfaceMode::QuickPanel | DesktopCompanionSurfaceMode::VoiceOverlay
+            ));
     if let Some(icon) = app.default_window_icon().cloned() {
         builder = builder.icon(icon).context("failed to apply ambient surface icon")?;
     }
     builder = match surface {
-        DesktopCompanionSurfaceMode::Main => builder
-            .center()
-            .inner_size(1120.0, 760.0)
-            .min_inner_size(900.0, 620.0),
+        DesktopCompanionSurfaceMode::Main => {
+            builder.center().inner_size(1120.0, 760.0).min_inner_size(900.0, 620.0)
+        }
         DesktopCompanionSurfaceMode::QuickPanel => builder
             .inner_size(440.0, 680.0)
             .min_inner_size(360.0, 520.0)
@@ -475,12 +506,14 @@ fn refresh_global_hotkey<R: Runtime>(
     shortcut: &str,
 ) -> Result<Option<String>> {
     let manager = app.global_shortcut();
-    manager
-        .unregister_all()
-        .context("failed to reset desktop companion global hotkeys")?;
+    manager.unregister_all().context("failed to reset desktop companion global hotkeys")?;
 
     let trimmed = shortcut.trim();
-    if !enabled || trimmed.is_empty() || !rollout.companion_shell_enabled || !rollout.ambient_companion_enabled {
+    if !enabled
+        || trimmed.is_empty()
+        || !rollout.companion_shell_enabled
+        || !rollout.ambient_companion_enabled
+    {
         return Ok(None);
     }
 
@@ -494,11 +527,8 @@ fn refresh_global_hotkey<R: Runtime>(
     match registration {
         Ok(()) => Ok(None),
         Err(error) => Ok(Some(sanitize_log_line(
-            format!(
-            "desktop global hotkey '{}' could not be registered: {error}",
-            trimmed
-            )
-            .as_str(),
+            format!("desktop global hotkey '{}' could not be registered: {error}", trimmed)
+                .as_str(),
         ))),
     }
 }
@@ -556,7 +586,9 @@ fn resolve_supported_surface(
             DesktopCompanionSurfaceMode::QuickPanel
         }
         DesktopCompanionSurfaceMode::Main => DesktopCompanionSurfaceMode::Main,
-        _ if fallback != requested => resolve_supported_surface(fallback, rollout, DesktopCompanionSurfaceMode::Main),
+        _ if fallback != requested => {
+            resolve_supported_surface(fallback, rollout, DesktopCompanionSurfaceMode::Main)
+        }
         _ if rollout.companion_shell_enabled && rollout.ambient_companion_enabled => {
             DesktopCompanionSurfaceMode::QuickPanel
         }
@@ -622,10 +654,7 @@ fn persist_hotkey_registration_error<R: Runtime>(
     message: Option<&str>,
 ) -> Result<()> {
     with_supervisor(app, |supervisor| {
-        supervisor
-            .persisted
-            .active_companion_mut()
-            .set_hotkey_registration_error(message);
+        supervisor.persisted.active_companion_mut().set_hotkey_registration_error(message);
         supervisor.save_state_file()
     })
 }
@@ -651,10 +680,7 @@ async fn open_dashboard_from_tray<R: Runtime>(app: &AppHandle<R>) -> Result<()> 
     let (snapshot_inputs, dashboard_open_inputs) = {
         let state = app.state::<DesktopAppState>();
         let mut supervisor = state.supervisor.lock().await;
-        (
-            supervisor.capture_snapshot_inputs(),
-            supervisor.capture_dashboard_open_inputs(),
-        )
+        (supervisor.capture_snapshot_inputs(), supervisor.capture_dashboard_open_inputs())
     };
     let snapshot = build_snapshot_from_inputs(snapshot_inputs).await?;
     if snapshot.quick_facts.dashboard_access_mode == "local"

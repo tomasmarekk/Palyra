@@ -1,3 +1,8 @@
+//! Dashboard open-url builder for desktop handoff.
+//!
+//! Local dashboard opens must bootstrap a console browser handoff first so the
+//! external browser lands on the dashboard with a valid same-origin session.
+
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
@@ -10,6 +15,7 @@ use super::snapshot::{
 use super::supervisor::ConsoleSessionCache;
 use super::{ControlCenter, RuntimeConfig};
 
+/// Captured inputs needed to build a dashboard open URL off the UI thread.
 #[derive(Debug, Clone)]
 pub(crate) struct DashboardOpenInputs {
     pub(crate) runtime: RuntimeConfig,
@@ -19,6 +25,7 @@ pub(crate) struct DashboardOpenInputs {
 }
 
 impl ControlCenter {
+    /// Captures runtime and session state for later dashboard URL generation.
     pub(crate) fn capture_dashboard_open_inputs(&self) -> DashboardOpenInputs {
         DashboardOpenInputs {
             runtime: self.runtime.clone(),
@@ -29,6 +36,11 @@ impl ControlCenter {
     }
 }
 
+/// Builds the URL that should be opened for dashboard access.
+///
+/// # Errors
+/// Returns an error when local handoff redirect parsing, console session
+/// bootstrap, handoff creation, or URL normalization fails.
 pub(crate) async fn build_dashboard_open_url(
     inputs: DashboardOpenInputs,
     dashboard_url: &str,

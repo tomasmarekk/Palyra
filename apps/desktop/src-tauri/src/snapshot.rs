@@ -1,3 +1,10 @@
+//! Control-center snapshot assembly and desktop-facing sanitization helpers.
+//!
+//! This module gathers local process state, gateway health, console diagnostics,
+//! dashboard routing data, and support-bundle export results into DTOs returned
+//! by the Tauri command layer. It also centralizes redaction for text surfaced
+//! in the desktop UI.
+
 use std::{
     env, fs,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -20,18 +27,20 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::process::Command;
 
+pub(crate) use super::dashboard_open::{build_dashboard_open_url, DashboardOpenInputs};
 use super::supervisor::{CachedConsolePayload, ConsolePayloadCache, ConsoleSessionCache};
 use super::{
     normalize_optional_text, resolve_binary_path, unix_ms_now, ControlCenter,
     HealthEndpointPayload, LogLine, RuntimeConfig, ServiceKind, ServiceProcessSnapshot,
     CONSOLE_DEVICE_ID, CONSOLE_PRINCIPAL, DASHBOARD_SCHEME, LOOPBACK_HOST, MAX_DIAGNOSTIC_ERRORS,
 };
-pub(crate) use super::dashboard_open::{build_dashboard_open_url, DashboardOpenInputs};
 
 const DEFAULT_DASHBOARD_HASH_ROUTE: &str = "#/control/overview";
 const CONSOLE_SESSION_EXPIRY_SKEW_MS: i64 = 5_000;
 const CONSOLE_PAYLOAD_CACHE_TTL_MS: i64 = 15_000;
 const CONSOLE_PAYLOAD_STALE_WARNING_MS: i64 = 60_000;
+
+/// Discord connector status summary shown in desktop quick facts.
 #[derive(Debug, Serialize)]
 pub(crate) struct DiscordStatusSnapshot {
     pub(crate) connector_id: String,
@@ -54,6 +63,7 @@ pub(crate) struct DiscordStatusSnapshot {
     pub(crate) last_error: Option<String>,
 }
 
+/// Browser daemon health summary shown in desktop quick facts.
 #[derive(Debug, Serialize)]
 pub(crate) struct BrowserStatusSnapshot {
     pub(crate) enabled: bool,
@@ -63,6 +73,7 @@ pub(crate) struct BrowserStatusSnapshot {
     pub(crate) last_error: Option<String>,
 }
 
+/// Desktop node host lifecycle summary shown in desktop quick facts.
 #[derive(Debug, Serialize)]
 pub(crate) struct NodeHostStatusSnapshot {
     pub(crate) installed: bool,
@@ -74,6 +85,7 @@ pub(crate) struct NodeHostStatusSnapshot {
     pub(crate) detail: String,
 }
 
+/// Source used to open the dashboard from the desktop UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum DashboardAccessMode {
@@ -90,6 +102,7 @@ impl DashboardAccessMode {
     }
 }
 
+/// Resolved dashboard URL and trust metadata.
 #[derive(Debug, Clone)]
 pub(crate) struct DashboardAccessTarget {
     pub(crate) url: String,
@@ -97,6 +110,7 @@ pub(crate) struct DashboardAccessTarget {
     pub(crate) remote_verification_mode: Option<String>,
 }
 
+/// Compact facts rendered in the desktop control-center header.
 #[derive(Debug, Serialize)]
 pub(crate) struct QuickFactsSnapshot {
     pub(crate) dashboard_url: String,
@@ -111,6 +125,7 @@ pub(crate) struct QuickFactsSnapshot {
     pub(crate) node_host: NodeHostStatusSnapshot,
 }
 
+/// Diagnostics payload normalized for desktop display.
 #[derive(Debug, Serialize)]
 pub(crate) struct DiagnosticsSnapshot {
     pub(crate) generated_at_unix_ms: Option<i64>,
@@ -120,6 +135,7 @@ pub(crate) struct DiagnosticsSnapshot {
     pub(crate) experiments: DesktopExperimentGovernanceSnapshot,
 }
 
+/// Desktop observability counters sourced from console diagnostics.
 #[derive(Debug, Serialize)]
 pub(crate) struct DesktopObservabilitySnapshot {
     pub(crate) provider_auth: DesktopProviderAuthObservability,
@@ -131,6 +147,7 @@ pub(crate) struct DesktopObservabilitySnapshot {
     pub(crate) recent_failure_count: usize,
 }
 
+/// Provider-auth observability counters.
 #[derive(Debug, Serialize)]
 pub(crate) struct DesktopProviderAuthObservability {
     pub(crate) state: String,
@@ -140,6 +157,7 @@ pub(crate) struct DesktopProviderAuthObservability {
     pub(crate) refresh_failures: u64,
 }
 
+/// Dashboard mutation observability counters.
 #[derive(Debug, Serialize)]
 pub(crate) struct DesktopDashboardMutationObservability {
     pub(crate) attempts: u64,
@@ -147,6 +165,7 @@ pub(crate) struct DesktopDashboardMutationObservability {
     pub(crate) failure_rate_bps: u32,
 }
 
+/// Connector observability counters.
 #[derive(Debug, Serialize)]
 pub(crate) struct DesktopConnectorObservability {
     pub(crate) queue_depth: u64,
@@ -156,6 +175,7 @@ pub(crate) struct DesktopConnectorObservability {
     pub(crate) upload_failure_rate_bps: u32,
 }
 
+/// Browser relay observability counters.
 #[derive(Debug, Serialize)]
 pub(crate) struct DesktopBrowserObservability {
     pub(crate) relay_attempts: u64,
@@ -163,6 +183,7 @@ pub(crate) struct DesktopBrowserObservability {
     pub(crate) relay_failure_rate_bps: u32,
 }
 
+/// Support-bundle observability counters.
 #[derive(Debug, Serialize)]
 pub(crate) struct DesktopSupportBundleObservability {
     pub(crate) attempts: u64,
@@ -171,6 +192,7 @@ pub(crate) struct DesktopSupportBundleObservability {
     pub(crate) success_rate_bps: u32,
 }
 
+/// Recent failure classes grouped for operator diagnostics.
 #[derive(Debug, Serialize)]
 pub(crate) struct DesktopFailureClassSummary {
     pub(crate) config_failure: u64,
@@ -178,6 +200,7 @@ pub(crate) struct DesktopFailureClassSummary {
     pub(crate) product_failure: u64,
 }
 
+/// Experiment governance posture shown in desktop diagnostics.
 #[derive(Debug, Serialize)]
 pub(crate) struct DesktopExperimentGovernanceSnapshot {
     pub(crate) structured_contract: String,
@@ -186,6 +209,7 @@ pub(crate) struct DesktopExperimentGovernanceSnapshot {
     pub(crate) native_canvas: DesktopExperimentTrackSnapshot,
 }
 
+/// One experiment track and its rollout guardrails.
 #[derive(Debug, Serialize)]
 pub(crate) struct DesktopExperimentTrackSnapshot {
     pub(crate) track_id: String,
@@ -200,6 +224,7 @@ pub(crate) struct DesktopExperimentTrackSnapshot {
     pub(crate) limits: DesktopExperimentLimitsSnapshot,
 }
 
+/// Resource limits for a desktop experiment track.
 #[derive(Debug, Serialize)]
 pub(crate) struct DesktopExperimentLimitsSnapshot {
     pub(crate) max_state_bytes: u64,
@@ -208,6 +233,7 @@ pub(crate) struct DesktopExperimentLimitsSnapshot {
     pub(crate) max_updates_per_minute: u64,
 }
 
+/// Rollup health state used by the desktop overview.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum OverallStatus {
@@ -216,6 +242,7 @@ pub(crate) enum OverallStatus {
     Down,
 }
 
+/// Full desktop control-center snapshot returned to the UI.
 #[derive(Debug, Serialize)]
 pub(crate) struct ControlCenterSnapshot {
     pub(crate) generated_at_unix_ms: i64,
@@ -229,18 +256,21 @@ pub(crate) struct ControlCenterSnapshot {
     pub(crate) warnings: Vec<String>,
 }
 
+/// Generic command outcome returned by mutating desktop commands.
 #[derive(Debug, Serialize)]
 pub(crate) struct ActionResult {
     pub(crate) ok: bool,
     pub(crate) message: String,
 }
 
+/// Support-bundle export result returned to the UI.
 #[derive(Debug, Serialize)]
 pub(crate) struct SupportBundleExportResult {
     pub(crate) output_path: String,
     pub(crate) command_output: String,
 }
 
+/// Inputs captured under the supervisor lock before async snapshot assembly.
 #[derive(Debug)]
 pub(crate) struct SnapshotBuildInputs {
     pub(crate) runtime: RuntimeConfig,
@@ -259,6 +289,7 @@ pub(crate) struct SnapshotBuildInputs {
     pub(crate) console_payload_cache: Arc<Mutex<ConsolePayloadCache>>,
 }
 
+/// Inputs required to invoke the CLI support-bundle export.
 #[derive(Debug, Clone)]
 pub(crate) struct SupportBundleExportPlan {
     pub(crate) runtime_root: PathBuf,
@@ -266,16 +297,19 @@ pub(crate) struct SupportBundleExportPlan {
     pub(crate) admin_token: String,
 }
 
+/// Persisted desktop settings surfaced to the UI.
 #[derive(Debug, Serialize)]
 pub(crate) struct DesktopSettingsSnapshot {
     pub(crate) browser_service_enabled: bool,
 }
 
 impl ControlCenter {
+    /// Returns persisted settings exposed to desktop preferences.
     pub(crate) fn settings_snapshot(&self) -> DesktopSettingsSnapshot {
         DesktopSettingsSnapshot { browser_service_enabled: self.persisted.browser_service_enabled }
     }
 
+    /// Captures all supervisor-owned state needed to assemble a snapshot.
     pub(crate) fn capture_snapshot_inputs(&mut self) -> SnapshotBuildInputs {
         self.refresh_runtime_state();
         SnapshotBuildInputs {
@@ -296,6 +330,7 @@ impl ControlCenter {
         }
     }
 
+    /// Captures support-bundle export inputs without holding the supervisor lock.
     pub(crate) fn prepare_support_bundle_export(&self) -> SupportBundleExportPlan {
         SupportBundleExportPlan {
             runtime_root: self.runtime_root.clone(),
@@ -305,6 +340,7 @@ impl ControlCenter {
     }
 }
 
+/// Builds a browser-service status summary from process and health data.
 pub(crate) fn build_browser_status(
     enabled: bool,
     running: bool,
@@ -341,6 +377,7 @@ pub(crate) fn build_browser_status(
     }
 }
 
+/// Parses the console Discord payload into the desktop quick-fact shape.
 pub(crate) fn parse_discord_status(payload: Option<&Value>) -> DiscordStatusSnapshot {
     let mut snapshot = DiscordStatusSnapshot {
         connector_id: "discord:default".to_owned(),
@@ -645,6 +682,7 @@ fn read_json_u32(record: Option<&serde_json::Map<String, Value>>, key: &str) -> 
         .unwrap_or_default()
 }
 
+/// Collects deduplicated, redacted operator-facing errors from diagnostics JSON.
 pub(crate) fn collect_redacted_errors(value: &Value, limit: usize) -> Vec<String> {
     let mut collected = Vec::new();
     collect_redacted_errors_inner(value, None, &mut collected);
@@ -662,6 +700,7 @@ pub(crate) fn collect_redacted_errors(value: &Value, limit: usize) -> Vec<String
     deduped
 }
 
+/// Recursively collects redacted error-like strings from diagnostics JSON.
 pub(crate) fn collect_redacted_errors_inner(
     value: &Value,
     key_context: Option<&str>,
@@ -678,17 +717,15 @@ pub(crate) fn collect_redacted_errors_inner(
                 collect_redacted_errors_inner(entry, key_context, out);
             }
         }
-        Value::String(raw) => {
-            if key_context.is_some_and(should_collect_operator_error_key) {
-                let sanitized = sanitize_log_line(raw.as_str());
-                if !sanitized.trim().is_empty()
-                    && !is_internal_operator_diagnostic_label(
-                        key_context.unwrap_or_default(),
-                        sanitized.as_str(),
-                    )
-                {
-                    out.push(sanitized);
-                }
+        Value::String(raw) if key_context.is_some_and(should_collect_operator_error_key) => {
+            let sanitized = sanitize_log_line(raw.as_str());
+            if !sanitized.trim().is_empty()
+                && !is_internal_operator_diagnostic_label(
+                    key_context.unwrap_or_default(),
+                    sanitized.as_str(),
+                )
+            {
+                out.push(sanitized);
             }
         }
         _ => {}
@@ -721,6 +758,7 @@ fn is_internal_operator_diagnostic_label(key: &str, value: &str) -> bool {
     )
 }
 
+/// Builds a full control-center snapshot from captured supervisor inputs.
 pub(crate) async fn build_snapshot_from_inputs(
     inputs: SnapshotBuildInputs,
 ) -> Result<ControlCenterSnapshot> {
@@ -1123,6 +1161,7 @@ fn cached_console_payload_for_kind_mut(
     }
 }
 
+/// Builds a loopback control-plane client for the supervised gateway.
 pub(crate) fn build_control_plane_client(
     http_client: Client,
     runtime: &RuntimeConfig,
@@ -1135,6 +1174,7 @@ pub(crate) fn build_control_plane_client(
         .map_err(|error| anyhow!("failed to build control-plane client: {error}"))
 }
 
+/// Ensures a console session and returns its CSRF token.
 pub(crate) async fn ensure_console_session_with_csrf(
     control_plane: &mut ControlPlaneClient,
     admin_token: &str,
@@ -1142,6 +1182,7 @@ pub(crate) async fn ensure_console_session_with_csrf(
     request_console_session(control_plane, admin_token).await.map(|session| session.csrf_token)
 }
 
+/// Ensures a console session using the shared cache when it is still valid.
 pub(crate) async fn ensure_console_session_with_cache(
     control_plane: &mut ControlPlaneClient,
     admin_token: &str,
@@ -1157,6 +1198,7 @@ pub(crate) async fn ensure_console_session_with_cache(
     Ok(session)
 }
 
+/// Ensures a console session using cache and returns its CSRF token.
 pub(crate) async fn ensure_console_session_with_cached_csrf(
     control_plane: &mut ControlPlaneClient,
     admin_token: &str,
@@ -1167,6 +1209,7 @@ pub(crate) async fn ensure_console_session_with_cached_csrf(
         .map(|session| session.csrf_token)
 }
 
+/// Requests or creates a console session for the desktop principal.
 pub(crate) async fn request_console_session(
     control_plane: &mut ControlPlaneClient,
     admin_token: &str,
@@ -1188,6 +1231,7 @@ pub(crate) async fn request_console_session(
     }
 }
 
+/// Converts a loopback dashboard URL into a redirect path.
 pub(crate) fn dashboard_redirect_path_from_url(dashboard_url: &str) -> Result<String> {
     let parsed = Url::parse(dashboard_url)
         .with_context(|| format!("failed to parse dashboard URL {dashboard_url}"))?;
@@ -1213,6 +1257,7 @@ pub(crate) fn dashboard_redirect_path_from_url(dashboard_url: &str) -> Result<St
     Ok(redirect_path)
 }
 
+/// Validates a local browser handoff URL against the dashboard origin.
 pub(crate) fn normalize_local_browser_handoff_url(
     dashboard_url: &str,
     handoff_url: &str,
@@ -1346,6 +1391,7 @@ fn load_cached_console_session(
     Some(session)
 }
 
+/// Runs the CLI support-bundle export in a sanitized desktop environment.
 pub(crate) async fn run_support_bundle_export(
     plan: SupportBundleExportPlan,
 ) -> Result<SupportBundleExportResult> {
@@ -1426,69 +1472,7 @@ fn support_bundle_inherited_env_keys() -> &'static [&'static str] {
     &["PATH", "PALYRA_CONFIG", "HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "TMPDIR"]
 }
 
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    use super::{
-        collect_redacted_errors, dashboard_redirect_path_from_url,
-        normalize_local_browser_handoff_url,
-    };
-
-    #[test]
-    fn collect_redacted_errors_ignores_internal_failure_class_labels() {
-        let payload = json!({
-            "observability": {
-                "failure_classes": {
-                    "recent_upload_failures_only": "recent_upload_failures_only"
-                },
-                "recent_failures": [
-                    {
-                        "failure_class": "config_failure",
-                        "message": "console session bootstrap failed: request failed with HTTP 429"
-                    },
-                    {
-                        "failure_class": "product_failure",
-                        "message": "failed to fetch Discord connector status"
-                    }
-                ]
-            }
-        });
-
-        let errors = collect_redacted_errors(&payload, 10);
-
-        assert!(
-            errors.iter().all(|entry| !entry.ends_with("_failure")),
-            "failure class labels should stay out of operator-facing diagnostics: {errors:?}"
-        );
-        assert!(
-            errors.iter().any(|entry| entry.contains("HTTP 429")),
-            "operator-facing diagnostics should retain actionable messages: {errors:?}"
-        );
-    }
-
-    #[test]
-    fn dashboard_redirect_path_from_url_preserves_hash_routes() {
-        let redirect_path =
-            dashboard_redirect_path_from_url("http://127.0.0.1:7142/#/control/overview")
-                .expect("loopback dashboard URL should produce redirect path");
-        assert_eq!(redirect_path, "/#/control/overview");
-    }
-
-    #[test]
-    fn normalize_local_browser_handoff_url_prefers_direct_consume_url() {
-        let handoff_url = normalize_local_browser_handoff_url(
-            "http://127.0.0.1:7142/#/control/overview",
-            "http://127.0.0.1:7142/console/v1/auth/browser-handoff/consume?token=test-token",
-        )
-        .expect("handoff URL should stay on the daemon consume endpoint");
-        assert_eq!(
-            handoff_url,
-            "http://127.0.0.1:7142/console/v1/auth/browser-handoff/consume?token=test-token"
-        );
-    }
-}
-
+/// Returns whether a diagnostics JSON key is likely to contain operator detail.
 pub(crate) fn is_error_like_key(key: &str) -> bool {
     let lowered = key.to_ascii_lowercase();
     ["error", "failure", "warning", "detail", "reason", "message"]
@@ -1496,12 +1480,14 @@ pub(crate) fn is_error_like_key(key: &str) -> bool {
         .any(|needle| lowered.contains(needle))
 }
 
+/// Redacts auth-sensitive text and inline URLs from one log line.
 pub(crate) fn sanitize_log_line(raw: &str) -> String {
     let mut line = redact_auth_error_strict(raw);
     line = redact_inline_urls(line.as_str());
     line.trim().to_owned()
 }
 
+/// Redacts URL tokens while preserving surrounding punctuation.
 pub(crate) fn redact_inline_urls(raw: &str) -> String {
     let mut tokens = Vec::new();
     for token in raw.split_whitespace() {
@@ -1511,6 +1497,7 @@ pub(crate) fn redact_inline_urls(raw: &str) -> String {
     tokens.join(" ")
 }
 
+/// Redacts one token when it contains a URL directly or behind key-value text.
 pub(crate) fn sanitize_token_with_url(token: &str) -> String {
     let trimmed = token.trim();
     if trimmed.is_empty() {
@@ -1558,6 +1545,7 @@ pub(crate) fn sanitize_token_with_url(token: &str) -> String {
     trimmed.to_owned()
 }
 
+/// Probes local dashboard reachability; remote access is trusted to config.
 pub(crate) async fn probe_dashboard_reachability(
     http_client: &Client,
     raw_url: &str,
@@ -1576,6 +1564,7 @@ pub(crate) async fn probe_dashboard_reachability(
     }
 }
 
+/// Constructs a loopback URL for a daemon endpoint path.
 pub(crate) fn loopback_url(port: u16, path: &str) -> Result<Url> {
     if !path.starts_with('/') {
         bail!("path must be absolute");
@@ -1584,6 +1573,7 @@ pub(crate) fn loopback_url(port: u16, path: &str) -> Result<Url> {
         .with_context(|| format!("failed to construct loopback URL for path '{path}'"))
 }
 
+/// Resolves the desktop dashboard access target from config or local defaults.
 pub(crate) fn resolve_dashboard_access_target(default_port: u16) -> Result<DashboardAccessTarget> {
     let Some(config_path) = resolve_dashboard_config_path()? else {
         return Ok(default_dashboard_access_target(default_port));
@@ -1657,6 +1647,7 @@ fn dashboard_remote_trust_state(target: &DashboardAccessTarget) -> &'static str 
     }
 }
 
+/// Finds the root config file used for dashboard access discovery.
 pub(crate) fn resolve_dashboard_config_path() -> Result<Option<PathBuf>> {
     if let Ok(explicit) = env::var("PALYRA_CONFIG") {
         let trimmed = explicit.trim();
@@ -1678,6 +1669,7 @@ pub(crate) fn resolve_dashboard_config_path() -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
+/// Loads and migrates the root config document used by desktop dashboard discovery.
 pub(crate) fn load_dashboard_root_file_config(path: &Path) -> Result<RootFileConfig> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read desktop dashboard config {}", path.display()))?;
@@ -1689,6 +1681,7 @@ pub(crate) fn load_dashboard_root_file_config(path: &Path) -> Result<RootFileCon
     toml::from_str(migrated.as_str()).context("desktop dashboard config does not match schema")
 }
 
+/// Validates and normalizes a remote dashboard base URL from config.
 pub(crate) fn parse_remote_dashboard_base_url(raw: &str, source_name: &str) -> Result<String> {
     let parsed =
         Url::parse(raw).with_context(|| format!("{source_name} must be a valid absolute URL"))?;
@@ -1707,6 +1700,7 @@ pub(crate) fn parse_remote_dashboard_base_url(raw: &str, source_name: &str) -> R
     Ok(parsed.to_string())
 }
 
+/// Normalizes wildcard dashboard binds to the loopback address displayed by UI.
 pub(crate) fn normalize_dashboard_socket(socket: SocketAddr) -> SocketAddr {
     if socket.ip().is_unspecified() {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), socket.port())
@@ -1715,10 +1709,12 @@ pub(crate) fn normalize_dashboard_socket(socket: SocketAddr) -> SocketAddr {
     }
 }
 
+/// Formats the dashboard URL including the default hash route.
 pub(crate) fn format_dashboard_url(socket: SocketAddr) -> String {
     format!("{DASHBOARD_SCHEME}://{socket}/{DEFAULT_DASHBOARD_HASH_ROUTE}")
 }
 
+/// Builds the local default dashboard access target.
 pub(crate) fn default_dashboard_access_target(default_port: u16) -> DashboardAccessTarget {
     DashboardAccessTarget {
         url: format!(
@@ -1726,5 +1722,68 @@ pub(crate) fn default_dashboard_access_target(default_port: u16) -> DashboardAcc
         ),
         mode: DashboardAccessMode::Local,
         remote_verification_mode: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{
+        collect_redacted_errors, dashboard_redirect_path_from_url,
+        normalize_local_browser_handoff_url,
+    };
+
+    #[test]
+    fn collect_redacted_errors_ignores_internal_failure_class_labels() {
+        let payload = json!({
+            "observability": {
+                "failure_classes": {
+                    "recent_upload_failures_only": "recent_upload_failures_only"
+                },
+                "recent_failures": [
+                    {
+                        "failure_class": "config_failure",
+                        "message": "console session bootstrap failed: request failed with HTTP 429"
+                    },
+                    {
+                        "failure_class": "product_failure",
+                        "message": "failed to fetch Discord connector status"
+                    }
+                ]
+            }
+        });
+
+        let errors = collect_redacted_errors(&payload, 10);
+
+        assert!(
+            errors.iter().all(|entry| !entry.ends_with("_failure")),
+            "failure class labels should stay out of operator-facing diagnostics: {errors:?}"
+        );
+        assert!(
+            errors.iter().any(|entry| entry.contains("HTTP 429")),
+            "operator-facing diagnostics should retain actionable messages: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn dashboard_redirect_path_from_url_preserves_hash_routes() {
+        let redirect_path =
+            dashboard_redirect_path_from_url("http://127.0.0.1:7142/#/control/overview")
+                .expect("loopback dashboard URL should produce redirect path");
+        assert_eq!(redirect_path, "/#/control/overview");
+    }
+
+    #[test]
+    fn normalize_local_browser_handoff_url_prefers_direct_consume_url() {
+        let handoff_url = normalize_local_browser_handoff_url(
+            "http://127.0.0.1:7142/#/control/overview",
+            "http://127.0.0.1:7142/console/v1/auth/browser-handoff/consume?token=test-token",
+        )
+        .expect("handoff URL should stay on the daemon consume endpoint");
+        assert_eq!(
+            handoff_url,
+            "http://127.0.0.1:7142/console/v1/auth/browser-handoff/consume?token=test-token"
+        );
     }
 }

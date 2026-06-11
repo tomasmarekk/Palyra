@@ -1,3 +1,9 @@
+//! Tauri command adapters for the desktop control center.
+//!
+//! Commands in this module should stay thin: capture state, delegate to the
+//! supervisor or control-plane helper, sanitize errors, and return UI-facing
+//! envelopes without owning business logic.
+
 use std::{path::Path, process::Stdio, sync::Arc, time::Duration};
 
 use anyhow::{anyhow, Context, Result};
@@ -16,16 +22,14 @@ use super::ambient::{
 use super::companion::{
     build_companion_handoff_url, build_companion_snapshot, decide_companion_approval,
     emit_companion_ux_event, fetch_companion_transcript, resolve_companion_chat_session,
-    send_companion_chat_message, transcribe_companion_audio, DesktopCompanionAudioTranscriptionRequest,
-    DesktopCompanionAudioTranscriptionResult,
-    DesktopCompanionAmbientRequest,
-    DesktopCompanionApprovalDecisionRequest, DesktopCompanionNotificationsRequest,
+    send_companion_chat_message, transcribe_companion_audio, DesktopCompanionAmbientRequest,
+    DesktopCompanionApprovalDecisionRequest, DesktopCompanionAudioTranscriptionRequest,
+    DesktopCompanionAudioTranscriptionResult, DesktopCompanionNotificationsRequest,
     DesktopCompanionOpenDashboardRequest, DesktopCompanionPreferencesRequest,
     DesktopCompanionResolveSessionRequest, DesktopCompanionRolloutRequest,
     DesktopCompanionSendMessageRequest, DesktopCompanionSendMessageResult,
     DesktopCompanionSnapshot, DesktopCompanionSwitchProfileRequest, DesktopCompanionUxEventRequest,
-    DesktopCompanionVoiceStateRequest,
-    DesktopSessionTranscriptEnvelope,
+    DesktopCompanionVoiceStateRequest, DesktopSessionTranscriptEnvelope,
 };
 use super::features::onboarding::connectors::discord::{
     apply_discord_onboarding, run_discord_onboarding_preflight, verify_discord_connector,
@@ -47,10 +51,11 @@ use super::snapshot::{
     ControlCenterSnapshot, DesktopSettingsSnapshot, SupportBundleExportResult,
 };
 use super::{
-    build_onboarding_status, ControlCenter, DesktopOnboardingStep, DiscordOnboardingRequest,
-    DesktopCompanionSurfaceMode, CONSOLE_PRINCIPAL, SUPERVISOR_TICK_MS,
+    build_onboarding_status, ControlCenter, DesktopCompanionSurfaceMode, DesktopOnboardingStep,
+    DiscordOnboardingRequest, CONSOLE_PRINCIPAL, SUPERVISOR_TICK_MS,
 };
 
+/// Request body for selecting or confirming the runtime state root.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OnboardingStateRootRequest {
@@ -68,10 +73,12 @@ struct DesktopNodeLifecyclePayload {
     detail: String,
 }
 
+/// Shared Tauri state containing the supervised control center.
 pub(crate) struct DesktopAppState {
     pub(crate) supervisor: Arc<Mutex<ControlCenter>>,
 }
 
+/// Request body for showing or hiding one companion surface.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DesktopCompanionSurfaceRequest {
@@ -79,6 +86,7 @@ pub(crate) struct DesktopCompanionSurfaceRequest {
     surface: Option<DesktopCompanionSurfaceMode>,
 }
 
+/// Returns the current control-center snapshot.
 #[tauri::command]
 pub(crate) async fn get_snapshot(
     state: State<'_, DesktopAppState>,
@@ -90,12 +98,14 @@ pub(crate) async fn get_snapshot(
     build_snapshot_from_inputs(snapshot_inputs).await.map_err(command_error)
 }
 
+/// Shows the main desktop companion window.
 #[tauri::command]
 pub(crate) fn show_main_window(app: AppHandle) -> Result<(), String> {
     show_surface(&app, DesktopCompanionSurfaceMode::Main).map_err(command_error)?;
     Ok(())
 }
 
+/// Returns desktop settings derived from supervisor state.
 #[tauri::command]
 pub(crate) async fn get_settings(
     state: State<'_, DesktopAppState>,
@@ -104,6 +114,7 @@ pub(crate) async fn get_settings(
     Ok(supervisor.settings_snapshot())
 }
 
+/// Returns onboarding status and marks completion when the flow is done.
 #[tauri::command]
 pub(crate) async fn get_onboarding_status(
     state: State<'_, DesktopAppState>,
@@ -116,6 +127,7 @@ pub(crate) async fn get_onboarding_status(
     finalize_onboarding_status(state, status.map_err(command_error)?).await
 }
 
+/// Returns the full desktop refresh payload used by onboarding-aware screens.
 #[tauri::command]
 pub(crate) async fn get_desktop_refresh_payload(
     state: State<'_, DesktopAppState>,
@@ -129,6 +141,7 @@ pub(crate) async fn get_desktop_refresh_payload(
     Ok(DesktopRefreshPayload { onboarding_status, ..payload })
 }
 
+/// Returns the full desktop companion snapshot and synchronizes ambient state.
 #[tauri::command]
 pub(crate) async fn get_desktop_companion_snapshot(
     app: AppHandle,
@@ -148,6 +161,7 @@ pub(crate) async fn get_desktop_companion_snapshot(
     Ok(snapshot)
 }
 
+/// Acknowledges the onboarding welcome step.
 #[tauri::command]
 pub(crate) async fn acknowledge_onboarding_welcome(
     state: State<'_, DesktopAppState>,
@@ -157,6 +171,7 @@ pub(crate) async fn acknowledge_onboarding_welcome(
     Ok(ActionResult { ok: true, message: "desktop onboarding welcome acknowledged".to_owned() })
 }
 
+/// Updates the runtime state-root override used by desktop-managed services.
 #[tauri::command]
 pub(crate) async fn set_onboarding_state_root_command(
     state: State<'_, DesktopAppState>,
@@ -176,6 +191,7 @@ pub(crate) async fn set_onboarding_state_root_command(
     })
 }
 
+/// Enables or disables the browser sidecar service in persisted state.
 #[tauri::command]
 pub(crate) async fn set_browser_service_enabled(
     state: State<'_, DesktopAppState>,
@@ -187,6 +203,7 @@ pub(crate) async fn set_browser_service_enabled(
     Ok(ActionResult { ok: true, message: message.to_owned() })
 }
 
+/// Updates companion navigation preferences.
 #[tauri::command]
 pub(crate) async fn update_desktop_companion_preferences(
     state: State<'_, DesktopAppState>,
@@ -197,6 +214,7 @@ pub(crate) async fn update_desktop_companion_preferences(
     Ok(ActionResult { ok: true, message: "desktop companion preferences updated".to_owned() })
 }
 
+/// Updates companion rollout flags and synchronizes ambient runtime state.
 #[tauri::command]
 pub(crate) async fn update_desktop_companion_rollout(
     app: AppHandle,
@@ -213,6 +231,7 @@ pub(crate) async fn update_desktop_companion_rollout(
     Ok(ActionResult { ok: true, message: "desktop companion rollout updated".to_owned() })
 }
 
+/// Updates ambient companion settings and synchronizes tray/shortcut state.
 #[tauri::command]
 pub(crate) async fn update_desktop_companion_ambient(
     app: AppHandle,
@@ -229,6 +248,7 @@ pub(crate) async fn update_desktop_companion_ambient(
     Ok(ActionResult { ok: true, message: "desktop companion ambient settings updated".to_owned() })
 }
 
+/// Updates companion voice state and synchronizes ambient runtime state.
 #[tauri::command]
 pub(crate) async fn update_desktop_companion_voice_state(
     app: AppHandle,
@@ -245,6 +265,7 @@ pub(crate) async fn update_desktop_companion_voice_state(
     Ok(ActionResult { ok: true, message: "desktop companion voice state updated".to_owned() })
 }
 
+/// Shows the requested companion surface.
 #[tauri::command]
 pub(crate) async fn show_desktop_companion_window(
     app: AppHandle,
@@ -265,6 +286,7 @@ pub(crate) async fn show_desktop_companion_window(
     })
 }
 
+/// Hides one companion surface or all companion surfaces.
 #[tauri::command]
 pub(crate) async fn hide_desktop_companion_window(
     app: AppHandle,
@@ -274,6 +296,7 @@ pub(crate) async fn hide_desktop_companion_window(
     Ok(ActionResult { ok: true, message: "desktop companion window hidden".to_owned() })
 }
 
+/// Switches the active desktop profile.
 #[tauri::command]
 pub(crate) async fn switch_desktop_companion_profile(
     state: State<'_, DesktopAppState>,
@@ -286,6 +309,7 @@ pub(crate) async fn switch_desktop_companion_profile(
     Ok(ActionResult { ok: true, message })
 }
 
+/// Marks selected companion notifications as read.
 #[tauri::command]
 pub(crate) async fn mark_desktop_companion_notifications_read(
     state: State<'_, DesktopAppState>,
@@ -296,6 +320,7 @@ pub(crate) async fn mark_desktop_companion_notifications_read(
     Ok(ActionResult { ok: true, message: "desktop companion notifications updated".to_owned() })
 }
 
+/// Removes one queued companion offline draft.
 #[tauri::command]
 pub(crate) async fn remove_desktop_companion_offline_draft(
     state: State<'_, DesktopAppState>,
@@ -306,6 +331,7 @@ pub(crate) async fn remove_desktop_companion_offline_draft(
     Ok(ActionResult { ok: true, message: "desktop companion offline draft removed".to_owned() })
 }
 
+/// Starts desktop-managed Palyra services.
 #[tauri::command]
 pub(crate) async fn start_palyra(
     state: State<'_, DesktopAppState>,
@@ -320,6 +346,7 @@ pub(crate) async fn start_palyra(
     Ok(ActionResult { ok: true, message: "start requested".to_owned() })
 }
 
+/// Stops desktop-managed Palyra services.
 #[tauri::command]
 pub(crate) async fn stop_palyra(state: State<'_, DesktopAppState>) -> Result<ActionResult, String> {
     let mut supervisor = state.supervisor.lock().await;
@@ -331,6 +358,7 @@ pub(crate) async fn stop_palyra(state: State<'_, DesktopAppState>) -> Result<Act
     Ok(ActionResult { ok: true, message: "stop requested".to_owned() })
 }
 
+/// Restarts desktop-managed Palyra services.
 #[tauri::command]
 pub(crate) async fn restart_palyra(
     state: State<'_, DesktopAppState>,
@@ -345,6 +373,7 @@ pub(crate) async fn restart_palyra(
     Ok(ActionResult { ok: true, message: "restart requested".to_owned() })
 }
 
+/// Enrolls the desktop node host.
 #[tauri::command]
 pub(crate) async fn enroll_desktop_node(
     state: State<'_, DesktopAppState>,
@@ -352,6 +381,7 @@ pub(crate) async fn enroll_desktop_node(
     run_desktop_node_enrollment(state, false).await
 }
 
+/// Repairs desktop node host enrollment.
 #[tauri::command]
 pub(crate) async fn repair_desktop_node(
     state: State<'_, DesktopAppState>,
@@ -359,6 +389,7 @@ pub(crate) async fn repair_desktop_node(
     run_desktop_node_enrollment(state, true).await
 }
 
+/// Resets desktop node host enrollment state.
 #[tauri::command]
 pub(crate) async fn reset_desktop_node(
     state: State<'_, DesktopAppState>,
@@ -368,9 +399,10 @@ pub(crate) async fn reset_desktop_node(
         supervisor.stop_node_host();
         supervisor.runtime_root.clone()
     };
-    let lifecycle = run_palyra_json_command(runtime_root.as_path(), &["node", "uninstall", "--json"])
-        .await
-        .map_err(command_error)?;
+    let lifecycle =
+        run_palyra_json_command(runtime_root.as_path(), &["node", "uninstall", "--json"])
+            .await
+            .map_err(command_error)?;
     let detail = lifecycle
         .get("detail")
         .and_then(serde_json::Value::as_str)
@@ -383,6 +415,7 @@ pub(crate) async fn reset_desktop_node(
     Ok(ActionResult { ok: true, message: sanitize_log_line(detail) })
 }
 
+/// Opens the dashboard, bootstrapping browser handoff for local access.
 #[tauri::command]
 pub(crate) async fn open_dashboard(
     state: State<'_, DesktopAppState>,
@@ -422,6 +455,7 @@ pub(crate) async fn open_dashboard(
     Ok(ActionResult { ok: true, message: format!("opened {url}") })
 }
 
+/// Opens a dashboard handoff URL scoped to companion context.
 #[tauri::command]
 pub(crate) async fn open_desktop_companion_handoff(
     state: State<'_, DesktopAppState>,
@@ -433,15 +467,17 @@ pub(crate) async fn open_desktop_companion_handoff(
     };
     let control_center_snapshot =
         build_companion_snapshot(companion_inputs).await.map_err(command_error)?.control_center;
-    let handoff_url = build_companion_handoff_url(dashboard_inputs, &control_center_snapshot, &payload)
-    .await
-    .map_err(command_error)?;
+    let handoff_url =
+        build_companion_handoff_url(dashboard_inputs, &control_center_snapshot, &payload)
+            .await
+            .map_err(command_error)?;
     let mut supervisor = state.supervisor.lock().await;
     let opened = supervisor.open_dashboard(handoff_url.as_str()).map_err(command_error)?;
     let _ = supervisor.mark_dashboard_handoff_complete();
     Ok(ActionResult { ok: true, message: format!("opened {opened}") })
 }
 
+/// Emits companion UX telemetry through the console API.
 #[tauri::command]
 pub(crate) async fn emit_desktop_companion_ux_event(
     state: State<'_, DesktopAppState>,
@@ -451,12 +487,11 @@ pub(crate) async fn emit_desktop_companion_ux_event(
         let mut supervisor = state.supervisor.lock().await;
         supervisor.capture_companion_inputs()
     };
-    emit_companion_ux_event(&companion_inputs, &payload)
-        .await
-        .map_err(command_error)?;
+    emit_companion_ux_event(&companion_inputs, &payload).await.map_err(command_error)?;
     Ok(ActionResult { ok: true, message: format!("recorded {}", payload.name) })
 }
 
+/// Exports a support bundle through the CLI helper path.
 #[tauri::command]
 pub(crate) async fn export_support_bundle(
     state: State<'_, DesktopAppState>,
@@ -485,6 +520,7 @@ pub(crate) async fn export_support_bundle(
     }
 }
 
+/// Resolves or creates the active companion chat session.
 #[tauri::command]
 pub(crate) async fn resolve_desktop_companion_chat_session(
     state: State<'_, DesktopAppState>,
@@ -511,6 +547,7 @@ pub(crate) async fn resolve_desktop_companion_chat_session(
     serde_json::to_value(session).map_err(command_error)
 }
 
+/// Returns the transcript envelope for a companion chat session.
 #[tauri::command]
 pub(crate) async fn get_desktop_companion_session_transcript(
     state: State<'_, DesktopAppState>,
@@ -525,6 +562,7 @@ pub(crate) async fn get_desktop_companion_session_transcript(
         .map_err(command_error)
 }
 
+/// Sends a companion chat message, queueing it offline when configured.
 #[tauri::command]
 pub(crate) async fn send_desktop_companion_chat_message(
     state: State<'_, DesktopAppState>,
@@ -587,6 +625,7 @@ pub(crate) async fn send_desktop_companion_chat_message(
     }
 }
 
+/// Uploads companion audio and returns a transcript artifact.
 #[tauri::command]
 pub(crate) async fn transcribe_desktop_companion_audio(
     state: State<'_, DesktopAppState>,
@@ -612,6 +651,7 @@ pub(crate) async fn transcribe_desktop_companion_audio(
         .map_err(command_error)
 }
 
+/// Applies a companion-visible approval decision.
 #[tauri::command]
 pub(crate) async fn decide_desktop_companion_approval(
     state: State<'_, DesktopAppState>,
@@ -628,6 +668,7 @@ pub(crate) async fn decide_desktop_companion_approval(
     Ok(response)
 }
 
+/// Returns OpenAI provider-auth status for the desktop UI.
 #[tauri::command]
 pub(crate) async fn get_openai_auth_status(
     state: State<'_, DesktopAppState>,
@@ -639,6 +680,7 @@ pub(crate) async fn get_openai_auth_status(
     }
 }
 
+/// Connects or rotates an OpenAI API-key profile.
 #[tauri::command]
 pub(crate) async fn connect_openai_api_key_command(
     state: State<'_, DesktopAppState>,
@@ -662,6 +704,7 @@ pub(crate) async fn connect_openai_api_key_command(
     Ok(result)
 }
 
+/// Starts an OpenAI OAuth bootstrap flow.
 #[tauri::command]
 pub(crate) async fn start_openai_oauth_bootstrap_command(
     state: State<'_, DesktopAppState>,
@@ -687,6 +730,7 @@ pub(crate) async fn start_openai_oauth_bootstrap_command(
     open_browser_result(result)
 }
 
+/// Returns state for an OpenAI OAuth callback attempt.
 #[tauri::command]
 pub(crate) async fn get_openai_oauth_callback_state_command(
     state: State<'_, DesktopAppState>,
@@ -717,6 +761,7 @@ pub(crate) async fn get_openai_oauth_callback_state_command(
     Ok(response)
 }
 
+/// Starts OpenAI OAuth reconnect for an existing profile.
 #[tauri::command]
 pub(crate) async fn reconnect_openai_oauth_command(
     state: State<'_, DesktopAppState>,
@@ -744,6 +789,7 @@ pub(crate) async fn reconnect_openai_oauth_command(
     open_browser_result(result)
 }
 
+/// Refreshes one OpenAI auth profile.
 #[tauri::command]
 pub(crate) async fn refresh_openai_profile_command(
     state: State<'_, DesktopAppState>,
@@ -753,6 +799,7 @@ pub(crate) async fn refresh_openai_profile_command(
     refresh_openai_profile(inputs, payload).await.map_err(command_error)
 }
 
+/// Revokes one OpenAI auth profile.
 #[tauri::command]
 pub(crate) async fn revoke_openai_profile_command(
     state: State<'_, DesktopAppState>,
@@ -762,6 +809,7 @@ pub(crate) async fn revoke_openai_profile_command(
     revoke_openai_profile(inputs, payload).await.map_err(command_error)
 }
 
+/// Sets one OpenAI profile as default.
 #[tauri::command]
 pub(crate) async fn set_openai_default_profile_command(
     state: State<'_, DesktopAppState>,
@@ -771,6 +819,7 @@ pub(crate) async fn set_openai_default_profile_command(
     set_openai_default_profile(inputs, payload).await.map_err(command_error)
 }
 
+/// Runs Discord onboarding preflight.
 #[tauri::command]
 pub(crate) async fn run_discord_onboarding_preflight_command(
     state: State<'_, DesktopAppState>,
@@ -794,6 +843,7 @@ pub(crate) async fn run_discord_onboarding_preflight_command(
     Ok(response)
 }
 
+/// Applies Discord onboarding configuration.
 #[tauri::command]
 pub(crate) async fn apply_discord_onboarding_command(
     state: State<'_, DesktopAppState>,
@@ -817,6 +867,7 @@ pub(crate) async fn apply_discord_onboarding_command(
     Ok(response)
 }
 
+/// Sends a Discord connector verification test.
 #[tauri::command]
 pub(crate) async fn verify_discord_connector_command(
     state: State<'_, DesktopAppState>,
@@ -841,12 +892,14 @@ pub(crate) async fn verify_discord_connector_command(
     Ok(response)
 }
 
+/// Opens a validated external URL in the system browser.
 #[tauri::command]
 pub(crate) async fn open_external_url_command(url: String) -> Result<ActionResult, String> {
     open_external_browser(url.as_str(), webbrowser::open).map_err(command_error)?;
     Ok(ActionResult { ok: true, message: "opened browser handoff".to_owned() })
 }
 
+/// Polls supervised service state on the configured interval.
 pub(crate) async fn supervisor_loop(supervisor: Arc<Mutex<ControlCenter>>) {
     loop {
         {
@@ -857,21 +910,25 @@ pub(crate) async fn supervisor_loop(supervisor: Arc<Mutex<ControlCenter>>) {
     }
 }
 
+/// Formats a startup error for the desktop UI.
 pub(crate) fn format_control_center_init_error(error: &anyhow::Error) -> String {
     format!("desktop initialization failed: {}", sanitize_log_line(error.to_string().as_str()))
 }
 
+/// Initializes the control center and converts initialization errors to UI text.
 pub(crate) fn initialize_control_center(
     init: impl FnOnce() -> Result<ControlCenter>,
 ) -> std::result::Result<ControlCenter, String> {
     init().map_err(|error| format_control_center_init_error(&error))
 }
 
+/// Starts services and refreshes state during app launch.
 pub(crate) fn prepare_control_center_for_launch(control_center: &mut ControlCenter) {
     control_center.start_all();
     control_center.refresh_runtime_state();
 }
 
+/// Sanitizes an error for returning across the Tauri command boundary.
 pub(crate) fn command_error(error: impl ToString) -> String {
     sanitize_log_line(error.to_string().as_str())
 }
@@ -936,12 +993,10 @@ async fn run_desktop_node_enrollment(
         return Err("desktop node enrollment requires the local gateway to be running".to_owned());
     }
 
-    let status = read_desktop_node_lifecycle(runtime_root.as_path()).await.map_err(command_error)?;
+    let status =
+        read_desktop_node_lifecycle(runtime_root.as_path()).await.map_err(command_error)?;
     if status.installed && !repair {
-        return Ok(ActionResult {
-            ok: true,
-            message: sanitize_log_line(status.detail.as_str()),
-        });
+        return Ok(ActionResult { ok: true, message: sanitize_log_line(status.detail.as_str()) });
     }
 
     let device_id = status.device_id.unwrap_or_else(|| Ulid::new().to_string());
@@ -963,7 +1018,9 @@ async fn run_desktop_node_enrollment(
             ttl_ms: Some(10 * 60 * 1_000),
         })
         .await
-        .map_err(|error| command_error(anyhow!("failed to mint desktop node pairing code: {error}")))?
+        .map_err(|error| {
+            command_error(anyhow!("failed to mint desktop node pairing code: {error}"))
+        })?
         .code;
     let grpc_url = format!("https://127.0.0.1:{}", runtime.gateway_grpc_port.saturating_add(1));
     let runtime_root_for_install = runtime_root.clone();
@@ -1057,11 +1114,10 @@ async fn wait_for_pending_node_pairing_request(
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    Err(anyhow!(
-        "timed out waiting for desktop node pairing request for device {device_id}"
-    ))
+    Err(anyhow!("timed out waiting for desktop node pairing request for device {device_id}"))
 }
 
+/// Selects the one safe pending desktop-node pairing request to approve.
 pub(crate) fn select_desktop_node_pairing_request_id(
     requests: Vec<control_plane::NodePairingRequestView>,
     device_id: &str,
@@ -1134,33 +1190,30 @@ async fn run_palyra_json_command_owned_with_stdin(
             let mut child_stdin = child.stdin.take().ok_or_else(|| {
                 anyhow!("desktop CLI command `{command_display}` did not expose stdin")
             })?;
-            child_stdin
-                .write_all(payload.as_bytes())
-                .await
-                .with_context(|| {
-                    format!("failed to write desktop CLI command stdin for `{command_display}`")
-                })?;
+            child_stdin.write_all(payload.as_bytes()).await.with_context(|| {
+                format!("failed to write desktop CLI command stdin for `{command_display}`")
+            })?;
             drop(child_stdin);
             child.wait_with_output().await.with_context(|| {
                 format!("failed to wait for desktop CLI command `{command_display}`")
             })?
         }
-        None => command.output().await.with_context(|| {
-            format!("failed to run desktop CLI command `{command_display}`")
-        })?,
+        None => command
+            .output()
+            .await
+            .with_context(|| format!("failed to run desktop CLI command `{command_display}`"))?,
     };
     let stdout = String::from_utf8_lossy(output.stdout.as_slice()).to_string();
     let stderr = sanitize_log_line(String::from_utf8_lossy(output.stderr.as_slice()).as_ref());
     if !output.status.success() {
-        return Err(anyhow!(
-            "desktop CLI command `{command_display}` failed: {stderr}",
-        ));
+        return Err(anyhow!("desktop CLI command `{command_display}` failed: {stderr}",));
     }
     serde_json::from_str(stdout.as_str()).with_context(|| {
         format!("failed to decode desktop CLI JSON output for `{command_display}`")
     })
 }
 
+/// Formats a desktop CLI command for error messages with secret arguments redacted.
 pub(crate) fn desktop_cli_command_for_error(args: &[String]) -> String {
     let mut redact_next = false;
     args.iter()
@@ -1197,6 +1250,7 @@ fn is_desktop_cli_secret_arg_name(arg: &str) -> bool {
     )
 }
 
+/// Starts the Tauri desktop control-center runtime.
 pub(crate) fn run() {
     let mut control_center = match initialize_control_center(|| {
         super::bootstrap_portable_install_environment()?;
@@ -1225,7 +1279,8 @@ pub(crate) fn run() {
         })
         .manage(DesktopAppState { supervisor: Arc::new(Mutex::new(control_center)) })
         .setup(|app| {
-            setup_ambient_runtime(app).map_err(|error| anyhow!(format_control_center_init_error(&error)))?;
+            setup_ambient_runtime(app)
+                .map_err(|error| anyhow!(format_control_center_init_error(&error)))?;
             let companion = {
                 let state = app.state::<DesktopAppState>();
                 let supervisor = state.supervisor.blocking_lock();
@@ -1235,10 +1290,9 @@ pub(crate) fn run() {
                 Ok(outcome) => {
                     let state = app.state::<DesktopAppState>();
                     let mut supervisor = state.supervisor.blocking_lock();
-                    supervisor
-                        .persisted
-                        .active_companion_mut()
-                        .set_hotkey_registration_error(outcome.hotkey_registration_error.as_deref());
+                    supervisor.persisted.active_companion_mut().set_hotkey_registration_error(
+                        outcome.hotkey_registration_error.as_deref(),
+                    );
                     let _ = supervisor.save_state_file();
                 }
                 Err(error) => {

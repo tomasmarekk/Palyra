@@ -1,3 +1,10 @@
+//! Persisted desktop control-center state and local secret bootstrap.
+//!
+//! The desktop app keeps UI rollout, onboarding, profile selection, and
+//! runtime-root preferences in a JSON state file. Runtime credentials are
+//! hydrated through the vault so serialized state can be inspected and migrated
+//! without exposing tokens.
+
 use std::{
     collections::BTreeMap,
     fs,
@@ -27,9 +34,11 @@ const DESKTOP_RECENT_PROFILE_LIMIT: usize = 6;
 const DESKTOP_INSTALL_METADATA_FILE_NAME: &str = "install-metadata.json";
 pub(crate) const IMPLICIT_DESKTOP_PROFILE_NAME: &str = "desktop-local";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Top-level companion section selected in the desktop shell.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum DesktopCompanionSection {
+    #[default]
     Home,
     Chat,
     Approvals,
@@ -37,26 +46,17 @@ pub(crate) enum DesktopCompanionSection {
     Onboarding,
 }
 
-impl Default for DesktopCompanionSection {
-    fn default() -> Self {
-        Self::Home
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Desktop companion surface that should be shown or remembered.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum DesktopCompanionSurfaceMode {
+    #[default]
     Main,
     QuickPanel,
     VoiceOverlay,
 }
 
-impl Default for DesktopCompanionSurfaceMode {
-    fn default() -> Self {
-        Self::Main
-    }
-}
-
+/// Notification category used for companion badge and list grouping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum DesktopCompanionNotificationKind {
@@ -67,6 +67,7 @@ pub(crate) enum DesktopCompanionNotificationKind {
     Trust,
 }
 
+/// Persisted desktop notification entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DesktopCompanionNotification {
     pub(crate) notification_id: String,
@@ -77,6 +78,7 @@ pub(crate) struct DesktopCompanionNotification {
     pub(crate) read: bool,
 }
 
+/// Offline chat draft queued until the companion can reach the console.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DesktopCompanionOfflineDraft {
     pub(crate) draft_id: String,
@@ -86,9 +88,11 @@ pub(crate) struct DesktopCompanionOfflineDraft {
     pub(crate) created_at_unix_ms: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Voice capture lifecycle state for the companion overlay.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum DesktopVoiceLifecycleState {
+    #[default]
     Idle,
     Recording,
     Transcribing,
@@ -99,12 +103,7 @@ pub(crate) enum DesktopVoiceLifecycleState {
     Cancelled,
 }
 
-impl Default for DesktopVoiceLifecycleState {
-    fn default() -> Self {
-        Self::Idle
-    }
-}
-
+/// Persisted audit record for voice capture and playback decisions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DesktopCompanionVoiceAuditEntry {
     pub(crate) audit_id: String,
@@ -118,6 +117,7 @@ pub(crate) struct DesktopCompanionVoiceAuditEntry {
     pub(crate) output_voice_label: Option<String>,
 }
 
+/// Ambient companion shell settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct DesktopCompanionAmbientState {
@@ -140,6 +140,7 @@ impl Default for DesktopCompanionAmbientState {
     }
 }
 
+/// Persisted voice settings and pending voice draft state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct DesktopCompanionVoiceState {
@@ -190,6 +191,7 @@ impl Default for DesktopCompanionVoiceState {
     }
 }
 
+/// Feature rollout flags persisted for the desktop companion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct DesktopCompanionRolloutState {
@@ -220,6 +222,7 @@ impl Default for DesktopCompanionRolloutState {
     }
 }
 
+/// Per-profile companion UI state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct DesktopCompanionState {
@@ -257,45 +260,55 @@ impl Default for DesktopCompanionState {
 }
 
 impl DesktopCompanionState {
+    /// Selects the current companion section.
     pub(crate) fn set_active_section(&mut self, next: DesktopCompanionSection) {
         self.active_section = next;
     }
 
+    /// Stores a normalized active chat session id.
     pub(crate) fn set_active_session_id(&mut self, next: Option<&str>) {
         self.active_session_id = next.and_then(normalize_optional_text).map(str::to_owned);
     }
 
+    /// Stores a normalized active device id.
     pub(crate) fn set_active_device_id(&mut self, next: Option<&str>) {
         self.active_device_id = next.and_then(normalize_optional_text).map(str::to_owned);
     }
 
+    /// Stores a normalized last run id.
     pub(crate) fn set_last_run_id(&mut self, next: Option<&str>) {
         self.last_run_id = next.and_then(normalize_optional_text).map(str::to_owned);
     }
 
+    /// Remembers the most recently used companion surface.
     pub(crate) fn set_last_surface(&mut self, next: DesktopCompanionSurfaceMode) {
         self.ambient.last_surface = next;
     }
 
+    /// Updates the global hotkey when the provided value is non-empty.
     pub(crate) fn set_global_hotkey(&mut self, next: Option<&str>) {
         if let Some(value) = next.and_then(normalize_optional_text) {
             self.ambient.global_hotkey = value.to_owned();
         }
     }
 
+    /// Replaces the hotkey registration error shown by the UI.
     pub(crate) fn set_hotkey_registration_error(&mut self, next: Option<&str>) {
         self.ambient.hotkey_registration_error =
             next.and_then(normalize_optional_text).map(str::to_owned);
     }
 
+    /// Records that voice capture consent was granted.
     pub(crate) fn grant_voice_capture_consent(&mut self, granted_at_unix_ms: i64) {
         self.voice.capture_consent_granted_at_unix_ms = Some(granted_at_unix_ms);
     }
 
+    /// Records that text-to-speech consent was granted.
     pub(crate) fn grant_tts_consent(&mut self, granted_at_unix_ms: i64) {
         self.voice.tts_consent_granted_at_unix_ms = Some(granted_at_unix_ms);
     }
 
+    /// Clears the transient voice draft and returns the voice flow to idle.
     pub(crate) fn clear_voice_draft(&mut self) {
         self.voice.draft_session_id = None;
         self.voice.draft_text = None;
@@ -306,6 +319,11 @@ impl DesktopCompanionState {
         self.voice.lifecycle_state = DesktopVoiceLifecycleState::Idle;
     }
 
+    /// Appends a bounded voice audit entry.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "voice audit records intentionally mirror the persisted audit fields"
+    )]
     pub(crate) fn push_voice_audit(
         &mut self,
         kind: impl Into<String>,
@@ -339,6 +357,7 @@ impl DesktopCompanionState {
         }
     }
 
+    /// Appends a bounded desktop companion notification.
     pub(crate) fn push_notification(
         &mut self,
         kind: DesktopCompanionNotificationKind,
@@ -361,6 +380,7 @@ impl DesktopCompanionState {
         }
     }
 
+    /// Marks either all notifications or the selected notification ids as read.
     pub(crate) fn mark_notifications_read(&mut self, ids: Option<&[String]>) {
         for notification in &mut self.notifications {
             let should_mark = match ids {
@@ -375,6 +395,7 @@ impl DesktopCompanionState {
         }
     }
 
+    /// Queues a bounded offline draft and returns its generated id.
     pub(crate) fn queue_offline_draft(
         &mut self,
         session_id: Option<&str>,
@@ -398,11 +419,13 @@ impl DesktopCompanionState {
         draft_id
     }
 
+    /// Removes an offline draft by id.
     pub(crate) fn remove_offline_draft(&mut self, draft_id: &str) {
         self.offline_drafts.retain(|draft| draft.draft_id != draft_id);
     }
 }
 
+/// Ordered onboarding step identifiers persisted by the desktop shell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum DesktopOnboardingStep {
@@ -418,6 +441,7 @@ pub(crate) enum DesktopOnboardingStep {
 }
 
 impl DesktopOnboardingStep {
+    /// Returns the stable persisted string representation.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Welcome => "welcome",
@@ -433,6 +457,7 @@ impl DesktopOnboardingStep {
     }
 }
 
+/// Last onboarding failure remembered for recovery screens.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DesktopOnboardingFailureState {
     pub(crate) step: DesktopOnboardingStep,
@@ -440,6 +465,7 @@ pub(crate) struct DesktopOnboardingFailureState {
     pub(crate) recorded_at_unix_ms: i64,
 }
 
+/// Bounded onboarding event used for diagnostics and support bundles.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DesktopOnboardingEvent {
     pub(crate) kind: String,
@@ -447,6 +473,7 @@ pub(crate) struct DesktopOnboardingEvent {
     pub(crate) recorded_at_unix_ms: i64,
 }
 
+/// Persisted provider-onboarding state for OpenAI profiles.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct DesktopOpenAiOnboardingState {
@@ -455,6 +482,7 @@ pub(crate) struct DesktopOpenAiOnboardingState {
     pub(crate) last_connected_at_unix_ms: Option<i64>,
 }
 
+/// Per-profile onboarding state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct DesktopOnboardingState {
@@ -474,12 +502,14 @@ pub(crate) struct DesktopOnboardingState {
 }
 
 impl DesktopOnboardingState {
+    /// Ensures old or malformed state files always have a flow id.
     pub(crate) fn ensure_flow_id(&mut self) {
         if self.flow_id.trim().is_empty() {
             self.flow_id = Ulid::new().to_string();
         }
     }
 
+    /// Appends a bounded onboarding event.
     pub(crate) fn push_event(
         &mut self,
         kind: impl Into<String>,
@@ -498,12 +528,14 @@ impl DesktopOnboardingState {
         }
     }
 
+    /// Increments the failure count for one onboarding step.
     pub(crate) fn record_failure_step(&mut self, step: DesktopOnboardingStep) {
         let key = step.as_str().to_owned();
         let next = self.failure_step_counts.get(key.as_str()).copied().unwrap_or_default();
         self.failure_step_counts.insert(key, next.saturating_add(1));
     }
 
+    /// Updates support-bundle export counters.
     pub(crate) fn record_support_bundle_export_result(&mut self, success: bool) {
         self.support_bundle_export_attempts = self.support_bundle_export_attempts.saturating_add(1);
         if success {
@@ -536,7 +568,8 @@ impl Default for DesktopOnboardingState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Persisted state scoped to one desktop profile.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct DesktopProfileState {
     pub(crate) runtime_state_root: Option<String>,
@@ -544,16 +577,7 @@ pub(crate) struct DesktopProfileState {
     pub(crate) companion: DesktopCompanionState,
 }
 
-impl Default for DesktopProfileState {
-    fn default() -> Self {
-        Self {
-            runtime_state_root: None,
-            onboarding: DesktopOnboardingState::default(),
-            companion: DesktopCompanionState::default(),
-        }
-    }
-}
-
+/// Versioned desktop state file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct DesktopStateFile {
@@ -565,6 +589,7 @@ pub(crate) struct DesktopStateFile {
 }
 
 impl DesktopStateFile {
+    /// Builds a default state file with the implicit desktop-local profile.
     pub(crate) fn new_default() -> Self {
         let mut profile_states = BTreeMap::new();
         profile_states
@@ -578,6 +603,7 @@ impl DesktopStateFile {
         }
     }
 
+    /// Resolves the active runtime root against the default desktop state root.
     pub(crate) fn resolve_runtime_root(&self, default_root: &Path) -> Result<PathBuf> {
         validate_runtime_state_root_override(
             normalize_optional_text(
@@ -587,6 +613,7 @@ impl DesktopStateFile {
         )
     }
 
+    /// Returns the normalized active runtime root override, if one is set.
     pub(crate) fn normalized_runtime_state_root(&self) -> Option<String> {
         normalize_optional_text(
             self.active_profile_state().runtime_state_root.as_deref().unwrap_or_default(),
@@ -594,6 +621,7 @@ impl DesktopStateFile {
         .map(str::to_owned)
     }
 
+    /// Returns the active profile name, falling back to the implicit profile.
     pub(crate) fn active_profile_name(&self) -> &str {
         self.active_profile_name
             .as_deref()
@@ -601,10 +629,12 @@ impl DesktopStateFile {
             .unwrap_or(IMPLICIT_DESKTOP_PROFILE_NAME)
     }
 
+    /// Returns recently selected profile names in most-recent-first order.
     pub(crate) fn recent_profile_names(&self) -> &[String] {
         self.recent_profile_names.as_slice()
     }
 
+    /// Returns the active profile state.
     pub(crate) fn active_profile_state(&self) -> &DesktopProfileState {
         self.profile_states
             .get(self.active_profile_name())
@@ -613,33 +643,38 @@ impl DesktopStateFile {
             .expect("desktop state must always contain at least one profile state")
     }
 
+    /// Returns the active profile state, creating it when necessary.
     pub(crate) fn active_profile_state_mut(&mut self) -> &mut DesktopProfileState {
         let profile_name = self.active_profile_name().to_owned();
         self.ensure_profile_state(profile_name.as_str())
     }
 
+    /// Returns onboarding state for the active profile.
     pub(crate) fn active_onboarding(&self) -> &DesktopOnboardingState {
         &self.active_profile_state().onboarding
     }
 
+    /// Returns mutable onboarding state for the active profile.
     pub(crate) fn active_onboarding_mut(&mut self) -> &mut DesktopOnboardingState {
         &mut self.active_profile_state_mut().onboarding
     }
 
+    /// Returns companion state for the active profile.
     pub(crate) fn active_companion(&self) -> &DesktopCompanionState {
         &self.active_profile_state().companion
     }
 
+    /// Returns mutable companion state for the active profile.
     pub(crate) fn active_companion_mut(&mut self) -> &mut DesktopCompanionState {
         &mut self.active_profile_state_mut().companion
     }
 
+    /// Ensures a profile state exists and returns it.
     pub(crate) fn ensure_profile_state(&mut self, profile_name: &str) -> &mut DesktopProfileState {
-        self.profile_states
-            .entry(profile_name.to_owned())
-            .or_insert_with(DesktopProfileState::default)
+        self.profile_states.entry(profile_name.to_owned()).or_default()
     }
 
+    /// Activates a profile and promotes it in the recent-profile list.
     pub(crate) fn activate_profile(&mut self, profile_name: &str) {
         let normalized = normalize_profile_name(profile_name);
         self.active_profile_name = Some(normalized.clone());
@@ -647,10 +682,12 @@ impl DesktopStateFile {
         self.promote_recent_profile(normalized.as_str());
     }
 
+    /// Returns onboarding completion time for the active profile.
     pub(crate) fn active_profile_completion_unix_ms(&self) -> Option<i64> {
         self.active_onboarding().completed_at_unix_ms
     }
 
+    /// Normalizes the state file after loading or profile changes.
     pub(crate) fn ensure_profile_integrity(&mut self) {
         if self.profile_states.is_empty() {
             self.profile_states
@@ -674,7 +711,8 @@ impl DesktopStateFile {
         for state in self.profile_states.values_mut() {
             state.onboarding.ensure_flow_id();
             if normalize_optional_text(state.companion.ambient.global_hotkey.as_str()).is_none() {
-                state.companion.ambient.global_hotkey = DesktopCompanionAmbientState::default().global_hotkey;
+                state.companion.ambient.global_hotkey =
+                    DesktopCompanionAmbientState::default().global_hotkey;
             }
             if state.companion.voice.silence_timeout_ms == 0 {
                 state.companion.voice.silence_timeout_ms =
@@ -698,6 +736,10 @@ impl Default for DesktopStateFile {
     }
 }
 
+/// Validates a user-selected runtime state root override.
+///
+/// The override must be absolute and stay inside the desktop state root family
+/// so onboarding cannot redirect desktop-managed files to arbitrary locations.
 pub(crate) fn validate_runtime_state_root_override(
     candidate: Option<&str>,
     default_root: &Path,
@@ -850,6 +892,7 @@ impl PersistedDesktopStateEnvelope {
     }
 }
 
+/// Runtime secrets loaded from the desktop vault.
 #[derive(Clone)]
 pub(crate) struct DesktopRuntimeSecrets {
     pub(crate) admin_token: String,
@@ -868,11 +911,13 @@ impl std::fmt::Debug for DesktopRuntimeSecrets {
     }
 }
 
+/// Vault-backed store for desktop runtime credentials.
 pub(crate) struct DesktopSecretStore {
     vault: Vault,
 }
 
 impl DesktopSecretStore {
+    /// Opens the desktop vault under the given state directory.
     pub(crate) fn open(state_dir: &Path) -> Result<Self> {
         let backend_preference =
             if cfg!(test) { BackendPreference::EncryptedFile } else { BackendPreference::Auto };
@@ -886,6 +931,7 @@ impl DesktopSecretStore {
         Ok(Self { vault })
     }
 
+    /// Loads an existing UTF-8 secret or creates and stores a replacement.
     pub(crate) fn load_or_create_secret(
         &self,
         key: &str,
@@ -944,6 +990,7 @@ struct PortableDesktopInstallPaths {
     config_path: Option<PathBuf>,
 }
 
+/// Seeds desktop environment variables from portable install metadata.
 pub(crate) fn bootstrap_portable_install_environment() -> Result<()> {
     let Ok(current_exe) = std::env::current_exe() else {
         return Ok(());
@@ -951,6 +998,7 @@ pub(crate) fn bootstrap_portable_install_environment() -> Result<()> {
     bootstrap_portable_install_environment_for_executable(current_exe.as_path())
 }
 
+/// Seeds desktop environment variables for a specific executable path.
 pub(crate) fn bootstrap_portable_install_environment_for_executable(
     executable_path: &Path,
 ) -> Result<()> {
@@ -963,6 +1011,7 @@ pub(crate) fn bootstrap_portable_install_environment_for_executable(
     Ok(())
 }
 
+/// Resolves the desktop state root from env, portable metadata, or defaults.
 pub(crate) fn resolve_desktop_state_root() -> Result<PathBuf> {
     if let Ok(raw) = std::env::var("PALYRA_STATE_ROOT") {
         if let Some(value) = normalize_optional_text(raw.as_str()) {
@@ -989,7 +1038,9 @@ pub(crate) fn resolve_desktop_state_root() -> Result<PathBuf> {
     })
 }
 
-fn load_portable_desktop_install_paths(executable_path: &Path) -> Result<Option<PortableDesktopInstallPaths>> {
+fn load_portable_desktop_install_paths(
+    executable_path: &Path,
+) -> Result<Option<PortableDesktopInstallPaths>> {
     let Some(install_root) = executable_path.parent() else {
         return Ok(None);
     };
@@ -999,19 +1050,12 @@ fn load_portable_desktop_install_paths(executable_path: &Path) -> Result<Option<
     }
 
     let raw = fs::read_to_string(metadata_path.as_path()).with_context(|| {
-        format!(
-            "failed to read desktop install metadata {}",
-            metadata_path.display()
-        )
+        format!("failed to read desktop install metadata {}", metadata_path.display())
     })?;
-    let metadata: PortableDesktopInstallMetadata = serde_json::from_str(raw.as_str()).with_context(
-        || {
-            format!(
-                "failed to parse desktop install metadata {}",
-                metadata_path.display()
-            )
-        },
-    )?;
+    let metadata: PortableDesktopInstallMetadata = serde_json::from_str(raw.as_str())
+        .with_context(|| {
+            format!("failed to parse desktop install metadata {}", metadata_path.display())
+        })?;
 
     if metadata
         .artifact_kind
@@ -1056,12 +1100,7 @@ fn parse_install_metadata_path(
 }
 
 fn seed_missing_env_path(env_key: &str, value: Option<&Path>) {
-    if std::env::var(env_key)
-        .ok()
-        .as_deref()
-        .and_then(normalize_optional_text)
-        .is_some()
-    {
+    if std::env::var(env_key).ok().as_deref().and_then(normalize_optional_text).is_some() {
         return;
     }
     let Some(path) = value else {
@@ -1074,6 +1113,7 @@ fn seed_missing_env_path(env_key: &str, value: Option<&Path>) {
     }
 }
 
+/// Loads the persisted desktop state file, creating a default file when absent.
 pub(crate) fn load_or_initialize_state_file(path: &Path) -> Result<DesktopStateFile> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| {
@@ -1104,10 +1144,14 @@ fn persist_desktop_state_file(path: &Path, state: &DesktopStateFile, label: &str
         .with_context(|| format!("failed to persist {label} desktop state file {}", path.display()))
 }
 
-pub(crate) fn load_runtime_secrets(secret_store: &DesktopSecretStore) -> Result<DesktopRuntimeSecrets> {
+/// Loads runtime secrets from the desktop secret store.
+pub(crate) fn load_runtime_secrets(
+    secret_store: &DesktopSecretStore,
+) -> Result<DesktopRuntimeSecrets> {
     load_desktop_runtime_secrets(secret_store, LegacyDesktopSecrets::default())
 }
 
+/// Migrates legacy inline runtime secrets into the vault when present.
 pub(crate) fn migrate_legacy_runtime_secrets_from_state_file(
     path: &Path,
     secret_store: &DesktopSecretStore,
@@ -1117,9 +1161,10 @@ pub(crate) fn migrate_legacy_runtime_secrets_from_state_file(
     }
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read desktop state file {}", path.display()))?;
-    let legacy_secrets: LegacyDesktopSecrets = serde_json::from_str(raw.as_str()).with_context(
-        || format!("failed to parse legacy desktop secrets from {}", path.display()),
-    )?;
+    let legacy_secrets: LegacyDesktopSecrets =
+        serde_json::from_str(raw.as_str()).with_context(|| {
+            format!("failed to parse legacy desktop secrets from {}", path.display())
+        })?;
     hydrate_desktop_runtime_secrets(secret_store, legacy_secrets)
 }
 
@@ -1146,15 +1191,9 @@ fn load_desktop_runtime_secrets(
         DESKTOP_SECRET_KEY_BROWSER_AUTH_TOKEN,
         legacy_secrets.seed_for_browser_auth_token(),
     )?;
-    let browser_state_encryption_key = secret_store.load_or_create_secret(
-        DESKTOP_SECRET_KEY_BROWSER_STATE_ENCRYPTION_KEY,
-        None,
-    )?;
-    Ok(DesktopRuntimeSecrets {
-        admin_token,
-        browser_auth_token,
-        browser_state_encryption_key,
-    })
+    let browser_state_encryption_key = secret_store
+        .load_or_create_secret(DESKTOP_SECRET_KEY_BROWSER_STATE_ENCRYPTION_KEY, None)?;
+    Ok(DesktopRuntimeSecrets { admin_token, browser_auth_token, browser_state_encryption_key })
 }
 
 fn generate_secret_token() -> String {
@@ -1183,8 +1222,7 @@ fn normalize_profile_name(raw: &str) -> String {
 mod tests {
     use super::{
         DesktopCompanionNotificationKind, DesktopCompanionState, LegacyDesktopSecrets,
-        DESKTOP_COMPANION_NOTIFICATION_LIMIT,
-        DESKTOP_COMPANION_OFFLINE_DRAFT_LIMIT,
+        DESKTOP_COMPANION_NOTIFICATION_LIMIT, DESKTOP_COMPANION_OFFLINE_DRAFT_LIMIT,
     };
 
     #[test]

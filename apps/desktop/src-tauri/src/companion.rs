@@ -1,3 +1,9 @@
+//! Desktop companion snapshot and action bridge.
+//!
+//! This module joins persisted companion state with console data and exposes
+//! request/response contracts used by Tauri commands for chat, approvals,
+//! dashboard handoff, voice capture, notifications, and profile switching.
+
 use anyhow::{anyhow, Context, Result};
 use palyra_control_plane::{self as control_plane};
 use reqwest::{Client, Url};
@@ -19,6 +25,7 @@ use super::snapshot::{
 use super::supervisor::{ConsolePayloadCache, ConsoleSessionCache};
 use super::{normalize_optional_text, unix_ms_now, ControlCenter, RuntimeConfig};
 
+/// Captured inputs required to build a desktop companion snapshot.
 #[derive(Debug)]
 pub(crate) struct DesktopCompanionInputs {
     pub(crate) refresh_inputs: OnboardingStatusInputs,
@@ -32,6 +39,7 @@ pub(crate) struct DesktopCompanionInputs {
     pub(crate) recent_profiles: Vec<String>,
 }
 
+/// Persisted companion navigation and selection preferences.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) struct DesktopCompanionPreferencesSnapshot {
@@ -41,6 +49,7 @@ pub(crate) struct DesktopCompanionPreferencesSnapshot {
     pub(crate) last_run_id: Option<String>,
 }
 
+/// Ambient shell state exposed to the companion UI.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct DesktopCompanionAmbientSnapshot {
     pub(crate) start_on_login_enabled: bool,
@@ -50,6 +59,7 @@ pub(crate) struct DesktopCompanionAmbientSnapshot {
     pub(crate) last_surface: DesktopCompanionSurfaceMode,
 }
 
+/// Voice-audit record exposed in the companion snapshot.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct DesktopCompanionVoiceAuditEntrySnapshot {
     pub(crate) audit_id: String,
@@ -63,6 +73,7 @@ pub(crate) struct DesktopCompanionVoiceAuditEntrySnapshot {
     pub(crate) output_voice_label: Option<String>,
 }
 
+/// Voice capture and playback state exposed to the companion UI.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct DesktopCompanionVoiceSnapshot {
     pub(crate) lifecycle_state: DesktopVoiceLifecycleState,
@@ -85,6 +96,7 @@ pub(crate) struct DesktopCompanionVoiceSnapshot {
     pub(crate) audit_log: Vec<DesktopCompanionVoiceAuditEntrySnapshot>,
 }
 
+/// Active run summary derived from the session catalog.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct DesktopCompanionActiveRunSnapshot {
     pub(crate) session_id: String,
@@ -96,6 +108,7 @@ pub(crate) struct DesktopCompanionActiveRunSnapshot {
     pub(crate) preview: Option<String>,
 }
 
+/// Companion badge and list counters.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct DesktopCompanionMetrics {
     pub(crate) unread_notifications: usize,
@@ -108,6 +121,7 @@ pub(crate) struct DesktopCompanionMetrics {
     pub(crate) stale_devices: usize,
 }
 
+/// Profile row shown in the desktop companion profile switcher.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct DesktopCompanionProfileRecord {
     pub(crate) context: control_plane::ConsoleProfileContext,
@@ -118,6 +132,7 @@ pub(crate) struct DesktopCompanionProfileRecord {
 }
 
 impl DesktopCompanionProfileRecord {
+    /// Converts a resolved desktop profile into a companion profile row.
     pub(crate) fn from_resolved_profile(
         profile: &super::profile_registry::DesktopResolvedProfile,
         recent: bool,
@@ -134,6 +149,7 @@ impl DesktopCompanionProfileRecord {
     }
 }
 
+/// Full companion snapshot returned to the Tauri UI.
 #[derive(Debug, Serialize)]
 pub(crate) struct DesktopCompanionSnapshot {
     pub(crate) generated_at_unix_ms: i64,
@@ -163,6 +179,7 @@ pub(crate) struct DesktopCompanionSnapshot {
     pub(crate) metrics: DesktopCompanionMetrics,
 }
 
+/// Request body for updating companion navigation preferences.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DesktopCompanionPreferencesRequest {
@@ -176,6 +193,7 @@ pub(crate) struct DesktopCompanionPreferencesRequest {
     pub(crate) last_run_id: Option<String>,
 }
 
+/// Request body for updating ambient companion settings.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DesktopCompanionAmbientRequest {
@@ -191,6 +209,7 @@ pub(crate) struct DesktopCompanionAmbientRequest {
     pub(crate) last_surface: Option<DesktopCompanionSurfaceMode>,
 }
 
+/// Request body for changing companion rollout settings.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DesktopCompanionRolloutRequest {
@@ -214,6 +233,7 @@ pub(crate) struct DesktopCompanionRolloutRequest {
     pub(crate) release_channel: Option<String>,
 }
 
+/// Request body for updating companion voice state.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DesktopCompanionVoiceStateRequest {
@@ -267,6 +287,7 @@ pub(crate) struct DesktopCompanionVoiceStateRequest {
     pub(crate) audit_tts_playback: Option<bool>,
 }
 
+/// Request body for marking companion notifications as read.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DesktopCompanionNotificationsRequest {
@@ -274,6 +295,7 @@ pub(crate) struct DesktopCompanionNotificationsRequest {
     pub(crate) ids: Option<Vec<String>>,
 }
 
+/// Request body for resolving or creating a companion chat session.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DesktopCompanionResolveSessionRequest {
@@ -289,6 +311,7 @@ pub(crate) struct DesktopCompanionResolveSessionRequest {
     pub(crate) reset_session: bool,
 }
 
+/// Request body for sending a chat message from the companion.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DesktopCompanionSendMessageRequest {
@@ -304,6 +327,7 @@ pub(crate) struct DesktopCompanionSendMessageRequest {
     pub(crate) draft_id: Option<String>,
 }
 
+/// Result of sending or queueing a companion chat message.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct DesktopCompanionSendMessageResult {
     pub(crate) queued_offline: bool,
@@ -316,6 +340,7 @@ pub(crate) struct DesktopCompanionSendMessageResult {
     pub(crate) message: String,
 }
 
+/// Request body for uploading push-to-talk audio for transcription.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DesktopCompanionAudioTranscriptionRequest {
@@ -326,6 +351,7 @@ pub(crate) struct DesktopCompanionAudioTranscriptionRequest {
     pub(crate) consent_acknowledged: bool,
 }
 
+/// Result returned after companion audio transcription.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DesktopCompanionAudioTranscriptionResult {
     pub(crate) attachment_id: String,
@@ -346,6 +372,7 @@ pub(crate) struct DesktopCompanionAudioTranscriptionResult {
     pub(crate) warnings: Vec<String>,
 }
 
+/// Request body for resolving a companion-visible approval.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DesktopCompanionApprovalDecisionRequest {
@@ -357,6 +384,7 @@ pub(crate) struct DesktopCompanionApprovalDecisionRequest {
     pub(crate) scope: Option<String>,
 }
 
+/// Request body for constructing a dashboard handoff URL.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DesktopCompanionOpenDashboardRequest {
@@ -378,6 +406,7 @@ pub(crate) struct DesktopCompanionOpenDashboardRequest {
     pub(crate) source: Option<String>,
 }
 
+/// Request body for emitting companion UX telemetry.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DesktopCompanionUxEventRequest {
@@ -410,6 +439,7 @@ pub(crate) struct DesktopCompanionUxEventRequest {
     pub(crate) locale: Option<String>,
 }
 
+/// Request body for switching the active desktop profile.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DesktopCompanionSwitchProfileRequest {
@@ -418,6 +448,7 @@ pub(crate) struct DesktopCompanionSwitchProfileRequest {
     pub(crate) allow_strict_switch: bool,
 }
 
+/// Transcript event record returned for a desktop companion session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DesktopTranscriptRecord {
     pub(crate) session_id: String,
@@ -431,6 +462,7 @@ pub(crate) struct DesktopTranscriptRecord {
     pub(crate) origin_run_id: Option<String>,
 }
 
+/// Queued offline input record returned with a session transcript.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DesktopQueuedInputRecord {
     pub(crate) queued_input_id: String,
@@ -444,6 +476,7 @@ pub(crate) struct DesktopQueuedInputRecord {
     pub(crate) origin_run_id: Option<String>,
 }
 
+/// Transcript envelope returned for companion session detail.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DesktopSessionTranscriptEnvelope {
     pub(crate) session: control_plane::SessionCatalogRecord,
@@ -500,6 +533,7 @@ struct DesktopAttachmentDerivedArtifactWarning {
     message: String,
 }
 
+/// Resolved chat session record returned after companion session creation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DesktopResolvedChatSessionRecord {
     pub(crate) session_id: String,
@@ -517,10 +551,12 @@ pub(crate) struct DesktopResolvedChatSessionRecord {
 }
 
 impl ControlCenter {
+    /// Returns whether offline draft queueing is enabled for the active profile.
     pub(crate) fn companion_offline_drafts_enabled(&self) -> bool {
         self.persisted.active_companion().rollout.offline_drafts_enabled
     }
 
+    /// Captures inputs needed to build a companion snapshot off the UI thread.
     pub(crate) fn capture_companion_inputs(&mut self) -> DesktopCompanionInputs {
         DesktopCompanionInputs {
             refresh_inputs: self.capture_onboarding_status_inputs(),
@@ -535,6 +571,7 @@ impl ControlCenter {
         }
     }
 
+    /// Applies companion navigation and selection preferences.
     pub(crate) fn update_companion_preferences(
         &mut self,
         payload: &DesktopCompanionPreferencesRequest,
@@ -555,6 +592,7 @@ impl ControlCenter {
         self.save_state_file()
     }
 
+    /// Applies ambient companion preferences.
     pub(crate) fn update_companion_ambient(
         &mut self,
         payload: &DesktopCompanionAmbientRequest,
@@ -578,6 +616,7 @@ impl ControlCenter {
         self.save_state_file()
     }
 
+    /// Applies desktop companion rollout flags.
     pub(crate) fn update_companion_rollout(
         &mut self,
         payload: &DesktopCompanionRolloutRequest,
@@ -615,6 +654,7 @@ impl ControlCenter {
         self.save_state_file()
     }
 
+    /// Applies voice capture and playback state changes.
     pub(crate) fn update_companion_voice_state(
         &mut self,
         payload: &DesktopCompanionVoiceStateRequest,
@@ -633,10 +673,8 @@ impl ControlCenter {
         if payload.tts_consent_granted == Some(false) {
             companion.voice.tts_consent_granted_at_unix_ms = None;
         }
-        if let Some(value) = payload
-            .microphone_permission_state
-            .as_deref()
-            .and_then(normalize_optional_text)
+        if let Some(value) =
+            payload.microphone_permission_state.as_deref().and_then(normalize_optional_text)
         {
             companion.voice.microphone_permission_state = value.to_owned();
         }
@@ -688,11 +726,8 @@ impl ControlCenter {
                 .map(str::to_owned);
         }
         if payload.draft_text.is_some() {
-            companion.voice.draft_text = payload
-                .draft_text
-                .as_deref()
-                .and_then(normalize_optional_text)
-                .map(str::to_owned);
+            companion.voice.draft_text =
+                payload.draft_text.as_deref().and_then(normalize_optional_text).map(str::to_owned);
         }
         if payload.draft_summary.is_some() {
             companion.voice.draft_summary = payload
@@ -712,11 +747,8 @@ impl ControlCenter {
             companion.voice.draft_duration_ms = payload.draft_duration_ms;
         }
         if payload.last_error.is_some() {
-            companion.voice.last_error = payload
-                .last_error
-                .as_deref()
-                .and_then(normalize_optional_text)
-                .map(str::to_owned);
+            companion.voice.last_error =
+                payload.last_error.as_deref().and_then(normalize_optional_text).map(str::to_owned);
         }
         if payload.clear_error {
             companion.voice.last_error = None;
@@ -744,6 +776,7 @@ impl ControlCenter {
         self.save_state_file()
     }
 
+    /// Marks companion notifications read.
     pub(crate) fn mark_companion_notifications_read(
         &mut self,
         ids: Option<&[String]>,
@@ -752,11 +785,13 @@ impl ControlCenter {
         self.save_state_file()
     }
 
+    /// Removes a queued companion offline draft by id.
     pub(crate) fn remove_companion_offline_draft(&mut self, draft_id: &str) -> Result<()> {
         self.persisted.active_companion_mut().remove_offline_draft(draft_id);
         self.save_state_file()
     }
 
+    /// Records a completed companion run notification.
     pub(crate) fn record_companion_run_completion(
         &mut self,
         run_id: &str,
@@ -775,6 +810,7 @@ impl ControlCenter {
         self.save_state_file()
     }
 
+    /// Queues an offline draft and returns its generated id.
     pub(crate) fn record_companion_offline_draft(
         &mut self,
         session_id: Option<&str>,
@@ -797,6 +833,7 @@ impl ControlCenter {
         Ok(draft_id)
     }
 
+    /// Reconciles persisted companion state after a freshly built snapshot.
     pub(crate) fn reconcile_companion_snapshot(
         &mut self,
         snapshot: &mut DesktopCompanionSnapshot,
@@ -857,6 +894,11 @@ impl ControlCenter {
     }
 }
 
+/// Builds the full desktop companion snapshot.
+///
+/// # Errors
+/// Returns an error when refresh payload construction, shared onboarding
+/// posture, console data fetch, or snapshot assembly fails.
 pub(crate) async fn build_companion_snapshot(
     inputs: DesktopCompanionInputs,
 ) -> Result<DesktopCompanionSnapshot> {
@@ -948,10 +990,8 @@ pub(crate) async fn build_companion_snapshot(
     let trusted_devices =
         inventory.as_ref().map(|value| value.summary.trusted_devices).unwrap_or(0);
     let stale_devices = inventory.as_ref().map(|value| value.summary.stale_devices).unwrap_or(0);
-    let active_runs = session_catalog
-        .iter()
-        .filter_map(active_run_snapshot_from_session)
-        .collect::<Vec<_>>();
+    let active_runs =
+        session_catalog.iter().filter_map(active_run_snapshot_from_session).collect::<Vec<_>>();
 
     Ok(DesktopCompanionSnapshot {
         generated_at_unix_ms: unix_ms_now(),
@@ -1029,11 +1069,7 @@ fn voice_snapshot_from_state(state: &DesktopCompanionVoiceState) -> DesktopCompa
         draft_language: state.draft_language.clone(),
         draft_duration_ms: state.draft_duration_ms,
         last_error: state.last_error.clone(),
-        audit_log: state
-            .audit_log
-            .iter()
-            .map(voice_audit_snapshot_from_state)
-            .collect(),
+        audit_log: state.audit_log.iter().map(voice_audit_snapshot_from_state).collect(),
     }
 }
 
@@ -1096,12 +1132,14 @@ async fn fetch_shared_onboarding_posture(
     let mut control_plane = build_control_plane_client(http_client.clone(), runtime)?;
     ensure_console_session_with_cache(&mut control_plane, admin_token, console_session_cache)
         .await?;
-    control_plane
-        .get_onboarding_posture(Vec::new())
-        .await
-        .map_err(anyhow::Error::from)
+    control_plane.get_onboarding_posture(Vec::new()).await.map_err(anyhow::Error::from)
 }
 
+/// Resolves or creates a companion chat session through the console API.
+///
+/// # Errors
+/// Returns an error when control-plane client construction, console session
+/// bootstrap, HTTP dispatch, or response decoding fails.
 pub(crate) async fn resolve_companion_chat_session(
     http_client: &Client,
     runtime: &RuntimeConfig,
@@ -1127,6 +1165,11 @@ pub(crate) async fn resolve_companion_chat_session(
     Ok(parsed.session)
 }
 
+/// Fetches a transcript envelope for a companion session.
+///
+/// # Errors
+/// Returns an error when control-plane client construction, console session
+/// bootstrap, HTTP dispatch, or response decoding fails.
 pub(crate) async fn fetch_companion_transcript(
     http_client: &Client,
     runtime: &RuntimeConfig,
@@ -1142,6 +1185,11 @@ pub(crate) async fn fetch_companion_transcript(
         .context("desktop companion transcript response did not match the expected contract")
 }
 
+/// Sends a chat message from the desktop companion.
+///
+/// # Errors
+/// Returns an error when session bootstrap, URL construction, HTTP dispatch,
+/// stream parsing, or stream error reporting fails.
 pub(crate) async fn send_companion_chat_message(
     http_client: &Client,
     runtime: &RuntimeConfig,
@@ -1220,6 +1268,12 @@ pub(crate) async fn send_companion_chat_message(
     })
 }
 
+/// Uploads companion audio and returns the completed transcript artifact.
+///
+/// # Errors
+/// Returns an error when consent is missing, request validation fails, console
+/// session bootstrap fails, upload fails, or no completed transcript is
+/// returned.
 pub(crate) async fn transcribe_companion_audio(
     http_client: &Client,
     runtime: &RuntimeConfig,
@@ -1301,6 +1355,11 @@ pub(crate) async fn transcribe_companion_audio(
     })
 }
 
+/// Resolves a companion-visible approval decision.
+///
+/// # Errors
+/// Returns an error when console session bootstrap, approval resolution, or
+/// response serialization fails.
 pub(crate) async fn decide_companion_approval(
     http_client: &Client,
     runtime: &RuntimeConfig,
@@ -1320,6 +1379,11 @@ pub(crate) async fn decide_companion_approval(
         .context("desktop companion approval response could not be serialized")
 }
 
+/// Builds a dashboard handoff URL for the requested companion context.
+///
+/// # Errors
+/// Returns an error when redirect construction or dashboard open URL creation
+/// fails.
 pub(crate) async fn build_companion_handoff_url(
     inputs: DashboardOpenInputs,
     control_center: &super::snapshot::ControlCenterSnapshot,
@@ -1338,13 +1402,19 @@ pub(crate) async fn build_companion_handoff_url(
     .await
 }
 
+/// Emits a companion UX telemetry event through the console API.
+///
+/// # Errors
+/// Returns an error when the event name is empty, console session bootstrap
+/// fails, or event emission fails.
 pub(crate) async fn emit_companion_ux_event(
     inputs: &DesktopCompanionInputs,
     payload: &DesktopCompanionUxEventRequest,
 ) -> Result<()> {
-    let event_name =
-        normalize_optional_text(payload.name.as_str()).ok_or_else(|| anyhow!("desktop companion UX telemetry requires an event name"))?;
-    let mut control_plane = build_control_plane_client(inputs.http_client.clone(), &inputs.runtime)?;
+    let event_name = normalize_optional_text(payload.name.as_str())
+        .ok_or_else(|| anyhow!("desktop companion UX telemetry requires an event name"))?;
+    let mut control_plane =
+        build_control_plane_client(inputs.http_client.clone(), &inputs.runtime)?;
     let _csrf_token =
         ensure_console_session_with_csrf(&mut control_plane, inputs.admin_token.as_str()).await?;
     let details = json!({

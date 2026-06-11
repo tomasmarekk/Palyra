@@ -1,3 +1,9 @@
+//! Desktop profile registry loader.
+//!
+//! Profiles are read from the CLI registry when present and supplemented with
+//! an implicit local desktop profile so the control center can start cleanly on
+//! first run.
+
 use std::{
     collections::BTreeMap,
     env, fs,
@@ -16,6 +22,7 @@ const CLI_PROFILES_RELATIVE_PATH: &str = "cli/profiles.toml";
 const CLI_PROFILE_SCHEMA_VERSION: u32 = 1;
 const PALYRA_CONFIG_ENV: &str = "PALYRA_CONFIG";
 
+/// Resolved desktop connection profile with optional config and state roots.
 #[derive(Debug, Clone)]
 pub(crate) struct DesktopResolvedProfile {
     pub(crate) context: control_plane::ConsoleProfileContext,
@@ -49,6 +56,7 @@ struct DesktopCliConnectionProfile {
     last_used_at_unix_ms: Option<i64>,
 }
 
+/// Catalog of resolved desktop profiles keyed by profile name.
 #[derive(Debug, Clone)]
 pub(crate) struct DesktopProfileCatalog {
     pub(crate) default_profile_name: Option<String>,
@@ -56,6 +64,11 @@ pub(crate) struct DesktopProfileCatalog {
 }
 
 impl DesktopProfileCatalog {
+    /// Loads the CLI profile registry and inserts the implicit desktop profile.
+    ///
+    /// # Errors
+    /// Returns an error when the profile registry path, document, schema
+    /// version, or configured paths are invalid.
     pub(crate) fn load(base_state_root: &Path) -> Result<Self> {
         let registry_path = resolve_cli_profiles_registry_path(base_state_root)?;
         let document = load_profiles_document(registry_path.as_deref())?;
@@ -175,6 +188,7 @@ fn resolve_profile(
     })
 }
 
+/// Builds the implicit local desktop profile.
 pub(crate) fn implicit_profile(name: &str) -> DesktopResolvedProfile {
     DesktopResolvedProfile {
         context: control_plane::ConsoleProfileContext {

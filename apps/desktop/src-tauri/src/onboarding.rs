@@ -1,3 +1,8 @@
+//! Desktop onboarding status and refresh payload assembly.
+//!
+//! The desktop UI reads this module's snapshots to guide first-run setup,
+//! provider auth, dashboard handoff, Discord connector setup, and recovery.
+
 use std::{
     fs,
     io::Write,
@@ -26,6 +31,7 @@ use super::{
     DesktopOnboardingStep, LOOPBACK_HOST,
 };
 
+/// One preflight check shown during desktop onboarding.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct OnboardingPreflightCheck {
     pub(crate) key: String,
@@ -34,6 +40,7 @@ pub(crate) struct OnboardingPreflightCheck {
     pub(crate) detail: String,
 }
 
+/// Aggregated preflight status for the current desktop environment.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct OnboardingPreflightSnapshot {
     pub(crate) blocked_count: usize,
@@ -41,6 +48,7 @@ pub(crate) struct OnboardingPreflightSnapshot {
     pub(crate) checks: Vec<OnboardingPreflightCheck>,
 }
 
+/// UI-facing status for one onboarding step.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct OnboardingStepSnapshot {
     pub(crate) key: DesktopOnboardingStep,
@@ -49,12 +57,14 @@ pub(crate) struct OnboardingStepSnapshot {
     pub(crate) detail: String,
 }
 
+/// Operator-auth readiness summary for onboarding.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct OnboardingOperatorAuthSnapshot {
     pub(crate) ready: bool,
     pub(crate) note: String,
 }
 
+/// Recovery guidance captured after a failing onboarding step.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct OnboardingRecoverySnapshot {
     pub(crate) step: DesktopOnboardingStep,
@@ -63,12 +73,14 @@ pub(crate) struct OnboardingRecoverySnapshot {
     pub(crate) suggested_actions: Vec<String>,
 }
 
+/// Failure count for one onboarding step.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct OnboardingStepFailureMetric {
     pub(crate) step: String,
     pub(crate) failures: u64,
 }
 
+/// Support-bundle export counters displayed during onboarding recovery.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct OnboardingSupportBundleMetrics {
     pub(crate) attempts: u64,
@@ -77,6 +89,7 @@ pub(crate) struct OnboardingSupportBundleMetrics {
     pub(crate) success_rate_bps: u32,
 }
 
+/// Full desktop onboarding status snapshot.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct OnboardingStatusSnapshot {
     pub(crate) flow_id: String,
@@ -114,6 +127,7 @@ pub(crate) struct OnboardingStatusSnapshot {
     pub(crate) steps: Vec<OnboardingStepSnapshot>,
 }
 
+/// Combined desktop refresh payload returned to the UI.
 #[derive(Debug, Serialize)]
 pub(crate) struct DesktopRefreshPayload {
     pub(crate) snapshot: ControlCenterSnapshot,
@@ -121,6 +135,7 @@ pub(crate) struct DesktopRefreshPayload {
     pub(crate) openai_status: OpenAiAuthStatusSnapshot,
 }
 
+/// Captured inputs required to build onboarding status off the UI thread.
 #[derive(Debug)]
 pub(crate) struct OnboardingStatusInputs {
     pub(crate) snapshot_inputs: SnapshotBuildInputs,
@@ -139,6 +154,7 @@ pub(crate) struct OnboardingStatusInputs {
 }
 
 impl ControlCenter {
+    /// Captures the current control-center state needed for onboarding status.
     pub(crate) fn capture_onboarding_status_inputs(&mut self) -> OnboardingStatusInputs {
         OnboardingStatusInputs {
             snapshot_inputs: self.capture_snapshot_inputs(),
@@ -158,12 +174,22 @@ impl ControlCenter {
     }
 }
 
+/// Builds only the onboarding status portion of the desktop refresh payload.
+///
+/// # Errors
+/// Returns an error when snapshot construction, dashboard probing, operator
+/// auth probing, or onboarding payload assembly fails.
 pub(crate) async fn build_onboarding_status(
     inputs: OnboardingStatusInputs,
 ) -> Result<OnboardingStatusSnapshot> {
     Ok(build_desktop_refresh_payload(inputs).await?.onboarding_status)
 }
 
+/// Builds the full desktop refresh payload for onboarding-aware UI refreshes.
+///
+/// # Errors
+/// Returns an error when snapshot construction, dashboard probing, operator
+/// auth probing, or onboarding payload assembly fails.
 pub(crate) async fn build_desktop_refresh_payload(
     inputs: OnboardingStatusInputs,
 ) -> Result<DesktopRefreshPayload> {
@@ -337,7 +363,10 @@ fn success_rate_bps(successes: u64, attempts: u64) -> u32 {
     u32::try_from(scaled).unwrap_or(u32::MAX)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "preflight checks mirror the desktop onboarding snapshot contract"
+)]
 fn build_preflight_snapshot(
     runtime_root: &Path,
     gateway_bound_ports: &[u16],
@@ -836,7 +865,10 @@ fn suggested_actions(step: DesktopOnboardingStep) -> Vec<String> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "onboarding step rows are assembled from explicit UI-facing fields"
+)]
 fn build_step_snapshots(
     persisted: &super::DesktopStateFile,
     snapshot: &ControlCenterSnapshot,

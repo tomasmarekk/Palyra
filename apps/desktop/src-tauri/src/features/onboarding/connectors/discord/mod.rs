@@ -1,3 +1,5 @@
+//! Discord onboarding state, client, and summary helpers for desktop.
+
 pub(crate) mod client;
 pub(crate) mod state;
 pub(crate) mod summary;

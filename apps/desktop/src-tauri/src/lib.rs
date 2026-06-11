@@ -1,3 +1,9 @@
+//! Tauri desktop control-center runtime for supervising local Palyra services.
+//!
+//! The crate exposes a small entrypoint and keeps platform process setup,
+//! sidecar supervision, onboarding state, and UI command adapters behind
+//! crate-private modules.
+
 const SUPERVISOR_TICK_MS: u64 = 500;
 const MAX_LOG_LINES_PER_SERVICE: usize = 400;
 const LOG_EVENT_CHANNEL_CAPACITY: usize = 2_048;
@@ -28,8 +34,8 @@ mod commands;
 mod companion;
 mod companion_console;
 mod console_cache;
-mod desktop_state;
 mod dashboard_open;
+mod desktop_state;
 mod features;
 mod onboarding;
 mod openai_auth;
@@ -39,14 +45,14 @@ mod supervisor;
 
 use snapshot::sanitize_log_line;
 
+#[cfg(test)]
+pub(crate) use desktop_state::bootstrap_portable_install_environment_for_executable;
 pub(crate) use desktop_state::{
     bootstrap_portable_install_environment, load_or_initialize_state_file, load_runtime_secrets,
     migrate_legacy_runtime_secrets_from_state_file, resolve_desktop_state_root,
     validate_runtime_state_root_override, DesktopCompanionSection, DesktopCompanionSurfaceMode,
     DesktopOnboardingStep, DesktopRuntimeSecrets, DesktopSecretStore, DesktopStateFile,
 };
-#[cfg(test)]
-pub(crate) use desktop_state::bootstrap_portable_install_environment_for_executable;
 pub(crate) use features::onboarding::connectors::discord::DiscordOnboardingRequest;
 pub(crate) use onboarding::{build_desktop_refresh_payload, build_onboarding_status};
 pub(crate) use supervisor::{
@@ -55,9 +61,9 @@ pub(crate) use supervisor::{
 };
 
 #[cfg(test)]
-pub(crate) use reqwest::Client;
-#[cfg(test)]
 pub(crate) use commands::prepare_control_center_for_launch;
+#[cfg(test)]
+pub(crate) use reqwest::Client;
 #[cfg(test)]
 pub(crate) use snapshot::{
     build_snapshot_from_inputs, collect_redacted_errors, parse_discord_status,
@@ -65,10 +71,11 @@ pub(crate) use snapshot::{
 };
 #[cfg(test)]
 pub(crate) use supervisor::{
-    compute_backoff_ms, executable_file_name, try_enqueue_log_event, DesktopInstanceLock,
-    LogEvent, LogStream, ManagedService,
+    compute_backoff_ms, executable_file_name, try_enqueue_log_event, DesktopInstanceLock, LogEvent,
+    LogStream, ManagedService,
 };
 
+/// Configures a child process so desktop sidecars do not show extra windows.
 pub(crate) fn configure_background_command(command: &mut Command) {
     #[cfg(windows)]
     {
@@ -88,6 +95,7 @@ pub(crate) use ulid::Ulid;
 #[cfg(test)]
 mod tests;
 
+/// Runs the desktop control-center application.
 pub fn run() {
     commands::run();
 }
