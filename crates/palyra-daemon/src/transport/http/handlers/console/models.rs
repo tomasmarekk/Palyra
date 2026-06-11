@@ -1,3 +1,13 @@
+//! Console model-provider connectivity probes.
+//!
+//! Serves `POST /console/v1/models/test-connection` and
+//! `POST /console/v1/models/discover`. Builds probe targets from the on-disk
+//! daemon config overlaid with the live runtime provider snapshot, resolves a
+//! credential (auth profile, then inline config key, then vault ref), and
+//! calls each provider's models endpoint. Per-provider failures are reported
+//! inside the envelope payload, not as HTTP errors, and every outbound error
+//! string is redacted before it reaches the console wire contract.
+
 use std::time::Instant;
 
 use palyra_auth::{AuthCredential, AuthProviderKind};
@@ -18,6 +28,8 @@ const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 const DEFAULT_PROVIDER_PROBE_TIMEOUT_MS: u64 = 5_000;
 
+/// Request body shared by the test-connection and discover endpoints:
+/// an optional provider filter (id or kind) and an optional probe timeout.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub(crate) struct ConsoleProviderProbeRequest {
     #[serde(default)]
@@ -26,6 +38,7 @@ pub(crate) struct ConsoleProviderProbeRequest {
     pub timeout_ms: Option<u64>,
 }
 
+/// Wire envelope for probe results returned to the web console.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ConsoleProviderProbeEnvelope {
     pub contract: control_plane::ContractDescriptor,
@@ -37,6 +50,9 @@ pub(crate) struct ConsoleProviderProbeEnvelope {
     pub providers: Vec<ConsoleProviderProbePayload>,
 }
 
+/// Per-provider probe outcome: a state label (`ok`, `auth_failed`,
+/// `endpoint_failed`, ...), a redacted human-readable message, and the
+/// discovered/configured model id sets.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ConsoleProviderProbePayload {
     pub provider_id: String,
@@ -56,6 +72,7 @@ pub(crate) struct ConsoleProviderProbePayload {
     pub latency_ms: Option<u64>,
 }
 
+/// One provider to probe, with config-derived endpoint and credential wiring.
 #[derive(Debug, Clone)]
 struct ConsoleProbeTarget {
     provider_id: String,
@@ -70,12 +87,21 @@ struct ConsoleProbeTarget {
     configured_model_ids: Vec<String>,
 }
 
+/// Credential resolved for a probe, tagged with how it is sent (API-key
+/// header vs Bearer) and where it came from (`source` is echoed on the wire).
 #[derive(Debug, Clone)]
 enum ResolvedCredential {
     ApiKey { token: String, source: String },
     Bearer { token: String, source: String },
 }
 
+/// Probes provider connectivity and credentials without model discovery.
+///
+/// # Errors
+/// Returns an error response when the console session/CSRF check fails, the
+/// daemon config snapshot cannot be loaded or parsed, no provider matches the
+/// requested filter, or the system clock is unavailable. Individual provider
+/// failures are reported inside the envelope instead.
 pub(crate) async fn console_models_test_connection_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -85,6 +111,11 @@ pub(crate) async fn console_models_test_connection_handler(
     run_console_provider_probe(&state, &session.context, payload, false).await.map(Json)
 }
 
+/// Probes provider connectivity and additionally discovers selectable model
+/// ids from each provider's models endpoint.
+///
+/// # Errors
+/// Same failure modes as [`console_models_test_connection_handler`].
 pub(crate) async fn console_models_discover_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -182,6 +213,10 @@ fn build_console_probe_targets_with_env(
             .map(|entry| {
                 let provider_id = entry.provider_id.clone().unwrap_or_default();
                 let kind = entry.kind.clone().unwrap_or_else(|| provider_kind.clone());
+                // Global base-url/auth settings describe one provider, not the
+                // whole registry: only the provider serving the default chat
+                // model inherits them (or every entry when no default resolves,
+                // matching legacy single-provider configs).
                 let inherit_globals = default_provider_id
                     .as_deref()
                     .is_some_and(|candidate| candidate == provider_id)
@@ -248,11 +283,15 @@ fn effective_global_allow_private_base_url(
     env_override: Option<&str>,
 ) -> bool {
     if let Some(value) = env_override {
+        // A malformed env override fails closed: private base URLs stay blocked.
         return value.trim().parse::<bool>().unwrap_or(false);
     }
     config.allow_private_base_url.unwrap_or(false)
 }
 
+// The runtime snapshot wins over the on-disk config wherever it carries a
+// value, so probes exercise the endpoints and auth wiring the daemon is
+// actually using (including hot-reloaded changes).
 fn overlay_probe_targets_with_runtime_snapshot(
     mut targets: Vec<ConsoleProbeTarget>,
     snapshot: &crate::model_provider::ProviderStatusSnapshot,
@@ -477,6 +516,11 @@ async fn probe_console_provider(
     };
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    // Anthropic-kind targets authenticate via the x-api-key scheme, except
+    // MiniMax-compatible endpoints (detected through the auth profile provider
+    // kind), which expect a standard Bearer token instead. Tokens that contain
+    // non-header-safe bytes are swapped for a redaction placeholder so the
+    // probe fails as an auth error rather than panicking or leaking bytes.
     match &credential {
         ResolvedCredential::ApiKey { token, .. }
             if target.kind == ANTHROPIC_PROVIDER_KIND && !target_uses_minimax_auth(target) =>
@@ -508,6 +552,10 @@ async fn probe_console_provider(
             if status.is_success() {
                 payload.state = "ok".to_owned();
                 if discover {
+                    // Unparseable discovery bodies fall back to the configured
+                    // registry. The equality check below therefore also labels
+                    // a live response that exactly matches the registry as
+                    // "registry_fallback" -- indistinguishable by design.
                     let discovered = parse_discovered_model_ids(body.as_str())
                         .unwrap_or_else(|_| target.configured_model_ids.clone());
                     payload.discovered_model_ids = discovered;
@@ -578,6 +626,14 @@ fn validate_console_probe_endpoint_policy(
     )
 }
 
+/// Resolves the probe credential with the same precedence the model runtime
+/// uses: auth profile, then inline config key, then config vault ref.
+///
+/// Returns `Ok(None)` when the target has no credential configured at all.
+///
+/// # Errors
+/// Fails when the referenced auth profile is missing or belongs to a different
+/// provider kind than the target, or when a vault secret cannot be loaded.
 fn resolve_provider_credential(
     state: &AppState,
     target: &ConsoleProbeTarget,
@@ -671,6 +727,8 @@ fn load_vault_secret_utf8(
         .with_context(|| format!("vault secret '{}' must contain valid UTF-8", parsed.key))
 }
 
+// Configured base URLs appear both with and without a trailing `/v1`
+// segment; normalize so either form probes the same models endpoint.
 fn provider_models_endpoint(base_url: &str) -> Result<reqwest::Url, anyhow::Error> {
     let trimmed = base_url.trim().trim_end_matches('/');
     let raw = if trimmed.ends_with("/v1") {

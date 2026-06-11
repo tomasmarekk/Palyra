@@ -1,3 +1,11 @@
+//! Console inventory aggregation handlers.
+//!
+//! Serves `GET /console/v1/inventory` and `GET /console/v1/inventory/{device_id}`.
+//! Joins paired-device records, node-runtime heartbeats, pairing requests, and
+//! runtime/browser/channel diagnostics snapshots into the control-plane
+//! inventory envelopes. The envelope shapes are a wire contract consumed by
+//! the web console (`apps/web`).
+
 use std::cmp::Reverse;
 use std::collections::HashMap;
 
@@ -8,9 +16,17 @@ use super::diagnostics::{
 use crate::gateway::current_unix_ms;
 use crate::*;
 
+// Heartbeat freshness thresholds: a paired node is reported stale after five
+// minutes of silence and offline after thirty minutes.
 const NODE_STALE_AFTER_MS: i64 = 5 * 60 * 1000;
 const NODE_OFFLINE_AFTER_MS: i64 = 30 * 60 * 1000;
 
+/// Lists every paired device, active pairing request, and managed service
+/// instance as one inventory snapshot.
+///
+/// # Errors
+/// Returns an error response when the console session is missing or invalid,
+/// or when device/node/runtime snapshots cannot be collected.
 pub(crate) async fn console_inventory_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -32,6 +48,8 @@ pub(crate) async fn console_inventory_list_handler(
         contract: contract_descriptor(),
         generated_at_unix_ms,
         summary,
+        // The inventory list is not paginated; `.max(1)` keeps the page-size
+        // field of the contract nonzero even when no devices exist.
         page: build_page_info(devices.len().max(1), devices.len(), None),
         devices,
         pending_pairings: active_pairings,
@@ -39,6 +57,12 @@ pub(crate) async fn console_inventory_list_handler(
     }))
 }
 
+/// Returns one device's inventory record together with its pairing history,
+/// capability requests, and recent workspace activity.
+///
+/// # Errors
+/// Returns an error response when the console session is missing or invalid,
+/// when `device_id` is not a canonical ULID, or when the device is unknown.
 pub(crate) async fn console_inventory_device_detail_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -339,6 +363,8 @@ async fn build_inventory_instances(
         .pointer("/failures/recent_relay_action_failures")
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    // When the browser service reports no explicit health status, infer one
+    // from the recent failure counters instead of defaulting to healthy.
     let browser_status_label = if browser_enabled {
         browser_payload.pointer("/health/status").and_then(Value::as_str).unwrap_or({
             if browser_health_failures > 0 || browser_relay_failures > 0 {
@@ -351,6 +377,9 @@ async fn build_inventory_instances(
         "disabled"
     };
     let browser_presence_label = if browser_enabled { browser_status_label } else { "offline" };
+    let channels_degraded =
+        connector_payload.get("degraded_connectors").and_then(Value::as_u64).unwrap_or(0) > 0
+            || connector_payload.get("dead_letters").and_then(Value::as_u64).unwrap_or(0) > 0;
 
     Ok(vec![
         control_plane::InventoryInstanceRecord {
@@ -397,29 +426,13 @@ async fn build_inventory_instances(
             instance_id: "channels".to_owned(),
             label: "Channels runtime".to_owned(),
             kind: "channels".to_owned(),
-            presence_state: if connector_payload
-                .get("degraded_connectors")
-                .and_then(Value::as_u64)
-                .unwrap_or(0)
-                > 0
-                || connector_payload.get("dead_letters").and_then(Value::as_u64).unwrap_or(0) > 0
-            {
+            presence_state: if channels_degraded {
                 control_plane::InventoryPresenceState::Degraded
             } else {
                 control_plane::InventoryPresenceState::Ok
             },
             observed_at_unix_ms: now_unix_ms,
-            state_label: if connector_payload
-                .get("degraded_connectors")
-                .and_then(Value::as_u64)
-                .unwrap_or(0)
-                > 0
-                || connector_payload.get("dead_letters").and_then(Value::as_u64).unwrap_or(0) > 0
-            {
-                "degraded".to_owned()
-            } else {
-                "ok".to_owned()
-            },
+            state_label: if channels_degraded { "degraded".to_owned() } else { "ok".to_owned() },
             detail: Some(format!(
                 "{} connectors, {} degraded, {} dead letters",
                 connector_payload.get("connectors").and_then(Value::as_u64).unwrap_or(0),
@@ -542,6 +555,12 @@ fn inventory_capability_summary(
     }
 }
 
+/// Derives a device presence label from pairing status, heartbeat age, and
+/// capability availability.
+///
+/// Precedence: not-paired/no-node beats heartbeat age, and heartbeat age
+/// (offline, then stale) beats capability degradation, because a silent node
+/// gives no trustworthy capability data to grade.
 fn inventory_device_presence_state(
     device: &control_plane::DeviceRecord,
     node: Option<&control_plane::NodeRecord>,
@@ -554,6 +573,7 @@ fn inventory_device_presence_state(
     let Some(node) = node else {
         return control_plane::InventoryPresenceState::Offline;
     };
+    // `.max(0)` guards against clock skew producing a future heartbeat stamp.
     let age_ms = now_unix_ms.saturating_sub(node.last_seen_at_unix_ms.max(0));
     if age_ms >= NODE_OFFLINE_AFTER_MS {
         control_plane::InventoryPresenceState::Offline
@@ -566,6 +586,11 @@ fn inventory_device_presence_state(
     }
 }
 
+/// Grades device trust from pairing provenance.
+///
+/// A paired device counts as trusted only when both an approval id and an
+/// identity fingerprint were recorded; paired devices without that provenance
+/// predate the approval-gated pairing flow and are labeled legacy.
 fn inventory_device_trust_state(
     device: &control_plane::DeviceRecord,
 ) -> control_plane::InventoryTrustState {
@@ -616,6 +641,10 @@ fn inventory_device_warnings(
     warnings
 }
 
+/// Maps free-form runtime status labels onto the inventory presence enum.
+///
+/// Unrecognized labels intentionally map to `Degraded` rather than `Ok`, so a
+/// new or misspelled status surfaces as something an operator will look at.
 fn inventory_presence_from_runtime_label(raw: &str) -> control_plane::InventoryPresenceState {
     match raw.trim().to_ascii_lowercase().as_str() {
         "ok" | "ready" | "healthy" | "running" | "active" | "connected" => {
@@ -630,6 +659,8 @@ fn inventory_presence_from_runtime_label(raw: &str) -> control_plane::InventoryP
     }
 }
 
+// Sort order for the device list: attention-needing states (degraded, stale)
+// come first and healthy devices last.
 fn inventory_presence_rank(state: control_plane::InventoryPresenceState) -> usize {
     match state {
         control_plane::InventoryPresenceState::Degraded => 0,

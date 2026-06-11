@@ -1,3 +1,14 @@
+//! Console usage, cost, and operator-insights reporting handlers.
+//!
+//! Serves the `/console/v1/usage/*` surface: `summary`, `sessions`,
+//! `sessions/{session_id}`, `agents`, `models`, `insights`, and `export`
+//! reads, plus the `pricing`, `budgets`, and per-policy `override-request`
+//! writes. Aggregates journal usage records with
+//! `usage_governance` pricing/budget evaluation and samples run tapes, cron
+//! history, and plugin bindings for the operator-insights snapshot. All
+//! envelope shapes and error strings here are a wire contract consumed by
+//! the web console (`apps/web`).
+
 use std::{
     collections::{HashMap, HashSet},
     time::{SystemTime, UNIX_EPOCH},
@@ -22,6 +33,8 @@ use crate::usage_governance::{
 };
 use crate::*;
 
+// Usage queries default to the trailing 30 days and are capped at 366 days
+// (one leap year) because every endpoint scans the journal window on demand.
 const DEFAULT_USAGE_LOOKBACK_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 const MAX_USAGE_LOOKBACK_MS: i64 = 366 * 24 * 60 * 60 * 1_000;
 const HOUR_BUCKET_MS: i64 = 60 * 60 * 1_000;
@@ -30,12 +43,16 @@ const DEFAULT_USAGE_BREAKDOWN_LIMIT: usize = 10;
 const MAX_USAGE_BREAKDOWN_LIMIT: usize = 50;
 const DEFAULT_USAGE_RUN_LIMIT: usize = 12;
 const MAX_USAGE_RUN_LIMIT: usize = 25;
+// Sampling caps for the operator-insights snapshot; the response reports the
+// observed-vs-sampled counts so operators can tell when data was truncated.
 const OPERATOR_INSIGHTS_RUN_SAMPLE_LIMIT: usize = 24;
 const OPERATOR_INSIGHTS_TAPE_SAMPLE_LIMIT: usize = 128;
 const OPERATOR_INSIGHTS_CRON_RUN_LIMIT: usize = 32;
 const OPERATOR_INSIGHTS_PLUGIN_LIMIT: usize = 32;
 const OPERATOR_INSIGHTS_QUERY_PREVIEW_BYTES: usize = 160;
 
+/// Query string for the usage summary and insights endpoints: an optional
+/// time window, bucket selector (`auto|hour|day`), and archived-session flag.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleUsageSummaryQuery {
     #[serde(default)]
@@ -48,6 +65,8 @@ pub(crate) struct ConsoleUsageSummaryQuery {
     include_archived: Option<bool>,
 }
 
+/// Query string for the paginated breakdown endpoints (sessions, agents,
+/// models): the summary parameters plus a page `limit` and offset `cursor`.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleUsageBreakdownQuery {
     #[serde(default)]
@@ -64,6 +83,8 @@ pub(crate) struct ConsoleUsageBreakdownQuery {
     cursor: Option<String>,
 }
 
+/// Query string for the per-session detail endpoint; `run_limit` caps how
+/// many recent runs are embedded in the response.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleUsageSessionDetailQuery {
     #[serde(default)]
@@ -78,6 +99,8 @@ pub(crate) struct ConsoleUsageSessionDetailQuery {
     run_limit: Option<usize>,
 }
 
+/// Query string for the usage export endpoint; `dataset` selects
+/// timeline/sessions/agents/models and `format` selects json/csv.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleUsageExportQuery {
     dataset: String,
@@ -92,6 +115,8 @@ pub(crate) struct ConsoleUsageExportQuery {
     include_archived: Option<bool>,
 }
 
+/// Request body for upserting one model pricing record (per-million token
+/// costs plus an effective time range).
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleUsagePricingUpsertRequest {
     pricing_id: String,
@@ -113,6 +138,8 @@ pub(crate) struct ConsoleUsagePricingUpsertRequest {
     currency: String,
 }
 
+/// Request body for upserting one usage budget policy (scope, metric,
+/// interval, soft/hard limits, and the action taken on breach).
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleUsageBudgetPolicyUpsertRequest {
     policy_id: String,
@@ -131,12 +158,15 @@ pub(crate) struct ConsoleUsageBudgetPolicyUpsertRequest {
     enabled: bool,
 }
 
+/// Request body for asking approval to override a budget policy.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleUsageBudgetOverrideRequest {
     #[serde(default)]
     reason: Option<String>,
 }
 
+/// Resolved query parameters echoed back so clients see the effective
+/// window/bucket after defaulting and clamping.
 #[derive(Debug, Clone, Serialize)]
 struct UsageQueryEcho {
     start_at_unix_ms: i64,
@@ -167,6 +197,7 @@ struct UsageSessionDetailQueryEcho {
     run_limit: usize,
 }
 
+/// Response envelope for `GET /console/v1/usage/summary`.
 #[derive(Debug, Serialize)]
 pub(crate) struct UsageSummaryEnvelope {
     contract: control_plane::ContractDescriptor,
@@ -176,6 +207,7 @@ pub(crate) struct UsageSummaryEnvelope {
     cost_tracking_available: bool,
 }
 
+/// Response envelope for `GET /console/v1/usage/sessions`.
 #[derive(Debug, Serialize)]
 pub(crate) struct UsageSessionsEnvelope {
     contract: control_plane::ContractDescriptor,
@@ -185,6 +217,7 @@ pub(crate) struct UsageSessionsEnvelope {
     cost_tracking_available: bool,
 }
 
+/// Response envelope for `GET /console/v1/usage/sessions/{session_id}`.
 #[derive(Debug, Serialize)]
 pub(crate) struct UsageSessionDetailEnvelope {
     contract: control_plane::ContractDescriptor,
@@ -196,6 +229,7 @@ pub(crate) struct UsageSessionDetailEnvelope {
     cost_tracking_available: bool,
 }
 
+/// Usage rollup for one agent (sessions attributed via session bindings).
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct UsageAgentRecord {
     agent_id: String,
@@ -218,6 +252,7 @@ pub(crate) struct UsageAgentRecord {
     estimated_cost_usd: Option<f64>,
 }
 
+/// Response envelope for `GET /console/v1/usage/agents`.
 #[derive(Debug, Serialize)]
 pub(crate) struct UsageAgentsEnvelope {
     contract: control_plane::ContractDescriptor,
@@ -227,6 +262,8 @@ pub(crate) struct UsageAgentsEnvelope {
     cost_tracking_available: bool,
 }
 
+/// Usage rollup for one model profile (sessions attributed via the bound
+/// agent's default model profile, not the per-run routed model).
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct UsageModelRecord {
     model_id: String,
@@ -248,6 +285,7 @@ pub(crate) struct UsageModelRecord {
     estimated_cost_usd: Option<f64>,
 }
 
+/// Response envelope for `GET /console/v1/usage/models`.
 #[derive(Debug, Serialize)]
 pub(crate) struct UsageModelsEnvelope {
     contract: control_plane::ContractDescriptor,
@@ -257,6 +295,7 @@ pub(crate) struct UsageModelsEnvelope {
     cost_tracking_available: bool,
 }
 
+/// Pricing-table coverage shown in the insights envelope.
 #[derive(Debug, Serialize)]
 pub(crate) struct UsageInsightsPricingSummary {
     known_entries: usize,
@@ -264,6 +303,7 @@ pub(crate) struct UsageInsightsPricingSummary {
     estimate_only: bool,
 }
 
+/// Model-provider health snapshot embedded in the insights envelope.
 #[derive(Debug, Serialize)]
 pub(crate) struct UsageInsightsHealthSummary {
     provider_state: String,
@@ -275,6 +315,8 @@ pub(crate) struct UsageInsightsHealthSummary {
     recent_routing_overrides: usize,
 }
 
+/// Smart-routing activity rollup (mode counts and recent decisions) for the
+/// queried window.
 #[derive(Debug, Serialize)]
 pub(crate) struct UsageInsightsRoutingSummary {
     default_mode: String,
@@ -285,12 +327,15 @@ pub(crate) struct UsageInsightsRoutingSummary {
     recent_decisions: Vec<journal::UsageRoutingDecisionRecord>,
 }
 
+/// Budget policies and their evaluation results for the queried window.
 #[derive(Debug, Serialize)]
 pub(crate) struct UsageInsightsBudgetsEnvelope {
     policies: Vec<journal::UsageBudgetPolicyRecord>,
     evaluations: Vec<UsageBudgetEvaluation>,
 }
 
+/// Declares where operator-insight data comes from and that derived metrics
+/// are recomputed per request rather than persisted.
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct OperatorInsightsRetentionPolicy {
     source_of_truth: String,
@@ -301,6 +346,8 @@ pub(crate) struct OperatorInsightsRetentionPolicy {
     window_end_at_unix_ms: i64,
 }
 
+/// Sampling caps applied while building the snapshot, with observed-vs-sampled
+/// counts and human-readable truncation notes.
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct OperatorInsightsSamplingPolicy {
     run_sample_limit: usize,
@@ -316,6 +363,8 @@ pub(crate) struct OperatorInsightsSamplingPolicy {
     notes: Vec<String>,
 }
 
+/// Declares the redaction guarantees of the snapshot (no raw queries, error
+/// messages, or config values; secret-like values redacted).
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct OperatorInsightsPrivacyPolicy {
     redaction_mode: String,
@@ -325,6 +374,8 @@ pub(crate) struct OperatorInsightsPrivacyPolicy {
     secret_like_values_redacted: bool,
 }
 
+/// Link pair (console API path plus web console route) for drilling into an
+/// insight's underlying data.
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct OperatorInsightDrillDown {
     label: String,
@@ -333,6 +384,7 @@ pub(crate) struct OperatorInsightDrillDown {
     console_path: String,
 }
 
+/// One non-info subsystem finding surfaced at the top of the snapshot.
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct OperatorInsightHotspot {
     hotspot_id: String,
@@ -345,6 +397,7 @@ pub(crate) struct OperatorInsightHotspot {
     drill_down: OperatorInsightDrillDown,
 }
 
+/// Roll-up verdict over all hotspots (blocking beats warning beats ok).
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct OperatorInsightsSummary {
     state: String,
@@ -355,6 +408,7 @@ pub(crate) struct OperatorInsightsSummary {
     recommendation: String,
 }
 
+/// Provider auth, error-rate, latency, and response-cache health insight.
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct OperatorProviderHealthInsight {
     state: String,
@@ -373,6 +427,8 @@ pub(crate) struct OperatorProviderHealthInsight {
     drill_down: OperatorInsightDrillDown,
 }
 
+/// One sampled recall event; `query_preview` is whitespace-collapsed,
+/// truncated, and redacted before serialization.
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct OperatorRecallSample {
     run_id: String,
@@ -387,6 +443,7 @@ pub(crate) struct OperatorRecallSample {
     compaction_hits: usize,
 }
 
+/// Memory recall quality insight (explicit recall and auto-inject hit rates).
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct OperatorRecallInsight {
     state: String,
@@ -403,6 +460,7 @@ pub(crate) struct OperatorRecallInsight {
     drill_down: OperatorInsightDrillDown,
 }
 
+/// One sampled session-compaction event.
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct OperatorCompactionSample {
     run_id: String,
@@ -414,6 +472,8 @@ pub(crate) struct OperatorCompactionSample {
     artifact_id: Option<String>,
 }
 
+/// Session-compaction effectiveness insight (preview/created/blocked counts
+/// and token-reduction averages).
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct OperatorCompactionInsight {
     state: String,
@@ -429,6 +489,8 @@ pub(crate) struct OperatorCompactionInsight {
     drill_down: OperatorInsightDrillDown,
 }
 
+/// One sampled denied tool decision; `reason` is sanitized before
+/// serialization.
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct OperatorSafetySample {
     run_id: String,
@@ -437,6 +499,7 @@ pub(crate) struct OperatorSafetySample {
     approval_required: bool,
 }
 
+/// Tool-decision policy insight (deny/approval rates over sampled runs).
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct OperatorSafetyBoundaryInsight {
     state: String,
@@ -452,6 +515,7 @@ pub(crate) struct OperatorSafetyBoundaryInsight {
     drill_down: OperatorInsightDrillDown,
 }
 
+/// One sampled unhealthy plugin binding with its failure reasons.
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct OperatorPluginSample {
     plugin_id: String,
@@ -461,6 +525,8 @@ pub(crate) struct OperatorPluginSample {
     reasons: Vec<String>,
 }
 
+/// Plugin-bindings operability insight (contract, config, and discovery
+/// failure counts).
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct OperatorPluginInsight {
     state: String,
@@ -477,6 +543,7 @@ pub(crate) struct OperatorPluginInsight {
     drill_down: OperatorInsightDrillDown,
 }
 
+/// One sampled cron run outcome.
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct OperatorCronRunSample {
     run_id: String,
@@ -486,6 +553,7 @@ pub(crate) struct OperatorCronRunSample {
     tool_denies: u64,
 }
 
+/// Cron delivery insight (failure rate and tool denies over recent runs).
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct OperatorCronInsight {
     state: String,
@@ -500,6 +568,7 @@ pub(crate) struct OperatorCronInsight {
     drill_down: OperatorInsightDrillDown,
 }
 
+/// One config ref whose reload state needs operator attention.
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct OperatorReloadHotspot {
     ref_id: String,
@@ -510,6 +579,7 @@ pub(crate) struct OperatorReloadHotspot {
     advice: Option<String>,
 }
 
+/// Config-ref reload health insight (blocking/warning refs and hotspots).
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct OperatorReloadInsight {
     state: String,
@@ -522,6 +592,8 @@ pub(crate) struct OperatorReloadInsight {
     drill_down: OperatorInsightDrillDown,
 }
 
+/// Cross-subsystem operations rollup (stuck runs, queue backlog, cooldowns,
+/// worker fleet anomalies).
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct OperatorOperationsOverviewInsight {
     state: String,
@@ -538,6 +610,8 @@ pub(crate) struct OperatorOperationsOverviewInsight {
     drill_down: OperatorInsightDrillDown,
 }
 
+/// Security posture insight (policy/approval denies, redactions, sandbox
+/// violations).
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct OperatorSecurityInsight {
     state: String,
@@ -553,6 +627,7 @@ pub(crate) struct OperatorSecurityInsight {
     drill_down: OperatorInsightDrillDown,
 }
 
+/// Routine (scheduled job) delivery insight.
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct OperatorRoutineInsight {
     state: String,
@@ -567,6 +642,8 @@ pub(crate) struct OperatorRoutineInsight {
     drill_down: OperatorInsightDrillDown,
 }
 
+/// Learning-candidate lifecycle insight (review queue, rollbacks, and
+/// prompt-injection conflicts).
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct OperatorMemoryLearningInsight {
     state: String,
@@ -587,6 +664,8 @@ pub(crate) struct OperatorMemoryLearningInsight {
     drill_down: OperatorInsightDrillDown,
 }
 
+/// Full operator-insights snapshot; embedded in the usage insights envelope
+/// and in support bundles.
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct OperatorInsightsEnvelope {
     generated_at_unix_ms: i64,
@@ -608,6 +687,7 @@ pub(crate) struct OperatorInsightsEnvelope {
     reload: OperatorReloadInsight,
 }
 
+/// Response envelope for `GET /console/v1/usage/insights`.
 #[derive(Debug, Serialize)]
 pub(crate) struct UsageInsightsEnvelope {
     contract: control_plane::ContractDescriptor,
@@ -626,6 +706,11 @@ pub(crate) struct UsageInsightsEnvelope {
     cost_tracking_available: bool,
 }
 
+/// Returns window totals and a bucketed timeline of orchestrator usage.
+///
+/// # Errors
+/// Returns an error response when the console session is invalid, the query
+/// window/bucket fails validation, or the journal query fails.
 pub(crate) async fn console_usage_summary_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -654,6 +739,12 @@ pub(crate) async fn console_usage_summary_handler(
     }))
 }
 
+/// Lists per-session usage rollups, paginated with an offset cursor over the
+/// in-memory result list.
+///
+/// # Errors
+/// Returns an error response when the console session is invalid, the cursor
+/// or query window fails validation, or the journal query fails.
 pub(crate) async fn console_usage_sessions_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -681,6 +772,10 @@ pub(crate) async fn console_usage_sessions_handler(
     let page =
         build_page_info(limit, sessions.len().saturating_sub(cursor).min(limit), next_cursor);
     let sessions = sessions.into_iter().skip(cursor).take(limit).collect::<Vec<_>>();
+    // AIDEV-NOTE: cost_tracking_available is derived from the returned page
+    // only, so a page without cost rows reports false even when other pages
+    // in the same window carry estimates. The agents and models handlers
+    // below share this pattern; changing it would alter the wire payload.
     let cost_tracking_available = sessions.iter().any(|entry| entry.estimated_cost_usd.is_some());
 
     Ok(Json(UsageSessionsEnvelope {
@@ -700,6 +795,13 @@ pub(crate) async fn console_usage_sessions_handler(
     }))
 }
 
+/// Returns one session's usage rollup, its window timeline, and its most
+/// recent runs (capped by `run_limit`).
+///
+/// # Errors
+/// Returns an error response when the console session is invalid, the session
+/// id is not a canonical ULID, the query fails validation, the journal query
+/// fails, or the session does not exist in the window.
 pub(crate) async fn console_usage_session_detail_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -727,7 +829,7 @@ pub(crate) async fn console_usage_session_detail_handler(
         .summarize_orchestrator_usage(resolved.query.clone())
         .await
         .map_err(runtime_status_response)?;
-    let detail = state
+    let (session_record, session_runs) = state
         .runtime
         .get_orchestrator_usage_session(resolved.query.clone(), session_id, run_limit)
         .await
@@ -746,14 +848,20 @@ pub(crate) async fn console_usage_session_detail_handler(
             include_archived: resolved.echo.include_archived,
             run_limit,
         },
-        session: detail.0,
+        session: session_record,
         totals: summary.totals,
         timeline: summary.timeline,
-        runs: detail.1,
+        runs: session_runs,
         cost_tracking_available: summary.cost_tracking_available,
     }))
 }
 
+/// Lists per-agent usage rollups built by grouping sessions through their
+/// agent bindings; unbound sessions fall into an "unassigned" row.
+///
+/// # Errors
+/// Returns an error response when the console session is invalid, the cursor
+/// or query window fails validation, or journal/agent lookups fail.
 pub(crate) async fn console_usage_agents_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -801,6 +909,12 @@ pub(crate) async fn console_usage_agents_handler(
     }))
 }
 
+/// Lists per-model usage rollups keyed by each bound agent's default model
+/// profile (the journal does not record a per-run model id at this level).
+///
+/// # Errors
+/// Returns an error response when the console session is invalid, the cursor
+/// or query window fails validation, or journal/agent lookups fail.
 pub(crate) async fn console_usage_models_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -848,6 +962,14 @@ pub(crate) async fn console_usage_models_handler(
     }))
 }
 
+/// Builds the full usage-insights view: window totals, cost estimation,
+/// routing and budget evaluation, alert generation, and the operator
+/// insights snapshot.
+///
+/// # Errors
+/// Returns an error response when the console session is invalid, the query
+/// window fails validation, or any of the journal/runtime/auth snapshot
+/// queries fail. Alert persistence failures are intentionally swallowed.
 pub(crate) async fn console_usage_insights_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -914,6 +1036,8 @@ pub(crate) async fn console_usage_insights_handler(
         build_provider_auth_observability(&auth_payload, state.observability.as_ref());
     let provider_snapshot = &status_snapshot.model_provider;
     let provider_kind = provider_snapshot.kind.clone();
+    // Fallback chain mirrors the model runtime's default-model resolution;
+    // "deterministic" is the offline provider used when nothing is configured.
     let default_model_id = provider_snapshot
         .registry
         .default_chat_model_id
@@ -927,6 +1051,10 @@ pub(crate) async fn console_usage_insights_handler(
         .iter()
         .map(|record| (record.run_id.clone(), record))
         .collect::<HashMap<_, _>>();
+    // Cost attribution precedence: a recorded routing decision pins the exact
+    // model and provider for the run; otherwise infer the provider from the
+    // registry entry for the default chat model, falling back to the
+    // top-level provider snapshot.
     let enriched_runs = runs
         .iter()
         .map(|run| {
@@ -967,6 +1095,8 @@ pub(crate) async fn console_usage_insights_handler(
         budget_policies.as_slice(),
     )
     .await;
+    // Budget evaluation deliberately uses the upper cost estimate for both
+    // projection bounds: budgets should trip on the conservative figure.
     let total_estimated_cost =
         enriched_runs.iter().filter_map(|entry| entry.cost_estimate.upper_usd).sum::<f64>();
     let cost_projection = PricingEstimate {
@@ -993,6 +1123,9 @@ pub(crate) async fn console_usage_insights_handler(
         model_mix.as_slice(),
         model_provider_health_state(&status_snapshot.model_provider),
     );
+    // Alert persistence is best-effort: a failed upsert must not break the
+    // insights read path. Each candidate gets a fresh id; the journal
+    // deduplicates recurring alerts through dedupe_key.
     for (index, candidate) in alert_candidates.iter().enumerate() {
         let _ = state
             .runtime
@@ -1086,6 +1219,11 @@ pub(crate) async fn console_usage_insights_handler(
     }))
 }
 
+/// Upserts a model pricing record (CSRF-checked console session required).
+///
+/// # Errors
+/// Returns an error response when the session/CSRF check fails or the journal
+/// rejects the pricing record.
 pub(crate) async fn console_usage_pricing_upsert_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1117,6 +1255,12 @@ pub(crate) async fn console_usage_pricing_upsert_handler(
     })))
 }
 
+/// Upserts a usage budget policy, attributing the change to the operator
+/// principal (CSRF-checked console session required).
+///
+/// # Errors
+/// Returns an error response when the session/CSRF check fails or the journal
+/// rejects the policy.
 pub(crate) async fn console_usage_budget_policy_upsert_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1147,6 +1291,12 @@ pub(crate) async fn console_usage_budget_policy_upsert_handler(
     })))
 }
 
+/// Files an approval request to override one budget policy and records a
+/// console audit event (best-effort) for the request.
+///
+/// # Errors
+/// Returns an error response when the session/CSRF check fails, the policy id
+/// is unknown, or the override request cannot be persisted.
 pub(crate) async fn console_usage_budget_override_request_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1200,6 +1350,15 @@ pub(crate) async fn console_usage_budget_override_request_handler(
     })))
 }
 
+/// Streams a usage dataset as a JSON or CSV file-download response.
+///
+/// CSV cells are quoted and formula-prefixed defensively so exports cannot
+/// trigger spreadsheet formula execution.
+///
+/// # Errors
+/// Returns an error response when the console session is invalid, the
+/// dataset/format/window parameters fail validation, or the journal queries
+/// or serialization fail.
 pub(crate) async fn console_usage_export_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1318,18 +1477,22 @@ pub(crate) async fn console_usage_export_handler(
     Ok(response)
 }
 
+/// Validated usage query plus the echo payload describing the effective
+/// window after defaulting and clamping.
 #[derive(Debug, Clone)]
 struct ResolvedUsageQuery {
     query: OrchestratorUsageQuery,
     echo: UsageQueryEcho,
 }
 
+/// Lookup tables used to attribute sessions to agents and model profiles.
 #[derive(Debug, Clone)]
 struct UsageMetadata {
     bindings_by_session: HashMap<String, SessionAgentBinding>,
     agents_by_id: HashMap<String, AgentRecord>,
 }
 
+/// Datasets accepted by the export endpoint (`dataset` query parameter).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UsageExportDataset {
     Timeline,
@@ -1338,6 +1501,8 @@ enum UsageExportDataset {
     Models,
 }
 
+/// Output encodings accepted by the export endpoint (`format` query
+/// parameter).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UsageExportFormat {
     Json,
@@ -1352,6 +1517,9 @@ fn default_usage_currency() -> String {
     "USD".to_owned()
 }
 
+/// Grades provider health for the insights view: any open circuit breaker or
+/// recorded error wins over auth state, and missing credentials are reported
+/// distinctly so the console can prompt for setup rather than show "degraded".
 fn model_provider_health_state(
     snapshot: &crate::model_provider::ProviderStatusSnapshot,
 ) -> &'static str {
@@ -1364,6 +1532,9 @@ fn model_provider_health_state(
     }
 }
 
+/// Resolves `(provider_id, provider_kind)` for a model id via the provider
+/// registry, falling back to the snapshot's primary provider when the model
+/// is not registered.
 fn resolve_provider_for_model<'a>(
     snapshot: &'a crate::model_provider::ProviderStatusSnapshot,
     model_id: &str,
@@ -1378,6 +1549,9 @@ fn resolve_provider_for_model<'a>(
     (snapshot.provider_id.as_str(), snapshot.kind.as_str())
 }
 
+/// Counts tool usage by scanning session transcripts for the runs in the
+/// window. Best-effort: sessions whose transcript cannot be loaded are
+/// skipped rather than failing the whole insights response.
 async fn load_usage_tool_mix(
     state: &AppState,
     runs: &[journal::OrchestratorUsageInsightsRunRecord],
@@ -1416,6 +1590,8 @@ async fn load_usage_tool_mix(
     build_tool_mix(&tool_counts)
 }
 
+/// Counters and bounded sample lists accumulated from sampled run tapes
+/// (recall, compaction, and tool-decision events).
 #[derive(Debug, Default)]
 struct OperatorTapeAggregation {
     explicit_recall_events: usize,
@@ -1439,6 +1615,13 @@ struct OperatorTapeAggregation {
     truncated_tape_runs: usize,
 }
 
+/// Builds an operator-insights snapshot for a request context using the
+/// default usage window; used by support bundles and the system insights
+/// endpoint in addition to the usage insights handler.
+///
+/// # Errors
+/// Returns an error response when the usage window cannot be resolved or any
+/// underlying journal/runtime query fails.
 pub(crate) async fn build_operator_insights_for_context(
     state: &AppState,
     context: &gateway::RequestContext,
@@ -1473,6 +1656,8 @@ async fn build_operator_insights_snapshot(
             "failed to resolve operator insights timestamp: {error}"
         )))
     })?;
+    // Sample the newest runs first; the run-id tiebreak keeps the order
+    // deterministic for runs sharing a start timestamp.
     let mut sampled_runs = runs.iter().collect::<Vec<_>>();
     sampled_runs.sort_by(|left, right| {
         right
@@ -1537,8 +1722,10 @@ async fn build_operator_insights_snapshot(
     let blocking_hotspots =
         hotspots.iter().filter(|hotspot| hotspot.severity == "blocking").count();
     let warning_hotspots = hotspots.iter().filter(|hotspot| hotspot.severity == "warning").count();
-    let summary = build_operator_summary(hotspots.as_slice());
+    let (summary_state, summary_severity) = build_operator_summary(hotspots.as_slice());
 
+    // The cron pager only reveals whether more history exists, not how much;
+    // "+1" simply signals truncation in the observed-vs-sampled counts.
     let observed_cron_runs = cron_runs.len().saturating_add(usize::from(cron_next_after.is_some()));
     let sampled_cron_runs = cron_runs.len();
     let observed_plugins = plugin_index.as_ref().map(|index| index.entries.len()).unwrap_or(0);
@@ -1580,8 +1767,8 @@ async fn build_operator_insights_snapshot(
     Ok(OperatorInsightsEnvelope {
         generated_at_unix_ms,
         summary: OperatorInsightsSummary {
-            state: summary.0.to_owned(),
-            severity: summary.1.to_owned(),
+            state: summary_state.to_owned(),
+            severity: summary_severity.to_owned(),
             hotspot_count: hotspots.len(),
             blocking_hotspots,
             warning_hotspots,
@@ -1634,6 +1821,9 @@ async fn build_operator_insights_snapshot(
     })
 }
 
+/// Fetches a bounded tape snapshot per sampled run and folds the events into
+/// one aggregation; runs whose tape exceeds the per-run event cap are counted
+/// as truncated for the sampling notes.
 #[allow(clippy::result_large_err)]
 async fn collect_operator_tape_aggregation(
     state: &AppState,
@@ -1660,6 +1850,9 @@ async fn collect_operator_tape_aggregation(
     Ok(aggregation)
 }
 
+/// Folds one tape event into the aggregation. Sample lists are capped at 8
+/// entries each; counters keep accumulating past the cap. Events with
+/// unparseable payloads are skipped (best-effort sampling).
 fn accumulate_operator_tape_event(
     run: &journal::OrchestratorUsageInsightsRunRecord,
     event: &journal::OrchestratorTapeRecord,
@@ -1737,10 +1930,15 @@ fn accumulate_operator_tape_event(
         "session.compaction.auto_preview"
         | "session.compaction.auto_created"
         | "session.compaction" => {
+            // Generic "session.compaction" records carry the specific phase in
+            // the payload's "event" field; classification below is substring
+            // based so blocked previews count toward both preview and blocked.
             let event_name =
                 payload.get("event").and_then(Value::as_str).unwrap_or(event.event_type.as_str());
             let estimated_input_tokens = json_u64(payload.get("estimated_input_tokens"));
             let estimated_output_tokens = json_u64(payload.get("estimated_output_tokens"));
+            // Older tape payloads lack token_delta; reconstruct it from the
+            // estimates. The clamp makes the u64 -> i64 narrowing lossless.
             let token_delta =
                 payload.get("token_delta").and_then(Value::as_i64).unwrap_or_else(|| {
                     estimated_input_tokens
@@ -1947,12 +2145,19 @@ fn build_operator_recall_insight(aggregation: &OperatorTapeAggregation) -> Opera
 fn build_operator_compaction_insight(
     aggregation: &OperatorTapeAggregation,
 ) -> OperatorCompactionInsight {
+    // AIDEV-NOTE: the divisor is the retained sample count (capped at 8 by
+    // accumulate_operator_tape_event) while compaction_total_token_delta sums
+    // every observed compaction event, so the average overstates the
+    // per-event delta once a window exceeds the sample cap. Correcting it
+    // changes reported wire values, so it is left as is for now.
     let avg_token_delta = if aggregation.compaction_samples.is_empty() {
         0
     } else {
         (aggregation.compaction_total_token_delta / aggregation.compaction_samples.len() as i128)
             .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
     };
+    // Reduction is reported in basis points of the estimated input tokens;
+    // negative total deltas (compaction grew the context) clamp to zero.
     let avg_reduction_bps = ((aggregation.compaction_total_token_delta.max(0) as u128) * 10_000)
         .checked_div(aggregation.compaction_total_input_tokens)
         .unwrap_or(0)
@@ -2593,8 +2798,10 @@ async fn build_operator_memory_learning_insight(
     })
 }
 
+/// Normalizes the free-form journal status into one lifecycle bucket.
 fn learning_candidate_lifecycle_status(status: &str, auto_applied: bool) -> &'static str {
     let normalized = status.trim().to_ascii_lowercase().replace('_', "-");
+    // An auto-applied candidate is live regardless of its recorded status.
     if auto_applied {
         return "deployed";
     }
@@ -2609,6 +2816,9 @@ fn learning_candidate_lifecycle_status(status: &str, auto_applied: bool) -> &'st
     }
 }
 
+// Heuristic text scan: injection conflicts are not a structured field on
+// learning candidates, so look for the known marker phrases anywhere in the
+// candidate's descriptive and provenance text.
 fn candidate_mentions_injection_conflict(candidate: &journal::LearningCandidateRecord) -> bool {
     [
         candidate.risk_level.as_str(),
@@ -2626,6 +2836,7 @@ fn candidate_mentions_injection_conflict(candidate: &journal::LearningCandidateR
     })
 }
 
+/// Borrowed per-subsystem insights consumed by [`build_operator_hotspots`].
 struct OperatorHotspotSources<'a> {
     operations: &'a OperatorOperationsOverviewInsight,
     provider_health: &'a OperatorProviderHealthInsight,
@@ -2640,6 +2851,9 @@ struct OperatorHotspotSources<'a> {
     reload: &'a OperatorReloadInsight,
 }
 
+/// Flattens the per-subsystem insights into the hotspot list, keeping only
+/// warning/blocking entries; the iteration order below fixes the display
+/// order in the console.
 fn build_operator_hotspots(sources: OperatorHotspotSources<'_>) -> Vec<OperatorInsightHotspot> {
     let OperatorHotspotSources {
         operations,
@@ -2825,6 +3039,8 @@ fn build_operator_hotspots(sources: OperatorHotspotSources<'_>) -> Vec<OperatorI
     hotspots
 }
 
+/// Returns the overall `(state, severity)` pair: any blocking hotspot makes
+/// the whole snapshot blocking, otherwise any warning makes it degraded.
 fn build_operator_summary(hotspots: &[OperatorInsightHotspot]) -> (&'static str, &'static str) {
     if hotspots.iter().any(|hotspot| hotspot.severity == "blocking") {
         ("blocking", "blocking")
@@ -2835,6 +3051,8 @@ fn build_operator_summary(hotspots: &[OperatorInsightHotspot]) -> (&'static str,
     }
 }
 
+/// Loads the plugin bindings index, returning a sanitized error string
+/// instead of failing so plugin insights can degrade gracefully.
 fn load_operator_plugin_index() -> (Option<crate::plugins::PluginBindingsIndex>, Option<String>) {
     let plugins_root = match resolve_plugins_root() {
         Ok(path) => path,
@@ -2901,6 +3119,8 @@ fn operator_drill_down(
     }
 }
 
+/// Produces a privacy-safe preview of a recall query: whitespace collapsed,
+/// truncated to the preview byte budget, then secret patterns redacted.
 fn operator_query_preview(raw: &str) -> String {
     let flattened = raw.replace(['\r', '\n', '\t'], " ");
     let collapsed = flattened.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -2909,6 +3129,8 @@ fn operator_query_preview(raw: &str) -> String {
     sanitize_http_error_message(truncated.as_str())
 }
 
+// Ratio helpers report basis points (1/10_000) and treat a zero denominator
+// as zero rather than an error, since "no events" is a normal quiet window.
 fn ratio_bps(numerator: usize, denominator: usize) -> u32 {
     if denominator == 0 {
         0
@@ -2925,6 +3147,8 @@ fn ratio_bps_u64(numerator: u64, denominator: u64) -> u32 {
     }
 }
 
+// Saturating usize -> u64 conversion (lossless on every supported target;
+// the guard only matters for hypothetical >64-bit usize).
 const fn usize_to_u64(value: usize) -> u64 {
     if value > u64::MAX as usize {
         u64::MAX
@@ -2941,6 +3165,10 @@ fn json_u64(value: Option<&Value>) -> u64 {
     value.and_then(Value::as_u64).unwrap_or(0)
 }
 
+/// Applies the usage-window defaults: `end` falls back to now, `start` to
+/// `end` minus the 30-day default lookback, and the span is capped at the
+/// supported maximum. The query is always scoped to the requesting principal,
+/// device, and channel.
 #[allow(clippy::result_large_err)]
 fn resolve_usage_query(
     start_at_unix_ms: Option<i64>,
@@ -2991,6 +3219,9 @@ fn resolve_usage_query(
     })
 }
 
+/// Resolves the bucket selector to a `(label, width_ms)` pair. `auto` picks
+/// hour buckets for windows up to 72 hours (at most 72 timeline points) and
+/// day buckets beyond that.
 #[allow(clippy::result_large_err)]
 fn normalize_usage_bucket(
     raw: Option<&str>,
@@ -3038,6 +3269,8 @@ fn normalize_usage_export_format(raw: &str) -> Result<UsageExportFormat, Respons
     }
 }
 
+// The cursor is a plain numeric offset into the recomputed result list, not
+// an opaque token; a missing or empty cursor means "start at the beginning".
 #[allow(clippy::result_large_err)]
 fn parse_usage_cursor(raw: Option<&str>) -> Result<usize, Response> {
     let Some(raw) = raw.map(str::trim) else {
@@ -3053,6 +3286,8 @@ fn parse_usage_cursor(raw: Option<&str>) -> Result<usize, Response> {
     })
 }
 
+/// Loads the agent bindings for the requesting principal plus the full agent
+/// registry (paged at 100 per request) for session attribution.
 async fn load_usage_metadata(
     state: &AppState,
     context: &gateway::RequestContext,
@@ -3092,6 +3327,8 @@ async fn load_usage_metadata(
     })
 }
 
+/// Groups session rollups by bound agent and sorts by total tokens, then
+/// runs, then agent id, so the heaviest consumers list first.
 fn build_usage_agent_rows(
     sessions: &[journal::OrchestratorUsageSessionRecord],
     metadata: &UsageMetadata,
@@ -3147,6 +3384,8 @@ fn build_usage_agent_rows(
     rows
 }
 
+/// Groups session rollups by model profile with the same ordering as the
+/// agent rows; the model key comes from the bound agent's default profile.
 fn build_usage_model_rows(
     sessions: &[journal::OrchestratorUsageSessionRecord],
     metadata: &UsageMetadata,
@@ -3206,6 +3445,10 @@ fn build_usage_model_rows(
     rows
 }
 
+/// Returns `(agent_id, display_name, binding_source, default_model_profile)`
+/// for a session. A binding whose agent record is gone (deleted agent) still
+/// attributes usage to the agent id; unbound sessions collapse into the
+/// shared "unassigned" row.
 fn resolve_usage_agent_identity(
     session: &journal::OrchestratorUsageSessionRecord,
     metadata: &UsageMetadata,
@@ -3228,6 +3471,9 @@ fn resolve_usage_agent_identity(
     }
 }
 
+/// Returns `(model_id, display_name, model_source, agent_id)` for a session.
+/// Sessions without a resolvable agent (and therefore no default model
+/// profile) collapse into the shared "unassigned" row.
 fn resolve_usage_model_identity(
     session: &journal::OrchestratorUsageSessionRecord,
     metadata: &UsageMetadata,
@@ -3245,12 +3491,15 @@ fn resolve_usage_model_identity(
     }
 }
 
+/// In-progress agent rollup; latency is accumulated as a completed-run
+/// weighted total so the final average is run-weighted, not session-weighted.
 #[derive(Debug)]
 struct UsageAgentAccumulator {
     record: UsageAgentRecord,
     latency_weighted_total_ms: u128,
 }
 
+/// In-progress model rollup; tracks distinct agent ids for `agent_count`.
 #[derive(Debug)]
 struct UsageModelAccumulator {
     record: UsageModelRecord,
@@ -3271,6 +3520,8 @@ fn finalize_model_accumulator(mut aggregate: UsageModelAccumulator) -> UsageMode
     aggregate.record
 }
 
+// None (rather than zero) when nothing completed, so the JSON field is
+// omitted instead of implying a measured zero-latency average.
 fn weighted_latency(weighted_total_ms: u128, completed_runs: u64) -> Option<u64> {
     if completed_runs == 0 {
         return None;
@@ -3458,6 +3709,8 @@ fn csv_escape(value: &str) -> String {
     format!("\"{escaped}\"")
 }
 
+// CSV-injection defense: cells starting with a formula trigger character get
+// a leading apostrophe so spreadsheet apps treat them as text, not formulas.
 fn neutralize_csv_formula(value: &str) -> String {
     if matches!(value.chars().next(), Some('=' | '+' | '-' | '@' | '\t' | '\r' | '\n')) {
         format!("'{value}")
@@ -3479,6 +3732,8 @@ fn optional_f64(value: Option<f64>) -> String {
 }
 
 fn current_unix_ms() -> Result<i64, std::time::SystemTimeError> {
+    // Intentional narrowing: milliseconds since the epoch fit in i64 far
+    // beyond any realistic clock value.
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64)
 }
 
