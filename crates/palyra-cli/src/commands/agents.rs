@@ -167,11 +167,16 @@ pub(crate) async fn run_agents_async(
             let response = client.get_agent(normalize_agent_id_cli(agent_id.as_str())?).await?;
             let agent = response.agent.context("GetAgent returned empty agent payload")?;
             let model_routing = load_agent_model_routing_snapshot();
+            let cli_launch_cwd = std::env::current_dir().ok();
             if json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&json!({
-                        "agent": agent_to_json_with_model_routing(&agent, &model_routing),
+                        "agent": agent_show_to_json_with_model_routing(
+                            &agent,
+                            &model_routing,
+                            cli_launch_cwd.as_deref(),
+                        ),
                         "is_default": response.is_default,
                         "model_routing": model_routing.to_json(),
                         "resolved_execution_backend": empty_to_none(response.resolved_execution_backend),
@@ -197,6 +202,11 @@ pub(crate) async fn run_agents_async(
                     response.execution_backend_fallback_used
                 );
                 println!("agents.show.backend_reason {}", response.execution_backend_reason);
+                println!(
+                    "agents.show.workspace_binding mode=cli_launch_cwd_then_agent_workspace_roots cli_launch_workspace_root={} configured_workspace_roots={}",
+                    cli_launch_workspace_root_text(cli_launch_cwd.as_deref()),
+                    agent_workspace_roots_text(agent.workspace_roots.as_slice())
+                );
                 print_execution_backend_inventory(response.execution_backends.as_slice());
             }
         }
@@ -572,6 +582,54 @@ fn agent_to_json_with_model_routing(
     })
 }
 
+fn agent_show_to_json_with_model_routing(
+    agent: &gateway_v1::Agent,
+    routing: &AgentModelRoutingSnapshot,
+    cli_launch_cwd: Option<&Path>,
+) -> Value {
+    let mut payload = agent_to_json_with_model_routing(agent, routing);
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "agent_run_workspace_binding".to_owned(),
+            agent_run_workspace_binding_to_json_with_launch_cwd(agent, cli_launch_cwd),
+        );
+    }
+    payload
+}
+
+fn agent_run_workspace_binding_to_json_with_launch_cwd(
+    agent: &gateway_v1::Agent,
+    cli_launch_cwd: Option<&Path>,
+) -> Value {
+    let cli_launch_workspace_root = cli_launch_workspace_root_text(cli_launch_cwd);
+    let effective_first_workspace_root = if cli_launch_workspace_root == "unknown" {
+        agent.workspace_roots.first().cloned().map(Value::String).unwrap_or(Value::Null)
+    } else {
+        Value::String(cli_launch_workspace_root.clone())
+    };
+
+    json!({
+        "mode": "cli_launch_cwd_then_agent_workspace_roots",
+        "cli_launch_workspace_root": cli_launch_workspace_root,
+        "configured_workspace_roots": agent.workspace_roots.clone(),
+        "effective_first_workspace_root": effective_first_workspace_root,
+    })
+}
+
+fn cli_launch_workspace_root_text(cli_launch_cwd: Option<&Path>) -> String {
+    cli_launch_cwd
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn agent_workspace_roots_text(workspace_roots: &[String]) -> String {
+    if workspace_roots.is_empty() {
+        "none".to_owned()
+    } else {
+        workspace_roots.join(",")
+    }
+}
+
 // Session ids are redacted (presence-only) so binding listings cannot be used
 // to hijack or correlate live sessions.
 fn agent_binding_to_json(binding: &gateway_v1::AgentBinding) -> Value {
@@ -681,6 +739,8 @@ fn agent_resolution_source_label(raw: i32) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
     use tempfile::tempdir;
 
@@ -743,6 +803,25 @@ mod tests {
         assert_eq!(payload["default_model_profile_authoritative"], true);
         assert_eq!(payload["model_profile_authority"], "agent_registry");
         assert!(payload["model_profile_note"].is_null());
+    }
+
+    #[test]
+    fn agent_show_json_reports_cli_launch_workspace_binding() {
+        let routing = agent_model_routing_snapshot_from_status(&sample_models_status());
+        let mut agent = sample_agent("MiniMax-M2.7");
+        agent.workspace_roots = vec!["C:/palyra/state/workspace".to_owned()];
+
+        let payload = agent_show_to_json_with_model_routing(
+            &agent,
+            &routing,
+            Some(Path::new("/tmp/current-project")),
+        );
+
+        let binding = &payload["agent_run_workspace_binding"];
+        assert_eq!(binding["mode"], "cli_launch_cwd_then_agent_workspace_roots");
+        assert_eq!(binding["cli_launch_workspace_root"], "/tmp/current-project");
+        assert_eq!(binding["configured_workspace_roots"][0], "C:/palyra/state/workspace");
+        assert_eq!(binding["effective_first_workspace_root"], "/tmp/current-project");
     }
 
     #[test]

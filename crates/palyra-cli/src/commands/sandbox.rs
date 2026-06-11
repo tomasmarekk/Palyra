@@ -4,6 +4,7 @@
 //! through the standard secret-redaction pass before rendering.
 
 use crate::*;
+use std::path::Path;
 
 /// Runs a `palyra sandbox` subcommand against the live runtime tool policy.
 ///
@@ -225,6 +226,21 @@ fn emit_sandbox_explain(
                 join_json_string_list(process_runner.get("allowed_dns_suffixes"))
             );
             println!(
+                "sandbox.explain.process_runner_agent_run_binding mode={} cli_launch_workspace_root={} configured_workspace_root={}",
+                process_runner
+                    .get("agent_run_workspace_binding")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+                process_runner
+                    .get("cli_launch_workspace_root")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+                process_runner
+                    .get("configured_workspace_root")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+            );
+            println!(
                 "sandbox.explain.process_runner_hint value={}",
                 process_runner
                     .get("operator_hint")
@@ -298,6 +314,14 @@ fn emit_sandbox_explain(
 }
 
 fn sandbox_process_runner_view(policy: &Value) -> Value {
+    let cli_launch_cwd = std::env::current_dir().ok();
+    sandbox_process_runner_view_with_launch_cwd(policy, cli_launch_cwd.as_deref())
+}
+
+fn sandbox_process_runner_view_with_launch_cwd(
+    policy: &Value,
+    cli_launch_cwd: Option<&Path>,
+) -> Value {
     let allowlisted = policy.get("allowed_tools").and_then(Value::as_array).is_some_and(|tools| {
         tools.iter().filter_map(Value::as_str).any(|tool| tool == "palyra.process.run")
     });
@@ -305,6 +329,13 @@ fn sandbox_process_runner_view(policy: &Value) -> Value {
         policy.pointer("/process_runner/enabled").and_then(Value::as_bool).unwrap_or(false);
     let tier = policy.pointer("/process_runner/tier").and_then(Value::as_str).unwrap_or("unknown");
     let status = sandbox_status_label(enabled, allowlisted);
+    let configured_workspace_root = policy
+        .pointer("/process_runner/workspace_root")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let cli_launch_workspace_root = cli_launch_cwd
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".to_owned());
     json!({
         "name": "process_runner",
         "status": status,
@@ -313,7 +344,10 @@ fn sandbox_process_runner_view(policy: &Value) -> Value {
         "tier": tier,
         "isolation": if tier == "c" { "tier_c_os_enforced" } else { "tier_b_in_process" },
         "executor": process_runner_executor_label(tier),
-        "workspace_root": policy.pointer("/process_runner/workspace_root").and_then(Value::as_str).unwrap_or("unknown"),
+        "workspace_root": configured_workspace_root,
+        "configured_workspace_root": configured_workspace_root,
+        "agent_run_workspace_binding": "cli_launch_cwd_then_configured_roots",
+        "cli_launch_workspace_root": cli_launch_workspace_root,
         "allow_interpreters": policy.pointer("/process_runner/allow_interpreters").and_then(Value::as_bool).unwrap_or(false),
         "egress_enforcement_mode": policy
             .pointer("/process_runner/egress_enforcement_mode")
@@ -412,10 +446,13 @@ fn join_json_string_list(value: Option<&Value>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use serde_json::{json, Value};
 
     use super::{
-        join_json_string_list, process_runner_executor_label, sandbox_status_label,
+        join_json_string_list, process_runner_executor_label,
+        sandbox_process_runner_view_with_launch_cwd, sandbox_status_label,
         sandbox_tool_policy_from_admin_status_payload, sandbox_wasm_runtime_view,
     };
 
@@ -463,5 +500,27 @@ mod tests {
             join_json_string_list(wasm_runtime.get("allowed_secrets")),
             "db_password,api_token"
         );
+    }
+
+    #[test]
+    fn sandbox_process_runner_view_reports_cli_launch_workspace_binding() {
+        let policy = json!({
+            "allowed_tools": ["palyra.process.run"],
+            "process_runner": {
+                "enabled": true,
+                "tier": "b",
+                "workspace_root": "C:/palyra/state/workspace"
+            }
+        });
+
+        let view = sandbox_process_runner_view_with_launch_cwd(
+            &policy,
+            Some(Path::new("/tmp/current-project")),
+        );
+
+        assert_eq!(view["workspace_root"], "C:/palyra/state/workspace");
+        assert_eq!(view["configured_workspace_root"], "C:/palyra/state/workspace");
+        assert_eq!(view["cli_launch_workspace_root"], "/tmp/current-project");
+        assert_eq!(view["agent_run_workspace_binding"], "cli_launch_cwd_then_configured_roots");
     }
 }
