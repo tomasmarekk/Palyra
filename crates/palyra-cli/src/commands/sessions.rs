@@ -3,7 +3,7 @@
 //!
 //! Mixes the gateway gRPC operator runtime (session resolution, runs) with the admin
 //! console HTTP API (queue, compaction, checkpoints, background tasks). Text output
-//! redacts session keys, labels, and run ids; `--json` output preserves them.
+//! preserves command identifiers needed for resume/debug while redacting free-form labels.
 
 use crate::*;
 use palyra_common::runtime_contracts::{AuxiliaryTaskKind, AuxiliaryTaskState};
@@ -98,7 +98,7 @@ pub(crate) async fn run_sessions_async(
                 println!(
                     "sessions.list count={} next_after={} include_archived={}",
                     response.sessions.len(),
-                    redacted_text_or_none(!response.next_after_session_key.trim().is_empty()),
+                    empty_to_none(response.next_after_session_key.as_str()),
                     include_archived
                 );
                 for session in &response.sessions {
@@ -107,11 +107,11 @@ pub(crate) async fn run_sessions_async(
                         session_title_for_output(session),
                         empty_to_none(session.title_source.as_str()),
                         empty_to_none(session.preview.as_str()),
-                        redacted_text_or_none(!session.session_key.trim().is_empty()),
+                        empty_to_none(session.session_key.as_str()),
                         redacted_text_or_none(!session.session_label.trim().is_empty()),
                         session.updated_at_unix_ms,
                         empty_to_none(session.last_run_state.as_str()),
-                        redacted_presence_for_output(session.last_run_id.is_some()),
+                        optional_canonical_id_text(&session.last_run_id),
                         optional_unix_ms_text(session.archived_at_unix_ms)
                     );
                 }
@@ -176,7 +176,7 @@ pub(crate) async fn run_sessions_async(
                         first.preview.as_deref().unwrap_or("none"),
                         first.archived,
                         REDACTED,
-                        redacted_text_or_none(!first.session_key.trim().is_empty())
+                        empty_to_none(first.session_key.as_str())
                     );
                 }
             } else if json {
@@ -227,12 +227,12 @@ pub(crate) async fn run_sessions_async(
                     session_title_for_output(&session),
                     empty_to_none(session.title_source.as_str()),
                     empty_to_none(session.preview.as_str()),
-                    redacted_text_or_none(!session.session_key.trim().is_empty()),
+                    empty_to_none(session.session_key.as_str()),
                     redacted_text_or_none(!session.session_label.trim().is_empty()),
                     session.created_at_unix_ms,
                     session.updated_at_unix_ms,
                     empty_to_none(session.last_run_state.as_str()),
-                    redacted_presence_for_output(session.last_run_id.is_some()),
+                    optional_canonical_id_text(&session.last_run_id),
                     optional_unix_ms_text(session.archived_at_unix_ms)
                 );
             }
@@ -271,7 +271,7 @@ pub(crate) async fn run_sessions_async(
                     session_title_for_output(&session),
                     empty_to_none(session.title_source.as_str()),
                     empty_to_none(session.preview.as_str()),
-                    redacted_text_or_none(!session.session_key.trim().is_empty()),
+                    empty_to_none(session.session_key.as_str()),
                     redacted_text_or_none(!session.session_label.trim().is_empty()),
                     response.created,
                     response.reset_applied,
@@ -365,7 +365,7 @@ pub(crate) async fn run_sessions_async(
                 } else {
                     println!(
                         "sessions.cleanup.dry_run key={} archived_at_unix_ms={} would_archive={}",
-                        redacted_text_or_none(!session.session_key.trim().is_empty()),
+                        empty_to_none(session.session_key.as_str()),
                         optional_unix_ms_text(session.archived_at_unix_ms),
                         session.archived_at_unix_ms == 0
                     );
@@ -1183,9 +1183,17 @@ fn optional_canonical_id_json_value(value: &Option<common_v1::CanonicalId>) -> V
         .unwrap_or(Value::Null)
 }
 
-// Session keys, labels, and run ids may carry user-identifying routing data, so the
-// text renderers below print only `<redacted>`/`none` presence markers. JSON output
-// keeps the raw identifiers for scripting (pinned by session_to_json tests).
+fn optional_canonical_id_text(value: &Option<common_v1::CanonicalId>) -> String {
+    value
+        .as_ref()
+        .map(|id| id.ulid.trim())
+        .filter(|ulid| !ulid.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| "none".to_owned())
+}
+
+// Free-form labels and reasons may carry user-identifying content, so text
+// renderers print only `<redacted>`/`none` presence markers for those fields.
 fn redacted_text_or_none(present: bool) -> String {
     redacted_presence_for_output(present)
 }
@@ -1566,7 +1574,7 @@ mod render_tests {
 mod tests {
     use super::{
         build_cleanup_session_request, build_resolve_session_request,
-        build_session_retry_agent_run_input, session_to_json,
+        build_session_retry_agent_run_input, optional_canonical_id_text, session_to_json,
     };
     use crate::args::AgentApprovalModeArg;
     use crate::proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1};
@@ -1674,6 +1682,21 @@ mod tests {
         assert_eq!(
             payload.get("session_label").and_then(serde_json::Value::as_str),
             Some("Sensitive user label")
+        );
+    }
+
+    #[test]
+    fn text_identifier_renderer_preserves_resume_ids() {
+        assert_eq!(
+            optional_canonical_id_text(&Some(common_v1::CanonicalId {
+                ulid: " 01ARZ3NDEKTSV4RRFFQ69G5FAX ".to_owned(),
+            })),
+            "01ARZ3NDEKTSV4RRFFQ69G5FAX"
+        );
+        assert_eq!(optional_canonical_id_text(&None), "none");
+        assert_eq!(
+            optional_canonical_id_text(&Some(common_v1::CanonicalId { ulid: " ".to_owned() })),
+            "none"
         );
     }
 
