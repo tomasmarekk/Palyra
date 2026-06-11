@@ -1,3 +1,12 @@
+//! Request payload builders for the two provider chat dialects.
+//!
+//! [`ProviderChatAdapter`] turns a provider-neutral [`ProviderRequest`] into
+//! the JSON body each HTTP backend posts. The OpenAI-compatible dialect is a
+//! near-direct mapping; the Anthropic dialect requires reshaping: system and
+//! developer turns move into the top-level system block, tool results travel
+//! as user-turn content blocks adjacent to their tool_use, and orphan tool
+//! results degrade to plain text. Field names and value shapes here are wire
+//! contracts pinned by tests.
 use serde_json::{json, Value};
 
 use crate::application::tool_registry::{provider_tools_from_catalog_snapshot, ToolSchemaDialect};
@@ -7,6 +16,8 @@ use super::{
     ProviderMessageToolCall, ProviderRequest,
 };
 
+// Anthropic requires max_tokens on every request; this default applies when
+// the caller sets no explicit output budget.
 const DEFAULT_ANTHROPIC_MAX_OUTPUT_TOKENS: u64 = 4_096;
 
 fn build_openai_message_content(
@@ -31,6 +42,8 @@ fn build_openai_message_content(
         parts.push(openai_image_part(image));
     }
 
+    // A single text part collapses to a plain string: maximally compatible
+    // with OpenAI-likes that reject array content for text-only messages.
     if parts.len() == 1 {
         if let Some(text) = parts[0].get("text").and_then(Value::as_str) {
             return Value::String(text.to_owned());
@@ -49,6 +62,9 @@ fn openai_image_part(image: &ProviderImageInput) -> Value {
     })
 }
 
+/// Builds the OpenAI-compatible `messages` array, attaching request-level
+/// vision inputs to the most recent user turn (providers only accept images
+/// inside user messages).
 pub(super) fn build_openai_messages(request: &ProviderRequest) -> Vec<Value> {
     let mut messages = request.effective_messages();
     if !request.vision_inputs.is_empty() {
@@ -85,6 +101,8 @@ pub(super) fn build_openai_messages(request: &ProviderRequest) -> Vec<Value> {
                         })
                         .collect(),
                 );
+                // Tool-call-only assistant turns must carry null content, not
+                // an empty array, to satisfy strict OpenAI-compatible parsers.
                 if message.content.is_empty() {
                     payload["content"] = Value::Null;
                 }
@@ -156,6 +174,9 @@ fn build_anthropic_tool_result_content_part(message: &ProviderMessage) -> Value 
     })
 }
 
+// Anthropic rejects tool_result blocks whose tool_use_id has no matching
+// tool_use in the previous assistant turn; orphaned results are downgraded
+// to labeled plain text so the conversation still round-trips.
 fn build_anthropic_orphan_tool_result_text_part(message: &ProviderMessage) -> Value {
     let tool_call_id = message.tool_call_id.as_deref().unwrap_or("unknown");
     json!({
@@ -166,6 +187,10 @@ fn build_anthropic_orphan_tool_result_text_part(message: &ProviderMessage) -> Va
 
 // Some Anthropic-compatible endpoints validate flattened content block order and reject
 // `tool_use, tool_use, tool_result, tool_result`, even when official clients accept it.
+// When an assistant turn with 2+ tool calls is followed by exactly matching tool results
+// in order, expand it into interleaved assistant(tool_use)/user(tool_result) pairs and
+// return how many tool result messages were consumed; otherwise return None and let the
+// caller emit the message unchanged.
 fn push_anthropic_expanded_multi_tool_exchange(
     provider_messages: &mut Vec<Value>,
     assistant_message: &ProviderMessage,
@@ -216,6 +241,13 @@ fn push_anthropic_expanded_multi_tool_exchange(
     Some(tool_result_count)
 }
 
+/// Builds the Anthropic `messages` array and the extracted system prompt.
+///
+/// Reshaping rules: system/developer turns concatenate into the returned
+/// system string; consecutive tool results matching the preceding assistant
+/// turn's tool calls stay adjacent (batched into one user turn, or expanded
+/// pairwise for multi-tool exchanges); unmatched tool results become labeled
+/// text; vision inputs attach to the most recent user turn.
 pub(super) fn build_anthropic_messages_and_system(
     request: &ProviderRequest,
 ) -> (Vec<Value>, Option<String>) {
@@ -254,6 +286,9 @@ pub(super) fn build_anthropic_messages_and_system(
                 }
             }
             ProviderMessageRole::Tool => {
+                // Results must answer the preceding assistant turn's tool
+                // calls in order; matching results batch into one user turn,
+                // anything else is treated as an orphan.
                 let expected_id = expected_tool_result_ids.first().map(String::as_str);
                 if message.tool_call_id.as_deref() == expected_id {
                     pending_tool_result_parts
@@ -304,10 +339,14 @@ pub(super) fn build_anthropic_messages_and_system(
     (provider_messages, (!system_blocks.is_empty()).then(|| system_blocks.join("\n\n")))
 }
 
+/// Builds the dialect-specific JSON body for one chat completion request.
 pub(super) trait ProviderChatAdapter {
+    /// Serializes `request` into the wire payload targeting `model_name`.
     fn request_payload(&self, request: &ProviderRequest, model_name: &str) -> Value;
 }
 
+/// Adapter for the OpenAI chat-completions dialect (also used by compatible
+/// third-party endpoints).
 pub(super) struct OpenAiCompatibleChatAdapter;
 
 impl ProviderChatAdapter for OpenAiCompatibleChatAdapter {
@@ -335,6 +374,7 @@ impl ProviderChatAdapter for OpenAiCompatibleChatAdapter {
     }
 }
 
+/// Adapter for the Anthropic messages dialect (Anthropic and MiniMax).
 pub(super) struct AnthropicCompatibleChatAdapter;
 
 impl ProviderChatAdapter for AnthropicCompatibleChatAdapter {
@@ -354,6 +394,8 @@ impl ProviderChatAdapter for AnthropicCompatibleChatAdapter {
                 body["tools"] = Value::Array(tools);
             }
         }
+        // Anthropic has no response_format parameter; JSON mode is enforced
+        // through a system-prompt instruction instead.
         let system = if request.json_mode {
             Some(system.map_or_else(
                 || "Return valid JSON only.".to_owned(),

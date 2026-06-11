@@ -1,7 +1,15 @@
+//! Stable, redacted provider error envelope.
+//!
+//! Translates an internal [`ProviderError`] plus its failure classification
+//! into the serialized shape consumed by console, journal, and channel
+//! surfaces: a coarse kind/severity/retryability triple, a failover
+//! eligibility flag, and a message scrubbed of credential material. The
+//! serde shape is a published contract; extend it additively only.
 use serde::{Deserialize, Serialize};
 
 use super::{sanitize_remote_error, ProviderError, ProviderFailureClass, ProviderFailureSnapshot};
 
+/// Coarse error category exposed to envelope consumers.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderErrorKind {
@@ -18,6 +26,8 @@ pub enum ProviderErrorKind {
     Internal,
 }
 
+/// How damaging the failure is for the current run, from recoverable
+/// (retry/failover possible) to fatal (operator action required).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderErrorSeverity {
@@ -26,6 +36,7 @@ pub enum ProviderErrorSeverity {
     Fatal,
 }
 
+/// Whether and how the failed operation may be retried.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderRetryability {
@@ -35,6 +46,10 @@ pub enum ProviderRetryability {
     RefreshCredential,
 }
 
+/// Serialized provider failure surfaced outside the daemon core.
+///
+/// `redacted_message` has passed credential scrubbing and is safe to log,
+/// persist, and show to operators; the raw upstream body is never carried.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderErrorEnvelope {
     pub kind: ProviderErrorKind,
@@ -48,6 +63,9 @@ pub struct ProviderErrorEnvelope {
 }
 
 impl ProviderErrorEnvelope {
+    /// Builds the envelope for `error`, deriving kind, retryability,
+    /// failover eligibility, and severity from its failure classification
+    /// and redacting the message for safe exposure.
     #[must_use]
     pub fn from_error(error: &ProviderError) -> Self {
         let classification = error.failure_snapshot();
@@ -61,6 +79,9 @@ impl ProviderErrorEnvelope {
                     | ProviderErrorKind::Timeout
                     | ProviderErrorKind::MalformedResponse
             ) || matches!(classification.recommended_action.as_str(), "provider_failover");
+        // Severity is derived, not stored: anything retryable or failover
+        // eligible is recoverable by definition; malformed/internal failures
+        // degrade the run; everything else needs operator action.
         let severity = if failover_eligible || retryability != ProviderRetryability::NotRetryable {
             ProviderErrorSeverity::Recoverable
         } else if matches!(kind, ProviderErrorKind::MalformedResponse | ProviderErrorKind::Internal)

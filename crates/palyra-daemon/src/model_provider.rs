@@ -1,3 +1,20 @@
+//! Model/provider orchestration: registry-backed routing across chat,
+//! embeddings, and audio-transcription backends with retries, circuit
+//! breaking, response caching, and console status snapshots.
+//!
+//! Provider abstraction model: [`ModelProvider`] (chat completion, audio
+//! transcription, status) and [`EmbeddingsProvider`] are the runtime traits.
+//! Concrete backends are a deterministic offline provider (fixtures, smoke
+//! flows), an OpenAI-compatible HTTP provider, and an Anthropic-compatible
+//! HTTP provider that also serves MiniMax via bearer auth.
+//! [`RegistryBackedModelProvider`] composes per-provider runtimes from
+//! [`ModelProviderRegistryConfig`] and fails over between providers when the
+//! primary candidate errors.
+//!
+//! Streaming semantics: upstream HTTP calls are non-streaming; each full turn
+//! output is re-chunked into bounded [`ProviderEvent::ModelToken`] preview
+//! events (see the `streaming` and `contract` submodules) so the orchestrator
+//! consumes one uniform event stream regardless of backend.
 use std::{
     collections::{hash_map::DefaultHasher, HashMap},
     future::Future,
@@ -49,6 +66,8 @@ const OPENAI_EMBEDDINGS_PATH: &str = "/embeddings";
 const OPENAI_AUDIO_TRANSCRIPTIONS_PATH: &str = "/audio/transcriptions";
 const ANTHROPIC_MESSAGES_PATH: &str = "/v1/messages";
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
+// Shared by all HTTP backends; 529 is the Anthropic/MiniMax overload status
+// and must be retried like the other transient upstream codes.
 const OPENAI_RETRYABLE_STATUS_CODES: &[u16] = &[429, 500, 502, 503, 504, 529];
 // Keep provider envelope above default wasm module quota (256KiB) including base64 and JSON overhead.
 const MAX_TOOL_ARGUMENT_BYTES: usize = 512 * 1024;
@@ -68,6 +87,11 @@ const DETERMINISTIC_TOOL_FIXTURE_WRITE_CALL_ID: &str = "deterministic-fixture-wr
 const DETERMINISTIC_TOOL_FIXTURE_READ_CALL_ID: &str = "deterministic-fixture-read";
 const DETERMINISTIC_TOOL_FIXTURE_REPORT: &str = "# Deterministic Provider Fixture\n\nfixture_id: deterministic-provider-tool-call-v1\nstatus: passed\nprovider: deterministic\n";
 
+/// Transport/protocol family a provider speaks.
+///
+/// `Anthropic` also covers Anthropic-compatible endpoints such as MiniMax;
+/// the auth header style is selected separately via
+/// [`ModelProviderAuthProviderKind`].
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelProviderKind {
@@ -77,6 +101,7 @@ pub enum ModelProviderKind {
 }
 
 impl ModelProviderKind {
+    /// Returns the canonical snake_case identifier used in config and snapshots.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -86,6 +111,10 @@ impl ModelProviderKind {
         }
     }
 
+    /// Parses a provider kind from a config string, accepting common aliases.
+    ///
+    /// # Errors
+    /// Returns an error when `value` does not name a supported provider kind.
     pub fn parse(value: &str) -> Result<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "deterministic" => Ok(Self::Deterministic),
@@ -96,6 +125,7 @@ impl ModelProviderKind {
     }
 }
 
+/// Functional role a registry model entry fulfills.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderModelRole {
@@ -105,6 +135,7 @@ pub enum ProviderModelRole {
 }
 
 impl ProviderModelRole {
+    /// Returns the canonical snake_case identifier used in config and snapshots.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -115,6 +146,7 @@ impl ProviderModelRole {
     }
 }
 
+/// Origin of a model capability record, for audit and override precedence.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderMetadataSource {
@@ -125,6 +157,7 @@ pub enum ProviderMetadataSource {
 }
 
 impl ProviderMetadataSource {
+    /// Returns the canonical snake_case identifier used in config and snapshots.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -136,6 +169,7 @@ impl ProviderMetadataSource {
     }
 }
 
+/// Coarse cost bucket used to rank failover candidates (cheapest first).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderCostTier {
@@ -145,6 +179,7 @@ pub enum ProviderCostTier {
 }
 
 impl ProviderCostTier {
+    /// Returns the canonical snake_case identifier used in capability snapshots.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -155,6 +190,7 @@ impl ProviderCostTier {
     }
 }
 
+/// Coarse latency bucket used as a failover tiebreaker after cost.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderLatencyTier {
@@ -164,6 +200,7 @@ pub enum ProviderLatencyTier {
 }
 
 impl ProviderLatencyTier {
+    /// Returns the canonical snake_case identifier used in capability snapshots.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -174,6 +211,8 @@ impl ProviderLatencyTier {
     }
 }
 
+/// Configuration for one provider endpoint in the registry: transport kind,
+/// base URL policy, credential references, and retry/circuit-breaker tuning.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderRegistryEntryConfig {
     pub provider_id: String,
@@ -195,6 +234,8 @@ pub struct ProviderRegistryEntryConfig {
     pub circuit_breaker_cooldown_ms: u64,
 }
 
+/// Configuration for one model exposed by a registry provider, including the
+/// capability envelope used for request/candidate matching.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderModelEntryConfig {
     pub model_id: String,
@@ -206,6 +247,11 @@ pub struct ProviderModelEntryConfig {
     pub capabilities: ProviderCapabilitiesSnapshot,
 }
 
+/// Full provider registry: provider endpoints, model entries, role defaults,
+/// and failover/cache/discovery/health tuning.
+///
+/// An empty registry is back-filled from the legacy single-provider fields of
+/// [`ModelProviderConfig`] by [`ModelProviderConfig::normalized_registry`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelProviderRegistryConfig {
     pub providers: Vec<ProviderRegistryEntryConfig>,
@@ -239,6 +285,8 @@ impl Default for ModelProviderRegistryConfig {
     }
 }
 
+/// Vendor behind an auth profile; selects credential semantics such as the
+/// auth header style on Anthropic-compatible transports.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelProviderAuthProviderKind {
@@ -248,6 +296,7 @@ pub enum ModelProviderAuthProviderKind {
 }
 
 impl ModelProviderAuthProviderKind {
+    /// Returns the canonical snake_case identifier used in config and snapshots.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -257,6 +306,10 @@ impl ModelProviderAuthProviderKind {
         }
     }
 
+    /// Parses an auth provider kind from a config string, accepting aliases.
+    ///
+    /// # Errors
+    /// Returns an error when `value` does not name a supported auth provider.
     pub fn parse(value: &str) -> Result<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "openai" | "openai_compatible" | "openai-compatible" => Ok(Self::Openai),
@@ -267,10 +320,14 @@ impl ModelProviderAuthProviderKind {
     }
 }
 
+// MiniMax exposes an Anthropic-compatible messages API but authenticates with
+// an Authorization bearer header instead of Anthropic's x-api-key header.
 fn anthropic_compatible_uses_bearer_auth(kind: Option<ModelProviderAuthProviderKind>) -> bool {
     matches!(kind, Some(ModelProviderAuthProviderKind::Minimax))
 }
 
+/// Where a provider credential was sourced from, for audit display; the raw
+/// secret itself is never exposed in snapshots.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelProviderCredentialSource {
@@ -282,6 +339,7 @@ pub enum ModelProviderCredentialSource {
 }
 
 impl ModelProviderCredentialSource {
+    /// Returns the canonical snake_case identifier used in config and snapshots.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -294,6 +352,12 @@ impl ModelProviderCredentialSource {
     }
 }
 
+/// Top-level model provider configuration.
+///
+/// The flat `openai_*`/`anthropic_*` fields are the legacy single-provider
+/// surface; `registry` is the multi-provider surface. When the registry is
+/// empty it is synthesized from the legacy fields so both shapes behave
+/// identically downstream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelProviderConfig {
     pub kind: ModelProviderKind,
@@ -352,6 +416,14 @@ impl Default for ModelProviderConfig {
 }
 
 impl ModelProviderConfig {
+    /// Returns the validated provider registry, synthesizing one from the
+    /// legacy single-provider fields when no registry is configured.
+    ///
+    /// # Errors
+    /// Returns an error when the registry is structurally invalid: zero TTLs
+    /// or cache sizes, missing providers/models, duplicate or malformed
+    /// identifiers, unknown provider references, disallowed private base
+    /// URLs, or default models with a mismatched role.
     pub fn normalized_registry(&self) -> Result<ModelProviderRegistryConfig> {
         let mut registry = self.registry.clone();
         if registry.providers.is_empty() && registry.models.is_empty() {
@@ -361,6 +433,8 @@ impl ModelProviderConfig {
         Ok(registry)
     }
 
+    /// Returns the effective default chat model id, falling back to the
+    /// legacy per-kind model fields when the registry defines none.
     #[must_use]
     #[allow(dead_code)]
     pub fn default_chat_model_id(&self) -> Option<String> {
@@ -373,6 +447,8 @@ impl ModelProviderConfig {
         )
     }
 
+    /// Returns the effective default embeddings model id, falling back to the
+    /// legacy `openai_embeddings_model` field when the registry defines none.
     #[must_use]
     #[allow(dead_code)]
     pub fn default_embeddings_model_id(&self) -> Option<String> {
@@ -383,6 +459,8 @@ impl ModelProviderConfig {
     }
 }
 
+// Synthesizes a one-provider registry from the legacy flat config fields so
+// pre-registry deployments keep working unchanged.
 fn legacy_registry_from_config(config: &ModelProviderConfig) -> ModelProviderRegistryConfig {
     let provider_id = match (config.kind, config.auth_profile_provider_kind) {
         (ModelProviderKind::Deterministic, _) => "deterministic-primary".to_owned(),
@@ -1076,6 +1154,8 @@ fn provider_route_reason(
     }
 }
 
+/// Audit record of one provider/model attempt within a single completion,
+/// covering cache hits, failover hops, and terminal errors.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderAttemptSummary {
     pub provider_id: String,
@@ -1087,11 +1167,15 @@ pub struct ProviderAttemptSummary {
     pub reason_code: Option<String>,
 }
 
+/// Batch of texts to embed; validated against batch and byte limits before
+/// any provider call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddingsRequest {
     pub inputs: Vec<String>,
 }
 
+/// Embedding vectors in the same order as the request inputs; all vectors
+/// share `dimensions`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EmbeddingsResponse {
     pub model_name: String,
@@ -1100,6 +1184,7 @@ pub struct EmbeddingsResponse {
     pub retry_count: u32,
 }
 
+/// Audio payload plus optional transcription hints (prompt, language).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioTranscriptionRequest {
     pub file_name: String,
@@ -1109,6 +1194,8 @@ pub struct AudioTranscriptionRequest {
     pub language: Option<String>,
 }
 
+/// One timed transcript segment; `confidence` is provider-derived when
+/// available.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AudioTranscriptionSegment {
     pub start_ms: u64,
@@ -1117,6 +1204,7 @@ pub struct AudioTranscriptionSegment {
     pub confidence: Option<f64>,
 }
 
+/// Full transcription result: flattened text plus per-segment timing.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AudioTranscriptionResponse {
     pub text: String,
@@ -1127,6 +1215,12 @@ pub struct AudioTranscriptionResponse {
     pub segments: Vec<AudioTranscriptionSegment>,
 }
 
+/// Terminal failure of a provider operation after the per-provider retry
+/// budget is spent.
+///
+/// Display strings are part of the operator-facing contract (tests and
+/// fixtures assert on them); change them only deliberately. Each error maps
+/// to a [`ProviderFailureClassification`] for recovery routing.
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
     #[error("model provider circuit breaker is open; retry after {retry_after_ms}ms")]
@@ -1167,6 +1261,8 @@ pub enum ProviderError {
 }
 
 impl ProviderError {
+    /// Returns how many retries were attempted before this error became
+    /// terminal (zero for errors raised before any request was sent).
     #[must_use]
     pub const fn retry_count(&self) -> u32 {
         match self {
@@ -1176,11 +1272,14 @@ impl ProviderError {
         }
     }
 
+    /// Returns true when the request was rejected by an open circuit breaker.
     #[must_use]
     pub const fn is_circuit_open(&self) -> bool {
         matches!(self, Self::CircuitOpen { .. })
     }
 
+    /// Returns the failure classification driving recovery routing
+    /// (retry, failover, credential rotation, fail closed).
     #[must_use]
     pub fn classification(&self) -> ProviderFailureClassification {
         match self {
@@ -1227,6 +1326,8 @@ impl ProviderError {
         }
     }
 
+    /// Builds the serializable failure snapshot (classification, recovery
+    /// plan, and a message safe for journaling) for this error.
     #[must_use]
     pub fn failure_snapshot(&self) -> ProviderFailureSnapshot {
         let message = match self {
@@ -1254,12 +1355,16 @@ impl ProviderError {
         }
     }
 
+    /// Builds the stable, redacted error envelope surfaced to console/journal
+    /// consumers.
     #[must_use]
     pub fn envelope(&self) -> ProviderErrorEnvelope {
         ProviderErrorEnvelope::from_error(self)
     }
 }
 
+/// Fine-grained failure class derived from HTTP status, response body
+/// keywords, and transport errors; the primary key for recovery decisions.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderFailureClass {
@@ -1278,6 +1383,7 @@ pub enum ProviderFailureClass {
 }
 
 impl ProviderFailureClass {
+    /// Returns the canonical snake_case identifier used in failure snapshots.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -1297,6 +1403,7 @@ impl ProviderFailureClass {
     }
 }
 
+/// Action the runtime recommends in response to a classified failure.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderFailureAction {
@@ -1309,6 +1416,7 @@ pub enum ProviderFailureAction {
 }
 
 impl ProviderFailureAction {
+    /// Returns the canonical snake_case identifier used in failure snapshots.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -1322,6 +1430,7 @@ impl ProviderFailureAction {
     }
 }
 
+/// Coarse failure category in the recovery-plan taxonomy shown to operators.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderFailureCategory {
@@ -1337,6 +1446,7 @@ pub enum ProviderFailureCategory {
 }
 
 impl ProviderFailureCategory {
+    /// Returns the canonical snake_case identifier used in recovery plans.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -1353,6 +1463,8 @@ impl ProviderFailureCategory {
     }
 }
 
+/// Recovery step suggested to the orchestrator/operator for a failure
+/// category.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderRecoveryAction {
@@ -1365,6 +1477,7 @@ pub enum ProviderRecoveryAction {
 }
 
 impl ProviderRecoveryAction {
+    /// Returns the canonical snake_case identifier used in recovery plans.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -1378,6 +1491,8 @@ impl ProviderRecoveryAction {
     }
 }
 
+/// Serialized recovery plan: failure category, suggested action, and an
+/// optional retry delay.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderRecoveryPlanSnapshot {
     pub category: String,
@@ -1386,6 +1501,8 @@ pub struct ProviderRecoveryPlanSnapshot {
     pub retry_after_ms: Option<u64>,
 }
 
+/// Typed failure classification: class, recommended action, originating HTTP
+/// status, and an internal trace detail keyed by call site.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderFailureClassification {
     pub class: ProviderFailureClass,
@@ -1397,6 +1514,7 @@ pub struct ProviderFailureClassification {
 }
 
 impl ProviderFailureClassification {
+    /// Creates a classification from its parts.
     #[must_use]
     pub const fn new(
         class: ProviderFailureClass,
@@ -1407,6 +1525,8 @@ impl ProviderFailureClassification {
         Self { class, recommended_action, status_code, provider_detail }
     }
 
+    /// Renders this classification into a serializable snapshot carrying
+    /// `message`; the recovery plan is derived from the failure class.
     #[must_use]
     pub fn snapshot(&self, message: String) -> ProviderFailureSnapshot {
         ProviderFailureSnapshot {
@@ -1420,6 +1540,8 @@ impl ProviderFailureClassification {
     }
 }
 
+/// Serializable failure record stored in runtime metrics and journals; the
+/// message must already be safe to persist.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderFailureSnapshot {
     pub class: String,
@@ -1433,6 +1555,7 @@ pub struct ProviderFailureSnapshot {
 }
 
 impl ProviderFailureSnapshot {
+    /// Sets the recovery plan retry delay (used for circuit-open failures).
     #[must_use]
     pub fn with_retry_after_ms(mut self, retry_after_ms: Option<u64>) -> Self {
         self.recovery.retry_after_ms = retry_after_ms;
@@ -1440,6 +1563,8 @@ impl ProviderFailureSnapshot {
     }
 }
 
+/// Capability envelope advertised for a model: supported features, context
+/// budget, and cost/latency tiers used for candidate ranking.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderCapabilitiesSnapshot {
     pub streaming_tokens: bool,
@@ -1569,6 +1694,10 @@ fn user_action_provider_classification(
     )
 }
 
+// Body keyword checks deliberately outrank generic status checks: providers
+// report quota/context/policy failures under varying status codes (400, 403,
+// 413, 429), and the body text is the more reliable discriminator. Order
+// matters; quota outranks context outranks policy outranks status fallbacks.
 fn classify_http_provider_failure(
     status_code: u16,
     retryable: bool,
@@ -1666,12 +1795,14 @@ fn retryable_invalid_response_classification(
     )
 }
 
+/// Configured retry budget: attempt count and base backoff delay.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProviderRetryPolicySnapshot {
     pub max_retries: u32,
     pub retry_backoff_ms: u64,
 }
 
+/// Point-in-time circuit breaker state for one provider.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProviderCircuitBreakerSnapshot {
     pub failure_threshold: u32,
@@ -1680,6 +1811,8 @@ pub struct ProviderCircuitBreakerSnapshot {
     pub open: bool,
 }
 
+/// Aggregated request/error/latency/token counters for one provider runtime;
+/// `error_rate_bps` is in basis points (1/10000).
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProviderRuntimeMetricsSnapshot {
     pub request_count: u64,
@@ -1703,6 +1836,8 @@ pub struct ProviderRuntimeMetricsSnapshot {
     pub last_error: Option<ProviderFailureSnapshot>,
 }
 
+/// Latest health probe outcome for a provider; `source` records whether the
+/// probe was static, registry-derived, or runtime-observed.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProviderHealthProbeSnapshot {
     pub state: String,
@@ -1714,6 +1849,8 @@ pub struct ProviderHealthProbeSnapshot {
     pub source: String,
 }
 
+/// Model discovery status for a provider, including the model ids currently
+/// believed to be available.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProviderDiscoverySnapshot {
     pub status: String,
@@ -1728,6 +1865,9 @@ pub struct ProviderDiscoverySnapshot {
     pub message: Option<String>,
 }
 
+/// Console-facing view of one registry provider: identity, configuration
+/// flags, and live retry/circuit/health/discovery state. Secrets are reduced
+/// to the `api_key_configured` boolean.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProviderRegistryProviderSnapshot {
     pub provider_id: String,
@@ -1751,6 +1891,8 @@ pub struct ProviderRegistryProviderSnapshot {
     pub discovery: ProviderDiscoverySnapshot,
 }
 
+/// Union of capabilities across the enabled models reachable through one
+/// credential.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProviderCredentialCapabilitySummary {
     pub chat: bool,
@@ -1761,6 +1903,8 @@ pub struct ProviderCredentialCapabilitySummary {
     pub max_context_tokens: Option<u32>,
 }
 
+/// Console-facing view of one provider credential: availability state,
+/// capability summary, and runtime health. Never carries secret material.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProviderRegistryCredentialSnapshot {
     pub credential_id: String,
@@ -1778,6 +1922,7 @@ pub struct ProviderRegistryCredentialSnapshot {
     pub runtime_metrics: ProviderRuntimeMetricsSnapshot,
 }
 
+/// Console-facing view of one registry model entry.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProviderRegistryModelSnapshot {
     pub model_id: String,
@@ -1787,6 +1932,8 @@ pub struct ProviderRegistryModelSnapshot {
     pub capabilities: ProviderCapabilitiesSnapshot,
 }
 
+/// Console-facing view of the whole registry: role defaults, failover/cache
+/// flags, and per-provider/credential/model snapshots.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProviderRegistrySnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1803,6 +1950,7 @@ pub struct ProviderRegistrySnapshot {
     pub models: Vec<ProviderRegistryModelSnapshot>,
 }
 
+/// Why one chat candidate was or was not routable at snapshot time.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProviderRouteCandidateTrace {
     pub provider_id: String,
@@ -1815,6 +1963,8 @@ pub struct ProviderRouteCandidateTrace {
     pub reason_code: String,
 }
 
+/// Explainable routing trace: which model would be selected for chat and how
+/// every other candidate was ranked or excluded.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProviderRouteSelectionTrace {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1830,6 +1980,7 @@ pub struct ProviderRouteSelectionTrace {
 }
 
 impl ProviderRouteSelectionTrace {
+    /// Returns a trace with no candidates, timestamped now.
     #[must_use]
     pub fn empty() -> Self {
         Self {
@@ -1843,6 +1994,7 @@ impl ProviderRouteSelectionTrace {
     }
 }
 
+/// Point-in-time response cache statistics.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProviderResponseCacheSnapshot {
     pub enabled: bool,
@@ -1851,6 +2003,12 @@ pub struct ProviderResponseCacheSnapshot {
     pub miss_count: u64,
 }
 
+/// Complete provider status surfaced over the console API: default provider
+/// identity, capabilities, retry/circuit/cache/health/discovery state, the
+/// full registry view, and the route selection trace.
+///
+/// The legacy `openai_*`/`anthropic_*` fields mirror the default provider so
+/// older console clients keep working.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProviderStatusSnapshot {
     pub kind: String,
@@ -1888,30 +2046,67 @@ pub struct ProviderStatusSnapshot {
     pub route_selection: ProviderRouteSelectionTrace,
 }
 
+/// Runtime contract every chat-capable model backend implements.
+///
+/// Implementations own their retry, circuit-breaker, and metrics policies;
+/// callers see only the terminal [`ProviderResponse`]/[`ProviderError`].
+/// Methods return boxed futures so the trait stays object-safe behind
+/// `Arc<dyn ModelProvider>`.
 pub trait ModelProvider: Send + Sync {
+    /// Runs one chat completion turn, including any internal retries and the
+    /// translation of provider output into uniform [`ProviderEvent`]s.
+    ///
+    /// # Errors
+    /// Returns a [`ProviderError`] once the retry budget is exhausted or the
+    /// request is rejected up front (missing credential, open circuit,
+    /// unsupported capability).
     fn complete<'a>(
         &'a self,
         request: ProviderRequest,
     ) -> Pin<Box<dyn Future<Output = Result<ProviderResponse, ProviderError>> + Send + 'a>>;
+    /// Transcribes an audio payload with the provider's transcription model.
+    ///
+    /// # Errors
+    /// Returns a [`ProviderError`] when the backend does not support audio
+    /// transcription or the upstream request ultimately fails.
     fn transcribe_audio<'a>(
         &'a self,
         request: AudioTranscriptionRequest,
     ) -> Pin<Box<dyn Future<Output = Result<AudioTranscriptionResponse, ProviderError>> + Send + 'a>>;
+    /// Returns the current status snapshot for console/diagnostics surfaces.
     fn status_snapshot(&self) -> ProviderStatusSnapshot;
 }
 
+/// Runtime contract for text-embedding backends.
 pub trait EmbeddingsProvider: Send + Sync {
+    /// Embeds a validated batch of inputs, preserving input order.
+    ///
+    /// # Errors
+    /// Returns [`ProviderError::InvalidEmbeddingsRequest`] for batches that
+    /// violate size limits, and other [`ProviderError`] variants for
+    /// credential or upstream failures.
     fn embed<'a>(
         &'a self,
         request: EmbeddingsRequest,
     ) -> Pin<Box<dyn Future<Output = Result<EmbeddingsResponse, ProviderError>> + Send + 'a>>;
 }
 
+/// Builds the registry-backed model provider from validated configuration.
+///
+/// # Errors
+/// Returns an error when the configuration fails validation (timeouts,
+/// retry/circuit tuning, base URL network policy, or registry shape).
 pub fn build_model_provider(config: &ModelProviderConfig) -> Result<Arc<dyn ModelProvider>> {
     validate_model_provider_config(config)?;
     Ok(Arc::new(RegistryBackedModelProvider::new(config.clone())?))
 }
 
+/// Builds the embeddings provider matching `config.kind`.
+///
+/// # Errors
+/// Returns an error when configuration validation fails, when the
+/// OpenAI-compatible backend lacks an embeddings model, or when the kind
+/// (Anthropic) exposes no embeddings adapter.
 pub fn build_embeddings_provider(
     config: &ModelProviderConfig,
 ) -> Result<Arc<dyn EmbeddingsProvider>> {
@@ -1962,6 +2157,16 @@ fn validate_model_provider_config(config: &ModelProviderConfig) -> Result<()> {
     Ok(())
 }
 
+/// Enforces the SSRF guard on a provider base URL: localhost, private, and
+/// special-use addresses are rejected unless `allow_private_base_url` is set.
+///
+/// Hostnames are resolved eagerly and the guard fails closed when resolution
+/// fails or yields any private/local address.
+///
+/// # Errors
+/// Returns an error when the URL is malformed, lacks a host or resolvable
+/// port, cannot be resolved, or targets a private/local network without the
+/// explicit opt-in.
 pub fn validate_openai_base_url_network_policy(
     base_url: &str,
     allow_private_base_url: bool,
@@ -2049,6 +2254,7 @@ fn is_localhost_hostname(host: &str) -> bool {
     normalized == "localhost" || normalized.ends_with(".localhost")
 }
 
+/// One instantiated provider backend paired with its registry entry.
 struct RegistryProviderRuntime {
     entry: ProviderRegistryEntryConfig,
     provider: Arc<dyn ModelProvider>,
@@ -2069,6 +2275,9 @@ struct ProviderResponseCacheState {
     miss_count: u64,
 }
 
+/// Routing facade over all configured provider runtimes: per-request
+/// candidate ordering, cross-provider failover, a TTL-bounded response
+/// cache, and aggregate runtime metrics.
 struct RegistryBackedModelProvider {
     config: ModelProviderConfig,
     registry: ModelProviderRegistryConfig,
@@ -2216,6 +2425,8 @@ impl RegistryBackedModelProvider {
                 ),
             })?;
 
+        // Deterministic fallback order: cheapest first, then lowest latency,
+        // then model id as a stable tiebreaker.
         let mut fallbacks = compatible
             .into_iter()
             .filter(|model| model.model_id != primary.model_id)
@@ -2230,6 +2441,9 @@ impl RegistryBackedModelProvider {
                 .then_with(|| left.model_id.cmp(&right.model_id))
         });
         let mut ordered = vec![primary];
+        // An explicit model override pins the request to that model: no
+        // failover. Fallbacks on the primary's own provider are skipped too,
+        // since a provider-level failure would hit them identically.
         if self.registry.failover_enabled && request.model_override.is_none() {
             ordered.extend(
                 fallbacks.into_iter().filter(|model| model.provider_id != primary.provider_id),
@@ -2238,6 +2452,9 @@ impl RegistryBackedModelProvider {
         Ok(ordered)
     }
 
+    // The key hashes only request fields that affect the model's answer.
+    // Volatile tool catalog audit metadata (snapshot id, hash, timestamp) is
+    // stripped first so re-issued identical requests still hit the cache.
     fn response_cache_key(
         &self,
         request: &ProviderRequest,
@@ -2289,6 +2506,9 @@ impl RegistryBackedModelProvider {
             return None;
         }
         cache.hit_count = cache.hit_count.saturating_add(1);
+        // Rewrite identity and attempt metadata: a cache hit must report the
+        // current candidate and a clean cache_hit attempt trail, not the
+        // retries/failovers of the original upstream call.
         let mut response = entry.response;
         response.provider_id = model.provider_id.clone();
         response.model_id = model.model_id.clone();
@@ -2307,6 +2527,8 @@ impl RegistryBackedModelProvider {
     }
 
     fn insert_cached_response(&self, cache_key: String, response: &ProviderResponse) {
+        // Responses carrying tool proposals are never cached: replaying one
+        // would skip approval flows and re-execute side effects.
         if !self.registry.response_cache_enabled
             || response.served_from_cache
             || response
@@ -2331,6 +2553,9 @@ impl RegistryBackedModelProvider {
                 response: response.clone(),
             },
         );
+        // FIFO eviction by insertion sequence: entries are short-lived (TTL
+        // in the tens of seconds), so recency tracking would add complexity
+        // without measurable benefit.
         while cache.entries.len() > self.registry.response_cache_max_entries {
             let Some(oldest_key) = cache
                 .entries
@@ -2513,6 +2738,8 @@ impl ModelProvider for RegistryBackedModelProvider {
             let mut last_error = None;
 
             for (index, model) in candidates.iter().enumerate() {
+                // Registry normalization guarantees every model references a
+                // known provider; a miss here means internal state corruption.
                 let runtime = self
                     .providers
                     .get(model.provider_id.as_str())
@@ -2565,6 +2792,10 @@ impl ModelProvider for RegistryBackedModelProvider {
                         return Ok(response);
                     }
                     Err(error) => {
+                        // Missing-credential errors count as retryable in the
+                        // attempt record: the failure is provider-local and a
+                        // failover candidate with its own credential can still
+                        // serve the request.
                         let retryable = matches!(
                             error,
                             ProviderError::CircuitOpen { .. }
@@ -2882,6 +3113,9 @@ impl ModelProvider for RegistryBackedModelProvider {
     }
 }
 
+// Projects a tool catalog snapshot onto its semantically relevant fields for
+// cache keying. Typed parse preferred; the untyped fallback only strips the
+// known volatile audit fields.
 fn stable_tool_catalog_snapshot_for_response_cache(snapshot: &Value) -> Value {
     if let Ok(snapshot) =
         serde_json::from_value::<ModelVisibleToolCatalogSnapshot>(snapshot.clone())
@@ -3051,6 +3285,8 @@ fn build_registry_provider_runtime(
     }
 }
 
+/// Offline provider that echoes input (or replays the scripted tool-call
+/// fixture) with estimated token usage; used for tests and smoke flows.
 #[derive(Debug)]
 struct DeterministicProvider {
     config: ModelProviderConfig,
@@ -3080,6 +3316,10 @@ impl DeterministicProvider {
     }
 }
 
+// Scripted three-turn tool-call fixture for offline regression: turn 1
+// proposes a workspace patch write, turn 2 (after the write result) proposes
+// a read-back, turn 3 (after the read result) emits the final text. The turn
+// is inferred from which tool results are already present in the request.
 fn deterministic_tool_fixture_output(
     request: &ProviderRequest,
     prompt_tokens: u64,
@@ -3456,6 +3696,8 @@ impl ModelProvider for DeterministicProvider {
     }
 }
 
+/// Offline embeddings backend producing stable hash-derived unit vectors;
+/// useful for deterministic memory/retrieval tests without network access.
 #[derive(Debug)]
 struct DeterministicEmbeddingsProvider {
     dimensions: usize,
@@ -3494,6 +3736,8 @@ impl EmbeddingsProvider for DeterministicEmbeddingsProvider {
     }
 }
 
+/// HTTP backend for OpenAI-compatible chat-completions and audio
+/// transcription endpoints, with retries and a per-provider circuit breaker.
 #[derive(Debug)]
 struct OpenAiCompatibleProvider {
     config: ModelProviderConfig,
@@ -3508,6 +3752,9 @@ struct CircuitBreakerState {
     open_until: Option<Instant>,
 }
 
+/// Failure of a single upstream attempt, before retry policy is applied.
+/// `invalid_response` selects between [`ProviderError::InvalidResponse`] and
+/// [`ProviderError::RequestFailed`] once retries are exhausted.
 #[derive(Debug)]
 struct AttemptError {
     message: String,
@@ -3544,6 +3791,8 @@ impl AttemptError {
     }
 }
 
+// Wire-format DTOs for upstream responses. Fields default aggressively so
+// partial vendor payloads still deserialize; validation happens afterwards.
 #[derive(Debug, Deserialize)]
 struct OpenAiChatCompletionResponse {
     #[serde(default)]
@@ -3671,6 +3920,8 @@ struct AnthropicContentBlock {
     input: Option<Value>,
 }
 
+/// HTTP backend for OpenAI-compatible embeddings endpoints with retry and
+/// strict response-shape validation (ordering, dimensions, counts).
 #[derive(Debug)]
 struct OpenAiCompatibleEmbeddingsProvider {
     config: ModelProviderConfig,
@@ -3693,6 +3944,8 @@ impl OpenAiCompatibleEmbeddingsProvider {
         format!("{}{}", self.config.openai_base_url.trim_end_matches('/'), OPENAI_EMBEDDINGS_PATH)
     }
 
+    // Exponential backoff (base * 2^retry) with the exponent capped at 8 so
+    // the multiplier stays bounded at 256x even for large retry budgets.
     fn backoff_for_retry(&self, retry_index: u32) -> Duration {
         let exponent = retry_index.min(8);
         let multiplier = 1_u64 << exponent;
@@ -3773,6 +4026,10 @@ impl OpenAiCompatibleEmbeddingsProvider {
             ));
         }
 
+        // Vectors may arrive out of order; reassemble by the reported index
+        // (falling back to array position when omitted) and reject
+        // out-of-range, duplicate, or missing slots so callers can rely on
+        // input/vector alignment.
         let mut ordered_vectors: Vec<Option<Vec<f32>>> = vec![None; inputs.len()];
         for (position, item) in parsed.data.into_iter().enumerate() {
             let index = item.index.unwrap_or(position);
@@ -3942,6 +4199,8 @@ impl OpenAiCompatibleProvider {
         lock_runtime_metrics(&self.runtime_metrics).snapshot()
     }
 
+    // Once the cooldown elapses the breaker closes fully and the failure
+    // count resets; there is no half-open probe state.
     fn ensure_circuit_closed(&self) -> Result<(), ProviderError> {
         let now = Instant::now();
         let mut state = self.circuit_state.lock().map_err(|_| ProviderError::StatePoisoned)?;
@@ -3974,6 +4233,8 @@ impl OpenAiCompatibleProvider {
         Ok(())
     }
 
+    // Exponential backoff (base * 2^retry) with the exponent capped at 8 so
+    // the multiplier stays bounded at 256x even for large retry budgets.
     fn backoff_for_retry(&self, retry_index: u32) -> Duration {
         let exponent = retry_index.min(8);
         let multiplier = 1_u64 << exponent;
@@ -3996,6 +4257,9 @@ impl OpenAiCompatibleProvider {
         )
     }
 
+    // Chat model ids cannot serve the transcription endpoint, so unless the
+    // configured model is itself a transcription model (heuristic: name
+    // contains "transcribe"), fall back to the known-good default.
     fn transcription_model_name(&self) -> &str {
         if self.config.openai_model.contains("transcribe") {
             self.config.openai_model.as_str()
@@ -4064,6 +4328,8 @@ impl OpenAiCompatibleProvider {
         let provider_usage = parsed.usage.as_ref().map(|usage| ProviderUsage {
             prompt_tokens: usage.prompt_tokens,
             completion_tokens: usage.completion_tokens,
+            // Some compatible vendors omit total_tokens; derive it rather
+            // than reporting zero usage.
             total_tokens: if usage.total_tokens == 0 {
                 usage.prompt_tokens.saturating_add(usage.completion_tokens)
             } else {
@@ -4101,6 +4367,10 @@ impl OpenAiCompatibleProvider {
         }
 
         let mut completion_text = extract_completion_text(choice.message.content);
+        // Some models emit tool calls as inline markup in the text body
+        // instead of the structured tool-call field. Recover those into real
+        // proposals; malformed markup is retryable because a fresh sample
+        // usually produces well-formed output.
         let coerced_raw_tool_markup = if tool_events.is_empty() {
             match coerce_raw_tool_call_markup(completion_text.as_str()).map_err(|error| {
                 AttemptError::retryable_invalid_response(
@@ -4118,11 +4388,15 @@ impl OpenAiCompatibleProvider {
         } else {
             false
         };
+        // A blank completion with no tool calls would read as a dead turn
+        // downstream; substitute a minimal acknowledgement instead.
         let full_text = if completion_text.trim().is_empty() && tool_events.is_empty() {
             "ack".to_owned()
         } else {
             completion_text
         };
+        // Without provider-reported usage, fall back to local estimates and
+        // label the source so token accounting can distinguish the two.
         let usage = provider_usage.unwrap_or_else(|| {
             ProviderUsage::new(
                 estimate_token_count(request.input_text.as_str()),
@@ -4247,6 +4521,11 @@ impl OpenAiCompatibleProvider {
                     "openai_compatible_audio_response_json",
                 )
             })?;
+        // AIDEV-NOTE: `as u64 * 1_000` floors provider seconds to whole
+        // seconds before converting to ms, discarding sub-second precision
+        // for segment boundaries and total duration (e.g. 1.75s -> 1000ms).
+        // The fix is `(value * 1000.0) as u64`, but that changes persisted
+        // timestamp values, so it needs a deliberate behavior change.
         let segments = parsed
             .segments
             .into_iter()
@@ -4255,6 +4534,8 @@ impl OpenAiCompatibleProvider {
                 start_ms: segment.start.unwrap_or_default().max(0.0) as u64 * 1_000,
                 end_ms: segment.end.unwrap_or_default().max(0.0) as u64 * 1_000,
                 text: segment.text,
+                // OpenAI verbose_json reports avg_logprob; exp() maps it back
+                // to an approximate per-segment probability in (0, 1].
                 confidence: segment.avg_logprob.map(|value| value.exp()),
             })
             .collect::<Vec<_>>();
@@ -4434,7 +4715,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
             .lock()
             .map(|state| {
                 let now = Instant::now();
-                let open = state.open_until.map(|until| now < until).unwrap_or(false);
+                let open = state.open_until.is_some_and(|until| now < until);
                 (state.consecutive_failures, open)
             })
             .unwrap_or((0, false));
@@ -4532,6 +4813,8 @@ impl ModelProvider for OpenAiCompatibleProvider {
     }
 }
 
+/// HTTP backend for the Anthropic messages API and Anthropic-compatible
+/// endpoints (MiniMax), with retries and a per-provider circuit breaker.
 #[derive(Debug)]
 struct AnthropicProvider {
     config: ModelProviderConfig,
@@ -4574,6 +4857,8 @@ impl AnthropicProvider {
         lock_runtime_metrics(&self.runtime_metrics).snapshot()
     }
 
+    // Once the cooldown elapses the breaker closes fully and the failure
+    // count resets; there is no half-open probe state.
     fn ensure_circuit_closed(&self) -> Result<(), ProviderError> {
         let now = Instant::now();
         let mut state = self.circuit_state.lock().map_err(|_| ProviderError::StatePoisoned)?;
@@ -4606,6 +4891,8 @@ impl AnthropicProvider {
         Ok(())
     }
 
+    // Exponential backoff (base * 2^retry) with the exponent capped at 8 so
+    // the multiplier stays bounded at 256x even for large retry budgets.
     fn backoff_for_retry(&self, retry_index: u32) -> Duration {
         let exponent = retry_index.min(8);
         let multiplier = 1_u64 << exponent;
@@ -4716,6 +5003,10 @@ impl AnthropicProvider {
         }
 
         let mut completion_text = completion_fragments.join("\n");
+        // Some models emit tool calls as inline markup in the text body
+        // instead of the structured tool-call field. Recover those into real
+        // proposals; malformed markup is retryable because a fresh sample
+        // usually produces well-formed output.
         let coerced_raw_tool_markup = if tool_events.is_empty() {
             match coerce_raw_tool_call_markup(completion_text.as_str()).map_err(|error| {
                 AttemptError::retryable_invalid_response(
@@ -4733,11 +5024,15 @@ impl AnthropicProvider {
         } else {
             false
         };
+        // A blank completion with no tool calls would read as a dead turn
+        // downstream; substitute a minimal acknowledgement instead.
         let full_text = if completion_text.trim().is_empty() && tool_events.is_empty() {
             "ack".to_owned()
         } else {
             completion_text
         };
+        // Without provider-reported usage, fall back to local estimates and
+        // label the source so token accounting can distinguish the two.
         let usage = provider_usage.unwrap_or_else(|| {
             ProviderUsage::new(
                 estimate_token_count(request.input_text.as_str()),
@@ -4897,7 +5192,7 @@ impl ModelProvider for AnthropicProvider {
             .lock()
             .map(|state| {
                 let now = Instant::now();
-                let open = state.open_until.map(|until| now < until).unwrap_or(false);
+                let open = state.open_until.is_some_and(|until| now < until);
                 (state.consecutive_failures, open)
             })
             .unwrap_or((0, false));
@@ -4977,6 +5272,8 @@ impl ModelProvider for AnthropicProvider {
     }
 }
 
+/// Mutable accumulator behind each provider's runtime metrics mutex; all
+/// counters saturate instead of wrapping.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct ProviderRuntimeMetrics {
     request_count: u64,
@@ -5100,6 +5397,9 @@ fn normalize_embeddings_inputs(request: &EmbeddingsRequest) -> Result<Vec<String
     Ok(normalized_inputs)
 }
 
+// Deterministic feature-hashing embedding: each (token, position) pair is
+// hashed into a signed bucket contribution, then the vector is L2-normalized.
+// Not semantically meaningful; it only needs to be stable across runs.
 fn hash_embed_text(text: &str, dims: usize) -> Vec<f32> {
     let mut vector = vec![0.0_f32; dims];
     if dims == 0 {
@@ -5134,6 +5434,8 @@ fn normalize_vector(vector: &mut [f32]) {
     }
 }
 
+// Metrics are advisory telemetry: recovering a poisoned guard is preferable
+// to failing the request path over a bookkeeping mutex.
 fn lock_runtime_metrics(
     metrics: &Mutex<ProviderRuntimeMetrics>,
 ) -> std::sync::MutexGuard<'_, ProviderRuntimeMetrics> {
@@ -5193,6 +5495,11 @@ fn route_selection_from_status_snapshot(
     }
 }
 
+/// Makes a remote error body safe to log/persist: collapses whitespace,
+/// redacts credential-shaped substrings, and truncates to 240 characters.
+///
+/// Truncation counts Unicode scalar values, not bytes, so multi-byte text
+/// can never be cut on a partial code point.
 pub(crate) fn sanitize_remote_error(body: &str) -> String {
     let collapsed = body.replace(['\r', '\n', '\t'], " ");
     let trimmed = collapsed.trim();
@@ -5218,6 +5525,9 @@ fn trim_to_option(value: String) -> Option<String> {
     }
 }
 
+// Byte-level scan that blanks bearer header values, provider API key
+// prefixes, and key=value credential pairs. Operates on bytes so a single
+// pass handles mixed/invalid UTF-8 bodies without panicking.
 fn redact_remote_error_secrets(raw: &str) -> String {
     const REDACTED: &[u8] = b"<redacted>";
     const KV_PATTERNS: [&[u8]; 3] = [b"api_key=", b"token=", b"secret="];
@@ -5299,6 +5609,9 @@ fn is_secret_value_delimiter(byte: u8) -> bool {
         || matches!(byte, b'&' | b',' | b';' | b'"' | b'\'' | b')' | b']' | b'}')
 }
 
+// OpenAI-compatible `message.content` arrives as a plain string, an array of
+// multimodal parts, or an object depending on vendor; flatten all shapes to
+// the concatenated text.
 fn extract_completion_text(content: Option<Value>) -> String {
     let Some(content) = content else {
         return String::new();
@@ -5327,6 +5640,9 @@ struct RawToolCallMarkupExtraction {
     tool_events: Vec<ProviderEvent>,
 }
 
+// Recovers tool invocations that models (notably MiniMax) emit as inline
+// tag markup inside the text body. ASCII lowercasing preserves byte offsets,
+// so indices found in `lower` slice `text` safely.
 fn coerce_raw_tool_call_markup(text: &str) -> Result<Option<RawToolCallMarkupExtraction>, String> {
     let lower = text.to_ascii_lowercase();
     if !lower.contains("<minimax:tool_call") && !lower.contains("<tool_call") {
@@ -5352,6 +5668,8 @@ fn coerce_raw_tool_call_markup(text: &str) -> Result<Option<RawToolCallMarkupExt
             (&text[content_start..], text.len(), true)
         };
         let mut parsed_events = parse_raw_tool_call_invocations(block_content)?;
+        // Models often drop the trailing close tag; tolerate that as long as
+        // the block still yields at least one complete invocation.
         if missing_outer_close && parsed_events.is_empty() {
             return Err("raw tool-call block is missing a closing tag".to_owned());
         }
@@ -5457,6 +5775,10 @@ fn extract_raw_tool_invoke_name(opening_tag: &str) -> Option<String> {
     None
 }
 
+// Tool argument strings from providers are kept verbatim when they already
+// parse as JSON; anything else is wrapped as {"raw": ...} so downstream
+// consumers always receive valid JSON bytes. Size is capped before and after
+// wrapping to bound journal payloads.
 fn normalize_tool_arguments(raw: &str) -> Result<Vec<u8>, String> {
     if raw.trim().is_empty() {
         return Ok(b"{}".to_vec());

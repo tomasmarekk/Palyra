@@ -1,3 +1,12 @@
+//! Provider stream event model and accumulation.
+//!
+//! [`ProviderStreamEvent`] is the canonical incremental event vocabulary
+//! (started/delta/tool/usage/completed/failed/cancelled);
+//! [`ProviderStreamAccumulator`] folds those events into one size-bounded
+//! [`ProviderTurnOutput`], recording a spill reference when text exceeds the
+//! inline buffer cap. Non-streaming HTTP responses are funneled through the
+//! same accumulator (see [`provider_output_from_text_and_tools`]) so both
+//! paths share identical truncation and tool-call semantics.
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -9,6 +18,10 @@ use super::{
 
 const DEFAULT_PROVIDER_STREAM_BUFFER_CAP_BYTES: usize = 256 * 1024;
 
+/// Incremental event emitted while a provider turn is in flight.
+///
+/// `Completed`, `Failed`, and `Cancelled` are terminal: the accumulator
+/// ignores every event that arrives after one of them.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProviderStreamEvent {
@@ -21,6 +34,11 @@ pub enum ProviderStreamEvent {
     Cancelled { reason: String },
 }
 
+/// Folds [`ProviderStreamEvent`]s into one bounded [`ProviderTurnOutput`].
+///
+/// Text deltas accumulate under the hard inline limit; once either the limit
+/// or the configured buffer cap is crossed, a spill reference naming the
+/// provider/model is recorded so the truncation point stays auditable.
 #[derive(Debug, Clone)]
 pub struct ProviderStreamAccumulator {
     provider_id: String,
@@ -39,11 +57,14 @@ pub struct ProviderStreamAccumulator {
 }
 
 impl ProviderStreamAccumulator {
+    /// Creates an accumulator with the default inline buffer cap.
     #[must_use]
     pub fn new(provider_id: impl Into<String>, model_id: impl Into<String>) -> Self {
         Self::with_buffer_cap(provider_id, model_id, DEFAULT_PROVIDER_STREAM_BUFFER_CAP_BYTES)
     }
 
+    /// Creates an accumulator with an explicit buffer cap in bytes (floored
+    /// to 1); crossing the cap records the spill reference.
     #[must_use]
     pub fn with_buffer_cap(
         provider_id: impl Into<String>,
@@ -67,6 +88,8 @@ impl ProviderStreamAccumulator {
         }
     }
 
+    /// Applies one stream event; events arriving after a terminal event
+    /// (completed/failed/cancelled) are silently ignored.
     pub fn apply(&mut self, event: ProviderStreamEvent) {
         if self.finalized {
             return;
@@ -125,8 +148,12 @@ impl ProviderStreamAccumulator {
         }
     }
 
+    /// Consumes the accumulator and produces the bounded turn output,
+    /// carrying forward any spill reference and truncation flag.
     #[must_use]
     pub fn finalize(mut self) -> ProviderTurnOutput {
+        // The accumulator's spill ref wins over whatever Completed carried:
+        // it reflects what actually overflowed during this stream.
         if let Some(spill_ref) = self.spill_ref.take() {
             self.raw_provider_refs.stream_spill_ref = Some(spill_ref);
         }
@@ -142,6 +169,9 @@ impl ProviderStreamAccumulator {
     }
 }
 
+/// Builds a turn output from a non-streaming response by replaying it
+/// through [`ProviderStreamAccumulator`], so HTTP and streamed paths share
+/// the same truncation, spill, and tool-call semantics.
 pub(super) fn provider_output_from_text_and_tools(
     full_text: String,
     tool_calls: Vec<ProviderEvent>,
@@ -149,6 +179,8 @@ pub(super) fn provider_output_from_text_and_tools(
     usage: ProviderUsage,
     raw_provider_refs: ProviderRawProviderRefs,
 ) -> ProviderTurnOutput {
+    // No registry provider id is available at this layer; the trace ref and
+    // provider model id stand in for spill-reference labeling only.
     let provider_id =
         raw_provider_refs.provider_trace_ref.clone().unwrap_or_else(|| "provider".to_owned());
     let model_id =
@@ -175,6 +207,8 @@ pub(super) fn provider_output_from_text_and_tools(
     accumulator.apply(ProviderStreamEvent::Completed { finish_reason, raw_provider_refs });
     let mut output = accumulator.finalize();
     output.usage.source = usage_source;
+    // Tool-only turns still get an empty leading text part so consumers can
+    // rely on a text block always being present in content_parts.
     if output.full_text.is_empty()
         && output
             .content_parts
@@ -186,6 +220,8 @@ pub(super) fn provider_output_from_text_and_tools(
     output
 }
 
+// Tool inputs are stored as raw bytes upstream; non-JSON bytes are wrapped as
+// {"raw": ...} instead of dropped so the proposal survives intact.
 fn tool_input_json_value(input_json: &[u8]) -> Value {
     serde_json::from_slice::<Value>(input_json)
         .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(input_json).to_string() }))

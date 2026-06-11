@@ -1,11 +1,24 @@
+//! Provider-neutral data contract: request/message/output types shared by
+//! every model backend, plus the hard output-size bounds applied before
+//! persistence.
+//!
+//! Streaming semantics live here as the projection step: a finished
+//! [`ProviderTurnOutput`] is re-chunked into bounded
+//! [`ProviderEvent::ModelToken`] preview events by
+//! [`provider_events_from_output`], and oversized text is truncated with an
+//! explicit marker plus a `stream_spill_ref` so the truncation is auditable.
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const PROVIDER_STREAM_EVENT_TOKEN_CHUNK_SIZE: usize =
     crate::orchestrator::MAX_MODEL_TOKENS_PER_EVENT;
+/// Hard inline text bound: keeps a serialized turn output comfortably under
+/// the default journal payload limit (256KiB) even with JSON overhead and
+/// tool-call parts.
 pub(super) const MAX_PROVIDER_TURN_TEXT_BYTES: usize = 64 * 1024;
 const PROVIDER_OUTPUT_TRUNCATED_MARKER: &str = "\n\n[provider output truncated]";
 
+/// Base64-encoded image attached to a request for vision-capable models.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderImageInput {
     pub mime_type: String,
@@ -16,6 +29,7 @@ pub struct ProviderImageInput {
     pub artifact_id: Option<String>,
 }
 
+/// Provider-neutral conversation role; adapters map it to each dialect.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderMessageRole {
@@ -27,6 +41,7 @@ pub enum ProviderMessageRole {
 }
 
 impl ProviderMessageRole {
+    /// Returns the role string used by OpenAI-compatible chat payloads.
     #[must_use]
     pub const fn as_openai_role(self) -> &'static str {
         match self {
@@ -38,6 +53,11 @@ impl ProviderMessageRole {
         }
     }
 
+    /// Returns the role string used by Anthropic message payloads.
+    ///
+    /// Anthropic only accepts user/assistant turns: system and developer
+    /// content moves to the top-level system block, and tool results travel
+    /// inside user turns, so everything except assistant maps to "user".
     #[must_use]
     pub const fn as_anthropic_role(self) -> &'static str {
         match self {
@@ -47,6 +67,7 @@ impl ProviderMessageRole {
     }
 }
 
+/// One content block inside a message: text or an inline image.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProviderMessageContentPart {
@@ -55,12 +76,16 @@ pub enum ProviderMessageContentPart {
 }
 
 impl ProviderMessageContentPart {
+    /// Creates a text content part.
     #[must_use]
     pub fn text(text: impl Into<String>) -> Self {
         Self::Text { text: text.into() }
     }
 }
 
+/// One provider-neutral conversation turn. `tool_call_id` is set on tool
+/// result messages; `tool_calls` is set on assistant turns that proposed
+/// tools.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderMessage {
     pub role: ProviderMessageRole,
@@ -73,6 +98,8 @@ pub struct ProviderMessage {
     pub tool_calls: Vec<ProviderMessageToolCall>,
 }
 
+/// Tool invocation recorded on an assistant turn, re-fed to providers when
+/// continuing a tool exchange.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderMessageToolCall {
     pub proposal_id: String,
@@ -81,6 +108,7 @@ pub struct ProviderMessageToolCall {
 }
 
 impl ProviderMessage {
+    /// Creates a plain user text message.
     #[must_use]
     pub fn user_text(text: impl Into<String>) -> Self {
         Self {
@@ -92,6 +120,8 @@ impl ProviderMessage {
         }
     }
 
+    /// Rebuilds the assistant turn corresponding to a completed output so the
+    /// conversation can be re-fed to a provider (e.g. after tool execution).
     #[must_use]
     pub fn assistant_from_output(output: &ProviderTurnOutput) -> Self {
         let mut content = Vec::new();
@@ -124,6 +154,7 @@ impl ProviderMessage {
         }
     }
 
+    /// Creates a tool result message answering the given tool call id.
     #[must_use]
     pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
@@ -135,6 +166,7 @@ impl ProviderMessage {
         }
     }
 
+    /// Returns all text parts joined with newlines, ignoring image parts.
     #[must_use]
     pub fn text_content(&self) -> String {
         self.content
@@ -148,6 +180,12 @@ impl ProviderMessage {
     }
 }
 
+/// One completion request as every backend sees it.
+///
+/// `input_text` is the full model-visible prompt (used for token estimation
+/// and cache keying); `user_visible_input_text` is the un-augmented user text
+/// and is deliberately excluded from serialization so prompt augmentation
+/// context never leaks into persisted payloads.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderRequest {
     pub input_text: String,
@@ -170,6 +208,8 @@ pub struct ProviderRequest {
 }
 
 impl ProviderRequest {
+    /// Creates a single-turn request whose message history is just the input
+    /// text as one user message.
     #[must_use]
     pub fn from_input_text(
         input_text: String,
@@ -192,6 +232,8 @@ impl ProviderRequest {
         }
     }
 
+    /// Returns the message history to send, synthesizing a single user turn
+    /// from `input_text` when no explicit messages were provided.
     #[must_use]
     pub fn effective_messages(&self) -> Vec<ProviderMessage> {
         if self.messages.is_empty() {
@@ -202,12 +244,17 @@ impl ProviderRequest {
     }
 }
 
+/// Uniform event consumed by the orchestrator: bounded text preview chunks
+/// (`is_final` marks the last chunk of a completed turn) or a tool proposal
+/// whose `input_json` is guaranteed-valid JSON bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderEvent {
     ModelToken { token: String, is_final: bool },
     ToolProposal { proposal_id: String, tool_name: String, input_json: Vec<u8> },
 }
 
+/// Provider-neutral reason a turn ended; unrecognized vendor values map to
+/// `Unknown` rather than failing the turn.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderFinishReason {
@@ -221,6 +268,7 @@ pub enum ProviderFinishReason {
 }
 
 impl ProviderFinishReason {
+    /// Maps an OpenAI-compatible `finish_reason` string to the neutral enum.
     #[must_use]
     pub fn from_openai(value: Option<&str>) -> Self {
         match value.unwrap_or_default().trim().to_ascii_lowercase().as_str() {
@@ -232,6 +280,7 @@ impl ProviderFinishReason {
         }
     }
 
+    /// Maps an Anthropic `stop_reason` string to the neutral enum.
     #[must_use]
     pub fn from_anthropic(value: Option<&str>) -> Self {
         match value.unwrap_or_default().trim().to_ascii_lowercase().as_str() {
@@ -243,6 +292,9 @@ impl ProviderFinishReason {
     }
 }
 
+/// Token accounting for one turn. `source` distinguishes provider-reported
+/// counts ("provider") from local estimates ("estimated") so downstream
+/// budget logic can weigh them differently.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderUsage {
     pub prompt_tokens: u64,
@@ -252,6 +304,7 @@ pub struct ProviderUsage {
 }
 
 impl ProviderUsage {
+    /// Creates usage with `total_tokens` derived as the saturating sum.
     #[must_use]
     pub fn new(prompt_tokens: u64, completion_tokens: u64, source: impl Into<String>) -> Self {
         Self {
@@ -263,6 +316,7 @@ impl ProviderUsage {
     }
 }
 
+/// One ordered block of a turn output: text or a proposed tool call.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProviderOutputContentPart {
@@ -270,6 +324,8 @@ pub enum ProviderOutputContentPart {
     ToolCall { proposal_id: String, tool_name: String, input_json: Value },
 }
 
+/// Opaque upstream correlation ids kept for tracing and replay;
+/// `stream_spill_ref` marks where truncated/spilled output can be located.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ProviderRawProviderRefs {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -284,6 +340,8 @@ pub struct ProviderRawProviderRefs {
     pub stream_spill_ref: Option<String>,
 }
 
+/// Flags recording which safety projections were applied to a turn output;
+/// `output_redacted` is set whenever text was truncated to the size bound.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderRedactionState {
     pub output_redacted: bool,
@@ -297,6 +355,11 @@ impl Default for ProviderRedactionState {
     }
 }
 
+/// Canonical, size-bounded result of one completed model turn.
+///
+/// Invariant: `full_text` never exceeds the inline text bound; oversized
+/// output is truncated with a visible marker, `redaction_state` is flagged,
+/// and a `stream_spill_ref` is recorded.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderTurnOutput {
     pub full_text: String,
@@ -308,6 +371,8 @@ pub struct ProviderTurnOutput {
 }
 
 impl ProviderTurnOutput {
+    /// Builds a text-only output, applying the inline size bound and
+    /// recording truncation in the redaction state when it occurs.
     #[must_use]
     pub fn text(
         full_text: String,
@@ -340,6 +405,11 @@ impl ProviderTurnOutput {
     }
 }
 
+/// Returns a copy of `output` with `full_text` and every text content part
+/// re-bounded for persistence, flagging truncation when any part was cut.
+///
+/// Needed because outputs assembled part-by-part (e.g. from accumulated tool
+/// exchanges) can bypass the bound enforced by [`ProviderTurnOutput::text`].
 pub(crate) fn bounded_provider_turn_output_for_persistence(
     output: &ProviderTurnOutput,
 ) -> ProviderTurnOutput {
@@ -365,6 +435,11 @@ pub(crate) fn bounded_provider_turn_output_for_persistence(
     bounded
 }
 
+/// Appends `incoming` to `target` while keeping `target` within `max_bytes`
+/// (plus room for the truncation marker); returns true once truncation has
+/// occurred. Idempotent after truncation: a target already ending with the
+/// marker rejects further input so the marker stays terminal across repeated
+/// stream deltas.
 pub(super) fn append_provider_text_with_hard_limit(
     target: &mut String,
     incoming: &str,
@@ -382,6 +457,8 @@ pub(super) fn append_provider_text_with_hard_limit(
         return false;
     }
 
+    // Cut at UTF-8 boundaries only: the budget is in bytes but the text must
+    // remain valid for display and serialization.
     let prefix_budget = limit.saturating_sub(PROVIDER_OUTPUT_TRUNCATED_MARKER.len());
     if target.len() > prefix_budget {
         truncate_string_to_utf8_boundary(target, prefix_budget);
@@ -433,6 +510,9 @@ fn utf8_prefix(value: &str, max_bytes: usize) -> &str {
     &value[..boundary]
 }
 
+/// Full result of one [`super::ModelProvider::complete`] call: the bounded
+/// turn output, its projected events, token totals, and routing metadata
+/// (cache/retry/failover attempt history).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderResponse {
     pub output: ProviderTurnOutput,
@@ -447,6 +527,9 @@ pub struct ProviderResponse {
     pub attempts: Vec<super::ProviderAttemptSummary>,
 }
 
+/// Returns true when the request carries image input anywhere (top-level
+/// vision inputs or image parts inside messages), gating vision-capability
+/// checks.
 pub(super) fn provider_request_has_vision(request: &ProviderRequest) -> bool {
     !request.vision_inputs.is_empty()
         || request.effective_messages().iter().any(|message| {
@@ -457,6 +540,11 @@ pub(super) fn provider_request_has_vision(request: &ProviderRequest) -> bool {
         })
 }
 
+// Splits text into chunks of at most `max_words_per_chunk` words while
+// preserving every byte of the original (including inter-word whitespace),
+// so concatenating the chunks reconstructs the input exactly. That
+// reconstruction property is what lets preview events double as the full
+// output stream.
 fn split_provider_stream_text(input: &str, max_words_per_chunk: usize) -> Vec<String> {
     if max_words_per_chunk == 0 || input.trim().is_empty() {
         return Vec::new();
@@ -508,6 +596,12 @@ fn split_provider_stream_text(input: &str, max_words_per_chunk: usize) -> Vec<St
     chunks
 }
 
+/// Projects a finished turn output into the uniform event stream: text parts
+/// become bounded `ModelToken` chunks, tool calls become `ToolProposal`s.
+///
+/// The last text token is marked final only when the turn proposes no tools;
+/// a tool-calling turn continues after execution, so its text must not signal
+/// completion to streaming consumers.
 pub(crate) fn provider_events_from_output(output: &ProviderTurnOutput) -> Vec<ProviderEvent> {
     let mut events = Vec::new();
     let should_mark_final_model_token =
