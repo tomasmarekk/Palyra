@@ -1,3 +1,10 @@
+//! Per-tool execution backends for the daemon tool runtime.
+//!
+//! Each submodule implements one tool family (browser, HTTP fetch, workspace
+//! files, memory, routines, ...) behind the gateway's approval and policy
+//! checks; dispatch happens in `crate::gateway`, which selects the module by
+//! tool name and converts results into journaled tool outcomes.
+
 pub(crate) mod artifacts;
 pub(crate) mod browser;
 pub(crate) mod delegation;

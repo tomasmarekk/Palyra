@@ -1,3 +1,17 @@
+//! Browser tool runtime: brokers `palyra.browser.*` tool calls to the
+//! `palyra-browserd` gRPC `BrowserService` (sessions, navigation, DOM
+//! actions, observation, tabs, permissions, downloads).
+//!
+//! Beyond plain RPC mapping this module owns the daemon-side guarantees:
+//! JSON payload validation, workspace/OS-root scoping for `file://`
+//! navigation, uploads, and saved artifacts, safety redaction of all exported
+//! page content (titles, DOM, cookies, logs), engine-capability annotation
+//! (Chromium vs simulated static-HTML), and normalization of failures into
+//! attested [`ToolExecutionOutcome`]s carrying machine-readable recovery
+//! hints. Entry points are [`execute_browser_tool`] (dispatched from
+//! `crate::gateway`) and [`close_browser_session_for_run_cleanup`];
+//! closed-session bookkeeping lives on [`GatewayRuntimeState`].
+
 use std::{
     collections::BTreeMap,
     fs,
@@ -48,7 +62,11 @@ use crate::{
     transport::grpc::proto::palyra::{browser::v1 as browser_v1, common::v1 as common_v1},
 };
 
+/// gRPC metadata key carrying the daemon-side caller principal to browserd.
 const BROWSER_CALLER_PRINCIPAL_HEADER: &str = "x-palyra-principal";
+// Recovery hints and runtime warnings ride along on tool outcomes so the
+// calling agent can self-correct without operator help. Tests and fixtures
+// pin the exact wording; treat these strings as frozen.
 const BROWSER_SELECTOR_RECOVERY_HINT: &str = "selector_not_found: call palyra.browser.observe with include_dom_snapshot=true and include_accessibility_tree=true, choose a selector from observed ids, names, labels, roles, or visible text, then retry once with that grounded selector; do not keep guessing selectors";
 const BROWSER_WAIT_FOR_INPUT_RECOVERY_HINT: &str =
     "wait_for_input_required: pass either selector or text; when unsure, call palyra.browser.observe first and wait for a visible text snippet or observed selector";
@@ -64,13 +82,24 @@ const BROWSER_UNKNOWN_RUNTIME_WARNING: &str =
     "browser_runtime_capabilities_unknown: browserd did not report JavaScript/subresource capabilities; do not treat title, URL, or fetched HTML alone as JS UI validation";
 const BROWSER_TOOL_INPUT_RECOVERY_HINT: &str =
     "browser_tool_input_error: inspect the error field, fix the browser tool input or session state, and retry";
+/// Hard cap on upload file size; the file body travels inline in the gRPC
+/// request, so this also bounds request memory.
 const BROWSER_UPLOAD_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+/// Default and hard cap for download-artifact bytes fetched from browserd in
+/// a single `downloads.get` call.
 const BROWSER_DOWNLOAD_TOOL_DEFAULT_MAX_BYTES: u64 = 256 * 1024;
 const BROWSER_DOWNLOAD_TOOL_MAX_BYTES: u64 = 512 * 1024;
 const BROWSER_OBSERVE_MAX_CAPTURE_SELECTORS: usize = 8;
 const BROWSER_OBSERVE_MAX_COMPUTED_STYLE_PROPERTIES: usize = 16;
+/// Env var listing extra OS roots (split like `PATH`) approved for browser
+/// file IO outside agent workspaces; replaces the implicit home-dir roots.
 const PALYRA_OS_FILE_ROOTS_ENV: &str = "PALYRA_OS_FILE_ROOTS";
 
+/// JavaScript/DOM capability report for the browserd engine serving a call.
+///
+/// Attached to every tool outcome (success or failure) so agents cannot
+/// mistake static-HTML fetches from the simulated engine for real Chromium
+/// rendering when validating UI behavior.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BrowserRuntimeCapabilities {
     source: &'static str,
@@ -82,6 +111,8 @@ struct BrowserRuntimeCapabilities {
 }
 
 impl BrowserRuntimeCapabilities {
+    /// Maps a browserd health response; engine modes other than `chromium`
+    /// or `simulated` degrade to "unknown" with a validation warning.
     fn from_health(response: &browser_v1::BrowserHealthResponse) -> Self {
         let engine_mode = response.engine_mode.trim().to_ascii_lowercase();
         match engine_mode.as_str() {
@@ -140,6 +171,11 @@ fn browser_text_entry_action_name(tool_name: &str) -> &'static str {
     }
 }
 
+/// Whether `tool_name` operates on an already-open browser session.
+///
+/// `session.create` is exempt because it mints the session; `session.close`
+/// is exempt so closing stays idempotent even after the daemon has already
+/// recorded the session as closed.
 fn browser_tool_requires_open_session(tool_name: &str) -> bool {
     matches!(
         tool_name,
@@ -174,6 +210,12 @@ fn browser_tool_requires_open_session(tool_name: &str) -> bool {
     )
 }
 
+/// Whether navigation to a private network target should be requested.
+///
+/// Loopback URLs are auto-allowed only when the process-runner policy already
+/// grants host access, keeping browser reach aligned with the sandbox posture
+/// (an agent that can run servers locally may also browse them). browserd
+/// still enforces its own private-target policy on top of this flag.
 fn browser_tool_allows_private_targets_for_url(
     runtime_state: &GatewayRuntimeState,
     payload: &serde_json::Map<String, Value>,
@@ -184,6 +226,8 @@ fn browser_tool_allows_private_targets_for_url(
             && browser_url_targets_loopback(url))
 }
 
+/// Returns `true` only for http(s) URLs whose host is `localhost` or a
+/// loopback IP (IPv6 brackets stripped); unparsable URLs are not loopback.
 fn browser_url_targets_loopback(raw_url: &str) -> bool {
     let Ok(parsed) = Url::parse(raw_url.trim()) else {
         return false;
@@ -210,6 +254,16 @@ fn browser_url_uses_file_scheme(raw_url: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Parses the optional `profile_id` field of `session.create`.
+///
+/// # Errors
+/// Returns a tool-facing message when `profile_id` is present but not a
+/// string or not a canonical id.
+// AIDEV-NOTE: the second tuple element ("ignored profile id") is always None
+// today -- non-canonical ids hard-fail instead of being ignored (pinned by
+// browser_session_profile_id_rejects_friendly_labels). It survives only so
+// the session.create output keeps its `ignored_profile_id` and
+// `profile_id_warning` JSON fields; removing it changes the output shape.
 fn browser_session_profile_id_from_payload(
     payload: &serde_json::Map<String, Value>,
 ) -> Result<(Option<common_v1::CanonicalId>, Option<String>), String> {
@@ -230,6 +284,12 @@ fn browser_session_profile_id_from_payload(
     Err("palyra.browser.session.create field 'profile_id' must be a canonical id".to_owned())
 }
 
+/// Resolves `(persistence_enabled, persistence_id)` for `session.create`.
+///
+/// `private_profile: true` always wins and forces an ephemeral session.
+/// Otherwise persistence defaults to on, keyed by the caller-supplied
+/// `persistence_id` or an id derived from the agent session, so browser state
+/// survives daemon/browserd restarts within the same agent session.
 fn browser_session_persistence_from_payload(
     payload: &serde_json::Map<String, Value>,
     agent_session_id: &str,
@@ -252,10 +312,13 @@ fn browser_session_persistence_from_payload(
     (true, persistence_id)
 }
 
+/// Derives a deterministic persistence id from the agent session id.
 fn default_browser_session_persistence_id(agent_session_id: &str) -> String {
     const PREFIX: &str = "agent-session-";
     const MAX_PERSISTENCE_ID_BYTES: usize = 128;
 
+    // Restrict to a filesystem- and id-safe charset and a bounded length so
+    // browserd can use the value directly as a profile storage key.
     let mut suffix = agent_session_id
         .chars()
         .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
@@ -268,6 +331,15 @@ fn default_browser_session_persistence_id(agent_session_id: &str) -> String {
     format!("{PREFIX}{suffix}")
 }
 
+/// Confines `file://` navigation targets to the agent's workspace roots.
+///
+/// Non-file URLs pass through untouched. The target must canonicalize to a
+/// regular file inside one of the resolved workspace roots, which blocks
+/// symlink and `..` escapes before the URL ever reaches browserd.
+///
+/// # Errors
+/// Returns a tool-facing message when the URL is malformed, the target does
+/// not resolve to a regular file, or it lies outside every workspace root.
 async fn validate_browser_file_url_workspace_scope(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -300,6 +372,8 @@ async fn validate_browser_file_url_workspace_scope(
     )
 }
 
+/// Converts a `file://` URL to a local path, rejecting embedded credentials
+/// and query strings so nothing can be smuggled past the path checks.
 fn browser_file_url_to_path(parsed: &Url) -> Result<PathBuf, String> {
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err("palyra.browser.navigate file URL credentials are not allowed".to_owned());
@@ -310,6 +384,11 @@ fn browser_file_url_to_path(parsed: &Url) -> Result<PathBuf, String> {
     parsed.to_file_path().map_err(|_| "palyra.browser.navigate file URL path is invalid".to_owned())
 }
 
+/// Canonicalizes workspace roots, requiring each to be an existing directory.
+///
+/// # Errors
+/// Returns a tool-facing message when a root cannot be canonicalized, is not
+/// a directory, or the agent has no roots at all.
 fn canonicalize_browser_workspace_roots(roots: &[String]) -> Result<Vec<PathBuf>, String> {
     let mut canonical_roots = Vec::with_capacity(roots.len());
     for (index, root) in roots.iter().enumerate() {
@@ -336,6 +415,13 @@ fn canonical_file_path_is_inside_workspace_roots(
     canonical_roots.iter().any(|root| canonical_target.starts_with(root))
 }
 
+/// Resolves the agent for this execution context and returns its
+/// canonicalized workspace roots, augmented with run-launch-context roots
+/// (e.g. the CLI launch cwd) when the agent resolution source allows them.
+///
+/// # Errors
+/// Returns a tool-facing message when agent resolution fails or the roots do
+/// not canonicalize to existing directories.
 async fn resolve_browser_agent_workspace_roots(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -367,6 +453,8 @@ async fn resolve_browser_agent_workspace_roots(
     canonicalize_browser_workspace_roots(workspace_roots.as_slice())
 }
 
+/// Extracts the `file_path` field for `upload`, rejecting empty values and
+/// control characters.
 fn browser_upload_path_from_payload(
     payload: &serde_json::Map<String, Value>,
 ) -> Result<&str, String> {
@@ -388,6 +476,15 @@ fn browser_upload_path_from_payload(
     Ok(file_path)
 }
 
+/// Resolves and reads an upload file, returning `(file_name, bytes)`.
+///
+/// The size cap is checked against metadata before reading so an oversized
+/// file is rejected without ever being loaded into memory.
+///
+/// # Errors
+/// Returns a tool-facing message when the path escapes the allowed roots, is
+/// not a regular file, exceeds [`BROWSER_UPLOAD_MAX_FILE_BYTES`], or IO
+/// fails.
 async fn read_browser_upload_file(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -438,6 +535,13 @@ async fn read_browser_upload_file(
     Ok((file_name, file_bytes))
 }
 
+/// Resolves an upload `file_path` to a canonical path inside the allowed
+/// roots.
+///
+/// Resolution order: env-prefixed paths expand first, absolute paths must
+/// fall inside workspace roots, approved user-owned OS roots, or launch env
+/// roots, and relative paths are confined to the first workspace root.
+/// Protected OS locations are denied regardless of root membership.
 fn resolve_browser_upload_path(
     file_path: &str,
     workspace_roots: &[PathBuf],
@@ -484,6 +588,8 @@ fn validate_browser_workspace_relative_path(path: &Path) -> Result<PathBuf, Stri
     validate_browser_workspace_relative_path_for_tool(BROWSER_UPLOAD_TOOL_NAME, "file_path", path)
 }
 
+/// Rejects rooted, `.`, and `..` components so a relative path can only
+/// descend from the root it is later joined to.
 fn validate_browser_workspace_relative_path_for_tool(
     tool_name: &str,
     field_name: &str,
@@ -505,6 +611,8 @@ fn validate_browser_workspace_relative_path_for_tool(
     Ok(path.to_path_buf())
 }
 
+/// Extracts the optional `output_path` field; `Ok(None)` means the caller
+/// did not ask for the artifact to be written to disk.
 fn browser_output_path_from_payload<'a>(
     payload: &'a serde_json::Map<String, Value>,
     tool_name: &str,
@@ -524,6 +632,16 @@ fn browser_output_path_from_payload<'a>(
     Ok(Some(output_path))
 }
 
+/// Writes artifact `bytes` to the payload's `output_path`, if requested.
+///
+/// Returns `Ok(None)` when no `output_path` was supplied, otherwise a JSON
+/// manifest (`path`, `mime_type`, `size_bytes`, `sha256`) describing the
+/// written file. The target is scope-checked against workspace and approved
+/// OS roots before any write happens.
+///
+/// # Errors
+/// Returns a tool-facing message when scope resolution fails, the target is
+/// outside every allowed root, or the write fails.
 async fn save_browser_output_file_from_payload(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -566,6 +684,12 @@ async fn save_browser_output_file_from_payload(
     })))
 }
 
+/// Resolves an `output_path` to a validated, writable target path.
+///
+/// Env-prefixed paths expand first. Absolute paths must land inside the
+/// workspace, user-owned OS, or launch env roots. Relative paths prefer the
+/// session's active workspace root (so artifacts land next to the work in
+/// progress) and fall back to the first workspace root.
 fn resolve_browser_output_path(
     tool_name: &str,
     output_path: &str,
@@ -600,6 +724,7 @@ fn resolve_browser_output_path(
     prepare_browser_output_target(tool_name, requested.as_path(), allowed_roots.as_slice())
 }
 
+/// Union of all roots an absolute browser path may resolve into, deduplicated.
 fn browser_absolute_path_allowed_roots(
     workspace_roots: &[PathBuf],
     user_owned_roots: &[PathBuf],
@@ -615,6 +740,11 @@ fn browser_absolute_path_allowed_roots(
     roots
 }
 
+/// Expands a `%VAR%`, `${VAR}`, or `$VAR` prefix into an absolute base path.
+///
+/// Run-launch-context variables take precedence over process env so harness
+/// or CLI launches can hand the agent approved roots without baking machine
+/// paths into tool inputs. Returns `Ok(None)` when `path` has no env prefix.
 fn expand_browser_env_prefixed_path(
     tool_name: &str,
     field_name: &str,
@@ -639,6 +769,7 @@ fn expand_browser_env_prefixed_path(
     append_browser_env_path_suffix(tool_name, field_name, base, suffix).map(Some)
 }
 
+/// Splits a leading `%VAR%`, `${VAR}`, or `$VAR` prefix into `(key, suffix)`.
 fn browser_path_env_prefix<'a>(
     tool_name: &str,
     field_name: &str,
@@ -698,6 +829,11 @@ fn validate_browser_path_env_key(
     Ok(())
 }
 
+/// Appends the post-prefix suffix to the expanded env base path.
+///
+/// Segments are re-validated here (no `.`, `..`, or drive-colon segments)
+/// because the suffix bypassed the relative-path validator; this keeps an
+/// env-prefixed path from escaping its expanded root.
 fn append_browser_env_path_suffix(
     tool_name: &str,
     field_name: &str,
@@ -725,6 +861,13 @@ fn append_browser_env_path_suffix(
     Ok(base)
 }
 
+/// Picks the base root for a relative `output_path` when a session has an
+/// active workspace.
+///
+/// Short relative paths resolve under the active workspace root itself;
+/// paths that already start with the active root's relative prefix resolve
+/// under the workspace root that owns it (so the prefix is not doubled).
+/// `None` defers to the caller's first-workspace-root fallback.
 fn browser_relative_output_base_root(
     output_path: &str,
     workspace_roots: &[PathBuf],
@@ -740,6 +883,8 @@ fn browser_relative_output_base_root(
     None
 }
 
+/// Finds the workspace root under which the active workspace's relative path
+/// canonicalizes to the active root itself.
 fn workspace_root_for_active_relative_path(
     workspace_roots: &[PathBuf],
     active_workspace_root: &ActiveWorkspaceRoot,
@@ -757,6 +902,13 @@ fn workspace_root_for_active_relative_path(
     })
 }
 
+/// Validates an output target and creates its parent directory, returning
+/// the canonical path to write to.
+///
+/// Containment is checked twice on purpose: against the nearest existing
+/// ancestor before `create_dir_all` (so no directories are ever created
+/// outside the allowed roots), and against the canonicalized parent after
+/// creation (so symlinked intermediates cannot redirect the write).
 fn prepare_browser_output_target(
     tool_name: &str,
     target: &Path,
@@ -811,6 +963,7 @@ fn prepare_browser_output_target(
     Ok(resolved)
 }
 
+/// Walks up from `path` to the closest ancestor that already exists.
 fn nearest_existing_parent(path: &Path) -> Option<PathBuf> {
     let mut candidate = path;
     loop {
@@ -821,6 +974,13 @@ fn nearest_existing_parent(path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// User-owned OS roots where browser tools may read uploads or save outputs
+/// outside agent workspaces.
+///
+/// Explicitly configured roots (`PALYRA_OS_FILE_ROOTS`) *replace* the
+/// implicit `USERPROFILE`/`HOME` roots rather than extending them, so an
+/// operator can narrow access below the default. Temp directories are always
+/// allowed.
 fn browser_user_owned_os_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(configured_roots) = configured_browser_user_os_roots() {
@@ -868,6 +1028,8 @@ fn push_browser_windows_drive_temp_roots(roots: &mut Vec<PathBuf>) {
     }
 }
 
+// Mirrors the unix /var/tmp allowance for harnesses that lay out POSIX-style
+// temp paths on the Windows system drive.
 #[cfg(windows)]
 fn browser_windows_drive_temp_root_candidates(system_drive: &str) -> Vec<PathBuf> {
     let drive = system_drive.trim().trim_end_matches(['\\', '/']);
@@ -878,6 +1040,8 @@ fn browser_windows_drive_temp_root_candidates(system_drive: &str) -> Vec<PathBuf
     vec![PathBuf::from(format!("{drive}\\var\\tmp"))]
 }
 
+/// Adds `root` if it canonicalizes to an existing directory not already
+/// listed; non-existent candidates are silently skipped.
 fn push_browser_canonical_root(roots: &mut Vec<PathBuf>, root: PathBuf) {
     if let Ok(canonical) = fs::canonicalize(root.as_path()) {
         if canonical.is_dir() && !roots.iter().any(|existing| existing == &canonical) {
@@ -886,6 +1050,11 @@ fn push_browser_canonical_root(roots: &mut Vec<PathBuf>, root: PathBuf) {
     }
 }
 
+/// Coarse deny-list of OS-critical locations browser tools must never touch,
+/// even when an approved root would otherwise contain them.
+///
+/// Substring matching on the normalized path is deliberate on Windows so the
+/// check applies to every drive letter.
 fn browser_protected_os_path(path: &Path) -> bool {
     #[cfg(windows)]
     {
@@ -911,6 +1080,15 @@ fn browser_protected_os_path(path: &Path) -> bool {
     }
 }
 
+/// Executes one approved `palyra.browser.*` tool call against browserd.
+///
+/// Validates the JSON `input_json` payload, short-circuits sessions the
+/// daemon has already recorded as closed, dials the browserd gRPC service,
+/// dispatches the request for `tool_name`, and post-processes the result:
+/// engine-capability annotation, missing-session normalization, recovery
+/// hints, and an execution attestation. Every failure -- input validation,
+/// transport, or backend-reported -- is encoded in the returned outcome
+/// rather than panicking or bubbling an error.
 pub(crate) async fn execute_browser_tool(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -962,6 +1140,9 @@ pub(crate) async fn execute_browser_tool(
         }
     };
 
+    // The daemon keeps its own ledger of sessions it saw close so calls on a
+    // dead session fail fast with a stable `browser_session_closed` error
+    // instead of a backend-specific one (and without an RPC round trip).
     if browser_tool_requires_open_session(tool_name) {
         let session_id = match parse_browser_tool_session_id(&payload) {
             Ok(value) => value,
@@ -1007,12 +1188,18 @@ pub(crate) async fn execute_browser_tool(
                 );
             }
         };
+    // One extra health RPC per tool call is accepted so each outcome reports
+    // the engine that actually served it (browserd may restart or change
+    // engine mode between calls).
     let browser_runtime_capabilities = fetch_browser_runtime_capabilities(
         &mut client,
         runtime_state.config.browser_service.auth_token.as_deref(),
     )
     .await;
 
+    // Every arm evaluates to (success, output_json, error); shared
+    // post-processing below the match attaches capabilities, recovery hints,
+    // and missing-session normalization.
     let outcome = match tool_name {
         BROWSER_SESSION_CREATE_TOOL_NAME => {
             let idle_ttl_ms = payload.get("idle_ttl_ms").and_then(Value::as_u64).unwrap_or(0);
@@ -1031,6 +1218,9 @@ pub(crate) async fn execute_browser_tool(
                         );
                     }
                 };
+            // Budget fields left at zero are sentinels: browserd substitutes
+            // its own defaults and hard caps, and the response reports the
+            // effective budget actually applied.
             let budget = payload.get("budget").and_then(Value::as_object).map(|value| {
                 browser_v1::SessionBudget {
                     max_navigation_timeout_ms: value
@@ -1140,8 +1330,7 @@ pub(crate) async fn execute_browser_tool(
             match client.create_session(request).await {
                 Ok(response) => {
                     let response = response.into_inner();
-                    let session_id =
-                        if let Some(value) = response.session_id { Some(value.ulid) } else { None };
+                    let session_id = response.session_id.map(|value| value.ulid);
                     let profile_id_warning = ignored_profile_id.as_ref().map(|value| {
                         format!(
                             "ignored non-canonical profile_id '{value}'; session was created without a browser profile"
@@ -1225,6 +1414,8 @@ pub(crate) async fn execute_browser_tool(
                 Ok(response) => {
                     let response = response.into_inner();
                     if response.closed {
+                        // Feed the daemon-side ledger so later calls on this
+                        // session short-circuit before reaching browserd.
                         runtime_state.record_closed_browser_session(session_id.as_str());
                     }
                     let output = json!({
@@ -1293,9 +1484,16 @@ pub(crate) async fn execute_browser_tool(
                     error,
                 );
             }
+            // file:// URLs were already workspace-scoped above, so they get
+            // the private-target flag implicitly (browserd would otherwise
+            // refuse non-network schemes as private).
             let allow_private_targets =
                 browser_tool_allows_private_targets_for_url(runtime_state, &payload, url)
                     || browser_url_uses_file_scheme(url);
+            // AIDEV-NOTE: `max_redirects as u32` (also in reload and
+            // tabs.open) wraps for payload values above u32::MAX; switching
+            // to a saturating conversion is a behavior change left for a
+            // deliberate fix.
             let mut request = Request::new(browser_v1::NavigateRequest {
                 v: CANONICAL_PROTOCOL_MAJOR,
                 session_id: Some(common_v1::CanonicalId { ulid: session_id }),
@@ -1346,6 +1544,9 @@ pub(crate) async fn execute_browser_tool(
                 ),
             }
         }
+        // browserd has no native reload RPC: reload reads the active tab URL
+        // via get_session and re-navigates it, re-applying the same file-URL
+        // and private-target checks as a fresh navigation.
         BROWSER_RELOAD_TOOL_NAME => {
             let session_id = match parse_browser_tool_session_id(&payload) {
                 Ok(value) => value,
@@ -1762,7 +1963,7 @@ pub(crate) async fn execute_browser_tool(
                 v: CANONICAL_PROTOCOL_MAJOR,
                 session_id: Some(common_v1::CanonicalId { ulid: session_id }),
                 selector: selector.to_owned(),
-                file_name: file_name.clone(),
+                file_name,
                 file_bytes,
                 timeout_ms: payload.get("timeout_ms").and_then(Value::as_u64).unwrap_or(0),
                 capture_failure_screenshot: payload
@@ -1850,7 +2051,7 @@ pub(crate) async fn execute_browser_tool(
             let mut request = Request::new(browser_v1::PressRequest {
                 v: CANONICAL_PROTOCOL_MAJOR,
                 session_id: Some(common_v1::CanonicalId { ulid: session_id }),
-                key: key.to_owned(),
+                key,
                 timeout_ms: payload.get("timeout_ms").and_then(Value::as_u64).unwrap_or(0),
                 capture_failure_screenshot: payload
                     .get("capture_failure_screenshot")
@@ -2068,6 +2269,9 @@ pub(crate) async fn execute_browser_tool(
                     let response = response.into_inner();
                     let response_width = response.width;
                     let response_height = response.height;
+                    // Engines may silently clamp the viewport. Treat any
+                    // mismatch as failure so responsive/mobile visual
+                    // assertions are never made against the wrong geometry.
                     let mismatch_error = response.success.then(|| {
                         browser_viewport_metric_mismatch_error(
                             width,
@@ -2439,6 +2643,8 @@ pub(crate) async fn execute_browser_tool(
                     };
                     let mut success = response.success;
                     let mut error = response.error.clone();
+                    // A failed save fails the call: never report an artifact
+                    // that was not written (pdf and downloads.get likewise).
                     let saved_file = if response.success {
                         match save_browser_output_file_from_payload(
                             runtime_state,
@@ -3635,6 +3841,9 @@ pub(crate) async fn execute_browser_tool(
             };
             let artifact_id = match parse_browser_download_artifact_id(&payload) {
                 Ok(Some(value)) => Some(value),
+                // No artifact_id means "the latest download": resolve it via
+                // a limit-1 listing so agents can fetch what they just
+                // triggered without scraping ids first.
                 Ok(None) => {
                     let mut list_request = Request::new(browser_v1::ListDownloadArtifactsRequest {
                         v: CANONICAL_PROTOCOL_MAJOR,
@@ -3706,6 +3915,8 @@ pub(crate) async fn execute_browser_tool(
                         .to_owned(),
                 );
             };
+            // Clamp rather than reject so an over-eager max_bytes still
+            // succeeds at the hard cap; content_base64 is bounded either way.
             let max_bytes = payload
                 .get("max_bytes")
                 .and_then(Value::as_u64)
@@ -3802,6 +4013,10 @@ pub(crate) async fn execute_browser_tool(
     let (success, mut output_json, mut error) = outcome;
     output_json =
         browser_output_with_runtime_capabilities(output_json, &browser_runtime_capabilities);
+    // Normalize any backend "session not found" shape into the canonical
+    // browser_session_closed error and remember the session, so the agent
+    // gets one consistent recovery path (recreate the session) no matter
+    // which RPC discovered the loss.
     if !success && browser_tool_reports_missing_session(output_json.as_slice(), error.as_str()) {
         if let Ok(session_id) = parse_browser_tool_session_id(&payload) {
             runtime_state.record_closed_browser_session(session_id.as_str());
@@ -3814,6 +4029,15 @@ pub(crate) async fn execute_browser_tool(
     browser_tool_execution_outcome(proposal_id, input_json, success, output_json, error)
 }
 
+/// Closes a browser session as part of run-termination cleanup.
+///
+/// Returns `Ok(true)` when browserd confirms the close, `Ok(false)` when
+/// `session_id` is blank (nothing to clean up) or browserd reports the
+/// session was not closed.
+///
+/// # Errors
+/// Returns a message when the browser service is disabled, the session id is
+/// not a canonical id, or the connect/close RPC fails.
 pub(crate) async fn close_browser_session_for_run_cleanup(
     runtime_state: &Arc<GatewayRuntimeState>,
     session_id: &str,
@@ -3848,6 +4072,14 @@ pub(crate) async fn close_browser_session_for_run_cleanup(
     )
 }
 
+/// Dials the configured browserd gRPC endpoint.
+///
+/// Connect and per-request timeouts come from runtime config, so every RPC
+/// issued through the returned client carries a deadline.
+///
+/// # Errors
+/// Returns a tool-facing message when the endpoint URI is invalid or the
+/// connection cannot be established.
 async fn connect_browser_service(
     config: BrowserServiceRuntimeConfig,
 ) -> Result<
@@ -3866,6 +4098,9 @@ async fn connect_browser_service(
     Ok(browser_v1::browser_service_client::BrowserServiceClient::new(channel))
 }
 
+/// Best-effort capability probe: health-RPC failures degrade to an
+/// "unavailable" report instead of an error, because capability annotation
+/// must never block tool execution itself.
 async fn fetch_browser_runtime_capabilities(
     client: &mut browser_v1::browser_service_client::BrowserServiceClient<
         tonic::transport::Channel,
@@ -3883,6 +4118,7 @@ async fn fetch_browser_runtime_capabilities(
     }
 }
 
+/// Extracts and validates the mandatory `session_id` payload field.
 fn parse_browser_tool_session_id(
     payload: &serde_json::Map<String, Value>,
 ) -> Result<String, String> {
@@ -3897,6 +4133,8 @@ fn parse_browser_tool_session_id(
     Ok(session_id.to_owned())
 }
 
+/// Parses the optional `artifact_id` for `downloads.get`; `Ok(None)` (missing
+/// or blank) means "fetch the latest artifact".
 fn parse_browser_download_artifact_id(
     payload: &serde_json::Map<String, Value>,
 ) -> Result<Option<common_v1::CanonicalId>, String> {
@@ -3921,6 +4159,9 @@ fn browser_observe_include_visible_text(payload: &serde_json::Map<String, Value>
     payload.get("include_visible_text").and_then(Value::as_bool).unwrap_or(true)
 }
 
+/// Parses an observe string-array field, trimming entries, dropping blanks
+/// and duplicates, and silently capping at `max_items` (the caps bound the
+/// per-call work browserd is asked to do; excess entries are not an error).
 fn parse_browser_observe_string_array(
     payload: &serde_json::Map<String, Value>,
     field: &str,
@@ -3951,6 +4192,7 @@ fn parse_browser_observe_string_array(
     Ok(parsed)
 }
 
+/// Extracts and validates the mandatory `tab_id` payload field.
 fn parse_browser_tool_tab_id(payload: &serde_json::Map<String, Value>) -> Result<String, String> {
     let Some(tab_id) = payload.get("tab_id").and_then(Value::as_str).map(str::trim) else {
         return Err("palyra.browser.tabs.* requires non-empty string field 'tab_id'".to_owned());
@@ -3963,6 +4205,8 @@ fn parse_browser_tool_tab_id(payload: &serde_json::Map<String, Value>) -> Result
     Ok(tab_id.to_owned())
 }
 
+/// Parses a permission field as either the proto enum number (0..=2) or a
+/// label (`allow`/`deny`/`unspecified`); missing means unspecified.
 fn parse_browser_permission_setting(
     payload: &serde_json::Map<String, Value>,
     field: &str,
@@ -3995,6 +4239,8 @@ fn parse_browser_permission_setting(
     }
 }
 
+/// Parses a console-log severity as either the proto enum number (0..=4) or
+/// a label (`debug`/`info`/`warn`/`error`/`unspecified`).
 fn parse_browser_diagnostic_severity(
     payload: &serde_json::Map<String, Value>,
     field: &str,
@@ -4027,6 +4273,8 @@ fn parse_browser_diagnostic_severity(
     }
 }
 
+/// Attaches the configured browserd bearer token to a request; a no-op when
+/// no token is configured. The token value itself never appears in errors.
 fn attach_browser_auth_metadata<T>(
     request: &mut Request<T>,
     auth_token: Option<&str>,
@@ -4040,6 +4288,8 @@ fn attach_browser_auth_metadata<T>(
     Ok(())
 }
 
+/// Forwards the daemon-side caller principal to browserd so sensitive reads
+/// (storage, logs, downloads, pdf) can be attributed and access-checked.
 fn attach_browser_caller_principal_metadata<T>(
     request: &mut Request<T>,
     caller_principal: &str,
@@ -4054,6 +4304,8 @@ fn attach_browser_caller_principal_metadata<T>(
     Ok(())
 }
 
+/// Renders a gRPC status as a bounded, single-string error message (512
+/// chars max); falls back to the full status when the message is empty.
 fn sanitize_status_message(status: &Status) -> String {
     let message = status.message().trim();
     if message.is_empty() {
@@ -4091,6 +4343,8 @@ fn browser_layout_metrics_to_json(metrics: browser_v1::BrowserLayoutMetrics) -> 
     })
 }
 
+/// Builds the agent-facing error for a viewport that browserd reported
+/// differently from what was requested; `None` when they match.
 fn browser_viewport_metric_mismatch_error(
     requested_width: u32,
     requested_height: u32,
@@ -4105,6 +4359,9 @@ fn browser_viewport_metric_mismatch_error(
     ))
 }
 
+/// Converts element captures to redacted JSON, returning
+/// `(captures, per-text scans, any_redacted)` so the caller can fold the
+/// scans into the observation-wide safety verdict.
 fn browser_element_captures_to_json(
     captures: &[browser_v1::BrowserElementCapture],
 ) -> (Vec<Value>, Vec<SafetyScanResult>, bool) {
@@ -4176,12 +4433,16 @@ fn browser_console_severity_label(value: i32) -> &'static str {
     }
 }
 
+/// A redacted JSON export plus the safety scan that produced it, kept
+/// together so per-entry verdicts can be merged into a tool-level one.
 struct BrowserValueExport {
     value: Value,
     scan: SafetyScanResult,
     redacted: bool,
 }
 
+/// Scans and redacts browser-sourced text for export; all browser content is
+/// treated as externally untrusted regardless of the page it came from.
 fn export_browser_text(text: &str, content_kind: SafetyContentKind) -> ExportRedactionOutcome {
     redact_text_for_export(
         text,
@@ -4200,6 +4461,8 @@ fn browser_safety_json(scan: &SafetyScanResult, redacted: bool) -> Value {
     })
 }
 
+/// Folds per-entry scans into one tool-level safety verdict; an empty set
+/// scans the empty string to obtain a clean baseline result.
 fn merge_browser_value_scans(
     content_kind: SafetyContentKind,
     values: &[BrowserValueExport],
@@ -4218,6 +4481,9 @@ fn merge_browser_value_scans(
 
 fn browser_cookie_domain_to_json(domain: browser_v1::SessionCookieDomain) -> BrowserValueExport {
     let mut redacted = false;
+    // Scan the raw name=value pairs as one block so secret patterns spanning
+    // the key/value boundary are caught; displayed values are still redacted
+    // individually.
     let mut scan_input = format!("domain={}", domain.domain);
     let cookies = domain
         .cookies
@@ -4250,6 +4516,8 @@ fn browser_cookie_domain_to_json(domain: browser_v1::SessionCookieDomain) -> Bro
 
 fn browser_storage_origin_to_json(origin: browser_v1::SessionStorageOrigin) -> BrowserValueExport {
     let mut redacted = false;
+    // Same scan strategy as cookies: scan raw key=value pairs as one block,
+    // redact displayed values individually.
     let mut scan_input = format!("origin={}", origin.origin);
     let entries = origin
         .entries
@@ -4355,6 +4623,8 @@ fn browser_network_log_entry_to_json(entry: browser_v1::NetworkLogEntry) -> Brow
             json!({ "name": header.name, "value": redacted_value })
         })
         .collect::<Vec<_>>();
+    // Sort headers by name for deterministic output across engines and
+    // replays; fixtures assert on stable ordering.
     headers.sort_by(|left, right| {
         let left_name = left.get("name").and_then(Value::as_str).unwrap_or_default();
         let right_name = right.get("name").and_then(Value::as_str).unwrap_or_default();
@@ -4418,6 +4688,8 @@ fn browser_permissions_to_json(permissions: browser_v1::SessionPermissions) -> V
     })
 }
 
+/// Trims a `press` key name, except that a single literal space is itself a
+/// valid key press and must survive untrimmed (pinned by test).
 fn normalize_browser_press_key_input(raw: &str) -> String {
     if raw == " " {
         " ".to_owned()
@@ -4426,6 +4698,9 @@ fn normalize_browser_press_key_input(raw: &str) -> String {
     }
 }
 
+/// Detects "session no longer exists" failures from either the error string
+/// or the output's `error`/`reason` fields (`reason` covers session.close
+/// responses, which report `session_not_found` there instead).
 fn browser_tool_reports_missing_session(output_json: &[u8], error: &str) -> bool {
     if browser_session_closed_error(error.to_ascii_lowercase().as_str()) {
         return true;
@@ -4450,6 +4725,9 @@ fn browser_session_closed_error_message(tool_name: &str, session_id: &str) -> St
     )
 }
 
+/// Rewrites a failure output into the canonical `browser_session_closed`
+/// shape, preserving the backend's original error as `previous_error` for
+/// diagnostics.
 fn browser_session_closed_output_json(session_id: &str, previous_output_json: &[u8]) -> Vec<u8> {
     let previous_error = serde_json::from_slice::<Value>(previous_output_json)
         .ok()
@@ -4472,6 +4750,8 @@ fn browser_session_closed_output_json(session_id: &str, previous_output_json: &[
     .unwrap_or_else(|_| br#"{"success":false,"error":"browser_session_closed"}"#.to_vec())
 }
 
+/// Heuristic over lowercased error text for session-closed conditions; must
+/// match the phrasings browserd and this module emit.
 fn browser_session_closed_error(normalized_error: &str) -> bool {
     normalized_error.contains("browser_session_closed")
         || normalized_error.contains("session_not_found")
@@ -4481,6 +4761,8 @@ fn browser_session_closed_error(normalized_error: &str) -> bool {
                 || normalized_error.contains("not found")))
 }
 
+/// Maps an error to the recovery hint for its failure class, most specific
+/// first. Classification must stay aligned with [`browser_error_category`].
 fn browser_recovery_hint(error: &str) -> Option<&'static str> {
     let normalized = error.to_ascii_lowercase();
     if browser_session_closed_error(normalized.as_str()) {
@@ -4503,6 +4785,8 @@ fn browser_recovery_hint(error: &str) -> Option<&'static str> {
     None
 }
 
+/// Matches tonic/h2 transport-failure signatures that indicate browserd is
+/// unreachable or restarted, as opposed to a tool-level failure.
 fn browser_runtime_unavailable_error(normalized_error: &str) -> bool {
     let browser_service_transport_error = normalized_error.contains("browser service")
         && (normalized_error.contains("connection refused")
@@ -4526,6 +4810,9 @@ fn browser_runtime_unavailable_error(normalized_error: &str) -> bool {
         || browser_tool_transport_error
 }
 
+/// Stable machine-readable category for a failure; mirrors the
+/// classification order of [`browser_recovery_hint`] so hint and category
+/// never disagree on the same error.
 fn browser_error_category(error: &str) -> &'static str {
     let normalized = error.to_ascii_lowercase();
     if browser_session_closed_error(normalized.as_str()) {
@@ -4545,6 +4832,8 @@ fn browser_error_category(error: &str) -> &'static str {
     }
 }
 
+/// Extracts the leading `palyra.browser.<tool>` label from an error message,
+/// falling back to the wildcard label.
 fn browser_tool_label_from_error(error: &str) -> &str {
     error
         .split_whitespace()
@@ -4554,6 +4843,8 @@ fn browser_tool_label_from_error(error: &str) -> &str {
         .unwrap_or("palyra.browser.*")
 }
 
+/// Builds a self-describing failure payload for arms that produced no output
+/// of their own (`{}`), so agents always get category, hint, and executor.
 fn browser_failure_diagnostic_output(error: &str, hint: &str) -> Vec<u8> {
     serde_json::to_vec(&json!({
         "success": false,
@@ -4567,6 +4858,8 @@ fn browser_failure_diagnostic_output(error: &str, hint: &str) -> Vec<u8> {
     .unwrap_or_else(|_| br#"{"success":false,"error":"browser tool failed"}"#.to_vec())
 }
 
+/// Appends `; recovery_hint=...` to a failure message unless the hint text
+/// is already present (avoids doubling on re-processed errors).
 fn browser_error_with_recovery_hint(error: String) -> String {
     let Some(hint) = browser_recovery_hint(error.as_str()) else {
         return error;
@@ -4577,6 +4870,9 @@ fn browser_error_with_recovery_hint(error: String) -> String {
     format!("{error}; recovery_hint={hint}")
 }
 
+/// Enriches a failure output with `error_category` and `recovery_hint`
+/// fields; an empty `{}` output is replaced by the full diagnostic payload.
+/// Non-object outputs pass through unchanged.
 fn browser_output_with_recovery_hint(output_json: Vec<u8>, error: &str) -> Vec<u8> {
     let hint = browser_recovery_hint(error).unwrap_or(BROWSER_TOOL_INPUT_RECOVERY_HINT);
     let mut output = serde_json::from_slice::<Value>(output_json.as_slice())
@@ -4596,6 +4892,9 @@ fn browser_output_with_recovery_hint(output_json: Vec<u8>, error: &str) -> Vec<u
     serde_json::to_vec(&output).unwrap_or(output_json)
 }
 
+/// Adds the `browser_runtime` capability report (and, for limited engines,
+/// `browser_validation_warning`) to every object-shaped output, success or
+/// failure; non-object outputs pass through unchanged.
 fn browser_output_with_runtime_capabilities(
     output_json: Vec<u8>,
     capabilities: &BrowserRuntimeCapabilities,
@@ -4614,6 +4913,8 @@ fn browser_output_with_runtime_capabilities(
     serde_json::to_vec(&output).unwrap_or(output_json)
 }
 
+/// Finalizes a browser tool result into an attested [`ToolExecutionOutcome`],
+/// enriching failures with recovery hints and error categories first.
 fn browser_tool_execution_outcome(
     proposal_id: &str,
     input_json: &[u8],
@@ -4625,6 +4926,8 @@ fn browser_tool_execution_outcome(
         if success { output_json } else { browser_output_with_recovery_hint(output_json, &error) };
     let error = if success { error } else { browser_error_with_recovery_hint(error) };
     let executed_at_unix_ms = current_unix_ms();
+    // Domain-separated digest with length-prefixed fields so adjacent values
+    // cannot collide by shifting bytes across a field boundary.
     let mut hasher = Sha256::new();
     hasher.update(b"palyra.browser.tool.attestation.v1");
     hasher.update((proposal_id.len() as u64).to_be_bytes());
@@ -4685,8 +4988,12 @@ mod tests {
     use serde_json::json;
     use tonic::Request;
 
+    // Process env vars are global; tests that mutate them serialize here so
+    // parallel test threads cannot observe each other's overrides.
     static BROWSER_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+    /// Sets an env var for the test's lifetime and restores the previous
+    /// value (or removes the var) on drop.
     struct ScopedEnvVar {
         key: &'static str,
         previous: Option<std::ffi::OsString>,
