@@ -1,3 +1,7 @@
+//! Pins the device pairing flow: explicit approval, verifiable identity and rotation output,
+//! stdin proof handling, and that failed pairing persists no device identity secret.
+//! Compiled out entirely on Windows.
+
 #[cfg(not(windows))]
 use std::{
     io::Write,

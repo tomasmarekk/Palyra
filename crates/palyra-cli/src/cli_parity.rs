@@ -1,3 +1,8 @@
+//! CLI parity assets: the committed parity matrix, its verification against
+//! the live clap command tree, and the markdown reports pinned byte-for-byte
+//! by the `cli_parity` integration tests. Rendered strings are contract
+//! surface; changing them requires regenerating the committed assets.
+
 use std::collections::BTreeMap;
 
 use anyhow::Result;
@@ -9,6 +14,8 @@ use crate::shared_chat_commands::{
     shared_chat_commands, SharedChatCommandExecution, SharedChatCommandSurface,
 };
 
+/// Expected parity posture declared per matrix entry, independent of whether
+/// the live CLI currently satisfies it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CliParityStatus {
@@ -19,6 +26,7 @@ pub enum CliParityStatus {
 }
 
 impl CliParityStatus {
+    /// Returns the snake_case label used in reports and summaries.
     pub fn as_label(self) -> &'static str {
         match self {
             Self::Done => "done",
@@ -29,6 +37,8 @@ impl CliParityStatus {
     }
 }
 
+/// Help-snapshot reference for a matrix entry; `file` is the shared snapshot
+/// with optional platform-specific overrides.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CliParitySnapshotSpec {
     pub path: String,
@@ -41,6 +51,9 @@ pub struct CliParitySnapshotSpec {
 }
 
 impl CliParitySnapshotSpec {
+    /// Returns the snapshot file for the compiling platform, preferring the
+    /// platform-specific entry, then the shared one, then the other platform
+    /// as a last resort so a lone declaration still resolves.
     pub fn expected_file(&self) -> Option<&str> {
         #[cfg(windows)]
         {
@@ -53,6 +66,8 @@ impl CliParitySnapshotSpec {
         }
     }
 
+    /// Renders a human-readable label, collapsing identical platform entries
+    /// into one name and spelling out platform splits otherwise.
     pub fn display_label(&self) -> Option<String> {
         match (self.file.as_deref(), self.unix_file.as_deref(), self.windows_file.as_deref()) {
             (Some(file), None, None) => Some(file.to_owned()),
@@ -79,6 +94,8 @@ impl CliParitySnapshotSpec {
     }
 }
 
+/// One committed parity expectation for a command path: posture, required
+/// aliases/flags, and an optional help-snapshot binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CliParityMatrixEntry {
     pub path: String,
@@ -95,12 +112,14 @@ pub struct CliParityMatrixEntry {
     pub snapshot: Option<CliParitySnapshotSpec>,
 }
 
+/// The committed parity matrix loaded from `tests/cli_parity_matrix.toml`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CliParityMatrix {
     pub version: u32,
     pub entries: Vec<CliParityMatrixEntry>,
 }
 
+/// Result of checking one matrix entry against the live clap command tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CliParityVerificationStatus {
@@ -112,6 +131,7 @@ pub enum CliParityVerificationStatus {
 }
 
 impl CliParityVerificationStatus {
+    /// Returns the snake_case label used in reports and summaries.
     pub fn as_label(self) -> &'static str {
         match self {
             Self::Verified => "verified",
@@ -122,11 +142,14 @@ impl CliParityVerificationStatus {
         }
     }
 
+    /// Returns `true` when the entry passed verification without regressions.
     pub fn is_verified(self) -> bool {
         matches!(self, Self::Verified)
     }
 }
 
+/// Matrix entry enriched with the observed CLI surface and verification
+/// outcome.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CliParityReportEntry {
     pub path: String,
@@ -144,6 +167,7 @@ pub struct CliParityReportEntry {
     pub missing_flags: Vec<String>,
 }
 
+/// Aggregate counters over all report entries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CliParitySummary {
     pub total_entries: usize,
@@ -154,6 +178,7 @@ pub struct CliParitySummary {
     pub verification_counts: BTreeMap<String, usize>,
 }
 
+/// Full parity report: matrix expectations verified against the live CLI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CliParityReport {
     pub version: u32,
@@ -161,6 +186,7 @@ pub struct CliParityReport {
     pub entries: Vec<CliParityReportEntry>,
 }
 
+/// Report row for one shared chat slash command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SharedChatCommandParityEntry {
     pub name: String,
@@ -173,6 +199,7 @@ pub struct SharedChatCommandParityEntry {
     pub entity_targets: Vec<String>,
 }
 
+/// Surface-coverage counters for the shared chat command registry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SharedChatCommandParitySummary {
     pub total_commands: usize,
@@ -183,16 +210,24 @@ pub struct SharedChatCommandParitySummary {
     pub tui_only_commands: usize,
 }
 
+/// Parity report over the shared web/TUI chat command registry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SharedChatCommandParityReport {
     pub summary: SharedChatCommandParitySummary,
     pub entries: Vec<SharedChatCommandParityEntry>,
 }
 
+/// Builds the fully resolved clap command tree for parity inspection.
+///
+/// # Panics
+/// Panics on Windows if the dedicated helper thread cannot be spawned or
+/// itself panics while building the command tree.
 pub fn build_cli_root_command() -> ClapCommand {
     build_cli_root_command_inner()
 }
 
+/// Verifies every matrix entry against `root` and aggregates the outcome
+/// counters consumed by the parity tests and rendered reports.
 pub fn build_cli_parity_report(matrix: &CliParityMatrix, root: &ClapCommand) -> CliParityReport {
     let mut status_counts = BTreeMap::new();
     let mut verification_counts = BTreeMap::new();
@@ -284,6 +319,8 @@ pub fn build_cli_parity_report(matrix: &CliParityMatrix, root: &ClapCommand) -> 
     }
 }
 
+/// Renders the parity report as the committed markdown asset
+/// (`tests/cli_parity_report.md`); output is pinned byte-for-byte.
 pub fn render_cli_parity_report_markdown(report: &CliParityReport) -> String {
     let mut lines = Vec::new();
     lines.push("# CLI Parity Acceptance Matrix".to_owned());
@@ -365,6 +402,10 @@ pub fn render_cli_parity_report_markdown(report: &CliParityReport) -> String {
     lines.join("\n")
 }
 
+/// Fails when any report entry did not verify against the live CLI surface.
+///
+/// # Errors
+/// Returns a single error listing every regression, one bullet per entry.
 pub fn validate_cli_parity_report(report: &CliParityReport) -> Result<()> {
     let regressions = report
         .entries
@@ -379,6 +420,11 @@ pub fn validate_cli_parity_report(report: &CliParityReport) -> Result<()> {
     anyhow::bail!("CLI parity regressions detected:\n{}", regressions.join("\n"));
 }
 
+/// Builds the parity report for the shared web/TUI chat command registry.
+///
+/// # Panics
+/// Panics if the embedded chat command registry fails validation on first
+/// access (see [`crate::shared_chat_commands::shared_chat_commands`]).
 pub fn build_shared_chat_command_parity_report() -> SharedChatCommandParityReport {
     let mut shared_commands = 0_usize;
     let mut web_only_commands = 0_usize;
@@ -432,6 +478,8 @@ pub fn build_shared_chat_command_parity_report() -> SharedChatCommandParityRepor
     }
 }
 
+/// Renders the shared chat command report as the committed markdown asset
+/// (`tests/shared_chat_command_parity.md`); output is pinned byte-for-byte.
 pub fn render_shared_chat_command_parity_markdown(
     report: &SharedChatCommandParityReport,
 ) -> String {
@@ -500,7 +548,11 @@ pub fn render_shared_chat_command_parity_markdown(
     lines.join("\n")
 }
 
+/// Walks a space-separated matrix path (e.g. `palyra sessions list`) through
+/// the command tree, matching subcommand names or aliases per segment.
 fn find_command<'a>(root: &'a ClapCommand, path: &str) -> Option<&'a ClapCommand> {
+    // The root binary name is the matrix path for the top-level command and
+    // is not a subcommand of itself.
     if path == "palyra" {
         return Some(root);
     }
@@ -608,6 +660,9 @@ fn render_regression(entry: &CliParityReportEntry) -> String {
     }
 }
 
+// Building the full clap tree recurses deeply enough to overflow the default
+// thread stack on Windows, so the work runs on a helper thread with an
+// explicit 8 MiB stack. Unix builds use the plain variant below.
 #[cfg(windows)]
 fn build_cli_root_command_inner() -> ClapCommand {
     const CLI_HELP_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
@@ -620,9 +675,9 @@ fn build_cli_root_command_inner() -> ClapCommand {
             command.build();
             command
         })
-        .expect("failed to spawn CLI parity helper thread")
+        .expect("OS can always spawn one short-lived helper thread with an 8 MiB stack")
         .join()
-        .expect("CLI parity helper thread panicked")
+        .expect("CLI parity helper thread panicked while building the clap command tree")
 }
 
 #[cfg(not(windows))]

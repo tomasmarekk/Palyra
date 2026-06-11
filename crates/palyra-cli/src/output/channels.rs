@@ -1,9 +1,19 @@
+//! Output rendering for `palyra channels` commands over raw daemon JSON
+//! payloads: connector list/status and router rules/warnings/preview/pairings.
+//!
+//! Text lines and JSON shapes are pinned by CLI parity tests; missing fields
+//! render as stable placeholders instead of failing.
+
 use anyhow::Result;
 use palyra_common::redaction::REDACTED;
 use serde_json::Value;
 
 use super::print_json_pretty;
 
+/// Emits the connector list as pretty JSON or pinned text lines.
+///
+/// # Errors
+/// Returns an error when the JSON payload cannot be encoded.
 pub(crate) fn emit_list(payload: Value, json_output: bool) -> Result<()> {
     if json_output {
         return print_json_pretty(&payload, "failed to encode channels list payload as JSON");
@@ -14,6 +24,10 @@ pub(crate) fn emit_list(payload: Value, json_output: bool) -> Result<()> {
     Ok(())
 }
 
+/// Emits one connector's status as pretty JSON or pinned text lines.
+///
+/// # Errors
+/// Returns an error when the JSON payload cannot be encoded.
 pub(crate) fn emit_status(payload: Value, json_output: bool) -> Result<()> {
     if json_output {
         return print_json_pretty(&payload, "failed to encode channels status payload as JSON");
@@ -24,6 +38,10 @@ pub(crate) fn emit_status(payload: Value, json_output: bool) -> Result<()> {
     Ok(())
 }
 
+/// Emits the router rules summary as pretty JSON or a pinned text line.
+///
+/// # Errors
+/// Returns an error when the JSON payload cannot be encoded.
 pub(crate) fn emit_router_rules(payload: Value, json_output: bool) -> Result<()> {
     if json_output {
         return print_json_pretty(
@@ -49,6 +67,10 @@ pub(crate) fn emit_router_rules(payload: Value, json_output: bool) -> Result<()>
     Ok(())
 }
 
+/// Emits router warnings as pretty JSON or pinned per-warning text lines.
+///
+/// # Errors
+/// Returns an error when the JSON payload cannot be encoded.
 pub(crate) fn emit_router_warnings(payload: Value, json_output: bool) -> Result<()> {
     if json_output {
         return print_json_pretty(
@@ -68,6 +90,11 @@ pub(crate) fn emit_router_warnings(payload: Value, json_output: bool) -> Result<
     Ok(())
 }
 
+/// Emits a router preview as pretty JSON or a pinned text line; the session
+/// key is redacted in both formats before anything is printed.
+///
+/// # Errors
+/// Returns an error when the JSON payload cannot be encoded.
 pub(crate) fn emit_router_preview(mut payload: Value, json_output: bool) -> Result<()> {
     redact_router_preview_session_key(&mut payload);
 
@@ -91,6 +118,11 @@ pub(crate) fn emit_router_preview(mut payload: Value, json_output: bool) -> Resu
     Ok(())
 }
 
+/// Emits per-channel pairing state (pending, granted, active codes) as pretty
+/// JSON or pinned text lines.
+///
+/// # Errors
+/// Returns an error when the JSON payload cannot be encoded.
 pub(crate) fn emit_router_pairings(payload: Value, json_output: bool) -> Result<()> {
     if json_output {
         return print_json_pretty(
@@ -152,6 +184,10 @@ pub(crate) fn emit_router_pairings(payload: Value, json_output: bool) -> Result<
     Ok(())
 }
 
+/// Emits a newly issued pairing code as pretty JSON or a pinned text line.
+///
+/// # Errors
+/// Returns an error when the JSON payload cannot be encoded.
 pub(crate) fn emit_router_pairing_code(payload: Value, json_output: bool) -> Result<()> {
     if json_output {
         return print_json_pretty(
@@ -173,6 +209,8 @@ pub(crate) fn emit_router_pairing_code(payload: Value, json_output: bool) -> Res
     Ok(())
 }
 
+/// Replaces the `session_key` value with the redaction placeholder, handling
+/// both the nested `preview` object and bare top-level payload shapes.
 pub(crate) fn redact_router_preview_session_key(payload: &mut Value) {
     let target = if let Some(preview) = payload.get_mut("preview") { preview } else { payload };
     if let Some(object) = target.as_object_mut() {
@@ -182,7 +220,10 @@ pub(crate) fn redact_router_preview_session_key(payload: &mut Value) {
     }
 }
 
+/// Renders the pinned text lines for the connector list.
 pub(crate) fn render_list_lines(payload: &Value) -> Vec<String> {
+    // Deferred connectors are hidden entirely (including from the count):
+    // they are roadmap placeholders, not operable channels.
     let connectors = payload
         .get("connectors")
         .and_then(Value::as_array)
@@ -210,7 +251,10 @@ pub(crate) fn render_list_lines(payload: &Value) -> Vec<String> {
     lines
 }
 
+/// Renders the pinned text lines for one connector's status, including the
+/// optional operations, health-refresh, action, and runtime metrics sections.
 pub(crate) fn render_status_lines(payload: &Value) -> Vec<String> {
+    // Accept both the wrapped ({"connector": {...}}) and bare payload shapes.
     let connector = payload.get("connector").unwrap_or(payload);
     let connector_id = connector.get("connector_id").and_then(Value::as_str).unwrap_or("unknown");
     let availability = connector_availability(connector);

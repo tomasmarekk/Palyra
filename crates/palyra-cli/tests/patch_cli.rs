@@ -1,3 +1,7 @@
+//! Pins `palyra patch apply` stdin handling: a single validation payload on parse errors,
+//! workspace-root resolution independent of the shell cwd, and tolerance for Windows
+//! pipeline control-line whitespace.
+
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};

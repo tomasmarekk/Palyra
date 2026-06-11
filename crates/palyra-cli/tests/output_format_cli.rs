@@ -1,3 +1,7 @@
+//! Pins the global JSON output-format contract: early CLI errors, runtime health, and core
+//! surfaces must emit machine-readable JSON when requested. Seeds a local config and a
+//! usage-cost SQLite fixture in a temp workdir.
+
 use std::fs;
 use std::process::{Command, Output};
 

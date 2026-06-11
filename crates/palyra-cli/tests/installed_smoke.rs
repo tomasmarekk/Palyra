@@ -1,3 +1,7 @@
+//! Pins installed-product smoke behavior for the binary named by PALYRA_BIN_UNDER_TEST plus
+//! the PALYRA_INSTALL_* / *_UNDER_TEST paths; every test no-ops when that install context
+//! is not configured.
+
 use std::fs;
 
 use anyhow::{Context, Result};

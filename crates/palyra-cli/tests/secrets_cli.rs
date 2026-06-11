@@ -1,3 +1,7 @@
+//! Pins `palyra secrets` set/get/explain/configure/audit/apply contracts: byte-exact
+//! roundtrips, redaction by default, and JSON output. Uses a temp encrypted-file vault
+//! backend instead of the OS keychain.
+
 use std::fs;
 use std::io::Write;
 use std::process::{Command, Output, Stdio};

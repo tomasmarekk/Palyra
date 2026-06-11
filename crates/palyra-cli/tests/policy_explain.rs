@@ -1,3 +1,6 @@
+//! Pins `palyra policy explain`: deny-by-default when no config exists and honoring a
+//! configured tool allowlist.
+
 use std::process::Command;
 
 use anyhow::{Context, Result};

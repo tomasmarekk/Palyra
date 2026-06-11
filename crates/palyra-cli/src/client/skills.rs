@@ -1,5 +1,11 @@
+//! Blocking HTTP helper for skill status actions on the daemon admin API.
+//!
+//! Wraps `POST /admin/v1/skills/{skill_id}/{action}` with the identity headers
+//! the daemon expects; connection details fall back to env vars and defaults.
+
 use crate::*;
 
+/// Identity and connection inputs for a skills admin request.
 #[derive(Debug, Clone)]
 pub(crate) struct SkillsAdminRequestContext {
     pub url: Option<String>,
@@ -9,6 +15,12 @@ pub(crate) struct SkillsAdminRequestContext {
     pub channel: Option<String>,
 }
 
+/// Posts a skill status action (for example `quarantine` or `enable`) and
+/// decodes the daemon's `SkillStatusResponse`.
+///
+/// # Errors
+/// Returns an error when the HTTP client cannot be built, the request fails,
+/// the daemon responds with a non-success status, or the payload fails to parse.
 pub(crate) fn post_skill_status_action(
     skill_id: &str,
     action: &'static str,
@@ -23,6 +35,8 @@ pub(crate) fn post_skill_status_action(
     let endpoint =
         format!("{}/admin/v1/skills/{skill_id}/{action}", base_url.trim_end_matches('/'));
     let token = context.token.or_else(|| env::var("PALYRA_ADMIN_TOKEN").ok());
+    // Short timeout: skill status actions target the (usually local) daemon
+    // admin endpoint, so an unreachable daemon should fail fast, not hang.
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(2))
         .build()

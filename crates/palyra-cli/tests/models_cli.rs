@@ -1,3 +1,7 @@
+//! Pins `palyra models` list/set/status/explain/test-connection contracts, including MiniMax
+//! legacy-Anthropic identity handling and live-discovery caching against mock loopback HTTP
+//! provider servers.
+
 use std::{
     fs,
     io::{Read, Write},

@@ -1,3 +1,8 @@
+//! Root CLI context: resolves output/log options, the active profile, state
+//! root, config path, and connection endpoints/credentials for every command.
+//! Token resolution is origin-scoped -- a stored admin token is attached only
+//! when the target endpoint matches the source that supplied the token.
+
 use std::{
     collections::BTreeMap,
     env,
@@ -33,6 +38,9 @@ const PROFILE_STATE_ROOT_RELATIVE_SUFFIX: &str = "state";
 const PROFILE_CONFIG_RELATIVE_DIR: &str = "config";
 const PROFILE_CONFIG_FILE_NAME: &str = "palyra.toml";
 
+/// Fully resolved per-invocation context shared by all command handlers:
+/// formatting options, active profile, state root, config path, and the
+/// defaults used to resolve daemon/gateway connections.
 #[derive(Debug, Clone)]
 pub(crate) struct RootCommandContext {
     cli_state_root: PathBuf,
@@ -49,6 +57,8 @@ pub(crate) struct RootCommandContext {
     pub(crate) allow_strict_profile_actions: bool,
 }
 
+/// Minimal context for rendering errors before (or without) a full root
+/// context, so failures honor the requested output format and trace id.
 #[derive(Debug, Clone)]
 pub(crate) struct ErrorRenderContext {
     pub(crate) output_format: OutputFormatArg,
@@ -85,6 +95,8 @@ impl ErrorRenderContext {
     }
 }
 
+/// Built-in identity defaults applied when neither flags, profile, config,
+/// nor environment supply a value.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ConnectionDefaults {
     pub principal: &'static str,
@@ -100,6 +112,8 @@ impl ConnectionDefaults {
         Self { principal: "admin:local", device_id: DEFAULT_DEVICE_ID, channel: DEFAULT_CHANNEL };
 }
 
+/// Explicit per-command overrides (flags) that take precedence over profile,
+/// config, and environment when resolving a connection.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ConnectionOverrides {
     pub daemon_url: Option<String>,
@@ -110,6 +124,8 @@ pub(crate) struct ConnectionOverrides {
     pub channel: Option<String>,
 }
 
+/// Resolved daemon HTTP connection parameters, including the origin-matched
+/// admin token (if any) and the per-invocation trace id.
 #[derive(Debug, Clone)]
 pub(crate) struct HttpConnection {
     pub base_url: String,
@@ -120,6 +136,7 @@ pub(crate) struct HttpConnection {
     pub trace_id: String,
 }
 
+/// On-disk CLI profile registry (`cli/profiles.toml` under the state root).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CliProfilesDocument {
@@ -129,6 +146,8 @@ pub(crate) struct CliProfilesDocument {
     pub(crate) profiles: BTreeMap<String, CliConnectionProfile>,
 }
 
+/// One named connection profile: endpoints, credentials (inline or via env
+/// indirection), identity defaults, and display posture metadata.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CliConnectionProfile {
@@ -153,6 +172,8 @@ pub(crate) struct CliConnectionProfile {
     pub(crate) last_used_at_unix_ms: Option<i64>,
 }
 
+/// Display posture of the active profile with derived defaults filled in
+/// (mode, environment, risk level, color); see `build_active_profile_context`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ActiveProfileContext {
     pub(crate) name: String,
@@ -172,6 +193,7 @@ struct ConfigConnectionDefaults {
     principal: Option<String>,
 }
 
+/// Connection-related environment variables read once per resolution.
 #[derive(Debug, Clone)]
 struct ConnectionEnvironment {
     daemon_url: Option<String>,
@@ -189,6 +211,9 @@ enum ConnectionEndpointKind {
     GatewayGrpc,
 }
 
+/// Where a resolved endpoint URL came from; precedence is declaration order
+/// (explicit flag first, built-in default last) and the source decides which
+/// stored tokens may be attached to the endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConnectionEndpointSource {
     Explicit,
@@ -214,20 +239,36 @@ fn error_render_context_cell() -> &'static Mutex<Option<ErrorRenderContext>> {
     ERROR_RENDER_CONTEXT.get_or_init(|| Mutex::new(None))
 }
 
+/// Whether an explicit `--config` path must already exist; bootstrap flows
+/// (setup/init) accept a missing file they are about to create.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) enum ExplicitConfigPathPolicy {
     #[default]
     RequireExisting,
     AllowMissingForBootstrap,
 }
+
+// Serializes tests that mutate process-wide env vars and the context cells.
 #[cfg(test)]
 pub(crate) fn test_env_lock_for_tests() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
+
+/// Builds the root context from CLI options and installs it as the
+/// process-wide current context.
+///
+/// # Errors
+/// Returns an error when profile/config/state-root resolution fails or the
+/// context lock is poisoned.
 pub(crate) fn install_root_context(root: RootOptions) -> Result<RootCommandContext> {
     install_root_context_with_policy(root, ExplicitConfigPathPolicy::RequireExisting)
 }
+
+/// Same as [`install_root_context`] but with an explicit config-path policy.
+///
+/// # Errors
+/// See [`install_root_context`].
 pub(crate) fn install_root_context_with_policy(
     root: RootOptions,
     explicit_config_path_policy: ExplicitConfigPathPolicy,
@@ -239,10 +280,16 @@ pub(crate) fn install_root_context_with_policy(
     Ok(context)
 }
 
+/// Returns a clone of the installed root context, if any.
 pub(crate) fn current_root_context() -> Option<RootCommandContext> {
     context_cell().lock().ok().and_then(|guard| guard.as_ref().cloned())
 }
 
+/// Scrapes formatting options from raw argv before clap runs, so that even
+/// argument-parse failures render in the caller's requested format.
+///
+/// # Errors
+/// Returns an error when the error-context lock is poisoned.
 pub(crate) fn install_early_error_context_from_args(args: &[OsString]) -> Result<()> {
     install_error_render_context(ErrorRenderContext {
         output_format: resolve_output_format_from_raw_args(args),
@@ -257,6 +304,11 @@ pub(crate) fn install_early_error_context_from_args(args: &[OsString]) -> Result
     })
 }
 
+/// Refreshes the error-render context from parsed root options, preserving a
+/// previously assigned trace id so one invocation logs one id throughout.
+///
+/// # Errors
+/// Returns an error when the error-context lock is poisoned.
 pub(crate) fn install_early_error_context(root: &RootOptions) -> Result<()> {
     let existing_trace_id = current_error_render_context().map(|context| context.trace_id);
     install_error_render_context(ErrorRenderContext {
@@ -269,6 +321,8 @@ pub(crate) fn install_early_error_context(root: &RootOptions) -> Result<()> {
     })
 }
 
+/// Returns the active error-render context, preferring the richer root
+/// context when one has been installed.
 pub(crate) fn current_error_render_context() -> Option<ErrorRenderContext> {
     if let Some(context) = current_root_context() {
         return Some(ErrorRenderContext {
@@ -323,10 +377,12 @@ impl RootCommandContext {
         self.profile_name.as_deref()
     }
 
+    /// Returns the active profile's display posture with derived defaults.
     pub(crate) fn active_profile_context(&self) -> Option<ActiveProfileContext> {
         build_active_profile_context(self.profile_name.as_deref(), self.profile.as_ref())
     }
 
+    /// Returns `true` when the active profile demands strict-mode guardrails.
     pub(crate) fn strict_profile_mode(&self) -> bool {
         self.active_profile_context().is_some_and(|profile| profile.strict_mode)
     }
@@ -339,6 +395,8 @@ impl RootCommandContext {
         self.cli_state_root.as_path()
     }
 
+    /// Returns `true` when the state root came from `--state-root` rather
+    /// than profile, environment, or platform defaults.
     pub(crate) fn state_root_explicit(&self) -> bool {
         self.state_root_explicit
     }
@@ -355,6 +413,11 @@ impl RootCommandContext {
         matches!(self.output_format, OutputFormatArg::Ndjson)
     }
 
+    /// Resolves a gateway gRPC connection from overrides, profile, config,
+    /// environment, and defaults, in that precedence order.
+    ///
+    /// # Errors
+    /// Returns an error when the fallback gRPC bind configuration is invalid.
     pub(crate) fn resolve_grpc_connection(
         &self,
         overrides: ConnectionOverrides,
@@ -380,6 +443,12 @@ impl RootCommandContext {
         })
     }
 
+    /// Resolves a daemon HTTP connection from overrides, profile, config,
+    /// environment, and defaults, in that precedence order.
+    ///
+    /// # Errors
+    /// Currently infallible in practice; kept fallible to mirror
+    /// [`Self::resolve_grpc_connection`] at call sites.
     pub(crate) fn resolve_http_connection(
         &self,
         overrides: ConnectionOverrides,
@@ -405,6 +474,9 @@ impl RootCommandContext {
         })
     }
 
+    /// Picks the principal for admin console logins, accepting only
+    /// `admin:`-prefixed candidates so a user run-owner principal can never
+    /// be promoted into an admin login.
     pub(crate) fn resolve_admin_console_principal(
         &self,
         candidate_principal: Option<&str>,
@@ -505,6 +577,11 @@ impl RootCommandContext {
         })
     }
 
+    // Origin-scoped token resolution: a stored token (profile, config, or
+    // environment) is attached only when the resolved endpoint matches the
+    // origin that token was configured for. This keeps credentials from
+    // leaking to an arbitrary endpoint passed via --daemon-url/--grpc-url;
+    // only an explicitly provided token follows an explicit endpoint.
     fn resolve_token(
         &self,
         override_token: Option<String>,
@@ -561,6 +638,8 @@ impl RootCommandContext {
         if self.config_token_matches_endpoint(endpoint, endpoint_kind) {
             return true;
         }
+        // A default-resolved endpoint is the local daemon, which is what a
+        // profile without explicit endpoint URLs implicitly targets.
         endpoint.source == ConnectionEndpointSource::Default
     }
 
@@ -585,6 +664,9 @@ impl RootCommandContext {
         {
             return true;
         }
+        // The ambient env token also applies to locally resolved endpoints
+        // (config or built-in default), but never to explicit or profile
+        // endpoints that point somewhere else.
         matches!(
             endpoint.source,
             ConnectionEndpointSource::Config | ConnectionEndpointSource::Default
@@ -637,6 +719,9 @@ impl RootCommandContext {
             .or_else(|| normalize_owned_text(self.config_defaults.principal.clone()))
             .or(connection_env.admin_bound_principal)
             .or_else(|| {
+                // An explicitly supplied token is an admin credential, so a
+                // user-default connection escalates to the admin principal to
+                // match the identity the daemon will associate with it.
                 (explicit_token_present && defaults.principal == ConnectionDefaults::USER.principal)
                     .then(|| ConnectionDefaults::ADMIN.principal.to_owned())
             })
@@ -808,6 +893,8 @@ fn raw_flag_present(args: &[OsString], flag: &str) -> bool {
     args.iter().any(|arg| arg == OsStr::new(flag))
 }
 
+// Counts verbosity before clap runs: each `--verbose` adds one, and bundled
+// short flags add one per `v` (so `-vv` counts as two).
 fn raw_count_flag(args: &[OsString], short_flag: &str) -> usize {
     args.iter()
         .filter_map(|arg| arg.to_str())
@@ -867,7 +954,17 @@ fn load_profiles_document(path: Option<&Path>) -> Result<CliProfilesDocument> {
     Ok(document)
 }
 
+/// Returns the path of the CLI profile registry, preferring the installed
+/// root context's bootstrap state root.
+///
+/// # Errors
+/// Returns an error when no state root can be resolved or the configured
+/// profiles path is invalid.
 pub(crate) fn cli_profiles_registry_path() -> Result<PathBuf> {
+    // AIDEV-NOTE: `unwrap_or` evaluates its argument eagerly, so the default
+    // state-root resolution runs (and its `?` can fail, e.g. when neither
+    // LOCALAPPDATA nor HOME is set) even when a root context already provides
+    // the answer. Fixing this changes behavior; use a match if addressed.
     let base_state_root = current_root_context()
         .map(|context| context.cli_state_root.to_path_buf())
         .unwrap_or(resolve_cli_state_root(None)?);
@@ -885,12 +982,22 @@ fn resolve_profiles_storage_path(base_state_root: &Path) -> Result<PathBuf> {
     Ok(base_state_root.join(CLI_PROFILES_RELATIVE_PATH))
 }
 
+/// Loads the profile registry (empty document when the file is absent).
+///
+/// # Errors
+/// Returns an error when the registry path cannot be resolved, the file is
+/// unreadable or invalid TOML, or its schema version is unsupported.
 pub(crate) fn load_cli_profiles_registry() -> Result<(PathBuf, CliProfilesDocument)> {
     let path = cli_profiles_registry_path()?;
     let document = load_profiles_document(Some(path.as_path()))?;
     Ok((path, document))
 }
 
+/// Writes the registry to `path`, stamping the current schema version.
+///
+/// # Errors
+/// Returns an error when the parent directory cannot be created or the file
+/// cannot be serialized or written.
 pub(crate) fn persist_cli_profiles_registry(
     path: &Path,
     document: &CliProfilesDocument,
@@ -908,6 +1015,11 @@ pub(crate) fn persist_cli_profiles_registry(
         .with_context(|| format!("failed to write CLI profiles {}", path.display()))
 }
 
+/// Returns the default state root for a named profile
+/// (`<cli-state-root>/profiles/<name>/state`).
+///
+/// # Errors
+/// Returns an error when the base CLI state root cannot be resolved.
 pub(crate) fn default_profile_state_root(profile_name: &str) -> Result<PathBuf> {
     let base_state_root = resolve_cli_state_root(None)?;
     Ok(base_state_root
@@ -916,6 +1028,11 @@ pub(crate) fn default_profile_state_root(profile_name: &str) -> Result<PathBuf> 
         .join(PROFILE_STATE_ROOT_RELATIVE_SUFFIX))
 }
 
+/// Returns the default config file path for a named profile
+/// (`<cli-state-root>/profiles/<name>/config/palyra.toml`).
+///
+/// # Errors
+/// Returns an error when the base CLI state root cannot be resolved.
 pub(crate) fn default_profile_config_path(profile_name: &str) -> Result<PathBuf> {
     let base_state_root = resolve_cli_state_root(None)?;
     Ok(base_state_root
@@ -925,6 +1042,12 @@ pub(crate) fn default_profile_config_path(profile_name: &str) -> Result<PathBuf>
         .join(PROFILE_CONFIG_FILE_NAME))
 }
 
+/// Validates and normalizes a profile name (trimmed, max 64 chars, lowercase
+/// ASCII letters/digits plus `.`, `-`, `_`) so names stay safe as path
+/// segments under the state root.
+///
+/// # Errors
+/// Returns an error describing the violated rule.
 pub(crate) fn validate_profile_name(raw: &str) -> Result<String> {
     let normalized = raw.trim();
     if normalized.is_empty() {
@@ -944,10 +1067,17 @@ pub(crate) fn validate_profile_name(raw: &str) -> Result<String> {
     Ok(normalized.to_owned())
 }
 
+/// Trims `value` and discards empty results.
 pub(crate) fn normalized_profile_text(value: Option<&str>) -> Option<String> {
     value.map(str::trim).filter(|candidate| !candidate.is_empty()).map(ToOwned::to_owned)
 }
 
+/// Records new config/state paths on the active profile and bumps its
+/// timestamps. A no-op when no root context, active profile, or registry
+/// entry exists.
+///
+/// # Errors
+/// Returns an error when the registry cannot be loaded or persisted.
 pub(crate) fn update_active_profile_paths(
     config_path: Option<&Path>,
     state_root: Option<&Path>,
@@ -973,6 +1103,14 @@ pub(crate) fn update_active_profile_paths(
     persist_cli_profiles_registry(path.as_path(), &document)
 }
 
+/// Creates the default `local` profile on first bootstrap, or refreshes an
+/// existing local profile's paths. Endpoint URLs are deliberately left unset
+/// so the local profile keeps following the config-derived daemon ports
+/// instead of freezing whichever ports were active at bootstrap time.
+///
+/// # Errors
+/// Returns an error when the registry cannot be loaded or persisted, or when
+/// the system clock is unusable for timestamps.
 pub(crate) fn ensure_bootstrap_local_profile(
     config_path: &Path,
     state_root: Option<&Path>,
@@ -1154,6 +1292,12 @@ fn build_active_profile_context(
     })
 }
 
+/// Resolves the CLI state root: explicit value, then `PALYRA_STATE_ROOT`,
+/// then the platform default.
+///
+/// # Errors
+/// Returns an error when a provided path is invalid or no platform default
+/// can be derived (missing home/appdata environment).
 pub(crate) fn resolve_cli_state_root(explicit: Option<&str>) -> Result<PathBuf> {
     resolve_cli_state_root_with(explicit, env::var("PALYRA_STATE_ROOT").ok(), default_state_root)
 }
@@ -1237,6 +1381,9 @@ fn resolve_config_path(
         return Ok(Some(parsed));
     }
 
+    // INTENTIONAL: an explicit --state-root selects an isolated installation,
+    // so PALYRA_CONFIG and the default search paths are skipped; only the
+    // profile's own config or the managed config inside that state root apply.
     if normalize_optional_text(root.state_root.as_deref()).is_some() {
         if let Some(profile_path) =
             profile.and_then(|profile| normalize_optional_text(profile.config_path.as_deref()))
@@ -1276,6 +1423,8 @@ fn resolve_config_path(
     Ok(default_config_search_paths().into_iter().find(|candidate| candidate.exists()))
 }
 
+/// Returns the managed config path inside a state root
+/// (`<state-root>/config/palyra.toml`).
 pub(crate) fn state_root_config_path(state_root: &Path) -> PathBuf {
     state_root.join(PROFILE_CONFIG_RELATIVE_DIR).join(PROFILE_CONFIG_FILE_NAME)
 }

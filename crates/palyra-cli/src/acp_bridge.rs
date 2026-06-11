@@ -1,3 +1,8 @@
+//! ACP (Agent Client Protocol) stdio bridge: exposes the Palyra gateway as an
+//! ACP agent so external editors and IDE clients can drive sessions, prompts,
+//! tool approvals, and session listings over stdin/stdout JSON-RPC. Bindings
+//! map ACP session ids onto gateway sessions and optional daemon-side state.
+
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -18,16 +23,21 @@ use crate::{
     AgentApprovalMode, AgentConnection, AgentRunInputArgs, SessionResolveInput,
 };
 
+// `_meta` extension keys accepted on session/new, session/load, and
+// session/prompt to override the CLI-provided session defaults per request.
 const META_SESSION_KEY: &str = "sessionKey";
 const META_SESSION_LABEL: &str = "sessionLabel";
 const META_RESET_SESSION: &str = "resetSession";
 const META_REQUIRE_EXISTING: &str = "requireExisting";
 
+// Permission option ids surfaced to the ACP client; the `-always` variants map
+// to a session-scoped `ApprovalDecisionScope` when forwarded to the gateway.
 const PERMISSION_ALLOW_ONCE: &str = "allow-once";
 const PERMISSION_ALLOW_ALWAYS: &str = "allow-always";
 const PERMISSION_REJECT_ONCE: &str = "reject-once";
 const PERMISSION_REJECT_ALWAYS: &str = "reject-always";
 
+/// Resolved link between an ACP session id and its gateway session identity.
 #[derive(Debug, Clone)]
 struct SessionBinding {
     gateway_session_id_ulid: String,
@@ -36,6 +46,8 @@ struct SessionBinding {
     cwd: PathBuf,
 }
 
+/// Optional daemon control-plane channel used to persist session bindings and
+/// session config beyond the lifetime of this bridge process.
 #[derive(Clone)]
 struct AcpDaemonControl {
     client: Arc<TokioMutex<ControlPlaneClient>>,
@@ -45,7 +57,11 @@ struct AcpDaemonControl {
 }
 
 impl AcpDaemonControl {
+    /// Sends one `console/v1/acp/command` request and unwraps its envelope.
     async fn command(&self, command: &str, params: Value) -> acp::Result<Value> {
+        // The `client` block restates the full handshake (scopes plus
+        // capabilities) on every command because the console ACP endpoint is
+        // stateless across requests.
         let payload = json!({
             "client": {
                 "protocol_version": 1,
@@ -106,6 +122,11 @@ impl AcpDaemonControl {
     }
 }
 
+/// In-memory binding and active-run registry shared across ACP handlers.
+///
+/// Bindings are indexed three ways because clients may echo any of the three
+/// identifiers (ACP session id, gateway session key, gateway session ulid) as
+/// the ACP `SessionId` on follow-up requests.
 #[derive(Debug, Default)]
 struct BridgeState {
     bindings_by_acp_session_id: HashMap<String, SessionBinding>,
@@ -146,6 +167,8 @@ impl BridgeState {
     }
 }
 
+/// Client-directed calls funneled through one dispatch task so agent handlers
+/// can stay `Clone` while `AgentSideConnection` is owned by a single task.
 enum ClientBridgeRequest {
     SessionUpdate {
         notification: acp::SessionNotification,
@@ -157,6 +180,7 @@ enum ClientBridgeRequest {
     },
 }
 
+/// ACP `Agent` implementation backed by the gateway gRPC runtime client.
 #[derive(Clone)]
 struct PalyraAcpAgent {
     connection: AgentConnection,
@@ -168,6 +192,7 @@ struct PalyraAcpAgent {
     default_cwd: PathBuf,
 }
 
+/// Per-request `_meta` overrides parsed from an ACP request, if any.
 #[derive(Debug, Default, Clone)]
 struct SessionMetaOverrides {
     session_key: Option<String>,
@@ -176,6 +201,8 @@ struct SessionMetaOverrides {
     require_existing: Option<bool>,
 }
 
+/// Session defaults supplied via CLI flags, applied whenever an ACP request
+/// does not carry the corresponding `_meta` override.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct AcpSessionDefaults {
     pub(crate) session_key: Option<String>,
@@ -295,6 +322,9 @@ impl PalyraAcpAgent {
         }
     }
 
+    // Gateway runs accept plain text, so only text-bearing blocks are kept:
+    // text, embedded text resources, and resource links (serialized inline).
+    // Image/audio blocks are intentionally dropped.
     fn prompt_text(prompt: &[acp::ContentBlock]) -> String {
         let mut chunks = Vec::new();
         for block in prompt {
@@ -543,6 +573,10 @@ impl PalyraAcpAgent {
         let mut run_stream =
             client.open_run_stream(initial_request).await.map_err(acp_internal_error)?;
 
+        // AIDEV-NOTE: if streaming below fails mid-run (any `?` until the end
+        // of this function), the active_runs entry is not removed, so a later
+        // session/cancel would target the dead run id. Cleaning this up needs
+        // a behavior change (e.g. a scope guard around the stream loop).
         {
             let mut state = self.lock_state()?;
             state
@@ -640,6 +674,9 @@ impl PalyraAcpAgent {
                 }
                 Some(common_v1::run_stream_event::Body::Status(status)) => {
                     if status.kind == common_v1::stream_status::StatusKind::Failed as i32 {
+                        // The stream contract has no structured cancelled
+                        // status; cancellations arrive as Failed with a
+                        // cancel-flavored message, hence the text heuristic.
                         stop_reason = if status.message.to_ascii_lowercase().contains("cancel") {
                             acp::StopReason::Cancelled
                         } else {
@@ -801,6 +838,8 @@ impl acp::Agent for PalyraAcpAgent {
         &self,
         arguments: acp::ListSessionsRequest,
     ) -> acp::Result<acp::ListSessionsResponse> {
+        // Prefer the daemon listing (it includes persisted bindings); fall
+        // back to the gateway list when no daemon control-plane is attached.
         if let Some(response) = self.list_daemon_sessions(arguments.cursor.clone()).await? {
             return Ok(response);
         }
@@ -810,6 +849,14 @@ impl acp::Agent for PalyraAcpAgent {
     }
 }
 
+/// Runs the ACP stdio bridge until the client closes the stream.
+///
+/// Blocks the calling thread on a dedicated Tokio runtime; the connection
+/// futures are `!Send`, so everything is driven on a single-thread `LocalSet`.
+///
+/// # Errors
+/// Returns an error when the runtime cannot be built, the daemon ACP
+/// control-plane connection fails, or the stdio I/O loop terminates abnormally.
 pub fn run_agent_acp_bridge(
     connection: AgentConnection,
     control_plane_overrides: app::ConnectionOverrides,
@@ -821,6 +868,9 @@ pub fn run_agent_acp_bridge(
         let local_set = tokio::task::LocalSet::new();
         local_set
             .run_until(async move {
+                // Unbounded is safe here: every sender awaits its oneshot
+                // response before sending again, so the queue depth is bounded
+                // by the number of in-flight ACP requests.
                 let (client_request_tx, mut client_request_rx) =
                     mpsc::unbounded_channel::<ClientBridgeRequest>();
                 let state = Arc::new(Mutex::new(BridgeState::default()));
@@ -846,6 +896,9 @@ pub fn run_agent_acp_bridge(
                     default_cwd,
                 );
 
+                // Blocking stdio wrapped as async is acceptable: this runtime
+                // exists solely for the bridge, so a stalled read cannot
+                // starve unrelated tasks.
                 let outgoing = AllowStdIo::new(std::io::stdout());
                 let incoming = AllowStdIo::new(std::io::stdin());
                 let (conn, handle_io) =
@@ -886,6 +939,10 @@ fn parse_json_bytes(raw: &[u8]) -> Option<Value> {
     serde_json::from_slice::<Value>(raw).ok()
 }
 
+/// Maps a gateway tool-approval request onto an ACP permission request.
+///
+/// Returns `Ok(None)` when the approval carries no proposal id: without it the
+/// client's decision could not be correlated back to the gateway proposal.
 fn build_tool_permission_request(
     session_id: &acp::SessionId,
     approval: &common_v1::ToolApprovalRequest,
@@ -948,6 +1005,11 @@ fn build_tool_permission_request(
     Ok(Some(acp::RequestPermissionRequest::new(session_id.clone(), tool_call, options)))
 }
 
+/// Translates an ACP permission outcome into the gateway approval fields
+/// `(approved, reason, decision_scope, decision_scope_ttl_ms)`.
+///
+/// Unknown option ids and non-selection outcomes fail closed as a once-scoped
+/// denial; the TTL is never set so the gateway default applies.
 fn map_permission_outcome(
     response: acp::RequestPermissionResponse,
 ) -> (bool, String, i32, Option<i64>) {
@@ -999,6 +1061,8 @@ fn map_permission_outcome(
     }
 }
 
+/// Maps gateway session summaries to ACP session infos, preferring locally
+/// remembered bindings for cwd/label and falling back to gateway fields.
 fn map_list_sessions_response(
     response: gateway_v1::ListSessionsResponse,
     state: &BridgeState,
@@ -1034,6 +1098,8 @@ fn map_list_sessions_response(
         .next_cursor(non_empty(Some(response.next_after_session_key)))
 }
 
+/// Maps a daemon `session.list` JSON response to ACP session infos; unnamed
+/// sessions fall back to their id and the bridge's default cwd.
 fn map_daemon_sessions_response(response: Value, default_cwd: &Path) -> acp::ListSessionsResponse {
     let sessions = response
         .get("sessions")

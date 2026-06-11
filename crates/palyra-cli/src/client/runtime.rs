@@ -1,3 +1,9 @@
+//! Typed gateway gRPC client: agent/session/run RPC wrappers plus the
+//! bidirectional `RunStream` handle used for live agent runs.
+//!
+//! Identity metadata is injected on every request via
+//! [`inject_run_stream_metadata`] so the gateway can authorize the operator.
+
 use anyhow::{Context, Result};
 use futures::stream;
 use tokio::sync::mpsc;
@@ -6,22 +12,32 @@ use tonic::Request;
 
 use crate::*;
 
+/// A connected gateway gRPC client bound to one operator connection identity.
 pub(crate) struct GatewayRuntimeClient {
     client: gateway_v1::gateway_service_client::GatewayServiceClient<tonic::transport::Channel>,
     connection: AgentConnection,
 }
 
+/// A live bidirectional `RunStream`: events arrive on `event_stream`, and
+/// follow-up requests are queued through `request_sender`.
 pub(crate) struct GatewayRunStream {
     event_stream: tonic::Streaming<common_v1::RunStreamEvent>,
     request_sender: mpsc::Sender<RunStreamRequestEnvelope>,
 }
 
+// The Close sentinel lets callers half-close the client-to-server side (the
+// unfold below ends the request stream on Close) while keeping the channel
+// sender alive for the lifetime of the stream handle.
 enum RunStreamRequestEnvelope {
     Request(Box<common_v1::RunStreamRequest>),
     Close,
 }
 
 impl GatewayRunStream {
+    /// Awaits the next server event; `Ok(None)` means the stream ended cleanly.
+    ///
+    /// # Errors
+    /// Returns an error when the underlying gRPC stream yields a status error.
     pub(crate) async fn next_event(&mut self) -> Result<Option<common_v1::RunStreamEvent>> {
         match self.event_stream.next().await {
             Some(event) => event.context("failed to read RunStream event").map(Some),
@@ -29,6 +45,10 @@ impl GatewayRunStream {
         }
     }
 
+    /// Queues a follow-up request on the client-to-server side of the stream.
+    ///
+    /// # Errors
+    /// Returns an error when the request side has already been closed.
     pub(crate) async fn send_request(&self, request: common_v1::RunStreamRequest) -> Result<()> {
         self.request_sender
             .send(RunStreamRequestEnvelope::Request(Box::new(request)))
@@ -36,14 +56,25 @@ impl GatewayRunStream {
             .context("failed to queue RunStream request message because the request stream is already closed")
     }
 
+    /// Half-closes the client-to-server side; closing twice is not an error.
+    ///
+    /// # Errors
+    /// Currently infallible in practice: a send failure here can only carry
+    /// back the Close sentinel, which is treated as already-closed success.
     pub(crate) async fn close_request_stream(&self) -> Result<()> {
         match self.request_sender.send(RunStreamRequestEnvelope::Close).await {
             Ok(()) => Ok(()),
+            // The receiver dropping means the request stream is already done,
+            // which is exactly the state this method wants to reach.
             Err(error) if matches!(error.0, RunStreamRequestEnvelope::Close) => Ok(()),
             Err(error) => Err(error).context("failed to close RunStream request stream"),
         }
     }
 
+    /// Sends a tool approval decision for the given session/run on the stream.
+    ///
+    /// # Errors
+    /// Returns an error when the request side of the stream is already closed.
     pub(crate) async fn send_tool_approval_response(
         &self,
         session_id: &str,
@@ -71,6 +102,10 @@ impl GatewayRunStream {
 }
 
 impl GatewayRuntimeClient {
+    /// Connects to the gateway gRPC endpoint named by the connection.
+    ///
+    /// # Errors
+    /// Returns an error when the transport connection cannot be established.
     pub(crate) async fn connect(connection: AgentConnection) -> Result<Self> {
         let client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(
             connection.grpc_url.clone(),
@@ -82,12 +117,17 @@ impl GatewayRuntimeClient {
         Ok(Self { client, connection })
     }
 
+    // Wraps a payload in a tonic request carrying the operator identity headers.
     fn request<T>(&self, payload: T) -> Result<Request<T>> {
         let mut request = Request::new(payload);
         inject_run_stream_metadata(request.metadata_mut(), &self.connection)?;
         Ok(request)
     }
 
+    /// Calls `ListAgents`; the page size defaults to 100 when no limit is given.
+    ///
+    /// # Errors
+    /// Returns an error when metadata injection or the RPC fails.
     pub(crate) async fn list_agents(
         &mut self,
         after_agent_id: Option<String>,
@@ -105,6 +145,10 @@ impl GatewayRuntimeClient {
             .map(|response| response.into_inner())
     }
 
+    /// Calls `GetAgent` for one agent id.
+    ///
+    /// # Errors
+    /// Returns an error when metadata injection or the RPC fails.
     pub(crate) async fn get_agent(
         &mut self,
         agent_id: String,
@@ -118,6 +162,10 @@ impl GatewayRuntimeClient {
             .map(|response| response.into_inner())
     }
 
+    /// Calls `CreateAgent` with a caller-built request.
+    ///
+    /// # Errors
+    /// Returns an error when metadata injection or the RPC fails.
     pub(crate) async fn create_agent(
         &mut self,
         request: gateway_v1::CreateAgentRequest,
@@ -130,6 +178,10 @@ impl GatewayRuntimeClient {
             .map(|response| response.into_inner())
     }
 
+    /// Calls `DeleteAgent` for one agent id.
+    ///
+    /// # Errors
+    /// Returns an error when metadata injection or the RPC fails.
     pub(crate) async fn delete_agent(
         &mut self,
         agent_id: String,
@@ -143,6 +195,10 @@ impl GatewayRuntimeClient {
             .map(|response| response.into_inner())
     }
 
+    /// Calls `SetDefaultAgent` to change the gateway-wide default agent.
+    ///
+    /// # Errors
+    /// Returns an error when metadata injection or the RPC fails.
     pub(crate) async fn set_default_agent(
         &mut self,
         agent_id: String,
@@ -158,6 +214,10 @@ impl GatewayRuntimeClient {
             .map(|response| response.into_inner())
     }
 
+    /// Calls `ListAgentBindings` filtered by the query input.
+    ///
+    /// # Errors
+    /// Returns an error when metadata injection or the RPC fails.
     pub(crate) async fn list_agent_bindings(
         &mut self,
         input: AgentBindingsQueryInput,
@@ -177,6 +237,10 @@ impl GatewayRuntimeClient {
             .map(|response| response.into_inner())
     }
 
+    /// Calls `BindAgentForContext` with a caller-built request.
+    ///
+    /// # Errors
+    /// Returns an error when metadata injection or the RPC fails.
     pub(crate) async fn bind_agent_for_context(
         &mut self,
         request: gateway_v1::BindAgentForContextRequest,
@@ -189,6 +253,10 @@ impl GatewayRuntimeClient {
             .map(|response| response.into_inner())
     }
 
+    /// Calls `UnbindAgentForContext` with a caller-built request.
+    ///
+    /// # Errors
+    /// Returns an error when metadata injection or the RPC fails.
     pub(crate) async fn unbind_agent_for_context(
         &mut self,
         request: gateway_v1::UnbindAgentForContextRequest,
@@ -201,6 +269,10 @@ impl GatewayRuntimeClient {
             .map(|response| response.into_inner())
     }
 
+    /// Calls `ResolveAgentForContext` to pick the agent for a routing context.
+    ///
+    /// # Errors
+    /// Returns an error when metadata injection or the RPC fails.
     pub(crate) async fn resolve_agent_for_context(
         &mut self,
         input: AgentContextResolveInput,
@@ -220,6 +292,10 @@ impl GatewayRuntimeClient {
             .map(|response| response.into_inner())
     }
 
+    /// Calls `ListSessions`; the page size defaults to 100 when no limit is given.
+    ///
+    /// # Errors
+    /// Returns an error when metadata injection or the RPC fails.
     pub(crate) async fn list_sessions(
         &mut self,
         after_session_key: Option<String>,
@@ -241,6 +317,10 @@ impl GatewayRuntimeClient {
             .map(|response| response.into_inner())
     }
 
+    /// Calls `ResolveSession` to look up or create a session from a selector.
+    ///
+    /// # Errors
+    /// Returns an error when metadata injection or the RPC fails.
     pub(crate) async fn resolve_session(
         &mut self,
         input: SessionResolveInput,
@@ -260,6 +340,10 @@ impl GatewayRuntimeClient {
             .map(|response| response.into_inner())
     }
 
+    /// Calls `AbortRun` for one run id with an optional operator reason.
+    ///
+    /// # Errors
+    /// Returns an error when metadata injection or the RPC fails.
     pub(crate) async fn abort_run(
         &mut self,
         run_id: String,
@@ -277,6 +361,10 @@ impl GatewayRuntimeClient {
             .map(|response| response.into_inner())
     }
 
+    /// Calls `CleanupSession` for a session selected by id or key.
+    ///
+    /// # Errors
+    /// Returns an error when metadata injection or the RPC fails.
     pub(crate) async fn cleanup_session(
         &mut self,
         input: SessionCleanupInput,
@@ -293,15 +381,24 @@ impl GatewayRuntimeClient {
             .map(|response| response.into_inner())
     }
 
+    /// Opens a bidirectional `RunStream`, queueing `initial_request` as the
+    /// first client message.
+    ///
+    /// # Errors
+    /// Returns an error when metadata injection or the `RunStream` call fails.
     pub(crate) async fn open_run_stream(
         &mut self,
         initial_request: common_v1::RunStreamRequest,
     ) -> Result<GatewayRunStream> {
+        // Bounded channel: follow-up requests are operator-driven (approvals,
+        // prompts), so a small buffer is enough and applies backpressure.
         let (request_sender, request_receiver) = mpsc::channel(16);
         request_sender
             .send(RunStreamRequestEnvelope::Request(Box::new(initial_request)))
             .await
             .context("failed to queue initial RunStream request message")?;
+        // Yielding None (on Close or sender drop) is what half-closes the
+        // client-to-server side of the gRPC stream.
         let request_stream = stream::unfold(request_receiver, |mut receiver| async move {
             match receiver.recv().await {
                 Some(RunStreamRequestEnvelope::Request(request)) => Some((*request, receiver)),

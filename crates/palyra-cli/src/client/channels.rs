@@ -1,3 +1,9 @@
+//! Blocking HTTP transport for the daemon channels admin endpoints.
+//!
+//! Resolves connection identity (profile context first, env/defaults second),
+//! attaches the identity headers, and turns non-success responses into bounded,
+//! human-readable error messages.
+
 use anyhow::{Context, Result};
 use reqwest::blocking::Client;
 use serde_json::Value;
@@ -5,9 +11,13 @@ use std::io::Read;
 
 use crate::{app, env, DEFAULT_CHANNEL, DEFAULT_DAEMON_URL, DEFAULT_DEVICE_ID};
 
+// Error bodies are operator-facing diagnostics, not payloads: cap both the
+// bytes buffered from the wire and the characters surfaced in the message so a
+// misbehaving endpoint cannot bloat CLI errors.
 const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
 const MAX_ERROR_MESSAGE_CHARS: usize = 512;
 
+/// Resolved connection target and identity headers for one channels request.
 #[derive(Debug, Clone)]
 pub(crate) struct ChannelRequestContext {
     pub base_url: String,
@@ -18,6 +28,11 @@ pub(crate) struct ChannelRequestContext {
     pub trace_id: Option<String>,
 }
 
+/// Resolves the channels request context from the CLI root context when one is
+/// active, otherwise directly from env vars and built-in defaults.
+///
+/// # Errors
+/// Returns an error when the root context fails to resolve the HTTP connection.
 pub(crate) fn resolve_request_context(
     url: Option<String>,
     token: Option<String>,
@@ -62,6 +77,8 @@ pub(crate) fn resolve_request_context(
     })
 }
 
+// Clap always supplies the built-in default, so an unchanged value must be
+// treated as "no override" or it would shadow profile-configured identity.
 fn normalize_default_override(value: String, default_value: &str) -> Option<String> {
     if value == default_value {
         None
@@ -70,6 +87,10 @@ fn normalize_default_override(value: String, default_value: &str) -> Option<Stri
     }
 }
 
+/// Builds the blocking HTTP client used for channels admin requests.
+///
+/// # Errors
+/// Returns an error when the client cannot be constructed.
 pub(crate) fn build_client() -> Result<Client> {
     Client::builder()
         .timeout(std::time::Duration::from_secs(3))
@@ -77,6 +98,13 @@ pub(crate) fn build_client() -> Result<Client> {
         .context("failed to build channels HTTP client")
 }
 
+/// Sends a prepared channels request with identity headers attached and parses
+/// the JSON response.
+///
+/// # Errors
+/// Returns an error when the request fails, the endpoint responds with a
+/// non-success status (including the bounded response message), or the success
+/// payload is not valid JSON.
 pub(crate) fn send_request(
     request: reqwest::blocking::RequestBuilder,
     context: ChannelRequestContext,
@@ -125,6 +153,8 @@ fn channel_error_message_from_response(
 }
 
 fn read_limited_error_body<R: Read>(reader: R) -> Option<LimitedErrorBody> {
+    // Read one byte past the cap so truncation can be detected without
+    // buffering an unbounded body.
     let mut limited = reader.take((MAX_ERROR_BODY_BYTES as u64).saturating_add(1));
     let mut bytes = Vec::new();
     limited.read_to_end(&mut bytes).ok()?;
@@ -135,6 +165,8 @@ fn read_limited_error_body<R: Read>(reader: R) -> Option<LimitedErrorBody> {
     Some(LimitedErrorBody { bytes, truncated })
 }
 
+// Prefer the structured "error"/"message" fields the control plane emits;
+// fall back to the raw (trimmed, capped) body, then to the HTTP status text.
 fn channel_error_message(body: &str, fallback: &str, body_truncated: bool) -> String {
     let trimmed = body.trim();
     if trimmed.is_empty() {
@@ -152,6 +184,8 @@ fn channel_error_message(body: &str, fallback: &str, body_truncated: bool) -> St
 }
 
 fn truncate_error_message(message: &str, body_truncated: bool) -> String {
+    // A truncated wire body always gets an ellipsis, even when the extracted
+    // message is short, so operators know the diagnostic is incomplete.
     if !body_truncated && message.chars().count() <= MAX_ERROR_MESSAGE_CHARS {
         return message.to_owned();
     }

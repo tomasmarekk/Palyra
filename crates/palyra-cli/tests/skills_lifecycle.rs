@@ -1,3 +1,7 @@
+//! Pins the skills lifecycle: check/audit inventory, install/verify/remove roundtrip,
+//! extension doctor preflight, and tampered-artifact rejection. Builds signed sample
+//! artifacts from the repo example skill fixtures.
+
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};

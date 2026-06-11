@@ -1,8 +1,17 @@
+//! Connector message operations (send, read, search, edit, delete, reactions)
+//! over the daemon channels admin API.
+//!
+//! Every mutating call is preflighted against the connector's advertised
+//! capability metadata so unsupported actions fail before any POST is made.
+
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
 
 use crate::commands::channels::{post_connector_action, resolve_connector_status};
 
+// User-facing message action names. `extract_action_details` maps each one to
+// its `capabilities.message` field in the daemon's connector status payload
+// (the reaction actions map to the `react_add`/`react_remove` fields).
 pub(crate) const MESSAGE_ACTION_SEND: &str = "send";
 pub(crate) const MESSAGE_ACTION_THREAD: &str = "thread";
 pub(crate) const MESSAGE_ACTION_REPLY: &str = "reply";
@@ -13,6 +22,8 @@ pub(crate) const MESSAGE_ACTION_DELETE: &str = "delete";
 pub(crate) const MESSAGE_ACTION_REACT_ADD: &str = "react:add";
 pub(crate) const MESSAGE_ACTION_REACT_REMOVE: &str = "react:remove";
 
+/// Inputs for an outbound message send, including optional thread/reply targets
+/// and connection identity.
 #[derive(Debug, Clone)]
 pub(crate) struct MessageDispatchOptions {
     pub connector_id: String,
@@ -29,6 +40,8 @@ pub(crate) struct MessageDispatchOptions {
     pub channel: Option<String>,
 }
 
+/// Per-action capability metadata: support flag plus policy, approval, risk,
+/// audit, and permission requirements advertised by the connector.
 #[derive(Debug, Clone)]
 pub(crate) struct MessageCapabilityDetail {
     pub action: String,
@@ -41,6 +54,8 @@ pub(crate) struct MessageCapabilityDetail {
     pub required_permissions: Vec<String>,
 }
 
+/// A connector's message capability summary, partitioned into supported and
+/// unsupported actions.
 #[derive(Debug, Clone)]
 pub(crate) struct MessageCapabilities {
     pub provider_kind: String,
@@ -49,6 +64,8 @@ pub(crate) struct MessageCapabilities {
     pub action_details: Vec<MessageCapabilityDetail>,
 }
 
+/// Inputs for reading conversation history, with mutually optional message-id
+/// anchors (`before`/`after`/`around`) and a result limit.
 #[derive(Debug, Clone)]
 pub(crate) struct MessageReadOptions {
     pub connector_id: String,
@@ -66,6 +83,8 @@ pub(crate) struct MessageReadOptions {
     pub channel: Option<String>,
 }
 
+/// Inputs for searching messages within a conversation by text, author, or
+/// attachment presence.
 #[derive(Debug, Clone)]
 pub(crate) struct MessageSearchOptions {
     pub connector_id: String,
@@ -83,6 +102,7 @@ pub(crate) struct MessageSearchOptions {
     pub channel: Option<String>,
 }
 
+/// Inputs for editing an existing message body.
 #[derive(Debug, Clone)]
 pub(crate) struct MessageEditOptions {
     pub connector_id: String,
@@ -98,6 +118,7 @@ pub(crate) struct MessageEditOptions {
     pub channel: Option<String>,
 }
 
+/// Inputs for deleting a message, with an optional audit reason.
 #[derive(Debug, Clone)]
 pub(crate) struct MessageDeleteOptions {
     pub connector_id: String,
@@ -113,6 +134,7 @@ pub(crate) struct MessageDeleteOptions {
     pub channel: Option<String>,
 }
 
+/// Inputs for adding or removing an emoji reaction on a message.
 #[derive(Debug, Clone)]
 pub(crate) struct MessageReactionOptions {
     pub connector_id: String,
@@ -128,10 +150,17 @@ pub(crate) struct MessageReactionOptions {
     pub channel: Option<String>,
 }
 
+/// Extracts the provider kind from a connector status payload, accepting both
+/// the wrapped (`{"connector": {...}}`) and bare connector object shapes.
 pub(crate) fn connector_kind(payload: &Value) -> Option<&str> {
     payload.get("connector").unwrap_or(payload).get("kind").and_then(Value::as_str)
 }
 
+/// Loads a connector's message capabilities from its daemon status payload.
+///
+/// # Errors
+/// Returns an error when the connector id is not routable or the status
+/// endpoint call fails.
 pub(crate) fn load_capabilities(
     connector_id: &str,
     url: Option<String>,
@@ -165,6 +194,11 @@ fn load_connector_status(
     )
 }
 
+/// Validates that a connector id is routable for message commands.
+///
+/// # Errors
+/// Returns an error when the id is empty or is a provider shorthand without an
+/// instance segment (no `:`); the message suggests the `provider:instance` form.
 pub(crate) fn validate_message_connector_id(connector_id: &str) -> Result<()> {
     let connector_id = connector_id.trim();
     if connector_id.is_empty() {
@@ -178,6 +212,11 @@ pub(crate) fn validate_message_connector_id(connector_id: &str) -> Result<()> {
     );
 }
 
+/// Sends an outbound message after capability and readiness preflights.
+///
+/// # Errors
+/// Returns an error when preflight fails (unsupported action, connector
+/// disabled or not ready/running) or the send endpoint call fails.
 pub(crate) fn send_message(options: MessageDispatchOptions) -> Result<Value> {
     let status = ensure_message_actions_supported(
         options.connector_id.as_str(),
@@ -209,6 +248,10 @@ pub(crate) fn send_message(options: MessageDispatchOptions) -> Result<Value> {
     )
 }
 
+/// Reads conversation history after a capability preflight.
+///
+/// # Errors
+/// Returns an error when the action is unsupported or the read endpoint fails.
 pub(crate) fn read_messages(options: MessageReadOptions) -> Result<Value> {
     ensure_message_actions_supported(
         options.connector_id.as_str(),
@@ -240,6 +283,10 @@ pub(crate) fn read_messages(options: MessageReadOptions) -> Result<Value> {
     )
 }
 
+/// Searches messages after a capability preflight.
+///
+/// # Errors
+/// Returns an error when the action is unsupported or the search endpoint fails.
 pub(crate) fn search_messages(options: MessageSearchOptions) -> Result<Value> {
     ensure_message_actions_supported(
         options.connector_id.as_str(),
@@ -271,6 +318,10 @@ pub(crate) fn search_messages(options: MessageSearchOptions) -> Result<Value> {
     )
 }
 
+/// Edits a message after a capability preflight.
+///
+/// # Errors
+/// Returns an error when the action is unsupported or the edit endpoint fails.
 pub(crate) fn edit_message(options: MessageEditOptions) -> Result<Value> {
     ensure_message_actions_supported(
         options.connector_id.as_str(),
@@ -302,6 +353,10 @@ pub(crate) fn edit_message(options: MessageEditOptions) -> Result<Value> {
     )
 }
 
+/// Deletes a message after a capability preflight.
+///
+/// # Errors
+/// Returns an error when the action is unsupported or the delete endpoint fails.
 pub(crate) fn delete_message(options: MessageDeleteOptions) -> Result<Value> {
     ensure_message_actions_supported(
         options.connector_id.as_str(),
@@ -333,14 +388,24 @@ pub(crate) fn delete_message(options: MessageDeleteOptions) -> Result<Value> {
     )
 }
 
+/// Adds an emoji reaction after a capability preflight.
+///
+/// # Errors
+/// Returns an error when the action is unsupported or the endpoint call fails.
 pub(crate) fn add_reaction(options: MessageReactionOptions) -> Result<Value> {
     mutate_reaction(options, "/messages/react-add", MESSAGE_ACTION_REACT_ADD)
 }
 
+/// Removes an emoji reaction after a capability preflight.
+///
+/// # Errors
+/// Returns an error when the action is unsupported or the endpoint call fails.
 pub(crate) fn remove_reaction(options: MessageReactionOptions) -> Result<Value> {
     mutate_reaction(options, "/messages/react-remove", MESSAGE_ACTION_REACT_REMOVE)
 }
 
+/// Encodes capabilities into the stable JSON shape emitted by
+/// `palyra message capabilities --json`.
 pub(crate) fn encode_capabilities_json(
     connector_id: &str,
     capabilities: &MessageCapabilities,
@@ -374,6 +439,8 @@ pub(crate) fn encode_capabilities_json(
     })
 }
 
+/// Wraps a connector response in the stable JSON envelope used by message
+/// command `--json` output.
 pub(crate) fn encode_dispatch_json(action: &str, connector_id: &str, response: Value) -> Value {
     json!({
         "action": action,
@@ -393,6 +460,8 @@ fn dispatch_action_names(options: &MessageDispatchOptions) -> Vec<&'static str> 
     actions
 }
 
+// Returns the full status payload on success so callers (send preflight) can
+// reuse it without a second status round-trip.
 fn ensure_message_actions_supported(
     connector_id: &str,
     url: Option<String>,
@@ -487,6 +556,8 @@ fn extract_action_details(status: &Value) -> Option<Vec<MessageCapabilityDetail>
     ])
 }
 
+// Fail closed: when the status payload carries no capability metadata, every
+// action is reported as unsupported instead of being optimistically allowed.
 fn missing_capability_details(provider_kind: &str) -> Vec<MessageCapabilityDetail> {
     let reason =
         format!("message capability metadata is unavailable for provider '{}'", provider_kind);

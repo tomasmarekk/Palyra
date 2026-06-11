@@ -1,7 +1,17 @@
+//! Low-level gateway gRPC plumbing: health checks with retry, request metadata
+//! injection, endpoint URL resolution from env/config, and runtime bootstrap.
+//! Higher-level RPC wrappers live in [`crate::client::runtime`].
+
 use anyhow::{Context, Result};
 
 use crate::*;
 
+/// Fetches gateway health, retrying transient transport failures with
+/// exponential backoff (up to `MAX_GRPC_ATTEMPTS` attempts).
+///
+/// # Errors
+/// Returns the last failure once attempts are exhausted or a non-retryable
+/// error is encountered.
 pub(crate) async fn fetch_health_with_retry(
     grpc_url: String,
 ) -> Result<gateway_v1::HealthResponse> {
@@ -13,6 +23,8 @@ pub(crate) async fn fetch_health_with_retry(
                 let retryable = is_retryable_error(&error);
                 last_error = Some(error);
                 if attempt < MAX_GRPC_ATTEMPTS && retryable {
+                    // Exponential backoff: base * 2^(attempt-1), so a daemon
+                    // that is still starting up gets progressively more time.
                     let delay_ms = BASE_GRPC_BACKOFF_MS * (1_u64 << (attempt - 1));
                     sleep(Duration::from_millis(delay_ms)).await;
                 } else {
@@ -29,6 +41,10 @@ pub(crate) async fn fetch_health_with_retry(
     }
 }
 
+/// Performs a single gateway `GetHealth` call without retries.
+///
+/// # Errors
+/// Returns an error when the gRPC connection or the `GetHealth` call fails.
 pub(crate) async fn fetch_health_once(grpc_url: &str) -> Result<gateway_v1::HealthResponse> {
     let mut client =
         gateway_v1::gateway_service_client::GatewayServiceClient::connect(grpc_url.to_owned())
@@ -41,7 +57,10 @@ pub(crate) async fn fetch_health_once(grpc_url: &str) -> Result<gateway_v1::Heal
     Ok(response.into_inner())
 }
 
+/// Reports whether an error looks transient enough to retry a gateway call.
 pub(crate) fn is_retryable_error(error: &anyhow::Error) -> bool {
+    // Transport-level failures (connect refused, broken stream) are always
+    // worth retrying; the daemon may simply not be listening yet.
     if error.chain().any(|cause| cause.is::<tonic::transport::Error>()) {
         return true;
     }
@@ -56,6 +75,11 @@ pub(crate) fn is_retryable_error(error: &anyhow::Error) -> bool {
     })
 }
 
+/// Injects the identity and tracing headers the gateway requires on every RPC:
+/// optional bearer authorization plus principal, device, channel, and trace id.
+///
+/// # Errors
+/// Returns an error when a connection value is not a valid ASCII header value.
 pub(crate) fn inject_run_stream_metadata(
     metadata: &mut tonic::metadata::MetadataMap,
     connection: &AgentConnection,
@@ -85,6 +109,11 @@ pub(crate) fn inject_run_stream_metadata(
     Ok(())
 }
 
+/// Resolves the gateway gRPC URL: explicit flag, then `PALYRA_GATEWAY_GRPC_URL`,
+/// then a URL derived from the daemon bind address/port env vars or defaults.
+///
+/// # Errors
+/// Returns an error when the configured bind address cannot be parsed.
 pub(crate) fn resolve_url(explicit: Option<String>) -> Result<String> {
     if let Some(url) = explicit {
         return Ok(url);
@@ -106,6 +135,8 @@ pub(crate) fn resolve_url(explicit: Option<String>) -> Result<String> {
     Ok(format!("http://{socket}"))
 }
 
+/// Rewrites unspecified bind addresses (0.0.0.0 / ::) to loopback: the daemon
+/// listens on the wildcard, but a client must dial a concrete address.
 pub(crate) fn normalize_client_socket(socket: SocketAddr) -> SocketAddr {
     match socket {
         SocketAddr::V4(v4) if v4.ip().is_unspecified() => {
@@ -118,6 +149,10 @@ pub(crate) fn normalize_client_socket(socket: SocketAddr) -> SocketAddr {
     }
 }
 
+/// Builds the multi-threaded Tokio runtime used by synchronous CLI entry points.
+///
+/// # Errors
+/// Returns an error when the runtime cannot be initialized.
 pub(crate) fn build_runtime() -> Result<tokio::runtime::Runtime> {
     RuntimeBuilder::new_multi_thread()
         .enable_all()

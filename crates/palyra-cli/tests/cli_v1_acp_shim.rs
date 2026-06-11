@@ -1,3 +1,7 @@
+//! Pins v1 CLI surfaces end to end: status/channels output, `agent run` streaming, the ACP
+//! NDJSON shim contract, shell completion, and the onboarding wizard. Spawns a real palyrad
+//! on dynamic loopback ports for the daemon-backed cases.
+
 use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpStream},

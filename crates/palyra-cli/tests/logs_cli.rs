@@ -1,3 +1,6 @@
+//! Pins `palyra logs` and `gateway logs` behavior without a journal: a notice instead of an
+//! error, in both text and JSON output.
+
 use anyhow::{Context, Result};
 use serde_json::Value;
 

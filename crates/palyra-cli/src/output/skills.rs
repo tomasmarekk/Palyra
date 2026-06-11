@@ -1,6 +1,15 @@
+//! Output rendering for `palyra skills` status, inventory, and check commands.
+//!
+//! Text lines and JSON field names are pinned by CLI parity tests.
+
 use crate::*;
 use std::path::Path;
 
+/// Emits a skill status-change response as pretty JSON or a pinned text line
+/// prefixed with `event_kind`.
+///
+/// # Errors
+/// Returns an error when the JSON payload cannot be encoded.
 pub(crate) fn emit_status(
     event_kind: &str,
     response: &SkillStatusResponse,
@@ -22,6 +31,10 @@ pub(crate) fn emit_status(
     Ok(())
 }
 
+/// Emits the skills inventory as pretty JSON or pinned per-entry text lines.
+///
+/// # Errors
+/// Returns an error when the JSON payload cannot be encoded.
 pub(crate) fn emit_inventory_list(
     skills_root: &Path,
     entries: &[SkillInventoryEntry],
@@ -56,6 +69,10 @@ pub(crate) fn emit_inventory_list(
     Ok(())
 }
 
+/// Emits detail for one skill as pretty JSON or pinned text lines.
+///
+/// # Errors
+/// Returns an error when the JSON payload cannot be encoded.
 pub(crate) fn emit_inventory_info(info: &SkillInfoOutput, json_output: bool) -> Result<()> {
     if json_output {
         return super::print_json_pretty(info, "failed to encode skill info as JSON");
@@ -82,6 +99,11 @@ pub(crate) fn emit_inventory_info(info: &SkillInfoOutput, json_output: bool) -> 
     Ok(())
 }
 
+/// Emits skill check results as pretty JSON or pinned per-result text lines
+/// (with an extra reasons line when a check reports any).
+///
+/// # Errors
+/// Returns an error when the JSON payload cannot be encoded.
 pub(crate) fn emit_check_results(
     skills_root: &Path,
     results: &[SkillCheckResult],

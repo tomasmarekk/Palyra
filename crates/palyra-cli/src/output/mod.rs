@@ -1,3 +1,9 @@
+//! CLI output layer: JSON/NDJSON/text printers, secret redaction, error
+//! rendering, and the error-to-exit-code classification.
+//!
+//! Emitted strings, JSON field names, and exit codes are part of the CLI
+//! contract pinned by parity tests; treat any change here as a format change.
+
 use std::{fmt, io::Write, process::ExitCode};
 
 use anyhow::{Context, Result};
@@ -13,6 +19,9 @@ pub(crate) mod support_bundle;
 
 const JSON_ERROR_ENVELOPE_VERSION: u32 = 1;
 
+/// Process exit codes of the CLI; the numeric values and their `kind()` names
+/// are a documented operator contract. `Cancelled = 130` follows the shell
+/// convention of 128 + SIGINT.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CliExitCode {
     Success = 0,
@@ -29,10 +38,12 @@ pub(crate) enum CliExitCode {
 }
 
 impl CliExitCode {
+    /// Converts to the process [`ExitCode`] returned from `main`.
     pub(crate) fn as_exit_code(self) -> ExitCode {
         ExitCode::from(self as u8)
     }
 
+    /// Returns the stable machine-readable kind label used in error envelopes.
     pub(crate) fn kind(self) -> &'static str {
         match self {
             CliExitCode::Success => "success",
@@ -50,6 +61,9 @@ impl CliExitCode {
     }
 }
 
+// Sentinel error for paths that have already printed their own user-facing
+// output; the top-level handler must only translate it into an exit code
+// without printing a second error message.
 #[derive(Debug)]
 struct AlreadyEmittedCliError {
     exit_code: CliExitCode,
@@ -63,10 +77,14 @@ impl fmt::Display for AlreadyEmittedCliError {
 
 impl std::error::Error for AlreadyEmittedCliError {}
 
+/// Builds the sentinel error signalling that CLI output was already emitted
+/// and only `exit_code` remains to be applied.
 pub(crate) fn already_emitted_error(exit_code: CliExitCode) -> anyhow::Error {
     AlreadyEmittedCliError { exit_code }.into()
 }
 
+/// Extracts the exit code from an already-emitted sentinel anywhere in the
+/// error chain, or `None` for ordinary errors.
 pub(crate) fn already_emitted_exit_code(error: &anyhow::Error) -> Option<CliExitCode> {
     error.chain().find_map(|cause| {
         cause.downcast_ref::<AlreadyEmittedCliError>().map(|value| value.exit_code)
@@ -90,6 +108,10 @@ struct ErrorEntry<'a> {
     no_color: Option<bool>,
 }
 
+/// Prints a value as pretty multi-line JSON on stdout.
+///
+/// # Errors
+/// Returns an error when the value cannot be serialized.
 pub(crate) fn print_json_pretty<T>(value: &T, error_context: &'static str) -> Result<()>
 where
     T: Serialize,
@@ -98,6 +120,10 @@ where
     Ok(())
 }
 
+/// Prints a value as a single NDJSON line on stdout.
+///
+/// # Errors
+/// Returns an error when the value cannot be serialized.
 pub(crate) fn print_json_line<T>(value: &T, error_context: &'static str) -> Result<()>
 where
     T: Serialize,
@@ -106,6 +132,10 @@ where
     Ok(())
 }
 
+/// Prints a text line on stdout after running it through secret redaction.
+///
+/// # Errors
+/// Returns an error when the write to stdout fails.
 pub(crate) fn print_text_line(line: &str) -> Result<()> {
     let line = sanitize_text_output_line(line);
     let mut stdout = std::io::stdout().lock();
@@ -118,14 +148,20 @@ fn sanitize_text_output_line(line: &str) -> String {
     sanitize_diagnostic_text(line)
 }
 
+/// Redacts credential-shaped material (tokens, authorization headers, secret
+/// query parameters) from diagnostic text before it reaches any output sink.
 pub(crate) fn sanitize_diagnostic_text(line: &str) -> String {
     redact_diagnostic_text(line)
 }
 
+/// Reports whether JSON output is requested, either by an explicit flag or by
+/// the root context's `--output json` preference.
 pub(crate) fn preferred_json(explicit_json: bool) -> bool {
     explicit_json || app::current_root_context().is_some_and(|context| context.prefers_json())
 }
 
+/// Reports whether NDJSON output is requested. An explicit `--json` wins over
+/// NDJSON so a per-command flag can override an `--output ndjson` profile.
 pub(crate) fn preferred_ndjson(explicit_json: bool, explicit_ndjson: bool) -> bool {
     if explicit_json {
         return false;
@@ -133,6 +169,11 @@ pub(crate) fn preferred_ndjson(explicit_json: bool, explicit_ndjson: bool) -> bo
     explicit_ndjson || app::current_root_context().is_some_and(|context| context.prefers_ndjson())
 }
 
+/// Renders an error on stderr in the active output format (text line or
+/// JSON/NDJSON envelope) and returns the classified exit code.
+///
+/// # Errors
+/// Returns an error when the JSON error envelope cannot be encoded.
 pub(crate) fn emit_error(error: &anyhow::Error) -> Result<CliExitCode> {
     let exit_code = classify_error(error);
     let kind = exit_code.kind();
@@ -209,6 +250,13 @@ pub(crate) fn emit_error(error: &anyhow::Error) -> Result<CliExitCode> {
     Ok(exit_code)
 }
 
+/// Maps an error chain onto the CLI exit-code taxonomy.
+///
+/// Typed causes (clap, control plane, tonic, reqwest) are matched first; only
+/// then does substring matching over the lowercased chain apply. The order of
+/// the substring checks is load-bearing and pinned by the tests below: more
+/// specific phrases must win before broad keyword buckets such as the
+/// token-related auth match.
 pub(crate) fn classify_error(error: &anyhow::Error) -> CliExitCode {
     let lower =
         error.chain().map(ToString::to_string).collect::<Vec<_>>().join(": ").to_ascii_lowercase();
@@ -254,6 +302,8 @@ pub(crate) fn classify_error(error: &anyhow::Error) -> CliExitCode {
     if is_active_same_session_follow_up_precondition(&lower) {
         return CliExitCode::Precondition;
     }
+    // Provider stop/timeout phrases mention "token(s)" and must be classified
+    // before the broad token-keyword auth bucket below.
     if is_provider_output_limit_stop(&lower) {
         return CliExitCode::Precondition;
     }
@@ -409,6 +459,7 @@ fn classify_http_status(status: u16) -> Option<CliExitCode> {
         404 => Some(CliExitCode::NotFound),
         409 | 412 => Some(CliExitCode::Precondition),
         408 | 429 | 500..=599 => Some(CliExitCode::Connectivity),
+        // Remaining 4xx codes default to validation: the request was at fault.
         400..=499 => Some(CliExitCode::Validation),
         _ => None,
     }

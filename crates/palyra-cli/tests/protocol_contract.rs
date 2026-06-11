@@ -1,3 +1,6 @@
+//! Pins `palyra protocol` contracts: major version reporting and canonical ULID
+//! acceptance/rejection in `protocol validate-id`.
+
 use std::process::Command;
 
 use anyhow::{Context, Result};

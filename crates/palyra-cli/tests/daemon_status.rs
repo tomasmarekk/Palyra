@@ -1,3 +1,7 @@
+//! Pins daemon/gateway status, admin-auth handling, and run inspection/cancel contracts.
+//! Spawns a real palyrad on dynamic loopback ports plus single-request JSON fixture
+//! listeners that stand in for daemon HTTP endpoints.
+
 use std::{
     io::{Read, Write},
     net::TcpListener,

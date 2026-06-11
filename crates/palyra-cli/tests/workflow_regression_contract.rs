@@ -1,3 +1,7 @@
+//! Pins consistency between the workflow regression manifest and the compat
+//! release-readiness checklist, plus the wiring of each runtime acceptance contract
+//! scenario to its CLI command.
+
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};

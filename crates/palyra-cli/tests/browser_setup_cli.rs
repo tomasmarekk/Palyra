@@ -1,3 +1,7 @@
+//! Pins the `palyra browser setup` and `browser stop` contracts: gateway/browserd prerequisite
+//! configuration, preservation of existing auth-token secret refs, and JSON output. Runs
+//! against a temp encrypted-file vault with no live daemons.
+
 use std::fs;
 use std::process::{Command, Output};
 

@@ -1,3 +1,6 @@
+//! Pins the CLI parity matrix (tests/cli_parity_matrix.toml) against the real clap command
+//! tree and the committed shared chat command snapshot markdown.
+
 use std::{collections::BTreeSet, fs, path::PathBuf};
 
 use anyhow::{Context, Result};

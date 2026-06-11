@@ -1,19 +1,53 @@
+//! Crate root of the `palyra` operator CLI.
+//!
+//! The binary entry point is [`run`]: it parses argv into `cli::Cli`,
+//! installs the root context (config path, state root, active profile), and
+//! dispatches each subcommand to its `commands::*::run_*` handler.
+//!
+//! Module map:
+//! - [`app`]: root context, profiles, and gateway connection resolution.
+//! - [`args`] (re-exported as `cli`): the clap argument surface.
+//! - `commands`: one module per operator-facing subcommand.
+//! - [`client`]: HTTP/gRPC gateway clients and the operator runtime adapter.
+//! - [`output`]: exit codes, JSON/NDJSON emission, and error rendering.
+//! - [`cli_parity`] / [`workflow_regression`]: parity and regression harnesses.
+//! - [`support`]: install/lifecycle/service helpers for support tooling.
+//! - [`proto`]: generated protocol stubs.
+//!
+//! The rest of this file holds cross-command plumbing that has not been split
+//! into modules yet: command dispatch, doctor checks and report snapshots,
+//! support-bundle assembly, agent run-stream execution and approval prompts,
+//! skills install/registry/trust-store handling, and the shared redaction and
+//! normalization helpers they rely on.
+//!
+//! Output contract: user-visible strings and JSON field names emitted from
+//! this crate are pinned byte-for-byte by parity, snapshot, and regression
+//! tests. Treat any printed text or serialized shape as a frozen contract.
+
 mod acp_bridge;
+/// Root context, profiles, and connection resolution shared by all commands.
 pub mod app;
+/// Clap-derive argument surface for the `palyra` binary.
 pub mod args;
 mod cli;
+/// Status model and report helpers for the CLI/web parity harness.
 pub mod cli_parity;
+/// HTTP and gRPC clients for the gateway and control plane.
 pub mod client;
 mod commands;
 pub mod domain;
 pub mod infra;
+/// Exit codes, JSON/NDJSON printing, and CLI error rendering.
 pub mod output;
+/// Chat slash-command definitions shared between the web and TUI surfaces.
 pub mod shared_chat_commands;
 pub mod support;
 pub mod transport;
 mod tui;
+/// Manifest model and helpers for the scripted workflow-regression suites.
 pub mod workflow_regression;
 
+/// Generated tonic/prost stubs for the canonical `palyra.*.v1` protocol surfaces.
 pub mod proto {
     pub mod palyra {
         pub mod common {
@@ -175,6 +209,7 @@ const DEFAULT_GATEWAY_QUIC_PORT: u16 =
 const DEFAULT_GATEWAY_QUIC_ENABLED: bool = true;
 const DEFAULT_GATEWAY_BIND_PROFILE: &str = "loopback_only";
 const DEFAULT_DEPLOYMENT_MODE: &str = "local_desktop";
+/// Fallback admin base URL when neither root context nor `PALYRA_DAEMON_URL` provide one.
 pub(crate) const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:7142";
 const DEFAULT_BROWSER_SERVICE_ENDPOINT: &str = "http://127.0.0.1:7543";
 const DEFAULT_JOURNAL_DB_PATH: &str = "data/journal.sqlite3";
@@ -205,6 +240,11 @@ const DANGEROUS_REMOTE_BIND_ACK_ENV: &str = "PALYRA_GATEWAY_DANGEROUS_REMOTE_BIN
 const TRUST_STORE_INTEGRITY_VAULT_SCOPE: VaultScope = VaultScope::Global;
 const TRUST_STORE_INTEGRITY_VAULT_KEY_PREFIX: &str = "skills.trust_store.integrity.";
 
+/// Runs the operator CLI end to end and maps the outcome to a process exit code.
+///
+/// Parses `std::env::args_os`, dispatches the selected subcommand, and renders
+/// any failure through `output::emit_error`; if even error rendering fails,
+/// a plain `stderr` line is emitted and the internal exit code is returned.
 pub fn run() -> ExitCode {
     match run_cli_entrypoint() {
         Ok(()) => output::CliExitCode::Success.as_exit_code(),
@@ -227,6 +267,9 @@ pub fn run() -> ExitCode {
 fn run_cli_entrypoint() -> Result<()> {
     const CLI_MAIN_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
 
+    // Deeply nested command futures and serde types can overflow the default
+    // Windows main-thread stack, so run the CLI body on a worker thread with
+    // an explicit 8 MiB stack instead of raising the process-wide reserve.
     thread::Builder::new()
         .name("palyra-cli-main".to_owned())
         .stack_size(CLI_MAIN_STACK_SIZE_BYTES)
@@ -430,6 +473,9 @@ fn run_cli() -> Result<()> {
     }
 }
 
+// `--state-root` is both a global root flag and a `profile create` option; clap
+// would bind the post-subcommand occurrence to the global flag, so rewrite it to
+// the dedicated `--profile-state-root` before parsing.
 fn normalize_profile_create_state_root_args(mut args: Vec<OsString>) -> Vec<OsString> {
     let Some(create_args_start) = profile_create_args_start(args.as_slice()) else {
         return args;
@@ -752,6 +798,8 @@ fn build_init_config_document(
         toml::Value::String(mode.deployment_mode().to_owned()),
     )?;
     apply_deployment_profile_defaults(&mut document, deployment_profile)?;
+    // Re-apply after profile defaults: the profile manifest may carry its own
+    // deployment.mode, and the explicit init mode must win.
     set_value_at_path(
         &mut document,
         "deployment.mode",
@@ -854,6 +902,8 @@ fn build_init_config_document(
     }
 
     if let Some((cert_path, key_path)) = tls_paths {
+        // INTENTIONAL: scaffold cert/key paths but keep TLS disabled; the operator
+        // enables gateway.tls.enabled only after provisioning real certificates.
         set_value_at_path(&mut document, "gateway.tls.enabled", toml::Value::Boolean(false))?;
         set_value_at_path(
             &mut document,
@@ -1182,7 +1232,7 @@ fn build_doctor_report_with_connectivity(
     Ok(DoctorReport {
         generated_at_unix_ms,
         profile,
-        checks: checks.to_vec(),
+        checks,
         summary: DoctorSummary {
             required_checks_total,
             required_checks_ok,
@@ -1575,10 +1625,7 @@ fn collect_doctor_browser_snapshot(
         .and_then(|config| config.state_dir.as_ref())
         .map(|value| value.trim())
         .is_some_and(|value| !value.is_empty())
-        || env::var("PALYRA_BROWSERD_STATE_DIR")
-            .ok()
-            .map(|value| value.trim().to_owned())
-            .is_some_and(|value| !value.is_empty());
+        || env::var("PALYRA_BROWSERD_STATE_DIR").ok().is_some_and(|value| !value.trim().is_empty());
     let state_key_vault_ref_configured = browser_service
         .and_then(|config| config.state_key_vault_ref.as_ref())
         .map(|value| value.trim())
@@ -1665,6 +1712,8 @@ fn doctor_browser_port_diagnostics(
         .collect()
 }
 
+// browserd convention: the health listener sits one port below the gRPC port;
+// the well-known default ports are mapped explicitly.
 fn derive_browser_health_base_url_from_endpoint(endpoint: &str) -> String {
     Url::parse(endpoint)
         .ok()
@@ -2134,10 +2183,9 @@ fn collect_doctor_deployment_snapshot() -> DoctorDeploymentSnapshot {
         .as_ref()
         .and_then(|config| config.admin.as_ref())
         .and_then(|admin| admin.auth_token.as_ref())
-        .map(|token| !token.trim().is_empty())
-        .unwrap_or(false);
+        .is_some_and(|token| !token.trim().is_empty());
     let env_admin_token_configured =
-        env::var("PALYRA_ADMIN_TOKEN").ok().map(|token| !token.trim().is_empty()).unwrap_or(false);
+        env::var("PALYRA_ADMIN_TOKEN").ok().is_some_and(|token| !token.trim().is_empty());
     let admin_token_configured = file_admin_token_configured || env_admin_token_configured;
 
     let mut dangerous_remote_bind_ack_config = parsed
@@ -2194,6 +2242,7 @@ fn collect_doctor_deployment_snapshot() -> DoctorDeploymentSnapshot {
 }
 
 fn bind_is_non_loopback(bind_addr: &str, port: u16) -> bool {
+    // Unparseable binds are treated as remote so the security warnings fail closed.
     parse_daemon_bind_socket(bind_addr, port)
         .map(|socket| !socket.ip().is_loopback())
         .unwrap_or(true)
@@ -2314,15 +2363,13 @@ fn redact_json_value_tree(value: &mut Value, key_context: Option<&str>) {
                 return;
             }
             if key_context
-                .map(|key| key_contains_any(key, &["url", "uri", "endpoint", "location"]))
-                .unwrap_or(false)
+                .is_some_and(|key| key_contains_any(key, &["url", "uri", "endpoint", "location"]))
             {
                 *raw = redact_cli_json_url(raw.as_str(), key_context);
                 return;
             }
             if key_context
-                .map(|key| key_contains_any(key, &["error", "reason", "message", "detail"]))
-                .unwrap_or(false)
+                .is_some_and(|key| key_contains_any(key, &["error", "reason", "message", "detail"]))
             {
                 *raw = sanitize_diagnostic_error(raw.as_str());
             }
@@ -3138,15 +3185,13 @@ fn redact_support_bundle_recall_artifact_json(value: &mut Value, key_context: Op
                 return;
             }
             if key_context
-                .map(|key| key_contains_any(key, &["url", "uri", "endpoint", "location"]))
-                .unwrap_or(false)
+                .is_some_and(|key| key_contains_any(key, &["url", "uri", "endpoint", "location"]))
             {
                 *raw = redact_cli_json_url(raw.as_str(), key_context);
                 return;
             }
             if key_context
-                .map(|key| key_contains_any(key, &["error", "reason", "message", "detail"]))
-                .unwrap_or(false)
+                .is_some_and(|key| key_contains_any(key, &["error", "reason", "message", "detail"]))
             {
                 *raw = sanitize_diagnostic_error(raw.as_str());
             } else {
@@ -3345,9 +3390,9 @@ fn collect_error_strings(value: &Value, key_context: Option<&str>, output: &mut 
             }
         }
         Value::String(raw)
-            if key_context
-                .map(|key| key_contains_any(key, &["error", "reason", "message", "failure"]))
-                .unwrap_or(false) =>
+            if key_context.is_some_and(|key| {
+                key_contains_any(key, &["error", "reason", "message", "failure"])
+            }) =>
         {
             output.push(raw.clone());
         }
@@ -3516,10 +3561,7 @@ fn truncate_utf8_chars(raw: &str, max_chars: usize) -> String {
     if raw.chars().count() <= max_chars {
         return raw.to_owned();
     }
-    let mut output = String::new();
-    for ch in raw.chars().take(max_chars) {
-        output.push(ch);
-    }
+    let mut output: String = raw.chars().take(max_chars).collect();
     output.push_str("...");
     output
 }
@@ -3748,13 +3790,7 @@ async fn resolve_memory_scope(
     session: Option<String>,
     connection: &AgentConnection,
 ) -> Result<(Option<String>, Option<String>)> {
-    let channel = channel.map(|value| value.trim().to_owned()).and_then(|value| {
-        if value.is_empty() {
-            None
-        } else {
-            Some(value)
-        }
-    });
+    let channel = channel.and_then(normalize_optional_text_arg);
     let session = session.and_then(normalize_optional_text_arg);
 
     match scope {
@@ -4480,6 +4516,11 @@ fn resolve_optional_prompt_input(
     prompt.map(normalize_prompt_arg).transpose()
 }
 
+/// Trims an inline text argument, rejecting embedded line breaks.
+///
+/// # Errors
+/// Returns an error directing the user to `stdin_flag` when `value` contains
+/// carriage returns or newlines.
 pub(crate) fn normalize_single_line_cli_text_arg(
     value: String,
     inline_flag: &str,
@@ -4497,6 +4538,14 @@ fn normalize_prompt_arg(value: String) -> Result<String> {
     normalize_single_line_cli_text_arg(value, "--prompt", "--prompt-stdin")
 }
 
+/// Decodes prompt bytes piped via stdin and strips only trailing line endings.
+///
+/// Interior newlines and indentation are preserved so multi-line prompts
+/// survive intact.
+///
+/// # Errors
+/// Returns an error when the bytes are not valid UTF-8 and (on Windows) cannot
+/// be decoded with any active console code page.
 pub(crate) fn normalize_prompt_stdin_bytes(input: &[u8]) -> Result<String> {
     let input = decode_prompt_stdin_bytes(input)?;
     Ok(input.trim_end_matches(['\r', '\n']).to_owned())
@@ -4517,6 +4566,8 @@ fn decode_prompt_stdin_bytes(input: &[u8]) -> Result<String> {
 fn decode_prompt_stdin_bytes_fallback(input: &[u8]) -> Result<String> {
     let mut code_pages = Vec::new();
     for code_page in windows_prompt_stdin_code_pages() {
+        // 0 means "no code page" and 65001 is UTF-8, which strict decoding
+        // already rejected before reaching this fallback.
         if code_page == 0 || code_page == 65001 || code_pages.contains(&code_page) {
             continue;
         }
@@ -4827,7 +4878,7 @@ fn mark_interrupted_follow_up_origin(request: &mut AgentRunInput, interrupted_ru
 }
 
 fn normalize_optional_owned_text(value: Option<String>) -> Option<String> {
-    value.and_then(|value| empty_to_none(value.trim().to_owned()))
+    value.and_then(empty_to_none)
 }
 
 fn session_summary_reference(
@@ -5003,6 +5054,9 @@ fn normalized_workspace_path(raw: &str) -> String {
     raw.trim().trim_start_matches('/').replace('\\', "/").to_ascii_lowercase()
 }
 
+// Mode is `&mut` so a decision could downgrade it mid-run later; today
+// allow-once deliberately persists for every request in the run, which
+// approval_mode_allow_once_approves_all_requests_in_current_run pins.
 fn prompt_tool_approval_decision_with_mode_state(
     approval: &common_v1::ToolApprovalRequest,
     mode: &mut AgentApprovalMode,
@@ -5058,10 +5112,18 @@ fn resolve_or_generate_canonical_id(value: Option<String>) -> Result<String> {
     Ok(resolved)
 }
 
+/// Validates `value` as a canonical ULID and wraps it in a proto `CanonicalId`.
+///
+/// # Errors
+/// Returns an error when `value` is not a valid canonical ULID.
 pub(crate) fn resolve_required_canonical_id(value: String) -> Result<common_v1::CanonicalId> {
     resolve_or_generate_canonical_id(Some(value)).map(|ulid| common_v1::CanonicalId { ulid })
 }
 
+/// Validates an optional canonical ULID, passing `None` through unchanged.
+///
+/// # Errors
+/// Returns an error when a provided value is not a valid canonical ULID.
 pub(crate) fn resolve_optional_canonical_id(
     value: Option<String>,
 ) -> Result<Option<common_v1::CanonicalId>> {
@@ -5448,6 +5510,9 @@ fn redact_stream_json_value(value: Value, key_context: Option<&str>, depth: usiz
             Value::Object(output)
         }
         Value::Array(items) => {
+            // CLI-style argument arrays carry secrets as the element after a
+            // sensitive flag marker (e.g. ["--token", value]), so the element
+            // following any marker is redacted wholesale.
             let mut output = Vec::new();
             let mut redact_next = false;
             let mut omitted = 0usize;
@@ -5510,9 +5575,7 @@ fn stream_binary_payload_placeholder(value: &Value) -> Value {
 }
 
 fn sanitize_stream_json_string_with_context(raw: &str, key_context: Option<&str>) -> String {
-    if key_context
-        .map(|key| key_contains_any(key, &["url", "uri", "endpoint", "location"]))
-        .unwrap_or(false)
+    if key_context.is_some_and(|key| key_contains_any(key, &["url", "uri", "endpoint", "location"]))
     {
         return truncate_utf8_chars(
             redact_cli_json_url(raw, key_context).as_str(),
@@ -5609,7 +5672,7 @@ fn split_url_query_or_fragment(value: &str) -> (&str, &str) {
 }
 
 fn cli_json_url_key_requires_full_path_redaction(key_context: Option<&str>) -> bool {
-    key_context.map(|key| key_contains_any(key, &["webhook"])).unwrap_or(false)
+    key_context.is_some_and(|key| key_contains_any(key, &["webhook"]))
 }
 
 fn cli_json_url_is_known_webhook_path(authority: &str, path: &str) -> bool {
@@ -6741,6 +6804,7 @@ impl AgentStreamOutcome {
     }
 }
 
+/// Parameters for resolving (or creating) a gateway session by id, key, or label.
 #[derive(Clone)]
 pub(crate) struct SessionResolveInput {
     pub(crate) session_id: Option<common_v1::CanonicalId>,
@@ -6750,12 +6814,14 @@ pub(crate) struct SessionResolveInput {
     pub(crate) reset_session: bool,
 }
 
+/// Parameters identifying a gateway session to clean up by id or key.
 #[derive(Clone)]
 pub(crate) struct SessionCleanupInput {
     pub(crate) session_id: Option<common_v1::CanonicalId>,
     pub(crate) session_key: String,
 }
 
+/// Query parameters for listing agent bindings scoped to a principal and channel.
 #[derive(Clone)]
 pub(crate) struct AgentBindingsQueryInput {
     pub(crate) agent_id: String,
@@ -6765,6 +6831,7 @@ pub(crate) struct AgentBindingsQueryInput {
     pub(crate) limit: u32,
 }
 
+/// Parameters for resolving the effective agent context for a session.
 #[derive(Clone)]
 pub(crate) struct AgentContextResolveInput {
     pub(crate) principal: String,
@@ -8070,6 +8137,7 @@ fn sha256_hex(payload: &[u8]) -> String {
     output
 }
 
+/// Renders presence of a sensitive value as the redaction marker or `none` for text output.
 pub(crate) fn redacted_presence_for_output(present: bool) -> String {
     if present {
         REDACTED.to_owned()
@@ -8078,6 +8146,7 @@ pub(crate) fn redacted_presence_for_output(present: bool) -> String {
     }
 }
 
+/// Renders presence of a sensitive value as the redaction marker or JSON null.
 pub(crate) fn redacted_presence_json_value(present: bool) -> Value {
     if present {
         Value::String(REDACTED.to_owned())
@@ -8086,14 +8155,17 @@ pub(crate) fn redacted_presence_json_value(present: bool) -> Value {
     }
 }
 
+/// Redacts a sensitive identifier for text output, mapping blank input to `none`.
 pub(crate) fn redacted_identifier_for_output(value: &str) -> String {
     redacted_presence_for_output(!value.trim().is_empty())
 }
 
+/// Redacts an optional sensitive identifier, mapping absent or blank input to `none`.
 pub(crate) fn redacted_optional_identifier_for_output(value: Option<&str>) -> String {
     redacted_presence_for_output(value.is_some_and(|candidate| !candidate.trim().is_empty()))
 }
 
+/// Redacts an optional sensitive identifier as JSON, mapping absent or blank input to null.
 pub(crate) fn redacted_identifier_json_value(value: Option<&str>) -> Value {
     redacted_presence_json_value(value.is_some_and(|candidate| !candidate.trim().is_empty()))
 }
@@ -8119,6 +8191,7 @@ fn compare_semver_versions(left: &str, right: &str) -> std::cmp::Ordering {
 }
 
 fn unix_now_ms() -> i64 {
+    // Intentional cast: unix milliseconds fit in i64 far beyond any real clock value.
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64
 }
 
@@ -8573,6 +8646,9 @@ fn write_file_atomically(path: &Path, payload: &[u8]) -> Result<()> {
             return Ok(());
         }
 
+        // Replacing an existing file with rename can fail on Windows (open
+        // handles, AV scanners), so stage the original as a backup first and
+        // restore it if the swap fails.
         let backup_path =
             path.with_extension(format!("bak.{}.{}", std::process::id(), Ulid::new()));
         fs::rename(path, backup_path.as_path()).with_context(|| {
@@ -9328,8 +9404,7 @@ fn select_registry_entry(
         compare_semver_versions(left.version.as_str(), right.version.as_str())
     });
     candidates
-        .into_iter()
-        .last()
+        .pop()
         .ok_or_else(|| anyhow!("registry does not contain installable versions for {}", skill_id))
 }
 
@@ -9354,7 +9429,7 @@ fn select_remote_registry_entry(
     candidates.sort_by(|left, right| {
         compare_semver_versions(left.entry.version.as_str(), right.entry.version.as_str())
     });
-    candidates.into_iter().last().ok_or_else(|| {
+    candidates.pop().ok_or_else(|| {
         anyhow!("remote registry does not contain installable versions for {}", skill_id)
     })
 }
@@ -9399,6 +9474,8 @@ fn fetch_limited_bytes(client: &Client, url: &str, limit: usize) -> Result<Vec<u
             limit
         );
     }
+    // Read in bounded chunks instead of trusting Content-Length so oversized
+    // or mislabeled responses are rejected as soon as the limit is crossed.
     let mut payload = Vec::with_capacity(limit.min(64 * 1024));
     let mut chunk = [0_u8; 8 * 1024];
     loop {
@@ -9497,6 +9574,10 @@ fn resolve_and_prompt_missing_skill_secrets(
     Ok(missing)
 }
 
+/// Prompts on stderr for a yes/no answer, returning `default` on empty input.
+///
+/// # Errors
+/// Returns an error when stderr cannot be flushed or stdin cannot be read.
 pub(crate) fn prompt_yes_no_default(prompt: &str, default: bool) -> Result<bool> {
     eprint!("{prompt}");
     std::io::stderr().flush().context("stderr flush failed")?;
@@ -9539,6 +9620,10 @@ fn redact_channel_router_preview_session_key(payload: &mut Value) {
     output::channels::redact_router_preview_session_key(payload);
 }
 
+/// Prompts on stderr for a yes/no answer; anything but `y`/`yes` counts as no.
+///
+/// # Errors
+/// Returns an error when stderr cannot be flushed or stdin cannot be read.
 pub(crate) fn prompt_yes_no(prompt: &str) -> Result<bool> {
     eprint!("{prompt}");
     std::io::stderr().flush().context("stderr flush failed")?;
@@ -9548,6 +9633,10 @@ pub(crate) fn prompt_yes_no(prompt: &str) -> Result<bool> {
     Ok(matches!(normalized.as_str(), "y" | "yes"))
 }
 
+/// Prompts on stderr and reads a secret without echoing it to the terminal.
+///
+/// # Errors
+/// Returns an error when stderr cannot be flushed or the secret cannot be read.
 pub(crate) fn prompt_secret_value(prompt: &str) -> Result<String> {
     eprint!("{prompt}");
     std::io::stderr().flush().context("stderr flush failed")?;
@@ -9555,12 +9644,15 @@ pub(crate) fn prompt_secret_value(prompt: &str) -> Result<String> {
     Ok(normalize_prompt_secret_value(&value))
 }
 
+/// Strips trailing line endings from a prompted secret without touching inner content.
 pub(crate) fn normalize_prompt_secret_value(raw: &str) -> String {
     raw.trim_end_matches(['\r', '\n']).to_owned()
 }
 
 fn update_skill_current_pointer(skill_root: &Path, version: &str) -> Result<()> {
     let current = skill_root.join(SKILLS_CURRENT_LINK_NAME);
+    // exists() follows symlinks, so a dangling `current` link reports false;
+    // the symlink_metadata branch below still detects and clears it.
     if current.exists() {
         if current.is_dir() && !current.is_symlink() {
             fs::remove_dir_all(current.as_path()).with_context(|| {
@@ -10275,16 +10367,12 @@ fn process_runner_tier_b_allowlist_preflight_only(parsed: &RootFileConfig) -> bo
     if tier != "b" && tier != "tier_b" {
         return true;
     }
-    let has_host_allowlists = process_runner
-        .allowed_egress_hosts
-        .as_ref()
-        .map(|hosts| !hosts.is_empty())
-        .unwrap_or(false)
-        || process_runner
-            .allowed_dns_suffixes
-            .as_ref()
-            .map(|suffixes| !suffixes.is_empty())
-            .unwrap_or(false);
+    let has_host_allowlists =
+        process_runner.allowed_egress_hosts.as_ref().is_some_and(|hosts| !hosts.is_empty())
+            || process_runner
+                .allowed_dns_suffixes
+                .as_ref()
+                .is_some_and(|suffixes| !suffixes.is_empty());
     !has_host_allowlists
 }
 
@@ -10318,16 +10406,12 @@ fn process_runner_tier_c_strict_offline_allowlists_empty(parsed: &RootFileConfig
     if mode != "strict" {
         return true;
     }
-    let has_host_allowlists = process_runner
-        .allowed_egress_hosts
-        .as_ref()
-        .map(|hosts| !hosts.is_empty())
-        .unwrap_or(false)
-        || process_runner
-            .allowed_dns_suffixes
-            .as_ref()
-            .map(|suffixes| !suffixes.is_empty())
-            .unwrap_or(false);
+    let has_host_allowlists =
+        process_runner.allowed_egress_hosts.as_ref().is_some_and(|hosts| !hosts.is_empty())
+            || process_runner
+                .allowed_dns_suffixes
+                .as_ref()
+                .is_some_and(|suffixes| !suffixes.is_empty());
     !has_host_allowlists
 }
 

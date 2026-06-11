@@ -1,7 +1,13 @@
+//! Shared slash-command registry for chat surfaces. Definitions are compiled
+//! in from `apps/web/src/chat/chatCommandRegistry.json` so the web composer
+//! and the TUI resolve the same command names, aliases, and per-surface
+//! visibility from a single source of truth.
+
 use std::{collections::BTreeSet, sync::OnceLock};
 
 use serde::{Deserialize, Serialize};
 
+/// Chat surface a command is visible on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SharedChatCommandSurface {
@@ -10,6 +16,7 @@ pub enum SharedChatCommandSurface {
 }
 
 impl SharedChatCommandSurface {
+    /// Returns the snake_case label used in parity reports.
     pub fn as_label(self) -> &'static str {
         match self {
             Self::Web => "web",
@@ -18,6 +25,8 @@ impl SharedChatCommandSurface {
     }
 }
 
+/// Where a command executes: in the client, on the server, or in the client
+/// gated by a local capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SharedChatCommandExecution {
@@ -27,6 +36,7 @@ pub enum SharedChatCommandExecution {
 }
 
 impl SharedChatCommandExecution {
+    /// Returns the snake_case label used in parity reports.
     pub fn as_label(self) -> &'static str {
         match self {
             Self::Local => "local",
@@ -36,6 +46,7 @@ impl SharedChatCommandExecution {
     }
 }
 
+/// One slash-command definition deserialized from the shared JSON registry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SharedChatCommandDefinition {
     pub name: String,
@@ -57,16 +68,25 @@ pub struct SharedChatCommandDefinition {
 
 static SHARED_CHAT_COMMANDS: OnceLock<Vec<SharedChatCommandDefinition>> = OnceLock::new();
 
+/// Returns the full command registry, loading and validating it on first use.
+///
+/// # Panics
+/// Panics on first access if the embedded registry JSON is malformed or
+/// violates registry invariants (duplicate names/aliases, empty fields,
+/// synopsis not starting with the command name). The registry is a build-time
+/// asset, so a failure here is a packaging bug, not a runtime condition.
 pub fn shared_chat_commands() -> &'static [SharedChatCommandDefinition] {
     SHARED_CHAT_COMMANDS.get_or_init(load_shared_chat_commands).as_slice()
 }
 
+/// Returns the commands visible on `surface`, in registry order.
 pub fn shared_chat_commands_for_surface(
     surface: SharedChatCommandSurface,
 ) -> Vec<&'static SharedChatCommandDefinition> {
     shared_chat_commands().iter().filter(|command| command.surfaces.contains(&surface)).collect()
 }
 
+/// Looks up a command by canonical name or alias, scoped to `surface`.
 pub fn find_shared_chat_command(
     name: &str,
     surface: SharedChatCommandSurface,
@@ -77,6 +97,8 @@ pub fn find_shared_chat_command(
         .find(|command| command.name == canonical && command.surfaces.contains(&surface))
 }
 
+/// Resolves user input (canonical name or alias, case-insensitive) to the
+/// canonical command name for `surface`, or `None` when unknown there.
 pub fn resolve_shared_chat_command_name(
     name: &str,
     surface: SharedChatCommandSurface,
@@ -86,6 +108,8 @@ pub fn resolve_shared_chat_command_name(
         return None;
     }
 
+    // Canonical names win over aliases so a name that doubles as another
+    // command's alias always resolves to itself.
     if let Some(command) = shared_chat_commands()
         .iter()
         .find(|command| command.name == normalized && command.surfaces.contains(&surface))
@@ -102,6 +126,8 @@ pub fn resolve_shared_chat_command_name(
         .map(|command| command.name.as_str())
 }
 
+/// Renders the surface's command synopses as two-space-indented lines,
+/// greedily packing synopses up to `max_width` bytes per line.
 pub fn render_shared_chat_command_synopsis_lines(
     surface: SharedChatCommandSurface,
     max_width: usize,
@@ -142,6 +168,8 @@ fn load_shared_chat_commands() -> Vec<SharedChatCommandDefinition> {
     validate_shared_chat_commands(commands)
 }
 
+// Asserts (rather than returning errors) because the registry is embedded at
+// compile time: any violation is a packaging bug that must fail fast.
 fn validate_shared_chat_commands(
     commands: Vec<SharedChatCommandDefinition>,
 ) -> Vec<SharedChatCommandDefinition> {

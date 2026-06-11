@@ -1,3 +1,6 @@
+//! Unit tests for ACP bridge protocol mapping: prompt assembly, permission
+//! option semantics, session listing fallbacks, and binding lookups.
+
 use super::{
     acp, build_tool_permission_request, map_list_sessions_response, map_permission_outcome,
     AcpSessionDefaults, AgentConnection, BridgeState, ClientBridgeRequest, PalyraAcpAgent,

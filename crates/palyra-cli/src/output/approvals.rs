@@ -1,5 +1,13 @@
+//! Output rendering for `palyra approvals` list/show.
+//!
+//! Text lines and JSON field names are pinned by CLI parity tests.
+
 use crate::*;
 
+/// Emits an approvals listing as pretty JSON or pinned text lines.
+///
+/// # Errors
+/// Returns an error when the JSON payload cannot be encoded.
 pub(crate) fn emit_list(
     response: &gateway_v1::ListApprovalsResponse,
     json_output: bool,
@@ -47,6 +55,10 @@ pub(crate) fn emit_list(
     Ok(())
 }
 
+/// Emits a single approval record as pretty JSON or a pinned text line.
+///
+/// # Errors
+/// Returns an error when the JSON payload cannot be encoded.
 pub(crate) fn emit_show(approval: &gateway_v1::ApprovalRecord, json_output: bool) -> Result<()> {
     if json_output {
         return super::print_json_pretty(
@@ -67,6 +79,8 @@ pub(crate) fn emit_show(approval: &gateway_v1::ApprovalRecord, json_output: bool
     Ok(())
 }
 
+// An approval is pending only while it is both unresolved and undecided; an
+// unspecified decision on a resolved record still renders as a decision label.
 fn approval_status_text(approval: &gateway_v1::ApprovalRecord) -> &'static str {
     if approval.resolved_at_unix_ms == 0
         && approval.decision == gateway_v1::ApprovalDecision::Unspecified as i32

@@ -1,3 +1,8 @@
+//! Authenticated control-plane (admin console) session setup.
+//!
+//! Resolves the admin HTTP connection from the CLI root context plus per-command
+//! overrides, then performs the console login so callers get a ready client.
+
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -5,16 +10,27 @@ use palyra_control_plane::{ConsoleLoginRequest, ControlPlaneClient, ControlPlane
 
 use crate::app;
 
+/// A control-plane client that already holds an authenticated console session.
 pub(crate) struct AdminConsoleContext {
     pub(crate) client: ControlPlaneClient,
 }
 
+/// Connects to the admin console using the client's default request timeout.
+///
+/// # Errors
+/// Returns an error when the CLI root context is unavailable, the connection
+/// cannot be resolved, client initialization fails, or the console login fails.
 pub(crate) async fn connect_admin_console(
     overrides: app::ConnectionOverrides,
 ) -> Result<AdminConsoleContext> {
     connect_admin_console_with_request_timeout(overrides, None).await
 }
 
+/// Connects to the admin console, optionally overriding the request timeout.
+///
+/// # Errors
+/// Returns an error when the CLI root context is unavailable, the connection
+/// cannot be resolved, client initialization fails, or the console login fails.
 pub(crate) async fn connect_admin_console_with_request_timeout(
     overrides: app::ConnectionOverrides,
     request_timeout: Option<Duration>,

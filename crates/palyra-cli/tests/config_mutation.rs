@@ -1,3 +1,7 @@
+//! Pins `palyra config set/get/unset/list/migrate/recover` mutation semantics: secret
+//! redaction, backup rotation, schema validation, and rejection paths that must leave the
+//! active config file untouched.
+
 use std::{
     ffi::OsString,
     fs,

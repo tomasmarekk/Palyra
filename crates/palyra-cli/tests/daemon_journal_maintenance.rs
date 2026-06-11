@@ -1,3 +1,6 @@
+//! Pins `palyra daemon journal` vacuum/checkpoint and `gateway journal recent` maintenance
+//! commands against a seeded WAL-mode SQLite journal database.
+
 use std::{
     io::{Read, Write},
     net::TcpListener,

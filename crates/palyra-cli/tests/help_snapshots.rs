@@ -1,3 +1,7 @@
+//! Pins normalized --help output for every command in the CLI parity matrix against
+//! snapshots under tests/help_snapshots. Set PALYRA_UPDATE_HELP_SNAPSHOTS to any value to
+//! regenerate the snapshots instead of asserting.
+
 use std::{env, fs, path::PathBuf, process::Command};
 
 use anyhow::{Context, Result};

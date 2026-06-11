@@ -1,3 +1,7 @@
+//! Pins `palyra doctor` diagnostics: global config resolution, vault-ref and gateway
+//! connectivity findings, and admin-token probing against a stub loopback HTTP server
+//! standing in for the daemon.
+
 use std::{
     fs,
     io::{Read, Write},

@@ -1,3 +1,6 @@
+//! Pins that `palyra dashboard`, `dashboard-url`, and `gateway dashboard-url` resolve the
+//! global --config path and report the configured remote URL as JSON.
+
 use std::fs;
 use std::process::{Command, Output};
 

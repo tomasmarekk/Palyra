@@ -1,3 +1,9 @@
+//! Workflow-regression contracts: the scenario/profile manifest, the compat
+//! release-readiness checklist, and the run report consumed by CI regression
+//! gates. Validation cross-checks manifests against the canonical runtime
+//! acceptance catalog published by `palyra-common`; emitted strings are
+//! pinned by the workflow-regression contract tests and CI tooling.
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -10,8 +16,11 @@ use palyra_common::runtime_preview::{
 };
 use serde::{Deserialize, Serialize};
 
+/// Schema version shared by the manifest, checklist, and run report formats.
 pub const WORKFLOW_REGRESSION_SCHEMA_VERSION: u32 = 1;
 
+/// Committed manifest describing regression profiles, scenarios, and the
+/// runtime acceptance coverage each profile must provide.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowRegressionManifest {
     pub schema_version: u32,
@@ -25,6 +34,8 @@ pub struct WorkflowRegressionManifest {
     pub scenarios: Vec<WorkflowRegressionScenario>,
 }
 
+/// One named execution profile (for example fast vs full) with its required
+/// subsystem coverage and chaos-scenario floor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowRegressionProfile {
     pub description: String,
@@ -32,12 +43,14 @@ pub struct WorkflowRegressionProfile {
     pub minimum_chaos_scenarios: usize,
 }
 
+/// Catalog entry for a subsystem that scenarios can claim coverage for.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowRegressionSubsystem {
     pub id: String,
     pub summary: String,
 }
 
+/// Preparatory command executed before scenarios for the selected profiles.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowRegressionSetupStep {
     pub id: String,
@@ -46,12 +59,16 @@ pub struct WorkflowRegressionSetupStep {
     pub command: Vec<String>,
 }
 
+/// Shared runtime acceptance fixture re-declared by the manifest; ids must
+/// exist in the `palyra-common` fixture catalog.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowRegressionFixture {
     pub id: String,
     pub summary: String,
 }
 
+/// Runtime acceptance scenario mirrored from the canonical `palyra-common`
+/// catalog; capability and fixture keys must match the canonical definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowRegressionAcceptanceScenario {
     pub id: String,
@@ -62,6 +79,8 @@ pub struct WorkflowRegressionAcceptanceScenario {
     pub fixture_keys: Vec<String>,
 }
 
+/// Executable regression scenario plus the profiles, subsystems, and
+/// acceptance scenarios it claims coverage for.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowRegressionScenario {
     pub id: String,
@@ -75,6 +94,8 @@ pub struct WorkflowRegressionScenario {
     pub command: Vec<String>,
 }
 
+/// Committed release-readiness checklist tying rollout controls, migration
+/// tracks, known limitations, and evidence requirements to a release scope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompatReleaseReadinessChecklist {
     pub schema_version: u32,
@@ -87,6 +108,7 @@ pub struct CompatReleaseReadinessChecklist {
     pub evidence: Vec<CompatEvidenceRequirement>,
 }
 
+/// Operator-facing rollout control (flag, toggle, or staged switch).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompatRolloutControl {
     pub id: String,
@@ -94,6 +116,7 @@ pub struct CompatRolloutControl {
     pub summary: String,
 }
 
+/// Migration surface with apply and rollback instructions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompatMigrationTrack {
     pub id: String,
@@ -102,6 +125,7 @@ pub struct CompatMigrationTrack {
     pub rollback: String,
 }
 
+/// Documented limitation acknowledged for the release scope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompatKnownLimitation {
     pub id: String,
@@ -109,6 +133,8 @@ pub struct CompatKnownLimitation {
     pub summary: String,
 }
 
+/// Evidence the checklist requires before a release is considered ready:
+/// either a workflow run report for a profile or a source-contract file scan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompatEvidenceRequirement {
     pub id: String,
@@ -125,6 +151,7 @@ pub struct CompatEvidenceRequirement {
     pub must_pass_scenarios: Vec<String>,
 }
 
+/// How a piece of checklist evidence is produced.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CompatEvidenceKind {
@@ -132,6 +159,7 @@ pub enum CompatEvidenceKind {
     SourceContract,
 }
 
+/// Whether evidence is validated by executing scenarios or by static checks.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CompatValidationMode {
@@ -139,6 +167,7 @@ pub enum CompatValidationMode {
     Structural,
 }
 
+/// Serialized result of one workflow-regression run; consumed by CI gates.
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkflowRegressionRunReport {
     pub schema_version: u32,
@@ -155,6 +184,7 @@ pub struct WorkflowRegressionRunReport {
     pub release_checklist: CompatChecklistStatusReport,
 }
 
+/// Pass/fail/skip counters aggregated over setup steps and scenarios.
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkflowRegressionRunSummary {
     pub setup_total: usize,
@@ -167,6 +197,8 @@ pub struct WorkflowRegressionRunSummary {
     pub chaos_failed: usize,
 }
 
+/// Required-versus-covered subsystem and acceptance-scenario sets for the
+/// executed profile.
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkflowRegressionCoverageSummary {
     pub required_subsystems: Vec<String>,
@@ -177,6 +209,7 @@ pub struct WorkflowRegressionCoverageSummary {
     pub missing_acceptance_scenarios: Vec<String>,
 }
 
+/// Outcome of one executed setup step or scenario, including log location.
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkflowRegressionExecutionRecord {
     pub id: String,
@@ -192,6 +225,7 @@ pub struct WorkflowRegressionExecutionRecord {
     pub output_excerpt: String,
 }
 
+/// Execution status of a setup step or scenario.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowRegressionExecutionStatus {
@@ -200,6 +234,7 @@ pub enum WorkflowRegressionExecutionStatus {
     Skipped,
 }
 
+/// Aggregated checklist evaluation embedded in the run report.
 #[derive(Debug, Clone, Serialize)]
 pub struct CompatChecklistStatusReport {
     pub state: CompatChecklistState,
@@ -209,6 +244,8 @@ pub struct CompatChecklistStatusReport {
     pub evidence: Vec<CompatEvidenceStatus>,
 }
 
+/// Overall checklist verdict: any failure wins over pending evidence, which
+/// wins over a fully validated checklist.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CompatChecklistState {
@@ -217,6 +254,7 @@ pub enum CompatChecklistState {
     NeedsAttention,
 }
 
+/// Evaluation result for a single evidence requirement.
 #[derive(Debug, Clone, Serialize)]
 pub struct CompatEvidenceStatus {
     pub id: String,
@@ -225,6 +263,8 @@ pub struct CompatEvidenceStatus {
     pub details: String,
 }
 
+/// Fine-grained evidence status; `PendingOtherProfile` marks evidence that a
+/// different profile run must satisfy.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CompatEvidenceStatusKind {
@@ -235,6 +275,12 @@ pub enum CompatEvidenceStatusKind {
     InvalidReference,
 }
 
+/// Loads and parses a workflow-regression manifest from disk.
+///
+/// # Errors
+/// Returns an error when the file cannot be read or is not valid manifest
+/// JSON; structural rules are checked separately by
+/// [`validate_workflow_regression_manifest`].
 pub fn load_workflow_regression_manifest(path: &Path) -> Result<WorkflowRegressionManifest> {
     let manifest_text = fs::read_to_string(path).with_context(|| {
         format!("failed to read workflow regression manifest {}", path.display())
@@ -243,6 +289,11 @@ pub fn load_workflow_regression_manifest(path: &Path) -> Result<WorkflowRegressi
         .with_context(|| format!("failed to parse workflow regression manifest {}", path.display()))
 }
 
+/// Loads and parses a compat release-readiness checklist from disk.
+///
+/// # Errors
+/// Returns an error when the file cannot be read or is not valid checklist
+/// JSON; cross-references are checked by [`validate_compat_release_readiness`].
 pub fn load_compat_release_readiness(path: &Path) -> Result<CompatReleaseReadinessChecklist> {
     let checklist_text = fs::read_to_string(path)
         .with_context(|| format!("failed to read compat release checklist {}", path.display()))?;
@@ -250,6 +301,13 @@ pub fn load_compat_release_readiness(path: &Path) -> Result<CompatReleaseReadine
         .with_context(|| format!("failed to parse compat release checklist {}", path.display()))
 }
 
+/// Validates manifest invariants: non-empty catalogs, unique ids, known
+/// cross-references, full canonical acceptance coverage, and per-profile
+/// subsystem/acceptance/chaos coverage floors.
+///
+/// # Errors
+/// Returns the first violated invariant as an `anyhow` error whose message is
+/// stable enough to be surfaced directly by CI tooling.
 pub fn validate_workflow_regression_manifest(manifest: &WorkflowRegressionManifest) -> Result<()> {
     ensure_nonempty_value(
         manifest.release_scope.as_str(),
@@ -358,6 +416,12 @@ pub fn validate_workflow_regression_manifest(manifest: &WorkflowRegressionManife
     Ok(())
 }
 
+/// Validates the checklist against the manifest it references: matching
+/// release scope, unique non-empty entries, known profiles/subsystems/
+/// scenarios, and resolvable source-contract paths under `repo_root`.
+///
+/// # Errors
+/// Returns the first violated invariant as an `anyhow` error.
 pub fn validate_compat_release_readiness(
     checklist: &CompatReleaseReadinessChecklist,
     manifest: &WorkflowRegressionManifest,
@@ -522,6 +586,14 @@ pub fn validate_compat_release_readiness(
     Ok(())
 }
 
+/// Evaluates every checklist evidence requirement against one run report.
+///
+/// Workflow evidence bound to a different profile is counted as pending, not
+/// failed, so a single-profile run can still produce a useful verdict.
+///
+/// # Errors
+/// Returns an error only for malformed checklist entries (workflow evidence
+/// without a profile); evidence evaluation failures are reported as statuses.
 pub fn build_compat_checklist_status(
     checklist: &CompatReleaseReadinessChecklist,
     repo_root: &Path,
@@ -677,6 +749,7 @@ pub fn build_compat_checklist_status(
     Ok(CompatChecklistStatusReport { state, validated, pending, failed, evidence })
 }
 
+/// Returns the subsystems covered by scenarios that run in `profile_id`.
 pub fn covered_subsystems_for_profile(
     manifest: &WorkflowRegressionManifest,
     profile_id: &str,
@@ -689,6 +762,8 @@ pub fn covered_subsystems_for_profile(
         .collect()
 }
 
+/// Returns the acceptance scenarios whose `required_profiles` include
+/// `profile_id`.
 pub fn required_acceptance_scenarios_for_profile(
     manifest: &WorkflowRegressionManifest,
     profile_id: &str,
@@ -701,6 +776,8 @@ pub fn required_acceptance_scenarios_for_profile(
         .collect()
 }
 
+/// Returns the acceptance scenarios claimed by scenarios that run in
+/// `profile_id`.
 pub fn covered_acceptance_scenarios_for_profile(
     manifest: &WorkflowRegressionManifest,
     profile_id: &str,
@@ -713,6 +790,11 @@ pub fn covered_acceptance_scenarios_for_profile(
         .collect()
 }
 
+/// Resolves the workspace root two levels above this crate's manifest dir.
+///
+/// # Errors
+/// Returns an error when `CARGO_MANIFEST_DIR` has fewer than two ancestors,
+/// which only happens outside the expected `crates/palyra-cli` layout.
 pub fn repo_root_from_manifest_dir() -> Result<PathBuf> {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -721,6 +803,7 @@ pub fn repo_root_from_manifest_dir() -> Result<PathBuf> {
         .context("failed to resolve workspace root from CARGO_MANIFEST_DIR")
 }
 
+/// Joins `value` onto `repo_root` unless it is already an absolute path.
 pub fn resolve_repo_relative_path(repo_root: &Path, value: &str) -> PathBuf {
     let candidate = PathBuf::from(value);
     if candidate.is_absolute() {
@@ -839,6 +922,8 @@ fn runtime_acceptance_fixture_catalog_ids() -> Result<BTreeSet<String>> {
     })?;
     let mut fixture_ids = BTreeSet::new();
     for key in fixture_catalog.keys() {
+        // The catalog object stores its schema marker alongside fixture
+        // entries; it is metadata, not a fixture id.
         if key == "schema_version" {
             continue;
         }

@@ -1,3 +1,7 @@
+//! Pins the end-to-end workflow regression matrix: local/remote/session lifecycle, plugin
+//! operability, browser, and Discord admin workflows. Spawns real palyrad and browserd
+//! processes on dynamic loopback ports with fixture HTTP responders.
+
 use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},

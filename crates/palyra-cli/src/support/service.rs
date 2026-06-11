@@ -1,3 +1,10 @@
+//! Background gateway service management (`palyra gateway install/start/...`).
+//!
+//! Wraps the per-platform user-level service manager: Windows Scheduled Tasks,
+//! macOS launchd agents, and systemd user units. The installed definition is
+//! tracked in `gateway-service.json` under the state root so later lifecycle
+//! commands operate only on services this CLI installed.
+
 #[cfg(windows)]
 use std::process::Output;
 use std::{
@@ -13,6 +20,8 @@ use windows_sys::Win32::Globalization::{GetACP, GetOEMCP, MultiByteToWideChar};
 
 const SERVICE_METADATA_SCHEMA_VERSION: u32 = 1;
 
+/// Persisted record of an installed gateway service definition; the source of
+/// truth for which service the lifecycle commands are allowed to manage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct GatewayServiceMetadata {
     pub(crate) schema_version: u32,
@@ -29,6 +38,7 @@ pub(crate) struct GatewayServiceMetadata {
     pub(crate) stderr_log_path: String,
 }
 
+/// Point-in-time service state as reported by the platform service manager.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct GatewayServiceStatus {
     pub(crate) installed: bool,
@@ -42,6 +52,7 @@ pub(crate) struct GatewayServiceStatus {
     pub(crate) detail: Option<String>,
 }
 
+/// Inputs for installing the gateway service definition.
 #[derive(Debug, Clone)]
 pub(crate) struct GatewayServiceInstallRequest {
     pub(crate) service_name: Option<String>,
@@ -52,6 +63,8 @@ pub(crate) struct GatewayServiceInstallRequest {
     pub(crate) start_now: bool,
 }
 
+// Resolved, borrowed view of the install request shared by the per-platform
+// installers.
 struct GatewayServiceInstallContext<'a> {
     service_root: &'a Path,
     service_name: &'a str,
@@ -64,10 +77,12 @@ struct GatewayServiceInstallContext<'a> {
     start_now: bool,
 }
 
+/// Returns the `gateway-service.json` metadata path for a state root.
 pub(crate) fn service_metadata_path(state_root: &Path) -> PathBuf {
     state_root.join("service").join("gateway-service.json")
 }
 
+/// Returns the platform-conventional default service name.
 pub(crate) fn default_service_name() -> String {
     if cfg!(windows) {
         "PalyraGateway".to_owned()
@@ -78,6 +93,10 @@ pub(crate) fn default_service_name() -> String {
     }
 }
 
+/// Loads the managed service metadata; `Ok(None)` when none was installed.
+///
+/// # Errors
+/// Returns an error when the metadata file exists but cannot be read or parsed.
 pub(crate) fn load_service_metadata(state_root: &Path) -> Result<Option<GatewayServiceMetadata>> {
     let metadata_path = service_metadata_path(state_root);
     if !metadata_path.is_file() {
@@ -90,6 +109,13 @@ pub(crate) fn load_service_metadata(state_root: &Path) -> Result<Option<GatewayS
     Ok(Some(metadata))
 }
 
+/// Installs (or reinstalls) the gateway service definition for the current
+/// platform, persists its metadata, and returns the resulting status.
+///
+/// # Errors
+/// Returns an error when directories or wrapper/definition files cannot be
+/// written, the daemon binary cannot be canonicalized, or the platform service
+/// manager rejects the installation.
 pub(crate) fn install_gateway_service(
     request: &GatewayServiceInstallRequest,
 ) -> Result<GatewayServiceStatus> {
@@ -107,6 +133,8 @@ pub(crate) fn install_gateway_service(
     let daemon_bin = request.daemon_bin.canonicalize().with_context(|| {
         format!("failed to canonicalize palyrad binary {}", request.daemon_bin.display())
     })?;
+    // Best-effort canonicalization: the config file may be created after the
+    // service is installed, so a non-resolvable path is kept as provided.
     let config_path = request
         .config_path
         .as_ref()
@@ -150,24 +178,44 @@ pub(crate) fn install_gateway_service(
     query_gateway_service_status(request.state_root.as_path())
 }
 
+/// Starts the managed gateway service and reports the resulting status.
+///
+/// # Errors
+/// Returns an error when no managed service metadata exists or the platform
+/// service manager fails to start the service.
 pub(crate) fn start_gateway_service(state_root: &Path) -> Result<GatewayServiceStatus> {
     let metadata = require_service_metadata(state_root)?;
     service_manager_start(&metadata)?;
     query_gateway_service_status(state_root)
 }
 
+/// Stops the managed gateway service and reports the resulting status.
+///
+/// # Errors
+/// Returns an error when no managed service metadata exists or the platform
+/// service manager fails to stop the service.
 pub(crate) fn stop_gateway_service(state_root: &Path) -> Result<GatewayServiceStatus> {
     let metadata = require_service_metadata(state_root)?;
     service_manager_stop(&metadata)?;
     query_gateway_service_status(state_root)
 }
 
+/// Restarts the managed gateway service and reports the resulting status.
+///
+/// # Errors
+/// Returns an error when no managed service metadata exists or the platform
+/// service manager fails to restart the service.
 pub(crate) fn restart_gateway_service(state_root: &Path) -> Result<GatewayServiceStatus> {
     let metadata = require_service_metadata(state_root)?;
     service_manager_restart(&metadata)?;
     query_gateway_service_status(state_root)
 }
 
+/// Uninstalls the managed gateway service definition and removes its metadata.
+/// Reports a not-installed status when no metadata exists.
+///
+/// # Errors
+/// Returns an error when the service definition or metadata cannot be removed.
 pub(crate) fn uninstall_gateway_service(state_root: &Path) -> Result<GatewayServiceStatus> {
     let Some(metadata) = load_service_metadata(state_root)? else {
         return Ok(GatewayServiceStatus {
@@ -183,6 +231,8 @@ pub(crate) fn uninstall_gateway_service(state_root: &Path) -> Result<GatewayServ
         });
     };
 
+    // Best-effort stop: the service may already be stopped or never started,
+    // and uninstall must proceed either way.
     let _ = service_manager_stop(&metadata);
     service_manager_uninstall(&metadata)?;
     let metadata_path = service_metadata_path(state_root);
@@ -204,6 +254,12 @@ pub(crate) fn uninstall_gateway_service(state_root: &Path) -> Result<GatewayServ
     })
 }
 
+/// Queries the platform service manager for the managed service's status;
+/// reports a not-installed status when no metadata exists.
+///
+/// # Errors
+/// Returns an error when the metadata cannot be loaded or the platform query
+/// command cannot be launched.
 pub(crate) fn query_gateway_service_status(state_root: &Path) -> Result<GatewayServiceStatus> {
     let Some(metadata) = load_service_metadata(state_root)? else {
         return Ok(GatewayServiceStatus {
@@ -299,6 +355,8 @@ fn install_windows_task(
         format!("failed to write Windows gateway wrapper {}", wrapper_path.display())
     })?;
     let task_name = format!("\\{}", context.service_name);
+    // Reinstall must be idempotent: drop any existing task with the same name
+    // before creating the new definition.
     let query = Command::new("schtasks")
         .args(["/Query", "/TN", task_name.as_str()])
         .output()
@@ -341,8 +399,12 @@ fn install_windows_task(
         ));
     }
     if context.start_now {
+        // Best-effort start: installation already succeeded, and the follow-up
+        // status query reports whether the task is actually running.
         let _ = Command::new("schtasks").args(["/Run", "/TN", task_name.as_str()]).status();
     }
+    // Scheduled tasks have no on-disk unit file, so the wrapper script serves
+    // as both the wrapper and the definition path in the metadata.
     Ok((wrapper_path.clone(), wrapper_path, "schtasks".to_owned()))
 }
 
@@ -373,6 +435,9 @@ fn summarize_command_output(output: &Output) -> Option<String> {
     }
 }
 
+// Localized console tools (schtasks) emit legacy code-page bytes, not UTF-8.
+// Try UTF-8 first, then decode with several likely code pages and keep the
+// candidate that scores lowest on the mojibake penalty heuristic below.
 #[cfg(windows)]
 fn decode_windows_process_output(bytes: &[u8]) -> String {
     if bytes.is_empty() {
@@ -392,6 +457,10 @@ fn decode_windows_process_output(bytes: &[u8]) -> String {
 
 #[cfg(windows)]
 fn windows_process_output_candidates(bytes: &[u8]) -> Vec<String> {
+    // Console output usually uses the OEM code page, the ANSI code page is the
+    // next best guess, and 852/1250 cover Central European systems where the
+    // active pages may not match the text. SAFETY: GetOEMCP/GetACP take no
+    // arguments and only read process-global locale state.
     let mut code_pages = Vec::from([unsafe { GetOEMCP() }, unsafe { GetACP() }, 852, 1250]);
     code_pages.dedup();
     code_pages
@@ -400,6 +469,9 @@ fn windows_process_output_candidates(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
+// Scores how "wrong" a decoded candidate looks: replacement chars and control
+// bytes dominate, followed by box-drawing/symbol chars that typically appear
+// when text is decoded with the wrong Central European code page.
 #[cfg(windows)]
 fn windows_output_decode_penalty(value: &str) -> usize {
     value
@@ -420,6 +492,10 @@ fn windows_output_decode_penalty(value: &str) -> usize {
 #[cfg(windows)]
 fn windows_code_page_to_string(bytes: &[u8], code_page: u32) -> Option<String> {
     let input_len = i32::try_from(bytes.len()).ok()?;
+    // SAFETY: standard two-call MultiByteToWideChar protocol. The first call
+    // only sizes the output (null buffer, length 0); the second writes at most
+    // `required` UTF-16 units into a buffer allocated with exactly that length,
+    // and `input_len` matches the live `bytes` slice in both calls.
     let required = unsafe {
         MultiByteToWideChar(code_page, 0, bytes.as_ptr(), input_len, std::ptr::null_mut(), 0)
     };
@@ -457,6 +533,11 @@ fn query_windows_task_status(metadata: &GatewayServiceMetadata) -> Result<Gatewa
         });
     }
     let text = String::from_utf8_lossy(&output.stdout);
+    // AIDEV-NOTE: schtasks /Query localizes its LIST output, so these English
+    // markers never match on non-English Windows and `running` is reported as
+    // false even when the task runs. Fixing this needs a locale-independent
+    // query (e.g. /FO CSV column positions or the Task Scheduler COM/PowerShell
+    // API) plus decode_windows_process_output-style code-page handling.
     let running =
         text.contains("Status: Running") || text.contains("Scheduled Task State: Running");
     Ok(GatewayServiceStatus {
@@ -506,6 +587,7 @@ fn service_manager_stop(metadata: &GatewayServiceMetadata) -> Result<()> {
 
 #[cfg(windows)]
 fn service_manager_restart(metadata: &GatewayServiceMetadata) -> Result<()> {
+    // Best-effort stop: restarting a task that is not running is fine.
     let _ = service_manager_stop(metadata);
     service_manager_start(metadata)
 }
@@ -574,6 +656,9 @@ fn install_launch_agent(
     fs::write(definition_path.as_path(), plist.as_bytes())
         .with_context(|| format!("failed to write {}", definition_path.display()))?;
     let domain = launchctl_domain()?;
+    // Best-effort bootout first: bootstrap fails if a previous definition with
+    // the same label is still loaded, and on a fresh install there is nothing
+    // to unload.
     let _ = Command::new("launchctl")
         .args(["bootout", domain.as_str(), definition_path.display().to_string().as_str()])
         .status();
@@ -655,6 +740,8 @@ fn service_manager_stop(metadata: &GatewayServiceMetadata) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn service_manager_restart(metadata: &GatewayServiceMetadata) -> Result<()> {
+    // Best-effort stop: the agent may not be loaded; bootstrap + kickstart
+    // below re-establish the running state either way.
     let _ = service_manager_stop(metadata);
     let domain = launchctl_domain()?;
     run_command(
@@ -667,6 +754,7 @@ fn service_manager_restart(metadata: &GatewayServiceMetadata) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn service_manager_uninstall(metadata: &GatewayServiceMetadata) -> Result<()> {
+    // Best-effort stop: uninstall proceeds whether or not the agent is loaded.
     let _ = service_manager_stop(metadata);
     if Path::new(metadata.definition_path.as_str()).exists() {
         fs::remove_file(metadata.definition_path.as_str())
@@ -791,6 +879,8 @@ fn service_manager_restart(metadata: &GatewayServiceMetadata) -> Result<()> {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn service_manager_uninstall(metadata: &GatewayServiceMetadata) -> Result<()> {
+    // Best-effort disable/stop: the unit may already be disabled or absent,
+    // and removing the unit file below is what actually uninstalls it.
     let _ = Command::new("systemctl")
         .args(["--user", "disable", "--now", metadata.service_name.as_str()])
         .status();
@@ -870,15 +960,11 @@ fn run_command(command: &str, args: &[&str], context: &str) -> Result<()> {
     Ok(())
 }
 
+// Only compiled on Unix targets (Windows task installation does not need the
+// home directory), so the HOME lookup is sufficient.
 #[cfg(any(target_os = "macos", all(unix, not(target_os = "macos"))))]
 fn home_dir() -> Result<PathBuf> {
-    if cfg!(windows) {
-        env::var_os("USERPROFILE")
-            .map(PathBuf::from)
-            .ok_or_else(|| anyhow!("USERPROFILE is not set"))
-    } else {
-        env::var_os("HOME").map(PathBuf::from).ok_or_else(|| anyhow!("HOME is not set"))
-    }
+    env::var_os("HOME").map(PathBuf::from).ok_or_else(|| anyhow!("HOME is not set"))
 }
 
 #[cfg(target_os = "macos")]

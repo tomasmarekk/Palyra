@@ -1,3 +1,6 @@
+//! Pins `palyra config validate` path resolution and schema rejection rules. Each run
+//! isolates HOME/XDG/APPDATA into a temp workdir so host configs cannot leak in.
+
 use std::fs;
 use std::process::{Command, Output};
 

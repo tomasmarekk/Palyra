@@ -1,3 +1,6 @@
+//! Pins `palyra backup verify` error classification: a non-Palyra zip fails as a validation
+//! error and a missing archive reports not-found, never an internal error.
+
 use std::io::Write;
 use std::process::{Command, Output};
 

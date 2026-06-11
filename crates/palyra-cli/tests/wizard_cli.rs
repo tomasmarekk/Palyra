@@ -1,3 +1,7 @@
+//! Pins the setup/onboarding wizard and `configure` flows: quickstart and non-interactive
+//! JSON summaries, stdin secret handling, config backups, and the profile lifecycle. Uses
+//! mock loopback provider servers for model discovery.
+
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{

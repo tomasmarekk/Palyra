@@ -1,3 +1,6 @@
+//! Pins `palyra --version` and `version --json` output, including the checkout git hash
+//! reported from build metadata.
+
 use std::process::{Command, Output};
 
 use anyhow::{Context, Result};
