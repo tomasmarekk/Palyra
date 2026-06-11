@@ -1,3 +1,14 @@
+//! Tool-runtime executor for the routines tools.
+//!
+//! Implements `palyra.routines.query` (list/get/list_runs/wait_terminal/
+//! schedule_preview) and `palyra.routines.control`
+//! (upsert/pause/resume/delete/run_now/test_run). A routine is persisted in
+//! two halves that must stay in sync: the backing cron job (scheduler state)
+//! and the routine metadata registry (trigger, execution, delivery, and
+//! approval policy). Every operation is owner-scoped, and dispatch enforces
+//! approval gates, trigger dedupe, cooldowns, and quiet hours before a run
+//! reaches the cron trigger path.
+
 use std::{
     collections::HashMap,
     path::{Component, Path, PathBuf},
@@ -57,6 +68,11 @@ const ROUTINE_WAIT_RUN_LIMIT: usize = 100;
 const DEFAULT_ROUTINE_RETRY_MAX_ATTEMPTS: u32 = 2;
 const DEFAULT_ROUTINE_RETRY_BACKOFF_MS: u64 = 1_000;
 
+/// Executes one `palyra.routines.query` or `palyra.routines.control` call.
+///
+/// Never fails at the tool boundary: input-size violations, parse errors,
+/// and runtime failures are folded into an unsuccessful
+/// [`ToolExecutionOutcome`] carrying a sanitized error string.
 pub(crate) async fn execute_routines_tool(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -147,6 +163,8 @@ pub(crate) async fn execute_routines_tool(
     }
 }
 
+/// Owned copy of the borrowed execution context so the async operation
+/// handlers do not hold tool-runtime borrows across awaits.
 #[derive(Debug, Clone)]
 struct RoutinesToolContext {
     principal: String,
@@ -155,12 +173,15 @@ struct RoutinesToolContext {
     run_id: String,
 }
 
+/// A routine's two persistence halves: the scheduler-facing cron job and the
+/// registry metadata.
 #[derive(Debug, Clone)]
 struct RoutineParts {
     job: CronJobRecord,
     metadata: RoutineMetadataRecord,
 }
 
+/// Resolved cron-job fields for create-or-update of a routine's backing job.
 #[derive(Debug, Clone)]
 struct RoutineJobUpsert {
     routine_id: String,
@@ -181,6 +202,8 @@ struct RoutineJobUpsert {
     next_run_at_unix_ms: Option<i64>,
 }
 
+/// Resolved schedule for an upsert; `trigger_payload_json_override` is set
+/// when schedule resolution also normalizes the trigger payload (file_watch).
 #[derive(Debug, Clone)]
 struct ScheduleResolution {
     schedule_type: crate::journal::CronScheduleType,
@@ -189,6 +212,7 @@ struct ScheduleResolution {
     trigger_payload_json_override: Option<String>,
 }
 
+/// Parameters for dispatching one routine run (manual, test, or replay).
 #[derive(Debug, Clone)]
 struct RoutineDispatchRequest {
     trigger_kind: RoutineTriggerKind,
@@ -204,6 +228,8 @@ struct RoutineDispatchRequest {
     bypass_operator_gates: bool,
 }
 
+/// Parameters for recording a run that terminates at a gate without ever
+/// executing (skipped, throttled, or denied).
 struct TerminalRoutineRunRequest<'a> {
     routine_id: &'a str,
     trigger_kind: RoutineTriggerKind,
@@ -403,6 +429,9 @@ async fn wait_for_terminal_routine(
     payload: &Map<String, Value>,
 ) -> Result<Value, String> {
     let routine_id = required_string_field(payload, "routine_id")?;
+    // The clamps bound a single wait_terminal call (MAX_ROUTINE_WAIT_TIMEOUT_MS
+    // total, MIN_ROUTINE_WAIT_POLL_INTERVAL_MS between journal reads) so a
+    // tool call can neither hang its parent run nor hot-poll the journal.
     let timeout_ms =
         optional_u64_field(payload, "timeout_ms")?.unwrap_or(DEFAULT_ROUTINE_WAIT_TIMEOUT_MS);
     let timeout_ms = timeout_ms.clamp(1, MAX_ROUTINE_WAIT_TIMEOUT_MS);
@@ -457,6 +486,11 @@ async fn observe_routine_wait_state(
         context.principal.as_str(),
     )
     .await?;
+    // AIDEV-NOTE: list_cron_runs pages ascending by run id, so this window is
+    // the OLDEST ROUTINE_WAIT_RUN_LIMIT runs; a routine with more runs can
+    // mis-count active/succeeded state here (has_more_runs surfaces the
+    // truncation). Reading the newest window instead is a behavior change
+    // left for a dedicated fix.
     let (runs, next_after_run_id) = runtime_state
         .list_cron_runs(Some(routine.job.job_id.clone()), None, Some(ROUTINE_WAIT_RUN_LIMIT))
         .await
@@ -546,6 +580,8 @@ fn routine_wait_summary(
     })
 }
 
+/// A routine is terminal when nothing can run anymore: no active runs, no
+/// queued run, disabled, and no future fire time.
 fn routine_job_is_terminal(job: &CronJobRecord, active_runs: u32) -> bool {
     active_runs == 0
         && !job.queued_run
@@ -579,6 +615,9 @@ async fn upsert_routine(
     context: &RoutinesToolContext,
     payload: &Map<String, Value>,
 ) -> Result<Value, String> {
+    // Upsert is a partial update: fields absent from the payload preserve the
+    // stored value for an existing routine. The *_was_requested flags
+    // distinguish "omitted" (preserve) from "explicitly cleared".
     let requested_routine_id = optional_string_field(payload, "routine_id");
     let routine_id_was_requested = requested_routine_id.is_some();
     let routine_id = match requested_routine_id {
@@ -740,6 +779,9 @@ async fn upsert_routine(
                 execution_posture_was_requested,
             );
             if trigger_kind == RoutineTriggerKind::FileWatch {
+                // File-watch routines run on a synthesized poll schedule that
+                // would always look high-frequency to the schedule-shaped
+                // auto-enable guard, so the guard is skipped for them.
                 approval_policy
             } else {
                 routine_approval_policy_with_auto_enable_guard(
@@ -758,6 +800,9 @@ async fn upsert_routine(
     )?;
     let misfire_policy =
         parse_misfire_policy(optional_string_field(payload, "misfire_policy").as_deref())?;
+    // A before_enable routine is persisted disabled until its approval is
+    // granted; the pending approval record is created below and returned to
+    // the caller alongside the routine view.
     let approval_required = enabled
         && approval_policy.mode == RoutineApprovalMode::BeforeEnable
         && !routine_approval_granted(
@@ -790,6 +835,9 @@ async fn upsert_routine(
     .await?;
     runtime.scheduler_wake.notify_one();
 
+    // Trigger payload precedence: schedule-resolution override (file_watch
+    // normalization) > payload derived from the schedule itself > preserved
+    // existing payload on partial update > caller-provided payload.
     let trigger_payload_json = if let Some(trigger_payload_json) =
         schedule.trigger_payload_json_override
     {
@@ -1101,6 +1149,10 @@ async fn dispatch_single_routine(
     let delivery =
         request.delivery_override.clone().unwrap_or_else(|| routine.metadata.delivery.clone());
 
+    // Gate order: disabled routines short-circuit, before_first_run approval
+    // fails closed, then operator throttles (trigger-kind match, dedupe,
+    // cooldown, quiet hours) apply unless this is a sanctioned bypass
+    // (test_run/replay, which force fresh-session, audit-only delivery).
     if !routine.job.enabled {
         return register_terminal_routine_run(
             runtime_state,
@@ -1219,6 +1271,10 @@ async fn dispatch_single_routine(
                 .map_err(map_registry_error)?
                 .into_iter()
                 .last();
+            // AIDEV-NOTE: `cooldown_ms as i64` wraps for values above
+            // i64::MAX and the addition can overflow in debug builds on a
+            // hostile cooldown value (tool input is model-controlled); a
+            // saturating fix is a behavior change left for a dedicated pass.
             if latest.as_ref().is_some_and(|entry| {
                 entry.created_at_unix_ms + routine.metadata.cooldown_ms as i64 > now_unix_ms
             }) {
@@ -1330,6 +1386,9 @@ async fn dispatch_single_routine(
     }))
 }
 
+/// Records a gate-terminated run as a started-and-finalized cron run plus
+/// registry metadata, so the skip/throttle/denial is auditable even though
+/// the routine never dispatched.
 async fn register_terminal_routine_run(
     runtime_state: &Arc<GatewayRuntimeState>,
     registry: &Arc<RoutineRegistry>,
@@ -1427,6 +1486,8 @@ async fn routine_views_for_principal(
     Ok(routines)
 }
 
+/// Fails an id-less upsert that would silently create a second active
+/// routine with the same name and trigger kind as an existing one.
 async fn reject_ambiguous_active_routine_create(
     runtime_state: &Arc<GatewayRuntimeState>,
     registry: &Arc<RoutineRegistry>,
@@ -1584,6 +1645,9 @@ async fn persist_routine_job(
     }
 }
 
+/// Reconciles registry metadata with the cron job table before reads so
+/// schedule jobs created or removed outside these tools still surface as
+/// routines.
 async fn synchronize_schedule_routines(
     runtime_state: &Arc<GatewayRuntimeState>,
     registry: &Arc<RoutineRegistry>,
@@ -1622,6 +1686,11 @@ async fn enrich_routine_view_with_latest_run(
     routine_id: &str,
     job_id: &str,
 ) -> Result<Value, String> {
+    // AIDEV-NOTE: list_cron_runs pages ascending by run id, so this window of
+    // 10 is the OLDEST runs; once a routine exceeds 10 runs, "last_run" and
+    // the troubleshooting counts describe stale history. Fixing it (descending
+    // order or paging to the final page) is a behavior change left for a
+    // dedicated fix.
     let (runs, _) = runtime_state
         .list_cron_runs(Some(job_id.to_owned()), None, Some(10))
         .await
@@ -1723,6 +1792,8 @@ fn routine_approval_subject_id(routine_id: &str, mode: RoutineApprovalMode) -> S
     format!("routine:{routine_id}:{}", mode.as_str())
 }
 
+/// Returns whether an Allow decision has been recorded for the approval
+/// subject.
 async fn routine_approval_granted(
     runtime_state: &Arc<GatewayRuntimeState>,
     subject_id: String,
@@ -1745,6 +1816,8 @@ async fn routine_approval_granted(
         .any(|approval| matches!(approval.decision, Some(ApprovalDecision::Allow))))
 }
 
+/// Returns the existing pending approval for the routine subject, or creates
+/// a new approval request and returns its record.
 async fn ensure_routine_approval_requested(
     runtime_state: &Arc<GatewayRuntimeState>,
     principal: &str,
@@ -1866,6 +1939,9 @@ fn resolve_routine_schedule(
     let schedule_timezone =
         parse_routine_timezone(optional_string_field(payload, "timezone"), timezone_mode)?;
     let max_runs = optional_u32_field(payload, "max_runs")?;
+    // A partial update that touches no schedule field keeps the stored
+    // schedule verbatim (including the next fire time); only max_runs may be
+    // layered on top.
     if preserve_existing_schedule
         && !payload_has_any(
             payload,
@@ -1923,6 +1999,9 @@ fn resolve_routine_schedule(
             trigger_payload_json_override: Some(trigger_payload_json),
         });
     }
+    // Non-schedule triggers (hook/webhook/system_event/manual) still need a
+    // backing cron job; a shadow one-shot schedule with no fire time keeps
+    // the scheduler from ever firing it.
     if trigger_kind != RoutineTriggerKind::Schedule {
         return Ok(ScheduleResolution {
             schedule_type: crate::journal::CronScheduleType::At,
@@ -2144,6 +2223,8 @@ fn output_delivered_for_outcome(
     !matches!(effective_mode, RoutineDeliveryMode::LocalOnly | RoutineDeliveryMode::LogsOnly)
 }
 
+/// Operator intent for how visible successful runs should be; steers
+/// [`normalize_delivery_for_success_visibility`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RoutineSuccessVisibility {
     Announce,
@@ -2151,6 +2232,10 @@ enum RoutineSuccessVisibility {
     AuditOnly,
 }
 
+/// Applies the success-visibility default: a routine whose successes would be
+/// invisible (local_only/logs_only mode or audit_only silence) is upgraded to
+/// same_channel + noisy delivery, unless the caller explicitly requested a
+/// delivery mode or opted into artifact/audit-only visibility.
 fn normalize_delivery_for_success_visibility(
     mut delivery: RoutineDeliveryConfig,
     success_visibility: Option<RoutineSuccessVisibility>,
@@ -2185,6 +2270,8 @@ fn normalize_delivery_for_success_visibility(
         return delivery;
     }
 
+    // Reaching here means success output would be silently dropped without
+    // an explicit opt-in: upgrade to user-visible delivery.
     if matches!(delivery.mode, RoutineDeliveryMode::LocalOnly | RoutineDeliveryMode::LogsOnly) {
         delivery.mode = RoutineDeliveryMode::SameChannel;
         delivery.channel = None;
@@ -2414,6 +2501,9 @@ fn parse_approval_policy(value: Option<&str>) -> Result<RoutineApprovalPolicy, S
     Ok(RoutineApprovalPolicy { mode })
 }
 
+// INTENTIONAL: a pass-through today. Tests pin that sensitive-tools posture
+// alone must not force an approval mode; the unused parameters keep the seam
+// where a posture-aware default would plug in.
 fn default_approval_policy_for_execution(
     _execution: &RoutineExecutionConfig,
     approval_policy: RoutineApprovalPolicy,
@@ -2458,6 +2548,10 @@ fn normalize_optional_workdir(value: Option<String>) -> Result<Option<String>, S
     Ok(Some(workdir))
 }
 
+/// Resolves the effective workdir: an explicit request wins (including an
+/// explicit clear), an existing job keeps its stored value when the field is
+/// omitted, and a brand-new schedule routine inherits the launch workspace
+/// root so scheduled runs start where the operator launched.
 fn resolve_routine_workdir_from_launch_context(
     trigger_kind: RoutineTriggerKind,
     existing_job_was_present: bool,
@@ -2512,6 +2606,9 @@ fn resolve_requested_routine_workdir(
     Ok(workdir)
 }
 
+/// Detects the `/workspace` alias. Returns `None` when the input is not an
+/// alias, `Some(None)` for the bare alias, and `Some(Some(suffix))` for a
+/// child path under the alias.
 fn workspace_alias_relative_suffix(workdir: &str) -> Option<Option<String>> {
     let normalized = workdir.trim().replace('\\', "/");
     let trimmed = normalized.trim_end_matches('/');
@@ -2535,6 +2632,9 @@ fn should_resolve_relative_workdir_against_launch_root(workdir: &str) -> bool {
     path.components().all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
 }
 
+// Drive-letter ("C:\" or "C:/") and UNC ("\\server", "//server") forms must
+// be detected textually: on non-Windows hosts Path::is_absolute does not
+// recognize them, yet they must never resolve against the launch root.
 fn looks_like_windows_absolute_path(workdir: &str) -> bool {
     let trimmed = workdir.trim();
     let bytes = trimmed.as_bytes();
@@ -2555,6 +2655,12 @@ fn resolve_workdir_under_launch_root(
     let target = relative
         .filter(|value| !value.is_empty())
         .map_or_else(|| launch_root.to_path_buf(), |relative| launch_root.join(relative));
+    // AIDEV-NOTE: blocking std::fs::canonicalize on the async tool path
+    // (mirrors the same trade-off in memory.rs). One metadata syscall is
+    // normally cheap, but on network filesystems it can stall a runtime
+    // worker; moving it to spawn_blocking is a behavior change left undone.
+    // Canonicalization is also the symlink/.. escape check below, so it must
+    // stay before the starts_with containment test.
     let canonical = std::fs::canonicalize(target.as_path()).map_err(|error| {
         format!(
             "workdir {} does not resolve inside the launch workspace: {error}",
@@ -2578,6 +2684,8 @@ fn routine_path_starts_with(path: &Path, root: &Path) -> bool {
     if path.starts_with(root) {
         return true;
     }
+    // Windows canonical paths can differ in separators and drive-letter case,
+    // so fall back to a case-insensitive, separator-normalized comparison.
     #[cfg(windows)]
     {
         let path = path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
@@ -2623,6 +2731,8 @@ fn is_in_quiet_hours(
     };
     let start = quiet_hours.start_minute_of_day;
     let end = quiet_hours.end_minute_of_day;
+    // start == end covers the whole day; start > end wraps past midnight
+    // (e.g. 22:00-06:00).
     Ok(if start == end {
         true
     } else if start < end {
@@ -2683,6 +2793,8 @@ fn optional_u64_field(payload: &Map<String, Value>, key: &str) -> Result<Option<
 }
 
 fn optional_usize_field(payload: &Map<String, Value>, key: &str) -> Result<Option<usize>, String> {
+    // `value as usize` truncates u64 on 32-bit targets; callers clamp the
+    // result to small page limits, so the truncation is harmless.
     optional_u64_field(payload, key).map(|value| value.map(|value| value as usize))
 }
 
@@ -2729,6 +2841,8 @@ fn routines_tool_execution_outcome(
     error: String,
 ) -> ToolExecutionOutcome {
     let executed_at_unix_ms = current_unix_ms();
+    // Each field is length-prefixed before hashing so adjacent fields cannot
+    // be reinterpreted across boundaries in the attestation digest.
     let mut hasher = Sha256::new();
     hasher.update(b"palyra.routines.attestation.v1");
     hasher.update((proposal_id.len() as u64).to_be_bytes());

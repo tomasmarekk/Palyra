@@ -1,3 +1,11 @@
+//! Nested tool-call RPC bridge for tool programs.
+//!
+//! Executes a single grant-checked child tool call on behalf of a running
+//! tool program (`tool_program.rs`), re-running the full proposal security
+//! evaluation per call so a program cannot escalate past its parent proposal.
+//! Also ships the stdio-JSONL Python SDK source and the bridge context handed
+//! to sandboxed program code.
+
 use std::{collections::BTreeMap, collections::BTreeSet, sync::Arc, time::Duration};
 
 use palyra_common::redaction::{redact_auth_error, redact_url_segments_in_text};
@@ -20,8 +28,11 @@ use crate::{
     transport::grpc::auth::RequestContext,
 };
 
+/// Wire schema version for tool RPC requests and responses; any mismatch
+/// fails closed in [`execute_granted_tool_rpc_call`].
 pub(crate) const TOOL_RPC_SCHEMA_VERSION: u32 = 1;
 
+/// One child tool call requested by a tool program step or bridge client.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct ToolRpcRequest {
     pub schema_version: u32,
@@ -37,6 +48,8 @@ pub(crate) struct ToolRpcRequest {
     pub result_projection: ToolRpcResultProjection,
 }
 
+/// Caller-declared scopes and artifact references attached to a call; sizes
+/// are bounded by [`execute_granted_tool_rpc_call`] validation.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub(crate) struct ToolRpcScope {
     #[serde(default)]
@@ -45,6 +58,8 @@ pub(crate) struct ToolRpcScope {
     pub allowed_artifact_refs: Vec<String>,
 }
 
+/// How much of the child tool output becomes model-visible: the full parsed
+/// output, a redacted summary, or only an artifact requirement marker.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ToolRpcResultProjection {
@@ -54,6 +69,7 @@ pub(crate) enum ToolRpcResultProjection {
     ArtifactOnly,
 }
 
+/// Terminal status of a tool RPC call.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ToolRpcStatus {
@@ -63,6 +79,8 @@ pub(crate) enum ToolRpcStatus {
     TimedOut,
 }
 
+/// Result envelope returned to the program for one tool RPC call; denials and
+/// failures are encoded in `status`/`error` rather than as transport errors.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ToolRpcResponse {
     pub schema_version: u32,
@@ -78,6 +96,7 @@ pub(crate) struct ToolRpcResponse {
     pub attestation: Option<ToolRpcAttestation>,
 }
 
+/// Serializable projection of a child tool execution attestation.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ToolRpcAttestation {
     pub attestation_id: String,
@@ -101,6 +120,8 @@ impl From<&ToolAttestation> for ToolRpcAttestation {
     }
 }
 
+/// Connection metadata handed to sandboxed Python program code: the IPC
+/// shape, the scoped tool grant list, and non-secret environment variables.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct PythonToolRpcBridgeContext {
     pub schema_version: u32,
@@ -111,6 +132,13 @@ pub(crate) struct PythonToolRpcBridgeContext {
     pub environment: BTreeMap<String, String>,
 }
 
+/// Executes one grant-checked child tool call on behalf of a tool program.
+///
+/// Validates the request envelope, requires `tool_name` to be in the program
+/// grant set, then re-runs the full proposal security evaluation under a
+/// derived child proposal id before dispatching. Never returns a transport
+/// error: every denial, failure, and timeout is folded into the returned
+/// [`ToolRpcResponse`].
 pub(crate) async fn execute_granted_tool_rpc_call(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -141,6 +169,8 @@ pub(crate) async fn execute_granted_tool_rpc_call(
         }
     };
 
+    // Deriving the child proposal id from the parent keeps journal entries
+    // and attestations for nested calls correlated to the outer proposal.
     let child_proposal_id = format!("{parent_proposal_id}:{}", request.call_id);
     let request_context = RequestContext {
         principal: context.principal.to_owned(),
@@ -184,6 +214,9 @@ pub(crate) async fn execute_granted_tool_rpc_call(
         });
     let child_tool_requires_approval =
         tool_protocol::tool_requires_approval(request.tool_name.as_str());
+    // A nested call has no operator to prompt, so anything approval-shaped
+    // (proposal gate, tool metadata, or resolved decision) fails closed here
+    // instead of suspending the program.
     if proposal_approval_required || child_tool_requires_approval || decision.approval_required {
         let denial_reason =
             nested_approval_denial_reason(request.tool_name.as_str(), decision.reason.as_str());
@@ -199,6 +232,8 @@ pub(crate) async fn execute_granted_tool_rpc_call(
         backend_reason_code: backend_selection.resolution.reason_code.as_str(),
         ..context
     };
+    // Box::pin breaks the otherwise infinitely sized recursive future:
+    // dispatch can re-enter tool programs, which re-enter this function.
     let execution = Box::pin(execute_tool_with_runtime_dispatch(
         runtime_state,
         child_context,
@@ -249,12 +284,16 @@ pub(crate) async fn execute_granted_tool_rpc_call(
     }
 }
 
+/// Runs `resolve` against the shared remaining tool budget, or against a
+/// local fallback counter when the caller did not thread a shared budget.
 fn with_tool_rpc_budget<T>(
     remaining_tool_budget: Option<&SharedToolBudget>,
     fallback_budget: u32,
     resolve: impl FnOnce(&mut u32) -> T,
 ) -> T {
     if let Some(remaining_tool_budget) = remaining_tool_budget {
+        // A poisoned lock only means another worker panicked mid-update; the
+        // budget counter itself stays valid, so recover rather than panic.
         let mut guard =
             remaining_tool_budget.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         return resolve(&mut guard);
@@ -264,6 +303,8 @@ fn with_tool_rpc_budget<T>(
     resolve(&mut local_budget)
 }
 
+/// Returns the embedded Python SDK source for the stdio-JSONL tool RPC
+/// bridge, shipped verbatim into sandboxed program workspaces.
 pub(crate) fn python_tool_rpc_sdk_source() -> &'static str {
     r#"import json
 import sys
@@ -300,6 +341,8 @@ class ToolRpcClient:
 "#
 }
 
+/// Builds the non-secret bridge context (IPC shape, scoped grant list, and
+/// bridge environment variables) surfaced to sandboxed Python program code.
 pub(crate) fn build_python_tool_rpc_bridge_context(
     job_id: &str,
     program_id: &str,

@@ -1,3 +1,11 @@
+//! Tool-runtime executor for the scoped delegation tools.
+//!
+//! Implements `palyra.delegation.query` (list/status/merge_preview) and
+//! `palyra.delegation.control` (delegate/interrupt) on top of orchestrator
+//! background tasks. Dispatched from the gateway tool runtime
+//! (`gateway::execute_tool_with_runtime_dispatch`); every free-text field is
+//! redacted before it becomes model-visible output.
+
 use std::sync::Arc;
 
 use palyra_common::{
@@ -31,6 +39,8 @@ const DELEGATION_TOOL_EXECUTOR: &str = "delegation_runtime";
 const DELEGATION_TOOL_SANDBOX: &str = "delegation_scope";
 const MAX_DELEGATION_TOOL_TASKS: usize = 256;
 
+/// Combined input shape for both delegation tools; each operation reads only
+/// the fields it needs and ignores the rest.
 #[derive(Debug, Deserialize)]
 struct DelegationToolInput {
     operation: String,
@@ -88,6 +98,11 @@ struct DelegationToolInput {
     include_completed: Option<bool>,
 }
 
+/// Executes one `palyra.delegation.query` or `palyra.delegation.control` call.
+///
+/// Never fails at the call boundary: invalid input and runtime errors are
+/// folded into an unsuccessful [`ToolExecutionOutcome`] whose output carries
+/// a redacted `error` field.
 pub(crate) async fn execute_delegation_tool(
     runtime: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -148,6 +163,11 @@ async fn create_delegation(
 ) -> Result<Value, Status> {
     let objective = normalize_required(input.objective.as_deref(), "objective")?;
     let parent_run_id = context.run_id.to_owned();
+    // The delegation resolver enforces per-child budget-share limits against
+    // the parent budget, but tool input does not carry the real parent
+    // budget. Synthesize one: double the requested child budget (keeps the
+    // child's share at 50%), falling back to the objective's estimated token
+    // count when no budget was requested.
     let parent_budget_tokens = input
         .budget_tokens
         .map(|budget| budget.saturating_mul(2).max(1))
@@ -320,6 +340,9 @@ async fn interrupt_delegation(
     } else {
         None
     };
+    // The orchestrator cancel only reaches tasks with a live child run; tasks
+    // that never started or are parked in a non-running state are finalized
+    // directly so the background queue cannot pick them up later.
     if child_run_id.is_none()
         || matches!(
             AuxiliaryTaskState::from_str(task.state.as_str()),
@@ -344,7 +367,9 @@ async fn interrupt_delegation(
     Ok(json!({
         "schema_version": 1,
         "operation": "interrupt",
-        "cancel_requested": cancel.as_ref().map(|value| value.cancel_requested).unwrap_or(true),
+        // Without a child run the task was finalized directly above, so the
+        // interrupt is reported as effective.
+        "cancel_requested": cancel.as_ref().is_none_or(|value| value.cancel_requested),
         "reason": safe_text(reason.as_str()),
         "task": refreshed.as_ref().map(task_safe_json).unwrap_or_else(|| task_safe_json(&task)),
         "child_run": cancel.map(|value| json!({
@@ -372,6 +397,8 @@ async fn scoped_delegation_tasks(
             limit: MAX_DELEGATION_TOOL_TASKS,
         })
         .await?;
+    // The background-task store holds every auxiliary task kind; only
+    // delegation-backed tasks are visible through these tools.
     Ok(tasks.into_iter().filter(|task| task.delegation.is_some()).collect())
 }
 
@@ -394,6 +421,8 @@ async fn find_scoped_delegation_task(
         .ok_or_else(|| Status::not_found("delegated task not found in scoped runtime"))
 }
 
+/// Projects a background task into the model-visible shape: allowlisted
+/// fields only, with free-text fields passed through redaction.
 fn task_safe_json(task: &OrchestratorBackgroundTaskRecord) -> Value {
     let delegation = task.delegation.as_ref().map(|snapshot| {
         json!({
@@ -434,6 +463,8 @@ fn task_safe_json(task: &OrchestratorBackgroundTaskRecord) -> Value {
     })
 }
 
+/// Projects a child run snapshot into the model-visible shape with redacted
+/// free-text fields.
 fn run_safe_json(run: &crate::journal::OrchestratorRunStatusSnapshot) -> Value {
     json!({
         "run_id": run.run_id,
@@ -454,6 +485,8 @@ fn task_merge_preview(
     run: Option<&crate::journal::OrchestratorRunStatusSnapshot>,
 ) -> Value {
     let result_json = task.result_json.as_deref().and_then(parse_json_object);
+    // Prefer the live run snapshot; fall back to the archived task result for
+    // runs whose orchestrator state has already been pruned.
     let merge_result = run
         .and_then(|snapshot| snapshot.merge_result.as_ref())
         .and_then(|merge| serde_json::to_value(merge).ok())
@@ -506,6 +539,7 @@ fn normalize_optional(value: Option<&str>) -> Option<String> {
     value.map(str::trim).filter(|value| !value.is_empty()).map(ToOwned::to_owned)
 }
 
+/// Applies the model-visible redaction chain to free-form text.
 fn safe_text(value: &str) -> String {
     redact_url_segments_in_text(&redact_auth_error(value))
 }

@@ -1,3 +1,13 @@
+//! Declarative tool-program runtime for `palyra.tool_program.run`.
+//!
+//! Validates a program (bounded steps, explicit tool grants, DAG
+//! dependencies), then executes it level by level: every step becomes a
+//! grant-checked tool RPC call (`tool_rpc.rs`) under shared budgets for
+//! steps, runtime, child runs, nested approvals, and output bytes. Oversized
+//! step outputs are spilled to tool-result artifacts so only a redacted
+//! summary stays model-visible. Progress is journaled as a durable tool job
+//! with per-step tail entries.
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -45,6 +55,8 @@ const MAX_PROGRAM_ID_BYTES: usize = 128;
 const MAX_STEP_ID_BYTES: usize = 128;
 const MAX_TOOL_PROGRAM_STEPS: usize = 32;
 
+/// Top-level `palyra.tool_program.run` input: grants, budgets, safety
+/// switches, and the declarative step list.
 #[derive(Debug, Clone, Deserialize)]
 struct ToolProgramRunRequest {
     schema_version: u32,
@@ -58,6 +70,8 @@ struct ToolProgramRunRequest {
     steps: Vec<ToolProgramStep>,
 }
 
+/// One declarative step: a granted tool call plus its dependency, budget,
+/// and parallelism constraints.
 #[derive(Debug, Clone, Deserialize)]
 struct ToolProgramStep {
     step_id: String,
@@ -133,6 +147,10 @@ impl ToolParallelism {
     }
 }
 
+// AIDEV-NOTE: retry_policy is validated (positive max_attempts, retries
+// require an idempotency_key) but not yet enforced: execute_program_step
+// runs each step exactly once regardless of max_attempts. Enforcing it is a
+// behavior change left for a dedicated fix.
 #[derive(Debug, Clone, Deserialize)]
 struct ToolProgramStepRetryPolicy {
     #[serde(default = "default_retry_max_attempts")]
@@ -147,6 +165,8 @@ impl Default for ToolProgramStepRetryPolicy {
     }
 }
 
+/// Fail-closed safety switches; defaults deny nested programs and stop on
+/// the first failed step.
 #[derive(Debug, Clone, Deserialize)]
 struct ToolProgramSafetyPolicy {
     #[serde(default = "default_true")]
@@ -236,6 +256,11 @@ struct ToolProgramBudgetReport {
     saved_model_visible_bytes: u64,
 }
 
+/// Executes one `palyra.tool_program.run` proposal.
+///
+/// Never fails at the tool boundary: parse/validation errors and runtime
+/// failures are folded into an unsuccessful [`ToolExecutionOutcome`] whose
+/// output JSON carries the error string.
 pub(crate) async fn execute_tool_program_run_tool(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -299,6 +324,11 @@ async fn execute_validated_program(
         build_python_tool_rpc_bridge_context(proposal_id, request.program_id.as_str(), &grants);
     let python_sdk_bytes = python_tool_rpc_sdk_source().len();
     let job_id = Ulid::new().to_string();
+    // AIDEV-NOTE: every early `?` exit below this point (registry failures,
+    // cancellation-check errors, step serialization/artifact errors) returns
+    // before the transition_tool_job call at the end, leaving the durable
+    // tool job parked in Running. Transitioning the job on those error paths
+    // is a behavior change left for a dedicated fix.
     runtime_state
         .create_tool_job(ToolJobCreateRequest {
             job_id: job_id.clone(),
@@ -330,7 +360,7 @@ async fn execute_validated_program(
         owner: context.run_id.to_owned(),
         purpose: "palyra.tool_program.run".to_owned(),
         started_at_unix_ms: current_unix_ms(),
-        cancellation_handle: format!("cancel:{}", proposal_id),
+        cancellation_handle: format!("cancel:{proposal_id}"),
         cleanup_policy: cleanup_policy.clone(),
         state: RuntimeProcessState::Running,
     })?;
@@ -387,6 +417,9 @@ async fn execute_validated_program(
             })?;
         }
 
+        // Budget deltas are applied only after the whole level resolves, so
+        // every step in a level (parallel or sequential) sees the budget as
+        // of level start; siblings cannot observe each other's spending.
         let step_executions = if parallel {
             let budget_snapshot = budget.clone();
             let futures = level.iter().map(|step_index| {
@@ -593,6 +626,9 @@ async fn execute_program_step(
     if rpc_response.approval_required {
         budget_delta.nested_approval_requests += 1;
     }
+    // The approval budget is checked against the pre-level snapshot plus this
+    // step's own delta; with the default max_nested_approvals=0 any
+    // approval-shaped child call is rejected outright.
     if request.safety_policy.deny_sensitive_tools_without_approval
         && budget_snapshot
             .nested_approval_requests
@@ -632,6 +668,9 @@ async fn execute_program_step(
         .max_output_bytes
         .unwrap_or(request.budgets.max_step_output_bytes)
         .min(request.budgets.max_total_output_bytes);
+    // Oversized output is spilled to an artifact: the step keeps its success
+    // flag, but only a redacted summary plus the artifact reference stays
+    // model-visible.
     if output_json.len() > max_output_bytes {
         let artifact =
             create_step_artifact(runtime_state, context, proposal_id, step, output_json.as_slice())
@@ -668,6 +707,9 @@ async fn execute_program_step(
             status: match rpc_response.status {
                 ToolRpcStatus::Completed => ToolProgramStepStatus::Completed,
                 ToolRpcStatus::Denied => ToolProgramStepStatus::Denied,
+                // A timed-out child call was dropped mid-flight by its
+                // deadline, so it surfaces as a cancelled step rather than a
+                // tool failure.
                 ToolRpcStatus::TimedOut => ToolProgramStepStatus::Cancelled,
                 ToolRpcStatus::Failed => ToolProgramStepStatus::Failed,
             },
@@ -751,9 +793,14 @@ fn granted_tool_set(request: &ToolProgramRunRequest) -> Result<BTreeSet<String>,
     Ok(grants)
 }
 
+/// Builds the level-ordered execution plan: Kahn's topological sort where
+/// each level holds the steps whose dependencies are fully satisfied by
+/// earlier levels.
 fn build_execution_plan(request: &ToolProgramRunRequest) -> Result<Vec<Vec<usize>>, String> {
     let mut id_to_index = BTreeMap::new();
     for (index, step) in request.steps.iter().enumerate() {
+        // Dependency ids resolve case-insensitively, mirroring the
+        // duplicate-id check in validate_request.
         id_to_index.insert(step.step_id.to_ascii_lowercase(), index);
     }
 
@@ -773,6 +820,8 @@ fn build_execution_plan(request: &ToolProgramRunRequest) -> Result<Vec<Vec<usize
         }
     }
 
+    // BTreeSet keeps the within-level ordering deterministic, which stable
+    // plan fixtures and tests rely on.
     let mut ready = incoming
         .iter()
         .enumerate()
@@ -795,6 +844,7 @@ fn build_execution_plan(request: &ToolProgramRunRequest) -> Result<Vec<Vec<usize
         levels.push(level);
     }
 
+    // Any node left unvisited by the sort can only sit on a dependency cycle.
     if visited != request.steps.len() {
         return Err("tool program dependency graph contains a cycle".to_owned());
     }
@@ -820,6 +870,8 @@ fn level_has_path_conflicts(steps: &[ToolProgramStep], level: &[usize]) -> bool 
 }
 
 fn step_paths_conflict(left: &ToolProgramStep, right: &ToolProgramStep) -> bool {
+    // An empty scope means the step declared no paths (non-path_scoped
+    // parallelism modes); such steps never path-conflict.
     if left.path_scope.is_empty() || right.path_scope.is_empty() {
         return false;
     }
@@ -831,6 +883,8 @@ fn step_paths_conflict(left: &ToolProgramStep, right: &ToolProgramStep) -> bool 
     })
 }
 
+// Two scopes conflict when they are equal or one is a directory prefix of
+// the other ("src" vs "src/app"); sibling paths stay parallel-safe.
 fn paths_conflict(left: &str, right: &str) -> bool {
     let left = left.trim_matches('/');
     let right = right.trim_matches('/');
@@ -1064,6 +1118,7 @@ fn truncate_utf8(raw: &str, max_bytes: usize) -> String {
 }
 
 fn elapsed_millis(started_at: Instant) -> u64 {
+    // Clamped to u64::MAX first, so the narrowing cast cannot truncate.
     started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
 
