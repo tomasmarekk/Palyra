@@ -268,8 +268,9 @@ fn parse_quoted_value(input: &str, quote_start: usize) -> Result<(String, usize)
                 if cursor >= bytes.len() {
                     return Err(cursor);
                 }
-                // AIDEV-NOTE: escaping a multi-byte UTF-8 char (e.g. `\é`) pushes only its
-                // lead byte as a Latin-1 char and advances the cursor mid-character; the
+                // AIDEV-NOTE: escaping a multi-byte UTF-8 char (a backslash followed by
+                // any non-ASCII char) pushes only its lead byte as a Latin-1 char and
+                // advances the cursor mid-character; the
                 // next iteration then slices `input[cursor..]` off a char boundary and
                 // panics. Fixing requires changing observable behavior for such inputs,
                 // so it is left as-is and only documented here.
