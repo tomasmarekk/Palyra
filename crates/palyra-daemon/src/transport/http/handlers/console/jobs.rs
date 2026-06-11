@@ -1,3 +1,15 @@
+//! Console HTTP handlers for long-running tool jobs (`/console/v1/jobs*`):
+//! list, get, tail, lifecycle transitions (cancel/drain/resume), retry,
+//! attach/release, and the sweep/recover maintenance endpoints.
+//!
+//! All access is scoped to the authenticated principal's jobs; every mutation
+//! goes through [`authorize_console_job_mutation`], which requires the
+//! console CSRF token (pinned by a const assertion in the tests module).
+//!
+//! Response JSON shapes are part of the `/console/v1` wire contract consumed
+//! by `apps/web`; field names, status codes, and error strings must stay
+//! byte-identical.
+
 use crate::*;
 use crate::{
     app::state::ConsoleSession,
@@ -11,6 +23,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tonic::Status;
 
+/// Query filters for `GET /console/v1/jobs`; terminal jobs are excluded
+/// unless `include_terminal` is set.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleJobsListQuery {
     pub(crate) limit: Option<usize>,
@@ -19,6 +33,8 @@ pub(crate) struct ConsoleJobsListQuery {
     pub(crate) include_terminal: Option<bool>,
 }
 
+/// Window parameters for `GET /console/v1/jobs/{job_id}/tail`; negative
+/// offsets are clamped to the start of the output.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleJobTailQuery {
     pub(crate) offset: Option<i64>,
@@ -26,18 +42,25 @@ pub(crate) struct ConsoleJobTailQuery {
     pub(crate) max_bytes: Option<usize>,
 }
 
+/// Body for job lifecycle actions (cancel/drain/resume/retry); the reason
+/// defaults to an operation-specific `operator_*` audit tag, and the
+/// idempotency key is honored by retry only.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleJobActionRequest {
     pub(crate) reason: Option<String>,
     pub(crate) idempotency_key: Option<String>,
 }
 
+/// Body for `POST /console/v1/jobs/sweep-expired`; `now_unix_ms` exists so
+/// tests can sweep against a fixed clock.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleJobSweepRequest {
     pub(crate) now_unix_ms: Option<i64>,
     pub(crate) limit: Option<usize>,
 }
 
+/// Body for `POST /console/v1/jobs/recover-stale`; staleness defaults to five
+/// minutes without a heartbeat.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleJobRecoverRequest {
     pub(crate) now_unix_ms: Option<i64>,
@@ -45,8 +68,16 @@ pub(crate) struct ConsoleJobRecoverRequest {
     pub(crate) limit: Option<usize>,
 }
 
+/// Security posture pin: job mutations must always demand the console CSRF
+/// token. A const assertion in the tests module fails the build if this is
+/// ever flipped.
 const REQUIRE_CSRF_FOR_JOB_MUTATION: bool = true;
 
+/// Lists the principal's tool jobs (`GET /console/v1/jobs`).
+///
+/// # Errors
+/// Returns an unauthorized response when console authorization fails, or a
+/// mapped runtime error response when listing fails.
 pub(crate) async fn console_jobs_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -72,6 +103,11 @@ pub(crate) async fn console_jobs_list_handler(
     })))
 }
 
+/// Returns one owned tool job (`GET /console/v1/jobs/{job_id}`).
+///
+/// # Errors
+/// Returns not-found for unknown jobs, permission-denied for jobs owned by
+/// another principal, or a mapped runtime error response.
 pub(crate) async fn console_job_get_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -82,6 +118,13 @@ pub(crate) async fn console_job_get_handler(
     Ok(Json(job_envelope(job)))
 }
 
+/// Reads a byte-bounded window of an owned job's output
+/// (`GET /console/v1/jobs/{job_id}/tail`); ownership is enforced by the
+/// runtime via the `owner_principal` filter.
+///
+/// # Errors
+/// Returns invalid-argument for an empty job id, or a mapped runtime error
+/// response (not-found, permission-denied).
 pub(crate) async fn console_job_tail_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -106,6 +149,12 @@ pub(crate) async fn console_job_tail_handler(
     })))
 }
 
+/// Requests cancellation of an owned job
+/// (`POST /console/v1/jobs/{job_id}/cancel`).
+///
+/// # Errors
+/// Returns unauthorized/CSRF failures, not-found or permission-denied for
+/// missing/foreign jobs, or a mapped runtime transition error response.
 pub(crate) async fn console_job_cancel_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -123,6 +172,12 @@ pub(crate) async fn console_job_cancel_handler(
     .await
 }
 
+/// Requests a graceful drain of an owned job
+/// (`POST /console/v1/jobs/{job_id}/drain`).
+///
+/// # Errors
+/// Returns unauthorized/CSRF failures, not-found or permission-denied for
+/// missing/foreign jobs, or a mapped runtime transition error response.
 pub(crate) async fn console_job_drain_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -140,6 +195,12 @@ pub(crate) async fn console_job_drain_handler(
     .await
 }
 
+/// Requeues an owned job for execution
+/// (`POST /console/v1/jobs/{job_id}/resume`).
+///
+/// # Errors
+/// Returns unauthorized/CSRF failures, not-found or permission-denied for
+/// missing/foreign jobs, or a mapped runtime transition error response.
 pub(crate) async fn console_job_resume_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -157,6 +218,13 @@ pub(crate) async fn console_job_resume_handler(
     .await
 }
 
+/// Retries an owned job, optionally idempotently via `idempotency_key`
+/// (`POST /console/v1/jobs/{job_id}/retry`); ownership is enforced by the
+/// runtime via the `owner_principal` filter.
+///
+/// # Errors
+/// Returns unauthorized/CSRF failures, invalid-argument for an empty job id,
+/// or a mapped runtime error response.
 pub(crate) async fn console_job_retry_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -177,6 +245,12 @@ pub(crate) async fn console_job_retry_handler(
     Ok(Json(job_envelope(job)))
 }
 
+/// Attaches the console to an owned job's output stream
+/// (`POST /console/v1/jobs/{job_id}/attach`).
+///
+/// # Errors
+/// Returns unauthorized/CSRF failures, invalid-argument for an empty job id,
+/// or a mapped runtime error response.
 pub(crate) async fn console_job_attach_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -194,6 +268,13 @@ pub(crate) async fn console_job_attach_handler(
     Ok(Json(job_envelope(job)))
 }
 
+/// Releases a previous attachment on an owned job
+/// (`POST /console/v1/jobs/{job_id}/release`); ownership is checked
+/// explicitly because the release call itself is not owner-filtered.
+///
+/// # Errors
+/// Returns unauthorized/CSRF failures, not-found or permission-denied for
+/// missing/foreign jobs, or a mapped runtime error response.
 pub(crate) async fn console_job_release_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -208,6 +289,11 @@ pub(crate) async fn console_job_release_handler(
     Ok(Json(job_envelope(job)))
 }
 
+/// Sweeps jobs whose leases expired into a terminal state
+/// (`POST /console/v1/jobs/sweep-expired`).
+///
+/// # Errors
+/// Returns unauthorized/CSRF failures or a mapped runtime error response.
 pub(crate) async fn console_jobs_sweep_expired_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -228,6 +314,11 @@ pub(crate) async fn console_jobs_sweep_expired_handler(
     })))
 }
 
+/// Recovers jobs whose heartbeat went stale, requeueing or failing them per
+/// runtime policy (`POST /console/v1/jobs/recover-stale`).
+///
+/// # Errors
+/// Returns unauthorized/CSRF failures or a mapped runtime error response.
 pub(crate) async fn console_jobs_recover_stale_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -249,6 +340,9 @@ pub(crate) async fn console_jobs_recover_stale_handler(
     })))
 }
 
+// Shared body of the cancel/drain/resume handlers: CSRF-authorized session,
+// ownership check, then an unconditional (no expected_state) transition with
+// a fresh heartbeat so the job does not immediately look stale.
 async fn transition_authorized_job(
     state: AppState,
     headers: HeaderMap,
@@ -277,6 +371,8 @@ async fn transition_authorized_job(
     Ok(Json(job_envelope(job)))
 }
 
+// Single chokepoint for job mutations so the CSRF requirement cannot be
+// dropped on one endpoint by accident.
 #[allow(clippy::result_large_err)]
 fn authorize_console_job_mutation(
     state: &AppState,

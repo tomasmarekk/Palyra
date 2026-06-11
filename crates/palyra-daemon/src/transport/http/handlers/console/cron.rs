@@ -1,6 +1,25 @@
+//! Console HTTP handlers for raw cron jobs (`/console/v1/cron/jobs*`): list,
+//! create, enable/disable, run-now, and run history.
+//!
+//! Unlike the routines surface, these handlers operate on bare cron jobs.
+//! Create and run-now are brokered through the gateway `CronServiceImpl` gRPC
+//! service so they share its validation and policy path; the console session
+//! identity is forwarded via [`apply_console_rpc_context`], which other
+//! console handlers also reuse for gateway RPC dispatch.
+//!
+//! Response JSON shapes are part of the `/console/v1` wire contract consumed
+//! by `apps/web`; field names, status codes, and error strings must stay
+//! byte-identical.
+
 use crate::journal::CronJobRecord;
 use crate::*;
 
+/// Lists the principal's cron jobs with cursor pagination
+/// (`GET /console/v1/cron/jobs`).
+///
+/// # Errors
+/// Returns an unauthorized response when console authorization fails, or a
+/// mapped runtime error response when listing fails.
 pub(crate) async fn console_cron_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -8,6 +27,10 @@ pub(crate) async fn console_cron_list_handler(
 ) -> Result<Json<Value>, Response> {
     let session = authorize_console_session(&state, &headers, false)?;
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
+    // AIDEV-NOTE: the runtime call receives the raw `query.limit`, not the
+    // clamped `limit` reported in the page envelope, so an oversized request
+    // can return more rows than `page.limit` claims (same in the runs handler
+    // below). Aligning them is a behavior change left for a deliberate fix.
     let (jobs, next_after_job_id) = state
         .runtime
         .list_cron_jobs(
@@ -26,6 +49,13 @@ pub(crate) async fn console_cron_list_handler(
     })))
 }
 
+/// Creates a cron job owned by the caller via the gateway cron service
+/// (`POST /console/v1/cron/jobs`).
+///
+/// # Errors
+/// Returns invalid-argument for empty name/prompt or malformed schedules,
+/// permission-denied when `owner_principal` differs from the session
+/// principal, or a mapped gateway/runtime error response.
 pub(crate) async fn console_cron_create_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -108,6 +138,13 @@ pub(crate) async fn console_cron_create_handler(
     Ok(Json(json!({ "job": job })))
 }
 
+/// Enables or disables an owned cron job, recomputing the next run timestamp
+/// and waking the scheduler (`POST /console/v1/cron/jobs/{job_id}/enabled`).
+///
+/// # Errors
+/// Returns invalid-argument for non-ULID job ids, not-found or
+/// permission-denied for missing/foreign jobs, or a mapped runtime error
+/// response.
 pub(crate) async fn console_cron_set_enabled_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -146,6 +183,13 @@ pub(crate) async fn console_cron_set_enabled_handler(
     Ok(Json(json!({ "job": updated })))
 }
 
+/// Triggers an immediate run of a cron job via the gateway cron service,
+/// which enforces ownership (`POST /console/v1/cron/jobs/{job_id}/run-now`).
+///
+/// # Errors
+/// Returns invalid-argument for non-ULID job ids, or a mapped
+/// gateway/runtime error response (not-found, permission-denied, scheduler
+/// failures).
 pub(crate) async fn console_cron_run_now_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -179,6 +223,13 @@ pub(crate) async fn console_cron_run_now_handler(
     })))
 }
 
+/// Lists an owned cron job's run history with cursor pagination
+/// (`GET /console/v1/cron/jobs/{job_id}/runs`).
+///
+/// # Errors
+/// Returns invalid-argument for non-ULID job ids, not-found or
+/// permission-denied for missing/foreign jobs, or a mapped runtime error
+/// response.
 pub(crate) async fn console_cron_runs_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -204,6 +255,7 @@ pub(crate) async fn console_cron_runs_handler(
     })))
 }
 
+// Ownership probe used where the job record itself is not needed.
 #[allow(clippy::result_large_err)]
 async fn ensure_console_cron_job_owner(
     state: &AppState,
@@ -238,6 +290,9 @@ async fn load_console_cron_job_for_owner(
     Ok(job)
 }
 
+// Builds the protobuf schedule from the console payload. Kept separate from
+// the near-identical routines.rs builder because the two surfaces evolve
+// their error envelopes independently.
 #[allow(clippy::result_large_err)]
 fn build_console_schedule(
     schedule_type_raw: &str,
@@ -308,6 +363,14 @@ fn build_console_cron_service(state: &AppState) -> gateway::CronServiceImpl {
     )
 }
 
+/// Stamps a console session's principal, device, and channel onto outgoing
+/// gateway RPC metadata. Convenience wrapper over
+/// [`apply_console_request_context`].
+///
+/// # Errors
+/// Returns failed-precondition when auth is required but no admin token is
+/// configured, or an internal error response when a value cannot be encoded
+/// as gRPC metadata.
 #[allow(clippy::result_large_err)]
 pub(crate) fn apply_console_rpc_context(
     state: &AppState,
@@ -323,6 +386,14 @@ pub(crate) fn apply_console_rpc_context(
     )
 }
 
+/// Attaches the daemon admin bearer token (when auth is enabled) plus the
+/// caller's principal/device/channel headers to gateway RPC metadata, so
+/// in-process gateway services authorize console calls like external ones.
+///
+/// # Errors
+/// Returns failed-precondition when auth is required but no admin token is
+/// configured, or an internal error response when a value cannot be encoded
+/// as gRPC metadata.
 #[allow(clippy::result_large_err)]
 pub(crate) fn apply_console_request_context(
     state: &AppState,

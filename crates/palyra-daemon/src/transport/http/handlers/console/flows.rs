@@ -1,3 +1,15 @@
+//! Console HTTP handlers for durable flows (`/console/v1/flows*`): list,
+//! create, get, pause/resume/cancel, and per-step retry/skip/compensate.
+//!
+//! Flows are multi-step orchestrations persisted in the journal; handlers
+//! here only request state transitions through the runtime, which owns the
+//! actual step execution. Access is scoped to the owning principal AND the
+//! creating device/channel (see [`authorize_console_flow_bundle`]).
+//!
+//! Response JSON shapes are part of the `/console/v1` wire contract consumed
+//! by `apps/web`; field names, status codes, and error strings must stay
+//! byte-identical.
+
 use axum::{
     extract::{Path, Query, State},
     http::HeaderMap,
@@ -25,6 +37,8 @@ const DEFAULT_FLOW_PAGE_LIMIT: usize = 100;
 const MAX_FLOW_PAGE_LIMIT: usize = 500;
 const DEFAULT_FLOW_EVENT_LIMIT: usize = 512;
 
+/// Query filters for `GET /console/v1/flows`; terminal flows are included by
+/// default.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleFlowsListQuery {
     #[serde(default)]
@@ -35,6 +49,9 @@ pub(crate) struct ConsoleFlowsListQuery {
     include_terminal: Option<bool>,
 }
 
+/// Body for `POST /console/v1/flows`; requires at least one step and rejects
+/// unknown fields. Linkage ids (objective/routine/webhook/session/run) are
+/// optional lineage metadata.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConsoleFlowCreateRequest {
@@ -62,6 +79,9 @@ pub(crate) struct ConsoleFlowCreateRequest {
     steps: Vec<ConsoleFlowStepCreateRequest>,
 }
 
+/// One step in a flow create request; the adapter must be one of the
+/// registered flow adapter contracts and `step_kind` defaults to the adapter
+/// name.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConsoleFlowStepCreateRequest {
@@ -85,6 +105,8 @@ pub(crate) struct ConsoleFlowStepCreateRequest {
     not_before_unix_ms: Option<i64>,
 }
 
+/// Body for flow and step actions; the reason defaults to an action-specific
+/// operator audit message.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConsoleFlowActionRequest {
@@ -92,6 +114,7 @@ pub(crate) struct ConsoleFlowActionRequest {
     reason: Option<String>,
 }
 
+// Parameter object describing one operator-initiated step transition.
 struct ConsoleFlowStepAction<'a> {
     flow_id: &'a str,
     step_id: &'a str,
@@ -101,6 +124,12 @@ struct ConsoleFlowStepAction<'a> {
     terminal: bool,
 }
 
+/// Lists the caller's flows with a state summary, adapter contracts, and the
+/// rollout posture (`GET /console/v1/flows`).
+///
+/// # Errors
+/// Returns an unauthorized response when console authorization fails, or a
+/// mapped runtime error response when listing fails.
 pub(crate) async fn console_flows_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -129,6 +158,13 @@ pub(crate) async fn console_flows_list_handler(
     })))
 }
 
+/// Creates a flow with its steps and returns the full bundle view
+/// (`POST /console/v1/flows`).
+///
+/// # Errors
+/// Returns invalid-argument for empty step lists, unknown modes/adapters, or
+/// malformed lineage, and a mapped runtime error response when persistence or
+/// the post-create bundle read fails.
 pub(crate) async fn console_flow_create_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -196,6 +232,13 @@ pub(crate) async fn console_flow_create_handler(
     Ok(Json(flow_bundle_view(&bundle)))
 }
 
+/// Returns one owned flow bundle: flow, steps, events, revisions, blockers,
+/// retry history, and lineage (`GET /console/v1/flows/{flow_id}`).
+///
+/// # Errors
+/// Returns not-found for unknown flows, permission-denied when the flow
+/// belongs to another principal/device/channel, or a mapped runtime error
+/// response.
 pub(crate) async fn console_flow_get_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -206,6 +249,11 @@ pub(crate) async fn console_flow_get_handler(
     Ok(Json(flow_bundle_view(&bundle)))
 }
 
+/// Pauses an owned flow (`POST /console/v1/flows/{flow_id}/pause`).
+///
+/// # Errors
+/// Returns not-found or permission-denied for missing/foreign flows, or a
+/// mapped runtime transition error response (including revision conflicts).
 pub(crate) async fn console_flow_pause_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -224,6 +272,12 @@ pub(crate) async fn console_flow_pause_handler(
     .await
 }
 
+/// Resumes an owned flow back to pending, clearing its completion timestamp
+/// (`POST /console/v1/flows/{flow_id}/resume`).
+///
+/// # Errors
+/// Returns not-found or permission-denied for missing/foreign flows, or a
+/// mapped runtime transition error response (including revision conflicts).
 pub(crate) async fn console_flow_resume_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -242,6 +296,12 @@ pub(crate) async fn console_flow_resume_handler(
     .await
 }
 
+/// Requests cancellation of an owned flow; the runtime drives the flow to a
+/// terminal state asynchronously (`POST /console/v1/flows/{flow_id}/cancel`).
+///
+/// # Errors
+/// Returns not-found or permission-denied for missing/foreign flows, or a
+/// mapped runtime transition error response (including revision conflicts).
 pub(crate) async fn console_flow_cancel_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -260,6 +320,12 @@ pub(crate) async fn console_flow_cancel_handler(
     .await
 }
 
+/// Marks an owned flow step for retry and reactivates the flow
+/// (`POST /console/v1/flows/{flow_id}/steps/{step_id}/retry`).
+///
+/// # Errors
+/// Returns not-found for missing flows/steps, permission-denied for foreign
+/// flows, or a mapped runtime error response.
 pub(crate) async fn console_flow_step_retry_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -281,6 +347,12 @@ pub(crate) async fn console_flow_step_retry_handler(
     .await
 }
 
+/// Skips an owned flow step, marking it terminal
+/// (`POST /console/v1/flows/{flow_id}/steps/{step_id}/skip`).
+///
+/// # Errors
+/// Returns not-found for missing flows/steps, permission-denied for foreign
+/// flows, or a mapped runtime error response.
 pub(crate) async fn console_flow_step_skip_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -302,6 +374,12 @@ pub(crate) async fn console_flow_step_skip_handler(
     .await
 }
 
+/// Requests compensation for an owned flow step
+/// (`POST /console/v1/flows/{flow_id}/steps/{step_id}/compensate`).
+///
+/// # Errors
+/// Returns not-found for missing flows/steps, permission-denied for foreign
+/// flows, or a mapped runtime error response.
 pub(crate) async fn console_flow_step_compensate_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -323,6 +401,9 @@ pub(crate) async fn console_flow_step_compensate_handler(
     .await
 }
 
+// Validates adapters against the registered contracts and converts console
+// step payloads into journal create requests, preserving request order as
+// the step index.
 fn build_console_flow_steps(
     steps: Vec<ConsoleFlowStepCreateRequest>,
 ) -> Result<Vec<FlowStepCreateRequest>, tonic::Status> {
@@ -367,6 +448,9 @@ fn build_console_flow_steps(
         .collect()
 }
 
+// Shared body of the pause/resume/cancel handlers. The transition carries the
+// bundle's revision as expected_revision so concurrent operator actions fail
+// loudly instead of clobbering each other.
 async fn transition_console_flow(
     state: &AppState,
     headers: &HeaderMap,
@@ -378,6 +462,8 @@ async fn transition_console_flow(
 ) -> Result<Json<Value>, Response> {
     let session = authorize_console_session(state, headers, true)?;
     let bundle = load_owned_flow_bundle(state, &session.context, flow_id).await?;
+    // Patch semantics are Option<Option<_>>: Some(None) clears the stored
+    // value, None leaves it untouched.
     let completed_at_unix_ms = if clear_completed_at {
         Some(None)
     } else if next_state.is_terminal() {
@@ -411,6 +497,9 @@ async fn transition_console_flow(
     Ok(Json(flow_bundle_view(&updated)))
 }
 
+// Shared body of the step retry/skip/compensate handlers. Retry clears the
+// step's prior output, error, and timing so the runtime treats it as fresh,
+// and defers the next attempt by the step's backoff.
 async fn update_console_flow_step(
     state: &AppState,
     headers: &HeaderMap,
@@ -422,6 +511,8 @@ async fn update_console_flow_step(
         bundle.steps.iter().find(|step| step.step_id == action.step_id).ok_or_else(|| {
             runtime_status_response(tonic::Status::not_found("flow step not found"))
         })?;
+    // Patch semantics are Option<Option<_>>: Some(None) clears the stored
+    // value, None leaves it untouched.
     let not_before_unix_ms = if action.next_state == FlowStepState::Retrying {
         Some(Some(crate::gateway::current_unix_ms().saturating_add(step.backoff_ms as i64)))
     } else {
@@ -469,6 +560,10 @@ async fn update_console_flow_step(
             .await
             .map_err(runtime_status_response)?
             .ok_or_else(|| runtime_status_response(tonic::Status::not_found("flow not found")))?;
+        // Reactivation is best-effort: the step update above already
+        // succeeded, and this transition can lose a benign revision race with
+        // the runtime picking the flow back up. The bundle re-read below
+        // returns the authoritative state either way.
         let _ = state
             .runtime
             .transition_flow(FlowTransitionRequest {
@@ -510,6 +605,9 @@ async fn load_owned_flow_bundle(
     Ok(bundle)
 }
 
+// Flows are scoped to the exact creating identity: principal AND device AND
+// channel. Cross-device access by the same principal is rejected on purpose
+// (pinned by tests) because flows can carry device-local context.
 #[allow(clippy::result_large_err)]
 fn authorize_console_flow_bundle(
     bundle: &crate::journal::FlowBundleRecord,
@@ -686,6 +784,8 @@ fn flow_rollout_payload(state: &AppState) -> Value {
     })
 }
 
+// Stored JSON columns are surfaced as parsed values; unparseable content is
+// wrapped as { "raw": ... } instead of failing the whole view.
 fn json_value(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or_else(|_| json!({ "raw": raw }))
 }

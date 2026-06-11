@@ -1,3 +1,18 @@
+//! Console HTTP handlers for routines: operator-defined automations that pair
+//! a backing cron job (schedule, retries, ownership) with routine metadata
+//! (trigger matching, execution posture, delivery, quiet hours, approvals).
+//!
+//! Route surface: `/console/v1/routines*` (list, get, upsert, import/export,
+//! delete, enable, run-now, test-run, dispatch, runs, templates, and natural
+//! language schedule preview). Also exposes the `dispatch_*_routines` entry
+//! points used by the hook, webhook, and system handlers, plus
+//! [`apply_routine_approval_decision`] invoked by the approvals handler when
+//! an operator allows a pending routine approval.
+//!
+//! Response JSON shapes here are part of the `/console/v1` wire contract
+//! consumed by `apps/web`; field names, status codes, and error strings must
+//! stay byte-identical.
+
 use std::{collections::HashMap, sync::Arc};
 
 use chrono::{TimeZone, Timelike};
@@ -44,6 +59,8 @@ const ROUTINE_APPROVAL_DEVICE_ID: &str = "system:routines";
 const DEFAULT_ROUTINE_RETRY_MAX_ATTEMPTS: u32 = 2;
 const DEFAULT_ROUTINE_RETRY_BACKOFF_MS: u64 = 1_000;
 
+/// Query filters for `GET /console/v1/routines`; all filters are optional and
+/// string matches are case-insensitive.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleRoutineListQuery {
     #[serde(default)]
@@ -60,6 +77,11 @@ pub(crate) struct ConsoleRoutineListQuery {
     template_id: Option<String>,
 }
 
+/// Create-or-update payload for `POST /console/v1/routines`.
+///
+/// Omitted optional fields fall back to trigger-kind-specific defaults (run
+/// mode, execution posture, delivery, approval policy); `routine_id` is
+/// generated when absent. Unknown fields are rejected.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConsoleRoutineUpsertRequest {
@@ -140,12 +162,14 @@ pub(crate) struct ConsoleRoutineUpsertRequest {
     template_id: Option<String>,
 }
 
+/// Body for `POST /console/v1/routines/{routine_id}/enabled`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConsoleRoutineEnabledRequest {
     enabled: bool,
 }
 
+/// Cursor pagination for `GET /console/v1/routines/{routine_id}/runs`.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleRoutineRunsQuery {
     #[serde(default)]
@@ -154,6 +178,8 @@ pub(crate) struct ConsoleRoutineRunsQuery {
     limit: Option<usize>,
 }
 
+/// Body for `POST /console/v1/routines/{routine_id}/dispatch`; trigger kind
+/// defaults to `manual` when omitted.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConsoleRoutineDispatchRequest {
@@ -167,6 +193,9 @@ pub(crate) struct ConsoleRoutineDispatchRequest {
     trigger_dedupe_key: Option<String>,
 }
 
+/// Body for `POST /console/v1/routines/{routine_id}/test-run`; setting
+/// `source_run_id` replays an archived run's trigger payload instead of the
+/// routine's configured one.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConsoleRoutineTestRunRequest {
@@ -178,6 +207,8 @@ pub(crate) struct ConsoleRoutineTestRunRequest {
     trigger_payload: Option<Value>,
 }
 
+/// Body for `POST /console/v1/routines/schedule-preview`: a natural language
+/// phrase plus an optional timezone override.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConsoleRoutineSchedulePreviewRequest {
@@ -186,6 +217,8 @@ pub(crate) struct ConsoleRoutineSchedulePreviewRequest {
     timezone: Option<String>,
 }
 
+/// Body for `POST /console/v1/routines/import`: a validated export bundle with
+/// optional overrides for the target routine id and enabled state.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConsoleRoutineImportRequest {
@@ -196,6 +229,12 @@ pub(crate) struct ConsoleRoutineImportRequest {
     enabled: Option<bool>,
 }
 
+/// Lists the authenticated principal's routines with filters and cursor
+/// pagination (`GET /console/v1/routines`).
+///
+/// # Errors
+/// Returns an unauthorized response when console authorization fails, or a
+/// mapped runtime/registry error response when loading routines fails.
 pub(crate) async fn console_routines_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -287,6 +326,12 @@ pub(crate) async fn console_routines_list_handler(
     })))
 }
 
+/// Returns one owned routine enriched with latest-run and troubleshooting
+/// data (`GET /console/v1/routines/{routine_id}`).
+///
+/// # Errors
+/// Returns not-found when the routine or its backing cron job is missing,
+/// permission-denied for non-owners, or a mapped runtime error response.
 pub(crate) async fn console_routine_get_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -302,6 +347,12 @@ pub(crate) async fn console_routine_get_handler(
     Ok(Json(json!({ "routine": routine })))
 }
 
+/// Builds a portable export bundle for an owned routine
+/// (`GET /console/v1/routines/{routine_id}/export`).
+///
+/// # Errors
+/// Returns not-found or permission-denied for missing/foreign routines, or a
+/// validation error response when the bundle cannot be built.
 pub(crate) async fn console_routine_export_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -319,6 +370,17 @@ pub(crate) async fn console_routine_export_handler(
     Ok(Json(json!({ "export": export })))
 }
 
+/// Imports an export bundle as a new or updated routine owned by the caller
+/// (`POST /console/v1/routines/import`).
+///
+/// Approval policy is re-evaluated on import: when the bundle requires a
+/// before-enable approval that has not been granted yet, the routine is
+/// persisted disabled and a pending approval record is returned alongside it.
+///
+/// # Errors
+/// Returns invalid-argument for malformed bundles or routine ids,
+/// permission-denied for ownership/channel/feature-flag violations, or a
+/// mapped runtime error response.
 pub(crate) async fn console_routine_import_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -348,6 +410,8 @@ pub(crate) async fn console_routine_import_handler(
         ensure_job_owner(job, session.context.principal.as_str())?;
     }
     let approval_policy = bundle.routine.approval_policy.clone();
+    // Before-enable approvals gate activation, not persistence: the routine is
+    // stored disabled and re-enabled later by apply_routine_approval_decision.
     let approval_required = requested_enabled
         && approval_policy.mode == RoutineApprovalMode::BeforeEnable
         && !routine_approval_granted(
@@ -416,6 +480,17 @@ pub(crate) async fn console_routine_import_handler(
     })))
 }
 
+/// Creates or updates a routine and its backing cron job
+/// (`POST /console/v1/routines`).
+///
+/// When the resolved approval policy is `before_enable` and no approval has
+/// been granted, the routine is persisted disabled and the pending approval
+/// record is returned in the `approval` field.
+///
+/// # Errors
+/// Returns invalid-argument for unparseable fields or schedules,
+/// permission-denied for ownership/channel/feature-flag violations, or a
+/// mapped runtime/registry error response.
 pub(crate) async fn console_routine_upsert_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -501,6 +576,8 @@ pub(crate) async fn console_routine_upsert_handler(
     let concurrency_policy = parse_concurrency_policy(payload.concurrency_policy.as_deref())?;
     let retry_policy = parse_retry_policy(payload.retry_max_attempts, payload.retry_backoff_ms)?;
     let misfire_policy = parse_misfire_policy(payload.misfire_policy.as_deref())?;
+    // Before-enable approvals gate activation, not persistence: the routine is
+    // stored disabled and re-enabled later by apply_routine_approval_decision.
     let approval_required = enabled
         && approval_policy.mode == RoutineApprovalMode::BeforeEnable
         && !routine_approval_granted(
@@ -585,6 +662,12 @@ pub(crate) async fn console_routine_upsert_handler(
     })))
 }
 
+/// Deletes an owned routine: the backing cron job plus its metadata record
+/// (`POST /console/v1/routines/{routine_id}/delete`).
+///
+/// # Errors
+/// Returns not-found or permission-denied for missing/foreign routines, or a
+/// mapped runtime/registry error response.
 pub(crate) async fn console_routine_delete_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -612,6 +695,16 @@ pub(crate) async fn console_routine_delete_handler(
     })))
 }
 
+/// Enables or disables an owned routine, recomputing the next run timestamp
+/// (`POST /console/v1/routines/{routine_id}/enabled`).
+///
+/// Enable requests subject to a pending before-enable approval keep the
+/// routine disabled and return the approval record instead.
+///
+/// # Errors
+/// Returns not-found or permission-denied for missing/foreign routines,
+/// permission-denied when the routines automation feature flag blocks the
+/// write, or a mapped runtime error response.
 pub(crate) async fn console_routine_set_enabled_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -676,6 +769,9 @@ pub(crate) async fn console_routine_set_enabled_handler(
     })))
 }
 
+/// Rejects writes that would leave a routine effectively enabled while the
+/// routines automation rollout flag is disabled; disabled-routine edits stay
+/// allowed so operators can fix definitions before rollout.
 #[allow(clippy::result_large_err)]
 fn require_routines_automation_enabled_for_write(
     state: &AppState,
@@ -704,6 +800,12 @@ const fn routine_automation_flag_permits_enabled_write(
     !effective_enabled || feature_enabled
 }
 
+/// Dispatches an owned routine immediately with a manual trigger
+/// (`POST /console/v1/routines/{routine_id}/run-now`).
+///
+/// # Errors
+/// Returns not-found or permission-denied for missing/foreign routines, or a
+/// mapped runtime/registry error response from dispatch.
 pub(crate) async fn console_routine_run_now_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -732,6 +834,13 @@ pub(crate) async fn console_routine_run_now_handler(
     Ok(Json(outcome))
 }
 
+/// Runs a no-delivery diagnostic of an owned routine, optionally replaying an
+/// archived run (`POST /console/v1/routines/{routine_id}/test-run`).
+///
+/// # Errors
+/// Returns not-found for missing routines or source runs, invalid-argument
+/// when the source run belongs to another routine, or a mapped runtime error
+/// response from dispatch.
 pub(crate) async fn console_routine_test_run_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -749,6 +858,12 @@ pub(crate) async fn console_routine_test_run_handler(
     Ok(Json(outcome))
 }
 
+/// Lists an owned routine's run history joined with routine run metadata and
+/// output previews (`GET /console/v1/routines/{routine_id}/runs`).
+///
+/// # Errors
+/// Returns not-found or permission-denied for missing/foreign routines, or a
+/// mapped runtime/registry error response.
 pub(crate) async fn console_routine_runs_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -866,6 +981,11 @@ fn routine_output_text_from_replied_payload(payload_json: &str) -> Option<String
     normalize_routine_output_text(Some(reply_text))
 }
 
+/// Builds the `output_*` fields attached to a routine run view.
+///
+/// Source precedence (each branch tagged via `output_source`): suppression for
+/// denied/failed runs, then the immutable run tape, then the live session
+/// preview. Returns `None` when the session belongs to another principal.
 fn routine_output_fields_from_session(
     session_id: &str,
     owner_principal: &str,
@@ -874,6 +994,8 @@ fn routine_output_fields_from_session(
     allow_preview: bool,
     session: &crate::journal::OrchestratorSessionRecord,
 ) -> Option<Map<String, Value>> {
+    // Routine run views must never leak output across principals, even though
+    // the caller already filtered the routine by owner.
     if session.principal != owner_principal {
         return None;
     }
@@ -903,6 +1025,9 @@ fn routine_output_fields_from_session(
         return Some(fields);
     }
 
+    // Session previews are mutable shared-session state: copying one onto an
+    // older run would misattribute output, so previews are only surfaced when
+    // the session's last run is the run being viewed.
     let session_matches_run =
         orchestrator_run_id.is_some_and(|run_id| session.last_run_id.as_deref() == Some(run_id));
     if !session_matches_run {
@@ -922,10 +1047,14 @@ fn routine_output_fields_from_session(
     Some(fields)
 }
 
+// Denied and failed runs must not surface success-looking tape replies, so
+// their previews are suppressed entirely.
 fn routine_run_allows_output_preview(run: &Value) -> bool {
     !matches!(run.pointer("/outcome_kind").and_then(Value::as_str), Some("denied" | "failed"))
 }
 
+// Strips control characters (except newline/tab) and caps the preview at
+// 2000 chars so model output cannot inject terminal escapes or bloat views.
 fn normalize_routine_output_text(value: Option<&str>) -> Option<String> {
     let normalized = value?
         .trim()
@@ -936,6 +1065,13 @@ fn normalize_routine_output_text(value: Option<&str>) -> Option<String> {
     (!normalized.is_empty()).then_some(normalized)
 }
 
+/// Dispatches an owned routine with a caller-supplied trigger payload
+/// (`POST /console/v1/routines/{routine_id}/dispatch`).
+///
+/// # Errors
+/// Returns invalid-argument for unknown trigger kinds or kind mismatches,
+/// not-found or permission-denied for missing/foreign routines, or a mapped
+/// runtime/registry error response from dispatch.
 pub(crate) async fn console_routine_dispatch_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -972,6 +1108,11 @@ pub(crate) async fn console_routine_dispatch_handler(
     Ok(Json(outcome))
 }
 
+/// Returns the built-in routine template pack
+/// (`GET /console/v1/routines/templates`).
+///
+/// # Errors
+/// Returns an unauthorized response when console authorization fails.
 pub(crate) async fn console_routine_templates_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -983,6 +1124,12 @@ pub(crate) async fn console_routine_templates_handler(
     })))
 }
 
+/// Previews the schedule a natural language phrase resolves to without
+/// persisting anything (`POST /console/v1/routines/schedule-preview`).
+///
+/// # Errors
+/// Returns invalid-argument for unknown timezones or unparseable phrases, or
+/// an internal error response when the system clock cannot be read.
 pub(crate) async fn console_routine_schedule_preview_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -999,6 +1146,12 @@ pub(crate) async fn console_routine_schedule_preview_handler(
     Ok(Json(json!({ "preview": preview })))
 }
 
+/// Dispatches every routine of the principal whose `system_event` trigger
+/// matches `event`. Used by the system console handler.
+///
+/// # Errors
+/// Returns a mapped runtime/registry error response when routine lookup or
+/// dispatch fails; per-routine gate outcomes are reported in the result list.
 pub(crate) async fn dispatch_system_event_routines(
     state: &AppState,
     principal: &str,
@@ -1016,6 +1169,12 @@ pub(crate) async fn dispatch_system_event_routines(
     .await
 }
 
+/// Dispatches every routine of the principal whose `hook` trigger matches the
+/// fired hook and event. Used by the hooks console handler.
+///
+/// # Errors
+/// Returns a mapped runtime/registry error response when routine lookup or
+/// dispatch fails; per-routine gate outcomes are reported in the result list.
 pub(crate) async fn dispatch_hook_event_routines(
     state: &AppState,
     principal: &str,
@@ -1040,6 +1199,12 @@ pub(crate) async fn dispatch_hook_event_routines(
     .await
 }
 
+/// Dispatches every routine of the principal whose `webhook` trigger matches
+/// the integration, provider, and event. Used by the webhooks handler.
+///
+/// # Errors
+/// Returns a mapped runtime/registry error response when routine lookup or
+/// dispatch fails; per-routine gate outcomes are reported in the result list.
 pub(crate) async fn dispatch_webhook_event_routines(
     state: &AppState,
     principal: &str,
@@ -1077,6 +1242,8 @@ struct ScheduleResolution {
     schedule_type: CronScheduleType,
     schedule_payload_json: String,
     next_run_at_unix_ms: Option<i64>,
+    // Set when schedule resolution also normalizes the trigger payload (file
+    // watch), in which case it replaces the caller-supplied payload verbatim.
     trigger_payload_json_override: Option<String>,
 }
 
@@ -1100,6 +1267,8 @@ struct RoutineJobUpsert {
     next_run_at_unix_ms: Option<i64>,
 }
 
+// Cron jobs can be created outside the routines surface (CLI, gRPC); syncing
+// before reads keeps schedule-kind routine metadata mirrored onto them.
 async fn synchronize_schedule_routines(state: &AppState) -> Result<Vec<CronJobRecord>, Response> {
     let jobs = list_all_cron_jobs(state).await?;
     state
@@ -1256,6 +1425,8 @@ async fn persist_routine_job(
     }
 }
 
+// Attaches `automation`, `last_run`, and a troubleshooting summary computed
+// over the 10 most recent runs to a routine view.
 async fn enrich_routine_view_with_latest_run(
     state: &AppState,
     mut view: Value,
@@ -1359,6 +1530,8 @@ fn routine_troubleshooting_recommended_action(
     }
 }
 
+// Routine approvals ride on Tool-subject approval records; the subject id
+// encodes "routine:{routine_id}:{mode}" so decisions can be routed back here.
 fn routine_approval_subject_id(routine_id: &str, mode: RoutineApprovalMode) -> String {
     format!("routine:{routine_id}:{}", mode.as_str())
 }
@@ -1391,6 +1564,9 @@ async fn routine_approval_granted(state: &AppState, subject_id: String) -> Resul
         .any(|approval| matches!(approval.decision, Some(ApprovalDecision::Allow))))
 }
 
+// Returns the existing undecided approval for this routine/mode if one is
+// pending; otherwise creates a fresh approval prompt so repeated enable
+// attempts do not stack duplicate operator prompts.
 async fn ensure_routine_approval_requested(
     state: &AppState,
     principal: &str,
@@ -1510,6 +1686,16 @@ async fn ensure_routine_approval_requested(
     })
 }
 
+/// Applies the side effect of an allowed routine approval: re-enables a
+/// before-enable routine or schedules the first run of a before-first-run
+/// routine. Invoked by the approvals handler after a decision is recorded.
+///
+/// Returns `Ok(None)` for decisions that are not routine approvals (denials,
+/// non-tool subjects, or foreign subject ids).
+///
+/// # Errors
+/// Returns permission-denied when the routines automation feature flag is
+/// disabled, or a mapped runtime/registry error response.
 pub(crate) async fn apply_routine_approval_decision(
     state: &AppState,
     approval: &ApprovalRecord,
@@ -1641,9 +1827,19 @@ struct RoutineDispatchRequest {
     delivery_override: Option<RoutineDeliveryConfig>,
     approval_note: Option<String>,
     safety_note: Option<String>,
+    // Skips the trigger-kind match, dedupe, cooldown, and quiet-hours gates.
+    // Only safe test-runs/replays set this; approval gates still apply.
     bypass_operator_gates: bool,
 }
 
+/// Dispatches a safe diagnostic run of an owned routine: forces a fresh
+/// session and audit-only (no-delivery) output, optionally replaying the
+/// trigger payload of an archived run identified by `source_run_id`.
+///
+/// # Errors
+/// Returns not-found for missing routines or source runs, invalid-argument
+/// when the source run belongs to another routine, or a mapped
+/// runtime/registry error response from dispatch.
 pub(crate) async fn dispatch_routine_test_run(
     state: &AppState,
     routine_id: &str,
@@ -1726,6 +1922,11 @@ pub(crate) async fn dispatch_routine_test_run(
     .await
 }
 
+// Runs the routine gate pipeline, then triggers the backing cron job. Gate
+// order matters: disabled state and pending before-first-run approval are
+// checked before the bypassable operator gates (trigger-kind match, dedupe,
+// cooldown, quiet hours), so even safe test-runs cannot run an unapproved
+// routine. Gate hits are recorded as terminal runs instead of erroring.
 async fn dispatch_single_routine(
     state: &AppState,
     routine_id: &str,
@@ -1855,6 +2056,10 @@ async fn dispatch_single_routine(
                 .map_err(routine_registry_error_response)?
                 .into_iter()
                 .last();
+            // AIDEV-NOTE: cooldown_ms is untrusted u64 input; `as i64` wraps
+            // above i64::MAX and the addition can overflow (panic in debug
+            // builds). A saturating fix changes accepted-input behavior, so it
+            // is left as-is; consider capping cooldown_ms at upsert time.
             if latest.as_ref().is_some_and(|entry| {
                 entry.created_at_unix_ms + routine.metadata.cooldown_ms as i64 > now_unix_ms
             }) {
@@ -2027,6 +2232,9 @@ async fn dispatch_matching_routines(
     Ok(outcomes)
 }
 
+// Matches an incoming trigger payload against a routine's configured trigger.
+// Unset configured matchers act as wildcards; schedule routines never match
+// event dispatch because the scheduler owns their execution.
 fn routine_matches_trigger(metadata: &RoutineMetadataRecord, payload: &Value) -> bool {
     let configured = serde_json::from_str::<Value>(metadata.trigger_payload_json.as_str())
         .unwrap_or_else(|_| json!({}));
@@ -2089,6 +2297,10 @@ struct TerminalRoutineRunRequest<'a> {
     safety_note: Option<String>,
 }
 
+// Synthesizes a start+finalize cron run pair plus run metadata for a routine
+// that was stopped by a gate (disabled, approval, dedupe, cooldown, quiet
+// hours), so gate outcomes stay visible in run history without invoking the
+// scheduler.
 async fn register_terminal_routine_run(
     state: &AppState,
     request: TerminalRoutineRunRequest<'_>,
@@ -2214,6 +2426,11 @@ fn routine_view_from_parts(job: &CronJobRecord, metadata: &RoutineMetadataRecord
     })
 }
 
+// Resolves the cron schedule backing a routine upsert. Resolution precedence
+// for schedule triggers is explicit `schedule_type` first, then the natural
+// language phrase; file-watch triggers always derive an `every` poll schedule
+// from their normalized payload, and other trigger kinds get an inert shadow
+// schedule.
 #[allow(clippy::result_large_err)]
 fn resolve_routine_schedule(
     payload: &ConsoleRoutineUpsertRequest,
@@ -2259,6 +2476,9 @@ fn resolve_routine_schedule(
                 "max_runs is only supported for scheduled and file_watch routines",
             )));
         }
+        // Every routine is backed by a cron job row; event-triggered routines
+        // get a one-shot shadow schedule with no next run so the scheduler
+        // never fires them on its own.
         return Ok(ScheduleResolution {
             schedule_type: CronScheduleType::At,
             schedule_payload_json: shadow_manual_schedule_payload_json(),
@@ -2270,6 +2490,9 @@ fn resolve_routine_schedule(
         parse_optional_schedule_timezone_mode(payload.schedule_timezone.as_deref(), timezone_mode)?;
     let explicit_schedule_type =
         payload.schedule_type.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    // The natural language phrase is consulted only when no explicit
+    // schedule_type was supplied; an explicit schedule must never be
+    // downgraded by leftover phrase text (pinned by tests).
     if explicit_schedule_type.is_none() {
         if let Some(phrase) = payload
             .natural_language_schedule
@@ -2320,6 +2543,9 @@ fn resolve_routine_schedule(
     })
 }
 
+// Embeds the run-count cap into the schedule payload JSON. A missing request
+// value preserves the cap already stored on the existing job, so updates that
+// omit max_runs do not silently drop the limit.
 #[allow(clippy::result_large_err)]
 fn schedule_payload_with_max_runs(
     schedule_payload_json: String,
@@ -2656,22 +2882,8 @@ fn parse_delivery(
         })?,
         None => RoutineSilentPolicy::Noisy,
     };
-    let channel = channel.and_then(|value| {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_owned())
-        }
-    });
-    let failure_channel = failure_channel.and_then(|value| {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_owned())
-        }
-    });
+    let channel = normalize_optional_text(channel.as_deref());
+    let failure_channel = normalize_optional_text(failure_channel.as_deref());
     if matches!(mode, RoutineDeliveryMode::SpecificChannel) && channel.is_none() {
         return Err(runtime_status_response(tonic::Status::invalid_argument(
             "delivery_channel is required for delivery_mode=specific_channel",
@@ -2760,6 +2972,9 @@ fn parse_approval_policy(value: Option<&str>) -> Result<RoutineApprovalPolicy, R
     Ok(RoutineApprovalPolicy { mode })
 }
 
+// INTENTIONAL: a deliberate pass-through. Execution posture (including
+// sensitive_tools) does not force an approval mode; tests pin this decision.
+// The unused parameters keep the decision inputs explicit at the call site.
 fn default_approval_policy_for_execution(
     _execution: &RoutineExecutionConfig,
     approval_policy: RoutineApprovalPolicy,
@@ -2769,6 +2984,9 @@ fn default_approval_policy_for_execution(
     approval_policy
 }
 
+// Fast-recurring schedules get a before-enable approval injected when the
+// operator did not state an approval mode explicitly; explicit choices and
+// file-watch poll schedules are left untouched.
 fn approval_policy_for_requested_schedule(
     trigger_kind: RoutineTriggerKind,
     schedule_type: CronScheduleType,
@@ -2919,6 +3137,8 @@ fn is_in_quiet_hours(
     };
     let start = quiet_hours.start_minute_of_day;
     let end = quiet_hours.end_minute_of_day;
+    // Equal endpoints mean all-day quiet; start > end is a window that wraps
+    // past midnight (e.g. 22:00-06:00). The end minute is exclusive.
     Ok(if start == end {
         true
     } else if start < end {
@@ -2932,6 +3152,8 @@ fn read_string_value(record: &Value, key: &str) -> String {
     record.get(key).and_then(Value::as_str).unwrap_or_default().to_owned()
 }
 
+// Field-level registry validation maps to a structured 400 payload; every
+// other registry failure is an internal error.
 fn routine_registry_error_response(error: RoutineRegistryError) -> Response {
     match error {
         RoutineRegistryError::InvalidField { field, message } => {

@@ -1,3 +1,16 @@
+//! Console HTTP handlers for hook bindings (`/console/v1/hooks*`): list, get,
+//! bind, check, enable/disable, delete, and fire.
+//!
+//! Bindings live in a file-backed index under the hooks root and connect a
+//! hook id and event to a plugin binding. Firing a hook does not execute the
+//! plugin directly; it fans out to matching hook-triggered routines via
+//! [`super::routines::dispatch_hook_event_routines`]. Every read response
+//! carries a readiness `check` derived from the referenced plugin binding.
+//!
+//! Response JSON shapes are part of the `/console/v1` wire contract consumed
+//! by `apps/web`; field names, status codes, and error strings must stay
+//! byte-identical.
+
 use crate::{
     hooks::{
         delete_hook_binding, hook_binding, load_hook_bindings_index, normalize_hook_binding_upsert,
@@ -9,6 +22,8 @@ use crate::{
     *,
 };
 
+/// Query filters for `GET /console/v1/hooks`; ids match case-insensitively
+/// and the event filter is normalized before comparison.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleHooksListQuery {
     hook_id: Option<String>,
@@ -16,6 +31,8 @@ pub(crate) struct ConsoleHooksListQuery {
     event: Option<String>,
 }
 
+/// Body for `POST /console/v1/hooks/bind`; the referenced plugin binding must
+/// already exist. Unknown fields are rejected.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConsoleHookBindRequest {
@@ -28,10 +45,15 @@ pub(crate) struct ConsoleHookBindRequest {
     operator: Option<HookOperatorMetadata>,
 }
 
+/// Deliberately empty body for hook enable/disable: keeps the mutations as
+/// JSON POSTs with strict bodies (`{}`) so the CSRF and content-type checks
+/// of the console surface apply.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConsoleHookToggleRequest {}
 
+/// Body for `POST /console/v1/hooks/{hook_id}/fire`; the event defaults to
+/// the binding's configured event and the payload to `{}`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConsoleHookFireRequest {
@@ -43,6 +65,13 @@ pub(crate) struct ConsoleHookFireRequest {
     dedupe_key: Option<String>,
 }
 
+/// Lists hook bindings with optional hook/plugin/event filters
+/// (`GET /console/v1/hooks`).
+///
+/// # Errors
+/// Returns an unauthorized response when console authorization fails, or an
+/// internal error response when the bindings index cannot be loaded or the
+/// event filter cannot be normalized.
 pub(crate) async fn console_hooks_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -54,12 +83,16 @@ pub(crate) async fn console_hooks_list_handler(
         load_hook_bindings_index(hooks_root.as_path()).map_err(internal_console_error)?;
     if let Some(hook_id) = query.hook_id.as_deref().map(str::trim).filter(|value| !value.is_empty())
     {
-        index.entries.retain(|entry| entry.hook_id == hook_id.to_ascii_lowercase());
+        // Stored ids are lowercase; lowercasing the filter once keeps the
+        // comparison out of the retain loop.
+        let hook_id = hook_id.to_ascii_lowercase();
+        index.entries.retain(|entry| entry.hook_id == hook_id);
     }
     if let Some(plugin_id) =
         query.plugin_id.as_deref().map(str::trim).filter(|value| !value.is_empty())
     {
-        index.entries.retain(|entry| entry.plugin_id == plugin_id.to_ascii_lowercase());
+        let plugin_id = plugin_id.to_ascii_lowercase();
+        index.entries.retain(|entry| entry.plugin_id == plugin_id);
     }
     if let Some(event) = query.event.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
         let normalized = normalize_hook_event(event).map_err(internal_console_error)?;
@@ -78,10 +111,18 @@ pub(crate) async fn console_hooks_list_handler(
         "hooks_root": hooks_root,
         "count": entries.len(),
         "entries": entries,
+        // The hooks index is small and unpaginated; the page envelope is
+        // synthesized for consistency with other console list endpoints.
         "page": build_page_info(entries.len().max(1), entries.len(), None),
     })))
 }
 
+/// Returns one hook binding with its readiness check
+/// (`GET /console/v1/hooks/{hook_id}`).
+///
+/// # Errors
+/// Returns not-found for unknown hook ids, or an internal error response when
+/// the bindings index cannot be loaded.
 pub(crate) async fn console_hook_get_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -98,6 +139,15 @@ pub(crate) async fn console_hook_get_handler(
     })))
 }
 
+/// Creates or updates a hook binding after verifying the referenced plugin
+/// binding exists (`POST /console/v1/hooks/bind`).
+///
+/// Operator ownership defaults to the session principal when not supplied,
+/// and `updated_by` always records the session principal.
+///
+/// # Errors
+/// Returns not-found for unknown plugin ids, or an internal error response
+/// for index load/normalize/save failures.
 pub(crate) async fn console_hooks_bind_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -155,6 +205,12 @@ pub(crate) async fn console_hooks_bind_handler(
     })))
 }
 
+/// Re-evaluates a hook binding's readiness without mutating it
+/// (`GET /console/v1/hooks/{hook_id}/check`).
+///
+/// # Errors
+/// Returns not-found for unknown hook ids, or an internal error response when
+/// the bindings index cannot be loaded.
 pub(crate) async fn console_hook_check_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -171,6 +227,11 @@ pub(crate) async fn console_hook_check_handler(
     })))
 }
 
+/// Enables a hook binding (`POST /console/v1/hooks/{hook_id}/enable`).
+///
+/// # Errors
+/// Returns not-found for unknown hook ids, or an internal error response for
+/// index load/save failures.
 pub(crate) async fn console_hook_enable_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -196,6 +257,11 @@ pub(crate) async fn console_hook_enable_handler(
     })))
 }
 
+/// Disables a hook binding (`POST /console/v1/hooks/{hook_id}/disable`).
+///
+/// # Errors
+/// Returns not-found for unknown hook ids, or an internal error response for
+/// index load/save failures.
 pub(crate) async fn console_hook_disable_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -221,6 +287,12 @@ pub(crate) async fn console_hook_disable_handler(
     })))
 }
 
+/// Deletes a hook binding and returns the removed record
+/// (`POST /console/v1/hooks/{hook_id}/delete`).
+///
+/// # Errors
+/// Returns not-found for unknown hook ids, or an internal error response for
+/// index load/save failures.
 pub(crate) async fn console_hook_delete_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -240,6 +312,16 @@ pub(crate) async fn console_hook_delete_handler(
     })))
 }
 
+/// Fires a hook event, dispatching every matching hook-triggered routine of
+/// the session principal (`POST /console/v1/hooks/{hook_id}/fire`).
+///
+/// Bindings owned by another principal cannot be fired; unowned bindings
+/// default to the session principal.
+///
+/// # Errors
+/// Returns not-found for unknown hook ids, permission-denied for foreign
+/// owners, or a mapped error response from event normalization or routine
+/// dispatch.
 pub(crate) async fn console_hook_fire_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -289,6 +371,9 @@ pub(crate) async fn console_hook_fire_handler(
     })))
 }
 
+// Computes the readiness payload for a binding: not ready when the binding or
+// its referenced plugin is disabled, missing, or unresolvable. Failure
+// reasons are sanitized before they reach the response.
 async fn build_hook_binding_check(binding: HookBindingRecord) -> Value {
     let mut ready = binding.enabled;
     let mut reasons = Vec::<String>::new();
