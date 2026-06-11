@@ -1,3 +1,7 @@
+//! End-to-end gRPC gateway tests against a spawned `palyrad`: message
+//! routing through fake channel adapters, channel commands and pairing,
+//! conversation bindings, JSON-mode security labels, and journal events.
+
 use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},

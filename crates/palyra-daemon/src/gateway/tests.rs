@@ -1,3 +1,7 @@
+//! In-process unit tests for the gateway module: approval flows and export
+//! chains, tool dispatch and cleanup, canvas/cron/vault validation, and
+//! runtime-state behavior. Pins error strings and journal/wire payloads.
+
 use std::{
     collections::BTreeMap,
     fs,

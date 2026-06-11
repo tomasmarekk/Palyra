@@ -1,3 +1,7 @@
+//! Shared integration-test support: `DaemonHarness` for spawning a real
+//! `palyrad` with throwaway state, console session login/JSON helpers, and
+//! JSON golden assertions.
+
 use std::{
     fs,
     io::Read,

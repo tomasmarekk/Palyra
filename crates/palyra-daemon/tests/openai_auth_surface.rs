@@ -1,3 +1,7 @@
+//! Console and compat surface tests for model-provider auth: OpenAI and
+//! Anthropic API-key flows persisting vault refs, model probe/discover
+//! results, and registry-backed model/embeddings/tools compat payloads.
+
 #[allow(dead_code)]
 mod support;
 

@@ -1,3 +1,7 @@
+//! mTLS posture tests for the node RPC listener of a spawned `palyrad`:
+//! clients without or with revoked certificates are rejected, valid
+//! certificates are accepted, and the insecure opt-out is honored.
+
 use std::{
     fs,
     io::{BufRead, BufReader},

@@ -1,3 +1,7 @@
+//! Golden-snapshot inventory of the daemon's current externally observable
+//! state: capabilities, CLI command families, and compat route surface,
+//! probed against a live `DaemonHarness` and pinned via JSON goldens.
+
 mod support;
 
 use std::{fs, path::PathBuf};

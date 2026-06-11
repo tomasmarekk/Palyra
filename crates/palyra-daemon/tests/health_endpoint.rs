@@ -1,3 +1,6 @@
+//! Smoke test that a freshly spawned `palyrad` with a minimal config and
+//! dynamic port serves its HTTP health endpoint.
+
 use std::{
     fs,
     net::TcpListener,

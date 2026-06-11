@@ -1,11 +1,19 @@
+//! Approval wire helpers: proto enum conversion for approval records and the
+//! tamper-evident NDJSON export format (per-record checksums chained from a
+//! fixed seed). Consumed by the gateway gRPC service and approval export RPCs.
+
 use super::*;
 
+/// Returns the lowercase hex SHA-256 digest of `bytes`.
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())
 }
 
+// Chains the export checksums: each link commits to the schema id, the record
+// position, the previous link, and the record digest, so reordering, dropping,
+// or editing any exported record breaks every subsequent chain checksum.
 fn approval_export_chain_checksum(
     sequence: u64,
     previous_chain_checksum_sha256: &str,
@@ -22,6 +30,17 @@ fn approval_export_chain_checksum(
     hex::encode(hasher.finalize())
 }
 
+/// Serializes one approval record as an NDJSON export line and returns the
+/// line bytes (newline-terminated) together with the new chain checksum to
+/// feed into the next record.
+///
+/// The record is round-tripped through [`serde_json::Value`] before hashing
+/// so the checksum is computed over canonically ordered keys; a verifier can
+/// re-serialize the embedded `record` object and reproduce
+/// `record_checksum_sha256` from the line alone.
+///
+/// # Errors
+/// Returns `Status::internal` when the record cannot be serialized to JSON.
 #[allow(clippy::result_large_err)]
 pub(crate) fn approval_export_ndjson_record_line(
     record: &ApprovalRecord,
@@ -56,6 +75,11 @@ pub(crate) fn approval_export_ndjson_record_line(
     Ok((line, chain_checksum_sha256))
 }
 
+/// Serializes the export trailer line carrying the record count and the final
+/// chain checksum, letting consumers detect a truncated export.
+///
+/// # Errors
+/// Returns `Status::internal` when the trailer cannot be serialized to JSON.
 #[allow(clippy::result_large_err)]
 pub(crate) fn approval_export_ndjson_trailer_line(
     exported_records: usize,
@@ -74,6 +98,7 @@ pub(crate) fn approval_export_ndjson_trailer_line(
     Ok(line)
 }
 
+/// Converts a journal approval subject type to its proto enum value.
 pub(crate) fn approval_subject_type_to_proto(value: ApprovalSubjectType) -> i32 {
     match value {
         ApprovalSubjectType::Tool => gateway_v1::ApprovalSubjectType::Tool as i32,
@@ -87,6 +112,8 @@ pub(crate) fn approval_subject_type_to_proto(value: ApprovalSubjectType) -> i32 
     }
 }
 
+/// Parses a proto approval subject type; `None` for unspecified or unknown
+/// values so callers must decide how to treat an absent subject explicitly.
 pub(crate) fn approval_subject_type_from_proto(value: i32) -> Option<ApprovalSubjectType> {
     match gateway_v1::ApprovalSubjectType::try_from(value)
         .unwrap_or(gateway_v1::ApprovalSubjectType::Unspecified)
@@ -103,6 +130,7 @@ pub(crate) fn approval_subject_type_from_proto(value: i32) -> Option<ApprovalSub
     }
 }
 
+/// Converts a journal approval decision to its proto enum value.
 pub(crate) fn approval_decision_to_proto(value: ApprovalDecision) -> i32 {
     match value {
         ApprovalDecision::Allow => gateway_v1::ApprovalDecision::Allow as i32,
@@ -112,6 +140,8 @@ pub(crate) fn approval_decision_to_proto(value: ApprovalDecision) -> i32 {
     }
 }
 
+/// Parses a proto approval decision; `None` for unspecified or unknown values
+/// (an undecided approval), never silently coerced to allow or deny.
 pub(crate) fn approval_decision_from_proto(value: i32) -> Option<ApprovalDecision> {
     match gateway_v1::ApprovalDecision::try_from(value)
         .unwrap_or(gateway_v1::ApprovalDecision::Unspecified)
@@ -124,6 +154,7 @@ pub(crate) fn approval_decision_from_proto(value: i32) -> Option<ApprovalDecisio
     }
 }
 
+/// Converts a journal approval decision scope to its proto enum value.
 pub(crate) fn approval_scope_to_proto(value: ApprovalDecisionScope) -> i32 {
     match value {
         ApprovalDecisionScope::Once => common_v1::ApprovalDecisionScope::Once as i32,
@@ -132,10 +163,13 @@ pub(crate) fn approval_scope_to_proto(value: ApprovalDecisionScope) -> i32 {
     }
 }
 
+/// Parses a proto approval decision scope, defaulting to the narrowest scope.
 pub(crate) fn approval_scope_from_proto(value: i32) -> ApprovalDecisionScope {
     match common_v1::ApprovalDecisionScope::try_from(value)
         .unwrap_or(common_v1::ApprovalDecisionScope::Unspecified)
     {
+        // Unspecified or unknown scopes collapse to Once: an ambiguous client
+        // request must never widen a decision to session or timeboxed reuse.
         common_v1::ApprovalDecisionScope::Unspecified => ApprovalDecisionScope::Once,
         common_v1::ApprovalDecisionScope::Once => ApprovalDecisionScope::Once,
         common_v1::ApprovalDecisionScope::Session => ApprovalDecisionScope::Session,
@@ -143,6 +177,7 @@ pub(crate) fn approval_scope_from_proto(value: i32) -> ApprovalDecisionScope {
     }
 }
 
+/// Converts a journal approval risk level to its proto enum value.
 pub(crate) fn approval_risk_to_proto(value: ApprovalRiskLevel) -> i32 {
     match value {
         ApprovalRiskLevel::Low => common_v1::ApprovalRiskLevel::Low as i32,

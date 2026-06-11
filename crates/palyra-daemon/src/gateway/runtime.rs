@@ -1,3 +1,28 @@
+//! Gateway runtime state: [`GatewayRuntimeState`] is the daemon-wide hub that
+//! every transport (gRPC, HTTP console, QUIC) shares, together with the
+//! config/snapshot types it exposes.
+//!
+//! Relationship to its neighbours: `gateway.rs` (the parent module) owns tool
+//! dispatch, approval prompting, and run cleanup; `application::run_stream`
+//! drives the streaming agent loop. Both lean on this file for persistence and
+//! policy: orchestrator run lifecycle records (queued -> running -> waiting ->
+//! terminal, parsed via `RunLifecyclePhase`), tape pagination, cancel flags and
+//! run-completion wakeups (`orchestrator_run_notify`), approval decision
+//! caching, provider lease admission, and the journal-backed stores for
+//! sessions, memory, workspace, cron, flows, skills, and workers.
+//!
+//! Conventions used throughout this file:
+//! - Journal/SQLite access is synchronous. Each `*_blocking` method performs
+//!   the query and maps `JournalError` into a gRPC `Status`; its `pub async`
+//!   twin moves that call onto `tokio::task::spawn_blocking` so transports
+//!   never block the runtime. The async wrappers fail with `Status::internal`
+//!   when the worker panics.
+//! - `std::sync` locks guard in-memory state only and are never held across an
+//!   `.await`. Poisoned locks are recovered with `into_inner()` (warn and
+//!   continue) because the guarded data remains structurally valid.
+//! - Counters are relaxed atomics; they feed status snapshots, never control
+//!   flow.
+
 use super::*;
 use crate::agents::{
     AgentBindingOutcome, AgentBindingQuery, AgentBindingRequest, AgentDeleteOutcome, AgentListPage,
@@ -83,6 +108,11 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 mod external_retrieval;
 
+/// Immutable copy of the daemon configuration the gateway runtime was started with.
+///
+/// Captured once at startup and shared read-only. Settings that can be retuned
+/// at runtime (memory, retrieval, learning, routines) live separately in
+/// [`GatewayRuntimeState`] behind locks.
 #[derive(Debug, Clone)]
 pub struct GatewayRuntimeConfigSnapshot {
     pub grpc_bind_addr: String,
@@ -115,6 +145,8 @@ pub struct GatewayRuntimeConfigSnapshot {
     pub smart_routing: SmartRoutingRuntimeConfig,
 }
 
+/// Cursor-paginated filter for listing sessions scoped to a principal and
+/// device (plus optional channel and case-insensitive search).
 #[derive(Debug, Clone)]
 pub struct ListOrchestratorSessionsRequest {
     pub after_session_key: Option<String>,
@@ -126,6 +158,8 @@ pub struct ListOrchestratorSessionsRequest {
     pub search_query: Option<String>,
 }
 
+/// Cursor-paginated filter for listing sessions across all devices of one
+/// principal.
 #[derive(Debug, Clone)]
 pub struct ListPrincipalOrchestratorSessionsRequest {
     pub after_session_key: Option<String>,
@@ -135,6 +169,11 @@ pub struct ListPrincipalOrchestratorSessionsRequest {
     pub search_query: Option<String>,
 }
 
+/// Parameters for [`GatewayRuntimeState::wait_for_orchestrator_run`].
+///
+/// `return_on_waiting` makes the wait resolve as soon as the run parks in a
+/// waiting phase (for example pending approval) instead of only on terminal
+/// phases.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratorRunWaitRequest {
     pub run_id: String,
@@ -143,12 +182,15 @@ pub struct OrchestratorRunWaitRequest {
     pub return_on_waiting: bool,
 }
 
+/// Final run snapshot observed by a wait, plus its parsed canonical phase.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratorRunWaitOutcome {
     pub snapshot: OrchestratorRunStatusSnapshot,
     pub canonical_state: RunLifecyclePhase,
 }
 
+/// Live-tunable memory subsystem limits, auto-injection policy, and retention
+/// policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MemoryRuntimeConfig {
     pub max_item_bytes: usize,
@@ -162,6 +204,8 @@ pub struct MemoryRuntimeConfig {
     pub retention_vacuum_schedule: String,
 }
 
+/// Live-tunable learning/reflection pipeline settings; confidence thresholds
+/// are expressed in basis points (10000 = 1.0).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LearningRuntimeConfig {
     pub enabled: bool,
@@ -176,6 +220,9 @@ pub struct LearningRuntimeConfig {
     pub procedure_review_min_confidence_bps: u16,
 }
 
+/// Egress policy for the `http_fetch` tool: timeouts, size caps,
+/// redirect/header/content-type allowlists, credential vault-ref allowlist,
+/// and response caching.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HttpFetchRuntimeConfig {
     pub allow_private_targets: bool,
@@ -192,6 +239,8 @@ pub struct HttpFetchRuntimeConfig {
     pub max_cache_entries: usize,
 }
 
+/// Connection settings and response size caps for the external browser
+/// service (`palyra-browserd`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BrowserServiceRuntimeConfig {
     pub enabled: bool,
@@ -203,6 +252,8 @@ pub struct BrowserServiceRuntimeConfig {
     pub max_title_bytes: usize,
 }
 
+/// Canvas host limits: enablement, public base URL, token TTL, and
+/// state/bundle/update-rate caps.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CanvasHostRuntimeConfig {
     pub enabled: bool,
@@ -247,6 +298,8 @@ impl Default for LearningRuntimeConfig {
     }
 }
 
+/// Resolved tool approval decision as consumed by the run stream, including
+/// the scope and TTL that drive decision caching.
 #[derive(Debug, Clone)]
 pub(crate) struct ToolApprovalOutcome {
     pub(crate) approval_id: String,
@@ -267,6 +320,11 @@ struct CachedToolApprovalDecision {
     expires_at_unix_ms: Option<i64>,
 }
 
+/// Session-scoped cache of resolved approval decisions.
+///
+/// `generations` counts cache invalidations per session prefix so that a
+/// decision resolved before an invalidation cannot be written back afterwards
+/// (see [`GatewayRuntimeState::remember_tool_approval_if_generation`]).
 #[derive(Debug, Default)]
 struct ToolApprovalCacheState {
     decisions: HashMap<String, CachedToolApprovalDecision>,
@@ -282,30 +340,36 @@ fn bump_tool_approval_cache_generation(cache: &mut ToolApprovalCacheState, key_p
     *generation = generation.saturating_add(1);
 }
 
+/// Cached `http_fetch` tool response with an absolute expiry.
 #[derive(Debug, Clone)]
 pub(crate) struct CachedHttpFetchEntry {
     pub(crate) expires_at_unix_ms: i64,
     pub(crate) output_json: Vec<u8>,
 }
 
+/// Cached memory search hits; `expires_at_unix_ms` is the earliest TTL among
+/// the hits so the cache never serves an already-expired item.
 #[derive(Debug, Clone)]
 pub(crate) struct CachedMemorySearchEntry {
     pub(crate) hits: Vec<MemorySearchHit>,
     pub(crate) expires_at_unix_ms: Option<i64>,
 }
 
+/// Memory search hits plus retrieval branch diagnostics for observability.
 #[derive(Debug, Clone)]
 pub(crate) struct MemorySearchOutcome {
     pub(crate) hits: Vec<MemorySearchHit>,
     pub(crate) diagnostics: RetrievalBranchDiagnostics,
 }
 
+/// Workspace document search hits plus retrieval branch diagnostics.
 #[derive(Debug, Clone)]
 pub(crate) struct WorkspaceSearchOutcome {
     pub(crate) hits: Vec<WorkspaceSearchHit>,
     pub(crate) diagnostics: RetrievalBranchDiagnostics,
 }
 
+/// Skill attribution attached to a tool call (skill id plus optional version).
 #[derive(Debug, Clone)]
 pub(crate) struct ToolSkillContext {
     pub(crate) skill_id: String,
@@ -313,19 +377,24 @@ pub(crate) struct ToolSkillContext {
 }
 
 impl ToolSkillContext {
+    /// Creates a skill attribution from id and optional version.
     pub(crate) fn new(skill_id: String, version: Option<String>) -> Self {
         Self { skill_id, version }
     }
 
+    /// The skill identifier.
     pub(crate) fn skill_id(&self) -> &str {
         self.skill_id.as_str()
     }
 
+    /// The skill version, when one was specified.
     pub(crate) fn version(&self) -> Option<&str> {
         self.version.as_deref()
     }
 }
 
+/// Result of executing one approved tool proposal inside the run stream;
+/// `Cancelled` means the run was cancelled while the tool was in flight.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum RunStreamToolExecutionOutcome {
@@ -337,12 +406,15 @@ pub(crate) enum RunStreamToolExecutionOutcome {
     Cancelled,
 }
 
+/// Single canvas bundle asset: content type plus raw body bytes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct CanvasAssetRecord {
     pub(crate) content_type: String,
     pub(crate) body: Vec<u8>,
 }
 
+/// Validated canvas bundle: assets keyed by normalized path, a content hash,
+/// and the gateway-issued signature binding it to canvas/principal/session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct CanvasBundleRecord {
     pub(crate) bundle_id: String,
@@ -352,6 +424,9 @@ pub(crate) struct CanvasBundleRecord {
     pub(crate) signature: String,
 }
 
+/// In-memory canvas state: current state JSON/version, bundle, parent-origin
+/// allowlist, expiry, and the rolling per-minute update timestamps that back
+/// the update rate limit.
 #[derive(Debug, Clone)]
 pub(crate) struct CanvasRecord {
     pub(crate) canvas_id: String,
@@ -370,6 +445,8 @@ pub(crate) struct CanvasRecord {
     pub(crate) update_timestamps_unix_ms: VecDeque<i64>,
 }
 
+/// Rendered HTML shell served at `/canvas/v1/frame/{canvas_id}` together with
+/// the CSP header to attach to the response.
 #[derive(Debug, Clone, Serialize)]
 pub struct CanvasFrameDocument {
     pub canvas_id: String,
@@ -378,6 +455,7 @@ pub struct CanvasFrameDocument {
     pub expires_at_unix_ms: i64,
 }
 
+/// Canvas asset payload plus the CSP header to serve with it.
 #[derive(Debug, Clone)]
 pub struct CanvasAssetResponse {
     pub content_type: String,
@@ -385,6 +463,7 @@ pub struct CanvasAssetResponse {
     pub csp: String,
 }
 
+/// Canvas state document returned by the HTTP polling endpoint.
 #[derive(Debug, Clone, Serialize)]
 pub struct CanvasStateResponse {
     pub canvas_id: String,
@@ -397,6 +476,8 @@ pub struct CanvasStateResponse {
     pub expires_at_unix_ms: i64,
 }
 
+/// Client-facing handle to an active canvas: frame/runtime URLs plus a signed
+/// auth token bound to the canvas, principal, and session.
 #[derive(Debug, Clone, Serialize)]
 pub struct CanvasRuntimeDescriptor {
     pub canvas_id: String,
@@ -406,10 +487,14 @@ pub struct CanvasRuntimeDescriptor {
     pub expires_at_unix_ms: i64,
 }
 
+/// Maximum patch records fetched when assembling a canvas patch history
+/// response (further trimmed by the byte budget below).
 pub(crate) const CANVAS_PATCH_HISTORY_RESPONSE_ROW_LIMIT: usize = 100;
 const CANVAS_PATCH_HISTORY_RESPONSE_BYTE_LIMIT: usize = 4 * 1024 * 1024;
 const CANVAS_PATCH_HISTORY_RESPONSE_RECORD_OVERHEAD: usize = 256;
 
+/// Signed canvas token claims: canvas/principal/session scope, validity
+/// window, and a nonce making every issued token unique.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CanvasTokenPayload {
     pub(crate) canvas_id: String,
@@ -420,21 +505,27 @@ struct CanvasTokenPayload {
     nonce: String,
 }
 
+/// Fixed-window request counter for one principal's vault operations.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct VaultRateLimitEntry {
     window_started_at: Instant,
     requests_in_window: u32,
 }
 
+/// Journal storage settings surfaced in status snapshots.
 #[derive(Debug, Clone)]
 pub struct GatewayJournalConfigSnapshot {
     pub db_path: PathBuf,
     pub hash_chain_enabled: bool,
 }
 
+/// Externally constructed collaborators injected into
+/// [`GatewayRuntimeState::new_with_provider`].
 #[rustfmt::skip]
 pub struct GatewayRuntimeDependencies { pub model_provider: Arc<dyn ModelProvider>, pub vault: Arc<Vault>, pub auth_profile_registry: Option<Arc<AuthProfileRegistry>>, pub agent_registry: AgentRegistry, pub tool_posture_registry: ToolPostureRegistry, pub retrieval_backend: Arc<dyn RetrievalBackend>, pub external_retrieval_index: Arc<ExternalRetrievalRuntime>, pub conversation_bindings: ConversationBindingStore }
 
+/// Maps internal lease preview reason codes to operator-facing wording.
+/// Internal codes must not leak into user-visible errors (pinned by tests).
 fn provider_lease_pressure_reason(preview: &ProviderLeasePreviewSnapshot) -> &'static str {
     match preview.reason.as_deref() {
         Some("shared_capacity_exhausted") => "shared provider capacity is exhausted",
@@ -472,6 +563,8 @@ fn provider_lease_timeout_status(
     ))
 }
 
+/// Routines/objectives wiring installed late, once the scheduler is running
+/// (see [`GatewayRuntimeState::configure_routines_runtime`]).
 #[derive(Clone)]
 pub(crate) struct RoutinesRuntimeConfig {
     pub registry: Arc<crate::routines::RoutineRegistry>,
@@ -482,6 +575,8 @@ pub(crate) struct RoutinesRuntimeConfig {
     pub timezone_mode: crate::cron::CronTimezoneMode,
 }
 
+/// Live resources tied to a run (browser sessions, background process PIDs)
+/// that terminal-run cleanup must release.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RunCleanupResources {
     pub(crate) browser_session_ids: Vec<String>,
@@ -489,11 +584,15 @@ pub(crate) struct RunCleanupResources {
 }
 
 impl RunCleanupResources {
+    /// True when no resources remain registered for the run.
     pub(crate) fn is_empty(&self) -> bool {
         self.browser_session_ids.is_empty() && self.background_process_pids.is_empty()
     }
 }
 
+/// Bounded dedupe ledger of browser sessions that already closed, so terminal
+/// run cleanup does not try to close them again. Insertion order is kept so
+/// the oldest entries can be evicted once capacity is reached.
 #[derive(Debug, Default)]
 struct ClosedBrowserSessionLedger {
     ids: HashSet<String>,
@@ -524,6 +623,13 @@ impl ClosedBrowserSessionLedger {
     }
 }
 
+/// Daemon-wide gateway state shared (via `Arc`) by every transport surface.
+///
+/// Owns the journal store and all in-memory runtime state: counters, caches
+/// (memory search, http fetch, tool approvals), run cleanup bookkeeping,
+/// canvas records, provider leases, the channel router, and the worker fleet.
+/// All mutation goes through interior mutability; methods take `&self` (or
+/// `&Arc<Self>` for the `spawn_blocking` wrappers).
 pub struct GatewayRuntimeState {
     pub(crate) started_at: Instant,
     pub(crate) build: BuildSnapshot,
@@ -562,6 +668,9 @@ pub struct GatewayRuntimeState {
     pub(crate) self_healing: Arc<SelfHealingState>,
 }
 
+/// Relaxed atomic counters backing [`CountersSnapshot`]. All values count
+/// since process start except `journal_events`, which is seeded from the
+/// persisted journal total.
 #[derive(Debug)]
 pub(crate) struct RuntimeCounters {
     pub(crate) run_stream_requests: AtomicU64,
@@ -648,6 +757,7 @@ pub(crate) struct RuntimeCounters {
     canvas_denied: AtomicU64,
 }
 
+/// Build metadata reported in status responses.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct BuildSnapshot {
     pub(crate) version: String,
@@ -655,6 +765,7 @@ pub(crate) struct BuildSnapshot {
     pub(crate) build_profile: String,
 }
 
+/// Top-level admin status document returned by the gateway status endpoints.
 #[derive(Debug, Clone, Serialize)]
 pub struct GatewayStatusSnapshot {
     pub service: &'static str,
@@ -673,6 +784,7 @@ pub struct GatewayStatusSnapshot {
     pub request_context: RequestContext,
 }
 
+/// Listener addresses and transport toggles in the status document.
 #[derive(Debug, Clone, Serialize)]
 pub struct TransportSnapshot {
     pub grpc_bind_addr: String,
@@ -682,6 +794,7 @@ pub struct TransportSnapshot {
     pub quic_enabled: bool,
 }
 
+/// Security posture flags in the status document.
 #[derive(Debug, Clone, Serialize)]
 pub struct SecuritySnapshot {
     pub deny_by_default: bool,
@@ -694,6 +807,7 @@ pub struct SecuritySnapshot {
     pub smart_routing_default_mode: String,
 }
 
+/// Journal storage details in the status document.
 #[derive(Debug, Clone, Serialize)]
 pub struct StorageSnapshot {
     pub journal_db_path: String,
@@ -702,6 +816,7 @@ pub struct StorageSnapshot {
     pub latest_event_hash: Option<String>,
 }
 
+/// Point-in-time copy of [`RuntimeCounters`] for status responses.
 #[derive(Debug, Clone, Serialize)]
 pub struct CountersSnapshot {
     pub run_stream_requests: u64,
@@ -788,6 +903,7 @@ pub struct CountersSnapshot {
     pub canvas_denied: u64,
 }
 
+/// Agent registry summary in the status document; session ids are redacted.
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentRuntimeSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -796,12 +912,14 @@ pub struct AgentRuntimeSnapshot {
     pub active_session_bindings: Vec<AgentSessionBindingSnapshot>,
 }
 
+/// One active session-to-agent binding (redacted session id).
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentSessionBindingSnapshot {
     pub session_id_redacted: String,
     pub agent_id: String,
 }
 
+/// OAuth refresh attempt counts for a single provider.
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct AuthProviderRefreshMetricsSnapshot {
     pub provider: String,
@@ -810,6 +928,7 @@ pub struct AuthProviderRefreshMetricsSnapshot {
     pub failures: u64,
 }
 
+/// Aggregate OAuth refresh metrics, broken down per provider.
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct AuthRefreshMetricsSnapshot {
     pub attempts: u64,
@@ -818,6 +937,8 @@ pub struct AuthRefreshMetricsSnapshot {
     pub by_provider: Vec<AuthProviderRefreshMetricsSnapshot>,
 }
 
+/// Admin-facing auth health: profile summary, expiry buckets, and refresh
+/// metrics.
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct AuthAdminStatusSnapshot {
     pub summary: AuthHealthSummary,
@@ -825,6 +946,7 @@ pub struct AuthAdminStatusSnapshot {
     pub refresh_metrics: AuthRefreshMetricsSnapshot,
 }
 
+/// Most recent journal events plus chain metadata for admin inspection.
 #[derive(Debug, Clone, Serialize)]
 pub struct JournalRecentSnapshot {
     pub total_events: u64,
@@ -832,6 +954,8 @@ pub struct JournalRecentSnapshot {
     pub events: Vec<JournalEventRecord>,
 }
 
+/// Page of orchestrator tape events with entry/byte budget bookkeeping;
+/// `next_after_seq` is set when more events remain.
 #[derive(Debug, Clone, Serialize)]
 pub struct RunTapeSnapshot {
     pub run_id: String,
@@ -845,6 +969,7 @@ pub struct RunTapeSnapshot {
     pub events: Vec<OrchestratorTapeRecord>,
 }
 
+/// Run state right after a cancel request was recorded.
 #[derive(Debug, Clone, Serialize)]
 pub struct RunCancelSnapshot {
     pub run_id: String,
@@ -860,6 +985,7 @@ struct AuthProviderRefreshCounters {
     failures: u64,
 }
 
+/// Mutable refresh-metrics accumulator behind [`AuthRuntimeState`].
 #[derive(Debug, Default)]
 struct AuthRefreshMetricsState {
     attempts: AtomicU64,
@@ -916,6 +1042,8 @@ impl AuthRefreshMetricsState {
     }
 }
 
+/// OAuth profile refresh runtime: serializes refreshes per profile, records
+/// refresh metrics, and produces auth health snapshots for admin surfaces.
 #[derive(Clone)]
 pub struct AuthRuntimeState {
     registry: Arc<AuthProfileRegistry>,
@@ -925,6 +1053,7 @@ pub struct AuthRuntimeState {
 }
 
 impl AuthRuntimeState {
+    /// Creates the auth runtime over a profile registry and refresh adapter.
     #[must_use]
     pub fn new(
         registry: Arc<AuthProfileRegistry>,
@@ -938,23 +1067,36 @@ impl AuthRuntimeState {
         }
     }
 
+    /// Returns the underlying auth profile registry.
     pub fn registry(&self) -> &AuthProfileRegistry {
         self.registry.as_ref()
     }
 
+    /// Returns the current refresh metrics, sorted per provider.
     pub fn refresh_metrics_snapshot(&self) -> AuthRefreshMetricsSnapshot {
         self.refresh_metrics.snapshot()
     }
 
+    /// Records a refresh outcome into the metrics (no-op when nothing was
+    /// attempted).
     pub fn record_refresh_outcome(&self, outcome: &OAuthRefreshOutcome) {
         self.refresh_metrics.record_outcome(outcome);
     }
 
+    // One async mutex per profile id: refreshes for the same profile must not
+    // race each other (token rotation in the vault), while different profiles
+    // may refresh concurrently.
     fn refresh_lock(&self, profile_id: &str) -> Arc<AsyncMutex<()>> {
         let mut guard = self.refresh_locks.lock().unwrap_or_else(|error| error.into_inner());
         guard.entry(profile_id.to_owned()).or_insert_with(|| Arc::new(AsyncMutex::new(()))).clone()
     }
 
+    /// Refreshes one OAuth profile on a blocking worker, serialized per
+    /// profile id, and records the outcome in the refresh metrics.
+    ///
+    /// # Errors
+    /// Returns the mapped auth profile error, or `Status::internal` if the
+    /// worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn refresh_oauth_profile(
         self: &Arc<Self>,
@@ -980,6 +1122,12 @@ impl AuthRuntimeState {
         .map_err(|_| Status::internal("auth refresh worker panicked"))?
     }
 
+    /// Builds the admin auth status (health report plus refresh metrics) on a
+    /// blocking worker.
+    ///
+    /// # Errors
+    /// Returns the mapped auth profile error, or `Status::internal` if the
+    /// worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn admin_status_snapshot(
         self: &Arc<Self>,
@@ -1001,6 +1149,12 @@ impl AuthRuntimeState {
         .map_err(|_| Status::internal("auth status worker panicked"))?
     }
 
+    /// Refreshes all due OAuth profiles (optionally filtered by agent) and
+    /// returns the resulting health report, refresh outcomes, and metrics.
+    ///
+    /// # Errors
+    /// Returns the mapped auth profile error, or `Status::internal` if the
+    /// worker panicked.
     #[allow(clippy::result_large_err)]
     pub(crate) async fn refresh_health_report(
         self: &Arc<Self>,
@@ -1034,6 +1188,8 @@ impl AuthRuntimeState {
 }
 
 impl RuntimeCounters {
+    /// Copies every counter into a serializable snapshot (relaxed loads; the
+    /// values are not guaranteed to be mutually consistent).
     pub(crate) fn snapshot(&self) -> CountersSnapshot {
         CountersSnapshot {
             run_stream_requests: self.run_stream_requests.load(Ordering::Relaxed),
@@ -1171,6 +1327,8 @@ fn elapsed_millis(started_at: Instant) -> u64 {
     u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+/// Extracts the profile id from an `auth-profile:<provider>:<profile>`
+/// credential id; `None` for other credential id shapes.
 fn auth_profile_id_from_credential_id(credential_id: &str) -> Option<&str> {
     let mut parts = credential_id.splitn(3, ':');
     let prefix = parts.next()?;
@@ -1201,6 +1359,10 @@ fn provider_credential_attribution_from_parts(
     }
 }
 
+/// Resolves which credential actually served `provider_id`. The provider that
+/// answered may differ from the leased one when registry failover routed the
+/// request elsewhere, so the live snapshot is consulted before falling back to
+/// the lease context.
 fn provider_credential_attribution_for_provider(
     snapshot: &ProviderStatusSnapshot,
     lease_context: &ProviderLeaseExecutionContext,
@@ -1239,6 +1401,8 @@ fn provider_credential_attribution_for_provider(
     })
 }
 
+/// True when registry failover could route this request to another enabled
+/// chat provider, which makes per-credential failure attribution ambiguous.
 fn request_may_failover_to_other_provider(
     snapshot: &ProviderStatusSnapshot,
     model_override_requested: bool,
@@ -1278,6 +1442,8 @@ fn auth_profile_failure_kind_for_provider_error(
     }
 }
 
+/// Canonical fingerprint of a run start request, used to detect conflicting
+/// payloads behind the same idempotency key.
 fn orchestrator_run_start_payload_sha256(
     request: &OrchestratorRunStartRequest,
 ) -> Result<String, Status> {
@@ -1305,6 +1471,8 @@ fn stable_error_from_journal(code: &str, error: &JournalError) -> StableErrorEnv
     )
 }
 
+/// Parses the stored run state into the canonical lifecycle phase, failing
+/// closed on states this build does not know.
 fn canonical_phase_from_snapshot(
     snapshot: &OrchestratorRunStatusSnapshot,
 ) -> Result<RunLifecyclePhase, Status> {
@@ -1317,9 +1485,15 @@ fn canonical_phase_from_snapshot(
 }
 
 impl GatewayRuntimeState {
+    // Cache entries expire when the earliest hit TTL lapses, so a cached
+    // result can never include an item the journal already considers expired.
     fn cached_memory_search_expires_at(hits: &[MemorySearchHit]) -> Option<i64> {
         hits.iter().filter_map(|hit| hit.item.ttl_unix_ms).min()
     }
+
+    // Construction. `new` is the test-only convenience constructor with
+    // deterministic defaults; production wiring goes through
+    // `new_with_provider`.
 
     #[cfg(test)]
     pub fn new(
@@ -1349,6 +1523,17 @@ impl GatewayRuntimeState {
         )
     }
 
+    /// Builds the runtime state, recovering canvas records from journal
+    /// snapshots and seeding the journal event counter from the stored total.
+    ///
+    /// Canvas recovery is verified by replaying the patch chain and comparing
+    /// it against the latest snapshot; construction fails closed on any
+    /// divergence rather than serving a canvas whose history cannot be
+    /// reproduced.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when journal reads fail or canvas replay
+    /// verification does not match the persisted snapshots.
     pub fn new_with_provider(
         config: GatewayRuntimeConfigSnapshot,
         journal_config: GatewayJournalConfigSnapshot,
@@ -1522,14 +1707,22 @@ impl GatewayRuntimeState {
         }))
     }
 
+    // Counter recorders and run cleanup bookkeeping. The `record_*` methods
+    // are fire-and-forget; identifier arguments are trimmed and empty values
+    // ignored so malformed callers cannot poison the cleanup maps.
+
+    /// Counts a denied request.
     pub fn record_denied(&self) {
         self.counters.denied_requests.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Counts an admin status request.
     pub fn record_admin_status_request(&self) {
         self.counters.admin_status_requests.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Registers a browser session for cleanup when the run terminates,
+    /// clearing any stale closed-marker for the same session first.
     pub(crate) fn record_run_browser_session(&self, run_id: &str, session_id: &str) {
         let run_id = run_id.trim();
         let session_id = session_id.trim();
@@ -1555,6 +1748,8 @@ impl GatewayRuntimeState {
         }
     }
 
+    /// Marks a browser session as already closed so terminal-run cleanup
+    /// skips it.
     pub(crate) fn record_closed_browser_session(&self, session_id: &str) {
         let session_id = session_id.trim();
         if session_id.is_empty() {
@@ -1573,6 +1768,7 @@ impl GatewayRuntimeState {
         }
     }
 
+    /// Clears the closed-marker for a browser session (it is live again).
     pub(crate) fn forget_closed_browser_session(&self, session_id: &str) {
         let session_id = session_id.trim();
         if session_id.is_empty() {
@@ -1591,6 +1787,7 @@ impl GatewayRuntimeState {
         }
     }
 
+    /// Whether a browser session is marked as already closed.
     pub(crate) fn is_browser_session_closed(&self, session_id: &str) -> bool {
         let session_id = session_id.trim();
         if session_id.is_empty() {
@@ -1610,6 +1807,8 @@ impl GatewayRuntimeState {
         }
     }
 
+    /// Unregisters a browser session from the run's cleanup set, dropping the
+    /// run entry when nothing remains.
     pub(crate) fn forget_run_browser_session(&self, run_id: &str, session_id: &str) {
         let run_id = run_id.trim();
         let session_id = session_id.trim();
@@ -1636,6 +1835,8 @@ impl GatewayRuntimeState {
         }
     }
 
+    /// Registers a background process PID for cleanup when the run
+    /// terminates.
     pub(crate) fn record_run_background_process(&self, run_id: &str, pid: u32) {
         let run_id = run_id.trim();
         if run_id.is_empty() || pid == 0 {
@@ -1660,6 +1861,8 @@ impl GatewayRuntimeState {
         }
     }
 
+    /// Unregisters a background process PID from the run's cleanup set,
+    /// dropping the run entry when nothing remains.
     pub(crate) fn forget_run_background_process(&self, run_id: &str, pid: u32) {
         let run_id = run_id.trim();
         if run_id.is_empty() || pid == 0 {
@@ -1686,6 +1889,7 @@ impl GatewayRuntimeState {
         }
     }
 
+    /// Lists the background process PIDs currently registered for a run.
     pub(crate) fn list_run_background_processes(&self, run_id: &str) -> Vec<u32> {
         let run_id = run_id.trim();
         if run_id.is_empty() {
@@ -1708,6 +1912,8 @@ impl GatewayRuntimeState {
         }
     }
 
+    /// Removes and returns everything still registered for the run; cleanup
+    /// consumes the entry so a second cleanup pass finds nothing to do.
     pub(crate) fn take_run_cleanup_resources(&self, run_id: &str) -> RunCleanupResources {
         let run_id = run_id.trim();
         if run_id.is_empty() {
@@ -1726,6 +1932,9 @@ impl GatewayRuntimeState {
             }
         }
     }
+
+    // Self-healing: thin delegates to `SelfHealingState`; the names mirror
+    // the methods they forward to.
 
     #[must_use]
     pub(crate) fn self_healing_settings_snapshot(&self) -> SelfHealingSettingsSnapshot {
@@ -1840,6 +2049,8 @@ impl GatewayRuntimeState {
         self.counters.memory_auto_inject_events.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Prepends a context assembly trace, keeping only the most recent few
+    /// for the diagnostics endpoint.
     pub(crate) fn record_context_assembly_trace(&self, trace: Value) {
         const MAX_RECENT_CONTEXT_ASSEMBLY_TRACES: usize = 16;
 
@@ -1854,6 +2065,7 @@ impl GatewayRuntimeState {
         traces.truncate(MAX_RECENT_CONTEXT_ASSEMBLY_TRACES);
     }
 
+    /// Copies the retained context assembly traces, newest first.
     #[must_use]
     pub(crate) fn context_assembly_traces_snapshot(&self) -> Vec<Value> {
         match self.recent_context_assembly_traces.lock() {
@@ -1881,6 +2093,9 @@ impl GatewayRuntimeState {
         self.counters.learning_candidates_auto_applied.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Counts an allow/deny tool decision. Denials also count as denied
+    /// requests, and process-runner denials additionally count as sandbox
+    /// policy denies.
     pub(crate) fn record_tool_decision(&self, tool_name: &str, decision_allowed: bool) {
         if decision_allowed {
             self.counters.tool_decisions_allowed.fetch_add(1, Ordering::Relaxed);
@@ -1898,6 +2113,12 @@ impl GatewayRuntimeState {
         self.counters.skill_execution_denied.fetch_add(1, Ordering::Relaxed);
     }
 
+    // Canvas host. In-memory records live behind `canvas_records`; every
+    // state transition is journaled while that lock is held so the persisted
+    // patch sequence can never diverge from the in-memory version counter.
+    // Public HTTP access (frame, runtime assets, state polling) is authorized
+    // exclusively through signed canvas tokens.
+
     #[allow(clippy::result_large_err)]
     fn ensure_canvas_host_enabled(&self) -> Result<(), Status> {
         if self.config.canvas_host.enabled {
@@ -1907,6 +2128,14 @@ impl GatewayRuntimeState {
         }
     }
 
+    /// Creates a canvas: validates state/bundle limits, signs the bundle,
+    /// journals the initial transition, and issues the first runtime
+    /// descriptor with a signed auth token.
+    ///
+    /// # Errors
+    /// `failed_precondition` when the canvas host is disabled,
+    /// `invalid_argument`/`resource_exhausted` for malformed or oversized
+    /// payloads, and `already_exists` for duplicate canvas ids.
     #[allow(clippy::result_large_err)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn create_canvas(
@@ -1966,6 +2195,9 @@ impl GatewayRuntimeState {
             session_id.as_str(),
         );
 
+        // The registry lock stays held through the journal write below so the
+        // duplicate-id check and the persisted transition are atomic with the
+        // in-memory insert.
         let mut records = self
             .canvas_records
             .lock()
@@ -2049,6 +2281,15 @@ impl GatewayRuntimeState {
         Ok((record, descriptor))
     }
 
+    /// Applies a full-state replacement or JSON patch to a canvas, enforcing
+    /// version/schema preconditions and the per-minute update rate limit, and
+    /// journals the resulting transition.
+    ///
+    /// # Errors
+    /// `invalid_argument` for malformed payloads, `failed_precondition` for
+    /// version/schema mismatches or closed canvases, `permission_denied` for
+    /// principal mismatch or expiry, and `resource_exhausted` for size or
+    /// rate limits.
     #[allow(clippy::result_large_err)]
     pub(crate) fn update_canvas_state(
         &self,
@@ -2175,6 +2416,8 @@ impl GatewayRuntimeState {
         }
         let next_state_version = record.state_version + 1;
 
+        // Sliding-window rate limit: drop timestamps older than one minute,
+        // then reject the update if the window is already at capacity.
         while record
             .update_timestamps_unix_ms
             .front()
@@ -2232,6 +2475,12 @@ impl GatewayRuntimeState {
         Ok(record.clone())
     }
 
+    /// Closes a canvas (idempotent), journaling one final transition with the
+    /// close reason.
+    ///
+    /// # Errors
+    /// `not_found` for unknown ids, `permission_denied` for principal
+    /// mismatch, and journal mapping errors from persisting the transition.
     #[allow(clippy::result_large_err)]
     pub(crate) fn close_canvas(
         &self,
@@ -2314,6 +2563,11 @@ impl GatewayRuntimeState {
         Ok(record.clone())
     }
 
+    /// Loads a canvas record, enforcing principal ownership.
+    ///
+    /// # Errors
+    /// `not_found` for unknown ids, `permission_denied` for principal
+    /// mismatch.
     #[allow(clippy::result_large_err)]
     pub(crate) fn get_canvas(
         &self,
@@ -2336,6 +2590,11 @@ impl GatewayRuntimeState {
         Ok(record.clone())
     }
 
+    /// Lists journal-backed state patches after a version (limit clamped to
+    /// the streaming batch maximum).
+    ///
+    /// # Errors
+    /// Ownership errors from [`Self::get_canvas`] plus mapped journal errors.
     #[allow(clippy::result_large_err)]
     pub(crate) fn list_canvas_state_patches(
         &self,
@@ -2351,6 +2610,11 @@ impl GatewayRuntimeState {
             .map_err(|error| map_canvas_store_error("list_canvas_state_patches", error))
     }
 
+    /// Lists the principal's canvases for one session, newest update first.
+    ///
+    /// # Errors
+    /// `invalid_argument` for non-canonical session ids; `failed_precondition`
+    /// when the canvas host is disabled.
     #[allow(clippy::result_large_err)]
     pub(crate) fn list_session_canvases(
         &self,
@@ -2381,6 +2645,12 @@ impl GatewayRuntimeState {
         Ok(scoped)
     }
 
+    /// Issues a fresh runtime descriptor (and token) for an existing canvas;
+    /// the token expiry never outlives the canvas session itself.
+    ///
+    /// # Errors
+    /// Ownership errors from [`Self::get_canvas`]; `failed_precondition` when
+    /// the canvas session already expired.
     #[allow(clippy::result_large_err)]
     pub(crate) fn issue_canvas_runtime_descriptor(
         &self,
@@ -2421,6 +2691,13 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Restores a canvas to an earlier persisted state version by replaying
+    /// that version's resulting state as a new update (history only ever
+    /// moves forward; no versions are rewritten).
+    ///
+    /// # Errors
+    /// `invalid_argument` for version 0, `not_found` for unknown versions,
+    /// `failed_precondition` for closed canvases or closed target revisions.
     #[allow(clippy::result_large_err)]
     pub(crate) fn restore_canvas_state(
         &self,
@@ -2461,6 +2738,11 @@ impl GatewayRuntimeState {
         )
     }
 
+    /// Renders the HTML shell for the canvas iframe; access is authorized by
+    /// the signed token in the URL, not by request principal.
+    ///
+    /// # Errors
+    /// Token/ownership errors from `Self::authorize_canvas_http_request`.
     #[allow(clippy::result_large_err)]
     pub fn canvas_frame_document(
         &self,
@@ -2510,6 +2792,11 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Serves the generated canvas runtime script (state polling plus
+    /// postMessage bridge restricted to the allowed parent origins).
+    ///
+    /// # Errors
+    /// Token/ownership errors from `Self::authorize_canvas_http_request`.
     #[allow(clippy::result_large_err)]
     pub fn canvas_runtime_script(
         &self,
@@ -2582,6 +2869,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Serves the static canvas stylesheet.
+    ///
+    /// # Errors
+    /// Token/ownership errors from `Self::authorize_canvas_http_request`.
     #[allow(clippy::result_large_err)]
     pub fn canvas_runtime_stylesheet(
         &self,
@@ -2602,6 +2893,11 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Serves one asset from the canvas bundle by normalized path.
+    ///
+    /// # Errors
+    /// Token/ownership errors from `Self::authorize_canvas_http_request`;
+    /// `not_found` for unknown asset paths.
     #[allow(clippy::result_large_err)]
     pub fn canvas_bundle_asset(
         &self,
@@ -2624,6 +2920,11 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Returns the current canvas state, or `None` when `after_version` is
+    /// already current (the HTTP layer turns that into 204 No Content).
+    ///
+    /// # Errors
+    /// Token/ownership errors from `Self::authorize_canvas_http_request`.
     #[allow(clippy::result_large_err)]
     pub fn canvas_state(
         &self,
@@ -2649,6 +2950,11 @@ impl GatewayRuntimeState {
         }))
     }
 
+    /// Loads recent patch history for a canvas, trimmed to the response row
+    /// and byte budgets (newest records win).
+    ///
+    /// # Errors
+    /// Mapped journal errors from the patch history read.
     #[allow(clippy::result_large_err)]
     pub(crate) fn load_canvas_patch_history(
         &self,
@@ -2664,6 +2970,9 @@ impl GatewayRuntimeState {
         ))
     }
 
+    // Walks history newest-first so the byte budget keeps the most recent
+    // contiguous records; oversized records at the newest edge are skipped
+    // until something fits (pinned by a unit test below).
     fn limit_canvas_patch_history_response(
         history: Vec<CanvasStatePatchRecord>,
         max_response_bytes: usize,
@@ -2698,6 +3007,9 @@ impl GatewayRuntimeState {
             .saturating_add(record.actor_device_id.len())
     }
 
+    /// Verifies a canvas token and checks that its scope (canvas, principal,
+    /// session) matches the live record and that neither token nor canvas has
+    /// expired. Every rejection increments the `canvas_denied` counter.
     #[allow(clippy::result_large_err)]
     fn authorize_canvas_http_request(
         &self,
@@ -2814,6 +3126,13 @@ impl GatewayRuntimeState {
         Ok(bounded)
     }
 
+    // AIDEV-NOTE: canvas bundle/token signing uses SHA-256 over
+    // secret-prefixed input rather than HMAC-SHA256. A prefix MAC is
+    // theoretically open to length-extension; practical forgery is blocked
+    // here because appended SHA-256 padding bytes can never form valid
+    // base64url/JSON payloads, and verification compares in constant time.
+    // Migrating to a real HMAC would change every issued signature/token, so
+    // it needs a coordinated behavior change, not a comment-level fix.
     fn sign_canvas_bundle(
         &self,
         canvas_id: &str,
@@ -2834,6 +3153,9 @@ impl GatewayRuntimeState {
         URL_SAFE_NO_PAD.encode(hasher.finalize())
     }
 
+    /// Issues a `payload_b64.signature` token scoped to canvas, principal,
+    /// and session (see the signing AIDEV-NOTE above). The signing secret is
+    /// generated per process, so tokens do not survive a daemon restart.
     #[allow(clippy::result_large_err)]
     fn issue_canvas_token(
         &self,
@@ -2889,6 +3211,16 @@ impl GatewayRuntimeState {
         Ok(payload)
     }
 
+    // Journal event recording and vault access (rate limiting, counters, and
+    // spawn_blocking wrappers around the synchronous vault backends).
+
+    /// Appends a journal event, updating event/redaction counters and warning
+    /// when the write exceeds the latency budget.
+    ///
+    /// # Errors
+    /// `already_exists` for duplicate event ids, `resource_exhausted` when the
+    /// journal capacity is reached, `internal` for other persistence failures
+    /// (the persist-failure counter is bumped for the latter two).
     #[allow(clippy::result_large_err)]
     pub(crate) fn record_journal_event_blocking(
         &self,
@@ -2930,6 +3262,11 @@ impl GatewayRuntimeState {
         Ok(outcome)
     }
 
+    /// Async wrapper for [`Self::record_journal_event_blocking`] on a
+    /// blocking worker.
+    ///
+    /// # Errors
+    /// Same as the blocking variant, plus `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub(crate) async fn record_journal_event(
         self: &Arc<Self>,
@@ -2941,6 +3278,13 @@ impl GatewayRuntimeState {
             .map_err(|_| Status::internal("journal write worker panicked"))?
     }
 
+    /// Consumes one slot from the principal's fixed-window vault rate limit;
+    /// returns `false` when the budget is exhausted.
+    ///
+    /// Fails closed: a poisoned lock denies the request. The bucket map is
+    /// bounded; when full, stale windows are pruned and, if still full, the
+    /// principal with the oldest window is evicted so an attacker cannot grow
+    /// the map without bound by rotating principals.
     pub(crate) fn consume_vault_rate_limit(&self, principal: &str) -> bool {
         let now = Instant::now();
         let mut buckets = match self.vault_rate_limit.lock() {
@@ -3006,6 +3350,10 @@ impl GatewayRuntimeState {
         self.counters.vault_list_requests.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Stores a secret in the vault scope on a blocking worker.
+    ///
+    /// # Errors
+    /// Returns the mapped vault error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub(crate) async fn vault_put_secret(
         self: &Arc<Self>,
@@ -3022,6 +3370,10 @@ impl GatewayRuntimeState {
         .map_err(|error| map_vault_error("put secret", error))
     }
 
+    /// Reads a secret from the vault scope on a blocking worker.
+    ///
+    /// # Errors
+    /// Returns the mapped vault error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub(crate) async fn vault_get_secret(
         self: &Arc<Self>,
@@ -3035,6 +3387,11 @@ impl GatewayRuntimeState {
             .map_err(|error| map_vault_error("get secret", error))
     }
 
+    /// Deletes a secret from the vault scope on a blocking worker; returns
+    /// whether it existed.
+    ///
+    /// # Errors
+    /// Returns the mapped vault error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub(crate) async fn vault_delete_secret(
         self: &Arc<Self>,
@@ -3048,6 +3405,11 @@ impl GatewayRuntimeState {
             .map_err(|error| map_vault_error("delete secret", error))
     }
 
+    /// Lists secret metadata in the vault scope on a blocking worker (values
+    /// are never returned by this call).
+    ///
+    /// # Errors
+    /// Returns the mapped vault error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub(crate) async fn vault_list_secrets(
         self: &Arc<Self>,
@@ -3060,6 +3422,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_vault_error("list secrets", error))
     }
 
+    // Status snapshots and model provider execution.
+
+    /// Assembles the full gateway status document. Performs synchronous
+    /// journal reads; call [`Self::status_snapshot_async`] from async code.
     pub fn status_snapshot(
         &self,
         context: RequestContext,
@@ -3127,6 +3493,10 @@ impl GatewayRuntimeState {
         }
     }
 
+    /// Builds [`Self::status_snapshot`] on a blocking worker.
+    ///
+    /// # Errors
+    /// `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn status_snapshot_async(
         self: &Arc<Self>,
@@ -3139,6 +3509,11 @@ impl GatewayRuntimeState {
             .map_err(|_| Status::internal("status snapshot worker panicked"))
     }
 
+    /// Loads the most recent journal events plus totals (limit clamped to
+    /// `MAX_JOURNAL_RECENT_EVENTS`).
+    ///
+    /// # Errors
+    /// `internal` when journal reads fail.
     #[allow(clippy::result_large_err)]
     pub(crate) fn recent_journal_snapshot_blocking(
         &self,
@@ -3159,6 +3534,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Async wrapper for `Self::recent_journal_snapshot_blocking`.
+    ///
+    /// # Errors
+    /// Same as the blocking variant, plus `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn recent_journal_snapshot(
         self: &Arc<Self>,
@@ -3170,25 +3549,35 @@ impl GatewayRuntimeState {
             .map_err(|_| Status::internal("journal read worker panicked"))?
     }
 
+    /// Whether the v1 orchestrator run loop is enabled by configuration.
     #[must_use]
     pub const fn is_orchestrator_runloop_enabled(&self) -> bool {
         self.config.orchestrator_runloop_v1_enabled
     }
 
+    /// Current model provider/registry status.
     #[must_use]
     pub fn model_provider_status_snapshot(&self) -> ProviderStatusSnapshot {
         self.model_provider.status_snapshot()
     }
 
+    /// Current provider lease manager state (active leases and waiters).
     #[must_use]
     pub fn provider_lease_snapshot(&self) -> ProviderLeaseManagerSnapshot {
         self.provider_leases.snapshot()
     }
 
+    /// Feeds a credential health signal (success, rate limit, quota, auth,
+    /// transient) into the lease manager's cooldown logic.
     pub fn record_provider_credential_feedback(&self, request: ProviderCredentialFeedbackRequest) {
         self.provider_leases.record_credential_feedback(request);
     }
 
+    /// Snapshot of the retrieval backend including memory embeddings status.
+    ///
+    /// # Errors
+    /// Returns the mapped memory store error when the embeddings status read
+    /// fails.
     #[allow(clippy::result_large_err)]
     pub fn retrieval_backend_snapshot(&self) -> Result<RetrievalBackendSnapshot, Status> {
         let embeddings_status = self
@@ -3198,6 +3587,9 @@ impl GatewayRuntimeState {
         Ok(self.retrieval_backend.snapshot(&self.retrieval_config_snapshot(), &embeddings_status))
     }
 
+    /// Previews lease admission for a provider/credential without acquiring
+    /// or queueing anything. `task_label` is accepted for signature parity
+    /// with acquisition but does not influence the preview.
     #[must_use]
     pub fn preview_provider_lease(
         &self,
@@ -3216,6 +3608,11 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Test-only completion path that skips lease admission while still
+    /// updating provider counters.
+    ///
+    /// # Errors
+    /// Returns the mapped provider error.
     #[cfg(test)]
     #[allow(clippy::result_large_err)]
     pub async fn execute_model_provider(
@@ -3249,6 +3646,16 @@ impl GatewayRuntimeState {
         }
     }
 
+    /// Completes a model request under provider lease admission.
+    ///
+    /// Waits for (or is refused) a lease first, then runs the request and
+    /// feeds credential-health and auth-profile signals back from the
+    /// outcome. The lease guard is held for the whole provider call so
+    /// concurrency limits hold.
+    ///
+    /// # Errors
+    /// `resource_exhausted` when capacity is busy or the lease wait times
+    /// out, otherwise the mapped provider error.
     #[allow(clippy::result_large_err)]
     pub async fn execute_model_provider_with_lease(
         self: &Arc<Self>,
@@ -3314,6 +3721,10 @@ impl GatewayRuntimeState {
                         .model_provider_circuit_open_rejections
                         .fetch_add(1, Ordering::Relaxed);
                 }
+                // When registry failover could have routed the request to a
+                // different provider, the final error cannot be attributed to
+                // the leased credential, so failure feedback is suppressed to
+                // avoid cooling down (or flagging) a healthy credential.
                 let provider_status = self.model_provider.status_snapshot();
                 if !request_may_failover_to_other_provider(
                     &provider_status,
@@ -3401,6 +3812,11 @@ impl GatewayRuntimeState {
         });
     }
 
+    /// Transcribes audio through the model provider, updating provider
+    /// counters (no lease admission; transcription is not lease-governed).
+    ///
+    /// # Errors
+    /// Returns the mapped provider error.
     #[allow(clippy::result_large_err)]
     pub async fn execute_audio_transcription(
         self: &Arc<Self>,
@@ -3433,6 +3849,11 @@ impl GatewayRuntimeState {
         }
     }
 
+    // Orchestrator sessions, usage accounting, and agent registry access.
+    // From here to the end of the impl, most methods follow the
+    // blocking/async delegate pattern described in the module header; the
+    // async wrapper is the documented public surface.
+
     #[allow(clippy::result_large_err)]
     fn resolve_orchestrator_session_blocking(
         &self,
@@ -3443,6 +3864,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("resolve orchestrator session", error))
     }
 
+    /// Resolves (or creates) the orchestrator session for a conversation context.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn resolve_orchestrator_session(
         self: &Arc<Self>,
@@ -3464,6 +3889,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Updates a session title.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn update_orchestrator_session_title(
         self: &Arc<Self>,
@@ -3497,6 +3926,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Loads a session by id.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn orchestrator_session_by_id(
         self: &Arc<Self>,
@@ -3508,6 +3941,10 @@ impl GatewayRuntimeState {
             .map_err(|_| Status::internal("orchestrator session lookup worker panicked"))?
     }
 
+    /// Loads a read-only snapshot of a session by id.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn orchestrator_session_by_id_snapshot(
         self: &Arc<Self>,
@@ -3531,6 +3968,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Loads the per-session project context state, if any.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn session_project_context_state(
         self: &Arc<Self>,
@@ -3554,6 +3995,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Creates or updates the per-session project context state.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn upsert_session_project_context_state(
         self: &Arc<Self>,
@@ -3577,6 +4022,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Copies project context state between sessions; `None` when the source has no state.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn copy_session_project_context_state(
         self: &Arc<Self>,
@@ -3600,6 +4049,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Updates a session's quick-control settings.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn update_orchestrator_session_quick_controls(
         self: &Arc<Self>,
@@ -3625,6 +4078,9 @@ impl GatewayRuntimeState {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(|value| value.to_ascii_lowercase());
+        // Search cannot be pushed into the store query, so matching pages are
+        // scanned in store order until limit+1 hits are collected; the extra
+        // hit only signals has_more and is truncated below.
         let mut sessions = if let Some(search) = normalized_search.as_deref() {
             let mut matched = Vec::new();
             let mut cursor = request.after_session_key.clone();
@@ -3697,6 +4153,11 @@ impl GatewayRuntimeState {
         Ok((sessions, next_after_session_key))
     }
 
+    /// Lists sessions for a principal/device with cursor pagination and optional case-insensitive
+    /// search over title/preview/intent/summary/run-state.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn list_orchestrator_sessions(
         self: &Arc<Self>,
@@ -3708,6 +4169,8 @@ impl GatewayRuntimeState {
             .map_err(|_| Status::internal("orchestrator session list worker panicked"))?
     }
 
+    // Same pagination/search shape as list_orchestrator_sessions_blocking,
+    // but scoped to the principal across devices.
     fn list_orchestrator_sessions_for_principal_blocking(
         &self,
         request: &ListPrincipalOrchestratorSessionsRequest,
@@ -3790,6 +4253,10 @@ impl GatewayRuntimeState {
         Ok((sessions, next_after_session_key))
     }
 
+    /// Like [`Self::list_orchestrator_sessions`] but scoped to the principal across all devices.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn list_orchestrator_sessions_for_principal(
         self: &Arc<Self>,
@@ -3815,6 +4282,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("summarize orchestrator usage", error))
     }
 
+    /// Aggregates orchestrator usage for the query window.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn summarize_orchestrator_usage(
         self: &Arc<Self>,
@@ -3836,6 +4307,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Lists per-session usage rows for the query window.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn list_orchestrator_usage_sessions(
         self: &Arc<Self>,
@@ -3860,6 +4335,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("get orchestrator usage session", error))
     }
 
+    /// Loads one session's usage plus up to `run_limit` of its run records.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn get_orchestrator_usage_session(
         self: &Arc<Self>,
@@ -3886,6 +4365,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("cleanup orchestrator session", error))
     }
 
+    /// Archives/cleans a session per the cleanup request.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn cleanup_orchestrator_session(
         self: &Arc<Self>,
@@ -3908,6 +4391,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_agent_registry_error("list agents", error))
     }
 
+    /// Lists agents with cursor pagination.
+    ///
+    /// # Errors
+    /// Returns the mapped agent registry error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn list_agents(
         self: &Arc<Self>,
@@ -3929,6 +4416,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_agent_registry_error("get agent", error))
     }
 
+    /// Loads an agent record; the bool flags whether it is the default agent.
+    ///
+    /// # Errors
+    /// Returns the mapped agent registry error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn get_agent(
         self: &Arc<Self>,
@@ -3950,6 +4441,11 @@ impl GatewayRuntimeState {
             .map_err(|error| map_agent_registry_error("create agent", error))
     }
 
+    /// Creates an agent, defaulting its model profile from the provider registry when unset;
+    /// updates mutation/validation counters.
+    ///
+    /// # Errors
+    /// Returns the mapped agent registry error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn create_agent(
         self: &Arc<Self>,
@@ -4002,6 +4498,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_agent_registry_error("delete agent", error))
     }
 
+    /// Deletes an agent; updates mutation/validation counters.
+    ///
+    /// # Errors
+    /// Returns the mapped agent registry error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn delete_agent(
         self: &Arc<Self>,
@@ -4029,6 +4529,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_agent_registry_error("set default agent", error))
     }
 
+    /// Marks an agent as the default; updates mutation/validation counters.
+    ///
+    /// # Errors
+    /// Returns the mapped agent registry error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn set_default_agent(
         self: &Arc<Self>,
@@ -4060,6 +4564,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_agent_registry_error("list agent bindings", error))
     }
 
+    /// Lists session-agent bindings matching the query.
+    ///
+    /// # Errors
+    /// Returns the mapped agent registry error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn list_agent_bindings(
         self: &Arc<Self>,
@@ -4088,6 +4596,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_agent_registry_error("bind agent for context", error))
     }
 
+    /// Binds an agent to a conversation context; updates mutation/validation counters.
+    ///
+    /// # Errors
+    /// Returns the mapped agent registry error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn bind_agent_for_context(
         self: &Arc<Self>,
@@ -4121,6 +4633,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_agent_registry_error("unbind agent for context", error))
     }
 
+    /// Removes an agent binding; counts a mutation only when something was actually removed.
+    ///
+    /// # Errors
+    /// Returns the mapped agent registry error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn unbind_agent_for_context(
         self: &Arc<Self>,
@@ -4156,6 +4672,11 @@ impl GatewayRuntimeState {
             .map_err(|error| map_agent_registry_error("resolve agent for context", error))
     }
 
+    /// Resolves the agent for a context, recording binding hit/miss counters and any binding
+    /// created on the way.
+    ///
+    /// # Errors
+    /// Returns the mapped agent registry error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn resolve_agent_for_context(
         self: &Arc<Self>,
@@ -4186,6 +4707,11 @@ impl GatewayRuntimeState {
         result
     }
 
+    // Run lifecycle: idempotent start, metadata/state updates, tape, cancel
+    // flags, startup recovery, and run-completion waiting.
+
+    // Returns Ok(true) only when this call actually inserted the run, so the
+    // async wrapper counts each run exactly once across idempotent retries.
     #[allow(clippy::result_large_err)]
     fn start_orchestrator_run_blocking(
         &self,
@@ -4224,6 +4750,9 @@ impl GatewayRuntimeState {
                 self.complete_run_start_idempotency(idempotency_key.as_str(), request)?;
                 Ok(true)
             }
+            // A duplicate run id on a retry/reserved decision means an
+            // earlier attempt inserted the run but crashed before completing
+            // the idempotency record: finish that record and report replay.
             Err(JournalError::DuplicateRunId { .. })
                 if matches!(
                     begin.decision,
@@ -4245,6 +4774,13 @@ impl GatewayRuntimeState {
         }
     }
 
+    /// Starts a run idempotently: replays of the same start payload are
+    /// accepted without effect, conflicting payloads under the same run id
+    /// are rejected. Wakes run waiters either way.
+    ///
+    /// # Errors
+    /// `already_exists` for conflicting idempotent payloads, otherwise the
+    /// mapped journal error or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn start_orchestrator_run(
         self: &Arc<Self>,
@@ -4292,6 +4828,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Updates run metadata (intent, summary, parameters).
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn update_orchestrator_run_metadata(
         self: &Arc<Self>,
@@ -4317,6 +4857,12 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("update orchestrator run state", error))
     }
 
+    /// Transitions a run's lifecycle state, bumping completed/cancelled
+    /// counters on terminal states, and wakes run waiters.
+    ///
+    /// # Errors
+    /// Returns the mapped journal error, or `internal` if the worker
+    /// panicked.
     #[allow(clippy::result_large_err)]
     pub async fn update_orchestrator_run_state(
         self: &Arc<Self>,
@@ -4354,6 +4900,12 @@ impl GatewayRuntimeState {
         )
     }
 
+    /// Marks runs left non-terminal by a previous daemon process as failed
+    /// with `reason`; wakes run waiters when anything changed.
+    ///
+    /// # Errors
+    /// Returns the mapped journal error, or `internal` if the worker
+    /// panicked.
     #[allow(clippy::result_large_err)]
     pub async fn terminalize_orphaned_orchestrator_runs_on_startup(
         self: &Arc<Self>,
@@ -4382,6 +4934,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("update orchestrator usage", error))
     }
 
+    /// Accumulates a usage delta onto run and session totals.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn add_orchestrator_usage(
         self: &Arc<Self>,
@@ -4404,6 +4960,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("list orchestrator usage runs", error))
     }
 
+    /// Lists usage-insight run records for the query window.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn list_orchestrator_usage_runs(
         self: &Arc<Self>,
@@ -4427,6 +4987,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("list usage pricing records", error))
     }
 
+    /// Lists model pricing records.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn list_usage_pricing_records(
         self: &Arc<Self>,
@@ -4447,6 +5011,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("upsert usage pricing record", error))
     }
 
+    /// Creates or updates a model pricing record.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn upsert_usage_pricing_record(
         self: &Arc<Self>,
@@ -4468,6 +5036,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("upsert usage budget policy", error))
     }
 
+    /// Creates or updates a usage budget policy.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn upsert_usage_budget_policy(
         self: &Arc<Self>,
@@ -4489,6 +5061,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("list usage budget policies", error))
     }
 
+    /// Lists usage budget policies matching the filter.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn list_usage_budget_policies(
         self: &Arc<Self>,
@@ -4510,6 +5086,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("create usage routing decision", error))
     }
 
+    /// Records a smart-routing decision for auditability.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn create_usage_routing_decision(
         self: &Arc<Self>,
@@ -4531,6 +5111,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("list usage routing decisions", error))
     }
 
+    /// Lists recorded smart-routing decisions matching the filter.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn list_usage_routing_decisions(
         self: &Arc<Self>,
@@ -4552,6 +5136,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("upsert usage alert", error))
     }
 
+    /// Creates or updates a usage alert.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn upsert_usage_alert(
         self: &Arc<Self>,
@@ -4573,6 +5161,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("list usage alerts", error))
     }
 
+    /// Lists usage alerts matching the filter.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn list_usage_alerts(
         self: &Arc<Self>,
@@ -4594,6 +5186,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("load latest approval by subject", error))
     }
 
+    /// Loads the most recent approval recorded for a subject id.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn latest_approval_by_subject(
         self: &Arc<Self>,
@@ -4617,6 +5213,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("append orchestrator tape event", error))
     }
 
+    /// Appends one tape event for a run and bumps the tape counter.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn append_orchestrator_tape_event(
         self: &Arc<Self>,
@@ -4642,6 +5242,12 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("request orchestrator cancel", error))
     }
 
+    /// Records a cancel request for a run, bumps the cancel counter, and returns the resulting
+    /// cancel snapshot. The run loop observes the flag at its next checkpoint; cancellation is
+    /// cooperative.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn request_orchestrator_cancel(
         self: &Arc<Self>,
@@ -4669,6 +5275,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("load orchestrator cancel flag", error))
     }
 
+    /// Reads the cancel-requested flag for a run.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn is_orchestrator_cancel_requested(
         self: &Arc<Self>,
@@ -4692,6 +5302,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("load orchestrator run snapshot", error))
     }
 
+    /// Loads the current run status snapshot, if the run exists.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn orchestrator_run_status_snapshot(
         self: &Arc<Self>,
@@ -4705,6 +5319,8 @@ impl GatewayRuntimeState {
         .map_err(|_| Status::internal("orchestrator snapshot worker panicked"))?
     }
 
+    // Diagnostics accept either an orchestrator run id or a cron run id;
+    // cron runs are followed to the orchestrator run they spawned.
     #[allow(clippy::result_large_err)]
     fn resolve_orchestrator_diagnostics_run_id_blocking(
         &self,
@@ -4726,6 +5342,11 @@ impl GatewayRuntimeState {
         Ok(cron_run.and_then(|run| run.orchestrator_run_id))
     }
 
+    /// Maps an operator-supplied id to an orchestrator run id, following cron run linkage when
+    /// needed.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn resolve_orchestrator_diagnostics_run_id(
         self: &Arc<Self>,
@@ -4739,6 +5360,13 @@ impl GatewayRuntimeState {
         .map_err(|_| Status::internal("orchestrator diagnostics run-id resolver worker panicked"))?
     }
 
+    /// Waits until the run reaches a terminal phase (or also a waiting phase
+    /// when `return_on_waiting` is set), up to `request.timeout`.
+    ///
+    /// # Errors
+    /// `not_found` for unknown runs, `failed_precondition` for unknown
+    /// lifecycle states, `deadline_exceeded` on timeout, plus mapped journal
+    /// errors from the snapshot reads.
     #[allow(clippy::result_large_err)]
     pub async fn wait_for_orchestrator_run(
         self: &Arc<Self>,
@@ -4759,6 +5387,10 @@ impl GatewayRuntimeState {
                 {
                     return Ok(OrchestratorRunWaitOutcome { snapshot, canonical_state });
                 }
+                // Hybrid notify/poll: `notified()` is registered only after
+                // the snapshot read, so a state change in that gap would be
+                // missed; bounding the wait by poll_interval guarantees the
+                // loop re-reads the snapshot regardless.
                 let notified = self.orchestrator_run_notify.notified();
                 let _ = tokio::time::timeout(poll_interval, notified).await;
             }
@@ -4771,6 +5403,8 @@ impl GatewayRuntimeState {
         })?
     }
 
+    // Tool result artifacts and tool jobs (background tool execution).
+
     #[allow(clippy::result_large_err)]
     fn create_tool_result_artifact_blocking(
         &self,
@@ -4781,6 +5415,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("create tool result artifact", error))
     }
 
+    /// Persists a tool result artifact and returns its reference.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn create_tool_result_artifact(
         self: &Arc<Self>,
@@ -4792,6 +5430,7 @@ impl GatewayRuntimeState {
             .map_err(|_| Status::internal("tool result artifact create worker panicked"))?
     }
 
+    /// Maximum artifact payload size accepted by the journal store.
     pub(crate) fn tool_result_artifact_max_payload_bytes(&self) -> usize {
         self.journal_store.max_payload_bytes()
     }
@@ -4806,6 +5445,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("read tool result artifact", error))
     }
 
+    /// Reads a tool result artifact range by reference.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn read_tool_result_artifact(
         self: &Arc<Self>,
@@ -4827,6 +5470,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("create tool job", error))
     }
 
+    /// Creates a background tool job record.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn create_tool_job(
         self: &Arc<Self>,
@@ -4845,6 +5492,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("get tool job", error))
     }
 
+    /// Loads a tool job by id.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn get_tool_job(
         self: &Arc<Self>,
@@ -4866,6 +5517,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("list tool jobs", error))
     }
 
+    /// Lists tool jobs matching the filter.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn list_tool_jobs(
         self: &Arc<Self>,
@@ -4887,6 +5542,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("transition tool job", error))
     }
 
+    /// Applies a state transition to a tool job.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn transition_tool_job(
         self: &Arc<Self>,
@@ -4908,6 +5567,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("append tool job tail", error))
     }
 
+    /// Appends an output tail entry to a tool job.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn append_tool_job_tail(
         self: &Arc<Self>,
@@ -4929,6 +5592,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("tail tool job", error))
     }
 
+    /// Reads a page of a tool job's output tail.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn tail_tool_job(
         self: &Arc<Self>,
@@ -4950,6 +5617,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("attach tool job", error))
     }
 
+    /// Attaches a consumer to a tool job.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn attach_tool_job(
         self: &Arc<Self>,
@@ -4968,6 +5639,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("release tool job attachment", error))
     }
 
+    /// Releases a tool job's consumer attachment.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn release_tool_job_attachment(
         self: &Arc<Self>,
@@ -4991,6 +5666,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("retry tool job", error))
     }
 
+    /// Requeues a failed tool job for retry.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn retry_tool_job(
         self: &Arc<Self>,
@@ -5013,6 +5692,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("sweep expired tool jobs", error))
     }
 
+    /// Expires tool jobs past their deadline, bounded by `limit`.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn sweep_expired_tool_jobs(
         self: &Arc<Self>,
@@ -5039,6 +5722,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("recover stale tool jobs", error))
     }
 
+    /// Recovers jobs whose owner stopped heartbeating for `stale_after_ms`.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn recover_stale_tool_jobs(
         self: &Arc<Self>,
@@ -5054,6 +5741,11 @@ impl GatewayRuntimeState {
         .map_err(|_| Status::internal("tool job recovery worker panicked"))?
     }
 
+    // Session history and context: runs, lineage, transcripts, window
+    // search, recall artifacts, queued inputs, queue controls, pins,
+    // compaction artifacts, checkpoints, workspace checkpoints/restore
+    // reports, flows, background tasks, and learning records.
+
     #[allow(clippy::result_large_err)]
     fn list_orchestrator_session_runs_blocking(
         &self,
@@ -5064,6 +5756,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("list orchestrator session runs", error))
     }
 
+    /// Lists run snapshots belonging to a session.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn list_orchestrator_session_runs(
         self: &Arc<Self>,
@@ -5087,6 +5783,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Updates a session's fork/branch lineage pointers.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn update_orchestrator_session_lineage(
         self: &Arc<Self>,
@@ -5110,6 +5810,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Loads the transcript records for a session.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn list_orchestrator_session_transcript(
         self: &Arc<Self>,
@@ -5133,6 +5837,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Searches transcript windows of a session.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn search_orchestrator_session_windows(
         self: &Arc<Self>,
@@ -5156,6 +5864,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_memory_store_error("create recall artifact", error))
     }
 
+    /// Persists a recall artifact.
+    ///
+    /// # Errors
+    /// Returns the mapped memory store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn create_recall_artifact(
         self: &Arc<Self>,
@@ -5177,6 +5889,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_memory_store_error("list recall artifacts", error))
     }
 
+    /// Lists recall artifacts matching the filter.
+    ///
+    /// # Errors
+    /// Returns the mapped memory store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn list_recall_artifacts(
         self: &Arc<Self>,
@@ -5198,6 +5914,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Queues an input for a busy session.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn create_orchestrator_queued_input(
         self: &Arc<Self>,
@@ -5221,6 +5941,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Updates the state of a queued input.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn update_orchestrator_queued_input_state(
         self: &Arc<Self>,
@@ -5254,6 +5978,11 @@ impl GatewayRuntimeState {
             })
     }
 
+    /// Moves a queued input to a priority lane, recording the decision reason and explanation for
+    /// audit.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn prioritize_orchestrator_queued_input(
         self: &Arc<Self>,
@@ -5285,6 +6014,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Loads a session's queue control record, if any.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn get_orchestrator_session_queue_control(
         self: &Arc<Self>,
@@ -5308,6 +6041,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Creates or updates a session's queue control record.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn upsert_orchestrator_session_queue_control(
         self: &Arc<Self>,
@@ -5331,6 +6068,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("load queued orchestrator inputs", error))
     }
 
+    /// Lists the queued inputs of a session.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn list_orchestrator_queued_inputs(
         self: &Arc<Self>,
@@ -5354,6 +6095,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("create orchestrator session pin", error))
     }
 
+    /// Pins a transcript item in a session.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn create_orchestrator_session_pin(
         self: &Arc<Self>,
@@ -5377,6 +6122,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("load orchestrator session pins", error))
     }
 
+    /// Lists the pins of a session.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn list_orchestrator_session_pins(
         self: &Arc<Self>,
@@ -5397,6 +6146,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("delete orchestrator session pin", error))
     }
 
+    /// Deletes a session pin; returns whether it existed.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn delete_orchestrator_session_pin(
         self: &Arc<Self>,
@@ -5420,6 +6173,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Persists a context-compaction artifact for a session.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn create_orchestrator_compaction_artifact(
         self: &Arc<Self>,
@@ -5443,6 +6200,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Lists the compaction artifacts of a session.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn list_orchestrator_compaction_artifacts(
         self: &Arc<Self>,
@@ -5466,6 +6227,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Loads a compaction artifact by id.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn get_orchestrator_compaction_artifact(
         self: &Arc<Self>,
@@ -5489,6 +6254,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("create orchestrator checkpoint", error))
     }
 
+    /// Persists a conversation checkpoint.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn create_orchestrator_checkpoint(
         self: &Arc<Self>,
@@ -5510,6 +6279,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("list orchestrator checkpoints", error))
     }
 
+    /// Lists the checkpoints of a session.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn list_orchestrator_checkpoints(
         self: &Arc<Self>,
@@ -5533,6 +6306,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("load orchestrator checkpoint", error))
     }
 
+    /// Loads a checkpoint by id.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn get_orchestrator_checkpoint(
         self: &Arc<Self>,
@@ -5556,6 +6333,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Marks a checkpoint as restored.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn mark_orchestrator_checkpoint_restored(
         self: &Arc<Self>,
@@ -5579,6 +6360,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("create workspace checkpoint", error))
     }
 
+    /// Persists a workspace (file-state) checkpoint.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn create_workspace_checkpoint(
         self: &Arc<Self>,
@@ -5600,6 +6385,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("link workspace checkpoint pair", error))
     }
 
+    /// Links the pre/post workspace checkpoints of one operation.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn link_workspace_checkpoint_pair(
         self: &Arc<Self>,
@@ -5621,6 +6410,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("list workspace checkpoints", error))
     }
 
+    /// Lists workspace checkpoints matching the filter.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn list_workspace_checkpoints(
         self: &Arc<Self>,
@@ -5642,6 +6435,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("load workspace checkpoint", error))
     }
 
+    /// Loads a workspace checkpoint by id.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn get_workspace_checkpoint(
         self: &Arc<Self>,
@@ -5665,6 +6462,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("list workspace checkpoint files", error))
     }
 
+    /// Lists the file records captured by a workspace checkpoint.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn list_workspace_checkpoint_files(
         self: &Arc<Self>,
@@ -5688,6 +6489,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Loads one captured file payload by artifact id.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn get_workspace_checkpoint_file_payload(
         self: &Arc<Self>,
@@ -5711,6 +6516,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("load workspace restore report", error))
     }
 
+    /// Loads a workspace restore report by id.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn get_workspace_restore_report(
         self: &Arc<Self>,
@@ -5734,6 +6543,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("list workspace restore reports", error))
     }
 
+    /// Lists workspace restore reports matching the filter.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn list_workspace_restore_reports(
         self: &Arc<Self>,
@@ -5755,6 +6568,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Aggregates workspace restore activity for the filter window.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn summarize_workspace_restore_activity(
         self: &Arc<Self>,
@@ -5778,6 +6595,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("create workspace restore report", error))
     }
 
+    /// Persists a workspace restore report.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn create_workspace_restore_report(
         self: &Arc<Self>,
@@ -5801,6 +6622,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Marks a workspace checkpoint as restored.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn mark_workspace_checkpoint_restored(
         self: &Arc<Self>,
@@ -5821,6 +6646,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("create flow", error))
     }
 
+    /// Creates a flow record.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn create_flow(
         self: &Arc<Self>,
@@ -5839,6 +6668,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("list flows", error))
     }
 
+    /// Lists flows matching the filter.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn list_flows(
         self: &Arc<Self>,
@@ -5861,6 +6694,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("load flow", error))
     }
 
+    /// Loads a flow with up to `event_limit` of its events.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn get_flow_bundle(
         self: &Arc<Self>,
@@ -5885,6 +6722,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("transition flow", error))
     }
 
+    /// Applies a state transition to a flow.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn transition_flow(
         self: &Arc<Self>,
@@ -5906,6 +6747,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("update flow step", error))
     }
 
+    /// Updates one step of a flow.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn update_flow_step(
         self: &Arc<Self>,
@@ -5927,6 +6772,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Creates a background task record.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn create_orchestrator_background_task(
         self: &Arc<Self>,
@@ -5950,6 +6799,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Updates a background task record.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn update_orchestrator_background_task(
         self: &Arc<Self>,
@@ -5973,6 +6826,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Lists background tasks matching the filter.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn list_orchestrator_background_tasks(
         self: &Arc<Self>,
@@ -5996,6 +6853,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Loads a background task by id.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn get_orchestrator_background_task(
         self: &Arc<Self>,
@@ -6019,6 +6880,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("upsert learning candidate", error))
     }
 
+    /// Creates or updates a learning candidate.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn upsert_learning_candidate(
         self: &Arc<Self>,
@@ -6040,6 +6905,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("review learning candidate", error))
     }
 
+    /// Applies a review decision to a learning candidate.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn review_learning_candidate(
         self: &Arc<Self>,
@@ -6061,6 +6930,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("list learning candidates", error))
     }
 
+    /// Lists learning candidates matching the filter.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn list_learning_candidates(
         self: &Arc<Self>,
@@ -6082,6 +6955,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("list learning candidate history", error))
     }
 
+    /// Loads the review history of a learning candidate.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn learning_candidate_history(
         self: &Arc<Self>,
@@ -6105,6 +6982,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("upsert learning preference", error))
     }
 
+    /// Creates or updates a learned preference.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn upsert_learning_preference(
         self: &Arc<Self>,
@@ -6126,6 +7007,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("list learning preferences", error))
     }
 
+    /// Lists learned preferences matching the filter.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn list_learning_preferences(
         self: &Arc<Self>,
@@ -6137,6 +7022,16 @@ impl GatewayRuntimeState {
             .map_err(|_| Status::internal("learning preference list worker panicked"))?
     }
 
+    /// Assembles a redacted, budgeted page of tape events for a run.
+    ///
+    /// Payloads are redacted before byte accounting, the page is capped by
+    /// both the entry and byte budgets, and `next_after_seq` is set when more
+    /// events remain.
+    ///
+    /// # Errors
+    /// `not_found` for unknown runs, `resource_exhausted` when a single event
+    /// alone exceeds the byte budget (otherwise pagination could never make
+    /// progress), plus mapped journal errors.
     #[allow(clippy::result_large_err)]
     pub(crate) fn orchestrator_tape_snapshot_blocking(
         &self,
@@ -6205,6 +7100,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Async wrapper for `Self::orchestrator_tape_snapshot_blocking`.
+    ///
+    /// # Errors
+    /// Same as the blocking variant, plus `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn orchestrator_tape_snapshot(
         self: &Arc<Self>,
@@ -6243,6 +7142,11 @@ impl GatewayRuntimeState {
         .map_err(|error| Status::internal(format!("failed to capture replay bundle: {error:#}")))
     }
 
+    /// Captures a deterministic replay bundle for an incident run, bounded by
+    /// the replay-capture event budget.
+    ///
+    /// # Errors
+    /// `internal` when capture fails or the worker panicked.
     #[allow(clippy::result_large_err)]
     #[allow(dead_code)]
     pub async fn incident_replay_bundle(
@@ -6258,6 +7162,8 @@ impl GatewayRuntimeState {
         .map_err(|_| Status::internal("incident replay capture worker panicked"))?
     }
 
+    // Cron jobs and cron runs.
+
     #[allow(clippy::result_large_err)]
     fn create_cron_job_blocking(
         &self,
@@ -6268,6 +7174,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_cron_store_error("create cron job", error))
     }
 
+    /// Creates a cron job and counts the creation.
+    ///
+    /// # Errors
+    /// Returns the mapped cron store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn create_cron_job(
         self: &Arc<Self>,
@@ -6292,6 +7202,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_cron_store_error("update cron job", error))
     }
 
+    /// Applies a patch to a cron job and counts the update.
+    ///
+    /// # Errors
+    /// Returns the mapped cron store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn update_cron_job(
         self: &Arc<Self>,
@@ -6315,6 +7229,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_cron_store_error("delete cron job", error))
     }
 
+    /// Deletes a cron job; returns whether it existed and counts the deletion.
+    ///
+    /// # Errors
+    /// Returns the mapped cron store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn delete_cron_job(self: &Arc<Self>, job_id: String) -> Result<bool, Status> {
         let state = Arc::clone(self);
@@ -6335,6 +7253,10 @@ impl GatewayRuntimeState {
             .map_err(|error| map_cron_store_error("load cron job", error))
     }
 
+    /// Loads a cron job by id.
+    ///
+    /// # Errors
+    /// Returns the mapped cron store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn cron_job(
         self: &Arc<Self>,
@@ -6346,6 +7268,10 @@ impl GatewayRuntimeState {
             .map_err(|_| Status::internal("cron read worker panicked"))?
     }
 
+    /// Lists cron jobs with cursor pagination and optional enabled/owner/channel filters.
+    ///
+    /// # Errors
+    /// Returns the mapped cron store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn list_cron_jobs(
         self: &Arc<Self>,
@@ -6383,6 +7309,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Lists enabled cron jobs due at or before `now_unix_ms`.
+    ///
+    /// # Errors
+    /// Returns the mapped cron store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn list_due_cron_jobs(
         self: &Arc<Self>,
@@ -6400,6 +7330,10 @@ impl GatewayRuntimeState {
         .map_err(|_| Status::internal("cron due-list worker panicked"))?
     }
 
+    /// Earliest `next_run_at` across cron jobs, if any (scheduler wake time).
+    ///
+    /// # Errors
+    /// Returns the mapped cron store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn first_due_cron_job_time(self: &Arc<Self>) -> Result<Option<i64>, Status> {
         let state = Arc::clone(self);
@@ -6413,6 +7347,10 @@ impl GatewayRuntimeState {
         .map_err(|_| Status::internal("cron next due worker panicked"))?
     }
 
+    /// Updates a cron job's next/last run timestamps.
+    ///
+    /// # Errors
+    /// Returns the mapped cron store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn set_cron_job_next_run(
         self: &Arc<Self>,
@@ -6431,6 +7369,10 @@ impl GatewayRuntimeState {
         .map_err(|_| Status::internal("cron next-run worker panicked"))?
     }
 
+    /// Sets whether a cron job has a queued run pending.
+    ///
+    /// # Errors
+    /// Returns the mapped cron store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn set_cron_job_queue_state(
         self: &Arc<Self>,
@@ -6448,6 +7390,10 @@ impl GatewayRuntimeState {
         .map_err(|_| Status::internal("cron queue worker panicked"))?
     }
 
+    /// Records the start of a cron run and counts it.
+    ///
+    /// # Errors
+    /// Returns the mapped cron store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn start_cron_run(
         self: &Arc<Self>,
@@ -6466,6 +7412,10 @@ impl GatewayRuntimeState {
         Ok(())
     }
 
+    /// Finalizes a cron run and bumps the counter matching its terminal status.
+    ///
+    /// # Errors
+    /// Returns the mapped cron store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn finalize_cron_run(
         self: &Arc<Self>,
@@ -6496,6 +7446,10 @@ impl GatewayRuntimeState {
         Ok(())
     }
 
+    /// Loads a cron run by id.
+    ///
+    /// # Errors
+    /// Returns the mapped cron store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn cron_run(
         self: &Arc<Self>,
@@ -6512,6 +7466,10 @@ impl GatewayRuntimeState {
         .map_err(|_| Status::internal("cron run read worker panicked"))?
     }
 
+    /// Loads the active (non-terminal) cron run of a job, if any.
+    ///
+    /// # Errors
+    /// Returns the mapped cron store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn active_cron_run_for_job(
         self: &Arc<Self>,
@@ -6528,6 +7486,10 @@ impl GatewayRuntimeState {
         .map_err(|_| Status::internal("active cron run worker panicked"))?
     }
 
+    /// Lists cron runs (optionally for one job) with cursor pagination.
+    ///
+    /// # Errors
+    /// Returns the mapped cron store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn list_cron_runs(
         self: &Arc<Self>,
@@ -6538,6 +7500,10 @@ impl GatewayRuntimeState {
         self.list_cron_runs_filtered(job_id, None, after_run_id, requested_limit).await
     }
 
+    /// Lists cron runs across all jobs owned by a principal, with cursor pagination.
+    ///
+    /// # Errors
+    /// Returns the mapped cron store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn list_cron_runs_for_owner(
         self: &Arc<Self>,
@@ -6584,6 +7550,15 @@ impl GatewayRuntimeState {
         })
     }
 
+    // Approvals: persistence plus the session-scoped decision cache that lets
+    // identical tool proposals reuse a prior Allow/Deny within its scope.
+
+    /// Persists an approval request; tool-subject requests bump the request
+    /// counter.
+    ///
+    /// # Errors
+    /// Returns the mapped approval store error, or `internal` if the worker
+    /// panicked.
     #[allow(clippy::result_large_err)]
     pub async fn create_approval_record(
         self: &Arc<Self>,
@@ -6605,6 +7580,13 @@ impl GatewayRuntimeState {
         Ok(result)
     }
 
+    /// Resolves an approval. For tool subjects this also bumps the matching
+    /// decision counter and seeds the session approval cache so later
+    /// identical proposals can reuse the decision within its scope.
+    ///
+    /// # Errors
+    /// Returns the mapped approval store error, or `internal` if the worker
+    /// panicked.
     #[allow(clippy::result_large_err)]
     pub async fn resolve_approval_record(
         self: &Arc<Self>,
@@ -6651,6 +7633,11 @@ impl GatewayRuntimeState {
         Ok(result)
     }
 
+    /// Loads one approval by id.
+    ///
+    /// # Errors
+    /// Returns the mapped approval store error, or `internal` if the worker
+    /// panicked.
     #[allow(clippy::result_large_err)]
     pub async fn approval_record(
         self: &Arc<Self>,
@@ -6667,6 +7654,12 @@ impl GatewayRuntimeState {
         .map_err(|_| Status::internal("approval read worker panicked"))?
     }
 
+    /// Lists approvals with cursor pagination and optional time, subject,
+    /// principal, decision, and subject-type filters.
+    ///
+    /// # Errors
+    /// Returns the mapped approval store error, or `internal` if the worker
+    /// panicked.
     #[allow(clippy::result_large_err)]
     #[allow(clippy::too_many_arguments)]
     pub async fn list_approval_records(
@@ -6716,12 +7709,23 @@ impl GatewayRuntimeState {
         })
     }
 
+    // Tool posture registry delegates (synchronous; the registry has its own
+    // storage). All of them map registry failures to `Status::internal`.
+
+    /// Lists all tool posture overrides.
+    ///
+    /// # Errors
+    /// `internal` when the posture registry read fails.
     pub fn list_tool_posture_overrides(&self) -> Result<Vec<ToolPostureOverrideRecord>, Status> {
         self.tool_posture_registry.list_overrides().map_err(|error| {
             Status::internal(format!("failed to list tool posture overrides: {error}"))
         })
     }
 
+    /// Lists recorded posture recommendation actions.
+    ///
+    /// # Errors
+    /// `internal` when the posture registry read fails.
     pub fn list_tool_posture_recommendation_actions(
         &self,
     ) -> Result<Vec<ToolPostureRecommendationActionRecord>, Status> {
@@ -6730,6 +7734,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Lists posture audit events.
+    ///
+    /// # Errors
+    /// `internal` when the posture registry read fails.
     pub fn list_tool_posture_audit_events(
         &self,
     ) -> Result<Vec<ToolPostureAuditEventRecord>, Status> {
@@ -6738,6 +7746,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Creates or updates a posture override.
+    ///
+    /// # Errors
+    /// `internal` when persisting the override fails.
     pub fn upsert_tool_posture_override(
         &self,
         request: ToolPostureOverrideUpsertRequest,
@@ -6747,6 +7759,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Clears a posture override; returns whether one existed.
+    ///
+    /// # Errors
+    /// `internal` when clearing the override fails.
     pub fn clear_tool_posture_override(
         &self,
         request: ToolPostureOverrideClearRequest,
@@ -6756,6 +7772,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Resets all overrides in a scope, returning the removed records.
+    ///
+    /// # Errors
+    /// `internal` when the scope reset fails.
     pub fn reset_tool_posture_scope(
         &self,
         request: ToolPostureScopeResetRequest,
@@ -6765,6 +7785,10 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Records the action taken on a posture recommendation.
+    ///
+    /// # Errors
+    /// `internal` when persisting the action fails.
     pub fn record_tool_posture_recommendation_action(
         &self,
         request: ToolPostureRecommendationActionRequest,
@@ -6776,6 +7800,13 @@ impl GatewayRuntimeState {
         })
     }
 
+    // Skill status records and journaled runtime/console events.
+
+    /// Persists a skill status record and counts the update.
+    ///
+    /// # Errors
+    /// Returns the mapped skill store error, or `internal` if the worker
+    /// panicked.
     #[allow(clippy::result_large_err)]
     pub async fn upsert_skill_status(
         self: &Arc<Self>,
@@ -6794,6 +7825,11 @@ impl GatewayRuntimeState {
         Ok(record)
     }
 
+    /// Loads the status record for one skill version.
+    ///
+    /// # Errors
+    /// Returns the mapped skill store error, or `internal` if the worker
+    /// panicked.
     #[allow(clippy::result_large_err)]
     pub async fn skill_status(
         self: &Arc<Self>,
@@ -6811,6 +7847,11 @@ impl GatewayRuntimeState {
         .map_err(|_| Status::internal("skill status read worker panicked"))?
     }
 
+    /// Loads the most recent status record for a skill across versions.
+    ///
+    /// # Errors
+    /// Returns the mapped skill store error, or `internal` if the worker
+    /// panicked.
     #[allow(clippy::result_large_err)]
     pub async fn latest_skill_status(
         self: &Arc<Self>,
@@ -6827,6 +7868,11 @@ impl GatewayRuntimeState {
         .map_err(|_| Status::internal("latest skill status read worker panicked"))?
     }
 
+    /// Journals a skill lifecycle event under fresh synthetic session/run ids
+    /// (these events are not tied to a conversation).
+    ///
+    /// # Errors
+    /// Same as `Self::record_journal_event`.
     #[allow(clippy::result_large_err)]
     pub async fn record_skill_status_event(
         self: &Arc<Self>,
@@ -6860,6 +7906,11 @@ impl GatewayRuntimeState {
         .map(|_| ())
     }
 
+    /// Journals an operator console event under fresh synthetic session/run
+    /// ids.
+    ///
+    /// # Errors
+    /// Same as `Self::record_journal_event`.
     #[allow(clippy::result_large_err)]
     pub async fn record_console_event(
         self: &Arc<Self>,
@@ -6922,6 +7973,11 @@ impl GatewayRuntimeState {
         Ok(())
     }
 
+    /// Journals a runtime decision event for an authenticated request context
+    /// and feeds it into observability.
+    ///
+    /// # Errors
+    /// Same as `Self::record_journal_event`.
     #[allow(clippy::result_large_err)]
     pub async fn record_runtime_decision_event(
         self: &Arc<Self>,
@@ -6941,6 +7997,11 @@ impl GatewayRuntimeState {
         .await
     }
 
+    /// Journals a runtime decision event attributed to a system principal
+    /// (background work with no request context).
+    ///
+    /// # Errors
+    /// Same as `Self::record_journal_event`.
     #[allow(clippy::result_large_err)]
     pub async fn record_system_runtime_decision_event(
         self: &Arc<Self>,
@@ -6962,6 +8023,7 @@ impl GatewayRuntimeState {
         .await
     }
 
+    /// Builds the decision actor for an authenticated request context.
     #[must_use]
     pub fn runtime_decision_actor_from_context(
         &self,
@@ -6976,6 +8038,11 @@ impl GatewayRuntimeState {
         )
     }
 
+    // Live runtime configuration (memory/retrieval/learning/routines) and
+    // channel router delegates.
+
+    /// Replaces the memory config and invalidates the memory search cache
+    /// (cached scores depend on the old limits).
     pub fn configure_memory(&self, config: MemoryRuntimeConfig) {
         match self.memory_config.write() {
             Ok(mut guard) => {
@@ -6990,6 +8057,7 @@ impl GatewayRuntimeState {
         self.clear_memory_search_cache();
     }
 
+    /// Replaces the retrieval config and invalidates the memory search cache.
     pub fn configure_retrieval(&self, config: RetrievalRuntimeConfig) {
         match self.retrieval_config.write() {
             Ok(mut guard) => {
@@ -7004,6 +8072,7 @@ impl GatewayRuntimeState {
         self.clear_memory_search_cache();
     }
 
+    /// Installs the routines/objectives wiring once the scheduler is up.
     pub fn configure_routines_runtime(&self, config: RoutinesRuntimeConfig) {
         match self.routines_runtime.write() {
             Ok(mut guard) => {
@@ -7017,6 +8086,11 @@ impl GatewayRuntimeState {
         }
     }
 
+    /// Returns the routines wiring.
+    ///
+    /// # Errors
+    /// `failed_precondition` until [`Self::configure_routines_runtime`] has
+    /// run.
     #[allow(clippy::result_large_err)]
     pub fn routines_runtime_config(&self) -> Result<RoutinesRuntimeConfig, Status> {
         match self.routines_runtime.read() {
@@ -7030,6 +8104,7 @@ impl GatewayRuntimeState {
         }
     }
 
+    /// Current memory config (cloned).
     #[must_use]
     pub fn memory_config_snapshot(&self) -> MemoryRuntimeConfig {
         match self.memory_config.read() {
@@ -7041,6 +8116,7 @@ impl GatewayRuntimeState {
         }
     }
 
+    /// Current retrieval config (cloned).
     #[must_use]
     pub fn retrieval_config_snapshot(&self) -> RetrievalRuntimeConfig {
         match self.retrieval_config.read() {
@@ -7052,6 +8128,7 @@ impl GatewayRuntimeState {
         }
     }
 
+    /// Replaces the learning config (no caches depend on it).
     pub fn configure_learning(&self, config: LearningRuntimeConfig) {
         match self.learning_config.write() {
             Ok(mut guard) => {
@@ -7065,6 +8142,7 @@ impl GatewayRuntimeState {
         }
     }
 
+    /// Current learning config (cloned).
     #[must_use]
     pub fn learning_config_snapshot(&self) -> LearningRuntimeConfig {
         match self.learning_config.read() {
@@ -7076,31 +8154,37 @@ impl GatewayRuntimeState {
         }
     }
 
+    /// Channel router config as loaded at startup (cloned).
     #[must_use]
     pub fn channel_router_config_snapshot(&self) -> ChannelRouterConfig {
         self.config.channel_router.clone()
     }
 
+    /// Stable hash of the active channel router config (drift detection).
     #[must_use]
     pub fn channel_router_config_hash(&self) -> String {
         self.channel_router.config_hash()
     }
 
+    /// Full startup config snapshot (cloned).
     #[must_use]
     pub fn runtime_config_snapshot(&self) -> GatewayRuntimeConfigSnapshot {
         self.config.clone()
     }
 
+    /// Validation warnings produced when the router config was loaded.
     #[must_use]
     pub fn channel_router_validation_warnings(&self) -> Vec<String> {
         self.channel_router.validation_warnings()
     }
 
+    /// Dry-runs routing for an inbound message without delivering it.
     #[must_use]
     pub fn channel_router_preview(&self, message: &ChannelInboundMessage) -> ChannelRoutePreview {
         self.channel_router.preview_route(message)
     }
 
+    /// Pairing state per channel (optionally filtered to one channel).
     #[must_use]
     pub fn channel_router_pairing_snapshot(
         &self,
@@ -7109,6 +8193,10 @@ impl GatewayRuntimeState {
         self.channel_router.pairing_snapshot(channel)
     }
 
+    /// Mints a pairing code for a channel.
+    ///
+    /// # Errors
+    /// `failed_precondition` with the router's refusal reason.
     pub fn channel_router_mint_pairing_code(
         &self,
         channel: &str,
@@ -7120,6 +8208,7 @@ impl GatewayRuntimeState {
             .map_err(|reason| Status::failed_precondition(reason.as_str()))
     }
 
+    /// Attempts to consume a pairing code for a sender identity.
     #[must_use]
     pub fn channel_router_consume_pairing_code(
         &self,
@@ -7131,6 +8220,8 @@ impl GatewayRuntimeState {
         self.channel_router.consume_pairing_code(channel, sender_identity, code, pending_ttl_ms)
     }
 
+    /// Associates an approval id with a pending pairing; `false` when no
+    /// matching pending entry exists.
     #[must_use]
     pub fn channel_router_attach_pairing_pending_approval(
         &self,
@@ -7143,6 +8234,7 @@ impl GatewayRuntimeState {
             .is_some()
     }
 
+    /// Applies an operator approval/denial to a pending pairing.
     #[must_use]
     pub fn channel_router_apply_pairing_approval(
         &self,
@@ -7153,6 +8245,12 @@ impl GatewayRuntimeState {
         self.channel_router.apply_pairing_approval(approval_id, approved, decision_scope_ttl_ms)
     }
 
+    // Networked worker fleet. The fleet manager lives behind an RwLock; each
+    // mutation journals its lifecycle event afterwards, and cleanup paths
+    // fail closed when a worker's cleanup report shows leftover scoped data.
+
+    /// Builds the fleet admission policy from networked-worker config. The
+    /// trusted capability list is currently a fixed built-in allowlist.
     #[must_use]
     pub fn worker_fleet_policy(&self) -> WorkerFleetPolicy {
         WorkerFleetPolicy {
@@ -7186,6 +8284,7 @@ impl GatewayRuntimeState {
         }
     }
 
+    /// Current worker fleet state.
     #[must_use]
     pub fn worker_fleet_snapshot(&self) -> WorkerFleetSnapshot {
         match self.worker_fleet.read() {
@@ -7197,6 +8296,7 @@ impl GatewayRuntimeState {
         }
     }
 
+    /// Recent worker lifecycle events retained by the fleet manager.
     #[must_use]
     pub fn worker_fleet_recent_events(&self) -> Vec<WorkerLifecycleEvent> {
         match self.worker_fleet.read() {
@@ -7208,6 +8308,10 @@ impl GatewayRuntimeState {
         }
     }
 
+    /// Admits a worker after attestation checks and journals the event.
+    ///
+    /// # Errors
+    /// `failed_precondition` on policy rejection, plus journaling errors.
     #[allow(clippy::result_large_err)]
     #[allow(dead_code)]
     pub async fn register_networked_worker(
@@ -7239,6 +8343,11 @@ impl GatewayRuntimeState {
         Ok(event)
     }
 
+    /// Assigns a lease to a specific worker and journals the event.
+    ///
+    /// # Errors
+    /// `failed_precondition` when assignment is refused, plus journaling
+    /// errors.
     #[allow(clippy::result_large_err)]
     #[allow(dead_code)]
     pub async fn assign_networked_worker_lease(
@@ -7267,6 +8376,11 @@ impl GatewayRuntimeState {
         Ok((lease, event))
     }
 
+    /// Assigns a lease to the next eligible worker and journals the event.
+    ///
+    /// # Errors
+    /// `failed_precondition` when no worker can take the lease, plus
+    /// journaling errors.
     #[allow(clippy::result_large_err)]
     #[allow(dead_code)]
     pub async fn assign_next_networked_worker_lease(
@@ -7294,6 +8408,13 @@ impl GatewayRuntimeState {
         Ok((lease, event))
     }
 
+    /// Finalizes a worker's lease against its cleanup report. Fails closed:
+    /// incomplete cleanup is journaled as a non-recoverable orphan and
+    /// surfaced as an error so scoped data leaks need operator action.
+    ///
+    /// # Errors
+    /// `failed_precondition` when finalization is refused or cleanup left
+    /// scoped data behind, plus journaling errors.
     #[allow(clippy::result_large_err)]
     #[allow(dead_code)]
     pub async fn complete_networked_worker_lease(
@@ -7342,6 +8463,11 @@ impl GatewayRuntimeState {
         }
     }
 
+    /// Expires workers past their lease TTL, journaling each event with
+    /// recovery guidance for operators.
+    ///
+    /// # Errors
+    /// Journaling errors from recording the lifecycle events.
     #[allow(clippy::result_large_err)]
     #[allow(dead_code)]
     pub async fn reap_expired_networked_workers(
@@ -7372,6 +8498,10 @@ impl GatewayRuntimeState {
         Ok(events)
     }
 
+    /// Quarantines every worker (operator drain) and journals the events.
+    ///
+    /// # Errors
+    /// Journaling errors from recording the lifecycle events.
     #[allow(clippy::result_large_err)]
     #[allow(dead_code)]
     pub async fn drain_networked_workers(
@@ -7402,6 +8532,11 @@ impl GatewayRuntimeState {
         Ok(events)
     }
 
+    /// Quarantines one worker by operator action and journals the event.
+    ///
+    /// # Errors
+    /// `failed_precondition` when the worker cannot be quarantined, plus
+    /// journaling errors.
     #[allow(clippy::result_large_err)]
     #[allow(dead_code)]
     pub async fn quarantine_networked_worker(
@@ -7437,6 +8572,12 @@ impl GatewayRuntimeState {
         Ok(event)
     }
 
+    /// Re-runs attestation checks for a quarantined worker and journals the
+    /// outcome.
+    ///
+    /// # Errors
+    /// `failed_precondition` when re-verification fails, plus journaling
+    /// errors.
     #[allow(clippy::result_large_err)]
     #[allow(dead_code)]
     pub async fn reverify_networked_worker(
@@ -7472,6 +8613,12 @@ impl GatewayRuntimeState {
         Ok(event)
     }
 
+    /// Operator-forced cleanup of an orphaned worker; fails closed when the
+    /// cleanup report shows leftover scoped data.
+    ///
+    /// # Errors
+    /// `failed_precondition` when cleanup is refused or incomplete, plus
+    /// journaling errors.
     #[allow(clippy::result_large_err)]
     #[allow(dead_code)]
     pub async fn force_cleanup_networked_worker(
@@ -7579,6 +8726,10 @@ impl GatewayRuntimeState {
         .await
     }
 
+    // In-memory caches: memory search results and tool approval decisions.
+
+    /// Drops every cached memory search result. Called on any write that can
+    /// change search outcomes (config changes, item mutations, maintenance).
     pub fn clear_memory_search_cache(&self) {
         match self.memory_search_cache.lock() {
             Ok(mut cache) => {
@@ -7592,6 +8743,9 @@ impl GatewayRuntimeState {
         }
     }
 
+    /// Removes cached approval decisions for one session scope and bumps the
+    /// scope's generation so in-flight `remember_*_if_generation` writes that
+    /// raced this invalidation are discarded.
     pub(crate) fn clear_tool_approval_cache_for_session(
         &self,
         context: &RequestContext,
@@ -7612,6 +8766,9 @@ impl GatewayRuntimeState {
         }
     }
 
+    /// Current cache generation for the session scope. Read this before an
+    /// approval wait and pass it to
+    /// [`Self::remember_tool_approval_if_generation`] afterwards.
     pub(crate) fn tool_approval_cache_generation_for_session(
         &self,
         context: &RequestContext,
@@ -7628,6 +8785,8 @@ impl GatewayRuntimeState {
         }
     }
 
+    /// Returns a previously remembered decision for the subject, pruning
+    /// expired entries first; the returned TTL is the remaining lifetime.
     pub(crate) fn resolve_cached_tool_approval(
         &self,
         context: &RequestContext,
@@ -7670,6 +8829,8 @@ impl GatewayRuntimeState {
         }
     }
 
+    /// Caches a decision unconditionally (no generation check); used when the
+    /// decision is fresh and no invalidation race is possible.
     pub(crate) fn remember_tool_approval(
         &self,
         context: &RequestContext,
@@ -7681,6 +8842,12 @@ impl GatewayRuntimeState {
             .remember_tool_approval_if_generation(context, session_id, subject_id, outcome, None);
     }
 
+    /// Caches an Allow/Deny decision for `Session`/`Timeboxed` scopes
+    /// (`Once` decisions and timeboxed entries without a positive TTL are
+    /// never cached). When `expected_generation` is set, the write is dropped
+    /// if the session cache was invalidated while the approval was pending,
+    /// so a stale decision cannot resurrect after a cache clear. Returns
+    /// whether the decision was stored.
     pub(crate) fn remember_tool_approval_if_generation(
         &self,
         context: &RequestContext,
@@ -7733,6 +8900,8 @@ impl GatewayRuntimeState {
                 Some(entry_expires_at_unix_ms) => entry_expires_at_unix_ms > now_unix_ms,
                 None => true,
             });
+            // Capacity eviction removes an arbitrary entry (HashMap iteration
+            // order), not LRU: this is a size bound, not a hit-rate strategy.
             if cache.decisions.len() >= APPROVAL_DECISION_CACHE_CAPACITY {
                 if let Some(first_key) = cache.decisions.keys().next().cloned() {
                     cache.decisions.remove(first_key.as_str());
@@ -7751,6 +8920,16 @@ impl GatewayRuntimeState {
         }
     }
 
+    // Memory items, memory search (cached and diagnostic variants), and
+    // workspace documents.
+
+    /// Validates content limits, applies the default TTL when none is set,
+    /// persists the item, and invalidates the memory search cache.
+    ///
+    /// # Errors
+    /// `invalid_argument` when content exceeds the configured byte/token
+    /// limits (the rejection counter is bumped), otherwise the mapped memory
+    /// store error or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn ingest_memory_item(
         self: &Arc<Self>,
@@ -7784,6 +8963,10 @@ impl GatewayRuntimeState {
         Ok(created)
     }
 
+    /// Loads a memory item by id.
+    ///
+    /// # Errors
+    /// Returns the mapped memory store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn memory_item(
         self: &Arc<Self>,
@@ -7800,6 +8983,12 @@ impl GatewayRuntimeState {
         .map_err(|_| Status::internal("memory read worker panicked"))?
     }
 
+    /// Applies a lifecycle update, revalidating content limits when the text
+    /// changes, and invalidates the search cache when something was updated.
+    ///
+    /// # Errors
+    /// `invalid_argument` for content over limits, otherwise the mapped
+    /// memory store error or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn update_memory_item_lifecycle(
         self: &Arc<Self>,
@@ -7827,6 +9016,11 @@ impl GatewayRuntimeState {
         Ok(updated)
     }
 
+    /// Deletes a memory item scoped to principal/channel; invalidates the search cache when
+    /// something was removed.
+    ///
+    /// # Errors
+    /// Returns the mapped memory store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn delete_memory_item(
         self: &Arc<Self>,
@@ -7849,6 +9043,10 @@ impl GatewayRuntimeState {
         Ok(deleted)
     }
 
+    /// Lists memory items with cursor pagination and tag/source filters.
+    ///
+    /// # Errors
+    /// Returns the mapped memory store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err, clippy::too_many_arguments)]
     pub async fn list_memory_items(
         self: &Arc<Self>,
@@ -7889,6 +9087,11 @@ impl GatewayRuntimeState {
         })
     }
 
+    /// Bulk-deletes memory matching the request and returns the count; invalidates the search
+    /// cache when anything was removed.
+    ///
+    /// # Errors
+    /// Returns the mapped memory store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn purge_memory(
         self: &Arc<Self>,
@@ -7909,6 +9112,10 @@ impl GatewayRuntimeState {
         Ok(deleted)
     }
 
+    /// Loads the memory maintenance bookkeeping (last/next runs).
+    ///
+    /// # Errors
+    /// Returns the mapped memory store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn memory_maintenance_status(
         self: &Arc<Self>,
@@ -7924,6 +9131,10 @@ impl GatewayRuntimeState {
         .map_err(|_| Status::internal("memory maintenance status worker panicked"))?
     }
 
+    /// Loads embedding coverage statistics for memory items.
+    ///
+    /// # Errors
+    /// Returns the mapped memory store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn memory_embeddings_status(
         self: &Arc<Self>,
@@ -7939,6 +9150,10 @@ impl GatewayRuntimeState {
         .map_err(|_| Status::internal("memory embeddings status worker panicked"))?
     }
 
+    /// Runs retention/vacuum maintenance; invalidates the search cache when anything was deleted.
+    ///
+    /// # Errors
+    /// Returns the mapped memory store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn run_memory_maintenance(
         self: &Arc<Self>,
@@ -7967,6 +9182,11 @@ impl GatewayRuntimeState {
         Ok(outcome)
     }
 
+    /// Backfills missing memory embeddings in batches; invalidates the search cache when rows
+    /// changed.
+    ///
+    /// # Errors
+    /// Returns the mapped memory store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn run_memory_embeddings_backfill(
         self: &Arc<Self>,
@@ -7987,6 +9207,13 @@ impl GatewayRuntimeState {
         Ok(outcome)
     }
 
+    /// Searches memory and returns hits plus full retrieval diagnostics.
+    /// Never served from (nor written to) the search cache; logs when the
+    /// latency budget is exceeded.
+    ///
+    /// # Errors
+    /// Returns the mapped memory store error, or `internal` if the worker
+    /// panicked.
     #[allow(clippy::result_large_err)]
     pub async fn search_memory_with_diagnostics(
         self: &Arc<Self>,
@@ -8027,6 +9254,14 @@ impl GatewayRuntimeState {
         Ok(outcome)
     }
 
+    /// Cached memory search: a hit is served until the earliest TTL among its
+    /// items lapses; misses run the backend search and repopulate the cache.
+    /// Concurrent misses for the same key may compute twice (last write
+    /// wins), which is acceptable for a read-through cache.
+    ///
+    /// # Errors
+    /// Returns the mapped memory store error, or `internal` if the worker
+    /// panicked.
     #[allow(clippy::result_large_err)]
     pub async fn search_memory(
         self: &Arc<Self>,
@@ -8094,6 +9329,8 @@ impl GatewayRuntimeState {
             );
         }
 
+        // Capacity eviction removes an arbitrary entry (HashMap iteration
+        // order), not LRU: this is a size bound, not a hit-rate strategy.
         match self.memory_search_cache.lock() {
             Ok(mut cache) => {
                 if cache.len() >= MEMORY_SEARCH_CACHE_CAPACITY {
@@ -8129,6 +9366,10 @@ impl GatewayRuntimeState {
         Ok(results)
     }
 
+    /// Loads a workspace document by path within the principal/channel/agent scope.
+    ///
+    /// # Errors
+    /// Returns the mapped memory store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn workspace_document_by_path(
         self: &Arc<Self>,
@@ -8155,6 +9396,10 @@ impl GatewayRuntimeState {
         .map_err(|_| Status::internal("workspace document worker panicked"))?
     }
 
+    /// Loads a workspace document by id within the principal/channel/agent scope.
+    ///
+    /// # Errors
+    /// Returns the mapped memory store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn workspace_document_by_id(
         self: &Arc<Self>,
@@ -8181,6 +9426,10 @@ impl GatewayRuntimeState {
         .map_err(|_| Status::internal("workspace document worker panicked"))?
     }
 
+    /// Lists workspace documents matching the filter.
+    ///
+    /// # Errors
+    /// Returns the mapped memory store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn list_workspace_documents(
         self: &Arc<Self>,
@@ -8197,6 +9446,10 @@ impl GatewayRuntimeState {
         .map_err(|_| Status::internal("workspace document list worker panicked"))?
     }
 
+    /// Creates or updates a workspace document (new version on change).
+    ///
+    /// # Errors
+    /// Returns the mapped memory store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn upsert_workspace_document(
         self: &Arc<Self>,
@@ -8213,6 +9466,10 @@ impl GatewayRuntimeState {
         .map_err(|_| Status::internal("workspace document write worker panicked"))?
     }
 
+    /// Moves/renames a workspace document.
+    ///
+    /// # Errors
+    /// Returns the mapped memory store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn move_workspace_document(
         self: &Arc<Self>,
@@ -8229,6 +9486,10 @@ impl GatewayRuntimeState {
         .map_err(|_| Status::internal("workspace document move worker panicked"))?
     }
 
+    /// Soft-deletes a workspace document (history is retained).
+    ///
+    /// # Errors
+    /// Returns the mapped memory store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn soft_delete_workspace_document(
         self: &Arc<Self>,
@@ -8245,6 +9506,10 @@ impl GatewayRuntimeState {
         .map_err(|_| Status::internal("workspace document delete worker panicked"))?
     }
 
+    /// Lists the stored versions of a workspace document.
+    ///
+    /// # Errors
+    /// Returns the mapped memory store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn list_workspace_document_versions(
         self: &Arc<Self>,
@@ -8262,6 +9527,10 @@ impl GatewayRuntimeState {
         .map_err(|_| Status::internal("workspace document versions worker panicked"))?
     }
 
+    /// Sets or clears the pinned flag on a workspace document by path.
+    ///
+    /// # Errors
+    /// Returns the mapped memory store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn set_workspace_document_pinned(
         self: &Arc<Self>,
@@ -8288,6 +9557,10 @@ impl GatewayRuntimeState {
         .map_err(|_| Status::internal("workspace document pin worker panicked"))?
     }
 
+    /// Records that a workspace document was recalled into context.
+    ///
+    /// # Errors
+    /// Returns the mapped memory store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn record_workspace_document_recall(
         self: &Arc<Self>,
@@ -8305,6 +9578,10 @@ impl GatewayRuntimeState {
         .map_err(|_| Status::internal("workspace recall worker panicked"))?
     }
 
+    /// Seeds the default workspace documents for a principal.
+    ///
+    /// # Errors
+    /// Returns the mapped memory store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn bootstrap_workspace(
         self: &Arc<Self>,
@@ -8321,6 +9598,13 @@ impl GatewayRuntimeState {
         .map_err(|_| Status::internal("workspace bootstrap worker panicked"))?
     }
 
+    /// Searches workspace documents. When the retrieval index returns no
+    /// hits, falls back to lexical scoring over journal documents so content
+    /// that has not been indexed yet stays findable.
+    ///
+    /// # Errors
+    /// Returns the mapped memory store error, or `internal` if the worker
+    /// panicked.
     #[allow(clippy::result_large_err)]
     pub async fn search_workspace_documents_with_diagnostics(
         self: &Arc<Self>,
@@ -8385,6 +9669,11 @@ impl GatewayRuntimeState {
         Ok(outcome)
     }
 
+    /// Hits-only variant of
+    /// [`Self::search_workspace_documents_with_diagnostics`].
+    ///
+    /// # Errors
+    /// Same as the diagnostics variant.
     #[allow(clippy::result_large_err)]
     pub async fn search_workspace_documents(
         self: &Arc<Self>,
@@ -8393,11 +9682,15 @@ impl GatewayRuntimeState {
         Ok(self.search_workspace_documents_with_diagnostics(request).await?.hits)
     }
 
+    /// Counts a cron trigger firing.
     pub fn record_cron_trigger_fired(&self) {
         self.counters.cron_triggers_fired.fetch_add(1, Ordering::Relaxed);
     }
 }
 
+/// Lexical-only fallback scoring over journal workspace documents, used when
+/// the retrieval backend returned no hits (for example, content not yet
+/// indexed).
 fn fallback_workspace_document_search_hits(
     documents: Vec<WorkspaceDocumentRecord>,
     request: &WorkspaceSearchRequest,
@@ -8482,6 +9775,9 @@ fn fallback_workspace_document_search_hits(
     hits
 }
 
+/// Extracts a query-anchored snippet: finds the earliest token match, then
+/// backs the start up by a quarter of the snippet length (on a char boundary)
+/// so the match appears with leading context rather than at position zero.
 fn fallback_workspace_document_snippet(content: &str, query: &str) -> String {
     const SNIPPET_CHARS: usize = 512;
     let query_tokens = query
@@ -8505,6 +9801,10 @@ fn fallback_workspace_document_snippet(content: &str, query: &str) -> String {
     content[start..].chars().take(SNIPPET_CHARS).collect::<String>()
 }
 
+/// Enforces the configured memory content byte and whitespace-token limits.
+///
+/// # Errors
+/// `invalid_argument` naming the limit that was exceeded.
 fn validate_memory_item_content_limits(
     content_text: &str,
     config: &MemoryRuntimeConfig,
@@ -8526,6 +9826,8 @@ fn validate_memory_item_content_limits(
     Ok(())
 }
 
+/// Picks the first non-blank model profile in priority order: registry
+/// default chat model, active model, OpenAI model, Anthropic model.
 fn select_default_agent_model_profile(
     registry_default_chat_model_id: Option<&str>,
     active_model_id: Option<&str>,

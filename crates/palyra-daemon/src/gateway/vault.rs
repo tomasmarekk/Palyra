@@ -1,6 +1,13 @@
+//! Vault access over RPC: error mapping, scope enforcement, and the layered
+//! approval gate every secret read passes before bytes leave the daemon.
+//! Also hosts the approval/memory cache-key builders shared with tool flow.
+
 use super::*;
 use crate::application::service_authorization::authorize_vault_action;
 
+/// Maps a vault backend error to a gRPC status. `NotFound` deliberately
+/// carries no scope/key detail so the error cannot confirm which secrets
+/// exist; IO failures are tagged with `operation` for diagnostics.
 pub(crate) fn map_vault_error(operation: &str, error: VaultError) -> Status {
     match error {
         VaultError::NotFound => Status::not_found("secret not found"),
@@ -16,12 +23,30 @@ pub(crate) fn map_vault_error(operation: &str, error: VaultError) -> Status {
     }
 }
 
+/// Parses a vault scope literal (for example `global` or
+/// `principal:<id>`).
+///
+/// # Errors
+/// Returns `Status::invalid_argument` when the literal is not a valid scope.
 #[allow(clippy::result_large_err)]
 pub(crate) fn parse_vault_scope(raw: &str) -> Result<VaultScope, Status> {
     raw.parse::<VaultScope>()
         .map_err(|error| Status::invalid_argument(format!("invalid vault scope: {error}")))
 }
 
+/// Enforces that the authenticated request context may touch the given vault
+/// scope. This is the identity gate for every external vault RPC:
+///
+/// - `Global` is open to any authenticated caller (further restricted by the
+///   approval policy and service authorization downstream).
+/// - `Principal` must match the caller's own principal exactly.
+/// - `Channel` requires the caller's channel context to equal
+///   `<channel_name>:<account_id>`.
+/// - `Skill` is never reachable over external RPC; skill-scoped secrets are
+///   resolved only by the internal skill runtime.
+///
+/// # Errors
+/// Returns `Status::permission_denied` for any scope/context mismatch.
 #[allow(clippy::result_large_err)]
 pub(crate) fn enforce_vault_scope_access(
     scope: &VaultScope,
@@ -59,6 +84,7 @@ pub(crate) fn enforce_vault_scope_access(
     }
 }
 
+/// Converts vault secret metadata (never the value) to its proto form.
 pub(crate) fn vault_secret_metadata_message(
     metadata: &VaultSecretMetadata,
 ) -> gateway_v1::VaultSecretMetadata {
@@ -67,10 +93,16 @@ pub(crate) fn vault_secret_metadata_message(
         key: metadata.key.clone(),
         created_at_unix_ms: metadata.created_at_unix_ms,
         updated_at_unix_ms: metadata.updated_at_unix_ms,
+        // Intentional narrowing cast: secret values are capped at
+        // MAX_VAULT_SECRET_BYTES (64 KiB), far below u32::MAX.
         value_bytes: metadata.value_bytes as u32,
     }
 }
 
+/// Builds the memory-search cache key from every request field that affects
+/// results, including caller identity, so cached hits never leak across
+/// principals, channels, or sessions. `serde_json` orders object keys
+/// deterministically, making the rendered string a stable key.
 pub(crate) fn memory_search_cache_key(request: &MemorySearchRequest) -> String {
     json!({
         "principal": request.principal,
@@ -85,6 +117,11 @@ pub(crate) fn memory_search_cache_key(request: &MemorySearchRequest) -> String {
     .to_string()
 }
 
+/// Builds the identity-scoped prefix for tool-approval cache keys. Every
+/// caller dimension (principal, device, channel, session) is baked in so a
+/// session-scoped approval decision can never be replayed by a different
+/// identity; the trailing delimiter also lets callers invalidate a whole
+/// session's entries by prefix match.
 pub(crate) fn tool_approval_cache_key_prefix(context: &RequestContext, session_id: &str) -> String {
     format!(
         "principal={}|device_id={}|channel={}|session={}|",
@@ -95,6 +132,8 @@ pub(crate) fn tool_approval_cache_key_prefix(context: &RequestContext, session_i
     )
 }
 
+/// Full cache key for one approval subject under the caller's identity
+/// prefix (see [`tool_approval_cache_key_prefix`]).
 pub(crate) fn tool_approval_cache_key(
     context: &RequestContext,
     session_id: &str,
@@ -103,6 +142,10 @@ pub(crate) fn tool_approval_cache_key(
     format!("{}subject={subject_id}", tool_approval_cache_key_prefix(context, session_id))
 }
 
+/// Derives a tool approval outcome from a stored approval record;
+/// `fallback_decision` stands in when the record has not been resolved yet.
+/// Only an explicit `Allow` yields `approved == true` - timeouts and errors
+/// stay denials.
 pub(crate) fn tool_approval_outcome_from_record(
     record: &ApprovalRecord,
     fallback_decision: ApprovalDecision,
@@ -118,6 +161,11 @@ pub(crate) fn tool_approval_outcome_from_record(
     }
 }
 
+/// Rejects requests whose protocol major version differs from the daemon's
+/// canonical major.
+///
+/// # Errors
+/// Returns `Status::failed_precondition` on version mismatch.
 #[allow(clippy::result_large_err)]
 pub(crate) fn require_supported_version(v: u32) -> Result<(), Status> {
     if v != CANONICAL_PROTOCOL_MAJOR {
@@ -126,10 +174,14 @@ pub(crate) fn require_supported_version(v: u32) -> Result<(), Status> {
     Ok(())
 }
 
+// Canonical "scope/key" form used to match configured approval-required refs.
 fn normalize_vault_ref_literal(scope: &VaultScope, key: &str) -> String {
     format!("{scope}/{key}").to_ascii_lowercase()
 }
 
+/// Whether reading this secret is configured to require an explicit
+/// approval. Configured refs are `scope/key` literals matched
+/// case-insensitively against the request.
 pub(crate) fn vault_get_requires_approval(
     scope: &VaultScope,
     key: &str,
@@ -144,6 +196,19 @@ pub(crate) fn vault_get_requires_approval(
         .any(|configured| configured.eq_ignore_ascii_case(candidate.as_str()))
 }
 
+/// Enforces the approval requirement for reading an approval-gated secret.
+///
+/// Secrets not listed in `approval_required_refs` pass through. For gated
+/// ones the decision is delegated to the deny-by-default policy engine with
+/// `vault.get` registered as a sensitive action and `approval_granted`
+/// mapped onto `allow_sensitive_tools` - reusing the engine instead of an ad
+/// hoc boolean check keeps the decision and its journal explanation
+/// consistent with tool approvals.
+///
+/// # Errors
+/// Returns `Status::permission_denied` (with the policy reason) when
+/// approval is required but not granted, and `Status::internal` when policy
+/// evaluation itself fails.
 #[allow(clippy::result_large_err)]
 pub(crate) fn enforce_vault_get_approval_policy(
     principal: &str,
@@ -178,6 +243,17 @@ pub(crate) fn enforce_vault_get_approval_policy(
     }
 }
 
+/// Reads a secret value for an authenticated request context, applying the
+/// full gate stack in order: scope/identity match, approval policy for gated
+/// refs, service authorization, and finally the vault fetch.
+///
+/// The `secret.accessed` journal event is mandatory: if recording it fails,
+/// the error propagates and the caller never receives the value, so no
+/// secret read can go unaudited.
+///
+/// # Errors
+/// Returns `Status::permission_denied` from any gate, `Status::not_found`
+/// for missing secrets, and storage/journal errors otherwise.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn read_vault_secret_for_context(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -213,6 +289,15 @@ pub(crate) async fn read_vault_secret_for_context(
     Ok(value)
 }
 
+/// Console-facing secret reveal: parses the scope/key literals and reads via
+/// [`read_vault_secret_for_context`] with `approval_granted = true`, because
+/// the console handler has already authenticated an operator session and
+/// required an explicit reveal acknowledgment - that interaction *is* the
+/// approval for approval-gated refs.
+///
+/// # Errors
+/// Returns `Status::invalid_argument` for a bad scope literal, plus
+/// everything [`read_vault_secret_for_context`] can return.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn reveal_vault_secret_for_console(
     runtime_state: &Arc<GatewayRuntimeState>,

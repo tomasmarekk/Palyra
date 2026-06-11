@@ -1,7 +1,13 @@
+//! Domain-record to gateway proto message converters for sessions, agents,
+//! execution backends, and approval prompts/records. Pure mapping only:
+//! optional journal fields flatten to proto3 defaults, nothing is validated.
+
 use super::*;
 use crate::agents::SessionAgentBinding;
 use crate::execution_backends::ExecutionBackendInventoryRecord;
 
+/// Builds the session summary proto from an orchestrator session record;
+/// `preview_state` is derived from preview presence rather than stored.
 pub(crate) fn session_summary_message(
     session: &OrchestratorSessionRecord,
 ) -> gateway_v1::SessionSummary {
@@ -37,6 +43,7 @@ pub(crate) fn session_summary_message(
     }
 }
 
+/// Builds the agent proto from a registry record.
 pub(crate) fn agent_message(agent: &AgentRecord) -> gateway_v1::Agent {
     gateway_v1::Agent {
         agent_id: agent.agent_id.clone(),
@@ -52,6 +59,8 @@ pub(crate) fn agent_message(agent: &AgentRecord) -> gateway_v1::Agent {
     }
 }
 
+/// Builds the execution-backend inventory proto from an inventory record;
+/// node counts saturate at `u32::MAX` instead of failing the conversion.
 pub(crate) fn execution_backend_inventory_message(
     backend: &ExecutionBackendInventoryRecord,
 ) -> gateway_v1::ExecutionBackendInventory {
@@ -73,6 +82,7 @@ pub(crate) fn execution_backend_inventory_message(
     }
 }
 
+/// Builds the agent-binding proto from a session binding record.
 pub(crate) fn agent_binding_message(binding: &SessionAgentBinding) -> gateway_v1::AgentBinding {
     gateway_v1::AgentBinding {
         principal: binding.principal.clone(),
@@ -83,6 +93,7 @@ pub(crate) fn agent_binding_message(binding: &SessionAgentBinding) -> gateway_v1
     }
 }
 
+/// Converts an agent resolution source to its proto enum value.
 pub(crate) fn agent_resolution_source_to_proto(source: AgentResolutionSource) -> i32 {
     match source {
         AgentResolutionSource::SessionBinding => {
@@ -93,6 +104,8 @@ pub(crate) fn agent_resolution_source_to_proto(source: AgentResolutionSource) ->
     }
 }
 
+/// Stable snake_case label for an agent resolution source, used in journal
+/// payloads and logs; treat the strings as contract.
 pub(crate) fn agent_resolution_source_label(source: AgentResolutionSource) -> &'static str {
     match source {
         AgentResolutionSource::SessionBinding => "session_binding",
@@ -101,6 +114,7 @@ pub(crate) fn agent_resolution_source_label(source: AgentResolutionSource) -> &'
     }
 }
 
+/// Converts approval prompt options to their proto representation.
 pub(crate) fn approval_option_messages(
     options: &[ApprovalPromptOption],
 ) -> Vec<common_v1::ApprovalOption> {
@@ -117,6 +131,8 @@ pub(crate) fn approval_option_messages(
         .collect()
 }
 
+/// Builds the approval prompt proto shown to clients when a tool call or
+/// other sensitive action needs an explicit decision.
 pub(crate) fn approval_prompt_message(prompt: &ApprovalPromptRecord) -> common_v1::ApprovalPrompt {
     common_v1::ApprovalPrompt {
         title: prompt.title.clone(),
@@ -130,6 +146,8 @@ pub(crate) fn approval_prompt_message(prompt: &ApprovalPromptRecord) -> common_v
     }
 }
 
+/// Converts the policy snapshot captured at approval time to proto, so
+/// clients can show which policy version produced the prompt.
 pub(crate) fn approval_policy_snapshot_message(
     value: &ApprovalPolicySnapshot,
 ) -> gateway_v1::ApprovalPolicySnapshot {
@@ -140,6 +158,9 @@ pub(crate) fn approval_policy_snapshot_message(
     }
 }
 
+/// Builds the full approval record proto. An unresolved approval surfaces as
+/// `Unspecified` decision/scope (proto3 zero values), distinguishing
+/// "pending" from any explicit allow or deny.
 pub(crate) fn approval_record_message(record: &ApprovalRecord) -> gateway_v1::ApprovalRecord {
     gateway_v1::ApprovalRecord {
         v: CANONICAL_PROTOCOL_MAJOR,

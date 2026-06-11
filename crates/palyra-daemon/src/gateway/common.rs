@@ -1,5 +1,11 @@
+//! Store-error to gRPC `Status` mapping for every gateway storage domain
+//! (orchestrator, agents, cron, approvals, memory, skills, canvas), plus the
+//! shared wall-clock helper. Status messages here are client-facing contract.
+
 use super::*;
 
+/// Maps an orchestrator/journal store error to the matching gRPC status code;
+/// unrecognized errors become `internal` prefixed with `operation`.
 pub(crate) fn map_orchestrator_store_error(operation: &str, error: JournalError) -> Status {
     match error {
         JournalError::DuplicateRunId { run_id } => {
@@ -71,6 +77,8 @@ pub(crate) fn map_orchestrator_store_error(operation: &str, error: JournalError)
     }
 }
 
+/// Maps an agent-registry error to the matching gRPC status code;
+/// unrecognized errors become `internal` prefixed with `operation`.
 pub(crate) fn map_agent_registry_error(operation: &str, error: AgentRegistryError) -> Status {
     match error {
         AgentRegistryError::AgentNotFound(agent_id) => {
@@ -98,6 +106,8 @@ pub(crate) fn map_agent_registry_error(operation: &str, error: AgentRegistryErro
     }
 }
 
+/// Maps a cron store error to the matching gRPC status code; unrecognized
+/// errors become `internal` prefixed with `operation`.
 pub(crate) fn map_cron_store_error(operation: &str, error: JournalError) -> Status {
     match error {
         JournalError::CronJobNotFound { job_id } => {
@@ -124,6 +134,8 @@ pub(crate) fn map_cron_store_error(operation: &str, error: JournalError) -> Stat
     }
 }
 
+/// Maps an approval store error to the matching gRPC status code;
+/// unrecognized errors become `internal` prefixed with `operation`.
 pub(crate) fn map_approval_store_error(operation: &str, error: JournalError) -> Status {
     match error {
         JournalError::ApprovalNotFound { approval_id } => {
@@ -141,6 +153,8 @@ pub(crate) fn map_approval_store_error(operation: &str, error: JournalError) -> 
     }
 }
 
+/// Maps a memory/workspace-document store error to the matching gRPC status
+/// code; unrecognized errors become `internal` prefixed with `operation`.
 pub(crate) fn map_memory_store_error(operation: &str, error: JournalError) -> Status {
     match error {
         JournalError::MemoryNotFound { memory_id } => {
@@ -173,6 +187,8 @@ pub(crate) fn map_memory_store_error(operation: &str, error: JournalError) -> St
     }
 }
 
+/// Maps a skill store error to a gRPC status: payload-size violations become
+/// `invalid_argument`, everything else `internal` prefixed with `operation`.
 pub(crate) fn map_skill_store_error(operation: &str, error: JournalError) -> Status {
     match error {
         JournalError::PayloadTooLarge { payload_kind, actual_bytes, max_bytes } => {
@@ -184,6 +200,8 @@ pub(crate) fn map_skill_store_error(operation: &str, error: JournalError) -> Sta
     }
 }
 
+/// Maps a canvas store error to the matching gRPC status code; unrecognized
+/// errors become `internal` prefixed with `operation`.
 pub(crate) fn map_canvas_store_error(operation: &str, error: JournalError) -> Status {
     match error {
         JournalError::DuplicateCanvasStateVersion { canvas_id, state_version } => {
@@ -206,6 +224,14 @@ pub(crate) fn map_canvas_store_error(operation: &str, error: JournalError) -> St
     }
 }
 
+/// Returns the current unix time in milliseconds for RPC handlers.
+///
+/// Near-duplicate of [`super::unix_ms_now_for_status`]; this variant predates
+/// it and truncates via `as` instead of saturating (identical results until
+/// the year ~292278994, so the cast is intentionally left as-is).
+///
+/// # Errors
+/// Returns `Status::internal` when the system clock reads before the epoch.
 pub(crate) fn current_unix_ms_status() -> Result<i64, Status> {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)

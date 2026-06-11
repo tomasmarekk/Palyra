@@ -1,3 +1,7 @@
+//! End-to-end tests for the admin HTTP surface of a spawned `palyrad`:
+//! token gating, brute-force rate limiting, journal/status/policy-explain
+//! payloads, and skill quarantine override acknowledgements.
+
 use std::{
     fs,
     io::Read,

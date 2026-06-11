@@ -1,5 +1,14 @@
+//! Cron RPC support: request validation (names, prompts, jitter, ownership,
+//! channel context) and journal-record/proto conversion for jobs and runs.
+//! Ownership checks here are the authorization boundary for all cron RPCs.
+
 use super::*;
 
+/// Validates and trims a cron job name (non-empty, at most
+/// `MAX_CRON_JOB_NAME_BYTES`).
+///
+/// # Errors
+/// Returns `Status::invalid_argument` when the name is empty or too long.
 #[allow(clippy::result_large_err)]
 pub(crate) fn validate_cron_job_name(name: String) -> Result<String, Status> {
     let value = name.trim();
@@ -15,6 +24,11 @@ pub(crate) fn validate_cron_job_name(name: String) -> Result<String, Status> {
     Ok(value.to_owned())
 }
 
+/// Validates and trims a cron job prompt (non-empty, at most
+/// `MAX_CRON_PROMPT_BYTES`).
+///
+/// # Errors
+/// Returns `Status::invalid_argument` when the prompt is empty or too long.
 #[allow(clippy::result_large_err)]
 pub(crate) fn validate_cron_job_prompt(prompt: String) -> Result<String, Status> {
     let value = prompt.trim();
@@ -30,6 +44,10 @@ pub(crate) fn validate_cron_job_prompt(prompt: String) -> Result<String, Status>
     Ok(value.to_owned())
 }
 
+/// Validates a cron jitter value against `MAX_CRON_JITTER_MS`.
+///
+/// # Errors
+/// Returns `Status::invalid_argument` when the jitter exceeds the maximum.
 #[allow(clippy::result_large_err)]
 pub(crate) fn validate_cron_jitter_ms(jitter_ms: u64) -> Result<u64, Status> {
     if jitter_ms > MAX_CRON_JITTER_MS {
@@ -40,6 +58,13 @@ pub(crate) fn validate_cron_jitter_ms(jitter_ms: u64) -> Result<u64, Status> {
     Ok(jitter_ms)
 }
 
+/// Resolves the owner principal for cron job creation: an empty request
+/// defaults to the authenticated principal, and a non-empty request must
+/// match it - a caller can never create a job owned by someone else.
+///
+/// # Errors
+/// Returns `Status::permission_denied` when the requested owner differs from
+/// the authenticated principal.
 #[allow(clippy::result_large_err)]
 pub(crate) fn validate_cron_job_owner_principal(
     authenticated_principal: &str,
@@ -54,6 +79,14 @@ pub(crate) fn validate_cron_job_owner_principal(
     }
 }
 
+/// Validates the owner principal on cron job updates. Unlike creation, an
+/// empty owner is rejected here: updates address an existing job, so a
+/// missing owner indicates a malformed request rather than "default to me".
+///
+/// # Errors
+/// Returns `Status::invalid_argument` for an empty owner and
+/// `Status::permission_denied` when it differs from the authenticated
+/// principal.
 #[allow(clippy::result_large_err)]
 pub(crate) fn validate_cron_job_owner_principal_for_update(
     authenticated_principal: &str,
@@ -69,6 +102,13 @@ pub(crate) fn validate_cron_job_owner_principal_for_update(
     Ok(owner_principal)
 }
 
+/// Checks that a requested cron delivery channel is permitted for the
+/// caller's authenticated channel context. Passes when either side is absent
+/// (no channel to pin against, or nothing requested).
+///
+/// # Errors
+/// Returns `Status::permission_denied` when the requested channel neither
+/// matches the context channel nor is the internal cron channel.
 #[allow(clippy::result_large_err)]
 pub(crate) fn validate_cron_job_channel_context(
     context_channel: Option<&str>,
@@ -80,6 +120,9 @@ pub(crate) fn validate_cron_job_channel_context(
     let Some(context_channel) = context_channel else {
         return Ok(());
     };
+    // "system:cron" is the daemon-internal delivery channel; any caller may
+    // target it because output stays inside the daemon instead of being sent
+    // to a channel the caller is not bound to.
     if context_channel != requested_channel && requested_channel != "system:cron" {
         return Err(Status::permission_denied(
             "cron channel must match authenticated channel context",
@@ -88,6 +131,13 @@ pub(crate) fn validate_cron_job_channel_context(
     Ok(())
 }
 
+/// Resolves the delivery channel for a new cron job: the validated requested
+/// channel when present, else the caller's context channel, else the
+/// internal cron channel.
+///
+/// # Errors
+/// Returns `Status::permission_denied` when the requested channel fails
+/// [`validate_cron_job_channel_context`].
 #[allow(clippy::result_large_err)]
 pub(crate) fn resolve_cron_job_channel_for_create(
     context_channel: Option<&str>,
@@ -100,6 +150,12 @@ pub(crate) fn resolve_cron_job_channel_for_create(
         .unwrap_or_else(|| "system:cron".to_owned()))
 }
 
+/// Validates the channel patch on a cron job update. `None` (empty request)
+/// means "leave the stored channel unchanged" rather than defaulting it.
+///
+/// # Errors
+/// Returns `Status::permission_denied` when the requested channel fails
+/// [`validate_cron_job_channel_context`].
 #[allow(clippy::result_large_err)]
 pub(crate) fn validate_cron_job_channel_for_update(
     context_channel: Option<&str>,
@@ -110,6 +166,11 @@ pub(crate) fn validate_cron_job_channel_for_update(
     Ok(requested_channel)
 }
 
+/// Requires the authenticated principal to own the cron job; every mutating
+/// and run-control cron RPC must pass through this gate.
+///
+/// # Errors
+/// Returns `Status::permission_denied` on owner mismatch.
 #[allow(clippy::result_large_err)]
 pub(crate) fn enforce_cron_job_owner(
     authenticated_principal: &str,
@@ -121,6 +182,11 @@ pub(crate) fn enforce_cron_job_owner(
     Err(Status::permission_denied("cron job owner mismatch for authenticated principal"))
 }
 
+/// Parses a proto concurrency policy into the journal enum.
+///
+/// # Errors
+/// Returns `Status::invalid_argument` for unspecified or unknown values; a
+/// concurrency policy has no safe default, so the client must choose one.
 #[allow(clippy::result_large_err)]
 pub(crate) fn cron_concurrency_from_proto(raw: i32) -> Result<CronConcurrencyPolicy, Status> {
     match cron_v1::ConcurrencyPolicy::try_from(raw)
@@ -135,6 +201,7 @@ pub(crate) fn cron_concurrency_from_proto(raw: i32) -> Result<CronConcurrencyPol
     }
 }
 
+/// Converts a journal concurrency policy to its proto enum value.
 pub(crate) fn cron_concurrency_to_proto(policy: CronConcurrencyPolicy) -> i32 {
     match policy {
         CronConcurrencyPolicy::Forbid => cron_v1::ConcurrencyPolicy::Forbid as i32,
@@ -143,6 +210,10 @@ pub(crate) fn cron_concurrency_to_proto(policy: CronConcurrencyPolicy) -> i32 {
     }
 }
 
+/// Parses a proto misfire policy into the journal enum.
+///
+/// # Errors
+/// Returns `Status::invalid_argument` for unspecified or unknown values.
 #[allow(clippy::result_large_err)]
 pub(crate) fn cron_misfire_from_proto(
     raw: i32,
@@ -156,6 +227,7 @@ pub(crate) fn cron_misfire_from_proto(
     }
 }
 
+/// Converts a journal misfire policy to its proto enum value.
 pub(crate) fn cron_misfire_to_proto(policy: crate::journal::CronMisfirePolicy) -> i32 {
     match policy {
         crate::journal::CronMisfirePolicy::Skip => cron_v1::MisfirePolicy::Skip as i32,
@@ -163,6 +235,12 @@ pub(crate) fn cron_misfire_to_proto(policy: crate::journal::CronMisfirePolicy) -
     }
 }
 
+/// Parses the required proto retry policy, silently clamping `max_attempts`
+/// to 1..=16 and `backoff_ms` to 1..=60000 instead of rejecting - out-of-range
+/// retry settings are bounded to safe values rather than failing the request.
+///
+/// # Errors
+/// Returns `Status::invalid_argument` when the retry policy is missing.
 #[allow(clippy::result_large_err)]
 pub(crate) fn cron_retry_from_proto(
     value: Option<cron_v1::RetryPolicy>,
@@ -177,6 +255,13 @@ fn optional_canonical_id(value: &Option<String>) -> Option<common_v1::CanonicalI
     value.as_deref().map(|ulid| common_v1::CanonicalId { ulid: ulid.to_owned() })
 }
 
+/// Builds the proto job message from a journal record. `enabled` and
+/// `next_run_at_unix_ms` go through the `crate::cron` visibility helpers so
+/// the wire view reflects effective scheduler state, not raw stored fields.
+///
+/// # Errors
+/// Returns an error when the stored schedule payload cannot be converted to
+/// its proto representation.
 #[allow(clippy::result_large_err)]
 pub(crate) fn cron_job_message(job: &CronJobRecord) -> Result<cron_v1::Job, Status> {
     let schedule = schedule_to_proto(job.schedule_type, job.schedule_payload_json.as_str())?;
@@ -205,6 +290,8 @@ pub(crate) fn cron_job_message(job: &CronJobRecord) -> Result<cron_v1::Job, Stat
     })
 }
 
+/// Builds the proto run message from a journal record; absent optionals are
+/// flattened to proto3 defaults (empty string / zero).
 pub(crate) fn cron_run_message(run: &CronRunRecord) -> cron_v1::JobRun {
     let session_reference = optional_canonical_id(&run.session_id);
     let orchestrator_reference = optional_canonical_id(&run.orchestrator_run_id);
@@ -227,6 +314,7 @@ pub(crate) fn cron_run_message(run: &CronRunRecord) -> cron_v1::JobRun {
     }
 }
 
+/// Converts a journal run status to its proto enum value.
 pub(crate) fn cron_run_status_to_proto(status: CronRunStatus) -> i32 {
     match status {
         CronRunStatus::Accepted => cron_v1::JobRunStatus::Accepted as i32,
