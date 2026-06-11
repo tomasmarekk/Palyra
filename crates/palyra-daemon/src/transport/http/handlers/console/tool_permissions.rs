@@ -1,3 +1,8 @@
+//! Console tool-permission inspection and mutation handlers.
+//!
+//! These endpoints expose effective tool posture, friction metrics,
+//! recommendations, presets, and scoped overrides for the console UI.
+
 use std::collections::BTreeSet;
 
 use serde::Serialize;
@@ -25,6 +30,7 @@ const TOOL_PERMISSION_AUDIT_HISTORY_LIMIT: usize = 20;
 
 type ToolPermissionsStatusResult<T> = Result<T, tonic::Status>;
 
+/// Effective scope chain returned with tool-permission responses.
 #[derive(Debug, Serialize)]
 pub(crate) struct ToolPermissionsScopeEnvelope {
     active: ToolPostureScopeRef,
@@ -35,6 +41,7 @@ pub(crate) struct ToolPermissionsScopeEnvelope {
     chain: Vec<ToolPostureScopeRef>,
 }
 
+/// Aggregate tool-permission counts for a scope.
 #[derive(Debug, Serialize)]
 pub(crate) struct ToolPermissionsSummary {
     total_tools: usize,
@@ -44,6 +51,7 @@ pub(crate) struct ToolPermissionsSummary {
     pending_approvals_14d: u64,
 }
 
+/// Effective permission record for one tool.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ToolPermissionRecord {
     tool_name: String,
@@ -60,6 +68,7 @@ pub(crate) struct ToolPermissionRecord {
     recommendation: Option<ToolPostureRecommendation>,
 }
 
+/// List response for tool permissions in one scope.
 #[derive(Debug, Serialize)]
 pub(crate) struct ToolPermissionsEnvelope {
     contract: control_plane::ContractDescriptor,
@@ -71,6 +80,7 @@ pub(crate) struct ToolPermissionsEnvelope {
     tools: Vec<ToolPermissionRecord>,
 }
 
+/// Detail response for one tool permission record.
 #[derive(Debug, Serialize)]
 pub(crate) struct ToolPermissionDetailEnvelope {
     contract: control_plane::ContractDescriptor,
@@ -80,6 +90,7 @@ pub(crate) struct ToolPermissionDetailEnvelope {
     change_history: Vec<ToolPostureAuditEventRecord>,
 }
 
+/// One preset preview diff row.
 #[derive(Debug, Serialize)]
 pub(crate) struct ToolPermissionPresetDiffEntry {
     tool_name: String,
@@ -92,6 +103,7 @@ pub(crate) struct ToolPermissionPresetDiffEntry {
     lock_reason: Option<String>,
 }
 
+/// Preview response for applying a posture preset.
 #[derive(Debug, Serialize)]
 pub(crate) struct ToolPermissionPresetPreviewEnvelope {
     contract: control_plane::ContractDescriptor,
@@ -101,6 +113,7 @@ pub(crate) struct ToolPermissionPresetPreviewEnvelope {
     preview: Vec<ToolPermissionPresetDiffEntry>,
 }
 
+/// Mutation response for override or recommendation actions.
 #[derive(Debug, Serialize)]
 pub(crate) struct ToolPermissionMutationEnvelope {
     contract: control_plane::ContractDescriptor,
@@ -112,6 +125,7 @@ pub(crate) struct ToolPermissionMutationEnvelope {
     detail: ToolPermissionDetailEnvelope,
 }
 
+/// Response returned after clearing all overrides for a scope.
 #[derive(Debug, Serialize)]
 pub(crate) struct ToolPermissionScopeResetEnvelope {
     contract: control_plane::ContractDescriptor,
@@ -145,6 +159,11 @@ struct ToolPermissionsJournalEvent<'a> {
     source: &'a str, reason: Option<&'a str>, recommendation_id: Option<&'a str>, preset_id: Option<&'a str>,
 }
 
+/// Lists effective tool permissions for a scope.
+///
+/// # Errors
+/// Returns an error response when session authorization, scope resolution,
+/// posture loading, or approval-history loading fails.
 pub(crate) async fn console_tool_permissions_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -165,6 +184,11 @@ pub(crate) async fn console_tool_permissions_list_handler(
     }))
 }
 
+/// Returns one effective tool permission with change history.
+///
+/// # Errors
+/// Returns an error response when session authorization, scope resolution,
+/// posture loading, or tool lookup fails.
 pub(crate) async fn console_tool_permission_get_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -178,6 +202,12 @@ pub(crate) async fn console_tool_permission_get_handler(
     ))
 }
 
+/// Sets a manual posture override for one tool and scope.
+///
+/// # Errors
+/// Returns an error response when session authorization, tool validation, scope
+/// parsing, override persistence, journal recording, or detail rebuilding
+/// fails.
 pub(crate) async fn console_tool_permission_override_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -223,6 +253,11 @@ pub(crate) async fn console_tool_permission_override_handler(
     }))
 }
 
+/// Clears a manual posture override for one tool and scope.
+///
+/// # Errors
+/// Returns an error response when session authorization, tool validation, scope
+/// parsing, override deletion, journal recording, or detail rebuilding fails.
 pub(crate) async fn console_tool_permission_reset_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -266,6 +301,11 @@ pub(crate) async fn console_tool_permission_reset_handler(
     }))
 }
 
+/// Clears all tool posture overrides for a scope.
+///
+/// # Errors
+/// Returns an error response when session authorization, scope parsing,
+/// override deletion, or journal recording fails.
 pub(crate) async fn console_tool_permission_scope_reset_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -315,6 +355,11 @@ pub(crate) async fn console_tool_permission_scope_reset_handler(
     }))
 }
 
+/// Previews the diff for applying a posture preset.
+///
+/// # Errors
+/// Returns an error response when session authorization, scope resolution,
+/// preset lookup, or posture loading fails.
 pub(crate) async fn console_tool_permissions_preset_preview_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -353,6 +398,11 @@ pub(crate) async fn console_tool_permissions_preset_preview_handler(
     }))
 }
 
+/// Applies a posture preset to a scope.
+///
+/// # Errors
+/// Returns an error response when session authorization, scope parsing, preset
+/// lookup, override persistence, or journal recording fails.
 pub(crate) async fn console_tool_permissions_preset_apply_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -439,6 +489,11 @@ pub(crate) async fn console_tool_permissions_preset_apply_handler(
     }))
 }
 
+/// Records the chosen action for a tool-posture recommendation.
+///
+/// # Errors
+/// Returns an error response when session authorization, recommendation action
+/// validation, persistence, or journal recording fails.
 pub(crate) async fn console_tool_permissions_recommendation_action_handler(
     State(state): State<AppState>,
     headers: HeaderMap,

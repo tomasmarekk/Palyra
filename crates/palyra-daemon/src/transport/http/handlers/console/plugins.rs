@@ -1,3 +1,9 @@
+//! Console plugin binding, installation, validation, and lifecycle handlers.
+//!
+//! Plugin bindings connect installed skill artifacts to runtime plugin config.
+//! The install path deliberately keeps artifact security audit and binding
+//! mutation in one flow so the console never enables unaudited code.
+
 #![allow(clippy::result_large_err)]
 
 use std::{collections::BTreeMap, fs, path::PathBuf};
@@ -26,12 +32,14 @@ use crate::{
     *,
 };
 
+/// Query parameters for filtering console plugin bindings.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsolePluginsListQuery {
     plugin_id: Option<String>,
     skill_id: Option<String>,
 }
 
+/// Request body for installing an artifact and/or upserting a plugin binding.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConsolePluginInstallOrBindRequest {
@@ -64,10 +72,16 @@ pub(crate) struct ConsolePluginInstallOrBindRequest {
     clear_config: Option<bool>,
 }
 
+/// Empty request body used by plugin toggle actions.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConsoleToggleRequest {}
 
+/// Lists plugin bindings and their current validation checks.
+///
+/// # Errors
+/// Returns an error response when session authorization, plugin-root
+/// resolution, binding-index IO, validation, or index persistence fails.
 pub(crate) async fn console_plugins_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -115,6 +129,11 @@ pub(crate) async fn console_plugins_list_handler(
     })))
 }
 
+/// Returns one plugin binding with validation and installed-skill details.
+///
+/// # Errors
+/// Returns an error response when session authorization, plugin-root
+/// resolution, binding lookup, validation, or index persistence fails.
 pub(crate) async fn console_plugin_get_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -146,6 +165,12 @@ pub(crate) async fn console_plugin_get_handler(
     })))
 }
 
+/// Installs a skill artifact when supplied and upserts the plugin binding.
+///
+/// # Errors
+/// Returns an error response when session authorization, artifact install,
+/// config validation, binding normalization, plugin-root preparation, binding
+/// persistence, or audit-event recording fails.
 pub(crate) async fn console_plugins_install_or_bind_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -296,6 +321,11 @@ pub(crate) async fn console_plugins_install_or_bind_handler(
     })))
 }
 
+/// Re-runs validation for one plugin binding.
+///
+/// # Errors
+/// Returns an error response when session authorization, plugin lookup,
+/// validation, or index persistence fails.
 pub(crate) async fn console_plugin_check_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -327,6 +357,11 @@ pub(crate) async fn console_plugin_check_handler(
     })))
 }
 
+/// Enables one plugin binding.
+///
+/// # Errors
+/// Returns an error response when session authorization, plugin lookup,
+/// validation, mutation, or audit-event recording fails.
 pub(crate) async fn console_plugin_enable_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -357,6 +392,11 @@ pub(crate) async fn console_plugin_enable_handler(
     })))
 }
 
+/// Disables one plugin binding.
+///
+/// # Errors
+/// Returns an error response when session authorization, plugin lookup,
+/// mutation, or audit-event recording fails.
 pub(crate) async fn console_plugin_disable_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -387,6 +427,11 @@ pub(crate) async fn console_plugin_disable_handler(
     })))
 }
 
+/// Deletes one plugin binding and any associated config instance.
+///
+/// # Errors
+/// Returns an error response when session authorization, plugin deletion,
+/// config removal, or audit-event recording fails.
 pub(crate) async fn console_plugin_delete_handler(
     State(state): State<AppState>,
     headers: HeaderMap,

@@ -1,3 +1,9 @@
+//! Mobile companion console endpoints.
+//!
+//! The mobile surface is a constrained view over approvals, recent sessions,
+//! safe URL handoff, and voice-note capture. It reuses console session auth
+//! while returning mobile-specific envelopes for cacheable companion clients.
+
 use std::collections::{BTreeMap, HashMap};
 
 use palyra_common::runtime_contracts::{AuxiliaryTaskKind, AuxiliaryTaskState};
@@ -21,6 +27,7 @@ const MOBILE_NOTIFICATION_POLL_INTERVAL_MS: u64 = 45_000;
 const MOBILE_VOICE_NOTE_MAX_TEXT_BYTES: usize = 8 * 1024;
 const MOBILE_VOICE_NOTE_MAX_DURATION_MS: u64 = 2 * 60 * 1000;
 
+/// Query parameters for mobile approval list pagination.
 #[derive(Debug, Deserialize)]
 pub(crate) struct MobileApprovalsQuery {
     #[serde(default)]
@@ -31,6 +38,7 @@ pub(crate) struct MobileApprovalsQuery {
     include_resolved: Option<bool>,
 }
 
+/// Query parameters for mobile session list pagination and search.
 #[derive(Debug, Deserialize)]
 pub(crate) struct MobileSessionsQuery {
     #[serde(default)]
@@ -43,6 +51,7 @@ pub(crate) struct MobileSessionsQuery {
     q: Option<String>,
 }
 
+/// Request body for creating a mobile voice-note task.
 #[derive(Debug, Deserialize)]
 pub(crate) struct MobileVoiceNoteRequest {
     #[serde(default)]
@@ -66,6 +75,10 @@ struct MobileSessionView {
     handoff: control_plane::MobileHandoffTarget,
 }
 
+/// Returns mobile capability, pairing, notification, and cache policy.
+///
+/// # Errors
+/// Returns an error response when console session authorization fails.
 pub(crate) async fn console_mobile_bootstrap_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -124,6 +137,11 @@ pub(crate) async fn console_mobile_bootstrap_handler(
     }))
 }
 
+/// Returns the mobile inbox summary with approval and task alerts.
+///
+/// # Errors
+/// Returns an error response when session authorization, approval lookup,
+/// background-task lookup, or session lookup fails.
 pub(crate) async fn console_mobile_inbox_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -207,6 +225,11 @@ pub(crate) async fn console_mobile_inbox_handler(
     }))
 }
 
+/// Lists approvals for the mobile companion.
+///
+/// # Errors
+/// Returns an error response when session authorization or approval lookup
+/// fails.
 pub(crate) async fn console_mobile_approvals_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -241,6 +264,11 @@ pub(crate) async fn console_mobile_approvals_list_handler(
     }))
 }
 
+/// Returns one approval record for the mobile companion.
+///
+/// # Errors
+/// Returns an error response when session authorization or approval lookup
+/// fails.
 pub(crate) async fn console_mobile_approval_get_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -257,6 +285,11 @@ pub(crate) async fn console_mobile_approval_get_handler(
     }))
 }
 
+/// Records an approval decision from the mobile companion.
+///
+/// # Errors
+/// Returns an error response when session authorization, approval lookup,
+/// decision validation, or approval mutation fails.
 pub(crate) async fn console_mobile_approval_decision_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -295,6 +328,11 @@ pub(crate) async fn console_mobile_approval_decision_handler(
     }))
 }
 
+/// Lists recent sessions for the mobile companion.
+///
+/// # Errors
+/// Returns an error response when session authorization or session listing
+/// fails.
 pub(crate) async fn console_mobile_sessions_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -342,6 +380,11 @@ pub(crate) async fn console_mobile_sessions_list_handler(
     }))
 }
 
+/// Returns one recent session view for the mobile companion.
+///
+/// # Errors
+/// Returns an error response when session authorization, id validation, session
+/// lookup, or transcript loading fails.
 pub(crate) async fn console_mobile_session_get_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -369,6 +412,11 @@ pub(crate) async fn console_mobile_session_get_handler(
     }))
 }
 
+/// Creates a mediated safe-URL handoff for mobile clients.
+///
+/// # Errors
+/// Returns an error response when session authorization, URL validation, or
+/// browser handoff creation fails.
 pub(crate) async fn console_mobile_safe_url_open_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -430,6 +478,11 @@ pub(crate) async fn console_mobile_safe_url_open_handler(
     }))
 }
 
+/// Creates a voice-note background task from reviewed transcript text.
+///
+/// # Errors
+/// Returns an error response when session authorization, transcript validation,
+/// target session resolution, task creation, or event recording fails.
 pub(crate) async fn console_mobile_voice_note_create_handler(
     State(state): State<AppState>,
     headers: HeaderMap,

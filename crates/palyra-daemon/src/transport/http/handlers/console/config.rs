@@ -1,5 +1,15 @@
+//! Console config inspection, mutation, migration, recovery, and reload handlers.
+//!
+//! This module keeps filesystem writes behind explicit console mutations and
+//! records reload planning/apply events so config changes remain auditable.
+
 use crate::*;
 
+/// Loads and optionally redacts a daemon config document for inspection.
+///
+/// # Errors
+/// Returns an error response when session authorization, config loading,
+/// serialization, or backup listing fails.
 pub(crate) async fn console_config_inspect_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -27,6 +37,11 @@ pub(crate) async fn console_config_inspect_handler(
     }))
 }
 
+/// Validates a daemon config document without writing it.
+///
+/// # Errors
+/// Returns an error response when session authorization, config loading, or
+/// daemon-compatible validation fails.
 pub(crate) async fn console_config_validate_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -45,6 +60,12 @@ pub(crate) async fn console_config_validate_handler(
     }))
 }
 
+/// Mutates one config key and persists the updated document with backups.
+///
+/// # Errors
+/// Returns an error response when session authorization, path resolution,
+/// document loading, TOML parsing, key mutation, validation, or persistence
+/// fails.
 pub(crate) async fn console_config_mutate_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -103,6 +124,11 @@ pub(crate) async fn console_config_mutate_handler(
     }))
 }
 
+/// Migrates an existing config file to the current config version.
+///
+/// # Errors
+/// Returns an error response when session authorization, path resolution,
+/// document loading, validation, or persistence fails.
 pub(crate) async fn console_config_migrate_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -136,6 +162,11 @@ pub(crate) async fn console_config_migrate_handler(
     }))
 }
 
+/// Recovers a config file from a selected backup.
+///
+/// # Errors
+/// Returns an error response when session authorization, path resolution,
+/// backup loading, validation, recovery, or post-recovery verification fails.
 pub(crate) async fn console_config_recover_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -172,6 +203,11 @@ pub(crate) async fn console_config_recover_handler(
     }))
 }
 
+/// Plans a config reload for the current console session.
+///
+/// # Errors
+/// Returns an error response when session authorization or reload planning
+/// fails.
 pub(crate) async fn console_config_reload_plan_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -181,6 +217,11 @@ pub(crate) async fn console_config_reload_plan_handler(
     Ok(Json(plan_config_reload_for_context(&state, &session.context, payload).await?))
 }
 
+/// Builds and stores a reload plan for a validated config candidate.
+///
+/// # Errors
+/// Returns an error response when reload path validation, candidate config
+/// loading, active-run estimation, or audit-event recording fails.
 pub(crate) async fn plan_config_reload_for_context(
     state: &AppState,
     context: &gateway::RequestContext,
@@ -228,6 +269,11 @@ pub(crate) async fn plan_config_reload_for_context(
     Ok(plan)
 }
 
+/// Applies the latest compatible config reload plan.
+///
+/// # Errors
+/// Returns an error response when session authorization or reload application
+/// fails.
 pub(crate) async fn console_config_reload_apply_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -237,6 +283,12 @@ pub(crate) async fn console_config_reload_apply_handler(
     Ok(Json(apply_config_reload_for_context(&state, &session.context, payload).await?))
 }
 
+/// Applies a config reload plan and records the reload result.
+///
+/// # Errors
+/// Returns an error response when no plan is available, the plan is blocked,
+/// candidate config loading fails, config application fails, or audit-event
+/// recording fails.
 pub(crate) async fn apply_config_reload_for_context(
     state: &AppState,
     context: &gateway::RequestContext,

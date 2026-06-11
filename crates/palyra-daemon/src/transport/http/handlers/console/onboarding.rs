@@ -1,3 +1,8 @@
+//! Console onboarding posture endpoint.
+//!
+//! The handler reduces live config, deployment, provider, model-discovery, and
+//! connector signals into a stable step model used by the web onboarding flow.
+
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -6,6 +11,7 @@ use crate::transport::http::handlers::console::diagnostics::{
 };
 use crate::*;
 
+/// Query parameters selecting the onboarding flow variant.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub(crate) struct ConsoleOnboardingQuery {
     #[serde(default)]
@@ -76,6 +82,11 @@ impl StepPresentation {
     }
 }
 
+/// Returns current onboarding posture and recommended next step.
+///
+/// # Errors
+/// Returns an error response when session authorization, config loading,
+/// deployment posture construction, flow parsing, or signal collection fails.
 pub(crate) async fn console_onboarding_posture_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
