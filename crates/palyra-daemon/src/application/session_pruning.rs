@@ -1,11 +1,26 @@
+//! Ephemeral provider-input pruning for session prompts.
+//!
+//! Each model round is classified into a [`PruningTaskClass`] and a
+//! [`PruningRiskLevel`]; the pair maps onto a [`PruningPolicyClass`] token
+//! budget. [`apply_ephemeral_prompt_pruning`] then drops whole low-priority
+//! trust-boundary blocks (memory, attachments, project context) from the
+//! rendered provider input until the budget is met. Pruning is ephemeral by
+//! design: only the outgoing prompt text changes and the journal transcript
+//! is never mutated (`transcript_mutated` is `false` in every explain
+//! payload). Durable history reduction is session compaction in
+//! `application::session_compaction`; this module is consumed by
+//! `application::provider_input` and `application::context_engine`.
+
 use palyra_common::{runtime_contracts::PruningPolicyClass, runtime_preview::RuntimePreviewMode};
 use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::config::PruningPolicyMatrixConfig;
 
+/// Policy identifier recorded in pruning decisions and explain payloads.
 pub(crate) const SESSION_PRUNING_POLICY_ID: &str = "session_pruning.v1";
 
+/// Kind of work the prompt serves; picks the default pruning aggressiveness.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 pub(crate) enum PruningTaskClass {
     InteractiveChat,
@@ -16,6 +31,7 @@ pub(crate) enum PruningTaskClass {
 }
 
 impl PruningTaskClass {
+    /// Returns the stable snake_case identifier used in explain payloads.
     #[must_use]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
@@ -28,6 +44,7 @@ impl PruningTaskClass {
     }
 }
 
+/// Sensitivity of the prompt content; `Elevated` forces conservative pruning.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 pub(crate) enum PruningRiskLevel {
     Normal,
@@ -35,6 +52,7 @@ pub(crate) enum PruningRiskLevel {
 }
 
 impl PruningRiskLevel {
+    /// Returns the stable snake_case identifier used in explain payloads.
     #[must_use]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
@@ -44,6 +62,7 @@ impl PruningRiskLevel {
     }
 }
 
+/// Resolved pruning policy for one prompt: budgets plus apply/preview mode.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct SessionPruningDecision {
     pub(crate) policy_id: String,
@@ -51,21 +70,27 @@ pub(crate) struct SessionPruningDecision {
     pub(crate) task_class: PruningTaskClass,
     pub(crate) risk_level: PruningRiskLevel,
     pub(crate) policy_class: PruningPolicyClass,
+    /// True only when the runtime preview mode is `Enabled`; otherwise the
+    /// outcome is a preview and the original prompt text is forwarded.
     pub(crate) apply_enabled: bool,
     pub(crate) manual_apply_enabled: bool,
+    /// Pruning that saves fewer tokens than this is skipped entirely.
     pub(crate) min_token_savings: u64,
     pub(crate) protected_tail_turns: usize,
     pub(crate) target_prompt_tokens: u64,
     pub(crate) reason: String,
 }
 
+/// Result of a pruning attempt, including the (possibly unchanged) prompt.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct SessionPruningOutcome {
     pub(crate) provider_input_text: String,
     pub(crate) source_tokens: u64,
     pub(crate) output_tokens: u64,
     pub(crate) tokens_saved: u64,
+    /// True when the returned text was actually pruned (not just previewed).
     pub(crate) applied: bool,
+    /// True when pruning met the minimum-savings bar, even in preview mode.
     pub(crate) eligible: bool,
     pub(crate) reason: String,
     pub(crate) explain_json: Value,
@@ -81,6 +106,10 @@ struct PromptBlock {
     priority: u8,
 }
 
+/// Classifies the prompt's task from the ingest reason and parameter delta.
+///
+/// The parameter delta is checked first because it is the more specific
+/// signal: workspace/recall payloads override whatever the reason says.
 #[must_use]
 pub(crate) fn classify_pruning_task(
     memory_ingest_reason: &str,
@@ -106,6 +135,11 @@ pub(crate) fn classify_pruning_task(
     PruningTaskClass::InteractiveChat
 }
 
+/// Scans the rendered prompt for tool, approval, or secret-adjacent text.
+///
+/// Any hit elevates the risk level, which in turn forces the conservative
+/// policy class: prompts that reference credentials or in-flight tool and
+/// approval rounds must not lose context to aggressive pruning.
 #[must_use]
 pub(crate) fn detect_pruning_risk(provider_input_text: &str) -> PruningRiskLevel {
     let lowered = provider_input_text.to_ascii_lowercase();
@@ -128,6 +162,10 @@ pub(crate) fn detect_pruning_risk(provider_input_text: &str) -> PruningRiskLevel
     }
 }
 
+/// Maps a (task class, risk level) pair onto a concrete pruning decision.
+///
+/// Risk wins over task class: an elevated risk level downgrades any policy
+/// to conservative so sensitive prompts keep the most context.
 #[must_use]
 pub(crate) fn pruning_decision_from_config(
     config: &PruningPolicyMatrixConfig,
@@ -146,6 +184,8 @@ pub(crate) fn pruning_decision_from_config(
     if risk_level == PruningRiskLevel::Elevated {
         policy_class = PruningPolicyClass::Conservative;
     }
+    // Per-class budgets: how many trailing turns stay untouchable and how
+    // many estimated tokens the pruned prompt may keep.
     let (protected_tail_turns, target_prompt_tokens) = match policy_class {
         PruningPolicyClass::Disabled => (0, u64::MAX),
         PruningPolicyClass::Conservative => (3, 8_192),
@@ -172,6 +212,13 @@ pub(crate) fn pruning_decision_from_config(
     }
 }
 
+/// Prunes whole trust-boundary blocks from the prompt until it fits budget.
+///
+/// In preview mode (`apply_enabled == false`) the original text is returned
+/// unchanged while the explain payload still reports what would have been
+/// dropped. Protected blocks (user input, recent conversation, tool and
+/// approval content) are never removed; if dropping every unprotected block
+/// still cannot reach the target, pruning stops there.
 #[must_use]
 pub(crate) fn apply_ephemeral_prompt_pruning(
     provider_input_text: &str,
@@ -189,6 +236,8 @@ pub(crate) fn apply_ephemeral_prompt_pruning(
     let mut removed = Vec::new();
     let mut selected_tokens = blocks.iter().map(|block| block.estimated_tokens).sum::<u64>();
     while selected_tokens > decision.target_prompt_tokens {
+        // Drop order is deterministic: lowest priority label first, then the
+        // largest block, then the earliest position as the final tie-break.
         let Some(remove_index) = blocks
             .iter()
             .enumerate()
@@ -262,6 +311,11 @@ pub(crate) fn apply_ephemeral_prompt_pruning(
     }
 }
 
+/// Wraps a context-engine budget cut into a pruning outcome for reporting.
+///
+/// Returns `None` when pruning is disabled or the cut is below the
+/// minimum-savings bar; the context engine has already done the dropping,
+/// so this only records it (`provider_input_text` stays empty).
 #[must_use]
 pub(crate) fn context_engine_pruning_outcome(
     decision: &SessionPruningDecision,
@@ -295,6 +349,10 @@ pub(crate) fn context_engine_pruning_outcome(
     })
 }
 
+/// Estimates token count with the ~4 chars/token heuristic used repo-wide.
+///
+/// Deliberately cheap and provider-agnostic; budgets derived from it are
+/// approximate by design.
 #[must_use]
 pub(crate) fn estimate_prompt_tokens(text: &str) -> u64 {
     let trimmed = text.trim();
@@ -305,6 +363,7 @@ pub(crate) fn estimate_prompt_tokens(text: &str) -> u64 {
     }
 }
 
+/// Renders the decision as the `policy` object embedded in explain payloads.
 #[must_use]
 pub(crate) fn decision_snapshot_json(decision: &SessionPruningDecision) -> Value {
     json!({
@@ -349,6 +408,10 @@ fn no_pruning_outcome(
     }
 }
 
+// Splits the prompt on blank lines, then re-merges paragraphs that fall
+// inside one trust-boundary wrapper (open tag through close tag) into a
+// single block, so wrapped context is dropped or kept atomically and no
+// unwrapped fragment of untrusted text can survive pruning.
 fn split_prompt_blocks(provider_input_text: &str) -> Vec<PromptBlock> {
     let paragraphs = provider_input_text
         .split("\n\n")
@@ -432,6 +495,9 @@ fn block_label(text: &str) -> &'static str {
     }
 }
 
+// Lower value = less load-bearing = dropped first; the unlabeled
+// `user_input` fallback (100) is effectively never reached because such
+// blocks are also protected.
 fn block_priority(label: &str) -> u8 {
     match label {
         "memory_context" => 10,
@@ -444,6 +510,9 @@ fn block_priority(label: &str) -> u8 {
     }
 }
 
+// Mirrors the keyword set in `detect_pruning_risk`: blocks referencing
+// in-flight tool or approval rounds keep their context even when their
+// trust label would otherwise make them prunable.
 fn block_is_protected(text: &str, _index: usize) -> bool {
     let lowered = text.to_ascii_lowercase();
     matches!(block_label(text), "user_input" | "recent_conversation" | "context_references")
@@ -459,6 +528,9 @@ struct PromptTrustBoundary {
     close_tag: &'static str,
 }
 
+// Open tags are unclosed prefixes on purpose: wrappers may carry attributes.
+// These must stay in sync with the wrappers rendered into provider input
+// (note the `session_compaction` label wraps `<session_summary>` tags).
 const PROMPT_TRUST_BOUNDARIES: [PromptTrustBoundary; 6] = [
     PromptTrustBoundary {
         label: "memory_context",

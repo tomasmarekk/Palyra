@@ -1,3 +1,20 @@
+//! Durable session-history compaction: planning, continuity writes, apply.
+//!
+//! The deterministic compressor splits a session transcript at a summary
+//! boundary -- everything from the earliest pin or lineage marker onward,
+//! plus the most recent text events, stays verbatim ("protected"), while
+//! older events are condensed into a bounded [`SessionCompactionPlan`] with
+//! an active-task summary and evidence refs back to the source records. A
+//! continuity planner mines the condensed range for durable facts,
+//! decisions, and open action items, gating each candidate through noise,
+//! secret, prompt-injection, duplicate, and contradiction checks before it
+//! may be written into curated workspace documents.
+//! [`apply_session_compaction`] persists the artifact plus a checkpoint and
+//! rolls back partial workspace writes on failure. Unlike the ephemeral
+//! prompt pruning in `application::session_pruning`, compaction durably
+//! changes what future prompts see; consumers include `provider_input`,
+//! `context_engine`, `recall`, `run_stream::tape`, and the console handlers.
+
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 use std::{
@@ -32,8 +49,13 @@ use crate::{
     orchestrator::estimate_token_count,
 };
 
+/// Strategy identifier recorded on compaction artifacts and checkpoints.
 pub(crate) const SESSION_COMPACTION_STRATEGY: &str = "session_window_v1";
+/// Compressor version recorded on artifacts and in summary-ref hashes.
 pub(crate) const SESSION_COMPACTION_VERSION: &str = "palyra-session-compaction-v1";
+// The newest text events always stay verbatim so the model keeps the live
+// conversational tail; compaction is skipped entirely unless at least
+// MIN_CONDENSED_EVENTS older events would actually be condensed.
 const SESSION_COMPACTION_KEEP_RECENT_TEXT_EVENTS: usize = 6;
 const SESSION_COMPACTION_MIN_CONDENSED_EVENTS: usize = 4;
 const SESSION_COMPACTION_MAX_SUMMARY_LINES: usize = 8;
@@ -45,6 +67,8 @@ const SESSION_COMPACTION_TOOL_RESULT_MAX_CHARS: usize = 3_000;
 const SESSION_COMPACTION_TOOL_RESULT_FIELD_MAX_CHARS: usize = 1_200;
 const SESSION_COMPACTION_TOOL_RESULT_MAX_DEPTH: usize = 6;
 const SESSION_COMPACTION_DEFAULT_COOLDOWN_MS: i64 = 5 * 60 * 1_000;
+// Continuity candidates below this confidence need operator review before a
+// durable workspace write; seeds are scored against it in finalize_candidate.
 const AUTO_WRITE_CONFIDENCE_THRESHOLD: f64 = 0.82;
 const CURATED_WORKSPACE_DOC_LIMIT: usize = 64;
 const SENSITIVE_CANDIDATE_PATTERNS: &[&str] = &[
@@ -69,6 +93,9 @@ const NOISE_PATTERNS: &[&str] = &[
     "retry",
     "rerun",
 ];
+// A new candidate that shares words with an existing curated line but sits
+// on the opposite side of one of these pairs is routed to operator review
+// instead of silently overwriting the earlier decision.
 const CONTRADICTION_PAIRS: &[(&str, &str)] = &[
     ("enable", "disable"),
     ("allow", "deny"),
@@ -82,8 +109,13 @@ const CONTRADICTION_PAIRS: &[(&str, &str)] = &[
 #[cfg(test)]
 static TEST_WRITE_FAILURE_PATH: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
+/// Complete compaction proposal for one session: summary, counts, candidates.
+///
+/// Produced by a [`ContextCompressor`]; identical structure serves both
+/// preview (nothing persisted) and apply (artifact + checkpoint + writes).
 #[derive(Debug, Clone)]
 pub(crate) struct SessionCompactionPlan {
+    /// False when compaction is blocked; see `blocked_reason`.
     pub(crate) eligible: bool,
     pub(crate) blocked_reason: Option<String>,
     pub(crate) trigger_reason: String,
@@ -110,6 +142,7 @@ pub(crate) struct SessionCompactionPlan {
 }
 
 impl SessionCompactionPlan {
+    /// Renders the plan as the console/API response payload.
     pub(crate) fn to_response_json(&self) -> Value {
         json!({
             "eligible": self.eligible,
@@ -147,27 +180,35 @@ impl SessionCompactionPlan {
     }
 }
 
+/// Inputs for [`apply_session_compaction`].
 #[derive(Clone)]
 pub(crate) struct SessionCompactionApplyRequest<'a> {
     pub(crate) runtime_state: &'a Arc<GatewayRuntimeState>,
     pub(crate) session: &'a OrchestratorSessionRecord,
     pub(crate) actor_principal: &'a str,
     pub(crate) run_id: Option<&'a str>,
+    /// `"automatic"` forces operator review for all durable writes;
+    /// any other mode (for example `"manual"`) honors auto-write candidates.
     pub(crate) mode: &'a str,
     pub(crate) trigger_reason: Option<&'a str>,
     pub(crate) trigger_policy: Option<&'a str>,
+    /// Review-required candidates the operator explicitly approved.
     pub(crate) accept_candidate_ids: &'a [String],
+    /// Review-required candidates the operator explicitly rejected.
     pub(crate) reject_candidate_ids: &'a [String],
 }
 
+/// Everything persisted by a successful [`apply_session_compaction`] call.
 #[derive(Debug, Clone)]
 pub(crate) struct SessionCompactionExecution {
     pub(crate) plan: SessionCompactionPlan,
     pub(crate) artifact: OrchestratorCompactionArtifactRecord,
     pub(crate) checkpoint: OrchestratorCheckpointRecord,
+    /// Workspace writes that were applied (or were no-ops), in path order.
     pub(crate) writes: Vec<SessionCompactionWritePreview>,
 }
 
+/// Source transcript record a continuity candidate was extracted from.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct SessionCompactionCandidateProvenance {
     pub run_id: String,
@@ -177,22 +218,34 @@ pub(crate) struct SessionCompactionCandidateProvenance {
     pub excerpt: String,
 }
 
+/// Continuity item the planner wants to preserve across compaction.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct SessionCompactionCandidate {
+    /// Deterministic id derived from category, target path, and content, so
+    /// the same candidate keeps its id between preview and apply.
     pub candidate_id: String,
+    /// One of: `durable_fact`, `decision`, `next_action`, `open_loop`,
+    /// `current_focus`, `daily_summary`.
     pub category: String,
     pub target_path: String,
     pub content: String,
     pub confidence: f64,
+    /// `normal`, `sensitive`, or `poisoned`; only `normal` content may enter
+    /// the trusted compaction summary.
     pub sensitivity: String,
+    /// Write gate outcome: `auto_write`, `review_required`, or a terminal
+    /// skip/block (`skipped_noise`, `skipped_duplicate`, `blocked_sensitive`,
+    /// `blocked_poisoned`).
     pub disposition: String,
     pub rationale: String,
     pub provenance: Vec<SessionCompactionCandidateProvenance>,
 }
 
+/// Planned or applied workspace write for one curated document path.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct SessionCompactionWritePreview {
     pub target_path: String,
+    /// `planned`, `applied`, `noop`, or `review_required` (blocked merge).
     pub status: String,
     pub action: String,
     pub candidate_ids: Vec<String>,
@@ -202,6 +255,7 @@ pub(crate) struct SessionCompactionWritePreview {
     pub diff: Option<WorkspaceManagedBlockDiff>,
 }
 
+/// Name, note, and touched paths of the checkpoint an apply would create.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct SessionCompactionCheckpointPreview {
     pub name: String,
@@ -209,6 +263,11 @@ pub(crate) struct SessionCompactionCheckpointPreview {
     pub workspace_paths: Vec<String>,
 }
 
+/// Structured "what was I doing" digest carried across the compaction cut.
+///
+/// Rendered into the summary text inside an `<active_task_summary>` wrapper
+/// so the model resumes the task instead of replaying old context as new
+/// requests.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct SessionActiveTaskSummary {
     pub active_goal: String,
@@ -237,6 +296,7 @@ impl SessionActiveTaskSummary {
     }
 }
 
+/// Audit metadata attached to the checkpoint that anchors a compaction.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct SessionCompactionCheckpointMetadata {
     pub reason: String,
@@ -254,6 +314,8 @@ pub(crate) struct SessionCompactionCheckpointMetadata {
     pub abnormal_churn: bool,
 }
 
+/// Per-category and per-gate counts embedded in the summary JSON, used by
+/// regression suites to assert the planner kept its quality bar.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct SessionCompactionQualityGateMetrics {
     pub decision_count: usize,
@@ -335,6 +397,7 @@ struct CompactionSummaryJsonInput<'a> {
     evidence_refs: &'a [String],
 }
 
+/// Inputs a [`ContextCompressor`] needs to build a compaction plan.
 pub(crate) struct SessionContextCompressionInput<'a> {
     pub(crate) session: &'a OrchestratorSessionRecord,
     pub(crate) transcript: &'a [OrchestratorSessionTranscriptRecord],
@@ -346,11 +409,17 @@ pub(crate) struct SessionContextCompressionInput<'a> {
     pub(crate) previous_compaction_count: usize,
 }
 
+/// Strategy interface for turning a session transcript into a compaction plan.
 pub(crate) trait ContextCompressor {
+    /// Stable strategy identifier recorded on artifacts produced by this
+    /// compressor.
     fn strategy(&self) -> &'static str;
+    /// Builds a complete (preview-or-apply) plan; must be deterministic for
+    /// identical inputs so previews match later applies.
     fn compress(&self, input: SessionContextCompressionInput<'_>) -> SessionCompactionPlan;
 }
 
+/// Pure rule-based compressor; the always-available baseline.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct DeterministicSessionContextCompressor;
 
@@ -365,6 +434,11 @@ impl ContextCompressor for DeterministicSessionContextCompressor {
     }
 }
 
+/// Deterministic compressor plus an evidence-ref gate.
+///
+/// Marks the plan `hybrid_evidence_backed` only when every summary claim can
+/// be traced to source records; otherwise it degrades to
+/// `deterministic_fallback` and records why.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct HybridSessionContextCompressor {
     fallback: DeterministicSessionContextCompressor,
@@ -382,6 +456,13 @@ impl ContextCompressor for HybridSessionContextCompressor {
     }
 }
 
+/// Builds a compaction plan for `session` without persisting anything.
+///
+/// # Errors
+/// Returns the journal `Status` when loading the transcript, pins,
+/// workspace documents, or prior compaction artifacts fails. An ineligible
+/// session is not an error here: the plan comes back with
+/// `eligible == false` and a `blocked_reason`.
 pub(crate) async fn preview_session_compaction(
     runtime_state: &Arc<GatewayRuntimeState>,
     session: &OrchestratorSessionRecord,
@@ -406,6 +487,19 @@ pub(crate) async fn preview_session_compaction(
     }))
 }
 
+/// Executes a compaction: workspace writes, artifact, and checkpoint.
+///
+/// The plan is rebuilt from the current journal state (not taken from the
+/// caller) so a stale preview can never apply against newer history.
+/// Workspace writes are applied sequentially; if any write fails, the ones
+/// already applied are rolled back before the error is returned, so the
+/// curated workspace is never left half-updated.
+///
+/// # Errors
+/// Returns `failed_precondition` when the session is not eligible or a
+/// managed-block merge needs review, `internal` when persisting a workspace
+/// write fails, and the underlying `Status` for journal load/persist
+/// failures (including rollback failures, which mask the original error).
 #[allow(clippy::result_large_err)]
 pub(crate) async fn apply_session_compaction(
     request: SessionCompactionApplyRequest<'_>,
@@ -597,6 +691,8 @@ pub(crate) async fn apply_session_compaction(
     Ok(SessionCompactionExecution { plan, artifact, checkpoint, writes: applied_writes })
 }
 
+/// Test-only shorthand for building a manual-mode plan with no prior
+/// compactions; production paths go through a [`ContextCompressor`].
 #[cfg(test)]
 pub(crate) fn build_session_compaction_plan(
     session: &OrchestratorSessionRecord,
@@ -628,7 +724,7 @@ fn build_session_compaction_plan_with_metadata(
     let trigger_reason_input = input.trigger_reason;
     let trigger_policy_input = input.trigger_policy;
     let pin_keys =
-        pins.iter().map(|pin| (pin.run_id.clone(), pin.tape_seq)).collect::<HashSet<_>>();
+        pins.iter().map(|pin| (pin.run_id.as_str(), pin.tape_seq)).collect::<HashSet<_>>();
     let extracted = transcript
         .iter()
         .filter_map(|record| {
@@ -648,10 +744,14 @@ fn build_session_compaction_plan_with_metadata(
     let estimated_input_tokens =
         extracted.iter().map(|record| estimate_token_count(record.text.as_str())).sum::<u64>();
 
+    // Summary boundary: protect at least the trailing KEEP_RECENT window,
+    // then pull the boundary back to the earliest pin or lineage marker so
+    // compaction never condenses across a pinned event or a rollback /
+    // restore point -- everything from that point forward stays verbatim.
     let mut protected_start =
         extracted.len().saturating_sub(SESSION_COMPACTION_KEEP_RECENT_TEXT_EVENTS);
     for (index, record) in extracted.iter().enumerate() {
-        if pin_keys.contains(&(record.run_id.clone(), record.seq))
+        if pin_keys.contains(&(record.run_id.as_str(), record.seq))
             || record.event_type == "rollback.marker"
             || record.event_type == "checkpoint.restore"
         {
@@ -662,7 +762,7 @@ fn build_session_compaction_plan_with_metadata(
     let mut protected_records = Vec::new();
     let mut condensed_records = Vec::new();
     for (index, record) in extracted.iter().enumerate() {
-        if pin_keys.contains(&(record.run_id.clone(), record.seq)) {
+        if pin_keys.contains(&(record.run_id.as_str(), record.seq)) {
             let mut protected = record.clone();
             protected.bucket = "protected";
             protected.reason = Some("pinned");
@@ -747,6 +847,9 @@ fn build_session_compaction_plan_with_metadata(
         .iter()
         .map(|record| estimate_token_count(record.text.as_str()))
         .sum::<u64>();
+    // Output budget = summary + verbatim protected tail + the continuity
+    // content that will be re-injected via workspace writes; review-gated
+    // candidates are excluded because they may never be written.
     let planner_tokens = candidates
         .iter()
         .filter(|candidate| candidate.disposition == "auto_write")
@@ -851,6 +954,9 @@ fn build_session_compaction_plan_with_metadata(
     }
 }
 
+// Downgrades the plan to deterministic_fallback when no claim can be traced
+// back to a source record; an unevidenced summary must not present itself as
+// evidence-backed.
 fn annotate_hybrid_compaction_plan(plan: &mut SessionCompactionPlan) {
     let evidence_refs = collect_plan_evidence_refs(plan);
     if evidence_refs.is_empty() {
@@ -909,6 +1015,8 @@ fn annotate_compaction_json(plan: &mut SessionCompactionPlan) {
     }
 }
 
+/// Wraps a compaction summary in the `<session_compaction_summary>` tags
+/// injected into provider input (and recognized by prompt-block pruning).
 pub(crate) fn render_compaction_prompt_block(
     artifact_id: &str,
     mode: &str,
@@ -999,6 +1107,9 @@ fn candidate_can_enter_trusted_compaction_summary(candidate: &SessionCompactionC
         && candidate.sensitivity == "normal"
 }
 
+// Bounds and safety-transforms text destined for a prompt summary. When the
+// safety layer wrapped the text (e.g. a blocked-content marker), the wrapper
+// is returned intact -- re-truncating could cut its closing tag.
 fn compaction_prompt_text(raw: &str, max_chars: usize) -> String {
     let bounded = truncate_console_text(raw, max_chars);
     let transformed = transform_text_for_prompt(
@@ -1044,6 +1155,12 @@ fn open_action_item_signature(item: &str) -> String {
         .join(" ")
 }
 
+// AIDEV-NOTE: this line-oriented state machine and its helpers below encode
+// many hard-won heuristics (section openers vs. negative mentions, blank-line
+// section exits, checkbox/ordinal/bold-name stripping, status-line and
+// orphaned-fragment rejection). Each rule is pinned by an
+// active_task_summary_* test in this module -- run those before and after
+// any change here, and extend them when adding a rule.
 fn extract_open_action_items(raw: &str) -> Vec<String> {
     let mut items = Vec::new();
     let mut in_action_item_section = false;
@@ -1235,6 +1352,8 @@ fn normalize_open_action_item_candidate(
     Some(compaction_prompt_text(redacted.as_str(), SESSION_COMPACTION_ACTION_ITEM_MAX_CHARS))
 }
 
+// Strips memory-tool echo prefixes like "Action item 1/3 (S078, source:
+// tasks/notes.md): <item>" down to the item itself.
 fn strip_memory_action_item_prefix(raw: &str) -> &str {
     let trimmed = raw.trim();
     if !trimmed.to_ascii_lowercase().starts_with("action item ")
@@ -1242,6 +1361,8 @@ fn strip_memory_action_item_prefix(raw: &str) -> &str {
     {
         return trimmed;
     }
+    // rfind, not find: the prefix itself may contain ": " (e.g. "source:
+    // ..."), so only text after the last separator is the real item.
     trimmed
         .rfind(": ")
         .map(|index| trimmed[index + 2..].trim())
@@ -1280,6 +1401,10 @@ fn looks_like_compaction_status_action_item(normalized: &str) -> bool {
     }
 }
 
+// Rejects sentence tails that leak into numbered lists ("a context-only
+// fragment from the preceding sentence."): a one-letter lowercase first word
+// plus a terminal period, unless a checkbox or "name: task" shape proves the
+// line is a real item.
 fn looks_like_orphaned_action_item_fragment(normalized: &str, has_checkbox_marker: bool) -> bool {
     if has_checkbox_marker || has_assignment_separator(normalized) {
         return false;
@@ -1498,6 +1623,12 @@ fn build_checkpoint_metadata(
             condensed_event_count
         )
     };
+    // AIDEV-NOTE: std's DefaultHasher is not guaranteed stable across Rust
+    // releases, yet this hash is persisted inside checkpoint
+    // post_summary_ref values. A toolchain upgrade can change the ref for
+    // identical input. Treat refs as opaque ids, never recompute-and-compare
+    // them; if reproducibility ever matters, switch to crate::sha256_hex
+    // (like candidate ids), which is a behavior change for stored refs.
     let mut hasher = DefaultHasher::new();
     session.session_id.hash(&mut hasher);
     summary_text.hash(&mut hasher);
@@ -1525,6 +1656,8 @@ fn build_checkpoint_metadata(
         },
         compaction_count_before: previous_compaction_count,
         cooldown_ms: SESSION_COMPACTION_DEFAULT_COOLDOWN_MS,
+        // A session compacted 3+ times is churning abnormally; the flag lets
+        // downstream policy throttle or escalate instead of looping.
         abnormal_churn: previous_compaction_count >= 3,
     }
 }
@@ -1536,6 +1669,8 @@ fn build_continuity_candidates(
     let mut candidates = Vec::new();
     let mut seen_signatures = HashSet::new();
     let existing_lines = collect_existing_workspace_lines(workspace_documents);
+    // Newest-first so when the same fact was stated more than once, the
+    // freshest wording wins the signature dedupe below.
     for record in condensed_records.iter().rev() {
         if candidates.len() >= SESSION_COMPACTION_MAX_CANDIDATES {
             break;
@@ -1576,6 +1711,9 @@ fn build_continuity_candidates(
     candidates
 }
 
+// Tool output is externally influenced text; only user/assistant messages
+// may seed durable workspace writes (tool text still feeds action-item
+// extraction, which has its own injection scan).
 fn record_can_seed_continuity_candidate(record: &SessionCompactionRecordSnapshot) -> bool {
     record.event_type != "tool_result"
 }
@@ -1761,6 +1899,8 @@ fn build_quality_gate_metrics(
     }
 }
 
+/// Arms a one-shot injected failure for the next workspace write to `path`,
+/// letting tests exercise the apply rollback path. `None` disarms it.
 #[cfg(test)]
 pub(crate) fn configure_test_write_failure_path(path: Option<&str>) {
     let cell = TEST_WRITE_FAILURE_PATH.get_or_init(|| Mutex::new(None));
@@ -1808,6 +1948,9 @@ fn collect_effective_write_candidates(
                     content: candidate.content.clone(),
                 });
             }
+            // INTENTIONAL no-op arm: explicitly rejected candidates are
+            // dropped, as are review-required ones the operator has not
+            // (yet) accepted -- only an explicit accept promotes a write.
             "review_required" if reject.contains(candidate.candidate_id.as_str()) => {}
             _ => {}
         }
@@ -1860,6 +2003,10 @@ fn build_write_inputs(
     Ok(inputs)
 }
 
+// Restores workspace documents to their pre-apply snapshots, newest write
+// first. Documents that did not exist before the apply are soft-deleted
+// best-effort: this already runs on a failure path, and a leftover empty
+// document is preferable to masking the original write error.
 #[allow(clippy::result_large_err)]
 async fn rollback_applied_workspace_writes(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -1903,6 +2050,11 @@ async fn rollback_applied_workspace_writes(
     Ok(())
 }
 
+// Runs a seed through the write gates. Order matters -- first match wins:
+// noise, then secret-bearing content, then prompt injection, then duplicate,
+// then contradiction, then the confidence threshold. Safety blocks must fire
+// before dedupe so a poisoned line never slips through as a "duplicate" of
+// trusted content.
 fn finalize_candidate(
     seed: CandidateSeed,
     existing_lines: &[ExistingWorkspaceLine],
@@ -2105,6 +2257,9 @@ fn derive_daily_compaction_candidate(
     })
 }
 
+// Compaction must not run while a tool round is mid-flight: condensing away
+// the proposal or approval context would strand the pending interaction.
+// An open approval is reported in preference to an open proposal.
 fn detect_compaction_blocked_reason(
     transcript: &[OrchestratorSessionTranscriptRecord],
 ) -> Option<String> {
@@ -2284,6 +2439,12 @@ fn compaction_event_label(event_type: &str) -> &'static str {
     }
 }
 
+/// Extracts the human-meaningful text of a transcript event, or `None` for
+/// event types that carry no compactable/searchable text.
+///
+/// Tool results are flattened from their JSON payload with metadata keys
+/// filtered out; also used by recall search, so changing the extraction
+/// changes what sessions are findable.
 pub(crate) fn extract_transcript_search_text(
     record: &OrchestratorSessionTranscriptRecord,
 ) -> Option<String> {
@@ -2399,6 +2560,9 @@ fn truncate_preserving_newlines(raw: &str, max_chars: usize) -> String {
     output
 }
 
+// Metadata/provenance keys whose values are ids, hashes, or lifecycle echoes
+// rather than user-meaningful text; skipping them keeps memory-write echoes
+// out of compaction summaries and recall snippets.
 fn tool_result_json_key_is_noise(key: &str) -> bool {
     matches!(
         key,
@@ -2442,6 +2606,8 @@ fn tool_result_json_key_is_noise(key: &str) -> bool {
     )
 }
 
+/// Collapses all whitespace to single spaces and truncates to `max_chars`
+/// chars (suffixing `...`), producing a one-line console/preview snippet.
 pub(crate) fn truncate_console_text(raw: &str, max_chars: usize) -> String {
     let normalized = raw.replace(['\r', '\n'], " ");
     let trimmed = normalized.split_whitespace().collect::<Vec<_>>().join(" ");

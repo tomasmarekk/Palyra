@@ -1,3 +1,17 @@
+//! Session input queue policy: admission, coalescing, and busy-state analysis.
+//!
+//! When new input arrives for a session that may already have an active run,
+//! [`decide_session_queue_mode`] maps the requested [`QueueMode`] onto a
+//! [`QueueDecision`] gated by [`SessionQueueSafeBoundary`]: interrupts and
+//! steering are honored only at safe points (no pending approval, no
+//! sensitive tool execution), otherwise the input defers into collect mode,
+//! and hitting the per-group cap forces a deterministic overflow summary
+//! instead of unbounded queue growth. [`build_queue_collect_summary`] renders
+//! that summary with full provenance; [`analyze_session_queue`] derives the
+//! operator-facing busy state and depth/age/fairness metrics. This module is
+//! pure decision logic over journal `OrchestratorQueuedInputRecord`s --
+//! persistence and forwarding live in the console chat handlers.
+
 use palyra_common::runtime_contracts::{QueueDecision, QueueMode};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -5,6 +19,7 @@ use serde_json::{json, Value};
 use crate::config::SessionQueuePolicyConfig;
 use crate::journal::OrchestratorQueuedInputRecord;
 
+/// Policy identifier recorded in queue decisions and explain payloads.
 pub(crate) const SESSION_QUEUE_POLICY_ID: &str = "session_queue.v1";
 const DEFAULT_PRIORITY_LANE: &str = "normal";
 const DEFAULT_DROP_POLICY: &str = "summarize_oldest";
@@ -12,19 +27,27 @@ const DEFAULT_OVERFLOW_BEHAVIOR: &str = "deterministic_backlog_summary";
 const COLLECT_SUMMARY_MAX_ITEMS: usize = 12;
 const COLLECT_SUMMARY_TEXT_LIMIT: usize = 240;
 
+/// Effective queue policy for one session: cap, debounce, and coalescing scope.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct SessionQueuePolicy {
     pub(crate) policy_id: String,
+    /// Default mode applied when the caller does not request one explicitly.
     pub(crate) mode: QueueMode,
     pub(crate) priority_lane: String,
     pub(crate) debounce_ms: u64,
+    /// Pending-depth limit per coalescing group; reaching it forces overflow.
     pub(crate) cap: usize,
     pub(crate) drop_policy: String,
     pub(crate) overflow_behavior: String,
+    /// Scope key that groups inputs for merging and depth accounting.
     pub(crate) coalescing_group: String,
     pub(crate) source: String,
 }
 
+/// Snapshot of where the active run currently stands; gates interrupt/steer.
+///
+/// The flags feed [`Self::can_steer`] and [`Self::can_interrupt`]: both are
+/// denied while an approval is pending or a sensitive tool is executing.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct SessionQueueSafeBoundary {
     pub(crate) active_run_stream: bool,
@@ -37,24 +60,33 @@ pub(crate) struct SessionQueueSafeBoundary {
     pub(crate) after_child_merge: bool,
 }
 
+/// Outcome of queue admission: decision, effective mode, and policy snapshot.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct SessionQueueDecision {
     pub(crate) decision: QueueDecision,
+    /// Mode actually applied, which may differ from the requested one (for
+    /// example a deferred interrupt lands in collect mode).
     pub(crate) mode: QueueMode,
+    /// False only for overflow: the input must not enter the pending queue.
     pub(crate) accepted: bool,
     pub(crate) reason: String,
     pub(crate) safe_boundary: SessionQueueSafeBoundary,
     pub(crate) policy: SessionQueuePolicy,
 }
 
+/// Deterministic backlog summary produced when queued inputs are collected.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct QueueCollectSummary {
     pub(crate) summary_ref: String,
+    /// Human-readable digest; bounded to the first few queued inputs.
     pub(crate) text: String,
     pub(crate) source_count: usize,
+    /// Full audit trail: every source id is retained even when the rendered
+    /// text omits items beyond the display bound.
     pub(crate) provenance_json: Value,
 }
 
+/// Origin lane of a queued input; drives fairness counts and prioritization.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SessionQueueProfile {
@@ -65,6 +97,7 @@ pub(crate) enum SessionQueueProfile {
 }
 
 impl SessionQueueProfile {
+    /// Returns the stable snake_case identifier used in metrics payloads.
     #[must_use]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
@@ -76,6 +109,7 @@ impl SessionQueueProfile {
     }
 }
 
+/// Operator-facing session state derived from queue metrics and run boundaries.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SessionBusyState {
@@ -88,6 +122,7 @@ pub(crate) enum SessionBusyState {
 }
 
 impl SessionBusyState {
+    /// Returns the stable snake_case identifier used in analysis payloads.
     #[must_use]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
@@ -101,6 +136,7 @@ impl SessionBusyState {
     }
 }
 
+/// Per-profile tallies of queued inputs within one coalescing group.
 #[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct SessionQueueProfileCounts {
     pub(crate) interactive: usize,
@@ -120,6 +156,7 @@ impl SessionQueueProfileCounts {
     }
 }
 
+/// Depth, age, and fairness metrics for one session's queue.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct SessionQueueMetrics {
     pub(crate) pending_depth: usize,
@@ -127,6 +164,7 @@ pub(crate) struct SessionQueueMetrics {
     pub(crate) total_count: usize,
     pub(crate) oldest_pending_age_ms: Option<u64>,
     pub(crate) newest_pending_age_ms: Option<u64>,
+    /// Pending inputs beyond the first one, i.e. how many could merge.
     pub(crate) merge_candidate_count: usize,
     pub(crate) merged_count: usize,
     pub(crate) overflowed_count: usize,
@@ -135,12 +173,14 @@ pub(crate) struct SessionQueueMetrics {
 }
 
 impl SessionQueueMetrics {
+    /// Renders the metrics as a JSON object for explain/console payloads.
     #[must_use]
     pub(crate) fn snapshot_json(&self) -> Value {
         json!(self)
     }
 }
 
+/// Busy-state classification plus the recommended next operator action.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct SessionQueueAnalysis {
     pub(crate) busy_state: SessionBusyState,
@@ -149,6 +189,7 @@ pub(crate) struct SessionQueueAnalysis {
 }
 
 impl SessionQueueAnalysis {
+    /// Renders the analysis as a JSON object for console payloads.
     #[must_use]
     pub(crate) fn snapshot_json(&self) -> Value {
         json!({
@@ -160,6 +201,10 @@ impl SessionQueueAnalysis {
 }
 
 impl SessionQueuePolicy {
+    /// Builds the effective policy for a session from daemon configuration.
+    ///
+    /// The coalescing group is scoped by the most specific identity
+    /// available: agent id over channel over a bare session scope.
     #[must_use]
     pub(crate) fn from_config(
         config: &SessionQueuePolicyConfig,
@@ -184,6 +229,7 @@ impl SessionQueuePolicy {
         }
     }
 
+    /// Renders the policy as the `policy` object embedded in explain payloads.
     #[must_use]
     pub(crate) fn snapshot_json(&self) -> Value {
         json!({
@@ -207,6 +253,11 @@ impl SessionQueuePolicy {
 }
 
 impl SessionQueueSafeBoundary {
+    /// Builds the boundary snapshot for a possibly-active run.
+    ///
+    /// Boundary flags that cannot be observed from here default to `false`,
+    /// which keeps the gate conservative: steering is only allowed at the
+    /// pre-model-round point this constructor can actually prove.
     #[must_use]
     pub(crate) fn active(active_run_stream: bool, pending_approval: bool) -> Self {
         Self {
@@ -221,6 +272,7 @@ impl SessionQueueSafeBoundary {
         }
     }
 
+    /// True when injected guidance may join the run at the current boundary.
     #[must_use]
     pub(crate) const fn can_steer(&self) -> bool {
         self.active_run_stream
@@ -232,6 +284,8 @@ impl SessionQueueSafeBoundary {
                 || self.after_child_merge)
     }
 
+    /// True when the run may be interrupted without abandoning an approval
+    /// or a sensitive tool mid-flight.
     #[must_use]
     pub(crate) const fn can_interrupt(&self) -> bool {
         self.active_run_stream && !self.pending_approval && !self.sensitive_tool_execution
@@ -239,6 +293,7 @@ impl SessionQueueSafeBoundary {
 }
 
 impl SessionQueueDecision {
+    /// Renders the decision and its inputs as a JSON explain payload.
     #[must_use]
     pub(crate) fn explain_json(&self) -> Value {
         json!({
@@ -252,6 +307,11 @@ impl SessionQueueDecision {
     }
 }
 
+/// Decides how a new session input is admitted into the queue.
+///
+/// Interrupt and steer requests are honored only when the safe boundary
+/// allows them; otherwise they defer into collect mode rather than being
+/// rejected, so no operator input is lost.
 #[must_use]
 pub(crate) fn decide_session_queue_mode(
     policy: SessionQueuePolicy,
@@ -260,6 +320,9 @@ pub(crate) fn decide_session_queue_mode(
     current_depth: usize,
 ) -> SessionQueueDecision {
     let requested_mode = requested_mode.unwrap_or(policy.mode);
+    // The cap wins over any requested mode: at capacity the only acceptable
+    // outcome is a collect-mode overflow summary, and the input itself is
+    // not admitted into the pending queue.
     if current_depth >= policy.cap {
         return SessionQueueDecision {
             decision: QueueDecision::Overflow,
@@ -299,6 +362,11 @@ pub(crate) fn decide_session_queue_mode(
     }
 }
 
+/// Builds the deterministic backlog summary for collected queued inputs.
+///
+/// The rendered text and per-source provenance entries are bounded to the
+/// first [`COLLECT_SUMMARY_MAX_ITEMS`] inputs with truncated previews, but
+/// every source id is recorded so omitted inputs remain auditable.
 #[must_use]
 pub(crate) fn build_queue_collect_summary(
     summary_ref: String,
@@ -347,6 +415,10 @@ pub(crate) fn build_queue_collect_summary(
     }
 }
 
+/// Classifies the session's busy state and recommends the next operator step.
+///
+/// Metrics are scoped to the policy's coalescing group so unrelated lanes in
+/// the same session do not skew the depth or age numbers.
 #[must_use]
 pub(crate) fn analyze_session_queue(
     queued_inputs: &[OrchestratorQueuedInputRecord],
@@ -374,6 +446,10 @@ pub(crate) fn analyze_session_queue(
     SessionQueueAnalysis { busy_state, recommendation, metrics }
 }
 
+/// Computes depth, age, and fairness metrics over the queued inputs.
+///
+/// When `coalescing_group` is given, only records in that group are counted;
+/// `None` counts everything (used for whole-session views).
 #[must_use]
 pub(crate) fn session_queue_metrics(
     queued_inputs: &[OrchestratorQueuedInputRecord],
@@ -433,6 +509,11 @@ pub(crate) fn session_queue_metrics(
     }
 }
 
+/// Classifies a queued input into its fairness profile.
+///
+/// Precedence: an operator priority lane beats a `routine:` coalescing
+/// group, which beats the queue-mode heuristic, so an operator escalation
+/// is never misfiled into a background lane.
 #[must_use]
 pub(crate) fn queue_profile_for_input(
     queued: &OrchestratorQueuedInputRecord,
@@ -450,6 +531,7 @@ pub(crate) fn queue_profile_for_input(
     }
 }
 
+/// Counts pending inputs, optionally scoped to one coalescing group.
 #[must_use]
 pub(crate) fn pending_queue_depth(
     queued_inputs: &[OrchestratorQueuedInputRecord],
@@ -459,27 +541,27 @@ pub(crate) fn pending_queue_depth(
         .iter()
         .filter(|queued| {
             queued.state == "pending"
-                && match coalescing_group {
-                    Some(group) => queued.coalescing_group.as_deref() == Some(group),
-                    None => true,
-                }
+                && coalescing_group
+                    .is_none_or(|group| queued.coalescing_group.as_deref() == Some(group))
         })
         .count()
 }
 
+// Truncates by char (not byte) count so multi-byte input cannot be split
+// mid-character.
 #[must_use]
 fn truncate_for_summary(value: &str, limit: usize) -> String {
     let trimmed = value.trim();
-    let mut output = String::with_capacity(limit.min(trimmed.len()));
-    for character in trimmed.chars().take(limit) {
-        output.push(character);
-    }
+    let mut output = trimmed.chars().take(limit).collect::<String>();
     if trimmed.chars().count() > limit {
         output.push_str("...");
     }
     output
 }
 
+// Precedence is deliberate: paused > backpressured > waiting-on-approval >
+// idle > collecting. A paused or saturated queue must surface before the
+// softer "busy" states so the operator sees the action that unblocks it.
 fn derive_session_busy_state(
     metrics: &SessionQueueMetrics,
     policy: &SessionQueuePolicy,
@@ -505,6 +587,8 @@ fn derive_session_busy_state(
 }
 
 fn queue_age_ms(observed_at_unix_ms: i64, created_at_unix_ms: i64) -> u64 {
+    // Clock skew can place created_at after observed_at; clamp to zero so
+    // the age never wraps into a huge unsigned value.
     observed_at_unix_ms.saturating_sub(created_at_unix_ms).max(0) as u64
 }
 

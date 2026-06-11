@@ -1,3 +1,12 @@
+//! Bounded JSON shrinking for prompt-context compression.
+//!
+//! [`shrink_json_value`] recursively clamps string length, array and object
+//! fanout, and nesting depth so arbitrarily large tool or journal payloads
+//! cannot blow up a provider prompt. Every cut is marked in-band (an `...`
+//! suffix on strings, `_palyra_truncated` sentinel entries on collections)
+//! so downstream consumers can tell a shrunk value from a complete one.
+//! Consumed by `application::context_engine` when assembling provider input.
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -6,6 +15,10 @@ const DEFAULT_MAX_ARRAY_ITEMS: usize = 8;
 const DEFAULT_MAX_OBJECT_FIELDS: usize = 16;
 const DEFAULT_MAX_DEPTH: usize = 8;
 
+/// Per-dimension limits applied by [`shrink_json_value`].
+///
+/// All limits are inclusive caps on what is kept; anything beyond a cap is
+/// replaced by a truncation marker rather than dropped silently.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct JsonShrinkConfig {
     pub(crate) max_string_chars: usize,
@@ -25,15 +38,24 @@ impl Default for JsonShrinkConfig {
     }
 }
 
+/// Result of shrinking: the bounded value plus truncation diagnostics.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct JsonShrinkOutcome {
     pub(crate) value: Value,
+    /// True when any string, collection, or subtree was cut by a limit.
     pub(crate) truncated: bool,
     pub(crate) original_bytes: usize,
     pub(crate) output_bytes: usize,
 }
 
+/// Shrinks `value` to fit `config`, marking every truncation in-band.
+///
+/// The returned value is always valid JSON; strings are cut on `char`
+/// boundaries so multi-byte sequences are never split. The byte counts are
+/// serialized sizes before and after shrinking.
 pub(crate) fn shrink_json_value(value: &Value, config: JsonShrinkConfig) -> JsonShrinkOutcome {
+    // Byte sizes are diagnostics only, so a (practically unreachable)
+    // serialization failure degrades to 0 instead of failing the shrink.
     let original_bytes = serde_json::to_vec(value).map(|bytes| bytes.len()).unwrap_or_default();
     let mut truncated = false;
     let value = shrink_value(value, config, 0, &mut truncated);
@@ -65,6 +87,8 @@ fn shrink_string(raw: &str, max_chars: usize, truncated: &mut bool) -> Value {
         return Value::String(raw.to_owned());
     }
     *truncated = true;
+    // Cut by chars, not bytes: byte slicing could split a multi-byte
+    // sequence and produce invalid UTF-8 / unparseable JSON.
     let mut shortened = raw.chars().take(max_chars).collect::<String>();
     shortened.push_str("...");
     Value::String(shortened)
