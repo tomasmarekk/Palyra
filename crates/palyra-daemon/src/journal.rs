@@ -1,3 +1,24 @@
+//! SQLite-backed daemon journal: the hash-chained audit event log plus durable
+//! state for orchestrator sessions/runs/tape, approvals, cron, memory and
+//! workspace retrieval, tool jobs and result artifacts, flows, learning, usage
+//! accounting, and canvas state.
+//!
+//! Storage model: a single SQLite database (WAL mode, foreign keys on,
+//! owner-only file permissions) behind one mutex-guarded connection inside
+//! [`JournalStore`]. The schema evolves only through the append-only
+//! `MIGRATIONS` list.
+//!
+//! Audit invariants: every payload passes through `sanitize_payload` (secret
+//! and binary redaction) before persistence, and with `hash_chain_enabled`
+//! each journal event stores `hash = SHA-256(prev_hash | identity fields |
+//! payload)` (see `compute_hash`), making the event log tamper-evident.
+//!
+//! Layout: contract types (request/record/filter DTOs) up to [`JournalError`],
+//! then migrations, shared row/transaction helpers, the large
+//! `impl JournalStore` block, free query/mapper helpers, and the redaction
+//! pipeline. Key consumers are the gateway runtime, console HTTP/gRPC
+//! handlers, the orchestrator run loop, and the background queue.
+
 use std::{
     collections::BTreeMap,
     fmt, fs,
@@ -37,6 +58,7 @@ use crate::{
 };
 
 mod retrieval_index_status;
+/// Aggregate indexing status of the workspace retrieval index, surfaced by the journal API.
 pub type WorkspaceRetrievalIndexStatus = retrieval_index_status::WorkspaceRetrievalIndexStatus;
 
 const REDACTED_MARKER: &str = "<redacted>";
@@ -123,12 +145,21 @@ const MAX_TOOL_JOB_TAIL_LIMIT: usize = 1_000;
 const MAX_TOOL_JOB_TAIL_CHUNK_BYTES: usize = 64 * 1_024;
 const MAX_TOOL_JOB_TAIL_PREVIEW_BYTES: usize = 16 * 1_024;
 
+// Contract types: request/record/filter DTOs grouped by subsystem (cron,
+// memory, workspace, approvals, skills, canvas, sessions/runs, tool jobs,
+// flows, learning, usage). They run from here down to `JournalError`.
+
+/// Text-embedding backend used to index and query memory items and workspace chunks.
 pub trait MemoryEmbeddingProvider: Send + Sync {
+    /// Identifier of the embedding model, persisted alongside each vector.
     fn model_name(&self) -> &str;
+    /// Number of dimensions in vectors produced by [`Self::embed_text`].
     fn dimensions(&self) -> usize;
+    /// Embeds `text` into a fixed-dimension vector.
     fn embed_text(&self, text: &str) -> Vec<f32>;
 }
 
+/// Deterministic hash-based embedding provider used as the offline/legacy fallback.
 #[derive(Debug, Clone)]
 pub struct HashMemoryEmbeddingProvider {
     dimensions: usize,
@@ -141,6 +172,7 @@ impl Default for HashMemoryEmbeddingProvider {
 }
 
 impl HashMemoryEmbeddingProvider {
+    /// Creates a provider emitting vectors of `dimensions` (clamped to at least 1).
     #[must_use]
     pub fn with_dimensions(dimensions: usize) -> Self {
         Self { dimensions: dimensions.max(1) }
@@ -161,6 +193,7 @@ impl MemoryEmbeddingProvider for HashMemoryEmbeddingProvider {
     }
 }
 
+/// How a cron job's schedule payload is interpreted.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CronScheduleType {
@@ -170,6 +203,7 @@ pub enum CronScheduleType {
 }
 
 impl CronScheduleType {
+    /// Returns the canonical string persisted in SQLite and used in API payloads.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -179,6 +213,7 @@ impl CronScheduleType {
         }
     }
 
+    /// Parses the persisted string form; returns `None` for unknown values.
     pub fn from_str(value: &str) -> Option<Self> {
         match value {
             "cron" => Some(Self::Cron),
@@ -189,6 +224,7 @@ impl CronScheduleType {
     }
 }
 
+/// What to do when a cron job fires while its previous run is still active.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CronConcurrencyPolicy {
@@ -198,6 +234,7 @@ pub enum CronConcurrencyPolicy {
 }
 
 impl CronConcurrencyPolicy {
+    /// Returns the canonical string persisted in SQLite and used in API payloads.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -207,6 +244,7 @@ impl CronConcurrencyPolicy {
         }
     }
 
+    /// Parses the persisted string form; returns `None` for unknown values.
     pub fn from_str(value: &str) -> Option<Self> {
         match value {
             "forbid" => Some(Self::Forbid),
@@ -217,6 +255,7 @@ impl CronConcurrencyPolicy {
     }
 }
 
+/// How to handle cron firings missed while the scheduler was not running.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CronMisfirePolicy {
@@ -225,6 +264,7 @@ pub enum CronMisfirePolicy {
 }
 
 impl CronMisfirePolicy {
+    /// Returns the canonical string persisted in SQLite and used in API payloads.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -233,6 +273,7 @@ impl CronMisfirePolicy {
         }
     }
 
+    /// Parses the persisted string form; returns `None` for unknown values.
     pub fn from_str(value: &str) -> Option<Self> {
         match value {
             "skip" => Some(Self::Skip),
@@ -242,6 +283,7 @@ impl CronMisfirePolicy {
     }
 }
 
+/// Lifecycle status of a single cron run attempt.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CronRunStatus {
@@ -254,6 +296,7 @@ pub enum CronRunStatus {
 }
 
 impl CronRunStatus {
+    /// Returns the canonical string persisted in SQLite and used in API payloads.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -266,6 +309,7 @@ impl CronRunStatus {
         }
     }
 
+    /// Parses the persisted string form; returns `None` for unknown values.
     pub fn from_str(value: &str) -> Option<Self> {
         match value {
             "accepted" => Some(Self::Accepted),
@@ -278,18 +322,21 @@ impl CronRunStatus {
         }
     }
 
+    /// Returns `true` while the run still occupies its job's concurrency slot.
     #[must_use]
     pub fn is_active(self) -> bool {
         matches!(self, Self::Accepted | Self::Running)
     }
 }
 
+/// Retry budget applied to failed cron runs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CronRetryPolicy {
     pub max_attempts: u32,
     pub backoff_ms: u64,
 }
 
+/// Parameters for creating a cron job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CronJobCreateRequest {
     pub job_id: String,
@@ -310,6 +357,8 @@ pub struct CronJobCreateRequest {
     pub next_run_at_unix_ms: Option<i64>,
 }
 
+/// Partial cron job update; `None` leaves a field unchanged and `Some(None)` on
+/// double-`Option` fields clears the stored value.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CronJobUpdatePatch {
     pub name: Option<String>,
@@ -330,6 +379,7 @@ pub struct CronJobUpdatePatch {
     pub queued_run: Option<bool>,
 }
 
+/// Stored cron job definition and scheduling state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CronJobRecord {
     pub job_id: String,
@@ -359,6 +409,7 @@ pub struct CronJobRecord {
     pub updated_at_unix_ms: i64,
 }
 
+/// Filter and pagination options for listing cron runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CronRunsListFilter<'a> {
     pub job_id: Option<&'a str>,
@@ -367,6 +418,7 @@ pub struct CronRunsListFilter<'a> {
     pub limit: usize,
 }
 
+/// Filter and pagination options for listing cron jobs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CronJobsListFilter<'a> {
     pub after_job_id: Option<&'a str>,
@@ -376,6 +428,7 @@ pub struct CronJobsListFilter<'a> {
     pub channel: Option<&'a str>,
 }
 
+/// Parameters recording the start (or immediate denial/skip) of a cron run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CronRunStartRequest {
     pub run_id: String,
@@ -388,6 +441,7 @@ pub struct CronRunStartRequest {
     pub error_message_redacted: Option<String>,
 }
 
+/// Terminal status and usage counters recorded when a cron run finishes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CronRunFinalizeRequest {
     pub run_id: String,
@@ -402,6 +456,7 @@ pub struct CronRunFinalizeRequest {
     pub session_id: Option<String>,
 }
 
+/// Stored cron run attempt with status and usage counters.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct CronRunRecord {
     pub run_id: String,
@@ -427,6 +482,7 @@ pub struct CronRunRecord {
     pub updated_at_unix_ms: i64,
 }
 
+/// Provenance of a memory item.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MemorySource {
@@ -438,6 +494,7 @@ pub enum MemorySource {
 }
 
 impl MemorySource {
+    /// Returns the canonical string persisted in SQLite and used in API payloads.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -449,6 +506,7 @@ impl MemorySource {
         }
     }
 
+    /// Parses the persisted string form; returns `None` for unknown values.
     pub fn from_str(value: &str) -> Option<Self> {
         match value {
             "tape:user_message" => Some(Self::TapeUserMessage),
@@ -461,6 +519,7 @@ impl MemorySource {
     }
 }
 
+/// Parameters for storing a new memory item.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemoryItemCreateRequest {
     pub memory_id: String,
@@ -474,6 +533,7 @@ pub struct MemoryItemCreateRequest {
     pub ttl_unix_ms: Option<i64>,
 }
 
+/// Scoped content/tags/TTL update for an existing memory item.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemoryItemLifecycleUpdateRequest {
     pub memory_id: String,
@@ -486,6 +546,7 @@ pub struct MemoryItemLifecycleUpdateRequest {
     pub ttl_unix_ms: Option<i64>,
 }
 
+/// Scoped hybrid (lexical plus vector) memory search parameters.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemorySearchRequest {
     pub principal: String,
@@ -498,6 +559,7 @@ pub struct MemorySearchRequest {
     pub sources: Vec<MemorySource>,
 }
 
+/// Filter and pagination options for listing memory items.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryItemsListFilter {
     pub after_memory_id: Option<String>,
@@ -509,6 +571,7 @@ pub struct MemoryItemsListFilter {
     pub sources: Vec<MemorySource>,
 }
 
+/// Scope selector for bulk memory deletion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryPurgeRequest {
     pub principal: String,
@@ -517,6 +580,7 @@ pub struct MemoryPurgeRequest {
     pub purge_all_principal: bool,
 }
 
+/// Stored memory item with sanitized, normalized content and its content hash.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct MemoryItemRecord {
     pub memory_id: String,
@@ -537,6 +601,7 @@ pub struct MemoryItemRecord {
     pub updated_at_unix_ms: i64,
 }
 
+/// Per-signal score components behind a memory search hit.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct MemoryScoreBreakdown {
     pub lexical_score: f64,
@@ -546,6 +611,7 @@ pub struct MemoryScoreBreakdown {
     pub final_score: f64,
 }
 
+/// Scored memory search result.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct MemorySearchHit {
     pub item: MemoryItemRecord,
@@ -554,6 +620,7 @@ pub struct MemorySearchHit {
     pub breakdown: MemoryScoreBreakdown,
 }
 
+/// Per-signal score components behind a workspace search hit.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct WorkspaceScoreBreakdown {
     pub lexical_score: f64,
@@ -563,6 +630,7 @@ pub struct WorkspaceScoreBreakdown {
     pub final_score: f64,
 }
 
+/// Pre-fusion memory candidate carrying raw lexical/vector/recency signals.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemorySearchCandidateRecord {
     pub item: MemoryItemRecord,
@@ -574,6 +642,7 @@ pub struct MemorySearchCandidateRecord {
     pub vector_candidate: bool,
 }
 
+/// Pre-fusion workspace chunk candidate carrying raw retrieval signals.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkspaceSearchCandidateRecord {
     pub document: WorkspaceDocumentRecord,
@@ -588,6 +657,7 @@ pub struct WorkspaceSearchCandidateRecord {
     pub vector_candidate: bool,
 }
 
+/// Latency and candidate-count diagnostics for one retrieval branch.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RetrievalBranchDiagnostics {
     pub source_kind: String,
@@ -608,18 +678,21 @@ pub struct RetrievalBranchDiagnostics {
     pub coverage_gap: Option<String>,
 }
 
+/// Memory candidates plus diagnostics from the producing search.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemorySearchCandidateOutcome {
     pub candidates: Vec<MemorySearchCandidateRecord>,
     pub diagnostics: RetrievalBranchDiagnostics,
 }
 
+/// Workspace candidates plus diagnostics from the producing search.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkspaceSearchCandidateOutcome {
     pub candidates: Vec<WorkspaceSearchCandidateRecord>,
     pub diagnostics: RetrievalBranchDiagnostics,
 }
 
+/// Create-or-update request for a workspace document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceDocumentWriteRequest {
     pub document_id: Option<String>,
@@ -637,6 +710,7 @@ pub struct WorkspaceDocumentWriteRequest {
     pub manual_override: bool,
 }
 
+/// Request renaming a workspace document to a new path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceDocumentMoveRequest {
     pub principal: String,
@@ -647,6 +721,7 @@ pub struct WorkspaceDocumentMoveRequest {
     pub next_path: String,
 }
 
+/// Request soft-deleting a workspace document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceDocumentDeleteRequest {
     pub principal: String,
@@ -656,6 +731,7 @@ pub struct WorkspaceDocumentDeleteRequest {
     pub path: String,
 }
 
+/// Filter and pagination options for listing workspace documents.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceDocumentListFilter {
     pub principal: String,
@@ -666,6 +742,7 @@ pub struct WorkspaceDocumentListFilter {
     pub limit: usize,
 }
 
+/// Scoped hybrid workspace document search parameters.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkspaceSearchRequest {
     pub principal: String,
@@ -679,6 +756,7 @@ pub struct WorkspaceSearchRequest {
     pub include_quarantined: bool,
 }
 
+/// Request seeding or repairing curated workspace templates for a scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceBootstrapRequest {
     pub principal: String,
@@ -688,6 +766,7 @@ pub struct WorkspaceBootstrapRequest {
     pub force_repair: bool,
 }
 
+/// Stored workspace document head (latest version) with risk and binding state.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct WorkspaceDocumentRecord {
     pub document_id: String,
@@ -727,6 +806,7 @@ pub struct WorkspaceDocumentRecord {
     pub last_recalled_at_unix_ms: Option<i64>,
 }
 
+/// Immutable entry in a workspace document's version history.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct WorkspaceDocumentVersionRecord {
     pub document_id: String,
@@ -748,6 +828,7 @@ pub struct WorkspaceDocumentVersionRecord {
     pub created_at_unix_ms: i64,
 }
 
+/// Scored workspace search result for one document chunk.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct WorkspaceSearchHit {
     pub document: WorkspaceDocumentRecord,
@@ -760,6 +841,7 @@ pub struct WorkspaceSearchHit {
     pub breakdown: WorkspaceScoreBreakdown,
 }
 
+/// Paths created, updated, or skipped by a workspace bootstrap run.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct WorkspaceBootstrapOutcome {
     pub ran_at_unix_ms: i64,
@@ -768,6 +850,7 @@ pub struct WorkspaceBootstrapOutcome {
     pub skipped_paths: Vec<String>,
 }
 
+/// Optional caps (entries, bytes, TTL days) enforced by memory maintenance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryRetentionPolicy {
     pub max_entries: Option<usize>,
@@ -776,18 +859,21 @@ pub struct MemoryRetentionPolicy {
 }
 
 impl MemoryRetentionPolicy {
+    /// Returns `true` when at least one retention cap is configured.
     #[must_use]
     pub const fn is_enforced(self) -> bool {
         self.max_entries.is_some() || self.max_bytes.is_some() || self.ttl_days.is_some()
     }
 }
 
+/// Entry count and approximate byte usage of the memory store.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct MemoryUsageSnapshot {
     pub entries: u64,
     pub approx_bytes: u64,
 }
 
+/// Persisted summary of the most recent memory maintenance run.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct MemoryMaintenanceRunRecord {
     pub ran_at_unix_ms: i64,
@@ -801,6 +887,7 @@ pub struct MemoryMaintenanceRunRecord {
     pub vacuum_performed: bool,
 }
 
+/// Current memory usage plus maintenance and vacuum bookkeeping.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct MemoryMaintenanceStatus {
     pub usage: MemoryUsageSnapshot,
@@ -814,6 +901,7 @@ pub struct MemoryMaintenanceStatus {
     pub next_maintenance_run_at_unix_ms: Option<i64>,
 }
 
+/// Whether memory embeddings come from a model provider or the hash fallback.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryEmbeddingsMode {
@@ -821,6 +909,7 @@ pub enum MemoryEmbeddingsMode {
     ModelProvider,
 }
 
+/// Operator-facing view of the query-embedding cache configuration.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct QueryEmbeddingCacheStatus {
     pub capacity: usize,
@@ -830,6 +919,7 @@ pub struct QueryEmbeddingCacheStatus {
     pub misses: u64,
 }
 
+/// Operator-facing report on embedding coverage, quality, and remediation.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct MemoryEmbeddingsStatus {
     pub mode: MemoryEmbeddingsMode,
@@ -901,6 +991,7 @@ fn memory_embeddings_status_remediation(
     .to_owned())
 }
 
+/// Inputs for one memory maintenance pass (retention policy and schedule hints).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryMaintenanceRequest {
     pub now_unix_ms: i64,
@@ -909,6 +1000,7 @@ pub struct MemoryMaintenanceRequest {
     pub next_maintenance_run_at_unix_ms: Option<i64>,
 }
 
+/// Deletion counts and vacuum results of a memory maintenance pass.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct MemoryMaintenanceOutcome {
     pub ran_at_unix_ms: i64,
@@ -928,6 +1020,7 @@ pub struct MemoryMaintenanceOutcome {
     pub next_maintenance_run_at_unix_ms: Option<i64>,
 }
 
+/// Progress report from one memory-embeddings backfill batch.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct MemoryEmbeddingsBackfillOutcome {
     pub ran_at_unix_ms: i64,
@@ -941,6 +1034,7 @@ pub struct MemoryEmbeddingsBackfillOutcome {
 }
 
 impl MemoryEmbeddingsBackfillOutcome {
+    /// Returns `true` once no memory items await re-embedding.
     #[must_use]
     pub const fn is_complete(&self) -> bool {
         self.pending_count == 0
@@ -963,6 +1057,7 @@ struct MemoryMaintenanceStateRow {
     last_vacuum_performed: bool,
 }
 
+/// Kind of subject an approval request gates.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalSubjectType {
@@ -975,6 +1070,7 @@ pub enum ApprovalSubjectType {
 }
 
 impl ApprovalSubjectType {
+    /// Returns the canonical string persisted in SQLite and used in API payloads.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -987,6 +1083,7 @@ impl ApprovalSubjectType {
         }
     }
 
+    /// Parses the persisted string form; returns `None` for unknown values.
     pub fn from_str(value: &str) -> Option<Self> {
         match value {
             "tool" => Some(Self::Tool),
@@ -1000,6 +1097,7 @@ impl ApprovalSubjectType {
     }
 }
 
+/// Operator decision recorded for an approval.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalDecision {
@@ -1010,6 +1108,7 @@ pub enum ApprovalDecision {
 }
 
 impl ApprovalDecision {
+    /// Returns the canonical string persisted in SQLite and used in API payloads.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -1020,6 +1119,7 @@ impl ApprovalDecision {
         }
     }
 
+    /// Parses the persisted string form; returns `None` for unknown values.
     pub fn from_str(value: &str) -> Option<Self> {
         match value {
             "allow" => Some(Self::Allow),
@@ -1031,6 +1131,7 @@ impl ApprovalDecision {
     }
 }
 
+/// How long an approval decision stays in force.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalDecisionScope {
@@ -1040,6 +1141,7 @@ pub enum ApprovalDecisionScope {
 }
 
 impl ApprovalDecisionScope {
+    /// Returns the canonical string persisted in SQLite and used in API payloads.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -1049,6 +1151,7 @@ impl ApprovalDecisionScope {
         }
     }
 
+    /// Parses the persisted string form; returns `None` for unknown values.
     pub fn from_str(value: &str) -> Option<Self> {
         match value {
             "once" => Some(Self::Once),
@@ -1059,6 +1162,7 @@ impl ApprovalDecisionScope {
     }
 }
 
+/// Operator-facing risk classification of an approval prompt.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalRiskLevel {
@@ -1069,6 +1173,7 @@ pub enum ApprovalRiskLevel {
 }
 
 impl ApprovalRiskLevel {
+    /// Returns the canonical string persisted in SQLite and used in API payloads.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -1080,6 +1185,7 @@ impl ApprovalRiskLevel {
     }
 }
 
+/// Identifying snapshot of the policy evaluation that produced an approval prompt.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApprovalPolicySnapshot {
     pub policy_id: String,
@@ -1087,6 +1193,7 @@ pub struct ApprovalPolicySnapshot {
     pub evaluation_summary: String,
 }
 
+/// Single selectable option in an approval prompt.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApprovalPromptOption {
     pub option_id: String,
@@ -1098,6 +1205,7 @@ pub struct ApprovalPromptOption {
     pub timebox_ttl_ms: Option<i64>,
 }
 
+/// Full prompt presented to the operator for an approval.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApprovalPromptRecord {
     pub title: String,
@@ -1110,6 +1218,7 @@ pub struct ApprovalPromptRecord {
     pub policy_explanation: String,
 }
 
+/// Parameters for persisting a new pending approval.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalCreateRequest {
     pub approval_id: String,
@@ -1125,6 +1234,7 @@ pub struct ApprovalCreateRequest {
     pub prompt: ApprovalPromptRecord,
 }
 
+/// Decision parameters applied to a pending approval.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalResolveRequest {
     pub approval_id: String,
@@ -1134,6 +1244,7 @@ pub struct ApprovalResolveRequest {
     pub decision_scope_ttl_ms: Option<i64>,
 }
 
+/// Stored approval request with optional resolution.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ApprovalRecord {
     pub approval_id: String,
@@ -1163,6 +1274,7 @@ pub struct ApprovalRecord {
     pub updated_at_unix_ms: i64,
 }
 
+/// Filter and pagination options for listing approvals.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalsListFilter<'a> {
     pub after_approval_id: Option<&'a str>,
@@ -1175,6 +1287,7 @@ pub struct ApprovalsListFilter<'a> {
     pub subject_type: Option<ApprovalSubjectType>,
 }
 
+/// Execution gate for an installed skill version.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillExecutionStatus {
@@ -1184,6 +1297,7 @@ pub enum SkillExecutionStatus {
 }
 
 impl SkillExecutionStatus {
+    /// Returns the canonical string persisted in SQLite and used in API payloads.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -1193,6 +1307,7 @@ impl SkillExecutionStatus {
         }
     }
 
+    /// Parses the persisted string form; returns `None` for unknown values.
     pub fn from_str(value: &str) -> Option<Self> {
         match value {
             "active" => Some(Self::Active),
@@ -1203,6 +1318,7 @@ impl SkillExecutionStatus {
     }
 }
 
+/// Parameters for recording a skill execution status change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillStatusUpsertRequest {
     pub skill_id: String,
@@ -1213,6 +1329,7 @@ pub struct SkillStatusUpsertRequest {
     pub operator_principal: String,
 }
 
+/// Stored execution status for a skill version.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SkillStatusRecord {
     pub skill_id: String,
@@ -1226,6 +1343,7 @@ pub struct SkillStatusRecord {
     pub updated_at_unix_ms: i64,
 }
 
+/// One canvas state transition: patch, resulting state, and actor metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanvasStateTransitionRequest {
     pub canvas_id: String,
@@ -1247,6 +1365,7 @@ pub struct CanvasStateTransitionRequest {
     pub actor_device_id: String,
 }
 
+/// Latest materialized state snapshot for a canvas.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct CanvasStateSnapshotRecord {
     pub canvas_id: String,
@@ -1265,6 +1384,7 @@ pub struct CanvasStateSnapshotRecord {
     pub close_reason: Option<String>,
 }
 
+/// Stored canvas patch with its resulting state, kept for replay verification.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct CanvasStatePatchRecord {
     pub seq: i64,
@@ -1282,6 +1402,7 @@ pub struct CanvasStatePatchRecord {
     pub applied_at_unix_ms: i64,
 }
 
+/// Canvas state rebuilt by replaying its patch log.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct CanvasStateReplayRecord {
     pub canvas_id: String,
@@ -1294,6 +1415,7 @@ pub struct CanvasStateReplayRecord {
     pub patches_applied: usize,
 }
 
+/// Storage location and limits for a [`JournalStore`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalConfig {
     pub db_path: PathBuf,
@@ -1302,6 +1424,7 @@ pub struct JournalConfig {
     pub max_events: usize,
 }
 
+/// Event payload and identity fields appended to the audit journal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalAppendRequest {
     pub event_id: String,
@@ -1316,6 +1439,7 @@ pub struct JournalAppendRequest {
     pub channel: Option<String>,
 }
 
+/// Result of appending one journal event (redaction flag and hash-chain links).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalAppendOutcome {
     pub redacted: bool,
@@ -1324,6 +1448,7 @@ pub struct JournalAppendOutcome {
     pub write_duration: Duration,
 }
 
+/// Stored audit journal event.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct JournalEventRecord {
     pub seq: i64,
@@ -1343,6 +1468,7 @@ pub struct JournalEventRecord {
     pub created_at_unix_ms: i64,
 }
 
+/// Test-only parameters for directly upserting a session row.
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratorSessionUpsertRequest {
@@ -1354,6 +1480,7 @@ pub struct OrchestratorSessionUpsertRequest {
     pub channel: Option<String>,
 }
 
+/// Selector and caller identity for resolving (or creating) an orchestrator session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratorSessionResolveRequest {
     pub session_id: Option<String>,
@@ -1366,6 +1493,7 @@ pub struct OrchestratorSessionResolveRequest {
     pub reset_session: bool,
 }
 
+/// Manual title update for a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratorSessionTitleUpdateRequest {
     pub session_id: String,
@@ -1376,6 +1504,7 @@ pub struct OrchestratorSessionTitleUpdateRequest {
     pub manual_title_locked: bool,
 }
 
+/// Per-session override toggles; `Some(None)` clears an override.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct OrchestratorSessionQuickControlsUpdateRequest {
     pub session_id: String,
@@ -1388,6 +1517,7 @@ pub struct OrchestratorSessionQuickControlsUpdateRequest {
     pub verbose_override: Option<Option<bool>>,
 }
 
+/// Selector and caller identity for archiving a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratorSessionCleanupRequest {
     pub session_id: Option<String>,
@@ -1397,6 +1527,7 @@ pub struct OrchestratorSessionCleanupRequest {
     pub channel: Option<String>,
 }
 
+/// Replacement state for a session's project-context selections.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionProjectContextStateUpsertRequest {
     pub session_id: String,
@@ -1406,12 +1537,14 @@ pub struct SessionProjectContextStateUpsertRequest {
     pub last_refreshed_at_unix_ms: Option<i64>,
 }
 
+/// Source and target sessions for copying project-context state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionProjectContextStateCopyRequest {
     pub source_session_id: String,
     pub target_session_id: String,
 }
 
+/// Stored per-session project-context selections.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionProjectContextStateRecord {
     pub session_id: String,
@@ -1424,6 +1557,7 @@ pub struct SessionProjectContextStateRecord {
 }
 
 impl SessionProjectContextStateRecord {
+    /// Returns an empty project-context state for `session_id`.
     #[must_use]
     pub fn new(session_id: &str) -> Self {
         Self {
@@ -1437,6 +1571,7 @@ impl SessionProjectContextStateRecord {
     }
 }
 
+/// Stored orchestrator session enriched with derived title/preview fields.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct OrchestratorSessionRecord {
     pub session_id: String,
@@ -1494,6 +1629,7 @@ pub struct OrchestratorSessionRecord {
     pub last_run_state: Option<String>,
 }
 
+/// Resolved session plus whether it was created or reset.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct OrchestratorSessionResolveOutcome {
     pub session: OrchestratorSessionRecord,
@@ -1501,6 +1637,7 @@ pub struct OrchestratorSessionResolveOutcome {
     pub reset_applied: bool,
 }
 
+/// Archived session plus cleanup bookkeeping.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct OrchestratorSessionCleanupOutcome {
     pub session: OrchestratorSessionRecord,
@@ -1510,6 +1647,7 @@ pub struct OrchestratorSessionCleanupOutcome {
     pub run_count: u64,
 }
 
+/// Parameters for registering a new orchestrator run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratorRunStartRequest {
     pub run_id: String,
@@ -1520,6 +1658,7 @@ pub struct OrchestratorRunStartRequest {
     pub parameter_delta_json: Option<String>,
 }
 
+/// Token usage increment applied to a run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratorUsageDelta {
     pub run_id: String,
@@ -1527,6 +1666,7 @@ pub struct OrchestratorUsageDelta {
     pub completion_tokens_delta: u64,
 }
 
+/// One tape event appended to a run's transcript.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratorTapeAppendRequest {
     pub run_id: String,
@@ -1535,12 +1675,14 @@ pub struct OrchestratorTapeAppendRequest {
     pub payload_json: String,
 }
 
+/// Cancellation request for a run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratorCancelRequest {
     pub run_id: String,
     pub reason: String,
 }
 
+/// Run state observed when cancellation was requested.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratorCancelSnapshot {
     pub run_id: String,
@@ -1549,12 +1691,14 @@ pub struct OrchestratorCancelSnapshot {
     pub reason: String,
 }
 
+/// Runs force-failed by startup orphan recovery.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
 pub struct OrchestratorStartupRunRecoveryReport {
     pub terminalized_count: u64,
     pub terminalized_run_ids: Vec<String>,
 }
 
+/// Stored tape event of a run transcript.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct OrchestratorTapeRecord {
     pub seq: i64,
@@ -1562,6 +1706,7 @@ pub struct OrchestratorTapeRecord {
     pub payload_json: String,
 }
 
+/// Point-in-time view of a run's state, usage, and lineage.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct OrchestratorRunStatusSnapshot {
     pub run_id: String,
@@ -1600,6 +1745,7 @@ pub struct OrchestratorRunStatusSnapshot {
     pub tape_events: u64,
 }
 
+/// Lifecycle transition appended to the run audit trail.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunLifecycleEventAppendRequest {
     pub event_id: String,
@@ -1615,6 +1761,7 @@ pub struct RunLifecycleEventAppendRequest {
     pub payload_json: String,
 }
 
+/// Reservation parameters for an idempotent operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdempotencyBeginRequest {
     pub key: String,
@@ -1624,24 +1771,28 @@ pub struct IdempotencyBeginRequest {
     pub expires_at_unix_ms: Option<i64>,
 }
 
+/// Successful result recorded for an idempotent operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdempotencyCompleteRequest {
     pub key: String,
     pub result_json: String,
 }
 
+/// Failure envelope recorded for an idempotent operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdempotencyFailRequest {
     pub key: String,
     pub error: StableErrorEnvelope,
 }
 
+/// Replay decision plus the current idempotency record, if any.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdempotencyBeginOutcome {
     pub decision: IdempotencyReplayDecision,
     pub record: Option<IdempotencyRecordSnapshot>,
 }
 
+/// Content and retention metadata for a new tool result artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolResultArtifactCreateRequest {
     pub artifact_id: String,
@@ -1656,6 +1807,7 @@ pub struct ToolResultArtifactCreateRequest {
     pub content: Vec<u8>,
 }
 
+/// Scoped, integrity-checked read request for a tool result artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolResultArtifactReadRequest {
     pub artifact_id: String,
@@ -1687,6 +1839,7 @@ pub enum ToolJobState {
 }
 
 impl ToolJobState {
+    /// Returns the canonical string persisted in SQLite and used in API payloads.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Queued => "queued",
@@ -1702,6 +1855,7 @@ impl ToolJobState {
         }
     }
 
+    /// Parses the persisted string form; returns `None` for unknown values.
     pub fn parse(raw: &str) -> Option<Self> {
         match raw {
             "queued" => Some(Self::Queued),
@@ -1718,6 +1872,7 @@ impl ToolJobState {
         }
     }
 
+    /// Returns `true` for states that still hold the job's execution slot.
     pub fn is_active(self) -> bool {
         matches!(
             self,
@@ -1725,6 +1880,8 @@ impl ToolJobState {
         )
     }
 
+    /// Returns `true` for states that end the job; `Orphaned` is excluded because it
+    /// may still be recovered or retried.
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Cancelled | Self::Expired)
     }
@@ -1767,6 +1924,7 @@ impl ToolJobState {
     }
 }
 
+/// Output stream a tool job tail chunk belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolJobTailStream {
@@ -1776,6 +1934,7 @@ pub enum ToolJobTailStream {
 }
 
 impl ToolJobTailStream {
+    /// Returns the canonical string persisted in SQLite and used in API payloads.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Stdout => "stdout",
@@ -1794,6 +1953,7 @@ impl ToolJobTailStream {
     }
 }
 
+/// Retry budget for a tool job; retries additionally require an idempotency key.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolJobRetryPolicy {
     pub max_attempts: u32,
@@ -1808,12 +1968,15 @@ impl Default for ToolJobRetryPolicy {
 }
 
 impl ToolJobRetryPolicy {
+    /// Returns `true` when more than one attempt is allowed and a non-empty
+    /// idempotency key is present.
     pub fn retry_allowed(&self) -> bool {
         self.max_attempts > 1
             && self.idempotency_key.as_deref().is_some_and(|value| !value.is_empty())
     }
 }
 
+/// Expiry and legal-hold settings for a tool job.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ToolJobRetentionPolicy {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1821,6 +1984,7 @@ pub struct ToolJobRetentionPolicy {
     pub legal_hold: bool,
 }
 
+/// Parameters for registering a new tool job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolJobCreateRequest {
     pub job_id: String,
@@ -1843,6 +2007,7 @@ pub struct ToolJobCreateRequest {
     pub lease_expires_at_unix_ms: Option<i64>,
 }
 
+/// Validated state-transition request for a tool job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolJobTransitionRequest {
     pub job_id: String,
@@ -1854,6 +2019,7 @@ pub struct ToolJobTransitionRequest {
     pub lease_expires_at_unix_ms: Option<i64>,
 }
 
+/// Output chunk appended to a tool job's tail.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolJobTailAppendRequest {
     pub job_id: String,
@@ -1861,6 +2027,7 @@ pub struct ToolJobTailAppendRequest {
     pub chunk: String,
 }
 
+/// Paged read request for a tool job's tail.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolJobTailReadRequest {
     pub job_id: String,
@@ -1870,6 +2037,7 @@ pub struct ToolJobTailReadRequest {
     pub max_bytes: usize,
 }
 
+/// Filter and pagination options for listing tool jobs.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ToolJobsListFilter {
     pub owner_principal: Option<String>,
@@ -1879,6 +2047,7 @@ pub struct ToolJobsListFilter {
     pub limit: usize,
 }
 
+/// Request to requeue a failed, cancelled, or orphaned tool job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolJobRetryRequest {
     pub job_id: String,
@@ -1887,12 +2056,14 @@ pub struct ToolJobRetryRequest {
     pub reason: String,
 }
 
+/// Request to attach a watcher to a tool job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolJobAttachRequest {
     pub job_id: String,
     pub owner_principal: Option<String>,
 }
 
+/// Stored tool job with lifecycle, retry, and artifact bookkeeping.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ToolJobRecord {
     pub job_id: String,
@@ -1945,6 +2116,7 @@ pub struct ToolJobRecord {
     pub lease_expires_at_unix_ms: Option<i64>,
 }
 
+/// Stored (redacted) tail chunk of a tool job.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ToolJobTailEntry {
     pub seq: i64,
@@ -1956,6 +2128,7 @@ pub struct ToolJobTailEntry {
     pub created_at_unix_ms: i64,
 }
 
+/// Page of tail entries with a continuation offset.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ToolJobTailPage {
     pub job_id: String,
@@ -1965,6 +2138,7 @@ pub struct ToolJobTailPage {
     pub truncated: bool,
 }
 
+/// Partial run metadata update; `Some(None)` clears a field.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct OrchestratorRunMetadataUpdateRequest {
     pub run_id: String,
@@ -1973,6 +2147,7 @@ pub struct OrchestratorRunMetadataUpdateRequest {
     pub merge_result: Option<Option<DelegationMergeResult>>,
 }
 
+/// Stored queued user input awaiting forwarding into a run.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct OrchestratorQueuedInputRecord {
     pub queued_input_id: String,
@@ -2004,6 +2179,7 @@ pub struct OrchestratorQueuedInputRecord {
     pub origin_run_id: Option<String>,
 }
 
+/// Stored pause state for a session's input queue.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct OrchestratorSessionQueueControlRecord {
     pub session_id: String,
@@ -2013,6 +2189,7 @@ pub struct OrchestratorSessionQueueControlRecord {
     pub updated_at_unix_ms: i64,
 }
 
+/// Stored context-compaction summary artifact.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct OrchestratorCompactionArtifactRecord {
     pub artifact_id: String,
@@ -2041,6 +2218,7 @@ pub struct OrchestratorCompactionArtifactRecord {
     pub created_at_unix_ms: i64,
 }
 
+/// Parameters for persisting a compaction artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratorCompactionArtifactCreateRequest {
     pub artifact_id: String,
@@ -2065,6 +2243,7 @@ pub struct OrchestratorCompactionArtifactCreateRequest {
     pub created_by_principal: String,
 }
 
+/// Stored conversation checkpoint with restore bookkeeping.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct OrchestratorCheckpointRecord {
     pub checkpoint_id: String,
@@ -2087,6 +2266,7 @@ pub struct OrchestratorCheckpointRecord {
     pub last_restored_at_unix_ms: Option<i64>,
 }
 
+/// Parameters for creating a conversation checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratorCheckpointCreateRequest {
     pub checkpoint_id: String,
@@ -2102,11 +2282,13 @@ pub struct OrchestratorCheckpointCreateRequest {
     pub created_by_principal: String,
 }
 
+/// Marks a conversation checkpoint as restored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratorCheckpointRestoreMarkRequest {
     pub checkpoint_id: String,
 }
 
+/// Stored filesystem checkpoint taken around a workspace mutation.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct WorkspaceCheckpointRecord {
     pub checkpoint_id: String,
@@ -2140,6 +2322,7 @@ pub struct WorkspaceCheckpointRecord {
     pub latest_restore_report_id: Option<String>,
 }
 
+/// Per-file metadata captured in a workspace checkpoint.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct WorkspaceCheckpointFileRecord {
     pub artifact_id: String,
@@ -2168,12 +2351,14 @@ pub struct WorkspaceCheckpointFileRecord {
     pub created_at_unix_ms: i64,
 }
 
+/// Checkpoint file metadata plus optional stored content bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceCheckpointFilePayload {
     pub file: WorkspaceCheckpointFileRecord,
     pub content_bytes: Option<Vec<u8>>,
 }
 
+/// Per-file payload for creating a workspace checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceCheckpointFileCreateRequest {
     pub artifact_id: String,
@@ -2192,6 +2377,7 @@ pub struct WorkspaceCheckpointFileCreateRequest {
     pub content_bytes: Option<Vec<u8>>,
 }
 
+/// Parameters for persisting a workspace checkpoint and its files.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceCheckpointCreateRequest {
     pub checkpoint_id: String,
@@ -2215,6 +2401,7 @@ pub struct WorkspaceCheckpointCreateRequest {
     pub files: Vec<WorkspaceCheckpointFileCreateRequest>,
 }
 
+/// Links the preflight and post-change checkpoints of one mutation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceCheckpointPairLinkRequest {
     pub mutation_id: String,
@@ -2224,6 +2411,7 @@ pub struct WorkspaceCheckpointPairLinkRequest {
     pub review_posture: String,
 }
 
+/// Filter options for listing workspace checkpoints.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WorkspaceCheckpointListFilter {
     pub session_id: Option<String>,
@@ -2232,6 +2420,7 @@ pub struct WorkspaceCheckpointListFilter {
     pub limit: Option<usize>,
 }
 
+/// Filter options for listing workspace restore reports.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WorkspaceRestoreReportListFilter {
     pub checkpoint_id: Option<String>,
@@ -2241,6 +2430,7 @@ pub struct WorkspaceRestoreReportListFilter {
     pub limit: Option<usize>,
 }
 
+/// Scope filter for summarizing workspace restore activity.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WorkspaceRestoreActivityFilter {
     pub session_id: Option<String>,
@@ -2248,6 +2438,7 @@ pub struct WorkspaceRestoreActivityFilter {
     pub device_id: Option<String>,
 }
 
+/// Aggregated checkpoint/restore counters with basis-point rates.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
 pub struct WorkspaceRestoreActivitySummary {
     pub checkpoint_count: u64,
@@ -2267,12 +2458,14 @@ pub struct WorkspaceRestoreActivitySummary {
     pub high_risk_mutation_rate_bps: u64,
 }
 
+/// Marks a workspace checkpoint as restored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceCheckpointRestoreMarkRequest {
     pub checkpoint_id: String,
     pub latest_restore_report_id: Option<String>,
 }
 
+/// Stored outcome of a workspace checkpoint restore.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct WorkspaceRestoreReportRecord {
     pub report_id: String,
@@ -2296,6 +2489,7 @@ pub struct WorkspaceRestoreReportRecord {
     pub created_at_unix_ms: i64,
 }
 
+/// Parameters for persisting a workspace restore report.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceRestoreReportCreateRequest {
     pub report_id: String,
@@ -2315,6 +2509,7 @@ pub struct WorkspaceRestoreReportCreateRequest {
     pub result_state: String,
 }
 
+/// Stored background task with scheduling and budget state.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct OrchestratorBackgroundTaskRecord {
     pub task_id: String,
@@ -2359,6 +2554,7 @@ pub struct OrchestratorBackgroundTaskRecord {
     pub completed_at_unix_ms: Option<i64>,
 }
 
+/// Parameters for enqueueing a background task.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratorBackgroundTaskCreateRequest {
     pub task_id: String,
@@ -2382,6 +2578,7 @@ pub struct OrchestratorBackgroundTaskCreateRequest {
     pub payload_json: Option<String>,
 }
 
+/// Partial background task update; `Some(None)` clears a field.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct OrchestratorBackgroundTaskUpdateRequest {
     pub task_id: String,
@@ -2394,6 +2591,7 @@ pub struct OrchestratorBackgroundTaskUpdateRequest {
     pub completed_at_unix_ms: Option<Option<i64>>,
 }
 
+/// Filter and pagination options for listing background tasks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratorBackgroundTaskListFilter {
     pub owner_principal: Option<String>,
@@ -2404,6 +2602,7 @@ pub struct OrchestratorBackgroundTaskListFilter {
     pub limit: usize,
 }
 
+/// Stored flow (multi-step orchestrated workflow) header.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct FlowRecord {
     pub flow_id: String,
@@ -2442,6 +2641,7 @@ pub struct FlowRecord {
     pub completed_at_unix_ms: Option<i64>,
 }
 
+/// Stored step within a flow.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct FlowStepRecord {
     pub step_id: String,
@@ -2475,6 +2675,7 @@ pub struct FlowStepRecord {
     pub completed_at_unix_ms: Option<i64>,
 }
 
+/// Stored flow audit event.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct FlowEventRecord {
     pub event_id: String,
@@ -2492,6 +2693,7 @@ pub struct FlowEventRecord {
     pub created_at_unix_ms: i64,
 }
 
+/// Stored flow revision-history entry.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct FlowRevisionRecord {
     pub revision_id: String,
@@ -2505,6 +2707,7 @@ pub struct FlowRevisionRecord {
     pub created_at_unix_ms: i64,
 }
 
+/// Flow together with its steps, events, and revisions.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct FlowBundleRecord {
     pub flow: FlowRecord,
@@ -2513,6 +2716,7 @@ pub struct FlowBundleRecord {
     pub revisions: Vec<FlowRevisionRecord>,
 }
 
+/// Parameters for creating a flow with its initial steps.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlowCreateRequest {
     pub flow_id: String,
@@ -2535,6 +2739,7 @@ pub struct FlowCreateRequest {
     pub steps: Vec<FlowStepCreateRequest>,
 }
 
+/// Parameters for one step inside a flow create request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlowStepCreateRequest {
     pub step_id: String,
@@ -2552,6 +2757,7 @@ pub struct FlowStepCreateRequest {
     pub not_before_unix_ms: Option<i64>,
 }
 
+/// Filter and pagination options for listing flows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlowListFilter {
     pub owner_principal: Option<String>,
@@ -2562,6 +2768,7 @@ pub struct FlowListFilter {
     pub limit: usize,
 }
 
+/// Optimistically-versioned flow state transition with its audit metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlowTransitionRequest {
     pub flow_id: String,
@@ -2577,6 +2784,7 @@ pub struct FlowTransitionRequest {
     pub payload_json: String,
 }
 
+/// Partial step update plus the audit event describing it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlowStepUpdateRequest {
     pub flow_id: String,
@@ -2596,6 +2804,7 @@ pub struct FlowStepUpdateRequest {
     pub payload_json: String,
 }
 
+/// Stored learning candidate awaiting (or past) review.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct LearningCandidateRecord {
     pub candidate_id: String,
@@ -2634,6 +2843,7 @@ pub struct LearningCandidateRecord {
     pub last_action_payload_json: Option<String>,
 }
 
+/// Parameters for upserting a learning candidate (deduplicated by key).
 #[derive(Debug, Clone, PartialEq)]
 pub struct LearningCandidateCreateRequest {
     pub candidate_id: String,
@@ -2658,6 +2868,7 @@ pub struct LearningCandidateCreateRequest {
     pub source_task_id: Option<String>,
 }
 
+/// Filter and pagination options for listing learning candidates.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LearningCandidateListFilter {
     pub candidate_id: Option<String>,
@@ -2676,6 +2887,7 @@ pub struct LearningCandidateListFilter {
     pub limit: usize,
 }
 
+/// Review decision applied to a learning candidate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LearningCandidateReviewRequest {
     pub candidate_id: String,
@@ -2685,6 +2897,7 @@ pub struct LearningCandidateReviewRequest {
     pub action_payload_json: Option<String>,
 }
 
+/// Stored review-history entry for a learning candidate.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct LearningCandidateHistoryRecord {
     pub history_id: String,
@@ -2698,6 +2911,7 @@ pub struct LearningCandidateHistoryRecord {
     pub created_at_unix_ms: i64,
 }
 
+/// Stored learned preference value for a scope and key.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct LearningPreferenceRecord {
     pub preference_id: String,
@@ -2719,6 +2933,7 @@ pub struct LearningPreferenceRecord {
     pub updated_at_unix_ms: i64,
 }
 
+/// Parameters for upserting a learned preference.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LearningPreferenceUpsertRequest {
     pub preference_id: Option<String>,
@@ -2736,6 +2951,7 @@ pub struct LearningPreferenceUpsertRequest {
     pub provenance_json: String,
 }
 
+/// Filter and pagination options for listing learned preferences.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LearningPreferenceListFilter {
     pub owner_principal: Option<String>,
@@ -2748,6 +2964,7 @@ pub struct LearningPreferenceListFilter {
     pub limit: usize,
 }
 
+/// Parameters for persisting a queued input decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratorQueuedInputCreateRequest {
     pub queued_input_id: String,
@@ -2767,6 +2984,7 @@ pub struct OrchestratorQueuedInputCreateRequest {
     pub explain_json: String,
 }
 
+/// State update for a queued input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratorQueuedInputUpdateRequest {
     pub queued_input_id: String,
@@ -2776,6 +2994,7 @@ pub struct OrchestratorQueuedInputUpdateRequest {
     pub explain_json: Option<String>,
 }
 
+/// Pause/resume update for a session's input queue.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratorSessionQueueControlUpdateRequest {
     pub session_id: String,
@@ -2783,6 +3002,7 @@ pub struct OrchestratorSessionQueueControlUpdateRequest {
     pub pause_reason: Option<String>,
 }
 
+/// Stored pin referencing a tape position in a session.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct OrchestratorSessionPinRecord {
     pub pin_id: String,
@@ -2795,6 +3015,7 @@ pub struct OrchestratorSessionPinRecord {
     pub created_at_unix_ms: i64,
 }
 
+/// Parameters for creating a session pin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratorSessionPinCreateRequest {
     pub pin_id: String,
@@ -2805,6 +3026,7 @@ pub struct OrchestratorSessionPinCreateRequest {
     pub note: Option<String>,
 }
 
+/// Tape event projected into a session-wide transcript view.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct OrchestratorSessionTranscriptRecord {
     pub session_id: String,
@@ -2818,6 +3040,7 @@ pub struct OrchestratorSessionTranscriptRecord {
     pub origin_run_id: Option<String>,
 }
 
+/// Scoped cross-session transcript search with context-window options.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionSearchRequest {
     pub principal: String,
@@ -2834,9 +3057,12 @@ pub struct SessionSearchRequest {
     pub include_archived: bool,
 }
 
+/// Artifact kind for persisted recall previews.
 pub const RECALL_ARTIFACT_KIND_PREVIEW: &str = "recall_preview";
+/// Artifact kind for persisted session-search results.
 pub const RECALL_ARTIFACT_KIND_SESSION_SEARCH: &str = "session_search";
 
+/// Parameters for persisting a recall artifact.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecallArtifactCreateRequest {
     pub artifact_id: String,
@@ -2853,6 +3079,7 @@ pub struct RecallArtifactCreateRequest {
     pub created_by_principal: String,
 }
 
+/// Stored recall artifact (query, payload, diagnostics, and provenance).
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct RecallArtifactRecord {
     pub artifact_id: String,
@@ -2872,6 +3099,7 @@ pub struct RecallArtifactRecord {
     pub created_at_unix_ms: i64,
 }
 
+/// Filter and pagination options for listing recall artifacts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecallArtifactListFilter {
     pub principal: String,
@@ -2882,6 +3110,7 @@ pub struct RecallArtifactListFilter {
     pub limit: usize,
 }
 
+/// Grouped session-search results plus retrieval diagnostics.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct SessionSearchOutcome {
     pub query: String,
@@ -2889,6 +3118,7 @@ pub struct SessionSearchOutcome {
     pub diagnostics: RetrievalBranchDiagnostics,
 }
 
+/// Search windows for one matching session.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct SessionSearchGroup {
     pub session: OrchestratorSessionRecord,
@@ -2898,6 +3128,7 @@ pub struct SessionSearchGroup {
     pub windows: Vec<SessionSearchWindow>,
 }
 
+/// Branch lineage of a session as shown in search results.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SessionSearchLineage {
     pub branch_state: String,
@@ -2908,6 +3139,7 @@ pub struct SessionSearchLineage {
     pub runs: Vec<SessionSearchRunRef>,
 }
 
+/// Run reference inside session-search lineage.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SessionSearchRunRef {
     pub run_id: String,
@@ -2918,6 +3150,7 @@ pub struct SessionSearchRunRef {
     pub parent_run_id: Option<String>,
 }
 
+/// One transcript match with its surrounding context events.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct SessionSearchWindow {
     pub window_id: String,
@@ -2934,6 +3167,7 @@ pub struct SessionSearchWindow {
     pub provenance: SessionSearchProvenanceRef,
 }
 
+/// Transcript event inside a session-search window.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SessionSearchEvent {
     pub session_id: String,
@@ -2950,6 +3184,7 @@ pub struct SessionSearchEvent {
     pub is_match: bool,
 }
 
+/// Provenance pointer for a session-search match.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SessionSearchProvenanceRef {
     pub source_type: String,
@@ -2960,6 +3195,7 @@ pub struct SessionSearchProvenanceRef {
     pub created_at_unix_ms: i64,
 }
 
+/// Branch lineage update for a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratorSessionLineageUpdateRequest {
     pub session_id: String,
@@ -2969,6 +3205,7 @@ pub struct OrchestratorSessionLineageUpdateRequest {
     pub suggested_auto_title: Option<String>,
 }
 
+/// Scope and time-range parameters for usage reporting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratorUsageQuery {
     pub start_at_unix_ms: i64,
@@ -2981,6 +3218,7 @@ pub struct OrchestratorUsageQuery {
     pub session_id: Option<String>,
 }
 
+/// Aggregate usage counters over a query range.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct OrchestratorUsageTotals {
     pub runs: u64,
@@ -2998,6 +3236,7 @@ pub struct OrchestratorUsageTotals {
     pub estimated_cost_usd: Option<f64>,
 }
 
+/// Usage counters for one timeline bucket.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct OrchestratorUsageTimelineBucket {
     pub bucket_start_unix_ms: i64,
@@ -3015,6 +3254,7 @@ pub struct OrchestratorUsageTimelineBucket {
     pub estimated_cost_usd: Option<f64>,
 }
 
+/// Usage totals plus the bucketed timeline.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct OrchestratorUsageSummary {
     pub totals: OrchestratorUsageTotals,
@@ -3022,6 +3262,7 @@ pub struct OrchestratorUsageSummary {
     pub cost_tracking_available: bool,
 }
 
+/// Per-session usage aggregates.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct OrchestratorUsageSessionRecord {
     pub session_id: String,
@@ -3053,6 +3294,7 @@ pub struct OrchestratorUsageSessionRecord {
     pub estimated_cost_usd: Option<f64>,
 }
 
+/// Per-run usage row for a session detail view.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct OrchestratorUsageRunRecord {
     pub run_id: String,
@@ -3073,6 +3315,7 @@ pub struct OrchestratorUsageRunRecord {
     pub last_error: Option<String>,
 }
 
+/// Run-level usage row enriched with session and lineage context.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct OrchestratorUsageInsightsRunRecord {
     pub run_id: String,
@@ -3104,6 +3347,7 @@ pub struct OrchestratorUsageInsightsRunRecord {
     pub last_error: Option<String>,
 }
 
+/// Stored model pricing catalog entry.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct UsagePricingRecord {
     pub pricing_id: String,
@@ -3126,6 +3370,7 @@ pub struct UsagePricingRecord {
     pub updated_at_unix_ms: i64,
 }
 
+/// Parameters for upserting a pricing catalog entry.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsagePricingUpsertRequest {
     pub pricing_id: String,
@@ -3142,6 +3387,7 @@ pub struct UsagePricingUpsertRequest {
     pub currency: String,
 }
 
+/// Stored model-routing decision with cost estimates.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct UsageRoutingDecisionRecord {
     pub decision_id: String,
@@ -3171,6 +3417,7 @@ pub struct UsageRoutingDecisionRecord {
     pub created_at_unix_ms: i64,
 }
 
+/// Parameters for recording a model-routing decision.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageRoutingDecisionCreateRequest {
     pub decision_id: String,
@@ -3195,6 +3442,7 @@ pub struct UsageRoutingDecisionCreateRequest {
     pub budget_outcome: Option<String>,
 }
 
+/// Filter and pagination options for listing routing decisions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageRoutingDecisionsFilter {
     pub since_unix_ms: Option<i64>,
@@ -3204,6 +3452,7 @@ pub struct UsageRoutingDecisionsFilter {
     pub limit: usize,
 }
 
+/// Stored usage budget policy.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct UsageBudgetPolicyRecord {
     pub policy_id: String,
@@ -3225,6 +3474,7 @@ pub struct UsageBudgetPolicyRecord {
     pub updated_at_unix_ms: i64,
 }
 
+/// Parameters for upserting a usage budget policy.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageBudgetPolicyUpsertRequest {
     pub policy_id: String,
@@ -3240,6 +3490,7 @@ pub struct UsageBudgetPolicyUpsertRequest {
     pub operator_principal: String,
 }
 
+/// Filter options for listing budget policies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageBudgetPoliciesFilter {
     pub enabled_only: bool,
@@ -3247,6 +3498,7 @@ pub struct UsageBudgetPoliciesFilter {
     pub scope_id: Option<String>,
 }
 
+/// Stored usage alert, deduplicated by key with occurrence counting.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct UsageAlertRecord {
     pub alert_id: String,
@@ -3269,6 +3521,7 @@ pub struct UsageAlertRecord {
     pub resolved_at_unix_ms: Option<i64>,
 }
 
+/// Parameters for raising or refreshing a deduplicated usage alert.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageAlertUpsertRequest {
     pub alert_id: String,
@@ -3286,6 +3539,7 @@ pub struct UsageAlertUpsertRequest {
     pub resolved: bool,
 }
 
+/// Filter options for listing usage alerts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageAlertsFilter {
     pub active_only: bool,
@@ -3294,6 +3548,7 @@ pub struct UsageAlertsFilter {
     pub scope_id: Option<String>,
 }
 
+/// Errors produced by journal storage, validation, and replay operations.
 #[derive(thiserror::Error, Debug)]
 pub enum JournalError {
     #[error("journal db path cannot be empty")]
@@ -3423,12 +3678,17 @@ pub enum JournalError {
     InvalidSystemTime(#[from] std::time::SystemTimeError),
 }
 
+/// One versioned schema migration, applied at most once and recorded in
+/// `schema_migrations`.
 struct Migration {
     version: i64,
     name: &'static str,
     sql: &'static str,
 }
 
+// INTENTIONAL: this list is append-only history. Versions already shipped have
+// been applied to live databases and are skipped on startup, so never edit or
+// reorder an existing entry -- add a new `Migration` with the next version.
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -4921,6 +5181,10 @@ const MIGRATIONS: &[Migration] = &[
     },
 ];
 
+// Shared serialization, lifecycle, and row-hydration helpers used by the
+// `impl JournalStore` block below. The `_tx` suffix marks helpers that expect
+// the caller to hold the connection lock (and usually a transaction).
+
 fn serialize_json_field<T: Serialize>(
     value: &T,
     _field: &'static str,
@@ -4928,6 +5192,8 @@ fn serialize_json_field<T: Serialize>(
     serde_json::to_string(value).map_err(JournalError::from)
 }
 
+/// Serializes a JSON field, enforces the payload size limit, and runs secret
+/// redaction; returns the sanitized string and its parsed value.
 fn serialize_sanitized_json_field<T: Serialize>(
     value: &T,
     field: &'static str,
@@ -4969,6 +5235,7 @@ fn parse_optional_json_column<T: DeserializeOwned>(
     })
 }
 
+/// Maps legacy run states onto the canonical lifecycle phases.
 fn canonical_run_lifecycle_phase(state: RunLifecycleState) -> RunLifecyclePhase {
     match state {
         RunLifecycleState::Pending | RunLifecycleState::Accepted => RunLifecyclePhase::Queued,
@@ -4979,6 +5246,8 @@ fn canonical_run_lifecycle_phase(state: RunLifecycleState) -> RunLifecyclePhase 
     }
 }
 
+/// Appends a sanitized run lifecycle transition row; the caller holds the
+/// connection lock (and any enclosing transaction).
 fn append_run_lifecycle_event_tx(
     connection: &Connection,
     request: &RunLifecycleEventAppendRequest,
@@ -5099,8 +5368,7 @@ fn append_orchestrator_tape_event_tx(
                     || error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
                     || message
                         .as_deref()
-                        .map(|value| value.contains("orchestrator_tape"))
-                        .unwrap_or(false)) =>
+                        .is_some_and(|value| value.contains("orchestrator_tape"))) =>
         {
             Err(JournalError::DuplicateTapeSequence {
                 run_id: request.run_id.clone(),
@@ -5343,6 +5611,7 @@ fn require_tool_job_scope(
     Ok(())
 }
 
+/// Truncates to at most `max_bytes` without splitting a UTF-8 character.
 fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
     if value.len() <= max_bytes {
         return value.to_owned();
@@ -5354,6 +5623,7 @@ fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
     value[..end].to_owned()
 }
 
+/// Keeps at most the trailing `max_bytes` of `value`, boundary-safe.
 fn truncate_utf8_bytes_from_end(value: &str, max_bytes: usize) -> String {
     if value.len() <= max_bytes {
         return value.to_owned();
@@ -5365,6 +5635,8 @@ fn truncate_utf8_bytes_from_end(value: &str, max_bytes: usize) -> String {
     value[start..].to_owned()
 }
 
+/// Boundary-safe byte-range read; returns the slice, its byte length, and an
+/// end-of-content flag.
 fn utf8_slice_by_byte_range(value: &str, offset: usize, max_bytes: usize) -> (String, usize, bool) {
     let mut start = offset.min(value.len());
     while start < value.len() && !value.is_char_boundary(start) {
@@ -5400,6 +5672,8 @@ fn redact_tool_job_tail_chunk(chunk: &str) -> String {
     truncate_utf8_bytes(redacted.as_str(), MAX_TOOL_JOB_TAIL_CHUNK_BYTES)
 }
 
+/// Appends a chunk to the rolling tail preview, trimming from the front to stay
+/// within the preview byte cap.
 fn append_tool_job_tail_preview(existing: &str, chunk_redacted: &str) -> String {
     let mut preview =
         String::with_capacity(existing.len().saturating_add(chunk_redacted.len() + 1));
@@ -5577,6 +5851,13 @@ struct QueryEmbeddingCacheState {
     misses: u64,
 }
 
+/// SQLite-backed persistence hub for the daemon: the hash-chained audit journal
+/// plus orchestrator sessions/runs/tape, approvals, cron, memory and workspace
+/// retrieval, tool jobs and artifacts, flows, learning, usage accounting, and
+/// canvas state.
+///
+/// All access serializes through one mutex-guarded SQLite connection opened in
+/// WAL mode with foreign keys enabled and owner-only file permissions.
 pub struct JournalStore {
     config: JournalConfig,
     connection: Mutex<Connection>,
@@ -5596,11 +5877,14 @@ impl fmt::Debug for JournalStore {
     }
 }
 
+/// Background and delegation runs must not steal the session's interactive
+/// `last_run` pointer; only foreground origin kinds update it.
 fn origin_kind_updates_session_last_run(origin_kind: &str) -> bool {
     let normalized = origin_kind.trim().to_ascii_lowercase();
     !matches!(normalized.as_str(), "background" | "delegation")
 }
 
+/// Returns the session's `last_run` id if that run is still active.
 fn active_session_last_run(
     connection: &Connection,
     session_id: &str,
@@ -5628,10 +5912,17 @@ fn active_session_last_run(
 }
 
 impl JournalStore {
+    /// Maximum accepted payload size in bytes for journal, tape, and artifact writes.
     pub(crate) fn max_payload_bytes(&self) -> usize {
         self.config.max_payload_bytes
     }
 
+    /// Opens (creating if needed) the journal database with the default
+    /// hash-fallback embedding provider.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] for an invalid configuration or path, or if the
+    /// database cannot be opened or migrated.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn open(config: JournalConfig) -> Result<Self, JournalError> {
         Self::open_with_memory_embedding_runtime(
@@ -5644,6 +5935,12 @@ impl JournalStore {
         )
     }
 
+    /// Opens the journal with a custom embedding provider, deriving a legacy
+    /// embeddings runtime profile from it.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] for an invalid configuration or path, or if the
+    /// database cannot be opened or migrated.
     #[allow(dead_code)]
     pub fn open_with_memory_embedding_provider(
         config: JournalConfig,
@@ -5656,6 +5953,12 @@ impl JournalStore {
         Self::open_with_memory_embedding_runtime(config, memory_embedding_provider, runtime)
     }
 
+    /// Opens the journal database: validates config, secures file permissions,
+    /// applies pragmas and pending schema migrations, and seeds the pricing catalog.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] for an invalid configuration or path, or if the
+    /// database cannot be opened or migrated.
     pub fn open_with_memory_embedding_runtime(
         config: JournalConfig,
         memory_embedding_provider: Arc<dyn MemoryEmbeddingProvider>,
@@ -5668,9 +5971,6 @@ impl JournalStore {
             return Err(JournalError::InvalidMemoryVectorDimensions);
         }
         validate_db_path(&config.db_path)?;
-        if config.max_payload_bytes == 0 {
-            return Err(JournalError::InvalidPayloadLimit);
-        }
         if config.max_events == 0 {
             return Err(JournalError::InvalidEventLimit);
         }
@@ -5788,6 +6088,9 @@ impl JournalStore {
         QueryEmbeddingLookup { vector, cache_hit: false }
     }
 
+    // INTENTIONAL: entry_count/hits/misses are reported as zero so the
+    // operator-facing status cannot leak cross-tenant cache activity; only the
+    // static capacity/TTL configuration is exposed (pinned by tests).
     fn query_embedding_cache_status(&self, now_unix_ms: i64) -> QueryEmbeddingCacheStatus {
         match self.query_embedding_cache.lock() {
             Ok(mut cache) => {
@@ -5814,6 +6117,12 @@ impl JournalStore {
         }
     }
 
+    /// Appends one event to the audit journal, sanitizing and redacting the payload
+    /// and extending the hash chain when enabled.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::PayloadTooLarge`], [`JournalError::JournalCapacityExceeded`],
+    /// [`JournalError::DuplicateEventId`], or [`JournalError::Sqlite`].
     pub fn append(
         &self,
         request: &JournalAppendRequest,
@@ -5830,6 +6139,9 @@ impl JournalStore {
         let created_at_unix_ms = current_unix_ms()?;
 
         let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        // The capacity check, prev-hash read, and insert must share one
+        // transaction so the hash chain stays linear: reading the latest hash
+        // outside it could interleave with another append and fork the chain.
         let transaction = guard.transaction()?;
         let current_events: i64 =
             transaction.query_row("SELECT COUNT(*) FROM journal_events", [], |row| row.get(0))?;
@@ -5900,8 +6212,7 @@ impl JournalStore {
                     && (error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
                         || message
                             .as_deref()
-                            .map(|value| value.contains("journal_events.event_ulid"))
-                            .unwrap_or(false)) =>
+                            .is_some_and(|value| value.contains("journal_events.event_ulid"))) =>
             {
                 return Err(JournalError::DuplicateEventId { event_id: request.event_id.clone() });
             }
@@ -5912,6 +6223,10 @@ impl JournalStore {
         Ok(JournalAppendOutcome { redacted, hash, prev_hash, write_duration: started_at.elapsed() })
     }
 
+    /// Returns the total number of journal events.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn total_events(&self) -> Result<usize, JournalError> {
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let total_events: i64 =
@@ -5919,6 +6234,10 @@ impl JournalStore {
         Ok(total_events as usize)
     }
 
+    /// Returns the hash of the most recent journal event, if any.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn latest_hash(&self) -> Result<Option<String>, JournalError> {
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         guard
@@ -5930,6 +6249,10 @@ impl JournalStore {
             .map_err(JournalError::from)
     }
 
+    /// Returns the most recent journal events, newest first (limit clamped to 500).
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn recent(&self, requested_limit: usize) -> Result<Vec<JournalEventRecord>, JournalError> {
         let limit = requested_limit.clamp(1, MAX_RECENT_EVENTS_LIMIT) as i64;
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
@@ -5980,6 +6303,11 @@ impl JournalStore {
         Ok(events)
     }
 
+    /// Test-only direct upsert of a session row.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::SessionIdentityMismatch`] if the row exists under a
+    /// different identity, or [`JournalError`] on storage failure.
     #[cfg(test)]
     pub fn upsert_orchestrator_session(
         &self,
@@ -6052,6 +6380,13 @@ impl JournalStore {
         Ok(())
     }
 
+    /// Resolves a session by id/key/label under the caller identity, optionally
+    /// resetting it, or creates a new session when allowed.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::InvalidSessionSelector`],
+    /// [`JournalError::SessionIdentityMismatch`], or [`JournalError::SessionNotFound`]
+    /// (with `require_existing`), or [`JournalError`] on storage failure.
     pub fn resolve_orchestrator_session(
         &self,
         request: &OrchestratorSessionResolveRequest,
@@ -6285,6 +6620,13 @@ impl JournalStore {
         })
     }
 
+    /// Sets or clears a session's manual title and recomputes the title generation
+    /// state.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::SessionNotFound`] or
+    /// [`JournalError::SessionIdentityMismatch`], or [`JournalError`] on storage
+    /// failure.
     pub fn update_orchestrator_session_title(
         &self,
         request: &OrchestratorSessionTitleUpdateRequest,
@@ -6342,6 +6684,11 @@ impl JournalStore {
         hydrate_orchestrator_session(&guard, session, None)
     }
 
+    /// Returns the hydrated session, or `None` if absent; hydration may persist
+    /// refreshed auto-title state.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn orchestrator_session_by_id(
         &self,
         session_id: &str,
@@ -6352,6 +6699,11 @@ impl JournalStore {
             .transpose()
     }
 
+    /// Returns the session hydrated in snapshot mode (derived fields computed but
+    /// never written back).
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn orchestrator_session_by_id_snapshot(
         &self,
         session_id: &str,
@@ -6362,6 +6714,10 @@ impl JournalStore {
             .transpose()
     }
 
+    /// Returns the stored project-context state for a session, if any.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn session_project_context_state(
         &self,
         session_id: &str,
@@ -6370,6 +6726,11 @@ impl JournalStore {
         load_session_project_context_state(&guard, session_id)
     }
 
+    /// Inserts or replaces a session's project-context state.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::SessionNotFound`] if the state cannot be read back,
+    /// or [`JournalError`] on storage failure.
     pub fn upsert_session_project_context_state(
         &self,
         request: &SessionProjectContextStateUpsertRequest,
@@ -6406,6 +6767,11 @@ impl JournalStore {
             .ok_or_else(|| JournalError::SessionNotFound { selector: request.session_id.clone() })
     }
 
+    /// Copies project-context state between sessions; returns `None` when the
+    /// source has none.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn copy_session_project_context_state(
         &self,
         request: &SessionProjectContextStateCopyRequest,
@@ -6424,6 +6790,13 @@ impl JournalStore {
         .map(Some)
     }
 
+    /// Applies per-session override toggles (model profile, thinking, trace,
+    /// verbose); `Some(None)` clears an override.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::SessionNotFound`] or
+    /// [`JournalError::SessionIdentityMismatch`], or [`JournalError`] on storage
+    /// failure.
     pub fn update_orchestrator_session_quick_controls(
         &self,
         request: &OrchestratorSessionQuickControlsUpdateRequest,
@@ -6502,6 +6875,11 @@ impl JournalStore {
         hydrate_orchestrator_session(&guard, session, None)
     }
 
+    /// Lists sessions for an exact principal/device/channel scope, paged by session
+    /// key.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_orchestrator_sessions(
         &self,
         after_session_key: Option<&str>,
@@ -6528,6 +6906,11 @@ impl JournalStore {
             .collect()
     }
 
+    /// Lists sessions for a principal across devices and channels, paged by session
+    /// key.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_orchestrator_sessions_for_principal(
         &self,
         after_session_key: Option<&str>,
@@ -6550,6 +6933,10 @@ impl JournalStore {
             .collect()
     }
 
+    /// Returns usage totals and a bucketed timeline for the query scope.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn summarize_orchestrator_usage(
         &self,
         query: &OrchestratorUsageQuery,
@@ -6560,6 +6947,10 @@ impl JournalStore {
         Ok(OrchestratorUsageSummary { totals, timeline, cost_tracking_available: false })
     }
 
+    /// Lists per-session usage aggregates for the query scope.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_orchestrator_usage_sessions(
         &self,
         query: &OrchestratorUsageQuery,
@@ -6568,6 +6959,11 @@ impl JournalStore {
         load_orchestrator_usage_sessions(&guard, query)
     }
 
+    /// Returns usage for one session plus its most recent runs, or `None` when the
+    /// session is outside the query scope.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn get_orchestrator_usage_session(
         &self,
         query: &OrchestratorUsageQuery,
@@ -6595,6 +6991,10 @@ impl JournalStore {
         Ok(Some((session_usage, runs)))
     }
 
+    /// Lists run-level usage rows (insights view) for the query scope.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_orchestrator_usage_runs(
         &self,
         query: &OrchestratorUsageQuery,
@@ -6604,11 +7004,19 @@ impl JournalStore {
         load_orchestrator_usage_insights_runs(&guard, query, limit)
     }
 
+    /// Lists all pricing catalog entries.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_usage_pricing_records(&self) -> Result<Vec<UsagePricingRecord>, JournalError> {
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         load_usage_pricing_records(&guard)
     }
 
+    /// Inserts or updates a pricing catalog entry and returns the stored row.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn upsert_usage_pricing_record(
         &self,
         request: &UsagePricingUpsertRequest,
@@ -6667,6 +7075,10 @@ impl JournalStore {
             .ok_or_else(|| JournalError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
     }
 
+    /// Persists a model-routing decision and returns the stored row.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn create_usage_routing_decision(
         &self,
         request: &UsageRoutingDecisionCreateRequest,
@@ -6729,6 +7141,10 @@ impl JournalStore {
             .ok_or_else(|| JournalError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
     }
 
+    /// Lists routing decisions matching the filter.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_usage_routing_decisions(
         &self,
         filter: &UsageRoutingDecisionsFilter,
@@ -6737,6 +7153,10 @@ impl JournalStore {
         load_usage_routing_decisions(&guard, filter)
     }
 
+    /// Inserts or updates a budget policy and returns the stored row.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn upsert_usage_budget_policy(
         &self,
         request: &UsageBudgetPolicyUpsertRequest,
@@ -6793,6 +7213,10 @@ impl JournalStore {
             .ok_or_else(|| JournalError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
     }
 
+    /// Lists budget policies matching the filter.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_usage_budget_policies(
         &self,
         filter: &UsageBudgetPoliciesFilter,
@@ -6801,6 +7225,11 @@ impl JournalStore {
         load_usage_budget_policies(&guard, filter)
     }
 
+    /// Raises or refreshes a usage alert deduplicated by key, bumping its
+    /// occurrence count.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn upsert_usage_alert(
         &self,
         request: &UsageAlertUpsertRequest,
@@ -6888,6 +7317,10 @@ impl JournalStore {
             .ok_or_else(|| JournalError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
     }
 
+    /// Lists usage alerts matching the filter.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_usage_alerts(
         &self,
         filter: &UsageAlertsFilter,
@@ -6896,6 +7329,10 @@ impl JournalStore {
         load_usage_alerts(&guard, filter)
     }
 
+    /// Returns the most recent approval recorded for a subject id, if any.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn latest_approval_by_subject(
         &self,
         subject_id: &str,
@@ -6904,6 +7341,14 @@ impl JournalStore {
         load_latest_approval_by_subject(&guard, subject_id)
     }
 
+    /// Archives a session, rewriting its key to a tombstone form; a no-op if it is
+    /// already archived.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::InvalidSessionSelector`],
+    /// [`JournalError::SessionNotFound`], or
+    /// [`JournalError::SessionIdentityMismatch`], or [`JournalError`] on storage
+    /// failure.
     pub fn cleanup_orchestrator_session(
         &self,
         request: &OrchestratorSessionCleanupRequest,
@@ -7006,6 +7451,11 @@ impl JournalStore {
         })
     }
 
+    /// Registers a new run for a session and appends the initial lifecycle event.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::SessionRunAlreadyActive`] or
+    /// [`JournalError::DuplicateRunId`], or [`JournalError`] on storage failure.
     pub fn start_orchestrator_run(
         &self,
         request: &OrchestratorRunStartRequest,
@@ -7114,8 +7564,7 @@ impl JournalStore {
                         || error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
                         || message
                             .as_deref()
-                            .map(|value| value.contains("orchestrator_runs.run_ulid"))
-                            .unwrap_or(false)) =>
+                            .is_some_and(|value| value.contains("orchestrator_runs.run_ulid"))) =>
             {
                 Err(JournalError::DuplicateRunId { run_id: request.run_id.clone() })
             }
@@ -7123,6 +7572,10 @@ impl JournalStore {
         }
     }
 
+    /// Updates run lineage and delegation metadata; `Some(None)` clears a field.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::RunNotFound`], or [`JournalError`] on storage failure.
     pub fn update_orchestrator_run_metadata(
         &self,
         request: &OrchestratorRunMetadataUpdateRequest,
@@ -7182,6 +7635,11 @@ impl JournalStore {
         Ok(())
     }
 
+    /// Transitions a run's state and appends a lifecycle event; terminal states are
+    /// sticky (a second terminal update is a no-op).
+    ///
+    /// # Errors
+    /// Returns [`JournalError::RunNotFound`], or [`JournalError`] on storage failure.
     pub fn update_orchestrator_run_state(
         &self,
         run_id: &str,
@@ -7257,6 +7715,11 @@ impl JournalStore {
         Ok(())
     }
 
+    /// Force-fails runs left active by a previous daemon process, recording
+    /// lifecycle and recovery tape events for each.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn terminalize_orphaned_orchestrator_runs_on_startup(
         &self,
         reason: &str,
@@ -7359,6 +7822,10 @@ impl JournalStore {
         })
     }
 
+    /// Adds token deltas to a run's usage counters; an all-zero delta is a no-op.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::RunNotFound`], or [`JournalError`] on storage failure.
     pub fn add_orchestrator_usage(
         &self,
         delta: &OrchestratorUsageDelta,
@@ -7391,6 +7858,12 @@ impl JournalStore {
         Ok(())
     }
 
+    /// Appends one sanitized event to a run's tape.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::PayloadTooLarge`] or
+    /// [`JournalError::DuplicateTapeSequence`], or [`JournalError`] on storage
+    /// failure.
     pub fn append_orchestrator_tape_event(
         &self,
         request: &OrchestratorTapeAppendRequest,
@@ -7400,6 +7873,11 @@ impl JournalStore {
         append_orchestrator_tape_event_tx(&guard, self.config.max_payload_bytes, request, now)
     }
 
+    /// Marks a run cancelled (unless already terminal) and appends a lifecycle
+    /// event; returns the observed state.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::RunNotFound`], or [`JournalError`] on storage failure.
     pub fn request_orchestrator_cancel(
         &self,
         request: &OrchestratorCancelRequest,
@@ -7482,6 +7960,10 @@ impl JournalStore {
         })
     }
 
+    /// Returns whether cancellation has been requested for the run.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::RunNotFound`], or [`JournalError`] on storage failure.
     pub fn is_orchestrator_cancel_requested(&self, run_id: &str) -> Result<bool, JournalError> {
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let value = guard
@@ -7497,6 +7979,10 @@ impl JournalStore {
         Ok(value == 1)
     }
 
+    /// Returns a run's full tape in order.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     #[allow(dead_code)]
     pub fn orchestrator_tape(
         &self,
@@ -7506,6 +7992,10 @@ impl JournalStore {
         load_orchestrator_tape(&guard, run_id)
     }
 
+    /// Returns a page of a run's tape after the given sequence number.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn orchestrator_tape_page(
         &self,
         run_id: &str,
@@ -7517,6 +8007,10 @@ impl JournalStore {
         load_orchestrator_tape_page(&guard, run_id, after_seq, limit)
     }
 
+    /// Lists a run's lifecycle transitions in chronological order.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_run_lifecycle_events(
         &self,
         run_id: &str,
@@ -7550,6 +8044,11 @@ impl JournalStore {
         Ok(records)
     }
 
+    /// Reserves an idempotency key, or classifies the retry (completed replay,
+    /// conflicting payload, same-payload retry, or expired retry).
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn begin_idempotency_operation(
         &self,
         request: &IdempotencyBeginRequest,
@@ -7635,6 +8134,11 @@ impl JournalStore {
         Ok(IdempotencyBeginOutcome { decision, record: Some(existing) })
     }
 
+    /// Stores the sanitized success result for a reserved idempotency key.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::PayloadTooLarge`], [`JournalError::InvalidArgument`]
+    /// for an unknown key, or [`JournalError`] on storage failure.
     pub fn complete_idempotency_operation(
         &self,
         request: &IdempotencyCompleteRequest,
@@ -7672,6 +8176,11 @@ impl JournalStore {
         })
     }
 
+    /// Stores the failure envelope for a reserved idempotency key.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::InvalidArgument`] for an unknown key, or
+    /// [`JournalError`] on storage failure.
     pub fn fail_idempotency_operation(
         &self,
         request: &IdempotencyFailRequest,
@@ -7702,10 +8211,16 @@ impl JournalStore {
         })
     }
 
+    /// Lists idempotency records whose key or payloads mention the run id.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_idempotency_records_for_run(
         &self,
         run_id: &str,
     ) -> Result<Vec<IdempotencyRecordSnapshot>, JournalError> {
+        // Idempotency rows carry no run column; run ids are embedded in keys
+        // (e.g. "run:start:<run_id>") and payloads, hence the LIKE scan.
         let run_pattern = format!("%{run_id}%");
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let mut statement = guard.prepare(
@@ -7736,6 +8251,13 @@ impl JournalStore {
         Ok(records)
     }
 
+    /// Stores a tool result artifact with its content digest and retention
+    /// metadata.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::PayloadTooLarge`] or
+    /// [`JournalError::DuplicateToolResultArtifactId`], or [`JournalError`] on
+    /// storage failure.
     pub fn create_tool_result_artifact(
         &self,
         request: &ToolResultArtifactCreateRequest,
@@ -7814,8 +8336,7 @@ impl JournalStore {
                         || error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
                         || message
                             .as_deref()
-                            .map(|value| value.contains("tool_result_artifacts"))
-                            .unwrap_or(false)) =>
+                            .is_some_and(|value| value.contains("tool_result_artifacts"))) =>
             {
                 Err(JournalError::DuplicateToolResultArtifactId {
                     artifact_id: request.artifact_id.clone(),
@@ -7825,6 +8346,10 @@ impl JournalStore {
         }
     }
 
+    /// Lists artifact references recorded for a run.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_tool_result_artifacts_for_run(
         &self,
         run_id: &str,
@@ -7863,6 +8388,15 @@ impl JournalStore {
         Ok(artifacts)
     }
 
+    /// Reads artifact content gated by scope, digest, retention, and sensitivity;
+    /// every attempt (allowed or denied) is recorded in the read audit table.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::ToolResultArtifactNotFound`],
+    /// [`JournalError::ToolResultArtifactScopeMismatch`],
+    /// [`JournalError::ToolResultArtifactDigestMismatch`], or
+    /// [`JournalError::ToolResultArtifactReadDenied`], or [`JournalError`] on
+    /// storage failure.
     pub fn read_tool_result_artifact(
         &self,
         request: &ToolResultArtifactReadRequest,
@@ -7966,6 +8500,11 @@ impl JournalStore {
         })
     }
 
+    /// Registers a tool job in its initial state.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::DuplicateToolJobId`], or [`JournalError`] on storage
+    /// failure.
     pub fn create_tool_job(
         &self,
         request: &ToolJobCreateRequest,
@@ -8075,10 +8614,7 @@ impl JournalStore {
                 if error.code == ErrorCode::ConstraintViolation
                     && (error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
                         || error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
-                        || message
-                            .as_deref()
-                            .map(|value| value.contains("tool_jobs"))
-                            .unwrap_or(false)) =>
+                        || message.as_deref().is_some_and(|value| value.contains("tool_jobs"))) =>
             {
                 Err(JournalError::DuplicateToolJobId { job_id: request.job_id.clone() })
             }
@@ -8086,11 +8622,19 @@ impl JournalStore {
         }
     }
 
+    /// Returns the tool job, or `None` if absent.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn get_tool_job(&self, job_id: &str) -> Result<Option<ToolJobRecord>, JournalError> {
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         load_tool_job(&guard, job_id)
     }
 
+    /// Lists tool jobs matching the filter.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_tool_jobs(
         &self,
         filter: &ToolJobsListFilter,
@@ -8141,6 +8685,12 @@ impl JournalStore {
         Ok(records)
     }
 
+    /// Applies a validated state transition to a tool job.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::ToolJobNotFound`] or
+    /// [`JournalError::InvalidToolJobTransition`], or [`JournalError`] on storage
+    /// failure.
     pub fn transition_tool_job(
         &self,
         request: &ToolJobTransitionRequest,
@@ -8206,6 +8756,12 @@ impl JournalStore {
             .ok_or_else(|| JournalError::ToolJobNotFound { job_id: request.job_id.clone() })
     }
 
+    /// Appends a redacted output chunk to a job's tail and refreshes the rolling
+    /// preview.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::ToolJobNotFound`] or
+    /// [`JournalError::PayloadTooLarge`], or [`JournalError`] on storage failure.
     pub fn append_tool_job_tail(
         &self,
         request: &ToolJobTailAppendRequest,
@@ -8279,6 +8835,12 @@ impl JournalStore {
             .map_err(JournalError::from)
     }
 
+    /// Reads a page of tail entries under entry and byte budgets.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::ToolJobNotFound`] or
+    /// [`JournalError::ToolJobScopeMismatch`], or [`JournalError`] on storage
+    /// failure.
     pub fn tail_tool_job(
         &self,
         request: &ToolJobTailReadRequest,
@@ -8330,6 +8892,12 @@ impl JournalStore {
         })
     }
 
+    /// Increments a job's active watcher count (scope-checked).
+    ///
+    /// # Errors
+    /// Returns [`JournalError::ToolJobNotFound`] or
+    /// [`JournalError::ToolJobScopeMismatch`], or [`JournalError`] on storage
+    /// failure.
     pub fn attach_tool_job(
         &self,
         request: &ToolJobAttachRequest,
@@ -8353,6 +8921,11 @@ impl JournalStore {
             .ok_or_else(|| JournalError::ToolJobNotFound { job_id: request.job_id.clone() })
     }
 
+    /// Decrements a job's active watcher count.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::ToolJobNotFound`], or [`JournalError`] on storage
+    /// failure.
     pub fn release_tool_job_attachment(&self, job_id: &str) -> Result<ToolJobRecord, JournalError> {
         let now = current_unix_ms()?;
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
@@ -8373,6 +8946,12 @@ impl JournalStore {
             .ok_or_else(|| JournalError::ToolJobNotFound { job_id: job_id.to_owned() })
     }
 
+    /// Requeues a failed, cancelled, or orphaned job when its retry policy allows.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::ToolJobNotFound`],
+    /// [`JournalError::ToolJobScopeMismatch`], or
+    /// [`JournalError::ToolJobRetryDenied`], or [`JournalError`] on storage failure.
     pub fn retry_tool_job(
         &self,
         request: &ToolJobRetryRequest,
@@ -8429,6 +9008,11 @@ impl JournalStore {
             .ok_or_else(|| JournalError::ToolJobNotFound { job_id: request.job_id.clone() })
     }
 
+    /// Expires terminal jobs past their retention deadline (legal holds exempt);
+    /// returns the affected records.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn sweep_expired_tool_jobs(
         &self,
         now_unix_ms: i64,
@@ -8478,6 +9062,11 @@ impl JournalStore {
         Ok(expired)
     }
 
+    /// Marks active jobs without a recent heartbeat as orphaned; returns the
+    /// affected records.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn recover_stale_tool_jobs(
         &self,
         now_unix_ms: i64,
@@ -8527,6 +9116,10 @@ impl JournalStore {
         Ok(recovered)
     }
 
+    /// Returns a point-in-time status snapshot of a run, or `None` if absent.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn orchestrator_run_status_snapshot(
         &self,
         run_id: &str,
@@ -8609,6 +9202,10 @@ impl JournalStore {
         Ok(Some(snapshot))
     }
 
+    /// Lists run status snapshots for a session.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_orchestrator_session_runs(
         &self,
         session_id: &str,
@@ -8685,6 +9282,11 @@ impl JournalStore {
         Ok(records)
     }
 
+    /// Updates a session's branch lineage and optionally suggests an auto title.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::SessionNotFound`], or [`JournalError`] on storage
+    /// failure.
     pub fn update_orchestrator_session_lineage(
         &self,
         request: &OrchestratorSessionLineageUpdateRequest,
@@ -8738,6 +9340,10 @@ impl JournalStore {
         Ok(())
     }
 
+    /// Lists tape events across all of a session's runs as one transcript.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_orchestrator_session_transcript(
         &self,
         session_id: &str,
@@ -8778,6 +9384,10 @@ impl JournalStore {
         Ok(records)
     }
 
+    /// Searches transcripts across sessions and returns grouped context windows.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn search_orchestrator_session_windows(
         &self,
         request: &SessionSearchRequest,
@@ -8787,6 +9397,12 @@ impl JournalStore {
         search_orchestrator_session_windows(&guard, request, started_at)
     }
 
+    /// Persists a recall artifact with sanitized payload, diagnostics, and
+    /// provenance.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::DuplicateRecallArtifactId`] or
+    /// [`JournalError::PayloadTooLarge`], or [`JournalError`] on storage failure.
     pub fn create_recall_artifact(
         &self,
         request: &RecallArtifactCreateRequest,
@@ -8851,10 +9467,9 @@ impl JournalStore {
                 if error.code == ErrorCode::ConstraintViolation
                     && (error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
                         || error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
-                        || message
-                            .as_deref()
-                            .map(|value| value.contains("recall_artifacts.artifact_ulid"))
-                            .unwrap_or(false)) =>
+                        || message.as_deref().is_some_and(|value| {
+                            value.contains("recall_artifacts.artifact_ulid")
+                        })) =>
             {
                 return Err(JournalError::DuplicateRecallArtifactId {
                     artifact_id: request.artifact_id.clone(),
@@ -8879,6 +9494,10 @@ impl JournalStore {
         })
     }
 
+    /// Lists recall artifacts matching the filter.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_recall_artifacts(
         &self,
         filter: &RecallArtifactListFilter,
@@ -8944,6 +9563,10 @@ impl JournalStore {
         Ok(artifacts)
     }
 
+    /// Persists a queued input decision for a run.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn create_orchestrator_queued_input(
         &self,
         request: &OrchestratorQueuedInputCreateRequest,
@@ -9028,6 +9651,11 @@ impl JournalStore {
         })
     }
 
+    /// Updates a queued input's state and decision metadata; unknown ids are a
+    /// silent no-op.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn update_orchestrator_queued_input_state(
         &self,
         request: &OrchestratorQueuedInputUpdateRequest,
@@ -9069,6 +9697,11 @@ impl JournalStore {
         Ok(())
     }
 
+    /// Moves a queued input to the given priority lane with an updated decision
+    /// explanation.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn prioritize_orchestrator_queued_input(
         &self,
         queued_input_id: &str,
@@ -9099,6 +9732,10 @@ impl JournalStore {
         Ok(())
     }
 
+    /// Returns a session's queue pause state, if recorded.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn get_orchestrator_session_queue_control(
         &self,
         session_id: &str,
@@ -9125,6 +9762,10 @@ impl JournalStore {
             .map_err(JournalError::from)
     }
 
+    /// Sets or clears the pause flag of a session's input queue.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn upsert_orchestrator_session_queue_control(
         &self,
         request: &OrchestratorSessionQueueControlUpdateRequest,
@@ -9159,6 +9800,10 @@ impl JournalStore {
         })
     }
 
+    /// Lists queued inputs recorded for a session.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_orchestrator_queued_inputs(
         &self,
         session_id: &str,
@@ -9221,6 +9866,10 @@ impl JournalStore {
         Ok(records)
     }
 
+    /// Persists a pin referencing a tape position.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn create_orchestrator_session_pin(
         &self,
         request: &OrchestratorSessionPinCreateRequest,
@@ -9276,6 +9925,10 @@ impl JournalStore {
         })
     }
 
+    /// Lists pins for a session.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_orchestrator_session_pins(
         &self,
         session_id: &str,
@@ -9312,6 +9965,10 @@ impl JournalStore {
         Ok(records)
     }
 
+    /// Deletes a pin; returns whether a row was removed.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn delete_orchestrator_session_pin(&self, pin_id: &str) -> Result<bool, JournalError> {
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         Ok(guard.execute(
@@ -9320,6 +9977,10 @@ impl JournalStore {
         )? > 0)
     }
 
+    /// Persists a compaction artifact summarizing condensed session context.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn create_orchestrator_compaction_artifact(
         &self,
         request: &OrchestratorCompactionArtifactCreateRequest,
@@ -9414,6 +10075,10 @@ impl JournalStore {
         })
     }
 
+    /// Lists compaction artifacts for a session.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_orchestrator_compaction_artifacts(
         &self,
         session_id: &str,
@@ -9478,6 +10143,10 @@ impl JournalStore {
         Ok(records)
     }
 
+    /// Returns a compaction artifact, or `None` if absent.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn get_orchestrator_compaction_artifact(
         &self,
         artifact_id: &str,
@@ -9542,6 +10211,10 @@ impl JournalStore {
             .map_err(JournalError::from)
     }
 
+    /// Persists a conversation checkpoint.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn create_orchestrator_checkpoint(
         &self,
         request: &OrchestratorCheckpointCreateRequest,
@@ -9600,6 +10273,10 @@ impl JournalStore {
         })
     }
 
+    /// Lists conversation checkpoints for a session.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_orchestrator_checkpoints(
         &self,
         session_id: &str,
@@ -9650,6 +10327,10 @@ impl JournalStore {
         Ok(records)
     }
 
+    /// Returns a conversation checkpoint, or `None` if absent.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn get_orchestrator_checkpoint(
         &self,
         checkpoint_id: &str,
@@ -9700,6 +10381,11 @@ impl JournalStore {
             .map_err(JournalError::from)
     }
 
+    /// Increments a checkpoint's restore counter and timestamp.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::SessionNotFound`] (carrying the checkpoint id) for an
+    /// unknown checkpoint, or [`JournalError`] on storage failure.
     pub fn mark_orchestrator_checkpoint_restored(
         &self,
         request: &OrchestratorCheckpointRestoreMarkRequest,
@@ -9717,11 +10403,20 @@ impl JournalStore {
             params![request.checkpoint_id, now],
         )?;
         if updated == 0 {
+            // AIDEV-NOTE: misleading variant reuse -- an unknown checkpoint id
+            // surfaces as "orchestrator session not found". Fixing it needs a
+            // dedicated CheckpointNotFound variant (an error-contract change),
+            // so it is only flagged here.
             return Err(JournalError::SessionNotFound { selector: request.checkpoint_id.clone() });
         }
         Ok(())
     }
 
+    /// Persists a workspace checkpoint and all of its file payloads in one
+    /// transaction.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn create_workspace_checkpoint(
         &self,
         request: &WorkspaceCheckpointCreateRequest,
@@ -9934,6 +10629,10 @@ impl JournalStore {
         })
     }
 
+    /// Lists workspace checkpoints matching the filter.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_workspace_checkpoints(
         &self,
         filter: &WorkspaceCheckpointListFilter,
@@ -10031,6 +10730,10 @@ impl JournalStore {
         Ok(records)
     }
 
+    /// Returns a workspace checkpoint, or `None` if absent.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn get_workspace_checkpoint(
         &self,
         checkpoint_id: &str,
@@ -10097,6 +10800,11 @@ impl JournalStore {
             .map_err(JournalError::from)
     }
 
+    /// Links the preflight and post-change checkpoints of one mutation and stores
+    /// the comparison summary.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn link_workspace_checkpoint_pair(
         &self,
         request: &WorkspaceCheckpointPairLinkRequest,
@@ -10149,6 +10857,10 @@ impl JournalStore {
         Ok(())
     }
 
+    /// Returns a restore report, or `None` if absent.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn get_workspace_restore_report(
         &self,
         report_id: &str,
@@ -10203,6 +10915,10 @@ impl JournalStore {
             .map_err(JournalError::from)
     }
 
+    /// Lists restore reports matching the filter.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_workspace_restore_reports(
         &self,
         filter: &WorkspaceRestoreReportListFilter,
@@ -10286,6 +11002,11 @@ impl JournalStore {
         Ok(records)
     }
 
+    /// Aggregates checkpoint and restore counters (with basis-point rates) for a
+    /// scope.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn summarize_workspace_restore_activity(
         &self,
         filter: &WorkspaceRestoreActivityFilter,
@@ -10431,6 +11152,10 @@ impl JournalStore {
         })
     }
 
+    /// Lists the per-file records of a workspace checkpoint.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_workspace_checkpoint_files(
         &self,
         checkpoint_id: &str,
@@ -10485,6 +11210,10 @@ impl JournalStore {
         Ok(files)
     }
 
+    /// Returns one checkpoint file with its stored content bytes, if present.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn get_workspace_checkpoint_file_payload(
         &self,
         artifact_id: &str,
@@ -10549,6 +11278,10 @@ impl JournalStore {
             .map_err(JournalError::from)
     }
 
+    /// Persists the outcome of a checkpoint restore.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn create_workspace_restore_report(
         &self,
         request: &WorkspaceRestoreReportCreateRequest,
@@ -10615,6 +11348,12 @@ impl JournalStore {
         })
     }
 
+    /// Increments a workspace checkpoint's restore counter and links the latest
+    /// restore report.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::SessionNotFound`] (carrying the checkpoint id) for an
+    /// unknown checkpoint, or [`JournalError`] on storage failure.
     pub fn mark_workspace_checkpoint_restored(
         &self,
         request: &WorkspaceCheckpointRestoreMarkRequest,
@@ -10633,11 +11372,17 @@ impl JournalStore {
             params![request.checkpoint_id, now, request.latest_restore_report_id],
         )?;
         if updated == 0 {
+            // AIDEV-NOTE: same misleading SessionNotFound reuse as
+            // mark_orchestrator_checkpoint_restored; see the note there.
             return Err(JournalError::SessionNotFound { selector: request.checkpoint_id.clone() });
         }
         Ok(())
     }
 
+    /// Enqueues a background task.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn create_orchestrator_background_task(
         &self,
         request: &OrchestratorBackgroundTaskCreateRequest,
@@ -10737,6 +11482,10 @@ impl JournalStore {
         })
     }
 
+    /// Applies a partial update to a background task; `Some(None)` clears a field.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn update_orchestrator_background_task(
         &self,
         request: &OrchestratorBackgroundTaskUpdateRequest,
@@ -10809,6 +11558,10 @@ impl JournalStore {
         Ok(())
     }
 
+    /// Lists background tasks matching the filter.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_orchestrator_background_tasks(
         &self,
         filter: &OrchestratorBackgroundTaskListFilter,
@@ -10908,6 +11661,10 @@ impl JournalStore {
         Ok(records)
     }
 
+    /// Returns a background task, or `None` if absent.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn get_orchestrator_background_task(
         &self,
         task_id: &str,
@@ -10982,6 +11739,11 @@ impl JournalStore {
             .map_err(JournalError::from)
     }
 
+    /// Creates a flow with its steps plus the initial audit event and revision in
+    /// one transaction.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn create_flow(&self, request: &FlowCreateRequest) -> Result<FlowRecord, JournalError> {
         ensure_json_field(request.retry_policy_json.as_str(), "retry_policy_json")?;
         ensure_json_field(request.metadata_json.as_str(), "metadata_json")?;
@@ -11134,6 +11896,10 @@ impl JournalStore {
             .ok_or_else(|| JournalError::FlowNotFound { flow_id: request.flow_id.clone() })
     }
 
+    /// Lists flows matching the filter.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_flows(&self, filter: &FlowListFilter) -> Result<Vec<FlowRecord>, JournalError> {
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let limit = filter.limit.clamp(1, 500) as i64;
@@ -11187,11 +11953,19 @@ impl JournalStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(JournalError::from)
     }
 
+    /// Returns a flow, or `None` if absent.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn get_flow(&self, flow_id: &str) -> Result<Option<FlowRecord>, JournalError> {
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         query_flow_by_id(&guard, flow_id)
     }
 
+    /// Returns a flow with its steps, events, and revisions, or `None` if absent.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn get_flow_bundle(
         &self,
         flow_id: &str,
@@ -11208,6 +11982,10 @@ impl JournalStore {
         }))
     }
 
+    /// Lists a flow's steps in order.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_flow_steps(&self, flow_id: &str) -> Result<Vec<FlowStepRecord>, JournalError> {
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let mut statement = guard.prepare(
@@ -11244,6 +12022,10 @@ impl JournalStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(JournalError::from)
     }
 
+    /// Returns one flow step, or `None` if absent.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn get_flow_step(
         &self,
         flow_id: &str,
@@ -11253,6 +12035,10 @@ impl JournalStore {
         query_flow_step_by_id(&guard, flow_id, step_id)
     }
 
+    /// Lists a flow's audit events.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_flow_events(
         &self,
         flow_id: &str,
@@ -11283,6 +12069,10 @@ impl JournalStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(JournalError::from)
     }
 
+    /// Lists a flow's revision history.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_flow_revisions(
         &self,
         flow_id: &str,
@@ -11308,6 +12098,13 @@ impl JournalStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(JournalError::from)
     }
 
+    /// Transitions a flow's state with optimistic revision checking and writes the
+    /// audit event.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::FlowNotFound`] or
+    /// [`JournalError::FlowRevisionConflict`], or [`JournalError`] on storage
+    /// failure.
     pub fn transition_flow(
         &self,
         request: &FlowTransitionRequest,
@@ -11418,6 +12215,11 @@ impl JournalStore {
             .ok_or_else(|| JournalError::FlowNotFound { flow_id: request.flow_id.clone() })
     }
 
+    /// Applies a partial step update and writes the audit event.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::FlowNotFound`] or [`JournalError::FlowStepNotFound`],
+    /// or [`JournalError`] on storage failure.
     pub fn update_flow_step(
         &self,
         request: &FlowStepUpdateRequest,
@@ -11565,6 +12367,10 @@ impl JournalStore {
         })
     }
 
+    /// Creates or refreshes a learning candidate, deduplicating by key.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn upsert_learning_candidate(
         &self,
         request: &LearningCandidateCreateRequest,
@@ -11650,6 +12456,11 @@ impl JournalStore {
         })
     }
 
+    /// Records a review decision and appends candidate history.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::LearningCandidateNotFound`], or [`JournalError`] on
+    /// storage failure.
     pub fn review_learning_candidate(
         &self,
         request: &LearningCandidateReviewRequest,
@@ -11722,6 +12533,10 @@ impl JournalStore {
         )
     }
 
+    /// Lists learning candidates matching the filter.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_learning_candidates(
         &self,
         filter: &LearningCandidateListFilter,
@@ -11798,6 +12613,10 @@ impl JournalStore {
         Ok(records)
     }
 
+    /// Lists review history for a learning candidate.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn learning_candidate_history(
         &self,
         candidate_id: &str,
@@ -11826,6 +12645,10 @@ impl JournalStore {
         Ok(records)
     }
 
+    /// Creates or updates a learned preference for a scope and key.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn upsert_learning_preference(
         &self,
         request: &LearningPreferenceUpsertRequest,
@@ -11892,6 +12715,10 @@ impl JournalStore {
         .ok_or(JournalError::LearningPreferenceNotFound { preference_id })
     }
 
+    /// Lists learned preferences matching the filter.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_learning_preferences(
         &self,
         filter: &LearningPreferenceListFilter,
@@ -11945,6 +12772,11 @@ impl JournalStore {
         Ok(records)
     }
 
+    /// Creates a cron job.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::DuplicateCronJobId`], or [`JournalError`] on storage
+    /// failure.
     pub fn create_cron_job(
         &self,
         request: &CronJobCreateRequest,
@@ -12006,8 +12838,7 @@ impl JournalStore {
                         || error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
                         || message
                             .as_deref()
-                            .map(|value| value.contains("cron_jobs.job_ulid"))
-                            .unwrap_or(false)) =>
+                            .is_some_and(|value| value.contains("cron_jobs.job_ulid"))) =>
             {
                 return Err(JournalError::DuplicateCronJobId {
                     job_id: request.job_id.clone(),
@@ -12019,6 +12850,11 @@ impl JournalStore {
             .ok_or_else(|| JournalError::CronJobNotFound { job_id: request.job_id.clone() })
     }
 
+    /// Applies a partial update to a cron job.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::CronJobNotFound`], or [`JournalError`] on storage
+    /// failure.
     pub fn update_cron_job(
         &self,
         job_id: &str,
@@ -12096,6 +12932,11 @@ impl JournalStore {
             .ok_or_else(|| JournalError::CronJobNotFound { job_id: job_id.to_owned() })
     }
 
+    /// Deletes a cron job; returns whether a row was removed.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::CronJobHasActiveRuns`] if a run is still active, or
+    /// [`JournalError`] on storage failure.
     pub fn delete_cron_job(&self, job_id: &str) -> Result<bool, JournalError> {
         let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let transaction = guard.transaction()?;
@@ -12120,11 +12961,19 @@ impl JournalStore {
         Ok(deleted > 0)
     }
 
+    /// Returns a cron job, or `None` if absent.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn cron_job(&self, job_id: &str) -> Result<Option<CronJobRecord>, JournalError> {
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         load_cron_job_by_id(&guard, job_id)
     }
 
+    /// Lists cron jobs matching the filter.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_cron_jobs(
         &self,
         filter: CronJobsListFilter<'_>,
@@ -12179,6 +13028,10 @@ impl JournalStore {
         Ok(jobs)
     }
 
+    /// Lists enabled jobs due to run at or before `now_unix_ms`.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_due_cron_jobs(
         &self,
         now_unix_ms: i64,
@@ -12226,6 +13079,10 @@ impl JournalStore {
         Ok(jobs)
     }
 
+    /// Returns the earliest next-run time among enabled jobs, if any.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn first_due_cron_job_time(&self) -> Result<Option<i64>, JournalError> {
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let due = guard
@@ -12245,6 +13102,11 @@ impl JournalStore {
         Ok(due)
     }
 
+    /// Sets a job's next scheduled run time (and optionally its last-run stamp).
+    ///
+    /// # Errors
+    /// Returns [`JournalError::CronJobNotFound`], or [`JournalError`] on storage
+    /// failure.
     pub fn set_cron_job_next_run(
         &self,
         job_id: &str,
@@ -12270,6 +13132,11 @@ impl JournalStore {
         Ok(())
     }
 
+    /// Sets a job's queued-run flag.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::CronJobNotFound`], or [`JournalError`] on storage
+    /// failure.
     pub fn set_cron_job_queue_state(
         &self,
         job_id: &str,
@@ -12293,6 +13160,12 @@ impl JournalStore {
         Ok(())
     }
 
+    /// Records the start (or immediate denial/skip) of a cron run and stamps the
+    /// job's last-run time.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::DuplicateCronRunId`] or
+    /// [`JournalError::CronJobNotFound`], or [`JournalError`] on storage failure.
     pub fn start_cron_run(&self, request: &CronRunStartRequest) -> Result<(), JournalError> {
         let now = current_unix_ms()?;
         let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
@@ -12339,8 +13212,7 @@ impl JournalStore {
                         || error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
                         || message
                             .as_deref()
-                            .map(|value| value.contains("cron_runs.run_ulid"))
-                            .unwrap_or(false)) =>
+                            .is_some_and(|value| value.contains("cron_runs.run_ulid"))) =>
             {
                 return Err(JournalError::DuplicateCronRunId { run_id: request.run_id.clone() });
             }
@@ -12363,6 +13235,11 @@ impl JournalStore {
         Ok(())
     }
 
+    /// Records a cron run's terminal status and usage counters.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::CronRunNotFound`], or [`JournalError`] on storage
+    /// failure.
     pub fn finalize_cron_run(&self, request: &CronRunFinalizeRequest) -> Result<(), JournalError> {
         let now = current_unix_ms()?;
         let finished_at = if request.status.is_active() { None } else { Some(now) };
@@ -12405,11 +13282,19 @@ impl JournalStore {
         Ok(())
     }
 
+    /// Returns a cron run, or `None` if absent.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn cron_run(&self, run_id: &str) -> Result<Option<CronRunRecord>, JournalError> {
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         load_cron_run_by_id(&guard, run_id)
     }
 
+    /// Returns a job's currently active run, if any.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn active_cron_run_for_job(
         &self,
         job_id: &str,
@@ -12444,6 +13329,10 @@ impl JournalStore {
         statement.query_row(params![job_id], map_cron_run_row).optional().map_err(Into::into)
     }
 
+    /// Lists cron runs matching the filter.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_cron_runs(
         &self,
         filter: CronRunsListFilter<'_>,
@@ -12493,6 +13382,11 @@ impl JournalStore {
         Ok(runs)
     }
 
+    /// Persists a pending approval.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::DuplicateApprovalId`], or [`JournalError`] on storage
+    /// failure.
     pub fn create_approval(
         &self,
         request: &ApprovalCreateRequest,
@@ -12553,8 +13447,7 @@ impl JournalStore {
                         || error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
                         || message
                             .as_deref()
-                            .map(|value| value.contains("approvals.approval_ulid"))
-                            .unwrap_or(false)) =>
+                            .is_some_and(|value| value.contains("approvals.approval_ulid"))) =>
             {
                 return Err(JournalError::DuplicateApprovalId {
                     approval_id: request.approval_id.clone(),
@@ -12567,6 +13460,13 @@ impl JournalStore {
         })
     }
 
+    /// Records the decision for a pending approval; the first decision wins,
+    /// and re-resolving an already decided approval returns the stored record
+    /// unchanged.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::ApprovalNotFound`], or [`JournalError`] on storage
+    /// failure.
     pub fn resolve_approval(
         &self,
         request: &ApprovalResolveRequest,
@@ -12609,11 +13509,19 @@ impl JournalStore {
         Ok(record)
     }
 
+    /// Returns an approval, or `None` if absent.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn approval(&self, approval_id: &str) -> Result<Option<ApprovalRecord>, JournalError> {
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         load_approval_by_id(&guard, approval_id)
     }
 
+    /// Lists approvals matching the filter.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_approvals(
         &self,
         filter: ApprovalsListFilter<'_>,
@@ -12672,6 +13580,10 @@ impl JournalStore {
         Ok(records)
     }
 
+    /// Inserts or updates the execution status of a skill version.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn upsert_skill_status(
         &self,
         request: &SkillStatusUpsertRequest,
@@ -12717,6 +13629,10 @@ impl JournalStore {
             .ok_or(JournalError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
     }
 
+    /// Returns the status row for a skill id and version, if any.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn skill_status(
         &self,
         skill_id: &str,
@@ -12726,6 +13642,10 @@ impl JournalStore {
         load_skill_status_by_key(&guard, skill_id, version)
     }
 
+    /// Returns the most recently updated status for a skill id, if any.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn latest_skill_status(
         &self,
         skill_id: &str,
@@ -12734,6 +13654,14 @@ impl JournalStore {
         load_latest_skill_status_by_id(&guard, skill_id)
     }
 
+    /// Validates and stores a canvas patch plus the resulting snapshot in one
+    /// transaction.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::InvalidCanvasReplay`] for version/limit violations,
+    /// [`JournalError::PayloadTooLarge`], or
+    /// [`JournalError::DuplicateCanvasStateVersion`], or [`JournalError`] on storage
+    /// failure.
     pub fn record_canvas_state_transition(
         &self,
         request: &CanvasStateTransitionRequest,
@@ -12861,10 +13789,9 @@ impl JournalStore {
                 if error.code == ErrorCode::ConstraintViolation
                     && (error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
                         || error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
-                        || message
-                            .as_deref()
-                            .map(|value| value.contains("canvas_state_patches.canvas_ulid"))
-                            .unwrap_or(false)) =>
+                        || message.as_deref().is_some_and(|value| {
+                            value.contains("canvas_state_patches.canvas_ulid")
+                        })) =>
             {
                 return Err(JournalError::DuplicateCanvasStateVersion {
                     canvas_id: request.canvas_id.clone(),
@@ -12928,6 +13855,10 @@ impl JournalStore {
         })
     }
 
+    /// Returns a canvas's latest snapshot, or `None` if absent.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn canvas_state_snapshot(
         &self,
         canvas_id: &str,
@@ -12936,6 +13867,10 @@ impl JournalStore {
         load_canvas_state_snapshot_by_id(&guard, canvas_id)
     }
 
+    /// Lists the most recently updated canvas snapshots.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_canvas_state_snapshots(
         &self,
         limit: usize,
@@ -12971,6 +13906,10 @@ impl JournalStore {
         Ok(records)
     }
 
+    /// Lists a canvas's patches after the given state version, ascending.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_canvas_state_patches(
         &self,
         canvas_id: &str,
@@ -13009,6 +13948,10 @@ impl JournalStore {
         Ok(records)
     }
 
+    /// Lists a canvas's most recent patches, returned in ascending version order.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_recent_canvas_state_patches(
         &self,
         canvas_id: &str,
@@ -13046,6 +13989,10 @@ impl JournalStore {
         Ok(records)
     }
 
+    /// Returns the patch at a specific state version, if any.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn get_canvas_state_patch(
         &self,
         canvas_id: &str,
@@ -13078,6 +14025,12 @@ impl JournalStore {
         Ok(rows.next()?.map(map_canvas_state_patch_row).transpose()?)
     }
 
+    /// Rebuilds canvas state by replaying every patch, verifying each base version
+    /// and resulting state along the way; returns `None` for an unknown canvas.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::InvalidCanvasReplay`] when the patch log is
+    /// inconsistent, or [`JournalError`] on storage failure.
     pub fn replay_canvas_state(
         &self,
         canvas_id: &str,
@@ -13177,6 +14130,12 @@ impl JournalStore {
         }))
     }
 
+    /// Stores a memory item (normalized, secret-redacted, content-hashed) together
+    /// with its embedding vector, then purges expired items.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::DuplicateMemoryId`], or [`JournalError`] on storage
+    /// failure.
     pub fn create_memory_item(
         &self,
         request: &MemoryItemCreateRequest,
@@ -13234,8 +14193,7 @@ impl JournalStore {
                         || error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
                         || message
                             .as_deref()
-                            .map(|value| value.contains("memory_items.memory_ulid"))
-                            .unwrap_or(false)) =>
+                            .is_some_and(|value| value.contains("memory_items.memory_ulid"))) =>
             {
                 return Err(JournalError::DuplicateMemoryId {
                     memory_id: request.memory_id.clone(),
@@ -13281,6 +14239,10 @@ impl JournalStore {
             .ok_or_else(|| JournalError::MemoryNotFound { memory_id: request.memory_id.clone() })
     }
 
+    /// Returns a memory item (after purging expired items), or `None`.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn memory_item(&self, memory_id: &str) -> Result<Option<MemoryItemRecord>, JournalError> {
         let now = current_unix_ms()?;
         self.purge_expired_memory_items(now)?;
@@ -13288,6 +14250,11 @@ impl JournalStore {
         load_memory_item_by_id(&guard, memory_id, now)
     }
 
+    /// Updates content, tags, and TTL of a scoped memory item and re-embeds it;
+    /// returns `None` when the item is absent or out of scope.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn update_memory_item_lifecycle(
         &self,
         request: &MemoryItemLifecycleUpdateRequest,
@@ -13396,6 +14363,10 @@ impl JournalStore {
         load_memory_item_by_id(&guard, request.memory_id.as_str(), now)
     }
 
+    /// Deletes a scoped memory item; returns whether a row was removed.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn delete_memory_item(
         &self,
         memory_id: &str,
@@ -13415,6 +14386,10 @@ impl JournalStore {
         Ok(deleted > 0)
     }
 
+    /// Lists scoped memory items, purging expired items first.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_memory_items(
         &self,
         filter: &MemoryItemsListFilter,
@@ -13476,6 +14451,10 @@ impl JournalStore {
         Ok(items)
     }
 
+    /// Deletes memory items in the requested scope; returns the number removed.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn purge_memory(&self, request: &MemoryPurgeRequest) -> Result<u64, JournalError> {
         let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let transaction = guard.transaction()?;
@@ -13516,6 +14495,10 @@ impl JournalStore {
         Ok((deleted_memory as u64).saturating_add(deleted_artifacts))
     }
 
+    /// Deletes memory items whose TTL elapsed; returns the number removed.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn purge_expired_memory_items(&self, now_unix_ms: i64) -> Result<u64, JournalError> {
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let deleted = guard.execute(
@@ -13525,6 +14508,10 @@ impl JournalStore {
         Ok(deleted as u64)
     }
 
+    /// Returns memory usage plus maintenance and vacuum bookkeeping.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn memory_maintenance_status(&self) -> Result<MemoryMaintenanceStatus, JournalError> {
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let usage = query_memory_usage_snapshot(&guard)?;
@@ -13549,6 +14536,11 @@ impl JournalStore {
         })
     }
 
+    /// Reports embedding coverage, quality classification, and remediation
+    /// guidance.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn memory_embeddings_status(&self) -> Result<MemoryEmbeddingsStatus, JournalError> {
         let now = current_unix_ms()?;
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
@@ -13590,6 +14582,11 @@ impl JournalStore {
         })
     }
 
+    /// Applies retention (TTL, entry, and byte caps) to memory items and recall
+    /// artifacts, optionally VACUUMs, and persists the maintenance bookkeeping.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn run_memory_maintenance(
         &self,
         request: &MemoryMaintenanceRequest,
@@ -13681,6 +14678,11 @@ impl JournalStore {
         })
     }
 
+    /// Re-embeds one batch of memory items still pending the target embedding
+    /// model/version; returns progress counters.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn run_memory_embeddings_backfill(
         &self,
         batch_size: usize,
@@ -13804,6 +14806,11 @@ impl JournalStore {
         })
     }
 
+    /// Runs scoped hybrid memory retrieval (FTS plus vector scan) and returns raw
+    /// candidates with branch diagnostics.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn search_memory_candidate_outcome(
         &self,
         request: &MemorySearchRequest,
@@ -14108,6 +15115,10 @@ impl JournalStore {
         })
     }
 
+    /// Returns just the candidates from [`Self::search_memory_candidate_outcome`].
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn search_memory_candidates(
         &self,
         request: &MemorySearchRequest,
@@ -14115,6 +15126,11 @@ impl JournalStore {
         Ok(self.search_memory_candidate_outcome(request)?.candidates)
     }
 
+    /// Runs hybrid memory retrieval and fuses signals (0.55 lexical, 0.35 vector,
+    /// 0.10 recency) into scored hits filtered by `min_score`.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     #[allow(dead_code)]
     pub fn search_memory(
         &self,
@@ -14166,6 +15182,14 @@ impl JournalStore {
         Ok(hits)
     }
 
+    /// Creates or updates a workspace document: validates path and content, scans
+    /// for prompt injection, appends a version row, and reindexes search chunks.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::InvalidWorkspacePath`],
+    /// [`JournalError::InvalidWorkspaceContent`], or
+    /// [`JournalError::DuplicateWorkspacePath`], or [`JournalError`] on storage
+    /// failure.
     pub fn upsert_workspace_document(
         &self,
         request: &WorkspaceDocumentWriteRequest,
@@ -14391,6 +15415,10 @@ impl JournalStore {
             .ok_or(JournalError::WorkspaceDocumentNotFound { path: path_info.normalized_path })
     }
 
+    /// Returns a scoped document by path, or `None`.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn workspace_document_by_path(
         &self,
         principal: &str,
@@ -14412,6 +15440,10 @@ impl JournalStore {
         )
     }
 
+    /// Returns a document by id, or `None`.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn workspace_document_by_id(
         &self,
         principal: &str,
@@ -14439,6 +15471,10 @@ impl JournalStore {
         Ok(Some(document))
     }
 
+    /// Lists scoped documents, optionally filtered by path prefix.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_workspace_documents(
         &self,
         filter: &WorkspaceDocumentListFilter,
@@ -14502,6 +15538,10 @@ impl JournalStore {
         Ok(records)
     }
 
+    /// Lists a document's version history.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn list_workspace_document_versions(
         &self,
         document_id: &str,
@@ -14541,6 +15581,13 @@ impl JournalStore {
         Ok(versions)
     }
 
+    /// Renames a document's path and records a move version.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::WorkspaceDocumentNotFound`],
+    /// [`JournalError::DuplicateWorkspacePath`], or
+    /// [`JournalError::InvalidWorkspacePath`], or [`JournalError`] on storage
+    /// failure.
     pub fn move_workspace_document(
         &self,
         request: &WorkspaceDocumentMoveRequest,
@@ -14659,6 +15706,11 @@ impl JournalStore {
             .ok_or(JournalError::WorkspaceDocumentNotFound { path: current_path.normalized_path })
     }
 
+    /// Soft-deletes a document and records a delete version.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::WorkspaceDocumentNotFound`], or [`JournalError`] on
+    /// storage failure.
     pub fn soft_delete_workspace_document(
         &self,
         request: &WorkspaceDocumentDeleteRequest,
@@ -14742,6 +15794,11 @@ impl JournalStore {
             .ok_or(JournalError::WorkspaceDocumentNotFound { path: path_info.normalized_path })
     }
 
+    /// Sets a document's pinned flag; returns the updated record, or `None` when
+    /// the document is absent.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn set_workspace_document_pinned(
         &self,
         principal: &str,
@@ -14776,6 +15833,10 @@ impl JournalStore {
         )
     }
 
+    /// Stamps a document's last-recalled time; unknown ids are a silent no-op.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn record_workspace_document_recall(
         &self,
         document_id: &str,
@@ -14789,6 +15850,11 @@ impl JournalStore {
         Ok(())
     }
 
+    /// Seeds or repairs curated workspace templates for a scope; returns the paths
+    /// touched.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage write fails.
     pub fn bootstrap_workspace(
         &self,
         request: &WorkspaceBootstrapRequest,
@@ -14850,6 +15916,11 @@ impl JournalStore {
         })
     }
 
+    /// Runs scoped hybrid workspace retrieval over document chunks and returns raw
+    /// candidates with branch diagnostics.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn search_workspace_candidate_outcome(
         &self,
         request: &WorkspaceSearchRequest,
@@ -15171,6 +16242,11 @@ impl JournalStore {
         })
     }
 
+    /// Returns just the candidates from
+    /// [`Self::search_workspace_candidate_outcome`].
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     pub fn search_workspace_candidates(
         &self,
         request: &WorkspaceSearchRequest,
@@ -15178,6 +16254,11 @@ impl JournalStore {
         Ok(self.search_workspace_candidate_outcome(request)?.candidates)
     }
 
+    /// Runs hybrid workspace retrieval and fuses signals into scored hits filtered
+    /// by `min_score`.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
     #[allow(dead_code)]
     pub fn search_workspace_documents(
         &self,
@@ -15242,6 +16323,9 @@ impl JournalStore {
         Ok(hits)
     }
 }
+
+// Free helper functions: workspace chunking and retrieval, session hydration
+// and transcript search, usage queries, and per-table row mappers.
 
 fn workspace_candidate_key(document_id: &str, version: i64, chunk_index: usize) -> String {
     format!("{document_id}:{version}:{chunk_index}")
@@ -15386,6 +16470,7 @@ struct WorkspaceChunkReindexArgs<'a> {
     embedding_dims: usize,
 }
 
+/// Restricts `path` to owner-only access on Unix; the non-Unix twin is a no-op.
 #[cfg(unix)]
 fn enforce_owner_only_permissions(path: &Path, mode: u32) -> Result<(), JournalError> {
     fs::set_permissions(path, fs::Permissions::from_mode(mode))
@@ -15411,6 +16496,8 @@ fn workspace_title_from_path(path: &str) -> String {
         .replace(['-', '_'], " ")
 }
 
+/// Splits document text into roughly 1 KiB chunks with a small overlap so
+/// matches near chunk borders are not lost.
 fn workspace_text_chunks(content_text: &str) -> Vec<String> {
     let trimmed = content_text.trim();
     if trimmed.is_empty() {
@@ -16742,6 +17829,7 @@ fn excerpt_text(text: &str, focus_byte_index: usize, max_chars: usize) -> String
     excerpt
 }
 
+/// Escapes `%`, `_`, and `\` for use in a SQL LIKE pattern with `ESCAPE '\'`.
 fn escape_sql_like(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for ch in value.chars() {
@@ -18006,6 +19094,8 @@ fn bool_to_sqlite(value: bool) -> i64 {
     }
 }
 
+/// Converts to `i64` for SQLite storage, failing with `InvalidArgument` instead
+/// of wrapping when the value exceeds `i64::MAX`.
 fn u64_to_sqlite(value: u64, field_name: &'static str) -> Result<i64, JournalError> {
     i64::try_from(value).map_err(|_| {
         rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
@@ -18016,6 +19106,7 @@ fn u64_to_sqlite(value: u64, field_name: &'static str) -> Result<i64, JournalErr
     })
 }
 
+/// Validates that `raw` parses as JSON.
 fn ensure_json_field(raw: &str, field: &'static str) -> Result<(), JournalError> {
     serde_json::from_str::<Value>(raw).map(|_| ()).map_err(|error| {
         JournalError::InvalidArgument(format!("{field} must be valid JSON: {error}"))
@@ -18281,6 +19372,7 @@ fn nonnegative_i64_to_u64(value: i64) -> Option<u64> {
     (value >= 0).then_some(value as u64)
 }
 
+/// Inserts or refreshes the built-in model pricing rows (idempotent upsert).
 fn seed_usage_pricing_catalog(connection: &mut Connection) -> Result<(), JournalError> {
     let existing_count: i64 =
         connection.query_row("SELECT COUNT(*) FROM usage_pricing_catalog", [], |row| row.get(0))?;
@@ -19733,6 +20825,8 @@ fn sha256_hex(payload: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Deterministic fallback embedding: hashes each token into a bucket with a
+/// signed magnitude, then L2-normalizes the vector.
 fn hash_embed_text(text: &str, dims: usize) -> Vec<f32> {
     let mut vector = vec![0_f32; dims];
     if dims == 0 {
@@ -19753,6 +20847,7 @@ fn hash_embed_text(text: &str, dims: usize) -> Vec<f32> {
     vector
 }
 
+/// Pads or truncates the vector to `expected_dims`, then re-normalizes.
 fn normalize_embedding_dimensions(mut vector: Vec<f32>, expected_dims: usize) -> Vec<f32> {
     if expected_dims == 0 {
         return Vec::new();
@@ -19808,6 +20903,8 @@ fn decode_vector_blob(blob: &[u8], dims: usize) -> Vec<f32> {
     vector
 }
 
+/// Applies pending schema migrations in version order, each in its own
+/// transaction, recording applied versions in `schema_migrations`.
 fn apply_migrations(connection: &mut Connection) -> Result<(), JournalError> {
     connection.execute_batch(
         r#"
@@ -19843,6 +20940,13 @@ fn apply_migrations(connection: &mut Connection) -> Result<(), JournalError> {
     Ok(())
 }
 
+// Payload sanitization and secret redaction. Everything persisted by this
+// module (journal events, tape, lifecycle payloads, artifacts, memory text)
+// funnels through sanitize_payload/redact_value before hitting SQLite.
+
+/// Sanitizes an event payload for persistence; returns the JSON text plus a
+/// flag reporting whether anything was redacted. Binary or non-JSON payloads
+/// are replaced wholesale by a redaction stub.
 fn sanitize_payload(raw_payload: &[u8]) -> Result<(String, bool), JournalError> {
     if raw_payload.is_empty() {
         return Ok(("{}".to_owned(), false));
@@ -19882,6 +20986,12 @@ fn sanitize_payload(raw_payload: &[u8]) -> Result<(String, bool), JournalError> 
     Ok((serde_json::to_string(&value)?, redacted))
 }
 
+/// Returns the secret-redacted JSON form of a raw payload, replacing binary or
+/// non-JSON input with a redaction stub.
+///
+/// # Errors
+/// Returns [`JournalError::SerializePayload`] if the sanitized value cannot be
+/// re-serialized.
 pub fn redact_payload_json(raw_payload: &[u8]) -> Result<String, JournalError> {
     let (payload, _) = sanitize_payload(raw_payload)?;
     Ok(payload)
@@ -19899,6 +21009,8 @@ fn sanitize_object_text_field(key: &str, value: &str) -> Result<String, JournalE
     Ok(sanitized)
 }
 
+/// Recursively masks sensitive keys, secret-looking strings, and embedded JSON;
+/// returns whether anything was redacted.
 fn redact_value(value: &mut Value, key_context: Option<&str>) -> bool {
     match value {
         Value::Object(object) => {
@@ -19921,7 +21033,7 @@ fn redact_value(value: &mut Value, key_context: Option<&str>) -> bool {
             redacted
         }
         Value::String(text) => {
-            if key_context.map(is_sensitive_key).unwrap_or(false) {
+            if key_context.is_some_and(is_sensitive_key) {
                 *value = Value::String(REDACTED_MARKER.to_owned());
                 return true;
             }
@@ -19949,7 +21061,7 @@ fn redact_value(value: &mut Value, key_context: Option<&str>) -> bool {
 
             false
         }
-        _ => key_context.map(is_sensitive_key).unwrap_or(false),
+        _ => key_context.is_some_and(is_sensitive_key),
     }
 }
 
@@ -20111,6 +21223,11 @@ fn redact_error_text(input: &str) -> String {
     crate::model_provider::sanitize_remote_error(trimmed)
 }
 
+/// Computes a journal event's chain hash from the previous hash, the identity
+/// fields, and the sanitized payload.
+// INTENTIONAL: the field order and `|` separators below are the persisted
+// hash-chain preimage. Changing them invalidates verification of every
+// existing journal; treat this layout as a frozen on-disk format.
 fn compute_hash(
     prev_hash: Option<&str>,
     request: &JournalAppendRequest,
@@ -20157,6 +21274,8 @@ fn ratio_bps(numerator: u64, denominator: u64) -> u64 {
     ((u128::from(numerator) * 10_000) / u128::from(denominator)).min(10_000) as u64
 }
 
+/// Restore success rate in basis points; vacuously 100% when nothing was
+/// restored.
 fn restore_success_rate_bps(succeeded: u64, total: u64) -> u64 {
     if total == 0 {
         return 10_000;
