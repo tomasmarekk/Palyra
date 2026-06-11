@@ -1,3 +1,17 @@
+//! Background task queue for orchestrator auxiliary and delegated work.
+//!
+//! A single polling loop (`spawn_background_queue_loop`) leases non-terminal
+//! `OrchestratorBackgroundTaskRecord` rows, enforces delegation scheduler
+//! limits (lineage depth, fan-out, concurrency, serial ordering), and
+//! dispatches work either to in-process executors (reflection, auxiliary task
+//! kinds) or as child gateway runs supervised over a RunStream. Child
+//! lifecycle progress is mirrored onto the parent run tape under throttles
+//! and budgets; delegated children additionally produce a merge result.
+//!
+//! Terminal task states (succeeded/failed/cancelled/expired) are persisted
+//! back through `GatewayRuntimeState`; retry accounting lives in the task
+//! record's `attempt_count`/`max_attempts`.
+
 #![allow(clippy::result_large_err)]
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -54,14 +68,26 @@ use crate::{
 
 const BACKGROUND_QUEUE_IDLE_SLEEP: Duration = Duration::from_secs(3);
 const DEFAULT_BACKGROUND_CHANNEL: &str = "console:background";
+// Throttle for mirroring non-terminal child progress onto the parent tape.
 const CHILD_PROGRESS_MIN_INTERVAL_MS: i64 = 2_000;
 const CHILD_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+// Hard caps on child events mirrored to one parent tape; once exceeded, a
+// single compaction notice is emitted and further events of that kind drop.
 const CHILD_PARENT_PROGRESS_TAPE_EVENT_LIMIT: usize = 1_024;
 const CHILD_PARENT_HEARTBEAT_TAPE_EVENT_LIMIT: usize = 240;
 const CHILD_PROGRESS_HISTORY_LIMIT: usize = 64;
+// RunStream accepts a request before the child run row is persisted; attach
+// polls briefly so target_run_id never references a missing run.
 const CHILD_RUN_ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
 const CHILD_RUN_ATTACH_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
+/// Spawns the background queue polling loop on the Tokio runtime.
+///
+/// Polls every `BACKGROUND_QUEUE_IDLE_SLEEP` for non-terminal background
+/// tasks, advances each through its lifecycle (expiry, cancellation sync,
+/// delegation limits, dispatch), and drives the flow coordinator. Poll
+/// errors are logged and retried on the next tick; the loop runs until the
+/// returned handle is aborted.
 pub(crate) fn spawn_background_queue_loop(
     runtime: Arc<GatewayRuntimeState>,
     auth: GatewayAuthConfig,
@@ -77,6 +103,12 @@ pub(crate) fn spawn_background_queue_loop(
     })
 }
 
+/// One poll pass: lists non-terminal tasks and advances each one.
+///
+/// Tasks are processed in list order; after each task the in-memory snapshot
+/// is refreshed so later siblings observe the state transition (delegation
+/// limits and serial ordering depend on this). A task failure is recorded on
+/// that task and does not abort the rest of the pass.
 async fn poll_background_queue(
     runtime: &Arc<GatewayRuntimeState>,
     auth: &GatewayAuthConfig,
@@ -92,6 +124,8 @@ async fn poll_background_queue(
             limit: 256,
         })
         .await?;
+    // Indexed loop because the snapshot vector is refreshed in place after
+    // each task; an iterator would hold a borrow across the await points.
     for index in 0..tasks.len() {
         let task = tasks[index].clone();
         if let Err(error) =
@@ -140,6 +174,11 @@ async fn poll_background_queue(
     Ok(())
 }
 
+/// Advances a single task one lifecycle step.
+///
+/// Gate order: terminal/paused cleanup, expiry, parent-cancel sync, pending
+/// cancellation, running-run supervision, retry budget, delegation scheduler
+/// limits, serial sibling ordering, and finally dispatch.
 async fn process_background_task(
     runtime: &Arc<GatewayRuntimeState>,
     auth: &GatewayAuthConfig,
@@ -200,13 +239,12 @@ async fn process_background_task(
         == Some(AuxiliaryTaskState::CancelRequested)
     {
         if let Some(target_run_id) = task.target_run_id.as_deref() {
+            // The run cancel was already requested; finalize only once the
+            // run is terminal. A missing snapshot counts as terminal because
+            // nothing else can ever resolve the cancellation.
             let snapshot =
                 runtime.orchestrator_run_status_snapshot(target_run_id.to_owned()).await?;
-            if snapshot
-                .as_ref()
-                .map(|run| is_terminal_run_state(run.state.as_str()))
-                .unwrap_or(true)
-            {
+            if snapshot.as_ref().is_none_or(|run| is_terminal_run_state(run.state.as_str())) {
                 finalize_task_from_run(runtime, task, snapshot.as_ref(), "cancelled").await?;
             }
         } else {
@@ -258,6 +296,7 @@ async fn process_background_task(
         }
         return Ok(());
     }
+    // max_attempts == 0 means unlimited retries.
     if task.max_attempts > 0 && task.attempt_count >= task.max_attempts {
         runtime
             .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
@@ -311,6 +350,7 @@ async fn process_background_task(
     dispatch_background_task(runtime, auth, grpc_url, task).await
 }
 
+/// Re-reads one task from the journal into the local poll snapshot.
 async fn refresh_background_task_snapshot(
     runtime: &Arc<GatewayRuntimeState>,
     tasks: &mut [OrchestratorBackgroundTaskRecord],
@@ -334,6 +374,9 @@ fn replace_background_task_snapshot(
     }
 }
 
+/// Marks the task running and routes it to the matching executor: reflection
+/// tasks and auxiliary task kinds run in-process; everything else becomes a
+/// child gateway run supervised by `run_background_task_stream`.
 async fn dispatch_background_task(
     runtime: &Arc<GatewayRuntimeState>,
     auth: &GatewayAuthConfig,
@@ -343,16 +386,10 @@ async fn dispatch_background_task(
     let started_at_unix_ms = crate::gateway::current_unix_ms();
     if task.task_kind == REFLECTION_TASK_KIND {
         runtime
-            .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
-                task_id: task.task_id.clone(),
-                state: Some(AuxiliaryTaskState::Running.as_str().to_owned()),
-                target_run_id: Some(None),
-                increment_attempt_count: true,
-                last_error: Some(None),
-                result_json: Some(None),
-                started_at_unix_ms: Some(Some(started_at_unix_ms)),
-                completed_at_unix_ms: Some(None),
-            })
+            .update_orchestrator_background_task(build_background_task_running_update(
+                task.task_id.as_str(),
+                started_at_unix_ms,
+            ))
             .await?;
         let runtime = Arc::clone(runtime);
         let task = task.clone();
@@ -473,6 +510,8 @@ async fn dispatch_background_task(
     Ok(())
 }
 
+/// Runs an auxiliary task kind through the in-process auxiliary executor on
+/// a detached worker; the worker persists the terminal state itself.
 async fn dispatch_auxiliary_executor_task(
     runtime: &Arc<GatewayRuntimeState>,
     task: &OrchestratorBackgroundTaskRecord,
@@ -480,16 +519,10 @@ async fn dispatch_auxiliary_executor_task(
     started_at_unix_ms: i64,
 ) -> Result<(), Status> {
     runtime
-        .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
-            task_id: task.task_id.clone(),
-            state: Some(AuxiliaryTaskState::Running.as_str().to_owned()),
-            target_run_id: Some(None),
-            increment_attempt_count: true,
-            last_error: Some(None),
-            result_json: Some(None),
-            started_at_unix_ms: Some(Some(started_at_unix_ms)),
-            completed_at_unix_ms: Some(None),
-        })
+        .update_orchestrator_background_task(build_background_task_running_update(
+            task.task_id.as_str(),
+            started_at_unix_ms,
+        ))
         .await?;
 
     let runtime = Arc::clone(runtime);
@@ -579,11 +612,20 @@ async fn dispatch_auxiliary_executor_task(
     Ok(())
 }
 
+/// Scheduler verdict for a delegated child: `Defer` keeps it queued
+/// (transient capacity pressure), `Fail` rejects it permanently (structural
+/// limit violated).
 enum DelegationSchedulerDecision {
     Defer { reason: &'static str, message: String },
     Fail { reason: &'static str, message: String },
 }
 
+/// Enforces delegation runtime limits for a queued child.
+///
+/// Structural violations (lineage cycle, max depth, total/per-parent
+/// fan-out) fail closed; capacity pressure (concurrent children, parallel
+/// groups) defers. Counts come from the current poll snapshot, so the
+/// per-task refresh in `poll_background_queue` is what keeps them honest.
 fn evaluate_delegation_scheduler_limits(
     all_tasks: &[OrchestratorBackgroundTaskRecord],
     task: &OrchestratorBackgroundTaskRecord,
@@ -662,6 +704,8 @@ fn evaluate_delegation_scheduler_limits(
                 active_groups.push(group_id);
             }
         }
+        // A group that is already running never blocks its own remaining
+        // members; only opening a new group counts against the limit.
         let current_group_active = active_groups.contains(&delegation.group_id.as_str());
         let active_group_count = u64::try_from(active_groups.len()).unwrap_or(u64::MAX);
         if !current_group_active && active_group_count >= limits.max_parallel_groups {
@@ -678,6 +722,8 @@ fn evaluate_delegation_scheduler_limits(
     None
 }
 
+/// True when walking parent links upward from `parent_run_id` revisits a run
+/// id; `seen` also guards against malformed self-referencing records.
 fn delegated_lineage_has_cycle(
     all_tasks: &[OrchestratorBackgroundTaskRecord],
     parent_run_id: &str,
@@ -697,6 +743,7 @@ fn delegated_lineage_has_cycle(
     false
 }
 
+/// Number of delegation hops above `parent_run_id` (0 for a root parent).
 fn delegated_lineage_depth(
     all_tasks: &[OrchestratorBackgroundTaskRecord],
     parent_run_id: &str,
@@ -718,6 +765,7 @@ fn delegated_lineage_depth(
     depth
 }
 
+/// Topmost run id reachable by walking parent links from `parent_run_id`.
 fn delegated_root_parent_run_id(
     all_tasks: &[OrchestratorBackgroundTaskRecord],
     parent_run_id: &str,
@@ -737,6 +785,8 @@ fn delegated_root_parent_run_id(
     root
 }
 
+/// Finds the delegated task whose child run is `child_run_id`, i.e. the edge
+/// pointing at that run in the lineage graph.
 fn delegated_task_for_child_run<'a>(
     all_tasks: &'a [OrchestratorBackgroundTaskRecord],
     child_run_id: &str,
@@ -746,6 +796,9 @@ fn delegated_task_for_child_run<'a>(
     })
 }
 
+/// Non-terminal delegated descendants under `root_parent_run_id`, counted up
+/// to and including `task` in deterministic FIFO order so the same task
+/// always observes the same total within a snapshot.
 fn delegated_total_child_count_for_root(
     all_tasks: &[OrchestratorBackgroundTaskRecord],
     task: &OrchestratorBackgroundTaskRecord,
@@ -767,6 +820,8 @@ fn delegated_total_child_count_for_root(
     u64::try_from(count).unwrap_or(u64::MAX)
 }
 
+/// 1-based rank of `task` among its parent's non-terminal delegated children
+/// in deterministic FIFO order.
 fn delegated_child_rank_for_parent(
     all_tasks: &[OrchestratorBackgroundTaskRecord],
     task: &OrchestratorBackgroundTaskRecord,
@@ -795,6 +850,8 @@ fn running_delegated_children_for_parent<'a>(
     })
 }
 
+/// Cancel-requested children still hold a concurrency slot while their work
+/// can be in flight (attached run, or executor work without a run yet).
 fn task_counts_as_active_delegated_child(task: &OrchestratorBackgroundTaskRecord) -> bool {
     match AuxiliaryTaskState::from_str(task.state.as_str()) {
         Some(AuxiliaryTaskState::Running) => true,
@@ -805,11 +862,16 @@ fn task_counts_as_active_delegated_child(task: &OrchestratorBackgroundTaskRecord
     }
 }
 
+/// True when a Running task has no child run to supervise because its work
+/// executes in-process (reflection/auxiliary executor); the spawned worker
+/// finalizes the task itself, so the poll loop must leave it alone.
 fn running_task_should_wait_for_in_flight_work(task: &OrchestratorBackgroundTaskRecord) -> bool {
     task.target_run_id.is_none()
         && (task.task_kind == REFLECTION_TASK_KIND || task_has_in_flight_work_without_target(task))
 }
 
+/// Executor-backed work in flight: started, no child run attached, and still
+/// Running or CancelRequested.
 fn task_has_in_flight_work_without_target(task: &OrchestratorBackgroundTaskRecord) -> bool {
     task.target_run_id.is_none()
         && task.started_at_unix_ms.is_some()
@@ -819,6 +881,8 @@ fn task_has_in_flight_work_without_target(task: &OrchestratorBackgroundTaskRecor
         )
 }
 
+/// Deterministic FIFO order (created_at, then task id as tiebreaker);
+/// includes `task` itself so filtered counts behave as 1-based ranks.
 fn task_precedes_or_equals(
     candidate: &OrchestratorBackgroundTaskRecord,
     task: &OrchestratorBackgroundTaskRecord,
@@ -828,12 +892,16 @@ fn task_precedes_or_equals(
             && candidate.task_id.as_str() <= task.task_id.as_str())
 }
 
+/// Records a waiting reason on a deferred delegated child and mirrors it to
+/// the parent tape.
 async fn mark_delegation_task_waiting(
     runtime: &Arc<GatewayRuntimeState>,
     task: &OrchestratorBackgroundTaskRecord,
     reason: &'static str,
     message: String,
 ) -> Result<(), Status> {
+    // Idempotent: the same waiting reason is recorded once, so steady-state
+    // deferral does not spam task updates and parent tape events every poll.
     if task.last_error.as_deref() == Some(message.as_str()) {
         return Ok(());
     }
@@ -873,6 +941,8 @@ async fn mark_delegation_task_waiting(
     .await
 }
 
+/// Fails a delegated child closed (structural limit violated) and mirrors
+/// the failure to the parent tape.
 async fn fail_delegation_task(
     runtime: &Arc<GatewayRuntimeState>,
     task: &OrchestratorBackgroundTaskRecord,
@@ -918,6 +988,8 @@ async fn fail_delegation_task(
     Ok(())
 }
 
+/// Timeout message when the child's wall-clock runtime has exceeded its
+/// delegation limit; `None` while still within budget.
 fn delegated_child_timeout_message(
     task: &OrchestratorBackgroundTaskRecord,
     now_unix_ms: i64,
@@ -934,6 +1006,8 @@ fn delegated_child_timeout_message(
     })
 }
 
+/// Requests cancellation of a timed-out child run and marks the task
+/// cancel-requested; the terminal state lands once the run actually stops.
 async fn request_delegated_child_timeout_cancel(
     runtime: &Arc<GatewayRuntimeState>,
     task: &OrchestratorBackgroundTaskRecord,
@@ -982,6 +1056,10 @@ async fn request_delegated_child_timeout_cancel(
     .await
 }
 
+/// Supervises one child gateway run end to end: opens the RunStream, attaches
+/// the run id to the task, mirrors throttled/budgeted progress onto the
+/// parent tape, builds the delegation merge result, and finalizes the task
+/// from the run's terminal snapshot.
 async fn run_background_task_stream(
     runtime: &Arc<GatewayRuntimeState>,
     auth: &GatewayAuthConfig,
@@ -1074,6 +1152,8 @@ async fn run_background_task_stream(
     let mut parent_tape_budget = ChildLifecycleTapeBudget::default();
     let mut heartbeat = tokio::time::interval(CHILD_HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // An interval's first tick fires immediately; consume it so heartbeats
+    // start one full period from now.
     let _ = heartbeat.tick().await;
     loop {
         tokio::select! {
@@ -1167,6 +1247,8 @@ async fn run_background_task_stream(
                 }
             }
             _ = heartbeat.tick() => {
+                // Defensive exit: if the run reached a terminal state but the
+                // stream stays open, stop supervising instead of hanging.
                 if child_run_is_terminal(runtime, run_id).await? {
                     break;
                 }
@@ -1204,6 +1286,9 @@ async fn run_background_task_stream(
         }
     }
 
+    // The run snapshot is authoritative: persist merge results and the
+    // terminal task state first; a transport error is surfaced as an error
+    // only when no snapshot exists at all.
     let run_snapshot = runtime.orchestrator_run_status_snapshot(run_id.to_owned()).await?;
     if let Some(run) = run_snapshot.as_ref() {
         let run_with_merge = if let Some(delegation) = task.delegation.as_ref() {
@@ -1243,6 +1328,8 @@ async fn run_background_task_stream(
     Err(Status::internal(format!("background run {run_id} finished without a persisted snapshot")))
 }
 
+/// Update that marks a task Running and counts the attempt; `target_run_id`
+/// is reset because the child run does not exist yet (see attach below).
 fn build_background_task_running_update(
     task_id: &str,
     started_at_unix_ms: i64,
@@ -1259,6 +1346,8 @@ fn build_background_task_running_update(
     }
 }
 
+/// Update that attaches the persisted child run id to the task, leaving all
+/// other fields untouched.
 fn build_background_task_child_run_attach_update(
     task_id: &str,
     run_id: &str,
@@ -1270,6 +1359,8 @@ fn build_background_task_child_run_attach_update(
     }
 }
 
+/// Waits for the child run row, attaches it to the task, and emits the spawn
+/// and conversation-binding events.
 async fn attach_background_task_child_run(
     runtime: &Arc<GatewayRuntimeState>,
     task: &OrchestratorBackgroundTaskRecord,
@@ -1286,6 +1377,8 @@ async fn attach_background_task_child_run(
     create_delegated_child_binding(runtime, task, run_id).await
 }
 
+/// Polls until the child run row is persisted or the attach timeout elapses;
+/// the gateway accepts RunStream requests before persisting the run.
 async fn wait_for_background_child_run(
     runtime: &Arc<GatewayRuntimeState>,
     run_id: &str,
@@ -1314,6 +1407,8 @@ async fn child_run_is_terminal(
     Ok(is_terminal_run_state(snapshot.state.as_str()))
 }
 
+/// Records a conversation binding for a delegated child run; no-op for plain
+/// background tasks.
 async fn create_delegated_child_binding(
     runtime: &Arc<GatewayRuntimeState>,
     task: &OrchestratorBackgroundTaskRecord,
@@ -1360,6 +1455,8 @@ async fn create_delegated_child_binding(
     .await
 }
 
+/// Propagates a parent run's cancellation down to this child task; returns
+/// `true` when the task was handled and processing should stop this poll.
 async fn sync_parent_run_cancellation(
     runtime: &Arc<GatewayRuntimeState>,
     task: &OrchestratorBackgroundTaskRecord,
@@ -1449,6 +1546,8 @@ async fn sync_parent_run_cancellation(
     Ok(true)
 }
 
+/// True when an earlier or still-active sibling in the same serial group
+/// must finish before `task` may dispatch.
 fn task_is_blocked_by_serial_sibling(
     all_tasks: &[OrchestratorBackgroundTaskRecord],
     task: &OrchestratorBackgroundTaskRecord,
@@ -1464,12 +1563,16 @@ fn task_is_blocked_by_serial_sibling(
     })
 }
 
+/// The serial group id, when the task participates in serial execution.
 fn delegation_serial_group(task: &OrchestratorBackgroundTaskRecord) -> Option<&str> {
     let delegation = task.delegation.as_ref()?;
     (delegation.execution_mode == DelegationExecutionMode::Serial)
         .then_some(delegation.group_id.as_str())
 }
 
+/// Active siblings always block; queued/paused siblings block only when they
+/// precede `current` in FIFO order. Terminal siblings never block, so one
+/// failure cannot wedge the rest of the group.
 fn serial_sibling_blocks(
     sibling: &OrchestratorBackgroundTaskRecord,
     current: &OrchestratorBackgroundTaskRecord,
@@ -1491,6 +1594,7 @@ fn serial_sibling_blocks(
     }
 }
 
+/// Strict FIFO predecessor test (created_at, then task id tiebreaker).
 fn task_precedes_in_serial_group(
     sibling: &OrchestratorBackgroundTaskRecord,
     current: &OrchestratorBackgroundTaskRecord,
@@ -1500,6 +1604,8 @@ fn task_precedes_in_serial_group(
             && sibling.task_id < current.task_id)
 }
 
+/// Folds a child run's terminal state into the task record and clears the
+/// heartbeat; non-terminal states are a no-op so supervision continues.
 async fn finalize_task_from_run(
     runtime: &Arc<GatewayRuntimeState>,
     task: &OrchestratorBackgroundTaskRecord,
@@ -1545,6 +1651,8 @@ async fn finalize_task_from_run(
     Ok(())
 }
 
+/// Extracts the raw `parameter_delta` object from a task payload as bytes;
+/// empty when the payload or the key is absent.
 fn extract_parameter_delta_bytes(payload_json: Option<&str>) -> Result<Vec<u8>, Status> {
     let Some(payload_json) = payload_json else {
         return Ok(Vec::new());
@@ -1563,9 +1671,13 @@ fn extract_parameter_delta_bytes(payload_json: Option<&str>) -> Result<Vec<u8>, 
     })
 }
 
+/// Merges the task's stored parameter delta with synthesized
+/// `background_task` and delegation context forwarded to the child run.
 fn build_parameter_delta_bytes(task: &OrchestratorBackgroundTaskRecord) -> Result<Vec<u8>, Status> {
     let mut merged = match extract_parameter_delta_value(task.payload_json.as_deref())? {
         Some(Value::Object(object)) => Value::Object(object),
+        // A non-object stored delta cannot take extra keys; preserve it under
+        // a dedicated key instead of dropping it.
         Some(other) => json!({ "prior_parameter_delta": other }),
         None => json!({}),
     };
@@ -1599,6 +1711,7 @@ fn build_parameter_delta_bytes(task: &OrchestratorBackgroundTaskRecord) -> Resul
     })
 }
 
+/// Short objective excerpt used in delegated scope and provenance records.
 fn task_objective(task: &OrchestratorBackgroundTaskRecord) -> String {
     task.input_text
         .as_deref()
@@ -1607,6 +1720,8 @@ fn task_objective(task: &OrchestratorBackgroundTaskRecord) -> String {
         .unwrap_or_else(|| format!("Delegated task {} ({})", task.task_id, task.task_kind))
 }
 
+/// Builds the bounded scope (context/memory refs, tool and skill allowlists)
+/// a delegated child is allowed to operate within.
 fn build_task_delegated_scope(
     task: &OrchestratorBackgroundTaskRecord,
     delegation: &DelegationSnapshot,
@@ -1641,6 +1756,8 @@ fn build_task_delegated_scope(
     })
 }
 
+/// Builds the delegated-run record snapshot emitted with lifecycle events;
+/// requires delegation metadata and a parent run id.
 fn build_task_delegated_record(
     task: &OrchestratorBackgroundTaskRecord,
     child_run_id: Option<&str>,
@@ -1685,6 +1802,7 @@ fn extract_parameter_delta_value(payload_json: Option<&str>) -> Result<Option<Va
     })
 }
 
+/// Parent-tape projection of one child run stream event.
 struct ChildStreamProgress {
     event_type: &'static str,
     child_state: String,
@@ -1692,6 +1810,7 @@ struct ChildStreamProgress {
     details: Value,
 }
 
+/// What to write to the parent tape for one child event.
 #[derive(Debug)]
 enum ChildLifecycleTapeDecision {
     Emit,
@@ -1699,6 +1818,11 @@ enum ChildLifecycleTapeDecision {
     Suppress,
 }
 
+/// Budget for child events mirrored onto a parent tape.
+///
+/// Progress and heartbeats are capped separately; the first overflow of each
+/// kind emits one `*_compacted` notice and everything after it is suppressed.
+/// Terminal progress events bypass the budget so completion is never lost.
 struct ChildLifecycleTapeBudget {
     progress_events: usize,
     heartbeat_events: usize,
@@ -1822,6 +1946,8 @@ fn stream_event_name(details: &Value) -> Option<&str> {
     details.get("stream_event").and_then(Value::as_str)
 }
 
+/// Throttles non-terminal `child_progress` to one parent-tape event per
+/// `CHILD_PROGRESS_MIN_INTERVAL_MS`; all other event types always pass.
 fn should_emit_child_stream_progress(
     progress: &ChildStreamProgress,
     now_unix_ms: i64,
@@ -1857,6 +1983,9 @@ impl ChildStreamProgress {
     }
 }
 
+/// Maps a run stream event to its parent-tape projection; `None` for events
+/// that are never mirrored. Free-text fields are excerpted so tape payloads
+/// stay bounded regardless of stream contents.
 fn summarize_child_stream_event(
     event: &common_v1::RunStreamEvent,
     model_token_chars: &mut usize,
@@ -2010,6 +2139,9 @@ fn tool_decision_kind(raw: i32) -> &'static str {
     }
 }
 
+/// Replays the child run tape into a `DelegationMergeResult`: model output,
+/// tool provenance (trace summary capped at 24 entries), artifact references
+/// (capped at 16), and approval signals, summarized per the merge strategy.
 async fn build_merge_result(
     runtime: &Arc<GatewayRuntimeState>,
     run: &crate::journal::OrchestratorRunStatusSnapshot,
@@ -2186,6 +2318,8 @@ async fn build_merge_result(
     })
 }
 
+/// Depth-first scan for artifact references in tool output JSON; dedupes by
+/// artifact id and stops at 16 references to bound payload size.
 fn append_artifact_references(
     references: &mut Vec<DelegationMergeArtifactReference>,
     value: &Value,
@@ -2237,6 +2371,9 @@ fn append_artifact_references(
     }
 }
 
+/// Best-effort failure taxonomy: structured signals first (cancellation,
+/// approval state, failed tool traces), then substring heuristics over the
+/// error and warning text. `None` for successful runs.
 fn categorize_child_failure(
     run: &crate::journal::OrchestratorRunStatusSnapshot,
     warnings: &[String],
@@ -2280,6 +2417,11 @@ fn categorize_child_failure(
     Some(DelegationMergeFailureCategory::Unknown)
 }
 
+/// Loads the child run tape with bounded pagination (16 pages x 128 events).
+// AIDEV-NOTE: runs with more than 2048 tape events are silently truncated
+// here, so merge results can miss late model output or tool evidence on very
+// chatty children. Raising the bound or streaming the tape would change merge
+// behavior, so it is only flagged.
 async fn load_run_tape(
     runtime: &Arc<GatewayRuntimeState>,
     run_id: &str,
@@ -2333,6 +2475,8 @@ fn build_merge_summary(
     }
 }
 
+/// Emits the `child_run_spawned` parent-tape event plus the matching
+/// `child_started` lifecycle event for a newly attached child run.
 async fn append_parent_spawned_event(
     runtime: &Arc<GatewayRuntimeState>,
     task: &OrchestratorBackgroundTaskRecord,
@@ -2380,6 +2524,11 @@ async fn append_parent_spawned_event(
     .await
 }
 
+/// Emits the merge outcome to the parent tape and the child lifecycle stream.
+///
+/// When delivery arbitration holds the output for final review, the payloads
+/// carry only the hold reason; the merge result itself is withheld until
+/// released (pinned by tests).
 async fn append_parent_merge_event(
     runtime: &Arc<GatewayRuntimeState>,
     task: &OrchestratorBackgroundTaskRecord,
@@ -2475,6 +2624,7 @@ fn delivery_holds_merge_result(decision: &DeliveryDecision) -> bool {
     matches!(decision.action, DeliveryDecisionAction::HoldForReview)
 }
 
+/// Shared inputs for building parent-tape and child-lifecycle merge payloads.
 struct MergeDeliveryPayloadContext<'a> {
     task_id: &'a str,
     child_run_id: &'a str,
@@ -2573,6 +2723,8 @@ async fn evaluate_delivery_arbitration_for_merge(
     Ok((policy, decision))
 }
 
+/// Merge status ladder: failure first, then denied/pending approval, then
+/// merged vs preview depending on the child's terminal state.
 fn merge_status_for_result(
     run: &crate::journal::OrchestratorRunStatusSnapshot,
     merge_result: &DelegationMergeResult,
@@ -2626,6 +2778,8 @@ fn merge_preview_json(
     })
 }
 
+/// Records the delivery arbitration decision as a parent tape event and a
+/// structured runtime decision; no-op while the capability is inactive.
 async fn emit_delivery_arbitration_audit(
     runtime: &Arc<GatewayRuntimeState>,
     task: &OrchestratorBackgroundTaskRecord,
@@ -2705,6 +2859,8 @@ async fn emit_delivery_arbitration_audit(
         .await
 }
 
+/// Appends a normalized child lifecycle event to the parent run tape; no-op
+/// for tasks without a parent run.
 async fn append_child_lifecycle_event(
     runtime: &Arc<GatewayRuntimeState>,
     task: &OrchestratorBackgroundTaskRecord,
@@ -2746,6 +2902,8 @@ async fn append_child_lifecycle_event(
     .await
 }
 
+/// Builds `(delegated_run, graph_explain)` payload snippets for delegated
+/// tasks; `(None, None)` for plain background tasks.
 fn build_optional_delegated_run_context(
     task: &OrchestratorBackgroundTaskRecord,
     parent_run_id: &str,
@@ -2766,6 +2924,12 @@ fn build_optional_delegated_run_context(
     Ok((Some(delegated_run.safe_snapshot_json()), Some(graph_explain)))
 }
 
+/// Appends to the parent tape with optimistic sequencing.
+///
+/// `seq` is the run snapshot's current event count; `AlreadyExists` means a
+/// concurrent writer claimed it, so the snapshot is re-read (3 attempts).
+/// Events are dropped, not errored, when the parent run is missing or still
+/// active.
 async fn append_parent_tape_event(
     runtime: &Arc<GatewayRuntimeState>,
     parent_run_id: &str,
@@ -2804,6 +2968,9 @@ async fn append_parent_tape_event(
     Err(Status::aborted(format!("failed to append parent tape event '{event_type}' after retries")))
 }
 
+/// Background events may only land on a parent tape after the parent run is
+/// terminal; appending earlier would race the orchestrator's own writes for
+/// the same sequence numbers (pinned by tests).
 fn parent_tape_accepts_background_event(parent_run_state: &str) -> bool {
     is_terminal_run_state(parent_run_state)
 }
@@ -2816,6 +2983,8 @@ fn value_excerpt(value: &Value) -> String {
     }
 }
 
+/// Truncates to `max_chars` characters, appending `...` when trimmed (the
+/// result may therefore exceed `max_chars` by the ellipsis).
 fn truncate_excerpt(value: &str, max_chars: usize) -> String {
     let mut excerpt = value.trim().chars().take(max_chars).collect::<String>();
     if value.chars().count() > max_chars {
@@ -2871,6 +3040,9 @@ fn attach_delivery_progress_details(
     }
 }
 
+/// Injects task identity (and admin bearer auth when required) into outgoing
+/// gateway metadata. Blank channels are omitted entirely so the receiver
+/// resolves `RequestContext.channel` to `None` (pinned by tests).
 fn inject_background_metadata(
     metadata: &mut tonic::metadata::MetadataMap,
     auth: &GatewayAuthConfig,
@@ -2933,10 +3105,13 @@ fn run_status_to_json(run: &crate::journal::OrchestratorRunStatusSnapshot) -> Va
     })
 }
 
+/// Terminal background-task states per `AuxiliaryTaskState::is_terminal`.
 fn is_terminal_task_state(state: &str) -> bool {
     AuxiliaryTaskState::from_str(state).is_some_and(AuxiliaryTaskState::is_terminal)
 }
 
+/// Terminal orchestrator run states; the string values are pinned by the
+/// journal layer.
 fn is_terminal_run_state(state: &str) -> bool {
     matches!(state, "done" | "failed" | "cancelled")
 }

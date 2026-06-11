@@ -1,3 +1,17 @@
+//! Cron-style scheduling for daemon routines.
+//!
+//! Owns the scheduler loop (`spawn_scheduler_loop`): parsing and normalizing
+//! `cron`/`every`/`at` schedules (persisted as JSON payloads on `CronJobRecord`
+//! journal rows), computing due ticks and misfire recovery, dispatching runs
+//! through the gateway gRPC surface, and recording per-attempt outcomes as
+//! `CronRunRecord` rows. The same loop hosts the periodic skill re-audit,
+//! memory maintenance, and embeddings backfill ticks.
+//!
+//! Scheduling must stay deterministic: jitter is derived from stable hashes,
+//! recovery reasons are fixed tokens consumed by audits and fixtures, and
+//! `next_run_at_unix_ms` is advanced before dispatch so a due tick fires at
+//! most once across restarts.
+
 #![allow(clippy::result_large_err)]
 
 use std::{
@@ -58,13 +72,22 @@ use crate::{
 
 const SCHEDULER_IDLE_SLEEP: Duration = Duration::from_secs(15);
 const SCHEDULER_MAX_DUE_BATCH: usize = 64;
+// Misfire backlogs larger than this collapse to a single run, or are routed to
+// operator review when the outage is older than the catch-up window below.
 const SCHEDULER_CATCH_UP_MAX_RUNS: usize = 3;
 const SCHEDULER_CATCH_UP_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
+// Active runs without progress for this long are treated as leftovers of a
+// dead daemon process and repaired to Failed on startup.
 const SCHEDULER_STALE_RUN_AFTER_MS: i64 = 30 * 60 * 1_000;
+// Fixed ULID identifying the scheduler itself in journal and audit metadata.
 const SCHEDULER_DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const DEFAULT_CRON_CHANNEL: &str = "system:cron";
+// Bounds the minute-by-minute next-tick scan (~370 days) so expressions with
+// no reachable tick (e.g. "0 0 30 2 *") terminate instead of looping forever.
 const MAX_CRON_LOOKAHEAD_MINUTES: i64 = 60 * 24 * 370;
 const MAX_RETRY_ATTEMPTS: u32 = 16;
+// Caps the per-job configured base backoff, not the exponential product
+// computed in `run_job_with_retries`.
 const MAX_RETRY_BACKOFF_MS: u64 = 60_000;
 const SKILLS_LAYOUT_VERSION: u32 = 1;
 const SKILLS_INDEX_FILE_NAME: &str = "installed-index.json";
@@ -75,7 +98,9 @@ const SKILLS_TRUST_STORE_PATH_ENV: &str = "PALYRA_SKILLS_TRUST_STORE";
 const SKILL_REAUDIT_INTERVAL_ENV: &str = "PALYRA_SKILL_REAUDIT_INTERVAL_MS";
 const DEFAULT_SKILL_REAUDIT_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const SYSTEM_DAEMON_PRINCIPAL: &str = "system:daemon";
+/// Cadence of the memory maintenance tick hosted by the scheduler loop.
 pub const MEMORY_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// Cadence of the memory embeddings backfill tick hosted by the scheduler loop.
 pub const MEMORY_EMBEDDINGS_BACKFILL_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const MEMORY_EMBEDDINGS_BACKFILL_BATCH_SIZE: usize = 64;
 const CRON_MAX_RUNS_EXHAUSTED_ERROR_KIND: &str = "cron_max_runs_exhausted";
@@ -85,6 +110,11 @@ const OBJECTIVE_BUDGET_EXHAUSTED_ACTION: &str = "budget_exhausted";
 const ROUTINE_APPROVAL_TIMEOUT_SECONDS: u32 = 900;
 const ROUTINE_APPROVAL_DEVICE_ID: &str = "system:routines";
 
+/// Timezone in which a 5-field cron expression is evaluated.
+///
+/// `Utc` is the default and also covers legacy schedule payloads without a
+/// `timezone` key; `Local` follows the daemon host timezone; `Named` is an
+/// IANA timezone resolved through `chrono-tz`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CronTimezoneMode {
     #[default]
@@ -94,6 +124,7 @@ pub enum CronTimezoneMode {
 }
 
 impl CronTimezoneMode {
+    /// Returns the canonical payload string: `"utc"`, `"local"`, or the IANA name.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -103,6 +134,8 @@ impl CronTimezoneMode {
         }
     }
 
+    /// Parses a stored timezone string; `None` when it is neither `utc`,
+    /// `local`, nor a valid IANA timezone name.
     pub fn from_str(value: &str) -> Option<Self> {
         let trimmed = value.trim();
         match trimmed.to_ascii_lowercase().as_str() {
@@ -113,31 +146,48 @@ impl CronTimezoneMode {
     }
 }
 
+/// Validated schedule produced by [`normalize_schedule`].
 #[derive(Debug, Clone)]
 pub struct ScheduleNormalization {
+    /// Schedule family persisted on the job record.
     pub schedule_type: CronScheduleType,
+    /// Canonical JSON payload stored alongside the job; shape depends on type.
     pub schedule_payload_json: String,
+    /// First due tick, or `None` when the schedule has no future tick.
     pub next_run_at_unix_ms: Option<i64>,
 }
 
+/// Outcome of one dispatch decision for a cron job.
 #[derive(Debug, Clone)]
 pub struct DispatchOutcome {
+    /// Journal run id, or `None` when no run record was created (e.g. the run
+    /// was queued behind an active execution).
     pub run_id: Option<String>,
+    /// Status reported to the caller; not necessarily terminal yet.
     pub status: CronRunStatus,
+    /// Human-readable dispatch summary.
     pub message: String,
+    /// Session key the run executes under, when known at dispatch time.
     pub session_key: Option<String>,
+    /// Session label the run executes under, when known at dispatch time.
     pub session_label: Option<String>,
 }
 
+/// How the scheduler recovers a job whose due tick was missed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CronMisfireRecoveryAction {
+    /// Drop missed ticks and resume from the next future tick.
     Skip,
+    /// Collapse a large backlog into one immediate run.
     RunOnce,
+    /// Replay the (small) backlog tick by tick.
     CatchUpLimited,
+    /// Backlog is too large and too old; an operator must review before replay.
     RequireReview,
 }
 
 impl CronMisfireRecoveryAction {
+    /// Stable token used in misfire audit payloads.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -148,6 +198,7 @@ impl CronMisfireRecoveryAction {
         }
     }
 
+    /// Operator-facing action token surfaced in health and audit reasons.
     #[must_use]
     pub const fn operator_action(self) -> &'static str {
         match self {
@@ -159,19 +210,27 @@ impl CronMisfireRecoveryAction {
     }
 }
 
+/// Recovery decision computed by [`compute_misfire_recovery_plan`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CronMisfireRecoveryPlan {
+    /// Selected recovery action.
     pub action: CronMisfireRecoveryAction,
+    /// Next tick to persist, with deterministic per-job jitter already applied.
     pub next_run_at_unix_ms: Option<i64>,
+    /// Number of missed ticks; counting stops just past the catch-up limit.
     pub missed_runs: usize,
+    /// Oldest missed tick, when any tick was missed.
     pub oldest_missed_at_unix_ms: Option<i64>,
+    /// Stable snake_case reason token consumed by audits and fixtures.
     pub reason: String,
 }
 
+/// Aggregated scheduler health built by [`build_scheduler_health_snapshot`].
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SchedulerHealthSnapshot {
     pub generated_at_unix_ms: i64,
+    /// One of `healthy`, `degraded`, or `blocked`.
     pub state: String,
     pub due_jobs: usize,
     pub active_runs: usize,
@@ -184,6 +243,7 @@ pub struct SchedulerHealthSnapshot {
     pub audit: SchedulerHealthAudit,
 }
 
+/// Audit annotations attached to a [`SchedulerHealthSnapshot`].
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SchedulerHealthAudit {
@@ -193,6 +253,7 @@ pub struct SchedulerHealthAudit {
     pub missed_run_reasons: Vec<String>,
 }
 
+/// Inputs for [`build_scheduler_health_snapshot`].
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct SchedulerHealthInput<'a> {
@@ -202,17 +263,31 @@ pub struct SchedulerHealthInput<'a> {
     pub last_error: Option<String>,
 }
 
+/// Per-trigger overrides applied to a single dispatched run.
+///
+/// The default (`None` everywhere) means "use the job and routine
+/// configuration".
 #[derive(Debug, Clone, Default)]
 pub struct TriggerJobOptions {
+    /// Forces the routine run mode (same vs fresh session).
     pub force_run_mode: Option<RoutineRunMode>,
+    /// Overrides whether sensitive tools are allowed for this run.
     pub allow_sensitive_tools: Option<bool>,
+    /// Overrides the model/provider profile for this run.
     pub model_profile_override: Option<String>,
+    /// Extra parameter delta JSON forwarded to the orchestrator.
     pub parameter_delta_json: Option<String>,
+    /// Origin tag recorded on the run (`cron`, `manual`, `file_watch`, ...).
     pub origin_kind: Option<String>,
+    /// Routine trigger kind recorded in run metadata.
     pub routine_trigger_kind: Option<RoutineTriggerKind>,
+    /// Human-readable trigger reason recorded in run metadata.
     pub routine_trigger_reason: Option<String>,
+    /// Trigger payload JSON recorded in run metadata and the prompt.
     pub routine_trigger_payload_json: Option<String>,
+    /// Dedupe key recorded in run metadata.
     pub routine_trigger_dedupe_key: Option<String>,
+    /// Updated trigger config persisted back to the routine (file watch state).
     pub routine_trigger_config_update_json: Option<String>,
 }
 
@@ -257,6 +332,7 @@ struct InstalledSkillRecord {
     current: bool,
 }
 
+/// Schedule decoded from its persisted JSON payload form.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ParsedSchedule {
     Cron { expression: String, matcher: CronMatcher, timezone: CronTimezoneMode },
@@ -264,6 +340,11 @@ enum ParsedSchedule {
     At { at_unix_ms: i64, timestamp_rfc3339: String },
 }
 
+/// Compiled 5-field cron expression (minute hour day month weekday).
+///
+/// Fields are membership bitmaps indexed from each field's minimum value. The
+/// wildcard flags remember whether day-of-month/weekday were `*`, which drives
+/// the Vixie-cron day-selector semantics in `matches_components`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CronMatcher {
     minutes: Vec<bool>,
@@ -294,6 +375,10 @@ impl CronMatcher {
         })
     }
 
+    // Scans forward one minute at a time in UTC and evaluates the match in the
+    // job timezone. Stepping UTC minutes (not local wall-clock) keeps the scan
+    // deterministic across DST transitions: a local time skipped by a forward
+    // jump never fires, and a repeated local hour can fire twice.
     fn next_after(&self, after_unix_ms: i64, timezone: CronTimezoneMode) -> Option<i64> {
         let after_seconds = after_unix_ms.div_euclid(1_000);
         let mut cursor =
@@ -355,6 +440,9 @@ impl CronMatcher {
     ) -> bool {
         let day_of_month_match = self.day_of_month[day - 1];
         let weekday_match = self.weekdays[weekday];
+        // Vixie-cron day semantics: when both day-of-month and weekday are
+        // restricted, EITHER match selects the day; a lone restricted field
+        // must match on its own.
         let day_selector_match = match (self.day_of_month_wildcard, self.weekdays_wildcard) {
             (true, true) => true,
             (true, false) => weekday_match,
@@ -432,6 +520,7 @@ fn parse_cron_value(
 }
 
 impl ParsedSchedule {
+    /// Next tick strictly after `after_unix_ms`; `None` when exhausted.
     fn next_after(&self, after_unix_ms: i64) -> Option<i64> {
         match self {
             Self::Cron { matcher, timezone, .. } => matcher.next_after(after_unix_ms, *timezone),
@@ -447,6 +536,13 @@ impl ParsedSchedule {
     }
 }
 
+/// Validates a wire-format schedule and computes its canonical persisted
+/// payload plus the first due tick.
+///
+/// # Errors
+/// Returns `Status::invalid_argument` when the schedule is missing, its type
+/// is unspecified, the cron expression is invalid, `every.interval_ms` is
+/// zero or too large, or the `at` timestamp is malformed or not in the future.
 pub fn normalize_schedule(
     schedule: Option<cron_v1::Schedule>,
     now_unix_ms: i64,
@@ -534,6 +630,11 @@ pub fn normalize_schedule(
     }
 }
 
+/// Reconstructs the wire-format schedule from a persisted payload.
+///
+/// # Errors
+/// Returns `Status::internal` when the stored payload does not match the
+/// schedule type (corrupt or hand-edited job state).
 pub fn schedule_to_proto(
     schedule_type: CronScheduleType,
     schedule_payload_json: &str,
@@ -547,6 +648,7 @@ pub fn schedule_to_proto(
         ParsedSchedule::Every { interval_ms } => Ok(cron_v1::Schedule {
             r#type: cron_v1::ScheduleType::Every as i32,
             spec: Some(cron_v1::schedule::Spec::Every(cron_v1::EverySchedule {
+                // Lossless: parse_schedule_payload rejects non-positive intervals.
                 interval_ms: interval_ms as u64,
             })),
         }),
@@ -566,6 +668,19 @@ fn compute_next_run_after(
     Ok(compute_misfire_recovery_plan(job, reference_unix_ms, now_unix_ms)?.next_run_at_unix_ms)
 }
 
+/// Computes how to recover a job whose reference tick is at or before `now`.
+///
+/// `reference_unix_ms` is the last persisted `next_run_at_unix_ms` (or "now"
+/// when absent). Decision ladder: a future tick yields `Skip` with that tick;
+/// the `Skip` misfire policy advances past the backlog; a backlog larger than
+/// `SCHEDULER_CATCH_UP_MAX_RUNS` yields `RequireReview` when older than
+/// `SCHEDULER_CATCH_UP_WINDOW_MS` and `RunOnce` otherwise; small backlogs
+/// yield `CatchUpLimited`, replaying from the first missed tick. All returned
+/// ticks carry deterministic per-job jitter.
+///
+/// # Errors
+/// Returns `Status::internal` when the persisted schedule payload cannot be
+/// parsed.
 pub fn compute_misfire_recovery_plan(
     job: &CronJobRecord,
     reference_unix_ms: i64,
@@ -633,11 +748,16 @@ pub fn compute_misfire_recovery_plan(
     })
 }
 
+/// Operator-visible enabled flag for a job.
+///
+/// A one-shot `at` job whose only tick already fired reads as disabled even
+/// before the disable patch has been persisted.
 #[must_use]
 pub fn visible_cron_job_enabled(job: &CronJobRecord) -> bool {
     job.enabled && !one_shot_schedule_is_exhausted(job, job.next_run_at_unix_ms)
 }
 
+/// Operator-visible next tick; `None` whenever the job reads as disabled.
 #[must_use]
 pub fn visible_next_run_at_unix_ms(job: &CronJobRecord) -> Option<i64> {
     if visible_cron_job_enabled(job) {
@@ -651,6 +771,9 @@ fn one_shot_schedule_is_exhausted(job: &CronJobRecord, next_run_at_unix_ms: Opti
     matches!(job.schedule_type, CronScheduleType::At) && next_run_at_unix_ms.is_none()
 }
 
+/// Optional `max_runs` budget read from the schedule payload.
+///
+/// Absent, non-numeric, or zero values all mean "unlimited".
 #[must_use]
 pub fn max_runs_for_job(job: &CronJobRecord) -> Option<u32> {
     max_runs_from_schedule_payload_json(job.schedule_payload_json.as_str())
@@ -662,6 +785,14 @@ fn max_runs_from_schedule_payload_json(schedule_payload_json: &str) -> Option<u3
     u32::try_from(value).ok().filter(|max_runs| *max_runs > 0)
 }
 
+/// Next tick to persist when toggling a job's enabled flag.
+///
+/// Disabling always clears the tick; enabling recomputes it from "now" so a
+/// re-enabled job does not immediately replay a stale backlog.
+///
+/// # Errors
+/// Returns `Status::internal` when the persisted schedule payload cannot be
+/// parsed (see [`compute_misfire_recovery_plan`]).
 pub fn next_run_at_for_enabled_state(
     job: &CronJobRecord,
     enabled: bool,
@@ -674,6 +805,12 @@ pub fn next_run_at_for_enabled_state(
     Ok(compute_misfire_recovery_plan(job, now_unix_ms, now_unix_ms)?.next_run_at_unix_ms)
 }
 
+/// Aggregates due jobs, misfire backlogs, and stale run leases into a health
+/// snapshot for operator surfaces.
+///
+/// # Errors
+/// Returns `Status::internal` when a job's persisted schedule payload cannot
+/// be parsed.
 #[allow(dead_code)]
 pub fn build_scheduler_health_snapshot(
     input: SchedulerHealthInput<'_>,
@@ -768,6 +905,8 @@ pub fn build_scheduler_health_snapshot(
     })
 }
 
+/// Builds the `cron.misfire.recovery` audit payload; field names and value
+/// tokens are pinned by fixtures and tests.
 pub fn cron_misfire_audit_payload(
     job: &CronJobRecord,
     recovery_plan: &CronMisfireRecoveryPlan,
@@ -786,6 +925,8 @@ pub fn cron_misfire_audit_payload(
     })
 }
 
+/// Counts ticks in `[first_missed, now]`, returning
+/// `(missed_runs, first_missed, next_future_tick)`.
 fn count_missed_schedule_ticks(
     parsed: &ParsedSchedule,
     first_missed_unix_ms: i64,
@@ -793,6 +934,7 @@ fn count_missed_schedule_ticks(
 ) -> (usize, i64, Option<i64>) {
     match parsed {
         ParsedSchedule::Every { interval_ms } if *interval_ms > 0 => {
+            // Every is closed-form: ticks are evenly spaced from the first miss.
             let elapsed = now_unix_ms.saturating_sub(first_missed_unix_ms);
             let missed_runs = elapsed.div_euclid(*interval_ms).saturating_add(1) as usize;
             let next = first_missed_unix_ms
@@ -809,6 +951,8 @@ fn count_missed_schedule_ticks(
             return (missed_runs, first_missed_unix_ms, Some(value));
         }
         missed_runs = missed_runs.saturating_add(1);
+        // Callers only branch on "more than the catch-up limit", so stop the
+        // walk one past it instead of enumerating an unbounded outage backlog.
         if missed_runs > SCHEDULER_CATCH_UP_MAX_RUNS {
             return (missed_runs, first_missed_unix_ms, parsed.next_after(now_unix_ms));
         }
@@ -817,6 +961,9 @@ fn count_missed_schedule_ticks(
     (missed_runs, first_missed_unix_ms, None)
 }
 
+// Jitter must be stable across restarts and replays: it is derived from the
+// job id and the scheduled tick instead of an RNG, so the same tick always
+// lands on the same adjusted fire time.
 fn apply_stable_jitter(job: &CronJobRecord, scheduled_unix_ms: i64) -> i64 {
     if job.jitter_ms > 0 {
         let jitter = deterministic_jitter_ms(job.job_id.as_str(), scheduled_unix_ms, job.jitter_ms);
@@ -825,6 +972,8 @@ fn apply_stable_jitter(job: &CronJobRecord, scheduled_unix_ms: i64) -> i64 {
     scheduled_unix_ms
 }
 
+/// Decodes a persisted schedule payload; failures map to `Status::internal`
+/// because the payload was validated when the job was created.
 fn parse_schedule_payload(
     schedule_type: CronScheduleType,
     schedule_payload_json: &str,
@@ -881,7 +1030,8 @@ fn deterministic_jitter_ms(job_id: &str, seed: i64, max_jitter_ms: u64) -> u64 {
     hasher.finish() % (max_jitter_ms.saturating_add(1))
 }
 
-#[allow(clippy::result_large_err)]
+/// Parses the re-audit interval env override: absent keeps the default,
+/// `0` disables the periodic job, anything else is milliseconds.
 fn parse_skill_reaudit_interval(raw: Option<&str>) -> Result<Option<Duration>, Status> {
     let Some(raw) = raw else {
         return Ok(Some(DEFAULT_SKILL_REAUDIT_INTERVAL));
@@ -903,7 +1053,6 @@ fn parse_skill_reaudit_interval(raw: Option<&str>) -> Result<Option<Duration>, S
     Ok(Some(Duration::from_millis(interval_ms)))
 }
 
-#[allow(clippy::result_large_err)]
 fn default_skills_root() -> Result<PathBuf, Status> {
     let identity_root = match std::env::var_os("PALYRA_GATEWAY_IDENTITY_STORE_DIR") {
         Some(raw) if raw.is_empty() => {
@@ -950,7 +1099,6 @@ fn resolve_skills_trust_store_path(skills_root: &Path) -> Result<PathBuf, Status
     }
 }
 
-#[allow(clippy::result_large_err)]
 fn resolve_periodic_skill_reaudit_config() -> Result<Option<PeriodicSkillReauditConfig>, Status> {
     let interval_raw = match std::env::var(SKILL_REAUDIT_INTERVAL_ENV) {
         Ok(value) => Some(value),
@@ -970,6 +1118,8 @@ fn resolve_periodic_skill_reaudit_config() -> Result<Option<PeriodicSkillReaudit
     Ok(Some(PeriodicSkillReauditConfig { interval, skills_root, trust_store_path }))
 }
 
+/// Selects `(skill_id, version)` pairs to re-audit: current versions when any
+/// entry is marked current, otherwise every entry (legacy indexes).
 fn periodic_reaudit_targets(index: &InstalledSkillsIndex) -> Vec<(String, String)> {
     let mut selected = index
         .entries
@@ -989,7 +1139,8 @@ fn periodic_reaudit_targets(index: &InstalledSkillsIndex) -> Vec<(String, String
     selected
 }
 
-#[allow(clippy::result_large_err)]
+/// Idempotently quarantines a skill version and records the status event;
+/// already-quarantined skills keep their original reason.
 async fn quarantine_skill_after_periodic_reaudit(
     state: Arc<GatewayRuntimeState>,
     skill_id: &str,
@@ -1020,7 +1171,8 @@ async fn quarantine_skill_after_periodic_reaudit(
     state.record_skill_status_event(&context, "skill.quarantined", &record).await
 }
 
-#[allow(clippy::result_large_err)]
+/// Re-audits installed skill artifacts against the trust store; missing
+/// artifacts and audit failures quarantine the skill fail-closed.
 async fn run_periodic_skill_reaudit(
     state: Arc<GatewayRuntimeState>,
     config: &PeriodicSkillReauditConfig,
@@ -1105,7 +1257,6 @@ async fn run_periodic_skill_reaudit(
     Ok(())
 }
 
-#[allow(clippy::result_large_err)]
 fn load_periodic_reaudit_skills_index(index_path: &Path) -> Result<InstalledSkillsIndex, Status> {
     let payload = fs::read(index_path).map_err(|error| {
         Status::internal(format!(
@@ -1131,14 +1282,14 @@ fn compute_next_vacuum_due_at_unix_ms(
     last_vacuum_at_unix_ms: Option<i64>,
     now_unix_ms: i64,
 ) -> Result<Option<i64>, Status> {
-    let matcher =
-        CronMatcher::parse(schedule).map_err(|error| Status::invalid_argument(error.to_owned()))?;
+    let matcher = CronMatcher::parse(schedule).map_err(Status::invalid_argument)?;
+    // No vacuum yet: back the reference off by one minute so a tick due right
+    // now is still eligible (next_after is strictly exclusive).
     let reference_unix_ms =
         last_vacuum_at_unix_ms.unwrap_or_else(|| now_unix_ms.saturating_sub(60_000));
     Ok(matcher.next_after(reference_unix_ms, CronTimezoneMode::Utc))
 }
 
-#[allow(clippy::result_large_err)]
 async fn run_memory_maintenance_tick(
     state: Arc<GatewayRuntimeState>,
     retention: MemoryRetentionConfig,
@@ -1201,7 +1352,6 @@ async fn run_memory_maintenance_tick(
     Ok(())
 }
 
-#[allow(clippy::result_large_err)]
 async fn run_memory_embeddings_backfill_tick(
     state: Arc<GatewayRuntimeState>,
 ) -> Result<(), Status> {
@@ -1233,6 +1383,13 @@ async fn run_memory_embeddings_backfill_tick(
     Ok(())
 }
 
+/// Spawns the cron scheduler loop on the Tokio runtime.
+///
+/// Each iteration repairs stale runs (startup only), dispatches due jobs,
+/// drains queued runs, services the periodic skill re-audit, memory
+/// maintenance, and embeddings backfill ticks, then sleeps until the next due
+/// tick or until `wake_signal` is notified. Errors are logged and retried on
+/// the next iteration; the loop runs until the returned handle is aborted.
 pub fn spawn_scheduler_loop(
     state: Arc<GatewayRuntimeState>,
     auth: GatewayAuthConfig,
@@ -1335,6 +1492,8 @@ pub fn spawn_scheduler_loop(
     })
 }
 
+/// Fails active runs left behind by a previous daemon process so jobs are not
+/// blocked by phantom leases; returns the number of repaired runs.
 async fn recover_stale_scheduler_runs(state: Arc<GatewayRuntimeState>) -> Result<usize, Status> {
     let now_unix_ms = now_unix_ms()?;
     let mut after_run_id = None::<String>;
@@ -1381,6 +1540,10 @@ fn should_repair_stale_cron_run(run: &CronRunRecord, now_unix_ms: i64) -> bool {
         && now_unix_ms.saturating_sub(run.updated_at_unix_ms) >= SCHEDULER_STALE_RUN_AFTER_MS
 }
 
+/// Dispatches a job immediately with default trigger options.
+///
+/// # Errors
+/// See [`trigger_job_now_with_options`].
 pub async fn trigger_job_now(
     state: Arc<GatewayRuntimeState>,
     auth: GatewayAuthConfig,
@@ -1399,6 +1562,13 @@ pub async fn trigger_job_now(
     .await
 }
 
+/// Dispatches a job immediately, bypassing schedule due-ness but not the
+/// policy, approval, concurrency, or budget gates.
+///
+/// # Errors
+/// Returns `Status` when policy evaluation, journal persistence, or gateway
+/// metadata encoding fails. Gate denials are not errors; they are reported
+/// through the returned [`DispatchOutcome`].
 pub async fn trigger_job_now_with_options(
     state: Arc<GatewayRuntimeState>,
     auth: GatewayAuthConfig,
@@ -1410,6 +1580,8 @@ pub async fn trigger_job_now_with_options(
     dispatch_job(state, auth, grpc_url, job, wake_signal, true, options).await
 }
 
+/// Applies misfire recovery and dispatches all due jobs (bounded batch);
+/// no-op while the routines automation feature gate is disabled.
 async fn process_due_jobs(
     state: Arc<GatewayRuntimeState>,
     auth: GatewayAuthConfig,
@@ -1426,6 +1598,8 @@ async fn process_due_jobs(
         let reference_unix_ms = job.next_run_at_unix_ms.unwrap_or(now_unix_ms);
         let recovery_plan = compute_misfire_recovery_plan(&job, reference_unix_ms, now_unix_ms)?;
         let next_run_at_unix_ms = recovery_plan.next_run_at_unix_ms;
+        // Advance the persisted tick before dispatching: if the daemon dies
+        // mid-dispatch the tick is lost rather than double-fired (at-most-once).
         state.set_cron_job_next_run(job.job_id.clone(), next_run_at_unix_ms, None).await?;
         if should_disable_exhausted_scheduled_one_shot(&job, next_run_at_unix_ms) {
             disable_exhausted_scheduled_one_shot(Arc::clone(&state), &job).await?;
@@ -1452,6 +1626,8 @@ async fn process_due_jobs(
         )
         .await?;
         if next_run_at_unix_ms.is_some_and(|value| value <= now_unix_ms) {
+            // Catch-up backlog: the new tick is already due, so nudge the loop
+            // instead of waiting out the idle sleep.
             wake_signal.notify_one();
         }
     }
@@ -1483,6 +1659,8 @@ async fn disable_exhausted_scheduled_one_shot(
     Ok(())
 }
 
+/// Journals a Skipped run carrying the require-review misfire decision so
+/// operators can find the backlog and replay it deliberately.
 async fn record_misfire_review_required(
     state: Arc<GatewayRuntimeState>,
     job: &CronJobRecord,
@@ -1530,6 +1708,8 @@ async fn record_misfire_review_required(
     Ok(())
 }
 
+/// Drains `queued_run` markers (QueueOne policy) once a job's active run has
+/// finished; failed dispatches keep the marker so the run retries next pass.
 async fn process_queued_jobs(
     state: Arc<GatewayRuntimeState>,
     auth: GatewayAuthConfig,
@@ -1567,6 +1747,7 @@ async fn process_queued_jobs(
             .await
             {
                 Ok(outcome) => {
+                    // Still blocked behind an active run: keep the queued marker.
                     if outcome.status == CronRunStatus::Accepted && outcome.run_id.is_none() {
                         continue;
                     }
@@ -1590,6 +1771,8 @@ async fn process_queued_jobs(
     Ok(())
 }
 
+/// Reads the routines automation feature gate; a poisoned registry lock is
+/// recovered for this read-only check and logged.
 fn routines_automation_enabled(access_registry: &Arc<Mutex<AccessRegistry>>) -> bool {
     let registry = match access_registry.lock() {
         Ok(guard) => guard,
@@ -1601,6 +1784,7 @@ fn routines_automation_enabled(access_registry: &Arc<Mutex<AccessRegistry>>) -> 
     registry.is_feature_enabled(FEATURE_ROUTINES_AUTOMATION)
 }
 
+/// Resolution of the per-job concurrency policy against an active run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConcurrencyDecision {
     SkipForbid,
@@ -1610,6 +1794,10 @@ enum ConcurrencyDecision {
     Replace,
 }
 
+/// Decides what to do when a job triggers while another run is active.
+///
+/// A manual trigger into an already-full queue(1) is skipped loudly rather
+/// than silently coalesced so the operator sees the rejection.
 fn decide_concurrency_policy(
     policy: CronConcurrencyPolicy,
     queued_run: bool,
@@ -1645,6 +1833,7 @@ async fn disable_objective_if_budget_exhausted(
     Ok(Some(exhaustion))
 }
 
+/// Disables the job once completed runs have consumed the `max_runs` budget.
 async fn disable_cron_if_max_runs_exhausted(
     state: Arc<GatewayRuntimeState>,
     job: &CronJobRecord,
@@ -1677,6 +1866,9 @@ async fn cron_max_runs_exhaustion_for_job(
     Ok(Some(CronMaxRunsExhaustion { max_runs, completed_runs }))
 }
 
+/// Disables the job once reserved slots (including still-active runs) have
+/// consumed the `max_runs` budget; used pre-dispatch so concurrent runs
+/// cannot over-commit the budget.
 async fn disable_cron_if_max_run_slots_exhausted(
     state: Arc<GatewayRuntimeState>,
     job: &CronJobRecord,
@@ -1719,6 +1911,8 @@ async fn count_budgeted_cron_runs_for_job(
         let (runs, next_after_run_id) =
             state.list_cron_runs(Some(job_id.to_owned()), after_run_id.clone(), Some(500)).await?;
         count = count.saturating_add(budgeted_cron_run_count(&runs));
+        // Stop paging once the budget is provably exhausted; exact totals
+        // beyond `stop_after` are never needed.
         if count >= stop_after {
             return Ok(count);
         }
@@ -1759,6 +1953,8 @@ fn budgeted_cron_run_count(runs: &[CronRunRecord]) -> u32 {
         .fold(0_u32, |count, _| count.saturating_add(1))
 }
 
+/// Terminal runs that consume `max_runs` budget. Approval-wait denials are
+/// excluded so a pending first-run approval cannot burn the budget.
 fn is_budgeted_cron_run(run: &CronRunRecord) -> bool {
     matches!(run.status, CronRunStatus::Succeeded | CronRunStatus::Failed)
         || (matches!(run.status, CronRunStatus::Denied)
@@ -1771,6 +1967,8 @@ fn reserved_cron_run_slot_count(runs: &[CronRunRecord]) -> u32 {
         .fold(0_u32, |count, _| count.saturating_add(1))
 }
 
+/// Runs that hold a `max_runs` slot, including still-active ones, so
+/// concurrent dispatches cannot over-commit the remaining budget.
 fn is_reserved_cron_run_slot(run: &CronRunRecord) -> bool {
     matches!(
         run.status,
@@ -1782,6 +1980,9 @@ fn is_reserved_cron_run_slot(run: &CronRunRecord) -> bool {
         && !is_scheduler_approval_required_denial(run))
 }
 
+/// Synthetic scheduler-side denial recorded while waiting for first-run
+/// approval: no orchestrator run and no tool activity ever happened, so it
+/// must not consume budget or run slots.
 fn is_scheduler_approval_required_denial(run: &CronRunRecord) -> bool {
     matches!(run.status, CronRunStatus::Denied)
         && run.error_kind.as_deref() == Some(ROUTINE_APPROVAL_REQUIRED_ERROR_KIND)
@@ -1884,6 +2085,8 @@ fn budgeted_objective_run_count(runs: &[CronRunRecord]) -> u32 {
         .fold(0_u32, |count, _| count.saturating_add(1))
 }
 
+/// Objective budgets count terminal runs that actually reached the
+/// orchestrator, excluding synthetic budget-exhausted skips.
 fn is_budgeted_objective_run(run: &CronRunRecord) -> bool {
     !run.status.is_active()
         && run.orchestrator_run_id.is_some()
@@ -1911,6 +2114,8 @@ async fn apply_objective_budget_exhaustion(
 
     let mut objective = exhaustion.objective.clone();
     let from_state = objective.state;
+    // Archived/cancelled objectives keep their state; anything else is paused
+    // so the operator re-arms the budget deliberately instead of silently.
     let to_state = if matches!(from_state, ObjectiveState::Archived | ObjectiveState::Cancelled) {
         from_state
     } else {
@@ -1951,6 +2156,9 @@ fn routine_approval_subject_id(routine_id: &str, mode: RoutineApprovalMode) -> S
     format!("routine:{routine_id}:{}", mode.as_str())
 }
 
+/// Schedule and file-watch routines are autonomous recurring jobs, so they
+/// honor the before-first-run approval gate; manual routines are gated by the
+/// manual dispatch path instead.
 fn scheduled_routine_requires_first_run_approval(routine: &RoutineMetadataRecord) -> bool {
     matches!(routine.trigger_kind, RoutineTriggerKind::Schedule | RoutineTriggerKind::FileWatch)
         && routine.approval_policy.mode == RoutineApprovalMode::BeforeFirstRun
@@ -2086,7 +2294,8 @@ async fn enforce_scheduled_routine_approval(
     state: Arc<GatewayRuntimeState>,
     job: &CronJobRecord,
 ) -> Result<Option<DispatchOutcome>, Status> {
-    let Some(runtime) = state.routines_runtime_config().ok() else {
+    // Routines runtime is optional; without it the job runs as plain cron.
+    let Ok(runtime) = state.routines_runtime_config() else {
         return Ok(None);
     };
     let Some(routine) = runtime.registry.get_routine(job.job_id.as_str()).map_err(|error| {
@@ -2115,12 +2324,17 @@ async fn enforce_scheduled_routine_approval(
     .map(Some)
 }
 
+/// Evaluates a file-watch routine before dispatch.
+///
+/// Returns `Some(outcome)` to short-circuit when the watched path is
+/// unchanged; otherwise fills `options` with the observed change (trigger
+/// payload, dedupe key, updated watch state) and lets dispatch proceed.
 async fn prepare_file_watch_dispatch(
     state: Arc<GatewayRuntimeState>,
     job: &CronJobRecord,
     options: &mut TriggerJobOptions,
 ) -> Result<Option<DispatchOutcome>, Status> {
-    let Some(runtime) = state.routines_runtime_config().ok() else {
+    let Ok(runtime) = state.routines_runtime_config() else {
         return Ok(None);
     };
     let Some(routine) = runtime.registry.get_routine(job.job_id.as_str()).map_err(|error| {
@@ -2173,12 +2387,14 @@ async fn prepare_file_watch_dispatch(
     Ok(None)
 }
 
+/// Persists the updated file-watch signature so the same change is not
+/// re-triggered on the next poll.
 async fn persist_file_watch_observation(
     state: Arc<GatewayRuntimeState>,
     job: &CronJobRecord,
     trigger_config_update_json: &str,
 ) -> Result<(), Status> {
-    let Some(runtime) = state.routines_runtime_config().ok() else {
+    let Ok(runtime) = state.routines_runtime_config() else {
         return Ok(());
     };
     let Some(routine) = runtime.registry.get_routine(job.job_id.as_str()).map_err(|error| {
@@ -2209,6 +2425,9 @@ async fn persist_file_watch_observation(
     Ok(())
 }
 
+/// Runs every dispatch gate in order (run-slot budget, objective budget, file
+/// watch evaluation, policy, first-run approval, concurrency) and, when all
+/// pass, journals an Accepted run and spawns the retry loop.
 async fn dispatch_job(
     state: Arc<GatewayRuntimeState>,
     auth: GatewayAuthConfig,
@@ -2282,6 +2501,10 @@ async fn dispatch_job(
         }
     }
 
+    // AIDEV-NOTE: the concurrency gate is check-then-act: between this lookup
+    // and start_cron_run below, another dispatcher (manual trigger racing a
+    // scheduler tick) can pass the same check, so Forbid/QueueOne can briefly
+    // overlap. Closing the race needs an atomic claim in the journal layer.
     let active_run = state.active_cron_run_for_job(job.job_id.clone()).await?;
     if let Some(active) = active_run {
         match decide_concurrency_policy(job.concurrency_policy, job.queued_run, manual_trigger) {
@@ -2326,6 +2549,8 @@ async fn dispatch_job(
             }
             ConcurrencyDecision::Replace => {
                 if let Some(orchestrator_run_id) = active.orchestrator_run_id {
+                    // Best effort: the new run supersedes the old one even if
+                    // this cancel request fails.
                     let _ = state
                         .request_orchestrator_cancel(OrchestratorCancelRequest {
                             run_id: orchestrator_run_id,
@@ -2399,6 +2624,8 @@ async fn dispatch_job(
     })
 }
 
+/// Journals a synthetic start+finalize pair so skipped/denied dispatch
+/// decisions stay visible as terminal runs without ever executing.
 async fn register_terminal(
     state: Arc<GatewayRuntimeState>,
     job_id: &str,
@@ -2455,6 +2682,12 @@ async fn register_terminal_and_disable_cron_if_max_runs_exhausted(
     Ok(outcome)
 }
 
+/// Executes a dispatched run with bounded retries.
+///
+/// Only scheduler-classified retryable failures are retried (see
+/// [`scheduler_attempt_failure`]); success, denial, budget exhaustion, and
+/// non-retryable failures end the loop. Each retry journals a fresh run id so
+/// every attempt stays auditable.
 async fn run_job_with_retries(
     state: Arc<GatewayRuntimeState>,
     auth: GatewayAuthConfig,
@@ -2563,6 +2796,12 @@ async fn run_job_with_retries(
             }
         }
 
+        // Exponential backoff: base * 2^(attempt - 1); attempt <= 16 keeps the
+        // shift in range.
+        // AIDEV-NOTE: MAX_RETRY_BACKOFF_MS caps only the configured base, not
+        // this product, so late attempts can wait far longer than 60s (base
+        // 60s at attempt 16 sleeps ~22 days). Capping the product would change
+        // retry timing, so it is only flagged here.
         let backoff_multiplier = 1_u64 << u64::from(attempt.saturating_sub(1));
         let delay = base_backoff_ms.saturating_mul(backoff_multiplier);
         tokio::time::sleep(Duration::from_millis(delay)).await;
@@ -2570,6 +2809,7 @@ async fn run_job_with_retries(
     Ok(())
 }
 
+/// Classified failure of one scheduler attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SchedulerAttemptFailure {
     error_kind: String,
@@ -2577,6 +2817,11 @@ struct SchedulerAttemptFailure {
     retryable: bool,
 }
 
+/// Classifies a failed attempt into a stable `error_kind` token and decides
+/// retryability.
+///
+/// The tokens and substring probes are pinned by tests and deterministic
+/// fixtures; the raw message is sanitized before journaling.
 fn scheduler_attempt_failure(error: &Status, attempt: u32) -> SchedulerAttemptFailure {
     let raw_message = error.message();
     let normalized = raw_message.to_ascii_lowercase();
@@ -2614,6 +2859,11 @@ fn scheduler_attempt_failure(error: &Status, attempt: u32) -> SchedulerAttemptFa
     }
 }
 
+/// True when a recurring scheduled job should be paused after a denial.
+///
+/// Only trusted scheduler-side policy denials qualify; denials inferred from
+/// run-stream tool activity are model-driven outcomes and must not disable
+/// the job (see the call site in `run_job_with_retries`).
 fn should_pause_recurring_cron_after_policy_denied(
     job: &CronJobRecord,
     options: &TriggerJobOptions,
@@ -2644,6 +2894,8 @@ async fn pause_recurring_cron_after_policy_denied(
     Ok(())
 }
 
+/// Effective execution parameters for one cron run after merging trigger
+/// options with the linked routine's configuration.
 #[derive(Debug, Clone)]
 struct EffectiveCronExecutionRequest {
     session_key: String,
@@ -2654,6 +2906,8 @@ struct EffectiveCronExecutionRequest {
     origin_kind: String,
 }
 
+/// Merges [`TriggerJobOptions`] (highest precedence) with the linked routine
+/// configuration and job defaults.
 fn build_effective_cron_execution_request(
     state: &GatewayRuntimeState,
     job: &CronJobRecord,
@@ -2751,6 +3005,8 @@ fn file_watch_access_root(record: &RoutineMetadataRecord) -> Option<String> {
     Some(access_root.to_string_lossy().into_owned())
 }
 
+// Explicit job session keys always win; otherwise FreshSession isolates each
+// run in its own session while SameSession reuses one session per job.
 fn effective_cron_session_key(
     job: &CronJobRecord,
     run_id: &str,
@@ -2786,6 +3042,9 @@ fn effective_cron_session_label(
     }
 }
 
+/// Runs one attempt end to end: resolves the session, journals the transition
+/// to Running, streams the orchestrator run, and finalizes the run record
+/// with the observed terminal status and usage.
 async fn execute_single_job_attempt(
     state: Arc<GatewayRuntimeState>,
     auth: GatewayAuthConfig,
@@ -3057,6 +3316,11 @@ async fn execute_single_job_attempt(
     Ok(terminal_status)
 }
 
+/// Derives the terminal run status from observed stream signals.
+///
+/// Denied takes precedence over success when tools were denied and no
+/// completion tool succeeded, so model text cannot spoof a clean completion.
+/// Side-effect routines additionally fail without completion-tool evidence.
 fn cron_terminal_status_from_stream(
     saw_done: bool,
     saw_failed: bool,
@@ -3079,6 +3343,8 @@ fn cron_terminal_status_from_stream(
     CronRunStatus::Failed
 }
 
+/// Heuristic: prompts that promise file/workspace side effects must show a
+/// successful mutation tool before the run may count as succeeded.
 fn cron_job_requires_completion_tool(job: &CronJobRecord) -> bool {
     let prompt = format!("{} {}", job.name, job.prompt).to_ascii_lowercase();
     cron_prompt_mentions_side_effect(prompt.as_str())
@@ -3086,6 +3352,7 @@ fn cron_job_requires_completion_tool(job: &CronJobRecord) -> bool {
 }
 
 fn cron_prompt_mentions_side_effect(prompt: &str) -> bool {
+    // English and Czech mutation verbs; the routine prompt corpus is bilingual.
     [
         "append", "write", "create", "update", "edit", "save", "delete", "remove", "modify",
         "backup", "generate", "touch", "pridej", "vytvor", "zapis", "uprav", "smaz", "uloz",
@@ -3111,6 +3378,9 @@ fn cron_prompt_mentions_file_or_workspace_target(prompt: &str) -> bool {
     .any(|needle| prompt.contains(needle))
 }
 
+/// Whether a proposed tool call can serve as completion evidence, and whether
+/// a backgrounded result must be rejected (a background process does not
+/// prove the side effect actually happened).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CronCompletionCandidate {
     completion_surface: bool,
@@ -3124,6 +3394,10 @@ impl CronCompletionCandidate {
     }
 }
 
+/// Maps a tool proposal to its completion-evidence classification.
+///
+/// Only explicit mutation surfaces qualify; `palyra.process.run` qualifies
+/// when foreground and not a known read-only command.
 fn cron_completion_candidate_for_tool_proposal(
     tool_name: &str,
     input_json: &[u8],
@@ -3221,6 +3495,8 @@ fn build_cron_prompt(
     )
 }
 
+/// Escapes control characters so job-provided text cannot inject fake lines
+/// into the structured prompt metadata header.
 fn format_workdir_metadata(workdir: &str) -> String {
     let prompt_safe_workdir = if workdir.chars().any(char::is_control) {
         workdir.chars().flat_map(char::escape_default).collect()
@@ -3230,6 +3506,8 @@ fn format_workdir_metadata(workdir: &str) -> String {
     format!("         - workdir: {prompt_safe_workdir}\n")
 }
 
+/// Same control-character escaping as `format_workdir_metadata`, applied to
+/// the trigger payload line.
 fn format_trigger_payload_metadata(trigger_payload_json: &str) -> String {
     let prompt_safe_payload = if trigger_payload_json.chars().any(char::is_control) {
         trigger_payload_json.chars().flat_map(char::escape_default).collect()
@@ -3245,7 +3523,7 @@ async fn record_scheduled_routine_run_metadata(
     run_id: &str,
     options: &TriggerJobOptions,
 ) -> Result<(), Status> {
-    let Some(runtime) = state.routines_runtime_config().ok() else {
+    let Ok(runtime) = state.routines_runtime_config() else {
         return Ok(());
     };
     let Some(routine) = runtime.registry.get_routine(job.job_id.as_str()).map_err(|error| {
@@ -3315,6 +3593,8 @@ fn scheduled_routine_trigger_payload(job: &CronJobRecord) -> Value {
     })
 }
 
+/// Zeroed usage snapshot for runs the orchestrator never persisted (e.g. a
+/// failure before start), keeping finalize bookkeeping total.
 fn fallback_usage_snapshot(
     run_id: &str,
     session_id: &str,
@@ -3353,6 +3633,9 @@ fn fallback_usage_snapshot(
     }
 }
 
+/// Injects scheduler identity (and admin bearer auth when required) into
+/// outgoing gateway request metadata; blank channels fall back to the
+/// system cron channel.
 fn inject_scheduler_metadata(
     metadata: &mut tonic::metadata::MetadataMap,
     auth: &GatewayAuthConfig,
@@ -3392,6 +3675,8 @@ fn inject_scheduler_metadata(
     Ok(())
 }
 
+/// Current wall-clock time as unix milliseconds; errors when the system
+/// clock reads before the epoch.
 fn now_unix_ms() -> Result<i64, Status> {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3399,6 +3684,8 @@ fn now_unix_ms() -> Result<i64, Status> {
     Ok(elapsed.as_millis() as i64)
 }
 
+/// Unwraps a time read, logging and substituting `fallback` on failure so
+/// scheduler progress never depends on a healthy clock.
 fn now_unix_ms_or_fallback(
     now_result: Result<i64, Status>,
     fallback: i64,
