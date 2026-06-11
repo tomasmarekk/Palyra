@@ -3753,6 +3753,47 @@ fn cleanup_resource_parsers_extract_run_owned_handles() {
 }
 
 #[test]
+fn process_stop_parser_requires_verified_tracked_tree_shutdown() {
+    let tracked_without_after_count = serde_json::to_vec(&json!({
+        "alive": false,
+        "process_tree_alive": false,
+        "tracked_process_count_before_stop": 2,
+    }))
+    .expect("stop output should serialize");
+    assert!(
+        !super::process_stop_outcome_verifies_tree_stopped(
+            tracked_without_after_count.as_slice()
+        ),
+        "tracked Windows tree stops need a post-stop tracked count before cleanup tracking is released"
+    );
+
+    let tracked_with_zero_after_count = serde_json::to_vec(&json!({
+        "alive": false,
+        "process_tree_alive": false,
+        "tracked_process_count_before_stop": 2,
+        "tracked_process_count": 0,
+    }))
+    .expect("stop output should serialize");
+    assert!(super::process_stop_outcome_verifies_tree_stopped(
+        tracked_with_zero_after_count.as_slice()
+    ));
+
+    let direct_only_stopped = serde_json::to_vec(&json!({
+        "alive": false,
+        "process_tree_alive": false,
+    }))
+    .expect("stop output should serialize");
+    assert!(super::process_stop_outcome_verifies_tree_stopped(direct_only_stopped.as_slice()));
+
+    let still_alive = serde_json::to_vec(&json!({
+        "alive": true,
+        "process_tree_alive": true,
+    }))
+    .expect("stop output should serialize");
+    assert!(!super::process_stop_outcome_verifies_tree_stopped(still_alive.as_slice()));
+}
+
+#[test]
 fn cleanup_resource_registry_deduplicates_and_drains_by_run() {
     let state = build_test_runtime_state(false);
     let run_id = Ulid::new().to_string();

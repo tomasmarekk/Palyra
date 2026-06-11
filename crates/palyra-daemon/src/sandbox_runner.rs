@@ -402,10 +402,9 @@ impl Drop for WindowsBackgroundJob {
 
 // Registry of live background jobs keyed by the direct child pid, consulted by the portable
 // stop/status builtins so they can act on the whole tree instead of just the launcher pid.
-// AIDEV-NOTE: entries are only removed by an explicit stop (take_windows_background_job).
-// Background processes that exit naturally, or are reaped by the lifetime monitor, leave their
-// job handle registered until daemon shutdown. Fixing this needs a behavior change (eviction
-// when the monitor observes exit), so it is only flagged here.
+// AIDEV-NOTE: keep the job registered through termination verification. If stop removes the
+// handle before the post-stop status probe, a dead wrapper pid can make detached descendants look
+// cleaned up even while the job still had process-tree evidence.
 #[cfg(windows)]
 static WINDOWS_BACKGROUND_JOBS: OnceLock<Mutex<HashMap<u32, Arc<WindowsBackgroundJob>>>> =
     OnceLock::new();
@@ -1006,6 +1005,9 @@ fn builtin_stop_process_success(
         kind: SandboxProcessRunErrorKind::RuntimeFailure,
         message: format!("failed to serialize sandbox process stop output JSON: {error}"),
     })?;
+    if !alive {
+        release_background_process_tracking_if_stopped(pid);
+    }
     Ok(SandboxProcessRunSuccess { output_json })
 }
 
@@ -3931,14 +3933,6 @@ fn register_windows_background_job(pid: u32, job: Arc<WindowsBackgroundJob>) -> 
 }
 
 #[cfg(windows)]
-fn take_windows_background_job(pid: u32) -> Option<Arc<WindowsBackgroundJob>> {
-    match windows_background_jobs().lock() {
-        Ok(mut jobs) => jobs.remove(&pid),
-        Err(_) => None,
-    }
-}
-
-#[cfg(windows)]
 fn windows_background_job_active_process_count(pid: u32) -> Option<io::Result<u32>> {
     let job = match windows_background_jobs().lock() {
         Ok(jobs) => jobs.get(&pid).cloned(),
@@ -3949,6 +3943,30 @@ fn windows_background_job_active_process_count(pid: u32) -> Option<io::Result<u3
         }
     }?;
     Some(job.active_process_count())
+}
+
+#[cfg(windows)]
+fn windows_background_job(pid: u32) -> Option<Arc<WindowsBackgroundJob>> {
+    match windows_background_jobs().lock() {
+        Ok(jobs) => jobs.get(&pid).cloned(),
+        Err(_) => None,
+    }
+}
+
+#[cfg(windows)]
+fn remove_windows_background_job(pid: u32) {
+    if let Ok(mut jobs) = windows_background_jobs().lock() {
+        jobs.remove(&pid);
+    }
+}
+
+/// Releases platform-specific process-tree tracking once a caller has verified the tree is
+/// inactive.
+pub(crate) fn release_background_process_tracking_if_stopped(pid: u32) {
+    #[cfg(windows)]
+    if background_process_runtime_status(pid).map(|status| !status.alive()).unwrap_or(false) {
+        remove_windows_background_job(pid);
+    }
 }
 
 /// Terminates the process tree rooted at `pid` (Windows).
@@ -3966,7 +3984,7 @@ pub(crate) fn terminate_background_process_tree(pid: u32) -> io::Result<()> {
     let mut succeeded = false;
     let mut errors = Vec::new();
 
-    if let Some(job) = take_windows_background_job(pid) {
+    if let Some(job) = windows_background_job(pid) {
         match job.terminate() {
             Ok(()) => succeeded = true,
             Err(error) => errors.push(format!("job object termination failed: {error}")),
@@ -7689,6 +7707,11 @@ mod tests {
                 .and_then(serde_json::Value::as_bool),
             Some(true),
             "stop should recognize the tree as running before termination: {stopped_output}"
+        );
+        assert_eq!(
+            stopped_output.get("tracked_process_count").and_then(serde_json::Value::as_u64),
+            Some(0),
+            "stop should report the post-termination Windows job count before releasing tracking: {stopped_output}"
         );
     }
 

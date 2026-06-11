@@ -987,7 +987,10 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation(
         let config =
             process_runner_tool_config_for_session(runtime_state, context, input_json).await;
         let outcome = execute_tool_call(&config, proposal_id, tool_name, input_json).await;
-        if tool_name == PROCESS_STOP_TOOL_NAME && outcome.success {
+        if tool_name == PROCESS_STOP_TOOL_NAME
+            && outcome.success
+            && process_stop_outcome_verifies_tree_stopped(outcome.output_json.as_slice())
+        {
             if let Some(pid) = process_lifecycle_pid_from_tool_input(input_json) {
                 runtime_state.forget_run_background_process(context.run_id, pid);
             }
@@ -1154,6 +1157,24 @@ fn process_lifecycle_pid_from_tool_input(input_json: &[u8]) -> Option<u32> {
         .get("pid")
         .and_then(|value| value.as_u64().or_else(|| value.as_str()?.trim().parse::<u64>().ok()))?;
     u32::try_from(pid).ok().filter(|pid| *pid > 0)
+}
+
+fn process_stop_outcome_verifies_tree_stopped(output_json: &[u8]) -> bool {
+    let Ok(payload) = serde_json::from_slice::<Value>(output_json) else {
+        return false;
+    };
+    if payload.get("alive").and_then(Value::as_bool) != Some(false) {
+        return false;
+    }
+
+    let tracked_count_before =
+        payload.get("tracked_process_count_before_stop").and_then(Value::as_u64);
+    if tracked_count_before.is_some() {
+        return payload.get("process_tree_alive").and_then(Value::as_bool) == Some(false)
+            && payload.get("tracked_process_count").and_then(Value::as_u64) == Some(0);
+    }
+
+    true
 }
 
 fn browser_session_id_from_create_output(output_json: &[u8]) -> Option<String> {
@@ -1672,6 +1693,9 @@ pub(crate) async fn cleanup_run_resources(
             Ok(()) => {
                 let status_after = background_process_cleanup_status(pid);
                 let alive_after = status_after.as_ref().map(|status| status.alive);
+                if alive_after == Some(false) {
+                    crate::sandbox_runner::release_background_process_tracking_if_stopped(pid);
+                }
                 let pid_artifact_outcomes = cleanup_stale_pid_artifacts_after_status(
                     runtime_state,
                     run_id,
@@ -1699,6 +1723,9 @@ pub(crate) async fn cleanup_run_resources(
                 );
                 let status_after = background_process_cleanup_status(pid);
                 let alive_after = status_after.as_ref().map(|status| status.alive);
+                if alive_after == Some(false) {
+                    crate::sandbox_runner::release_background_process_tracking_if_stopped(pid);
+                }
                 let pid_artifact_outcomes = cleanup_stale_pid_artifacts_after_status(
                     runtime_state,
                     run_id,
