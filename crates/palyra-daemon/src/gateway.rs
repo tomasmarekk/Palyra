@@ -1518,9 +1518,8 @@ pub(crate) async fn build_and_ingest_tool_result_memory_summary(
     summary
 }
 
-/// Marks an approval record as `Error` (e.g. the prompt could not be
-/// delivered); resolution failures are logged, not propagated, because this
-/// runs on paths that are already failing.
+/// Resolves a failed approval request path without propagating secondary
+/// resolution errors, because this runs on paths that are already failing.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn best_effort_mark_approval_error(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -1530,14 +1529,22 @@ pub(crate) async fn best_effort_mark_approval_error(
     if let Err(error) = runtime_state
         .resolve_approval_record(ApprovalResolveRequest {
             approval_id: approval_id.to_owned(),
-            decision: ApprovalDecision::Error,
+            decision: approval_failure_decision(reason.as_str()),
             decision_scope: ApprovalDecisionScope::Once,
             decision_reason: reason,
             decision_scope_ttl_ms: None,
         })
         .await
     {
-        warn!(approval_id, error = %error, "failed to mark approval record as error");
+        warn!(approval_id, error = %error, "failed to resolve failed approval request");
+    }
+}
+
+fn approval_failure_decision(reason: &str) -> ApprovalDecision {
+    if reason.starts_with("approval_request_dispatch_error:") {
+        ApprovalDecision::Deny
+    } else {
+        ApprovalDecision::Error
     }
 }
 

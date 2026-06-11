@@ -47,7 +47,7 @@ use ulid::Ulid;
 
 use super::vault::vault_get_requires_approval;
 use super::{
-    best_effort_mark_approval_error, common_v1, constant_time_eq,
+    approval_failure_decision, best_effort_mark_approval_error, common_v1, constant_time_eq,
     enforce_vault_get_approval_policy, enforce_vault_scope_access, ingest_memory_best_effort,
     matching_tool_approval_response_id, process_runner_input_should_use_active_root,
     process_runner_input_with_path_env, process_runner_workspace_root_for_input,
@@ -5011,7 +5011,7 @@ async fn approval_list_zero_limit_uses_default_page_size() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn best_effort_mark_approval_error_resolves_pending_record() {
+async fn best_effort_mark_approval_error_resolves_dispatch_failures_as_denies() {
     let state = build_test_runtime_state(false);
     let created = state
         .create_approval_record(build_test_approval_request(0))
@@ -5033,8 +5033,8 @@ async fn best_effort_mark_approval_error_resolves_pending_record() {
         .expect("approval should exist");
     assert_eq!(
         resolved.decision,
-        Some(ApprovalDecision::Error),
-        "best-effort error marking should close the approval lifecycle"
+        Some(ApprovalDecision::Deny),
+        "missing interactive approval dispatch is a fail-closed policy denial, not a system error"
     );
     assert!(
         resolved.resolved_at_unix_ms.is_some(),
@@ -5047,6 +5047,22 @@ async fn best_effort_mark_approval_error_resolves_pending_record() {
             .unwrap_or_default()
             .contains("approval_request_dispatch_error"),
         "resolved approval should retain reason context"
+    );
+}
+
+#[test]
+fn approval_failure_decision_keeps_durable_recording_errors_as_errors() {
+    assert_eq!(
+        approval_failure_decision("approval_request_dispatch_error: response channel closed"),
+        ApprovalDecision::Deny
+    );
+    assert_eq!(
+        approval_failure_decision("approval_request_journal_error: disk full"),
+        ApprovalDecision::Error
+    );
+    assert_eq!(
+        approval_failure_decision("route_approval_request_tape_error: write failed"),
+        ApprovalDecision::Error
     );
 }
 
