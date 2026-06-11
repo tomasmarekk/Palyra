@@ -270,6 +270,9 @@ pub(crate) fn classify_error(error: &anyhow::Error) -> CliExitCode {
     if is_agent_needs_continuation(&lower) {
         return CliExitCode::NeedsContinuation;
     }
+    if is_model_behavior_abort(&lower) {
+        return CliExitCode::Precondition;
+    }
     if let Some(exit_code) = error.chain().find_map(classify_tonic_status) {
         return exit_code;
     }
@@ -384,6 +387,11 @@ fn is_agent_needs_continuation(lower_error: &str) -> bool {
     lower_error.contains("needs_continuation=true")
         || lower_error.contains("needs continuation")
         || lower_error.contains("agent run needs continuation")
+}
+
+fn is_model_behavior_abort(lower_error: &str) -> bool {
+    lower_error.contains("model_behavior_abort")
+        || lower_error.contains("repeated malformed palyra.fs.apply_patch calls")
 }
 
 fn is_provider_turn_timeout(lower_error: &str) -> bool {
@@ -507,6 +515,16 @@ mod tests {
 
         assert_eq!(classify_error(&error), CliExitCode::NeedsContinuation);
         assert_eq!(CliExitCode::NeedsContinuation.kind(), "needs_continuation");
+    }
+
+    #[test]
+    fn classify_error_maps_repeated_model_tool_input_abort_without_internal_error() {
+        let error = anyhow!(
+            "agent run failed: model_behavior_abort: stopped after 3 repeated malformed palyra.fs.apply_patch calls (workspace_patch_parse.expected_end_patch)"
+        );
+
+        assert_eq!(classify_error(&error), CliExitCode::Precondition);
+        assert_eq!(CliExitCode::Precondition.kind(), "precondition_failed");
     }
 
     #[test]

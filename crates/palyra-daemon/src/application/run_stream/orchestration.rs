@@ -2445,7 +2445,7 @@ fn repeated_tool_failure_message(
     repeated_count: u32,
 ) -> String {
     format!(
-        "agent loop stopped after {repeated_count} repeated malformed {tool} calls ({kind}). The patch was not applied. Read the current file before retrying and send one complete patch that starts with '*** Begin Patch' and ends with '*** End Patch'; if a valid artifact already exists, preserve it instead of deleting or replacing it.",
+        "model_behavior_abort: stopped after {repeated_count} repeated malformed {tool} calls ({kind}). The failing patch was not applied. Earlier successful tool calls, if any, already ran and remain in the workspace and run tape; inspect the run tape or continue in the same session with a narrower repair prompt.",
         tool = signature.tool_name,
         kind = signature.failure_kind,
     )
@@ -3495,9 +3495,11 @@ mod tests {
             .observe(std::slice::from_ref(&message))
             .expect("third identical patch parse failure should terminate");
 
+        assert!(failure.message.contains("model_behavior_abort"));
         assert!(failure.message.contains("3 repeated malformed palyra.fs.apply_patch calls"));
         assert!(failure.message.contains("workspace_patch_parse.expected_end_patch"));
-        assert!(failure.message.contains("Read the current file before retrying"));
+        assert!(failure.message.contains("Earlier successful tool calls"));
+        assert!(!failure.message.contains("Read the current file before retrying"));
     }
 
     #[test]
