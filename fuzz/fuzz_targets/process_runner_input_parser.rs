@@ -1,3 +1,5 @@
+//! Fuzzes process-runner tool input parsing under the configured byte limit.
+
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;

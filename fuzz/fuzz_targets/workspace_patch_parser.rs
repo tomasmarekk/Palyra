@@ -1,10 +1,13 @@
+//! Fuzzes workspace patch parsing and dry-run application inside a temp root.
+
 #![no_main]
 
 use std::{fs, path::PathBuf, sync::OnceLock};
 
 use libfuzzer_sys::fuzz_target;
 use palyra_common::workspace_patch::{
-    apply_workspace_patch, WorkspacePatchLimits, WorkspacePatchRedactionPolicy, WorkspacePatchRequest,
+    apply_workspace_patch, WorkspacePatchLimits, WorkspacePatchRedactionPolicy,
+    WorkspacePatchRequest,
 };
 
 const MAX_FUZZ_PATCH_BYTES: usize = 16 * 1024;

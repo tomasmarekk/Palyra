@@ -1,3 +1,5 @@
+//! Fuzzes URL, token, cookie, header, and auth-error redaction routines.
+
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;

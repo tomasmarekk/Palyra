@@ -1,3 +1,5 @@
+//! Fuzzes webhook replay verification with an in-memory nonce store.
+
 #![no_main]
 
 use std::{collections::HashSet, sync::Mutex};
@@ -13,7 +15,11 @@ struct InMemoryReplayNonceStore {
 }
 
 impl ReplayNonceStore for InMemoryReplayNonceStore {
-    fn consume_once(&self, nonce: &str, _timestamp_unix_ms: u64) -> Result<(), WebhookPayloadError> {
+    fn consume_once(
+        &self,
+        nonce: &str,
+        _timestamp_unix_ms: u64,
+    ) -> Result<(), WebhookPayloadError> {
         let mut guard = self
             .consumed
             .lock()

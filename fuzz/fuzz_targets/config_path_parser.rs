@@ -1,3 +1,5 @@
+//! Fuzzes config-path parsing with arbitrary UTF-8 path candidates.
+
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;

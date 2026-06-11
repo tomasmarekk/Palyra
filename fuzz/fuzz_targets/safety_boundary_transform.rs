@@ -1,9 +1,11 @@
+//! Fuzzes safety inspection, prompt transforms, and export redaction.
+
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
 use palyra_safety::{
-    inspect_text, redact_text_for_export, transform_text_for_prompt, SafetyContentKind, SafetyPhase,
-    SafetySourceKind, TrustLabel,
+    inspect_text, redact_text_for_export, transform_text_for_prompt, SafetyContentKind,
+    SafetyPhase, SafetySourceKind, TrustLabel,
 };
 
 const SOURCES: &[SafetySourceKind] = &[
@@ -26,11 +28,8 @@ const CONTENT_KINDS: &[SafetyContentKind] = &[
     SafetyContentKind::SupportBundle,
 ];
 
-const TRUST_LABELS: &[TrustLabel] = &[
-    TrustLabel::TrustedLocal,
-    TrustLabel::ExternalUntrusted,
-    TrustLabel::Mixed,
-];
+const TRUST_LABELS: &[TrustLabel] =
+    &[TrustLabel::TrustedLocal, TrustLabel::ExternalUntrusted, TrustLabel::Mixed];
 
 fuzz_target!(|data: &[u8]| {
     let Ok(input) = std::str::from_utf8(data) else {

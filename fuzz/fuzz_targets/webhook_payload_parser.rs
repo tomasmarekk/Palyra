@@ -1,3 +1,5 @@
+//! Fuzzes webhook payload parsing against arbitrary byte input.
+
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;

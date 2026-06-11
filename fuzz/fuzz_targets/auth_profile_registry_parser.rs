@@ -1,3 +1,5 @@
+//! Fuzzes auth-profile registry loading from arbitrary TOML-like bytes.
+
 #![no_main]
 
 use std::{fs, path::PathBuf, sync::OnceLock};

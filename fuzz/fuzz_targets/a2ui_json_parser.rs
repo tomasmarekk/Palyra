@@ -1,3 +1,5 @@
+//! Fuzzes A2UI JSON parsing and validation against arbitrary byte input.
+
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;

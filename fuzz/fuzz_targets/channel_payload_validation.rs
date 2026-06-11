@@ -1,3 +1,5 @@
+//! Fuzzes channel inbound and outbound payload deserialization plus validation.
+
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
