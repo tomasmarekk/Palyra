@@ -1,3 +1,11 @@
+//! Outbound delivery lifecycle tracking for channel responses.
+//!
+//! Records the phase trail of one outbound response (accepted through
+//! delivered/failed/cleaned-up), selects the delivery mode from per-channel
+//! capabilities, and guarantees connector-side artifacts (typing indicators,
+//! reactions) are cleaned up exactly once on every terminal path. Consumed
+//! by `route_message` and surfaced in journal snapshots.
+
 use palyra_common::redaction::redact_auth_error;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -6,6 +14,8 @@ use crate::application::delivery_arbitration::DeliverySurface;
 
 const OUTBOUND_LIFECYCLE_SCHEMA_VERSION: u32 = 1;
 
+/// Outbound feature set a channel supports, used to pick the delivery mode
+/// and decide which lifecycle phases apply.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ChannelOutboundCapabilities {
     pub(crate) typing: bool,
@@ -18,6 +28,11 @@ pub(crate) struct ChannelOutboundCapabilities {
 }
 
 impl ChannelOutboundCapabilities {
+    /// Derives the capability set for `channel` from its delivery surface.
+    ///
+    /// A zero or unrepresentable `max_message_bytes` falls back to 2000
+    /// bytes, except on audit-only surfaces where it is forced to 0 (the
+    /// sentinel that disables delivery entirely).
     #[must_use]
     pub(crate) fn for_channel(channel: &str, max_message_bytes: u64) -> Self {
         let surface = DeliverySurface::from_channel(Some(channel));
@@ -64,6 +79,7 @@ impl ChannelOutboundCapabilities {
     }
 }
 
+/// Observable phases of one outbound response, in rough delivery order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum OutboundLifecyclePhase {
@@ -81,6 +97,7 @@ pub(crate) enum OutboundLifecyclePhase {
 }
 
 impl OutboundLifecyclePhase {
+    /// Stable snake_case label used in journal snapshots.
     #[must_use]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
@@ -99,6 +116,8 @@ impl OutboundLifecyclePhase {
     }
 }
 
+/// How the final response reaches the channel: progressively edited draft,
+/// single final message, or journal-only audit record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum OutboundDeliveryMode {
@@ -108,6 +127,7 @@ pub(crate) enum OutboundDeliveryMode {
 }
 
 impl OutboundDeliveryMode {
+    /// Stable snake_case label used in journal snapshots.
     #[must_use]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
@@ -118,6 +138,8 @@ impl OutboundDeliveryMode {
     }
 }
 
+/// One recorded phase transition; cleanup flags capture the lifecycle state
+/// at the moment the event was observed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct OutboundLifecycleEvent {
     pub(crate) phase: OutboundLifecyclePhase,
@@ -127,6 +149,7 @@ pub(crate) struct OutboundLifecycleEvent {
     pub(crate) cleanup_completed: bool,
 }
 
+/// Inputs for [`OutboundLifecycle::start`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OutboundLifecycleStart {
     pub(crate) lifecycle_id: String,
@@ -140,6 +163,8 @@ pub(crate) struct OutboundLifecycleStart {
     pub(crate) observed_at_unix_ms: i64,
 }
 
+/// Mutable lifecycle state for one outbound response, accumulating the
+/// ordered phase trail until a terminal `finalize_*` call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct OutboundLifecycle {
     pub(crate) schema_version: u32,
@@ -156,6 +181,12 @@ pub(crate) struct OutboundLifecycle {
 }
 
 impl OutboundLifecycle {
+    /// Opens a lifecycle and records the synchronous intake phases
+    /// (accepted, acked, queued) that route_message has already completed
+    /// by the time the lifecycle exists.
+    ///
+    /// Typing/reaction requests are honored only when the channel supports
+    /// them, and either one marks the lifecycle as requiring cleanup.
     #[must_use]
     pub(crate) fn start(input: OutboundLifecycleStart) -> Self {
         let delivery_mode = select_delivery_mode(&input.capabilities, input.draft_requested);
@@ -201,16 +232,19 @@ impl OutboundLifecycle {
         lifecycle
     }
 
+    /// Records that the provider started streaming output.
     #[allow(dead_code)]
     pub(crate) fn record_streaming(&mut self, observed_at_unix_ms: i64) {
         self.record(OutboundLifecyclePhase::Streaming, "provider_streaming", observed_at_unix_ms);
     }
 
+    /// Records that a tool call is executing for this response.
     #[allow(dead_code)]
     pub(crate) fn record_tool_running(&mut self, observed_at_unix_ms: i64) {
         self.record(OutboundLifecyclePhase::ToolRunning, "tool_call_running", observed_at_unix_ms);
     }
 
+    /// Records that the run is blocked on an explicit approval.
     #[allow(dead_code)]
     pub(crate) fn record_waiting_approval(&mut self, observed_at_unix_ms: i64) {
         self.record(
@@ -220,6 +254,7 @@ impl OutboundLifecycle {
         );
     }
 
+    /// Terminal path: records finalizing + delivered, then runs cleanup.
     pub(crate) fn finalize_success(&mut self, observed_at_unix_ms: i64) {
         self.record(
             OutboundLifecyclePhase::Finalizing,
@@ -234,6 +269,10 @@ impl OutboundLifecycle {
         self.cleanup("success", observed_at_unix_ms);
     }
 
+    /// Terminal path: records the failure and runs cleanup.
+    ///
+    /// The reason is redacted before storage because provider failures can
+    /// echo credentials from request headers.
     pub(crate) fn finalize_failure(&mut self, reason: &str, observed_at_unix_ms: i64) {
         let safe_reason = redact_auth_error(reason);
         self.failure_reason = Some(safe_reason.clone());
@@ -241,6 +280,8 @@ impl OutboundLifecycle {
         self.cleanup("failure", observed_at_unix_ms);
     }
 
+    /// Terminal path for cancelled runs; recorded as a failure with the
+    /// fixed reason `cancelled`, then cleaned up.
     #[allow(dead_code)]
     pub(crate) fn finalize_cancelled(&mut self, observed_at_unix_ms: i64) {
         self.failure_reason = Some("cancelled".to_owned());
@@ -248,6 +289,8 @@ impl OutboundLifecycle {
         self.cleanup("cancellation", observed_at_unix_ms);
     }
 
+    /// Renders the lifecycle as journal-safe JSON; the failure reason was
+    /// already redacted when it was recorded.
     #[must_use]
     pub(crate) fn safe_snapshot_json(&self) -> Value {
         json!({
@@ -274,6 +317,7 @@ impl OutboundLifecycle {
     }
 
     fn cleanup(&mut self, reason: &str, observed_at_unix_ms: i64) {
+        // Idempotent so overlapping terminal paths record CleanedUp once.
         if self.cleanup_completed {
             return;
         }
@@ -297,6 +341,7 @@ fn select_delivery_mode(
     capabilities: &ChannelOutboundCapabilities,
     draft_requested: bool,
 ) -> OutboundDeliveryMode {
+    // max_message_bytes == 0 is the audit-only sentinel set by for_channel.
     if capabilities.max_message_bytes == 0 {
         return OutboundDeliveryMode::AuditOnly;
     }

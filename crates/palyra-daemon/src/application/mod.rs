@@ -1,3 +1,8 @@
+//! Application layer of the daemon: channel routing, session orchestration,
+//! tool execution, memory, and approval flows built on top of the gateway
+//! runtime and journal. Submodules are grouped by capability; `route_message`
+//! and `run_stream` are the inbound and provider-turn entry points.
+
 pub mod approvals;
 pub mod auth;
 pub mod channel_commands;

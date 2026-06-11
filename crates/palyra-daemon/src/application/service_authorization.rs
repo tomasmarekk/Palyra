@@ -1,15 +1,28 @@
+//! Deny-by-default authorization gates for sensitive gRPC service surfaces.
+//!
+//! Wraps `palyra-policy` evaluation and maps decisions to `tonic::Status`
+//! errors. Sensitive surfaces (agent management, auth profiles, approvals)
+//! additionally require an admin/system principal prefix regardless of the
+//! policy outcome. Called from the gateway gRPC handlers before any work.
+
 use palyra_policy::{
     evaluate_with_config, evaluate_with_context, PolicyDecision, PolicyEvaluationConfig,
     PolicyRequest, PolicyRequestContext,
 };
 use tonic::Status;
 
+/// Principal-prefix requirement applied on top of policy evaluation for
+/// sensitive service surfaces.
 #[derive(Clone, Copy)]
 pub(crate) enum SensitiveServiceRole {
     AdminOnly,
     AdminOrSystem,
 }
 
+/// Returns whether `principal` carries the prefix required by `role`.
+///
+/// Matching is case-insensitive on the prefix only; the remainder of the
+/// principal is not validated here.
 #[must_use]
 pub(crate) fn principal_has_sensitive_service_role(
     principal: &str,
@@ -25,6 +38,11 @@ pub(crate) fn principal_has_sensitive_service_role(
     }
 }
 
+/// Authorizes a cron service action through the default policy.
+///
+/// # Errors
+/// Returns `Status::permission_denied` when policy denies the action and
+/// `Status::internal` when policy evaluation itself fails.
 #[allow(clippy::result_large_err)]
 pub(crate) fn authorize_cron_action(
     principal: &str,
@@ -34,6 +52,14 @@ pub(crate) fn authorize_cron_action(
     authorize_policy_action(principal, action, resource, "cron")
 }
 
+/// Authorizes message routing with the channel forwarded as policy context.
+///
+/// The session and run identifiers are accepted for call-site symmetry but
+/// are not part of the policy request today.
+///
+/// # Errors
+/// Returns `Status::permission_denied` when policy denies the action and
+/// `Status::internal` when policy evaluation itself fails.
 #[allow(clippy::result_large_err)]
 pub(crate) fn authorize_message_action(
     principal: &str,
@@ -61,6 +87,11 @@ pub(crate) fn authorize_message_action(
     map_policy_decision(action, resource, evaluation.decision)
 }
 
+/// Authorizes a memory service action through the default policy.
+///
+/// # Errors
+/// Returns `Status::permission_denied` when policy denies the action and
+/// `Status::internal` when policy evaluation itself fails.
 #[allow(clippy::result_large_err)]
 pub(crate) fn authorize_memory_action(
     principal: &str,
@@ -70,6 +101,11 @@ pub(crate) fn authorize_memory_action(
     authorize_policy_action(principal, action, resource, "memory")
 }
 
+/// Authorizes a vault service action through the default policy.
+///
+/// # Errors
+/// Returns `Status::permission_denied` when policy denies the action and
+/// `Status::internal` when policy evaluation itself fails.
 #[allow(clippy::result_large_err)]
 pub(crate) fn authorize_vault_action(
     principal: &str,
@@ -79,6 +115,11 @@ pub(crate) fn authorize_vault_action(
     authorize_policy_action(principal, action, resource, "vault")
 }
 
+/// Authorizes agent management; requires an `admin:` principal prefix.
+///
+/// # Errors
+/// Returns `Status::permission_denied` when the principal lacks the required
+/// role prefix and `Status::internal` when policy evaluation fails.
 #[allow(clippy::result_large_err)]
 pub(crate) fn authorize_agent_management_action(
     principal: &str,
@@ -95,6 +136,11 @@ pub(crate) fn authorize_agent_management_action(
     )
 }
 
+/// Authorizes auth profile management; requires an admin/system principal.
+///
+/// # Errors
+/// Returns `Status::permission_denied` when the principal lacks the required
+/// role prefix and `Status::internal` when policy evaluation fails.
 #[allow(clippy::result_large_err)]
 pub(crate) fn authorize_auth_profile_action(
     principal: &str,
@@ -111,6 +157,11 @@ pub(crate) fn authorize_auth_profile_action(
     )
 }
 
+/// Authorizes approvals APIs; requires an admin/system principal.
+///
+/// # Errors
+/// Returns `Status::permission_denied` when the principal lacks the required
+/// role prefix and `Status::internal` when policy evaluation fails.
 #[allow(clippy::result_large_err)]
 pub(crate) fn authorize_approvals_action(
     principal: &str,
@@ -167,6 +218,9 @@ fn authorize_sensitive_service_action(
     if principal_has_sensitive_service_role(principal, role) {
         return Ok(());
     }
+    // The role prefix is a hard requirement: even a policy Allow is rejected
+    // for principals without it, and the surface-specific allow_reason
+    // explains the missing prefix instead of the policy's allow rationale.
     let reason = match evaluation.decision {
         PolicyDecision::Allow => allow_reason.to_owned(),
         PolicyDecision::DenyByDefault { reason } => reason,

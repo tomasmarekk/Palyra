@@ -27,6 +27,9 @@ pub(crate) use onboarding::{
     finalize_discord_onboarding_plan, normalize_discord_token, summarize_discord_inbound_monitor,
 };
 
+/// Builds the Discord block of the channel operations snapshot: required
+/// permission labels, the most recent permission-shaped failure message, and
+/// a health-refresh hint for exact gap checks.
 pub(crate) fn build_discord_channel_operations_payload(
     connector_id: &str,
     connector: &palyra_connectors::ConnectorStatusSnapshot,
@@ -62,6 +65,16 @@ pub(crate) fn build_discord_channel_operations_payload(
     })
 }
 
+/// Probes the bot identity (and optionally one channel's permissions) with
+/// the connector's vault token and assembles the `health_refresh` payload.
+///
+/// Token-resolution and identity-probe failures are reported inside the
+/// payload (`refreshed: false` plus a sanitized message) rather than as
+/// errors, so a broken credential still yields an inspectable health surface.
+///
+/// # Errors
+/// Returns an invalid-argument response only when `verify_channel_id` is not
+/// a canonical Discord snowflake.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn build_discord_channel_health_refresh_payload(
     state: &AppState,
@@ -120,6 +133,18 @@ fn discord_account_id_from_connector_id(connector_id: &str) -> Option<&str> {
     connector_id.trim().strip_prefix("discord:").map(str::trim).filter(|value| !value.is_empty())
 }
 
+/// Resolves the Discord bot token for a connector from the vault, preferring
+/// the instance's explicit vault ref over the account-derived default.
+///
+/// This is the static credential check behind the channel auth-failure
+/// overlay, so failures are returned as operator-facing message strings (the
+/// caller surfaces them verbatim) instead of a typed error. The token value
+/// itself must never appear in the returned messages.
+///
+/// # Errors
+/// Returns a message when the connector instance cannot be loaded, the
+/// connector is not a Discord connector, the vault ref is malformed, or the
+/// secret is missing, non-UTF-8, or empty.
 pub(crate) fn resolve_discord_connector_token(
     state: &AppState,
     connector_id: &str,
@@ -160,28 +185,29 @@ pub(crate) fn resolve_discord_connector_token(
     Ok(token)
 }
 
+fn discord_operation_for_mutation(
+    operation: channels::DiscordMessageMutationKind,
+) -> DiscordMessageOperation {
+    match operation {
+        channels::DiscordMessageMutationKind::Edit => DiscordMessageOperation::Edit,
+        channels::DiscordMessageMutationKind::Delete => DiscordMessageOperation::Delete,
+        channels::DiscordMessageMutationKind::ReactAdd => DiscordMessageOperation::ReactAdd,
+        channels::DiscordMessageMutationKind::ReactRemove => DiscordMessageOperation::ReactRemove,
+    }
+}
+
+/// Maps a message mutation kind to its Discord policy action name.
 pub(crate) fn channel_message_policy_action(
     operation: channels::DiscordMessageMutationKind,
 ) -> &'static str {
-    let discord_operation = match operation {
-        channels::DiscordMessageMutationKind::Edit => DiscordMessageOperation::Edit,
-        channels::DiscordMessageMutationKind::Delete => DiscordMessageOperation::Delete,
-        channels::DiscordMessageMutationKind::ReactAdd => DiscordMessageOperation::ReactAdd,
-        channels::DiscordMessageMutationKind::ReactRemove => DiscordMessageOperation::ReactRemove,
-    };
-    discord_policy_action_for_operation(discord_operation)
+    discord_policy_action_for_operation(discord_operation_for_mutation(operation))
 }
 
+/// Maps a message mutation kind to the Discord permission labels it requires.
 pub(crate) fn channel_message_required_permissions(
     operation: channels::DiscordMessageMutationKind,
 ) -> Vec<String> {
-    let discord_operation = match operation {
-        channels::DiscordMessageMutationKind::Edit => DiscordMessageOperation::Edit,
-        channels::DiscordMessageMutationKind::Delete => DiscordMessageOperation::Delete,
-        channels::DiscordMessageMutationKind::ReactAdd => DiscordMessageOperation::ReactAdd,
-        channels::DiscordMessageMutationKind::ReactRemove => DiscordMessageOperation::ReactRemove,
-    };
-    discord_permission_labels_for_operation(discord_operation)
+    discord_permission_labels_for_operation(discord_operation_for_mutation(operation))
         .iter()
         .map(|value| (*value).to_owned())
         .collect()

@@ -1,3 +1,12 @@
+//! Durable mapping from channel conversation scopes to daemon sessions.
+//!
+//! A binding ties one (channel, conversation, thread, sender, principal)
+//! scope to a session, with idle/max-age expiry, conflict detection, and
+//! operator-reviewable repair plans. Binding ids are content-addressed
+//! (`cb_<sha256>`), so create_or_touch is idempotent per scope+session.
+//! The store persists as a single JSON file and is consumed by
+//! `route_message` to resolve which session an inbound message belongs to.
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
@@ -16,12 +25,20 @@ const DEFAULT_IDLE_TIMEOUT_MS: i64 = 8 * 60 * 60 * 1_000;
 const DEFAULT_MAX_AGE_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 const MAX_BINDING_COMPONENT_BYTES: usize = 512;
 const MAX_BINDING_LIST_LIMIT: usize = 1_000;
+// Tiny test cap so prune-at-limit behavior is exercisable without
+// creating thousands of records.
 #[cfg(not(test))]
 const MAX_BINDING_RECORDS: usize = 10_000;
 #[cfg(test)]
 const MAX_BINDING_RECORDS: usize = 8;
 const HASH_SUFFIX_PREFIX: &str = "#sha256:";
 
+/// Kind of conversation binding.
+///
+/// INTENTIONAL: the derived `Ord` doubles as resolution priority - among
+/// the kinds considered by [`ConversationBindingStore::resolve`], later
+/// variants win (DelegatedRun > Thread > Main). Do not reorder variants
+/// without revisiting the resolver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConversationBindingKind {
@@ -33,6 +50,7 @@ pub enum ConversationBindingKind {
 }
 
 impl ConversationBindingKind {
+    /// Stable snake_case label used in snapshots and binding ids.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -45,6 +63,8 @@ impl ConversationBindingKind {
     }
 }
 
+/// Lifecycle state of a binding. Only `Active` bindings resolve; the other
+/// states are kept for audit until pruning removes them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConversationBindingLifecycleState {
@@ -55,6 +75,7 @@ pub enum ConversationBindingLifecycleState {
 }
 
 impl ConversationBindingLifecycleState {
+    /// Stable snake_case label used in snapshots.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -65,12 +86,14 @@ impl ConversationBindingLifecycleState {
         }
     }
 
+    /// Returns whether the state is `Active`.
     #[must_use]
     pub const fn is_active(self) -> bool {
         matches!(self, Self::Active)
     }
 }
 
+/// Expiry policy for a binding; `None` disables the respective limit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationBindingLifecycle {
     pub idle_timeout_ms: Option<i64>,
@@ -89,6 +112,11 @@ impl Default for ConversationBindingLifecycle {
 }
 
 impl ConversationBindingLifecycle {
+    /// Computes the effective expiry: the earlier of idle and max-age
+    /// deadlines, or `None` when both limits are disabled.
+    ///
+    /// Negative TTLs are clamped to zero, i.e. immediate expiry rather than
+    /// an expiry in the past of the anchor timestamp.
     #[must_use]
     pub fn expires_at(
         &self,
@@ -107,6 +135,8 @@ impl ConversationBindingLifecycle {
     }
 }
 
+/// One persisted binding. All identifier components are normalized
+/// (trimmed, byte-bounded) before storage; see `bound_component_bytes`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationBindingRecord {
     pub schema_version: u32,
@@ -136,12 +166,14 @@ pub struct ConversationBindingRecord {
 }
 
 impl ConversationBindingRecord {
+    /// Returns whether the binding is active and not past its expiry.
     #[must_use]
     pub fn active(&self, now_unix_ms: i64) -> bool {
         self.state.is_active()
             && self.expires_at_unix_ms.is_none_or(|expires_at| expires_at > now_unix_ms)
     }
 
+    /// Returns the full per-principal scope key used for resolution.
     #[must_use]
     pub fn scope_key(&self) -> ConversationBindingScopeKey {
         ConversationBindingScopeKey {
@@ -154,6 +186,8 @@ impl ConversationBindingRecord {
         }
     }
 
+    /// Returns the principal-less scope key used to detect cross-principal
+    /// and cross-workspace conflicts on the same conversation.
     #[must_use]
     pub fn conflict_scope_key(&self) -> ConversationBindingConflictScopeKey {
         ConversationBindingConflictScopeKey {
@@ -165,6 +199,8 @@ impl ConversationBindingRecord {
         }
     }
 
+    /// Renders a journal-safe snapshot with channel-derived identifiers
+    /// redacted.
     #[must_use]
     pub fn safe_snapshot_json(&self) -> Value {
         json!({
@@ -235,6 +271,8 @@ impl ConversationBindingRecord {
     }
 }
 
+/// Resolution key: a binding matches a message only when every component,
+/// including the principal, is equal.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ConversationBindingScopeKey {
     pub binding_kind: ConversationBindingKind,
@@ -248,6 +286,8 @@ pub struct ConversationBindingScopeKey {
     pub principal: String,
 }
 
+/// Conflict-detection key: like [`ConversationBindingScopeKey`] but without
+/// the principal, so two principals bound to one conversation collide.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ConversationBindingConflictScopeKey {
     pub binding_kind: ConversationBindingKind,
@@ -260,6 +300,7 @@ pub struct ConversationBindingConflictScopeKey {
     pub sender_identity: Option<String>,
 }
 
+/// Inputs for [`ConversationBindingStore::create_or_touch`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationBindingCreateRequest {
     pub binding_kind: ConversationBindingKind,
@@ -276,6 +317,8 @@ pub struct ConversationBindingCreateRequest {
     pub now_unix_ms: i64,
 }
 
+/// Inputs for [`ConversationBindingStore::resolve`]: the scope of one
+/// inbound message, without a binding kind (the resolver tries all kinds).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationBindingResolveRequest {
     pub channel: String,
@@ -287,6 +330,12 @@ pub struct ConversationBindingResolveRequest {
 }
 
 impl ConversationBindingResolveRequest {
+    /// Builds the normalized scope key this request would match for
+    /// `binding_kind`.
+    ///
+    /// The thread id participates only for thread-shaped kinds: a main
+    /// binding covers the whole conversation, so a message inside a thread
+    /// must still fall back to it when no thread binding exists.
     #[must_use]
     pub fn scope_key(&self, binding_kind: ConversationBindingKind) -> ConversationBindingScopeKey {
         ConversationBindingScopeKey {
@@ -307,6 +356,7 @@ impl ConversationBindingResolveRequest {
     }
 }
 
+/// Filter for [`ConversationBindingStore::list`]; `None` fields match all.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ConversationBindingListFilter {
     pub channel: Option<String>,
@@ -316,6 +366,8 @@ pub struct ConversationBindingListFilter {
     pub limit: Option<usize>,
 }
 
+/// Result of a create-or-touch: the stored record plus whether it was newly
+/// created and a stable reason label.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ConversationBindingMutationOutcome {
     pub record: ConversationBindingRecord,
@@ -323,6 +375,8 @@ pub struct ConversationBindingMutationOutcome {
     pub reason: String,
 }
 
+/// Result of a resolve: the winning record (if any), why, how many records
+/// expired during the lookup, and any detected conflicts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ConversationBindingResolution {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -332,6 +386,7 @@ pub struct ConversationBindingResolution {
     pub conflicts: Vec<ConversationBindingConflict>,
 }
 
+/// Categories of binding inconsistencies surfaced by conflict detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConversationBindingConflictKind {
@@ -344,6 +399,7 @@ pub enum ConversationBindingConflictKind {
 }
 
 impl ConversationBindingConflictKind {
+    /// Stable snake_case label used in reports.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -357,6 +413,8 @@ impl ConversationBindingConflictKind {
     }
 }
 
+/// One detected conflict with the bindings involved and a human-readable
+/// reason.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationBindingConflict {
     pub kind: ConversationBindingConflictKind,
@@ -364,6 +422,9 @@ pub struct ConversationBindingConflict {
     pub reason: String,
 }
 
+/// Repair operations a plan can propose. Only `Detach`, `Expire`, and
+/// `MarkStale` are applied automatically; `Rebind` and `Split` always wait
+/// for an operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConversationBindingRepairAction {
@@ -375,6 +436,7 @@ pub enum ConversationBindingRepairAction {
 }
 
 impl ConversationBindingRepairAction {
+    /// Stable snake_case label used in reports.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -387,6 +449,7 @@ impl ConversationBindingRepairAction {
     }
 }
 
+/// One proposed repair; `automatic` marks steps safe to apply unattended.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationBindingRepairStep {
     pub binding_id: String,
@@ -395,6 +458,8 @@ pub struct ConversationBindingRepairStep {
     pub reason: String,
 }
 
+/// Conflicts plus the proposed repair steps; `safe_to_auto_apply` is true
+/// only when every step is automatic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ConversationBindingRepairPlan {
     pub conflicts: Vec<ConversationBindingConflict>,
@@ -402,6 +467,8 @@ pub struct ConversationBindingRepairPlan {
     pub safe_to_auto_apply: bool,
 }
 
+/// Operator-facing explanation of how a scope resolves: candidate
+/// snapshots, the repair plan for any conflicts, and a one-line summary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ConversationBindingExplainReport {
     pub matches: Vec<Value>,
@@ -409,6 +476,8 @@ pub struct ConversationBindingExplainReport {
     pub summary: String,
 }
 
+/// Result of startup reconciliation: expiry and conflict counts plus the
+/// repair plan for whatever remains.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
 pub struct ConversationBindingReconcileReport {
     pub expired_count: usize,
@@ -416,6 +485,7 @@ pub struct ConversationBindingReconcileReport {
     pub repair_plan: ConversationBindingRepairPlan,
 }
 
+/// Result of applying a repair plan; `records` holds the mutated bindings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ConversationBindingRepairOutcome {
     pub applied_count: usize,
@@ -423,6 +493,10 @@ pub struct ConversationBindingRepairOutcome {
     pub records: Vec<ConversationBindingRecord>,
 }
 
+/// JSON-file-backed binding store; clones share the same in-memory state.
+///
+/// Every mutation rewrites the whole file synchronously, which is fine at
+/// the enforced `MAX_BINDING_RECORDS` scale.
 #[derive(Debug, Clone)]
 pub struct ConversationBindingStore {
     path: PathBuf,
@@ -430,6 +504,13 @@ pub struct ConversationBindingStore {
 }
 
 impl ConversationBindingStore {
+    /// Opens (or creates) the store at `path`, normalizing, validating, and
+    /// pruning persisted records before first use.
+    ///
+    /// # Errors
+    /// Returns I/O or JSON errors from reading/writing the file and
+    /// [`ConversationBindingError::InvalidRecord`] for an unsupported schema
+    /// version or a record that fails validation.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ConversationBindingError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
@@ -463,6 +544,7 @@ impl ConversationBindingStore {
         Ok(store)
     }
 
+    /// Opens a store at a unique temp path; test helper only.
     #[cfg(test)]
     pub fn open_temp() -> Self {
         let path = std::env::temp_dir()
@@ -470,6 +552,17 @@ impl ConversationBindingStore {
         Self::open(path).expect("temporary conversation binding store should open")
     }
 
+    /// Creates a binding for the request's scope, or refreshes the existing
+    /// one (the content-addressed id makes repeats idempotent).
+    ///
+    /// Touching also reactivates a detached/stale record and overwrites its
+    /// session, workspace, policy scope, parent, and lifecycle from the
+    /// request. Due records are expired first; new inserts may prune the
+    /// lowest-ranked record to stay within `MAX_BINDING_RECORDS`.
+    ///
+    /// # Errors
+    /// Returns validation errors for malformed components, lock-poisoning,
+    /// and persistence (I/O/JSON) failures.
     pub fn create_or_touch(
         &self,
         request: ConversationBindingCreateRequest,
@@ -500,6 +593,15 @@ impl ConversationBindingStore {
         Ok(ConversationBindingMutationOutcome { record, created, reason })
     }
 
+    /// Resolves the active binding for an inbound message scope.
+    ///
+    /// Precedence: delegated-run over thread over main scope, then most
+    /// recent activity, then lowest binding id as the deterministic
+    /// tiebreaker. Expires due records first and reports (but does not
+    /// repair) any conflicts found in the store.
+    ///
+    /// # Errors
+    /// Returns lock-poisoning and persistence failures from the expiry pass.
     pub fn resolve(
         &self,
         request: ConversationBindingResolveRequest,
@@ -518,6 +620,8 @@ impl ConversationBindingStore {
             })
             .cloned()
             .collect::<Vec<_>>();
+        // Descending by kind: the enum's derived Ord places DelegatedRun
+        // above Thread above Main (see ConversationBindingKind docs).
         candidates.sort_by(|left, right| {
             right
                 .binding_kind
@@ -546,6 +650,11 @@ impl ConversationBindingStore {
         })
     }
 
+    /// Refreshes activity timestamps (and thus expiry) for `binding_id`;
+    /// returns `None` when the binding does not exist.
+    ///
+    /// # Errors
+    /// Returns lock-poisoning and persistence failures.
     pub fn touch(
         &self,
         binding_id: &str,
@@ -562,6 +671,11 @@ impl ConversationBindingStore {
         Ok(Some(record))
     }
 
+    /// Lists bindings matching `filter` in deterministic (channel,
+    /// conversation, thread, id) order, capped at `MAX_BINDING_LIST_LIMIT`.
+    ///
+    /// # Errors
+    /// Returns a lock-poisoning failure.
     pub fn list(
         &self,
         filter: ConversationBindingListFilter,
@@ -600,6 +714,11 @@ impl ConversationBindingStore {
         Ok(records)
     }
 
+    /// Detaches `binding_id` so it stops resolving; returns `None` when the
+    /// binding does not exist.
+    ///
+    /// # Errors
+    /// Returns lock-poisoning and persistence failures.
     pub fn unbind(
         &self,
         binding_id: &str,
@@ -616,6 +735,12 @@ impl ConversationBindingStore {
         Ok(Some(record))
     }
 
+    /// Removes every active binding whose expiry has passed, returning the
+    /// removed records marked as expired. Persists only when something
+    /// actually expired.
+    ///
+    /// # Errors
+    /// Returns lock-poisoning and persistence failures.
     pub fn expire_due(
         &self,
         now_unix_ms: i64,
@@ -629,6 +754,11 @@ impl ConversationBindingStore {
         Ok(expired)
     }
 
+    /// Startup pass: expires due records, then reports remaining conflicts
+    /// with a repair plan (which the caller decides whether to apply).
+    ///
+    /// # Errors
+    /// Returns lock-poisoning and persistence failures.
     pub fn reconcile_on_startup(
         &self,
         now_unix_ms: i64,
@@ -644,6 +774,13 @@ impl ConversationBindingStore {
         })
     }
 
+    /// Explains how `request` resolves: a redacted summary, snapshots of
+    /// nearby bindings (including inactive ones), and the repair plan for
+    /// any conflicts.
+    ///
+    /// # Errors
+    /// Returns lock-poisoning and persistence failures from the underlying
+    /// resolve/list calls.
     pub fn explain(
         &self,
         request: ConversationBindingResolveRequest,
@@ -676,6 +813,11 @@ impl ConversationBindingStore {
         Ok(ConversationBindingExplainReport { matches, repair_plan, summary: safe_text(&summary) })
     }
 
+    /// Applies the automatic steps of `plan`; manual steps (`Rebind`,
+    /// `Split`) and steps targeting missing bindings are counted as skipped.
+    ///
+    /// # Errors
+    /// Returns lock-poisoning and persistence failures.
     pub fn apply_repair_plan(
         &self,
         plan: &ConversationBindingRepairPlan,
@@ -725,6 +867,10 @@ impl ConversationBindingStore {
             .map_err(|_| ConversationBindingError::PoisonedLock("conversation binding store"))
     }
 
+    // AIDEV-NOTE: fs::write is not atomic; a crash mid-write can leave a
+    // truncated/corrupt store that the next open() rejects with a JSON
+    // error (only a fully empty file is tolerated). A durable fix is
+    // write-to-temp-then-rename, which changes persistence behavior.
     fn persist(&self) -> Result<(), ConversationBindingError> {
         let records = self.lock_records()?.clone();
         let envelope =
@@ -750,6 +896,7 @@ impl Default for ConversationBindingStoreEnvelope {
     }
 }
 
+/// Failures from the conversation binding store.
 #[derive(Debug)]
 pub enum ConversationBindingError {
     Io(std::io::Error),
@@ -759,6 +906,8 @@ pub enum ConversationBindingError {
 }
 
 impl ConversationBindingError {
+    /// Display message with channel-derived identifiers redacted, suitable
+    /// for journals and user-facing errors.
     #[must_use]
     pub fn safe_message(&self) -> String {
         safe_text(self.to_string().as_str())
@@ -980,6 +1129,10 @@ fn build_repair_plan(conflicts: Vec<ConversationBindingConflict>) -> Conversatio
     ConversationBindingRepairPlan { conflicts, steps, safe_to_auto_apply }
 }
 
+// Content-addressed id over scope + session: rebinding the same scope to a
+// different session yields a new id (the old binding surfaces as a
+// duplicate-active conflict until detached), while repeats of the same
+// scope+session are idempotent touches.
 fn stable_binding_id(
     binding_kind: ConversationBindingKind,
     channel: &str,
@@ -1048,6 +1201,8 @@ fn normalize_record_components(
     Ok(())
 }
 
+// On duplicate ids loaded from disk, keep the record with the most recent
+// activity (then update) timestamp.
 fn insert_preferred_record(
     records: &mut BTreeMap<String, ConversationBindingRecord>,
     record: ConversationBindingRecord,
@@ -1086,6 +1241,9 @@ fn remove_due_records(
     expired
 }
 
+// Evicts lowest-ranked records (expired first, then detached/stale, then
+// least recently active) until the cap holds, never evicting the binding
+// that triggered the prune.
 fn prune_records_to_limit(
     records: &mut BTreeMap<String, ConversationBindingRecord>,
     preserve_binding_id: Option<&str>,
@@ -1141,6 +1299,9 @@ fn normalize_optional_component(value: Option<&str>) -> Option<String> {
     value.and_then(normalize_component)
 }
 
+// Oversized components are truncated but keep a full-content sha256 suffix,
+// so two long identifiers that differ only past the cutoff still produce
+// distinct (and stable) normalized values.
 fn bound_component_bytes(value: &str) -> String {
     if value.len() <= MAX_BINDING_COMPONENT_BYTES {
         return value.to_owned();

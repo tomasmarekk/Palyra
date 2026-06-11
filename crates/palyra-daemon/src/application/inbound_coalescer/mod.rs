@@ -1,3 +1,12 @@
+//! Debounce-based coalescing of rapid-fire inbound channel messages.
+//!
+//! Buckets messages by a normalized scope key (principal, session, channel,
+//! conversation, thread, sender) and merges everything that arrives within
+//! the policy debounce window into one provider turn. Commands, urgent stop
+//! requests, and media bypass coalescing. Policy comes from
+//! `channel_router::InboundCoalescingPolicy`; `route_message` drives the
+//! production flush path.
+
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
@@ -12,6 +21,9 @@ use crate::channel_router::InboundCoalescingPolicy;
 const INBOUND_COALESCING_SCHEMA_VERSION: u32 = 1;
 const MAX_SAFE_TEXT_PREVIEW_CHARS: usize = 240;
 
+/// Normalized identity of one coalescing bucket; messages merge only when
+/// every component matches. Empty required components normalize to
+/// "unknown" so malformed requests still bucket deterministically.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct InboundCoalescingKey {
     pub(crate) principal: String,
@@ -42,6 +54,8 @@ impl InboundCoalescingKey {
     }
 }
 
+/// Per-message audit trail kept alongside the merged text so the original
+/// message order and sizes stay reconstructible.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct InboundMessageProvenance {
     pub(crate) message_id: String,
@@ -51,6 +65,8 @@ pub(crate) struct InboundMessageProvenance {
     pub(crate) has_media: bool,
 }
 
+/// Result of merging one bucket: trimmed message texts joined with blank
+/// lines plus the provenance of every contributing message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct InboundCoalescedInput {
     pub(crate) key: InboundCoalescingKey,
@@ -61,6 +77,8 @@ pub(crate) struct InboundCoalescedInput {
 }
 
 impl InboundCoalescedInput {
+    /// Renders a journal-safe snapshot; the text is reduced to a redacted,
+    /// length-capped preview.
     #[must_use]
     pub(crate) fn safe_snapshot_json(&self) -> Value {
         json!({
@@ -76,6 +94,9 @@ impl InboundCoalescedInput {
     }
 }
 
+/// What the coalescer decided for a submitted message: routed around the
+/// debounce (`Bypassed`), buffered (`Pending`), or merged and released
+/// (`Ready`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum InboundCoalescingDecisionKind {
@@ -85,6 +106,7 @@ pub(crate) enum InboundCoalescingDecisionKind {
 }
 
 impl InboundCoalescingDecisionKind {
+    /// Stable snake_case label used in journal snapshots.
     #[must_use]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
@@ -95,6 +117,8 @@ impl InboundCoalescingDecisionKind {
     }
 }
 
+/// Outcome of one submission: the decision kind, a stable reason label,
+/// the coalesced input when released, and tracker occupancy for telemetry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct InboundCoalescingDecision {
     pub(crate) kind: InboundCoalescingDecisionKind,
@@ -106,6 +130,8 @@ pub(crate) struct InboundCoalescingDecision {
 }
 
 impl InboundCoalescingDecision {
+    /// Renders a journal-safe snapshot including the policy that produced
+    /// this decision.
     #[must_use]
     pub(crate) fn safe_snapshot_json(&self, policy: &InboundCoalescingPolicy) -> Value {
         json!({
@@ -121,6 +147,9 @@ impl InboundCoalescingDecision {
     }
 }
 
+/// One inbound message offered to the coalescer, carrying both the scope
+/// identity and the bypass signals (`is_command`, `urgent_stop`,
+/// `has_media`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InboundCoalescingRequest {
     pub(crate) message_id: String,
@@ -140,6 +169,7 @@ pub(crate) struct InboundCoalescingRequest {
     pub(crate) urgent_stop: bool,
 }
 
+/// Coalescer failure with a stable machine-readable code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InboundCoalescingError {
     code: &'static str,
@@ -147,17 +177,22 @@ pub(crate) struct InboundCoalescingError {
 }
 
 impl InboundCoalescingError {
+    /// Stable error code of the form `inbound_coalescing/<cause>`.
     #[must_use]
     pub(crate) const fn code(&self) -> &'static str {
         self.code
     }
 
+    /// Human-readable message with auth material redacted.
     #[must_use]
     pub(crate) fn safe_message(&self) -> String {
         redact_auth_error(self.message.as_str())
     }
 }
 
+/// Thread-safe coalescer shared across inbound handlers; clones share the
+/// same pending-bucket state. `BTreeMap` keeps bucket iteration order
+/// deterministic for drain and snapshot output.
 #[derive(Debug, Clone)]
 pub(crate) struct InboundCoalescer {
     policy: InboundCoalescingPolicy,
@@ -165,16 +200,22 @@ pub(crate) struct InboundCoalescer {
 }
 
 impl InboundCoalescer {
+    /// Creates an empty coalescer governed by `policy`.
     #[must_use]
     pub(crate) fn new(policy: InboundCoalescingPolicy) -> Self {
         Self { policy, pending: Arc::new(Mutex::new(BTreeMap::new())) }
     }
 
+    /// Returns the policy this coalescer was built with.
     #[must_use]
     pub(crate) const fn policy(&self) -> &InboundCoalescingPolicy {
         &self.policy
     }
 
+    // Deferred debounce path (buffer until the window elapses, then drain).
+    // Production currently routes through submit_for_immediate_route only,
+    // so this and drain_ready stay exercised by tests until a scheduler
+    // flushes pending buckets asynchronously.
     #[cfg(test)]
     fn submit(
         &self,
@@ -215,12 +256,16 @@ impl InboundCoalescer {
                 ready_at_unix_ms: received_at_unix_ms
                     .saturating_add(self.policy.debounce_ms as i64),
             });
+            // push() slides ready_at forward: every new message restarts the
+            // debounce window from its own arrival time.
             bucket.push(request, self.policy.debounce_ms);
             bucket.ready_at_unix_ms
         };
         let tracked_key_count = guard.len();
         if received_at_unix_ms >= ready_at_unix_ms {
-            let bucket = guard.remove(&key).expect("ready bucket should still be present");
+            let bucket = guard
+                .remove(&key)
+                .expect("bucket inserted above cannot vanish while the lock is held");
             return Ok(InboundCoalescingDecision {
                 kind: InboundCoalescingDecisionKind::Ready,
                 reason: "debounce_window_elapsed".to_owned(),
@@ -241,6 +286,16 @@ impl InboundCoalescer {
         })
     }
 
+    /// Submits a message and flushes its bucket in the same call, merging
+    /// it with anything already pending for the same key.
+    ///
+    /// This is the synchronous route_message path: the decision is always
+    /// `Bypassed` or `Ready`, never `Pending`.
+    ///
+    /// # Errors
+    /// Returns `inbound_coalescing/state_unavailable` when the state lock is
+    /// poisoned and `inbound_coalescing/max_tracked_keys_exceeded` when a
+    /// new key would exceed the policy key limit.
     pub(crate) fn submit_for_immediate_route(
         &self,
         request: InboundCoalescingRequest,
@@ -279,9 +334,8 @@ impl InboundCoalescer {
         });
         bucket.push(request, self.policy.debounce_ms);
         let ready_at_unix_ms = bucket.ready_at_unix_ms;
-        let bucket = guard
-            .remove(&key)
-            .expect("immediate route bucket should still be present while lock is held");
+        let bucket =
+            guard.remove(&key).expect("bucket inserted above cannot vanish while the lock is held");
         let coalesced = bucket.coalesced();
         Ok(InboundCoalescingDecision {
             kind: InboundCoalescingDecisionKind::Ready,
@@ -293,6 +347,11 @@ impl InboundCoalescer {
         })
     }
 
+    /// Releases every bucket whose debounce window elapsed by `now_unix_ms`.
+    ///
+    /// # Errors
+    /// Returns `inbound_coalescing/state_unavailable` when the state lock is
+    /// poisoned.
     #[allow(dead_code)]
     pub(crate) fn drain_ready(
         &self,
@@ -324,6 +383,9 @@ impl InboundCoalescer {
         Ok(decisions)
     }
 
+    // Wraps a single message as an already-coalesced decision without ever
+    // touching the pending map, so bypassed traffic cannot stall behind a
+    // bucket opened by earlier messages.
     fn bypass(
         &self,
         request: InboundCoalescingRequest,
@@ -373,6 +435,8 @@ struct PendingCoalescingBucket {
 impl PendingCoalescingBucket {
     fn push(&mut self, request: InboundCoalescingRequest, debounce_ms: u64) {
         let order = u32::try_from(self.messages.len()).unwrap_or(u32::MAX);
+        // Sliding window: each message restarts the debounce from its own
+        // arrival. The as-cast is safe for any realistic config value.
         self.ready_at_unix_ms = request.received_at_unix_ms.saturating_add(debounce_ms as i64);
         self.messages.push(PendingCoalescingMessage {
             provenance: InboundMessageProvenance {
@@ -433,12 +497,11 @@ fn normalize_optional_component(value: Option<String>) -> Option<String> {
     value.map(|value| value.trim().to_owned()).filter(|value| !value.is_empty())
 }
 
+// Redaction must run before truncation so a cut never re-exposes a secret
+// that the redactor would otherwise have matched.
 fn safe_preview(value: &str) -> String {
     let redacted = redact_url_segments_in_text(&redact_auth_error(value));
-    let mut output = String::new();
-    for character in redacted.chars().take(MAX_SAFE_TEXT_PREVIEW_CHARS) {
-        output.push(character);
-    }
+    let mut output: String = redacted.chars().take(MAX_SAFE_TEXT_PREVIEW_CHARS).collect();
     if redacted.chars().count() > MAX_SAFE_TEXT_PREVIEW_CHARS {
         output.push_str("...");
     }

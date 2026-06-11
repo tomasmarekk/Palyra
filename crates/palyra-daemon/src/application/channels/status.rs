@@ -1,3 +1,10 @@
+//! Channel status and health-refresh payload assembly for console/admin APIs.
+//!
+//! Combines connector status, runtime snapshot, queue depth, and recent dead
+//! letters into one operations view, then overlays a fail-closed auth-failure
+//! surface whenever any signal looks credential-related so a cached
+//! ready/running snapshot can never mask a broken token.
+
 use serde_json::{json, Value};
 
 use crate::{
@@ -9,6 +16,13 @@ use crate::{
     *,
 };
 
+/// Builds the consolidated status payload (`connector`, `runtime`,
+/// `operations`) for one connector, applying the auth-failure overlay when a
+/// static credential check fails.
+///
+/// # Errors
+/// Returns a platform error response when the connector is unknown or any
+/// status, runtime, queue, or dead-letter lookup fails.
 #[allow(clippy::result_large_err)]
 pub(crate) fn build_channel_status_payload(
     state: &AppState,
@@ -40,6 +54,13 @@ pub(crate) fn build_channel_status_payload(
     Ok(payload)
 }
 
+/// Extends the status payload with a provider-driven `health_refresh` probe
+/// and re-applies the auth-failure overlay when the probe surfaces a
+/// credential problem.
+///
+/// # Errors
+/// Returns a platform error response when status assembly fails or the
+/// provider health refresh rejects its inputs.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn build_channel_health_refresh_payload(
     state: &AppState,
@@ -90,6 +111,10 @@ fn build_channel_operations_snapshot(
         .unwrap_or(0);
     let last_auth_failure = find_channel_auth_failure(connector, runtime, recent_dead_letters);
     let mut saturation_reasons = Vec::new();
+    // Saturation states are ordered by operator urgency; the first matching
+    // condition wins: an explicit pause outranks dead letters, which outrank
+    // rate limiting, auth failures, in-flight backpressure, and pending
+    // retries. Reorder only with a matching console/UI contract change.
     let saturation_state = if !connector.enabled {
         saturation_reasons.push("connector_disabled".to_owned());
         "paused"
@@ -165,6 +190,8 @@ fn build_channel_operations_snapshot(
     })
 }
 
+/// Scans connector error, runtime error, and the newest dead-letter reason
+/// for credential-related wording; first match wins.
 fn find_channel_auth_failure(
     connector: &palyra_connectors::ConnectorStatusSnapshot,
     runtime: Option<&Value>,
@@ -202,6 +229,10 @@ fn health_refresh_auth_failure_message(health_refresh: &Value) -> Option<String>
     )
 }
 
+/// Rewrites the status payload to fail closed on an auth failure: readiness
+/// and liveness are forced to a stopped/credential-failed surface even when
+/// the cached connector snapshot still claims ready/running, because a static
+/// credential check outranks stale runtime state.
 fn apply_channel_auth_failure_surface(payload: &mut Value, message: &str) {
     let readiness = if message.contains("credential missing")
         || message.contains("missing credential")
@@ -223,7 +254,7 @@ fn apply_channel_auth_failure_surface(payload: &mut Value, message: &str) {
     payload["operations"]["saturation"]["state"] = Value::String("auth_failed".to_owned());
     let reasons = payload["operations"]["saturation"]["reasons"]
         .as_array_mut()
-        .expect("channel saturation reasons should stay array-backed");
+        .expect("operations.saturation.reasons is always emitted as a JSON array by build_channel_operations_snapshot");
     let failure_reason = format!("last_auth_failure={message}");
     if !reasons.iter().filter_map(Value::as_str).any(|existing| existing == failure_reason) {
         reasons.push(Value::String(failure_reason));

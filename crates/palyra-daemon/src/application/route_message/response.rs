@@ -1,3 +1,12 @@
+//! Provider-response post-processing and outbound assembly for route-message.
+//!
+//! Folds provider events into a single reply string (tool proposals execute
+//! inline through the shared provider-event surface), persists the bounded
+//! provider turn output to the tape, extracts optional structured JSON and
+//! A2UI updates when JSON mode was requested, and splits the final text into
+//! channel-size-bounded outbound chunks where only the first chunk carries
+//! attachments and metadata.
+
 use std::sync::Arc;
 
 use palyra_common::CANONICAL_PROTOCOL_MAJOR;
@@ -21,14 +30,21 @@ use crate::{
     },
 };
 
+/// Hard ceiling per outbound chunk; a connector-reported payload limit can
+/// only lower it, never raise it.
 const DEFAULT_ROUTE_MESSAGE_OUTPUT_MAX_BYTES: usize = 2_000;
 
+/// Structured output extracted from a JSON-mode reply: the canonicalized
+/// JSON bytes plus an optional embedded A2UI update. Empty when JSON mode is
+/// off or the reply is not valid JSON.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RouteMessageStructuredOutput {
     pub(crate) structured_json: Vec<u8>,
     pub(crate) a2ui_update: Option<common_v1::A2uiUpdate>,
 }
 
+/// Final result of provider-response processing: the assembled reply text,
+/// structured output, and token usage to account against the run.
 #[derive(Debug, Clone)]
 pub(crate) struct RouteProviderResponseOutcome {
     pub(crate) reply_text: String,
@@ -37,6 +53,9 @@ pub(crate) struct RouteProviderResponseOutcome {
     pub(crate) completion_tokens: u64,
 }
 
+/// Per-route metadata applied when chunking a reply into outbound messages;
+/// attachment/ack/reaction/structured fields are emitted on the first chunk
+/// only.
 pub(crate) struct RouteMessageOutputTemplate<'a> {
     pub(crate) thread_id: &'a str,
     pub(crate) in_reply_to_message_id: &'a str,
@@ -49,6 +68,10 @@ pub(crate) struct RouteMessageOutputTemplate<'a> {
     pub(crate) delivery_metadata: Option<&'a Value>,
 }
 
+/// Parses the reply as structured output when JSON mode was requested.
+///
+/// Non-JSON replies degrade to the default (empty) output instead of failing
+/// the route: JSON mode is a request to the model, not a guarantee.
 pub(crate) fn parse_route_message_structured_output(
     reply_text: &str,
     json_mode_requested: bool,
@@ -72,6 +95,8 @@ pub(crate) fn parse_route_message_structured_output(
     RouteMessageStructuredOutput { structured_json, a2ui_update }
 }
 
+/// Splits the reply into outbound messages no larger than the effective
+/// payload limit, applying the template's first-chunk-only metadata.
 pub(crate) fn build_route_message_outputs(
     reply_text: &str,
     max_payload_bytes: u64,
@@ -109,6 +134,9 @@ pub(crate) fn build_route_message_outputs(
     outputs
 }
 
+/// Picks the first chunk's structured payload: model-produced structured
+/// JSON always wins; delivery metadata is only attached when the model
+/// produced none, so it can never mask model output.
 fn build_route_message_first_structured_json(template: &RouteMessageOutputTemplate<'_>) -> Vec<u8> {
     if !template.structured_json.is_empty() {
         return template.structured_json.to_vec();
@@ -122,6 +150,14 @@ fn build_route_message_first_structured_json(template: &RouteMessageOutputTempla
     .unwrap_or_default()
 }
 
+/// Drives every provider event through the shared event surface (executing
+/// tool proposals inline), persists the turn output, and assembles the final
+/// reply for the route.
+///
+/// # Errors
+/// Returns a status when event processing, tool execution bookkeeping, or
+/// the tape append of the provider turn output fails, or when the shared
+/// surface reports a cancelled outcome (impossible on this surface).
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_route_provider_response(
@@ -160,6 +196,9 @@ pub(crate) async fn process_route_provider_response(
         {
             RunStreamProviderEventOutcome::Continue => {}
             RunStreamProviderEventOutcome::Cancelled => {
+                // The route surface has no cancellation source, so a
+                // cancelled outcome can only mean a bug in the shared
+                // provider-event machinery.
                 return Err(Status::internal(
                     "route provider event processing unexpectedly returned cancelled outcome",
                 ));
@@ -167,6 +206,10 @@ pub(crate) async fn process_route_provider_response(
         }
     }
     persist_route_provider_turn_output(runtime_state, run_id, tape_seq, &provider_output).await?;
+    // Reply precedence: the turn's consolidated full text leads, any text
+    // accumulated by the event surface follows; if both are empty, fall back
+    // to tool-result summary tokens, then to a literal ack so connectors
+    // never have to deliver an empty message.
     if !provider_output.full_text.trim().is_empty() {
         if reply_text.trim().is_empty() {
             reply_text = provider_output.full_text.clone();
@@ -180,6 +223,8 @@ pub(crate) async fn process_route_provider_response(
     if reply_text.trim().is_empty() {
         reply_text = "ack".to_owned();
     }
+    // Structured output must be parsed before the prefix is applied: a
+    // prepended prefix would make an otherwise valid JSON reply unparseable.
     let structured_output =
         parse_route_message_structured_output(reply_text.as_str(), json_mode_requested);
     if let Some(prefix) = response_prefix {
@@ -194,6 +239,7 @@ pub(crate) async fn process_route_provider_response(
     })
 }
 
+/// Appends the size-bounded, redacted provider turn output to the tape.
 #[allow(clippy::result_large_err)]
 async fn persist_route_provider_turn_output(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -215,10 +261,12 @@ async fn persist_route_provider_turn_output(
             payload_json,
         })
         .await?;
-    *tape_seq += 1;
+    *tape_seq = (*tape_seq).saturating_add(1);
     Ok(())
 }
 
+/// Splits the trimmed reply into chunks of at most `max_bytes`, breaking on
+/// `char` boundaries so multi-byte UTF-8 sequences are never severed.
 fn split_route_message_reply_text(reply_text: &str, max_bytes: usize) -> Vec<String> {
     let normalized = reply_text.trim();
     if normalized.is_empty() {
@@ -246,6 +294,9 @@ fn split_route_message_reply_text(reply_text: &str, max_bytes: usize) -> Vec<Str
     chunks
 }
 
+/// Extracts an A2UI update from structured output, accepting both field
+/// spellings and a patch supplied either as an embedded object or as a
+/// stringified-JSON value (re-encoded canonically when it parses).
 fn parse_route_message_a2ui_update(value: &Value) -> Option<common_v1::A2uiUpdate> {
     let update = value.get("a2ui_update").or_else(|| value.get("a2ui"))?;
     let update_object = update.as_object()?;

@@ -1,3 +1,11 @@
+//! Approval-request recording for tool proposals on the route-message surface.
+//!
+//! Route message has no interactive client that could answer an approval
+//! prompt mid-request, so a required approval is persisted as a pending
+//! record (plus tape and journal events) and handed to the decision layer,
+//! which denies the proposal for this run while the record stays available
+//! for later operator action.
+
 use std::sync::Arc;
 
 use tonic::Status;
@@ -19,6 +27,18 @@ use crate::{
     transport::grpc::auth::RequestContext,
 };
 
+/// Creates the pending approval record for a proposal that requires one and
+/// mirrors the request to the tape and journal.
+///
+/// Returns `Ok(None)` when no approval is required, otherwise
+/// `Ok(Some(approval_id))` for the decision layer to attach as the pending
+/// approval (which denies the proposal for this run).
+///
+/// # Errors
+/// Returns the status from approval-record creation, tape append, or journal
+/// append failures. Tape/journal failures first mark the freshly created
+/// approval as errored (best effort) so no permanently pending record is
+/// left behind for a request that was never durably recorded.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn resolve_route_tool_approval_outcome(

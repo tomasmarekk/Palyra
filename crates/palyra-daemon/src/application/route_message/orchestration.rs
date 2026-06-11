@@ -1,3 +1,15 @@
+//! Route-message orchestration: one inbound channel message to one reply.
+//!
+//! [`handle_routed_route_message`] runs the full pipeline for a message the
+//! channel router already matched to a route plan: authorize the inbound
+//! action, resolve session and conversation binding, coalesce duplicate
+//! inbound text, run a single provider exchange (tool proposals handled
+//! inline via `tool_flow` behind `response`), authorize the outbound send,
+//! and assemble size-bounded outputs. In contrast to `run_stream` there is
+//! no client to stream to: every outcome, including rejection, comes back as
+//! one `RouteMessageResponse` while being mirrored to the orchestrator tape
+//! and journal.
+
 use std::sync::{atomic::Ordering, Arc};
 
 use palyra_common::{runtime_preview::RuntimePreviewCapability, CANONICAL_PROTOCOL_MAJOR};
@@ -58,6 +70,8 @@ use super::response::{
     build_route_message_outputs, process_route_provider_response, RouteMessageOutputTemplate,
 };
 
+/// Builds the model-visible tool catalog for this routed run and records it
+/// on the tape so replays see exactly what the model was offered.
 #[allow(clippy::too_many_arguments)]
 async fn build_and_record_route_tool_catalog_snapshot(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -98,6 +112,19 @@ async fn build_and_record_route_tool_catalog_snapshot(
     Ok(snapshot)
 }
 
+/// Processes one routed inbound message end to end and returns the final
+/// `RouteMessageResponse`.
+///
+/// Policy denials and provider failures are not errors: they return
+/// `accepted: false` with a decision reason (and a retry disposition for
+/// provider failures) so the connector can ack, retry, or quarantine the
+/// envelope. Journal writes along the way are best-effort and never fail the
+/// route.
+///
+/// # Errors
+/// Returns a status only for infrastructure failures: session resolution,
+/// conversation-binding or run-state bookkeeping, tape appends, usage
+/// accounting, or provider-response processing.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_routed_route_message(
@@ -115,6 +142,8 @@ pub(crate) async fn handle_routed_route_message(
     actor_gateway_device_id: &str,
     retry_attempt: u32,
 ) -> Result<gateway_v1::RouteMessageResponse, Status> {
+    // Cloned because binding metadata is filled in below for journaling and
+    // output assembly; the caller's plan must stay untouched for retries.
     let mut plan = plan.clone();
     let route_request_context =
         request_context_with_resolved_route_channel(request_context, plan.channel.as_str());
@@ -130,8 +159,12 @@ pub(crate) async fn handle_routed_route_message(
     ) {
         runtime_state.record_denied();
         runtime_state.counters.channel_messages_rejected.fetch_add(1, Ordering::Relaxed);
+        // The intake denial happens before any session/run exists, so fresh
+        // ids are minted purely to give the journal event a stable shape.
         let journal_session_id = Ulid::new().to_string();
         let journal_run_id = Ulid::new().to_string();
+        // Journal writes are best-effort throughout this flow: the routing
+        // outcome must not change because an audit append failed.
         let _ = record_message_router_journal_event(
             runtime_state,
             &route_request_context,
@@ -176,7 +209,7 @@ pub(crate) async fn handle_routed_route_message(
             session_key: Some(plan.session_key.clone()),
             session_label: requested_session_label
                 .map(ToOwned::to_owned)
-                .or(plan.session_label.clone()),
+                .or_else(|| plan.session_label.clone()),
             principal: route_request_context.principal.clone(),
             device_id: route_request_context.device_id.clone(),
             channel: Some(plan.channel.clone()),
@@ -257,6 +290,8 @@ pub(crate) async fn handle_routed_route_message(
         })?;
     let inbound_coalescing_snapshot =
         coalescing_decision.safe_snapshot_json(runtime_state.inbound_coalescer.policy());
+    // When the coalescer merged rapid-fire messages, the merged text becomes
+    // the model input; a blank merge falls back to the original message.
     let effective_input_text = coalescing_decision
         .coalesced
         .as_ref()
@@ -302,6 +337,8 @@ pub(crate) async fn handle_routed_route_message(
     .await;
     runtime_state.record_channel_message_routed();
 
+    // Agent resolution only enriches journaling/routing metadata; a failure
+    // here must not reject a message that already passed policy.
     let route_agent = match runtime_state
         .resolve_agent_for_context(AgentResolveRequest {
             principal: route_request_context.principal.clone(),
@@ -524,6 +561,9 @@ pub(crate) async fn handle_routed_route_message(
     let provider_response = match provider_response {
         Ok(response) => response,
         Err(error) => {
+            // Provider failure is a retryable outcome, not an RPC error: the
+            // router decides whether the envelope is re-queued, quarantined,
+            // or dropped, and the response reports that disposition.
             let error_message = error.message().to_owned();
             outbound_lifecycle.finalize_failure(error_message.as_str(), current_unix_ms());
             let outbound_lifecycle_snapshot = outbound_lifecycle.safe_snapshot_json();
@@ -651,6 +691,10 @@ pub(crate) async fn handle_routed_route_message(
     };
     let reply_text = route_provider_response.reply_text;
     let route_structured_output = route_provider_response.structured_output;
+    // Second policy gate: intake authorized receiving the message, but the
+    // outbound send is re-checked closest to dispatch (now with session/run
+    // context) so a policy change or session-scoped rule landing during
+    // generation still blocks delivery.
     if let Err(error) = authorize_message_action(
         route_request_context.principal.as_str(),
         "channel.send",

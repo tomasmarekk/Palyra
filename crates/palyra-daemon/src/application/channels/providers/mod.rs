@@ -9,6 +9,10 @@ use crate::{app::state::AppState, journal::ApprovalRiskLevel, *};
 
 pub(crate) mod discord;
 
+/// Builds the provider-specific block of the channel operations snapshot.
+///
+/// Returns [`Value::Null`] for connector kinds without provider-owned
+/// operations data so the generic payload shape stays stable.
 pub(crate) fn build_channel_provider_operations_payload(
     connector_id: &str,
     connector: &palyra_connectors::ConnectorStatusSnapshot,
@@ -28,6 +32,12 @@ pub(crate) fn build_channel_provider_operations_payload(
     }
 }
 
+/// Runs the provider's static (no-network) credential check and returns the
+/// failure message when credentials cannot be resolved.
+///
+/// `None` means either the credentials resolved or the provider has no static
+/// check; callers use the message to overlay a fail-closed auth surface on
+/// otherwise healthy-looking status payloads.
 pub(crate) fn channel_provider_static_auth_failure(
     state: &AppState,
     connector_id: &str,
@@ -41,6 +51,14 @@ pub(crate) fn channel_provider_static_auth_failure(
     }
 }
 
+/// Runs the provider's live health-refresh probe for the connector.
+///
+/// Unsupported connector kinds return a stable `supported: false` payload
+/// instead of an error so the console can render the gap explicitly.
+///
+/// # Errors
+/// Returns a platform error response when the connector is unknown or the
+/// provider probe rejects its inputs.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn build_channel_provider_health_refresh_payload(
     state: &AppState,
@@ -64,6 +82,15 @@ pub(crate) async fn build_channel_provider_health_refresh_payload(
     }
 }
 
+/// Classifies the approval/risk governance for a channel message mutation
+/// (edit, delete, reaction changes) against the previewed message.
+///
+/// Non-Discord connectors fail closed: every mutation is classified high risk
+/// with approval required until a provider implements its own governance.
+///
+/// # Errors
+/// Returns a platform error response when the connector or its instance
+/// cannot be loaded, or when the wall clock is unavailable.
 #[allow(clippy::result_large_err)]
 pub(crate) fn classify_channel_message_mutation_governance(
     state: &AppState,
@@ -97,18 +124,25 @@ pub(crate) fn classify_channel_message_mutation_governance(
     }
 }
 
+/// Maps a message mutation to its policy action name.
+///
+/// Currently delegates to Discord because the mutation kinds themselves are
+/// Discord-shaped; a second provider will need a provider-neutral kind first.
 pub(crate) fn channel_message_policy_action(
     operation: channels::DiscordMessageMutationKind,
 ) -> &'static str {
     discord::channel_message_policy_action(operation)
 }
 
+/// Maps a message mutation to the provider permission labels it requires.
 pub(crate) fn channel_message_required_permissions(
     operation: channels::DiscordMessageMutationKind,
 ) -> Vec<String> {
     discord::channel_message_required_permissions(operation)
 }
 
+/// Returns the first non-empty message containing any needle
+/// (case-insensitive), sanitized for safe surfacing to operators.
 pub(crate) fn find_matching_message<'a, I>(messages: I, needles: &[&str]) -> Option<String>
 where
     I: IntoIterator<Item = Option<&'a str>>,

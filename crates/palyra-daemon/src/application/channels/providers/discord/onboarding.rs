@@ -1,3 +1,14 @@
+//! Discord onboarding: preflight evaluation and the apply flow.
+//!
+//! One evaluation path backs both surfaces: preflight validates the token
+//! against the Discord API and previews routing, policy, and security
+//! defaults without persisting anything, while apply re-runs the same
+//! evaluation (with the open-guild-scope confirmation enforced) and then
+//! persists the token to the vault, merges routing rules into the config
+//! file, and enables the connector. Permission and intent checks are
+//! best-effort warnings, never hard failures, so onboarding can complete
+//! under degraded Discord API connectivity.
+
 use std::{
     fs,
     path::PathBuf,
@@ -18,6 +29,11 @@ use crate::{
     *,
 };
 
+/// Normalized, validated onboarding decisions derived from one request.
+///
+/// Built once by [`build_discord_onboarding_plan`] and shared by preflight
+/// preview, config persistence, and policy-warning evaluation so all three
+/// surfaces describe the same effective configuration.
 #[derive(Debug, Clone)]
 pub(crate) struct DiscordOnboardingPlan {
     pub(crate) connector_id: String,
@@ -42,6 +58,12 @@ struct DiscordOnboardingEvaluation {
     preflight: DiscordOnboardingPreflightResponse,
 }
 
+/// Evaluates an onboarding request without persisting anything: validates
+/// the token live against Discord and returns the full preflight preview.
+///
+/// # Errors
+/// Returns an error response when the token is empty, request fields fail
+/// validation, or the Discord identity probe fails.
 pub(crate) async fn build_discord_onboarding_preflight(
     state: &AppState,
     payload: DiscordOnboardingRequest,
@@ -50,6 +72,25 @@ pub(crate) async fn build_discord_onboarding_preflight(
     Ok(evaluation.preflight)
 }
 
+/// Applies an onboarding request end to end and returns the combined
+/// preflight, applied-state, status, and inbound-monitor payload.
+///
+/// Step ordering is deliberate: the request is fully re-evaluated (including
+/// the live token probe and the open-guild-scope confirmation gate) before
+/// any persistence; the token reaches the vault before the connector is
+/// enabled so the runtime can authenticate on first start; and the routing
+/// rules land in the config file before enablement, even though they only
+/// take effect after a daemon restart (`restart_required_for_routing_rules`).
+///
+/// AIDEV-NOTE: this apply flow is not atomic. If config persistence or
+/// enablement fails after the vault write, the token stays stored with the
+/// connector still disabled; a retry overwrites the secret, and logout/remove
+/// clean it up. Rolling back the vault write on later failures would be a
+/// behavior change.
+///
+/// # Errors
+/// Returns an error response when evaluation fails, the open-guild scope is
+/// not confirmed, or any vault, config, or connector persistence step fails.
 pub(crate) async fn apply_discord_onboarding(
     state: &AppState,
     payload: DiscordOnboardingRequest,
@@ -109,6 +150,11 @@ pub(crate) async fn apply_discord_onboarding(
     }))
 }
 
+/// Shared evaluation behind preflight and apply: normalize the request into
+/// a plan, probe Discord with the token, and assemble the preview payload.
+///
+/// `require_open_scope_confirmation` is `true` only on apply so preflight can
+/// preview an open-guild plan (with a warning) without the confirmation flag.
 async fn evaluate_discord_onboarding_request(
     state: &AppState,
     payload: &DiscordOnboardingRequest,
@@ -133,6 +179,8 @@ async fn evaluate_discord_onboarding_request(
         probe_discord_bot_identity(token.as_str(), verify_channel_id.as_deref())
             .await
             .map_err(runtime_status_response)?;
+    // The identity probe must precede plan finalization: default mention
+    // patterns are derived from the bot id/username returned by Discord.
     plan = finalize_discord_onboarding_plan(plan, &bot);
     let inbound_monitor = load_discord_inbound_monitor_summary(state, plan.connector_id.as_str());
     let mut warnings = build_discord_onboarding_warnings(
@@ -172,6 +220,13 @@ async fn evaluate_discord_onboarding_request(
     Ok(DiscordOnboardingEvaluation { token, plan, preflight })
 }
 
+/// Normalizes and validates a raw onboarding request into a
+/// [`DiscordOnboardingPlan`], applying conservative defaults (DM-only scope,
+/// pairing DM policy, deny broadcast, mention gating outside open scope).
+///
+/// # Errors
+/// Returns an invalid-argument response when an explicitly provided mode,
+/// scope, policy, or filter value fails validation.
 #[allow(clippy::result_large_err)]
 pub(crate) fn build_discord_onboarding_plan(
     payload: &DiscordOnboardingRequest,
@@ -179,6 +234,8 @@ pub(crate) fn build_discord_onboarding_plan(
     let account_id =
         channels::normalize_discord_account_id(payload.account_id.as_deref().unwrap_or("default"))
             .map_err(channel_platform_error_response)?;
+    // `parse` returns None for both absent and invalid input, so defaulting
+    // and rejecting an explicit-but-invalid value need separate checks.
     let mode = DiscordOnboardingMode::parse(payload.mode.as_deref())
         .unwrap_or(DiscordOnboardingMode::Local);
     if payload.mode.is_some() && DiscordOnboardingMode::parse(payload.mode.as_deref()).is_none() {
@@ -237,6 +294,12 @@ pub(crate) fn build_discord_onboarding_plan(
     })
 }
 
+/// Normalizes an optional channel id to a canonical Discord snowflake,
+/// treating absent or blank input as "no channel to verify".
+///
+/// # Errors
+/// Returns an invalid-argument response when a non-blank value contains
+/// non-digit characters or has a non-snowflake length.
 #[allow(clippy::result_large_err)]
 pub(crate) fn normalize_optional_discord_channel_id(
     raw: Option<&str>,
@@ -261,6 +324,9 @@ pub(crate) fn normalize_optional_discord_channel_id(
     Ok(Some(normalized.to_owned()))
 }
 
+/// Completes a plan with identity-dependent defaults: when mention gating is
+/// on and the request supplied no patterns, derive them from the probed bot
+/// id and username.
 pub(crate) fn finalize_discord_onboarding_plan(
     mut plan: DiscordOnboardingPlan,
     bot: &DiscordBotIdentitySummary,
@@ -359,6 +425,8 @@ fn build_discord_onboarding_warnings(
     warnings
 }
 
+/// Converts a channel permission check into operator-facing warnings, one
+/// per failed check status and one per missing required permission.
 pub(crate) fn build_discord_channel_permission_warnings(
     check: Option<&DiscordChannelPermissionCheck>,
 ) -> Vec<String> {
@@ -424,6 +492,8 @@ pub(crate) fn build_discord_channel_permission_warnings(
     warnings
 }
 
+/// Describes the security posture this plan ships with, as human-readable
+/// statements surfaced in the preflight preview.
 pub(crate) fn build_discord_onboarding_security_defaults(
     plan: &DiscordOnboardingPlan,
 ) -> Vec<String> {
@@ -449,6 +519,8 @@ pub(crate) fn build_discord_onboarding_security_defaults(
     defaults
 }
 
+/// Summarizes the connector's inbound gateway-monitor state from the current
+/// runtime snapshot; lookup failures degrade to a not-registered summary.
 pub(crate) fn load_discord_inbound_monitor_summary(
     state: &AppState,
     connector_id: &str,
@@ -458,6 +530,12 @@ pub(crate) fn load_discord_inbound_monitor_summary(
     summarize_discord_inbound_monitor(connector_registered, runtime.as_ref())
 }
 
+/// Polls the inbound monitor summary until it reports alive or the bounded
+/// wait expires, returning the last summary either way.
+///
+/// The gateway monitor exposes no readiness signal to await, so a short
+/// bounded poll of the runtime snapshot is the only way to give apply
+/// responses a meaningful `inbound_alive` without blocking indefinitely.
 async fn wait_for_discord_inbound_monitor_summary(
     state: &AppState,
     connector_id: &str,
@@ -473,6 +551,8 @@ async fn wait_for_discord_inbound_monitor_summary(
     }
 }
 
+/// Builds the inbound-monitor summary from a runtime snapshot's `inbound`
+/// section; missing fields degrade to disconnected/never-observed values.
 pub(crate) fn summarize_discord_inbound_monitor(
     connector_registered: bool,
     runtime: Option<&Value>,
@@ -509,6 +589,9 @@ pub(crate) fn summarize_discord_inbound_monitor(
     }
 }
 
+/// Emits the single most actionable inbound-monitor warning for the
+/// summary's state: registration, then connectivity, then first ingest, then
+/// staleness; later checks are meaningless until earlier ones pass.
 pub(crate) fn build_discord_inbound_monitor_warnings(
     summary: &DiscordInboundMonitorSummary,
 ) -> Vec<String> {
@@ -543,10 +626,15 @@ pub(crate) fn build_discord_inbound_monitor_warnings(
     warnings
 }
 
+/// Returns whether the inbound monitor is fully alive: registered, gateway
+/// connected, and with a recent inbound event.
 pub(crate) fn discord_inbound_monitor_is_alive(summary: &DiscordInboundMonitorSummary) -> bool {
     summary.connector_registered && summary.gateway_connected && summary.recent_inbound
 }
 
+/// Dry-runs the deny-by-default policy engine for the message and tool
+/// actions this plan will need, so operators learn about missing policy
+/// grants during preflight instead of at first live message.
 fn evaluate_discord_policy_warnings(state: &AppState, plan: &DiscordOnboardingPlan) -> Vec<String> {
     let mut warnings = Vec::new();
     let principal = channels::discord_principal(plan.account_id.as_str());
@@ -625,6 +713,17 @@ fn evaluate_discord_policy_warnings(state: &AppState, plan: &DiscordOnboardingPl
     warnings
 }
 
+/// Validates the bot token against the Discord API and returns the bot
+/// identity plus best-effort application and channel-permission summaries.
+///
+/// Only the identity lookup is fatal; the application and channel checks
+/// degrade to `None`/check-status values so transient Discord issues cannot
+/// block onboarding.
+///
+/// # Errors
+/// Returns `invalid_argument` when Discord rejects the token (401/403) and
+/// `unavailable` when the identity endpoint is unreachable or returns an
+/// unusable response.
 pub(crate) async fn probe_discord_bot_identity(
     token: &str,
     verify_channel_id: Option<&str>,
@@ -704,6 +803,28 @@ pub(crate) async fn probe_discord_bot_identity(
     Ok((bot, application, channel_permission_check))
 }
 
+/// Builds the all-permissions-false check result used for every non-Ok
+/// outcome. `can_view_channel` is `true` only for [`ParseError`] outcomes:
+/// the channel GET itself succeeded, proving visibility, even though the
+/// permission bitset could not be read.
+///
+/// [`ParseError`]: DiscordChannelPermissionCheckStatus::ParseError
+fn discord_channel_permission_check_failure(
+    channel_id: &str,
+    status: DiscordChannelPermissionCheckStatus,
+) -> DiscordChannelPermissionCheck {
+    DiscordChannelPermissionCheck {
+        channel_id: channel_id.to_owned(),
+        status,
+        can_view_channel: matches!(status, DiscordChannelPermissionCheckStatus::ParseError),
+        can_send_messages: false,
+        can_read_message_history: false,
+        can_embed_links: false,
+        can_attach_files: false,
+        can_send_messages_in_threads: false,
+    }
+}
+
 async fn probe_discord_channel_permission_check(
     client: &ReqwestClient,
     token: &str,
@@ -723,70 +844,40 @@ async fn probe_discord_channel_permission_check(
     {
         Ok(value) => value,
         Err(_) => {
-            return Some(DiscordChannelPermissionCheck {
-                channel_id: channel_id.to_owned(),
-                status: DiscordChannelPermissionCheckStatus::Unavailable,
-                can_view_channel: false,
-                can_send_messages: false,
-                can_read_message_history: false,
-                can_embed_links: false,
-                can_attach_files: false,
-                can_send_messages_in_threads: false,
-            });
+            return Some(discord_channel_permission_check_failure(
+                channel_id,
+                DiscordChannelPermissionCheckStatus::Unavailable,
+            ));
         }
     };
     let status_code = response.status().as_u16();
     let status_success = response.status().is_success();
     let body = response.text().await.unwrap_or_default();
     if status_code == 403 {
-        return Some(DiscordChannelPermissionCheck {
-            channel_id: channel_id.to_owned(),
-            status: DiscordChannelPermissionCheckStatus::Forbidden,
-            can_view_channel: false,
-            can_send_messages: false,
-            can_read_message_history: false,
-            can_embed_links: false,
-            can_attach_files: false,
-            can_send_messages_in_threads: false,
-        });
+        return Some(discord_channel_permission_check_failure(
+            channel_id,
+            DiscordChannelPermissionCheckStatus::Forbidden,
+        ));
     }
     if status_code == 404 {
-        return Some(DiscordChannelPermissionCheck {
-            channel_id: channel_id.to_owned(),
-            status: DiscordChannelPermissionCheckStatus::NotFound,
-            can_view_channel: false,
-            can_send_messages: false,
-            can_read_message_history: false,
-            can_embed_links: false,
-            can_attach_files: false,
-            can_send_messages_in_threads: false,
-        });
+        return Some(discord_channel_permission_check_failure(
+            channel_id,
+            DiscordChannelPermissionCheckStatus::NotFound,
+        ));
     }
     if !status_success {
-        return Some(DiscordChannelPermissionCheck {
-            channel_id: channel_id.to_owned(),
-            status: DiscordChannelPermissionCheckStatus::Unavailable,
-            can_view_channel: false,
-            can_send_messages: false,
-            can_read_message_history: false,
-            can_embed_links: false,
-            can_attach_files: false,
-            can_send_messages_in_threads: false,
-        });
+        return Some(discord_channel_permission_check_failure(
+            channel_id,
+            DiscordChannelPermissionCheckStatus::Unavailable,
+        ));
     }
     let payload = match serde_json::from_str::<Value>(body.as_str()) {
         Ok(value) => value,
         Err(_) => {
-            return Some(DiscordChannelPermissionCheck {
-                channel_id: channel_id.to_owned(),
-                status: DiscordChannelPermissionCheckStatus::ParseError,
-                can_view_channel: true,
-                can_send_messages: false,
-                can_read_message_history: false,
-                can_embed_links: false,
-                can_attach_files: false,
-                can_send_messages_in_threads: false,
-            });
+            return Some(discord_channel_permission_check_failure(
+                channel_id,
+                DiscordChannelPermissionCheckStatus::ParseError,
+            ));
         }
     };
     let Some(raw_permissions) = payload
@@ -795,30 +886,18 @@ async fn probe_discord_channel_permission_check(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
-        return Some(DiscordChannelPermissionCheck {
-            channel_id: channel_id.to_owned(),
-            status: DiscordChannelPermissionCheckStatus::ParseError,
-            can_view_channel: true,
-            can_send_messages: false,
-            can_read_message_history: false,
-            can_embed_links: false,
-            can_attach_files: false,
-            can_send_messages_in_threads: false,
-        });
+        return Some(discord_channel_permission_check_failure(
+            channel_id,
+            DiscordChannelPermissionCheckStatus::ParseError,
+        ));
     };
     let permissions_mask = match raw_permissions.parse::<u64>() {
         Ok(value) => value,
         Err(_) => {
-            return Some(DiscordChannelPermissionCheck {
-                channel_id: channel_id.to_owned(),
-                status: DiscordChannelPermissionCheckStatus::ParseError,
-                can_view_channel: true,
-                can_send_messages: false,
-                can_read_message_history: false,
-                can_embed_links: false,
-                can_attach_files: false,
-                can_send_messages_in_threads: false,
-            });
+            return Some(discord_channel_permission_check_failure(
+                channel_id,
+                DiscordChannelPermissionCheckStatus::ParseError,
+            ));
         }
     };
     Some(DiscordChannelPermissionCheck {
@@ -835,6 +914,8 @@ async fn probe_discord_channel_permission_check(
     })
 }
 
+/// Best-effort lookup of the bot's application id, flags, and privileged
+/// intent status; any failure returns `None` rather than blocking onboarding.
 async fn fetch_discord_application_summary(
     client: &ReqwestClient,
     token: &str,
@@ -867,6 +948,11 @@ fn build_discord_api_url(path: &str) -> Result<Url, Response> {
     })
 }
 
+/// Extracts a short, sanitized error summary from a Discord error body.
+///
+/// Prefers the structured `message` field; otherwise falls back to the raw
+/// body capped at 200 chars, since the body is untrusted remote input that
+/// ends up in operator-facing error strings.
 fn parse_discord_error_summary(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -890,6 +976,9 @@ fn parse_discord_error_summary(raw: &str) -> Option<String> {
     }
 }
 
+/// Normalizes a pasted bot token: trims whitespace and strips an optional
+/// authorization-scheme prefix users commonly copy from API examples.
+/// Returns `None` when nothing usable remains.
 pub(crate) fn normalize_discord_token(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -907,6 +996,8 @@ pub(crate) fn normalize_discord_token(raw: &str) -> Option<String> {
     }
 }
 
+/// Lowercases, dedupes, and validates sender filter entries; the character
+/// allowlist keeps the values safe to embed in TOML routing rules.
 #[allow(clippy::result_large_err)]
 fn normalize_discord_sender_filters(
     raw: Option<&[String]>,
@@ -932,6 +1023,8 @@ fn normalize_discord_sender_filters(
     Ok(values)
 }
 
+/// Lowercases, dedupes, and length-bounds mention patterns; an empty result
+/// lets `finalize_discord_onboarding_plan` substitute bot-derived defaults.
 #[allow(clippy::result_large_err)]
 fn normalize_discord_mention_patterns(raw: Option<&[String]>) -> Result<Vec<String>, Response> {
     let mut patterns = Vec::new();
@@ -969,6 +1062,13 @@ fn default_discord_mention_patterns(bot_id: &str, bot_username: &str) -> Vec<Str
     patterns
 }
 
+/// Merges the plan's routing rule into the config file (replacing any
+/// existing rule for the same connector), enables the channel router, and
+/// writes the document with rotating backups.
+///
+/// The merged document is validated against the full daemon config schema
+/// before writing so a bad merge can never persist an unloadable config.
+/// Returns the config path and whether the file was newly created.
 #[allow(clippy::result_large_err)]
 fn persist_discord_onboarding_config(
     plan: &DiscordOnboardingPlan,
@@ -1079,11 +1179,15 @@ fn build_discord_onboarding_rule(plan: &DiscordOnboardingPlan) -> toml::Value {
     );
     map.insert(
         "concurrency_limit".to_owned(),
+        // Clamped to 1..=32 in build_discord_onboarding_plan, so this
+        // conversion cannot actually saturate.
         toml::Value::Integer(i64::try_from(plan.concurrency_limit).unwrap_or(i64::MAX)),
     );
     toml::Value::Table(map)
 }
 
+/// Round-trips the merged TOML document through the daemon config schema to
+/// reject any onboarding edit that would leave the config unloadable.
 #[allow(clippy::result_large_err)]
 fn validate_discord_onboarding_document(document: &toml::Value) -> Result<(), Response> {
     let serialized = toml::to_string(document).map_err(|error| {
@@ -1099,6 +1203,13 @@ fn validate_discord_onboarding_document(document: &toml::Value) -> Result<(), Re
     Ok(())
 }
 
+/// Resolves where onboarding reads and writes the daemon config:
+/// `PALYRA_CONFIG` when set, otherwise the first existing default search
+/// path, otherwise the first default path (which will be created on write).
+///
+/// # Errors
+/// Returns an error response when `PALYRA_CONFIG` holds an invalid path or
+/// the platform exposes no default config location.
 #[allow(clippy::result_large_err)]
 pub(super) fn resolve_discord_onboarding_config_path() -> Result<PathBuf, Response> {
     if let Ok(path_raw) = std::env::var("PALYRA_CONFIG") {
@@ -1123,6 +1234,12 @@ pub(super) fn resolve_discord_onboarding_config_path() -> Result<PathBuf, Respon
     Ok(candidates[0].clone())
 }
 
+/// Lifecycle-facing alias for the schema validation so `lifecycle.rs` shares
+/// the exact same guarantee when rewriting the config during account removal.
+///
+/// # Errors
+/// Returns an error response when the document no longer satisfies the
+/// daemon config schema.
 #[allow(clippy::result_large_err)]
 pub(super) fn validate_discord_onboarding_document_for_lifecycle(
     document: &toml::Value,

@@ -1,3 +1,9 @@
+//! Auth profile gRPC adapter: proto/domain conversions plus journal events.
+//!
+//! Translates between `auth.v1` protobuf messages and `palyra-auth` domain
+//! types (credentials stay vault-references only, never raw secrets) and
+//! records auth profile lifecycle events through the gateway journal.
+
 use std::sync::Arc;
 
 use palyra_auth::{
@@ -19,6 +25,7 @@ use crate::{
     },
 };
 
+/// Maps an [`AuthProfileError`] to the closest gRPC status code.
 pub(crate) fn map_auth_profile_error(error: AuthProfileError) -> Status {
     match error {
         AuthProfileError::InvalidField { .. } | AuthProfileError::InvalidPath { .. } => {
@@ -36,6 +43,13 @@ pub(crate) fn map_auth_profile_error(error: AuthProfileError) -> Status {
     }
 }
 
+/// Builds a domain list filter from the proto request.
+///
+/// Unspecified proto enums mean "no filter"; zero limit means "no limit".
+///
+/// # Errors
+/// Returns `Status::invalid_argument` when a custom provider or agent scope
+/// is selected without its required name/id field.
 #[allow(clippy::result_large_err)]
 pub(crate) fn auth_list_filter_from_proto(
     payload: auth_v1::ListAuthProfilesRequest,
@@ -84,6 +98,11 @@ pub(crate) fn auth_list_filter_from_proto(
     })
 }
 
+/// Converts a proto auth profile into a validated set request.
+///
+/// # Errors
+/// Returns `Status::invalid_argument` when provider, scope, or credential is
+/// missing or fails field-level validation.
 #[allow(clippy::result_large_err)]
 pub(crate) fn auth_set_request_from_proto(
     profile: auth_v1::AuthProfile,
@@ -166,6 +185,8 @@ fn auth_credential_from_proto(
             client_id: non_empty(value.client_id),
             client_secret_vault_ref: non_empty(value.client_secret_vault_ref),
             scopes: value.scopes,
+            // Proto3 scalars cannot express absence, so zero/negative
+            // timestamps are decoded as "unset" throughout this block.
             expires_at_unix_ms: if value.expires_at_unix_ms > 0 {
                 Some(value.expires_at_unix_ms)
             } else {
@@ -218,6 +239,7 @@ fn auth_provider_kind_from_proto(
     }
 }
 
+/// Converts a domain auth profile record into its proto representation.
 pub(crate) fn auth_profile_to_proto(profile: &AuthProfileRecord) -> auth_v1::AuthProfile {
     auth_v1::AuthProfile {
         profile_id: profile.profile_id.clone(),
@@ -297,6 +319,7 @@ fn auth_credential_to_proto(credential: &AuthCredential) -> auth_v1::AuthCredent
     }
 }
 
+/// Converts an aggregate auth health summary into its proto representation.
 pub(crate) fn auth_health_summary_to_proto(
     summary: &AuthHealthSummary,
 ) -> auth_v1::AuthHealthSummary {
@@ -310,6 +333,7 @@ pub(crate) fn auth_health_summary_to_proto(
     }
 }
 
+/// Converts a credential-expiry distribution into its proto representation.
 pub(crate) fn auth_expiry_distribution_to_proto(
     distribution: &AuthExpiryDistribution,
 ) -> auth_v1::AuthExpiryDistribution {
@@ -326,6 +350,7 @@ pub(crate) fn auth_expiry_distribution_to_proto(
     }
 }
 
+/// Converts a per-profile health record into its proto representation.
 pub(crate) fn auth_health_profile_to_proto(
     health: &palyra_auth::AuthProfileHealthRecord,
 ) -> auth_v1::AuthProfileHealth {
@@ -354,6 +379,7 @@ fn auth_health_state_to_proto(state: AuthProfileHealthState) -> i32 {
     }
 }
 
+/// Converts the OAuth refresh metrics snapshot into its proto representation.
 pub(crate) fn auth_refresh_metrics_to_proto(
     metrics: &AuthRefreshMetricsSnapshot,
 ) -> auth_v1::AuthRefreshMetrics {
@@ -374,6 +400,10 @@ pub(crate) fn auth_refresh_metrics_to_proto(
     }
 }
 
+/// Records an `auth.profile.saved` journal event for an upserted profile.
+///
+/// # Errors
+/// Returns the journal append failure from the gateway runtime.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn record_auth_profile_saved_journal_event(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -383,6 +413,8 @@ pub(crate) async fn record_auth_profile_saved_journal_event(
     runtime_state
         .record_journal_event(JournalAppendRequest {
             event_id: Ulid::new().to_string(),
+            // Auth profile administration is not tied to a chat session or
+            // run, so fresh ULIDs satisfy the journal's non-empty id fields.
             session_id: Ulid::new().to_string(),
             run_id: Ulid::new().to_string(),
             kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
@@ -408,6 +440,13 @@ pub(crate) async fn record_auth_profile_saved_journal_event(
         .map(|_| ())
 }
 
+/// Records an `auth.profile.deleted` journal event.
+///
+/// `profile` is the pre-delete record when it was still readable; provider,
+/// scope, and credential type are null in the payload otherwise.
+///
+/// # Errors
+/// Returns the journal append failure from the gateway runtime.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn record_auth_profile_deleted_journal_event(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -443,6 +482,13 @@ pub(crate) async fn record_auth_profile_deleted_journal_event(
         .map(|_| ())
 }
 
+/// Records an OAuth refresh outcome (`auth.token.refreshed` on success,
+/// `auth.refresh.failed` otherwise); no-op when no refresh was attempted.
+///
+/// The provider-supplied reason is sanitized before it reaches the journal.
+///
+/// # Errors
+/// Returns the journal append failure from the gateway runtime.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn record_auth_refresh_journal_event(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -481,6 +527,11 @@ pub(crate) async fn record_auth_refresh_journal_event(
         .map(|_| ())
 }
 
+/// Records a generic auth runtime operation event with a caller-chosen
+/// event name and details payload.
+///
+/// # Errors
+/// Returns the journal append failure from the gateway runtime.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn record_auth_runtime_operation_journal_event(
     runtime_state: &Arc<GatewayRuntimeState>,

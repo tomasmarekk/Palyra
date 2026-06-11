@@ -1,3 +1,11 @@
+//! Explicit-approval flow for sensitive tool executions.
+//!
+//! Builds approval prompts (deny is always the default option), applies
+//! operator decisions to tool decisions, reuses cached session-scoped
+//! approvals, and records approval request/resolution journal events.
+//! Workspace patches and process-runner commands get extra risk context so
+//! operators see what they are approving.
+
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -23,6 +31,8 @@ use crate::{
 
 const WORKSPACE_PATCH_TOOL_NAME: &str = "palyra.fs.apply_patch";
 
+/// Fully built approval request ready to be journaled and surfaced to the
+/// approval channel; `approval_id` is freshly generated per request.
 #[derive(Debug, Clone)]
 pub(crate) struct PendingToolApproval {
     pub(crate) approval_id: String,
@@ -31,6 +41,8 @@ pub(crate) struct PendingToolApproval {
     pub(crate) prompt: ApprovalPromptRecord,
 }
 
+/// Execution-backend resolution metadata embedded into approval prompts so
+/// operators can see where an approved tool call will actually run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ApprovalExecutionContext {
     pub(crate) requested_backend: String,
@@ -41,6 +53,12 @@ pub(crate) struct ApprovalExecutionContext {
     pub(crate) agent_id: Option<String>,
 }
 
+/// Folds an operator approval outcome into a tool decision.
+///
+/// Only decisions that are allowed *and* require approval are affected.
+/// Fail-closed: a missing approval outcome (approval channel unavailable)
+/// denies the call, as does an explicit deny. Every branch appends the
+/// original reason so the audit trail keeps the policy rationale.
 pub(crate) fn apply_tool_approval_outcome(
     mut decision: ToolDecision,
     tool_name: &str,
@@ -75,6 +93,11 @@ pub(crate) fn apply_tool_approval_outcome(
     decision
 }
 
+/// Looks up a previously granted session-scoped approval for the proposal's
+/// subject, logging the reuse when one is found.
+///
+/// Returns `None` when the proposal does not require approval or no cached
+/// decision exists, in which case the caller must prompt.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_cached_tool_approval_for_proposal(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -109,6 +132,11 @@ pub(crate) fn resolve_cached_tool_approval_for_proposal(
     cached_outcome
 }
 
+/// Assembles the approval prompt, request summary, and policy snapshot for
+/// a tool call that requires explicit approval.
+///
+/// Workspace patch calls additionally embed checkpoint/rollback context and
+/// the touched paths so the operator reviews the blast radius up front.
 pub(crate) fn build_pending_tool_approval(
     tool_name: &str,
     skill_context: Option<&ToolSkillContext>,
@@ -178,6 +206,10 @@ pub(crate) fn build_pending_tool_approval(
     }
 }
 
+/// Builds the approval cache key for a tool call.
+///
+/// The skill id is part of the subject so a session-scoped approval granted
+/// to one skill never silently covers the same tool used by another skill.
 pub(crate) fn build_tool_approval_subject_id(
     tool_name: &str,
     skill_context: Option<&ToolSkillContext>,
@@ -189,6 +221,8 @@ pub(crate) fn build_tool_approval_subject_id(
     }
 }
 
+/// Classifies the approval subject; browser tools are audited as browser
+/// actions, everything else as a generic tool.
 pub(crate) fn approval_subject_type_for_tool(tool_name: &str) -> ApprovalSubjectType {
     if tool_name.starts_with("palyra.browser.") {
         ApprovalSubjectType::BrowserAction
@@ -197,6 +231,8 @@ pub(crate) fn approval_subject_type_for_tool(tool_name: &str) -> ApprovalSubject
     }
 }
 
+// Deny is the default-selected option so a timed-out or fat-fingered prompt
+// fails closed; tests pin this invariant.
 fn default_approval_prompt_options() -> Vec<ApprovalPromptOption> {
     vec![
         ApprovalPromptOption {
@@ -321,6 +357,9 @@ fn workspace_patch_policy_hooks(patch: &str) -> Vec<&'static str> {
     hooks
 }
 
+// Extracts touched paths from both the structured patch format and plain
+// unified diffs. Capped at 16 paths: the approval prompt needs the blast
+// radius, not an exhaustive listing of an attacker-sized patch.
 fn workspace_patch_header_paths(patch: &str) -> Vec<String> {
     const PATH_PREFIXES: &[&str] =
         &["*** Add File: ", "*** Update File: ", "*** Delete File: ", "*** Move to: "];
@@ -347,6 +386,8 @@ fn workspace_patch_header_paths(patch: &str) -> Vec<String> {
     paths
 }
 
+// Prefers the post-change (+++) path; the pre-change (---) path only wins
+// for deletions, where the new side is /dev/null.
 fn push_unified_diff_header_path(paths: &mut Vec<String>, old_path: &str, new_path: &str) {
     let old_path = parse_unified_diff_header_path(old_path);
     let new_path = parse_unified_diff_header_path(new_path);
@@ -382,6 +423,12 @@ fn push_workspace_patch_path(paths: &mut Vec<String>, path: &str) {
     paths.push(truncate_with_ellipsis(normalized.to_owned(), 256));
 }
 
+/// Classifies prompt risk for an approval-gated tool call.
+///
+/// Everything defaults to High. The only downgrade (to Medium) is a
+/// process-runner call under the strongest sandbox tier (C) whose command
+/// is on the read-only allowlist; weaker tiers or unparseable input stay
+/// High.
 pub(crate) fn approval_risk_for_tool(
     tool_name: &str,
     input_json: &[u8],
@@ -400,6 +447,8 @@ pub(crate) fn approval_risk_for_tool(
     }
 }
 
+// Matches the bare command name only; arguments are deliberately ignored
+// because the Tier C sandbox, not this list, is the actual write barrier.
 fn process_runner_command_is_read_only(input_json: &[u8]) -> bool {
     const READ_ONLY_COMMANDS: &[&str] = &[
         "cat", "find", "grep", "head", "id", "ls", "pwd", "rg", "stat", "tail", "uname", "wc",
@@ -420,6 +469,10 @@ fn process_runner_command_is_read_only(input_json: &[u8]) -> bool {
     READ_ONLY_COMMANDS.iter().any(|candidate| candidate.eq_ignore_ascii_case(command))
 }
 
+/// Records an `approval.requested` journal event for a pending approval.
+///
+/// # Errors
+/// Returns the journal append failure from the gateway runtime.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn record_approval_requested_journal_event(
@@ -503,6 +556,13 @@ fn approval_requested_journal_payload(
     .into_bytes()
 }
 
+/// Records an `approval.resolved` journal event for an operator decision.
+///
+/// `proposal_id` is `None` for operator-initiated resolutions that are not
+/// tied to a specific tool proposal.
+///
+/// # Errors
+/// Returns the journal append failure from the gateway runtime.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn record_approval_resolved_journal_event(

@@ -1,3 +1,12 @@
+//! Operator command surface for chat channels (`/palyra ...`).
+//!
+//! Defines the built-in command catalog with typed argument specs, parses
+//! both free-text and connector-native invocations into a common
+//! [`ChannelCommandInvocation`], and renders policy-aware, redacted
+//! responses with audit payloads. Side-effecting commands fail closed when
+//! the scope has neither an active conversation binding nor an explicit
+//! target argument. Routing and policy checks live in `route_message`.
+
 use std::collections::BTreeMap;
 
 use palyra_common::redaction::{redact_auth_error, redact_url_segments_in_text};
@@ -13,6 +22,7 @@ const CHANNEL_COMMAND_SCHEMA_VERSION: u32 = 1;
 const COMMAND_PREFIXES: &[&str] = &["/palyra", "!palyra"];
 const MAX_FREEFORM_ARG_BYTES: usize = 8 * 1024;
 
+/// Canonical names of the built-in channel commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ChannelCommandName {
@@ -37,6 +47,8 @@ pub(crate) enum ChannelCommandName {
 }
 
 impl ChannelCommandName {
+    /// Canonical kebab-case command token shown to users and used in the
+    /// native command catalog.
     #[must_use]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
@@ -61,6 +73,7 @@ impl ChannelCommandName {
         }
     }
 
+    /// Policy action string evaluated before the command executes.
     #[must_use]
     pub(crate) const fn policy_action(self) -> &'static str {
         match self {
@@ -85,6 +98,11 @@ impl ChannelCommandName {
         }
     }
 
+    /// Returns whether the command mutates state.
+    ///
+    /// INTENTIONAL: written as the negation of the read-only set so a new
+    /// variant is treated as side-effecting (and binding-gated) until it is
+    /// explicitly listed as read-only.
     #[must_use]
     pub(crate) const fn side_effecting(self) -> bool {
         !matches!(
@@ -100,6 +118,9 @@ impl ChannelCommandName {
         )
     }
 
+    /// Resolves a command token, accepting the canonical name plus
+    /// case-insensitive aliases and separator variants
+    /// (`routine.status`/`routine:status`).
     #[must_use]
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
@@ -134,6 +155,8 @@ impl ChannelCommandName {
     }
 }
 
+/// How an invocation arrived: parsed from message text or from a
+/// connector-native command interaction (e.g. a slash command).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ChannelCommandSourceKind {
@@ -141,6 +164,7 @@ pub(crate) enum ChannelCommandSourceKind {
     Native,
 }
 
+/// Typed argument declaration within a [`ChannelCommandSpec`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ChannelCommandArgumentSpec {
     pub(crate) name: String,
@@ -163,6 +187,8 @@ impl ChannelCommandArgumentSpec {
     }
 }
 
+/// One registered command: description, policy action, side-effect flag,
+/// and ordered argument specs (order drives positional text parsing).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ChannelCommandSpec {
     pub(crate) name: ChannelCommandName,
@@ -173,6 +199,7 @@ pub(crate) struct ChannelCommandSpec {
 }
 
 impl ChannelCommandSpec {
+    /// Converts the spec to the connector-facing native command shape.
     #[must_use]
     pub(crate) fn native(&self) -> ChannelNativeCommandSpec {
         ChannelNativeCommandSpec {
@@ -185,6 +212,7 @@ impl ChannelCommandSpec {
     }
 }
 
+/// A successfully parsed command with validated, typed arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ChannelCommandInvocation {
     pub(crate) command: ChannelCommandName,
@@ -195,6 +223,9 @@ pub(crate) struct ChannelCommandInvocation {
 }
 
 impl ChannelCommandInvocation {
+    /// Deterministic dedup key over command, arguments, and scope, so a
+    /// retried delivery of the same command in the same conversation can be
+    /// recognized without suppressing identical commands elsewhere.
     #[must_use]
     pub(crate) fn idempotency_key(&self, scope: &ChannelCommandScope) -> String {
         let payload = serde_json::to_vec(&json!({
@@ -208,6 +239,7 @@ impl ChannelCommandInvocation {
     }
 }
 
+/// Typed value of one parsed argument, tagged by argument kind.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub(crate) enum ChannelCommandValue {
@@ -221,6 +253,8 @@ pub(crate) enum ChannelCommandValue {
 }
 
 impl ChannelCommandValue {
+    // Free-text values are redacted before rendering because operators can
+    // paste URLs or tokens into command arguments.
     #[must_use]
     fn user_visible(&self) -> String {
         match self {
@@ -235,6 +269,7 @@ impl ChannelCommandValue {
     }
 }
 
+/// Conversation scope a command executes in; part of the idempotency key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ChannelCommandScope {
     pub(crate) channel: String,
@@ -244,6 +279,8 @@ pub(crate) struct ChannelCommandScope {
     pub(crate) principal: String,
 }
 
+/// Snapshot of the scoped runtime (queue depth, binding, session/run ids)
+/// that response rendering reads; assembled by the caller per command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ChannelCommandRuntimeView {
     pub(crate) queue_depth: usize,
@@ -259,6 +296,8 @@ pub(crate) struct ChannelCommandRuntimeView {
     pub(crate) observed_at_unix_ms: i64,
 }
 
+/// Rendered command outcome: user-facing text plus the audit JSON that is
+/// journaled verbatim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ChannelCommandResponse {
     pub(crate) ok: bool,
@@ -267,6 +306,8 @@ pub(crate) struct ChannelCommandResponse {
     pub(crate) audit_json: Value,
 }
 
+/// Parse/validation failure with a stable code and a recovery hint that is
+/// safe to echo back to the channel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ChannelCommandErrorEnvelope {
     pub(crate) code: String,
@@ -274,6 +315,8 @@ pub(crate) struct ChannelCommandErrorEnvelope {
     pub(crate) recovery_hint: String,
 }
 
+/// Three-way parse result: ordinary message (`NotCommand`), a valid
+/// invocation, or a command-shaped input that failed validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ChannelCommandParseOutcome {
     NotCommand,
@@ -281,6 +324,8 @@ pub(crate) enum ChannelCommandParseOutcome {
     Malformed(ChannelCommandErrorEnvelope),
 }
 
+/// Catalog of registered commands; `BTreeMap` keeps native spec export and
+/// the catalog hash deterministic.
 #[derive(Debug, Clone)]
 pub(crate) struct ChannelCommandRegistry {
     specs: BTreeMap<ChannelCommandName, ChannelCommandSpec>,
@@ -293,6 +338,7 @@ impl Default for ChannelCommandRegistry {
 }
 
 impl ChannelCommandRegistry {
+    /// Builds the registry of all built-in commands.
     #[must_use]
     pub(crate) fn builtin() -> Self {
         let specs = [
@@ -622,28 +668,37 @@ impl ChannelCommandRegistry {
         Self { specs }
     }
 
+    /// Exports the catalog in connector-native form for registration.
     #[must_use]
     pub(crate) fn native_specs(&self) -> Vec<ChannelNativeCommandSpec> {
         self.specs.values().map(ChannelCommandSpec::native).collect()
     }
 
+    /// Deterministic sha256 over the native catalog, used to detect when
+    /// connectors must re-register commands.
     #[must_use]
     pub(crate) fn catalog_hash(&self) -> String {
         let payload = serde_json::to_vec(&self.native_specs()).unwrap_or_default();
         sha256_hex(payload.as_slice())
     }
 
+    /// Parses free-form message text into a command invocation.
+    ///
+    /// Returns `NotCommand` for anything that does not start with a known
+    /// prefix followed by whitespace (so `/palyrafoo` stays an ordinary
+    /// message); after the prefix matches, every failure is `Malformed`
+    /// rather than silently treated as chat.
     #[must_use]
     pub(crate) fn parse_text(&self, text: &str) -> ChannelCommandParseOutcome {
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return ChannelCommandParseOutcome::NotCommand;
         }
-        let Some((_, body)) = COMMAND_PREFIXES.iter().find_map(|prefix| {
+        let Some(body) = COMMAND_PREFIXES.iter().find_map(|prefix| {
             trimmed
                 .strip_prefix(prefix)
                 .and_then(|rest| rest.strip_prefix(char::is_whitespace))
-                .map(|rest| (*prefix, rest.trim()))
+                .map(str::trim)
         }) else {
             return ChannelCommandParseOutcome::NotCommand;
         };
@@ -654,6 +709,8 @@ impl ChannelCommandRegistry {
         self.parse_tokens(tokens, Some(trimmed.to_owned()))
     }
 
+    /// Parses a connector-native command interaction (arguments arrive as a
+    /// JSON object, already named).
     #[allow(dead_code)]
     #[must_use]
     pub(crate) fn parse_native(
@@ -666,23 +723,17 @@ impl ChannelCommandRegistry {
                 format!("native command payload failed validation: {error}"),
             );
         }
-        let command = match ChannelCommandName::parse(payload.command.as_str()) {
-            Some(command) => command,
-            None => {
-                return malformed(
-                    "channel_command/unknown",
-                    format!("unknown channel command `{}`", payload.command),
-                )
-            }
+        let Some(command) = ChannelCommandName::parse(payload.command.as_str()) else {
+            return malformed(
+                "channel_command/unknown",
+                format!("unknown channel command `{}`", payload.command),
+            );
         };
-        let spec = match self.specs.get(&command) {
-            Some(spec) => spec,
-            None => {
-                return malformed(
-                    "channel_command/unregistered",
-                    format!("channel command `{}` is not registered", command.as_str()),
-                )
-            }
+        let Some(spec) = self.specs.get(&command) else {
+            return malformed(
+                "channel_command/unregistered",
+                format!("channel command `{}` is not registered", command.as_str()),
+            );
         };
         let args = if payload.args_json.is_empty() {
             Value::Object(Map::new())
@@ -723,14 +774,11 @@ impl ChannelCommandRegistry {
         let Some(command_token) = tokens.first() else {
             return malformed("channel_command/missing_command", "missing command name");
         };
-        let command = match ChannelCommandName::parse(command_token) {
-            Some(command) => command,
-            None => {
-                return malformed(
-                    "channel_command/unknown",
-                    format!("unknown channel command `{command_token}`"),
-                )
-            }
+        let Some(command) = ChannelCommandName::parse(command_token) else {
+            return malformed(
+                "channel_command/unknown",
+                format!("unknown channel command `{command_token}`"),
+            );
         };
         let Some(spec) = self.specs.get(&command) else {
             return malformed(
@@ -751,6 +799,12 @@ impl ChannelCommandRegistry {
     }
 }
 
+/// Renders the response and audit payload for a parsed command.
+///
+/// Read-only commands always succeed and report the runtime view.
+/// Side-effecting commands without an active binding fail closed with
+/// `channel_command/requires_binding` unless the invocation names an
+/// explicit target (run/session/task/approval/routine id).
 #[must_use]
 pub(crate) fn build_channel_command_response(
     invocation: &ChannelCommandInvocation,
@@ -951,6 +1005,8 @@ pub(crate) fn build_channel_command_response(
     }
 }
 
+/// Renders the response for a command that failed parsing or validation,
+/// echoing the (redacted) error and recovery hint back to the channel.
 #[must_use]
 pub(crate) fn build_malformed_command_response(
     error: &ChannelCommandErrorEnvelope,
@@ -974,6 +1030,7 @@ pub(crate) fn build_malformed_command_response(
     }
 }
 
+/// Renders the response for a command the policy engine denied.
 #[must_use]
 pub(crate) fn build_policy_denied_command_response(
     invocation: &ChannelCommandInvocation,
@@ -1029,6 +1086,20 @@ fn arg(
     }
 }
 
+// Binds tokens to the spec's arguments. Precedence per argument, in spec
+// order: a `name=value` token wins; otherwise the next unconsumed
+// positional token is taken; FreeformTail joins all remaining positional
+// tokens. Missing required arguments fail with a stable message.
+//
+// AIDEV-NOTE: when a FreeformTail argument precedes positional-capable
+// arguments in the spec (only `delegate`, where `objective` comes first),
+// the tail consumes positional[position..] without advancing `position`,
+// so later arguments (profile_id, template_id, parent_run_id) re-consume
+// the same tokens already absorbed into the tail. "/palyra delegate fix
+// the build" thus also sets profile_id="fix", template_id="the",
+// parent_run_id="build" - and parent_run_id then counts as an explicit
+// target in has_explicit_target. Fixing this changes parse results, i.e.
+// behavior; left as-is in this comment-only pass.
 fn coerce_text_arguments(
     spec: &ChannelCommandSpec,
     tokens: &[String],
@@ -1047,6 +1118,8 @@ fn coerce_text_arguments(
     let mut position = 0usize;
     for argument in &spec.arguments {
         if argument.kind == ChannelCommandArgumentKind::FreeformTail {
+            // position never exceeds positional.len(): it only advances
+            // after a successful positional.get(position) above.
             let tail = positional[position..].join(" ");
             if !tail.is_empty() {
                 output.insert(argument.name.clone(), coerce_text_value(argument, tail.as_str())?);
@@ -1164,6 +1237,8 @@ fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
+// Accepts bare milliseconds or a digits+suffix form (ms/s/m/h); checked
+// multiplication rejects values that would overflow instead of wrapping.
 fn parse_duration_ms(value: &str) -> Option<u64> {
     let trimmed = value.trim();
     let suffix_start = trimmed.find(|ch: char| !ch.is_ascii_digit()).unwrap_or(trimmed.len());
@@ -1178,6 +1253,8 @@ fn parse_duration_ms(value: &str) -> Option<u64> {
     }
 }
 
+// Whitespace tokenizer with single/double quoting (no escape sequences);
+// an unterminated quote is a parse error rather than an implicit token.
 fn split_command_tokens(input: &str) -> Result<Vec<String>, String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -1210,6 +1287,8 @@ fn split_command_tokens(input: &str) -> Result<Vec<String>, String> {
     Ok(tokens)
 }
 
+// An explicit target lets a side-effecting command run without an active
+// binding, because the operator named exactly what to act on.
 fn has_explicit_target(invocation: &ChannelCommandInvocation) -> bool {
     invocation.arguments.contains_key("run_id")
         || invocation.arguments.contains_key("session_id")

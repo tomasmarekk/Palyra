@@ -1,3 +1,12 @@
+//! Inline tool execution for the route-message surface.
+//!
+//! Mirrors the run-stream tool flow (catalog validation, security
+//! evaluation, approval gate, policy decision, runtime dispatch) but runs
+//! synchronously inside the single routed exchange and returns a one-line
+//! summary string that is folded back into the model conversation instead
+//! of streamed wire events. Every stage still lands on the orchestrator
+//! tape so routed runs replay like streamed ones.
+
 use std::{sync::Arc, time::Instant};
 
 use serde_json::json;
@@ -29,6 +38,19 @@ use crate::{
     transport::grpc::auth::RequestContext,
 };
 
+/// Validates, gates, and (when allowed) executes one tool proposal from the
+/// routed provider turn, returning the textual tool-result summary fed back
+/// to the model.
+///
+/// Approval-required proposals are recorded as pending and denied for this
+/// run (there is no interactive client to answer the prompt); denied
+/// proposals still produce a denial outcome on the tape so replays stay
+/// complete.
+///
+/// # Errors
+/// Returns a status when a tape append, approval recording, or the decision
+/// audit trail fails; tool execution failures are reported inside the
+/// returned summary, not as errors.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_route_tool_proposal_event(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -50,6 +72,8 @@ pub(crate) async fn process_route_tool_proposal_event(
         ) {
             Ok(normalized) => normalized,
             Err(rejection) => {
+                // Rejected calls still consume budget so a model emitting
+                // invalid calls cannot loop on free attempts forever.
                 *remaining_tool_budget = (*remaining_tool_budget).saturating_sub(1);
                 return reject_route_tool_call(
                     runtime_state,
@@ -167,6 +191,9 @@ pub(crate) async fn process_route_tool_proposal_event(
     let execution_outcome = if decision.allowed {
         runtime_state.record_tool_execution_attempt();
         let started_at = Instant::now();
+        // Dispatch may spawn nested tool calls (e.g. delegation), so the
+        // budget travels as a shared counter and is read back afterwards to
+        // charge everything the dispatch consumed.
         let nested_tool_budget = shared_tool_budget(*remaining_tool_budget);
         let outcome = execute_tool_with_runtime_dispatch(
             runtime_state,
@@ -246,6 +273,8 @@ pub(crate) async fn process_route_tool_proposal_event(
     .await)
 }
 
+/// Records the argument-normalization audit on the tape so replays can see
+/// how the model's raw arguments were rewritten before validation.
 #[allow(clippy::result_large_err)]
 async fn append_route_tool_argument_normalization_tape_event(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -267,6 +296,9 @@ async fn append_route_tool_argument_normalization_tape_event(
     Ok(())
 }
 
+/// Records the full proposal/decision/rejection/executed tape sequence for a
+/// call that failed catalog validation, so a rejected call replays with the
+/// same event shape as an executed one, and returns its summary line.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 async fn reject_route_tool_call(
@@ -326,6 +358,8 @@ async fn reject_route_tool_call(
     Ok(format!("tool={tool_name} success=false error={reason}"))
 }
 
+/// Appends a `tool.executed` tape event carrying the outcome's attestation
+/// for an intake-rejected call.
 #[allow(clippy::result_large_err)]
 async fn append_route_tool_execution_tape_event(
     runtime_state: &Arc<GatewayRuntimeState>,
