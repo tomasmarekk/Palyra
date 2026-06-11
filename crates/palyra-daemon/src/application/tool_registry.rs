@@ -1,3 +1,13 @@
+//! Model-visible tool registry: builtin tool metadata, per-provider-turn
+//! catalog snapshots, and tool-call argument normalization against those
+//! snapshots.
+//!
+//! Flow: `builtin` declares the static registry entries, `catalog` filters
+//! them into a content-hashed `ModelVisibleToolCatalogSnapshot` for one
+//! provider turn, and `normalization` validates incoming tool calls against
+//! that snapshot. `hashing` provides the canonical-JSON hashing that keeps
+//! snapshot ids and catalog hashes stable across runs.
+
 mod builtin;
 mod catalog;
 mod hashing;

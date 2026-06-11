@@ -1,3 +1,12 @@
+//! Tool-call intake: validates and normalizes model-proposed tool arguments
+//! against the provider-turn catalog snapshot.
+//!
+//! Accepted calls come back as canonical JSON plus a hash-anchored audit of
+//! every coercion applied; rejected calls produce structured
+//! `ToolCallRejection` records for tape and journal replay. Tools the catalog
+//! never evaluated fall through to a legacy passthrough so the downstream
+//! policy gate keeps owning allowlist decisions.
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Map, Number, Value};
@@ -11,6 +20,14 @@ use super::types::{
     ToolCatalogFilterReasonCode, ToolParallelismPolicy, TOOL_REJECTION_SCHEMA_VERSION,
 };
 
+/// Validates one proposed tool call against the catalog snapshot the model
+/// saw, returning canonicalized arguments plus the normalization audit.
+///
+/// # Errors
+/// Returns a [`ToolCallRejection`] when the tool was filtered from the
+/// snapshot for a runtime/schema/surface/budget reason, when a non-read-only
+/// call arrives with an exhausted budget, or when the arguments are not a
+/// JSON object or do not match the tool's internal schema.
 #[allow(clippy::result_large_err)]
 pub(crate) fn validate_tool_call_against_catalog_snapshot(
     snapshot: &ModelVisibleToolCatalogSnapshot,
@@ -19,6 +36,10 @@ pub(crate) fn validate_tool_call_against_catalog_snapshot(
 ) -> Result<NormalizedToolCall, ToolCallRejection> {
     let raw_json_hash = stable_hash_bytes(input_json);
     let Some(tool) = snapshot.tools.iter().find(|tool| tool.name == tool_name) else {
+        // Allowlist and unknown-tool gating stays owned by the downstream
+        // policy gate (pre-catalog behavior): intake only canonicalizes such
+        // calls instead of rejecting them here. Tools filtered for any other
+        // reason were knowingly withheld from the model, so reject directly.
         match snapshot.filtered_tools.iter().find(|tool| tool.name == tool_name) {
             Some(filtered)
                 if matches!(
@@ -34,6 +55,8 @@ pub(crate) fn validate_tool_call_against_catalog_snapshot(
         }
         return Err(rejection_for_missing_snapshot_tool(snapshot, tool_name, raw_json_hash));
     };
+    // Read-only tools stay callable on an exhausted budget; anything that can
+    // mutate state is cut off once the provider-turn budget hits zero.
     if tool.parallelism_policy != ToolParallelismPolicy::ReadOnly
         && snapshot.remaining_tool_budget == 0
     {
@@ -96,6 +119,9 @@ pub(crate) fn validate_tool_call_against_catalog_snapshot(
     })
 }
 
+/// Canonicalizes arguments for a tool the catalog did not expose without
+/// schema-validating them, preserving pre-catalog intake behavior; the
+/// downstream policy gate still decides whether the call may run.
 #[allow(clippy::result_large_err)]
 fn normalize_legacy_policy_passthrough(
     snapshot: &ModelVisibleToolCatalogSnapshot,
@@ -138,6 +164,8 @@ fn normalize_legacy_policy_passthrough(
     })
 }
 
+/// Applies per-tool argument aliases before schema normalization; currently
+/// only `palyra.fs.apply_patch` accepts an alias form.
 fn normalize_tool_specific_argument_aliases(
     tool_name: &str,
     value: Value,
@@ -149,6 +177,13 @@ fn normalize_tool_specific_argument_aliases(
     normalize_apply_patch_raw_alias(value, steps)
 }
 
+/// Rewrites the `raw` alias some models emit for apply_patch into the schema
+/// shape (`patch` plus optional `workspace_root`).
+///
+/// A string `raw` may carry either the bare patch text or an XML-ish
+/// `<parameter>` wrapper; an object `raw` may nest the real fields. Every
+/// rewrite is recorded as an audit step, and unrecognized shapes are left
+/// untouched so schema validation reports them.
 fn normalize_apply_patch_raw_alias(
     value: Value,
     steps: &mut Vec<ToolArgumentNormalizationStep>,
@@ -233,6 +268,11 @@ fn normalize_apply_patch_raw_alias(
     Value::Object(input)
 }
 
+/// Parses a sequence of top-level `<parameter name="...">value</parameter>`
+/// blocks emitted by some models instead of JSON arguments.
+///
+/// Returns `None` on any malformation (including duplicate names) so the
+/// caller falls back to treating the raw text as the patch body itself.
 fn parse_top_level_xmlish_parameters(input: &str) -> Option<BTreeMap<String, String>> {
     let mut remaining = input.trim();
     if remaining.is_empty() {
@@ -254,6 +294,8 @@ fn parse_top_level_xmlish_parameters(input: &str) -> Option<BTreeMap<String, Str
     (!parameters.is_empty()).then_some(parameters)
 }
 
+/// Parses one `<parameter name=...>` opening tag, returning the parameter
+/// name and the byte offset where its value starts.
 fn parse_xmlish_parameter_opening(input: &str) -> Option<(String, usize)> {
     let prefix = "<parameter name=";
     let after_prefix = input.strip_prefix(prefix)?;
@@ -272,6 +314,7 @@ fn parse_xmlish_parameter_opening(input: &str) -> Option<(String, usize)> {
     Some((name, prefix.len() + 1 + name_end + 1 + 1))
 }
 
+/// Builds the structured error payload returned to the model for a rejection.
 pub(crate) fn tool_call_rejection_error_payload(rejection: &ToolCallRejection) -> Value {
     json!({
         "schema_version": rejection.schema_version,
@@ -287,6 +330,8 @@ pub(crate) fn tool_call_rejection_error_payload(rejection: &ToolCallRejection) -
     })
 }
 
+/// Wraps a rejection in a failed [`ToolExecutionOutcome`] so it flows through
+/// the normal tool-result path instead of aborting the run.
 pub(crate) fn tool_call_rejection_outcome(
     proposal_id: &str,
     input_json: &[u8],
@@ -307,6 +352,8 @@ pub(crate) fn tool_call_rejection_outcome(
     )
 }
 
+/// Renders the tape line recording which normalization steps were applied to
+/// one proposal; only hashes of the argument bytes are included.
 pub(crate) fn normalization_audit_tape_payload(
     proposal_id: &str,
     tool_name: &str,
@@ -322,6 +369,8 @@ pub(crate) fn normalization_audit_tape_payload(
     .unwrap_or_else(|_| "{}".to_owned())
 }
 
+/// Renders the tape line for a rejected proposal, including the snapshot
+/// identity so replays can correlate it with the catalog the model saw.
 pub(crate) fn rejection_tape_payload(proposal_id: &str, rejection: &ToolCallRejection) -> String {
     serde_json::to_string(&json!({
         "proposal_id": proposal_id,
@@ -337,6 +386,8 @@ pub(crate) fn rejection_tape_payload(proposal_id: &str, rejection: &ToolCallReje
     .unwrap_or_else(|_| "{}".to_owned())
 }
 
+/// Maps the catalog filter reason for a withheld tool onto the matching
+/// rejection kind, reason code, and model-facing message.
 fn rejection_for_missing_snapshot_tool(
     snapshot: &ModelVisibleToolCatalogSnapshot,
     tool_name: &str,
@@ -392,6 +443,9 @@ fn rejection_for_missing_snapshot_tool(
     }
 }
 
+/// Recursively validates `value` against the tool's internal schema, applying
+/// only the narrow string-to-scalar coercions permitted by
+/// [`safe_scalar_coercion_allowed`] and recording each one in `steps`.
 fn normalize_value_against_schema(
     value: Value,
     schema: &Value,
@@ -647,6 +701,14 @@ fn validate_bounds(value: &Value, schema: &Map<String, Value>, path: &str) -> Re
     Ok(())
 }
 
+/// Decides whether a string value at this path may be coerced to the schema's
+/// scalar type.
+///
+/// Coercion is denied whenever the path or property name contains any of the
+/// sensitive substrings below: a silent type rewrite on a path, credential,
+/// command, or payload-bearing field could change what actually executes.
+/// Substring matching is deliberately broad (e.g. any `*_token` field is
+/// excluded) at the cost of occasionally skipping a harmless coercion.
 fn safe_scalar_coercion_allowed(path: &str, property_name: Option<&str>) -> bool {
     let combined = format!(
         "{} {}",
@@ -672,6 +734,7 @@ fn safe_scalar_coercion_allowed(path: &str, property_name: Option<&str>) -> bool
     .any(|needle| combined.contains(needle))
 }
 
+/// Renders the root path (`""`) as `/` for error messages and audit steps.
 fn path_or_root(path: &str) -> &str {
     if path.is_empty() {
         "/"
@@ -680,6 +743,7 @@ fn path_or_root(path: &str) -> &str {
     }
 }
 
+/// Escapes a key for use as a JSON Pointer segment (RFC 6901: `~` before `/`).
 fn escape_json_pointer(value: &str) -> String {
     value.replace('~', "~0").replace('/', "~1")
 }

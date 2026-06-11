@@ -1,3 +1,10 @@
+//! Static builtin tool registry: names, model-facing descriptions, input
+//! schemas, and scheduling/projection policies for every daemon tool.
+//!
+//! Descriptions and schema strings here are model-visible prompt surface and
+//! are pinned by unit tests and replay fixtures; treat any wording change as
+//! a contract change, not a copy edit.
+
 use serde_json::{json, Map, Value};
 
 use crate::tool_protocol::{tool_metadata, tool_requires_approval};
@@ -8,6 +15,10 @@ use super::types::{
     ToolResultProjectionPolicy, TOOL_REGISTRY_ENTRY_VERSION,
 };
 
+/// Returns every builtin tool registry entry, sorted by name.
+///
+/// Entries are rebuilt on each call; they are small and call sites operate
+/// per proposal/turn, so no caching is layered on top.
 #[must_use]
 pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
     let mut entries = vec![
@@ -866,6 +877,9 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
     ];
 
     for browser_tool in browser_tool_names() {
+        // Session lifecycle results are tiny and safe to inline; every other
+        // browser tool can return page-derived content, so results go through
+        // the redacted-preview/artifact projection.
         let projection_policy = if matches!(
             *browser_tool,
             "palyra.browser.session.create" | "palyra.browser.session.close"
@@ -883,14 +897,19 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
         ));
     }
 
+    // Name-sorted so catalog hashing never depends on declaration order.
     entries.sort_by(|left, right| left.name.cmp(&right.name));
     entries
 }
 
+/// Looks up one builtin registry entry by exact tool name.
 pub(crate) fn registry_entry(tool_name: &str) -> Option<ToolRegistryEntry> {
     registry_entries().into_iter().find(|entry| entry.name == tool_name)
 }
 
+/// Assembles one registry entry, sourcing capabilities and approval posture
+/// from `tool_protocol` metadata so the registry stays consistent with the
+/// policy layer instead of duplicating those decisions.
 fn entry(
     name: &str,
     description: &str,
@@ -926,6 +945,7 @@ fn entry(
     }
 }
 
+/// Builds a `type: object` schema from `(name, schema)` property pairs.
 fn object_schema(required: &[&str], properties: Vec<(&str, Value)>, additional: bool) -> Value {
     let mut property_map = Map::new();
     for (name, schema) in properties {
@@ -939,6 +959,7 @@ fn object_schema(required: &[&str], properties: Vec<(&str, Value)>, additional: 
     })
 }
 
+/// Every brokered browser tool registered alongside the core tools.
 fn browser_tool_names() -> &'static [&'static str] {
     &[
         "palyra.browser.session.create",
@@ -974,6 +995,7 @@ fn browser_tool_names() -> &'static [&'static str] {
     ]
 }
 
+/// Model-facing description for one browser tool.
 fn browser_tool_description(tool_name: &str) -> &'static str {
     match tool_name {
         "palyra.browser.session.create" => "Create a brokered browser session.",
@@ -1018,6 +1040,9 @@ fn browser_tool_description(tool_name: &str) -> &'static str {
     }
 }
 
+/// Builds the input schema for one browser tool from the shared
+/// session/timeout base plus tool-specific fields; `session.create` is the
+/// only tool that does not require `session_id`.
 fn browser_tool_schema(tool_name: &str) -> Value {
     let mut properties = vec![
         (

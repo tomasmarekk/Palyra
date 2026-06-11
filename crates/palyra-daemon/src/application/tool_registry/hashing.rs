@@ -1,3 +1,9 @@
+//! Canonical-JSON SHA-256 hashing for tool catalog and schema stability.
+//!
+//! Catalog hashes, snapshot ids, and schema hashes are compared across runs
+//! and replays, so the canonical form (recursively key-sorted objects, compact
+//! serialization) and every hash input must stay byte-identical.
+
 use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
@@ -5,6 +11,11 @@ use sha2::{Digest, Sha256};
 
 use super::types::ModelVisibleToolCatalogSnapshot;
 
+/// Builds the JSON payload hashed into `catalog_hash`.
+///
+/// Deliberately excludes `snapshot_id` and `catalog_hash` themselves so the
+/// hash can be computed before those fields are filled in. Adding or removing
+/// a field here changes every catalog hash.
 pub(super) fn catalog_hash_payload(snapshot: &ModelVisibleToolCatalogSnapshot) -> Value {
     json!({
         "schema_version": snapshot.schema_version,
@@ -21,22 +32,30 @@ pub(super) fn catalog_hash_payload(snapshot: &ModelVisibleToolCatalogSnapshot) -
     })
 }
 
+/// Hex-encoded SHA-256 of the canonical JSON form of `value`.
 pub(super) fn stable_hash_value(value: &Value) -> String {
     stable_hash_bytes(canonical_json_bytes(value).as_slice())
 }
 
+/// Hex-encoded SHA-256 of raw bytes.
 pub(super) fn stable_hash_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())
 }
 
+/// Serializes `value` with recursively key-sorted objects so logically equal
+/// values always produce identical bytes (and therefore identical hashes).
 pub(super) fn canonical_json_bytes(value: &Value) -> Vec<u8> {
     let mut sorted = value.clone();
     sort_json_value(&mut sorted);
+    // Serializing a tree-shaped `Value` cannot realistically fail; fall back
+    // defensively instead of panicking inside the hashing path.
     serde_json::to_vec(&sorted).unwrap_or_else(|_| b"null".to_vec())
 }
 
+/// Recursively sorts object keys in place. Arrays keep their order because
+/// element position is meaningful (e.g. `required` field lists).
 pub(super) fn sort_json_value(value: &mut Value) {
     match value {
         Value::Object(map) => {

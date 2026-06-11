@@ -1,14 +1,28 @@
+//! Shared types for the model-visible tool registry: schema-version constants,
+//! dialect/policy enums with stable wire labels, and the catalog-snapshot,
+//! normalization-audit, and rejection records exchanged between the catalog
+//! builder and tool-call intake.
+//!
+//! The `as_str` labels and serde shapes here feed catalog hashing and tape
+//! payloads; changing any of them changes hashes and replay output.
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::tool_protocol::{ToolCallConfig, ToolRequestContext};
 
+/// Schema version stamped into every catalog snapshot; bump on breaking payload changes.
 pub(super) const TOOL_CATALOG_SCHEMA_VERSION: u32 = 1;
+/// Version stamped into every builtin registry entry.
 pub(super) const TOOL_REGISTRY_ENTRY_VERSION: u32 = 1;
+/// Schema version stamped into every [`ToolCallRejection`] record.
 pub(super) const TOOL_REJECTION_SCHEMA_VERSION: u32 = 1;
+/// Maximum schema nesting depth accepted by provider sanitization and validation.
 pub(super) const MAX_SCHEMA_DEPTH: usize = 8;
+/// Maximum number of properties accepted on a single object schema node.
 pub(super) const MAX_SCHEMA_PROPERTIES: usize = 128;
 
+/// Provider schema dialect a catalog snapshot is sanitized and serialized for.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ToolSchemaDialect {
@@ -18,6 +32,10 @@ pub(crate) enum ToolSchemaDialect {
 }
 
 impl ToolSchemaDialect {
+    /// Maps a provider kind string to its dialect.
+    ///
+    /// Unknown kinds fall back to [`Self::OpenAiCompatible`], the most widely
+    /// implemented tool wire shape.
     pub(crate) fn from_provider_kind(provider_kind: &str) -> Self {
         match provider_kind.trim().to_ascii_lowercase().as_str() {
             "anthropic" => Self::Anthropic,
@@ -26,6 +44,7 @@ impl ToolSchemaDialect {
         }
     }
 
+    /// Stable snake_case label used in catalog hashes and tape payloads.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::OpenAiCompatible => "openai_compatible",
@@ -35,6 +54,7 @@ impl ToolSchemaDialect {
     }
 }
 
+/// Runtime surface a tool catalog is built for and a tool may be exposed on.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ToolExposureSurface {
@@ -43,6 +63,7 @@ pub(crate) enum ToolExposureSurface {
 }
 
 impl ToolExposureSurface {
+    /// Stable snake_case label used in catalog hashes and tape payloads.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::RunStream => "run_stream",
@@ -51,6 +72,7 @@ impl ToolExposureSurface {
     }
 }
 
+/// Whether a tool runs without approval or requires an operator approval gate.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ToolApprovalPosture {
@@ -59,6 +81,7 @@ pub(crate) enum ToolApprovalPosture {
 }
 
 impl ToolApprovalPosture {
+    /// Stable snake_case label used in catalog hashes and tape payloads.
     pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::Safe => "safe",
@@ -67,6 +90,7 @@ impl ToolApprovalPosture {
     }
 }
 
+/// How a tool may be scheduled relative to other tool calls in the same turn.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ToolParallelismPolicy {
@@ -76,6 +100,7 @@ pub(crate) enum ToolParallelismPolicy {
 }
 
 impl ToolParallelismPolicy {
+    /// Stable snake_case label used in catalog hashes and tape payloads.
     pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::ReadOnly => "read_only",
@@ -85,6 +110,7 @@ impl ToolParallelismPolicy {
     }
 }
 
+/// How a tool result is projected back into model context (inline, summarized, or redacted).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ToolResultProjectionPolicy {
@@ -94,6 +120,7 @@ pub(crate) enum ToolResultProjectionPolicy {
 }
 
 impl ToolResultProjectionPolicy {
+    /// Stable snake_case label used in catalog hashes and tape payloads.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::InlineUnlessLarge => "inline_unless_large",
@@ -103,6 +130,7 @@ impl ToolResultProjectionPolicy {
     }
 }
 
+/// Why a registry entry was excluded from a model-visible catalog snapshot.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ToolCatalogFilterReasonCode {
@@ -116,6 +144,7 @@ pub(crate) enum ToolCatalogFilterReasonCode {
 }
 
 impl ToolCatalogFilterReasonCode {
+    /// Stable snake_case label used in catalog hashes and tape payloads.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::NotAllowlisted => "not_allowlisted",
@@ -129,6 +158,7 @@ impl ToolCatalogFilterReasonCode {
     }
 }
 
+/// A builtin tool's registry metadata before per-provider catalog filtering.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ToolRegistryEntry {
     pub(crate) name: String,
@@ -144,6 +174,8 @@ pub(crate) struct ToolRegistryEntry {
     pub(crate) target_surfaces: Vec<ToolExposureSurface>,
 }
 
+/// A tool as exposed to the model: internal and provider-sanitized schemas
+/// plus stable content hashes for audit and replay comparison.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ModelVisibleTool {
     pub(crate) name: String,
@@ -162,6 +194,8 @@ pub(crate) struct ModelVisibleTool {
     pub(crate) exposure_reason: String,
 }
 
+/// A tool excluded from a catalog snapshot, with the filter reason and an
+/// operator-facing repair hint.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct FilteredToolCatalogEntry {
     pub(crate) name: String,
@@ -169,6 +203,11 @@ pub(crate) struct FilteredToolCatalogEntry {
     pub(crate) repair_hint: String,
 }
 
+/// Immutable per-provider-turn tool catalog.
+///
+/// `catalog_hash` covers every model-visible field (see
+/// `hashing::catalog_hash_payload`) and `snapshot_id` is derived from it, so
+/// identical build inputs always produce identical ids.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ModelVisibleToolCatalogSnapshot {
     pub(crate) schema_version: u32,
@@ -186,6 +225,7 @@ pub(crate) struct ModelVisibleToolCatalogSnapshot {
     pub(crate) filtered_tools: Vec<FilteredToolCatalogEntry>,
 }
 
+/// Inputs for building one [`ModelVisibleToolCatalogSnapshot`].
 pub(crate) struct ToolCatalogBuildRequest<'a> {
     pub(crate) config: &'a ToolCallConfig,
     pub(crate) browser_service_enabled: bool,
@@ -197,6 +237,7 @@ pub(crate) struct ToolCatalogBuildRequest<'a> {
     pub(crate) created_at_unix_ms: i64,
 }
 
+/// One recorded type coercion applied during argument normalization.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ToolArgumentNormalizationStep {
     pub(crate) json_pointer: String,
@@ -205,6 +246,7 @@ pub(crate) struct ToolArgumentNormalizationStep {
     pub(crate) reason_code: String,
 }
 
+/// Hash-anchored audit trail of every normalization step applied to one call.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ToolArgumentNormalizationAudit {
     pub(crate) raw_json_hash: String,
@@ -212,12 +254,14 @@ pub(crate) struct ToolArgumentNormalizationAudit {
     pub(crate) steps: Vec<ToolArgumentNormalizationStep>,
 }
 
+/// Canonicalized tool-call arguments accepted by intake, plus their audit.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct NormalizedToolCall {
     pub(crate) input_json: Vec<u8>,
     pub(crate) audit: ToolArgumentNormalizationAudit,
 }
 
+/// Category of a tool-call intake rejection.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ToolCallRejectionKind {
@@ -230,6 +274,7 @@ pub(crate) enum ToolCallRejectionKind {
 }
 
 impl ToolCallRejectionKind {
+    /// Stable snake_case label used in rejection payloads and tape output.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::UnknownTool => "unknown_tool",
@@ -242,6 +287,9 @@ impl ToolCallRejectionKind {
     }
 }
 
+/// Structured rejection emitted when a tool call fails catalog validation,
+/// carrying the snapshot identity so replays can correlate it with the catalog
+/// the model actually saw.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ToolCallRejection {
     pub(crate) schema_version: u32,

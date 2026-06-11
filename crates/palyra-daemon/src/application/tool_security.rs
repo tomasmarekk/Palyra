@@ -1,3 +1,12 @@
+//! SECURITY-CRITICAL tool proposal gating for the daemon gateway.
+//!
+//! Every model tool proposal passes through here before execution: skill
+//! context parsing, delegation scope, skill execution policy, tool posture,
+//! and backend capability gates run fail-closed in a fixed order, and the
+//! resulting allow/deny decision is journaled for audit replay. Decision
+//! reason strings are asserted by tests and consumed by operators; keep them
+//! byte-stable.
+
 use std::sync::Arc;
 
 use palyra_policy::{
@@ -39,6 +48,11 @@ use crate::{
     transport::grpc::{auth::RequestContext, proto::palyra::common::v1 as common_v1},
 };
 
+/// Outcome of the pre-execution security evaluation for one tool proposal.
+///
+/// `skill_gate_decision` carries the first denial produced by any gate (or
+/// `None` when every gate passed); the remaining fields feed the final
+/// decision resolution and approval flow.
 #[derive(Debug, Clone)]
 pub(crate) struct ToolProposalSecurityEvaluation {
     pub(crate) skill_context: Option<ToolSkillContext>,
@@ -49,12 +63,15 @@ pub(crate) struct ToolProposalSecurityEvaluation {
     pub(crate) backend_selection: ToolProposalBackendSelection,
 }
 
+/// Final allow/deny decision for a proposal plus the execution-gate pipeline
+/// report when the v2 pipeline rollout is enabled.
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedToolProposalDecision {
     pub(crate) decision: ToolDecision,
     pub(crate) gate_report: Option<ExecutionGateReport>,
 }
 
+/// Which execution backend a proposal was resolved to, and why.
 #[derive(Debug, Clone)]
 pub(crate) struct ToolProposalBackendSelection {
     pub(crate) agent_id: Option<String>,
@@ -62,6 +79,12 @@ pub(crate) struct ToolProposalBackendSelection {
     pub(crate) resolution: ExecutionBackendResolution,
 }
 
+/// Extracts the skill identity from `palyra.plugin.run` arguments.
+///
+/// Returns `Ok(None)` for every other tool and for plugin runs that carry no
+/// `skill_id` (inline-module execution). Rejects `skill_version` without a
+/// `skill_id` and `skill_id` combined with an inline module payload, so a
+/// call can never claim a skill identity while executing different bytes.
 #[allow(clippy::result_large_err)]
 fn parse_tool_skill_context(
     tool_name: &str,
@@ -111,9 +134,20 @@ fn parse_tool_skill_context(
             "palyra.plugin.run skill_id cannot be combined with inline module payloads",
         ));
     }
-    Ok(Some(ToolSkillContext::new(skill_id.expect("checked"), version)))
+    Ok(Some(ToolSkillContext::new(
+        skill_id.expect("skill_id is Some: the None case returned Ok(None) above"),
+        version,
+    )))
 }
 
+/// Gates skill-backed plugin runs on installed-skill status and skill policy.
+///
+/// Returns `Ok(None)` when execution may proceed, `Ok(Some(denial))` when the
+/// skill is missing, not active, or denied by policy.
+///
+/// # Errors
+/// Returns `Status` when the skill status lookup fails; callers convert that
+/// into a denial so the gate stays fail-closed.
 #[allow(clippy::result_large_err)]
 async fn evaluate_skill_execution_gate(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -186,6 +220,8 @@ async fn evaluate_skill_execution_gate(
     }
 }
 
+/// Resolves the execution backend for a proposal from the bound agent's
+/// preference (defaulting to automatic) and the current backend inventory.
 async fn derive_tool_proposal_backend_selection(
     runtime_state: &Arc<GatewayRuntimeState>,
     agent_id: Option<&str>,
@@ -216,6 +252,12 @@ async fn derive_tool_proposal_backend_selection(
     }
 }
 
+/// Builds the execution context attached to approval records.
+///
+/// Returns `None` for the default automatic-to-local-sandbox resolution so
+/// ordinary local executions keep compact approval records; any other
+/// resolution (explicit preference, fallback, or approval-requiring backend)
+/// is surfaced in full.
 pub(crate) fn approval_execution_context_for_backend_selection(
     backend_selection: &ToolProposalBackendSelection,
 ) -> Option<ApprovalExecutionContext> {
@@ -238,6 +280,7 @@ pub(crate) fn approval_execution_context_for_backend_selection(
     })
 }
 
+/// Stable label for a tool capability in backend denial reasons.
 fn backend_capability_label(capability: ToolCapability) -> &'static str {
     match capability {
         ToolCapability::ProcessExec => "process_exec",
@@ -249,6 +292,12 @@ fn backend_capability_label(capability: ToolCapability) -> &'static str {
     }
 }
 
+/// Denies tools that must not run on a networked worker.
+///
+/// Process execution, secret reads, and filesystem access touch the local
+/// host and vault, so they are pinned to the local sandbox; tools without
+/// remote support are denied with a distinct reason code. Local backends are
+/// never restricted here.
 pub(crate) fn evaluate_backend_capability_gate(
     tool_name: &str,
     backend_selection: &ToolProposalBackendSelection,
@@ -303,6 +352,10 @@ pub(crate) fn evaluate_backend_capability_gate(
     None
 }
 
+/// Appends backend resolution context to a decision reason for audit trails.
+///
+/// The default automatic-to-local-sandbox resolution is left unannotated so
+/// the common decision reason stays compact (asserted by tests).
 pub(crate) fn annotate_tool_decision_with_backend_context(
     mut decision: ToolDecision,
     backend_selection: &ToolProposalBackendSelection,
@@ -334,6 +387,7 @@ pub(crate) fn annotate_tool_decision_with_backend_context(
     decision
 }
 
+/// Formats an allowlist for denial reasons, making emptiness explicit.
 fn allowlist_display(allowlist: &[String]) -> String {
     if allowlist.is_empty() {
         "<empty>".to_owned()
@@ -342,6 +396,8 @@ fn allowlist_display(allowlist: &[String]) -> String {
     }
 }
 
+/// Confines delegated child runs to their declared tool and skill allowlists;
+/// an empty allowlist denies everything.
 fn evaluate_delegation_scope_gate(
     delegation: &DelegationSnapshot,
     tool_name: &str,
@@ -379,6 +435,14 @@ fn evaluate_delegation_scope_gate(
     None
 }
 
+/// Runs the full pre-execution security evaluation for one tool proposal.
+///
+/// Gates run in a fixed order and the first denial wins: skill-context
+/// parsing, delegation scope, skill execution policy, disabled tool posture,
+/// then backend capability. Every lookup failure along the way is converted
+/// into a denial rather than skipping the gate, so the chain is fail-closed
+/// end to end. This function never errors; denials are carried in
+/// `skill_gate_decision`.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn evaluate_tool_proposal_security(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -521,6 +585,9 @@ pub(crate) async fn evaluate_tool_proposal_security(
     if skill_gate_decision.is_none() {
         skill_gate_decision = evaluate_backend_capability_gate(tool_name, &backend_selection);
     }
+    // Ask-each-time posture forces an approval prompt unless a gate already
+    // denied the call outright; an approval-requiring backend resolution
+    // forces the prompt independently of posture.
     let proposal_approval_required = skill_gate_decision
         .as_ref()
         .map(|decision| {
@@ -538,6 +605,10 @@ pub(crate) async fn evaluate_tool_proposal_security(
         backend_selection,
     }
 }
+
+/// Resolves the legacy (pre-pipeline) decision: a gate denial passes through
+/// unchanged, otherwise the allowlist/budget policy decides, with
+/// always-allow posture suppressing the approval requirement.
 #[allow(clippy::too_many_arguments)]
 fn resolve_tool_proposal_decision(
     remaining_tool_budget: &mut u32,
@@ -575,6 +646,13 @@ fn resolve_tool_proposal_decision(
     )
 }
 
+/// Produces the final decision for a proposal and debits the tool budget.
+///
+/// The legacy decision is always computed (on a scratch copy of the budget)
+/// even when the v2 execution-gate pipeline is rolled out: the pipeline
+/// report records the legacy outcome via `append_audit_finalization_step` so
+/// divergence between the two paths is auditable. The rollout flag picks
+/// which decision and budget become authoritative.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_tool_proposal_decision_for_context(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -637,6 +715,7 @@ pub(crate) fn resolve_tool_proposal_decision_for_context(
     ResolvedToolProposalDecision { decision, gate_report }
 }
 
+/// Assembles the policy-engine request context for one proposal.
 fn build_tool_policy_request_context(
     request_context: &RequestContext,
     channel: Option<&str>,
@@ -654,6 +733,12 @@ fn build_tool_policy_request_context(
     }
 }
 
+/// Journals the policy decision for a proposal and, when a skill-execution
+/// gate denied it, the dedicated skill-denial event as well.
+///
+/// # Errors
+/// Returns `Status` when a journal append fails; callers treat that as a
+/// hard failure because an unauditable decision must not proceed.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn record_tool_proposal_decision_audit_trail(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -693,6 +778,8 @@ pub(crate) async fn record_tool_proposal_decision_audit_trail(
     .await
 }
 
+/// Emits the skill-denial journal event and counter when a denial reason
+/// carries the skill-execution prefix and a skill context is present.
 #[allow(clippy::too_many_arguments)]
 async fn record_skill_gate_denial_if_needed(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -724,6 +811,7 @@ async fn record_skill_gate_denial_if_needed(
     .await
 }
 
+/// Appends the `policy_decision` journal event for one proposal.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 async fn record_policy_decision_journal_event(
@@ -764,6 +852,8 @@ async fn record_policy_decision_journal_event(
         .map(|_| ())
 }
 
+/// Serializes the `policy_decision` journal payload, embedding the execution
+/// gate report when the v2 pipeline produced one.
 fn tool_decision_journal_payload(
     proposal_id: &str,
     tool_name: &str,
@@ -788,6 +878,7 @@ fn tool_decision_journal_payload(
     payload.to_string().into_bytes()
 }
 
+/// Appends the `skill.execution_denied` journal event for a denied skill run.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 async fn record_skill_execution_denied_journal_event(

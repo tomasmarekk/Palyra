@@ -1,3 +1,11 @@
+//! Provider-facing JSON schema sanitization and subset validation.
+//!
+//! Internal registry schemas are richer than what providers accept, so each
+//! schema is first normalized for the target dialect (unsupported keywords
+//! stripped or downleveled) and then validated against a closed keyword
+//! subset. Incompatible tools are filtered out of the catalog with a reason
+//! code rather than shipped with a schema a provider could silently mangle.
+
 use serde_json::{json, Map, Value};
 
 use super::hashing::sort_json_value;
@@ -6,12 +14,22 @@ use super::types::{
     ToolSchemaDialect, MAX_SCHEMA_DEPTH, MAX_SCHEMA_PROPERTIES,
 };
 
+/// Why a tool schema cannot be expressed in the target provider dialect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SchemaCompatibilityError {
     pub(super) reason_code: String,
     pub(super) message: String,
 }
 
+/// Produces the provider-safe form of an internal tool schema.
+///
+/// Validation runs after normalization so downleveled keywords are judged in
+/// their provider form; key sorting runs last to keep `provider_schema_hash`
+/// canonical.
+///
+/// # Errors
+/// Returns [`SchemaCompatibilityError`] when the schema exceeds the depth or
+/// property gates, or uses constructs outside the supported provider subset.
 pub(super) fn sanitize_schema_for_provider(
     schema: &Value,
     dialect: ToolSchemaDialect,
@@ -38,9 +56,13 @@ fn normalize_schema_for_provider(
         return Ok(());
     };
 
+    // `default` is outside the supported provider subset and intake
+    // normalization never applies defaults, so dropping it is lossless.
     object.remove("default");
     downlevel_exclusive_numeric_bounds(object);
 
+    // Anthropic tool schemas only accept boolean additionalProperties; widen
+    // an object-valued schema to `true` instead of filtering the whole tool.
     if dialect == ToolSchemaDialect::Anthropic
         && object.get("additionalProperties").is_some_and(Value::is_object)
     {
@@ -66,6 +88,10 @@ fn normalize_schema_for_provider(
     Ok(())
 }
 
+// exclusiveMinimum/exclusiveMaximum are outside the supported subset.
+// Downleveling to inclusive bounds deliberately widens the range by one
+// boundary value rather than dropping the bound entirely; an explicit
+// inclusive bound, when present, wins.
 fn downlevel_exclusive_numeric_bounds(object: &mut Map<String, Value>) {
     if let Some(bound) = object.remove("exclusiveMinimum") {
         object.entry("minimum".to_owned()).or_insert(bound);
@@ -75,6 +101,8 @@ fn downlevel_exclusive_numeric_bounds(object: &mut Map<String, Value>) {
     }
 }
 
+/// Recursively checks that a normalized schema stays within the closed
+/// keyword/type subset every supported provider dialect understands.
 fn validate_schema_subset(
     schema: &Value,
     dialect: ToolSchemaDialect,
@@ -89,6 +117,8 @@ fn validate_schema_subset(
     let object = schema
         .as_object()
         .ok_or_else(|| schema_error("schema.not_object", "tool schema nodes must be objects"))?;
+    // Closed keyword set: anything outside it filters the tool with a reason
+    // code instead of sending a schema a provider may silently ignore.
     let allowed_keywords = [
         "type",
         "description",
@@ -173,6 +203,9 @@ fn validate_schema_subset(
         let empty_properties = Map::new();
         let has_additional_property_schema =
             object.get("additionalProperties").is_some_and(Value::is_object);
+        // An object schema may omit `properties` only when additional
+        // properties are accepted (open map); otherwise it would describe an
+        // object that can never validate any input.
         let properties = match object.get("properties").and_then(Value::as_object) {
             Some(properties) => properties,
             None if object.get("additionalProperties").and_then(Value::as_bool) == Some(true) => {
@@ -209,6 +242,9 @@ fn schema_error(reason_code: &str, message: &str) -> SchemaCompatibilityError {
     SchemaCompatibilityError { reason_code: reason_code.to_owned(), message: message.to_owned() }
 }
 
+/// Renders one tool in the wire shape the provider dialect expects: bare
+/// `input_schema` for Anthropic, the `function` wrapper for OpenAI-compatible
+/// and deterministic providers.
 pub(super) fn provider_tool_payload(tool: &ModelVisibleTool, dialect: ToolSchemaDialect) -> Value {
     match dialect {
         ToolSchemaDialect::Anthropic => json!({
@@ -227,6 +263,7 @@ pub(super) fn provider_tool_payload(tool: &ModelVisibleTool, dialect: ToolSchema
     }
 }
 
+/// Convenience constructor for a filtered-catalog entry.
 pub(super) fn filtered(
     name: &str,
     reason_code: ToolCatalogFilterReasonCode,
@@ -239,6 +276,7 @@ pub(super) fn filtered(
     }
 }
 
+/// Stable exposure-reason label recorded on every model-visible tool.
 pub(super) fn exposure_reason(approval_posture: ToolApprovalPosture) -> &'static str {
     match approval_posture {
         ToolApprovalPosture::Safe => "allowlisted_policy_visible",

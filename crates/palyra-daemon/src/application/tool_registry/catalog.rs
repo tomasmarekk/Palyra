@@ -1,3 +1,10 @@
+//! Builds the per-provider-turn model-visible tool catalog snapshot.
+//!
+//! Builtin registry entries pass through allowlist, surface, runtime
+//! availability, and provider-schema gates; both survivors and filtered
+//! entries are sorted deterministically and content-hashed so identical
+//! inputs always yield the same `snapshot_id`/`catalog_hash`.
+
 use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
@@ -15,6 +22,11 @@ use super::types::{
     TOOL_CATALOG_SCHEMA_VERSION,
 };
 
+/// Builds the catalog snapshot describing exactly which tools one provider
+/// turn may see, including filter records for every excluded tool.
+///
+/// Principal and channel identifiers are hashed before they enter the
+/// snapshot so the catalog never carries raw identity strings.
 pub(crate) fn build_model_visible_tool_catalog_snapshot(
     request: ToolCatalogBuildRequest<'_>,
 ) -> ModelVisibleToolCatalogSnapshot {
@@ -23,6 +35,8 @@ pub(crate) fn build_model_visible_tool_catalog_snapshot(
     let allowed_tools = normalized_allowlist(request.config.allowed_tools.as_slice());
     let mut tools = Vec::new();
 
+    // An exhausted budget collapses the whole catalog: every known or
+    // allowlisted name is reported as filtered instead of evaluating gates.
     if request.remaining_tool_budget == 0 {
         for name in all_registry_and_allowlist_names(allowed_tools.iter().map(String::as_str)) {
             filtered_tools.push(filtered(
@@ -90,6 +104,8 @@ pub(crate) fn build_model_visible_tool_catalog_snapshot(
             });
         }
 
+        // Surface allowlisted names with no registry entry so operators see
+        // typos instead of tools silently never appearing.
         for allowed in &allowed_tools {
             if registry_entry(allowed.as_str()).is_none() {
                 filtered_tools.push(filtered(
@@ -101,6 +117,8 @@ pub(crate) fn build_model_visible_tool_catalog_snapshot(
         }
     }
 
+    // Deterministic ordering and dedup: the catalog hash must not depend on
+    // evaluation order, and a name can be filtered for one reason at most once.
     filtered_tools.sort_by(|left, right| {
         left.name.cmp(&right.name).then(left.reason_code.as_str().cmp(right.reason_code.as_str()))
     });
@@ -127,12 +145,17 @@ pub(crate) fn build_model_visible_tool_catalog_snapshot(
         tools,
         filtered_tools,
     };
+    // The hash payload excludes the still-empty snapshot_id/catalog_hash
+    // fields, so hashing before filling them in is well-defined; the id is a
+    // stable prefix of the hash.
     let catalog_hash = stable_hash_value(&catalog_hash_payload(&snapshot));
     snapshot.snapshot_id = format!("toolcat_{}", &catalog_hash[..16]);
     snapshot.catalog_hash = catalog_hash;
     snapshot
 }
 
+/// Serializes the snapshot for embedding in a provider request record,
+/// degrading to a minimal tool-less envelope if serialization ever fails.
 pub(crate) fn snapshot_to_provider_request_value(
     snapshot: &ModelVisibleToolCatalogSnapshot,
 ) -> Value {
@@ -147,6 +170,8 @@ pub(crate) fn snapshot_to_provider_request_value(
     })
 }
 
+/// Converts a serialized catalog snapshot back into dialect-specific provider
+/// tool payloads; an unparsable snapshot yields no tools (fail closed).
 pub(crate) fn provider_tools_from_catalog_snapshot(
     snapshot: &Value,
     dialect: ToolSchemaDialect,
@@ -158,6 +183,9 @@ pub(crate) fn provider_tools_from_catalog_snapshot(
     snapshot.tools.iter().map(|tool| provider_tool_payload(tool, dialect)).collect()
 }
 
+/// Renders the hashes-only tape line for a catalog snapshot: descriptions and
+/// schemas are reduced to their hashes so the tape stays bounded and free of
+/// model-facing prose.
 pub(crate) fn tool_catalog_tape_payload(snapshot: &ModelVisibleToolCatalogSnapshot) -> String {
     let payload = json!({
         "schema_version": snapshot.schema_version,
@@ -193,12 +221,16 @@ pub(crate) fn tool_catalog_tape_payload(snapshot: &ModelVisibleToolCatalogSnapsh
     serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_owned())
 }
 
+/// Returns the registry projection policy for `tool_name`, defaulting unknown
+/// tools to the most restrictive policy (redacted preview plus artifact).
 pub(crate) fn projection_policy_for_tool(tool_name: &str) -> ToolResultProjectionPolicy {
     registry_entry(tool_name)
         .map(|entry| entry.projection_policy)
         .unwrap_or(ToolResultProjectionPolicy::RedactedPreviewAndArtifact)
 }
 
+/// Reports whether the runtime dependency backing `tool_name` is enabled;
+/// tools without a dedicated runtime are always available.
 fn runtime_available(
     config: &ToolCallConfig,
     browser_service_enabled: bool,
@@ -215,6 +247,7 @@ fn runtime_available(
     }
 }
 
+/// Trims, lowercases, and dedups the configured allowlist.
 fn normalized_allowlist(allowed_tools: &[String]) -> BTreeSet<String> {
     let mut tools = BTreeSet::new();
     for tool in allowed_tools {
@@ -222,16 +255,20 @@ fn normalized_allowlist(allowed_tools: &[String]) -> BTreeSet<String> {
         if tool.is_empty() {
             continue;
         }
-        tools.insert(tool.clone());
+        // Allowing process.run implies its lifecycle companions so that
+        // background processes can always be stopped and inspected.
         if tool == "palyra.process.run" {
             tools.insert("palyra.process.stop".to_owned());
             tools.insert("palyra.process.status".to_owned());
             tools.insert("palyra.process.list".to_owned());
         }
+        tools.insert(tool);
     }
     tools
 }
 
+/// Union of every builtin registry name and every allowlisted name, used to
+/// report a complete filtered set when the tool budget is exhausted.
 fn all_registry_and_allowlist_names<'a>(
     allowlist: impl Iterator<Item = &'a str>,
 ) -> BTreeSet<String> {

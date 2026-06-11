@@ -1,3 +1,6 @@
+//! Catalog building, schema sanitization, and tool-call intake tests for the
+//! model-visible tool registry.
+
 use super::builtin::registry_entry;
 use super::types::{ToolCallRejectionKind, ToolParallelismPolicy};
 use super::{
