@@ -1,3 +1,8 @@
+//! Workspace document domain rules: path normalization and allowlisted roots,
+//! content limits, prompt-injection risk scanning, curated bootstrap templates,
+//! and Palyra-managed markdown blocks (HTML-comment delimited sections that
+//! only the daemon may rewrite).
+
 use chrono::{Datelike, Utc};
 use palyra_safety::{
     inspect_text, SafetyAction, SafetyContentKind, SafetyPhase, SafetySourceKind, TrustLabel,
@@ -15,6 +20,8 @@ const PALYRA_MANAGED_BLOCK_SUFFIX: &str = " -->";
 const PALYRA_MANAGED_BLOCK_END_PREFIX: &str = "<!-- PALYRA:END ";
 const PALYRA_MANAGED_ITEM_PREFIX: &str = "<!-- PALYRA:ITEM ";
 
+/// One daemon-written list item inside a managed block, keyed by `entry_id`
+/// for idempotent merges.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceManagedEntry {
     pub entry_id: String,
@@ -22,6 +29,7 @@ pub struct WorkspaceManagedEntry {
     pub content: String,
 }
 
+/// Requested state of a managed block identified by `block_id`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceManagedBlockUpdate {
     pub block_id: String,
@@ -29,6 +37,8 @@ pub struct WorkspaceManagedBlockUpdate {
     pub entries: Vec<WorkspaceManagedEntry>,
 }
 
+/// Hash- and line-level summary of a managed block rewrite, with truncated
+/// before/after previews for audit surfaces.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceManagedBlockDiff {
     pub before_hash: String,
@@ -39,6 +49,11 @@ pub struct WorkspaceManagedBlockDiff {
     pub after_preview: String,
 }
 
+/// Result of applying or syncing a managed block: the full rewritten document
+/// plus which entry ids were inserted/preserved and the resulting diff.
+///
+/// `action` is one of `"noop"`, `"updated_block"`, `"synced_block"`, or
+/// `"created_block"`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceManagedBlockOutcome {
     pub content_text: String,
@@ -48,10 +63,15 @@ pub struct WorkspaceManagedBlockOutcome {
     pub diff: WorkspaceManagedBlockDiff,
 }
 
+/// Reasons a managed block cannot be parsed or rewritten; all variants fail
+/// closed so manual edits inside the block are never silently overwritten.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceManagedBlockError {
+    /// A begin marker exists without a matching end marker.
     UnterminatedBlock { block_id: String },
+    /// An end marker exists without a matching begin marker.
     MissingBlockStart { block_id: String },
+    /// A line inside the block does not follow the item-marker/list-line shape.
     MalformedItem { block_id: String, line: String },
 }
 
@@ -76,6 +96,7 @@ impl std::fmt::Display for WorkspaceManagedBlockError {
 
 impl std::error::Error for WorkspaceManagedBlockError {}
 
+/// Functional role of a workspace document, derived from its normalized path.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceDocumentKind {
@@ -89,6 +110,7 @@ pub enum WorkspaceDocumentKind {
 }
 
 impl WorkspaceDocumentKind {
+    /// Canonical `snake_case` label, identical to the serde representation.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -103,6 +125,8 @@ impl WorkspaceDocumentKind {
     }
 }
 
+/// Who owns a document's lifecycle: user-created, curated scaffold, or
+/// system-managed root document.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceDocumentClass {
@@ -112,6 +136,7 @@ pub enum WorkspaceDocumentClass {
 }
 
 impl WorkspaceDocumentClass {
+    /// Canonical `snake_case` label, identical to the serde representation.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -122,6 +147,7 @@ impl WorkspaceDocumentClass {
     }
 }
 
+/// Visibility state of a document; deletion is soft so history stays restorable.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceDocumentState {
@@ -130,6 +156,7 @@ pub enum WorkspaceDocumentState {
 }
 
 impl WorkspaceDocumentState {
+    /// Canonical `snake_case` label, identical to the serde representation.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -139,6 +166,8 @@ impl WorkspaceDocumentState {
     }
 }
 
+/// How a document may reach the model prompt: never, only via explicit manual
+/// reference, or as an automatic system-prompt candidate.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspacePromptBinding {
@@ -148,6 +177,7 @@ pub enum WorkspacePromptBinding {
 }
 
 impl WorkspacePromptBinding {
+    /// Canonical `snake_case` label, identical to the serde representation.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -158,6 +188,8 @@ impl WorkspacePromptBinding {
     }
 }
 
+/// Outcome bucket of a prompt-injection scan; `Quarantined` content must be
+/// kept out of prompts until an operator clears it.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceRiskState {
@@ -167,6 +199,7 @@ pub enum WorkspaceRiskState {
 }
 
 impl WorkspaceRiskState {
+    /// Canonical `snake_case` label, identical to the serde representation.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -177,12 +210,15 @@ impl WorkspaceRiskState {
     }
 }
 
+/// Risk verdict for one document, with safety finding codes as `reasons`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceRiskScan {
     pub state: WorkspaceRiskState,
     pub reasons: Vec<String>,
 }
 
+/// Seed document created during workspace bootstrap (see
+/// [`curated_workspace_templates`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceTemplate {
     pub template_id: &'static str,
@@ -193,25 +229,34 @@ pub struct WorkspaceTemplate {
     pub content: String,
 }
 
+/// Classification of a validated workspace path (see
+/// [`normalize_workspace_path`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspacePathInfo {
     pub normalized_path: String,
+    /// Directory portion of the path, `None` for root documents.
     pub parent_path: Option<String>,
     pub kind: WorkspaceDocumentKind,
     pub class: WorkspaceDocumentClass,
     pub prompt_binding: WorkspacePromptBinding,
 }
 
+/// Reasons an untrusted workspace path is rejected during normalization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspacePathError {
     Empty,
     TooLong,
     SegmentTooLong(String),
+    /// Path contains a `..` segment.
     Traversal,
+    /// Path starts with `/` or contains a drive/scheme `:` separator.
     AbsolutePath,
     ControlCharacter(String),
+    /// First segment is not one of [`curated_workspace_roots`].
     RootNotAllowed(String),
+    /// Path enters a blocked segment such as `.git`, `.ssh`, or `secrets`.
     SensitiveSegment(String),
+    /// File extension is not in the allowlisted text formats.
     InvalidExtension(String),
 }
 
@@ -247,6 +292,8 @@ impl std::fmt::Display for WorkspacePathError {
 
 impl std::error::Error for WorkspacePathError {}
 
+/// Reasons workspace document content is rejected (see
+/// [`validate_workspace_content`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceContentError {
     Empty,
@@ -269,6 +316,7 @@ fn current_daily_filename() -> String {
     format!("daily/{:04}-{:02}-{:02}.md", now.year(), now.month(), now.day())
 }
 
+/// Workspace path of today's daily note (`daily/YYYY-MM-DD.md`, UTC date).
 #[must_use]
 pub fn current_daily_workspace_path() -> String {
     current_daily_filename()
@@ -291,6 +339,8 @@ fn root_document_template(
     }
 }
 
+/// Seed documents written during workspace bootstrap: the three system root
+/// documents plus curated starter notes (including today's daily note).
 #[must_use]
 pub fn curated_workspace_templates() -> Vec<WorkspaceTemplate> {
     let today = current_daily_filename();
@@ -349,11 +399,25 @@ pub fn curated_workspace_templates() -> Vec<WorkspaceTemplate> {
     ]
 }
 
+/// The only path roots a workspace document or prefix may use; everything
+/// else is rejected with [`WorkspacePathError::RootNotAllowed`].
 #[must_use]
 pub fn curated_workspace_roots() -> &'static [&'static str] {
     &["README.md", "MEMORY.md", "HEARTBEAT.md", "context", "daily", "projects"]
 }
 
+/// Merges `update.entries` into the managed block `update.block_id`, creating
+/// the block if absent and leaving all text outside the block untouched.
+///
+/// The merge is additive and idempotent: entries whose `entry_id` already
+/// exists in the block are kept as-is, and the merged entries are re-sorted by
+/// label/content/id so repeated applications converge to the same bytes. Use
+/// [`sync_workspace_managed_block`] to replace the block contents instead.
+///
+/// # Errors
+///
+/// Returns [`WorkspaceManagedBlockError`] when the existing block markers are
+/// unbalanced or the block interior contains manual or malformed lines.
 pub fn apply_workspace_managed_block(
     current_content: &str,
     update: &WorkspaceManagedBlockUpdate,
@@ -414,6 +478,14 @@ pub fn apply_workspace_managed_block(
     })
 }
 
+/// Replaces the managed block `update.block_id` with exactly `update.entries`
+/// (removing stale entries), creating the block if absent; text outside the
+/// block is untouched.
+///
+/// # Errors
+///
+/// Returns [`WorkspaceManagedBlockError`] when the existing block markers are
+/// unbalanced or the block interior contains manual or malformed lines.
 pub fn sync_workspace_managed_block(
     current_content: &str,
     update: &WorkspaceManagedBlockUpdate,
@@ -458,6 +530,9 @@ pub fn sync_workspace_managed_block(
     })
 }
 
+/// Scans document content with the safety engine and maps the recommended
+/// action onto the workspace risk states (block/approval -> quarantined,
+/// annotate/redact -> warning).
 #[must_use]
 pub fn scan_workspace_content_for_prompt_injection(content: &str) -> WorkspaceRiskScan {
     let safety_scan = inspect_text(
@@ -476,6 +551,12 @@ pub fn scan_workspace_content_for_prompt_injection(content: &str) -> WorkspaceRi
     WorkspaceRiskScan { state, reasons }
 }
 
+/// Enforces the document content contract: non-blank and at most 128 KiB.
+///
+/// # Errors
+///
+/// Returns [`WorkspaceContentError::Empty`] for blank content and
+/// [`WorkspaceContentError::TooLarge`] when the byte limit is exceeded.
 pub fn validate_workspace_content(content: &str) -> Result<(), WorkspaceContentError> {
     if content.trim().is_empty() {
         return Err(WorkspaceContentError::Empty);
@@ -530,6 +611,10 @@ fn normalize_workspace_path_segments(path: &str) -> Result<Vec<String>, Workspac
 /// Unlike [`normalize_workspace_path`], this accepts directory-style prefixes such as
 /// `projects/release/` in addition to exact document paths. It preserves the same root,
 /// traversal, absolute path, control-character, and sensitive-segment validation rules.
+///
+/// # Errors
+///
+/// Returns [`WorkspacePathError`] when the prefix violates any of those rules.
 pub fn normalize_workspace_prefix(prefix: &str) -> Result<String, WorkspacePathError> {
     let segments = normalize_workspace_path_segments(prefix)?;
     let normalized_prefix = segments.join("/");
@@ -541,6 +626,15 @@ pub fn normalize_workspace_prefix(prefix: &str) -> Result<String, WorkspacePathE
     }
 }
 
+/// Validates and normalizes an untrusted document path, classifying it into
+/// kind/class/prompt-binding by its root. This is the single trust boundary
+/// for workspace paths; code past it may assume the path is safe.
+///
+/// # Errors
+///
+/// Returns [`WorkspacePathError`] for empty/oversized paths, traversal or
+/// absolute paths, control characters, sensitive segments, roots outside
+/// [`curated_workspace_roots`], or non-allowlisted file extensions.
 pub fn normalize_workspace_path(path: &str) -> Result<WorkspacePathInfo, WorkspacePathError> {
     let segments = normalize_workspace_path_segments(path)?;
     let normalized_path = segments.join("/");
@@ -569,9 +663,7 @@ pub fn normalize_workspace_path(path: &str) -> Result<WorkspacePathInfo, Workspa
         },
         _ if root == "context" => WorkspacePathInfo {
             normalized_path: normalized_path.clone(),
-            parent_path: segments
-                .len()
-                .gt(&1)
+            parent_path: (segments.len() > 1)
                 .then(|| segments[..segments.len() - 1].join("/"))
                 .filter(|value| !value.is_empty()),
             kind: WorkspaceDocumentKind::Context,
@@ -587,9 +679,7 @@ pub fn normalize_workspace_path(path: &str) -> Result<WorkspacePathInfo, Workspa
         },
         _ if root == "projects" => WorkspacePathInfo {
             normalized_path: normalized_path.clone(),
-            parent_path: segments
-                .len()
-                .gt(&1)
+            parent_path: (segments.len() > 1)
                 .then(|| segments[..segments.len() - 1].join("/"))
                 .filter(|value| !value.is_empty()),
             kind: WorkspaceDocumentKind::Project,
@@ -599,14 +689,11 @@ pub fn normalize_workspace_path(path: &str) -> Result<WorkspacePathInfo, Workspa
         _ => return Err(WorkspacePathError::RootNotAllowed(segments[0].clone())),
     };
 
-    let has_valid_extension = normalized_path
-        .rsplit_once('.')
-        .map(|(_, extension)| {
-            WORKSPACE_ALLOWED_TEXT_EXTENSIONS
-                .iter()
-                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
-        })
-        .unwrap_or(false);
+    let has_valid_extension = normalized_path.rsplit_once('.').is_some_and(|(_, extension)| {
+        WORKSPACE_ALLOWED_TEXT_EXTENSIONS
+            .iter()
+            .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+    });
     if !has_valid_extension {
         return Err(WorkspacePathError::InvalidExtension(normalized_path));
     }
@@ -614,17 +701,33 @@ pub fn normalize_workspace_path(path: &str) -> Result<WorkspacePathInfo, Workspa
     Ok(path_info)
 }
 
+/// Builds the canonical document path for an objective
+/// (`projects/objectives/<id>.md`), validated by [`normalize_workspace_path`].
+///
+/// # Errors
+///
+/// Returns [`WorkspacePathError`] when `objective_id` makes the resulting path
+/// fail normalization (for example traversal or control characters).
 pub fn objective_workspace_document_path(objective_id: &str) -> Result<String, WorkspacePathError> {
     let path = format!("projects/objectives/{objective_id}.md");
     Ok(normalize_workspace_path(path.as_str())?.normalized_path)
 }
 
+/// Located managed block: byte range covering heading-through-end-marker
+/// (`None` when the block does not exist yet) plus its parsed entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedManagedBlock {
     range: Option<(usize, usize)>,
     entries: Vec<WorkspaceManagedEntry>,
 }
 
+// AIDEV-NOTE: this parser assumes the first BEGIN marker precedes the first
+// END marker. A manually edited document that places the END marker before
+// the BEGIN marker makes `after_begin > end_start`, and the
+// `current_content[after_begin..end_start]` slice below panics. Fixing it
+// requires a behavior change (return MissingBlockStart/MalformedItem for the
+// reversed-marker case) and a regression test; do not "simplify" the marker
+// lookups without handling that ordering.
 fn parse_existing_block(
     current_content: &str,
     block_id: &str,
@@ -645,6 +748,10 @@ fn parse_existing_block(
             Err(WorkspaceManagedBlockError::MissingBlockStart { block_id: block_id.to_owned() })
         }
         (Some(begin_start), Some(end_start)) => {
+            // The rendered block always starts with a "## <heading>" line, so
+            // when the line right above the BEGIN marker is such a heading it
+            // belongs to the block and the replacement range must absorb it;
+            // otherwise re-renders would stack duplicate headings.
             let marker_line_start =
                 current_content[..begin_start].rfind('\n').map_or(0, |index| index + 1);
             let heading_scan_end = marker_line_start.saturating_sub(1);
@@ -747,6 +854,8 @@ fn append_managed_block(current_content: &str, rendered_block: &str) -> String {
     normalize_workspace_document_content(content)
 }
 
+/// Canonical document form: LF line endings and a single trailing newline,
+/// so hashing and noop detection are insensitive to line-ending drift.
 fn normalize_workspace_document_content(content: String) -> String {
     let normalized = content.replace("\r\n", "\n");
     if normalized.is_empty() || normalized.ends_with('\n') {
@@ -756,6 +865,8 @@ fn normalize_workspace_document_content(content: String) -> String {
     }
 }
 
+/// Counts lines present on only one side (set difference, not a positional
+/// diff) and attaches truncated previews; adequate for audit summaries.
 fn build_managed_block_diff(
     before_content: &str,
     after_content: &str,

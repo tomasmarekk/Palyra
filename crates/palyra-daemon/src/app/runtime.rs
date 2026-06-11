@@ -1,3 +1,5 @@
+//! Assembly of the shared [`AppState`] and derived runtime config snapshots.
+
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -27,6 +29,10 @@ use crate::{
 use palyra_identity::IdentityManager;
 use palyra_vault::Vault;
 
+/// Pre-built runtime collaborators threaded into [`build_app_state`].
+///
+/// Groups the long-lived `Arc` handles created during startup so the builder
+/// signature stays stable as subsystems are added.
 pub(crate) struct AppStateBuildContext {
     pub(crate) acp_runtime: Arc<AcpRuntime>,
     pub(crate) runtime: Arc<GatewayRuntimeState>,
@@ -44,6 +50,8 @@ pub(crate) struct AppStateBuildContext {
     pub(crate) access_registry: Arc<Mutex<AccessRegistry>>,
 }
 
+/// Builds the [`AppState`] shared by every HTTP handler, seeding empty
+/// rate-limit buckets, session/token maps, and job registries.
 pub(crate) fn build_app_state(
     loaded: &LoadedConfig,
     dangerous_remote_bind_ack_env: bool,
@@ -102,6 +110,7 @@ pub(crate) fn build_app_state(
     }
 }
 
+/// Converts the file-config browser service section into the gateway runtime shape.
 pub(crate) fn build_browser_service_runtime_config(
     config: &BrowserServiceConfig,
 ) -> gateway::BrowserServiceRuntimeConfig {
@@ -111,11 +120,15 @@ pub(crate) fn build_browser_service_runtime_config(
         auth_token: config.auth_token.clone(),
         connect_timeout_ms: config.connect_timeout_ms,
         request_timeout_ms: config.request_timeout_ms,
+        // u64 config limits saturate to usize::MAX on 32-bit targets: an
+        // oversized cap degrades to "no cap" rather than failing startup.
         max_screenshot_bytes: usize::try_from(config.max_screenshot_bytes).unwrap_or(usize::MAX),
         max_title_bytes: usize::try_from(config.max_title_bytes).unwrap_or(usize::MAX),
     }
 }
 
+/// Captures the deployment/bind posture observed at startup for diagnostics
+/// endpoints; values are frozen and do not track later config reloads.
 pub(crate) fn build_deployment_runtime_snapshot(
     loaded: &LoadedConfig,
     dangerous_remote_bind_ack_env: bool,
@@ -138,6 +151,10 @@ pub(crate) fn build_deployment_runtime_snapshot(
     }
 }
 
+/// Builds the URL local clients use to reach the gateway gRPC listener.
+///
+/// Unspecified bind addresses (`0.0.0.0` / `::`) are rewritten to the matching
+/// loopback address because clients cannot dial the wildcard address itself.
 pub(crate) fn loopback_grpc_url(socket: SocketAddr, tls_enabled: bool) -> String {
     let normalized = match socket {
         SocketAddr::V4(v4) if v4.ip().is_unspecified() => {

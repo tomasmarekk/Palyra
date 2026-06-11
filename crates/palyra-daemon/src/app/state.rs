@@ -1,3 +1,6 @@
+//! Shared daemon state ([`AppState`]) and the session, token, rate-limit, and
+//! OAuth bookkeeping types stored inside it.
+
 use std::{
     collections::{HashMap, VecDeque},
     net::IpAddr,
@@ -31,6 +34,11 @@ use crate::{
     routines, webhooks,
 };
 
+/// Axum/handler state shared by the whole admin and console HTTP surface.
+///
+/// Cloning is cheap (all heavy members are `Arc`s) and every clone observes the
+/// same underlying state. Mutable maps are guarded by `std::sync::Mutex`;
+/// guards must not be held across `.await` points.
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) started_at: Instant,
@@ -74,6 +82,8 @@ pub(crate) struct AppState {
     pub(crate) access_registry: Arc<Mutex<AccessRegistry>>,
 }
 
+/// Snapshot of which configured secret references resolved (and how), exposed
+/// through console diagnostics; carries no secret values.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ConfiguredSecretsState {
     pub(crate) generated_at_unix_ms: i64,
@@ -81,12 +91,14 @@ pub(crate) struct ConfiguredSecretsState {
     pub(crate) secrets: Vec<control_plane::ConfiguredSecretRecord>,
 }
 
+/// Latest config-reload plan plus a bounded history of apply outcomes.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ReloadOperationsState {
     pub(crate) latest_plan: Option<control_plane::ConfigReloadPlanEnvelope>,
     pub(crate) recent_events: VecDeque<control_plane::ConfigReloadApplyEnvelope>,
 }
 
+/// Deployment/bind posture captured once at startup for diagnostics surfaces.
 #[derive(Debug, Clone)]
 pub(crate) struct DeploymentRuntimeSnapshot {
     pub(crate) profile: String,
@@ -105,6 +117,8 @@ pub(crate) struct DeploymentRuntimeSnapshot {
     pub(crate) dangerous_remote_bind_ack_env: bool,
 }
 
+/// Identity attribution for a console-initiated action, recorded with journal
+/// events and OAuth attempts.
 #[derive(Debug, Clone)]
 pub(crate) struct ConsoleActionContext {
     pub(crate) principal: String,
@@ -112,6 +126,11 @@ pub(crate) struct ConsoleActionContext {
     pub(crate) channel: Option<String>,
 }
 
+/// In-flight OAuth authorization attempt for a model-provider auth profile.
+///
+/// Holds live credential material (`client_secret`, `code_verifier`), so
+/// `Debug` is implemented manually below to redact those fields. Keep the
+/// manual impl in sync when adding fields.
 #[derive(Clone)]
 pub(crate) struct OpenAiOAuthAttempt {
     pub(crate) provider: ModelProviderAuthProviderKind,
@@ -134,6 +153,8 @@ pub(crate) struct OpenAiOAuthAttempt {
     pub(crate) state: OpenAiOAuthAttemptStateRecord,
 }
 
+// INTENTIONAL: manual Debug so secret-bearing fields are redacted; do not
+// replace with #[derive(Debug)].
 impl std::fmt::Debug for OpenAiOAuthAttempt {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -160,6 +181,9 @@ impl std::fmt::Debug for OpenAiOAuthAttempt {
     }
 }
 
+/// Most recent admin request observed from a non-loopback address, kept for
+/// the deployment security diagnostics view. The remote IP is stored only as
+/// a fingerprint, never verbatim.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct RemoteAdminAccessAttempt {
     pub(crate) observed_at_unix_ms: i64,
@@ -170,24 +194,29 @@ pub(crate) struct RemoteAdminAccessAttempt {
     pub(crate) outcome: String,
 }
 
+/// Fixed-window request counter for one admin API client IP.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AdminRateLimitEntry {
     pub(crate) window_started_at: Instant,
     pub(crate) requests_in_window: u32,
 }
 
+/// Fixed-window request counter for one canvas HTTP client IP.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CanvasRateLimitEntry {
     pub(crate) window_started_at: Instant,
     pub(crate) requests_in_window: u32,
 }
 
+/// Fixed-window request counter for one OpenAI-compatible API key bucket.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CompatApiRateLimitEntry {
     pub(crate) window_started_at: Instant,
     pub(crate) requests_in_window: u32,
 }
 
+/// Authenticated console session; only the SHA-256 hash of the bearer token is
+/// retained, alongside the CSRF token validated on mutating requests.
 #[derive(Debug, Clone)]
 pub(crate) struct ConsoleSession {
     pub(crate) session_token_hash_sha256: String,
@@ -197,6 +226,8 @@ pub(crate) struct ConsoleSession {
     pub(crate) expires_at_unix_ms: i64,
 }
 
+/// One-shot, hash-stored token that lets the console hand a session off to a
+/// browser tab via redirect.
 #[derive(Debug, Clone)]
 pub(crate) struct ConsoleBrowserHandoff {
     pub(crate) token_hash_sha256: String,
@@ -205,6 +236,8 @@ pub(crate) struct ConsoleBrowserHandoff {
     pub(crate) expires_at_unix_ms: i64,
 }
 
+/// Scoped, expiring token authorizing a browser-extension relay to act on one
+/// browser session; stored by token hash only.
 #[derive(Debug, Clone)]
 pub(crate) struct ConsoleRelayToken {
     pub(crate) token_hash_sha256: String,
@@ -217,6 +250,8 @@ pub(crate) struct ConsoleRelayToken {
     pub(crate) expires_at_unix_ms: i64,
 }
 
+/// Live console chat run: the request side of the gRPC run stream plus
+/// approvals awaiting an operator decision.
 #[derive(Debug, Clone)]
 pub(crate) struct ConsoleChatRunStream {
     pub(crate) session_id: String,

@@ -1,7 +1,12 @@
+//! Orchestrator run lifecycle: the run state machine plus small token and
+//! cancel-command helpers shared by streaming surfaces.
+
 use serde::Serialize;
 
+/// Maximum model tokens emitted in a single streamed run event.
 pub const MAX_MODEL_TOKENS_PER_EVENT: usize = 16;
 
+/// Events that drive [`RunStateMachine::transition`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunTransition {
     Accept,
@@ -11,6 +16,10 @@ pub enum RunTransition {
     Cancel,
 }
 
+/// Lifecycle states of an orchestrator run.
+///
+/// Serialized (and persisted) as `snake_case` strings; [`Self::as_str`] and
+/// [`Self::from_str`] must stay in sync with the serde representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunLifecycleState {
@@ -23,6 +32,7 @@ pub enum RunLifecycleState {
 }
 
 impl RunLifecycleState {
+    /// Canonical `snake_case` label, identical to the serde representation.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -35,6 +45,7 @@ impl RunLifecycleState {
         }
     }
 
+    /// Parses a canonical `snake_case` label; returns `None` for unknown values.
     #[must_use]
     pub fn from_str(value: &str) -> Option<Self> {
         match value {
@@ -48,18 +59,23 @@ impl RunLifecycleState {
         }
     }
 
+    /// Returns `true` once the run can never transition again.
     #[must_use]
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Done | Self::Failed | Self::Cancelled)
     }
 }
 
+/// Errors produced by [`RunStateMachine::transition`].
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RunStateMachineError {
+    /// The requested transition is not legal from the current state.
     #[error("invalid run state transition from {from:?} via {transition:?}")]
     InvalidTransition { from: RunLifecycleState, transition: RunTransition },
 }
 
+/// Enforces the legal run lifecycle; starts in [`RunLifecycleState::Pending`]
+/// and rejects every transition not listed in [`Self::transition`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunStateMachine {
     state: RunLifecycleState,
@@ -72,11 +88,22 @@ impl Default for RunStateMachine {
 }
 
 impl RunStateMachine {
+    /// Current lifecycle state.
     #[must_use]
     pub fn state(self) -> RunLifecycleState {
         self.state
     }
 
+    /// Applies `transition` and returns the new state.
+    ///
+    /// Legal transitions: `Pending -> Accepted` (accept); `Accepted ->
+    /// InProgress | Cancelled | Failed`; `InProgress -> Done | Failed |
+    /// Cancelled`. Terminal states accept no further transitions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunStateMachineError::InvalidTransition`] for any other
+    /// combination; the state is left unchanged.
     pub fn transition(
         &mut self,
         transition: RunTransition,
@@ -103,11 +130,16 @@ impl RunStateMachine {
     }
 }
 
+/// Cheap token estimate (whitespace-separated word count) used for budget
+/// accounting; deliberately not a model tokenizer.
 #[must_use]
 pub fn estimate_token_count(input: &str) -> u64 {
     input.split_whitespace().count() as u64
 }
 
+/// Splits `input` into at most `max_tokens` word tokens, attaching each word's
+/// leading whitespace so that `tokens.concat()` reproduces the consumed prefix
+/// byte-for-byte (mirrors how streamed model tokens are re-joined).
 #[must_use]
 #[cfg(test)]
 pub fn split_model_tokens(input: &str, max_tokens: usize) -> Vec<String> {
@@ -153,6 +185,8 @@ pub fn split_model_tokens(input: &str, max_tokens: usize) -> Vec<String> {
     tokens
 }
 
+/// Recognizes the operator cancel commands `/cancel` and `cancel`
+/// (case-insensitive, surrounding whitespace ignored).
 #[must_use]
 pub fn is_cancel_command(input: &str) -> bool {
     let trimmed = input.trim();

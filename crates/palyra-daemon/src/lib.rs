@@ -1,3 +1,36 @@
+//! Palyra daemon (`palyrad`): the gateway runtime that hosts the admin/console
+//! HTTP surface, the gateway and node-RPC gRPC listeners, optional QUIC
+//! transport, and every background subsystem in a single process.
+//!
+//! # Entry points
+//!
+//! [`run`] is the only public entry point; the `palyrad` binary
+//! (`src/bin/palyrad.rs`) just awaits it inside a Tokio runtime. `run` loads
+//! config (`app::bootstrap`), wires the subsystems below, enforces the
+//! remote-bind security guard, then serves HTTP and gRPC until Ctrl+C.
+//!
+//! # Module map
+//!
+//! - [`app`]: bootstrap, logging, shared `app::state::AppState`, shutdown.
+//! - `transport`: HTTP router/handlers/middleware and gRPC/QUIC servers.
+//! - `application` / [`domain`]: use-case services and domain invariants.
+//! - `gateway`: gateway runtime state, runtime config snapshots, auth config.
+//! - `journal`: SQLite event journal, memory/workspace storage, approvals.
+//! - `orchestrator`: run lifecycle state machine shared by streaming surfaces.
+//! - `channels`, `channel_router`, `webhooks`, `routines`, `objectives`:
+//!   connector platform and scheduled/queued work.
+//! - `model_provider`, `openai_auth`, `openai_surface`, `provider_leases`:
+//!   model provider runtime and auth-profile credential flows.
+//! - `sandbox_runner`, `wasm_plugin_runner`, `tool_protocol`, `tool_posture`:
+//!   tool execution backends and their fail-closed policies.
+//! - `access_control`, `acp`, `node_runtime`, `quic_runtime`, `maintenance`,
+//!   `observability`, `self_healing`, `usage_governance`: supporting runtimes.
+//!
+//! Besides [`run`], this crate root hosts the startup helpers (identity/vault/
+//! secret resolution, bind guard) plus the serde DTOs for the console/admin
+//! HTTP surface, which are crate-private but referenced from the `transport`
+//! handler modules.
+
 #![recursion_limit = "256"]
 
 mod access_control;
@@ -253,16 +286,27 @@ const SYSTEM_VAULT_CHANNEL: &str = "system:vault";
 const SYSTEM_DAEMON_DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const GRPC_MAX_DECODING_MESSAGE_SIZE_BYTES: usize = 4 * 1024 * 1024;
 const GRPC_MAX_ENCODING_MESSAGE_SIZE_BYTES: usize = 4 * 1024 * 1024;
+/// Fixed-window length for per-IP admin API rate limiting.
 pub(crate) const ADMIN_RATE_LIMIT_WINDOW_MS: u64 = 1_000;
+/// Admin API requests allowed per window for non-loopback clients.
 pub(crate) const ADMIN_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW: u32 = 30;
+/// Looser admin budget for loopback clients (local desktop/CLI bursts).
 pub(crate) const ADMIN_RATE_LIMIT_LOOPBACK_MAX_REQUESTS_PER_WINDOW: u32 = 1_000;
+/// Failed admin auth attempts allowed per IP per window before lockout.
 pub(crate) const ADMIN_AUTH_FAILURE_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW: u32 = 30;
+/// Cap on tracked admin rate-limit IP buckets (oldest evicted beyond this).
 pub(crate) const ADMIN_RATE_LIMIT_MAX_IP_BUCKETS: usize = 4_096;
+/// Fixed-window length for per-IP canvas HTTP rate limiting.
 pub(crate) const CANVAS_RATE_LIMIT_WINDOW_MS: u64 = 1_000;
+/// Canvas HTTP requests allowed per IP per window.
 pub(crate) const CANVAS_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW: u32 = 90;
+/// Cap on tracked canvas rate-limit IP buckets (oldest evicted beyond this).
 pub(crate) const CANVAS_RATE_LIMIT_MAX_IP_BUCKETS: usize = 4_096;
+/// Maximum accepted canvas token query parameter size.
 pub(crate) const CANVAS_HTTP_MAX_TOKEN_BYTES: usize = 8 * 1024;
+/// Maximum accepted canvas id length (canonical ULIDs are 26 bytes).
 pub(crate) const CANVAS_HTTP_MAX_CANVAS_ID_BYTES: usize = 64;
+/// Request body cap applied across the admin/console HTTP surface.
 pub(crate) const HTTP_MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
 const DISCORD_ONBOARDING_HTTP_TIMEOUT_MS: u64 = 5_000;
@@ -273,6 +317,8 @@ const SMART_ROUTING_ENABLED_ENV: &str = "PALYRA_SMART_ROUTING_ENABLED";
 const SMART_ROUTING_MODE_ENV: &str = "PALYRA_SMART_ROUTING_MODE";
 const SMART_ROUTING_AUXILIARY_ENABLED_ENV: &str = "PALYRA_SMART_ROUTING_AUXILIARY_ENABLED";
 
+/// Reads the smart-routing env toggles; unset or unrecognized values fall back
+/// to the enabled/suggest defaults rather than failing startup.
 fn load_smart_routing_runtime_config() -> usage_governance::SmartRoutingRuntimeConfig {
     let enabled = std::env::var(SMART_ROUTING_ENABLED_ENV)
         .ok()
@@ -316,6 +362,11 @@ const SKILL_ARTIFACT_FILE_NAME: &str = "artifact.palyra-skill";
 const INSTALLED_SKILLS_INDEX_FORMAT: VersionedJsonFormat =
     VersionedJsonFormat::new("installed skills index", SKILLS_LAYOUT_VERSION);
 
+// Serde DTOs for the console/admin HTTP surface follow. They are crate-root
+// private on purpose: every `transport::http` handler module can reach them
+// as `crate::<Name>` while nothing leaks into the public API. Field shapes
+// mirror the `/console/v1` JSON contract; renaming fields is a breaking
+// contract change.
 #[derive(Debug, Deserialize)]
 struct JournalRecentQuery {
     limit: Option<usize>,
@@ -1724,6 +1775,10 @@ struct ConsoleChatAttachmentReference {
     artifact_id: String,
 }
 
+/// Persisted index of installed skills (`skills/installed-index.json`).
+///
+/// On-disk schema: changes must bump `SKILLS_LAYOUT_VERSION` and ship a
+/// migration for `parse_versioned_json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InstalledSkillsIndex {
@@ -1739,6 +1794,8 @@ const SKILL_BUILDER_CANDIDATE_INDEX_FORMAT: VersionedJsonFormat = VersionedJsonF
     SKILL_BUILDER_CANDIDATE_LAYOUT_VERSION,
 );
 
+/// Persisted index of skill-builder candidates awaiting artifact/eval/review
+/// gates; an on-disk schema like `InstalledSkillsIndex`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SkillBuilderCandidateIndex {
@@ -1758,6 +1815,8 @@ impl Default for SkillBuilderCandidateIndex {
     }
 }
 
+/// One generated-skill candidate: scaffold/manifest paths, gate statuses, and
+/// the capability profile it would be granted if promoted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SkillBuilderCandidateRecord {
@@ -1812,6 +1871,9 @@ impl Default for InstalledSkillsIndex {
     }
 }
 
+/// One installed skill version with its trust decision, hashes, security scan
+/// snapshot, and optional rollback pointer. At most one record per `skill_id`
+/// has `current == true` (enforced by `normalize_installed_skills_index`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InstalledSkillRecord {
@@ -1833,6 +1895,7 @@ struct InstalledSkillRecord {
     rollback_snapshot: Option<InstalledSkillRollbackSnapshot>,
 }
 
+/// Where a skill artifact came from (for example a local path or registry ref).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InstalledSkillSource {
@@ -1840,6 +1903,9 @@ struct InstalledSkillSource {
     reference: String,
 }
 
+/// Persisted result of the install-time security audit for one skill payload.
+/// The `Default` is deliberately fail-closed (`should_quarantine: true`) so
+/// legacy records without a scan stay quarantined until re-audited.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct InstalledSkillSecuritySnapshot {
@@ -1876,6 +1942,8 @@ impl Default for InstalledSkillSecuritySnapshot {
     }
 }
 
+/// Pointer to the previously current version, captured before an upgrade so
+/// the operator can roll back.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct InstalledSkillRollbackSnapshot {
@@ -1886,6 +1954,7 @@ struct InstalledSkillRollbackSnapshot {
     captured_at_unix_ms: i64,
 }
 
+/// A vault secret a skill declares but that is not provisioned yet.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct MissingSkillSecret {
@@ -1893,17 +1962,20 @@ struct MissingSkillSecret {
     key: String,
 }
 
+/// Query carrying a canvas access token.
 #[derive(Debug, Deserialize)]
 pub(crate) struct CanvasTokenQuery {
     token: String,
 }
 
+/// Query addressing a specific canvas with its access token.
 #[derive(Debug, Deserialize)]
 pub(crate) struct CanvasRuntimeQuery {
     canvas_id: String,
     token: String,
 }
 
+/// Canvas state poll: returns state newer than `after_version` when set.
 #[derive(Debug, Deserialize)]
 pub(crate) struct CanvasStateQuery {
     token: String,
@@ -1935,6 +2007,8 @@ struct PolicyExplainResponse {
     diagnostics: serde_json::Value,
 }
 
+/// Identity material initialized at startup: the store root, gateway CA, the
+/// node-RPC server certificate, and the shared [`IdentityManager`] handle.
 #[derive(Clone)]
 struct IdentityRuntime {
     store_root: PathBuf,
@@ -1944,6 +2018,8 @@ struct IdentityRuntime {
     manager: Arc<Mutex<IdentityManager>>,
 }
 
+/// Journal payload describing one secret resolution; identifies the secret by
+/// config path and fingerprint only, never by value.
 #[derive(Debug, Clone)]
 struct SecretAccessAuditRecord {
     action: String,
@@ -1953,6 +2029,8 @@ struct SecretAccessAuditRecord {
     resolved_at_unix_ms: i64,
 }
 
+/// Parses a boolean-like env value (`1/0`, `true/false`, `yes/no`, `on/off`;
+/// empty means `false`); anything else is a startup error, not a default.
 fn parse_offline_env_flag(raw: &str) -> Result<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Ok(true),
@@ -1963,6 +2041,7 @@ fn parse_offline_env_flag(raw: &str) -> Result<bool> {
     }
 }
 
+/// Reads `PALYRA_OFFLINE`; absent means online, malformed values fail startup.
 fn offline_mode_enabled() -> Result<bool> {
     match std::env::var("PALYRA_OFFLINE") {
         Ok(raw) => parse_offline_env_flag(raw.as_str()),
@@ -1973,6 +2052,8 @@ fn offline_mode_enabled() -> Result<bool> {
     }
 }
 
+/// Builds the learning runtime config from defaults plus `PALYRA_LEARNING_*`
+/// env overrides; out-of-range or non-numeric values fail startup loudly.
 fn build_learning_runtime_config() -> Result<LearningRuntimeConfig> {
     let mut config = LearningRuntimeConfig::default();
 
@@ -2043,6 +2124,25 @@ fn build_learning_runtime_config() -> Result<LearningRuntimeConfig> {
     Ok(config)
 }
 
+/// Runs the daemon until shutdown: the single entry point used by `palyrad`.
+///
+/// Startup sequence: install tracing, load config and CLI overrides, open the
+/// identity store, journal, vault, and registries, resolve configured secret
+/// references (auditing each access to the journal), enforce the fail-closed
+/// remote-bind guard, bind the admin HTTP, gateway gRPC, and node-RPC
+/// listeners, spawn the scheduler/channel/hook/background/self-healing loops,
+/// then serve until Ctrl+C triggers graceful shutdown.
+///
+/// With `--journal-migrate-only` it applies journal migrations and returns
+/// before binding any listener.
+///
+/// # Errors
+///
+/// Returns an error when any startup stage fails - invalid config or env
+/// values, storage/identity/vault initialization failures, secret resolution
+/// failures, rejected security posture (bind guard, process-runner policy,
+/// missing admin token), unbindable listeners - or when either server exits
+/// with a failure at runtime.
 pub async fn run() -> Result<()> {
     init_tracing();
     let bootstrap = load_runtime_bootstrap()?;
@@ -2661,6 +2761,9 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
+/// In local-desktop deployments, guarantees a usable default agent exists
+/// (creating or selecting one); skipped entirely for other deployment modes,
+/// and left to the operator when multiple agents exist without a default.
 fn ensure_local_default_agent(
     agent_registry: &agents::AgentRegistry,
     loaded: &config::LoadedConfig,
@@ -2708,6 +2811,8 @@ fn ensure_local_default_agent(
     Ok(())
 }
 
+/// Anchors a relative configured workspace root to the current directory so
+/// the persisted agent record holds an absolute path.
 fn default_agent_workspace_root(configured_workspace_root: &FsPath) -> Result<PathBuf> {
     if configured_workspace_root.is_absolute() {
         return Ok(configured_workspace_root.to_path_buf());
@@ -2730,6 +2835,9 @@ struct ConsoleCronRunsQuery {
     limit: Option<usize>,
 }
 
+/// Resolves the daemon state root with precedence: `PALYRA_STATE_ROOT` env
+/// override, then the identity store's parent directory, then the platform
+/// default state root.
 #[allow(clippy::result_large_err)]
 fn resolve_runtime_state_root(identity_store_root: &FsPath) -> Result<PathBuf> {
     resolve_runtime_state_root_with_override(
@@ -2738,6 +2846,7 @@ fn resolve_runtime_state_root(identity_store_root: &FsPath) -> Result<PathBuf> {
     )
 }
 
+/// Env-free core of `resolve_runtime_state_root`, split out for tests.
 fn resolve_runtime_state_root_with_override(
     state_root_override: Option<PathBuf>,
     identity_store_root: &FsPath,
@@ -2755,6 +2864,11 @@ fn resolve_runtime_state_root_with_override(
     default_state_root().context("failed to resolve default state root")
 }
 
+/// Resolves the skills storage root under the runtime state root.
+///
+/// Returns a ready-to-send HTTP error `Response` on failure because every
+/// caller is an HTTP handler (hence the `result_large_err` allowance here and
+/// on the sibling skills helpers).
 #[allow(clippy::result_large_err)]
 fn resolve_skills_root() -> Result<PathBuf, Response> {
     let identity_root = match std::env::var_os("PALYRA_GATEWAY_IDENTITY_STORE_DIR") {
@@ -2778,6 +2892,8 @@ fn resolve_skills_root() -> Result<PathBuf, Response> {
     Ok(state_root.join("skills"))
 }
 
+/// Trust store path: `PALYRA_SKILLS_TRUST_STORE` override or the default
+/// `trust-store.json` under the skills root.
 fn resolve_skills_trust_store_path(skills_root: &FsPath) -> PathBuf {
     match std::env::var("PALYRA_SKILLS_TRUST_STORE") {
         Ok(raw) if !raw.trim().is_empty() => PathBuf::from(raw),
@@ -2785,6 +2901,8 @@ fn resolve_skills_trust_store_path(skills_root: &FsPath) -> PathBuf {
     }
 }
 
+/// Loads the skill trust store; a missing file yields the empty default
+/// (first install runs under TOFU rules rather than failing).
 #[allow(clippy::result_large_err)]
 fn load_trust_store(path: &FsPath) -> Result<SkillTrustStore, Response> {
     if !path.exists() {
@@ -2798,6 +2916,7 @@ fn load_trust_store(path: &FsPath) -> Result<SkillTrustStore, Response> {
     })
 }
 
+/// Persists the skill trust store, mapping failures to an HTTP error response.
 #[allow(clippy::result_large_err)]
 fn save_trust_store(path: &FsPath, store: &SkillTrustStore) -> Result<(), Response> {
     store.save(path).map_err(|error| {
@@ -2808,6 +2927,8 @@ fn save_trust_store(path: &FsPath, store: &SkillTrustStore) -> Result<(), Respon
     })
 }
 
+/// Loads and normalizes the installed-skills index; a missing file yields the
+/// empty default, and legacy layouts are migrated on read.
 #[allow(clippy::result_large_err)]
 fn load_installed_skills_index(skills_root: &FsPath) -> Result<InstalledSkillsIndex, Response> {
     let index_path = skills_root.join(SKILLS_INDEX_FILE_NAME);
@@ -2835,6 +2956,8 @@ fn load_installed_skills_index(skills_root: &FsPath) -> Result<InstalledSkillsIn
     Ok(index)
 }
 
+/// Writes the installed-skills index after re-normalizing and stamping the
+/// current schema version and timestamp.
 #[allow(clippy::result_large_err)]
 fn save_installed_skills_index(
     skills_root: &FsPath,
@@ -2867,6 +2990,9 @@ fn save_installed_skills_index(
     })
 }
 
+/// Restores the index invariants: deterministic ordering and exactly one
+/// `current` entry per skill (the first marked one wins; if none is marked,
+/// the first entry in sort order is promoted).
 fn normalize_installed_skills_index(index: &mut InstalledSkillsIndex) {
     index.entries.sort_by(|left, right| {
         left.skill_id
@@ -2882,6 +3008,9 @@ fn normalize_installed_skills_index(index: &mut InstalledSkillsIndex) {
             current_by_skill.insert(entry.skill_id.clone(), true);
         }
     }
+    // Second pass: skills whose entries were all unmarked get their first
+    // entry promoted. The or_insert_with closure deliberately mutates `entry`
+    // as a side effect; it only runs for a skill_id not seen above.
     for entry in &mut index.entries {
         current_by_skill.entry(entry.skill_id.clone()).or_insert_with(|| {
             entry.current = true;
@@ -2890,6 +3019,8 @@ fn normalize_installed_skills_index(index: &mut InstalledSkillsIndex) {
     }
 }
 
+/// Picks the effective version for a skill action: an explicit non-blank
+/// `version` wins, otherwise the current (or first known) installed version.
 #[allow(clippy::result_large_err)]
 fn resolve_skill_version(
     index: &InstalledSkillsIndex,
@@ -2912,10 +3043,13 @@ fn resolve_skill_version(
     Ok(current.version.clone())
 }
 
+/// Canonical on-disk location of a managed skill artifact:
+/// `<skills_root>/<skill_id>/<version>/artifact.palyra-skill`.
 fn managed_skill_artifact_path(skills_root: &FsPath, skill_id: &str, version: &str) -> PathBuf {
     skills_root.join(skill_id).join(version).join(SKILL_ARTIFACT_FILE_NAME)
 }
 
+/// Stable `snake_case` label persisted in the installed-skills index.
 fn trust_decision_label(decision: palyra_skills::TrustDecision) -> String {
     match decision {
         palyra_skills::TrustDecision::Allowlisted => "allowlisted".to_owned(),
@@ -2924,12 +3058,15 @@ fn trust_decision_label(decision: palyra_skills::TrustDecision) -> String {
     }
 }
 
+/// Lowercase hex SHA-256 digest; the canonical fingerprint format for token
+/// hashes and artifact checksums across the daemon.
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())
 }
 
+/// Trims `value`, mapping blank input to `None`.
 fn trim_to_option(value: String) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -2939,6 +3076,7 @@ fn trim_to_option(value: String) -> Option<String> {
     }
 }
 
+/// Trims a required request field, rejecting blank values with a 400 response.
 #[allow(clippy::result_large_err)]
 fn normalize_non_empty_field(value: String, field_name: &'static str) -> Result<String, Response> {
     let trimmed = value.trim();
@@ -2947,12 +3085,16 @@ fn normalize_non_empty_field(value: String, field_name: &'static str) -> Result<
             "{field_name} cannot be empty"
         ))));
     }
+    // Skill ids are case-insensitive; lowercase here so index lookups and
+    // on-disk paths share one canonical form.
     if field_name == "skill_id" {
         return Ok(trimmed.to_ascii_lowercase());
     }
     Ok(trimmed.to_owned())
 }
 
+/// Maps gateway auth failures onto HTTP status, error code, and category,
+/// sanitizing the message before it leaves the process.
 fn auth_error_response(error: AuthError) -> Response {
     let status = match error {
         AuthError::MissingConfiguredToken => StatusCode::SERVICE_UNAVAILABLE,
@@ -2978,6 +3120,9 @@ fn auth_error_response(error: AuthError) -> Response {
     build_error_response(status, sanitized_error, code, category, retryable, Vec::new(), redacted)
 }
 
+/// Redacts secret-like values from an error message before it is returned to
+/// HTTP clients, reusing the journal redaction rules with the provider
+/// sanitizer as fallback when the round-trip through JSON fails.
 fn sanitize_http_error_message(raw: &str) -> String {
     if raw.trim().is_empty() {
         return String::new();
@@ -2993,6 +3138,9 @@ fn sanitize_http_error_message(raw: &str) -> String {
     }
 }
 
+/// Maps channel platform errors onto gRPC statuses (and through them HTTP
+/// responses), distinguishing validation, precondition, not-found, and
+/// availability failures.
 fn channel_platform_error_response(error: channels::ChannelPlatformError) -> Response {
     let status = match &error {
         channels::ChannelPlatformError::InvalidInput(message) => {
@@ -3029,6 +3177,11 @@ fn channel_platform_error_response(error: channels::ChannelPlatformError) -> Res
     runtime_status_response(status)
 }
 
+/// Converts a `tonic::Status` into the daemon's HTTP error envelope, mapping
+/// gRPC codes to HTTP statuses/categories and sanitizing the message.
+///
+/// This is the single choke point for handler errors on the HTTP surface, so
+/// redaction and the error contract stay uniform.
 pub(crate) fn runtime_status_response(status: tonic::Status) -> Response {
     let (http_status, code, category, retryable) = match status.code() {
         tonic::Code::Unauthenticated => {
@@ -3085,6 +3238,7 @@ pub(crate) fn runtime_status_response(status: tonic::Status) -> Response {
     )
 }
 
+/// Builds a 400 response carrying a single structured validation issue.
 fn validation_error_response(field: &str, code: &str, message: &str) -> Response {
     build_error_response(
         StatusCode::BAD_REQUEST,
@@ -3101,6 +3255,8 @@ fn validation_error_response(field: &str, code: &str, message: &str) -> Response
     )
 }
 
+/// Serializes the shared control-plane error envelope; `message` must already
+/// be sanitized by the caller.
 fn build_error_response(
     status: StatusCode,
     message: String,
@@ -3124,6 +3280,8 @@ fn build_error_response(
         .into_response()
 }
 
+/// Startup preflight: admin auth may not be enabled without a usable token,
+/// so misconfiguration fails the boot instead of yielding 503s at runtime.
 fn validate_admin_auth_config(auth: &GatewayAuthConfig) -> Result<()> {
     if auth.require_auth && auth.admin_token.as_deref().is_none_or(|value| value.trim().is_empty())
     {
@@ -3134,6 +3292,17 @@ fn validate_admin_auth_config(auth: &GatewayAuthConfig) -> Result<()> {
     Ok(())
 }
 
+/// Fail-closed preflight for the process-runner sandbox configuration.
+///
+/// Rejects combinations whose isolation guarantees cannot be honored: Tier C
+/// on Windows (no OS-enforced backend yet), Tier B with strict egress (Tier B
+/// cannot enforce it), and strict egress combined with host allowlists
+/// (strict mode blocks all egress, so allowlists would silently lie).
+///
+/// # Errors
+///
+/// Returns a descriptive error naming the offending config keys for each of
+/// the rejected combinations above.
 fn validate_process_runner_backend_policy(
     enabled: bool,
     tier: sandbox_runner::SandboxProcessRunnerTier,
@@ -3164,6 +3333,12 @@ fn validate_process_runner_backend_policy(
     Ok(())
 }
 
+/// Hydrates API keys for the primary model provider and every registry entry,
+/// returning one audit record per secret actually resolved.
+///
+/// Credential precedence per provider: inline config key, then auth profile,
+/// then `*_secret_ref`, then legacy `*_vault_ref` (upgraded to a secret ref
+/// in place). `credential_source` is set to record which path won.
 fn resolve_model_provider_secret(
     model_provider: &mut ModelProviderConfig,
     auth_registry: &AuthProfileRegistry,
@@ -3189,6 +3364,9 @@ fn resolve_model_provider_secret(
     Ok(audits)
 }
 
+/// Resolves the primary provider's API key following the precedence described
+/// on `resolve_model_provider_secret`; returns `None` when nothing needed
+/// resolving (inline key, deterministic provider, or no credential configured).
 fn resolve_primary_model_provider_secret(
     model_provider: &mut ModelProviderConfig,
     auth_registry: &AuthProfileRegistry,
@@ -3267,6 +3445,8 @@ fn resolve_primary_model_provider_secret(
     Ok(Some(access_audit))
 }
 
+/// Registry-entry counterpart of `resolve_primary_model_provider_secret`,
+/// with the same credential precedence and audit semantics.
 fn resolve_registry_provider_secret(
     entry: &mut ProviderRegistryEntryConfig,
     auth_registry: &AuthProfileRegistry,
@@ -3329,6 +3509,8 @@ fn resolve_registry_provider_secret(
     Ok(Some(access_audit))
 }
 
+/// Auth-profile provider expected for a model provider kind; `None` for the
+/// deterministic provider, which needs no credentials.
 fn auth_provider_kind_for_model_provider(
     kind: ModelProviderKind,
 ) -> Option<ModelProviderAuthProviderKind> {
@@ -3339,6 +3521,10 @@ fn auth_provider_kind_for_model_provider(
     }
 }
 
+/// Loads the credential behind an auth profile (API key or OAuth access
+/// token), rejecting profiles whose provider kind does not match the
+/// configured expectation. Returns the decoded secret, the audit record, the
+/// credential-source classification, and the resolved profile id.
 fn resolve_provider_secret_from_auth_profile(
     auth_registry: &AuthProfileRegistry,
     resolver: &SecretResolver<'_>,
@@ -3408,6 +3594,8 @@ fn resolve_provider_secret_from_auth_profile(
     Ok((value, access_audit, credential_source, profile.profile_id))
 }
 
+/// Resolves one secret reference to UTF-8 text plus its audit record; the
+/// error path carries `context_label`, never the secret value.
 fn resolve_provider_secret_from_secret_ref(
     resolver: &SecretResolver<'_>,
     secret_ref: &SecretRef,
@@ -3432,6 +3620,8 @@ fn resolve_provider_secret_from_secret_ref(
     ))
 }
 
+/// Hydrates the admin auth/connector tokens and the browser-service token
+/// from their secret refs, returning an audit record per resolution.
 fn resolve_admin_and_browser_secret_refs(
     loaded: &mut config::LoadedConfig,
     resolver: &SecretResolver<'_>,
@@ -3475,6 +3665,15 @@ fn resolve_admin_and_browser_secret_refs(
     Ok(audits)
 }
 
+/// Probes every configured secret reference and records its health (without
+/// retaining values) for the console secrets diagnostics view.
+///
+/// Individual resolution failures are captured in the records rather than
+/// failing the snapshot.
+///
+/// # Errors
+///
+/// Returns an error only if the system clock reads before the UNIX epoch.
 pub(crate) fn build_configured_secrets_state(
     loaded: &config::LoadedConfig,
     resolver: &SecretResolver<'_>,
@@ -3559,6 +3758,8 @@ pub(crate) fn build_configured_secrets_state(
     })
 }
 
+/// Appends the diagnostics record for one optional secret ref; resolution
+/// failures become record fields (`last_error*`), not function errors.
 fn collect_configured_secret_record(
     records: &mut Vec<control_plane::ConfiguredSecretRecord>,
     secret_ref: Option<&SecretRef>,
@@ -3623,6 +3824,7 @@ fn collect_configured_secret_record(
     Ok(())
 }
 
+/// Projects a secret ref's redacted metadata into the control-plane view type.
 fn configured_secret_source_view(
     secret_ref: &SecretRef,
 ) -> control_plane::ConfiguredSecretSourceView {
@@ -3650,6 +3852,7 @@ fn configured_secret_source_view(
     }
 }
 
+/// Stable `snake_case` label for a secret resolution failure kind.
 fn secret_resolve_error_kind_label(kind: SecretResolveErrorKind) -> &'static str {
     match kind {
         SecretResolveErrorKind::Missing => "missing",
@@ -3663,6 +3866,9 @@ fn secret_resolve_error_kind_label(kind: SecretResolveErrorKind) -> &'static str
     }
 }
 
+/// What it takes to pick up a rotated secret at this config path: model
+/// provider secrets reload once runs drain, browser/admin tokens need a
+/// restart, everything else needs manual review.
 fn reload_action_for_secret_path(config_path: &str) -> &'static str {
     if config_path.starts_with("model_provider.") {
         "blocked_while_runs_active"
@@ -3675,6 +3881,8 @@ fn reload_action_for_secret_path(config_path: &str) -> &'static str {
     }
 }
 
+/// Classifies a secret ref as the legacy vault path or the generic secret-ref
+/// path for `credential_source` reporting.
 fn secret_ref_credential_source(secret_ref: &SecretRef) -> ModelProviderCredentialSource {
     match secret_ref.source {
         SecretSource::Vault { .. } => ModelProviderCredentialSource::VaultRef,
@@ -3682,7 +3890,15 @@ fn secret_ref_credential_source(secret_ref: &SecretRef) -> ModelProviderCredenti
     }
 }
 
+/// Directory used to resolve relative file/exec secret sources: the loaded
+/// config file's directory, or the current directory when running on defaults.
+///
+/// # Errors
+///
+/// Returns an error if the current working directory cannot be resolved.
 pub(crate) fn secret_resolution_working_dir(loaded: &config::LoadedConfig) -> Result<PathBuf> {
+    // `loaded.source` is a provenance string like "<path> +env(...) +cli(...)";
+    // the leading token is the config file path (or the literal "defaults").
     let source_path = loaded.source.split(" +env(").next().map(str::trim).unwrap_or("defaults");
     if source_path.eq_ignore_ascii_case("defaults") {
         return std::env::current_dir().context("failed to resolve current working directory");
@@ -3697,6 +3913,8 @@ pub(crate) fn secret_resolution_working_dir(loaded: &config::LoadedConfig) -> Re
     }
 }
 
+/// Appends a `secret.accessed` audit event for one startup secret resolution,
+/// attributed to the system daemon principal.
 fn record_secret_access_journal_event(
     journal_store: &JournalStore,
     audit: &SecretAccessAuditRecord,
@@ -3727,12 +3945,19 @@ fn record_secret_access_journal_event(
     Ok(())
 }
 
+/// Current wall-clock time as UNIX milliseconds.
+///
+/// # Errors
+///
+/// Returns an error if the system clock reads before the UNIX epoch.
 pub(crate) fn unix_ms_now() -> Result<i64> {
     let elapsed =
         SystemTime::now().duration_since(UNIX_EPOCH).context("system clock before UNIX epoch")?;
     Ok(elapsed.as_millis() as i64)
 }
 
+// Thin delegation shims: the implementations moved into the transport handler
+// tree, but crate-root call sites and tests still use these short names.
 fn parse_csv_values(raw: Option<&str>) -> Vec<String> {
     transport::http::handlers::console::channels::connectors::discord::parse_csv_values(raw)
 }
@@ -3748,6 +3973,8 @@ fn parse_memory_sources_csv(raw: Option<&str>) -> Result<Vec<journal::MemorySour
     transport::http::handlers::console::channels::connectors::discord::parse_memory_sources_csv(raw)
 }
 
+/// Opens (or initializes) the identity store and issues the node-RPC server
+/// certificate, producing the [`IdentityRuntime`] shared across transports.
 fn load_identity_runtime(configured_store_root: Option<PathBuf>) -> Result<IdentityRuntime> {
     let store_root = if let Some(configured_store_root) = configured_store_root {
         configured_store_root
@@ -3774,6 +4001,8 @@ fn load_identity_runtime(configured_store_root: Option<PathBuf>) -> Result<Ident
     })
 }
 
+/// Builds the gateway TLS config from operator-provided cert/key paths, with
+/// optional client-CA verification when `client_ca_path` is set.
 fn build_gateway_tls_config(tls: &config::GatewayTlsConfig) -> Result<ServerTlsConfig> {
     let cert_path =
         tls.cert_path.as_ref().context("gateway TLS enabled but cert path is missing")?;
@@ -3793,6 +4022,8 @@ fn build_gateway_tls_config(tls: &config::GatewayTlsConfig) -> Result<ServerTlsC
     Ok(tls_config)
 }
 
+/// Builds the node-RPC TLS config from daemon-issued identity material,
+/// requiring client certificates signed by the gateway CA when mTLS is on.
 fn build_node_rpc_tls_config(
     identity_runtime: &IdentityRuntime,
     mtls_required: bool,
@@ -3809,6 +4040,7 @@ fn build_node_rpc_tls_config(
     tls_config
 }
 
+/// The three listener addresses checked by the remote-bind guard.
 #[derive(Debug, Clone, Copy)]
 struct RemoteBindEndpoints {
     admin_address: SocketAddr,
@@ -3816,6 +4048,7 @@ struct RemoteBindEndpoints {
     quic_address: Option<SocketAddr>,
 }
 
+/// Security posture inputs evaluated by [`enforce_remote_bind_guard`].
 #[derive(Debug, Clone, Copy)]
 struct RemoteBindGuardConfig {
     bind_profile: config::GatewayBindProfile,
@@ -3828,6 +4061,16 @@ struct RemoteBindGuardConfig {
     env_dangerous_remote_bind_ack: bool,
 }
 
+/// Fail-closed gate for exposing any listener beyond loopback.
+///
+/// Loopback-only binds always pass. A non-loopback bind requires all of: a
+/// bind profile that allows remote exposure, gateway TLS, an authenticated
+/// admin surface, node-RPC mTLS for remote gRPC/QUIC, active admin rate
+/// limits, and the dual (config + env) dangerous-remote-bind acknowledgement.
+///
+/// # Errors
+///
+/// Returns an error naming the first unmet requirement; startup must abort.
 fn enforce_remote_bind_guard(
     endpoints: RemoteBindEndpoints,
     config: RemoteBindGuardConfig,
@@ -3900,10 +4143,14 @@ fn enforce_remote_bind_guard(
     Ok(())
 }
 
+/// True when the compile-time admin rate-limit constants are non-zero; the
+/// remote-bind guard refuses remote exposure if limits are ever disabled.
 fn admin_rate_limiting_enabled() -> bool {
     ADMIN_RATE_LIMIT_WINDOW_MS > 0 && ADMIN_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW > 0
 }
 
+/// Reads the env half of the dual remote-bind acknowledgement; absent means
+/// not acknowledged, malformed values fail startup.
 fn dangerous_remote_bind_acknowledged() -> Result<bool> {
     match std::env::var(DANGEROUS_REMOTE_BIND_ACK_ENV) {
         Ok(raw) => raw

@@ -1,3 +1,5 @@
+//! Startup bootstrap: CLI parsing, config load, and fail-closed policy preflight.
+
 use anyhow::Result;
 use clap::Parser;
 
@@ -6,6 +8,7 @@ use crate::{
     validate_process_runner_backend_policy,
 };
 
+// Clap derive: keep comments as `//` so they never leak into --help output.
 #[derive(Debug, Clone, Parser)]
 #[command(name = "palyrad", about = "Palyra gateway skeleton daemon")]
 struct Args {
@@ -21,12 +24,24 @@ struct Args {
     journal_migrate_only: bool,
 }
 
+/// Resolved startup inputs: merged config plus startup-mode flags derived from it.
 pub(crate) struct BootstrapContext {
     pub(crate) loaded: LoadedConfig,
+    /// When set, the daemon applies journal migrations and exits without serving.
     pub(crate) journal_migrate_only: bool,
     pub(crate) node_rpc_mtls_required: bool,
 }
 
+/// Parses CLI arguments, loads layered config, applies CLI overrides, and runs
+/// the process-runner policy preflight.
+///
+/// Calls `Args::parse`, so invalid CLI input terminates the process with a
+/// usage error before this function returns.
+///
+/// # Errors
+///
+/// Returns an error if config loading fails or if the configured process-runner
+/// tier/egress combination is rejected by the fail-closed backend policy.
 pub(crate) fn load_runtime_bootstrap() -> Result<BootstrapContext> {
     let args = Args::parse();
     let mut loaded = load_config()?;
@@ -46,6 +61,8 @@ pub(crate) fn load_runtime_bootstrap() -> Result<BootstrapContext> {
     })
 }
 
+/// Applies CLI flag overrides onto the loaded config, appending each override
+/// to `loaded.source` so diagnostics can show where every value came from.
 fn apply_cli_overrides(loaded: &mut LoadedConfig, args: &Args) {
     if let Some(bind) = args.bind.as_ref() {
         loaded.daemon.bind_addr = bind.clone();
