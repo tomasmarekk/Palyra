@@ -1,3 +1,12 @@
+//! Incident replay-bundle export: assembles a run's journal state (status
+//! snapshot, ordered tape events, lifecycle transitions, idempotency records,
+//! artifact references) into an offline-replayable [`ReplayBundle`].
+//!
+//! Determinism matters here: the same run must always export the same bundle,
+//! so tape events are sorted by sequence before truncation. Secret redaction
+//! is delegated to `build_replay_bundle` in `palyra_common::replay_bundle`;
+//! this module only shapes journal rows into its input.
+
 use anyhow::{Context, Result};
 use palyra_common::replay_bundle::{
     build_replay_bundle, ReplayArtifactRef, ReplayBundle, ReplayBundleBuildInput,
@@ -11,6 +20,8 @@ use crate::{
     journal::{JournalStore, OrchestratorRunStatusSnapshot},
 };
 
+/// Inputs for one bundle export; `max_events` caps the tape so a runaway run
+/// cannot produce an unbounded bundle (truncation is recorded as a warning).
 pub(crate) struct IncidentReplayCaptureRequest<'a> {
     pub journal_store: &'a JournalStore,
     pub replay_capture: &'a ReplayCaptureConfig,
@@ -20,6 +31,13 @@ pub(crate) struct IncidentReplayCaptureRequest<'a> {
     pub max_events: usize,
 }
 
+/// Exports one orchestrator run from the journal as a redacted, offline
+/// replayable bundle.
+///
+/// # Errors
+/// Fails when the run id is unknown or any journal read (snapshot, tape,
+/// lifecycle, idempotency, tool-result artifacts) fails; each error carries
+/// the run id as context.
 pub(crate) fn capture_incident_replay_bundle(
     request: IncidentReplayCaptureRequest<'_>,
 ) -> Result<ReplayBundle> {
@@ -32,6 +50,9 @@ pub(crate) fn capture_incident_replay_bundle(
         .journal_store
         .orchestrator_tape(request.run_id)
         .with_context(|| format!("failed to load tape for {}", request.run_id))?;
+    // Sort before truncating so the cap always keeps the earliest events;
+    // relying on journal read order would make truncated bundles
+    // non-deterministic.
     tape.sort_by_key(|event| event.seq);
     let truncated = tape.len() > request.max_events;
     tape.truncate(request.max_events);
@@ -39,6 +60,9 @@ pub(crate) fn capture_incident_replay_bundle(
     let tape_events = tape
         .into_iter()
         .map(|record| {
+            // Malformed payload JSON is wrapped as a raw string instead of
+            // failing the export: an incident bundle missing one event body
+            // is far more useful than no bundle at all.
             let payload = serde_json::from_str::<Value>(record.payload_json.as_str())
                 .unwrap_or_else(|_| json!({ "raw": record.payload_json }));
             ReplayTapeEvent { seq: record.seq, event_type: record.event_type, payload }

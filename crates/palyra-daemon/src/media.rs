@@ -1,3 +1,16 @@
+//! Media attachment ingest, content-addressed storage, and download/upload
+//! policy enforcement for connector and console surfaces.
+//!
+//! [`MediaArtifactStore`] keeps artifact metadata, audit events, and derived
+//! artifact lifecycle rows in SQLite while raw bytes live on disk under a
+//! SHA-256-addressed content root (deduplicated by digest). Inbound Discord
+//! attachments pass a deny-by-default gate (count/size budgets, declared-type
+//! check, host allowlist, resolved-IP netguard, sniffed content type) before
+//! any bytes are fetched or persisted; console uploads pass the same sniffing
+//! and size gates. Derived artifacts themselves are produced by
+//! [`crate::media_derived`]; the channel layer (`channels/attachments.rs`,
+//! `channels/media.rs`) is the primary consumer.
+
 use std::{
     fs,
     io::Write,
@@ -42,9 +55,18 @@ const DEFAULT_VISION_MAX_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_VISION_MAX_DIMENSION_PX: u32 = 2_048;
 const DEFAULT_OUTBOUND_MAX_UPLOAD_BYTES: usize = 4 * 1024 * 1024;
 const RECENT_EVENT_LIMIT: usize = 10;
+// Retention pruning scans the whole artifact table, so it is throttled: run at
+// most once per interval, but never defer more than a bounded number of
+// ingests so a steady write load cannot starve cleanup forever.
 const RETENTION_PRUNE_MIN_INTERVAL_MS: i64 = 30_000;
 const RETENTION_PRUNE_MAX_DEFERRED_INGESTS: u32 = 16;
 
+/// Effective media policy: attachment ingest budgets, download/upload gates,
+/// vision forwarding limits, and store retention bounds.
+///
+/// Defaults deny both downloads and outbound uploads; operators must opt in
+/// via daemon config. `outbound_upload_enabled` is enforced by the channel
+/// layer (`channels/attachments.rs`) before bytes ever reach the store.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MediaRuntimeConfig {
     pub download_enabled: bool,
@@ -106,6 +128,8 @@ impl Default for MediaRuntimeConfig {
     }
 }
 
+/// Console diagnostics view of one connector's media policy, usage, and
+/// recent denial/failure events.
 #[derive(Debug, Clone, Serialize)]
 pub struct MediaConnectorSnapshot {
     pub policy: MediaRuntimeConfig,
@@ -115,6 +139,8 @@ pub struct MediaConnectorSnapshot {
     pub recent_upload_failures: Vec<MediaEventSnapshot>,
 }
 
+/// Store-wide counterpart of [`MediaConnectorSnapshot`], aggregated across all
+/// connectors.
 #[derive(Debug, Clone, Serialize)]
 pub struct MediaGlobalSnapshot {
     pub policy: MediaRuntimeConfig,
@@ -124,6 +150,9 @@ pub struct MediaGlobalSnapshot {
     pub recent_upload_failures: Vec<MediaEventSnapshot>,
 }
 
+/// Current store occupancy. `stored_content_count` counts distinct content
+/// digests, so it can be lower than `artifact_count` when artifacts share
+/// deduplicated bytes.
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct MediaUsageSnapshot {
     pub artifact_count: u64,
@@ -131,6 +160,7 @@ pub struct MediaUsageSnapshot {
     pub stored_bytes: u64,
 }
 
+/// Retention limits currently in effect for the media store.
 #[derive(Debug, Clone, Serialize)]
 pub struct MediaRetentionSnapshot {
     pub max_store_bytes: u64,
@@ -138,6 +168,8 @@ pub struct MediaRetentionSnapshot {
     pub ttl_ms: i64,
 }
 
+/// One audit event row (blocked download, failed upload, stored artifact)
+/// surfaced in console snapshots.
 #[derive(Debug, Clone, Serialize)]
 pub struct MediaEventSnapshot {
     pub event_type: String,
@@ -148,6 +180,8 @@ pub struct MediaEventSnapshot {
     pub created_at_unix_ms: i64,
 }
 
+/// Fully loaded artifact: persisted metadata plus the raw content bytes read
+/// back from the content root.
 #[derive(Debug, Clone)]
 pub struct MediaArtifactPayload {
     pub artifact_id: String,
@@ -160,6 +194,7 @@ pub struct MediaArtifactPayload {
     pub bytes: Vec<u8>,
 }
 
+/// Derived-artifact counts grouped by lifecycle state, for console dashboards.
 #[derive(Debug, Clone, Serialize)]
 pub struct MediaDerivedStatsSnapshot {
     pub total: u64,
@@ -172,6 +207,11 @@ pub struct MediaDerivedStatsSnapshot {
     pub orphaned: u64,
 }
 
+/// Persisted derived-artifact row as exposed to console APIs.
+///
+/// `state` is one of `pending`, `succeeded`, `failed`, `quarantined`, or
+/// `purged`; the serde shape (including `skip_serializing_if` omissions) is
+/// part of the `/console/v1` contract.
 #[derive(Debug, Clone, Serialize)]
 pub struct MediaDerivedArtifactRecord {
     pub derived_artifact_id: String,
@@ -225,6 +265,8 @@ pub struct MediaDerivedArtifactRecord {
     pub purged_at_unix_ms: Option<i64>,
 }
 
+/// One scored, citable chunk of derived text selected for model prompt
+/// context by [`MediaArtifactStore::select_derived_prompt_chunks`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaDerivedArtifactSelection {
     pub derived_artifact_id: String,
@@ -236,6 +278,8 @@ pub struct MediaDerivedArtifactSelection {
     pub score: f64,
 }
 
+/// Parameters for recording a successful derive run; one row exists per
+/// `(source_artifact_id, kind)` pair, so re-runs overwrite in place.
 #[derive(Debug, Clone)]
 pub struct MediaDerivedArtifactUpsertRequest<'a> {
     pub source_artifact_id: &'a str,
@@ -251,6 +295,8 @@ pub struct MediaDerivedArtifactUpsertRequest<'a> {
     pub derived: &'a DerivedArtifactContent,
 }
 
+/// Parameters for recording a failed derive run under the same
+/// `(source_artifact_id, kind)` slot used by successful upserts.
 #[derive(Debug, Clone)]
 pub struct MediaFailedDerivedArtifactUpsertRequest<'a> {
     pub source_artifact_id: &'a str,
@@ -269,6 +315,9 @@ pub struct MediaFailedDerivedArtifactUpsertRequest<'a> {
     pub failure_reason: &'a str,
 }
 
+/// Console upload request. Origin fields (principal/device/session/channel)
+/// are persisted and later re-checked on every read, binding the artifact to
+/// the uploading session.
 #[derive(Debug, Clone)]
 pub struct ConsoleAttachmentStoreRequest<'a> {
     pub connector_id: &'a str,
@@ -282,6 +331,9 @@ pub struct ConsoleAttachmentStoreRequest<'a> {
     pub bytes: &'a [u8],
 }
 
+/// One inbound connector attachment plus the per-message accounting
+/// (`attachment_count`, `total_declared_bytes`) needed to enforce message
+/// budgets before any download starts.
 #[derive(Debug)]
 pub struct InboundAttachmentIngestRequest<'a> {
     pub connector_id: &'a str,
@@ -294,6 +346,12 @@ pub struct InboundAttachmentIngestRequest<'a> {
     pub total_declared_bytes: u64,
 }
 
+/// Failure modes of the media store.
+///
+/// `Io` and `Sql` are infrastructure faults and propagate to callers;
+/// `InvalidAttachment`, `NetworkPolicy`, and `Download` are policy or remote
+/// failures that inbound ingest downgrades into blocked-attachment metadata
+/// instead of failing the message.
 #[derive(Debug, thiserror::Error)]
 pub enum MediaStoreError {
     #[error("io failure: {0}")]
@@ -365,6 +423,9 @@ struct MediaDerivedArtifactRow {
     record: MediaDerivedArtifactRecord,
 }
 
+/// SQLite-backed media store: artifact metadata and audit events in the
+/// database, deduplicated raw bytes on disk under a digest-addressed content
+/// root. All access goes through one mutex-guarded connection.
 pub struct MediaArtifactStore {
     content_root: PathBuf,
     config: MediaRuntimeConfig,
@@ -374,6 +435,13 @@ pub struct MediaArtifactStore {
 }
 
 impl MediaArtifactStore {
+    /// Opens (creating if needed) the media database and content root, and
+    /// applies the idempotent schema migration.
+    ///
+    /// # Errors
+    /// Returns [`MediaStoreError::Io`] if directories cannot be created,
+    /// [`MediaStoreError::Download`] if the HTTP client cannot be built, and
+    /// [`MediaStoreError::Sql`] if the database cannot be opened or migrated.
     pub fn open(
         db_path: PathBuf,
         content_root: PathBuf,
@@ -409,11 +477,24 @@ impl MediaArtifactStore {
         Ok(store)
     }
 
+    /// Returns the media policy this store was opened with.
     #[must_use]
     pub fn config(&self) -> &MediaRuntimeConfig {
         &self.config
     }
 
+    /// Applies the inbound media policy to one connector attachment and, when
+    /// every gate passes, downloads and stores its bytes.
+    ///
+    /// Policy denials do not fail the message: the returned [`AttachmentRef`]
+    /// carries the denial in `policy_context` and the block is recorded as an
+    /// audit event, so callers keep the (safe) metadata either way.
+    ///
+    /// # Errors
+    /// Returns [`MediaStoreError::InvalidAttachment`] when the attachment has
+    /// no usable source URL, and [`MediaStoreError::Io`] or
+    /// [`MediaStoreError::Sql`] for storage faults. Network-policy and
+    /// download failures are downgraded as described above.
     pub async fn ingest_inbound_attachment(
         &self,
         request: InboundAttachmentIngestRequest<'_>,
@@ -516,6 +597,11 @@ impl MediaArtifactStore {
             .ok_or_else(|| {
                 MediaStoreError::InvalidAttachment("attachment source URL is missing".to_owned())
             })?;
+        // Policy/download failures are downgraded into a blocked attachment
+        // (recorded for audit, surfaced via policy_context) while real storage
+        // faults still propagate. The sentinel InvalidAttachment value below
+        // exists only to thread "blocked, keep the metadata" through map_err;
+        // the match right after intercepts it and must stay in sync.
         let stored = self
             .download_and_store_discord_attachment(
                 request.connector_id,
@@ -572,6 +658,13 @@ impl MediaArtifactStore {
         Ok(attachment)
     }
 
+    /// Loads one artifact's metadata row plus its raw bytes from the content
+    /// root, or `None` when the artifact id is unknown.
+    ///
+    /// # Errors
+    /// Returns [`MediaStoreError::Sql`] on query failures and
+    /// [`MediaStoreError::Io`] when the stored path fails digest validation or
+    /// the content file cannot be read.
     pub fn load_artifact_payload(
         &self,
         artifact_id: &str,
@@ -638,6 +731,18 @@ impl MediaArtifactStore {
         }))
     }
 
+    /// Validates and persists a console-chat upload: size and sniffed-type
+    /// gates first, then deduplicated content write and metadata insert.
+    ///
+    /// The sniffed content type (not the declared one) is what gets stored
+    /// and checked against the outbound allowlist. Every denial is recorded
+    /// as an `attachment.upload.failed` audit event before returning.
+    ///
+    /// # Errors
+    /// Returns [`MediaStoreError::InvalidAttachment`] when the bytes are
+    /// empty, exceed `outbound_max_upload_bytes`, or sniff to a blocked
+    /// content type, and [`MediaStoreError::Io`] or [`MediaStoreError::Sql`]
+    /// for storage faults.
     pub fn store_console_attachment(
         &self,
         request: ConsoleAttachmentStoreRequest<'_>,
@@ -795,6 +900,17 @@ impl MediaArtifactStore {
         })
     }
 
+    /// Loads a console upload only when the caller's identity matches the
+    /// origin recorded at store time.
+    ///
+    /// Returns `None` (indistinguishable from "not found") when the artifact
+    /// does not exist, is not a console upload for this session, or the
+    /// principal/device/channel/session quadruple does not match the stored
+    /// origin -- callers cannot probe for other sessions' artifacts.
+    ///
+    /// # Errors
+    /// Returns [`MediaStoreError::Sql`] on query failures and
+    /// [`MediaStoreError::Io`] for lock or content-read faults.
     pub fn load_console_attachment(
         &self,
         artifact_id: &str,
@@ -841,6 +957,13 @@ impl MediaArtifactStore {
         self.load_artifact_payload(artifact_id)
     }
 
+    /// Lists all console uploads for a session, oldest first, re-applying the
+    /// per-artifact origin check from [`Self::load_console_attachment`] so
+    /// mismatched rows are silently skipped rather than leaked.
+    ///
+    /// # Errors
+    /// Returns [`MediaStoreError::Sql`] on query failures and
+    /// [`MediaStoreError::Io`] for lock or content-read faults.
     pub fn list_console_attachment_payloads(
         &self,
         session_id: &str,
@@ -883,6 +1006,14 @@ impl MediaArtifactStore {
         Ok(payloads)
     }
 
+    /// Records a successful derive run, overwriting any prior row for the
+    /// same `(source_artifact_id, kind)` and clearing failure or quarantine
+    /// state from earlier attempts.
+    ///
+    /// # Errors
+    /// Returns [`MediaStoreError::Sql`] on insert/update failures and
+    /// [`MediaStoreError::Io`] when the lock is poisoned or the row cannot be
+    /// read back after the upsert.
     pub fn upsert_derived_artifact(
         &self,
         request: MediaDerivedArtifactUpsertRequest<'_>,
@@ -996,6 +1127,14 @@ impl MediaArtifactStore {
         })
     }
 
+    /// Records a failed derive run in the same `(source_artifact_id, kind)`
+    /// slot, wiping any stale derived content from a previous success so
+    /// failed rows never carry text that no longer matches the source.
+    ///
+    /// # Errors
+    /// Returns [`MediaStoreError::Sql`] on insert/update failures and
+    /// [`MediaStoreError::Io`] when the lock is poisoned or the row cannot be
+    /// read back after the upsert.
     pub fn upsert_failed_derived_artifact(
         &self,
         request: MediaFailedDerivedArtifactUpsertRequest<'_>,
@@ -1066,6 +1205,13 @@ impl MediaArtifactStore {
             })
     }
 
+    /// Lists derived artifacts bound to one session identity, newest first.
+    /// All four origin fields must match, mirroring the console-attachment
+    /// access rule.
+    ///
+    /// # Errors
+    /// Returns [`MediaStoreError::Sql`] on query failures and
+    /// [`MediaStoreError::Io`] when the lock is poisoned.
     pub fn list_session_derived_artifacts(
         &self,
         session_id: &str,
@@ -1099,6 +1245,12 @@ impl MediaArtifactStore {
         Ok(rows.into_iter().map(|row| row.record).collect())
     }
 
+    /// Lists every derived artifact produced from one source artifact,
+    /// oldest first.
+    ///
+    /// # Errors
+    /// Returns [`MediaStoreError::Sql`] on query failures and
+    /// [`MediaStoreError::Io`] when the lock is poisoned.
     pub fn list_attachment_derived_artifacts(
         &self,
         source_artifact_id: &str,
@@ -1123,6 +1275,11 @@ impl MediaArtifactStore {
         Ok(rows.into_iter().map(|row| row.record).collect())
     }
 
+    /// Loads one derived artifact by id, or `None` when unknown.
+    ///
+    /// # Errors
+    /// Returns [`MediaStoreError::Sql`] on query failures and
+    /// [`MediaStoreError::Io`] when the lock is poisoned.
     pub fn get_derived_artifact(
         &self,
         derived_artifact_id: &str,
@@ -1143,6 +1300,12 @@ impl MediaArtifactStore {
             .map_err(Into::into)
     }
 
+    /// Loads the single derived artifact for a `(source_artifact_id, kind)`
+    /// pair, or `None` when no derive run has been recorded for it.
+    ///
+    /// # Errors
+    /// Returns [`MediaStoreError::Sql`] on query failures and
+    /// [`MediaStoreError::Io`] when the lock is poisoned.
     pub fn get_derived_artifact_by_source_kind(
         &self,
         source_artifact_id: &str,
@@ -1165,13 +1328,20 @@ impl MediaArtifactStore {
             .map_err(Into::into)
     }
 
+    /// Lists derived artifacts linked to a workspace document and/or memory
+    /// item, most recently updated first, capped at `limit` (minimum 1).
+    /// Passing neither id returns an empty list.
+    ///
+    /// # Errors
+    /// Returns [`MediaStoreError::Sql`] on query failures and
+    /// [`MediaStoreError::Io`] when the lock is poisoned.
     pub fn list_linked_derived_artifacts(
         &self,
         workspace_document_id: Option<&str>,
         memory_item_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<MediaDerivedArtifactRecord>, MediaStoreError> {
-        let Some(limit) = i64::try_from(limit.max(1)).ok() else {
+        let Ok(limit) = i64::try_from(limit.max(1)) else {
             return Ok(Vec::new());
         };
         let guard = self.connection.lock().map_err(|_| {
@@ -1233,6 +1403,13 @@ impl MediaArtifactStore {
         Ok(rows.into_iter().map(|row| row.record).collect())
     }
 
+    /// Links a derived artifact to a workspace document and/or memory item.
+    /// `None` arguments leave the existing link untouched, so links can only
+    /// be set or replaced here, never cleared.
+    ///
+    /// # Errors
+    /// Returns [`MediaStoreError::Sql`] on update failures and
+    /// [`MediaStoreError::Io`] when the lock is poisoned.
     pub fn link_derived_artifact_targets(
         &self,
         derived_artifact_id: &str,
@@ -1257,6 +1434,13 @@ impl MediaArtifactStore {
         Ok(())
     }
 
+    /// Moves a derived artifact to the `quarantined` state (content is kept
+    /// but excluded from prompt selection), returning the updated record or
+    /// `None` when the id is unknown.
+    ///
+    /// # Errors
+    /// Returns [`MediaStoreError::Sql`] on update failures and
+    /// [`MediaStoreError::Io`] when the lock is poisoned.
     pub fn quarantine_derived_artifact(
         &self,
         derived_artifact_id: &str,
@@ -1282,6 +1466,14 @@ impl MediaArtifactStore {
         self.get_derived_artifact(derived_artifact_id)
     }
 
+    /// Releases a derived artifact from quarantine. The restored state is
+    /// recomputed from what the row still holds (`succeeded` when content
+    /// text survives, `failed` when only a failure reason remains) instead of
+    /// trusting the pre-quarantine label.
+    ///
+    /// # Errors
+    /// Returns [`MediaStoreError::Sql`] on update failures and
+    /// [`MediaStoreError::Io`] when the lock is poisoned.
     pub fn release_derived_artifact(
         &self,
         derived_artifact_id: &str,
@@ -1310,6 +1502,12 @@ impl MediaArtifactStore {
         self.get_derived_artifact(derived_artifact_id)
     }
 
+    /// Sets or clears the recompute-required flag on a derived artifact,
+    /// returning the updated record or `None` when the id is unknown.
+    ///
+    /// # Errors
+    /// Returns [`MediaStoreError::Sql`] on update failures and
+    /// [`MediaStoreError::Io`] when the lock is poisoned.
     pub fn mark_derived_artifact_recompute_required(
         &self,
         derived_artifact_id: &str,
@@ -1334,6 +1532,14 @@ impl MediaArtifactStore {
         self.get_derived_artifact(derived_artifact_id)
     }
 
+    /// Purges a derived artifact's content while keeping the row itself, so
+    /// lineage (source artifact, parser identity, timestamps) stays auditable
+    /// after the derived text is gone. Returns the updated record or `None`
+    /// when the id is unknown.
+    ///
+    /// # Errors
+    /// Returns [`MediaStoreError::Sql`] on update failures and
+    /// [`MediaStoreError::Io`] when the lock is poisoned.
     pub fn purge_derived_artifact(
         &self,
         derived_artifact_id: &str,
@@ -1370,6 +1576,11 @@ impl MediaArtifactStore {
         self.get_derived_artifact(derived_artifact_id)
     }
 
+    /// Counts derived artifacts by lifecycle state for console dashboards.
+    ///
+    /// # Errors
+    /// Returns [`MediaStoreError::Sql`] on query failures and
+    /// [`MediaStoreError::Io`] when the lock is poisoned.
     pub fn derived_stats(&self) -> Result<MediaDerivedStatsSnapshot, MediaStoreError> {
         let guard = self.connection.lock().map_err(|_| {
             MediaStoreError::Io(
@@ -1408,6 +1619,15 @@ impl MediaArtifactStore {
             .map_err(Into::into)
     }
 
+    /// Selects scored derived-text chunks for prompt context across the given
+    /// source artifacts, delegating chunking/scoring/budgeting to
+    /// [`select_prompt_chunks`]. Only rows in the `succeeded` state with
+    /// content text are eligible, so quarantined or purged output can never
+    /// reach the model.
+    ///
+    /// # Errors
+    /// Returns [`MediaStoreError::Sql`] on query failures and
+    /// [`MediaStoreError::Io`] when the lock is poisoned.
     pub fn select_derived_prompt_chunks(
         &self,
         source_artifact_ids: &[String],
@@ -1446,6 +1666,12 @@ impl MediaArtifactStore {
             .collect())
     }
 
+    /// Builds the per-connector diagnostics snapshot: usage, retention
+    /// limits, and the most recent blocked/upload-failure events.
+    ///
+    /// # Errors
+    /// Returns [`MediaStoreError::Sql`] on query failures and
+    /// [`MediaStoreError::Io`] when the lock is poisoned.
     pub fn build_connector_snapshot(
         &self,
         connector_id: &str,
@@ -1499,6 +1725,12 @@ impl MediaArtifactStore {
         })
     }
 
+    /// Builds the store-wide counterpart of [`Self::build_connector_snapshot`],
+    /// aggregating usage and recent events across all connectors.
+    ///
+    /// # Errors
+    /// Returns [`MediaStoreError::Sql`] on query failures and
+    /// [`MediaStoreError::Io`] when the lock is poisoned.
     pub fn build_global_snapshot(&self) -> Result<MediaGlobalSnapshot, MediaStoreError> {
         let guard = self.connection.lock().map_err(|_| {
             MediaStoreError::Io(
@@ -1526,7 +1758,11 @@ impl MediaArtifactStore {
         })
     }
 
-    #[allow(dead_code)]
+    /// Records an `attachment.upload.succeeded` audit event.
+    ///
+    /// # Errors
+    /// Returns [`MediaStoreError::Sql`] on insert failures and
+    /// [`MediaStoreError::Io`] when the lock is poisoned.
     pub fn record_upload_success(
         &self,
         connector_id: &str,
@@ -1547,6 +1783,12 @@ impl MediaArtifactStore {
         )
     }
 
+    /// Records an `attachment.upload.failed` audit event; also used by the
+    /// channel layer to surface outbound-policy denials in snapshots.
+    ///
+    /// # Errors
+    /// Returns [`MediaStoreError::Sql`] on insert failures and
+    /// [`MediaStoreError::Io`] when the lock is poisoned.
     pub fn record_upload_failure(
         &self,
         connector_id: &str,
@@ -1693,8 +1935,19 @@ impl MediaArtifactStore {
             &self.config.allowed_source_hosts,
             self.config.allow_http_fixture_urls,
         )?;
+        // Redirects are followed manually (the shared client has redirects
+        // disabled) so every hop -- not just the first URL -- passes the
+        // scheme/credential/host-allowlist check and the resolved-IP netguard
+        // below. Automatic redirect following would let an allowlisted host
+        // bounce the daemon to an arbitrary or private target.
         let mut redirects_followed = 0usize;
         let body = loop {
+            // AIDEV-NOTE: this netguard check resolves DNS once, but reqwest
+            // resolves again independently when sending the request, leaving a
+            // DNS-rebinding window between the two lookups. Closing it needs a
+            // behavior change (pin the validated addresses via the client's
+            // resolve override); the host allowlist limits exposure to
+            // attacker-influenced allowlisted hosts in the meantime.
             let resolved = resolve_target_addresses(&current_url).await?;
             validate_resolved_addresses(resolved.as_slice())?;
             let response =
@@ -2168,6 +2421,9 @@ fn remove_artifact_locked(
     Ok(())
 }
 
+// Pre-download gate on declared metadata only; the post-download sniff in
+// sniff_content is the real authority. This exists so obviously unsafe
+// attachments are refused before any bytes are fetched.
 fn metadata_type_is_safe(attachment: &AttachmentRef) -> bool {
     let declared =
         attachment.content_type.as_deref().map(str::trim).map(|value| value.to_ascii_lowercase());
@@ -2279,6 +2535,9 @@ async fn read_response_body_with_limit(
     mut response: reqwest::Response,
     max_download_bytes: usize,
 ) -> Result<Vec<u8>, MediaStoreError> {
+    // The Content-Length check is only a fast-fail courtesy; the streaming
+    // cap below is authoritative because the header can be absent (chunked
+    // transfer) or understate the real body size.
     if let Some(content_length) = response.content_length() {
         if content_length > max_download_bytes as u64 {
             return Err(MediaStoreError::NetworkPolicy(format!(
@@ -2309,6 +2568,10 @@ async fn read_response_body_with_limit(
     Ok(bytes)
 }
 
+// The sniffed type derived from the actual bytes is authoritative; declared
+// content types and filenames are advisory only. Anything that does not match
+// a known-safe shape is rejected, and SVG is refused outright because it can
+// carry active script content.
 fn sniff_content(bytes: &[u8]) -> Result<SniffedContent, MediaStoreError> {
     if is_png(bytes) {
         let (width_px, height_px) = png_dimensions(bytes).ok_or_else(|| {
@@ -2570,6 +2833,10 @@ fn prepare_content_storage_path(
     Ok((normalized_storage_path, relative_path))
 }
 
+// The stored relative path must equal the path recomputed from the digest,
+// and the canonicalized result must stay under the content root. Together
+// these make a tampered media_contents row unable to point reads outside the
+// store (covered by the tampered-storage-path test).
 fn resolve_content_storage_path(
     content_root: &Path,
     storage_rel_path: &str,
@@ -2670,6 +2937,8 @@ struct MediaMaintenanceState {
 }
 
 fn build_media_http_client() -> Result<HttpClient, MediaStoreError> {
+    // Policy::none is deliberate: redirects are followed manually in
+    // download_and_store_discord_attachment so each hop can be re-validated.
     HttpClient::builder().redirect(Policy::none()).timeout(Duration::from_secs(15)).build().map_err(
         |error| MediaStoreError::Download(format!("failed to build media client: {error}")),
     )

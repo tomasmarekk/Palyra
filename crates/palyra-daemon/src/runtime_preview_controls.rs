@@ -1,3 +1,14 @@
+//! Effective-state resolution for runtime preview capabilities: combines each
+//! capability's config section mode with its feature-rollout flag into
+//! disabled/preview_only/enabled/blocked verdicts plus operator-readable
+//! activation blockers.
+//!
+//! Activation is deliberately two-keyed: promoting a capability past preview
+//! requires both `<section>.mode = "enabled"` and the matching rollout flag,
+//! so no single knob can enable it. [`RuntimePreviewConfigView`] abstracts
+//! over [`LoadedConfig`] and [`GatewayRuntimeConfigSnapshot`] so the same
+//! logic serves startup and live gateway snapshots.
+
 use palyra_common::{
     feature_rollouts::{
         AUXILIARY_EXECUTOR_ROLLOUT_CONFIG_PATH, AUXILIARY_EXECUTOR_ROLLOUT_ENV,
@@ -27,6 +38,9 @@ use crate::config::{
 };
 use crate::gateway::GatewayRuntimeConfigSnapshot;
 
+/// Resolves every preview capability and rolls the per-capability states up
+/// into one summary. The summary collapses to a single state only when all
+/// capabilities agree; any disagreement reports `Mixed`.
 #[must_use]
 pub(crate) fn build_runtime_preview_config_snapshot<C: RuntimePreviewConfigView>(
     config: &C,
@@ -81,6 +95,12 @@ pub(crate) fn build_runtime_preview_config_snapshot<C: RuntimePreviewConfigView>
     }
 }
 
+/// Resolves one capability's configured mode and rollout flag into its
+/// effective state with any activation blockers.
+///
+/// A configured `preview_only`/`enabled` mode degrades to `Blocked` while
+/// blockers exist; `disabled` never reports blockers because there is
+/// nothing to activate.
 #[must_use]
 pub(crate) fn capability_snapshot<C: RuntimePreviewConfigView>(
     config: &C,
@@ -117,6 +137,8 @@ pub(crate) fn capability_snapshot<C: RuntimePreviewConfigView>(
     }
 }
 
+/// Returns whether a capability may run at all (preview or fully enabled);
+/// this is the gate runtime code paths consult before doing preview work.
 #[must_use]
 pub(crate) fn capability_active<C: RuntimePreviewConfigView>(
     config: &C,
@@ -128,6 +150,8 @@ pub(crate) fn capability_active<C: RuntimePreviewConfigView>(
     )
 }
 
+/// Returns the operator-facing explanation for an inactive capability
+/// (label, effective state, joined blockers), or `None` when it is active.
 #[must_use]
 pub(crate) fn capability_blocker_message<C: RuntimePreviewConfigView>(
     config: &C,
@@ -234,6 +258,8 @@ fn capability_blockers<C: RuntimePreviewConfigView>(
         return Vec::new();
     }
     let mut blockers = Vec::new();
+    // The rollout flag is only required for full enablement; preview_only is
+    // allowed to run without it so operators can observe before opting in.
     if matches!(mode, RuntimePreviewMode::Enabled) && !rollout_enabled {
         blockers.push(format!(
             "Set {}=true or {}=1 before promoting {} past preview_only.",
@@ -315,6 +341,9 @@ fn runtime_preview_section(
     )
 }
 
+/// Read-only access to the preview-capability config sections and rollout
+/// flags, implemented by both the loaded daemon config and the gateway's
+/// runtime snapshot so resolution logic is shared.
 pub(crate) trait RuntimePreviewConfigView {
     fn feature_rollouts(&self) -> &crate::config::FeatureRolloutsConfig;
     fn session_queue_policy(&self) -> &SessionQueuePolicyConfig;
@@ -403,6 +432,9 @@ impl RuntimePreviewConfigView for GatewayRuntimeConfigSnapshot {
     }
 }
 
+// Per-section adapter exposing the mode plus the operator-visible settings
+// summary. Settings must stay non-sensitive: NetworkedWorkersConfig, for
+// example, reports only whether digests are configured, never their values.
 trait RuntimePreviewSection {
     fn mode(&self) -> RuntimePreviewMode;
     fn settings(&self) -> Value;

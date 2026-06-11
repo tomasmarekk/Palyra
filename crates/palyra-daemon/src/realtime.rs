@@ -1,3 +1,13 @@
+//! Realtime SDK control-plane primitives: handshake negotiation, the
+//! versioned method registry, command authorization, event visibility
+//! filtering with replay/gap detection, and per-bucket rate limiting.
+//!
+//! Grants are always the intersection of what the client requested and what
+//! the role plus admin status permit (deny by default). Event egress is
+//! filtered per connection by topic scope, sensitivity, ownership, and
+//! subscriptions before anything leaves the daemon. The transport layer
+//! (gateway/QUIC) drives these pure functions; no IO happens here.
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use palyra_common::runtime_contracts::{
@@ -9,11 +19,19 @@ use palyra_common::runtime_contracts::{
 };
 use serde_json::json;
 
+/// Wire-visible ABI tag returned in every accepted handshake; pinned by the
+/// golden registry test, so changing it is a breaking SDK contract change.
 pub(crate) const REALTIME_SDK_ABI_VERSION: &str = "palyra.realtime.sdk.v1";
+/// Ring-buffer capacity of the in-memory event router; clients that fall
+/// further behind must resynchronize via snapshot refresh.
 pub(crate) const REALTIME_EVENT_BUFFER_CAPACITY: usize = 1_024;
+/// Fixed-window length for command rate limiting.
 pub(crate) const REALTIME_RATE_LIMIT_WINDOW_MS: i64 = 1_000;
+/// Maximum commands per window for one (bucket, subject, client) key.
 pub(crate) const REALTIME_RATE_LIMIT_MAX_REQUESTS: u32 = 60;
 
+/// Per-connection grant state produced by a successful handshake; every
+/// later authorization and visibility decision reads from this snapshot.
 #[derive(Debug, Clone)]
 pub(crate) struct RealtimeConnectionContext {
     pub(crate) client_id: String,
@@ -41,12 +59,19 @@ impl RealtimeConnectionContext {
     }
 }
 
+/// Result of replaying buffered events for a reconnecting client.
 #[derive(Debug, Clone)]
 pub(crate) enum RealtimeReplayOutcome {
+    /// Every event after the cursor that the connection may see, in order.
     Events(Vec<RealtimeEventEnvelope>),
+    /// The cursor fell behind the ring buffer; the client must fetch a fresh
+    /// snapshot before resuming the stream.
     SnapshotRequired { cursor: RealtimeCursor, first_available_sequence: u64 },
 }
 
+/// Bounded in-memory event log with monotonically increasing sequences.
+/// When full, the oldest event is dropped; lagging clients detect the gap
+/// via [`RealtimeEventRouter::replay_from`] and resynchronize by snapshot.
 #[derive(Debug, Clone)]
 pub(crate) struct RealtimeEventRouter {
     capacity: usize,
@@ -65,6 +90,8 @@ impl Default for RealtimeEventRouter {
 }
 
 impl RealtimeEventRouter {
+    /// Assigns the next sequence number to `event`, appends it (evicting the
+    /// oldest entry when at capacity), and returns the stamped copy.
     #[must_use]
     pub(crate) fn publish(&mut self, mut event: RealtimeEventEnvelope) -> RealtimeEventEnvelope {
         event.sequence = self.next_sequence;
@@ -76,6 +103,8 @@ impl RealtimeEventRouter {
         event
     }
 
+    /// Replays buffered events newer than `cursor` that are visible to this
+    /// connection, or signals that the cursor predates the buffer.
     #[must_use]
     pub(crate) fn replay_from(
         &self,
@@ -83,6 +112,9 @@ impl RealtimeEventRouter {
         cursor: RealtimeCursor,
     ) -> RealtimeReplayOutcome {
         let first_available_sequence = self.events.front().map(|event| event.sequence).unwrap_or(0);
+        // The client expects cursor+1 next; if the buffer already starts past
+        // that, events were evicted and silent replay would hide the gap, so
+        // force a snapshot refresh instead.
         if first_available_sequence > 0
             && cursor.sequence.saturating_add(1) < first_available_sequence
         {
@@ -99,6 +131,9 @@ impl RealtimeEventRouter {
     }
 }
 
+/// Fixed-window rate limiter keyed by (method bucket, auth subject, client
+/// id), so one noisy client cannot exhaust another client's budget even
+/// under the same subject.
 #[derive(Debug, Clone)]
 pub(crate) struct RealtimeRateLimiter {
     window_ms: i64,
@@ -123,6 +158,11 @@ struct RealtimeRateLimitBucket {
 }
 
 impl RealtimeRateLimiter {
+    /// Counts one command against its window and admits or rejects it.
+    ///
+    /// # Errors
+    /// Returns `realtime/unknown_command` for unregistered commands and
+    /// `realtime/rate_limited` when the bucket's window budget is spent.
     pub(crate) fn check(
         &mut self,
         context: &RealtimeConnectionContext,
@@ -160,6 +200,18 @@ impl RealtimeRateLimiter {
     }
 }
 
+/// Negotiates a realtime handshake into an accepted grant set and the
+/// connection context used for all later authorization.
+///
+/// Scopes, capabilities, and commands are each intersected with what the
+/// authenticated role (and admin status) allows; empty request lists default
+/// to "everything permitted". An empty scope or command intersection fails
+/// the handshake rather than producing a connection that can do nothing.
+///
+/// # Errors
+/// Returns `realtime/incompatible_protocol` (with the supported range),
+/// `realtime/invalid_client_id`, `realtime/no_scopes_granted`, or
+/// `realtime/no_commands_granted`.
 pub(crate) fn negotiate_realtime_handshake(
     request: RealtimeHandshakeRequest,
     auth_subject: String,
@@ -222,6 +274,8 @@ pub(crate) fn negotiate_realtime_handshake(
         ));
     }
 
+    // Clamp client-proposed heartbeats: below 5s wastes daemon work on chatty
+    // pings, above 60s makes dead-connection detection too slow.
     let heartbeat_interval_ms = request
         .heartbeat_interval_ms
         .unwrap_or(REALTIME_DEFAULT_HEARTBEAT_INTERVAL_MS)
@@ -260,6 +314,12 @@ pub(crate) fn negotiate_realtime_handshake(
     Ok((accepted, context))
 }
 
+/// Returns the full realtime method registry: required scopes/capabilities,
+/// idempotency and side-effect flags, and rate-limit bucket per command.
+///
+/// INTENTIONAL: order and contents are pinned by the golden ABI test
+/// (`method_registry_golden_abi_stays_versioned`). Treat the registry as
+/// append-only and bump a descriptor's `version` on any semantic change.
 pub(crate) fn realtime_method_descriptors() -> Vec<RealtimeMethodDescriptor> {
     vec![
         descriptor(
@@ -377,10 +437,20 @@ pub(crate) fn realtime_method_descriptors() -> Vec<RealtimeMethodDescriptor> {
     ]
 }
 
+/// Looks up a command's registry descriptor, or `None` for commands missing
+/// from [`realtime_method_descriptors`].
 pub(crate) fn descriptor_for_command(command: RealtimeCommand) -> Option<RealtimeMethodDescriptor> {
     realtime_method_descriptors().into_iter().find(|descriptor| descriptor.command == command)
 }
 
+/// Authorizes one command invocation against the connection's grants and the
+/// method registry, returning the descriptor on success.
+///
+/// # Errors
+/// Returns `realtime/command_not_granted`, `realtime/unknown_command`,
+/// `realtime/missing_scope`, `realtime/missing_capability`, or
+/// `realtime/idempotency_required` (side-effecting commands must carry a
+/// non-empty idempotency key).
 pub(crate) fn authorize_realtime_command(
     context: &RealtimeConnectionContext,
     command: RealtimeCommand,
@@ -430,6 +500,9 @@ pub(crate) fn authorize_realtime_command(
     Ok(descriptor)
 }
 
+/// Decides whether one event may be delivered to one connection. All four
+/// gates must pass: topic scope, sensitivity grant, ownership, and at least
+/// one matching subscription.
 pub(crate) fn event_visible_to_context(
     context: &RealtimeConnectionContext,
     event: &RealtimeEventEnvelope,
@@ -440,15 +513,21 @@ pub(crate) fn event_visible_to_context(
     match event.sensitivity {
         RealtimeEventSensitivity::Public | RealtimeEventSensitivity::Internal => {}
         RealtimeEventSensitivity::Sensitive => {
+            // Sensitive events need both the scope and the capability; the
+            // scope is admin-gated, so non-admin subjects can never qualify.
             if !context.has_scope(RealtimeScope::EventsSensitive)
                 || !context.has_capability(RealtimeCapability::SensitiveEvents)
             {
                 return false;
             }
         }
+        // Secret events never leave the daemon over the realtime stream,
+        // regardless of grants.
         RealtimeEventSensitivity::Secret => return false,
     }
     if let Some(owner) = event.owner_principal.as_deref() {
+        // Owned events are visible only to their owner; admin subjects see
+        // all owners for operational oversight.
         if owner != context.auth_subject && !context.auth_subject.starts_with("admin:") {
             return false;
         }
@@ -456,6 +535,9 @@ pub(crate) fn event_visible_to_context(
     context.subscriptions.iter().any(|subscription| subscription_allows(subscription, event))
 }
 
+/// Builds the synthetic system event sent when a client's cursor fell behind
+/// the buffer; `sequence` stays 0 because it is out-of-band, not part of the
+/// replayable stream.
 pub(crate) fn snapshot_refresh_event(
     cursor: RealtimeCursor,
     first_available_sequence: u64,
@@ -512,6 +594,9 @@ fn allowed_scopes_for_role(role: RealtimeRole, auth_subject: &str) -> BTreeSet<R
         ]),
         RealtimeRole::Node => BTreeSet::from([RealtimeScope::NodesRead, RealtimeScope::NodesWrite]),
     };
+    // Write and sensitive-event scopes are admin-only regardless of role: a
+    // non-admin subject claiming the Operator role still degrades to
+    // read-only grants.
     if !auth_subject.starts_with("admin:") {
         scopes.remove(&RealtimeScope::RunsWrite);
         scopes.remove(&RealtimeScope::ApprovalsWrite);

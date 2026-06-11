@@ -1,3 +1,13 @@
+//! Read-only diagnostics builders for console and ops surfaces: the
+//! component-level runtime health snapshot, agent runtime metrics JSON,
+//! Prometheus text rendering, and the OTel span, connector-delivery,
+//! watchdog, budget-gate, and support-bundle contract payloads.
+//!
+//! Everything here derives pure values from already-collected state
+//! (gateway status counters, journal tool jobs, console payloads) -- no IO
+//! and no mutation. Outputs are deterministic (sorted components, BTreeMaps)
+//! because contract snapshot tests pin them.
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -19,12 +29,19 @@ use crate::{
     model_provider::ProviderRuntimeMetricsSnapshot,
 };
 
+/// Schema version stamped on runtime health snapshots; bump on any
+/// backward-incompatible shape change.
 pub(crate) const RUNTIME_HEALTH_SCHEMA_VERSION: u32 = 1;
+/// Schema version for the agent runtime metrics JSON payload.
 pub(crate) const AGENT_RUNTIME_METRICS_SCHEMA_VERSION: u32 = 1;
+/// Schema version for the OTel span contract payload.
 pub(crate) const OTEL_SPAN_CONTRACT_SCHEMA_VERSION: u32 = 1;
+/// Schema version for the test-only ABI contract snapshot suite.
 #[cfg(test)]
 pub(crate) const CONTRACT_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 
+// An active tool job whose heartbeat (or start) is older than this is
+// reported as stale/stuck by the jobs component and the watchdog.
 const STUCK_TOOL_JOB_AFTER_MS: i64 = 120_000;
 const STARTUP_CONFIG_BUDGET_MS: u64 = 1_500;
 const STARTUP_MIGRATION_BUDGET_MS: u64 = 5_000;
@@ -39,6 +56,7 @@ const ROUTE_PLANNING_BUDGET_MS: u64 = 250;
 const DAEMON_STARTUP_BASELINE_RSS_BYTES: u64 = 256 * 1024 * 1024;
 const AGENT_LOOP_BASELINE_RSS_BYTES: u64 = 384 * 1024 * 1024;
 
+/// Three-level health verdict used per component and overall.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RuntimeHealthStatus {
@@ -48,6 +66,7 @@ pub(crate) enum RuntimeHealthStatus {
 }
 
 impl RuntimeHealthStatus {
+    /// Returns the snake_case wire label (matches the serde representation).
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Healthy => "healthy",
@@ -56,6 +75,7 @@ impl RuntimeHealthStatus {
         }
     }
 
+    // Severity order for the worst-component-wins overall status.
     const fn rank(self) -> u8 {
         match self {
             Self::Healthy => 0,
@@ -65,6 +85,8 @@ impl RuntimeHealthStatus {
     }
 }
 
+/// Health verdict for one subsystem with stable reason codes, bounded
+/// numeric metrics, and operator repair hints.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RuntimeHealthComponentSnapshot {
     pub component: String,
@@ -74,6 +96,8 @@ pub(crate) struct RuntimeHealthComponentSnapshot {
     pub repair_hints: Vec<String>,
 }
 
+/// Versioned whole-daemon health snapshot; `status` is the worst component
+/// status.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RuntimeHealthSnapshot {
     pub schema_version: u32,
@@ -82,6 +106,9 @@ pub(crate) struct RuntimeHealthSnapshot {
     pub components: Vec<RuntimeHealthComponentSnapshot>,
 }
 
+/// Evaluates every subsystem payload into one health snapshot. Components
+/// are sorted by name and the overall status is the worst component rank, so
+/// equal inputs always produce byte-equal snapshots.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_runtime_health_snapshot(
     generated_at_unix_ms: i64,
@@ -122,6 +149,9 @@ pub(crate) fn build_runtime_health_snapshot(
     }
 }
 
+/// Builds the agent runtime metrics JSON payload. The embedded
+/// `cardinality_policy` is itself part of the contract: labels stay bounded
+/// and raw user data, prompts, and per-session ids are forbidden.
 pub(crate) fn build_agent_runtime_metrics_snapshot(
     status: &GatewayStatusSnapshot,
     runtime_preview_payload: &Value,
@@ -183,6 +213,10 @@ pub(crate) fn build_agent_runtime_metrics_snapshot(
     })
 }
 
+/// Renders the Prometheus text exposition for the daemon's core counters and
+/// gauges. Labels are restricted to bounded values (provider kind, job
+/// state, delivery status) -- never principals, sessions, or paths -- to keep
+/// cardinality flat and avoid leaking identifiers into scrape targets.
 pub(crate) fn render_prometheus_metrics(
     status: &GatewayStatusSnapshot,
     tool_jobs: &[ToolJobRecord],
@@ -316,6 +350,9 @@ pub(crate) fn render_prometheus_metrics(
     output
 }
 
+/// Builds the OTel span contract payload: the span chain shape, required
+/// attributes, sampling posture, and forbidden/high-cardinality attribute
+/// lists that exporters must honor.
 pub(crate) fn build_otel_span_contract(
     generated_at_unix_ms: i64,
     status: &GatewayStatusSnapshot,
@@ -383,6 +420,9 @@ pub(crate) fn build_otel_span_contract(
     })
 }
 
+/// Builds the connector delivery diagnostics payload: queue metrics, the
+/// bounded binding-conflict and repair-action vocabularies, and guardrails
+/// (mutating repairs require policy and idempotency).
 pub(crate) fn build_connector_delivery_diagnostics(
     status: &GatewayStatusSnapshot,
     runtime_preview_payload: &Value,
@@ -427,6 +467,10 @@ pub(crate) fn build_connector_delivery_diagnostics(
     })
 }
 
+/// Builds the runtime watchdog payload, flagging active tool jobs whose
+/// heartbeat went silent past the stuck threshold. Recovery actions are
+/// split into safe (automatic) and manual sets; destructive recovery always
+/// requires policy.
 pub(crate) fn build_runtime_watchdog_diagnostics(
     generated_at_unix_ms: i64,
     self_healing_payload: &Value,
@@ -471,6 +515,9 @@ pub(crate) fn build_runtime_watchdog_diagnostics(
     })
 }
 
+/// Builds the startup/memory/latency budget-gate payload comparing observed
+/// values against the fixed budgets defined above; the thresholds are the
+/// stable contract enforced by the performance smoke gate.
 pub(crate) fn build_budget_gates_snapshot(
     status: &GatewayStatusSnapshot,
     memory_payload: &Value,
@@ -509,6 +556,9 @@ pub(crate) fn build_budget_gates_snapshot(
     })
 }
 
+/// Builds the static support-bundle collector contract: allowed inputs,
+/// redaction posture (no raw secrets or prompts), size caps, and audit
+/// expectations.
 pub(crate) fn build_support_bundle_collector_contract() -> Value {
     json!({
         "schema_version": 1,
@@ -538,6 +588,9 @@ pub(crate) fn build_support_bundle_collector_contract() -> Value {
     })
 }
 
+/// Builds the test-only ABI contract snapshot covering provider, tool,
+/// channel-command, extension-manifest, and memory-provider surfaces;
+/// consumed by the runtime contract snapshot checks.
 #[cfg(test)]
 pub(crate) fn build_contract_snapshot_suite() -> Value {
     let tool_config = crate::tool_protocol::ToolCallConfig {
@@ -809,6 +862,9 @@ fn memory_health_component(memory_payload: &Value) -> RuntimeHealthComponentSnap
 
 fn memory_embeddings_degraded(memory_payload: &Value) -> bool {
     let posture = memory_payload.pointer("/embeddings/posture").and_then(Value::as_str);
+    // An operator who explicitly opted into hash fallback chose that posture;
+    // reporting it as degraded would nag about a deliberate decision. Only
+    // implicit fallbacks (missing model, degraded postures) count.
     if posture == Some("explicit_hash_fallback") {
         return false;
     }

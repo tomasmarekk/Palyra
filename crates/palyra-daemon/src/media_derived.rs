@@ -1,3 +1,13 @@
+//! Derived-artifact content production for media attachments: metadata
+//! summaries, document text extraction (plain/JSON/HTML/PDF/Office formats),
+//! audio-transcript formatting, and lexical prompt-chunk selection.
+//!
+//! Everything here is pure transformation over in-memory bytes; persistence
+//! and lifecycle (upsert, quarantine, purge) live in [`crate::media`], which
+//! stores the [`DerivedArtifactContent`] values produced here. Extracted text
+//! carries character-offset [`DerivedArtifactAnchor`]s (page/section/slide/
+//! sheet/segment) so prompt selections stay citable.
+
 use std::{
     cmp::Ordering,
     io::{Cursor, Read},
@@ -11,17 +21,28 @@ use zip::ZipArchive;
 
 use crate::model_provider::AudioTranscriptionResponse;
 
+/// Parser identity persisted with each derived row; bump the version when
+/// output for the same input changes, so stale rows can be detected.
 pub const METADATA_SUMMARY_PARSER_NAME: &str = "attachment-metadata";
+/// Version paired with [`METADATA_SUMMARY_PARSER_NAME`].
 pub const METADATA_SUMMARY_PARSER_VERSION: &str = "1";
+/// Parser identity for document text extraction.
 pub const DOCUMENT_EXTRACTOR_PARSER_NAME: &str = "attachment-document-extractor";
+/// Version paired with [`DOCUMENT_EXTRACTOR_PARSER_NAME`].
 pub const DOCUMENT_EXTRACTOR_PARSER_VERSION: &str = "1";
+/// Parser identity for audio transcription formatting.
 pub const AUDIO_TRANSCRIBER_PARSER_NAME: &str = "attachment-audio-transcriber";
+/// Version paired with [`AUDIO_TRANSCRIBER_PARSER_NAME`].
 pub const AUDIO_TRANSCRIBER_PARSER_VERSION: &str = "1";
 const DEFAULT_SUMMARY_MAX_CHARS: usize = 320;
 const DEFAULT_CHUNK_TARGET_CHARS: usize = 420;
 const DEFAULT_SELECTION_BUDGET_CHARS: usize = 1_600;
+// Zip-bomb guard: caps the decompressed size of any single archive entry
+// (docx/pptx/xlsx XML) regardless of how small the compressed input is.
 const MAX_ZIP_TEXT_ENTRY_BYTES: u64 = 2 * 1024 * 1024;
 
+/// What a derived artifact contains; one row exists per source artifact and
+/// kind, so each kind is a distinct derivation slot.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DerivedArtifactKind {
@@ -31,6 +52,8 @@ pub enum DerivedArtifactKind {
 }
 
 impl DerivedArtifactKind {
+    /// Returns the snake_case label used in SQLite rows and console payloads
+    /// (matches the serde representation).
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -41,12 +64,15 @@ impl DerivedArtifactKind {
     }
 }
 
+/// Non-fatal extraction issue persisted alongside the derived content.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DerivedArtifactWarning {
     pub code: String,
     pub message: String,
 }
 
+/// Citable location inside derived text: a `[start_char, end_char)` character
+/// range labeled with its source unit (page, section, slide, sheet, segment).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DerivedArtifactAnchor {
     pub kind: String,
@@ -57,6 +83,8 @@ pub struct DerivedArtifactAnchor {
     pub end_char: usize,
 }
 
+/// Output of one successful derive run: normalized text, its hash, a bounded
+/// summary, anchors, and the producing parser's identity.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DerivedArtifactContent {
     pub kind: DerivedArtifactKind,
@@ -74,6 +102,8 @@ pub struct DerivedArtifactContent {
     pub anchors: Vec<DerivedArtifactAnchor>,
 }
 
+/// Input for [`extract_document_content`]; `content_type` picks the
+/// extractor and `filename` is only used in error messages.
 #[derive(Debug, Clone)]
 pub struct AttachmentTextExtractionRequest<'a> {
     pub filename: &'a str,
@@ -81,6 +111,8 @@ pub struct AttachmentTextExtractionRequest<'a> {
     pub bytes: &'a [u8],
 }
 
+/// One scored chunk chosen by [`select_prompt_chunks`], carrying the citation
+/// label callers must surface next to the snippet.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SelectedDerivedChunk {
     pub derived_artifact_id: String,
@@ -92,6 +124,8 @@ pub struct SelectedDerivedChunk {
     pub kind: String,
 }
 
+/// Borrowed view of one persisted derived artifact offered to
+/// [`select_prompt_chunks`] for scoring.
 #[derive(Debug, Clone)]
 pub struct DerivedSelectionCandidate<'a> {
     pub derived_artifact_id: &'a str,
@@ -101,6 +135,8 @@ pub struct DerivedSelectionCandidate<'a> {
     pub anchors: &'a [DerivedArtifactAnchor],
 }
 
+/// Builds the always-available metadata summary (filename, type, size, hash,
+/// optional dimensions) for an attachment; never inspects the content bytes.
 #[must_use]
 pub fn build_metadata_summary_content(
     filename: &str,
@@ -136,6 +172,8 @@ pub fn build_metadata_summary_content(
     }
 }
 
+/// Returns whether [`extract_document_content`] has an extractor for this
+/// content type; keep in sync with the dispatch match inside it.
 #[must_use]
 pub fn supports_document_extraction(content_type: &str) -> bool {
     matches!(
@@ -152,6 +190,8 @@ pub fn supports_document_extraction(content_type: &str) -> bool {
     )
 }
 
+/// Returns whether an attachment content type is eligible for audio
+/// transcription (any `audio/*` plus a few container aliases).
 #[must_use]
 pub fn supports_audio_transcription(content_type: &str) -> bool {
     let normalized = content_type.trim().to_ascii_lowercase();
@@ -162,6 +202,12 @@ pub fn supports_audio_transcription(content_type: &str) -> bool {
         )
 }
 
+/// Extracts normalized, anchored text from a document attachment.
+///
+/// # Errors
+/// Returns a human-readable reason (persisted as the derive failure reason)
+/// when the content type is unsupported, parsing fails, a zip entry exceeds
+/// the decompression budget, or the extractor yields too little text.
 pub fn extract_document_content(
     request: &AttachmentTextExtractionRequest<'_>,
 ) -> Result<DerivedArtifactContent, String> {
@@ -200,6 +246,9 @@ pub fn extract_document_content(
         }
     };
     let normalized = normalize_extracted_text(content_text.as_str());
+    // Near-empty output is treated as an extractor failure rather than a
+    // valid empty document: persisting a few stray characters as "the text"
+    // would silently feed garbage into prompt selection.
     if normalized.len() < 24 {
         warnings.push(DerivedArtifactWarning {
             code: "content_too_sparse".to_owned(),
@@ -226,6 +275,13 @@ pub fn extract_document_content(
     })
 }
 
+/// Scores every chunk of every candidate against the query lexically and
+/// greedily packs the best ones into the character budget
+/// (default [`DEFAULT_SELECTION_BUDGET_CHARS`]).
+///
+/// Each chunk is labeled with the smallest enclosing anchor so callers can
+/// cite the source page/section/slide; chunks without an enclosing anchor
+/// fall back to a positional `chunk N` label.
 #[must_use]
 pub fn select_prompt_chunks(
     query: &str,
@@ -273,6 +329,9 @@ pub fn select_prompt_chunks(
             break;
         }
         let next_len = chunk.snippet.chars().count();
+        // The first chunk is admitted even when it alone exceeds the budget,
+        // so callers always receive at least one citation; later chunks must
+        // fit in the remaining budget but smaller ones may still squeeze in.
         if !selected.is_empty() && used.saturating_add(next_len) > budget {
             continue;
         }
@@ -282,6 +341,13 @@ pub fn select_prompt_chunks(
     selected
 }
 
+/// Formats a provider transcription into derived transcript content. When
+/// the provider returns timed segments, each becomes a `[segment mm:ss-mm:ss]`
+/// line with a matching anchor; otherwise the plain text is used as-is.
+///
+/// # Errors
+/// Returns a human-readable reason when the transcription text normalizes to
+/// an empty string.
 pub fn build_transcription_content(
     response: AudioTranscriptionResponse,
     processing_ms: u64,
@@ -650,6 +716,8 @@ fn read_zip_text<R: Read + std::io::Seek>(
         ));
     }
     let mut text = String::new();
+    // The declared size above can lie in a crafted archive, so reads are
+    // capped at budget+1 and the actual decompressed length is re-checked.
     file.take(MAX_ZIP_TEXT_ENTRY_BYTES + 1)
         .read_to_string(&mut text)
         .map_err(|error| format!("zip entry '{path}' is not valid UTF-8 text: {error}"))?;
@@ -676,6 +744,8 @@ fn decode_reasonable_text(bytes: &[u8]) -> Result<String, String> {
     let printable_chars =
         decoded.chars().filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\r' | '\t')).count();
     let total_chars = decoded.chars().count().max(1);
+    // Require at least 75% printable characters; lossily decoded binary blobs
+    // masquerading as text fail this ratio instead of polluting derived text.
     if printable_chars * 4 < total_chars * 3 {
         return Err("attachment bytes do not look like readable text".to_owned());
     }
@@ -683,6 +753,10 @@ fn decode_reasonable_text(bytes: &[u8]) -> Result<String, String> {
 }
 
 fn normalize_extracted_text(raw: &str) -> String {
+    // Whitespace collapsing flattens everything onto one line; the final
+    // replace re-breaks before "[" so extractor-emitted markers like
+    // "[page 2]" or "[segment 00:10-00:20]" start their own lines again,
+    // keeping anchor offsets aligned with visible structure.
     raw.lines()
         .map(str::trim_end)
         .collect::<Vec<_>>()
@@ -802,6 +876,9 @@ fn extract_trailing_number(raw: &str) -> usize {
 
 fn lexical_score(query: &str, candidate: &str) -> f64 {
     let query_terms = normalized_terms(query);
+    // No usable query terms: give every chunk the same small positive score
+    // so selection still returns content, ordered by the shorter-snippet
+    // tiebreak instead of relevance.
     if query_terms.is_empty() {
         return 0.1;
     }

@@ -1,3 +1,12 @@
+//! In-memory daemon observability state: provider-auth, dashboard-mutation,
+//! and support-bundle counters, a bounded recent-failure ring, and runtime
+//! decision telemetry with guardrail auto-disable heuristics.
+//!
+//! [`ObservabilityState`] is shared across request handlers; counters are
+//! lock-free atomics while richer telemetry sits behind mutexes. Counts reset
+//! on daemon restart by design -- durable history belongs to the journal.
+//! Snapshots feed console diagnostics and [`crate::runtime_diagnostics`].
+
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::{
@@ -13,11 +22,18 @@ use serde::Serialize;
 
 const RECENT_FAILURE_LIMIT: usize = 24;
 const RECENT_RUNTIME_DECISION_LIMIT: usize = 24;
+// Queue auto-disable needs both an absolute floor (so one early failure does
+// not trip it) and a failure rate above 50% of queue decisions (so a busy but
+// mostly healthy queue stays enabled).
 const QUEUE_DELIVERY_FAILURE_AUTO_DISABLE_THRESHOLD: u64 = 3;
 const QUEUE_DELIVERY_FAILURE_RATE_AUTO_DISABLE_BPS: u32 = 5_000;
+// Pruning auto-disable waits for a minimum number of applied prunes before
+// judging average savings, so the first few runs cannot trigger it.
 const PRUNING_LOW_SAVINGS_AUTO_DISABLE_THRESHOLD: u64 = 5;
 const PRUNING_LOW_SAVINGS_FALLBACK_TOKENS: u64 = 128;
 
+/// Optional correlation ids attached to a recorded failure so console views
+/// can link it back to the session/run/approval that produced it.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct CorrelationSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -36,6 +52,9 @@ pub struct CorrelationSnapshot {
     pub browser_session_id: Option<String>,
 }
 
+/// Who is accountable for a failure: a Palyra defect, an operator config
+/// problem, or an upstream provider fault. The serde labels are part of the
+/// console diagnostics contract.
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureClass {
@@ -47,6 +66,7 @@ pub enum FailureClass {
     UpstreamProvider,
 }
 
+/// One entry in the bounded recent-failure ring shown in diagnostics.
 #[derive(Debug, Clone, Serialize)]
 pub struct FailureSnapshot {
     pub operation: String,
@@ -56,6 +76,13 @@ pub struct FailureSnapshot {
     pub correlation: CorrelationSnapshot,
 }
 
+/// Shared, restart-volatile observability state for the daemon process.
+///
+/// Counter updates use relaxed atomics (only totals matter, not ordering).
+/// The mutex-guarded parts recover from poisoning via
+/// `unwrap_or_else(PoisonError::into_inner)` because telemetry must never
+/// take the daemon down and the state stays structurally valid even if a
+/// recording thread panicked mid-update.
 #[derive(Debug, Default)]
 pub struct ObservabilityState {
     provider_auth_attempts: AtomicU64,
@@ -71,6 +98,8 @@ pub struct ObservabilityState {
     runtime_decisions: Mutex<RuntimeDecisionTelemetryState>,
 }
 
+/// Attempt/success/failure totals with the failure rate in basis points
+/// (1/100th of a percent), pre-computed so consumers never divide by zero.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct CounterSnapshot {
     pub attempts: u64,
@@ -79,6 +108,8 @@ pub struct CounterSnapshot {
     pub failure_rate_bps: u32,
 }
 
+/// Catalog row for one runtime decision event type: identity, labels, and
+/// how often (and how recently) it has been emitted.
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimeDecisionCatalogEntry {
     pub event_type: String,
@@ -90,6 +121,8 @@ pub struct RuntimeDecisionCatalogEntry {
     pub last_seen_at_unix_ms: Option<i64>,
 }
 
+/// Sampled runtime decision event kept in the bounded recent-events ring for
+/// the diagnostics inspector.
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimeDecisionEventSample {
     pub event_type: String,
@@ -113,6 +146,8 @@ pub struct RuntimeDecisionEventSample {
     pub output_state: Option<String>,
 }
 
+/// Aggregated runtime decision metrics (queueing, pruning, retrieval,
+/// auxiliary tasks, flows, arbitration, workers) for one snapshot.
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimeDecisionMetricsSnapshot {
     pub queue_depth: u64,
@@ -149,6 +184,8 @@ pub struct RuntimeDecisionMetricsSnapshot {
     pub worker_orphan_rate_bps: u32,
 }
 
+/// Full runtime decision observability payload: catalog, metrics, guardrail
+/// verdicts, and the recent-event samples.
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimeDecisionObservabilitySnapshot {
     pub state: String,
@@ -158,6 +195,8 @@ pub struct RuntimeDecisionObservabilitySnapshot {
     pub recent_events: Vec<RuntimeDecisionEventSample>,
 }
 
+/// Guardrail verdicts (`ok`/`watch`/`auto_disabled`) plus the operator-facing
+/// recommendations and rollout checklist for runtime preview features.
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimeDecisionGuardrailSnapshot {
     pub state: String,
@@ -201,10 +240,15 @@ struct RuntimeDecisionTelemetryState {
 }
 
 impl ObservabilityState {
+    /// Counts one provider auth attempt; pair with
+    /// [`Self::record_provider_auth_failure`] on the failure path so the
+    /// derived success count stays consistent.
     pub fn record_provider_auth_attempt(&self) {
         self.provider_auth_attempts.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Counts one provider auth failure and pushes it onto the
+    /// recent-failure ring.
     pub fn record_provider_auth_failure(
         &self,
         operation: impl Into<String>,
@@ -223,6 +267,8 @@ impl ObservabilityState {
         });
     }
 
+    /// Counts one credential refresh failure and pushes it onto the
+    /// recent-failure ring.
     pub fn record_provider_refresh_failure(
         &self,
         operation: impl Into<String>,
@@ -241,6 +287,8 @@ impl ObservabilityState {
         });
     }
 
+    /// Counts one dashboard mutation; the failure metadata is only recorded
+    /// (and the failure ring touched) when `success` is false.
     pub fn record_dashboard_mutation_result(
         &self,
         success: bool,
@@ -265,10 +313,13 @@ impl ObservabilityState {
         }
     }
 
+    /// Counts the start of a support-bundle export.
     pub fn record_support_bundle_export_started(&self) {
         self.support_bundle_exports_started.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Counts the outcome of a support-bundle export; failures are always
+    /// classed as product failures and pushed onto the failure ring.
     pub fn record_support_bundle_export_result(
         &self,
         success: bool,
@@ -291,6 +342,8 @@ impl ObservabilityState {
         }
     }
 
+    /// Snapshots provider auth counters; successes are derived as
+    /// attempts minus failures since only failures are recorded explicitly.
     pub fn provider_auth_snapshot(&self) -> CounterSnapshot {
         let attempts = self.provider_auth_attempts.load(Ordering::Relaxed);
         let failures = self.provider_auth_failures.load(Ordering::Relaxed);
@@ -302,6 +355,7 @@ impl ObservabilityState {
         }
     }
 
+    /// Snapshots dashboard mutation counters.
     pub fn dashboard_mutation_snapshot(&self) -> CounterSnapshot {
         let attempts = self.dashboard_mutation_attempts.load(Ordering::Relaxed);
         let successes = self.dashboard_mutation_successes.load(Ordering::Relaxed);
@@ -314,6 +368,7 @@ impl ObservabilityState {
         }
     }
 
+    /// Snapshots support-bundle export counters.
     pub fn support_bundle_snapshot(&self) -> CounterSnapshot {
         let attempts = self.support_bundle_exports_started.load(Ordering::Relaxed);
         let successes = self.support_bundle_exports_succeeded.load(Ordering::Relaxed);
@@ -326,10 +381,12 @@ impl ObservabilityState {
         }
     }
 
+    /// Returns the total count of credential refresh failures since startup.
     pub fn provider_refresh_failures(&self) -> u64 {
         self.provider_refresh_failures.load(Ordering::Relaxed)
     }
 
+    /// Returns the recent failures, newest first (bounded ring contents).
     pub fn recent_failures(&self) -> Vec<FailureSnapshot> {
         self.recent_failures
             .lock()
@@ -339,6 +396,9 @@ impl ObservabilityState {
             .collect()
     }
 
+    /// Ingests one runtime decision event: updates the per-type catalog
+    /// counts, samples it into the recent-events ring, and accumulates the
+    /// metric family that matches the event type.
     pub fn record_runtime_decision_event(&self, payload: &RuntimeDecisionPayload) {
         let mut guard = self.runtime_decisions.lock().unwrap_or_else(|error| error.into_inner());
         let event_key = payload.event_type.as_str().to_owned();
@@ -450,6 +510,8 @@ impl ObservabilityState {
         }
     }
 
+    /// Samples the current session queue depth, tracking peak and the totals
+    /// from which average depth is derived at snapshot time.
     pub fn observe_runtime_queue_depth(&self, queue_depth: u64) {
         let mut guard = self.runtime_decisions.lock().unwrap_or_else(|error| error.into_inner());
         guard.queue_depth = queue_depth;
@@ -458,16 +520,23 @@ impl ObservabilityState {
         guard.queue_depth_samples = guard.queue_depth_samples.saturating_add(1);
     }
 
+    /// Returns whether queue delivery failures have crossed the auto-disable
+    /// guardrail (absolute floor plus failure-rate threshold).
     pub fn session_queue_auto_disable_active(&self) -> bool {
         let guard = self.runtime_decisions.lock().unwrap_or_else(|error| error.into_inner());
         session_queue_auto_disable_active(&guard)
     }
 
+    /// Returns whether applied pruning is saving fewer than
+    /// `min_token_savings` tokens on average, after enough applied prunes to
+    /// judge.
     pub fn pruning_auto_disable_active(&self, min_token_savings: u64) -> bool {
         let guard = self.runtime_decisions.lock().unwrap_or_else(|error| error.into_inner());
         pruning_auto_disable_active(&guard, min_token_savings)
     }
 
+    /// Builds the full runtime decision observability payload (catalog,
+    /// derived metrics, guardrail verdicts, recent samples).
     pub fn runtime_decision_snapshot(&self) -> RuntimeDecisionObservabilitySnapshot {
         let guard = self.runtime_decisions.lock().unwrap_or_else(|error| error.into_inner());
         let catalog = ALL_RUNTIME_DECISION_EVENT_TYPES
@@ -481,6 +550,8 @@ impl ObservabilityState {
                 last_seen_at_unix_ms: guard.last_seen_at_unix_ms.get(event_type.as_str()).copied(),
             })
             .collect::<Vec<_>>();
+        // checked_div keeps the average None (omitted from JSON) until a
+        // search happened, distinguishing "no data" from "0ms average".
         let retrieval_branch_latency_avg_ms =
             guard.retrieval_branch_latency_total_ms.checked_div(guard.retrieval_searches);
         let queue_average_depth =
@@ -642,6 +713,7 @@ fn pruning_auto_disable_active(
     average_savings < min_token_savings.max(1)
 }
 
+// Ratio in basis points (1/100th of a percent); 0 for an empty denominator.
 fn ratio_bps(numerator: u64, denominator: u64) -> u32 {
     if denominator == 0 {
         return 0;
