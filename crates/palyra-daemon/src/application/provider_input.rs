@@ -1,3 +1,16 @@
+//! Legacy provider-input assembly: prompt enrichment, recall, and pruning.
+//!
+//! [`prepare_model_provider_input`] turns the raw user message into the final
+//! provider prompt by layering, in order: previous-run context, session
+//! compaction summaries, project context, attachment recall, explicit recall,
+//! context references, auto-injected memory, preference context, ephemeral
+//! pruning (`application::session_pruning`), and a runtime-context preamble.
+//! Each enrichment that fires is recorded as an orchestrator tape event.
+//! Retrieved memory is wrapped in trust-labelled fences with
+//! `instruction_authority="none"` so recalled text never gains instruction
+//! authority over the model. When the `context_engine` feature rollout is
+//! enabled the whole pipeline is delegated to `application::context_engine`.
+
 use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 
 use base64::Engine as _;
@@ -71,6 +84,12 @@ const AUTO_SESSION_COMPACTION_MIN_TOKEN_DELTA: u64 = 120;
 const AUTO_SESSION_COMPACTION_COOLDOWN_MS: i64 = 5 * 60 * 1_000;
 const MAX_MEMORY_QUERY_VARIANTS: usize = 4;
 
+/// Provider-ready model input produced by [`prepare_model_provider_input`].
+///
+/// `provider_input_text` is the fully enriched prompt; `provider_messages`
+/// carries the reconstructed previous-run turns (legacy path only). The
+/// remaining metadata fields are populated by the context-engine path and
+/// stay `None` on the legacy path.
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedModelProviderInput {
     pub(crate) provider_input_text: String,
@@ -82,12 +101,19 @@ pub(crate) struct PreparedModelProviderInput {
     pub(crate) max_output_tokens: Option<u64>,
 }
 
+/// How memory-augmentation failures affect the overall input preparation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MemoryPromptFailureMode {
+    /// Propagate the memory-search error and fail the whole preparation.
     Fail,
+    /// Log `warn_message` and continue with the un-augmented prompt.
     FallbackToRawInput { warn_message: &'static str },
 }
 
+/// Parameters for [`prepare_model_provider_input`].
+///
+/// `tape_seq` is shared mutable state: every tape event appended during
+/// preparation advances it so later run-stream events stay ordered.
 pub(crate) struct PrepareModelProviderInputRequest<'a> {
     pub(crate) run_id: &'a str,
     pub(crate) tape_seq: &'a mut i64,
@@ -104,6 +130,7 @@ pub(crate) struct PrepareModelProviderInputRequest<'a> {
     pub(crate) channel_for_log: &'a str,
 }
 
+/// Optional per-run overrides carried in the request `parameter_delta_json`.
 #[derive(Debug, Clone, Deserialize)]
 struct ParameterDeltaEnvelope {
     #[serde(default)]
@@ -123,6 +150,12 @@ struct AttachmentRecallSelection {
     chunks: Vec<MediaDerivedArtifactSelection>,
 }
 
+/// Selects inline image attachments that fit the vision media policy.
+///
+/// Attachments are filtered against the configured content-type allowlist
+/// and per-image/dimension caps; selection stops once the image count or
+/// total byte budget is reached. Oversized or disallowed attachments are
+/// silently skipped rather than failing the run.
 pub(crate) fn build_provider_image_inputs(
     attachments: &[common_v1::MessageAttachment],
     media_config: &MediaRuntimeConfig,
@@ -173,6 +206,16 @@ pub(crate) fn build_provider_image_inputs(
     inputs
 }
 
+/// Prepends auto-injected memory and workspace-memory recall to the prompt.
+///
+/// Best-effort by design: when auto-inject is disabled, policy denies recall,
+/// or the searches fail or return nothing, the prompt is returned unchanged
+/// so memory problems never block a run. Successful injections append a
+/// `memory_auto_inject` tape event.
+///
+/// # Errors
+/// Returns `Status` only when appending the tape event fails; search and
+/// policy failures degrade to the raw prompt instead.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn build_memory_augmented_prompt(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -286,10 +329,21 @@ pub(crate) async fn build_memory_augmented_prompt(
     ))
 }
 
+/// Memory sources eligible for prompt-context auto-injection.
+///
+/// Deliberately restricted to curated sources: transient tape captures and
+/// model-written summaries are excluded so the model cannot feed itself
+/// unreviewed text through the recall channel (pinned by tests).
 pub(crate) fn curated_memory_sources_for_prompt_context() -> Vec<MemorySource> {
     vec![MemorySource::Manual, MemorySource::Import]
 }
 
+/// Expands a memory query into up to [`MAX_MEMORY_QUERY_VARIANTS`] variants.
+///
+/// Variants improve lexical recall: the raw query, a normalized form, a
+/// stopword-free keyword form, and domain-specific expansions (UI testing,
+/// checkpoint/rollback vocabulary). Duplicates are removed case-insensitively
+/// and the original query always comes first.
 pub(crate) fn build_memory_query_variants(query: &str) -> Vec<String> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
@@ -327,6 +381,10 @@ pub(crate) fn build_memory_query_variants(query: &str) -> Vec<String> {
     variants
 }
 
+/// Merges `hits` into `merged`, deduplicating by memory id.
+///
+/// When the same memory is found by multiple query variants the hit with the
+/// higher score (or, on a tie, the newer creation time) wins.
 pub(crate) fn merge_memory_search_hits_by_id(
     merged: &mut Vec<MemorySearchHit>,
     hits: Vec<MemorySearchHit>,
@@ -344,6 +402,10 @@ pub(crate) fn merge_memory_search_hits_by_id(
     }
 }
 
+/// Orders hits best-first and keeps at most `limit` (minimum 1).
+///
+/// Sort is fully deterministic: score descending, then recency, then memory
+/// id, so equal-scoring hits never reorder between runs.
 pub(crate) fn sort_and_truncate_memory_search_hits(hits: &mut Vec<MemorySearchHit>, limit: usize) {
     hits.sort_by(|left, right| {
         right
@@ -516,6 +578,10 @@ async fn search_workspace_memory_for_auto_inject(
         return Ok(Vec::new());
     }
 
+    // Two-phase recall: curated MEMORY.md documents are loaded directly first
+    // (always injected at full score when present), then a lexical prefix
+    // search fills the remaining slots. The composite key deduplicates a
+    // document the search would otherwise return again.
     let mut seen = BTreeSet::new();
     let mut hits = Vec::new();
     for prefix in &prefixes {
@@ -633,6 +699,10 @@ fn workspace_memory_document_snippet(content: &str, query: &str) -> String {
     else {
         return truncate_with_ellipsis(content.trim().to_owned(), 512);
     };
+    // Window of ~120 chars before / ~240 after the first term match, walked
+    // via char_indices so the slice bounds always land on UTF-8 boundaries.
+    // Byte offsets from lower_content are valid in content because ASCII
+    // lowercasing preserves the byte layout.
     let start = content[..position].char_indices().rev().nth(120).map_or(0, |(index, _)| index);
     let end = content[position..]
         .char_indices()
@@ -702,6 +772,14 @@ fn push_unique_workspace_memory_prefix(prefixes: &mut Vec<String>, prefix: Strin
     }
 }
 
+/// Builds the prompt for an operator-requested explicit recall, if any.
+///
+/// Returns `Ok(None)` when the parameter delta carries no recall selection,
+/// the query is blank, or recall produced no hits of any kind. A successful
+/// recall appends an `explicit_recall` tape event before rendering.
+///
+/// # Errors
+/// Returns `Status` when recall materialization or the tape append fails.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn build_explicit_recall_prompt(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -793,6 +871,14 @@ fn parse_project_context_preview(
     serde_json::from_str::<ParameterDeltaEnvelope>(raw).ok().and_then(|value| value.project_context)
 }
 
+/// Renders a previewed project-context selection into the prompt, if any.
+///
+/// Returns `Ok(None)` when the parameter delta carries no project-context
+/// preview or no entry in it is active; the caller then falls back to
+/// deriving project context server-side.
+///
+/// # Errors
+/// Returns `Status` when appending the `project_context` tape event fails.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn build_project_context_prompt(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -839,6 +925,13 @@ pub(crate) async fn build_project_context_prompt(
     Ok(render_project_context_prompt(&preview, fallback_prompt))
 }
 
+/// Renders previewed `@`-style context references into the prompt, if any.
+///
+/// Returns `Ok(None)` when the parameter delta carries no reference preview
+/// or the preview lists no references.
+///
+/// # Errors
+/// Returns `Status` when appending the `context_references` tape event fails.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn build_context_reference_prompt(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -883,6 +976,14 @@ pub(crate) async fn build_context_reference_prompt(
     Ok(render_context_reference_prompt(&preview, fallback_prompt))
 }
 
+/// Renders selected attachment-derived chunks into the prompt, if any.
+///
+/// Returns `Ok(None)` when the parameter delta carries no attachment-recall
+/// selection or the selection has no query/chunks. At most six chunks are
+/// injected to bound prompt growth.
+///
+/// # Errors
+/// Returns `Status` when appending the `attachment_recall` tape event fails.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn build_attachment_recall_prompt(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -973,6 +1074,14 @@ async fn load_previous_run_context_turns(
     Ok(turns)
 }
 
+/// Reconstructs the previous run's turns as structured provider messages.
+///
+/// Returns an empty list when there is no previous run or its tape no longer
+/// exists.
+///
+/// # Errors
+/// Returns `Status` when reading the previous run's tape fails for any
+/// reason other than `NotFound`.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn build_previous_run_provider_messages(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -994,6 +1103,14 @@ pub(crate) async fn build_previous_run_provider_messages(
         .collect())
 }
 
+/// Prepends a `<recent_conversation>` block with the previous run's turns.
+///
+/// Returns the input unchanged when there is no previous run or its tape
+/// holds no usable turns.
+///
+/// # Errors
+/// Returns `Status` when reading the previous run's tape fails for any
+/// reason other than `NotFound`.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn build_previous_run_context_prompt(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -1013,6 +1130,7 @@ pub(crate) async fn build_previous_run_context_prompt(
     Ok(format!("{block}\n\n{input_text}"))
 }
 
+/// Parses a boolean env flag, keeping `default` for unset or unknown values.
 fn env_flag_enabled(name: &str, default: bool) -> bool {
     match std::env::var(name) {
         Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
@@ -1024,6 +1142,12 @@ fn env_flag_enabled(name: &str, default: bool) -> bool {
     }
 }
 
+/// Runs the automatic compaction policy (`budget_guard_v1`) for the session.
+///
+/// Compaction only proceeds when the preview is eligible and clears the
+/// minimum input-token and token-savings thresholds; a recent artifact from
+/// the same policy inside the cooldown window is reused instead of
+/// recompacting. In dry-run mode only the preview tape event is emitted.
 #[allow(clippy::result_large_err)]
 async fn maybe_apply_automatic_session_compaction(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -1067,6 +1191,8 @@ async fn maybe_apply_automatic_session_compaction(
     let existing =
         runtime_state.list_orchestrator_compaction_artifacts(session_id.to_owned()).await?;
     if let Some(latest) = existing.first() {
+        // Cooldown guard: reuse a fresh automatic artifact instead of paying
+        // for another compaction every run while the session keeps growing.
         let same_policy = latest.mode == "automatic"
             && latest.trigger_policy.as_deref() == Some("budget_guard_v1");
         let in_cooldown =
@@ -1138,6 +1264,14 @@ async fn maybe_apply_automatic_session_compaction(
     Ok(Some(artifact))
 }
 
+/// Returns the compaction artifact the current run should summarize from.
+///
+/// Prefers an artifact produced (or reused) by the automatic compaction
+/// policy this run; otherwise falls back to the newest stored artifact.
+///
+/// # Errors
+/// Returns `Status` when session resolution, compaction, or artifact listing
+/// fails.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn resolve_latest_session_compaction_artifact(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -1166,6 +1300,10 @@ pub(crate) async fn resolve_latest_session_compaction_artifact(
     )
 }
 
+/// Prepends the latest compaction summary block to the prompt, if one exists.
+///
+/// # Errors
+/// Returns `Status` when resolving the compaction artifact fails.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn load_session_compaction_prompt(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -1195,6 +1333,15 @@ pub(crate) async fn load_session_compaction_prompt(
     Ok(format!("{block}\n\n{prompt_input_text}"))
 }
 
+/// Assembles the complete provider input for one model invocation.
+///
+/// Dispatches to the context-engine pipeline when its feature rollout is
+/// enabled; otherwise runs the legacy enrichment chain documented in the
+/// module header.
+///
+/// # Errors
+/// Returns `Status` when a required enrichment step or tape append fails;
+/// individually best-effort steps degrade to the raw input instead.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn prepare_model_provider_input(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -1233,6 +1380,10 @@ async fn prepare_model_provider_input_legacy(
         memory_prompt_failure_mode,
         channel_for_log,
     } = request;
+    // When the client previewed @-references, its clean_prompt (with the
+    // reference tokens stripped) is the canonical user text for memory
+    // ingestion and recall queries; the referenced content is appended later
+    // by build_context_reference_prompt.
     let context_reference_preview = parse_context_reference_preview(parameter_delta_json);
     let normalized_input_text = context_reference_preview
         .as_ref()
@@ -1349,6 +1500,9 @@ async fn prepare_model_provider_input_legacy(
         Some(value) => value,
         None => input_with_project_context,
     };
+    // Explicit recall short-circuits the rest of the chain: the operator
+    // hand-picked the context, so auto-injected memory and preference blocks
+    // are skipped and only references, pruning, and the runtime preamble run.
     if let Some(provider_input_text) = build_explicit_recall_prompt(
         runtime_state,
         context,
@@ -1400,8 +1554,10 @@ async fn prepare_model_provider_input_legacy(
     .await?
     {
         Some(value) => value,
-        None => input_with_attachment_recall.clone(),
+        None => input_with_attachment_recall,
     };
+    // Snapshot kept so a failed memory augmentation can fall back to the
+    // enriched-but-unaugmented prompt instead of losing earlier enrichment.
     let provider_input_text_before_memory = provider_input_text.clone();
     let provider_input_text = match build_memory_augmented_prompt(
         runtime_state,
@@ -1472,6 +1628,10 @@ fn prepend_legacy_runtime_context(provider_input_text: String) -> String {
     format!("{}\n\n{}", render_legacy_runtime_context_prompt(Utc::now()), provider_input_text)
 }
 
+/// Renders the trusted runtime-context preamble (current time, host OS).
+///
+/// Gives the model an authoritative "now" so it cites real timestamps
+/// instead of inventing them. Wording and field names are pinned by tests.
 fn render_legacy_runtime_context_prompt(now: DateTime<Utc>) -> String {
     format!(
         "<palyra_runtime_context>\ncurrent_utc: {}\ncurrent_unix_ms: {}\nhost_os: {}\nhost_family: {}\ntemporal_evidence_contract: Use current_utc or current_unix_ms as trusted runtime evidence when the user asks for current timestamps in reports, monitoring output, changelogs, status summaries, or citations. Do not invent calendar dates or times; if no exact timestamp is required, omit it instead of fabricating one.\n</palyra_runtime_context>",
@@ -1482,9 +1642,14 @@ fn render_legacy_runtime_context_prompt(now: DateTime<Utc>) -> String {
     )
 }
 
-#[allow(clippy::result_large_err)]
+/// `(run_id, tape_seq, session_id, parameter_delta_json, memory_ingest_reason)`.
 type ProviderInputPruningRequest<'a> = (&'a str, &'a mut i64, &'a str, Option<&'a str>, &'a str);
 
+/// Applies the ephemeral pruning policy as the final text transformation.
+///
+/// Pruning never runs when the observability auto-disable circuit is active
+/// for the decision's savings threshold; eligible outcomes are recorded as
+/// runtime-decision events even in preview (non-applying) mode.
 #[allow(clippy::result_large_err)]
 async fn finalize_provider_input_with_pruning(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -1520,6 +1685,11 @@ async fn finalize_provider_input_with_pruning(
     Ok(outcome.provider_input_text)
 }
 
+/// Records a pruning outcome as a runtime-decision event plus a tape event.
+///
+/// # Errors
+/// Returns `Status` when persisting the decision event or appending the tape
+/// event fails.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn record_provider_pruning_decision(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -1558,6 +1728,7 @@ pub(crate) async fn record_provider_pruning_decision(
     append_runtime_decision_tape_event(runtime_state, run_id, tape_seq, &payload).await
 }
 
+/// Prepends a fenced memory-recall block (no workspace hits) to the prompt.
 pub(crate) fn render_memory_augmented_prompt(hits: &[MemorySearchHit], input_text: &str) -> String {
     render_memory_augmented_prompt_with_workspace(hits, &[], input_text)
 }
@@ -1581,6 +1752,9 @@ fn render_memory_augmented_prompt_with_workspace(
     }
 }
 
+// Trust boundary: recalled snippets are sanitized and wrapped in a fence
+// that explicitly declares instruction_authority="none", so retrieved text
+// is presented as citable evidence rather than as instructions.
 fn render_memory_recall_block(hits: &[MemorySearchHit]) -> String {
     let mut context_lines = Vec::with_capacity(hits.len());
     for (index, hit) in hits.iter().enumerate() {
@@ -1648,6 +1822,11 @@ fn render_workspace_memory_recall_block(hits: &[WorkspaceSearchHit]) -> String {
     block
 }
 
+/// Neutralizes recalled text before it is inlined into a prompt fence.
+///
+/// Escapes XML-significant characters so untrusted content cannot close or
+/// forge fence tags, and flattens control characters (including newlines) so
+/// a stored snippet cannot break out of its single attribute-style line.
 pub(crate) fn sanitize_prompt_inline_value(value: &str) -> String {
     let mut sanitized = String::with_capacity(value.len());
     for ch in value.chars() {
@@ -1690,6 +1869,7 @@ fn render_attachment_recall_prompt(
     block
 }
 
+/// Builds the `memory_auto_inject` tape payload for memory-only injections.
 pub(crate) fn memory_auto_inject_tape_payload(query: &str, hits: &[MemorySearchHit]) -> String {
     memory_auto_inject_tape_payload_with_workspace(query, hits, &[])
 }
@@ -1739,6 +1919,8 @@ fn memory_auto_inject_tape_payload_with_workspace(
         }).collect::<Vec<_>>(),
     })
     .to_string();
+    // Journal redaction is best-effort here: an unredactable payload is still
+    // recorded so the tape never silently loses an injection event.
     crate::journal::redact_payload_json(payload.as_bytes()).unwrap_or(payload)
 }
 

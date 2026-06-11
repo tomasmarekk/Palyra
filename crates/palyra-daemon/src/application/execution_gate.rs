@@ -1,3 +1,17 @@
+//! Execution-gate pipeline (v2) for tool proposals.
+//!
+//! [`evaluate_execution_gate_pipeline`] runs a tool proposal through an
+//! ordered gate chain -- request context, skill gate, tool posture, backend
+//! capability, secret resolution, safety boundary, policy, approval, and
+//! execution launch -- and records every step in an [`ExecutionGateReport`]
+//! for journal/support-bundle output. The pipeline is fail-closed: the first
+//! blocking gate preempts policy evaluation, later gates report as skipped,
+//! and the run's tool budget is consumed only along the path whose decision
+//! actually allows execution. It runs alongside the legacy decision path
+//! during the `execution_gate_pipeline_v2` rollout;
+//! [`append_audit_finalization_step`] records whether both paths agreed so a
+//! mismatch can be triaged (and the rollout rolled back) from audit data.
+
 use palyra_common::feature_rollouts::{
     EXECUTION_GATE_PIPELINE_V2_ROLLOUT_CONFIG_PATH, EXECUTION_GATE_PIPELINE_V2_ROLLOUT_ENV,
 };
@@ -23,15 +37,19 @@ const BUDGET_DENY_REASON: &str = "tool execution budget exhausted for run";
 const UNSUPPORTED_TOOL_DENY_REASON: &str =
     "tool is allowlisted but unsupported by runtime executor";
 
+/// Per-gate (and final) verdict recorded in the pipeline report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ExecutionGateVerdict {
     Allow,
     Block,
     RequireApproval,
+    /// The gate did not apply, or an earlier gate already blocked.
     Skipped,
 }
 
+/// One evaluated gate: machine-readable reason code plus operator-facing
+/// summary/remediation text and gate-specific metadata.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct ExecutionGateStep {
     pub(crate) gate_id: String,
@@ -43,6 +61,7 @@ pub(crate) struct ExecutionGateStep {
     pub(crate) metadata: Value,
 }
 
+/// Serializable copy of a [`ToolDecision`] for report payloads.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct ExecutionGateDecisionSnapshot {
     pub(crate) allowed: bool,
@@ -51,6 +70,8 @@ pub(crate) struct ExecutionGateDecisionSnapshot {
     pub(crate) reason: String,
 }
 
+/// Full audit record of one pipeline evaluation, attached to journal and
+/// support-bundle output alongside the decision itself.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct ExecutionGateReport {
     pub(crate) pipeline_version: String,
@@ -62,6 +83,8 @@ pub(crate) struct ExecutionGateReport {
     pub(crate) steps: Vec<ExecutionGateStep>,
 }
 
+/// Pipeline result: the enforced decision, the post-decision tool budget,
+/// and the audit report.
 #[derive(Debug, Clone)]
 pub(crate) struct ExecutionGatePipelineOutcome {
     pub(crate) decision: ToolDecision,
@@ -69,12 +92,18 @@ pub(crate) struct ExecutionGatePipelineOutcome {
     pub(crate) report: ExecutionGateReport,
 }
 
+/// Approval signals known at evaluation time.
+///
+/// `pending_approval_id` set means a request is awaiting an operator;
+/// `outcome` set means the operator already decided. Both `None` (the
+/// default) means no approval interaction has happened yet.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ToolProposalApprovalState<'a> {
     pub(crate) outcome: Option<&'a ToolApprovalOutcome>,
     pub(crate) pending_approval_id: Option<&'a str>,
 }
 
+/// Everything [`evaluate_execution_gate_pipeline`] needs for one proposal.
 #[derive(Debug)]
 pub(crate) struct ExecutionGatePipelineInput<'a> {
     pub(crate) tool_call_config: &'a ToolCallConfig,
@@ -89,6 +118,14 @@ pub(crate) struct ExecutionGatePipelineInput<'a> {
     pub(crate) remaining_budget: u32,
 }
 
+/// Evaluates the full gate chain for one tool proposal.
+///
+/// Gate precedence: a skill-gate denial preempts everything, then a disabled
+/// tool posture, then a backend capability denial; only when none of those
+/// fire is the policy engine consulted, with the approval state deciding
+/// between pending/granted/denied/channel-unavailable outcomes. Budget is
+/// consumed exactly once, on the policy evaluation whose decision is
+/// returned; blocked proposals leave the budget untouched.
 pub(crate) fn evaluate_execution_gate_pipeline(
     input: ExecutionGatePipelineInput<'_>,
 ) -> ExecutionGatePipelineOutcome {
@@ -116,6 +153,9 @@ pub(crate) fn evaluate_execution_gate_pipeline(
     let posture_blocked = effective_posture.effective_state == ToolPostureState::Disabled;
     steps.push(posture_step);
 
+    // Backend capability is only evaluated when no earlier gate blocked, so
+    // the report attributes the denial to the first failing gate instead of
+    // piling up redundant downstream denials.
     let backend_capability_decision = if skill_gate_blocked || posture_blocked {
         None
     } else {
@@ -129,6 +169,9 @@ pub(crate) fn evaluate_execution_gate_pipeline(
     steps.push(secret_resolution_step(tool_name));
     steps.push(safety_boundary_step(tool_name));
 
+    // A preemptive decision short-circuits policy evaluation entirely
+    // (fail-closed); precedence is skill gate, then posture, then backend
+    // capability.
     let preemptive_decision = if let Some(decision) = skill_gate_decision {
         Some(annotate_tool_decision_with_backend_context(decision, backend_selection))
     } else if posture_blocked {
@@ -165,6 +208,11 @@ pub(crate) fn evaluate_execution_gate_pipeline(
     if preemptive_decision.is_none() {
         let posture_always_allow =
             effective_posture.effective_state == ToolPostureState::AlwaysAllow;
+        // Policy is evaluated twice against independent budget copies: once
+        // as-is (pre-approval view) and once with sensitivity overridden for
+        // the explicit-approval path. Only the budget of the path whose
+        // decision is ultimately returned is committed below, so a proposal
+        // never pays for both evaluations.
         let mut pre_policy_budget = remaining_budget;
         let pre_policy_decision = decide_tool_call(
             tool_call_config,
@@ -177,6 +225,9 @@ pub(crate) fn evaluate_execution_gate_pipeline(
             pre_policy_decision.reason.as_str(),
             pre_policy_decision.allowed,
         );
+        // Only the sensitive-action denial is approval-overridable; every
+        // other policy denial (allowlist, budget, unsupported tool) stands
+        // even if an operator approves.
         let approval_can_override_policy =
             pre_policy_reason_code == "policy.sensitive.requires_approval";
         let effective_approval_required =
@@ -298,6 +349,12 @@ pub(crate) fn evaluate_execution_gate_pipeline(
             annotate_tool_decision_with_backend_context(allowed, backend_selection)
         };
 
+        // AIDEV-NOTE: budget asymmetry - when approval was required only by
+        // the proposal (approval_can_override_policy == false), the approved
+        // path commits approved_policy_budget, which was never decremented
+        // because the second decide_tool_call did not run; the override path
+        // consumes one unit. Aligning them is a behavior change gated by the
+        // budget-consumption tests, so it is intentionally not fixed here.
         resulting_budget = if final_decision.allowed {
             if effective_approval_required
                 && approval_state.outcome.is_some_and(|value| value.approved)
@@ -364,6 +421,10 @@ pub(crate) fn evaluate_execution_gate_pipeline(
     }
 }
 
+/// Appends the legacy-comparison step to a finished pipeline report.
+///
+/// A mismatch with the legacy decision path does not change enforcement; it
+/// is preserved in audit payloads as the rollback signal for the v2 rollout.
 pub(crate) fn append_audit_finalization_step(
     report: &mut ExecutionGateReport,
     legacy_decision: &ToolDecision,
@@ -433,6 +494,9 @@ fn skill_gate_step(
     skill_gate_decision: Option<&ToolDecision>,
 ) -> ExecutionGateStep {
     if let Some(skill_gate_decision) = skill_gate_decision {
+        // The skill gate hands over only a ToolDecision, so the reason code
+        // is recovered from its reason string; these substrings are the
+        // gate's stable vocabulary (pinned by tests/fixtures).
         let reason_code = if skill_gate_decision.reason.contains("invalid skill context") {
             "skill.execution.invalid_context"
         } else if skill_gate_decision.reason.contains("status=missing") {
@@ -577,6 +641,9 @@ fn backend_gate_step(
     }
 }
 
+// Always-Skipped informational step: credential binding happens inside the
+// HTTP runtime adapter, and the report documents that handoff explicitly so
+// audits do not mistake the absence of a pre-execution check for a gap.
 fn secret_resolution_step(tool_name: &str) -> ExecutionGateStep {
     let applicable = tool_name == "palyra.http.fetch";
     ExecutionGateStep {
@@ -601,6 +668,8 @@ fn secret_resolution_step(tool_name: &str) -> ExecutionGateStep {
     }
 }
 
+// Always-Skipped informational step: safety scanning of external content
+// runs inside the browser/HTTP runtime boundary, not at proposal time.
 fn safety_boundary_step(tool_name: &str) -> ExecutionGateStep {
     let applicable = tool_name == "palyra.http.fetch" || tool_name.starts_with("palyra.browser.");
     ExecutionGateStep {
@@ -792,6 +861,9 @@ fn final_verdict(decision: &ToolDecision, final_reason_code: &str) -> ExecutionG
     }
 }
 
+// Reason codes are inferred from decision reason strings because the policy
+// layer returns only a ToolDecision; the matched substrings are canonical
+// policy wording pinned by tests, so they must not be reworded here.
 fn infer_policy_reason_code(reason: &str, allowed: bool) -> String {
     if allowed {
         return "policy.allowed".to_owned();
@@ -814,11 +886,15 @@ fn infer_policy_reason_code(reason: &str, allowed: bool) -> String {
     "policy.denied".to_owned()
 }
 
+// Matches both the bare canonical reason and the post-approval wrapped form
+// ("...; original_reason=<canonical>") so classification survives wrapping.
 fn reason_matches_or_wraps_original(reason: &str, canonical_reason: &str) -> bool {
     reason == canonical_reason
         || reason.contains(format!("original_reason={canonical_reason}").as_str())
 }
 
+// Approval-related codes are checked before policy codes so an approval
+// outcome is never misreported as a plain policy denial.
 fn infer_final_reason_code(reason: &str, allowed: bool, has_pending_approval: bool) -> String {
     if allowed {
         if reason.contains("explicit approval granted") {
@@ -879,6 +955,7 @@ fn policy_reason_code_remediation(
     }
 }
 
+/// Fail-closed decision while an approval request is still unanswered.
 fn approval_pending_decision(
     tool_name: &str,
     approval_id: &str,

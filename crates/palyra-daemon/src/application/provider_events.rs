@@ -1,3 +1,14 @@
+//! Provider-event dispatch for run streams and routed channel messages.
+//!
+//! Takes the [`ProviderEvent`] batch produced by one model round and fans
+//! each event out to the active surface: a gRPC run stream (tokens forwarded
+//! to the client, tool proposals executed via `run_stream::tool_flow`) or
+//! channel route-message handling (tool summaries appended to the reply
+//! text). On the run-stream path, contiguous tool proposals are buffered and
+//! flushed as one batch so approvals can be gathered up front while
+//! execution stays in submission order, and orchestrator cancellation is
+//! re-checked before every event so a cancel request wins promptly.
+
 use std::sync::Arc;
 
 use palyra_common::runtime_preview::{
@@ -29,24 +40,37 @@ use crate::{
     transport::grpc::{auth::RequestContext, proto::palyra::common::v1 as common_v1},
 };
 
+/// Result of the pre-event cancellation gate.
+///
+/// Same shape as [`RunStreamProviderEventOutcome`] but kept as a distinct
+/// type: a gate `Cancelled` means the run was already transitioned to the
+/// cancelled state before the event was processed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunStreamProviderEventGateOutcome {
     Continue,
     Cancelled,
 }
 
+/// Result of processing a single provider event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunStreamProviderEventOutcome {
     Continue,
     Cancelled,
 }
 
+/// Result of processing a whole provider-event batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RunStreamProviderEventsOutcome {
-    Completed { summary_tokens: Vec<String>, tool_results: Vec<RunStreamToolResultForModel> },
+    /// All events processed; carries the accumulated non-empty model tokens
+    /// and the tool results to feed back into the next model round.
+    Completed {
+        summary_tokens: Vec<String>,
+        tool_results: Vec<RunStreamToolResultForModel>,
+    },
     Cancelled,
 }
 
+/// A completed tool execution, keyed for the model's follow-up round.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RunStreamToolResultForModel {
     pub(crate) proposal_id: String,
@@ -54,6 +78,7 @@ pub(crate) struct RunStreamToolResultForModel {
     pub(crate) outcome: ToolExecutionOutcome,
 }
 
+/// A tool proposal buffered until the contiguous proposal batch is flushed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingRunStreamToolProposal {
     proposal_id: String,
@@ -61,6 +86,7 @@ struct PendingRunStreamToolProposal {
     input_json: Vec<u8>,
 }
 
+/// Mutable run-stream state a provider event may touch while being handled.
 pub(crate) struct RunStreamProviderEventSurface<'a> {
     pub(crate) sender: &'a mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
     pub(crate) stream: &'a mut Streaming<common_v1::RunStreamRequest>,
@@ -74,16 +100,23 @@ pub(crate) struct RunStreamProviderEventSurface<'a> {
     pub(crate) stream_model_tokens_immediately: bool,
 }
 
+/// Route-message state a provider event may touch while being handled.
 pub(crate) struct RouteMessageProviderEventSurface<'a> {
     pub(crate) request_context: &'a RequestContext,
     pub(crate) reply_text: &'a mut String,
 }
 
+/// The delivery surface a provider event is being processed for.
 pub(crate) enum ProviderEventSurface<'a> {
     RunStream(RunStreamProviderEventSurface<'a>),
     RouteMessage(RouteMessageProviderEventSurface<'a>),
 }
 
+/// Checks for a pending cancel request and, if found, cancels the run.
+///
+/// A positive check records a `run_cancel_requested` runtime decision, tapes
+/// it, and transitions the run state machine to cancelled before reporting
+/// [`RunStreamProviderEventGateOutcome::Cancelled`] to the caller.
 #[allow(clippy::result_large_err)]
 async fn gate_run_stream_provider_event_on_cancellation(
     sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
@@ -135,6 +168,16 @@ async fn gate_run_stream_provider_event_on_cancellation(
     }
 }
 
+/// Handles one provider event for the given surface.
+///
+/// Model tokens are always accumulated into `summary_tokens` (whitespace-only
+/// tokens are skipped) and streamed to the client only on run-stream surfaces
+/// that opted into immediate token streaming. Tool proposals execute through
+/// the surface-specific tool flow and land in `tool_results`.
+///
+/// # Errors
+/// Returns `Status` when streaming a token or executing a tool proposal
+/// fails.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_provider_event_for_surface(
@@ -240,6 +283,16 @@ pub(crate) async fn process_provider_event_for_surface(
     }
 }
 
+/// Processes one model round's provider events on the run-stream surface.
+///
+/// Tool proposals are buffered while contiguous and flushed as a batch when a
+/// model token arrives or the batch ends, so approval prompts for the whole
+/// batch can be raised before any tool runs while execution still happens in
+/// submission order. Cancellation is re-checked before every event.
+///
+/// # Errors
+/// Returns `Status` when cancellation gating, token streaming, or tool
+/// execution fails.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_run_stream_provider_events(
@@ -291,6 +344,8 @@ pub(crate) async fn process_run_stream_provider_events(
                 });
             }
             provider_event @ ProviderEvent::ModelToken { .. } => {
+                // A token ends the contiguous proposal run: execute the
+                // buffered batch first so tool results precede later text.
                 match flush_pending_run_stream_tool_proposals(
                     sender,
                     stream,
@@ -376,6 +431,12 @@ pub(crate) async fn process_run_stream_provider_events(
     Ok(RunStreamProviderEventsOutcome::Completed { summary_tokens, tool_results })
 }
 
+/// Prepares and executes the buffered tool-proposal batch in order.
+///
+/// Preparation (validation, gating, approval collection) runs per proposal;
+/// proposals that complete during preparation (for example denials) force the
+/// already-prepared prefix to execute first so result order still matches
+/// submission order.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 async fn flush_pending_run_stream_tool_proposals(
@@ -442,6 +503,8 @@ async fn flush_pending_run_stream_tool_proposals(
                 prepared_tools.push(prepared);
             }
             RunStreamToolProposalPreparationOutcome::Completed(outcome) => {
+                // Drain prepared-but-unexecuted proposals before recording
+                // this short-circuited outcome to preserve submission order.
                 match flush_prepared_run_stream_tool_batch(
                     sender,
                     runtime_state,
@@ -484,6 +547,7 @@ async fn flush_pending_run_stream_tool_proposals(
     .await
 }
 
+/// Executes a prepared tool batch and folds the outcomes into `tool_results`.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 async fn flush_prepared_run_stream_tool_batch(
@@ -530,6 +594,7 @@ async fn flush_prepared_run_stream_tool_batch(
     }
 }
 
+/// Folds one execution outcome into `tool_results`, mapping cancellation.
 fn push_run_stream_tool_execution_outcome(
     tool_results: &mut Vec<RunStreamToolResultForModel>,
     outcome: RunStreamToolExecutionOutcome,
@@ -543,6 +608,7 @@ fn push_run_stream_tool_execution_outcome(
     }
 }
 
+/// Adapts loose run-stream arguments into the surface-based event handler.
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 async fn process_run_stream_provider_event(

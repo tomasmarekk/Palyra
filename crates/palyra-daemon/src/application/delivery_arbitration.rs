@@ -1,3 +1,18 @@
+//! Delivery arbitration between parent runs and delegated descendant runs.
+//!
+//! Decides which output reaches the user when a delegated child run
+//! supersedes its parent: [`resolve_delivery_policy`] derives the active
+//! [`DeliveryPolicySet`] from config, the delegation snapshot, and the
+//! channel surface, and [`arbitrate_delivery`] applies it with a fixed
+//! precedence (disabled mode, then the final-review gate, then terminal
+//! descendant preference, then interim parent delivery). Surfaces differ in
+//! capability -- only web chat supports in-place replacement, so other
+//! channels fall back to annotating the superseded parent. Progress updates
+//! from child runs, flow steps, and approval waits are merged per surface
+//! budget by [`merge_delivery_progress_updates`]. The inner
+//! `phase_five_delivery_contracts` module holds ack/dead-letter contracts
+//! that are specified and tested but not yet wired into the runtime.
+
 use std::collections::HashMap;
 
 use palyra_common::{
@@ -13,8 +28,13 @@ use crate::{
     delegation::{DelegationExecutionMode, DelegationMergeApprovalSummary, DelegationSnapshot},
 };
 
+/// Policy identifier recorded in arbitration decisions and snapshots.
 pub(crate) const DELIVERY_ARBITRATION_POLICY_ID: &str = "delivery_arbitration.v1";
 
+/// Where arbitrated output is ultimately presented.
+///
+/// The surface determines delivery capabilities (replacement, annotation)
+/// and the progress-merge budget; see the `const` accessors below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum DeliverySurface {
@@ -25,6 +45,12 @@ pub(crate) enum DeliverySurface {
 }
 
 impl DeliverySurface {
+    /// Classifies a raw channel identifier into a delivery surface.
+    ///
+    /// `web`/`console` prefixes map to [`Self::WebChat`], `cli` to
+    /// [`Self::Notification`], anything else non-empty to
+    /// [`Self::ExternalChannel`], and a missing or blank channel to
+    /// [`Self::AuditOnly`].
     #[must_use]
     pub(crate) fn from_channel(channel: Option<&str>) -> Self {
         let Some(raw_channel) = channel else {
@@ -47,6 +73,7 @@ impl DeliverySurface {
         Self::ExternalChannel
     }
 
+    /// Stable snake_case label used in snapshots and explain payloads.
     #[must_use]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
@@ -57,16 +84,22 @@ impl DeliverySurface {
         }
     }
 
+    /// Whether a superseded parent message can be replaced in place.
+    ///
+    /// Only web chat owns its rendered transcript; external channels cannot
+    /// retract an already-sent message, so they annotate instead.
     #[must_use]
     pub(crate) const fn supports_replacement(self) -> bool {
         matches!(self, Self::WebChat)
     }
 
+    /// Whether a superseded parent can at least be annotated on this surface.
     #[must_use]
     pub(crate) const fn supports_annotation(self) -> bool {
         matches!(self, Self::WebChat | Self::ExternalChannel | Self::Notification)
     }
 
+    /// How merged progress is presented on this surface.
     #[must_use]
     pub(crate) const fn progress_presentation(self) -> &'static str {
         match self {
@@ -77,6 +110,7 @@ impl DeliverySurface {
         }
     }
 
+    /// Minimum interval between progress refreshes pushed to this surface.
     #[must_use]
     pub(crate) const fn refresh_cadence_ms(self) -> u64 {
         match self {
@@ -87,6 +121,7 @@ impl DeliverySurface {
         }
     }
 
+    /// Maximum number of merged progress items shown on this surface.
     #[must_use]
     pub(crate) const fn max_progress_items(self) -> usize {
         match self {
@@ -98,6 +133,7 @@ impl DeliverySurface {
     }
 }
 
+/// Which configuration source the active delivery policy was derived from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum DeliveryPolicySourceKind {
@@ -117,6 +153,11 @@ impl DeliveryPolicySourceKind {
     }
 }
 
+/// The resolved delivery policy for one parent/descendant arbitration.
+///
+/// Produced by [`resolve_delivery_policy`] and consumed by
+/// [`arbitrate_delivery`]; `snapshot_json` is the auditable form attached to
+/// explain payloads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DeliveryPolicySet {
     pub(crate) policy_id: String,
@@ -133,16 +174,19 @@ pub(crate) struct DeliveryPolicySet {
 }
 
 impl DeliveryPolicySet {
+    /// Returns `true` when `policy` is part of this set.
     #[must_use]
     pub(crate) fn contains(&self, policy: DeliveryPolicy) -> bool {
         self.policies.contains(&policy)
     }
 
+    /// Stable labels of the active policies, in set order.
     #[must_use]
     pub(crate) fn policy_names(&self) -> Vec<&'static str> {
         self.policies.iter().map(|policy| policy.as_str()).collect()
     }
 
+    /// Auditable JSON form embedded in explain payloads and previews.
     #[must_use]
     pub(crate) fn snapshot_json(&self) -> Value {
         json!({
@@ -171,6 +215,13 @@ impl DeliveryPolicySet {
     }
 }
 
+/// Derives the active [`DeliveryPolicySet`] for one arbitration.
+///
+/// Source precedence: a delegation profile wins over a flow definition,
+/// which wins over the session default. Interim parent delivery and progress
+/// merging are always on; descendant preference (with stale-parent
+/// suppression) is config-gated, and a final-review requirement is added
+/// when the delegation merge contract demands approval.
 #[must_use]
 pub(crate) fn resolve_delivery_policy(
     config: &DeliveryArbitrationConfig,
@@ -198,6 +249,8 @@ pub(crate) fn resolve_delivery_policy(
     if delegation.is_some_and(|snapshot| snapshot.merge_contract.approval_required) {
         policies.push(DeliveryPolicy::RequireFinalReview);
     }
+    // Canonical order + dedup keep policy snapshots byte-stable for replay
+    // and golden comparisons regardless of how the set was assembled.
     policies.sort_by_key(|policy| policy.as_str());
     policies.dedup();
 
@@ -216,6 +269,7 @@ pub(crate) fn resolve_delivery_policy(
     }
 }
 
+/// The user-visible action selected by [`arbitrate_delivery`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum DeliveryDecisionAction {
@@ -227,6 +281,7 @@ pub(crate) enum DeliveryDecisionAction {
 }
 
 impl DeliveryDecisionAction {
+    /// Stable snake_case label used in explain payloads.
     #[must_use]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
@@ -239,6 +294,7 @@ impl DeliveryDecisionAction {
     }
 }
 
+/// Observed run/approval state fed into [`arbitrate_delivery`].
 #[derive(Debug, Clone)]
 pub(crate) struct DeliveryDecisionInput<'a> {
     pub(crate) policy: &'a DeliveryPolicySet,
@@ -253,6 +309,12 @@ pub(crate) struct DeliveryDecisionInput<'a> {
     pub(crate) observed_at_unix_ms: i64,
 }
 
+/// Arbitration outcome with the flags consumers need to act on it.
+///
+/// `would_suppress_parent` reports what enforcement *would* do, while
+/// `parent_suppressed` is only set when the policy mode actually enforces;
+/// the gap is what preview mode surfaces to operators. `audit_retained` is
+/// always `true`: arbitration never erases output from the journal.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DeliveryDecision {
     pub(crate) action: DeliveryDecisionAction,
@@ -268,6 +330,7 @@ pub(crate) struct DeliveryDecision {
 }
 
 impl DeliveryDecision {
+    /// Number of outputs this decision suppressed (0 or 1), for budgets.
     #[must_use]
     pub(crate) const fn suppression_count(&self) -> u64 {
         if self.parent_suppressed {
@@ -278,10 +341,18 @@ impl DeliveryDecision {
     }
 }
 
+// Phase-five delivery contracts: ack tracking, recovery, failure routing,
+// and dead-letter previews. Specified and unit-tested ahead of runtime
+// adoption, hence the module-wide dead_code allowance; remove the allowance
+// as adapters start consuming these types.
 #[allow(dead_code)]
 mod phase_five_delivery_contracts {
     use super::*;
 
+    /// Acknowledgement state reported by an external delivery adapter.
+    ///
+    /// `Unknown` is the dangerous state: the message may or may not have
+    /// reached the channel, so recovery must avoid blind re-sends.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
     #[serde(rename_all = "snake_case")]
     pub(crate) enum DeliveryAckState {
@@ -291,6 +362,7 @@ mod phase_five_delivery_contracts {
     }
 
     impl DeliveryAckState {
+        /// Stable snake_case label used in trace snapshots.
         #[must_use]
         pub(crate) const fn as_str(self) -> &'static str {
             match self {
@@ -301,6 +373,7 @@ mod phase_five_delivery_contracts {
         }
     }
 
+    /// Bounded retry budget attached to each delivery attempt.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
     pub(crate) struct DeliveryRetryPolicy {
         pub(crate) max_attempts: u32,
@@ -313,6 +386,8 @@ mod phase_five_delivery_contracts {
         }
     }
 
+    /// One adapter send attempt, identified by payload digest rather than
+    /// payload content so audit records never embed message bodies.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
     pub(crate) struct DeliveryAttemptRecord {
         pub(crate) attempt_id: String,
@@ -327,6 +402,7 @@ mod phase_five_delivery_contracts {
     }
 
     impl DeliveryAttemptRecord {
+        /// Auditable JSON form of this attempt.
         #[must_use]
         pub(crate) fn snapshot_json(&self) -> Value {
             json!({
@@ -343,6 +419,7 @@ mod phase_five_delivery_contracts {
         }
     }
 
+    /// Full attempt history for one logical delivery.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
     pub(crate) struct DeliveryTrace {
         pub(crate) trace_id: String,
@@ -350,21 +427,25 @@ mod phase_five_delivery_contracts {
     }
 
     impl DeliveryTrace {
+        /// The most recent attempt by timestamp, if any were made.
         #[must_use]
         pub(crate) fn latest_attempt(&self) -> Option<&DeliveryAttemptRecord> {
             self.attempts.iter().max_by_key(|attempt| attempt.attempted_at_unix_ms)
         }
 
+        /// Ack state of the latest attempt; `Unknown` for an empty trace.
         #[must_use]
         pub(crate) fn latest_ack_state(&self) -> DeliveryAckState {
             self.latest_attempt().map_or(DeliveryAckState::Unknown, |attempt| attempt.ack_state)
         }
 
+        /// Whether delivery may have happened without confirmation.
         #[must_use]
         pub(crate) fn ack_uncertain(&self) -> bool {
             self.latest_ack_state() == DeliveryAckState::Unknown
         }
 
+        /// Auditable JSON form of the trace and its derived ack state.
         #[must_use]
         pub(crate) fn snapshot_json(&self) -> Value {
             json!({
@@ -381,6 +462,7 @@ mod phase_five_delivery_contracts {
         }
     }
 
+    /// What to do next when a delivery trace needs resolution.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
     #[serde(rename_all = "snake_case")]
     pub(crate) enum DeliveryAckRecoveryAction {
@@ -392,6 +474,7 @@ mod phase_five_delivery_contracts {
     }
 
     impl DeliveryAckRecoveryAction {
+        /// Stable snake_case label used in recovery snapshots.
         #[must_use]
         pub(crate) const fn as_str(self) -> &'static str {
             match self {
@@ -404,6 +487,8 @@ mod phase_five_delivery_contracts {
         }
     }
 
+    /// Recovery action plus whether a retry must first mint an idempotency
+    /// key (to make an uncertain re-send safe against duplicates).
     #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
     pub(crate) struct DeliveryAckRecoveryDecision {
         pub(crate) action: DeliveryAckRecoveryAction,
@@ -412,6 +497,7 @@ mod phase_five_delivery_contracts {
     }
 
     impl DeliveryAckRecoveryDecision {
+        /// Auditable JSON form of this recovery decision.
         #[must_use]
         pub(crate) fn snapshot_json(&self) -> Value {
             json!({
@@ -422,6 +508,12 @@ mod phase_five_delivery_contracts {
         }
     }
 
+    /// Chooses the recovery action for a delivery trace.
+    ///
+    /// The uncertain-ack split is the core rule: with an idempotency key a
+    /// duplicate send is harmless so we can wait for the external ack;
+    /// without one, only an operator can decide, because retrying blindly
+    /// risks a duplicate message the channel cannot deduplicate.
     #[must_use]
     pub(crate) fn resolve_ack_recovery(trace: &DeliveryTrace) -> DeliveryAckRecoveryDecision {
         let Some(latest) = trace.latest_attempt() else {
@@ -457,6 +549,7 @@ mod phase_five_delivery_contracts {
         }
     }
 
+    /// Where a failed delivery's notification is routed.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
     #[serde(rename_all = "snake_case")]
     pub(crate) enum FailureDestinationKind {
@@ -466,6 +559,7 @@ mod phase_five_delivery_contracts {
     }
 
     impl FailureDestinationKind {
+        /// Stable snake_case label used in routing snapshots.
         #[must_use]
         pub(crate) const fn as_str(self) -> &'static str {
             match self {
@@ -476,6 +570,7 @@ mod phase_five_delivery_contracts {
         }
     }
 
+    /// Signals consulted when routing a delivery-failure notification.
     #[derive(Debug, Clone, Copy)]
     pub(crate) struct FailureDestinationInput {
         pub(crate) surface: DeliverySurface,
@@ -485,6 +580,7 @@ mod phase_five_delivery_contracts {
         pub(crate) sensitive: bool,
     }
 
+    /// Routing decision for a delivery-failure notification.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
     pub(crate) struct FailureDestinationDecision {
         pub(crate) destination: FailureDestinationKind,
@@ -493,6 +589,7 @@ mod phase_five_delivery_contracts {
     }
 
     impl FailureDestinationDecision {
+        /// Auditable JSON form of this routing decision.
         #[must_use]
         pub(crate) fn snapshot_json(&self) -> Value {
             json!({
@@ -503,6 +600,12 @@ mod phase_five_delivery_contracts {
         }
     }
 
+    /// Routes a delivery failure, most restrictive rule first.
+    ///
+    /// Sensitive output never leaves the audit trail; uncertain acks go to
+    /// the operator (a fallback re-send could duplicate the message); only
+    /// a confirmed failure with a healthy fallback channel is re-routed
+    /// automatically.
     #[must_use]
     pub(crate) fn resolve_failure_destination(
         input: FailureDestinationInput,
@@ -535,6 +638,7 @@ mod phase_five_delivery_contracts {
         }
     }
 
+    /// Operator-facing summary of a dead-lettered delivery.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
     pub(crate) struct DeadLetterQueuePreview {
         pub(crate) redacted_preview: String,
@@ -546,12 +650,18 @@ mod phase_five_delivery_contracts {
     }
 
     impl DeadLetterQueuePreview {
+        /// Auditable JSON form of this preview.
         #[must_use]
         pub(crate) fn snapshot_json(&self) -> Value {
             json!(self)
         }
     }
 
+    /// Builds a dead-letter preview with the payload redacted and truncated.
+    ///
+    /// URL query/path secrets are scrubbed before the 240-char cut so a
+    /// dead-letter entry can be shown to operators without leaking
+    /// credentials embedded in the failed payload.
     #[must_use]
     pub(crate) fn build_dead_letter_preview(
         payload_preview: &str,
@@ -576,6 +686,7 @@ mod phase_five_delivery_contracts {
         }
     }
 
+    /// Outcome of gating a child run's output before external delivery.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
     #[serde(rename_all = "snake_case")]
     pub(crate) enum ChildRunOutputGuardAction {
@@ -585,6 +696,7 @@ mod phase_five_delivery_contracts {
     }
 
     impl ChildRunOutputGuardAction {
+        /// Stable snake_case label used in guard snapshots.
         #[must_use]
         pub(crate) const fn as_str(self) -> &'static str {
             match self {
@@ -595,6 +707,7 @@ mod phase_five_delivery_contracts {
         }
     }
 
+    /// Signals consulted by [`guard_child_run_output`].
     #[derive(Debug, Clone)]
     pub(crate) struct ChildRunOutputGuardInput<'a> {
         pub(crate) output_size_bytes: usize,
@@ -606,6 +719,8 @@ mod phase_five_delivery_contracts {
         pub(crate) artifact_id: Option<&'a str>,
     }
 
+    /// Guard verdict; `artifact_required` means the output must be parked as
+    /// an artifact (it is not safely deliverable inline).
     #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
     pub(crate) struct ChildRunOutputGuardDecision {
         pub(crate) action: ChildRunOutputGuardAction,
@@ -615,6 +730,7 @@ mod phase_five_delivery_contracts {
     }
 
     impl ChildRunOutputGuardDecision {
+        /// Auditable JSON form of this guard decision.
         #[must_use]
         pub(crate) fn snapshot_json(&self) -> Value {
             json!({
@@ -626,6 +742,11 @@ mod phase_five_delivery_contracts {
         }
     }
 
+    /// Gates a delegated child run's output before it leaves the daemon.
+    ///
+    /// Checks run most-restrictive first: audit-only surface, then
+    /// sensitivity/approval gating, then the external size budget, then
+    /// channel health. Only output that clears every check is delivered.
     #[must_use]
     pub(crate) fn guard_child_run_output(
         input: ChildRunOutputGuardInput<'_>,
@@ -671,6 +792,17 @@ mod phase_five_delivery_contracts {
     }
 }
 
+/// Applies the delivery policy to one parent/descendant output pair.
+///
+/// Rule precedence, first match wins:
+/// 1. policy mode disabled -> audit only;
+/// 2. an unresolved final-review gate -> hold for review;
+/// 3. successful terminal descendant with descendant preference -> replace
+///    the parent (web chat with suppression enabled) or annotate it;
+/// 4. any other terminal descendant -> annotate, parent stays primary;
+/// 5. otherwise -> deliver the interim parent output.
+///
+/// The full rationale is mirrored into `explain_json` for audit surfaces.
 #[must_use]
 pub(crate) fn arbitrate_delivery(input: DeliveryDecisionInput<'_>) -> DeliveryDecision {
     let policy = input.policy;
@@ -679,6 +811,9 @@ pub(crate) fn arbitrate_delivery(input: DeliveryDecisionInput<'_>) -> DeliveryDe
     let enforcement_enabled = matches!(policy.mode, RuntimePreviewMode::Enabled);
     let review_required_by_policy = policy.contains(DeliveryPolicy::RequireFinalReview)
         && (input.approval_required || input.approval_pending || input.approval_denied);
+    // The gate stays active until at least one approval event resolves it:
+    // approval_events == 0 means review was demanded but nobody decided yet,
+    // so delivery must hold even though nothing is formally "pending".
     let review_gate_active = review_required_by_policy
         && (input.approval_pending || input.approval_denied || input.approval_events == 0);
 
@@ -705,6 +840,10 @@ pub(crate) fn arbitrate_delivery(input: DeliveryDecisionInput<'_>) -> DeliveryDe
         {
             let would_suppress = policy.contains(DeliveryPolicy::SuppressStaleParent)
                 && policy.suppression_limit > 0;
+            // Replacement needs both the policy intent and a surface that can
+            // actually retract the parent message; everywhere else the parent
+            // is annotated so already-delivered text is never contradicted
+            // silently.
             if policy.surface.supports_replacement() && would_suppress {
                 (
                     DeliveryDecisionAction::PreferTerminalDescendant,
@@ -740,6 +879,8 @@ pub(crate) fn arbitrate_delivery(input: DeliveryDecisionInput<'_>) -> DeliveryDe
             )
         };
 
+    // Preview mode reports would_suppress_parent without acting on it; only
+    // the enabled mode actually suppresses.
     let parent_suppressed = enforcement_enabled && would_suppress_parent;
     let explain_json = json!({
         "schema_version": RUNTIME_PREVIEW_SCHEMA_VERSION,
@@ -787,6 +928,7 @@ pub(crate) fn arbitrate_delivery(input: DeliveryDecisionInput<'_>) -> DeliveryDe
     }
 }
 
+/// What kind of in-flight work a progress update describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum DeliveryProgressSourceKind {
@@ -812,6 +954,8 @@ impl DeliveryProgressSourceKind {
     }
 }
 
+/// One observed progress event; the latest update per `(kind, source_id)`
+/// wins during merging.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DeliveryProgressUpdate {
     pub(crate) source_kind: DeliveryProgressSourceKind,
@@ -825,6 +969,7 @@ pub(crate) struct DeliveryProgressUpdate {
 }
 
 impl DeliveryProgressUpdate {
+    /// Progress update for a delegated child run.
     #[must_use]
     pub(crate) fn child_run(
         source_id: impl Into<String>,
@@ -847,6 +992,7 @@ impl DeliveryProgressUpdate {
         }
     }
 
+    /// Progress update for a flow step.
     #[must_use]
     pub(crate) fn flow_step(
         source_id: impl Into<String>,
@@ -869,6 +1015,8 @@ impl DeliveryProgressUpdate {
         }
     }
 
+    /// Progress update for an approval wait; always user-visible and never
+    /// terminal, since the wait resolves through a separate decision event.
     #[must_use]
     pub(crate) fn approval_wait(
         source_id: impl Into<String>,
@@ -902,6 +1050,8 @@ impl DeliveryProgressUpdate {
     }
 }
 
+/// Surface-budgeted progress summary built by
+/// [`merge_delivery_progress_updates`].
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct MergedDeliveryProgress {
     pub(crate) surface: DeliverySurface,
@@ -917,6 +1067,7 @@ pub(crate) struct MergedDeliveryProgress {
 }
 
 impl MergedDeliveryProgress {
+    /// Auditable JSON form of the merged progress view.
     #[must_use]
     pub(crate) fn snapshot_json(&self) -> Value {
         json!({
@@ -939,6 +1090,14 @@ impl MergedDeliveryProgress {
     }
 }
 
+/// Merges raw progress updates into the surface's display budget.
+///
+/// Keeps only the latest update per `(kind, source_id)`, then orders by
+/// [`progress_priority`] (terminal and failure states first, then approval
+/// waits, then user-visible activity) and truncates to the surface's
+/// `max_progress_items`; `hidden_count` reports what was cut. Terminal state
+/// and approval-wait counts are computed before truncation so they reflect
+/// all sources, not just the displayed ones.
 #[must_use]
 pub(crate) fn merge_delivery_progress_updates(
     updates: &[DeliveryProgressUpdate],
@@ -1010,6 +1169,7 @@ pub(crate) fn merge_delivery_progress_updates(
     }
 }
 
+/// JSON summary of a delegation merge-approval state for audit payloads.
 #[must_use]
 pub(crate) fn delivery_review_summary(summary: &DelegationMergeApprovalSummary) -> Value {
     json!({
@@ -1020,6 +1180,8 @@ pub(crate) fn delivery_review_summary(summary: &DelegationMergeApprovalSummary) 
     })
 }
 
+/// Display priority: outcomes (terminal/failed) beat approval waits, which
+/// beat ordinary user-visible activity; visibility breaks severity ties.
 fn progress_priority(update: &DeliveryProgressUpdate) -> (u8, bool) {
     let severity = if update.terminal {
         4
@@ -1045,6 +1207,7 @@ fn progress_title(terminal_state: Option<&str>, approval_wait_count: usize) -> S
     }
 }
 
+/// Truncates to `limit` characters (not bytes), appending `...` when cut.
 fn truncate_preview(value: &str, limit: usize) -> String {
     let mut output = String::with_capacity(limit.min(value.len()));
     for character in value.chars().take(limit) {
@@ -1056,6 +1219,9 @@ fn truncate_preview(value: &str, limit: usize) -> String {
     output
 }
 
+// State labels are stringly here because descendant states arrive from
+// heterogeneous sources (child runs, flow steps); both US/UK cancelled
+// spellings are accepted on purpose.
 fn is_terminal_descendant_state(state: &str) -> bool {
     matches!(state, "done" | "succeeded" | "completed" | "failed" | "cancelled" | "canceled")
 }
