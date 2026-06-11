@@ -137,6 +137,7 @@ pub(crate) const APPROVAL_DENIED_REASON: &str =
     "tool execution denied by explicit client approval response";
 pub(crate) const APPROVAL_DECISION_CACHE_CAPACITY: usize = 1_024;
 pub(crate) const CLOSED_BROWSER_SESSION_LEDGER_CAPACITY: usize = 4_096;
+pub(crate) const RUN_PARAMETER_DELTA_CACHE_CAPACITY: usize = 4_096;
 pub(crate) const MAX_MODEL_TOKEN_TAPE_EVENTS_PER_RUN: usize = 1_024;
 pub(crate) const MAX_CRON_JOB_NAME_BYTES: usize = 128;
 pub(crate) const MAX_CRON_PROMPT_BYTES: usize = 16 * 1024;

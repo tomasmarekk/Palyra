@@ -109,15 +109,12 @@ pub(crate) async fn run_launch_context_path_env(
     runtime_state: &Arc<GatewayRuntimeState>,
     run_id: &str,
 ) -> BTreeMap<String, PathBuf> {
-    let Some(run) =
-        runtime_state.orchestrator_run_status_snapshot(run_id.to_owned()).await.ok().flatten()
+    let Some(parameter_delta_json) = run_launch_parameter_delta_json(runtime_state, run_id).await
     else {
         return BTreeMap::new();
     };
-    let Some(parameter_delta_json) = run.parameter_delta_json.as_deref() else {
-        return BTreeMap::new();
-    };
-    let Ok(parameter_delta) = serde_json::from_str::<RunLaunchParameterDelta>(parameter_delta_json)
+    let Ok(parameter_delta) =
+        serde_json::from_str::<RunLaunchParameterDelta>(parameter_delta_json.as_str())
     else {
         return BTreeMap::new();
     };
@@ -130,19 +127,31 @@ async fn run_launch_context_workspace_roots(
 ) -> RunLaunchWorkspaceRoots {
     // Launch context is optional and best-effort: a missing run, missing
     // parameter delta, or unparseable JSON simply contributes no extra roots.
-    let Some(run) =
-        runtime_state.orchestrator_run_status_snapshot(run_id.to_owned()).await.ok().flatten()
+    let Some(parameter_delta_json) = run_launch_parameter_delta_json(runtime_state, run_id).await
     else {
         return RunLaunchWorkspaceRoots::default();
     };
-    let Some(parameter_delta_json) = run.parameter_delta_json.as_deref() else {
-        return RunLaunchWorkspaceRoots::default();
-    };
-    let Ok(parameter_delta) = serde_json::from_str::<RunLaunchParameterDelta>(parameter_delta_json)
+    let Ok(parameter_delta) =
+        serde_json::from_str::<RunLaunchParameterDelta>(parameter_delta_json.as_str())
     else {
         return RunLaunchWorkspaceRoots::default();
     };
     parameter_delta.cli_context.map(launch_workspace_roots_from_context).unwrap_or_default()
+}
+
+async fn run_launch_parameter_delta_json(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+) -> Option<String> {
+    if let Some(parameter_delta_json) = runtime_state.cached_run_parameter_delta_json(run_id) {
+        return Some(parameter_delta_json);
+    }
+    runtime_state
+        .orchestrator_run_status_snapshot(run_id.to_owned())
+        .await
+        .ok()
+        .flatten()?
+        .parameter_delta_json
 }
 
 fn launch_path_env_from_context(context: RunLaunchCliContext) -> BTreeMap<String, PathBuf> {

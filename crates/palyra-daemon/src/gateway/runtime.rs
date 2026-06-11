@@ -623,10 +623,47 @@ impl ClosedBrowserSessionLedger {
     }
 }
 
+#[derive(Debug, Default)]
+struct RunParameterDeltaCache {
+    entries: HashMap<String, String>,
+    order: VecDeque<String>,
+}
+
+impl RunParameterDeltaCache {
+    fn insert(&mut self, run_id: &str, parameter_delta_json: &str) {
+        let run_id = run_id.trim();
+        let parameter_delta_json = parameter_delta_json.trim();
+        if run_id.is_empty() || parameter_delta_json.is_empty() {
+            return;
+        }
+        if let Some(existing) = self.entries.get_mut(run_id) {
+            *existing = parameter_delta_json.to_owned();
+            return;
+        }
+
+        self.entries.insert(run_id.to_owned(), parameter_delta_json.to_owned());
+        self.order.push_back(run_id.to_owned());
+        while self.entries.len() > RUN_PARAMETER_DELTA_CACHE_CAPACITY {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(oldest.as_str());
+        }
+    }
+
+    fn get(&self, run_id: &str) -> Option<String> {
+        let run_id = run_id.trim();
+        if run_id.is_empty() {
+            return None;
+        }
+        self.entries.get(run_id).cloned()
+    }
+}
+
 /// Daemon-wide gateway state shared (via `Arc`) by every transport surface.
 ///
 /// Owns the journal store and all in-memory runtime state: counters, caches
-/// (memory search, http fetch, tool approvals), run cleanup bookkeeping,
+/// (memory search, http fetch, tool approvals, run launch context), run cleanup bookkeeping,
 /// canvas records, provider leases, the channel router, and the worker fleet.
 /// All mutation goes through interior mutability; methods take `&self` (or
 /// `&Arc<Self>` for the `spawn_blocking` wrappers).
@@ -648,6 +685,7 @@ pub struct GatewayRuntimeState {
     pub(crate) http_fetch_cache: Mutex<HashMap<String, CachedHttpFetchEntry>>,
     recent_context_assembly_traces: Mutex<Vec<Value>>,
     tool_approval_cache: Mutex<ToolApprovalCacheState>,
+    run_parameter_delta_cache: Mutex<RunParameterDeltaCache>,
     run_cleanup_resources: Mutex<HashMap<String, RunCleanupResources>>,
     closed_browser_sessions: Mutex<ClosedBrowserSessionLedger>,
     worker_fleet: RwLock<WorkerFleetManager>,
@@ -1686,6 +1724,7 @@ impl GatewayRuntimeState {
             http_fetch_cache: Mutex::new(HashMap::new()),
             recent_context_assembly_traces: Mutex::new(Vec::new()),
             tool_approval_cache: Mutex::new(ToolApprovalCacheState::default()),
+            run_parameter_delta_cache: Mutex::new(RunParameterDeltaCache::default()),
             run_cleanup_resources: Mutex::new(HashMap::new()),
             closed_browser_sessions: Mutex::new(ClosedBrowserSessionLedger::default()),
             worker_fleet: RwLock::new(WorkerFleetManager::default()),
@@ -1803,6 +1842,39 @@ impl GatewayRuntimeState {
                     "failed to inspect closed browser session marker"
                 );
                 false
+            }
+        }
+    }
+
+    fn remember_run_parameter_delta_json(&self, run_id: &str, parameter_delta_json: Option<&str>) {
+        let Some(parameter_delta_json) = parameter_delta_json else {
+            return;
+        };
+        match self.run_parameter_delta_cache.lock() {
+            Ok(mut cache) => cache.insert(run_id, parameter_delta_json),
+            Err(error) => {
+                warn!(
+                    run_id,
+                    error = %error,
+                    "failed to lock run launch context cache"
+                );
+                error.into_inner().insert(run_id, parameter_delta_json);
+            }
+        }
+    }
+
+    /// Returns the in-process start-time parameter delta for a run, when this
+    /// daemon instance started or replayed it.
+    pub(crate) fn cached_run_parameter_delta_json(&self, run_id: &str) -> Option<String> {
+        match self.run_parameter_delta_cache.lock() {
+            Ok(cache) => cache.get(run_id),
+            Err(error) => {
+                warn!(
+                    run_id,
+                    error = %error,
+                    "failed to read run launch context cache"
+                );
+                error.into_inner().get(run_id)
             }
         }
     }
@@ -4786,11 +4858,14 @@ impl GatewayRuntimeState {
         self: &Arc<Self>,
         request: OrchestratorRunStartRequest,
     ) -> Result<(), Status> {
+        let run_id = request.run_id.clone();
+        let parameter_delta_json = request.parameter_delta_json.clone();
         let state = Arc::clone(self);
         let inserted =
             tokio::task::spawn_blocking(move || state.start_orchestrator_run_blocking(&request))
                 .await
                 .map_err(|_| Status::internal("orchestrator run worker panicked"))??;
+        self.remember_run_parameter_delta_json(run_id.as_str(), parameter_delta_json.as_deref());
         if inserted {
             self.counters.orchestrator_runs_started.fetch_add(1, Ordering::Relaxed);
         }
@@ -9856,6 +9931,7 @@ mod tests {
         select_default_agent_model_profile, validate_memory_item_content_limits,
         GatewayRuntimeState, MemoryRuntimeConfig,
     };
+    use crate::gateway::RUN_PARAMETER_DELTA_CACHE_CAPACITY;
     use crate::journal::{CanvasStatePatchRecord, WorkspaceDocumentRecord, WorkspaceSearchRequest};
     use crate::model_provider::{
         ProviderCapabilitiesSnapshot, ProviderCircuitBreakerSnapshot, ProviderDiscoverySnapshot,
@@ -9916,6 +9992,28 @@ mod tests {
             !status.message().contains("shared_capacity_exhausted"),
             "internal lease reason codes should not leak into user-facing errors"
         );
+    }
+
+    #[test]
+    fn run_parameter_delta_cache_updates_and_evicts_oldest() {
+        let mut cache = super::RunParameterDeltaCache::default();
+
+        cache.insert(" run-1 ", r#"{"cli_context":{"launch_cwd":"/tmp/one"}}"#);
+        cache.insert("run-1", r#"{"cli_context":{"launch_cwd":"/tmp/two"}}"#);
+
+        assert_eq!(
+            cache.get("run-1").as_deref(),
+            Some(r#"{"cli_context":{"launch_cwd":"/tmp/two"}}"#)
+        );
+
+        for index in 2..=(RUN_PARAMETER_DELTA_CACHE_CAPACITY + 1) {
+            cache.insert(format!("run-{index}").as_str(), "{}");
+        }
+
+        assert_eq!(cache.get("run-1"), None);
+        assert_eq!(cache.entries.len(), RUN_PARAMETER_DELTA_CACHE_CAPACITY);
+        let newest_run_id = format!("run-{}", RUN_PARAMETER_DELTA_CACHE_CAPACITY + 1);
+        assert_eq!(cache.get(newest_run_id.as_str()).as_deref(), Some("{}"));
     }
 
     #[test]
