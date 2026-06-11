@@ -1,3 +1,10 @@
+//! Flow coordination: reconciling multi-step flows with their external work.
+//!
+//! The [`FlowCoordinator`] poll loop mirrors background tasks, child orchestrator runs, and
+//! approval decisions into flow step states, applies step timeouts, derives the overall flow
+//! state, and dispatches the next runnable step. It is invoked from the gateway runtime tick and
+//! persists every transition through the journal-backed flow APIs on [`GatewayRuntimeState`].
+
 use std::sync::Arc;
 
 use palyra_common::{
@@ -29,6 +36,8 @@ const DEFAULT_FLOW_RETRY_MAX_ATTEMPTS: u64 = 1;
 const DEFAULT_FLOW_BACKOFF_MS: u64 = 1_000;
 const DEFAULT_BACKGROUND_TASK_BUDGET_TOKENS: u64 = 1_200;
 
+/// Ownership model of a flow: `Managed` flows dispatch their own work, `Mirrored` flows only
+/// track lineage created elsewhere (routines, objectives, webhooks).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum FlowMode {
@@ -37,6 +46,7 @@ pub(crate) enum FlowMode {
 }
 
 impl FlowMode {
+    /// Parses a wire name (trimmed, case-insensitive); returns `None` for unknown values.
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "managed" => Some(Self::Managed),
@@ -45,6 +55,7 @@ impl FlowMode {
         }
     }
 
+    /// Returns the canonical snake_case wire name.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Managed => "managed",
@@ -53,6 +64,7 @@ impl FlowMode {
     }
 }
 
+/// Retry budget serialized into a flow's `retry_policy_json` column.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FlowRetryPolicy {
@@ -68,6 +80,10 @@ impl Default for FlowRetryPolicy {
     }
 }
 
+/// External identifiers a flow step is bound to, serialized into `lineage_json`.
+///
+/// Exactly which ids are set determines how [`FlowCoordinator::sync_external_step`] mirrors
+/// state: background task first, then child run, then approval.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FlowLineage {
@@ -91,6 +107,7 @@ pub(crate) struct FlowLineage {
     pub external_task_id: Option<String>,
 }
 
+/// Human-readable contract description for one flow step adapter, used by console surfaces.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct FlowAdapterContract {
     pub adapter: &'static str,
@@ -99,9 +116,15 @@ pub(crate) struct FlowAdapterContract {
     pub ownership: &'static str,
 }
 
+/// Stateless reconciler for non-terminal flows; all state lives in the journal.
 pub(crate) struct FlowCoordinator;
 
 impl FlowCoordinator {
+    /// Reconciles every non-terminal flow once; no-op when flow orchestration is disabled.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the first [`Status`] returned by the runtime flow APIs.
     #[allow(clippy::result_large_err)]
     pub(crate) async fn poll(runtime: &Arc<GatewayRuntimeState>) -> Result<(), Status> {
         if !flow_runtime_enabled(runtime) {
@@ -134,6 +157,8 @@ impl FlowCoordinator {
             return Ok(());
         };
         let state = FlowState::from_str(bundle.flow.state.as_str());
+        // Paused and cancel-requested flows are operator-owned; the coordinator must not advance
+        // or time out their steps until the operator resumes or the cancel completes.
         if state.is_some_and(FlowState::is_terminal)
             || matches!(state, Some(FlowState::Paused | FlowState::CancelRequested))
         {
@@ -149,6 +174,8 @@ impl FlowCoordinator {
             Self::apply_step_timeout(runtime, step).await?;
         }
 
+        // Each mutation above persisted through the journal, so re-read the bundle before
+        // deriving the flow state; acting on the stale pre-sync rows would undo those updates.
         let Some(updated) = runtime.get_flow_bundle(flow.flow_id.clone(), FLOW_EVENT_LIMIT).await?
         else {
             return Ok(());
@@ -189,6 +216,15 @@ impl FlowCoordinator {
         Ok(())
     }
 
+    /// Mirrors the state of a step's external lineage (background task, child run, or approval)
+    /// into the step record, returning the step state after synchronization.
+    ///
+    /// Returns `Ok(None)` when the lineage target is missing or belongs to a different
+    /// principal/device/channel scope.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Status`] failures from the runtime lookup and update APIs.
     #[allow(clippy::result_large_err)]
     pub(crate) async fn sync_external_step(
         runtime: &Arc<GatewayRuntimeState>,
@@ -206,6 +242,8 @@ impl FlowCoordinator {
             else {
                 return Ok(None);
             };
+            // Lineage ids are stored as plain strings, so ownership is re-checked before trusting
+            // the external record; a scope mismatch must never leak state across principals.
             if !same_flow_scope(
                 flow,
                 task.owner_principal.as_str(),
@@ -228,6 +266,8 @@ impl FlowCoordinator {
                         output_json: Some(output_json),
                         lineage_json: None,
                         not_before_unix_ms: None,
+                        // Double-Option update semantics: outer Some means "write this field",
+                        // inner value is the new content. A task error clears any waiting reason.
                         waiting_reason: task.last_error.as_ref().map(|_| None),
                         last_error: Some(task.last_error.clone()),
                         started_at_unix_ms: Some(task.started_at_unix_ms),
@@ -558,6 +598,7 @@ impl FlowCoordinator {
     }
 }
 
+/// Returns the static adapter contract catalog surfaced to operators.
 pub(crate) fn flow_adapter_contracts() -> Vec<FlowAdapterContract> {
     vec![
         FlowAdapterContract {
@@ -605,6 +646,7 @@ pub(crate) fn flow_adapter_contracts() -> Vec<FlowAdapterContract> {
     ]
 }
 
+/// Folds flow step records into a channel-aware delivery progress summary.
 pub(crate) fn merge_flow_step_progress_for_delivery(
     steps: &[FlowStepRecord],
     channel: Option<&str>,
@@ -646,6 +688,7 @@ fn flow_step_progress_update(step: &FlowStepRecord) -> DeliveryProgressUpdate {
     )
 }
 
+/// Caller-facing parameters for creating a flow; converted by [`build_flow_create_request`].
 pub(crate) struct FlowCreateDescriptor {
     pub(crate) owner_principal: String,
     pub(crate) device_id: String,
@@ -658,6 +701,8 @@ pub(crate) struct FlowCreateDescriptor {
     pub(crate) steps: Vec<FlowStepCreateRequest>,
 }
 
+/// Builds a journal create request for a new pending flow with a fresh ULID and default retry
+/// policy; the descriptor owner is recorded as both flow owner and acting principal.
 pub(crate) fn build_flow_create_request(descriptor: FlowCreateDescriptor) -> FlowCreateRequest {
     let owner_principal = descriptor.owner_principal;
     FlowCreateRequest {
@@ -687,6 +732,12 @@ pub(crate) fn build_flow_create_request(descriptor: FlowCreateDescriptor) -> Flo
     }
 }
 
+/// Builds a pending flow step create request with default retry/backoff and no dependencies.
+///
+/// # Panics
+///
+/// Panics if `lineage` fails to serialize, which cannot happen for [`FlowLineage`]'s
+/// plain-string fields.
 pub(crate) fn build_flow_step(
     step_index: i64,
     adapter: &str,
@@ -724,6 +775,9 @@ fn flow_runtime_enabled(runtime: &GatewayRuntimeState) -> bool {
     !matches!(runtime.config.flow_orchestration.mode, RuntimePreviewMode::Disabled)
 }
 
+// Aggregation precedence (most decisive first): any timed-out step times out the whole flow
+// immediately, while a failed step only fails the flow once every step has settled -- remaining
+// steps may still be retrying or compensating.
 fn derive_flow_state(steps: &[FlowStepRecord]) -> FlowState {
     if steps.is_empty() {
         return FlowState::Succeeded;
@@ -773,6 +827,8 @@ fn derive_flow_state(steps: &[FlowStepRecord]) -> FlowState {
     }
 }
 
+// Outer Option is the update flag for FlowTransitionRequest::current_step_id: None leaves the
+// stored pointer untouched (all steps terminal), Some(Some(id)) points at the first live step.
 fn active_step_id(steps: &[FlowStepRecord]) -> Option<Option<String>> {
     steps.iter().find_map(|step| {
         let state = FlowStepState::from_str(step.state.as_str())?;
@@ -806,6 +862,8 @@ fn next_dispatchable_step(steps: &[FlowStepRecord]) -> Option<&FlowStepRecord> {
 }
 
 fn dependencies_satisfied(steps: &[FlowStepRecord], step: &FlowStepRecord) -> bool {
+    // Malformed dependency JSON degrades to "no dependencies" (fail-open); the field is only
+    // ever written by build_flow_step, which serializes a plain string list.
     let dependencies = serde_json::from_str::<Vec<String>>(step.depends_on_step_ids_json.as_str())
         .unwrap_or_default();
     dependencies.iter().all(|dependency_id| {
@@ -857,6 +915,10 @@ fn same_flow_scope(
         && flow.channel.as_deref() == channel
 }
 
+// AIDEV-NOTE: corrupt lineage_json silently parses as an empty FlowLineage. For managed steps
+// that means dispatch_background_step would see no background_task_id and create a duplicate
+// task instead of reusing the existing one. Surfacing the parse failure requires a behavior
+// change, so the fail-open default is only flagged here.
 fn parse_lineage(step: &FlowStepRecord) -> FlowLineage {
     serde_json::from_str(step.lineage_json.as_str()).unwrap_or_default()
 }

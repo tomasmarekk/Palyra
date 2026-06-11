@@ -1,3 +1,11 @@
+//! Routine definitions, run metadata persistence, and trigger/delivery contracts.
+//!
+//! Owns the JSON-backed [`RoutineRegistry`] under `<state_root>/routines/`, normalization of
+//! routine and run metadata, natural-language schedule parsing, file-watch trigger observation,
+//! and the delivery/approval/wake-gate contracts the cron scheduler and gateway services apply
+//! when dispatching routine runs. Many of the `as_str` values and reason strings here are wire
+//! contract pinned by fixtures and CLI parity tests; do not reword them casually.
+
 use std::{
     collections::BTreeSet,
     fs,
@@ -29,18 +37,32 @@ const ROUTINES_REGISTRY_FILE: &str = "definitions.json";
 const ROUTINE_RUNS_FILE: &str = "run_metadata.json";
 const MAX_ROUTINE_COUNT: usize = 2_048;
 const MAX_ROUTINE_RUN_METADATA_COUNT: usize = 8_192;
+// Hard parse floor for "every ..." phrases. Same value as the auto-enable guard below, but kept
+// as a separate constant on purpose: loosening the parser floor must not silently loosen the
+// approval guard, and vice versa.
 const MIN_EVERY_INTERVAL_MS: u64 = 30 * 1_000;
 /// Recurring routine schedules below this interval require review before they
 /// can be enabled, even when the caller omits an approval policy.
 pub const MIN_AUTO_ENABLE_EVERY_INTERVAL_MS: u64 = 30_000;
+/// Far-future timestamp used as a never-firing `at` schedule placeholder for routines that are
+/// triggered manually or by hooks instead of by the cron clock.
 pub const SHADOW_AT_TIMESTAMP_RFC3339: &str = "2100-01-01T00:00:00Z";
+/// Schema identifier embedded in [`RoutineExportBundle`] payloads.
 pub const ROUTINE_EXPORT_SCHEMA_ID: &str = "palyra.routine.export.v1";
+/// Schema version embedded in [`RoutineExportBundle`] payloads.
 pub const ROUTINE_EXPORT_SCHEMA_VERSION: u32 = 1;
+/// Version of the built-in [`routine_templates`] pack.
 pub const ROUTINE_TEMPLATE_PACK_VERSION: u32 = 1;
+/// An active run whose record has not been updated for this long is treated as lease-expired
+/// and becomes eligible for repair (see [`routine_run_lifecycle_snapshot`]).
 pub const ROUTINE_RUN_LEASE_TTL_MS: i64 = 15 * 60 * 1_000;
+/// Poll interval applied when a file-watch trigger payload omits `poll_interval_ms`.
 pub const DEFAULT_FILE_WATCH_POLL_INTERVAL_MS: u64 = 30 * 1_000;
+/// Lower bound for file-watch polling; faster polling is rejected at validation time.
 pub const MIN_FILE_WATCH_POLL_INTERVAL_MS: u64 = 30 * 1_000;
 
+/// What fires a routine: the cron clock, an internal hook, an inbound webhook, a system event,
+/// a polled file watch, or an explicit manual dispatch.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutineTriggerKind {
@@ -53,6 +75,7 @@ pub enum RoutineTriggerKind {
 }
 
 impl RoutineTriggerKind {
+    /// Returns the canonical snake_case wire name.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -65,6 +88,7 @@ impl RoutineTriggerKind {
         }
     }
 
+    /// Parses a wire name (trimmed, case-insensitive); returns `None` for unknown values.
     pub fn from_str(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "schedule" => Some(Self::Schedule),
@@ -78,6 +102,9 @@ impl RoutineTriggerKind {
     }
 }
 
+/// Whether a routine run reuses the originating session or starts a fresh one.
+///
+/// Fresh-session prompts must be self-contained; see [`validate_routine_prompt_self_contained`].
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutineRunMode {
@@ -87,6 +114,7 @@ pub enum RoutineRunMode {
 }
 
 impl RoutineRunMode {
+    /// Returns the canonical snake_case wire name.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -95,6 +123,7 @@ impl RoutineRunMode {
         }
     }
 
+    /// Parses a wire name (trimmed, case-insensitive); returns `None` for unknown values.
     pub fn from_str(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "same_session" => Some(Self::SameSession),
@@ -104,6 +133,7 @@ impl RoutineRunMode {
     }
 }
 
+/// Tool-access posture for routine runs; `SensitiveTools` opts the run into stricter gating.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutineExecutionPosture {
@@ -113,6 +143,7 @@ pub enum RoutineExecutionPosture {
 }
 
 impl RoutineExecutionPosture {
+    /// Returns the canonical snake_case wire name.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -121,6 +152,7 @@ impl RoutineExecutionPosture {
         }
     }
 
+    /// Parses a wire name (trimmed, case-insensitive); returns `None` for unknown values.
     pub fn from_str(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "standard" => Some(Self::Standard),
@@ -130,6 +162,8 @@ impl RoutineExecutionPosture {
     }
 }
 
+/// Where routine output is announced: the origin channel, an explicit channel, the local
+/// automation session only, or logs/diagnostics only.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutineDeliveryMode {
@@ -140,6 +174,7 @@ pub enum RoutineDeliveryMode {
 }
 
 impl RoutineDeliveryMode {
+    /// Returns the canonical snake_case wire name.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -150,6 +185,7 @@ impl RoutineDeliveryMode {
         }
     }
 
+    /// Parses a wire name (trimmed, case-insensitive); returns `None` for unknown values.
     pub fn from_str(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "same_channel" => Some(Self::SameChannel),
@@ -161,6 +197,8 @@ impl RoutineDeliveryMode {
     }
 }
 
+/// How chatty a routine is: announce everything, announce failures only, or stay silent and
+/// rely on the audit trail.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutineSilentPolicy {
@@ -171,6 +209,7 @@ pub enum RoutineSilentPolicy {
 }
 
 impl RoutineSilentPolicy {
+    /// Returns the canonical snake_case wire name.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -180,6 +219,7 @@ impl RoutineSilentPolicy {
         }
     }
 
+    /// Parses a wire name (trimmed, case-insensitive); returns `None` for unknown values.
     pub fn from_str(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "noisy" => Some(Self::Noisy),
@@ -190,6 +230,8 @@ impl RoutineSilentPolicy {
     }
 }
 
+/// Effective outcome of a routine run; richer than the raw cron status because metadata can
+/// override it (for example no-op successes or throttled runs).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutineRunOutcomeKind {
@@ -203,6 +245,7 @@ pub enum RoutineRunOutcomeKind {
 }
 
 impl RoutineRunOutcomeKind {
+    /// Returns the canonical snake_case wire name.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -217,6 +260,8 @@ impl RoutineRunOutcomeKind {
     }
 }
 
+/// Lease view of a run: `Active` while heartbeating, `Expired` after
+/// [`ROUTINE_RUN_LEASE_TTL_MS`] without progress, `Released` once terminal.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutineRunLeaseState {
@@ -225,6 +270,7 @@ pub enum RoutineRunLeaseState {
     Released,
 }
 
+/// Approval gate of a run as derived from the routine policy and the run's approval note.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutineApprovalGateState {
@@ -234,6 +280,8 @@ pub enum RoutineApprovalGateState {
     Denied,
 }
 
+/// Shape of a run's delivery obligation: a channel announcement, an artifact-only result, a
+/// deliberate silence, or a dead-letter held for operator review.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutineDeliveryContractKind {
@@ -243,6 +291,7 @@ pub enum RoutineDeliveryContractKind {
     OperatorReview,
 }
 
+/// Resolved delivery obligation for one run outcome, built by [`routine_delivery_contract`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RoutineDeliveryContract {
@@ -257,6 +306,7 @@ pub struct RoutineDeliveryContract {
     pub reason: String,
 }
 
+/// Combined lease/approval/terminality view of a run with a machine-readable recovery hint.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RoutineRunLifecycleSnapshot {
@@ -270,10 +320,14 @@ pub struct RoutineRunLifecycleSnapshot {
     pub recovery_hint: String,
 }
 
+/// Contracts for routine preflight steps and the wake gate that decides whether a triggered
+/// routine may actually dispatch. Preflight context is fenced (allow-listed, redacted, bounded)
+/// before it can reach a model or tool.
 #[allow(dead_code)]
 pub(crate) mod routine_preflight_contracts {
     use super::*;
 
+    /// Verdict of one preflight step; anything but `Proceed` blocks dispatch.
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(rename_all = "snake_case")]
     pub(crate) enum RoutinePreflightOutcome {
@@ -285,6 +339,7 @@ pub(crate) mod routine_preflight_contracts {
     }
 
     impl RoutinePreflightOutcome {
+        /// Returns the canonical snake_case wire name.
         #[must_use]
         pub(crate) const fn as_str(self) -> &'static str {
             match self {
@@ -297,6 +352,7 @@ pub(crate) mod routine_preflight_contracts {
         }
     }
 
+    /// Declaration of one preflight tool invocation, validated by [`validate_preflight_step`].
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     pub(crate) struct RoutinePreflightStep {
         pub(crate) step_id: String,
@@ -312,6 +368,7 @@ pub(crate) mod routine_preflight_contracts {
         pub(crate) timeout_ms: u64,
     }
 
+    /// Result a preflight step reports back: outcome, reason, and a context delta to merge.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     pub(crate) struct RoutinePreflightOutput {
         pub(crate) outcome: RoutinePreflightOutcome,
@@ -320,12 +377,15 @@ pub(crate) mod routine_preflight_contracts {
         pub(crate) context_delta: Value,
     }
 
+    /// Accept/reject verdict for a preflight step declaration with a stable reason code.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     pub(crate) struct RoutinePreflightValidation {
         pub(crate) accepted: bool,
         pub(crate) reason: String,
     }
 
+    /// Validates a preflight step declaration fail-closed: empty identifiers, out-of-range
+    /// timeouts, wildcard or empty scopes, and empty capability names are all rejected.
     #[must_use]
     pub(crate) fn validate_preflight_step(
         step: &RoutinePreflightStep,
@@ -348,6 +408,7 @@ pub(crate) mod routine_preflight_contracts {
         RoutinePreflightValidation { accepted: true, reason: "preflight_step_valid".to_owned() }
     }
 
+    /// Allow-list plus size bound applied to preflight context objects.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) struct RoutinePreflightContextFence {
         pub(crate) allowed_keys: BTreeSet<String>,
@@ -355,6 +416,7 @@ pub(crate) mod routine_preflight_contracts {
     }
 
     impl RoutinePreflightContextFence {
+        /// Builds a fence allowing exactly `keys`, each value capped at `max_value_bytes`.
         #[must_use]
         pub(crate) fn allow_keys(keys: &[&str], max_value_bytes: usize) -> Self {
             Self {
@@ -364,6 +426,7 @@ pub(crate) mod routine_preflight_contracts {
         }
     }
 
+    /// Fenced context plus the audit lists of which keys were dropped or redacted.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     pub(crate) struct RoutinePreflightFenceResult {
         pub(crate) context: Value,
@@ -371,6 +434,11 @@ pub(crate) mod routine_preflight_contracts {
         pub(crate) redacted_keys: Vec<String>,
     }
 
+    /// Applies a fence to untrusted preflight context.
+    ///
+    /// Non-object inputs fence to an empty object. Keys outside the allow-list are dropped,
+    /// allow-listed keys with sensitive names are redacted (allow-listing alone must not leak a
+    /// secret), and surviving values are truncated to the fence's byte bound.
     #[must_use]
     pub(crate) fn fence_preflight_context(
         input: &Value,
@@ -403,6 +471,7 @@ pub(crate) mod routine_preflight_contracts {
         RoutinePreflightFenceResult { context: Value::Object(context), dropped_keys, redacted_keys }
     }
 
+    /// Stable reason code for a wake-gate decision.
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(rename_all = "snake_case")]
     pub(crate) enum RoutineWakeGateReason {
@@ -420,6 +489,7 @@ pub(crate) mod routine_preflight_contracts {
     }
 
     impl RoutineWakeGateReason {
+        /// Returns the canonical snake_case wire name.
         #[must_use]
         pub(crate) const fn as_str(self) -> &'static str {
             match self {
@@ -438,6 +508,7 @@ pub(crate) mod routine_preflight_contracts {
         }
     }
 
+    /// Everything the wake gate looks at for one candidate dispatch.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) struct RoutineWakeGateInput {
         pub(crate) enabled: bool,
@@ -450,6 +521,7 @@ pub(crate) mod routine_preflight_contracts {
         pub(crate) now_unix_ms: i64,
     }
 
+    /// Wake-gate verdict with a stable reason and a machine-readable recovery hint.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     pub(crate) struct RoutineWakeGateDecision {
         pub(crate) allowed: bool,
@@ -458,6 +530,7 @@ pub(crate) mod routine_preflight_contracts {
     }
 
     impl RoutineWakeGateDecision {
+        /// Renders the decision as the JSON shape journaled with the dispatch attempt.
         #[must_use]
         pub(crate) fn snapshot_json(&self) -> Value {
             json!({
@@ -468,6 +541,12 @@ pub(crate) mod routine_preflight_contracts {
         }
     }
 
+    /// Decides whether a triggered routine may dispatch.
+    ///
+    /// Checks run in a fixed precedence order that is part of the contract -- disabled routine,
+    /// missing schedule tick, still-active previous run, preflight verdict, provider cooldown,
+    /// channel health, then policy -- so the reported block reason is always the first gate that
+    /// failed, not an arbitrary one.
     #[must_use]
     pub(crate) fn evaluate_routine_wake_gate(
         input: RoutineWakeGateInput,
@@ -550,6 +629,8 @@ pub(crate) mod routine_preflight_contracts {
         RoutineWakeGateDecision { allowed: false, reason, recovery_hint: recovery_hint.to_owned() }
     }
 
+    // Truncates by char count rather than byte count so a multi-byte character is never split;
+    // the bound is therefore approximate (a truncated value can exceed max_value_bytes in bytes).
     fn bounded_json_value(value: &Value, max_value_bytes: usize) -> Value {
         let rendered = value.to_string();
         if rendered.len() <= max_value_bytes {
@@ -564,6 +645,7 @@ pub(crate) mod routine_preflight_contracts {
     }
 }
 
+/// Why a run was dispatched: a normal trigger, an operator test run, or a replay of a prior run.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutineDispatchMode {
@@ -574,6 +656,7 @@ pub enum RoutineDispatchMode {
 }
 
 impl RoutineDispatchMode {
+    /// Returns the canonical snake_case wire name.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -584,6 +667,8 @@ impl RoutineDispatchMode {
     }
 }
 
+/// Execution settings of a routine: session reuse, optional pinned procedure/skill/provider
+/// profiles, and the tool-access posture.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RoutineExecutionConfig {
@@ -611,6 +696,8 @@ impl Default for RoutineExecutionConfig {
     }
 }
 
+/// When operator approval is required: never, before the routine can be enabled, or before its
+/// first run may deliver.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutineApprovalMode {
@@ -620,6 +707,7 @@ pub enum RoutineApprovalMode {
 }
 
 impl RoutineApprovalMode {
+    /// Returns the canonical snake_case wire name.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -629,6 +717,7 @@ impl RoutineApprovalMode {
         }
     }
 
+    /// Parses a wire name (trimmed, case-insensitive); returns `None` for unknown values.
     pub fn from_str(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "none" => Some(Self::None),
@@ -639,6 +728,10 @@ impl RoutineApprovalMode {
     }
 }
 
+/// Delivery settings of a routine, including an optional separate failure target.
+///
+/// `failure_mode`/`failure_channel` fall back to the success target when unset; validation
+/// requires a channel whenever a `SpecificChannel` mode cannot resolve one.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RoutineDeliveryConfig {
@@ -665,6 +758,8 @@ impl Default for RoutineDeliveryConfig {
     }
 }
 
+/// Daily window (minutes of day, 0..=1439) during which a routine stays quiet; the window may
+/// wrap past midnight when `start` is greater than `end`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RoutineQuietHours {
@@ -674,6 +769,8 @@ pub struct RoutineQuietHours {
     pub timezone: Option<String>,
 }
 
+/// Approval policy wrapper; high-frequency schedules may force the mode up to `BeforeEnable`
+/// via [`routine_approval_policy_with_auto_enable_guard`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RoutineApprovalPolicy {
@@ -726,6 +823,8 @@ fn every_interval_ms_from_schedule_payload(schedule_payload_json: &str) -> Optio
     })
 }
 
+/// Persisted routine definition; the routine id matches the backing cron job id for
+/// schedule-triggered routines.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RoutineMetadataRecord {
@@ -747,6 +846,7 @@ pub struct RoutineMetadataRecord {
     pub updated_at_unix_ms: i64,
 }
 
+/// Caller-provided fields for [`RoutineRegistry::upsert_routine`]; normalized before storage.
 #[derive(Debug, Clone)]
 pub struct RoutineMetadataUpsert {
     pub routine_id: String,
@@ -760,6 +860,8 @@ pub struct RoutineMetadataUpsert {
     pub template_id: Option<String>,
 }
 
+/// Persisted per-run metadata that augments the cron run record (trigger context, dispatch
+/// mode, outcome overrides, delivery/approval/safety notes).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RoutineRunMetadataRecord {
@@ -796,6 +898,8 @@ pub struct RoutineRunMetadataRecord {
     pub updated_at_unix_ms: i64,
 }
 
+/// Caller-provided fields for [`RoutineRegistry::upsert_run_metadata`]; normalized before
+/// storage.
 #[derive(Debug, Clone)]
 pub struct RoutineRunMetadataUpsert {
     pub run_id: String,
@@ -817,6 +921,7 @@ pub struct RoutineRunMetadataUpsert {
     pub safety_note: Option<String>,
 }
 
+/// Preview of how a natural-language phrase was parsed into a normalized schedule.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RoutineSchedulePreview {
@@ -831,6 +936,7 @@ pub struct RoutineSchedulePreview {
     pub timezone: String,
 }
 
+/// One observation of a watched path; `signature` hashes the fields that define "changed".
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RoutineFileWatchObservation {
@@ -845,6 +951,7 @@ pub struct RoutineFileWatchObservation {
     pub signature: String,
 }
 
+/// Validated file-watch trigger payload, including the baseline observation polls diff against.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RoutineFileWatchConfig {
@@ -857,6 +964,7 @@ pub struct RoutineFileWatchConfig {
     pub last_observed: Option<RoutineFileWatchObservation>,
 }
 
+/// Detected change on a watched path; `config` carries the advanced baseline to persist.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutineFileWatchChange {
     pub event: String,
@@ -865,6 +973,7 @@ pub struct RoutineFileWatchChange {
     pub current: RoutineFileWatchObservation,
 }
 
+/// Built-in routine template offered by [`routine_templates`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RoutineTemplateDefinition {
@@ -882,6 +991,8 @@ pub struct RoutineTemplateDefinition {
     pub tags: Vec<String>,
 }
 
+/// Portable export of one routine plus its backing cron job, versioned by
+/// [`ROUTINE_EXPORT_SCHEMA_ID`]/[`ROUTINE_EXPORT_SCHEMA_VERSION`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RoutineExportBundle {
@@ -892,6 +1003,7 @@ pub struct RoutineExportBundle {
     pub job: CronJobRecord,
 }
 
+/// Retention bounds for run metadata: a time-to-live and a record-count cap.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoutineRetentionPolicy {
@@ -899,6 +1011,7 @@ pub struct RoutineRetentionPolicy {
     pub max_records: usize,
 }
 
+/// One run metadata record a retention sweep would delete, with its protection status.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RoutineRetentionCandidate {
@@ -908,6 +1021,7 @@ pub struct RoutineRetentionCandidate {
     pub protected_by_active_ref: bool,
 }
 
+/// Result of [`routine_retention_dry_run`]; nothing is deleted, candidates are only reported.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RoutineRetentionDryRun {
@@ -917,6 +1031,8 @@ pub struct RoutineRetentionDryRun {
     pub candidates: Vec<RoutineRetentionCandidate>,
 }
 
+/// Cross-reference report of cron jobs, routine metadata, and run metadata produced by
+/// [`routine_runtime_backfill_plan`].
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RoutineRuntimeBackfillReport {
@@ -968,6 +1084,11 @@ impl RegistryPath {
     }
 }
 
+/// File-backed store for routine definitions and run metadata.
+///
+/// Both documents are held in memory behind mutexes and rewritten wholesale on every mutation,
+/// so the on-disk JSON always mirrors the in-memory state. Lock poisoning is reported as
+/// [`RoutineRegistryError::LockPoisoned`] instead of panicking.
 #[derive(Debug)]
 pub struct RoutineRegistry {
     definitions_path: RegistryPath,
@@ -978,6 +1099,7 @@ pub struct RoutineRegistry {
     run_metadata: Mutex<RoutineRunMetadataDocument>,
 }
 
+/// Errors returned by [`RoutineRegistry`] and the routine helper functions in this module.
 #[derive(Debug, Error)]
 pub enum RoutineRegistryError {
     #[error("routine registry lock poisoned")]
@@ -1015,6 +1137,12 @@ pub enum RoutineRegistryError {
 }
 
 impl RoutineRegistry {
+    /// Opens (or initializes) both registry documents under `<state_root>/routines/`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a read/write/parse variant when a document cannot be prepared, or
+    /// [`RoutineRegistryError::UnsupportedVersion`] for an unknown schema version.
     pub fn open(state_root: &Path) -> Result<Self, RoutineRegistryError> {
         let routines_root = resolve_routines_root(Some(state_root))?;
         let definitions_path = RegistryPath { path: routines_root.join(ROUTINES_REGISTRY_FILE) };
@@ -1033,12 +1161,23 @@ impl RoutineRegistry {
         })
     }
 
+    /// Returns a snapshot of all routine definitions in `routine_id` order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoutineRegistryError::LockPoisoned`] if a previous holder panicked.
     pub fn list_routines(&self) -> Result<Vec<RoutineMetadataRecord>, RoutineRegistryError> {
         let definitions =
             self.definitions.lock().map_err(|_| RoutineRegistryError::LockPoisoned)?;
         Ok(definitions.routines.clone())
     }
 
+    /// Looks up one routine; returns `Ok(None)` when it does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoutineRegistryError::InvalidField`] for a malformed id or
+    /// [`RoutineRegistryError::LockPoisoned`] if a previous holder panicked.
     pub fn get_routine(
         &self,
         routine_id: &str,
@@ -1049,6 +1188,15 @@ impl RoutineRegistry {
         Ok(definitions.routines.iter().find(|entry| entry.routine_id == normalized).cloned())
     }
 
+    /// Normalizes and persists a routine definition; existing routines keep their original
+    /// `created_at_unix_ms`. Returns the record as stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoutineRegistryError::InvalidField`] for validation failures,
+    /// [`RoutineRegistryError::RegistryLimitExceeded`] when inserting beyond the cap,
+    /// [`RoutineRegistryError::LockPoisoned`] if a previous holder panicked, or a write error
+    /// when persisting fails.
     pub fn upsert_routine(
         &self,
         request: RoutineMetadataUpsert,
@@ -1092,6 +1240,13 @@ impl RoutineRegistry {
         Ok(normalized)
     }
 
+    /// Deletes a routine definition; returns `false` when no matching routine existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoutineRegistryError::InvalidField`] for a malformed id,
+    /// [`RoutineRegistryError::LockPoisoned`] if a previous holder panicked, or a write error
+    /// when persisting fails.
     pub fn delete_routine(&self, routine_id: &str) -> Result<bool, RoutineRegistryError> {
         let normalized = normalize_identifier(routine_id, "routine_id")?;
         let mut definitions =
@@ -1110,6 +1265,15 @@ impl RoutineRegistry {
         Ok(deleted)
     }
 
+    /// Reconciles schedule-triggered routine definitions against the current cron job set:
+    /// refreshes payloads for existing jobs, creates default definitions for new jobs, and
+    /// removes schedule routines whose cron job disappeared. Non-schedule routines are never
+    /// touched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoutineRegistryError::LockPoisoned`] if a previous holder panicked, or a
+    /// serialize/write error when persisting fails.
     pub fn sync_schedule_routines(
         &self,
         cron_jobs: &[CronJobRecord],
@@ -1123,6 +1287,8 @@ impl RoutineRegistry {
             if let Some(existing) =
                 definitions.routines.iter_mut().find(|entry| entry.routine_id == job.job_id)
             {
+                // A non-schedule routine that shares an id with a cron job stays authoritative;
+                // only schedule-triggered definitions mirror the cron payload.
                 if existing.trigger_kind != RoutineTriggerKind::Schedule {
                     continue;
                 }
@@ -1157,6 +1323,13 @@ impl RoutineRegistry {
         write_registry_document(&self.definitions_path, &self.definitions_file, &document)
     }
 
+    /// Returns the newest run metadata entries (optionally for one routine) in chronological
+    /// order; `limit` is clamped to the registry capacity and to at least one entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoutineRegistryError::InvalidField`] for a malformed routine id or
+    /// [`RoutineRegistryError::LockPoisoned`] if a previous holder panicked.
     pub fn list_run_metadata(
         &self,
         routine_id: Option<&str>,
@@ -1184,6 +1357,12 @@ impl RoutineRegistry {
         Ok(entries)
     }
 
+    /// Looks up run metadata by run id; returns `Ok(None)` when it does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoutineRegistryError::InvalidField`] for a malformed id or
+    /// [`RoutineRegistryError::LockPoisoned`] if a previous holder panicked.
     pub fn find_run_metadata(
         &self,
         run_id: &str,
@@ -1194,6 +1373,15 @@ impl RoutineRegistry {
         Ok(run_metadata.runs.iter().find(|entry| entry.run_id == normalized).cloned())
     }
 
+    /// Returns whether any retained run of this routine already used `dedupe_key`.
+    ///
+    /// Deduplication only spans the retained metadata window: once old records are evicted by
+    /// the capacity cap, their dedupe keys are forgotten with them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoutineRegistryError::InvalidField`] for malformed inputs or
+    /// [`RoutineRegistryError::LockPoisoned`] if a previous holder panicked.
     pub fn seen_dedupe_key(
         &self,
         routine_id: &str,
@@ -1210,6 +1398,14 @@ impl RoutineRegistry {
         }))
     }
 
+    /// Normalizes and persists run metadata keyed by run id; when the capacity cap is exceeded
+    /// the oldest records are evicted first (FIFO). Returns the record as stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoutineRegistryError::InvalidField`] for validation failures,
+    /// [`RoutineRegistryError::LockPoisoned`] if a previous holder panicked, or a write error
+    /// when persisting fails.
     pub fn upsert_run_metadata(
         &self,
         request: RoutineRunMetadataUpsert,
@@ -1261,6 +1457,13 @@ impl RoutineRegistry {
     }
 }
 
+/// Resolves (and creates if needed) the routines storage directory under the given state root,
+/// falling back to the default state root when `None`.
+///
+/// # Errors
+///
+/// Returns [`RoutineRegistryError::DefaultStateRoot`] when the default root cannot be resolved
+/// or [`RoutineRegistryError::WriteRegistry`] when the directory cannot be created.
 pub fn resolve_routines_root(state_root: Option<&Path>) -> Result<PathBuf, RoutineRegistryError> {
     let root = match state_root {
         Some(path) => path.to_path_buf(),
@@ -1273,11 +1476,23 @@ pub fn resolve_routines_root(state_root: Option<&Path>) -> Result<PathBuf, Routi
     Ok(routines_root)
 }
 
+/// Returns the `at` schedule payload pointing at [`SHADOW_AT_TIMESTAMP_RFC3339`], used as a
+/// never-firing shadow schedule for manually triggered routines.
 #[must_use]
 pub fn shadow_manual_schedule_payload_json() -> String {
     json!({ "timestamp_rfc3339": SHADOW_AT_TIMESTAMP_RFC3339 }).to_string()
 }
 
+/// Validates a raw file-watch trigger payload and takes the initial observation.
+///
+/// With `fire_on_start` the baseline is left empty so the first poll reports an event even for
+/// a pre-existing file; otherwise the current observation becomes the baseline and pre-existing
+/// state does not fire.
+///
+/// # Errors
+///
+/// Returns [`RoutineRegistryError::InvalidField`] when the payload, path, or poll interval is
+/// missing or invalid, or when the path fails the watch-root policy.
 pub fn normalize_file_watch_trigger_payload(
     payload: Option<&Value>,
 ) -> Result<RoutineFileWatchConfig, RoutineRegistryError> {
@@ -1317,6 +1532,12 @@ pub fn normalize_file_watch_trigger_payload(
     })
 }
 
+/// Parses a stored file-watch trigger payload back into its config.
+///
+/// # Errors
+///
+/// Returns [`RoutineRegistryError::InvalidField`] when the JSON does not match
+/// [`RoutineFileWatchConfig`].
 pub fn parse_file_watch_config(
     payload_json: &str,
 ) -> Result<RoutineFileWatchConfig, RoutineRegistryError> {
@@ -1328,16 +1549,26 @@ pub fn parse_file_watch_config(
     })
 }
 
+/// Re-observes the watched path and reports a change when its signature moved from the
+/// baseline; the returned config carries the advanced baseline either way.
+///
+/// # Errors
+///
+/// Returns [`RoutineRegistryError::InvalidField`] when the path can no longer be observed or
+/// fails the watch-root policy.
 pub fn evaluate_file_watch_change(
     mut config: RoutineFileWatchConfig,
 ) -> Result<Option<RoutineFileWatchChange>, RoutineRegistryError> {
     let current = observe_file_watch_path(config.path.as_str())?;
-    let previous = config.last_observed.clone();
+    // take() instead of clone(): last_observed is unconditionally replaced below, so the old
+    // baseline can be moved out as `previous` without copying it.
+    let previous = config.last_observed.take();
     if previous.as_ref().is_some_and(|previous| previous.signature == current.signature) {
         config.last_observed = Some(current);
         return Ok(None);
     }
     let event = match previous.as_ref() {
+        // No baseline means fire_on_start: the very first poll classifies whatever it finds.
         None if current.exists => "created",
         None => "missing",
         Some(previous) if !previous.exists && current.exists => "created",
@@ -1350,6 +1581,14 @@ pub fn evaluate_file_watch_change(
     Ok(Some(RoutineFileWatchChange { event, config, previous, current }))
 }
 
+/// Observes a watched path: validates and resolves it, enforces the watch-root policy, and
+/// captures existence, kind, size, mtime, and a change signature. A missing path is a valid
+/// observation, not an error.
+///
+/// # Errors
+///
+/// Returns [`RoutineRegistryError::InvalidField`] for malformed or policy-rejected paths and
+/// for metadata failures other than not-found.
 pub fn observe_file_watch_path(
     path: &str,
 ) -> Result<RoutineFileWatchObservation, RoutineRegistryError> {
@@ -1455,6 +1694,8 @@ fn parse_absolute_watch_path(path: &str) -> Result<PathBuf, RoutineRegistryError
     Ok(parsed)
 }
 
+// Canonicalizes through the nearest existing ancestor so a watch may target a file that does
+// not exist yet (its later creation is exactly the event being watched for).
 fn resolve_watch_target_path(path: &Path) -> Result<PathBuf, RoutineRegistryError> {
     if path.exists() {
         return fs::canonicalize(path).map_err(|error| RoutineRegistryError::InvalidField {
@@ -1503,6 +1744,9 @@ fn nearest_existing_watch_ancestor(
     Ok((cursor, suffix))
 }
 
+// Fail-closed watch-path policy: protected OS locations are always rejected, and everything
+// else must live under a user-owned root (home/profile/temp). Watch targets come from operator
+// input, so this is the boundary that keeps routines from observing system paths.
 fn ensure_watch_path_allowed(path: &Path) -> Result<(), RoutineRegistryError> {
     if protected_os_path(path) {
         return Err(RoutineRegistryError::InvalidField {
@@ -1577,6 +1821,8 @@ fn path_starts_with(path: &Path, root: &Path) -> bool {
     if path.starts_with(root) {
         return true;
     }
+    // Windows paths compare case-insensitively with normalized separators, because the same
+    // location can be spelled with different casing and slash styles.
     #[cfg(windows)]
     {
         let path = path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
@@ -1606,6 +1852,7 @@ fn display_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
+/// Maps a raw cron run status to the routine outcome used when metadata supplies no override.
 #[must_use]
 pub fn default_outcome_from_cron_status(status: CronRunStatus) -> RoutineRunOutcomeKind {
     match status {
@@ -1617,6 +1864,11 @@ pub fn default_outcome_from_cron_status(status: CronRunStatus) -> RoutineRunOutc
     }
 }
 
+/// Derives the lease/approval/delivery lifecycle view of one run at `now_unix_ms`.
+///
+/// The run's `updated_at_unix_ms` doubles as its heartbeat: an active run that has not been
+/// updated within [`ROUTINE_RUN_LEASE_TTL_MS`] is reported as lease-expired. Delivery is ready
+/// only for terminal runs whose approval gate is satisfied.
 #[must_use]
 pub fn routine_run_lifecycle_snapshot(
     routine_id: &str,
@@ -1663,6 +1915,8 @@ pub fn routine_run_lifecycle_snapshot(
     }
 }
 
+/// Joins a cron run record with its optional routine metadata into the JSON shape served to
+/// console and CLI surfaces; missing metadata falls back to sensible defaults.
 pub fn join_run_metadata(
     routine_id: &str,
     run: &CronRunRecord,
@@ -1694,6 +1948,10 @@ pub fn join_run_metadata(
             .and_then(|entry| entry.approval_note.as_deref())
             .is_some_and(approval_note_requires_operator_review),
     );
+    // AIDEV-NOTE: this join has neither the routine's approval policy nor a real clock, so the
+    // embedded lifecycle uses the default (approval-free) policy and the run's own updated_at as
+    // "now" -- it can therefore never report Pending/Denied approval or an Expired lease. Callers
+    // that need those signals must call routine_run_lifecycle_snapshot with real inputs.
     let lifecycle = routine_run_lifecycle_snapshot(
         routine_id,
         run,
@@ -1754,12 +2012,21 @@ fn effective_run_outcome_kind(
     if status.is_active() {
         return RoutineRunOutcomeKind::Pending;
     }
+    // A stale Pending override on a terminal run is reconciled back to the status-derived
+    // outcome; a terminal run must never present itself as still pending.
     match metadata.and_then(|entry| entry.outcome_override) {
         Some(RoutineRunOutcomeKind::Pending) | None => default_outcome_from_cron_status(status),
         Some(outcome_kind) => outcome_kind,
     }
 }
 
+/// Packages a routine and its cron job into a versioned export bundle stamped with the current
+/// time.
+///
+/// # Errors
+///
+/// Returns [`RoutineRegistryError::InvalidSystemTime`] when the system clock reports a
+/// pre-epoch time.
 pub fn build_routine_export_bundle(
     job: &CronJobRecord,
     routine: &RoutineMetadataRecord,
@@ -1773,6 +2040,11 @@ pub fn build_routine_export_bundle(
     })
 }
 
+/// Checks an imported bundle against the supported schema id and version.
+///
+/// # Errors
+///
+/// Returns [`RoutineRegistryError::InvalidField`] naming the mismatched field.
 pub fn validate_routine_export_bundle(
     bundle: &RoutineExportBundle,
 ) -> Result<(), RoutineRegistryError> {
@@ -1797,6 +2069,8 @@ pub fn validate_routine_export_bundle(
     Ok(())
 }
 
+/// Plans (without applying) which run metadata records a retention sweep would delete under
+/// `policy`; records referenced by `active_run_ids` are reported but protected from deletion.
 #[allow(dead_code)]
 #[must_use]
 pub fn routine_retention_dry_run(
@@ -1805,6 +2079,8 @@ pub fn routine_retention_dry_run(
     policy: RoutineRetentionPolicy,
     now_unix_ms: i64,
 ) -> RoutineRetentionDryRun {
+    // `runs` is stored oldest-first, so the first `overflow_count` entries are the ones the
+    // max_records cap would evict.
     let overflow_count = runs.len().saturating_sub(policy.max_records);
     let mut candidates = Vec::new();
     let mut retained_active_refs = 0usize;
@@ -1830,6 +2106,8 @@ pub fn routine_retention_dry_run(
     RoutineRetentionDryRun { dry_run: true, would_delete_count, retained_active_refs, candidates }
 }
 
+/// Cross-references cron jobs, routine definitions, and run metadata and reports every orphan
+/// in deterministic (sorted) order; this function only plans, it never mutates.
 #[allow(dead_code)]
 #[must_use]
 pub fn routine_runtime_backfill_plan(
@@ -1874,6 +2152,7 @@ pub fn routine_runtime_backfill_plan(
     }
 }
 
+/// Returns the built-in routine template pack (see [`ROUTINE_TEMPLATE_PACK_VERSION`]).
 #[must_use]
 pub fn routine_templates() -> Vec<RoutineTemplateDefinition> {
     vec![
@@ -1950,6 +2229,14 @@ pub fn routine_templates() -> Vec<RoutineTemplateDefinition> {
     ]
 }
 
+/// Parses an English schedule phrase (for example `in 30 minutes`, `every 2h`, `every Monday
+/// at 09:00`, `daily at 9`, or an RFC3339 timestamp) into a normalized schedule preview.
+///
+/// # Errors
+///
+/// Returns [`RoutineRegistryError::InvalidField`] for unsupported phrases, intervals below the
+/// minimum, bounded `for ...` suffixes, and out-of-range times; the message lists supported
+/// shapes.
 pub fn natural_language_schedule_preview(
     phrase: &str,
     timezone_mode: CronTimezoneMode,
@@ -1963,6 +2250,8 @@ pub fn natural_language_schedule_preview(
         });
     }
 
+    // Parser precedence matters: relative ("in ...") before interval ("every ..."), and the
+    // weekly-day form before the generic weekday form, so the most specific match wins.
     if let Some(parsed) = parse_relative_phrase(normalized_phrase, now_unix_ms)? {
         return preview_from_schedule(normalized_phrase, timezone_mode, now_unix_ms, parsed);
     }
@@ -2141,6 +2430,9 @@ fn normalize_quiet_hours(
     }))
 }
 
+// The approval gate is inferred from the free-form operator note. Denial keywords are checked
+// before approval keywords so an ambiguous note ("approved then denied") fails closed, and a
+// note matching neither set stays Pending.
 fn routine_approval_gate_state(
     approval_policy: &RoutineApprovalPolicy,
     metadata: Option<&RoutineRunMetadataRecord>,
@@ -2161,6 +2453,8 @@ fn routine_approval_gate_state(
     }
 }
 
+// A note that already records a decision (approved/denied) needs no review; otherwise pending
+// or review-style wording flags the run for an operator.
 fn approval_note_requires_operator_review(note: &str) -> bool {
     let normalized = note.trim().to_ascii_lowercase();
     if normalized.contains("approved")
@@ -2176,6 +2470,11 @@ fn approval_note_requires_operator_review(note: &str) -> bool {
         || normalized.contains("approval")
 }
 
+/// Resolves the delivery obligation for one run outcome.
+///
+/// Failure-path outcomes use the configured failure target. Pending approvals and unannounced
+/// failures escalate to operator review; only failures that need no review are retryable, and
+/// reviewed failures are dead-lettered instead of retried.
 #[must_use]
 pub fn routine_delivery_contract(
     delivery: &RoutineDeliveryConfig,
@@ -2220,6 +2519,12 @@ pub fn routine_delivery_contract(
     }
 }
 
+/// Rejects empty prompts and, for fresh-session routines, prompts that lean on conversation
+/// context that will not exist when the routine runs ("as above", "resume where you left off").
+///
+/// # Errors
+///
+/// Returns [`RoutineRegistryError::InvalidField`] naming the fragile marker that was found.
 pub fn validate_routine_prompt_self_contained(
     prompt: &str,
     execution: &RoutineExecutionConfig,
@@ -2349,6 +2654,7 @@ fn provider_routing_preview(execution: &RoutineExecutionConfig) -> Value {
     }
 }
 
+/// Renders the success- and failure-path delivery targets of a config as preview JSON.
 pub fn routine_delivery_preview(delivery: &RoutineDeliveryConfig) -> Value {
     let success_target = effective_delivery_target(delivery, false);
     let failure_target = effective_delivery_target(delivery, true);
@@ -2430,6 +2736,7 @@ fn trim_to_option(value: String) -> Option<String> {
 
 fn unix_ms_now() -> Result<i64, RoutineRegistryError> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
+    // Intentional `as` narrowing: epoch milliseconds stay far below i64::MAX for any real clock.
     Ok(now.as_millis() as i64)
 }
 
@@ -2493,6 +2800,10 @@ where
     Ok(parsed)
 }
 
+// AIDEV-NOTE: documents are rewritten in place (set_len(0) + write on the long-lived handle)
+// rather than via temp file + rename. A crash between truncate and sync_all can leave a partial
+// document that fails to parse on the next open (only a fully empty file falls back to the
+// default). Making this atomic is a behavior change, so the hazard is only flagged here.
 fn write_registry_document<T>(
     path: &RegistryPath,
     file: &Mutex<fs::File>,
@@ -2656,6 +2967,9 @@ fn parse_interval_phrase(
     }))
 }
 
+// Splits "every 30 seconds for 2 minutes" into the interval part and the bounded suffix. The
+// suffix keeps its leading "for" on purpose so the rejection message can echo the operator's
+// own phrasing (pinned by tests).
 fn split_bounded_duration_suffix(normalized: &str) -> (&str, Option<&str>) {
     for marker in [" for "] {
         if let Some(index) = normalized.find(marker) {

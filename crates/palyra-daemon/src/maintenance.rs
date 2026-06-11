@@ -1,3 +1,10 @@
+//! Maintenance sweeper registry and operator-facing health reporting.
+//!
+//! Defines the registered maintenance sweepers, derives read-only status snapshots from runtime
+//! counters and subsystem snapshots, and assembles the doctor health graph consumed by console
+//! and CLI surfaces. Nothing in this module mutates state: the sweeps themselves run elsewhere,
+//! and reporting here only projects current evidence plus remediation guidance.
+
 use std::sync::Arc;
 
 use palyra_common::runtime_contracts::{
@@ -16,6 +23,8 @@ const SEVERITY_INFO: &str = "info";
 const SEVERITY_WARNING: &str = "warning";
 const SEVERITY_BLOCKING: &str = "blocking";
 
+/// Static definition of one registered maintenance sweeper: what it cleans, how often, under
+/// which policy gate, and the journal event names its runs emit.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct MaintenanceSweeperDefinition {
     pub(crate) task_id: String,
@@ -31,6 +40,7 @@ pub(crate) struct MaintenanceSweeperDefinition {
     pub(crate) event_names: MaintenanceEventNames,
 }
 
+/// Journal event names for the started/completed/failed phases of one sweeper.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct MaintenanceEventNames {
     pub(crate) started: String,
@@ -38,6 +48,7 @@ pub(crate) struct MaintenanceEventNames {
     pub(crate) failed: String,
 }
 
+/// Immutable catalog of registered sweepers, shared cheaply across request handlers.
 #[derive(Debug, Clone)]
 pub(crate) struct MaintenanceRegistry {
     sweepers: Arc<[MaintenanceSweeperDefinition]>,
@@ -125,10 +136,13 @@ impl Default for MaintenanceRegistry {
 }
 
 impl MaintenanceRegistry {
+    /// Returns every registered sweeper definition.
     pub(crate) fn definitions(&self) -> &[MaintenanceSweeperDefinition] {
         &self.sweepers
     }
 
+    /// Returns the definitions matching the filter's component (case-insensitive); the severity
+    /// filter is applied later, once per-task severities have been computed.
     pub(crate) fn filtered_definitions(
         &self,
         filter: &MaintenanceStatusFilter,
@@ -146,12 +160,14 @@ impl MaintenanceRegistry {
     }
 }
 
+/// Optional component/severity filters for status collection; `None` matches everything.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MaintenanceStatusFilter {
     pub(crate) component: Option<String>,
     pub(crate) severity: Option<String>,
 }
 
+/// Full maintenance status response: summary, per-task statuses, and the realtime contract.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct MaintenanceStatusSnapshot {
     pub(crate) generated_at_unix_ms: i64,
@@ -161,6 +177,7 @@ pub(crate) struct MaintenanceStatusSnapshot {
     pub(crate) event_contract: MaintenanceRealtimeEventContract,
 }
 
+/// Rollup across all reported tasks, including the highest severity seen.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct MaintenanceStatusSummary {
     pub(crate) overall_state: String,
@@ -175,6 +192,8 @@ pub(crate) struct MaintenanceStatusSummary {
     pub(crate) human_summary: String,
 }
 
+/// Point-in-time status of one sweeper: definition fields plus derived state, evidence, and a
+/// human remediation hint.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct MaintenanceTaskStatus {
     pub(crate) task_id: String,
@@ -201,6 +220,7 @@ pub(crate) struct MaintenanceTaskStatus {
     pub(crate) event_names: MaintenanceEventNames,
 }
 
+/// Describes the realtime event stream maintenance runs publish on, so clients can subscribe.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct MaintenanceRealtimeEventContract {
     pub(crate) topic: String,
@@ -209,6 +229,7 @@ pub(crate) struct MaintenanceRealtimeEventContract {
     pub(crate) phases: Vec<String>,
 }
 
+/// Doctor view of subsystem health: nodes, dependency edges, and the degraded critical path.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct DoctorHealthGraphSnapshot {
     pub(crate) generated_at_unix_ms: i64,
@@ -220,6 +241,7 @@ pub(crate) struct DoctorHealthGraphSnapshot {
     pub(crate) edges: Vec<DoctorHealthGraphEdge>,
 }
 
+/// One subsystem node in the doctor health graph, with evidence and remediation guidance.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct DoctorHealthGraphNode {
     pub(crate) node_id: String,
@@ -232,6 +254,7 @@ pub(crate) struct DoctorHealthGraphNode {
     pub(crate) remediation: String,
 }
 
+/// Directed dependency between two health graph nodes (`from` supports `to`).
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct DoctorHealthGraphEdge {
     pub(crate) from: String,
@@ -240,6 +263,7 @@ pub(crate) struct DoctorHealthGraphEdge {
     pub(crate) required: bool,
 }
 
+/// Degraded node entry on the critical path, ordered most severe first.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct DoctorHealthGraphCriticalPathEntry {
     pub(crate) node_id: String,
@@ -249,6 +273,14 @@ pub(crate) struct DoctorHealthGraphCriticalPathEntry {
     pub(crate) remediation: String,
 }
 
+/// Builds the maintenance status snapshot for the registered sweepers matching `filter`.
+///
+/// Tasks are sorted most-severe-first, then by component and task id, so operators always see
+/// the most urgent work at the top.
+///
+/// # Errors
+///
+/// Propagates [`tonic::Status`] failures from the runtime snapshot queries.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn collect_maintenance_status(
     state: &AppState,
@@ -331,6 +363,11 @@ pub(crate) async fn collect_maintenance_status(
     })
 }
 
+/// Assembles the doctor health graph from live subsystem snapshots plus the maintenance status.
+///
+/// # Errors
+///
+/// Propagates [`tonic::Status`] failures from the underlying runtime and maintenance queries.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn collect_doctor_health_graph(
     state: &AppState,
@@ -430,6 +467,10 @@ pub(crate) async fn collect_doctor_health_graph(
     })
 }
 
+/// Publishes a maintenance event on the internal system topic.
+///
+/// Best effort by design: a poisoned router lock is recovered and publish failures are ignored,
+/// because realtime fan-out must never block or fail a maintenance run.
 pub(crate) fn publish_maintenance_realtime_event(
     state: &AppState,
     owner_principal: Option<String>,
@@ -787,6 +828,8 @@ fn default_registered_status(
     )
 }
 
+// Builder for one task status row. Most callers pass next_run_at_unix_ms as a display-only
+// projection (now + interval); only memory_retention reports a persisted schedule.
 #[allow(clippy::too_many_arguments)]
 fn task_status(
     definition: MaintenanceSweeperDefinition,
@@ -904,6 +947,9 @@ fn load_plugin_health() -> PluginHealthSnapshot {
             }
         }
     };
+    // A binding counts as healthy only when it is enabled AND passes the typed-contract,
+    // config-validation, discovery, and capability-drift checks; disabled bindings therefore
+    // also surface in the stale-bindings review queue.
     let unhealthy_bindings = index
         .entries
         .iter()
@@ -943,6 +989,8 @@ fn load_plugin_health() -> PluginHealthSnapshot {
     }
 }
 
+// Saturating usize -> u64 conversion; the guard only matters on hypothetical targets where
+// usize is wider than 64 bits, everywhere else the `as` cast is lossless.
 const fn usize_to_u64(value: usize) -> u64 {
     if value > u64::MAX as usize {
         u64::MAX

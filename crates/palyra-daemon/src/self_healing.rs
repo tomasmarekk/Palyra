@@ -1,3 +1,11 @@
+//! Self-healing incident tracking and the background remediation loop.
+//!
+//! [`SelfHealingState`] keeps deduplicated runtime incidents, remediation attempts, and work
+//! heartbeats in memory. [`spawn_self_healing_loop`] periodically inspects watchdog heartbeats,
+//! stale approvals, the browser daemon, and installed skill artifacts. Per-feature modes come
+//! from the `PALYRA_HEALING_*` env vars (default observe-only): low-risk fixes may auto-execute,
+//! everything else only records a remediation proposal for the operator.
+
 use std::{
     collections::{BTreeMap, HashMap},
     env, fs,
@@ -12,16 +20,16 @@ use tonic::Request as TonicRequest;
 use tracing::warn;
 
 use crate::{
-    app::state::{AppState, ConsoleSession},
-    apply_browser_service_auth, browser_v1, build_console_browser_client, common_v1,
-    gateway::GatewayRuntimeState,
-    journal::SkillExecutionStatus,
+    app::state::AppState, apply_browser_service_auth, browser_v1, build_console_browser_client,
+    common_v1, gateway::GatewayRuntimeState, journal::SkillExecutionStatus,
     load_installed_skills_index, managed_skill_artifact_path, resolve_skills_root,
 };
 
 const INCIDENT_HISTORY_LIMIT: usize = 128;
 const REMEDIATION_HISTORY_LIMIT: usize = 128;
 const HEALING_LOOP_INTERVAL: Duration = Duration::from_secs(15);
+// Escalation thresholds: active work whose heartbeat stalls for 2 minutes is treated as stuck,
+// while pending approvals get a 10 minute review window because a human is expected in the loop.
 const RUN_HEARTBEAT_STUCK_AFTER_MS: i64 = 120_000;
 const BACKGROUND_TASK_STUCK_AFTER_MS: i64 = 120_000;
 const APPROVAL_STUCK_AFTER_MS: i64 = 600_000;
@@ -32,6 +40,7 @@ const HEALING_BROWSER_MODE_ENV: &str = "PALYRA_HEALING_BROWSER_MODE";
 const HEALING_ARTIFACT_MODE_ENV: &str = "PALYRA_HEALING_ARTIFACT_MODE";
 const HEALING_APPROVALS_MODE_ENV: &str = "PALYRA_HEALING_APPROVALS_MODE";
 
+/// Subsystem an incident belongs to; part of the incident dedupe identity.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum IncidentDomain {
@@ -41,6 +50,7 @@ pub(crate) enum IncidentDomain {
     Approval,
 }
 
+/// Incident severity; `Ord` follows declaration order so `Critical` compares highest.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum IncidentSeverity {
@@ -50,6 +60,7 @@ pub(crate) enum IncidentSeverity {
     Critical,
 }
 
+/// Incident lifecycle; re-observing a resolved incident reopens it under the same id.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum IncidentState {
@@ -58,6 +69,7 @@ pub(crate) enum IncidentState {
     Resolved,
 }
 
+/// How risky executing a remediation is, shown to operators before they approve it.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RemediationRiskLevel {
@@ -66,6 +78,7 @@ pub(crate) enum RemediationRiskLevel {
     High,
 }
 
+/// Scope a remediation can affect, from a single session up to the whole daemon.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RemediationBlastRadius {
@@ -74,6 +87,7 @@ pub(crate) enum RemediationBlastRadius {
     Global,
 }
 
+/// Operating mode for self-healing: detection off, detect-and-report, or detect-and-fix.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SelfHealingMode {
@@ -83,6 +97,7 @@ pub(crate) enum SelfHealingMode {
 }
 
 impl SelfHealingMode {
+    // Unknown or empty env values fall back to the given default instead of failing startup.
     fn from_env_value(value: Option<String>, default: Self) -> Self {
         match value.as_deref().map(str::trim).filter(|candidate| !candidate.is_empty()) {
             Some("disabled") => Self::Disabled,
@@ -93,6 +108,7 @@ impl SelfHealingMode {
     }
 }
 
+/// Independently configurable self-healing feature areas.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SelfHealingFeature {
@@ -102,6 +118,7 @@ pub(crate) enum SelfHealingFeature {
     Approval,
 }
 
+/// Outcome of one remediation attempt; `Skipped` records why auto-execution did not happen.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RemediationAttemptStatus {
@@ -111,6 +128,7 @@ pub(crate) enum RemediationAttemptStatus {
     Skipped,
 }
 
+/// Kind of tracked work behind a heartbeat; part of the heartbeat key.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum WorkHeartbeatKind {
@@ -119,6 +137,7 @@ pub(crate) enum WorkHeartbeatKind {
     Approval,
 }
 
+/// Proposed fix attached to an incident, including the approval/auto-execution policy flags.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RuntimeRemediationDescriptor {
     pub remediation_id: String,
@@ -130,6 +149,10 @@ pub(crate) struct RuntimeRemediationDescriptor {
     pub auto_executable: bool,
 }
 
+/// Current state of one deduplicated incident.
+///
+/// The id is derived from `(domain, dedupe_key)`, so repeated observations of the same problem
+/// update this record in place rather than creating new incidents.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RuntimeIncidentRecord {
     pub incident_id: String,
@@ -145,6 +168,7 @@ pub(crate) struct RuntimeIncidentRecord {
     pub remediation: Option<RuntimeRemediationDescriptor>,
 }
 
+/// Append-only audit entry recorded for every incident observation or resolution.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RuntimeIncidentHistoryEntry {
     pub incident_id: String,
@@ -154,6 +178,7 @@ pub(crate) struct RuntimeIncidentHistoryEntry {
     pub recorded_at_unix_ms: i64,
 }
 
+/// Audit record of one planned, executed, failed, or skipped remediation attempt.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RuntimeRemediationAttemptRecord {
     pub attempt_id: String,
@@ -165,6 +190,7 @@ pub(crate) struct RuntimeRemediationAttemptRecord {
     pub recorded_at_unix_ms: i64,
 }
 
+/// Last reported liveness signal for a tracked unit of work.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct WorkHeartbeatRecord {
     pub heartbeat_key: String,
@@ -174,18 +200,21 @@ pub(crate) struct WorkHeartbeatRecord {
     pub updated_at_unix_ms: i64,
 }
 
+/// Effective mode of one feature area, as exposed to status surfaces.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct SelfHealingFeatureSettingSnapshot {
     pub feature: SelfHealingFeature,
     pub mode: SelfHealingMode,
 }
 
+/// Snapshot of the global mode plus all per-feature overrides.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct SelfHealingSettingsSnapshot {
     pub mode: SelfHealingMode,
     pub features: Vec<SelfHealingFeatureSettingSnapshot>,
 }
 
+/// Aggregated incident counts by state, domain, and severity.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RuntimeIncidentSummary {
     pub active: usize,
@@ -195,6 +224,8 @@ pub(crate) struct RuntimeIncidentSummary {
     pub by_severity: BTreeMap<String, usize>,
 }
 
+/// Input for [`SelfHealingState::observe_incident`]; `dedupe_key` defines incident identity
+/// within its domain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RuntimeIncidentObservation {
     pub domain: IncidentDomain,
@@ -205,6 +236,7 @@ pub(crate) struct RuntimeIncidentObservation {
     pub remediation: Option<RuntimeRemediationDescriptor>,
 }
 
+/// Input for [`SelfHealingState::record_heartbeat`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorkHeartbeatUpdate {
     pub kind: WorkHeartbeatKind,
@@ -230,6 +262,11 @@ struct SelfHealingStateInner {
     heartbeats: HashMap<String, WorkHeartbeatRecord>,
 }
 
+/// In-memory self-healing store: settings are read at construction, mutable state (incidents,
+/// history, heartbeats) lives behind one mutex. Nothing here is persisted across restarts.
+///
+/// All accessor and mutator methods panic if the inner mutex is poisoned, since a panic while
+/// holding the lock would already indicate a daemon bug.
 #[derive(Debug)]
 pub(crate) struct SelfHealingState {
     settings: SelfHealingSettings,
@@ -243,6 +280,8 @@ impl Default for SelfHealingState {
 }
 
 impl SelfHealingState {
+    /// Builds the state with modes resolved from `PALYRA_HEALING_*` env vars; the global mode
+    /// (default observe-only) is the fallback for every per-feature override.
     #[must_use]
     pub(crate) fn new() -> Self {
         let global_mode = SelfHealingMode::from_env_value(
@@ -271,6 +310,7 @@ impl SelfHealingState {
         Self { settings, inner: Mutex::new(SelfHealingStateInner::default()) }
     }
 
+    /// Returns the effective global and per-feature modes.
     #[must_use]
     pub(crate) fn settings_snapshot(&self) -> SelfHealingSettingsSnapshot {
         SelfHealingSettingsSnapshot {
@@ -296,6 +336,7 @@ impl SelfHealingState {
         }
     }
 
+    /// Returns the effective mode for one feature area.
     #[must_use]
     pub(crate) fn mode_for_feature(&self, feature: SelfHealingFeature) -> SelfHealingMode {
         match feature {
@@ -306,12 +347,22 @@ impl SelfHealingState {
         }
     }
 
+    /// Aggregates all known incidents into per-state/domain/severity counts.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the self-healing mutex is poisoned.
     #[must_use]
     pub(crate) fn incident_summary(&self) -> RuntimeIncidentSummary {
         let inner = self.inner.lock().expect("self-healing mutex poisoned");
         build_incident_summary(inner.incidents.values())
     }
 
+    /// Returns up to `limit` unresolved incidents, most recently updated first.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the self-healing mutex is poisoned.
     #[must_use]
     pub(crate) fn active_incidents(&self, limit: usize) -> Vec<RuntimeIncidentRecord> {
         let mut incidents = self
@@ -328,6 +379,11 @@ impl SelfHealingState {
         incidents
     }
 
+    /// Returns up to `limit` incident history entries, newest first.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the self-healing mutex is poisoned.
     #[must_use]
     pub(crate) fn recent_incident_history(&self, limit: usize) -> Vec<RuntimeIncidentHistoryEntry> {
         let mut entries =
@@ -337,6 +393,11 @@ impl SelfHealingState {
         entries
     }
 
+    /// Returns up to `limit` remediation attempts, newest first.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the self-healing mutex is poisoned.
     #[must_use]
     pub(crate) fn recent_remediation_attempts(
         &self,
@@ -349,6 +410,11 @@ impl SelfHealingState {
         entries
     }
 
+    /// Returns all tracked heartbeats, most recently updated first.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the self-healing mutex is poisoned.
     #[must_use]
     pub(crate) fn list_heartbeats(&self) -> Vec<WorkHeartbeatRecord> {
         let mut heartbeats = self
@@ -363,6 +429,11 @@ impl SelfHealingState {
         heartbeats
     }
 
+    /// Records (or refreshes) the liveness heartbeat for one unit of work.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the self-healing mutex is poisoned.
     pub(crate) fn record_heartbeat(&self, update: WorkHeartbeatUpdate) {
         let mut inner = self.inner.lock().expect("self-healing mutex poisoned");
         let heartbeat_key = heartbeat_key(update.kind, update.object_id.as_str());
@@ -378,6 +449,12 @@ impl SelfHealingState {
         );
     }
 
+    /// Removes a heartbeat once its work finished and resolves any stuck-watchdog incident that
+    /// was opened for it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the self-healing mutex is poisoned.
     pub(crate) fn clear_heartbeat(&self, kind: WorkHeartbeatKind, object_id: &str) {
         let mut inner = self.inner.lock().expect("self-healing mutex poisoned");
         let Some(heartbeat) = inner.heartbeats.remove(heartbeat_key(kind, object_id).as_str())
@@ -392,6 +469,15 @@ impl SelfHealingState {
         );
     }
 
+    /// Upserts an incident keyed by `(domain, dedupe_key)` and returns the stored record.
+    ///
+    /// Re-observing refreshes severity, summary, detail, and remediation while preserving
+    /// `created_at_unix_ms`; a previously resolved incident is reopened under the same id so the
+    /// history stays attached to one identity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the self-healing mutex is poisoned.
     #[must_use]
     pub(crate) fn observe_incident(
         &self,
@@ -438,11 +524,22 @@ impl SelfHealingState {
         record
     }
 
+    /// Marks the incident identified by `(domain, dedupe_key)` resolved; no-op when the incident
+    /// is unknown or already resolved.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the self-healing mutex is poisoned.
     pub(crate) fn resolve_incident(&self, domain: IncidentDomain, dedupe_key: &str, summary: &str) {
         let mut inner = self.inner.lock().expect("self-healing mutex poisoned");
         resolve_incident_locked(&mut inner, domain, dedupe_key, summary);
     }
 
+    /// Appends a remediation attempt to the capped audit history and returns the record.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the self-healing mutex is poisoned.
     pub(crate) fn record_remediation_attempt(
         &self,
         incident_id: &str,
@@ -503,9 +600,13 @@ fn resolve_incident_locked(
     );
 }
 
+/// Spawns the periodic self-healing loop; it runs until the daemon shuts down and logs (rather
+/// than propagates) cycle failures so one bad cycle never kills the watchdog.
 pub(crate) fn spawn_self_healing_loop(state: AppState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = interval(HEALING_LOOP_INTERVAL);
+        // Delay instead of bursting after a stall (for example host suspend); back-to-back
+        // healing cycles would only re-observe the same incidents.
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
@@ -516,6 +617,10 @@ pub(crate) fn spawn_self_healing_loop(state: AppState) -> tokio::task::JoinHandl
     })
 }
 
+// AIDEV-NOTE: the `?` chain means an early evaluator error skips the later ones for that cycle;
+// in particular a browser connect failure (see evaluate_browser_runtime) suppresses the skill
+// artifact checks until the next tick. Evaluating each area independently would be a behavior
+// change, so the coupling is only flagged here.
 async fn run_self_healing_cycle(state: &AppState) -> Result<(), String> {
     evaluate_watchdog_runtime(state).await?;
     evaluate_pending_approvals(state).await?;
@@ -539,11 +644,9 @@ async fn evaluate_watchdog_runtime(state: &AppState) -> Result<(), String> {
                     .orchestrator_run_status_snapshot(heartbeat.object_id.clone())
                     .await
                     .map_err(|error| format!("failed to load run heartbeat state: {error}"))?;
-                if snapshot
-                    .as_ref()
-                    .map(|run| is_terminal_run_state(run.state.as_str()))
-                    .unwrap_or(true)
-                {
+                // A missing snapshot is treated like terminal work: the heartbeat is cleared so
+                // deleted runs cannot keep a stuck-watchdog incident alive forever.
+                if snapshot.as_ref().is_none_or(|run| is_terminal_run_state(run.state.as_str())) {
                     state.runtime.clear_self_healing_heartbeat(
                         WorkHeartbeatKind::Run,
                         heartbeat.object_id.as_str(),
@@ -571,10 +674,7 @@ async fn evaluate_watchdog_runtime(state: &AppState) -> Result<(), String> {
                     .map_err(|error| {
                         format!("failed to load background task heartbeat state: {error}")
                     })?;
-                if snapshot
-                    .as_ref()
-                    .map(|task| is_terminal_task_state(task.state.as_str()))
-                    .unwrap_or(true)
+                if snapshot.as_ref().is_none_or(|task| is_terminal_task_state(task.state.as_str()))
                 {
                     state.runtime.clear_self_healing_heartbeat(
                         WorkHeartbeatKind::BackgroundTask,
@@ -595,6 +695,8 @@ async fn evaluate_watchdog_runtime(state: &AppState) -> Result<(), String> {
                     build_background_task_watchdog_remediation(),
                 );
             }
+            // Approvals are aged by evaluate_pending_approvals against the approval records
+            // themselves, so their heartbeats carry no extra signal here.
             WorkHeartbeatKind::Approval => {}
         }
     }
@@ -700,6 +802,10 @@ async fn evaluate_browser_runtime(state: &AppState) -> Result<(), String> {
         return Ok(());
     }
 
+    // AIDEV-NOTE: a connect failure here returns Err without opening a Browser incident, so a
+    // fully unreachable browserd is only visible as a warn log (and it also skips the skill
+    // checks for the cycle, see run_self_healing_cycle). Only an established client whose health
+    // RPC fails produces an incident. Changing that is a behavior change; flagged only.
     let mut client = build_console_browser_client(state).await.map_err(|response| {
         format!("browser service connect failed with http {}", response.status())
     })?;
@@ -764,6 +870,8 @@ fn prune_expired_relay_tokens(state: &AppState) {
         return;
     }
 
+    // The incident is opened, marked remediated, and resolved in one pass on purpose: pruning is
+    // immediate, but the observe/attempt/resolve sequence leaves a complete audit trail.
     let incident = state.runtime.observe_self_healing_incident(RuntimeIncidentObservation {
         domain: IncidentDomain::Browser,
         severity: IncidentSeverity::Low,
@@ -911,6 +1019,8 @@ async fn heal_missing_active_profiles(state: &AppState) -> Result<(), String> {
     Ok(())
 }
 
+// Matches the browserd error for profile persistence that is switched off by configuration
+// (missing state encryption key). That setup is deliberate, so it must not raise incidents.
 fn browser_profiles_intentionally_unavailable(message: &str) -> bool {
     let normalized = message.to_ascii_lowercase();
     normalized.contains("browser profiles require")
@@ -972,7 +1082,7 @@ async fn evaluate_skill_runtime(state: &AppState) -> Result<(), String> {
         let status_dedupe_key = format!("skill_status:{}@{}", entry.skill_id, entry.version);
         match status.as_ref().map(|record| record.status) {
             Some(SkillExecutionStatus::Quarantined) | Some(SkillExecutionStatus::Disabled) => {
-                let record = status.expect("status just matched");
+                let record = status.expect("match arm guarantees skill status is Some");
                 let _ = state.runtime.observe_self_healing_incident(RuntimeIncidentObservation {
                     domain: IncidentDomain::Artifact,
                     severity: IncidentSeverity::Medium,
@@ -1006,6 +1116,8 @@ async fn evaluate_skill_runtime(state: &AppState) -> Result<(), String> {
     Ok(())
 }
 
+// Degrades to 0 when the clock reports a pre-epoch time instead of failing: a wrong timestamp
+// only skews incident ages, while an error here would take down the healing loop.
 fn current_unix_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1018,6 +1130,8 @@ fn incident_index_key(domain: IncidentDomain, dedupe_key: &str) -> String {
     format!("{domain:?}:{dedupe_key}")
 }
 
+// Derives ids from content rather than randomness so the same incident identity hashes to the
+// same id across daemon restarts (the in-memory store itself does not survive a restart).
 fn stable_sha256_id(prefix: &str, payload: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(prefix.as_bytes());
@@ -1063,15 +1177,13 @@ fn build_background_task_watchdog_remediation() -> RuntimeRemediationDescriptor 
 }
 
 fn collect_browser_principals(state: &AppState) -> Vec<String> {
-    let sessions = state
+    let mut principals = state
         .console_sessions
         .lock()
         .expect("console session mutex poisoned")
         .values()
-        .cloned()
-        .collect::<Vec<ConsoleSession>>();
-    let mut principals =
-        sessions.into_iter().map(|session| session.context.principal).collect::<Vec<_>>();
+        .map(|session| session.context.principal.clone())
+        .collect::<Vec<_>>();
     principals.sort();
     principals.dedup();
     principals

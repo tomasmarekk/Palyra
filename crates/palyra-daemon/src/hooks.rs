@@ -1,3 +1,10 @@
+//! Hook binding registry and wasm-plugin hook dispatch.
+//!
+//! Persists hook-to-plugin bindings under `<state_root>/hooks/`, polls the journal for
+//! hook-worthy events, executes the bound wasm plugins, and resolves run-lifecycle decisions
+//! (continue, annotate, request approval, block, transform preview, fail). A terminal lifecycle
+//! resolution is surfaced as a dispatch error so the calling run path stops fail-closed.
+
 use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -38,6 +45,7 @@ const LIFECYCLE_HOOK_EXIT_BLOCK: i64 = 30;
 const LIFECYCLE_HOOK_EXIT_TRANSFORM_PREVIEW: i64 = 40;
 const LIFECYCLE_HOOK_EXIT_FAIL_RUN: i64 = 50;
 
+/// On-disk index of all hook bindings; entries are kept sorted by `hook_id`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct HookBindingsIndex {
@@ -57,6 +65,7 @@ impl Default for HookBindingsIndex {
     }
 }
 
+/// One persisted binding from a hook event to a plugin, plus operator bookkeeping.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct HookBindingRecord {
@@ -70,6 +79,7 @@ pub(crate) struct HookBindingRecord {
     pub(crate) updated_at_unix_ms: i64,
 }
 
+/// Free-form operator annotations attached to a hook binding; all fields are optional.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct HookOperatorMetadata {
@@ -83,6 +93,7 @@ pub(crate) struct HookOperatorMetadata {
     pub(crate) updated_by: Option<String>,
 }
 
+/// Caller-provided fields for creating or replacing a hook binding; normalized before storage.
 #[derive(Debug, Clone)]
 pub(crate) struct HookBindingUpsert {
     pub(crate) hook_id: String,
@@ -92,6 +103,8 @@ pub(crate) struct HookBindingUpsert {
     pub(crate) operator: HookOperatorMetadata,
 }
 
+/// Canonical hook event names: gateway/skill events plus the run-lifecycle phases re-exported
+/// from [`RunLifecycleHookPhase`].
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum HookEventKind {
     GatewayStartup,
@@ -106,6 +119,7 @@ pub(crate) enum HookEventKind {
 }
 
 impl HookEventKind {
+    /// Returns the canonical `scope:event` wire name.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::GatewayStartup => "gateway:startup",
@@ -121,6 +135,7 @@ impl HookEventKind {
     }
 }
 
+/// Result of executing one hook binding during [`dispatch_named_event`].
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct HookDispatchOutcome {
@@ -131,6 +146,11 @@ pub(crate) struct HookDispatchOutcome {
     pub(crate) output_json: Value,
 }
 
+/// Resolves the hooks storage root as a sibling of the plugins root.
+///
+/// # Errors
+///
+/// Fails when the plugins root itself cannot be resolved.
 pub(crate) fn resolve_hooks_root() -> Result<PathBuf> {
     let plugins_root = resolve_plugins_root()?;
     let state_root =
@@ -138,10 +158,16 @@ pub(crate) fn resolve_hooks_root() -> Result<PathBuf> {
     Ok(state_root.join("hooks"))
 }
 
+/// Returns the path of the bindings index file inside `hooks_root`.
 pub(crate) fn hook_bindings_index_path(hooks_root: &FsPath) -> PathBuf {
     hooks_root.join(HOOK_BINDINGS_INDEX_FILE_NAME)
 }
 
+/// Loads the bindings index, migrating legacy layouts; a missing file yields an empty index.
+///
+/// # Errors
+///
+/// Fails when the index file exists but cannot be read or parsed.
 pub(crate) fn load_hook_bindings_index(hooks_root: &FsPath) -> Result<HookBindingsIndex> {
     let path = hook_bindings_index_path(hooks_root);
     if !path.exists() {
@@ -159,6 +185,12 @@ pub(crate) fn load_hook_bindings_index(hooks_root: &FsPath) -> Result<HookBindin
     Ok(index)
 }
 
+/// Persists the bindings index, re-stamping schema version and update time and re-sorting
+/// entries so the on-disk order stays deterministic.
+///
+/// # Errors
+///
+/// Fails when the hooks root cannot be created or the index cannot be serialized or written.
 pub(crate) fn save_hook_bindings_index(
     hooks_root: &FsPath,
     index: &HookBindingsIndex,
@@ -176,6 +208,11 @@ pub(crate) fn save_hook_bindings_index(
         .with_context(|| format!("failed to write hook bindings index {}", path.display()))
 }
 
+/// Looks up one binding by normalized hook id.
+///
+/// # Errors
+///
+/// Fails when `hook_id` is malformed or no binding with that id exists.
 pub(crate) fn hook_binding(index: &HookBindingsIndex, hook_id: &str) -> Result<HookBindingRecord> {
     let hook_id = normalize_hook_identifier(hook_id, "hook_id")?;
     index
@@ -186,6 +223,7 @@ pub(crate) fn hook_binding(index: &HookBindingsIndex, hook_id: &str) -> Result<H
         .ok_or_else(|| anyhow!("hook binding not found: {hook_id}"))
 }
 
+/// Returns all bindings (enabled or not) that target `plugin_id`.
 pub(crate) fn hooks_for_plugin(
     index: &HookBindingsIndex,
     plugin_id: &str,
@@ -193,6 +231,12 @@ pub(crate) fn hooks_for_plugin(
     index.entries.iter().filter(|entry| entry.plugin_id == plugin_id).cloned().collect()
 }
 
+/// Validates and normalizes an upsert into a storable record, preserving the original
+/// `created_at_unix_ms` when replacing an existing binding.
+///
+/// # Errors
+///
+/// Fails when the hook id, event name, or plugin id does not normalize.
 pub(crate) fn normalize_hook_binding_upsert(
     request: HookBindingUpsert,
     now_unix_ms: i64,
@@ -209,6 +253,7 @@ pub(crate) fn normalize_hook_binding_upsert(
     })
 }
 
+/// Inserts or replaces a binding in the in-memory index, keeping entries sorted on insert.
 pub(crate) fn upsert_hook_binding(
     index: &mut HookBindingsIndex,
     record: HookBindingRecord,
@@ -222,6 +267,11 @@ pub(crate) fn upsert_hook_binding(
     record
 }
 
+/// Toggles a binding and stamps who changed it; returns the updated record.
+///
+/// # Errors
+///
+/// Fails when `hook_id` is malformed, the binding does not exist, or the clock is unavailable.
 pub(crate) fn set_hook_binding_enabled(
     index: &mut HookBindingsIndex,
     hook_id: &str,
@@ -241,6 +291,11 @@ pub(crate) fn set_hook_binding_enabled(
     Ok(entry.clone())
 }
 
+/// Removes a binding from the in-memory index and returns it.
+///
+/// # Errors
+///
+/// Fails when `hook_id` is malformed or no binding with that id exists.
 pub(crate) fn delete_hook_binding(
     index: &mut HookBindingsIndex,
     hook_id: &str,
@@ -254,6 +309,12 @@ pub(crate) fn delete_hook_binding(
     Ok(index.entries.remove(position))
 }
 
+/// Normalizes an event name (including run-lifecycle aliases such as `before_run`) to its
+/// canonical `scope:event` form.
+///
+/// # Errors
+///
+/// Fails for event names outside the supported gateway, skill, and run-lifecycle set.
 pub(crate) fn normalize_hook_event(raw: &str) -> Result<&'static str> {
     let normalized = raw.trim().to_ascii_lowercase();
     if let Some(phase) = RunLifecycleHookPhase::parse_hook_event(normalized.as_str()) {
@@ -278,12 +339,16 @@ fn hook_event_kind_for_lifecycle_phase(phase: RunLifecycleHookPhase) -> HookEven
     }
 }
 
+/// Spawns the long-lived hook runtime: fires the startup hook once, then polls the journal and
+/// dispatches hook events for new entries. The task runs until the daemon shuts down.
 pub(crate) fn spawn_hook_runtime(
     runtime: Arc<GatewayRuntimeState>,
     policy: crate::wasm_plugin_runner::WasmPluginRunnerPolicy,
     execution_timeout: Duration,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // Start the cursor at the newest journal seq so daemon restarts do not replay historical
+        // skill events into hooks; only events recorded after startup are dispatched.
         let mut last_journal_seq = match runtime.recent_journal_snapshot(1).await {
             Ok(snapshot) => snapshot.events.iter().map(|event| event.seq).max().unwrap_or(0),
             Err(error) => {
@@ -343,6 +408,17 @@ pub(crate) fn spawn_hook_runtime(
     })
 }
 
+/// Executes every enabled hook bound to `event` and journals each outcome.
+///
+/// Per-hook plugin failures are captured in the returned [`HookDispatchOutcome`]s rather than
+/// aborting the dispatch. For run-lifecycle events the individual plugin decisions are resolved
+/// into a single [`RunLifecycleHookResolution`] afterwards.
+///
+/// # Errors
+///
+/// Fails when the hook or plugin indexes cannot be loaded, a skill status lookup fails, a
+/// lifecycle decision is invalid for its phase set, or the resolved lifecycle decision is
+/// terminal (request approval, block, or fail run) -- the error text then carries the decision.
 pub(crate) async fn dispatch_named_event(
     runtime: Arc<GatewayRuntimeState>,
     policy: &crate::wasm_plugin_runner::WasmPluginRunnerPolicy,
@@ -358,6 +434,8 @@ pub(crate) async fn dispatch_named_event(
     let mut outcomes = Vec::new();
     let mut lifecycle_decisions = Vec::new();
 
+    // The index is persisted sorted by hook_id, so hooks for the same event always run in a
+    // deterministic order; lifecycle decision resolution depends on that stability.
     for hook in
         hooks_index.entries.into_iter().filter(|entry| entry.enabled && entry.event == event)
     {
@@ -477,6 +555,8 @@ pub(crate) async fn dispatch_named_event(
             continue;
         }
 
+        // Run-lifecycle hooks execute with no requested capabilities: a plugin sitting on the
+        // run path only returns a decision and must not gain its full capability profile there.
         let requested_capabilities = if lifecycle_phase.is_some() {
             crate::wasm_plugin_runner::WasmPluginRequestedCapabilities::default()
         } else {
@@ -629,6 +709,8 @@ fn enforce_run_lifecycle_resolution(
     )
 }
 
+// Only skill lifecycle journal events fan out to hooks here; run-lifecycle hook events are
+// dispatched inline by the run path so their decisions can gate it synchronously.
 fn hook_event_from_journal(event: JournalEventRecord) -> Option<(&'static str, Value)> {
     let payload = serde_json::from_str::<Value>(event.payload_json.as_str()).ok()?;
     let event_name = payload.get("event").and_then(Value::as_str)?;
@@ -666,6 +748,8 @@ fn lifecycle_decision_from_wasm_output(
     decision
 }
 
+// Exit-code mapping fails closed: anything negative or at/above the fail-run threshold becomes
+// FailRun, while unknown codes inside the reserved 0..50 range degrade to a harmless Annotate.
 fn lifecycle_decision_kind_from_exit_code(exit_code: i64) -> RunLifecycleHookDecisionKind {
     match exit_code {
         LIFECYCLE_HOOK_EXIT_CONTINUE => RunLifecycleHookDecisionKind::Continue,

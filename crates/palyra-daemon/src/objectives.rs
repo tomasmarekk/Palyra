@@ -1,3 +1,11 @@
+//! Objective registry persistence for long-lived operator goals.
+//!
+//! Stores [`ObjectiveRecord`] documents (lifecycle state, budget, attempt/approach/lifecycle
+//! history, plus workspace and routine-automation bindings) in a single JSON registry file under
+//! the daemon state root. Every record is normalized once on upsert so downstream consumers can
+//! rely on trimmed, length-bounded fields. Trigger and delivery types are shared with
+//! [`crate::routines`].
+
 use std::{
     fs,
     io::{Read, Seek, SeekFrom, Write},
@@ -21,6 +29,7 @@ const MAX_OBJECTIVE_COUNT: usize = 512;
 const MAX_HISTORY_ENTRIES: usize = 256;
 const MAX_LINKED_IDS: usize = 256;
 
+/// Category of a long-lived objective, controlling how operator surfaces present it.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectiveKind {
@@ -32,6 +41,7 @@ pub enum ObjectiveKind {
 }
 
 impl ObjectiveKind {
+    /// Returns the canonical snake_case wire name.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -42,6 +52,7 @@ impl ObjectiveKind {
         }
     }
 
+    /// Parses a wire name (trimmed, case-insensitive); returns `None` for unknown values.
     #[must_use]
     pub fn from_str(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
@@ -54,6 +65,10 @@ impl ObjectiveKind {
     }
 }
 
+/// Lifecycle state of an objective.
+///
+/// Entering [`ObjectiveState::Archived`] additionally stamps
+/// [`ObjectiveRecord::archived_at_unix_ms`] during upsert normalization.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectiveState {
@@ -66,6 +81,7 @@ pub enum ObjectiveState {
 }
 
 impl ObjectiveState {
+    /// Returns the canonical snake_case wire name.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -78,6 +94,7 @@ impl ObjectiveState {
     }
 }
 
+/// Operator-facing priority of an objective; informational, not a scheduling weight.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectivePriority {
@@ -89,6 +106,7 @@ pub enum ObjectivePriority {
 }
 
 impl ObjectivePriority {
+    /// Returns the canonical snake_case wire name.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -99,6 +117,7 @@ impl ObjectivePriority {
         }
     }
 
+    /// Parses a wire name (trimmed, case-insensitive); returns `None` for unknown values.
     #[must_use]
     pub fn from_str(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
@@ -111,6 +130,7 @@ impl ObjectivePriority {
     }
 }
 
+/// Optional spend guardrails for an objective's automation runs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectiveBudget {
@@ -122,6 +142,7 @@ pub struct ObjectiveBudget {
     pub notes: Option<String>,
 }
 
+/// Links an objective to its workspace document plus related documents, memories, and sessions.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectiveWorkspaceBinding {
@@ -138,6 +159,10 @@ pub struct ObjectiveWorkspaceBinding {
     pub related_session_ids: Vec<String>,
 }
 
+/// Routine-automation settings attached to an objective.
+///
+/// Mirrors the routine trigger/execution/delivery shape from [`crate::routines`] so an objective
+/// can drive (or be driven by) a registered routine identified by `routine_id`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectiveAutomationBinding {
@@ -162,6 +187,7 @@ pub struct ObjectiveAutomationBinding {
     pub template_id: Option<String>,
 }
 
+/// One recorded attempt at advancing an objective, including what was learned from it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectiveAttemptRecord {
@@ -183,6 +209,7 @@ pub struct ObjectiveAttemptRecord {
     pub completed_at_unix_ms: Option<i64>,
 }
 
+/// Classification of an approach-history entry.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectiveApproachKind {
@@ -193,6 +220,7 @@ pub enum ObjectiveApproachKind {
     StandingOrder,
 }
 
+/// Narrative history entry describing an approach taken for the objective.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectiveApproachRecord {
@@ -204,6 +232,7 @@ pub struct ObjectiveApproachRecord {
     pub created_at_unix_ms: i64,
 }
 
+/// State-transition audit entry for an objective.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectiveLifecycleRecord {
@@ -219,6 +248,11 @@ pub struct ObjectiveLifecycleRecord {
     pub occurred_at_unix_ms: i64,
 }
 
+/// Persisted objective document.
+///
+/// Invariants enforced by [`ObjectiveRegistry::upsert_objective`]: identifiers are canonical
+/// ULIDs, free-form text fields are trimmed and length-bounded, the three history vectors are
+/// sorted ascending by timestamp and capped, and linked collections are sorted and deduplicated.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectiveRecord {
@@ -264,6 +298,7 @@ pub struct ObjectiveRecord {
     pub archived_at_unix_ms: Option<i64>,
 }
 
+/// Upsert request wrapper; the contained record is normalized before persistence.
 #[derive(Debug, Clone)]
 pub struct ObjectiveUpsert {
     pub record: ObjectiveRecord,
@@ -276,6 +311,7 @@ struct ObjectiveRegistryDocument {
     objectives: Vec<ObjectiveRecord>,
 }
 
+/// Errors returned by [`ObjectiveRegistry`] operations.
 #[derive(Debug, Error)]
 pub enum ObjectiveRegistryError {
     #[error("failed to create objectives storage directory `{path}`: {source}")]
@@ -298,6 +334,10 @@ pub enum ObjectiveRegistryError {
     InvalidField { field: &'static str, message: String },
 }
 
+/// File-backed objective store with an in-memory working copy.
+///
+/// The registry keeps the JSON document and its file handle behind separate mutexes; every
+/// mutation rewrites the whole document so the on-disk state always matches memory.
 #[derive(Debug)]
 pub struct ObjectiveRegistry {
     document_path: PathBuf,
@@ -306,6 +346,13 @@ pub struct ObjectiveRegistry {
 }
 
 impl ObjectiveRegistry {
+    /// Opens (or initializes) the objective registry under `<state_root>/objectives/`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ObjectiveRegistryError::CreateDirectory`], [`ObjectiveRegistryError::OpenFile`],
+    /// [`ObjectiveRegistryError::ReadFile`], or [`ObjectiveRegistryError::ParseFile`] when the
+    /// storage directory or registry document cannot be prepared.
     pub fn open(state_root: &Path) -> Result<Self, ObjectiveRegistryError> {
         let objectives_root = state_root.join(OBJECTIVES_DIRECTORY);
         fs::create_dir_all(&objectives_root).map_err(|source| {
@@ -326,11 +373,22 @@ impl ObjectiveRegistry {
         Ok(Self { document_path, file: Mutex::new(file), document: Mutex::new(document) })
     }
 
+    /// Returns a snapshot of all stored objectives in `objective_id` order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ObjectiveRegistryError::LockPoisoned`] if a previous holder panicked.
     pub fn list_objectives(&self) -> Result<Vec<ObjectiveRecord>, ObjectiveRegistryError> {
         let document = self.document.lock().map_err(|_| ObjectiveRegistryError::LockPoisoned)?;
         Ok(document.objectives.clone())
     }
 
+    /// Looks up one objective by ULID; returns `Ok(None)` when it does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ObjectiveRegistryError::InvalidField`] when `objective_id` is not a canonical
+    /// ULID, or [`ObjectiveRegistryError::LockPoisoned`] if a previous holder panicked.
     pub fn get_objective(
         &self,
         objective_id: &str,
@@ -340,6 +398,17 @@ impl ObjectiveRegistry {
         Ok(document.objectives.iter().find(|entry| entry.objective_id == normalized).cloned())
     }
 
+    /// Normalizes and persists an objective, replacing any record with the same id.
+    ///
+    /// Returns the normalized record as stored. `updated_at_unix_ms` is always stamped with the
+    /// current time; `created_at_unix_ms` is only backfilled when the caller left it unset.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ObjectiveRegistryError::InvalidField`] for validation failures,
+    /// [`ObjectiveRegistryError::RegistryLimitExceeded`] when inserting beyond the registry cap,
+    /// [`ObjectiveRegistryError::LockPoisoned`] if a previous holder panicked, or a
+    /// write/serialize error when persisting the document fails.
     pub fn upsert_objective(
         &self,
         request: ObjectiveUpsert,
@@ -400,6 +469,10 @@ fn persist_registry_document(
     write_registry_document(path, &mut file, document)
 }
 
+// AIDEV-NOTE: this rewrites the registry in place (truncate + write on the long-lived handle)
+// rather than writing a temp file and renaming. A crash between set_len and sync_all can leave a
+// partial document that fails to parse on the next open. Making this atomic requires a behavior
+// change (temp file + rename), so it is only flagged here.
 fn write_registry_document(
     path: &Path,
     file: &mut fs::File,
@@ -524,6 +597,7 @@ fn normalize_attempts(
             .cmp(&right.created_at_unix_ms)
             .then_with(|| left.attempt_id.cmp(&right.attempt_id))
     });
+    // History is sorted oldest-first, so split_off keeps the newest entries when capping.
     if normalized.len() > MAX_HISTORY_ENTRIES {
         normalized = normalized.split_off(normalized.len() - MAX_HISTORY_ENTRIES);
     }
@@ -611,7 +685,7 @@ fn normalize_text(
     allow_empty: bool,
     max_len: usize,
 ) -> Result<String, ObjectiveRegistryError> {
-    let trimmed = value.trim().to_owned();
+    let trimmed = value.trim();
     if trimmed.is_empty() && !allow_empty {
         return Err(ObjectiveRegistryError::InvalidField {
             field,
@@ -624,11 +698,13 @@ fn normalize_text(
             message: format!("value must be at most {max_len} bytes"),
         });
     }
-    Ok(trimmed)
+    Ok(trimmed.to_owned())
 }
 
 fn normalize_id(value: &str, field: &'static str) -> Result<String, ObjectiveRegistryError> {
     let trimmed = value.trim();
+    // Validates ULID shape only; the caller's original casing is preserved so stored ids keep
+    // matching whatever external systems recorded.
     Ulid::from_string(trimmed).map_err(|_| ObjectiveRegistryError::InvalidField {
         field,
         message: "value must be a canonical ULID".to_owned(),
