@@ -1,3 +1,24 @@
+//! Memory lifecycle core: write classification, the retain/dedupe pipeline,
+//! and proto mapping for durable memory items.
+//!
+//! Ingest path: `retain_memory_candidate` normalizes candidate text, runs
+//! [`classify_memory_write`] (category, sensitivity, approval gate), holds
+//! low-confidence or sensitive writes for operator review, merges exact and
+//! near-duplicates (and correction conflicts) into existing items, and only
+//! then ingests a new item through [`GatewayRuntimeState`] into the journal
+//! store.
+//!
+//! Scope model: every item is owned by a principal and optionally narrowed to
+//! a channel or session. Scope checks here are deny-by-default -- a requested
+//! scope must match the authenticated context, and channel-scoped items are
+//! invisible without channel context. The memory tool surface lives in
+//! `application::tool_runtime::memory`, recall assembly in
+//! `application::recall`, and ranking in `crate::retrieval`.
+//!
+//! All memory text returned to callers passes
+//! [`redact_memory_text_for_output`], which reuses the journal redaction
+//! pipeline.
+
 use std::{collections::BTreeSet, sync::Arc};
 
 use serde::Serialize;
@@ -20,6 +41,16 @@ use crate::{
     transport::grpc::proto::palyra::{common::v1 as common_v1, memory::v1 as memory_v1},
 };
 
+/// Resolves the effective channel scope for a memory request.
+///
+/// An explicitly requested channel must equal the authenticated channel
+/// context; otherwise a caller could read or write another channel's
+/// memories. When no channel is requested, the context channel (if any)
+/// becomes the scope.
+///
+/// # Errors
+/// Returns `PermissionDenied` when the requested channel differs from the
+/// authenticated channel context.
 #[allow(clippy::result_large_err)]
 pub(crate) fn resolve_memory_channel_scope(
     context_channel: Option<&str>,
@@ -38,6 +69,13 @@ pub(crate) fn resolve_memory_channel_scope(
     Ok(normalized_requested.or_else(|| context_channel.map(str::to_owned)))
 }
 
+/// Maps a proto `MemorySource` discriminant to the journal enum.
+///
+/// Unknown discriminants degrade to `Unspecified` and are rejected, so newly
+/// added proto values fail loudly instead of being silently misfiled.
+///
+/// # Errors
+/// Returns `InvalidArgument` when the source is unspecified or unknown.
 #[allow(clippy::result_large_err)]
 pub(crate) fn memory_source_from_proto(raw: i32) -> Result<MemorySource, Status> {
     match memory_v1::MemorySource::try_from(raw).unwrap_or(memory_v1::MemorySource::Unspecified) {
@@ -66,6 +104,16 @@ fn optional_canonical_id(value: &Option<String>) -> Option<common_v1::CanonicalI
     value.as_deref().map(|ulid| common_v1::CanonicalId { ulid: ulid.to_owned() })
 }
 
+/// Enforces that a memory item is visible to the authenticated context.
+///
+/// Visibility rules: the item principal must match, and a channel-scoped
+/// item is only visible from that same channel. Principal-scoped items
+/// (no channel on the item) stay visible from any channel of the owning
+/// principal.
+///
+/// # Errors
+/// Returns `PermissionDenied` on a principal mismatch, a channel mismatch,
+/// or when a channel-scoped item is accessed without channel context.
 #[allow(clippy::result_large_err)]
 pub(crate) fn enforce_memory_item_scope(
     item: &MemoryItemRecord,
@@ -89,12 +137,20 @@ pub(crate) fn enforce_memory_item_scope(
     Ok(())
 }
 
+/// Redacts memory text before it is returned to any caller or model.
+///
+/// Wraps the text in a one-field JSON object so it can flow through the
+/// journal's payload redaction pipeline, then unwraps the redacted value.
 pub(crate) fn redact_memory_text_for_output(raw: &str) -> String {
     if raw.is_empty() {
         return String::new();
     }
 
     let payload = json!({ "value": raw });
+    // AIDEV-NOTE: fail-open redaction -- if redact_payload_json errors or the
+    // redacted JSON does not round-trip, the raw unredacted text is returned.
+    // Failing closed (empty string or error) would change tool output for
+    // every caller, so it needs a deliberate behavior change.
     let redacted_payload = match crate::journal::redact_payload_json(payload.to_string().as_bytes())
     {
         Ok(redacted) => redacted,
@@ -110,11 +166,22 @@ pub(crate) fn redact_memory_text_for_output(raw: &str) -> String {
     }
 }
 
+/// Fence marker stamped into memory provenance so downstream consumers can
+/// recognize (and version) retrieved-memory context blocks.
 pub(crate) const MEMORY_CONTEXT_FENCE_VERSION: &str = "palyra.memory_context.v2";
+/// Trust label attached to recalled memory content; it marks the text as
+/// retrieved evidence rather than instructions.
 pub(crate) const MEMORY_TRUST_LABEL_RETRIEVED: &str = "retrieved_memory";
+// Below this confidence a write is held for review instead of auto-retained.
 const MEMORY_RETAIN_LOW_CONFIDENCE_THRESHOLD: f64 = 0.45;
+// Search score at or above which a hit may merge as a near-duplicate.
 const MEMORY_RETAIN_NEAR_DUPLICATE_SCORE: f64 = 0.92;
+// Floor for dedupe candidate retrieval; below this, hits are not even
+// considered for duplicate/conflict matching.
 const MEMORY_RETAIN_DEDUPE_MIN_SCORE: f64 = 0.55;
+// Lowercase substrings that flag candidate text as possibly carrying secret
+// material; refined by the intent heuristics in
+// contains_secret_value_like_memory_write.
 const MEMORY_WRITE_SENSITIVE_PATTERNS: &[&str] = &[
     "api key",
     "bearer ",
@@ -126,8 +193,11 @@ const MEMORY_WRITE_SENSITIVE_PATTERNS: &[&str] = &[
     "session token",
     "token",
 ];
+// Default TTL for transient runtime facts written without an explicit TTL.
 const MEMORY_TRANSIENT_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
 
+/// Visibility scope of a memory write: one session, one channel, or the
+/// whole principal. Wider scopes face stricter review gates.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum MemoryLifecycleScope {
@@ -137,6 +207,11 @@ pub(crate) enum MemoryLifecycleScope {
 }
 
 impl MemoryLifecycleScope {
+    /// Parses a scope keyword; `None` defaults to `session`, and `global` is
+    /// accepted as an alias for `principal`.
+    ///
+    /// # Errors
+    /// Returns `InvalidArgument` for any other value.
     pub(crate) fn parse(raw: Option<&str>) -> Result<Self, Status> {
         match raw.unwrap_or("session").trim().to_ascii_lowercase().as_str() {
             "session" => Ok(Self::Session),
@@ -148,6 +223,7 @@ impl MemoryLifecycleScope {
         }
     }
 
+    /// Returns the canonical lowercase scope keyword.
     #[must_use]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
@@ -158,6 +234,8 @@ impl MemoryLifecycleScope {
     }
 }
 
+/// Outcome of a retain attempt: written as new, merged into or updating an
+/// existing item, held for review, or rejected outright.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum MemoryLifecycleStatus {
@@ -169,6 +247,7 @@ pub(crate) enum MemoryLifecycleStatus {
 }
 
 impl MemoryLifecycleStatus {
+    /// Returns the canonical snake_case status keyword used in tool output.
     #[must_use]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
@@ -181,6 +260,8 @@ impl MemoryLifecycleStatus {
     }
 }
 
+/// Semantic category of a memory write; drives TTL defaults, dedupe and
+/// replacement behavior, and operator-review requirements.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum MemoryWriteCategory {
@@ -194,6 +275,7 @@ pub(crate) enum MemoryWriteCategory {
 }
 
 impl MemoryWriteCategory {
+    /// Returns the canonical snake_case category keyword.
     #[must_use]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
@@ -207,6 +289,8 @@ impl MemoryWriteCategory {
         }
     }
 
+    /// Parses a category keyword; returns `None` for unknown values so
+    /// callers can choose between rejecting and defaulting.
     #[must_use]
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value.trim() {
@@ -226,6 +310,9 @@ impl MemoryWriteCategory {
     }
 }
 
+/// Sensitivity verdict for a memory write: `Sensitive` flags likely secret
+/// material, `HighRisk` flags principal-wide policy/approval-weakening
+/// intent. Anything but `Normal` forces review.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum MemoryWriteSensitivity {
@@ -234,6 +321,7 @@ pub(crate) enum MemoryWriteSensitivity {
     HighRisk,
 }
 
+/// Whether a memory write may be auto-retained or must wait for review.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum MemoryWriteApprovalState {
@@ -241,6 +329,8 @@ pub(crate) enum MemoryWriteApprovalState {
     Required,
 }
 
+/// Provenance reference linking a memory write back to its origin (tape
+/// event, artifact, or direct memory write).
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct MemoryWriteSourceRef {
     pub(crate) source_kind: String,
@@ -255,6 +345,8 @@ pub(crate) struct MemoryWriteSourceRef {
     pub(crate) artifact_id: Option<String>,
 }
 
+/// Inputs to [`classify_memory_write`]; `now_unix_ms` is injected so
+/// classification stays deterministic and testable.
 #[derive(Debug, Clone)]
 pub(crate) struct MemoryWriteClassificationInput {
     pub(crate) principal: String,
@@ -269,6 +361,8 @@ pub(crate) struct MemoryWriteClassificationInput {
     pub(crate) now_unix_ms: i64,
 }
 
+/// Result of classifying a memory write; serialized into provenance and tool
+/// output, so field names are part of the external contract.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct MemoryWriteClassification {
     pub(crate) category: MemoryWriteCategory,
@@ -285,6 +379,10 @@ pub(crate) struct MemoryWriteClassification {
     pub(crate) reason_codes: Vec<String>,
 }
 
+/// A candidate memory write submitted to the retain pipeline.
+///
+/// `replaces_terms` carries the caller's hint about which existing values a
+/// correction supersedes; it widens dedupe search and gates conflict merges.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct MemoryLifecycleRetainRequest {
     pub(crate) principal: String,
@@ -301,6 +399,9 @@ pub(crate) struct MemoryLifecycleRetainRequest {
     pub(crate) provenance: Value,
 }
 
+/// Result of a retain attempt. `durable_memory_write` is the authoritative
+/// "was anything persisted" signal; `item` is the written/updated record when
+/// it was.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct MemoryLifecycleRetainOutcome {
     pub(crate) status: MemoryLifecycleStatus,
@@ -317,6 +418,8 @@ pub(crate) struct MemoryLifecycleRetainOutcome {
     pub(crate) provenance: Value,
 }
 
+/// Entry point for durable memory writes; owns the classify -> review-gate ->
+/// dedupe -> ingest pipeline on top of the gateway runtime state.
 pub(crate) struct MemoryLifecycleProvider {
     runtime_state: Arc<GatewayRuntimeState>,
 }
@@ -327,6 +430,15 @@ impl MemoryLifecycleProvider {
         Self { runtime_state }
     }
 
+    /// Runs the full retain pipeline for one memory candidate.
+    ///
+    /// Non-retained outcomes (rejected, needs-review) are reported through
+    /// [`MemoryLifecycleRetainOutcome`], not as errors.
+    ///
+    /// # Errors
+    /// Returns `InvalidArgument` for out-of-range confidence,
+    /// `PermissionDenied` from scope or policy checks, and storage errors
+    /// from the journal-backed search/ingest/update calls.
     #[allow(clippy::result_large_err)]
     pub(crate) async fn retain(
         &self,
@@ -378,10 +490,13 @@ async fn retain_memory_candidate(
         now_unix_ms: current_unix_ms_status()?,
     });
     request.ttl_unix_ms = classification.ttl_unix_ms;
+    // The memory_write:<category> tag is the durable category marker that
+    // lifecycle_item_write_category reads back during later dedupe scans.
     request.tags.push(format!("memory_write:{}", classification.category.as_str()));
     request
         .tags
         .push(format!("source_hash:{}", classification.source_hash.get(..16).unwrap_or("short")));
+    // Re-normalize after appending classification tags (dedupe + tag cap).
     request.tags = lifecycle_tags(request.tags.as_slice(), request.scope);
     request.provenance = memory_write_provenance(request.provenance, &classification);
 
@@ -426,6 +541,8 @@ async fn retain_memory_candidate(
             && classification.category == MemoryWriteCategory::Correction;
         let updates_preference_content = replacement_content.is_some()
             && classification.category == MemoryWriteCategory::Preference;
+        // A correction supersedes the old value, so its tags replace the
+        // existing ones; plain merges keep the union of both tag sets.
         let tags = if replaces_with_correction {
             normalize_lifecycle_tags(request.tags.as_slice())
         } else {
@@ -498,6 +615,8 @@ async fn retain_memory_candidate(
     }))
 }
 
+/// Existing item that a retain candidate collapses into, with the kind of
+/// match that justified the merge.
 #[derive(Debug, Clone)]
 struct LifecycleDuplicate {
     item: MemoryItemRecord,
@@ -517,6 +636,11 @@ enum LifecycleDuplicateMatchKind {
     CorrectionConflict,
 }
 
+/// Looks for an existing item the candidate should merge into: an exact
+/// normalized-text match, a same-category near-duplicate, or (for
+/// corrections) a conflicting prior value. Search-based matching runs first;
+/// a bounded scope-list scan backstops corrections whose wording diverges too
+/// far for search recall.
 #[allow(clippy::result_large_err)]
 async fn find_lifecycle_duplicate(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -542,6 +666,8 @@ async fn find_lifecycle_duplicate(
             })
             .await?;
         for hit in hits {
+            // search_memory widens visibility across scopes; dedupe must only
+            // merge within the exact scope cell being written.
             if !lifecycle_item_matches_scan_scope(
                 &hit.item,
                 channel_scope.as_deref(),
@@ -633,6 +759,9 @@ async fn find_lifecycle_conflict_by_scope_scan(
     ))
 }
 
+/// Scans listed scope items for the strongest correction conflict, ranked by
+/// significant-term overlap; an exact text match short-circuits as a plain
+/// duplicate.
 fn lifecycle_conflict_from_scope_items(
     items: Vec<MemoryItemRecord>,
     candidate_category: MemoryWriteCategory,
@@ -674,6 +803,10 @@ fn lifecycle_conflict_from_scope_items(
     })
 }
 
+/// Exact scope-cell match: an item only qualifies for dedupe/conflict
+/// handling when its channel and session bindings equal the write scope.
+/// Principal-scope writes (None, None) must not absorb channel- or
+/// session-scoped items, and vice versa.
 fn lifecycle_item_matches_scan_scope(
     item: &MemoryItemRecord,
     channel_scope: Option<&str>,
@@ -695,6 +828,10 @@ fn lifecycle_item_matches_scan_scope(
     }
 }
 
+/// Builds the dedupe search queries: the full candidate text, the caller's
+/// replacement terms (so corrections find the value they supersede even when
+/// the new wording shares little with the old), and a significant-terms
+/// digest of the candidate.
 fn lifecycle_duplicate_search_queries(
     content_text: &str,
     replaces_terms: &[String],
@@ -745,6 +882,12 @@ fn lifecycle_significant_terms(content_text: &str) -> Vec<String> {
     terms
 }
 
+/// Decides whether an existing item is the prior value a correction
+/// supersedes. Only corrections conflict, only against prior
+/// corrections/preferences, the caller's replacement terms must actually
+/// reference the existing content, and the texts must share enough
+/// significant terms -- all of which keeps unrelated notes from being
+/// overwritten.
 fn lifecycle_conflict_matches(
     category: MemoryWriteCategory,
     replaces_terms: &[String],
@@ -778,6 +921,8 @@ fn lifecycle_conflict_overlap_count(candidate_content: &str, existing_content: &
     candidate_terms.intersection(&existing_terms).count()
 }
 
+/// Reads the durable category marker written at retain time; untagged
+/// (legacy) items default to `Fact`.
 fn lifecycle_item_write_category(item: &MemoryItemRecord) -> MemoryWriteCategory {
     item.tags
         .iter()
@@ -808,6 +953,10 @@ fn lifecycle_near_duplicate_texts_compatible(
     let intersection_count = candidate_terms.intersection(&existing_terms).count();
     let smaller_count = candidate_terms.len().min(existing_terms.len());
     let larger_count = candidate_terms.len().max(existing_terms.len());
+    // Short texts share terms by accident easily, so they must be fully
+    // contained and close in size; longer texts merge on 75% overlap of the
+    // smaller set and 60% of the larger. The dual bound keeps distinct items
+    // that share boilerplate (e.g. action items citing one source) separate.
     if smaller_count <= 4 {
         return intersection_count == smaller_count && larger_count <= smaller_count + 2;
     }
@@ -836,6 +985,10 @@ fn lifecycle_replacement_terms_reference_existing_value(
         .any(|term| existing_terms.contains(&term))
 }
 
+/// Decides whether the merge replaces the existing item's text. Only
+/// corrections (over their matched conflict) and near-duplicate preferences
+/// carry the new wording; other merges keep the existing text and just
+/// refresh metadata.
 fn lifecycle_duplicate_replacement_content(
     classification: &MemoryWriteClassification,
     duplicate: &LifecycleDuplicate,
@@ -877,6 +1030,8 @@ fn lifecycle_replacement_content(
 
 fn compact_memory_text(input: &str) -> String {
     let mut compact = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Each replace pass can create new adjacent punctuation pairs (", ," ->
+    // "," etc.); three passes reach a fixed point for the patterns handled.
     for _ in 0..3 {
         compact = compact
             .replace(" ,", ",")
@@ -895,6 +1050,8 @@ fn compact_memory_text(input: &str) -> String {
         .to_owned()
 }
 
+/// Maps the requested scope to the (channel, session) storage bindings plus
+/// the policy resource string used for the `memory.ingest` authorization.
 fn resolve_lifecycle_write_scope(
     request: &MemoryLifecycleRetainRequest,
 ) -> Result<(Option<String>, Option<String>, String), Status> {
@@ -941,6 +1098,13 @@ fn memory_retain_outcome(input: MemoryRetainOutcomeInput<'_>) -> MemoryLifecycle
     }
 }
 
+/// Classifies a memory write: category, sensitivity, TTL bounding, source
+/// references, and whether the write needs operator approval.
+///
+/// Approval is required for low confidence, any non-normal sensitivity, or
+/// persistent (channel/principal) procedure/constraint rules written by a
+/// non-admin principal -- the paths a prompt-injected agent would use to
+/// plant durable instructions.
 pub(crate) fn classify_memory_write(
     input: MemoryWriteClassificationInput,
 ) -> MemoryWriteClassification {
@@ -954,6 +1118,9 @@ pub(crate) fn classify_memory_write(
         }
         (_, ttl) => ttl,
     };
+    // Identity hash over (principal, channel, session, scope, normalized
+    // text): the same text written into a different scope hashes differently.
+    // sha256_hex always yields 64 hex chars, so the [..16] slices below hold.
     let source_hash = crate::sha256_hex(
         format!(
             "{}:{}:{}:{}:{}",
@@ -1048,6 +1215,11 @@ fn classify_memory_write_sensitivity(
     }
 }
 
+/// Heuristic for "this text probably carries a secret value" (vs. merely
+/// talking about secrets). Layered: assignment-like forms always match;
+/// otherwise a sensitive keyword must pair with store/remember intent or
+/// value-talk, while purely defensive phrasing ("never log ...") is allowed
+/// through as normal.
 fn contains_secret_value_like_memory_write(lowered: &str) -> bool {
     if contains_any(
         lowered,
@@ -1108,6 +1280,9 @@ fn contains_secret_value_like_memory_write(lowered: &str) -> bool {
     contains_any(lowered, &["actual", "value"])
 }
 
+/// True when `word` appears as a whole word that is not negated earlier in
+/// the same clause -- "store the token" matches, "never store the token"
+/// does not.
 fn contains_unnegated_memory_write_word(lowered: &str, word: &str) -> bool {
     lowered.match_indices(word).any(|(index, _)| {
         let clause_prefix = current_clause_prefix(lowered, index);
@@ -1120,6 +1295,9 @@ fn contains_unnegated_memory_write_word(lowered: &str, word: &str) -> bool {
     })
 }
 
+/// Returns the clause text preceding `index` (back to the nearest sentence
+/// or clause delimiter). `index` comes from `match_indices`, so the slice
+/// boundaries are valid char boundaries.
 fn current_clause_prefix(text: &str, index: usize) -> &str {
     let prefix = &text[..index];
     let clause_start =
@@ -1138,6 +1316,10 @@ fn memory_classifier_word_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '_'
 }
 
+/// Heuristic for principal-wide writes that try to weaken approvals, auth,
+/// policy, or sandboxing. Explicit bypass-approval phrasing always matches;
+/// defensive "never bypass ..." phrasing short-circuits to false before the
+/// broader bypass/disable/ignore patterns are consulted.
 fn contains_high_risk_memory_write_intent(lowered: &str) -> bool {
     if contains_any(
         lowered,
@@ -1190,6 +1372,9 @@ fn contains_high_risk_memory_write_intent(lowered: &str) -> bool {
     )
 }
 
+/// Derives the provenance source reference for a write: orchestrator tape
+/// when a tape sequence is present, artifact when an artifact id is, and a
+/// hash-derived synthetic source otherwise.
 fn memory_write_source_refs(
     provenance: &Value,
     source_hash: &str,
@@ -1238,6 +1423,8 @@ fn memory_write_provenance(
     provenance
 }
 
+/// Category buckets offered by the reflect tool when distilling raw
+/// observations into retain candidates.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum MemoryReflectionCategory {
@@ -1249,6 +1436,8 @@ pub(crate) enum MemoryReflectionCategory {
 }
 
 impl MemoryReflectionCategory {
+    /// Parses a category keyword, accepting singular/plural and shorthand
+    /// aliases; returns `None` for unknown values.
     pub(crate) fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "fact" | "facts" => Some(Self::Facts),
@@ -1260,6 +1449,7 @@ impl MemoryReflectionCategory {
         }
     }
 
+    /// Returns the canonical snake_case category keyword.
     #[must_use]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
@@ -1272,6 +1462,8 @@ impl MemoryReflectionCategory {
     }
 }
 
+/// Input to [`reflect_memory_candidates`]: raw observations plus the
+/// category whitelist and candidate cap.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct MemoryReflectionRequest {
     pub(crate) observations: Vec<String>,
@@ -1280,6 +1472,8 @@ pub(crate) struct MemoryReflectionRequest {
     pub(crate) provenance: Value,
 }
 
+/// One proposed memory write produced by reflection. `retain_input` is a
+/// ready-to-submit `palyra.memory.retain` payload for the candidate.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct MemoryReflectionCandidate {
     pub(crate) category: MemoryReflectionCategory,
@@ -1290,6 +1484,8 @@ pub(crate) struct MemoryReflectionCandidate {
     pub(crate) retain_input: Value,
 }
 
+/// Reflection result. `durable_memory_write` is always `false`: reflection
+/// only proposes candidates, it never writes.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct MemoryReflectionOutcome {
     pub(crate) durable_memory_write: bool,
@@ -1299,6 +1495,8 @@ pub(crate) struct MemoryReflectionOutcome {
     pub(crate) provenance: Value,
 }
 
+/// Turns raw observations into session-scoped retain candidates without
+/// writing anything; callers review and submit candidates separately.
 pub(crate) fn reflect_memory_candidates(
     request: MemoryReflectionRequest,
 ) -> MemoryReflectionOutcome {
@@ -1377,6 +1575,9 @@ fn reflection_confidence(category: MemoryReflectionCategory, content_text: &str)
     }
 }
 
+/// Canonical text normalization for memory content: control characters
+/// become spaces and whitespace runs collapse to single spaces. Exact-match
+/// dedupe compares this form, so it must stay stable.
 pub(crate) fn normalize_lifecycle_content(raw: &str) -> String {
     raw.chars()
         .map(|ch| if ch.is_control() { ' ' } else { ch })
@@ -1390,6 +1591,9 @@ fn contains_any(input: &str, patterns: &[&str]) -> bool {
     patterns.iter().any(|pattern| input.contains(pattern))
 }
 
+/// Prepends the standard lifecycle/scope/trust tags to caller tags and
+/// normalizes the result. The base tags come first so the
+/// [`MAX_MEMORY_TOOL_TAGS`] cap never drops them.
 pub(crate) fn lifecycle_tags(raw: &[String], scope: MemoryLifecycleScope) -> Vec<String> {
     let mut tags = vec![
         "lifecycle:memory".to_owned(),
@@ -1400,6 +1604,8 @@ pub(crate) fn lifecycle_tags(raw: &[String], scope: MemoryLifecycleScope) -> Vec
     normalize_lifecycle_tags(tags.as_slice())
 }
 
+/// Lowercases, restricts to a safe tag charset, deduplicates preserving
+/// first occurrence, and caps at [`MAX_MEMORY_TOOL_TAGS`].
 fn normalize_lifecycle_tags(raw: &[String]) -> Vec<String> {
     let mut normalized = Vec::new();
     for tag in raw {
@@ -1428,6 +1634,13 @@ fn merge_memory_tags(existing: &[String], requested: &[String]) -> Vec<String> {
     normalize_lifecycle_tags(merged.as_slice())
 }
 
+/// Resolves a caller-provided TTL into an absolute expiry timestamp.
+/// `ttl_ms` (relative) and `ttl_unix_ms` (absolute) are mutually exclusive.
+///
+/// # Errors
+/// Returns `InvalidArgument` when both fields are set, `ttl_ms` is not
+/// positive, or `ttl_unix_ms` is not in the future; also fails when the
+/// system clock cannot produce a current timestamp.
 #[allow(clippy::result_large_err)]
 pub(crate) fn ttl_unix_ms_from_input(
     ttl_ms: Option<i64>,
@@ -1446,6 +1659,8 @@ pub(crate) fn ttl_unix_ms_from_input(
     }
 }
 
+/// Maps a journal memory record to its proto message; `content_text` is
+/// redacted on the way out.
 pub(crate) fn memory_item_message(item: &MemoryItemRecord) -> memory_v1::MemoryItem {
     let session_reference = optional_canonical_id(&item.session_id);
     memory_v1::MemoryItem {
@@ -1465,6 +1680,8 @@ pub(crate) fn memory_item_message(item: &MemoryItemRecord) -> memory_v1::MemoryI
     }
 }
 
+/// Maps a search hit to its proto message, redacting the snippet and
+/// optionally attaching the score breakdown.
 pub(crate) fn memory_search_hit_message(
     hit: &MemorySearchHit,
     include_score_breakdown: bool,

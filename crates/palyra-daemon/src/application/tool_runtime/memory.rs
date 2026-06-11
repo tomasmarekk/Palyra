@@ -1,3 +1,25 @@
+//! Tool-runtime executors for the `palyra.memory.*` tools: status, retain,
+//! delete, replace, reflect, search, recall, and session_search.
+//!
+//! Each executor parses and validates untrusted JSON tool input, authorizes
+//! the action against memory policy, dispatches to the lifecycle store
+//! (`application::memory`, journal-backed) or to workspace MEMORY.md
+//! documents, and returns a [`ToolExecutionOutcome`] whose attestation hashes
+//! the full request/response. Failures are reported through
+//! `outcome.success == false` plus an error string -- executors never return
+//! `Err`.
+//!
+//! Model-safety conventions enforced here: every payload carries a
+//! `claim_boundary` string telling the model what it may and may not claim
+//! about stored memory; memory text is redacted before output; and session
+//! search replaces raw session/run ULIDs with `prior_session_N` /
+//! `prior_run_N` labels so internal ids never reach the model.
+//!
+//! Scope handling: lifecycle scopes (session/channel/principal) bind to the
+//! authenticated context, while `workspace`/`project` scopes route to
+//! workspace documents, inferring a `projects/<slug>-<hash>` prefix from the
+//! active agent workspace root when none is given.
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Component, Path, PathBuf},
@@ -54,6 +76,9 @@ const MIN_MEMORY_RECALL_PROMPT_BUDGET_TOKENS: usize = 512;
 const MAX_MEMORY_RECALL_PROMPT_BUDGET_TOKENS: usize = 4_096;
 const MEMORY_SOURCE_VALUES: &[&str] =
     &["manual", "summary", "import", "tape:user_message", "tape:tool_result"];
+// Claim-boundary strings are part of the model-facing tool contract: they
+// instruct the model what it may assert about stored memory given the result
+// set. Several are pinned by tests/fixtures -- treat them as frozen.
 const MEMORY_HITS_PRESENT_CLAIM_BOUNDARY: &str = "memory hits are retrieved evidence; do not claim no stored preference or prior fact exists unless the hits are irrelevant to the user's question";
 const MEMORY_HITS_ABSENT_CLAIM_BOUNDARY: &str =
     "no memory hits were returned; do not invent stored preferences or prior facts";
@@ -70,6 +95,8 @@ const SESSION_SEARCH_HITS_ABSENT_CLAIM_BOUNDARY: &str =
 const MEMORY_STATUS_CLAIM_BOUNDARY: &str = "memory status is usage and retention diagnostics; do not infer memory capacity from search hit_count, and treat no_hard_capacity_configured as no entries/bytes hard limit";
 const MAX_WORKSPACE_RECALL_TOOL_SNIPPET_CHARS: usize = 512;
 
+/// Builds the JSON payload for lifecycle memory search results: redacted
+/// snippets/content, provenance, score breakdowns, and the claim boundary.
 pub(crate) fn memory_search_tool_output_payload(search_hits: &[MemorySearchHit]) -> Value {
     json!({
         "hit_count": search_hits.len(),
@@ -98,6 +125,8 @@ pub(crate) fn memory_search_tool_output_payload(search_hits: &[MemorySearchHit])
     })
 }
 
+/// Builds the JSON payload for workspace document search results; hits carry
+/// document metadata only (never full document content).
 pub(crate) fn workspace_search_tool_output_payload(search_hits: &[WorkspaceSearchHit]) -> Value {
     json!({
         "hit_count": search_hits.len(),
@@ -118,13 +147,15 @@ fn combined_memory_search_tool_output_payload(
         workspace_payload.get("hits").and_then(Value::as_array).cloned().unwrap_or_default();
     let mut hits =
         Vec::with_capacity(memory_hit_values.len().saturating_add(workspace_hit_values.len()));
-    hits.extend(memory_hit_values.iter().cloned().map(|mut hit| {
+    // The combined "hits" list tags each entry with its origin store; the
+    // untagged per-store lists are also emitted below for compatibility.
+    hits.extend(memory_hit_values.into_iter().map(|mut hit| {
         if let Some(object) = hit.as_object_mut() {
             object.insert("hit_source".to_owned(), json!("lifecycle"));
         }
         hit
     }));
-    hits.extend(workspace_hit_values.iter().cloned().map(|mut hit| {
+    hits.extend(workspace_hit_values.into_iter().map(|mut hit| {
         if let Some(object) = hit.as_object_mut() {
             object.insert("hit_source".to_owned(), json!("workspace"));
         }
@@ -197,6 +228,9 @@ fn workspace_search_hit_tool_output_payload(hit: &WorkspaceSearchHit) -> Value {
     })
 }
 
+/// Project scope inferred from the active workspace root: candidate
+/// `projects/...` prefixes (identity-hash form first, then plain basename)
+/// plus the raw basename for fuzzy fallback matching.
 #[derive(Debug, Clone, Default)]
 struct InferredProjectMemorySearchScope {
     prefixes: Vec<String>,
@@ -209,12 +243,16 @@ impl InferredProjectMemorySearchScope {
     }
 }
 
+/// One fallback search target: a prefix to query and an optional project
+/// basename filter applied to its results.
 #[derive(Debug, Clone)]
 struct WorkspaceMemorySearchFallback {
     prefix: String,
     project_basename_filter: Option<String>,
 }
 
+/// Ordered workspace search strategy: the primary prefix first, then
+/// fallbacks tried only while no hits have been found.
 #[derive(Debug, Clone)]
 struct WorkspaceMemorySearchPlan {
     primary_prefix: Option<String>,
@@ -250,6 +288,9 @@ impl WorkspaceMemorySearchParameters {
     }
 }
 
+/// Executes a workspace memory search plan: primary prefix first, then each
+/// fallback until any hits appear, deduplicating across passes by
+/// (document, version, chunk).
 async fn search_workspace_documents_for_memory(
     runtime_state: &Arc<GatewayRuntimeState>,
     parameters: &WorkspaceMemorySearchParameters,
@@ -296,6 +337,8 @@ async fn append_workspace_memory_search_hits(
     hits: &mut Vec<WorkspaceSearchHit>,
     seen: &mut BTreeSet<String>,
 ) -> Result<(), Status> {
+    // When a basename filter will discard hits afterwards, over-fetch so the
+    // post-filter result can still fill top_k.
     let search_top_k =
         if project_basename_filter.is_some() { MAX_MEMORY_SEARCH_TOP_K } else { parameters.top_k };
     let mut found = runtime_state
@@ -316,6 +359,10 @@ async fn append_workspace_memory_search_hits(
     Ok(())
 }
 
+/// Builds the search plan. Fallbacks exist only for inferred (not explicit)
+/// prefixes: secondary inferred prefixes first, then a `projects/`-wide scan
+/// filtered by project basename -- so launches from renamed or relocated
+/// roots still find their project memory without leaking other projects.
 fn workspace_memory_search_plan(
     primary_prefix: Option<String>,
     search_primary_without_prefix: bool,
@@ -362,6 +409,10 @@ fn workspace_search_hit_parent_path(hit: &WorkspaceSearchHit) -> Option<&str> {
     })
 }
 
+/// Fuzzy match between a `projects/<segment>` directory and a workspace
+/// basename. Slugs must match exactly or on a `-`-delimited boundary; very
+/// short basenames only match their exact `project-<slug>` form so that e.g.
+/// "a" cannot match every project containing "-a-".
 fn project_memory_segment_matches_basename(segment: &str, basename: &str) -> bool {
     let basename_slug = project_memory_slug(basename);
     let segment_slug = project_memory_slug(segment);
@@ -376,6 +427,8 @@ fn project_memory_segment_matches_basename(segment: &str, basename: &str) -> boo
         || segment_slug.contains(format!("-{basename_slug}-").as_str())
 }
 
+/// Builds the JSON payload for `palyra.memory.recall`: per-source hit lists,
+/// the recall plan/budget, and a prompt preview, all redacted.
 pub(crate) fn memory_recall_tool_output_payload(preview: &RecallPreviewEnvelope) -> Value {
     let memory_hits = memory_search_tool_output_payload(preview.memory_hits.as_slice())
         .get("hits")
@@ -402,6 +455,12 @@ pub(crate) fn memory_recall_tool_output_payload(preview: &RecallPreviewEnvelope)
     })
 }
 
+/// Builds the JSON payload for `palyra.memory.session_search`.
+///
+/// All session and run ids are replaced with `prior_session_N`/`prior_run_N`
+/// labels (see [`SessionSearchOutputLabels`]); the absence of raw ULIDs in
+/// the serialized payload is pinned by tests. Session metadata hits act as a
+/// fallback evidence tier when no transcript windows matched.
 pub(crate) fn memory_session_search_tool_output_payload(
     outcome: &SessionSearchOutcome,
     session_hits: &[OrchestratorSessionRecord],
@@ -446,6 +505,10 @@ pub(crate) fn memory_session_search_tool_output_payload(
     })
 }
 
+/// Pseudonymizing label maps for session-search output. Raw session/run
+/// ULIDs must never reach the model, so every id referenced anywhere in the
+/// outcome is registered first and then rendered as a stable
+/// `prior_session_N`/`prior_run_N` label (numbered in first-seen order).
 #[derive(Debug, Default)]
 struct SessionSearchOutputLabels {
     session_labels: BTreeMap<String, String>,
@@ -489,6 +552,9 @@ impl SessionSearchOutputLabels {
     }
 }
 
+/// Pre-registers every session/run id reachable from the outcome (groups,
+/// lineage, windows, events, provenance, fallback hits) so payload rendering
+/// never encounters an unlabeled id.
 fn session_search_output_labels(
     outcome: &SessionSearchOutcome,
     session_hits: &[OrchestratorSessionRecord],
@@ -723,6 +789,7 @@ fn session_search_session_hit_payload(
     })
 }
 
+/// Picks the present/absent claim-boundary string for a memory result set.
 fn memory_search_claim_boundary(hit_count: usize) -> &'static str {
     if hit_count == 0 {
         MEMORY_HITS_ABSENT_CLAIM_BOUNDARY
@@ -731,6 +798,9 @@ fn memory_search_claim_boundary(hit_count: usize) -> &'static str {
     }
 }
 
+/// Builds the JSON payload for `palyra.memory.status`: usage counters,
+/// capacity state against configured retention limits, maintenance/vacuum
+/// timestamps, and the runtime limit configuration.
 pub(crate) fn memory_status_tool_output_payload(
     status: &MemoryMaintenanceStatus,
     config: &MemoryRuntimeConfig,
@@ -788,10 +858,14 @@ pub(crate) fn memory_status_tool_output_payload(
     })
 }
 
+// A configured limit of zero reports as fully used rather than dividing by
+// zero.
 fn capacity_fraction(used: u64, limit: Option<u64>) -> Option<f64> {
     limit.map(|limit| if limit == 0 { 1.0 } else { used as f64 / limit as f64 })
 }
 
+/// Classifies usage against the configured limits; `near_limit` starts at
+/// 85% of either dimension, and either dimension alone can trip a state.
 fn memory_capacity_state(
     entries_used: u64,
     bytes_used: u64,
@@ -821,6 +895,9 @@ fn memory_capacity_state(
     "within_limit"
 }
 
+/// Executes `palyra.memory.status` (no input fields accepted): returns the
+/// retention/capacity diagnostics payload. Requires `memory.list` policy.
+/// Failures are reported via `outcome.success == false`, never `Err`.
 pub(crate) async fn execute_memory_status_tool(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -908,6 +985,12 @@ pub(crate) async fn execute_memory_status_tool(
     }
 }
 
+/// Executes `palyra.memory.retain`: validates the candidate write, then
+/// routes by scope -- `workspace`/`project` scopes append to a MEMORY.md
+/// workspace document, lifecycle scopes go through the classify/dedupe
+/// retain pipeline. Unknown `source` values are normalized to `manual` and
+/// reported back via `source_normalization` rather than rejected. Failures
+/// are reported via `outcome.success == false`, never `Err`.
 pub(crate) async fn execute_memory_retain_tool(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -1084,7 +1167,9 @@ pub(crate) async fn execute_memory_retain_tool(
         .await;
     }
 
-    let scope = lifecycle_scope.expect("non-workspace memory retain scope should be parsed");
+    let scope = lifecycle_scope.expect(
+        "lifecycle scope is Some on this branch: it parses above whenever workspace scope is None",
+    );
 
     let provider = MemoryLifecycleProvider::new(Arc::clone(runtime_state));
     let outcome = match provider
@@ -1125,6 +1210,9 @@ pub(crate) async fn execute_memory_retain_tool(
     )
 }
 
+/// Retain scopes that write to workspace documents instead of the lifecycle
+/// store: `workspace` targets the root MEMORY.md, `project` a
+/// `projects/...` MEMORY.md.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkspaceMemoryRetainScope {
     Workspace,
@@ -1162,6 +1250,10 @@ impl WorkspaceMemoryRetainScope {
     }
 }
 
+/// Workspace/project branch of the retain tool: appends a metadata-stamped
+/// markdown entry to the target MEMORY.md document, first removing entries
+/// matched by `replaces_terms` (correction semantics) and skipping the write
+/// entirely when the content already exists verbatim.
 #[allow(clippy::too_many_arguments)]
 async fn execute_workspace_memory_retain_tool(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -1262,6 +1354,8 @@ async fn execute_workspace_memory_retain_tool(
         .as_ref()
         .map(|document| document.title.clone())
         .unwrap_or_else(|| scope.default_title().to_owned());
+    // Only write when something changed; an exact-duplicate retain returns
+    // the existing document with status updated_existing.
     let document = if appended || replaced_entries > 0 {
         match runtime_state
             .upsert_workspace_document(WorkspaceDocumentWriteRequest {
@@ -1323,6 +1417,10 @@ async fn execute_workspace_memory_retain_tool(
     })
 }
 
+/// Executes `palyra.memory.delete`: deletes the lifecycle item with the
+/// given id after scope/policy checks; when no lifecycle item exists, the id
+/// is also tried as a workspace document id (soft delete). Failures are
+/// reported via `outcome.success == false`, never `Err`.
 pub(crate) async fn execute_memory_delete_tool(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -1472,6 +1570,9 @@ pub(crate) async fn execute_memory_delete_tool(
     }
 }
 
+/// Workspace fallback for delete-by-id: `None` means "no such workspace
+/// document, continue with lifecycle deletion"; `Some` is the final outcome
+/// (success or failure) of the workspace soft delete.
 async fn maybe_delete_workspace_document_by_id(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -1573,6 +1674,10 @@ async fn maybe_delete_workspace_document_by_id(
     })
 }
 
+/// Executes `palyra.memory.replace`: replaces the content of an existing
+/// lifecycle item in place (tags/confidence/TTL optionally updated), falling
+/// back to replacing a workspace document body when the id matches one.
+/// Failures are reported via `outcome.success == false`, never `Err`.
 pub(crate) async fn execute_memory_replace_tool(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -1661,6 +1766,8 @@ pub(crate) async fn execute_memory_replace_tool(
                     input_json,
                     false,
                     b"{}".to_vec(),
+                    // parse_string_array_field hard-codes the retain tool
+                    // name in its messages; rewrite it for this tool.
                     error.replace("palyra.memory.retain", "palyra.memory.replace"),
                 );
             }
@@ -1759,6 +1866,7 @@ pub(crate) async fn execute_memory_replace_tool(
             format!("palyra.memory.replace {}", error.message()),
         );
     }
+    // Omitted/empty tags keep the existing tag set; replace only swaps text.
     let tags = if parsed_tags.is_empty() { existing_item.tags.clone() } else { parsed_tags };
     let updated = match runtime_state
         .update_memory_item_lifecycle(MemoryItemLifecycleUpdateRequest {
@@ -1823,6 +1931,7 @@ pub(crate) async fn execute_memory_replace_tool(
     }
 }
 
+/// Parameter bundle for the workspace branch of the replace tool.
 struct WorkspaceDocumentReplaceRequest<'a> {
     runtime_state: &'a Arc<GatewayRuntimeState>,
     namespace: &'static [u8],
@@ -1833,6 +1942,9 @@ struct WorkspaceDocumentReplaceRequest<'a> {
     parsed: &'a Map<String, Value>,
 }
 
+/// Workspace fallback for replace-by-id: `None` means "no such workspace
+/// document, report the lifecycle item as missing"; `Some` is the final
+/// outcome of rewriting the document body in place.
 async fn maybe_replace_workspace_document_by_id(
     context: ToolRuntimeExecutionContext<'_>,
     request: WorkspaceDocumentReplaceRequest<'_>,
@@ -1954,6 +2066,10 @@ fn workspace_memory_replace_payload(
     })
 }
 
+/// Executes `palyra.memory.reflect`: distills observations (or message
+/// contents, or split `content_text`) into retain candidates without writing
+/// anything durable. Failures are reported via `outcome.success == false`,
+/// never `Err`.
 pub(crate) async fn execute_memory_reflect_tool(
     context: ToolRuntimeExecutionContext<'_>,
     proposal_id: &str,
@@ -2017,6 +2133,12 @@ pub(crate) async fn execute_memory_reflect_tool(
     serialize_memory_reflection_outcome(namespace, proposal_id, input_json, &outcome)
 }
 
+/// Executes `palyra.memory.search` across its scope variants:
+/// `workspace`/`project` search workspace documents, `all` (the default)
+/// combines lifecycle and workspace hits, and `session`/`channel`/
+/// `principal` search the lifecycle store only. Each scope authorizes
+/// against its own policy resource before searching. Failures are reported
+/// via `outcome.success == false`, never `Err`.
 pub(crate) async fn execute_memory_search_tool(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -2195,6 +2317,8 @@ pub(crate) async fn execute_memory_search_tool(
     }
 
     if scope == "all" {
+        // The combined scope touches both stores, so it must pass both the
+        // principal-memory and workspace-memory policy checks.
         if let Err(error) = authorize_memory_action(principal, "memory.search", "memory:principal")
         {
             return memory_tool_execution_outcome(
@@ -2296,6 +2420,8 @@ pub(crate) async fn execute_memory_search_tool(
         } else {
             inferred_project_scope.primary_prefix().map(str::to_owned)
         };
+        // Workspace hits only join the combined result when some prefix
+        // (explicit or inferred from the active project) bounds the search.
         let workspace_hits = if workspace_prefix.is_some() {
             let search_plan = workspace_memory_search_plan(
                 workspace_prefix.clone(),
@@ -2487,6 +2613,8 @@ pub(crate) async fn execute_memory_search_tool(
     }
 }
 
+/// Parses the optional `tags` filter array (bounded, strings only, blanks
+/// dropped); absent means no tag filtering.
 fn parse_memory_search_tags(parsed: &Map<String, Value>) -> Result<Vec<String>, String> {
     match parsed.get("tags") {
         Some(Value::Array(values)) => {
@@ -2512,6 +2640,8 @@ fn parse_memory_search_tags(parsed: &Map<String, Value>) -> Result<Vec<String>, 
     }
 }
 
+/// Parses the optional `sources` filter; unknown source literals are
+/// rejected (unlike retain, which normalizes them to `manual`).
 fn parse_memory_search_sources(parsed: &Map<String, Value>) -> Result<Vec<MemorySource>, String> {
     match parsed.get("sources") {
         Some(Value::Array(values)) => {
@@ -2534,17 +2664,23 @@ fn parse_memory_search_sources(parsed: &Map<String, Value>) -> Result<Vec<Memory
     }
 }
 
+/// Executes `palyra.memory.recall`: budgeted multi-source recall (lifecycle
+/// memory, workspace documents, transcripts, checkpoints, compactions)
+/// through `application::recall::preview_recall`. A `channel` override must
+/// match the authenticated channel. Failures are reported via
+/// `outcome.success == false`, never `Err`.
 pub(crate) async fn execute_memory_recall_tool(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
     proposal_id: &str,
     input_json: &[u8],
 ) -> ToolExecutionOutcome {
+    let namespace = b"palyra.memory.recall.attestation.v1";
     let parsed = match serde_json::from_slice::<Value>(input_json) {
         Ok(Value::Object(map)) => map,
         Ok(_) => {
             return memory_tool_execution_outcome(
-                b"palyra.memory.recall.attestation.v1",
+                namespace,
                 proposal_id,
                 input_json,
                 false,
@@ -2554,7 +2690,7 @@ pub(crate) async fn execute_memory_recall_tool(
         }
         Err(error) => {
             return memory_tool_execution_outcome(
-                b"palyra.memory.recall.attestation.v1",
+                namespace,
                 proposal_id,
                 input_json,
                 false,
@@ -2568,7 +2704,7 @@ pub(crate) async fn execute_memory_recall_tool(
         Some(value) if !value.is_empty() => value.to_owned(),
         _ => {
             return memory_tool_execution_outcome(
-                b"palyra.memory.recall.attestation.v1",
+                namespace,
                 proposal_id,
                 input_json,
                 false,
@@ -2579,7 +2715,7 @@ pub(crate) async fn execute_memory_recall_tool(
     };
     if query.len() > MAX_MEMORY_TOOL_QUERY_BYTES {
         return memory_tool_execution_outcome(
-            b"palyra.memory.recall.attestation.v1",
+            namespace,
             proposal_id,
             input_json,
             false,
@@ -2593,7 +2729,7 @@ pub(crate) async fn execute_memory_recall_tool(
         Some(Value::Null) | None => None,
         Some(_) => {
             return memory_tool_execution_outcome(
-                b"palyra.memory.recall.attestation.v1",
+                namespace,
                 proposal_id,
                 input_json,
                 false,
@@ -2607,7 +2743,7 @@ pub(crate) async fn execute_memory_recall_tool(
             Some(current_channel) if current_channel == requested_channel => {}
             Some(_) => {
                 return memory_tool_execution_outcome(
-                    b"palyra.memory.recall.attestation.v1",
+                    namespace,
                     proposal_id,
                     input_json,
                     false,
@@ -2618,7 +2754,7 @@ pub(crate) async fn execute_memory_recall_tool(
             }
             None => {
                 return memory_tool_execution_outcome(
-                    b"palyra.memory.recall.attestation.v1",
+                    namespace,
                     proposal_id,
                     input_json,
                     false,
@@ -2633,7 +2769,7 @@ pub(crate) async fn execute_memory_recall_tool(
     let min_score = parsed.get("min_score").and_then(Value::as_f64).unwrap_or(0.0);
     if !min_score.is_finite() || !(0.0..=1.0).contains(&min_score) {
         return memory_tool_execution_outcome(
-            b"palyra.memory.recall.attestation.v1",
+            namespace,
             proposal_id,
             input_json,
             false,
@@ -2646,7 +2782,7 @@ pub(crate) async fn execute_memory_recall_tool(
         Ok(value) => value.unwrap_or(4),
         Err(error) => {
             return memory_tool_execution_outcome(
-                b"palyra.memory.recall.attestation.v1",
+                namespace,
                 proposal_id,
                 input_json,
                 false,
@@ -2659,7 +2795,7 @@ pub(crate) async fn execute_memory_recall_tool(
         Ok(value) => value.unwrap_or(4),
         Err(error) => {
             return memory_tool_execution_outcome(
-                b"palyra.memory.recall.attestation.v1",
+                namespace,
                 proposal_id,
                 input_json,
                 false,
@@ -2675,7 +2811,7 @@ pub(crate) async fn execute_memory_recall_tool(
         Ok(value) => value.unwrap_or(DEFAULT_MEMORY_RECALL_MAX_CANDIDATES),
         Err(error) => {
             return memory_tool_execution_outcome(
-                b"palyra.memory.recall.attestation.v1",
+                namespace,
                 proposal_id,
                 input_json,
                 false,
@@ -2691,7 +2827,7 @@ pub(crate) async fn execute_memory_recall_tool(
                 .contains(&value)
             {
                 return memory_tool_execution_outcome(
-                    b"palyra.memory.recall.attestation.v1",
+                    namespace,
                     proposal_id,
                     input_json,
                     false,
@@ -2729,7 +2865,7 @@ pub(crate) async fn execute_memory_recall_tool(
         Ok(prefix) => prefix,
         Err(error) => {
             return memory_tool_execution_outcome(
-                b"palyra.memory.recall.attestation.v1",
+                namespace,
                 proposal_id,
                 input_json,
                 false,
@@ -2765,7 +2901,7 @@ pub(crate) async fn execute_memory_recall_tool(
         Ok(preview) => preview,
         Err(error) => {
             return memory_tool_execution_outcome(
-                b"palyra.memory.recall.attestation.v1",
+                namespace,
                 proposal_id,
                 input_json,
                 false,
@@ -2778,7 +2914,7 @@ pub(crate) async fn execute_memory_recall_tool(
     let payload = memory_recall_tool_output_payload(&preview);
     match serde_json::to_vec(&payload) {
         Ok(output_json) => memory_tool_execution_outcome(
-            b"palyra.memory.recall.attestation.v1",
+            namespace,
             proposal_id,
             input_json,
             true,
@@ -2786,7 +2922,7 @@ pub(crate) async fn execute_memory_recall_tool(
             String::new(),
         ),
         Err(error) => memory_tool_execution_outcome(
-            b"palyra.memory.recall.attestation.v1",
+            namespace,
             proposal_id,
             input_json,
             false,
@@ -2796,6 +2932,11 @@ pub(crate) async fn execute_memory_recall_tool(
     }
 }
 
+/// Executes `palyra.memory.session_search`: searches prior-session tape
+/// windows (current session excluded unless `include_current_session`), with
+/// a session-metadata listing as fallback evidence, and emits the
+/// label-pseudonymized payload. Failures are reported via
+/// `outcome.success == false`, never `Err`.
 pub(crate) async fn execute_memory_session_search_tool(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -3012,6 +3153,8 @@ pub(crate) async fn execute_memory_session_search_tool(
             );
         }
     };
+    // Fetch one extra candidate when the current session will be filtered
+    // out below, so the fallback list can still reach top_k.
     let session_fallback_limit =
         if include_current_session { top_k } else { top_k.saturating_add(1) };
     let mut session_hits = match runtime_state
@@ -3074,6 +3217,15 @@ fn parse_memory_tool_object(input_json: &[u8]) -> Result<Map<String, Value>, Str
     }
 }
 
+/// Parses an optional integer limit, clamping into `min..=max`; absent and
+/// `null` mean "use the caller's default", any non-u64 value is an error.
+///
+/// AIDEV-NOTE: `value as usize` truncates u64 on 32-bit targets before the
+/// clamp, so an absurdly large input could clamp to `min` instead of `max`.
+/// Same pattern in parse_optional_recall_limit and the inline top_k /
+/// max_candidates / prompt_budget_tokens parses. Harmless on the 64-bit
+/// daemon targets; fixing it means switching to u64 bounds (behavior change
+/// on 32-bit only).
 fn parse_optional_session_search_limit(
     value: Option<&Value>,
     field: &str,
@@ -3126,6 +3278,9 @@ fn parse_string_array_field(
     Ok(parsed)
 }
 
+/// Extracts reflection observations from the first non-empty input form:
+/// `observations` (string array), then `messages` (objects with `content`),
+/// then `content_text` split on newlines/semicolons.
 fn parse_reflection_observations(parsed: &Map<String, Value>) -> Result<Vec<String>, String> {
     if let Some(value) = parsed.get("observations") {
         let Value::Array(values) = value else {
@@ -3198,6 +3353,8 @@ fn parse_reflection_categories(
     Ok(categories)
 }
 
+/// Default provenance for tool-initiated memory writes, tying the write back
+/// to the proposal, run, and session that produced it.
 fn retain_tool_provenance(context: ToolRuntimeExecutionContext<'_>, proposal_id: &str) -> Value {
     json!({
         "tool_proposal_id": proposal_id,
@@ -3209,6 +3366,7 @@ fn retain_tool_provenance(context: ToolRuntimeExecutionContext<'_>, proposal_id:
     })
 }
 
+/// Default MEMORY.md document path inside the inferred project prefix.
 async fn infer_project_memory_document_path(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -3228,6 +3386,8 @@ async fn infer_project_memory_prefix(
         .map(str::to_owned)
 }
 
+/// Infers the project memory scope from the first active workspace root of
+/// the resolved agent; empty when no root can be resolved.
 async fn infer_project_memory_search_scope(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -3242,6 +3402,9 @@ async fn infer_project_memory_search_scope(
     }
 }
 
+/// Resolves the workspace roots for the context's agent, honoring run-launch
+/// overrides; agent resolution failure falls back to run-launch context
+/// alone rather than failing the memory operation.
 async fn resolve_memory_agent_workspace_roots(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -3273,6 +3436,10 @@ async fn resolve_memory_agent_workspace_roots(
     .await
 }
 
+/// Computes the candidate `projects/...` prefixes for a workspace root: the
+/// stable identity prefix (`project-<slug>-<path-hash>`) first, then the
+/// plain `projects/<basename>` form for memories written before identity
+/// prefixes existed (or with explicit basename prefixes).
 pub(crate) fn project_memory_prefix_candidates_from_workspace_root(root: &Path) -> Vec<String> {
     let mut prefixes = Vec::new();
     if let Some(identity_prefix) = project_memory_prefix_from_workspace_root(root) {
@@ -3289,7 +3456,14 @@ pub(crate) fn project_memory_prefix_candidates_from_workspace_root(root: &Path) 
     prefixes
 }
 
+/// Derives the identity prefix `projects/project-<slug>-<hash10>` from the
+/// canonicalized root path, so two projects with the same directory name get
+/// distinct memory namespaces.
 fn project_memory_prefix_from_workspace_root(root: &Path) -> Option<String> {
+    // AIDEV-NOTE: blocking std::fs::canonicalize on the async tool path
+    // (called from infer_project_memory_search_scope). One metadata syscall
+    // is normally cheap, but on network filesystems it can stall a runtime
+    // worker; moving it to spawn_blocking is a behavior change left undone.
     let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let name = last_normal_path_segment(canonical.as_path())?;
     let slug = project_memory_slug(name.as_str());
@@ -3310,6 +3484,9 @@ fn last_normal_path_segment(path: &Path) -> Option<String> {
     })
 }
 
+/// Lowercase ASCII slug of a directory name: alphanumerics kept, runs of
+/// anything else collapse to single dashes, length-capped; "workspace" when
+/// nothing survives.
 fn project_memory_slug(name: &str) -> String {
     const MAX_SLUG_CHARS: usize = 80;
 
@@ -3335,6 +3512,9 @@ fn project_memory_slug(name: &str) -> String {
     }
 }
 
+// Path fingerprint normalized for hashing: forward slashes everywhere, and
+// case-folded on Windows so the same root reached through different casing
+// hashes to the same project identity.
 fn project_memory_root_fingerprint(root: &Path) -> String {
     let normalized = root.to_string_lossy().replace('\\', "/").trim_end_matches('/').to_owned();
     #[cfg(windows)]
@@ -3347,6 +3527,12 @@ fn project_memory_root_fingerprint(root: &Path) -> String {
     }
 }
 
+/// Resolves the target document path for a workspace/project retain:
+/// explicit path/prefix input wins, then the inferred project MEMORY.md,
+/// then the scope default. Paths that fail workspace normalization get one
+/// remap attempt under `projects/` (so bare names and absolute workspace
+/// roots still land in project memory); `scope=project` must end up under
+/// `projects/`.
 fn workspace_memory_retain_path(
     parsed: &Map<String, Value>,
     scope: WorkspaceMemoryRetainScope,
@@ -3391,6 +3577,10 @@ fn workspace_memory_retain_path(
     Ok(normalized)
 }
 
+/// Resolves the search prefix for workspace/project memory search, with the
+/// same explicit -> inferred -> default precedence and `projects/` remap as
+/// [`workspace_memory_retain_path`]. Project scope is never allowed to widen
+/// to root workspace memory.
 fn workspace_memory_search_prefix(
     explicit_prefix: Option<&str>,
     scope: &str,
@@ -3437,6 +3627,8 @@ fn workspace_memory_search_prefix(
     Ok(Some(normalized))
 }
 
+// Directory-like inputs (no allowed document extension) address the
+// MEMORY.md inside them.
 fn workspace_memory_document_candidate(raw_path: &str) -> String {
     if workspace_memory_path_has_allowed_extension(raw_path) {
         raw_path.to_owned()
@@ -3461,12 +3653,17 @@ fn workspace_memory_project_prefix_candidate(raw_path: &str) -> Option<String> {
     Some(format!("projects/{}", target.trim_end_matches('/')))
 }
 
+/// Maps a free-form path onto a `projects/` target. Absolute-looking inputs
+/// (leading slash, drive letter, or scheme-like `:/`) reduce to their final
+/// segment -- the workspace root's basename -- while relative inputs keep
+/// their full segment chain.
 fn workspace_memory_project_target(raw_path: &str) -> Option<String> {
     let trimmed = raw_path.trim().trim_matches('"').trim_matches('\'').trim();
     if trimmed.is_empty() {
         return None;
     }
     let normalized = trimmed.replace('\\', "/");
+    // A drive letter shows up as ':' at byte 1 after backslash replacement.
     let absolute_like = normalized.starts_with('/')
         || normalized.as_bytes().get(1).is_some_and(|value| *value == b':')
         || normalized.contains(":/");
@@ -3488,6 +3685,9 @@ fn workspace_memory_path_has_allowed_extension(path: &str) -> bool {
         .any(|extension| lower.ends_with(format!(".{extension}").as_str()))
 }
 
+/// Prepares the existing document for a retain write: when replacement terms
+/// are given, entries matching them are removed first (correction
+/// semantics). Returns the base content and how many entries were removed.
 fn workspace_memory_document_base_content(
     existing_content: Option<&str>,
     _category_hint: Option<MemoryWriteCategory>,
@@ -3504,6 +3704,10 @@ fn workspace_memory_document_base_content(
     (Some(content), replaced_entries)
 }
 
+/// Removes entries matched by the replacement terms from a memory document.
+/// Entries are framed by their `- remembered_at_unix_ms=` metadata line (see
+/// [`workspace_memory_markdown_entry`]); everything before the first entry
+/// (title, prose) is preserved verbatim.
 fn workspace_memory_remove_replaced_entries(
     existing_content: &str,
     replaces_terms: &[String],
@@ -3554,6 +3758,9 @@ fn flush_workspace_memory_entry(
     0
 }
 
+/// An entry matches when any sufficiently distinctive replacement token
+/// appears in it. Tokens shorter than 5 chars without a digit are ignored so
+/// stopwords ("use", "for") cannot wipe unrelated entries.
 fn workspace_memory_entry_matches_replacement(entry: &str, replaces_terms: &[String]) -> bool {
     let entry_tokens = workspace_memory_replacement_tokens(entry);
     if entry_tokens.is_empty() {
@@ -3585,6 +3792,9 @@ fn workspace_memory_replacement_tokens(input: &str) -> Vec<String> {
     tokens
 }
 
+/// Appends a new memory entry to the document (creating it with a title
+/// heading when absent). Returns the resulting content and whether anything
+/// was appended.
 #[allow(clippy::too_many_arguments)]
 fn workspace_memory_document_content(
     existing_content: Option<&str>,
@@ -3597,6 +3807,8 @@ fn workspace_memory_document_content(
     now_unix_ms: i64,
 ) -> (String, bool) {
     if let Some(existing) = existing_content {
+        // Dedupe is a plain substring check: if the exact text already
+        // appears anywhere in the document, the write is a no-op.
         if existing.contains(content_text) {
             return (existing.to_owned(), false);
         }
@@ -3635,6 +3847,10 @@ fn workspace_memory_document_content(
     (content, true)
 }
 
+/// Renders one document entry: a `- key=value ...` metadata line followed by
+/// the two-space-indented content. The `remembered_at_unix_ms=` lead-in is
+/// the entry framing marker that [`workspace_memory_remove_replaced_entries`]
+/// keys on -- keep them in sync.
 fn workspace_memory_markdown_entry(
     content_text: &str,
     source: MemorySource,
@@ -3659,6 +3875,9 @@ fn workspace_memory_markdown_entry(
     format!("- {}\n{}", metadata.join(" "), indented_content.join("\n"))
 }
 
+/// Document metadata for tool output -- deliberately excludes content_text
+/// and content_hash so full document bodies never leak through memory tools
+/// (pinned by tests).
 fn workspace_document_output_payload(document: &WorkspaceDocumentRecord) -> Value {
     json!({
         "document_id": document.document_id.as_str(),
@@ -3686,6 +3905,7 @@ fn memory_hit_provenance(hit: &MemorySearchHit) -> Value {
     })
 }
 
+// Narrowest binding wins: session beats channel beats principal.
 fn memory_item_scope_label(item: &crate::journal::MemoryItemRecord) -> &'static str {
     if item.session_id.is_some() {
         "session"
@@ -3696,6 +3916,8 @@ fn memory_item_scope_label(item: &crate::journal::MemoryItemRecord) -> &'static 
     }
 }
 
+/// Policy resource string for writes against an existing item, derived from
+/// the item's own scope bindings.
 fn memory_item_write_resource(item: &MemoryItemRecord) -> String {
     if let Some(session_id) = item.session_id.as_deref() {
         format!("memory:session:{session_id}")
@@ -3706,6 +3928,7 @@ fn memory_item_write_resource(item: &MemoryItemRecord) -> String {
     }
 }
 
+/// Parameter bundle for serializing a workspace retain outcome.
 struct WorkspaceMemoryRetainSerialization<'a> {
     namespace: &'static [u8],
     proposal_id: &'a str,
@@ -3777,6 +4000,10 @@ fn serialize_workspace_memory_retain_outcome(
     }
 }
 
+/// Serializes a lifecycle retain outcome into the tool result. Tool-level
+/// success mirrors `durable_memory_write`: a needs-review or rejected retain
+/// is reported as failure with an explicit "do not claim stored" error so
+/// the model cannot mistake a held write for a persisted one.
 fn serialize_memory_lifecycle_outcome(
     namespace: &'static [u8],
     proposal_id: &str,
@@ -3841,6 +4068,9 @@ fn serialize_memory_lifecycle_outcome(
     }
 }
 
+/// Spells out whether the written memory is visible to future sessions:
+/// only durable principal-scoped writes are, and the claim boundary says so
+/// explicitly for every other case.
 fn memory_lifecycle_visibility_payload(outcome: &MemoryLifecycleRetainOutcome) -> Value {
     let cross_session =
         outcome.durable_memory_write && outcome.scope == MemoryLifecycleScope::Principal;
@@ -3882,6 +4112,9 @@ fn memory_lifecycle_review_payload(outcome: &MemoryLifecycleRetainOutcome) -> Op
     }))
 }
 
+/// Builds the operator CLI command suggested for completing a held write,
+/// appending session/channel flags only when their values pass the strict
+/// argument allowlist.
 fn memory_lifecycle_review_command(outcome: &MemoryLifecycleRetainOutcome) -> String {
     let mut command =
         "palyra memory ingest \"<reviewed memory content>\" --source manual --confidence 1.0"
@@ -3911,6 +4144,10 @@ fn memory_lifecycle_review_command(outcome: &MemoryLifecycleRetainOutcome) -> St
     command
 }
 
+/// Allowlist filter for values interpolated into the suggested operator
+/// command: bounded length, no surrounding whitespace, and only
+/// shell-inert identifier characters -- provenance is model-influenced, so
+/// this blocks command injection into the copy-pasteable command.
 fn memory_lifecycle_review_command_arg(raw: &str) -> Option<&str> {
     let value = raw.trim();
     if value.is_empty() || value.len() > 256 || value.len() != raw.len() {
@@ -3977,6 +4214,8 @@ fn serialize_memory_reflection_outcome(
     }
 }
 
+/// Parses a memory source literal, accepting the canonical `tape:*` forms
+/// plus underscore and bare aliases.
 fn parse_memory_source_literal(raw: &str) -> Option<MemorySource> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "tape:user_message" | "tape_user_message" | "user_message" => {
@@ -3992,6 +4231,10 @@ fn parse_memory_source_literal(raw: &str) -> Option<MemorySource> {
     }
 }
 
+/// Assembles the final outcome with its execution attestation. The hash is
+/// computed over namespace, proposal id, input, success flag, output, error,
+/// and timestamp, each variable-length field prefixed with its big-endian
+/// length so adjacent fields cannot be reinterpreted across boundaries.
 fn memory_tool_execution_outcome(
     attestation_namespace: &'static [u8],
     proposal_id: &str,
@@ -4030,6 +4273,9 @@ fn memory_tool_execution_outcome(
     }
 }
 
+/// Recall variant of the optional-limit parser (zero allowed, clamped to
+/// `0..=max`); see the AIDEV-NOTE on [`parse_optional_session_search_limit`]
+/// about the u64-to-usize cast.
 fn parse_optional_recall_limit(value: Option<&Value>, max: usize) -> Result<Option<usize>, String> {
     match value.and_then(Value::as_u64) {
         Some(value) => Ok(Some((value as usize).clamp(0, max))),
@@ -4052,6 +4298,9 @@ fn memory_retain_scope_text(parsed: &Map<String, Value>) -> String {
     memory_scope_text(parsed, DEFAULT_MEMORY_RETAIN_SCOPE)
 }
 
+// A workspace prefix without an explicit scope implies workspace search;
+// otherwise prefixed searches would silently default to scope=all and
+// ignore the prefix's intent.
 fn memory_search_scope_text(parsed: &Map<String, Value>) -> String {
     if !parsed.contains_key("scope")
         && (optional_trimmed_string(parsed.get("workspace_prefix")).is_some()
@@ -4062,6 +4311,8 @@ fn memory_search_scope_text(parsed: &Map<String, Value>) -> String {
     memory_scope_text(parsed, DEFAULT_MEMORY_SEARCH_SCOPE)
 }
 
+// Recall only distinguishes project vs. workspace for its document branch;
+// lifecycle scopes collapse to workspace here.
 fn memory_recall_workspace_scope_text(parsed: &Map<String, Value>) -> String {
     let scope = memory_scope_text(parsed, "workspace");
     if scope == "project" {

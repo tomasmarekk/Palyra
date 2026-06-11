@@ -1,3 +1,20 @@
+//! Memory provider abstraction: pluggable backends that contribute context
+//! blocks, recall hits, and write handling to the orchestrator session
+//! lifecycle.
+//!
+//! [`MemoryProviderRuntime`] defines hook points (initialize, status, system
+//! prompt block, prefetch, turn sync, session end, pre-compact, memory
+//! write) with no-op defaults so providers implement only what they support.
+//! Two built-ins exist: [`BuiltinJournalMemoryProvider`] over the durable
+//! lifecycle store in the journal (see `application::memory`), and
+//! [`WorkspaceMemoryProvider`] over indexed workspace documents.
+//!
+//! Everything a provider returns is treated as retrieved evidence: content
+//! is redacted via `redact_memory_text_for_output`, labeled with a trust
+//! label, and carries an injection scan status, so callers can fence it
+//! before prompt assembly. Provider writes go through the same
+//! classification/approval gate as direct memory writes.
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -22,11 +39,15 @@ use crate::{
     transport::grpc::auth::RequestContext,
 };
 
+// System-prompt injection is the highest-trust placement, so only items with
+// high stored confidence qualify; prefetch hits are advisory and use a loose
+// score floor instead.
 const MEMORY_PROVIDER_SYSTEM_PROMPT_MIN_CONFIDENCE: f64 = 0.82;
 const MEMORY_PROVIDER_PREFETCH_MIN_SCORE: f64 = 0.05;
 const MEMORY_PROVIDER_SYSTEM_PROMPT_TOP_K: usize = 8;
 const MEMORY_PROVIDER_PREFETCH_TOP_K: usize = 8;
 
+/// Overall provider health reported by [`MemoryProviderRuntime::status`].
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -36,6 +57,7 @@ pub(crate) enum MemoryProviderHealth {
     Unavailable,
 }
 
+/// Freshness of the provider's retrieval index.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -46,6 +68,8 @@ pub(crate) enum MemoryProviderIndexState {
     Unavailable,
 }
 
+/// Degraded-mode advertisement: whether the provider is degraded, why, and
+/// which fallback strategy it serves results with in the meantime.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct MemoryProviderDegradedMode {
     pub(crate) active: bool,
@@ -54,6 +78,8 @@ pub(crate) struct MemoryProviderDegradedMode {
     pub(crate) fallback: String,
 }
 
+/// Storage and prompt-budget limits the provider operates under; `None`
+/// means no hard limit is configured for that dimension.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct MemoryProviderQuota {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -63,6 +89,8 @@ pub(crate) struct MemoryProviderQuota {
     pub(crate) max_prompt_tokens: usize,
 }
 
+/// Policy posture echoed back to callers so recall consumers know the
+/// boundaries the provider enforces.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct MemoryProviderPolicyLimits {
     pub(crate) sensitivity_ceiling: String,
@@ -71,6 +99,8 @@ pub(crate) struct MemoryProviderPolicyLimits {
     pub(crate) durable_write_requires_approval: bool,
 }
 
+/// Point-in-time provider diagnostics snapshot returned by
+/// [`MemoryProviderRuntime::status`].
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct MemoryProviderStatus {
     pub(crate) provider_id: String,
@@ -86,6 +116,8 @@ pub(crate) struct MemoryProviderStatus {
     pub(crate) updated_at_unix_ms: i64,
 }
 
+/// Per-hit score components surfaced for recall explainability;
+/// `final_score` is the fused ranking value.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct MemoryProviderScoreBreakdown {
     pub(crate) lexical_score: f64,
@@ -97,6 +129,8 @@ pub(crate) struct MemoryProviderScoreBreakdown {
     pub(crate) final_score: f64,
 }
 
+/// Citation pointing a hit back to its source record (memory item or
+/// workspace document) for provenance display.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct MemoryProviderCitation {
     pub(crate) source_kind: String,
@@ -113,6 +147,8 @@ pub(crate) struct MemoryProviderCitation {
     pub(crate) artifact_id: Option<String>,
 }
 
+/// One recall hit from a provider; `snippet` is already redacted and the
+/// trust label marks it as retrieved evidence.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct MemoryProviderHit {
     pub(crate) hit_id: String,
@@ -126,6 +162,8 @@ pub(crate) struct MemoryProviderHit {
     pub(crate) injection_scan_status: String,
 }
 
+/// A redacted, trust-labeled content block a provider offers for prompt
+/// assembly (e.g. the system prompt memory section).
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct MemoryProviderContextBlock {
     pub(crate) block_id: String,
@@ -138,6 +176,9 @@ pub(crate) struct MemoryProviderContextBlock {
     pub(crate) sensitivity: String,
 }
 
+/// Result of a provider write hook: the classification always, plus the
+/// retain outcome when the write was allowed to proceed (`lifecycle` stays
+/// `None` for approval-gated writes).
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct MemoryProviderWriteOutcome {
     pub(crate) classification: MemoryWriteClassification,
@@ -145,6 +186,8 @@ pub(crate) struct MemoryProviderWriteOutcome {
     pub(crate) lifecycle: Option<MemoryLifecycleRetainOutcome>,
 }
 
+/// Uniform envelope returned by every provider hook; `reason_code` explains
+/// the (possibly empty) result and `degraded` flags fallback-quality data.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct MemoryProviderHookOutcome {
     pub(crate) provider_id: String,
@@ -174,6 +217,9 @@ impl MemoryProviderHookOutcome {
     }
 }
 
+/// Authenticated caller context plus session/workspace hints shared by all
+/// provider hooks; `objective`, `active_files`, and `recent_context` feed
+/// the prefetch query.
 #[derive(Debug, Clone)]
 pub(crate) struct MemoryProviderHookContext {
     pub(crate) principal: String,
@@ -191,6 +237,9 @@ pub(crate) struct MemoryProviderHookContext {
 }
 
 impl MemoryProviderHookContext {
+    /// Builds a console-scoped hook context from an authenticated gRPC
+    /// request context, with conservative defaults (normal sensitivity, no
+    /// session/agent/workspace binding).
     #[must_use]
     pub(crate) fn from_request_context(context: &RequestContext) -> Self {
         Self {
@@ -213,6 +262,8 @@ impl MemoryProviderHookContext {
         }
     }
 
+    /// Concatenates objective, active files, and recent context into one
+    /// whitespace-normalized search query; empty when no hints are set.
     fn prefetch_query(&self) -> String {
         [
             self.objective.clone().unwrap_or_default(),
@@ -226,6 +277,8 @@ impl MemoryProviderHookContext {
     }
 }
 
+/// Memory write submitted through a provider's write hook; mirrors the
+/// retain request minus the context fields the hook already carries.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct MemoryProviderWriteCandidate {
@@ -237,6 +290,7 @@ pub(crate) struct MemoryProviderWriteCandidate {
     pub(crate) ttl_unix_ms: Option<i64>,
 }
 
+/// Result of one reindex (embeddings backfill) batch run.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct MemoryProviderReindexOutcome {
     pub(crate) job_id: String,
@@ -251,6 +305,7 @@ pub(crate) struct MemoryProviderReindexOutcome {
     pub(crate) artifact_log: Vec<String>,
 }
 
+/// Progress counters for a reindex run against the target embedding model.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct MemoryProviderReindexProgress {
     pub(crate) batch_size: usize,
@@ -263,12 +318,21 @@ pub(crate) struct MemoryProviderReindexProgress {
     pub(crate) target_version: i64,
 }
 
+/// Lifecycle hook contract for memory backends.
+///
+/// Every hook except [`status`](Self::status) has a no-op default returning
+/// an empty [`MemoryProviderHookOutcome`], so providers opt into only the
+/// hooks they support. Implementations must redact and trust-label any
+/// content they emit.
 #[async_trait]
 #[allow(dead_code)]
 pub(crate) trait MemoryProviderRuntime: Send + Sync {
+    /// Stable provider identifier used in hit/block ids and diagnostics.
     fn provider_id(&self) -> &'static str;
+    /// Provider family (e.g. journal-backed vs. workspace-backed).
     fn provider_kind(&self) -> &'static str;
 
+    /// One-time provider setup for a context.
     async fn initialize(
         &self,
         _context: &MemoryProviderHookContext,
@@ -276,11 +340,17 @@ pub(crate) trait MemoryProviderRuntime: Send + Sync {
         Ok(MemoryProviderHookOutcome::empty(self.provider_id(), "initialized"))
     }
 
+    /// Reports provider health, index state, quotas, and policy limits.
+    ///
+    /// # Errors
+    /// Returns the underlying storage/diagnostics error when the snapshot
+    /// cannot be assembled.
     async fn status(
         &self,
         context: &MemoryProviderHookContext,
     ) -> Result<MemoryProviderStatus, Status>;
 
+    /// Contributes high-trust context blocks for system prompt assembly.
     async fn system_prompt_block(
         &self,
         _context: &MemoryProviderHookContext,
@@ -288,6 +358,7 @@ pub(crate) trait MemoryProviderRuntime: Send + Sync {
         Ok(MemoryProviderHookOutcome::empty(self.provider_id(), "system_prompt_block_empty"))
     }
 
+    /// Speculatively fetches recall hits for the context's objective/files.
     async fn prefetch(
         &self,
         _context: &MemoryProviderHookContext,
@@ -295,6 +366,7 @@ pub(crate) trait MemoryProviderRuntime: Send + Sync {
         Ok(MemoryProviderHookOutcome::empty(self.provider_id(), "prefetch_empty"))
     }
 
+    /// Synchronizes provider state after a conversation turn.
     async fn sync_turn(
         &self,
         _context: &MemoryProviderHookContext,
@@ -302,6 +374,7 @@ pub(crate) trait MemoryProviderRuntime: Send + Sync {
         Ok(MemoryProviderHookOutcome::empty(self.provider_id(), "sync_turn_noop"))
     }
 
+    /// Runs provider cleanup/distillation when a session ends.
     async fn on_session_end(
         &self,
         _context: &MemoryProviderHookContext,
@@ -309,6 +382,7 @@ pub(crate) trait MemoryProviderRuntime: Send + Sync {
         Ok(MemoryProviderHookOutcome::empty(self.provider_id(), "session_end_noop"))
     }
 
+    /// Lets the provider preserve context before session compaction.
     async fn on_pre_compact(
         &self,
         _context: &MemoryProviderHookContext,
@@ -316,6 +390,8 @@ pub(crate) trait MemoryProviderRuntime: Send + Sync {
         Ok(MemoryProviderHookOutcome::empty(self.provider_id(), "pre_compact_noop"))
     }
 
+    /// Handles a memory write candidate; implementations classify the write
+    /// and may persist it subject to the approval gate.
     async fn on_memory_write(
         &self,
         _context: &MemoryProviderHookContext,
@@ -325,6 +401,8 @@ pub(crate) trait MemoryProviderRuntime: Send + Sync {
     }
 }
 
+/// Provider over the durable lifecycle memory store in the journal; writes
+/// route through [`MemoryLifecycleProvider`].
 pub(crate) struct BuiltinJournalMemoryProvider {
     runtime_state: Arc<GatewayRuntimeState>,
 }
@@ -354,6 +432,9 @@ impl MemoryProviderRuntime for BuiltinJournalMemoryProvider {
         let embeddings = self.runtime_state.memory_embeddings_status().await?;
         let retrieval = self.runtime_state.retrieval_backend_snapshot()?;
         let memory_config = self.runtime_state.memory_config_snapshot();
+        // Embeddings degradation outranks external-index errors as the
+        // reported reason; either one degrades health and marks the index
+        // stale, with lexical search as the advertised fallback.
         let degraded_reason = embeddings.degraded_reason_code.clone().or_else(|| {
             retrieval.external_index.as_ref().and_then(|index| index.last_error.clone())
         });
@@ -416,6 +497,8 @@ impl MemoryProviderRuntime for BuiltinJournalMemoryProvider {
                 sources: curated_memory_sources_for_provider_prompt(),
             })
             .await?;
+        // Only high-confidence, stable (preference/rule-like) memories may
+        // enter the system prompt; everything else stays recall-only.
         let blocks = hits
             .iter()
             .filter(|hit| {
@@ -504,6 +587,8 @@ impl MemoryProviderRuntime for BuiltinJournalMemoryProvider {
             provenance: context.provenance.clone(),
             now_unix_ms: current_unix_ms_status()?,
         });
+        // Approval-gated writes stop at classification: the caller gets the
+        // verdict but nothing is persisted until an operator approves.
         let lifecycle = if classification.approval_state == MemoryWriteApprovalState::Required {
             None
         } else {
@@ -538,6 +623,8 @@ impl MemoryProviderRuntime for BuiltinJournalMemoryProvider {
     }
 }
 
+/// Provider over indexed workspace documents (MEMORY.md and project files);
+/// read-oriented, with cross-workspace recall disabled by policy.
 pub(crate) struct WorkspaceMemoryProvider {
     runtime_state: Arc<GatewayRuntimeState>,
 }
@@ -686,6 +773,11 @@ impl MemoryProviderRuntime for WorkspaceMemoryProvider {
     }
 }
 
+/// Collects status snapshots from all default providers, in registration
+/// order.
+///
+/// # Errors
+/// Fails fast with the first provider's status error.
 pub(crate) async fn memory_provider_status_snapshot(
     runtime_state: Arc<GatewayRuntimeState>,
     context: &MemoryProviderHookContext,
@@ -697,6 +789,10 @@ pub(crate) async fn memory_provider_status_snapshot(
     Ok(statuses)
 }
 
+/// Collects system-prompt context blocks from all default providers.
+///
+/// # Errors
+/// Fails fast with the first provider's hook error.
 pub(crate) async fn memory_provider_system_prompt_snapshot(
     runtime_state: Arc<GatewayRuntimeState>,
     context: &MemoryProviderHookContext,
@@ -708,6 +804,10 @@ pub(crate) async fn memory_provider_system_prompt_snapshot(
     Ok(outcomes)
 }
 
+/// Runs prefetch on all default providers for the context's query hints.
+///
+/// # Errors
+/// Fails fast with the first provider's hook error.
 pub(crate) async fn memory_provider_prefetch_snapshot(
     runtime_state: Arc<GatewayRuntimeState>,
     context: &MemoryProviderHookContext,
@@ -728,6 +828,11 @@ fn default_memory_providers(
     ]
 }
 
+/// Runs one embeddings-backfill batch for the journal provider and reports
+/// progress; callers re-invoke until `progress.complete`.
+///
+/// # Errors
+/// Propagates the backfill error from the runtime state.
 pub(crate) async fn run_memory_provider_reindex(
     runtime_state: Arc<GatewayRuntimeState>,
     batch_size: usize,
@@ -758,6 +863,9 @@ pub(crate) async fn run_memory_provider_reindex(
     })
 }
 
+/// Converts a journal memory search hit into the provider hit shape,
+/// redacting the snippet and computing the provider-only score components
+/// (sensitivity penalty, exact phrase match).
 pub(crate) fn memory_hit_to_provider_hit(
     provider_id: &str,
     hit: &MemorySearchHit,
@@ -792,6 +900,8 @@ pub(crate) fn memory_hit_to_provider_hit(
     }
 }
 
+/// Converts a workspace document search hit into the provider hit shape;
+/// the document's stored risk state doubles as the injection scan status.
 pub(crate) fn workspace_hit_to_provider_hit(
     provider_id: &str,
     hit: &WorkspaceSearchHit,
@@ -826,6 +936,7 @@ pub(crate) fn workspace_hit_to_provider_hit(
     }
 }
 
+/// Renders a hit's ranking and provenance as a JSON explainability record.
 pub(crate) fn explain_provider_hit(hit: &MemoryProviderHit) -> Value {
     json!({
         "hit_id": hit.hit_id,
@@ -866,6 +977,8 @@ fn workspace_document_to_context_block(
     provider_id: &str,
     document: &WorkspaceDocumentRecord,
 ) -> MemoryProviderContextBlock {
+    // System-prompt blocks re-scan content at read time instead of trusting
+    // the stored risk_state, since the prompt is the highest-trust placement.
     let scan = scan_workspace_content_for_prompt_injection(document.content_text.as_str());
     MemoryProviderContextBlock {
         block_id: format!("{provider_id}:{}", document.document_id),
@@ -886,6 +999,9 @@ fn workspace_document_to_context_block(
     }
 }
 
+/// Stability filter for system-prompt placement: prefer the explicit
+/// category tags written at retain time; fall back to keyword sniffing for
+/// untagged items so legacy preferences still surface.
 fn stable_memory_hit_for_system_prompt(hit: &MemorySearchHit) -> bool {
     hit.item.tags.iter().any(|tag| {
         matches!(
@@ -901,10 +1017,14 @@ fn stable_memory_hit_for_system_prompt(hit: &MemorySearchHit) -> bool {
     }
 }
 
+// Only curated sources may reach the system prompt; tape-derived and summary
+// memories are excluded as too noisy/untrusted for that placement.
 fn curated_memory_sources_for_provider_prompt() -> Vec<MemorySource> {
     vec![MemorySource::Manual, MemorySource::Import]
 }
 
+// System-prompt visibility is opt-in: a document must be active, scanned
+// clean, and explicitly pinned or bound as a system candidate.
 fn workspace_document_visible_in_system_prompt(document: &WorkspaceDocumentRecord) -> bool {
     document.state == "active"
         && document.risk_state == "clean"
@@ -923,6 +1043,8 @@ fn exact_phrase_match(query: &str, snippet: &str) -> f64 {
     }
 }
 
+// Flat ranking penalty for snippets that mention secret-like keywords, so
+// potentially sensitive matches sort below equally relevant clean ones.
 fn sensitivity_penalty(snippet: &str) -> f64 {
     let lower = snippet.to_ascii_lowercase();
     if ["api key", "password", "private key", "secret", "session token", "token"]
