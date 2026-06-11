@@ -1,3 +1,13 @@
+//! Execution backend inventory, selection, and preflight for tool jobs.
+//!
+//! Models where tool work may run -- local sandbox, paired desktop node,
+//! attested networked worker, or operator SSH tunnel -- and resolves a
+//! requested [`ExecutionBackendPreference`] against the live inventory.
+//! Preview backends stay disabled until their `PALYRA_EXPERIMENTAL_*` rollout
+//! flags opt in; the local sandbox is the conservative default. Also hosts
+//! fail-closed container/SSH profile validation and recovery planning for
+//! stuck tool jobs ([`plan_stuck_tool_job_recovery`]).
+
 #![allow(dead_code)]
 
 use std::collections::BTreeSet;
@@ -19,8 +29,14 @@ use crate::{
     sandbox_runner::{process_runner_executor_name, SandboxProcessRunnerPolicy},
 };
 
+/// A desktop node counts as healthy only when seen within this window.
 const NODE_HEALTHY_AFTER_MS: i64 = 5 * 60 * 1_000;
 
+/// Operator/runtime preference for where tool work should execute.
+///
+/// `Automatic` keeps the conservative default (local sandbox) until a
+/// preview backend is explicitly selected. Serialized snake_case values are
+/// persisted in tool job records; do not rename variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ExecutionBackendPreference {
@@ -33,6 +49,7 @@ pub(crate) enum ExecutionBackendPreference {
 }
 
 impl ExecutionBackendPreference {
+    /// Stable snake_case identifier; doubles as the inventory `backend_id`.
     #[must_use]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
@@ -44,6 +61,7 @@ impl ExecutionBackendPreference {
         }
     }
 
+    /// Human-readable label for operator surfaces.
     #[must_use]
     pub(crate) const fn label(self) -> &'static str {
         match self {
@@ -55,6 +73,7 @@ impl ExecutionBackendPreference {
         }
     }
 
+    /// One-sentence operator description of the backend's posture.
     #[must_use]
     pub(crate) const fn description(self) -> &'static str {
         match self {
@@ -77,6 +96,7 @@ impl ExecutionBackendPreference {
     }
 }
 
+/// Inventory health of a backend; only `Available` backends are selectable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ExecutionBackendState {
@@ -86,6 +106,7 @@ pub(crate) enum ExecutionBackendState {
 }
 
 impl ExecutionBackendState {
+    /// Stable snake_case identifier matching the serde representation.
     #[must_use]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
@@ -96,6 +117,9 @@ impl ExecutionBackendState {
     }
 }
 
+/// One advertised execution backend with its live state, rollout posture,
+/// declared capabilities, and workspace/cleanup contract. This is what the
+/// console renders and what the resolvers select from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ExecutionBackendInventoryRecord {
     pub(crate) backend_id: String,
@@ -125,6 +149,8 @@ pub(crate) struct ExecutionBackendInventoryRecord {
     pub(crate) total_node_count: usize,
 }
 
+/// Result of resolving a backend preference: what was requested, what was
+/// chosen, whether a fallback happened, and whether approval is required.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ExecutionBackendResolution {
     pub(crate) requested: ExecutionBackendPreference,
@@ -135,6 +161,7 @@ pub(crate) struct ExecutionBackendResolution {
     pub(crate) reason: String,
 }
 
+/// How a backend materializes the workspace a tool job runs against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum WorkspaceStrategyKind {
@@ -147,6 +174,7 @@ pub(crate) enum WorkspaceStrategyKind {
 }
 
 impl WorkspaceStrategyKind {
+    /// Stable snake_case identifier matching the serde representation.
     #[must_use]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
@@ -160,6 +188,7 @@ impl WorkspaceStrategyKind {
     }
 }
 
+/// How results flow back into the primary workspace, if at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum WorkspaceWritebackMode {
@@ -169,6 +198,9 @@ pub(crate) enum WorkspaceWritebackMode {
     LeaseCommit,
 }
 
+/// Full workspace contract of a backend: lifecycle, isolation, cleanup,
+/// writeback mode, and preconditions. Hashable into an attestation digest via
+/// [`WorkspaceStrategyDescriptor::attestation_digest_sha256`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct WorkspaceStrategyDescriptor {
     pub(crate) kind: WorkspaceStrategyKind,
@@ -182,6 +214,7 @@ pub(crate) struct WorkspaceStrategyDescriptor {
 }
 
 impl WorkspaceStrategyDescriptor {
+    /// Contract for running directly in the validated daemon workspace root.
     #[must_use]
     pub(crate) fn daemon_workspace_root() -> Self {
         Self {
@@ -196,6 +229,7 @@ impl WorkspaceStrategyDescriptor {
         }
     }
 
+    /// Contract for a scoped git worktree created from a clean base ref.
     #[must_use]
     pub(crate) fn git_worktree() -> Self {
         Self {
@@ -210,6 +244,7 @@ impl WorkspaceStrategyDescriptor {
         }
     }
 
+    /// Contract for a throwaway per-run copy of the scoped workspace.
     #[must_use]
     pub(crate) fn ephemeral_copy() -> Self {
         Self {
@@ -224,6 +259,7 @@ impl WorkspaceStrategyDescriptor {
         }
     }
 
+    /// Contract for a workspace volume mounted into a container profile.
     #[must_use]
     pub(crate) fn container_volume() -> Self {
         Self {
@@ -239,6 +275,7 @@ impl WorkspaceStrategyDescriptor {
         }
     }
 
+    /// Contract for a leased remote worker workspace (networked workers).
     #[must_use]
     pub(crate) fn remote_lease_workspace() -> Self {
         Self {
@@ -253,6 +290,7 @@ impl WorkspaceStrategyDescriptor {
         }
     }
 
+    /// Contract for an operator-managed remote scope (SSH tunnel backend).
     #[must_use]
     pub(crate) fn operator_managed_remote() -> Self {
         Self {
@@ -267,8 +305,12 @@ impl WorkspaceStrategyDescriptor {
         }
     }
 
+    /// SHA-256 over the serialized descriptor, binding the exact workspace
+    /// contract into job attestations.
     #[must_use]
     pub(crate) fn attestation_digest_sha256(&self) -> String {
+        // Serialization of this plain struct cannot realistically fail; the
+        // kind string fallback keeps the digest stable rather than panicking.
         let encoded =
             serde_json::to_vec(self).unwrap_or_else(|_| self.kind.as_str().as_bytes().to_vec());
         let mut hasher = Sha256::new();
@@ -277,6 +319,7 @@ impl WorkspaceStrategyDescriptor {
     }
 }
 
+/// Trust mechanism a backend uses to attest its execution environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum BackendAttestationMode {
@@ -287,6 +330,8 @@ pub(crate) enum BackendAttestationMode {
     WorkerLease,
 }
 
+/// Capability- and workspace-aware backend request used by
+/// [`resolve_execution_backend_for_request`] and the preflight report.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExecutionBackendResolutionRequest {
     pub(crate) preference: ExecutionBackendPreference,
@@ -294,6 +339,8 @@ pub(crate) struct ExecutionBackendResolutionRequest {
     pub(crate) workspace_strategy: Option<WorkspaceStrategyKind>,
 }
 
+/// Coarse environment profile derived from a backend's declared capability
+/// strings; advisory data for operators, not an enforcement surface.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub(crate) struct ExecutionEnvironmentCapabilities {
     pub(crate) filesystem_read: bool,
@@ -308,6 +355,7 @@ pub(crate) struct ExecutionEnvironmentCapabilities {
     pub(crate) memory_limit_bytes: Option<u64>,
 }
 
+/// Health verdict of a backend preflight check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ExecutionBackendHealthStatus {
@@ -316,6 +364,8 @@ pub(crate) enum ExecutionBackendHealthStatus {
     Unavailable,
 }
 
+/// Outcome of preflighting one backend against a resolution request:
+/// status, stable reason code, repair hint, and capability gap.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ExecutionBackendPreflightRecord {
     pub(crate) backend_id: String,
@@ -328,6 +378,7 @@ pub(crate) struct ExecutionBackendPreflightRecord {
     pub(crate) environment: ExecutionEnvironmentCapabilities,
 }
 
+/// Recovery action recommended for a tool job whose heartbeat went stale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum StuckToolJobRecoveryAction {
@@ -338,6 +389,8 @@ pub(crate) enum StuckToolJobRecoveryAction {
     RepairRequired,
 }
 
+/// Recovery recommendation for one stuck tool job; produced by
+/// [`plan_stuck_tool_job_recovery`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct StuckToolJobRecoveryPlan {
     pub(crate) job_id: String,
@@ -348,6 +401,9 @@ pub(crate) struct StuckToolJobRecoveryPlan {
     pub(crate) stale_for_ms: i64,
 }
 
+/// Read-only contract every execution backend exposes for selection and
+/// preflight. Implemented by [`ExecutionBackendInventoryRecord`] so inventory
+/// entries can be preflighted uniformly.
 pub(crate) trait ExecutionBackend {
     fn backend_id(&self) -> &str;
     fn capabilities(&self) -> &[String];
@@ -405,6 +461,8 @@ impl ExecutionBackend for ExecutionBackendInventoryRecord {
     }
 }
 
+/// Default preflight: checks declared capabilities and workspace strategy
+/// against the request and classifies the backend's health.
 pub(crate) fn build_execution_backend_preflight<B: ExecutionBackend + ?Sized>(
     backend: &B,
     request: &ExecutionBackendResolutionRequest,
@@ -422,6 +480,11 @@ pub(crate) fn build_execution_backend_preflight<B: ExecutionBackend + ?Sized>(
     let status = if !missing_capabilities.is_empty() || workspace_mismatch {
         ExecutionBackendHealthStatus::Unavailable
     } else if backend.health_probe().contains("degraded") {
+        // Substring sniffing on the probe label: none of the built-in probe
+        // names contain "degraded", so this branch only fires for custom
+        // ExecutionBackend impls that encode degradation in their probe.
+        // Inventory-level degradation is layered on in
+        // build_execution_backend_preflight_report instead.
         ExecutionBackendHealthStatus::Degraded
     } else {
         ExecutionBackendHealthStatus::Healthy
@@ -465,6 +528,8 @@ pub(crate) fn build_execution_backend_preflight<B: ExecutionBackend + ?Sized>(
     }
 }
 
+/// Preflights every inventory backend against one request, overlaying
+/// inventory-level disabled/degraded state on the per-backend verdicts.
 pub(crate) fn build_execution_backend_preflight_report(
     inventory: &[ExecutionBackendInventoryRecord],
     request: &ExecutionBackendResolutionRequest,
@@ -474,6 +539,8 @@ pub(crate) fn build_execution_backend_preflight_report(
         .iter()
         .map(|backend| {
             let mut record = backend.preflight(request, now_unix_ms);
+            // Inventory state overrides the capability verdict: a disabled
+            // backend stays unavailable even when capabilities would match.
             if !backend.selectable || backend.state == ExecutionBackendState::Disabled {
                 record.status = ExecutionBackendHealthStatus::Unavailable;
                 record.reason_code = "backend.preflight.disabled".to_owned();
@@ -490,6 +557,13 @@ pub(crate) fn build_execution_backend_preflight_report(
         .collect()
 }
 
+/// Plans recovery for an in-flight tool job whose heartbeat is stale, or
+/// returns `None` for jobs that are terminal or still fresh.
+///
+/// Orphaned jobs always get a plan regardless of staleness. The action
+/// depends on what the owning backend still supports: cancel for cancelling
+/// jobs, cleanup for orphans, attach when the backend is healthy, otherwise
+/// mark-failed or repair-required.
 pub(crate) fn plan_stuck_tool_job_recovery(
     job: &ToolJobRecord,
     inventory: &[ExecutionBackendInventoryRecord],
@@ -506,6 +580,8 @@ pub(crate) fn plan_stuck_tool_job_recovery(
     ) {
         return None;
     }
+    // An expired lease caps last_seen: a job whose lease lapsed is treated as
+    // stale from the lease deadline even if a later heartbeat arrived.
     let last_seen = job
         .heartbeat_at_unix_ms
         .unwrap_or(job.updated_at_unix_ms)
@@ -551,6 +627,9 @@ pub(crate) fn plan_stuck_tool_job_recovery(
     })
 }
 
+// Maps free-form capability strings onto the coarse environment profile.
+// The timeout/cpu/memory numbers are advisory defaults for display, not
+// enforced limits; enforcement lives in the per-backend runner policies.
 fn capabilities_to_environment(
     capabilities: &[String],
     workspace_strategy: &WorkspaceStrategyDescriptor,
@@ -585,6 +664,7 @@ fn capabilities_to_environment(
     }
 }
 
+/// Supported container engines for the container-volume backend profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ContainerRuntimeKind {
@@ -592,6 +672,7 @@ pub(crate) enum ContainerRuntimeKind {
     Podman,
 }
 
+/// Container network posture: fully isolated or proxy-mediated egress only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ContainerNetworkPolicy {
@@ -599,6 +680,7 @@ pub(crate) enum ContainerNetworkPolicy {
     EgressProxy,
 }
 
+/// One host-to-container mount; must stay workspace-scoped (validated).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ContainerMountPolicy {
     pub(crate) host_path: String,
@@ -607,6 +689,7 @@ pub(crate) struct ContainerMountPolicy {
     pub(crate) workspace_scoped: bool,
 }
 
+/// Hard resource ceilings for a container run; all must be positive.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ContainerResourceLimits {
     pub(crate) cpu_time_limit_ms: u64,
@@ -614,6 +697,8 @@ pub(crate) struct ContainerResourceLimits {
     pub(crate) max_output_bytes: u64,
 }
 
+/// Where a container env value comes from: an inline non-secret literal or a
+/// vault reference resolved at launch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ContainerEnvSourceKind {
@@ -621,6 +706,7 @@ pub(crate) enum ContainerEnvSourceKind {
     VaultRef,
 }
 
+/// One environment variable binding inside a container profile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ContainerEnvBinding {
     pub(crate) name: String,
@@ -628,6 +714,8 @@ pub(crate) struct ContainerEnvBinding {
     pub(crate) value: String,
 }
 
+/// Declarative container execution profile; `validate` enforces the
+/// fail-closed security invariants before any container is launched.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ContainerBackendProfile {
     pub(crate) profile_id: String,
@@ -643,6 +731,13 @@ pub(crate) struct ContainerBackendProfile {
 }
 
 impl ContainerBackendProfile {
+    /// Validates the fail-closed container invariants: no privileged
+    /// containers, explicit non-root user, positive resource limits,
+    /// workspace-scoped mounts only, and secret env values only via
+    /// `vault://` references.
+    ///
+    /// # Errors
+    /// Returns a human-readable message naming the first violated invariant.
     pub(crate) fn validate(&self) -> Result<(), String> {
         if self.profile_id.trim().is_empty() {
             return Err("container backend profile_id must not be empty".to_owned());
@@ -667,6 +762,9 @@ impl ContainerBackendProfile {
         if self.mounts.iter().any(|mount| !mount.workspace_scoped) {
             return Err("container backend mounts must be workspace-scoped".to_owned());
         }
+        // A literal value under a sensitive-looking env name is treated as a
+        // leaked secret regardless of its content: secret material may only
+        // travel as a vault reference.
         if self.env.iter().any(|binding| {
             matches!(binding.source_kind, ContainerEnvSourceKind::LiteralSafeValue)
                 && palyra_common::redaction::is_sensitive_key(binding.name.as_str())
@@ -683,6 +781,8 @@ impl ContainerBackendProfile {
     }
 }
 
+/// Declarative SSH worker profile. All connection material is referenced via
+/// `vault://` or `identity://` handles -- never plaintext (validated).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SshWorkerBackendProfile {
     pub(crate) profile_id: String,
@@ -695,6 +795,12 @@ pub(crate) struct SshWorkerBackendProfile {
 }
 
 impl SshWorkerBackendProfile {
+    /// Validates the fail-closed SSH worker invariants: handle-only
+    /// credentials, the versioned worker RPC envelope (no raw shell), and a
+    /// remote-lease workspace strategy.
+    ///
+    /// # Errors
+    /// Returns a human-readable message naming the first violated invariant.
     pub(crate) fn validate(&self) -> Result<(), String> {
         if self.profile_id.trim().is_empty() {
             return Err("ssh worker profile_id must not be empty".to_owned());
@@ -721,6 +827,12 @@ impl SshWorkerBackendProfile {
     }
 }
 
+/// Parses an operator-supplied backend preference, accepting short aliases
+/// (`auto`, `local`, `node`, `worker`, `ssh`, ...). Empty input means
+/// `Automatic`.
+///
+/// # Errors
+/// Returns a message listing the canonical values when `raw` is unknown.
 pub(crate) fn parse_execution_backend_preference(
     raw: &str,
     field_name: &str,
@@ -743,6 +855,10 @@ pub(crate) fn parse_execution_backend_preference(
     Ok(preference)
 }
 
+/// Optional-input wrapper around [`parse_execution_backend_preference`].
+///
+/// # Errors
+/// Propagates the parse error for a present-but-invalid value.
 pub(crate) fn parse_optional_execution_backend_preference(
     raw: Option<&str>,
     field_name: &str,
@@ -750,6 +866,9 @@ pub(crate) fn parse_optional_execution_backend_preference(
     raw.map(|value| parse_execution_backend_preference(value, field_name)).transpose()
 }
 
+/// Builds the backend inventory without live worker-fleet state (defaults to
+/// an empty fleet); see
+/// [`build_execution_backend_inventory_with_worker_state`].
 #[allow(dead_code)]
 #[must_use]
 pub(crate) fn build_execution_backend_inventory(
@@ -770,6 +889,9 @@ pub(crate) fn build_execution_backend_inventory(
     )
 }
 
+/// Builds the full backend inventory from the sandbox policy, registered
+/// desktop nodes, rollout flags, and the live worker-fleet snapshot. Node
+/// health is judged by heartbeat recency (`NODE_HEALTHY_AFTER_MS`).
 #[must_use]
 pub(crate) fn build_execution_backend_inventory_with_worker_state(
     policy: &SandboxProcessRunnerPolicy,
@@ -827,6 +949,12 @@ fn build_execution_backend_inventory_with_rollout(
     ]
 }
 
+/// Rejects an explicit backend selection that the current inventory cannot
+/// honor; `Automatic` is always accepted.
+///
+/// # Errors
+/// Returns an operator-facing message when the backend is missing from the
+/// inventory or not selectable.
 pub(crate) fn validate_execution_backend_selection(
     preference: ExecutionBackendPreference,
     inventory: &[ExecutionBackendInventoryRecord],
@@ -848,6 +976,12 @@ pub(crate) fn validate_execution_backend_selection(
     ))
 }
 
+/// Resolves a capability-aware backend request without silent substitution.
+///
+/// `Automatic` picks the default-selected match first, then any match. An
+/// explicit preference that cannot satisfy the request fails closed (the
+/// resolution keeps the requested backend and an `unsatisfied` reason code)
+/// rather than falling back to another backend.
 #[must_use]
 pub(crate) fn resolve_execution_backend_for_request(
     request: &ExecutionBackendResolutionRequest,
@@ -932,6 +1066,13 @@ pub(crate) fn resolve_execution_backend_for_request(
     }
 }
 
+/// Resolves a plain backend preference with fallback semantics.
+///
+/// `Automatic` pins to the local sandbox. Unselectable preview backends fall
+/// back to the local sandbox (flagged via `fallback_used`) -- except
+/// `NetworkedWorker`, where falling back would silently downgrade a
+/// run-scoped attested worker grant onto the daemon host, so that request
+/// fails closed instead. Every non-local resolution requires approval.
 #[must_use]
 pub(crate) fn resolve_execution_backend(
     preference: ExecutionBackendPreference,
@@ -983,6 +1124,9 @@ pub(crate) fn resolve_execution_backend(
         }
     }
 
+    // Deny local fallback for networked workers: the caller asked for an
+    // attested, proxy-mediated environment and must not silently end up on
+    // the daemon host (pinned by tests).
     if matches!(preference, ExecutionBackendPreference::NetworkedWorker) {
         return ExecutionBackendResolution {
             requested: preference,
@@ -1065,6 +1209,8 @@ fn execution_backend_matches_request(
             .is_none_or(|strategy| record.workspace_strategy.kind == strategy)
 }
 
+// Capability names are matched case-insensitively because they arrive from
+// config files and remote node registrations with varying casing.
 fn capabilities_satisfy(available: &[String], required: &[String]) -> bool {
     required.iter().all(|required| {
         available.iter().any(|available| available.eq_ignore_ascii_case(required.as_str()))
@@ -1392,6 +1538,9 @@ fn ssh_tunnel_inventory_record(rollout: FeatureRolloutSetting) -> ExecutionBacke
     }
 }
 
+// Union of available capabilities across healthy nodes, deduplicated and
+// capped at 6 entries to keep the operator-facing inventory readable; the
+// placeholder keeps the backend describable when no node reported anything.
 fn aggregate_node_capabilities(nodes: &[&RegisteredNodeRecord]) -> Vec<String> {
     let mut capabilities = BTreeSet::<String>::new();
     for node in nodes {

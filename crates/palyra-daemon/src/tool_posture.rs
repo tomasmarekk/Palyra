@@ -1,3 +1,15 @@
+//! Tool security posture: per-scope approval overrides, presets, and
+//! friction-based recommendations.
+//!
+//! [`ToolPostureRegistry`] persists operator overrides
+//! (always-allow/ask-each-time/disabled), recommendation actions, and an
+//! audit trail in `tool-posture/registry.json` under the state root.
+//! [`evaluate_effective_tool_posture`] resolves the effective state through
+//! the session -> agent -> workspace -> global scope chain, with runtime lock
+//! reasons ([`tool_lock_reason`]) overriding everything. The static
+//! [`TOOL_CATALOG`] and [`TOOL_POSTURE_PRESETS`] feed the console UI;
+//! approval analytics come from journal [`ApprovalRecord`]s.
+
 use std::{
     fs,
     io::{Read, Seek, SeekFrom, Write},
@@ -19,9 +31,13 @@ const TOOL_POSTURE_DIRECTORY: &str = "tool-posture";
 const TOOL_POSTURE_REGISTRY_FILE: &str = "registry.json";
 const TOOL_POSTURE_SCHEMA_VERSION: u32 = 2;
 const GLOBAL_SCOPE_ID: &str = "global";
+/// Lookback window (14 days) for approval analytics fed into recommendations.
 pub(crate) const TOOL_POSTURE_ANALYTICS_WINDOW_MS: i64 = 14 * 24 * 60 * 60 * 1_000;
+/// Minimum deny-free approvals in the window before an always-allow
+/// recommendation is surfaced.
 pub(crate) const TOOL_POSTURE_RECOMMENDATION_MIN_APPROVALS: u64 = 5;
 
+/// Failure modes of [`ToolPostureRegistry`] persistence and validation.
 #[derive(Debug, Error)]
 pub enum ToolPostureRegistryError {
     #[error("tool posture directory could not be created: {path}")]
@@ -68,6 +84,10 @@ pub enum ToolPostureRegistryError {
     MissingScopeId,
 }
 
+/// Approval posture of a tool within one scope.
+///
+/// `AskEachTime` is the default: a tool stays usable but every call needs an
+/// interactive approval. Serialized snake_case names are persisted state.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolPostureState {
@@ -78,6 +98,7 @@ pub enum ToolPostureState {
 }
 
 impl ToolPostureState {
+    /// Stable snake_case identifier matching the serde representation.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -87,6 +108,7 @@ impl ToolPostureState {
         }
     }
 
+    /// Human-readable approval-mode label shown in operator surfaces.
     #[must_use]
     pub fn approval_mode_label(self) -> &'static str {
         match self {
@@ -97,6 +119,8 @@ impl ToolPostureState {
     }
 }
 
+/// Scope levels an override can attach to, from broadest to narrowest:
+/// global, workspace, agent, session. Narrower scopes win during resolution.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolPostureScopeKind {
@@ -107,6 +131,7 @@ pub enum ToolPostureScopeKind {
 }
 
 impl ToolPostureScopeKind {
+    /// Stable snake_case identifier matching the serde representation.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -118,6 +143,7 @@ impl ToolPostureScopeKind {
     }
 }
 
+/// Operator response to a posture recommendation.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolPostureRecommendationAction {
@@ -126,6 +152,7 @@ pub enum ToolPostureRecommendationAction {
     Deferred,
 }
 
+/// Kind of change captured by a [`ToolPostureAuditEventRecord`].
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolPostureAuditAction {
@@ -137,6 +164,7 @@ pub enum ToolPostureAuditAction {
 }
 
 impl ToolPostureAuditAction {
+    /// Stable snake_case identifier matching the serde representation.
     #[allow(dead_code)]
     #[must_use]
     pub fn as_str(self) -> &'static str {
@@ -151,6 +179,7 @@ impl ToolPostureAuditAction {
 }
 
 impl ToolPostureRecommendationAction {
+    /// Stable snake_case identifier matching the serde representation.
     #[allow(dead_code)]
     #[must_use]
     pub fn as_str(self) -> &'static str {
@@ -162,6 +191,10 @@ impl ToolPostureRecommendationAction {
     }
 }
 
+/// Persisted operator override pinning one tool's posture in one scope.
+///
+/// Expired records (past `expires_at_unix_ms`) are pruned lazily on the next
+/// registry read or write.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolPostureOverrideRecord {
     pub tool_name: String,
@@ -178,6 +211,8 @@ pub struct ToolPostureOverrideRecord {
     pub expires_at_unix_ms: Option<i64>,
 }
 
+/// Persisted operator response to a recommendation, keyed by
+/// recommendation id and scope so re-actions update in place.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolPostureRecommendationActionRecord {
     pub recommendation_id: String,
@@ -188,6 +223,8 @@ pub struct ToolPostureRecommendationActionRecord {
     pub created_at_unix_ms: i64,
 }
 
+/// Audit-trail entry for posture changes; newest-first, capped at 2000
+/// entries by `append_audit_event`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolPostureAuditEventRecord {
     pub audit_id: String,
@@ -211,6 +248,8 @@ pub struct ToolPostureAuditEventRecord {
     pub created_at_unix_ms: i64,
 }
 
+/// Request to create or update one override; see
+/// [`ToolPostureRegistry::upsert_override`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolPostureOverrideUpsertRequest {
     pub tool_name: String,
@@ -224,6 +263,8 @@ pub struct ToolPostureOverrideUpsertRequest {
     pub now_unix_ms: i64,
 }
 
+/// Request to remove one override; see
+/// [`ToolPostureRegistry::clear_override`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolPostureOverrideClearRequest {
     pub tool_name: String,
@@ -235,6 +276,8 @@ pub struct ToolPostureOverrideClearRequest {
     pub now_unix_ms: i64,
 }
 
+/// Request to record an operator action on a recommendation; see
+/// [`ToolPostureRegistry::record_recommendation_action`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolPostureRecommendationActionRequest {
     pub recommendation_id: String,
@@ -245,6 +288,8 @@ pub struct ToolPostureRecommendationActionRequest {
     pub now_unix_ms: i64,
 }
 
+/// Request to remove every override in one scope; see
+/// [`ToolPostureRegistry::reset_scope`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolPostureScopeResetRequest {
     pub scope_kind: ToolPostureScopeKind,
@@ -266,6 +311,12 @@ struct ToolPostureRegistryDocument {
     audit_events: Vec<ToolPostureAuditEventRecord>,
 }
 
+/// Durable store for posture overrides, recommendation actions, and audit
+/// events, backed by a single JSON document.
+///
+/// The file handle is kept open for the registry's lifetime and rewritten in
+/// place on every mutation. Lock order is always `document` before `file`;
+/// keep that order to avoid deadlocks.
 pub struct ToolPostureRegistry {
     document_path: PathBuf,
     file: Mutex<fs::File>,
@@ -273,6 +324,12 @@ pub struct ToolPostureRegistry {
 }
 
 impl ToolPostureRegistry {
+    /// Opens (and creates if needed) the registry under
+    /// `<state_root>/tool-posture/registry.json`.
+    ///
+    /// # Errors
+    /// Returns a [`ToolPostureRegistryError`] variant when the directory or
+    /// file cannot be created, read, or parsed.
     pub fn open(state_root: &Path) -> Result<Self, ToolPostureRegistryError> {
         let tool_posture_root = state_root.join(TOOL_POSTURE_DIRECTORY);
         fs::create_dir_all(&tool_posture_root).map_err(|source| {
@@ -293,6 +350,10 @@ impl ToolPostureRegistry {
         Ok(Self { document_path, file: Mutex::new(file), document: Mutex::new(document) })
     }
 
+    /// Lists current overrides, pruning expired entries as a side effect.
+    ///
+    /// # Errors
+    /// Fails on lock poisoning or when persisting the pruned document fails.
     pub fn list_overrides(
         &self,
     ) -> Result<Vec<ToolPostureOverrideRecord>, ToolPostureRegistryError> {
@@ -300,10 +361,18 @@ impl ToolPostureRegistry {
         let mut document =
             self.document.lock().map_err(|_| ToolPostureRegistryError::LockPoisoned)?;
         prune_expired_entries(&mut document, now_unix_ms);
+        // AIDEV-NOTE: this read path rewrites and fsyncs the registry file on
+        // every call, even when pruning removed nothing. Skipping the persist
+        // when no entry expired would avoid the write, but callers currently
+        // rely on listing to also flush lazy expiry to disk.
         persist_registry_document(&self.document_path, &self.file, &document)?;
         Ok(document.overrides.clone())
     }
 
+    /// Lists recorded recommendation actions.
+    ///
+    /// # Errors
+    /// Fails only on lock poisoning.
     pub fn list_recommendation_actions(
         &self,
     ) -> Result<Vec<ToolPostureRecommendationActionRecord>, ToolPostureRegistryError> {
@@ -311,6 +380,10 @@ impl ToolPostureRegistry {
         Ok(document.recommendation_actions.clone())
     }
 
+    /// Lists audit events, newest first.
+    ///
+    /// # Errors
+    /// Fails only on lock poisoning.
     pub fn list_audit_events(
         &self,
     ) -> Result<Vec<ToolPostureAuditEventRecord>, ToolPostureRegistryError> {
@@ -318,6 +391,13 @@ impl ToolPostureRegistry {
         Ok(document.audit_events.clone())
     }
 
+    /// Creates or updates the override for `(tool_name, scope_kind,
+    /// scope_id)`, appending an `override_set` audit event and persisting.
+    ///
+    /// # Errors
+    /// Returns [`ToolPostureRegistryError::UnknownTool`] for tools outside
+    /// [`TOOL_CATALOG`], [`ToolPostureRegistryError::MissingScopeId`] for
+    /// non-global scopes without an id, plus lock/persistence failures.
     pub fn upsert_override(
         &self,
         request: ToolPostureOverrideUpsertRequest,
@@ -401,6 +481,8 @@ impl ToolPostureRegistry {
             document.overrides.push(record.clone());
             record
         };
+        // Deterministic ordering keeps the persisted JSON diff-stable across
+        // upserts regardless of insertion order.
         document.overrides.sort_by(|left, right| {
             left.scope_kind
                 .as_str()
@@ -412,6 +494,12 @@ impl ToolPostureRegistry {
         Ok(record)
     }
 
+    /// Removes the matching override, returning `true` when one existed.
+    /// Audit event and persistence happen only on actual removal.
+    ///
+    /// # Errors
+    /// Same validation and persistence failures as
+    /// [`ToolPostureRegistry::upsert_override`].
     pub fn clear_override(
         &self,
         request: ToolPostureOverrideClearRequest,
@@ -467,6 +555,11 @@ impl ToolPostureRegistry {
         Ok(removed)
     }
 
+    /// Removes every override in one scope, returning the removed records
+    /// and appending one `override_cleared` audit event per removal.
+    ///
+    /// # Errors
+    /// Fails on scope-id validation, lock poisoning, or persistence errors.
     pub fn reset_scope(
         &self,
         request: ToolPostureScopeResetRequest,
@@ -516,6 +609,11 @@ impl ToolPostureRegistry {
         Ok(removed)
     }
 
+    /// Records (or updates in place) the operator action for one
+    /// recommendation in one scope, with a matching audit event.
+    ///
+    /// # Errors
+    /// Fails on scope-id validation, lock poisoning, or persistence errors.
     pub fn record_recommendation_action(
         &self,
         request: ToolPostureRecommendationActionRequest,
@@ -587,6 +685,10 @@ impl ToolPostureRegistry {
     }
 }
 
+/// Static metadata describing one tool in the operator-facing catalog.
+///
+/// `recommend_always_allow` marks tools safe enough that high deny-free
+/// approval volume should suggest promoting them to always-allow.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct ToolCatalogEntry {
     pub tool_name: &'static str,
@@ -597,6 +699,7 @@ pub struct ToolCatalogEntry {
     pub recommend_always_allow: bool,
 }
 
+/// Approval friction counters for one tool over the analytics window.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
 pub struct ToolFrictionMetrics {
     pub requested_14d: u64,
@@ -606,6 +709,7 @@ pub struct ToolFrictionMetrics {
     pub unique_sessions_14d: u64,
 }
 
+/// Identifies one scope in a resolution chain, with its display label.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ToolPostureScopeRef {
     pub kind: ToolPostureScopeKind,
@@ -613,6 +717,8 @@ pub struct ToolPostureScopeRef {
     pub label: String,
 }
 
+/// One link of the resolution chain shown to operators: the scope plus the
+/// override state/source found there, if any.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ToolPostureChainEntry {
     pub kind: ToolPostureScopeKind,
@@ -624,6 +730,8 @@ pub struct ToolPostureChainEntry {
     pub source: Option<String>,
 }
 
+/// Resolved posture of one tool for one scope chain, including which scope
+/// supplied the winning state and whether the tool is runtime-locked.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct EffectiveToolPosture {
     pub effective_state: ToolPostureState,
@@ -638,6 +746,8 @@ pub struct EffectiveToolPosture {
     pub editable: bool,
 }
 
+/// Suggested ask-each-time -> always-allow promotion derived from approval
+/// analytics; see [`build_tool_recommendation`].
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ToolPostureRecommendation {
     pub recommendation_id: String,
@@ -652,12 +762,14 @@ pub struct ToolPostureRecommendation {
     pub action: Option<ToolPostureRecommendationAction>,
 }
 
+/// One tool-state pair inside a preset.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct ToolPosturePresetAssignment {
     pub tool_name: &'static str,
     pub state: ToolPostureState,
 }
 
+/// Named bundle of posture assignments operators can apply in one step.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct ToolPosturePresetDefinition {
     pub preset_id: &'static str,
@@ -666,6 +778,9 @@ pub struct ToolPosturePresetDefinition {
     pub assignments: &'static [ToolPosturePresetAssignment],
 }
 
+/// Operator-facing tool catalog: titles, risk levels, and always-allow
+/// recommendation flags. Tools absent from this list are rejected by the
+/// posture registry (`validate_known_tool`).
 pub const TOOL_CATALOG: &[ToolCatalogEntry] = &[
     ToolCatalogEntry {
         tool_name: "palyra.echo",
@@ -1143,6 +1258,8 @@ const PRESET_AUTOMATION_REVIEW: &[ToolPosturePresetAssignment] = &[
     },
 ];
 
+/// Built-in posture presets. Every preset deliberately keeps
+/// `palyra.memory.recall` at ask-each-time (pinned by tests).
 pub const TOOL_POSTURE_PRESETS: &[ToolPosturePresetDefinition] = &[
     ToolPosturePresetDefinition {
         preset_id: "conservative_coding",
@@ -1174,16 +1291,20 @@ pub const TOOL_POSTURE_PRESETS: &[ToolPosturePresetDefinition] = &[
     },
 ];
 
+/// Looks up the catalog entry for `tool_name`, if it is a known tool.
 #[must_use]
 pub fn tool_catalog_entry(tool_name: &str) -> Option<&'static ToolCatalogEntry> {
     TOOL_CATALOG.iter().find(|entry| entry.tool_name == tool_name)
 }
 
+/// Looks up a built-in preset by id.
 #[must_use]
 pub fn tool_posture_preset(preset_id: &str) -> Option<&'static ToolPosturePresetDefinition> {
     TOOL_POSTURE_PRESETS.iter().find(|preset| preset.preset_id == preset_id)
 }
 
+/// Builds the deterministic recommendation id for one tool/scope pair so
+/// repeated analytics runs converge on the same recommendation record.
 #[must_use]
 pub fn tool_recommendation_id(
     scope_kind: ToolPostureScopeKind,
@@ -1193,6 +1314,12 @@ pub fn tool_recommendation_id(
     format!("tool-posture:{}:{}:{}:always_allow", scope_kind.as_str(), scope_id, tool_name)
 }
 
+/// Canonicalizes a scope id: global scopes always map to `"global"`, every
+/// other scope kind requires a non-empty id.
+///
+/// # Errors
+/// Returns [`ToolPostureRegistryError::MissingScopeId`] when a non-global
+/// scope id is absent or blank.
 pub fn normalize_scope_id(
     scope_kind: ToolPostureScopeKind,
     scope_id: Option<&str>,
@@ -1210,6 +1337,9 @@ pub fn normalize_scope_id(
     }
 }
 
+/// Derives the built-in posture for a tool when no override exists:
+/// runtime-locked tools are disabled, approval-gated tools ask each time,
+/// everything else is always allowed.
 #[must_use]
 pub fn default_tool_posture_state(
     config: &GatewayRuntimeConfigSnapshot,
@@ -1225,6 +1355,11 @@ pub fn default_tool_posture_state(
     }
 }
 
+/// Returns the operator-facing reason a tool cannot be enabled at all under
+/// the current daemon configuration, or `None` when it is editable.
+///
+/// A lock wins over any override: not allowlisted, runner/relay disabled by
+/// runtime config, or a required capability backend unavailable.
 #[must_use]
 pub fn tool_lock_reason(config: &GatewayRuntimeConfigSnapshot, tool_name: &str) -> Option<String> {
     let metadata = tool_protocol::tool_metadata(tool_name)?;
@@ -1241,6 +1376,8 @@ pub fn tool_lock_reason(config: &GatewayRuntimeConfigSnapshot, tool_name: &str) 
     if tool_name.starts_with("palyra.browser.") && !config.browser_service.enabled {
         return Some("Browser relay is disabled in runtime configuration.".to_owned());
     }
+    // Only ProcessExec currently depends on runtime state; the other
+    // capabilities are always served by the gateway, so they stay `true`.
     let runtime_available = metadata.capabilities.iter().all(|capability| match capability {
         ToolCapability::ProcessExec => config.tool_call.process_runner.enabled,
         ToolCapability::Network => true,
@@ -1255,6 +1392,11 @@ pub fn tool_lock_reason(config: &GatewayRuntimeConfigSnapshot, tool_name: &str) 
     None
 }
 
+/// Builds the narrow-to-broad scope chain used for posture resolution.
+///
+/// Only a session-scoped request inherits from agent and workspace; agent,
+/// workspace, and global requests resolve against themselves plus the global
+/// fallback, which is always appended last when not already present.
 #[must_use]
 pub fn derive_scope_chain(
     active_scope: ToolPostureScopeRef,
@@ -1290,6 +1432,12 @@ pub fn derive_scope_chain(
     scopes
 }
 
+/// Resolves the effective posture of one tool against a scope chain.
+///
+/// The first scope in `scope_chain` (narrowest) with a matching override
+/// wins; without any override the built-in default applies. A runtime lock
+/// reason forces the effective state to `Disabled` regardless of overrides
+/// and marks the posture non-editable.
 #[must_use]
 pub fn evaluate_effective_tool_posture(
     config: &GatewayRuntimeConfigSnapshot,
@@ -1331,6 +1479,8 @@ pub fn evaluate_effective_tool_posture(
     }
 
     if !found_override {
+        // Make the implicit default visible in the chain so the UI can show
+        // where the effective state came from.
         chain.push(ToolPostureChainEntry {
             kind: ToolPostureScopeKind::Global,
             scope_id: GLOBAL_SCOPE_ID.to_owned(),
@@ -1340,6 +1490,8 @@ pub fn evaluate_effective_tool_posture(
         });
     }
 
+    // Runtime locks are not overridable: a disabled runner/relay must win
+    // over any persisted always-allow override.
     if lock_reason.is_some() {
         effective_state = ToolPostureState::Disabled;
     }
@@ -1357,6 +1509,8 @@ pub fn evaluate_effective_tool_posture(
     }
 }
 
+/// Aggregates approval friction counters for one tool from journal approval
+/// records (the caller pre-filters to the 14-day analytics window).
 #[must_use]
 pub fn build_tool_friction_metrics(
     approvals: &[ApprovalRecord],
@@ -1364,6 +1518,11 @@ pub fn build_tool_friction_metrics(
 ) -> ToolFrictionMetrics {
     let mut metrics = ToolFrictionMetrics::default();
     let mut session_ids = std::collections::BTreeSet::new();
+    // AIDEV-NOTE: subject ids are matched by `starts_with("tool:<name>")`
+    // here and in recent_tool_approvals. If a future tool name is a strict
+    // prefix of another (e.g. "x.run" vs "x.runner"), their metrics would be
+    // conflated; an exact-segment match would need a subject-id format
+    // change.
     let prefix = format!("tool:{tool_name}");
     for approval in approvals {
         if !approval.subject_id.starts_with(prefix.as_str()) {
@@ -1382,6 +1541,8 @@ pub fn build_tool_friction_metrics(
     metrics
 }
 
+/// Builds an always-allow recommendation when the friction data supports it,
+/// or `None` otherwise.
 #[must_use]
 pub fn build_tool_recommendation(
     tool_name: &str,
@@ -1391,6 +1552,9 @@ pub fn build_tool_recommendation(
     metrics: &ToolFrictionMetrics,
     action: Option<ToolPostureRecommendationAction>,
 ) -> Option<ToolPostureRecommendation> {
+    // Recommend only when all gates hold: the tool currently asks each time,
+    // the catalog marks it safe to promote, approvals cleared the volume
+    // threshold, and there was not a single deny in the window.
     if posture.effective_state != ToolPostureState::AskEachTime
         || !catalog.recommend_always_allow
         || metrics.approved_14d < TOOL_POSTURE_RECOMMENDATION_MIN_APPROVALS
@@ -1417,6 +1581,8 @@ pub fn build_tool_recommendation(
     })
 }
 
+/// Returns up to `limit` approval records for one tool, preserving the
+/// caller's ordering (the journal supplies newest-first).
 #[must_use]
 pub fn recent_tool_approvals<'a>(
     approvals: &'a [ApprovalRecord],
@@ -1431,6 +1597,8 @@ pub fn recent_tool_approvals<'a>(
         .collect()
 }
 
+// An empty or new file is initialized with an empty current-version document
+// so later writes never have to special-case first use.
 fn load_registry_document(
     path: &Path,
     file: &mut fs::File,
@@ -1467,6 +1635,10 @@ fn persist_registry_document(
     write_registry_document(path, &mut file, document)
 }
 
+// AIDEV-NOTE: the registry is rewritten in place (seek 0 + set_len(0) +
+// write + fsync on the long-lived handle), not via write-to-temp-and-rename.
+// A crash between truncate and write loses all overrides and audit events;
+// making this atomic would require swapping to a fresh file handle.
 fn write_registry_document(
     path: &Path,
     file: &mut fs::File,
@@ -1507,6 +1679,8 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
     value.map(|value| value.trim().to_owned()).filter(|value| !value.is_empty())
 }
 
+// Keeps the audit trail newest-first and bounded at 2000 entries so the
+// registry document cannot grow without limit.
 fn append_audit_event(
     audit_events: &mut Vec<ToolPostureAuditEventRecord>,
     event: ToolPostureAuditEventRecord,
@@ -1535,6 +1709,8 @@ fn recommendation_action_to_audit_action(
     }
 }
 
+// Override sources written by preset application use the "preset:<id>" form;
+// the id is lifted into the audit event for filtering.
 fn extract_preset_id(source: &str) -> Option<String> {
     source
         .strip_prefix("preset:")

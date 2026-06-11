@@ -1,3 +1,14 @@
+//! Wasm plugin runner backing the `palyra.plugin.run` tool.
+//!
+//! Resolves a module from an installed, signed skill artifact (the default)
+//! or an inline WAT/base64 payload (policy opt-in only), then executes it in
+//! the fuel- and memory-limited [`WasmRuntime`] from `palyra-plugins/runtime`.
+//! Capability requests (http hosts, secrets, storage prefixes, channels) are
+//! normalized and checked as a strict subset of the policy allowlists --
+//! further narrowed by the skill manifest grants for installed skills --
+//! before any grant reaches the guest. Called from `tool_protocol` via
+//! `spawn_blocking`; execution here is synchronous.
+
 use std::{
     collections::BTreeSet,
     convert::TryFrom,
@@ -14,6 +25,9 @@ use palyra_skills::{
 use serde::Deserialize;
 use serde_json::json;
 
+/// Runtime policy for the wasm plugin runner: enablement, inline-module
+/// opt-in, resource quotas, and the capability allowlists that bound what any
+/// plugin may request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WasmPluginRunnerPolicy {
     pub enabled: bool,
@@ -29,17 +43,22 @@ pub struct WasmPluginRunnerPolicy {
     pub allowed_channels: Vec<String>,
 }
 
+/// Successful plugin run: the serialized execution report (exit code,
+/// duration, module provenance, granted capability handles).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WasmPluginRunSuccess {
     pub output_json: Vec<u8>,
 }
 
+/// Failed plugin run with a classified kind and operator-facing message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WasmPluginRunError {
     pub kind: WasmPluginRunErrorKind,
     pub message: String,
 }
 
+/// Failure classes of a plugin run; `tool_protocol` maps `TimedOut` and
+/// `QuotaExceeded` onto attestation/log treatment distinct from plain errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WasmPluginRunErrorKind {
     Disabled,
@@ -50,6 +69,8 @@ pub enum WasmPluginRunErrorKind {
     RuntimeFailure,
 }
 
+// deny_unknown_fields is a security control: untrusted tool input must not
+// smuggle unrecognized switches (e.g. a "dev" override) past validation.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WasmPluginRunInput {
@@ -68,6 +89,8 @@ struct WasmPluginRunInput {
     capabilities: WasmPluginRequestedCapabilities,
 }
 
+/// Capabilities a plugin run asks for; each list must be a subset of the
+/// corresponding policy (and, for installed skills, manifest) allowlist.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WasmPluginRequestedCapabilities {
@@ -81,6 +104,8 @@ pub(crate) struct WasmPluginRequestedCapabilities {
     pub(crate) channels: Vec<String>,
 }
 
+/// Builds the JSON harness document the skill test runner uses to exercise
+/// one tool entrypoint with the manifest-declared capability set.
 pub(crate) fn build_manifest_test_harness(
     manifest: &SkillManifest,
     tool: &SkillToolEntrypoint,
@@ -109,6 +134,8 @@ pub(crate) fn build_manifest_test_harness(
     })
 }
 
+/// Fully resolved module from an installed skill artifact: manifest,
+/// capability grants, selected tool/module, and the module bytes themselves.
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedInstalledSkillModule {
     pub(crate) skill_id: String,
@@ -121,6 +148,18 @@ pub(crate) struct ResolvedInstalledSkillModule {
     pub(crate) entrypoint: String,
 }
 
+/// Parses, validates, resolves, and executes one `palyra.plugin.run` request.
+///
+/// Blocking: compiles and runs the module on the calling thread. The
+/// effective wall-clock budget is `timeout`, further capped by the skill
+/// manifest's quota for installed skills.
+///
+/// # Errors
+/// Returns [`WasmPluginRunError`] with kind `Disabled` when the runtime is
+/// off, `InvalidInput` for malformed input or module resolution failures,
+/// `CapabilityDenied` for non-allowlisted capability requests,
+/// `QuotaExceeded`/`TimedOut` for resource exhaustion, and `RuntimeFailure`
+/// for host-side faults (artifact IO, guest traps).
 pub fn run_wasm_plugin(
     policy: &WasmPluginRunnerPolicy,
     input_json: &[u8],
@@ -145,6 +184,8 @@ pub fn run_wasm_plugin(
         resolved.module_bytes.as_slice(),
         resolved.entrypoint.as_str(),
         input.capabilities,
+        // Zero means "no skill-level quota" (inline modules); otherwise the
+        // skill manifest can only shorten the caller's timeout, never extend.
         if resolved.execution_timeout.is_zero() {
             timeout
         } else {
@@ -153,6 +194,12 @@ pub fn run_wasm_plugin(
     )
 }
 
+/// Executes an already-resolved installed-skill module (plugin bindings
+/// path), enforcing the same policy gate and capability subset checks as
+/// [`run_wasm_plugin`].
+///
+/// # Errors
+/// Same failure classes as [`run_wasm_plugin`], minus input parsing.
 pub(crate) fn run_resolved_wasm_plugin(
     policy: &WasmPluginRunnerPolicy,
     resolved: &ResolvedInstalledSkillModule,
@@ -197,6 +244,8 @@ fn validate_optional_metadata(
     Ok(())
 }
 
+// Module bytes plus execution metadata; `execution_timeout` is ZERO for
+// inline modules (no skill quota applies).
 struct ResolvedModuleSource {
     module_bytes: Vec<u8>,
     entrypoint: String,
@@ -204,6 +253,9 @@ struct ResolvedModuleSource {
     installed_skill: Option<ResolvedInstalledSkillModule>,
 }
 
+// Module resolution precedence: inline WAT/base64 payloads (only with the
+// explicit allow_inline_modules opt-in, since they bypass artifact signing),
+// otherwise an installed skill artifact addressed by skill_id.
 fn resolve_module_source(
     policy: &WasmPluginRunnerPolicy,
     input: &WasmPluginRunInput,
@@ -284,6 +336,13 @@ fn inline_module_payload_present(input: &WasmPluginRunInput) -> bool {
     input.module_wat.is_some() || input.module_base64.is_some()
 }
 
+/// Resolves a module from the installed skills index: picks the version,
+/// reads and inspects the signed artifact, and selects the tool entrypoint
+/// and `modules/*.wasm` entry.
+///
+/// # Errors
+/// `RuntimeFailure` for skills-root or artifact IO problems; `InvalidInput`
+/// when the skill, version, tool, or module path does not resolve.
 pub(crate) fn resolve_installed_skill_module(
     skill_id: &str,
     skill_version: Option<&str>,
@@ -317,18 +376,21 @@ pub(crate) fn resolve_installed_skill_module(
                 ),
             }
         })?;
-    let _record = index
+    // Existence check only: the artifact itself is re-read and re-inspected
+    // below, so nothing from the index entry is needed past this point.
+    if !index
         .entries
         .iter()
-        .find(|entry| entry.skill_id == skill_id && entry.version == resolved_version)
-        .cloned()
-        .ok_or_else(|| WasmPluginRunError {
+        .any(|entry| entry.skill_id == skill_id && entry.version == resolved_version)
+    {
+        return Err(WasmPluginRunError {
             kind: WasmPluginRunErrorKind::InvalidInput,
             message: format!(
                 "installed skill artifact not found for {}@{}",
                 skill_id, resolved_version
             ),
-        })?;
+        });
+    }
     let artifact_path = crate::managed_skill_artifact_path(
         skills_root.as_path(),
         skill_id,
@@ -389,6 +451,10 @@ fn select_tool_entrypoint(
     )
 }
 
+// Selects the wasm module entry inside the artifact. A requested path is
+// validated against traversal (NUL, "..", absolute prefixes) before lookup;
+// without a request, exactly one module must exist -- ambiguity is an error
+// rather than an arbitrary pick.
 fn select_module_path(
     artifact_paths: Vec<String>,
     requested: Option<&str>,
@@ -431,6 +497,10 @@ fn select_module_path(
     })
 }
 
+// Core execution: size quota, capability normalization and subset checks,
+// runtime limits, then the actual guest run. For installed skills the
+// allowed sets are policy INTERSECT manifest grants, so a skill can only
+// narrow what the daemon policy permits, never widen it.
 fn execute_module(
     policy: &WasmPluginRunnerPolicy,
     installed_skill: Option<&ResolvedInstalledSkillModule>,
@@ -518,6 +588,8 @@ fn execute_module(
         "channels",
     )?;
 
+    // Skill manifest quotas are min'ed with policy quotas: a skill cannot
+    // request more fuel or memory than the daemon policy allows.
     let limits = RuntimeLimits {
         fuel_budget: installed_skill
             .map(|skill| skill.manifest.capabilities.quotas.fuel_budget.min(policy.fuel_budget))
@@ -551,6 +623,9 @@ fn execute_module(
         channels: requested_channels.clone(),
     };
     let runtime = WasmRuntime::new_with_limits(limits).map_err(map_runtime_error)?;
+    // Re-applies the manifest wall-clock cap so direct callers of this path
+    // (run_resolved_wasm_plugin) get it too; for run_wasm_plugin the caller
+    // already min'ed, making this a no-op there.
     let effective_timeout = if let Some(skill) = installed_skill {
         timeout.min(Duration::from_millis(skill.manifest.capabilities.quotas.wall_clock_timeout_ms))
     } else {
@@ -574,6 +649,8 @@ fn execute_module(
         })),
         "capabilities": {
             "http_handles": execution.capability_handles.http_handles,
+            // Only the count for secrets: handle values must never appear in
+            // tool output that flows back into model context.
             "secret_handles_count": execution.capability_handles.secret_handles.len(),
             "storage_handles": execution.capability_handles.storage_handles,
             "channel_handles": execution.capability_handles.channel_handles,
@@ -589,6 +666,8 @@ fn execute_module(
     Ok(WasmPluginRunSuccess { output_json })
 }
 
+// Intersection of policy allowlist and skill manifest grants (when present),
+// both normalized first so the comparison is canonical.
 fn effective_allowed_capabilities(
     skill_caps: Option<&[String]>,
     policy_caps: &[String],
@@ -604,6 +683,8 @@ fn effective_allowed_capabilities(
     Ok(policy_values)
 }
 
+// Entrypoint names are restricted to [a-z0-9_-] so a hostile input cannot
+// address unexpected exports; absent input falls back to the SDK default.
 fn parse_entrypoint(entrypoint: Option<&str>) -> Result<String, WasmPluginRunError> {
     let entrypoint = entrypoint.map(str::trim).unwrap_or(DEFAULT_RUNTIME_ENTRYPOINT);
     if entrypoint.is_empty() {
@@ -626,6 +707,8 @@ fn parse_entrypoint(entrypoint: Option<&str>) -> Result<String, WasmPluginRunErr
     Ok(entrypoint.to_owned())
 }
 
+// Deny-by-default capability gate: every requested entry must already be in
+// the allowed set; the error names every denied entry for diagnosability.
 fn ensure_capabilities_subset(
     requested: &[String],
     allowed: &[String],
@@ -650,6 +733,9 @@ fn ensure_capabilities_subset(
     })
 }
 
+// Hostname canonicalization (lowercase, trailing dot stripped) plus a strict
+// charset/shape check, so subset comparison cannot be bypassed by case or
+// trailing-dot variants of an allowlisted host.
 fn normalize_host_allowlist(
     raw: &[String],
     source_name: &str,
@@ -704,6 +790,8 @@ fn normalize_identifier_allowlist(
     Ok(normalized.into_iter().collect())
 }
 
+// Storage prefixes must stay relative and traversal-free (no NUL, "..", or
+// absolute prefixes) since they scope filesystem-like access for plugins.
 fn normalize_storage_prefix_allowlist(
     raw: &[String],
     source_name: &str,
@@ -731,6 +819,8 @@ fn normalize_storage_prefix_allowlist(
     Ok(normalized.into_iter().collect())
 }
 
+// Maps runtime faults onto the tool-facing error taxonomy; compile/link
+// problems count as invalid input (bad module), traps as runtime failure.
 fn map_runtime_error(error: RuntimeError) -> WasmPluginRunError {
     match error {
         RuntimeError::ExecutionTimedOut => WasmPluginRunError {

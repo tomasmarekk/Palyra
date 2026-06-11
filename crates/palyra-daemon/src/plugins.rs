@@ -1,3 +1,14 @@
+//! Plugin binding registry: maps stable plugin ids onto installed skill
+//! artifacts with operator metadata, config instances, and capability diffs.
+//!
+//! Bindings live in `plugins/bindings.json` (versioned, migrated on load)
+//! next to the skills root; per-plugin config sits in
+//! `plugins/<plugin_id>/config.json`. This module also validates config
+//! values against the skill manifest's operator.config contract, computes
+//! declared/granted/effective capability diffs against the wasm runner
+//! policy, negotiates typed plugin contracts, and audits plugin filesystem
+//! safety (symlinks, root escapes, loose permissions).
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -31,6 +42,7 @@ const PLUGIN_CONFIG_INSTANCE_FILE_NAME: &str = "config.json";
 const PLUGIN_CONFIG_INSTANCE_FORMAT: VersionedJsonFormat =
     VersionedJsonFormat::new("plugin config instance", PLUGIN_CONFIG_INSTANCE_LAYOUT_VERSION);
 
+/// Versioned on-disk index of all plugin bindings, sorted by plugin id.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PluginBindingsIndex {
@@ -50,6 +62,9 @@ impl Default for PluginBindingsIndex {
     }
 }
 
+/// One plugin binding: which skill/tool/module it points at, the granted
+/// capability profile, and cached discovery/config/diff/contract state
+/// refreshed by scans.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PluginBindingRecord {
@@ -80,6 +95,8 @@ pub(crate) struct PluginBindingRecord {
     pub(crate) updated_at_unix_ms: i64,
 }
 
+/// Capability sets (http hosts, secrets, storage prefixes, channels) used
+/// for declared, granted, and effective views alike.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PluginCapabilityProfile {
@@ -93,6 +110,8 @@ pub(crate) struct PluginCapabilityProfile {
     pub(crate) channels: Vec<String>,
 }
 
+/// Free-form operator bookkeeping on a binding (display name, notes, owner,
+/// tags); normalized but never security-relevant.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PluginOperatorMetadata {
@@ -108,6 +127,8 @@ pub(crate) struct PluginOperatorMetadata {
     pub(crate) tags: Vec<String>,
 }
 
+/// Health of a binding as judged by the last discovery scan; see
+/// [`build_plugin_discovery_snapshot`] for the precedence rules.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PluginDiscoveryState {
@@ -121,6 +142,7 @@ pub(crate) enum PluginDiscoveryState {
     FilesystemUnsafe,
 }
 
+/// One filesystem-safety finding with a stable code and remediation text.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PluginFilesystemIssue {
@@ -130,6 +152,7 @@ pub(crate) struct PluginFilesystemIssue {
     pub(crate) remediation: String,
 }
 
+/// Aggregate filesystem-safety verdict for one plugin's managed paths.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PluginFilesystemSafetySnapshot {
@@ -139,6 +162,8 @@ pub(crate) struct PluginFilesystemSafetySnapshot {
     pub(crate) issues: Vec<PluginFilesystemIssue>,
 }
 
+/// Cached discovery result on a binding: state, reasons, missing module
+/// paths, and the filesystem-safety snapshot from the last scan.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PluginDiscoverySnapshot {
@@ -154,6 +179,8 @@ pub(crate) struct PluginDiscoverySnapshot {
     pub(crate) filesystem: PluginFilesystemSafetySnapshot,
 }
 
+/// Result class of validating a config instance against the manifest's
+/// operator.config contract.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PluginConfigValidationState {
@@ -165,6 +192,8 @@ pub(crate) enum PluginConfigValidationState {
     RequiresMigration,
 }
 
+/// Validation outcome plus the property names whose values must be redacted
+/// in any operator-facing view.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PluginConfigValidationSnapshot {
@@ -176,6 +205,8 @@ pub(crate) struct PluginConfigValidationSnapshot {
     pub(crate) redacted_fields: Vec<String>,
 }
 
+/// Pointer from a binding to its config file plus the cached validation
+/// snapshot and the manifest digest the config was written against.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PluginConfigInstanceRef {
@@ -189,6 +220,8 @@ pub(crate) struct PluginConfigInstanceRef {
     pub(crate) validation: PluginConfigValidationSnapshot,
 }
 
+/// Persisted operator config values for one plugin, tied to a specific
+/// config contract schema version and skill manifest digest.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PluginConfigInstance {
@@ -206,6 +239,7 @@ pub(crate) struct PluginConfigInstance {
     pub(crate) updated_at_unix_ms: i64,
 }
 
+/// Classes of capability drift between manifest, binding grant, and policy.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PluginCapabilityDiffCategory {
@@ -216,6 +250,7 @@ pub(crate) enum PluginCapabilityDiffCategory {
     UnusedDeclaredCapability,
 }
 
+/// One capability-drift finding (category, kind, value, message).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PluginCapabilityDiffEntry {
@@ -225,6 +260,10 @@ pub(crate) struct PluginCapabilityDiffEntry {
     pub(crate) message: String,
 }
 
+/// Cached capability diff: declared (manifest), granted (binding), and
+/// effective (declared INTERSECT granted INTERSECT policy) profiles plus the
+/// drift entries. `valid` is false when excess or policy-restricted grants
+/// exist.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PluginCapabilityDiffCache {
@@ -240,6 +279,8 @@ pub(crate) struct PluginCapabilityDiffCache {
     pub(crate) entries: Vec<PluginCapabilityDiffEntry>,
 }
 
+/// Raw upsert request; normalized into a [`PluginBindingRecord`] by
+/// [`normalize_plugin_binding_upsert`].
 #[derive(Debug, Clone)]
 pub(crate) struct PluginBindingUpsert {
     pub(crate) plugin_id: String,
@@ -253,6 +294,11 @@ pub(crate) struct PluginBindingUpsert {
     pub(crate) operator: PluginOperatorMetadata,
 }
 
+/// Resolves the managed plugins root as a `plugins/` sibling of the skills
+/// root.
+///
+/// # Errors
+/// Fails when the skills root itself cannot be resolved.
 pub(crate) fn resolve_plugins_root() -> Result<PathBuf> {
     let skills_root = resolve_skills_root().map_err(|response| {
         anyhow!("failed to resolve skills root (http {})", response.status())
@@ -262,18 +308,27 @@ pub(crate) fn resolve_plugins_root() -> Result<PathBuf> {
     Ok(state_root.join("plugins"))
 }
 
+/// Path of the bindings index file under the plugins root.
 pub(crate) fn plugin_bindings_index_path(plugins_root: &FsPath) -> PathBuf {
     plugins_root.join(PLUGIN_BINDINGS_INDEX_FILE_NAME)
 }
 
+/// Per-plugin directory under the plugins root; callers must pass an already
+/// normalized plugin id (it becomes a path segment).
 pub(crate) fn plugin_root_path(plugins_root: &FsPath, plugin_id: &str) -> PathBuf {
     plugins_root.join(plugin_id)
 }
 
+/// Path of one plugin's config instance file.
 pub(crate) fn plugin_config_instance_path(plugins_root: &FsPath, plugin_id: &str) -> PathBuf {
     plugin_root_path(plugins_root, plugin_id).join(PLUGIN_CONFIG_INSTANCE_FILE_NAME)
 }
 
+/// Loads the bindings index, migrating v0/v1 layouts in memory and
+/// normalizing the result. A missing file yields an empty index.
+///
+/// # Errors
+/// Fails when the file cannot be read or its JSON does not parse/migrate.
 pub(crate) fn load_plugin_bindings_index(plugins_root: &FsPath) -> Result<PluginBindingsIndex> {
     let path = plugin_bindings_index_path(plugins_root);
     if !path.exists() {
@@ -294,6 +349,11 @@ pub(crate) fn load_plugin_bindings_index(plugins_root: &FsPath) -> Result<Plugin
     Ok(index)
 }
 
+/// Persists the index, stamping the current schema version and a fresh
+/// `updated_at_unix_ms` and re-normalizing entry order.
+///
+/// # Errors
+/// Fails when the plugins root cannot be created or the file write fails.
 pub(crate) fn save_plugin_bindings_index(
     plugins_root: &FsPath,
     index: &PluginBindingsIndex,
@@ -311,6 +371,12 @@ pub(crate) fn save_plugin_bindings_index(
         .with_context(|| format!("failed to write plugin bindings index {}", path.display()))
 }
 
+/// Normalizes and validates an upsert into a full record. Scan-derived state
+/// (discovery, config ref, capability diff, typed contracts) is carried over
+/// from `existing` because an upsert must not erase what scans learned.
+///
+/// # Errors
+/// Fails when any identifier, module path, or capability entry is invalid.
 pub(crate) fn normalize_plugin_binding_upsert(
     request: PluginBindingUpsert,
     now_unix_ms: i64,
@@ -335,6 +401,8 @@ pub(crate) fn normalize_plugin_binding_upsert(
     })
 }
 
+/// Inserts or replaces the binding with the record's plugin id, returning
+/// the stored record.
 pub(crate) fn upsert_plugin_binding(
     index: &mut PluginBindingsIndex,
     record: PluginBindingRecord,
@@ -350,6 +418,10 @@ pub(crate) fn upsert_plugin_binding(
     record
 }
 
+/// Toggles a binding's enabled flag, stamping update time and actor.
+///
+/// # Errors
+/// Fails on an invalid plugin id, an unknown binding, or a clock error.
 pub(crate) fn set_plugin_binding_enabled(
     index: &mut PluginBindingsIndex,
     plugin_id: &str,
@@ -369,6 +441,10 @@ pub(crate) fn set_plugin_binding_enabled(
     Ok(entry.clone())
 }
 
+/// Removes a binding from the index, returning the removed record.
+///
+/// # Errors
+/// Fails on an invalid plugin id or an unknown binding.
 pub(crate) fn delete_plugin_binding(
     index: &mut PluginBindingsIndex,
     plugin_id: &str,
@@ -382,6 +458,10 @@ pub(crate) fn delete_plugin_binding(
     Ok(index.entries.remove(position))
 }
 
+/// Looks up a binding by plugin id.
+///
+/// # Errors
+/// Fails on an invalid plugin id or an unknown binding.
 pub(crate) fn plugin_binding(
     index: &PluginBindingsIndex,
     plugin_id: &str,
@@ -405,10 +485,15 @@ fn normalize_plugin_bindings_index(index: &mut PluginBindingsIndex) {
     index.entries.sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
 }
 
+// No-op by design: v2 only added optional fields whose serde defaults cover
+// v1 documents, so the migration just bumps the schema version.
 fn migrate_plugin_bindings_v1_to_v2(_object: &mut Map<String, Value>) -> Result<()> {
     Ok(())
 }
 
+// Identifier charset and length are restricted because plugin ids become
+// directory names under the managed plugins root; anything outside
+// [a-z0-9._-] (or longer than 128) could enable path tricks.
 fn normalize_registry_identifier(raw: &str, field_name: &'static str) -> Result<String> {
     let trimmed = raw.trim().to_ascii_lowercase();
     if trimmed.is_empty() {
@@ -441,6 +526,8 @@ fn normalize_optional_tool_id(value: Option<String>) -> Result<Option<String>> {
     Ok(Some(tool_id))
 }
 
+// Mirrors the wasm runner's module-path validation: only traversal-free
+// modules/*.wasm entries inside the signed artifact are addressable.
 fn normalize_optional_module_path(value: Option<String>) -> Result<Option<String>> {
     let Some(path) = value.and_then(trim_to_option) else {
         return Ok(None);
@@ -561,6 +648,10 @@ where
     Ok(normalized.into_iter().collect())
 }
 
+/// Creates (if needed) and returns the per-plugin directory.
+///
+/// # Errors
+/// Fails on an invalid plugin id or directory creation errors.
 pub(crate) fn prepare_plugin_root(plugins_root: &FsPath, plugin_id: &str) -> Result<PathBuf> {
     let plugin_id = normalize_registry_identifier(plugin_id, "plugin_id")?;
     fs::create_dir_all(plugins_root)
@@ -571,6 +662,10 @@ pub(crate) fn prepare_plugin_root(plugins_root: &FsPath, plugin_id: &str) -> Res
     Ok(plugin_root)
 }
 
+/// Loads one plugin's config instance; `None` when no config file exists.
+///
+/// # Errors
+/// Fails on an invalid plugin id, unreadable file, or parse/migration error.
 pub(crate) fn load_plugin_config_instance(
     plugins_root: &FsPath,
     plugin_id: &str,
@@ -591,6 +686,10 @@ pub(crate) fn load_plugin_config_instance(
     .map(Some)
 }
 
+/// Persists one plugin's config instance, creating its directory if needed.
+///
+/// # Errors
+/// Fails on an invalid plugin id, serialization, or write errors.
 pub(crate) fn save_plugin_config_instance(
     plugins_root: &FsPath,
     instance: &PluginConfigInstance,
@@ -603,6 +702,10 @@ pub(crate) fn save_plugin_config_instance(
         .with_context(|| format!("failed to write plugin config instance {}", path.display()))
 }
 
+/// Deletes one plugin's config file and, when empty, its directory.
+///
+/// # Errors
+/// Fails on an invalid plugin id or when the config file cannot be removed.
 pub(crate) fn remove_plugin_config_instance(plugins_root: &FsPath, plugin_id: &str) -> Result<()> {
     let plugin_id = normalize_registry_identifier(plugin_id, "plugin_id")?;
     let path = plugin_config_instance_path(plugins_root, plugin_id.as_str());
@@ -613,11 +716,16 @@ pub(crate) fn remove_plugin_config_instance(plugins_root: &FsPath, plugin_id: &s
     }
     let plugin_root = plugin_root_path(plugins_root, plugin_id.as_str());
     if plugin_root.exists() {
+        // Best effort: remove_dir only succeeds on an empty directory, and a
+        // non-empty plugin root (other operator files) is fine to keep.
         let _ = fs::remove_dir(plugin_root.as_path());
     }
     Ok(())
 }
 
+/// Audits the plugins root, plugin root, and config path for symlinks,
+/// escapes from the managed root, and (on Unix) loose permissions. Never
+/// fails: an invalid plugin id is itself reported as an unsafe finding.
 pub(crate) fn inspect_plugin_filesystem_safety(
     plugins_root: &FsPath,
     plugin_id: &str,
@@ -647,12 +755,22 @@ pub(crate) fn inspect_plugin_filesystem_safety(
     PluginFilesystemSafetySnapshot { safe: issues.is_empty(), issues }
 }
 
+/// Validates a config instance against the manifest's operator.config
+/// contract and returns the snapshot plus the effective values (instance
+/// values overlaid on property defaults).
+///
+/// Contract-schema or manifest-digest mismatches short-circuit to
+/// `RequiresMigration` with no effective values, since stale values must not
+/// be applied to a changed contract. Issues limited to missing required
+/// properties classify as `Missing`; anything else invalid is `Invalid`.
 pub(crate) fn validate_plugin_config_instance(
     manifest: &SkillManifest,
     instance: Option<&PluginConfigInstance>,
     manifest_payload_sha256: Option<&str>,
 ) -> (PluginConfigValidationSnapshot, BTreeMap<String, Value>) {
     let Some(contract) = manifest.operator.config.as_ref() else {
+        // No contract: an empty (or absent) instance is fine, but leftover
+        // values from a previous manifest version are flagged as invalid.
         if let Some(instance) = instance {
             if !instance.values.is_empty() {
                 return (
@@ -757,6 +875,8 @@ pub(crate) fn validate_plugin_config_instance(
     (PluginConfigValidationSnapshot { state, issues, redacted_fields }, effective)
 }
 
+/// Replaces values of redacted properties with a placeholder for any
+/// operator-facing view; the on-disk instance keeps the real values.
 pub(crate) fn redact_plugin_config_values(
     values: &BTreeMap<String, Value>,
     validation: &PluginConfigValidationSnapshot,
@@ -774,6 +894,9 @@ pub(crate) fn redact_plugin_config_values(
         .collect()
 }
 
+/// Computes capability drift between the skill manifest (declared), the
+/// binding (granted), and the wasm runner policy, caching the effective
+/// intersection used at execution time.
 pub(crate) fn build_plugin_capability_diff(
     manifest: &SkillManifest,
     granted: &PluginCapabilityProfile,
@@ -791,6 +914,11 @@ pub(crate) fn build_plugin_capability_diff(
         &granted,
         &declared,
     );
+    // INTENTIONAL: MissingGrant and UnusedDeclaredCapability are computed
+    // from the same declared-minus-granted set, producing two entries per
+    // capability. They carry distinct operator messages (action needed vs
+    // informational) and tests assert both categories appear; do not
+    // deduplicate.
     append_profile_diffs(
         &mut entries,
         PluginCapabilityDiffCategory::MissingGrant,
@@ -834,6 +962,11 @@ pub(crate) fn build_plugin_capability_diff(
     }
 }
 
+/// Folds scan inputs into one discovery snapshot.
+///
+/// State precedence (first match wins): filesystem unsafe > untrusted
+/// signature override > config requires migration > module resolution error
+/// > config missing/invalid > installed > unknown.
 pub(crate) fn build_plugin_discovery_snapshot(
     binding: &PluginBindingRecord,
     resolved_ok: bool,
@@ -860,6 +993,9 @@ pub(crate) fn build_plugin_discovery_snapshot(
         PluginDiscoveryState::RequiresMigration
     } else if let Some(error) = resolve_error {
         reasons.push(error.to_owned());
+        // Heuristic: resolver errors mentioning "module" are classified as a
+        // missing/mismatched module entry rather than a generally invalid
+        // binding, so the UI can point at the configured module path.
         if error.contains("module") {
             if let Some(path) = binding.module_path.clone() {
                 missing_paths.push(path);
@@ -890,6 +1026,9 @@ pub(crate) fn build_plugin_discovery_snapshot(
     }
 }
 
+// Checks one managed path for symlinks, escapes from the canonical plugins
+// root, and (on Unix) group/world-writable permissions. Nonexistent paths
+// are skipped silently -- absence is handled by discovery, not by this audit.
 fn inspect_path_safety(
     plugins_root: &FsPath,
     path: &Path,
@@ -953,6 +1092,8 @@ fn inspect_path_safety(
     }
 }
 
+// Type check first, then enum membership; enum_values imply a string
+// property, so a non-string value with declared enums is rejected outright.
 fn validate_config_value_against_property(
     name: &str,
     property: &SkillConfigProperty,
@@ -1133,6 +1274,7 @@ fn append_wildcard_entries(
 }
 
 impl PluginCapabilityProfile {
+    /// Converts the profile into the wasm runner's request shape.
     pub(crate) fn to_requested_capabilities(
         &self,
     ) -> crate::wasm_plugin_runner::WasmPluginRequestedCapabilities {
@@ -1145,6 +1287,8 @@ impl PluginCapabilityProfile {
     }
 }
 
+/// Negotiates the manifest's typed plugin contract declarations against the
+/// host adapters and the capability classes implied by the binding's grants.
 pub(crate) fn negotiate_plugin_typed_contracts(
     manifest: &SkillManifest,
     capability_profile: &PluginCapabilityProfile,
@@ -1158,6 +1302,11 @@ pub(crate) fn negotiate_plugin_typed_contracts(
     })
 }
 
+// Host-side adapter table: which contract kinds the daemon can bind and
+// which capability classes each may carry. Lifecycle hooks and policy signal
+// providers deliberately allow no capability classes (minimal-capability
+// contracts; pinned by tests). Keep in sync with
+// all_typed_plugin_contract_kinds in the plugins SDK.
 fn supported_plugin_contract_adapters() -> Vec<TypedPluginContractAdapterSupport> {
     let data_capability_classes = vec![
         TypedPluginCapabilityClass::HttpHosts,
@@ -1250,6 +1399,8 @@ fn plugin_contract_adapter_support(
     }
 }
 
+// A capability class is "in play" for negotiation when the binding grants at
+// least one entry of that kind.
 fn plugin_capability_classes(
     capability_profile: &PluginCapabilityProfile,
 ) -> Vec<TypedPluginCapabilityClass> {
@@ -1269,6 +1420,9 @@ fn plugin_capability_classes(
     classes
 }
 
+/// Flattens the manifest's capability declarations (http egress allowlist,
+/// secret key names, filesystem write roots, node capabilities) into a
+/// [`PluginCapabilityProfile`].
 pub(crate) fn plugin_capability_profile_from_manifest(
     manifest: &SkillManifest,
 ) -> PluginCapabilityProfile {

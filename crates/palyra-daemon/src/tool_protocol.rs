@@ -1,3 +1,18 @@
+//! Tool-call protocol for the generic runtime executor: policy decisions,
+//! execution dispatch, per-tool input quotas, and attested outcomes.
+//!
+//! [`decide_tool_call`] gates every request through the deny-by-default Cedar
+//! policy evaluation plus the per-run call budget before anything executes.
+//! [`execute_tool_call`] runs the tools this executor implements directly
+//! (echo/sleep, the sandbox process runner, the wasm plugin runner) and
+//! returns explicit "requires gateway ... runtime context" failures for tools
+//! owned by richer gateway runtimes. Every outcome -- success, denial, or
+//! timeout -- carries a [`ToolAttestation`] whose SHA-256 binds proposal,
+//! input, output, and executor metadata.
+//!
+//! Executor labels, sandbox-enforcement labels, and error strings are pinned
+//! by tests and security fixtures; keep them byte-identical.
+
 use std::{
     collections::BTreeSet,
     sync::{atomic::AtomicBool, Arc},
@@ -27,6 +42,8 @@ use crate::sandbox_runner::{
 };
 use crate::wasm_plugin_runner::{run_wasm_plugin, WasmPluginRunErrorKind, WasmPluginRunnerPolicy};
 
+/// Per-run tool execution policy: the allowlist, call budget, timeout, and
+/// the sandbox/wasm runner policies applied to every call in the run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCallConfig {
     pub allowed_tools: Vec<String>,
@@ -36,6 +53,8 @@ pub struct ToolCallConfig {
     pub wasm_runtime: WasmPluginRunnerPolicy,
 }
 
+/// Outcome of policy evaluation for one tool call: whether it may execute,
+/// why, and whether explicit operator approval is (still) required.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolDecision {
     pub allowed: bool,
@@ -44,6 +63,7 @@ pub struct ToolDecision {
     pub policy_enforced: bool,
 }
 
+/// Caller identity and run scope forwarded into Cedar policy evaluation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolRequestContext {
     pub principal: String,
@@ -54,6 +74,12 @@ pub struct ToolRequestContext {
     pub skill_id: Option<String>,
 }
 
+/// Tamper-evidence record attached to every execution outcome.
+///
+/// `execution_sha256` binds proposal id, tool name, input, output, error,
+/// timeout flag, executor, sandbox-enforcement label, and timestamp into one
+/// digest (see `compute_execution_hash`), so journal consumers can detect
+/// post-hoc mutation of any recorded field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolAttestation {
     pub attestation_id: String,
@@ -64,6 +90,8 @@ pub struct ToolAttestation {
     pub sandbox_enforcement: String,
 }
 
+/// Final attested result of a tool call: success flag, JSON output bytes,
+/// error text (empty on success), and the binding [`ToolAttestation`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolExecutionOutcome {
     pub success: bool,
@@ -72,6 +100,10 @@ pub struct ToolExecutionOutcome {
     pub attestation: ToolAttestation,
 }
 
+/// Serializable view of [`ToolCallConfig`] for console/diagnostics surfaces.
+///
+/// Field names are part of the JSON contract consumed by clients; do not
+/// rename them.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ToolCallPolicySnapshot {
     pub allowed_tools: Vec<String>,
@@ -81,6 +113,8 @@ pub struct ToolCallPolicySnapshot {
     pub wasm_runtime: WasmRuntimePolicySnapshot,
 }
 
+/// Serializable view of the sandbox process-runner policy inside
+/// [`ToolCallPolicySnapshot`].
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProcessRunnerPolicySnapshot {
     pub enabled: bool,
@@ -96,6 +130,8 @@ pub struct ProcessRunnerPolicySnapshot {
     pub max_output_bytes: u64,
 }
 
+/// Serializable view of the wasm plugin-runner policy inside
+/// [`ToolCallPolicySnapshot`].
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct WasmRuntimePolicySnapshot {
     pub enabled: bool,
@@ -142,6 +178,7 @@ const MAX_BROWSER_TOOL_INPUT_BYTES: usize = 128 * 1024;
 const MAX_ARTIFACT_READ_TOOL_INPUT_BYTES: usize = 16 * 1024;
 const MAX_WASM_PLUGIN_TOOL_INPUT_BYTES: usize = 448 * 1024;
 
+/// Builds the serializable policy snapshot exposed on console/status APIs.
 pub fn tool_policy_snapshot(config: &ToolCallConfig) -> ToolCallPolicySnapshot {
     ToolCallPolicySnapshot {
         allowed_tools: config.allowed_tools.clone(),
@@ -180,6 +217,12 @@ pub fn tool_policy_snapshot(config: &ToolCallConfig) -> ToolCallPolicySnapshot {
     }
 }
 
+/// Gates one tool call through the per-run budget, the deny-by-default Cedar
+/// policy, and the runtime-support check, in that order.
+///
+/// `remaining_budget` is decremented only when the decision is an allow, so
+/// denied calls never consume budget (pinned by tests). The caller owns
+/// synchronization of the budget counter across concurrent calls.
 pub fn decide_tool_call(
     config: &ToolCallConfig,
     remaining_budget: &mut u32,
@@ -236,6 +279,10 @@ pub fn decide_tool_call(
             }
         };
     if let PolicyDecision::DenyByDefault { reason } = policy_evaluation.decision {
+        // Surface approval_required only for denials that an approval can
+        // actually fix (sensitive-tool gating); allowlist or budget denials
+        // must not spawn approval prompts. The reason substring is the only
+        // signal the policy crate exposes for this distinction.
         let approval_required =
             approval_required && reason.contains("explicit user approval required");
         return ToolDecision {
@@ -272,6 +319,12 @@ pub fn decide_tool_call(
     }
 }
 
+/// Expands the configured allowlist with legacy aliases and implied tools so
+/// policy evaluation accepts every spelling the runtime executes.
+///
+/// Allowlisting `palyra.process.run` deliberately implies the stop/status/
+/// list lifecycle tools: they only act on run-owned background processes and
+/// must stay available to clean up what `run` started.
 fn allowlisted_tools_with_compat_aliases(allowed_tools: &[String]) -> Vec<String> {
     let mut names = BTreeSet::new();
     for tool_name in allowed_tools {
@@ -314,6 +367,8 @@ fn format_policy_reason(
     base_reason.to_owned()
 }
 
+/// Builds the attested failure outcome for a call denied before execution,
+/// using the fixed `"policy"` executor label.
 pub fn denied_execution_outcome(
     proposal_id: &str,
     tool_name: &str,
@@ -335,6 +390,8 @@ pub fn denied_execution_outcome(
     )
 }
 
+/// Wraps an externally produced raw result (e.g. from a gateway runtime)
+/// into an attested [`ToolExecutionOutcome`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_tool_execution_outcome(
     proposal_id: &str,
@@ -362,6 +419,9 @@ pub(crate) fn build_tool_execution_outcome(
     )
 }
 
+/// Executes an already-allowed tool call without a cancellation handle.
+///
+/// See [`execute_tool_call_with_cancellation`] for the full contract.
 pub async fn execute_tool_call(
     config: &ToolCallConfig,
     proposal_id: &str,
@@ -371,6 +431,13 @@ pub async fn execute_tool_call(
     execute_tool_call_with_cancellation(config, proposal_id, tool_name, input_json, None).await
 }
 
+/// Executes an already-allowed tool call and returns an attested outcome.
+///
+/// Never returns an error: every failure mode (oversized input, timeout,
+/// runner error, unsupported tool) is encoded as a failed
+/// [`ToolExecutionOutcome`] so the journal always records an attestation.
+/// `cancellation_requested` is polled cooperatively by the sandbox process
+/// runner; other tools ignore it.
 pub async fn execute_tool_call_with_cancellation(
     config: &ToolCallConfig,
     proposal_id: &str,
@@ -382,6 +449,10 @@ pub async fn execute_tool_call_with_cancellation(
         return build_execution_outcome(proposal_id, tool_name, input_json, raw);
     }
 
+    // palyra.plugin.run is exempt from the outer tokio timeout: the wasm
+    // runtime enforces the same wall-clock budget internally and can stop the
+    // guest, whereas an outer timeout would only abandon the spawn_blocking
+    // worker while the module keeps burning a blocking thread.
     let raw = if tool_name == "palyra.plugin.run" {
         run_allowlisted_tool_with_cancellation(
             config,
@@ -418,6 +489,7 @@ pub async fn execute_tool_call_with_cancellation(
     build_execution_outcome(proposal_id, tool_name, input_json, raw)
 }
 
+/// Pre-attestation execution result produced by the individual tool runners.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ToolExecutionRawResult {
     success: bool,
@@ -463,6 +535,9 @@ fn build_execution_outcome(
     }
 }
 
+// Failures that left only the "{}" placeholder are upgraded to a structured
+// diagnostic payload so model callers receive the error and a recovery hint
+// inside output_json, not just in the error field.
 fn normalize_failure_output_json(tool_name: &str, raw: &ToolExecutionRawResult) -> Vec<u8> {
     if raw.success || !tool_output_json_is_empty_object(raw.output_json.as_slice()) {
         return raw.output_json.clone();
@@ -476,10 +551,14 @@ fn normalize_failure_output_json(tool_name: &str, raw: &ToolExecutionRawResult) 
     )
 }
 
+/// Returns `true` when the output bytes are exactly the `{}` placeholder the
+/// runners emit for "no output produced".
 pub(crate) fn tool_output_json_is_empty_object(output_json: &[u8]) -> bool {
     std::str::from_utf8(output_json).map(|raw| raw.trim() == "{}").unwrap_or(false)
 }
 
+/// Builds the structured failure payload (error, recovery hint, executor
+/// metadata) substituted when a failed tool produced no output of its own.
 pub(crate) fn failed_tool_output_json(
     tool_name: &str,
     error: &str,
@@ -508,6 +587,9 @@ pub(crate) fn failed_tool_output_json(
         .unwrap_or_else(|_| br#"{"success":false,"error":"tool failed"}"#.to_vec())
 }
 
+// Hints are matched on stable error substrings (quota code, "requires
+// gateway", "disabled by runtime policy") before falling back to per-tool
+// guidance, so generic failure classes win over tool-specific advice.
 fn tool_failure_recovery_hint(tool_name: &str, error: &str, timed_out: bool) -> String {
     if timed_out {
         return "Retry with a smaller operation, narrower scope, or a larger configured tool timeout."
@@ -536,6 +618,10 @@ fn tool_failure_recovery_hint(tool_name: &str, error: &str, timed_out: bool) -> 
     }
 }
 
+// Dispatch table for the generic executor. Tools owned by richer gateway
+// runtimes (memory, routines, workspace, browser, ...) intentionally fail
+// here with explicit "requires gateway ..." errors; their strings, executor
+// labels, and sandbox-enforcement labels are pinned by tests.
 async fn run_allowlisted_tool_with_cancellation(
     config: &ToolCallConfig,
     tool_name: &str,
@@ -787,6 +873,9 @@ async fn run_allowlisted_tool_with_cancellation(
     }
 }
 
+// Closed set of tool names this executor can answer for (directly or with an
+// explicit delegation error). Keep in sync with the dispatch match above and
+// with `tool_input_limit_bytes`.
 fn is_runtime_supported_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
@@ -852,6 +941,8 @@ fn is_runtime_supported_tool(tool_name: &str) -> bool {
     )
 }
 
+// Executor labels recorded in attestations; pinned by tests and security
+// fixtures. Must mirror the labels the dispatch arms emit.
 fn tool_executor_name(config: &ToolCallConfig, tool_name: &str) -> String {
     if matches!(
         tool_name,
@@ -901,6 +992,9 @@ fn tool_executor_name(config: &ToolCallConfig, tool_name: &str) -> String {
     }
 }
 
+// Per-tool input byte quotas, applied before any parsing so oversized
+// payloads cannot reach a runner. Unknown tools fall back to the 64 KiB
+// memory-search limit as a conservative default.
 fn tool_input_limit_bytes(tool_name: &str) -> usize {
     match tool_name {
         "palyra.echo" => MAX_ECHO_TOOL_INPUT_BYTES,
@@ -966,6 +1060,9 @@ fn tool_input_limit_bytes(tool_name: &str) -> usize {
     }
 }
 
+// Sandbox-enforcement labels recorded in attestations; pinned by tests. For
+// process tools the label reflects the live policy: "host_access" when the
+// runner is allowed to escape the workspace, else the egress mode.
 fn sandbox_enforcement_for_tool(config: &ToolCallConfig, tool_name: &str) -> String {
     if matches!(
         tool_name,
@@ -1001,6 +1098,8 @@ fn sandbox_enforcement_for_tool(config: &ToolCallConfig, tool_name: &str) -> Str
     }
 }
 
+// Returns the quota-failure result when the input exceeds the per-tool
+// limit, or None when the call may proceed.
 fn reject_oversized_tool_input(
     config: &ToolCallConfig,
     tool_name: &str,
@@ -1044,6 +1143,8 @@ async fn execute_process_runner_tool(
     };
     let input = input_json.to_vec();
     let timeout = Duration::from_millis(config.execution_timeout_ms);
+    // The runner blocks on the child process, so it runs off the async
+    // executor; the same timeout is enforced inside the runner itself.
     match tokio::task::spawn_blocking(move || {
         run_constrained_process_with_cancellation(
             &policy,
@@ -1155,6 +1256,8 @@ async fn execute_process_lifecycle_tool(
     }
 }
 
+// Accepts the pid as a JSON number or a numeric string (clients differ),
+// then rejects zero and out-of-u32-range values.
 fn process_lifecycle_pid_from_input(input_json: &[u8], tool_name: &str) -> Result<u32, String> {
     let payload = serde_json::from_slice::<Value>(input_json)
         .map_err(|error| format!("{tool_name} input must be valid JSON: {error}"))?;
@@ -1256,6 +1359,9 @@ fn parse_input_json(input_json: &[u8]) -> Result<Value, String> {
     }
 }
 
+// Every variable-length field is length-prefixed before hashing so adjacent
+// fields cannot be reinterpreted across boundaries (no "A|B"/"AB|" style
+// collisions); pinned by the delimiter-collision test below.
 #[allow(clippy::too_many_arguments)]
 fn compute_execution_hash(
     proposal_id: &str,
@@ -1294,6 +1400,8 @@ fn hash_len_prefixed_bytes(hasher: &mut Sha256, value: &[u8]) {
 }
 
 fn current_unix_ms() -> i64 {
+    // A clock before the epoch degrades to 0 instead of failing the call; the
+    // `as i64` truncation is unreachable for any realistic wall-clock value.
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64
 }
 
