@@ -1,3 +1,8 @@
+//! Build script embedding the short git hash as the `PALYRA_GIT_HASH` rustc env var.
+//!
+//! An explicit `PALYRA_GIT_HASH` env override (used by CI/release) wins over `git
+//! rev-parse`; outside a git checkout the hash falls back to "unknown".
+
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -49,6 +54,9 @@ fn resolve_git_hash(repo_root: &Path) -> Option<String> {
     normalize_git_hash(String::from_utf8_lossy(output.stdout.as_slice()).into_owned())
 }
 
+// Registers rerun-if-changed on the files that change when HEAD moves, so rebuilds pick
+// up new commits. A `.git` file (instead of a directory) means a worktree/submodule and
+// points at the real git dir via a `gitdir:` line.
 fn emit_git_rerun_paths(repo_root: &Path) {
     let git_path = repo_root.join(".git");
     if git_path.is_dir() {

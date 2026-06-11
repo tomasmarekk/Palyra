@@ -1,3 +1,10 @@
+//! Default config, identity-store, and state-root path resolution per platform.
+//!
+//! Windows resolves through APPDATA/LOCALAPPDATA/PROGRAMDATA; other platforms follow the
+//! XDG base-directory spec with HOME fallbacks. `parse_config_path` validates
+//! operator-supplied config paths and is exercised by
+//! `fuzz/fuzz_targets/config_path_parser.rs`.
+
 use std::{
     env,
     ffi::OsString,
@@ -6,6 +13,7 @@ use std::{
 
 use thiserror::Error;
 
+/// Why an operator-supplied config path was rejected.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ConfigPathParseError {
     #[error("config path cannot be empty")]
@@ -16,6 +24,7 @@ pub enum ConfigPathParseError {
     ParentTraversal,
 }
 
+/// The environment lacks the variables needed to derive a default state path.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum IdentityStorePathError {
     #[cfg(not(windows))]
@@ -26,6 +35,14 @@ pub enum IdentityStorePathError {
     AppDataNotSet,
 }
 
+/// Validates and parses an operator-supplied config path.
+///
+/// Parent-directory traversal is rejected so a config path passed via env/CLI cannot
+/// escape the directory the operator believes it points into.
+///
+/// # Errors
+/// Returns a [`ConfigPathParseError`] for empty input, embedded NUL bytes, or `..`
+/// components.
 pub fn parse_config_path(raw: &str) -> Result<PathBuf, ConfigPathParseError> {
     if raw.trim().is_empty() {
         return Err(ConfigPathParseError::Empty);
@@ -42,6 +59,7 @@ pub fn parse_config_path(raw: &str) -> Result<PathBuf, ConfigPathParseError> {
     Ok(path)
 }
 
+/// Returns the ordered candidate locations of `palyra.toml` (user config before system).
 #[must_use]
 pub fn default_config_search_paths() -> Vec<PathBuf> {
     #[cfg(windows)]
@@ -54,6 +72,10 @@ pub fn default_config_search_paths() -> Vec<PathBuf> {
     }
 }
 
+/// Returns the default identity-store directory derived from the process environment.
+///
+/// # Errors
+/// Returns [`IdentityStorePathError`] when the platform base-directory variables are unset.
 pub fn default_identity_store_root() -> Result<PathBuf, IdentityStorePathError> {
     #[cfg(windows)]
     {
@@ -65,6 +87,10 @@ pub fn default_identity_store_root() -> Result<PathBuf, IdentityStorePathError> 
     }
 }
 
+/// Returns the default state root (the parent of the identity store).
+///
+/// # Errors
+/// Returns [`IdentityStorePathError`] when the platform base-directory variables are unset.
 pub fn default_state_root() -> Result<PathBuf, IdentityStorePathError> {
     #[cfg(windows)]
     {
@@ -76,6 +102,10 @@ pub fn default_state_root() -> Result<PathBuf, IdentityStorePathError> {
     }
 }
 
+/// Injectable-environment variant of [`default_identity_store_root`] for tests.
+///
+/// # Errors
+/// Returns [`IdentityStorePathError::AppDataNotSet`] when both inputs are `None`.
 #[cfg(windows)]
 pub fn default_identity_store_root_from_env(
     local_appdata: Option<OsString>,
@@ -90,6 +120,10 @@ pub fn default_identity_store_root_from_env(
     Err(IdentityStorePathError::AppDataNotSet)
 }
 
+/// Injectable-environment variant of [`default_state_root`] for tests.
+///
+/// # Errors
+/// Returns [`IdentityStorePathError::AppDataNotSet`] when both inputs are `None`.
 #[cfg(windows)]
 pub fn default_state_root_from_env(
     local_appdata: Option<OsString>,
@@ -99,6 +133,10 @@ pub fn default_state_root_from_env(
     Ok(identity_root.parent().map(PathBuf::from).unwrap_or(identity_root))
 }
 
+/// Injectable-environment variant of [`default_identity_store_root`] for tests.
+///
+/// # Errors
+/// Returns [`IdentityStorePathError::HomeNotSet`] when both inputs are `None`.
 #[cfg(not(windows))]
 pub fn default_identity_store_root_from_env(
     xdg_state_home: Option<OsString>,
@@ -111,6 +149,10 @@ pub fn default_identity_store_root_from_env(
     Ok(home.join(".local").join("state").join("palyra").join("identity"))
 }
 
+/// Injectable-environment variant of [`default_state_root`] for tests.
+///
+/// # Errors
+/// Returns [`IdentityStorePathError::HomeNotSet`] when both inputs are `None`.
 #[cfg(not(windows))]
 pub fn default_state_root_from_env(
     xdg_state_home: Option<OsString>,

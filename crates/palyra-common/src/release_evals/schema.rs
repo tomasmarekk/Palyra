@@ -1,3 +1,10 @@
+//! Serde data model for the golden release-eval manifest and its report.
+//!
+//! Manifest shapes are pinned by the golden fixture consumed by the
+//! release-eval gate (`just release-eval-gate`) and by
+//! `tests/release_eval_contract.rs`; renaming fields or variants breaks the
+//! gate. Evaluation logic lives in the sibling `evaluator` module.
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

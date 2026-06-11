@@ -1,9 +1,16 @@
+//! Structured secret references: where a secret comes from and how it is refreshed.
+//!
+//! A [`SecretRef`] describes a vault/env/file/exec source plus lifecycle policies without
+//! ever holding the secret value itself. Consumers resolve refs through the vault/runtime;
+//! [`SecretRef::redacted_view`] is the only serialization safe for logs and console APIs.
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const DEFAULT_SECRET_MAX_BYTES: u64 = 64 * 1024;
 const DEFAULT_SECRET_REQUIRED: bool = true;
 
+/// When a resolved secret value is re-read from its source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SecretRefreshPolicy {
@@ -15,6 +22,7 @@ pub enum SecretRefreshPolicy {
 }
 
 impl SecretRefreshPolicy {
+    /// Returns the canonical snake_case wire name for this policy.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -26,6 +34,7 @@ impl SecretRefreshPolicy {
     }
 }
 
+/// How long a captured secret snapshot stays valid before it must be refreshed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SecretSnapshotPolicy {
@@ -36,6 +45,7 @@ pub enum SecretSnapshotPolicy {
 }
 
 impl SecretSnapshotPolicy {
+    /// Returns the canonical snake_case wire name for this policy.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -46,6 +56,7 @@ impl SecretSnapshotPolicy {
     }
 }
 
+/// Where a secret value is resolved from; never carries the value itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SecretSource {
@@ -72,6 +83,7 @@ pub enum SecretSource {
 }
 
 impl SecretSource {
+    /// Returns the serde tag name of this source variant.
     #[must_use]
     pub const fn kind(&self) -> &'static str {
         match self {
@@ -83,6 +95,10 @@ impl SecretSource {
     }
 }
 
+/// A reference to a secret: source, lifecycle policies, and resolution limits.
+///
+/// Serialization of this type contains source locators (paths, commands, vault refs) and
+/// must not reach logs — use [`SecretRef::redacted_view`] for any operator-facing output.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecretRef {
     #[serde(flatten)]
@@ -103,6 +119,7 @@ pub struct SecretRef {
     pub display_name: Option<String>,
 }
 
+/// Log-safe projection of a [`SecretRef`] with source locators replaced by counts/labels.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SecretRefRedactedView {
     pub kind: String,
@@ -121,6 +138,7 @@ pub struct SecretRefRedactedView {
     pub source: SecretSourceDisplay,
 }
 
+/// Human-readable, locator-free description of a [`SecretSource`] for redacted views.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SecretSourceDisplay {
     pub description: String,
@@ -132,6 +150,7 @@ pub struct SecretSourceDisplay {
     pub allow_symlinks: Option<bool>,
 }
 
+/// Validation failure for a [`SecretRef`] field, carrying the offending field path.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SecretRefValidationError {
     #[error("{field}: {message}")]
@@ -139,6 +158,7 @@ pub enum SecretRefValidationError {
 }
 
 impl SecretRef {
+    /// Builds a vault-backed ref with legacy defaults for configs that predate [`SecretRef`].
     #[must_use]
     pub fn from_legacy_vault_ref(vault_ref: impl Into<String>) -> Self {
         Self {
@@ -153,6 +173,12 @@ impl SecretRef {
         }
     }
 
+    /// Validates field limits and source-specific invariants without resolving the secret.
+    ///
+    /// # Errors
+    /// Returns [`SecretRefValidationError::InvalidField`] naming the first offending field:
+    /// zero limits, `exec_timeout_ms` on a non-exec source, empty/oversized text fields,
+    /// malformed env var names, a file source without trusted dirs, or an empty exec argv.
     pub fn validate(&self) -> Result<(), SecretRefValidationError> {
         if let Some(max_bytes) = self.max_bytes {
             if max_bytes == 0 {
@@ -213,13 +239,18 @@ impl SecretRef {
         Ok(())
     }
 
+    /// Returns the serde tag name of the underlying source variant.
     #[must_use]
     pub fn source_kind(&self) -> &'static str {
         self.source.kind()
     }
 
+    /// Returns a stable 16-hex-char identity for this ref (truncated, domain-separated
+    /// SHA-256 of its JSON form) for correlating log entries without exposing locators.
     #[must_use]
     pub fn fingerprint(&self) -> String {
+        // Serializing this plain data type cannot fail in practice; falling back to the
+        // empty encoding keeps fingerprinting total instead of panicking.
         let encoded = serde_json::to_vec(self).unwrap_or_default();
         let mut hasher = Sha256::new();
         hasher.update(b"palyra.secret_ref.v1");
@@ -228,11 +259,13 @@ impl SecretRef {
         digest.chars().take(16).collect()
     }
 
+    /// Returns the configured `max_bytes`, or the 64 KiB default when unset.
     #[must_use]
     pub fn effective_max_bytes(&self) -> u64 {
         self.max_bytes.unwrap_or(DEFAULT_SECRET_MAX_BYTES)
     }
 
+    /// Builds the log-safe view of this ref; source locators are reduced to counts/labels.
     #[must_use]
     pub fn redacted_view(&self) -> SecretRefRedactedView {
         let source = match &self.source {

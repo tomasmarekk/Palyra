@@ -1,3 +1,11 @@
+//! Deterministic incident replay bundles: capture, redaction, validation, offline replay.
+//!
+//! Builds byte-stable, secret-free bundles from orchestrator tape events (wall-clock
+//! timestamps zeroed, identifiers pseudonymized) and re-derives expected outputs to detect
+//! drift offline. The canonical serialization and contract version are pinned by the
+//! replay gate (`scripts/test/run-replay-gate.sh`); shape or formatting changes invalidate
+//! stored bundle hashes and golden fixtures.
+
 use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -14,13 +22,19 @@ use crate::{
     versioned_json::{parse_versioned_json, VersionedJsonFormat},
 };
 
+/// Human-readable format name embedded in versioned-JSON parse errors.
 pub const REPLAY_BUNDLE_FORMAT_NAME: &str = "palyra incident replay bundle";
+/// Current replay bundle schema version; newer versions are rejected until migrated.
 pub const REPLAY_BUNDLE_SCHEMA_VERSION: u32 = 1;
+/// Contract identifier validated against captured bundles.
 pub const REPLAY_BUNDLE_CONTRACT_VERSION: &str = "incident-replay-v1";
 
+// Hard caps keeping bundles reviewable and safe to load in CI; oversized captures must be
+// truncated upstream, never inflated here.
 const MAX_REPLAY_TAPE_EVENTS: usize = 4_096;
 const MAX_REPLAY_PAYLOAD_BYTES: usize = 512 * 1024;
 
+/// Top-level incident replay bundle: redacted capture, expected outputs, integrity hash.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReplayBundle {
     pub schema_version: u32,
@@ -47,6 +61,7 @@ pub struct ReplayBundle {
     pub integrity: ReplayIntegrity,
 }
 
+/// Identifies the product, run, and schema policy a bundle was captured from.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReplaySource {
     pub product: String,
@@ -57,6 +72,7 @@ pub struct ReplaySource {
     pub schema_policy: String,
 }
 
+/// Capture-time settings and warnings recorded alongside the tape.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReplayCaptureMetadata {
     pub captured_at_unix_ms: i64,
@@ -68,6 +84,7 @@ pub struct ReplayCaptureMetadata {
     pub warnings: Vec<String>,
 }
 
+/// Redacted snapshot of the captured run's state and token usage.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReplayRunSnapshot {
     pub state: String,
@@ -90,6 +107,7 @@ pub struct ReplayRunSnapshot {
     pub parameter_delta: Option<Value>,
 }
 
+/// Single normalized orchestrator tape event, ordered by `seq`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReplayTapeEvent {
     pub seq: i64,
@@ -97,6 +115,7 @@ pub struct ReplayTapeEvent {
     pub payload: Value,
 }
 
+/// Hash-level summary of one model exchange reconstructed from token events.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReplayModelExchange {
     pub exchange_id: String,
@@ -106,6 +125,7 @@ pub struct ReplayModelExchange {
     pub response: Value,
 }
 
+/// Tool proposal, decision, result, and attestation grouped by proposal id.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReplayToolExchange {
     pub proposal_id: String,
@@ -119,6 +139,7 @@ pub struct ReplayToolExchange {
     pub attestation: Option<Value>,
 }
 
+/// HTTP fetch exchange derived from `palyra.http.fetch` tool calls.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReplayHttpExchange {
     pub exchange_id: String,
@@ -127,6 +148,7 @@ pub struct ReplayHttpExchange {
     pub fixture_ref: ReplayArtifactRef,
 }
 
+/// Approval request/response pair grouped by approval id.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReplayApprovalExchange {
     pub approval_id: String,
@@ -136,6 +158,7 @@ pub struct ReplayApprovalExchange {
     pub response: Option<Value>,
 }
 
+/// Generic decision record (queue, auxiliary, flow) extracted from the tape.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReplayDecisionRecord {
     pub record_id: String,
@@ -143,6 +166,7 @@ pub struct ReplayDecisionRecord {
     pub payload: Value,
 }
 
+/// Reference to an out-of-band artifact; the reference string itself is pseudonymized.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReplayArtifactRef {
     pub artifact_id: String,
@@ -154,6 +178,7 @@ pub struct ReplayArtifactRef {
     pub size_bytes: Option<u64>,
 }
 
+/// Outputs re-derived during offline replay and compared against the capture.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReplayExpectedOutputs {
     pub tape_event_count: usize,
@@ -172,6 +197,7 @@ pub struct ReplayExpectedOutputs {
     pub artifact_ref_count: usize,
 }
 
+/// Expected outcome of one tool exchange, carrying hashes rather than raw output.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReplayExpectedToolOutcome {
     pub proposal_id: String,
@@ -183,6 +209,7 @@ pub struct ReplayExpectedToolOutcome {
     pub error: Option<String>,
 }
 
+/// Expected approval verdict for one approval exchange.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReplayExpectedApprovalDecision {
     pub approval_id: String,
@@ -191,6 +218,7 @@ pub struct ReplayExpectedApprovalDecision {
     pub decision_scope: String,
 }
 
+/// Counters describing how much the normalizer redacted or rewrote during capture.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ReplayRedactionReport {
     pub redacted_fields: usize,
@@ -199,6 +227,7 @@ pub struct ReplayRedactionReport {
     pub warnings: Vec<String>,
 }
 
+/// Canonical-bytes digest and the canonicalization scheme that produced it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ReplayIntegrity {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -206,8 +235,11 @@ pub struct ReplayIntegrity {
     pub canonicalization: String,
 }
 
+/// Raw capture handed to [`build_replay_bundle`] before normalization and redaction.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReplayBundleBuildInput {
+    /// Capture-time wall clock; deliberately ignored by the builder, which pins the
+    /// bundle's `generated_at_unix_ms` to 0 for determinism.
     pub generated_at_unix_ms: i64,
     pub source: ReplaySource,
     pub capture: ReplayCaptureMetadata,
@@ -228,6 +260,7 @@ struct ReplayCaptureCounts {
     idempotency_records: usize,
 }
 
+/// Result of statically validating a bundle: schema, limits, and secret scan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReplayValidationReport {
     pub valid: bool,
@@ -235,12 +268,14 @@ pub struct ReplayValidationReport {
     pub issues: Vec<ReplayValidationIssue>,
 }
 
+/// Single validation finding with a JSONPath-style location.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReplayValidationIssue {
     pub path: String,
     pub reason: String,
 }
 
+/// Outcome of an offline replay: validation result plus expected-vs-actual diffs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReplayRunReport {
     pub status: ReplayRunStatus,
@@ -250,6 +285,7 @@ pub struct ReplayRunReport {
     pub validation: ReplayValidationReport,
 }
 
+/// Overall offline replay verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplayRunStatus {
@@ -257,6 +293,7 @@ pub enum ReplayRunStatus {
     Failed,
 }
 
+/// One expected-vs-actual divergence found during offline replay.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReplayDiff {
     pub category: String,
@@ -265,6 +302,8 @@ pub struct ReplayDiff {
     pub actual: String,
 }
 
+// Walks captured JSON, redacting secrets, zeroing wall-clock fields, and replacing
+// identifiers with stable per-bundle aliases so output is deterministic and PII-free.
 #[derive(Debug, Default)]
 struct ReplayNormalizer {
     redaction: ReplayRedactionReport,
@@ -288,6 +327,11 @@ struct ApprovalAccumulator {
     response: Option<Value>,
 }
 
+/// Returns the machine-readable replay contract descriptor served by diagnostics surfaces.
+///
+/// INTENTIONAL: consumed verbatim by CLI support bundles and console diagnostics; treat
+/// the contents as golden-snapshot material and change them only with the gates that pin
+/// them.
 #[must_use]
 pub fn replay_contract_snapshot() -> Value {
     json!({
@@ -323,6 +367,13 @@ pub fn replay_contract_snapshot() -> Value {
     })
 }
 
+/// Parses a replay bundle from JSON bytes, rejecting newer schema versions.
+///
+/// # Errors
+///
+/// Fails when the payload is not valid JSON, is not an object, declares a schema version
+/// newer than [`REPLAY_BUNDLE_SCHEMA_VERSION`], or does not deserialize into
+/// [`ReplayBundle`].
 pub fn parse_replay_bundle(bytes: &[u8]) -> Result<ReplayBundle> {
     parse_versioned_json(
         bytes,
@@ -331,6 +382,16 @@ pub fn parse_replay_bundle(bytes: &[u8]) -> Result<ReplayBundle> {
     )
 }
 
+/// Builds a redacted, deterministic replay bundle from a raw capture.
+///
+/// Normalization zeroes wall-clock timestamps, pseudonymizes identifiers, redacts
+/// secret-bearing strings, sorts capture metadata, and finalizes the integrity hash, so
+/// identical captures always produce identical canonical bytes.
+///
+/// # Errors
+///
+/// Fails when the capture exceeds the tape event limit or when lifecycle/idempotency
+/// records cannot be round-tripped through JSON for normalization.
 pub fn build_replay_bundle(input: ReplayBundleBuildInput) -> Result<ReplayBundle> {
     if input.tape_events.len() > MAX_REPLAY_TAPE_EVENTS {
         bail!(
@@ -408,7 +469,10 @@ pub fn build_replay_bundle(input: ReplayBundleBuildInput) -> Result<ReplayBundle
     );
 
     let mut capture = input.capture;
+    // Wall-clock capture time is zeroed (like generated_at below) so rebuilding the same
+    // run always yields identical canonical bytes.
     capture.captured_at_unix_ms = 0;
+    // Hitting the per-run cap means the capture may have dropped events upstream.
     capture.truncated |= tape_events.len() >= capture.max_events_per_run;
     capture.inline_sections.sort();
     capture.inline_sections.dedup();
@@ -463,17 +527,33 @@ fn normalize_artifact_refs(
         .collect()
 }
 
+/// Recomputes the canonical integrity hash over the bundle.
+///
+/// # Errors
+///
+/// Fails only when the bundle cannot be serialized to canonical JSON.
 pub fn finalize_replay_bundle(bundle: &mut ReplayBundle) -> Result<()> {
+    // Hash with the digest field cleared so the digest covers everything except itself.
     bundle.integrity.canonical_sha256 = None;
     let hash = sha256_hex(canonical_replay_bundle_bytes(bundle)?.as_slice());
     bundle.integrity.canonical_sha256 = Some(hash);
     Ok(())
 }
 
+/// Serializes the bundle to its canonical byte representation.
+///
+/// INTENTIONAL: pretty-printed JSON with serde_json's default sorted (BTreeMap) object
+/// order is the canonicalization named in [`ReplayIntegrity`]; changing the formatting
+/// invalidates every stored bundle hash.
+///
+/// # Errors
+///
+/// Fails only when JSON serialization fails.
 pub fn canonical_replay_bundle_bytes(bundle: &ReplayBundle) -> Result<Vec<u8>> {
     serde_json::to_vec_pretty(bundle).context("failed to encode replay bundle")
 }
 
+/// Validates schema/contract versions, size limits, and absence of unredacted secrets.
 pub fn validate_replay_bundle(bundle: &ReplayBundle) -> ReplayValidationReport {
     let mut issues = Vec::new();
     if bundle.schema_version != REPLAY_BUNDLE_SCHEMA_VERSION {
@@ -498,6 +578,7 @@ pub fn validate_replay_bundle(bundle: &ReplayBundle) -> ReplayValidationReport {
         });
     }
     for event in &bundle.tape_events {
+        // Fail closed: a payload that cannot be serialized counts as oversized.
         let payload_bytes =
             serde_json::to_vec(&event.payload).map_or(usize::MAX, |bytes| bytes.len());
         if payload_bytes > MAX_REPLAY_PAYLOAD_BYTES {
@@ -509,12 +590,19 @@ pub fn validate_replay_bundle(bundle: &ReplayBundle) -> ReplayValidationReport {
     }
 
     let mut checked_values = 0_usize;
+    // AIDEV-NOTE: `unwrap_or(Value::Null)` makes the secret scan fail-open if
+    // serialization ever fails. Unreachable for today's plain-JSON payloads, but if
+    // non-JSON-safe types are added to ReplayBundle this should surface a validation
+    // issue instead of silently scanning nothing.
     let value = serde_json::to_value(bundle).unwrap_or(Value::Null);
     scan_for_unredacted_secrets(&value, "$", None, &mut checked_values, &mut issues);
 
     ReplayValidationReport { valid: issues.is_empty(), checked_values, issues }
 }
 
+/// Replays a bundle offline by re-deriving expected outputs and diffing the capture.
+///
+/// Purely deterministic: no network, provider, or filesystem access is involved.
 pub fn replay_bundle_offline(bundle: &ReplayBundle) -> ReplayRunReport {
     let validation = validate_replay_bundle(bundle);
     let actual_expected = expected_outputs_from_capture(
@@ -749,6 +837,8 @@ impl ReplayNormalizer {
         if raw.trim().is_empty() {
             return String::new();
         }
+        // Aliases are assigned in first-seen order, so identical captures always map the
+        // same identifiers to the same aliases.
         if let Some(existing) = self.id_aliases.get(raw) {
             return existing.clone();
         }
@@ -882,6 +972,7 @@ fn split_replay_query_pair(pair: &str) -> (&str, &str) {
     }
 }
 
+// Only a digest and token count are retained; raw model text never lands in the bundle.
 fn extract_model_exchanges(tape_events: &[ReplayTapeEvent]) -> Vec<ReplayModelExchange> {
     let tokens = tape_events
         .iter()
@@ -1018,6 +1109,9 @@ fn extract_decision_records(
         .collect()
 }
 
+// Typed records round-trip through JSON so the generic normalizer (redaction, aliasing,
+// timestamp zeroing) applies to them exactly as it does to raw payloads; the same
+// rationale applies to normalize_idempotency_records below.
 fn normalize_lifecycle_transitions(
     transitions: Vec<RunLifecycleTransitionRecord>,
     normalizer: &mut ReplayNormalizer,
@@ -1201,6 +1295,8 @@ fn entry_is_redacted_or_empty(value: &Value) -> bool {
 }
 
 fn string_contains_unredacted_secret(raw: &str, key_context: Option<&str>) -> bool {
+    // A redaction marker means the normalizer already processed this string; skipping it
+    // avoids re-flagging partially redacted text (e.g. "token=<redacted>").
     if raw.contains(REDACTED) {
         return false;
     }
@@ -1230,6 +1326,8 @@ fn string_contains_unredacted_secret(raw: &str, key_context: Option<&str>) -> bo
             return true;
         }
     }
+    // URLs with a userinfo component embed credentials in the authority part; a bare
+    // "://@" means the userinfo was already emptied and is safe.
     lowered.contains("://") && lowered.contains('@') && !lowered.contains("://@")
 }
 
@@ -1316,6 +1414,7 @@ fn compare_approval_decisions(
     });
 }
 
+// Derived from the run id so rebuilding the same run always yields the same bundle id.
 fn stable_bundle_id(run_id: &str) -> String {
     format!("replay:{}", &sha256_hex(run_id.as_bytes())[..16])
 }
@@ -1354,6 +1453,8 @@ fn is_identifier_key(key: &str) -> bool {
         || normalized.contains("correlation_id")
 }
 
+// Identifier-style keys are pseudonymized rather than redacted, and token *count* metrics
+// are plain numbers despite containing "token", so both are carved out of secret handling.
 fn is_replay_secret_key(key: &str) -> bool {
     is_sensitive_key(key) && !is_identifier_key(key) && !is_token_metric_key(key)
 }
@@ -1367,6 +1468,8 @@ fn is_token_metric_key(key: &str) -> bool {
         || normalized.contains("tokens_")
 }
 
+// Durations, budgets, and TTLs are deterministic configuration, not wall-clock readings;
+// only point-in-time fields are zeroed for reproducibility.
 fn is_nondeterministic_time_key(key: &str) -> bool {
     let normalized = normalize_key(key);
     if key_contains_any(
@@ -1381,6 +1484,8 @@ fn is_nondeterministic_time_key(key: &str) -> bool {
         || normalized.ends_with("_at_unix_ms")
 }
 
+// Cheap shape check (26 alphanumeric chars); false positives are harmless because they
+// merely get pseudonymized like any other identifier.
 fn looks_like_ulid(value: &str) -> bool {
     let trimmed = value.trim();
     trimmed.len() == 26 && trimmed.chars().all(|ch| ch.is_ascii_digit() || ch.is_ascii_alphabetic())
@@ -1398,6 +1503,11 @@ fn normalize_key(key: &str) -> String {
     normalized
 }
 
+/// Converts a failed replay report into an error suitable for gate scripts.
+///
+/// # Errors
+///
+/// Fails when the report status is not [`ReplayRunStatus::Passed`], citing the first diff.
 pub fn ensure_replay_report_passed(report: &ReplayRunReport) -> Result<()> {
     if report.status == ReplayRunStatus::Passed {
         return Ok(());

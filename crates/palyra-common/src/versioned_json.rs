@@ -1,12 +1,22 @@
+//! Schema-versioned JSON parsing with stepwise forward migrations.
+//!
+//! Persisted JSON documents carry a `schema_version` field; loading applies one migration
+//! per version step until the current version is reached, so old state files written by
+//! earlier builds stay readable. Documents newer than the running build are rejected.
+
 use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 
+/// Field carrying the document schema version in every versioned JSON format.
 pub const SCHEMA_VERSION_FIELD: &str = "schema_version";
+/// Shared metadata field for last-update wall-clock time in unix milliseconds.
 pub const UPDATED_AT_UNIX_MS_FIELD: &str = "updated_at_unix_ms";
 
+/// A single in-place migration step from one schema version to the next.
 pub type JsonMigrationFn = fn(&mut Map<String, Value>) -> Result<()>;
 
+/// Identity of a versioned JSON format: a diagnostic name and its current version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VersionedJsonFormat {
     pub format_name: &'static str,
@@ -14,21 +24,32 @@ pub struct VersionedJsonFormat {
 }
 
 impl VersionedJsonFormat {
+    /// Creates a format descriptor for `format_name` at `current_version`.
     #[must_use]
     pub const fn new(format_name: &'static str, current_version: u32) -> Self {
         Self { format_name, current_version }
     }
 }
 
+/// Inserts `default` under `field_name` if the field is absent (migration helper).
 pub fn ensure_i64_field(object: &mut Map<String, Value>, field_name: &'static str, default: i64) {
     object.entry(field_name.to_owned()).or_insert_with(|| Value::from(default));
 }
 
+/// Shared v0→v1 migration: backfills [`UPDATED_AT_UNIX_MS_FIELD`] with `0`.
+///
+/// # Errors
+/// Never fails; the `Result` only satisfies the [`JsonMigrationFn`] signature.
 pub fn migrate_updated_at_metadata_v0_to_v1(object: &mut Map<String, Value>) -> Result<()> {
     ensure_i64_field(object, UPDATED_AT_UNIX_MS_FIELD, 0);
     Ok(())
 }
 
+/// Parses bytes as `format`, migrating older documents forward before deserializing.
+///
+/// # Errors
+/// Fails on malformed JSON, an unsupported or future schema version, a failing migration
+/// step, or a post-migration document that does not deserialize into `T`.
 pub fn parse_versioned_json<T>(
     bytes: &[u8],
     format: VersionedJsonFormat,
@@ -44,6 +65,11 @@ where
         .with_context(|| format!("failed to deserialize {}", format.format_name))
 }
 
+/// Migrates a JSON value to `format.current_version`, one version step at a time.
+///
+/// # Errors
+/// Fails when the value is not an object, the version field is malformed, the document is
+/// newer than `current_version`, a migration step is missing, or a step returns an error.
 pub fn migrate_versioned_json_value(
     value: Value,
     format: VersionedJsonFormat,
@@ -53,6 +79,7 @@ pub fn migrate_versioned_json_value(
         Value::Object(object) => object,
         _ => bail!("{} must be a JSON object", format.format_name),
     };
+    // Documents predating versioning carry no schema_version field; treat them as v0.
     let mut version = match object.get(SCHEMA_VERSION_FIELD) {
         Some(value) => parse_schema_version(value, format.format_name)?,
         None => 0,

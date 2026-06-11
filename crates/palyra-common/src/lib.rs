@@ -1,3 +1,11 @@
+//! Shared foundation crate for the Palyra workspace.
+//!
+//! Hosts cross-service primitives with no daemon dependencies: configuration and path
+//! resolution, canonical IDs, secret redaction and references, network/SSRF guards,
+//! webhook envelope parsing, tool catalog metadata, versioned JSON migration, workspace
+//! patching, replay bundles, and runtime contracts. Security-sensitive parsers here are
+//! fuzzed from `fuzz/fuzz_targets/` and pinned by golden fixtures.
+
 mod build;
 mod config;
 pub mod config_system;
@@ -39,7 +47,9 @@ pub use webhook::{
     WebhookEnvelope, WebhookPayloadError, WebhookSignatureVerifier,
 };
 
+/// Major version of the canonical protobuf protocol (`palyra.*.v1`).
 pub const CANONICAL_PROTOCOL_MAJOR: u32 = 1;
+/// Pinned `v` value required in every canonical JSON envelope.
 pub const CANONICAL_JSON_ENVELOPE_VERSION: u32 = 1;
 
 #[cfg(test)]

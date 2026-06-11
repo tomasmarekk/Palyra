@@ -1,3 +1,6 @@
+//! Contract tests pinning protobuf/JSON schema invariants: versioned packages, reserved
+//! fields, envelope version/limit fields, and JSON-proto parity for the message envelope.
+
 use std::{
     fs,
     path::{Path, PathBuf},

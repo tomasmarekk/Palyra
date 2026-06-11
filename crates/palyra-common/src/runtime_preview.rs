@@ -11,8 +11,11 @@ use serde_json::{json, Value};
 
 use crate::feature_rollouts::FeatureRolloutSource;
 
+/// Schema version stamped on runtime-preview snapshots and decision payloads.
 pub const RUNTIME_PREVIEW_SCHEMA_VERSION: u32 = 1;
 
+/// Defines a string-keyed enum with canonical serde names plus optional
+/// aliases, generating `as_str`, a lenient `parse`, and `Display`.
 macro_rules! runtime_preview_enum {
     (
         $(#[$meta:meta])*
@@ -32,6 +35,7 @@ macro_rules! runtime_preview_enum {
         }
 
         impl $name {
+            /// Returns the canonical serialized identifier.
             #[must_use]
             pub const fn as_str(self) -> &'static str {
                 match self {
@@ -41,6 +45,8 @@ macro_rules! runtime_preview_enum {
                 }
             }
 
+            /// Parses a trimmed, case-insensitive identifier, accepting
+            /// canonical names and declared aliases.
             #[must_use]
             pub fn parse(value: &str) -> Option<Self> {
                 let normalized = value.trim().to_ascii_lowercase();
@@ -76,6 +82,7 @@ runtime_preview_enum! {
     }
 }
 
+/// Every preview capability, in canonical display order.
 pub const ALL_RUNTIME_PREVIEW_CAPABILITIES: [RuntimePreviewCapability; 8] = [
     RuntimePreviewCapability::SessionQueuePolicy,
     RuntimePreviewCapability::PruningPolicyMatrix,
@@ -88,6 +95,7 @@ pub const ALL_RUNTIME_PREVIEW_CAPABILITIES: [RuntimePreviewCapability; 8] = [
 ];
 
 impl RuntimePreviewCapability {
+    /// Human-readable name for console and CLI surfaces.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -102,6 +110,7 @@ impl RuntimePreviewCapability {
         }
     }
 
+    /// One-line operator-facing description of what the capability previews.
     #[must_use]
     pub const fn summary(self) -> &'static str {
         match self {
@@ -143,6 +152,7 @@ runtime_preview_enum! {
 }
 
 impl RuntimePreviewMode {
+    /// Human-readable name for console and CLI surfaces.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -153,6 +163,7 @@ impl RuntimePreviewMode {
     }
 }
 
+/// Error returned when a runtime-preview mode string is not recognized.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimePreviewModeParseError {
     source_name: String,
@@ -171,6 +182,14 @@ impl fmt::Display for RuntimePreviewModeParseError {
 
 impl std::error::Error for RuntimePreviewModeParseError {}
 
+/// Parses a runtime-preview mode from config or environment input.
+///
+/// `source_name` identifies the config key or environment variable so the
+/// error message points operators at the offending setting.
+///
+/// # Errors
+/// Returns [`RuntimePreviewModeParseError`] when `raw` is not a known mode
+/// or alias.
 pub fn parse_runtime_preview_mode(
     raw: &str,
     source_name: &str,
@@ -203,6 +222,7 @@ runtime_preview_enum! {
     }
 }
 
+/// Diagnostics snapshot of one capability's configured and effective state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimePreviewCapabilityConfigSnapshot {
     pub capability: RuntimePreviewCapability,
@@ -220,6 +240,7 @@ pub struct RuntimePreviewCapabilityConfigSnapshot {
     pub settings: Value,
 }
 
+/// Aggregate diagnostics snapshot across all preview capabilities.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimePreviewConfigSnapshot {
     pub schema_version: u32,
@@ -250,6 +271,7 @@ runtime_preview_enum! {
     }
 }
 
+/// Every runtime decision event type, in canonical display order.
 pub const ALL_RUNTIME_DECISION_EVENT_TYPES: [RuntimeDecisionEventType; 12] = [
     RuntimeDecisionEventType::QueueEnqueue,
     RuntimeDecisionEventType::QueueMerge,
@@ -266,6 +288,7 @@ pub const ALL_RUNTIME_DECISION_EVENT_TYPES: [RuntimeDecisionEventType; 12] = [
 ];
 
 impl RuntimeDecisionEventType {
+    /// Dotted journal event name recorded for this decision type.
     #[must_use]
     pub const fn journal_event(self) -> &'static str {
         match self {
@@ -284,6 +307,7 @@ impl RuntimeDecisionEventType {
         }
     }
 
+    /// Human-readable name for console and CLI surfaces.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -302,6 +326,7 @@ impl RuntimeDecisionEventType {
         }
     }
 
+    /// One-line description of what the decision event records.
     #[must_use]
     pub const fn summary(self) -> &'static str {
         match self {
@@ -341,6 +366,7 @@ runtime_preview_enum! {
     }
 }
 
+/// Actor that triggered a runtime decision.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeDecisionActor {
     pub kind: RuntimeDecisionActorKind,
@@ -351,6 +377,7 @@ pub struct RuntimeDecisionActor {
 }
 
 impl RuntimeDecisionActor {
+    /// Creates an actor record for a decision payload.
     #[must_use]
     pub fn new(
         kind: RuntimeDecisionActorKind,
@@ -362,6 +389,8 @@ impl RuntimeDecisionActor {
     }
 }
 
+/// Reference to a runtime entity (run, queued input, session, ...) involved
+/// in a decision.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeEntityRef {
     pub role: String,
@@ -372,11 +401,13 @@ pub struct RuntimeEntityRef {
 }
 
 impl RuntimeEntityRef {
+    /// Creates an entity reference without a state label.
     #[must_use]
     pub fn new(role: impl Into<String>, kind: impl Into<String>, id: impl Into<String>) -> Self {
         Self { role: role.into(), kind: kind.into(), id: id.into(), state: None }
     }
 
+    /// Attaches a state label to the entity reference.
     #[must_use]
     pub fn with_state(mut self, state: impl Into<String>) -> Self {
         self.state = Some(state.into());
@@ -384,6 +415,7 @@ impl RuntimeEntityRef {
     }
 }
 
+/// When a decision was observed and, optionally, how long it took.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeDecisionTiming {
     pub observed_at_unix_ms: i64,
@@ -392,17 +424,21 @@ pub struct RuntimeDecisionTiming {
 }
 
 impl RuntimeDecisionTiming {
+    /// Timing with only an observation timestamp.
     #[must_use]
     pub const fn observed(observed_at_unix_ms: i64) -> Self {
         Self { observed_at_unix_ms, duration_ms: None }
     }
 
+    /// Timing with an observation timestamp and a measured duration.
     #[must_use]
     pub const fn observed_with_duration(observed_at_unix_ms: i64, duration_ms: u64) -> Self {
         Self { observed_at_unix_ms, duration_ms: Some(duration_ms) }
     }
 }
 
+/// Optional resource counters attached to a decision; fully empty budgets are
+/// omitted from the serialized payload.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeResourceBudget {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -419,6 +455,7 @@ pub struct RuntimeResourceBudget {
     pub suppression_count: Option<u64>,
 }
 
+/// Canonical journal/diagnostics payload describing one runtime decision.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RuntimeDecisionPayload {
     pub schema_version: u32,
@@ -440,6 +477,8 @@ pub struct RuntimeDecisionPayload {
 }
 
 impl RuntimeDecisionPayload {
+    /// Creates a payload with the required fields; optional context starts
+    /// empty and is added via the `with_*` builders.
     #[must_use]
     pub fn new(
         event_type: RuntimeDecisionEventType,
@@ -463,30 +502,35 @@ impl RuntimeDecisionPayload {
         }
     }
 
+    /// Sets the entity the decision consumed.
     #[must_use]
     pub fn with_input(mut self, input: RuntimeEntityRef) -> Self {
         self.input = Some(input);
         self
     }
 
+    /// Sets the entity the decision produced.
     #[must_use]
     pub fn with_output(mut self, output: RuntimeEntityRef) -> Self {
         self.output = Some(output);
         self
     }
 
+    /// Sets the resource counters observed for the decision.
     #[must_use]
     pub fn with_resource_budget(mut self, resource_budget: RuntimeResourceBudget) -> Self {
         self.resource_budget = resource_budget;
         self
     }
 
+    /// Appends an additional entity related to the decision.
     #[must_use]
     pub fn with_related_entity(mut self, entity: RuntimeEntityRef) -> Self {
         self.related_entities.push(entity);
         self
     }
 
+    /// Sets the free-form JSON detail payload.
     #[must_use]
     pub fn with_details(mut self, details: Value) -> Self {
         self.details = details;
@@ -518,6 +562,7 @@ runtime_preview_enum! {
     }
 }
 
+/// Every acceptance scenario, in canonical display order.
 pub const ALL_RUNTIME_ACCEPTANCE_SCENARIOS: [RuntimeAcceptanceScenario; 9] = [
     RuntimeAcceptanceScenario::QueuedInputLifecycle,
     RuntimeAcceptanceScenario::PruningDecision,
@@ -530,12 +575,19 @@ pub const ALL_RUNTIME_ACCEPTANCE_SCENARIOS: [RuntimeAcceptanceScenario; 9] = [
     RuntimeAcceptanceScenario::NetworkedWorkerPreview,
 ];
 
+/// Shared fixture key: canonical session transcript sample.
 pub const RUNTIME_ACCEPTANCE_FIXTURE_SESSION_TRANSCRIPT: &str = "session_transcript";
+/// Shared fixture key: canonical retrieval query sample.
 pub const RUNTIME_ACCEPTANCE_FIXTURE_RETRIEVAL_QUERY: &str = "retrieval_query";
+/// Shared fixture key: canonical workspace patch sample.
 pub const RUNTIME_ACCEPTANCE_FIXTURE_WORKSPACE_PATCH: &str = "workspace_patch";
+/// Shared fixture key: canonical delegated child-run sample.
 pub const RUNTIME_ACCEPTANCE_FIXTURE_DELEGATED_CHILD_RUN: &str = "delegated_child_run";
+/// Shared fixture key: canonical replay bundle sample.
 pub const RUNTIME_ACCEPTANCE_FIXTURE_REPLAY_BUNDLE: &str = "replay_bundle";
+/// Shared fixture key: canonical worker lease sample.
 pub const RUNTIME_ACCEPTANCE_FIXTURE_WORKER_LEASE: &str = "worker_lease";
+/// Shared fixture key: canonical routine automation trace sample.
 pub const RUNTIME_ACCEPTANCE_FIXTURE_AUTOMATION_TRACE: &str = "automation_trace";
 
 const QUEUED_INPUT_LIFECYCLE_FIXTURES: &[&str] = &[RUNTIME_ACCEPTANCE_FIXTURE_SESSION_TRANSCRIPT];
@@ -563,6 +615,7 @@ const DELIVERY_ARBITRATION_FIXTURES: &[&str] = &[
 const NETWORKED_WORKER_PREVIEW_FIXTURES: &[&str] = &[RUNTIME_ACCEPTANCE_FIXTURE_WORKER_LEASE];
 
 impl RuntimeAcceptanceScenario {
+    /// Human-readable name for console and CLI surfaces.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -578,6 +631,7 @@ impl RuntimeAcceptanceScenario {
         }
     }
 
+    /// One-line description of the invariant the scenario keeps covered.
     #[must_use]
     pub const fn summary(self) -> &'static str {
         match self {
@@ -611,6 +665,7 @@ impl RuntimeAcceptanceScenario {
         }
     }
 
+    /// Preview capability exercised by this scenario.
     #[must_use]
     pub const fn capability(self) -> RuntimePreviewCapability {
         match self {
@@ -626,6 +681,8 @@ impl RuntimeAcceptanceScenario {
         }
     }
 
+    /// Shared fixture keys the scenario consumes from
+    /// [`runtime_acceptance_fixture_catalog`].
     #[must_use]
     pub const fn required_fixture_keys(self) -> &'static [&'static str] {
         match self {
@@ -642,6 +699,11 @@ impl RuntimeAcceptanceScenario {
     }
 }
 
+/// Builds the shared JSON fixture catalog backing every acceptance scenario.
+///
+/// Top-level keys must cover every key returned by
+/// [`RuntimeAcceptanceScenario::required_fixture_keys`]; a unit test enforces
+/// the pairing.
 #[must_use]
 pub fn runtime_acceptance_fixture_catalog() -> Value {
     json!({

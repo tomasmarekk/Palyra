@@ -1,3 +1,9 @@
+//! Input parsing and normalization for the `palyra.process.run` tool.
+//!
+//! Models emit predictable argv mistakes — repeating the command as `args[0]` or putting
+//! `--cwd` into `args` — so parsing normalizes those instead of failing the run. Accept/
+//! reject behavior is exercised by `fuzz/fuzz_targets/process_runner_input_parser.rs`.
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -22,6 +28,7 @@ pub struct ProcessRunnerToolInput {
     pub background: bool,
 }
 
+/// Parse failure for a `palyra.process.run` payload (malformed JSON or unknown fields).
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ProcessRunnerToolInputParseError {
     #[error("{0}")]
@@ -29,11 +36,22 @@ pub enum ProcessRunnerToolInputParseError {
 }
 
 /// Parse the raw JSON payload for `palyra.process.run`.
+///
+/// Applies model-output normalization after deserialization: a duplicated command token
+/// in `args[0]` is dropped, and a leading `--cwd <dir>` / `--cwd=<dir>` pair is lifted
+/// into the `cwd` field. Single-string command lines are kept verbatim.
+///
+/// # Errors
+/// Returns [`ProcessRunnerToolInputParseError::InvalidJson`] for malformed JSON or
+/// unknown fields (the schema is closed via `deny_unknown_fields`).
 pub fn parse_process_runner_tool_input(
     input_json: &[u8],
 ) -> Result<ProcessRunnerToolInput, ProcessRunnerToolInputParseError> {
     let mut input = serde_json::from_slice::<ProcessRunnerToolInput>(input_json)
         .map_err(|error| ProcessRunnerToolInputParseError::InvalidJson(error.to_string()))?;
+    // The second repeated-command pass is required: stripping `--cwd <dir>` can expose a
+    // duplicated command token that was previously not at args[0]
+    // (e.g. `args: ["--cwd", "/x", "node", "server.js"]` with command "node").
     normalize_repeated_command_argument(&mut input);
     normalize_leading_cwd_argument(&mut input);
     normalize_repeated_command_argument(&mut input);
@@ -81,6 +99,8 @@ fn executable_tokens_match(command: &str, candidate: &str) -> bool {
     !command.is_empty() && command == candidate
 }
 
+// Reduces an executable spelling to a comparable form: strips quotes, directories, and a
+// Windows `.exe` suffix, then lowercases — so `"C:\Tools\node"` matches `node.exe`.
 fn normalize_executable_token(value: &str) -> String {
     let trimmed = value.trim().trim_matches('"').trim_matches('\'');
     let file_name = trimmed

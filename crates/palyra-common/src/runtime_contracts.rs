@@ -9,7 +9,9 @@
 //! - Intentionally deferred variants stay out of this module until the
 //!   corresponding behavior is implemented and covered by rollout/config
 //!   guardrails, diagnostics, and regression harnesses.
-//!
+//! - Wire names, aliases, and serialized shapes are pinned by the runtime-contract
+//!   snapshot gate (`scripts/test/check-runtime-contract-snapshots.sh`): add aliases
+//!   instead of renaming canonical strings.
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
@@ -33,6 +35,7 @@ macro_rules! runtime_contract_enum {
         }
 
         impl $name {
+            /// Returns the canonical wire name for this variant.
             #[must_use]
             pub const fn as_str(self) -> &'static str {
                 match self {
@@ -42,6 +45,9 @@ macro_rules! runtime_contract_enum {
                 }
             }
 
+            /// Parses a canonical wire name or backward-compatible alias.
+            ///
+            /// Matching is case-insensitive and ignores surrounding whitespace.
             #[must_use]
             pub fn parse(value: &str) -> Option<Self> {
                 let normalized = value.trim().to_ascii_lowercase();
@@ -53,6 +59,8 @@ macro_rules! runtime_contract_enum {
                 }
             }
 
+            /// Option-returning alias for [`Self::parse`], kept alongside the
+            /// `FromStr` impl for call-site ergonomics.
             #[allow(clippy::should_implement_trait)]
             #[must_use]
             pub fn from_str(value: &str) -> Option<Self> {
@@ -93,11 +101,13 @@ runtime_contract_enum! {
 }
 
 impl RunLifecyclePhase {
+    /// Returns `true` for states a run can never transition out of.
     #[must_use]
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Aborted | Self::Expired)
     }
 
+    /// Returns `true` while the run is parked waiting on an approval or operator action.
     #[must_use]
     pub const fn is_waiting(self) -> bool {
         matches!(self, Self::WaitingForApproval | Self::Paused)
@@ -116,6 +126,7 @@ runtime_contract_enum! {
 }
 
 impl RunLifecycleHookPhase {
+    /// Returns the namespaced `run:*` event name used on event buses.
     #[must_use]
     pub fn event_name(self) -> &'static str {
         match self {
@@ -127,6 +138,7 @@ impl RunLifecycleHookPhase {
         }
     }
 
+    /// Parses either the short phase name or the namespaced `run:*` event name.
     #[must_use]
     pub fn parse_hook_event(raw: &str) -> Option<Self> {
         Self::parse(raw.trim().to_ascii_lowercase().as_str())
@@ -146,6 +158,10 @@ runtime_contract_enum! {
 }
 
 impl RunLifecycleHookDecisionKind {
+    /// Returns the arbitration weight for this decision kind; higher values win.
+    ///
+    /// Gaps between values are deliberate so new kinds can be inserted without
+    /// renumbering the pinned ordering.
     #[must_use]
     pub const fn priority(self) -> u8 {
         match self {
@@ -158,11 +174,13 @@ impl RunLifecycleHookDecisionKind {
         }
     }
 
+    /// Returns `true` for decisions that stop further processing of the phase.
     #[must_use]
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::RequestApproval | Self::Block | Self::FailRun)
     }
 
+    /// Reports whether this decision kind may be returned from the given hook phase.
     #[must_use]
     pub const fn is_allowed_in_phase(self, phase: RunLifecycleHookPhase) -> bool {
         match self {
@@ -210,6 +228,7 @@ runtime_contract_enum! {
 }
 
 impl IdempotencyOperationState {
+    /// Returns `true` for states an idempotency record can never transition out of.
     #[must_use]
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Expired)
@@ -251,6 +270,7 @@ runtime_contract_enum! {
 }
 
 impl ToolResultSensitivity {
+    /// Returns `true` when reading the full artifact payload requires the audit read gate.
     #[must_use]
     pub const fn requires_full_read_gate(self) -> bool {
         matches!(
@@ -284,6 +304,7 @@ pub struct StableErrorEnvelope {
 }
 
 impl StableErrorEnvelope {
+    /// Creates an envelope from a stable code, operator-facing message, and recovery hint.
     #[must_use]
     pub fn new(
         code: impl Into<String>,
@@ -337,6 +358,7 @@ pub struct RunLifecycleHookDecision {
 }
 
 impl RunLifecycleHookDecision {
+    /// Creates a schema-version-1 decision with empty annotations and no preview transform.
     #[must_use]
     pub fn new(
         phase: RunLifecycleHookPhase,
@@ -377,6 +399,7 @@ pub struct RunLifecycleHookDecisionError {
 }
 
 impl RunLifecycleHookDecisionError {
+    /// Creates a validation error from a stable code and human-readable message.
     #[must_use]
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self { code: code.into(), message: message.into() }
@@ -384,6 +407,12 @@ impl RunLifecycleHookDecisionError {
 }
 
 /// Resolves sandboxed lifecycle hook decisions with deterministic terminal precedence.
+///
+/// # Errors
+///
+/// Returns a [`RunLifecycleHookDecisionError`] with code `phase_mismatch` when a decision
+/// was produced for a different phase, or `decision_not_allowed_in_phase` when its kind is
+/// not permitted in `phase`.
 pub fn resolve_run_lifecycle_hook_decisions(
     phase: RunLifecycleHookPhase,
     mut decisions: Vec<RunLifecycleHookDecision>,
@@ -407,6 +436,7 @@ pub fn resolve_run_lifecycle_hook_decisions(
         }
     }
 
+    // No hook responded: synthesize a Continue so resolution always selects something.
     if decisions.is_empty() {
         decisions.push(RunLifecycleHookDecision::new(
             phase,
@@ -416,6 +446,8 @@ pub fn resolve_run_lifecycle_hook_decisions(
         ));
     }
 
+    // Highest priority wins; hook/plugin ids break ties so the outcome is deterministic
+    // regardless of hook invocation order.
     decisions.sort_by(|left, right| {
         right
             .kind
@@ -425,6 +457,8 @@ pub fn resolve_run_lifecycle_hook_decisions(
             .then_with(|| left.plugin_id.cmp(&right.plugin_id))
     });
     let selected = decisions[0].clone();
+    // Record losers as conflicts only when either side carried semantic weight (terminal,
+    // transform, or annotate); Continue losing to Continue is not a conflict.
     let conflicts = decisions
         .iter()
         .skip(1)
@@ -493,6 +527,7 @@ pub struct ArtifactRetentionPolicy {
 }
 
 impl ArtifactRetentionPolicy {
+    /// Creates a policy that retains the artifact indefinitely without legal hold.
     #[must_use]
     pub const fn keep() -> Self {
         Self {
@@ -502,6 +537,7 @@ impl ArtifactRetentionPolicy {
         }
     }
 
+    /// Creates a policy that places the artifact under audit legal hold.
     #[must_use]
     pub const fn audit_legal_hold() -> Self {
         Self {
@@ -590,8 +626,11 @@ pub struct ToolResultBudgetMetrics {
     pub saved_model_visible_bytes: u64,
 }
 
+/// Lowest realtime protocol version the daemon accepts.
 pub const REALTIME_PROTOCOL_MIN_VERSION: u32 = 1;
+/// Highest realtime protocol version the daemon accepts.
 pub const REALTIME_PROTOCOL_MAX_VERSION: u32 = 1;
+/// Default heartbeat interval offered to realtime clients, in milliseconds.
 pub const REALTIME_DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 15_000;
 
 runtime_contract_enum! {
@@ -691,6 +730,7 @@ impl Default for RealtimeProtocolVersionRange {
 }
 
 impl RealtimeProtocolVersionRange {
+    /// Returns `true` when `protocol_version` falls inside the inclusive range.
     #[must_use]
     pub const fn contains(self, protocol_version: u32) -> bool {
         protocol_version >= self.min && protocol_version <= self.max
@@ -768,13 +808,16 @@ pub struct RealtimeEventEnvelope {
 /// Subscription filter carried in connection state and restored on reconnect.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RealtimeSubscription {
+    /// Topics to receive; empty means all topics.
     #[serde(default)]
     pub topics: Vec<RealtimeEventTopic>,
+    /// Session ids to receive; empty means all sessions.
     #[serde(default)]
     pub session_ids: Vec<String>,
 }
 
 impl RealtimeSubscription {
+    /// Creates an unfiltered subscription (empty filters match everything).
     #[must_use]
     pub fn all_topics() -> Self {
         Self { topics: Vec::new(), session_ids: Vec::new() }
@@ -818,12 +861,17 @@ pub struct RealtimeCommandResultEnvelope {
     pub error: Option<StableErrorEnvelope>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+    /// `true` when the result was served from an idempotency record instead of re-executing.
     pub replayed: bool,
 }
 
+/// Lowest ACP protocol version the daemon bridge accepts.
 pub const ACP_PROTOCOL_MIN_VERSION: u32 = 1;
+/// Highest ACP protocol version the daemon bridge accepts.
 pub const ACP_PROTOCOL_MAX_VERSION: u32 = 1;
+/// Default cap on transcript events returned by a single ACP replay.
 pub const ACP_DEFAULT_REPLAY_MAX_EVENTS: usize = 200;
+/// Grace period in milliseconds before a disconnected ACP client's pending state expires.
 pub const ACP_DEFAULT_DISCONNECT_GRACE_MS: i64 = 10 * 60 * 1_000;
 
 runtime_contract_enum! {
@@ -985,6 +1033,7 @@ impl Default for AcpProtocolVersionRange {
 }
 
 impl AcpProtocolVersionRange {
+    /// Returns `true` when `protocol_version` falls inside the inclusive range.
     #[must_use]
     pub const fn contains(self, protocol_version: u32) -> bool {
         protocol_version >= self.min && protocol_version <= self.max
@@ -1113,6 +1162,7 @@ pub struct AcpCommandResultEnvelope {
     pub error: Option<StableErrorEnvelope>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+    /// `true` when the result was served from an idempotency record instead of re-executing.
     pub replayed: bool,
 }
 

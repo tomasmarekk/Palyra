@@ -1,3 +1,6 @@
+//! Crate-internal tests for config paths, bind sockets, canonical IDs, and webhook
+//! parsing/verification (including private clock-injected parse helpers).
+
 use std::{
     collections::HashSet,
     ffi::OsString,

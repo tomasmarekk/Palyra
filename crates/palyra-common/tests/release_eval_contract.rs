@@ -1,3 +1,6 @@
+//! Contract tests for the release-eval gate against the golden inventory fixture:
+//! required suites, regression detection, and path-safe replay bundle filenames.
+
 use anyhow::{Context, Result};
 use palyra_common::release_evals::{
     ensure_release_eval_report_passed, evaluate_release_eval_manifest, parse_release_eval_manifest,

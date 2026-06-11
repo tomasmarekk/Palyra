@@ -1,7 +1,16 @@
+//! Canonical deployment profile catalog: local, single-vm, worker-enabled.
+//!
+//! Each profile carries fail-closed config defaults, promotion blockers,
+//! health preflights, and recipe targets. Consumed by `palyra deployment`
+//! and onboarding CLI commands and by daemon diagnostics; manifest strings
+//! are operator-facing contract data.
+
 use serde::{Deserialize, Serialize};
 
+/// Schema version stamped on emitted deployment profile manifests.
 pub const DEPLOYMENT_PROFILE_SCHEMA_VERSION: u32 = 1;
 
+/// Canonical deployment profile selector; defaults to [`Local`](Self::Local).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum DeploymentProfileId {
@@ -12,6 +21,7 @@ pub enum DeploymentProfileId {
 }
 
 impl DeploymentProfileId {
+    /// Canonical kebab-case identifier, matching the serde representation.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -21,6 +31,7 @@ impl DeploymentProfileId {
         }
     }
 
+    /// Runtime deployment mode recorded in config for this profile.
     #[must_use]
     pub const fn deployment_mode(self) -> &'static str {
         match self {
@@ -29,11 +40,21 @@ impl DeploymentProfileId {
         }
     }
 
+    /// Gateway bind posture for this profile.
+    ///
+    /// INTENTIONAL: every profile is loopback-only. Public exposure is never
+    /// a profile default; it requires explicit TLS plus dual acknowledgement.
     #[must_use]
     pub const fn bind_profile(self) -> &'static str {
         "loopback_only"
     }
 
+    /// Parses a profile id or deployment-mode alias (trimmed,
+    /// case-insensitive).
+    ///
+    /// # Errors
+    /// Returns [`DeploymentProfileError::UnknownProfile`] for unrecognized
+    /// input.
     pub fn parse(raw: &str) -> Result<Self, DeploymentProfileError> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "local" | "local_desktop" | "local-desktop" => Ok(Self::Local),
@@ -45,12 +66,14 @@ impl DeploymentProfileId {
     }
 }
 
+/// Errors from parsing deployment profile identifiers.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DeploymentProfileError {
     #[error("unknown deployment profile '{0}' (expected local, single-vm, or worker-enabled)")]
     UnknownProfile(String),
 }
 
+/// Full operator-facing description of one deployment profile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeploymentProfileManifest {
     pub schema_version: u32,
@@ -67,6 +90,7 @@ pub struct DeploymentProfileManifest {
     pub next_steps: Vec<String>,
 }
 
+/// A capability surface and its default posture within a profile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeploymentProfileCapability {
     pub id: String,
@@ -74,6 +98,7 @@ pub struct DeploymentProfileCapability {
     pub posture: String,
 }
 
+/// One config default applied by a profile, with operator-facing rationale.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeploymentProfileDefault {
     pub config_path: String,
@@ -81,6 +106,7 @@ pub struct DeploymentProfileDefault {
     pub rationale: String,
 }
 
+/// Typed value carried by a profile config default.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum DeploymentProfileDefaultValue {
@@ -90,6 +116,7 @@ pub enum DeploymentProfileDefaultValue {
     StringList(Vec<String>),
 }
 
+/// A condition that blocks promotion or rollout until remediated.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeploymentProfileBlocker {
     pub code: String,
@@ -98,6 +125,7 @@ pub struct DeploymentProfileBlocker {
     pub remediation: String,
 }
 
+/// A preflight check the profile expects before going live.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeploymentProfileHealthPreflight {
     pub id: String,
@@ -106,6 +134,8 @@ pub struct DeploymentProfileHealthPreflight {
     pub summary: String,
 }
 
+/// Deployment recipe artifact (Dockerfile, Compose, systemd) tied to a
+/// profile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeploymentRecipeTarget {
     pub kind: String,
@@ -113,16 +143,19 @@ pub struct DeploymentRecipeTarget {
     pub service: String,
 }
 
+/// All profile ids in canonical order.
 #[must_use]
 pub fn canonical_deployment_profile_ids() -> [DeploymentProfileId; 3] {
     [DeploymentProfileId::Local, DeploymentProfileId::SingleVm, DeploymentProfileId::WorkerEnabled]
 }
 
+/// Manifests for every canonical profile, in canonical order.
 #[must_use]
 pub fn canonical_deployment_profiles() -> Vec<DeploymentProfileManifest> {
     canonical_deployment_profile_ids().into_iter().map(deployment_profile_manifest).collect()
 }
 
+/// Builds the canonical manifest for one profile.
 #[must_use]
 pub fn deployment_profile_manifest(profile_id: DeploymentProfileId) -> DeploymentProfileManifest {
     match profile_id {
@@ -132,6 +165,12 @@ pub fn deployment_profile_manifest(profile_id: DeploymentProfileId) -> Deploymen
     }
 }
 
+/// Derives the effective profile from config inputs.
+///
+/// Precedence: explicit `configured_profile`, then the networked-workers
+/// rollout flag, then `deployment_mode` (any remote mode maps to
+/// [`DeploymentProfileId::SingleVm`]); everything else falls back to
+/// [`DeploymentProfileId::Local`].
 #[must_use]
 pub fn derive_deployment_profile(
     configured_profile: Option<&str>,
@@ -147,6 +186,8 @@ pub fn derive_deployment_profile(
         return DeploymentProfileId::WorkerEnabled;
     }
     match deployment_mode.and_then(|value| DeploymentProfileId::parse(value).ok()) {
+        // A mode string alone never opts into workers; worker routing
+        // requires the explicit rollout flag handled above.
         Some(DeploymentProfileId::SingleVm | DeploymentProfileId::WorkerEnabled) => {
             DeploymentProfileId::SingleVm
         }

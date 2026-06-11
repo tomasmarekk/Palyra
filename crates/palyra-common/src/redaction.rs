@@ -1,5 +1,13 @@
+//! Secret redaction for headers, URLs, and free-form diagnostic text.
+//!
+//! Heuristic variants minimize false positives on benign fixture text; `_strict` variants
+//! redact every sensitive-looking assignment for diagnostics that leave the host. Outcomes
+//! are pinned by fixtures and exercised by `fuzz/fuzz_targets/redaction_routines.rs` —
+//! placeholder strings and redaction decisions must stay byte-identical.
+
 use std::borrow::Cow;
 
+/// Placeholder substituted for redacted values; pinned contract surface in fixtures.
 pub const REDACTED: &str = "<redacted>";
 
 const SENSITIVE_KEY_MARKERS: &[&str] = &[
@@ -28,18 +36,24 @@ const SENSITIVE_KEY_MARKERS: &[&str] = &[
     "x_goog_signature",
 ];
 
+/// How aggressively assignment values are redacted.
+///
+/// `Heuristic` keeps benign short bare `token=` values visible; `Diagnostic` redacts every
+/// sensitive-keyed assignment because diagnostic exports must err on the side of removal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RedactionStrictness {
     Heuristic,
     Diagnostic,
 }
 
+/// Returns whether a header/query/assignment key matches a known sensitive marker.
 #[must_use]
 pub fn is_sensitive_key(key: &str) -> bool {
     let normalized = normalize_key(key);
     SENSITIVE_KEY_MARKERS.iter().any(|marker| normalized.contains(marker))
 }
 
+/// Replaces a non-empty token value with the [`REDACTED`] placeholder.
 #[must_use]
 pub fn redact_token(value: &str) -> String {
     if value.trim().is_empty() {
@@ -49,6 +63,7 @@ pub fn redact_token(value: &str) -> String {
     }
 }
 
+/// Replaces a non-empty cookie value with the [`REDACTED`] placeholder.
 #[must_use]
 pub fn redact_cookie(value: &str) -> String {
     if value.trim().is_empty() {
@@ -58,6 +73,10 @@ pub fn redact_cookie(value: &str) -> String {
     }
 }
 
+/// Redacts a header value based on the header name.
+///
+/// Sensitive header names mask the whole value; `Location`/`Referer` get URL redaction
+/// (their query strings can carry tokens); all other values get heuristic text redaction.
 #[must_use]
 pub fn redact_header(name: &str, value: &str) -> String {
     if is_sensitive_key(name) {
@@ -72,11 +91,13 @@ pub fn redact_header(name: &str, value: &str) -> String {
     redact_auth_error(value)
 }
 
+/// Redacts userinfo credentials and sensitive query/fragment values from a URL (heuristic).
 #[must_use]
 pub fn redact_url(raw: &str) -> String {
     redact_url_with_strictness(raw, RedactionStrictness::Heuristic)
 }
 
+/// Like [`redact_url`] but redacts every sensitive-keyed value, including short ones.
 #[must_use]
 pub fn redact_url_strict(raw: &str) -> String {
     redact_url_with_strictness(raw, RedactionStrictness::Diagnostic)
@@ -107,16 +128,19 @@ fn redact_url_with_strictness(raw: &str, strictness: RedactionStrictness) -> Str
     output
 }
 
+/// Redacts bearer credentials and sensitive `key=value` assignments in free text (heuristic).
 #[must_use]
 pub fn redact_auth_error(message: &str) -> String {
     redact_auth_error_with_strictness(message, RedactionStrictness::Heuristic)
 }
 
+/// Like [`redact_auth_error`] but redacts every sensitive-keyed assignment value.
 #[must_use]
 pub fn redact_auth_error_strict(message: &str) -> String {
     redact_auth_error_with_strictness(message, RedactionStrictness::Diagnostic)
 }
 
+/// Strict full-text redaction for diagnostics: embedded URLs first, then inline assignments.
 #[must_use]
 pub fn redact_diagnostic_text(message: &str) -> String {
     redact_auth_error_strict(redact_url_segments_in_text_strict(message).as_str())
@@ -153,11 +177,13 @@ fn redact_auth_error_with_strictness(message: &str, strictness: RedactionStrictn
     output
 }
 
+/// Applies URL redaction to every URL-looking whitespace token embedded in free text.
 #[must_use]
 pub fn redact_url_segments_in_text(raw: &str) -> String {
     redact_url_segments_in_text_with_strictness(raw, RedactionStrictness::Heuristic)
 }
 
+/// Like [`redact_url_segments_in_text`] but with strict query/fragment value redaction.
 #[must_use]
 pub fn redact_url_segments_in_text_strict(raw: &str) -> String {
     redact_url_segments_in_text_with_strictness(raw, RedactionStrictness::Diagnostic)
@@ -195,6 +221,8 @@ fn flush_redacted_token(
         return;
     }
 
+    // A preceding "Bearer" marker means this whole token is the credential itself;
+    // trailing punctuation stays visible so log structure survives redaction.
     if redact_next_bearer {
         let (core, suffix) = split_trailing_punctuation(token);
         if !core.is_empty() {
@@ -272,6 +300,8 @@ fn should_redact_assignment_value(key: &str, value: &str, strictness: RedactionS
     if strictness == RedactionStrictness::Diagnostic {
         return true;
     }
+    // Heuristic mode: bare "token" keys are common in benign fixture/test text, so only
+    // redact when the value itself looks like a real credential.
     if normalize_key(sensitive_key) == "token" {
         return value_looks_like_secret_token(value);
     }
@@ -285,6 +315,8 @@ fn assignment_key_is_sensitive(key: &str) -> bool {
 fn sensitive_assignment_key(key: &str) -> Option<&str> {
     let trimmed = key.trim().trim_matches(['"', '\'']);
     let plain = trailing_plain_key_segment(trimmed)?;
+    // A '?', '&', or '#' directly before the key means a URL query/fragment (handled by URL
+    // redaction) or a CSS-selector-like token (e.g. `selector=#password`), not an assignment.
     if matches!(plain.prefix, Some('?') | Some('&') | Some('#')) {
         return None;
     }
@@ -329,6 +361,8 @@ fn value_looks_like_secret_token(value: &str) -> bool {
     if trimmed.is_empty() {
         return false;
     }
+    // Matches well-known provider credential prefixes plus a length/charset heuristic for
+    // opaque token-shaped values; short structured values (e.g. URL-encoded pairs) pass.
     let lowered = trimmed.to_ascii_lowercase();
     lowered.contains("secret")
         || lowered.starts_with("bearer")
@@ -404,6 +438,8 @@ fn redact_query_pairs(raw: &str, strictness: RedactionStrictness) -> String {
     redacted_pairs.join("&")
 }
 
+// Drops the entire `user:password@` userinfo part instead of masking it, so credentials
+// never appear in any form; `rsplit_once` keeps hosts containing literal '@' intact.
 fn redact_url_userinfo(base: &str) -> String {
     let Some((scheme, rest)) = base.split_once("://") else {
         return base.to_owned();

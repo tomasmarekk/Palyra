@@ -1,3 +1,9 @@
+//! Canonical coverage requirements enforced by the release-eval gate.
+//!
+//! Lists the suites, per-suite dimensions, and protocol-inventory contracts
+//! the golden manifest must cover; the `evaluator` module fails the gate on
+//! any missing entry, so additions here tighten the release gate.
+
 use super::schema::{ReleaseEvalDimension, ReleaseEvalSuiteKind};
 
 /// Release-gate minimum used by the canonical golden inventory.

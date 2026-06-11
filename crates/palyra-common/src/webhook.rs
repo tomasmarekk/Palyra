@@ -1,3 +1,10 @@
+//! Strict webhook envelope parsing with replay protection and signature hooks.
+//!
+//! Validates untrusted inbound payloads field by field (closed field sets, size caps,
+//! ±5-minute replay window) before any business logic sees them. Accept/reject behavior
+//! and error values are contract surface exercised by the `webhook_payload_parser` and
+//! `webhook_replay_verifier` fuzz targets — do not loosen or reorder checks.
+
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -14,6 +21,7 @@ const WEBHOOK_REPLAY_PROTECTION_ALLOWED_FIELDS: &[&str] =
     &["nonce", "timestamp_unix_ms", "signature"];
 const WEBHOOK_LIMITS_ALLOWED_FIELDS: &[&str] = &["max_payload_bytes"];
 
+/// A validated inbound webhook envelope (canonical JSON envelope v1).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WebhookEnvelope {
     pub v: u32,
@@ -24,6 +32,8 @@ pub struct WebhookEnvelope {
     pub replay_protection: ReplayProtection,
 }
 
+/// Anti-replay metadata carried by every envelope: a one-time nonce, the sender timestamp,
+/// and an optional transport signature.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReplayProtection {
     pub nonce: String,
@@ -32,14 +42,27 @@ pub struct ReplayProtection {
     pub signature: Option<String>,
 }
 
+/// Store that records nonces and rejects any nonce it has already seen.
 pub trait ReplayNonceStore {
+    /// Atomically records `nonce`; returns an error if it was consumed before.
+    ///
+    /// # Errors
+    /// Implementations return a [`WebhookPayloadError`] for replayed nonces or store
+    /// failures; both must reject the payload.
     fn consume_once(&self, nonce: &str, timestamp_unix_ms: u64) -> Result<(), WebhookPayloadError>;
 }
 
+/// Verifies a payload signature against the raw request bytes.
 pub trait WebhookSignatureVerifier {
+    /// Checks `signature` over `payload_bytes`.
+    ///
+    /// # Errors
+    /// Implementations return a [`WebhookPayloadError`] when the signature does not
+    /// validate; the payload must then be rejected.
     fn verify(&self, payload_bytes: &[u8], signature: &str) -> Result<(), WebhookPayloadError>;
 }
 
+/// Why a webhook payload was rejected; values are pinned contract surface.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum WebhookPayloadError {
     #[error("payload exceeds maximum size of {limit} bytes")]
@@ -58,12 +81,27 @@ pub enum WebhookPayloadError {
     InvalidValue(&'static str),
 }
 
+/// Parses and validates a webhook payload against the current system clock.
+///
+/// # Errors
+/// Returns a [`WebhookPayloadError`] for oversized input, malformed JSON, unknown fields,
+/// invalid field values, or a replay timestamp outside the ±5-minute window.
 pub fn parse_webhook_payload(input: &[u8]) -> Result<WebhookEnvelope, WebhookPayloadError> {
     let now_unix_ms = current_unix_ms()
         .map_err(|_| WebhookPayloadError::InvalidValue("replay_protection.timestamp_unix_ms"))?;
     parse_webhook_payload_with_now(input, now_unix_ms)
 }
 
+/// Parses a webhook payload and enforces signature plus one-time-nonce replay protection.
+///
+/// The signature is required here (unlike in [`parse_webhook_payload`]) and is verified
+/// over the raw input bytes, not a re-serialized form, so there is no canonicalization
+/// gap to exploit. The nonce is consumed only after the signature validates; otherwise
+/// unauthenticated senders could burn nonces of legitimate pending deliveries.
+///
+/// # Errors
+/// Returns a [`WebhookPayloadError`] for any parse failure, a missing or invalid
+/// signature, or a replayed nonce.
 pub fn verify_webhook_payload(
     input: &[u8],
     nonce_store: &dyn ReplayNonceStore,
@@ -83,10 +121,12 @@ pub fn verify_webhook_payload(
     Ok(envelope)
 }
 
+/// Clock-injectable parse core; `now_unix_ms` anchors the replay window in tests.
 pub(crate) fn parse_webhook_payload_with_now(
     input: &[u8],
     now_unix_ms: u64,
 ) -> Result<WebhookEnvelope, WebhookPayloadError> {
+    // Size check first: nothing else may touch the bytes before the cap is enforced.
     if input.len() > WEBHOOK_MAX_PAYLOAD_BYTES {
         return Err(WebhookPayloadError::PayloadTooLarge { limit: WEBHOOK_MAX_PAYLOAD_BYTES });
     }
@@ -160,6 +200,9 @@ fn read_replay_protection(
         .ok_or(WebhookPayloadError::MissingField("replay_protection.timestamp_unix_ms"))?
         .as_u64()
         .ok_or(WebhookPayloadError::InvalidType("replay_protection.timestamp_unix_ms"))?;
+    // The window is symmetric (past and future) so nonce stores only need to retain
+    // nonces for a bounded interval; future-dated timestamps would otherwise let an
+    // attacker replay a capture after the store evicts its nonce.
     let minimum_allowed = now_unix_ms.saturating_sub(WEBHOOK_MAX_REPLAY_SKEW_MS);
     let maximum_allowed = now_unix_ms.saturating_add(WEBHOOK_MAX_REPLAY_SKEW_MS);
     if timestamp_unix_ms < minimum_allowed || timestamp_unix_ms > maximum_allowed {

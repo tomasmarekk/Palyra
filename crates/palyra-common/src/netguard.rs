@@ -1,7 +1,18 @@
+//! SSRF guards shared by the egress proxy and HTTP fetch tooling.
+//!
+//! Classifies IP addresses as private/local/special-use and rejects non-canonical IPv4
+//! literal forms that resolvers interpret differently than naive string checks. All
+//! checks fail closed: anything ambiguous is treated as blocked.
+
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Parses canonical IP literals and rejects legacy/non-canonical IPv4 literal forms
 /// (decimal integer, dotted octal/hex, short dotted forms) to keep SSRF handling fail-closed.
+///
+/// Returns `Ok(None)` when `host` is a hostname rather than an IP literal.
+///
+/// # Errors
+/// Returns an error message for an empty host or a non-canonical IPv4 literal.
 pub fn parse_host_ip_literal(host: &str) -> Result<Option<IpAddr>, String> {
     let normalized = host.trim();
     if normalized.is_empty() {
@@ -15,6 +26,14 @@ pub fn parse_host_ip_literal(host: &str) -> Result<Option<IpAddr>, String> {
     Ok(normalized.parse::<IpAddr>().ok())
 }
 
+/// Validates a DNS answer set against the private-target policy.
+///
+/// A single private/local address fails the whole set: DNS can interleave public and
+/// private answers (rebinding-style attacks), and the connector may pick any of them.
+///
+/// # Errors
+/// Returns an error message for an empty answer set, or for any private/local/special-use
+/// address unless `allow_private_targets` is set.
 pub fn validate_resolved_ip_addrs(
     addrs: &[IpAddr],
     allow_private_targets: bool,
@@ -28,12 +47,15 @@ pub fn validate_resolved_ip_addrs(
     Ok(())
 }
 
+/// Returns whether a hostname is `localhost` or a `*.localhost` name (RFC 6761).
 #[must_use]
 pub fn is_localhost_hostname(host: &str) -> bool {
     let normalized = host.trim_end_matches('.').to_ascii_lowercase();
     normalized == "localhost" || normalized.ends_with(".localhost")
 }
 
+/// Returns whether an address is private, loopback, link-local, or in a special-use range
+/// that must never be reachable through policy-guarded egress.
 #[must_use]
 pub fn is_private_or_local_ip(address: IpAddr) -> bool {
     match address {
@@ -53,6 +75,8 @@ fn is_private_or_local_ipv4(address: Ipv4Addr) -> bool {
 }
 
 fn is_private_or_local_ipv6(address: Ipv6Addr) -> bool {
+    // IPv4-mapped addresses (::ffff:a.b.c.d) must be judged by the embedded IPv4 rules,
+    // otherwise wrapping a private IPv4 target in IPv6 would bypass the guard.
     if let Some(mapped_ipv4) = address.to_ipv4_mapped() {
         return is_private_or_local_ipv4(mapped_ipv4);
     }
@@ -67,6 +91,10 @@ fn is_private_or_local_ipv6(address: Ipv6Addr) -> bool {
         || is_teredo_ipv6(address)
 }
 
+// Special-use IPv4 ranges beyond what std classifies: 0.0.0.0/8 ("this network"),
+// 100.64/10 (carrier-grade NAT), 192.0.0/24 (protocol assignments), 192.0.2/24,
+// 198.51.100/24, 203.0.113/24 (documentation TEST-NETs), 192.88.99/24 (6to4 relay),
+// 198.18/15 (benchmarking), and 240/4 (reserved, includes 255.255.255.255).
 fn is_special_ipv4_ssrf_range(address: Ipv4Addr) -> bool {
     let octets = address.octets();
     let first = octets[0];
@@ -103,6 +131,10 @@ fn is_teredo_ipv6(address: Ipv6Addr) -> bool {
     segments[0] == 0x2001 && segments[1] == 0
 }
 
+// Detects IPv4 spellings that `IpAddr::from_str` rejects but OS resolvers and libcurl
+// accept (decimal "2130706433", hex "0x7f000001", octal "0177.0.0.1", short "127.1").
+// Allowing them through as "hostnames" would let DNS-stage code resolve them to
+// addresses the literal-stage guard never inspected.
 fn is_non_canonical_ipv4_literal(host: &str) -> bool {
     let normalized = host.trim().to_ascii_lowercase();
     if normalized.is_empty() {

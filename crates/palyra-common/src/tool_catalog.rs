@@ -1,3 +1,10 @@
+//! Static catalog mapping built-in tool names to capabilities and approval sensitivity.
+//!
+//! This is the deny-by-default source of truth the daemon's policy and approval layers
+//! consult before dispatching a tool call: unknown tools always require approval, and
+//! capability names here must match the policy engine's vocabulary.
+
+/// A capability class a tool may exercise, used for policy evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolCapability {
     ProcessExec,
@@ -9,6 +16,7 @@ pub enum ToolCapability {
 }
 
 impl ToolCapability {
+    /// Returns the policy-engine name for this capability.
     #[must_use]
     pub const fn policy_name(self) -> &'static str {
         match self {
@@ -22,6 +30,7 @@ impl ToolCapability {
     }
 }
 
+/// Capabilities and default approval sensitivity for one catalog tool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ToolMetadata {
     pub capabilities: &'static [ToolCapability],
@@ -41,9 +50,11 @@ const ARTIFACT_READ_CAPABILITIES: &[ToolCapability] = &[ToolCapability::Artifact
 const WASM_PLUGIN_CAPABILITIES: &[ToolCapability] =
     &[ToolCapability::Network, ToolCapability::SecretsRead, ToolCapability::FilesystemWrite];
 
+/// Policy names of the capabilities that always force approval gating.
 pub const SENSITIVE_CAPABILITY_POLICY_NAMES: &[&str] =
     &["process_exec", "network", "secrets_read", "filesystem_write"];
 
+/// Looks up catalog metadata for a tool name; `None` means the tool is not built in.
 #[must_use]
 pub fn tool_metadata(tool_name: &str) -> Option<ToolMetadata> {
     match tool_name {
@@ -211,6 +222,9 @@ pub fn tool_metadata(tool_name: &str) -> Option<ToolMetadata> {
     }
 }
 
+/// Returns whether a tool call must pass approval before execution.
+///
+/// Fails closed: tools missing from the catalog require approval unconditionally.
 #[must_use]
 pub fn tool_requires_approval(tool_name: &str) -> bool {
     let Some(metadata) = tool_metadata(tool_name) else {
@@ -228,6 +242,7 @@ pub fn tool_requires_approval(tool_name: &str) -> bool {
         })
 }
 
+/// Returns the sorted, deduplicated policy capability names for a tool (empty if unknown).
 #[must_use]
 pub fn tool_policy_capability_names(tool_name: &str) -> Vec<String> {
     let Some(metadata) = tool_metadata(tool_name) else {
@@ -243,6 +258,7 @@ pub fn tool_policy_capability_names(tool_name: &str) -> Vec<String> {
     capabilities
 }
 
+/// Filters an allowlist down to approval-requiring tools, lowercased for stable matching.
 #[must_use]
 pub fn sensitive_allowlisted_tool_names(allowlisted_tools: &[String]) -> Vec<String> {
     allowlisted_tools

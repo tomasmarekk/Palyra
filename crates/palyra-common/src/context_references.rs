@@ -1,5 +1,13 @@
+//! Parser for inline `@kind:target` context references in operator chat input.
+//!
+//! Extracts references like `@file:README.md` or `@memory:"release notes"` from a message,
+//! reporting malformed ones as errors and returning the message text with references
+//! stripped. `@@` escapes a literal `@`; references only start at word boundaries so
+//! e-mail addresses pass through untouched.
+
 use serde::{Deserialize, Serialize};
 
+/// What a context reference points at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextReferenceKind {
@@ -12,6 +20,7 @@ pub enum ContextReferenceKind {
 }
 
 impl ContextReferenceKind {
+    /// Returns the canonical snake_case wire name for this kind.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -36,11 +45,13 @@ impl ContextReferenceKind {
         }
     }
 
+    // Diff and staged describe workspace state as a whole, so a target is optional.
     const fn requires_target(self) -> bool {
         !matches!(self, Self::Diff | Self::Staged)
     }
 }
 
+/// One successfully parsed reference with byte offsets into the original input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedContextReference {
     pub kind: ContextReferenceKind,
@@ -50,6 +61,7 @@ pub struct ParsedContextReference {
     pub end_offset: usize,
 }
 
+/// A malformed reference (missing target, unterminated quote) with its input location.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextReferenceParseError {
     pub raw_text: String,
@@ -58,6 +70,7 @@ pub struct ContextReferenceParseError {
     pub end_offset: usize,
 }
 
+/// Full parse outcome: extracted references, errors, and the reference-free message text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextReferenceParseResult {
     pub references: Vec<ParsedContextReference>,
@@ -65,6 +78,11 @@ pub struct ContextReferenceParseResult {
     pub clean_text: String,
 }
 
+/// Parses all context references out of a chat message.
+///
+/// Valid references are removed from `clean_text` (whitespace collapsed); malformed ones
+/// are reported in `errors` and left in place; `@` sequences that don't form a reference
+/// pass through verbatim.
 #[must_use]
 pub fn parse_context_references(input: &str) -> ContextReferenceParseResult {
     let mut references = Vec::new();
@@ -80,6 +98,7 @@ pub fn parse_context_references(input: &str) -> ContextReferenceParseResult {
             continue;
         }
 
+        // `@@` is the escape for a literal `@`.
         if index + 1 < bytes.len() && bytes[index + 1] == b'@' {
             clean_text.push('@');
             index += 2;
@@ -235,6 +254,8 @@ fn parse_reference_at(
     )))
 }
 
+// Reads a quote-delimited target starting at `quote_start`; `Err` carries the byte offset
+// where the unterminated quote scan ended.
 fn parse_quoted_value(input: &str, quote_start: usize) -> Result<(String, usize), usize> {
     let bytes = input.as_bytes();
     let quote = bytes[quote_start];
@@ -247,6 +268,11 @@ fn parse_quoted_value(input: &str, quote_start: usize) -> Result<(String, usize)
                 if cursor >= bytes.len() {
                     return Err(cursor);
                 }
+                // AIDEV-NOTE: escaping a multi-byte UTF-8 char (e.g. `\é`) pushes only its
+                // lead byte as a Latin-1 char and advances the cursor mid-character; the
+                // next iteration then slices `input[cursor..]` off a char boundary and
+                // panics. Fixing requires changing observable behavior for such inputs,
+                // so it is left as-is and only documented here.
                 value.push(match bytes[cursor] {
                     b'n' => '\n',
                     b'r' => '\r',
@@ -275,6 +301,8 @@ fn parse_quoted_value(input: &str, quote_start: usize) -> Result<(String, usize)
     Err(bytes.len())
 }
 
+// Collapses the whitespace holes left by removed references: runs of spaces become one
+// space, spaces before newlines are dropped, and blank-line runs collapse to one newline.
 fn normalize_clean_text(raw: String) -> String {
     let mut normalized = String::with_capacity(raw.len());
     let mut previous_was_whitespace = false;
@@ -302,6 +330,8 @@ fn normalize_clean_text(raw: String) -> String {
     normalized.trim().to_owned()
 }
 
+// References must start after whitespace or an opening bracket/quote so that infix `@`
+// (e-mail addresses, handles) is never treated as a reference.
 fn is_reference_boundary(input: &str, at_offset: usize) -> bool {
     if at_offset == 0 {
         return true;

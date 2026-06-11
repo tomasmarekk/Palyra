@@ -1,5 +1,11 @@
+//! Validation for canonical Palyra identifiers (ULID strings).
+//!
+//! Canonical IDs are 26-character uppercase Crockford Base32 ULIDs; every untrusted ID
+//! crossing a protocol boundary (e.g. webhook envelopes) is validated here.
+
 use thiserror::Error;
 
+/// Why a candidate canonical ID was rejected.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum CanonicalIdError {
     #[error("canonical ID must be exactly 26 characters")]
@@ -8,6 +14,12 @@ pub enum CanonicalIdError {
     InvalidCharacter(char),
 }
 
+/// Validates that `input` is a canonical 26-character uppercase Crockford Base32 ULID.
+///
+/// # Errors
+/// Returns [`CanonicalIdError::InvalidLength`] for any other length and
+/// [`CanonicalIdError::InvalidCharacter`] for characters outside the alphabet
+/// (Crockford Base32 excludes I, L, O, and U).
 pub fn validate_canonical_id(input: &str) -> Result<(), CanonicalIdError> {
     if input.len() != 26 {
         return Err(CanonicalIdError::InvalidLength);

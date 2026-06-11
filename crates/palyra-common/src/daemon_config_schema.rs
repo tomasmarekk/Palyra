@@ -1,3 +1,11 @@
+//! Typed serde mirror of the daemon's TOML config file (`palyra.toml`).
+//!
+//! Every table uses `deny_unknown_fields` with all-optional fields: unknown
+//! keys fail loudly while absent sections fall back to daemon defaults.
+//! Field names are pinned by config import/export fixtures and the JSON
+//! config contracts under `schemas/json`, so renames are breaking changes.
+//! Also owns the secret config paths redacted from config exports.
+
 use serde::Deserialize;
 use toml::Value;
 
@@ -5,6 +13,12 @@ use crate::secret_refs::SecretRef;
 
 const REDACTED_CONFIG_VALUE: &str = "<redacted>";
 
+/// Dot-separated config paths whose values must never leave the daemon
+/// unredacted.
+///
+/// Extend this list whenever a new secret-bearing field is added to the
+/// schema; [`redact_secret_config_values`] and config-export surfaces
+/// consume it.
 pub const SECRET_CONFIG_PATHS: &[&str] = &[
     "admin.auth_token",
     "admin.auth_token_secret_ref",
@@ -23,12 +37,20 @@ pub const SECRET_CONFIG_PATHS: &[&str] = &[
     "tool_call.browser_service.state_key_vault_ref",
 ];
 
+/// Reports whether a dot-separated config path names a secret value.
+///
+/// Matching is case-insensitive and ignores whitespace around segments.
 #[must_use]
 pub fn is_secret_config_path(path: &str) -> bool {
     let normalized = normalize_config_path(path);
     SECRET_CONFIG_PATHS.iter().any(|candidate| *candidate == normalized)
 }
 
+/// Replaces all known secret values in a parsed config document with a
+/// redaction marker.
+///
+/// Covers the static [`SECRET_CONFIG_PATHS`] plus per-provider secret fields
+/// inside `model_provider.providers` registry entries.
 pub fn redact_secret_config_values(document: &mut Value) {
     for secret_path in SECRET_CONFIG_PATHS {
         redact_config_path(document, secret_path);
@@ -108,6 +130,7 @@ fn redact_provider_registry_secrets(document: &mut Value) {
     }
 }
 
+/// Root of the config file; one optional field per top-level TOML table.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RootFileConfig {
@@ -138,6 +161,7 @@ pub struct RootFileConfig {
     pub storage: Option<FileStorageConfig>,
 }
 
+/// `[deployment]`: bootstrap profile and remote-bind acknowledgement.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileDeploymentConfig {
@@ -146,6 +170,7 @@ pub struct FileDeploymentConfig {
     pub dangerous_remote_bind_ack: Option<bool>,
 }
 
+/// `[daemon]`: HTTP bind address and port.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileDaemonConfig {
@@ -153,6 +178,7 @@ pub struct FileDaemonConfig {
     pub port: Option<u16>,
 }
 
+/// `[gateway]`: gRPC/QUIC bind posture, TLS, and response limits.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileGatewayConfig {
@@ -170,6 +196,7 @@ pub struct FileGatewayConfig {
     pub tls: Option<FileGatewayTlsConfig>,
 }
 
+/// `[gateway.tls]`: gateway TLS material paths.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileGatewayTlsConfig {
@@ -179,6 +206,8 @@ pub struct FileGatewayTlsConfig {
     pub client_ca_path: Option<String>,
 }
 
+/// `[gateway_access]`: remote console URL and pinned certificate
+/// fingerprints.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileGatewayAccessConfig {
@@ -187,6 +216,7 @@ pub struct FileGatewayAccessConfig {
     pub pinned_gateway_ca_fingerprint_sha256: Option<String>,
 }
 
+/// `[feature_rollouts]`: per-feature rollout switches.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileFeatureRolloutsConfig {
@@ -207,6 +237,7 @@ pub struct FileFeatureRolloutsConfig {
     pub networked_workers: Option<bool>,
 }
 
+/// `[session_queue_policy]`: runtime-preview queue posture.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileSessionQueuePolicyConfig {
@@ -215,6 +246,7 @@ pub struct FileSessionQueuePolicyConfig {
     pub merge_window_ms: Option<u64>,
 }
 
+/// `[pruning_policy_matrix]`: runtime-preview compaction/pruning posture.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FilePruningPolicyMatrixConfig {
@@ -223,6 +255,7 @@ pub struct FilePruningPolicyMatrixConfig {
     pub min_token_savings: Option<u64>,
 }
 
+/// `[retrieval_dual_path]`: runtime-preview split-retrieval posture.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileRetrievalDualPathConfig {
@@ -231,6 +264,7 @@ pub struct FileRetrievalDualPathConfig {
     pub prompt_budget_tokens: Option<u64>,
 }
 
+/// `[auxiliary_executor]`: runtime-preview background-task limits.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileAuxiliaryExecutorConfig {
@@ -239,6 +273,7 @@ pub struct FileAuxiliaryExecutorConfig {
     pub default_budget_tokens: Option<u64>,
 }
 
+/// `[flow_orchestration]`: runtime-preview flow transition/retry posture.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileFlowOrchestrationConfig {
@@ -247,6 +282,7 @@ pub struct FileFlowOrchestrationConfig {
     pub max_retry_count: Option<u32>,
 }
 
+/// `[delivery_arbitration]`: runtime-preview descendant delivery policy.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileDeliveryArbitrationConfig {
@@ -255,6 +291,7 @@ pub struct FileDeliveryArbitrationConfig {
     pub suppression_limit: Option<u32>,
 }
 
+/// `[replay_capture]`: runtime-preview replay bundle capture posture.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileReplayCaptureConfig {
@@ -263,6 +300,7 @@ pub struct FileReplayCaptureConfig {
     pub max_events_per_run: Option<u64>,
 }
 
+/// `[networked_workers]`: worker leasing, attestation, and expected digests.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileNetworkedWorkersConfig {
@@ -274,18 +312,21 @@ pub struct FileNetworkedWorkersConfig {
     pub expected_artifact_digest_sha256: Option<String>,
 }
 
+/// `[cron]`: scheduler timezone.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileCronConfig {
     pub timezone: Option<String>,
 }
 
+/// `[orchestrator]`: orchestrator run-loop rollout switch.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileOrchestratorConfig {
     pub runloop_v1_enabled: Option<bool>,
 }
 
+/// `[memory]`: memory item limits, auto-inject, retention, and retrieval.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileMemoryConfig {
@@ -297,6 +338,7 @@ pub struct FileMemoryConfig {
     pub retrieval: Option<FileMemoryRetrievalConfig>,
 }
 
+/// `[memory.auto_inject]`: automatic memory injection limits.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileMemoryAutoInjectConfig {
@@ -304,6 +346,7 @@ pub struct FileMemoryAutoInjectConfig {
     pub max_items: Option<u64>,
 }
 
+/// `[memory.retention]`: memory store retention and vacuum policy.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileMemoryRetentionConfig {
@@ -313,6 +356,7 @@ pub struct FileMemoryRetentionConfig {
     pub vacuum_schedule: Option<String>,
 }
 
+/// `[memory.retrieval]`: retrieval backend and scoring configuration.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileMemoryRetrievalConfig {
@@ -320,12 +364,14 @@ pub struct FileMemoryRetrievalConfig {
     pub scoring: Option<FileRetrievalScoringConfig>,
 }
 
+/// `[memory.retrieval.backend]`: retrieval backend selection.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileRetrievalBackendConfig {
     pub kind: Option<String>,
 }
 
+/// `[memory.retrieval.scoring]`: per-source scoring profiles in basis points.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileRetrievalScoringConfig {
@@ -338,6 +384,7 @@ pub struct FileRetrievalScoringConfig {
     pub compaction: Option<FileRetrievalSourceScoringProfile>,
 }
 
+/// Scoring weights (basis points) for one retrieval source.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileRetrievalSourceScoringProfile {
@@ -350,6 +397,7 @@ pub struct FileRetrievalSourceScoringProfile {
     pub pinned_bonus_bps: Option<u16>,
 }
 
+/// `[media]`: attachment download/upload limits and content-type allowlists.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileMediaConfig {
@@ -374,6 +422,8 @@ pub struct FileMediaConfig {
     pub retention_ttl_ms: Option<i64>,
 }
 
+/// `[model_provider]`: provider credentials, endpoints, retries, and the
+/// provider/model registry.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileModelProviderConfig {
@@ -412,6 +462,7 @@ pub struct FileModelProviderConfig {
     pub health_ttl_ms: Option<u64>,
 }
 
+/// One `[[model_provider.providers]]` registry entry.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileModelProviderRegistryEntry {
@@ -433,6 +484,7 @@ pub struct FileModelProviderRegistryEntry {
     pub circuit_breaker_cooldown_ms: Option<u64>,
 }
 
+/// One `[[model_provider.models]]` registry entry with capability metadata.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileModelProviderRegistryModel {
@@ -454,6 +506,7 @@ pub struct FileModelProviderRegistryModel {
     pub known_limitations: Option<Vec<String>>,
 }
 
+/// `[tool_call]`: tool allowlist, budgets, and tool-runtime sub-sections.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileToolCallConfig {
@@ -466,6 +519,7 @@ pub struct FileToolCallConfig {
     pub browser_service: Option<FileBrowserServiceConfig>,
 }
 
+/// `[tool_call.http_fetch]`: outbound HTTP fetch policy and limits.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileHttpFetchConfig {
@@ -483,6 +537,7 @@ pub struct FileHttpFetchConfig {
     pub max_cache_entries: Option<u64>,
 }
 
+/// `[tool_call.browser_service]`: browser daemon endpoint, auth, and limits.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileBrowserServiceConfig {
@@ -500,6 +555,7 @@ pub struct FileBrowserServiceConfig {
     pub max_title_bytes: Option<u64>,
 }
 
+/// `[channel_router]`: channel delivery limits, retries, and routing.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileChannelRouterConfig {
@@ -513,6 +569,7 @@ pub struct FileChannelRouterConfig {
     pub routing: Option<FileChannelRoutingConfig>,
 }
 
+/// `[channel_router.inbound_coalescing]`: inbound message debouncing.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileInboundCoalescingConfig {
@@ -523,6 +580,7 @@ pub struct FileInboundCoalescingConfig {
     pub bypass_media: Option<bool>,
 }
 
+/// `[canvas_host]`: canvas hosting limits and token TTL.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileCanvasHostConfig {
@@ -535,6 +593,7 @@ pub struct FileCanvasHostConfig {
     pub max_updates_per_minute: Option<u32>,
 }
 
+/// `[channel_router.routing]`: default routing posture and per-channel rules.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileChannelRoutingConfig {
@@ -547,6 +606,7 @@ pub struct FileChannelRoutingConfig {
     pub channels: Option<Vec<FileChannelRoutingRule>>,
 }
 
+/// One `[[channel_router.routing.channels]]` rule.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileChannelRoutingRule {
@@ -565,6 +625,8 @@ pub struct FileChannelRoutingRule {
     pub concurrency_limit: Option<u64>,
 }
 
+/// `[tool_call.process_runner]`: sandboxed process execution policy and
+/// limits.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileProcessRunnerConfig {
@@ -581,6 +643,7 @@ pub struct FileProcessRunnerConfig {
     pub max_output_bytes: Option<u64>,
 }
 
+/// `[tool_call.wasm_runtime]`: Wasm plugin runtime limits and allowlists.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileWasmRuntimeConfig {
@@ -597,6 +660,7 @@ pub struct FileWasmRuntimeConfig {
     pub allowed_channels: Option<Vec<String>>,
 }
 
+/// `[admin]`: admin/connector auth tokens and bound principal.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileAdminConfig {
@@ -608,12 +672,14 @@ pub struct FileAdminConfig {
     pub bound_principal: Option<String>,
 }
 
+/// `[identity]`: identity and mTLS escape hatches.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileIdentityConfig {
     pub allow_insecure_node_rpc_without_mtls: Option<bool>,
 }
 
+/// `[storage]`: journal and vault storage paths and limits.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileStorageConfig {

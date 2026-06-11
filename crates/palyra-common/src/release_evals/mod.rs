@@ -1,4 +1,8 @@
 //! Replay/eval contract used by release gates.
+//!
+//! Re-exports the manifest schema, coverage catalog, and evaluator that
+//! power `just release-eval-gate`; the version constants below gate
+//! compatibility with the golden manifest fixture.
 
 mod catalog;
 mod evaluator;

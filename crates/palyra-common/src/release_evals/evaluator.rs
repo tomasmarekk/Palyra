@@ -1,3 +1,10 @@
+//! Release-eval gate evaluator: validates the golden manifest and emits a
+//! fail-closed report plus one generated replay bundle per case.
+//!
+//! Consumed by `just release-eval-gate` and the replay-gate CI path; issue
+//! codes and report shapes are pinned by `tests/release_eval_contract.rs`,
+//! so message and code changes must update fixtures in the same change.
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{anyhow, Context, Result};
@@ -21,6 +28,10 @@ use super::{
 };
 
 /// Parse a release eval manifest from JSON bytes.
+///
+/// # Errors
+/// Returns an error when the bytes are not a valid [`ReleaseEvalManifest`];
+/// the schema denies unknown fields, so extra keys fail too.
 pub fn parse_release_eval_manifest(bytes: &[u8]) -> Result<ReleaseEvalManifest> {
     let manifest: ReleaseEvalManifest =
         serde_json::from_slice(bytes).context("failed to parse release eval manifest")?;
@@ -28,6 +39,10 @@ pub fn parse_release_eval_manifest(bytes: &[u8]) -> Result<ReleaseEvalManifest> 
 }
 
 /// Evaluate a release eval manifest and generate replay bundles for every case.
+///
+/// Never short-circuits: every validation issue is collected into the
+/// report, and the overall status is `Passed` only when no issue exists and
+/// every suite passed.
 #[must_use]
 pub fn evaluate_release_eval_manifest(manifest: &ReleaseEvalManifest) -> ReleaseEvalOutput {
     let mut issues = validate_manifest_header_and_inventory(manifest);
@@ -51,7 +66,7 @@ pub fn evaluate_release_eval_manifest(manifest: &ReleaseEvalManifest) -> Release
         if !seen.insert(suite.kind) {
             issues.push(error_issue(
                 "duplicate_suite",
-                format!("$.suites[{suite_index}]",),
+                format!("$.suites[{suite_index}]"),
                 format!("suite '{}' is declared more than once", suite.kind.as_str()),
                 "Keep exactly one suite per release eval domain.",
             ));
@@ -109,6 +124,10 @@ pub fn evaluate_release_eval_manifest(manifest: &ReleaseEvalManifest) -> Release
 }
 
 /// Return an error when a release eval report failed.
+///
+/// # Errors
+/// Returns an error naming the first issue (code and path) found at report,
+/// suite, or case level when the report status is not `Passed`.
 pub fn ensure_release_eval_report_passed(report: &ReleaseEvalReport) -> Result<()> {
     if report.status == ReleaseEvalStatus::Passed {
         return Ok(());
@@ -134,6 +153,10 @@ pub fn ensure_release_eval_report_passed(report: &ReleaseEvalReport) -> Result<(
 /// Case identifiers are manifest-controlled and are later used for artifact
 /// filenames. Keeping them to one explicit ASCII segment avoids path traversal,
 /// absolute paths, Windows drive prefixes, and alternate stream syntax.
+///
+/// # Errors
+/// Returns an error when `case_id` is not a non-empty ASCII slug of letters,
+/// digits, `_`, or `-`.
 pub fn release_eval_replay_bundle_filename(case_id: &str) -> Result<String> {
     validate_release_eval_case_id_segment(case_id)?;
     Ok(format!("{case_id}.json"))
@@ -407,6 +430,8 @@ fn evaluate_case(
         }
     }
 
+    // `ReleaseReplayFixture` holds only JSON-representable fields, so
+    // serialization cannot fail in practice; `Null` keeps the scan total.
     let raw_replay_value = serde_json::to_value(&case.replay).unwrap_or(Value::Null);
     scan_value_for_unredacted_secrets(
         &raw_replay_value,
@@ -415,6 +440,8 @@ fn evaluate_case(
         &mut issues,
     );
 
+    // An unsafe case_id already produced an issue above; skip bundle
+    // generation so no artifact is emitted under an attacker-chosen name.
     let (bundle_metadata, generated_bundle, replay_status) = if !case_id_is_file_safe {
         ((None, None), None, ReleaseEvalStatus::Failed)
     } else {
@@ -428,6 +455,7 @@ fn evaluate_case(
                         "generated replay bundle failed offline validation",
                         "Inspect the replay diffs and restore deterministic expected outputs.",
                     ));
+                    // Cap reported diffs per case to keep gate output triageable.
                     for diff in report.diffs.iter().take(3) {
                         issues.push(error_issue(
                             "replay_bundle_diff",
@@ -604,11 +632,14 @@ fn string_contains_unredacted_secret(raw: &str, key_context: Option<&str>) -> bo
         || lowered.contains("authorization=")
         || lowered.contains("client_secret=")
         || lowered.contains("password=")
+        // URL with non-empty userinfo, i.e. embedded credentials.
         || (lowered.contains("://") && lowered.contains('@') && !lowered.contains("://@"))
 }
 
 fn is_release_eval_secret_key(key: &str) -> bool {
     let normalized = normalize_key(key);
+    // `is_sensitive_key` is a broad heuristic; identifiers and token
+    // *accounting* fields would otherwise false-positive as credentials.
     is_sensitive_key(key)
         && !normalized.ends_with("_id")
         && normalized != "cross_session_event_leak"
@@ -656,7 +687,7 @@ fn error_issue(
     }
 }
 
-/// Count issues by stable issue code.
+/// Count issues by stable issue code across report, suite, and case levels.
 #[must_use]
 pub fn release_eval_issue_counts_by_code(report: &ReleaseEvalReport) -> BTreeMap<String, usize> {
     let mut counts = BTreeMap::new();

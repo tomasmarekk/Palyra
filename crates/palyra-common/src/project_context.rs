@@ -1,6 +1,14 @@
+//! Project context file handling: normalization and prompt-injection risk scanning.
+//!
+//! Project context (PALYRA.md, AGENTS.md, CLAUDE.md, .cursorrules) is untrusted input that
+//! gets injected into model prompts. This module canonicalizes content for hashing and
+//! scans for override/exfiltration patterns, hidden HTML comments, and invisible or
+//! bidirectional Unicode before the daemon admits a file into a session.
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// Filename Palyra itself writes and recommends for project context.
 pub const PREFERRED_PROJECT_CONTEXT_FILENAME: &str = "PALYRA.md";
 
 const PROJECT_CONTEXT_FILENAMES: &[&str] = &["PALYRA.md", "AGENTS.md", "CLAUDE.md", ".cursorrules"];
@@ -36,6 +44,7 @@ const BLOCKED_BIDI_CHARS: &[char] = &[
 ];
 const MAX_PREVIEW_CHARS: usize = 320;
 
+/// Recognized project context file flavors, ordered by ascending precedence.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectContextFileKind {
@@ -46,6 +55,7 @@ pub enum ProjectContextFileKind {
 }
 
 impl ProjectContextFileKind {
+    /// Returns the canonical snake_case wire name for this file kind.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -56,6 +66,7 @@ impl ProjectContextFileKind {
         }
     }
 
+    /// Returns the on-disk filename for this kind.
     #[must_use]
     pub const fn display_name(self) -> &'static str {
         match self {
@@ -66,6 +77,7 @@ impl ProjectContextFileKind {
         }
     }
 
+    /// Returns the selection rank when multiple context files coexist; higher wins.
     #[must_use]
     pub const fn precedence_rank(self) -> usize {
         match self {
@@ -76,6 +88,7 @@ impl ProjectContextFileKind {
         }
     }
 
+    /// Returns the operator-facing label explaining why this kind ranks where it does.
     #[must_use]
     pub const fn precedence_label(self) -> &'static str {
         match self {
@@ -86,11 +99,13 @@ impl ProjectContextFileKind {
         }
     }
 
+    /// Returns whether this kind is the Palyra-native format rather than a compatibility one.
     #[must_use]
     pub const fn preferred(self) -> bool {
         matches!(self, Self::Palyra)
     }
 
+    /// Maps a filename (case-insensitive) to its context file kind, if recognized.
     #[must_use]
     pub fn from_filename(filename: &str) -> Option<Self> {
         if filename.eq_ignore_ascii_case("PALYRA.md") {
@@ -107,6 +122,7 @@ impl ProjectContextFileKind {
     }
 }
 
+/// Gate decision for a scanned context file, ordered by ascending severity.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectContextRiskAction {
@@ -117,6 +133,7 @@ pub enum ProjectContextRiskAction {
 }
 
 impl ProjectContextRiskAction {
+    /// Returns the canonical snake_case wire name for this action.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -127,6 +144,7 @@ impl ProjectContextRiskAction {
         }
     }
 
+    /// Returns the minimum 0-100 risk score implied by a finding with this action.
     #[must_use]
     pub const fn score_floor(self) -> u32 {
         match self {
@@ -138,6 +156,7 @@ impl ProjectContextRiskAction {
     }
 }
 
+/// Single matched risk rule with its action, explanation, and optional evidence excerpt.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectContextRiskFinding {
     pub rule_id: String,
@@ -148,6 +167,7 @@ pub struct ProjectContextRiskFinding {
     pub evidence: Option<String>,
 }
 
+/// Aggregated scan result: the strictest recommended action, a 0-100 score, and findings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectContextRiskScan {
     pub recommended_action: ProjectContextRiskAction,
@@ -162,6 +182,7 @@ impl Default for ProjectContextRiskScan {
 }
 
 impl ProjectContextRiskScan {
+    /// Records a finding, raising the aggregate score and recommended action monotonically.
     pub fn push(
         &mut self,
         reaction: ProjectContextRiskAction,
@@ -181,6 +202,7 @@ impl ProjectContextRiskScan {
         });
     }
 
+    /// Combines two scans, keeping the stricter action/score and concatenating findings.
     #[must_use]
     pub fn merge(mut self, other: &Self) -> Self {
         self.score = self.score.max(other.score);
@@ -190,6 +212,7 @@ impl ProjectContextRiskScan {
     }
 }
 
+/// Canonicalized context document with a stable hash and a sanitized one-line preview.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NormalizedProjectContextDocument {
     pub normalized_text: String,
@@ -199,11 +222,14 @@ pub struct NormalizedProjectContextDocument {
     pub line_count: usize,
 }
 
+/// Returns all recognized project context filenames, preferred filename first.
 #[must_use]
 pub const fn project_context_filenames() -> &'static [&'static str] {
     PROJECT_CONTEXT_FILENAMES
 }
 
+/// Normalizes content (BOM stripped, line endings to LF) and derives hash, preview, and
+/// size metadata; the hash is over the normalized bytes so platforms agree on identity.
 #[must_use]
 pub fn normalize_project_context_content(content: &str) -> NormalizedProjectContextDocument {
     let normalized = content
@@ -224,6 +250,11 @@ pub fn normalize_project_context_content(content: &str) -> NormalizedProjectCont
     }
 }
 
+/// Scans normalized content for injection-style risks and returns the gate decision.
+///
+/// Pattern matching runs on lowercased normalized text; hidden HTML comments, invisible
+/// Unicode, bidirectional controls, and embedded script tags are checked separately
+/// because they hide instructions from rendered previews rather than matching wording.
 #[must_use]
 pub fn scan_project_context_content(content: &str) -> ProjectContextRiskScan {
     let normalized = normalize_project_context_content(content);

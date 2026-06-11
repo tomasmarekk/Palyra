@@ -1,9 +1,14 @@
+//! Shared health-endpoint response shape for daemon and browserd services.
+//!
+//! Combines build metadata with uptime so every service reports identical health JSON.
+
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
 use crate::build::build_metadata;
 
+/// JSON body returned by service health endpoints.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub service: String,
@@ -14,6 +19,7 @@ pub struct HealthResponse {
     pub uptime_seconds: u64,
 }
 
+/// Builds an "ok" health response for `service` using its process start instant.
 #[must_use]
 pub fn health_response(service: &'static str, started_at: Instant) -> HealthResponse {
     let metadata = build_metadata();

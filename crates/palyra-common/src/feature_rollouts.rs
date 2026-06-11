@@ -1,48 +1,85 @@
+//! Experimental feature rollout flags: env/config key names and boolish parsing.
+//!
+//! Every experimental subsystem is toggled through a `PALYRA_EXPERIMENTAL_*` variable or
+//! a `feature_rollouts.*` config path defined here so flag names stay consistent across
+//! the daemon, CLI, and tests. All rollouts default to off.
+
 use std::{error::Error, fmt};
 
 use serde::{Deserialize, Serialize};
 
+/// Env toggle for the experimental dynamic tool builder.
 pub const DYNAMIC_TOOL_BUILDER_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_DYNAMIC_TOOL_BUILDER";
+/// Env toggle for the experimental context engine.
 pub const CONTEXT_ENGINE_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_CONTEXT_ENGINE";
+/// Env toggle for the experimental remote-node execution backend.
 pub const EXECUTION_BACKEND_REMOTE_NODE_ROLLOUT_ENV: &str =
     "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_REMOTE_NODE";
+/// Env toggle for the experimental networked-worker execution backend.
 pub const EXECUTION_BACKEND_NETWORKED_WORKER_ROLLOUT_ENV: &str =
     "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_NETWORKED_WORKER";
+/// Env toggle for the experimental SSH-tunnel execution backend.
 pub const EXECUTION_BACKEND_SSH_TUNNEL_ROLLOUT_ENV: &str =
     "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_SSH_TUNNEL";
+/// Env toggle for the experimental safety boundary.
 pub const SAFETY_BOUNDARY_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_SAFETY_BOUNDARY";
+/// Env toggle for the experimental execution gate pipeline v2.
 pub const EXECUTION_GATE_PIPELINE_V2_ROLLOUT_ENV: &str =
     "PALYRA_EXPERIMENTAL_EXECUTION_GATE_PIPELINE_V2";
+/// Env toggle for the experimental session queue policy.
 pub const SESSION_QUEUE_POLICY_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_SESSION_QUEUE_POLICY";
+/// Env toggle for the experimental pruning policy matrix.
 pub const PRUNING_POLICY_MATRIX_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_PRUNING_POLICY_MATRIX";
+/// Env toggle for the experimental dual-path retrieval.
 pub const RETRIEVAL_DUAL_PATH_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_RETRIEVAL_DUAL_PATH";
+/// Env toggle for the experimental auxiliary executor.
 pub const AUXILIARY_EXECUTOR_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_AUXILIARY_EXECUTOR";
+/// Env toggle for the experimental flow orchestration.
 pub const FLOW_ORCHESTRATION_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_FLOW_ORCHESTRATION";
+/// Env toggle for the experimental delivery arbitration.
 pub const DELIVERY_ARBITRATION_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_DELIVERY_ARBITRATION";
+/// Env toggle for the experimental replay capture.
 pub const REPLAY_CAPTURE_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_REPLAY_CAPTURE";
+/// Env toggle for experimental networked workers.
 pub const NETWORKED_WORKERS_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_NETWORKED_WORKERS";
 
+/// Config path for [`DYNAMIC_TOOL_BUILDER_ROLLOUT_ENV`].
 pub const DYNAMIC_TOOL_BUILDER_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.dynamic_tool_builder";
+/// Config path for [`CONTEXT_ENGINE_ROLLOUT_ENV`].
 pub const CONTEXT_ENGINE_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.context_engine";
+/// Config path for [`EXECUTION_BACKEND_REMOTE_NODE_ROLLOUT_ENV`].
 pub const EXECUTION_BACKEND_REMOTE_NODE_ROLLOUT_CONFIG_PATH: &str =
     "feature_rollouts.execution_backend_remote_node";
+/// Config path for [`EXECUTION_BACKEND_NETWORKED_WORKER_ROLLOUT_ENV`].
 pub const EXECUTION_BACKEND_NETWORKED_WORKER_ROLLOUT_CONFIG_PATH: &str =
     "feature_rollouts.execution_backend_networked_worker";
+/// Config path for [`EXECUTION_BACKEND_SSH_TUNNEL_ROLLOUT_ENV`].
 pub const EXECUTION_BACKEND_SSH_TUNNEL_ROLLOUT_CONFIG_PATH: &str =
     "feature_rollouts.execution_backend_ssh_tunnel";
+/// Config path for [`SAFETY_BOUNDARY_ROLLOUT_ENV`].
 pub const SAFETY_BOUNDARY_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.safety_boundary";
+/// Config path for [`EXECUTION_GATE_PIPELINE_V2_ROLLOUT_ENV`].
 pub const EXECUTION_GATE_PIPELINE_V2_ROLLOUT_CONFIG_PATH: &str =
     "feature_rollouts.execution_gate_pipeline_v2";
+/// Config path for [`SESSION_QUEUE_POLICY_ROLLOUT_ENV`].
 pub const SESSION_QUEUE_POLICY_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.session_queue_policy";
+/// Config path for [`PRUNING_POLICY_MATRIX_ROLLOUT_ENV`].
 pub const PRUNING_POLICY_MATRIX_ROLLOUT_CONFIG_PATH: &str =
     "feature_rollouts.pruning_policy_matrix";
+/// Config path for [`RETRIEVAL_DUAL_PATH_ROLLOUT_ENV`].
 pub const RETRIEVAL_DUAL_PATH_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.retrieval_dual_path";
+/// Config path for [`AUXILIARY_EXECUTOR_ROLLOUT_ENV`].
 pub const AUXILIARY_EXECUTOR_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.auxiliary_executor";
+/// Config path for [`FLOW_ORCHESTRATION_ROLLOUT_ENV`].
 pub const FLOW_ORCHESTRATION_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.flow_orchestration";
+/// Config path for [`DELIVERY_ARBITRATION_ROLLOUT_ENV`].
 pub const DELIVERY_ARBITRATION_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.delivery_arbitration";
+/// Config path for [`REPLAY_CAPTURE_ROLLOUT_ENV`].
 pub const REPLAY_CAPTURE_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.replay_capture";
+/// Config path for [`NETWORKED_WORKERS_ROLLOUT_ENV`].
 pub const NETWORKED_WORKERS_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.networked_workers";
 
+/// Where a rollout decision came from, for diagnostics and precedence reporting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FeatureRolloutSource {
@@ -51,6 +88,7 @@ pub enum FeatureRolloutSource {
     Env,
 }
 
+/// A resolved rollout flag value together with its provenance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeatureRolloutSetting {
     pub enabled: bool,
@@ -58,11 +96,13 @@ pub struct FeatureRolloutSetting {
 }
 
 impl FeatureRolloutSetting {
+    /// Builds a setting resolved from the config file.
     #[must_use]
     pub const fn from_config(enabled: bool) -> Self {
         Self { enabled, source: FeatureRolloutSource::Config }
     }
 
+    /// Builds a setting resolved from an environment variable.
     #[must_use]
     pub const fn from_env(enabled: bool) -> Self {
         Self { enabled, source: FeatureRolloutSource::Env }
@@ -75,6 +115,7 @@ impl Default for FeatureRolloutSetting {
     }
 }
 
+/// A rollout value that does not parse as any accepted boolean alias.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeatureRolloutParseError {
     source_name: String,
@@ -93,6 +134,12 @@ impl fmt::Display for FeatureRolloutParseError {
 
 impl Error for FeatureRolloutParseError {}
 
+/// Parses a rollout flag value, accepting 1/0, true/false, yes/no, and on/off
+/// (case-insensitive, surrounding whitespace ignored).
+///
+/// # Errors
+/// Returns [`FeatureRolloutParseError`] naming `source_name` for any other value, so an
+/// operator typo fails loudly instead of silently disabling a rollout.
 pub fn parse_boolish_feature_rollout(
     raw: &str,
     source_name: &str,

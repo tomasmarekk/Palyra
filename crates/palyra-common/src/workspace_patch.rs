@@ -1,3 +1,11 @@
+//! Workspace patch parsing, planning, and fail-closed filesystem application.
+//!
+//! Accepts the fenced `*** Begin Patch` format (plus tolerant model-emitted variants) and
+//! plain unified diffs, confines all writes to canonicalized workspace roots, and executes
+//! plans atomically with best-effort rollback. Parse accept/reject behavior and error
+//! strings are contract surface: unit tests assert message substrings and the parser is
+//! fuzzed by `fuzz/fuzz_targets/workspace_patch_parser.rs` — do not reword or change them.
+
 use std::{
     borrow::Cow,
     cmp::Reverse,
@@ -19,6 +27,8 @@ const REDACTION_PLACEHOLDER_MARKERS: &[&str] =
     &["[redacted]", "[redacted_secret]", "<redacted>", "redacted_secret"];
 const NON_SECRET_ENV_FILE_SUFFIXES: &[&str] =
     &[".example", ".sample", ".template", ".templates", ".dist", ".default", ".defaults"];
+// Heuristic gate: a full-file replacement that shrinks a sizeable file down to a handful of
+// lines is usually a truncated model edit, not an intentional rewrite.
 const SUSPICIOUS_REPLACE_MIN_BEFORE_BYTES: usize = 256;
 const SUSPICIOUS_REPLACE_MAX_NON_EMPTY_LINES: usize = 4;
 
@@ -27,9 +37,13 @@ const SUSPICIOUS_REPLACE_MAX_NON_EMPTY_LINES: usize = 4;
 /// Limits are fail-closed and enforced before any filesystem mutation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspacePatchLimits {
+    /// Maximum size of the raw patch payload in bytes.
     pub max_patch_bytes: usize,
+    /// Maximum number of distinct files a single patch may touch.
     pub max_files_touched: usize,
+    /// Maximum size in bytes of any patched file, before and after the patch.
     pub max_file_bytes: usize,
+    /// Maximum size of the redacted preview string in bytes.
     pub max_preview_bytes: usize,
 }
 
@@ -49,7 +63,9 @@ impl Default for WorkspacePatchLimits {
 /// This affects only the preview string returned in outcomes/errors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspacePatchRedactionPolicy {
+    /// Case-insensitive substrings that are masked wherever they appear in the preview.
     pub redaction_patterns: Vec<String>,
+    /// Path substrings marking a file as secret-bearing; its body lines are fully masked.
     pub secret_file_markers: Vec<String>,
 }
 
@@ -71,16 +87,23 @@ impl Default for WorkspacePatchRedactionPolicy {
 /// Request payload for patch execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspacePatchRequest {
+    /// Raw patch document text.
     pub patch: String,
+    /// When `true`, the patch is parsed and planned but the filesystem is never mutated.
     pub dry_run: bool,
+    /// Policy applied when rendering the redacted preview.
     pub redaction_policy: WorkspacePatchRedactionPolicy,
 }
 
 /// Per-file attestation emitted for each touched file.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct WorkspacePatchFileAttestation {
+    /// Workspace-relative path rendered with `/` separators.
     pub path: String,
+    /// Index into the caller-supplied workspace roots the path resolved against.
     pub workspace_root_index: usize,
+    /// Stable operation label: `create`, `create_idempotent`, `replace`, `line_replace`,
+    /// `update`, `move`, `delete`, or `no_op`.
     pub operation: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub moved_from: Option<String>,
@@ -100,6 +123,7 @@ pub struct WorkspacePatchOutcome {
     pub patch_sha256: String,
     pub dry_run: bool,
     pub files_touched: Vec<WorkspacePatchFileAttestation>,
+    /// Update operations whose result was byte-identical to the existing file.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub no_op_files: Vec<WorkspacePatchFileAttestation>,
     pub rollback_performed: bool,
@@ -157,6 +181,7 @@ pub enum WorkspacePatchError {
 }
 
 impl WorkspacePatchError {
+    /// Returns the 1-based `(line, column)` location of a parse error, if any.
     #[must_use]
     pub const fn parse_location(&self) -> Option<(usize, usize)> {
         match self {
@@ -165,6 +190,9 @@ impl WorkspacePatchError {
         }
     }
 
+    /// Reports whether a failed execution rolled previously applied actions back.
+    ///
+    /// Always `false` for errors raised before any filesystem mutation.
     #[must_use]
     pub const fn rollback_performed(&self) -> bool {
         match self {
@@ -226,6 +254,13 @@ struct PatchExecutionError {
 /// - patch size, touched file count, and per-file size limits are enforced;
 /// - paths are confined to canonicalized workspace roots;
 /// - writes are executed atomically with best-effort rollback on partial failure.
+///
+/// # Errors
+///
+/// Returns a [`WorkspacePatchError`] when a limit is exceeded, the patch fails to parse, a
+/// path escapes the workspace roots, a target file is missing or invalid, or filesystem
+/// execution fails. Execution failures report rollback status via
+/// [`WorkspacePatchError::ExecutionFailed`].
 pub fn apply_workspace_patch(
     workspace_roots: &[PathBuf],
     request: &WorkspacePatchRequest,
@@ -242,6 +277,11 @@ pub fn apply_workspace_patch(
 /// This is used by callers that accept a narrower workspace-root override. It
 /// preserves the original workspace-root confinement after any later
 /// re-canonicalization of the selected root.
+///
+/// # Errors
+///
+/// Returns [`WorkspacePatchError::InvalidWorkspaceRoot`] when a root resolves outside the
+/// constraint set, plus every failure mode of [`apply_workspace_patch`].
 pub fn apply_workspace_patch_with_canonical_root_constraints(
     workspace_roots: &[PathBuf],
     canonical_constraint_roots: &[PathBuf],
@@ -256,6 +296,12 @@ pub fn apply_workspace_patch_with_canonical_root_constraints(
 
 /// Revalidates that the current canonical roots still resolve below the
 /// supplied already-canonicalized parent roots.
+///
+/// # Errors
+///
+/// Returns [`WorkspacePatchError::EmptyWorkspaceRoots`] when no roots are supplied and
+/// [`WorkspacePatchError::InvalidWorkspaceRoot`] when a root fails to canonicalize, is not
+/// a directory, or resolves outside the constraint set.
 pub fn validate_workspace_patch_roots_with_canonical_constraints(
     workspace_roots: &[PathBuf],
     canonical_constraint_roots: &[PathBuf],
@@ -335,6 +381,10 @@ pub fn compute_patch_sha256(patch: &str) -> String {
 }
 
 /// Produces a redacted, size-capped preview of the patch payload.
+///
+/// Body lines of files matching a secret-file marker are masked entirely, redaction
+/// patterns are replaced case-insensitively everywhere, and the result is truncated to
+/// `max_preview_bytes` on a UTF-8 character boundary.
 #[must_use]
 pub fn redact_patch_preview(
     patch: &str,
@@ -396,6 +446,8 @@ fn replace_ascii_case_insensitive(haystack: &str, needle: &str, replacement: &st
         return haystack.replace(needle, replacement);
     }
 
+    // ASCII lowercasing preserves byte offsets, so match indices found in the lowered copy
+    // map directly back into the original haystack.
     let lowered_haystack = haystack.to_ascii_lowercase();
     let lowered_needle = needle.to_ascii_lowercase();
     let mut cursor = 0usize;
@@ -465,6 +517,7 @@ fn validate_canonical_root_constraints(
     canonical_roots: &[PathBuf],
     canonical_constraint_roots: &[PathBuf],
 ) -> Result<(), WorkspacePatchError> {
+    // An empty constraint set means the caller imposed no narrowing; nothing to enforce.
     if canonical_constraint_roots.is_empty() {
         return Ok(());
     }
@@ -480,6 +533,9 @@ fn validate_canonical_root_constraints(
     Ok(())
 }
 
+// Input formats are tried in fixed order: tolerant fenced-variant normalization, an
+// already-canonical fenced document, then unified-diff conversion. Anything else passes
+// through unchanged so the parser can reject it with a precise location.
 fn normalize_supported_patch_document(patch: &str) -> Cow<'_, str> {
     if let Some(normalized) = normalize_palyra_patch_fences(patch) {
         return Cow::Owned(normalized);
@@ -499,6 +555,9 @@ fn normalize_palyra_patch_fences(patch: &str) -> Option<String> {
 
     let mut lines = Vec::with_capacity(original_lines.len());
     let mut changed = false;
+    // Tracks an Add/Replace File header that has no body yet so a redundant
+    // "*** Begin File:" wrapper for the same path can be dropped instead of being
+    // mistaken for a second add operation.
     let mut pending_empty_file_header: Option<(usize, String)> = None;
     for original in &original_lines {
         let Some(line) =
@@ -724,6 +783,7 @@ fn collect_unified_add_file_lines(
         if let Some(content) = line.strip_prefix('+') {
             add_lines.push(content.to_owned());
         } else if line.starts_with('-') || line.starts_with(' ') || line.trim().is_empty() {
+            // Context/removal lines carry no content for a brand-new file; skip them.
         } else {
             return None;
         }
@@ -1102,6 +1162,9 @@ fn is_patch_header_or_end(line: &str) -> bool {
     control_line == "*** End Patch" || control_line.starts_with("*** ")
 }
 
+// "+ text" drops the single separator space, but "+<indent>..." strips only the '+' so
+// indented file content keeps its leading whitespace; pinned by the plus-space
+// normalization tests.
 fn full_file_body_content(line: &str) -> &str {
     if let Some(rest) = line.strip_prefix("+ ") {
         if rest.is_empty()
@@ -1113,6 +1176,8 @@ fn full_file_body_content(line: &str) -> &str {
     line.strip_prefix('+').unwrap_or(line)
 }
 
+// INTENTIONAL: the guidance text below (and in replace_line_target_not_found_message) is
+// asserted by substring in tests and read by model callers; keep the wording stable.
 fn hunk_context_not_found_message(index: usize, old_lines: &[String]) -> String {
     let mut message = format!("hunk {index} context not found");
     if old_lines.iter().any(|line| line.starts_with(" -") || line.starts_with(" +")) {
@@ -1133,6 +1198,8 @@ fn replace_line_target_not_found_message(old_line: &str) -> String {
     message
 }
 
+// Trailing spaces/tabs are ignored on control lines so patches piped through Windows
+// tooling (which can leave trailing whitespace after CRLF normalization) still match.
 fn patch_control_line(line: &str) -> &str {
     line.trim_end_matches([' ', '\t'])
 }
@@ -1448,6 +1515,8 @@ fn resolve_new_path(
     preferred_root_index: Option<usize>,
     path_label: &str,
 ) -> Result<(PathBuf, usize), WorkspacePatchError> {
+    // New files default to the first workspace root; moves pin the destination to the
+    // source file's root so a rename never silently hops between roots.
     let index = preferred_root_index.unwrap_or(0);
     let root = canonical_roots
         .get(index)
@@ -1769,6 +1838,11 @@ fn find_subsequence(haystack: &[String], needle: &[String], from: usize) -> Opti
     if haystack.len() < needle.len() {
         return None;
     }
+    // AIDEV-NOTE: when the needle no longer fits in the remaining lines, `start` clamps
+    // *below* `from`, so a later hunk may match before the search cursor (overlapping an
+    // earlier hunk's output near end-of-file). This widened acceptance is part of the
+    // pinned parse/apply contract exercised by the fuzz target; do not tighten it without
+    // an explicit contract change.
     let start = from.min(haystack.len().saturating_sub(needle.len()));
     (start..=haystack.len().saturating_sub(needle.len()))
         .find(|&offset| haystack[offset..offset + needle.len()] == *needle)
@@ -1778,6 +1852,8 @@ fn execute_patch_plan(
     actions: &[PlannedAction],
     limits: &WorkspacePatchLimits,
 ) -> Result<(), PatchExecutionError> {
+    // Snapshot every target before mutating anything so a mid-plan failure can be rolled
+    // back; `None` marks paths that did not exist and must be removed on rollback.
     let mut backups = HashMap::<PathBuf, Option<Vec<u8>>>::new();
     for action in actions {
         let (path, root) = match action {
@@ -1827,6 +1903,8 @@ fn execute_patch_plan(
     Ok(())
 }
 
+// Re-checked at execution time (not just planning) so a path swapped for a symlink between
+// plan and write/delete cannot escape the workspace root (TOCTOU guard).
 fn revalidate_execution_target(path: &Path, root: &Path) -> Result<(), WorkspacePatchError> {
     let path_label = path.display().to_string();
     match fs::symlink_metadata(path) {
@@ -1903,6 +1981,9 @@ fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), WorkspacePatchErro
     drop(file);
 
     if let Err(_rename_error) = fs::rename(temp_path.as_path(), path) {
+        // On Windows, renaming onto an existing file can fail (e.g. sharing violations),
+        // so retry once after removing the destination. The brief non-atomic window is
+        // accepted because plan-level rollback restores the original bytes on failure.
         #[cfg(windows)]
         {
             if path.exists() {
@@ -1932,6 +2013,9 @@ fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), WorkspacePatchErro
 
     Ok(())
 }
+// Best-effort: individual restore/remove failures are ignored so rollback never becomes a
+// second failure source. Restores run shallowest-first and removals deepest-first so
+// directory hierarchies created during execution unwind cleanly.
 fn rollback_from_backups(backups: &HashMap<PathBuf, Option<Vec<u8>>>) -> bool {
     if backups.is_empty() {
         return false;
@@ -1966,6 +2050,8 @@ fn sha256_hex(value: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+// Collisions are tolerated: the temp file is opened with create_new, so a duplicate suffix
+// fails loudly instead of clobbering another writer's file.
 fn unique_suffix() -> String {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
     format!("{now}-{}", std::process::id())

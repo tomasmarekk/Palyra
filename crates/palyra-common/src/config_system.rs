@@ -1,3 +1,9 @@
+//! Versioned TOML config document engine shared by the daemon and CLI.
+//!
+//! Owns parse/migration to the supported config version, dot-path
+//! get/set/unset with safe-segment validation, and atomic file writes with
+//! rotating backups plus owner-only permissions for secret-bearing files.
+
 use std::{
     ffi::OsString,
     fs,
@@ -11,10 +17,15 @@ use std::os::unix::fs::PermissionsExt;
 use thiserror::Error;
 use toml::{map::Entry, Value};
 
+/// The only config document version currently supported.
 pub const CONFIG_VERSION_V1: u32 = 1;
+/// Default number of rotating `.bak.N` copies kept beside a config file.
 pub const DEFAULT_CONFIG_BACKUP_ROTATION: usize = 5;
+// Rejected defensively: config paths round-trip through JSON/JS consumers
+// (web console, import/export), where these keys enable prototype pollution.
 const FORBIDDEN_PATH_SEGMENTS: &[&str] = &["__proto__", "prototype", "constructor"];
 
+/// Outcome of bringing a parsed config document up to the supported version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConfigMigrationInfo {
     pub source_version: u32,
@@ -22,6 +33,7 @@ pub struct ConfigMigrationInfo {
     pub migrated: bool,
 }
 
+/// Errors from config document parsing, editing, and persistence.
 #[derive(Debug, Error)]
 pub enum ConfigSystemError {
     #[error("failed to parse config document: {source}")]
@@ -86,6 +98,14 @@ pub enum ConfigSystemError {
     BackupNotFound { path: PathBuf },
 }
 
+/// Parses TOML config content and migrates it to the supported version.
+///
+/// Empty or whitespace-only content yields an empty, freshly versioned
+/// document.
+///
+/// # Errors
+/// Returns an error when the content is not valid TOML or declares an
+/// unsupported `version`.
 pub fn parse_document_with_migration(
     content: &str,
 ) -> Result<(Value, ConfigMigrationInfo), ConfigSystemError> {
@@ -98,6 +118,14 @@ pub fn parse_document_with_migration(
     Ok((document, migration))
 }
 
+/// Stamps a missing `version` field and validates an existing one.
+///
+/// A document without `version` is treated as legacy (version 0) and
+/// migrated in place to [`CONFIG_VERSION_V1`].
+///
+/// # Errors
+/// Returns an error when the document is not a table, the version is not a
+/// positive integer, or the version is newer than [`CONFIG_VERSION_V1`].
 pub fn ensure_document_version(
     document: &mut Value,
 ) -> Result<ConfigMigrationInfo, ConfigSystemError> {
@@ -128,6 +156,10 @@ pub fn ensure_document_version(
     })
 }
 
+/// Serializes a table document to pretty-printed TOML.
+///
+/// # Errors
+/// Returns an error when the document is not a table or cannot be serialized.
 pub fn serialize_document_pretty(document: &Value) -> Result<String, ConfigSystemError> {
     if !document.is_table() {
         return Err(ConfigSystemError::DocumentNotTable);
@@ -136,20 +168,32 @@ pub fn serialize_document_pretty(document: &Value) -> Result<String, ConfigSyste
         .map_err(|source| ConfigSystemError::SerializeDocument { source })
 }
 
+/// Parses a bare TOML value literal (e.g. `true`, `42`, `"text"`, `[1, 2]`).
+///
+/// # Errors
+/// Returns an error when the literal is empty or not a valid TOML value.
 pub fn parse_toml_value_literal(raw: &str) -> Result<Value, ConfigSystemError> {
     if raw.trim().is_empty() {
         return Err(ConfigSystemError::EmptyValueLiteral);
     }
+    // TOML has no bare-value grammar, so wrap the literal in a dummy key to
+    // reuse the document parser.
     let wrapped = format!("value = {raw}");
     let mut table: toml::Table = toml::from_str(&wrapped)
         .map_err(|source| ConfigSystemError::ParseValueLiteral { source })?;
     table.remove("value").ok_or(ConfigSystemError::EmptyValueLiteral)
 }
 
+/// Formats a TOML value using its canonical literal representation.
 pub fn format_toml_value(value: &Value) -> String {
     value.to_string()
 }
 
+/// Looks up the value at a dot-separated path; `Ok(None)` when absent.
+///
+/// # Errors
+/// Returns an error when the path is empty, contains an invalid segment, or
+/// crosses a non-table value.
 pub fn get_value_at_path<'a>(
     document: &'a Value,
     path: &str,
@@ -171,6 +215,11 @@ pub fn get_value_at_path<'a>(
     Ok(Some(cursor))
 }
 
+/// Sets the value at a dot-separated path, creating intermediate tables.
+///
+/// # Errors
+/// Returns an error when the path is empty, contains an invalid segment, or
+/// crosses an existing non-table value.
 pub fn set_value_at_path(
     document: &mut Value,
     path: &str,
@@ -203,6 +252,12 @@ pub fn set_value_at_path(
     Ok(())
 }
 
+/// Removes the value at a dot-separated path; returns whether anything was
+/// removed.
+///
+/// # Errors
+/// Returns an error when the path is empty, contains an invalid segment, or
+/// crosses an existing non-table value.
 pub fn unset_value_at_path(document: &mut Value, path: &str) -> Result<bool, ConfigSystemError> {
     let segments = parse_path_segments(path)?;
     let Some((last, parent_segments)) = segments.split_last() else {
@@ -224,6 +279,11 @@ pub fn unset_value_at_path(document: &mut Value, path: &str) -> Result<bool, Con
     Ok(cursor.remove(*last).is_some())
 }
 
+/// Serializes and writes a config document atomically, rotating backups.
+///
+/// # Errors
+/// Returns an error when serialization, backup rotation, or the atomic write
+/// fails.
 pub fn write_document_with_backups(
     path: &Path,
     document: &Value,
@@ -233,6 +293,12 @@ pub fn write_document_with_backups(
     write_content_with_backups(path, &content, max_backups)
 }
 
+/// Like [`write_document_with_backups`], but enforces owner-only permissions
+/// for secret-bearing files.
+///
+/// # Errors
+/// Returns an error when serialization, permission tightening, backup
+/// rotation, or the atomic write fails.
 pub fn write_secret_document_with_backups(
     path: &Path,
     document: &Value,
@@ -242,6 +308,14 @@ pub fn write_secret_document_with_backups(
     write_secret_content_with_backups(path, &content, max_backups)
 }
 
+/// Writes raw content atomically, rotating backups first.
+///
+/// Existing file permissions are preserved; new files get secure defaults
+/// (owner-only on Unix).
+///
+/// # Errors
+/// Returns an error when permissions cannot be resolved, backup rotation
+/// fails, or the atomic write fails.
 pub fn write_content_with_backups(
     path: &Path,
     content: &str,
@@ -254,12 +328,22 @@ pub fn write_content_with_backups(
     write_atomically(path, content, target_permissions)
 }
 
+/// Writes secret-bearing content atomically with owner-only permissions.
+///
+/// Unlike [`write_content_with_backups`], an existing file's looser
+/// permissions are not preserved but tightened to the secure default.
+///
+/// # Errors
+/// Returns an error when permission tightening, backup rotation, or the
+/// atomic write fails.
 pub fn write_secret_content_with_backups(
     path: &Path,
     content: &str,
     max_backups: usize,
 ) -> Result<(), ConfigSystemError> {
     let target_permissions = default_secure_permissions()?;
+    // Tighten before rotating so the rotated backup inherits owner-only
+    // permissions rather than the file's previous mode.
     tighten_existing_file_permissions(path, target_permissions.as_ref())?;
     if path.exists() {
         rotate_backups(path, max_backups)?;
@@ -267,6 +351,13 @@ pub fn write_secret_content_with_backups(
     write_atomically(path, content, target_permissions)
 }
 
+/// Shifts `path` into `.bak.1` and each `.bak.N` into `.bak.N+1`, dropping
+/// the copy beyond `max_backups`.
+///
+/// A `max_backups` of zero or a missing file is a no-op.
+///
+/// # Errors
+/// Returns an error when a backup file cannot be removed or renamed.
 pub fn rotate_backups(path: &Path, max_backups: usize) -> Result<(), ConfigSystemError> {
     if max_backups == 0 || !path.exists() {
         return Ok(());
@@ -294,6 +385,12 @@ pub fn rotate_backups(path: &Path, max_backups: usize) -> Result<(), ConfigSyste
     Ok(())
 }
 
+/// Restores config content from `.bak.{backup_index}` and returns the backup
+/// path used; the current file is rotated into the backups first.
+///
+/// # Errors
+/// Returns an error when `backup_index` is zero, the backup does not exist,
+/// or reading/writing the config file fails.
 pub fn recover_config_from_backup(
     path: &Path,
     backup_index: usize,
@@ -307,13 +404,13 @@ pub fn recover_config_from_backup(
     if !source_path.exists() {
         return Err(ConfigSystemError::BackupNotFound { path: source_path });
     }
-    let source_for_read = source_path.clone();
     let content = fs::read_to_string(&source_path)
-        .map_err(|source| ConfigSystemError::ReadFile { path: source_for_read, source })?;
+        .map_err(|source| ConfigSystemError::ReadFile { path: source_path.clone(), source })?;
     write_content_with_backups(path, &content, max_backups)?;
     Ok(source_path)
 }
 
+/// Returns the `.bak.{index}` sibling path for a config file.
 pub fn backup_path(path: &Path, index: usize) -> PathBuf {
     let mut raw: OsString = path.as_os_str().to_os_string();
     raw.push(format!(".bak.{index}"));
@@ -381,6 +478,8 @@ fn write_atomically(
         }
     }
 
+    // The timestamp only disambiguates temporary file names alongside the
+    // process id; a pre-epoch clock harmlessly degrades to 0.
     let timestamp_ns = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
     let mut temporary_name = path.as_os_str().to_os_string();
     temporary_name.push(format!(".tmp.{}.{}", std::process::id(), timestamp_ns));
@@ -394,6 +493,9 @@ fn write_atomically(
         })?;
     }
 
+    // On Windows, rename fails when the destination exists: swap the current
+    // file aside, move the new content in, then drop the old copy — restoring
+    // the original if the second rename fails.
     if let Err(source) = fs::rename(&temporary_path, path) {
         if !path.exists() || !path.is_file() {
             let _ = remove_file_if_exists(&temporary_path);
