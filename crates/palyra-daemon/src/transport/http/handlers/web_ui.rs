@@ -1,3 +1,9 @@
+//! Static dashboard asset serving for the daemon HTTP fallback route.
+//!
+//! The handler resolves the packaged web bundle, rejects traversal attempts,
+//! serves real files with stable MIME types, and falls back to `index.html` for
+//! dashboard SPA routes.
+
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -13,6 +19,7 @@ use crate::transport::http::middleware::apply_admin_console_security_headers;
 const WEB_UI_ROOT_ENV: &str = "PALYRA_WEB_DIST_DIR";
 const WEB_UI_ENTRYPOINT: &str = "index.html";
 
+/// Serves a dashboard asset or SPA fallback for the current request path.
 pub(crate) async fn web_ui_entry_handler(uri: Uri) -> Response {
     let Some(root) = resolve_web_ui_root() else {
         return missing_web_ui_response();

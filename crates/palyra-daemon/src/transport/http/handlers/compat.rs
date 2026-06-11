@@ -1,3 +1,10 @@
+//! OpenAI-compatible HTTP handlers backed by the Palyra gateway runtime.
+//!
+//! This module translates `/v1/*` compatibility requests into authenticated
+//! Palyra sessions and run-stream calls. JSON shapes and error codes are
+//! externally visible compatibility contract; keep behavior changes paired with
+//! parity fixtures and client updates.
+
 use crate::{
     access_control::{
         AccessRegistry, AccessRegistryError, AuthenticatedApiToken, FEATURE_API_TOKENS,
@@ -12,6 +19,7 @@ use crate::{
 
 const COMPAT_API_CHANNEL: &str = "compat-api";
 
+/// Request body for the compatibility chat-completions endpoint.
 #[derive(Debug, Deserialize)]
 pub(crate) struct CompatChatCompletionsRequest {
     model: Option<String>,
@@ -21,6 +29,7 @@ pub(crate) struct CompatChatCompletionsRequest {
     metadata: Option<Value>,
 }
 
+/// Request body for the compatibility responses endpoint.
 #[derive(Debug, Deserialize)]
 pub(crate) struct CompatResponsesRequest {
     model: Option<String>,
@@ -30,6 +39,7 @@ pub(crate) struct CompatResponsesRequest {
     metadata: Option<Value>,
 }
 
+/// Request body for the compatibility embeddings endpoint.
 #[derive(Debug, Deserialize)]
 pub(crate) struct CompatEmbeddingsRequest {
     model: Option<String>,
@@ -44,6 +54,7 @@ pub(crate) struct CompatEmbeddingsRequest {
     metadata: Option<Value>,
 }
 
+/// One chat-style message accepted by compatibility chat and responses inputs.
 #[derive(Debug, Deserialize)]
 pub(crate) struct CompatChatMessage {
     role: String,
@@ -52,6 +63,7 @@ pub(crate) struct CompatChatMessage {
     name: Option<String>,
 }
 
+/// Input forms accepted by the compatibility responses endpoint.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum CompatResponsesInput {
@@ -59,6 +71,7 @@ pub(crate) enum CompatResponsesInput {
     Messages(Vec<CompatResponseInputItem>),
 }
 
+/// Input forms accepted by the compatibility embeddings endpoint.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum CompatEmbeddingsInput {
@@ -66,6 +79,7 @@ pub(crate) enum CompatEmbeddingsInput {
     Texts(Vec<String>),
 }
 
+/// One structured response-input message item.
 #[derive(Debug, Deserialize)]
 pub(crate) struct CompatResponseInputItem {
     role: Option<String>,
@@ -74,6 +88,7 @@ pub(crate) struct CompatResponseInputItem {
     name: Option<String>,
 }
 
+/// Text-bearing message content accepted by compatibility request formats.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum CompatMessageContent {
@@ -82,6 +97,7 @@ pub(crate) enum CompatMessageContent {
     Json(Value),
 }
 
+/// One typed content part inside a compatibility message.
 #[derive(Debug, Deserialize)]
 pub(crate) struct CompatMessagePart {
     #[serde(rename = "type")]
@@ -138,6 +154,11 @@ struct CompatModelDescriptor {
     capabilities: Option<model_provider::ProviderCapabilitiesSnapshot>,
 }
 
+/// Handles `GET /v1/models` for the compatibility API.
+///
+/// # Errors
+/// Returns an error response when API-token authorization fails, the compat
+/// rate limit is exhausted, or the system clock cannot be read.
 pub(crate) async fn compat_models_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -162,6 +183,12 @@ pub(crate) async fn compat_models_handler(
     })))
 }
 
+/// Handles `GET /v1/models/{model_id}` for the compatibility API.
+///
+/// # Errors
+/// Returns an error response when API-token authorization fails, the compat
+/// rate limit is exhausted, the requested model is not published, or the system
+/// clock cannot be read.
 pub(crate) async fn compat_model_detail_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -187,6 +214,12 @@ pub(crate) async fn compat_model_detail_handler(
     Ok(Json(compat_model_json(&descriptor)))
 }
 
+/// Handles `POST /v1/embeddings` using the configured embeddings provider.
+///
+/// # Errors
+/// Returns an error response when authorization or rate limiting fails, the
+/// embeddings provider is unavailable, the requested model/dimensions are
+/// invalid, or provider execution fails.
 pub(crate) async fn compat_embeddings_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -342,6 +375,11 @@ pub(crate) async fn compat_embeddings_handler(
     Ok(Json(build_compat_embeddings_payload(prompt_tokens, &response)))
 }
 
+/// Handles `POST /v1/tools/invoke`.
+///
+/// # Errors
+/// Always returns a compatibility error after authorization because direct
+/// tool invocation stays disabled until it can be approval-bound.
 pub(crate) async fn compat_tools_invoke_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -372,6 +410,12 @@ pub(crate) async fn compat_tools_invoke_handler(
     ))
 }
 
+/// Handles `POST /v1/chat/completions`.
+///
+/// # Errors
+/// Returns an error response when request rendering, API-token authorization,
+/// rate limiting, gateway connection, run execution, or final status lookup
+/// fails.
 pub(crate) async fn compat_chat_completions_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -421,6 +465,12 @@ pub(crate) async fn compat_chat_completions_handler(
     }
 }
 
+/// Handles `POST /v1/responses`.
+///
+/// # Errors
+/// Returns an error response when the request asks for unsupported streaming,
+/// contains no text-bearing input, fails authorization/rate limiting, or the
+/// backing gateway run fails.
 pub(crate) async fn compat_responses_handler(
     State(state): State<AppState>,
     headers: HeaderMap,

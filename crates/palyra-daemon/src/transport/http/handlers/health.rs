@@ -1,3 +1,8 @@
+//! Health and legacy runtime handoff handlers for the daemon HTTP server.
+//!
+//! `/healthz` is the machine-readable liveness probe; `/runtime` is a narrow
+//! HTML handoff that points operators toward the authenticated dashboard.
+
 use axum::{
     extract::State,
     response::{Html, IntoResponse},
@@ -7,10 +12,12 @@ use palyra_common::{health_response, HealthResponse};
 
 use crate::app::state::AppState;
 
+/// Returns the JSON daemon health response.
 pub(crate) async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
     Json::<HealthResponse>(health_response("palyrad", state.started_at))
 }
 
+/// Renders the legacy runtime landing page with links to dashboard surfaces.
 pub(crate) async fn dashboard_handoff_handler(State(state): State<AppState>) -> impl IntoResponse {
     let health = health_response("palyrad", state.started_at);
     Html(format!(

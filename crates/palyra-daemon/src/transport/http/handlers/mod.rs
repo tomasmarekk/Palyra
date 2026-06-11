@@ -1,3 +1,5 @@
+//! HTTP handler module tree for daemon route surfaces.
+
 pub(crate) mod admin;
 pub(crate) mod canvas;
 pub(crate) mod compat;

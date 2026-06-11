@@ -1,3 +1,9 @@
+//! HTTP middleware for daemon security headers, observability, and rate limits.
+//!
+//! Admin and console routes share cache/clickjacking protections, while canvas
+//! gets a narrower no-cache surface. Rate-limit helpers are factored for direct
+//! unit testing because they enforce remote-access and canvas DoS boundaries.
+
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
@@ -26,6 +32,7 @@ use crate::{
     CANVAS_RATE_LIMIT_WINDOW_MS,
 };
 
+/// Applies admin-console security headers to responses after route handling.
 pub(crate) async fn admin_console_security_headers_middleware(
     request: Request,
     next: Next,
@@ -35,6 +42,8 @@ pub(crate) async fn admin_console_security_headers_middleware(
     response
 }
 
+/// Writes cache, MIME-sniffing, frame, CSP, and referrer protections for
+/// authenticated admin and console surfaces.
 pub(crate) fn apply_admin_console_security_headers(headers: &mut HeaderMap) {
     headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(
@@ -52,6 +61,7 @@ pub(crate) fn apply_admin_console_security_headers(headers: &mut HeaderMap) {
     );
 }
 
+/// Records non-idempotent console route outcomes in dashboard observability.
 pub(crate) async fn console_observability_middleware(
     State(state): State<AppState>,
     request: Request,
@@ -85,6 +95,7 @@ pub(crate) async fn console_observability_middleware(
     response
 }
 
+/// Refreshes a console session cookie after successful authenticated requests.
 pub(crate) async fn console_session_cookie_refresh_middleware(
     State(state): State<AppState>,
     request: Request,
@@ -107,6 +118,7 @@ pub(crate) async fn console_session_cookie_refresh_middleware(
     }
 }
 
+/// Applies no-cache and MIME-sniffing protections to canvas asset responses.
 pub(crate) async fn canvas_security_headers_middleware(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
@@ -141,6 +153,16 @@ fn admin_rate_limit_budget(remote_ip: IpAddr) -> u32 {
     ADMIN_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW
 }
 
+/// Returns elapsed milliseconds as `u64`, saturating only for impossible
+/// long-lived process windows rather than wrapping.
+fn elapsed_millis_since(now: Instant, started_at: Instant) -> u64 {
+    u64::try_from(now.duration_since(started_at).as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Consumes one admin API rate-limit slot for a remote IP.
+///
+/// Returns `false` when the mutex is poisoned, when the bucket table cannot
+/// evict an old entry, or when the caller has exhausted the active window.
 pub(crate) fn consume_admin_rate_limit_with_now(
     buckets: &Mutex<HashMap<IpAddr, AdminRateLimitEntry>>,
     remote_ip: IpAddr,
@@ -152,8 +174,7 @@ pub(crate) fn consume_admin_rate_limit_with_now(
     };
     if !buckets.contains_key(&remote_ip) && buckets.len() >= ADMIN_RATE_LIMIT_MAX_IP_BUCKETS {
         buckets.retain(|_, entry| {
-            now.duration_since(entry.window_started_at).as_millis() as u64
-                <= ADMIN_RATE_LIMIT_WINDOW_MS
+            elapsed_millis_since(now, entry.window_started_at) <= ADMIN_RATE_LIMIT_WINDOW_MS
         });
         if buckets.len() >= ADMIN_RATE_LIMIT_MAX_IP_BUCKETS {
             let evicted_ip =
@@ -167,7 +188,7 @@ pub(crate) fn consume_admin_rate_limit_with_now(
     let entry = buckets
         .entry(remote_ip)
         .or_insert(AdminRateLimitEntry { window_started_at: now, requests_in_window: 0 });
-    if now.duration_since(entry.window_started_at).as_millis() as u64 > ADMIN_RATE_LIMIT_WINDOW_MS {
+    if elapsed_millis_since(now, entry.window_started_at) > ADMIN_RATE_LIMIT_WINDOW_MS {
         entry.window_started_at = now;
         entry.requests_in_window = 0;
     }
@@ -178,6 +199,11 @@ pub(crate) fn consume_admin_rate_limit_with_now(
     true
 }
 
+/// Consumes one failed-auth admin rate-limit slot for a remote IP.
+///
+/// This secondary budget is checked only after an admin request returns
+/// unauthorized/forbidden, keeping brute-force failures from crowding out
+/// normal admin traffic.
 pub(crate) fn consume_admin_auth_failure_rate_limit_with_now(
     buckets: &Mutex<HashMap<IpAddr, AdminRateLimitEntry>>,
     remote_ip: IpAddr,
@@ -189,8 +215,7 @@ pub(crate) fn consume_admin_auth_failure_rate_limit_with_now(
     };
     if !buckets.contains_key(&remote_ip) && buckets.len() >= ADMIN_RATE_LIMIT_MAX_IP_BUCKETS {
         buckets.retain(|_, entry| {
-            now.duration_since(entry.window_started_at).as_millis() as u64
-                <= ADMIN_RATE_LIMIT_WINDOW_MS
+            elapsed_millis_since(now, entry.window_started_at) <= ADMIN_RATE_LIMIT_WINDOW_MS
         });
         if buckets.len() >= ADMIN_RATE_LIMIT_MAX_IP_BUCKETS {
             let evicted_ip =
@@ -204,7 +229,7 @@ pub(crate) fn consume_admin_auth_failure_rate_limit_with_now(
     let entry = buckets
         .entry(remote_ip)
         .or_insert(AdminRateLimitEntry { window_started_at: now, requests_in_window: 0 });
-    if now.duration_since(entry.window_started_at).as_millis() as u64 > ADMIN_RATE_LIMIT_WINDOW_MS {
+    if elapsed_millis_since(now, entry.window_started_at) > ADMIN_RATE_LIMIT_WINDOW_MS {
         entry.window_started_at = now;
         entry.requests_in_window = 0;
     }
@@ -215,6 +240,7 @@ pub(crate) fn consume_admin_auth_failure_rate_limit_with_now(
     true
 }
 
+/// Enforces remote admin rate limits and records non-loopback access attempts.
 pub(crate) async fn admin_rate_limit_middleware(
     State(state): State<AppState>,
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
@@ -307,6 +333,8 @@ fn admin_access_outcome(status: StatusCode) -> &'static str {
     }
 }
 
+/// Locks the last remote admin access attempt, recovering from poison so the
+/// diagnostics surface remains available after a prior panic.
 pub(crate) fn lock_remote_admin_access<'a>(
     slot: &'a Arc<Mutex<Option<RemoteAdminAccessAttempt>>>,
 ) -> std::sync::MutexGuard<'a, Option<RemoteAdminAccessAttempt>> {
@@ -323,6 +351,10 @@ fn consume_canvas_rate_limit(state: &AppState, remote_addr: SocketAddr) -> bool 
     consume_canvas_rate_limit_with_now(&state.canvas_rate_limit, remote_addr.ip(), Instant::now())
 }
 
+/// Consumes one canvas HTTP rate-limit slot for a remote IP.
+///
+/// Returns `false` when the bucket table is unavailable or the caller exceeds
+/// the configured canvas window.
 pub(crate) fn consume_canvas_rate_limit_with_now(
     buckets: &Mutex<HashMap<IpAddr, CanvasRateLimitEntry>>,
     remote_ip: IpAddr,
@@ -334,8 +366,7 @@ pub(crate) fn consume_canvas_rate_limit_with_now(
     };
     if !buckets.contains_key(&remote_ip) && buckets.len() >= CANVAS_RATE_LIMIT_MAX_IP_BUCKETS {
         buckets.retain(|_, entry| {
-            now.duration_since(entry.window_started_at).as_millis() as u64
-                <= CANVAS_RATE_LIMIT_WINDOW_MS
+            elapsed_millis_since(now, entry.window_started_at) <= CANVAS_RATE_LIMIT_WINDOW_MS
         });
         if buckets.len() >= CANVAS_RATE_LIMIT_MAX_IP_BUCKETS {
             let evicted_ip =
@@ -349,8 +380,7 @@ pub(crate) fn consume_canvas_rate_limit_with_now(
     let entry = buckets
         .entry(remote_ip)
         .or_insert(CanvasRateLimitEntry { window_started_at: now, requests_in_window: 0 });
-    if now.duration_since(entry.window_started_at).as_millis() as u64 > CANVAS_RATE_LIMIT_WINDOW_MS
-    {
+    if elapsed_millis_since(now, entry.window_started_at) > CANVAS_RATE_LIMIT_WINDOW_MS {
         entry.window_started_at = now;
         entry.requests_in_window = 0;
     }
@@ -361,6 +391,7 @@ pub(crate) fn consume_canvas_rate_limit_with_now(
     true
 }
 
+/// Enforces the canvas asset/state rate limit before invoking the handler.
 pub(crate) async fn canvas_rate_limit_middleware(
     State(state): State<AppState>,
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,

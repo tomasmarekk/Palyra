@@ -1,3 +1,10 @@
+//! HTTP and WebSocket handlers for the realtime command/event protocol.
+//!
+//! Console sessions authorize the connection, negotiate protocol capabilities,
+//! then dispatch text-frame commands through the command router. The WebSocket
+//! path accepts only same-origin browser clients when an `Origin` header is
+//! present.
+
 use std::time::Duration;
 
 use axum::{
@@ -28,6 +35,11 @@ use crate::{
     transport::http::handlers::console::diagnostics::authorize_console_session,
 };
 
+/// Upgrades an authorized realtime request into a WebSocket session.
+///
+/// # Errors
+/// Returns an error response when origin validation or console authorization
+/// fails before the WebSocket upgrade.
 pub(crate) async fn realtime_ws_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -94,6 +106,10 @@ fn realtime_origin_rejected_response(message: &'static str) -> Box<Response> {
     Box::new(runtime_status_response(tonic::Status::permission_denied(message)))
 }
 
+/// Returns the supported realtime protocol versions and method descriptors.
+///
+/// # Errors
+/// Returns an error response when console authorization fails.
 pub(crate) async fn realtime_methods_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -109,6 +125,11 @@ pub(crate) async fn realtime_methods_handler(
     })))
 }
 
+/// Negotiates a realtime HTTP handshake without opening a WebSocket.
+///
+/// # Errors
+/// Returns an error response when console authorization fails or the handshake
+/// payload is outside the supported protocol range.
 pub(crate) async fn realtime_handshake_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -124,6 +145,11 @@ pub(crate) async fn realtime_handshake_handler(
     Ok(Json(json!({ "accepted": accepted })))
 }
 
+/// Dispatches one realtime command over HTTP using the negotiated context.
+///
+/// # Errors
+/// Returns an error response when console authorization fails or the handshake
+/// payload is invalid for the current protocol.
 pub(crate) async fn realtime_command_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -398,6 +424,7 @@ fn realtime_error_response(error: RealtimeErrorEnvelope) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!(error))).into_response()
 }
 
+/// HTTP envelope for one negotiated realtime command dispatch.
 #[derive(Debug, Deserialize)]
 pub(crate) struct RealtimeHttpCommandRequest {
     pub(crate) handshake: RealtimeHandshakeRequest,

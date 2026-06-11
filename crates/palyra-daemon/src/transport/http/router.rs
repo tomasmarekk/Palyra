@@ -1,3 +1,10 @@
+//! Axum router assembly for daemon HTTP surfaces.
+//!
+//! This module is the single route table for admin, console, compatibility,
+//! realtime, canvas, health, and dashboard fallback endpoints. Paths and route
+//! layering are wire contract: change them only with the matching client,
+//! parity, and runtime-contract updates.
+
 use axum::{
     extract::DefaultBodyLimit,
     middleware,
@@ -14,6 +21,7 @@ use crate::{
     HTTP_MAX_REQUEST_BODY_BYTES,
 };
 
+/// Builds the HTTP router with all per-surface middleware and shared app state.
 pub(crate) fn build_router(state: AppState) -> Router {
     let admin_routes = Router::new()
         .route("/admin/v1/status", get(admin::core::admin_status_handler))

@@ -1,3 +1,8 @@
+//! HTTP handlers for signed canvas frames, runtime assets, bundle assets, and state.
+//!
+//! The query token and canvas id are validated before runtime access so bundle
+//! assets never reach the canvas store with unchecked path or token input.
+
 use axum::{
     extract::{Path, Query, State},
     http::{
@@ -15,7 +20,12 @@ use crate::{
     CANVAS_HTTP_MAX_TOKEN_BYTES,
 };
 
-#[allow(clippy::result_large_err)]
+/// Validates the signed canvas token passed as a query string.
+///
+/// # Errors
+/// Returns an error response when the token is blank or exceeds the HTTP byte
+/// budget accepted by the canvas runtime.
+#[expect(clippy::result_large_err, reason = "axum handlers return Response errors directly")]
 pub(crate) fn validate_canvas_http_token_query(token: &str) -> Result<(), Response> {
     if token.trim().is_empty() {
         return Err(runtime_status_response(tonic::Status::invalid_argument(
@@ -31,7 +41,12 @@ pub(crate) fn validate_canvas_http_token_query(token: &str) -> Result<(), Respon
     Ok(())
 }
 
-#[allow(clippy::result_large_err)]
+/// Validates a canvas id before it is used for runtime lookup.
+///
+/// # Errors
+/// Returns an error response when the id exceeds the path byte budget or is not
+/// a canonical ULID.
+#[expect(clippy::result_large_err, reason = "axum handlers return Response errors directly")]
 pub(crate) fn validate_canvas_http_canvas_id(canvas_id: &str) -> Result<(), Response> {
     if canvas_id.len() > CANVAS_HTTP_MAX_CANVAS_ID_BYTES {
         return Err(runtime_status_response(tonic::Status::invalid_argument(format!(
@@ -46,6 +61,11 @@ pub(crate) fn validate_canvas_http_canvas_id(canvas_id: &str) -> Result<(), Resp
     })
 }
 
+/// Serves the signed HTML frame for a canvas instance.
+///
+/// # Errors
+/// Returns an error response when id/token validation fails, when the runtime
+/// rejects the frame request, or when the CSP header cannot be encoded.
 pub(crate) async fn canvas_frame_handler(
     State(state): State<AppState>,
     Path(canvas_id): Path<String>,
@@ -65,6 +85,11 @@ pub(crate) async fn canvas_frame_handler(
     Ok(response)
 }
 
+/// Serves the signed JavaScript runtime for a canvas instance.
+///
+/// # Errors
+/// Returns an error response when id/token validation fails, when the runtime
+/// rejects the request, or when response headers cannot be encoded.
 pub(crate) async fn canvas_runtime_js_handler(
     State(state): State<AppState>,
     Query(query): Query<CanvasRuntimeQuery>,
@@ -78,6 +103,11 @@ pub(crate) async fn canvas_runtime_js_handler(
     canvas_asset_response(asset)
 }
 
+/// Serves the signed stylesheet runtime for a canvas instance.
+///
+/// # Errors
+/// Returns an error response when id/token validation fails, when the runtime
+/// rejects the request, or when response headers cannot be encoded.
 pub(crate) async fn canvas_runtime_css_handler(
     State(state): State<AppState>,
     Query(query): Query<CanvasRuntimeQuery>,
@@ -91,6 +121,11 @@ pub(crate) async fn canvas_runtime_css_handler(
     canvas_asset_response(asset)
 }
 
+/// Serves one signed canvas bundle asset by canvas id and asset path.
+///
+/// # Errors
+/// Returns an error response when id/token validation fails, when the runtime
+/// rejects the asset path, or when response headers cannot be encoded.
 pub(crate) async fn canvas_bundle_asset_handler(
     State(state): State<AppState>,
     Path((canvas_id, asset_path)): Path<(String, String)>,
@@ -110,6 +145,11 @@ pub(crate) async fn canvas_bundle_asset_handler(
     canvas_asset_response(asset)
 }
 
+/// Returns the latest canvas state after an optional version cursor.
+///
+/// # Errors
+/// Returns an error response when id/token validation fails or the runtime
+/// rejects the state lookup.
 pub(crate) async fn canvas_state_handler(
     State(state): State<AppState>,
     Path(canvas_id): Path<String>,
@@ -134,7 +174,7 @@ pub(crate) async fn canvas_state_handler(
     }
 }
 
-#[allow(clippy::result_large_err)]
+#[expect(clippy::result_large_err, reason = "axum handlers return Response errors directly")]
 fn canvas_asset_response(asset: CanvasAssetResponse) -> Result<Response, Response> {
     let mut response = asset.body.into_response();
     let content_type = HeaderValue::from_str(asset.content_type.as_str()).map_err(|error| {
@@ -147,7 +187,7 @@ fn canvas_asset_response(asset: CanvasAssetResponse) -> Result<Response, Respons
     Ok(response)
 }
 
-#[allow(clippy::result_large_err)]
+#[expect(clippy::result_large_err, reason = "axum handlers return Response errors directly")]
 fn apply_canvas_security_headers(headers: &mut HeaderMap, csp: &str) -> Result<(), Response> {
     let csp_header = HeaderValue::from_str(csp).map_err(|error| {
         runtime_status_response(tonic::Status::internal(format!(
