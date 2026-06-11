@@ -1,9 +1,19 @@
+//! Discord connector admin HTTP handlers.
+//!
+//! These endpoints keep Discord onboarding and account lifecycle operations
+//! behind the same admin auth and audit counters as the rest of channel admin.
+
 use crate::application::channels::providers::discord::{
     apply_discord_onboarding, build_discord_onboarding_preflight, perform_discord_account_logout,
     perform_discord_account_remove,
 };
 use crate::*;
 
+/// Runs a Discord onboarding preflight without persisting connector changes.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction, or
+/// onboarding preflight validation fails.
 pub(crate) async fn admin_discord_onboarding_probe_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -22,6 +32,11 @@ pub(crate) async fn admin_discord_onboarding_probe_handler(
     Ok(Json(response))
 }
 
+/// Applies Discord onboarding changes for a connector.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction, or
+/// onboarding application fails.
 pub(crate) async fn admin_discord_onboarding_apply_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -40,6 +55,11 @@ pub(crate) async fn admin_discord_onboarding_apply_handler(
     Ok(Json(response))
 }
 
+/// Logs out a Discord account selected by path parameter.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction, or
+/// account logout fails.
 pub(crate) async fn admin_discord_account_logout_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -59,6 +79,11 @@ pub(crate) async fn admin_discord_account_logout_handler(
     Ok(Json(response))
 }
 
+/// Logs out a Discord account selected by request body.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction, or
+/// account logout fails.
 pub(crate) async fn admin_discord_account_logout_action_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -78,6 +103,11 @@ pub(crate) async fn admin_discord_account_logout_action_handler(
     Ok(Json(response))
 }
 
+/// Removes a Discord account selected by path parameter.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction, or
+/// account removal fails.
 pub(crate) async fn admin_discord_account_remove_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -97,6 +127,11 @@ pub(crate) async fn admin_discord_account_remove_handler(
     Ok(Json(response))
 }
 
+/// Removes a Discord account selected by request body.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction, or
+/// account removal fails.
 pub(crate) async fn admin_discord_account_remove_action_handler(
     State(state): State<AppState>,
     headers: HeaderMap,

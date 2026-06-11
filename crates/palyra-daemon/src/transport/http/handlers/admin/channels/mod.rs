@@ -1,3 +1,8 @@
+//! Admin channel HTTP handlers.
+//!
+//! These endpoints expose connector status, queue operations, message
+//! inspection, mutation approval flows, and router diagnostics for operators.
+
 pub(crate) mod connectors;
 mod message_mutations;
 
@@ -13,6 +18,11 @@ pub(crate) use message_mutations::{
     channel_message_search_response,
 };
 
+/// Lists configured channel connectors for the admin console.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction, or
+/// connector enumeration fails.
 pub(crate) async fn admin_channels_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -30,6 +40,11 @@ pub(crate) async fn admin_channels_list_handler(
     Ok(Json(json!({ "connectors": connectors })))
 }
 
+/// Returns status for one configured channel connector.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction,
+/// connector-id normalization, or status payload construction fails.
 pub(crate) async fn admin_channel_status_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -48,6 +63,11 @@ pub(crate) async fn admin_channel_status_handler(
     Ok(Json(build_channel_status_payload(&state, connector_id.as_str())?))
 }
 
+/// Enables or disables a channel connector.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction,
+/// connector-id normalization, or connector state mutation fails.
 pub(crate) async fn admin_channel_set_enabled_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -71,6 +91,11 @@ pub(crate) async fn admin_channel_set_enabled_handler(
     Ok(Json(json!({ "connector": connector })))
 }
 
+/// Returns recent channel events and dead letters for a connector.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction,
+/// connector-id normalization, or log collection fails.
 pub(crate) async fn admin_channel_logs_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -89,6 +114,11 @@ pub(crate) async fn admin_channel_logs_handler(
     admin_channel_logs_response(&state, connector_id, query.limit)
 }
 
+/// Reads channel messages through the admin API.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction,
+/// connector-id normalization, provider access, or audit-event recording fails.
 pub(crate) async fn admin_channel_message_read_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -107,6 +137,11 @@ pub(crate) async fn admin_channel_message_read_handler(
     channel_message_read_response(&state, &context, connector_id, payload.request).await
 }
 
+/// Searches channel messages through the admin API.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction,
+/// connector-id normalization, provider search, or audit-event recording fails.
 pub(crate) async fn admin_channel_message_search_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -125,6 +160,12 @@ pub(crate) async fn admin_channel_message_search_handler(
     channel_message_search_response(&state, &context, connector_id, payload.request).await
 }
 
+/// Edits a channel message after policy and approval checks.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction,
+/// connector-id normalization, preview lookup, policy evaluation, approval
+/// validation, provider mutation, or audit-event recording fails.
 pub(crate) async fn admin_channel_message_edit_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -150,6 +191,12 @@ pub(crate) async fn admin_channel_message_edit_handler(
     .await
 }
 
+/// Deletes a channel message after policy and approval checks.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction,
+/// connector-id normalization, preview lookup, policy evaluation, approval
+/// validation, provider mutation, or audit-event recording fails.
 pub(crate) async fn admin_channel_message_delete_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -175,6 +222,12 @@ pub(crate) async fn admin_channel_message_delete_handler(
     .await
 }
 
+/// Adds a reaction to a channel message after policy and approval checks.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction,
+/// connector-id normalization, preview lookup, policy evaluation, approval
+/// validation, provider mutation, or audit-event recording fails.
 pub(crate) async fn admin_channel_message_react_add_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -201,6 +254,12 @@ pub(crate) async fn admin_channel_message_react_add_handler(
     .await
 }
 
+/// Removes a reaction from a channel message after policy and approval checks.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction,
+/// connector-id normalization, preview lookup, policy evaluation, approval
+/// validation, provider mutation, or audit-event recording fails.
 pub(crate) async fn admin_channel_message_react_remove_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -227,6 +286,11 @@ pub(crate) async fn admin_channel_message_react_remove_handler(
     .await
 }
 
+/// Returns recent channel events and dead letters using a JSON request body.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction,
+/// connector-id normalization, or log collection fails.
 pub(crate) async fn admin_channel_logs_query_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -244,6 +308,11 @@ pub(crate) async fn admin_channel_logs_query_handler(
     admin_channel_logs_response(&state, payload.connector_id, payload.limit)
 }
 
+/// Refreshes provider health for a channel connector.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction,
+/// connector-id normalization, or provider health refresh fails.
 pub(crate) async fn admin_channel_health_refresh_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -269,7 +338,10 @@ pub(crate) async fn admin_channel_health_refresh_handler(
     Ok(Json(payload))
 }
 
-#[allow(clippy::result_large_err)]
+#[expect(
+    clippy::result_large_err,
+    reason = "axum handler helpers return Response directly to preserve transport contracts"
+)]
 fn admin_channel_logs_response(
     state: &AppState,
     connector_id: String,
@@ -290,6 +362,12 @@ fn admin_channel_logs_response(
     })))
 }
 
+/// Pauses outbound queue processing for one connector.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction,
+/// connector-id normalization, queue mutation, or status payload construction
+/// fails.
 pub(crate) async fn admin_channel_queue_pause_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -322,6 +400,12 @@ pub(crate) async fn admin_channel_queue_pause_handler(
     Ok(Json(payload))
 }
 
+/// Resumes outbound queue processing for one connector.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction,
+/// connector-id normalization, queue mutation, or status payload construction
+/// fails.
 pub(crate) async fn admin_channel_queue_resume_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -350,6 +434,12 @@ pub(crate) async fn admin_channel_queue_resume_handler(
     Ok(Json(payload))
 }
 
+/// Drains due outbound work for one connector.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction,
+/// connector-id normalization, queue drain execution, or status payload
+/// construction fails.
 pub(crate) async fn admin_channel_queue_drain_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -379,6 +469,12 @@ pub(crate) async fn admin_channel_queue_drain_handler(
     Ok(Json(payload))
 }
 
+/// Replays one dead-lettered channel event.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction,
+/// connector-id normalization, dead-letter replay, or status payload
+/// construction fails.
 pub(crate) async fn admin_channel_dead_letter_replay_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -410,6 +506,12 @@ pub(crate) async fn admin_channel_dead_letter_replay_handler(
     Ok(Json(payload))
 }
 
+/// Discards one dead-lettered channel event.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction,
+/// connector-id normalization, dead-letter discard, or status payload
+/// construction fails.
 pub(crate) async fn admin_channel_dead_letter_discard_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -441,6 +543,11 @@ pub(crate) async fn admin_channel_dead_letter_discard_handler(
     Ok(Json(payload))
 }
 
+/// Runs a provider connectivity test for one connector.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction,
+/// connector-id normalization, or provider test execution fails.
 pub(crate) async fn admin_channel_test_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -461,6 +568,11 @@ pub(crate) async fn admin_channel_test_handler(
     Ok(Json(response))
 }
 
+/// Sends a provider test message for one connector.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction,
+/// connector-id normalization, or provider test-send execution fails.
 pub(crate) async fn admin_channel_test_send_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -481,6 +593,11 @@ pub(crate) async fn admin_channel_test_send_handler(
     Ok(Json(response))
 }
 
+/// Returns the active channel-router rules and config hash.
+///
+/// # Errors
+/// Returns an error response when admin authorization or context extraction
+/// fails.
 pub(crate) async fn admin_channel_router_rules_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -502,6 +619,11 @@ pub(crate) async fn admin_channel_router_rules_handler(
     })))
 }
 
+/// Returns channel-router validation warnings and config hash.
+///
+/// # Errors
+/// Returns an error response when admin authorization or context extraction
+/// fails.
 pub(crate) async fn admin_channel_router_warnings_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -521,6 +643,11 @@ pub(crate) async fn admin_channel_router_warnings_handler(
     })))
 }
 
+/// Previews channel-router resolution for an operator-supplied message.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction, or
+/// preview input validation fails.
 pub(crate) async fn admin_channel_router_preview_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -540,6 +667,11 @@ pub(crate) async fn admin_channel_router_preview_handler(
     Ok(Json(json!({ "preview": preview })))
 }
 
+/// Returns channel-router pairing records, optionally scoped to a channel.
+///
+/// # Errors
+/// Returns an error response when admin authorization or context extraction
+/// fails.
 pub(crate) async fn admin_channel_router_pairings_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -561,6 +693,11 @@ pub(crate) async fn admin_channel_router_pairings_handler(
     })))
 }
 
+/// Mints a channel-router pairing code for a target channel.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction,
+/// channel normalization, or pairing-code creation fails.
 pub(crate) async fn admin_channel_router_pairing_code_mint_handler(
     State(state): State<AppState>,
     headers: HeaderMap,

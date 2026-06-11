@@ -1,3 +1,9 @@
+//! Admin channel message read/search and mutation response builders.
+//!
+//! Message mutations pass through provider previews, policy evaluation, and
+//! one-shot approvals before dispatch so high-risk connector edits remain
+//! auditable and deny-by-default.
+
 use super::*;
 use crate::application::channels::providers::{
     channel_message_policy_action, channel_message_required_permissions,
@@ -12,6 +18,11 @@ use palyra_connectors::ConnectorMessageRecord;
 const CHANNEL_MESSAGE_APPROVAL_TIMEOUT_SECONDS: u32 = 15 * 60;
 const CHANNEL_MESSAGE_APPROVAL_POLICY_ID: &str = "discord.message.mutation.approval.v1";
 
+/// Reads channel messages and records an admin console audit event.
+///
+/// # Errors
+/// Returns an error response when connector-id normalization, provider access,
+/// or audit-event recording fails.
 pub(crate) async fn channel_message_read_response(
     state: &AppState,
     context: &RequestContext,
@@ -42,6 +53,11 @@ pub(crate) async fn channel_message_read_response(
     Ok(Json(json!({ "result": result })))
 }
 
+/// Searches channel messages and records an admin console audit event.
+///
+/// # Errors
+/// Returns an error response when connector-id normalization, provider search,
+/// or audit-event recording fails.
 pub(crate) async fn channel_message_search_response(
     state: &AppState,
     context: &RequestContext,
@@ -73,6 +89,12 @@ pub(crate) async fn channel_message_search_response(
     Ok(Json(json!({ "result": result })))
 }
 
+/// Edits a channel message after preview, policy, and approval checks.
+///
+/// # Errors
+/// Returns an error response when connector-id normalization, preview lookup,
+/// policy evaluation, approval validation, provider mutation, or audit-event
+/// recording fails.
 pub(crate) async fn channel_message_edit_response(
     state: &AppState,
     context: &RequestContext,
@@ -132,6 +154,12 @@ pub(crate) async fn channel_message_edit_response(
     Ok(Json(json!({ "result": result })))
 }
 
+/// Deletes a channel message after preview, policy, and approval checks.
+///
+/// # Errors
+/// Returns an error response when connector-id normalization, preview lookup,
+/// policy evaluation, approval validation, provider mutation, or audit-event
+/// recording fails.
 pub(crate) async fn channel_message_delete_response(
     state: &AppState,
     context: &RequestContext,
@@ -191,6 +219,12 @@ pub(crate) async fn channel_message_delete_response(
     Ok(Json(json!({ "result": result })))
 }
 
+/// Adds or removes a channel message reaction after authorization checks.
+///
+/// # Errors
+/// Returns an error response when connector-id normalization, preview lookup,
+/// policy evaluation, approval validation, provider mutation, or audit-event
+/// recording fails.
 pub(crate) async fn channel_message_reaction_response(
     state: &AppState,
     context: &RequestContext,

@@ -1,5 +1,16 @@
+//! Core admin HTTP handlers for runtime diagnostics and run control.
+//!
+//! These handlers are intentionally thin adapters around daemon runtime
+//! services so auth, counters, and response shaping stay consistent with the
+//! rest of the transport layer.
+
 use crate::*;
 
+/// Returns the aggregate admin status document for the daemon.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction,
+/// runtime snapshot collection, serialization, or diagnostics assembly fails.
 pub(crate) async fn admin_status_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -108,6 +119,11 @@ pub(crate) async fn admin_status_handler(
     Ok(Json(payload))
 }
 
+/// Renders daemon runtime metrics in Prometheus text format.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction, or
+/// runtime metric snapshot collection fails.
 pub(crate) async fn admin_metrics_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -141,6 +157,11 @@ pub(crate) async fn admin_metrics_handler(
     Ok(([(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], body).into_response())
 }
 
+/// Returns the most recent gateway journal records.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction, or
+/// journal snapshot collection fails.
 pub(crate) async fn admin_journal_recent_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -161,6 +182,11 @@ pub(crate) async fn admin_journal_recent_handler(
     Ok(Json(snapshot))
 }
 
+/// Explains the policy decision for an operator-supplied principal/action pair.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction, or
+/// policy evaluation fails.
 pub(crate) async fn admin_policy_explain_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -255,6 +281,11 @@ fn requested_tool_for_admin_policy_explain(request: &PolicyRequest) -> Option<St
     }
 }
 
+/// Returns an orchestrator run status snapshot for admin diagnostics.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction,
+/// run-id validation, run-id resolution, or status snapshot lookup fails.
 pub(crate) async fn admin_run_status_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -286,6 +317,11 @@ pub(crate) async fn admin_run_status_handler(
     Ok(Json(snapshot))
 }
 
+/// Returns a paginated orchestrator run tape for admin diagnostics.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction,
+/// run-id validation, run-id resolution, or tape snapshot lookup fails.
 pub(crate) async fn admin_run_tape_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -329,9 +365,15 @@ async fn resolve_admin_diagnostics_run_id(
                  objective or routine output, use orchestrator_run_id when available or retry after \
                  the run links one."
             )))
-        })
+    })
 }
 
+/// Requests cancellation of an orchestrator run from the admin API.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction,
+/// run-id validation, cancellation request recording, or cleanup signaling
+/// fails.
 pub(crate) async fn admin_run_cancel_handler(
     State(state): State<AppState>,
     headers: HeaderMap,

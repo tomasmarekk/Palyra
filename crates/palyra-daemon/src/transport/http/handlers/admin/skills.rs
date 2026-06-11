@@ -1,5 +1,16 @@
+//! Admin skill-status handlers.
+//!
+//! The endpoints here mutate skill execution status and always record a
+//! corresponding operator event so quarantine and re-enable actions remain
+//! auditable.
+
 use crate::*;
 
+/// Marks a skill version as quarantined.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction,
+/// input normalization, clock access, persistence, or event recording fails.
 pub(crate) async fn admin_skill_quarantine_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -48,6 +59,12 @@ pub(crate) async fn admin_skill_quarantine_handler(
     Ok(Json(skill_status_response(record)))
 }
 
+/// Re-enables a quarantined skill version after explicit operator override.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction,
+/// override acknowledgement, input normalization, clock access, persistence,
+/// or event recording fails.
 pub(crate) async fn admin_skill_enable_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -101,6 +118,7 @@ pub(crate) async fn admin_skill_enable_handler(
     Ok(Json(skill_status_response(record)))
 }
 
+/// Converts a persisted skill status record into the HTTP response contract.
 pub(crate) fn skill_status_response(record: SkillStatusRecord) -> SkillStatusResponse {
     SkillStatusResponse {
         skill_id: record.skill_id,
