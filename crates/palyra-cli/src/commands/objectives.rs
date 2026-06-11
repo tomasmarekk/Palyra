@@ -3,6 +3,8 @@
 //! Shares routine argument enums and the natural-language schedule parser
 //! with the routines command surface.
 
+use std::io::Write;
+
 use palyra_control_plane as control_plane;
 use serde_json::{json, Map, Value};
 
@@ -369,48 +371,78 @@ fn emit_objectives_list(payload: &Value, json: bool) -> Result<()> {
     if json {
         return output::print_json_pretty(payload, "failed to encode objectives list as JSON");
     }
-    let objectives =
-        payload.pointer("/objectives").and_then(Value::as_array).cloned().unwrap_or_default();
-    if objectives.is_empty() {
-        println!("No objectives found.");
-        return Ok(());
+    for line in objectives_list_text_lines(payload) {
+        println!("{line}");
     }
-    for objective in objectives {
-        let objective_id = json_optional_string_at(&objective, "/objective_id").unwrap_or_default();
-        let kind =
-            json_optional_string_at(&objective, "/kind").unwrap_or_else(|| "unknown".to_owned());
-        let state =
-            json_optional_string_at(&objective, "/state").unwrap_or_else(|| "unknown".to_owned());
-        let name = json_optional_string_at(&objective, "/name").unwrap_or_default();
-        let focus = json_optional_string_at(&objective, "/current_focus")
-            .unwrap_or_else(|| "No focus.".to_owned());
-        println!("{objective_id} [{kind}/{state}] {name}");
-        println!("  focus: {focus}");
-    }
-    Ok(())
+    std::io::stdout().flush().context("stdout flush failed")
 }
 
-fn emit_objective_envelope(_event: &str, payload: &Value, json: bool) -> Result<()> {
+fn emit_objective_envelope(event: &str, payload: &Value, json: bool) -> Result<()> {
     if json {
         return output::print_json_pretty(
             &objective_envelope_output_value(payload),
             "failed to encode objective output as JSON",
         );
     }
+    for line in objective_envelope_text_lines(event, payload) {
+        println!("{line}");
+    }
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn objectives_list_text_lines(payload: &Value) -> Vec<String> {
+    let objectives =
+        payload.pointer("/objectives").and_then(Value::as_array).cloned().unwrap_or_default();
+    let mut lines = Vec::with_capacity(1 + objectives.len());
+    lines.push(format!(
+        "objectives.list count={} next_after={}",
+        objectives.len(),
+        json_optional_string_at(payload, "/next_after_objective_id")
+            .unwrap_or_else(|| "none".to_owned())
+    ));
+    for objective in objectives {
+        lines.push(objective_text_line("objectives.objective", &objective));
+    }
+    lines
+}
+
+fn objective_envelope_text_lines(event: &str, payload: &Value) -> Vec<String> {
     let objective = payload.pointer("/objective").unwrap_or(payload);
+    let mut lines = vec![objective_text_line(event, objective)];
+    if let Some(next_step) = json_optional_string_at(objective, "/next_recommended_step") {
+        lines.push(format!(
+            "{event}.next id={} value=\"{}\"",
+            objective_id_text(objective),
+            quote_text_field(next_step.as_str())
+        ));
+    }
+    lines
+}
+
+fn objective_text_line(prefix: &str, objective: &Value) -> String {
     let objective_id = json_optional_string_at(objective, "/objective_id").unwrap_or_default();
     let kind = json_optional_string_at(objective, "/kind").unwrap_or_else(|| "unknown".to_owned());
     let state =
         json_optional_string_at(objective, "/state").unwrap_or_else(|| "unknown".to_owned());
     let name = json_optional_string_at(objective, "/name").unwrap_or_default();
-    println!("{objective_id} [{kind}/{state}] {name}");
-    if let Some(focus) = json_optional_string_at(objective, "/current_focus") {
-        println!("focus: {focus}");
-    }
-    if let Some(next_step) = json_optional_string_at(objective, "/next_recommended_step") {
-        println!("next: {next_step}");
-    }
-    Ok(())
+    let focus =
+        json_optional_string_at(objective, "/current_focus").unwrap_or_else(|| "none".to_owned());
+    format!(
+        "{prefix} id={} kind={} state={} name=\"{}\" focus=\"{}\"",
+        objective_id,
+        kind,
+        state,
+        quote_text_field(name.as_str()),
+        quote_text_field(focus.as_str())
+    )
+}
+
+fn objective_id_text(objective: &Value) -> String {
+    json_optional_string_at(objective, "/objective_id").unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn quote_text_field(value: &str) -> String {
+    value.replace('\r', " ").replace('\n', " ").replace('"', "\\\"")
 }
 
 fn objective_envelope_output_value(payload: &Value) -> Value {
@@ -536,6 +568,41 @@ mod tests {
         assert_eq!(
             payload.get("execution_posture").and_then(Value::as_str),
             Some("sensitive_tools")
+        );
+    }
+
+    #[test]
+    fn objectives_list_text_uses_machine_readable_empty_state() {
+        let payload = json!({
+            "objectives": [],
+            "next_after_objective_id": null,
+        });
+
+        assert_eq!(
+            objectives_list_text_lines(&payload),
+            vec!["objectives.list count=0 next_after=none".to_owned()]
+        );
+    }
+
+    #[test]
+    fn objective_envelope_text_uses_prefixed_lines() {
+        let payload = json!({
+            "objective": {
+                "objective_id": "obj_123",
+                "kind": "heartbeat",
+                "state": "active",
+                "name": "Nightly check",
+                "current_focus": "Review queue",
+                "next_recommended_step": "Wait for next run"
+            }
+        });
+
+        assert_eq!(
+            objective_envelope_text_lines("objectives.show", &payload),
+            vec![
+                "objectives.show id=obj_123 kind=heartbeat state=active name=\"Nightly check\" focus=\"Review queue\"".to_owned(),
+                "objectives.show.next id=obj_123 value=\"Wait for next run\"".to_owned(),
+            ]
         );
     }
 
