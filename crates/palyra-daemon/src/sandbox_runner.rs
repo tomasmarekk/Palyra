@@ -3639,6 +3639,8 @@ fn spawn_background_process(
         "auto_backgrounded": auto_backgrounded,
         "auto_background_reason": auto_background_reason,
         "foreground_request_backgrounded": auto_backgrounded,
+        "run_owned_lifetime": true,
+        "run_lifecycle_note": "This background process is owned by the current agent run. Palyra automatically stops run-owned background processes when the run reaches a terminal state, so do not tell the user this PID or server will keep running after the final answer unless you explicitly stopped it first or a future detached-process feature says otherwise.",
         "started": true,
         "completed": false,
         "startup_success": true,
@@ -3651,7 +3653,7 @@ fn spawn_background_process(
         "background_lifetime_adjusted": background_lifetime_adjusted,
         "background_lifetime_adjustment_reason": background_lifetime_adjustment_reason,
         "background_lifetime_note": format!(
-            "{}Palyra will auto-terminate this background process after {lifetime_ms}ms; omit timeout_ms for the default long-lived background server window, set timeout_ms up to {max_lifetime_ms}ms within the operator-configured tool execution timeout for long browser verification loops, and use cleanup.portable_stop_command when finished.",
+            "{}Palyra will auto-terminate this run-owned background process after {lifetime_ms}ms or when the current agent run reaches a terminal state, whichever happens first; omit timeout_ms for the default long-lived background server window, set timeout_ms up to {max_lifetime_ms}ms within the operator-configured tool execution timeout for long browser verification loops, and use cleanup.portable_stop_command when finished.",
             background_lifetime_adjustment_note
         ),
         "process_handle": {
@@ -7279,11 +7281,30 @@ mod tests {
             output.get("background_lifetime_adjusted").and_then(serde_json::Value::as_bool),
             Some(false)
         );
+        assert_eq!(
+            output.get("run_owned_lifetime").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(output
+            .get("run_lifecycle_note")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .contains("terminal state"));
+        assert!(output
+            .get("run_lifecycle_note")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .contains("final answer"));
         assert!(output
             .get("background_lifetime_note")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .contains("auto-terminate"));
+        assert!(output
+            .get("background_lifetime_note")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .contains("terminal state"));
         assert!(output
             .get("background_lifetime_note")
             .and_then(serde_json::Value::as_str)

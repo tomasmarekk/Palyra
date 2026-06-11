@@ -721,7 +721,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                         "background",
                         json!({
                             "type":"boolean",
-                            "description":"Start an allowlisted long-running local process and return immediately. Use this instead of shell background syntax or nohup for temporary dev servers. The runtime fails fast if the process exits during startup and returns bounded startup stdout/stderr snapshots, which may include a server URL or selected dynamic port. Background lifetime is bounded by the operator-configured tool execution timeout and the runtime hard cap. Stop it with the returned cleanup.portable_stop_command and verify cleanup with cleanup.portable_status_command. For local browser verification, bind to 127.0.0.1 with an explicit port and omit timeout_ms unless a specific long lifetime is needed; short background timeout_ms values are raised to the safe minimum when the execution cap permits."
+                            "description":"Start an allowlisted long-running local process and return immediately. Use this instead of shell background syntax or nohup for temporary dev servers. The runtime fails fast if the process exits during startup and returns bounded startup stdout/stderr snapshots, which may include a server URL or selected dynamic port. Background lifetime is run-owned: Palyra automatically stops these processes when the agent run reaches a terminal state, and may also stop them at the operator-configured tool execution timeout/runtime hard cap. Stop it with the returned cleanup.portable_stop_command and verify cleanup with cleanup.portable_status_command. For local browser verification, bind to 127.0.0.1 with an explicit port and omit timeout_ms unless a specific long lifetime is needed; short background timeout_ms values are raised to the safe minimum when the execution cap permits."
                         }),
                     ),
                     (
@@ -1351,6 +1351,7 @@ mod tests {
             .expect("background description should be visible to models");
         assert!(background_description.contains("omit timeout_ms"));
         assert!(background_description.contains("safe minimum"));
+        assert!(background_description.contains("terminal state"));
 
         let timeout_description = entry
             .input_schema
