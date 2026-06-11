@@ -1,3 +1,20 @@
+//! Session and run-launch scoping for workspace tool roots.
+//!
+//! Workspace tools operate on an ordered list of workspace roots. This module
+//! derives that list from two dynamic sources layered over the agent's
+//! configured roots: the run-launch CLI context (launch cwd, extra roots, and
+//! allowlisted path env keys carried in the run's parameter delta) and the
+//! session's project focus (the directory the operator is currently working
+//! in, resolved from stored focus paths).
+//!
+//! Every dynamic root is canonicalized and validated before use: launch roots
+//! must be existing absolute directories outside the OS deny-list in
+//! `protected_launch_workspace_root`, and focus directories must resolve
+//! (symlinks included) to a strict descendant of a configured root. The
+//! containment decisions made here feed the security checks in
+//! `workspace_file` and `workspace_patch`; treat any semantic change as a
+//! security change.
+
 use std::{
     collections::BTreeMap,
     fs,
@@ -10,9 +27,13 @@ use serde::Deserialize;
 use crate::agents::AgentResolutionSource;
 use crate::gateway::GatewayRuntimeState;
 
+/// Session-focused directory selected as the preferred workspace root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ActiveWorkspaceRoot {
+    /// Canonicalized focus directory.
     pub(crate) root: PathBuf,
+    /// Normalized `/`-separated path of [`Self::root`] relative to the agent
+    /// workspace root it lives in; never `"."`.
     pub(crate) relative_path: String,
 }
 
@@ -34,8 +55,17 @@ struct RunLaunchWorkspaceRoots {
     extra_roots: Vec<PathBuf>,
 }
 
+/// Launch-context env keys whose values may contribute filesystem roots.
+/// Strict allowlist: every other key (including credential-bearing ones) is
+/// dropped before its value is ever interpreted as a path.
 const RUN_LAUNCH_SAFE_PATH_ENV_KEYS: &[&str] = &["PALYRA_E2E_HOME", "PALYRA_E2E_OS_ROOT"];
 
+/// Resolves the session's active workspace root from its stored project
+/// focus paths, if any focus resolves inside `workspace_roots`.
+///
+/// # Errors
+/// Returns an error when the session project-context state cannot be loaded
+/// from the runtime.
 pub(crate) async fn session_active_workspace_root(
     runtime_state: &Arc<GatewayRuntimeState>,
     session_id: &str,
@@ -50,6 +80,8 @@ pub(crate) async fn session_active_workspace_root(
     Ok(active_workspace_root_from_focus_paths(workspace_roots, state.focus_paths.as_slice()))
 }
 
+/// Merges validated run-launch roots (launch cwd first, then explicit extra
+/// roots) ahead of `workspace_roots`, dropping duplicates.
 pub(crate) async fn workspace_roots_with_run_launch_context(
     runtime_state: &Arc<GatewayRuntimeState>,
     run_id: &str,
@@ -59,6 +91,8 @@ pub(crate) async fn workspace_roots_with_run_launch_context(
     merge_launch_workspace_roots(workspace_roots, launch_roots)
 }
 
+/// [`workspace_roots_with_run_launch_context`] variant that also receives how
+/// the agent was resolved; the resolution source is currently ignored.
 pub(crate) async fn workspace_roots_with_run_launch_context_for_agent_source(
     runtime_state: &Arc<GatewayRuntimeState>,
     run_id: &str,
@@ -69,6 +103,8 @@ pub(crate) async fn workspace_roots_with_run_launch_context_for_agent_source(
     merge_launch_workspace_roots(workspace_roots, launch_roots)
 }
 
+/// Extracts allowlisted path-valued env entries from the run's launch
+/// context, validated and canonicalized like launch workspace roots.
 pub(crate) async fn run_launch_context_path_env(
     runtime_state: &Arc<GatewayRuntimeState>,
     run_id: &str,
@@ -92,6 +128,8 @@ async fn run_launch_context_workspace_roots(
     runtime_state: &Arc<GatewayRuntimeState>,
     run_id: &str,
 ) -> RunLaunchWorkspaceRoots {
+    // Launch context is optional and best-effort: a missing run, missing
+    // parameter delta, or unparseable JSON simply contributes no extra roots.
     let Some(run) =
         runtime_state.orchestrator_run_status_snapshot(run_id.to_owned()).await.ok().flatten()
     else {
@@ -140,6 +178,11 @@ fn push_launch_workspace_root(roots: &mut Vec<PathBuf>, raw_root: &str) {
     }
 }
 
+/// Validates one raw launch-context path: control-character free, absolute,
+/// canonicalizable to an existing directory, and not a protected OS location.
+///
+/// Launch roots are advisory, so invalid entries are skipped (`None`) rather
+/// than failing the run.
 fn canonical_launch_workspace_root(raw_root: &str) -> Option<PathBuf> {
     let raw_root = raw_root.trim();
     if raw_root.is_empty() || raw_root.chars().any(char::is_control) {
@@ -149,9 +192,8 @@ fn canonical_launch_workspace_root(raw_root: &str) -> Option<PathBuf> {
     if !requested.is_absolute() {
         return None;
     }
-    let canonical = match fs::canonicalize(requested) {
-        Ok(path) => path,
-        Err(_) => return None,
+    let Ok(canonical) = fs::canonicalize(requested) else {
+        return None;
     };
     let Ok(metadata) = fs::metadata(canonical.as_path()) else {
         return None;
@@ -162,6 +204,9 @@ fn canonical_launch_workspace_root(raw_root: &str) -> Option<PathBuf> {
     Some(canonical)
 }
 
+/// Orders roots as launch cwd, then explicit launch roots, then agent roots,
+/// deduplicated; root index 0 is the default target for relative paths, so
+/// this precedence is pinned by tests.
 fn merge_launch_workspace_roots(
     workspace_roots: &[PathBuf],
     launch_roots: RunLaunchWorkspaceRoots,
@@ -196,6 +241,10 @@ fn push_unique_workspace_root(roots: &mut Vec<PathBuf>, candidate: PathBuf) {
     roots.push(candidate);
 }
 
+/// Root equality for deduplication: canonicalization makes symlinked
+/// duplicates equal; on Windows a case-insensitive, separator-normalized
+/// comparison additionally matches aliases of roots that cannot be
+/// canonicalized (e.g. not-yet-created directories).
 fn same_workspace_root(left: &Path, right: &Path) -> bool {
     let left = fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
     let right = fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
@@ -214,6 +263,10 @@ fn same_workspace_root(left: &Path, right: &Path) -> bool {
     }
 }
 
+/// Deny-list of OS locations that may never become workspace roots, even when
+/// a launch context asks for them: drive/filesystem roots and core system
+/// directories. Last line of defense before a launch-supplied path would
+/// grant workspace-tool access.
 fn protected_launch_workspace_root(path: &Path) -> bool {
     #[cfg(windows)]
     {
@@ -239,6 +292,12 @@ fn protected_launch_workspace_root(path: &Path) -> bool {
     }
 }
 
+/// Picks the first focus path that resolves to an existing directory strictly
+/// inside one of `workspace_roots`.
+///
+/// The candidate (or its nearest existing ancestor, for file-like focus
+/// paths) is canonicalized before the containment check, so a focus path that
+/// traverses a symlink out of the workspace is rejected rather than followed.
 pub(crate) fn active_workspace_root_from_focus_paths(
     workspace_roots: &[PathBuf],
     focus_paths: &[String],
@@ -263,6 +322,9 @@ pub(crate) fn active_workspace_root_from_focus_paths(
             let Ok(directory) = fs::canonicalize(directory) else {
                 continue;
             };
+            // Containment is checked on the canonicalized directory so a
+            // symlinked focus cannot escape the root; the root itself is not
+            // a narrowing focus, so it is skipped.
             if directory == *root || !directory.starts_with(root) {
                 continue;
             }
@@ -280,6 +342,8 @@ pub(crate) fn active_workspace_root_from_focus_paths(
     None
 }
 
+/// Returns true when `path` is already expressed relative to the agent root
+/// and points at or below the active focus directory.
 pub(crate) fn relative_path_already_targets_active_root(
     path: &str,
     active: &ActiveWorkspaceRoot,
@@ -290,6 +354,13 @@ pub(crate) fn relative_path_already_targets_active_root(
     path == active.relative_path || path.starts_with(format!("{}/", active.relative_path).as_str())
 }
 
+/// Heuristic deciding whether a bare relative path should be re-rooted under
+/// the active focus directory.
+///
+/// A path qualifies only when its parent directory already exists inside the
+/// (canonicalized) active root. Paths that already target the focus keep
+/// their original meaning, and top-level workspace paths whose parent exists
+/// only at the outer root are never silently nested under the focus.
 pub(crate) fn relative_path_should_use_active_root(
     path: &str,
     active: &ActiveWorkspaceRoot,
@@ -314,6 +385,12 @@ pub(crate) fn relative_path_should_use_active_root(
     canonical_parent.is_dir() && canonical_parent.starts_with(canonical_active_root.as_path())
 }
 
+/// Returns true when an explicit `workspace_root` override refers to the
+/// active focus directory itself.
+///
+/// Accepted spellings: the canonicalized absolute path of the focus, its full
+/// root-relative path, or its bare basename (operators commonly pass just the
+/// project directory name).
 pub(crate) fn workspace_root_override_targets_active_root(
     workspace_root: &str,
     active: &ActiveWorkspaceRoot,
@@ -350,6 +427,8 @@ fn canonicalize_workspace_roots(workspace_roots: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Walks up from `candidate` to the closest existing directory (a file maps
+/// to its parent), giving up rather than climbing past `workspace_root`.
 fn nearest_existing_directory(candidate: &Path, workspace_root: &Path) -> Option<PathBuf> {
     let mut cursor = candidate.to_path_buf();
     loop {
@@ -365,6 +444,12 @@ fn nearest_existing_directory(candidate: &Path, workspace_root: &Path) -> Option
     }
 }
 
+/// Normalizes a workspace-relative path to `/`-separated form (or `"."`),
+/// stripping the `workspace/` alias prefix models commonly emit.
+///
+/// Returns `None` for absolute paths and for any path containing `..`, a root,
+/// or a drive prefix, so callers can join the result onto a workspace root
+/// without re-checking traversal.
 fn normalize_relative_workspace_path(path: &str) -> Option<String> {
     let normalized = path.trim().replace('\\', "/");
     let without_workspace_alias = normalized

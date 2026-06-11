@@ -1,3 +1,16 @@
+//! `palyra.fs.apply_patch` tool: scoped patch application over agent roots.
+//!
+//! This module owns input validation, workspace-root scoping (explicit
+//! override, session focus, launch context), and patch header path
+//! normalization; the patch grammar parsing and application engine lives in
+//! `palyra_common::workspace_patch`. Every request is planned as a dry run
+//! first, and real writes go through `checkpoint_flow`, which brackets the
+//! apply with preflight/post-change checkpoints and risk assessment.
+//!
+//! Error strings, recovery hints, and the grammar hint are pinned verbatim
+//! by tests; root containment decisions are security-sensitive. Keep both
+//! byte-identical unless tests move with the change.
+
 mod checkpoint_flow;
 
 use std::{
@@ -36,8 +49,11 @@ use crate::{
 
 use checkpoint_flow::WorkspacePatchMutationRequest;
 
+/// Model-facing patch grammar primer attached to every failure payload so
+/// the model can self-repair; pinned verbatim by tests.
 const WORKSPACE_PATCH_GRAMMAR_HINT: &str = "Use a complete Palyra patch document: begin with exactly '*** Begin Patch', then operation headers like '*** Add File: path', '*** Replace File: path', '*** Replace Line: path', or '*** Update File: path', end with exactly one '*** End Patch'. Never send a partial or truncated patch. For large file creation or multi-file changes, split work into multiple smaller complete apply_patch calls. Add-file and replace-file content lines may start with '+', and a bare '+' or '+ ' writes a blank line. Use Add File only for missing files. If search/read_file confirmed one exact target line, use Replace Line with exactly one '-' old line and one '+' new line. If an Update File hunk fails with context not found, read the current file and retry with Replace Line for a unique exact line, fresh context hunks, or Replace File plus the full intended file content. Update-file hunks must start with '@@'; hunk lines should start with ' ', '+', or '-', and a bare empty hunk line is accepted as blank context. To edit file content that itself begins with '-' or '+', prefix it directly with the hunk marker, for example '-- markdown item' removes '- markdown item' and '++value' adds '+value'. JSON files are validated after patch planning; if JSON validation fails, retry with the complete valid JSON file content.";
 
+/// Borrowed execution context for one apply_patch invocation.
 pub(crate) struct WorkspacePatchToolRequest<'a> {
     pub(crate) principal: &'a str,
     pub(crate) device_id: &'a str,
@@ -48,14 +64,23 @@ pub(crate) struct WorkspacePatchToolRequest<'a> {
     pub(crate) input_json: &'a [u8],
 }
 
+/// Scoping decision for one patch application.
 #[derive(Debug, Clone)]
 struct ResolvedWorkspacePatchRoots {
+    /// Root(s) the patch operations are resolved against.
     roots: Vec<PathBuf>,
+    /// Canonical agent roots enforced as containment constraints when the
+    /// patch runs against a narrowed override/focus root; empty means
+    /// `roots` are the agent roots themselves.
     canonical_constraint_roots: Vec<PathBuf>,
+    /// Paths of the narrowed root relative to each agent root, prepended to
+    /// touched paths during risk assessment so prefix rules match as if the
+    /// patch ran from the agent root.
     risk_path_prefixes: Vec<String>,
 }
 
 impl<'a> WorkspacePatchToolRequest<'a> {
+    /// Builds a patch request from the generic tool runtime context.
     pub(crate) fn from_runtime_context(
         context: crate::gateway::ToolRuntimeExecutionContext<'a>,
         proposal_id: &'a str,
@@ -73,6 +98,13 @@ impl<'a> WorkspacePatchToolRequest<'a> {
     }
 }
 
+/// Executes the apply_patch tool end to end: validates input, resolves the
+/// patch scope, plans the patch (always a dry run first), and either returns
+/// the plan (`dry_run`) or hands off to `checkpoint_flow` for the real
+/// mutation.
+///
+/// Never fails as a function; failures are reported in the outcome's error
+/// string together with recovery and grammar hints.
 pub(crate) async fn execute_workspace_patch_tool(
     runtime_state: &Arc<GatewayRuntimeState>,
     request: WorkspacePatchToolRequest<'_>,
@@ -261,6 +293,13 @@ pub(crate) async fn execute_workspace_patch_tool(
     let workspace_roots = resolved_workspace_roots.roots;
     let canonical_constraint_roots = resolved_workspace_roots.canonical_constraint_roots;
     let risk_path_prefixes = resolved_workspace_roots.risk_path_prefixes;
+    // AIDEV-NOTE: `planning_request` above was built from the
+    // pre-normalization patch, so the planned outcome (dry_run output, risk
+    // assessment, and the preflight checkpoint's files_touched) can disagree
+    // with this normalized patch that checkpoint_flow actually applies when
+    // header paths get rewritten (e.g. duplicated root basenames stripped).
+    // Normalizing before building planning_request would change dry-run
+    // outputs, so it needs a deliberate behavior change with test updates.
     let patch = normalize_workspace_patch_header_paths(patch.as_str(), workspace_roots.as_slice());
 
     let planned_outcome = match apply_workspace_patch_with_resolved_roots(
@@ -309,6 +348,9 @@ pub(crate) async fn execute_workspace_patch_tool(
     .await
 }
 
+/// Dispatches to the constrained engine entry point when canonical
+/// constraint roots are present (narrowed override/focus scope), otherwise
+/// to the plain one.
 fn apply_workspace_patch_with_resolved_roots(
     workspace_roots: &[PathBuf],
     canonical_constraint_roots: &[PathBuf],
@@ -327,6 +369,15 @@ fn apply_workspace_patch_with_resolved_roots(
     }
 }
 
+/// Resolves the scope one patch may write to.
+///
+/// Precedence: an explicit `workspace_root` override (with the session's
+/// active focus spelling honored first), then the session focus when every
+/// patch operation path re-roots under it, then the agent roots unchanged.
+///
+/// # Errors
+/// Returns tool-facing errors for invalid overrides and session-state load
+/// failures.
 async fn resolve_workspace_patch_roots(
     runtime_state: &Arc<GatewayRuntimeState>,
     session_id: &str,
@@ -376,6 +427,9 @@ async fn resolve_workspace_patch_roots(
     })
 }
 
+/// The focus root applies only when every operation path in the patch
+/// re-roots cleanly under it; a single top-level path keeps the patch at the
+/// agent roots so files are never silently nested under the focus.
 fn patch_should_use_active_root(
     patch: &str,
     active_root: &crate::application::tool_runtime::workspace_scope::ActiveWorkspaceRoot,
@@ -387,6 +441,8 @@ fn patch_should_use_active_root(
             .all(|path| relative_path_should_use_active_root(path, active_root))
 }
 
+/// Extracts operation target paths (excluding `Move to:` destinations) for
+/// the active-root decision.
 fn patch_operation_paths(patch: &str) -> Vec<String> {
     patch
         .lines()
@@ -406,6 +462,12 @@ fn patch_operation_paths(patch: &str) -> Vec<String> {
         .collect()
 }
 
+/// Rejects patches whose header paths start with a Palyra OS environment
+/// prefix before the patch is even parsed; those targets belong to the
+/// OS-file tool, never the workspace patch tool.
+///
+/// # Errors
+/// Returns a tool-facing message naming the offending path.
 fn reject_env_prefixed_workspace_patch_paths(patch: &str) -> Result<(), String> {
     for path in workspace_patch_header_paths(patch) {
         if looks_like_palyra_env_prefixed_os_path(path.as_str()) {
@@ -417,6 +479,8 @@ fn reject_env_prefixed_workspace_patch_paths(patch: &str) -> Result<(), String> 
     Ok(())
 }
 
+/// Extracts every header path including `Move to:` destinations; used for
+/// the OS-env-prefix rejection, which must also cover move targets.
 fn workspace_patch_header_paths(patch: &str) -> Vec<String> {
     patch
         .lines()
@@ -441,6 +505,9 @@ fn looks_like_palyra_env_prefixed_os_path(path: &str) -> bool {
     path.starts_with("%PALYRA_") || path.starts_with("$PALYRA_") || path.starts_with("${PALYRA_")
 }
 
+/// Rewrites patch header paths into root-relative form before parsing:
+/// strips duplicated root basenames/tails and converts absolute in-root
+/// paths, returning the patch untouched when no line changes.
 fn normalize_workspace_patch_header_paths(patch: &str, workspace_roots: &[PathBuf]) -> String {
     let mut changed = false;
     let mut lines = patch
@@ -454,6 +521,8 @@ fn normalize_workspace_patch_header_paths(patch: &str, workspace_roots: &[PathBu
             normalized
         })
         .collect::<Vec<_>>();
+    // split('\n') + join("\n") round-trips newline-terminated patches via the
+    // trailing empty segment; the pop is a guard for inputs without one.
     if !patch.ends_with('\n') && lines.last().is_some_and(|line| line.is_empty()) {
         lines.pop();
     }
@@ -486,6 +555,9 @@ fn normalize_workspace_patch_header_line(
     None
 }
 
+/// Maps one header path to its root-relative form: absolute paths must stay
+/// lexically inside a root (`..` rejected outright), relative paths get a
+/// duplicated root prefix stripped. `None` keeps the original line.
 fn normalize_workspace_patch_header_path(
     path: &str,
     workspace_roots: &[PathBuf],
@@ -513,6 +585,9 @@ fn normalize_workspace_patch_header_path(
         .find_map(|root| strip_duplicate_workspace_root_prefix(trimmed, root.as_path()))
 }
 
+/// Canonicalizes the nearest existing ancestor and re-appends the missing
+/// tail, so paths that do not exist yet (Add File targets) still compare
+/// against canonical roots.
 fn canonicalize_existing_header_path(path: &Path) -> Option<PathBuf> {
     let mut existing = path;
     let mut missing_components = Vec::new();
@@ -528,6 +603,8 @@ fn canonicalize_existing_header_path(path: &Path) -> Option<PathBuf> {
     Some(canonical)
 }
 
+/// Renders an absolute in-root path relative to `root`; Windows falls back
+/// to a case-insensitive, separator-normalized comparison.
 fn absolute_workspace_path_relative_to_root(path: &Path, root: &Path) -> Option<String> {
     if let Ok(relative) = path.strip_prefix(root) {
         return normalized_relative_path_display(relative);
@@ -549,6 +626,10 @@ fn absolute_workspace_path_relative_to_root(path: &Path, root: &Path) -> Option<
     }
 }
 
+/// Strips the longest suffix of `root` that the relative `path` repeats as a
+/// prefix, e.g. `scenario-runs/S037/src/x.ts` under a root ending in
+/// `scenario-runs/S037` becomes `src/x.ts`; a path equal to the repeated
+/// prefix alone is left untouched.
 fn strip_duplicate_workspace_root_prefix(path: &str, root: &Path) -> Option<String> {
     if path.is_empty() || Path::new(path).is_absolute() {
         return None;
@@ -600,6 +681,8 @@ fn path_segment_eq(left: &str, right: &str) -> bool {
     }
 }
 
+/// Lexical (no filesystem access) containment check; Windows compares
+/// case-insensitively on normalized separators.
 fn path_stays_inside_workspace_root_lexical(path: &Path, root: &Path) -> bool {
     if path.starts_with(root) {
         return true;
@@ -616,12 +699,25 @@ fn path_stays_inside_workspace_root_lexical(path: &Path, root: &Path) -> bool {
     }
 }
 
+/// Lowercased, forward-slashed, de-verbatimed Windows path key for lexical
+/// comparison.
 #[cfg(windows)]
 fn comparable_windows_path(path: &Path) -> String {
     let normalized = path.to_string_lossy().replace('\\', "/");
     normalized.strip_prefix("//?/").unwrap_or(normalized.as_str()).to_ascii_lowercase()
 }
 
+/// Resolves a `workspace_root` override for the patch tool.
+///
+/// Mirrors the workspace_file override resolution (existing-root basename
+/// match first, then join under each root) with one addition: for real
+/// writes (`create_missing_relative`), a missing relative override whose
+/// nearest existing ancestor canonicalizes in-root is created so a patch can
+/// target a fresh project directory. Dry runs never mutate the filesystem.
+///
+/// # Errors
+/// Returns tool-facing errors for control characters, traversal components,
+/// escapes, non-directories, and (for dry runs) missing roots.
 fn resolve_workspace_root_override(
     agent_workspace_roots: &[PathBuf],
     workspace_root: &str,
@@ -710,6 +806,9 @@ fn resolve_workspace_root_override(
     ))
 }
 
+/// Matches a single-component override against the basename of an existing
+/// canonical root, so naming the root directory itself resolves to that root
+/// instead of creating or targeting a same-named subdirectory.
 fn workspace_root_override_matching_existing_root_basename(
     requested: &Path,
     canonical_roots: &[PathBuf],
@@ -729,6 +828,8 @@ fn workspace_root_override_matching_existing_root_basename(
         .cloned()
 }
 
+/// Normalizes a raw override to `/` separators and strips the `/workspace`
+/// virtual alias that models commonly emit for the root.
 fn normalize_workspace_root_override_input(workspace_root: &str) -> String {
     let normalized = workspace_root.trim().replace('\\', "/");
     let without_current = normalized.strip_prefix("./").unwrap_or(normalized.as_str());
@@ -753,6 +854,9 @@ fn path_component_eq(left: &std::ffi::OsStr, right: &std::ffi::OsStr) -> bool {
     }
 }
 
+/// Builds the narrowed scope for the session focus root: the focus becomes
+/// the only writable root while the canonical agent roots stay attached as
+/// containment constraints.
 fn resolved_active_workspace_patch_roots(
     active_root: &Path,
     agent_workspace_roots: &[PathBuf],
@@ -772,6 +876,9 @@ fn resolved_active_workspace_patch_roots(
     })
 }
 
+/// Computes the chosen root's path relative to each agent root; risk
+/// assessment prepends these so prefix rules (e.g. CI workflow paths) still
+/// match when the patch runs from a narrowed root.
 fn workspace_root_risk_path_prefixes_from_canonical(
     root: &Path,
     canonical_roots: &[PathBuf],
@@ -785,7 +892,7 @@ fn workspace_root_risk_path_prefixes_from_canonical(
             continue;
         };
         if let Some(prefix) = normalized_relative_path_display(relative) {
-            if !prefixes.iter().any(|existing| existing == &prefix) {
+            if !prefixes.contains(&prefix) {
                 prefixes.push(prefix);
             }
         }
@@ -793,6 +900,8 @@ fn workspace_root_risk_path_prefixes_from_canonical(
     prefixes
 }
 
+/// Renders a relative path with `/` separators, rejecting traversal/rooted
+/// components; `None` for empty or non-normal paths.
 fn normalized_relative_path_display(path: &Path) -> Option<String> {
     let mut segments = Vec::new();
     for component in path.components() {
@@ -809,6 +918,10 @@ fn normalized_relative_path_display(path: &Path) -> Option<String> {
     }
 }
 
+/// Creates a missing relative override directory, but only after proving the
+/// nearest existing ancestor canonicalizes inside an agent root; the
+/// containment proof must precede `create_dir_all` so nothing is ever
+/// created outside the agent roots.
 fn create_missing_relative_workspace_root(
     canonical_root: &Path,
     requested: &Path,
@@ -843,6 +956,13 @@ fn create_missing_relative_workspace_root(
     canonicalize_workspace_root_override(candidate.as_path(), canonical_roots, workspace_root)
 }
 
+/// Canonicalizes agent roots, silently dropping entries that are missing or
+/// not directories (launch roots can vanish); any other IO failure aborts so
+/// a root is never skipped because of a transient error.
+///
+/// # Errors
+/// Returns an error when canonicalizing a root fails for a reason other than
+/// the root not existing.
 fn canonicalize_agent_workspace_roots(
     agent_workspace_roots: &[PathBuf],
 ) -> Result<Vec<PathBuf>, String> {
@@ -863,6 +983,8 @@ fn canonicalize_agent_workspace_roots(
     Ok(canonical_roots)
 }
 
+/// Canonicalizes an override candidate and verifies it is a directory inside
+/// one of the canonical agent roots.
 fn canonicalize_workspace_root_override(
     candidate: &Path,
     canonical_roots: &[PathBuf],
@@ -907,6 +1029,7 @@ fn validate_relative_workspace_root_override(
     Ok(())
 }
 
+/// Serializes a successful (or dry-run) patch outcome into the tool result.
 fn serialize_workspace_patch_success(
     proposal_id: &str,
     input_json: &[u8],
@@ -930,6 +1053,9 @@ fn serialize_workspace_patch_success(
     }
 }
 
+/// Builds the failure outcome for a patch error: logs once, then returns a
+/// diagnostic payload (redacted preview, parse location, recovery and
+/// grammar hints) the model can use to self-repair.
 fn workspace_patch_error_outcome(
     proposal_id: &str,
     input_json: &[u8],
@@ -984,6 +1110,8 @@ fn workspace_patch_error_outcome(
     )
 }
 
+/// Picks the model-facing recovery instruction for an error class; hints are
+/// pinned by tests.
 fn workspace_patch_recovery_hint(error: &WorkspacePatchError) -> &'static str {
     match error {
         WorkspacePatchError::Parse { message, .. }
@@ -1009,14 +1137,23 @@ fn workspace_patch_recovery_hint(error: &WorkspacePatchError) -> &'static str {
     }
 }
 
+/// Appends caller-supplied entries to the policy defaults, skipping
+/// duplicates; defaults can only be extended, never removed.
 pub(crate) fn extend_patch_string_defaults(defaults: &mut Vec<String>, additions: Vec<String>) {
     for addition in additions {
-        if !defaults.iter().any(|existing| existing == &addition) {
+        if !defaults.contains(&addition) {
             defaults.push(addition);
         }
     }
 }
 
+/// Parses an optional string-array tool input field with item-count and
+/// per-item byte caps; entries are trimmed and empty ones dropped. `None`
+/// means the field was absent.
+///
+/// # Errors
+/// Returns a tool-facing message when the field is not a string array or a
+/// cap is exceeded.
 pub(crate) fn parse_patch_string_array_field(
     payload: &serde_json::Map<String, Value>,
     field_name: &str,
@@ -1051,6 +1188,9 @@ pub(crate) fn parse_patch_string_array_field(
     Ok(Some(parsed))
 }
 
+/// Wraps tool output in the standard outcome with a deterministic
+/// attestation hash; failures carrying an empty output object get the
+/// canonical failed-tool payload so callers always receive diagnostics.
 fn workspace_patch_tool_execution_outcome(
     proposal_id: &str,
     input_json: &[u8],
@@ -1070,6 +1210,9 @@ fn workspace_patch_tool_execution_outcome(
     } else {
         output_json
     };
+    // Length-prefixing every field makes the attestation hash unambiguous:
+    // no two distinct (proposal, input, output, error) tuples can
+    // concatenate to the same byte stream.
     let mut hasher = Sha256::new();
     hasher.update(b"palyra.fs.apply_patch.attestation.v1");
     hasher.update((proposal_id.len() as u64).to_be_bytes());

@@ -1,3 +1,18 @@
+//! Workspace file tools: scoped read, list-dir, and search over agent roots.
+//!
+//! Each tool resolves its target against an ordered list of workspace roots
+//! (agent configuration layered with run-launch and session-focus roots from
+//! `workspace_scope`). Targets are canonicalized and containment-checked
+//! against the owning root before any data is returned; file reads
+//! additionally re-resolve the opened handle so a path swapped after
+//! validation (TOCTOU) is still rejected. Text output passes through
+//! palyra-safety secret-leak redaction before it reaches the model.
+//!
+//! Error strings and output JSON field names are pinned by tests and
+//! fixtures; treat the containment logic and literals here as
+//! security-sensitive and keep them byte-identical unless tests move with the
+//! change.
+
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "macos")]
@@ -5,6 +20,7 @@ use std::os::unix::ffi::OsStringExt;
 #[cfg(windows)]
 use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
 use std::{
+    borrow::Cow,
     fs::{self, File},
     io::{Read, Seek, SeekFrom},
     path::{Component, Path, PathBuf},
@@ -36,6 +52,8 @@ use crate::{
 
 const WORKSPACE_LIST_DIR_DEFAULT_ENTRIES: usize = 128;
 const WORKSPACE_LIST_DIR_MAX_ENTRIES: usize = 512;
+// Search traversal and output budgets; exceeding any of them marks the result
+// `truncated` instead of failing the call.
 const WORKSPACE_SEARCH_DEFAULT_MATCHES: usize = 64;
 const WORKSPACE_SEARCH_MAX_MATCHES: usize = 200;
 const WORKSPACE_SEARCH_MAX_FILES: usize = 2_000;
@@ -46,9 +64,11 @@ const WORKSPACE_SEARCH_MAX_DIR_ENTRIES: usize = 2_000;
 const WORKSPACE_SEARCH_MAX_LINE_TEXT_BYTES: usize = 4 * 1024;
 const WORKSPACE_SEARCH_MAX_OUTPUT_BYTES: usize = 512 * 1024;
 const WORKSPACE_SEARCH_MATCH_JSON_OVERHEAD_BYTES: usize = 160;
+// Well-known dependency/build directories whose contents are noise for search.
 const WORKSPACE_SEARCH_SKIPPED_DIRS: &[&str] =
     &[".git", "node_modules", "target", "dist", "build", ".next", ".svelte-kit"];
 
+/// Read-file tool input; field names are pinned by the tool JSON schema.
 #[derive(Debug, Deserialize)]
 struct WorkspaceReadFileInput {
     path: String,
@@ -60,6 +80,7 @@ struct WorkspaceReadFileInput {
     max_bytes: Option<u64>,
 }
 
+/// List-dir tool input; field names are pinned by the tool JSON schema.
 #[derive(Debug, Deserialize)]
 struct WorkspaceListDirInput {
     #[serde(default)]
@@ -70,6 +91,7 @@ struct WorkspaceListDirInput {
     max_entries: Option<u64>,
 }
 
+/// Search tool input; field names are pinned by the tool JSON schema.
 #[derive(Debug, Deserialize)]
 struct WorkspaceSearchInput {
     query: String,
@@ -83,6 +105,9 @@ struct WorkspaceSearchInput {
     max_matches: Option<u64>,
 }
 
+/// Read-file tool output. Exactly one of `text`/`bytes_base64` is set; when
+/// `redacted` is true, `text_authoritative` and `redaction_notice` warn the
+/// caller not to write the placeholder text back.
 #[derive(Debug, Serialize)]
 struct WorkspaceReadFileOutput {
     path: String,
@@ -147,6 +172,11 @@ struct WorkspaceListDirEntry {
     size_bytes: Option<u64>,
 }
 
+/// Executes the workspace read-file tool: resolves the scoped roots, reads a
+/// bounded chunk, and returns UTF-8 text (secret-redacted) or base64 binary.
+///
+/// Never fails as a function; validation, scoping, and IO failures are
+/// reported in the returned outcome's error string.
 pub(crate) async fn execute_workspace_read_file_tool(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -249,6 +279,11 @@ pub(crate) async fn execute_workspace_read_file_tool(
     }
 }
 
+/// Executes the workspace list-dir tool: resolves the scoped roots and
+/// returns a sorted, bounded listing of one in-root directory.
+///
+/// Never fails as a function; validation, scoping, and IO failures are
+/// reported in the returned outcome's error string.
 pub(crate) async fn execute_workspace_list_dir_tool(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -351,6 +386,11 @@ pub(crate) async fn execute_workspace_list_dir_tool(
     }
 }
 
+/// Executes the workspace search tool: a bounded, literal-substring search
+/// over in-root files with secret-redacted match excerpts.
+///
+/// Never fails as a function; validation, scoping, and IO failures are
+/// reported in the returned outcome's error string.
 pub(crate) async fn execute_workspace_search_tool(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -516,6 +556,8 @@ fn normalize_optional_workspace_root(workspace_root: Option<String>) -> Option<S
     workspace_root.map(|value| value.trim().to_owned()).filter(|value| !value.is_empty())
 }
 
+/// Normalizes raw tool path input to `/` separators and strips the
+/// `/workspace` virtual alias that models commonly emit for the root.
 fn normalize_workspace_path_input(path: &str) -> String {
     let normalized = path.trim().replace('\\', "/");
     let without_current = normalized.strip_prefix("./").unwrap_or(normalized.as_str());
@@ -529,6 +571,16 @@ fn normalize_workspace_path_input(path: &str) -> String {
     }
 }
 
+/// Syntactic gate run before any filesystem access: rejects control
+/// characters, Palyra env-prefixed OS paths (those belong to the OS-file
+/// tool), `:` outside a Windows drive prefix, and relative paths with
+/// non-normal components (`..`, roots, prefixes).
+///
+/// Absolute paths pass here on purpose; they are containment-checked against
+/// the workspace roots during resolution instead.
+///
+/// # Errors
+/// Returns a tool-facing message naming the violated rule.
 fn validate_workspace_path_syntax(path: &str, tool_name: &str) -> Result<(), String> {
     if path.chars().any(char::is_control) {
         return Err(format!("{tool_name} path contains unsupported characters"));
@@ -561,6 +613,16 @@ fn looks_like_palyra_env_prefixed_os_path(path: &str) -> bool {
     path.starts_with("%PALYRA_") || path.starts_with("$PALYRA_") || path.starts_with("${PALYRA_")
 }
 
+/// Resolves the ordered list of roots one tool call may touch.
+///
+/// Precedence: an explicit `workspace_root` override narrows the scope to a
+/// single root (resolved against the session's active focus first, then the
+/// agent roots); otherwise the session focus directory, when it applies to
+/// `requested_path`, is placed ahead of the agent roots.
+///
+/// # Errors
+/// Returns an error when session state cannot be loaded or the override does
+/// not resolve inside the agent workspace roots.
 async fn resolve_workspace_file_roots(
     runtime_state: &Arc<GatewayRuntimeState>,
     session_id: &str,
@@ -621,6 +683,9 @@ fn workspace_roots_with_active_first(
     roots
 }
 
+/// Root equality for deduplication: canonicalization unifies symlinked
+/// aliases, and Windows additionally compares case-insensitively with
+/// normalized separators for roots that cannot be canonicalized.
 fn same_workspace_file_root(left: &Path, right: &Path) -> bool {
     let left = fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
     let right = fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
@@ -656,6 +721,17 @@ fn resolve_workspace_file_roots_for_override(
         .map(|root| vec![root])
 }
 
+/// Resolves a `workspace_root` override to one canonical directory that must
+/// live inside the agent workspace roots.
+///
+/// Relative overrides are first matched against an existing root's basename
+/// (so an override naming the root itself never nests into a same-named
+/// subdirectory), then joined under each canonical root in order.
+///
+/// # Errors
+/// Returns an error for control characters, traversal components, overrides
+/// that escape the agent roots, non-directories, and overrides that exist in
+/// no root.
 fn resolve_workspace_root_override(
     tool_name: &str,
     agent_workspace_roots: &[PathBuf],
@@ -704,6 +780,9 @@ fn resolve_workspace_root_override(
     ))
 }
 
+/// Matches a single-component override against the basename of an existing
+/// canonical root, so naming the root directory itself resolves to that root
+/// even when a same-named subdirectory exists (the basename match wins).
 fn workspace_root_override_matching_existing_root_basename(
     requested: &Path,
     canonical_roots: &[(usize, PathBuf)],
@@ -734,6 +813,9 @@ fn path_component_eq(left: &std::ffi::OsStr, right: &std::ffi::OsStr) -> bool {
     }
 }
 
+/// Orders the relative paths to try under `canonical_root`: a variant with a
+/// duplicated leading root basename stripped first (models often repeat the
+/// root directory name), then the path as given.
 fn relative_workspace_path_candidates(path: &str, canonical_root: &Path) -> Vec<String> {
     let mut candidates = Vec::with_capacity(2);
     if let Some(stripped) = strip_duplicate_workspace_root_basename(path, canonical_root) {
@@ -768,6 +850,8 @@ fn strip_duplicate_workspace_root_basename(path: &str, canonical_root: &Path) ->
     Some(stripped.join("/"))
 }
 
+/// Canonicalizes an override candidate and verifies it is a directory inside
+/// one of the canonical agent roots.
 fn canonicalize_workspace_root_override(
     tool_name: &str,
     candidate: &Path,
@@ -818,6 +902,16 @@ fn looks_like_windows_drive_path(path: &str) -> bool {
         && matches!(bytes[2], b'/' | b'\\')
 }
 
+/// Locates `input.path` in the first root that contains it and reads the
+/// requested chunk.
+///
+/// Relative paths are tried against each root in order and must canonicalize
+/// back inside that root (a symlink pointing outside is rejected, not
+/// followed). Absolute paths go through [`resolve_absolute_workspace_file`].
+///
+/// # Errors
+/// Returns tool-facing error strings for escapes, missing files,
+/// non-regular-file targets, and IO failures.
 fn read_workspace_file_from_roots(
     workspace_roots: &[PathBuf],
     input: &WorkspaceReadFileInput,
@@ -899,6 +993,14 @@ fn read_workspace_file_from_roots(
     ))
 }
 
+/// Canonicalizes roots while keeping their original indices, silently
+/// dropping entries that are missing or not directories (launch and focus
+/// roots can vanish between resolution and use); any other IO failure aborts
+/// so a root is never skipped because of a transient error.
+///
+/// # Errors
+/// Returns an error when canonicalizing a root fails for a reason other than
+/// the root not existing.
 fn canonicalize_workspace_roots(
     workspace_roots: &[PathBuf],
     tool_name: &str,
@@ -919,11 +1021,20 @@ fn canonicalize_workspace_roots(
     Ok(canonical_roots)
 }
 
+/// Resolves an absolute requested path to a canonical in-root file.
+///
+/// # Errors
+/// Returns the uniform escape error for out-of-root paths and tool-facing
+/// errors for missing or non-regular-file targets.
 fn resolve_absolute_workspace_file(
     canonical_roots: &[(usize, PathBuf)],
     requested: &Path,
     input: &WorkspaceReadFileInput,
 ) -> Result<(usize, PathBuf, String), String> {
+    // Reject `..` and check root containment lexically BEFORE touching the
+    // filesystem: probing out-of-root paths would leak whether they exist,
+    // so the escape error must be identical for existing and missing targets
+    // (pinned by read_workspace_file_returns_uniform_error_for_outside_absolute_paths).
     if requested.components().any(|component| matches!(component, Component::ParentDir)) {
         return Err(format!("{WORKSPACE_READ_FILE_TOOL_NAME} path escapes agent workspace roots"));
     }
@@ -954,6 +1065,8 @@ fn resolve_absolute_workspace_file(
     Ok((workspace_root_index, canonical_target, display_path))
 }
 
+/// Finds the first root that lexically contains `requested` (alias-aware via
+/// [`path_stays_inside_workspace_root`]) without touching the filesystem.
 fn find_lexical_workspace_root<'a>(
     canonical_roots: &'a [(usize, PathBuf)],
     requested: &Path,
@@ -1056,6 +1169,14 @@ fn list_workspace_dir_from_roots(
     ))
 }
 
+/// Resolves an absolute requested path to a canonical in-root directory.
+// AIDEV-NOTE: unlike resolve_absolute_workspace_file, this canonicalizes the
+// requested absolute path before any containment check, so a missing outside
+// path reports "not found" while an existing one reports "escapes" (an
+// existence oracle), and absolute `..` traversal is not pre-rejected.
+// Aligning it with the read-file flow would change pinned error strings, so
+// it needs a deliberate behavior change with test updates. Same applies to
+// resolve_absolute_workspace_search_path below.
 fn resolve_absolute_workspace_dir(
     canonical_roots: &[(usize, PathBuf)],
     requested: &Path,
@@ -1089,6 +1210,14 @@ fn resolve_absolute_workspace_dir(
     Err(format!("{WORKSPACE_LIST_DIR_TOOL_NAME} path escapes agent workspace roots"))
 }
 
+/// Lists one canonical in-root directory, sorted by display path and
+/// truncated to the entry budget.
+// AIDEV-NOTE: the whole directory is collected before sorting/truncation so
+// the page is deterministic and `truncated` is accurate, which makes memory
+// proportional to the directory size (search caps directory entries via
+// WORKSPACE_SEARCH_MAX_DIR_ENTRIES; listing has no such cap). Bounding it
+// changes which entries appear on truncated pages, so it needs a deliberate
+// behavior change.
 fn list_workspace_directory(
     workspace_root_index: usize,
     canonical_root: &Path,
@@ -1235,6 +1364,9 @@ fn search_workspace_from_roots(
     ))
 }
 
+/// Resolves an absolute requested path to a canonical in-root search target.
+// AIDEV-NOTE: shares the canonicalize-before-containment-check ordering noted
+// on resolve_absolute_workspace_dir.
 fn resolve_absolute_workspace_search_path(
     canonical_roots: &[(usize, PathBuf)],
     requested: &Path,
@@ -1298,6 +1430,9 @@ fn search_workspace_path(
     })
 }
 
+/// Accumulated matches plus the budget counters (matches, files, dirs,
+/// estimated output bytes) that turn pathological workspaces into `truncated`
+/// results instead of unbounded work.
 struct WorkspaceSearchState {
     query: String,
     normalized_query: String,
@@ -1355,6 +1490,14 @@ impl WorkspaceSearchState {
         true
     }
 
+    /// Charges one prospective match against the output-size budget; a
+    /// `false` return means the match must be dropped and the result marked
+    /// truncated.
+    // AIDEV-NOTE: the x2 factor models typical JSON string escaping, but
+    // worst-case escaping (`\uXXXX` for control characters) is 6x, so the
+    // serialized output can overshoot WORKSPACE_SEARCH_MAX_OUTPUT_BYTES on
+    // control-character-heavy lines. Tightening the estimate changes when
+    // results truncate, so it needs a deliberate behavior change.
     fn reserve_match_output(&mut self, path: &str, line_text: &str) -> bool {
         let estimated = path
             .len()
@@ -1430,6 +1573,8 @@ fn search_workspace_directory_recursive(
         })?;
         entries.push(entry);
     }
+    // Sort for deterministic traversal so truncated results are stable
+    // across runs and platforms.
     entries.sort_by_key(|entry| entry.path());
 
     for entry in entries {
@@ -1449,6 +1594,8 @@ fn search_workspace_directory_recursive(
             state.skipped_dirs = state.skipped_dirs.saturating_add(1);
             continue;
         }
+        // Symlinks are never followed during search: a link pointing outside
+        // the workspace must not leak external content into match results.
         if file_type.is_symlink() {
             if file_type.is_dir() {
                 state.skipped_dirs = state.skipped_dirs.saturating_add(1);
@@ -1487,6 +1634,8 @@ fn search_workspace_file(
             path.to_string_lossy()
         )
     })?;
+    // Non-UTF-8 files are treated as binary and counted as skipped rather
+    // than failing the whole search.
     let Ok(text) = String::from_utf8(bytes) else {
         state.skipped_files = state.skipped_files.saturating_add(1);
         return Ok(());
@@ -1509,17 +1658,25 @@ fn search_workspace_file(
     Ok(())
 }
 
+/// Records every match of the query on one line, mapping byte offsets back
+/// to 1-based character columns.
 fn search_workspace_line(
     path: &str,
     line_number: usize,
     line: &str,
     state: &mut WorkspaceSearchState,
 ) {
-    let haystack = if state.case_sensitive { line.to_owned() } else { line.to_ascii_lowercase() };
-    let needle = state.normalized_query.clone();
+    // ASCII lowercasing is byte-for-byte, so match offsets found in the
+    // lowercased haystack map directly back onto `line`.
+    let haystack: Cow<'_, str> = if state.case_sensitive {
+        Cow::Borrowed(line)
+    } else {
+        Cow::Owned(line.to_ascii_lowercase())
+    };
     let query_len = state.query.len().max(1);
     let mut search_start = 0usize;
-    while let Some(relative_index) = haystack[search_start..].find(needle.as_str()) {
+    while let Some(relative_index) = haystack[search_start..].find(state.normalized_query.as_str())
+    {
         let byte_index = search_start + relative_index;
         let column = line[..byte_index].chars().count() + 1;
         let excerpt = workspace_search_line_excerpt(line, byte_index, query_len);
@@ -1544,6 +1701,8 @@ fn search_workspace_line(
     }
 }
 
+/// Bounds one match line to a byte window around the match, clamped to UTF-8
+/// char boundaries, with `...` markers for an elided prefix/suffix.
 fn workspace_search_line_excerpt(line: &str, match_start: usize, match_len: usize) -> String {
     if line.len() <= WORKSPACE_SEARCH_MAX_LINE_TEXT_BYTES {
         return line.to_owned();
@@ -1576,6 +1735,8 @@ fn workspace_search_line_excerpt(line: &str, match_start: usize, match_len: usiz
     excerpt
 }
 
+/// Largest index `<= index` that is a char boundary; stable stand-in for the
+/// unstable `str::floor_char_boundary`.
 fn floor_char_boundary(value: &str, mut index: usize) -> usize {
     index = index.min(value.len());
     while index > 0 && !value.is_char_boundary(index) {
@@ -1584,6 +1745,9 @@ fn floor_char_boundary(value: &str, mut index: usize) -> usize {
     index
 }
 
+/// Applies workspace-export secret redaction to one match line. Only a
+/// confirmed secret-leak finding swaps in the redacted text; other finding
+/// categories leave the line untouched.
 fn redact_workspace_search_line(line: &str) -> (String, bool) {
     let redaction = redact_text_for_export(
         line,
@@ -1599,6 +1763,12 @@ fn redact_workspace_search_line(line: &str) -> (String, bool) {
     }
 }
 
+/// Reads one bounded chunk from an already-resolved canonical file and
+/// classifies it as UTF-8 text (with secret redaction) or base64 binary.
+///
+/// # Errors
+/// Returns tool-facing error strings for open/seek/read failures and for
+/// opened files that resolve outside `canonical_root`.
 fn read_workspace_file_chunk(
     workspace_root_index: usize,
     canonical_root: &Path,
@@ -1612,6 +1782,10 @@ fn read_workspace_file_chunk(
             input.path
         )
     })?;
+    // Re-resolve the path from the opened handle and re-check containment:
+    // the target could have been swapped (TOCTOU) between path
+    // canonicalization and open, so the handle, not the path, is the source
+    // of truth for what was actually opened.
     let opened_path = canonicalize_open_file_path(&file, input.path.as_str())?;
     if !path_stays_inside_workspace_root(opened_path.as_path(), canonical_root) {
         return Err(format!("{WORKSPACE_READ_FILE_TOOL_NAME} path escapes agent workspace roots"));
@@ -1647,6 +1821,9 @@ fn read_workspace_file_chunk(
         u64::try_from(buffer.len()).expect("returned workspace file chunk size must fit u64");
     let eof = input.offset_bytes.saturating_add(returned_bytes) >= size_bytes;
     let chunk_sha256 = hex::encode(Sha256::digest(buffer.as_slice()));
+    // Redaction policy: only a confirmed secret-leak finding replaces the
+    // text, and redacted text is marked non-authoritative so callers do not
+    // write the placeholder markers back into the workspace.
     let (text, bytes_base64, binary, redacted) = if chunk_has_binary_control_bytes(&buffer) {
         (None, Some(BASE64_STANDARD.encode(buffer.as_slice())), true, false)
     } else {
@@ -1687,10 +1864,17 @@ fn read_workspace_file_chunk(
     })
 }
 
+/// Returns true when the chunk contains control bytes that never appear in
+/// plain text (the C0 set minus tab/LF/CR, plus DEL); such chunks are
+/// reported as base64 binary even when they happen to be valid UTF-8.
 fn chunk_has_binary_control_bytes(bytes: &[u8]) -> bool {
     bytes.iter().any(|byte| matches!(*byte, 0x00..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F | 0x7F))
 }
 
+/// Containment check applied to every resolved target: a plain prefix match
+/// first, then platform alias normalization -- macOS `/private` and Data
+/// volume prefixes, Windows verbatim/8.3/long-name forms -- so equivalent
+/// spellings of the same location cannot bypass the root boundary.
 fn path_stays_inside_workspace_root(candidate: &Path, root: &Path) -> bool {
     if candidate.starts_with(root) {
         return true;
@@ -1717,6 +1901,9 @@ fn path_stays_inside_workspace_root(candidate: &Path, root: &Path) -> bool {
     }
 }
 
+/// Normalizes a macOS path to a comparable key: strips the
+/// `/System/Volumes/Data` firmlink prefix and maps `/private/{var,tmp,etc}`
+/// to their symlinked `/var`-style spellings.
 #[cfg(target_os = "macos")]
 fn macos_path_alias_key(path: &Path) -> Option<String> {
     let normalized = path.to_string_lossy().replace('\\', "/");
@@ -1748,6 +1935,9 @@ fn normalized_path_key_starts_with(candidate: &str, root: &str) -> bool {
     candidate.strip_prefix(root).is_some_and(|suffix| suffix.starts_with('/'))
 }
 
+/// Normalizes a Windows path to a comparable key, preferring the long-name
+/// form of existing paths (resolves 8.3 short names) and falling back to
+/// lexical normalization for paths that no longer exist.
 #[cfg(windows)]
 fn windows_path_alias_key(path: &Path) -> Option<String> {
     windows_existing_path_alias_key(path).or_else(|| windows_lexical_path_alias_key(path))
@@ -1799,6 +1989,8 @@ fn windows_long_path_name(path: &Path) -> Option<String> {
     }
 }
 
+/// Strips verbatim (`\\?\`) and device (`\\.\`) prefixes so Win32 path APIs
+/// that reject verbatim paths can process the result.
 #[cfg(windows)]
 fn windows_deverbatim_path_string(path: &Path) -> Option<String> {
     let normalized = path.to_string_lossy().replace('\\', "/");
@@ -1818,6 +2010,8 @@ fn windows_lexical_path_alias_key(path: &Path) -> Option<String> {
     windows_normalized_path_alias_key(path.to_string_lossy().as_ref())
 }
 
+/// Lowercases, forward-slashes, de-verbatims, and trims trailing slashes to
+/// produce a comparable Windows path key.
 #[cfg(windows)]
 fn windows_normalized_path_alias_key(path: &str) -> Option<String> {
     let normalized = path.replace('\\', "/");
@@ -1838,6 +2032,8 @@ fn windows_normalized_path_alias_key(path: &str) -> Option<String> {
     Some(key)
 }
 
+/// Resolves the opened file's real path via `/proc/self/fd`, so containment
+/// is checked against what was actually opened, not the requested path.
 #[cfg(target_os = "linux")]
 fn canonicalize_open_file_path(file: &File, input_path: &str) -> Result<PathBuf, String> {
     let fd_path = format!("/proc/self/fd/{}", file.as_raw_fd());
@@ -1849,6 +2045,7 @@ fn canonicalize_open_file_path(file: &File, input_path: &str) -> Result<PathBuf,
     })
 }
 
+/// Resolves the opened file's real path via `fcntl(F_GETPATH)`.
 #[cfg(target_os = "macos")]
 fn canonicalize_open_file_path(file: &File, input_path: &str) -> Result<PathBuf, String> {
     let mut buffer = vec![0 as libc::c_char; libc::PATH_MAX as usize];
@@ -1875,6 +2072,7 @@ fn canonicalize_open_file_path(file: &File, input_path: &str) -> Result<PathBuf,
     })
 }
 
+/// Resolves the opened file's real path via BSD-style `/dev/fd`.
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn canonicalize_open_file_path(file: &File, input_path: &str) -> Result<PathBuf, String> {
     let fd_path = format!("/dev/fd/{}", file.as_raw_fd());
@@ -1886,6 +2084,7 @@ fn canonicalize_open_file_path(file: &File, input_path: &str) -> Result<PathBuf,
     })
 }
 
+/// Resolves the opened file's real path via `GetFinalPathNameByHandleW`.
 #[cfg(windows)]
 fn canonicalize_open_file_path(file: &File, input_path: &str) -> Result<PathBuf, String> {
     use windows_sys::Win32::Storage::FileSystem::{
@@ -1923,6 +2122,8 @@ fn canonicalize_open_file_path(file: &File, input_path: &str) -> Result<PathBuf,
     }
 }
 
+/// Platforms without a handle-to-path API cannot verify what was opened, so
+/// reads fail closed.
 #[cfg(not(any(unix, windows)))]
 fn canonicalize_open_file_path(_file: &File, input_path: &str) -> Result<PathBuf, String> {
     Err(format!(
@@ -1934,6 +2135,8 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// Renders a root-relative path with `/` separators for tool output, using
+/// `"."` for the root itself.
 fn normalize_relative_path_display(path: &Path) -> String {
     let mut rendered = Vec::new();
     for component in path.components() {

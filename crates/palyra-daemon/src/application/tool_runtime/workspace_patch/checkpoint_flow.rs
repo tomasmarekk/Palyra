@@ -1,3 +1,15 @@
+//! Checkpointed mutation flow for `palyra.fs.apply_patch` writes.
+//!
+//! Real (non-dry-run) patches are bracketed by workspace checkpoints:
+//! preflight capture -> apply (via the palyra-common workspace_patch engine)
+//! -> post-change capture -> pair link with a compare summary. High-risk
+//! mutations (deletes/moves, lockfiles, CI/security paths) fail closed when
+//! the preflight checkpoint cannot be captured; lower-risk ones degrade to a
+//! flagged best effort instead of blocking the patch.
+//!
+//! Journal event names and output JSON keys are pinned by tests and
+//! fixtures; keep them byte-identical.
+
 use std::{path::PathBuf, sync::Arc, time::Instant};
 
 use palyra_common::workspace_patch::{
@@ -23,6 +35,8 @@ use crate::{
 
 use super::{workspace_patch_error_outcome, workspace_patch_tool_execution_outcome};
 
+/// Borrowed inputs for one checkpointed patch mutation; the planned outcome
+/// is included so risk is assessed before any write happens.
 pub(super) struct WorkspacePatchMutationRequest<'a> {
     pub(super) principal: &'a str,
     pub(super) device_id: &'a str,
@@ -40,6 +54,13 @@ pub(super) struct WorkspacePatchMutationRequest<'a> {
     pub(super) planned_outcome: WorkspacePatchOutcome,
 }
 
+/// Applies a planned patch with checkpoint bracketing.
+///
+/// The ordering is deliberate: constraint validation and the preflight
+/// checkpoint happen before any write so high-risk mutations can fail closed
+/// with the workspace untouched, while checkpoint or pair-link failures
+/// after a successful apply only degrade the output (`degraded: true`)
+/// instead of reverting the patch.
 pub(super) async fn execute_workspace_patch_mutation(
     runtime_state: &Arc<GatewayRuntimeState>,
     request: WorkspacePatchMutationRequest<'_>,
@@ -271,6 +292,9 @@ pub(super) async fn execute_workspace_patch_mutation(
     serialize_workspace_patch_success_value(proposal_id, input_json, output_value)
 }
 
+/// Dispatches to the constrained engine entry point when canonical
+/// constraint roots are present (narrowed override/focus scope), otherwise
+/// to the plain one.
 fn apply_patch_with_constraints(
     workspace_roots: &[PathBuf],
     canonical_constraint_roots: &[PathBuf],
@@ -289,6 +313,8 @@ fn apply_patch_with_constraints(
     }
 }
 
+/// Re-validates the narrowed roots against the canonical agent roots right
+/// before the mutation; a no-op when no constraints apply.
 fn validate_patch_roots_against_constraints(
     workspace_roots: &[PathBuf],
     canonical_constraint_roots: &[PathBuf],
@@ -303,6 +329,8 @@ fn validate_patch_roots_against_constraints(
     }
 }
 
+/// Risk class of one planned mutation; rendered into checkpoint records and
+/// journal events via [`Self::as_str`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkspaceMutationRiskLevel {
     Low,
@@ -320,6 +348,8 @@ impl WorkspaceMutationRiskLevel {
     }
 }
 
+/// Risk verdict for one mutation: level, the review posture it implies, and
+/// whether the mutation must be refused when no preflight checkpoint exists.
 #[derive(Debug, Clone, Copy)]
 struct WorkspaceMutationRisk {
     level: WorkspaceMutationRiskLevel,
@@ -327,6 +357,10 @@ struct WorkspaceMutationRisk {
     fail_closed_without_preflight: bool,
 }
 
+/// Classifies a planned mutation: file count escalates Low -> Medium (>4)
+/// -> High (>8); any delete/move or high-risk path (including `moved_from`
+/// sources) forces High, which requires review and fails closed without a
+/// preflight checkpoint.
 fn assess_workspace_mutation_risk(
     files_touched: &[WorkspacePatchFileAttestation],
     risk_path_prefixes: &[String],
@@ -365,6 +399,9 @@ fn assess_workspace_mutation_risk(
     }
 }
 
+/// Checks the path both directly and re-rooted under each risk prefix, so
+/// rules keyed to repository-root paths still match when the patch ran from
+/// a narrowed workspace root.
 fn has_high_risk_workspace_path(path: &str, risk_path_prefixes: &[String]) -> bool {
     is_high_risk_workspace_path(path)
         || risk_path_prefixes.iter().any(|prefix| {
@@ -395,6 +432,9 @@ fn normalize_workspace_risk_path(path: &str) -> String {
     path.replace('\\', "/").trim().trim_start_matches("./").trim_matches('/').to_owned()
 }
 
+/// Repository paths whose mutation always escalates to High risk:
+/// supply-chain manifests/lockfiles, CI workflows, and security-critical
+/// crate subtrees.
 fn is_high_risk_workspace_path(path: &str) -> bool {
     let normalized = path.replace('\\', "/").to_ascii_lowercase();
     normalized == "cargo.toml"
@@ -423,10 +463,14 @@ fn is_medium_risk_workspace_path(path: &str) -> bool {
         || normalized.ends_with(".json")
 }
 
+/// Records the `workspace.checkpoint.created` journal event for a captured
+/// checkpoint.
 async fn record_workspace_checkpoint_created_event(
     runtime_state: &Arc<GatewayRuntimeState>,
     checkpoint: &WorkspaceCheckpointRecord,
 ) {
+    // Journaling is best-effort here: a journal write failure must not fail
+    // a patch whose checkpoint capture already succeeded.
     let _ = record_agent_journal_event(
         runtime_state,
         &RequestContext {
@@ -459,6 +503,8 @@ async fn record_workspace_checkpoint_created_event(
     .await;
 }
 
+/// Records the `workspace.checkpoint.pair_created` journal event once both
+/// checkpoints exist and are linked; best-effort like the created event.
 async fn record_workspace_checkpoint_pair_event(
     runtime_state: &Arc<GatewayRuntimeState>,
     preflight: &WorkspaceCheckpointRecord,
@@ -490,12 +536,17 @@ async fn record_workspace_checkpoint_pair_event(
     .await;
 }
 
+/// Compares the preflight and post-change checkpoints into a bounded summary
+/// (up to 64 files); a compare failure is reported inside the summary rather
+/// than failing the mutation.
 async fn workspace_patch_pair_compare_summary(
     runtime_state: &Arc<GatewayRuntimeState>,
     preflight: &WorkspaceCheckpointRecord,
     post_change: &WorkspaceCheckpointRecord,
 ) -> Value {
     let started = Instant::now();
+    // The `as u64` latency casts below are safe: as_millis() exceeds u64
+    // only after ~584 million years of elapsed time.
     match compare_workspace_anchors(
         runtime_state,
         WorkspaceCompareAnchor::Checkpoint(preflight.checkpoint_id.clone()),
@@ -516,6 +567,7 @@ async fn workspace_patch_pair_compare_summary(
     }
 }
 
+/// Everything needed to render the checkpoint section of the tool output.
 struct WorkspaceCheckpointOutputContext<'a> {
     mutation_id: &'a str,
     risk: &'a WorkspaceMutationRisk,
@@ -527,6 +579,8 @@ struct WorkspaceCheckpointOutputContext<'a> {
     pair_error: Option<&'a str>,
 }
 
+/// Appends checkpoint metadata to the successful patch output, including a
+/// `degraded` flag when any capture or pair-link step failed.
 fn append_workspace_checkpoint_output(
     output_value: &mut Value,
     context: WorkspaceCheckpointOutputContext<'_>,
@@ -534,6 +588,8 @@ fn append_workspace_checkpoint_output(
     let Some(payload) = output_value.as_object_mut() else {
         return;
     };
+    // Post-change values are published under both the `workspace_checkpoint*`
+    // and `post_change_checkpoint*` keys; consumers rely on both spellings.
     if let Some(checkpoint) = context.post_change_checkpoint {
         payload.insert("workspace_checkpoint".to_owned(), checkpoint_output_value(checkpoint));
         payload.insert("post_change_checkpoint".to_owned(), checkpoint_output_value(checkpoint));
@@ -593,10 +649,14 @@ fn checkpoint_output_value(checkpoint: &WorkspaceCheckpointRecord) -> Value {
     })
 }
 
+/// Parses a stored JSON field, falling back to the raw string so malformed
+/// stored JSON still surfaces in events instead of being dropped.
 fn parse_checkpoint_json_field(raw: &str) -> Value {
     serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.to_owned()))
 }
 
+/// Serializes the checkpoint-augmented output value into the success
+/// outcome.
 fn serialize_workspace_patch_success_value(
     proposal_id: &str,
     input_json: &[u8],
@@ -620,6 +680,9 @@ fn serialize_workspace_patch_success_value(
     }
 }
 
+/// Failure outcome for a high-risk mutation refused because its preflight
+/// checkpoint could not be captured; includes the planned (unapplied)
+/// outcome and a degraded pair stub so callers can see what was blocked.
 fn workspace_patch_preflight_failure_outcome(
     proposal_id: &str,
     input_json: &[u8],
