@@ -3352,7 +3352,7 @@ fn cron_job_requires_completion_tool(job: &CronJobRecord) -> bool {
 }
 
 fn cron_prompt_mentions_side_effect(prompt: &str) -> bool {
-    // English and Czech mutation verbs; the routine prompt corpus is bilingual.
+    // Mutation verbs cover the multilingual routine prompt corpus.
     [
         "append", "write", "create", "update", "edit", "save", "delete", "remove", "modify",
         "backup", "generate", "touch", "pridej", "vytvor", "zapis", "uprav", "smaz", "uloz",
