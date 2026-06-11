@@ -666,6 +666,9 @@ fn emit_cron_mutation(event: &str, payload: &Value, json: bool) -> Result<()> {
         json_optional_string_at(routine, "/workdir").unwrap_or_else(|| "none".to_owned()),
         approval_fragment,
     );
+    if let Some(line) = cron_standard_posture_hint_line(event, routine) {
+        println!("{line}");
+    }
     std::io::stdout().flush().context("stdout flush failed")
 }
 
@@ -699,20 +702,62 @@ fn emit_cron_runs(id: &str, payload: &Value, json: bool) -> Result<()> {
     );
     for run in runs {
         println!(
-            "cron.run run_id={} status={} session_key={} workdir={} started_at_ms={} finished_at_ms={} tool_calls={} tool_denies={}",
+            "cron.run run_id={} status={} session_key={} workdir={} execution_posture={} started_at_ms={} finished_at_ms={} tool_calls={} tool_denies={}",
             json_optional_string_at(run, "/run_id").unwrap_or_else(|| "unknown".to_owned()),
             json_optional_string_at(run, "/status").unwrap_or_else(|| "unknown".to_owned()),
             cron_run_session_key_display(run),
             json_optional_string_at(run, "/trigger_payload/workdir")
                 .or_else(|| json_optional_string_at(run, "/workdir"))
                 .unwrap_or_else(|| "none".to_owned()),
+            cron_run_execution_posture(run),
             json_i64_at(run, "/started_at_unix_ms").unwrap_or_default(),
             json_i64_at(run, "/finished_at_unix_ms").unwrap_or_default(),
             json_i64_at(run, "/tool_calls").unwrap_or_default(),
             json_i64_at(run, "/tool_denies").unwrap_or_default(),
         );
+        if let Some(line) = cron_run_remediation_line(run) {
+            println!("{line}");
+        }
     }
     std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn cron_standard_posture_hint_line(event: &str, routine: &Value) -> Option<String> {
+    if !matches!(event, "cron.add" | "cron.update" | "cron.enable") {
+        return None;
+    }
+    if !json_bool_at(routine, "/enabled").unwrap_or(false) {
+        return None;
+    }
+    let execution_posture = json_optional_string_at(routine, "/execution_posture")
+        .unwrap_or_else(|| "standard".to_owned());
+    if execution_posture != "standard" {
+        return None;
+    }
+    Some(format!(
+        "{event}.posture_hint id={} execution_posture=standard sensitive_tools=denied remediation=use_--execution-posture_sensitive-tools_for_file_process_browser_or_os_tools",
+        json_optional_string_at(routine, "/routine_id").unwrap_or_else(|| "unknown".to_owned()),
+    ))
+}
+
+fn cron_run_remediation_line(run: &Value) -> Option<String> {
+    if json_optional_string_at(run, "/status").as_deref() != Some("denied") {
+        return None;
+    }
+    if json_i64_at(run, "/tool_denies").unwrap_or_default() <= 0 {
+        return None;
+    }
+    if cron_run_execution_posture(run) != "standard" {
+        return None;
+    }
+    Some(format!(
+        "cron.run.remediation run_id={} reason=standard_posture_denied_sensitive_tools action=rerun_or_update_with_--execution-posture_sensitive-tools",
+        json_optional_string_at(run, "/run_id").unwrap_or_else(|| "unknown".to_owned()),
+    ))
+}
+
+fn cron_run_execution_posture(run: &Value) -> String {
+    json_optional_string_at(run, "/execution_posture").unwrap_or_else(|| "standard".to_owned())
 }
 
 fn cron_run_session_key(run: &Value) -> Option<String> {
@@ -884,8 +929,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        build_schedule_routine_payload, cron_mutation_json_payload, cron_run_session_key,
-        cron_run_session_key_display, cron_update_only_changes_enabled, ScheduleRoutineConfig,
+        build_schedule_routine_payload, cron_mutation_json_payload, cron_run_remediation_line,
+        cron_run_session_key, cron_run_session_key_display, cron_standard_posture_hint_line,
+        cron_update_only_changes_enabled, ScheduleRoutineConfig,
     };
     use crate::cli::{
         CronConcurrencyPolicyArg, CronMisfirePolicyArg, CronScheduleTypeArg,
@@ -1080,6 +1126,61 @@ mod tests {
             output.pointer("/approval/approval_id").and_then(serde_json::Value::as_str),
             Some("01APPROVAL")
         );
+    }
+
+    #[test]
+    fn cron_standard_posture_hint_explains_sensitive_tool_denials() {
+        let routine = json!({
+            "routine_id": "01CRON",
+            "enabled": true,
+            "execution_posture": "standard"
+        });
+
+        assert_eq!(
+            cron_standard_posture_hint_line("cron.add", &routine).as_deref(),
+            Some(
+                "cron.add.posture_hint id=01CRON execution_posture=standard sensitive_tools=denied remediation=use_--execution-posture_sensitive-tools_for_file_process_browser_or_os_tools"
+            )
+        );
+
+        let disabled = json!({
+            "routine_id": "01CRON",
+            "enabled": false,
+            "execution_posture": "standard"
+        });
+        assert!(cron_standard_posture_hint_line("cron.add", &disabled).is_none());
+
+        let sensitive = json!({
+            "routine_id": "01CRON",
+            "enabled": true,
+            "execution_posture": "sensitive_tools"
+        });
+        assert!(cron_standard_posture_hint_line("cron.add", &sensitive).is_none());
+    }
+
+    #[test]
+    fn cron_run_remediation_explains_standard_tool_denies() {
+        let denied = json!({
+            "run_id": "01RUN",
+            "status": "denied",
+            "execution_posture": "standard",
+            "tool_denies": 3
+        });
+
+        assert_eq!(
+            cron_run_remediation_line(&denied).as_deref(),
+            Some(
+                "cron.run.remediation run_id=01RUN reason=standard_posture_denied_sensitive_tools action=rerun_or_update_with_--execution-posture_sensitive-tools"
+            )
+        );
+
+        let sensitive = json!({
+            "run_id": "01RUN",
+            "status": "denied",
+            "execution_posture": "sensitive_tools",
+            "tool_denies": 3
+        });
+        assert!(cron_run_remediation_line(&sensitive).is_none());
     }
 
     #[test]
