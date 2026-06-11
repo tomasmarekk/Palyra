@@ -1,9 +1,16 @@
+//! ACP status payload helpers for console and command dispatch.
+
 use palyra_common::runtime_contracts::{AcpCapability, AcpCommand, AcpScope};
 use serde_json::{json, Value};
 
 use super::acp_runtime_response;
 use crate::*;
 
+/// Returns the ACP runtime status visible to the current console session.
+///
+/// # Errors
+/// Returns an error response when session authorization or ACP runtime snapshot
+/// loading fails.
 pub(crate) async fn console_acp_status_handler(
     State(state): State<AppState>,
     headers: HeaderMap,

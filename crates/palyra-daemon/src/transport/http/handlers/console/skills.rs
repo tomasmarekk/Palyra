@@ -1,3 +1,9 @@
+//! Console skill inventory, install, verification, and builder handlers.
+//!
+//! These routes manage local skill artifacts and generated builder candidates.
+//! Artifact verification and security audit outcomes are part of the console
+//! trust-chain surface, so JSON shapes must stay stable with `apps/web`.
+
 use crate::gateway::current_unix_ms;
 use crate::journal::{
     LearningCandidateListFilter, LearningCandidateRecord, LearningCandidateReviewRequest,
@@ -9,6 +15,11 @@ use palyra_common::feature_rollouts::{
 };
 use palyra_common::versioned_json::{migrate_updated_at_metadata_v0_to_v1, parse_versioned_json};
 
+/// Lists installed skills with runtime status snapshots.
+///
+/// # Errors
+/// Returns an error response when session authorization, skills-root
+/// resolution, index loading, or runtime status lookup fails.
 pub(crate) async fn console_skills_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -44,6 +55,11 @@ pub(crate) async fn console_skills_list_handler(
     })))
 }
 
+/// Lists generated skill-builder candidates.
+///
+/// # Errors
+/// Returns an error response when session authorization, skills-root
+/// resolution, or candidate-index loading fails.
 pub(crate) async fn console_skill_builder_candidates_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -69,6 +85,12 @@ pub(crate) async fn console_skill_builder_candidates_list_handler(
     })))
 }
 
+/// Creates a generated skill-builder scaffold from a prompt or procedure.
+///
+/// # Errors
+/// Returns an error response when session authorization, rollout checks,
+/// candidate loading, input normalization, scaffold writing, status upsert,
+/// event recording, or candidate-index persistence fails.
 pub(crate) async fn console_skill_builder_candidate_create_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -238,6 +260,12 @@ pub(crate) async fn console_skill_builder_candidate_create_handler(
     })))
 }
 
+/// Installs a skill artifact after verification and security audit.
+///
+/// # Errors
+/// Returns an error response when session authorization, artifact IO,
+/// inspection, trust-store handling, security audit, managed-artifact
+/// persistence, or installed-index persistence fails.
 pub(crate) async fn console_skills_install_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -397,6 +425,11 @@ pub(crate) async fn console_skills_install_handler(
     })))
 }
 
+/// Verifies a managed skill artifact and updates its trust metadata.
+///
+/// # Errors
+/// Returns an error response when session authorization, skill lookup, artifact
+/// IO, trust-store handling, verification, or index persistence fails.
 pub(crate) async fn console_skills_verify_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -443,6 +476,12 @@ pub(crate) async fn console_skills_verify_handler(
     Ok(Json(json!({ "report": report })))
 }
 
+/// Runs a security audit for a managed skill artifact.
+///
+/// # Errors
+/// Returns an error response when session authorization, skill lookup, artifact
+/// IO, trust-store handling, security audit, quarantine status update, or event
+/// recording fails.
 pub(crate) async fn console_skills_audit_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -510,6 +549,11 @@ pub(crate) async fn console_skills_audit_handler(
     })))
 }
 
+/// Marks a skill version as quarantined.
+///
+/// # Errors
+/// Returns an error response when session authorization, input normalization,
+/// status upsert, or event recording fails.
 pub(crate) async fn console_skill_quarantine_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -543,6 +587,11 @@ pub(crate) async fn console_skill_quarantine_handler(
     Ok(Json(skill_status_response(record)))
 }
 
+/// Enables a quarantined skill version after explicit override.
+///
+/// # Errors
+/// Returns an error response when session authorization, override validation,
+/// input normalization, status upsert, or event recording fails.
 pub(crate) async fn console_skill_enable_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -581,6 +630,12 @@ pub(crate) async fn console_skill_enable_handler(
     Ok(Json(skill_status_response(record)))
 }
 
+/// Promotes a reviewed procedure learning candidate to a skill scaffold.
+///
+/// # Errors
+/// Returns an error response when session authorization, candidate loading,
+/// promotability checks, scaffold writing, status upsert, event recording,
+/// candidate-index persistence, or review update fails.
 pub(crate) async fn console_procedure_skill_promote_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -830,6 +885,10 @@ fn normalize_generated_skill_identifier(raw: &str, field: &str) -> Result<String
     Ok(normalized)
 }
 
+/// Loads the generated skill-builder candidate index.
+///
+/// # Errors
+/// Returns an error response when the index file cannot be read or parsed.
 #[allow(clippy::result_large_err)]
 pub(crate) fn load_skill_builder_candidate_index(
     skills_root: &FsPath,

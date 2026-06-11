@@ -1,3 +1,9 @@
+//! Console authentication, session, provider-auth, and auth-profile handlers.
+//!
+//! This module bridges browser console sessions to the auth gRPC service and
+//! provider-specific OAuth/API-key flows. Cookie, CSRF, and handoff token
+//! behavior are security contract for `apps/web` and the desktop handoff.
+
 use crate::app::state::ConsoleBrowserHandoff;
 use crate::*;
 use reqwest::Url;
@@ -6,16 +12,23 @@ const CONSOLE_BROWSER_HANDOFF_TTL_MS: i64 = 60_000;
 const DEFAULT_CONSOLE_BROWSER_REDIRECT_PATH: &str = "/#/control/overview";
 const CONSOLE_BROWSER_HANDOFF_HOST: &str = "127.0.0.1";
 
+/// Browser handoff consume query carrying the one-time handoff token.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct ConsoleBrowserBootstrapQuery {
     token: String,
 }
 
+/// Browser session bootstrap request carrying the one-time handoff token.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct ConsoleBrowserBootstrapRequest {
     token: String,
 }
 
+/// Creates a console session from admin credentials.
+///
+/// # Errors
+/// Returns an error response when login input is invalid, admin auth fails,
+/// header values cannot be encoded, or the system clock cannot be read.
 pub(crate) async fn console_login_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -110,6 +123,11 @@ pub(crate) async fn console_login_handler(
     ))
 }
 
+/// Signs out the active console session and clears the session cookie.
+///
+/// # Errors
+/// Returns an error response when session authorization or cookie clearing
+/// fails.
 pub(crate) async fn console_logout_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -124,6 +142,11 @@ pub(crate) async fn console_logout_handler(
     Ok((response_headers, Json(json!({ "signed_out": true }))))
 }
 
+/// Mints a desktop/browser handoff URL for an authorized console session.
+///
+/// # Errors
+/// Returns an error response when session authorization fails or the redirect
+/// target cannot be normalized.
 pub(crate) async fn console_browser_handoff_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -137,6 +160,11 @@ pub(crate) async fn console_browser_handoff_handler(
     )?))
 }
 
+/// Creates a one-time same-origin browser handoff token.
+///
+/// # Errors
+/// Returns an error response when the redirect path is invalid or the system
+/// clock cannot be read.
 #[allow(clippy::result_large_err)]
 pub(crate) fn create_console_browser_handoff(
     state: &AppState,
@@ -171,6 +199,11 @@ pub(crate) fn create_console_browser_handoff(
     Ok(control_plane::ConsoleBrowserHandoffEnvelope { handoff_url, expires_at_unix_ms })
 }
 
+/// Consumes a handoff token from the browser and redirects to the dashboard.
+///
+/// # Errors
+/// Returns an error response when the token is invalid/expired, the clock read
+/// fails, or the redirect location cannot be encoded.
 pub(crate) async fn console_browser_bootstrap_handler(
     State(state): State<AppState>,
     Query(query): Query<ConsoleBrowserBootstrapQuery>,
@@ -204,6 +237,11 @@ pub(crate) async fn console_browser_bootstrap_handler(
     Ok(response)
 }
 
+/// Converts a valid handoff token into a browser console session.
+///
+/// # Errors
+/// Returns an error response when the token is invalid/expired, cookie encoding
+/// fails, or the system clock cannot be read.
 pub(crate) async fn console_browser_session_bootstrap_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -227,6 +265,10 @@ pub(crate) async fn console_browser_session_bootstrap_handler(
     ))
 }
 
+/// Returns the current console session envelope.
+///
+/// # Errors
+/// Returns an error response when session authorization fails.
 pub(crate) async fn console_session_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -235,6 +277,11 @@ pub(crate) async fn console_session_handler(
     Ok(Json(build_console_session_response(&state, &session, session.csrf_token.clone())))
 }
 
+/// Returns the control-plane capability catalog for the console.
+///
+/// # Errors
+/// Returns an error response when session authorization fails or the catalog
+/// cannot be built.
 pub(crate) async fn console_capability_catalog_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -243,6 +290,10 @@ pub(crate) async fn console_capability_catalog_handler(
     Ok(Json(build_capability_catalog()?))
 }
 
+/// Returns the current deployment posture summary.
+///
+/// # Errors
+/// Returns an error response when session authorization fails.
 pub(crate) async fn console_deployment_posture_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -251,6 +302,11 @@ pub(crate) async fn console_deployment_posture_handler(
     Ok(Json(build_deployment_posture_summary(&state)))
 }
 
+/// Lists auth profiles through the console auth service adapter.
+///
+/// # Errors
+/// Returns an error response when session authorization, RPC context encoding,
+/// profile conversion, or the auth service call fails.
 pub(crate) async fn console_auth_profiles_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -294,6 +350,11 @@ pub(crate) async fn console_auth_profiles_list_handler(
     }))
 }
 
+/// Loads one auth profile by id.
+///
+/// # Errors
+/// Returns an error response when session authorization, profile id validation,
+/// RPC context encoding, profile conversion, or the auth service call fails.
 pub(crate) async fn console_auth_profile_get_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -326,6 +387,11 @@ pub(crate) async fn console_auth_profile_get_handler(
     }))
 }
 
+/// Creates or updates one auth profile.
+///
+/// # Errors
+/// Returns an error response when session authorization, profile conversion,
+/// RPC context encoding, or the auth service call fails.
 pub(crate) async fn console_auth_profile_upsert_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -357,6 +423,12 @@ pub(crate) async fn console_auth_profile_upsert_handler(
     }))
 }
 
+/// Deletes one auth profile and clears provider selections that reference it.
+///
+/// # Errors
+/// Returns an error response when session authorization, id validation,
+/// pre-delete lookup, RPC context encoding, model-provider cleanup, or the auth
+/// service call fails.
 pub(crate) async fn console_auth_profile_delete_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -410,6 +482,11 @@ pub(crate) async fn console_auth_profile_delete_handler(
     }))
 }
 
+/// Returns auth health and optional profile details for the console.
+///
+/// # Errors
+/// Returns an error response when session authorization, RPC context encoding,
+/// or the auth service call fails.
 pub(crate) async fn console_auth_health_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -440,6 +517,11 @@ pub(crate) async fn console_auth_health_handler(
     }))
 }
 
+/// Returns auth runtime doctor records for an optional agent.
+///
+/// # Errors
+/// Returns an error response when session authorization, authorization,
+/// query normalization, blocking worker execution, or registry access fails.
 pub(crate) async fn console_auth_doctor_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -488,6 +570,11 @@ pub(crate) async fn console_auth_doctor_handler(
     })))
 }
 
+/// Returns auth runtime audit state and recent auth journal events.
+///
+/// # Errors
+/// Returns an error response when session authorization, authorization, query
+/// normalization, registry access, worker execution, or journal lookup fails.
 pub(crate) async fn console_auth_audit_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -543,6 +630,11 @@ pub(crate) async fn console_auth_audit_handler(
     })))
 }
 
+/// Explains how an auth profile would be selected for a request.
+///
+/// # Errors
+/// Returns an error response when session authorization, authorization, input
+/// parsing, worker execution, or registry lookup fails.
 pub(crate) async fn console_auth_selection_explain_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -590,6 +682,11 @@ pub(crate) async fn console_auth_selection_explain_handler(
     })))
 }
 
+/// Clears cooldown state for one auth profile.
+///
+/// # Errors
+/// Returns an error response when session authorization, authorization, profile
+/// id validation, worker execution, registry mutation, or audit logging fails.
 pub(crate) async fn console_auth_profile_cooldown_clear_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -629,6 +726,12 @@ pub(crate) async fn console_auth_profile_cooldown_clear_handler(
     })))
 }
 
+/// Sets the explicit auth-profile order for a provider and optional agent.
+///
+/// # Errors
+/// Returns an error response when session authorization, authorization, payload
+/// validation, provider parsing, worker execution, registry mutation, or audit
+/// logging fails.
 pub(crate) async fn console_auth_profile_order_set_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -782,6 +885,11 @@ fn auth_audit_event_json(event: &crate::journal::JournalEventRecord) -> Option<V
     }))
 }
 
+/// Returns OpenAI provider-auth state for the console.
+///
+/// # Errors
+/// Returns an error response when session authorization, auth-profile listing,
+/// or config snapshot loading fails.
 pub(crate) async fn console_openai_provider_state_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -798,6 +906,11 @@ pub(crate) async fn console_openai_provider_state_handler(
     Ok(Json(build_openai_provider_state(&document, profiles)))
 }
 
+/// Returns Anthropic provider-auth state for the console.
+///
+/// # Errors
+/// Returns an error response when session authorization, auth-profile listing,
+/// or config snapshot loading fails.
 pub(crate) async fn console_anthropic_provider_state_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -814,6 +927,11 @@ pub(crate) async fn console_anthropic_provider_state_handler(
     Ok(Json(build_provider_state(&document, profiles, ModelProviderAuthProviderKind::Anthropic)))
 }
 
+/// Returns Minimax provider-auth state for the console.
+///
+/// # Errors
+/// Returns an error response when session authorization, auth-profile listing,
+/// or config snapshot loading fails.
 pub(crate) async fn console_minimax_provider_state_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -825,6 +943,11 @@ pub(crate) async fn console_minimax_provider_state_handler(
     Ok(Json(build_provider_state(&document, profiles, ModelProviderAuthProviderKind::Minimax)))
 }
 
+/// Connects or updates an OpenAI API-key profile.
+///
+/// # Errors
+/// Returns an error response when session authorization or provider connection
+/// fails.
 pub(crate) async fn console_openai_provider_api_key_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -854,6 +977,11 @@ pub(crate) async fn console_openai_provider_api_key_handler(
     }
 }
 
+/// Connects or updates an Anthropic API-key profile.
+///
+/// # Errors
+/// Returns an error response when session authorization or provider connection
+/// fails.
 pub(crate) async fn console_anthropic_provider_api_key_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -883,6 +1011,11 @@ pub(crate) async fn console_anthropic_provider_api_key_handler(
     }
 }
 
+/// Connects or updates a Minimax API-key profile.
+///
+/// # Errors
+/// Returns an error response when session authorization or provider connection
+/// fails.
 pub(crate) async fn console_minimax_provider_api_key_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -912,6 +1045,11 @@ pub(crate) async fn console_minimax_provider_api_key_handler(
     }
 }
 
+/// Starts an OpenAI OAuth bootstrap attempt.
+///
+/// # Errors
+/// Returns an error response when session authorization or OAuth bootstrap
+/// setup fails.
 pub(crate) async fn console_openai_provider_bootstrap_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -942,6 +1080,11 @@ pub(crate) async fn console_openai_provider_bootstrap_handler(
     }
 }
 
+/// Starts a Minimax OAuth bootstrap attempt.
+///
+/// # Errors
+/// Returns an error response when session authorization or OAuth bootstrap
+/// setup fails.
 pub(crate) async fn console_minimax_provider_bootstrap_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -971,6 +1114,11 @@ pub(crate) async fn console_minimax_provider_bootstrap_handler(
     }
 }
 
+/// Returns OpenAI OAuth callback state for a pending attempt.
+///
+/// # Errors
+/// Returns an error response when session authorization fails or the callback
+/// state cannot be loaded.
 pub(crate) async fn console_openai_provider_callback_state_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -980,6 +1128,11 @@ pub(crate) async fn console_openai_provider_callback_state_handler(
     load_openai_oauth_callback_state(&state, query.attempt_id.as_str()).await.map(Json)
 }
 
+/// Returns Minimax OAuth callback state for a pending attempt.
+///
+/// # Errors
+/// Returns an error response when session authorization fails or the callback
+/// state cannot be loaded.
 pub(crate) async fn console_minimax_provider_callback_state_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -989,6 +1142,10 @@ pub(crate) async fn console_minimax_provider_callback_state_handler(
     load_minimax_oauth_callback_state(&state, query.attempt_id.as_str()).await.map(Json)
 }
 
+/// Completes an OpenAI OAuth callback and renders the result page.
+///
+/// # Errors
+/// Returns an error response when the callback cannot be completed.
 pub(crate) async fn console_openai_provider_callback_handler(
     State(state): State<AppState>,
     Query(query): Query<ConsoleOpenAiCallbackQuery>,
@@ -1013,6 +1170,11 @@ pub(crate) async fn console_openai_provider_callback_handler(
     }
 }
 
+/// Starts a reconnect flow for an existing OpenAI OAuth profile.
+///
+/// # Errors
+/// Returns an error response when session authorization or reconnect bootstrap
+/// fails.
 pub(crate) async fn console_openai_provider_reconnect_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1042,6 +1204,11 @@ pub(crate) async fn console_openai_provider_reconnect_handler(
     }
 }
 
+/// Starts a reconnect flow for an existing Minimax OAuth profile.
+///
+/// # Errors
+/// Returns an error response when session authorization or reconnect bootstrap
+/// fails.
 pub(crate) async fn console_minimax_provider_reconnect_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1071,6 +1238,11 @@ pub(crate) async fn console_minimax_provider_reconnect_handler(
     }
 }
 
+/// Refreshes an OpenAI OAuth profile.
+///
+/// # Errors
+/// Returns an error response when session authorization or provider refresh
+/// fails.
 pub(crate) async fn console_openai_provider_refresh_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1100,6 +1272,11 @@ pub(crate) async fn console_openai_provider_refresh_handler(
     }
 }
 
+/// Refreshes a Minimax OAuth profile.
+///
+/// # Errors
+/// Returns an error response when session authorization or provider refresh
+/// fails.
 pub(crate) async fn console_minimax_provider_refresh_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1129,6 +1306,11 @@ pub(crate) async fn console_minimax_provider_refresh_handler(
     }
 }
 
+/// Revokes an OpenAI provider-auth profile.
+///
+/// # Errors
+/// Returns an error response when session authorization or provider revoke
+/// fails.
 pub(crate) async fn console_openai_provider_revoke_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1158,6 +1340,11 @@ pub(crate) async fn console_openai_provider_revoke_handler(
     }
 }
 
+/// Selects an OpenAI auth profile as default for model-provider use.
+///
+/// # Errors
+/// Returns an error response when session authorization or default selection
+/// fails.
 pub(crate) async fn console_openai_provider_default_profile_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1167,6 +1354,11 @@ pub(crate) async fn console_openai_provider_default_profile_handler(
     select_default_openai_auth_profile(&state, &session.context, payload).await.map(Json)
 }
 
+/// Revokes an Anthropic provider-auth profile.
+///
+/// # Errors
+/// Returns an error response when session authorization or provider revoke
+/// fails.
 pub(crate) async fn console_anthropic_provider_revoke_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1196,6 +1388,11 @@ pub(crate) async fn console_anthropic_provider_revoke_handler(
     }
 }
 
+/// Revokes a Minimax provider-auth profile.
+///
+/// # Errors
+/// Returns an error response when session authorization or provider revoke
+/// fails.
 pub(crate) async fn console_minimax_provider_revoke_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1225,6 +1422,11 @@ pub(crate) async fn console_minimax_provider_revoke_handler(
     }
 }
 
+/// Selects an Anthropic auth profile as default for model-provider use.
+///
+/// # Errors
+/// Returns an error response when session authorization or default selection
+/// fails.
 pub(crate) async fn console_anthropic_provider_default_profile_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1234,6 +1436,11 @@ pub(crate) async fn console_anthropic_provider_default_profile_handler(
     select_default_anthropic_auth_profile(&state, &session.context, payload).await.map(Json)
 }
 
+/// Selects a Minimax auth profile as default for model-provider use.
+///
+/// # Errors
+/// Returns an error response when session authorization or default selection
+/// fails.
 pub(crate) async fn console_minimax_provider_default_profile_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1243,6 +1450,7 @@ pub(crate) async fn console_minimax_provider_default_profile_handler(
     select_default_minimax_auth_profile(&state, &session.context, payload).await.map(Json)
 }
 
+/// Issues and stores a console session with a CSRF token.
 pub(crate) fn issue_console_session(
     state: &AppState,
     context: gateway::RequestContext,
@@ -1282,6 +1490,10 @@ pub(crate) fn issue_console_session(
     (session_token, session)
 }
 
+/// Consumes a one-time browser handoff token.
+///
+/// # Errors
+/// Returns an error response when the token is invalid or expired.
 #[allow(clippy::result_large_err)]
 pub(crate) fn consume_console_browser_handoff(
     state: &AppState,

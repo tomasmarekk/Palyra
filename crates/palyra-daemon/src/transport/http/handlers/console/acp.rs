@@ -1,3 +1,9 @@
+//! Console ACP command bridge and HTTP entrypoints.
+//!
+//! The REST endpoint unwraps a console session into an ACP client context and
+//! dispatches commands through the same runtime-contract envelopes used by
+//! realtime clients.
+
 use std::collections::BTreeSet;
 
 use palyra_common::runtime_contracts::{
@@ -42,13 +48,20 @@ pub(crate) use bindings::{
 };
 pub(crate) use status::console_acp_status_handler;
 
+/// HTTP request body for dispatching one ACP command envelope.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AcpHttpCommandRequest {
+    /// Client context supplied by the ACP client.
     pub(crate) client: AcpClientContext,
+    /// Command envelope carrying command, params, and idempotency key.
     pub(crate) command: AcpCommandEnvelope,
 }
 
+/// Dispatches one ACP command through the console HTTP bridge.
+///
+/// # Errors
+/// Returns an error response when console session authorization fails.
 pub(crate) async fn console_acp_command_handler(
     State(state): State<AppState>,
     headers: HeaderMap,

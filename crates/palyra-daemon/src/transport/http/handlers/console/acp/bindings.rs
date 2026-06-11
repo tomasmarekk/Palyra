@@ -1,3 +1,8 @@
+//! REST handlers for ACP conversation-binding management.
+//!
+//! These routes expose list/get/upsert/detach/repair operations for the console
+//! while preserving owner checks before returning binding details.
+
 use palyra_common::runtime_contracts::AcpCursor;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -9,6 +14,7 @@ use crate::{
     transport::grpc::auth::RequestContext,
 };
 
+/// Query parameters for listing conversation bindings.
 #[derive(Debug, Deserialize)]
 pub(crate) struct BindingListQuery {
     owner_principal: Option<String>,
@@ -19,6 +25,7 @@ pub(crate) struct BindingListQuery {
     limit: Option<usize>,
 }
 
+/// Request body for upserting one conversation binding.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConversationBindingUpsertRequest {
@@ -34,12 +41,18 @@ pub(crate) struct ConversationBindingUpsertRequest {
     last_event_id: Option<String>,
 }
 
+/// Request body for applying a generated binding repair plan.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BindingRepairApplyRequest {
     apply: bool,
 }
 
+/// Lists conversation and session bindings visible to the console session.
+///
+/// # Errors
+/// Returns an error response when session authorization, owner enforcement, or
+/// ACP runtime access fails.
 pub(crate) async fn console_bindings_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -72,6 +85,11 @@ pub(crate) async fn console_bindings_list_handler(
     })))
 }
 
+/// Upserts one conversation binding for the console session owner.
+///
+/// # Errors
+/// Returns an error response when session authorization or ACP runtime mutation
+/// fails.
 pub(crate) async fn console_binding_upsert_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -101,6 +119,11 @@ pub(crate) async fn console_binding_upsert_handler(
     Ok(Json(json!({ "binding": binding })))
 }
 
+/// Returns one binding or binding explanation by id.
+///
+/// # Errors
+/// Returns an error response when session authorization, ACP lookup, or owner
+/// enforcement fails.
 pub(crate) async fn console_binding_get_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -119,6 +142,11 @@ pub(crate) async fn console_binding_get_handler(
     Ok(Json(json!({ "binding": snapshot })))
 }
 
+/// Detaches one conversation binding.
+///
+/// # Errors
+/// Returns an error response when session authorization, ACP lookup, owner
+/// enforcement, or detach mutation fails.
 pub(crate) async fn console_binding_detach_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -144,6 +172,11 @@ pub(crate) async fn console_binding_detach_handler(
     Ok(Json(json!({ "binding": detached })))
 }
 
+/// Builds a binding repair plan for an admin principal.
+///
+/// # Errors
+/// Returns an error response when session authorization, admin enforcement, or
+/// ACP runtime planning fails.
 pub(crate) async fn console_bindings_repair_plan_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -155,6 +188,11 @@ pub(crate) async fn console_bindings_repair_plan_handler(
     Ok(Json(json!({ "plan": plan })))
 }
 
+/// Applies or previews a binding repair plan for an admin principal.
+///
+/// # Errors
+/// Returns an error response when session authorization, admin enforcement, or
+/// ACP runtime repair fails.
 pub(crate) async fn console_bindings_repair_apply_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -180,6 +218,11 @@ pub(crate) async fn console_bindings_repair_apply_handler(
     Ok(Json(json!({ "plan": plan, "applied": true })))
 }
 
+/// Explains one binding's current ACP state.
+///
+/// # Errors
+/// Returns an error response when session authorization, ACP explanation, or
+/// owner enforcement fails.
 pub(crate) async fn console_binding_explain_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
