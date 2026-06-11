@@ -534,12 +534,13 @@ pub(crate) async fn run_memory_async(
                 );
             }
         }
-        MemoryCommand::Purge { session, channel, principal, json } => {
+        MemoryCommand::Purge { session, channel, principal, yes, json } => {
             if !principal && session.is_none() && channel.is_none() {
                 return Err(anyhow!(
                     "memory purge requires one of: --principal, --session, or --channel"
                 ));
             }
+            validate_memory_purge_confirmation(yes)?;
             let session_id =
                 resolve_optional_memory_session_id(session, &connection, "memory purge --session")
                     .await?;
@@ -630,6 +631,16 @@ pub(crate) async fn run_memory_async(
     }
 
     std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn validate_memory_purge_confirmation(confirmed: bool) -> Result<()> {
+    if confirmed {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "memory purge requires --yes to confirm irreversible deletion for the selected scope"
+        ))
+    }
 }
 
 /// Executes admin memory commands against the `/console/v1/memory/*` admin API.
@@ -1554,7 +1565,8 @@ mod tests {
     use super::{
         attach_manual_ingest_visibility, memory_embeddings_degraded_line,
         memory_search_claim_boundary, memory_search_output_payload, memory_session_scope_label,
-        replace_memory_item, resolve_optional_query_arg, MemoryReplaceOptions, MemoryReplaceRpc,
+        replace_memory_item, resolve_optional_query_arg, validate_memory_purge_confirmation,
+        MemoryReplaceOptions, MemoryReplaceRpc,
     };
     use crate::{common_v1, memory_v1, AgentConnection, CANONICAL_PROTOCOL_MAJOR};
     use serde_json::{json, Value};
@@ -1835,6 +1847,14 @@ mod tests {
         });
 
         assert_eq!(memory_embeddings_degraded_line(&payload), None);
+    }
+
+    #[test]
+    fn memory_purge_requires_explicit_confirmation() {
+        let error = validate_memory_purge_confirmation(false)
+            .expect_err("missing confirmation should fail before RPC");
+        assert!(error.to_string().contains("requires --yes"), "{error:?}");
+        validate_memory_purge_confirmation(true).expect("confirmation should pass");
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -101,6 +101,36 @@ pub(crate) fn authorize_memory_action(
     authorize_policy_action(principal, action, resource, "memory")
 }
 
+/// Authorizes destructive memory purge operations.
+///
+/// # Errors
+/// Returns `Status::permission_denied` when the principal lacks an
+/// admin/system prefix and `Status::internal` when policy evaluation fails.
+#[allow(clippy::result_large_err)]
+pub(crate) fn authorize_memory_purge_action(
+    principal: &str,
+    action: &str,
+    resource: &str,
+) -> Result<(), Status> {
+    evaluate_with_config(
+        &PolicyRequest {
+            principal: principal.to_owned(),
+            action: action.to_owned(),
+            resource: resource.to_owned(),
+        },
+        &PolicyEvaluationConfig::default(),
+    )
+    .map_err(|error| {
+        Status::internal(format!("failed to evaluate memory purge policy: {error}"))
+    })?;
+    if principal_has_sensitive_service_role(principal, SensitiveServiceRole::AdminOrSystem) {
+        return Ok(());
+    }
+    Err(Status::permission_denied(format!(
+        "policy denied action '{action}' on '{resource}': memory purge requires admin/system principal prefix"
+    )))
+}
+
 /// Authorizes a vault service action through the default policy.
 ///
 /// # Errors

@@ -3953,7 +3953,7 @@ async fn grpc_cron_jobs_survive_daemon_restart() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn grpc_memory_ingest_search_list_and_purge_requires_explicit_approval() -> Result<()> {
+async fn grpc_memory_ingest_search_list_and_purge_requires_elevated_principal() -> Result<()> {
     let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
@@ -4044,11 +4044,11 @@ async fn grpc_memory_ingest_search_list_and_purge_requires_explicit_approval() -
     let purge_error = memory_client
         .purge_memory(purge_request)
         .await
-        .expect_err("memory purge should require explicit approval by default");
+        .expect_err("memory purge should require an elevated principal");
     assert_eq!(purge_error.code(), Code::PermissionDenied);
     assert!(
-        purge_error.message().contains("explicit user approval required"),
-        "permission denied response should explain approval requirement"
+        purge_error.message().contains("admin/system principal prefix"),
+        "permission denied response should explain elevated principal requirement"
     );
 
     let mut get_request = tonic::Request::new(memory_v1::GetMemoryItemRequest {
@@ -4270,7 +4270,7 @@ async fn grpc_memory_search_and_list_default_to_authenticated_channel() -> Resul
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn grpc_memory_purge_all_requires_explicit_approval_before_scope_evaluation() -> Result<()> {
+async fn grpc_memory_purge_all_requires_elevated_principal_before_scope_evaluation() -> Result<()> {
     let (child, admin_port, grpc_port, _journal_db_path) = spawn_palyrad_with_dynamic_ports()?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
@@ -4341,11 +4341,11 @@ async fn grpc_memory_purge_all_requires_explicit_approval_before_scope_evaluatio
     let purge_error = memory_client
         .purge_memory(purge_request)
         .await
-        .expect_err("purge_all_principal should require explicit approval by default");
+        .expect_err("purge_all_principal should require an elevated principal");
     assert_eq!(purge_error.code(), Code::PermissionDenied);
     assert!(
-        purge_error.message().contains("explicit user approval required"),
-        "permission denied response should explain approval requirement"
+        purge_error.message().contains("admin/system principal prefix"),
+        "permission denied response should explain elevated principal requirement"
     );
 
     let mut preserved_cli_get = tonic::Request::new(memory_v1::GetMemoryItemRequest {

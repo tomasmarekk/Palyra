@@ -80,8 +80,8 @@ use crate::application::{
     route_message::approval::resolve_route_tool_approval_outcome,
     route_message::response::parse_route_message_structured_output,
     service_authorization::{
-        authorize_approvals_action, authorize_memory_action, principal_has_sensitive_service_role,
-        SensitiveServiceRole,
+        authorize_approvals_action, authorize_memory_action, authorize_memory_purge_action,
+        principal_has_sensitive_service_role, SensitiveServiceRole,
     },
     session_compaction::{
         apply_session_compaction, configure_test_write_failure_path, SessionCompactionApplyRequest,
@@ -2909,6 +2909,25 @@ fn approvals_authorization_requires_admin_or_system_principal() {
     assert!(
         authorize_approvals_action("system:cron", "approvals.list", "approvals:records").is_ok(),
         "system principal should pass approvals guard"
+    );
+}
+
+#[test]
+fn memory_purge_authorization_requires_admin_or_system_principal() {
+    let denied = authorize_memory_purge_action("user:ops", "memory.purge", "memory:items")
+        .expect_err("non-admin principal should be denied");
+    assert_eq!(denied.code(), Code::PermissionDenied);
+    assert!(
+        denied.message().contains("admin/system principal prefix"),
+        "denial should explain the elevated principal requirement"
+    );
+    assert!(
+        authorize_memory_purge_action("admin:ops", "memory.purge", "memory:items").is_ok(),
+        "admin principal should pass memory purge guard"
+    );
+    assert!(
+        authorize_memory_purge_action("system:cron", "memory.purge", "memory:items").is_ok(),
+        "system principal should pass memory purge guard"
     );
 }
 

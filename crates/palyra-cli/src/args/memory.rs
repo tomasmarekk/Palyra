@@ -101,6 +101,12 @@ pub enum MemoryCommand {
         channel: Option<String>,
         #[arg(long, default_value_t = false)]
         principal: bool,
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Confirm irreversible deletion for the selected memory scope"
+        )]
+        yes: bool,
         #[arg(long, default_value_t = false)]
         json: bool,
     },

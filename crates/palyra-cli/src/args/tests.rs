@@ -2729,7 +2729,25 @@ fn parse_memory_purge() {
                 session: Some("01ARZ3NDEKTSV4RRFFQ69G5FB0".to_owned()),
                 channel: None,
                 principal: false,
+                yes: false,
                 json: true,
+            }
+        }
+    );
+}
+
+#[test]
+fn parse_memory_purge_confirmation() {
+    let parsed = Cli::parse_from(["palyra", "memory", "purge", "--principal", "--yes"]);
+    assert_eq!(
+        parsed.command,
+        Command::Memory {
+            command: MemoryCommand::Purge {
+                session: None,
+                channel: None,
+                principal: true,
+                yes: true,
+                json: false,
             }
         }
     );
