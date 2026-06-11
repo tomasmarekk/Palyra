@@ -812,11 +812,7 @@ fn build_root_context(
 }
 
 fn resolve_output_format(root: &RootOptions) -> OutputFormatArg {
-    if root.plain {
-        OutputFormatArg::Text
-    } else {
-        root.output_format
-    }
+    root.output_format
 }
 
 fn resolve_log_level(root: &RootOptions) -> LogLevelArg {
@@ -832,9 +828,6 @@ fn new_cli_trace_id() -> String {
 }
 
 fn resolve_output_format_from_raw_args(args: &[OsString]) -> OutputFormatArg {
-    if raw_flag_present(args, "--plain") {
-        return OutputFormatArg::Text;
-    }
     raw_option_value(args, "--output-format")
         .and_then(|value| parse_output_format_value(value.as_str()))
         .unwrap_or_default()

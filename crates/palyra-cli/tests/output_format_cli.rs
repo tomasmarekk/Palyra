@@ -121,6 +121,53 @@ fn global_output_format_json_is_honored_for_early_cli_errors() -> Result<()> {
 }
 
 #[test]
+fn global_plain_does_not_override_json_output_format() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let config_path = bootstrap_local_config(&workdir)?;
+
+    let missing_config = run_cli(
+        &workdir,
+        &["--plain", "--output-format", "json", "--config", "missing.toml", "status"],
+    )?;
+    assert!(!missing_config.status.success(), "missing config should fail");
+    let missing_config_payload =
+        parse_stderr_json(&missing_config, "--plain missing config --output-format json")?;
+    assert_eq!(
+        missing_config_payload.pointer("/error/kind").and_then(Value::as_str),
+        Some("not_found")
+    );
+
+    for args in [
+        [
+            "--plain",
+            "--output-format",
+            "json",
+            "config",
+            "validate",
+            "--path",
+            config_path.as_str(),
+        ],
+        [
+            "--output-format",
+            "json",
+            "--plain",
+            "config",
+            "validate",
+            "--path",
+            config_path.as_str(),
+        ],
+    ] {
+        let payload = parse_stdout_json(
+            run_cli(&workdir, &args)?,
+            "--plain --output-format json config validate",
+        )?;
+        assert_eq!(payload.get("status").and_then(Value::as_str), Some("valid"));
+    }
+
+    Ok(())
+}
+
+#[test]
 fn command_level_health_json_reports_unavailable_runtime_as_json() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let output = run_cli(
