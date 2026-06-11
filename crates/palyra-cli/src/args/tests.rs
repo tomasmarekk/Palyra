@@ -6105,6 +6105,24 @@ fn parse_secrets_set_with_stdin() {
 }
 
 #[test]
+fn secrets_set_help_documents_stdin_value_input() {
+    let mut command = Cli::command();
+    let help = command
+        .find_subcommand_mut("secrets")
+        .and_then(|secrets| secrets.find_subcommand_mut("set"))
+        .expect("secrets set subcommand should be registered")
+        .render_long_help()
+        .to_string();
+
+    assert!(
+        help.contains("--value-stdin")
+            && help.contains("Read the secret value from stdin")
+            && help.contains("never accepted as argv"),
+        "secrets set help should document stdin-only secret values: {help}"
+    );
+}
+
+#[test]
 fn parse_secrets_get_with_reveal() {
     let parsed =
         Cli::parse_from(["palyra", "secrets", "get", "global", "openai_api_key", "--reveal"]);

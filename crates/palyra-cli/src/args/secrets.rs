@@ -7,6 +7,8 @@ use clap::Subcommand;
 
 const VAULT_SCOPE_HELP: &str =
     "Secret scope: global | principal:<id> | channel:<name>:<account_id> | skill:<skill_id>";
+const VALUE_STDIN_HELP: &str =
+    "Read the secret value from stdin; secret values are never accepted as argv";
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum SecretsCommand {
@@ -14,7 +16,7 @@ pub enum SecretsCommand {
         #[arg(help = VAULT_SCOPE_HELP)]
         scope: String,
         key: String,
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, help = VALUE_STDIN_HELP)]
         value_stdin: bool,
     },
     Get {
@@ -89,7 +91,7 @@ pub enum SecretsConfigureCommand {
         #[arg(help = VAULT_SCOPE_HELP)]
         scope: String,
         key: String,
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, help = VALUE_STDIN_HELP)]
         value_stdin: bool,
         #[arg(long)]
         path: Option<String>,
@@ -102,7 +104,7 @@ pub enum SecretsConfigureCommand {
         #[arg(help = VAULT_SCOPE_HELP)]
         scope: String,
         key: String,
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, help = VALUE_STDIN_HELP)]
         value_stdin: bool,
         #[arg(long)]
         path: Option<String>,
