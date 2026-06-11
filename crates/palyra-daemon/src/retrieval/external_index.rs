@@ -1,3 +1,11 @@
+//! External derived retrieval index runtime for the preview backend.
+//!
+//! Tracks a simulated checkpoint of journal-derived memory/workspace projections,
+//! detects and reconciles drift against [`JournalStore`] counts, and recomputes
+//! the scale SLOs that gate the external preview. The journal remains the source
+//! of truth: this runtime only reports freshness/drift posture consumed by
+//! [`super::ExternalDerivedRetrievalBackend`]; it never serves candidates.
+
 use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
@@ -6,11 +14,14 @@ use crate::journal::{JournalError, JournalStore};
 
 use super::{ExternalRetrievalIndex, ExternalRetrievalIndexSnapshot, RetrievalBackendState};
 
+// Preview gate SLO targets. The fallback-rate target is intentionally tight (5%) and
+// the reconciliation target high (95%) so the gate fails closed under churn.
 const DEFAULT_EXTERNAL_INDEX_FRESHNESS_SLO_MS: u64 = 60_000;
 const DEFAULT_EXTERNAL_QUERY_LATENCY_SLO_MS: u64 = 250;
 const DEFAULT_EXTERNAL_DEGRADED_FALLBACK_RATE_BPS: u32 = 500;
 const DEFAULT_EXTERNAL_RECONCILIATION_SUCCESS_RATE_BPS: u32 = 9_500;
 
+/// Measured-vs-target SLO posture for the external index, plus the preview gate verdict.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ExternalRetrievalScaleSloSnapshot {
     pub(crate) freshness_lag_ms: Option<u64>,
@@ -29,6 +40,8 @@ pub(crate) struct ExternalRetrievalScaleSloSnapshot {
 }
 
 impl Default for ExternalRetrievalScaleSloSnapshot {
+    // Fail-closed defaults: before the first checkpoint, freshness and reconciliation
+    // are unmet and the fallback rate reads 100%, so the preview gate starts blocked.
     fn default() -> Self {
         Self {
             freshness_lag_ms: None,
@@ -48,6 +61,7 @@ impl Default for ExternalRetrievalScaleSloSnapshot {
     }
 }
 
+/// Result of one indexer batch: counts advanced, what remains, and checkpoint status.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ExternalRetrievalIndexerOutcome {
     pub(crate) ran_at_unix_ms: i64,
@@ -63,6 +77,7 @@ pub(crate) struct ExternalRetrievalIndexerOutcome {
     pub(crate) retry_policy: String,
 }
 
+/// Indexed-vs-journal count comparison; positive drift means the index is behind.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ExternalRetrievalDriftReport {
     pub(crate) checked_at_unix_ms: i64,
@@ -77,6 +92,7 @@ pub(crate) struct ExternalRetrievalDriftReport {
     pub(crate) reconciliation_required: bool,
 }
 
+/// Drift before/after a reconciliation backfill, plus the indexer run that repaired it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ExternalRetrievalReconciliationOutcome {
     pub(crate) checked_at_unix_ms: i64,
@@ -86,6 +102,10 @@ pub(crate) struct ExternalRetrievalReconciliationOutcome {
     pub(crate) success: bool,
 }
 
+// AIDEV-NOTE: search_attempts, degraded_fallbacks, and query_latency_samples_ms have
+// no writers yet -- only reconcile() updates its counters. Until search paths record
+// attempts, the fallback-rate and latency SLOs always come from the zero-total
+// defaults in rate_bps/percentile_95 (state-derived rate, 0 ms p95).
 #[derive(Debug, Clone)]
 struct ExternalRetrievalRuntimeState {
     snapshot: ExternalRetrievalIndexSnapshot,
@@ -96,6 +116,10 @@ struct ExternalRetrievalRuntimeState {
     reconciliation_successes: u64,
 }
 
+/// In-memory checkpoint state machine for the external derived index preview.
+///
+/// All mutation happens under one [`RwLock`]; lock poisoning is recovered via
+/// `into_inner` because the state is a plain snapshot with no torn invariants.
 #[derive(Debug)]
 pub(crate) struct ExternalRetrievalRuntime {
     state: RwLock<ExternalRetrievalRuntimeState>,
@@ -132,11 +156,17 @@ impl Default for ExternalRetrievalRuntime {
 }
 
 impl ExternalRetrievalRuntime {
+    /// Returns the current index snapshot, including SLO posture.
     #[must_use]
     pub(crate) fn snapshot(&self) -> ExternalRetrievalIndexSnapshot {
         self.state.read().unwrap_or_else(|error| error.into_inner()).snapshot.clone()
     }
 
+    /// Advances the index checkpoint by up to `batch_size` journal-derived records per
+    /// projection and recomputes the SLO posture.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when journal memory/workspace status queries fail.
     pub(crate) fn run_indexer(
         &self,
         store: &JournalStore,
@@ -163,6 +193,8 @@ impl ExternalRetrievalRuntime {
         let pending_workspace_chunks = workspace.chunk_count.saturating_sub(next_workspace);
         let pending_total = pending_memory_items.saturating_add(pending_workspace_chunks);
         let complete = pending_total == 0;
+        // Synthetic lag: while records are pending, report a value just past the SLO
+        // target (scaled by backlog) so the freshness gate stays red until caught up.
         let freshness_lag_ms = if complete {
             0
         } else {
@@ -202,6 +234,12 @@ impl ExternalRetrievalRuntime {
         })
     }
 
+    /// Compares the checkpoint against current journal counts and updates the stored
+    /// snapshot (state, reason, drift counters) to match. Use [`Self::preview_drift`]
+    /// for a side-effect-free check.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when journal memory/workspace status queries fail.
     pub(crate) fn detect_drift(
         &self,
         store: &JournalStore,
@@ -217,6 +255,11 @@ impl ExternalRetrievalRuntime {
         ))
     }
 
+    /// Computes the same drift report as [`Self::detect_drift`] without mutating the
+    /// stored snapshot, for read-only operator inspection.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when journal memory/workspace status queries fail.
     pub(crate) fn preview_drift(
         &self,
         store: &JournalStore,
@@ -234,6 +277,8 @@ impl ExternalRetrievalRuntime {
         ))
     }
 
+    // Mutating by design (unlike preview_drift): folds the drift result back into the
+    // stored snapshot so operators see the same posture the report described.
     fn detect_drift_from_counts(
         &self,
         journal_memory_items: u64,
@@ -268,6 +313,11 @@ impl ExternalRetrievalRuntime {
         report
     }
 
+    /// Runs drift detection, a repair backfill sized to clear the full backlog, and a
+    /// post-repair drift check; success means no reconciliation remains required.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when any underlying journal status query fails.
     pub(crate) fn reconcile(
         &self,
         store: &JournalStore,
@@ -280,6 +330,8 @@ impl ExternalRetrievalRuntime {
             guard.reconciliation_attempts = guard.reconciliation_attempts.saturating_add(1);
             recompute_external_slos(&mut guard);
         }
+        // Repair in one pass: widen the batch to at least the observed drift so a
+        // single indexer run can catch the checkpoint up completely.
         let repair_batch_size =
             batch_size.max(1).max(usize::try_from(drift_before.drift_count).unwrap_or(usize::MAX));
         let indexer = self.run_indexer(store, repair_batch_size, 1, checked_at_unix_ms)?;
@@ -304,10 +356,14 @@ impl ExternalRetrievalRuntime {
 
 impl ExternalRetrievalIndex for ExternalRetrievalRuntime {
     fn snapshot(&self) -> ExternalRetrievalIndexSnapshot {
+        // Not recursion: inherent methods take precedence over trait methods, so this
+        // dispatches to ExternalRetrievalRuntime::snapshot above.
         self.snapshot()
     }
 }
 
+// Advances the checkpoint by one batch, clamped to the journal total in both
+// directions so deletions in the journal can never leave the count ahead of it.
 fn next_indexed_count(current: u64, journal_total: u64, batch_size: u64) -> u64 {
     current.min(journal_total).saturating_add(batch_size).min(journal_total)
 }
@@ -327,6 +383,8 @@ fn external_drift_report(
         .saturating_add(journal_workspace_chunks.saturating_sub(indexed_workspace_chunks));
     let freshness_lag_ms = snapshot
         .journal_watermark_unix_ms
+        // max(0) guards against a watermark ahead of the probe clock; the cast to u64
+        // is then lossless.
         .map(|watermark| checked_at_unix_ms.saturating_sub(watermark).max(0) as u64);
     ExternalRetrievalDriftReport {
         checked_at_unix_ms,
@@ -342,11 +400,16 @@ fn external_drift_report(
     }
 }
 
+// Widening to i128 keeps the subtraction exact for any u64 pair before clamping
+// back into the i64 report field.
 fn signed_drift(journal_total: u64, indexed_total: u64) -> i64 {
     let drift = i128::from(journal_total) - i128::from(indexed_total);
     drift.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
+// Re-derives every SLO and the preview gate from current counters; called after each
+// state mutation so the snapshot is always self-consistent. The gate checks are
+// ordered by triage priority: readiness, freshness, latency, fallback, reconciliation.
 fn recompute_external_slos(state: &mut ExternalRetrievalRuntimeState) {
     let freshness_lag_ms = state.snapshot.freshness_lag_ms;
     let query_latency_p95_ms = percentile_95(&state.query_latency_samples_ms);
@@ -394,6 +457,7 @@ fn recompute_external_slos(state: &mut ExternalRetrievalRuntimeState) {
     };
 }
 
+// Nearest-rank p95 on a sorted copy; an empty sample set reads as 0 ms.
 fn percentile_95(samples: &[u64]) -> u64 {
     if samples.is_empty() {
         return 0;
@@ -404,6 +468,8 @@ fn percentile_95(samples: &[u64]) -> u64 {
     sorted[index]
 }
 
+// With no attempts the rate is presumed from backend state: a Ready index counts as
+// 0 bps (no fallbacks), anything else as 100% so the gate stays pessimistic.
 fn rate_bps(count: u64, total: u64, state: RetrievalBackendState) -> u32 {
     if total == 0 {
         return if state == RetrievalBackendState::Ready { 0 } else { 10_000 };
@@ -412,6 +478,8 @@ fn rate_bps(count: u64, total: u64, state: RetrievalBackendState) -> u32 {
     u32::try_from(bps.min(10_000)).unwrap_or(10_000)
 }
 
+// With no reconciliation attempts, full marks are granted only when a checkpoint
+// exists and is fully caught up; otherwise the rate reads 0 and blocks the gate.
 fn reconciliation_success_rate_bps(
     successes: u64,
     attempts: u64,

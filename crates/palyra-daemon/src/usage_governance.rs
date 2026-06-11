@@ -1,3 +1,12 @@
+//! Usage governance: smart model routing, cost estimation, budget policies, and alerts.
+//!
+//! Owns the per-run routing pipeline ([`plan_usage_routing`]): score prompt complexity,
+//! pick a model/provider candidate under lease and health constraints, price the run,
+//! evaluate budget policies, and persist an auditable routing decision. Budget hard
+//! limits surface as gRPC failed-precondition errors and can be overridden through the
+//! approvals flow in [`crate::journal`]. Usage mixes and alert candidates feed the
+//! console usage handlers; lease previews come from [`crate::provider_leases`].
+
 use std::{collections::HashMap, sync::Arc};
 
 use serde::{Deserialize, Serialize};
@@ -21,19 +30,29 @@ use crate::{
     transport::grpc::auth::RequestContext,
 };
 
+// Cost-spike alerts ignore windows cheaper than this so noise-floor estimates
+// (fractions of a cent) cannot trip a 2x ratio.
 const ALERT_MIN_COST_SPIKE_USD: f64 = 0.50;
+// Interactive runs queue through short provider bursts instead of failing fast;
+// background/auxiliary classes get sub-second waits (see max_lease_wait_ms).
 const PRIMARY_INTERACTIVE_LEASE_WAIT_MS: u64 = 30_000;
+/// Approval subject-id prefix that scopes budget-override approvals to one policy.
 pub(crate) const USAGE_BUDGET_SUBJECT_PREFIX: &str = "usage-budget:";
 
+/// How strongly routing recommendations are applied to the actual model choice.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RoutingMode {
+    /// Publish the recommendation; the default model stays active.
     Suggest,
+    /// Like suggest, but flagged as a rehearsal of enforced routing.
     DryRun,
+    /// The recommended candidate becomes the actual model.
     Enforced,
 }
 
 impl RoutingMode {
+    /// Returns the wire/journal label for this mode.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Suggest => "suggest",
@@ -42,6 +61,7 @@ impl RoutingMode {
         }
     }
 
+    /// Parses an operator-supplied mode label; `None` for unknown values.
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "suggest" => Some(Self::Suggest),
@@ -52,6 +72,7 @@ impl RoutingMode {
     }
 }
 
+/// Smart-routing switches resolved from daemon configuration.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct SmartRoutingRuntimeConfig {
     pub enabled: bool,
@@ -60,6 +81,8 @@ pub(crate) struct SmartRoutingRuntimeConfig {
 }
 
 impl SmartRoutingRuntimeConfig {
+    /// Resolves the configured default mode, falling back to suggest-only when smart
+    /// routing is disabled or the configured label is unknown.
     pub(crate) fn effective_mode(&self) -> RoutingMode {
         if !self.enabled {
             return RoutingMode::Suggest;
@@ -68,6 +91,10 @@ impl SmartRoutingRuntimeConfig {
     }
 }
 
+/// Workload class of a run; drives lease priority, wait budget, and cost posture.
+///
+/// Every class except [`Self::PrimaryInteractive`] is auxiliary: background-priority
+/// leases and no cost escalation above the default model.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RoutingTaskClass {
@@ -81,6 +108,7 @@ pub(crate) enum RoutingTaskClass {
 }
 
 impl RoutingTaskClass {
+    /// Returns the wire/journal label for this task class.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::PrimaryInteractive => "primary_interactive",
@@ -93,6 +121,7 @@ impl RoutingTaskClass {
         }
     }
 
+    /// Maps the task class to its provider-lease priority tier.
     pub(crate) const fn lease_priority(self) -> LeasePriority {
         match self {
             Self::PrimaryInteractive => LeasePriority::Foreground,
@@ -105,6 +134,10 @@ impl RoutingTaskClass {
         }
     }
 
+    /// Longest a run of this class may queue for a provider lease before timing out.
+    ///
+    /// Auxiliary waits are tuned to each task's tolerance for added latency on the
+    /// interactive path that triggered them; classification is the most latency-bound.
     pub(crate) const fn max_lease_wait_ms(self) -> u64 {
         match self {
             Self::PrimaryInteractive => PRIMARY_INTERACTIVE_LEASE_WAIT_MS,
@@ -139,6 +172,8 @@ impl RoutingTaskClass {
     }
 }
 
+/// USD cost range for a run, or an explicit "unavailable" marker when no pricing
+/// record covers the model at the observation time.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct PricingEstimate {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -151,6 +186,7 @@ pub(crate) struct PricingEstimate {
 }
 
 impl PricingEstimate {
+    /// Estimate with no bounds, used when no pricing record matched.
     pub(crate) fn unavailable() -> Self {
         Self {
             lower_usd: None,
@@ -162,6 +198,10 @@ impl PricingEstimate {
     }
 }
 
+/// Outcome of evaluating one budget policy against consumed plus projected usage.
+///
+/// `status` is one of: `ok`, `soft_limit`, `hard_limit`, `blocked`,
+/// `approval_required`, `override_applied`, or `unknown` (metric unavailable).
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct UsageBudgetEvaluation {
     pub policy_id: String,
@@ -182,6 +222,8 @@ pub(crate) struct UsageBudgetEvaluation {
     pub message: String,
 }
 
+/// Fully resolved routing outcome for one run: recommended vs. actual model, lease
+/// posture, cost estimate, budget outcome, and the explanation/reason-code audit trail.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct RoutingDecision {
     pub mode: String,
@@ -209,6 +251,8 @@ pub(crate) struct RoutingDecision {
     pub deferred: bool,
 }
 
+/// Borrowed inputs for one routing evaluation (request, provider snapshot, leases,
+/// pricing, and pre-computed budget evaluations).
 #[derive(Debug, Clone)]
 pub(crate) struct RoutingDecisionContext<'a> {
     pub scope_kind: &'a str,
@@ -229,6 +273,7 @@ pub(crate) struct RoutingDecisionContext<'a> {
     pub budgets: &'a [UsageBudgetEvaluation],
 }
 
+/// Model choice produced by [`select_routing_models`] before budget gating.
 #[derive(Debug, Clone, PartialEq)]
 struct RoutingModelSelection {
     complexity_score: f64,
@@ -243,6 +288,8 @@ struct RoutingModelSelection {
     lease: ProviderLeasePreviewSnapshot,
 }
 
+/// One enabled chat model paired with its provider, health, cost/latency tier ranks,
+/// and current lease preview.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RoutingCandidate {
     model_id: String,
@@ -255,6 +302,7 @@ struct RoutingCandidate {
     lease: ProviderLeasePreviewSnapshot,
 }
 
+/// Aggregated usage per (model, provider kind, attribution source) group.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct UsageModelMixRecord {
     pub model_id: String,
@@ -266,12 +314,14 @@ pub(crate) struct UsageModelMixRecord {
     pub source: String,
 }
 
+/// Tool-call proposal count for one tool within the usage window.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct UsageToolMixRecord {
     pub tool_name: String,
     pub proposals: u64,
 }
 
+/// Aggregated usage for one execution scope (foreground vs. background).
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct UsageScopeMixRecord {
     pub scope: String,
@@ -281,6 +331,7 @@ pub(crate) struct UsageScopeMixRecord {
     pub estimated_cost_usd: Option<f64>,
 }
 
+/// Proposed usage alert; `dedupe_key` lets the journal upsert repeated detections.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct UsageAlertCandidate {
     pub alert_kind: String,
@@ -294,6 +345,8 @@ pub(crate) struct UsageAlertCandidate {
     pub payload: Value,
 }
 
+/// A usage run joined with its routing decision (when one exists) and a cost
+/// estimate; model/provider fall back to inferred defaults without a decision.
 #[derive(Debug, Clone)]
 pub(crate) struct UsageEnrichedRun<'a> {
     pub run: &'a OrchestratorUsageInsightsRunRecord,
@@ -303,6 +356,7 @@ pub(crate) struct UsageEnrichedRun<'a> {
     pub cost_estimate: PricingEstimate,
 }
 
+/// Inputs for [`plan_usage_routing`]: the run being planned plus runtime handles.
 pub(crate) struct UsageRoutingPlanRequest<'a> {
     pub runtime_state: &'a Arc<GatewayRuntimeState>,
     pub request_context: &'a RequestContext,
@@ -319,6 +373,10 @@ pub(crate) struct UsageRoutingPlanRequest<'a> {
     pub model_profile_override: Option<&'a str>,
 }
 
+/// Extracts a `routing.mode` override from a session parameter-delta JSON blob.
+///
+/// Returns `None` for missing/empty input, malformed JSON, or an unknown mode; the
+/// caller then falls back to the configured default mode.
 pub(crate) fn parse_routing_mode_override(
     parameter_delta_json: Option<&str>,
 ) -> Option<RoutingMode> {
@@ -332,10 +390,20 @@ pub(crate) fn parse_routing_mode_override(
     RoutingMode::parse(mode)
 }
 
+/// Builds the approval subject id binding a budget override to one policy.
 pub(crate) fn usage_budget_subject_id(policy_id: &str) -> String {
     format!("{USAGE_BUDGET_SUBJECT_PREFIX}{policy_id}")
 }
 
+/// Plans routing for one run end to end: loads pricing, budgets, history, and lease
+/// previews; selects a model; evaluates budget policies against projected usage; and
+/// persists the decision for audit before enforcing the outcome.
+///
+/// # Errors
+/// Returns `Status::failed_precondition` when a hard budget limit blocks the run or
+/// an override approval is still required (a pending approval is created first),
+/// `Status::resource_exhausted` when lease pressure defers a background/auxiliary
+/// task, and propagates storage errors from the pricing/budget lookups.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn plan_usage_routing(
     request: UsageRoutingPlanRequest<'_>,
@@ -396,6 +464,9 @@ pub(crate) async fn plan_usage_routing(
         request.provider_snapshot,
         request.task_class,
     );
+    // First selection pass with empty budgets: budget projection needs to price the
+    // model that would be chosen, and the budget evaluations in turn feed the final
+    // decide_routing call below.
     let projected_selection = select_routing_models(&RoutingDecisionContext {
         scope_kind: request.scope_kind,
         scope_id: request.scope_id,
@@ -468,6 +539,8 @@ pub(crate) async fn plan_usage_routing(
         .map(|entry| entry.total_tokens)
         .sum::<u64>()
         .saturating_add(prompt_tokens_estimate);
+    // Completion size is unknown at planning time; half the prompt estimate is the
+    // shared heuristic (see decide_routing) so projections stay comparable.
     let projected_cost = estimate_cost_for_model(
         pricing.as_slice(),
         projected_selection.provider_kind.as_str(),
@@ -506,6 +579,8 @@ pub(crate) async fn plan_usage_routing(
         pricing: pricing.as_slice(),
         budgets: budget_evaluations.as_slice(),
     });
+    // Best-effort audit write: a journal failure here must not turn a routable run
+    // into an error, so the result is intentionally discarded.
     let _ = request
         .runtime_state
         .create_usage_routing_decision(UsageRoutingDecisionCreateRequest {
@@ -555,6 +630,8 @@ pub(crate) async fn plan_usage_routing(
             .map(|entry| entry.policy_id.clone())
             .unwrap_or_else(|| "unknown".to_owned());
         if let Some(policy) = budget_policies.iter().find(|entry| entry.policy_id == policy_id) {
+            // Best-effort: the run is rejected below either way; the override request
+            // only seeds the approval queue for the operator.
             let _ = request_usage_budget_override(
                 request.runtime_state,
                 request.request_context,
@@ -583,6 +660,8 @@ pub(crate) async fn plan_usage_routing(
     Ok(decision)
 }
 
+// A run can accumulate several decisions (retries, mode changes); only the newest
+// one reflects what actually executed.
 fn latest_routing_decisions_by_run_id<'a>(
     decisions: &'a [UsageRoutingDecisionRecord],
 ) -> HashMap<&'a str, &'a UsageRoutingDecisionRecord> {
@@ -598,6 +677,8 @@ fn latest_routing_decisions_by_run_id<'a>(
     by_run
 }
 
+/// Prices a run from the pricing record effective for the model at
+/// `observed_at_unix_ms`; returns [`PricingEstimate::unavailable`] when none matches.
 pub(crate) fn estimate_cost_for_model(
     pricing: &[UsagePricingRecord],
     provider_kind: &str,
@@ -625,6 +706,8 @@ pub(crate) fn estimate_cost_for_model(
     let fixed_component = record.fixed_request_cost_usd.unwrap_or(0.0);
     let total =
         prompt_component.unwrap_or(0.0) + completion_component.unwrap_or(0.0) + fixed_component;
+    // Round to 5 decimals (thousandths of a cent) so estimates compare stably across
+    // platforms; tests assert on these rounded values.
     let total = (total * 100_000.0).round() / 100_000.0;
 
     PricingEstimate {
@@ -636,6 +719,12 @@ pub(crate) fn estimate_cost_for_model(
     }
 }
 
+/// Evaluates every enabled budget policy against consumed usage plus the projection.
+///
+/// Hard limits compare the projected value; an approved override downgrades a breach
+/// to `override_applied`, otherwise the policy `action` decides between `blocked`,
+/// `approval_required`, and the advisory `hard_limit` status. Policies whose metric
+/// cannot be computed report `unknown` rather than silently passing.
 pub(crate) fn evaluate_budget_policies(
     policies: &[UsageBudgetPolicyRecord],
     runs: &[UsageEnrichedRun<'_>],
@@ -747,6 +836,8 @@ pub(crate) fn evaluate_budget_policies(
         .collect()
 }
 
+/// Applies budget evaluations and lease posture on top of the model selection,
+/// producing the final decision with `blocked`/`approval_required`/`deferred` flags.
 pub(crate) fn decide_routing(context: RoutingDecisionContext<'_>) -> RoutingDecision {
     let selection = select_routing_models(&context);
     let mut explanation = selection.explanation.clone();
@@ -790,6 +881,11 @@ pub(crate) fn decide_routing(context: RoutingDecisionContext<'_>) -> RoutingDeci
     reason_codes.sort();
     reason_codes.dedup();
 
+    // AIDEV-NOTE: observed_at is hard-coded to 0 here, so this estimate only matches
+    // pricing records effective from the epoch (effective_from_unix_ms <= 0). Records
+    // with a later effective_from yield "unavailable" in the published decision even
+    // though plan_usage_routing's budget projection prices the same run with
+    // current_unix_ms. Fixing it changes decision payloads (behavior change).
     let estimate = estimate_cost_for_model(
         context.pricing,
         selection.provider_kind.as_str(),
@@ -833,6 +929,10 @@ pub(crate) fn decide_routing(context: RoutingDecisionContext<'_>) -> RoutingDeci
     }
 }
 
+// Core selection pipeline: score complexity, build the candidate pool, filter by
+// capability/health/lease pressure, pick a recommendation, then resolve the actual
+// model from the mode and any session override. Every pruning step appends to the
+// explanation/reason-code audit trail.
 fn select_routing_models(context: &RoutingDecisionContext<'_>) -> RoutingModelSelection {
     let complexity_score = complexity_score(
         context.prompt_text,
@@ -931,6 +1031,8 @@ fn select_routing_models(context: &RoutingDecisionContext<'_>) -> RoutingModelSe
         context.task_class,
         complexity_score,
     );
+    // Auxiliary cost guardrail: internal work may never escalate above the default
+    // model's cost tier, even when complexity would otherwise prefer a premium model.
     let recommended_candidate = if context.task_class.is_auxiliary()
         && !context.task_class.allows_cost_escalation()
         && recommended_candidate.cost_rank > default_candidate.cost_rank
@@ -950,6 +1052,8 @@ fn select_routing_models(context: &RoutingDecisionContext<'_>) -> RoutingModelSe
     } else {
         recommended_candidate
     };
+    // Session overrides only apply outside enforced mode; in enforced mode the
+    // recommendation wins so guardrails cannot be bypassed per session.
     let model_override_candidate = if context.mode == RoutingMode::Enforced {
         None
     } else {
@@ -1036,6 +1140,8 @@ fn select_routing_models(context: &RoutingDecisionContext<'_>) -> RoutingModelSe
     }
 }
 
+// Enumerates enabled chat models whose capabilities satisfy the request (JSON mode,
+// vision) and whose provider is enabled.
 fn build_routing_candidates(context: &RoutingDecisionContext<'_>) -> Vec<RoutingCandidate> {
     let mut candidates = Vec::new();
     for model in &context.provider_snapshot.registry.models {
@@ -1079,6 +1185,8 @@ fn build_routing_candidates(context: &RoutingDecisionContext<'_>) -> Vec<Routing
     candidates
 }
 
+// Resolves the default model into a candidate; when it is not in the registry the
+// provider snapshot's top-level binding stands in so a default always exists.
 fn default_routing_candidate(context: &RoutingDecisionContext<'_>) -> RoutingCandidate {
     if let Some(model) = find_registry_model(context.provider_snapshot, context.default_model_id) {
         if let Some(provider) =
@@ -1129,6 +1237,11 @@ fn default_routing_candidate(context: &RoutingDecisionContext<'_>) -> RoutingCan
     }
 }
 
+// Recommendation strategy, in order: prefer lease-ready (then non-deferred)
+// candidates; honor the task class cost/latency preference; otherwise route by
+// complexity (>= 0.75 escalates to the strongest tier, <= 0.35 economizes, the
+// mid band keeps the default). All comparator chains end on model_id so the
+// recommendation is deterministic for equal ranks.
 fn choose_routing_candidate(
     candidates: &[RoutingCandidate],
     default_candidate: &RoutingCandidate,
@@ -1240,6 +1353,8 @@ fn lease_pressure_rank(candidate: &RoutingCandidate) -> u8 {
     }
 }
 
+// Labels how the actual choice relates to the default: provider change = failover,
+// cheaper-or-equal model change on the same provider = degrade, otherwise proceed.
 fn routing_action_for_selection(
     default_candidate: &RoutingCandidate,
     actual_candidate: &RoutingCandidate,
@@ -1255,6 +1370,8 @@ fn routing_action_for_selection(
     }
 }
 
+// Blank credential ids collapse to a provider-scoped placeholder so lease accounting
+// still gets a stable, non-empty key per provider.
 fn normalized_routing_credential_id(raw: &str, provider_id: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -1268,6 +1385,8 @@ fn lease_preview_key(provider_id: &str, credential_id: &str) -> String {
     format!("{provider_id}:{credential_id}")
 }
 
+// Missing previews read as Ready: lease pressure should only ever bias routing away
+// from a candidate, never block one for lack of data.
 fn routing_lease_preview(
     previews: &HashMap<String, ProviderLeasePreviewSnapshot>,
     provider_id: &str,
@@ -1306,6 +1425,8 @@ fn resolve_provider_for_model<'a>(
     (snapshot.provider_id.as_str(), snapshot.kind.as_str())
 }
 
+/// Resolves `(provider_id, provider_kind, credential_id)` for a model, falling back
+/// to the snapshot's top-level provider binding when the model is not in the registry.
 pub(crate) fn resolve_provider_binding_for_model(
     snapshot: &ProviderStatusSnapshot,
     model_id: &str,
@@ -1332,6 +1453,8 @@ pub(crate) fn resolve_provider_binding_for_model(
     )
 }
 
+// Snapshots lease previews for every registry provider (plus the snapshot's own
+// binding) up front, so candidate building never queries the lease manager mid-loop.
 fn build_provider_lease_previews(
     runtime_state: &Arc<GatewayRuntimeState>,
     provider_snapshot: &ProviderStatusSnapshot,
@@ -1375,6 +1498,10 @@ fn build_provider_lease_previews(
     previews
 }
 
+// Any recorded error count degrades the provider for routing purposes (the metric is
+// cumulative, so one historical failure keeps it conservative until metrics reset).
+// Unknown probe states with configured credentials are treated as ok rather than
+// blocking routing on a missing health probe.
 fn registry_provider_health_state(provider: &ProviderRegistryProviderSnapshot) -> &'static str {
     if provider.circuit_breaker.open || provider.runtime_metrics.error_count > 0 {
         "degraded"
@@ -1396,6 +1523,7 @@ fn provider_latency_rank(model: &ProviderRegistryModelSnapshot) -> u8 {
     latency_tier_rank(model.capabilities.latency_tier.as_str())
 }
 
+// Unknown tiers rank as "standard" so unlabeled models neither win nor lose ties.
 fn cost_tier_rank(value: &str) -> u8 {
     match value {
         "low" => 0,
@@ -1414,6 +1542,11 @@ fn latency_tier_rank(value: &str) -> u8 {
     }
 }
 
+/// Groups runs by (model, provider kind, attribution source) with token and cost
+/// totals, sorted by tokens descending then model id for deterministic output.
+///
+/// A single run without a cost estimate poisons its group's cost to `None` so partial
+/// sums are never presented as complete.
 pub(crate) fn build_model_mix(runs: &[UsageEnrichedRun<'_>]) -> Vec<UsageModelMixRecord> {
     let mut groups = HashMap::<(String, String, String), UsageModelMixRecord>::new();
     for entry in runs {
@@ -1450,6 +1583,8 @@ pub(crate) fn build_model_mix(runs: &[UsageEnrichedRun<'_>]) -> Vec<UsageModelMi
     rows
 }
 
+/// Splits runs into foreground/background scope totals, sorted by run count
+/// descending; cost goes `None` if any run in the scope lacks an estimate.
 pub(crate) fn build_scope_mix(runs: &[UsageEnrichedRun<'_>]) -> Vec<UsageScopeMixRecord> {
     let mut groups = HashMap::<String, UsageScopeMixRecord>::new();
     for entry in runs {
@@ -1478,6 +1613,8 @@ pub(crate) fn build_scope_mix(runs: &[UsageEnrichedRun<'_>]) -> Vec<UsageScopeMi
     rows
 }
 
+/// Converts raw tool proposal counts into rows sorted by proposals descending,
+/// then tool name for deterministic output.
 pub(crate) fn build_tool_mix(tool_counts: &HashMap<String, u64>) -> Vec<UsageToolMixRecord> {
     let mut rows = tool_counts
         .iter()
@@ -1492,6 +1629,8 @@ pub(crate) fn build_tool_mix(tool_counts: &HashMap<String, u64>) -> Vec<UsageToo
     rows
 }
 
+/// Derives usage alert candidates (cost spike, dominant model, provider health,
+/// enforced-routing overrides, budget breaches) from the current usage window.
 pub(crate) fn build_alert_candidates(
     runs: &[UsageEnrichedRun<'_>],
     routing_decisions: &[UsageRoutingDecisionRecord],
@@ -1500,6 +1639,11 @@ pub(crate) fn build_alert_candidates(
     provider_health_state: &str,
 ) -> Vec<UsageAlertCandidate> {
     let total_cost = runs.iter().filter_map(|entry| entry.cost_estimate.upper_usd).sum::<f64>();
+    // AIDEV-NOTE: runs arrive newest-first (journal orders started_at DESC, and the
+    // console handler preserves that order), so skip(len/2) is actually the OLDER
+    // half and take(len/2) the NEWER half. The spike condition and the older/newer
+    // labels in the alert payload are therefore inverted: this fires when cost
+    // dropped, not when it spiked. Fixing it changes alert behavior/payloads.
     let first_half_cost = runs
         .iter()
         .skip(runs.len() / 2)
@@ -1570,12 +1714,11 @@ pub(crate) fn build_alert_candidates(
         });
     }
 
-    if routing_decisions
+    let enforced_override_count = routing_decisions
         .iter()
         .filter(|entry| entry.mode == "enforced" && entry.actual_model_id != entry.default_model_id)
-        .count()
-        > 0
-    {
+        .count();
+    if enforced_override_count > 0 {
         alerts.push(UsageAlertCandidate {
             alert_kind: "routing_regression".to_owned(),
             severity: "warning".to_owned(),
@@ -1586,10 +1729,7 @@ pub(crate) fn build_alert_candidates(
             recommended_action: "Review routing explanations and confirm the override matches current latency and budget goals.".to_owned(),
             dedupe_key: "routing_regression:default".to_owned(),
             payload: json!({
-                "enforced_override_count": routing_decisions
-                    .iter()
-                    .filter(|entry| entry.mode == "enforced" && entry.actual_model_id != entry.default_model_id)
-                    .count(),
+                "enforced_override_count": enforced_override_count,
             }),
         });
     }
@@ -1627,6 +1767,12 @@ pub(crate) fn build_alert_candidates(
     alerts
 }
 
+/// Creates (or reuses) a high-risk approval prompt asking the operator to override a
+/// hard budget limit for one policy. An existing pending request or still-active
+/// allow for the same actor/session/run is returned instead of creating a duplicate.
+///
+/// # Errors
+/// Propagates storage errors from approval lookup or creation as `Status`.
 pub(crate) async fn request_usage_budget_override(
     runtime_state: &Arc<GatewayRuntimeState>,
     request_context: &RequestContext,
@@ -1646,6 +1792,8 @@ pub(crate) async fn request_usage_budget_override(
         }
     }
 
+    // Approval records require non-empty ids; synthesized ULIDs keep an override
+    // request without a session/run from ever matching another context's approval.
     let session_id = session_id.map(ToOwned::to_owned).unwrap_or_else(|| Ulid::new().to_string());
     let run_id = run_id.map(ToOwned::to_owned).unwrap_or_else(|| Ulid::new().to_string());
     let request_summary =
@@ -1719,6 +1867,9 @@ pub(crate) async fn request_usage_budget_override(
         .await
 }
 
+/// Maps each policy's budget-override subject id to whether an allow is currently
+/// active for this actor/session/run. Lookup failures count as not approved, which
+/// fails closed toward enforcing the budget.
 pub(crate) async fn load_budget_override_approvals(
     runtime_state: &Arc<GatewayRuntimeState>,
     request_context: &RequestContext,
@@ -2414,6 +2565,8 @@ mod tests {
     }
 }
 
+/// Identity of the actor and execution context asking about a budget override; every
+/// approval reuse check must match on it so approvals never leak across actors.
 #[derive(Debug, Clone, Copy)]
 struct BudgetOverrideApprovalContext<'a> {
     principal: &'a str,
@@ -2446,6 +2599,10 @@ fn is_pending_budget_override_for_context(
     record.decision.is_none() && budget_override_record_matches_request_context(record, context)
 }
 
+// Override-allow validity by scope: Once binds to the exact approved run, Session to
+// the approved session (TTL-aware), and Timeboxed additionally requires a positive
+// TTL so a zero/absent timebox can never become an indefinite allow. A missing scope
+// is treated as Once -- the narrowest grant.
 fn is_active_budget_override_allow(
     record: &ApprovalRecord,
     context: &BudgetOverrideApprovalContext<'_>,
@@ -2468,6 +2625,8 @@ fn is_active_budget_override_allow(
     }
 }
 
+// Pending-request reuse check: actor must match exactly; session/run only constrain
+// when the requesting context actually has them.
 fn budget_override_record_matches_request_context(
     record: &ApprovalRecord,
     context: &BudgetOverrideApprovalContext<'_>,
@@ -2509,6 +2668,8 @@ fn budget_override_record_matches_actor(
         && record.channel.as_deref() == context.channel
 }
 
+// A TTL without a resolution timestamp can never expire (zip yields None), which is
+// safe because is_active_budget_override_allow already rejects unresolved records.
 fn budget_override_ttl_expired(record: &ApprovalRecord) -> bool {
     record.decision_scope_ttl_ms.zip(record.resolved_at_unix_ms).is_some_and(
         |(ttl_ms, resolved_at)| {
@@ -2527,6 +2688,11 @@ fn provider_health_state(snapshot: &ProviderStatusSnapshot) -> &'static str {
     }
 }
 
+// Heuristic complexity in [0, 1]: length and token estimates carry most of the
+// weight (0.35 each, saturating at ~4000 chars / ~3000 tokens), JSON mode and vision
+// add fixed bumps, and analysis-flavored keywords nudge the score up slightly. The
+// 0.75/0.35 escalation thresholds in choose_routing_candidate are tuned against
+// these weights; tests pin the resulting selections.
 fn complexity_score(
     prompt_text: &str,
     prompt_tokens_estimate: u64,

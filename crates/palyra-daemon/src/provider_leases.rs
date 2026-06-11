@@ -1,3 +1,13 @@
+//! In-process fair-share concurrency limiter for model-provider calls.
+//!
+//! [`ProviderLeaseManager`] caps concurrent leases per provider and per credential,
+//! reserves capacity for foreground (interactive) work over background/auxiliary
+//! tasks, and applies provider feedback (rate limits, quota, auth failures) as
+//! credential cooldowns. Routing consults [`ProviderLeaseManager::preview`] to bias
+//! candidate selection (see [`crate::usage_governance`]); execution paths hold a
+//! [`ProviderLeaseGuard`] for the duration of the provider call. Recent lease events
+//! are retained for console observability.
+
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, Mutex, Weak},
@@ -9,11 +19,16 @@ use serde::Serialize;
 const DEFAULT_PROVIDER_MAX_ACTIVE: u16 = 4;
 const DEFAULT_CREDENTIAL_MAX_ACTIVE: u16 = 2;
 const RECENT_LEASE_EVENTS_LIMIT: usize = 24;
+// Acquire polls state instead of using a notifier: the 25 ms cadence bounds wakeup
+// latency, and polling keeps cancellation trivially safe (see acquire).
 const LEASE_WAIT_POLL_MS: u64 = 25;
+// Cooldowns applied when the provider gives no retry-after hint. Rate limits and
+// user-action failures (quota/auth) cool for 30 s; transient failures retry sooner.
 const DEFAULT_RATE_LIMIT_RETRY_AFTER_MS: u64 = 30_000;
 const DEFAULT_TRANSIENT_FAILURE_RETRY_AFTER_MS: u64 = 5_000;
 const DEFAULT_USER_ACTION_RETRY_AFTER_MS: u64 = 30_000;
 
+/// Scheduling tier of a lease: foreground (interactive) work preempts background.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum LeasePriority {
@@ -21,6 +36,7 @@ pub(crate) enum LeasePriority {
     Background,
 }
 
+/// Predicted acquire outcome: ready now, expected to wait, or deferred outright.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum LeasePreviewState {
@@ -29,6 +45,8 @@ pub(crate) enum LeasePreviewState {
     Deferred,
 }
 
+/// Point-in-time lease availability for one provider/credential pair, including
+/// queue pressure, credential cooldown state, and the predicted wait.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct ProviderLeasePreviewSnapshot {
     pub state: LeasePreviewState,
@@ -57,6 +75,7 @@ pub(crate) struct ProviderLeasePreviewSnapshot {
 }
 
 impl ProviderLeasePreviewSnapshot {
+    /// Preview for an uncontended pair: ready immediately with no queue pressure.
     pub(crate) fn ready(priority: LeasePriority) -> Self {
         Self {
             state: LeasePreviewState::Ready,
@@ -85,6 +104,8 @@ fn lease_priority_class(priority: LeasePriority) -> &'static str {
     }
 }
 
+// Background requests queue behind every foreground waiter (strict priority), while
+// foreground requests only queue behind other foreground waiters.
 fn queue_position_for_preview(
     state: LeasePreviewState,
     priority: LeasePriority,
@@ -101,6 +122,8 @@ fn queue_position_for_preview(
     Some(waiters_ahead.saturating_add(1))
 }
 
+/// One lease lifecycle event ("acquired", "released", "deferred", "timed_out", or
+/// "credential_feedback_recorded"/"_cleared") kept in the recent-events ring.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct ProviderLeaseEventSnapshot {
     pub event: String,
@@ -120,6 +143,8 @@ pub(crate) struct ProviderLeaseEventSnapshot {
     pub observed_at_unix_ms: i64,
 }
 
+/// Provider response classification fed back into lease scheduling; everything
+/// except [`Self::Success`] places the credential on a cooldown.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ProviderCredentialFeedbackKind {
@@ -143,6 +168,8 @@ impl ProviderCredentialFeedbackKind {
     }
 }
 
+/// Feedback report for one provider call; `retry_after_ms` is the provider-supplied
+/// hint and falls back to kind-specific defaults when absent.
 #[derive(Debug, Clone)]
 pub(crate) struct ProviderCredentialFeedbackRequest {
     pub provider_id: String,
@@ -153,6 +180,7 @@ pub(crate) struct ProviderCredentialFeedbackRequest {
     pub observed_at_unix_ms: i64,
 }
 
+/// Operator-facing view of an active credential cooldown.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct ProviderCredentialFeedbackSnapshot {
     pub provider_id: String,
@@ -166,6 +194,7 @@ pub(crate) struct ProviderCredentialFeedbackSnapshot {
     pub observed_at_unix_ms: i64,
 }
 
+/// Aggregate lease-manager telemetry for diagnostics and the console.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct ProviderLeaseManagerSnapshot {
     pub provider_limit: u16,
@@ -182,6 +211,7 @@ pub(crate) struct ProviderLeaseManagerSnapshot {
     pub credential_feedback: Vec<ProviderCredentialFeedbackSnapshot>,
 }
 
+/// Owned lease parameters carried by execution paths that acquire leases later.
 #[derive(Debug, Clone)]
 pub(crate) struct ProviderLeaseExecutionContext {
     pub provider_id: String,
@@ -193,6 +223,7 @@ pub(crate) struct ProviderLeaseExecutionContext {
     pub run_id: Option<String>,
 }
 
+/// Borrowed parameters for [`ProviderLeaseManager::preview`].
 pub(crate) struct ProviderLeasePreviewRequest<'a> {
     pub provider_id: &'a str,
     pub credential_id: &'a str,
@@ -200,6 +231,7 @@ pub(crate) struct ProviderLeasePreviewRequest<'a> {
     pub max_wait_ms: u64,
 }
 
+/// Borrowed parameters for [`ProviderLeaseManager::acquire`].
 pub(crate) struct ProviderLeaseAcquireRequest<'a> {
     pub provider_id: &'a str,
     pub credential_id: &'a str,
@@ -210,12 +242,17 @@ pub(crate) struct ProviderLeaseAcquireRequest<'a> {
     pub run_id: Option<&'a str>,
 }
 
+/// Why an acquire did not produce a lease; carries the preview that explains it.
 #[derive(Debug, Clone)]
 pub(crate) enum ProviderLeaseAcquireError {
+    /// Fairness or cooldown policy rejected the request without waiting.
     Deferred(ProviderLeasePreviewSnapshot),
+    /// Capacity stayed exhausted past the caller's `max_wait_ms`.
     TimedOut { waited_ms: u64, preview: ProviderLeasePreviewSnapshot },
 }
 
+/// Cheaply cloneable handle to the shared lease state; all clones coordinate
+/// through the same inner [`Mutex`]-protected accounting.
 #[derive(Debug, Clone)]
 pub(crate) struct ProviderLeaseManager {
     inner: Arc<ProviderLeaseManagerInner>,
@@ -228,6 +265,8 @@ impl Default for ProviderLeaseManager {
 }
 
 impl ProviderLeaseManager {
+    /// Creates a manager with the given per-provider and per-credential caps;
+    /// both are clamped to at least 1 so a misconfigured 0 cannot deadlock.
     pub(crate) fn new(provider_limit: u16, credential_limit: u16) -> Self {
         Self {
             inner: Arc::new(ProviderLeaseManagerInner {
@@ -238,6 +277,8 @@ impl ProviderLeaseManager {
         }
     }
 
+    /// Predicts the acquire outcome for a provider/credential pair without queuing
+    /// or otherwise mutating state.
     pub(crate) fn preview(
         &self,
         request: ProviderLeasePreviewRequest<'_>,
@@ -252,12 +293,19 @@ impl ProviderLeaseManager {
         )
     }
 
+    /// Aggregates lease accounting, totals, recent events, and active credential
+    /// cooldowns into one telemetry snapshot.
     pub(crate) fn snapshot(&self) -> ProviderLeaseManagerSnapshot {
         let guard = self.inner.state.lock().unwrap_or_else(|error| error.into_inner());
         let mut foreground_active = 0_u16;
         let mut background_active = 0_u16;
         let mut foreground_waiters = 0_u16;
         let mut background_waiters = 0_u16;
+        // AIDEV-NOTE: actives are summed across provider buckets but waiters are
+        // aggregated with max(), so the snapshot under-reports total waiters when
+        // they queue on different providers at the same time (e.g. 2 on provider A
+        // and 3 on B reads as 3). Tests pin single-provider values; switching to a
+        // sum is a behavior change for the snapshot consumers.
         for bucket in guard.providers.values() {
             foreground_active = foreground_active.saturating_add(bucket.active_foreground);
             background_active = background_active.saturating_add(bucket.active_background);
@@ -285,6 +333,8 @@ impl ProviderLeaseManager {
         }
     }
 
+    /// Applies provider feedback for a credential: success clears any cooldown,
+    /// every failure kind records (or replaces) one. Both paths emit an event.
     pub(crate) fn record_credential_feedback(&self, request: ProviderCredentialFeedbackRequest) {
         let mut guard = self.inner.state.lock().unwrap_or_else(|error| error.into_inner());
         if request.kind == ProviderCredentialFeedbackKind::Success {
@@ -327,6 +377,18 @@ impl ProviderLeaseManager {
         guard.credential_feedback.insert(feedback.credential_id.clone(), feedback);
     }
 
+    /// Acquires a lease, polling until capacity frees up or `max_wait_ms` elapses.
+    ///
+    /// The returned [`ProviderLeaseGuard`] releases the lease on drop. Cancellation
+    /// is safe at any await point: while queued, the waiter is tracked by an RAII
+    /// guard whose `Drop` unregisters it, so an aborted acquire cannot leave stale
+    /// fairness pressure (pinned by `lease_manager_unregisters_waiter_when_acquire_is_cancelled`).
+    ///
+    /// # Errors
+    /// Returns [`ProviderLeaseAcquireError::Deferred`] when fairness or cooldown
+    /// policy rejects the request outright, and
+    /// [`ProviderLeaseAcquireError::TimedOut`] when capacity stays exhausted past
+    /// the wait budget.
     pub(crate) async fn acquire(
         &self,
         request: ProviderLeaseAcquireRequest<'_>,
@@ -345,6 +407,8 @@ impl ProviderLeaseManager {
         );
 
         loop {
+            // The std mutex guard lives only inside this block and is dropped before
+            // the sleep below, so the lock is never held across an await.
             {
                 let mut guard = self.inner.state.lock().unwrap_or_else(|error| error.into_inner());
                 let preview = self.inner.preview_locked(
@@ -459,6 +523,10 @@ impl ProviderLeaseManager {
     }
 }
 
+/// RAII registration of a queued waiter in the provider and credential buckets.
+///
+/// Dropping it (including when the owning `acquire` future is cancelled) removes the
+/// waiter so fairness counters cannot leak.
 #[derive(Debug)]
 struct ProviderLeaseWaiterGuard {
     manager: Arc<ProviderLeaseManagerInner>,
@@ -510,6 +578,11 @@ impl Drop for ProviderLeaseWaiterGuard {
     }
 }
 
+/// An acquired provider lease; dropping it releases the slot and records the
+/// "released" event with the held duration.
+///
+/// Holds only a [`Weak`] reference to the manager so an outstanding guard cannot
+/// keep lease accounting alive after the manager itself is gone.
 #[derive(Debug)]
 pub(crate) struct ProviderLeaseGuard {
     manager: Weak<ProviderLeaseManagerInner>,
@@ -567,6 +640,9 @@ struct ProviderLeaseManagerInner {
 }
 
 impl ProviderLeaseManagerInner {
+    // Pure preview computation; `_locked` marks that the caller already holds the
+    // state mutex. Lock poisoning is recovered via into_inner throughout this file
+    // because the accounting has no multi-step invariants that a panic could tear.
     fn preview_locked(
         &self,
         state: &ProviderLeaseState,
@@ -577,12 +653,16 @@ impl ProviderLeaseManagerInner {
     ) -> ProviderLeasePreviewSnapshot {
         let provider = state.providers.get(provider_id).copied().unwrap_or_default();
         let credential = state.credentials.get(credential_id).copied().unwrap_or_default();
+        // Waiters register in both the provider and credential buckets, so max()
+        // (not a sum) reflects the true queue depth without double counting.
         let foreground_waiters = provider.waiting_foreground.max(credential.waiting_foreground);
         let background_waiters = provider.waiting_background.max(credential.waiting_background);
         let provider_active = provider.active_total();
         let credential_active = credential.active_total();
         if let Some(feedback) = state.active_credential_feedback(credential_id) {
             let retry_after_ms = feedback.retry_after_ms(crate::gateway::current_unix_ms());
+            // A cooldown that ends within the caller's wait budget is worth queuing
+            // for; longer cooldowns defer the request immediately.
             let state_kind = if retry_after_ms.is_some_and(|value| value <= max_wait_ms.max(1)) {
                 LeasePreviewState::Waiting
             } else {
@@ -626,6 +706,8 @@ impl ProviderLeaseManagerInner {
         } else {
             LeasePreviewState::Waiting
         };
+        // Rough wait estimate: one poll interval per waiter ahead, capped by the
+        // caller's budget. It only has to be honest enough for routing explanations.
         let estimated_wait_ms = match state_kind {
             LeasePreviewState::Ready | LeasePreviewState::Deferred => None,
             LeasePreviewState::Waiting => Some(
@@ -658,6 +740,7 @@ impl ProviderLeaseManagerInner {
         }
     }
 
+    // Newest-first ring buffer bounded at RECENT_LEASE_EVENTS_LIMIT entries.
     fn push_event_locked(&self, state: &mut ProviderLeaseState, event: ProviderLeaseEventSnapshot) {
         state.recent_events.push_front(event);
         while state.recent_events.len() > RECENT_LEASE_EVENTS_LIMIT {
@@ -666,6 +749,7 @@ impl ProviderLeaseManagerInner {
     }
 }
 
+/// All mutable lease accounting, guarded by the manager's mutex.
 #[derive(Debug, Default)]
 struct ProviderLeaseState {
     providers: HashMap<String, LeaseBucketState>,
@@ -691,6 +775,7 @@ impl ProviderLeaseState {
     }
 }
 
+/// Stored cooldown for one credential, derived from the last failure feedback.
 #[derive(Debug, Clone)]
 struct ProviderCredentialFeedbackState {
     provider_id: String,
@@ -729,6 +814,9 @@ impl ProviderCredentialFeedbackState {
         }
     }
 
+    // A cooldown without a deadline counts as inactive: feedback must expire on its
+    // own rather than block a credential forever (pinned by
+    // credential_feedback_without_deadline_is_inactive).
     fn is_active(&self, now_unix_ms: i64) -> bool {
         match self.blocked_until_unix_ms {
             Some(blocked_until_unix_ms) => blocked_until_unix_ms > now_unix_ms,
@@ -736,6 +824,8 @@ impl ProviderCredentialFeedbackState {
         }
     }
 
+    // Callers only reach this through active_credential_feedback (blocked_until >
+    // now), so the difference is positive and the i64 -> u64 cast cannot wrap.
     fn retry_after_ms(&self, now_unix_ms: i64) -> Option<u64> {
         self.blocked_until_unix_ms
             .map(|blocked_until| blocked_until.saturating_sub(now_unix_ms) as u64)
@@ -755,6 +845,7 @@ impl ProviderCredentialFeedbackState {
     }
 }
 
+/// Active/waiting counts for one provider or credential key.
 #[derive(Debug, Default, Clone, Copy)]
 struct LeaseBucketState {
     active_foreground: u16,
@@ -776,6 +867,9 @@ impl LeaseBucketState {
     }
 }
 
+// Returns why this bucket cannot grant a lease right now, or None when it can.
+// Background work yields to any queued foreground waiter and to the reserved
+// foreground slot before the shared capacity check applies to everyone.
 fn bucket_reason(
     bucket: LeaseBucketState,
     priority: LeasePriority,
@@ -795,6 +889,8 @@ fn bucket_reason(
     None
 }
 
+// Background may use all but one slot, keeping one in reserve for foreground work;
+// a single-slot bucket stays fully usable so background is not starved outright.
 const fn background_limit(limit: u16) -> u16 {
     if limit > 1 {
         limit - 1
@@ -819,6 +915,8 @@ fn increment_active(
     }
 }
 
+// The decrement helpers drop buckets that reach all-zero so idle provider and
+// credential keys do not accumulate in the maps for the daemon's lifetime.
 fn decrement_active(
     map: &mut HashMap<String, LeaseBucketState>,
     key: &str,

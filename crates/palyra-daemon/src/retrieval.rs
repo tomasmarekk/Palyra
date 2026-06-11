@@ -1,3 +1,13 @@
+//! Hybrid retrieval runtime: backend selection, embeddings posture, and fusion scoring.
+//!
+//! Owns the retrieval backend abstraction (journal SQLite FTS vs. the external derived-index
+//! preview), the embeddings runtime selection with explicit degraded fallbacks, and the
+//! lexical/vector/recency/source-quality scoring shared by memory and workspace search.
+//! Candidate generation itself lives in [`crate::journal::JournalStore`]; the external index
+//! runtime lives in the [`external_index`] submodule. Scoring outputs are pinned by fixtures
+//! under `fixtures/retrieval/`, so any change to weights, biases, or rounding is
+//! regression-gated.
+
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -32,17 +42,23 @@ const DEFAULT_PRODUCTION_EMBEDDINGS_DIMS: usize = 1_536;
 const DEFAULT_EMBEDDINGS_BATCH_LIMIT: usize = 64;
 const DEFAULT_BACKFILL_STRATEGY: &str = "lazy_reindex";
 
+// Score floors below mirror the pre-profile scoring behavior so default rankings stay
+// byte-identical to the fixtures recorded before per-source profiles existed.
 const DEFAULT_RECALL_PHRASE_MATCH_BONUS_BPS: u16 = 2_000;
 const DEFAULT_LEGACY_MIN_RECENCY_BPS: u16 = 1_500;
 const DEFAULT_LEGACY_MIN_SOURCE_QUALITY_BPS: u16 = 2_000;
 
+/// Which retrieval backend serves candidate generation.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RetrievalBackendKind {
+    /// Journal-owned SQLite FTS index; the default and the source of truth.
     JournalSqliteFts,
+    /// Preview path backed by an external derived index with journal fallback.
     ExternalDerivedPreview,
 }
 
+/// Coarse health of a retrieval backend as surfaced to operators.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RetrievalBackendState {
@@ -50,6 +66,7 @@ pub(crate) enum RetrievalBackendState {
     Degraded,
 }
 
+/// Feature matrix advertised by a retrieval backend snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RetrievalBackendCapabilities {
     pub(crate) lexical_search: bool,
@@ -72,6 +89,7 @@ pub(crate) struct RetrievalBackendCapabilities {
     pub(crate) scale_slos: bool,
 }
 
+/// Operator-facing snapshot of the active retrieval backend and its posture.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RetrievalBackendSnapshot {
     pub(crate) kind: RetrievalBackendKind,
@@ -83,14 +101,19 @@ pub(crate) struct RetrievalBackendSnapshot {
     pub(crate) external_index: Option<ExternalRetrievalIndexSnapshot>,
 }
 
+/// How a journal field may (or may not) be projected into an external index.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RetrievalExternalizationClass {
+    /// Rebuildable projection; allowed to live in an external derived index.
     DerivedIndex,
+    /// Audit evidence; must never leave the journal store.
     JournalOnly,
+    /// Bulk payloads; stay in artifact storage, indexes keep only ids/snippets.
     ArtifactOnly,
 }
 
+/// Per-field externalization decision with a human-readable justification.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RetrievalDerivedFieldPolicy {
     pub(crate) field: String,
@@ -98,6 +121,7 @@ pub(crate) struct RetrievalDerivedFieldPolicy {
     pub(crate) reason: String,
 }
 
+/// Declares the journal as retrieval source of truth and lists field-level rules.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RetrievalExternalizationPolicySnapshot {
     pub(crate) source_of_truth: String,
@@ -106,6 +130,7 @@ pub(crate) struct RetrievalExternalizationPolicySnapshot {
     pub(crate) field_policy: Vec<RetrievalDerivedFieldPolicy>,
 }
 
+/// Point-in-time view of an external derived index: freshness, drift, and SLO posture.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ExternalRetrievalIndexSnapshot {
     pub(crate) provider: String,
@@ -126,6 +151,7 @@ pub(crate) struct ExternalRetrievalIndexSnapshot {
     pub(crate) last_error: Option<String>,
 }
 
+/// Source families that carry their own scoring profile during fusion.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RetrievalSourceProfileKind {
@@ -136,6 +162,7 @@ pub(crate) enum RetrievalSourceProfileKind {
     CompactionArtifact,
 }
 
+/// Selects which [`RetrievalBackendKind`] the daemon should serve searches from.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RetrievalBackendConfig {
     pub(crate) kind: RetrievalBackendKind,
@@ -147,6 +174,10 @@ impl Default for RetrievalBackendConfig {
     }
 }
 
+/// Fusion weights and floors for one source family, expressed in basis points.
+///
+/// Invariant: the four weight fields must sum to exactly 10_000 bps so the weighted
+/// score stays in `[0, 1]` before the optional pinned bonus; [`Self::validate`] enforces it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RetrievalSourceScoringProfile {
     pub(crate) lexical_bps: u16,
@@ -159,6 +190,11 @@ pub(crate) struct RetrievalSourceScoringProfile {
 }
 
 impl RetrievalSourceScoringProfile {
+    /// Checks weight-sum and per-field bounds for this profile.
+    ///
+    /// # Errors
+    /// Returns an error naming `label` when the four weights do not sum to 10_000 bps
+    /// or when any floor/bonus exceeds 10_000 bps.
     fn validate(&self, label: &str) -> Result<()> {
         let total = u32::from(self.lexical_bps)
             + u32::from(self.vector_bps)
@@ -181,6 +217,7 @@ impl RetrievalSourceScoringProfile {
     }
 }
 
+/// Complete scoring configuration: one profile per source family plus the phrase bonus.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RetrievalScoringConfig {
     pub(crate) phrase_match_bonus_bps: u16,
@@ -193,6 +230,10 @@ pub(crate) struct RetrievalScoringConfig {
 }
 
 impl RetrievalScoringConfig {
+    /// Validates the phrase bonus and every per-source profile.
+    ///
+    /// # Errors
+    /// Returns the first profile validation failure, labeled with its config path.
     pub(crate) fn validate(&self) -> Result<()> {
         anyhow::ensure!(
             self.phrase_match_bonus_bps <= 10_000,
@@ -207,6 +248,7 @@ impl RetrievalScoringConfig {
         Ok(())
     }
 
+    /// Returns the scoring profile configured for the given source family.
     #[must_use]
     pub(crate) fn profile_for(
         &self,
@@ -223,6 +265,10 @@ impl RetrievalScoringConfig {
 }
 
 impl Default for RetrievalScoringConfig {
+    // Default weight choices: memory leans on lexical+vector relevance because curated
+    // facts age well (low recency weight); workspace adds a pinned bonus and drops
+    // source-quality weight since documents carry quality via pinning/risk flags instead.
+    // These exact numbers are pinned by fixtures/retrieval/eval_report_default.json.
     fn default() -> Self {
         let default_profile = RetrievalSourceScoringProfile {
             lexical_bps: 4_200,
@@ -261,6 +307,7 @@ impl Default for RetrievalScoringConfig {
     }
 }
 
+/// Top-level retrieval runtime configuration: backend choice plus scoring weights.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RetrievalRuntimeConfig {
     pub(crate) backend: RetrievalBackendConfig,
@@ -268,11 +315,17 @@ pub(crate) struct RetrievalRuntimeConfig {
 }
 
 impl RetrievalRuntimeConfig {
+    /// Validates the scoring configuration.
+    ///
+    /// # Errors
+    /// Returns the underlying [`RetrievalScoringConfig::validate`] failure.
     pub(crate) fn validate(&self) -> Result<()> {
         self.scoring.validate()
     }
 }
 
+/// Returns the static externalization policy: journal/artifact storage stay the source
+/// of truth, and only rebuildable projections may be copied into a derived index.
 #[must_use]
 pub(crate) fn retrieval_externalization_policy() -> RetrievalExternalizationPolicySnapshot {
     RetrievalExternalizationPolicySnapshot {
@@ -326,16 +379,23 @@ pub(crate) fn retrieval_externalization_policy() -> RetrievalExternalizationPoli
     }
 }
 
+/// Why the embeddings runtime is (or is not) running the production provider path.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum MemoryEmbeddingsPosture {
+    /// Production embeddings provider is active.
     ProductionDefault,
+    /// `PALYRA_OFFLINE` forced the deterministic hash fallback.
     DegradedOffline,
+    /// Configuration is incomplete (no model, dims, or credentials).
     DegradedConfigFallback,
+    /// Provider runtime failed to initialize at selection time.
     DegradedProviderFallback,
+    /// Resolved provider kind cannot serve embeddings.
     DegradedUnsupportedProvider,
 }
 
+/// Resolved embeddings runtime parameters plus the degradation explanation, if any.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct MemoryEmbeddingsRuntimeProfile {
     pub(crate) posture: MemoryEmbeddingsPosture,
@@ -352,6 +412,8 @@ pub(crate) struct MemoryEmbeddingsRuntimeProfile {
 }
 
 impl MemoryEmbeddingsRuntimeProfile {
+    /// Reconstructs a profile from a journal-recorded provider name and dimensions when
+    /// no explicit runtime selection was persisted (pre-profile journals).
     #[must_use]
     pub(crate) fn legacy_from_provider(model_name: &str, dimensions: usize) -> Self {
         let hash_fallback = model_name == HashMemoryEmbeddingProvider::default().model_name();
@@ -389,6 +451,7 @@ impl MemoryEmbeddingsRuntimeProfile {
         }
     }
 
+    /// Maps the profile onto the journal's coarse embeddings mode.
     #[must_use]
     pub(crate) fn mode(&self) -> MemoryEmbeddingsMode {
         if self.production_default_active {
@@ -398,6 +461,7 @@ impl MemoryEmbeddingsRuntimeProfile {
         }
     }
 
+    /// Builds a hash-fallback selection carrying the given degradation posture and warning.
     fn degraded_hash_fallback(
         posture: MemoryEmbeddingsPosture,
         desired_model_id: Option<String>,
@@ -426,19 +490,29 @@ impl MemoryEmbeddingsRuntimeProfile {
     }
 }
 
+/// An embedding provider instance paired with the profile that selected it.
 #[derive(Clone)]
 pub(crate) struct MemoryEmbeddingRuntimeSelection {
     pub(crate) provider: Arc<dyn MemoryEmbeddingProvider>,
     pub(crate) profile: MemoryEmbeddingsRuntimeProfile,
 }
 
+/// Candidate-generation backend behind memory and workspace search.
+///
+/// Implementations must treat the [`JournalStore`] as the source of truth: candidates
+/// returned to callers are always journal records, never raw external-index rows.
 pub(crate) trait RetrievalBackend: Send + Sync {
+    /// Reports backend kind, health, capabilities, and externalization policy.
     fn snapshot(
         &self,
         config: &RetrievalRuntimeConfig,
         embeddings_status: &crate::journal::MemoryEmbeddingsStatus,
     ) -> RetrievalBackendSnapshot;
 
+    /// Generates raw memory candidates for the request.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when the journal query fails.
     fn search_memory_candidates(
         &self,
         store: &JournalStore,
@@ -446,6 +520,10 @@ pub(crate) trait RetrievalBackend: Send + Sync {
         config: &RetrievalRuntimeConfig,
     ) -> Result<Vec<MemorySearchCandidateRecord>, JournalError>;
 
+    /// Generates memory candidates together with branch/degradation diagnostics.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when the journal query fails.
     fn search_memory_candidate_outcome(
         &self,
         store: &JournalStore,
@@ -453,6 +531,10 @@ pub(crate) trait RetrievalBackend: Send + Sync {
         config: &RetrievalRuntimeConfig,
     ) -> Result<MemorySearchCandidateOutcome, JournalError>;
 
+    /// Generates workspace-document candidates together with diagnostics.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when the journal query fails.
     fn search_workspace_candidate_outcome(
         &self,
         store: &JournalStore,
@@ -461,6 +543,7 @@ pub(crate) trait RetrievalBackend: Send + Sync {
     ) -> Result<WorkspaceSearchCandidateOutcome, JournalError>;
 }
 
+/// Default backend that serves candidates straight from the journal SQLite FTS index.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct JournalRetrievalBackend;
 
@@ -483,7 +566,8 @@ impl RetrievalBackend for JournalRetrievalBackend {
                     "retrieval is operating in an explicitly degraded embeddings mode".to_owned()
                 })
             } else {
-                format!("journal-backed retrieval is ready with {} scoring profiles", 5)
+                // One profile per RetrievalSourceProfileKind variant.
+                "journal-backed retrieval is ready with 5 scoring profiles".to_owned()
             },
             capabilities: RetrievalBackendCapabilities {
                 lexical_search: true,
@@ -538,10 +622,16 @@ impl RetrievalBackend for JournalRetrievalBackend {
     }
 }
 
+/// Read-only freshness/drift view over an external derived index.
+///
+/// Implementations only report status; candidate serving always rehydrates
+/// through [`JournalStore`] so the external index never becomes an authority.
 pub(crate) trait ExternalRetrievalIndex: Send + Sync {
+    /// Reports current index freshness, drift, and SLO posture.
     fn snapshot(&self) -> ExternalRetrievalIndexSnapshot;
 }
 
+/// Placeholder index used when no external provider is configured; always degraded.
 #[derive(Debug, Default)]
 pub(crate) struct UnavailableExternalRetrievalIndex;
 
@@ -565,6 +655,8 @@ impl ExternalRetrievalIndex for UnavailableExternalRetrievalIndex {
     }
 }
 
+/// Preview backend that advertises an external derived index but still serves all
+/// candidates from the journal fallback, tagging outcomes with a degraded reason.
 #[derive(Clone)]
 pub(crate) struct ExternalDerivedRetrievalBackend {
     external_index: Arc<dyn ExternalRetrievalIndex>,
@@ -578,6 +670,7 @@ impl Default for ExternalDerivedRetrievalBackend {
 }
 
 impl ExternalDerivedRetrievalBackend {
+    /// Wraps the given external index status source with a journal fallback.
     #[must_use]
     pub(crate) fn new(external_index: Arc<dyn ExternalRetrievalIndex>) -> Self {
         Self { external_index, journal_fallback: JournalRetrievalBackend }
@@ -605,6 +698,8 @@ impl ExternalDerivedRetrievalBackend {
         Ok(outcome)
     }
 
+    // Both reasons mean "journal served the candidates"; they only distinguish whether
+    // the external index was down or merely not authoritative. Tests pin both strings.
     fn journal_rehydration_fallback_reason(&self) -> &'static str {
         if self.external_index.snapshot().state == RetrievalBackendState::Degraded {
             "external_index_unavailable"
@@ -711,6 +806,14 @@ impl RetrievalBackend for ExternalDerivedRetrievalBackend {
     }
 }
 
+/// Selects the embeddings provider for retrieval, degrading to the deterministic
+/// hash fallback (with an explicit posture, reason code, and operator warning)
+/// whenever offline mode is on or the configuration cannot serve production
+/// embeddings. The selection itself never fails for degraded configurations.
+///
+/// # Errors
+/// Returns an error only when the provider registry in `config` cannot be
+/// normalized (invalid registry definitions).
 pub(crate) fn build_memory_embedding_runtime_selection(
     config: &ModelProviderConfig,
     offline_mode: bool,
@@ -842,6 +945,11 @@ pub(crate) fn build_memory_embedding_runtime_selection(
     })
 }
 
+/// Fuses raw memory candidates into ranked hits using the memory scoring profile.
+///
+/// Lexical/vector raws are max-normalized within the candidate set, fused via
+/// [`score_with_profile`], filtered by `min_score`, then sorted by score with
+/// deterministic tie-breaks (newer first, then memory id).
 pub(crate) fn score_memory_candidates(
     candidates: Vec<MemorySearchCandidateRecord>,
     min_score: f64,
@@ -851,6 +959,8 @@ pub(crate) fn score_memory_candidates(
         return Vec::new();
     }
     let profile = config.scoring.profile_for(RetrievalSourceProfileKind::Memory);
+    // Normalizing by the per-query max makes lexical/vector branches comparable across
+    // backends with different raw score scales; fixtures pin the resulting rankings.
     let lexical_max = candidates.iter().map(|candidate| candidate.lexical_raw).fold(0.0, f64::max);
     let vector_max = candidates.iter().map(|candidate| candidate.vector_raw).fold(0.0, f64::max);
 
@@ -897,6 +1007,9 @@ pub(crate) fn score_memory_candidates(
     hits
 }
 
+/// Fuses raw workspace-document candidates into ranked hits, mirroring
+/// [`score_memory_candidates`] but with the workspace profile, the pinned-document
+/// bonus, and a human-readable fusion `reason` per hit.
 pub(crate) fn score_workspace_candidates(
     candidates: Vec<WorkspaceSearchCandidateRecord>,
     min_score: f64,
@@ -975,6 +1088,7 @@ pub(crate) fn score_workspace_candidates(
     hits
 }
 
+/// Labels which candidate-generation branches produced a hit, for explain output.
 #[must_use]
 pub(crate) fn retrieval_candidate_branches(lexical: bool, vector: bool) -> &'static str {
     match (lexical, vector) {
@@ -985,6 +1099,7 @@ pub(crate) fn retrieval_candidate_branches(lexical: bool, vector: bool) -> &'sta
     }
 }
 
+/// Per-component fusion scores (already clamped/floored) plus the weighted final score.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct RetrievalScoreBreakdown {
     pub(crate) lexical_score: f64,
@@ -994,6 +1109,9 @@ pub(crate) struct RetrievalScoreBreakdown {
     pub(crate) final_score: f64,
 }
 
+/// Token-overlap lexical score: the best overlap across all query variants.
+///
+/// May exceed 1.0 when the phrase bonus applies; [`score_with_profile`] clamps it.
 #[must_use]
 pub(crate) fn lexical_overlap_score(
     text: &str,
@@ -1006,6 +1124,8 @@ pub(crate) fn lexical_overlap_score(
         .fold(0.0, f64::max)
 }
 
+/// Deterministic stand-in for vector similarity used when real embeddings are not
+/// queried: character-trigram containment of the query in the text, in `[0, 1]`.
 #[must_use]
 pub(crate) fn proxy_vector_score(text: &str, query_variants: &[String]) -> f64 {
     query_variants
@@ -1023,6 +1143,10 @@ pub(crate) fn proxy_vector_score(text: &str, query_variants: &[String]) -> f64 {
         .clamp(0.0, 1.0)
 }
 
+/// Hyperbolic age decay with a one-week half-life, floored at `minimum_bps`.
+///
+/// Missing or future timestamps score a full 1.0 rather than penalizing the
+/// candidate for clock skew or absent metadata.
 #[must_use]
 pub(crate) fn recency_score(created_at_unix_ms: i64, now_unix_ms: i64, minimum_bps: u16) -> f64 {
     if created_at_unix_ms <= 0 || now_unix_ms <= created_at_unix_ms {
@@ -1033,6 +1157,11 @@ pub(crate) fn recency_score(created_at_unix_ms: i64, now_unix_ms: i64, minimum_b
     (1.0 / (1.0 + age_days / 7.0)).clamp(minimum, 1.0)
 }
 
+// The source-quality constants below are calibrated heuristics, not derived values.
+// They are pinned by fixtures/retrieval/eval_report_default.json and by ranking unit
+// tests; any retuning must regenerate those fixtures deliberately.
+
+/// Source-quality prior for transcript events: replies rank slightly above inputs.
 #[must_use]
 pub(crate) fn transcript_source_quality(
     event_type: &str,
@@ -1046,6 +1175,8 @@ pub(crate) fn transcript_source_quality(
     base.clamp(f64::from(profile.min_source_quality_bps) / 10_000.0, 1.0)
 }
 
+/// Source-quality prior for checkpoints; restores and a non-empty note signal that
+/// an operator found the checkpoint useful, so each adds a small bump.
 #[must_use]
 pub(crate) fn checkpoint_source_quality(
     checkpoint: &OrchestratorCheckpointRecord,
@@ -1061,6 +1192,11 @@ pub(crate) fn checkpoint_source_quality(
     quality.clamp(f64::from(profile.min_source_quality_bps) / 10_000.0, 1.0)
 }
 
+/// Source-quality prior for compaction artifacts, penalized per review candidate and
+/// (more heavily) per poisoned candidate reported by the compaction quality gates.
+///
+/// A corrupt or empty `summary_json` parses as `Null`, which yields zero penalties
+/// rather than failing the search.
 #[must_use]
 pub(crate) fn compaction_source_quality(
     artifact: &OrchestratorCompactionArtifactRecord,
@@ -1081,6 +1217,11 @@ pub(crate) fn compaction_source_quality(
         .clamp(f64::from(profile.min_source_quality_bps) / 10_000.0, 1.0)
 }
 
+/// Source-quality score for memory items: a confidence/source-bias blend, capped so
+/// transient tape captures can never outrank curated manual or imported memories.
+///
+/// The caps (tape <= 0.46/0.36, summary <= 0.66) enforce the ordering pinned by
+/// `memory_source_quality_downranks_transient_tape_entries`.
 #[must_use]
 pub(crate) fn memory_source_quality(
     source: MemorySource,
@@ -1106,6 +1247,8 @@ pub(crate) fn memory_source_quality(
         .clamp(f64::from(profile.min_source_quality_bps) / 10_000.0, 1.0)
 }
 
+/// Source-quality score for workspace documents: operator signals (pinning, manual
+/// override, system prompt binding) add bumps; any non-clean risk state subtracts.
 #[must_use]
 pub(crate) fn workspace_source_quality(
     pinned: bool,
@@ -1130,6 +1273,11 @@ pub(crate) fn workspace_source_quality(
     quality.clamp(f64::from(profile.min_source_quality_bps) / 10_000.0, 1.0)
 }
 
+/// Combines clamped component scores into the weighted fusion score for a profile.
+///
+/// Recency and source quality are floored at the profile minimums before weighting,
+/// and the pinned bonus is added after weighting (so a pinned hit may exceed 1.0 by
+/// at most the bonus).
 #[must_use]
 pub(crate) fn score_with_profile(
     lexical_score: f64,
@@ -1167,6 +1315,8 @@ fn lexical_overlap_for_query(text: &str, query: &str, phrase_match_bonus_bps: u1
         return 0.0;
     }
     let needle_set = needles.iter().collect::<std::collections::BTreeSet<_>>();
+    // Counting haystack tokens (with repeats) over distinct needles lets repeated query
+    // terms in the text push the ratio above 1.0; downstream clamping bounds it.
     let match_count = haystack.iter().filter(|token| needle_set.contains(token)).count();
     let phrase_bonus = if text.to_ascii_lowercase().contains(query.to_ascii_lowercase().as_str()) {
         f64::from(phrase_match_bonus_bps) / 10_000.0
@@ -1175,6 +1325,8 @@ fn lexical_overlap_for_query(text: &str, query: &str, phrase_match_bonus_bps: u1
     };
     (match_count as f64 / needle_set.len().max(1) as f64) + phrase_bonus
 }
+
+// Keeps path-like tokens ("src/lib.rs", "snake_case") intact so code references match.
 fn normalized_tokens(input: &str) -> Vec<String> {
     input
         .chars()
@@ -1207,6 +1359,15 @@ fn char_ngrams(input: &str) -> std::collections::BTreeSet<String> {
     grams
 }
 
+/// Resolves the effective provider configuration for the default embeddings model.
+///
+/// Overlays the matching registry provider entry (endpoint, credentials, retry and
+/// circuit-breaker settings) onto a copy of the base config. Returns `Ok(None)` when
+/// no embeddings model is configured or the resolved provider cannot serve
+/// production embeddings (wrong kind or no credential source).
+///
+/// # Errors
+/// Returns an error when the provider registry cannot be normalized.
 pub(crate) fn resolve_embeddings_provider_config(
     config: &ModelProviderConfig,
 ) -> Result<Option<ModelProviderConfig>> {
@@ -1325,6 +1486,8 @@ fn provider_can_use_production_embeddings(
     })
 }
 
+// Built-in dimension table for well-known OpenAI embedding models, so operators only
+// have to configure dims for models we do not recognize.
 fn known_embedding_dimensions(model_id: &str) -> Option<usize> {
     match model_id.trim() {
         DEFAULT_PRODUCTION_EMBEDDINGS_MODEL_ID => Some(DEFAULT_PRODUCTION_EMBEDDINGS_DIMS),
@@ -1334,6 +1497,8 @@ fn known_embedding_dimensions(model_id: &str) -> Option<usize> {
     }
 }
 
+/// Bridges the async [`crate::model_provider::EmbeddingsProvider`] into the journal's
+/// synchronous [`MemoryEmbeddingProvider`] trait, degrading to zero vectors on failure.
 struct ModelProviderMemoryEmbeddingAdapter {
     provider: Arc<dyn crate::model_provider::EmbeddingsProvider>,
     model_name: String,
@@ -1363,8 +1528,16 @@ impl MemoryEmbeddingProvider for ModelProviderMemoryEmbeddingAdapter {
         self.dimensions
     }
 
+    // Embedding failures degrade to zero vectors instead of erroring so memory writes
+    // and searches keep working; the lexical branch still produces useful rankings.
     fn embed_text(&self, text: &str) -> Vec<f32> {
         let request = crate::model_provider::EmbeddingsRequest { inputs: vec![text.to_owned()] };
+        // AIDEV-NOTE: block_in_place panics on a current_thread tokio runtime (it only
+        // works on the multi-thread flavor), and Handle::try_current succeeds there too.
+        // The daemon runs multi-thread, but calling this from a current_thread runtime
+        // (for example #[tokio::test] without a flavor) would panic rather than fall
+        // back to the zero vector. Fixing it requires a behavior change (runtime-flavor
+        // check or dedicated blocking thread).
         let result = match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 tokio::task::block_in_place(|| handle.block_on(self.provider.embed(request)))
@@ -1398,6 +1571,8 @@ impl MemoryEmbeddingProvider for ModelProviderMemoryEmbeddingAdapter {
     }
 }
 
+// The journal vector index requires a fixed dimensionality per target version, so
+// provider responses are zero-padded or truncated rather than rejected on mismatch.
 fn normalize_embedding_dimensions(mut vector: Vec<f32>, expected_dims: usize) -> Vec<f32> {
     if expected_dims == 0 {
         return Vec::new();
