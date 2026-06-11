@@ -1,3 +1,12 @@
+//! Daemon configuration: validated runtime types ([`schema`]) and the loader
+//! ([`load`]) that merges defaults, the TOML config file, and `PALYRA_*`
+//! environment overrides (in that precedence order, env winning) into a
+//! [`LoadedConfig`].
+//!
+//! The raw on-disk TOML shape lives in `palyra_common::daemon_config_schema`
+//! (the `File*` serde types); this module owns the parsed, validated runtime
+//! counterparts and their secure defaults.
+
 pub(crate) mod load;
 pub(crate) mod schema;
 

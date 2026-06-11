@@ -1,3 +1,22 @@
+//! Daemon configuration loading: defaults, TOML file, and environment
+//! overrides merged into a validated [`LoadedConfig`].
+//!
+//! Precedence is strictly defaults < config file < `PALYRA_*` environment
+//! variables; every applied file/env source is appended to
+//! `LoadedConfig::source` as provenance. The file shape is the `File*` serde
+//! tree from `palyra_common::daemon_config_schema` (with deny-unknown-fields
+//! and v0->v1 migration); this module converts it into the runtime types in
+//! [`super::schema`] through fail-closed `parse_*` validators.
+//!
+//! After all sources merge, [`load_config`] runs cross-field validation
+//! (TLS completeness, preview-mode/rollout pairing, secret-source
+//! mutual exclusion), resolves relative storage paths against the runtime
+//! state root, and derives the deployment profile when not set explicitly.
+//!
+//! Many error strings, env var names, and TOML key paths here are pinned by
+//! the in-file tests and by config import/export contract fixtures - treat
+//! them as frozen contract surface.
+
 use std::{
     collections::HashSet,
     env, fs,
@@ -46,6 +65,19 @@ use crate::retrieval::{
 };
 use crate::sandbox_runner::{EgressEnforcementMode, SandboxProcessRunnerTier};
 
+/// Loads the daemon configuration by layering the config file (located via
+/// `PALYRA_CONFIG` or the default search paths) and `PALYRA_*` environment
+/// overrides on top of the secure defaults, then validating the result.
+///
+/// Environment variables always win over file values; `LoadedConfig::source`
+/// records which file and env sources contributed.
+///
+/// # Errors
+/// Fails when the config file cannot be read, migrated, or parsed; when any
+/// individual value fails validation (the error names the offending TOML key
+/// or env var); or when cross-field validation rejects the merged result
+/// (incomplete gateway TLS, preview mode enabled without its rollout flag,
+/// conflicting secret sources, invalid retrieval weights).
 pub fn load_config() -> Result<LoadedConfig> {
     let mut deployment = DeploymentConfig::default();
     let mut deployment_profile_explicit = false;
@@ -138,6 +170,9 @@ pub fn load_config() -> Result<LoadedConfig> {
             if let Some(vault_get_approval_required_refs) =
                 file_gateway.vault_get_approval_required_refs
             {
+                // File arrays are joined with commas so the same allowlist
+                // parsers serve both TOML lists and comma-separated env vars;
+                // entries cannot themselves contain commas, so this is lossless.
                 gateway.vault_get_approval_required_refs = parse_vault_ref_allowlist(
                     vault_get_approval_required_refs.join(",").as_str(),
                     "gateway.vault_get_approval_required_refs",
@@ -523,6 +558,10 @@ pub fn load_config() -> Result<LoadedConfig> {
             if let Some(openai_base_url) = file_model_provider.openai_base_url {
                 model_provider.openai_base_url = parse_openai_base_url(openai_base_url.as_str())?;
             }
+            // AIDEV-NOTE: anthropic_base_url/anthropic_model reuse the openai
+            // parsers, so their validation errors say "openai base URL" /
+            // "openai model" for anthropic keys. Fixing the wording is a
+            // behavior change (error strings are pinned by tests/fixtures).
             if let Some(anthropic_base_url) = file_model_provider.anthropic_base_url {
                 model_provider.anthropic_base_url =
                     parse_openai_base_url(anthropic_base_url.as_str())?;
@@ -546,6 +585,9 @@ pub fn load_config() -> Result<LoadedConfig> {
                     "model_provider.openai_embeddings_dims",
                 )?);
             }
+            // Blank secret values mean "explicitly unset" across the loader:
+            // they clear the lower-precedence value instead of storing an
+            // empty credential. The same rule applies to the env overrides.
             if let Some(openai_api_key) = file_model_provider.openai_api_key {
                 model_provider.openai_api_key =
                     if openai_api_key.trim().is_empty() { None } else { Some(openai_api_key) };
@@ -586,6 +628,8 @@ pub fn load_config() -> Result<LoadedConfig> {
                     "model_provider.anthropic_api_key_vault_ref",
                 )?;
             }
+            // auth_profile_ref is the legacy spelling; auth_profile_id is
+            // applied second and therefore wins when both keys are present.
             if let Some(auth_profile_ref) = file_model_provider.auth_profile_ref {
                 model_provider.auth_profile_id = parse_optional_auth_profile_id(
                     auth_profile_ref.as_str(),
@@ -627,6 +671,9 @@ pub fn load_config() -> Result<LoadedConfig> {
                 model_provider.circuit_breaker_cooldown_ms =
                     parse_positive_u64(cooldown_ms, "model_provider.circuit_breaker_cooldown_ms")?;
             }
+            // Work on a clone of the registry: provider entries inherit
+            // defaults from `&model_provider`, so the registry cannot be
+            // mutated in place while that borrow is alive.
             let mut registry = model_provider.registry.clone();
             if let Some(entries) = file_model_provider.providers {
                 registry.providers = entries
@@ -1147,6 +1194,8 @@ pub fn load_config() -> Result<LoadedConfig> {
         }
     }
 
+    // Environment overrides are applied after the file so they always win;
+    // each one appends a provenance marker to `source`.
     if let Ok(bind_addr) = env::var("PALYRA_DAEMON_BIND_ADDR") {
         daemon.bind_addr = bind_addr;
         source.push_str(" +env(PALYRA_DAEMON_BIND_ADDR)");
@@ -1373,6 +1422,9 @@ pub fn load_config() -> Result<LoadedConfig> {
         source.push_str(" +env(PALYRA_MEMORY_RETENTION_VACUUM_SCHEDULE)");
     }
 
+    // AIDEV-NOTE: this error message omits "anthropic" even though
+    // ModelProviderKind::parse accepts it; the string is pinned, so updating
+    // it is a behavior change to schedule alongside other contract updates.
     if let Ok(kind) = env::var("PALYRA_MODEL_PROVIDER_KIND") {
         model_provider.kind = ModelProviderKind::parse(kind.as_str())
             .context("PALYRA_MODEL_PROVIDER_KIND must be deterministic or openai_compatible")?;
@@ -1424,6 +1476,8 @@ pub fn load_config() -> Result<LoadedConfig> {
         )?;
         source.push_str(" +env(PALYRA_MODEL_PROVIDER_OPENAI_API_KEY_VAULT_REF)");
     }
+    // As with the file keys, *_AUTH_PROFILE_REF is legacy and the *_ID
+    // variant applied below wins when both env vars are set.
     if let Ok(auth_profile_ref) = env::var("PALYRA_MODEL_PROVIDER_AUTH_PROFILE_REF") {
         model_provider.auth_profile_id = parse_optional_auth_profile_id(
             auth_profile_ref.as_str(),
@@ -1991,11 +2045,15 @@ pub fn load_config() -> Result<LoadedConfig> {
         &mut source,
     )?;
 
+    // Cross-field validation runs only after every source (defaults, file,
+    // env) has been merged, so it judges the final effective values.
     if gateway.tls.enabled && (gateway.tls.cert_path.is_none() || gateway.tls.key_path.is_none()) {
         anyhow::bail!(
             "gateway.tls.enabled=true requires both gateway.tls.cert_path and gateway.tls.key_path"
         );
     }
+    // An auth profile without an explicit provider kind predates the
+    // multi-provider registry; default it to OpenAI for compatibility.
     if model_provider.auth_profile_id.is_some()
         && model_provider.auth_profile_provider_kind.is_none()
     {
@@ -2019,6 +2077,8 @@ pub fn load_config() -> Result<LoadedConfig> {
         &replay_capture,
         &networked_workers,
     )?;
+    // Anchor relative storage paths against the state root only now, after
+    // env overrides, so PALYRA_STATE_ROOT and path overrides compose.
     let runtime_state_root =
         resolve_runtime_state_root_for_config(gateway.identity_store_dir.as_deref())?;
     storage.journal_db_path = resolve_state_relative_path(
@@ -2032,6 +2092,8 @@ pub fn load_config() -> Result<LoadedConfig> {
             Some(resolve_state_relative_path(runtime_state_root.as_path(), state_dir));
     }
     validate_secret_source_conflicts(&model_provider, &tool_call.browser_service, &admin)?;
+    // Without an explicit profile (file or env), derive it from the final
+    // deployment mode and whether networked workers are in play.
     if !deployment_profile_explicit {
         let derived = palyra_common::deployment_profiles::derive_deployment_profile(
             None,
@@ -2072,6 +2134,12 @@ pub fn load_config() -> Result<LoadedConfig> {
     })
 }
 
+/// Migrates a raw TOML document to the current schema version, then parses
+/// it into the strict (deny-unknown-fields) [`RootFileConfig`] shape.
+///
+/// The migrated document is re-serialized and re-parsed rather than
+/// converted in memory so the strict serde validation applies to exactly
+/// what the migration produced.
 fn parse_root_file_config(content: &str) -> Result<(RootFileConfig, ConfigMigrationInfo)> {
     let (document, migration) =
         parse_document_with_migration(content).context("failed to migrate config document")?;
@@ -2082,6 +2150,9 @@ fn parse_root_file_config(content: &str) -> Result<(RootFileConfig, ConfigMigrat
     Ok((parsed, migration))
 }
 
+/// Applies a feature-rollout env override on top of `current`. The env value
+/// always wins (even when it disables a config-enabled rollout) and appends
+/// a provenance marker to `source`; an unset env var keeps `current`.
 fn apply_feature_rollout_env_override(
     current: FeatureRolloutSetting,
     env_name: &'static str,
@@ -2095,6 +2166,10 @@ fn apply_feature_rollout_env_override(
     Ok(FeatureRolloutSetting::from_env(enabled))
 }
 
+/// Validates the merged runtime-preview sections: every `enabled` mode must
+/// have its rollout flag on, and numeric knobs must sit inside their fixed
+/// ranges. Lower bounds (> 0) were already enforced by the `parse_positive_*`
+/// helpers, so only upper bounds are checked here.
 #[allow(clippy::too_many_arguments)]
 fn validate_runtime_preview_config(
     feature_rollouts: &FeatureRolloutsConfig,
@@ -2201,6 +2276,8 @@ fn validate_runtime_preview_config(
     Ok(())
 }
 
+/// Rejects `mode = "enabled"` unless the paired rollout flag is set; the
+/// error spells out both the config path and the env var that unlock it.
 fn validate_enabled_mode_requires_rollout(
     mode: RuntimePreviewMode,
     rollout: FeatureRolloutSetting,
@@ -2214,6 +2291,10 @@ fn validate_enabled_mode_requires_rollout(
     Ok(())
 }
 
+/// Locates the config file: an explicit `PALYRA_CONFIG` path (which must
+/// exist - a typo should fail loudly rather than silently fall back to
+/// defaults), otherwise the first existing default search path, otherwise
+/// `None` (defaults-only run).
 fn find_config_path() -> Result<Option<PathBuf>> {
     if let Ok(path) = env::var("PALYRA_CONFIG") {
         let path =
@@ -2233,6 +2314,10 @@ fn find_config_path() -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
+/// Resolves the state root that relative storage paths are anchored to:
+/// `PALYRA_STATE_ROOT` first, then the parent of a configured identity store
+/// directory (so identity and storage stay co-located), then the platform
+/// default.
 fn resolve_runtime_state_root_for_config(identity_store_dir: Option<&Path>) -> Result<PathBuf> {
     if let Ok(raw) = env::var("PALYRA_STATE_ROOT") {
         let trimmed = raw.trim();
@@ -2256,6 +2341,7 @@ fn resolve_runtime_state_root_for_config(identity_store_dir: Option<&Path>) -> R
     default_state_root().context("failed to resolve default state root")
 }
 
+/// Joins `path` onto `state_root` unless it is already absolute.
 fn resolve_state_relative_path(state_root: &Path, path: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
@@ -2264,6 +2350,9 @@ fn resolve_state_relative_path(state_root: &Path, path: &Path) -> PathBuf {
     }
 }
 
+/// Validates the journal database path: non-empty, no NUL bytes, and no
+/// `..` components (a relative journal path is later joined onto the state
+/// root and must not be able to escape it).
 fn parse_journal_db_path(raw: &str) -> Result<PathBuf> {
     if raw.trim().is_empty() {
         anyhow::bail!("journal db path cannot be empty");
@@ -2278,6 +2367,12 @@ fn parse_journal_db_path(raw: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Validates the vault directory path: non-empty and no NUL bytes.
+///
+/// AIDEV-NOTE: unlike `parse_journal_db_path`, this accepts `..` components,
+/// so a relative vault dir can escape the state root after
+/// `resolve_state_relative_path`. Tightening it would be a behavior change;
+/// align it with the journal-path traversal check in a dedicated change.
 fn parse_vault_dir(raw: &str) -> Result<PathBuf> {
     if raw.trim().is_empty() {
         anyhow::bail!("vault directory cannot be empty");
@@ -2299,6 +2394,8 @@ fn parse_optional_browser_state_dir(raw: &str, source_name: &str) -> Result<Opti
     Ok(Some(PathBuf::from(trimmed)))
 }
 
+/// Parses a single-value vault ref field: blank clears the value, anything
+/// else must normalize to exactly one lowercase `<scope>/<key>` entry.
 fn parse_optional_vault_ref_field(raw: &str, source_name: &str) -> Result<Option<String>> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -2311,6 +2408,9 @@ fn parse_optional_vault_ref_field(raw: &str, source_name: &str) -> Result<Option
     Ok(refs.into_iter().next())
 }
 
+/// Validates a structured [`SecretRef`], normalizing the inner vault ref of
+/// vault-backed sources through the same single-entry rules as the legacy
+/// string fields before running the ref's own validation.
 fn parse_structured_secret_ref_field(
     secret_ref: SecretRef,
     source_name: &str,
@@ -2326,6 +2426,9 @@ fn parse_structured_secret_ref_field(
     Ok(parsed)
 }
 
+/// Parses an optional auth profile id: blank clears the value; otherwise it
+/// is lowercased and restricted to a small identifier charset so ids match
+/// the auth profile registry regardless of input casing.
 fn parse_optional_auth_profile_id(raw: &str, source_name: &str) -> Result<Option<String>> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -2355,6 +2458,10 @@ fn parse_optional_sha256_digest_field(raw: &str, source_name: &str) -> Result<Op
     Ok(Some(trimmed.to_ascii_lowercase()))
 }
 
+/// Enforces the secret-source mutual-exclusion rule across all credential
+/// fields: a secret may come from exactly one of an inline value, a
+/// structured `*_secret_ref`, or a legacy `*_vault_ref`. Ambiguity fails
+/// closed instead of letting one source silently shadow another.
 fn validate_secret_source_conflicts(
     model_provider: &ModelProviderConfig,
     browser_service: &BrowserServiceConfig,
@@ -2399,6 +2506,8 @@ fn validate_secret_source_conflicts(
     Ok(())
 }
 
+/// Rejects any pairwise combination of inline, structured-ref, and legacy
+/// vault-ref sources for a single logical secret field.
 fn validate_secret_field_conflict(
     field_name: &str,
     inline_present: bool,
@@ -2527,6 +2636,8 @@ fn default_provider_auth_kind(kind: ModelProviderKind) -> Option<ModelProviderAu
     }
 }
 
+/// Static capability baselines per (provider kind, model role); registry
+/// model entries start from these and may override individual fields.
 fn provider_capability_defaults(
     kind: ModelProviderKind,
     role: ProviderModelRole,
@@ -2675,11 +2786,15 @@ fn provider_capability_defaults(
     }
 }
 
+/// Capability baselines for a concrete provider entry, adjusting the
+/// kind-level defaults for known provider-specific gaps.
 fn provider_capability_defaults_for_entry(
     provider: &ProviderRegistryEntryConfig,
     role: ProviderModelRole,
 ) -> ProviderCapabilitiesSnapshot {
     let mut defaults = provider_capability_defaults(provider.kind, role);
+    // MiniMax exposes an Anthropic-compatible chat API but does not support
+    // vision, so its defaults must not advertise it.
     if provider.kind == ModelProviderKind::Anthropic
         && role == ProviderModelRole::Chat
         && provider.auth_profile_provider_kind == Some(ModelProviderAuthProviderKind::Minimax)
@@ -2695,6 +2810,10 @@ fn provider_capability_defaults_for_entry(
     defaults
 }
 
+/// Parses one `model_provider.providers[N]` registry entry, inheriting
+/// timeout/retry/circuit-breaker values from the top-level model provider
+/// config when the entry leaves them unset. Per-entry secrets follow the
+/// same one-source-only rule as the top-level credential fields.
 fn parse_model_provider_registry_entry(
     raw: palyra_common::daemon_config_schema::FileModelProviderRegistryEntry,
     index: usize,
@@ -2765,6 +2884,8 @@ fn parse_model_provider_registry_entry(
             "{source_name} cannot set both api_key_secret_ref and api_key_vault_ref for the same provider entry"
         );
     }
+    // A legacy vault ref is also surfaced as a structured secret ref so
+    // downstream credential resolution has a single code path.
     let resolved_api_key_secret_ref = api_key_secret_ref
         .clone()
         .or_else(|| api_key_vault_ref.clone().map(SecretRef::from_legacy_vault_ref));
@@ -2773,6 +2894,10 @@ fn parse_model_provider_registry_entry(
     } else if let Some(secret_ref) = resolved_api_key_secret_ref.as_ref() {
         Some(secret_ref_credential_source(secret_ref))
     } else if api_key_vault_ref.is_some() {
+        // AIDEV-NOTE: unreachable - a set api_key_vault_ref always populates
+        // resolved_api_key_secret_ref above, and that ref maps to VaultRef
+        // anyway. Kept because removing the arm changes control flow; drop it
+        // in a dedicated cleanup.
         Some(ModelProviderCredentialSource::VaultRef)
     } else if auth_profile_id.is_some() {
         auth_profile_provider_kind.map(|kind| match kind {
@@ -2854,6 +2979,10 @@ fn secret_ref_credential_source(secret_ref: &SecretRef) -> ModelProviderCredenti
     }
 }
 
+/// Parses one `model_provider.models[N]` registry entry. The referenced
+/// provider must already exist in `providers` (providers are parsed first),
+/// and unset capability fields fall back to that provider's kind/role
+/// defaults.
 fn parse_model_provider_registry_model(
     raw: palyra_common::daemon_config_schema::FileModelProviderRegistryModel,
     index: usize,
@@ -2975,6 +3104,11 @@ fn parse_gateway_tls_path(raw: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(raw))
 }
 
+/// Validates a model-provider base URL (also reused for Anthropic and
+/// per-registry-entry base URLs): https-only except for loopback hosts, no
+/// embedded credentials, and no query/fragment that could smuggle
+/// parameters into provider requests. Returns the URL without a trailing
+/// slash.
 fn parse_openai_base_url(raw: &str) -> Result<String> {
     if raw.trim().is_empty() {
         anyhow::bail!("openai base URL cannot be empty");
@@ -2984,6 +3118,8 @@ fn parse_openai_base_url(raw: &str) -> Result<String> {
         reqwest::Url::parse(normalized).context("openai base URL must be a valid absolute URL")?;
     let host =
         parsed.host_str().ok_or_else(|| anyhow::anyhow!("openai base URL must include a host"))?;
+    // Plain HTTP is tolerated only for loopback so local stubs and tests
+    // work; anything remote must be TLS.
     let loopback_http_allowed = host.eq_ignore_ascii_case("localhost")
         || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
     if parsed.scheme() != "https" && !(parsed.scheme() == "http" && loopback_http_allowed) {
@@ -3023,6 +3159,9 @@ fn push_unique_string(values: &mut Vec<String>, seen: &mut HashSet<String>, valu
     }
 }
 
+/// Parses a comma-separated vault ref allowlist, lowercasing each
+/// `<scope>/<key>` entry for case-insensitive matching and dropping
+/// duplicates while preserving order.
 fn parse_vault_ref_allowlist(raw: &str, source_name: &str) -> Result<Vec<String>> {
     let mut refs = Vec::new();
     let mut seen_refs = HashSet::new();
@@ -3039,6 +3178,9 @@ fn parse_vault_ref_allowlist(raw: &str, source_name: &str) -> Result<Vec<String>
     Ok(refs)
 }
 
+/// Like [`parse_vault_ref_allowlist`] but preserves the original casing:
+/// principal-scoped refs (e.g. `principal:UserA/...`) are case-sensitive
+/// and must match the stored scope exactly.
 fn parse_exact_vault_ref_allowlist(raw: &str, source_name: &str) -> Result<Vec<String>> {
     let mut refs = Vec::new();
     let mut seen_refs = HashSet::new();
@@ -3059,6 +3201,8 @@ fn parse_tool_allowlist(raw: &str, source_name: &str) -> Result<Vec<String>> {
     parse_identifier_allowlist(raw, source_name, "tool name")
 }
 
+/// Parses the process-runner executable allowlist: lowercase identifier
+/// names, plus the literal `*` wildcard that grants full host access.
 fn parse_process_executable_allowlist(raw: &str, source_name: &str) -> Result<Vec<String>> {
     let mut allowlist = Vec::new();
     let mut seen_values = HashSet::new();
@@ -3247,6 +3391,8 @@ fn parse_optional_text_field(
     Ok(Some(trimmed.to_owned()))
 }
 
+/// Validates the browserd endpoint: an http/https origin only - no path,
+/// credentials, query, or fragment - returned without a trailing slash.
 fn parse_browser_service_endpoint(raw: &str, source_name: &str) -> Result<String> {
     if raw.trim().is_empty() {
         anyhow::bail!("{source_name} cannot be empty");
@@ -3271,6 +3417,9 @@ fn parse_browser_service_endpoint(raw: &str, source_name: &str) -> Result<String
     Ok(parsed.as_str().trim_end_matches('/').to_owned())
 }
 
+/// Validates the canvas host public base URL: http/https without
+/// credentials, query, or fragment. Unlike the browserd endpoint a path
+/// prefix is allowed (the canvas may be served under a reverse proxy).
 fn parse_canvas_host_public_base_url(raw: &str, source_name: &str) -> Result<String> {
     if raw.trim().is_empty() {
         anyhow::bail!("{source_name} cannot be empty");
@@ -3349,6 +3498,9 @@ fn parse_mention_patterns(raw: &[String], source_name: &str) -> Result<Vec<Strin
     Ok(patterns)
 }
 
+/// Parses one `channel_router.routing.channels[N]` rule; unset fields fall
+/// back to the router-level `default_*` values already parsed into
+/// `defaults`.
 fn parse_channel_routing_rule(
     raw: palyra_common::daemon_config_schema::FileChannelRoutingRule,
     source_name: &str,
@@ -3450,6 +3602,9 @@ fn normalize_host_candidate(raw: &str) -> Result<String> {
     Ok(trimmed)
 }
 
+/// Normalizes a DNS suffix to host syntax with exactly one leading dot, so
+/// suffix matching cannot accidentally match a partial label (e.g.
+/// `.corp.local` never matches `evilcorp.local`).
 fn normalize_dns_suffix_candidate(raw: &str) -> Result<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -3490,6 +3645,8 @@ fn parse_positive_usize(value: u64, name: &str) -> Result<usize> {
     usize::try_from(value).with_context(|| format!("{name} exceeds platform usize range"))
 }
 
+/// Parses the default memory TTL: negative values are rejected and `0` is
+/// the documented "no default expiry" sentinel, mapped to `None`.
 fn parse_default_memory_ttl_ms(value: i64, name: &str) -> Result<Option<i64>> {
     if value < 0 {
         anyhow::bail!("{name} must be >= 0");
@@ -3500,6 +3657,9 @@ fn parse_default_memory_ttl_ms(value: i64, name: &str) -> Result<Option<i64>> {
     Ok(Some(value))
 }
 
+/// Normalizes the vacuum cron expression to single-space separators and
+/// checks the field count; full cron syntax validation happens when the
+/// scheduler consumes the string.
 fn parse_memory_retention_vacuum_schedule(raw: &str, name: &str) -> Result<String> {
     let normalized = raw.split_whitespace().collect::<Vec<_>>();
     if normalized.is_empty() {
@@ -3535,6 +3695,9 @@ fn parse_basis_points(value: u16, name: &str) -> Result<u16> {
     Ok(value)
 }
 
+/// Applies per-field basis-point overrides from a file scoring profile onto
+/// the runtime profile; cross-field weight-sum validation runs afterwards in
+/// [`apply_memory_retrieval_config`].
 fn apply_retrieval_profile_override(
     profile: &mut RetrievalSourceScoringProfile,
     file_profile: FileRetrievalSourceScoringProfile,
@@ -3568,6 +3731,9 @@ fn apply_retrieval_profile_override(
     Ok(())
 }
 
+/// Applies the `memory.retrieval` file section onto the runtime retrieval
+/// config, then re-validates the whole config so partial overrides cannot
+/// leave the scoring weights in an inconsistent state.
 fn apply_memory_retrieval_config(
     config: &mut RetrievalRuntimeConfig,
     file_retrieval: FileMemoryRetrievalConfig,

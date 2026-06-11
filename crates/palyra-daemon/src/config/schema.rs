@@ -1,3 +1,17 @@
+//! Validated runtime configuration types for the daemon plus their secure
+//! defaults (loopback binds, deny-by-default allowlists, disabled preview
+//! features).
+//!
+//! These types are produced exclusively by [`super::load::load_config`],
+//! which parses the raw `File*` serde shapes from
+//! `palyra_common::daemon_config_schema` and applies `PALYRA_*` environment
+//! overrides on top. Code elsewhere in the daemon consumes only these
+//! validated types, never the file-level ones.
+//!
+//! The `DEFAULT_*` constants below are contract surface: integration tests
+//! and config import/export fixtures pin them, so changing a value here is a
+//! behavioral (and security-posture) change, not a refactor.
+
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -122,10 +136,20 @@ const DEFAULT_DEPLOYMENT_MODE: DeploymentMode = DeploymentMode::LocalDesktop;
 const DEFAULT_GATEWAY_BIND_PROFILE: GatewayBindProfile = GatewayBindProfile::LoopbackOnly;
 const DEFAULT_DANGEROUS_REMOTE_BIND_ACK: bool = false;
 
+/// Fully merged and validated daemon configuration, the single source of
+/// truth handed to the runtime at startup.
+///
+/// Built only by [`super::load::load_config`]; all section values have
+/// already passed parsing and cross-field validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedConfig {
+    /// Human-readable provenance: the config file path (or `"defaults"`)
+    /// followed by one ` +env(NAME)` marker per applied override.
     pub source: String,
+    /// Schema version of the loaded document after migration.
     pub config_version: u32,
+    /// Original schema version when a legacy document was migrated; `None`
+    /// when no migration ran.
     pub migrated_from_version: Option<u32>,
     pub deployment: DeploymentConfig,
     pub daemon: DaemonConfig,
@@ -152,13 +176,20 @@ pub struct LoadedConfig {
     pub storage: StorageConfig,
 }
 
+/// Deployment posture: which profile/mode the daemon runs under and whether
+/// the operator acknowledged a dangerous remote bind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeploymentConfig {
+    /// Deployment profile id; derived from mode and worker settings unless
+    /// set explicitly in the file or via `PALYRA_DEPLOYMENT_PROFILE`.
     pub profile: String,
     pub mode: DeploymentMode,
+    /// Explicit operator acknowledgement required before non-loopback binds
+    /// are permitted in remote deployments. Defaults to `false`.
     pub dangerous_remote_bind_ack: bool,
 }
 
+/// Where the daemon is deployed; gates bind-address and TLS policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeploymentMode {
     LocalDesktop,
@@ -166,6 +197,7 @@ pub enum DeploymentMode {
 }
 
 impl DeploymentMode {
+    /// Returns the canonical snake_case config value for this mode.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -174,6 +206,11 @@ impl DeploymentMode {
         }
     }
 
+    /// Parses a config/env value, accepting hyphenated and short aliases.
+    ///
+    /// # Errors
+    /// Fails when `raw` is not a recognized mode; the message names
+    /// `source_name` so the operator can find the offending key.
     pub fn parse(raw: &str, source_name: &str) -> Result<Self> {
         let normalized = raw.trim().to_ascii_lowercase();
         match normalized.as_str() {
@@ -184,6 +221,8 @@ impl DeploymentMode {
     }
 }
 
+/// How the gateway may expose its listeners: loopback-only (default) or
+/// public with TLS required.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GatewayBindProfile {
     LoopbackOnly,
@@ -191,6 +230,7 @@ pub enum GatewayBindProfile {
 }
 
 impl GatewayBindProfile {
+    /// Returns the canonical snake_case config value for this profile.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -199,6 +239,11 @@ impl GatewayBindProfile {
         }
     }
 
+    /// Parses a config/env value, accepting hyphenated and short aliases.
+    ///
+    /// # Errors
+    /// Fails when `raw` is not a recognized profile; the message names
+    /// `source_name` so the operator can find the offending key.
     pub fn parse(raw: &str, source_name: &str) -> Result<Self> {
         let normalized = raw.trim().to_ascii_lowercase();
         match normalized.as_str() {
@@ -209,12 +254,15 @@ impl GatewayBindProfile {
     }
 }
 
+/// HTTP listener address for the daemon's console/admin API.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonConfig {
     pub bind_addr: String,
     pub port: u16,
 }
 
+/// Gateway transport (gRPC/QUIC) binds, exposure profile, and response
+/// budgets. Defaults to loopback-only listeners with QUIC enabled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayConfig {
     pub grpc_bind_addr: String,
@@ -223,27 +271,41 @@ pub struct GatewayConfig {
     pub quic_port: u16,
     pub quic_enabled: bool,
     pub bind_profile: GatewayBindProfile,
+    /// Escape hatch allowing remote exposure without TLS; defaults to
+    /// `false` and must be opted into explicitly.
     pub allow_insecure_remote: bool,
+    /// Identity/pairing store location; also used to derive the runtime
+    /// state root when `PALYRA_STATE_ROOT` is unset.
     pub identity_store_dir: Option<PathBuf>,
+    /// Vault refs (`<scope>/<key>`, lowercase) whose reads require explicit
+    /// operator approval through the gateway.
     pub vault_get_approval_required_refs: Vec<String>,
     pub max_tape_entries_per_response: usize,
     pub max_tape_bytes_per_response: usize,
     pub tls: GatewayTlsConfig,
 }
 
+/// Gateway TLS material; when `enabled`, the loader requires both
+/// `cert_path` and `key_path` to be set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayTlsConfig {
     pub enabled: bool,
     pub cert_path: Option<PathBuf>,
     pub key_path: Option<PathBuf>,
+    /// Optional client CA bundle enabling mutual TLS verification.
     pub client_ca_path: Option<PathBuf>,
 }
 
+/// Cron scheduler settings; defaults to UTC for deterministic cross-host
+/// behavior.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CronConfig {
     pub timezone: CronTimezoneMode,
 }
 
+/// Per-feature rollout switches (all disabled by default). Runtime preview
+/// sections may only be set to `enabled` mode when the matching rollout
+/// flag here is on; the loader enforces that pairing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FeatureRolloutsConfig {
     pub dynamic_tool_builder: FeatureRolloutSetting,
@@ -263,11 +325,13 @@ pub struct FeatureRolloutsConfig {
     pub networked_workers: FeatureRolloutSetting,
 }
 
+/// Orchestrator feature toggles; the v1 run loop defaults to disabled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratorConfig {
     pub runloop_v1_enabled: bool,
 }
 
+/// Session queue policy preview: queueing depth and message merge window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionQueuePolicyConfig {
     pub mode: RuntimePreviewMode,
@@ -285,6 +349,8 @@ impl Default for SessionQueuePolicyConfig {
     }
 }
 
+/// Context pruning policy preview: manual-apply gate and minimum token
+/// savings before a prune is proposed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PruningPolicyMatrixConfig {
     pub mode: RuntimePreviewMode,
@@ -302,6 +368,7 @@ impl Default for PruningPolicyMatrixConfig {
     }
 }
 
+/// Dual-path retrieval preview: per-branch timeout and prompt token budget.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetrievalDualPathConfig {
     pub mode: RuntimePreviewMode,
@@ -319,6 +386,8 @@ impl Default for RetrievalDualPathConfig {
     }
 }
 
+/// Auxiliary executor preview: per-session task cap and default token
+/// budget for spawned auxiliary tasks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuxiliaryExecutorConfig {
     pub mode: RuntimePreviewMode,
@@ -336,6 +405,7 @@ impl Default for AuxiliaryExecutorConfig {
     }
 }
 
+/// Flow orchestration preview: cancellation gating and step retry budget.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlowOrchestrationConfig {
     pub mode: RuntimePreviewMode,
@@ -353,6 +423,7 @@ impl Default for FlowOrchestrationConfig {
     }
 }
 
+/// Delivery arbitration preview: descendant preference and suppression cap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeliveryArbitrationConfig {
     pub mode: RuntimePreviewMode,
@@ -370,6 +441,8 @@ impl Default for DeliveryArbitrationConfig {
     }
 }
 
+/// Replay capture preview: whether runtime decisions are recorded and the
+/// per-run event cap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplayCaptureConfig {
     pub mode: RuntimePreviewMode,
@@ -387,6 +460,8 @@ impl Default for ReplayCaptureConfig {
     }
 }
 
+/// Networked worker fleet preview: lease TTL, attestation requirement, and
+/// expected artifact digests (lowercase 64-char hex SHA-256 when set).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkedWorkersConfig {
     pub mode: RuntimePreviewMode,
@@ -410,22 +485,28 @@ impl Default for NetworkedWorkersConfig {
     }
 }
 
+/// Memory subsystem limits, auto-injection, retention, and retrieval tuning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryConfig {
     pub max_item_bytes: usize,
     pub max_item_tokens: usize,
+    /// Default lifetime for new memory items; `None` means items never
+    /// expire by default (configured as `0`).
     pub default_ttl_ms: Option<i64>,
     pub auto_inject: MemoryAutoInjectConfig,
     pub retention: MemoryRetentionConfig,
     pub retrieval: RetrievalRuntimeConfig,
 }
 
+/// Automatic memory injection into prompts: on/off and per-prompt item cap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryAutoInjectConfig {
     pub enabled: bool,
     pub max_items: usize,
 }
 
+/// Memory retention bounds; `None` fields mean the bound is not enforced.
+/// `vacuum_schedule` is a normalized 5- or 6-field cron expression.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryRetentionConfig {
     pub max_entries: Option<usize>,
@@ -434,6 +515,8 @@ pub struct MemoryRetentionConfig {
     pub vacuum_schedule: String,
 }
 
+/// Tool execution broker policy: the tool allowlist (empty = deny all),
+/// per-run call/time budgets, and per-backend sub-configs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCallConfig {
     pub allowed_tools: Vec<String>,
@@ -445,21 +528,28 @@ pub struct ToolCallConfig {
     pub browser_service: BrowserServiceConfig,
 }
 
+/// Sandboxed process runner policy (disabled by default): tier, executable
+/// allowlist, egress enforcement, and resource limits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessRunnerConfig {
     pub enabled: bool,
     pub tier: SandboxProcessRunnerTier,
     pub workspace_root: PathBuf,
+    /// Executable names permitted to run; a literal `"*"` entry grants host
+    /// access to any executable.
     pub allowed_executables: Vec<String>,
     pub allow_interpreters: bool,
     pub egress_enforcement_mode: EgressEnforcementMode,
     pub allowed_egress_hosts: Vec<String>,
+    /// Allowed DNS suffixes, normalized with a leading dot.
     pub allowed_dns_suffixes: Vec<String>,
     pub cpu_time_limit_ms: u64,
     pub memory_limit_bytes: u64,
     pub max_output_bytes: u64,
 }
 
+/// Wasm plugin runtime policy (disabled by default): module size/fuel/memory
+/// limits and capability allowlists (empty = deny).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WasmRuntimeConfig {
     pub enabled: bool,
@@ -470,11 +560,15 @@ pub struct WasmRuntimeConfig {
     pub max_table_elements: u64,
     pub max_instances: u64,
     pub allowed_http_hosts: Vec<String>,
+    /// Secret handles (not secret values) plugins may request.
     pub allowed_secrets: Vec<String>,
     pub allowed_storage_prefixes: Vec<String>,
     pub allowed_channels: Vec<String>,
 }
 
+/// HTTP fetch tool policy: private-target blocking (on by default),
+/// timeouts, response/redirect budgets, content-type and header allowlists,
+/// and the vault refs eligible for credential injection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpFetchConfig {
     pub allow_private_targets: bool,
@@ -485,12 +579,19 @@ pub struct HttpFetchConfig {
     pub max_redirects: u32,
     pub allowed_content_types: Vec<String>,
     pub allowed_request_headers: Vec<String>,
+    /// Exact vault refs (scope case preserved) that fetch requests may bind
+    /// as credentials; empty means credential injection is disabled.
     pub allowed_credential_vault_refs: Vec<String>,
     pub cache_enabled: bool,
     pub cache_ttl_ms: u64,
     pub max_cache_entries: u64,
 }
 
+/// Browser daemon (browserd) broker settings (disabled by default).
+///
+/// Secrets follow the loader's mutual-exclusion rule: at most one of the
+/// inline value, structured `*_secret_ref`, or legacy `*_vault_ref` may be
+/// set per credential.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrowserServiceConfig {
     pub enabled: bool,
@@ -499,6 +600,8 @@ pub struct BrowserServiceConfig {
     pub auth_token_secret_ref: Option<SecretRef>,
     pub state_dir: Option<PathBuf>,
     pub state_key_secret_ref: Option<SecretRef>,
+    /// Legacy `<scope>/<key>` vault ref for the state encryption key; kept
+    /// as-is (not converted to a [`SecretRef`]) for config round-tripping.
     pub state_key_vault_ref: Option<String>,
     pub connect_timeout_ms: u64,
     pub request_timeout_ms: u64,
@@ -506,6 +609,8 @@ pub struct BrowserServiceConfig {
     pub max_title_bytes: u64,
 }
 
+/// Canvas hosting (disabled by default): public base URL, token TTL, and
+/// per-bundle/update rate budgets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanvasHostConfig {
     pub enabled: bool,
@@ -517,6 +622,11 @@ pub struct CanvasHostConfig {
     pub max_updates_per_minute: u32,
 }
 
+/// Admin/connector authentication. Auth is required by default; tokens left
+/// as `None` mean access is denied rather than open.
+///
+/// Each token follows the loader's mutual-exclusion rule: inline value and
+/// `*_secret_ref` cannot both be set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdminConfig {
     pub require_auth: bool,
@@ -524,14 +634,20 @@ pub struct AdminConfig {
     pub auth_token_secret_ref: Option<SecretRef>,
     pub connector_token: Option<String>,
     pub connector_token_secret_ref: Option<SecretRef>,
+    /// When set, the admin token is only honored for this principal.
     pub bound_principal: Option<String>,
 }
 
+/// Identity-plane toggles; insecure node RPC without mTLS defaults to off.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdentityConfig {
     pub allow_insecure_node_rpc_without_mtls: bool,
 }
 
+/// Journal and vault storage locations and journal limits.
+///
+/// `journal_db_path` and `vault_dir` are resolved against the runtime state
+/// root by the loader when configured as relative paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageConfig {
     pub journal_db_path: PathBuf,
@@ -577,7 +693,13 @@ impl Default for StorageConfig {
     }
 }
 
+/// Returns the default vault directory: a `vault` sibling of the identity
+/// store (i.e. `<state-root>/vault`), so vault and identity material live
+/// under the same state root by default.
 pub(super) fn default_vault_dir() -> PathBuf {
+    // Fall back to a relative .palyra/identity root when the platform state
+    // root cannot be resolved; the loader later re-anchors relative paths
+    // against the runtime state root.
     let identity_root =
         default_identity_store_root().unwrap_or_else(|_| PathBuf::from(".palyra/identity"));
     if let Some(parent) = identity_root.parent() {
