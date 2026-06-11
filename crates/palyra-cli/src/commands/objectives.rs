@@ -442,7 +442,7 @@ fn objective_id_text(objective: &Value) -> String {
 }
 
 fn quote_text_field(value: &str) -> String {
-    value.replace('\r', " ").replace('\n', " ").replace('"', "\\\"")
+    value.replace(['\r', '\n'], " ").replace('"', "\\\"")
 }
 
 fn objective_envelope_output_value(payload: &Value) -> Value {
