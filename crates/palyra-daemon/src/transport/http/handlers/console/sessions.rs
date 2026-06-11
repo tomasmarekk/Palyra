@@ -1,3 +1,14 @@
+//! Console session catalog handlers for the `/console/v1/sessions` route
+//! family.
+//!
+//! Builds the session catalog served to the web console: every request loads
+//! the caller's full scoped session set, enriches it with pending approvals,
+//! workspace activity, project context, agent bindings, and family metadata,
+//! then filters, sorts, and pages the result in memory. The list `cursor` is
+//! an offset into the filtered ordering, not a stable key. All operator
+//! visible text passes through redaction before truncation. Response shapes
+//! are part of the `/console/v1` wire contract consumed by `apps/web`.
+
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
@@ -23,6 +34,8 @@ const SESSION_CATALOG_PREVIEW_LEN: usize = 180;
 const SESSION_CATALOG_RELATIVES_LIMIT: usize = 4;
 const SESSION_CATALOG_RECAP_ITEMS_LIMIT: usize = 4;
 
+/// Query parameters accepted by the session catalog list endpoint; every
+/// field is optional and missing filters leave the catalog unrestricted.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleSessionCatalogQuery {
     #[serde(default)]
@@ -62,6 +75,8 @@ struct SessionCatalogSummary {
     sessions_with_context_files: usize,
 }
 
+/// Wire envelope for `GET /console/v1/sessions`: the filtered page plus
+/// catalog-wide summary counts and an echo of the applied query.
 #[derive(Debug, Serialize)]
 pub(crate) struct SessionCatalogListEnvelope {
     contract: control_plane::ContractDescriptor,
@@ -71,12 +86,15 @@ pub(crate) struct SessionCatalogListEnvelope {
     page: control_plane::PageInfo,
 }
 
+/// Wire envelope for a single fully enriched session catalog record.
 #[derive(Debug, Serialize)]
 pub(crate) struct SessionCatalogDetailEnvelope {
     contract: control_plane::ContractDescriptor,
     session: SessionCatalogRecord,
 }
 
+/// Wire envelope for session mutations (archive, quick-controls updates);
+/// `action` names which mutation produced the returned record.
 #[derive(Debug, Serialize)]
 pub(crate) struct SessionCatalogMutationEnvelope {
     contract: control_plane::ContractDescriptor,
@@ -84,6 +102,8 @@ pub(crate) struct SessionCatalogMutationEnvelope {
     action: &'static str,
 }
 
+/// Wire envelope for project-context endpoints: the refreshed session record
+/// plus the context preview produced by the requested `action`.
 #[derive(Debug, Serialize)]
 pub(crate) struct SessionProjectContextEnvelope {
     contract: control_plane::ContractDescriptor,
@@ -94,6 +114,11 @@ pub(crate) struct SessionProjectContextEnvelope {
     scaffold: Option<crate::application::project_context::ProjectContextScaffoldOutcome>,
 }
 
+/// Body for quick-controls updates.
+///
+/// The nested `Option<Option<_>>` fields distinguish "field omitted" (outer
+/// `None`, leave the override untouched) from an explicit JSON `null` (inner
+/// `None`, clear the override back to the inherited value).
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleSessionQuickControlsUpdateRequest {
     #[serde(default)]
@@ -110,6 +135,8 @@ pub(crate) struct ConsoleSessionQuickControlsUpdateRequest {
     reset_to_default: Option<bool>,
 }
 
+/// Wire envelope for run aborts: whether cancellation was requested and the
+/// reason that was recorded for it.
 #[derive(Debug, Serialize)]
 pub(crate) struct SessionCatalogRunAbortEnvelope {
     contract: control_plane::ContractDescriptor,
@@ -336,6 +363,13 @@ struct SessionCatalogContext {
     effective_model_profile: Option<String>,
 }
 
+/// Handles `GET /console/v1/sessions`: builds, filters, sorts, and pages the
+/// enriched session catalog for the authenticated console context.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, when the
+/// cursor is not an unsigned integer, or when any of the catalog data sources
+/// (sessions, approvals, workspace, project context, agents) fail to load.
 pub(crate) async fn console_sessions_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -366,11 +400,18 @@ pub(crate) async fn console_sessions_list_handler(
     let catalog_context =
         load_session_catalog_context(&state, &session.context, &base_sessions).await?;
 
+    // AIDEV-NOTE: every scoped session is fully enriched (including a per
+    // session run-status lookup in build_session_catalog_record) before any
+    // filter or page limit applies, so large catalogs pay the full cost per
+    // list request. Reducing this requires paging before enrichment, which
+    // changes summary semantics (behavior change).
     let mut catalog = Vec::with_capacity(base_sessions.len());
     for base in base_sessions {
         catalog.push(build_session_catalog_record(&state, &catalog_context, base, None).await?);
     }
 
+    // Summary counts are computed before the query filters below apply so the
+    // console can show catalog-wide totals alongside a filtered page.
     let summary = SessionCatalogSummary {
         active_sessions: catalog.iter().filter(|record| !record.archived).count(),
         archived_sessions: catalog.iter().filter(|record| record.archived).count(),
@@ -437,6 +478,8 @@ pub(crate) async fn console_sessions_list_handler(
 
     catalog.sort_by(|left, right| compare_session_catalog_records(left, right, sort.as_str()));
 
+    // The cursor is a plain offset into the filtered, sorted ordering; it is
+    // cheap but not stable across concurrent catalog changes.
     let next_cursor =
         (cursor.saturating_add(limit) < catalog.len()).then(|| (cursor + limit).to_string());
     let sessions = catalog.into_iter().skip(cursor).take(limit).collect::<Vec<_>>();
@@ -465,6 +508,13 @@ pub(crate) async fn console_sessions_list_handler(
     }))
 }
 
+/// Handles `GET /console/v1/sessions/{session_id}`: returns one enriched
+/// catalog record including artifact details.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, when the
+/// session id is not a canonical ULID, or when the session is missing from
+/// the caller's scope.
 pub(crate) async fn console_session_detail_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -480,6 +530,13 @@ pub(crate) async fn console_session_detail_handler(
     Ok(Json(SessionCatalogDetailEnvelope { contract: contract_descriptor(), session: record }))
 }
 
+/// Handles `GET /console/v1/sessions/{session_id}/project-context`: returns
+/// the current project-context preview without mutating anything.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, when the
+/// session id is invalid or out of scope, or when the preview cannot be
+/// computed.
 pub(crate) async fn console_session_project_context_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -514,6 +571,13 @@ pub(crate) async fn console_session_project_context_handler(
     Ok(Json(envelope))
 }
 
+/// Handles `POST /console/v1/sessions/{session_id}/project-context/refresh`:
+/// re-discovers project context files for the session.
+///
+/// # Errors
+/// Returns an error response when console authorization or CSRF validation
+/// fails, when the session id is invalid or out of scope, or when the refresh
+/// fails.
 pub(crate) async fn console_session_project_context_refresh_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -546,6 +610,13 @@ pub(crate) async fn console_session_project_context_refresh_handler(
     Ok(Json(envelope))
 }
 
+/// Handles `POST .../project-context/entries/{entry_id}/disable`: excludes
+/// one context entry from prompt assembly for this session.
+///
+/// # Errors
+/// Returns an error response when console authorization or CSRF validation
+/// fails, when the session id is invalid or out of scope, or when the entry
+/// cannot be disabled.
 pub(crate) async fn console_session_project_context_disable_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -579,6 +650,13 @@ pub(crate) async fn console_session_project_context_disable_handler(
     Ok(Json(envelope))
 }
 
+/// Handles `POST .../project-context/entries/{entry_id}/enable`: re-includes
+/// a previously disabled context entry.
+///
+/// # Errors
+/// Returns an error response when console authorization or CSRF validation
+/// fails, when the session id is invalid or out of scope, or when the entry
+/// cannot be enabled.
 pub(crate) async fn console_session_project_context_enable_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -612,6 +690,13 @@ pub(crate) async fn console_session_project_context_enable_handler(
     Ok(Json(envelope))
 }
 
+/// Handles `POST .../project-context/entries/{entry_id}/approve`: grants the
+/// approval a gated context entry needs before it becomes active.
+///
+/// # Errors
+/// Returns an error response when console authorization or CSRF validation
+/// fails, when the session id is invalid or out of scope, or when the entry
+/// cannot be approved.
 pub(crate) async fn console_session_project_context_approve_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -645,6 +730,13 @@ pub(crate) async fn console_session_project_context_approve_handler(
     Ok(Json(envelope))
 }
 
+/// Handles `POST .../project-context/scaffold`: creates a starter context
+/// file for the session workspace and refreshes the preview to include it.
+///
+/// # Errors
+/// Returns an error response when console authorization or CSRF validation
+/// fails, when the session id is invalid or out of scope, or when scaffolding
+/// or the follow-up refresh fails.
 pub(crate) async fn console_session_project_context_scaffold_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -687,6 +779,12 @@ pub(crate) async fn console_session_project_context_scaffold_handler(
     Ok(Json(envelope))
 }
 
+/// Handles `POST /console/v1/sessions/{session_id}/archive`: archives the
+/// session via the orchestrator cleanup path and returns the updated record.
+///
+/// # Errors
+/// Returns an error response when console authorization or CSRF validation
+/// fails, when the session id is not a canonical ULID, or when cleanup fails.
 pub(crate) async fn console_session_archive_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -721,6 +819,14 @@ pub(crate) async fn console_session_archive_handler(
     }))
 }
 
+/// Handles `POST /console/v1/sessions/{session_id}/quick-controls`: applies
+/// agent binding and model/thinking/trace/verbose overrides, or clears them
+/// all when `reset_to_default` is set.
+///
+/// # Errors
+/// Returns an error response when console authorization or CSRF validation
+/// fails, when the session id is invalid or out of scope, when the payload
+/// contains no change, or when persisting the overrides fails.
 pub(crate) async fn console_session_quick_controls_update_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -799,6 +905,9 @@ pub(crate) async fn console_session_quick_controls_update_handler(
                 principal: session.context.principal.clone(),
                 device_id: session.context.device_id.clone(),
                 channel: session.context.channel.clone(),
+                // reset_to_default clears every override with an explicit
+                // Some(None); otherwise only fields present in the payload
+                // change and omitted fields stay None (untouched).
                 model_profile_override: if reset_to_default {
                     Some(None)
                 } else {
@@ -812,6 +921,9 @@ pub(crate) async fn console_session_quick_controls_update_handler(
         .await
         .map_err(runtime_status_response)?;
 
+    // Reload the scoped set so family metadata and the returned record
+    // reflect the mutation; fall back to the direct update result if the
+    // record is missing from the listing.
     let base_sessions = load_scoped_sessions(
         &state,
         session.context.principal.as_str(),
@@ -868,6 +980,14 @@ pub(crate) async fn console_session_quick_controls_update_handler(
     }))
 }
 
+/// Handles `POST /console/v1/sessions/runs/{run_id}/abort`: requests
+/// orchestrator cancellation for a run owned by the caller's context and
+/// cleans up its resources.
+///
+/// # Errors
+/// Returns an error response when console authorization or CSRF validation
+/// fails, when the run id is invalid or unknown, or when the run belongs to a
+/// different console context.
 pub(crate) async fn console_session_run_abort_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -919,6 +1039,8 @@ pub(crate) async fn console_session_run_abort_handler(
     }))
 }
 
+/// Loads every session in the caller's scope by paging the journal to
+/// exhaustion; filtering and sorting happen in memory afterwards.
 async fn load_scoped_sessions(
     state: &AppState,
     principal: &str,
@@ -952,6 +1074,8 @@ async fn load_scoped_sessions(
     Ok(sessions)
 }
 
+/// Loads all approval records for the principal by paging to exhaustion;
+/// pending-only filtering happens at the call site.
 async fn load_scoped_pending_approvals(
     state: &AppState,
     principal: &str,
@@ -983,6 +1107,12 @@ async fn load_scoped_pending_approvals(
     Ok(approvals)
 }
 
+/// Loads one session and enforces that it belongs to the authenticated
+/// console context (principal, device, and channel must all match).
+///
+/// # Errors
+/// Returns not-found when the session does not exist and permission-denied
+/// when it exists but is owned by a different context.
 async fn load_scoped_session(
     state: &AppState,
     context: &gateway::RequestContext,
@@ -1007,6 +1137,9 @@ async fn load_scoped_session(
     Ok(session)
 }
 
+/// Builds the fully enriched detail record for one session. Loads the whole
+/// scoped set first because family metadata needs sibling sessions; not-found
+/// covers both missing and out-of-scope sessions.
 async fn load_session_catalog_record(
     state: &AppState,
     context: &gateway::RequestContext,
@@ -1049,6 +1182,9 @@ async fn build_session_project_context_envelope(
     })
 }
 
+/// Gathers the cross-session lookup tables (approvals, workspace files,
+/// project context, agent bindings, families) used to enrich every catalog
+/// record without per-record refetching.
 async fn load_session_catalog_context(
     state: &AppState,
     context: &gateway::RequestContext,
@@ -1090,6 +1226,8 @@ async fn load_session_catalog_context(
     })
 }
 
+/// Picks the model profile the runtime would actually use, preferring the
+/// registry default over provider-specific model ids.
 fn effective_model_profile_from_provider_snapshot(
     snapshot: &crate::model_provider::ProviderStatusSnapshot,
 ) -> Option<String> {
@@ -1189,6 +1327,8 @@ async fn load_session_agent_metadata(
     ))
 }
 
+/// Groups sessions into branch families keyed by root title and derives each
+/// session's sequence number, parent title, and capped relatives list.
 fn build_session_family_metadata(
     sessions: &[journal::OrchestratorSessionRecord],
 ) -> HashMap<String, SessionCatalogFamilyRecord> {
@@ -1244,7 +1384,9 @@ fn build_session_family_metadata(
                     session_id: entry.session_id.clone(),
                     title: entry.title.clone(),
                     branch_state: entry.branch_state.clone(),
-                    relation: if Some(entry.session_id.clone()) == session.parent_session_id {
+                    relation: if session.parent_session_id.as_deref()
+                        == Some(entry.session_id.as_str())
+                    {
                         "parent".to_owned()
                     } else if entry.parent_session_id.as_deref()
                         == Some(session.session_id.as_str())
@@ -1271,6 +1413,13 @@ fn build_session_family_metadata(
         .collect()
 }
 
+/// Walks `parent_session_id` links to the family root title, memoizing each
+/// resolved session. A session whose parent id points at itself terminates at
+/// its own title so a direct self-link cannot recurse.
+// AIDEV-NOTE: only direct self-parent links are guarded; a longer parent
+// cycle in journal data (A -> B -> A) would recurse until stack overflow
+// because memo entries are inserted only after the recursive call returns.
+// Fixing this requires cycle detection along the walk (behavior change).
 fn resolve_session_family_root<'a>(
     session_id: &str,
     sessions_by_id: &HashMap<&'a str, &'a journal::OrchestratorSessionRecord>,
@@ -1294,6 +1443,9 @@ fn resolve_session_family_root<'a>(
     Some(root)
 }
 
+/// Normalizes a title into a family-root key. Titles ending in an all-digit
+/// `#N` suffix collapse to the prefix so branch copies named `<root> #2`,
+/// `<root> #3`, ... group under the same root as the original.
 fn normalized_title_family_root(raw: &str) -> String {
     let normalized = normalize_catalog_text(raw, SESSION_CATALOG_TITLE_LEN)
         .unwrap_or_else(|| raw.trim().to_owned());
@@ -1307,6 +1459,9 @@ fn normalized_title_family_root(raw: &str) -> String {
     }
 }
 
+/// Loads the per-session artifact details (checkpoints and compaction
+/// artifacts) that are only fetched for detail and mutation responses, not
+/// for list pages.
 async fn load_session_detail_context(
     state: &AppState,
     _context: &gateway::RequestContext,
@@ -1344,6 +1499,9 @@ async fn load_session_detail_context(
     Ok(SessionDetailContext { recent_artifacts, artifact_count })
 }
 
+/// Assembles one wire-facing catalog record from the base session, the shared
+/// catalog context, and optional detail data; all free-text fields are
+/// redacted and truncated here before they reach the console.
 async fn build_session_catalog_record(
     state: &AppState,
     context: &SessionCatalogContext,
@@ -1407,8 +1565,12 @@ async fn build_session_catalog_record(
         .last_summary
         .as_deref()
         .and_then(|value| normalize_catalog_text(value, SESSION_CATALOG_PREVIEW_LEN));
-    let last_run_state =
-        run_snapshot.as_ref().map(|run| run.state.clone()).or(session.last_run_state.clone());
+    // Prefer the live run snapshot over the state persisted on the session
+    // record, which can lag behind an in-flight run.
+    let last_run_state = run_snapshot
+        .as_ref()
+        .map(|run| run.state.clone())
+        .or_else(|| session.last_run_state.clone());
     let recap = SessionCatalogRecapRecord {
         touched_files: workspace.touched_files.clone(),
         active_context_files: active_project_context_paths.clone(),
@@ -1514,6 +1676,9 @@ fn build_session_project_context_record(
     }
 }
 
+/// Derives the quick-controls block for one session, resolving each control
+/// from (in order) session override, runtime provider state, the bound agent,
+/// and the default agent; `source` on each control names which layer won.
 fn build_session_quick_controls(
     context: &SessionCatalogContext,
     session: &journal::OrchestratorSessionRecord,
@@ -1530,18 +1695,16 @@ fn build_session_quick_controls(
             display_value: agent.display_name.clone(),
             source: "session_binding".to_owned(),
             inherited_value: inherited.map(|entry| entry.agent_id.clone()),
-            override_active: inherited
-                .map(|entry| entry.agent_id != binding.agent_id)
-                .unwrap_or(true),
+            override_active: inherited.is_none_or(|entry| entry.agent_id != binding.agent_id),
         },
+        // A binding can outlive its agent record; fall back to the raw agent
+        // id as the display value instead of dropping the binding.
         (Some(binding), None, inherited) => SessionCatalogQuickControlRecord {
             value: Some(binding.agent_id.clone()),
             display_value: binding.agent_id.clone(),
             source: "session_binding".to_owned(),
             inherited_value: inherited.map(|entry| entry.agent_id.clone()),
-            override_active: inherited
-                .map(|entry| entry.agent_id != binding.agent_id)
-                .unwrap_or(true),
+            override_active: inherited.is_none_or(|entry| entry.agent_id != binding.agent_id),
         },
         (None, _, Some(agent)) => SessionCatalogQuickControlRecord {
             value: Some(agent.agent_id.clone()),
@@ -1561,6 +1724,8 @@ fn build_session_quick_controls(
 
     let inherited_model =
         bound_agent.or(inherited_agent).map(|agent| agent.default_model_profile.clone());
+    // The runtime profile only counts as a distinct layer when it differs
+    // from the agent default; otherwise the agent default reports as source.
     let runtime_model_profile = context
         .effective_model_profile
         .as_ref()
@@ -1571,10 +1736,7 @@ fn build_session_quick_controls(
                 Some(model_profile_override.clone()),
                 model_profile_override.clone(),
                 "session_override".to_owned(),
-                inherited_model
-                    .as_ref()
-                    .map(|entry| entry != model_profile_override)
-                    .unwrap_or(true),
+                inherited_model.as_ref().is_none_or(|entry| entry != model_profile_override),
             )
         } else if let Some(runtime_model_profile) = runtime_model_profile {
             (
@@ -1589,9 +1751,9 @@ fn build_session_quick_controls(
                     Some(agent.default_model_profile.clone()),
                     agent.default_model_profile.clone(),
                     "agent_default_model_profile".to_owned(),
-                    inherited
-                        .map(|entry| entry.default_model_profile != agent.default_model_profile)
-                        .unwrap_or(true),
+                    inherited.is_none_or(|entry| {
+                        entry.default_model_profile != agent.default_model_profile
+                    }),
                 ),
                 (None, Some(agent)) => (
                     Some(agent.default_model_profile.clone()),
@@ -1603,15 +1765,18 @@ fn build_session_quick_controls(
             }
         };
 
+    // Surface defaults inherited when no session override exists: thinking is
+    // on by default, trace and verbose are opt-in. An override equal to the
+    // inherited value is not reported as active.
     let thinking_inherited = true;
     let trace_inherited = false;
     let verbose_inherited = false;
     let thinking_override_active =
-        session.thinking_override.map(|value| value != thinking_inherited).unwrap_or(false);
+        session.thinking_override.is_some_and(|value| value != thinking_inherited);
     let trace_override_active =
-        session.trace_override.map(|value| value != trace_inherited).unwrap_or(false);
+        session.trace_override.is_some_and(|value| value != trace_inherited);
     let verbose_override_active =
-        session.verbose_override.map(|value| value != verbose_inherited).unwrap_or(false);
+        session.verbose_override.is_some_and(|value| value != verbose_inherited);
 
     SessionCatalogQuickControlsRecord {
         agent,
@@ -1685,6 +1850,10 @@ fn sorted_limited_paths(paths: HashSet<String>, limit: usize) -> Vec<String> {
     values
 }
 
+/// Redacts, whitespace-collapses, and truncates operator-visible catalog
+/// text, returning `None` when nothing displayable remains. Redaction runs
+/// before truncation so sensitive fragments embedded in runtime messages can
+/// never survive into the console via a truncation boundary.
 fn normalize_catalog_text(raw: &str, max_chars: usize) -> Option<String> {
     let normalized = palyra_common::redaction::redact_url_segments_in_text(
         palyra_common::redaction::redact_auth_error(raw).as_str(),
@@ -1702,6 +1871,12 @@ fn normalize_catalog_text(raw: &str, max_chars: usize) -> Option<String> {
     Some(truncated)
 }
 
+/// Parses the list cursor (an offset into the filtered ordering); a missing
+/// or blank cursor starts at the beginning.
+///
+/// # Errors
+/// Returns an invalid-argument response when the cursor is not an unsigned
+/// integer.
 #[allow(clippy::result_large_err)]
 fn parse_session_catalog_cursor(raw: Option<&str>) -> Result<usize, Response> {
     let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
@@ -1726,6 +1901,9 @@ fn normalize_catalog_token(raw: Option<&str>) -> Option<String> {
     raw.map(str::trim).filter(|value| !value.is_empty()).map(|value| value.to_ascii_lowercase())
 }
 
+/// Coerces the requested sort to a supported token; unknown values silently
+/// fall back to `updated_desc` rather than erroring, matching the console's
+/// permissive query handling.
 fn normalize_session_catalog_sort(raw: Option<&str>) -> String {
     match raw.map(str::trim).filter(|value| !value.is_empty()) {
         Some("updated_asc") => "updated_asc".to_owned(),
@@ -1750,6 +1928,8 @@ fn compare_session_catalog_records(
         "title_desc" => right.title.cmp(&left.title),
         _ => right.updated_at_unix_ms.cmp(&left.updated_at_unix_ms),
     };
+    // Ties break on session_id so offset paging over equal sort keys stays
+    // deterministic across requests.
     if ordering == Ordering::Equal {
         left.session_id.cmp(&right.session_id)
     } else {
@@ -1757,6 +1937,8 @@ fn compare_session_catalog_records(
     }
 }
 
+/// Case-insensitive substring search over every operator-visible text field
+/// of a record, including recap files, artifacts, and family relatives.
 fn session_catalog_record_matches(record: &SessionCatalogRecord, search: &str) -> bool {
     [
         Some(record.session_key.as_str()),

@@ -1,3 +1,15 @@
+//! Console objective handlers for the `/console/v1/objectives` route family.
+//!
+//! An objective bundles three persisted artifacts that this module keeps in
+//! sync: the objective record itself, a backing cron job plus routine
+//! metadata that drives automation, and managed-block projections into
+//! workspace documents. Lifecycle actions fail closed in opposite
+//! directions: `fire`/`resume` preflight the workspace projection and refuse
+//! to dispatch when it is malformed, while `pause`/`cancel`/`archive` always
+//! apply and downgrade a projection failure to a response warning. Response
+//! shapes are part of the `/console/v1` wire contract consumed by
+//! `apps/web`.
+
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -35,11 +47,18 @@ use crate::{
 const DEFAULT_OBJECTIVE_CHANNEL: &str = "system:objectives";
 const DEFAULT_OBJECTIVE_PAGE_LIMIT: usize = 100;
 const MAX_OBJECTIVE_PAGE_LIMIT: usize = 500;
+/// Default heartbeat cadence when the payload supplies no schedule.
+const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 60 * 60 * 1_000;
 const OBJECTIVE_FOCUS_BLOCK_ID: &str = "objective-focus";
 const OBJECTIVE_HEARTBEAT_BLOCK_ID: &str = "objective-heartbeats";
 const OBJECTIVE_INBOX_BLOCK_ID: &str = "objective-inbox";
+/// Warning attached to stop-action responses when the action applied but the
+/// workspace projection could not be rewritten. Tests pin its wording, so
+/// keep "action was applied" and "workspace projection did not update".
 const OBJECTIVE_WORKSPACE_PROJECTION_WARNING: &str = "Objective lifecycle action was applied, but workspace projection did not update. Repair malformed Palyra managed blocks or retry after workspace storage recovers.";
 
+/// Classifies each objective endpoint so CSRF enforcement stays declarative:
+/// mutating request kinds require a CSRF-validated console session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConsoleObjectiveRequestKind {
     List,
@@ -66,6 +85,8 @@ fn authorize_objective_console_session(
     authorize_console_session(state, headers, request_kind.requires_csrf())
 }
 
+/// Query parameters for the objective list endpoint; `kind` and `state`
+/// filter case-insensitively and `after_objective_id` enables keyset paging.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleObjectiveListQuery {
     #[serde(default)]
@@ -78,6 +99,8 @@ pub(crate) struct ConsoleObjectiveListQuery {
     state: Option<String>,
 }
 
+/// Budget fields accepted on upsert; omitted fields keep the stored budget
+/// values (see `normalize_budget`).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConsoleObjectiveBudgetPayload {
@@ -89,6 +112,10 @@ pub(crate) struct ConsoleObjectiveBudgetPayload {
     notes: Option<String>,
 }
 
+/// Body for objective create/update. `objective_id` selects update-in-place;
+/// most optional fields fall back to the existing record on update so a
+/// partial payload does not erase stored values. Schedule fields feed
+/// `resolve_objective_schedule` and are mutually layered, not combined.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConsoleObjectiveUpsertRequest {
@@ -159,6 +186,9 @@ pub(crate) struct ConsoleObjectiveUpsertRequest {
     template_id: Option<String>,
 }
 
+/// Body for lifecycle actions: `action` is one of
+/// fire|pause|resume|cancel|archive and `reason` is an optional operator note
+/// capped at 500 bytes.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConsoleObjectiveLifecycleRequest {
@@ -167,6 +197,8 @@ pub(crate) struct ConsoleObjectiveLifecycleRequest {
     reason: Option<String>,
 }
 
+/// Body for manually recording an attempt against an objective, optionally
+/// linking it to an existing run and session.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConsoleObjectiveAttemptRequest {
@@ -186,6 +218,8 @@ pub(crate) struct ConsoleObjectiveAttemptRequest {
     completed_at_unix_ms: Option<i64>,
 }
 
+/// Body for appending an approach-history entry (attempted, learned, failed
+/// approach, recommended next step, or standing order).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConsoleObjectiveApproachRequest {
@@ -195,6 +229,12 @@ pub(crate) struct ConsoleObjectiveApproachRequest {
     run_id: Option<String>,
 }
 
+/// Handles `GET /console/v1/objectives`: lists the caller's objectives with
+/// optional kind/state filters and keyset paging by objective id.
+///
+/// # Errors
+/// Returns an error response when console authorization fails or when the
+/// objective registry or any per-objective view source cannot be read.
 pub(crate) async fn console_objectives_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -223,6 +263,8 @@ pub(crate) async fn console_objectives_list_handler(
         state_filter.as_deref(),
     )
     .await?;
+    // Objective ids are ULIDs, so the lexicographic sort doubles as creation
+    // order and supports keyset paging via after_objective_id.
     objectives.sort_by(|left, right| {
         read_string_value(left, "objective_id").cmp(&read_string_value(right, "objective_id"))
     });
@@ -253,6 +295,12 @@ pub(crate) async fn console_objectives_list_handler(
     })))
 }
 
+/// Handles `GET /console/v1/objectives/{objective_id}`: returns one owned
+/// objective view.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, when the
+/// objective is missing, or when it is owned by a different principal.
 pub(crate) async fn console_objective_get_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -266,6 +314,15 @@ pub(crate) async fn console_objective_get_handler(
     Ok(Json(json!({ "objective": objective })))
 }
 
+/// Handles `POST /console/v1/objectives`: creates or updates an objective
+/// together with its backing cron job, routine metadata, and workspace
+/// projection.
+///
+/// # Errors
+/// Returns an error response when console authorization or CSRF validation
+/// fails, when the payload is invalid (kind, priority, schedule, delivery,
+/// quiet hours, approval mode), when the caller does not own an existing
+/// objective, or when any persistence step fails.
 pub(crate) async fn console_objective_upsert_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -295,7 +352,7 @@ pub(crate) async fn console_objective_upsert_handler(
         .map(|entry| entry.workspace.workspace_document_path.clone())
         .unwrap_or_else(|| {
             objective_workspace_document_path(objective_id.as_str())
-                .expect("objective workspace path should normalize")
+                .expect("objective ids are ULIDs, which always form a valid workspace path")
         });
     let schedule = resolve_objective_schedule(&payload, kind, state.cron_timezone_mode)?;
     let execution = parse_objective_execution_config(
@@ -310,6 +367,9 @@ pub(crate) async fn console_objective_upsert_handler(
                 .and_then(|entry| entry.automation.routine_id.clone())
                 .unwrap_or_else(|| objective_id.clone()),
         ),
+        // Updates keep the stored flag unless the payload overrides it. New
+        // heartbeats start enabled only when a schedule resolved; every
+        // other kind starts enabled.
         enabled: payload.enabled.unwrap_or_else(|| {
             existing
                 .as_ref()
@@ -341,11 +401,18 @@ pub(crate) async fn console_objective_upsert_handler(
             }
         }),
     };
+    // routine_id is always Some by construction above; this guard is a
+    // defensive fail-loud path, not a reachable state.
     let routine_id = automation.routine_id.clone().ok_or_else(|| {
         runtime_status_response(tonic::Status::internal(
             "objective automation routine id should always exist",
         ))
     })?;
+    // AIDEV-NOTE: this upsert is not transactional. The cron job and routine
+    // metadata are persisted before the objective record; a failure between
+    // the steps below leaves an orphaned routine without an objective.
+    // Making it atomic requires a journal-level transaction (behavior
+    // change).
     let cron_job = persist_objective_job(
         &state,
         existing.as_ref().and_then(|entry| entry.automation.routine_id.clone()),
@@ -367,10 +434,12 @@ pub(crate) async fn console_objective_upsert_handler(
     persist_objective_routine_metadata(&state, &automation)
         .map_err(routine_registry_error_response)?;
     let now_unix_ms = unix_ms_now().map_err(internal_console_error)?;
+    let initial_state = initial_objective_state(existing.as_ref(), payload.enabled);
     let mut lifecycle_history =
         existing.as_ref().map(|entry| entry.lifecycle_history.clone()).unwrap_or_default();
+    // Only creation seeds a lifecycle event; updates leave history untouched
+    // so the audit trail reflects explicit lifecycle actions only.
     if existing.is_none() {
-        let initial_state = initial_objective_state(existing.as_ref(), payload.enabled);
         lifecycle_history.push(ObjectiveLifecycleRecord {
             event_id: Ulid::new().to_string(),
             action: "created".to_owned(),
@@ -381,7 +450,6 @@ pub(crate) async fn console_objective_upsert_handler(
             occurred_at_unix_ms: now_unix_ms,
         });
     }
-    let initial_state = initial_objective_state(existing.as_ref(), payload.enabled);
     let objective = state
         .objectives
         .upsert_objective(ObjectiveUpsert {
@@ -479,6 +547,18 @@ pub(crate) async fn console_objective_upsert_handler(
     Ok(Json(json!({ "objective": objective_view })))
 }
 
+/// Handles `POST /console/v1/objectives/{objective_id}/lifecycle`: applies a
+/// fire/pause/resume/cancel/archive action.
+///
+/// Start actions (`fire`, `resume`) preflight the workspace projection and
+/// fail before any side effect when it is malformed; stop actions always
+/// apply and report a projection failure via
+/// `workspace_projection_warning` instead of an error.
+///
+/// # Errors
+/// Returns an error response when console authorization or CSRF validation
+/// fails, when the action is unknown or invalid for the current state, or
+/// when persisting the transition fails.
 pub(crate) async fn console_objective_lifecycle_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -494,6 +574,10 @@ pub(crate) async fn console_objective_lifecycle_handler(
         load_objective_record(&state, objective_id.as_str(), session.context.principal.as_str())?;
     let action = payload.action.trim().to_ascii_lowercase();
     let reason = normalize_lifecycle_reason(payload.reason)?;
+    // Run the pure state projection on a clone first: it validates the
+    // action against the current state without side effects, and for start
+    // actions the workspace projection must be writable before any dispatch
+    // or cron mutation happens.
     let mut preflight_objective = objective.clone();
     apply_lifecycle_workspace_projection(action.as_str(), &mut preflight_objective)
         .map_err(runtime_status_response)?;
@@ -516,6 +600,8 @@ pub(crate) async fn console_objective_lifecycle_handler(
         .objectives
         .upsert_objective(ObjectiveUpsert { record: objective })
         .map_err(objective_registry_error_response)?;
+    // Stop actions must never be rolled back because a workspace document is
+    // malformed; their projection failure is downgraded to a warning.
     let workspace_projection_warning = match project_objective_workspace(
         &state,
         updated.owner_principal.as_str(),
@@ -539,6 +625,13 @@ pub(crate) async fn console_objective_lifecycle_handler(
     Ok(Json(response))
 }
 
+/// Handles `POST /console/v1/objectives/{objective_id}/attempts`: appends an
+/// attempt record, links its run id, and refreshes the workspace projection.
+///
+/// # Errors
+/// Returns an error response when console authorization or CSRF validation
+/// fails, when the objective is missing or not owned by the caller, or when
+/// persistence or projection fails.
 pub(crate) async fn console_objective_attempt_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -590,6 +683,13 @@ pub(crate) async fn console_objective_attempt_handler(
     Ok(Json(json!({ "objective": build_objective_view(&state, updated).await? })))
 }
 
+/// Handles `POST /console/v1/objectives/{objective_id}/approach`: appends an
+/// approach-history entry and refreshes the workspace projection.
+///
+/// # Errors
+/// Returns an error response when console authorization or CSRF validation
+/// fails, when the approach kind is unknown, when the objective is missing or
+/// not owned by the caller, or when persistence fails.
 pub(crate) async fn console_objective_approach_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -625,6 +725,12 @@ pub(crate) async fn console_objective_approach_handler(
     Ok(Json(json!({ "objective": build_objective_view(&state, updated).await? })))
 }
 
+/// Handles `GET /console/v1/objectives/{objective_id}/summary`: returns the
+/// objective view plus a rendered markdown digest of its core fields.
+///
+/// # Errors
+/// Returns an error response when console authorization fails or when the
+/// objective is missing or not owned by the caller.
 pub(crate) async fn console_objective_summary_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -645,6 +751,8 @@ pub(crate) async fn console_objective_summary_handler(
     })))
 }
 
+/// Outcome of schedule resolution; `is_scheduled` is false only for the
+/// manual (shadow) schedule used by unscheduled objectives.
 #[derive(Debug, Clone)]
 struct ObjectiveScheduleResolution {
     trigger_kind: RoutineTriggerKind,
@@ -654,6 +762,8 @@ struct ObjectiveScheduleResolution {
     is_scheduled: bool,
 }
 
+/// Fields forwarded to the cron registry when creating or updating the
+/// backing job for an objective.
 #[derive(Debug, Clone)]
 struct ObjectiveJobUpsert {
     routine_id: String,
@@ -678,6 +788,11 @@ async fn load_objective_for_owner(
     build_objective_view(state, objective).await
 }
 
+/// Loads one objective and enforces ownership.
+///
+/// # Errors
+/// Returns not-found when the objective does not exist and
+/// permission-denied when it is owned by a different principal.
 #[allow(clippy::result_large_err)]
 fn load_objective_record(
     state: &AppState,
@@ -693,6 +808,12 @@ fn load_objective_record(
     Ok(objective)
 }
 
+/// Builds views for every objective owned by the principal that passes the
+/// kind/state filters.
+// AIDEV-NOTE: views (each loading the linked cron job and latest run) are
+// built for every matching objective before the list handler applies its
+// page limit, so large registries pay the full cost per list request.
+// Reducing this requires paging before view assembly (behavior change).
 async fn list_objective_views(
     state: &AppState,
     principal: &str,
@@ -714,6 +835,9 @@ async fn list_objective_views(
     Ok(objectives)
 }
 
+/// Renders the wire-facing objective view: the record joined with its linked
+/// routine snapshot, latest run, derived health badge, and attempt records
+/// reconciled against the latest run status.
 async fn build_objective_view(
     state: &AppState,
     objective: ObjectiveRecord,
@@ -784,6 +908,9 @@ async fn build_objective_view(
     }))
 }
 
+/// New objectives start `Active` only when explicitly enabled and `Draft`
+/// otherwise; updates always keep the stored state so upserts cannot bypass
+/// lifecycle actions.
 fn initial_objective_state(
     existing: Option<&ObjectiveRecord>,
     requested_enabled: Option<bool>,
@@ -797,6 +924,9 @@ fn initial_objective_state(
     })
 }
 
+/// Returns copies of the attempt records with any attempt that references the
+/// latest run updated to that run's terminal status, so the console never
+/// shows a stale "running" attempt next to a finished run.
 fn objective_attempts_for_view(
     objective: &ObjectiveRecord,
     latest_run: Option<&Value>,
@@ -823,6 +953,8 @@ fn objective_attempts_for_view(
     (last_attempt, attempt_history)
 }
 
+/// Persists the run-reconciled attempt records back onto the objective; used
+/// before archiving so the stored snapshot keeps the terminal run outcome.
 fn reconcile_objective_attempts_with_latest_run(
     objective: &mut ObjectiveRecord,
     latest_run: Option<&Value>,
@@ -832,6 +964,9 @@ fn reconcile_objective_attempts_with_latest_run(
     objective.attempt_history = attempt_history;
 }
 
+/// Synthesizes a last-run view from the stored attempt when no cron run is
+/// available anymore (for example after the backing job was removed), so
+/// archived objectives keep showing their final outcome.
 fn preserved_run_from_objective_attempt(objective: &ObjectiveRecord) -> Option<Value> {
     let attempt = objective.last_attempt.as_ref()?;
     let run_id = attempt.run_id.as_deref()?.trim();
@@ -852,6 +987,9 @@ fn preserved_run_from_objective_attempt(objective: &ObjectiveRecord) -> Option<V
     }))
 }
 
+/// Copies the run's status/outcome fields onto the attempt; session id and
+/// completion time are only filled in when the attempt lacks them so manually
+/// recorded data wins.
 fn reconcile_attempt_with_run(attempt: &mut ObjectiveAttemptRecord, run: &Value) {
     if let Some(status) =
         run.get("status").and_then(Value::as_str).filter(|value| !value.is_empty())
@@ -880,6 +1018,9 @@ fn reconcile_attempt_with_run(attempt: &mut ObjectiveAttemptRecord, run: &Value)
     }
 }
 
+/// Loads the live cron job linked to the objective; when the job no longer
+/// exists, falls back to a snapshot rebuilt from the stored automation
+/// binding so the view keeps its routine context.
 async fn load_objective_routine(
     state: &AppState,
     objective: &ObjectiveRecord,
@@ -909,6 +1050,8 @@ async fn load_objective_routine(
     })))
 }
 
+/// Rebuilds a routine view from the automation binding alone; `source` marks
+/// it as a snapshot so the console can distinguish it from a live job.
 fn objective_routine_snapshot_from_binding(objective: &ObjectiveRecord) -> Option<Value> {
     let routine_id = objective.automation.routine_id.as_ref()?;
     Some(json!({
@@ -930,6 +1073,8 @@ fn objective_routine_snapshot_from_binding(objective: &ObjectiveRecord) -> Optio
     }))
 }
 
+/// Fetches the most recent cron run for the objective's routine, joined with
+/// its routine run metadata.
 async fn latest_objective_run(
     state: &AppState,
     objective: &ObjectiveRecord,
@@ -952,6 +1097,9 @@ async fn latest_objective_run(
     Ok(Some(join_run_metadata(routine_id.as_str(), run, metadata.as_ref())))
 }
 
+/// Maps objective state plus last-run status onto the console health badge.
+/// `next_run_at_unix_ms` is surfaced only for active, enabled objectives so
+/// paused or terminal objectives never advertise a future run.
 fn compute_objective_health(
     objective: &ObjectiveRecord,
     routine: Option<&Value>,
@@ -989,6 +1137,9 @@ fn compute_objective_health(
     })
 }
 
+/// Creates or updates the backing cron job. Objective jobs are pinned to
+/// forbid-concurrency, no-retry, skip-misfire, zero-jitter policies so an
+/// objective can never stack overlapping or replayed runs.
 async fn persist_objective_job(
     state: &AppState,
     existing_routine_id: Option<String>,
@@ -1046,6 +1197,12 @@ async fn persist_objective_job(
     }
 }
 
+/// Mirrors the automation binding into the routine registry so routine-level
+/// tooling (delivery, quiet hours, approvals) sees objective routines.
+///
+/// # Panics
+/// Panics when the binding has no routine id; upsert always constructs the
+/// binding with one, so a missing id is a programming error.
 fn persist_objective_routine_metadata(
     state: &AppState,
     automation: &ObjectiveAutomationBinding,
@@ -1053,7 +1210,7 @@ fn persist_objective_routine_metadata(
     let routine_id = automation
         .routine_id
         .clone()
-        .expect("objective automation should always have a routine id");
+        .expect("objective automation bindings are always constructed with a routine id");
     state.routines.upsert_routine(crate::routines::RoutineMetadataUpsert {
         routine_id,
         trigger_kind: automation.trigger_kind,
@@ -1068,6 +1225,12 @@ fn persist_objective_routine_metadata(
     Ok(())
 }
 
+/// Toggles the backing cron job for pause/resume, recomputing the next run
+/// time for the new enabled state.
+///
+/// # Errors
+/// Returns not-found when the linked job is missing: pause/resume operate on
+/// live automation, unlike the archive path which tolerates a removed job.
 async fn set_objective_job_enabled(
     state: &AppState,
     objective: &ObjectiveRecord,
@@ -1107,6 +1270,8 @@ async fn set_objective_job_enabled(
     Ok(())
 }
 
+/// Best-effort job disable used by archive: a missing job is fine because
+/// archiving must succeed even after the automation was already deleted.
 async fn disable_objective_job_for_archive(
     state: &AppState,
     objective: &ObjectiveRecord,
@@ -1140,6 +1305,13 @@ async fn disable_objective_job_for_archive(
     Ok(())
 }
 
+/// Dispatches the objective's routine immediately (the `fire` action) and
+/// records manual-trigger run metadata for the spawned run.
+///
+/// # Errors
+/// Returns failed-precondition when the objective has no linked automation,
+/// not-found when the linked job is missing, and the mapped runtime error
+/// when dispatch fails.
 async fn trigger_objective_now(
     state: &AppState,
     objective: &ObjectiveRecord,
@@ -1197,6 +1369,8 @@ async fn trigger_objective_now(
     }))
 }
 
+/// Applies the `fire` action: dispatches the routine immediately and records
+/// the resulting attempt and lifecycle event on the objective.
 async fn apply_fire_action(
     state: &AppState,
     objective: &mut ObjectiveRecord,
@@ -1214,8 +1388,12 @@ async fn apply_fire_action(
     }
     let from_state = objective.state;
     let now_unix_ms = unix_ms_now().map_err(internal_console_error)?;
+    // Dispatch before mutating state so a failed trigger leaves the
+    // objective untouched.
     let outcome = trigger_objective_now(state, objective).await?;
     objective.state = ObjectiveState::Active;
+    // Seed an attempt from the dispatch outcome so the console shows the run
+    // immediately; later reads reconcile it with the real run status.
     if let Some(run_id) = outcome.get("run_id").and_then(Value::as_str) {
         objective.linked_run_ids.push(run_id.to_owned());
         let attempt = ObjectiveAttemptRecord {
@@ -1249,6 +1427,8 @@ async fn apply_fire_action(
     Ok(())
 }
 
+/// Applies the `pause` action: disables automation and records the
+/// lifecycle event; any state may be paused.
 async fn apply_pause_action(
     state: &AppState,
     objective: &mut ObjectiveRecord,
@@ -1270,6 +1450,8 @@ async fn apply_pause_action(
     Ok(())
 }
 
+/// Applies the `resume` action: re-enables automation and reactivates the
+/// objective; archived objectives stay archived.
 async fn apply_resume_action(
     state: &AppState,
     objective: &mut ObjectiveRecord,
@@ -1296,6 +1478,8 @@ async fn apply_resume_action(
     Ok(())
 }
 
+/// Applies the `cancel` action: disables automation, requests best-effort
+/// cancellation of the latest linked run, and records the lifecycle event.
 async fn apply_cancel_action(
     state: &AppState,
     objective: &mut ObjectiveRecord,
@@ -1305,6 +1489,8 @@ async fn apply_cancel_action(
     objective.state = ObjectiveState::Cancelled;
     objective.automation.enabled = false;
     set_objective_job_enabled(state, objective, false).await?;
+    // Cancelling the most recent linked run is best-effort: the objective
+    // transitions to cancelled even when no run is active anymore.
     if let Some(run_id) = objective.linked_run_ids.last() {
         let _ = state
             .runtime
@@ -1326,12 +1512,17 @@ async fn apply_cancel_action(
     Ok(())
 }
 
+/// Applies the `archive` action: freezes the objective with its terminal run
+/// outcome and disables the backing job if it still exists.
 async fn apply_archive_action(
     state: &AppState,
     objective: &mut ObjectiveRecord,
     reason: Option<String>,
 ) -> Result<(), Response> {
     let from_state = objective.state;
+    // Fold the latest run status into attempt history before archiving so
+    // the stored snapshot keeps the terminal outcome even if the cron job
+    // and its run history are removed later.
     let latest_run = latest_objective_run(state, objective).await?;
     reconcile_objective_attempts_with_latest_run(objective, latest_run.as_ref());
     let now_unix_ms = unix_ms_now().map_err(internal_console_error)?;
@@ -1351,6 +1542,8 @@ async fn apply_archive_action(
     Ok(())
 }
 
+/// Dry-runs every workspace write a lifecycle action would perform so a
+/// malformed managed block fails the request before any side effect.
 async fn preflight_objective_workspace_projection(
     state: &AppState,
     objective: &ObjectiveRecord,
@@ -1359,6 +1552,8 @@ async fn preflight_objective_workspace_projection(
     validate_owner_objective_blocks_projection(state, objective).await
 }
 
+/// Validates that the objective's own workspace document accepts a
+/// managed-block sync without writing anything.
 async fn validate_objective_document_projection(
     state: &AppState,
     objective: &ObjectiveRecord,
@@ -1383,12 +1578,16 @@ async fn validate_objective_document_projection(
     Ok(())
 }
 
+/// Validates the owner-wide projection docs (focus, heartbeats, inbox) with
+/// the pending objective substituted in, again without writing anything.
 async fn validate_owner_objective_blocks_projection(
     state: &AppState,
     objective: &ObjectiveRecord,
 ) -> Result<(), Response> {
     let mut objectives =
         state.objectives.list_objectives().map_err(objective_registry_error_response)?;
+    // Substitute the not-yet-persisted objective so the preflight sees the
+    // exact document state the post-action projection would produce.
     if let Some(existing) =
         objectives.iter_mut().find(|entry| entry.objective_id == objective.objective_id)
     {
@@ -1420,6 +1619,18 @@ async fn validate_owner_objective_blocks_projection(
     Ok(())
 }
 
+/// Pure lifecycle transition used for preflight: validates the action
+/// against the current state and applies the target state and automation
+/// flag without touching history or any external system.
+///
+/// Must stay side-effect free; the test
+/// `lifecycle_projection_is_pure_before_side_effects` pins this, and the
+/// apply_* functions re-run the real mutation with history and external
+/// effects afterwards.
+///
+/// # Errors
+/// Returns failed-precondition for transitions the lifecycle rules forbid
+/// and invalid-argument for unknown actions, mirroring the handler errors.
 fn apply_lifecycle_workspace_projection(
     action: &str,
     objective: &mut ObjectiveRecord,
@@ -1468,14 +1679,20 @@ fn apply_lifecycle_workspace_projection(
     Ok(())
 }
 
+/// Start actions must not dispatch or re-enable automation while the
+/// workspace projection is broken, so they preflight it.
 fn lifecycle_action_requires_workspace_preflight(action: &str) -> bool {
     matches!(action, "fire" | "resume")
 }
 
+/// Stop actions always apply; a failed projection afterwards becomes a
+/// response warning instead of an error.
 fn lifecycle_action_tolerates_workspace_projection_failure(action: &str) -> bool {
     matches!(action, "pause" | "cancel" | "archive")
 }
 
+/// Rewrites the objective's own document plus the owner-wide projection docs
+/// after a mutation so workspace views stay in sync with the registry.
 async fn project_objective_workspace(
     state: &AppState,
     owner_principal: &str,
@@ -1487,6 +1704,9 @@ async fn project_objective_workspace(
     sync_owner_objective_blocks(state, owner_principal, channel).await
 }
 
+/// Syncs the objective-record managed block into the objective's workspace
+/// document, creating the document with a kind-specific heading on first
+/// write; manual notes outside the managed block are preserved.
 async fn write_objective_document(
     state: &AppState,
     owner_principal: &str,
@@ -1533,6 +1753,8 @@ async fn write_objective_document(
     Ok(())
 }
 
+/// Rewrites the owner-wide projection docs from the full set of the owner's
+/// objectives; each doc gets its managed block replaced wholesale.
 async fn sync_owner_objective_blocks(
     state: &AppState,
     owner_principal: &str,
@@ -1551,6 +1773,8 @@ async fn sync_owner_objective_blocks(
     Ok(())
 }
 
+/// Applies one managed-block update to one workspace document, creating the
+/// document when it does not exist yet.
 async fn sync_owner_block(
     state: &AppState,
     owner_principal: &str,
@@ -1640,6 +1864,10 @@ fn objective_record_block(objective: &ObjectiveRecord) -> WorkspaceManagedBlockU
     }
 }
 
+/// Computes the managed-block updates projected into the owner's shared
+/// workspace docs. Per-doc state filters decide visibility: the focus doc
+/// hides archived/cancelled objectives, the heartbeat doc lists heartbeats
+/// of any state, and the inbox lists draft/active/paused objectives.
 fn owner_objective_block_updates(
     objectives: &[ObjectiveRecord],
 ) -> Vec<(&'static str, WorkspaceManagedBlockUpdate)> {
@@ -1728,6 +1956,11 @@ fn owner_objective_block_updates(
     ]
 }
 
+/// Trims the operator-supplied lifecycle reason, dropping blank values.
+///
+/// # Errors
+/// Returns a validation error when the trimmed reason exceeds 500 bytes;
+/// this runs before any lifecycle side effect.
 #[allow(clippy::result_large_err)]
 fn normalize_lifecycle_reason(reason: Option<String>) -> Result<Option<String>, Response> {
     let Some(reason) = reason else {
@@ -1747,6 +1980,9 @@ fn normalize_lifecycle_reason(reason: Option<String>) -> Result<Option<String>, 
     Ok(Some(trimmed.to_owned()))
 }
 
+/// Merges the budget payload over the existing budget: provided fields
+/// override, omitted fields keep their stored values. Fields cannot be
+/// cleared through this endpoint.
 fn normalize_budget(
     budget: Option<ConsoleObjectiveBudgetPayload>,
     existing: Option<&ObjectiveRecord>,
@@ -1781,6 +2017,11 @@ fn parse_objective_priority(value: Option<&str>) -> Result<ObjectivePriority, Re
     }
 }
 
+/// Resolves the routine execution config: keeps the stored config on update
+/// and only replaces the posture when the payload supplies one.
+///
+/// # Errors
+/// Returns an invalid-argument response for unknown posture values.
 #[allow(clippy::result_large_err)]
 fn parse_objective_execution_config(
     execution_posture: Option<&str>,
@@ -1806,6 +2047,8 @@ fn parse_objective_execution_config(
     Ok(execution)
 }
 
+/// All kinds currently default to the standard posture; the kind parameter
+/// is kept so a future kind-specific default stays a one-line change.
 fn default_objective_execution_posture(_kind: ObjectiveKind) -> RoutineExecutionPosture {
     RoutineExecutionPosture::Standard
 }
@@ -1824,6 +2067,12 @@ fn parse_approach_kind(value: &str) -> Result<ObjectiveApproachKind, Response> {
     }
 }
 
+/// Resolves the effective owner principal: console callers may only operate
+/// on their own objectives, so an explicit `owner_principal` must equal the
+/// session principal.
+///
+/// # Errors
+/// Returns permission-denied when a different principal is requested.
 #[allow(clippy::result_large_err)]
 fn normalize_owner_principal(
     requested: &Option<String>,
@@ -1840,6 +2089,8 @@ fn normalize_owner_principal(
     }
 }
 
+/// Picks the objective channel: explicit payload value, then the session
+/// channel, then the shared system objectives channel.
 fn normalize_channel(requested: Option<&str>, session_channel: Option<&str>) -> String {
     requested
         .map(str::trim)
@@ -1853,6 +2104,10 @@ fn normalize_optional_text(value: Option<&str>) -> Option<String> {
     value.map(str::trim).filter(|entry| !entry.is_empty()).map(ToOwned::to_owned)
 }
 
+/// Enforces objective ownership for the authenticated principal.
+///
+/// # Errors
+/// Returns permission-denied on owner mismatch.
 #[allow(clippy::result_large_err)]
 fn ensure_objective_owner(objective: &ObjectiveRecord, principal: &str) -> Result<(), Response> {
     if objective.owner_principal != principal {
@@ -1863,6 +2118,15 @@ fn ensure_objective_owner(objective: &ObjectiveRecord, principal: &str) -> Resul
     Ok(())
 }
 
+/// Resolves the requested schedule with layered precedence: a natural
+/// language phrase wins, then an explicit `schedule_type` payload, then the
+/// hourly heartbeat default (heartbeats must always tick), and finally the
+/// manual (shadow) schedule for unscheduled objectives.
+///
+/// # Errors
+/// Returns an invalid-argument response when the phrase cannot be parsed,
+/// when the schedule payload is incomplete for its type, or when the
+/// schedule fails cron normalization.
 #[allow(clippy::result_large_err)]
 fn resolve_objective_schedule(
     payload: &ConsoleObjectiveUpsertRequest,
@@ -1912,7 +2176,7 @@ fn resolve_objective_schedule(
             Some(cron_v1::Schedule {
                 r#type: cron_v1::ScheduleType::Every as i32,
                 spec: Some(cron_v1::schedule::Spec::Every(cron_v1::EverySchedule {
-                    interval_ms: payload.every_interval_ms.unwrap_or(60 * 60 * 1_000),
+                    interval_ms: payload.every_interval_ms.unwrap_or(DEFAULT_HEARTBEAT_INTERVAL_MS),
                 })),
             }),
             unix_ms_now().map_err(internal_console_error)?,
@@ -1936,6 +2200,13 @@ fn resolve_objective_schedule(
     })
 }
 
+/// Builds the protobuf schedule for an explicit `schedule_type`, requiring
+/// the matching spec field (`cron_expression`, `every_interval_ms`, or
+/// `at_timestamp_rfc3339`).
+///
+/// # Errors
+/// Returns an invalid-argument response for unknown types or missing spec
+/// fields.
 #[allow(clippy::result_large_err)]
 fn build_console_schedule(
     schedule_type_raw: &str,
@@ -2006,6 +2277,11 @@ fn parse_schedule_type(value: &str) -> Result<CronScheduleType, Response> {
     }
 }
 
+/// Parses the delivery configuration; the mode defaults to same-channel.
+///
+/// # Errors
+/// Returns an invalid-argument response for unknown modes or when
+/// `specific_channel` is requested without a delivery channel.
 #[allow(clippy::result_large_err)]
 fn parse_delivery(
     mode: Option<&str>,
@@ -2038,6 +2314,12 @@ fn parse_delivery(
     })
 }
 
+/// Parses optional quiet hours; start and end must be provided together so a
+/// half-open window can never be stored.
+///
+/// # Errors
+/// Returns an invalid-argument response when only one bound is provided or
+/// when either bound is not a valid `HH:MM` time of day.
 #[allow(clippy::result_large_err)]
 fn parse_quiet_hours(
     start: Option<&str>,
@@ -2099,6 +2381,8 @@ fn parse_approval_policy(value: Option<&str>) -> Result<RoutineApprovalPolicy, R
     Ok(RoutineApprovalPolicy { mode })
 }
 
+/// Renders the operator-facing markdown digest for the summary endpoint from
+/// an already-built objective view.
 fn render_objective_summary_markdown(view: &Value) -> String {
     let objective_id = read_string_value(view, "objective_id");
     let kind = read_string_value(view, "kind");
@@ -2128,6 +2412,8 @@ fn read_string_value(record: &Value, key: &str) -> String {
     record.get(key).and_then(Value::as_str).unwrap_or_default().to_owned()
 }
 
+/// Maps registry errors to the wire contract: field validation failures
+/// become structured validation errors, everything else an internal status.
 fn objective_registry_error_response(error: ObjectiveRegistryError) -> Response {
     match error {
         ObjectiveRegistryError::InvalidField { field, message } => {
@@ -2137,6 +2423,7 @@ fn objective_registry_error_response(error: ObjectiveRegistryError) -> Response 
     }
 }
 
+/// Routine-registry counterpart of [`objective_registry_error_response`].
 fn routine_registry_error_response(error: crate::routines::RoutineRegistryError) -> Response {
     match error {
         crate::routines::RoutineRegistryError::InvalidField { field, message } => {
@@ -2146,6 +2433,8 @@ fn routine_registry_error_response(error: crate::routines::RoutineRegistryError)
     }
 }
 
+/// Maps a managed-block failure to a failed-precondition response with
+/// repair instructions, used by both preflight and post-action projection.
 fn objective_workspace_error_response(
     error: crate::domain::workspace::WorkspaceManagedBlockError,
 ) -> Response {
@@ -2154,6 +2443,8 @@ fn objective_workspace_error_response(
     )))
 }
 
+/// Wraps unexpected errors as sanitized internal statuses so raw error text
+/// never reaches the console.
 fn internal_console_error(error: anyhow::Error) -> Response {
     runtime_status_response(tonic::Status::internal(sanitize_http_error_message(
         error.to_string().as_str(),

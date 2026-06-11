@@ -1,3 +1,10 @@
+//! Console agent registry handlers for the `/console/v1/agents` route family.
+//!
+//! Exposes list/get/create/set-default over the runtime agent registry and
+//! decorates every envelope with the execution-backend inventory so the web
+//! console can render backend selection state. Response shapes are part of
+//! the `/console/v1` wire contract consumed by `apps/web`.
+
 use std::borrow::Cow;
 
 use serde::{de, Deserialize, Deserializer};
@@ -14,8 +21,13 @@ use crate::{
     *,
 };
 
+/// Upper bound for agent identifiers accepted from path and query input.
 const CONSOLE_MAX_AGENT_ID_QUERY_BYTES: usize = 64;
 
+/// Agent identifier extracted from a request path.
+///
+/// The length cap is enforced at deserialization time so oversized input is
+/// rejected before any normalization or registry lookup runs.
 #[derive(Debug)]
 pub(crate) struct BoundedConsoleAgentIdentifier(String);
 
@@ -46,6 +58,13 @@ struct ConsoleAgentsListQuery {
     limit: Option<usize>,
 }
 
+/// Handles `GET /console/v1/agents`: lists registered agents with keyset
+/// paging plus the execution-backend inventory.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, when the query
+/// string is invalid, or when the runtime cannot list agents or build the
+/// backend inventory.
 pub(crate) async fn console_agents_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -75,6 +94,12 @@ pub(crate) async fn console_agents_list_handler(
     }))
 }
 
+/// Handles `GET /console/v1/agents/{agent_id}`: returns one agent with its
+/// resolved execution-backend selection.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, when the agent
+/// id is invalid or unknown, or when the backend inventory cannot be built.
 pub(crate) async fn console_agent_get_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -105,6 +130,13 @@ pub(crate) async fn console_agent_get_handler(
     }))
 }
 
+/// Handles `POST /console/v1/agents`: creates an agent and records audit
+/// journal events for the creation and any default-agent change.
+///
+/// # Errors
+/// Returns an error response when console authorization or CSRF validation
+/// fails, when the execution-backend preference is invalid or not selectable,
+/// or when the runtime rejects the create request.
 pub(crate) async fn console_agent_create_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -143,6 +175,8 @@ pub(crate) async fn console_agent_create_handler(
         .await
         .map_err(runtime_status_response)?;
 
+    // Journal writes are best-effort: the agent is already persisted, and a
+    // failed audit entry must not turn a successful create into an error.
     let _ = record_agent_journal_event(
         &state.runtime,
         &session.context,
@@ -190,6 +224,13 @@ pub(crate) async fn console_agent_create_handler(
     }))
 }
 
+/// Handles `POST /console/v1/agents/{agent_id}/set-default`: switches the
+/// default agent and records a best-effort journal event.
+///
+/// # Errors
+/// Returns an error response when console authorization or CSRF validation
+/// fails, when the agent id is invalid, or when the runtime rejects the
+/// default change.
 pub(crate) async fn console_agent_set_default_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -265,6 +306,8 @@ fn control_plane_execution_backend_inventory(
     }
 }
 
+/// Builds the execution-backend inventory from the current node and worker
+/// fleet state so envelopes reflect live backend availability.
 fn backend_inventory(
     state: &AppState,
 ) -> Result<Vec<crate::execution_backends::ExecutionBackendInventoryRecord>, tonic::Status> {
@@ -281,6 +324,11 @@ fn backend_inventory(
     ))
 }
 
+/// Authorizes one agent-management action for the console principal.
+///
+/// # Errors
+/// Returns the mapped authorization failure; the runtime denied counter is
+/// incremented as a side effect so access metrics stay accurate.
 #[allow(clippy::result_large_err)]
 fn authorize_console_agent_action(
     state: &AppState,
@@ -293,6 +341,12 @@ fn authorize_console_agent_action(
     })
 }
 
+/// Normalizes a caller-supplied agent identifier.
+///
+/// # Errors
+/// Returns the validation failure response; the agent-validation-failure
+/// counter is incremented as a side effect so rejected input stays visible
+/// in diagnostics.
 #[allow(clippy::result_large_err)]
 fn normalize_console_agent_id(
     state: &AppState,
@@ -309,6 +363,14 @@ fn normalize_console_agent_id(
     })
 }
 
+/// Parses the supported list-query parameters by hand from the raw query
+/// string so the byte-length cap applies before any decoding or
+/// normalization; unknown keys are ignored.
+///
+/// # Errors
+/// Returns an invalid-argument response when `after_agent_id` exceeds the
+/// byte cap or fails normalization, or when `limit` is not an unsigned
+/// integer.
 #[allow(clippy::result_large_err)]
 fn parse_console_agents_list_query(
     state: &AppState,
