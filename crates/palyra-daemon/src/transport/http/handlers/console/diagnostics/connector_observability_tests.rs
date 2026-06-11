@@ -1,3 +1,6 @@
+//! Unit tests pinning which connector states count as operator-actionable
+//! degradations in console connector observability.
+
 use super::connector_has_actionable_degradation;
 use palyra_connectors::{
     ConnectorAvailability, ConnectorKind, ConnectorLiveness, ConnectorQueueDepth,

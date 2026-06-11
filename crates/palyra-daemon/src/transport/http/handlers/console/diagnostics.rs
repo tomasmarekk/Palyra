@@ -1,3 +1,18 @@
+//! Console diagnostics handlers and shared console support helpers.
+//!
+//! Serves the aggregated `GET /console/v1/diagnostics` snapshot and the
+//! networked-worker fleet action endpoints, and hosts the shared plumbing the
+//! other console handler modules reuse: observability payload builders,
+//! support-bundle/doctor recovery jobs, auth-profile proto conversions,
+//! console config document helpers, the capability catalog, diagnostics
+//! redaction, and console session/cookie authorization.
+//!
+//! Every JSON shape produced here is part of the `/console/v1` wire contract
+//! consumed by `apps/web`: field names, status codes, and operator-facing
+//! strings must stay byte-stable. Diagnostics payloads derived from runtime
+//! state are redacted via [`redact_console_diagnostics_value`] before they
+//! leave the daemon.
+
 use crate::*;
 use palyra_common::feature_rollouts::{
     AUXILIARY_EXECUTOR_ROLLOUT_CONFIG_PATH, AUXILIARY_EXECUTOR_ROLLOUT_ENV,
@@ -20,9 +35,22 @@ use palyra_common::feature_rollouts::{
 use palyra_common::replay_bundle::replay_contract_snapshot;
 use palyra_common::runtime_contracts::{FlowState, FlowStepState};
 
+// Keeps CLI helper subprocesses (doctor, support-bundle export) from flashing
+// a console window when the daemon runs as a desktop-supervised process.
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+/// Handles `GET /console/v1/diagnostics`: assembles the full operator
+/// diagnostics snapshot (runtime health, model provider, auth, memory,
+/// workers, flows, rollouts, observability, and more) as one JSON document.
+///
+/// Runtime-derived payloads are serialized first and then passed through
+/// [`redact_console_diagnostics_value`] so secrets, URLs, and raw error
+/// detail never reach the dashboard verbatim.
+///
+/// # Errors
+/// Returns an error `Response` when the console session is missing or
+/// expired, or when any underlying runtime snapshot call fails.
 pub(crate) async fn console_diagnostics_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -292,6 +320,16 @@ pub(crate) async fn console_diagnostics_handler(
     })))
 }
 
+// Networked-worker fleet actions. Every handler requires a CSRF-validated
+// console session, performs one fleet mutation, and returns the shared
+// `networked_worker_action_response` shape so the dashboard can refresh its
+// worker view from any action result.
+
+/// Handles `POST /console/v1/networked-workers/reap-expired`.
+///
+/// # Errors
+/// Returns an error `Response` when console authorization fails or the
+/// runtime rejects the fleet operation.
 pub(crate) async fn console_networked_workers_reap_expired_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -302,6 +340,11 @@ pub(crate) async fn console_networked_workers_reap_expired_handler(
     Ok(Json(networked_worker_action_response(&state, "reap_expired", events)))
 }
 
+/// Handles `POST /console/v1/networked-workers/drain`.
+///
+/// # Errors
+/// Returns an error `Response` when console authorization fails or the
+/// runtime rejects the fleet operation.
 pub(crate) async fn console_networked_workers_drain_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -311,6 +354,11 @@ pub(crate) async fn console_networked_workers_drain_handler(
     Ok(Json(networked_worker_action_response(&state, "drain", events)))
 }
 
+/// Handles `POST /console/v1/networked-workers/{worker_id}/quarantine`.
+///
+/// # Errors
+/// Returns an error `Response` on authorization failure, an empty
+/// `worker_id`, or runtime rejection.
 pub(crate) async fn console_networked_worker_quarantine_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -326,6 +374,11 @@ pub(crate) async fn console_networked_worker_quarantine_handler(
     Ok(Json(networked_worker_action_response(&state, "quarantine", vec![event])))
 }
 
+/// Handles `POST /console/v1/networked-workers/{worker_id}/reverify`.
+///
+/// # Errors
+/// Returns an error `Response` on authorization failure, an empty
+/// `worker_id`, or runtime rejection.
 pub(crate) async fn console_networked_worker_reverify_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -341,6 +394,8 @@ pub(crate) async fn console_networked_worker_reverify_handler(
     Ok(Json(networked_worker_action_response(&state, "reverify", vec![event])))
 }
 
+/// Operator-supplied cleanup evidence for a force-cleanup action; omitted
+/// fields default to "not removed" so the recorded evidence stays honest.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleNetworkedWorkerForceCleanupRequest {
     #[serde(default)]
@@ -353,6 +408,11 @@ pub(crate) struct ConsoleNetworkedWorkerForceCleanupRequest {
     failure_reason: Option<String>,
 }
 
+/// Handles `POST /console/v1/networked-workers/{worker_id}/force-cleanup`.
+///
+/// # Errors
+/// Returns an error `Response` on authorization failure, an empty
+/// `worker_id`, or runtime rejection.
 pub(crate) async fn console_networked_worker_force_cleanup_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -381,6 +441,9 @@ pub(crate) async fn console_networked_worker_force_cleanup_handler(
     Ok(Json(networked_worker_action_response(&state, "force_cleanup", vec![event])))
 }
 
+/// Shared response shape for all fleet actions: the emitted lifecycle events
+/// plus a fresh fleet snapshot and diagnostics block, so the dashboard can
+/// refresh its worker view without a second request.
 fn networked_worker_action_response(
     state: &AppState,
     action: &str,
@@ -396,6 +459,9 @@ fn networked_worker_action_response(
     })
 }
 
+/// Summarizes delegated background tasks for the requesting principal:
+/// per-parent rollups, child state counters, and a bounded recent-children
+/// sample (24 entries, error text truncated).
 async fn collect_console_delegation_diagnostics(
     state: &AppState,
     context: &crate::gateway::RequestContext,
@@ -446,6 +512,9 @@ async fn collect_console_delegation_diagnostics(
                 }
             });
             group.child_count += 1;
+            // Children of one parent may carry different runtime limits (e.g.
+            // after a config change); report the most restrictive value per
+            // parent so the dashboard never overstates available headroom.
             group.max_concurrent_children = group
                 .max_concurrent_children
                 .min(delegation.runtime_limits.max_concurrent_children);
@@ -542,6 +611,9 @@ async fn collect_console_delegation_diagnostics(
     }))
 }
 
+/// Scopes delegation diagnostics to tasks owned by the requesting console
+/// principal, device, and channel so operators never see other principals'
+/// delegated runs.
 fn delegation_diagnostics_task_filter(
     context: &crate::gateway::RequestContext,
 ) -> crate::journal::OrchestratorBackgroundTaskListFilter {
@@ -555,6 +627,8 @@ fn delegation_diagnostics_task_filter(
     }
 }
 
+/// Accumulator for the per-parent delegation rollups in the diagnostics
+/// payload; limit fields hold the most restrictive value seen across children.
 struct DelegationParentDiagnostics {
     parent_run_id: String,
     child_count: usize,
@@ -572,6 +646,8 @@ struct DelegationParentDiagnostics {
     child_timeout_ms: u64,
 }
 
+/// Extracts a waiting reason from a task's result JSON when the task last
+/// reported a waiting status; `None` means the task is not waiting.
 fn delegation_waiting_reason(
     task: &crate::journal::OrchestratorBackgroundTaskRecord,
 ) -> Option<String> {
@@ -585,6 +661,11 @@ fn delegation_waiting_reason(
         })
 }
 
+/// Bounds free-form diagnostic text (errors, reasons) to `max_chars` so one
+/// oversized error cannot bloat the diagnostics payload.
+// AIDEV-NOTE: the overflow check counts the untrimmed input while the output
+// is trimmed, so input whose surrounding whitespace pushes it past max_chars
+// gains a spurious "..." suffix; fixing this changes emitted payload text.
 fn truncate_diagnostic_text(value: &str, max_chars: usize) -> String {
     let mut truncated = value.trim().chars().take(max_chars).collect::<String>();
     if value.chars().count() > max_chars {
@@ -593,6 +674,8 @@ fn truncate_diagnostic_text(value: &str, max_chars: usize) -> String {
     truncated
 }
 
+/// Serializes the execution-backend inventory (local runner, remote nodes,
+/// networked workers) with current worker fleet state folded in.
 fn collect_console_execution_backend_diagnostics(state: &AppState) -> Result<Value, tonic::Status> {
     let now_unix_ms = crate::gateway::current_unix_ms_status()?;
     let nodes = state.node_runtime.nodes()?;
@@ -612,6 +695,9 @@ fn collect_console_execution_backend_diagnostics(state: &AppState) -> Result<Val
     })
 }
 
+/// Builds the networked-worker diagnostics block: fleet snapshot, derived
+/// health state, failure metrics inferred from recent lifecycle and runtime
+/// events, rollout gate criteria, and the operator action descriptors.
 pub(crate) fn collect_console_networked_worker_diagnostics(state: &AppState) -> Value {
     let snapshot = state.runtime.worker_fleet_snapshot();
     let policy = state.runtime.worker_fleet_policy();
@@ -621,6 +707,9 @@ pub(crate) fn collect_console_networked_worker_diagnostics(state: &AppState) -> 
     for event in &recent_events {
         *reason_counts.entry(event.reason_code.clone()).or_default() += 1;
     }
+    // Lease failures are inferred from lifecycle reason codes rather than a
+    // dedicated counter; these four codes are the ones that require operator
+    // intervention before rollout can widen.
     let lease_failures = recent_events
         .iter()
         .filter(|event| {
@@ -646,6 +735,8 @@ pub(crate) fn collect_console_networked_worker_diagnostics(state: &AppState) -> 
         .iter()
         .filter(|event| event.reason.contains("fallback"))
         .count() as u64;
+    // Basis points over the recent-event window; an empty window reports 0
+    // instead of dividing by zero.
     let fallback_rate_bps = if runtime_preview.recent_events.is_empty() {
         0
     } else {
@@ -750,6 +841,9 @@ pub(crate) fn collect_console_networked_worker_diagnostics(state: &AppState) -> 
     })
 }
 
+/// Derives the fleet health label. Order matters: failed-closed workers or
+/// transport failures dominate (fail-closed posture), orphans and lease
+/// failures degrade, and an empty fleet reads as "disabled", not unhealthy.
 fn networked_worker_health_state(
     snapshot: &palyra_workerd::WorkerFleetSnapshot,
     lease_failures: u64,
@@ -766,6 +860,8 @@ fn networked_worker_health_state(
     }
 }
 
+/// Maps observed fleet problems to ordered operator next steps; always emits
+/// at least one action so the dashboard never renders an empty plan.
 fn networked_worker_recommended_actions(
     snapshot: &palyra_workerd::WorkerFleetSnapshot,
     lease_failures: u64,
@@ -792,6 +888,8 @@ fn networked_worker_recommended_actions(
     actions
 }
 
+/// Static descriptors for the fleet action endpoints the dashboard renders
+/// as buttons; paths here mirror the route table and are wire contract.
 fn networked_worker_action_descriptors() -> Value {
     json!([
         {
@@ -839,6 +937,8 @@ fn networked_worker_action_descriptors() -> Value {
     ])
 }
 
+/// Reports every feature-rollout flag with its effective value and source,
+/// plus the config path and env var an operator can use to change it.
 fn collect_console_feature_rollouts_diagnostics(state: &AppState) -> Value {
     let feature_rollouts = &state.runtime.config.feature_rollouts;
     json!({
@@ -938,6 +1038,8 @@ fn collect_console_feature_rollouts_diagnostics(state: &AppState) -> Value {
     })
 }
 
+/// Builds context-engine diagnostics from the in-memory trace ring buffer;
+/// every trace is sanitized and redacted before it leaves the daemon.
 fn collect_console_context_engine_diagnostics(state: &AppState) -> Value {
     let feature_rollout = &state.runtime.config.feature_rollouts.context_engine;
     let mut recent_traces = state.runtime.context_assembly_traces_snapshot();
@@ -963,6 +1065,10 @@ fn collect_console_context_engine_diagnostics(state: &AppState) -> Value {
     })
 }
 
+/// Strips context-assembly trace fields that can carry user content: the
+/// cache scope key is replaced by its SHA-256 hash (still correlatable, no
+/// longer reversible), and segment previews/source refs collapse into
+/// redaction markers plus counts.
 fn sanitize_context_engine_trace_for_console(trace: &mut Value) {
     if let Some(cache) = trace.get_mut("cache").and_then(Value::as_object_mut) {
         if let Some(cache_scope_key) = cache.remove("cache_scope_key") {
@@ -996,6 +1102,8 @@ fn sanitize_context_engine_trace_for_console(trace: &mut Value) {
     }
 }
 
+/// Summarizes the requesting principal's objectives by state and kind, with
+/// a small most-recent sample.
 #[allow(clippy::result_large_err)]
 fn collect_console_objectives_diagnostics(
     state: &AppState,
@@ -1036,6 +1144,9 @@ fn collect_console_objectives_diagnostics(
     }))
 }
 
+/// Summarizes the principal's non-terminal flows: state rollups, step-level
+/// blocked/retrying/waiting counters, runtime and rollout settings, and a
+/// recent-flow sample with delivery progress.
 #[allow(clippy::result_large_err)]
 async fn collect_console_flows_diagnostics(
     state: &AppState,
@@ -1073,6 +1184,9 @@ async fn collect_console_flows_diagnostics(
     let mut timed_out_steps = 0_u64;
     let mut waiting_steps = 0_u64;
     let mut recent = Vec::new();
+    // Step-level counters are sampled from the 10 most recent flows only;
+    // hydrating a full bundle per flow is too expensive for a diagnostics
+    // snapshot.
     for flow in flows.iter().take(10) {
         let Some(bundle) = state
             .runtime
@@ -1145,6 +1259,9 @@ async fn collect_console_flows_diagnostics(
     }))
 }
 
+/// Probes the browser service health (when enabled) and merges journal-based
+/// relay failure metrics into a redacted browser diagnostics block; probe
+/// failures become counted samples instead of errors.
 pub(crate) async fn collect_console_browser_diagnostics(state: &AppState) -> Value {
     let mut failure_messages = Vec::<String>::new();
     let (relay_failures, relay_failure_messages) =
@@ -1194,9 +1311,7 @@ pub(crate) async fn collect_console_browser_diagnostics(state: &AppState) -> Val
         }
     }
 
-    while failure_messages.len() > 5 {
-        failure_messages.pop();
-    }
+    failure_messages.truncate(5);
 
     let mut payload = json!({
         "enabled": state.browser_service_config.enabled,
@@ -1221,6 +1336,10 @@ pub(crate) async fn collect_console_browser_diagnostics(state: &AppState) -> Val
     payload
 }
 
+/// Summarizes installed skills: publishers, trust decisions, per-skill
+/// runtime activation states, missing secrets, and dynamic-tool-builder
+/// candidate counts. Index load failures degrade to an error field so the
+/// diagnostics snapshot stays available.
 pub(crate) async fn collect_console_skills_diagnostics(state: &AppState) -> Value {
     let skills_root = match resolve_skills_root() {
         Ok(path) => path,
@@ -1287,9 +1406,7 @@ pub(crate) async fn collect_console_skills_diagnostics(state: &AppState) -> Valu
         }
     }
 
-    while runtime_errors.len() > 5 {
-        runtime_errors.pop();
-    }
+    runtime_errors.truncate(5);
 
     json!({
         "skills_root": skills_root,
@@ -1322,6 +1439,8 @@ pub(crate) async fn collect_console_skills_diagnostics(state: &AppState) -> Valu
     })
 }
 
+/// Summarizes plugin bindings from the on-disk bindings index: enablement,
+/// discovery/config validation states, and capability drift counts.
 pub(crate) fn collect_console_plugins_diagnostics() -> Value {
     let plugins_root = match plugins::resolve_plugins_root() {
         Ok(path) => path,
@@ -1390,6 +1509,8 @@ pub(crate) fn collect_console_plugins_diagnostics() -> Value {
     })
 }
 
+/// Summarizes hook bindings from the on-disk bindings index: enablement
+/// totals and the distinct event kinds with at least one binding.
 pub(crate) fn collect_console_hooks_diagnostics() -> Value {
     let hooks_root = match hooks::resolve_hooks_root() {
         Ok(path) => path,
@@ -1424,6 +1545,9 @@ pub(crate) fn collect_console_hooks_diagnostics() -> Value {
     })
 }
 
+/// Serializes the typed deployment posture summary, degrading to a minimal
+/// inline payload (never an error) so diagnostics stay available even when
+/// the typed encoding fails.
 pub(crate) fn collect_console_deployment_diagnostics(state: &AppState) -> Value {
     serde_json::to_value(build_deployment_posture_summary(state)).unwrap_or_else(|_| {
         json!({
@@ -1435,6 +1559,18 @@ pub(crate) fn collect_console_deployment_diagnostics(state: &AppState) -> Value 
     })
 }
 
+// Observability payload builders. These compose the "observability" branch of
+// the diagnostics snapshot from provider auth, connectors, browser relay,
+// support bundles, doctor recovery, self-healing, and triage guidance.
+
+/// Builds the `observability` branch of the diagnostics snapshot for the
+/// requesting context, combining provider-auth metrics, operator insights,
+/// connector and browser health, support-bundle and doctor state, recent
+/// failures, and static triage guidance.
+///
+/// # Errors
+/// Returns an error `Response` when operator insights or connector snapshots
+/// cannot be collected.
 pub(crate) async fn build_observability_payload(
     state: &AppState,
     context: &gateway::RequestContext,
@@ -1504,6 +1640,9 @@ pub(crate) async fn build_observability_payload(
     }))
 }
 
+/// Aggregates config-ref (secret reference) health: per-ref status and
+/// severity items, reload-action rollups, deduplicated operator
+/// recommendations, and an overall state derived from the worst severity.
 pub(crate) fn build_config_ref_health_observability(state: &AppState) -> Value {
     let snapshot = super::secrets::configured_secrets_snapshot(state);
     let reload_state = state.reload_state.lock().unwrap_or_else(|error| error.into_inner());
@@ -1621,6 +1760,8 @@ pub(crate) fn build_config_ref_health_observability(state: &AppState) -> Value {
 
     let migration_severity =
         config_migration.get("severity").and_then(Value::as_str).unwrap_or("info");
+    // Overall state is the worst severity observed across refs, the migration
+    // check, and the latest reload plan; warnings never mask blocking refs.
     let overall = if blocking_refs > 0 || migration_severity == "blocking" {
         ("blocking", "blocking")
     } else if warning_refs > 0
@@ -1667,8 +1808,13 @@ pub(crate) fn build_config_ref_health_observability(state: &AppState) -> Value {
     })
 }
 
+/// Checks whether the active config file needs schema migration; running on
+/// defaults (no file) or an unreadable file reports advisory states with
+/// operator advice instead of failing.
 fn current_config_migration_observability(state: &AppState) -> Value {
     let loaded = state.loaded_config.lock().unwrap_or_else(|error| error.into_inner()).clone();
+    // The loaded-config source string may carry an " +env(...)" suffix listing
+    // env overrides; only the file path portion matters here.
     let source_path = loaded
         .source
         .split(" +env(")
@@ -1727,6 +1873,9 @@ fn current_config_migration_observability(state: &AppState) -> Value {
     }
 }
 
+/// Maps one config-ref status to a `(severity, operator advice)` pair, taking
+/// the ref's reload action, source kind, and last error kind into account.
+/// The advice strings are wire-visible and pinned by tests; do not reword.
 fn config_ref_item_guidance(
     entry: &control_plane::ConfiguredSecretRecord,
     active_runs: u64,
@@ -1844,6 +1993,9 @@ fn config_ref_reload_event_observability(
     })
 }
 
+/// Builds the provider-auth observability block from the auth snapshot
+/// payload, falling back to in-process counters when the payload lacks
+/// refresh metrics.
 pub(crate) fn build_provider_auth_observability(
     auth_payload: &Value,
     observability: &ObservabilityState,
@@ -1875,6 +2027,12 @@ pub(crate) fn build_provider_auth_observability(
     })
 }
 
+/// Rolls up connector queue depth, dead letters, pauses, actionable
+/// degradations, and recent upload failures across all channels.
+///
+/// # Errors
+/// Returns an error `Response` (boxed to keep the `Result` small) when the
+/// channel platform rejects a list or snapshot query.
 pub(crate) fn build_connector_observability(
     state: &AppState,
     media_payload: &Value,
@@ -1923,6 +2081,9 @@ pub(crate) fn build_connector_observability(
         .and_then(Value::as_array)
         .map(|entries| entries.len() as u64)
         .unwrap_or(0);
+    // Upload failures have no attempt denominator in this snapshot, so the
+    // rate is binary; the "upload_failure_rate_basis" field tells consumers
+    // how to interpret it.
     let upload_failure_rate_bps = if upload_failures > 0 { 10_000 } else { 0 };
     Ok(json!({
         "connectors": connector_count,
@@ -1937,6 +2098,9 @@ pub(crate) fn build_connector_observability(
     }))
 }
 
+/// True when a connector's state should count as an operator-actionable
+/// degradation. Disabled or non-supported (internal/test-only) connectors
+/// never count, so fresh installs are not reported as degraded.
 fn connector_has_actionable_degradation(
     connector: &palyra_connectors::ConnectorStatusSnapshot,
     runtime: Option<&Value>,
@@ -1956,6 +2120,9 @@ fn connector_has_actionable_degradation(
             .is_some_and(|error| !error.trim().is_empty())
 }
 
+/// Computes browser relay action attempt/failure metrics from the recent
+/// journal window, with up to five sanitized failure samples; journal errors
+/// degrade to a zeroed payload carrying an error field.
 pub(crate) async fn collect_console_browser_action_diagnostics(state: &AppState) -> Value {
     let snapshot = match state.runtime.recent_journal_snapshot(256).await {
         Ok(snapshot) => snapshot,
@@ -2010,6 +2177,9 @@ pub(crate) async fn collect_console_browser_action_diagnostics(state: &AppState)
     })
 }
 
+/// Builds the support-bundle observability block: export attempt metrics,
+/// workspace restore state, the health-graph and collector contracts, replay
+/// metadata, operator runbooks, and the latest export job.
 pub(crate) fn build_support_bundle_observability(state: &AppState) -> Value {
     let summary = state.observability.support_bundle_snapshot();
     let runtime_preview = serde_json::to_value(state.observability.runtime_decision_snapshot())
@@ -2024,6 +2194,8 @@ pub(crate) fn build_support_bundle_observability(state: &AppState) -> Value {
         "attempts": summary.attempts,
         "successes": summary.successes,
         "failures": summary.failures,
+        // No attempts yet means nothing has failed; report a perfect rate
+        // instead of a misleading zero.
         "success_rate_bps": if summary.attempts == 0 {
             10_000
         } else {
@@ -2054,6 +2226,8 @@ pub(crate) fn build_support_bundle_observability(state: &AppState) -> Value {
     })
 }
 
+/// Describes the health-graph inputs a support bundle captures (components,
+/// critical-path metrics, maintenance registry) plus its redaction posture.
 fn build_support_bundle_health_graph_observability(state: &AppState) -> Value {
     let counters = state.runtime.counters.snapshot();
     let runtime_preview = state.observability.runtime_decision_snapshot();
@@ -2112,6 +2286,8 @@ fn build_support_bundle_health_graph_observability(state: &AppState) -> Value {
     })
 }
 
+/// Summarizes runtime queue/pruning/flow/worker state for support bundles,
+/// pointing each area at its authoritative console endpoint.
 fn build_runtime_support_observability(state: &AppState, networked_workers: &Value) -> Value {
     let support_jobs = lock_support_bundle_jobs(&state.support_bundle_jobs);
     let mut support_jobs_by_state = std::collections::BTreeMap::<String, u64>::new();
@@ -2159,6 +2335,8 @@ fn build_runtime_support_observability(state: &AppState, networked_workers: &Val
     })
 }
 
+/// Static operator runbooks keyed by failure mode; rendered verbatim by the
+/// dashboard and included in support bundles.
 fn build_operator_runbooks_observability() -> Value {
     json!([
         {
@@ -2230,6 +2408,8 @@ fn build_operator_runbooks_observability() -> Value {
     ])
 }
 
+/// Static incident checklists (first response, promotion/rollback) rendered
+/// verbatim by the dashboard.
 fn build_incident_checklists_observability() -> Value {
     json!([
         {
@@ -2255,6 +2435,8 @@ fn build_incident_checklists_observability() -> Value {
     ])
 }
 
+/// Static replay-bundle support metadata: contract snapshot, CLI workflows,
+/// gate profiles, and the offline incident workflow.
 fn build_replay_support_observability() -> Value {
     json!({
         "contract": replay_contract_snapshot(),
@@ -2297,6 +2479,9 @@ fn build_replay_support_observability() -> Value {
     })
 }
 
+/// Summarizes workspace checkpoint/restore activity from the journal; each
+/// query failure degrades to an error field on the partial payload built so
+/// far rather than dropping the whole block.
 fn build_workspace_restore_observability(state: &AppState) -> Value {
     let summary = match state.runtime.journal_store.summarize_workspace_restore_activity(
         &crate::journal::WorkspaceRestoreActivityFilter::default(),
@@ -2425,6 +2610,8 @@ fn workspace_restore_report_support_summary(
     })
 }
 
+/// Summarizes doctor recovery jobs by state with a redacted view of the most
+/// recently requested job.
 pub(crate) fn build_doctor_recovery_observability(state: &AppState) -> Value {
     let jobs = lock_doctor_jobs(&state.doctor_jobs);
     let mut queued = 0_u64;
@@ -2452,6 +2639,9 @@ pub(crate) fn build_doctor_recovery_observability(state: &AppState) -> Value {
     })
 }
 
+/// Projects a doctor job into the console summary shape; report fields are
+/// pulled out of the job's recovery JSON, and the raw idempotency key is
+/// never echoed (only its presence).
 fn build_doctor_recovery_job_summary(job: &control_plane::DoctorRecoveryJob) -> Value {
     let report = job.report.as_ref();
     let recovery = report.and_then(|value| value.get("recovery"));
@@ -2519,6 +2709,8 @@ fn build_doctor_recovery_job_summary(job: &control_plane::DoctorRecoveryJob) -> 
     })
 }
 
+/// Counts recent failures per failure class (config, upstream provider,
+/// product) for the triage view.
 pub(crate) fn build_failure_class_summary(failures: &[observability::FailureSnapshot]) -> Value {
     let mut config = 0_u64;
     let mut upstream = 0_u64;
@@ -2537,6 +2729,10 @@ pub(crate) fn build_failure_class_summary(failures: &[observability::FailureSnap
     })
 }
 
+/// Builds an observability correlation snapshot from console request inputs.
+/// Console requests are not tied to chat sessions, so the session id is
+/// intentionally absent and the request context contributes nothing today;
+/// the parameter stays for call-site stability.
 pub(crate) fn auth_correlation_from_context(
     context: &RequestContext,
     auth_profile_id: Option<&str>,
@@ -2556,6 +2752,9 @@ pub(crate) fn auth_correlation_from_context(
     }
 }
 
+/// Records a provider-auth failure in observability, optionally double
+/// counting it as a refresh failure when the failed operation was a token
+/// refresh.
 pub(crate) fn record_provider_auth_failure(
     state: &AppState,
     operation: &str,
@@ -2584,6 +2783,9 @@ pub(crate) fn record_provider_auth_failure(
     }
 }
 
+/// Maps an HTTP status to a failure class: gateway-style 5xx statuses blame
+/// the upstream provider, other client errors blame configuration, and
+/// everything else is a product failure.
 pub(crate) fn classify_console_mutation_failure(status: StatusCode) -> FailureClass {
     match status {
         StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT => {
@@ -2594,12 +2796,16 @@ pub(crate) fn classify_console_mutation_failure(status: StatusCode) -> FailureCl
     }
 }
 
+/// Returns the control-plane contract descriptor embedded in every console
+/// response envelope.
 pub(crate) fn contract_descriptor() -> control_plane::ContractDescriptor {
     control_plane::ContractDescriptor {
         contract_version: control_plane::CONTROL_PLANE_CONTRACT_VERSION.to_owned(),
     }
 }
 
+/// Builds the standard pagination metadata for console list responses;
+/// `has_more` is derived purely from cursor presence.
 pub(crate) fn build_page_info(
     limit: usize,
     returned: usize,
@@ -2608,6 +2814,9 @@ pub(crate) fn build_page_info(
     control_plane::PageInfo { limit, returned, has_more: next_cursor.is_some(), next_cursor }
 }
 
+/// Builds the typed deployment posture summary shared by the diagnostics and
+/// posture endpoints: bind addresses, TLS state, remote-bind detection, the
+/// last remote admin access attempt, and operator warnings.
 pub(crate) fn build_deployment_posture_summary(
     state: &AppState,
 ) -> control_plane::DeploymentPostureSummary {
@@ -2623,6 +2832,8 @@ pub(crate) fn build_deployment_posture_summary(
                 status_code: attempt.status_code,
                 outcome: attempt.outcome,
             });
+    // A bind address that fails to parse is treated as remote: fail toward
+    // the stricter posture rather than silently reporting loopback.
     let admin_remote = !state
         .deployment
         .admin_bind_addr
@@ -2694,7 +2905,12 @@ pub(crate) fn build_deployment_posture_summary(
     }
 }
 
-#[allow(clippy::result_large_err)]
+// Auth profile conversions shared by the console auth handlers: free-form
+// request text <-> proto enums <-> control-plane views. The lowercase enum
+// text values here are wire contract.
+
+/// Parses a free-form provider kind string; unknown or empty input maps to
+/// `Unspecified`, which callers treat as "no filter".
 pub(crate) fn parse_console_auth_provider_kind(
     raw: Option<&str>,
 ) -> gateway::proto::palyra::auth::v1::AuthProviderKind {
@@ -2713,7 +2929,8 @@ pub(crate) fn parse_console_auth_provider_kind(
     }
 }
 
-#[allow(clippy::result_large_err)]
+/// Parses a free-form scope kind string; unknown or empty input maps to
+/// `Unspecified`, which callers treat as "no filter".
 pub(crate) fn parse_console_auth_scope_kind(
     raw: Option<&str>,
 ) -> gateway::proto::palyra::auth::v1::AuthScopeKind {
@@ -2727,6 +2944,8 @@ pub(crate) fn parse_console_auth_scope_kind(
     }
 }
 
+/// Builds an in-process auth gRPC service so console handlers reuse the
+/// gateway implementation instead of duplicating auth logic over HTTP.
 pub(crate) fn build_console_auth_service(state: &AppState) -> gateway::AuthServiceImpl {
     gateway::AuthServiceImpl::new(
         Arc::clone(&state.runtime),
@@ -2735,10 +2954,19 @@ pub(crate) fn build_console_auth_service(state: &AppState) -> gateway::AuthServi
     )
 }
 
+/// Builds an in-process vault gRPC service for console secret-metadata
+/// lookups; see [`build_console_auth_service`] for the rationale.
 pub(crate) fn build_console_vault_service(state: &AppState) -> gateway::VaultServiceImpl {
     gateway::VaultServiceImpl::new(Arc::clone(&state.runtime), state.auth.clone())
 }
 
+/// Converts a proto auth profile into the control-plane view exposed over
+/// `/console/v1`; credential fields carry vault references only, never
+/// secret material.
+///
+/// # Errors
+/// Returns an internal-error `Response` when required proto sub-messages
+/// (provider, scope, credential) are missing.
 #[allow(clippy::result_large_err)]
 pub(crate) fn control_plane_auth_profile_from_proto(
     profile: &gateway::proto::palyra::auth::v1::AuthProfile,
@@ -2801,6 +3029,12 @@ pub(crate) fn control_plane_auth_profile_from_proto(
     })
 }
 
+/// Converts a control-plane auth profile view back into its proto form for
+/// in-process gateway service calls.
+///
+/// # Errors
+/// Returns a validation-error `Response` for unknown provider or scope kind
+/// text.
 #[allow(clippy::result_large_err)]
 pub(crate) fn control_plane_auth_profile_to_proto(
     profile: &control_plane::AuthProfileView,
@@ -2858,6 +3092,8 @@ pub(crate) fn control_plane_auth_profile_to_proto(
     })
 }
 
+/// Maps a proto provider kind to its wire text; unknown values become
+/// "unspecified".
 pub(crate) fn auth_provider_kind_to_text(value: i32) -> &'static str {
     match gateway::proto::palyra::auth::v1::AuthProviderKind::try_from(value)
         .unwrap_or(gateway::proto::palyra::auth::v1::AuthProviderKind::Unspecified)
@@ -2873,6 +3109,12 @@ pub(crate) fn auth_provider_kind_to_text(value: i32) -> &'static str {
     }
 }
 
+/// Parses provider kind wire text into the proto enum. Unlike
+/// [`parse_console_auth_provider_kind`], unknown text is a validation error
+/// because callers are persisting, not filtering.
+///
+/// # Errors
+/// Returns a validation-error `Response` listing the accepted values.
 #[allow(clippy::result_large_err)]
 pub(crate) fn auth_provider_kind_from_text(
     raw: &str,
@@ -2893,6 +3135,8 @@ pub(crate) fn auth_provider_kind_from_text(
     }
 }
 
+/// Maps a proto scope kind to its wire text; unknown values become
+/// "unspecified".
 pub(crate) fn auth_scope_kind_to_text(value: i32) -> &'static str {
     match gateway::proto::palyra::auth::v1::AuthScopeKind::try_from(value)
         .unwrap_or(gateway::proto::palyra::auth::v1::AuthScopeKind::Unspecified)
@@ -2903,6 +3147,11 @@ pub(crate) fn auth_scope_kind_to_text(value: i32) -> &'static str {
     }
 }
 
+/// Parses scope kind wire text into the proto enum; unknown text is a
+/// validation error.
+///
+/// # Errors
+/// Returns a validation-error `Response` listing the accepted values.
 #[allow(clippy::result_large_err)]
 pub(crate) fn auth_scope_kind_from_text(
     raw: &str,
@@ -2918,6 +3167,7 @@ pub(crate) fn auth_scope_kind_from_text(
     }
 }
 
+/// Projects OAuth refresh bookkeeping into the console JSON shape.
 pub(crate) fn auth_oauth_refresh_state_json(
     refresh_state: &gateway::proto::palyra::auth::v1::OAuthRefreshState,
 ) -> Value {
@@ -2930,6 +3180,12 @@ pub(crate) fn auth_oauth_refresh_state_json(
     })
 }
 
+/// Rebuilds the proto OAuth refresh state from its console JSON form;
+/// missing or mistyped fields default to zero/empty rather than failing.
+///
+/// # Errors
+/// Currently never fails; the `Result` keeps parity with the other proto
+/// conversion helpers.
 #[allow(clippy::result_large_err)]
 pub(crate) fn auth_oauth_refresh_state_from_json(
     refresh_state: &Value,
@@ -2960,6 +3216,10 @@ pub(crate) fn auth_oauth_refresh_state_from_json(
     })
 }
 
+// Projections of proto auth health/metrics messages into the console JSON
+// shapes; absent optional summaries serialize as empty objects, not null.
+
+/// Projects the auth health summary counts; `None` becomes an empty object.
 pub(crate) fn auth_health_summary_json(
     summary: Option<&gateway::proto::palyra::auth::v1::AuthHealthSummary>,
 ) -> Value {
@@ -2977,6 +3237,7 @@ pub(crate) fn auth_health_summary_json(
         .unwrap_or_else(|| json!({}))
 }
 
+/// Projects the credential expiry histogram; `None` becomes an empty object.
 pub(crate) fn auth_expiry_distribution_json(
     summary: Option<&gateway::proto::palyra::auth::v1::AuthExpiryDistribution>,
 ) -> Value {
@@ -2997,6 +3258,8 @@ pub(crate) fn auth_expiry_distribution_json(
         .unwrap_or_else(|| json!({}))
 }
 
+/// Projects one profile's health record; a zero expiry timestamp serializes
+/// as null because the proto uses zero for "unknown".
 pub(crate) fn auth_profile_health_json(
     profile: &gateway::proto::palyra::auth::v1::AuthProfileHealth,
 ) -> Value {
@@ -3025,6 +3288,8 @@ pub(crate) fn auth_profile_health_json(
     })
 }
 
+/// Projects refresh attempt metrics with per-provider breakdown; `None`
+/// becomes an empty object.
 pub(crate) fn auth_refresh_metrics_json(
     metrics: Option<&gateway::proto::palyra::auth::v1::AuthRefreshMetrics>,
 ) -> Value {
@@ -3045,6 +3310,12 @@ pub(crate) fn auth_refresh_metrics_json(
         .unwrap_or_else(|| json!({}))
 }
 
+/// Lists auth profiles for a provider kind through the in-process gateway
+/// service.
+///
+/// # Errors
+/// Returns an error `Response` when the RPC context cannot be applied, the
+/// gateway call fails, or a returned profile is structurally incomplete.
 pub(crate) async fn list_console_auth_profiles(
     state: &AppState,
     session: &ConsoleSession,
@@ -3053,6 +3324,11 @@ pub(crate) async fn list_console_auth_profiles(
     list_console_auth_profiles_with_custom_name(state, session, provider_kind, "").await
 }
 
+/// Lists profiles for a named custom provider; see
+/// [`list_console_auth_profiles`] for error behavior.
+///
+/// # Errors
+/// Same as [`list_console_auth_profiles`].
 pub(crate) async fn list_console_custom_auth_profiles(
     state: &AppState,
     session: &ConsoleSession,
@@ -3067,6 +3343,11 @@ pub(crate) async fn list_console_custom_auth_profiles(
     .await
 }
 
+/// Shared implementation behind the profile listing helpers; fetches up to
+/// 256 profiles in one page (the console does not paginate profiles).
+///
+/// # Errors
+/// Same as [`list_console_auth_profiles`].
 pub(crate) async fn list_console_auth_profiles_with_custom_name(
     state: &AppState,
     session: &ConsoleSession,
@@ -3096,6 +3377,7 @@ pub(crate) async fn list_console_auth_profiles_with_custom_name(
     response.profiles.iter().map(control_plane_auth_profile_from_proto).collect()
 }
 
+/// Builds the standard envelope returned by provider auth action endpoints.
 pub(crate) fn provider_action_envelope(
     provider: &str,
     action: &str,
@@ -3113,6 +3395,8 @@ pub(crate) fn provider_action_envelope(
     }
 }
 
+/// Convenience wrapper around [`provider_action_envelope`] for the OpenAI
+/// provider endpoints.
 pub(crate) fn openai_provider_action_envelope(
     action: &str,
     state: &str,
@@ -3122,6 +3406,9 @@ pub(crate) fn openai_provider_action_envelope(
     provider_action_envelope("openai", action, state, message, profile_id)
 }
 
+/// True when the config document both selects an auth profile and targets
+/// the given provider, either via an explicit auth provider kind or implied
+/// by the configured model-provider kind.
 fn provider_selection_matches(
     document: &toml::Value,
     provider: ModelProviderAuthProviderKind,
@@ -3155,6 +3442,10 @@ fn provider_selection_matches(
     configured_provider == Some(provider)
 }
 
+/// Derives a provider's auth state envelope from the active config document:
+/// whether a profile is selected, whether an API key (vault ref or inline) is
+/// configured, which OAuth-style actions the provider supports, and the
+/// operator-facing migration note.
 pub(crate) fn build_provider_state(
     document: &toml::Value,
     profiles: Vec<control_plane::AuthProfileView>,
@@ -3232,6 +3523,7 @@ pub(crate) fn build_provider_state(
     }
 }
 
+/// Convenience wrapper around [`build_provider_state`] for OpenAI.
 pub(crate) fn build_openai_provider_state(
     document: &toml::Value,
     profiles: Vec<control_plane::AuthProfileView>,
@@ -3239,6 +3531,15 @@ pub(crate) fn build_openai_provider_state(
     build_provider_state(document, profiles, ModelProviderAuthProviderKind::Openai)
 }
 
+// Console config document helpers: path resolution, load-with-migration,
+// backups, and daemon-compatibility validation reused by the config
+// inspect/mutate endpoints.
+
+/// Loads and migration-parses an existing config file.
+///
+/// # Errors
+/// Returns an internal-error `Response` when the file cannot be read and an
+/// invalid-argument one when it cannot be parsed/migrated.
 #[allow(clippy::result_large_err)]
 pub(crate) fn load_console_document_from_existing_path(
     path: &FsPath,
@@ -3257,6 +3558,11 @@ pub(crate) fn load_console_document_from_existing_path(
     })
 }
 
+/// Loads a config document for mutation, starting from an empty document
+/// when the file does not exist yet (first console-driven write).
+///
+/// # Errors
+/// Same as [`load_console_document_from_existing_path`] for existing files.
 #[allow(clippy::result_large_err)]
 pub(crate) fn load_console_document_for_mutation(
     path: &FsPath,
@@ -3271,6 +3577,13 @@ pub(crate) fn load_console_document_for_mutation(
     })
 }
 
+/// Resolves the config path for console config operations: explicit request
+/// path first, then the `PALYRA_CONFIG` env var, then the first existing
+/// default search path. `Ok(None)` means "no config file" (defaults).
+///
+/// # Errors
+/// Returns an invalid-argument `Response` for unparsable paths and, with
+/// `require_existing`, a not-found one when the resolved file is missing.
 #[allow(clippy::result_large_err)]
 pub(crate) fn resolve_console_config_path(
     path: Option<&str>,
@@ -3315,6 +3628,13 @@ pub(crate) fn resolve_console_config_path(
     Ok(resolved)
 }
 
+/// Loads the active config document plus migration info, reporting the
+/// source as a path or the literal "defaults" when no file exists and
+/// `allow_defaults` is set.
+///
+/// # Errors
+/// Returns a not-found `Response` when no config exists and defaults are not
+/// allowed, or load/parse errors from the underlying helpers.
 #[allow(clippy::result_large_err)]
 pub(crate) fn load_console_config_snapshot(
     path: Option<&str>,
@@ -3340,6 +3660,12 @@ pub(crate) fn load_console_config_snapshot(
     }
 }
 
+/// Enumerates numbered backup slots for a config path with their existence
+/// state; the "defaults" pseudo-path has no backups by definition.
+///
+/// # Errors
+/// Returns a not-found `Response` when `require_existing` is set and the
+/// config file is missing.
 #[allow(clippy::result_large_err)]
 pub(crate) fn config_backup_records(
     path: Option<&str>,
@@ -3367,6 +3693,13 @@ pub(crate) fn config_backup_records(
         .collect())
 }
 
+/// Round-trips the document through the daemon config schema and validates
+/// every configured bind socket, so a console mutation can never persist a
+/// config the daemon would fail to boot with.
+///
+/// # Errors
+/// Returns an invalid-argument `Response` for schema or bind-socket
+/// violations and an internal one when the document cannot be re-serialized.
 #[allow(clippy::result_large_err)]
 pub(crate) fn validate_daemon_compatible_document(document: &toml::Value) -> Result<(), Response> {
     let content = toml::to_string(document).map_err(|error| {
@@ -3423,6 +3756,11 @@ pub(crate) fn validate_daemon_compatible_document(document: &toml::Value) -> Res
     Ok(())
 }
 
+/// Reads the selected model-provider auth profile id from a config file.
+///
+/// # Errors
+/// Returns an error `Response` when the file cannot be loaded or the key
+/// path is invalid.
 #[allow(clippy::result_large_err)]
 pub(crate) fn read_console_config_profile_id(path: &str) -> Result<Option<String>, Response> {
     let (document, _) = load_console_document_from_existing_path(FsPath::new(path))?;
@@ -3436,6 +3774,12 @@ pub(crate) fn read_console_config_profile_id(path: &str) -> Result<Option<String
         .map(str::to_owned))
 }
 
+/// Fetches metadata for one vault secret via the in-process vault service;
+/// only metadata crosses this boundary, never the secret value.
+///
+/// # Errors
+/// Returns a validation-error `Response` for blank scope/key, a not-found
+/// one when the key is absent, and gateway errors otherwise.
 pub(crate) async fn secret_metadata_from_runtime(
     state: &AppState,
     session: &ConsoleSession,
@@ -3472,6 +3816,7 @@ pub(crate) async fn secret_metadata_from_runtime(
         })
 }
 
+/// Converts proto vault secret metadata into the control-plane view.
 pub(crate) fn control_plane_secret_metadata_from_proto(
     secret: &gateway::proto::palyra::gateway::v1::VaultSecretMetadata,
 ) -> control_plane::SecretMetadata {
@@ -3484,6 +3829,8 @@ pub(crate) fn control_plane_secret_metadata_from_proto(
     }
 }
 
+/// Converts a channel pairing snapshot into the control-plane view exposed
+/// by the pairing endpoints.
 pub(crate) fn control_plane_pairing_snapshot_from_runtime(
     snapshot: &channel_router::ChannelPairingSnapshot,
 ) -> control_plane::PairingChannelSnapshot {
@@ -3526,18 +3873,28 @@ pub(crate) fn control_plane_pairing_snapshot_from_runtime(
     }
 }
 
+// Support-bundle export and doctor recovery jobs: in-memory job maps mutated
+// by detached background tasks that shell out to the palyra CLI with a
+// minimal pinned environment.
+
+/// Locks the support-bundle job map, recovering from poisoning (a panicked
+/// writer leaves individual job records intact and readable).
 pub(crate) fn lock_support_bundle_jobs(
     jobs: &Arc<Mutex<HashMap<String, control_plane::SupportBundleJob>>>,
 ) -> std::sync::MutexGuard<'_, HashMap<String, control_plane::SupportBundleJob>> {
     jobs.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Locks the doctor job map; same poisoning posture as
+/// [`lock_support_bundle_jobs`].
 pub(crate) fn lock_doctor_jobs(
     jobs: &Arc<Mutex<HashMap<String, control_plane::DoctorRecoveryJob>>>,
 ) -> std::sync::MutexGuard<'_, HashMap<String, control_plane::DoctorRecoveryJob>> {
     jobs.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Lists support-bundle jobs ordered by job id (ULIDs, so creation order)
+/// with cursor pagination via `after_job_id`.
 pub(crate) fn list_support_bundle_jobs(
     state: &AppState,
     after_job_id: Option<&str>,
@@ -3553,6 +3910,8 @@ pub(crate) fn list_support_bundle_jobs(
         .collect()
 }
 
+/// Lists doctor jobs visible to the requesting context (requester-scoped),
+/// ordered by job id with cursor pagination via `after_job_id`.
 pub(crate) fn list_doctor_jobs(
     state: &AppState,
     context: &gateway::RequestContext,
@@ -3570,6 +3929,8 @@ pub(crate) fn list_doctor_jobs(
         .collect()
 }
 
+/// True when a doctor job belongs to the requesting principal, device, and
+/// channel; doctor jobs are never visible across requester boundaries.
 pub(crate) fn doctor_job_matches_requester(
     job: &control_plane::DoctorRecoveryJob,
     context: &gateway::RequestContext,
@@ -3579,10 +3940,15 @@ pub(crate) fn doctor_job_matches_requester(
         && job.requested_channel == context.channel
 }
 
+/// Hashes the caller-supplied idempotency key so the raw value (which may be
+/// secret-like) is never stored in job records or echoed back.
 fn doctor_idempotency_key_digest(raw_key: &str) -> String {
     format!("sha256:{}", crate::sha256_hex(raw_key.as_bytes()))
 }
 
+/// True when an existing job may be reused for an idempotent doctor request:
+/// same key digest, same command, and same requester boundary, so one
+/// operator's idempotency key can never replay another's job.
 fn doctor_job_matches_idempotency_boundary(
     job: &control_plane::DoctorRecoveryJob,
     idempotency_key_digest: &str,
@@ -3594,6 +3960,11 @@ fn doctor_job_matches_idempotency_boundary(
         && doctor_job_matches_requester(job, context)
 }
 
+/// Queues a support-bundle export job and spawns its background runner.
+///
+/// # Errors
+/// Returns an internal-error `Response` when the system clock cannot be
+/// read.
 #[allow(clippy::result_large_err)]
 pub(crate) fn create_support_bundle_job(
     state: &AppState,
@@ -3625,6 +3996,8 @@ pub(crate) fn create_support_bundle_job(
     let admin_port = state.deployment.admin_port;
     let admin_token = state.auth.admin_token.clone();
     let observability = Arc::clone(&state.observability);
+    // Detached by design: the export outlives the HTTP request and reports
+    // its outcome through the shared job map polled by the job endpoints.
     tokio::spawn(async move {
         run_support_bundle_job(
             jobs,
@@ -3640,6 +4013,14 @@ pub(crate) fn create_support_bundle_job(
     Ok(job)
 }
 
+/// Background body of a support-bundle export job: marks the record running,
+/// shells out to the CLI exporter, records the outcome in observability, and
+/// prunes the job map down to `retain_jobs` entries.
+// AIDEV-NOTE: retention prunes the oldest jobs by request time regardless of
+// state, so under concurrent exports a still-running job's record can be
+// evicted before it completes (its final update is then lost); fixing this
+// requires skipping non-terminal jobs during pruning. Same pattern in
+// run_doctor_job below.
 pub(crate) async fn run_support_bundle_job(
     jobs: Arc<Mutex<HashMap<String, control_plane::SupportBundleJob>>>,
     observability: Arc<ObservabilityState>,
@@ -3700,6 +4081,14 @@ pub(crate) async fn run_support_bundle_job(
     }
 }
 
+/// Queues a doctor recovery job and spawns its background runner. When the
+/// request carries an idempotency key, an existing job with the same key
+/// digest, command, and requester boundary is returned instead of starting a
+/// duplicate run.
+///
+/// # Errors
+/// Returns an internal-error `Response` when the clock cannot be read or the
+/// support-bundle root cannot be resolved.
 #[allow(clippy::result_large_err)]
 pub(crate) fn create_doctor_job(
     state: &AppState,
@@ -3767,6 +4156,8 @@ pub(crate) fn create_doctor_job(
     Ok(job)
 }
 
+/// Background body of a doctor recovery job; mirrors
+/// [`run_support_bundle_job`], including its retention behavior.
 pub(crate) async fn run_doctor_job(
     jobs: Arc<Mutex<HashMap<String, control_plane::DoctorRecoveryJob>>>,
     job_id: String,
@@ -3815,6 +4206,8 @@ pub(crate) async fn run_doctor_job(
     }
 }
 
+/// Builds the doctor CLI argv from the typed request; only known flags are
+/// forwarded, so request fields can never inject arbitrary arguments.
 fn build_doctor_command_args(payload: &control_plane::DoctorRecoveryCreateRequest) -> Vec<String> {
     let mut command = vec!["doctor".to_owned(), "--json".to_owned()];
     if payload.repair {
@@ -3841,11 +4234,15 @@ fn build_doctor_command_args(payload: &control_plane::DoctorRecoveryCreateReques
     command
 }
 
+/// Failure outcome of a doctor CLI run: sanitized error plus whatever
+/// sanitized output was captured before the failure.
 struct DoctorCommandFailure {
     error: String,
     command_output: String,
 }
 
+/// Runs the doctor CLI and parses its stdout as the JSON report; stdout and
+/// stderr are sanitized before being stored on the job record.
 async fn run_doctor_command(
     command_args: &[String],
     state_root: &FsPath,
@@ -3858,6 +4255,9 @@ async fn run_doctor_command(
     let mut command = TokioCommand::new(cli_path.as_path());
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
+    // Spawn with a minimal pinned environment: only PATH plus the variables
+    // the CLI needs. This keeps daemon-process secrets out of the child
+    // environment and makes output locale-stable for parsing.
     command.env_clear();
     if let Ok(path) = std::env::var("PATH") {
         command.env("PATH", path);
@@ -3916,6 +4316,12 @@ async fn run_doctor_command(
     Ok((report, command_output))
 }
 
+/// Runs `palyra support-bundle export` against the local daemon and returns
+/// the output path plus sanitized command output.
+///
+/// # Errors
+/// Returns a sanitized message when the CLI cannot be located, the bundle
+/// directory cannot be created, or the export command fails.
 pub(crate) async fn run_support_bundle_export_command(
     admin_port: u16,
     admin_token: Option<String>,
@@ -3942,6 +4348,7 @@ pub(crate) async fn run_support_bundle_export_command(
     let mut command = TokioCommand::new(cli_path.as_path());
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
+    // Minimal pinned environment; see run_doctor_command for the rationale.
     command.env_clear();
     if let Ok(path) = std::env::var("PATH") {
         command.env("PATH", path);
@@ -3990,6 +4397,12 @@ pub(crate) async fn run_support_bundle_export_command(
     Ok((output_path.to_string_lossy().into_owned(), command_output))
 }
 
+/// Locates the `palyra` CLI binary next to the daemon executable, falling
+/// back to `target/{debug,release}` under the executable's ancestors so dev
+/// builds work without installation.
+///
+/// # Errors
+/// Returns a message when no candidate path is an existing file.
 pub(crate) fn resolve_console_cli_binary_path() -> Result<PathBuf, String> {
     if let Ok(current_exe) = std::env::current_exe() {
         let executable_name = if cfg!(windows) { "palyra.exe" } else { "palyra" };
@@ -4010,6 +4423,13 @@ pub(crate) fn resolve_console_cli_binary_path() -> Result<PathBuf, String> {
     Err("unable to locate `palyra` CLI binary near daemon executable".to_owned())
 }
 
+/// Resolves the support-bundle output directory under the state root
+/// (`PALYRA_STATE_ROOT` when set, otherwise derived from the identity store
+/// location).
+///
+/// # Errors
+/// Returns a message for an empty state-root override or when the identity
+/// store root cannot be determined.
 pub(crate) fn resolve_support_bundle_root() -> Result<PathBuf, String> {
     if let Some(raw) = std::env::var_os("PALYRA_STATE_ROOT") {
         if raw.is_empty() {
@@ -4023,6 +4443,13 @@ pub(crate) fn resolve_support_bundle_root() -> Result<PathBuf, String> {
     Ok(state_root.join("support-bundles"))
 }
 
+/// Builds the static capability catalog the dashboard uses to render direct
+/// actions, CLI handoffs, and internal-only capabilities; the entries and
+/// their contract paths are wire contract.
+///
+/// # Errors
+/// Returns an internal-error `Response` only when the system clock cannot be
+/// read.
 #[allow(clippy::result_large_err)]
 pub(crate) fn build_capability_catalog() -> Result<control_plane::CapabilityCatalog, Response> {
     let generated_at_unix_ms = unix_ms_now().map_err(|error| {
@@ -4593,6 +5020,9 @@ pub(crate) fn build_capability_catalog() -> Result<control_plane::CapabilityCata
     })
 }
 
+/// Builds one capability catalog entry; `execution_mode` drives the derived
+/// dashboard exposure ("generated_cli" maps to CLI handoff, "internal" to
+/// internal-only, anything else to a direct action).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn capability_entry(
     id: &str,
@@ -4632,6 +5062,9 @@ pub(crate) fn capability_entry(
     }
 }
 
+/// Counts browser relay action failures in the recent journal window and
+/// collects up to five sanitized failure messages; a journal error becomes a
+/// single sanitized message with a zero count.
 pub(crate) async fn collect_console_browser_relay_failure_metrics(
     state: &AppState,
 ) -> (u64, Vec<String>) {
@@ -4673,6 +5106,14 @@ pub(crate) async fn collect_console_browser_relay_failure_metrics(
     (failures, messages)
 }
 
+/// Recursively redacts a diagnostics JSON value in place before it leaves
+/// the daemon: values under sensitive keys are replaced wholesale, URL-like
+/// keys keep only their non-identifying parts, and error/message-like keys
+/// are scrubbed of auth detail and embedded URL segments.
+///
+/// `key_context` carries the parent object key while descending into arrays
+/// and string leaves so a leaf inherits the sensitivity of the key it sits
+/// under. Pass `None` at the top level.
 pub(crate) fn redact_console_diagnostics_value(value: &mut Value, key_context: Option<&str>) {
     match value {
         Value::Object(map) => {
@@ -4725,6 +5166,11 @@ pub(crate) fn redact_console_diagnostics_value(value: &mut Value, key_context: O
     }
 }
 
+// Console session and cookie plumbing shared by every /console/v1 handler.
+
+/// Derives the console profile badge (label, environment, color, risk level)
+/// from deployment posture; any remote bind or posture warning switches the
+/// console into strict mode.
 fn build_console_profile_context(state: &AppState) -> control_plane::ConsoleProfileContext {
     let deployment = build_deployment_posture_summary(state);
     let remote_like = deployment.remote_bind_detected
@@ -4763,6 +5209,8 @@ fn build_console_profile_context(state: &AppState) -> control_plane::ConsoleProf
     }
 }
 
+/// Builds the session payload returned by login/refresh endpoints, including
+/// the CSRF token the web console must echo on mutating requests.
 pub(crate) fn build_console_session_response(
     state: &AppState,
     session: &ConsoleSession,
@@ -4779,10 +5227,22 @@ pub(crate) fn build_console_session_response(
     }
 }
 
+/// Computes the sliding console session expiry: `now` plus the session TTL.
 pub(crate) fn next_console_session_expiry_unix_ms(now: i64) -> i64 {
     now.saturating_add(i64::try_from(CONSOLE_SESSION_TTL_SECONDS).unwrap_or(i64::MAX) * 1_000)
 }
 
+/// Authorizes a console request from the session cookie, optionally
+/// enforcing the CSRF header for mutating endpoints, and slides the session
+/// expiry on success.
+///
+/// Session tokens are stored hashed, so lookup compares SHA-256 digests, and
+/// the CSRF check is constant-time; neither comparison leaks token material.
+///
+/// # Errors
+/// Returns a permission-denied `Response` for missing or expired sessions
+/// and missing or invalid CSRF tokens, and an internal error when the system
+/// clock cannot be read.
 #[allow(clippy::result_large_err)]
 pub(crate) fn authorize_console_session(
     state: &AppState,
@@ -4801,6 +5261,8 @@ pub(crate) fn authorize_console_session(
         )))
     })?;
     let mut sessions = lock_console_sessions(&state.console_sessions);
+    // Expired sessions are pruned lazily on every authorization pass; there
+    // is no background sweeper.
     sessions.retain(|_, session| session.expires_at_unix_ms > now);
     let session_key = find_hashed_secret_map_key(&sessions, session_token_hash_sha256.as_str())
         .ok_or_else(|| {
@@ -4834,6 +5296,12 @@ pub(crate) fn authorize_console_session(
     Ok(session.clone())
 }
 
+/// Re-issues the session cookie with a refreshed expiry when the request
+/// carries a valid session; returns `Ok(None)` (not an error) otherwise so
+/// callers can attach the header opportunistically.
+///
+/// # Errors
+/// Returns an error `Response` only for clock or cookie-encoding failures.
 #[allow(clippy::result_large_err)]
 pub(crate) fn refresh_console_session_cookie(
     state: &AppState,
@@ -4862,6 +5330,8 @@ pub(crate) fn refresh_console_session_cookie(
     build_console_session_cookie(session_token.as_str(), request_uses_tls(headers)).map(Some)
 }
 
+/// Locks the console session map, recovering from poisoning with a warning;
+/// session records stay individually consistent after a panicked writer.
 pub(crate) fn lock_console_sessions<'a>(
     sessions: &'a Arc<Mutex<HashMap<String, ConsoleSession>>>,
 ) -> std::sync::MutexGuard<'a, HashMap<String, ConsoleSession>> {
@@ -4874,6 +5344,9 @@ pub(crate) fn lock_console_sessions<'a>(
     }
 }
 
+/// True when the request arrived over TLS according to `x-forwarded-proto`;
+/// the daemon terminates plain HTTP itself, so the proxy header is the only
+/// available signal for the cookie `Secure` attribute.
 pub(crate) fn request_uses_tls(headers: &HeaderMap) -> bool {
     headers
         .get("x-forwarded-proto")
@@ -4882,6 +5355,12 @@ pub(crate) fn request_uses_tls(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
+/// Builds the `Set-Cookie` header for a console session: HttpOnly, SameSite
+/// Lax, with `Secure` appended only when the request came over TLS.
+///
+/// # Errors
+/// Returns an internal-error `Response` when the header value cannot be
+/// encoded.
 #[allow(clippy::result_large_err)]
 pub(crate) fn build_console_session_cookie(
     session_id: &str,
@@ -4900,6 +5379,12 @@ pub(crate) fn build_console_session_cookie(
     })
 }
 
+/// Builds the expiring `Set-Cookie` header used by logout to clear the
+/// session cookie.
+///
+/// # Errors
+/// Returns an internal-error `Response` when the header value cannot be
+/// encoded.
 #[allow(clippy::result_large_err)]
 pub(crate) fn clear_console_session_cookie(secure: bool) -> Result<HeaderValue, Response> {
     let mut cookie =
@@ -4914,6 +5399,8 @@ pub(crate) fn clear_console_session_cookie(secure: bool) -> Result<HeaderValue, 
     })
 }
 
+/// Extracts a named cookie value from the `Cookie` header; empty values are
+/// treated as absent.
 pub(crate) fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     let raw = headers.get(COOKIE)?.to_str().ok()?;
     for part in raw.split(';') {
