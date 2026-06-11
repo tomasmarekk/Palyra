@@ -1,3 +1,8 @@
+//! Console log listing and export handlers.
+//!
+//! The module merges daemon journal records with connector logs while applying
+//! diagnostic redaction before records leave the daemon boundary.
+
 use std::cmp::Reverse;
 use std::collections::BTreeSet;
 
@@ -10,6 +15,7 @@ const DEFAULT_LOG_LIMIT: usize = 200;
 const MAX_LOG_LIMIT: usize = 2_000;
 const LOG_SCAN_MULTIPLIER: usize = 4;
 
+/// Query parameters for console log filtering, pagination, and export format.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleLogsQuery {
     limit: Option<usize>,
@@ -29,6 +35,11 @@ struct LogSortKey {
     tie_breaker: String,
 }
 
+/// Lists redacted daemon and connector logs for the console.
+///
+/// # Errors
+/// Returns an error response when console authorization, query normalization,
+/// journal lookup, connector log collection, or redaction fails.
 pub(crate) async fn console_logs_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -98,6 +109,13 @@ pub(crate) async fn console_logs_list_handler(
     }))
 }
 
+/// Exports redacted console logs as JSON or CSV.
+///
+/// CSV output neutralizes spreadsheet formula prefixes before quoting fields.
+///
+/// # Errors
+/// Returns an error response when console authorization, format validation,
+/// log collection, or JSON encoding fails.
 pub(crate) async fn console_logs_export_handler(
     State(state): State<AppState>,
     headers: HeaderMap,

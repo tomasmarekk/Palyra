@@ -1,5 +1,15 @@
+//! Console audit event listing handler.
+//!
+//! Audit reads use the journal snapshot and preserve existing event payloads;
+//! filtering is applied only at the transport boundary.
+
 use crate::*;
 
+/// Lists recent audit events from the daemon journal.
+///
+/// # Errors
+/// Returns an error response when console authorization or journal lookup
+/// fails.
 pub(crate) async fn console_audit_events_handler(
     State(state): State<AppState>,
     headers: HeaderMap,

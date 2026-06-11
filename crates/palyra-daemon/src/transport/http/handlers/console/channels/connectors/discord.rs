@@ -1,3 +1,8 @@
+//! Discord connector console handlers.
+//!
+//! These console routes wrap Discord onboarding and account lifecycle
+//! operations behind authenticated console mutations.
+
 use std::path::{Path as FsPath, PathBuf};
 
 use crate::application::channels::providers::discord::{
@@ -6,6 +11,11 @@ use crate::application::channels::providers::discord::{
 };
 use crate::*;
 
+/// Runs a Discord onboarding preflight without persisting connector changes.
+///
+/// # Errors
+/// Returns an error response when console authorization or onboarding
+/// preflight validation fails.
 pub(crate) async fn console_discord_onboarding_probe_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -16,6 +26,11 @@ pub(crate) async fn console_discord_onboarding_probe_handler(
     Ok(Json(response))
 }
 
+/// Applies Discord onboarding changes for a connector.
+///
+/// # Errors
+/// Returns an error response when console authorization or onboarding
+/// application fails.
 pub(crate) async fn console_discord_onboarding_apply_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -26,6 +41,11 @@ pub(crate) async fn console_discord_onboarding_apply_handler(
     Ok(Json(response))
 }
 
+/// Logs out a Discord account selected by path parameter.
+///
+/// # Errors
+/// Returns an error response when console authorization or account logout
+/// fails.
 pub(crate) async fn console_discord_account_logout_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -37,6 +57,11 @@ pub(crate) async fn console_discord_account_logout_handler(
     Ok(Json(response))
 }
 
+/// Removes a Discord account selected by path parameter.
+///
+/// # Errors
+/// Returns an error response when console authorization or account removal
+/// fails.
 pub(crate) async fn console_discord_account_remove_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -48,6 +73,7 @@ pub(crate) async fn console_discord_account_remove_handler(
     Ok(Json(response))
 }
 
+/// Parses comma-separated console query values into trimmed entries.
 pub(crate) fn parse_csv_values(raw: Option<&str>) -> Vec<String> {
     raw.map(|value| {
         value
@@ -60,6 +86,7 @@ pub(crate) fn parse_csv_values(raw: Option<&str>) -> Vec<String> {
     .unwrap_or_default()
 }
 
+/// Derives the connector database path colocated with a journal database.
 pub(crate) fn connector_db_path_from_journal_path(journal_db_path: &FsPath) -> PathBuf {
     let Some(parent) = journal_db_path.parent().filter(|path| !path.as_os_str().is_empty()) else {
         return PathBuf::from("data").join("connectors.sqlite3");
@@ -75,7 +102,14 @@ pub(crate) fn connector_db_path_from_journal_path(journal_db_path: &FsPath) -> P
     parent.join(format!("{stem}.connectors.sqlite3"))
 }
 
-#[allow(clippy::result_large_err)]
+/// Parses memory-source filters from comma-separated console query text.
+///
+/// # Errors
+/// Returns an error response when any memory source value is unsupported.
+#[expect(
+    clippy::result_large_err,
+    reason = "console parsing helpers return Response directly to preserve HTTP contracts"
+)]
 pub(crate) fn parse_memory_sources_csv(
     raw: Option<&str>,
 ) -> Result<Vec<journal::MemorySource>, Response> {

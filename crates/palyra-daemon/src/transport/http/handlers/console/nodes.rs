@@ -1,3 +1,8 @@
+//! Console node inventory and capability invocation handlers.
+//!
+//! Node capability execution can require local mediation before dispatch; this
+//! file owns the HTTP boundary and the approval prompt used for those cases.
+
 use std::time::{Duration, Instant};
 
 use crate::journal::{
@@ -11,6 +16,7 @@ use sha2::{Digest, Sha256};
 
 const NODE_CAPABILITY_LOCAL_MEDIATION_POLL_MS: u64 = 250;
 
+/// Classifies how a node capability may be executed from the console.
 fn capability_execution_mode(name: &str) -> &'static str {
     match name {
         "desktop.open_url" | "desktop.open_path" => "local_mediation",
@@ -22,12 +28,14 @@ fn capability_requires_local_mediation(name: &str) -> bool {
     capability_execution_mode(name.trim()) == "local_mediation"
 }
 
+/// Query parameters for pending node pairing requests.
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct ConsoleNodesPendingQuery {
     #[serde(default, alias = "status")]
     state: Option<String>,
 }
 
+/// Request body for invoking a node capability.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleNodeInvokeRequest {
     capability: String,
@@ -39,6 +47,11 @@ pub(crate) struct ConsoleNodeInvokeRequest {
     timeout_ms: Option<u64>,
 }
 
+/// Lists currently registered nodes.
+///
+/// # Errors
+/// Returns an error response when console authorization or node-runtime lookup
+/// fails.
 pub(crate) async fn console_nodes_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -49,6 +62,11 @@ pub(crate) async fn console_nodes_list_handler(
     Ok(Json(control_plane::NodeListEnvelope { contract: contract_descriptor(), nodes, page }))
 }
 
+/// Lists node pairing requests that are waiting for operator action.
+///
+/// # Errors
+/// Returns an error response when console authorization or node-runtime lookup
+/// fails.
 pub(crate) async fn console_nodes_pending_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -78,6 +96,11 @@ pub(crate) async fn console_nodes_pending_handler(
     }))
 }
 
+/// Returns one registered node by device id.
+///
+/// # Errors
+/// Returns an error response when console authorization, device-id validation,
+/// or node lookup fails.
 pub(crate) async fn console_node_get_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -99,6 +122,12 @@ pub(crate) async fn console_node_get_handler(
     }))
 }
 
+/// Invokes a node capability, requiring local mediation for desktop openers.
+///
+/// # Errors
+/// Returns an error response when console authorization, device-id validation,
+/// node freshness checks, input encoding, mediation approval, queueing, timeout
+/// handling, or result delivery fails.
 pub(crate) async fn console_node_invoke_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -331,6 +360,7 @@ fn collect_nodes(state: &AppState) -> Result<Vec<control_plane::NodeRecord>, ton
     state.node_runtime.nodes()?.iter().map(|node| Ok(node_record_json(node))).collect()
 }
 
+/// Converts a registered node into the control-plane node view.
 pub(crate) fn node_record_json(node: &RegisteredNodeRecord) -> control_plane::NodeRecord {
     control_plane::NodeRecord {
         device_id: node.device_id.clone(),

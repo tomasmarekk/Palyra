@@ -1,5 +1,11 @@
+//! Console webhook integration handlers.
+//!
+//! Webhook routes manage integration metadata and trigger routine dispatch
+//! tests while keeping vault-backed secret material behind registry views.
+
 use crate::*;
 
+/// Query parameters for filtering webhook integrations.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct ConsoleWebhooksListQuery {
     #[serde(default)]
@@ -8,6 +14,7 @@ pub(crate) struct ConsoleWebhooksListQuery {
     enabled: Option<bool>,
 }
 
+/// Request body for dispatching a webhook event into routine matching.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConsoleWebhookDispatchRequest {
@@ -20,6 +27,11 @@ pub(crate) struct ConsoleWebhookDispatchRequest {
     dedupe_key: Option<String>,
 }
 
+/// Lists configured webhook integrations.
+///
+/// # Errors
+/// Returns an error response when console authorization or registry listing
+/// fails.
 pub(crate) async fn console_webhooks_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -44,6 +56,11 @@ pub(crate) async fn console_webhooks_list_handler(
     }))
 }
 
+/// Returns one webhook integration by id.
+///
+/// # Errors
+/// Returns an error response when console authorization or registry lookup
+/// fails.
 pub(crate) async fn console_webhook_get_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -63,6 +80,11 @@ pub(crate) async fn console_webhook_get_handler(
     }))
 }
 
+/// Creates or updates a webhook integration.
+///
+/// # Errors
+/// Returns an error response when console authorization, registry validation,
+/// or persistence fails.
 pub(crate) async fn console_webhook_upsert_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -92,6 +114,11 @@ pub(crate) async fn console_webhook_upsert_handler(
     }))
 }
 
+/// Enables or disables one webhook integration.
+///
+/// # Errors
+/// Returns an error response when console authorization or registry mutation
+/// fails.
 pub(crate) async fn console_webhook_set_enabled_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -109,6 +136,11 @@ pub(crate) async fn console_webhook_set_enabled_handler(
     }))
 }
 
+/// Deletes one webhook integration.
+///
+/// # Errors
+/// Returns an error response when console authorization, id validation, or
+/// registry deletion fails.
 pub(crate) async fn console_webhook_delete_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -134,6 +166,11 @@ pub(crate) async fn console_webhook_delete_handler(
     }))
 }
 
+/// Sends a test payload through one webhook integration.
+///
+/// # Errors
+/// Returns an error response when console authorization, payload decoding, or
+/// test delivery fails.
 pub(crate) async fn console_webhook_test_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -159,6 +196,11 @@ pub(crate) async fn console_webhook_test_handler(
     }))
 }
 
+/// Dispatches a webhook event into matching routines.
+///
+/// # Errors
+/// Returns an error response when console authorization, registry lookup,
+/// event validation, or routine dispatch fails.
 pub(crate) async fn console_webhook_dispatch_handler(
     State(state): State<AppState>,
     headers: HeaderMap,

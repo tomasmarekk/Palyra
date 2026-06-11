@@ -1,3 +1,9 @@
+//! Console HTTP handler modules.
+//!
+//! This namespace contains browser-console routes that authorize through
+//! console sessions and adapt daemon, vault, channel, device, and support
+//! services into control-plane HTTP envelopes.
+
 pub(crate) mod access;
 pub(crate) mod acp;
 pub(crate) mod agents;

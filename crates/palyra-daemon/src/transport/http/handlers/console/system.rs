@@ -1,3 +1,8 @@
+//! Console system health, presence, insights, and operator-event handlers.
+//!
+//! System endpoints aggregate daemon status with auth, browser, channel,
+//! memory, maintenance, and support-bundle diagnostics for the web console.
+
 use super::diagnostics::{
     authorize_console_session, build_connector_observability, build_page_info,
     build_provider_auth_observability, build_support_bundle_observability,
@@ -15,6 +20,7 @@ const MAX_SYSTEM_EVENT_NAME_BYTES: usize = 64;
 const MAX_SYSTEM_EVENT_SUMMARY_BYTES: usize = 240;
 const MAX_SYSTEM_EVENT_DETAILS_BYTES: usize = 8 * 1024;
 
+/// Query parameters for filtering recent system journal events.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleSystemEventsQuery {
     limit: Option<usize>,
@@ -25,6 +31,7 @@ pub(crate) struct ConsoleSystemEventsQuery {
     event: Option<String>,
 }
 
+/// Request body for emitting an operator-scoped system event.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleSystemEventEmitRequest {
     name: String,
@@ -34,6 +41,11 @@ pub(crate) struct ConsoleSystemEventEmitRequest {
     details: Option<Value>,
 }
 
+/// Returns the lightweight daemon heartbeat payload for the console.
+///
+/// # Errors
+/// Returns an error response when console authorization, status snapshot
+/// collection, or clock access fails.
 pub(crate) async fn console_system_heartbeat_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -73,6 +85,11 @@ pub(crate) async fn console_system_heartbeat_handler(
     })))
 }
 
+/// Returns subsystem presence for gateway, auth, browser, channels, and memory.
+///
+/// # Errors
+/// Returns an error response when console authorization, subsystem snapshot
+/// collection, serialization, or clock access fails.
 pub(crate) async fn console_system_presence_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -167,6 +184,12 @@ pub(crate) async fn console_system_presence_handler(
     })))
 }
 
+/// Returns operator insights derived from runtime and auth state.
+///
+/// # Errors
+/// Returns an error response when console authorization, runtime snapshot
+/// collection, auth serialization, insight generation, or final serialization
+/// fails.
 pub(crate) async fn console_system_insights_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -203,6 +226,11 @@ pub(crate) async fn console_system_insights_handler(
     })?))
 }
 
+/// Lists recent system journal events with optional filters.
+///
+/// # Errors
+/// Returns an error response when console authorization or journal lookup
+/// fails.
 pub(crate) async fn console_system_events_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -267,6 +295,12 @@ pub(crate) async fn console_system_events_list_handler(
     })))
 }
 
+/// Emits an operator-scoped system event and dispatches matching routines.
+///
+/// # Errors
+/// Returns an error response when console authorization, event-name validation,
+/// payload validation, detail encoding, audit logging, or routine dispatch
+/// fails.
 pub(crate) async fn console_system_event_emit_handler(
     State(state): State<AppState>,
     headers: HeaderMap,

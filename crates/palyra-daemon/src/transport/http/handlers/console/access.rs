@@ -1,3 +1,8 @@
+//! Console access-control handlers.
+//!
+//! These routes expose workspace membership, invitation, API-token, feature
+//! flag, and resource-sharing operations through the access registry.
+
 use crate::{
     access_control::{
         AccessRegistry, AccessRegistryError, ApiTokenCreateRequest, InvitationCreateRequest,
@@ -6,12 +11,14 @@ use crate::{
     *,
 };
 
+/// Request body for enabling or disabling a feature flag.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleFeatureFlagMutationRequest {
     enabled: bool,
     stage: Option<String>,
 }
 
+/// Request body for creating an API token from the console.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleApiTokenCreatePayload {
     label: String,
@@ -24,12 +31,14 @@ pub(crate) struct ConsoleApiTokenCreatePayload {
     rate_limit_per_minute: Option<u32>,
 }
 
+/// Request body for creating a team workspace bundle.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleWorkspaceCreatePayload {
     team_name: String,
     workspace_name: String,
 }
 
+/// Request body for creating a workspace invitation.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleInvitationCreatePayload {
     workspace_id: String,
@@ -38,11 +47,13 @@ pub(crate) struct ConsoleInvitationCreatePayload {
     expires_at_unix_ms: i64,
 }
 
+/// Request body for accepting a workspace invitation.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleInvitationAcceptPayload {
     invitation_token: String,
 }
 
+/// Request body for changing a workspace member role.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleMembershipRolePayload {
     workspace_id: String,
@@ -50,12 +61,14 @@ pub(crate) struct ConsoleMembershipRolePayload {
     role: String,
 }
 
+/// Request body for removing a workspace member.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleMembershipRemovePayload {
     workspace_id: String,
     member_principal: String,
 }
 
+/// Request body for creating or updating a resource share.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleShareUpsertPayload {
     resource_kind: String,
@@ -64,12 +77,17 @@ pub(crate) struct ConsoleShareUpsertPayload {
     access_level: String,
 }
 
+/// Request body for running access-registry backfill.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleAccessBackfillPayload {
     #[serde(default)]
     dry_run: bool,
 }
 
+/// Returns the access registry snapshot visible to the current principal.
+///
+/// # Errors
+/// Returns an error response when console authorization fails.
 pub(crate) async fn console_access_snapshot_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -85,6 +103,11 @@ pub(crate) async fn console_access_snapshot_handler(
     })))
 }
 
+/// Runs access-registry backfill for the current principal.
+///
+/// # Errors
+/// Returns an error response when console authorization, clock access, backfill
+/// execution, or post-backfill snapshot collection fails.
 pub(crate) async fn console_access_backfill_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -108,6 +131,10 @@ pub(crate) async fn console_access_backfill_handler(
     })))
 }
 
+/// Lists workspace memberships visible to the current principal.
+///
+/// # Errors
+/// Returns an error response when console authorization fails.
 pub(crate) async fn console_access_memberships_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -123,6 +150,11 @@ pub(crate) async fn console_access_memberships_handler(
     })))
 }
 
+/// Sets one access-control feature flag.
+///
+/// # Errors
+/// Returns an error response when console authorization, clock access, or
+/// registry mutation fails.
 pub(crate) async fn console_access_feature_flag_set_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -148,6 +180,10 @@ pub(crate) async fn console_access_feature_flag_set_handler(
     })))
 }
 
+/// Lists API tokens visible to the current principal.
+///
+/// # Errors
+/// Returns an error response when console authorization fails.
 pub(crate) async fn console_access_api_tokens_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -163,6 +199,11 @@ pub(crate) async fn console_access_api_tokens_list_handler(
     })))
 }
 
+/// Creates an API token through the access registry.
+///
+/// # Errors
+/// Returns an error response when console authorization, clock access, or
+/// token creation fails.
 pub(crate) async fn console_access_api_token_create_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -193,6 +234,11 @@ pub(crate) async fn console_access_api_token_create_handler(
     })))
 }
 
+/// Rotates an API token and returns the rotated token record.
+///
+/// # Errors
+/// Returns an error response when console authorization, clock access, or
+/// token rotation fails.
 pub(crate) async fn console_access_api_token_rotate_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -211,6 +257,11 @@ pub(crate) async fn console_access_api_token_rotate_handler(
     })))
 }
 
+/// Revokes an API token.
+///
+/// # Errors
+/// Returns an error response when console authorization, clock access, or
+/// token revocation fails.
 pub(crate) async fn console_access_api_token_revoke_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -229,6 +280,11 @@ pub(crate) async fn console_access_api_token_revoke_handler(
     })))
 }
 
+/// Creates a team workspace bundle.
+///
+/// # Errors
+/// Returns an error response when console authorization, clock access, or
+/// workspace creation fails.
 pub(crate) async fn console_access_workspace_create_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -254,6 +310,11 @@ pub(crate) async fn console_access_workspace_create_handler(
     })))
 }
 
+/// Creates a workspace invitation.
+///
+/// # Errors
+/// Returns an error response when console authorization, clock access, or
+/// invitation creation fails.
 pub(crate) async fn console_access_invitation_create_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -281,6 +342,11 @@ pub(crate) async fn console_access_invitation_create_handler(
     })))
 }
 
+/// Accepts a workspace invitation for the current principal.
+///
+/// # Errors
+/// Returns an error response when console authorization, clock access, or
+/// invitation acceptance fails.
 pub(crate) async fn console_access_invitation_accept_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -303,6 +369,11 @@ pub(crate) async fn console_access_invitation_accept_handler(
     })))
 }
 
+/// Updates a workspace member role.
+///
+/// # Errors
+/// Returns an error response when console authorization, clock access, or
+/// membership mutation fails.
 pub(crate) async fn console_access_membership_role_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -327,6 +398,11 @@ pub(crate) async fn console_access_membership_role_handler(
     })))
 }
 
+/// Removes a workspace member.
+///
+/// # Errors
+/// Returns an error response when console authorization, clock access, or
+/// membership removal fails.
 pub(crate) async fn console_access_membership_remove_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -350,6 +426,11 @@ pub(crate) async fn console_access_membership_remove_handler(
     })))
 }
 
+/// Creates or updates a resource share.
+///
+/// # Errors
+/// Returns an error response when console authorization, clock access, or
+/// share mutation fails.
 pub(crate) async fn console_access_share_upsert_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -377,6 +458,7 @@ pub(crate) async fn console_access_share_upsert_handler(
     })))
 }
 
+/// Locks the access registry, recovering from poisoned locks with a warning.
 pub(crate) fn lock_access_registry<'a>(
     registry: &'a Arc<Mutex<AccessRegistry>>,
 ) -> std::sync::MutexGuard<'a, AccessRegistry> {

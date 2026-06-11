@@ -1,5 +1,14 @@
+//! Console doctor recovery job handlers.
+//!
+//! Doctor recovery requests are scoped to the requesting principal and record
+//! console audit events when a recovery job is created.
+
 use crate::*;
 
+/// Lists doctor recovery jobs visible to the current console session.
+///
+/// # Errors
+/// Returns an error response when console authorization fails.
 pub(crate) async fn console_doctor_jobs_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -17,6 +26,11 @@ pub(crate) async fn console_doctor_jobs_list_handler(
     }))
 }
 
+/// Creates a doctor recovery job and records an audit event.
+///
+/// # Errors
+/// Returns an error response when console authorization, job creation, or
+/// audit-event recording fails.
 pub(crate) async fn console_doctor_job_create_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -50,6 +64,11 @@ pub(crate) async fn console_doctor_job_create_handler(
     Ok(Json(control_plane::DoctorRecoveryJobEnvelope { contract: contract_descriptor(), job }))
 }
 
+/// Returns one doctor recovery job visible to the current principal.
+///
+/// # Errors
+/// Returns an error response when console authorization, job-id normalization,
+/// or job lookup fails.
 pub(crate) async fn console_doctor_job_get_handler(
     State(state): State<AppState>,
     headers: HeaderMap,

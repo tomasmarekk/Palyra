@@ -1,5 +1,11 @@
+//! Console pairing handlers for channel and node enrollment.
+//!
+//! Pairing routes bridge console decisions into approval records and node
+//! runtime state so enrollment stays auditable across channel and device flows.
+
 use crate::*;
 
+/// Query parameters for listing node pairing requests.
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct ConsoleNodePairingListQuery {
     limit: Option<usize>,
@@ -8,6 +14,7 @@ pub(crate) struct ConsoleNodePairingListQuery {
     client_kind: Option<String>,
 }
 
+/// Request body for approving or rejecting a node pairing request.
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct ConsoleNodePairingDecisionRequest {
     #[serde(default)]
@@ -18,6 +25,10 @@ pub(crate) struct ConsoleNodePairingDecisionRequest {
     decision_scope_ttl_ms: Option<i64>,
 }
 
+/// Returns channel-router pairing state.
+///
+/// # Errors
+/// Returns an error response when console authorization fails.
 pub(crate) async fn console_pairing_summary_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -34,6 +45,11 @@ pub(crate) async fn console_pairing_summary_handler(
     }))
 }
 
+/// Lists pending node pairing requests and active pairing codes.
+///
+/// # Errors
+/// Returns an error response when console authorization or node-runtime lookup
+/// fails.
 pub(crate) async fn console_node_pairing_requests_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -68,6 +84,10 @@ pub(crate) async fn console_node_pairing_requests_handler(
     }))
 }
 
+/// Mints a node pairing code.
+///
+/// # Errors
+/// Returns an error response when console authorization or code minting fails.
 pub(crate) async fn console_node_pairing_code_mint_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -92,6 +112,11 @@ pub(crate) async fn console_node_pairing_code_mint_handler(
     }))
 }
 
+/// Approves a node pairing request.
+///
+/// # Errors
+/// Returns an error response when console authorization, request validation,
+/// approval resolution, node-runtime update, or audit logging fails.
 pub(crate) async fn console_node_pairing_approve_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -101,6 +126,11 @@ pub(crate) async fn console_node_pairing_approve_handler(
     resolve_node_pairing_decision(state, headers, request_id, payload, true).await
 }
 
+/// Rejects a node pairing request.
+///
+/// # Errors
+/// Returns an error response when console authorization, request validation,
+/// approval resolution, node-runtime update, or audit logging fails.
 pub(crate) async fn console_node_pairing_reject_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -206,6 +236,11 @@ fn parse_pairing_decision_scope(
     }
 }
 
+/// Mints a channel-router pairing code.
+///
+/// # Errors
+/// Returns an error response when console authorization or pairing-code minting
+/// fails.
 pub(crate) async fn console_pairing_code_mint_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -231,6 +266,7 @@ pub(crate) async fn console_pairing_code_mint_handler(
     }))
 }
 
+/// Converts a node pairing code record into its control-plane view.
 pub(crate) fn control_plane_node_pairing_code_view(
     record: &crate::node_runtime::DevicePairingCodeRecord,
 ) -> control_plane::NodePairingCodeView {
@@ -243,6 +279,7 @@ pub(crate) fn control_plane_node_pairing_code_view(
     }
 }
 
+/// Converts a node pairing request record into its control-plane view.
 pub(crate) fn control_plane_node_pairing_request_view(
     record: &crate::node_runtime::DevicePairingRequestRecord,
 ) -> control_plane::NodePairingRequestView {

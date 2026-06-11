@@ -1,3 +1,8 @@
+//! Console maintenance status and doctor health graph handlers.
+//!
+//! Maintenance status requests also publish realtime lifecycle events so the
+//! console can reflect long-running health collection progress.
+
 use crate::maintenance::{
     collect_doctor_health_graph, collect_maintenance_status, publish_maintenance_realtime_event,
     DoctorHealthGraphSnapshot, MaintenanceStatusFilter, MaintenanceStatusSnapshot,
@@ -5,6 +10,7 @@ use crate::maintenance::{
 use crate::*;
 use serde::Serialize;
 
+/// Query parameters for filtering maintenance status output.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConsoleMaintenanceStatusQuery {
     #[serde(default)]
@@ -13,6 +19,11 @@ pub(crate) struct ConsoleMaintenanceStatusQuery {
     severity: Option<String>,
 }
 
+/// Collects maintenance status and emits realtime status lifecycle events.
+///
+/// # Errors
+/// Returns an error response when console authorization, maintenance
+/// collection, or payload serialization fails.
 pub(crate) async fn console_maintenance_status_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -61,6 +72,11 @@ pub(crate) async fn console_maintenance_status_handler(
     }
 }
 
+/// Returns the doctor health graph snapshot.
+///
+/// # Errors
+/// Returns an error response when console authorization, graph collection, or
+/// payload serialization fails.
 pub(crate) async fn console_doctor_health_graph_handler(
     State(state): State<AppState>,
     headers: HeaderMap,

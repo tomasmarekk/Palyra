@@ -1,5 +1,14 @@
+//! Console support-bundle job handlers.
+//!
+//! Support bundle creation is modeled as a queued job so the console can list,
+//! poll, and retain recent bundle generation attempts.
+
 use crate::*;
 
+/// Lists support-bundle jobs.
+///
+/// # Errors
+/// Returns an error response when console authorization fails.
 pub(crate) async fn console_support_bundle_jobs_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -17,6 +26,10 @@ pub(crate) async fn console_support_bundle_jobs_list_handler(
     }))
 }
 
+/// Creates a support-bundle generation job.
+///
+/// # Errors
+/// Returns an error response when console authorization or job creation fails.
 pub(crate) async fn console_support_bundle_job_create_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -27,6 +40,11 @@ pub(crate) async fn console_support_bundle_job_create_handler(
     Ok(Json(control_plane::SupportBundleJobEnvelope { contract: contract_descriptor(), job }))
 }
 
+/// Returns one support-bundle job by id.
+///
+/// # Errors
+/// Returns an error response when console authorization, job-id normalization,
+/// or job lookup fails.
 pub(crate) async fn console_support_bundle_job_get_handler(
     State(state): State<AppState>,
     headers: HeaderMap,

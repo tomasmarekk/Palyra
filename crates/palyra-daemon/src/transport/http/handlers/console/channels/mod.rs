@@ -1,3 +1,9 @@
+//! Console channel HTTP handlers.
+//!
+//! The console surface mirrors admin channel operations but uses console
+//! session and CSRF authorization before delegating to the shared channel
+//! application services.
+
 pub(crate) mod connectors;
 
 use crate::application::channels::{
@@ -11,6 +17,11 @@ use crate::transport::http::handlers::admin::channels::{
 };
 use crate::*;
 
+/// Lists configured channel connectors for the console.
+///
+/// # Errors
+/// Returns an error response when console authorization or connector
+/// enumeration fails.
 pub(crate) async fn console_channels_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -23,6 +34,11 @@ pub(crate) async fn console_channels_list_handler(
     })))
 }
 
+/// Returns status for one configured channel connector.
+///
+/// # Errors
+/// Returns an error response when console authorization, connector-id
+/// normalization, or status payload construction fails.
 pub(crate) async fn console_channel_status_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -33,6 +49,11 @@ pub(crate) async fn console_channel_status_handler(
     Ok(Json(build_channel_status_payload(&state, connector_id.as_str())?))
 }
 
+/// Enables or disables a channel connector from the console.
+///
+/// # Errors
+/// Returns an error response when console authorization, connector-id
+/// normalization, or connector state mutation fails.
 pub(crate) async fn console_channel_set_enabled_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -48,6 +69,11 @@ pub(crate) async fn console_channel_set_enabled_handler(
     Ok(Json(json!({ "connector": connector })))
 }
 
+/// Returns recent channel events and dead letters for one connector.
+///
+/// # Errors
+/// Returns an error response when console authorization, connector-id
+/// normalization, or log collection fails.
 pub(crate) async fn console_channel_logs_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -76,6 +102,11 @@ pub(crate) async fn console_channel_logs_handler(
     })))
 }
 
+/// Reads channel messages through the console.
+///
+/// # Errors
+/// Returns an error response when console authorization, connector-id
+/// normalization, provider access, or audit-event recording fails.
 pub(crate) async fn console_channel_message_read_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -86,6 +117,11 @@ pub(crate) async fn console_channel_message_read_handler(
     channel_message_read_response(&state, &session.context, connector_id, payload.request).await
 }
 
+/// Searches channel messages through the console.
+///
+/// # Errors
+/// Returns an error response when console authorization, connector-id
+/// normalization, provider search, or audit-event recording fails.
 pub(crate) async fn console_channel_message_search_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -96,6 +132,12 @@ pub(crate) async fn console_channel_message_search_handler(
     channel_message_search_response(&state, &session.context, connector_id, payload.request).await
 }
 
+/// Edits a channel message after policy and approval checks.
+///
+/// # Errors
+/// Returns an error response when console authorization, connector-id
+/// normalization, preview lookup, policy evaluation, approval validation,
+/// provider mutation, or audit-event recording fails.
 pub(crate) async fn console_channel_message_edit_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -113,6 +155,12 @@ pub(crate) async fn console_channel_message_edit_handler(
     .await
 }
 
+/// Deletes a channel message after policy and approval checks.
+///
+/// # Errors
+/// Returns an error response when console authorization, connector-id
+/// normalization, preview lookup, policy evaluation, approval validation,
+/// provider mutation, or audit-event recording fails.
 pub(crate) async fn console_channel_message_delete_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -130,6 +178,12 @@ pub(crate) async fn console_channel_message_delete_handler(
     .await
 }
 
+/// Adds a reaction to a channel message after policy and approval checks.
+///
+/// # Errors
+/// Returns an error response when console authorization, connector-id
+/// normalization, preview lookup, policy evaluation, approval validation,
+/// provider mutation, or audit-event recording fails.
 pub(crate) async fn console_channel_message_react_add_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -148,6 +202,12 @@ pub(crate) async fn console_channel_message_react_add_handler(
     .await
 }
 
+/// Removes a reaction from a channel message after policy and approval checks.
+///
+/// # Errors
+/// Returns an error response when console authorization, connector-id
+/// normalization, preview lookup, policy evaluation, approval validation,
+/// provider mutation, or audit-event recording fails.
 pub(crate) async fn console_channel_message_react_remove_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -166,6 +226,11 @@ pub(crate) async fn console_channel_message_react_remove_handler(
     .await
 }
 
+/// Refreshes provider health for a channel connector.
+///
+/// # Errors
+/// Returns an error response when console authorization, connector-id
+/// normalization, or provider health refresh fails.
 pub(crate) async fn console_channel_health_refresh_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -183,6 +248,11 @@ pub(crate) async fn console_channel_health_refresh_handler(
     Ok(Json(payload))
 }
 
+/// Pauses outbound queue processing for one connector.
+///
+/// # Errors
+/// Returns an error response when console authorization, connector-id
+/// normalization, queue mutation, or status payload construction fails.
 pub(crate) async fn console_channel_queue_pause_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -207,6 +277,11 @@ pub(crate) async fn console_channel_queue_pause_handler(
     Ok(Json(payload))
 }
 
+/// Resumes outbound queue processing for one connector.
+///
+/// # Errors
+/// Returns an error response when console authorization, connector-id
+/// normalization, queue mutation, or status payload construction fails.
 pub(crate) async fn console_channel_queue_resume_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -227,6 +302,11 @@ pub(crate) async fn console_channel_queue_resume_handler(
     Ok(Json(payload))
 }
 
+/// Drains due outbound work for one connector.
+///
+/// # Errors
+/// Returns an error response when console authorization, connector-id
+/// normalization, queue drain execution, or status payload construction fails.
 pub(crate) async fn console_channel_queue_drain_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -248,6 +328,11 @@ pub(crate) async fn console_channel_queue_drain_handler(
     Ok(Json(payload))
 }
 
+/// Replays one dead-lettered channel event.
+///
+/// # Errors
+/// Returns an error response when console authorization, connector-id
+/// normalization, dead-letter replay, or status payload construction fails.
 pub(crate) async fn console_channel_dead_letter_replay_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -271,6 +356,11 @@ pub(crate) async fn console_channel_dead_letter_replay_handler(
     Ok(Json(payload))
 }
 
+/// Discards one dead-lettered channel event.
+///
+/// # Errors
+/// Returns an error response when console authorization, connector-id
+/// normalization, dead-letter discard, or status payload construction fails.
 pub(crate) async fn console_channel_dead_letter_discard_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -294,6 +384,11 @@ pub(crate) async fn console_channel_dead_letter_discard_handler(
     Ok(Json(payload))
 }
 
+/// Runs a provider connectivity test for one connector.
+///
+/// # Errors
+/// Returns an error response when console authorization, connector-id
+/// normalization, or provider test execution fails.
 pub(crate) async fn console_channel_test_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -306,6 +401,11 @@ pub(crate) async fn console_channel_test_handler(
     Ok(Json(response))
 }
 
+/// Sends a provider test message for one connector.
+///
+/// # Errors
+/// Returns an error response when console authorization, connector-id
+/// normalization, or provider test-send execution fails.
 pub(crate) async fn console_channel_test_send_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -318,6 +418,10 @@ pub(crate) async fn console_channel_test_send_handler(
     Ok(Json(response))
 }
 
+/// Returns the active channel-router rules and config hash.
+///
+/// # Errors
+/// Returns an error response when console authorization fails.
 pub(crate) async fn console_channel_router_rules_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -331,6 +435,10 @@ pub(crate) async fn console_channel_router_rules_handler(
     })))
 }
 
+/// Returns channel-router validation warnings and config hash.
+///
+/// # Errors
+/// Returns an error response when console authorization fails.
 pub(crate) async fn console_channel_router_warnings_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -342,6 +450,11 @@ pub(crate) async fn console_channel_router_warnings_handler(
     })))
 }
 
+/// Previews channel-router resolution for an operator-supplied message.
+///
+/// # Errors
+/// Returns an error response when console authorization or preview input
+/// validation fails.
 pub(crate) async fn console_channel_router_preview_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -353,6 +466,10 @@ pub(crate) async fn console_channel_router_preview_handler(
     Ok(Json(json!({ "preview": preview })))
 }
 
+/// Returns channel-router pairing records, optionally scoped to a channel.
+///
+/// # Errors
+/// Returns an error response when console authorization fails.
 pub(crate) async fn console_channel_router_pairings_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -366,6 +483,11 @@ pub(crate) async fn console_channel_router_pairings_handler(
     })))
 }
 
+/// Mints a channel-router pairing code for a target channel.
+///
+/// # Errors
+/// Returns an error response when console authorization, channel
+/// normalization, or pairing-code creation fails.
 pub(crate) async fn console_channel_router_pairing_code_mint_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -386,7 +508,14 @@ pub(crate) async fn console_channel_router_pairing_code_mint_handler(
     })))
 }
 
-#[allow(clippy::result_large_err)]
+/// Converts a routing-preview request into a channel-router inbound message.
+///
+/// # Errors
+/// Returns an error response when the channel or text fields are invalid.
+#[expect(
+    clippy::result_large_err,
+    reason = "axum console helpers return Response directly to preserve HTTP contracts"
+)]
 pub(crate) fn build_channel_router_preview_input(
     payload: ChannelRouterPreviewRequest,
 ) -> Result<channel_router::InboundMessage, Response> {

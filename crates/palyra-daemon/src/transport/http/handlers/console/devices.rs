@@ -1,3 +1,9 @@
+//! Console device lifecycle handlers.
+//!
+//! Device routes project identity-manager state into control-plane envelopes
+//! and keep certificate rotation, revocation, and removal behind console
+//! mutation authorization.
+
 use std::{
     collections::HashMap,
     time::{SystemTime, UNIX_EPOCH},
@@ -8,6 +14,11 @@ use crate::*;
 
 type DeviceHandlerStatus<T> = Result<T, tonic::Status>;
 
+/// Lists paired and revoked devices.
+///
+/// # Errors
+/// Returns an error response when console authorization or identity lookup
+/// fails.
 pub(crate) async fn console_devices_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -18,6 +29,11 @@ pub(crate) async fn console_devices_list_handler(
     Ok(Json(control_plane::DeviceListEnvelope { contract: contract_descriptor(), devices, page }))
 }
 
+/// Returns one device record by canonical device id.
+///
+/// # Errors
+/// Returns an error response when console authorization, device-id validation,
+/// or identity lookup fails.
 pub(crate) async fn console_device_get_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -32,6 +48,11 @@ pub(crate) async fn console_device_get_handler(
     }))
 }
 
+/// Forces certificate rotation for one paired device.
+///
+/// # Errors
+/// Returns an error response when console authorization, device-id validation,
+/// identity mutation, clock access, or response projection fails.
 pub(crate) async fn console_device_rotate_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -57,6 +78,11 @@ pub(crate) async fn console_device_rotate_handler(
     }))
 }
 
+/// Revokes one paired device and removes its active node registration.
+///
+/// # Errors
+/// Returns an error response when console authorization, device-id validation,
+/// identity mutation, or response projection fails.
 pub(crate) async fn console_device_revoke_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -85,6 +111,11 @@ pub(crate) async fn console_device_revoke_handler(
     }))
 }
 
+/// Removes a paired or revoked device record.
+///
+/// # Errors
+/// Returns an error response when console authorization, device-id validation,
+/// existing-device lookup, identity mutation, or clock access fails.
 pub(crate) async fn console_device_remove_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -126,6 +157,11 @@ pub(crate) async fn console_device_remove_handler(
     }))
 }
 
+/// Clears all revoked device tombstones.
+///
+/// # Errors
+/// Returns an error response when console authorization or identity mutation
+/// fails.
 pub(crate) async fn console_devices_clear_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -157,6 +193,11 @@ pub(crate) async fn console_devices_clear_handler(
     }))
 }
 
+/// Collects paired and revoked devices as control-plane records.
+///
+/// # Errors
+/// Returns an error when identity state, pairing metadata, or timestamp
+/// conversion fails.
 pub(crate) fn collect_device_records(
     state: &AppState,
 ) -> DeviceHandlerStatus<Vec<control_plane::DeviceRecord>> {

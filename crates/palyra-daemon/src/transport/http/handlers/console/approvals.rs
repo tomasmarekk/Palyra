@@ -1,5 +1,16 @@
+//! Console approval inbox and decision handlers.
+//!
+//! Approval decisions may have side effects in channel pairing, device pairing,
+//! routine execution, and chat streams, so the handler keeps those follow-up
+//! synchronizations in one place after resolving the approval record.
+
 use crate::*;
 
+/// Lists approval records visible to the console.
+///
+/// # Errors
+/// Returns an error response when console authorization, query parsing, or
+/// approval listing fails.
 pub(crate) async fn console_approvals_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -30,6 +41,11 @@ pub(crate) async fn console_approvals_list_handler(
     })))
 }
 
+/// Returns one approval record by canonical approval id.
+///
+/// # Errors
+/// Returns an error response when console authorization, approval-id
+/// validation, or approval lookup fails.
 pub(crate) async fn console_approval_get_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -54,6 +70,12 @@ pub(crate) async fn console_approval_get_handler(
     Ok(Json(json!({ "approval": record })))
 }
 
+/// Applies an approval decision and synchronizes dependent runtime state.
+///
+/// # Errors
+/// Returns an error response when console authorization, approval-id
+/// validation, decision parsing, approval resolution, pairing synchronization,
+/// routine synchronization, or audit logging fails.
 pub(crate) async fn console_approval_decision_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -160,7 +182,10 @@ pub(crate) async fn console_approval_decision_handler(
     Ok(Json(response))
 }
 
-#[allow(clippy::result_large_err)]
+#[expect(
+    clippy::result_large_err,
+    reason = "console parsing helpers return Response directly to preserve HTTP contracts"
+)]
 fn parse_console_approval_decision(
     value: Option<&str>,
 ) -> Result<Option<ApprovalDecision>, Response> {
@@ -178,7 +203,10 @@ fn parse_console_approval_decision(
     }
 }
 
-#[allow(clippy::result_large_err)]
+#[expect(
+    clippy::result_large_err,
+    reason = "console parsing helpers return Response directly to preserve HTTP contracts"
+)]
 fn parse_console_approval_subject_type(
     value: Option<&str>,
 ) -> Result<Option<ApprovalSubjectType>, Response> {
@@ -198,7 +226,10 @@ fn parse_console_approval_subject_type(
     }
 }
 
-#[allow(clippy::result_large_err)]
+#[expect(
+    clippy::result_large_err,
+    reason = "console parsing helpers return Response directly to preserve HTTP contracts"
+)]
 fn parse_console_decision_scope(value: Option<&str>) -> Result<ApprovalDecisionScope, Response> {
     let Some(raw) = value.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(ApprovalDecisionScope::Once);

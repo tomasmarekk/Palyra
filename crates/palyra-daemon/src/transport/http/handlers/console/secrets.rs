@@ -1,5 +1,15 @@
+//! Console secret and configured-secret handlers.
+//!
+//! Vault operations are routed through the same gRPC service implementation as
+//! remote callers, with console session metadata applied at the HTTP boundary.
+
 use crate::*;
 
+/// Lists secret metadata for a requested vault scope.
+///
+/// # Errors
+/// Returns an error response when console authorization, scope validation,
+/// RPC context encoding, vault listing, or metadata conversion fails.
 pub(crate) async fn console_secrets_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -34,6 +44,11 @@ pub(crate) async fn console_secrets_list_handler(
     }))
 }
 
+/// Returns metadata for one vault secret.
+///
+/// # Errors
+/// Returns an error response when console authorization, input validation, RPC
+/// context encoding, vault lookup, or metadata conversion fails.
 pub(crate) async fn console_secret_metadata_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -49,6 +64,11 @@ pub(crate) async fn console_secret_metadata_handler(
     }))
 }
 
+/// Stores a vault secret from a base64-encoded request body.
+///
+/// # Errors
+/// Returns an error response when console authorization, base64 decoding, RPC
+/// context encoding, vault write, or metadata conversion fails.
 pub(crate) async fn console_secret_set_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -89,6 +109,11 @@ pub(crate) async fn console_secret_set_handler(
     }))
 }
 
+/// Reveals one vault secret after explicit reveal acknowledgement.
+///
+/// # Errors
+/// Returns an error response when console authorization, reveal validation, or
+/// vault reveal fails.
 pub(crate) async fn console_secret_reveal_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -121,6 +146,11 @@ pub(crate) async fn console_secret_reveal_handler(
     }))
 }
 
+/// Deletes one vault secret and returns its previous metadata.
+///
+/// # Errors
+/// Returns an error response when console authorization, pre-delete lookup,
+/// RPC context encoding, vault deletion, or metadata conversion fails.
 pub(crate) async fn console_secret_delete_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -158,6 +188,10 @@ pub(crate) async fn console_secret_delete_handler(
     }))
 }
 
+/// Lists configured secrets referenced by the loaded daemon config.
+///
+/// # Errors
+/// Returns an error response when console authorization fails.
 pub(crate) async fn console_configured_secrets_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -173,6 +207,11 @@ pub(crate) async fn console_configured_secrets_handler(
     }))
 }
 
+/// Returns one configured-secret record by secret id.
+///
+/// # Errors
+/// Returns an error response when console authorization fails or the configured
+/// secret is not found.
 pub(crate) async fn console_configured_secret_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -192,6 +231,7 @@ pub(crate) async fn console_configured_secret_handler(
     }))
 }
 
+/// Builds configured-secret state, marking entries stale after reload planning.
 pub(crate) fn configured_secrets_snapshot(
     state: &AppState,
 ) -> crate::app::state::ConfiguredSecretsState {
