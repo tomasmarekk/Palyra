@@ -1,3 +1,21 @@
+//! Post-run learning pipeline: reflection scheduling, candidate mining, and
+//! reviewed candidate application.
+//!
+//! After a run completes, [`schedule_post_run_reflection`] samples it for a
+//! background reflection task. [`process_post_run_reflection_task`] then mines
+//! the session transcript and the compaction preview (from
+//! `application::session_compaction`) into reviewable learning candidates:
+//! durable facts, preferences, tool-sequence procedures, and workspace
+//! patches. Candidates persist through the journal learning tables behind
+//! [`GatewayRuntimeState`].
+//!
+//! Safety posture is review-by-default: only high-confidence, injection-clean
+//! durable facts auto-write (via `domain::workspace` managed blocks); every
+//! other kind waits for an operator decision. Patch candidates are
+//! re-validated against the live workspace base and dry-run in an isolated
+//! staging copy before [`apply_patch_learning_candidate`] touches real
+//! workspace roots.
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
@@ -36,6 +54,8 @@ use crate::{
     },
 };
 
+/// Background-task kind under which post-run reflection runs; shared with the
+/// auxiliary task contract so executors and consoles agree on the name.
 pub(crate) const REFLECTION_TASK_KIND: &str = AuxiliaryTaskKind::PostRunReflection.as_str();
 const REFLECTION_TRIGGER_POLICY: &str = "post_run_learning_v1";
 const PATCH_SKILL_CANDIDATE_KIND: &str = "patch_skill";
@@ -44,6 +64,8 @@ const PATCH_SUPPORT_FILE_CANDIDATE_KIND: &str = "write_support_file";
 const PATCH_LEARNING_REASONING_VERSION: &str = "patch_learning_v1";
 const WORKSPACE_PATCH_TOOL_NAME: &str = "palyra.fs.apply_patch";
 
+/// Per-run summary of one successful tool sequence, grouped across runs by
+/// signature to detect repeatable procedures.
 #[derive(Debug, Clone)]
 struct ProcedureRunSignature {
     run_id: String,
@@ -52,6 +74,15 @@ struct ProcedureRunSignature {
     excerpts: Vec<String>,
 }
 
+/// Queues a post-run reflection background task for a completed run when
+/// learning is enabled, the run passes deterministic sampling, and the
+/// session has no duplicate or in-cooldown reflection task.
+///
+/// Returns `Ok(None)` whenever scheduling is skipped (disabled, sampled out,
+/// already scheduled for this run, or within the cooldown window).
+///
+/// # Errors
+/// Propagates journal errors from background-task listing or creation.
 pub(crate) async fn schedule_post_run_reflection(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: &RequestContext,
@@ -62,6 +93,8 @@ pub(crate) async fn schedule_post_run_reflection(
     if !learning_config.enabled || learning_config.sampling_percent == 0 {
         return Ok(None);
     }
+    // Deterministic sampling: hashing the request identity makes the sample
+    // decision stable for the same run across retries and restarts.
     let sample_key = crate::sha256_hex(
         format!(
             "{}:{}:{}:{}",
@@ -72,6 +105,11 @@ pub(crate) async fn schedule_post_run_reflection(
         )
         .as_bytes(),
     );
+    // AIDEV-NOTE: sample_value is a 0-255 hash byte, but sampling_percent is
+    // validated as 0-100 (PALYRA_LEARNING_SAMPLING_PERCENT), so the effective
+    // sampling rate is percent/256 -- the default 100 samples only ~39% of
+    // runs instead of all of them. Fixing the scale changes scheduling
+    // behavior, so it is only flagged here in this doc-only pass.
     let sample_value = u8::from_str_radix(&sample_key[..2], 16).unwrap_or_default();
     if sample_value >= learning_config.sampling_percent {
         return Ok(None);
@@ -88,6 +126,9 @@ pub(crate) async fn schedule_post_run_reflection(
             limit: 64,
         })
         .await?;
+    // At most one reflection per run, plus a per-session cooldown so chatty
+    // sessions cannot fan out reflection tasks; cancelled/failed/expired
+    // tasks do not hold the cooldown window.
     if existing.iter().any(|task| {
         task.task_kind == REFLECTION_TASK_KIND && task.parent_run_id.as_deref() == Some(run_id)
     }) {
@@ -143,6 +184,17 @@ pub(crate) async fn schedule_post_run_reflection(
     Ok(Some(task))
 }
 
+/// Executes a queued reflection task: mines the parent run's compaction
+/// preview and session transcript into learning candidates, persists them
+/// (capped at `max_candidates_per_run`), and auto-applies qualifying durable
+/// facts.
+///
+/// Returns the JSON status payload recorded on the background task.
+///
+/// # Errors
+/// Returns `FailedPrecondition` when the task carries no `parent_run_id`,
+/// `NotFound` when the parent run is gone, and propagates session
+/// resolution, transcript listing, and candidate persistence errors.
 pub(crate) async fn process_post_run_reflection_task(
     runtime_state: &Arc<GatewayRuntimeState>,
     task: &OrchestratorBackgroundTaskRecord,
@@ -218,6 +270,10 @@ pub(crate) async fn process_post_run_reflection_task(
     for request in candidates.into_iter().take(learning_config.max_candidates_per_run) {
         let mut record = runtime_state.upsert_learning_candidate(request).await?;
         runtime_state.record_learning_candidate_created();
+        // Auto-apply gate: only durable facts that clear the configured
+        // confidence bar and carry no sensitivity/poison risk skip operator
+        // review; the prompt-injection scan inside try_auto_write_durable_fact
+        // still has the final veto.
         if record.candidate_kind == "durable_fact"
             && record.status == "queued"
             && record.confidence
@@ -266,6 +322,11 @@ pub(crate) async fn process_post_run_reflection_task(
     }))
 }
 
+/// Renders the caller's active learning preferences as a
+/// `<preference_context>` prompt block, or `None` when none exist.
+///
+/// # Errors
+/// Propagates journal errors from preference listing.
 pub(crate) async fn render_preference_prompt_context(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: &RequestContext,
@@ -301,6 +362,15 @@ pub(crate) async fn render_preference_prompt_context(
     Ok(Some(format!("<preference_context>\n{}\n</preference_context>", lines.join("\n"))))
 }
 
+/// Applies a reviewed `preference` candidate: upserts the preference record
+/// and marks the candidate accepted under `reviewed_by_principal`.
+///
+/// Returns `Ok(None)` when the candidate is not a preference candidate.
+///
+/// # Errors
+/// Returns `Internal` when the candidate content JSON does not parse,
+/// `FailedPrecondition` when the key or value is missing, and propagates
+/// journal errors from the upsert and review writes.
 pub(crate) async fn apply_preference_candidate(
     runtime_state: &Arc<GatewayRuntimeState>,
     candidate: &LearningCandidateRecord,
@@ -362,6 +432,9 @@ pub(crate) async fn apply_preference_candidate(
     Ok(Some(record))
 }
 
+/// Maps compaction-preview candidates into learning candidate requests,
+/// deduplicating by content hash. Blocked or below-threshold entries are
+/// persisted as `suppressed` rather than dropped so they stay auditable.
 fn build_compaction_learning_candidates(
     run: &crate::journal::OrchestratorRunStatusSnapshot,
     session_id: &str,
@@ -450,6 +523,8 @@ fn build_compaction_learning_candidates(
     Ok(candidates)
 }
 
+/// Mines explicit preference statements from the parent run's received
+/// messages into reviewable `preference` candidates.
 fn build_preference_candidates(
     run: &crate::journal::OrchestratorRunStatusSnapshot,
     session_id: &str,
@@ -468,6 +543,9 @@ fn build_preference_candidates(
             continue;
         };
         let lower = text.to_ascii_lowercase();
+        // Keyword triggers, not NLP: "prefer"/"please use" reads as a style
+        // preference, "always"/"never" as a workflow rule. Anything subtler is
+        // left to the compaction-based candidate path.
         let classification = if lower.contains("prefer ") || lower.contains("please use ") {
             Some(("interaction.style", text.trim().to_owned(), "explicit"))
         } else if lower.contains("always ") || lower.contains("never ") {
@@ -526,6 +604,11 @@ fn build_preference_candidates(
     candidates
 }
 
+/// Mines repeatable tool-sequence procedures from the whole session
+/// transcript: successful, untainted tool calls are grouped per run, runs
+/// with the same tool signature are counted across the session, and a
+/// candidate is emitted once a signature recurs `procedure_min_occurrences`
+/// times.
 fn build_procedure_candidates(
     run: &crate::journal::OrchestratorRunStatusSnapshot,
     session_id: &str,
@@ -594,6 +677,12 @@ fn build_procedure_candidates(
 
     let mut signatures = BTreeMap::<String, Vec<ProcedureRunSignature>>::new();
     let mut per_run_tools = BTreeMap::<String, Vec<(String, String)>>::new();
+    // AIDEV-NOTE: taint is filtered per proposal, not per run -- a run with
+    // one prompt-injection-tainted result still contributes its remaining
+    // clean tools, so a promoted signature can omit a step that actually ran.
+    // If whole-run exclusion is intended (as the companion test name
+    // "procedure_candidates_ignore_prompt_injection_tainted_runs" suggests),
+    // fixing this is a behavior change outside this doc-only pass.
     for ((candidate_run_id, proposal_id), tool_name) in proposals {
         if !results.get(&(candidate_run_id.clone(), proposal_id.clone())).copied().unwrap_or(false)
             || tainted_results
@@ -606,9 +695,13 @@ fn build_procedure_candidates(
         per_run_tools.entry(candidate_run_id).or_default().push((proposal_id, tool_name));
     }
     for (candidate_run_id, mut tools) in per_run_tools {
+        // Proposal IDs are ULIDs, so lexicographic order is creation order;
+        // the signature must reflect the executed tool sequence.
         tools.sort_by(|left, right| left.0.cmp(&right.0));
         let tool_names = tools.iter().map(|(_, tool_name)| tool_name.clone()).collect::<Vec<_>>();
         let unique_tool_count = tool_names.iter().collect::<HashSet<_>>().len();
+        // A procedure needs at least two distinct tools; repeating one tool
+        // is retry noise, not a reusable sequence.
         if tool_names.len() < 2 || unique_tool_count < 2 {
             continue;
         }
@@ -747,6 +840,8 @@ struct PatchToolResultRecord {
     provenance: SessionCompactionCandidateProvenance,
 }
 
+/// Run-level risk evidence gathered while scanning the transcript: external
+/// input sources, prompt-injection taint reasons, and message provenance.
 #[derive(Debug, Clone, Default)]
 struct PatchRunEvidence {
     external_sources: HashSet<String>,
@@ -754,6 +849,9 @@ struct PatchRunEvidence {
     message_evidence: Vec<SessionCompactionCandidateProvenance>,
 }
 
+/// Mines this run's successful `palyra.fs.apply_patch` results into
+/// reviewable patch candidates, carrying enough base-state evidence
+/// (per-file `before_sha256`) for apply-time conflict detection.
 fn build_patch_candidates(
     run: &crate::journal::OrchestratorRunStatusSnapshot,
     session_id: &str,
@@ -1007,7 +1105,9 @@ fn build_patch_candidates(
             "self_improvement": self_improvement,
         })
         .to_string();
-        let mut provenance = vec![proposal.provenance.clone(), result.provenance.clone()];
+        // `proposal` is owned and not used past this point, so its provenance
+        // moves instead of cloning.
+        let mut provenance = vec![proposal.provenance, result.provenance.clone()];
         provenance.extend(run_evidence.message_evidence.iter().cloned());
         candidates.push(LearningCandidateCreateRequest {
             candidate_id: Ulid::new().to_string(),
@@ -1067,6 +1167,8 @@ fn patch_candidate_summary(
     format!("Reusable {label} over {}.", details.join(", "))
 }
 
+/// Shared self-improvement envelope: every mined capability ships as
+/// `proposal_only` behind the same scaffold/sign/eval/review gate sequence.
 fn self_improvement_metadata(
     source_refs: Vec<String>,
     rationale: String,
@@ -1113,6 +1215,8 @@ fn self_improvement_tests_for_patch_candidate(candidate_kind: &str) -> Vec<Value
     tests
 }
 
+/// Buckets a patch by its touched paths into skill, procedure, or generic
+/// support-file kinds; the review bar and required tests differ per kind.
 fn classify_patch_candidate_kind(files: &[Value]) -> &'static str {
     let paths = files
         .iter()
@@ -1141,6 +1245,9 @@ fn classify_patch_candidate_kind(files: &[Value]) -> &'static str {
     }
 }
 
+/// Digest over the sorted pre-image metadata of all touched files, so the
+/// candidate dedupe key distinguishes the same patch captured against
+/// different workspace bases.
 fn compute_patch_base_digest(files: &[Value]) -> String {
     let mut entries = files
         .iter()
@@ -1173,6 +1280,8 @@ fn collect_high_risk_patch_paths(files: &[Value]) -> Vec<String> {
         .collect()
 }
 
+/// Paths whose modification expands trust or could expose secrets; matching
+/// candidates are forced to `sensitive` risk and never auto-apply.
 fn is_high_risk_patch_path(path: &str) -> bool {
     let lowered = path.to_ascii_lowercase();
     WorkspacePatchRedactionPolicy::default()
@@ -1185,6 +1294,9 @@ fn is_high_risk_patch_path(path: &str) -> bool {
         || lowered.contains("secrets/")
 }
 
+/// Scans added/removed patch lines for keywords that signal a capability
+/// expansion (egress hosts, secret scopes, filesystem roots, channels,
+/// provider routing); any hit forces operator review.
 fn capability_delta_signals(patch_document: &str) -> Vec<String> {
     let mut signals = HashSet::new();
     for line in patch_document.lines() {
@@ -1217,6 +1329,10 @@ fn capability_delta_signals(patch_document: &str) -> Vec<String> {
     sorted
 }
 
+/// Heuristic confidence for a patch candidate: starts high for an observed
+/// successful apply and deducts per risk signal. Poison evidence dominates
+/// the deductions so tainted candidates land far below every review
+/// threshold.
 fn patch_candidate_confidence(
     run_evidence: &PatchRunEvidence,
     approval_required: bool,
@@ -1252,6 +1368,8 @@ fn external_source_label(tool_name: &str) -> Option<&'static str> {
     }
 }
 
+/// Extracts the first poison signal from a tool-result payload: top-level or
+/// nested prompt-injection findings, or any non-clean risk state.
 fn patch_taint_reason(payload: &Value) -> Option<String> {
     if let Some(findings) = payload
         .get("prompt_injection_findings")
@@ -1294,6 +1412,23 @@ fn patch_taint_reason(payload: &Value) -> Option<String> {
     None
 }
 
+/// Applies a reviewed patch candidate to the live workspace roots after
+/// re-validating its recorded base state.
+///
+/// Apply order is fail-closed: recorded `before_sha256` values are compared
+/// against the live files first (any mismatch marks the candidate
+/// `conflicted` without touching the workspace), the patch is then dry-run
+/// in an isolated staging copy, and only after both gates pass is it applied
+/// to the real roots.
+///
+/// Returns `Ok(None)` when the candidate is not a patch kind, otherwise a
+/// JSON outcome with `result` set to `applied` or `conflicted`.
+///
+/// # Errors
+/// Returns `FailedPrecondition` when the candidate is in a terminal review
+/// state, its content is incomplete, a workspace root is invalid, or the
+/// staging/live apply fails; returns `Internal` when the candidate JSON does
+/// not parse; and propagates journal review errors.
 pub(crate) async fn apply_patch_learning_candidate(
     runtime_state: &Arc<GatewayRuntimeState>,
     candidate: &LearningCandidateRecord,
@@ -1429,6 +1564,8 @@ pub(crate) async fn apply_patch_learning_candidate(
     })))
 }
 
+/// Review states that are terminal for apply purposes; a patch candidate in
+/// any of them must never reach the workspace again.
 fn patch_candidate_apply_blocked_status(status: &str) -> bool {
     matches!(
         status,
@@ -1436,6 +1573,8 @@ fn patch_candidate_apply_blocked_status(status: &str) -> bool {
     )
 }
 
+/// Compares each touched file's recorded `before_sha256` with the live
+/// workspace state and returns one conflict entry per mismatch.
 fn collect_patch_base_conflicts(
     canonical_workspace_roots: &[PathBuf],
     files: &[Value],
@@ -1447,6 +1586,8 @@ fn collect_patch_base_conflicts(
             file.get("workspace_root_index").and_then(Value::as_u64).ok_or_else(|| {
                 Status::failed_precondition("patch file is missing workspace_root_index")
             })?;
+        // unwrap_or(usize::MAX) turns an out-of-range index into a lookup
+        // miss, which the ok_or_else below reports as an invalid root.
         let root = canonical_workspace_roots
             .get(usize::try_from(root_index).unwrap_or(usize::MAX))
             .ok_or_else(|| {
@@ -1460,6 +1601,9 @@ fn collect_patch_base_conflicts(
         let snapshot = read_patch_learning_file_snapshot(root, expected_path, limits)?;
         let actual_sha256 = snapshot.bytes.as_deref().map(crate::sha256_hex);
 
+        // (Some == Some) is an unchanged base; (None, None) means the file
+        // did not exist at capture time and still does not. Everything else
+        // conflicts, including a create target that now exists.
         match (expected_before_sha256, actual_sha256.as_deref()) {
             (Some(expected), Some(actual)) if expected == actual => {}
             (None, None) => {}
@@ -1475,6 +1619,8 @@ fn collect_patch_base_conflicts(
     Ok(conflicts)
 }
 
+/// Dry-runs the patch in a throwaway temp copy of just its base files so a
+/// patch that fails validation never touches the real workspace roots.
 fn stage_patch_candidate(
     canonical_workspace_roots: &[PathBuf],
     files: &[Value],
@@ -1569,6 +1715,8 @@ fn stage_patch_candidate(
             "skill_validation": skill_validation,
         }))
     })();
+    // Best-effort cleanup: the staging copy lives under the OS temp dir, and
+    // a failed removal must not mask the validation outcome.
     let _ = fs::remove_dir_all(staging_root.as_path());
     response
 }
@@ -1578,6 +1726,8 @@ struct PatchLearningFileSnapshot {
     bytes: Option<Vec<u8>>,
 }
 
+/// Canonicalizes the agent's workspace roots and requires each to be an
+/// existing directory, so later containment checks compare canonical paths.
 fn canonicalize_patch_learning_roots(workspace_roots: &[PathBuf]) -> Result<Vec<PathBuf>, Status> {
     if workspace_roots.is_empty() {
         return Err(Status::failed_precondition("patch candidate has no workspace roots"));
@@ -1608,6 +1758,8 @@ fn canonicalize_patch_learning_roots(workspace_roots: &[PathBuf]) -> Result<Vec<
         .collect()
 }
 
+/// Reads the current workspace state of one patch base file, failing closed
+/// on symlinks and root escapes; missing files report `exists: false`.
 fn read_patch_learning_file_snapshot(
     canonical_root: &Path,
     path_label: &str,
@@ -1649,6 +1801,9 @@ fn read_patch_learning_file_snapshot(
     Ok(PatchLearningFileSnapshot { exists: true, bytes: Some(bytes) })
 }
 
+/// Normalizes a patch path label into a strictly relative path, rejecting
+/// absolute paths, parent components, and prefixes so the joined path cannot
+/// escape the workspace root.
 fn patch_learning_relative_path(path_label: &str) -> Result<PathBuf, Status> {
     if path_label.is_empty() {
         return Err(Status::failed_precondition("patch file path must not be empty"));
@@ -1687,12 +1842,16 @@ fn ensure_patch_learning_path_within_root(
     Ok(())
 }
 
+/// Opens and reads a patch base file with a hard size cap, re-verifying the
+/// path after open so a concurrent swap cannot smuggle content in.
 fn read_patch_learning_file_capped(
     absolute: &Path,
     canonical_root: &Path,
     path_label: &str,
     max_file_bytes: usize,
 ) -> Result<Vec<u8>, Status> {
+    // O_NOFOLLOW (and the dev/ino re-check below) defends against a symlink
+    // being swapped in between the snapshot's metadata check and this open.
     #[cfg(unix)]
     let mut file = {
         use std::os::unix::fs::OpenOptionsExt;
@@ -1736,6 +1895,8 @@ fn read_patch_learning_file_capped(
             "patch base file {path_label} exceeds max_file_bytes={max_file_bytes} (actual={size})"
         )));
     }
+    // Read one byte past the cap so growth after the stat is still detected
+    // without ever buffering an unbounded file.
     let mut bytes = Vec::with_capacity(size);
     file.by_ref()
         .take(u64::try_from(max_file_bytes.saturating_add(1)).unwrap_or(u64::MAX))
@@ -1751,6 +1912,8 @@ fn read_patch_learning_file_capped(
     Ok(bytes)
 }
 
+/// Parses every patched `skill.toml` and reports its identity and capability
+/// profile so reviewers see exactly what a skill patch grants.
 fn validate_skill_patch_targets(
     workspace_roots: &[PathBuf],
     files: &[Value],
@@ -1796,6 +1959,9 @@ fn validate_skill_patch_targets(
     Ok(results)
 }
 
+/// Attempts the review-free durable-fact write into a managed workspace
+/// block. Returns `Ok(false)` without writing when the prompt-injection scan
+/// is not clean, leaving the candidate queued for operator review.
 async fn try_auto_write_durable_fact(
     runtime_state: &Arc<GatewayRuntimeState>,
     run: &crate::journal::OrchestratorRunStatusSnapshot,
@@ -1861,6 +2027,8 @@ async fn try_auto_write_durable_fact(
     Ok(true)
 }
 
+/// Per-kind review threshold from config basis points (10_000 bps == 1.0);
+/// candidates below it are persisted as `suppressed` instead of `queued`.
 fn learning_review_min_confidence(
     candidate_kind: &str,
     learning_config: &LearningRuntimeConfig,
@@ -1890,6 +2058,9 @@ fn map_compaction_candidate_kind(candidate: &SessionCompactionCandidate) -> Opti
     }
 }
 
+/// Cheap lexical cue for splitting compaction `decision` entries into
+/// preferences vs durable facts; a false positive only changes review
+/// routing, not safety gating.
 fn looks_like_preference(content: &str) -> bool {
     let lower = content.to_ascii_lowercase();
     ["prefer ", "always ", "never ", "use ", "avoid ", "style", "tone"]
@@ -1919,6 +2090,8 @@ fn extract_text(record: &OrchestratorSessionTranscriptRecord) -> Option<String> 
         .filter(|value| !value.is_empty())
 }
 
+/// Managed-block IDs are stable per target document so repeated auto-writes
+/// update the same block instead of appending duplicates.
 fn managed_block_id(path: &str) -> &'static str {
     match path {
         "MEMORY.md" => "learning-memory",

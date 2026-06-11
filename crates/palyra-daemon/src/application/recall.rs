@@ -1,3 +1,21 @@
+//! Explicit recall: plans, executes, and explains retrieval across the five
+//! recall sources -- durable memory, workspace documents, the session
+//! transcript tape, checkpoints, and compaction artifacts.
+//!
+//! [`preview_recall`] builds a keyword-driven [`RecallPlan`], fans searches
+//! out per source, re-scores every hit through `crate::retrieval` profiles
+//! into one ranked candidate list, and emits an evidence-backed
+//! [`StructuredRecallOutput`] plus a prompt preview. The chosen candidates
+//! round-trip as an [`ExplicitRecallSelection`] inside the run parameter
+//! delta, which [`materialize_explicit_recall_context`] (called from
+//! `application::provider_input`) re-resolves against live journal state
+//! when the run actually executes.
+//!
+//! Session-scoped sources (transcript, checkpoint, compaction) stay blocked
+//! unless the requested session resolves for the authenticated principal --
+//! recall must not leak another principal's history. Everything rendered
+//! into prompts passes `sanitize_prompt_inline_value`.
+
 use std::{
     collections::{BTreeSet, HashMap},
     sync::Arc,
@@ -53,6 +71,8 @@ const MIN_TRANSCRIPT_RECENCY_SCORE: f64 = 0.15;
 #[allow(dead_code)]
 const MIN_SOURCE_QUALITY_SCORE: f64 = 0.20;
 
+/// Origin store of a recall hit; serialized into plans, citations, and tape
+/// payloads as `snake_case` strings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RecallSourceKind {
@@ -64,6 +84,7 @@ pub(crate) enum RecallSourceKind {
 }
 
 impl RecallSourceKind {
+    /// Stable wire name for this source; matches the serde representation.
     pub(crate) const fn as_str(&self) -> &'static str {
         match self {
             Self::Memory => "memory",
@@ -75,6 +96,8 @@ impl RecallSourceKind {
     }
 }
 
+/// Planner verdict per source: chosen, available-but-skipped, or blocked by
+/// a missing precondition (currently always the absence of a session scope).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RecallSourceDecision {
@@ -83,6 +106,8 @@ pub(crate) enum RecallSourceDecision {
     Blocked,
 }
 
+/// One planner row: a source's decision plus the human-readable reason
+/// surfaced in console explanations.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RecallPlanSource {
     pub(crate) source_kind: RecallSourceKind,
@@ -92,12 +117,16 @@ pub(crate) struct RecallPlanSource {
     pub(crate) query: String,
 }
 
+/// Budget knobs echoed back in the plan so operators can see why candidates
+/// were cut.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RecallBudgetExplain {
     pub(crate) prompt_budget_tokens: usize,
     pub(crate) candidate_limit: usize,
 }
 
+/// Explainable retrieval plan for one recall request: query expansion,
+/// session scope, budget, and the per-source decisions.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RecallPlan {
     pub(crate) original_query: String,
@@ -109,6 +138,8 @@ pub(crate) struct RecallPlan {
     pub(crate) sources: Vec<RecallPlanSource>,
 }
 
+/// Per-candidate score components; `final_score` already folds in the
+/// exact-phrase bonus and the sensitivity penalty.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct RecallScoreBreakdown {
     pub(crate) lexical_score: f64,
@@ -124,6 +155,8 @@ pub(crate) struct RecallScoreBreakdown {
     pub(crate) final_score: f64,
 }
 
+/// Source coordinates for one piece of evidence, precise enough to re-open
+/// the original record (tape seq, workspace path, artifact id).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RecallCitation {
     pub(crate) source_kind: RecallSourceKind,
@@ -140,12 +173,14 @@ pub(crate) struct RecallCitation {
     pub(crate) artifact_id: Option<String>,
 }
 
+/// Stable address of one transcript tape event (`run_id` plus sequence).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct TranscriptRecallRef {
     pub(crate) run_id: String,
     pub(crate) seq: i64,
 }
 
+/// Scored hit against one transcript tape event.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct TranscriptRecallHit {
     pub(crate) run_id: String,
@@ -157,6 +192,7 @@ pub(crate) struct TranscriptRecallHit {
     pub(crate) score: f64,
 }
 
+/// Scored hit against one session checkpoint's metadata.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct CheckpointRecallHit {
     pub(crate) checkpoint_id: String,
@@ -170,6 +206,7 @@ pub(crate) struct CheckpointRecallHit {
     pub(crate) score: f64,
 }
 
+/// Scored hit against one compaction artifact's trigger reason and summary.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct CompactionRecallHit {
     pub(crate) artifact_id: String,
@@ -182,6 +219,8 @@ pub(crate) struct CompactionRecallHit {
     pub(crate) score: f64,
 }
 
+/// One ranked, source-agnostic recall result with its citation and score
+/// breakdown.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct RecallCandidate {
     pub(crate) candidate_id: String,
@@ -195,6 +234,8 @@ pub(crate) struct RecallCandidate {
     pub(crate) score: RecallScoreBreakdown,
 }
 
+/// Natural-language statement distilled from evidence, linked back to the
+/// evidence ids that support it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RecallFact {
     pub(crate) statement: String,
@@ -202,6 +243,8 @@ pub(crate) struct RecallFact {
     pub(crate) evidence_ids: Vec<String>,
 }
 
+/// Evidence row in the structured output: a top candidate re-labeled with a
+/// stable `evidence-N` id that facts and citations can reference.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct RecallEvidenceRecord {
     pub(crate) evidence_id: String,
@@ -214,6 +257,7 @@ pub(crate) struct RecallEvidenceRecord {
     pub(crate) score: RecallScoreBreakdown,
 }
 
+/// Count of evidence records contributed per (provider, source kind) pair.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct RecallProviderUsage {
     pub(crate) provider_id: String,
@@ -221,6 +265,8 @@ pub(crate) struct RecallProviderUsage {
     pub(crate) evidence_count: usize,
 }
 
+/// Synthesis envelope for a recall: summary, facts, evidence, contradiction
+/// flags, and a content hash so replay can detect output drift.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct StructuredRecallOutput {
     pub(crate) summary: String,
@@ -243,6 +289,9 @@ pub(crate) struct StructuredRecallOutput {
     pub(crate) confidence: Option<f64>,
 }
 
+/// Operator- or planner-chosen recall set carried in the run parameter
+/// delta; ids here are re-resolved against live journal state at run time
+/// rather than trusted as materialized content.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct ExplicitRecallSelection {
     pub(crate) query: String,
@@ -272,6 +321,8 @@ pub(crate) struct ExplicitRecallSelection {
     pub(crate) compaction_artifact_ids: Vec<String>,
 }
 
+/// Full preview response: raw per-source hits, ranked candidates, structured
+/// output, the plan, branch diagnostics, and the rendered prompt preview.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct RecallPreviewEnvelope {
     pub(crate) query: String,
@@ -295,6 +346,8 @@ pub(crate) struct RecallPreviewEnvelope {
     pub(crate) prompt_preview: String,
 }
 
+/// Tunable recall inputs; pass through [`RecallRequest::normalized`] before
+/// use so scope strings are trimmed and limits are clamped.
 #[derive(Debug, Clone)]
 pub(crate) struct RecallRequest {
     pub(crate) query: String,
@@ -311,6 +364,8 @@ pub(crate) struct RecallRequest {
     pub(crate) prompt_budget_tokens: usize,
 }
 
+/// Hits re-fetched for an explicit selection at run time, ready for prompt
+/// rendering and tape capture.
 #[derive(Debug, Clone)]
 pub(crate) struct MaterializedRecallContext {
     pub(crate) memory_hits: Vec<MemorySearchHit>,
@@ -322,12 +377,16 @@ pub(crate) struct MaterializedRecallContext {
     pub(crate) structured_output: StructuredRecallOutput,
 }
 
+/// Deserialization envelope for the `explicit_recall` key of a run
+/// parameter delta.
 #[derive(Debug, Clone, Deserialize)]
 struct RecallParameterDeltaEnvelope {
     #[serde(default)]
     explicit_recall: Option<ExplicitRecallSelection>,
 }
 
+/// Internal result of one full recall execution, split into the preview
+/// envelope by [`preview_recall`].
 #[derive(Debug, Clone)]
 struct RecallExecution {
     memory_hits: Vec<MemorySearchHit>,
@@ -343,11 +402,14 @@ struct RecallExecution {
     diagnostics: Vec<RetrievalBranchDiagnostics>,
 }
 
+/// Ranking wrapper around a candidate; kept as a distinct type so the
+/// reranker's input cannot be confused with already-finalized candidates.
 #[derive(Debug, Clone)]
 struct CandidateRecord {
     candidate: RecallCandidate,
 }
 
+/// Borrowed view over all per-source hit lists feeding candidate ranking.
 struct RecallCandidateSources<'a> {
     memory_hits: &'a [MemorySearchHit],
     workspace_hits: &'a [WorkspaceSearchHit],
@@ -357,6 +419,8 @@ struct RecallCandidateSources<'a> {
 }
 
 impl RecallRequest {
+    /// Trims scope strings to `None` when blank and clamps top-k, score, and
+    /// budget values into their supported ranges.
     pub(crate) fn normalized(self) -> Self {
         Self {
             query: self.query,
@@ -375,6 +439,8 @@ impl RecallRequest {
     }
 }
 
+/// Builds a [`RecallRequest`] with the default per-source limits, score
+/// floor, and prompt budget for the given query and scope.
 pub(crate) fn default_recall_request(
     query: impl Into<String>,
     session_id: Option<String>,
@@ -396,6 +462,10 @@ pub(crate) fn default_recall_request(
     }
 }
 
+/// Extracts the `explicit_recall` selection from a run parameter delta.
+///
+/// Malformed or empty JSON degrades to `None` on purpose: recall is
+/// best-effort context, and a bad delta must not fail the run it rides on.
 pub(crate) fn parse_explicit_recall_selection(
     parameter_delta_json: Option<&str>,
 ) -> Option<ExplicitRecallSelection> {
@@ -408,6 +478,13 @@ pub(crate) fn parse_explicit_recall_selection(
         .and_then(|value| value.explicit_recall)
 }
 
+/// Plans and executes a full recall pass without side effects on the run:
+/// per-source searches, unified ranking, structured synthesis, and a prompt
+/// preview, all wrapped with the plan and diagnostics for console display.
+///
+/// # Errors
+/// Returns `InvalidArgument` when the trimmed query is empty, and propagates
+/// session resolution, search, and journal errors from execution.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn preview_recall(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -436,6 +513,13 @@ pub(crate) async fn preview_recall(
     })
 }
 
+/// Re-resolves an [`ExplicitRecallSelection`] against live journal state at
+/// run time and rebuilds the ranked candidates and structured output from
+/// the re-fetched hits.
+///
+/// # Errors
+/// Returns `InvalidArgument` when the selection query is empty, and
+/// propagates session resolution, search, and journal errors.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn materialize_explicit_recall_context(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -482,6 +566,8 @@ pub(crate) async fn materialize_explicit_recall_context(
     })
 }
 
+/// Serializes a materialized recall as the run-tape event payload; keys are
+/// part of the tape contract consumed by replay and consoles.
 pub(crate) fn explicit_recall_tape_payload(
     selection: &ExplicitRecallSelection,
     context: &MaterializedRecallContext,
@@ -498,6 +584,8 @@ pub(crate) fn explicit_recall_tape_payload(
     })
 }
 
+/// Condenses a preview for console display: hit lists become counts while
+/// the plan, structured output, and diagnostics stay verbatim.
 pub(crate) fn recall_preview_console_payload(preview: &RecallPreviewEnvelope) -> Value {
     json!({
         "query": preview.query,
@@ -513,6 +601,10 @@ pub(crate) fn recall_preview_console_payload(preview: &RecallPreviewEnvelope) ->
     })
 }
 
+/// Prepends one tagged context section per non-empty source ahead of the
+/// user input text. Every interpolated value passes
+/// `sanitize_prompt_inline_value` so recalled content cannot break out of
+/// its context block.
 pub(crate) fn render_explicit_recall_prompt(
     memory_hits: &[MemorySearchHit],
     workspace_hits: &[WorkspaceSearchHit],
@@ -647,6 +739,8 @@ fn render_compaction_recall_section(compaction_hits: &[CompactionRecallHit]) -> 
     block
 }
 
+/// Runs the planned recall end to end: per-source searches gated by the
+/// plan, unified ranking, candidate selection, and prompt rendering.
 #[allow(clippy::result_large_err)]
 async fn execute_recall(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -695,6 +789,9 @@ async fn execute_recall(
         };
     let mut diagnostics = memory_diagnostics;
     diagnostics.extend(workspace_diagnostics);
+    // build_recall_plan only Selects the session-scoped sources below when
+    // scoped_session_id is Some, which is what makes these expects invariants
+    // rather than reachable panics.
     let transcript_records =
         if plan_source_selected(plan.sources.as_slice(), RecallSourceKind::Transcript) {
             runtime_state
@@ -810,6 +907,13 @@ async fn execute_recall(
     })
 }
 
+/// Re-fetches the hits named by an explicit selection against live state.
+///
+/// Searches over-fetch (4x the selected id count, clamped) so previously
+/// chosen ids still surface even if their rank slipped since the preview,
+/// then the `select_*` helpers filter back to exactly the requested ids in
+/// selection order. `top_candidates` and the structured output are returned
+/// empty; the caller rebuilds them from the re-fetched hits.
 async fn build_selection_context(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: &RequestContext,
@@ -866,6 +970,8 @@ async fn build_selection_context(
             .await?;
         workspace_hits =
             select_workspace_hits(candidate_hits, selection.workspace_document_ids.as_slice());
+        // Stamp last_recalled_at on the documents that actually materialized
+        // so workspace usage tracking reflects explicit recalls.
         let recalled_at_unix_ms = current_unix_ms();
         for hit in &workspace_hits {
             runtime_state
@@ -877,6 +983,14 @@ async fn build_selection_context(
         }
     }
 
+    // AIDEV-NOTE: the expects below assume every selection carrying
+    // transcript/checkpoint/compaction refs also carries a session id.
+    // Selections built by selection_from_candidates uphold that, but
+    // parse_explicit_recall_selection accepts arbitrary parameter-delta
+    // JSON, so a hand-crafted delta with refs and no session id reaches
+    // these expects and panics the request path. Failing closed with
+    // FailedPrecondition instead would be a behavior change outside this
+    // doc-only pass.
     let transcript_hits = if !selection.transcript_refs.is_empty() {
         let transcript_records = runtime_state
             .list_orchestrator_session_transcript(
@@ -954,6 +1068,9 @@ async fn build_selection_context(
     })
 }
 
+/// Resolves the requested session for the authenticated context
+/// (`require_existing`), denying recall scope to sessions the caller cannot
+/// resolve; a `None` or blank request means no session scope, not an error.
 async fn validate_recall_session_scope(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: &RequestContext,
@@ -977,6 +1094,11 @@ async fn validate_recall_session_scope(
     Ok(Some(session_id))
 }
 
+/// Builds the per-source plan from cheap keyword cues in the query.
+///
+/// Memory and workspace are always-on baselines (skipped only at top_k 0);
+/// transcript, checkpoint, and compaction require a validated session scope
+/// and are otherwise reported as `Blocked` so consoles can explain the gap.
 fn build_recall_plan(
     query: &str,
     query_variants: &[String],
@@ -1108,6 +1230,9 @@ fn build_query_variants(query: &str) -> Vec<String> {
     build_memory_query_variants(query)
 }
 
+/// Runs the memory search once per query variant (capped at
+/// `MAX_RECALL_QUERY_VARIANTS`), merging duplicates by memory id before
+/// re-truncating to `top_k`.
 #[allow(clippy::result_large_err)]
 async fn search_memory_hits_for_recall(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -1140,6 +1265,10 @@ async fn search_memory_hits_for_recall(
     Ok((merged_hits, diagnostics))
 }
 
+/// Scores transcript events with the transcript retrieval profile. The
+/// `min_score` floor is applied to the lexical overlap alone, before the
+/// blended final score is computed (the same pre-filter all hit builders
+/// here use).
 fn build_transcript_hits(
     transcript_records: &[OrchestratorSessionTranscriptRecord],
     query_variants: &[String],
@@ -1191,6 +1320,9 @@ fn build_transcript_hits(
     hits
 }
 
+/// Scores checkpoints against their name, note, and workspace paths with the
+/// checkpoint retrieval profile; lexical pre-filter as in
+/// [`build_transcript_hits`].
 fn build_checkpoint_hits(
     checkpoints: &[OrchestratorCheckpointRecord],
     query_variants: &[String],
@@ -1252,6 +1384,9 @@ fn build_checkpoint_hits(
     hits
 }
 
+/// Scores compaction artifacts against trigger reason and summary text with
+/// the compaction retrieval profile; lexical pre-filter as in
+/// [`build_transcript_hits`].
 fn build_compaction_hits(
     artifacts: &[OrchestratorCompactionArtifactRecord],
     query_variants: &[String],
@@ -1309,6 +1444,12 @@ fn build_compaction_hits(
     hits
 }
 
+/// Flattens all per-source hits into uniformly scored candidates.
+///
+/// Memory and workspace hits arrive with a retrieval breakdown and are only
+/// re-based with the recall bonus/penalty; transcript hits are re-scored
+/// here; checkpoint and compaction hits use a fixed source-quality prior
+/// because their recall hit shape no longer carries the underlying record.
 fn build_candidate_records(
     query_variants: &[String],
     sources: &RecallCandidateSources<'_>,
@@ -1451,6 +1592,9 @@ fn build_candidate_records(
         let vector_score = retrieval_proxy_vector_score(searchable.as_str(), query_variants);
         let recency_score =
             retrieval_recency_score(hit.created_at_unix_ms, now_unix_ms, profile.min_recency_bps);
+        // Fixed prior: the hit no longer carries the checkpoint record, so
+        // source quality cannot be recomputed; a higher configured profile
+        // floor still wins.
         let source_quality_score =
             0.88_f64.clamp(f64::from(profile.min_source_quality_bps) / 10_000.0, 1.0);
         let score_breakdown = score_with_profile(
@@ -1507,6 +1651,8 @@ fn build_candidate_records(
         let vector_score = retrieval_proxy_vector_score(searchable.as_str(), query_variants);
         let recency_score =
             retrieval_recency_score(hit.created_at_unix_ms, now_unix_ms, profile.min_recency_bps);
+        // Fixed prior, slightly below checkpoints: summaries are derived
+        // content, not operator-curated state. See the checkpoint note above.
         let source_quality_score =
             0.84_f64.clamp(f64::from(profile.min_source_quality_bps) / 10_000.0, 1.0);
         let score_breakdown = score_with_profile(
@@ -1555,6 +1701,9 @@ fn build_candidate_records(
     records
 }
 
+/// Re-bases a retrieval score for recall ranking: a small exact-phrase bonus
+/// rewards literal matches, and the sensitivity penalty demotes snippets
+/// that look credential-bearing so they do not win prompt placement.
 fn recall_score_breakdown(
     query_variants: &[String],
     snippet: &str,
@@ -1580,6 +1729,8 @@ fn recall_score_breakdown(
     }
 }
 
+/// Binary phrase-match signal; variants shorter than 4 chars are ignored
+/// because they match almost anything.
 fn recall_exact_phrase_match(query_variants: &[String], snippet: &str) -> f64 {
     let snippet = snippet.to_ascii_lowercase();
     if query_variants
@@ -1594,6 +1745,9 @@ fn recall_exact_phrase_match(query_variants: &[String], snippet: &str) -> f64 {
     }
 }
 
+/// Flat ranking penalty for snippets containing credential-like markers.
+/// This only demotes ranking; it does not redact the snippet -- redaction is
+/// the journal pipeline's job.
 fn recall_sensitivity_penalty(snippet: &str) -> f64 {
     let lower = snippet.to_ascii_lowercase();
     if contains_any(
@@ -1606,6 +1760,11 @@ fn recall_sensitivity_penalty(snippet: &str) -> f64 {
     }
 }
 
+/// Ranks candidates and packs them into the prompt token budget.
+///
+/// The top candidate is always admitted even when it alone exceeds the
+/// budget, and over-budget candidates are skipped rather than ending the
+/// scan, so smaller lower-ranked items can still fill the remaining space.
 fn finalize_top_candidates(
     mut candidate_records: Vec<CandidateRecord>,
     max_candidates: usize,
@@ -1632,6 +1791,8 @@ fn finalize_top_candidates(
     selected
 }
 
+/// Folds ranked candidates back into the source-specific id lists of an
+/// [`ExplicitRecallSelection`] for the parameter-delta round trip.
 fn selection_from_candidates(
     query: &str,
     request: &RecallRequest,
@@ -1681,6 +1842,10 @@ fn selection_from_candidates(
     }
 }
 
+/// Distills ranked candidates into the evidence-backed synthesis: facts pass
+/// quality heuristics so raw tool output never masquerades as a fact,
+/// contradictions are keyword-detected, and the synthesis hash binds the
+/// output to its inputs for replay comparison.
 fn build_structured_output(
     top_candidates: &[RecallCandidate],
     query: &str,
@@ -1792,6 +1957,8 @@ fn build_unresolved_recall_items(evidence: &[RecallEvidenceRecord], query: &str)
     }
 }
 
+/// Coarse keyword-pair scan for conflicting guidance across evidence
+/// snippets; cheap recall hygiene, not semantic contradiction detection.
 fn detect_recall_contradictions(evidence: &[RecallEvidenceRecord]) -> Vec<String> {
     const CONTRADICTION_PAIRS: &[(&str, &str)] = &[
         ("enable", "disable"),
@@ -1842,6 +2009,8 @@ fn provider_id_for_source(source_kind: &RecallSourceKind) -> &'static str {
     }
 }
 
+/// Order-sensitive SHA-256 over query, summary, evidence, and contradictions
+/// so replay can detect any drift in the synthesized output.
 fn recall_synthesis_hash(
     query: &str,
     summary: &str,
@@ -1869,6 +2038,8 @@ fn recall_synthesis_hash(
     hex::encode(hasher.finalize())
 }
 
+/// Reduces a snippet to its first non-empty sentence, sanitized and capped
+/// for display.
 fn summarize_fact(snippet: &str) -> String {
     let normalized = sanitize_prompt_inline_value(snippet);
     let sentence = normalized
@@ -1893,6 +2064,8 @@ fn recall_fact_from_evidence(evidence: &RecallEvidenceRecord) -> Option<RecallFa
     })
 }
 
+/// Heuristic gate keeping tool output and serialized fragments out of the
+/// facts list; the raw evidence rows still carry the full snippet.
 fn recall_fact_summary_is_low_quality(summary: &str) -> bool {
     let trimmed = summary.trim();
     if trimmed.is_empty() {
@@ -1929,6 +2102,8 @@ fn recall_fact_summary_is_low_quality(summary: &str) -> bool {
     punctuation_count > alpha_count
 }
 
+/// Detects text that is a truncated JSON or serialized fragment; an odd
+/// number of quotes is the tell-tale of mid-string truncation.
 fn looks_like_serialized_fragment(value: &str) -> bool {
     let trimmed = value.trim();
     if trimmed
@@ -1950,6 +2125,9 @@ fn plan_source_selected(sources: &[RecallPlanSource], kind: RecallSourceKind) ->
     })
 }
 
+/// Ascending candidate ordering: final score, then source quality, then
+/// recency, then source ref as the deterministic tiebreaker. Callers flip
+/// the arguments to sort descending.
 fn compare_candidate_records(
     left: &CandidateRecord,
     right: &CandidateRecord,
@@ -1965,6 +2143,8 @@ fn compare_candidate_records(
         .then_with(|| left.candidate.source_ref.cmp(&right.candidate.source_ref))
 }
 
+/// Total order over scores; NaN (never produced by the clamped scorers)
+/// compares equal instead of poisoning the sort.
 fn compare_scores(left: f64, right: f64) -> std::cmp::Ordering {
     left.partial_cmp(&right).unwrap_or(std::cmp::Ordering::Equal)
 }
@@ -2007,6 +2187,14 @@ fn compaction_reason(
     )
 }
 
+// Test-only reference implementations of the legacy local scorer, kept so
+// unit tests can sanity-check the crate::retrieval-backed scores against a
+// known-simple baseline.
+// AIDEV-NOTE: only lexical_overlap_score and proxy_vector_score (plus their
+// helpers normalized_tokens and char_ngrams) are still exercised by tests;
+// the remaining #[allow(dead_code)] source-quality/recency/final_score
+// helpers and the two MIN_* consts are unreferenced and are deletion
+// candidates once a human confirms they are not kept for parity tests.
 #[cfg(test)]
 #[allow(dead_code)]
 fn transcript_source_quality(record: &OrchestratorSessionTranscriptRecord) -> f64 {
@@ -2184,6 +2372,7 @@ fn char_ngrams(input: &str) -> BTreeSet<String> {
     grams
 }
 
+/// Rough chars/4 token estimate; only used for prompt budget packing.
 fn estimate_tokens(input: &str) -> usize {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -2204,6 +2393,9 @@ fn trim_option(value: Option<String>) -> Option<String> {
     })
 }
 
+/// Filters hits to the selected ids, preserving selection (ranking) order;
+/// removing from the map also deduplicates repeated ids. The sibling
+/// `select_*` helpers below follow the same contract.
 fn select_memory_hits(hits: Vec<MemorySearchHit>, selected_ids: &[String]) -> Vec<MemorySearchHit> {
     let mut by_id =
         hits.into_iter().map(|hit| (hit.item.memory_id.clone(), hit)).collect::<HashMap<_, _>>();
