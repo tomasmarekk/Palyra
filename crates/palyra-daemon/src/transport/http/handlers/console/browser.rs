@@ -1,9 +1,29 @@
+//! Console browser-control handlers for the `/console/v1/browser/*` routes.
+//!
+//! Every handler authorizes the console session, validates identifiers, then
+//! proxies the operation to `palyra-browserd` over gRPC (`browser_v1`) and
+//! re-shapes the response into `control_plane` envelopes consumed by
+//! `apps/web` (the JSON field names are wire contract). Mutating handlers
+//! additionally write a `browser.*` console audit event with session/tab/
+//! profile identifiers redacted. The browser-extension relay flow (token
+//! minting plus token-authenticated relay actions) also lives here; relay
+//! tokens are stored hashed in [`AppState::relay_tokens`] and compared in
+//! constant time.
+
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 
 use crate::*;
 
+/// gRPC metadata key carrying the console caller's principal to browserd for
+/// per-principal scoping of session-derived data (downloads, network log).
 const BROWSER_CALLER_PRINCIPAL_HEADER: &str = "x-palyra-principal";
 
+/// Resolves the effective `allow_private_targets` flag for a navigation.
+///
+/// On a `local_desktop` deployment, loopback URLs are implicitly allowed even
+/// without an explicit opt-in so operators can drive locally hosted apps
+/// (e.g. the canvas host) without weakening the private-target guard for any
+/// other destination.
 fn console_browser_allows_private_targets_for_url(
     state: &AppState,
     allow_private_targets: Option<bool>,
@@ -13,6 +33,8 @@ fn console_browser_allows_private_targets_for_url(
         || (state.deployment.mode == "local_desktop" && console_browser_url_targets_loopback(url))
 }
 
+/// Returns `true` only for `http`/`https` URLs whose host is `localhost` or a
+/// loopback IP; unparseable URLs and every other scheme are non-loopback.
 fn console_browser_url_targets_loopback(raw_url: &str) -> bool {
     let Ok(parsed) = Url::parse(raw_url.trim()) else {
         return false;
@@ -33,6 +55,12 @@ fn console_browser_url_targets_loopback(raw_url: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// `GET /console/v1/browser/profiles` — lists browser profiles for the
+/// resolved principal, including which profile is active.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the principal
+/// is invalid, or the browserd RPC fails.
 pub(crate) async fn console_browser_profiles_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -62,6 +90,12 @@ pub(crate) async fn console_browser_profiles_list_handler(
     }))
 }
 
+/// `POST /console/v1/browser/profiles/create` — creates a browser profile
+/// and records a `browser.profile.created` audit event.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the name is
+/// empty, the browserd RPC fails, or the audit event cannot be recorded.
 pub(crate) async fn console_browser_profile_create_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -115,6 +149,13 @@ pub(crate) async fn console_browser_profile_create_handler(
     Ok(Json(control_plane::BrowserProfileEnvelope { contract: contract_descriptor(), profile }))
 }
 
+/// `POST /console/v1/browser/profiles/{profile_id}/rename` — renames a
+/// profile and records a `browser.profile.renamed` audit event.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the profile id
+/// or name is invalid, the browserd RPC fails, or the audit event cannot be
+/// recorded.
 pub(crate) async fn console_browser_profile_rename_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -166,6 +207,12 @@ pub(crate) async fn console_browser_profile_rename_handler(
     Ok(Json(control_plane::BrowserProfileEnvelope { contract: contract_descriptor(), profile }))
 }
 
+/// `POST /console/v1/browser/profiles/{profile_id}/delete` — deletes a
+/// profile and records a `browser.profile.deleted` audit event.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the profile id
+/// is invalid, the browserd RPC fails, or the audit event cannot be recorded.
 pub(crate) async fn console_browser_profile_delete_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -212,6 +259,12 @@ pub(crate) async fn console_browser_profile_delete_handler(
     Ok(Json(envelope))
 }
 
+/// `POST /console/v1/browser/profiles/{profile_id}/activate` — marks a
+/// profile active and records a `browser.profile.activated` audit event.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the profile id
+/// is invalid, the browserd RPC fails, or the audit event cannot be recorded.
 pub(crate) async fn console_browser_profile_activate_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -256,6 +309,12 @@ pub(crate) async fn console_browser_profile_activate_handler(
     Ok(Json(control_plane::BrowserProfileEnvelope { contract: contract_descriptor(), profile }))
 }
 
+/// `GET /console/v1/browser/sessions` — lists live browser sessions for the
+/// resolved principal (most recent first, limit clamped to 1..=250).
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the principal
+/// is invalid, or the browserd RPC fails.
 pub(crate) async fn console_browser_sessions_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -288,6 +347,14 @@ pub(crate) async fn console_browser_sessions_list_handler(
     })))
 }
 
+/// `POST /console/v1/browser/sessions` — creates a browser session with the
+/// requested budget/persistence options and records a
+/// `browser.session.created` audit event.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the principal
+/// or profile id is invalid, the browserd RPC fails, or the audit event
+/// cannot be recorded.
 pub(crate) async fn console_browser_session_create_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -371,6 +438,12 @@ pub(crate) async fn console_browser_session_create_handler(
     Ok(Json(envelope))
 }
 
+/// `GET /console/v1/browser/sessions/{session_id}` — returns the session
+/// summary, effective budget, and tab list.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the session id
+/// is not a canonical ULID, or the browserd RPC fails.
 pub(crate) async fn console_browser_session_show_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -395,6 +468,13 @@ pub(crate) async fn console_browser_session_show_handler(
     })))
 }
 
+/// `GET /console/v1/browser/sessions/{session_id}/inspect` — deep-inspects a
+/// session (cookies, storage, action/network/console logs, page snapshot)
+/// with per-section opt-ins and byte caps from the query string.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the session id
+/// is not a canonical ULID, or the browserd RPC fails.
 pub(crate) async fn console_browser_session_inspect_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -453,6 +533,14 @@ pub(crate) async fn console_browser_session_inspect_handler(
     })))
 }
 
+/// `POST /console/v1/browser/sessions/{session_id}/close` — closes a session,
+/// remembers it as closed for friendlier later errors, and records a
+/// `browser.session.closed` audit event.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the session id
+/// is not a canonical ULID, the browserd RPC fails, or the audit event cannot
+/// be recorded.
 pub(crate) async fn console_browser_session_close_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -494,6 +582,13 @@ pub(crate) async fn console_browser_session_close_handler(
     Ok(Json(envelope))
 }
 
+/// `POST /console/v1/browser/sessions/{session_id}/navigate` — navigates the
+/// active tab and records a `browser.action.navigate` audit event.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the session id
+/// or URL is invalid, the browserd RPC fails, or the audit event cannot be
+/// recorded.
 pub(crate) async fn console_browser_navigate_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -555,6 +650,14 @@ pub(crate) async fn console_browser_navigate_handler(
     Ok(Json(envelope))
 }
 
+/// `POST /console/v1/browser/sessions/{session_id}/click` — clicks the first
+/// element matching the selector and records a `browser.action.click` audit
+/// event.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the session id
+/// or selector is invalid, the browserd RPC fails, or the audit event cannot
+/// be recorded.
 pub(crate) async fn console_browser_click_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -617,6 +720,14 @@ pub(crate) async fn console_browser_click_handler(
     Ok(Json(envelope))
 }
 
+/// `POST /console/v1/browser/sessions/{session_id}/type` — types text into
+/// the element matching the selector and records a `browser.action.type`
+/// audit event (typed byte count only, never the text itself).
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the session id
+/// or selector is invalid, the browserd RPC fails, or the audit event cannot
+/// be recorded.
 pub(crate) async fn console_browser_type_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -681,6 +792,13 @@ pub(crate) async fn console_browser_type_handler(
     Ok(Json(envelope))
 }
 
+/// `POST /console/v1/browser/sessions/{session_id}/press` — presses a key in
+/// the active tab and records a `browser.action.press` audit event.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the session id
+/// or key is invalid, the browserd RPC fails, or the audit event cannot be
+/// recorded.
 pub(crate) async fn console_browser_press_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -742,6 +860,13 @@ pub(crate) async fn console_browser_press_handler(
     Ok(Json(envelope))
 }
 
+/// `POST /console/v1/browser/sessions/{session_id}/select` — selects a value
+/// in a `<select>` element and records a `browser.action.select` audit event.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the session
+/// id, selector, or value is invalid, the browserd RPC fails, or the audit
+/// event cannot be recorded.
 pub(crate) async fn console_browser_select_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -811,6 +936,14 @@ pub(crate) async fn console_browser_select_handler(
     Ok(Json(envelope))
 }
 
+/// `POST /console/v1/browser/sessions/{session_id}/highlight` — visually
+/// highlights the element matching the selector and records a
+/// `browser.action.highlight` audit event.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the session id
+/// or selector is invalid, the browserd RPC fails, or the audit event cannot
+/// be recorded.
 pub(crate) async fn console_browser_highlight_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -873,6 +1006,14 @@ pub(crate) async fn console_browser_highlight_handler(
     Ok(Json(envelope))
 }
 
+/// `POST /console/v1/browser/sessions/{session_id}/scroll` — scrolls the
+/// active tab by the requested deltas and records a `browser.action.scroll`
+/// audit event.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the session id
+/// is not a canonical ULID, the browserd RPC fails, or the audit event cannot
+/// be recorded.
 pub(crate) async fn console_browser_scroll_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -930,6 +1071,14 @@ pub(crate) async fn console_browser_scroll_handler(
     Ok(Json(envelope))
 }
 
+/// `POST /console/v1/browser/sessions/{session_id}/wait-for` — polls until a
+/// selector and/or text appears and records a `browser.action.wait_for`
+/// audit event.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the session id
+/// is not a canonical ULID, the browserd RPC fails, or the audit event cannot
+/// be recorded.
 pub(crate) async fn console_browser_wait_for_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -993,6 +1142,12 @@ pub(crate) async fn console_browser_wait_for_handler(
     Ok(Json(envelope))
 }
 
+/// `GET /console/v1/browser/sessions/{session_id}/title` — returns the active
+/// tab's title, truncated to the configured byte budget.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the session id
+/// is not a canonical ULID, or the browserd RPC fails.
 pub(crate) async fn console_browser_title_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1019,6 +1174,13 @@ pub(crate) async fn console_browser_title_handler(
     }))
 }
 
+/// `GET /console/v1/browser/sessions/{session_id}/screenshot` — captures a
+/// screenshot of the active tab as base64 (default `png`), capped by the
+/// configured screenshot byte budget.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the session id
+/// is not a canonical ULID, or the browserd RPC fails.
 pub(crate) async fn console_browser_screenshot_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1053,6 +1215,12 @@ pub(crate) async fn console_browser_screenshot_handler(
     }))
 }
 
+/// `GET /console/v1/browser/sessions/{session_id}/pdf` — exports the active
+/// tab as a PDF (inline base64 plus an optional download artifact record).
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the session id
+/// is not a canonical ULID, or the browserd RPC fails.
 pub(crate) async fn console_browser_pdf_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1083,6 +1251,13 @@ pub(crate) async fn console_browser_pdf_handler(
     }))
 }
 
+/// `GET /console/v1/browser/sessions/{session_id}/observe` — returns DOM
+/// snapshot, accessibility tree, and visible text for the active tab, each
+/// individually opt-out and byte-capped.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the session id
+/// is not a canonical ULID, or the browserd RPC fails.
 pub(crate) async fn console_browser_observe_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1125,6 +1300,14 @@ pub(crate) async fn console_browser_observe_handler(
     }))
 }
 
+/// `GET /console/v1/browser/sessions/{session_id}/network-log` — returns the
+/// session's captured network log entries; the caller principal is forwarded
+/// so browserd can enforce per-principal access to the log.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the session id
+/// is not a canonical ULID, the principal cannot be encoded as metadata, or
+/// the browserd RPC fails.
 pub(crate) async fn console_browser_network_log_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1165,6 +1348,13 @@ pub(crate) async fn console_browser_network_log_handler(
     }))
 }
 
+/// `GET /console/v1/browser/sessions/{session_id}/console` — returns the
+/// page's console log entries filtered by minimum severity, optionally with
+/// aggregate page diagnostics.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the session id
+/// is not a canonical ULID, or the browserd RPC fails.
 pub(crate) async fn console_browser_console_log_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1201,6 +1391,14 @@ pub(crate) async fn console_browser_console_log_handler(
     }))
 }
 
+/// `POST /console/v1/browser/sessions/{session_id}/reset-state` — clears the
+/// selected session state (cookies, storage, tabs, permissions) and records
+/// a `browser.state.reset` audit event.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the session id
+/// is not a canonical ULID, the browserd RPC fails, or the audit event cannot
+/// be recorded.
 pub(crate) async fn console_browser_reset_state_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1250,6 +1448,12 @@ pub(crate) async fn console_browser_reset_state_handler(
     Ok(Json(envelope))
 }
 
+/// `GET /console/v1/browser/sessions/{session_id}/tabs` — lists the session's
+/// open tabs and the active tab id.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the session id
+/// is not a canonical ULID, or the browserd RPC fails.
 pub(crate) async fn console_browser_tabs_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1277,6 +1481,13 @@ pub(crate) async fn console_browser_tabs_list_handler(
     }))
 }
 
+/// `POST /console/v1/browser/sessions/{session_id}/tabs/open` — opens a new
+/// tab at the requested URL and records a `browser.tab.opened` audit event.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the session id
+/// or URL is invalid, the browserd RPC fails, or the audit event cannot be
+/// recorded.
 pub(crate) async fn console_browser_tab_open_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1337,6 +1548,13 @@ pub(crate) async fn console_browser_tab_open_handler(
     Ok(Json(envelope))
 }
 
+/// `POST /console/v1/browser/sessions/{session_id}/tabs/switch` — activates
+/// another tab and records a `browser.tab.switched` audit event.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the session id
+/// or tab id is invalid, the browserd RPC fails, or the audit event cannot be
+/// recorded.
 pub(crate) async fn console_browser_tab_switch_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1380,6 +1598,14 @@ pub(crate) async fn console_browser_tab_switch_handler(
     Ok(Json(envelope))
 }
 
+/// `POST /console/v1/browser/sessions/{session_id}/tabs/close` — closes a tab
+/// (the active one when no `tab_id` is given) and records a
+/// `browser.tab.closed` audit event.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the session id
+/// or tab id is invalid, the browserd RPC fails, or the audit event cannot be
+/// recorded.
 pub(crate) async fn console_browser_tab_close_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1427,6 +1653,12 @@ pub(crate) async fn console_browser_tab_close_handler(
     Ok(Json(envelope))
 }
 
+/// `GET /console/v1/browser/sessions/{session_id}/permissions` — returns the
+/// session's camera/microphone/location permission settings.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the session id
+/// is not a canonical ULID, or the browserd RPC fails.
 pub(crate) async fn console_browser_permissions_get_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1452,6 +1684,14 @@ pub(crate) async fn console_browser_permissions_get_handler(
     }))
 }
 
+/// `POST /console/v1/browser/sessions/{session_id}/permissions` — updates the
+/// session's permission settings (or resets them to defaults) and records a
+/// `browser.permissions.set` audit event.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the session id
+/// is not a canonical ULID, the browserd RPC fails, or the audit event cannot
+/// be recorded.
 pub(crate) async fn console_browser_permissions_set_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1498,6 +1738,14 @@ pub(crate) async fn console_browser_permissions_set_handler(
     Ok(Json(envelope))
 }
 
+/// `GET /console/v1/browser/downloads` — lists download artifacts for a
+/// session; the caller principal is forwarded so browserd can enforce
+/// per-principal access to artifacts.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the session id
+/// is invalid, the principal cannot be encoded as metadata, or the browserd
+/// RPC fails.
 pub(crate) async fn console_browser_downloads_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1540,6 +1788,18 @@ pub(crate) async fn console_browser_downloads_list_handler(
     }))
 }
 
+/// `POST /console/v1/browser/relay/tokens` — mints a short-lived bearer token
+/// that lets the browser extension perform a scoped set of relay actions
+/// against one session, and records a `browser.relay.token.minted` audit
+/// event (hash only, never the token).
+///
+/// The plaintext token appears exactly once, in this response; the daemon
+/// keeps only its SHA-256 hash keyed in [`AppState::relay_tokens`].
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the session or
+/// extension id is invalid, the system clock cannot be read, or the audit
+/// event cannot be recorded.
 pub(crate) async fn console_browser_relay_token_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1570,6 +1830,9 @@ pub(crate) async fn console_browser_relay_token_handler(
         expires_at_unix_ms,
     };
     {
+        // Prune both before and after the insert: the first pass clears
+        // expired entries, the second re-enforces the size cap with the new
+        // token counted (it may evict the earliest-expiring record).
         let mut relay_tokens = lock_relay_tokens(&state.relay_tokens);
         prune_console_relay_tokens(&mut relay_tokens, issued_at_unix_ms);
         relay_tokens.insert(token_hash_sha256.clone(), record.clone());
@@ -1603,6 +1866,20 @@ pub(crate) async fn console_browser_relay_token_handler(
     })))
 }
 
+/// `POST /console/v1/browser/relay/actions` — executes a relay action
+/// (open_tab, capture_selection, send_page_snapshot) authenticated by a
+/// bearer relay token instead of a console session, and records a
+/// `browser.relay.action` audit event under the principal that minted the
+/// token.
+///
+/// The token must match both the requested `session_id` and `extension_id`;
+/// either mismatch is a permission error so a leaked token cannot be replayed
+/// against another session or extension.
+///
+/// # Errors
+/// Returns an error response when the relay token is missing/expired/
+/// mismatched, the action or payload is invalid, the browserd RPC fails, or
+/// the audit event cannot be recorded.
 pub(crate) async fn console_browser_relay_action_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1712,6 +1989,8 @@ pub(crate) async fn console_browser_relay_action_handler(
                 },
             ))
         }
+        // Unreachable in practice: parse_console_relay_action_kind rejects
+        // unknown labels before this match.
         browser_v1::RelayActionKind::Unspecified => None,
     };
 
@@ -1784,6 +2063,12 @@ pub(crate) async fn console_browser_relay_action_handler(
     })))
 }
 
+/// Picks the browser principal: an explicit non-empty request value wins,
+/// otherwise the authenticated console session's principal is used.
+///
+/// # Errors
+/// Returns an invalid-argument response when the resolved principal is empty
+/// or longer than 128 bytes.
 #[allow(clippy::result_large_err)]
 fn resolve_console_browser_principal(
     requested: Option<&str>,
@@ -1808,6 +2093,10 @@ fn normalize_optional_console_browser_channel(value: Option<&str>) -> Option<Str
     value.map(str::trim).filter(|candidate| !candidate.is_empty()).map(str::to_owned)
 }
 
+/// Validates that `raw` (after trimming) is a canonical ULID.
+///
+/// # Errors
+/// Returns an invalid-argument response naming `field_name` otherwise.
 #[allow(clippy::result_large_err)]
 fn validate_console_browser_canonical_id(raw: &str, field_name: &str) -> Result<(), Response> {
     validate_canonical_id(raw.trim()).map_err(|_| {
@@ -1817,6 +2106,11 @@ fn validate_console_browser_canonical_id(raw: &str, field_name: &str) -> Result<
     })
 }
 
+/// Trims and validates a mandatory canonical-ULID field.
+///
+/// # Errors
+/// Returns an invalid-argument response when the value is empty or not a
+/// canonical ULID.
 #[allow(clippy::result_large_err)]
 fn required_console_browser_canonical_id(raw: &str, field_name: &str) -> Result<String, Response> {
     let value = raw.trim();
@@ -1829,6 +2123,12 @@ fn required_console_browser_canonical_id(raw: &str, field_name: &str) -> Result<
     Ok(value.to_owned())
 }
 
+/// Converts an optional canonical-ULID field into proto form; absent or blank
+/// values become `None`.
+///
+/// # Errors
+/// Returns an invalid-argument response when a non-blank value is not a
+/// canonical ULID.
 #[allow(clippy::result_large_err)]
 fn optional_console_browser_canonical_id(
     raw: Option<&str>,
@@ -1972,6 +2272,7 @@ fn control_plane_browser_network_log_entry(
             value: header.value,
         })
         .collect::<Vec<_>>();
+    // Sorted so the envelope is deterministic regardless of capture order.
     headers.sort_by(|left, right| left.name.cmp(&right.name));
     control_plane::BrowserNetworkLogEntry {
         request_url: entry.request_url,
@@ -2274,6 +2575,15 @@ fn browser_page_diagnostics_to_value(value: &browser_v1::BrowserPageDiagnostics)
     })
 }
 
+/// Records a `browser.*` console audit event after redacting identifier
+/// fields from the details payload.
+///
+/// Failure to record is propagated to the caller, so mutating browser
+/// handlers fail closed: an action whose audit trail cannot be written is
+/// reported as an error even though browserd already performed it.
+///
+/// # Errors
+/// Returns the mapped runtime status response when the journal write fails.
 async fn record_browser_console_event(
     state: &AppState,
     context: &gateway::RequestContext,
@@ -2288,10 +2598,16 @@ async fn record_browser_console_event(
         .map_err(runtime_status_response)
 }
 
+/// Shortens an identifier to a `head***tail` form for audit payloads.
 fn redact_browser_console_identifier(value: &str) -> String {
     gateway::redact_session_id(value)
 }
 
+/// Returns `true` for JSON keys whose string values are browser identifiers.
+///
+/// Session/tab/profile/artifact ids double as capability handles on the
+/// `/console/v1/browser` surface, so audit events store them redacted to keep
+/// the journal from becoming a replayable handle inventory.
 fn browser_console_identifier_key(key: &str) -> bool {
     matches!(
         key,
@@ -2306,6 +2622,8 @@ fn browser_console_identifier_key(key: &str) -> bool {
     )
 }
 
+/// Recursively redacts identifier-keyed string values inside an audit details
+/// payload. Array elements inherit the key of the field that contains them.
 fn redact_browser_console_event_details(value: &mut Value, key_context: Option<&str>) {
     match value {
         Value::Object(map) => {
@@ -2328,6 +2646,12 @@ fn redact_browser_console_event_details(value: &mut Value, key_context: Option<&
     }
 }
 
+/// Trims and validates a browser extension id (ASCII alphanumerics plus
+/// `.`, `-`, `_`, length-capped).
+///
+/// # Errors
+/// Returns an invalid-argument response when the id is empty, too long, or
+/// contains unsupported characters.
 #[allow(clippy::result_large_err)]
 fn normalize_browser_extension_id(raw: &str) -> Result<String, Response> {
     let extension_id = raw.trim();
@@ -2352,21 +2676,31 @@ fn normalize_browser_extension_id(raw: &str) -> Result<String, Response> {
     Ok(extension_id.to_owned())
 }
 
+/// Clamps a requested relay-token TTL into the supported window, defaulting
+/// when absent.
 pub(crate) fn clamp_console_relay_token_ttl_ms(value: Option<u64>) -> u64 {
     value
         .unwrap_or(CONSOLE_RELAY_TOKEN_DEFAULT_TTL_MS)
         .clamp(CONSOLE_RELAY_TOKEN_MIN_TTL_MS, CONSOLE_RELAY_TOKEN_MAX_TTL_MS)
 }
 
+/// Mints a 256-bit random secret encoded as URL-safe base64 without padding.
+/// Shared by console session, CSRF, handoff, and relay token minting.
 pub(crate) fn mint_console_secret_token() -> String {
     let token_bytes: [u8; 32] = rand::random();
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_bytes)
 }
 
+/// Mints a browser-extension relay token (same entropy/encoding as every
+/// other console secret).
 pub(crate) fn mint_console_relay_token() -> String {
     mint_console_secret_token()
 }
 
+/// Locks the relay-token map, recovering from lock poisoning instead of
+/// panicking: the map only holds expiring token records, so serving requests
+/// with whatever state the panicked thread left behind is strictly better
+/// than taking the whole console surface down.
 fn lock_relay_tokens<'a>(
     tokens: &'a Arc<Mutex<HashMap<String, ConsoleRelayToken>>>,
 ) -> std::sync::MutexGuard<'a, HashMap<String, ConsoleRelayToken>> {
@@ -2379,6 +2713,11 @@ fn lock_relay_tokens<'a>(
     }
 }
 
+/// Compares two byte slices in time independent of where they first differ.
+///
+/// Used for secret-hash comparisons so an attacker cannot binary-search a
+/// token byte-by-byte from response latency. A length mismatch still returns
+/// `false` only after scanning `max(len)` bytes.
 pub(crate) fn constant_time_eq_bytes(left: &[u8], right: &[u8]) -> bool {
     let max_len = left.len().max(right.len());
     let mut difference = left.len() ^ right.len();
@@ -2390,6 +2729,11 @@ pub(crate) fn constant_time_eq_bytes(left: &[u8], right: &[u8]) -> bool {
     difference == 0
 }
 
+/// Finds the map key equal to `candidate_hash` without early exit.
+///
+/// INTENTIONAL: this is a full linear scan instead of `HashMap::get` so the
+/// lookup cost does not reveal whether (or where) a candidate hash exists in
+/// the map. Hash keys are unique, so at most one key can match.
 pub(crate) fn find_hashed_secret_map_key<T>(
     values: &HashMap<String, T>,
     candidate_hash: &str,
@@ -2403,6 +2747,9 @@ pub(crate) fn find_hashed_secret_map_key<T>(
     matched
 }
 
+/// Drops expired relay tokens, then evicts earliest-expiring tokens until the
+/// map fits the `CONSOLE_MAX_RELAY_TOKENS` cap (bounds memory under token
+/// minting abuse).
 pub(crate) fn prune_console_relay_tokens(
     tokens: &mut HashMap<String, ConsoleRelayToken>,
     now_unix_ms: i64,
@@ -2421,6 +2768,8 @@ pub(crate) fn prune_console_relay_tokens(
     }
 }
 
+/// Extracts the token from a case-insensitive `Bearer <token>` authorization
+/// value; returns `None` for any other shape or an empty token.
 fn extract_bearer_token(raw_authorization: &str) -> Option<String> {
     let trimmed = raw_authorization.trim();
     let prefix = "bearer ";
@@ -2435,6 +2784,11 @@ fn extract_bearer_token(raw_authorization: &str) -> Option<String> {
     }
 }
 
+/// Parses the relay action discriminator from its wire label.
+///
+/// # Errors
+/// Returns an invalid-argument response listing the supported actions when
+/// the label is unknown.
 #[allow(clippy::result_large_err)]
 fn parse_console_relay_action_kind(raw: &str) -> Result<browser_v1::RelayActionKind, Response> {
     let normalized = raw.trim().to_ascii_lowercase();
@@ -2448,6 +2802,7 @@ fn parse_console_relay_action_kind(raw: &str) -> Result<browser_v1::RelayActionK
     }
 }
 
+/// Maps a proto relay-action discriminator back to its stable wire label.
 fn relay_action_kind_label(raw: i32) -> &'static str {
     match browser_v1::RelayActionKind::try_from(raw)
         .unwrap_or(browser_v1::RelayActionKind::Unspecified)
@@ -2459,6 +2814,13 @@ fn relay_action_kind_label(raw: i32) -> &'static str {
     }
 }
 
+/// Connects a gRPC client to the configured browserd endpoint with the
+/// configured connect/request timeouts. Also used by self-healing probes.
+///
+/// # Errors
+/// Returns a failed-precondition response when the browser service is
+/// disabled, an invalid-argument response for a malformed endpoint, and an
+/// unavailable response when the connection cannot be established.
 pub(crate) async fn build_console_browser_client(
     state: &AppState,
 ) -> Result<
@@ -2493,6 +2855,12 @@ pub(crate) async fn build_console_browser_client(
     Ok(browser_v1::browser_service_client::BrowserServiceClient::new(channel))
 }
 
+/// Attaches the configured browserd bearer token to outgoing gRPC metadata;
+/// a no-op when no auth token is configured.
+///
+/// # Errors
+/// Returns an internal error response when the token cannot be encoded as
+/// metadata.
 #[allow(clippy::result_large_err)]
 pub(crate) fn apply_browser_service_auth(
     state: &AppState,
@@ -2509,6 +2877,13 @@ pub(crate) fn apply_browser_service_auth(
     Ok(())
 }
 
+/// Forwards the console caller's principal to browserd via
+/// [`BROWSER_CALLER_PRINCIPAL_HEADER`] so principal-scoped reads (downloads,
+/// network log) can be enforced server-side.
+///
+/// # Errors
+/// Returns an unauthenticated response for a blank principal and an
+/// invalid-argument response when it cannot be encoded as metadata.
 #[allow(clippy::result_large_err)]
 pub(crate) fn apply_browser_caller_principal_metadata(
     principal: &str,

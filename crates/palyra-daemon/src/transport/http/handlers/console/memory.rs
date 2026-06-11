@@ -1,3 +1,16 @@
+//! Console memory administration handlers for the `/console/v1/memory/*`
+//! routes: status/index/search/purge, learning candidates and preferences,
+//! workspace documents, recall previews, and session search.
+//!
+//! Every handler is scoped to the authenticated console session's principal
+//! (and usually its channel) -- this surface is per-user memory
+//! administration, not a cross-tenant admin API. Heavy operations are
+//! bounded: index runs are single-flight with a per-request batch budget,
+//! and purge demands an explicit scope. Drift/reconcile endpoints for the
+//! external retrieval index live in the sibling
+//! `memory_external_index` module; recall/search handlers persist their
+//! outcomes as recall artifacts in the journal.
+
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -31,17 +44,31 @@ use palyra_common::runtime_preview::{
 use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
+/// Batches executed per index request when the caller does not pick a limit.
 const MEMORY_INDEX_DEFAULT_MAX_BATCHES_PER_REQUEST: u64 = 8;
+/// Upper bound on batches per index request even when the caller asks for
+/// more; keeps a single HTTP request from running unbounded reindex work.
 const MEMORY_INDEX_HARD_MAX_BATCHES_PER_REQUEST: u64 = 32;
+/// Wire-visible `cancel_reason` reported when the batch budget stops a run.
 const MEMORY_INDEX_BATCH_LIMIT_REASON: &str = "batch_limit_reached";
+/// Error message returned while another index run holds the single-flight
+/// guard.
 const MEMORY_INDEX_CONCURRENT_RUN_MESSAGE: &str = "memory index run already in progress";
 
+/// `GET /console/v1/memory/status` — aggregates the memory subsystem view:
+/// usage, embeddings, retrieval backend plus diagnostics, providers,
+/// retention/auto-inject/maintenance/learning config, a workspace preview,
+/// and a shallow recall-artifact inventory.
+///
+/// # Errors
+/// Returns an error response when console authorization fails or any of the
+/// underlying runtime/channel snapshots fail.
 pub(crate) async fn console_memory_status_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, Response> {
-    let _session = authorize_console_session(&state, &headers, false)?;
-    let provider_context = MemoryProviderHookContext::from_request_context(&_session.context);
+    let session = authorize_console_session(&state, &headers, false)?;
+    let provider_context = MemoryProviderHookContext::from_request_context(&session.context);
     let provider_statuses =
         memory_provider_status_snapshot(state.runtime.clone(), &provider_context)
             .await
@@ -72,8 +99,8 @@ pub(crate) async fn console_memory_status_handler(
     let workspace_preview = state
         .runtime
         .list_workspace_documents(journal::WorkspaceDocumentListFilter {
-            principal: _session.context.principal.clone(),
-            channel: _session.context.channel.clone(),
+            principal: session.context.principal.clone(),
+            channel: session.context.channel.clone(),
             agent_id: None,
             prefix: None,
             include_deleted: false,
@@ -84,9 +111,9 @@ pub(crate) async fn console_memory_status_handler(
     let latest_recall_artifacts = state
         .runtime
         .list_recall_artifacts(RecallArtifactListFilter {
-            principal: _session.context.principal.clone(),
-            device_id: _session.context.device_id.clone(),
-            channel: _session.context.channel.clone(),
+            principal: session.context.principal.clone(),
+            device_id: session.context.device_id.clone(),
+            channel: session.context.channel.clone(),
             session_id: None,
             artifact_kind: None,
             limit: 8,
@@ -179,6 +206,10 @@ pub(crate) async fn console_memory_status_handler(
     })))
 }
 
+/// Shallow inventory row for a recall artifact: metadata plus availability
+/// flags only. The full payload/diagnostics/provenance bodies are
+/// deliberately omitted so the status endpoint stays small; clients fetch
+/// detail from `/console/v1/memory/recall-artifacts`.
 fn recall_artifact_inventory_json(artifact: &RecallArtifactRecord) -> Value {
     json!({
         "artifact_id": artifact.artifact_id,
@@ -195,6 +226,8 @@ fn recall_artifact_inventory_json(artifact: &RecallArtifactRecord) -> Value {
     })
 }
 
+/// Truncates to `max_chars` characters (not bytes) with a `...` marker, so
+/// multi-byte UTF-8 content can never be split mid-character.
 fn truncate_recall_inventory_text(value: &str, max_chars: usize) -> String {
     let trimmed = value.trim();
     let mut output = String::with_capacity(trimmed.len().min(max_chars));
@@ -210,6 +243,14 @@ fn truncate_recall_inventory_text(value: &str, max_chars: usize) -> String {
     output
 }
 
+/// `GET /console/v1/memory/derived-artifacts` — lists derived artifacts
+/// linked to a workspace document and/or memory item, post-filtered to the
+/// caller's principal and channel.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, neither
+/// `workspace_document_id` nor `memory_item_id` is provided, or the channel
+/// platform query fails.
 pub(crate) async fn console_memory_derived_artifacts_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -243,6 +284,19 @@ pub(crate) async fn console_memory_derived_artifacts_handler(
     })))
 }
 
+/// `POST /console/v1/memory/index` — runs provider reindex and external
+/// retrieval indexer batches (optionally preceded by memory maintenance) and
+/// reports progress, drift, and embeddings status.
+///
+/// Index runs are single-flight per daemon and bounded by a per-request
+/// batch budget; a budget-stopped run is reported as cancelled with
+/// `cancel_reason = "batch_limit_reached"` so the operator can rerun to
+/// continue.
+///
+/// # Errors
+/// Returns a resource-exhausted response while another index run is in
+/// flight, and an error response when console authorization or any
+/// maintenance/reindex/snapshot step fails.
 pub(crate) async fn console_memory_index_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -289,6 +343,9 @@ pub(crate) async fn console_memory_index_handler(
         .map_err(runtime_status_response)?;
     let mut external_indexer_batches_executed = 1_u64;
     let mut external_indexer_batch_limit_reached = false;
+    // The external indexer stops looping once the provider phase was
+    // cancelled (budget hit): the request already burned its batch budget,
+    // so the rerun that continues the provider phase continues this one too.
     while until_complete && !provider_reindex.cancelled && !external_indexer.complete {
         if external_indexer_batches_executed >= batch_budget.max_batches_per_request {
             external_indexer_batch_limit_reached = true;
@@ -379,12 +436,18 @@ pub(crate) async fn console_memory_index_handler(
     })))
 }
 
+/// Effective per-request batch budget for an index run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MemoryIndexBatchBudget {
+    /// What the caller asked for (`None` when absent or zero), echoed back in
+    /// the response for transparency.
     requested_cancel_after_batches: Option<u64>,
+    /// Enforced limit after defaulting and clamping to the hard maximum.
     max_batches_per_request: u64,
 }
 
+/// Resolves the caller's `cancel_after_batches` into an enforced budget;
+/// zero is treated the same as absent.
 fn memory_index_batch_budget(cancel_after_batches: Option<u64>) -> MemoryIndexBatchBudget {
     let requested_cancel_after_batches = cancel_after_batches.filter(|value| *value > 0);
     let max_batches_per_request = requested_cancel_after_batches
@@ -393,6 +456,10 @@ fn memory_index_batch_budget(cancel_after_batches: Option<u64>) -> MemoryIndexBa
     MemoryIndexBatchBudget { requested_cancel_after_batches, max_batches_per_request }
 }
 
+/// Rewrites a budget-stopped provider reindex outcome into the cancelled
+/// shape the wire contract uses, so clients see one consistent
+/// "stopped early, rerun to continue" signal for both explicit cancels and
+/// budget exhaustion.
 fn mark_provider_reindex_batch_limited(
     provider_reindex: &mut crate::application::memory_provider::MemoryProviderReindexOutcome,
     max_batches_per_request: u64,
@@ -405,6 +472,9 @@ fn mark_provider_reindex_batch_limited(
     ));
 }
 
+/// Serializes the external indexer outcome and annotates it with the batch
+/// accounting fields (`batches_executed`, budget, cancellation) the index
+/// endpoint promises.
 fn external_indexer_payload(
     external_indexer: &crate::retrieval::ExternalRetrievalIndexerOutcome,
     batches_executed: u64,
@@ -424,6 +494,8 @@ fn external_indexer_payload(
     payload
 }
 
+/// RAII guard marking a console memory index run as active; releases the
+/// single-flight flag on drop (including early returns and panics).
 struct ConsoleMemoryIndexRunGuard {
     active: Arc<AtomicBool>,
 }
@@ -434,6 +506,12 @@ impl Drop for ConsoleMemoryIndexRunGuard {
     }
 }
 
+/// Attempts to claim the single-flight index slot. Reindex batches hammer
+/// the journal and embedding providers, so concurrent console-triggered runs
+/// are rejected rather than queued.
+///
+/// # Errors
+/// Returns `resource_exhausted` while another run holds the slot.
 fn try_acquire_console_memory_index_guard(
     active: &Arc<AtomicBool>,
 ) -> Result<ConsoleMemoryIndexRunGuard, tonic::Status> {
@@ -443,6 +521,14 @@ fn try_acquire_console_memory_index_guard(
     Ok(ConsoleMemoryIndexRunGuard { active: Arc::clone(active) })
 }
 
+/// `GET /console/v1/memory/search` — searches the caller's memory items with
+/// scoring diagnostics, optionally filtered by channel, session, tags, and
+/// sources.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the query is
+/// empty, `min_score`/`session_id`/`sources_csv` are invalid, or the search
+/// itself fails.
 pub(crate) async fn console_memory_search_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -461,7 +547,7 @@ pub(crate) async fn console_memory_search_handler(
             "min_score must be in range 0.0..=1.0",
         )));
     }
-    let session_scope = query.session_id.clone().and_then(trim_to_option);
+    let session_scope = query.session_id.and_then(trim_to_option);
     if let Some(session_scope) = session_scope.as_deref() {
         validate_canonical_id(session_scope).map_err(|_| {
             runtime_status_response(tonic::Status::invalid_argument(
@@ -491,6 +577,13 @@ pub(crate) async fn console_memory_search_handler(
     })))
 }
 
+/// `GET /console/v1/memory/providers/explain` — runs a provider prefetch for
+/// the query and explains the scoring of each hit above `min_score`, for
+/// debugging what auto-inject would surface.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the query is
+/// empty, `min_score` is invalid, or the provider prefetch fails.
 pub(crate) async fn console_memory_provider_explain_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -540,13 +633,23 @@ pub(crate) async fn console_memory_provider_explain_handler(
     })))
 }
 
+/// `POST /console/v1/memory/purge` — deletes the caller's memory items within
+/// an explicit scope and returns the deleted count.
+///
+/// A purge with no channel/session scope must say `purge_all_principal=true`
+/// out loud; this keeps a payload of accidental nulls from silently wiping
+/// the principal's entire memory.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the scope is
+/// missing or invalid, or the purge itself fails.
 pub(crate) async fn console_memory_purge_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(payload): Json<ConsoleMemoryPurgeRequest>,
 ) -> Result<Json<Value>, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
-    let session_scope = payload.session_id.clone().and_then(trim_to_option);
+    let session_scope = payload.session_id.and_then(trim_to_option);
     if let Some(session_scope) = session_scope.as_deref() {
         validate_canonical_id(session_scope).map_err(|_| {
             runtime_status_response(tonic::Status::invalid_argument(
@@ -575,6 +678,12 @@ pub(crate) async fn console_memory_purge_handler(
     Ok(Json(json!({ "deleted_count": deleted_count })))
 }
 
+/// `GET /console/v1/memory/learning/candidates` — lists the caller's learning
+/// candidates with optional filters and a lifecycle summary.
+///
+/// # Errors
+/// Returns an error response when console authorization fails or the journal
+/// query fails.
 pub(crate) async fn console_learning_candidates_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -609,6 +718,14 @@ pub(crate) async fn console_learning_candidates_list_handler(
     })))
 }
 
+/// `GET /console/v1/memory/learning/candidates/{candidate_id}/history` —
+/// returns a candidate (caller-scoped) with its review history and lifecycle
+/// view.
+///
+/// # Errors
+/// Returns a not-found response when the candidate does not exist for the
+/// caller, and an error response when authorization or the journal query
+/// fails.
 pub(crate) async fn console_learning_candidate_history_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -631,6 +748,15 @@ pub(crate) async fn console_learning_candidate_history_handler(
     })))
 }
 
+/// `POST /console/v1/memory/learning/candidates/{candidate_id}/review` —
+/// records a review decision for a candidate. Accepting a preference
+/// candidate (or passing `apply_preference=true`) also applies it as a
+/// learning preference.
+///
+/// # Errors
+/// Returns a not-found response when the candidate does not exist for the
+/// caller, an invalid-argument response for an unknown status, and an error
+/// response when the review or preference application fails.
 pub(crate) async fn console_learning_candidate_review_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -672,6 +798,14 @@ pub(crate) async fn console_learning_candidate_review_handler(
     })))
 }
 
+/// `POST /console/v1/memory/learning/candidates/{candidate_id}/apply` —
+/// applies a patch-based learning candidate and returns the resulting
+/// candidate state plus apply outcome.
+///
+/// # Errors
+/// Returns a not-found response when the candidate does not exist for the
+/// caller, a failed-precondition response for non-patch candidates, and an
+/// error response when authorization or the apply itself fails.
 pub(crate) async fn console_learning_candidate_apply_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -704,6 +838,12 @@ pub(crate) async fn console_learning_candidate_apply_handler(
     })))
 }
 
+/// `GET /console/v1/memory/preferences` — lists the caller's learning
+/// preferences with optional scope/status/key filters.
+///
+/// # Errors
+/// Returns an error response when console authorization fails or the journal
+/// query fails.
 pub(crate) async fn console_learning_preferences_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -730,6 +870,12 @@ pub(crate) async fn console_learning_preferences_list_handler(
     })))
 }
 
+/// `GET /console/v1/memory/workspace/documents` — lists the caller's
+/// workspace documents, optionally filtered by agent and path prefix.
+///
+/// # Errors
+/// Returns an error response when console authorization fails or the journal
+/// query fails.
 pub(crate) async fn console_workspace_documents_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -755,6 +901,13 @@ pub(crate) async fn console_workspace_documents_list_handler(
     })))
 }
 
+/// `GET /console/v1/memory/workspace/document` — fetches one workspace
+/// document by path within the caller's scope.
+///
+/// # Errors
+/// Returns an invalid-argument response for an empty path, a not-found
+/// response when no document matches, and an error response when
+/// authorization or the journal query fails.
 pub(crate) async fn console_workspace_document_get_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -786,6 +939,13 @@ pub(crate) async fn console_workspace_document_get_handler(
     })))
 }
 
+/// `POST /console/v1/memory/workspace/document` — creates or updates a
+/// workspace document at the given path within the caller's scope.
+///
+/// # Errors
+/// Returns an invalid-argument response for an empty path/content or a
+/// non-ULID session id, and an error response when authorization or the
+/// upsert fails.
 pub(crate) async fn console_workspace_document_write_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -831,6 +991,12 @@ pub(crate) async fn console_workspace_document_write_handler(
     })))
 }
 
+/// `POST /console/v1/memory/workspace/document/move` — moves a workspace
+/// document from `path` to `next_path` within the caller's scope.
+///
+/// # Errors
+/// Returns an invalid-argument response for empty paths or a non-ULID
+/// session id, and an error response when authorization or the move fails.
 pub(crate) async fn console_workspace_document_move_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -869,6 +1035,12 @@ pub(crate) async fn console_workspace_document_move_handler(
     })))
 }
 
+/// `POST /console/v1/memory/workspace/document/delete` — soft-deletes a
+/// workspace document (history stays recoverable via versions).
+///
+/// # Errors
+/// Returns an invalid-argument response for an empty path or a non-ULID
+/// session id, and an error response when authorization or the delete fails.
 pub(crate) async fn console_workspace_document_delete_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -903,6 +1075,14 @@ pub(crate) async fn console_workspace_document_delete_handler(
     })))
 }
 
+/// `GET /console/v1/memory/workspace/document/versions` — returns a document
+/// (including soft-deleted ones, so deleted history stays inspectable) and
+/// its version history.
+///
+/// # Errors
+/// Returns an invalid-argument response for an empty path, a not-found
+/// response when no document matches, and an error response when
+/// authorization or the journal query fails.
 pub(crate) async fn console_workspace_document_versions_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -943,6 +1123,13 @@ pub(crate) async fn console_workspace_document_versions_handler(
     })))
 }
 
+/// `POST /console/v1/memory/workspace/document/pin` — pins or unpins a
+/// workspace document.
+///
+/// # Errors
+/// Returns an invalid-argument response for an empty path, a not-found
+/// response when no document matches, and an error response when
+/// authorization or the update fails.
 pub(crate) async fn console_workspace_document_pin_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -974,6 +1161,12 @@ pub(crate) async fn console_workspace_document_pin_handler(
     })))
 }
 
+/// `POST /console/v1/memory/workspace/bootstrap` — seeds (or force-repairs)
+/// the caller's curated workspace roots and templates.
+///
+/// # Errors
+/// Returns an invalid-argument response for a non-ULID session id and an
+/// error response when authorization or the bootstrap fails.
 pub(crate) async fn console_workspace_bootstrap_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1006,6 +1199,12 @@ pub(crate) async fn console_workspace_bootstrap_handler(
     })))
 }
 
+/// `GET /console/v1/memory/workspace/search` — searches the caller's
+/// workspace documents with scoring diagnostics.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the query is
+/// empty, `min_score` is invalid, or the search fails.
 pub(crate) async fn console_workspace_search_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1046,6 +1245,16 @@ pub(crate) async fn console_workspace_search_handler(
     })))
 }
 
+/// `POST /console/v1/memory/recall/preview` — runs the dual-path recall
+/// pipeline for a query (without writing durable memory), persists the
+/// outcome as a recall artifact, and records a runtime decision event plus a
+/// `memory.recall.preview` console event.
+///
+/// # Errors
+/// Returns a failed-precondition response when the retrieval dual-path
+/// preview capability is blocked, an invalid-argument response for bad
+/// query/score/budget parameters, and an error response when the preview,
+/// artifact write, or decision event fails.
 pub(crate) async fn console_recall_preview_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1093,7 +1302,7 @@ pub(crate) async fn console_recall_preview_handler(
             "prompt_budget_tokens must be in range 512..=4096",
         )));
     }
-    let recall_channel = payload.channel.clone().or(session.context.channel.clone());
+    let recall_channel = payload.channel.or(session.context.channel.clone());
     let started_at_unix_ms = current_unix_ms();
     let preview = preview_recall(
         &state.runtime,
@@ -1198,6 +1407,15 @@ pub(crate) async fn console_recall_preview_handler(
     })))
 }
 
+/// `GET /console/v1/memory/search-all` — federated search across memory,
+/// workspace documents, and orchestrator sessions in one call; transcript
+/// windows are included only when a `session_id` scope is given (a global
+/// transcript scan would be too expensive for an interactive endpoint).
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the query is
+/// empty, `min_score`/`session_id` are invalid, or any of the underlying
+/// searches fail.
 pub(crate) async fn console_search_all_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1334,6 +1552,14 @@ pub(crate) async fn console_search_all_handler(
     })))
 }
 
+/// `GET /console/v1/memory/session-search` — searches transcript windows
+/// across the caller's orchestrator sessions, persists the outcome as a
+/// session-search recall artifact, and records a `memory.session_search`
+/// console event.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, the query is
+/// empty, `min_score` is invalid, or the search or artifact write fails.
 pub(crate) async fn console_session_search_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1411,6 +1637,12 @@ pub(crate) async fn console_session_search_handler(
     })))
 }
 
+/// `GET /console/v1/memory/recall-artifacts` — lists the caller's stored
+/// recall artifacts (full records, unlike the status inventory).
+///
+/// # Errors
+/// Returns an invalid-argument response for a non-ULID session id and an
+/// error response when authorization or the journal query fails.
 pub(crate) async fn console_recall_artifacts_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1443,6 +1675,8 @@ pub(crate) async fn console_recall_artifacts_handler(
     })))
 }
 
+/// Builds the journal artifact record for a recall preview, embedding the
+/// full preview payload plus diagnostics and per-source provenance.
 fn build_recall_preview_artifact_request(
     context: &RequestContext,
     channel: Option<String>,
@@ -1487,6 +1721,8 @@ fn build_recall_preview_artifact_request(
     }
 }
 
+/// Builds the journal artifact record for a session search, embedding the
+/// result groups, synthesis, diagnostics, and per-window provenance.
 fn build_session_search_artifact_request(
     context: &RequestContext,
     channel: Option<String>,
@@ -1602,6 +1838,9 @@ fn session_search_provenance(outcome: &SessionSearchOutcome) -> Value {
     })
 }
 
+/// Builds the evidence-backed synthesis block for a session search: summary,
+/// confidence, contradictions, and up to 12 citation-bearing evidence rows
+/// (capped so synthesis stays prompt-budget friendly).
 fn session_search_synthesis(outcome: &SessionSearchOutcome) -> Value {
     let evidence = outcome
         .groups
@@ -1664,6 +1903,9 @@ fn session_search_provider_usage(outcome: &SessionSearchOutcome) -> Value {
     }])
 }
 
+/// Confidence is the mean score of the first three windows in result order
+/// (results arrive ranked, so this approximates top-3 strength); `None` when
+/// nothing matched.
 fn session_search_confidence(outcome: &SessionSearchOutcome) -> Option<f64> {
     let scores = outcome
         .groups
@@ -1678,6 +1920,11 @@ fn session_search_confidence(outcome: &SessionSearchOutcome) -> Option<f64> {
     Some(total / scores.len() as f64)
 }
 
+/// Flags potential contradictions across the matched snippets.
+///
+/// Deliberately a coarse lexical heuristic (both halves of an antonym pair
+/// appearing anywhere in the joined evidence): it can only over-warn, and the
+/// operator reviews the cited windows either way. No model call is involved.
 fn session_search_contradictions(outcome: &SessionSearchOutcome) -> Vec<String> {
     const CONTRADICTION_PAIRS: &[(&str, &str)] = &[
         ("enable", "disable"),
@@ -1701,6 +1948,9 @@ fn session_search_contradictions(outcome: &SessionSearchOutcome) -> Vec<String> 
         .collect()
 }
 
+/// Stable SHA-256 over the query plus every (session, window, snippet)
+/// triple, used as a provenance fingerprint to tie artifacts to the exact
+/// evidence set they summarized.
 fn session_search_synthesis_hash(outcome: &SessionSearchOutcome) -> String {
     let mut hasher = Sha256::new();
     hasher.update(outcome.query.as_bytes());
@@ -1717,6 +1967,8 @@ fn session_search_synthesis_hash(outcome: &SessionSearchOutcome) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Console-event payload for a recall preview, annotated with the persisted
+/// artifact id so the event links back to the stored artifact.
 fn recall_preview_console_event_payload(
     preview: &RecallPreviewEnvelope,
     artifact_id: &str,
@@ -1728,6 +1980,12 @@ fn recall_preview_console_event_payload(
     payload
 }
 
+/// Runs one memory maintenance pass immediately with the currently
+/// configured retention policy, scheduling the next run one interval out.
+///
+/// # Errors
+/// Returns the mapped runtime status response when the status snapshot or
+/// the maintenance run fails.
 #[allow(clippy::result_large_err)]
 async fn run_memory_maintenance_now(
     state: &AppState,
@@ -1754,6 +2012,12 @@ async fn run_memory_maintenance_now(
         .map_err(runtime_status_response)
 }
 
+/// Normalizes a review status into its stored form, accepting verb forms
+/// ("approve"), legacy synonyms, and `_`/`-` spelling variants so older
+/// clients keep working.
+///
+/// # Errors
+/// Returns `invalid_argument` for statuses outside the supported set.
 fn normalize_learning_candidate_review_status(status: &str) -> Result<String, tonic::Status> {
     let normalized = status.trim().to_ascii_lowercase().replace('_', "-");
     let accepted = match normalized.as_str() {
@@ -1777,6 +2041,8 @@ fn normalize_learning_candidate_review_status(status: &str) -> Result<String, to
     Ok(accepted)
 }
 
+/// Aggregates a candidate list into per-status counts, injection-conflict
+/// totals, and the static review/deployment policy the console renders.
 fn learning_candidates_lifecycle_summary(candidates: &[journal::LearningCandidateRecord]) -> Value {
     let mut counts = serde_json::Map::new();
     for status in ["proposed", "needs-review", "approved", "rejected", "deployed", "rolled-back"] {
@@ -1813,6 +2079,9 @@ fn learning_candidates_lifecycle_summary(candidates: &[journal::LearningCandidat
     })
 }
 
+/// Builds the full lifecycle view for one candidate: canonical status, scope,
+/// evidence, proposed change, deployment posture, and rollback availability
+/// (derived from both the current status and the review history).
 fn learning_candidate_lifecycle(
     candidate: &journal::LearningCandidateRecord,
     history: &[journal::LearningCandidateHistoryRecord],
@@ -1868,6 +2137,9 @@ fn learning_candidate_lifecycle(
     })
 }
 
+/// Lifecycle view variant for the apply endpoint, where the candidate is
+/// already JSON (returned by the apply pipeline) rather than a journal
+/// record.
 fn learning_candidate_lifecycle_from_value(candidate: &Value) -> Value {
     let status = candidate.get("status").and_then(Value::as_str).unwrap_or("proposed");
     let auto_applied = candidate.get("auto_applied").and_then(Value::as_bool).unwrap_or(false);
@@ -1890,6 +2162,9 @@ fn learning_candidate_lifecycle_from_value(candidate: &Value) -> Value {
     })
 }
 
+/// Canonical lifecycle status for a stored candidate. A recorded
+/// apply-action payload counts as deployment even when the stored status
+/// lags behind it.
 fn learning_candidate_lifecycle_status(
     candidate: &journal::LearningCandidateRecord,
 ) -> &'static str {
@@ -1906,6 +2181,9 @@ fn learning_candidate_lifecycle_status(
     )
 }
 
+/// Collapses stored/legacy status spellings onto the six canonical lifecycle
+/// labels the console contract exposes; anything unrecognized degrades to
+/// "proposed" rather than failing the whole listing.
 fn learning_candidate_status_label(
     status: &str,
     auto_applied: bool,
@@ -1946,6 +2224,10 @@ fn learning_candidate_deployment_posture(
     })
 }
 
+/// Heuristic substring scan for prompt-injection markers across a
+/// candidate's risk level, text, content, and provenance. Safety analysis
+/// upstream tags these fields; this only surfaces the tag in the lifecycle
+/// summary so reviewers are pointed at suspect candidates.
 fn learning_candidate_has_injection_conflict(candidate: &journal::LearningCandidateRecord) -> bool {
     [
         candidate.risk_level.as_str(),
@@ -1963,10 +2245,20 @@ fn learning_candidate_has_injection_conflict(candidate: &journal::LearningCandid
     })
 }
 
+/// Parses a string as a JSON object, returning `None` for invalid JSON or
+/// non-object values.
 fn parse_json_object(payload: &str) -> Option<serde_json::Map<String, Value>> {
     serde_json::from_str::<Value>(payload).ok()?.as_object().cloned()
 }
 
+/// Loads one learning candidate scoped to the caller's principal and
+/// channel. Scoping is part of the access check: another principal's
+/// candidate id yields the same not-found as a nonexistent one, so ids do
+/// not leak across users.
+///
+/// # Errors
+/// Returns a not-found response when no matching candidate exists and the
+/// mapped runtime status response when the journal query fails.
 async fn load_console_learning_candidate(
     state: &AppState,
     context: &RequestContext,

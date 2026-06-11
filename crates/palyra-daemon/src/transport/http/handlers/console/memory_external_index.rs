@@ -1,6 +1,22 @@
+//! Console handlers for external retrieval-index drift inspection and
+//! reconciliation: `GET /console/v1/memory/index/drift` and
+//! `POST /console/v1/memory/index/reconcile`.
+//!
+//! The journal is the memory source of truth; the external retrieval index
+//! is derived from it and can drift. These endpoints expose that drift and
+//! drive reconciliation, and [`build_memory_retrieval_diagnostics`] is shared
+//! with the sibling `memory` module's status endpoint so both surfaces
+//! describe retrieval health identically.
+
 use crate::*;
 use serde_json::{json, Value};
 
+/// `GET /console/v1/memory/index/drift` — previews drift between the journal
+/// and the external retrieval index without mutating anything.
+///
+/// # Errors
+/// Returns an error response when console authorization fails or the drift
+/// preview or backend snapshot fails.
 pub(crate) async fn console_memory_index_drift_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -26,6 +42,15 @@ pub(crate) async fn console_memory_index_drift_handler(
     })))
 }
 
+/// `POST /console/v1/memory/index/reconcile` — reconciles the external
+/// retrieval index against the journal in batches (clamped to 1..=10000)
+/// and records a `memory.index.reconcile` console event.
+///
+/// # Errors
+/// Returns an error response when console authorization fails or the
+/// reconciliation or backend snapshot fails. A failed audit-event write is
+/// only logged: the reconciliation already happened, so the outcome is still
+/// returned to the operator.
 pub(crate) async fn console_memory_index_reconcile_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -67,6 +92,14 @@ pub(crate) async fn console_memory_index_reconcile_handler(
     })))
 }
 
+/// Builds the operator-facing retrieval diagnostics block (mode, fallback
+/// availability, drift, recommended command, operator note).
+///
+/// `drift_count`/`reconciliation_required` override the snapshot's own
+/// values when the caller just measured fresher numbers (drift preview or a
+/// completed reconciliation); pass `None` to fall back to the snapshot. The
+/// mode labels and operator notes are part of the console wire contract and
+/// are pinned by unit tests below.
 pub(crate) fn build_memory_retrieval_diagnostics(
     retrieval_backend: &crate::retrieval::RetrievalBackendSnapshot,
     drift_count: Option<u64>,
@@ -77,6 +110,9 @@ pub(crate) fn build_memory_retrieval_diagnostics(
     let drift_count =
         drift_count.or_else(|| external_index.map(|snapshot| snapshot.drift_count)).unwrap_or(0);
     let reconciliation_required = reconciliation_required.unwrap_or(drift_count > 0);
+    // Mode precedence: stale index (with or without fallback) outranks a
+    // healthy external index, which outranks fallback-only and plain journal
+    // modes -- staleness must never be masked by a "ready" label.
     let external_state = external_index
         .map(|snapshot| match snapshot.state {
             crate::retrieval::RetrievalBackendState::Ready => "ready",
