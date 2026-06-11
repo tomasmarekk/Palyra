@@ -1,3 +1,20 @@
+//! `palyra.fs.os_file` tool backend: scoped OS-level file operations.
+//!
+//! Unlike the workspace tools, this backend may reach outside the agent
+//! workspace -- but only into an explicit allowlist of roots: the resolved
+//! workspace roots (see `workspace_scope`), user-owned roots (`USERPROFILE`/
+//! `HOME` or the `PALYRA_OS_FILE_ROOTS` override), temp directories, and
+//! run-launch path-env roots. Every requested path must be absolute, free of
+//! `.`/`..` components, canonicalized (or resolved through its nearest
+//! existing ancestor for new targets), checked against a protected-OS-path
+//! deny-list, and prefix-matched against an allowed root before any I/O.
+//! Treat any change to that pipeline as a security change.
+//!
+//! Reads stay model-visible even when the safety scanner finds secrets: the
+//! text is replaced with redacted placeholders and flagged via
+//! `text_authoritative`/`redaction_notice` instead of failing the call. All
+//! operations are bounded by the `MAX_OS_FILE_*` constants below.
+
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
@@ -36,6 +53,7 @@ const MAX_OS_FILE_SEARCH_FILE_BYTES: u64 = 128 * 1024;
 const MAX_OS_FILE_SEARCH_EXCERPT_CHARS: usize = 240;
 const PALYRA_OS_FILE_ROOTS_ENV: &str = "PALYRA_OS_FILE_ROOTS";
 
+/// Model-supplied tool input; one flat schema shared by all operations.
 #[derive(Debug, Deserialize)]
 struct OsFileInput {
     operation: OsFileOperation,
@@ -83,6 +101,8 @@ enum OsFileOperation {
     Search,
 }
 
+/// Per-call access policy: the canonicalized roots a path may resolve into,
+/// plus the run-launch env-var-to-path bindings usable as path prefixes.
 #[derive(Debug, Clone)]
 struct OsFilePolicy {
     workspace_roots: Vec<PathBuf>,
@@ -90,6 +110,11 @@ struct OsFilePolicy {
     path_env: BTreeMap<String, PathBuf>,
 }
 
+/// A requested path paired with its canonical resolution.
+///
+/// For not-yet-existing targets, `resolved_path` is the canonicalized nearest
+/// existing ancestor re-joined with the missing suffix, so containment checks
+/// always run against canonical forms.
 #[derive(Debug, Clone)]
 struct ResolvedOsPath {
     requested_path: PathBuf,
@@ -97,6 +122,13 @@ struct ResolvedOsPath {
     existed: bool,
 }
 
+/// Executes a `palyra.fs.os_file` tool call.
+///
+/// Validates input size and schema, resolves the caller's path policy from
+/// the agent bound to `context` (never from model input), runs the requested
+/// operation under that policy, and reports every failure as an unsuccessful
+/// [`ToolExecutionOutcome`] rather than an error so the tool loop stays
+/// alive.
 pub(crate) async fn execute_os_file_tool(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -240,6 +272,8 @@ fn read_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String
     })?;
     let requested_max = input.max_bytes.unwrap_or(MAX_OS_FILE_READ_BYTES);
     let read_limit = requested_max.min(MAX_OS_FILE_READ_BYTES);
+    // Pre-allocate at most 8 KiB regardless of the (caller-influenced) read
+    // limit; `read_to_end` grows the buffer as real bytes arrive.
     let mut buffer = Vec::with_capacity(usize::try_from(read_limit.min(8192)).unwrap_or(8192));
     file.take(read_limit).read_to_end(&mut buffer).map_err(|error| {
         format!("{OS_FILE_TOOL_NAME} failed to read {}: {error}", input.path.trim())
@@ -247,6 +281,10 @@ fn read_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String
     let returned_bytes = u64::try_from(buffer.len()).expect("OS file read size must fit u64");
     let eof = offset_bytes.saturating_add(returned_bytes) >= size_bytes;
     let chunk_sha256 = hex::encode(Sha256::digest(buffer.as_slice()));
+    // Redacted reads stay model-visible by design: the model gets placeholder
+    // text plus `text_authoritative=false` and a notice, instead of a hard
+    // failure that would dead-end the task. `chunk_sha256` above is computed
+    // over the raw bytes, so it will not match the redacted text.
     let (text, bytes_base64, redacted) = visible_file_content(buffer);
     let text_authoritative = text.as_ref().map(|_| !redacted);
     let redaction_notice = redacted.then(|| {
@@ -351,6 +389,11 @@ fn write_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, Strin
     }))
 }
 
+/// Rejects writes over an existing file unless `full_replace=true`.
+///
+/// `operation=write` always truncates, but models routinely send a fragment
+/// expecting append/partial-edit semantics; failing closed with an
+/// explanation prevents silent data loss on user files.
 fn guard_existing_file_write_intent(
     input: &OsFileInput,
     existing_size_bytes: Option<u64>,
@@ -413,6 +456,8 @@ fn move_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String
         .map_err(|error| format!("{OS_FILE_TOOL_NAME} failed to inspect source: {error}"))?
         .len();
     if !dry_run {
+        // Remove an existing target first: unlike Unix, `fs::rename` on
+        // Windows fails when the destination exists.
         if target.existed {
             fs::remove_file(target.resolved_path.as_path()).map_err(|error| {
                 format!("{OS_FILE_TOOL_NAME} failed to replace target before move: {error}")
@@ -533,6 +578,9 @@ fn list_dir_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, St
             skipped_entries = skipped_entries.saturating_add(1);
             continue;
         };
+        // Hide entries that resolve outside the listed directory (symlinks
+        // pointing elsewhere) so listings never leak paths the policy checks
+        // would reject on a follow-up read.
         if !path_starts_with(canonical_entry.as_path(), path.resolved_path.as_path()) {
             skipped_entries = skipped_entries.saturating_add(1);
             continue;
@@ -773,6 +821,9 @@ fn search_file(path: &Path, size_bytes: u64, state: &mut OsFileSearchState) -> R
         let Some(match_index) = normalized_line.find(state.normalized_query.as_str()) else {
             continue;
         };
+        // Excerpts pass through the same secret-leak scan as full reads so a
+        // search cannot be used to exfiltrate values that a read would
+        // redact.
         let excerpt = search_excerpt(line, match_index, state.query.len());
         let redaction = redact_text_for_export(
             excerpt.as_str(),
@@ -884,6 +935,12 @@ fn input_write_bytes(input: &OsFileInput) -> Result<Vec<u8>, String> {
     }
 }
 
+/// Converts read bytes into model-visible `(text, bytes_base64, redacted)`.
+///
+/// UTF-8 content is scanned for secret leaks; when the scanner redacts or
+/// flags a leak, the redacted text replaces the raw text (model-visible, but
+/// marked non-authoritative by the caller). Non-UTF-8 content is returned
+/// base64-encoded instead.
 fn visible_file_content(buffer: Vec<u8>) -> (Option<String>, Option<String>, bool) {
     match String::from_utf8(buffer) {
         Ok(text) => {
@@ -898,6 +955,10 @@ fn visible_file_content(buffer: Vec<u8>) -> (Option<String>, Option<String>, boo
             let visible_text = if redacted { redaction.redacted_text } else { text };
             (Some(visible_text), None, redacted)
         }
+        // AIDEV-NOTE: the base64 fallback bypasses the secret-leak scan --
+        // the safety scanner is text-based, so non-UTF-8 files (UTF-16
+        // configs, binary key stores) are returned unredacted. Tightening
+        // this requires a behavior change (e.g. decode-and-scan or deny).
         Err(error) => (None, Some(BASE64_STANDARD.encode(error.into_bytes())), false),
     }
 }
@@ -911,6 +972,10 @@ fn required_target_path(input: &OsFileInput) -> Result<&str, String> {
         .ok_or_else(|| format!("{OS_FILE_TOOL_NAME} operation requires non-empty target_path"))
 }
 
+/// Resolves a copy/move `target_path`, which -- unlike `path` -- may be
+/// workspace-relative: env-prefixed and absolute targets resolve as OS
+/// paths, while `workspace/...` aliases and bare relative paths resolve
+/// against the first workspace root (the "import into workspace" flow).
 fn resolve_copy_move_target_path(
     policy: &OsFilePolicy,
     target_path: &str,
@@ -1006,6 +1071,12 @@ fn resolve_target_os_path(policy: &OsFilePolicy, path: &str) -> Result<ResolvedO
     Ok(ResolvedOsPath { requested_path, resolved_path, existed: false })
 }
 
+/// Parses a model-supplied path into an absolute [`PathBuf`], expanding a
+/// leading `%VAR%`/`$VAR`/`${VAR}` prefix from the policy or process env.
+///
+/// `.`/`..` components and control characters are rejected up front, before
+/// any canonicalization, so traversal cannot hide behind a not-yet-existing
+/// suffix that `fs::canonicalize` would never see.
 fn parse_absolute_os_path(policy: &OsFilePolicy, path: &str) -> Result<PathBuf, String> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
@@ -1032,6 +1103,9 @@ fn expand_env_prefixed_os_path(policy: &OsFilePolicy, path: &str) -> Result<Path
     let Some((key, suffix)) = path_env_prefix(path)? else {
         return Ok(PathBuf::from(path));
     };
+    // Run-launch context bindings win over the daemon's process environment,
+    // so CLI-launched runs resolve env-prefixed paths against the operator's
+    // shell view rather than the daemon's.
     if let Some(value) = policy.path_env.get(key) {
         return append_env_path_suffix(value.clone(), suffix);
     }
@@ -1114,6 +1188,9 @@ fn append_env_path_suffix(mut base: PathBuf, suffix: &str) -> Result<PathBuf, St
     Ok(base)
 }
 
+/// Splits `path` into its nearest existing ancestor directory and the
+/// missing suffix, so the ancestor can be canonicalized and containment
+/// checked even though the target itself does not exist yet.
 fn nearest_existing_ancestor(path: &Path) -> Result<(PathBuf, PathBuf), String> {
     let mut cursor = path.to_path_buf();
     while !cursor.exists() {
@@ -1133,6 +1210,12 @@ fn nearest_existing_ancestor(path: &Path) -> Result<(PathBuf, PathBuf), String> 
     Ok((cursor, suffix.to_path_buf()))
 }
 
+/// Central containment gate: every operation must pass its resolved path
+/// through this before any I/O.
+///
+/// The deny-list runs first so a protected OS path is rejected even when an
+/// allowed root contains it; the path is then accepted only if its canonical
+/// form sits under a workspace root or an approved user-owned root.
 fn ensure_os_path_allowed(policy: &OsFilePolicy, path: &ResolvedOsPath) -> Result<(), String> {
     if protected_os_path(path.resolved_path.as_path()) {
         return Err(format!(
@@ -1160,6 +1243,10 @@ fn ensure_os_path_allowed(policy: &OsFilePolicy, path: &ResolvedOsPath) -> Resul
     ))
 }
 
+/// Builds the user-owned OS roots: `PALYRA_OS_FILE_ROOTS` when set
+/// (replacing -- not extending -- the implicit profile roots, so operators
+/// can narrow access), otherwise `USERPROFILE`/`HOME`, plus temp directories
+/// on every platform.
 fn user_owned_os_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(configured_roots) = configured_user_os_roots() {
@@ -1205,6 +1292,8 @@ fn push_windows_drive_temp_roots(roots: &mut Vec<PathBuf>) {
     }
 }
 
+/// Allows `<drive>:\var\tmp` as a Windows analogue of Unix `/var/tmp`, so
+/// cross-platform agent workflows can use one scratch path convention.
 #[cfg(windows)]
 fn windows_drive_temp_root_candidates(system_drive: &str) -> Vec<PathBuf> {
     let drive = system_drive.trim().trim_end_matches(['\\', '/']);
@@ -1233,6 +1322,9 @@ fn canonicalize_existing_dir(path: &Path) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
+/// Deny-list of OS locations the tool must never touch (drive/filesystem
+/// roots and system directories), checked on canonicalized paths so symlinks
+/// cannot disguise them.
 fn protected_os_path(path: &Path) -> bool {
     #[cfg(windows)]
     {
@@ -1258,6 +1350,10 @@ fn protected_os_path(path: &Path) -> bool {
     }
 }
 
+/// Component-wise prefix check with a Windows fallback that compares
+/// separator-normalized, lowercased strings, because NTFS paths are
+/// case-insensitive and the two sides may differ in drive-letter or segment
+/// casing even after canonicalization.
 fn path_starts_with(path: &Path, root: &Path) -> bool {
     if path.starts_with(root) {
         return true;

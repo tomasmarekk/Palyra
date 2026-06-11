@@ -1,3 +1,12 @@
+//! Tool-result artifact support: bounded journal payloads and the
+//! `palyra.artifact.read` tool backend.
+//!
+//! [`bounded_tool_result_artifact_content`] caps oversized tool outputs into
+//! a valid-JSON truncation envelope before journal storage, and
+//! [`execute_artifact_read_tool`] serves scoped artifact reads back to the
+//! model, downgrading sensitive full reads to redacted text previews so the
+//! content stays model-visible instead of failing outright.
+
 use std::sync::Arc;
 
 use palyra_common::runtime_contracts::{ArtifactReadRequest, ToolTurnBudget};
@@ -12,8 +21,15 @@ use crate::{
 const TOOL_RESULT_ARTIFACT_TRUNCATION_RESERVE_BYTES: usize = 2 * 1024;
 const TOOL_RESULT_ARTIFACT_TRUNCATION_MESSAGE: &str =
     "Original tool output exceeded the journal artifact payload limit; this artifact stores a bounded UTF-8 prefix.";
+// Must stay byte-identical to the denial reason emitted by the journal's
+// artifact read path; the preview retry below matches on it by substring.
 const SENSITIVE_FULL_READ_DENIED_REASON: &str = "sensitive_full_read_denied";
 
+/// Journal-ready artifact payload produced by
+/// [`bounded_tool_result_artifact_content`].
+///
+/// When `truncated` is true, `content` is a JSON truncation envelope rather
+/// than the raw tool output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BoundedToolResultArtifactContent {
     pub content: Vec<u8>,
@@ -22,6 +38,15 @@ pub(crate) struct BoundedToolResultArtifactContent {
     pub truncated: bool,
 }
 
+/// Bounds a tool output to `max_payload_bytes` for journal artifact storage.
+///
+/// Outputs within the limit are stored raw; larger outputs are replaced by a
+/// valid-JSON envelope carrying a bounded UTF-8 prefix plus truncation
+/// metadata, so downstream consumers never see partial, unparseable JSON.
+///
+/// # Errors
+/// Returns an error when the envelope cannot be serialized or when
+/// `max_payload_bytes` is too small to hold even the metadata-only envelope.
 pub(crate) fn bounded_tool_result_artifact_content(
     output_json: &[u8],
     max_payload_bytes: usize,
@@ -35,6 +60,9 @@ pub(crate) fn bounded_tool_result_artifact_content(
         });
     }
 
+    // JSON string escaping can expand the stored prefix well past its raw
+    // byte length, so reserve headroom for the envelope and halve the prefix
+    // until the serialized payload actually fits.
     let mut prefix_limit = output_json
         .len()
         .min(max_payload_bytes.saturating_sub(TOOL_RESULT_ARTIFACT_TRUNCATION_RESERVE_BYTES));
@@ -98,6 +126,15 @@ fn truncate_utf8_lossy(output_json: &[u8], max_bytes: usize) -> String {
         .collect()
 }
 
+/// Executes a `palyra.artifact.read` tool call against the journal.
+///
+/// The read is scoped to the caller's session/run/principal/device taken from
+/// `context` (never from model input), and the requested byte budget is
+/// clamped to [`ToolTurnBudget::max_artifact_read_bytes`]. When the journal
+/// denies a full read of sensitive content, the call is retried once as a
+/// redacted text preview so the model still receives usable structure.
+/// All failures are reported as unsuccessful [`ToolExecutionOutcome`]s rather
+/// than errors, keeping the tool loop alive.
 pub(crate) async fn execute_artifact_read_tool(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,

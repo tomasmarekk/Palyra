@@ -1,3 +1,19 @@
+//! `palyra.http.fetch` tool backend: policy-gated outbound HTTP.
+//!
+//! Every hop -- the initial request and each followed redirect -- is
+//! re-evaluated by [`palyra_egress_proxy::EgressProxyPolicyService`] (scheme,
+//! host/DNS-suffix allowlists, private-target rules, vault-only credential
+//! bindings), and the verdict's resolved addresses are pinned into the HTTP
+//! client so the connection cannot be rebound between policy check and
+//! connect. Redirects are followed manually (`Policy::none`) precisely so
+//! that no hop escapes evaluation.
+//!
+//! Responses are streamed under a byte cap, filtered by a content-type
+//! allowlist, reduced to visible text for HTML, and passed through the
+//! safety redaction scan before reaching the model. Successful uncached
+//! GET/HEAD responses may be cached under a key that fingerprints both the
+//! request and the active policy.
+
 use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
@@ -27,6 +43,14 @@ use crate::{
 const HTTP_FETCH_HTML_SKIP_TAGS: &[&str] =
     &["head", "script", "style", "noscript", "template", "svg"];
 
+/// Executes a `palyra.http.fetch` tool call.
+///
+/// Validates the request against the configured HTTP-fetch policy (method,
+/// header and content-type allowlists, vault-backed credential bindings),
+/// then runs the egress-gated fetch loop described in the module docs. Every
+/// failure -- invalid input, policy denial, transport error, non-2xx status
+/// -- is reported as an unsuccessful [`ToolExecutionOutcome`] rather than an
+/// error so the tool loop stays alive.
 pub(crate) async fn execute_http_fetch_tool(
     runtime_state: &Arc<GatewayRuntimeState>,
     proposal_id: &str,
@@ -175,6 +199,8 @@ pub(crate) async fn execute_http_fetch_tool(
             );
         }
     };
+    // A header supplied both explicitly and via a credential binding would
+    // let the model shadow or duplicate an injected credential; fail closed.
     if let Some(duplicate_header) = credential_bindings.iter().find_map(|binding| {
         let normalized = binding.header_name.trim().to_ascii_lowercase();
         request_headers
@@ -197,6 +223,9 @@ pub(crate) async fn execute_http_fetch_tool(
         .get("allow_redirects")
         .and_then(Value::as_bool)
         .unwrap_or(runtime_state.config.http_fetch.allow_redirects);
+    // The `as usize` casts below are safe even where they could truncate:
+    // the immediate clamp to the MAX_HTTP_FETCH_* ceilings bounds the result,
+    // so an attacker-supplied huge value can only shrink the limit.
     let max_redirects = payload
         .get("max_redirects")
         .and_then(Value::as_u64)
@@ -242,6 +271,9 @@ pub(crate) async fn execute_http_fetch_tool(
     let cache_request = payload.get("cache").and_then(Value::as_bool);
     let credential_bound_fetch = !credential_bindings.is_empty();
     let cache_target_is_loopback = http_fetch_url_targets_loopback(&url);
+    // Never cache credential-bound responses (a later uncredentialed call
+    // could replay them), and skip the cache by default for loopback targets,
+    // which are typically fast-changing local dev servers.
     let cache_enabled = matches!(method.as_str(), "GET" | "HEAD")
         && !credential_bound_fetch
         && cache_request.unwrap_or_else(|| {
@@ -400,6 +432,9 @@ pub(crate) async fn execute_http_fetch_tool(
     let mut current_url = url;
     let mut redirects_followed = 0_usize;
     loop {
+        // The first iteration consumes the verdict already computed above
+        // (so a redirect-free fetch evaluates policy exactly once); redirect
+        // iterations find `None` here and re-evaluate for the new target.
         let (egress_verdict, resolved_addrs) = if let Some(resolved) = next_egress_verdict.take() {
             resolved
         } else {
@@ -435,12 +470,17 @@ pub(crate) async fn execute_http_fetch_tool(
         current_egress_verdict = egress_verdict;
 
         let host = current_url.host_str().unwrap_or_default().to_owned();
+        // `Policy::none()` is load-bearing: redirects are followed manually
+        // below so each hop goes back through egress evaluation.
         let mut client_builder = reqwest::Client::builder()
             .redirect(Policy::none())
             .connect_timeout(Duration::from_millis(
                 runtime_state.config.http_fetch.connect_timeout_ms,
             ))
             .timeout(Duration::from_millis(runtime_state.config.http_fetch.request_timeout_ms));
+        // Pin the connection to the addresses the egress verdict validated;
+        // without this, a second DNS lookup inside reqwest could be rebound
+        // to a private address after the policy check (DNS-rebinding SSRF).
         if !host.is_empty() && host.parse::<IpAddr>().is_err() {
             for address in resolved_addrs {
                 client_builder = client_builder.resolve(host.as_str(), address);
@@ -547,6 +587,8 @@ pub(crate) async fn execute_http_fetch_tool(
                 }
             };
             redirects_followed = redirects_followed.saturating_add(1);
+            // Drop the consumed verdict so the next loop iteration
+            // re-evaluates egress policy for the redirect target.
             next_egress_verdict = None;
             continue;
         }
@@ -569,6 +611,8 @@ pub(crate) async fn execute_http_fetch_tool(
             );
         }
 
+        // Stream the body chunk by chunk and stop at the cap, so a hostile
+        // server cannot balloon memory by ignoring Content-Length.
         let mut body_bytes = Vec::new();
         let mut body_truncated = false;
         if method != "HEAD" {
@@ -634,6 +678,8 @@ pub(crate) async fn execute_http_fetch_tool(
         });
         let serialized = serde_json::to_vec(&output_json).unwrap_or_else(|_| b"{}".to_vec());
         if cache_enabled && success {
+            // A poisoned cache lock is deliberately ignored: caching is
+            // best-effort and must never fail an otherwise successful fetch.
             if let Ok(mut cache) = runtime_state.http_fetch_cache.lock() {
                 let now = current_unix_ms();
                 cache.retain(|_, entry| entry.expires_at_unix_ms > now);
@@ -646,6 +692,9 @@ pub(crate) async fn execute_http_fetch_tool(
                 cache.insert(
                     cache_key.clone(),
                     CachedHttpFetchEntry {
+                        // `cache_ttl_ms as i64` cannot produce a negative
+                        // expiry for any realistic TTL; an absurd operator
+                        // value would only expire the entry immediately.
                         expires_at_unix_ms: now.saturating_add(cache_ttl_ms as i64),
                         output_json: serialized.clone(),
                     },
@@ -666,6 +715,8 @@ pub(crate) async fn execute_http_fetch_tool(
     }
 }
 
+/// Policy dimensions folded into the cache key so requests evaluated under
+/// different policies can never share a cached response.
 pub(crate) struct HttpFetchCachePolicy<'a> {
     pub(crate) allow_private_targets: bool,
     pub(crate) allow_redirects: bool,
@@ -684,6 +735,8 @@ fn http_fetch_cache_status(cache_enabled: bool, bypassed_loopback_default: bool)
     }
 }
 
+/// Replays a cached response with its `cache` block rewritten to a hit
+/// marker; falls back to the stored bytes verbatim if they fail to re-parse.
 fn http_fetch_cached_output_with_hit_metadata(cached: &CachedHttpFetchEntry) -> Vec<u8> {
     let mut payload = serde_json::from_slice::<Value>(cached.output_json.as_slice())
         .unwrap_or_else(|_| json!({}));
@@ -702,6 +755,9 @@ fn http_fetch_cached_output_with_hit_metadata(cached: &CachedHttpFetchEntry) -> 
     }
 }
 
+/// Builds the deterministic cache key for one fetch: method, URL, sorted
+/// headers, body hash, and a hash of the [`HttpFetchCachePolicy`]
+/// fingerprint. Oversized keys collapse to their own SHA-256.
 pub(crate) fn http_fetch_cache_key(
     method: &str,
     url: &str,
@@ -740,6 +796,16 @@ pub(crate) fn http_fetch_cache_key(
     key
 }
 
+/// Resolves a fetch target to socket addresses and rejects any address the
+/// netguard private/SSRF rules disallow.
+///
+/// Not called on the production fetch path (which takes resolved addresses
+/// from the egress verdict); kept for the gateway SSRF test suite that
+/// exercises netguard validation directly.
+///
+/// # Errors
+/// Returns an error when the URL lacks a host/port, DNS resolution fails, or
+/// any resolved address is blocked.
 #[allow(dead_code)]
 pub(crate) async fn resolve_fetch_target_addresses(
     url: &Url,
@@ -760,6 +826,13 @@ pub(crate) async fn resolve_fetch_target_addresses(
     Ok(resolved)
 }
 
+/// Applies the netguard private/SSRF address rules to already-resolved
+/// addresses. Retained for the gateway SSRF test suite (see
+/// [`resolve_fetch_target_addresses`]).
+///
+/// # Errors
+/// Returns an error when any address falls in a blocked range and
+/// `allow_private_targets` is false.
 #[allow(dead_code)]
 pub(crate) fn validate_resolved_fetch_addresses(
     addrs: &[SocketAddr],
@@ -769,18 +842,27 @@ pub(crate) fn validate_resolved_fetch_addresses(
     netguard::validate_resolved_ip_addrs(ips.as_slice(), allow_private_targets)
 }
 
+/// Parses and validates `credential_bindings` from the tool input.
+///
+/// Bindings fail closed: each must reference a vault-backed secret whose
+/// normalized `scope/key` appears in the operator-configured allowlist, so
+/// the model can only ever attach pre-approved credentials.
+///
+/// # Errors
+/// Returns a model-facing message when the field is malformed, the allowlist
+/// is empty while bindings are present, a secret ref is invalid or
+/// non-vault, or a vault ref is not allowlisted.
 fn parse_credential_bindings(
     payload: &serde_json::Map<String, Value>,
     allowed_credential_vault_refs: &[String],
 ) -> Result<Vec<CredentialBindingPlan>, String> {
     match payload.get("credential_bindings") {
-        Some(Value::Array(_)) => {
-            let bindings = serde_json::from_value::<Vec<CredentialBindingPlan>>(
-                payload.get("credential_bindings").cloned().unwrap_or(Value::Null),
-            )
-            .map_err(|error| {
-                format!("palyra.http.fetch credential_bindings are invalid: {error}")
-            })?;
+        Some(Value::Array(values)) => {
+            let bindings =
+                serde_json::from_value::<Vec<CredentialBindingPlan>>(Value::Array(values.clone()))
+                    .map_err(|error| {
+                        format!("palyra.http.fetch credential_bindings are invalid: {error}")
+                    })?;
             if !bindings.is_empty() && allowed_credential_vault_refs.is_empty() {
                 return Err(
                     "palyra.http.fetch credential_bindings require configured tool_call.http_fetch.allowed_credential_vault_refs"
@@ -821,6 +903,9 @@ fn parse_credential_bindings(
     }
 }
 
+/// Returns the binding's normalized `scope/key` vault ref, `None` when the
+/// secret source is not vault-backed, or `Some(Err)` when the vault ref is
+/// syntactically invalid.
 fn http_fetch_credential_vault_ref(
     binding: &CredentialBindingPlan,
 ) -> Option<Result<String, String>> {
@@ -876,6 +961,10 @@ fn evaluate_http_fetch_egress(
         .map_err(|error| format!("palyra.http.fetch target blocked: {error}"))
 }
 
+/// Resolves allowlisted credential bindings into header values via the
+/// vault. Missing optional secrets are skipped; missing required secrets
+/// fail the call. Error messages carry only the header name, never the
+/// secret value.
 fn resolve_credential_bindings(
     runtime_state: &Arc<GatewayRuntimeState>,
     credential_bindings: &[CredentialBindingPlan],
@@ -915,6 +1004,12 @@ fn resolve_credential_bindings(
     Ok(resolved)
 }
 
+/// Decides whether a fetch may target private/loopback addresses.
+///
+/// When the daemon config already allows private targets, the request may
+/// only opt *out*. Otherwise an explicit `allow_private_targets=true` request
+/// is honored solely for loopback URLs, and only when the process-runner
+/// sandbox policy grants host access -- private LAN targets stay blocked.
 pub(crate) fn http_fetch_allows_private_targets_for_url(
     config_allow_private_targets: bool,
     process_runner_policy: &SandboxProcessRunnerPolicy,
@@ -946,10 +1041,15 @@ fn http_fetch_url_targets_loopback(url: &Url) -> bool {
         .unwrap_or(false)
 }
 
+/// Echoes the request headers into the tool output with values of
+/// credential-looking headers replaced, so journaled outputs never persist
+/// tokens the model supplied explicitly.
 fn redacted_http_headers(headers: &[(String, String)]) -> Vec<serde_json::Value> {
     headers
         .iter()
         .map(|(name, value)| {
+            // Header names are normalized to lowercase at parse time, so
+            // plain substring checks are case-insensitive in effect.
             let sensitive = name.contains("authorization")
                 || name.contains("cookie")
                 || name.contains("token")
@@ -971,6 +1071,9 @@ fn http_fetch_tool_execution_outcome(
     error: String,
 ) -> ToolExecutionOutcome {
     let executed_at_unix_ms = current_unix_ms();
+    // Length-prefix every variable-size field before hashing so distinct
+    // (input, output, error) triples can never produce colliding digests by
+    // shifting bytes across field boundaries.
     let mut hasher = Sha256::new();
     hasher.update(b"palyra.http.fetch.attestation.v1");
     hasher.update((proposal_id.len() as u64).to_be_bytes());
@@ -1000,6 +1103,8 @@ fn http_fetch_tool_execution_outcome(
     }
 }
 
+/// Body text prepared for the model plus the format tag describing how it
+/// was derived (`plain_text`, `html_text`, or `html_raw`).
 struct HttpFetchModelBody {
     body_text: String,
     format: &'static str,
@@ -1022,6 +1127,12 @@ fn is_html_content_type(content_type: &str) -> bool {
     content_type.split(';').next().unwrap_or_default().trim().eq_ignore_ascii_case("text/html")
 }
 
+/// Minimal hand-rolled extraction of human-visible text from HTML.
+///
+/// Deliberately not a full parser (no new dependency for this): it tracks a
+/// stack of skip-tags ([`HTTP_FETCH_HTML_SKIP_TAGS`]) whose content is
+/// dropped, inserts line boundaries at block-level tags, and decodes basic
+/// entities. Malformed markup degrades to truncation, never to a panic.
 fn extract_html_visible_text(html: &str) -> String {
     let mut output = String::new();
     let mut index = 0_usize;
@@ -1186,6 +1297,8 @@ fn decode_basic_html_entities(text: &str) -> String {
         };
         let semicolon = entity_start.saturating_add(relative_semicolon);
         let entity = &text[entity_start..semicolon];
+        // Real entities are short; a distant stray ';' would otherwise make
+        // this swallow a long span of legitimate text as one bogus entity.
         if entity.len() > 32 {
             output.push('&');
             index = entity_start;
@@ -1227,11 +1340,15 @@ fn decode_numeric_html_entity(digits: &str, radix: u32) -> Option<String> {
     Some(character.to_string())
 }
 
+/// Redacted body text plus the safety-scan metadata attached to the output.
 struct HttpFetchBodyExport {
     body_text: String,
     safety_json: Value,
 }
 
+/// Runs the safety redaction scan over the model-bound body text. HTTP
+/// responses are always labeled `ExternalUntrusted`, so secret-looking
+/// values are redacted before the model or journal sees them.
 fn export_http_fetch_body(body_text: &str) -> HttpFetchBodyExport {
     let outcome = redact_text_for_export(
         body_text,

@@ -1,3 +1,12 @@
+//! Networked-worker tool execution backend.
+//!
+//! Routes a small allowlist of tools through the `palyra-workerd` fleet
+//! contract: assign a capability-scoped lease, execute, complete the lease
+//! with a cleanup attestation, and journal the artifact transport as a
+//! runtime decision event. Every failure path (unsupported tool, lease
+//! denial, cleanup failure, journal failure) fails closed with a reason-coded
+//! [`ToolExecutionOutcome`] instead of falling back to another backend.
+
 use std::sync::Arc;
 
 use palyra_common::runtime_preview::{
@@ -20,6 +29,10 @@ use crate::{
 
 const NETWORKED_WORKER_SUPPORTED_TOOLS: &[&str] = &["palyra.echo", "palyra.sleep"];
 
+/// Returns whether `tool_name` may run on the networked-worker backend.
+///
+/// Tools outside [`NETWORKED_WORKER_SUPPORTED_TOOLS`] fail closed in
+/// [`execute_networked_worker_tool`] rather than falling back locally.
 #[must_use]
 pub(crate) fn networked_worker_supports_tool(tool_name: &str) -> bool {
     NETWORKED_WORKER_SUPPORTED_TOOLS
@@ -27,11 +40,18 @@ pub(crate) fn networked_worker_supports_tool(tool_name: &str) -> bool {
         .any(|supported| supported.eq_ignore_ascii_case(tool_name))
 }
 
+/// Builds the worker capability identifier required to lease `tool_name`.
 #[must_use]
 pub(crate) fn networked_worker_tool_capability(tool_name: &str) -> String {
     format!("tool:{}", tool_name.to_ascii_lowercase())
 }
 
+/// Executes `tool_name` under a networked-worker lease and returns the
+/// attested outcome.
+///
+/// The full lease lifecycle (assignment, cleanup report, artifact-transport
+/// journal event) must succeed; any lifecycle failure overrides the tool
+/// result and fails the call closed.
 pub(crate) async fn execute_networked_worker_tool(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -66,6 +86,9 @@ pub(crate) async fn execute_networked_worker_tool(
         }
     };
 
+    // The tool body still runs through the local runner; the lease exists to
+    // exercise and attest the fleet lifecycle (assign -> cleanup -> journal)
+    // for the supported tool allowlist before remote dispatch lands.
     let local_outcome =
         execute_tool_call(&runtime_state.config.tool_call, proposal_id, tool_name, input_json)
             .await;
@@ -156,6 +179,9 @@ fn build_worker_lease_request(
         },
         artifact_transport: WorkerArtifactTransport {
             input_manifest_sha256: sha256_hex(input_json),
+            // The real output does not exist at lease time; a deterministic
+            // placeholder digest keeps the lease request well-formed and the
+            // attested digest is journaled after execution instead.
             output_manifest_sha256: sha256_hex(
                 format!("pending:{proposal_id}:{tool_name}:{}", context.run_id).as_bytes(),
             ),
@@ -166,6 +192,9 @@ fn build_worker_lease_request(
             grant_id,
             run_id: context.run_id.to_owned(),
             tool_name: tool_name.to_owned(),
+            // `ttl_ms as i64` only wraps for absurd operator-configured TTLs
+            // (> i64::MAX ms); the wrap turns negative and merely expires the
+            // grant immediately, which fails safe.
             expires_at_unix_ms: now_unix_ms.saturating_add(ttl_ms as i64),
         },
     }

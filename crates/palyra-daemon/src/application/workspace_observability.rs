@@ -1,3 +1,18 @@
+//! Workspace checkpoint observability: artifact listing, diffing, and restore.
+//!
+//! Workspace-mutating tools record journal-backed checkpoints (preflight and
+//! post-change snapshots of every touched file). This module captures those
+//! checkpoints ([`capture_workspace_patch_checkpoint`]), aggregates them into
+//! per-path artifact histories for console/run views, diffs two anchors (runs
+//! or checkpoints), and restores checkpoint state back onto disk.
+//!
+//! Restore and capture both write through path-containment guards: relative
+//! paths are validated component-by-component, targets are canonicalized (or
+//! their nearest existing ancestor is), and symlinks anywhere on the resolved
+//! path are rejected before any filesystem mutation. Treat changes to those
+//! guards as security changes. All inline payloads served to clients are
+//! bounded by the `MAX_*` constants below.
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -38,18 +53,22 @@ const MAX_DIFF_TEXT_BYTES: usize = 64 * 1024;
 const MAX_DIFF_LINES: usize = 160;
 const MAX_ACTIVITY_LIST_LIMIT: usize = 32;
 
+/// Identity of one tracked workspace file: which root it lives under plus its
+/// root-relative path.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct WorkspaceArtifactKey {
     workspace_root_index: u32,
     path: String,
 }
 
+/// One file snapshot paired with the checkpoint that captured it.
 #[derive(Debug, Clone)]
 struct WorkspaceArtifactEntry {
     checkpoint: WorkspaceCheckpointRecord,
     file: WorkspaceCheckpointFileRecord,
 }
 
+/// Client-facing projection of a workspace checkpoint record.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct WorkspaceCheckpointSummary {
     pub checkpoint_id: String,
@@ -83,6 +102,7 @@ pub(crate) struct WorkspaceCheckpointSummary {
     pub latest_restore_report_id: Option<String>,
 }
 
+/// One historical snapshot of a workspace artifact at a specific checkpoint.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct WorkspaceArtifactVersion {
     pub artifact_id: String,
@@ -100,6 +120,8 @@ pub(crate) struct WorkspaceArtifactVersion {
     pub deleted: bool,
 }
 
+/// Per-path artifact history: latest state plus all captured versions,
+/// newest first.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct WorkspaceArtifactRecord {
     pub artifact_id: String,
@@ -135,6 +157,8 @@ pub(crate) struct WorkspaceArtifactRecord {
     pub versions: Vec<WorkspaceArtifactVersion>,
 }
 
+/// Single-artifact detail view with optional inline content (bounded to
+/// [`MAX_INLINE_ARTIFACT_BYTES`]).
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct WorkspaceArtifactDetail {
     pub artifact: WorkspaceArtifactRecord,
@@ -147,6 +171,7 @@ pub(crate) struct WorkspaceArtifactDetail {
     pub content_base64: Option<String>,
 }
 
+/// File state on one side (left or right anchor) of a workspace diff.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct WorkspaceDiffSide {
     pub artifact_id: String,
@@ -160,6 +185,7 @@ pub(crate) struct WorkspaceDiffSide {
     pub deleted: bool,
 }
 
+/// One changed file in a workspace diff, with an optional bounded text diff.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct WorkspaceDiffFileRecord {
     pub path: String,
@@ -174,6 +200,10 @@ pub(crate) struct WorkspaceDiffFileRecord {
     pub diff_text: Option<String>,
 }
 
+/// One path that could not be restored, with the failure reason.
+///
+/// Also deserialized from the `failed_paths_json` column of stored restore
+/// reports, so the field set is part of the persisted report format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct WorkspaceRestoreFailure {
     pub path: String,
@@ -182,6 +212,8 @@ pub(crate) struct WorkspaceRestoreFailure {
     pub error: String,
 }
 
+/// Inputs for [`capture_workspace_patch_checkpoint`]: the acting identity,
+/// the run/tool provenance, and the attested set of files being touched.
 pub(crate) struct WorkspacePatchCheckpointCapture<'a> {
     pub principal: &'a str,
     pub device_id: &'a str,
@@ -200,9 +232,12 @@ pub(crate) struct WorkspacePatchCheckpointCapture<'a> {
     pub files_touched: &'a [WorkspacePatchFileAttestation],
 }
 
+/// Whether a checkpoint snapshots the workspace before or after a mutation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorkspacePatchCheckpointStage {
+    /// Pre-mutation snapshot capturing the state a restore would roll back to.
     Preflight,
+    /// Post-mutation snapshot capturing the applied result.
     PostChange,
 }
 
@@ -229,16 +264,21 @@ impl WorkspacePatchCheckpointStage {
     }
 }
 
+/// Optional substring filter and result cap for artifact listings.
 pub(crate) struct WorkspaceArtifactListQuery<'a> {
     pub query: Option<&'a str>,
     pub limit: usize,
 }
 
+/// Reference point for a workspace diff: a whole run or a single checkpoint.
 pub(crate) enum WorkspaceCompareAnchor {
     Run(String),
     Checkpoint(String),
 }
 
+/// Inputs for [`restore_workspace_checkpoint`]: the acting identity, the
+/// checkpoint to roll back to, and the restore scope (whole workspace or one
+/// file).
 pub(crate) struct WorkspaceRestoreRequest<'a> {
     pub principal: &'a str,
     pub device_id: &'a str,
@@ -251,6 +291,8 @@ pub(crate) struct WorkspaceRestoreRequest<'a> {
     pub branched_session_id: Option<&'a str>,
 }
 
+/// Combined run-scoped workspace view: artifacts, checkpoints, background
+/// tasks, compactions, and session checkpoints for one run.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct RunWorkspaceArtifactsResponse {
     pub artifacts: Vec<WorkspaceArtifactRecord>,
@@ -260,6 +302,7 @@ pub(crate) struct RunWorkspaceArtifactsResponse {
     pub session_checkpoints: Vec<OrchestratorCheckpointRecord>,
 }
 
+/// Identity and label of one diff anchor as shown to clients.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct WorkspaceAnchorSummary {
     pub kind: String,
@@ -270,6 +313,8 @@ pub(crate) struct WorkspaceAnchorSummary {
     pub created_at_unix_ms: i64,
 }
 
+/// Result of [`compare_workspace_anchors`]: the changed files between two
+/// anchors of the same session.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct WorkspaceDiffResponse {
     pub left_anchor: WorkspaceAnchorSummary,
@@ -278,6 +323,8 @@ pub(crate) struct WorkspaceDiffResponse {
     pub files: Vec<WorkspaceDiffFileRecord>,
 }
 
+/// Result of [`restore_workspace_checkpoint`], including per-path outcomes
+/// and the persisted restore report.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct WorkspaceRestoreOutcome {
     pub scope_kind: String,
@@ -291,6 +338,7 @@ pub(crate) struct WorkspaceRestoreOutcome {
     pub report: WorkspaceRestoreReportRecord,
 }
 
+/// Scope filters and result cap for workspace activity snapshots.
 pub(crate) struct WorkspaceActivityQuery<'a> {
     pub session_id: Option<&'a str>,
     pub run_id: Option<&'a str>,
@@ -298,6 +346,7 @@ pub(crate) struct WorkspaceActivityQuery<'a> {
     pub limit: usize,
 }
 
+/// Client-facing projection of a workspace restore report record.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct WorkspaceRestoreReportSummary {
     pub report_id: String,
@@ -319,6 +368,8 @@ pub(crate) struct WorkspaceRestoreReportSummary {
     pub created_at_unix_ms: i64,
 }
 
+/// Restore report detail: the report, its source checkpoint, and the decoded
+/// per-path results.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct WorkspaceRestoreReportDetail {
     pub report: WorkspaceRestoreReportSummary,
@@ -327,6 +378,8 @@ pub(crate) struct WorkspaceRestoreReportDetail {
     pub failed_paths: Vec<WorkspaceRestoreFailure>,
 }
 
+/// Recent workspace checkpoint/restore activity for a session, run, or
+/// device scope.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct WorkspaceActivitySnapshot {
     pub summary: WorkspaceRestoreActivitySummary,
@@ -334,6 +387,12 @@ pub(crate) struct WorkspaceActivitySnapshot {
     pub recent_restore_reports: Vec<WorkspaceRestoreReportSummary>,
 }
 
+/// Loads the run-scoped workspace view: aggregated artifacts (optionally
+/// filtered by `query`), checkpoints, related background tasks, compactions,
+/// and the run's session checkpoints.
+///
+/// # Errors
+/// Returns the journal's [`Status`] when any of the underlying listings fail.
 pub(crate) async fn load_run_workspace_artifacts(
     runtime_state: &Arc<GatewayRuntimeState>,
     run: &OrchestratorRunStatusSnapshot,
@@ -355,8 +414,7 @@ pub(crate) async fn load_run_workspace_artifacts(
         .filter(|artifact| {
             normalized_query
                 .as_deref()
-                .map(|needle| artifact_matches_query(artifact, needle))
-                .unwrap_or(true)
+                .is_none_or(|needle| artifact_matches_query(artifact, needle))
         })
         .take(query.limit.clamp(1, MAX_ARTIFACT_LIST_LIMIT))
         .collect::<Vec<_>>();
@@ -394,6 +452,12 @@ pub(crate) async fn load_run_workspace_artifacts(
     })
 }
 
+/// Loads one workspace artifact, optionally with bounded inline content.
+///
+/// # Errors
+/// Returns `Status::not_found` when the artifact or its checkpoint does not
+/// exist, and `Status::permission_denied` when the artifact belongs to a
+/// different run or session than the authenticated `run` context.
 pub(crate) async fn load_workspace_artifact_detail(
     runtime_state: &Arc<GatewayRuntimeState>,
     run: &OrchestratorRunStatusSnapshot,
@@ -445,6 +509,11 @@ pub(crate) async fn load_workspace_artifact_detail(
     })
 }
 
+/// Summarizes recent checkpoint and restore activity for the queried scope,
+/// capped at [`MAX_ACTIVITY_LIST_LIMIT`] entries per list.
+///
+/// # Errors
+/// Returns the journal's [`Status`] when any of the underlying queries fail.
 pub(crate) async fn load_workspace_activity_snapshot(
     runtime_state: &Arc<GatewayRuntimeState>,
     query: WorkspaceActivityQuery<'_>,
@@ -484,6 +553,12 @@ pub(crate) async fn load_workspace_activity_snapshot(
     })
 }
 
+/// Loads one restore report together with its source checkpoint and decoded
+/// per-path results.
+///
+/// # Errors
+/// Returns `Status::not_found` when the report or its checkpoint is missing,
+/// and `Status::internal` when the stored path JSON fails to decode.
 pub(crate) async fn load_workspace_restore_report_detail(
     runtime_state: &Arc<GatewayRuntimeState>,
     report_id: &str,
@@ -520,6 +595,14 @@ pub(crate) async fn load_workspace_restore_report_detail(
     })
 }
 
+/// Diffs the workspace state of two anchors, returning at most
+/// `limit.clamp(1, MAX_COMPARE_FILE_LIMIT)` changed files with bounded text
+/// diffs where both sides are text.
+///
+/// # Errors
+/// Returns `Status::not_found` when an anchor does not exist,
+/// `Status::failed_precondition` when the anchors belong to different
+/// sessions, and the journal's [`Status`] when payload loading fails.
 pub(crate) async fn compare_workspace_anchors(
     runtime_state: &Arc<GatewayRuntimeState>,
     left: WorkspaceCompareAnchor,
@@ -560,8 +643,8 @@ pub(crate) async fn compare_workspace_anchors(
         let diff_text = build_diff_text(runtime_state, left_entry, right_entry).await?;
         let diff_kind = if diff_text.is_some() {
             "text".to_owned()
-        } else if left_entry.map(|entry| entry.file.deleted()).unwrap_or(false)
-            || right_entry.map(|entry| entry.file.deleted()).unwrap_or(false)
+        } else if left_entry.is_some_and(|entry| entry.file.deleted())
+            || right_entry.is_some_and(|entry| entry.file.deleted())
         {
             "metadata_only".to_owned()
         } else {
@@ -586,6 +669,19 @@ pub(crate) async fn compare_workspace_anchors(
     })
 }
 
+/// Restores the workspace (or one file) to the state captured at the given
+/// checkpoint, then persists a restore report and marks the checkpoint as
+/// restored.
+///
+/// Per-path write failures do not abort the restore; they are collected into
+/// `failed_paths` and reflected in the report's `result_state`.
+///
+/// # Errors
+/// Returns `Status::invalid_argument` for an unknown `scope_kind` or a
+/// file-scope request without `target_path`, `Status::not_found` /
+/// `Status::failed_precondition` when the target file state is missing or
+/// ambiguous across roots, and the journal's [`Status`] when agent
+/// resolution, state collection, or report persistence fails.
 pub(crate) async fn restore_workspace_checkpoint(
     runtime_state: &Arc<GatewayRuntimeState>,
     request: WorkspaceRestoreRequest<'_>,
@@ -622,8 +718,7 @@ pub(crate) async fn restore_workspace_checkpoint(
                 key.path == target_path
                     && request
                         .target_workspace_root_index
-                        .map(|value| value == key.workspace_root_index)
-                        .unwrap_or(true)
+                        .is_none_or(|value| value == key.workspace_root_index)
             })
             .collect::<Vec<_>>();
         if matching.is_empty() {
@@ -740,6 +835,9 @@ async fn aggregate_run_workspace_artifacts(
 
     let mut artifacts = Vec::with_capacity(versions_by_path.len());
     for (_key, mut versions) in versions_by_path {
+        // Newest first: timestamp, then stage (post_change outranks preflight
+        // at the same instant), then checkpoint id as a deterministic
+        // tiebreaker so `versions[0]` is always the authoritative latest.
         versions.sort_by(|left, right| {
             right
                 .checkpoint
@@ -927,6 +1025,8 @@ async fn load_anchor_artifacts(
                 path: file.path.clone(),
             };
             let candidate = WorkspaceArtifactEntry { checkpoint: checkpoint.clone(), file };
+            // Keep only the newest snapshot per path; on equal timestamps the
+            // first one seen wins, matching the input listing order.
             match artifacts.get(&key) {
                 Some(existing)
                     if existing.checkpoint.created_at_unix_ms
@@ -991,6 +1091,11 @@ async fn collect_workspace_state_for_checkpoint(
             limit: Some(MAX_ARTIFACT_LIST_LIMIT),
         })
         .await?;
+    // Reconstruct workspace state *at* the target checkpoint by replaying the
+    // session's checkpoints in chronological order up to and including it.
+    // The (timestamp, stage, checkpoint id) ordering here must mirror the
+    // sort in `aggregate_run_workspace_artifacts` or restores would pick a
+    // different "latest" version than the artifact views display.
     checkpoints.retain(|candidate| {
         candidate.created_at_unix_ms < checkpoint.created_at_unix_ms
             || (candidate.created_at_unix_ms == checkpoint.created_at_unix_ms && {
@@ -1080,6 +1185,9 @@ async fn restore_workspace_entry(
             ))
         })?;
     }
+    // Re-check confinement after creating parents: the directory tree may
+    // have changed (e.g. a symlink swapped in) since the resolve-time check
+    // in `resolve_workspace_restore_target`.
     ensure_workspace_restore_target_confined(
         canonical_workspace_root.as_path(),
         absolute_path.as_path(),
@@ -1147,6 +1255,13 @@ fn validate_workspace_restore_relative_path(relative_path: &Path) -> Result<(), 
     Ok(())
 }
 
+/// Verifies that `absolute_path` cannot write outside `workspace_root`.
+///
+/// Symlinks are rejected outright -- both at the leaf and at the nearest
+/// existing ancestor of a not-yet-created target -- because a symlink inside
+/// the workspace can redirect a confined-looking path anywhere on the
+/// filesystem. The surviving path (or ancestor) is then canonicalized and
+/// prefix-checked against the already-canonical workspace root.
 fn ensure_workspace_restore_target_confined(
     workspace_root: &Path,
     absolute_path: &Path,
@@ -1327,14 +1442,12 @@ fn artifact_matches_query(artifact: &WorkspaceArtifactRecord, query: &str) -> bo
         || artifact
             .preview_text
             .as_deref()
-            .map(|value| value.to_ascii_lowercase().contains(query))
-            .unwrap_or(false)
+            .is_some_and(|value| value.to_ascii_lowercase().contains(query))
         || artifact.versions.iter().any(|version| {
             version
                 .moved_from_path
                 .as_deref()
-                .map(|value| value.to_ascii_lowercase().contains(query))
-                .unwrap_or(false)
+                .is_some_and(|value| value.to_ascii_lowercase().contains(query))
         })
 }
 
@@ -1403,6 +1516,9 @@ fn build_reconciliation_prompt(
     prompt
 }
 
+/// Returns whether restoring `path` touches files that feed the agent's
+/// context stack (instructions, memory, project context), so callers can
+/// prompt the model to re-read them after a restore.
 fn path_affects_context_stack(path: &str) -> bool {
     let normalized = path.replace('\\', "/").to_ascii_lowercase();
     normalized == "palyra.md"
@@ -1430,6 +1546,12 @@ fn preview_kind(content_type: &str, is_text: bool) -> String {
     }
 }
 
+/// Builds a unified-style line diff (` `/`-`/`+` prefixes) capped at
+/// `max_output_lines`, appending `...` when truncated.
+///
+/// Classic longest-common-subsequence DP; quadratic in line count, which is
+/// acceptable because both inputs are already capped at
+/// [`MAX_DIFF_TEXT_BYTES`] by `payload_text_for_diff`.
 fn build_line_diff_preview(left: &str, right: &str, max_output_lines: usize) -> String {
     let left_lines = left.lines().collect::<Vec<_>>();
     let right_lines = right.lines().collect::<Vec<_>>();
@@ -1478,6 +1600,17 @@ fn build_line_diff_preview(left: &str, right: &str, max_output_lines: usize) -> 
     rows.join("\n")
 }
 
+/// Captures a workspace checkpoint for a patch mutation, snapshotting every
+/// attested file at the requested stage.
+///
+/// Returns `Ok(None)` when the attestation lists no touched files (nothing to
+/// checkpoint).
+///
+/// # Errors
+/// Returns `Status::failed_precondition` when on-disk content no longer
+/// matches the attested hash/size (the workspace changed between planning and
+/// capture), `Status::invalid_argument` when a path escapes its workspace
+/// root, and the journal's [`Status`] when checkpoint persistence fails.
 pub(crate) async fn capture_workspace_patch_checkpoint(
     runtime_state: &Arc<GatewayRuntimeState>,
     input: WorkspacePatchCheckpointCapture<'_>,
@@ -1610,6 +1743,9 @@ fn build_preflight_checkpoint_files(
             None,
             "preflight_create",
         )]),
+        // A move needs two preflight entries so a restore can undo it fully:
+        // the source's content (to recreate it) and the destination's absence
+        // (to delete the moved file).
         "move" => {
             let source_path = attestation.moved_from.clone().ok_or_else(|| {
                 Status::internal("workspace preflight move checkpoint missing source path")
@@ -1659,6 +1795,12 @@ struct WorkspaceCheckpointContentRead {
     size_bytes: u64,
 }
 
+/// Reads a workspace file for checkpoint capture, verifying it still matches
+/// the size and SHA-256 the mutation plan attested.
+///
+/// The hash check makes a checkpoint trustworthy as a restore source: if the
+/// file changed between planning and capture, the capture fails closed with
+/// `failed_precondition` instead of snapshotting unattested content.
 fn read_existing_workspace_checkpoint_content(
     workspace_roots: &[PathBuf],
     path: &str,
@@ -1749,6 +1891,10 @@ fn read_bounded_workspace_checkpoint_file(
             absolute_path.display()
         ))
     })?;
+    // Read one byte past the attested size: a file that grew since planning
+    // then fails the caller's size comparison instead of being silently
+    // truncated to the expected length, and oversized files cannot balloon
+    // memory.
     let read_limit = expected_size_bytes.checked_add(1).ok_or_else(|| {
         Status::failed_precondition(format!(
             "workspace checkpoint {change_kind} expected size is too large for {display_path}"

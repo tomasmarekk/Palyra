@@ -1,5 +1,14 @@
+//! In-memory registries for tool-runtime processes and background tasks.
+//!
+//! Pure bookkeeping (no process I/O): callers register work with a
+//! cancellation handle and a [`CleanupPolicy`], then drive state transitions
+//! and read [`RuntimeProcessDiagnostic`] snapshots. Shutdown escalates from
+//! graceful cancellation to hard kill based on elapsed time versus each
+//! record's policy.
+
 use std::collections::BTreeMap;
 
+/// Bookkeeping record for one tracked tool-runtime process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RuntimeProcessRecord {
     pub(crate) process_id: String,
@@ -11,6 +20,7 @@ pub(crate) struct RuntimeProcessRecord {
     pub(crate) state: RuntimeProcessState,
 }
 
+/// Bookkeeping record for one tracked background task.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BackgroundTaskRecord {
     pub(crate) task_id: String,
@@ -22,6 +32,10 @@ pub(crate) struct BackgroundTaskRecord {
     pub(crate) state: RuntimeProcessState,
 }
 
+/// Timing thresholds that drive cancellation escalation for one record.
+///
+/// Invariant (enforced by [`ProcessRegistry::register`]):
+/// `graceful_timeout_ms <= hard_kill_after_ms`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CleanupPolicy {
     pub(crate) graceful_timeout_ms: u64,
@@ -30,6 +44,8 @@ pub(crate) struct CleanupPolicy {
 }
 
 impl CleanupPolicy {
+    /// Default escalation policy for tool-program steps (1s graceful, 5s hard
+    /// kill, artifacts kept on cancel).
     pub(crate) const fn tool_program_default() -> Self {
         Self {
             graceful_timeout_ms: 1_000,
@@ -39,6 +55,7 @@ impl CleanupPolicy {
     }
 }
 
+/// Lifecycle state of a tracked process or background task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuntimeProcessState {
     Running,
@@ -49,11 +66,13 @@ pub(crate) enum RuntimeProcessState {
 }
 
 impl RuntimeProcessState {
+    /// Returns whether the state admits no further transitions.
     pub(crate) const fn is_terminal(self) -> bool {
         matches!(self, Self::Cancelled | Self::Completed | Self::HardKilled)
     }
 }
 
+/// Read-only snapshot of one live (non-terminal) record for diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RuntimeProcessDiagnostic {
     pub(crate) id: String,
@@ -64,6 +83,7 @@ pub(crate) struct RuntimeProcessDiagnostic {
     pub(crate) cleanup_policy: CleanupPolicy,
 }
 
+/// Per-state counts produced by [`ProcessRegistry::shutdown`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ShutdownOutcome {
     pub(crate) graceful_cancelled: usize,
@@ -71,12 +91,19 @@ pub(crate) struct ShutdownOutcome {
     pub(crate) already_terminal: usize,
 }
 
+/// Registry of tool-runtime processes keyed by process id.
 #[derive(Debug, Default)]
 pub(crate) struct ProcessRegistry {
     records: BTreeMap<String, RuntimeProcessRecord>,
 }
 
 impl ProcessRegistry {
+    /// Registers a new process record.
+    ///
+    /// # Errors
+    /// Returns an error when any identifying field is blank, when the cleanup
+    /// policy is inconsistent (graceful timeout exceeds the hard-kill
+    /// timeout), or when the process id is already registered.
     pub(crate) fn register(&mut self, record: RuntimeProcessRecord) -> Result<(), String> {
         validate_record_fields(
             record.process_id.as_str(),
@@ -96,6 +123,10 @@ impl ProcessRegistry {
         Ok(())
     }
 
+    /// Marks the process as completed.
+    ///
+    /// # Errors
+    /// Returns an error when `process_id` is not registered.
     pub(crate) fn complete(&mut self, process_id: &str) -> Result<(), String> {
         let record = self
             .records
@@ -105,6 +136,11 @@ impl ProcessRegistry {
         Ok(())
     }
 
+    /// Records a cancellation attempt, escalating the state by how long the
+    /// cancellation has already been in flight (`elapsed_ms`).
+    ///
+    /// # Errors
+    /// Returns an error when `process_id` is not registered.
     pub(crate) fn cancel(&mut self, process_id: &str, elapsed_ms: u64) -> Result<(), String> {
         let record = self
             .records
@@ -120,6 +156,8 @@ impl ProcessRegistry {
         Ok(())
     }
 
+    /// Returns snapshots of all non-terminal processes, aged against
+    /// `now_unix_ms`.
     pub(crate) fn diagnostics(&self, now_unix_ms: i64) -> Vec<RuntimeProcessDiagnostic> {
         self.records
             .values()
@@ -135,6 +173,9 @@ impl ProcessRegistry {
             .collect()
     }
 
+    /// Transitions every live process toward termination during daemon
+    /// shutdown: records whose hard-kill deadline has passed (`elapsed_ms`)
+    /// are marked hard-killed, the rest are marked cancelled.
     pub(crate) fn shutdown(&mut self, elapsed_ms: u64) -> ShutdownOutcome {
         let mut outcome =
             ShutdownOutcome { graceful_cancelled: 0, hard_killed: 0, already_terminal: 0 };
@@ -153,12 +194,18 @@ impl ProcessRegistry {
     }
 }
 
+/// Registry of background tasks keyed by task id.
 #[derive(Debug, Default)]
 pub(crate) struct BackgroundTaskRegistry {
     records: BTreeMap<String, BackgroundTaskRecord>,
 }
 
 impl BackgroundTaskRegistry {
+    /// Registers a new background task record.
+    ///
+    /// # Errors
+    /// Returns an error when any identifying field is blank or when the task
+    /// id is already registered.
     pub(crate) fn register(&mut self, record: BackgroundTaskRecord) -> Result<(), String> {
         validate_record_fields(
             record.task_id.as_str(),
@@ -173,6 +220,10 @@ impl BackgroundTaskRegistry {
         Ok(())
     }
 
+    /// Marks the background task as completed.
+    ///
+    /// # Errors
+    /// Returns an error when `task_id` is not registered.
     pub(crate) fn complete(&mut self, task_id: &str) -> Result<(), String> {
         let record = self
             .records
@@ -182,6 +233,8 @@ impl BackgroundTaskRegistry {
         Ok(())
     }
 
+    /// Returns snapshots of all non-terminal tasks, aged against
+    /// `now_unix_ms`.
     pub(crate) fn diagnostics(&self, now_unix_ms: i64) -> Vec<RuntimeProcessDiagnostic> {
         self.records
             .values()
