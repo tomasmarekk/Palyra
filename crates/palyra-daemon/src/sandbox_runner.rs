@@ -1,3 +1,20 @@
+//! Sandboxed execution of `palyra.process.run` tool calls: input validation, tier selection,
+//! process spawn, bounded output capture, and kill/timeout handling for foreground and
+//! background processes.
+//!
+//! Three execution modes share one pipeline:
+//! - Tier B spawns the child directly with a scrubbed environment, workspace-scoped path
+//!   arguments, and Unix rlimit quotas.
+//! - Tier C delegates isolation planning to the `palyra-sandbox` backend planners
+//!   ([`build_tier_c_command_plan`]) and fails closed when the compiled backend cannot enforce
+//!   the requested network isolation.
+//! - Host-access mode (tier B + egress mode `none` + a `*` executable allowlist) relaxes path
+//!   scoping to approved user-owned OS roots for desktop/E2E workflows while still scrubbing
+//!   the child environment.
+//!
+//! Every validation failure here is a deny-by-default security decision. Error message strings
+//! are pinned by tests and critical attack-scenario fixtures; do not reword them casually.
+
 #![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
 use std::{
@@ -42,6 +59,8 @@ use palyra_sandbox::{
 };
 use serde_json::{json, Value};
 
+// Input-shape caps applied before any spawn. They bound attacker-controlled argv/env size and
+// the allocations derived from it; raising any of them is a security-review change.
 const MAX_COMMAND_LENGTH: usize = 256;
 const MAX_ARGS_COUNT: usize = 128;
 const MAX_ARG_LENGTH: usize = 4_096;
@@ -54,6 +73,8 @@ const CAPTURE_POLL_INTERVAL_MS: u64 = 5;
 const CAPTURE_CHUNK_BYTES: usize = 4 * 1024;
 const PROCESS_FAILURE_OUTPUT_PREVIEW_BYTES: usize = 4 * 1024;
 const BACKGROUND_STARTUP_CHECK_MS: u64 = 250;
+// Windows process startup and pipe readiness are noticeably slower, so the window for draining
+// startup output (port announcements etc.) before returning metadata is longer there.
 #[cfg(windows)]
 const BACKGROUND_STARTUP_OUTPUT_DRAIN_MS: u64 = 4_000;
 #[cfg(not(windows))]
@@ -63,6 +84,8 @@ const BACKGROUND_METADATA_RETURN_RESERVE_MS: u64 = 100;
 const BACKGROUND_MONITOR_POLL_MS: u64 = 50;
 const BACKGROUND_TERMINATION_WAIT_MS: u64 = 1_000;
 const DEFAULT_FOREGROUND_PROCESS_TIMEOUT_MS: u64 = 30_000;
+// Background lifetimes have a floor (short timeouts would kill dev servers mid-verification)
+// and a hard ceiling (no background process may outlive operator expectations unsupervised).
 const MIN_BACKGROUND_PROCESS_LIFETIME_MS: u64 = 120_000;
 const DEFAULT_BACKGROUND_PROCESS_LIFETIME_MS: u64 = 10 * 60_000;
 const MAX_BACKGROUND_PROCESS_LIFETIME_MS: u64 = 30 * 60_000;
@@ -71,6 +94,8 @@ const PALYRA_CLI_PROFILES_PATH_ENV: &str = "PALYRA_CLI_PROFILES_PATH";
 const PALYRA_STATE_ROOT_ENV: &str = "PALYRA_STATE_ROOT";
 const PALYRA_OS_FILE_ROOTS_ENV: &str = "PALYRA_OS_FILE_ROOTS";
 const NODE_DISABLE_COMPILE_CACHE_ENV: &str = "NODE_DISABLE_COMPILE_CACHE";
+// Child environments are rebuilt deny-by-default from these allowlists so daemon secrets
+// (admin tokens, provider keys, vault paths) can never leak into spawned processes.
 const HOST_ACCESS_SAFE_ENV_KEYS: &[&str] = &["HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TERM"];
 const HOST_ACCESS_SAFE_PALYRA_ENV_KEYS: &[&str] = &["PALYRA_E2E_HOME", "PALYRA_E2E_OS_ROOT"];
 const CLI_PROFILES_RELATIVE_PATH: &str = "cli/profiles.toml";
@@ -78,10 +103,14 @@ const DESKTOP_CONTROL_CENTER_STATE_DIR: &str = "desktop-control-center";
 const DESKTOP_RUNTIME_STATE_DIR: &str = "runtime";
 const WORKSPACE_PYTHON_USER_BASE_RELATIVE_PATH: &[&str] = &[".palyra", "python-userbase"];
 const WORKSPACE_PIP_CACHE_RELATIVE_PATH: &[&str] = &[".palyra", "pip-cache"];
+// URL path segments following one of these markers (e.g. a path like .../<marker>/<value>) are
+// treated as secret material and replaced before any output leaves the runner.
 const SENSITIVE_URL_PATH_MARKERS: &[&str] =
     &["token", "secret", "key", "password", "credential", "session"];
 #[cfg(windows)]
 const WINDOWS_DEFAULT_PATH_EXTENSIONS: &[&str] = &[".com", ".exe", ".bat", ".cmd"];
+// Interpreters can execute arbitrary code regardless of argument scoping, so they require the
+// explicit `allow_interpreters` policy opt-in and get extra argument guardrails when allowed.
 const INTERPRETER_EXECUTABLE_DENYLIST: &[&str] = &[
     "bash",
     "sh",
@@ -98,14 +127,20 @@ const INTERPRETER_EXECUTABLE_DENYLIST: &[&str] = &[
     "deno",
 ];
 
+/// How outbound network access requested by a process run is policed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EgressEnforcementMode {
+    /// No egress validation; also a precondition for host-access mode.
     None,
+    /// Hosts referenced by the input are checked against allowlists before spawn, but the
+    /// running child is not network-isolated.
     Preflight,
+    /// Runtime network isolation must be enforced by a tier-C backend; tier B fails closed.
     Strict,
 }
 
 impl EgressEnforcementMode {
+    /// Returns the stable lowercase label used in telemetry and tool output.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -116,13 +151,17 @@ impl EgressEnforcementMode {
     }
 }
 
+/// Isolation tier for process execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxProcessRunnerTier {
+    /// In-process spawn with scrubbed environment, path scoping, and Unix rlimits.
     B,
+    /// Spawn through a platform sandbox backend planned by the `palyra-sandbox` crate.
     C,
 }
 
 impl SandboxProcessRunnerTier {
+    /// Returns the stable lowercase label used in tool output JSON (`"tier"` field).
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -132,47 +171,82 @@ impl SandboxProcessRunnerTier {
     }
 }
 
+/// Operator-configured policy governing what a process run may execute and consume.
+///
+/// All checks in this module evaluate against one immutable policy snapshot per run; the policy
+/// is never derived from tool input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxProcessRunnerPolicy {
+    /// Master switch; when false every run fails with [`SandboxProcessRunErrorKind::Disabled`].
     pub enabled: bool,
+    /// Requested isolation tier (see [`SandboxProcessRunnerTier`]).
     pub tier: SandboxProcessRunnerTier,
+    /// Root directory that scopes working directories and path-like arguments.
     pub workspace_root: PathBuf,
+    /// Case-insensitive executable allowlist; a `*` entry allows any executable and is one of
+    /// the host-access-mode preconditions (see [`process_runner_allows_host_access`]).
     pub allowed_executables: Vec<String>,
+    /// Explicit opt-in required before any denylisted interpreter may run.
     pub allow_interpreters: bool,
+    /// Outbound network posture (see [`EgressEnforcementMode`]).
     pub egress_enforcement_mode: EgressEnforcementMode,
+    /// Exact hostnames permitted for egress in preflight/strict modes.
     pub allowed_egress_hosts: Vec<String>,
+    /// DNS suffixes permitted for egress; matched on label boundaries only.
     pub allowed_dns_suffixes: Vec<String>,
+    /// Child CPU-time quota, enforced via `RLIMIT_CPU` on Unix.
     pub cpu_time_limit_ms: u64,
+    /// Child address-space quota, enforced via `RLIMIT_AS` on Unix (unsupported on macOS).
     pub memory_limit_bytes: u64,
+    /// Combined stdout+stderr capture budget; exceeding it terminates the process.
     pub max_output_bytes: u64,
 }
 
+/// Successful process-run result carrying the serialized tool output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxProcessRunSuccess {
+    /// JSON object with exit code, redacted stdout/stderr, truncation/redaction flags, and
+    /// tier/backend metadata; background runs add process-handle and cleanup metadata.
     pub output_json: Vec<u8>,
 }
 
+/// Failed process-run result; the message is already redacted and safe to surface to callers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxProcessRunError {
+    /// Failure category callers can match on.
     pub kind: SandboxProcessRunErrorKind,
+    /// Human-readable detail; string content is pinned by tests and security fixtures.
     pub message: String,
 }
 
+/// Failure categories for a process run, ordered roughly by pipeline stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxProcessRunErrorKind {
+    /// The runner is switched off by policy.
     Disabled,
+    /// The platform cannot provide fail-closed quota enforcement (currently macOS).
     #[cfg_attr(all(unix, not(target_os = "macos")), allow(dead_code))]
     UnsupportedPlatform,
+    /// The run was cancelled by request and the process tree was terminated.
     Cancelled,
+    /// The tool input failed shape or content validation.
     InvalidInput,
+    /// A path, executable, or interpreter check denied the run (deny-by-default scope rules).
     WorkspaceScopeDenied,
+    /// An egress host check or missing runtime network enforcement denied the run.
     EgressDenied,
+    /// The process exceeded its output budget and was terminated.
     QuotaExceeded,
+    /// The process exceeded its timeout or background lifetime and was terminated.
     TimedOut,
+    /// The OS-level spawn failed or the tier-C backend was unavailable.
     SpawnFailed,
+    /// The process ran but exited unsuccessfully, or capture/serialization failed.
     RuntimeFailure,
 }
 
+/// Returns the stable executor label for telemetry: `host_process` for host-access mode, the
+/// backend-specific `sandbox_tier_c_*` name for tier C, and `sandbox_tier_b` otherwise.
 #[must_use]
 pub fn process_runner_executor_name(policy: &SandboxProcessRunnerPolicy) -> String {
     if process_runner_allows_host_access(policy) {
@@ -185,6 +259,12 @@ pub fn process_runner_executor_name(policy: &SandboxProcessRunnerPolicy) -> Stri
     }
 }
 
+/// Reports whether the policy selects host-access mode (unsandboxed paths under approved
+/// user-owned OS roots).
+///
+/// All three conditions are required so that no single misconfiguration can unlock host access:
+/// tier B (tier C must never be downgraded), egress mode `none`, and an explicit `*` executable
+/// allowlist entry.
 #[must_use]
 pub fn process_runner_allows_host_access(policy: &SandboxProcessRunnerPolicy) -> bool {
     matches!(policy.tier, SandboxProcessRunnerTier::B)
@@ -218,31 +298,46 @@ struct BackgroundOutputMonitor {
     stderr: Arc<Mutex<StreamCapture>>,
 }
 
+/// Liveness snapshot of a background process and its tracked descendants.
+///
+/// On Windows the tree view comes from the job object the process was bound to at spawn; on
+/// other platforms only the direct pid is observable, so the tree view mirrors it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BackgroundProcessRuntimeStatus {
+    /// Whether the directly spawned pid is still alive.
     pub(crate) direct_pid_alive: bool,
+    /// Whether any process in the tracked tree (job object) is still alive.
     pub(crate) process_tree_alive: bool,
+    /// Number of live processes in the tracked tree, when the platform can count them.
     pub(crate) tracked_process_count: Option<u32>,
 }
 
 impl BackgroundProcessRuntimeStatus {
+    /// Returns true while either the direct pid or any tracked descendant is alive.
     pub(crate) fn alive(self) -> bool {
         self.process_tree_alive || self.direct_pid_alive
     }
 
+    /// Returns whether the directly spawned pid is still alive.
     pub(crate) fn direct_pid_alive(self) -> bool {
         self.direct_pid_alive
     }
 
+    /// Returns whether any process in the tracked tree is still alive.
     pub(crate) fn process_tree_alive(self) -> bool {
         self.process_tree_alive
     }
 
+    /// Returns the live tracked-process count, when the platform can report one.
     pub(crate) fn tracked_process_count(self) -> Option<u32> {
         self.tracked_process_count
     }
 }
 
+/// Owning wrapper around a Windows job object that tracks a background process tree.
+///
+/// The job is created with kill-on-close semantics, so dropping the last handle also tears the
+/// tree down if explicit termination never ran.
 #[cfg(windows)]
 #[derive(Debug)]
 struct WindowsBackgroundJob {
@@ -250,15 +345,20 @@ struct WindowsBackgroundJob {
     terminated: AtomicBool,
 }
 
+// SAFETY: `HANDLE` is a process-wide kernel handle, valid from any thread; this wrapper owns it
+// exclusively until Drop and the only mutable state (`terminated`) is an atomic.
 #[cfg(windows)]
 unsafe impl Send for WindowsBackgroundJob {}
 
+// SAFETY: see the Send rationale above; all &self methods are thread-safe Win32 calls guarded
+// by the `terminated` atomic.
 #[cfg(windows)]
 unsafe impl Sync for WindowsBackgroundJob {}
 
 #[cfg(windows)]
 impl WindowsBackgroundJob {
     fn terminate(&self) -> io::Result<()> {
+        // The swap makes termination idempotent: only the first caller issues the kill.
         if self.terminated.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
@@ -300,6 +400,12 @@ impl Drop for WindowsBackgroundJob {
     }
 }
 
+// Registry of live background jobs keyed by the direct child pid, consulted by the portable
+// stop/status builtins so they can act on the whole tree instead of just the launcher pid.
+// AIDEV-NOTE: entries are only removed by an explicit stop (take_windows_background_job).
+// Background processes that exit naturally, or are reaped by the lifetime monitor, leave their
+// job handle registered until daemon shutdown. Fixing this needs a behavior change (eviction
+// when the monitor observes exit), so it is only flagged here.
 #[cfg(windows)]
 static WINDOWS_BACKGROUND_JOBS: OnceLock<Mutex<HashMap<u32, Arc<WindowsBackgroundJob>>>> =
     OnceLock::new();
@@ -321,6 +427,9 @@ impl BackgroundOutputMonitor {
         (stdout, stderr)
     }
 
+    // Polls until the child produced any output (or an error/truncation) or `max_wait` elapses,
+    // so background metadata can include early port announcements without blocking the caller
+    // for the full drain window when output arrives quickly.
     fn snapshot_after_startup_drain(&self, max_wait: Duration) -> (StreamCapture, StreamCapture) {
         let started_at = Instant::now();
         let mut snapshot = self.snapshot();
@@ -346,6 +455,8 @@ fn background_snapshot_has_output_or_error(snapshot: &(StreamCapture, StreamCapt
         || stderr.read_error.is_some()
 }
 
+/// Test-only convenience wrapper over [`run_constrained_process_with_cancellation`] without a
+/// cancellation flag.
 #[cfg(test)]
 pub(crate) fn run_constrained_process(
     policy: &SandboxProcessRunnerPolicy,
@@ -355,6 +466,23 @@ pub(crate) fn run_constrained_process(
     run_constrained_process_with_cancellation(policy, input_json, execution_timeout, None)
 }
 
+/// Validates and executes one `palyra.process.run` invocation under `policy`.
+///
+/// The pipeline is strictly ordered: input-shape validation, executable/interpreter allowlist
+/// checks, working-directory and argument path scoping, egress preflight, portable builtins,
+/// platform quota and runtime-egress fail-closed checks, then foreground or background spawn.
+/// `execution_timeout` is the operator-level ceiling that caps both foreground timeouts and
+/// background lifetimes; `cancellation_requested` is polled during foreground capture and
+/// terminates the whole process tree when set.
+///
+/// Returns redacted, serialized tool output on success (see [`SandboxProcessRunSuccess`]).
+///
+/// # Errors
+///
+/// Returns a [`SandboxProcessRunError`] whose [`kind`](SandboxProcessRunError::kind) identifies
+/// the failing stage: `Disabled`, `InvalidInput`, `WorkspaceScopeDenied`, `EgressDenied`,
+/// `UnsupportedPlatform`, `SpawnFailed`, `Cancelled`, `TimedOut`, `QuotaExceeded`, or
+/// `RuntimeFailure` (non-zero exit, capture failure, or serialization failure).
 pub fn run_constrained_process_with_cancellation(
     policy: &SandboxProcessRunnerPolicy,
     input_json: &[u8],
@@ -427,12 +555,16 @@ pub fn run_constrained_process_with_cancellation(
     } else {
         collect_requested_egress_hosts(&input)?
     };
+    // Strict tier C is offline-only: requested hosts are denied before the allowlist check so
+    // configured allowlists cannot re-open network access in that mode.
     if matches!(policy.egress_enforcement_mode, EgressEnforcementMode::Strict) {
         validate_tier_c_strict_offline_egress_requests(policy, requested_hosts.as_slice())?;
     }
     if !matches!(policy.egress_enforcement_mode, EgressEnforcementMode::None) {
         validate_egress_hosts(policy, requested_hosts.as_slice())?;
     }
+    // Portable builtins (pwd/echo/ls/cat/mkdir and process stop/status) run in-process after
+    // the same scope validation as real spawns, so they behave identically on every platform.
     if let Some(result) = execute_builtin_process_command(
         policy,
         &input,
@@ -441,6 +573,8 @@ pub fn run_constrained_process_with_cancellation(
     )? {
         return Ok(result);
     }
+    // Fail closed before spawn when the platform cannot enforce CPU/memory quotas. Host-access
+    // mode is exempt: it is explicitly unsandboxed and bounded by timeout and output caps only.
     if !host_access {
         validate_platform_resource_quota_support(policy)?;
     }
@@ -462,6 +596,8 @@ pub fn run_constrained_process_with_cancellation(
         );
     }
 
+    // Recognized dev servers requested as foreground runs are promoted to background so they
+    // are not killed at the foreground timeout while still serving requests.
     if let Some(auto_background_reason) = auto_background_reason_for_foreground_dev_server(&input) {
         let per_call_timeout = background_process_lifetime(input.timeout_ms, execution_timeout);
         let max_background_lifetime = background_process_lifetime_limit(execution_timeout);
@@ -607,6 +743,8 @@ fn process_failure_diagnostic_hint(
     None
 }
 
+// Failure previews flatten control characters and collapse whitespace before redaction so the
+// preview stays a single safe log line regardless of what the child printed.
 fn redacted_process_output_preview(output: &[u8]) -> Option<String> {
     if output.is_empty() {
         return None;
@@ -662,6 +800,8 @@ fn redacted_process_output_text(value: &str) -> RedactedProcessOutputText {
     RedactedProcessOutputText { text: redacted_text, redacted }
 }
 
+// Export redaction may normalize away the trailing newline run; consumers assert on exact
+// stdout shapes (e.g. a single trailing newline), so the original CR/LF suffix is restored.
 fn restore_process_output_trailing_line_endings(original: &str, redacted: String) -> String {
     let original_base_len = original.trim_end_matches(['\r', '\n']).len();
     if original_base_len == original.len() {
@@ -705,6 +845,9 @@ fn redact_sensitive_url_path_token(token: &str) -> String {
     for marker in SENSITIVE_URL_PATH_MARKERS {
         let pattern = format!("/{marker}/");
         let mut search_start = 0;
+        // Case-insensitive scan: the remaining slice is lowercased per iteration while the
+        // replacement edits `output` in original case; `search_start` always advances past the
+        // replacement so overlapping marker hits cannot loop forever.
         loop {
             let normalized = output[search_start..].to_ascii_lowercase();
             let Some(relative_pos) = normalized.find(pattern.as_str()) else {
@@ -731,6 +874,9 @@ fn redact_sensitive_url_path_token(token: &str) -> String {
     output
 }
 
+// Dispatches commands the runner implements in-process instead of spawning: process stop and
+// status plus a portable subset of shell basics (pwd/echo/ls/dir/cat/type/mkdir). Returns
+// Ok(None) for anything else so the caller falls through to a real spawn.
 fn execute_builtin_process_command(
     policy: &SandboxProcessRunnerPolicy,
     input: &ProcessRunnerInput,
@@ -821,7 +967,11 @@ fn builtin_stop_process_success(
     let stopped = !was_running
         || wait_for_process_not_alive(pid, Duration::from_millis(BACKGROUND_TERMINATION_WAIT_MS));
     let after_status = background_process_runtime_status(pid).ok();
+    // When the post-stop probe fails, report alive=true: claiming a process is gone without
+    // evidence would let callers skip cleanup.
     let alive = !stopped && after_status.map(BackgroundProcessRuntimeStatus::alive).unwrap_or(true);
+    // A termination error only fails the builtin if the process is in fact still running;
+    // e.g. a race where the tree exited between the kill attempt and the liveness probe.
     if let Some(error) = stop_error.as_ref().filter(|_| !stopped) {
         return Err(SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::RuntimeFailure,
@@ -900,6 +1050,13 @@ fn builtin_process_status_success(
     Ok(SandboxProcessRunSuccess { output_json })
 }
 
+/// Terminates the background process tree rooted at `pid` via the portable stop builtin and
+/// returns its serialized stop report.
+///
+/// # Errors
+///
+/// Returns `RuntimeFailure` when the pid cannot be inspected or the tree is still alive after
+/// the termination attempt.
 pub(crate) fn stop_background_process_by_pid(
     pid: u32,
 ) -> Result<SandboxProcessRunSuccess, SandboxProcessRunError> {
@@ -907,6 +1064,12 @@ pub(crate) fn stop_background_process_by_pid(
     builtin_stop_process_success("palyra.process.stop", &args)
 }
 
+/// Reports liveness of the background process tree rooted at `pid` via the portable status
+/// builtin.
+///
+/// # Errors
+///
+/// Returns `RuntimeFailure` when the pid cannot be inspected on this platform.
 pub(crate) fn background_process_status_by_pid(
     pid: u32,
 ) -> Result<SandboxProcessRunSuccess, SandboxProcessRunError> {
@@ -914,6 +1077,12 @@ pub(crate) fn background_process_status_by_pid(
     builtin_process_status_success("palyra.process.status", &args)
 }
 
+/// Probes direct-pid and process-tree liveness for a background process.
+///
+/// # Errors
+///
+/// Returns the underlying OS error when liveness cannot be determined (e.g. permission errors
+/// on Unix `kill(pid, 0)`, or a failed job-object query while the direct pid is already gone).
 pub(crate) fn background_process_runtime_status(
     pid: u32,
 ) -> io::Result<BackgroundProcessRuntimeStatus> {
@@ -934,6 +1103,8 @@ fn background_process_tree_status(
 ) -> io::Result<(bool, Option<u32>)> {
     match windows_background_job_active_process_count(pid) {
         Some(Ok(active_count)) => Ok((active_count > 0, Some(active_count))),
+        // A failed job query is only fatal when the direct pid is also gone; otherwise the
+        // direct pid still gives a truthful (if tree-blind) liveness answer.
         Some(Err(error)) if !direct_pid_alive => Err(error),
         Some(Err(_)) | None => Ok((direct_pid_alive, None)),
     }
@@ -1060,6 +1231,8 @@ fn builtin_read_files_stdout(
                 ),
             })?;
         let mut chunk = Vec::new();
+        // Read one byte beyond the remaining budget purely to detect truncation; the extra
+        // byte is dropped below and never reaches the output.
         file.by_ref().take((remaining + 1) as u64).read_to_end(&mut chunk).map_err(|error| {
             SandboxProcessRunError {
                 kind: SandboxProcessRunErrorKind::RuntimeFailure,
@@ -1376,6 +1549,9 @@ fn valid_process_env_key_shape(key: &str) -> bool {
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
+// Overriding any of these would defeat the sandbox without touching a single path check:
+// PATH/PATHEXT redirect executable resolution, the LD_*/DYLD_* loader variables inject code
+// into the child, and the PALYRA_* keys repoint runtime config, state, and vault locations.
 fn process_env_key_is_reserved(key: &str) -> bool {
     matches!(
         key.to_ascii_uppercase().as_str(),
@@ -1429,6 +1605,9 @@ fn command_has_path_separator(command: &str) -> bool {
     command.contains('/') || command.contains('\\')
 }
 
+// Catches the common model mistake of passing one whole command line as a single arg (e.g.
+// args=["node -e ..."]); such strings would otherwise reach the child as a literal argument
+// and fail confusingly, or worse, be re-tokenized by .cmd shims on Windows.
 fn validate_no_embedded_command_line_arg(
     input: &ProcessRunnerInput,
 ) -> Result<(), SandboxProcessRunError> {
@@ -1489,6 +1668,10 @@ fn validate_cmd_invocation_shape(
     })
 }
 
+// Allowlist matching accepts either the raw command or its normalized basename (extension
+// stripped, lowercased) so "node", "node.exe", and a full path to node all match one entry.
+// Full executable paths are reserved for host-access mode; sandboxed runs must use bare names
+// so the runner controls resolution.
 fn validate_allowed_executable(
     policy: &SandboxProcessRunnerPolicy,
     command: &str,
@@ -1551,6 +1734,9 @@ fn validate_allowed_interpreter(
     Ok(())
 }
 
+// Name-based process termination (pkill, taskkill /IM, Stop-Process -Name, and PowerShell
+// pipelines that emulate them) can kill unrelated host processes, so only PID-scoped cleanup
+// is allowed through.
 fn validate_process_termination_scope(
     command: &str,
     args: &[String],
@@ -1594,6 +1780,10 @@ fn broad_process_kill_error() -> SandboxProcessRunError {
     }
 }
 
+// Interpreters get a second scan beyond ordinary argument scoping because their arguments can
+// embed absolute paths inside source text (e.g. open('/etc/passwd') passed as inline code):
+// shell-eval flags are denied outright, and any absolute-path-like substring must itself
+// resolve inside the workspace.
 fn validate_interpreter_argument_guardrails(
     workspace_root: &Path,
     cwd: &Path,
@@ -1654,6 +1844,8 @@ fn validate_host_interpreter_argument_guardrails(
     )
 }
 
+// Mirror of validate_interpreter_argument_guardrails with host-root scoping instead of
+// workspace-only scoping; keep the two in lockstep when changing either.
 fn validate_host_interpreter_argument_guardrails_with_roots(
     workspace_root: &Path,
     cwd: &Path,
@@ -1889,6 +2081,8 @@ fn is_blocked_eval_flag(arg: &str) -> bool {
     matches!(normalized.as_str(), "-c" | "/c" | "--command" | "-command" | "--eval")
 }
 
+// Splits on whitespace and common code punctuation so absolute paths quoted inside inline
+// source (open('/etc/passwd'), require("/x"), arrays, blocks) still surface as tokens.
 fn contains_embedded_absolute_path(raw: &str) -> bool {
     raw.split(|ch: char| {
         ch.is_whitespace()
@@ -1928,6 +2122,8 @@ fn token_looks_like_absolute_path(raw: &str) -> bool {
         && matches!(bytes[2], b'\\' | b'/')
 }
 
+// Distinguishes string-escape leftovers (e.g. a "\n" fragment split out of inline source code)
+// from genuine Windows root-relative paths that also start with a backslash.
 fn token_is_escaped_string_fragment(token: &str) -> bool {
     let rest = token.trim_start_matches('\\');
     if rest.len() == token.len() {
@@ -2011,6 +2207,8 @@ fn resolve_working_directory(
     Ok(resolved)
 }
 
+// Validation-only wrapper: runs the same rewriter that builds the spawn argv and discards the
+// result, so validation and execution can never disagree about which arguments are paths.
 fn validate_argument_workspace_scope(
     workspace_root: &Path,
     cwd: &Path,
@@ -2145,6 +2343,11 @@ fn validate_host_argument_path_scope(
     Ok(())
 }
 
+// Walks the argv once, classifying each argument: known non-path values (test patterns, node
+// -e code, python module names, Windows switches, sleep durations) pass through untouched,
+// while everything path-like (bare paths, file URLs, --opt=path and -Xpath forms, virtual
+// workspace aliases) is resolved through resolve_scoped_path and replaced with the proven
+// in-scope absolute form. Any path that fails scoping aborts the whole run.
 fn rewrite_arguments_to_scoped_paths(
     workspace_root: &Path,
     cwd: &Path,
@@ -2458,6 +2661,8 @@ fn option_assignment_value(arg: &str) -> Option<&str> {
     Some(value)
 }
 
+// Extracts the value glued onto a short option (e.g. "-Cpath" -> "path"), but only when the
+// value actually looks like a path; otherwise flag clusters like "-la" would be misread.
 fn option_compact_value(arg: &str) -> Option<&str> {
     let trimmed = arg.trim();
     if !trimmed.starts_with('-') || trimmed.starts_with("--") {
@@ -2523,6 +2728,14 @@ fn parse_file_url_path(arg: &str) -> Result<Option<String>, SandboxProcessRunErr
     Ok(Some(file_path.to_string_lossy().to_string()))
 }
 
+// Resolves `raw` to a path proven to stay under `workspace_root`. Traversal components are
+// rejected before any filesystem access, and the scope check runs on the canonicalized form so
+// symlinks cannot smuggle the path outside the workspace. For non-existent targets the nearest
+// existing ancestor is canonicalized and checked instead (non-existent components cannot be
+// symlinks), which lets mkdir-style builtins validate paths they are about to create.
+// AIDEV-NOTE: like all canonicalize-then-use path validation this is a check-then-use pattern;
+// a concurrent rename/symlink swap between the check and the consumer's open is a known TOCTOU
+// window that can only be closed with handle-based I/O (a behavior change).
 fn resolve_scoped_path(
     workspace_root: &Path,
     base: &Path,
@@ -2585,6 +2798,8 @@ fn resolve_scoped_path(
         });
     }
 
+    // Existing targets return the canonical form; not-yet-existing targets return the joined
+    // candidate so callers can create them at the exact path that was scope-checked.
     if candidate.exists() {
         Ok(inspected)
     } else {
@@ -2592,6 +2807,8 @@ fn resolve_scoped_path(
     }
 }
 
+// Host-access counterpart of `resolve_scoped_path`: the scope check accepts the workspace plus
+// the approved user-owned `host_roots`, and additionally refuses protected OS paths outright.
 fn resolve_host_access_path_with_roots(
     workspace_root: &Path,
     base: &Path,
@@ -2621,6 +2838,7 @@ fn resolve_host_access_path_with_roots(
         });
     }
     let candidate = if raw_path.is_absolute() { PathBuf::from(raw) } else { base.join(raw) };
+    // Re-checked after the join as defense in depth against any join/normalization surprises.
     if candidate.components().any(|component| matches!(component, Component::ParentDir)) {
         return Err(SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
@@ -2691,6 +2909,8 @@ fn ensure_host_access_path_allowed(
     })
 }
 
+// Executables (unlike data paths) may additionally live under Program Files, so installed
+// tools remain launchable; the protected-OS-path denial still applies to data arguments.
 fn ensure_host_executable_path_allowed(
     workspace_root: &Path,
     inspected: &Path,
@@ -2734,6 +2954,9 @@ fn host_access_roots_for_input(input: &ProcessRunnerInput) -> Vec<PathBuf> {
     roots
 }
 
+// Host-access scope = operator-configured roots (PALYRA_OS_FILE_ROOTS) + the user profile +
+// temp directories. Roots that fail to canonicalize or are not directories are silently
+// dropped: a missing root must narrow the scope, never widen or break it.
 fn user_owned_host_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(configured_roots) = configured_user_host_roots() {
@@ -2778,6 +3001,9 @@ fn push_canonical_host_root(roots: &mut Vec<PathBuf>, root: PathBuf) {
     }
 }
 
+// Deny-list of OS locations host-access mode must never touch even though they may sit under
+// an approved root. The substring form (":/windows" etc.) intentionally matches every drive
+// letter, not just C:.
 fn protected_host_path(path: &Path) -> bool {
     #[cfg(windows)]
     {
@@ -2803,6 +3029,8 @@ fn protected_host_path(path: &Path) -> bool {
     }
 }
 
+// Windows paths are case-insensitive, so a pure `starts_with` would wrongly deny e.g.
+// `c:\users\...` against a root recorded as `C:\Users\...`; Unix stays strictly case-exact.
 fn path_starts_with_case_aware(path: &Path, root: &Path) -> bool {
     if path.starts_with(root) {
         return true;
@@ -2832,6 +3060,8 @@ fn same_path_case_aware(left: &Path, right: &Path) -> bool {
     }
 }
 
+// Maps the virtual aliases models commonly emit ("/", "/workspace", "workspace/...") onto the
+// real workspace root so sandboxed runs behave as if the workspace were the filesystem root.
 fn virtual_workspace_path_suffix(raw: &str) -> Option<PathBuf> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -2853,6 +3083,8 @@ fn virtual_workspace_path_suffix(raw: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+// Collapses "/workspace/<root-name>/..." to "/workspace/..." when the first suffix component
+// repeats the active workspace directory name; models frequently double up the alias.
 fn normalize_virtual_workspace_suffix(workspace_root: &Path, suffix: PathBuf) -> PathBuf {
     let mut components = suffix.components();
     let Some(Component::Normal(first)) = components.next() else {
@@ -2878,6 +3110,8 @@ fn path_component_equals(left: &std::ffi::OsStr, right: &std::ffi::OsStr) -> boo
     }
 }
 
+// Host-access variant of `virtual_workspace_path_suffix` that deliberately excludes the bare
+// "/" alias: on the host, "/" is a real filesystem root and must not be remapped.
 fn named_virtual_workspace_path_suffix(raw: &str) -> Option<PathBuf> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -2952,6 +3186,10 @@ fn nearest_existing_ancestor(path: &Path) -> Result<PathBuf, SandboxProcessRunEr
     })
 }
 
+// Best-effort preflight extraction of every host the invocation appears to target: explicit
+// requested_egress_hosts, URL arguments, --host=value style assignments, and values following
+// host-hint flags. This is a heuristic deny gate, not runtime isolation; strict mode layers
+// backend-enforced network isolation on top.
 fn collect_requested_egress_hosts(
     input: &ProcessRunnerInput,
 ) -> Result<Vec<String>, SandboxProcessRunError> {
@@ -3036,6 +3274,8 @@ fn resolve_host_executable_path_with_roots(
     Ok(executable)
 }
 
+// Outside a host-hint context a bare token only counts as a host when it carries a numeric
+// port (host:443); requiring the port keeps ordinary words and file names out of egress checks.
 fn maybe_extract_bare_host(token: &str, host_context: bool) -> Option<&str> {
     let sanitized = token.trim_end_matches([')', ',', ';']);
     if sanitized.is_empty()
@@ -3163,7 +3403,8 @@ fn validate_tier_c_strict_offline_egress_requests(
         return Ok(());
     }
 
-    let sample_hosts = requested_hosts.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+    let sample_hosts =
+        requested_hosts.iter().take(3).map(String::as_str).collect::<Vec<_>>().join(", ");
     let overflow_suffix = if requested_hosts.len() > 3 {
         format!(" (+{} more)", requested_hosts.len() - 3)
     } else {
@@ -3220,6 +3461,8 @@ fn is_host_allowlisted(policy: &SandboxProcessRunnerPolicy, host: &str) -> bool 
         if suffix.is_empty() {
             return false;
         }
+        // Match only on label boundaries: suffix "corp.local" must allow "api.corp.local" but
+        // never "evilcorp.local".
         let bare_suffix = suffix.trim_start_matches('.');
         let dotted_suffix = format!(".{bare_suffix}");
         host.eq_ignore_ascii_case(bare_suffix) || host.ends_with(dotted_suffix.as_str())
@@ -3254,6 +3497,8 @@ fn execute_process(
     )
 }
 
+// Makes the child its own process-group leader so kill(-pid) can later terminate the whole
+// tree (see terminate_unix_process_group) instead of just the direct child.
 #[cfg(unix)]
 fn configure_child_process_group(command: &mut Command) {
     use std::os::unix::process::CommandExt;
@@ -3280,6 +3525,9 @@ fn spawn_background_process(
         attach_resource_limits_unix(&mut command, policy);
     }
 
+    // Every startup wait below is bounded by this budget, which reserves a slice of the
+    // lifetime for returning process metadata before the tool-call timeout fires; otherwise a
+    // slow startup could eat the whole window and the caller would never learn the pid.
     let lifetime_ms = lifetime.as_millis() as u64;
     let startup_budget = background_process_startup_metadata_budget(lifetime)
         .ok_or_else(|| background_process_startup_budget_expired_error(input, lifetime_ms))?;
@@ -3288,6 +3536,8 @@ fn spawn_background_process(
         message: format!("sandbox process spawn failed for command '{}': {error}", input.command),
     })?;
     let pid = child.id();
+    // Job binding is best effort: a bind failure downgrades stop/status to direct-pid tracking
+    // (reported via windows_job_object=false) rather than failing the whole run.
     #[cfg(windows)]
     let windows_job_bound = bind_child_to_windows_background_job(&child, pid).is_ok();
     #[cfg(not(windows))]
@@ -3345,6 +3595,8 @@ fn spawn_background_process(
         Duration::from_millis(BACKGROUND_POST_OUTPUT_EXIT_CHECK_MS),
     )
     .unwrap_or(Duration::ZERO);
+    // Second exit probe after the output drain: catches commands that print something and then
+    // die (e.g. an unknown-subcommand banner), which the first probe is too early to see.
     if let Some(status) = wait_for_background_process_exit(&mut child, post_output_exit_check)? {
         terminate_background_child(child);
         return Err(background_process_startup_failure(input, status, &stdout, &stderr));
@@ -3355,6 +3607,8 @@ fn spawn_background_process(
         terminate_background_child(child);
         return Err(background_process_lifetime_expired_error(input, lifetime_ms));
     };
+    // The monitor thread owns the child from here; it reaps a natural exit or kills the tree
+    // when the remaining lifetime expires, so no background process can outlive its budget.
     thread::spawn(move || monitor_background_child_until_lifetime(child, remaining_lifetime));
 
     let RedactedProcessOutputText { text: stdout_text, redacted: stdout_redacted } =
@@ -3526,6 +3780,9 @@ fn start_background_output_monitor(
     Ok(BackgroundOutputMonitor { stdout: stdout_capture, stderr: stderr_capture })
 }
 
+// Background variant of spawn_capture_reader: publishes incrementally into a shared capture
+// so startup snapshots can be taken while the process keeps running, instead of returning the
+// buffer once at join time.
 fn spawn_background_capture_reader<R>(
     mut reader: R,
     remaining_budget: Arc<AtomicUsize>,
@@ -3567,6 +3824,7 @@ fn spawn_background_capture_reader<R>(
 
 fn terminate_background_child(mut child: Child) {
     terminate_child_process_tree(&mut child);
+    // Reap the direct child so a failed background startup never leaves a zombie behind.
     let _ = child.wait();
 }
 
@@ -3625,6 +3883,8 @@ fn create_windows_background_job() -> io::Result<WindowsBackgroundJob> {
 
     let job = WindowsBackgroundJob { handle, terminated: AtomicBool::new(false) };
     let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    // Kill-on-close means the OS tears the whole tree down if the daemon exits or the last job
+    // handle is dropped, so orphaned background trees cannot survive a daemon crash.
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
     // SAFETY: `limits` points to a properly initialized JOBOBJECT_EXTENDED_LIMIT_INFORMATION
     // value for the requested JobObjectExtendedLimitInformation class.
@@ -3645,6 +3905,8 @@ fn create_windows_background_job() -> io::Result<WindowsBackgroundJob> {
     Ok(job)
 }
 
+// Win32 failure sentinels are inconsistent (CreateJobObjectW returns NULL, file APIs return
+// INVALID_HANDLE_VALUE), so both are rejected.
 #[cfg(windows)]
 fn windows_handle_is_valid(handle: HANDLE) -> bool {
     !handle.is_null() && handle != INVALID_HANDLE_VALUE
@@ -3689,6 +3951,16 @@ fn windows_background_job_active_process_count(pid: u32) -> Option<io::Result<u3
     Some(job.active_process_count())
 }
 
+/// Terminates the process tree rooted at `pid` (Windows).
+///
+/// Both mechanisms always run: the registered job object catches descendants that detached
+/// from the visible process tree, while `taskkill /T` catches processes spawned before job
+/// binding or when binding failed. Success of either one counts as success.
+///
+/// # Errors
+///
+/// Returns an error only when every available termination mechanism failed; the message
+/// aggregates the per-mechanism failures.
 #[cfg(windows)]
 pub(crate) fn terminate_background_process_tree(pid: u32) -> io::Result<()> {
     let mut succeeded = false;
@@ -3719,6 +3991,8 @@ pub(crate) fn terminate_background_process_tree(pid: u32) -> io::Result<()> {
 #[cfg(windows)]
 fn terminate_windows_process_tree(pid: u32) -> io::Result<()> {
     let pid_arg = pid.to_string();
+    // taskkill is resolved from the Win32 system directory with a cleared environment so a
+    // poisoned PATH (or PATH-resolved shim) can never substitute the termination tool.
     let system32_dir = trusted_windows_system32_dir()?;
     let taskkill_path = system32_dir.join("taskkill.exe");
     let mut command = Command::new(taskkill_path);
@@ -3746,6 +4020,8 @@ fn trusted_windows_system32_dir() -> io::Result<PathBuf> {
 
     const MAX_SYSTEM_DIRECTORY_CHARS: usize = 32_768;
 
+    // Grow-and-retry: GetSystemDirectoryW reports the required length when the buffer is too
+    // small; the hard cap keeps a misbehaving API from forcing unbounded allocation.
     let mut buffer = vec![0_u16; 260];
     loop {
         // SAFETY: `buffer` is a valid writable UTF-16 buffer for the provided length. The Win32
@@ -3778,12 +4054,28 @@ fn trusted_windows_system32_dir() -> io::Result<PathBuf> {
     }
 }
 
+/// Terminates the process tree rooted at `pid` (Unix).
+///
+/// Children are spawned with `process_group(0)`, so killing the process group with `SIGKILL`
+/// reaches the whole tree; a direct-pid kill is the fallback when the group kill fails (e.g.
+/// the leader already changed groups).
+///
+/// AIDEV-NOTE: pid/pgid reuse is a known hazard here. If the tracked process exited and the
+/// kernel reassigned the id before this runs, the SIGKILL hits an unrelated process group.
+/// Closing this requires holding a pidfd (or equivalent process handle) instead of a raw pid,
+/// which is a behavior change.
+///
+/// # Errors
+///
+/// Returns the OS error when both the group kill and the direct-pid kill fail.
 #[cfg(unix)]
 pub(crate) fn terminate_background_process_tree(pid: u32) -> io::Result<()> {
     match terminate_unix_process_group(pid) {
         Ok(()) => Ok(()),
         Err(group_error) => {
             let process_id = pid as libc::pid_t;
+            // SAFETY: kill(2) with SIGKILL is safe to call with any pid value; the worst case
+            // is an error return, which is handled below.
             let result = unsafe { libc::kill(process_id, libc::SIGKILL) };
             if result == 0 {
                 return Ok(());
@@ -3796,6 +4088,12 @@ pub(crate) fn terminate_background_process_tree(pid: u32) -> io::Result<()> {
     }
 }
 
+/// Fallback for platforms without a supported termination mechanism: always fails so callers
+/// surface the gap instead of silently believing a process was stopped.
+///
+/// # Errors
+///
+/// Always returns [`io::ErrorKind::Unsupported`].
 #[cfg(not(any(unix, windows)))]
 pub(crate) fn terminate_background_process_tree(pid: u32) -> io::Result<()> {
     let _ = pid;
@@ -3808,6 +4106,9 @@ pub(crate) fn terminate_background_process_tree(pid: u32) -> io::Result<()> {
 #[cfg(unix)]
 fn terminate_unix_process_group(pid: u32) -> io::Result<()> {
     let process_group_id = pid as libc::pid_t;
+    // A negative pid addresses the whole process group; the child was made its own group
+    // leader at spawn, so its pid doubles as the pgid.
+    // SAFETY: kill(2) is safe to call with any pid value; errors are handled below.
     let result = unsafe { libc::kill(-process_group_id, libc::SIGKILL) };
     if result == 0 {
         return Ok(());
@@ -3823,11 +4124,15 @@ fn process_id_is_alive(pid: u32) -> io::Result<bool> {
 #[cfg(unix)]
 fn process_id_is_alive(pid: u32) -> io::Result<bool> {
     let process_id = pid as libc::pid_t;
+    // Signal 0 performs the permission and existence checks without delivering anything.
+    // SAFETY: kill(2) with signal 0 never affects the target; errors are handled below.
     let result = unsafe { libc::kill(process_id, 0) };
     if result == 0 {
         return Ok(true);
     }
     let error = io::Error::last_os_error();
+    // ESRCH means "no such process" (dead); other errors (e.g. EPERM) mean the pid exists but
+    // is not ours, so they propagate instead of being misread as "stopped".
     if error.raw_os_error() == Some(libc::ESRCH) {
         return Ok(false);
     }
@@ -3858,6 +4163,8 @@ fn terminate_child_process_tree(child: &mut Child) {
             return;
         }
     }
+    // Last resort: kills only the direct child, so grandchildren may survive. Acceptable only
+    // because the tree-wide paths above are tried first on every supported platform.
     let _ = child.kill();
 }
 
@@ -3911,6 +4218,10 @@ fn background_cleanup_note() -> &'static str {
     }
 }
 
+// Requested lifetimes below the floor are raised (short timeouts copied from foreground habits
+// would kill dev servers mid-verification); everything is then capped by the operator execution
+// timeout and the runtime hard maximum. The adjustment is reported back to the caller via
+// background_lifetime_adjustment_reason.
 fn background_process_lifetime(timeout_ms: Option<u64>, execution_timeout: Duration) -> Duration {
     let lifetime_limit = background_process_lifetime_limit(execution_timeout);
     let default_lifetime = Duration::from_millis(DEFAULT_BACKGROUND_PROCESS_LIFETIME_MS);
@@ -3929,6 +4240,10 @@ fn foreground_process_timeout(timeout_ms: Option<u64>, execution_timeout: Durati
     timeout_ms.map(Duration::from_millis).unwrap_or(default_timeout).min(execution_timeout)
 }
 
+// Decides whether a foreground request is really a long-running server. Strong signals (npm run
+// dev, vite, python -m http.server) always promote; ambiguous ones (npm start, node server.js)
+// promote only when the caller also asked for a background-scale timeout, so tests and builds
+// stay foreground. Reason strings are part of the tool output contract.
 fn auto_background_reason_for_foreground_dev_server(
     input: &ProcessRunnerInput,
 ) -> Option<&'static str> {
@@ -4141,6 +4456,9 @@ fn background_process_startup_budget_expired_error(
     }
 }
 
+// Fail-closed platform gate: sandboxed (non-host-access) execution requires enforceable
+// CPU/memory quotas, and macOS lacks a reliable total-memory rlimit (RLIMIT_AS is advisory
+// there), so the runner refuses rather than running with silently weaker limits.
 fn validate_platform_resource_quota_support(
     _policy: &SandboxProcessRunnerPolicy,
 ) -> Result<(), SandboxProcessRunError> {
@@ -4197,7 +4515,7 @@ fn build_process_command(
             allowed_dns_suffixes: policy.allowed_dns_suffixes.clone(),
         };
         let tier_c_request =
-            TierCCommandRequest { command: input.command.clone(), args: scoped_args.clone() };
+            TierCCommandRequest { command: input.command.clone(), args: scoped_args };
         let plan = build_tier_c_command_plan(&tier_c_policy, &tier_c_request)
             .map_err(map_tier_c_backend_error)?;
         let mut command = Command::new(plan.program);
@@ -4226,6 +4544,8 @@ fn build_process_command(
     Ok(command)
 }
 
+// Applied last so explicit, already-validated overrides win over computed defaults; the
+// reserved-key check in validate_process_env_key keeps PATH/loader/config keys out of here.
 fn apply_process_env_overrides(command: &mut Command, input: &ProcessRunnerInput) {
     for (key, value) in &input.env {
         command.env(key, value);
@@ -4249,6 +4569,8 @@ fn build_tier_b_process_command(
     }
 }
 
+// Tier-B children start from an empty environment plus a deterministic minimum (fixed PATH,
+// LANG/LC_ALL=C); nothing from the daemon environment leaks through implicitly.
 fn configure_tier_b_process_environment(
     command: &mut Command,
     process_command: &str,
@@ -4285,6 +4607,10 @@ fn configure_host_access_process_environment(
     if !is_palyra_cli_program(program) {
         return;
     }
+    // The daemon may run with PALYRA_CLI_PROFILE set but without the profiles-path companion
+    // (e.g. desktop supervisor launch). A child `palyra` CLI would then fail to resolve the
+    // profile, so either re-derive the desktop profiles path from the state root or drop the
+    // dangling profile selector entirely.
     if !should_repair_palyra_cli_profile_env(
         std::env::var_os(PALYRA_CLI_PROFILE_ENV).as_deref(),
         std::env::var_os(PALYRA_CLI_PROFILES_PATH_ENV).as_deref(),
@@ -4302,6 +4628,8 @@ fn configure_host_access_process_environment(
     }
 }
 
+// Host-access children also start from env_clear, then copy only the allowlisted keys; this is
+// what keeps daemon admin tokens and provider keys out of unsandboxed processes (test-pinned).
 fn configure_host_access_safe_environment(command: &mut Command, workspace_root: &Path) {
     command.env_clear();
     for key in HOST_ACCESS_SAFE_ENV_KEYS {
@@ -4317,6 +4645,8 @@ fn configure_host_access_safe_environment(command: &mut Command, workspace_root:
     configure_node_runtime_environment(command);
 }
 
+// Node would otherwise persist an on-disk compile cache under the (scrubbed or redirected)
+// user profile, causing writes outside the workspace and nondeterministic startup behavior.
 fn configure_node_runtime_environment(command: &mut Command) {
     command.env(NODE_DISABLE_COMPILE_CACHE_ENV, "1");
 }
@@ -4380,6 +4710,8 @@ fn host_access_path() -> String {
         .unwrap_or_else(|| sandbox_process_path().to_owned())
 }
 
+// Pins pip user installs and caches inside the workspace so Python tooling cannot write into
+// the daemon user's real profile and runs stay reproducible per workspace.
 fn configure_workspace_python_environment(
     command: &mut Command,
     process_command: &str,
@@ -4471,6 +4803,8 @@ fn resolve_tier_b_process_program(command: &str, cwd: &Path) -> PathBuf {
     }
 }
 
+// Resolves a bare command on Windows: workspace-cwd candidates first so project-local shims
+// (e.g. node_modules/.bin) win over globally installed tools, then PATH candidates.
 #[cfg(windows)]
 fn resolve_windows_process_program(command: &str, cwd: &Path) -> Option<PathBuf> {
     let command_path = Path::new(command);
@@ -4503,6 +4837,8 @@ fn windows_path_program_candidates(command: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+// Expands a bare command name into the PATHEXT candidate list (npm -> npm.COM, npm.EXE, ...)
+// because std::process does not emulate cmd.exe extension resolution.
 #[cfg(windows)]
 fn windows_command_candidates(command: &str) -> Vec<String> {
     let has_extension = Path::new(command).extension().is_some();
@@ -4542,6 +4878,10 @@ fn build_windows_tier_b_process_command(
     cwd: &Path,
 ) -> Result<Command, SandboxProcessRunError> {
     let current_dir = windows_process_current_dir(cwd);
+    // .cmd/.bat scripts cannot be spawned directly by CreateProcess, so they are dispatched
+    // through cmd.exe with a fully controlled command line: /D skips AutoRun registry commands,
+    // /S plus the outer quotes pins cmd's quote parsing, and every argument is validated and
+    // quoted by windows_cmd_wrapper_command_line to prevent metacharacter injection.
     if windows_program_requires_cmd_wrapper(program) {
         let mut command = Command::new(windows_command_processor());
         command.raw_arg(format!("/D /S /C {}", windows_cmd_wrapper_command_line(program, args)?));
@@ -4595,6 +4935,8 @@ fn windows_cmd_compatible_path_string(path: &Path) -> String {
     windows_deverbatim_path_string(path).unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
+// Strips \\?\ and \\.\ verbatim prefixes (and rewrites \\?\UNC\) because cmd.exe and many
+// child tools reject verbatim paths that std::fs::canonicalize produces on Windows.
 #[cfg(windows)]
 fn windows_deverbatim_path_string(path: &Path) -> Option<String> {
     let normalized = path.to_string_lossy().replace('\\', "/");
@@ -4609,6 +4951,9 @@ fn windows_deverbatim_path_string(path: &Path) -> Option<String> {
     Some(deverbatim.replace('/', "\\"))
 }
 
+// Quoting alone cannot make cmd.exe safe: `%var%` expands and `!var!` may expand (delayed
+// expansion) even inside double quotes, and an embedded quote would re-open parsing. Those
+// characters are therefore rejected outright; the remaining text is quoted with `^` escaped.
 #[cfg(windows)]
 fn windows_cmd_wrapper_quote_arg(raw: &str) -> Result<String, SandboxProcessRunError> {
     if raw.chars().any(|ch| matches!(ch, '\0' | '\r' | '\n' | '"' | '%' | '!')) {
@@ -4664,6 +5009,9 @@ const WINDOWS_TIER_B_SAFE_ENV_KEYS: &[&str] = &[
     "WINDIR",
 ];
 
+// Builds the minimal child PATH for tier B: the fixed system directories plus only the parent
+// directories of the resolved program and of allowlisted executables, so the child can find
+// its own toolchain shims without inheriting the daemon's full PATH.
 #[cfg(windows)]
 fn windows_tier_b_process_path(program: &Path, policy: &SandboxProcessRunnerPolicy) -> String {
     let mut directories = std::env::split_paths(sandbox_process_path()).collect::<Vec<_>>();
@@ -4730,6 +5078,9 @@ fn attach_resource_limits_unix(command: &mut Command, policy: &SandboxProcessRun
 
     let cpu_time_limit_ms = policy.cpu_time_limit_ms;
     let memory_limit_bytes = policy.memory_limit_bytes;
+    // SAFETY: the pre_exec closure runs in the forked child before exec. Its success path only
+    // calls async-signal-safe syscalls (getrusage, setrlimit) on plain copied values; the error
+    // path allocates for the message, which is acceptable because the child aborts exec anyway.
     unsafe {
         command.pre_exec(move || {
             set_cpu_rlimit(cpu_time_limit_ms).map_err(|error| {
@@ -4748,7 +5099,9 @@ fn attach_resource_limits_unix(_command: &mut Command, _policy: &SandboxProcessR
 
 #[cfg(unix)]
 fn set_rlimit(resource: libc::c_int, limit: libc::rlim_t) -> std::io::Result<()> {
+    // Hard limit == soft limit so the child cannot raise its own quota back up.
     let rlimit = libc::rlimit { rlim_cur: limit, rlim_max: limit };
+    // SAFETY: `rlimit` is a valid initialized struct that outlives the call.
     let result = unsafe { libc::setrlimit(resource as _, &rlimit) };
     if result == 0 {
         Ok(())
@@ -4788,14 +5141,20 @@ fn current_process_cpu_rlimit_seconds(cpu_time_limit_ms: u64) -> std::io::Result
 #[cfg(unix)]
 fn current_process_cpu_time_micros() -> std::io::Result<u128> {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: `usage` is a writable rusage-sized buffer; getrusage fully initializes it on the
+    // success path checked below.
     let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
     if result != 0 {
         return Err(std::io::Error::last_os_error());
     }
+    // SAFETY: getrusage returned 0, so the buffer is initialized.
     let usage = unsafe { usage.assume_init() };
     Ok(timeval_micros(usage.ru_utime).saturating_add(timeval_micros(usage.ru_stime)))
 }
 
+// RLIMIT_CPU counts the process's total CPU time, so any CPU already attributed to the forked
+// child image when the limit is applied must be added on top of the requested budget; setting
+// the raw budget would silently shrink the child's effective quota.
 fn cpu_rlimit_seconds_from_usage_micros(cpu_time_limit_ms: u64, cpu_time_used_micros: u128) -> u64 {
     let requested_seconds = cpu_ms_to_rlimit_seconds(cpu_time_limit_ms) as u128;
     let used_seconds = cpu_time_used_micros.div_ceil(1_000_000);
@@ -4835,6 +5194,11 @@ fn capture_child_output(
     let stderr_reader =
         spawn_capture_reader(stderr, Arc::clone(&remaining_budget), Arc::clone(&quota_triggered));
 
+    // Poll loop semantics: cancellation, output quota, and timeout each request a single
+    // tree-wide kill (guarded by `termination_requested`), but the loop keeps running until the
+    // child actually exits so the reader threads can drain the pipes and report truthful
+    // truncation state. All three flags are sticky and reported with that priority by the
+    // caller (cancelled > timed_out > quota_exceeded).
     let started_at = Instant::now();
     let mut timed_out = false;
     let mut quota_exceeded = false;
@@ -4886,6 +5250,8 @@ fn capture_child_output(
         kind: SandboxProcessRunErrorKind::RuntimeFailure,
         message: "sandbox stderr reader thread panicked".to_owned(),
     })?;
+    // Re-check after joining the readers: a stream may have hit the budget between the last
+    // loop iteration and process exit.
     quota_exceeded = quota_exceeded
         || quota_triggered.load(Ordering::Relaxed)
         || stdout.truncated
@@ -4902,6 +5268,8 @@ fn capture_child_output(
     })
 }
 
+// Reader threads stop consuming once the shared budget is exhausted; combined with the kill in
+// the capture loop this bounds both memory use and how long a chatty child can keep running.
 fn spawn_capture_reader<R>(
     mut reader: R,
     remaining_budget: Arc<AtomicUsize>,
@@ -4937,6 +5305,9 @@ where
     })
 }
 
+// CAS loop over the budget shared by the stdout and stderr readers, so `max_output_bytes` caps
+// the combined capture: each reader keeps at most the bytes it could atomically reserve.
+// Relaxed ordering suffices because the counter is the only shared state being coordinated.
 fn reserve_output_budget(remaining_budget: &AtomicUsize, requested_bytes: usize) -> usize {
     let mut available = remaining_budget.load(Ordering::Relaxed);
     loop {
