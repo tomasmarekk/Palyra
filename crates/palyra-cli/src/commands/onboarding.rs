@@ -744,17 +744,7 @@ fn emit_onboarding_status(
         return Ok(());
     }
 
-    // AIDEV-NOTE: flow= and variant= both print flow_variant; payload.flow (the
-    // control-plane flow enum) is only visible in JSON output. Correcting flow= to the
-    // flow label would change pinned CLI output, so it must ship with a parity update.
-    println!(
-        "onboarding.status flow={} variant={} status={} config_path={} ready_for_first_success={}",
-        payload.flow_variant,
-        payload.flow_variant,
-        onboarding_posture_state_label(payload.status),
-        payload.config_path,
-        payload.ready_for_first_success
-    );
+    println!("{}", onboarding_status_summary_line(payload));
     println!(
         "onboarding.counts todo={} in_progress={} blocked={} done={} skipped={}",
         payload.counts.todo,
@@ -994,6 +984,17 @@ fn default_agent_status_from_agent_ids<'a>(
             format!("{source} default `{default_agent_id}` does not match any configured agent"),
         )
     }
+}
+
+fn onboarding_status_summary_line(payload: &control_plane::OnboardingPostureEnvelope) -> String {
+    format!(
+        "onboarding.status flow={} variant={} status={} config_path={} ready_for_first_success={}",
+        onboarding_flow_label(payload.flow),
+        payload.flow_variant,
+        onboarding_posture_state_label(payload.status),
+        payload.config_path,
+        payload.ready_for_first_success
+    )
 }
 
 fn memory_embeddings_model_configured_from_document(document: &toml::Value) -> Result<bool> {
@@ -1238,10 +1239,6 @@ fn diagnostic_endpoint_url(raw_url: &str) -> String {
 ///
 /// # Errors
 /// Returns an error for invalid URLs, DNS failures, or when no address connects.
-// AIDEV-NOTE: the final two error messages hardcode "gateway gRPC endpoint" even though
-// callers pass other endpoint_label values (e.g. the browser service probe). Fixing
-// them to use {endpoint_label} changes user-visible error text, so it needs a
-// coordinated parity/snapshot update.
 fn tcp_url_reachable(raw_url: &str, timeout: Duration, endpoint_label: &str) -> Result<()> {
     let url = reqwest::Url::parse(raw_url)
         .with_context(|| format!("{endpoint_label} URL is invalid: {raw_url}"))?;
@@ -1264,9 +1261,9 @@ fn tcp_url_reachable(raw_url: &str, timeout: Duration, endpoint_label: &str) -> 
     }
     if let Some(error) = last_error {
         return Err(error)
-            .with_context(|| format!("failed to connect gateway gRPC endpoint {host}:{port}"));
+            .with_context(|| format!("failed to connect {endpoint_label} {host}:{port}"));
     }
-    anyhow::bail!("gateway gRPC endpoint {host}:{port} resolved no socket addresses")
+    anyhow::bail!("{endpoint_label} {host}:{port} resolved no socket addresses")
 }
 
 fn done_step(
@@ -1446,6 +1443,13 @@ fn onboarding_posture_state_label(state: control_plane::OnboardingPostureState) 
     }
 }
 
+fn onboarding_flow_label(flow: control_plane::OnboardingFlow) -> &'static str {
+    match flow {
+        control_plane::OnboardingFlow::QuickStart => "quick_start",
+        control_plane::OnboardingFlow::AdvancedSetup => "advanced_setup",
+    }
+}
+
 fn onboarding_step_status_label(status: control_plane::OnboardingStepStatus) -> &'static str {
     match status {
         control_plane::OnboardingStepStatus::Todo => "todo",
@@ -1473,7 +1477,7 @@ fn cli_contract_descriptor() -> control_plane::ContractDescriptor {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, time::Duration};
 
     use anyhow::Result;
     use palyra_control_plane as control_plane;
@@ -1481,11 +1485,11 @@ mod tests {
 
     use super::{
         browser_runtime_status, build_onboarding_counts, build_onboarding_steps,
-        collect_onboarding_signals, default_agent_create_command,
+        cli_contract_descriptor, collect_onboarding_signals, default_agent_create_command,
         default_agent_status_from_agent_ids, derive_posture_status, diagnostic_endpoint_url,
-        load_onboarding_document, onboarding_prerequisites_ready, quote_cli_arg,
-        recommended_onboarding_step_id, record_cli_first_success, OnboardingSignals,
-        OnboardingVariant,
+        load_onboarding_document, onboarding_prerequisites_ready, onboarding_status_summary_line,
+        quote_cli_arg, recommended_onboarding_step_id, record_cli_first_success, tcp_url_reachable,
+        OnboardingSignals, OnboardingVariant,
     };
     use crate::{app, args::RootOptions};
 
@@ -1543,6 +1547,44 @@ kind = "anthropic"
         assert!(redacted.contains("mode=ok"));
         assert!(!redacted.contains("user:supersecret"));
         assert!(!redacted.contains("LEAKED_TOKEN"));
+    }
+
+    #[test]
+    fn onboarding_status_summary_line_distinguishes_flow_and_variant() {
+        let payload = control_plane::OnboardingPostureEnvelope {
+            contract: cli_contract_descriptor(),
+            flow: control_plane::OnboardingFlow::AdvancedSetup,
+            flow_variant: "remote".to_owned(),
+            status: control_plane::OnboardingPostureState::Ready,
+            config_path: "C:/portable/palyra.toml".to_owned(),
+            resume_supported: true,
+            ready_for_first_success: true,
+            recommended_step_id: None,
+            first_success_hint: None,
+            counts: control_plane::OnboardingStepCounts::default(),
+            available_flows: Vec::new(),
+            steps: Vec::new(),
+        };
+
+        let line = onboarding_status_summary_line(&payload);
+
+        assert!(line.contains("flow=advanced_setup"), "{line}");
+        assert!(line.contains("variant=remote"), "{line}");
+        assert!(!line.contains("flow=remote"), "{line}");
+    }
+
+    #[test]
+    fn tcp_url_reachable_errors_use_endpoint_label() {
+        let error = tcp_url_reachable(
+            "http://127.0.0.1:0",
+            Duration::from_millis(10),
+            "browserd gRPC endpoint",
+        )
+        .expect_err("port 0 should not accept a TCP connection");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("failed to connect browserd gRPC endpoint"), "{message}");
+        assert!(!message.contains("failed to connect gateway gRPC endpoint"), "{message}");
     }
 
     #[test]
