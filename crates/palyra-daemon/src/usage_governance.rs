@@ -839,6 +839,13 @@ pub(crate) fn evaluate_budget_policies(
 /// Applies budget evaluations and lease posture on top of the model selection,
 /// producing the final decision with `blocked`/`approval_required`/`deferred` flags.
 pub(crate) fn decide_routing(context: RoutingDecisionContext<'_>) -> RoutingDecision {
+    decide_routing_at(context, crate::gateway::current_unix_ms())
+}
+
+fn decide_routing_at(
+    context: RoutingDecisionContext<'_>,
+    observed_at_unix_ms: i64,
+) -> RoutingDecision {
     let selection = select_routing_models(&context);
     let mut explanation = selection.explanation.clone();
     let mut reason_codes = selection.reason_codes.clone();
@@ -881,17 +888,12 @@ pub(crate) fn decide_routing(context: RoutingDecisionContext<'_>) -> RoutingDeci
     reason_codes.sort();
     reason_codes.dedup();
 
-    // AIDEV-NOTE: observed_at is hard-coded to 0 here, so this estimate only matches
-    // pricing records effective from the epoch (effective_from_unix_ms <= 0). Records
-    // with a later effective_from yield "unavailable" in the published decision even
-    // though plan_usage_routing's budget projection prices the same run with
-    // current_unix_ms. Fixing it changes decision payloads (behavior change).
     let estimate = estimate_cost_for_model(
         context.pricing,
         selection.provider_kind.as_str(),
         selection.provider_id.as_str(),
         selection.actual_model_id.as_str(),
-        0,
+        observed_at_unix_ms,
         context.prompt_tokens_estimate,
         context.prompt_tokens_estimate / 2,
     );
@@ -1639,26 +1641,22 @@ pub(crate) fn build_alert_candidates(
     provider_health_state: &str,
 ) -> Vec<UsageAlertCandidate> {
     let total_cost = runs.iter().filter_map(|entry| entry.cost_estimate.upper_usd).sum::<f64>();
-    // AIDEV-NOTE: runs arrive newest-first (journal orders started_at DESC, and the
-    // console handler preserves that order), so skip(len/2) is actually the OLDER
-    // half and take(len/2) the NEWER half. The spike condition and the older/newer
-    // labels in the alert payload are therefore inverted: this fires when cost
-    // dropped, not when it spiked. Fixing it changes alert behavior/payloads.
-    let first_half_cost = runs
+    let half_window = runs.len() / 2;
+    let newer_half_cost = runs
         .iter()
-        .skip(runs.len() / 2)
+        .take(half_window)
         .filter_map(|entry| entry.cost_estimate.upper_usd)
         .sum::<f64>();
-    let second_half_cost = runs
+    let older_half_cost = runs
         .iter()
-        .take(runs.len() / 2)
+        .skip(half_window)
         .filter_map(|entry| entry.cost_estimate.upper_usd)
         .sum::<f64>();
 
     let mut alerts = Vec::new();
-    if first_half_cost > ALERT_MIN_COST_SPIKE_USD
-        && second_half_cost > 0.0
-        && first_half_cost > second_half_cost * 2.0
+    if newer_half_cost > ALERT_MIN_COST_SPIKE_USD
+        && older_half_cost > 0.0
+        && newer_half_cost > older_half_cost * 2.0
     {
         alerts.push(UsageAlertCandidate {
             alert_kind: "cost_spike".to_owned(),
@@ -1668,13 +1666,13 @@ pub(crate) fn build_alert_candidates(
             summary: "Recent usage cost spiked sharply.".to_owned(),
             reason: format!(
                 "The newer half of the selected interval is {:.2}x more expensive than the older half.",
-                first_half_cost / second_half_cost
+                newer_half_cost / older_half_cost
             ),
             recommended_action: "Inspect routing decisions and the model mix before the spike continues.".to_owned(),
             dedupe_key: "cost_spike:environment:default".to_owned(),
             payload: json!({
-                "older_half_cost_usd": second_half_cost,
-                "newer_half_cost_usd": first_half_cost,
+                "older_half_cost_usd": older_half_cost,
+                "newer_half_cost_usd": newer_half_cost,
                 "total_cost_usd": total_cost,
             }),
         });
@@ -1898,15 +1896,15 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        estimate_cost_for_model, is_active_budget_override_allow,
-        is_pending_budget_override_for_context, latest_routing_decisions_by_run_id,
-        select_routing_models, BudgetOverrideApprovalContext, RoutingDecisionContext, RoutingMode,
-        RoutingTaskClass,
+        build_alert_candidates, decide_routing_at, estimate_cost_for_model,
+        is_active_budget_override_allow, is_pending_budget_override_for_context,
+        latest_routing_decisions_by_run_id, select_routing_models, BudgetOverrideApprovalContext,
+        PricingEstimate, RoutingDecisionContext, RoutingMode, RoutingTaskClass, UsageEnrichedRun,
     };
     use crate::journal::{
         ApprovalDecision, ApprovalDecisionScope, ApprovalPolicySnapshot, ApprovalPromptRecord,
-        ApprovalRecord, ApprovalRiskLevel, ApprovalSubjectType, UsagePricingRecord,
-        UsageRoutingDecisionRecord,
+        ApprovalRecord, ApprovalRiskLevel, ApprovalSubjectType, OrchestratorUsageInsightsRunRecord,
+        UsagePricingRecord, UsageRoutingDecisionRecord,
     };
     use crate::model_provider::{
         ProviderCapabilitiesSnapshot, ProviderCircuitBreakerSnapshot, ProviderDiscoverySnapshot,
@@ -2127,6 +2125,50 @@ mod tests {
         }
     }
 
+    fn usage_run(run_id: &str, started_at_unix_ms: i64) -> OrchestratorUsageInsightsRunRecord {
+        OrchestratorUsageInsightsRunRecord {
+            run_id: run_id.to_owned(),
+            session_id: "session-1".to_owned(),
+            session_key: "session-key".to_owned(),
+            session_label: None,
+            principal: "user:test".to_owned(),
+            device_id: "device-1".to_owned(),
+            channel: Some("console".to_owned()),
+            state: "completed".to_owned(),
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+            started_at_unix_ms,
+            completed_at_unix_ms: Some(started_at_unix_ms.saturating_add(1)),
+            updated_at_unix_ms: started_at_unix_ms.saturating_add(1),
+            origin_kind: "foreground".to_owned(),
+            branch_state: "active_branch".to_owned(),
+            parent_session_id: None,
+            routine_id: None,
+            background_task_id: None,
+            last_error: None,
+        }
+    }
+
+    fn enriched_usage_run<'a>(
+        run: &'a OrchestratorUsageInsightsRunRecord,
+        upper_usd: f64,
+    ) -> UsageEnrichedRun<'a> {
+        UsageEnrichedRun {
+            run,
+            routing: None,
+            inferred_model_id: "cheap",
+            inferred_provider_kind: "openai_compatible",
+            cost_estimate: PricingEstimate {
+                lower_usd: Some(upper_usd),
+                upper_usd: Some(upper_usd),
+                estimate_only: true,
+                source: "test".to_owned(),
+                precision: "exact".to_owned(),
+            },
+        }
+    }
+
     fn ready_lease_previews() -> HashMap<String, ProviderLeasePreviewSnapshot> {
         HashMap::new()
     }
@@ -2265,6 +2307,44 @@ mod tests {
         assert_eq!(selection.actual_model_id, "premium");
         assert!(selection.reason_codes.iter().any(|code| code == "session_model_override"));
         assert_eq!(projected_cost.upper_usd, Some(0.004));
+    }
+
+    #[test]
+    fn decide_routing_prices_decision_at_observed_time() {
+        let mut pricing = pricing_record("cheap", 1.0, 2.0);
+        pricing.effective_from_unix_ms = 1_000;
+        let pricing = vec![pricing];
+        let lease_previews = ready_lease_previews();
+        let snapshot = provider_snapshot(
+            "cheap",
+            vec![registry_provider("openai", "openai_compatible", "ok", 0)],
+            vec![registry_model("cheap", "openai", "low", "low", true, false)],
+        );
+
+        let decision = decide_routing_at(
+            RoutingDecisionContext {
+                scope_kind: "session",
+                scope_id: "session-1",
+                mode: RoutingMode::Enforced,
+                task_class: RoutingTaskClass::PrimaryInteractive,
+                default_model_id: "cheap",
+                model_profile_override: None,
+                prompt_text: "short request",
+                prompt_tokens_estimate: 1_000,
+                json_mode: false,
+                vision_inputs: 0,
+                provider_health_state: "ok",
+                provider_snapshot: &snapshot,
+                auxiliary_routing_enabled: true,
+                lease_previews: &lease_previews,
+                pricing: pricing.as_slice(),
+                budgets: &[],
+            },
+            1_500,
+        );
+
+        let estimate = decision.estimated_cost.expect("decision should include estimate");
+        assert_eq!(estimate.upper_usd, Some(0.002));
     }
 
     #[test]
@@ -2426,6 +2506,27 @@ mod tests {
             by_run.get("run-1").map(|record| record.decision_id.as_str()),
             Some(latest.decision_id.as_str())
         );
+    }
+
+    #[test]
+    fn cost_spike_alert_compares_newer_half_against_older_half() {
+        let run_newest = usage_run("run-newest", 4_000);
+        let run_new = usage_run("run-new", 3_000);
+        let run_old = usage_run("run-old", 2_000);
+        let run_oldest = usage_run("run-oldest", 1_000);
+        let runs = vec![
+            enriched_usage_run(&run_newest, 5.0),
+            enriched_usage_run(&run_new, 5.0),
+            enriched_usage_run(&run_old, 1.0),
+            enriched_usage_run(&run_oldest, 1.0),
+        ];
+
+        let alerts = build_alert_candidates(&runs, &[], &[], &[], "ok");
+
+        let cost_spike =
+            alerts.iter().find(|alert| alert.alert_kind == "cost_spike").expect("spike alert");
+        assert_eq!(cost_spike.payload["newer_half_cost_usd"], serde_json::json!(10.0));
+        assert_eq!(cost_spike.payload["older_half_cost_usd"], serde_json::json!(2.0));
     }
 
     #[test]
