@@ -617,16 +617,21 @@ pub(crate) fn spawn_self_healing_loop(state: AppState) -> tokio::task::JoinHandl
     })
 }
 
-// AIDEV-NOTE: the `?` chain means an early evaluator error skips the later ones for that cycle;
-// in particular a browser connect failure (see evaluate_browser_runtime) suppresses the skill
-// artifact checks until the next tick. Evaluating each area independently would be a behavior
-// change, so the coupling is only flagged here.
 async fn run_self_healing_cycle(state: &AppState) -> Result<(), String> {
-    evaluate_watchdog_runtime(state).await?;
-    evaluate_pending_approvals(state).await?;
-    evaluate_browser_runtime(state).await?;
-    evaluate_skill_runtime(state).await?;
-    Ok(())
+    let mut errors = Vec::new();
+    if let Err(error) = evaluate_watchdog_runtime(state).await {
+        errors.push(("watchdog", error));
+    }
+    if let Err(error) = evaluate_pending_approvals(state).await {
+        errors.push(("approvals", error));
+    }
+    if let Err(error) = evaluate_browser_runtime(state).await {
+        errors.push(("browser", error));
+    }
+    if let Err(error) = evaluate_skill_runtime(state).await {
+        errors.push(("artifact", error));
+    }
+    format_self_healing_cycle_result(errors)
 }
 
 async fn evaluate_watchdog_runtime(state: &AppState) -> Result<(), String> {
@@ -802,19 +807,27 @@ async fn evaluate_browser_runtime(state: &AppState) -> Result<(), String> {
         return Ok(());
     }
 
-    // AIDEV-NOTE: a connect failure here returns Err without opening a Browser incident, so a
-    // fully unreachable browserd is only visible as a warn log (and it also skips the skill
-    // checks for the cycle, see run_self_healing_cycle). Only an established client whose health
-    // RPC fails produces an incident. Changing that is a behavior change; flagged only.
-    let mut client = build_console_browser_client(state).await.map_err(|response| {
-        format!("browser service connect failed with http {}", response.status())
-    })?;
+    let mut client = match build_console_browser_client(state).await {
+        Ok(client) => client,
+        Err(response) => {
+            let detail = format!("browser service connect failed with http {}", response.status());
+            let _ = state.runtime.observe_self_healing_incident(
+                build_browser_service_health_incident("browser service connect failed", detail),
+            );
+            return Ok(());
+        }
+    };
     let mut health_request = TonicRequest::new(browser_v1::BrowserHealthRequest {
         v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
     });
-    apply_browser_service_auth(state, health_request.metadata_mut()).map_err(|response| {
-        format!("browser service auth failed with http {}", response.status())
-    })?;
+    if let Err(response) = apply_browser_service_auth(state, health_request.metadata_mut()) {
+        let detail = format!("browser service auth failed with http {}", response.status());
+        let _ = state.runtime.observe_self_healing_incident(build_browser_service_health_incident(
+            "browser service auth failed",
+            detail,
+        ));
+        return Ok(());
+    }
     match client.health(health_request).await {
         Ok(_) => state.runtime.resolve_self_healing_incident(
             IncidentDomain::Browser,
@@ -822,24 +835,11 @@ async fn evaluate_browser_runtime(state: &AppState) -> Result<(), String> {
             "browser service health probe recovered",
         ),
         Err(error) => {
-            let _ = state.runtime.observe_self_healing_incident(RuntimeIncidentObservation {
-                domain: IncidentDomain::Browser,
-                severity: IncidentSeverity::High,
-                summary: "browser service health probe failed".to_owned(),
-                detail: error.to_string(),
-                dedupe_key: "browser_service_health".to_owned(),
-                remediation: Some(RuntimeRemediationDescriptor {
-                    remediation_id: "browser_service_probe".to_owned(),
-                    label: "Inspect browser daemon".to_owned(),
-                    description:
-                        "Verify browserd is reachable and restart it if operator confirms."
-                            .to_owned(),
-                    risk_level: RemediationRiskLevel::Medium,
-                    blast_radius: RemediationBlastRadius::Global,
-                    requires_approval: true,
-                    auto_executable: false,
-                }),
-            });
+            let _ =
+                state.runtime.observe_self_healing_incident(build_browser_service_health_incident(
+                    "browser service health probe failed",
+                    error.to_string(),
+                ));
             return Ok(());
         }
     }
@@ -1025,6 +1025,41 @@ fn browser_profiles_intentionally_unavailable(message: &str) -> bool {
     let normalized = message.to_ascii_lowercase();
     normalized.contains("browser profiles require")
         && normalized.contains("palyra_browserd_state_encryption_key")
+}
+
+fn build_browser_service_health_incident(
+    summary: impl Into<String>,
+    detail: impl Into<String>,
+) -> RuntimeIncidentObservation {
+    RuntimeIncidentObservation {
+        domain: IncidentDomain::Browser,
+        severity: IncidentSeverity::High,
+        summary: summary.into(),
+        detail: detail.into(),
+        dedupe_key: "browser_service_health".to_owned(),
+        remediation: Some(RuntimeRemediationDescriptor {
+            remediation_id: "browser_service_probe".to_owned(),
+            label: "Inspect browser daemon".to_owned(),
+            description: "Verify browserd is reachable and restart it if operator confirms."
+                .to_owned(),
+            risk_level: RemediationRiskLevel::Medium,
+            blast_radius: RemediationBlastRadius::Global,
+            requires_approval: true,
+            auto_executable: false,
+        }),
+    }
+}
+
+fn format_self_healing_cycle_result(errors: Vec<(&'static str, String)>) -> Result<(), String> {
+    if errors.is_empty() {
+        return Ok(());
+    }
+    let summary = errors
+        .into_iter()
+        .map(|(feature, error)| format!("{feature}: {error}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(format!("self-healing evaluators failed: {summary}"))
 }
 
 async fn evaluate_skill_runtime(state: &AppState) -> Result<(), String> {
@@ -1317,6 +1352,35 @@ mod tests {
         assert!(!browser_profiles_intentionally_unavailable(
             "browser profile list failed: transport error"
         ));
+    }
+
+    #[test]
+    fn browser_service_health_incident_uses_stable_dedupe_and_remediation() {
+        let incident = build_browser_service_health_incident(
+            "browser service connect failed",
+            "browser service connect failed with http 503",
+        );
+
+        assert_eq!(incident.domain, IncidentDomain::Browser);
+        assert_eq!(incident.severity, IncidentSeverity::High);
+        assert_eq!(incident.dedupe_key, "browser_service_health");
+        assert_eq!(incident.summary, "browser service connect failed");
+        assert_eq!(incident.detail, "browser service connect failed with http 503");
+        let remediation = incident.remediation.expect("browser incident should have remediation");
+        assert_eq!(remediation.remediation_id, "browser_service_probe");
+        assert!(remediation.requires_approval);
+    }
+
+    #[test]
+    fn self_healing_cycle_result_reports_all_evaluator_errors() {
+        let error = format_self_healing_cycle_result(vec![
+            ("watchdog", "load failed".to_owned()),
+            ("artifact", "index missing".to_owned()),
+        ])
+        .expect_err("aggregated evaluator errors should fail the cycle");
+
+        assert!(error.contains("watchdog: load failed"));
+        assert!(error.contains("artifact: index missing"));
     }
 
     #[test]
