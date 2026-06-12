@@ -105,13 +105,7 @@ pub(crate) async fn schedule_post_run_reflection(
         )
         .as_bytes(),
     );
-    // AIDEV-NOTE: sample_value is a 0-255 hash byte, but sampling_percent is
-    // validated as 0-100 (PALYRA_LEARNING_SAMPLING_PERCENT), so the effective
-    // sampling rate is percent/256 -- the default 100 samples only ~39% of
-    // runs instead of all of them. Fixing the scale changes scheduling
-    // behavior, so it is only flagged here in this doc-only pass.
-    let sample_value = u8::from_str_radix(&sample_key[..2], 16).unwrap_or_default();
-    if sample_value >= learning_config.sampling_percent {
+    if !learning_sample_included(sample_key.as_str(), learning_config.sampling_percent) {
         return Ok(None);
     }
 
@@ -182,6 +176,21 @@ pub(crate) async fn schedule_post_run_reflection(
         .await?;
     runtime_state.record_learning_reflection_scheduled();
     Ok(Some(task))
+}
+
+fn learning_sample_included(sample_key: &str, sampling_percent: u8) -> bool {
+    let sampling_percent = sampling_percent.min(100);
+    if sampling_percent == 0 {
+        return false;
+    }
+    learning_sample_bucket(sample_key) < sampling_percent
+}
+
+fn learning_sample_bucket(sample_key: &str) -> u8 {
+    let sample_value =
+        sample_key.get(..2).and_then(|hex| u8::from_str_radix(hex, 16).ok()).unwrap_or_default();
+    let bucket = (u16::from(sample_value) * 100) / 256;
+    u8::try_from(bucket).unwrap_or_default()
 }
 
 /// Executes a queued reflection task: mines the parent run's compaction
@@ -2173,6 +2182,16 @@ mod tests {
 
     fn learning_config() -> LearningRuntimeConfig {
         LearningRuntimeConfig::default()
+    }
+
+    #[test]
+    fn learning_sampling_uses_percent_scaled_hash_bucket() {
+        assert_eq!(learning_sample_bucket("00"), 0);
+        assert_eq!(learning_sample_bucket("ff"), 99);
+        assert!(learning_sample_included("ff", 100));
+        assert!(learning_sample_included("7f", 50));
+        assert!(!learning_sample_included("80", 50));
+        assert!(!learning_sample_included("00", 0));
     }
 
     #[cfg(unix)]

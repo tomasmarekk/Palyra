@@ -18,9 +18,7 @@
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 use std::{
-    collections::hash_map::DefaultHasher,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    hash::{Hash, Hasher},
     sync::Arc,
 };
 
@@ -1623,20 +1621,10 @@ fn build_checkpoint_metadata(
             condensed_event_count
         )
     };
-    // AIDEV-NOTE: std's DefaultHasher is not guaranteed stable across Rust
-    // releases, yet this hash is persisted inside checkpoint
-    // post_summary_ref values. A toolchain upgrade can change the ref for
-    // identical input. Treat refs as opaque ids, never recompute-and-compare
-    // them; if reproducibility ever matters, switch to crate::sha256_hex
-    // (like candidate ids), which is a behavior change for stored refs.
-    let mut hasher = DefaultHasher::new();
-    session.session_id.hash(&mut hasher);
-    summary_text.hash(&mut hasher);
+    let summary_hash = session_compaction_summary_hash(session.session_id.as_str(), summary_text);
     let post_summary_ref = format!(
-        "session:{}:compaction_summary:{}:{:016x}",
-        session.session_id,
-        SESSION_COMPACTION_VERSION,
-        hasher.finish()
+        "session:{}:compaction_summary:{}:{}",
+        session.session_id, SESSION_COMPACTION_VERSION, summary_hash
     );
 
     SessionCompactionCheckpointMetadata {
@@ -1660,6 +1648,17 @@ fn build_checkpoint_metadata(
         // downstream policy throttle or escalate instead of looping.
         abnormal_churn: previous_compaction_count >= 3,
     }
+}
+
+fn session_compaction_summary_hash(session_id: &str, summary_text: &str) -> String {
+    let hash_input = format!(
+        "session_id:{}:{}\nsummary_text:{}\n{}",
+        session_id.len(),
+        session_id,
+        summary_text.len(),
+        summary_text
+    );
+    crate::sha256_hex(hash_input.as_bytes())[..16].to_owned()
 }
 
 fn build_continuity_candidates(
@@ -2622,8 +2621,9 @@ pub(crate) fn truncate_console_text(raw: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_session_compaction_plan, render_compaction_prompt_block, ContextCompressor,
-        HybridSessionContextCompressor, SessionContextCompressionInput,
+        build_session_compaction_plan, render_compaction_prompt_block,
+        session_compaction_summary_hash, ContextCompressor, HybridSessionContextCompressor,
+        SessionContextCompressionInput,
     };
     use crate::journal::{
         OrchestratorSessionPinRecord, OrchestratorSessionRecord,
@@ -2703,6 +2703,14 @@ mod tests {
             deleted_at_unix_ms: None,
             last_recalled_at_unix_ms: None,
         }
+    }
+
+    #[test]
+    fn compaction_summary_hash_uses_stable_sha256_prefix() {
+        assert_eq!(
+            session_compaction_summary_hash("01ARZ3NDEKTSV4RRFFQ69G5FAV", "Stable summary"),
+            "9e47c1e23ad32f37"
+        );
     }
 
     #[test]
