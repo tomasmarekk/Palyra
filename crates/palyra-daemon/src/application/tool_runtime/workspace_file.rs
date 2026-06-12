@@ -1170,18 +1170,18 @@ fn list_workspace_dir_from_roots(
 }
 
 /// Resolves an absolute requested path to a canonical in-root directory.
-// AIDEV-NOTE: unlike resolve_absolute_workspace_file, this canonicalizes the
-// requested absolute path before any containment check, so a missing outside
-// path reports "not found" while an existing one reports "escapes" (an
-// existence oracle), and absolute `..` traversal is not pre-rejected.
-// Aligning it with the read-file flow would change pinned error strings, so
-// it needs a deliberate behavior change with test updates. Same applies to
-// resolve_absolute_workspace_search_path below.
 fn resolve_absolute_workspace_dir(
     canonical_roots: &[(usize, PathBuf)],
     requested: &Path,
     input: &WorkspaceListDirInput,
 ) -> Result<(usize, PathBuf, String), String> {
+    if requested.components().any(|component| matches!(component, Component::ParentDir)) {
+        return Err(format!("{WORKSPACE_LIST_DIR_TOOL_NAME} path escapes agent workspace roots"));
+    }
+    let (workspace_root_index, canonical_root) =
+        find_lexical_workspace_root(canonical_roots, requested).ok_or_else(|| {
+            format!("{WORKSPACE_LIST_DIR_TOOL_NAME} path escapes agent workspace roots")
+        })?;
     let canonical_target = fs::canonicalize(requested).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             format!(
@@ -1192,32 +1192,24 @@ fn resolve_absolute_workspace_dir(
             format!("{WORKSPACE_LIST_DIR_TOOL_NAME} failed to resolve path: {error}")
         }
     })?;
-    for (workspace_root_index, canonical_root) in canonical_roots {
-        if canonical_target.starts_with(canonical_root) {
-            if !canonical_target.is_dir() {
-                return Err(format!(
-                    "{WORKSPACE_LIST_DIR_TOOL_NAME} target is not a directory: {}",
-                    display_requested_path(input.path.as_str())
-                ));
-            }
-            let display_path = canonical_target
-                .strip_prefix(canonical_root)
-                .map(normalize_relative_path_display)
-                .unwrap_or_else(|_| display_requested_path(input.path.as_str()).to_owned());
-            return Ok((*workspace_root_index, canonical_target, display_path));
-        }
+    if !path_stays_inside_workspace_root(canonical_target.as_path(), canonical_root) {
+        return Err(format!("{WORKSPACE_LIST_DIR_TOOL_NAME} path escapes agent workspace roots"));
     }
-    Err(format!("{WORKSPACE_LIST_DIR_TOOL_NAME} path escapes agent workspace roots"))
+    if !canonical_target.is_dir() {
+        return Err(format!(
+            "{WORKSPACE_LIST_DIR_TOOL_NAME} target is not a directory: {}",
+            display_requested_path(input.path.as_str())
+        ));
+    }
+    let display_path = canonical_target
+        .strip_prefix(canonical_root)
+        .map(normalize_relative_path_display)
+        .unwrap_or_else(|_| display_requested_path(input.path.as_str()).to_owned());
+    Ok((workspace_root_index, canonical_target, display_path))
 }
 
 /// Lists one canonical in-root directory, sorted by display path and
 /// truncated to the entry budget.
-// AIDEV-NOTE: the whole directory is collected before sorting/truncation so
-// the page is deterministic and `truncated` is accurate, which makes memory
-// proportional to the directory size (search caps directory entries via
-// WORKSPACE_SEARCH_MAX_DIR_ENTRIES; listing has no such cap). Bounding it
-// changes which entries appear on truncated pages, so it needs a deliberate
-// behavior change.
 fn list_workspace_directory(
     workspace_root_index: usize,
     canonical_root: &Path,
@@ -1230,7 +1222,8 @@ fn list_workspace_directory(
         .and_then(|value| usize::try_from(value).ok())
         .unwrap_or(WORKSPACE_LIST_DIR_DEFAULT_ENTRIES)
         .min(WORKSPACE_LIST_DIR_MAX_ENTRIES);
-    let mut entries = Vec::new();
+    let mut entries = Vec::with_capacity(max_entries.saturating_add(1));
+    let mut total_entries = 0_usize;
     for entry_result in fs::read_dir(path.as_path()).map_err(|error| {
         format!(
             "{WORKSPACE_LIST_DIR_TOOL_NAME} failed to read workspace directory {}: {error}",
@@ -1275,13 +1268,36 @@ fn list_workspace_directory(
         } else {
             "other"
         };
-        entries.push(WorkspaceListDirEntry { name, path, kind: kind.to_owned(), size_bytes });
+        total_entries = total_entries.saturating_add(1);
+        retain_smallest_list_dir_entries(
+            &mut entries,
+            WorkspaceListDirEntry { name, path, kind: kind.to_owned(), size_bytes },
+            max_entries.saturating_add(1),
+        );
     }
     entries.sort_by(|left, right| left.path.cmp(&right.path));
-    let truncated = entries.len() > max_entries;
+    let truncated = total_entries > max_entries;
     entries.truncate(max_entries);
 
     Ok(WorkspaceListDirOutput { path: display_path, workspace_root_index, entries, truncated })
+}
+
+fn retain_smallest_list_dir_entries(
+    entries: &mut Vec<WorkspaceListDirEntry>,
+    entry: WorkspaceListDirEntry,
+    limit: usize,
+) {
+    if entries.len() < limit {
+        entries.push(entry);
+        return;
+    }
+    if let Some((largest_index, largest_entry)) =
+        entries.iter().enumerate().max_by(|(_, left), (_, right)| left.path.cmp(&right.path))
+    {
+        if entry.path < largest_entry.path {
+            entries[largest_index] = entry;
+        }
+    }
 }
 
 fn search_workspace_from_roots(
@@ -1365,13 +1381,18 @@ fn search_workspace_from_roots(
 }
 
 /// Resolves an absolute requested path to a canonical in-root search target.
-// AIDEV-NOTE: shares the canonicalize-before-containment-check ordering noted
-// on resolve_absolute_workspace_dir.
 fn resolve_absolute_workspace_search_path(
     canonical_roots: &[(usize, PathBuf)],
     requested: &Path,
     input: &WorkspaceSearchInput,
 ) -> Result<(usize, PathBuf, String), String> {
+    if requested.components().any(|component| matches!(component, Component::ParentDir)) {
+        return Err(format!("{WORKSPACE_SEARCH_TOOL_NAME} path escapes agent workspace roots"));
+    }
+    let (workspace_root_index, canonical_root) =
+        find_lexical_workspace_root(canonical_roots, requested).ok_or_else(|| {
+            format!("{WORKSPACE_SEARCH_TOOL_NAME} path escapes agent workspace roots")
+        })?;
     let canonical_target = fs::canonicalize(requested).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             format!(
@@ -1382,22 +1403,20 @@ fn resolve_absolute_workspace_search_path(
             format!("{WORKSPACE_SEARCH_TOOL_NAME} failed to resolve path: {error}")
         }
     })?;
-    for (workspace_root_index, canonical_root) in canonical_roots {
-        if canonical_target.starts_with(canonical_root) {
-            if !canonical_target.is_file() && !canonical_target.is_dir() {
-                return Err(format!(
-                    "{WORKSPACE_SEARCH_TOOL_NAME} target is not a file or directory: {}",
-                    display_requested_path(input.path.as_str())
-                ));
-            }
-            let display_path = canonical_target
-                .strip_prefix(canonical_root)
-                .map(normalize_relative_path_display)
-                .unwrap_or_else(|_| input.path.clone());
-            return Ok((*workspace_root_index, canonical_target, display_path));
-        }
+    if !path_stays_inside_workspace_root(canonical_target.as_path(), canonical_root) {
+        return Err(format!("{WORKSPACE_SEARCH_TOOL_NAME} path escapes agent workspace roots"));
     }
-    Err(format!("{WORKSPACE_SEARCH_TOOL_NAME} path escapes agent workspace roots"))
+    if !canonical_target.is_file() && !canonical_target.is_dir() {
+        return Err(format!(
+            "{WORKSPACE_SEARCH_TOOL_NAME} target is not a file or directory: {}",
+            display_requested_path(input.path.as_str())
+        ));
+    }
+    let display_path = canonical_target
+        .strip_prefix(canonical_root)
+        .map(normalize_relative_path_display)
+        .unwrap_or_else(|_| input.path.clone());
+    Ok((workspace_root_index, canonical_target, display_path))
 }
 
 fn search_workspace_path(
@@ -1493,16 +1512,9 @@ impl WorkspaceSearchState {
     /// Charges one prospective match against the output-size budget; a
     /// `false` return means the match must be dropped and the result marked
     /// truncated.
-    // AIDEV-NOTE: the x2 factor models typical JSON string escaping, but
-    // worst-case escaping (`\uXXXX` for control characters) is 6x, so the
-    // serialized output can overshoot WORKSPACE_SEARCH_MAX_OUTPUT_BYTES on
-    // control-character-heavy lines. Tightening the estimate changes when
-    // results truncate, so it needs a deliberate behavior change.
     fn reserve_match_output(&mut self, path: &str, line_text: &str) -> bool {
-        let estimated = path
-            .len()
-            .saturating_mul(2)
-            .saturating_add(line_text.len().saturating_mul(2))
+        let estimated = json_string_encoded_len(path)
+            .saturating_add(json_string_encoded_len(line_text))
             .saturating_add(WORKSPACE_SEARCH_MATCH_JSON_OVERHEAD_BYTES);
         let next = self.estimated_output_bytes.saturating_add(estimated);
         if next > WORKSPACE_SEARCH_MAX_OUTPUT_BYTES {
@@ -1512,6 +1524,19 @@ impl WorkspaceSearchState {
         self.estimated_output_bytes = next;
         true
     }
+}
+
+fn json_string_encoded_len(value: &str) -> usize {
+    let mut len = 2_usize;
+    for ch in value.chars() {
+        len = len.saturating_add(match ch {
+            '"' | '\\' => 2,
+            '\u{08}' | '\u{0C}' | '\n' | '\r' | '\t' => 2,
+            '\u{00}'..='\u{1F}' => 6,
+            _ => ch.len_utf8(),
+        });
+    }
+    len
 }
 
 fn search_workspace_path_recursive(
@@ -3226,6 +3251,30 @@ mod tests {
     }
 
     #[test]
+    fn search_workspace_bounds_control_character_escaped_output() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let control_heavy_line =
+            format!("needle {}", "\u{0001}".repeat(WORKSPACE_SEARCH_MAX_LINE_TEXT_BYTES / 2));
+        for index in 0..WORKSPACE_SEARCH_MAX_MATCHES {
+            fs::write(tempdir.path().join(format!("entry-{index:03}.txt")), &control_heavy_line)
+                .expect("workspace file should be written");
+        }
+        let input = parse_workspace_search_input(br#"{"query":"needle","max_matches":200}"#)
+            .expect("search input should parse");
+
+        let output = search_workspace_from_roots(&[tempdir.path().to_path_buf()], &input)
+            .expect("workspace search should complete");
+        let serialized = serde_json::to_vec(&output).expect("output should serialize");
+
+        assert!(output.truncated, "escaped control-heavy output should truncate");
+        assert!(
+            serialized.len() <= WORKSPACE_SEARCH_MAX_OUTPUT_BYTES,
+            "serialized search output should stay bounded: {}",
+            serialized.len()
+        );
+    }
+
+    #[test]
     fn search_workspace_bounds_recursive_depth() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let mut current = tempdir.path().to_path_buf();
@@ -3268,9 +3317,148 @@ mod tests {
     }
 
     #[test]
+    fn list_workspace_dir_returns_uniform_error_for_outside_absolute_paths() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let workspace = tempdir.path().join("workspace");
+        let outside = tempdir.path().join("outside");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        fs::create_dir_all(&outside).expect("outside directory should exist");
+        let existing_outside = outside.join("existing");
+        fs::create_dir_all(existing_outside.as_path()).expect("outside child should exist");
+        let missing_outside = outside.join("missing");
+        let outside_inputs = [existing_outside, missing_outside]
+            .into_iter()
+            .map(|path| WorkspaceListDirInput {
+                path: path.to_string_lossy().into_owned(),
+                workspace_root: None,
+                max_entries: None,
+            })
+            .collect::<Vec<_>>();
+
+        let errors = outside_inputs
+            .iter()
+            .map(|input| {
+                list_workspace_dir_from_roots(std::slice::from_ref(&workspace), input)
+                    .expect_err("outside absolute directory should be rejected")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            errors,
+            vec![
+                format!("{WORKSPACE_LIST_DIR_TOOL_NAME} path escapes agent workspace roots"),
+                format!("{WORKSPACE_LIST_DIR_TOOL_NAME} path escapes agent workspace roots"),
+            ]
+        );
+    }
+
+    #[test]
+    fn list_workspace_dir_rejects_absolute_parent_traversal_without_probe() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let workspace = tempdir.path().join("workspace");
+        let outside = tempdir.path().join("outside");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        fs::create_dir_all(&outside).expect("outside directory should exist");
+        let input = WorkspaceListDirInput {
+            path: workspace.join("..").join("outside").to_string_lossy().into_owned(),
+            workspace_root: None,
+            max_entries: None,
+        };
+
+        let error = list_workspace_dir_from_roots(&[workspace], &input)
+            .expect_err("absolute parent traversal should be rejected before resolution");
+
+        assert_eq!(
+            error,
+            format!("{WORKSPACE_LIST_DIR_TOOL_NAME} path escapes agent workspace roots")
+        );
+    }
+
+    #[test]
+    fn list_workspace_dir_truncates_after_sorted_smallest_entries() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        for name in ["zeta.txt", "alpha.txt", "middle.txt"] {
+            fs::write(tempdir.path().join(name), name).expect("workspace file should be written");
+        }
+        let input = parse_workspace_list_dir_input(br#"{"path":".","max_entries":2}"#)
+            .expect("list input should parse");
+
+        let output = list_workspace_dir_from_roots(&[tempdir.path().to_path_buf()], &input)
+            .expect("workspace directory should list");
+
+        assert!(output.truncated);
+        assert_eq!(
+            output.entries.iter().map(|entry| entry.path.as_str()).collect::<Vec<_>>(),
+            vec!["alpha.txt", "middle.txt"]
+        );
+    }
+
+    #[test]
     fn list_workspace_dir_rejects_parent_traversal() {
         let error = parse_workspace_list_dir_input(br#"{"path":"../outside"}"#).expect_err("path");
 
         assert!(error.contains("must not contain"), "unexpected validation error: {error}");
+    }
+
+    #[test]
+    fn search_workspace_returns_uniform_error_for_outside_absolute_paths() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let workspace = tempdir.path().join("workspace");
+        let outside = tempdir.path().join("outside");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        fs::create_dir_all(&outside).expect("outside directory should exist");
+        let existing_outside = outside.join("existing.txt");
+        fs::write(existing_outside.as_path(), "needle").expect("outside file should exist");
+        let missing_outside = outside.join("missing.txt");
+        let outside_inputs = [existing_outside, missing_outside]
+            .into_iter()
+            .map(|path| WorkspaceSearchInput {
+                query: "needle".to_owned(),
+                path: path.to_string_lossy().into_owned(),
+                workspace_root: None,
+                case_sensitive: None,
+                max_matches: None,
+            })
+            .collect::<Vec<_>>();
+
+        let errors = outside_inputs
+            .iter()
+            .map(|input| {
+                search_workspace_from_roots(std::slice::from_ref(&workspace), input)
+                    .expect_err("outside absolute search path should be rejected")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            errors,
+            vec![
+                format!("{WORKSPACE_SEARCH_TOOL_NAME} path escapes agent workspace roots"),
+                format!("{WORKSPACE_SEARCH_TOOL_NAME} path escapes agent workspace roots"),
+            ]
+        );
+    }
+
+    #[test]
+    fn search_workspace_rejects_absolute_parent_traversal_without_probe() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let workspace = tempdir.path().join("workspace");
+        let outside = tempdir.path().join("outside");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        fs::create_dir_all(&outside).expect("outside directory should exist");
+        let input = WorkspaceSearchInput {
+            query: "needle".to_owned(),
+            path: workspace.join("..").join("outside").to_string_lossy().into_owned(),
+            workspace_root: None,
+            case_sensitive: None,
+            max_matches: None,
+        };
+
+        let error = search_workspace_from_roots(&[workspace], &input)
+            .expect_err("absolute parent traversal should be rejected before resolution");
+
+        assert_eq!(
+            error,
+            format!("{WORKSPACE_SEARCH_TOOL_NAME} path escapes agent workspace roots")
+        );
     }
 }
