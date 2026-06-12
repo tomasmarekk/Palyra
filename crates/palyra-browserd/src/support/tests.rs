@@ -2668,20 +2668,20 @@ async fn browser_service_clamps_untrusted_session_budgets() {
             principal: "user:ops".to_owned(),
             idle_ttl_ms: 10_000,
             budget: Some(browser_v1::SessionBudget {
-                max_navigation_timeout_ms: 0,
-                max_session_lifetime_ms: 0,
-                max_screenshot_bytes: 0,
+                max_navigation_timeout_ms: u64::MAX,
+                max_session_lifetime_ms: u64::MAX,
+                max_screenshot_bytes: u64::MAX,
                 max_response_bytes: u64::MAX,
-                max_action_timeout_ms: 0,
+                max_action_timeout_ms: u64::MAX,
                 max_type_input_bytes: u64::MAX,
                 max_actions_per_session: u64::MAX,
-                max_actions_per_window: 0,
-                action_rate_window_ms: 0,
+                max_actions_per_window: u64::MAX,
+                action_rate_window_ms: u64::MAX,
                 max_action_log_entries: u64::MAX,
-                max_observe_snapshot_bytes: 0,
-                max_visible_text_bytes: 0,
-                max_network_log_entries: 0,
-                max_network_log_bytes: 0,
+                max_observe_snapshot_bytes: u64::MAX,
+                max_visible_text_bytes: u64::MAX,
+                max_network_log_entries: u64::MAX,
+                max_network_log_bytes: u64::MAX,
             }),
             allow_private_targets: true,
             allow_downloads: false,
@@ -2697,8 +2697,24 @@ async fn browser_service_clamps_untrusted_session_budgets() {
         .into_inner();
     let effective_budget = created.effective_budget.expect("effective budget should be returned");
     assert_eq!(
+        effective_budget.max_navigation_timeout_ms, default_budget.max_navigation_timeout_ms,
+        "untrusted session budgets must not widen max_navigation_timeout_ms"
+    );
+    assert_eq!(
+        effective_budget.max_session_lifetime_ms, default_budget.max_session_lifetime_ms,
+        "untrusted session budgets must not widen max_session_lifetime_ms"
+    );
+    assert_eq!(
+        effective_budget.max_screenshot_bytes, default_budget.max_screenshot_bytes,
+        "untrusted session budgets must not widen max_screenshot_bytes"
+    );
+    assert_eq!(
         effective_budget.max_response_bytes, default_budget.max_response_bytes,
         "untrusted session budgets must not widen max_response_bytes"
+    );
+    assert_eq!(
+        effective_budget.max_action_timeout_ms, default_budget.max_action_timeout_ms,
+        "untrusted session budgets must not widen max_action_timeout_ms"
     );
     assert_eq!(
         effective_budget.max_type_input_bytes, default_budget.max_type_input_bytes,
@@ -2709,8 +2725,32 @@ async fn browser_service_clamps_untrusted_session_budgets() {
         "untrusted session budgets must not widen max_actions_per_session"
     );
     assert_eq!(
+        effective_budget.max_actions_per_window, default_budget.max_actions_per_window,
+        "untrusted session budgets must not widen max_actions_per_window"
+    );
+    assert_eq!(
+        effective_budget.action_rate_window_ms, default_budget.action_rate_window_ms,
+        "untrusted session budgets must not widen action_rate_window_ms"
+    );
+    assert_eq!(
         effective_budget.max_action_log_entries, default_budget.max_action_log_entries as u64,
         "untrusted session budgets must not widen max_action_log_entries"
+    );
+    assert_eq!(
+        effective_budget.max_observe_snapshot_bytes, default_budget.max_observe_snapshot_bytes,
+        "untrusted session budgets must not widen max_observe_snapshot_bytes"
+    );
+    assert_eq!(
+        effective_budget.max_visible_text_bytes, default_budget.max_visible_text_bytes,
+        "untrusted session budgets must not widen max_visible_text_bytes"
+    );
+    assert_eq!(
+        effective_budget.max_network_log_entries, default_budget.max_network_log_entries as u64,
+        "untrusted session budgets must not widen max_network_log_entries"
+    );
+    assert_eq!(
+        effective_budget.max_network_log_bytes, default_budget.max_network_log_bytes,
+        "untrusted session budgets must not widen max_network_log_bytes"
     );
 }
 

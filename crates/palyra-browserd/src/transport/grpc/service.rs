@@ -435,43 +435,27 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         let clamp_usize_budget = |requested: Option<usize>, default: usize| {
             requested.filter(|value| *value > 0).map(|value| value.min(default)).unwrap_or(default)
         };
-        // AIDEV-NOTE: budget fields are inconsistently capped. The clamp_*
-        // helpers limit requested values to the daemon default, but the
-        // .filter(>0).unwrap_or(default) fields below (e.g.
-        // max_navigation_timeout_ms, max_screenshot_bytes,
-        // max_observe_snapshot_bytes) accept any requested value, including
-        // ones above the operator-configured default. If that is not
-        // intentional, aligning them changes effective session budgets -
-        // coordinate before fixing.
         let budget = SessionBudget {
-            max_navigation_timeout_ms: payload
-                .budget
-                .as_ref()
-                .map(|value| value.max_navigation_timeout_ms)
-                .filter(|value| *value > 0)
-                .unwrap_or(self.runtime.default_budget.max_navigation_timeout_ms),
-            max_session_lifetime_ms: payload
-                .budget
-                .as_ref()
-                .map(|value| value.max_session_lifetime_ms)
-                .filter(|value| *value > 0)
-                .unwrap_or(self.runtime.default_budget.max_session_lifetime_ms),
-            max_screenshot_bytes: payload
-                .budget
-                .as_ref()
-                .map(|value| value.max_screenshot_bytes)
-                .filter(|value| *value > 0)
-                .unwrap_or(self.runtime.default_budget.max_screenshot_bytes),
+            max_navigation_timeout_ms: clamp_u64_budget(
+                requested_budget.map(|value| value.max_navigation_timeout_ms),
+                self.runtime.default_budget.max_navigation_timeout_ms,
+            ),
+            max_session_lifetime_ms: clamp_u64_budget(
+                requested_budget.map(|value| value.max_session_lifetime_ms),
+                self.runtime.default_budget.max_session_lifetime_ms,
+            ),
+            max_screenshot_bytes: clamp_u64_budget(
+                requested_budget.map(|value| value.max_screenshot_bytes),
+                self.runtime.default_budget.max_screenshot_bytes,
+            ),
             max_response_bytes: clamp_u64_budget(
                 requested_budget.map(|value| value.max_response_bytes),
                 self.runtime.default_budget.max_response_bytes,
             ),
-            max_action_timeout_ms: payload
-                .budget
-                .as_ref()
-                .map(|value| value.max_action_timeout_ms)
-                .filter(|value| *value > 0)
-                .unwrap_or(self.runtime.default_budget.max_action_timeout_ms),
+            max_action_timeout_ms: clamp_u64_budget(
+                requested_budget.map(|value| value.max_action_timeout_ms),
+                self.runtime.default_budget.max_action_timeout_ms,
+            ),
             max_type_input_bytes: clamp_u64_budget(
                 requested_budget.map(|value| value.max_type_input_bytes),
                 self.runtime.default_budget.max_type_input_bytes,
@@ -480,49 +464,38 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                 requested_budget.map(|value| value.max_actions_per_session),
                 self.runtime.default_budget.max_actions_per_session,
             ),
-            max_actions_per_window: payload
-                .budget
-                .as_ref()
-                .map(|value| value.max_actions_per_window)
-                .filter(|value| *value > 0)
-                .unwrap_or(self.runtime.default_budget.max_actions_per_window),
-            action_rate_window_ms: payload
-                .budget
-                .as_ref()
-                .map(|value| value.action_rate_window_ms)
-                .filter(|value| *value > 0)
-                .unwrap_or(self.runtime.default_budget.action_rate_window_ms),
+            max_actions_per_window: clamp_u64_budget(
+                requested_budget.map(|value| value.max_actions_per_window),
+                self.runtime.default_budget.max_actions_per_window,
+            ),
+            action_rate_window_ms: clamp_u64_budget(
+                requested_budget.map(|value| value.action_rate_window_ms),
+                self.runtime.default_budget.action_rate_window_ms,
+            ),
             max_action_log_entries: clamp_usize_budget(
                 requested_budget
                     .map(|value| value.max_action_log_entries)
                     .and_then(|value| usize::try_from(value).ok()),
                 self.runtime.default_budget.max_action_log_entries,
             ),
-            max_observe_snapshot_bytes: payload
-                .budget
-                .as_ref()
-                .map(|value| value.max_observe_snapshot_bytes)
-                .filter(|value| *value > 0)
-                .unwrap_or(self.runtime.default_budget.max_observe_snapshot_bytes),
-            max_visible_text_bytes: payload
-                .budget
-                .as_ref()
-                .map(|value| value.max_visible_text_bytes)
-                .filter(|value| *value > 0)
-                .unwrap_or(self.runtime.default_budget.max_visible_text_bytes),
-            max_network_log_entries: payload
-                .budget
-                .as_ref()
-                .map(|value| value.max_network_log_entries)
-                .and_then(|value| usize::try_from(value).ok())
-                .filter(|value| *value > 0)
-                .unwrap_or(self.runtime.default_budget.max_network_log_entries),
-            max_network_log_bytes: payload
-                .budget
-                .as_ref()
-                .map(|value| value.max_network_log_bytes)
-                .filter(|value| *value > 0)
-                .unwrap_or(self.runtime.default_budget.max_network_log_bytes),
+            max_observe_snapshot_bytes: clamp_u64_budget(
+                requested_budget.map(|value| value.max_observe_snapshot_bytes),
+                self.runtime.default_budget.max_observe_snapshot_bytes,
+            ),
+            max_visible_text_bytes: clamp_u64_budget(
+                requested_budget.map(|value| value.max_visible_text_bytes),
+                self.runtime.default_budget.max_visible_text_bytes,
+            ),
+            max_network_log_entries: clamp_usize_budget(
+                requested_budget
+                    .map(|value| value.max_network_log_entries)
+                    .and_then(|value| usize::try_from(value).ok()),
+                self.runtime.default_budget.max_network_log_entries,
+            ),
+            max_network_log_bytes: clamp_u64_budget(
+                requested_budget.map(|value| value.max_network_log_bytes),
+                self.runtime.default_budget.max_network_log_bytes,
+            ),
             max_tabs_per_session: self.runtime.default_budget.max_tabs_per_session,
             max_title_bytes: self.runtime.default_budget.max_title_bytes,
         };
