@@ -436,10 +436,6 @@ impl LiveMcpBackend {
     }
 
     fn lookup_read_session_id(&mut self, selector: SessionReadSelector) -> Result<String> {
-        // AIDEV-NOTE: unlike load_session_summary_for_show in sessions.rs, this
-        // pagination loop has no repeated-cursor guard; a daemon that returns a
-        // non-advancing next_after_session_key would loop forever. Fixing it changes
-        // control flow, so it is left as-is for now.
         let mut after_session_key = None::<String>;
         loop {
             let response = self.runtime.block_on(async {
@@ -456,10 +452,14 @@ impl LiveMcpBackend {
             {
                 return Ok(session_id);
             }
-            after_session_key = normalize_optional_text(response.next_after_session_key.as_str());
-            if after_session_key.is_none() {
+            let next_after_session_key = next_distinct_session_page_cursor(
+                &after_session_key,
+                response.next_after_session_key.as_str(),
+            );
+            if next_after_session_key.is_none() {
                 break;
             }
+            after_session_key = next_after_session_key;
         }
         anyhow::bail!("session not found for {}", selector.description())
     }
@@ -1348,6 +1348,18 @@ fn normalize_optional_text(value: &str) -> Option<String> {
     }
 }
 
+fn next_distinct_session_page_cursor(
+    current_after_session_key: &Option<String>,
+    next_after_session_key: &str,
+) -> Option<String> {
+    let next_after_session_key = normalize_optional_text(next_after_session_key);
+    if next_after_session_key == *current_after_session_key {
+        None
+    } else {
+        next_after_session_key
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::output::{classify_error, CliExitCode};
@@ -1427,6 +1439,23 @@ mod tests {
         let error = reject_read_session_mutation_args(TOOL_SESSION_TRANSCRIPT_READ, &args)
             .expect_err("read tool should reject reset_session");
         assert!(error.to_string().contains("reset_session"));
+    }
+
+    #[test]
+    fn read_session_pagination_guard_stops_on_repeated_cursor() {
+        assert_eq!(
+            next_distinct_session_page_cursor(&None, "session-a"),
+            Some("session-a".to_owned())
+        );
+        assert_eq!(
+            next_distinct_session_page_cursor(&Some("session-a".to_owned()), "session-b"),
+            Some("session-b".to_owned())
+        );
+        assert_eq!(
+            next_distinct_session_page_cursor(&Some("session-a".to_owned()), "session-a"),
+            None
+        );
+        assert_eq!(next_distinct_session_page_cursor(&Some("session-a".to_owned()), "  "), None);
     }
 
     #[test]
