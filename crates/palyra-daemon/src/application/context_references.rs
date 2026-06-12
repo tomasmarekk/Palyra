@@ -849,13 +849,6 @@ fn read_text_file_limited(
 /// Breadth-first folder walk rendering up to [`MAX_FOLDER_REFERENCE_FILES`]
 /// text files as `<folder_file>` blocks. Symlinked entries are skipped so
 /// the walk can never follow a link outside the workspace root.
-///
-/// AIDEV-NOTE: the char-cap `break` below only exits the current
-/// directory's entry loop; queued subdirectories are still visited (and
-/// read) until the file cap hits. The final `consume_reference_budget`
-/// bounds the output either way, so this only wastes reads -- but making the
-/// break terminate the walk would change the emitted warnings and is a
-/// behavior change.
 fn collect_folder_reference_text(
     folder: &Path,
     matched_root: &Path,
@@ -936,7 +929,7 @@ fn collect_folder_reference_text(
                 warnings.push(format!(
                     "Folder reference output was capped at {MAX_FOLDER_REFERENCE_CHARS} characters."
                 ));
-                break;
+                return Ok(consume_reference_budget(rendered, total_chars, warnings));
             }
         }
     }
@@ -949,10 +942,10 @@ mod tests {
     use std::{fs, path::Path};
 
     use super::{
-        authorize_url_reference_fetch, contains_blocked_path_component, estimate_text_tokens,
-        read_text_file_limited, render_context_reference_prompt,
-        validate_workspace_relative_git_target, ContextReferencePreviewEnvelope,
-        ContextReferenceProvenance, ResolvedContextReference,
+        authorize_url_reference_fetch, collect_folder_reference_text,
+        contains_blocked_path_component, estimate_text_tokens, read_text_file_limited,
+        render_context_reference_prompt, validate_workspace_relative_git_target,
+        ContextReferencePreviewEnvelope, ContextReferenceProvenance, ResolvedContextReference,
     };
     use crate::{
         sandbox_runner::{
@@ -988,6 +981,36 @@ mod tests {
             .expect("read should work");
         assert_eq!(output.len(), 32);
         assert!(!warnings.is_empty(), "truncate should surface a warning");
+    }
+
+    #[test]
+    fn folder_reference_stops_traversal_after_char_cap() {
+        let temp = tempfile::tempdir().expect("temp dir should exist");
+        let folder = temp.path().join("context");
+        let nested = folder.join("nested");
+        fs::create_dir_all(nested.as_path()).expect("fixture directories should be written");
+        fs::write(folder.join("large.txt"), "A".repeat(super::MAX_FOLDER_REFERENCE_CHARS))
+            .expect("large fixture should be written");
+        fs::write(nested.join("later.txt"), "later").expect("nested fixture should be written");
+        let mut total_chars = 0;
+        let mut warnings = Vec::new();
+        let mut provenance = Vec::new();
+
+        let rendered = collect_folder_reference_text(
+            folder.as_path(),
+            folder.as_path(),
+            &mut total_chars,
+            &mut warnings,
+            &mut provenance,
+        )
+        .expect("folder reference should render");
+
+        assert!(rendered.contains("large.txt"));
+        assert!(!rendered.contains("later.txt"));
+        assert_eq!(provenance.len(), 1);
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("Folder reference output was capped")));
     }
 
     #[test]

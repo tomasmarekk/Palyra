@@ -64,12 +64,6 @@ const DEFAULT_MAX_TOP_CANDIDATES: usize = 8;
 const MAX_TOP_CANDIDATES: usize = 12;
 const DEFAULT_RECALL_PROMPT_BUDGET_TOKENS: usize = 1_800;
 const MAX_RECALL_QUERY_VARIANTS: usize = 4;
-#[cfg(test)]
-#[allow(dead_code)]
-const MIN_TRANSCRIPT_RECENCY_SCORE: f64 = 0.15;
-#[cfg(test)]
-#[allow(dead_code)]
-const MIN_SOURCE_QUALITY_SCORE: f64 = 0.20;
 
 /// Origin store of a recall hit; serialized into plans, citations, and tape
 /// payloads as `snake_case` strings.
@@ -983,20 +977,11 @@ async fn build_selection_context(
         }
     }
 
-    // AIDEV-NOTE: the expects below assume every selection carrying
-    // transcript/checkpoint/compaction refs also carries a session id.
-    // Selections built by selection_from_candidates uphold that, but
-    // parse_explicit_recall_selection accepts arbitrary parameter-delta
-    // JSON, so a hand-crafted delta with refs and no session id reaches
-    // these expects and panics the request path. Failing closed with
-    // FailedPrecondition instead would be a behavior change outside this
-    // doc-only pass.
     let transcript_hits = if !selection.transcript_refs.is_empty() {
-        let transcript_records = runtime_state
-            .list_orchestrator_session_transcript(
-                session_id.clone().expect("session scope should exist for transcript recall"),
-            )
-            .await?;
+        let scoped_session_id =
+            require_recall_session_scope(session_id.as_deref(), "transcript references")?;
+        let transcript_records =
+            runtime_state.list_orchestrator_session_transcript(scoped_session_id).await?;
         let built_hits = build_transcript_hits(
             transcript_records.as_slice(),
             query_variants.as_slice(),
@@ -1010,11 +995,10 @@ async fn build_selection_context(
     };
 
     let checkpoint_hits = if !selection.checkpoint_ids.is_empty() {
-        let checkpoint_records = runtime_state
-            .list_orchestrator_checkpoints(
-                session_id.clone().expect("session scope should exist for checkpoint recall"),
-            )
-            .await?;
+        let scoped_session_id =
+            require_recall_session_scope(session_id.as_deref(), "checkpoint references")?;
+        let checkpoint_records =
+            runtime_state.list_orchestrator_checkpoints(scoped_session_id).await?;
         let built_hits = build_checkpoint_hits(
             checkpoint_records.as_slice(),
             query_variants.as_slice(),
@@ -1028,11 +1012,10 @@ async fn build_selection_context(
     };
 
     let compaction_hits = if !selection.compaction_artifact_ids.is_empty() {
-        let compaction_records = runtime_state
-            .list_orchestrator_compaction_artifacts(
-                session_id.expect("session scope should exist for compaction recall"),
-            )
-            .await?;
+        let scoped_session_id =
+            require_recall_session_scope(session_id.as_deref(), "compaction references")?;
+        let compaction_records =
+            runtime_state.list_orchestrator_compaction_artifacts(scoped_session_id).await?;
         let built_hits = build_compaction_hits(
             compaction_records.as_slice(),
             query_variants.as_slice(),
@@ -2187,88 +2170,9 @@ fn compaction_reason(
     )
 }
 
-// Test-only reference implementations of the legacy local scorer, kept so
-// unit tests can sanity-check the crate::retrieval-backed scores against a
-// known-simple baseline.
-// AIDEV-NOTE: only lexical_overlap_score and proxy_vector_score (plus their
-// helpers normalized_tokens and char_ngrams) are still exercised by tests;
-// the remaining #[allow(dead_code)] source-quality/recency/final_score
-// helpers and the two MIN_* consts are unreferenced and are deletion
-// candidates once a human confirms they are not kept for parity tests.
-#[cfg(test)]
-#[allow(dead_code)]
-fn transcript_source_quality(record: &OrchestratorSessionTranscriptRecord) -> f64 {
-    let base: f64 = match record.event_type.as_str() {
-        "message.received" | "queued.input" => 0.72,
-        "message.replied" => 0.76,
-        _ => 0.70,
-    };
-    base.clamp(MIN_SOURCE_QUALITY_SCORE, 1.0)
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-fn memory_source_quality(hit: &MemorySearchHit) -> f64 {
-    let confidence = hit.item.confidence.unwrap_or(0.75).clamp(0.0, 1.0);
-    let source_bias = match hit.item.source {
-        crate::journal::MemorySource::Manual => 0.94,
-        crate::journal::MemorySource::Summary => 0.88,
-        crate::journal::MemorySource::Import => 0.84,
-        crate::journal::MemorySource::TapeUserMessage => 0.78,
-        crate::journal::MemorySource::TapeToolResult => 0.74,
-    };
-    ((confidence * 0.6) + (source_bias * 0.4)).clamp(MIN_SOURCE_QUALITY_SCORE, 1.0)
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-fn workspace_source_quality(hit: &WorkspaceSearchHit) -> f64 {
-    let mut quality: f64 = 0.78;
-    if hit.document.pinned {
-        quality += 0.10;
-    }
-    if hit.document.manual_override {
-        quality += 0.05;
-    }
-    if hit.document.prompt_binding == "system_candidate" {
-        quality += 0.04;
-    }
-    if hit.document.risk_state != "clean" {
-        quality -= 0.12;
-    }
-    quality.clamp(MIN_SOURCE_QUALITY_SCORE, 1.0)
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-fn checkpoint_source_quality(checkpoint: &OrchestratorCheckpointRecord) -> f64 {
-    let mut quality: f64 = 0.86;
-    if checkpoint.restore_count > 0 {
-        quality += 0.04;
-    }
-    if checkpoint.note.as_deref().is_some_and(|note| !note.trim().is_empty()) {
-        quality += 0.02;
-    }
-    quality.clamp(MIN_SOURCE_QUALITY_SCORE, 1.0)
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-fn compaction_source_quality(artifact: &OrchestratorCompactionArtifactRecord) -> f64 {
-    let summary = serde_json::from_str::<Value>(artifact.summary_json.as_str()).unwrap_or_default();
-    let review_penalty = summary
-        .pointer("/planner/review_candidate_count")
-        .and_then(Value::as_u64)
-        .unwrap_or_default() as f64
-        * 0.02;
-    let poisoned_penalty = summary
-        .pointer("/quality_gates/poisoned_candidate_count")
-        .and_then(Value::as_u64)
-        .unwrap_or_default() as f64
-        * 0.08;
-    (0.88 - review_penalty - poisoned_penalty).clamp(MIN_SOURCE_QUALITY_SCORE, 1.0)
-}
-
+// Test-only reference implementations of the legacy local lexical and proxy
+// vector scorers, kept so unit tests can sanity-check the crate::retrieval
+// backed scores against a known-simple baseline.
 #[cfg(test)]
 #[allow(dead_code)]
 fn lexical_overlap_score(text: &str, query_variants: &[String]) -> f64 {
@@ -2308,31 +2212,6 @@ fn proxy_vector_score(text: &str, query_variants: &[String]) -> f64 {
             shared as f64 / query_ngrams.len().max(1) as f64
         })
         .fold(0.0, f64::max)
-        .clamp(0.0, 1.0)
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-fn recency_score(created_at_unix_ms: i64, now_unix_ms: i64) -> f64 {
-    if created_at_unix_ms <= 0 || now_unix_ms <= created_at_unix_ms {
-        return 1.0;
-    }
-    let age_days = (now_unix_ms - created_at_unix_ms) as f64 / 86_400_000.0;
-    (1.0 / (1.0 + age_days / 7.0)).clamp(MIN_TRANSCRIPT_RECENCY_SCORE, 1.0)
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-fn final_score(
-    lexical_score: f64,
-    vector_score: f64,
-    recency_score: f64,
-    source_quality_score: f64,
-) -> f64 {
-    ((lexical_score * 0.42)
-        + (vector_score * 0.24)
-        + (recency_score * 0.16)
-        + (source_quality_score * 0.18))
         .clamp(0.0, 1.0)
 }
 
@@ -2390,6 +2269,15 @@ fn trim_option(value: Option<String>) -> Option<String> {
     value.and_then(|value| {
         let trimmed = value.trim();
         (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn require_recall_session_scope(session_id: Option<&str>, source: &str) -> Result<String, Status> {
+    session_id.map(ToOwned::to_owned).ok_or_else(|| {
+        Status::failed_precondition(format!(
+            "explicit recall {source} requires a resolved session_id"
+        ))
     })
 }
 
@@ -2666,6 +2554,15 @@ mod tests {
         );
         assert!(lexical > 0.9, "lexical overlap should be strong");
         assert!(vector > 0.5, "ngram overlap should be strong");
+    }
+
+    #[test]
+    fn recall_session_scoped_sources_require_session_id() {
+        let error = super::require_recall_session_scope(None, "checkpoint references")
+            .expect_err("missing session scope must fail closed");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("checkpoint references"));
     }
 
     #[test]

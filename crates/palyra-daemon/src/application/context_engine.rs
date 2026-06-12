@@ -851,21 +851,18 @@ fn assemble_segments(
             break;
         };
 
-        // Grouped segments fall together so a tool call never survives
-        // without its result (and vice versa).
-        // AIDEV-NOTE: group eviction ignores the `protected` flag of group
-        // members; it is sound today only because groups are homogeneous
-        // (instruction segments are all protected, tool-exchange groups all
-        // unprotected). A mixed group would let an unprotected seed drag a
-        // protected member out of the prompt.
+        // Grouped unprotected segments fall together so a tool call never
+        // survives without its result. Protected members remain pinned even if
+        // a malformed or future mixed group id links them to evictable content.
         let drop_group_id = selected[drop_index].segment.group_id.clone();
         let mut removed_indexes = selected
             .iter()
             .enumerate()
             .filter(|(_, entry)| {
-                drop_group_id
-                    .as_deref()
-                    .is_some_and(|group_id| entry.segment.group_id.as_deref() == Some(group_id))
+                !entry.segment.protected
+                    && drop_group_id
+                        .as_deref()
+                        .is_some_and(|group_id| entry.segment.group_id.as_deref() == Some(group_id))
             })
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
@@ -1568,12 +1565,6 @@ fn evaluate_summary_quality(
 
 /// Counts opposing-directive pairs both present in a summary, a coarse
 /// signal that compaction merged contradictory instructions.
-///
-/// AIDEV-NOTE: matching is plain substring containment, so it can fire on
-/// embedded words ("house" contains "use") and ("must", "must not") always
-/// fires whenever "must not" appears. Tightening to word-boundary matching
-/// would change reject/fallback verdicts and the deterministic fixtures, so
-/// it must be a deliberate behavior change.
 fn count_contradiction_signals(summary_text: &str) -> usize {
     const CONTRADICTION_PAIRS: &[(&str, &str)] = &[
         ("enable", "disable"),
@@ -1584,11 +1575,44 @@ fn count_contradiction_signals(summary_text: &str) -> usize {
         ("remote", "local"),
         ("public", "private"),
     ];
-    let lowered = summary_text.to_ascii_lowercase();
+    let tokens = normalized_word_tokens(summary_text);
     CONTRADICTION_PAIRS
         .iter()
-        .filter(|(left, right)| lowered.contains(left) && lowered.contains(right))
+        .filter(|(left, right)| contains_non_overlapping_terms(tokens.as_slice(), left, right))
         .count()
+}
+
+fn normalized_word_tokens(input: &str) -> Vec<String> {
+    input
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+fn contains_non_overlapping_terms(tokens: &[String], left: &str, right: &str) -> bool {
+    let left_tokens = normalized_word_tokens(left);
+    let right_tokens = normalized_word_tokens(right);
+    let left_ranges = term_ranges(tokens, left_tokens.as_slice());
+    let right_ranges = term_ranges(tokens, right_tokens.as_slice());
+    left_ranges.iter().any(|left_range| {
+        right_ranges.iter().any(|right_range| {
+            left_range.end <= right_range.start || right_range.end <= left_range.start
+        })
+    })
+}
+
+fn term_ranges(tokens: &[String], term_tokens: &[String]) -> Vec<std::ops::Range<usize>> {
+    if term_tokens.is_empty() || term_tokens.len() > tokens.len() {
+        return Vec::new();
+    }
+    tokens
+        .windows(term_tokens.len())
+        .enumerate()
+        .filter_map(|(index, window)| {
+            (window == term_tokens).then_some(index..index + term_tokens.len())
+        })
+        .collect()
 }
 
 /// Turns the pre-resolved context-reference preview from the parameter
@@ -2645,6 +2669,65 @@ mod tests {
                 .iter()
                 .all(|segment| segment.reason == "dropped_by_budget_group"),
             "grouped drops should explain that the whole group was removed"
+        );
+    }
+
+    #[test]
+    fn assembly_does_not_drop_protected_member_of_mixed_group() {
+        let assembled = assemble_segments(
+            &[
+                segment(
+                    ContextSegmentKind::ToolExchange,
+                    "protected_group_member",
+                    500,
+                    100,
+                    false,
+                    true,
+                    Some("mixed:1"),
+                ),
+                segment(
+                    ContextSegmentKind::ToolExchange,
+                    "unprotected_group_member",
+                    520,
+                    30,
+                    false,
+                    false,
+                    Some("mixed:1"),
+                ),
+                segment(ContextSegmentKind::UserInput, "question", 220, 100, false, true, None),
+            ],
+            ContextEngineStrategy::CheckpointAware,
+            budget(1_536, 512, 128, 128, false),
+            &RequestContext {
+                principal: "user:ops".to_owned(),
+                device_id: "device".to_owned(),
+                channel: Some("cli".to_owned()),
+            },
+            "session-2",
+            None,
+        );
+
+        assert!(assembled.prompt_text.contains("protected_group_member"));
+        assert!(!assembled.prompt_text.contains("unprotected_group_member"));
+        assert_eq!(assembled.explain.dropped_segments.len(), 1);
+        assert_eq!(assembled.explain.dropped_segments[0].label, "unprotected_group_member");
+    }
+
+    #[test]
+    fn contradiction_signals_require_non_overlapping_word_terms() {
+        assert_eq!(
+            super::count_contradiction_signals("The warehouse note should avoid churn."),
+            0,
+            "embedded words must not count as directive terms"
+        );
+        assert_eq!(
+            super::count_contradiction_signals("The rollout must not expose secrets."),
+            0,
+            "a phrase must not satisfy its own shorter prefix term"
+        );
+        assert_eq!(
+            super::count_contradiction_signals("The rollout must proceed, but must not leak."),
+            1
         );
     }
 }
