@@ -7,7 +7,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Command, ExitStatus, Stdio},
 };
 
 use anyhow::{Context, Result};
@@ -517,11 +517,6 @@ fn resolve_workspace_artifact_path(app: &App, artifact: &serde_json::Value) -> R
 }
 
 fn open_path_in_default_app(path: &Path) -> Result<()> {
-    // AIDEV-NOTE: explorer.exe commonly exits with code 1 even when it opens
-    // the target successfully, so the success() check below can report a
-    // spurious "failed to open" error on Windows although the file opened.
-    // Fixing this needs a behavior change (e.g. `cmd /C start` or treating
-    // explorer's exit code as advisory).
     #[cfg(target_os = "windows")]
     let mut commands = vec![{
         let mut command = Command::new("explorer");
@@ -544,12 +539,28 @@ fn open_path_in_default_app(path: &Path) -> Result<()> {
     let mut failures = Vec::new();
     for command in &mut commands {
         match command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status() {
-            Ok(status) if status.success() => return Ok(()),
+            Ok(status) if default_app_launcher_status_is_success(status) => return Ok(()),
             Ok(status) => failures.push(format!("launcher exited with {}", status)),
             Err(error) => failures.push(error.to_string()),
         }
     }
     anyhow::bail!("failed to open workspace path {}: {}", path.display(), failures.join("; "))
+}
+
+fn default_app_launcher_status_is_success(status: ExitStatus) -> bool {
+    if status.success() {
+        return true;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        status.code() == Some(1)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
 }
 
 fn build_console_handoff_url(path: &str) -> Result<String> {
@@ -616,5 +627,15 @@ mod tests {
                 run_id: None,
             }
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn workspace_launcher_treats_explorer_exit_code_one_as_success() {
+        use std::os::windows::process::ExitStatusExt;
+
+        let explorer_status = std::process::ExitStatus::from_raw(1);
+
+        assert!(super::default_app_launcher_status_is_success(explorer_status));
     }
 }
