@@ -5398,6 +5398,33 @@ impl GatewayRuntimeState {
         .map_err(|_| Status::internal("orchestrator snapshot worker panicked"))?
     }
 
+    #[allow(clippy::result_large_err)]
+    fn list_orchestrator_run_status_snapshots_blocking(
+        &self,
+        run_ids: &[String],
+    ) -> Result<Vec<OrchestratorRunStatusSnapshot>, Status> {
+        self.journal_store
+            .list_orchestrator_run_status_snapshots(run_ids)
+            .map_err(|error| map_orchestrator_store_error("list orchestrator run snapshots", error))
+    }
+
+    /// Loads current run status snapshots for the supplied run ids.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn list_orchestrator_run_status_snapshots(
+        self: &Arc<Self>,
+        run_ids: Vec<String>,
+    ) -> Result<Vec<OrchestratorRunStatusSnapshot>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.list_orchestrator_run_status_snapshots_blocking(run_ids.as_slice())
+        })
+        .await
+        .map_err(|_| Status::internal("orchestrator snapshot list worker panicked"))?
+    }
+
     // Diagnostics accept either an orchestrator run id or a cron run id;
     // cron runs are followed to the orchestrator run they spawned.
     #[allow(clippy::result_large_err)]

@@ -20,7 +20,7 @@
 //! handlers, the orchestrator run loop, and the background queue.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt, fs,
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
@@ -9202,6 +9202,101 @@ impl JournalStore {
             |row| row.get::<_, i64>(0),
         )? as u64;
         Ok(Some(snapshot))
+    }
+
+    /// Lists point-in-time status snapshots for the supplied run ids.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
+    pub fn list_orchestrator_run_status_snapshots(
+        &self,
+        run_ids: &[String],
+    ) -> Result<Vec<OrchestratorRunStatusSnapshot>, JournalError> {
+        const RUN_SNAPSHOT_QUERY_CHUNK: usize = 512;
+
+        let unique_run_ids = run_ids
+            .iter()
+            .map(String::as_str)
+            .filter(|run_id| !run_id.is_empty())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if unique_run_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let mut records = Vec::new();
+        for chunk in unique_run_ids.chunks(RUN_SNAPSHOT_QUERY_CHUNK) {
+            let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                r#"
+                    SELECT
+                        runs.run_ulid,
+                        runs.session_ulid,
+                        runs.state,
+                        runs.cancel_requested,
+                        runs.cancel_reason,
+                        sessions.principal,
+                        sessions.device_id,
+                        sessions.channel,
+                        runs.prompt_tokens,
+                        runs.completion_tokens,
+                        runs.total_tokens,
+                        runs.created_at_unix_ms,
+                        runs.started_at_unix_ms,
+                        runs.completed_at_unix_ms,
+                        runs.updated_at_unix_ms,
+                        runs.last_error,
+                        runs.origin_kind,
+                        runs.origin_run_ulid,
+                        runs.parent_run_ulid,
+                        runs.triggered_by_principal,
+                        runs.parameter_delta_json,
+                        runs.delegation_json,
+                        runs.merge_result_json,
+                        (SELECT COUNT(*) FROM orchestrator_tape WHERE run_ulid = runs.run_ulid) AS tape_events
+                    FROM orchestrator_runs AS runs
+                    INNER JOIN orchestrator_sessions AS sessions
+                        ON sessions.session_ulid = runs.session_ulid
+                    WHERE runs.run_ulid IN ({placeholders})
+                "#
+            );
+            let mut statement = guard.prepare(sql.as_str())?;
+            let mut rows = statement.query(params_from_iter(chunk.iter().copied()))?;
+            while let Some(row) = rows.next()? {
+                let raw_state: String = row.get(2)?;
+                let normalized_state = RunLifecycleState::from_str(raw_state.as_str())
+                    .map(|state| state.as_str().to_owned())
+                    .unwrap_or(raw_state);
+                records.push(OrchestratorRunStatusSnapshot {
+                    run_id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    state: normalized_state,
+                    cancel_requested: row.get::<_, i64>(3)? == 1,
+                    cancel_reason: row.get(4)?,
+                    principal: row.get(5)?,
+                    device_id: row.get(6)?,
+                    channel: row.get(7)?,
+                    prompt_tokens: row.get::<_, i64>(8)? as u64,
+                    completion_tokens: row.get::<_, i64>(9)? as u64,
+                    total_tokens: row.get::<_, i64>(10)? as u64,
+                    created_at_unix_ms: row.get(11)?,
+                    started_at_unix_ms: row.get(12)?,
+                    completed_at_unix_ms: row.get(13)?,
+                    updated_at_unix_ms: row.get(14)?,
+                    last_error: row.get(15)?,
+                    origin_kind: row.get(16)?,
+                    origin_run_id: row.get(17)?,
+                    parent_run_id: row.get(18)?,
+                    triggered_by_principal: row.get(19)?,
+                    parameter_delta_json: row.get(20)?,
+                    delegation: parse_optional_json_column(row.get(21)?, "delegation_json")?,
+                    merge_result: parse_optional_json_column(row.get(22)?, "merge_result_json")?,
+                    tape_events: row.get::<_, i64>(23)?.max(0) as u64,
+                });
+            }
+        }
+        Ok(records)
     }
 
     /// Lists run status snapshots for a session.
@@ -21356,9 +21451,8 @@ mod tests {
         OrchestratorRunStartRequest, OrchestratorSessionPinCreateRequest,
         OrchestratorSessionResolveRequest, OrchestratorSessionUpsertRequest,
         OrchestratorTapeAppendRequest, OrchestratorUsageDelta, RecallArtifactCreateRequest,
-        RecallArtifactListFilter,
-        SessionProjectContextStateUpsertRequest, SessionSearchRequest, SkillExecutionStatus,
-        SkillStatusUpsertRequest, ToolJobAttachRequest, ToolJobCreateRequest,
+        RecallArtifactListFilter, SessionProjectContextStateUpsertRequest, SessionSearchRequest,
+        SkillExecutionStatus, SkillStatusUpsertRequest, ToolJobAttachRequest, ToolJobCreateRequest,
         ToolJobRetentionPolicy, ToolJobRetryPolicy, ToolJobRetryRequest, ToolJobState,
         ToolJobTailAppendRequest, ToolJobTailReadRequest, ToolJobTailStream,
         ToolJobTransitionRequest, ToolJobsListFilter, ToolResultArtifactCreateRequest,
@@ -23155,6 +23249,60 @@ mod tests {
             tape[1].payload_json.contains("<redacted>"),
             "persisted tape payloads should preserve explicit redaction marker"
         );
+    }
+
+    #[test]
+    fn list_orchestrator_run_status_snapshots_dedupes_and_preserves_counts() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let first_session_id = "01ARZ3NDEKTSV4RRFFQ69G5LS1";
+        let second_session_id = "01ARZ3NDEKTSV4RRFFQ69G5LS2";
+        let first_run_id = "01ARZ3NDEKTSV4RRFFQ69G5LR1";
+        let second_run_id = "01ARZ3NDEKTSV4RRFFQ69G5LR2";
+        upsert_orchestrator_session(&store, first_session_id);
+        upsert_orchestrator_session(&store, second_session_id);
+        start_orchestrator_run(&store, first_session_id, first_run_id);
+        start_orchestrator_run(&store, second_session_id, second_run_id);
+        store
+            .update_orchestrator_run_state(first_run_id, RunLifecycleState::InProgress, None)
+            .expect("first run should transition");
+        store
+            .update_orchestrator_run_state(second_run_id, RunLifecycleState::Done, None)
+            .expect("second run should transition");
+        store
+            .add_orchestrator_usage(&OrchestratorUsageDelta {
+                run_id: first_run_id.to_owned(),
+                prompt_tokens_delta: 8,
+                completion_tokens_delta: 5,
+            })
+            .expect("first run usage should persist");
+        append_tape_event(&store, first_run_id, 1);
+
+        let snapshots = store
+            .list_orchestrator_run_status_snapshots(&[
+                first_run_id.to_owned(),
+                first_run_id.to_owned(),
+                "01ARZ3NDEKTSV4RRFFQ69G5LRX".to_owned(),
+                second_run_id.to_owned(),
+            ])
+            .expect("bulk snapshot query should succeed");
+
+        assert_eq!(snapshots.len(), 2);
+        let first = snapshots
+            .iter()
+            .find(|snapshot| snapshot.run_id == first_run_id)
+            .expect("first run snapshot should be returned");
+        assert_eq!(first.state, "in_progress");
+        assert_eq!(first.prompt_tokens, 8);
+        assert_eq!(first.completion_tokens, 5);
+        assert_eq!(first.total_tokens, 13);
+        assert_eq!(first.tape_events, 1);
+        let second = snapshots
+            .iter()
+            .find(|snapshot| snapshot.run_id == second_run_id)
+            .expect("second run snapshot should be returned");
+        assert_eq!(second.state, "done");
     }
 
     #[test]

@@ -357,6 +357,7 @@ struct SessionCatalogContext {
     project_context_by_session:
         HashMap<String, crate::application::project_context::ProjectContextPreviewEnvelope>,
     family_by_session: HashMap<String, SessionCatalogFamilyRecord>,
+    run_snapshot_by_id: HashMap<String, journal::OrchestratorRunStatusSnapshot>,
     bindings_by_session: HashMap<String, SessionAgentBinding>,
     agents_by_id: HashMap<String, AgentRecord>,
     default_agent_id: Option<String>,
@@ -400,11 +401,6 @@ pub(crate) async fn console_sessions_list_handler(
     let catalog_context =
         load_session_catalog_context(&state, &session.context, &base_sessions).await?;
 
-    // AIDEV-NOTE: every scoped session is fully enriched (including a per
-    // session run-status lookup in build_session_catalog_record) before any
-    // filter or page limit applies, so large catalogs pay the full cost per
-    // list request. Reducing this requires paging before enrichment, which
-    // changes summary semantics (behavior change).
     let mut catalog = Vec::with_capacity(base_sessions.len());
     for base in base_sessions {
         catalog.push(build_session_catalog_record(&state, &catalog_context, base, None).await?);
@@ -1210,6 +1206,7 @@ async fn load_session_catalog_context(
     let (bindings_by_session, agents_by_id, default_agent_id) =
         load_session_agent_metadata(state, context).await?;
     let family_by_session = build_session_family_metadata(base_sessions);
+    let run_snapshot_by_id = load_session_catalog_run_snapshots(state, base_sessions).await?;
     let effective_model_profile = effective_model_profile_from_provider_snapshot(
         &state.runtime.model_provider_status_snapshot(),
     );
@@ -1219,11 +1216,26 @@ async fn load_session_catalog_context(
         workspace_by_session,
         project_context_by_session,
         family_by_session,
+        run_snapshot_by_id,
         bindings_by_session,
         agents_by_id,
         default_agent_id,
         effective_model_profile,
     })
+}
+
+async fn load_session_catalog_run_snapshots(
+    state: &AppState,
+    base_sessions: &[journal::OrchestratorSessionRecord],
+) -> Result<HashMap<String, journal::OrchestratorRunStatusSnapshot>, Response> {
+    let run_ids =
+        base_sessions.iter().filter_map(|session| session.last_run_id.clone()).collect::<Vec<_>>();
+    let snapshots = state
+        .runtime
+        .list_orchestrator_run_status_snapshots(run_ids)
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(snapshots.into_iter().map(|snapshot| (snapshot.run_id.clone(), snapshot)).collect())
 }
 
 /// Picks the model profile the runtime would actually use, preferring the
@@ -1338,10 +1350,12 @@ fn build_session_family_metadata(
         .collect::<HashMap<_, _>>();
     let mut family_root_by_session = HashMap::<String, String>::new();
     for session in sessions {
+        let mut visiting = HashSet::new();
         let _ = resolve_session_family_root(
             session.session_id.as_str(),
             &sessions_by_id,
             &mut family_root_by_session,
+            &mut visiting,
         );
     }
 
@@ -1413,32 +1427,33 @@ fn build_session_family_metadata(
         .collect()
 }
 
-/// Walks `parent_session_id` links to the family root title, memoizing each
-/// resolved session. A session whose parent id points at itself terminates at
-/// its own title so a direct self-link cannot recurse.
-// AIDEV-NOTE: only direct self-parent links are guarded; a longer parent
-// cycle in journal data (A -> B -> A) would recurse until stack overflow
-// because memo entries are inserted only after the recursive call returns.
-// Fixing this requires cycle detection along the walk (behavior change).
+/// Walks `parent_session_id` links to the family root title with memoization.
+/// Cyclic or self-referential lineage falls back to the current session title
+/// so corrupted journal data cannot recurse indefinitely.
 fn resolve_session_family_root<'a>(
     session_id: &str,
     sessions_by_id: &HashMap<&'a str, &'a journal::OrchestratorSessionRecord>,
     memo: &mut HashMap<String, String>,
+    visiting: &mut HashSet<String>,
 ) -> Option<String> {
     if let Some(existing) = memo.get(session_id) {
         return Some(existing.clone());
     }
     let session = sessions_by_id.get(session_id).copied()?;
+    if !visiting.insert(session_id.to_owned()) {
+        return None;
+    }
     let root = if let Some(parent_session_id) = session.parent_session_id.as_deref() {
         if parent_session_id == session.session_id {
             session.title.clone()
         } else {
-            resolve_session_family_root(parent_session_id, sessions_by_id, memo)
+            resolve_session_family_root(parent_session_id, sessions_by_id, memo, visiting)
                 .unwrap_or_else(|| normalized_title_family_root(session.title.as_str()))
         }
     } else {
         normalized_title_family_root(session.title.as_str())
     };
+    visiting.remove(session_id);
     memo.insert(session.session_id.clone(), root.clone());
     Some(root)
 }
@@ -1503,20 +1518,13 @@ async fn load_session_detail_context(
 /// catalog context, and optional detail data; all free-text fields are
 /// redacted and truncated here before they reach the console.
 async fn build_session_catalog_record(
-    state: &AppState,
+    _state: &AppState,
     context: &SessionCatalogContext,
     session: journal::OrchestratorSessionRecord,
     detail_context: Option<SessionDetailContext>,
 ) -> Result<SessionCatalogRecord, Response> {
-    let run_snapshot = if let Some(last_run_id) = session.last_run_id.as_ref() {
-        state
-            .runtime
-            .orchestrator_run_status_snapshot(last_run_id.clone())
-            .await
-            .map_err(runtime_status_response)?
-    } else {
-        None
-    };
+    let run_snapshot =
+        session.last_run_id.as_ref().and_then(|run_id| context.run_snapshot_by_id.get(run_id));
     let pending_approvals =
         context.pending_approvals_by_session.get(session.session_id.as_str()).copied().unwrap_or(0);
     let workspace =
@@ -1567,10 +1575,8 @@ async fn build_session_catalog_record(
         .and_then(|value| normalize_catalog_text(value, SESSION_CATALOG_PREVIEW_LEN));
     // Prefer the live run snapshot over the state persisted on the session
     // record, which can lag behind an in-flight run.
-    let last_run_state = run_snapshot
-        .as_ref()
-        .map(|run| run.state.clone())
-        .or_else(|| session.last_run_state.clone());
+    let last_run_state =
+        run_snapshot.map(|run| run.state.clone()).or_else(|| session.last_run_state.clone());
     let recap = SessionCatalogRecapRecord {
         touched_files: workspace.touched_files.clone(),
         active_context_files: active_project_context_paths.clone(),
@@ -1608,10 +1614,10 @@ async fn build_session_catalog_record(
         updated_at_unix_ms: session.updated_at_unix_ms,
         last_run_id: session.last_run_id.clone(),
         last_run_state,
-        last_run_started_at_unix_ms: run_snapshot.as_ref().map(|run| run.started_at_unix_ms),
-        prompt_tokens: run_snapshot.as_ref().map(|run| run.prompt_tokens).unwrap_or(0),
-        completion_tokens: run_snapshot.as_ref().map(|run| run.completion_tokens).unwrap_or(0),
-        total_tokens: run_snapshot.as_ref().map(|run| run.total_tokens).unwrap_or(0),
+        last_run_started_at_unix_ms: run_snapshot.map(|run| run.started_at_unix_ms),
+        prompt_tokens: run_snapshot.map(|run| run.prompt_tokens).unwrap_or(0),
+        completion_tokens: run_snapshot.map(|run| run.completion_tokens).unwrap_or(0),
+        total_tokens: run_snapshot.map(|run| run.total_tokens).unwrap_or(0),
         archived: session.archived_at_unix_ms.is_some(),
         archived_at_unix_ms: session.archived_at_unix_ms,
         pending_approvals,
@@ -2029,6 +2035,24 @@ mod tests {
         }
     }
 
+    fn test_lineage_session(
+        session_id: &str,
+        title: &str,
+        parent_session_id: Option<&str>,
+        created_at_unix_ms: i64,
+    ) -> journal::OrchestratorSessionRecord {
+        let mut session = test_session(None);
+        session.session_id = session_id.to_owned();
+        session.session_key = session_id.to_owned();
+        session.title = title.to_owned();
+        session.created_at_unix_ms = created_at_unix_ms;
+        session.updated_at_unix_ms = created_at_unix_ms;
+        session.parent_session_id = parent_session_id.map(str::to_owned);
+        session.branch_state =
+            if parent_session_id.is_some() { "branched" } else { "root" }.to_owned();
+        session
+    }
+
     fn test_context(
         agent: AgentRecord,
         effective_model_profile: Option<&str>,
@@ -2038,6 +2062,7 @@ mod tests {
             workspace_by_session: HashMap::new(),
             project_context_by_session: HashMap::new(),
             family_by_session: HashMap::new(),
+            run_snapshot_by_id: HashMap::new(),
             bindings_by_session: HashMap::new(),
             agents_by_id: HashMap::from([(agent.agent_id.clone(), agent)]),
             default_agent_id: Some("agent-default".to_owned()),
@@ -2067,5 +2092,23 @@ mod tests {
         assert_eq!(controls.model.source, "session_override");
         assert_eq!(controls.model.inherited_value.as_deref(), Some("deterministic"));
         assert!(controls.model.override_active);
+    }
+
+    #[test]
+    fn session_family_metadata_handles_parent_cycles() {
+        let sessions = vec![
+            test_lineage_session("session-a", "Alpha", Some("session-b"), 1),
+            test_lineage_session("session-b", "Beta", Some("session-a"), 2),
+        ];
+
+        let families = build_session_family_metadata(&sessions);
+        let alpha = families.get("session-a").expect("alpha family should resolve");
+        let beta = families.get("session-b").expect("beta family should resolve");
+
+        assert_eq!(alpha.root_title, beta.root_title);
+        assert_eq!(alpha.family_size, 2);
+        assert_eq!(beta.family_size, 2);
+        assert_eq!(alpha.relatives.len(), 1);
+        assert_eq!(beta.relatives.len(), 1);
     }
 }
