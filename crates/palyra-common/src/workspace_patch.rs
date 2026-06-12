@@ -1838,7 +1838,7 @@ fn find_subsequence(haystack: &[String], needle: &[String], from: usize) -> Opti
     if haystack.len() < needle.len() {
         return None;
     }
-    // AIDEV-NOTE: when the needle no longer fits in the remaining lines, `start` clamps
+    // NOTE: when the needle no longer fits in the remaining lines, `start` clamps
     // *below* `from`, so a later hunk may match before the search cursor (overlapping an
     // earlier hunk's output near end-of-file). This widened acceptance is part of the
     // pinned parse/apply contract exercised by the fuzz target; do not tighten it without

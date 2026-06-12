@@ -67,7 +67,7 @@ pub(super) fn validate_pairing_method(method: &PairingMethod) -> IdentityResult<
 /// The `palyra-pairing-v1` prefix domain-separates this signature from any other use
 /// of the device key.
 ///
-/// AIDEV-NOTE: variable-length fields are concatenated without length framing. This is
+/// NOTE: variable-length fields are concatenated without length framing. This is
 /// unambiguous today only because session_id is a fixed-length ULID, device_id is a
 /// fixed 26-char canonical ID, and client_kind is a closed label set. Any new or
 /// loosened field needs length prefixes — which means a protocol version bump.

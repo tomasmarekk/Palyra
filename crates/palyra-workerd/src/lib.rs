@@ -1057,7 +1057,7 @@ fn assign_worker_record(
         lease_id: Ulid::new().to_string(),
         worker_id: worker_id.to_owned(),
         run_id: request.run_id.clone(),
-        // AIDEV-NOTE: `ttl_ms as i64` can wrap only when `policy.max_ttl_ms` is
+        // NOTE: `ttl_ms as i64` can wrap only when `policy.max_ttl_ms` is
         // configured above i64::MAX milliseconds; the wrapped (negative) ttl yields an
         // already-expired lease that fails closed at the next reap, rather than
         // granting unbounded time, so the cast is kept as-is.

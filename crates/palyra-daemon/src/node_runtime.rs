@@ -750,7 +750,7 @@ impl NodeRuntimeState {
     /// Records a node-reported result and wakes the waiting caller; returns
     /// `false` when no waiter remained (caller timed out or disconnected).
     ///
-    /// AIDEV-NOTE: a late result deliberately overwrites a `TimedOut` record
+    /// NOTE: a late result deliberately overwrites a `TimedOut` record
     /// with the real Succeeded/Failed outcome for audit accuracy, even though
     /// the original caller already received DEADLINE_EXCEEDED. Do not "fix"
     /// this by guarding on state without revisiting node_rpc timeout handling.

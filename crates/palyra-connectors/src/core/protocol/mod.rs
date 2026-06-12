@@ -5,7 +5,7 @@
 //! field names and enum casing are part of persisted/transport contracts and
 //! must not change. Size limits live in the private `validation` module.
 
-// AIDEV-NOTE: `validation::ProtocolError` is returned by the public
+// NOTE: `validation::ProtocolError` is returned by the public
 // `validate()` methods below but is not re-exported, so downstream crates can
 // only Display it, not match on it. Re-exporting it is a deliberate
 // curated-surface decision; do not widen the surface as a drive-by change.

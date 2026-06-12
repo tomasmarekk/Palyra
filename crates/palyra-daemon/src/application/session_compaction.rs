@@ -1155,7 +1155,7 @@ fn open_action_item_signature(item: &str) -> String {
         .join(" ")
 }
 
-// AIDEV-NOTE: this line-oriented state machine and its helpers below encode
+// NOTE: this line-oriented state machine and its helpers below encode
 // many hard-won heuristics (section openers vs. negative mentions, blank-line
 // section exits, checkbox/ordinal/bold-name stripping, status-line and
 // orphaned-fragment rejection). Each rule is pinned by an

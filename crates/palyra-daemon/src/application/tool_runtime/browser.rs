@@ -259,7 +259,7 @@ fn browser_url_uses_file_scheme(raw_url: &str) -> bool {
 /// # Errors
 /// Returns a tool-facing message when `profile_id` is present but not a
 /// string or not a canonical id.
-// AIDEV-NOTE: the second tuple element ("ignored profile id") is always None
+// NOTE: the second tuple element ("ignored profile id") is always None
 // today -- non-canonical ids hard-fail instead of being ignored (pinned by
 // browser_session_profile_id_rejects_friendly_labels). It survives only so
 // the session.create output keeps its `ignored_profile_id` and

@@ -402,7 +402,7 @@ impl Drop for WindowsBackgroundJob {
 
 // Registry of live background jobs keyed by the direct child pid, consulted by the portable
 // stop/status builtins so they can act on the whole tree instead of just the launcher pid.
-// AIDEV-NOTE: keep the job registered through termination verification. If stop removes the
+// NOTE: keep the job registered through termination verification. If stop removes the
 // handle before the post-stop status probe, a dead wrapper pid can make detached descendants look
 // cleaned up even while the job still had process-tree evidence.
 #[cfg(windows)]

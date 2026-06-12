@@ -319,7 +319,7 @@ pub fn evaluate_with_context(
 ) -> Result<PolicyEvaluation, PolicyEngineError> {
     let normalized_action = request.action.to_ascii_lowercase();
     let normalized_request_context = normalize_request_context(request_context);
-    // AIDEV-NOTE: a context-supplied tool_name/skill_id overrides the name parsed from the
+    // NOTE: a context-supplied tool_name/skill_id overrides the name parsed from the
     // resource, and the allowlist and sensitivity gates trust it. Callers are trusted daemon
     // code and must keep the context consistent with the resource they execute.
     let requested_tool = normalized_request_context

@@ -1156,7 +1156,7 @@ impl AuthProfileRegistry {
 
     /// Records a success against an already-resolved profile (post-refresh path).
     ///
-    /// AIDEV-NOTE: this intentionally diverges from `record_profile_success_with_clock`:
+    /// NOTE: this intentionally diverges from `record_profile_success_with_clock`:
     /// here eligibility is recomputed (Expired/MissingCredential/Eligible) and the doctor
     /// hint refreshed, while the public method preserves prior eligibility for
     /// Missing/Expired tokens. Consolidating the two would change observable runtime

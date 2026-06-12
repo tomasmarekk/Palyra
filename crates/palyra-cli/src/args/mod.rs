@@ -2,7 +2,7 @@
 //! options, and the top-level `Command` tree that fans out into the per-family
 //! modules in this directory.
 //!
-//! AIDEV-NOTE: clap derive renders `///` doc comments on parser structs, fields,
+//! NOTE: clap derive renders `///` doc comments on parser structs, fields,
 //! and variants as help text, and help output is pinned byte-for-byte by the
 //! `help_snapshots` and `cli_parity` test suites. Never add, change, or remove
 //! `///` docs on clap items anywhere under `args/`; use plain `//` comments
