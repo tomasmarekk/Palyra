@@ -2417,27 +2417,37 @@ fn categorize_child_failure(
     Some(DelegationMergeFailureCategory::Unknown)
 }
 
-/// Loads the child run tape with bounded pagination (16 pages x 128 events).
-// AIDEV-NOTE: runs with more than 2048 tape events are silently truncated
-// here, so merge results can miss late model output or tool evidence on very
-// chatty children. Raising the bound or streaming the tape would change merge
-// behavior, so it is only flagged.
+/// Loads the full child run tape using fixed-size pages.
 async fn load_run_tape(
     runtime: &Arc<GatewayRuntimeState>,
     run_id: &str,
 ) -> Result<Vec<crate::journal::OrchestratorTapeRecord>, Status> {
     let mut after_seq = None;
     let mut events = Vec::new();
-    for _ in 0..16 {
+    loop {
         let page =
             runtime.orchestrator_tape_snapshot(run_id.to_owned(), after_seq, Some(128)).await?;
-        after_seq = page.next_after_seq;
+        let next_after_seq = advance_tape_cursor(after_seq, page.next_after_seq, run_id)?;
         events.extend(page.events);
-        if after_seq.is_none() {
+        let Some(next_after_seq) = next_after_seq else {
             break;
-        }
+        };
+        after_seq = Some(next_after_seq);
     }
     Ok(events)
+}
+
+fn advance_tape_cursor(
+    previous_after_seq: Option<i64>,
+    next_after_seq: Option<i64>,
+    run_id: &str,
+) -> Result<Option<i64>, Status> {
+    if next_after_seq.is_some() && next_after_seq == previous_after_seq {
+        return Err(Status::internal(format!(
+            "orchestrator tape pagination cursor did not advance for run {run_id}"
+        )));
+    }
+    Ok(next_after_seq)
 }
 
 fn build_merge_summary(
@@ -3119,16 +3129,17 @@ fn is_terminal_run_state(state: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_artifact_references, build_background_task_child_run_attach_update,
-        build_background_task_running_update, build_optional_delegated_run_context,
-        build_parameter_delta_bytes, categorize_child_failure, child_merge_lifecycle_details,
-        delegated_child_timeout_message, evaluate_delegation_scheduler_limits,
-        inject_background_metadata, parent_merge_event_payload,
-        parent_tape_accepts_background_event, replace_background_task_snapshot,
-        running_delegated_children_for_parent, running_task_should_wait_for_in_flight_work,
-        should_emit_child_stream_progress, task_has_in_flight_work_without_target,
-        ChildLifecycleTapeBudget, ChildLifecycleTapeDecision, ChildStreamProgress,
-        DelegationSchedulerDecision, MergeDeliveryPayloadContext,
+        advance_tape_cursor, append_artifact_references,
+        build_background_task_child_run_attach_update, build_background_task_running_update,
+        build_optional_delegated_run_context, build_parameter_delta_bytes,
+        categorize_child_failure, child_merge_lifecycle_details, delegated_child_timeout_message,
+        evaluate_delegation_scheduler_limits, inject_background_metadata,
+        parent_merge_event_payload, parent_tape_accepts_background_event,
+        replace_background_task_snapshot, running_delegated_children_for_parent,
+        running_task_should_wait_for_in_flight_work, should_emit_child_stream_progress,
+        task_has_in_flight_work_without_target, ChildLifecycleTapeBudget,
+        ChildLifecycleTapeDecision, ChildStreamProgress, DelegationSchedulerDecision,
+        MergeDeliveryPayloadContext,
     };
     use crate::{
         application::delivery_arbitration::{DeliveryDecision, DeliveryDecisionAction},
@@ -3144,7 +3155,7 @@ mod tests {
     };
     use palyra_common::runtime_contracts::AuxiliaryTaskState;
     use serde_json::{json, Value};
-    use tonic::metadata::MetadataMap;
+    use tonic::{metadata::MetadataMap, Code};
 
     fn unauthenticated_gateway_auth() -> GatewayAuthConfig {
         GatewayAuthConfig {
@@ -3153,6 +3164,22 @@ mod tests {
             connector_token: None,
             bound_principal: None,
         }
+    }
+
+    #[test]
+    fn tape_cursor_rejects_non_advancing_pagination() {
+        assert_eq!(
+            advance_tape_cursor(None, Some(128), "run-1").expect("cursor should advance"),
+            Some(128)
+        );
+        assert_eq!(
+            advance_tape_cursor(Some(128), None, "run-1").expect("missing cursor ends pagination"),
+            None
+        );
+        let error = advance_tape_cursor(Some(128), Some(128), "run-1")
+            .expect_err("repeated cursor must fail instead of looping");
+        assert_eq!(error.code(), Code::Internal);
+        assert!(error.message().contains("did not advance"));
     }
 
     #[test]
