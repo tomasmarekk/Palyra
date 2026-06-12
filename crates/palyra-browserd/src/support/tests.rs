@@ -883,6 +883,24 @@ async fn navigate_with_guards_blocks_http_redirect_to_local_file() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn navigate_with_guards_does_not_replay_cookie_header_to_cross_host_redirect() {
+    let (target_url, target_handle) = spawn_cookie_capture_http_server("localhost");
+    let (url, redirect_handle) = spawn_redirect_http_server(target_url.as_str());
+
+    let outcome =
+        navigate_with_guards(url.as_str(), 2_000, true, 3, true, 4_096, Some("session=abc123"))
+            .await;
+    redirect_handle.join().expect("redirect server should exit");
+    let target_request = target_handle.join().expect("target server should exit");
+
+    assert!(outcome.success, "redirected navigation should succeed: {}", outcome.error);
+    assert!(
+        !target_request.to_ascii_lowercase().contains("cookie:"),
+        "cross-host redirect target must not receive original cookie header: {target_request}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn navigate_with_guards_truncates_oversized_successful_response() {
     let (url, handle) = spawn_chunked_http_server(
         200,
@@ -6364,6 +6382,25 @@ fn spawn_redirect_http_server(location: &str) -> (String, thread::JoinHandle<()>
         stream.flush().expect("server should flush response");
     });
     (format!("http://{address}/"), handle)
+}
+
+fn spawn_cookie_capture_http_server(url_host: &str) -> (String, thread::JoinHandle<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+    let address = listener.local_addr().expect("listener local address should resolve");
+    let url = format!("http://{}:{}/", url_host, address.port());
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("listener should accept request");
+        let request = read_http_request(&mut stream);
+        let body = "<html><body>redirected</body></html>";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).expect("server should write response");
+        stream.flush().expect("server should flush response");
+        request
+    });
+    (url, handle)
 }
 
 fn write_chunked_test_bytes(stream: &mut TcpStream, bytes: &[u8], context: &str) -> bool {

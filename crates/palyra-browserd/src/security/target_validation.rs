@@ -551,6 +551,7 @@ pub(crate) async fn navigate_with_guards(
     let redirect_limit = max_redirects.clamp(1, 10);
     let mut redirects = 0_u32;
     let initial_scheme = current_url.scheme().to_owned();
+    let initial_cookie_host = current_url.host_str().map(str::to_ascii_lowercase);
     loop {
         if current_url.scheme() == "file" {
             return navigate_local_file_with_guards(
@@ -600,12 +601,11 @@ pub(crate) async fn navigate_with_guards(
 
         let request_started = Instant::now();
         let mut request_builder = client.get(current_url.clone());
-        // AIDEV-NOTE: cookie_header is built once for the original URL and
-        // re-attached on every redirect hop, including cross-origin ones, so
-        // cookies scoped to the initial host can leak to redirect targets.
-        // Fixing this changes observable request behavior - coordinate before
-        // changing.
-        if let Some(value) = cookie_header.filter(|value| !value.trim().is_empty()) {
+        if let Some(value) = cookie_header_for_redirect_hop(
+            &current_url,
+            initial_cookie_host.as_deref(),
+            cookie_header,
+        ) {
             request_builder = request_builder.header(COOKIE_HEADER, value);
         }
         let mut response = match request_builder.send().await {
@@ -826,6 +826,18 @@ pub(crate) async fn navigate_with_guards(
             cookie_updates,
         };
     }
+}
+
+fn cookie_header_for_redirect_hop<'a>(
+    current_url: &Url,
+    initial_cookie_host: Option<&str>,
+    cookie_header: Option<&'a str>,
+) -> Option<&'a str> {
+    let value = cookie_header.filter(|value| !value.trim().is_empty())?;
+    let current_host = current_url.host_str()?;
+    initial_cookie_host
+        .filter(|initial_host| current_host.eq_ignore_ascii_case(initial_host))
+        .map(|_| value)
 }
 
 /// Serves a `file://` navigation after the local-file gate passes, enforcing
