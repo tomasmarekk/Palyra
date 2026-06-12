@@ -954,13 +954,10 @@ fn load_profiles_document(path: Option<&Path>) -> Result<CliProfilesDocument> {
 /// Returns an error when no state root can be resolved or the configured
 /// profiles path is invalid.
 pub(crate) fn cli_profiles_registry_path() -> Result<PathBuf> {
-    // AIDEV-NOTE: `unwrap_or` evaluates its argument eagerly, so the default
-    // state-root resolution runs (and its `?` can fail, e.g. when neither
-    // LOCALAPPDATA nor HOME is set) even when a root context already provides
-    // the answer. Fixing this changes behavior; use a match if addressed.
-    let base_state_root = current_root_context()
-        .map(|context| context.cli_state_root.to_path_buf())
-        .unwrap_or(resolve_cli_state_root(None)?);
+    let base_state_root = match current_root_context() {
+        Some(context) => context.cli_state_root.to_path_buf(),
+        None => resolve_cli_state_root(None)?,
+    };
     resolve_profiles_storage_path(base_state_root.as_path())
 }
 
@@ -2238,6 +2235,30 @@ daemon_url = "http://127.0.0.1:8200"
         drop(guard);
 
         let registry_path = cli_profiles_registry_path()?;
+        assert_eq!(registry_path, state_root.join(CLI_PROFILES_RELATIVE_PATH));
+        Ok(())
+    }
+
+    #[test]
+    fn cli_profiles_registry_path_ignores_state_env_when_root_context_is_installed() -> Result<()> {
+        let _guard = super::test_env_lock_for_tests().lock().expect("env lock");
+        clear_env();
+        let temp = tempdir()?;
+        let state_root = temp.path().join("portable-state");
+        let context = build_root_context(
+            RootOptions {
+                state_root: Some(state_root.display().to_string()),
+                ..RootOptions::default()
+            },
+            ExplicitConfigPathPolicy::RequireExisting,
+        )?;
+        let mut guard = context_cell().lock().expect("context lock");
+        *guard = Some(context);
+        drop(guard);
+        env::set_var("PALYRA_STATE_ROOT", "../outside");
+
+        let registry_path = cli_profiles_registry_path()?;
+
         assert_eq!(registry_path, state_root.join(CLI_PROFILES_RELATIVE_PATH));
         Ok(())
     }

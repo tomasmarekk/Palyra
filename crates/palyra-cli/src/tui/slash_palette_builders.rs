@@ -758,16 +758,35 @@ pub(super) fn build_static_suggestions(
 }
 
 /// Compresses long entity ids to a head-and-tail form for palette rows.
-// AIDEV-NOTE: the head/tail slices are byte-indexed, so a value containing a
-// multi-byte UTF-8 character within the first 6 or last 4 bytes panics on a
-// char boundary. Safe for the ASCII ULIDs passed today; switch to
-// char_indices-based slicing (like shorten_palette_id) before feeding it
-// user-controlled text.
 pub(super) fn shorten_entity_id(value: &str) -> String {
     let trimmed = value.trim();
-    if trimmed.len() <= 12 {
+    let char_count = trimmed.chars().count();
+    if char_count <= 12 {
         trimmed.to_owned()
     } else {
-        format!("{}…{}", &trimmed[..6], &trimmed[trimmed.len().saturating_sub(4)..])
+        let head = trimmed.chars().take(6).collect::<String>();
+        let tail = trimmed.chars().skip(char_count.saturating_sub(4)).collect::<String>();
+        format!("{head}…{tail}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shorten_entity_id;
+
+    #[test]
+    fn shorten_entity_id_keeps_short_values_unchanged_after_trim() {
+        assert_eq!(shorten_entity_id("  01ARZ3NDEKTS  "), "01ARZ3NDEKTS");
+    }
+
+    #[test]
+    fn shorten_entity_id_preserves_ascii_head_and_tail_shape() {
+        assert_eq!(shorten_entity_id("0123456789abcdef"), "012345…cdef");
+    }
+
+    #[test]
+    fn shorten_entity_id_handles_multibyte_char_boundaries() {
+        let shortened = shorten_entity_id("abcde\u{00e9}ghijklmnop");
+        assert_eq!(shortened, format!("abcde{}…mnop", '\u{00e9}'));
     }
 }

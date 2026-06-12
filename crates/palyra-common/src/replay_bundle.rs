@@ -590,12 +590,15 @@ pub fn validate_replay_bundle(bundle: &ReplayBundle) -> ReplayValidationReport {
     }
 
     let mut checked_values = 0_usize;
-    // AIDEV-NOTE: `unwrap_or(Value::Null)` makes the secret scan fail-open if
-    // serialization ever fails. Unreachable for today's plain-JSON payloads, but if
-    // non-JSON-safe types are added to ReplayBundle this should surface a validation
-    // issue instead of silently scanning nothing.
-    let value = serde_json::to_value(bundle).unwrap_or(Value::Null);
-    scan_for_unredacted_secrets(&value, "$", None, &mut checked_values, &mut issues);
+    match serde_json::to_value(bundle) {
+        Ok(value) => {
+            scan_for_unredacted_secrets(&value, "$", None, &mut checked_values, &mut issues)
+        }
+        Err(error) => issues.push(ReplayValidationIssue {
+            path: "$".to_owned(),
+            reason: format!("replay bundle cannot be serialized for secret scan: {error}"),
+        }),
+    }
 
     ReplayValidationReport { valid: issues.is_empty(), checked_values, issues }
 }

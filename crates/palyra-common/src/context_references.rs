@@ -268,22 +268,20 @@ fn parse_quoted_value(input: &str, quote_start: usize) -> Result<(String, usize)
                 if cursor >= bytes.len() {
                     return Err(cursor);
                 }
-                // AIDEV-NOTE: escaping a multi-byte UTF-8 char (a backslash followed by
-                // any non-ASCII char) pushes only its lead byte as a Latin-1 char and
-                // advances the cursor mid-character; the
-                // next iteration then slices `input[cursor..]` off a char boundary and
-                // panics. Fixing requires changing observable behavior for such inputs,
-                // so it is left as-is and only documented here.
-                value.push(match bytes[cursor] {
-                    b'n' => '\n',
-                    b'r' => '\r',
-                    b't' => '\t',
-                    b'\\' => '\\',
-                    b'"' => '"',
-                    b'\'' => '\'',
-                    other => other as char,
+                let escaped = input[cursor..]
+                    .chars()
+                    .next()
+                    .expect("quoted escape cursor should remain on a valid char");
+                value.push(match escaped {
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    '\\' => '\\',
+                    '"' => '"',
+                    '\'' => '\'',
+                    other => other,
                 });
-                cursor += 1;
+                cursor += escaped.len_utf8();
             }
             current if current == quote => {
                 cursor += 1;
@@ -404,5 +402,14 @@ mod tests {
         assert_eq!(parsed.references.len(), 1);
         assert_eq!(parsed.references[0].kind, ContextReferenceKind::Diff);
         assert_eq!(parsed.clean_text, "mail me at ops@example.com about");
+    }
+
+    #[test]
+    fn parses_escaped_multibyte_chars_inside_quoted_targets() {
+        let parsed = parse_context_references("Inspect @file:\"caf\\\u{00e9}\" now.");
+        assert!(parsed.errors.is_empty(), "expected clean parse: {:?}", parsed.errors);
+        assert_eq!(parsed.references.len(), 1);
+        assert_eq!(parsed.references[0].target, Some(format!("caf{}", '\u{00e9}')));
+        assert_eq!(parsed.clean_text, "Inspect now.");
     }
 }
