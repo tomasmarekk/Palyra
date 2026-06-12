@@ -1104,7 +1104,13 @@ async fn latest_objective_run(
         .routines
         .find_run_metadata(run.run_id.as_str())
         .map_err(routine_registry_error_response)?;
-    Ok(Some(join_run_metadata(routine_id.as_str(), run, metadata.as_ref())))
+    Ok(Some(join_run_metadata(
+        routine_id.as_str(),
+        run,
+        metadata.as_ref(),
+        Some(&objective.automation.approval_policy),
+        Some(unix_ms_now().map_err(internal_console_error)?),
+    )))
 }
 
 /// Maps objective state plus last-run status onto the console health badge.

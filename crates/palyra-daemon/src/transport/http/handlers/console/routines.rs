@@ -883,14 +883,20 @@ pub(crate) async fn console_routine_runs_handler(
         .list_cron_runs(Some(routine.job.job_id.clone()), query.after_run_id.clone(), Some(limit))
         .await
         .map_err(runtime_status_response)?;
+    let now_unix_ms = unix_ms_now().map_err(internal_console_error)?;
     let mut mapped_runs = Vec::with_capacity(runs.len());
     for run in &runs {
         let metadata = state
             .routines
             .find_run_metadata(run.run_id.as_str())
             .map_err(routine_registry_error_response)?;
-        let mut mapped =
-            join_run_metadata(routine.metadata.routine_id.as_str(), run, metadata.as_ref());
+        let mut mapped = join_run_metadata(
+            routine.metadata.routine_id.as_str(),
+            run,
+            metadata.as_ref(),
+            Some(&routine.metadata.approval_policy),
+            Some(now_unix_ms),
+        );
         enrich_routine_run_output_fields(&state, routine.job.owner_principal.as_str(), &mut mapped)
             .await?;
         mapped_runs.push(mapped);
@@ -1320,6 +1326,7 @@ async fn routine_views_for_principal(
             routine_view_from_parts(job, &metadata),
             metadata.routine_id.as_str(),
             job.job_id.as_str(),
+            &metadata.approval_policy,
         )
         .await?;
         routines.push(view);
@@ -1341,6 +1348,7 @@ async fn load_routine_view_for_owner(
         routine_view_from_parts(&parts.job, &parts.metadata),
         parts.metadata.routine_id.as_str(),
         parts.job.job_id.as_str(),
+        &parts.metadata.approval_policy,
     )
     .await
 }
@@ -1432,6 +1440,7 @@ async fn enrich_routine_view_with_latest_run(
     mut view: Value,
     routine_id: &str,
     job_id: &str,
+    approval_policy: &RoutineApprovalPolicy,
 ) -> Result<Value, Response> {
     let automation_enabled = routines_automation_feature_enabled(state);
     if let Some(object) = view.as_object_mut() {
@@ -1474,7 +1483,13 @@ async fn enrich_routine_view_with_latest_run(
         .routines
         .find_run_metadata(run.run_id.as_str())
         .map_err(routine_registry_error_response)?;
-    let latest_run = join_run_metadata(routine_id, run, metadata.as_ref());
+    let latest_run = join_run_metadata(
+        routine_id,
+        run,
+        metadata.as_ref(),
+        Some(approval_policy),
+        Some(unix_ms_now().map_err(internal_console_error)?),
+    );
     if let Some(object) = view.as_object_mut() {
         object.insert("last_run".to_owned(), latest_run.clone());
         object.insert(

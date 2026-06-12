@@ -1922,6 +1922,8 @@ pub fn join_run_metadata(
     routine_id: &str,
     run: &CronRunRecord,
     metadata: Option<&RoutineRunMetadataRecord>,
+    approval_policy: Option<&RoutineApprovalPolicy>,
+    now_unix_ms: Option<i64>,
 ) -> Value {
     let terminal = !run.status.is_active();
     let outcome_kind = effective_run_outcome_kind(run.status, metadata);
@@ -1949,16 +1951,13 @@ pub fn join_run_metadata(
             .and_then(|entry| entry.approval_note.as_deref())
             .is_some_and(approval_note_requires_operator_review),
     );
-    // AIDEV-NOTE: this join has neither the routine's approval policy nor a real clock, so the
-    // embedded lifecycle uses the default (approval-free) policy and the run's own updated_at as
-    // "now" -- it can therefore never report Pending/Denied approval or an Expired lease. Callers
-    // that need those signals must call routine_run_lifecycle_snapshot with real inputs.
+    let default_approval_policy = RoutineApprovalPolicy::default();
     let lifecycle = routine_run_lifecycle_snapshot(
         routine_id,
         run,
         metadata,
-        &RoutineApprovalPolicy::default(),
-        run.updated_at_unix_ms,
+        approval_policy.unwrap_or(&default_approval_policy),
+        now_unix_ms.unwrap_or(run.updated_at_unix_ms),
     );
     json!({
         "routine_id": routine_id,
@@ -3436,7 +3435,7 @@ mod tests {
             updated_at_unix_ms: now,
         };
 
-        let value = join_run_metadata("routine-active", &run, None);
+        let value = join_run_metadata("routine-active", &run, None, None, Some(now));
 
         assert_eq!(value.get("outcome_kind").and_then(Value::as_str), Some("pending"));
         assert_eq!(value.get("output_delivered").and_then(Value::as_bool), Some(false));
@@ -3451,12 +3450,39 @@ mod tests {
     }
 
     #[test]
+    fn join_run_metadata_uses_policy_and_clock_for_lifecycle() {
+        let now = 1_700_000_000_000_i64;
+        let run = sample_cron_run(CronRunStatus::Running, now - ROUTINE_RUN_LEASE_TTL_MS - 1);
+        let metadata = sample_run_metadata("run-1", "routine-1", run.updated_at_unix_ms);
+        let approval_policy = RoutineApprovalPolicy { mode: RoutineApprovalMode::BeforeFirstRun };
+
+        let value = join_run_metadata(
+            "routine-1",
+            &run,
+            Some(&metadata),
+            Some(&approval_policy),
+            Some(now),
+        );
+        let lifecycle = value.get("lifecycle").expect("lifecycle should be present");
+
+        assert_eq!(lifecycle.get("lease_state").and_then(Value::as_str), Some("expired"));
+        assert_eq!(lifecycle.get("approval_gate").and_then(Value::as_str), Some("pending"));
+        assert_eq!(lifecycle.get("delivery_ready").and_then(Value::as_bool), Some(false));
+    }
+
+    #[test]
     fn join_run_metadata_reconciles_stale_pending_override_for_terminal_run() {
         let run = sample_cron_run(CronRunStatus::Succeeded, 3_000);
         let mut metadata = sample_run_metadata("run-1", "routine-1", 2_000);
         metadata.outcome_override = Some(RoutineRunOutcomeKind::Pending);
 
-        let value = join_run_metadata("routine-1", &run, Some(&metadata));
+        let value = join_run_metadata(
+            "routine-1",
+            &run,
+            Some(&metadata),
+            Some(&RoutineApprovalPolicy::default()),
+            Some(3_000),
+        );
 
         assert_eq!(value.get("outcome_kind").and_then(Value::as_str), Some("success_with_output"));
         assert_eq!(value.get("outcome_provisional").and_then(Value::as_bool), Some(false));

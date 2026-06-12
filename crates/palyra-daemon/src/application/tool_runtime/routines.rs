@@ -402,6 +402,7 @@ async fn list_routine_runs(
         )
         .await
         .map_err(sanitize_status_message)?;
+    let now_unix_ms = current_unix_ms();
     let mapped_runs = runs
         .iter()
         .map(|run| {
@@ -411,6 +412,8 @@ async fn list_routine_runs(
                 routine.metadata.routine_id.as_str(),
                 run,
                 metadata.as_ref(),
+                Some(&routine.metadata.approval_policy),
+                Some(now_unix_ms),
             ))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -493,6 +496,7 @@ async fn observe_routine_wait_state(
     )
     .await
     .map_err(sanitize_status_message)?;
+    let now_unix_ms = current_unix_ms();
     let mapped_runs = runs
         .iter()
         .map(|run| {
@@ -502,6 +506,8 @@ async fn observe_routine_wait_state(
                 routine.metadata.routine_id.as_str(),
                 run,
                 metadata.as_ref(),
+                Some(&routine.metadata.approval_policy),
+                Some(now_unix_ms),
             ))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1475,6 +1481,7 @@ async fn routine_views_for_principal(
             routine_view_from_parts(job, &metadata),
             metadata.routine_id.as_str(),
             job.job_id.as_str(),
+            &metadata.approval_policy,
         )
         .await?;
         routines.push(view);
@@ -1565,6 +1572,7 @@ async fn load_routine_view_for_owner(
         routine_view_from_parts(&parts.job, &parts.metadata),
         parts.metadata.routine_id.as_str(),
         parts.job.job_id.as_str(),
+        &parts.metadata.approval_policy,
     )
     .await
 }
@@ -1727,6 +1735,7 @@ async fn enrich_routine_view_with_latest_run(
     mut view: Value,
     routine_id: &str,
     job_id: &str,
+    approval_policy: &RoutineApprovalPolicy,
 ) -> Result<Value, String> {
     let (runs, _) = list_latest_cron_runs_for_job(runtime_state, job_id, 10)
         .await
@@ -1735,7 +1744,13 @@ async fn enrich_routine_view_with_latest_run(
         return Ok(view);
     };
     let metadata = registry.find_run_metadata(run.run_id.as_str()).map_err(map_registry_error)?;
-    let latest_run = join_run_metadata(routine_id, run, metadata.as_ref());
+    let latest_run = join_run_metadata(
+        routine_id,
+        run,
+        metadata.as_ref(),
+        Some(approval_policy),
+        Some(current_unix_ms()),
+    );
     if let Some(object) = view.as_object_mut() {
         object.insert("last_run".to_owned(), latest_run.clone());
         object.insert(
