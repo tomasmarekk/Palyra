@@ -5,7 +5,10 @@ use std::{
     collections::VecDeque,
     convert::Infallible,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -17,9 +20,9 @@ use super::{
     validate_discord_url_target_with_resolver, ConnectorNetGuard, DiscordAdapterConfig,
     DiscordConnectorAdapter, DiscordCredential, DiscordCredentialResolver, DiscordGatewayEnvelope,
     DiscordGatewayInflater, DiscordGatewayMonitorContext, DiscordGatewayResumeState,
-    DiscordRuntimeState, DiscordTransport, DiscordTransportResponse, OpenFence,
-    DISCORD_GATEWAY_MAX_COMPRESSED_FRAME_BYTES, DISCORD_GATEWAY_MAX_DECOMPRESSED_FRAME_BYTES,
-    DISCORD_GATEWAY_ZLIB_SYNC_FLUSH_SUFFIX,
+    DiscordInboundMonitorHandle, DiscordRuntimeState, DiscordTransport, DiscordTransportResponse,
+    OpenFence, DISCORD_GATEWAY_MAX_COMPRESSED_FRAME_BYTES,
+    DISCORD_GATEWAY_MAX_DECOMPRESSED_FRAME_BYTES, DISCORD_GATEWAY_ZLIB_SYNC_FLUSH_SUFFIX,
 };
 use crate::{
     protocol::{
@@ -34,8 +37,8 @@ use flate2::{Compress, Compression, FlushCompress, Status};
 use futures::stream;
 use reqwest::Url;
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::{interval, timeout, MissedTickBehavior};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 #[derive(Debug, Default)]
@@ -425,6 +428,44 @@ fn inbound_monitor_count(adapter: &DiscordConnectorAdapter) -> usize {
     adapter.inbound_monitors.lock().expect("inbound monitor registry should not be poisoned").len()
 }
 
+struct MonitorAbortFlag(Arc<AtomicBool>);
+
+impl Drop for MonitorAbortFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+fn pending_monitor_handle(
+    aborted: Arc<AtomicBool>,
+) -> (DiscordInboundMonitorHandle, oneshot::Receiver<()>) {
+    let (_sender, receiver) = mpsc::channel(1);
+    let (started_sender, started_receiver) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _abort_flag = MonitorAbortFlag(aborted);
+        let _ = started_sender.send(());
+        std::future::pending::<()>().await;
+    });
+    (DiscordInboundMonitorHandle { receiver, task }, started_receiver)
+}
+
+async fn wait_for_monitor_start(started: oneshot::Receiver<()>) {
+    timeout(Duration::from_secs(1), started)
+        .await
+        .expect("monitor task should start promptly")
+        .expect("monitor task should signal startup before exiting");
+}
+
+async fn wait_for_monitor_abort(aborted: Arc<AtomicBool>) {
+    timeout(Duration::from_secs(1), async {
+        while !aborted.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("monitor task should observe abort promptly");
+}
+
 #[tokio::test]
 async fn stop_runtime_tears_down_inbound_monitor_for_reonboarding() {
     let adapter = adapter_with_fake_transport(Arc::new(FakeTransport::default()));
@@ -442,6 +483,35 @@ async fn stop_runtime_tears_down_inbound_monitor_for_reonboarding() {
     assert_eq!(inbound_monitor_count(&adapter), 1);
 
     adapter.stop_runtime("discord:default").expect("fresh monitor stop should succeed");
+}
+
+#[tokio::test]
+async fn duplicate_inbound_monitor_registration_aborts_redundant_task() {
+    let adapter = adapter_with_fake_transport(Arc::new(FakeTransport::default()));
+    let original_aborted = Arc::new(AtomicBool::new(false));
+    let redundant_aborted = Arc::new(AtomicBool::new(false));
+    let (original_handle, original_started) = pending_monitor_handle(Arc::clone(&original_aborted));
+    wait_for_monitor_start(original_started).await;
+
+    adapter
+        .register_inbound_monitor_handle("discord:default".to_owned(), original_handle)
+        .expect("initial monitor handle should register");
+    let (redundant_handle, redundant_started) =
+        pending_monitor_handle(Arc::clone(&redundant_aborted));
+    wait_for_monitor_start(redundant_started).await;
+    adapter
+        .register_inbound_monitor_handle("discord:default".to_owned(), redundant_handle)
+        .expect("duplicate monitor handle should be rejected cleanly");
+
+    assert_eq!(inbound_monitor_count(&adapter), 1);
+    wait_for_monitor_abort(redundant_aborted).await;
+    assert!(
+        !original_aborted.load(Ordering::SeqCst),
+        "duplicate registration must not abort the registered monitor"
+    );
+
+    adapter.stop_runtime("discord:default").expect("registered monitor should stop cleanly");
+    wait_for_monitor_abort(original_aborted).await;
 }
 
 fn ok_identity_response() -> DiscordTransportResponse {

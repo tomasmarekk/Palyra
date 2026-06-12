@@ -131,12 +131,8 @@ pub(super) struct DiscordInboundMonitorHandle {
 impl DiscordConnectorAdapter {
     /// Starts the gateway monitor task for `instance` if one is not already registered.
     ///
-    /// AIDEV-NOTE: the existence check and the insert below take the registry lock
-    /// separately (the spawn between them must not hold a sync lock). Two concurrent
-    /// callers for the same connector could therefore both spawn; the second insert would
-    /// drop the first handle, leaking a monitor task that can no longer be aborted. Fixing
-    /// it requires re-checking under the second lock and aborting the redundant task —
-    /// a control-flow change deliberately not made during the comment/quality pass.
+    /// The monitor is spawned outside the registry lock, then registration re-checks under
+    /// the lock and aborts the redundant task if another caller won the race.
     pub(super) async fn ensure_inbound_monitor(
         &self,
         instance: &ConnectorInstanceRecord,
@@ -167,12 +163,28 @@ impl DiscordConnectorAdapter {
             run_discord_gateway_monitor(context).await;
         });
 
+        self.register_inbound_monitor_handle(
+            connector_id,
+            DiscordInboundMonitorHandle { receiver, task },
+        )
+    }
+
+    /// Registers a spawned monitor handle, aborting it when a monitor is already registered.
+    pub(super) fn register_inbound_monitor_handle(
+        &self,
+        connector_id: String,
+        handle: DiscordInboundMonitorHandle,
+    ) -> Result<(), ConnectorAdapterError> {
         let mut monitors = self.inbound_monitors.lock().map_err(|_| {
             ConnectorAdapterError::Backend(
                 "discord inbound monitor registry lock poisoned".to_owned(),
             )
         })?;
-        monitors.insert(connector_id, DiscordInboundMonitorHandle { receiver, task });
+        if monitors.contains_key(connector_id.as_str()) {
+            handle.task.abort();
+            return Ok(());
+        }
+        monitors.insert(connector_id, handle);
         Ok(())
     }
 
