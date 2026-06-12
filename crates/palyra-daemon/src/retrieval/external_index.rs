@@ -20,6 +20,7 @@ const DEFAULT_EXTERNAL_INDEX_FRESHNESS_SLO_MS: u64 = 60_000;
 const DEFAULT_EXTERNAL_QUERY_LATENCY_SLO_MS: u64 = 250;
 const DEFAULT_EXTERNAL_DEGRADED_FALLBACK_RATE_BPS: u32 = 500;
 const DEFAULT_EXTERNAL_RECONCILIATION_SUCCESS_RATE_BPS: u32 = 9_500;
+const MAX_EXTERNAL_QUERY_LATENCY_SAMPLES: usize = 512;
 
 /// Measured-vs-target SLO posture for the external index, plus the preview gate verdict.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -102,10 +103,6 @@ pub(crate) struct ExternalRetrievalReconciliationOutcome {
     pub(crate) success: bool,
 }
 
-// AIDEV-NOTE: search_attempts, degraded_fallbacks, and query_latency_samples_ms have
-// no writers yet -- only reconcile() updates its counters. Until search paths record
-// attempts, the fallback-rate and latency SLOs always come from the zero-total
-// defaults in rate_bps/percentile_95 (state-derived rate, 0 ms p95).
 #[derive(Debug, Clone)]
 struct ExternalRetrievalRuntimeState {
     snapshot: ExternalRetrievalIndexSnapshot,
@@ -160,6 +157,25 @@ impl ExternalRetrievalRuntime {
     #[must_use]
     pub(crate) fn snapshot(&self) -> ExternalRetrievalIndexSnapshot {
         self.state.read().unwrap_or_else(|error| error.into_inner()).snapshot.clone()
+    }
+
+    /// Records one search routed through the external-derived preview path and
+    /// recomputes SLO posture from the updated counters.
+    pub(crate) fn record_search_attempt(&self, latency_ms: u64, degraded_fallback: bool) {
+        let mut guard = self.state.write().unwrap_or_else(|error| error.into_inner());
+        guard.search_attempts = guard.search_attempts.saturating_add(1);
+        if degraded_fallback {
+            guard.degraded_fallbacks = guard.degraded_fallbacks.saturating_add(1);
+        }
+        guard.query_latency_samples_ms.push(latency_ms);
+        if guard.query_latency_samples_ms.len() > MAX_EXTERNAL_QUERY_LATENCY_SAMPLES {
+            let excess = guard
+                .query_latency_samples_ms
+                .len()
+                .saturating_sub(MAX_EXTERNAL_QUERY_LATENCY_SAMPLES);
+            guard.query_latency_samples_ms.drain(0..excess);
+        }
+        recompute_external_slos(&mut guard);
     }
 
     /// Advances the index checkpoint by up to `batch_size` journal-derived records per
@@ -359,6 +375,10 @@ impl ExternalRetrievalIndex for ExternalRetrievalRuntime {
         // Not recursion: inherent methods take precedence over trait methods, so this
         // dispatches to ExternalRetrievalRuntime::snapshot above.
         self.snapshot()
+    }
+
+    fn record_search_attempt(&self, latency_ms: u64, degraded_fallback: bool) {
+        self.record_search_attempt(latency_ms, degraded_fallback);
     }
 }
 
@@ -673,5 +693,27 @@ mod tests {
         assert_eq!(snapshot_after.drift_count, 0);
         assert_eq!(snapshot_after.pending_reconciliation_count, 0);
         assert_eq!(snapshot_after.scale_slos.preview_gate_state, "preview_ready");
+    }
+
+    #[test]
+    fn external_runtime_records_search_attempt_slos() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let store = JournalStore::open(JournalConfig {
+            db_path: temp.path().join("journal.sqlite3"),
+            hash_chain_enabled: false,
+            max_payload_bytes: 256 * 1024,
+            max_events: 10_000,
+        })
+        .expect("journal store should open");
+        let external_index = ExternalRetrievalRuntime::default();
+        external_index.run_indexer(&store, 64, 1, 2_000).expect("checkpoint should complete");
+
+        external_index.record_search_attempt(120, false);
+        external_index.record_search_attempt(400, true);
+
+        let scale_slos = external_index.snapshot().scale_slos;
+        assert_eq!(scale_slos.query_latency_p95_ms, 120);
+        assert_eq!(scale_slos.degraded_fallback_rate_bps, 5_000);
+        assert!(!scale_slos.degraded_fallback_ok);
     }
 }

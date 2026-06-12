@@ -301,16 +301,11 @@ impl ProviderLeaseManager {
         let mut background_active = 0_u16;
         let mut foreground_waiters = 0_u16;
         let mut background_waiters = 0_u16;
-        // AIDEV-NOTE: actives are summed across provider buckets but waiters are
-        // aggregated with max(), so the snapshot under-reports total waiters when
-        // they queue on different providers at the same time (e.g. 2 on provider A
-        // and 3 on B reads as 3). Tests pin single-provider values; switching to a
-        // sum is a behavior change for the snapshot consumers.
         for bucket in guard.providers.values() {
             foreground_active = foreground_active.saturating_add(bucket.active_foreground);
             background_active = background_active.saturating_add(bucket.active_background);
-            foreground_waiters = foreground_waiters.max(bucket.waiting_foreground);
-            background_waiters = background_waiters.max(bucket.waiting_background);
+            foreground_waiters = foreground_waiters.saturating_add(bucket.waiting_foreground);
+            background_waiters = background_waiters.saturating_add(bucket.waiting_background);
         }
         ProviderLeaseManagerSnapshot {
             provider_limit: self.inner.provider_limit,
@@ -1201,6 +1196,78 @@ mod tests {
             Some("foreground_waiters_present"),
             "cancelled foreground acquires must not leave stale fairness pressure"
         );
+    }
+
+    #[tokio::test]
+    async fn lease_manager_snapshot_sums_waiters_across_providers() {
+        let manager = ProviderLeaseManager::new(1, 1);
+        let held_a = manager
+            .acquire(ProviderLeaseAcquireRequest {
+                provider_id: "openai",
+                credential_id: "cred-a",
+                priority: LeasePriority::Foreground,
+                task_label: "primary_interactive",
+                max_wait_ms: 0,
+                session_id: Some("session-a"),
+                run_id: Some("run-a"),
+            })
+            .await
+            .expect("first provider lease should acquire");
+        let held_b = manager
+            .acquire(ProviderLeaseAcquireRequest {
+                provider_id: "minimax",
+                credential_id: "cred-b",
+                priority: LeasePriority::Foreground,
+                task_label: "primary_interactive",
+                max_wait_ms: 0,
+                session_id: Some("session-b"),
+                run_id: Some("run-b"),
+            })
+            .await
+            .expect("second provider lease should acquire");
+
+        let manager_a = manager.clone();
+        let waiter_a = tokio::spawn(async move {
+            manager_a
+                .acquire(ProviderLeaseAcquireRequest {
+                    provider_id: "openai",
+                    credential_id: "cred-a",
+                    priority: LeasePriority::Foreground,
+                    task_label: "primary_interactive",
+                    max_wait_ms: 30_000,
+                    session_id: Some("session-a2"),
+                    run_id: Some("run-a2"),
+                })
+                .await
+        });
+        let manager_b = manager.clone();
+        let waiter_b = tokio::spawn(async move {
+            manager_b
+                .acquire(ProviderLeaseAcquireRequest {
+                    provider_id: "minimax",
+                    credential_id: "cred-b",
+                    priority: LeasePriority::Foreground,
+                    task_label: "primary_interactive",
+                    max_wait_ms: 30_000,
+                    session_id: Some("session-b2"),
+                    run_id: Some("run-b2"),
+                })
+                .await
+        });
+
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            manager.snapshot().foreground_waiters,
+            2,
+            "snapshot should report total foreground waiters across provider buckets"
+        );
+
+        waiter_a.abort();
+        waiter_b.abort();
+        let _ = waiter_a.await;
+        let _ = waiter_b.await;
+        drop(held_a);
+        drop(held_b);
     }
 
     #[tokio::test]

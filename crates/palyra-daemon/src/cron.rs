@@ -86,8 +86,7 @@ const DEFAULT_CRON_CHANNEL: &str = "system:cron";
 // no reachable tick (e.g. "0 0 30 2 *") terminate instead of looping forever.
 const MAX_CRON_LOOKAHEAD_MINUTES: i64 = 60 * 24 * 370;
 const MAX_RETRY_ATTEMPTS: u32 = 16;
-// Caps the per-job configured base backoff, not the exponential product
-// computed in `run_job_with_retries`.
+// Caps both the per-job configured base backoff and the exponential product.
 const MAX_RETRY_BACKOFF_MS: u64 = 60_000;
 const SKILLS_LAYOUT_VERSION: u32 = 1;
 const SKILLS_INDEX_FILE_NAME: &str = "installed-index.json";
@@ -2796,17 +2795,17 @@ async fn run_job_with_retries(
             }
         }
 
-        // Exponential backoff: base * 2^(attempt - 1); attempt <= 16 keeps the
-        // shift in range.
-        // AIDEV-NOTE: MAX_RETRY_BACKOFF_MS caps only the configured base, not
-        // this product, so late attempts can wait far longer than 60s (base
-        // 60s at attempt 16 sleeps ~22 days). Capping the product would change
-        // retry timing, so it is only flagged here.
-        let backoff_multiplier = 1_u64 << u64::from(attempt.saturating_sub(1));
-        let delay = base_backoff_ms.saturating_mul(backoff_multiplier);
+        let delay = scheduler_retry_backoff_delay_ms(base_backoff_ms, attempt);
         tokio::time::sleep(Duration::from_millis(delay)).await;
     }
     Ok(())
+}
+
+fn scheduler_retry_backoff_delay_ms(base_backoff_ms: u64, attempt: u32) -> u64 {
+    let capped_base = base_backoff_ms.min(MAX_RETRY_BACKOFF_MS);
+    let backoff_multiplier =
+        1_u64 << u64::from(attempt.saturating_sub(1).min(MAX_RETRY_ATTEMPTS.saturating_sub(1)));
+    capped_base.saturating_mul(backoff_multiplier).min(MAX_RETRY_BACKOFF_MS)
 }
 
 /// Classified failure of one scheduler attempt.
@@ -3762,11 +3761,12 @@ mod tests {
         periodic_reaudit_targets, reserved_cron_run_slot_count, routine_approval_subject_id,
         routine_parameter_delta_json, routines_automation_enabled,
         scheduled_routine_requires_first_run_approval, scheduled_routine_run_metadata_upsert,
-        scheduler_attempt_failure, should_disable_exhausted_scheduled_one_shot,
+        scheduler_attempt_failure, scheduler_retry_backoff_delay_ms,
+        should_disable_exhausted_scheduled_one_shot,
         should_pause_recurring_cron_after_policy_denied, should_repair_stale_cron_run,
         visible_cron_job_enabled, ConcurrencyDecision, CronMatcher, CronMisfireRecoveryAction,
         CronTimezoneMode, InstalledSkillRecord, InstalledSkillsIndex, SchedulerHealthInput,
-        TriggerJobOptions, CRON_MAX_RUNS_EXHAUSTED_ERROR_KIND,
+        TriggerJobOptions, CRON_MAX_RUNS_EXHAUSTED_ERROR_KIND, MAX_RETRY_BACKOFF_MS,
         OBJECTIVE_BUDGET_EXHAUSTED_ERROR_KIND, ROUTINE_APPROVAL_REQUIRED_ERROR_KIND,
         SCHEDULER_STALE_RUN_AFTER_MS, SKILLS_INDEX_FILE_NAME, SKILLS_LAYOUT_VERSION,
     };
@@ -4021,6 +4021,12 @@ mod tests {
         assert_eq!(failure.error_kind, "provider_malformed_response");
         assert!(failure.retryable);
         assert!(failure.error_message_redacted.contains("malformed_response"));
+    }
+
+    #[test]
+    fn scheduler_retry_backoff_caps_exponential_product() {
+        assert_eq!(scheduler_retry_backoff_delay_ms(60_000, 16), MAX_RETRY_BACKOFF_MS);
+        assert_eq!(scheduler_retry_backoff_delay_ms(1_000, 4), 8_000);
     }
 
     fn sample_routine_metadata(routine_id: &str) -> RoutineMetadataRecord {

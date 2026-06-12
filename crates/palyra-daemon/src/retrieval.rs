@@ -8,7 +8,7 @@
 //! under `fixtures/retrieval/`, so any change to weights, biases, or rounding is
 //! regression-gated.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -629,6 +629,9 @@ impl RetrievalBackend for JournalRetrievalBackend {
 pub(crate) trait ExternalRetrievalIndex: Send + Sync {
     /// Reports current index freshness, drift, and SLO posture.
     fn snapshot(&self) -> ExternalRetrievalIndexSnapshot;
+
+    /// Records one search routed through the external-derived path.
+    fn record_search_attempt(&self, _latency_ms: u64, _degraded_fallback: bool) {}
 }
 
 /// Placeholder index used when no external provider is configured; always degraded.
@@ -700,11 +703,11 @@ impl ExternalDerivedRetrievalBackend {
 
     // Both reasons mean "journal served the candidates"; they only distinguish whether
     // the external index was down or merely not authoritative. Tests pin both strings.
-    fn journal_rehydration_fallback_reason(&self) -> &'static str {
+    fn external_search_metrics(&self) -> (&'static str, bool) {
         if self.external_index.snapshot().state == RetrievalBackendState::Degraded {
-            "external_index_unavailable"
+            ("external_index_unavailable", true)
         } else {
-            "external_index_candidate_rehydration_required"
+            ("external_index_candidate_rehydration_required", false)
         }
     }
 }
@@ -788,7 +791,14 @@ impl RetrievalBackend for ExternalDerivedRetrievalBackend {
         if config.backend.kind == RetrievalBackendKind::JournalSqliteFts {
             return self.journal_fallback.search_memory_candidate_outcome(store, request, config);
         }
-        self.fallback_memory_outcome(store, request, self.journal_rehydration_fallback_reason())
+        let (reason, degraded_fallback) = self.external_search_metrics();
+        let started = Instant::now();
+        let outcome = self.fallback_memory_outcome(store, request, reason);
+        self.external_index.record_search_attempt(
+            started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+            degraded_fallback,
+        );
+        outcome
     }
 
     fn search_workspace_candidate_outcome(
@@ -802,7 +812,14 @@ impl RetrievalBackend for ExternalDerivedRetrievalBackend {
                 .journal_fallback
                 .search_workspace_candidate_outcome(store, request, config);
         }
-        self.fallback_workspace_outcome(store, request, self.journal_rehydration_fallback_reason())
+        let (reason, degraded_fallback) = self.external_search_metrics();
+        let started = Instant::now();
+        let outcome = self.fallback_workspace_outcome(store, request, reason);
+        self.external_index.record_search_attempt(
+            started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+            degraded_fallback,
+        );
+        outcome
     }
 }
 
@@ -1589,7 +1606,7 @@ fn normalize_embedding_dimensions(mut vector: Vec<f32>, expected_dims: usize) ->
 mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
-        sync::Arc,
+        sync::{Arc, Mutex},
     };
 
     use serde::{Deserialize, Serialize};
@@ -1957,6 +1974,47 @@ mod tests {
         }
     }
 
+    struct CountingExternalIndex {
+        state: RetrievalBackendState,
+        attempts: Mutex<Vec<(u64, bool)>>,
+    }
+
+    impl CountingExternalIndex {
+        fn new(state: RetrievalBackendState) -> Self {
+            Self { state, attempts: Mutex::new(Vec::new()) }
+        }
+
+        fn attempts(&self) -> Vec<(u64, bool)> {
+            self.attempts.lock().expect("attempts lock should not be poisoned").clone()
+        }
+    }
+
+    impl super::ExternalRetrievalIndex for CountingExternalIndex {
+        fn snapshot(&self) -> ExternalRetrievalIndexSnapshot {
+            ExternalRetrievalIndexSnapshot {
+                provider: "counting-preview".to_owned(),
+                state: self.state,
+                reason: "test external index metrics source".to_owned(),
+                indexed_memory_items: 1,
+                indexed_workspace_chunks: 0,
+                last_indexed_at_unix_ms: Some(1_700_000_000_000),
+                journal_watermark_unix_ms: Some(1_700_000_000_000),
+                freshness_lag_ms: Some(0),
+                drift_count: 0,
+                pending_reconciliation_count: 0,
+                scale_slos: ExternalRetrievalScaleSloSnapshot::default(),
+                last_error: None,
+            }
+        }
+
+        fn record_search_attempt(&self, latency_ms: u64, degraded_fallback: bool) {
+            self.attempts
+                .lock()
+                .expect("attempts lock should not be poisoned")
+                .push((latency_ms, degraded_fallback));
+        }
+    }
+
     #[test]
     fn external_preview_backend_keeps_journal_source_of_truth_when_external_ready() {
         let temp = tempfile::tempdir().expect("tempdir should be created");
@@ -2020,6 +2078,60 @@ mod tests {
         assert_eq!(
             external.diagnostics.degraded_reason.as_deref(),
             Some("external_index_candidate_rehydration_required")
+        );
+    }
+
+    #[test]
+    fn external_preview_backend_records_search_attempt_metrics() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let store = JournalStore::open(JournalConfig {
+            db_path: temp.path().join("journal.sqlite3"),
+            hash_chain_enabled: false,
+            max_payload_bytes: 256 * 1024,
+            max_events: 10_000,
+        })
+        .expect("journal store should open");
+        store
+            .create_memory_item(&MemoryItemCreateRequest {
+                memory_id: "01ARZ3NDEKTSV4RRFFQ69G5M55".to_owned(),
+                principal: "user:ops".to_owned(),
+                channel: Some("cli".to_owned()),
+                session_id: None,
+                source: MemorySource::Manual,
+                content_text: "external preview metrics attempt".to_owned(),
+                tags: Vec::new(),
+                confidence: Some(0.9),
+                ttl_unix_ms: None,
+            })
+            .expect("memory item should be indexed in journal");
+        let request = MemorySearchRequest {
+            principal: "user:ops".to_owned(),
+            channel: Some("cli".to_owned()),
+            session_id: None,
+            query: "preview metrics".to_owned(),
+            top_k: 4,
+            min_score: 0.0,
+            tags: Vec::new(),
+            sources: Vec::new(),
+        };
+        let external_index = Arc::new(CountingExternalIndex::new(RetrievalBackendState::Ready));
+        let external_backend = ExternalDerivedRetrievalBackend::new(external_index.clone());
+        let external_config = RetrievalRuntimeConfig {
+            backend: super::RetrievalBackendConfig {
+                kind: RetrievalBackendKind::ExternalDerivedPreview,
+            },
+            ..RetrievalRuntimeConfig::default()
+        };
+
+        external_backend
+            .search_memory_candidate_outcome(&store, &request, &external_config)
+            .expect("external preview should rehydrate through journal candidates");
+
+        let attempts = external_index.attempts();
+        assert_eq!(attempts.len(), 1);
+        assert!(
+            !attempts[0].1,
+            "ready external preview should record a rehydration attempt, not a degraded fallback"
         );
     }
 
