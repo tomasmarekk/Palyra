@@ -41,7 +41,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 use tokio_stream::StreamExt;
-use tonic::{Request, Status};
+use tonic::{Code, Request, Status};
 use tracing::warn;
 use ulid::Ulid;
 
@@ -1819,6 +1819,60 @@ fn decide_concurrency_policy(
     }
 }
 
+fn is_cron_active_claim_conflict(error: &Status) -> bool {
+    error.code() == Code::FailedPrecondition
+        && error.message().starts_with("cron job already has active run:")
+}
+
+async fn handle_atomic_concurrency_claim_conflict(
+    state: Arc<GatewayRuntimeState>,
+    job: &CronJobRecord,
+    manual_trigger: bool,
+) -> Result<DispatchOutcome, Status> {
+    match decide_concurrency_policy(job.concurrency_policy, job.queued_run, manual_trigger) {
+        ConcurrencyDecision::SkipForbid => {
+            register_terminal_and_disable_cron_if_max_runs_exhausted(
+                state,
+                job,
+                CronRunStatus::Skipped,
+                "concurrency_forbid",
+                "concurrency policy forbids overlapping runs",
+            )
+            .await
+        }
+        ConcurrencyDecision::QueueNew => {
+            state.set_cron_job_queue_state(job.job_id.clone(), true).await?;
+            Ok(DispatchOutcome {
+                run_id: None,
+                status: CronRunStatus::Accepted,
+                message: "run queued due to active execution".to_owned(),
+                session_key: None,
+                session_label: None,
+            })
+        }
+        ConcurrencyDecision::QueueAlreadyPresent => Ok(DispatchOutcome {
+            run_id: None,
+            status: CronRunStatus::Accepted,
+            message: "run remains queued until active execution completes".to_owned(),
+            session_key: None,
+            session_label: None,
+        }),
+        ConcurrencyDecision::SkipQueueFull => {
+            register_terminal_and_disable_cron_if_max_runs_exhausted(
+                state,
+                job,
+                CronRunStatus::Skipped,
+                "concurrency_queue_full",
+                "queue(1) already has one pending run",
+            )
+            .await
+        }
+        ConcurrencyDecision::Replace => Err(Status::failed_precondition(
+            "cron replace run lost an active-run claim unexpectedly",
+        )),
+    }
+}
+
 async fn disable_objective_if_budget_exhausted(
     state: Arc<GatewayRuntimeState>,
     job: &CronJobRecord,
@@ -2500,10 +2554,6 @@ async fn dispatch_job(
         }
     }
 
-    // AIDEV-NOTE: the concurrency gate is check-then-act: between this lookup
-    // and start_cron_run below, another dispatcher (manual trigger racing a
-    // scheduler tick) can pass the same check, so Forbid/QueueOne can briefly
-    // overlap. Closing the race needs an atomic claim in the journal layer.
     let active_run = state.active_cron_run_for_job(job.job_id.clone()).await?;
     if let Some(active) = active_run {
         match decide_concurrency_policy(job.concurrency_policy, job.queued_run, manual_trigger) {
@@ -2580,18 +2630,27 @@ async fn dispatch_job(
     };
     let effective_preview =
         build_effective_cron_execution_request(state.as_ref(), &job, run_id.as_str(), &options)?;
-    state
-        .start_cron_run(CronRunStartRequest {
-            run_id: run_id.clone(),
-            job_id: job.job_id.clone(),
-            attempt: 1,
-            session_id: None,
-            orchestrator_run_id: None,
-            status: CronRunStatus::Accepted,
-            error_kind: None,
-            error_message_redacted: None,
-        })
-        .await?;
+    let start_request = CronRunStartRequest {
+        run_id: run_id.clone(),
+        job_id: job.job_id.clone(),
+        attempt: 1,
+        session_id: None,
+        orchestrator_run_id: None,
+        status: CronRunStatus::Accepted,
+        error_kind: None,
+        error_message_redacted: None,
+    };
+    if let Err(error) = state.start_cron_run(start_request).await {
+        if is_cron_active_claim_conflict(&error) {
+            return handle_atomic_concurrency_claim_conflict(
+                Arc::clone(&state),
+                &job,
+                manual_trigger,
+            )
+            .await;
+        }
+        return Err(error);
+    }
 
     let dispatch_run_id = run_id.clone();
     tokio::spawn(async move {

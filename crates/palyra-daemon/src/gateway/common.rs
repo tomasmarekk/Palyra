@@ -119,6 +119,11 @@ pub(crate) fn map_cron_store_error(operation: &str, error: JournalError) -> Stat
         JournalError::CronJobHasActiveRuns { job_id } => {
             Status::failed_precondition(format!("cron job has an active run: {job_id}"))
         }
+        JournalError::CronRunAlreadyActive { job_id, active_run_id, requested_run_id } => {
+            Status::failed_precondition(format!(
+                "cron job already has active run: job_id={job_id} active_run_id={active_run_id} requested_run_id={requested_run_id}"
+            ))
+        }
         JournalError::CronRunNotFound { run_id } => {
             Status::not_found(format!("cron run not found: {run_id}"))
         }

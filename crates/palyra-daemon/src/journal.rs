@@ -3592,6 +3592,8 @@ pub enum JournalError {
     DuplicateCronJobId { job_id: String },
     #[error("cron run already exists: {run_id}")]
     DuplicateCronRunId { run_id: String },
+    #[error("cron job {job_id} already has active run {active_run_id}; cannot start run {requested_run_id}")]
+    CronRunAlreadyActive { job_id: String, active_run_id: String, requested_run_id: String },
     #[error("memory item already exists: {memory_id}")]
     DuplicateMemoryId { memory_id: String },
     #[error("recall artifact already exists: {artifact_id}")]
@@ -13265,12 +13267,72 @@ impl JournalStore {
     /// job's last-run time.
     ///
     /// # Errors
-    /// Returns [`JournalError::DuplicateCronRunId`] or
+    /// Returns [`JournalError::DuplicateCronRunId`], [`JournalError::CronRunAlreadyActive`], or
     /// [`JournalError::CronJobNotFound`], or [`JournalError`] on storage failure.
     pub fn start_cron_run(&self, request: &CronRunStartRequest) -> Result<(), JournalError> {
         let now = current_unix_ms()?;
         let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let transaction = guard.transaction()?;
+        let duplicate_run_exists = transaction
+            .query_row(
+                "SELECT 1 FROM cron_runs WHERE run_ulid = ?1",
+                params![request.run_id],
+                |_row| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if duplicate_run_exists {
+            return Err(JournalError::DuplicateCronRunId { run_id: request.run_id.clone() });
+        }
+        if request.status.is_active() {
+            let concurrency_policy_raw = transaction
+                .query_row(
+                    "SELECT concurrency_policy FROM cron_jobs WHERE job_ulid = ?1",
+                    params![request.job_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .ok_or_else(|| JournalError::CronJobNotFound { job_id: request.job_id.clone() })?;
+            let concurrency_policy = CronConcurrencyPolicy::from_str(
+                concurrency_policy_raw.as_str(),
+            )
+            .ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("invalid cron concurrency_policy value: {concurrency_policy_raw}"),
+                    )),
+                )
+            })?;
+            if matches!(
+                concurrency_policy,
+                CronConcurrencyPolicy::Forbid | CronConcurrencyPolicy::QueueOne
+            ) {
+                let active_run_id = transaction
+                    .query_row(
+                        r#"
+                            SELECT run_ulid
+                            FROM cron_runs
+                            WHERE job_ulid = ?1
+                              AND status IN ('accepted', 'running')
+                            ORDER BY started_at_unix_ms DESC, run_ulid DESC
+                            LIMIT 1
+                        "#,
+                        params![request.job_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                if let Some(active_run_id) = active_run_id {
+                    return Err(JournalError::CronRunAlreadyActive {
+                        job_id: request.job_id.clone(),
+                        active_run_id,
+                        requested_run_id: request.run_id.clone(),
+                    });
+                }
+            }
+        }
         match transaction.execute(
             r#"
                 INSERT INTO cron_runs (
@@ -24699,6 +24761,67 @@ mod tests {
             .expect("cron runs listing should succeed");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].run_id, "01ARZ3NDEKTSV4RRFFQ69G5FBD");
+    }
+
+    #[test]
+    fn cron_run_start_rejects_second_active_for_forbid_policy() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let job = store
+            .create_cron_job(&sample_cron_job_request("01ARZ3NDEKTSV4RRFFQ69G5FC0"))
+            .expect("cron job should be inserted");
+
+        store
+            .start_cron_run(&CronRunStartRequest {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FC1".to_owned(),
+                job_id: job.job_id.clone(),
+                attempt: 1,
+                session_id: None,
+                orchestrator_run_id: None,
+                status: CronRunStatus::Accepted,
+                error_kind: None,
+                error_message_redacted: None,
+            })
+            .expect("first active cron run should persist");
+
+        let error = store
+            .start_cron_run(&CronRunStartRequest {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FC2".to_owned(),
+                job_id: job.job_id.clone(),
+                attempt: 1,
+                session_id: None,
+                orchestrator_run_id: None,
+                status: CronRunStatus::Running,
+                error_kind: None,
+                error_message_redacted: None,
+            })
+            .expect_err("second active cron run should be rejected atomically");
+        assert!(matches!(
+            error,
+            JournalError::CronRunAlreadyActive {
+                job_id,
+                active_run_id,
+                requested_run_id
+            } if job_id == job.job_id
+                && active_run_id == "01ARZ3NDEKTSV4RRFFQ69G5FC1"
+                && requested_run_id == "01ARZ3NDEKTSV4RRFFQ69G5FC2"
+        ));
+
+        store
+            .start_cron_run(&CronRunStartRequest {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FC3".to_owned(),
+                job_id: job.job_id.clone(),
+                attempt: 1,
+                session_id: None,
+                orchestrator_run_id: None,
+                status: CronRunStatus::Skipped,
+                error_kind: Some("concurrency_forbid".to_owned()),
+                error_message_redacted: Some(
+                    "concurrency policy forbids overlapping runs".to_owned(),
+                ),
+            })
+            .expect("terminal concurrency audit row should persist while active");
     }
 
     #[test]
