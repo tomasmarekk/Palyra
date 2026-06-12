@@ -146,25 +146,31 @@ pub(crate) async fn execute_granted_tool_rpc_call(
     grants: &BTreeSet<String>,
     remaining_tool_budget: Option<SharedToolBudget>,
     request: ToolRpcRequest,
-) -> ToolRpcResponse {
+) -> (ToolRpcResponse, u32) {
     if let Err(error) = validate_tool_rpc_request(&request) {
-        return denied_response(request, error, false);
+        return (denied_response(request, error, false), 0);
     }
     if !grants.contains(&request.tool_name) {
-        return denied_response(
-            request,
-            "tool rpc call is not in the program grant set".to_owned(),
-            false,
+        return (
+            denied_response(
+                request,
+                "tool rpc call is not in the program grant set".to_owned(),
+                false,
+            ),
+            0,
         );
     }
 
     let input_bytes = match serde_json::to_vec(&request.arguments) {
         Ok(bytes) => bytes,
         Err(error) => {
-            return failed_response(
-                request,
-                format!("failed to serialize tool rpc arguments: {error}"),
-                None,
+            return (
+                failed_response(
+                    request,
+                    format!("failed to serialize tool rpc arguments: {error}"),
+                    None,
+                ),
+                0,
             );
         }
     };
@@ -194,7 +200,7 @@ pub(crate) async fn execute_granted_tool_rpc_call(
         input_bytes.as_slice(),
     )
     .await;
-    let ResolvedToolProposalDecision { decision, gate_report: _ } =
+    let (ResolvedToolProposalDecision { decision, gate_report: _ }, mut budget_debit) =
         with_tool_rpc_budget(remaining_tool_budget.as_ref(), 1, |remaining_budget| {
             resolve_tool_proposal_decision_for_context(
                 runtime_state,
@@ -218,12 +224,14 @@ pub(crate) async fn execute_granted_tool_rpc_call(
     // (proposal gate, tool metadata, or resolved decision) fails closed here
     // instead of suspending the program.
     if proposal_approval_required || child_tool_requires_approval || decision.approval_required {
+        budget_debit.refund();
         let denial_reason =
             nested_approval_denial_reason(request.tool_name.as_str(), decision.reason.as_str());
-        return denied_response(request, denial_reason, true);
+        return (denied_response(request, denial_reason, true), budget_debit.consumed());
     }
     if !decision.allowed {
-        return denied_response(request, decision.reason, false);
+        budget_debit.refund();
+        return (denied_response(request, decision.reason, false), budget_debit.consumed());
     }
 
     let timeout = request.timeout_ms.map(Duration::from_millis);
@@ -246,42 +254,48 @@ pub(crate) async fn execute_granted_tool_rpc_call(
         Some(timeout) => match tokio::time::timeout(timeout, execution).await {
             Ok(outcome) => outcome,
             Err(_) => {
-                return ToolRpcResponse {
-                    schema_version: TOOL_RPC_SCHEMA_VERSION,
-                    call_id: request.call_id,
-                    tool_name: request.tool_name,
-                    status: ToolRpcStatus::TimedOut,
-                    success: false,
-                    decision_reason: decision.reason,
-                    approval_required: decision.approval_required,
-                    output: json!({}),
-                    error: "tool rpc call timed out".to_owned(),
-                    redacted_preview: String::new(),
-                    attestation: None,
-                };
+                return (
+                    ToolRpcResponse {
+                        schema_version: TOOL_RPC_SCHEMA_VERSION,
+                        call_id: request.call_id,
+                        tool_name: request.tool_name,
+                        status: ToolRpcStatus::TimedOut,
+                        success: false,
+                        decision_reason: decision.reason,
+                        approval_required: decision.approval_required,
+                        output: json!({}),
+                        error: "tool rpc call timed out".to_owned(),
+                        redacted_preview: String::new(),
+                        attestation: None,
+                    },
+                    budget_debit.consumed(),
+                );
             }
         },
         None => execution.await,
     };
 
     let redacted_preview = summarize_rpc_output(outcome.output_json.as_slice(), 1024);
-    ToolRpcResponse {
-        schema_version: TOOL_RPC_SCHEMA_VERSION,
-        call_id: request.call_id,
-        tool_name: request.tool_name,
-        status: if outcome.success { ToolRpcStatus::Completed } else { ToolRpcStatus::Failed },
-        success: outcome.success,
-        decision_reason: decision.reason,
-        approval_required: decision.approval_required,
-        output: project_rpc_output(
-            outcome.output_json.as_slice(),
-            request.result_projection,
-            redacted_preview.as_str(),
-        ),
-        error: outcome.error,
-        redacted_preview,
-        attestation: Some(ToolRpcAttestation::from(&outcome.attestation)),
-    }
+    (
+        ToolRpcResponse {
+            schema_version: TOOL_RPC_SCHEMA_VERSION,
+            call_id: request.call_id,
+            tool_name: request.tool_name,
+            status: if outcome.success { ToolRpcStatus::Completed } else { ToolRpcStatus::Failed },
+            success: outcome.success,
+            decision_reason: decision.reason,
+            approval_required: decision.approval_required,
+            output: project_rpc_output(
+                outcome.output_json.as_slice(),
+                request.result_projection,
+                redacted_preview.as_str(),
+            ),
+            error: outcome.error,
+            redacted_preview,
+            attestation: Some(ToolRpcAttestation::from(&outcome.attestation)),
+        },
+        budget_debit.consumed(),
+    )
 }
 
 /// Runs `resolve` against the shared remaining tool budget, or against a
@@ -290,17 +304,49 @@ fn with_tool_rpc_budget<T>(
     remaining_tool_budget: Option<&SharedToolBudget>,
     fallback_budget: u32,
     resolve: impl FnOnce(&mut u32) -> T,
-) -> T {
+) -> (T, ToolRpcBudgetDebit) {
     if let Some(remaining_tool_budget) = remaining_tool_budget {
         // A poisoned lock only means another worker panicked mid-update; the
         // budget counter itself stays valid, so recover rather than panic.
         let mut guard =
             remaining_tool_budget.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        return resolve(&mut guard);
+        let before = *guard;
+        let result = resolve(&mut guard);
+        let consumed = before.saturating_sub(*guard);
+        return (
+            result,
+            ToolRpcBudgetDebit { consumed, shared_budget: Some(Arc::clone(remaining_tool_budget)) },
+        );
     }
 
     let mut local_budget = fallback_budget;
-    resolve(&mut local_budget)
+    let before = local_budget;
+    let result = resolve(&mut local_budget);
+    let consumed = before.saturating_sub(local_budget);
+    (result, ToolRpcBudgetDebit { consumed, shared_budget: None })
+}
+
+#[derive(Debug)]
+struct ToolRpcBudgetDebit {
+    consumed: u32,
+    shared_budget: Option<SharedToolBudget>,
+}
+
+impl ToolRpcBudgetDebit {
+    fn consumed(&self) -> u32 {
+        self.consumed
+    }
+
+    fn refund(&mut self) {
+        if self.consumed == 0 {
+            return;
+        }
+        if let Some(shared_budget) = &self.shared_budget {
+            let mut guard = shared_budget.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *guard = guard.saturating_add(self.consumed);
+        }
+        self.consumed = 0;
+    }
 }
 
 /// Returns the embedded Python SDK source for the stdio-JSONL tool RPC

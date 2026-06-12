@@ -669,7 +669,7 @@ async fn execute_program_step(
         timeout_ms: step.budget.timeout_ms,
         result_projection: Default::default(),
     };
-    let (rpc_response, attempts_used) = execute_tool_rpc_with_retries(
+    let (rpc_response, child_runs_consumed) = execute_tool_rpc_with_retries(
         runtime_state,
         context,
         proposal_id,
@@ -679,7 +679,7 @@ async fn execute_program_step(
         &step.retry_policy,
     )
     .await;
-    budget_delta.child_runs_used += usize::try_from(attempts_used).unwrap_or(usize::MAX);
+    budget_delta.child_runs_used += usize::try_from(child_runs_consumed).unwrap_or(usize::MAX);
     if rpc_response.approval_required {
         budget_delta.nested_approval_requests += 1;
     }
@@ -792,8 +792,9 @@ async fn execute_tool_rpc_with_retries(
 ) -> (ToolRpcResponse, u32) {
     let max_attempts = retry_policy.max_attempts.max(1);
     let mut attempt = 1;
+    let mut child_runs_consumed = 0_u32;
     loop {
-        let response = execute_granted_tool_rpc_call(
+        let (response, consumed) = execute_granted_tool_rpc_call(
             runtime_state,
             context,
             proposal_id,
@@ -802,11 +803,12 @@ async fn execute_tool_rpc_with_retries(
             request.clone(),
         )
         .await;
+        child_runs_consumed = child_runs_consumed.saturating_add(consumed);
         if !should_retry_tool_rpc_response(&response, retry_policy, attempt) {
-            return (response, attempt);
+            return (response, child_runs_consumed);
         }
         if attempt >= max_attempts {
-            return (response, attempt);
+            return (response, child_runs_consumed);
         }
         attempt += 1;
     }
