@@ -6,7 +6,7 @@
 //! websocket URL Discord hands back) are validated against the connector's net guard first.
 
 use std::{
-    net::{IpAddr, ToSocketAddrs},
+    net::{IpAddr, SocketAddr, ToSocketAddrs},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -17,9 +17,10 @@ use palyra_common::redaction::redact_auth_error;
 use reqwest::Url;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::{interval, MissedTickBehavior};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{client_async_tls, tungstenite::Message};
 use ulid::Ulid;
 
 use crate::{
@@ -123,11 +124,41 @@ async fn run_discord_gateway_session(
     }
     let gateway_url = parse_gateway_ws_url(gateway_probe.body.as_str())?;
     let gateway_url = normalize_gateway_ws_url(gateway_url)?;
-    validate_discord_url_target(&guard, &gateway_url)?;
+    let gateway_socket_addrs = validated_discord_socket_addrs(&guard, &gateway_url)?;
 
     let connect_result = tokio::time::timeout(
         Duration::from_millis(context.config.request_timeout_ms.max(1)),
-        connect_async(gateway_url.as_str()),
+        async {
+            if gateway_socket_addrs.is_empty() {
+                return Err(ConnectorAdapterError::Backend(
+                    "discord gateway connection has no validated socket addresses".to_owned(),
+                ));
+            }
+
+            let mut failures = Vec::new();
+            for socket_addr in gateway_socket_addrs.as_slice() {
+                let stream = match TcpStream::connect(socket_addr).await {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        failures.push(format!("{socket_addr}: tcp connect failed: {error}"));
+                        continue;
+                    }
+                };
+                match client_async_tls(gateway_url.as_str(), stream).await {
+                    Ok(connection) => return Ok(connection),
+                    Err(error) => {
+                        failures
+                            .push(format!("{socket_addr}: websocket handshake failed: {error}"));
+                    }
+                }
+            }
+
+            Err(ConnectorAdapterError::Backend(format!(
+                "discord gateway connection failed for {} validated address(es): {}",
+                gateway_socket_addrs.len(),
+                failures.join("; ")
+            )))
+        },
     )
     .await
     .map_err(|_| ConnectorAdapterError::Backend("discord gateway connection timed out".to_owned()))?
@@ -559,16 +590,30 @@ pub(super) fn validate_discord_url_target(
 }
 
 /// Resolver-injectable form of [`validate_discord_url_target`] for tests.
-///
-/// AIDEV-NOTE: validation resolves DNS separately from the actual connection (reqwest and
-/// tungstenite re-resolve when connecting), leaving a TOCTOU window a DNS-rebinding attacker
-/// could exploit. Closing it requires pinning the validated addresses into the connectors'
-/// transports — a behavioral change deferred to the egress hardening work.
 pub(super) fn validate_discord_url_target_with_resolver<F>(
     guard: &ConnectorNetGuard,
     url: &Url,
     resolver: F,
 ) -> Result<(), ConnectorAdapterError>
+where
+    F: Fn(&str, u16) -> Result<Vec<IpAddr>, ConnectorAdapterError>,
+{
+    validated_discord_socket_addrs_with_resolver(guard, url, resolver).map(|_| ())
+}
+
+fn validated_discord_socket_addrs(
+    guard: &ConnectorNetGuard,
+    url: &Url,
+) -> Result<Vec<SocketAddr>, ConnectorAdapterError> {
+    validated_discord_socket_addrs_with_resolver(guard, url, resolve_discord_target_addresses)
+}
+
+/// Resolves, egress-validates, and returns the exact socket addresses the gateway dialer uses.
+pub(super) fn validated_discord_socket_addrs_with_resolver<F>(
+    guard: &ConnectorNetGuard,
+    url: &Url,
+    resolver: F,
+) -> Result<Vec<SocketAddr>, ConnectorAdapterError>
 where
     F: Fn(&str, u16) -> Result<Vec<IpAddr>, ConnectorAdapterError>,
 {
@@ -592,9 +637,11 @@ where
             "discord egress denied: DNS resolution returned no addresses for '{host}:{port}'"
         )));
     }
-    guard
-        .validate_target(host, resolved.as_slice())
-        .map_err(|error| ConnectorAdapterError::Backend(format!("discord egress denied: {error}")))
+    guard.validate_target(host, resolved.as_slice()).map_err(|error| {
+        ConnectorAdapterError::Backend(format!("discord egress denied: {error}"))
+    })?;
+
+    Ok(resolved.into_iter().map(|ip| SocketAddr::new(ip, port)).collect())
 }
 
 fn resolve_discord_target_addresses(

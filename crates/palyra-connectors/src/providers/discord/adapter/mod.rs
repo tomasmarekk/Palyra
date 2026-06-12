@@ -33,8 +33,8 @@ use async_trait::async_trait;
 use gateway::{
     decode_gateway_binary_payload, deterministic_inbound_envelope_id, handle_gateway_envelope,
     normalize_gateway_ws_url, run_discord_gateway_transport_loop, validate_discord_url_target,
-    validate_discord_url_target_with_resolver, DiscordGatewayEnvelope,
-    DiscordGatewayMonitorContext,
+    validate_discord_url_target_with_resolver, validated_discord_socket_addrs_with_resolver,
+    DiscordGatewayEnvelope, DiscordGatewayMonitorContext,
 };
 use outbound::{
     build_discord_message_payload, chunk_discord_text, collect_discord_upload_files,

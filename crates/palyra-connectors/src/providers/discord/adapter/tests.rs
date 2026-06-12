@@ -17,12 +17,13 @@ use super::{
     chunk_discord_text, decode_gateway_binary_payload, deterministic_inbound_envelope_id,
     handle_gateway_envelope, normalize_discord_message_create, normalize_gateway_ws_url,
     parse_fence_line, run_discord_gateway_transport_loop,
-    validate_discord_url_target_with_resolver, ConnectorNetGuard, DiscordAdapterConfig,
-    DiscordConnectorAdapter, DiscordCredential, DiscordCredentialResolver, DiscordGatewayEnvelope,
-    DiscordGatewayInflater, DiscordGatewayMonitorContext, DiscordGatewayResumeState,
-    DiscordInboundMonitorHandle, DiscordRuntimeState, DiscordTransport, DiscordTransportResponse,
-    OpenFence, DISCORD_GATEWAY_MAX_COMPRESSED_FRAME_BYTES,
-    DISCORD_GATEWAY_MAX_DECOMPRESSED_FRAME_BYTES, DISCORD_GATEWAY_ZLIB_SYNC_FLUSH_SUFFIX,
+    validate_discord_url_target_with_resolver, validated_discord_socket_addrs_with_resolver,
+    ConnectorNetGuard, DiscordAdapterConfig, DiscordConnectorAdapter, DiscordCredential,
+    DiscordCredentialResolver, DiscordGatewayEnvelope, DiscordGatewayInflater,
+    DiscordGatewayMonitorContext, DiscordGatewayResumeState, DiscordInboundMonitorHandle,
+    DiscordRuntimeState, DiscordTransport, DiscordTransportResponse, OpenFence,
+    DISCORD_GATEWAY_MAX_COMPRESSED_FRAME_BYTES, DISCORD_GATEWAY_MAX_DECOMPRESSED_FRAME_BYTES,
+    DISCORD_GATEWAY_ZLIB_SYNC_FLUSH_SUFFIX,
 };
 use crate::{
     protocol::{
@@ -1657,6 +1658,28 @@ fn validate_url_target_reports_empty_dns_results_as_egress_deny() {
     assert!(
         message.contains("DNS resolution returned no addresses"),
         "error should mention empty DNS response: {message}"
+    );
+}
+
+#[test]
+fn validated_socket_addrs_are_sorted_deduped_and_ported() {
+    let guard = ConnectorNetGuard::new(&["*.discord.gg".to_owned()]).expect("guard should build");
+    let url = Url::parse("wss://gateway.discord.gg/?v=10").expect("fixture URL should parse");
+    let addresses = validated_discord_socket_addrs_with_resolver(&guard, &url, |_host, _port| {
+        Ok(vec![
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 35)),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34)),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34)),
+        ])
+    })
+    .expect("public Discord gateway addresses should pass validation");
+
+    assert_eq!(
+        addresses,
+        vec![
+            std::net::SocketAddr::from(([93, 184, 216, 34], 443)),
+            std::net::SocketAddr::from(([93, 184, 216, 35], 443)),
+        ]
     );
 }
 
