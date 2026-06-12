@@ -3637,11 +3637,12 @@ async fn handle_chat_key(app: &mut App, key: KeyEvent) -> Result<()> {
             app.composer.clear_selection();
             app.status_line = "Composer selection cleared".to_owned();
         }
-        // AIDEV-NOTE: this arm matches before the text-insertion arm below,
-        // so a literal '?' can never be typed into the composer (it always
-        // opens Help). Guarding it like the 'q' arm (e.g. only when the
-        // composer is empty) is a behavior change left to a follow-up.
-        KeyCode::Char('?') => app.mode = Mode::Help,
+        KeyCode::Char('?')
+            if is_text_input_modifier(key.modifiers)
+                && (!matches!(app.focus, Focus::Input) || app.composer.is_empty()) =>
+        {
+            app.mode = Mode::Help;
+        }
         KeyCode::F(2) => app.open_picker(PickerKind::Agent).await?,
         KeyCode::F(3) => app.open_picker(PickerKind::Session).await?,
         KeyCode::F(4) => app.open_picker(PickerKind::Model).await?,
@@ -4204,6 +4205,36 @@ mod tests {
 
         assert!(!app.should_exit(), "draft composer q should not request exit");
         assert_eq!(app.composer.text(), "draftq");
+    }
+
+    #[tokio::test]
+    async fn question_mark_opens_help_when_composer_is_empty() {
+        let mut app = test_app();
+
+        let question =
+            KeyEvent::new_with_kind(KeyCode::Char('?'), KeyModifiers::SHIFT, KeyEventKind::Press);
+
+        assert!(!handle_key(&mut app, question).await.expect("? should be handled by the TUI"));
+
+        assert!(matches!(app.mode, Mode::Help));
+        assert_eq!(app.composer.text(), "");
+    }
+
+    #[tokio::test]
+    async fn question_mark_stays_text_when_composer_has_draft() {
+        let mut app = test_app();
+        app.composer.set_text("draft".to_owned());
+        app.sync_composer_after_edit();
+
+        let question =
+            KeyEvent::new_with_kind(KeyCode::Char('?'), KeyModifiers::SHIFT, KeyEventKind::Press);
+
+        assert!(!handle_key(&mut app, question)
+            .await
+            .expect("? should be inserted into the composer"));
+
+        assert!(matches!(app.mode, Mode::Chat));
+        assert_eq!(app.composer.text(), "draft?");
     }
 
     #[tokio::test]
