@@ -80,6 +80,7 @@ pub(crate) enum OpenAiCredentialValidationError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OpenAiOAuthAttemptStateRecord {
     Pending { message: String },
+    Completing { message: String },
     Succeeded { profile_id: String, message: String, completed_at_unix_ms: i64 },
     Failed { message: String, completed_at_unix_ms: i64 },
 }

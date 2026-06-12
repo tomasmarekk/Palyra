@@ -560,8 +560,11 @@ pub(crate) async fn load_openai_oauth_callback_state(
             "OAuth attempt does not belong to OpenAI",
         )));
     }
-    if matches!(attempt.state, OpenAiOAuthAttemptStateRecord::Pending { .. })
-        && attempt.expires_at_unix_ms <= now
+    if matches!(
+        attempt.state,
+        OpenAiOAuthAttemptStateRecord::Pending { .. }
+            | OpenAiOAuthAttemptStateRecord::Completing { .. }
+    ) && attempt.expires_at_unix_ms <= now
     {
         attempt.state = OpenAiOAuthAttemptStateRecord::Failed {
             message: "OpenAI OAuth attempt expired before the callback completed.".to_owned(),
@@ -596,6 +599,8 @@ pub(crate) async fn complete_openai_oauth_callback(
             "failed to read system clock: {error}"
         )))
     })?;
+    let callback_error = query.error.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    let code = query.code.as_deref().map(str::trim).filter(|value| !value.is_empty());
     let attempt = {
         let mut attempts = lock_openai_oauth_attempts(state)?;
         cleanup_openai_oauth_attempts(&mut attempts, now);
@@ -613,15 +618,18 @@ pub(crate) async fn complete_openai_oauth_callback(
             let payload = callback_payload_json(attempt, Some(body.as_str()), None);
             return Ok(render_callback_page(title.as_str(), body.as_str(), Some(payload.as_str())));
         }
+        if callback_error.is_none() && code.is_none() {
+            return Err(validation_error_response("code", "required", "code is required"));
+        }
+        if callback_error.is_none() {
+            attempt.state = OpenAiOAuthAttemptStateRecord::Completing {
+                message: "OpenAI OAuth callback is being completed.".to_owned(),
+            };
+        }
         attempt.clone()
     };
-    // AIDEV-NOTE: the attempt is cloned and the map lock released across the
-    // token exchange below, so two concurrent callbacks for the same attempt
-    // can both pass the terminal-state check above and race the exchange.
-    // Authorization codes are single-use at the provider, so the loser fails
-    // there; serializing would require a per-attempt in-progress marker.
 
-    if let Some(error) = query.error.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(error) = callback_error {
         let description = query
             .error_description
             .as_deref()
@@ -644,12 +652,7 @@ pub(crate) async fn complete_openai_oauth_callback(
         );
     }
 
-    let code = query
-        .code
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| validation_error_response("code", "required", "code is required"))?;
+    let code = code.expect("callback code was validated before reserving the OAuth attempt");
     let token_result = match exchange_authorization_code(
         &attempt.token_endpoint,
         attempt.redirect_uri.as_str(),
@@ -3151,7 +3154,8 @@ fn lock_openai_oauth_attempts(
 /// before the entry disappears.
 fn cleanup_openai_oauth_attempts(attempts: &mut HashMap<String, OpenAiOAuthAttempt>, now: i64) {
     attempts.retain(|_, attempt| match &attempt.state {
-        OpenAiOAuthAttemptStateRecord::Pending { .. } => {
+        OpenAiOAuthAttemptStateRecord::Pending { .. }
+        | OpenAiOAuthAttemptStateRecord::Completing { .. } => {
             attempt.expires_at_unix_ms.saturating_add(OPENAI_OAUTH_ATTEMPT_TTL_MS) >= now
         }
         OpenAiOAuthAttemptStateRecord::Succeeded { completed_at_unix_ms, .. }
@@ -3166,7 +3170,8 @@ fn oauth_callback_state_envelope(
 ) -> control_plane::OpenAiOAuthCallbackStateEnvelope {
     let provider = attempt.provider.as_str().to_owned();
     match &attempt.state {
-        OpenAiOAuthAttemptStateRecord::Pending { message } => {
+        OpenAiOAuthAttemptStateRecord::Pending { message }
+        | OpenAiOAuthAttemptStateRecord::Completing { message, .. } => {
             control_plane::OpenAiOAuthCallbackStateEnvelope {
                 contract: contract_descriptor(),
                 provider,
@@ -3253,13 +3258,19 @@ fn callback_terminal_page(attempt: &mut OpenAiOAuthAttempt, now: i64) -> Option<
         OpenAiOAuthAttemptStateRecord::Failed { message, .. } => {
             Some(("OpenAI Connection Failed".to_owned(), message.clone()))
         }
-        OpenAiOAuthAttemptStateRecord::Pending { .. } if attempt.expires_at_unix_ms <= now => {
+        OpenAiOAuthAttemptStateRecord::Pending { .. }
+        | OpenAiOAuthAttemptStateRecord::Completing { .. }
+            if attempt.expires_at_unix_ms <= now =>
+        {
             let message = "OpenAI OAuth attempt expired before the callback completed.".to_owned();
             attempt.state = OpenAiOAuthAttemptStateRecord::Failed {
                 message: message.clone(),
                 completed_at_unix_ms: now,
             };
             Some(("OpenAI Connection Failed".to_owned(), message))
+        }
+        OpenAiOAuthAttemptStateRecord::Completing { message, .. } => {
+            Some(("OpenAI Connection In Progress".to_owned(), message.clone()))
         }
         OpenAiOAuthAttemptStateRecord::Pending { .. } => None,
     }
@@ -3458,6 +3469,44 @@ mod tests {
     }
 
     #[test]
+    fn callback_terminal_page_reports_completing_attempt_as_in_progress() {
+        let mut attempt = test_openai_oauth_attempt(
+            OpenAiOAuthAttemptStateRecord::Completing {
+                message: "OpenAI OAuth callback is being completed.".to_owned(),
+            },
+            100,
+        );
+
+        let rendered = callback_terminal_page(&mut attempt, 50)
+            .expect("completing attempt should render an in-progress page");
+        assert_eq!(rendered.0, "OpenAI Connection In Progress");
+        assert!(rendered.1.contains("being completed"));
+        assert!(matches!(attempt.state, OpenAiOAuthAttemptStateRecord::Completing { .. }));
+        let envelope = oauth_callback_state_envelope(&attempt);
+        assert_eq!(envelope.state, "pending");
+        assert_eq!(envelope.expires_at_unix_ms, Some(100));
+    }
+
+    #[test]
+    fn callback_terminal_page_marks_expired_completing_attempt_failed() {
+        let mut attempt = test_openai_oauth_attempt(
+            OpenAiOAuthAttemptStateRecord::Completing {
+                message: "OpenAI OAuth callback is being completed.".to_owned(),
+            },
+            100,
+        );
+
+        let rendered = callback_terminal_page(&mut attempt, 101)
+            .expect("expired completing attempt should render a failed page");
+        assert_eq!(rendered.0, "OpenAI Connection Failed");
+        assert!(rendered.1.contains("expired"));
+        assert!(matches!(
+            attempt.state,
+            OpenAiOAuthAttemptStateRecord::Failed { completed_at_unix_ms: 101, .. }
+        ));
+    }
+
+    #[test]
     fn map_openai_validation_error_preserves_http_semantics() {
         assert_eq!(
             map_openai_validation_error(
@@ -3480,5 +3529,36 @@ mod tests {
             .status(),
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    fn test_openai_oauth_attempt(
+        state: OpenAiOAuthAttemptStateRecord,
+        expires_at_unix_ms: i64,
+    ) -> OpenAiOAuthAttempt {
+        OpenAiOAuthAttempt {
+            provider: ModelProviderAuthProviderKind::Openai,
+            attempt_id: "attempt-test".to_owned(),
+            expires_at_unix_ms,
+            redirect_uri: "http://127.0.0.1/callback".to_owned(),
+            profile_id: "openai-default".to_owned(),
+            profile_name: "OpenAI Default".to_owned(),
+            scope: default_openai_profile_scope(),
+            client_id: "client".to_owned(),
+            client_secret: String::new(),
+            scopes: vec!["openid".to_owned()],
+            token_endpoint: Url::parse("https://auth0.openai.com/oauth/token")
+                .expect("token endpoint URL should parse"),
+            code_verifier: "verifier".to_owned(),
+            device_user_code: None,
+            poll_interval_ms: 0,
+            next_poll_after_unix_ms: 0,
+            set_default: false,
+            context: ConsoleActionContext {
+                principal: "admin:test".to_owned(),
+                device_id: "device".to_owned(),
+                channel: None,
+            },
+            state,
+        }
     }
 }
