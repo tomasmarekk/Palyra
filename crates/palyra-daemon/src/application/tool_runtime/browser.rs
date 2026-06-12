@@ -78,6 +78,14 @@ const BROWSER_RUNTIME_RECOVERY_HINT: &str =
     "browser_runtime_unavailable: inspect `palyra browser status`; if browserd was restarted, recreate the browser session and retry the browser operation";
 const BROWSER_STATIC_HTML_RUNTIME_WARNING: &str =
     "simulated_browser_engine_static_html_only: this browserd engine fetches static HTML and does not execute JavaScript, module scripts, app hydration, or subresource-driven UI state; use a Chromium browserd engine before claiming JS UI validation";
+
+fn browser_max_redirects_from_payload(payload: &serde_json::Map<String, Value>) -> u32 {
+    payload
+        .get("max_redirects")
+        .and_then(Value::as_u64)
+        .map(|value| u32::try_from(value).unwrap_or(u32::MAX))
+        .unwrap_or(3)
+}
 const BROWSER_UNKNOWN_RUNTIME_WARNING: &str =
     "browser_runtime_capabilities_unknown: browserd did not report JavaScript/subresource capabilities; do not treat title, URL, or fetched HTML alone as JS UI validation";
 const BROWSER_TOOL_INPUT_RECOVERY_HINT: &str =
@@ -1490,10 +1498,6 @@ pub(crate) async fn execute_browser_tool(
             let allow_private_targets =
                 browser_tool_allows_private_targets_for_url(runtime_state, &payload, url)
                     || browser_url_uses_file_scheme(url);
-            // AIDEV-NOTE: `max_redirects as u32` (also in reload and
-            // tabs.open) wraps for payload values above u32::MAX; switching
-            // to a saturating conversion is a behavior change left for a
-            // deliberate fix.
             let mut request = Request::new(browser_v1::NavigateRequest {
                 v: CANONICAL_PROTOCOL_MAJOR,
                 session_id: Some(common_v1::CanonicalId { ulid: session_id }),
@@ -1503,8 +1507,7 @@ pub(crate) async fn execute_browser_tool(
                     .get("allow_redirects")
                     .and_then(Value::as_bool)
                     .unwrap_or(true),
-                max_redirects: payload.get("max_redirects").and_then(Value::as_u64).unwrap_or(3)
-                    as u32,
+                max_redirects: browser_max_redirects_from_payload(&payload),
                 allow_private_targets,
             });
             if let Err(error) = attach_browser_auth_metadata(
@@ -1678,8 +1681,7 @@ pub(crate) async fn execute_browser_tool(
                     .get("allow_redirects")
                     .and_then(Value::as_bool)
                     .unwrap_or(true),
-                max_redirects: payload.get("max_redirects").and_then(Value::as_u64).unwrap_or(3)
-                    as u32,
+                max_redirects: browser_max_redirects_from_payload(&payload),
                 allow_private_targets,
             });
             if let Err(error) = attach_browser_auth_metadata(
@@ -3408,8 +3410,7 @@ pub(crate) async fn execute_browser_tool(
                     .get("allow_redirects")
                     .and_then(Value::as_bool)
                     .unwrap_or(true),
-                max_redirects: payload.get("max_redirects").and_then(Value::as_u64).unwrap_or(3)
-                    as u32,
+                max_redirects: browser_max_redirects_from_payload(&payload),
                 allow_private_targets,
             });
             if let Err(error) = attach_browser_auth_metadata(
@@ -4965,17 +4966,18 @@ mod tests {
     use super::{
         attach_browser_caller_principal_metadata, browser_console_entry_to_json,
         browser_element_captures_to_json, browser_file_url_to_path,
-        browser_network_log_entry_to_json, browser_observe_include_visible_text,
-        browser_output_with_runtime_capabilities, browser_session_closed_error_message,
-        browser_session_closed_output_json, browser_session_persistence_from_payload,
-        browser_session_profile_id_from_payload, browser_tool_execution_outcome,
-        browser_tool_reports_missing_session, browser_tool_requires_open_session,
-        browser_url_targets_loopback, browser_user_owned_os_roots,
-        browser_viewport_metric_mismatch_error, canonical_file_path_is_inside_workspace_roots,
-        normalize_browser_press_key_input, parse_browser_download_artifact_id,
-        parse_browser_observe_string_array, resolve_browser_output_path,
-        resolve_browser_upload_path, validate_browser_workspace_relative_path,
-        BrowserRuntimeCapabilities, BROWSER_CALLER_PRINCIPAL_HEADER, PALYRA_OS_FILE_ROOTS_ENV,
+        browser_max_redirects_from_payload, browser_network_log_entry_to_json,
+        browser_observe_include_visible_text, browser_output_with_runtime_capabilities,
+        browser_session_closed_error_message, browser_session_closed_output_json,
+        browser_session_persistence_from_payload, browser_session_profile_id_from_payload,
+        browser_tool_execution_outcome, browser_tool_reports_missing_session,
+        browser_tool_requires_open_session, browser_url_targets_loopback,
+        browser_user_owned_os_roots, browser_viewport_metric_mismatch_error,
+        canonical_file_path_is_inside_workspace_roots, normalize_browser_press_key_input,
+        parse_browser_download_artifact_id, parse_browser_observe_string_array,
+        resolve_browser_output_path, resolve_browser_upload_path,
+        validate_browser_workspace_relative_path, BrowserRuntimeCapabilities,
+        BROWSER_CALLER_PRINCIPAL_HEADER, PALYRA_OS_FILE_ROOTS_ENV,
     };
     use crate::application::tool_runtime::workspace_scope::ActiveWorkspaceRoot;
     use crate::gateway::{
@@ -5229,6 +5231,25 @@ mod tests {
         assert_eq!(normalize_browser_press_key_input(" "), " ");
         assert_eq!(normalize_browser_press_key_input(" Space "), "Space");
         assert!(normalize_browser_press_key_input(" \t ").is_empty());
+    }
+
+    #[test]
+    fn browser_max_redirects_saturates_large_payload_values() {
+        let default_payload = json!({});
+        let large_payload = json!({"max_redirects": u64::MAX});
+
+        assert_eq!(
+            browser_max_redirects_from_payload(
+                default_payload.as_object().expect("payload should be an object")
+            ),
+            3
+        );
+        assert_eq!(
+            browser_max_redirects_from_payload(
+                large_payload.as_object().expect("payload should be an object")
+            ),
+            u32::MAX
+        );
     }
 
     #[test]

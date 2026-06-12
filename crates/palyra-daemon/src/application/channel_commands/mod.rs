@@ -1088,18 +1088,8 @@ fn arg(
 
 // Binds tokens to the spec's arguments. Precedence per argument, in spec
 // order: a `name=value` token wins; otherwise the next unconsumed
-// positional token is taken; FreeformTail joins all remaining positional
-// tokens. Missing required arguments fail with a stable message.
-//
-// AIDEV-NOTE: when a FreeformTail argument precedes positional-capable
-// arguments in the spec (only `delegate`, where `objective` comes first),
-// the tail consumes positional[position..] without advancing `position`,
-// so later arguments (profile_id, template_id, parent_run_id) re-consume
-// the same tokens already absorbed into the tail. "/palyra delegate fix
-// the build" thus also sets profile_id="fix", template_id="the",
-// parent_run_id="build" - and parent_run_id then counts as an explicit
-// target in has_explicit_target. Fixing this changes parse results, i.e.
-// behavior; left as-is in this comment-only pass.
+// positional token is taken; FreeformTail joins and consumes all remaining
+// positional tokens. Missing required arguments fail with a stable message.
 fn coerce_text_arguments(
     spec: &ChannelCommandSpec,
     tokens: &[String],
@@ -1123,6 +1113,7 @@ fn coerce_text_arguments(
             let tail = positional[position..].join(" ");
             if !tail.is_empty() {
                 output.insert(argument.name.clone(), coerce_text_value(argument, tail.as_str())?);
+                position = positional.len();
             } else if argument.required {
                 return Err(format!("missing required argument `{}`", argument.name));
             }
@@ -1344,6 +1335,22 @@ mod tests {
         assert_eq!(delegate.command, ChannelCommandName::Delegate);
         assert!(delegate.arguments.contains_key("objective"));
         assert!(delegate.arguments.contains_key("profile_id"));
+
+        let ChannelCommandParseOutcome::Parsed(freeform_delegate) =
+            registry.parse_text("/palyra delegate fix the build")
+        else {
+            panic!("delegate freeform command should parse");
+        };
+        assert!(matches!(
+            freeform_delegate.arguments.get("objective"),
+            Some(super::ChannelCommandValue::FreeformTail(value)) if value == "fix the build"
+        ));
+        assert!(
+            !freeform_delegate.arguments.contains_key("profile_id")
+                && !freeform_delegate.arguments.contains_key("template_id")
+                && !freeform_delegate.arguments.contains_key("parent_run_id"),
+            "objective tail tokens must not be reused as later positional arguments"
+        );
 
         let ChannelCommandParseOutcome::Parsed(status) =
             registry.parse_text("/palyra delegation-status task_id=01ARZ3")
