@@ -131,10 +131,8 @@ pub(super) fn derive_transcript_mac(
 /// No early exit: the loop always runs over the longer input, padding the shorter one
 /// with zeros, and the length difference is folded into the accumulator up front.
 ///
-/// AIDEV-NOTE: hand-rolled because `subtle` is not a workspace dependency. The
-/// accumulate-then-compare shape is the standard pattern, but it carries no
-/// compiler-barrier guarantees; if `subtle` is ever added to the workspace, replace
-/// this with `ConstantTimeEq`.
+/// This is hand-rolled because the workspace does not currently carry a dedicated
+/// compiler-barrier constant-time comparison dependency.
 pub(super) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     let mut diff = left.len() ^ right.len();
     let max_len = left.len().max(right.len());

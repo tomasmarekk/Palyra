@@ -310,11 +310,8 @@ fn process_is_alive(pid: u32) -> bool {
 
 #[cfg(windows)]
 fn process_is_alive(pid: u32) -> bool {
-    // AIDEV-NOTE: `unwrap_or(false)` treats a failed liveness probe as "dead", letting
-    // a stale lock be reclaimed on uncertainty — the opposite of the Unix branch, which
-    // assumes "alive" when it cannot probe. Aligning this to fail-safe (`true`) would
-    // change lock-recovery behavior on Windows, so it is left as-is and only flagged.
-    palyra_common::windows_security::process_is_alive(pid).unwrap_or(false)
+    // Unprobeable pid: claim "alive" so the lock is never reclaimed on uncertainty.
+    palyra_common::windows_security::process_is_alive(pid).unwrap_or(true)
 }
 
 #[cfg(all(not(unix), not(windows)))]

@@ -333,11 +333,8 @@ fn decrypt_secret_payload(
     encryption_key: &[u8; SECRET_STORE_ENCRYPTION_KEY_BYTES],
     encoded: &[u8],
 ) -> IdentityResult<Vec<u8>> {
-    // Legacy compatibility: stores written before at-rest encryption hold plaintext
-    // payloads without the magic header, so anything unprefixed is returned verbatim.
-    // AIDEV-NOTE: this fallback also means a payload whose header bytes were corrupted
-    // or stripped is silently treated as plaintext instead of failing decryption.
-    // Removing it requires a one-time migration of legacy stores (behavior change).
+    // INTENTIONAL: pre-encryption stores are indistinguishable from unprefixed bytes,
+    // so unprefixed payloads remain the legacy plaintext compatibility path.
     if !encoded.starts_with(SECRET_STORE_ENCRYPTION_MAGIC) {
         return Ok(encoded.to_vec());
     }
@@ -579,36 +576,6 @@ fn current_user_sid_uncached() -> IdentityResult<String> {
     windows_security::current_user_sid().map_err(|error| {
         IdentityError::Internal(format!("failed to resolve current user SID: {error}"))
     })
-}
-
-// AIDEV-NOTE: dead code — no test references this helper (it predates the move to
-// windows_security::current_user_sid). Safe to delete in a dedicated cleanup change.
-#[cfg(all(test, windows))]
-#[allow(dead_code)]
-fn parse_whoami_sid_csv(raw: &str) -> Option<String> {
-    let mut fields = Vec::new();
-    let mut current = String::new();
-    let mut in_quotes = false;
-    for ch in raw.chars() {
-        match ch {
-            '"' => in_quotes = !in_quotes,
-            ',' if !in_quotes => {
-                fields.push(current.trim().to_owned());
-                current.clear();
-            }
-            _ => current.push(ch),
-        }
-    }
-    fields.push(current.trim().to_owned());
-    if fields.len() < 2 {
-        return None;
-    }
-    let sid = fields[1].trim().trim_matches('"').to_owned();
-    if sid.starts_with("S-1-") {
-        Some(sid)
-    } else {
-        None
-    }
 }
 
 // ACL hardening is comparatively expensive and runs on every write, so successfully

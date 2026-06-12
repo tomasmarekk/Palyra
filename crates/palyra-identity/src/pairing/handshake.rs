@@ -179,18 +179,18 @@ impl IdentityManager {
     /// revoking any certificates from a previous pairing of the same device ID.
     ///
     /// # Errors
-    /// Returns [`IdentityError::Cryptographic`] on issuance failure plus lock and
-    /// persistence failure modes.
+    /// Returns [`IdentityError::DeviceRevoked`] if the device was revoked after
+    /// verification, [`IdentityError::Cryptographic`] on issuance failure, plus lock
+    /// and persistence failure modes.
     pub fn finalize_verified_pairing(
         &mut self,
         verified: VerifiedPairing,
     ) -> IdentityResult<PairingResult> {
-        // AIDEV-NOTE: this step reloads state but does not re-check revoked_devices, so
-        // a device revoked between verify_pairing and finalize_verified_pairing (the
-        // approval gap) would still be re-paired. Re-checking here would be a behavior
-        // change; callers holding a VerifiedPairing across time should re-verify policy.
         let _guard = self.acquire_state_mutation_guard()?;
         self.reload_persisted_state()?;
+        if self.revoked_devices.contains_key(&verified.device_id) {
+            return Err(IdentityError::DeviceRevoked);
+        }
         let result = self.persist_verified_pairing(verified)?;
         self.persist_identity_state_bundle()?;
         Ok(result)

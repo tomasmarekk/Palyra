@@ -556,6 +556,31 @@ fn revocation_state_is_loaded_from_secret_store() {
 }
 
 #[test]
+fn finalize_verified_pairing_rechecks_revocation_after_approval_gap() {
+    let store = Arc::new(crate::InMemorySecretStore::new());
+    let mut manager =
+        IdentityManager::with_store(store.clone()).expect("manager should initialize");
+    let (_, _, hello) = start_pin_pairing(&mut manager, "123456");
+    let verified = manager
+        .verify_pairing(hello, SystemTime::now())
+        .expect("pairing should verify before approval");
+
+    manager
+        .revoke_device(sample_device_id(), "approval denied", SystemTime::now())
+        .expect("revocation should persist during approval gap");
+
+    let result = manager.finalize_verified_pairing(verified);
+
+    assert!(matches!(result, Err(IdentityError::DeviceRevoked)));
+    let reloaded = IdentityManager::with_store(store).expect("manager should reload");
+    assert!(
+        reloaded.paired_device(sample_device_id()).is_none(),
+        "revoked device must not be persisted as paired"
+    );
+    assert!(reloaded.revoked_devices().contains(sample_device_id()));
+}
+
+#[test]
 fn identity_state_bundle_excludes_gateway_ca_private_key_material() {
     let store = Arc::new(crate::InMemorySecretStore::new());
     let mut manager =
