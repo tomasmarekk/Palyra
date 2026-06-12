@@ -629,6 +629,40 @@ fn trust_store_load_accepts_empty_uninitialized_file() {
 }
 
 #[test]
+fn trust_store_save_replaces_existing_file_without_temp_artifact() {
+    let path = unique_temp_trust_store_path();
+    let old_payload = serde_json::json!({
+        "trusted_publishers": { "old": [hex::encode([1_u8; 32])] },
+        "tofu_publishers": {}
+    });
+    std::fs::write(&path, serde_json::to_vec(&old_payload).expect("json payload"))
+        .expect("old trust store should be written");
+
+    let trusted_key = hex::encode([7_u8; 32]);
+    let mut store = SkillTrustStore::default();
+    store.add_trusted_key("acme", trusted_key.as_str()).expect("trusted key should be accepted");
+
+    store.save(path.as_path()).expect("trust store should save atomically");
+    let loaded = SkillTrustStore::load(path.as_path()).expect("saved trust store should load");
+
+    assert_eq!(loaded.trusted_publishers.get("acme"), Some(&vec![trusted_key]));
+    assert!(!loaded.trusted_publishers.contains_key("old"));
+    let file_name = path.file_name().expect("path has file name").to_string_lossy();
+    let temp_prefix = format!(".{file_name}.");
+    let leftovers = std::fs::read_dir(path.parent().expect("path has parent"))
+        .expect("temp directory should be readable")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(temp_prefix.as_str()) && name.ends_with(".tmp")
+        })
+        .collect::<Vec<_>>();
+    assert!(leftovers.is_empty(), "temporary trust store files should be cleaned up");
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn mapping_to_runtime_grants_and_policy_requests() {
     let manifest = parse_manifest_toml(sample_manifest().as_str()).expect("manifest");
     let grants = capability_grants_from_manifest(&manifest);

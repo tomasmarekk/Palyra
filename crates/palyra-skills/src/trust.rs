@@ -5,7 +5,14 @@
 //! publishers and keys are always in canonical form before any trust
 //! comparison happens.
 
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{
+    collections::BTreeMap,
+    ffi::{OsStr, OsString},
+    fs::{self, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use crate::error::SkillPackagingError;
 use crate::manifest::{normalize_identifier, normalize_public_key_hex};
@@ -50,12 +57,6 @@ impl SkillTrustStore {
     /// Writes the normalized trust store as pretty-printed JSON, creating
     /// parent directories as needed.
     ///
-    /// AIDEV-NOTE: the write is not atomic (no temp-file + rename), so a crash
-    /// mid-write can leave a truncated file. `load` then fails closed with a
-    /// parse error rather than returning partial trust, so the impact is
-    /// availability, not trust widening. Making it atomic would change
-    /// filesystem behavior — coordinate before fixing.
-    ///
     /// # Errors
     /// Returns [`SkillPackagingError::Io`] on directory-creation or write
     /// failures and [`SkillPackagingError::Serialization`] when the store
@@ -74,12 +75,7 @@ impl SkillTrustStore {
         let payload = serde_json::to_vec_pretty(&normalized).map_err(|error| {
             SkillPackagingError::Serialization(format!("failed to serialize trust store: {error}"))
         })?;
-        fs::write(path, payload).map_err(|error| {
-            SkillPackagingError::Io(format!(
-                "failed to write trust store {}: {error}",
-                path.display()
-            ))
-        })
+        write_trust_store_atomically(path, payload.as_slice())
     }
 
     /// Adds a key to the publisher's allowlist (idempotent; keys stay sorted).
@@ -166,6 +162,63 @@ impl SkillTrustStore {
         self.tofu_publishers = tofu_publishers;
         Ok(())
     }
+}
+
+fn write_trust_store_atomically(path: &Path, payload: &[u8]) -> Result<(), SkillPackagingError> {
+    let temp_path = trust_store_temp_path(path)?;
+    let mut created_temp = false;
+    let result = (|| {
+        let mut temp_file =
+            OpenOptions::new().write(true).create_new(true).open(temp_path.as_path()).map_err(
+                |error| {
+                    SkillPackagingError::Io(format!(
+                        "failed to create temporary trust store {}: {error}",
+                        temp_path.display()
+                    ))
+                },
+            )?;
+        created_temp = true;
+        temp_file.write_all(payload).map_err(|error| {
+            SkillPackagingError::Io(format!(
+                "failed to write temporary trust store {}: {error}",
+                temp_path.display()
+            ))
+        })?;
+        temp_file.sync_all().map_err(|error| {
+            SkillPackagingError::Io(format!(
+                "failed to sync temporary trust store {}: {error}",
+                temp_path.display()
+            ))
+        })?;
+        drop(temp_file);
+        fs::rename(temp_path.as_path(), path).map_err(|error| {
+            SkillPackagingError::Io(format!(
+                "failed to replace trust store {} with {}: {error}",
+                path.display(),
+                temp_path.display()
+            ))
+        })
+    })();
+    if result.is_err() && created_temp {
+        let _ = fs::remove_file(temp_path);
+    }
+    result
+}
+
+fn trust_store_temp_path(path: &Path) -> Result<PathBuf, SkillPackagingError> {
+    let file_name = path.file_name().ok_or_else(|| {
+        SkillPackagingError::Io(format!("trust store path {} has no file name", path.display()))
+    })?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let mut temp_file_name = OsString::from(".");
+    temp_file_name.push(file_name);
+    temp_file_name.push(OsStr::new(format!(".{}.{}.tmp", std::process::id(), nonce).as_str()));
+    let mut temp_path = path.to_path_buf();
+    temp_path.set_file_name(temp_file_name);
+    Ok(temp_path)
 }
 
 /// Returns `true` when a builder-generated skill still needs human review.

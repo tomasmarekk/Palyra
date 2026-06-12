@@ -153,12 +153,10 @@ pub fn build_signed_skill_artifact(
 /// Checks required entries, payload hash, signature, publisher binding, and
 /// the manifest integrity table for already-decoded artifact entries.
 ///
-/// AIDEV-NOTE: manifest/SBOM/provenance parsing runs BEFORE the signature is
-/// verified, so those parsers see unauthenticated input (bounded by the
-/// `decode_zip` size limits). Reordering to verify-first would change the
-/// error precedence pinned by tests (e.g. a missing SBOM must surface as
-/// `MissingArtifactEntry`, not as a signature failure) — do not reorder
-/// without a deliberate contract change.
+/// Manifest, SBOM, and provenance validation intentionally run before signature
+/// verification to preserve package-shape error precedence. The parsed bytes
+/// are already bounded by `decode_zip` size limits; reordering this flow would
+/// require a deliberate artifact contract change.
 pub(crate) fn parse_and_verify_artifact(
     entries: &BTreeMap<String, Vec<u8>>,
 ) -> Result<ParsedArtifact, SkillPackagingError> {

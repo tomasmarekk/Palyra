@@ -31,11 +31,8 @@ pub fn capability_grants_from_manifest(manifest: &SkillManifest) -> SkillCapabil
         http_hosts: dedupe_sorted(manifest.capabilities.http_egress_allowlist.as_slice()),
         secret_keys,
         storage_prefixes: dedupe_sorted(manifest.capabilities.filesystem.write_roots.as_slice()),
-        // AIDEV-NOTE: channels are intentionally never derived from the
-        // manifest here, while `extension_capability_grants_from_skill_manifest`
-        // maps `node_capabilities` to Channel grants. Snapshot-based grant
-        // conversion therefore drops node/channel capabilities; populating
-        // this field would change persisted grant snapshots.
+        // Channel grants are intentionally not projected into this persisted
+        // snapshot; extension capability grants carry node/channel capabilities.
         channels: Vec::new(),
     }
 }
