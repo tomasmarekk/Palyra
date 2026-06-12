@@ -58,6 +58,48 @@ struct DiscordOnboardingEvaluation {
     preflight: DiscordOnboardingPreflightResponse,
 }
 
+#[derive(Debug, Clone)]
+struct DiscordOnboardingConfigWrite {
+    path: PathBuf,
+    created: bool,
+    rollback: DiscordOnboardingConfigRollback,
+}
+
+#[derive(Debug, Clone)]
+struct DiscordOnboardingConfigRollback {
+    path: PathBuf,
+    previous_content: Option<String>,
+}
+
+impl DiscordOnboardingConfigRollback {
+    fn restore(&self) -> Result<(), String> {
+        match &self.previous_content {
+            Some(content) => palyra_common::config_system::write_content_with_backups(
+                self.path.as_path(),
+                content,
+                DISCORD_ONBOARDING_CONFIG_BACKUPS,
+            )
+            .map_err(|error| {
+                format!(
+                    "failed to restore discord onboarding config '{}': {error}",
+                    self.path.display()
+                )
+            }),
+            None => {
+                if self.path.exists() {
+                    fs::remove_file(self.path.as_path()).map_err(|error| {
+                        format!(
+                            "failed to remove created discord onboarding config '{}': {error}",
+                            self.path.display()
+                        )
+                    })?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Evaluates an onboarding request without persisting anything: validates
 /// the token live against Discord and returns the full preflight preview.
 ///
@@ -82,11 +124,9 @@ pub(crate) async fn build_discord_onboarding_preflight(
 /// rules land in the config file before enablement, even though they only
 /// take effect after a daemon restart (`restart_required_for_routing_rules`).
 ///
-/// AIDEV-NOTE: this apply flow is not atomic. If config persistence or
-/// enablement fails after the vault write, the token stays stored with the
-/// connector still disabled; a retry overwrites the secret, and logout/remove
-/// clean it up. Rolling back the vault write on later failures would be a
-/// behavior change.
+/// If a later persistence step fails after the token is stored, apply rolls
+/// back the token and restores the config snapshot so a failed enablement
+/// cannot leave an unused bot token or stale routing rule behind.
 ///
 /// # Errors
 /// Returns an error response when evaluation fails, the open-guild scope is
@@ -96,6 +136,7 @@ pub(crate) async fn apply_discord_onboarding(
     payload: DiscordOnboardingRequest,
 ) -> Result<Value, Response> {
     let evaluation = evaluate_discord_onboarding_request(state, &payload, true).await?;
+    let connector_existed = state.channels.status(evaluation.plan.connector_id.as_str()).is_ok();
     state
         .channels
         .ensure_discord_connector(evaluation.plan.account_id.as_str())
@@ -116,11 +157,35 @@ pub(crate) async fn apply_discord_onboarding(
             )))
         })?;
 
-    let (config_path, config_created) = persist_discord_onboarding_config(&evaluation.plan)?;
-    let status = state
-        .channels
-        .set_enabled(evaluation.plan.connector_id.as_str(), true)
-        .map_err(channel_platform_error_response)?;
+    let config_write = match persist_discord_onboarding_config(&evaluation.plan) {
+        Ok(write) => write,
+        Err(error) => {
+            rollback_discord_onboarding_after_failure(
+                state,
+                &parsed_ref,
+                None,
+                evaluation.plan.connector_id.as_str(),
+                !connector_existed,
+                "config persistence",
+            )?;
+            return Err(error);
+        }
+    };
+    let status = match state.channels.set_enabled(evaluation.plan.connector_id.as_str(), true) {
+        Ok(status) => status,
+        Err(error) => {
+            let response = channel_platform_error_response(error);
+            rollback_discord_onboarding_after_failure(
+                state,
+                &parsed_ref,
+                Some(&config_write.rollback),
+                evaluation.plan.connector_id.as_str(),
+                !connector_existed,
+                "connector enablement",
+            )?;
+            return Err(response);
+        }
+    };
     let runtime = state
         .channels
         .runtime_snapshot(evaluation.plan.connector_id.as_str())
@@ -136,8 +201,8 @@ pub(crate) async fn apply_discord_onboarding(
         "applied": {
             "token_vault_ref": token_vault_ref,
             "connector_id": evaluation.plan.connector_id,
-            "config_path": config_path.display().to_string(),
-            "config_created": config_created,
+            "config_path": config_write.path.display().to_string(),
+            "config_created": config_write.created,
             "config_backups": DISCORD_ONBOARDING_CONFIG_BACKUPS,
             "connector_enabled": true,
             "restart_required_for_routing_rules": true,
@@ -148,6 +213,50 @@ pub(crate) async fn apply_discord_onboarding(
         "inbound_alive": inbound_alive,
         "inbound_monitor_warnings": inbound_monitor_warnings,
     }))
+}
+
+#[allow(clippy::result_large_err)]
+fn rollback_discord_onboarding_after_failure(
+    state: &AppState,
+    parsed_ref: &VaultRef,
+    config_rollback: Option<&DiscordOnboardingConfigRollback>,
+    connector_id: &str,
+    remove_created_connector: bool,
+    failed_stage: &str,
+) -> Result<(), Response> {
+    if let Some(rollback) = config_rollback {
+        rollback.restore().map_err(|error| {
+            discord_onboarding_rollback_error_response(failed_stage, error.as_str())
+        })?;
+    }
+    rollback_discord_onboarding_vault_secret(state.vault.as_ref(), parsed_ref).map_err(
+        |error| discord_onboarding_rollback_error_response(failed_stage, error.as_str()),
+    )?;
+    if remove_created_connector {
+        state.channels.remove_connector(connector_id).map_err(|error| {
+            let message = error.to_string();
+            discord_onboarding_rollback_error_response(failed_stage, message.as_str())
+        })?;
+    }
+    Ok(())
+}
+
+fn rollback_discord_onboarding_vault_secret(
+    vault: &palyra_vault::Vault,
+    parsed_ref: &VaultRef,
+) -> Result<bool, String> {
+    vault
+        .delete_secret(&parsed_ref.scope, parsed_ref.key.as_str())
+        .map_err(|error| format!("failed to delete discord onboarding token from vault: {error}"))
+}
+
+fn discord_onboarding_rollback_error_response(
+    failed_stage: &str,
+    rollback_error: &str,
+) -> Response {
+    runtime_status_response(tonic::Status::internal(format!(
+        "discord onboarding failed during {failed_stage} and rollback failed: {rollback_error}"
+    )))
 }
 
 /// Shared evaluation behind preflight and apply: normalize the request into
@@ -1072,7 +1181,7 @@ fn default_discord_mention_patterns(bot_id: &str, bot_username: &str) -> Vec<Str
 #[allow(clippy::result_large_err)]
 fn persist_discord_onboarding_config(
     plan: &DiscordOnboardingPlan,
-) -> Result<(PathBuf, bool), Response> {
+) -> Result<DiscordOnboardingConfigWrite, Response> {
     let config_path = resolve_discord_onboarding_config_path()?;
     let config_exists = config_path.exists();
     let content = if config_exists {
@@ -1140,7 +1249,14 @@ fn persist_discord_onboarding_config(
             "failed to persist config during discord onboarding update: {error}"
         )))
     })?;
-    Ok((config_path, !config_exists))
+    Ok(DiscordOnboardingConfigWrite {
+        path: config_path.clone(),
+        created: !config_exists,
+        rollback: DiscordOnboardingConfigRollback {
+            path: config_path,
+            previous_content: config_exists.then_some(content),
+        },
+    })
 }
 
 fn build_discord_onboarding_rule(plan: &DiscordOnboardingPlan) -> toml::Value {
@@ -1245,4 +1361,58 @@ pub(super) fn validate_discord_onboarding_document_for_lifecycle(
     document: &toml::Value,
 ) -> Result<(), Response> {
     validate_discord_onboarding_document(document)
+}
+
+#[cfg(test)]
+mod tests {
+    use palyra_vault::{BackendPreference, Vault, VaultConfig, VaultError, VaultRef};
+    use tempfile::tempdir;
+
+    use super::{rollback_discord_onboarding_vault_secret, DiscordOnboardingConfigRollback};
+
+    #[test]
+    fn discord_onboarding_config_rollback_restores_previous_content() {
+        let temp = tempdir().expect("tempdir should be created");
+        let config_path = temp.path().join("palyra.toml");
+        std::fs::write(config_path.as_path(), "channel_router.enabled = false\n")
+            .expect("initial config should be written");
+        let rollback = DiscordOnboardingConfigRollback {
+            path: config_path.clone(),
+            previous_content: Some("channel_router.enabled = false\n".to_owned()),
+        };
+        std::fs::write(config_path.as_path(), "channel_router.enabled = true\n")
+            .expect("updated config should be written");
+
+        rollback.restore().expect("rollback should restore prior config");
+
+        let restored =
+            std::fs::read_to_string(config_path.as_path()).expect("config should be readable");
+        assert_eq!(restored, "channel_router.enabled = false\n");
+    }
+
+    #[test]
+    fn discord_onboarding_vault_rollback_deletes_stored_token() {
+        let temp = tempdir().expect("tempdir should be created");
+        let vault = Vault::open_with_config(VaultConfig {
+            root: Some(temp.path().join("vault")),
+            identity_store_root: Some(temp.path().join("identity")),
+            backend_preference: BackendPreference::EncryptedFile,
+            max_secret_bytes: 1024,
+        })
+        .expect("vault should open");
+        let parsed_ref =
+            VaultRef::parse("channel:discord:default/bot_token").expect("vault ref should parse");
+        vault
+            .put_secret(&parsed_ref.scope, parsed_ref.key.as_str(), b"discord-token")
+            .expect("token should be stored");
+
+        let deleted = rollback_discord_onboarding_vault_secret(&vault, &parsed_ref)
+            .expect("rollback should delete token");
+
+        assert!(deleted);
+        assert!(matches!(
+            vault.get_secret(&parsed_ref.scope, parsed_ref.key.as_str()),
+            Err(VaultError::NotFound)
+        ));
+    }
 }
