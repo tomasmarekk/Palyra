@@ -167,6 +167,34 @@ impl BridgeState {
     }
 }
 
+struct ActiveRunGuard {
+    state: Arc<Mutex<BridgeState>>,
+    acp_session_id: String,
+}
+
+impl ActiveRunGuard {
+    fn insert(
+        state: &Arc<Mutex<BridgeState>>,
+        acp_session_id: &str,
+        run_id: String,
+    ) -> acp::Result<Self> {
+        let mut bridge_state = state.lock().map_err(|_| {
+            acp::Error::new(-32603, "ACP bridge state lock poisoned while registering active run")
+        })?;
+        bridge_state.active_runs.insert(acp_session_id.to_owned(), run_id);
+        drop(bridge_state);
+        Ok(Self { state: Arc::clone(state), acp_session_id: acp_session_id.to_owned() })
+    }
+}
+
+impl Drop for ActiveRunGuard {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.active_runs.remove(self.acp_session_id.as_str());
+        }
+    }
+}
+
 /// Client-directed calls funneled through one dispatch task so agent handlers
 /// can stay `Clone` while `AgentSideConnection` is owned by a single task.
 enum ClientBridgeRequest {
@@ -573,16 +601,11 @@ impl PalyraAcpAgent {
         let mut run_stream =
             client.open_run_stream(initial_request).await.map_err(acp_internal_error)?;
 
-        // AIDEV-NOTE: if streaming below fails mid-run (any `?` until the end
-        // of this function), the active_runs entry is not removed, so a later
-        // session/cancel would target the dead run id. Cleaning this up needs
-        // a behavior change (e.g. a scope guard around the stream loop).
-        {
-            let mut state = self.lock_state()?;
-            state
-                .active_runs
-                .insert(arguments.session_id.0.as_ref().to_owned(), run_input.run_id.clone());
-        }
+        let _active_run_guard = ActiveRunGuard::insert(
+            &self.state,
+            arguments.session_id.0.as_ref(),
+            run_input.run_id.clone(),
+        )?;
 
         let mut stop_reason = acp::StopReason::EndTurn;
         while let Some(event) = run_stream.next_event().await.map_err(acp_internal_error)? {
@@ -690,7 +713,6 @@ impl PalyraAcpAgent {
             }
         }
 
-        self.lock_state()?.active_runs.remove(arguments.session_id.0.as_ref());
         Ok(acp::PromptResponse::new(stop_reason))
     }
 }

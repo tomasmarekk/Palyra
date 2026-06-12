@@ -3,9 +3,9 @@
 
 use super::{
     acp, build_tool_permission_request, map_list_sessions_response, map_permission_outcome,
-    AcpSessionDefaults, AgentConnection, BridgeState, ClientBridgeRequest, PalyraAcpAgent,
-    SessionBinding, PERMISSION_ALLOW_ALWAYS, PERMISSION_ALLOW_ONCE, PERMISSION_REJECT_ALWAYS,
-    PERMISSION_REJECT_ONCE,
+    AcpSessionDefaults, ActiveRunGuard, AgentConnection, BridgeState, ClientBridgeRequest,
+    PalyraAcpAgent, SessionBinding, PERMISSION_ALLOW_ALWAYS, PERMISSION_ALLOW_ONCE,
+    PERMISSION_REJECT_ALWAYS, PERMISSION_REJECT_ONCE,
 };
 use crate::proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1};
 use serde_json::json;
@@ -47,6 +47,30 @@ fn prompt_text_includes_resource_link_blocks() {
     let prompt = PalyraAcpAgent::prompt_text(&prompt);
 
     assert_eq!(prompt, "Summarize the context\nlink (Runbook): https://example.test/runbook");
+}
+
+#[test]
+fn active_run_guard_removes_registered_run_on_drop() {
+    let state = Arc::new(Mutex::new(BridgeState::default()));
+    {
+        let _guard = ActiveRunGuard::insert(
+            &state,
+            "acp-session-alpha",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+        )
+        .expect("active run should register");
+        let state = state.lock().expect("bridge state lock should be available");
+        assert_eq!(
+            state.active_runs.get("acp-session-alpha").map(String::as_str),
+            Some("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+        );
+    }
+
+    let state = state.lock().expect("bridge state lock should be available after guard drop");
+    assert!(
+        !state.active_runs.contains_key("acp-session-alpha"),
+        "guard drop should remove stale active run ids"
+    );
 }
 
 #[tokio::test]
