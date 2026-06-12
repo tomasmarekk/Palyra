@@ -76,6 +76,9 @@ pub struct EgressPolicyVerdict {
 /// Every variant is fail-closed: any error means the request must not be sent.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum EgressPolicyError {
+    /// URL parsing failed before scheme, host, or credential checks could run.
+    #[error("URL parse failed: {message}")]
+    InvalidUrl { message: String },
     /// URL scheme is neither `http` nor `https`.
     #[error("unsupported URL scheme '{0}'")]
     UnsupportedScheme(String),
@@ -91,8 +94,7 @@ pub enum EgressPolicyError {
     /// DNS resolution succeeded but returned an empty address set.
     #[error("DNS resolution returned no addresses for host '{host}'")]
     EmptyResolution { host: String },
-    /// DNS resolution (or URL/IP-literal parsing, see
-    /// [`EgressProxyPolicyService::evaluate_request`]) failed.
+    /// DNS resolution or IP-literal parsing failed.
     #[error("DNS resolution failed for host '{host}': {message}")]
     DnsResolution { host: String, message: String },
     /// Host matched neither the exact-host nor the DNS-suffix allowlist.
@@ -134,8 +136,7 @@ impl EgressProxyPolicyService {
     /// URL is malformed, non-HTTP(S), credentialed, or hostless, the host is not
     /// allowlisted, resolution fails or yields a private/local address without
     /// `allow_private_targets`, or any credential binding is not a valid vault-backed
-    /// reference. Malformed URLs are reported as [`EgressPolicyError::DnsResolution`] with
-    /// the full URL in the `host` field.
+    /// reference.
     pub fn evaluate_request(
         &self,
         request: &EgressProxyRequest<'_>,
@@ -144,13 +145,8 @@ impl EgressProxyPolicyService {
             return Err(EgressPolicyError::InvalidResponseBudget);
         }
 
-        // AIDEV-NOTE: URL parse failures reuse the DnsResolution variant with the full URL
-        // in `host`. Misleading, but the error surface is pinned by callers/fixtures; do
-        // not change the variant or message without coordinating that contract.
-        let url = Url::parse(request.url).map_err(|error| EgressPolicyError::DnsResolution {
-            host: request.url.to_owned(),
-            message: error.to_string(),
-        })?;
+        let url = Url::parse(request.url)
+            .map_err(|error| EgressPolicyError::InvalidUrl { message: error.to_string() })?;
         if !matches!(url.scheme(), "http" | "https") {
             return Err(EgressPolicyError::UnsupportedScheme(url.scheme().to_owned()));
         }
@@ -298,31 +294,48 @@ fn validate_credential_bindings(
 }
 
 fn request_fingerprint(request: &EgressProxyRequest<'_>) -> String {
-    // AIDEV-NOTE: method/url and the flag/budget bytes are concatenated without length
-    // prefixes, so distinct requests can in principle share a fingerprint (the list
-    // separators below only disambiguate within each list). Fixing this would change
-    // every emitted fingerprint, which audit tooling may pin — do not alter the framing
-    // without versioning the domain tag.
     let mut hasher = Sha256::new();
-    hasher.update(b"palyra.egress.proxy.v1");
-    hasher.update(request.method.as_bytes());
-    hasher.update(request.url.as_bytes());
-    hasher.update([u8::from(request.allow_private_targets)]);
-    hasher.update(request.max_response_bytes.to_be_bytes());
+    hasher.update(b"palyra.egress.proxy.v2");
+    hash_bytes(&mut hasher, b"method", request.method.as_bytes());
+    hash_bytes(&mut hasher, b"url", request.url.as_bytes());
+    hash_bytes(&mut hasher, b"allow_private_targets", &[u8::from(request.allow_private_targets)]);
+    hash_u64(
+        &mut hasher,
+        b"max_response_bytes",
+        u64::try_from(request.max_response_bytes).unwrap_or(u64::MAX),
+    );
+    hash_u64(&mut hasher, b"allowed_hosts.len", request.allowed_hosts.len() as u64);
     for host in request.allowed_hosts {
-        hasher.update(host.as_bytes());
-        hasher.update([0]);
+        hash_bytes(&mut hasher, b"allowed_hosts.item", host.as_bytes());
     }
+    hash_u64(&mut hasher, b"allowed_dns_suffixes.len", request.allowed_dns_suffixes.len() as u64);
     for suffix in request.allowed_dns_suffixes {
-        hasher.update(suffix.as_bytes());
-        hasher.update([1]);
+        hash_bytes(&mut hasher, b"allowed_dns_suffixes.item", suffix.as_bytes());
     }
+    hash_u64(&mut hasher, b"credential_bindings.len", request.credential_bindings.len() as u64);
     for binding in request.credential_bindings {
-        hasher.update(binding.header_name.as_bytes());
-        hasher.update(binding.secret_ref.fingerprint().as_bytes());
-        hasher.update([u8::from(binding.required)]);
+        hash_bytes(&mut hasher, b"credential_header", binding.header_name.as_bytes());
+        hash_bytes(
+            &mut hasher,
+            b"credential_secret_ref",
+            binding.secret_ref.fingerprint().as_bytes(),
+        );
+        hash_bytes(&mut hasher, b"credential_required", &[u8::from(binding.required)]);
     }
     hex::encode(hasher.finalize())
+}
+
+fn hash_bytes(hasher: &mut Sha256, field: &[u8], value: &[u8]) {
+    hash_u64(hasher, b"field_name_len", field.len() as u64);
+    hasher.update(field);
+    hash_u64(hasher, b"value_len", value.len() as u64);
+    hasher.update(value);
+}
+
+fn hash_u64(hasher: &mut Sha256, field: &[u8], value: u64) {
+    hasher.update((field.len() as u64).to_be_bytes());
+    hasher.update(field);
+    hasher.update(value.to_be_bytes());
 }
 
 #[cfg(test)]
@@ -332,7 +345,7 @@ mod tests {
     };
 
     use super::{
-        validate_resolved_addrs, CredentialBindingPlan, EgressPolicyError,
+        request_fingerprint, validate_resolved_addrs, CredentialBindingPlan, EgressPolicyError,
         EgressProxyPolicyService, EgressProxyRequest,
     };
 
@@ -424,6 +437,25 @@ mod tests {
     }
 
     #[test]
+    fn malformed_url_error_does_not_reuse_dns_resolution_or_leak_url() {
+        let service = EgressProxyPolicyService;
+        let request = EgressProxyRequest {
+            method: "GET",
+            url: "https://exa mple.test/path?token=secret",
+            allow_private_targets: false,
+            allowed_hosts: &[],
+            allowed_dns_suffixes: &[],
+            max_response_bytes: 1024,
+            credential_bindings: &[],
+        };
+        let error =
+            service.evaluate_request(&request).expect_err("malformed URL should be rejected");
+
+        assert!(matches!(error, EgressPolicyError::InvalidUrl { .. }));
+        assert!(!error.to_string().contains("token=secret"));
+    }
+
+    #[test]
     fn egress_proxy_rejects_non_vault_credential_bindings() {
         let service = EgressProxyPolicyService;
         let request = EgressProxyRequest {
@@ -456,6 +488,30 @@ mod tests {
         let error = validate_resolved_addrs(addrs.as_slice(), false)
             .expect_err("loopback target should be rejected");
         assert_eq!(error, EgressPolicyError::PrivateTargetBlocked);
+    }
+
+    #[test]
+    fn request_fingerprint_length_prefixes_method_and_url() {
+        let first = EgressProxyRequest {
+            method: "AB",
+            url: "C",
+            allow_private_targets: false,
+            allowed_hosts: &[],
+            allowed_dns_suffixes: &[],
+            max_response_bytes: 1024,
+            credential_bindings: &[],
+        };
+        let second = EgressProxyRequest {
+            method: "A",
+            url: "BC",
+            allow_private_targets: false,
+            allowed_hosts: &[],
+            allowed_dns_suffixes: &[],
+            max_response_bytes: 1024,
+            credential_bindings: &[],
+        };
+
+        assert_ne!(request_fingerprint(&first), request_fingerprint(&second));
     }
 
     #[test]
