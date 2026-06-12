@@ -762,21 +762,14 @@ async fn execute_parallel_prepared_tool_group(
                 .await?;
                 return Ok(RunStreamPreparedToolExecutionBatchOutcome::Cancelled);
             }
-            // AIDEV-NOTE: unlike the cancel path above (which drains), the
-            // internal-error path aborts sibling tasks, dropping their tool
-            // executions mid-flight. For tools that require execution drain
-            // (see tool_cancellation_requires_execution_drain) this can leave
-            // external state half-mutated. Fixing it means draining here too,
-            // which is a behavior change; left as-is deliberately.
             Ok(Err(error)) => {
-                join_set.abort_all();
-                return Err(error);
+                return Err(drain_parallel_tool_group_after_error(&mut join_set, error).await);
             }
             Err(error) => {
-                join_set.abort_all();
-                return Err(Status::internal(format!(
+                let status = Status::internal(format!(
                     "parallel tool execution task failed to join: {error}"
-                )));
+                ));
+                return Err(drain_parallel_tool_group_after_error(&mut join_set, status).await);
             }
         }
     }
@@ -832,6 +825,24 @@ async fn drain_parallel_tool_group_after_cancel(
         }
     }
     Ok(())
+}
+
+async fn drain_parallel_tool_group_after_error(
+    join_set: &mut JoinSet<Result<ParallelToolExecutionTaskOutcome, Status>>,
+    original_error: Status,
+) -> Status {
+    let original_code = original_error.code();
+    let original_message = original_error.message().to_owned();
+    match drain_parallel_tool_group_after_cancel(join_set).await {
+        Ok(()) => original_error,
+        Err(drain_error) => Status::new(
+            original_code,
+            format!(
+                "{original_message}; additional parallel tool drain error: {}",
+                drain_error.message()
+            ),
+        ),
+    }
 }
 
 #[allow(clippy::result_large_err)]
@@ -1758,7 +1769,8 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
 mod tests {
     use super::{
         allow_sensitive_tools_approval_outcome, classify_tool_parallelism,
-        drain_parallel_tool_group_after_cancel, ParallelToolExecutionTaskOutcome, ToolParallelism,
+        drain_parallel_tool_group_after_cancel, drain_parallel_tool_group_after_error,
+        ParallelToolExecutionTaskOutcome, ToolParallelism,
     };
     use crate::journal::{ApprovalDecision, ApprovalDecisionScope};
     use crate::tool_protocol::{ToolAttestation, ToolExecutionOutcome};
@@ -1773,6 +1785,7 @@ mod tests {
         task::JoinSet,
         time::{sleep, Duration},
     };
+    use tonic::{Code, Status};
 
     #[test]
     fn tool_parallelism_classifies_safe_and_unsafe_tools() {
@@ -1848,6 +1861,29 @@ mod tests {
         assert!(
             sibling_completed.load(Ordering::SeqCst),
             "parallel cancellation must wait instead of aborting sibling tasks"
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_error_drain_waits_for_sibling_tasks() {
+        let sibling_completed = Arc::new(AtomicBool::new(false));
+        let sibling_completed_for_task = Arc::clone(&sibling_completed);
+        let mut join_set = JoinSet::new();
+        join_set.spawn(async move {
+            sleep(Duration::from_millis(10)).await;
+            sibling_completed_for_task.store(true, Ordering::SeqCst);
+            Ok(ParallelToolExecutionTaskOutcome::Cancelled)
+        });
+
+        let error =
+            drain_parallel_tool_group_after_error(&mut join_set, Status::internal("primary error"))
+                .await;
+
+        assert_eq!(error.code(), Code::Internal);
+        assert_eq!(error.message(), "primary error");
+        assert!(
+            sibling_completed.load(Ordering::SeqCst),
+            "parallel errors must drain sibling tasks instead of aborting them"
         );
     }
 
