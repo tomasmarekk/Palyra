@@ -147,22 +147,17 @@ pub(crate) fn redact_memory_text_for_output(raw: &str) -> String {
     }
 
     let payload = json!({ "value": raw });
-    // AIDEV-NOTE: fail-open redaction -- if redact_payload_json errors or the
-    // redacted JSON does not round-trip, the raw unredacted text is returned.
-    // Failing closed (empty string or error) would change tool output for
-    // every caller, so it needs a deliberate behavior change.
-    let redacted_payload = match crate::journal::redact_payload_json(payload.to_string().as_bytes())
-    {
-        Ok(redacted) => redacted,
-        Err(_) => return raw.to_owned(),
-    };
+    let redacted_payload = crate::journal::redact_payload_json(payload.to_string().as_bytes());
+    redacted_memory_payload_value(redacted_payload).unwrap_or_default()
+}
+
+fn redacted_memory_payload_value(
+    redacted_payload: Result<String, crate::journal::JournalError>,
+) -> Option<String> {
+    let redacted_payload = redacted_payload.ok()?;
     match serde_json::from_str::<Value>(redacted_payload.as_str()) {
-        Ok(Value::Object(fields)) => fields
-            .get("value")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .unwrap_or_else(|| raw.to_owned()),
-        _ => raw.to_owned(),
+        Ok(Value::Object(fields)) => fields.get("value").and_then(Value::as_str).map(str::to_owned),
+        _ => None,
     }
 }
 
@@ -2068,6 +2063,29 @@ mod tests {
             .expect_err("requested channel must match authenticated channel context");
 
         assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn redact_memory_text_for_output_masks_sensitive_values() {
+        let redacted = redact_memory_text_for_output(
+            "Authorization: Bearer topsecret123 api_key=abc token=qwe secret=xyz",
+        );
+
+        assert!(redacted.contains("<redacted>"));
+        assert!(!redacted.contains("topsecret123"));
+        assert!(!redacted.contains("api_key=abc"));
+        assert!(!redacted.contains("token=qwe"));
+        assert!(!redacted.contains("secret=xyz"));
+    }
+
+    #[test]
+    fn redacted_memory_payload_value_fails_closed_for_unusable_payloads() {
+        assert_eq!(
+            redacted_memory_payload_value(Err(crate::journal::JournalError::EmptyPath)),
+            None
+        );
+        assert_eq!(redacted_memory_payload_value(Ok("{}".to_owned())), None);
+        assert_eq!(redacted_memory_payload_value(Ok(r#"{"value":42}"#.to_owned())), None);
     }
 
     fn lifecycle_test_memory_item(
