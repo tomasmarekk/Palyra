@@ -767,16 +767,13 @@ pub(crate) async fn console_usage_sessions_handler(
         .list_orchestrator_usage_sessions(resolved.query.clone())
         .await
         .map_err(runtime_status_response)?;
+    let cost_tracking_available =
+        usage_cost_tracking_available(sessions.iter().map(|entry| entry.estimated_cost_usd));
     let next_cursor =
         (cursor.saturating_add(limit) < sessions.len()).then(|| (cursor + limit).to_string());
     let page =
         build_page_info(limit, sessions.len().saturating_sub(cursor).min(limit), next_cursor);
     let sessions = sessions.into_iter().skip(cursor).take(limit).collect::<Vec<_>>();
-    // AIDEV-NOTE: cost_tracking_available is derived from the returned page
-    // only, so a page without cost rows reports false even when other pages
-    // in the same window carry estimates. The agents and models handlers
-    // below share this pattern; changing it would alter the wire payload.
-    let cost_tracking_available = sessions.iter().any(|entry| entry.estimated_cost_usd.is_some());
 
     Ok(Json(UsageSessionsEnvelope {
         contract: contract_descriptor(),
@@ -886,11 +883,12 @@ pub(crate) async fn console_usage_agents_handler(
         .map_err(runtime_status_response)?;
     let usage_metadata = load_usage_metadata(&state, &session.context).await?;
     let rows = build_usage_agent_rows(sessions.as_slice(), &usage_metadata);
+    let cost_tracking_available =
+        usage_cost_tracking_available(rows.iter().map(|entry| entry.estimated_cost_usd));
     let next_cursor =
         (cursor.saturating_add(limit) < rows.len()).then(|| (cursor + limit).to_string());
     let page = build_page_info(limit, rows.len().saturating_sub(cursor).min(limit), next_cursor);
     let agents = rows.into_iter().skip(cursor).take(limit).collect::<Vec<_>>();
-    let cost_tracking_available = agents.iter().any(|entry| entry.estimated_cost_usd.is_some());
 
     Ok(Json(UsageAgentsEnvelope {
         contract: contract_descriptor(),
@@ -939,11 +937,12 @@ pub(crate) async fn console_usage_models_handler(
         .map_err(runtime_status_response)?;
     let usage_metadata = load_usage_metadata(&state, &session.context).await?;
     let rows = build_usage_model_rows(sessions.as_slice(), &usage_metadata);
+    let cost_tracking_available =
+        usage_cost_tracking_available(rows.iter().map(|entry| entry.estimated_cost_usd));
     let next_cursor =
         (cursor.saturating_add(limit) < rows.len()).then(|| (cursor + limit).to_string());
     let page = build_page_info(limit, rows.len().saturating_sub(cursor).min(limit), next_cursor);
     let models = rows.into_iter().skip(cursor).take(limit).collect::<Vec<_>>();
-    let cost_tracking_available = models.iter().any(|entry| entry.estimated_cost_usd.is_some());
 
     Ok(Json(UsageModelsEnvelope {
         contract: contract_descriptor(),
@@ -960,6 +959,10 @@ pub(crate) async fn console_usage_models_handler(
         page,
         cost_tracking_available,
     }))
+}
+
+fn usage_cost_tracking_available(costs: impl IntoIterator<Item = Option<f64>>) -> bool {
+    costs.into_iter().any(|cost| cost.is_some())
 }
 
 /// Builds the full usage-insights view: window totals, cost estimation,
@@ -1603,6 +1606,7 @@ struct OperatorTapeAggregation {
     compaction_created_events: usize,
     compaction_blocked_events: usize,
     compaction_dry_run_events: usize,
+    compaction_events: usize,
     compaction_total_token_delta: i128,
     compaction_total_input_tokens: u128,
     inspected_tool_decisions: usize,
@@ -1945,6 +1949,7 @@ fn accumulate_operator_tape_event(
                         .saturating_sub(estimated_output_tokens)
                         .min(i64::MAX as u64) as i64
                 });
+            aggregation.compaction_events = aggregation.compaction_events.saturating_add(1);
             aggregation.compaction_total_input_tokens = aggregation
                 .compaction_total_input_tokens
                 .saturating_add(u128::from(estimated_input_tokens));
@@ -2145,15 +2150,10 @@ fn build_operator_recall_insight(aggregation: &OperatorTapeAggregation) -> Opera
 fn build_operator_compaction_insight(
     aggregation: &OperatorTapeAggregation,
 ) -> OperatorCompactionInsight {
-    // AIDEV-NOTE: the divisor is the retained sample count (capped at 8 by
-    // accumulate_operator_tape_event) while compaction_total_token_delta sums
-    // every observed compaction event, so the average overstates the
-    // per-event delta once a window exceeds the sample cap. Correcting it
-    // changes reported wire values, so it is left as is for now.
-    let avg_token_delta = if aggregation.compaction_samples.is_empty() {
+    let avg_token_delta = if aggregation.compaction_events == 0 {
         0
     } else {
-        (aggregation.compaction_total_token_delta / aggregation.compaction_samples.len() as i128)
+        (aggregation.compaction_total_token_delta / aggregation.compaction_events as i128)
             .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
     };
     // Reduction is reported in basis points of the estimated input tokens;
@@ -3740,12 +3740,13 @@ fn current_unix_ms() -> Result<i64, std::time::SystemTimeError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_operator_hotspots, build_operator_summary, csv_escape, operator_drill_down,
-        operator_query_preview, OperatorCompactionInsight, OperatorCronInsight,
-        OperatorHotspotSources, OperatorMemoryLearningInsight, OperatorOperationsOverviewInsight,
-        OperatorPluginInsight, OperatorProviderHealthInsight, OperatorRecallInsight,
-        OperatorReloadInsight, OperatorRoutineInsight, OperatorSafetyBoundaryInsight,
-        OperatorSecurityInsight,
+        build_operator_compaction_insight, build_operator_hotspots, build_operator_summary,
+        csv_escape, operator_drill_down, operator_query_preview, usage_cost_tracking_available,
+        OperatorCompactionInsight, OperatorCronInsight, OperatorHotspotSources,
+        OperatorMemoryLearningInsight, OperatorOperationsOverviewInsight, OperatorPluginInsight,
+        OperatorProviderHealthInsight, OperatorRecallInsight, OperatorReloadInsight,
+        OperatorRoutineInsight, OperatorSafetyBoundaryInsight, OperatorSecurityInsight,
+        OperatorTapeAggregation,
     };
 
     #[test]
@@ -3794,6 +3795,26 @@ mod tests {
         assert!(!preview.contains("sk-live-super-secret"));
         assert!(!preview.contains('\n'));
         assert!(preview.len() <= 240);
+    }
+
+    #[test]
+    fn cost_tracking_available_accepts_any_window_cost() {
+        assert!(usage_cost_tracking_available([None, Some(0.0), None]));
+        assert!(!usage_cost_tracking_available([None, None]));
+    }
+
+    #[test]
+    fn compaction_average_uses_observed_event_count() {
+        let aggregation = OperatorTapeAggregation {
+            compaction_events: 3,
+            compaction_total_token_delta: 90,
+            compaction_total_input_tokens: 300,
+            ..OperatorTapeAggregation::default()
+        };
+
+        let insight = build_operator_compaction_insight(&aggregation);
+
+        assert_eq!(insight.avg_token_delta, 30);
     }
 
     fn test_operations(
