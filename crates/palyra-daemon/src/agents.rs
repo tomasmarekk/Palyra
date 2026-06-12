@@ -13,7 +13,7 @@ use std::{
     collections::HashSet,
     env, fs,
     path::{Component, Path, PathBuf},
-    sync::Mutex,
+    sync::{Mutex, MutexGuard},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -268,6 +268,25 @@ impl Default for RegistryDocument {
     }
 }
 
+struct RegistryMutation<T> {
+    outcome: T,
+    should_persist: bool,
+}
+
+impl<T> RegistryMutation<T> {
+    fn new(outcome: T, should_persist: bool) -> Self {
+        Self { outcome, should_persist }
+    }
+
+    fn persisted(outcome: T) -> Self {
+        Self::new(outcome, true)
+    }
+
+    fn unchanged(outcome: T) -> Self {
+        Self::new(outcome, false)
+    }
+}
+
 /// Failure modes of the agent registry; `InvalidPath` covers all field
 /// validation (ids, names, paths), not just filesystem paths.
 #[derive(Debug, Error)]
@@ -338,23 +357,29 @@ impl AgentRegistry {
             })?;
         }
 
-        let mut document = if registry_path.exists() {
-            let raw = fs::read_to_string(&registry_path).map_err(|source| {
-                AgentRegistryError::ReadRegistry { path: registry_path.clone(), source }
-            })?;
-            toml::from_str::<RegistryDocument>(&raw).map_err(|source| {
-                AgentRegistryError::ParseRegistry {
-                    path: registry_path.clone(),
-                    source: Box::new(source),
-                }
-            })?
-        } else {
-            RegistryDocument::default()
-        };
-        normalize_document(&mut document, state_root.as_path())?;
-        persist_registry(registry_path.as_path(), &document)?;
+        let document =
+            load_and_persist_registry_document(registry_path.as_path(), state_root.as_path())?;
 
         Ok(Self { registry_path, state_root, state: Mutex::new(document) })
+    }
+
+    fn mutate_persisted_document<T>(
+        &self,
+        guard: &mut MutexGuard<'_, RegistryDocument>,
+        mutate: impl FnOnce(&mut RegistryDocument) -> Result<RegistryMutation<T>, AgentRegistryError>,
+    ) -> Result<T, AgentRegistryError> {
+        prepare_registry_parent(self.registry_path.as_path())?;
+        let _file_lock = acquire_registry_lock(self.registry_path.as_path()).map_err(|source| {
+            AgentRegistryError::WriteRegistry { path: self.registry_path.clone(), source }
+        })?;
+        let mut next =
+            load_registry_document(self.registry_path.as_path(), self.state_root.as_path())?;
+        let mutation = mutate(&mut next)?;
+        if mutation.should_persist {
+            persist_registry_locked(self.registry_path.as_path(), &next)?;
+        }
+        **guard = next;
+        Ok(mutation.outcome)
     }
 
     /// Lists agents in id order as a cursor page: entries strictly after
@@ -426,15 +451,7 @@ impl AgentRegistry {
         &self,
         request: AgentCreateRequest,
     ) -> Result<AgentCreateOutcome, AgentRegistryError> {
-        let mut guard = self.state.lock().map_err(|_| AgentRegistryError::LockPoisoned)?;
-        let mut next = guard.clone();
-        if next.agents.len() >= MAX_AGENT_COUNT {
-            return Err(AgentRegistryError::RegistryLimitExceeded);
-        }
         let agent_id = normalize_agent_id(request.agent_id.as_str())?;
-        if next.agents.iter().any(|agent| agent.agent_id == agent_id) {
-            return Err(AgentRegistryError::DuplicateAgentId(agent_id));
-        }
         let display_name = normalize_required_text(request.display_name.as_str(), "display_name")?;
         let default_model_profile = normalize_required_text(
             request.default_model_profile.as_deref().unwrap_or(DEFAULT_MODEL_PROFILE),
@@ -447,49 +464,62 @@ impl AgentRegistry {
             request.allow_absolute_paths,
         )?;
         let agent_dir_key = canonical_path_key(agent_dir.as_path());
-        for existing in &next.agents {
-            if canonical_path_key(Path::new(existing.agent_dir.as_str())) == agent_dir_key {
-                return Err(AgentRegistryError::AgentDirCollision(existing.agent_id.clone()));
-            }
-        }
         let workspace_roots = resolve_workspace_roots(
             request.workspace_roots.as_slice(),
             agent_dir.as_path(),
             request.allow_absolute_paths,
         )?;
-        let now = current_unix_ms()?;
-        let record = AgentRecord {
-            agent_id: agent_id.clone(),
-            display_name,
-            agent_dir: agent_dir.to_string_lossy().into_owned(),
-            workspace_roots: workspace_roots
-                .iter()
-                .map(|path| path.to_string_lossy().into_owned())
-                .collect(),
-            default_model_profile,
-            execution_backend_preference: request.execution_backend_preference.unwrap_or_default(),
-            default_tool_allowlist: normalize_allowlist(request.default_tool_allowlist),
-            default_skill_allowlist: normalize_allowlist(request.default_skill_allowlist),
-            created_at_unix_ms: now,
-            updated_at_unix_ms: now,
-        };
-        let previous_default_agent_id = next.default_agent_id.clone();
-        next.agents.push(record.clone());
-        next.agents.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
+        let execution_backend_preference = request.execution_backend_preference.unwrap_or_default();
+        let default_tool_allowlist = normalize_allowlist(request.default_tool_allowlist);
+        let default_skill_allowlist = normalize_allowlist(request.default_skill_allowlist);
+        let set_default = request.set_default;
 
-        let mut default_changed = false;
-        if next.default_agent_id.is_none() || request.set_default {
-            next.default_agent_id = Some(agent_id);
-            default_changed = previous_default_agent_id != next.default_agent_id;
-        }
-        persist_registry(self.registry_path.as_path(), &next)?;
-        let default_agent_id = next.default_agent_id.clone();
-        *guard = next;
-        Ok(AgentCreateOutcome {
-            previous_default_agent_id,
-            default_agent_id,
-            default_changed,
-            agent: record,
+        let mut guard = self.state.lock().map_err(|_| AgentRegistryError::LockPoisoned)?;
+        self.mutate_persisted_document(&mut guard, move |next| {
+            if next.agents.len() >= MAX_AGENT_COUNT {
+                return Err(AgentRegistryError::RegistryLimitExceeded);
+            }
+            if next.agents.iter().any(|agent| agent.agent_id == agent_id) {
+                return Err(AgentRegistryError::DuplicateAgentId(agent_id));
+            }
+            for existing in &next.agents {
+                if canonical_path_key(Path::new(existing.agent_dir.as_str())) == agent_dir_key {
+                    return Err(AgentRegistryError::AgentDirCollision(existing.agent_id.clone()));
+                }
+            }
+
+            let now = current_unix_ms()?;
+            let record = AgentRecord {
+                agent_id: agent_id.clone(),
+                display_name,
+                agent_dir: agent_dir.to_string_lossy().into_owned(),
+                workspace_roots: workspace_roots
+                    .iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect(),
+                default_model_profile,
+                execution_backend_preference,
+                default_tool_allowlist,
+                default_skill_allowlist,
+                created_at_unix_ms: now,
+                updated_at_unix_ms: now,
+            };
+            let previous_default_agent_id = next.default_agent_id.clone();
+            next.agents.push(record.clone());
+            next.agents.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
+
+            let mut default_changed = false;
+            if next.default_agent_id.is_none() || set_default {
+                next.default_agent_id = Some(agent_id);
+                default_changed = previous_default_agent_id != next.default_agent_id;
+            }
+            let default_agent_id = next.default_agent_id.clone();
+            Ok(RegistryMutation::persisted(AgentCreateOutcome {
+                previous_default_agent_id,
+                default_agent_id,
+                default_changed,
+                agent: record,
+            }))
         })
     }
 
@@ -506,17 +536,18 @@ impl AgentRegistry {
     ) -> Result<AgentSetDefaultOutcome, AgentRegistryError> {
         let agent_id = normalize_agent_id(agent_id)?;
         let mut guard = self.state.lock().map_err(|_| AgentRegistryError::LockPoisoned)?;
-        let mut next = guard.clone();
-        if !next.agents.iter().any(|agent| agent.agent_id == agent_id) {
-            return Err(AgentRegistryError::AgentNotFound(agent_id));
-        }
-        let previous_default_agent_id = next.default_agent_id.clone();
-        next.default_agent_id = Some(agent_id.clone());
-        if previous_default_agent_id != next.default_agent_id {
-            persist_registry(self.registry_path.as_path(), &next)?;
-            *guard = next;
-        }
-        Ok(AgentSetDefaultOutcome { previous_default_agent_id, default_agent_id: agent_id })
+        self.mutate_persisted_document(&mut guard, move |next| {
+            if !next.agents.iter().any(|agent| agent.agent_id == agent_id) {
+                return Err(AgentRegistryError::AgentNotFound(agent_id));
+            }
+            let previous_default_agent_id = next.default_agent_id.clone();
+            next.default_agent_id = Some(agent_id.clone());
+            let should_persist = previous_default_agent_id != next.default_agent_id;
+            Ok(RegistryMutation::new(
+                AgentSetDefaultOutcome { previous_default_agent_id, default_agent_id: agent_id },
+                should_persist,
+            ))
+        })
     }
 
     /// Startup helper that guarantees a usable default agent: keeps an
@@ -590,36 +621,36 @@ impl AgentRegistry {
         agent_id: &str,
         workspace_root: &Path,
     ) -> Result<bool, AgentRegistryError> {
+        let agent_id = normalize_agent_id(agent_id)?;
         let mut guard = self.state.lock().map_err(|_| AgentRegistryError::LockPoisoned)?;
-        let mut next = guard.clone();
-        let agent = next
-            .agents
-            .iter_mut()
-            .find(|candidate| candidate.agent_id == agent_id)
-            .ok_or_else(|| AgentRegistryError::AgentNotFound(agent_id.to_owned()))?;
-        if agent.agent_id != "local-default" {
-            return Ok(false);
-        }
+        self.mutate_persisted_document(&mut guard, move |next| {
+            let agent = next
+                .agents
+                .iter_mut()
+                .find(|candidate| candidate.agent_id == agent_id)
+                .ok_or_else(|| AgentRegistryError::AgentNotFound(agent_id.to_owned()))?;
+            if agent.agent_id != "local-default" {
+                return Ok(RegistryMutation::unchanged(false));
+            }
 
-        let agent_dir = PathBuf::from(agent.agent_dir.as_str());
-        let workspace_roots = resolve_workspace_roots(
-            &[workspace_root.to_string_lossy().into_owned()],
-            agent_dir.as_path(),
-            true,
-        )?;
-        let workspace_roots = workspace_roots
-            .iter()
-            .map(|path| path.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        if agent.workspace_roots == workspace_roots {
-            return Ok(false);
-        }
+            let agent_dir = PathBuf::from(agent.agent_dir.as_str());
+            let workspace_roots = resolve_workspace_roots(
+                &[workspace_root.to_string_lossy().into_owned()],
+                agent_dir.as_path(),
+                true,
+            )?;
+            let workspace_roots = workspace_roots
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            if agent.workspace_roots == workspace_roots {
+                return Ok(RegistryMutation::unchanged(false));
+            }
 
-        agent.workspace_roots = workspace_roots;
-        agent.updated_at_unix_ms = current_unix_ms()?;
-        persist_registry(self.registry_path.as_path(), &next)?;
-        *guard = next;
-        Ok(true)
+            agent.workspace_roots = workspace_roots;
+            agent.updated_at_unix_ms = current_unix_ms()?;
+            Ok(RegistryMutation::persisted(true))
+        })
     }
 
     /// Deletes an agent together with its session bindings; when the deleted
@@ -633,30 +664,29 @@ impl AgentRegistry {
     pub fn delete_agent(&self, agent_id: &str) -> Result<AgentDeleteOutcome, AgentRegistryError> {
         let agent_id = normalize_agent_id(agent_id)?;
         let mut guard = self.state.lock().map_err(|_| AgentRegistryError::LockPoisoned)?;
-        let mut next = guard.clone();
-        let index = next
-            .agents
-            .iter()
-            .position(|agent| agent.agent_id == agent_id)
-            .ok_or_else(|| AgentRegistryError::AgentNotFound(agent_id.clone()))?;
-        let removed_agent = next.agents.remove(index);
-        let previous_default_agent_id = next.default_agent_id.clone();
-        let removed_bindings_count =
-            next.session_bindings.iter().filter(|binding| binding.agent_id == agent_id).count();
-        next.session_bindings.retain(|binding| binding.agent_id != agent_id);
-        if previous_default_agent_id.as_deref() == Some(agent_id.as_str()) {
-            next.default_agent_id = next.agents.first().map(|agent| agent.agent_id.clone());
-        }
-        persist_registry(self.registry_path.as_path(), &next)?;
-        let default_agent_id = next.default_agent_id.clone();
-        *guard = next;
-        Ok(AgentDeleteOutcome {
-            deleted_agent_id: agent_id,
-            deleted: true,
-            removed_bindings_count,
-            previous_default_agent_id,
-            default_agent_id,
-            agent_dir: removed_agent.agent_dir,
+        self.mutate_persisted_document(&mut guard, move |next| {
+            let index = next
+                .agents
+                .iter()
+                .position(|agent| agent.agent_id == agent_id)
+                .ok_or_else(|| AgentRegistryError::AgentNotFound(agent_id.clone()))?;
+            let removed_agent = next.agents.remove(index);
+            let previous_default_agent_id = next.default_agent_id.clone();
+            let removed_bindings_count =
+                next.session_bindings.iter().filter(|binding| binding.agent_id == agent_id).count();
+            next.session_bindings.retain(|binding| binding.agent_id != agent_id);
+            if previous_default_agent_id.as_deref() == Some(agent_id.as_str()) {
+                next.default_agent_id = next.agents.first().map(|agent| agent.agent_id.clone());
+            }
+            let default_agent_id = next.default_agent_id.clone();
+            Ok(RegistryMutation::persisted(AgentDeleteOutcome {
+                deleted_agent_id: agent_id,
+                deleted: true,
+                removed_bindings_count,
+                previous_default_agent_id,
+                default_agent_id,
+                agent_dir: removed_agent.agent_dir,
+            }))
         })
     }
 
@@ -729,42 +759,41 @@ impl AgentRegistry {
             .map_err(|_| AgentRegistryError::InvalidSessionId(request.session_id.clone()))?;
 
         let mut guard = self.state.lock().map_err(|_| AgentRegistryError::LockPoisoned)?;
-        let mut next = guard.clone();
-        if !next.agents.iter().any(|agent| agent.agent_id == agent_id) {
-            return Err(AgentRegistryError::AgentNotFound(agent_id));
-        }
-        let now = current_unix_ms()?;
-        let mut created = false;
-        let binding = if let Some(existing) = next.session_bindings.iter_mut().find(|binding| {
-            binding.principal == principal
-                && binding.channel == channel
-                && binding.session_id == request.session_id
-        }) {
-            if existing.agent_id != agent_id {
-                existing.agent_id = agent_id.clone();
+        self.mutate_persisted_document(&mut guard, move |next| {
+            if !next.agents.iter().any(|agent| agent.agent_id == agent_id) {
+                return Err(AgentRegistryError::AgentNotFound(agent_id));
             }
-            existing.updated_at_unix_ms = now;
-            existing.clone()
-        } else {
-            created = true;
-            let binding = SessionAgentBinding {
-                principal: principal.clone(),
-                channel: channel.clone(),
-                session_id: request.session_id.clone(),
-                agent_id: agent_id.clone(),
-                updated_at_unix_ms: now,
+            let now = current_unix_ms()?;
+            let mut created = false;
+            let binding = if let Some(existing) = next.session_bindings.iter_mut().find(|binding| {
+                binding.principal == principal
+                    && binding.channel == channel
+                    && binding.session_id == request.session_id
+            }) {
+                if existing.agent_id != agent_id {
+                    existing.agent_id = agent_id.clone();
+                }
+                existing.updated_at_unix_ms = now;
+                existing.clone()
+            } else {
+                created = true;
+                let binding = SessionAgentBinding {
+                    principal: principal.clone(),
+                    channel: channel.clone(),
+                    session_id: request.session_id.clone(),
+                    agent_id: agent_id.clone(),
+                    updated_at_unix_ms: now,
+                };
+                next.session_bindings.push(binding.clone());
+                if next.session_bindings.len() > MAX_SESSION_BINDINGS {
+                    next.session_bindings
+                        .sort_by_key(|binding| std::cmp::Reverse(binding.updated_at_unix_ms));
+                    next.session_bindings.truncate(MAX_SESSION_BINDINGS);
+                }
+                binding
             };
-            next.session_bindings.push(binding.clone());
-            if next.session_bindings.len() > MAX_SESSION_BINDINGS {
-                next.session_bindings
-                    .sort_by_key(|binding| std::cmp::Reverse(binding.updated_at_unix_ms));
-                next.session_bindings.truncate(MAX_SESSION_BINDINGS);
-            }
-            binding
-        };
-        persist_registry(self.registry_path.as_path(), &next)?;
-        *guard = next;
-        Ok(AgentBindingOutcome { binding, created })
+            Ok(RegistryMutation::persisted(AgentBindingOutcome { binding, created }))
+        })
     }
 
     /// Removes the session binding for the request's context; a missing
@@ -784,18 +813,20 @@ impl AgentRegistry {
             .map_err(|_| AgentRegistryError::InvalidSessionId(request.session_id.clone()))?;
 
         let mut guard = self.state.lock().map_err(|_| AgentRegistryError::LockPoisoned)?;
-        let mut next = guard.clone();
-        let Some(index) = next.session_bindings.iter().position(|binding| {
-            binding.principal == principal
-                && binding.channel == channel
-                && binding.session_id == request.session_id
-        }) else {
-            return Ok(AgentUnbindOutcome { removed: false, removed_agent_id: None });
-        };
-        let removed_agent_id = Some(next.session_bindings.remove(index).agent_id);
-        persist_registry(self.registry_path.as_path(), &next)?;
-        *guard = next;
-        Ok(AgentUnbindOutcome { removed: true, removed_agent_id })
+        self.mutate_persisted_document(&mut guard, move |next| {
+            let Some(index) = next.session_bindings.iter().position(|binding| {
+                binding.principal == principal
+                    && binding.channel == channel
+                    && binding.session_id == request.session_id
+            }) else {
+                return Ok(RegistryMutation::unchanged(AgentUnbindOutcome {
+                    removed: false,
+                    removed_agent_id: None,
+                }));
+            };
+            let removed_agent_id = Some(next.session_bindings.remove(index).agent_id);
+            Ok(RegistryMutation::persisted(AgentUnbindOutcome { removed: true, removed_agent_id }))
+        })
     }
 
     /// Resolves which agent handles a request. Precedence: an explicit
@@ -822,93 +853,34 @@ impl AgentRegistry {
         } else {
             None
         };
-
-        let mut guard = self.state.lock().map_err(|_| AgentRegistryError::LockPoisoned)?;
-        if guard.agents.is_empty() {
-            return Err(AgentRegistryError::DefaultAgentNotConfigured);
-        }
-        let mut next = guard.clone();
-
         let preferred_agent_id =
             request.preferred_agent_id.as_deref().map(normalize_agent_id).transpose()?;
-        let mut source = AgentResolutionSource::Fallback;
-        let resolved_agent_id = if let Some(preferred) = preferred_agent_id {
-            if !next.agents.iter().any(|agent| agent.agent_id == preferred) {
-                return Err(AgentRegistryError::AgentNotFound(preferred));
-            }
-            preferred
-        } else if let Some(session_id_value) = session_id.as_deref() {
-            if let Some(binding) = next.session_bindings.iter().find(|binding| {
-                binding.principal == principal
-                    && binding.channel == channel
-                    && binding.session_id == session_id_value
-            }) {
-                source = AgentResolutionSource::SessionBinding;
-                binding.agent_id.clone()
-            } else if let Some(default_agent_id) = next.default_agent_id.clone() {
-                source = AgentResolutionSource::Default;
-                default_agent_id
-            } else {
-                next.agents
-                    .first()
-                    .map(|agent| agent.agent_id.clone())
-                    .ok_or(AgentRegistryError::DefaultAgentNotConfigured)?
-            }
-        } else if let Some(default_agent_id) = next.default_agent_id.clone() {
-            source = AgentResolutionSource::Default;
-            default_agent_id
-        } else {
-            next.agents
-                .first()
-                .map(|agent| agent.agent_id.clone())
-                .ok_or(AgentRegistryError::DefaultAgentNotConfigured)?
-        };
+        let persist_session_binding = request.persist_session_binding;
 
-        let mut binding_created = false;
-        if request.persist_session_binding {
-            if let Some(session_id_value) = session_id {
-                let now = current_unix_ms()?;
-                if let Some(binding) = next.session_bindings.iter_mut().find(|binding| {
-                    binding.principal == principal
-                        && binding.channel == channel
-                        && binding.session_id == session_id_value
-                }) {
-                    if binding.agent_id != resolved_agent_id {
-                        binding.agent_id = resolved_agent_id.clone();
-                        binding.updated_at_unix_ms = now;
-                        binding_created = true;
-                    }
-                } else {
-                    next.session_bindings.push(SessionAgentBinding {
-                        principal: principal.clone(),
-                        channel: channel.clone(),
-                        session_id: session_id_value,
-                        agent_id: resolved_agent_id.clone(),
-                        updated_at_unix_ms: now,
-                    });
-                    binding_created = true;
-                }
-                if next.session_bindings.len() > MAX_SESSION_BINDINGS {
-                    next.session_bindings.sort_by(|left, right| {
-                        right.updated_at_unix_ms.cmp(&left.updated_at_unix_ms)
-                    });
-                    next.session_bindings.truncate(MAX_SESSION_BINDINGS);
-                }
-            }
+        let mut guard = self.state.lock().map_err(|_| AgentRegistryError::LockPoisoned)?;
+        if persist_session_binding {
+            return self.mutate_persisted_document(&mut guard, move |next| {
+                resolve_agent_for_context_from_document(
+                    next,
+                    principal,
+                    channel,
+                    session_id,
+                    preferred_agent_id,
+                    true,
+                )
+            });
         }
 
-        let agent = next
-            .agents
-            .iter()
-            .find(|candidate| candidate.agent_id == resolved_agent_id)
-            .cloned()
-            .ok_or_else(|| AgentRegistryError::AgentNotFound(resolved_agent_id.clone()))?;
-        let is_default = next.default_agent_id.as_deref() == Some(resolved_agent_id.as_str());
-        if binding_created {
-            persist_registry(self.registry_path.as_path(), &next)?;
-            *guard = next;
-        }
-        Ok(AgentResolveOutcome { is_default, agent, source, binding_created })
+        let mut snapshot = guard.clone();
+        let mutation = resolve_agent_for_context_from_document(
+            &mut snapshot,
+            principal,
+            channel,
+            session_id,
+            preferred_agent_id,
+            false,
+        )?;
+        Ok(mutation.outcome)
     }
 
     /// Returns a consistent snapshot of the default selection, agent count,
@@ -925,6 +897,99 @@ impl AgentRegistry {
             session_bindings: guard.session_bindings.clone(),
         })
     }
+}
+
+fn resolve_agent_for_context_from_document(
+    document: &mut RegistryDocument,
+    principal: String,
+    channel: Option<String>,
+    session_id: Option<String>,
+    preferred_agent_id: Option<String>,
+    persist_session_binding: bool,
+) -> Result<RegistryMutation<AgentResolveOutcome>, AgentRegistryError> {
+    if document.agents.is_empty() {
+        return Err(AgentRegistryError::DefaultAgentNotConfigured);
+    }
+
+    let mut source = AgentResolutionSource::Fallback;
+    let resolved_agent_id = if let Some(preferred) = preferred_agent_id {
+        if !document.agents.iter().any(|agent| agent.agent_id == preferred) {
+            return Err(AgentRegistryError::AgentNotFound(preferred));
+        }
+        preferred
+    } else if let Some(session_id_value) = session_id.as_deref() {
+        if let Some(binding) = document.session_bindings.iter().find(|binding| {
+            binding.principal == principal
+                && binding.channel == channel
+                && binding.session_id == session_id_value
+        }) {
+            source = AgentResolutionSource::SessionBinding;
+            binding.agent_id.clone()
+        } else if let Some(default_agent_id) = document.default_agent_id.clone() {
+            source = AgentResolutionSource::Default;
+            default_agent_id
+        } else {
+            document
+                .agents
+                .first()
+                .map(|agent| agent.agent_id.clone())
+                .ok_or(AgentRegistryError::DefaultAgentNotConfigured)?
+        }
+    } else if let Some(default_agent_id) = document.default_agent_id.clone() {
+        source = AgentResolutionSource::Default;
+        default_agent_id
+    } else {
+        document
+            .agents
+            .first()
+            .map(|agent| agent.agent_id.clone())
+            .ok_or(AgentRegistryError::DefaultAgentNotConfigured)?
+    };
+
+    let mut binding_created = false;
+    if persist_session_binding {
+        if let Some(session_id_value) = session_id {
+            let now = current_unix_ms()?;
+            if let Some(binding) = document.session_bindings.iter_mut().find(|binding| {
+                binding.principal == principal
+                    && binding.channel == channel
+                    && binding.session_id == session_id_value
+            }) {
+                if binding.agent_id != resolved_agent_id {
+                    binding.agent_id = resolved_agent_id.clone();
+                    binding.updated_at_unix_ms = now;
+                    binding_created = true;
+                }
+            } else {
+                document.session_bindings.push(SessionAgentBinding {
+                    principal,
+                    channel,
+                    session_id: session_id_value,
+                    agent_id: resolved_agent_id.clone(),
+                    updated_at_unix_ms: now,
+                });
+                binding_created = true;
+            }
+            if document.session_bindings.len() > MAX_SESSION_BINDINGS {
+                document
+                    .session_bindings
+                    .sort_by_key(|binding| std::cmp::Reverse(binding.updated_at_unix_ms));
+                document.session_bindings.truncate(MAX_SESSION_BINDINGS);
+            }
+        }
+    }
+
+    let agent = document
+        .agents
+        .iter()
+        .find(|candidate| candidate.agent_id == resolved_agent_id)
+        .cloned()
+        .ok_or_else(|| AgentRegistryError::AgentNotFound(resolved_agent_id.clone()))?;
+    let is_default = document.default_agent_id.as_deref() == Some(resolved_agent_id.as_str());
+    Ok(RegistryMutation::new(
+        AgentResolveOutcome { is_default, agent, source, binding_created },
+        binding_created,
+    ))
 }
 
 fn resolve_state_root(identity_store_root: &Path) -> Result<PathBuf, AgentRegistryError> {
@@ -1041,11 +1106,38 @@ fn normalize_document(
     Ok(())
 }
 
-// AIDEV-NOTE: the lock file only serializes the write itself; the surrounding
-// read-modify-write cycle is guarded by the in-process Mutex, not across
-// processes. Two daemons sharing one registry can therefore lose each other's
-// updates (last writer wins) even though no write is ever torn.
-fn persist_registry(path: &Path, document: &RegistryDocument) -> Result<(), AgentRegistryError> {
+fn load_and_persist_registry_document(
+    path: &Path,
+    state_root: &Path,
+) -> Result<RegistryDocument, AgentRegistryError> {
+    prepare_registry_parent(path)?;
+    let _file_lock = acquire_registry_lock(path)
+        .map_err(|source| AgentRegistryError::WriteRegistry { path: path.to_path_buf(), source })?;
+    let document = load_registry_document(path, state_root)?;
+    persist_registry_locked(path, &document)?;
+    Ok(document)
+}
+
+fn load_registry_document(
+    path: &Path,
+    state_root: &Path,
+) -> Result<RegistryDocument, AgentRegistryError> {
+    let mut document = if path.exists() {
+        let raw = fs::read_to_string(path).map_err(|source| AgentRegistryError::ReadRegistry {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        toml::from_str::<RegistryDocument>(&raw).map_err(|source| {
+            AgentRegistryError::ParseRegistry { path: path.to_path_buf(), source: Box::new(source) }
+        })?
+    } else {
+        RegistryDocument::default()
+    };
+    normalize_document(&mut document, state_root)?;
+    Ok(document)
+}
+
+fn prepare_registry_parent(path: &Path) -> Result<(), AgentRegistryError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| AgentRegistryError::WriteRegistry {
             path: parent.to_path_buf(),
@@ -1055,8 +1147,13 @@ fn persist_registry(path: &Path, document: &RegistryDocument) -> Result<(), Agen
             AgentRegistryError::WriteRegistry { path: parent.to_path_buf(), source }
         })?;
     }
-    let _lock = acquire_registry_lock(path)
-        .map_err(|source| AgentRegistryError::WriteRegistry { path: path.to_path_buf(), source })?;
+    Ok(())
+}
+
+fn persist_registry_locked(
+    path: &Path,
+    document: &RegistryDocument,
+) -> Result<(), AgentRegistryError> {
     let payload = toml::to_string_pretty(document)?;
     write_registry_atomically(path, payload.as_str())
         .map_err(|source| AgentRegistryError::WriteRegistry { path: path.to_path_buf(), source })
@@ -1685,6 +1782,50 @@ mod tests {
             "in-memory registry must not include agent when persistence failed"
         );
         assert_eq!(page.agents[0].agent_id, "main");
+        assert_eq!(page.default_agent_id.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn create_agent_merges_disk_state_from_stale_registry_handle() {
+        let temp = tempdir().expect("tempdir should be created");
+        let identity_root = temp.path().join("state").join("identity");
+        let first =
+            AgentRegistry::open(identity_root.as_path()).expect("first registry should initialize");
+        let second = AgentRegistry::open(identity_root.as_path())
+            .expect("second registry should initialize");
+
+        first
+            .create_agent(AgentCreateRequest {
+                agent_id: "main".to_owned(),
+                display_name: "Main".to_owned(),
+                agent_dir: Some("agents/main".to_owned()),
+                workspace_roots: vec!["workspace".to_owned()],
+                default_model_profile: Some("gpt-4o-mini".to_owned()),
+                execution_backend_preference: None,
+                default_tool_allowlist: Vec::new(),
+                default_skill_allowlist: Vec::new(),
+                set_default: true,
+                allow_absolute_paths: false,
+            })
+            .expect("first registry should create main agent");
+        second
+            .create_agent(AgentCreateRequest {
+                agent_id: "review".to_owned(),
+                display_name: "Review".to_owned(),
+                agent_dir: Some("agents/review".to_owned()),
+                workspace_roots: vec!["workspace".to_owned()],
+                default_model_profile: Some("gpt-4o-mini".to_owned()),
+                execution_backend_preference: None,
+                default_tool_allowlist: Vec::new(),
+                default_skill_allowlist: Vec::new(),
+                set_default: false,
+                allow_absolute_paths: false,
+            })
+            .expect("stale registry handle should merge with current disk state");
+
+        let page = second.list_agents(None, Some(10)).expect("agents should list");
+        let agent_ids = page.agents.iter().map(|agent| agent.agent_id.as_str()).collect::<Vec<_>>();
+        assert_eq!(agent_ids, vec!["main", "review"]);
         assert_eq!(page.default_agent_id.as_deref(), Some("main"));
     }
 
