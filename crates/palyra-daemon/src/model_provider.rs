@@ -4521,18 +4521,13 @@ impl OpenAiCompatibleProvider {
                     "openai_compatible_audio_response_json",
                 )
             })?;
-        // AIDEV-NOTE: `as u64 * 1_000` floors provider seconds to whole
-        // seconds before converting to ms, discarding sub-second precision
-        // for segment boundaries and total duration (e.g. 1.75s -> 1000ms).
-        // The fix is `(value * 1000.0) as u64`, but that changes persisted
-        // timestamp values, so it needs a deliberate behavior change.
         let segments = parsed
             .segments
             .into_iter()
             .filter(|segment| !segment.text.trim().is_empty())
             .map(|segment| AudioTranscriptionSegment {
-                start_ms: segment.start.unwrap_or_default().max(0.0) as u64 * 1_000,
-                end_ms: segment.end.unwrap_or_default().max(0.0) as u64 * 1_000,
+                start_ms: provider_seconds_to_millis(segment.start.unwrap_or_default()),
+                end_ms: provider_seconds_to_millis(segment.end.unwrap_or_default()),
                 text: segment.text,
                 // OpenAI verbose_json reports avg_logprob; exp() maps it back
                 // to an approximate per-segment probability in (0, 1].
@@ -4542,7 +4537,7 @@ impl OpenAiCompatibleProvider {
         Ok(AudioTranscriptionResponse {
             text: parsed.text,
             language: parsed.language,
-            duration_ms: parsed.duration.map(|value| value.max(0.0) as u64 * 1_000),
+            duration_ms: parsed.duration.map(provider_seconds_to_millis),
             model_name: self.transcription_model_name().to_owned(),
             retry_count: 0,
             segments,
@@ -5453,6 +5448,18 @@ fn current_unix_ms() -> Result<i64, std::time::SystemTimeError> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64)
 }
 
+fn provider_seconds_to_millis(seconds: f64) -> u64 {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return 0;
+    }
+    let milliseconds = seconds * 1_000.0;
+    if milliseconds >= u64::MAX as f64 {
+        u64::MAX
+    } else {
+        milliseconds as u64
+    }
+}
+
 fn route_selection_from_status_snapshot(
     snapshot: &ProviderStatusSnapshot,
 ) -> ProviderRouteSelectionTrace {
@@ -5827,18 +5834,27 @@ mod tests {
     use super::{
         build_embeddings_provider, build_model_provider, capability_defaults_for_kind,
         classify_http_provider_failure, classify_transport_provider_failure,
-        extract_completion_text, normalize_tool_arguments, sanitize_remote_error,
-        validate_openai_base_url_network_policy_with_resolver, AnthropicCompatibleChatAdapter,
-        EmbeddingsRequest, ModelProviderAuthProviderKind, ModelProviderConfig, ModelProviderKind,
-        ModelProviderRegistryConfig, OpenAiCompatibleChatAdapter, ProviderChatAdapter,
-        ProviderError, ProviderEvent, ProviderFailureAction, ProviderFailureClass,
-        ProviderFinishReason, ProviderImageInput, ProviderMessage, ProviderMessageContentPart,
-        ProviderMessageRole, ProviderMessageToolCall, ProviderMetadataSource,
-        ProviderModelEntryConfig, ProviderModelRole, ProviderOutputContentPart,
-        ProviderRawProviderRefs, ProviderRegistryEntryConfig, ProviderRequest,
-        ProviderRetryability, ProviderStreamAccumulator, ProviderStreamEvent, ProviderTurnOutput,
-        ProviderUsage, OPENAI_RETRYABLE_STATUS_CODES,
+        extract_completion_text, normalize_tool_arguments, provider_seconds_to_millis,
+        sanitize_remote_error, validate_openai_base_url_network_policy_with_resolver,
+        AnthropicCompatibleChatAdapter, EmbeddingsRequest, ModelProviderAuthProviderKind,
+        ModelProviderConfig, ModelProviderKind, ModelProviderRegistryConfig,
+        OpenAiCompatibleChatAdapter, ProviderChatAdapter, ProviderError, ProviderEvent,
+        ProviderFailureAction, ProviderFailureClass, ProviderFinishReason, ProviderImageInput,
+        ProviderMessage, ProviderMessageContentPart, ProviderMessageRole, ProviderMessageToolCall,
+        ProviderMetadataSource, ProviderModelEntryConfig, ProviderModelRole,
+        ProviderOutputContentPart, ProviderRawProviderRefs, ProviderRegistryEntryConfig,
+        ProviderRequest, ProviderRetryability, ProviderStreamAccumulator, ProviderStreamEvent,
+        ProviderTurnOutput, ProviderUsage, OPENAI_RETRYABLE_STATUS_CODES,
     };
+
+    #[test]
+    fn provider_seconds_to_millis_preserves_subsecond_precision() {
+        assert_eq!(provider_seconds_to_millis(1.75), 1_750);
+        assert_eq!(provider_seconds_to_millis(0.125), 125);
+        assert_eq!(provider_seconds_to_millis(-1.0), 0);
+        assert_eq!(provider_seconds_to_millis(f64::INFINITY), 0);
+        assert_eq!(provider_seconds_to_millis(u64::MAX as f64), u64::MAX);
+    }
 
     #[test]
     fn transport_timeout_classification_is_actionable() {
