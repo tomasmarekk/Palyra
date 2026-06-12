@@ -11,19 +11,16 @@ pub(crate) fn current_unix_ms() -> i64 {
 }
 
 /// Redacts a session identifier for logs and console payloads, keeping only
-/// the first and last four characters (`abcd***wxyz`); ids of 8 bytes or
-/// fewer collapse entirely to `***`.
-// AIDEV-NOTE: the byte slices below panic if a multi-byte UTF-8 character
-// straddles index 4 or len-4. Safe today because every caller passes ASCII
-// ULIDs/identifiers; switch to `get(..4)`-style slicing if this is ever fed
-// arbitrary client input (behavior change: panic -> redaction, hence not
-// fixed in this documentation-only pass).
+/// the first and last four characters (`abcd***wxyz`); ids of 8 characters
+/// or fewer collapse entirely to `***`.
 pub(crate) fn redact_session_id(session_id: &str) -> String {
-    if session_id.len() <= 8 {
+    let char_count = session_id.chars().count();
+    if char_count <= 8 {
         return "***".to_owned();
     }
-    let prefix = &session_id[..4];
-    let suffix = &session_id[session_id.len().saturating_sub(4)..];
+    let prefix = session_id.chars().take(4).collect::<String>();
+    let suffix =
+        session_id.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect::<String>();
     format!("{prefix}***{suffix}")
 }
 
@@ -161,5 +158,22 @@ pub(crate) fn non_empty(input: String) -> Option<String> {
         None
     } else {
         Some(input)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_session_id;
+
+    #[test]
+    fn redact_session_id_preserves_ascii_shape() {
+        assert_eq!(redact_session_id("01HABCDEFGHJKLMNPQRS"), "01HA***PQRS");
+        assert_eq!(redact_session_id("12345678"), "***");
+    }
+
+    #[test]
+    fn redact_session_id_handles_multibyte_input() {
+        assert_eq!(redact_session_id("áβçďEFGHíjkl"), "áβçď***íjkl");
+        assert_eq!(redact_session_id("áβçďEFGH"), "***");
     }
 }

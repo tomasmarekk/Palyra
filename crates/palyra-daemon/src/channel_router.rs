@@ -568,9 +568,7 @@ impl ChannelRouter {
                 config_hash,
             };
         }
-        if message.text.len() > self.config.max_message_bytes
-            || (message.max_payload_bytes as usize) > self.config.max_message_bytes
-        {
+        if message_exceeds_size_limit(message, self.config.max_message_bytes) {
             return RoutePreview {
                 accepted: false,
                 reason: "message_oversized".to_owned(),
@@ -901,14 +899,7 @@ impl ChannelRouter {
                 ),
             });
         }
-        // AIDEV-NOTE: `max_payload_bytes as usize` truncates on 32-bit
-        // targets, so an adapter-declared payload size above u32::MAX could
-        // slip past this oversize gate there. Lossless on the 64-bit
-        // targets CI builds; fix by comparing in u64 (also in
-        // preview_route, which mirrors this expression).
-        if message.text.len() > self.config.max_message_bytes
-            || (message.max_payload_bytes as usize) > self.config.max_message_bytes
-        {
+        if message_exceeds_size_limit(message, self.config.max_message_bytes) {
             return RouteOutcome::Rejected(RouteRejection {
                 reason: "message_oversized".to_owned(),
                 quarantined: self.quarantine_message(
@@ -1482,6 +1473,10 @@ fn sender_identity(message: &InboundMessage) -> Option<String> {
         .or_else(|| normalize_non_empty(message.sender_display.as_deref().unwrap_or_default()))
 }
 
+fn message_exceeds_size_limit(message: &InboundMessage, max_message_bytes: usize) -> bool {
+    message.text.len() > max_message_bytes || message.max_payload_bytes > max_message_bytes as u64
+}
+
 fn normalize_non_empty(value: &str) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -1618,6 +1613,23 @@ mod tests {
         assert_eq!(routed.plan.session_key, "channel:slack:conversation:C01TEAM");
         assert_eq!(routed.plan.response_prefix.as_deref(), Some("[bot] "));
         routed.lease.release();
+    }
+
+    #[test]
+    fn oversized_declared_payload_is_rejected_without_usize_truncation() {
+        let router = ChannelRouter::new(baseline_config());
+        let mut message = inbound("hello @palyra");
+        message.max_payload_bytes = u64::MAX;
+
+        let preview = router.preview_route(&message);
+        assert!(!preview.accepted);
+        assert_eq!(preview.reason, "message_oversized");
+
+        let outcome = router.begin_route(&message);
+        assert!(matches!(
+            outcome,
+            RouteOutcome::Rejected(ref rejection) if rejection.reason == "message_oversized"
+        ));
     }
 
     #[test]
