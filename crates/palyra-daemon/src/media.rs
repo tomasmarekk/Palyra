@@ -21,7 +21,7 @@ use std::{
 };
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use reqwest::{redirect::Policy, Client as HttpClient, Url};
+use reqwest::{redirect::Policy, Client as HttpClient, ClientBuilder as HttpClientBuilder, Url};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -429,7 +429,6 @@ struct MediaDerivedArtifactRow {
 pub struct MediaArtifactStore {
     content_root: PathBuf,
     config: MediaRuntimeConfig,
-    http_client: HttpClient,
     connection: Mutex<Connection>,
     maintenance: Mutex<MediaMaintenanceState>,
 }
@@ -440,8 +439,8 @@ impl MediaArtifactStore {
     ///
     /// # Errors
     /// Returns [`MediaStoreError::Io`] if directories cannot be created,
-    /// [`MediaStoreError::Download`] if the HTTP client cannot be built, and
-    /// [`MediaStoreError::Sql`] if the database cannot be opened or migrated.
+    /// and [`MediaStoreError::Sql`] if the database cannot be opened or
+    /// migrated.
     pub fn open(
         db_path: PathBuf,
         content_root: PathBuf,
@@ -465,7 +464,6 @@ impl MediaArtifactStore {
         let store = Self {
             content_root,
             config,
-            http_client: build_media_http_client()?,
             connection: Mutex::new(connection),
             maintenance: Mutex::new(MediaMaintenanceState {
                 last_retention_prune_unix_ms: current_unix_ms()
@@ -1942,16 +1940,12 @@ impl MediaArtifactStore {
         // bounce the daemon to an arbitrary or private target.
         let mut redirects_followed = 0usize;
         let body = loop {
-            // AIDEV-NOTE: this netguard check resolves DNS once, but reqwest
-            // resolves again independently when sending the request, leaving a
-            // DNS-rebinding window between the two lookups. Closing it needs a
-            // behavior change (pin the validated addresses via the client's
-            // resolve override); the host allowlist limits exposure to
-            // attacker-influenced allowlisted hosts in the meantime.
             let resolved = resolve_target_addresses(&current_url).await?;
             validate_resolved_addresses(resolved.as_slice())?;
+            let pinned_client =
+                build_media_http_client_with_resolved_addresses(&current_url, resolved.as_slice())?;
             let response =
-                self.http_client.get(current_url.clone()).send().await.map_err(|error| {
+                pinned_client.get(current_url.clone()).send().await.map_err(|error| {
                     MediaStoreError::Download(format!(
                         "attachment download request failed: {error}"
                     ))
@@ -2936,12 +2930,27 @@ struct MediaMaintenanceState {
     deferred_ingests: u32,
 }
 
-fn build_media_http_client() -> Result<HttpClient, MediaStoreError> {
+fn build_media_http_client_with_resolved_addresses(
+    url: &Url,
+    resolved_addresses: &[SocketAddr],
+) -> Result<HttpClient, MediaStoreError> {
+    let host = url.host_str().ok_or_else(|| {
+        MediaStoreError::NetworkPolicy("attachment URL host is missing".to_owned())
+    })?;
+    if resolved_addresses.is_empty() {
+        return Err(MediaStoreError::NetworkPolicy(format!(
+            "DNS resolution returned no addresses for '{host}'"
+        )));
+    }
+    media_http_client_builder().resolve_to_addrs(host, resolved_addresses).build().map_err(
+        |error| MediaStoreError::Download(format!("failed to build pinned media client: {error}")),
+    )
+}
+
+fn media_http_client_builder() -> HttpClientBuilder {
     // Policy::none is deliberate: redirects are followed manually in
     // download_and_store_discord_attachment so each hop can be re-validated.
-    HttpClient::builder().redirect(Policy::none()).timeout(Duration::from_secs(15)).build().map_err(
-        |error| MediaStoreError::Download(format!("failed to build media client: {error}")),
-    )
+    HttpClient::builder().redirect(Policy::none()).timeout(Duration::from_secs(15))
 }
 
 fn should_prune_retention_after_ingest(state: &MediaMaintenanceState, now_unix_ms: i64) -> bool {
@@ -2955,9 +2964,10 @@ fn should_prune_retention_after_ingest(state: &MediaMaintenanceState, now_unix_m
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{net::SocketAddr, sync::Arc};
 
     use palyra_connectors::{AttachmentKind, AttachmentRef};
+    use reqwest::Url;
     use rusqlite::params;
     use tempfile::TempDir;
     use tokio::{
@@ -2968,7 +2978,8 @@ mod tests {
     use crate::media_derived::{DerivedArtifactContent, DerivedArtifactKind};
 
     use super::{
-        content_relative_path, read_response_body_with_limit, resolve_content_storage_path,
+        build_media_http_client_with_resolved_addresses, content_relative_path,
+        read_response_body_with_limit, resolve_content_storage_path,
         should_prune_retention_after_ingest, sniff_content, ConsoleAttachmentStoreRequest,
         InboundAttachmentIngestRequest, MediaArtifactStore, MediaDerivedArtifactUpsertRequest,
         MediaMaintenanceState, MediaRuntimeConfig, RETENTION_PRUNE_MAX_DEFERRED_INGESTS,
@@ -3358,6 +3369,50 @@ mod tests {
         assert!(ingested.artifact_ref.is_none());
         let snapshot = store.build_global_snapshot().expect("global snapshot should succeed");
         assert_eq!(snapshot.recent_blocked_reasons.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn media_http_client_uses_pinned_resolved_address() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("test listener should bind");
+        let address = listener.local_addr().expect("listener should expose address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("server should accept connection");
+            let mut request = [0u8; 1024];
+            let bytes_read = stream.read(&mut request).await.expect("server should read request");
+            let request_text = String::from_utf8_lossy(&request[..bytes_read]);
+            assert!(
+                request_text.starts_with("GET /fixture.txt "),
+                "client should request the URL path through the pinned address"
+            );
+            assert!(
+                request_text.contains("host: cdn.discordapp.com")
+                    || request_text.contains("Host: cdn.discordapp.com"),
+                "client should preserve the original allowlisted host header"
+            );
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 6\r\nConnection: close\r\n\r\npinned",
+                )
+                .await
+                .expect("server should write response");
+        });
+        let url =
+            Url::parse("http://cdn.discordapp.com/fixture.txt").expect("test URL should parse");
+        let addrs: [SocketAddr; 1] = [address];
+        let client = build_media_http_client_with_resolved_addresses(&url, &addrs)
+            .expect("pinned client should build");
+
+        let body = client
+            .get(url)
+            .send()
+            .await
+            .expect("client should connect to pinned address")
+            .text()
+            .await
+            .expect("response body should decode");
+        server.await.expect("server task should complete");
+
+        assert_eq!(body, "pinned");
     }
 
     #[tokio::test]
