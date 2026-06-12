@@ -516,7 +516,7 @@ fn windows_code_page_to_string(bytes: &[u8], code_page: u32) -> Option<String> {
 fn query_windows_task_status(metadata: &GatewayServiceMetadata) -> Result<GatewayServiceStatus> {
     let task_name = format!("\\{}", metadata.service_name);
     let output = Command::new("schtasks")
-        .args(["/Query", "/TN", task_name.as_str(), "/V", "/FO", "LIST"])
+        .args(["/Query", "/TN", task_name.as_str(), "/FO", "CSV", "/NH"])
         .output()
         .context("failed to query gateway scheduled task status")?;
     if !output.status.success() {
@@ -529,17 +529,25 @@ fn query_windows_task_status(metadata: &GatewayServiceMetadata) -> Result<Gatewa
             definition_path: Some(metadata.definition_path.clone()),
             stdout_log_path: Some(metadata.stdout_log_path.clone()),
             stderr_log_path: Some(metadata.stderr_log_path.clone()),
-            detail: Some(String::from_utf8_lossy(&output.stderr).trim().to_owned()),
+            detail: Some(decode_windows_process_output(&output.stderr).trim().to_owned()),
         });
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    // AIDEV-NOTE: schtasks /Query localizes its LIST output, so these English
-    // markers never match on non-English Windows and `running` is reported as
-    // false even when the task runs. Fixing this needs a locale-independent
-    // query (e.g. /FO CSV column positions or the Task Scheduler COM/PowerShell
-    // API) plus decode_windows_process_output-style code-page handling.
-    let running =
-        text.contains("Status: Running") || text.contains("Scheduled Task State: Running");
+    let text = decode_windows_process_output(&output.stdout);
+    let fields = parse_schtasks_csv_row(text.as_str());
+    let running = fields
+        .as_ref()
+        .and_then(|fields| fields.get(2))
+        .is_some_and(|status| is_schtasks_running_status(status));
+    let detail = fields
+        .as_ref()
+        .and_then(|fields| fields.get(1))
+        .filter(|next_run_time| !next_run_time.trim().is_empty())
+        .map(|next_run_time| format!("next_run_time={}", next_run_time.trim()))
+        .or_else(|| {
+            text.lines()
+                .find(|line| !line.trim().is_empty())
+                .map(|line| format!("unexpected schtasks CSV output: {}", line.trim()))
+        });
     Ok(GatewayServiceStatus {
         installed: true,
         running,
@@ -549,14 +557,45 @@ fn query_windows_task_status(metadata: &GatewayServiceMetadata) -> Result<Gatewa
         definition_path: Some(metadata.definition_path.clone()),
         stdout_log_path: Some(metadata.stdout_log_path.clone()),
         stderr_log_path: Some(metadata.stderr_log_path.clone()),
-        detail: Some(
-            text.lines()
-                .find(|line| line.contains("Next Run Time"))
-                .unwrap_or_default()
-                .trim()
-                .to_owned(),
-        ),
+        detail,
     })
+}
+
+#[cfg(windows)]
+fn parse_schtasks_csv_row(text: &str) -> Option<Vec<String>> {
+    text.lines().map(str::trim).find(|line| !line.is_empty()).and_then(parse_csv_record)
+}
+
+#[cfg(windows)]
+fn parse_csv_record(line: &str) -> Option<Vec<String>> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut chars = line.chars().peekable();
+    let mut in_quotes = false;
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if in_quotes && chars.peek() == Some(&'"') => {
+                field.push('"');
+                let _ = chars.next();
+            }
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                fields.push(field.trim().to_owned());
+                field.clear();
+            }
+            _ => field.push(ch),
+        }
+    }
+    if in_quotes {
+        return None;
+    }
+    fields.push(field.trim().to_owned());
+    Some(fields)
+}
+
+#[cfg(windows)]
+fn is_schtasks_running_status(status: &str) -> bool {
+    status.trim().eq_ignore_ascii_case("running")
 }
 
 #[cfg(windows)]
@@ -987,7 +1026,10 @@ fn current_uid() -> Result<u32> {
 #[cfg(test)]
 mod tests {
     #[cfg(windows)]
-    use super::{decode_windows_process_output, summarize_command_output};
+    use super::{
+        decode_windows_process_output, is_schtasks_running_status, parse_schtasks_csv_row,
+        summarize_command_output,
+    };
     use super::{
         default_service_name, load_service_metadata, query_gateway_service_status,
         require_service_metadata, service_metadata_path, GatewayServiceMetadata,
@@ -1104,5 +1146,28 @@ mod tests {
             !decoded.contains("non-UTF-8"),
             "Windows code-page fallback should decode non-UTF-8 process output: {decoded}"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn schtasks_csv_row_parser_reads_status_by_position() {
+        let fields = parse_schtasks_csv_row("\"\\PalyraGateway\",\"N/A\",\"Running\"\r\n")
+            .expect("schtasks CSV row should parse");
+
+        assert_eq!(fields.get(1).map(String::as_str), Some("N/A"));
+        assert!(fields.get(2).is_some_and(|value| is_schtasks_running_status(value)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn schtasks_csv_row_parser_handles_quoted_commas_and_escaped_quotes() {
+        let fields = parse_schtasks_csv_row(
+            "\"\\Palyra, Gateway\",\"6/12/2026 1:00:00 PM\",\"Ready\",\"author \"\"ops\"\"\"\r\n",
+        )
+        .expect("quoted schtasks CSV row should parse");
+
+        assert_eq!(fields[0], "\\Palyra, Gateway");
+        assert_eq!(fields[3], "author \"ops\"");
+        assert!(!is_schtasks_running_status(&fields[2]));
     }
 }
