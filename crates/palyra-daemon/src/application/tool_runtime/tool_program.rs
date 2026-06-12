@@ -147,10 +147,6 @@ impl ToolParallelism {
     }
 }
 
-// AIDEV-NOTE: retry_policy is validated (positive max_attempts, retries
-// require an idempotency_key) but not yet enforced: execute_program_step
-// runs each step exactly once regardless of max_attempts. Enforcing it is a
-// behavior change left for a dedicated fix.
 #[derive(Debug, Clone, Deserialize)]
 struct ToolProgramStepRetryPolicy {
     #[serde(default = "default_retry_max_attempts")]
@@ -256,6 +252,19 @@ struct ToolProgramBudgetReport {
     saved_model_visible_bytes: u64,
 }
 
+#[derive(Debug)]
+struct ToolProgramExecution {
+    response: ToolProgramRunResponse,
+    final_error: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToolProgramJobCompletion {
+    next_state: ToolJobState,
+    reason: String,
+    last_error: Option<String>,
+}
+
 /// Executes one `palyra.tool_program.run` proposal.
 ///
 /// Never fails at the tool boundary: parse/validation errors and runtime
@@ -324,11 +333,6 @@ async fn execute_validated_program(
         build_python_tool_rpc_bridge_context(proposal_id, request.program_id.as_str(), &grants);
     let python_sdk_bytes = python_tool_rpc_sdk_source().len();
     let job_id = Ulid::new().to_string();
-    // AIDEV-NOTE: every early `?` exit below this point (registry failures,
-    // cancellation-check errors, step serialization/artifact errors) returns
-    // before the transition_tool_job call at the end, leaving the durable
-    // tool job parked in Running. Transitioning the job on those error paths
-    // is a behavior change left for a dedicated fix.
     runtime_state
         .create_tool_job(ToolJobCreateRequest {
             job_id: job_id.clone(),
@@ -352,200 +356,250 @@ async fn execute_validated_program(
         })
         .await
         .map_err(|status| format!("failed to create tool program job: {}", status.message()))?;
-    let mut process_registry = ProcessRegistry::default();
-    let mut background_registry = BackgroundTaskRegistry::default();
-    let cleanup_policy = CleanupPolicy::tool_program_default();
-    background_registry.register(BackgroundTaskRecord {
-        task_id: format!("tool-program:{}", request.program_id),
-        owner: context.run_id.to_owned(),
-        purpose: "palyra.tool_program.run".to_owned(),
-        started_at_unix_ms: current_unix_ms(),
-        cancellation_handle: format!("cancel:{proposal_id}"),
-        cleanup_policy: cleanup_policy.clone(),
-        state: RuntimeProcessState::Running,
-    })?;
 
-    let execution_plan = build_execution_plan(&request)?;
-    let mut final_status = ToolProgramStatus::Completed;
-    let mut final_error = String::new();
-    'program: for level in execution_plan {
-        if runtime_state
-            .is_orchestrator_cancel_requested(context.run_id.to_owned())
-            .await
-            .map_err(|status| format!("cancellation check failed: {}", status.message()))?
-        {
-            final_status = ToolProgramStatus::Cancelled;
-            final_error = "tool program cancelled before next step".to_owned();
-            for step_index in level {
-                results
-                    .push(cancelled_step_result(&request.steps[step_index], final_error.as_str()));
-            }
-            break;
-        }
-        if started_at.elapsed() > Duration::from_millis(request.budgets.max_runtime_ms) {
-            final_status = ToolProgramStatus::Failed;
-            final_error = format!(
-                "tool program exceeded runtime budget max_runtime_ms={}",
-                request.budgets.max_runtime_ms
-            );
-            for step_index in level {
-                results.push(failed_step_result(&request.steps[step_index], final_error.as_str()));
-            }
-            break;
-        }
-        if budget.child_runs_used.saturating_add(level.len()) > request.budgets.max_child_runs {
-            final_status = ToolProgramStatus::Failed;
-            final_error = "tool program child run budget exhausted".to_owned();
-            for step_index in level {
-                results.push(failed_step_result(&request.steps[step_index], final_error.as_str()));
-            }
-            break;
-        }
+    let execution = async {
+        let mut process_registry = ProcessRegistry::default();
+        let mut background_registry = BackgroundTaskRegistry::default();
+        let cleanup_policy = CleanupPolicy::tool_program_default();
+        background_registry.register(BackgroundTaskRecord {
+            task_id: format!("tool-program:{}", request.program_id),
+            owner: context.run_id.to_owned(),
+            purpose: "palyra.tool_program.run".to_owned(),
+            started_at_unix_ms: current_unix_ms(),
+            cancellation_handle: format!("cancel:{proposal_id}"),
+            cleanup_policy: cleanup_policy.clone(),
+            state: RuntimeProcessState::Running,
+        })?;
 
-        let parallel = level.len() > 1 && level_allows_parallel(&request.steps, &level);
-        for step_index in &level {
-            let step = &request.steps[*step_index];
-            let process_id = format!("{}:{}", request.program_id, step.step_id);
-            process_registry.register(RuntimeProcessRecord {
-                process_id,
-                owner: context.run_id.to_owned(),
-                purpose: format!("tool-program-step:{}", step.tool),
-                started_at_unix_ms: current_unix_ms(),
-                cancellation_handle: format!("cancel:{proposal_id}:{}", step.step_id),
-                cleanup_policy: cleanup_policy.clone(),
-                state: RuntimeProcessState::Running,
-            })?;
-        }
+        let execution_plan = build_execution_plan(&request)?;
+        let mut final_status = ToolProgramStatus::Completed;
+        let mut final_error = String::new();
+        'program: for level in execution_plan {
+            if runtime_state
+                .is_orchestrator_cancel_requested(context.run_id.to_owned())
+                .await
+                .map_err(|status| format!("cancellation check failed: {}", status.message()))?
+            {
+                final_status = ToolProgramStatus::Cancelled;
+                final_error = "tool program cancelled before next step".to_owned();
+                for step_index in level {
+                    results.push(cancelled_step_result(
+                        &request.steps[step_index],
+                        final_error.as_str(),
+                    ));
+                }
+                break;
+            }
+            if started_at.elapsed() > Duration::from_millis(request.budgets.max_runtime_ms) {
+                final_status = ToolProgramStatus::Failed;
+                final_error = format!(
+                    "tool program exceeded runtime budget max_runtime_ms={}",
+                    request.budgets.max_runtime_ms
+                );
+                for step_index in level {
+                    results
+                        .push(failed_step_result(&request.steps[step_index], final_error.as_str()));
+                }
+                break;
+            }
+            if budget.child_runs_used.saturating_add(level.len()) > request.budgets.max_child_runs {
+                final_status = ToolProgramStatus::Failed;
+                final_error = "tool program child run budget exhausted".to_owned();
+                for step_index in level {
+                    results
+                        .push(failed_step_result(&request.steps[step_index], final_error.as_str()));
+                }
+                break;
+            }
 
-        // Budget deltas are applied only after the whole level resolves, so
-        // every step in a level (parallel or sequential) sees the budget as
-        // of level start; siblings cannot observe each other's spending.
-        let step_executions = if parallel {
-            let budget_snapshot = budget.clone();
-            let futures = level.iter().map(|step_index| {
-                let step = &request.steps[*step_index];
-                execute_program_step(
-                    runtime_state,
-                    context,
-                    proposal_id,
-                    &request,
-                    step,
-                    &budget_snapshot,
-                    &grants,
-                    Some(remaining_tool_budget.clone()),
-                )
-            });
-            join_all(futures).await
-        } else {
-            let mut executions = Vec::with_capacity(level.len());
+            let parallel = level.len() > 1 && level_allows_parallel(&request.steps, &level);
             for step_index in &level {
                 let step = &request.steps[*step_index];
-                executions.push(
+                let process_id = format!("{}:{}", request.program_id, step.step_id);
+                process_registry.register(RuntimeProcessRecord {
+                    process_id,
+                    owner: context.run_id.to_owned(),
+                    purpose: format!("tool-program-step:{}", step.tool),
+                    started_at_unix_ms: current_unix_ms(),
+                    cancellation_handle: format!("cancel:{proposal_id}:{}", step.step_id),
+                    cleanup_policy: cleanup_policy.clone(),
+                    state: RuntimeProcessState::Running,
+                })?;
+            }
+
+            // Budget deltas are applied only after the whole level resolves, so
+            // every step in a level (parallel or sequential) sees the budget as
+            // of level start; siblings cannot observe each other's spending.
+            let step_executions = if parallel {
+                let budget_snapshot = budget.clone();
+                let futures = level.iter().map(|step_index| {
+                    let step = &request.steps[*step_index];
                     execute_program_step(
                         runtime_state,
                         context,
                         proposal_id,
                         &request,
                         step,
-                        &budget,
+                        &budget_snapshot,
                         &grants,
                         Some(remaining_tool_budget.clone()),
                     )
-                    .await,
-                );
-            }
-            executions
-        };
-
-        for (step_index, execution) in level.into_iter().zip(step_executions) {
-            let step = &request.steps[step_index];
-            let process_id = format!("{}:{}", request.program_id, step.step_id);
-            let (step_result, child_attestation, budget_delta) = execution?;
-            apply_budget_delta(&mut budget, &budget_delta);
-            if let Some(attestation) = child_attestation {
-                child_attestations.push(attestation);
-            }
-            let _ = runtime_state
-                .append_tool_job_tail(ToolJobTailAppendRequest {
-                    job_id: job_id.clone(),
-                    stream: if step_result.success {
-                        ToolJobTailStream::Stdout
-                    } else {
-                        ToolJobTailStream::Stderr
-                    },
-                    chunk: format!(
-                        "step={} status={:?} success={} error={}",
-                        step.step_id, step_result.status, step_result.success, step_result.error
-                    ),
-                })
-                .await;
-            if step_result.status == ToolProgramStepStatus::Cancelled {
-                process_registry.cancel(process_id.as_str(), elapsed_millis(started_at))?;
+                });
+                join_all(futures).await
             } else {
-                process_registry.complete(process_id.as_str())?;
-            }
-
-            if !step_result.success {
-                final_status = if step_result.status == ToolProgramStepStatus::Cancelled {
-                    ToolProgramStatus::Cancelled
-                } else {
-                    ToolProgramStatus::Failed
-                };
-                final_error = step_result.error.clone();
-                results.push(step_result);
-                if request.safety_policy.stop_on_error {
-                    break 'program;
+                let mut executions = Vec::with_capacity(level.len());
+                for step_index in &level {
+                    let step = &request.steps[*step_index];
+                    executions.push(
+                        execute_program_step(
+                            runtime_state,
+                            context,
+                            proposal_id,
+                            &request,
+                            step,
+                            &budget,
+                            &grants,
+                            Some(remaining_tool_budget.clone()),
+                        )
+                        .await,
+                    );
                 }
-                continue;
-            }
-            results.push(step_result);
-        }
-    }
+                executions
+            };
 
-    let _shutdown = process_registry.shutdown(elapsed_millis(started_at));
-    let _ = background_registry.complete(format!("tool-program:{}", request.program_id).as_str());
+            for (step_index, execution) in level.into_iter().zip(step_executions) {
+                let step = &request.steps[step_index];
+                let process_id = format!("{}:{}", request.program_id, step.step_id);
+                let (step_result, child_attestation, budget_delta) = execution?;
+                apply_budget_delta(&mut budget, &budget_delta);
+                if let Some(attestation) = child_attestation {
+                    child_attestations.push(attestation);
+                }
+                let _ = runtime_state
+                    .append_tool_job_tail(ToolJobTailAppendRequest {
+                        job_id: job_id.clone(),
+                        stream: if step_result.success {
+                            ToolJobTailStream::Stdout
+                        } else {
+                            ToolJobTailStream::Stderr
+                        },
+                        chunk: format!(
+                            "step={} status={:?} success={} error={}",
+                            step.step_id,
+                            step_result.status,
+                            step_result.success,
+                            step_result.error
+                        ),
+                    })
+                    .await;
+                if step_result.status == ToolProgramStepStatus::Cancelled {
+                    process_registry.cancel(process_id.as_str(), elapsed_millis(started_at))?;
+                } else {
+                    process_registry.complete(process_id.as_str())?;
+                }
+
+                if !step_result.success {
+                    final_status = if step_result.status == ToolProgramStepStatus::Cancelled {
+                        ToolProgramStatus::Cancelled
+                    } else {
+                        ToolProgramStatus::Failed
+                    };
+                    final_error = step_result.error.clone();
+                    results.push(step_result);
+                    if request.safety_policy.stop_on_error {
+                        break 'program;
+                    }
+                    continue;
+                }
+                results.push(step_result);
+            }
+        }
+
+        let _shutdown = process_registry.shutdown(elapsed_millis(started_at));
+        let _ =
+            background_registry.complete(format!("tool-program:{}", request.program_id).as_str());
+        Ok(ToolProgramExecution {
+            response: ToolProgramRunResponse {
+                schema_version: TOOL_PROGRAM_SCHEMA_VERSION,
+                program_id: request.program_id,
+                status: final_status,
+                steps: results,
+                child_attestations,
+                budget,
+                python_bridge,
+                python_sdk_bytes,
+                process_diagnostics: process_registry
+                    .diagnostics(current_unix_ms())
+                    .into_iter()
+                    .map(|diagnostic| json!({ "id": diagnostic.id, "purpose": diagnostic.purpose }))
+                    .collect(),
+                background_task_diagnostics: background_registry
+                    .diagnostics(current_unix_ms())
+                    .into_iter()
+                    .map(|diagnostic| json!({ "id": diagnostic.id, "purpose": diagnostic.purpose }))
+                    .collect(),
+            },
+            final_error,
+        })
+    }
+    .await;
+    transition_tool_program_job(runtime_state, job_id.as_str(), &execution).await;
+    execution.map(|execution| (execution.response, execution.final_error))
+}
+
+async fn transition_tool_program_job(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    job_id: &str,
+    execution: &Result<ToolProgramExecution, String>,
+) {
+    let completion = tool_program_job_completion(execution);
     let _ = runtime_state
         .transition_tool_job(ToolJobTransitionRequest {
-            job_id: job_id.clone(),
+            job_id: job_id.to_owned(),
             expected_state: None,
-            next_state: match final_status {
-                ToolProgramStatus::Completed => ToolJobState::Completed,
-                ToolProgramStatus::Failed => ToolJobState::Failed,
-                ToolProgramStatus::Cancelled => ToolJobState::Cancelled,
-            },
-            reason: if final_error.is_empty() {
-                "tool_program_finished".to_owned()
-            } else {
-                final_error.clone()
-            },
-            last_error: (!final_error.is_empty()).then_some(final_error.clone()),
+            next_state: completion.next_state,
+            reason: completion.reason,
+            last_error: completion.last_error,
             heartbeat_at_unix_ms: Some(current_unix_ms()),
             lease_expires_at_unix_ms: None,
         })
         .await;
-    Ok((
-        ToolProgramRunResponse {
-            schema_version: TOOL_PROGRAM_SCHEMA_VERSION,
-            program_id: request.program_id,
-            status: final_status,
-            steps: results,
-            child_attestations,
-            budget,
-            python_bridge,
-            python_sdk_bytes,
-            process_diagnostics: process_registry
-                .diagnostics(current_unix_ms())
-                .into_iter()
-                .map(|diagnostic| json!({ "id": diagnostic.id, "purpose": diagnostic.purpose }))
-                .collect(),
-            background_task_diagnostics: background_registry
-                .diagnostics(current_unix_ms())
-                .into_iter()
-                .map(|diagnostic| json!({ "id": diagnostic.id, "purpose": diagnostic.purpose }))
-                .collect(),
+}
+
+fn tool_program_job_completion(
+    execution: &Result<ToolProgramExecution, String>,
+) -> ToolProgramJobCompletion {
+    match execution {
+        Ok(execution) => tool_program_job_completion_for_status(
+            execution.response.status,
+            &execution.final_error,
+        ),
+        Err(error) => ToolProgramJobCompletion {
+            next_state: ToolJobState::Failed,
+            reason: error.clone(),
+            last_error: Some(error.clone()),
         },
-        final_error,
-    ))
+    }
+}
+
+fn tool_program_job_completion_for_status(
+    status: ToolProgramStatus,
+    final_error: &str,
+) -> ToolProgramJobCompletion {
+    let next_state = match status {
+        ToolProgramStatus::Completed => ToolJobState::Completed,
+        ToolProgramStatus::Failed => ToolJobState::Failed,
+        ToolProgramStatus::Cancelled => ToolJobState::Cancelled,
+    };
+    ToolProgramJobCompletion {
+        next_state,
+        reason: if final_error.is_empty() {
+            "tool_program_finished".to_owned()
+        } else {
+            final_error.to_owned()
+        },
+        last_error: (!final_error.is_empty()).then(|| final_error.to_owned()),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -603,26 +657,29 @@ async fn execute_program_step(
         ));
     }
 
-    let rpc_response = execute_granted_tool_rpc_call(
+    let rpc_request = ToolRpcRequest {
+        schema_version: TOOL_RPC_SCHEMA_VERSION,
+        call_id: step.step_id.clone(),
+        tool_name: step.tool.clone(),
+        arguments: step.input.clone(),
+        scope: ToolRpcScope {
+            scopes: step.scopes.clone(),
+            allowed_artifact_refs: step.allowed_artifact_refs.clone(),
+        },
+        timeout_ms: step.budget.timeout_ms,
+        result_projection: Default::default(),
+    };
+    let (rpc_response, attempts_used) = execute_tool_rpc_with_retries(
         runtime_state,
         context,
         proposal_id,
         grants,
         remaining_tool_budget,
-        ToolRpcRequest {
-            schema_version: TOOL_RPC_SCHEMA_VERSION,
-            call_id: step.step_id.clone(),
-            tool_name: step.tool.clone(),
-            arguments: step.input.clone(),
-            scope: ToolRpcScope {
-                scopes: step.scopes.clone(),
-                allowed_artifact_refs: step.allowed_artifact_refs.clone(),
-            },
-            timeout_ms: step.budget.timeout_ms,
-            result_projection: Default::default(),
-        },
+        rpc_request,
+        &step.retry_policy,
     )
     .await;
+    budget_delta.child_runs_used += usize::try_from(attempts_used).unwrap_or(usize::MAX);
     if rpc_response.approval_required {
         budget_delta.nested_approval_requests += 1;
     }
@@ -657,7 +714,6 @@ async fn execute_program_step(
 
     let child_attestation =
         child_attestation_from_rpc_response(request, proposal_id, step, &rpc_response);
-    budget_delta.child_runs_used += 1;
     let output_json = serde_json::to_vec(&rpc_response.output)
         .map_err(|error| format!("failed to serialize tool rpc response output: {error}"))?;
     budget_delta.output_bytes_observed =
@@ -723,6 +779,48 @@ async fn execute_program_step(
         child_attestation,
         budget_delta,
     ))
+}
+
+async fn execute_tool_rpc_with_retries(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: ToolRuntimeExecutionContext<'_>,
+    proposal_id: &str,
+    grants: &BTreeSet<String>,
+    remaining_tool_budget: Option<SharedToolBudget>,
+    request: ToolRpcRequest,
+    retry_policy: &ToolProgramStepRetryPolicy,
+) -> (ToolRpcResponse, u32) {
+    let max_attempts = retry_policy.max_attempts.max(1);
+    let mut attempt = 1;
+    loop {
+        let response = execute_granted_tool_rpc_call(
+            runtime_state,
+            context,
+            proposal_id,
+            grants,
+            remaining_tool_budget.clone(),
+            request.clone(),
+        )
+        .await;
+        if !should_retry_tool_rpc_response(&response, retry_policy, attempt) {
+            return (response, attempt);
+        }
+        if attempt >= max_attempts {
+            return (response, attempt);
+        }
+        attempt += 1;
+    }
+}
+
+fn should_retry_tool_rpc_response(
+    response: &ToolRpcResponse,
+    retry_policy: &ToolProgramStepRetryPolicy,
+    attempt: u32,
+) -> bool {
+    attempt < retry_policy.max_attempts
+        && retry_policy.idempotency_key.as_deref().is_some_and(|value| !value.is_empty())
+        && !response.approval_required
+        && matches!(response.status, ToolRpcStatus::Failed | ToolRpcStatus::TimedOut)
 }
 
 async fn create_step_artifact(
@@ -940,6 +1038,7 @@ fn validate_request(request: &ToolProgramRunRequest) -> Result<(), String> {
     }
     let granted_tools = granted_tool_set(request)?;
     let mut step_ids = BTreeSet::new();
+    let mut max_child_attempts = 0_usize;
     for step in &request.steps {
         if step.step_id.trim().is_empty() || step.step_id.len() > MAX_STEP_ID_BYTES {
             return Err("palyra.tool_program.run step_id must be bounded and non-empty".to_owned());
@@ -985,6 +1084,11 @@ fn validate_request(request: &ToolProgramRunRequest) -> Result<(), String> {
         {
             return Err("tool program retries require an idempotency_key".to_owned());
         }
+        max_child_attempts = max_child_attempts
+            .saturating_add(usize::try_from(step.retry_policy.max_attempts).unwrap_or(usize::MAX));
+    }
+    if max_child_attempts > request.budgets.max_child_runs {
+        return Err("tool program retry attempts cannot exceed max_child_runs budget".to_owned());
     }
     build_execution_plan(request)?;
     Ok(())
@@ -1158,7 +1262,15 @@ fn default_retry_max_attempts() -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_execution_plan, parse_and_validate_request, ToolProgramStatus};
+    use serde_json::json;
+
+    use super::super::tool_rpc::{ToolRpcResponse, ToolRpcStatus, TOOL_RPC_SCHEMA_VERSION};
+    use super::{
+        build_execution_plan, parse_and_validate_request, should_retry_tool_rpc_response,
+        tool_program_job_completion, tool_program_job_completion_for_status, ToolProgramStatus,
+        ToolProgramStepRetryPolicy,
+    };
+    use crate::journal::ToolJobState;
 
     #[test]
     fn validates_declarative_program_shape() {
@@ -1249,9 +1361,128 @@ mod tests {
     }
 
     #[test]
+    fn validates_retry_policy_budget_and_idempotency() {
+        let missing_idempotency = parse_and_validate_request(
+            br#"{
+                "schema_version": 1,
+                "program_id": "program-retry",
+                "granted_tools": ["palyra.echo"],
+                "steps": [
+                    {
+                        "step_id": "retry",
+                        "tool": "palyra.echo",
+                        "retry_policy": {"max_attempts": 2}
+                    }
+                ]
+            }"#,
+        )
+        .expect_err("multi-attempt retry requires idempotency key");
+        assert!(missing_idempotency.contains("idempotency_key"));
+
+        let over_budget = parse_and_validate_request(
+            br#"{
+                "schema_version": 1,
+                "program_id": "program-retry-budget",
+                "budgets": {"max_child_runs": 2},
+                "granted_tools": ["palyra.echo"],
+                "steps": [
+                    {
+                        "step_id": "retry",
+                        "tool": "palyra.echo",
+                        "retry_policy": {"max_attempts": 3, "idempotency_key": "retry-1"}
+                    }
+                ]
+            }"#,
+        )
+        .expect_err("declared attempts must fit child run budget");
+        assert!(over_budget.contains("max_child_runs"));
+
+        parse_and_validate_request(
+            br#"{
+                "schema_version": 1,
+                "program_id": "program-retry-ok",
+                "budgets": {"max_child_runs": 2},
+                "granted_tools": ["palyra.echo"],
+                "steps": [
+                    {
+                        "step_id": "retry",
+                        "tool": "palyra.echo",
+                        "retry_policy": {"max_attempts": 2, "idempotency_key": "retry-1"}
+                    }
+                ]
+            }"#,
+        )
+        .expect("idempotent retry within child run budget should validate");
+    }
+
+    #[test]
+    fn retry_predicate_only_retries_retryable_child_rpc_results() {
+        let retry_policy =
+            ToolProgramStepRetryPolicy { max_attempts: 2, idempotency_key: Some("idem".into()) };
+        assert!(should_retry_tool_rpc_response(
+            &rpc_response(ToolRpcStatus::Failed, false),
+            &retry_policy,
+            1
+        ));
+        assert!(should_retry_tool_rpc_response(
+            &rpc_response(ToolRpcStatus::TimedOut, false),
+            &retry_policy,
+            1
+        ));
+        assert!(!should_retry_tool_rpc_response(
+            &rpc_response(ToolRpcStatus::Denied, false),
+            &retry_policy,
+            1
+        ));
+        assert!(!should_retry_tool_rpc_response(
+            &rpc_response(ToolRpcStatus::Failed, true),
+            &retry_policy,
+            1
+        ));
+        assert!(!should_retry_tool_rpc_response(
+            &rpc_response(ToolRpcStatus::Failed, false),
+            &retry_policy,
+            2
+        ));
+    }
+
+    #[test]
+    fn tool_program_job_completion_marks_runtime_errors_failed() {
+        let completed = tool_program_job_completion_for_status(ToolProgramStatus::Completed, "");
+        assert_eq!(completed.next_state, ToolJobState::Completed);
+        assert_eq!(completed.reason, "tool_program_finished");
+        assert_eq!(completed.last_error, None);
+
+        let failed = tool_program_job_completion(&Err("registry failed".to_owned()));
+        assert_eq!(failed.next_state, ToolJobState::Failed);
+        assert_eq!(failed.reason, "registry failed");
+        assert_eq!(failed.last_error.as_deref(), Some("registry failed"));
+    }
+
+    #[test]
     fn tool_program_status_serializes_as_stable_snake_case() {
         let serialized =
             serde_json::to_string(&ToolProgramStatus::Cancelled).expect("status should serialize");
         assert_eq!(serialized, "\"cancelled\"");
+    }
+
+    fn rpc_response(status: ToolRpcStatus, approval_required: bool) -> ToolRpcResponse {
+        ToolRpcResponse {
+            schema_version: TOOL_RPC_SCHEMA_VERSION,
+            call_id: "call-1".to_owned(),
+            tool_name: "palyra.echo".to_owned(),
+            status,
+            success: status == ToolRpcStatus::Completed,
+            decision_reason: "test".to_owned(),
+            approval_required,
+            output: json!({}),
+            error: if status == ToolRpcStatus::Completed {
+                String::new()
+            } else {
+                "failed".to_owned()
+            },
+            redacted_preview: String::new(),
+            attestation: None,
+        }
     }
 }
