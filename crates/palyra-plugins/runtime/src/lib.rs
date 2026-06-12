@@ -345,6 +345,13 @@ pub struct WasmRuntime {
     limits: RuntimeLimits,
 }
 
+fn build_runtime_engine() -> Result<Engine, RuntimeError> {
+    let mut config = Config::new();
+    config.consume_fuel(true);
+    config.epoch_interruption(true);
+    Ok(Engine::new(&config)?)
+}
+
 impl WasmRuntime {
     /// Creates a runtime with [`RuntimeLimits::default`].
     ///
@@ -359,10 +366,7 @@ impl WasmRuntime {
     /// # Errors
     /// Returns [`RuntimeError::Compile`] if the wasmtime engine cannot be built.
     pub fn new_with_limits(limits: RuntimeLimits) -> Result<Self, RuntimeError> {
-        let mut config = Config::new();
-        config.consume_fuel(true);
-        config.epoch_interruption(true);
-        let engine = Engine::new(&config)?;
+        let engine = build_runtime_engine()?;
         Ok(Self { engine, limits })
     }
 
@@ -410,6 +414,9 @@ impl WasmRuntime {
     /// On targets without 64-bit atomics the timeout cannot be armed and only
     /// fuel and store limits bound the execution.
     ///
+    /// Timed executions use a per-invocation engine so one timeout watchdog cannot
+    /// interrupt another concurrent timed invocation.
+    ///
     /// # Errors
     /// Same as [`WasmRuntime::execute_i32_entrypoint`], plus
     /// [`RuntimeError::ExecutionTimedOut`] when the timeout elapses first.
@@ -430,7 +437,8 @@ impl WasmRuntime {
         capabilities: &CapabilityGrantSet,
         timeout: Option<Duration>,
     ) -> Result<WasmExecutionResult, RuntimeError> {
-        let module = Module::new(&self.engine, module_bytes)?;
+        let engine = if timeout.is_some() { build_runtime_engine()? } else { self.engine.clone() };
+        let module = Module::new(&engine, module_bytes)?;
         let capability_handles = CapabilityHandles::from_grants(capabilities);
         let store_limits = StoreLimitsBuilder::new()
             .memory_size(self.limits.max_memory_bytes)
@@ -438,7 +446,7 @@ impl WasmRuntime {
             .instances(self.limits.max_instances)
             .build();
         let mut store = Store::new(
-            &self.engine,
+            &engine,
             RuntimeStoreState {
                 limits: store_limits,
                 capability_handles: capability_handles.clone(),
@@ -450,8 +458,8 @@ impl WasmRuntime {
         // The named binding keeps the watchdog armed until this function returns;
         // `let _ = ...` would drop the guard (cancelling the timeout) immediately.
         let _timeout_guard =
-            timeout.map(|duration| arm_epoch_timeout_guard(self.engine.clone(), duration));
-        let instance = self.instantiate_with_linker(&module, &mut store)?;
+            timeout.map(|duration| arm_epoch_timeout_guard(engine.clone(), duration));
+        let instance = Self::instantiate_with_linker(&engine, &module, &mut store)?;
         let function: TypedFunc<(), i32> = instance
             .get_typed_func(&mut store, entrypoint)
             .map_err(|_| RuntimeError::MissingExport(entrypoint.to_owned()))?;
@@ -462,11 +470,11 @@ impl WasmRuntime {
     }
 
     fn instantiate_with_linker(
-        &self,
+        engine: &Engine,
         module: &Module,
         store: &mut Store<RuntimeStoreState>,
     ) -> Result<Instance, RuntimeError> {
-        let mut linker = Linker::new(&self.engine);
+        let mut linker = Linker::new(engine);
         register_capability_bindings(&mut linker)?;
         linker
             .instantiate(&mut *store, module)
@@ -615,11 +623,6 @@ impl Drop for EpochTimeoutGuard {
 fn arm_epoch_timeout_guard(engine: Engine, timeout: Duration) -> EpochTimeoutGuard {
     #[cfg(target_has_atomic = "64")]
     {
-        // AIDEV-NOTE: `Engine::increment_epoch` is engine-global. Concurrent timed
-        // executions on the same `WasmRuntime` share one engine, so a watchdog
-        // firing for one execution can interrupt another in-flight timed execution
-        // before its own deadline. Fixing this needs per-execution engines or
-        // deadline bookkeeping — a behavioral change deliberately not made here.
         let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
         std::thread::spawn(move || match cancel_rx.recv_timeout(timeout) {
             Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {}
