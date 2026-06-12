@@ -558,13 +558,9 @@ pub fn load_config() -> Result<LoadedConfig> {
             if let Some(openai_base_url) = file_model_provider.openai_base_url {
                 model_provider.openai_base_url = parse_openai_base_url(openai_base_url.as_str())?;
             }
-            // AIDEV-NOTE: anthropic_base_url/anthropic_model reuse the openai
-            // parsers, so their validation errors say "openai base URL" /
-            // "openai model" for anthropic keys. Fixing the wording is a
-            // behavior change (error strings are pinned by tests/fixtures).
             if let Some(anthropic_base_url) = file_model_provider.anthropic_base_url {
                 model_provider.anthropic_base_url =
-                    parse_openai_base_url(anthropic_base_url.as_str())?;
+                    parse_anthropic_base_url(anthropic_base_url.as_str())?;
             }
             if let Some(allow_private_base_url) = file_model_provider.allow_private_base_url {
                 model_provider.allow_private_base_url = allow_private_base_url;
@@ -573,7 +569,7 @@ pub fn load_config() -> Result<LoadedConfig> {
                 model_provider.openai_model = parse_openai_model(openai_model.as_str())?;
             }
             if let Some(anthropic_model) = file_model_provider.anthropic_model {
-                model_provider.anthropic_model = parse_openai_model(anthropic_model.as_str())?;
+                model_provider.anthropic_model = parse_anthropic_model(anthropic_model.as_str())?;
             }
             if let Some(openai_embeddings_model) = file_model_provider.openai_embeddings_model {
                 model_provider.openai_embeddings_model =
@@ -1422,12 +1418,10 @@ pub fn load_config() -> Result<LoadedConfig> {
         source.push_str(" +env(PALYRA_MEMORY_RETENTION_VACUUM_SCHEDULE)");
     }
 
-    // AIDEV-NOTE: this error message omits "anthropic" even though
-    // ModelProviderKind::parse accepts it; the string is pinned, so updating
-    // it is a behavior change to schedule alongside other contract updates.
     if let Ok(kind) = env::var("PALYRA_MODEL_PROVIDER_KIND") {
-        model_provider.kind = ModelProviderKind::parse(kind.as_str())
-            .context("PALYRA_MODEL_PROVIDER_KIND must be deterministic or openai_compatible")?;
+        model_provider.kind = ModelProviderKind::parse(kind.as_str()).context(
+            "PALYRA_MODEL_PROVIDER_KIND must be deterministic, openai_compatible, or anthropic",
+        )?;
         source.push_str(" +env(PALYRA_MODEL_PROVIDER_KIND)");
     }
 
@@ -2367,12 +2361,8 @@ fn parse_journal_db_path(raw: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Validates the vault directory path: non-empty and no NUL bytes.
-///
-/// AIDEV-NOTE: unlike `parse_journal_db_path`, this accepts `..` components,
-/// so a relative vault dir can escape the state root after
-/// `resolve_state_relative_path`. Tightening it would be a behavior change;
-/// align it with the journal-path traversal check in a dedicated change.
+/// Validates the vault directory path: non-empty, no NUL bytes, and no
+/// `..` components.
 fn parse_vault_dir(raw: &str) -> Result<PathBuf> {
     if raw.trim().is_empty() {
         anyhow::bail!("vault directory cannot be empty");
@@ -2380,7 +2370,11 @@ fn parse_vault_dir(raw: &str) -> Result<PathBuf> {
     if raw.contains('\0') {
         anyhow::bail!("vault directory cannot contain embedded NUL byte");
     }
-    Ok(PathBuf::from(raw))
+    let path = PathBuf::from(raw);
+    if path.components().any(|component| matches!(component, Component::ParentDir)) {
+        anyhow::bail!("vault directory cannot contain parent traversal ('..')");
+    }
+    Ok(path)
 }
 
 fn parse_optional_browser_state_dir(raw: &str, source_name: &str) -> Result<Option<PathBuf>> {
@@ -2893,12 +2887,6 @@ fn parse_model_provider_registry_entry(
         Some(ModelProviderCredentialSource::InlineConfig)
     } else if let Some(secret_ref) = resolved_api_key_secret_ref.as_ref() {
         Some(secret_ref_credential_source(secret_ref))
-    } else if api_key_vault_ref.is_some() {
-        // AIDEV-NOTE: unreachable - a set api_key_vault_ref always populates
-        // resolved_api_key_secret_ref above, and that ref maps to VaultRef
-        // anyway. Kept because removing the arm changes control flow; drop it
-        // in a dedicated cleanup.
-        Some(ModelProviderCredentialSource::VaultRef)
     } else if auth_profile_id.is_some() {
         auth_profile_provider_kind.map(|kind| match kind {
             ModelProviderAuthProviderKind::Openai => {
@@ -3104,39 +3092,53 @@ fn parse_gateway_tls_path(raw: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(raw))
 }
 
-/// Validates a model-provider base URL (also reused for Anthropic and
-/// per-registry-entry base URLs): https-only except for loopback hosts, no
-/// embedded credentials, and no query/fragment that could smuggle
+fn parse_openai_base_url(raw: &str) -> Result<String> {
+    parse_model_provider_base_url(raw, "openai base URL")
+}
+
+fn parse_anthropic_base_url(raw: &str) -> Result<String> {
+    parse_model_provider_base_url(raw, "anthropic base URL")
+}
+
+/// Validates a model-provider base URL: https-only except for loopback hosts,
+/// no embedded credentials, and no query/fragment that could smuggle
 /// parameters into provider requests. Returns the URL without a trailing
 /// slash.
-fn parse_openai_base_url(raw: &str) -> Result<String> {
+fn parse_model_provider_base_url(raw: &str, label: &str) -> Result<String> {
     if raw.trim().is_empty() {
-        anyhow::bail!("openai base URL cannot be empty");
+        anyhow::bail!("{label} cannot be empty");
     }
     let normalized = raw.trim();
-    let parsed =
-        reqwest::Url::parse(normalized).context("openai base URL must be a valid absolute URL")?;
-    let host =
-        parsed.host_str().ok_or_else(|| anyhow::anyhow!("openai base URL must include a host"))?;
+    let parsed = reqwest::Url::parse(normalized)
+        .with_context(|| format!("{label} must be a valid absolute URL"))?;
+    let host = parsed.host_str().ok_or_else(|| anyhow::anyhow!("{label} must include a host"))?;
     // Plain HTTP is tolerated only for loopback so local stubs and tests
     // work; anything remote must be TLS.
     let loopback_http_allowed = host.eq_ignore_ascii_case("localhost")
         || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
     if parsed.scheme() != "https" && !(parsed.scheme() == "http" && loopback_http_allowed) {
-        anyhow::bail!("openai base URL must use https (http is only allowed for loopback hosts)");
+        anyhow::bail!("{label} must use https (http is only allowed for loopback hosts)");
     }
     if !parsed.username().is_empty() || parsed.password().is_some() {
-        anyhow::bail!("openai base URL must not embed credentials");
+        anyhow::bail!("{label} must not embed credentials");
     }
     if parsed.query().is_some() || parsed.fragment().is_some() {
-        anyhow::bail!("openai base URL must not include query or fragment");
+        anyhow::bail!("{label} must not include query or fragment");
     }
     Ok(parsed.as_str().trim_end_matches('/').to_owned())
 }
 
 fn parse_openai_model(raw: &str) -> Result<String> {
+    parse_model_provider_model(raw, "openai model")
+}
+
+fn parse_anthropic_model(raw: &str) -> Result<String> {
+    parse_model_provider_model(raw, "anthropic model")
+}
+
+fn parse_model_provider_model(raw: &str, label: &str) -> Result<String> {
     if raw.trim().is_empty() {
-        anyhow::bail!("openai model cannot be empty");
+        anyhow::bail!("{label} cannot be empty");
     }
     Ok(raw.trim().to_owned())
 }
@@ -3812,26 +3814,27 @@ mod tests {
     };
 
     use super::{
-        apply_feature_rollout_env_override, load_config, parse_broadcast_strategy,
-        parse_browser_service_endpoint, parse_canvas_host_public_base_url,
-        parse_content_type_allowlist, parse_cron_timezone_mode, parse_default_memory_ttl_ms,
-        parse_direct_message_policy, parse_dns_suffix_allowlist, parse_exact_vault_ref_allowlist,
-        parse_host_allowlist, parse_http_header_allowlist, parse_journal_db_path,
-        parse_memory_retention_vacuum_schedule, parse_model_provider_auth_provider_kind,
-        parse_model_provider_registry_entry, parse_model_provider_registry_model,
-        parse_openai_base_url, parse_openai_embeddings_dims, parse_optional_auth_profile_id,
-        parse_optional_browser_state_dir, parse_optional_openai_embeddings_model,
-        parse_optional_sha256_digest_field, parse_optional_vault_ref_field, parse_positive_u32,
-        parse_positive_usize, parse_process_executable_allowlist,
-        parse_process_runner_egress_enforcement_mode, parse_process_runner_tier,
-        parse_root_file_config, parse_storage_prefix_allowlist, parse_tool_allowlist,
-        parse_vault_dir, parse_vault_ref_allowlist, validate_runtime_preview_config, AdminConfig,
-        AuxiliaryExecutorConfig, BrowserServiceConfig, CanvasHostConfig, ChannelRouterConfig,
-        CronConfig, DeliveryArbitrationConfig, DeploymentConfig, DeploymentMode,
-        FlowOrchestrationConfig, GatewayBindProfile, GatewayConfig, GatewayTlsConfig,
-        HttpFetchConfig, IdentityConfig, MemoryConfig, ModelProviderConfig, NetworkedWorkersConfig,
-        OrchestratorConfig, PruningPolicyMatrixConfig, ReplayCaptureConfig,
-        RetrievalDualPathConfig, SessionQueuePolicyConfig, StorageConfig, ToolCallConfig,
+        apply_feature_rollout_env_override, load_config, parse_anthropic_base_url,
+        parse_anthropic_model, parse_broadcast_strategy, parse_browser_service_endpoint,
+        parse_canvas_host_public_base_url, parse_content_type_allowlist, parse_cron_timezone_mode,
+        parse_default_memory_ttl_ms, parse_direct_message_policy, parse_dns_suffix_allowlist,
+        parse_exact_vault_ref_allowlist, parse_host_allowlist, parse_http_header_allowlist,
+        parse_journal_db_path, parse_memory_retention_vacuum_schedule,
+        parse_model_provider_auth_provider_kind, parse_model_provider_registry_entry,
+        parse_model_provider_registry_model, parse_openai_base_url, parse_openai_embeddings_dims,
+        parse_optional_auth_profile_id, parse_optional_browser_state_dir,
+        parse_optional_openai_embeddings_model, parse_optional_sha256_digest_field,
+        parse_optional_vault_ref_field, parse_positive_u32, parse_positive_usize,
+        parse_process_executable_allowlist, parse_process_runner_egress_enforcement_mode,
+        parse_process_runner_tier, parse_root_file_config, parse_storage_prefix_allowlist,
+        parse_tool_allowlist, parse_vault_dir, parse_vault_ref_allowlist,
+        validate_runtime_preview_config, AdminConfig, AuxiliaryExecutorConfig,
+        BrowserServiceConfig, CanvasHostConfig, ChannelRouterConfig, CronConfig,
+        DeliveryArbitrationConfig, DeploymentConfig, DeploymentMode, FlowOrchestrationConfig,
+        GatewayBindProfile, GatewayConfig, GatewayTlsConfig, HttpFetchConfig, IdentityConfig,
+        MemoryConfig, ModelProviderConfig, NetworkedWorkersConfig, OrchestratorConfig,
+        PruningPolicyMatrixConfig, ReplayCaptureConfig, RetrievalDualPathConfig,
+        SessionQueuePolicyConfig, StorageConfig, ToolCallConfig,
     };
     use crate::channel_router::{BroadcastStrategy, DirectMessagePolicy};
     use crate::model_provider::{
@@ -5131,6 +5134,15 @@ state_dir = "browserd-state"
     }
 
     #[test]
+    fn vault_dir_rejects_parent_traversal() {
+        let error = parse_vault_dir("../vault").expect_err("vault dir must reject traversal");
+        assert!(
+            error.to_string().contains("parent traversal"),
+            "error should describe traversal rejection: {error}"
+        );
+    }
+
+    #[test]
     fn openai_base_url_requires_https_scheme() {
         let result = parse_openai_base_url("file:///tmp/openai");
         assert!(result.is_err(), "openai base URL without https scheme must fail");
@@ -5166,6 +5178,36 @@ state_dir = "browserd-state"
         let parsed =
             parse_openai_base_url("https://api.openai.com/v1").expect("base URL should parse");
         assert_eq!(parsed, "https://api.openai.com/v1");
+    }
+
+    #[test]
+    fn anthropic_base_url_errors_name_anthropic_key() {
+        let error = parse_anthropic_base_url("file:///tmp/anthropic")
+            .expect_err("anthropic base URL without https scheme must fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("anthropic base URL"),
+            "error should name anthropic base URL: {message}"
+        );
+        assert!(
+            !message.contains("openai base URL"),
+            "anthropic errors should not mention openai base URL: {message}"
+        );
+    }
+
+    #[test]
+    fn anthropic_model_errors_name_anthropic_key() {
+        let error =
+            parse_anthropic_model("   ").expect_err("anthropic model cannot accept an empty value");
+        let message = error.to_string();
+        assert!(
+            message.contains("anthropic model"),
+            "error should name anthropic model: {message}"
+        );
+        assert!(
+            !message.contains("openai model"),
+            "anthropic errors should not mention openai model: {message}"
+        );
     }
 
     #[test]
