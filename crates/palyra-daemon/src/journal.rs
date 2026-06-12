@@ -9967,15 +9967,19 @@ impl JournalStore {
         Ok(records)
     }
 
-    /// Deletes a pin; returns whether a row was removed.
+    /// Deletes a session pin; returns whether a row was removed.
     ///
     /// # Errors
     /// Returns [`JournalError`] if the storage write fails.
-    pub fn delete_orchestrator_session_pin(&self, pin_id: &str) -> Result<bool, JournalError> {
+    pub fn delete_orchestrator_session_pin(
+        &self,
+        session_id: &str,
+        pin_id: &str,
+    ) -> Result<bool, JournalError> {
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         Ok(guard.execute(
-            "DELETE FROM orchestrator_session_pins WHERE pin_ulid = ?1",
-            params![pin_id],
+            "DELETE FROM orchestrator_session_pins WHERE pin_ulid = ?1 AND session_ulid = ?2",
+            params![pin_id, session_id],
         )? > 0)
     }
 
@@ -21349,9 +21353,10 @@ mod tests {
         MemoryItemCreateRequest, MemoryItemsListFilter, MemoryMaintenanceRequest,
         MemoryPurgeRequest, MemoryRetentionPolicy, MemorySearchRequest, MemorySource,
         OrchestratorCancelRequest, OrchestratorQueuedInputCreateRequest,
-        OrchestratorRunStartRequest, OrchestratorSessionResolveRequest,
-        OrchestratorSessionUpsertRequest, OrchestratorTapeAppendRequest, OrchestratorUsageDelta,
-        RecallArtifactCreateRequest, RecallArtifactListFilter,
+        OrchestratorRunStartRequest, OrchestratorSessionPinCreateRequest,
+        OrchestratorSessionResolveRequest, OrchestratorSessionUpsertRequest,
+        OrchestratorTapeAppendRequest, OrchestratorUsageDelta, RecallArtifactCreateRequest,
+        RecallArtifactListFilter,
         SessionProjectContextStateUpsertRequest, SessionSearchRequest, SkillExecutionStatus,
         SkillStatusUpsertRequest, ToolJobAttachRequest, ToolJobCreateRequest,
         ToolJobRetentionPolicy, ToolJobRetryPolicy, ToolJobRetryRequest, ToolJobState,
@@ -21488,6 +21493,17 @@ mod tests {
             .expect("orchestrator run should be created");
     }
 
+    fn append_tape_event(store: &JournalStore, run_id: &str, seq: i64) {
+        store
+            .append_orchestrator_tape_event(&OrchestratorTapeAppendRequest {
+                run_id: run_id.to_owned(),
+                seq,
+                event_type: "message.delta".to_owned(),
+                payload_json: "{}".to_owned(),
+            })
+            .expect("orchestrator tape event should be appended");
+    }
+
     #[test]
     fn reset_orchestrator_session_clears_project_context_state() {
         let db_path = temp_db_path();
@@ -21527,6 +21543,65 @@ mod tests {
                 .is_none(),
             "reset-session must not retain stale project focus paths"
         );
+    }
+
+    #[test]
+    fn delete_orchestrator_session_pin_requires_session_match() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let local_session_id = "01ARZ3NDEKTSV4RRFFQ69G5PN1";
+        let foreign_session_id = "01ARZ3NDEKTSV4RRFFQ69G5PN2";
+        let local_run_id = "01ARZ3NDEKTSV4RRFFQ69G5PR1";
+        let foreign_run_id = "01ARZ3NDEKTSV4RRFFQ69G5PR2";
+        upsert_orchestrator_session(&store, local_session_id);
+        upsert_orchestrator_session(&store, foreign_session_id);
+        start_orchestrator_run(&store, local_session_id, local_run_id);
+        start_orchestrator_run(&store, foreign_session_id, foreign_run_id);
+        append_tape_event(&store, local_run_id, 1);
+        append_tape_event(&store, foreign_run_id, 1);
+
+        let local_pin = store
+            .create_orchestrator_session_pin(&OrchestratorSessionPinCreateRequest {
+                pin_id: "01ARZ3NDEKTSV4RRFFQ69G5PP1".to_owned(),
+                session_id: local_session_id.to_owned(),
+                run_id: local_run_id.to_owned(),
+                tape_seq: 1,
+                title: "Local pin".to_owned(),
+                note: None,
+            })
+            .expect("local pin should be created");
+        let foreign_pin = store
+            .create_orchestrator_session_pin(&OrchestratorSessionPinCreateRequest {
+                pin_id: "01ARZ3NDEKTSV4RRFFQ69G5PP2".to_owned(),
+                session_id: foreign_session_id.to_owned(),
+                run_id: foreign_run_id.to_owned(),
+                tape_seq: 1,
+                title: "Foreign pin".to_owned(),
+                note: None,
+            })
+            .expect("foreign pin should be created");
+
+        let deleted_foreign = store
+            .delete_orchestrator_session_pin(local_session_id, foreign_pin.pin_id.as_str())
+            .expect("cross-session pin delete should query successfully");
+        assert!(!deleted_foreign);
+        assert_eq!(
+            store
+                .list_orchestrator_session_pins(foreign_session_id)
+                .expect("foreign session pins should load")
+                .len(),
+            1
+        );
+
+        let deleted_local = store
+            .delete_orchestrator_session_pin(local_session_id, local_pin.pin_id.as_str())
+            .expect("local pin delete should succeed");
+        assert!(deleted_local);
+        assert!(store
+            .list_orchestrator_session_pins(local_session_id)
+            .expect("local session pins should load")
+            .is_empty());
     }
 
     #[test]

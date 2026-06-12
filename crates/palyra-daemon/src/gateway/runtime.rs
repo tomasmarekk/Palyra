@@ -6219,24 +6219,29 @@ impl GatewayRuntimeState {
     }
 
     #[allow(clippy::result_large_err)]
-    fn delete_orchestrator_session_pin_blocking(&self, pin_id: &str) -> Result<bool, Status> {
+    fn delete_orchestrator_session_pin_blocking(
+        &self,
+        session_id: &str,
+        pin_id: &str,
+    ) -> Result<bool, Status> {
         self.journal_store
-            .delete_orchestrator_session_pin(pin_id)
+            .delete_orchestrator_session_pin(session_id, pin_id)
             .map_err(|error| map_orchestrator_store_error("delete orchestrator session pin", error))
     }
 
-    /// Deletes a session pin; returns whether it existed.
+    /// Deletes a session pin; returns whether it existed in the supplied session.
     ///
     /// # Errors
     /// Returns the mapped journal store error, or `internal` if the worker panicked.
     #[allow(clippy::result_large_err)]
     pub async fn delete_orchestrator_session_pin(
         self: &Arc<Self>,
+        session_id: String,
         pin_id: String,
     ) -> Result<bool, Status> {
         let state = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
-            state.delete_orchestrator_session_pin_blocking(pin_id.as_str())
+            state.delete_orchestrator_session_pin_blocking(session_id.as_str(), pin_id.as_str())
         })
         .await
         .map_err(|_| Status::internal("orchestrator session pin delete worker panicked"))?

@@ -4428,16 +4428,11 @@ pub(crate) async fn console_chat_pin_delete_handler(
     Path((session_id, pin_id)): Path<(String, String)>,
 ) -> Result<Json<Value>, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
-    let _session_record =
+    let session_record =
         load_console_chat_session(&state, &session.context, session_id.as_str(), true).await?;
-    // AIDEV-NOTE: the delete below is keyed by pin_id alone; nothing checks
-    // that the pin actually belongs to the authorized {session_id}, so a
-    // valid console session can delete pins of sessions outside its
-    // principal/device/channel scope by supplying a foreign pin ULID. Fix
-    // requires loading the pin and comparing pin.session_id before deleting.
     let deleted = state
         .runtime
-        .delete_orchestrator_session_pin(pin_id)
+        .delete_orchestrator_session_pin(session_record.session_id, pin_id)
         .await
         .map_err(runtime_status_response)?;
     Ok(Json(json!({
