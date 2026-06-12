@@ -1,9 +1,9 @@
 //! Browser profile registry: tamper-evident profile records and LRU pruning.
 //!
 //! Each record carries a self-hash; records failing both the current and the legacy hash check
-//! are dropped on load. Pruning never evicts a principal's active profile. Registry mutations
-//! are serialized through `BrowserRuntimeState::profile_registry_lock` (with one known
-//! exception — see the AIDEV-NOTE on [`update_profile_state_metadata`]).
+//! are dropped on load. Pruning never evicts a principal's active profile. Registry mutations,
+//! including snapshot metadata refreshes, are serialized through
+//! `BrowserRuntimeState::profile_registry_lock`.
 
 use crate::*;
 
@@ -402,15 +402,13 @@ pub(crate) async fn upsert_profile_record(
 ///
 /// Silently no-ops for unknown profile ids (the profile may have been pruned meanwhile).
 ///
-/// AIDEV-NOTE: this is a load-modify-save of the registry, but the snapshot-persist call path
-/// (`persist_session_snapshot`) reaches it without holding
-/// `BrowserRuntimeState::profile_registry_lock`, so it can race with locked registry mutations
-/// and clobber a concurrent update. Fixing it means plumbing the lock (or runtime) into the
-/// persist path — a behavioral/structural change deliberately not made here.
+/// The caller must hold `BrowserRuntimeState::profile_registry_lock`; snapshot persistence keeps
+/// that lock across revision lookup, snapshot write, and this metadata refresh so concurrent
+/// profile mutations cannot be clobbered by a stale load-modify-save cycle.
 ///
 /// # Errors
 /// Fails when the registry cannot be loaded or saved.
-pub(crate) fn update_profile_state_metadata(
+pub(crate) fn update_profile_state_metadata_locked(
     store: &PersistedStateStore,
     profile_id: &str,
     state_schema_version: u32,

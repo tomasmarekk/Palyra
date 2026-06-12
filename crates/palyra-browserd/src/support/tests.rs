@@ -9,7 +9,7 @@ use super::{
     fetch_http_attachment_download_artifact, navigate_with_guards, parse_daemon_bind_socket,
     persisted_snapshot_hash, persisted_snapshot_legacy_hash, record_chromium_remote_ip_incident,
     reset_dns_validation_tracking_for_tests, run_chromium_blocking, sha256_hex,
-    store_dns_nxdomain_cache, store_generated_artifact, update_profile_state_metadata,
+    store_dns_nxdomain_cache, store_generated_artifact, update_profile_state_metadata_locked,
     validate_restored_snapshot_against_profile, validate_target_url, validate_target_url_blocking,
     Args, BrowserActionLogEntryInternal, BrowserEngineMode, BrowserProfileRecord,
     BrowserRuntimeState, BrowserServiceImpl, BrowserTabRecord, ChromiumPrivateTargetPolicy,
@@ -4751,14 +4751,17 @@ async fn browser_service_profile_restore_rejects_snapshot_revision_rollback() {
     store
         .save_snapshot(profile_id.as_str(), Some(profile_id.as_str()), &rollback_snapshot)
         .expect("rollback snapshot write should succeed");
-    update_profile_state_metadata(
-        store,
-        profile_id.as_str(),
-        PROFILE_RECORD_SCHEMA_VERSION,
-        snapshot.state_revision,
-        expected_hash.as_str(),
-    )
-    .expect("profile metadata update should succeed");
+    {
+        let _profile_registry_guard = runtime.profile_registry_lock.lock().await;
+        update_profile_state_metadata_locked(
+            store,
+            profile_id.as_str(),
+            PROFILE_RECORD_SCHEMA_VERSION,
+            snapshot.state_revision,
+            expected_hash.as_str(),
+        )
+        .expect("profile metadata update should succeed");
+    }
 
     let rollback_attempt = service
         .create_session(Request::new(browser_v1::CreateSessionRequest {

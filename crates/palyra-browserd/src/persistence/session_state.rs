@@ -123,20 +123,30 @@ pub(crate) fn validate_restored_snapshot_against_profile(
 ///
 /// No-op when persistence is disabled. Tab order is preserved and tabs missing from
 /// `tab_order` are appended so no tab state is silently lost; network logs are stripped before
-/// writing. A failed profile-metadata update is logged but does not fail the persist.
+/// writing. Profile-backed snapshots hold the profile registry lock across revision lookup,
+/// snapshot write, and metadata refresh. A failed profile-metadata update is logged but does not
+/// fail the persist.
 ///
 /// # Errors
 /// Fails when the persistence id is missing, revision lookup fails, or hashing/encryption/
 /// writing of the snapshot fails.
-pub(crate) fn persist_session_snapshot(
-    store: &PersistedStateStore,
+pub(crate) async fn persist_session_snapshot(
+    runtime: &BrowserRuntimeState,
     session: &BrowserSessionRecord,
 ) -> Result<()> {
     if !session.persistence.enabled {
         return Ok(());
     }
+    let Some(store) = runtime.state_store.as_ref() else {
+        return Ok(());
+    };
     let Some(persistence_id) = session.persistence.persistence_id.as_ref() else {
         anyhow::bail!("state persistence is enabled but persistence_id is missing");
+    };
+    let _profile_registry_guard = if session.profile_id.is_some() {
+        Some(runtime.profile_registry_lock.lock().await)
+    } else {
+        None
     };
     let mut tabs = session
         .tab_order
@@ -168,7 +178,7 @@ pub(crate) fn persist_session_snapshot(
     let snapshot_hash = persisted_snapshot_hash(&snapshot)?;
     store.save_snapshot(persistence_id.as_str(), session.profile_id.as_deref(), &snapshot)?;
     if let Some(profile_id) = session.profile_id.as_ref() {
-        if let Err(error) = update_profile_state_metadata(
+        if let Err(error) = update_profile_state_metadata_locked(
             store,
             profile_id.as_str(),
             PROFILE_RECORD_SCHEMA_VERSION,
@@ -195,14 +205,15 @@ pub(crate) fn persist_session_snapshot(
 /// # Errors
 /// Fails when [`persist_session_snapshot`] fails; `operation` names the mutation in the error
 /// context.
-pub(crate) fn persist_session_after_mutation(
+pub(crate) async fn persist_session_after_mutation(
     runtime: &BrowserRuntimeState,
     session_for_persist: Option<BrowserSessionRecord>,
     operation: &str,
 ) -> Result<()> {
-    if let (Some(store), Some(session)) = (runtime.state_store.as_ref(), session_for_persist) {
+    if let Some(session) = session_for_persist {
         if session.persistence.enabled {
-            persist_session_snapshot(store, &session)
+            persist_session_snapshot(runtime, &session)
+                .await
                 .with_context(|| format!("failed to persist state after {operation}"))?;
         }
     }

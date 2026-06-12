@@ -576,10 +576,9 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                 session_for_persist = Some(session);
             }
         }
-        if let (Some(store), Some(record)) =
-            (self.runtime.state_store.as_ref(), session_for_persist)
-        {
-            persist_session_snapshot(store, &record)
+        if let Some(record) = session_for_persist {
+            persist_session_snapshot(self.runtime.as_ref(), &record)
+                .await
                 .map_err(|error| Status::internal(format!("failed to persist state: {error}")))?;
         }
         if payload.allow_downloads {
@@ -634,9 +633,9 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         let removed = self.runtime.sessions.lock().await.remove(session_id.as_str());
         self.runtime.chromium_sessions.lock().await.remove(session_id.as_str());
         self.runtime.download_sessions.lock().await.remove(session_id.as_str());
-        if let (Some(store), Some(record)) = (self.runtime.state_store.as_ref(), removed.as_ref()) {
+        if let Some(record) = removed.as_ref() {
             if record.persistence.enabled {
-                persist_session_snapshot(store, record).map_err(|error| {
+                persist_session_snapshot(self.runtime.as_ref(), record).await.map_err(|error| {
                     Status::internal(format!(
                         "failed to persist state while closing session: {error}"
                     ))
@@ -1457,10 +1456,8 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             }
         }
         drop(sessions);
-        if let (Some(store), Some(record)) =
-            (self.runtime.state_store.as_ref(), session_for_persist)
-        {
-            persist_session_snapshot(store, &record).map_err(|error| {
+        if let Some(record) = session_for_persist {
+            persist_session_snapshot(self.runtime.as_ref(), &record).await.map_err(|error| {
                 Status::internal(format!("failed to persist state after navigate: {error}"))
             })?;
         }
@@ -1486,6 +1483,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             sessions.get(session_id.as_str()).filter(|session| session.persistence.enabled).cloned()
         };
         persist_session_after_mutation(self.runtime.as_ref(), session_for_persist, "navigate")
+            .await
             .map_err(map_persist_error_to_status)?;
 
         Ok(Response::new(browser_v1::NavigateResponse {
@@ -1696,6 +1694,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             sessions.get(session_id.as_str()).filter(|session| session.persistence.enabled).cloned()
         };
         persist_session_after_mutation(self.runtime.as_ref(), session_for_persist, "click")
+            .await
             .map_err(map_persist_error_to_status)?;
 
         Ok(Response::new(browser_v1::ClickResponse {
@@ -1864,6 +1863,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             sessions.get(session_id.as_str()).filter(|session| session.persistence.enabled).cloned()
         };
         persist_session_after_mutation(self.runtime.as_ref(), session_for_persist, "type")
+            .await
             .map_err(map_persist_error_to_status)?;
 
         Ok(Response::new(browser_v1::TypeResponse {
@@ -2028,6 +2028,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             session_for_persist,
             "set_file_input",
         )
+        .await
         .map_err(map_persist_error_to_status)?;
 
         Ok(Response::new(browser_v1::SetFileInputResponse {
@@ -2115,6 +2116,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             sessions.get(session_id.as_str()).filter(|session| session.persistence.enabled).cloned()
         };
         persist_session_after_mutation(self.runtime.as_ref(), session_for_persist, "press")
+            .await
             .map_err(map_persist_error_to_status)?;
 
         Ok(Response::new(browser_v1::PressResponse {
@@ -2248,6 +2250,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             sessions.get(session_id.as_str()).filter(|session| session.persistence.enabled).cloned()
         };
         persist_session_after_mutation(self.runtime.as_ref(), session_for_persist, "select")
+            .await
             .map_err(map_persist_error_to_status)?;
 
         Ok(Response::new(browser_v1::SelectResponse {
@@ -2484,6 +2487,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             sessions.get(session_id.as_str()).filter(|session| session.persistence.enabled).cloned()
         };
         persist_session_after_mutation(self.runtime.as_ref(), session_for_persist, "highlight")
+            .await
             .map_err(map_persist_error_to_status)?;
 
         Ok(Response::new(browser_v1::HighlightResponse {
@@ -2579,6 +2583,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             sessions.get(session_id.as_str()).filter(|session| session.persistence.enabled).cloned()
         };
         persist_session_after_mutation(self.runtime.as_ref(), session_for_persist, "scroll")
+            .await
             .map_err(map_persist_error_to_status)?;
 
         Ok(Response::new(browser_v1::ScrollResponse {
@@ -2717,6 +2722,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             sessions.get(session_id.as_str()).filter(|session| session.persistence.enabled).cloned()
         };
         persist_session_after_mutation(self.runtime.as_ref(), session_for_persist, "wait_for")
+            .await
             .map_err(map_persist_error_to_status)?;
 
         Ok(Response::new(browser_v1::WaitForResponse {
@@ -3486,6 +3492,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             }
         }
         persist_session_after_mutation(self.runtime.as_ref(), session_for_persist, "reset_state")
+            .await
             .map_err(map_persist_error_to_status)?;
         Ok(Response::new(response))
     }
@@ -3687,6 +3694,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             }
         }
         persist_session_after_mutation(self.runtime.as_ref(), session_for_persist, "open_tab")
+            .await
             .map_err(map_persist_error_to_status)?;
 
         let mut sessions = self.runtime.sessions.lock().await;
@@ -3754,6 +3762,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             }
         };
         persist_session_after_mutation(self.runtime.as_ref(), session_for_persist, "switch_tab")
+            .await
             .map_err(map_persist_error_to_status)?;
         Ok(Response::new(response))
     }
@@ -3828,6 +3837,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             }
         }
         persist_session_after_mutation(self.runtime.as_ref(), session_for_persist, "close_tab")
+            .await
             .map_err(map_persist_error_to_status)?;
         Ok(Response::new(response))
     }
@@ -3899,6 +3909,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             session_for_persist,
             "set_permissions",
         )
+        .await
         .map_err(map_persist_error_to_status)?;
         Ok(Response::new(response))
     }

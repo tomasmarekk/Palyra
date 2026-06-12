@@ -167,10 +167,12 @@ pub(crate) fn spawn_cleanup_loop(runtime: Arc<BrowserRuntimeState>) {
                     download_sessions.remove(session_id.as_str());
                 }
             }
-            if let Some(store) = runtime.state_store.as_ref() {
+            if runtime.state_store.is_some() {
                 for session in removed_sessions {
                     if session.persistence.enabled {
-                        if let Err(error) = persist_session_snapshot(store, &session) {
+                        if let Err(error) =
+                            persist_session_snapshot(runtime.as_ref(), &session).await
+                        {
                             warn!(
                                 principal = session.principal,
                                 channel = ?session.channel,
