@@ -427,6 +427,37 @@ fn oauth_refresh_adapter_rejects_query_bearing_endpoint() {
 }
 
 #[test]
+fn oauth_refresh_debug_redacts_secret_material() {
+    let request = OAuthRefreshRequest {
+        provider: AuthProvider::known(AuthProviderKind::Openai),
+        token_endpoint: "https://auth.example.test/oauth/token".to_owned(),
+        client_id: Some("visible-client-id".to_owned()),
+        client_secret: Some("raw-client-secret".to_owned()),
+        refresh_token: "raw-refresh-token".to_owned(),
+        scopes: vec!["chat:read".to_owned()],
+    };
+    let response = OAuthRefreshResponse {
+        access_token: "raw-access-token".to_owned(),
+        refresh_token: Some("raw-rotated-refresh-token".to_owned()),
+        expires_in_seconds: Some(3600),
+    };
+
+    let rendered_request = format!("{request:?}");
+    let rendered_response = format!("{response:?}");
+
+    assert!(!rendered_request.contains("raw-client-secret"));
+    assert!(!rendered_request.contains("raw-refresh-token"));
+    assert!(rendered_request.contains("<redacted>"));
+    assert!(rendered_request.contains("visible-client-id"));
+    assert!(rendered_request.contains("chat:read"));
+
+    assert!(!rendered_response.contains("raw-access-token"));
+    assert!(!rendered_response.contains("raw-rotated-refresh-token"));
+    assert!(rendered_response.contains("<redacted>"));
+    assert!(rendered_response.contains("3600"));
+}
+
+#[test]
 fn oauth_refresh_runtime_validation_rejects_https_hostnames_resolving_private_addresses() {
     let result = validate_runtime_token_endpoint_with_resolver(
         "https://auth.example.test/oauth/token",

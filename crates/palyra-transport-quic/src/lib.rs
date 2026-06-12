@@ -6,7 +6,7 @@
 //! [`QuicConnectOutcome::FallbackRequired`] and decide per policy. Consumed by
 //! `palyra-daemon` (`quic_runtime`) for node RPC.
 
-use std::{any::Any, net::SocketAddr, sync::Arc, time::Duration};
+use std::{any::Any, fmt, net::SocketAddr, sync::Arc, time::Duration};
 
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use rustls::{
@@ -90,11 +90,9 @@ impl std::fmt::Debug for QuicServerTlsConfig {
 }
 
 /// PEM-encoded TLS material and verification settings for a QUIC client endpoint.
-// AIDEV-NOTE: derive(Debug) prints `client_key_pem` (private key material) verbatim,
-// unlike QuicServerTlsConfig which redacts via a manual impl. Fixing requires a
-// manual Debug impl, which changes observable Debug output — left unchanged here
-// because this pass must not alter behavior; redact before logging at call sites.
-#[derive(Debug, Clone)]
+///
+/// `Debug` redacts all PEM fields so configurations can be logged safely.
+#[derive(Clone)]
 pub struct QuicClientTlsConfig {
     /// PEM bundle of CA certificates trusted for server verification.
     pub ca_cert_pem: String,
@@ -109,6 +107,19 @@ pub struct QuicClientTlsConfig {
     /// certificate DER; when set, connections to servers presenting any other
     /// leaf are rejected even if the chain otherwise validates.
     pub pinned_server_fingerprint_sha256: Option<String>,
+}
+
+impl fmt::Debug for QuicClientTlsConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("QuicClientTlsConfig")
+            .field("ca_cert_pem", &"<redacted>")
+            .field("client_cert_pem", &self.client_cert_pem.as_ref().map(|_| "<redacted>"))
+            .field("client_key_pem", &self.client_key_pem.as_ref().map(|_| "<redacted>"))
+            .field("server_name", &self.server_name)
+            .field("pinned_server_fingerprint_sha256", &self.pinned_server_fingerprint_sha256)
+            .finish()
+    }
 }
 
 /// Policy governing whether a failed QUIC connect may surface a TCP fallback.
@@ -556,7 +567,7 @@ fn parse_private_key(pem: &str) -> Result<PrivateKeyDer<'static>, QuicTransportE
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_pinned_server_fingerprint, QuicTransportError};
+    use super::{normalize_pinned_server_fingerprint, QuicClientTlsConfig, QuicTransportError};
 
     #[test]
     fn missing_pinned_server_fingerprint_is_allowed() {
@@ -584,5 +595,25 @@ mod tests {
                 .expect("pin normalization should succeed"),
             Some("abcdef0123".to_owned())
         );
+    }
+
+    #[test]
+    fn quic_client_tls_config_debug_redacts_pem_material() {
+        let config = QuicClientTlsConfig {
+            ca_cert_pem: "raw-ca-cert-pem".to_owned(),
+            client_cert_pem: Some("raw-client-cert-pem".to_owned()),
+            client_key_pem: Some("raw-client-key-pem".to_owned()),
+            server_name: "daemon.example.test".to_owned(),
+            pinned_server_fingerprint_sha256: Some("abcdef0123".to_owned()),
+        };
+
+        let rendered = format!("{config:?}");
+
+        assert!(!rendered.contains("raw-ca-cert-pem"));
+        assert!(!rendered.contains("raw-client-cert-pem"));
+        assert!(!rendered.contains("raw-client-key-pem"));
+        assert!(rendered.contains("<redacted>"));
+        assert!(rendered.contains("daemon.example.test"));
+        assert!(rendered.contains("abcdef0123"));
     }
 }

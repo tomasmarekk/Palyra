@@ -6,6 +6,7 @@
 //! the on-disk TOML registry format and console/CLI payloads — field names are contract.
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use thiserror::Error;
 
 /// Provider family an auth profile authenticates against.
@@ -419,11 +420,8 @@ pub struct AuthProfileSelectionResult {
 
 /// In-memory request handed to an [`OAuthRefreshAdapter`](crate::OAuthRefreshAdapter).
 ///
-/// AIDEV-NOTE: `refresh_token` and `client_secret` hold raw secret values, and the
-/// derived `Debug` impl would print them. Nothing in this crate Debug-formats the
-/// request; redacting `Debug` would observably change formatting, so it is deliberately
-/// left unchanged here. Never log or `Debug`-format this type.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Debug` redacts raw token fields so adapter diagnostics cannot leak secrets.
+#[derive(Clone, PartialEq, Eq)]
 pub struct OAuthRefreshRequest {
     pub provider: AuthProvider,
     pub token_endpoint: String,
@@ -433,14 +431,39 @@ pub struct OAuthRefreshRequest {
     pub scopes: Vec<String>,
 }
 
+impl fmt::Debug for OAuthRefreshRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OAuthRefreshRequest")
+            .field("provider", &self.provider)
+            .field("token_endpoint", &self.token_endpoint)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &self.client_secret.as_ref().map(|_| "<redacted>"))
+            .field("refresh_token", &"<redacted>")
+            .field("scopes", &self.scopes)
+            .finish()
+    }
+}
+
 /// In-memory token response returned by an adapter; same `Debug` caveat as
-/// [`OAuthRefreshRequest`] — never log or `Debug`-format this type.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// [`OAuthRefreshRequest`].
+#[derive(Clone, PartialEq, Eq)]
 pub struct OAuthRefreshResponse {
     pub access_token: String,
     /// Rotated refresh token, when the provider issued a new one.
     pub refresh_token: Option<String>,
     pub expires_in_seconds: Option<u64>,
+}
+
+impl fmt::Debug for OAuthRefreshResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OAuthRefreshResponse")
+            .field("access_token", &"<redacted>")
+            .field("refresh_token", &self.refresh_token.as_ref().map(|_| "<redacted>"))
+            .field("expires_in_seconds", &self.expires_in_seconds)
+            .finish()
+    }
 }
 
 /// Failure modes of an OAuth token refresh attempt.
