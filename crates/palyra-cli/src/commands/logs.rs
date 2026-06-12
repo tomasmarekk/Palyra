@@ -50,6 +50,32 @@ enum LogInput {
     Unavailable { message: String },
 }
 
+#[derive(Debug)]
+enum ConsoleLogFailure {
+    BeforeFirstRecord(anyhow::Error),
+    AfterRecord(anyhow::Error),
+}
+
+impl ConsoleLogFailure {
+    fn from_error(error: impl Into<anyhow::Error>, emitted_record: bool) -> Self {
+        if emitted_record {
+            Self::AfterRecord(error.into())
+        } else {
+            Self::BeforeFirstRecord(error.into())
+        }
+    }
+
+    fn allows_local_fallback(&self) -> bool {
+        matches!(self, Self::BeforeFirstRecord(_))
+    }
+
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::BeforeFirstRecord(error) | Self::AfterRecord(error) => error,
+        }
+    }
+}
+
 /// Emits recent log records, optionally following the selected source.
 ///
 /// # Errors
@@ -64,16 +90,19 @@ pub(crate) fn run_logs(
     json: bool,
 ) -> Result<()> {
     let runtime = build_runtime()?;
-    // Console API errors are intentionally swallowed: the console requires an
-    // authenticated, running daemon, and `logs` must keep working from local
-    // journal/service files precisely when the daemon is down.
-    // AIDEV-NOTE: if the console path fails *after* emitting records (for
-    // example the daemon restarts mid-follow), the fallback below re-emits the
-    // most recent lines, so followers can see duplicates across the switch.
-    if let Ok(()) = runtime.block_on(run_console_logs(lines, follow, poll_interval_ms, json)) {
-        return Ok(());
+    match runtime.block_on(run_console_logs(lines, follow, poll_interval_ms, json)) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.allows_local_fallback() => {}
+        Err(error) => {
+            return Err(error.into_error().context(
+                "console log stream failed after emitting records; local fallback suppressed to avoid duplicate log output",
+            ));
+        }
     }
 
+    // Console API errors before the first emitted record are intentionally
+    // swallowed: `logs` must keep working from local journal/service files
+    // precisely when the authenticated daemon console is unavailable.
     let root_context = app::current_root_context()
         .ok_or_else(|| anyhow!("CLI root context is unavailable for logs command"))?;
     if (json || root_context.prefers_json()) && follow {
@@ -100,14 +129,24 @@ async fn run_console_logs(
     follow: bool,
     poll_interval_ms: u64,
     json: bool,
-) -> Result<()> {
-    let context =
-        client::control_plane::connect_admin_console(app::ConnectionOverrides::default()).await?;
+) -> std::result::Result<(), ConsoleLogFailure> {
+    let context = client::control_plane::connect_admin_console(app::ConnectionOverrides::default())
+        .await
+        .map_err(|error| ConsoleLogFailure::from_error(error, false))?;
     let mut query =
         control_plane::LogListQuery { limit: Some(lines.clamp(1, 500)), ..Default::default() };
-    let initial = context.client.list_logs(&query).await?;
+    let initial = context
+        .client
+        .list_logs(&query)
+        .await
+        .map_err(|error| ConsoleLogFailure::from_error(error, false))?;
     let records = initial.records.into_iter().map(CliLogRecord::from).collect::<Vec<_>>();
-    emit_log_records(records.as_slice(), json)?;
+    let mut emitted_record = false;
+    if !records.is_empty() {
+        emit_log_records(records.as_slice(), json)
+            .map_err(|error| ConsoleLogFailure::from_error(error, true))?;
+        emitted_record = true;
+    }
     if !follow {
         return Ok(());
     }
@@ -118,13 +157,19 @@ async fn run_console_logs(
         tokio::time::sleep(sleep_duration).await;
         query.cursor = cursor.clone();
         query.direction = cursor.as_ref().map(|_| "after".to_owned());
-        let response = context.client.list_logs(&query).await?;
+        let response = context
+            .client
+            .list_logs(&query)
+            .await
+            .map_err(|error| ConsoleLogFailure::from_error(error, emitted_record))?;
         if response.records.is_empty() {
             continue;
         }
         cursor = response.newest_cursor.clone().or(cursor);
         let records = response.records.into_iter().map(CliLogRecord::from).collect::<Vec<_>>();
-        emit_log_records(records.as_slice(), json)?;
+        emit_log_records(records.as_slice(), json)
+            .map_err(|error| ConsoleLogFailure::from_error(error, true))?;
+        emitted_record = true;
     }
 }
 
@@ -404,9 +449,23 @@ fn emit_log_record(record: &CliLogRecord) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_follow_file_records, collect_recent_file_records};
+    use super::{collect_follow_file_records, collect_recent_file_records, ConsoleLogFailure};
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn console_log_failures_before_first_record_allow_local_fallback() {
+        let failure = ConsoleLogFailure::from_error(anyhow::anyhow!("connect failed"), false);
+
+        assert!(failure.allows_local_fallback());
+    }
+
+    #[test]
+    fn console_log_failures_after_records_block_local_fallback() {
+        let failure = ConsoleLogFailure::from_error(anyhow::anyhow!("stream failed"), true);
+
+        assert!(!failure.allows_local_fallback());
+    }
 
     #[test]
     fn collect_recent_file_records_keeps_last_n_lines() {
