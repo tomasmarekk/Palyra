@@ -77,13 +77,27 @@ impl ConnectorStore {
                     ],
                 )?;
                 if updated == 0 {
-                    // AIDEV-NOTE: if the dead outbox row is gone but a *live*
-                    // row for the same (connector_id, envelope_id) exists
-                    // (e.g. the envelope was re-enqueued after dead-lettering),
-                    // this INSERT hits the UNIQUE constraint and the replay
-                    // fails with a raw sqlite error instead of a typed
-                    // conflict. Fixing it changes observable behavior; left
-                    // as-is deliberately.
+                    let live_outbox_exists = transaction
+                        .query_row(
+                            r#"
+                            SELECT 1
+                            FROM outbox
+                            WHERE connector_id = ?1
+                              AND envelope_id = ?2
+                              AND status <> 'dead'
+                            LIMIT 1
+                            "#,
+                            params![dead_letter.1, dead_letter.2],
+                            |_| Ok(()),
+                        )
+                        .optional()?
+                        .is_some();
+                    if live_outbox_exists {
+                        return Err(ConnectorStoreError::DeadLetterReplayConflict {
+                            connector_id: dead_letter.1,
+                            envelope_id: dead_letter.2,
+                        });
+                    }
                     transaction.execute(
                         r#"
                         INSERT INTO outbox (

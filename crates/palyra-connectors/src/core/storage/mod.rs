@@ -63,6 +63,10 @@ pub enum ConnectorStoreError {
     OutboxNotFound(i64),
     #[error("dead-letter entry not found: {0}")]
     DeadLetterNotFound(i64),
+    #[error(
+        "dead-letter replay conflicts with live outbox envelope: connector_id={connector_id}, envelope_id={envelope_id}"
+    )]
+    DeadLetterReplayConflict { connector_id: String, envelope_id: String },
 }
 
 /// How long a claimed outbox entry stays invisible to other drains before the

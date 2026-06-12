@@ -1,6 +1,7 @@
 //! Unit tests for `ConnectorStore`: instance lifecycle, inbound dedupe,
 //! outbox claim transitions, dead-letter replay/discard, and queue snapshots.
 
+use rusqlite::params;
 use tempfile::TempDir;
 
 use super::super::protocol::{ConnectorInstanceSpec, ConnectorKind, OutboundMessageRequest};
@@ -249,6 +250,66 @@ fn dead_letter_can_be_replayed_back_into_pending_outbox() {
     assert_eq!(replay_due.len(), 1, "replayed entry should be ready for immediate retry");
     assert_eq!(replay_due[0].attempts, 0, "replayed outbox should reset attempts");
     assert_eq!(replay_due[0].envelope_id, "env-replay:0");
+}
+
+#[test]
+fn dead_letter_replay_reports_live_outbox_conflict() {
+    let (_tempdir, store) = open_store();
+    store.upsert_instance(&sample_spec(), 1_000).expect("instance should be created");
+    let request = sample_outbound("env-replay-conflict:0");
+    store.enqueue_outbox_if_absent(&request, 2, 1_000).expect("outbox enqueue should succeed");
+
+    let due = store
+        .load_due_outbox(1_000, 10, Some("echo:default"), false)
+        .expect("due outbox query should succeed");
+    let claimed = due.first().expect("entry should be claimed");
+    store
+        .move_outbox_to_dead_letter(
+            claimed.outbox_id,
+            claimed.claim_token.as_str(),
+            "permanent",
+            1_100,
+        )
+        .expect("dead letter move should succeed");
+    let dead_letter = store
+        .list_dead_letters("echo:default", 10)
+        .expect("dead letters should be queryable")
+        .into_iter()
+        .next()
+        .expect("dead letter should exist");
+
+    store
+        .with_transaction(|transaction| {
+            transaction.execute(
+                "DELETE FROM outbox WHERE connector_id = ?1 AND envelope_id = ?2 AND status = 'dead'",
+                params![request.connector_id.as_str(), request.envelope_id.as_str()],
+            )?;
+            Ok(())
+        })
+        .expect("test setup should remove the dead outbox row");
+    store
+        .enqueue_outbox_if_absent(&request, 2, 1_200)
+        .expect("test setup should recreate a live outbox row");
+
+    let error = store
+        .replay_dead_letter("echo:default", dead_letter.dead_letter_id, 5, 2_000)
+        .expect_err("replay should report a typed live-outbox conflict");
+    assert!(
+        matches!(
+            error,
+            ConnectorStoreError::DeadLetterReplayConflict { ref connector_id, ref envelope_id }
+                if connector_id == "echo:default" && envelope_id == "env-replay-conflict:0"
+        ),
+        "expected typed live outbox conflict, got {error:?}"
+    );
+    assert_eq!(
+        store
+            .list_dead_letters("echo:default", 10)
+            .expect("dead letters should remain queryable")
+            .len(),
+        1,
+        "conflicted replay should leave the operator-visible dead letter in place"
+    );
 }
 
 #[test]

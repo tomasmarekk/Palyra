@@ -94,12 +94,8 @@ impl ConnectorSupervisor {
             });
         }
 
-        // AIDEV-NOTE: the envelope is marked in the dedupe window *before*
-        // routing. If `route_inbound` then fails with an error, a provider
-        // redelivery of the same envelope is dropped as a duplicate — recovery
-        // relies on router-side retries, not connector re-ingestion. Moving
-        // the dedupe after routing would change delivery semantics
-        // (at-most-once -> at-least-once), so it is left as designed.
+        // Dedupe before routing preserves connector-level at-most-once ingestion; provider
+        // redelivery of the same envelope does not re-enter routing within the dedupe window.
         let is_new = self.store.record_inbound_dedupe_if_new(
             instance.connector_id.as_str(),
             event.envelope_id.as_str(),
