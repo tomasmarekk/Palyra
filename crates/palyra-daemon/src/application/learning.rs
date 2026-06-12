@@ -630,7 +630,7 @@ fn build_procedure_candidates(
     let mut proposals = HashMap::<(String, String), String>::new();
     let mut approvals = HashMap::<(String, String), bool>::new();
     let mut results = HashMap::<(String, String), bool>::new();
-    let mut tainted_results = HashMap::<(String, String), bool>::new();
+    let mut tainted_runs = HashSet::<String>::new();
     let mut excerpts = HashMap::<(String, String), String>::new();
     for record in transcript {
         let payload = serde_json::from_str::<Value>(record.payload_json.as_str()).ok();
@@ -675,10 +675,9 @@ fn build_procedure_candidates(
                     (record.run_id.clone(), proposal_id.to_owned()),
                     payload.get("success").and_then(Value::as_bool).unwrap_or(false),
                 );
-                tainted_results.insert(
-                    (record.run_id.clone(), proposal_id.to_owned()),
-                    tool_result_has_poison_signal(&payload),
-                );
+                if tool_result_has_poison_signal(&payload) {
+                    tainted_runs.insert(record.run_id.clone());
+                }
             }
             _ => {}
         }
@@ -686,18 +685,11 @@ fn build_procedure_candidates(
 
     let mut signatures = BTreeMap::<String, Vec<ProcedureRunSignature>>::new();
     let mut per_run_tools = BTreeMap::<String, Vec<(String, String)>>::new();
-    // AIDEV-NOTE: taint is filtered per proposal, not per run -- a run with
-    // one prompt-injection-tainted result still contributes its remaining
-    // clean tools, so a promoted signature can omit a step that actually ran.
-    // If whole-run exclusion is intended (as the companion test name
-    // "procedure_candidates_ignore_prompt_injection_tainted_runs" suggests),
-    // fixing this is a behavior change outside this doc-only pass.
     for ((candidate_run_id, proposal_id), tool_name) in proposals {
+        if tainted_runs.contains(candidate_run_id.as_str()) {
+            continue;
+        }
         if !results.get(&(candidate_run_id.clone(), proposal_id.clone())).copied().unwrap_or(false)
-            || tainted_results
-                .get(&(candidate_run_id.clone(), proposal_id.clone()))
-                .copied()
-                .unwrap_or(false)
         {
             continue;
         }
@@ -2509,35 +2501,42 @@ mod tests {
                 "run-1",
                 1,
                 "tool_proposal",
-                r#"{"proposal_id":"p1","tool_name":"palyra.fs.apply_patch"}"#,
+                r#"{"proposal_id":"p0","tool_name":"palyra.memory.recall"}"#,
             ),
             transcript_record(
                 "run-1",
                 2,
                 "tool_result",
-                r#"{"proposal_id":"p1","success":true,"prompt_injection_findings":["ignore safeguards"]}"#,
+                r#"{"proposal_id":"p0","success":true,"prompt_injection_findings":["ignore safeguards"]}"#,
             ),
             transcript_record(
                 "run-1",
                 3,
                 "tool_proposal",
-                r#"{"proposal_id":"p2","tool_name":"palyra.http.fetch"}"#,
+                r#"{"proposal_id":"p1","tool_name":"palyra.fs.apply_patch"}"#,
             ),
-            transcript_record("run-1", 4, "tool_result", r#"{"proposal_id":"p2","success":true}"#),
+            transcript_record("run-1", 4, "tool_result", r#"{"proposal_id":"p1","success":true}"#),
             transcript_record(
-                "run-2",
+                "run-1",
                 5,
                 "tool_proposal",
-                r#"{"proposal_id":"p3","tool_name":"palyra.fs.apply_patch"}"#,
+                r#"{"proposal_id":"p2","tool_name":"palyra.http.fetch"}"#,
             ),
-            transcript_record("run-2", 6, "tool_result", r#"{"proposal_id":"p3","success":true}"#),
+            transcript_record("run-1", 6, "tool_result", r#"{"proposal_id":"p2","success":true}"#),
             transcript_record(
                 "run-2",
                 7,
                 "tool_proposal",
+                r#"{"proposal_id":"p3","tool_name":"palyra.fs.apply_patch"}"#,
+            ),
+            transcript_record("run-2", 8, "tool_result", r#"{"proposal_id":"p3","success":true}"#),
+            transcript_record(
+                "run-2",
+                9,
+                "tool_proposal",
                 r#"{"proposal_id":"p4","tool_name":"palyra.http.fetch"}"#,
             ),
-            transcript_record("run-2", 8, "tool_result", r#"{"proposal_id":"p4","success":true}"#),
+            transcript_record("run-2", 10, "tool_result", r#"{"proposal_id":"p4","success":true}"#),
         ];
 
         let candidates = build_procedure_candidates(
