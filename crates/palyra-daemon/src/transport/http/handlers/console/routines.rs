@@ -2056,12 +2056,12 @@ async fn dispatch_single_routine(
                 .map_err(routine_registry_error_response)?
                 .into_iter()
                 .last();
-            // AIDEV-NOTE: cooldown_ms is untrusted u64 input; `as i64` wraps
-            // above i64::MAX and the addition can overflow (panic in debug
-            // builds). A saturating fix changes accepted-input behavior, so it
-            // is left as-is; consider capping cooldown_ms at upsert time.
             if latest.as_ref().is_some_and(|entry| {
-                entry.created_at_unix_ms + routine.metadata.cooldown_ms as i64 > now_unix_ms
+                routine_cooldown_deadline_is_after(
+                    entry.created_at_unix_ms,
+                    routine.metadata.cooldown_ms,
+                    now_unix_ms,
+                )
             }) {
                 return register_terminal_routine_run(
                     state,
@@ -2276,6 +2276,15 @@ fn routine_matches_trigger(metadata: &RoutineMetadataRecord, payload: &Value) ->
 fn compare_optional_matchers(expected: Option<&str>, actual: Option<&str>) -> bool {
     expected
         .is_none_or(|expected| actual.is_some_and(|actual| expected.eq_ignore_ascii_case(actual)))
+}
+
+fn routine_cooldown_deadline_is_after(
+    created_at_unix_ms: i64,
+    cooldown_ms: u64,
+    now_unix_ms: i64,
+) -> bool {
+    let cooldown_ms = i64::try_from(cooldown_ms).unwrap_or(i64::MAX);
+    created_at_unix_ms.saturating_add(cooldown_ms) > now_unix_ms
 }
 
 struct TerminalRoutineRunRequest<'a> {
@@ -3178,9 +3187,10 @@ mod tests {
         normalize_channel, output_delivered_for_outcome, parse_delivery, parse_execution_config,
         parse_optional_schedule_timezone_mode, parse_quiet_hours, parse_routine_approval_subject,
         parse_timezone_mode, routine_approval_subject_id,
-        routine_automation_flag_permits_enabled_write, routine_matches_trigger,
-        routine_output_fields_from_session, routine_output_text_from_tape_events,
-        routine_run_allows_output_preview, routine_troubleshooting_recommended_action,
+        routine_automation_flag_permits_enabled_write, routine_cooldown_deadline_is_after,
+        routine_matches_trigger, routine_output_fields_from_session,
+        routine_output_text_from_tape_events, routine_run_allows_output_preview,
+        routine_troubleshooting_recommended_action,
     };
     use crate::cron::CronTimezoneMode;
     use crate::journal::{CronScheduleType, OrchestratorSessionRecord, OrchestratorTapeRecord};
@@ -3238,6 +3248,12 @@ mod tests {
             routine_automation_flag_permits_enabled_write(true, true),
             "enabled rollout flag should permit enabled routine writes"
         );
+    }
+
+    #[test]
+    fn routine_cooldown_deadline_saturates_huge_values() {
+        assert!(routine_cooldown_deadline_is_after(100, u64::MAX, i64::MAX - 1));
+        assert!(!routine_cooldown_deadline_is_after(100, 25, 125));
     }
 
     #[test]

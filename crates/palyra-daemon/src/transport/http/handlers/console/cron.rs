@@ -26,16 +26,12 @@ pub(crate) async fn console_cron_list_handler(
     Query(query): Query<ConsoleCronListQuery>,
 ) -> Result<Json<Value>, Response> {
     let session = authorize_console_session(&state, &headers, false)?;
-    let limit = query.limit.unwrap_or(100).clamp(1, 500);
-    // AIDEV-NOTE: the runtime call receives the raw `query.limit`, not the
-    // clamped `limit` reported in the page envelope, so an oversized request
-    // can return more rows than `page.limit` claims (same in the runs handler
-    // below). Aligning them is a behavior change left for a deliberate fix.
+    let limit = console_cron_page_limit(query.limit);
     let (jobs, next_after_job_id) = state
         .runtime
         .list_cron_jobs(
             query.after_job_id,
-            query.limit,
+            Some(limit),
             query.enabled,
             Some(session.context.principal),
             session.context.channel,
@@ -237,7 +233,7 @@ pub(crate) async fn console_cron_runs_handler(
     Query(query): Query<ConsoleCronRunsQuery>,
 ) -> Result<Json<Value>, Response> {
     let session = authorize_console_session(&state, &headers, false)?;
-    let limit = query.limit.unwrap_or(100).clamp(1, 500);
+    let limit = console_cron_page_limit(query.limit);
     validate_canonical_id(job_id.as_str()).map_err(|_| {
         runtime_status_response(tonic::Status::invalid_argument("job_id must be a canonical ULID"))
     })?;
@@ -245,7 +241,7 @@ pub(crate) async fn console_cron_runs_handler(
         .await?;
     let (runs, next_after_run_id) = state
         .runtime
-        .list_cron_runs(Some(job_id), query.after_run_id, query.limit)
+        .list_cron_runs(Some(job_id), query.after_run_id, Some(limit))
         .await
         .map_err(runtime_status_response)?;
     Ok(Json(json!({
@@ -363,6 +359,10 @@ fn build_console_cron_service(state: &AppState) -> gateway::CronServiceImpl {
     )
 }
 
+fn console_cron_page_limit(requested_limit: Option<usize>) -> usize {
+    requested_limit.unwrap_or(100).clamp(1, 500)
+}
+
 /// Stamps a console session's principal, device, and channel onto outgoing
 /// gateway RPC metadata. Convenience wrapper over
 /// [`apply_console_request_context`].
@@ -430,4 +430,17 @@ pub(crate) fn apply_console_request_context(
         metadata.insert(gateway::HEADER_CHANNEL, channel);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::console_cron_page_limit;
+
+    #[test]
+    fn console_cron_page_limit_matches_runtime_limit() {
+        assert_eq!(console_cron_page_limit(None), 100);
+        assert_eq!(console_cron_page_limit(Some(0)), 1);
+        assert_eq!(console_cron_page_limit(Some(42)), 42);
+        assert_eq!(console_cron_page_limit(Some(10_000)), 500);
+    }
 }

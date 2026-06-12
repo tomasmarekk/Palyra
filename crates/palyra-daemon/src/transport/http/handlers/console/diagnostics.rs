@@ -663,12 +663,10 @@ fn delegation_waiting_reason(
 
 /// Bounds free-form diagnostic text (errors, reasons) to `max_chars` so one
 /// oversized error cannot bloat the diagnostics payload.
-// AIDEV-NOTE: the overflow check counts the untrimmed input while the output
-// is trimmed, so input whose surrounding whitespace pushes it past max_chars
-// gains a spurious "..." suffix; fixing this changes emitted payload text.
 fn truncate_diagnostic_text(value: &str, max_chars: usize) -> String {
-    let mut truncated = value.trim().chars().take(max_chars).collect::<String>();
-    if value.chars().count() > max_chars {
+    let trimmed = value.trim();
+    let mut truncated = trimmed.chars().take(max_chars).collect::<String>();
+    if trimmed.chars().count() > max_chars {
         truncated.push_str("...");
     }
     truncated
@@ -4016,11 +4014,6 @@ pub(crate) fn create_support_bundle_job(
 /// Background body of a support-bundle export job: marks the record running,
 /// shells out to the CLI exporter, records the outcome in observability, and
 /// prunes the job map down to `retain_jobs` entries.
-// AIDEV-NOTE: retention prunes the oldest jobs by request time regardless of
-// state, so under concurrent exports a still-running job's record can be
-// evicted before it completes (its final update is then lost); fixing this
-// requires skipping non-terminal jobs during pruning. Same pattern in
-// run_doctor_job below.
 pub(crate) async fn run_support_bundle_job(
     jobs: Arc<Mutex<HashMap<String, control_plane::SupportBundleJob>>>,
     observability: Arc<ObservabilityState>,
@@ -4071,14 +4064,7 @@ pub(crate) async fn run_support_bundle_job(
         }
     }
 
-    let mut finished = guard.values().cloned().collect::<Vec<_>>();
-    finished.sort_by_key(|left| left.requested_at_unix_ms);
-    while finished.len() > retain_jobs {
-        if let Some(first) = finished.first() {
-            guard.remove(first.job_id.as_str());
-        }
-        finished.remove(0);
-    }
+    prune_terminal_support_bundle_jobs(&mut guard, retain_jobs);
 }
 
 /// Queues a doctor recovery job and spawns its background runner. When the
@@ -4196,14 +4182,61 @@ pub(crate) async fn run_doctor_job(
         }
     }
 
-    let mut finished = guard.values().cloned().collect::<Vec<_>>();
-    finished.sort_by_key(|left| left.requested_at_unix_ms);
-    while finished.len() > retain_jobs {
-        if let Some(first) = finished.first() {
-            guard.remove(first.job_id.as_str());
-        }
-        finished.remove(0);
+    prune_terminal_doctor_jobs(&mut guard, retain_jobs);
+}
+
+fn prune_terminal_support_bundle_jobs(
+    jobs: &mut HashMap<String, control_plane::SupportBundleJob>,
+    retain_jobs: usize,
+) {
+    let mut removable = jobs
+        .values()
+        .filter(|job| support_bundle_job_is_terminal(job))
+        .map(|job| (job.requested_at_unix_ms, job.job_id.clone()))
+        .collect::<Vec<_>>();
+    removable.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    while jobs.len() > retain_jobs {
+        let Some((_, job_id)) = removable.first().cloned() else {
+            break;
+        };
+        jobs.remove(job_id.as_str());
+        removable.remove(0);
     }
+}
+
+fn support_bundle_job_is_terminal(job: &control_plane::SupportBundleJob) -> bool {
+    matches!(
+        job.state,
+        control_plane::SupportBundleJobState::Succeeded
+            | control_plane::SupportBundleJobState::Failed
+    )
+}
+
+fn prune_terminal_doctor_jobs(
+    jobs: &mut HashMap<String, control_plane::DoctorRecoveryJob>,
+    retain_jobs: usize,
+) {
+    let mut removable = jobs
+        .values()
+        .filter(|job| doctor_job_is_terminal(job))
+        .map(|job| (job.requested_at_unix_ms, job.job_id.clone()))
+        .collect::<Vec<_>>();
+    removable.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    while jobs.len() > retain_jobs {
+        let Some((_, job_id)) = removable.first().cloned() else {
+            break;
+        };
+        jobs.remove(job_id.as_str());
+        removable.remove(0);
+    }
+}
+
+fn doctor_job_is_terminal(job: &control_plane::DoctorRecoveryJob) -> bool {
+    matches!(
+        job.state,
+        control_plane::DoctorRecoveryJobState::Succeeded
+            | control_plane::DoctorRecoveryJobState::Failed
+    )
 }
 
 /// Builds the doctor CLI argv from the typed request; only known flags are
@@ -5621,6 +5654,17 @@ mod delegation_diagnostics_tests {
 }
 
 #[cfg(test)]
+mod diagnostic_text_tests {
+    use super::truncate_diagnostic_text;
+
+    #[test]
+    fn truncate_diagnostic_text_counts_trimmed_content() {
+        assert_eq!(truncate_diagnostic_text("  abc  ", 3), "abc");
+        assert_eq!(truncate_diagnostic_text("  abcd  ", 3), "abc...");
+    }
+}
+
+#[cfg(test)]
 mod doctor_job_security_tests {
     use super::*;
 
@@ -5656,6 +5700,105 @@ mod doctor_job_security_tests {
             command_output: String::new(),
             error: None,
         }
+    }
+
+    fn support_bundle_job(
+        job_id: &str,
+        state: control_plane::SupportBundleJobState,
+        requested_at_unix_ms: i64,
+    ) -> control_plane::SupportBundleJob {
+        control_plane::SupportBundleJob {
+            job_id: job_id.to_owned(),
+            state,
+            requested_at_unix_ms,
+            started_at_unix_ms: None,
+            completed_at_unix_ms: None,
+            output_path: None,
+            command_output: String::new(),
+            error: None,
+        }
+    }
+
+    fn doctor_job_with_state(
+        job_id: &str,
+        state: control_plane::DoctorRecoveryJobState,
+        requested_at_unix_ms: i64,
+    ) -> control_plane::DoctorRecoveryJob {
+        control_plane::DoctorRecoveryJob {
+            job_id: job_id.to_owned(),
+            state,
+            requested_at_unix_ms,
+            idempotency_key: None,
+            requested_by_principal: "operator".to_owned(),
+            requested_by_device_id: "device".to_owned(),
+            requested_channel: None,
+            started_at_unix_ms: None,
+            completed_at_unix_ms: None,
+            command: vec!["doctor".to_owned(), "--json".to_owned()],
+            report: None,
+            command_output: String::new(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn support_bundle_retention_preserves_non_terminal_jobs() {
+        let mut jobs = HashMap::from([
+            (
+                "running".to_owned(),
+                support_bundle_job("running", control_plane::SupportBundleJobState::Running, 1),
+            ),
+            (
+                "old-terminal".to_owned(),
+                support_bundle_job(
+                    "old-terminal",
+                    control_plane::SupportBundleJobState::Succeeded,
+                    2,
+                ),
+            ),
+            (
+                "new-terminal".to_owned(),
+                support_bundle_job("new-terminal", control_plane::SupportBundleJobState::Failed, 3),
+            ),
+        ]);
+
+        prune_terminal_support_bundle_jobs(&mut jobs, 1);
+
+        assert!(jobs.contains_key("running"));
+        assert!(!jobs.contains_key("old-terminal"));
+        assert!(!jobs.contains_key("new-terminal"));
+    }
+
+    #[test]
+    fn doctor_retention_preserves_non_terminal_jobs() {
+        let mut jobs = HashMap::from([
+            (
+                "queued".to_owned(),
+                doctor_job_with_state("queued", control_plane::DoctorRecoveryJobState::Queued, 1),
+            ),
+            (
+                "old-terminal".to_owned(),
+                doctor_job_with_state(
+                    "old-terminal",
+                    control_plane::DoctorRecoveryJobState::Succeeded,
+                    2,
+                ),
+            ),
+            (
+                "new-terminal".to_owned(),
+                doctor_job_with_state(
+                    "new-terminal",
+                    control_plane::DoctorRecoveryJobState::Failed,
+                    3,
+                ),
+            ),
+        ]);
+
+        prune_terminal_doctor_jobs(&mut jobs, 1);
+
+        assert!(jobs.contains_key("queued"));
+        assert!(!jobs.contains_key("old-terminal"));
+        assert!(!jobs.contains_key("new-terminal"));
     }
 
     #[test]
