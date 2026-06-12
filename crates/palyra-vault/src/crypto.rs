@@ -13,6 +13,7 @@ use std::{
 use hkdf::Hkdf;
 use palyra_identity::{FilesystemSecretStore, IdentityManager, SecretStore};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroize;
 
 use crate::{VaultError, VaultScope};
 
@@ -213,10 +214,6 @@ impl AsRef<[u8]> for SensitiveBytes {
 
 impl Drop for SensitiveBytes {
     fn drop(&mut self) {
-        // AIDEV-NOTE: best-effort wipe only — a plain fill can be elided by the optimizer and
-        // does not cover earlier reallocations or copies made before wrapping. A guaranteed wipe
-        // needs the `zeroize` crate (volatile writes + compiler fences), which is a dependency
-        // decision out of scope here.
-        self.0.fill(0);
+        self.0.zeroize();
     }
 }

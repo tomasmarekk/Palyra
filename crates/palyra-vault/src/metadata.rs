@@ -317,11 +317,8 @@ fn metadata_lock_owner_is_alive(pid: u32) -> bool {
 
 #[cfg(windows)]
 fn metadata_lock_owner_is_alive(pid: u32) -> bool {
-    // AIDEV-NOTE: `unwrap_or(false)` treats an errored probe as "dead", permitting reclaim of a
-    // stale-aged lock — the opposite bias of the Unix path, which treats ambiguity as "alive".
-    // (Access-denied and invalid-pid are already mapped to Ok inside `process_is_alive`; only
-    // unexpected probe failures hit this.) Aligning the bias would change reclaim behavior.
-    palyra_common::windows_security::process_is_alive(pid).unwrap_or(false)
+    // Unprobeable pid: claim "alive" so the lock is never reclaimed on uncertainty.
+    palyra_common::windows_security::process_is_alive(pid).unwrap_or(true)
 }
 
 #[cfg(all(not(unix), not(windows)))]

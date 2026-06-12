@@ -9,6 +9,7 @@ use anyhow::Context;
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
 use getrandom::fill as fill_random_bytes;
 use ring::aead::{Aad, LessSafeKey, Nonce, Tag, UnboundKey, CHACHA20_POLY1305};
+use zeroize::Zeroizing;
 
 use crate::{SensitiveBytes, VaultError};
 
@@ -52,10 +53,9 @@ pub fn seal(
     kek: &[u8; DEK_BYTES],
     aad: &[u8],
 ) -> Result<EnvelopePayload, VaultError> {
-    let mut dek = secure_random_array("data encryption key")?;
+    let dek = Zeroizing::new(secure_random_array("data encryption key")?);
     let (secret_nonce, secret_ciphertext, secret_mac) = seal_with_key(&dek, value, aad)?;
-    let (dek_nonce, dek_ciphertext, dek_mac) = seal_with_key(kek, &dek, aad)?;
-    dek.fill(0);
+    let (dek_nonce, dek_ciphertext, dek_mac) = seal_with_key(kek, dek.as_slice(), aad)?;
 
     Ok(EnvelopePayload {
         version: 1,
@@ -106,17 +106,14 @@ pub fn open(
     if dek_sensitive.as_ref().len() != DEK_BYTES {
         return Err(VaultError::Crypto("derived dek length mismatch".to_owned()));
     }
-    let mut dek = [0_u8; DEK_BYTES];
+    let mut dek = Zeroizing::new([0_u8; DEK_BYTES]);
     dek.copy_from_slice(dek_sensitive.as_ref());
 
     let secret_nonce =
         decode_fixed::<NONCE_BYTES>(payload.secret_nonce_b64.as_str(), "secret nonce")?;
     let secret_ciphertext = decode(payload.secret_ciphertext_b64.as_str(), "secret ciphertext")?;
     let secret_mac = decode_fixed::<MAC_BYTES>(payload.secret_mac_b64.as_str(), "secret mac")?;
-    let plaintext =
-        open_with_key(&dek, &secret_nonce, secret_ciphertext, &secret_mac, aad.as_slice())?;
-    dek.fill(0);
-    Ok(plaintext)
+    open_with_key(&dek, &secret_nonce, secret_ciphertext, &secret_mac, aad.as_slice())
 }
 
 /// Encrypts `plaintext` under `key_bytes` with a freshly drawn random nonce.
@@ -142,11 +139,7 @@ fn seal_with_key(
     Ok((nonce, in_out, mac))
 }
 
-/// Authenticates and decrypts `ciphertext` in place, returning the plaintext as a new buffer.
-///
-/// AIDEV-NOTE: the consumed `ciphertext` buffer holds decrypted plaintext when it is dropped
-/// here, and `plaintext.to_vec()` makes another heap copy — neither is zeroized. Tightening
-/// this means changing buffer ownership/zeroization strategy, not a comment-level fix.
+/// Authenticates and decrypts `ciphertext` in place, returning the same buffer as plaintext.
 fn open_with_key(
     key_bytes: &[u8; DEK_BYTES],
     nonce: &[u8; NONCE_BYTES],
@@ -163,7 +156,9 @@ fn open_with_key(
     let plaintext = key
         .open_in_place_separate_tag(nonce_value, Aad::from(aad), tag, &mut ciphertext, 0..)
         .map_err(|_| VaultError::Crypto("failed to decrypt envelope payload".to_owned()))?;
-    Ok(plaintext.to_vec())
+    let plaintext_len = plaintext.len();
+    ciphertext.truncate(plaintext_len);
+    Ok(ciphertext)
 }
 
 /// Decodes an unpadded-base64 envelope field, labelling failures for diagnostics.

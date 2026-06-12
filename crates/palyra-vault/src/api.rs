@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use palyra_common::default_identity_store_root;
+use zeroize::Zeroize;
 
 use crate::{
     backend::{select_backend, BackendKind, BackendPreference, BlobBackend},
@@ -113,10 +114,13 @@ pub struct Vault {
     pub(crate) root: PathBuf,
     pub(crate) backend: Box<dyn BlobBackend>,
     pub(crate) max_secret_bytes: usize,
-    // AIDEV-NOTE: the KEK is held in plain memory for the vault's lifetime and is not zeroized
-    // on drop; wrapping it (e.g. zeroize/secrecy) needs a dependency decision. See the related
-    // note on SensitiveBytes in crypto.rs.
     pub(crate) kek: [u8; 32],
+}
+
+impl Drop for Vault {
+    fn drop(&mut self) {
+        self.kek.zeroize();
+    }
 }
 
 impl Vault {
@@ -218,9 +222,6 @@ impl Vault {
             index.entries.iter().position(|entry| entry.scope == *scope && entry.key == key);
         // Captured before the overwrite so a failed metadata write below can restore the
         // previous ciphertext instead of leaving blob and index out of sync.
-        // AIDEV-NOTE: if the index lists an entry whose blob is gone, this surfaces NotFound and
-        // the overwrite is rejected; recovering (treating NotFound as "no previous blob") would
-        // be a behavior change.
         let previous_blob = if existing_entry_index.is_some() {
             Some(self.backend.get_blob(object_id.as_str())?)
         } else {
