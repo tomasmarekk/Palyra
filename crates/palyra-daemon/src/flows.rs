@@ -236,7 +236,7 @@ impl FlowCoordinator {
             return Ok(state);
         }
 
-        let lineage = parse_lineage(step);
+        let lineage = parse_lineage(step)?;
         if let Some(task_id) = lineage.background_task_id.as_deref() {
             let Some(task) = runtime.get_orchestrator_background_task(task_id.to_owned()).await?
             else {
@@ -457,7 +457,7 @@ impl FlowCoordinator {
                 mark_step_waiting(runtime, step, "waiting for external approval").await
             }
             "routine" | "objective" | "webhook" => {
-                let lineage = parse_lineage(step);
+                let lineage = parse_lineage(step)?;
                 if lineage.background_task_id.is_some()
                     || lineage.child_run_id.is_some()
                     || lineage.approval_id.is_some()
@@ -501,7 +501,7 @@ impl FlowCoordinator {
         flow: &FlowRecord,
         step: &FlowStepRecord,
     ) -> Result<(), Status> {
-        let mut lineage = parse_lineage(step);
+        let mut lineage = parse_lineage(step)?;
         if lineage.background_task_id.is_some() {
             return runtime
                 .update_flow_step(FlowStepUpdateRequest {
@@ -915,12 +915,11 @@ fn same_flow_scope(
         && flow.channel.as_deref() == channel
 }
 
-// AIDEV-NOTE: corrupt lineage_json silently parses as an empty FlowLineage. For managed steps
-// that means dispatch_background_step would see no background_task_id and create a duplicate
-// task instead of reusing the existing one. Surfacing the parse failure requires a behavior
-// change, so the fail-open default is only flagged here.
-fn parse_lineage(step: &FlowStepRecord) -> FlowLineage {
-    serde_json::from_str(step.lineage_json.as_str()).unwrap_or_default()
+#[allow(clippy::result_large_err)]
+fn parse_lineage(step: &FlowStepRecord) -> Result<FlowLineage, Status> {
+    serde_json::from_str(step.lineage_json.as_str()).map_err(|error| {
+        Status::internal(format!("failed to parse flow lineage for step {}: {error}", step.step_id))
+    })
 }
 
 fn serialize_lineage(lineage: &FlowLineage) -> Result<String, Status> {
@@ -1042,6 +1041,17 @@ mod tests {
         assert_eq!(map_auxiliary_task_state("running"), Some(FlowStepState::Running));
         assert_eq!(map_auxiliary_task_state("succeeded"), Some(FlowStepState::Succeeded));
         assert_eq!(map_auxiliary_task_state("expired"), Some(FlowStepState::TimedOut));
+    }
+
+    #[test]
+    fn parse_lineage_rejects_corrupt_json() {
+        let mut record = step("corrupt-lineage", FlowStepState::Pending);
+        record.lineage_json = "{".to_owned();
+
+        let error = parse_lineage(&record).expect_err("corrupt lineage must fail closed");
+
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(error.message().contains("corrupt-lineage"));
     }
 
     #[test]

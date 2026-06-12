@@ -35,6 +35,9 @@ pub(crate) fn map_orchestrator_store_error(operation: &str, error: JournalError)
         JournalError::SessionNotFound { selector } => {
             Status::not_found(format!("orchestrator session not found for selector: {selector}"))
         }
+        JournalError::CheckpointNotFound { checkpoint_kind, checkpoint_id } => {
+            Status::not_found(format!("{checkpoint_kind} checkpoint not found: {checkpoint_id}"))
+        }
         JournalError::InvalidSessionSelector { reason } => {
             Status::invalid_argument(format!("invalid orchestrator session selector: {reason}"))
         }
@@ -292,5 +295,20 @@ mod tests {
         assert_eq!(status.code(), Code::FailedPrecondition);
         assert!(status.message().contains("active run run-active"));
         assert!(status.message().contains("run-next"));
+    }
+
+    #[test]
+    fn map_orchestrator_store_error_maps_checkpoint_not_found_to_not_found() {
+        let status = map_orchestrator_store_error(
+            "restore checkpoint",
+            JournalError::CheckpointNotFound {
+                checkpoint_kind: "workspace",
+                checkpoint_id: "checkpoint-1".to_owned(),
+            },
+        );
+
+        assert_eq!(status.code(), Code::NotFound);
+        assert!(status.message().contains("workspace checkpoint not found"));
+        assert!(status.message().contains("checkpoint-1"));
     }
 }

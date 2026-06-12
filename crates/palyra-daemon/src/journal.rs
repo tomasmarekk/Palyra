@@ -3650,6 +3650,8 @@ pub enum JournalError {
     SessionIdentityMismatch { session_id: String },
     #[error("orchestrator session not found for selector: {selector}")]
     SessionNotFound { selector: String },
+    #[error("{checkpoint_kind} checkpoint not found: {checkpoint_id}")]
+    CheckpointNotFound { checkpoint_kind: &'static str, checkpoint_id: String },
     #[error("invalid orchestrator session selector: {reason}")]
     InvalidSessionSelector { reason: String },
     #[error("learning candidate not found: {candidate_id}")]
@@ -10384,7 +10386,7 @@ impl JournalStore {
     /// Increments a checkpoint's restore counter and timestamp.
     ///
     /// # Errors
-    /// Returns [`JournalError::SessionNotFound`] (carrying the checkpoint id) for an
+    /// Returns [`JournalError::CheckpointNotFound`] for an
     /// unknown checkpoint, or [`JournalError`] on storage failure.
     pub fn mark_orchestrator_checkpoint_restored(
         &self,
@@ -10403,11 +10405,10 @@ impl JournalStore {
             params![request.checkpoint_id, now],
         )?;
         if updated == 0 {
-            // AIDEV-NOTE: misleading variant reuse -- an unknown checkpoint id
-            // surfaces as "orchestrator session not found". Fixing it needs a
-            // dedicated CheckpointNotFound variant (an error-contract change),
-            // so it is only flagged here.
-            return Err(JournalError::SessionNotFound { selector: request.checkpoint_id.clone() });
+            return Err(JournalError::CheckpointNotFound {
+                checkpoint_kind: "orchestrator",
+                checkpoint_id: request.checkpoint_id.clone(),
+            });
         }
         Ok(())
     }
@@ -11352,7 +11353,7 @@ impl JournalStore {
     /// restore report.
     ///
     /// # Errors
-    /// Returns [`JournalError::SessionNotFound`] (carrying the checkpoint id) for an
+    /// Returns [`JournalError::CheckpointNotFound`] for an
     /// unknown checkpoint, or [`JournalError`] on storage failure.
     pub fn mark_workspace_checkpoint_restored(
         &self,
@@ -11372,9 +11373,10 @@ impl JournalStore {
             params![request.checkpoint_id, now, request.latest_restore_report_id],
         )?;
         if updated == 0 {
-            // AIDEV-NOTE: same misleading SessionNotFound reuse as
-            // mark_orchestrator_checkpoint_restored; see the note there.
-            return Err(JournalError::SessionNotFound { selector: request.checkpoint_id.clone() });
+            return Err(JournalError::CheckpointNotFound {
+                checkpoint_kind: "workspace",
+                checkpoint_id: request.checkpoint_id.clone(),
+            });
         }
         Ok(())
     }
@@ -27447,6 +27449,51 @@ mod tests {
             .expect("learning preferences should load");
         assert_eq!(preferences.len(), 1);
         assert_eq!(preferences[0].value, "direct");
+    }
+
+    #[test]
+    fn missing_orchestrator_checkpoint_restore_uses_checkpoint_not_found() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+
+        let error = store
+            .mark_orchestrator_checkpoint_restored(
+                &super::OrchestratorCheckpointRestoreMarkRequest {
+                    checkpoint_id: "01ARZ3NDEKTSV4RRFFQ69G5NO1".to_owned(),
+                },
+            )
+            .expect_err("missing orchestrator checkpoint must fail");
+
+        assert!(matches!(
+            error,
+            JournalError::CheckpointNotFound {
+                checkpoint_kind: "orchestrator",
+                checkpoint_id
+            } if checkpoint_id == "01ARZ3NDEKTSV4RRFFQ69G5NO1"
+        ));
+    }
+
+    #[test]
+    fn missing_workspace_checkpoint_restore_uses_checkpoint_not_found() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+
+        let error = store
+            .mark_workspace_checkpoint_restored(&super::WorkspaceCheckpointRestoreMarkRequest {
+                checkpoint_id: "01ARZ3NDEKTSV4RRFFQ69G5NW1".to_owned(),
+                latest_restore_report_id: None,
+            })
+            .expect_err("missing workspace checkpoint must fail");
+
+        assert!(matches!(
+            error,
+            JournalError::CheckpointNotFound {
+                checkpoint_kind: "workspace",
+                checkpoint_id
+            } if checkpoint_id == "01ARZ3NDEKTSV4RRFFQ69G5NW1"
+        ));
     }
 
     #[test]

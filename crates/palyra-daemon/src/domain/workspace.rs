@@ -721,13 +721,6 @@ struct ParsedManagedBlock {
     entries: Vec<WorkspaceManagedEntry>,
 }
 
-// AIDEV-NOTE: this parser assumes the first BEGIN marker precedes the first
-// END marker. A manually edited document that places the END marker before
-// the BEGIN marker makes `after_begin > end_start`, and the
-// `current_content[after_begin..end_start]` slice below panics. Fixing it
-// requires a behavior change (return MissingBlockStart/MalformedItem for the
-// reversed-marker case) and a regression test; do not "simplify" the marker
-// lookups without handling that ordering.
 fn parse_existing_block(
     current_content: &str,
     block_id: &str,
@@ -748,6 +741,12 @@ fn parse_existing_block(
             Err(WorkspaceManagedBlockError::MissingBlockStart { block_id: block_id.to_owned() })
         }
         (Some(begin_start), Some(end_start)) => {
+            if end_start < begin_start {
+                return Err(WorkspaceManagedBlockError::MalformedItem {
+                    block_id: block_id.to_owned(),
+                    line: "managed block end marker appears before start marker".to_owned(),
+                });
+            }
             // The rendered block always starts with a "## <heading>" line, so
             // when the line right above the BEGIN marker is such a heading it
             // belongs to the block and the replacement range must absorb it;
@@ -1045,6 +1044,24 @@ mod tests {
             matches!(error, WorkspaceManagedBlockError::MalformedItem { .. }),
             "manual edits inside the managed block must fail closed"
         );
+    }
+
+    #[test]
+    fn managed_block_merge_rejects_reversed_markers() {
+        let malformed = "# Memory\n\n<!-- PALYRA:END continuity-memory -->\n<!-- PALYRA:BEGIN continuity-memory -->\n";
+        let update = WorkspaceManagedBlockUpdate {
+            block_id: "continuity-memory".to_owned(),
+            heading: "Compaction Continuity".to_owned(),
+            entries: vec![WorkspaceManagedEntry {
+                entry_id: "fact-1".to_owned(),
+                label: "fact".to_owned(),
+                content: "Keep automatic compaction deterministic.".to_owned(),
+            }],
+        };
+        let error = apply_workspace_managed_block(malformed, &update)
+            .expect_err("reversed markers must fail closed");
+
+        assert!(matches!(error, WorkspaceManagedBlockError::MalformedItem { .. }));
     }
 
     #[test]
