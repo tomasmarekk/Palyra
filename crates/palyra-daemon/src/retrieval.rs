@@ -1549,25 +1549,7 @@ impl MemoryEmbeddingProvider for ModelProviderMemoryEmbeddingAdapter {
     // and searches keep working; the lexical branch still produces useful rankings.
     fn embed_text(&self, text: &str) -> Vec<f32> {
         let request = crate::model_provider::EmbeddingsRequest { inputs: vec![text.to_owned()] };
-        // AIDEV-NOTE: block_in_place panics on a current_thread tokio runtime (it only
-        // works on the multi-thread flavor), and Handle::try_current succeeds there too.
-        // The daemon runs multi-thread, but calling this from a current_thread runtime
-        // (for example #[tokio::test] without a flavor) would panic rather than fall
-        // back to the zero vector. Fixing it requires a behavior change (runtime-flavor
-        // check or dedicated blocking thread).
-        let result = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                tokio::task::block_in_place(|| handle.block_on(self.provider.embed(request)))
-            }
-            Err(_) => {
-                tracing::warn!(
-                    "tokio runtime unavailable for retrieval embeddings adapter; using zero vector fallback"
-                );
-                return self.zero_vector();
-            }
-        };
-
-        match result {
+        match run_embedding_request_synchronously(self.provider.clone(), request) {
             Ok(response) => {
                 let Some(vector) = response.vectors.into_iter().next() else {
                     tracing::warn!(
@@ -1579,13 +1561,30 @@ impl MemoryEmbeddingProvider for ModelProviderMemoryEmbeddingAdapter {
             }
             Err(error) => {
                 tracing::warn!(
-                    error = %error,
+                    error = error.as_str(),
                     "retrieval embeddings request failed; using zero vector fallback"
                 );
                 self.zero_vector()
             }
         }
     }
+}
+
+fn run_embedding_request_synchronously(
+    provider: Arc<dyn crate::model_provider::EmbeddingsProvider>,
+    request: crate::model_provider::EmbeddingsRequest,
+) -> Result<crate::model_provider::EmbeddingsResponse, String> {
+    let worker = std::thread::Builder::new()
+        .name("palyra-retrieval-embedding".to_owned())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| format!("failed to build retrieval embedding runtime: {error}"))?;
+            runtime.block_on(provider.embed(request)).map_err(|error| error.to_string())
+        })
+        .map_err(|error| format!("failed to spawn retrieval embedding worker: {error}"))?;
+    worker.join().map_err(|_| "retrieval embedding worker panicked".to_owned())?
 }
 
 // The journal vector index requires a fixed dimensionality per target version, so
@@ -1606,6 +1605,8 @@ fn normalize_embedding_dimensions(mut vector: Vec<f32>, expected_dims: usize) ->
 mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
+        future::Future,
+        pin::Pin,
         sync::{Arc, Mutex},
     };
 
@@ -1617,16 +1618,21 @@ mod tests {
         compaction_source_quality, lexical_overlap_score, memory_source_quality,
         proxy_vector_score, recency_score, score_with_profile, transcript_source_quality,
         workspace_source_quality, ExternalDerivedRetrievalBackend, ExternalRetrievalIndexSnapshot,
-        ExternalRetrievalScaleSloSnapshot, JournalRetrievalBackend, RetrievalBackend,
-        RetrievalBackendKind, RetrievalBackendState, RetrievalExternalizationClass,
-        RetrievalRuntimeConfig, RetrievalSourceProfileKind,
+        ExternalRetrievalScaleSloSnapshot, JournalRetrievalBackend,
+        ModelProviderMemoryEmbeddingAdapter, RetrievalBackend, RetrievalBackendKind,
+        RetrievalBackendState, RetrievalExternalizationClass, RetrievalRuntimeConfig,
+        RetrievalSourceProfileKind,
     };
     use crate::journal::{
-        JournalConfig, JournalStore, MemoryEmbeddingsMode, MemoryEmbeddingsStatus,
-        MemoryItemCreateRequest, MemorySearchRequest, MemorySource, OrchestratorCheckpointRecord,
-        OrchestratorCompactionArtifactRecord, QueryEmbeddingCacheStatus,
+        JournalConfig, JournalStore, MemoryEmbeddingProvider, MemoryEmbeddingsMode,
+        MemoryEmbeddingsStatus, MemoryItemCreateRequest, MemorySearchRequest, MemorySource,
+        OrchestratorCheckpointRecord, OrchestratorCompactionArtifactRecord,
+        QueryEmbeddingCacheStatus,
     };
-    use crate::model_provider::{ModelProviderConfig, ModelProviderKind};
+    use crate::model_provider::{
+        EmbeddingsProvider, EmbeddingsRequest, EmbeddingsResponse, ModelProviderConfig,
+        ModelProviderKind, ProviderError,
+    };
 
     #[test]
     fn retrieval_scoring_defaults_validate() {
@@ -1733,6 +1739,17 @@ mod tests {
             warning.contains("hash fallback"),
             "warning should make the degraded fallback mode explicit: {warning}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn memory_embedding_adapter_embeds_on_current_thread_runtime() {
+        let adapter = ModelProviderMemoryEmbeddingAdapter::new(
+            Arc::new(ConstantEmbeddingProvider),
+            "mock-embedding".to_owned(),
+            3,
+        );
+
+        assert_eq!(adapter.embed_text("hello"), vec![1.0, 2.0, 3.0]);
     }
 
     #[test]
@@ -2956,5 +2973,24 @@ mod tests {
             vector_heavy.cases[0].top_candidates[0].final_score,
             "eval harness should make scoring configuration changes visible"
         );
+    }
+
+    struct ConstantEmbeddingProvider;
+
+    impl EmbeddingsProvider for ConstantEmbeddingProvider {
+        fn embed<'a>(
+            &'a self,
+            request: EmbeddingsRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<EmbeddingsResponse, ProviderError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                Ok(EmbeddingsResponse {
+                    model_name: "mock-embedding".to_owned(),
+                    dimensions: 3,
+                    vectors: request.inputs.into_iter().map(|_| vec![1.0, 2.0, 3.0]).collect(),
+                    retry_count: 0,
+                })
+            })
+        }
     }
 }
