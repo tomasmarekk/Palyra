@@ -3,29 +3,31 @@
 
 use super::{
     action_log_entry_to_proto, browser_v1, build_accessibility_tree_snapshot, build_dom_snapshot,
-    chromium_active_tab_for_session, chromium_new_tab_error_is_retryable,
-    default_browserd_state_dir_from_env, derive_state_encryption_key, encrypt_state_blob,
-    enforce_non_loopback_bind_auth, fetch_http_attachment_download_artifact, navigate_with_guards,
-    parse_daemon_bind_socket, persisted_snapshot_hash, persisted_snapshot_legacy_hash,
-    record_chromium_remote_ip_incident, reset_dns_validation_tracking_for_tests,
-    run_chromium_blocking, sha256_hex, store_dns_nxdomain_cache, store_generated_artifact,
-    update_profile_state_metadata, validate_restored_snapshot_against_profile, validate_target_url,
-    validate_target_url_blocking, Args, BrowserActionLogEntryInternal, BrowserEngineMode,
-    BrowserProfileRecord, BrowserRuntimeState, BrowserServiceImpl, BrowserTabRecord,
-    ChromiumPrivateTargetPolicy, ChromiumSessionProxy, DnsValidationCache, NetworkLogEntryInternal,
-    NetworkLogHeaderInternal, PersistedSessionSnapshot, PersistedStateStore,
-    SessionPermissionsInternal, AUTHORIZATION_HEADER, CANONICAL_PROTOCOL_MAJOR,
-    CHROMIUM_NEW_TAB_RETRY_DELAY_MS, CHROMIUM_PATH_ENV, DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
-    DEFAULT_GRPC_PORT, DEFAULT_MAX_TABS_PER_SESSION, DOWNLOAD_MAX_FILE_BYTES,
-    MAX_RELAY_PAYLOAD_BYTES, ONE_BY_ONE_PNG, PRINCIPAL_HEADER, PROFILE_RECORD_SCHEMA_VERSION,
-    STATE_KEY_LEN,
+    build_state_store_from_env, chromium_active_tab_for_session,
+    chromium_new_tab_error_is_retryable, default_browserd_state_dir_from_env,
+    derive_state_encryption_key, encrypt_state_blob, enforce_non_loopback_bind_auth,
+    fetch_http_attachment_download_artifact, navigate_with_guards, parse_daemon_bind_socket,
+    persisted_snapshot_hash, persisted_snapshot_legacy_hash, record_chromium_remote_ip_incident,
+    reset_dns_validation_tracking_for_tests, run_chromium_blocking, sha256_hex,
+    store_dns_nxdomain_cache, store_generated_artifact, update_profile_state_metadata,
+    validate_restored_snapshot_against_profile, validate_target_url, validate_target_url_blocking,
+    Args, BrowserActionLogEntryInternal, BrowserEngineMode, BrowserProfileRecord,
+    BrowserRuntimeState, BrowserServiceImpl, BrowserTabRecord, ChromiumPrivateTargetPolicy,
+    ChromiumSessionProxy, DnsValidationCache, NetworkLogEntryInternal, NetworkLogHeaderInternal,
+    PersistedSessionSnapshot, PersistedStateStore, SessionPermissionsInternal,
+    AUTHORIZATION_HEADER, CANONICAL_PROTOCOL_MAJOR, CHROMIUM_NEW_TAB_RETRY_DELAY_MS,
+    CHROMIUM_PATH_ENV, DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS, DEFAULT_GRPC_PORT,
+    DEFAULT_MAX_TABS_PER_SESSION, DOWNLOAD_MAX_FILE_BYTES, MAX_RELAY_PAYLOAD_BYTES, ONE_BY_ONE_PNG,
+    PRINCIPAL_HEADER, PROFILE_RECORD_SCHEMA_VERSION, STATE_DIR_ENV, STATE_KEY_ENV, STATE_KEY_LEN,
+    STATE_ROOT_ENV,
 };
 use crate::proto;
 use crate::proto::palyra::browser::v1::browser_service_server::BrowserService;
 use crate::security::auth::constant_time_eq_bytes;
+use base64::Engine as _;
 use reqwest::Url;
 use std::collections::HashMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -80,6 +82,48 @@ fn resolve_chromium_path_for_tests() -> Option<PathBuf> {
         .ok()
         .map(PathBuf::from)
         .or_else(|| headless_chrome::browser::default_executable().ok())
+}
+
+struct EnvVarGuard {
+    name: &'static str,
+    previous: Option<OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(name: &'static str, value: impl AsRef<OsStr>) -> Self {
+        let previous = std::env::var_os(name);
+        // The browserd env test mutex serializes process-wide environment mutation.
+        unsafe {
+            std::env::set_var(name, value);
+        }
+        Self { name, previous }
+    }
+
+    fn remove(name: &'static str) -> Self {
+        let previous = std::env::var_os(name);
+        // The browserd env test mutex serializes process-wide environment mutation.
+        unsafe {
+            std::env::remove_var(name);
+        }
+        Self { name, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        // The browserd env test mutex serializes process-wide environment mutation.
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+}
+
+fn browserd_env_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static BROWSERD_ENV_TEST_LOCK: std::sync::OnceLock<StdMutex<()>> = std::sync::OnceLock::new();
+    BROWSERD_ENV_TEST_LOCK.get_or_init(|| StdMutex::new(())).lock().expect("env test lock")
 }
 
 async fn chromium_integration_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
@@ -623,6 +667,27 @@ fn default_browserd_state_dir_prefers_state_root_override() {
         PathBuf::from("state-root").join("browserd"),
         "PALYRA_STATE_ROOT should take precedence for browserd defaults"
     );
+}
+
+#[test]
+fn build_state_store_uses_configured_state_dir_without_resolving_default() {
+    let _env_guard = browserd_env_test_guard();
+    let temp = tempfile::tempdir().expect("tempdir should be available");
+    let state_dir = temp.path().join("configured-state");
+    let encoded_key = base64::engine::general_purpose::STANDARD.encode([7_u8; STATE_KEY_LEN]);
+    let _state_key = EnvVarGuard::set(STATE_KEY_ENV, encoded_key);
+    let _state_dir = EnvVarGuard::set(STATE_DIR_ENV, state_dir.as_os_str());
+    let _state_root = EnvVarGuard::remove(STATE_ROOT_ENV);
+    let _appdata = EnvVarGuard::remove("APPDATA");
+    let _local_appdata = EnvVarGuard::remove("LOCALAPPDATA");
+    let _xdg_state_home = EnvVarGuard::remove("XDG_STATE_HOME");
+    let _home = EnvVarGuard::remove("HOME");
+
+    let store = build_state_store_from_env()
+        .expect("explicit browserd state dir should not require default env vars")
+        .expect("state key should enable persistence");
+
+    assert_eq!(store.root_dir, state_dir);
 }
 
 #[cfg(windows)]

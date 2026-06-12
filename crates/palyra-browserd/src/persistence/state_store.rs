@@ -109,16 +109,16 @@ pub(crate) fn build_state_store_from_env() -> Result<Option<PersistedStateStore>
         return Ok(None);
     }
     let key = decode_state_key(key_raw.as_str())?;
-    // AIDEV-NOTE: `unwrap_or` evaluates `default_browserd_state_dir()?` eagerly, so an
-    // unresolvable default dir (e.g. APPDATA unset) fails startup even when STATE_DIR_ENV is
-    // explicitly configured. Fixing this would change observable behavior; left as-is.
-    let state_dir = std::env::var(STATE_DIR_ENV)
+    let configured_state_dir = std::env::var(STATE_DIR_ENV)
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
         .map(|value| normalize_configured_state_path(value.as_str(), STATE_DIR_ENV))
-        .transpose()?
-        .unwrap_or(default_browserd_state_dir()?);
+        .transpose()?;
+    let state_dir = match configured_state_dir {
+        Some(path) => path,
+        None => default_browserd_state_dir()?,
+    };
     Ok(Some(PersistedStateStore::new(state_dir, key)?))
 }
 
