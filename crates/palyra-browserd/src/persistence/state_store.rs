@@ -233,8 +233,15 @@ pub(crate) fn default_browserd_state_dir_from_env(
 /// # Errors
 /// Fails when the directory cannot be created or permissions cannot be applied.
 pub(crate) fn ensure_owner_only_dir(path: &Path) -> Result<()> {
-    fs::create_dir_all(path)
-        .with_context(|| format!("failed to create browserd state dir '{}'", path.display()))?;
+    match fs::create_dir_all(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to create browserd state dir '{}'", path.display())
+            });
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
