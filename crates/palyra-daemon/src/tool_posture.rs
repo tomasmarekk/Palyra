@@ -12,7 +12,7 @@
 
 use std::{
     fs,
-    io::{Read, Seek, SeekFrom, Write},
+    io::Write,
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -314,12 +314,10 @@ struct ToolPostureRegistryDocument {
 /// Durable store for posture overrides, recommendation actions, and audit
 /// events, backed by a single JSON document.
 ///
-/// The file handle is kept open for the registry's lifetime and rewritten in
-/// place on every mutation. Lock order is always `document` before `file`;
-/// keep that order to avoid deadlocks.
+/// Mutations update the in-memory document under `document`, then replace the
+/// on-disk JSON through a temporary sidecar file.
 pub struct ToolPostureRegistry {
     document_path: PathBuf,
-    file: Mutex<fs::File>,
     document: Mutex<ToolPostureRegistryDocument>,
 }
 
@@ -336,7 +334,7 @@ impl ToolPostureRegistry {
             ToolPostureRegistryError::CreateDirectory { path: tool_posture_root.clone(), source }
         })?;
         let document_path = tool_posture_root.join(TOOL_POSTURE_REGISTRY_FILE);
-        let mut file = fs::File::options()
+        fs::File::options()
             .create(true)
             .truncate(false)
             .read(true)
@@ -346,8 +344,8 @@ impl ToolPostureRegistry {
                 path: document_path.clone(),
                 source,
             })?;
-        let document = load_registry_document(&document_path, &mut file)?;
-        Ok(Self { document_path, file: Mutex::new(file), document: Mutex::new(document) })
+        let document = load_registry_document(&document_path)?;
+        Ok(Self { document_path, document: Mutex::new(document) })
     }
 
     /// Lists current overrides, pruning expired entries as a side effect.
@@ -360,12 +358,9 @@ impl ToolPostureRegistry {
         let now_unix_ms = current_unix_ms();
         let mut document =
             self.document.lock().map_err(|_| ToolPostureRegistryError::LockPoisoned)?;
-        prune_expired_entries(&mut document, now_unix_ms);
-        // AIDEV-NOTE: this read path rewrites and fsyncs the registry file on
-        // every call, even when pruning removed nothing. Skipping the persist
-        // when no entry expired would avoid the write, but callers currently
-        // rely on listing to also flush lazy expiry to disk.
-        persist_registry_document(&self.document_path, &self.file, &document)?;
+        if prune_expired_entries(&mut document, now_unix_ms) {
+            persist_registry_document(&self.document_path, &document)?;
+        }
         Ok(document.overrides.clone())
     }
 
@@ -490,7 +485,7 @@ impl ToolPostureRegistry {
                 .then_with(|| left.scope_id.cmp(&right.scope_id))
                 .then_with(|| left.tool_name.cmp(&right.tool_name))
         });
-        persist_registry_document(&self.document_path, &self.file, &document)?;
+        persist_registry_document(&self.document_path, &document)?;
         Ok(record)
     }
 
@@ -550,7 +545,7 @@ impl ToolPostureRegistry {
                     created_at_unix_ms: request.now_unix_ms,
                 },
             );
-            persist_registry_document(&self.document_path, &self.file, &document)?;
+            persist_registry_document(&self.document_path, &document)?;
         }
         Ok(removed)
     }
@@ -604,7 +599,7 @@ impl ToolPostureRegistry {
             );
         }
         if !removed.is_empty() {
-            persist_registry_document(&self.document_path, &self.file, &document)?;
+            persist_registry_document(&self.document_path, &document)?;
         }
         Ok(removed)
     }
@@ -650,7 +645,7 @@ impl ToolPostureRegistry {
                     created_at_unix_ms: request.now_unix_ms,
                 },
             );
-            persist_registry_document(&self.document_path, &self.file, &document)?;
+            persist_registry_document(&self.document_path, &document)?;
             return Ok(updated);
         }
         let record = ToolPostureRecommendationActionRecord {
@@ -680,7 +675,7 @@ impl ToolPostureRegistry {
                 created_at_unix_ms: record.created_at_unix_ms,
             },
         );
-        persist_registry_document(&self.document_path, &self.file, &document)?;
+        persist_registry_document(&self.document_path, &document)?;
         Ok(record)
     }
 }
@@ -1518,14 +1513,8 @@ pub fn build_tool_friction_metrics(
 ) -> ToolFrictionMetrics {
     let mut metrics = ToolFrictionMetrics::default();
     let mut session_ids = std::collections::BTreeSet::new();
-    // AIDEV-NOTE: subject ids are matched by `starts_with("tool:<name>")`
-    // here and in recent_tool_approvals. If a future tool name is a strict
-    // prefix of another (e.g. "x.run" vs "x.runner"), their metrics would be
-    // conflated; an exact-segment match would need a subject-id format
-    // change.
-    let prefix = format!("tool:{tool_name}");
     for approval in approvals {
-        if !approval.subject_id.starts_with(prefix.as_str()) {
+        if !tool_approval_subject_matches_tool(approval.subject_id.as_str(), tool_name) {
             continue;
         }
         metrics.requested_14d += 1;
@@ -1589,37 +1578,44 @@ pub fn recent_tool_approvals<'a>(
     tool_name: &str,
     limit: usize,
 ) -> Vec<&'a ApprovalRecord> {
-    let prefix = format!("tool:{tool_name}");
     approvals
         .iter()
-        .filter(|approval| approval.subject_id.starts_with(prefix.as_str()))
+        .filter(|approval| {
+            tool_approval_subject_matches_tool(approval.subject_id.as_str(), tool_name)
+        })
         .take(limit)
         .collect()
+}
+
+fn tool_approval_subject_matches_tool(subject_id: &str, tool_name: &str) -> bool {
+    let Some(subject_tool_name) = subject_id.strip_prefix("tool:") else {
+        return false;
+    };
+    subject_tool_name == tool_name
+        || subject_tool_name
+            .strip_prefix(tool_name)
+            .is_some_and(|remainder| remainder.starts_with('|'))
 }
 
 // An empty or new file is initialized with an empty current-version document
 // so later writes never have to special-case first use.
 fn load_registry_document(
     path: &Path,
-    file: &mut fs::File,
 ) -> Result<ToolPostureRegistryDocument, ToolPostureRegistryError> {
-    let mut buffer = String::new();
-    file.seek(SeekFrom::Start(0)).map_err(|source| ToolPostureRegistryError::ReadFile {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    file.read_to_string(&mut buffer).map_err(|source| ToolPostureRegistryError::ReadFile {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let buffer = match fs::read_to_string(path) {
+        Ok(buffer) => buffer,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            let document = empty_registry_document();
+            write_registry_document(path, &document)?;
+            return Ok(document);
+        }
+        Err(source) => {
+            return Err(ToolPostureRegistryError::ReadFile { path: path.to_path_buf(), source });
+        }
+    };
     if buffer.trim().is_empty() {
-        let document = ToolPostureRegistryDocument {
-            schema_version: TOOL_POSTURE_SCHEMA_VERSION,
-            overrides: vec![],
-            recommendation_actions: vec![],
-            audit_events: vec![],
-        };
-        write_registry_document(path, file, &document)?;
+        let document = empty_registry_document();
+        write_registry_document(path, &document)?;
         return Ok(document);
     }
     serde_json::from_str::<ToolPostureRegistryDocument>(&buffer)
@@ -1628,43 +1624,85 @@ fn load_registry_document(
 
 fn persist_registry_document(
     path: &Path,
-    file_mutex: &Mutex<fs::File>,
     document: &ToolPostureRegistryDocument,
 ) -> Result<(), ToolPostureRegistryError> {
-    let mut file = file_mutex.lock().map_err(|_| ToolPostureRegistryError::LockPoisoned)?;
-    write_registry_document(path, &mut file, document)
+    write_registry_document(path, document)
 }
 
-// AIDEV-NOTE: the registry is rewritten in place (seek 0 + set_len(0) +
-// write + fsync on the long-lived handle), not via write-to-temp-and-rename.
-// A crash between truncate and write loses all overrides and audit events;
-// making this atomic would require swapping to a fresh file handle.
 fn write_registry_document(
     path: &Path,
-    file: &mut fs::File,
     document: &ToolPostureRegistryDocument,
 ) -> Result<(), ToolPostureRegistryError> {
-    let serialized = serde_json::to_vec_pretty(document).map_err(|source| {
+    let mut serialized = serde_json::to_vec_pretty(document).map_err(|source| {
         ToolPostureRegistryError::SerializeFile { path: path.to_path_buf(), source }
     })?;
-    file.seek(SeekFrom::Start(0)).map_err(|source| ToolPostureRegistryError::WriteFile {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    file.set_len(0).map_err(|source| ToolPostureRegistryError::WriteFile {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    file.write_all(&serialized)
-        .and_then(|_| file.write_all(b"\n"))
-        .and_then(|_| file.sync_all())
+    serialized.push(b'\n');
+    write_registry_payload_atomically(path, serialized.as_slice())
+}
+
+fn empty_registry_document() -> ToolPostureRegistryDocument {
+    ToolPostureRegistryDocument {
+        schema_version: TOOL_POSTURE_SCHEMA_VERSION,
+        overrides: vec![],
+        recommendation_actions: vec![],
+        audit_events: vec![],
+    }
+}
+
+fn write_registry_payload_atomically(
+    path: &Path,
+    payload: &[u8],
+) -> Result<(), ToolPostureRegistryError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| ToolPostureRegistryError::WriteFile {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let temp_path = registry_sidecar_path(path, "tmp");
+    let result = (|| -> Result<(), std::io::Error> {
+        let mut temp_file =
+            fs::File::options().write(true).create_new(true).open(temp_path.as_path())?;
+        temp_file.write_all(payload)?;
+        temp_file.sync_all()?;
+        drop(temp_file);
+        replace_registry_file(temp_path.as_path(), path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temp_path.as_path());
+    }
+    result
         .map_err(|source| ToolPostureRegistryError::WriteFile { path: path.to_path_buf(), source })
 }
 
-fn prune_expired_entries(document: &mut ToolPostureRegistryDocument, now_unix_ms: i64) {
+fn replace_registry_file(temp_path: &Path, path: &Path) -> Result<(), std::io::Error> {
+    if let Err(rename_error) = fs::rename(temp_path, path) {
+        if !path.exists() || !path.is_file() {
+            return Err(rename_error);
+        }
+        let rollback_path = registry_sidecar_path(path, "swap");
+        fs::rename(path, rollback_path.as_path())?;
+        if let Err(install_error) = fs::rename(temp_path, path) {
+            let _ = fs::rename(rollback_path.as_path(), path);
+            return Err(install_error);
+        }
+        let _ = fs::remove_file(rollback_path);
+    }
+    Ok(())
+}
+
+fn registry_sidecar_path(path: &Path, kind: &str) -> PathBuf {
+    let mut sidecar_name = path.as_os_str().to_os_string();
+    sidecar_name.push(format!(".{kind}.{}.{}", std::process::id(), Ulid::new()));
+    PathBuf::from(sidecar_name)
+}
+
+fn prune_expired_entries(document: &mut ToolPostureRegistryDocument, now_unix_ms: i64) -> bool {
+    let before = document.overrides.len();
     document.overrides.retain(|record| {
         record.expires_at_unix_ms.is_none_or(|expires_at_unix_ms| expires_at_unix_ms > now_unix_ms)
     });
+    document.overrides.len() != before
 }
 
 fn validate_known_tool(tool_name: &str) -> Result<(), ToolPostureRegistryError> {
@@ -1722,6 +1760,9 @@ fn extract_preset_id(source: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::journal::{
+        ApprovalDecisionScope, ApprovalPolicySnapshot, ApprovalPromptRecord, ApprovalSubjectType,
+    };
 
     struct TempStateRoot {
         path: PathBuf,
@@ -1740,6 +1781,67 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    fn approval_record(
+        subject_id: &str,
+        session_id: &str,
+        decision: Option<ApprovalDecision>,
+    ) -> ApprovalRecord {
+        ApprovalRecord {
+            approval_id: format!("approval-{}", Ulid::new()),
+            session_id: session_id.to_owned(),
+            run_id: "run-1".to_owned(),
+            principal: "operator".to_owned(),
+            device_id: "device-1".to_owned(),
+            channel: None,
+            requested_at_unix_ms: 1_000,
+            resolved_at_unix_ms: decision.map(|_| 1_100),
+            subject_type: ApprovalSubjectType::Tool,
+            subject_id: subject_id.to_owned(),
+            request_summary: "test approval".to_owned(),
+            decision,
+            decision_scope: decision.map(|_| ApprovalDecisionScope::Once),
+            decision_reason: None,
+            decision_scope_ttl_ms: None,
+            policy_snapshot: ApprovalPolicySnapshot {
+                policy_id: "test-policy".to_owned(),
+                policy_hash: "hash".to_owned(),
+                evaluation_summary: "test".to_owned(),
+            },
+            prompt: ApprovalPromptRecord {
+                title: "Approve tool".to_owned(),
+                risk_level: ApprovalRiskLevel::Low,
+                subject_id: subject_id.to_owned(),
+                summary: "test approval".to_owned(),
+                options: vec![],
+                timeout_seconds: 30,
+                details_json: "{}".to_owned(),
+                policy_explanation: "test".to_owned(),
+            },
+            created_at_unix_ms: 1_000,
+            updated_at_unix_ms: 1_100,
+        }
+    }
+
+    fn registry_path(temp: &TempStateRoot) -> PathBuf {
+        temp.path.join(TOOL_POSTURE_DIRECTORY).join(TOOL_POSTURE_REGISTRY_FILE)
+    }
+
+    fn registry_sidecars(path: &Path) -> Vec<PathBuf> {
+        let Some(parent) = path.parent() else {
+            return Vec::new();
+        };
+        fs::read_dir(parent)
+            .expect("registry directory should be readable")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains(".tmp.") || name.contains(".swap."))
+            })
+            .collect()
     }
 
     #[test]
@@ -1822,6 +1924,58 @@ mod tests {
                 .all(|record| record.scope_id != "session-1"),
             "session scope overrides should be removed"
         );
+    }
+
+    #[test]
+    fn registry_persists_with_replaceable_sidecar_files() {
+        let temp = TempStateRoot::new();
+        let path = registry_path(&temp);
+        let registry = ToolPostureRegistry::open(&temp.path).expect("registry should open");
+
+        registry
+            .upsert_override(ToolPostureOverrideUpsertRequest {
+                tool_name: "palyra.browser.title".to_owned(),
+                scope_kind: ToolPostureScopeKind::Global,
+                scope_id: "global".to_owned(),
+                state: ToolPostureState::AlwaysAllow,
+                reason: None,
+                actor_principal: "operator".to_owned(),
+                source: "manual".to_owned(),
+                expires_at_unix_ms: None,
+                now_unix_ms: 1_000,
+            })
+            .expect("override should persist");
+
+        let raw = fs::read_to_string(path.as_path()).expect("registry should be readable");
+        let document = serde_json::from_str::<ToolPostureRegistryDocument>(raw.as_str())
+            .expect("registry should contain valid JSON");
+        assert_eq!(document.overrides.len(), 1);
+        assert_eq!(registry_sidecars(path.as_path()), Vec::<PathBuf>::new());
+
+        let reopened = ToolPostureRegistry::open(&temp.path).expect("registry should reopen");
+        assert_eq!(reopened.list_overrides().expect("overrides should load").len(), 1);
+    }
+
+    #[test]
+    fn tool_approval_subject_matching_uses_exact_tool_segment() {
+        let approvals = vec![
+            approval_record("tool:x.run", "session-1", Some(ApprovalDecision::Allow)),
+            approval_record("tool:x.runner", "session-2", Some(ApprovalDecision::Deny)),
+            approval_record("tool:x.run|skill:demo", "session-3", None),
+            approval_record("channel:x.run", "session-4", Some(ApprovalDecision::Allow)),
+        ];
+
+        let metrics = build_tool_friction_metrics(approvals.as_slice(), "x.run");
+        assert_eq!(metrics.requested_14d, 2);
+        assert_eq!(metrics.approved_14d, 1);
+        assert_eq!(metrics.denied_14d, 0);
+        assert_eq!(metrics.pending_14d, 1);
+        assert_eq!(metrics.unique_sessions_14d, 2);
+
+        let recent = recent_tool_approvals(approvals.as_slice(), "x.run", 10);
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].subject_id, "tool:x.run");
+        assert_eq!(recent[1].subject_id, "tool:x.run|skill:demo");
     }
 
     #[test]
