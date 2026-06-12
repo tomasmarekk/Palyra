@@ -349,17 +349,15 @@ pub(crate) fn evaluate_execution_gate_pipeline(
             annotate_tool_decision_with_backend_context(allowed, backend_selection)
         };
 
-        // AIDEV-NOTE: budget asymmetry - when approval was required only by
-        // the proposal (approval_can_override_policy == false), the approved
-        // path commits approved_policy_budget, which was never decremented
-        // because the second decide_tool_call did not run; the override path
-        // consumes one unit. Aligning them is a behavior change gated by the
-        // budget-consumption tests, so it is intentionally not fixed here.
         resulting_budget = if final_decision.allowed {
             if effective_approval_required
                 && approval_state.outcome.is_some_and(|value| value.approved)
             {
-                approved_policy_budget
+                if approval_can_override_policy {
+                    approved_policy_budget
+                } else {
+                    pre_policy_budget
+                }
             } else {
                 pre_policy_budget
             }
@@ -1172,6 +1170,31 @@ mod tests {
             .decision
             .reason
             .contains("explicit approval granted for tool=palyra.process.run"));
+    }
+
+    #[test]
+    fn pipeline_allows_proposal_only_approval_and_consumes_budget_once() {
+        let outcome = evaluate_execution_gate_pipeline(ExecutionGatePipelineInput {
+            tool_call_config: &tool_call_config(&["palyra.echo"]),
+            request_context: &request_context(),
+            tool_name: "palyra.echo",
+            skill_context: None,
+            skill_gate_decision: None,
+            proposal_approval_required: true,
+            effective_posture: &effective_posture(ToolPostureState::AskEachTime),
+            backend_selection: &local_backend_selection(),
+            approval_state: ToolProposalApprovalState {
+                outcome: Some(&approved_outcome("operator approved network execution")),
+                pending_approval_id: None,
+            },
+            remaining_budget: 2,
+        });
+
+        assert!(outcome.decision.allowed);
+        assert!(outcome.decision.approval_required);
+        assert_eq!(outcome.remaining_budget, 1);
+        assert_eq!(outcome.report.final_reason_code, "approval.granted");
+        assert!(outcome.decision.reason.contains("explicit approval granted for tool=palyra.echo"));
     }
 
     #[test]
