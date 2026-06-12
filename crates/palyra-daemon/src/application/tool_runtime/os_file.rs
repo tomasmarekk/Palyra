@@ -955,12 +955,24 @@ fn visible_file_content(buffer: Vec<u8>) -> (Option<String>, Option<String>, boo
             let visible_text = if redacted { redaction.redacted_text } else { text };
             (Some(visible_text), None, redacted)
         }
-        // AIDEV-NOTE: the base64 fallback bypasses the secret-leak scan --
-        // the safety scanner is text-based, so non-UTF-8 files (UTF-16
-        // configs, binary key stores) are returned unredacted. Tightening
-        // this requires a behavior change (e.g. decode-and-scan or deny).
-        Err(error) => (None, Some(BASE64_STANDARD.encode(error.into_bytes())), false),
+        Err(error) => visible_non_utf8_file_content(error.into_bytes()),
     }
+}
+
+fn visible_non_utf8_file_content(bytes: Vec<u8>) -> (Option<String>, Option<String>, bool) {
+    let lossy_text = String::from_utf8_lossy(bytes.as_slice());
+    let redaction = redact_text_for_export(
+        lossy_text.as_ref(),
+        SafetySourceKind::Workspace,
+        SafetyContentKind::WorkspaceDocument,
+        TrustLabel::TrustedLocal,
+    );
+    let redacted =
+        redaction.redacted || redaction.scan.has_category(SafetyFindingCategory::SecretLeak);
+    if redacted {
+        return (Some(redaction.redacted_text), None, true);
+    }
+    (None, Some(BASE64_STANDARD.encode(bytes)), false)
 }
 
 fn required_target_path(input: &OsFileInput) -> Result<&str, String> {
@@ -1821,6 +1833,20 @@ mod tests {
             .get("redaction_notice")
             .and_then(Value::as_str)
             .is_some_and(|notice| notice.contains("structure only")));
+        assert!(text.contains("provider_key = \"[REDACTED_SECRET]\""));
+        assert!(!text.contains("palyra_os_secret_abcdef"));
+    }
+
+    #[test]
+    fn non_utf8_visible_content_scans_lossy_text_before_base64_fallback() {
+        let mut bytes = vec![0xff, 0xfe, b'\n'];
+        bytes.extend_from_slice(b"provider_key = \"palyra_os_secret_abcdef\"\n");
+
+        let (text, bytes_base64, redacted) = visible_file_content(bytes);
+
+        let text = text.expect("secret-bearing lossy content should return redacted text");
+        assert!(redacted);
+        assert!(bytes_base64.is_none());
         assert!(text.contains("provider_key = \"[REDACTED_SECRET]\""));
         assert!(!text.contains("palyra_os_secret_abcdef"));
     }

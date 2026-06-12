@@ -284,23 +284,15 @@ pub(crate) async fn execute_workspace_patch_tool(
             );
         }
     };
-    let limits = WorkspacePatchLimits::default();
-    let planning_request = WorkspacePatchRequest {
-        patch: patch.clone(),
-        dry_run: true,
-        redaction_policy: redaction_policy.clone(),
-    };
     let workspace_roots = resolved_workspace_roots.roots;
     let canonical_constraint_roots = resolved_workspace_roots.canonical_constraint_roots;
     let risk_path_prefixes = resolved_workspace_roots.risk_path_prefixes;
-    // AIDEV-NOTE: `planning_request` above was built from the
-    // pre-normalization patch, so the planned outcome (dry_run output, risk
-    // assessment, and the preflight checkpoint's files_touched) can disagree
-    // with this normalized patch that checkpoint_flow actually applies when
-    // header paths get rewritten (e.g. duplicated root basenames stripped).
-    // Normalizing before building planning_request would change dry-run
-    // outputs, so it needs a deliberate behavior change with test updates.
-    let patch = normalize_workspace_patch_header_paths(patch.as_str(), workspace_roots.as_slice());
+    let limits = WorkspacePatchLimits::default();
+    let (patch, planning_request) = workspace_patch_planning_request(
+        patch.as_str(),
+        workspace_roots.as_slice(),
+        &redaction_policy,
+    );
 
     let planned_outcome = match apply_workspace_patch_with_resolved_roots(
         workspace_roots.as_slice(),
@@ -346,6 +338,20 @@ pub(crate) async fn execute_workspace_patch_tool(
         },
     )
     .await
+}
+
+fn workspace_patch_planning_request(
+    patch: &str,
+    workspace_roots: &[PathBuf],
+    redaction_policy: &WorkspacePatchRedactionPolicy,
+) -> (String, WorkspacePatchRequest) {
+    let normalized_patch = normalize_workspace_patch_header_paths(patch, workspace_roots);
+    let request = WorkspacePatchRequest {
+        patch: normalized_patch.clone(),
+        dry_run: true,
+        redaction_policy: redaction_policy.clone(),
+    };
+    (normalized_patch, request)
 }
 
 /// Dispatches to the constrained engine entry point when canonical
@@ -1248,13 +1254,14 @@ mod tests {
         normalize_workspace_patch_header_paths, patch_operation_paths,
         patch_should_use_active_root, reject_env_prefixed_workspace_patch_paths,
         resolve_workspace_root_override, workspace_patch_error_outcome,
-        workspace_patch_recovery_hint, workspace_patch_tool_execution_outcome,
-        WORKSPACE_PATCH_GRAMMAR_HINT,
+        workspace_patch_planning_request, workspace_patch_recovery_hint,
+        workspace_patch_tool_execution_outcome, WORKSPACE_PATCH_GRAMMAR_HINT,
     };
     use crate::application::tool_runtime::workspace_scope::ActiveWorkspaceRoot;
     use palyra_common::workspace_patch::{
         apply_workspace_patch, apply_workspace_patch_with_canonical_root_constraints,
-        WorkspacePatchError, WorkspacePatchLimits, WorkspacePatchRequest,
+        WorkspacePatchError, WorkspacePatchLimits, WorkspacePatchRedactionPolicy,
+        WorkspacePatchRequest,
     };
     use serde_json::Value;
 
@@ -1554,6 +1561,29 @@ mod tests {
 
         assert!(normalized.contains("*** Add File: feature_flag.test.ts"));
         assert!(!normalized.contains("S036_session_recall/feature_flag.test.ts"));
+    }
+
+    #[test]
+    fn workspace_patch_planning_request_uses_normalized_patch() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let workspace = tempdir.path().join("S036_session_recall");
+        std::fs::create_dir_all(workspace.as_path()).expect("workspace should exist");
+        let patch = concat!(
+            "*** Begin Patch\n",
+            "*** Add File: S036_session_recall/feature_flag.test.ts\n",
+            "+test\n",
+            "*** End Patch\n",
+        );
+
+        let (normalized, request) = workspace_patch_planning_request(
+            patch,
+            &[workspace],
+            &WorkspacePatchRedactionPolicy::default(),
+        );
+
+        assert_eq!(request.patch, normalized);
+        assert!(request.patch.contains("*** Add File: feature_flag.test.ts"));
+        assert!(!request.patch.contains("S036_session_recall/feature_flag.test.ts"));
     }
 
     #[test]
