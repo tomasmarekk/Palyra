@@ -256,38 +256,17 @@ pub(crate) async fn console_objectives_list_handler(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| value.to_ascii_lowercase());
-    let mut objectives = list_objective_views(
+    let after_objective_id =
+        query.after_objective_id.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    let (objectives, next_after_objective_id) = list_objective_views(
         &state,
         session.context.principal.as_str(),
         kind_filter.as_deref(),
         state_filter.as_deref(),
+        after_objective_id,
+        limit,
     )
     .await?;
-    // Objective ids are ULIDs, so the lexicographic sort doubles as creation
-    // order and supports keyset paging via after_objective_id.
-    objectives.sort_by(|left, right| {
-        read_string_value(left, "objective_id").cmp(&read_string_value(right, "objective_id"))
-    });
-    if let Some(after_objective_id) =
-        query.after_objective_id.as_deref().map(str::trim).filter(|value| !value.is_empty())
-    {
-        objectives.retain(|objective| {
-            read_string_value(objective, "objective_id").as_str() > after_objective_id
-        });
-    }
-    let has_more = objectives.len() > limit;
-    if has_more {
-        objectives.truncate(limit);
-    }
-    let next_after_objective_id = if has_more {
-        objectives
-            .last()
-            .and_then(|objective| objective.get("objective_id"))
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-    } else {
-        None
-    };
     Ok(Json(json!({
         "objectives": objectives,
         "next_after_objective_id": next_after_objective_id,
@@ -408,11 +387,8 @@ pub(crate) async fn console_objective_upsert_handler(
             "objective automation routine id should always exist",
         ))
     })?;
-    // AIDEV-NOTE: this upsert is not transactional. The cron job and routine
-    // metadata are persisted before the objective record; a failure between
-    // the steps below leaves an orphaned routine without an objective.
-    // Making it atomic requires a journal-level transaction (behavior
-    // change).
+    let is_new_objective = existing.is_none();
+    let routine_id_for_rollback = routine_id.clone();
     let cron_job = persist_objective_job(
         &state,
         existing.as_ref().and_then(|entry| entry.automation.routine_id.clone()),
@@ -439,7 +415,7 @@ pub(crate) async fn console_objective_upsert_handler(
         existing.as_ref().map(|entry| entry.lifecycle_history.clone()).unwrap_or_default();
     // Only creation seeds a lifecycle event; updates leave history untouched
     // so the audit trail reflects explicit lifecycle actions only.
-    if existing.is_none() {
+    if is_new_objective {
         lifecycle_history.push(ObjectiveLifecycleRecord {
             event_id: Ulid::new().to_string(),
             action: "created".to_owned(),
@@ -450,91 +426,97 @@ pub(crate) async fn console_objective_upsert_handler(
             occurred_at_unix_ms: now_unix_ms,
         });
     }
-    let objective = state
-        .objectives
-        .upsert_objective(ObjectiveUpsert {
-            record: ObjectiveRecord {
-                objective_id: objective_id.clone(),
-                kind,
-                state: initial_state,
-                name: payload.name,
-                prompt: payload.prompt,
-                owner_principal: owner_principal.clone(),
-                channel: Some(channel.clone()),
-                priority,
-                budget: normalize_budget(payload.budget, existing.as_ref()),
-                current_focus: payload
-                    .current_focus
-                    .or_else(|| existing.as_ref().and_then(|entry| entry.current_focus.clone())),
-                success_criteria: payload
-                    .success_criteria
-                    .or_else(|| existing.as_ref().and_then(|entry| entry.success_criteria.clone())),
-                exit_condition: payload
-                    .exit_condition
-                    .or_else(|| existing.as_ref().and_then(|entry| entry.exit_condition.clone())),
-                next_recommended_step: payload.next_recommended_step.or_else(|| {
-                    existing.as_ref().and_then(|entry| entry.next_recommended_step.clone())
+    let objective = match state.objectives.upsert_objective(ObjectiveUpsert {
+        record: ObjectiveRecord {
+            objective_id: objective_id.clone(),
+            kind,
+            state: initial_state,
+            name: payload.name,
+            prompt: payload.prompt,
+            owner_principal: owner_principal.clone(),
+            channel: Some(channel.clone()),
+            priority,
+            budget: normalize_budget(payload.budget, existing.as_ref()),
+            current_focus: payload
+                .current_focus
+                .or_else(|| existing.as_ref().and_then(|entry| entry.current_focus.clone())),
+            success_criteria: payload
+                .success_criteria
+                .or_else(|| existing.as_ref().and_then(|entry| entry.success_criteria.clone())),
+            exit_condition: payload
+                .exit_condition
+                .or_else(|| existing.as_ref().and_then(|entry| entry.exit_condition.clone())),
+            next_recommended_step: payload.next_recommended_step.or_else(|| {
+                existing.as_ref().and_then(|entry| entry.next_recommended_step.clone())
+            }),
+            standing_order: payload
+                .standing_order
+                .or_else(|| existing.as_ref().and_then(|entry| entry.standing_order.clone())),
+            workspace: ObjectiveWorkspaceBinding {
+                workspace_document_path,
+                session_key: payload.session_key.or_else(|| {
+                    existing.as_ref().and_then(|entry| entry.workspace.session_key.clone())
                 }),
-                standing_order: payload
-                    .standing_order
-                    .or_else(|| existing.as_ref().and_then(|entry| entry.standing_order.clone())),
-                workspace: ObjectiveWorkspaceBinding {
-                    workspace_document_path,
-                    session_key: payload.session_key.or_else(|| {
-                        existing.as_ref().and_then(|entry| entry.workspace.session_key.clone())
-                    }),
-                    session_label: payload.session_label.or_else(|| {
-                        existing.as_ref().and_then(|entry| entry.workspace.session_label.clone())
-                    }),
-                    related_document_paths: payload.related_document_paths.unwrap_or_else(|| {
-                        existing
-                            .as_ref()
-                            .map(|entry| entry.workspace.related_document_paths.clone())
-                            .unwrap_or_default()
-                    }),
-                    related_memory_ids: payload.related_memory_ids.unwrap_or_else(|| {
-                        existing
-                            .as_ref()
-                            .map(|entry| entry.workspace.related_memory_ids.clone())
-                            .unwrap_or_default()
-                    }),
-                    related_session_ids: payload.related_session_ids.unwrap_or_else(|| {
-                        existing
-                            .as_ref()
-                            .map(|entry| entry.workspace.related_session_ids.clone())
-                            .unwrap_or_default()
-                    }),
-                },
-                automation,
-                last_attempt: existing.as_ref().and_then(|entry| entry.last_attempt.clone()),
-                attempt_history: existing
-                    .as_ref()
-                    .map(|entry| entry.attempt_history.clone())
-                    .unwrap_or_default(),
-                approach_history: existing
-                    .as_ref()
-                    .map(|entry| entry.approach_history.clone())
-                    .unwrap_or_default(),
-                lifecycle_history,
-                linked_run_ids: existing
-                    .as_ref()
-                    .map(|entry| entry.linked_run_ids.clone())
-                    .unwrap_or_default(),
-                linked_artifact_paths: payload.linked_artifact_paths.unwrap_or_else(|| {
+                session_label: payload.session_label.or_else(|| {
+                    existing.as_ref().and_then(|entry| entry.workspace.session_label.clone())
+                }),
+                related_document_paths: payload.related_document_paths.unwrap_or_else(|| {
                     existing
                         .as_ref()
-                        .map(|entry| entry.linked_artifact_paths.clone())
+                        .map(|entry| entry.workspace.related_document_paths.clone())
                         .unwrap_or_default()
                 }),
-                created_at_unix_ms: existing
-                    .as_ref()
-                    .map(|entry| entry.created_at_unix_ms)
-                    .unwrap_or(now_unix_ms),
-                updated_at_unix_ms: now_unix_ms,
-                archived_at_unix_ms: existing.and_then(|entry| entry.archived_at_unix_ms),
+                related_memory_ids: payload.related_memory_ids.unwrap_or_else(|| {
+                    existing
+                        .as_ref()
+                        .map(|entry| entry.workspace.related_memory_ids.clone())
+                        .unwrap_or_default()
+                }),
+                related_session_ids: payload.related_session_ids.unwrap_or_else(|| {
+                    existing
+                        .as_ref()
+                        .map(|entry| entry.workspace.related_session_ids.clone())
+                        .unwrap_or_default()
+                }),
             },
-        })
-        .map_err(objective_registry_error_response)?;
+            automation,
+            last_attempt: existing.as_ref().and_then(|entry| entry.last_attempt.clone()),
+            attempt_history: existing
+                .as_ref()
+                .map(|entry| entry.attempt_history.clone())
+                .unwrap_or_default(),
+            approach_history: existing
+                .as_ref()
+                .map(|entry| entry.approach_history.clone())
+                .unwrap_or_default(),
+            lifecycle_history,
+            linked_run_ids: existing
+                .as_ref()
+                .map(|entry| entry.linked_run_ids.clone())
+                .unwrap_or_default(),
+            linked_artifact_paths: payload.linked_artifact_paths.unwrap_or_else(|| {
+                existing
+                    .as_ref()
+                    .map(|entry| entry.linked_artifact_paths.clone())
+                    .unwrap_or_default()
+            }),
+            created_at_unix_ms: existing
+                .as_ref()
+                .map(|entry| entry.created_at_unix_ms)
+                .unwrap_or(now_unix_ms),
+            updated_at_unix_ms: now_unix_ms,
+            archived_at_unix_ms: existing.and_then(|entry| entry.archived_at_unix_ms),
+        },
+    }) {
+        Ok(objective) => objective,
+        Err(error) => {
+            if is_new_objective {
+                rollback_created_objective_companions(&state, routine_id_for_rollback.as_str())
+                    .await?;
+            }
+            return Err(objective_registry_error_response(error));
+        }
+    };
     project_objective_workspace(
         &state,
         owner_principal.as_str(),
@@ -779,6 +761,12 @@ struct ObjectiveJobUpsert {
     next_run_at_unix_ms: Option<i64>,
 }
 
+#[derive(Debug)]
+struct ObjectiveRecordPage {
+    records: Vec<ObjectiveRecord>,
+    next_after_objective_id: Option<String>,
+}
+
 async fn load_objective_for_owner(
     state: &AppState,
     objective_id: &str,
@@ -808,31 +796,53 @@ fn load_objective_record(
     Ok(objective)
 }
 
-/// Builds views for every objective owned by the principal that passes the
-/// kind/state filters.
-// AIDEV-NOTE: views (each loading the linked cron job and latest run) are
-// built for every matching objective before the list handler applies its
-// page limit, so large registries pay the full cost per list request.
-// Reducing this requires paging before view assembly (behavior change).
+/// Builds views for the requested page of objectives owned by the principal.
 async fn list_objective_views(
     state: &AppState,
     principal: &str,
     kind_filter: Option<&str>,
     state_filter: Option<&str>,
-) -> Result<Vec<Value>, Response> {
+    after_objective_id: Option<&str>,
+    limit: usize,
+) -> Result<(Vec<Value>, Option<String>), Response> {
+    let page = page_objective_records(
+        state.objectives.list_objectives().map_err(objective_registry_error_response)?,
+        principal,
+        kind_filter,
+        state_filter,
+        after_objective_id,
+        limit,
+    );
     let mut objectives = Vec::new();
-    for objective in state
-        .objectives
-        .list_objectives()
-        .map_err(objective_registry_error_response)?
+    for objective in page.records {
+        objectives.push(build_objective_view(state, objective).await?);
+    }
+    Ok((objectives, page.next_after_objective_id))
+}
+
+fn page_objective_records(
+    records: Vec<ObjectiveRecord>,
+    principal: &str,
+    kind_filter: Option<&str>,
+    state_filter: Option<&str>,
+    after_objective_id: Option<&str>,
+    limit: usize,
+) -> ObjectiveRecordPage {
+    let mut records = records
         .into_iter()
         .filter(|entry| entry.owner_principal == principal)
         .filter(|entry| kind_filter.is_none_or(|expected| entry.kind.as_str() == expected))
         .filter(|entry| state_filter.is_none_or(|expected| entry.state.as_str() == expected))
-    {
-        objectives.push(build_objective_view(state, objective).await?);
+        .filter(|entry| after_objective_id.is_none_or(|after| entry.objective_id.as_str() > after))
+        .collect::<Vec<_>>();
+    records.sort_by(|left, right| left.objective_id.cmp(&right.objective_id));
+    let has_more = records.len() > limit;
+    if has_more {
+        records.truncate(limit);
     }
-    Ok(objectives)
+    let next_after_objective_id =
+        has_more.then(|| records.last().map(|objective| objective.objective_id.clone())).flatten();
+    ObjectiveRecordPage { records, next_after_objective_id }
 }
 
 /// Renders the wire-facing objective view: the record joined with its linked
@@ -1223,6 +1233,23 @@ fn persist_objective_routine_metadata(
         template_id: automation.template_id.clone(),
     })?;
     Ok(())
+}
+
+async fn rollback_created_objective_companions(
+    state: &AppState,
+    routine_id: &str,
+) -> Result<(), Response> {
+    let cron_result =
+        state.runtime.delete_cron_job(routine_id.to_owned()).await.map_err(runtime_status_response);
+    let routine_result = state
+        .routines
+        .delete_routine(routine_id)
+        .map(|_| ())
+        .map_err(routine_registry_error_response);
+    match (cron_result, routine_result) {
+        (Ok(_), Ok(())) => Ok(()),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+    }
 }
 
 /// Toggles the backing cron job for pause/resume, recomputing the next run
@@ -2460,10 +2487,11 @@ mod tests {
         lifecycle_action_tolerates_workspace_projection_failure, managed_entry, normalize_budget,
         normalize_lifecycle_reason, objective_attempts_for_view, objective_record_block,
         objective_routine_snapshot_from_binding, owner_objective_block_updates,
-        parse_objective_execution_config, parse_objective_kind, parse_objective_priority,
-        preserved_run_from_objective_attempt, reconcile_objective_attempts_with_latest_run,
-        render_objective_summary_markdown, ConsoleObjectiveBudgetPayload,
-        ConsoleObjectiveRequestKind, OBJECTIVE_WORKSPACE_PROJECTION_WARNING,
+        page_objective_records, parse_objective_execution_config, parse_objective_kind,
+        parse_objective_priority, preserved_run_from_objective_attempt,
+        reconcile_objective_attempts_with_latest_run, render_objective_summary_markdown,
+        ConsoleObjectiveBudgetPayload, ConsoleObjectiveRequestKind,
+        OBJECTIVE_WORKSPACE_PROJECTION_WARNING,
     };
     use crate::domain::workspace::{
         sync_workspace_managed_block, WorkspaceManagedBlockError, WorkspaceManagedBlockUpdate,
@@ -2528,6 +2556,12 @@ mod tests {
         }
     }
 
+    fn sample_objective_with_id(objective_id: &str) -> ObjectiveRecord {
+        let mut objective = sample_objective();
+        objective.objective_id = objective_id.to_owned();
+        objective
+    }
+
     #[test]
     fn kind_parser_accepts_product_terms() {
         assert_eq!(
@@ -2562,6 +2596,30 @@ mod tests {
         ] {
             assert!(!request_kind.requires_csrf());
         }
+    }
+
+    #[test]
+    fn objective_record_page_filters_and_pages_before_view_assembly() {
+        let first = sample_objective_with_id("objective-a");
+        let second = sample_objective_with_id("objective-b");
+        let third = sample_objective_with_id("objective-c");
+        let mut paused = sample_objective_with_id("objective-d");
+        paused.state = ObjectiveState::Paused;
+        let mut foreign = sample_objective_with_id("objective-e");
+        foreign.owner_principal = "user:other".to_owned();
+
+        let page = page_objective_records(
+            vec![foreign, third, paused, second, first],
+            "user:ops",
+            Some("heartbeat"),
+            Some("active"),
+            Some("objective-a"),
+            1,
+        );
+
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(page.records[0].objective_id, "objective-b");
+        assert_eq!(page.next_after_objective_id.as_deref(), Some("objective-b"));
     }
 
     #[test]
