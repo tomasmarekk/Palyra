@@ -2735,9 +2735,9 @@ fn parse_file_url_path(arg: &str) -> Result<Option<String>, SandboxProcessRunErr
 // symlinks cannot smuggle the path outside the workspace. For non-existent targets the nearest
 // existing ancestor is canonicalized and checked instead (non-existent components cannot be
 // symlinks), which lets mkdir-style builtins validate paths they are about to create.
-// AIDEV-NOTE: like all canonicalize-then-use path validation this is a check-then-use pattern;
-// a concurrent rename/symlink swap between the check and the consumer's open is a known TOCTOU
-// window that can only be closed with handle-based I/O (a behavior change).
+// This is path admission for arbitrary child-process arguments, not a lease on a filesystem
+// object. Runtime sandboxing must still contain hostile concurrent filesystem mutation because
+// ordinary child processes open these paths themselves after validation.
 fn resolve_scoped_path(
     workspace_root: &Path,
     base: &Path,
@@ -4085,10 +4085,9 @@ fn trusted_windows_system32_dir() -> io::Result<PathBuf> {
 /// reaches the whole tree; a direct-pid kill is the fallback when the group kill fails (e.g.
 /// the leader already changed groups).
 ///
-/// AIDEV-NOTE: pid/pgid reuse is a known hazard here. If the tracked process exited and the
-/// kernel reassigned the id before this runs, the SIGKILL hits an unrelated process group.
-/// Closing this requires holding a pidfd (or equivalent process handle) instead of a raw pid,
-/// which is a behavior change.
+/// The public stop/status APIs only accept decimal `u32` values, but Unix syscalls take
+/// signed `pid_t`; values that cannot round-trip into `pid_t` are rejected instead of wrapping
+/// into another process or process-group id.
 ///
 /// # Errors
 ///
@@ -4098,7 +4097,7 @@ pub(crate) fn terminate_background_process_tree(pid: u32) -> io::Result<()> {
     match terminate_unix_process_group(pid) {
         Ok(()) => Ok(()),
         Err(group_error) => {
-            let process_id = pid as libc::pid_t;
+            let process_id = unix_pid_from_u32(pid)?;
             // SAFETY: kill(2) with SIGKILL is safe to call with any pid value; the worst case
             // is an error return, which is handled below.
             let result = unsafe { libc::kill(process_id, libc::SIGKILL) };
@@ -4130,7 +4129,7 @@ pub(crate) fn terminate_background_process_tree(pid: u32) -> io::Result<()> {
 
 #[cfg(unix)]
 fn terminate_unix_process_group(pid: u32) -> io::Result<()> {
-    let process_group_id = pid as libc::pid_t;
+    let process_group_id = unix_pid_from_u32(pid)?;
     // A negative pid addresses the whole process group; the child was made its own group
     // leader at spawn, so its pid doubles as the pgid.
     // SAFETY: kill(2) is safe to call with any pid value; errors are handled below.
@@ -4148,7 +4147,7 @@ fn process_id_is_alive(pid: u32) -> io::Result<bool> {
 
 #[cfg(unix)]
 fn process_id_is_alive(pid: u32) -> io::Result<bool> {
-    let process_id = pid as libc::pid_t;
+    let process_id = unix_pid_from_u32(pid)?;
     // Signal 0 performs the permission and existence checks without delivering anything.
     // SAFETY: kill(2) with signal 0 never affects the target; errors are handled below.
     let result = unsafe { libc::kill(process_id, 0) };
@@ -4162,6 +4161,25 @@ fn process_id_is_alive(pid: u32) -> io::Result<bool> {
         return Ok(false);
     }
     Err(error)
+}
+
+#[cfg(unix)]
+fn unix_pid_from_u32(pid: u32) -> io::Result<libc::pid_t> {
+    Ok(unix_pid_i32_from_u32(pid)? as libc::pid_t)
+}
+
+#[cfg(any(unix, test))]
+fn unix_pid_i32_from_u32(pid: u32) -> io::Result<i32> {
+    let process_id = i32::try_from(pid).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, format!("pid {pid} exceeds Unix pid_t range"))
+    })?;
+    if process_id <= 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("pid {pid} is not a positive Unix pid"),
+        ));
+    }
+    Ok(process_id)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -5368,6 +5386,7 @@ mod tests {
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
+    use super::unix_pid_i32_from_u32;
     use super::{
         build_process_command, builtin_list_directory_stdout, canonical_workspace_root,
         collect_requested_egress_hosts, cpu_rlimit_seconds_from_usage_micros,
@@ -5416,6 +5435,17 @@ mod tests {
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+
+    #[test]
+    fn unix_pid_i32_from_u32_rejects_values_outside_pid_t_range() {
+        assert_eq!(unix_pid_i32_from_u32(1).expect("pid 1 should fit"), 1_i32);
+        let error = unix_pid_i32_from_u32(u32::MAX).expect_err("oversized pid should be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            error.to_string().contains("exceeds Unix pid_t range"),
+            "error should explain the rejected pid range"
+        );
     }
 
     fn background_test_execution_timeout() -> Duration {
