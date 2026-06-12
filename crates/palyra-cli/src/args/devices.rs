@@ -37,12 +37,12 @@ pub enum DevicesCommand {
         json: bool,
     },
     Clear {
-        // AIDEV-NOTE: `bool` with `default_value_t = true` derives clap's SetTrue
-        // action, so this flag parses as true whether or not it is passed;
-        // clearing non-revoked devices is currently unreachable from the CLI.
-        // Exposing the false case is a behavior change (ArgAction::Set or a
-        // --no-* flag) and would re-pin help snapshots.
-        #[arg(long, default_value_t = true)]
+        #[arg(
+            long,
+            default_value_t = true,
+            action = clap::ArgAction::Set,
+            value_parser = clap::value_parser!(bool)
+        )]
         revoked_only: bool,
         #[arg(long, default_value_t = false)]
         json: bool,

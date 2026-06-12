@@ -8,9 +8,9 @@ Options:
       --version <VERSION>
       --publisher <PUBLISHER>
       --name <NAME>
-      --accept-candidate
+      --accept-candidate <ACCEPT_CANDIDATE>  [default: true] [possible values: true, false]
       --json
-  -h, --help                   Print help
+  -h, --help                                 Print help
 
 Global Options:
       --profile <PROFILE>

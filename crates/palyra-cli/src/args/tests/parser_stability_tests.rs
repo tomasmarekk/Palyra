@@ -3,6 +3,8 @@
 
 use clap::Parser;
 
+use crate::cli::MemoryWorkspaceCommand;
+
 use super::*;
 
 #[test]
@@ -157,6 +159,22 @@ fn parse_memory_learning_command<const N: usize>(args: [&str; N]) -> MemoryLearn
     }
 }
 
+fn parse_memory_workspace_command<const N: usize>(args: [&str; N]) -> MemoryWorkspaceCommand {
+    let parsed = Cli::parse_from(args);
+    match parsed.command {
+        Command::Memory { command: MemoryCommand::Workspace { command } } => command,
+        other => panic!("expected memory workspace command, got {other:?}"),
+    }
+}
+
+fn parse_devices_command<const N: usize>(args: [&str; N]) -> DevicesCommand {
+    let parsed = Cli::parse_from(args);
+    match parsed.command {
+        Command::Devices { command } => command,
+        other => panic!("expected devices command, got {other:?}"),
+    }
+}
+
 #[test]
 fn parse_memory_learning_list() {
     let list = parse_memory_learning_command([
@@ -273,4 +291,60 @@ fn parse_memory_learning_promote_procedure() {
             json: true,
         }
     );
+}
+
+#[test]
+fn parse_memory_learning_promote_procedure_can_leave_candidate_pending() {
+    let promote = parse_memory_learning_command([
+        "palyra",
+        "memory",
+        "learning",
+        "promote-procedure",
+        "01ARZ3NDEKTSV4RRFFQ69G5FBA",
+        "--accept-candidate",
+        "false",
+    ]);
+    assert_eq!(
+        promote,
+        MemoryLearningCommand::PromoteProcedure {
+            candidate_id: "01ARZ3NDEKTSV4RRFFQ69G5FBA".to_owned(),
+            skill_id: None,
+            version: None,
+            publisher: None,
+            name: None,
+            accept_candidate: false,
+            json: false,
+        }
+    );
+}
+
+#[test]
+fn parse_memory_workspace_pin_can_unpin() {
+    let pin = parse_memory_workspace_command([
+        "palyra",
+        "memory",
+        "workspace",
+        "pin",
+        "projects/release.md",
+        "--pinned",
+        "false",
+        "--json",
+    ]);
+    assert_eq!(
+        pin,
+        MemoryWorkspaceCommand::Pin {
+            path: "projects/release.md".to_owned(),
+            pinned: false,
+            channel: None,
+            agent_id: None,
+            json: true,
+        }
+    );
+}
+
+#[test]
+fn parse_devices_clear_can_include_active_devices() {
+    let clear =
+        parse_devices_command(["palyra", "devices", "clear", "--revoked-only", "false", "--json"]);
+    assert_eq!(clear, DevicesCommand::Clear { revoked_only: false, json: true });
 }
