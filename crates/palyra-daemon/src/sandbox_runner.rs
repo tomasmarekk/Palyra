@@ -3964,12 +3964,17 @@ fn remove_windows_background_job(pid: u32) {
 
 /// Releases platform-specific process-tree tracking once a caller has verified the tree is
 /// inactive.
+#[cfg(windows)]
 pub(crate) fn release_background_process_tracking_if_stopped(pid: u32) {
-    #[cfg(windows)]
     if background_process_runtime_status(pid).map(|status| !status.alive()).unwrap_or(false) {
         remove_windows_background_job(pid);
     }
 }
+
+/// Releases platform-specific process-tree tracking once a caller has verified the tree is
+/// inactive.
+#[cfg(not(windows))]
+pub(crate) fn release_background_process_tracking_if_stopped(_pid: u32) {}
 
 /// Terminates the process tree rooted at `pid` (Windows).
 ///
