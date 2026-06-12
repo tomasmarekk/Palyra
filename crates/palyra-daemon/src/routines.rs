@@ -9,7 +9,7 @@
 use std::{
     collections::BTreeSet,
     fs,
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom},
     path::{Component, Path, PathBuf},
     sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
@@ -22,6 +22,7 @@ use crate::{
 };
 use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
 use palyra_common::{
+    config_system::write_content_with_backups,
     default_state_root,
     redaction::{is_sensitive_key, REDACTED},
     IdentityStorePathError,
@@ -2800,10 +2801,6 @@ where
     Ok(parsed)
 }
 
-// AIDEV-NOTE: documents are rewritten in place (set_len(0) + write on the long-lived handle)
-// rather than via temp file + rename. A crash between truncate and sync_all can leave a partial
-// document that fails to parse on the next open (only a fully empty file falls back to the
-// default). Making this atomic is a behavior change, so the hazard is only flagged here.
 fn write_registry_document<T>(
     path: &RegistryPath,
     file: &Mutex<fs::File>,
@@ -2812,26 +2809,14 @@ fn write_registry_document<T>(
 where
     T: Serialize,
 {
-    let payload = serde_json::to_vec_pretty(document)?;
-    let mut file = file.lock().map_err(|_| RoutineRegistryError::LockPoisoned)?;
-    file.set_len(0).map_err(|source| RoutineRegistryError::WriteRegistry {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    file.seek(SeekFrom::Start(0)).map_err(|source| RoutineRegistryError::WriteRegistry {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    file.write_all(payload.as_slice()).map_err(|source| RoutineRegistryError::WriteRegistry {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    file.flush().map_err(|source| RoutineRegistryError::WriteRegistry {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    file.sync_all()
-        .map_err(|source| RoutineRegistryError::WriteRegistry { path: path.to_path_buf(), source })
+    let payload = serde_json::to_string_pretty(document)?;
+    let _file = file.lock().map_err(|_| RoutineRegistryError::LockPoisoned)?;
+    write_content_with_backups(path.as_path(), payload.as_str(), 0).map_err(|source| {
+        RoutineRegistryError::WriteRegistry {
+            path: path.to_path_buf(),
+            source: std::io::Error::other(source.to_string()),
+        }
+    })
 }
 
 trait HasSchemaVersion {

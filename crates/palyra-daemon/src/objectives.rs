@@ -8,11 +8,12 @@
 
 use std::{
     fs,
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::Mutex,
 };
 
+use palyra_common::config_system::write_content_with_backups;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
@@ -452,7 +453,7 @@ fn load_registry_document(
             schema_version: OBJECTIVES_SCHEMA_VERSION,
             objectives: vec![],
         };
-        write_registry_document(path, file, &document)?;
+        write_registry_document(path, &document)?;
         return Ok(document);
     }
     let document = serde_json::from_str::<ObjectiveRegistryDocument>(&buffer)
@@ -465,30 +466,24 @@ fn persist_registry_document(
     file_mutex: &Mutex<fs::File>,
     document: &ObjectiveRegistryDocument,
 ) -> Result<(), ObjectiveRegistryError> {
-    let mut file = file_mutex.lock().map_err(|_| ObjectiveRegistryError::LockPoisoned)?;
-    write_registry_document(path, &mut file, document)
+    let _file = file_mutex.lock().map_err(|_| ObjectiveRegistryError::LockPoisoned)?;
+    write_registry_document(path, document)
 }
 
-// AIDEV-NOTE: this rewrites the registry in place (truncate + write on the long-lived handle)
-// rather than writing a temp file and renaming. A crash between set_len and sync_all can leave a
-// partial document that fails to parse on the next open. Making this atomic requires a behavior
-// change (temp file + rename), so it is only flagged here.
 fn write_registry_document(
     path: &Path,
-    file: &mut fs::File,
     document: &ObjectiveRegistryDocument,
 ) -> Result<(), ObjectiveRegistryError> {
-    let serialized = serde_json::to_vec_pretty(document).map_err(|source| {
+    let mut serialized = serde_json::to_string_pretty(document).map_err(|source| {
         ObjectiveRegistryError::SerializeFile { path: path.to_path_buf(), source }
     })?;
-    file.seek(SeekFrom::Start(0))
-        .map_err(|source| ObjectiveRegistryError::WriteFile { path: path.to_path_buf(), source })?;
-    file.set_len(0)
-        .map_err(|source| ObjectiveRegistryError::WriteFile { path: path.to_path_buf(), source })?;
-    file.write_all(&serialized)
-        .and_then(|_| file.write_all(b"\n"))
-        .and_then(|_| file.sync_all())
-        .map_err(|source| ObjectiveRegistryError::WriteFile { path: path.to_path_buf(), source })
+    serialized.push('\n');
+    write_content_with_backups(path, serialized.as_str(), 0).map_err(|source| {
+        ObjectiveRegistryError::WriteFile {
+            path: path.to_path_buf(),
+            source: std::io::Error::other(source.to_string()),
+        }
+    })
 }
 
 fn normalize_objective_record(

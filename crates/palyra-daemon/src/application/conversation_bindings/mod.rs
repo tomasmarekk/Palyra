@@ -15,7 +15,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use palyra_common::redaction::{redact_auth_error, redact_url_segments_in_text};
+use palyra_common::{
+    config_system::write_content_with_backups,
+    redaction::{redact_auth_error, redact_url_segments_in_text},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -867,20 +870,17 @@ impl ConversationBindingStore {
             .map_err(|_| ConversationBindingError::PoisonedLock("conversation binding store"))
     }
 
-    // AIDEV-NOTE: fs::write is not atomic; a crash mid-write can leave a
-    // truncated/corrupt store that the next open() rejects with a JSON
-    // error (only a fully empty file is tolerated). A durable fix is
-    // write-to-temp-then-rename, which changes persistence behavior.
     fn persist(&self) -> Result<(), ConversationBindingError> {
         let records = self.lock_records()?.clone();
         let envelope =
             ConversationBindingStoreEnvelope { schema_version: BINDING_SCHEMA_VERSION, records };
-        let bytes = serde_json::to_vec_pretty(&envelope)?;
+        let content = serde_json::to_string_pretty(&envelope)?;
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&self.path, bytes)?;
-        Ok(())
+        write_content_with_backups(self.path.as_path(), content.as_str(), 0).map_err(|source| {
+            ConversationBindingError::Io(std::io::Error::other(source.to_string()))
+        })
     }
 }
 

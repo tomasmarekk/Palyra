@@ -11,15 +11,15 @@
 use std::{
     collections::BTreeMap,
     fs,
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use palyra_common::{
-    parse_webhook_payload, verify_webhook_payload, ReplayNonceStore, WebhookPayloadError,
-    WebhookSignatureVerifier,
+    config_system::write_content_with_backups, parse_webhook_payload, verify_webhook_payload,
+    ReplayNonceStore, WebhookPayloadError, WebhookSignatureVerifier,
 };
 use palyra_control_plane as control_plane;
 use palyra_safety::{
@@ -1150,30 +1150,17 @@ fn persist_registry(
     write_registry_document(registry_path, &mut registry_file, document)
 }
 
-// AIDEV-NOTE: the document is rewritten in place (set_len(0) + write +
-// sync on the long-lived handle), matching the registry pattern used by
-// objectives.rs and routines.rs. A crash between truncate and sync leaves
-// a partial document; switching to atomic temp-file rename would also
-// change the owner-only permission and file-handle locking flow.
 fn write_registry_document(
     registry_path: &RegistryPath,
-    registry_file: &mut fs::File,
+    _registry_file: &mut fs::File,
     document: &RegistryDocument,
 ) -> Result<(), WebhookRegistryError> {
     let encoded = toml::to_string_pretty(document)?;
-    registry_file.set_len(0).map_err(|source| WebhookRegistryError::WriteRegistry {
-        path: registry_path.to_path_buf(),
-        source,
-    })?;
-    registry_file.seek(SeekFrom::Start(0)).map_err(|source| {
-        WebhookRegistryError::WriteRegistry { path: registry_path.to_path_buf(), source }
-    })?;
-    registry_file.write_all(encoded.as_bytes()).map_err(|source| {
-        WebhookRegistryError::WriteRegistry { path: registry_path.to_path_buf(), source }
-    })?;
-    registry_file.sync_all().map_err(|source| WebhookRegistryError::WriteRegistry {
-        path: registry_path.to_path_buf(),
-        source,
+    write_content_with_backups(registry_path.as_path(), encoded.as_str(), 0).map_err(|source| {
+        WebhookRegistryError::WriteRegistry {
+            path: registry_path.to_path_buf(),
+            source: std::io::Error::other(source.to_string()),
+        }
     })?;
     ensure_owner_only_file(registry_path.as_path()).map_err(|source| {
         WebhookRegistryError::WriteRegistry {
