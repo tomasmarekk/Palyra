@@ -758,7 +758,7 @@ async fn workspace_memory_auto_inject_prefixes(
     };
     let mut prefixes = Vec::new();
     for root in workspace_roots {
-        for prefix in project_memory_prefix_candidates_from_workspace_root(root.as_path()) {
+        for prefix in project_memory_prefix_candidates_from_workspace_root(root.as_path()).await {
             push_unique_workspace_memory_prefix(&mut prefixes, prefix);
         }
     }

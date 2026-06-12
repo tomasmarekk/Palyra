@@ -2118,7 +2118,7 @@ pub(crate) async fn execute_memory_reflect_tool(
     let max_candidates = parsed
         .get("max_candidates")
         .and_then(Value::as_u64)
-        .map(|value| (value as usize).clamp(1, 16))
+        .map(|value| clamp_u64_to_usize(value, 1, 16))
         .unwrap_or(8);
     let provenance = parsed
         .get("provenance")
@@ -2211,7 +2211,7 @@ pub(crate) async fn execute_memory_search_tool(
     let top_k = parsed
         .get("top_k")
         .and_then(Value::as_u64)
-        .map(|value| (value as usize).clamp(1, MAX_MEMORY_SEARCH_TOP_K))
+        .map(|value| clamp_u64_to_usize(value, 1, MAX_MEMORY_SEARCH_TOP_K))
         .unwrap_or(8);
 
     let scope = memory_search_scope_text(&parsed);
@@ -2822,24 +2822,27 @@ pub(crate) async fn execute_memory_recall_tool(
     };
     let prompt_budget_tokens = match parsed.get("prompt_budget_tokens").and_then(Value::as_u64) {
         Some(value) => {
-            let value = value as usize;
-            if !(MIN_MEMORY_RECALL_PROMPT_BUDGET_TOKENS..=MAX_MEMORY_RECALL_PROMPT_BUDGET_TOKENS)
-                .contains(&value)
-            {
-                return memory_tool_execution_outcome(
-                    namespace,
-                    proposal_id,
-                    input_json,
-                    false,
-                    b"{}".to_vec(),
-                    format!(
-                        "palyra.memory.recall prompt_budget_tokens must be in range {}..={}",
-                        MIN_MEMORY_RECALL_PROMPT_BUDGET_TOKENS,
-                        MAX_MEMORY_RECALL_PROMPT_BUDGET_TOKENS
-                    ),
-                );
+            match u64_to_usize_in_range(
+                value,
+                MIN_MEMORY_RECALL_PROMPT_BUDGET_TOKENS,
+                MAX_MEMORY_RECALL_PROMPT_BUDGET_TOKENS,
+            ) {
+                Some(value) => value,
+                None => {
+                    return memory_tool_execution_outcome(
+                        namespace,
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        format!(
+                            "palyra.memory.recall prompt_budget_tokens must be in range {}..={}",
+                            MIN_MEMORY_RECALL_PROMPT_BUDGET_TOKENS,
+                            MAX_MEMORY_RECALL_PROMPT_BUDGET_TOKENS
+                        ),
+                    );
+                }
             }
-            value
         }
         None => DEFAULT_MEMORY_RECALL_PROMPT_BUDGET_TOKENS,
     };
@@ -3219,13 +3222,6 @@ fn parse_memory_tool_object(input_json: &[u8]) -> Result<Map<String, Value>, Str
 
 /// Parses an optional integer limit, clamping into `min..=max`; absent and
 /// `null` mean "use the caller's default", any non-u64 value is an error.
-///
-/// AIDEV-NOTE: `value as usize` truncates u64 on 32-bit targets before the
-/// clamp, so an absurdly large input could clamp to `min` instead of `max`.
-/// Same pattern in parse_optional_recall_limit and the inline top_k /
-/// max_candidates / prompt_budget_tokens parses. Harmless on the 64-bit
-/// daemon targets; fixing it means switching to u64 bounds (behavior change
-/// on 32-bit only).
 fn parse_optional_session_search_limit(
     value: Option<&Value>,
     field: &str,
@@ -3233,12 +3229,27 @@ fn parse_optional_session_search_limit(
     max: usize,
 ) -> Result<Option<usize>, String> {
     match value.and_then(Value::as_u64) {
-        Some(value) => Ok(Some((value as usize).clamp(min, max))),
+        Some(value) => Ok(Some(clamp_u64_to_usize(value, min, max))),
         None if value.is_none() || matches!(value, Some(Value::Null)) => Ok(None),
         None => Err(format!(
             "palyra.memory.session_search {field} must be an integer in range {min}..={max}"
         )),
     }
+}
+
+fn clamp_u64_to_usize(value: u64, min: usize, max: usize) -> usize {
+    let clamped = value.clamp(min as u64, max as u64);
+    match usize::try_from(clamped) {
+        Ok(value) => value,
+        Err(_) => max,
+    }
+}
+
+fn u64_to_usize_in_range(value: u64, min: usize, max: usize) -> Option<usize> {
+    if !(min as u64..=max as u64).contains(&value) {
+        return None;
+    }
+    usize::try_from(value).ok()
 }
 
 fn required_string_field(parsed: &Map<String, Value>, field: &str) -> Result<String, String> {
@@ -3396,8 +3407,9 @@ async fn infer_project_memory_search_scope(
     let Some(root) = workspace_roots.first() else {
         return InferredProjectMemorySearchScope::default();
     };
+    let prefixes = project_memory_prefix_candidates_from_workspace_root(root.as_path()).await;
     InferredProjectMemorySearchScope {
-        prefixes: project_memory_prefix_candidates_from_workspace_root(root.as_path()),
+        prefixes,
         basename: last_normal_path_segment(root.as_path()),
     }
 }
@@ -3440,9 +3452,11 @@ async fn resolve_memory_agent_workspace_roots(
 /// stable identity prefix (`project-<slug>-<path-hash>`) first, then the
 /// plain `projects/<basename>` form for memories written before identity
 /// prefixes existed (or with explicit basename prefixes).
-pub(crate) fn project_memory_prefix_candidates_from_workspace_root(root: &Path) -> Vec<String> {
+pub(crate) async fn project_memory_prefix_candidates_from_workspace_root(
+    root: &Path,
+) -> Vec<String> {
     let mut prefixes = Vec::new();
-    if let Some(identity_prefix) = project_memory_prefix_from_workspace_root(root) {
+    if let Some(identity_prefix) = project_memory_prefix_from_workspace_root(root).await {
         prefixes.push(identity_prefix);
     }
     if let Some(name) = last_normal_path_segment(root) {
@@ -3459,12 +3473,14 @@ pub(crate) fn project_memory_prefix_candidates_from_workspace_root(root: &Path) 
 /// Derives the identity prefix `projects/project-<slug>-<hash10>` from the
 /// canonicalized root path, so two projects with the same directory name get
 /// distinct memory namespaces.
-fn project_memory_prefix_from_workspace_root(root: &Path) -> Option<String> {
-    // AIDEV-NOTE: blocking std::fs::canonicalize on the async tool path
-    // (called from infer_project_memory_search_scope). One metadata syscall
-    // is normally cheap, but on network filesystems it can stall a runtime
-    // worker; moving it to spawn_blocking is a behavior change left undone.
-    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+async fn project_memory_prefix_from_workspace_root(root: &Path) -> Option<String> {
+    let root_for_worker = root.to_path_buf();
+    let fallback = root.to_path_buf();
+    let canonical = tokio::task::spawn_blocking(move || std::fs::canonicalize(root_for_worker))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(fallback);
     let name = last_normal_path_segment(canonical.as_path())?;
     let slug = project_memory_slug(name.as_str());
     let fingerprint = project_memory_root_fingerprint(canonical.as_path());
@@ -4273,12 +4289,11 @@ fn memory_tool_execution_outcome(
     }
 }
 
-/// Recall variant of the optional-limit parser (zero allowed, clamped to
-/// `0..=max`); see the AIDEV-NOTE on [`parse_optional_session_search_limit`]
-/// about the u64-to-usize cast.
+/// Recall variant of the optional-limit parser; zero is allowed and values
+/// are clamped to `0..=max`.
 fn parse_optional_recall_limit(value: Option<&Value>, max: usize) -> Result<Option<usize>, String> {
     match value.and_then(Value::as_u64) {
-        Some(value) => Ok(Some((value as usize).clamp(0, max))),
+        Some(value) => Ok(Some(clamp_u64_to_usize(value, 0, max))),
         None if value.is_none() || matches!(value, Some(Value::Null)) => Ok(None),
         None => {
             Err(format!("palyra.memory.recall numeric limits must be integers in range 0..={max}"))
@@ -4428,6 +4443,16 @@ mod tests {
             Some(8)
         );
         assert_eq!(
+            parse_optional_session_search_limit(
+                Some(&serde_json::json!(u64::MAX)),
+                "window_after",
+                0,
+                8,
+            )
+            .expect("huge window should clamp to maximum"),
+            Some(8)
+        );
+        assert_eq!(
             parse_optional_session_search_limit(None, "top_k", 1, 24)
                 .expect("absent limit should use caller default"),
             None
@@ -4441,6 +4466,23 @@ mod tests {
         .expect_err("string limits should be rejected");
 
         assert!(error.contains("window_before must be an integer"));
+    }
+
+    #[test]
+    fn parse_recall_limits_clamp_before_usize_conversion() {
+        assert_eq!(
+            parse_optional_recall_limit(Some(&serde_json::json!(u64::MAX)), 12)
+                .expect("huge recall limit should clamp"),
+            Some(12)
+        );
+        assert_eq!(
+            u64_to_usize_in_range(
+                u64::MAX,
+                MIN_MEMORY_RECALL_PROMPT_BUDGET_TOKENS,
+                MAX_MEMORY_RECALL_PROMPT_BUDGET_TOKENS,
+            ),
+            None
+        );
     }
 
     #[test]
@@ -4773,18 +4815,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn project_memory_prefix_uses_workspace_root_identity() {
+    #[tokio::test]
+    async fn project_memory_prefix_uses_workspace_root_identity() {
         let prefix = project_memory_prefix_from_workspace_root(Path::new("/tmp/client-portal"))
+            .await
             .expect("workspace root should produce a project prefix");
         assert!(prefix.starts_with("projects/project-client-portal-"), "{prefix}");
         assert!(normalize_workspace_prefix(prefix.as_str()).is_ok());
     }
 
-    #[test]
-    fn project_memory_prefix_candidates_include_explicit_basename_prefix() {
+    #[tokio::test]
+    async fn project_memory_prefix_candidates_include_explicit_basename_prefix() {
         let prefixes =
-            project_memory_prefix_candidates_from_workspace_root(Path::new("/tmp/S079-project-A"));
+            project_memory_prefix_candidates_from_workspace_root(Path::new("/tmp/S079-project-A"))
+                .await;
 
         assert!(
             prefixes.iter().any(|prefix| prefix.starts_with("projects/project-s079-project-a-")),
