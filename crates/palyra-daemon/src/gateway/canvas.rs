@@ -4,6 +4,7 @@
 //! Everything served by the canvas HTTP host is normalized through here.
 
 use super::*;
+use getrandom::fill as fill_random_bytes;
 use reqwest::Url;
 
 /// Upper bound for canvas state/schema versions: they persist in SQLite
@@ -288,18 +289,9 @@ pub(crate) fn load_canvas_records_from_snapshots(
 /// Generates the per-process canvas token signing secret. Regenerated on
 /// every daemon start, deliberately invalidating all outstanding canvas
 /// tokens across restarts (tokens are short-lived by design).
-// AIDEV-NOTE: the secret's entropy is bounded by the ULID's 80 random bits;
-// the timestamp adds little. Strengthening to a full 256-bit OsRng/getrandom
-// fill changes runtime behavior (new dependency surface + different secret
-// derivation), so it is only flagged here, not fixed in this pass.
 pub(crate) fn generate_canvas_signing_secret() -> [u8; 32] {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
-    let mut hasher = Sha256::new();
-    hasher.update(Ulid::new().to_string().as_bytes());
-    hasher.update(now.to_string().as_bytes());
-    let digest = hasher.finalize();
     let mut secret = [0_u8; 32];
-    secret.copy_from_slice(&digest[..32]);
+    fill_random_bytes(&mut secret).expect("OS random source must be available for canvas signing");
     secret
 }
 
@@ -608,8 +600,8 @@ pub(crate) fn escape_html_attribute(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_canvas_experiment_governance_snapshot, CanvasHostRuntimeConfig,
-        CANVAS_EXPERIMENT_STRUCTURED_CONTRACT,
+        build_canvas_experiment_governance_snapshot, generate_canvas_signing_secret,
+        CanvasHostRuntimeConfig, CANVAS_EXPERIMENT_STRUCTURED_CONTRACT,
     };
 
     fn canvas_host_config(enabled: bool) -> CanvasHostRuntimeConfig {
@@ -648,5 +640,15 @@ mod tests {
         assert_eq!(snapshot.native_canvas.limits.max_assets_per_bundle, 8);
         assert_eq!(snapshot.native_canvas.limits.max_updates_per_minute, 30);
         assert_eq!(snapshot.native_canvas.exit_criteria.len(), 2);
+    }
+
+    #[test]
+    fn canvas_signing_secret_uses_fresh_os_random_bytes() {
+        let first = generate_canvas_signing_secret();
+        let second = generate_canvas_signing_secret();
+
+        assert_ne!(first, [0_u8; 32]);
+        assert_ne!(second, [0_u8; 32]);
+        assert_ne!(first, second);
     }
 }

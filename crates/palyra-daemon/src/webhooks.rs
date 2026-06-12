@@ -26,9 +26,9 @@ use palyra_safety::{
     inspect_text, SafetyAction, SafetyContentKind, SafetyPhase, SafetySourceKind, TrustLabel,
 };
 use palyra_vault::{ensure_owner_only_dir, ensure_owner_only_file, Vault, VaultError, VaultRef};
+use ring::hmac;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 const REGISTRY_VERSION: u32 = 1;
@@ -42,7 +42,6 @@ const MAX_FILTER_VALUE_BYTES: usize = 128;
 const DEFAULT_MAX_PAYLOAD_BYTES: u64 = 64 * 1024;
 const MAX_WEBHOOK_PAYLOAD_BYTES: u64 = 1_048_576;
 const MAX_REPLAY_NONCES: usize = 8_192;
-const HMAC_SHA256_BLOCK_BYTES: usize = 64;
 
 /// Optional provider/enabled filters for listing integrations; `None`
 /// fields match everything.
@@ -863,35 +862,9 @@ fn webhook_signature_payload(payload_bytes: &[u8]) -> Result<Vec<u8>, WebhookPay
 }
 
 /// RFC 2104 HMAC-SHA256 over `payload` with `secret`.
-// AIDEV-NOTE: hand-rolled HMAC (block-sized key pad, inner/outer hash).
-// The construction is the standard one and is pinned by the signature
-// tests, but if the workspace ever adopts the `hmac` crate this should be
-// replaced rather than maintained -- do not "optimize" the XOR loops.
 fn hmac_sha256(secret: &[u8], payload: &[u8]) -> Vec<u8> {
-    let mut key_block = [0_u8; HMAC_SHA256_BLOCK_BYTES];
-    if secret.len() > HMAC_SHA256_BLOCK_BYTES {
-        let digest = Sha256::digest(secret);
-        key_block[..digest.len()].copy_from_slice(digest.as_slice());
-    } else {
-        key_block[..secret.len()].copy_from_slice(secret);
-    }
-
-    let mut inner_key = [0x36_u8; HMAC_SHA256_BLOCK_BYTES];
-    let mut outer_key = [0x5c_u8; HMAC_SHA256_BLOCK_BYTES];
-    for index in 0..HMAC_SHA256_BLOCK_BYTES {
-        inner_key[index] ^= key_block[index];
-        outer_key[index] ^= key_block[index];
-    }
-
-    let mut inner = Sha256::new();
-    inner.update(inner_key);
-    inner.update(payload);
-    let inner_digest = inner.finalize();
-
-    let mut outer = Sha256::new();
-    outer.update(outer_key);
-    outer.update(inner_digest);
-    outer.finalize().to_vec()
+    let key = hmac::Key::new(hmac::HMAC_SHA256, secret);
+    hmac::sign(&key, payload).as_ref().to_vec()
 }
 
 /// Decodes a hex signature, tolerating the common `sha256=`/`hmac-sha256=`
@@ -1262,6 +1235,16 @@ mod tests {
             .list_views(WebhookIntegrationListFilter { provider: None, enabled: None }, &vault)?
             .is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn hmac_sha256_matches_rfc4231_test_vector() {
+        let mac = hmac_sha256(&[0x0b; 20], b"Hi There");
+
+        assert_eq!(
+            hex::encode(mac),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
     }
 
     #[test]

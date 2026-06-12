@@ -103,10 +103,22 @@ use palyra_workerd::{
     WorkerAttestation, WorkerCleanupReport, WorkerFleetManager, WorkerFleetPolicy,
     WorkerFleetSnapshot, WorkerLease, WorkerLeaseRequest, WorkerLifecycleEvent,
 };
+use ring::hmac;
 use std::path::PathBuf;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 mod external_retrieval;
+
+fn sign_canvas_hmac_sha256(secret: &[u8], domain: &str, parts: &[&[u8]]) -> String {
+    let key = hmac::Key::new(hmac::HMAC_SHA256, secret);
+    let mut context = hmac::Context::with_key(&key);
+    context.update(domain.as_bytes());
+    for part in parts {
+        context.update(&(part.len() as u64).to_be_bytes());
+        context.update(part);
+    }
+    URL_SAFE_NO_PAD.encode(context.sign().as_ref())
+}
 
 /// Immutable copy of the daemon configuration the gateway runtime was started with.
 ///
@@ -3198,13 +3210,6 @@ impl GatewayRuntimeState {
         Ok(bounded)
     }
 
-    // AIDEV-NOTE: canvas bundle/token signing uses SHA-256 over
-    // secret-prefixed input rather than HMAC-SHA256. A prefix MAC is
-    // theoretically open to length-extension; practical forgery is blocked
-    // here because appended SHA-256 padding bytes can never form valid
-    // base64url/JSON payloads, and verification compares in constant time.
-    // Migrating to a real HMAC would change every issued signature/token, so
-    // it needs a coordinated behavior change, not a comment-level fix.
     fn sign_canvas_bundle(
         &self,
         canvas_id: &str,
@@ -3212,22 +3217,21 @@ impl GatewayRuntimeState {
         principal: &str,
         session_id: &str,
     ) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(self.canvas_signing_secret);
-        hasher.update(b"\n");
-        hasher.update(canvas_id.as_bytes());
-        hasher.update(b"\n");
-        hasher.update(bundle_sha256.as_bytes());
-        hasher.update(b"\n");
-        hasher.update(principal.as_bytes());
-        hasher.update(b"\n");
-        hasher.update(session_id.as_bytes());
-        URL_SAFE_NO_PAD.encode(hasher.finalize())
+        sign_canvas_hmac_sha256(
+            &self.canvas_signing_secret,
+            "canvas_bundle.v1",
+            &[
+                canvas_id.as_bytes(),
+                bundle_sha256.as_bytes(),
+                principal.as_bytes(),
+                session_id.as_bytes(),
+            ],
+        )
     }
 
     /// Issues a `payload_b64.signature` token scoped to canvas, principal,
-    /// and session (see the signing AIDEV-NOTE above). The signing secret is
-    /// generated per process, so tokens do not survive a daemon restart.
+    /// and session. The signing secret is generated per process, so tokens do
+    /// not survive a daemon restart.
     #[allow(clippy::result_large_err)]
     fn issue_canvas_token(
         &self,
@@ -3249,11 +3253,11 @@ impl GatewayRuntimeState {
             Status::internal(format!("failed to serialize canvas token payload: {error}"))
         })?;
         let payload_b64 = URL_SAFE_NO_PAD.encode(payload_json);
-        let mut hasher = Sha256::new();
-        hasher.update(self.canvas_signing_secret);
-        hasher.update(b".");
-        hasher.update(payload_b64.as_bytes());
-        let signature = URL_SAFE_NO_PAD.encode(hasher.finalize());
+        let signature = sign_canvas_hmac_sha256(
+            &self.canvas_signing_secret,
+            "canvas_token.v1",
+            &[payload_b64.as_bytes()],
+        );
         Ok(format!("{payload_b64}.{signature}"))
     }
 
@@ -3265,11 +3269,11 @@ impl GatewayRuntimeState {
         let Some((payload_b64, signature_b64)) = token.split_once('.') else {
             return Err(Status::invalid_argument("canvas token format is invalid"));
         };
-        let mut hasher = Sha256::new();
-        hasher.update(self.canvas_signing_secret);
-        hasher.update(b".");
-        hasher.update(payload_b64.as_bytes());
-        let expected_signature = URL_SAFE_NO_PAD.encode(hasher.finalize());
+        let expected_signature = sign_canvas_hmac_sha256(
+            &self.canvas_signing_secret,
+            "canvas_token.v1",
+            &[payload_b64.as_bytes()],
+        );
         if !constant_time_eq(expected_signature.as_bytes(), signature_b64.as_bytes()) {
             return Err(Status::permission_denied("canvas token signature is invalid"));
         }
@@ -9928,8 +9932,8 @@ mod tests {
     use super::{
         fallback_workspace_document_search_hits, provider_credential_attribution_for_provider,
         provider_lease_timeout_status, request_may_failover_to_other_provider,
-        select_default_agent_model_profile, validate_memory_item_content_limits,
-        GatewayRuntimeState, MemoryRuntimeConfig,
+        select_default_agent_model_profile, sign_canvas_hmac_sha256,
+        validate_memory_item_content_limits, GatewayRuntimeState, MemoryRuntimeConfig,
     };
     use crate::gateway::RUN_PARAMETER_DELTA_CACHE_CAPACITY;
     use crate::journal::{CanvasStatePatchRecord, WorkspaceDocumentRecord, WorkspaceSearchRequest};
@@ -10029,6 +10033,16 @@ mod tests {
             vec![4, 5],
             "response budgeting should retain the newest contiguous revisions"
         );
+    }
+
+    #[test]
+    fn canvas_hmac_signature_frames_parts_unambiguously() {
+        let secret = [7_u8; 32];
+
+        let left = sign_canvas_hmac_sha256(&secret, "canvas_bundle.v1", &[b"ab", b"c"]);
+        let right = sign_canvas_hmac_sha256(&secret, "canvas_bundle.v1", &[b"a", b"bc"]);
+
+        assert_ne!(left, right);
     }
 
     #[test]

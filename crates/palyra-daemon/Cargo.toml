@@ -21,6 +21,7 @@ clap.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
 futures.workspace = true
+getrandom.workspace = true
 palyra-auth = { version = "0.1.0", path = "../palyra-auth" }
 palyra-a2ui = { version = "0.1.0", path = "../palyra-a2ui" }
 palyra-common = { version = "0.1.0", path = "../palyra-common" }
@@ -45,6 +46,7 @@ quinn.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true
+ring.workspace = true
 rusqlite.workspace = true
 rand.workspace = true
 rustls.workspace = true
