@@ -10,7 +10,7 @@
 //! reaches the cron trigger path.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::{Component, Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -486,15 +486,13 @@ async fn observe_routine_wait_state(
         context.principal.as_str(),
     )
     .await?;
-    // AIDEV-NOTE: list_cron_runs pages ascending by run id, so this window is
-    // the OLDEST ROUTINE_WAIT_RUN_LIMIT runs; a routine with more runs can
-    // mis-count active/succeeded state here (has_more_runs surfaces the
-    // truncation). Reading the newest window instead is a behavior change
-    // left for a dedicated fix.
-    let (runs, next_after_run_id) = runtime_state
-        .list_cron_runs(Some(routine.job.job_id.clone()), None, Some(ROUTINE_WAIT_RUN_LIMIT))
-        .await
-        .map_err(sanitize_status_message)?;
+    let (runs, has_more_runs) = list_latest_cron_runs_for_job(
+        runtime_state,
+        routine.job.job_id.as_str(),
+        ROUTINE_WAIT_RUN_LIMIT,
+    )
+    .await
+    .map_err(sanitize_status_message)?;
     let mapped_runs = runs
         .iter()
         .map(|run| {
@@ -511,7 +509,7 @@ async fn observe_routine_wait_state(
         &routine.job,
         runs.as_slice(),
         expected_successful_runs,
-        next_after_run_id.is_some(),
+        has_more_runs,
     );
     let terminal = summary.get("terminal").and_then(Value::as_bool).unwrap_or(false);
     let goal_met =
@@ -533,7 +531,7 @@ async fn observe_routine_wait_state(
         "routine": routine_view_from_parts(&routine.job, &routine.metadata),
         "run_summary": summary,
         "runs": mapped_runs,
-        "next_after_run_id": next_after_run_id,
+        "next_after_run_id": Value::Null,
         "safe_cleanup_command": format!(
             "palyra routines delete --id {} --json",
             routine.metadata.routine_id
@@ -680,7 +678,8 @@ async fn upsert_routine(
         requested_workdir,
         workdir_was_requested,
         launch_workspace_roots.as_slice(),
-    )?;
+    )
+    .await?;
     let name = optional_string_field(payload, "name")
         .or_else(|| existing_job.as_ref().map(|job| job.name.clone()))
         .ok_or_else(|| "name is required and must be a non-empty string".to_owned())?;
@@ -1271,12 +1270,12 @@ async fn dispatch_single_routine(
                 .map_err(map_registry_error)?
                 .into_iter()
                 .last();
-            // AIDEV-NOTE: `cooldown_ms as i64` wraps for values above
-            // i64::MAX and the addition can overflow in debug builds on a
-            // hostile cooldown value (tool input is model-controlled); a
-            // saturating fix is a behavior change left for a dedicated pass.
             if latest.as_ref().is_some_and(|entry| {
-                entry.created_at_unix_ms + routine.metadata.cooldown_ms as i64 > now_unix_ms
+                routine_cooldown_deadline_is_after(
+                    entry.created_at_unix_ms,
+                    routine.metadata.cooldown_ms,
+                    now_unix_ms,
+                )
             }) {
                 return register_terminal_routine_run(
                     runtime_state,
@@ -1679,6 +1678,49 @@ async fn list_all_cron_jobs(
     Ok(jobs)
 }
 
+async fn list_latest_cron_runs_for_job(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    job_id: &str,
+    limit: usize,
+) -> Result<(Vec<CronRunRecord>, bool), Status> {
+    let limit = limit.max(1);
+    let mut after_run_id = None::<String>;
+    let mut window = VecDeque::with_capacity(limit);
+    let mut total_seen = 0_usize;
+    loop {
+        let (page, next_after_run_id) = runtime_state
+            .list_cron_runs(
+                Some(job_id.to_owned()),
+                after_run_id.clone(),
+                Some(MAX_ROUTINE_PAGE_LIMIT),
+            )
+            .await?;
+        for run in page {
+            total_seen = total_seen.saturating_add(1);
+            retain_latest_cron_run_window(&mut window, run, limit);
+        }
+        let Some(next_after_run_id) = next_after_run_id else {
+            break;
+        };
+        after_run_id = Some(next_after_run_id);
+    }
+    Ok((window.into_iter().collect(), total_seen > limit))
+}
+
+fn retain_latest_cron_run_window(
+    window: &mut VecDeque<CronRunRecord>,
+    run: CronRunRecord,
+    limit: usize,
+) {
+    if limit == 0 {
+        return;
+    }
+    if window.len() == limit {
+        window.pop_front();
+    }
+    window.push_back(run);
+}
+
 async fn enrich_routine_view_with_latest_run(
     runtime_state: &Arc<GatewayRuntimeState>,
     registry: &Arc<RoutineRegistry>,
@@ -1686,13 +1728,7 @@ async fn enrich_routine_view_with_latest_run(
     routine_id: &str,
     job_id: &str,
 ) -> Result<Value, String> {
-    // AIDEV-NOTE: list_cron_runs pages ascending by run id, so this window of
-    // 10 is the OLDEST runs; once a routine exceeds 10 runs, "last_run" and
-    // the troubleshooting counts describe stale history. Fixing it (descending
-    // order or paging to the final page) is a behavior change left for a
-    // dedicated fix.
-    let (runs, _) = runtime_state
-        .list_cron_runs(Some(job_id.to_owned()), None, Some(10))
+    let (runs, _) = list_latest_cron_runs_for_job(runtime_state, job_id, 10)
         .await
         .map_err(sanitize_status_message)?;
     let Some(run) = runs.last() else {
@@ -2552,7 +2588,7 @@ fn normalize_optional_workdir(value: Option<String>) -> Result<Option<String>, S
 /// explicit clear), an existing job keeps its stored value when the field is
 /// omitted, and a brand-new schedule routine inherits the launch workspace
 /// root so scheduled runs start where the operator launched.
-fn resolve_routine_workdir_from_launch_context(
+async fn resolve_routine_workdir_from_launch_context(
     trigger_kind: RoutineTriggerKind,
     existing_job_was_present: bool,
     existing_workdir: Option<String>,
@@ -2563,7 +2599,7 @@ fn resolve_routine_workdir_from_launch_context(
     if workdir_was_requested {
         return match requested_workdir {
             Some(workdir) => {
-                resolve_requested_routine_workdir(workdir, launch_workspace_roots).map(Some)
+                resolve_requested_routine_workdir(workdir, launch_workspace_roots).await.map(Some)
             }
             None => Ok(None),
         };
@@ -2586,7 +2622,7 @@ fn resolve_routine_workdir_from_launch_context(
     Ok(None)
 }
 
-fn resolve_requested_routine_workdir(
+async fn resolve_requested_routine_workdir(
     workdir: String,
     launch_workspace_roots: &[PathBuf],
 ) -> Result<String, String> {
@@ -2594,12 +2630,12 @@ fn resolve_requested_routine_workdir(
         let launch_root = launch_workspace_roots.first().ok_or_else(|| {
             "workdir uses /workspace but this run has no resolved launch workspace".to_owned()
         })?;
-        return resolve_workdir_under_launch_root(launch_root, relative.as_deref());
+        return resolve_workdir_under_launch_root(launch_root, relative.as_deref()).await;
     }
 
     if should_resolve_relative_workdir_against_launch_root(workdir.as_str()) {
         if let Some(launch_root) = launch_workspace_roots.first() {
-            return resolve_workdir_under_launch_root(launch_root, Some(workdir.as_str()));
+            return resolve_workdir_under_launch_root(launch_root, Some(workdir.as_str())).await;
         }
     }
 
@@ -2648,25 +2684,23 @@ fn looks_like_windows_absolute_path(workdir: &str) -> bool {
     trimmed.starts_with("\\\\") || trimmed.starts_with("//")
 }
 
-fn resolve_workdir_under_launch_root(
+async fn resolve_workdir_under_launch_root(
     launch_root: &Path,
     relative: Option<&str>,
 ) -> Result<String, String> {
     let target = relative
         .filter(|value| !value.is_empty())
         .map_or_else(|| launch_root.to_path_buf(), |relative| launch_root.join(relative));
-    // AIDEV-NOTE: blocking std::fs::canonicalize on the async tool path
-    // (mirrors the same trade-off in memory.rs). One metadata syscall is
-    // normally cheap, but on network filesystems it can stall a runtime
-    // worker; moving it to spawn_blocking is a behavior change left undone.
-    // Canonicalization is also the symlink/.. escape check below, so it must
-    // stay before the starts_with containment test.
-    let canonical = std::fs::canonicalize(target.as_path()).map_err(|error| {
-        format!(
-            "workdir {} does not resolve inside the launch workspace: {error}",
-            target.display()
-        )
-    })?;
+    let target_for_error = target.clone();
+    let canonical = tokio::task::spawn_blocking(move || std::fs::canonicalize(target.as_path()))
+        .await
+        .map_err(|_| "workdir canonicalization worker panicked".to_owned())?
+        .map_err(|error| {
+            format!(
+                "workdir {} does not resolve inside the launch workspace: {error}",
+                target_for_error.display()
+            )
+        })?;
     if !canonical.is_dir() {
         return Err(format!("workdir must resolve to a directory: {}", canonical.display()));
     }
@@ -2696,6 +2730,15 @@ fn routine_path_starts_with(path: &Path, root: &Path) -> bool {
     {
         false
     }
+}
+
+fn routine_cooldown_deadline_is_after(
+    created_at_unix_ms: i64,
+    cooldown_ms: u64,
+    now_unix_ms: i64,
+) -> bool {
+    let cooldown_ms = i64::try_from(cooldown_ms).unwrap_or(i64::MAX);
+    created_at_unix_ms.saturating_add(cooldown_ms) > now_unix_ms
 }
 
 fn ensure_job_owner(job: &CronJobRecord, principal: &str) -> Result<(), String> {
@@ -2874,7 +2917,7 @@ fn routines_tool_execution_outcome(
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{collections::VecDeque, fs};
 
     use crate::journal::{
         CronConcurrencyPolicy, CronJobRecord, CronMisfirePolicy, CronRetryPolicy, CronRunRecord,
@@ -3063,6 +3106,30 @@ mod tests {
         assert_eq!(active_summary["active_runs"], json!(1));
         assert_eq!(queued_summary["terminal"], json!(false));
         assert_eq!(queued_summary["queued_run"], json!(true));
+    }
+
+    #[test]
+    fn latest_cron_run_window_keeps_newest_limit() {
+        let mut window = VecDeque::new();
+        for index in 0..5 {
+            let run_id = format!("run-{index}");
+            super::retain_latest_cron_run_window(
+                &mut window,
+                test_cron_run(run_id.as_str(), CronRunStatus::Succeeded),
+                3,
+            );
+        }
+
+        assert_eq!(
+            window.iter().map(|run| run.run_id.as_str()).collect::<Vec<_>>(),
+            vec!["run-2", "run-3", "run-4"]
+        );
+    }
+
+    #[test]
+    fn routine_cooldown_deadline_saturates_huge_values() {
+        assert!(super::routine_cooldown_deadline_is_after(100, u64::MAX, i64::MAX - 1));
+        assert!(!super::routine_cooldown_deadline_is_after(100, 25, 125));
     }
 
     #[test]
@@ -3572,8 +3639,8 @@ mod tests {
         assert_eq!(normalized, Some("/workspace/project".to_owned()));
     }
 
-    #[test]
-    fn schedule_workdir_defaults_to_launch_workspace_for_new_agent_routine_when_omitted() {
+    #[tokio::test]
+    async fn schedule_workdir_defaults_to_launch_workspace_for_new_agent_routine_when_omitted() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let launch_root = std::fs::canonicalize(tempdir.path()).expect("launch root should exist");
 
@@ -3585,13 +3652,14 @@ mod tests {
             false,
             std::slice::from_ref(&launch_root),
         )
+        .await
         .expect("omitted schedule workdir should inherit launch root");
 
         assert_eq!(workdir, Some(launch_root.to_string_lossy().into_owned()));
     }
 
-    #[test]
-    fn explicit_empty_schedule_workdir_remains_unset() {
+    #[tokio::test]
+    async fn explicit_empty_schedule_workdir_remains_unset() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let launch_root = std::fs::canonicalize(tempdir.path()).expect("launch root should exist");
 
@@ -3603,13 +3671,14 @@ mod tests {
             true,
             std::slice::from_ref(&launch_root),
         )
+        .await
         .expect("explicit empty workdir should stay unset");
 
         assert_eq!(workdir, None);
     }
 
-    #[test]
-    fn schedule_workdir_preserves_existing_job_when_omitted() {
+    #[tokio::test]
+    async fn schedule_workdir_preserves_existing_job_when_omitted() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let launch_root = std::fs::canonicalize(tempdir.path()).expect("launch root should exist");
 
@@ -3621,13 +3690,14 @@ mod tests {
             false,
             &[launch_root],
         )
+        .await
         .expect("existing workdir should be preserved");
 
         assert_eq!(workdir, Some("C:/existing/workspace".to_owned()));
     }
 
-    #[test]
-    fn existing_schedule_without_workdir_stays_unset_when_omitted() {
+    #[tokio::test]
+    async fn existing_schedule_without_workdir_stays_unset_when_omitted() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let launch_root = std::fs::canonicalize(tempdir.path()).expect("launch root should exist");
 
@@ -3639,13 +3709,14 @@ mod tests {
             false,
             std::slice::from_ref(&launch_root),
         )
+        .await
         .expect("existing omitted workdir should preserve absent workdir");
 
         assert_eq!(workdir, None);
     }
 
-    #[test]
-    fn explicit_workspace_alias_workdir_maps_to_launch_workspace() {
+    #[tokio::test]
+    async fn explicit_workspace_alias_workdir_maps_to_launch_workspace() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let launch_root = std::fs::canonicalize(tempdir.path()).expect("launch root should exist");
 
@@ -3657,13 +3728,14 @@ mod tests {
             true,
             std::slice::from_ref(&launch_root),
         )
+        .await
         .expect("/workspace should map to launch root");
 
         assert_eq!(workdir, Some(launch_root.to_string_lossy().into_owned()));
     }
 
-    #[test]
-    fn explicit_workspace_child_workdir_maps_existing_subdirectory() {
+    #[tokio::test]
+    async fn explicit_workspace_child_workdir_maps_existing_subdirectory() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let reports = tempdir.path().join("reports");
         std::fs::create_dir_all(reports.as_path()).expect("reports directory should exist");
@@ -3679,13 +3751,14 @@ mod tests {
             true,
             &[launch_root],
         )
+        .await
         .expect("/workspace child should map to an existing launch-root child");
 
         assert_eq!(workdir, Some(expected.to_string_lossy().into_owned()));
     }
 
-    #[test]
-    fn explicit_relative_workdir_maps_existing_launch_subdirectory() {
+    #[tokio::test]
+    async fn explicit_relative_workdir_maps_existing_launch_subdirectory() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let project = tempdir.path().join("project");
         std::fs::create_dir_all(project.as_path()).expect("project directory should exist");
@@ -3701,6 +3774,7 @@ mod tests {
             true,
             &[launch_root],
         )
+        .await
         .expect("relative workdir should resolve under launch root");
 
         assert_eq!(workdir, Some(expected.to_string_lossy().into_owned()));
