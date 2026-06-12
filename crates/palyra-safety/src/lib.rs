@@ -677,22 +677,22 @@ pub fn redact_text_for_export(
     ExportRedactionOutcome { redacted_text, redacted, scan }
 }
 
-// AIDEV-NOTE: an empty `labels` iterator yields TrustedLocal. For
-// `merge_scan_results(&[])` that is a fail-open default (an unattributed merge
-// reads as trusted); fixing it to ExternalUntrusted/Mixed would change pinned
-// behavior, so it is left as-is and flagged here.
 fn combine_trust_labels(labels: impl IntoIterator<Item = TrustLabel>) -> TrustLabel {
     let mut saw_trusted = false;
     let mut saw_external = false;
     let mut saw_mixed = false;
+    let mut saw_any = false;
     for label in labels {
+        saw_any = true;
         match label {
             TrustLabel::TrustedLocal => saw_trusted = true,
             TrustLabel::ExternalUntrusted => saw_external = true,
             TrustLabel::Mixed => saw_mixed = true,
         }
     }
-    if saw_mixed || (saw_trusted && saw_external) {
+    if !saw_any {
+        TrustLabel::ExternalUntrusted
+    } else if saw_mixed || (saw_trusted && saw_external) {
         TrustLabel::Mixed
     } else if saw_external {
         TrustLabel::ExternalUntrusted
@@ -1491,24 +1491,31 @@ fn contains_prefixed_token(
     false
 }
 
-// AIDEV-NOTE: like `redact_bearer_token`, this only examines the FIRST
-// "bearer " occurrence; a line whose first bearer value is short (< 12 token
-// chars) but whose second is a real token is missed. Fixing requires scanning
-// all occurrences, which changes pinned detection/redaction outcomes.
 fn contains_bearer_token(text: &str) -> bool {
     // ASCII lowercasing preserves byte offsets, so `start` indexes `text` too.
     let lowered = text.to_ascii_lowercase();
-    let Some(start) = lowered.find("bearer ") else {
-        return false;
-    };
-    let mut tail = 0usize;
-    for ch in text[start + "bearer ".len()..].chars() {
-        if !is_token_char(ch) {
-            break;
+    let mut index = 0usize;
+    while index < text.len() {
+        let Some(relative_start) = lowered[index..].find("bearer ") else {
+            return false;
+        };
+        let token_start = index + relative_start + "bearer ".len();
+        let mut cursor = token_start;
+        let mut token_chars = 0usize;
+        while cursor < text.len() {
+            let ch = text[cursor..].chars().next().unwrap_or_default();
+            if !is_token_char(ch) {
+                break;
+            }
+            token_chars = token_chars.saturating_add(1);
+            cursor = cursor.saturating_add(ch.len_utf8());
         }
-        tail = tail.saturating_add(1);
+        if token_chars >= 12 {
+            return true;
+        }
+        index += relative_start + 1;
     }
-    tail >= 12
+    false
 }
 
 fn is_token_char(ch: char) -> bool {
@@ -1755,32 +1762,38 @@ fn redact_prefixed_token(
     output
 }
 
-// AIDEV-NOTE: only the FIRST "bearer " occurrence per line is redacted; a
-// second bearer token on the same line survives. See the matching note on
-// `contains_bearer_token` — fixing both is a behavior change.
 fn redact_bearer_token(input: String) -> String {
     let lowered = input.to_ascii_lowercase();
-    let Some(start) = lowered.find("bearer ") else {
-        return input;
-    };
-    let token_start = start + "bearer ".len();
-    let mut cursor = token_start;
-    let mut token_chars = 0usize;
-    while cursor < input.len() {
-        let ch = input[cursor..].chars().next().unwrap_or_default();
-        if !is_token_char(ch) {
-            break;
-        }
-        token_chars = token_chars.saturating_add(1);
-        cursor = cursor.saturating_add(ch.len_utf8());
-    }
-    if token_chars < 12 {
-        return input;
-    }
     let mut output = String::with_capacity(input.len());
-    output.push_str(&input[..token_start]);
-    output.push_str(REDACTED_SECRET);
-    output.push_str(&input[cursor..]);
+    let mut index = 0usize;
+    while index < input.len() {
+        if !lowered[index..].starts_with("bearer ") {
+            let ch = input[index..].chars().next().unwrap_or_default();
+            output.push(ch);
+            index = index.saturating_add(ch.len_utf8());
+            continue;
+        }
+        let token_start = index + "bearer ".len();
+        let mut cursor = token_start;
+        let mut token_chars = 0usize;
+        while cursor < input.len() {
+            let ch = input[cursor..].chars().next().unwrap_or_default();
+            if !is_token_char(ch) {
+                break;
+            }
+            token_chars = token_chars.saturating_add(1);
+            cursor = cursor.saturating_add(ch.len_utf8());
+        }
+        if token_chars >= 12 {
+            output.push_str(&input[index..token_start]);
+            output.push_str(REDACTED_SECRET);
+            index = cursor;
+        } else {
+            let ch = input[index..].chars().next().unwrap_or_default();
+            output.push(ch);
+            index = index.saturating_add(ch.len_utf8());
+        }
+    }
     output
 }
 
@@ -1967,6 +1980,25 @@ mod tests {
         assert!(outcome.redacted);
         assert!(outcome.redacted_text.contains("[REDACTED_SECRET]"));
         assert!(!outcome.redacted_text.contains("sk-test-secret-token-value"));
+        assert_eq!(outcome.scan.recommended_action, SafetyAction::Redact);
+    }
+
+    #[test]
+    fn later_bearer_tokens_are_detected_and_redacted() {
+        let outcome = redact_text_for_export(
+            "model saw Bearer short and Bearer Bearer abcdefghijklmnop",
+            SafetySourceKind::HttpFetch,
+            SafetyContentKind::HttpResponse,
+            TrustLabel::ExternalUntrusted,
+        );
+
+        assert!(outcome.redacted);
+        assert_eq!(
+            outcome.redacted_text,
+            "model saw Bearer short and Bearer Bearer [REDACTED_SECRET]"
+        );
+        assert!(!outcome.redacted_text.contains("abcdefghijklmnop"));
+        assert!(outcome.scan.finding_codes().iter().any(|code| code == "secret_leak.token.bearer"));
         assert_eq!(outcome.scan.recommended_action, SafetyAction::Redact);
     }
 
@@ -2573,6 +2605,20 @@ mod tests {
         assert_eq!(merged.trust_label, TrustLabel::Mixed);
         assert_eq!(merged.recommended_action, SafetyAction::Annotate);
         assert!(!merged.findings.is_empty());
+    }
+
+    #[test]
+    fn empty_scan_merge_is_attributed_as_external_untrusted() {
+        let merged = merge_scan_results(
+            SafetyPhase::PrePrompt,
+            SafetySourceKind::Unknown,
+            SafetyContentKind::PlainText,
+            &[],
+        );
+
+        assert_eq!(merged.trust_label, TrustLabel::ExternalUntrusted);
+        assert_eq!(merged.recommended_action, SafetyAction::Allow);
+        assert!(merged.findings.is_empty());
     }
 
     #[test]
