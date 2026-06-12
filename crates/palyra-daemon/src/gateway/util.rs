@@ -173,7 +173,7 @@ mod tests {
 
     #[test]
     fn redact_session_id_handles_multibyte_input() {
-        assert_eq!(redact_session_id("áβçďEFGHíjkl"), "áβçď***íjkl");
-        assert_eq!(redact_session_id("áβçďEFGH"), "***");
+        assert_eq!(redact_session_id("αβγδEFGHικλμ"), "αβγδ***ικλμ");
+        assert_eq!(redact_session_id("αβγδEFGH"), "***");
     }
 }
