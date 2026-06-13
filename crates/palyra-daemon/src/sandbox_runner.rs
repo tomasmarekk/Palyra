@@ -4736,6 +4736,7 @@ fn build_process_command(
             workspace_root,
         );
         apply_process_env_overrides(&mut command, input);
+        configure_wsl_path_env_bridge(&mut command, input.command.as_str(), program.as_path());
         return Ok(command);
     }
 
@@ -4784,6 +4785,7 @@ fn build_process_command(
         policy,
     );
     apply_process_env_overrides(&mut command, input);
+    configure_wsl_path_env_bridge(&mut command, input.command.as_str(), program.as_path());
     Ok(command)
 }
 
@@ -4793,6 +4795,79 @@ fn apply_process_env_overrides(command: &mut Command, input: &ProcessRunnerInput
     for (key, value) in &input.env {
         command.env(key, value);
     }
+}
+
+#[cfg(windows)]
+fn configure_wsl_path_env_bridge(command: &mut Command, process_command: &str, program: &Path) {
+    if !windows_program_is_wsl_launcher(process_command, program) {
+        return;
+    }
+    let mut entries = command_env_value(command, "WSLENV")
+        .map(|value| {
+            value
+                .split(':')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for key in HOST_ACCESS_SAFE_PALYRA_ENV_KEYS {
+        if command_env_value(command, key).is_some() {
+            ensure_wslenv_path_entry(&mut entries, key);
+        }
+    }
+    if !entries.is_empty() {
+        command.env("WSLENV", entries.join(":"));
+    }
+}
+
+#[cfg(not(windows))]
+fn configure_wsl_path_env_bridge(_command: &mut Command, _process_command: &str, _program: &Path) {}
+
+#[cfg(windows)]
+fn command_env_value(command: &Command, requested_key: &str) -> Option<String> {
+    command.get_envs().find_map(|(key, value)| {
+        if !key.to_string_lossy().eq_ignore_ascii_case(requested_key) {
+            return None;
+        }
+        value.map(|value| value.to_string_lossy().into_owned())
+    })
+}
+
+#[cfg(windows)]
+fn ensure_wslenv_path_entry(entries: &mut Vec<String>, requested_key: &str) {
+    for entry in entries.iter_mut() {
+        let matches_key =
+            entry.split('/').next().is_some_and(|key| key.eq_ignore_ascii_case(requested_key));
+        if !matches_key {
+            continue;
+        }
+        let has_path_flag = entry
+            .split_once('/')
+            .is_some_and(|(_, flags)| flags.chars().any(|flag| matches!(flag, 'p' | 'P')));
+        if !has_path_flag {
+            if entry.contains('/') {
+                entry.push('p');
+            } else {
+                entry.push_str("/p");
+            }
+        }
+        return;
+    }
+    entries.push(format!("{requested_key}/p"));
+}
+
+#[cfg(windows)]
+fn windows_program_is_wsl_launcher(process_command: &str, program: &Path) -> bool {
+    let command = normalized_process_command_name(process_command);
+    if matches!(command.as_str(), "bash" | "wsl") {
+        return true;
+    }
+    program
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("bash") || stem.eq_ignore_ascii_case("wsl"))
 }
 
 fn build_tier_b_process_command(
@@ -6749,6 +6824,56 @@ mod tests {
         );
         assert_eq!(env.get(NODE_DISABLE_COMPILE_CACHE_ENV).and_then(Option::as_deref), Some("1"));
         assert!(env.contains_key("PATH"), "host-access process should keep a usable PATH");
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn host_access_wsl_bash_bridges_safe_path_env_through_wslenv() {
+        let workspace = unique_temp_dir("workspace-host-wsl-env");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        let e2e_home = workspace.join("fixture-home");
+        let e2e_os_root = workspace.join("fixture-os-root");
+        fs::create_dir_all(e2e_home.as_path()).expect("fixture home should exist");
+        fs::create_dir_all(e2e_os_root.as_path()).expect("fixture OS root should exist");
+        let policy = host_access_policy(workspace.clone());
+        let input = ProcessRunnerInput {
+            command: "bash".to_owned(),
+            args: vec!["scripts/show-env.sh".to_owned()],
+            cwd: None,
+            env: BTreeMap::from([
+                ("PALYRA_E2E_HOME".to_owned(), e2e_home.to_string_lossy().into_owned()),
+                ("PALYRA_E2E_OS_ROOT".to_owned(), e2e_os_root.to_string_lossy().into_owned()),
+            ]),
+            requested_egress_hosts: Vec::new(),
+            timeout_ms: None,
+            background: false,
+        };
+
+        let command =
+            build_process_command(&policy, &input, workspace.as_path(), workspace.as_path())
+                .expect("host access bash command should build");
+        let env = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let wslenv = env
+            .get("WSLENV")
+            .and_then(Option::as_deref)
+            .expect("WSL path env bridge should be configured for bash");
+
+        assert_eq!(
+            env.get("PALYRA_E2E_HOME").and_then(Option::as_deref),
+            Some(e2e_home.to_string_lossy().as_ref())
+        );
+        assert!(wslenv.split(':').any(|entry| entry == "PALYRA_E2E_HOME/p"), "{wslenv}");
+        assert!(wslenv.split(':').any(|entry| entry == "PALYRA_E2E_OS_ROOT/p"), "{wslenv}");
 
         let _ = fs::remove_dir_all(workspace.as_path());
     }
