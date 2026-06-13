@@ -3174,6 +3174,7 @@ fn rewrite_host_access_process_args(
         .collect()
 }
 
+#[cfg(test)]
 fn rewrite_host_virtual_workspace_args(
     args: &[String],
     workspace_root: &Path,
