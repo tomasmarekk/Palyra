@@ -3307,6 +3307,7 @@ async fn execute_single_job_attempt(
     let mut tool_calls = 0_u64;
     let mut tool_denies = 0_u64;
     let mut successful_completion_tools = 0_u64;
+    let mut successful_noop_observation_tools = 0_u64;
     let mut completion_candidates_by_proposal = HashMap::<String, CronCompletionCandidate>::new();
     while let Some(event) = stream.next().await {
         let event =
@@ -3325,18 +3326,22 @@ async fn execute_single_job_attempt(
             }
             Some(common_v1::run_stream_event::Body::ToolResult(result)) => {
                 tool_calls = tool_calls.saturating_add(1);
-                if result.success
-                    && result
-                        .proposal_id
-                        .as_ref()
-                        .and_then(|proposal_id| {
-                            completion_candidates_by_proposal.get(proposal_id.ulid.as_str())
-                        })
-                        .is_some_and(|candidate| {
-                            candidate.is_confirmed_by_output(result.output_json.as_slice())
-                        })
-                {
-                    successful_completion_tools = successful_completion_tools.saturating_add(1);
+                if result.success {
+                    let candidate = result.proposal_id.as_ref().and_then(|proposal_id| {
+                        completion_candidates_by_proposal.get(proposal_id.ulid.as_str())
+                    });
+                    if candidate.is_some_and(|candidate| {
+                        candidate.is_confirmed_by_output(result.output_json.as_slice())
+                    }) {
+                        successful_completion_tools = successful_completion_tools.saturating_add(1);
+                    }
+                    if candidate.is_some_and(|candidate| {
+                        candidate
+                            .is_noop_observation_confirmed_by_output(result.output_json.as_slice())
+                    }) {
+                        successful_noop_observation_tools =
+                            successful_noop_observation_tools.saturating_add(1);
+                    }
                 }
             }
             Some(common_v1::run_stream_event::Body::ToolDecision(decision))
@@ -3364,17 +3369,21 @@ async fn execute_single_job_attempt(
         .unwrap_or_else(|| fallback_usage_snapshot(&orchestrator_run_id, &session_id, job));
 
     let requires_completion_tool = cron_job_requires_completion_tool(job);
+    let allows_read_only_noop_success = cron_job_allows_read_only_noop_success(job);
     let terminal_status = cron_terminal_status_from_stream(
         saw_done,
         saw_failed,
         tool_denies,
         successful_completion_tools,
         requires_completion_tool,
+        allows_read_only_noop_success,
+        successful_noop_observation_tools,
     );
     let missing_required_completion_tool = saw_done
         && terminal_status == CronRunStatus::Failed
         && requires_completion_tool
         && successful_completion_tools == 0
+        && !(allows_read_only_noop_success && successful_noop_observation_tools > 0)
         && tool_denies == 0;
 
     let error_kind = if terminal_status == CronRunStatus::Succeeded {
@@ -3426,12 +3435,17 @@ fn cron_terminal_status_from_stream(
     tool_denies: u64,
     successful_completion_tools: u64,
     requires_completion_tool: bool,
+    allows_read_only_noop_success: bool,
+    successful_noop_observation_tools: u64,
 ) -> CronRunStatus {
     if saw_done {
         if tool_denies > 0 && successful_completion_tools == 0 {
             return CronRunStatus::Denied;
         }
         if requires_completion_tool && successful_completion_tools == 0 {
+            if allows_read_only_noop_success && successful_noop_observation_tools > 0 {
+                return CronRunStatus::Succeeded;
+            }
             return CronRunStatus::Failed;
         }
         return CronRunStatus::Succeeded;
@@ -3448,6 +3462,15 @@ fn cron_job_requires_completion_tool(job: &CronJobRecord) -> bool {
     let prompt = format!("{} {}", job.name, job.prompt).to_ascii_lowercase();
     cron_prompt_mentions_side_effect(prompt.as_str())
         && cron_prompt_mentions_file_or_workspace_target(prompt.as_str())
+}
+
+/// Returns true for side-effect routines that explicitly declare a valid
+/// idempotent no-op branch, such as "no new items, do not modify the file".
+fn cron_job_allows_read_only_noop_success(job: &CronJobRecord) -> bool {
+    let prompt = format!("{} {}", job.name, job.prompt).to_ascii_lowercase();
+    cron_prompt_mentions_side_effect(prompt.as_str())
+        && cron_prompt_mentions_file_or_workspace_target(prompt.as_str())
+        && cron_prompt_mentions_read_only_noop_success(prompt.as_str())
 }
 
 fn cron_prompt_mentions_side_effect(prompt: &str) -> bool {
@@ -3477,18 +3500,46 @@ fn cron_prompt_mentions_file_or_workspace_target(prompt: &str) -> bool {
     .any(|needle| prompt.contains(needle))
 }
 
+fn cron_prompt_mentions_read_only_noop_success(prompt: &str) -> bool {
+    [
+        "no new",
+        "no changes",
+        "no-op",
+        "noop",
+        "idempotent",
+        "dedupe",
+        "already-known",
+        "already known",
+        "skip already",
+        "do not modify",
+        "without modifying",
+        "do not update",
+        "without updating",
+        "bez nove",
+        "bez zmen",
+    ]
+    .iter()
+    .any(|needle| prompt.contains(needle))
+}
+
 /// Whether a proposed tool call can serve as completion evidence, and whether
 /// a backgrounded result must be rejected (a background process does not
 /// prove the side effect actually happened).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CronCompletionCandidate {
     completion_surface: bool,
+    noop_observation_surface: bool,
     reject_background_output: bool,
 }
 
 impl CronCompletionCandidate {
     fn is_confirmed_by_output(self, output_json: &[u8]) -> bool {
         self.completion_surface
+            && (!self.reject_background_output || !cron_tool_output_is_background(output_json))
+    }
+
+    fn is_noop_observation_confirmed_by_output(self, output_json: &[u8]) -> bool {
+        self.noop_observation_surface
             && (!self.reject_background_output || !cron_tool_output_is_background(output_json))
     }
 }
@@ -3504,7 +3555,6 @@ fn cron_completion_candidate_for_tool_proposal(
     if matches!(
         tool_name,
         "palyra.fs.apply_patch"
-            | "palyra.fs.os_file"
             | "palyra.memory.retain"
             | "palyra.retain"
             | "palyra.memory.delete"
@@ -3514,6 +3564,14 @@ fn cron_completion_candidate_for_tool_proposal(
     ) {
         return CronCompletionCandidate {
             completion_surface: true,
+            noop_observation_surface: false,
+            reject_background_output: false,
+        };
+    }
+    if tool_name == "palyra.fs.os_file" && cron_os_file_operation_is_mutation(input_json) {
+        return CronCompletionCandidate {
+            completion_surface: true,
+            noop_observation_surface: false,
             reject_background_output: false,
         };
     }
@@ -3522,10 +3580,22 @@ fn cron_completion_candidate_for_tool_proposal(
     {
         return CronCompletionCandidate {
             completion_surface: true,
+            noop_observation_surface: false,
             reject_background_output: true,
         };
     }
-    CronCompletionCandidate { completion_surface: false, reject_background_output: false }
+    if cron_tool_call_is_noop_observation_candidate(tool_name, input_json) {
+        return CronCompletionCandidate {
+            completion_surface: false,
+            noop_observation_surface: true,
+            reject_background_output: tool_name == crate::gateway::PROCESS_RUNNER_TOOL_NAME,
+        };
+    }
+    CronCompletionCandidate {
+        completion_surface: false,
+        noop_observation_surface: false,
+        reject_background_output: false,
+    }
 }
 
 fn cron_process_run_is_foreground_side_effect_candidate(input_json: &[u8]) -> bool {
@@ -3542,6 +3612,56 @@ fn cron_process_run_is_foreground_side_effect_candidate(input_json: &[u8]) -> bo
         return false;
     };
     !cron_process_run_command_is_read_only(command)
+}
+
+fn cron_tool_call_is_noop_observation_candidate(tool_name: &str, input_json: &[u8]) -> bool {
+    if matches!(tool_name, "palyra.fs.read_file" | "palyra.fs.list_dir" | "palyra.fs.search") {
+        return true;
+    }
+    if tool_name == "palyra.fs.os_file" {
+        return cron_os_file_operation_is_read_only(input_json);
+    }
+    if tool_name == crate::gateway::PROCESS_RUNNER_TOOL_NAME {
+        return cron_process_run_is_foreground_read_only_candidate(input_json);
+    }
+    false
+}
+
+fn cron_os_file_operation_is_read_only(input_json: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(input_json)
+        .ok()
+        .and_then(|value| value.get("operation").and_then(Value::as_str).map(str::to_owned))
+        .is_some_and(|operation| {
+            matches!(operation.as_str(), "stat" | "read" | "list_dir" | "search")
+        })
+}
+
+fn cron_os_file_operation_is_mutation(input_json: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(input_json)
+        .ok()
+        .and_then(|value| value.get("operation").and_then(Value::as_str).map(str::to_owned))
+        .is_some_and(|operation| {
+            matches!(
+                operation.as_str(),
+                "write" | "copy" | "move" | "delete_file" | "delete_empty_dir" | "mkdir"
+            )
+        })
+}
+
+fn cron_process_run_is_foreground_read_only_candidate(input_json: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<Value>(input_json) else {
+        return false;
+    };
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if object.get("background").and_then(Value::as_bool).unwrap_or(false) {
+        return false;
+    }
+    let Some(command) = object.get("command").and_then(Value::as_str).map(str::trim) else {
+        return false;
+    };
+    cron_process_run_command_is_read_only(command)
 }
 
 fn cron_process_run_command_is_read_only(command: &str) -> bool {
@@ -3812,13 +3932,13 @@ mod tests {
     use super::{
         budgeted_cron_run_count, budgeted_objective_run_count, build_cron_prompt,
         build_scheduler_health_snapshot, compute_misfire_recovery_plan, compute_next_run_after,
-        cron_completion_candidate_for_tool_proposal, cron_job_requires_completion_tool,
-        cron_misfire_audit_payload, cron_terminal_status_from_stream, decide_concurrency_policy,
-        effective_cron_session_key, effective_cron_session_label,
-        load_periodic_reaudit_skills_index, max_runs_for_job, merged_parameter_delta_json,
-        normalize_schedule, now_unix_ms_or_fallback, parse_skill_reaudit_interval,
-        periodic_reaudit_targets, reserved_cron_run_slot_count, routine_approval_subject_id,
-        routine_parameter_delta_json, routines_automation_enabled,
+        cron_completion_candidate_for_tool_proposal, cron_job_allows_read_only_noop_success,
+        cron_job_requires_completion_tool, cron_misfire_audit_payload,
+        cron_terminal_status_from_stream, decide_concurrency_policy, effective_cron_session_key,
+        effective_cron_session_label, load_periodic_reaudit_skills_index, max_runs_for_job,
+        merged_parameter_delta_json, normalize_schedule, now_unix_ms_or_fallback,
+        parse_skill_reaudit_interval, periodic_reaudit_targets, reserved_cron_run_slot_count,
+        routine_approval_subject_id, routine_parameter_delta_json, routines_automation_enabled,
         scheduled_routine_requires_first_run_approval, scheduled_routine_run_metadata_upsert,
         scheduler_attempt_failure, scheduler_retry_backoff_delay_ms,
         should_disable_exhausted_scheduled_one_shot,
@@ -4402,22 +4522,32 @@ mod tests {
     #[test]
     fn cron_terminal_status_uses_structured_completion_tools_for_done_runs() {
         assert_eq!(
-            cron_terminal_status_from_stream(true, false, 1, 0, false),
+            cron_terminal_status_from_stream(true, false, 1, 0, false, false, 0),
             CronRunStatus::Denied,
         );
         assert_eq!(
-            cron_terminal_status_from_stream(true, false, 1, 1, true),
+            cron_terminal_status_from_stream(true, false, 1, 1, true, false, 0),
             CronRunStatus::Succeeded,
             "model text must not spoof policy denial after a structured completion tool succeeds",
         );
         assert_eq!(
-            cron_terminal_status_from_stream(true, false, 0, 0, false),
+            cron_terminal_status_from_stream(true, false, 0, 0, false, false, 0),
             CronRunStatus::Succeeded,
         );
         assert_eq!(
-            cron_terminal_status_from_stream(true, false, 0, 0, true),
+            cron_terminal_status_from_stream(true, false, 0, 0, true, false, 0),
             CronRunStatus::Failed,
             "file/workspace side-effect routines must not succeed without a completion tool",
+        );
+        assert_eq!(
+            cron_terminal_status_from_stream(true, false, 0, 0, true, true, 0),
+            CronRunStatus::Failed,
+            "read-only no-op routines still need structured observation evidence",
+        );
+        assert_eq!(
+            cron_terminal_status_from_stream(true, false, 0, 0, true, true, 1),
+            CronRunStatus::Succeeded,
+            "idempotent no-op routines can succeed after a confirmed read-only observation",
         );
     }
 
@@ -4439,20 +4569,51 @@ mod tests {
             !cron_job_requires_completion_tool(&text_job),
             "text-only routines should still be able to succeed from a final response"
         );
+
+        let mut dedupe_job =
+            sample_every_job("01ARZ3NDEKTSV4RRFFQ69G5FAX", Some(1_000), CronMisfirePolicy::Skip);
+        dedupe_job.prompt = concat!(
+            "Read feed/items.json and append only new ids to reports/feed.md. ",
+            "If there are no new ids, skip already-known ids without modifying the file."
+        )
+        .to_owned();
+        assert!(
+            cron_job_requires_completion_tool(&dedupe_job),
+            "dedupe routines still require mutation evidence when they change files"
+        );
+        assert!(
+            cron_job_allows_read_only_noop_success(&dedupe_job),
+            "dedupe routines can succeed from read-only evidence when no update is needed"
+        );
     }
 
     #[test]
     fn cron_completion_tools_are_explicit_mutation_surfaces() {
         assert!(cron_completion_candidate_for_tool_proposal("palyra.fs.apply_patch", b"{}")
             .is_confirmed_by_output(b"{}"));
-        assert!(cron_completion_candidate_for_tool_proposal("palyra.fs.os_file", b"{}")
-            .is_confirmed_by_output(b"{}"));
+        assert!(cron_completion_candidate_for_tool_proposal(
+            "palyra.fs.os_file",
+            br#"{"operation":"write"}"#
+        )
+        .is_confirmed_by_output(b"{}"));
         assert!(cron_completion_candidate_for_tool_proposal("palyra.memory.retain", b"{}")
             .is_confirmed_by_output(b"{}"));
         assert!(cron_completion_candidate_for_tool_proposal("palyra.retain", b"{}")
             .is_confirmed_by_output(b"{}"));
         assert!(!cron_completion_candidate_for_tool_proposal("palyra.fs.read_file", b"{}")
             .is_confirmed_by_output(b"{}"));
+        assert!(cron_completion_candidate_for_tool_proposal("palyra.fs.read_file", b"{}")
+            .is_noop_observation_confirmed_by_output(b"{}"));
+        assert!(cron_completion_candidate_for_tool_proposal(
+            "palyra.fs.os_file",
+            br#"{"operation":"read"}"#
+        )
+        .is_noop_observation_confirmed_by_output(b"{}"));
+        assert!(!cron_completion_candidate_for_tool_proposal(
+            "palyra.fs.os_file",
+            br#"{"operation":"read"}"#
+        )
+        .is_confirmed_by_output(b"{}"));
 
         let process_script =
             br#"{"command":"node","args":["scripts/update-feed.js"],"background":false}"#;
@@ -4462,6 +4623,8 @@ mod tests {
         let read_only = br#"{"command":"rg","args":["feed-001","reports/feed.md"]}"#;
         assert!(!cron_completion_candidate_for_tool_proposal("palyra.process.run", read_only)
             .is_confirmed_by_output(br#"{"background":false,"exit_code":0}"#));
+        assert!(cron_completion_candidate_for_tool_proposal("palyra.process.run", read_only)
+            .is_noop_observation_confirmed_by_output(br#"{"background":false,"exit_code":0}"#));
 
         let background = br#"{"command":"node","args":["server.js"],"background":true}"#;
         assert!(!cron_completion_candidate_for_tool_proposal("palyra.process.run", background)
@@ -4535,7 +4698,7 @@ mod tests {
     fn model_induced_tool_denials_do_not_pause_recurring_jobs() {
         let every_job =
             sample_every_job("01ARZ3NDEKTSV4RRFFQ69G5FAV", Some(1_000), CronMisfirePolicy::Skip);
-        let terminal_status = cron_terminal_status_from_stream(true, false, 1, 0, false);
+        let terminal_status = cron_terminal_status_from_stream(true, false, 1, 0, false, false, 0);
 
         assert_eq!(terminal_status, CronRunStatus::Denied);
         assert!(!should_pause_recurring_cron_after_policy_denied(
