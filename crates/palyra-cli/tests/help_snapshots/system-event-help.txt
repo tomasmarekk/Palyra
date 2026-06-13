@@ -1,6 +1,6 @@
 List or emit system events
 
-Usage: palyra system event [OPTIONS] <COMMAND>
+Usage: palyra system event [OPTIONS] [COMMAND]
 
 Commands:
   list  List recent system events
