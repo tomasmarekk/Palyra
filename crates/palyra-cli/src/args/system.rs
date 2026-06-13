@@ -24,7 +24,7 @@ pub enum SystemCommand {
     #[command(visible_alias = "events", about = "List or emit system events")]
     Event {
         #[command(subcommand)]
-        command: SystemEventCommand,
+        command: Option<SystemEventCommand>,
     },
 }
 

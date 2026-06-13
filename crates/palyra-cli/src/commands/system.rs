@@ -39,7 +39,9 @@ async fn run_system_async(command: SystemCommand) -> Result<()> {
             let payload = context.client.get_json_value("console/v1/system/insights").await?;
             emit_system_insights(&payload, output::preferred_json(json))
         }
-        SystemCommand::Event { command } => match command {
+        SystemCommand::Event { command } => match command
+            .unwrap_or(SystemEventCommand::List { limit: None, json: false })
+        {
             SystemEventCommand::List { limit, json } => {
                 let payload =
                     context.client.get_json_value(build_system_event_list_path(limit)).await?;

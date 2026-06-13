@@ -2761,9 +2761,15 @@ fn parse_system_commands() {
         events.command,
         Command::System {
             command: SystemCommand::Event {
-                command: SystemEventCommand::List { limit: Some(25), json: false }
+                command: Some(SystemEventCommand::List { limit: Some(25), json: false })
             }
         }
+    );
+
+    let default_events = Cli::parse_from(["palyra", "system", "events"]);
+    assert_eq!(
+        default_events.command,
+        Command::System { command: SystemCommand::Event { command: None } }
     );
 
     let emit = Cli::parse_from([
@@ -2783,13 +2789,13 @@ fn parse_system_commands() {
         emit.command,
         Command::System {
             command: SystemCommand::Event {
-                command: SystemEventCommand::Emit {
+                command: Some(SystemEventCommand::Emit {
                     event: "operator.heartbeat".to_owned(),
                     message: Some("manual probe".to_owned()),
                     severity: SystemEventSeverityArg::Warn,
                     tag: vec!["ops".to_owned()],
                     json: false,
-                }
+                })
             }
         }
     );
