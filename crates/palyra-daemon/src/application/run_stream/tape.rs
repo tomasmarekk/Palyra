@@ -45,6 +45,8 @@ pub(crate) const RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE: &str =
 pub(crate) enum ToolResultCompactionOutcome {
     /// Compaction was not attempted (no results, or already emitted this run).
     Skipped,
+    /// Compaction was attempted but there was not enough history to reduce.
+    SkippedNotEnoughHistory,
     /// Compaction ran and a checkpoint artifact was written.
     Applied,
     /// Compaction was attempted but the preview declared it ineligible.
@@ -57,6 +59,7 @@ impl ToolResultCompactionOutcome {
     pub(crate) const fn progress_phase(self) -> Option<&'static str> {
         match self {
             Self::Skipped => None,
+            Self::SkippedNotEnoughHistory => Some("session.compaction.tool_results.skipped"),
             Self::Applied => Some("session.compaction.tool_results.applied"),
             Self::Blocked => Some("session.compaction.tool_results.blocked"),
         }
@@ -556,9 +559,9 @@ pub(crate) async fn compact_model_token_tape(
 /// Attempts at most one tool-result-driven context compaction per run.
 ///
 /// Guarded by `compaction_emitted` (run-scoped cooldown): only the first
-/// non-empty tool-result batch can trigger an applied compaction. The
+/// non-empty tool-result batch can trigger a compaction decision. The
 /// preview/apply decision is recorded as a `session.compaction` tape event in
-/// both the applied and blocked cases.
+/// applied, skipped, and blocked cases.
 ///
 /// # Errors
 ///
@@ -600,6 +603,7 @@ pub(crate) async fn maybe_compact_context_after_tool_results(
         Some(trigger_policy),
     )
     .await?;
+    *compaction_emitted = true;
     let (payload_json, outcome) = if preview.eligible {
         let execution = apply_session_compaction(SessionCompactionApplyRequest {
             runtime_state,
@@ -613,7 +617,6 @@ pub(crate) async fn maybe_compact_context_after_tool_results(
             reject_candidate_ids: &[],
         })
         .await?;
-        *compaction_emitted = true;
         let payload_json = json!({
             "event": "session.compaction.tool_results.applied",
             "artifact_id": execution.artifact.artifact_id,
@@ -643,6 +646,29 @@ pub(crate) async fn maybe_compact_context_after_tool_results(
         })
         .to_string();
         (payload_json, ToolResultCompactionOutcome::Applied)
+    } else if preview.blocked_reason.as_deref() == Some("not_enough_history") {
+        let payload_json = json!({
+            "event": "session.compaction.tool_results.skipped",
+            "policy": trigger_policy,
+            "trigger_reason": trigger_reason,
+            "tool_result_count": tool_result_count,
+            "source_refs": [
+                {
+                    "kind": "tool_result_batch",
+                    "count": tool_result_count,
+                },
+                {
+                    "kind": "session_transcript",
+                    "count": preview.source_event_count,
+                }
+            ],
+            "skip_reason": "not_enough_history",
+            "estimated_input_tokens": preview.estimated_input_tokens,
+            "estimated_output_tokens": preview.estimated_output_tokens,
+            "fallback_reason": "deterministic_context_compressor",
+        })
+        .to_string();
+        (payload_json, ToolResultCompactionOutcome::SkippedNotEnoughHistory)
     } else {
         let payload_json = json!({
             "event": "session.compaction.tool_results.blocked",
@@ -1345,6 +1371,7 @@ mod tests {
     use super::{
         redact_run_stream_text, redacted_run_stream_output_json,
         should_attempt_tool_result_compaction, status_tape_payload, tool_result_tape_payload,
+        ToolResultCompactionOutcome,
     };
     use crate::{
         gateway::CANCELLED_REASON, transport::grpc::proto::palyra::common::v1 as common_v1,
@@ -1355,6 +1382,14 @@ mod tests {
         assert!(!should_attempt_tool_result_compaction(0, false));
         assert!(should_attempt_tool_result_compaction(1, false));
         assert!(!should_attempt_tool_result_compaction(1, true));
+    }
+
+    #[test]
+    fn not_enough_history_compaction_outcome_is_reported_as_skipped() {
+        assert_eq!(
+            ToolResultCompactionOutcome::SkippedNotEnoughHistory.progress_phase(),
+            Some("session.compaction.tool_results.skipped")
+        );
     }
 
     #[test]

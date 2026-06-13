@@ -5807,6 +5807,7 @@ async fn grpc_run_stream_reports_partial_summary_when_provider_timeout_follows_t
         progress_statuses.iter().any(|status| {
             status == "progress:session.compaction.tool_results.applied"
                 || status == "progress:session.compaction.tool_results.blocked"
+                || status == "progress:session.compaction.tool_results.skipped"
         }),
         "run should expose the compaction outcome before the next provider turn: {progress_statuses:?}"
     );

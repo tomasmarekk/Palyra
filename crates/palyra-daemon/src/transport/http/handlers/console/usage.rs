@@ -481,6 +481,7 @@ pub(crate) struct OperatorCompactionInsight {
     summary: String,
     preview_events: usize,
     created_events: usize,
+    actionable_blocked_events: usize,
     dry_run_events: usize,
     avg_token_delta: i64,
     avg_reduction_bps: u32,
@@ -1605,6 +1606,7 @@ struct OperatorTapeAggregation {
     compaction_preview_events: usize,
     compaction_created_events: usize,
     compaction_blocked_events: usize,
+    compaction_actionable_blocked_events: usize,
     compaction_dry_run_events: usize,
     compaction_events: usize,
     compaction_total_token_delta: i128,
@@ -1966,6 +1968,12 @@ fn accumulate_operator_tape_event(
             if event_name.contains("blocked") {
                 aggregation.compaction_blocked_events =
                     aggregation.compaction_blocked_events.saturating_add(1);
+                if compaction_blocked_reason_requires_action(
+                    payload.get("blocked_reason").and_then(Value::as_str),
+                ) {
+                    aggregation.compaction_actionable_blocked_events =
+                        aggregation.compaction_actionable_blocked_events.saturating_add(1);
+                }
             }
             if payload.get("dry_run").and_then(Value::as_bool).unwrap_or(false) {
                 aggregation.compaction_dry_run_events =
@@ -2162,10 +2170,13 @@ fn build_operator_compaction_insight(
         .checked_div(aggregation.compaction_total_input_tokens)
         .unwrap_or(0)
         .min(u128::from(u32::MAX)) as u32;
-    let (state, severity, recommended_action) = if aggregation.compaction_blocked_events > 0
-        || (aggregation.compaction_preview_events > 0
-            && aggregation.compaction_created_events == 0
-            && aggregation.compaction_dry_run_events == 0)
+    let unresolved_preview_without_outcome = aggregation.compaction_preview_events > 0
+        && aggregation.compaction_created_events == 0
+        && aggregation.compaction_dry_run_events == 0
+        && aggregation.compaction_blocked_events == 0;
+    let (state, severity, recommended_action) = if aggregation.compaction_actionable_blocked_events
+        > 0
+        || unresolved_preview_without_outcome
     {
         (
             "degraded",
@@ -2186,14 +2197,16 @@ fn build_operator_compaction_insight(
         state: state.to_owned(),
         severity: severity.to_owned(),
         summary: format!(
-            "preview_events={} created_events={} blocked_events={} avg_reduction_bps={}",
+            "preview_events={} created_events={} blocked_events={} actionable_blocked_events={} avg_reduction_bps={}",
             aggregation.compaction_preview_events,
             aggregation.compaction_created_events,
             aggregation.compaction_blocked_events,
+            aggregation.compaction_actionable_blocked_events,
             avg_reduction_bps
         ),
         preview_events: aggregation.compaction_preview_events,
         created_events: aggregation.compaction_created_events,
+        actionable_blocked_events: aggregation.compaction_actionable_blocked_events,
         dry_run_events: aggregation.compaction_dry_run_events,
         avg_token_delta,
         avg_reduction_bps,
@@ -2206,6 +2219,10 @@ fn build_operator_compaction_insight(
             "/control/usage",
         ),
     }
+}
+
+fn compaction_blocked_reason_requires_action(reason: Option<&str>) -> bool {
+    !matches!(reason.map(str::trim), Some("not_enough_history"))
 }
 
 fn build_operator_safety_boundary_insight(
@@ -2935,8 +2952,11 @@ fn build_operator_hotspots(sources: OperatorHotspotSources<'_>) -> Vec<OperatorI
             compaction.severity.as_str(),
             compaction.summary.as_str(),
             format!(
-                "preview_events={} created_events={} avg_reduction_bps={}",
-                compaction.preview_events, compaction.created_events, compaction.avg_reduction_bps
+                "preview_events={} created_events={} actionable_blocked_events={} avg_reduction_bps={}",
+                compaction.preview_events,
+                compaction.created_events,
+                compaction.actionable_blocked_events,
+                compaction.avg_reduction_bps
             ),
             compaction.recommended_action.clone(),
             compaction.drill_down.clone(),
@@ -3817,6 +3837,39 @@ mod tests {
         assert_eq!(insight.avg_token_delta, 30);
     }
 
+    #[test]
+    fn compaction_not_enough_history_blockers_do_not_degrade_insight() {
+        let aggregation = OperatorTapeAggregation {
+            compaction_preview_events: 8,
+            compaction_blocked_events: 8,
+            compaction_actionable_blocked_events: 0,
+            compaction_events: 8,
+            ..OperatorTapeAggregation::default()
+        };
+
+        let insight = build_operator_compaction_insight(&aggregation);
+
+        assert_eq!(insight.state, "ok");
+        assert_eq!(insight.severity, "info");
+        assert!(insight.summary.contains("actionable_blocked_events=0"));
+    }
+
+    #[test]
+    fn compaction_actionable_blockers_degrade_insight() {
+        let aggregation = OperatorTapeAggregation {
+            compaction_preview_events: 1,
+            compaction_blocked_events: 1,
+            compaction_actionable_blocked_events: 1,
+            compaction_events: 1,
+            ..OperatorTapeAggregation::default()
+        };
+
+        let insight = build_operator_compaction_insight(&aggregation);
+
+        assert_eq!(insight.state, "degraded");
+        assert_eq!(insight.severity, "warning");
+    }
+
     fn test_operations(
         state: &str,
         severity: &str,
@@ -3921,6 +3974,7 @@ mod tests {
             summary: summary.to_owned(),
             preview_events: 0,
             created_events: 0,
+            actionable_blocked_events: 0,
             dry_run_events: 0,
             avg_token_delta: 0,
             avg_reduction_bps: 0,
