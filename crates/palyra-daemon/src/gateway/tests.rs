@@ -49,8 +49,9 @@ use super::vault::vault_get_requires_approval;
 use super::{
     approval_failure_decision, best_effort_mark_approval_error, common_v1, constant_time_eq,
     enforce_vault_get_approval_policy, enforce_vault_scope_access, ingest_memory_best_effort,
-    matching_tool_approval_response_id, process_runner_input_should_use_active_root,
-    process_runner_input_with_path_env, process_runner_workspace_root_for_input,
+    matching_tool_approval_response_id, process_runner_cwd_focus_path,
+    process_runner_input_should_use_active_root, process_runner_input_with_path_env,
+    process_runner_workspace_root_for_input, remember_process_runner_cwd_focus,
     resolve_cron_job_channel_for_create, tool_approval_response_proposal_id,
     workspace_patch_metrics_from_output, CachedMemorySearchEntry, GatewayAuthConfig,
     GatewayJournalConfigSnapshot, GatewayRuntimeConfigSnapshot, GatewayRuntimeState,
@@ -266,6 +267,89 @@ fn process_runner_workspace_root_follows_absolute_cwd_inside_agent_root() {
             .expect("workspace root should be selected");
 
     assert_eq!(selected, second_root);
+}
+
+#[test]
+fn process_runner_cwd_focus_path_follows_absolute_cwd_inside_agent_root() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let harness_root = tempdir.path().join("Palyra-TestHarness");
+    let scenario = harness_root.join("scenarios").join("S041-20260613");
+    fs::create_dir_all(scenario.join("reports")).expect("scenario reports dir should exist");
+    let input = serde_json::to_vec(&json!({
+        "command": "echo",
+        "args": ["ok"],
+        "cwd": scenario.to_string_lossy(),
+    }))
+    .expect("input should serialize");
+
+    let focus = process_runner_cwd_focus_path(&input, std::slice::from_ref(&harness_root))
+        .expect("absolute cwd inside the harness root should become a session focus");
+
+    assert_eq!(focus, "scenarios/S041-20260613");
+}
+
+#[test]
+fn process_runner_cwd_focus_path_ignores_workspace_root_cwd() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let workspace_root = tempdir.path().join("workspace");
+    fs::create_dir_all(workspace_root.as_path()).expect("workspace root should exist");
+    let input = serde_json::to_vec(&json!({
+        "command": "echo",
+        "args": ["ok"],
+        "cwd": workspace_root.to_string_lossy(),
+    }))
+    .expect("input should serialize");
+
+    assert!(process_runner_cwd_focus_path(&input, &[workspace_root]).is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn process_runner_cwd_focus_is_persisted_for_followup_workspace_tools() {
+    let state = build_test_runtime_state(false);
+    let harness_root = tempfile::tempdir().expect("harness root should be created");
+    let scenario = harness_root.path().join("scenarios").join("S041-20260613");
+    fs::create_dir_all(scenario.join("reports")).expect("scenario reports dir should exist");
+    state
+        .create_agent(AgentCreateRequest {
+            agent_id: "process-focus-s041".to_owned(),
+            display_name: "Process Focus S041".to_owned(),
+            agent_dir: None,
+            workspace_roots: vec![harness_root.path().to_string_lossy().into_owned()],
+            default_model_profile: None,
+            execution_backend_preference: None,
+            default_tool_allowlist: Vec::new(),
+            default_skill_allowlist: Vec::new(),
+            set_default: true,
+            allow_absolute_paths: true,
+        })
+        .await
+        .expect("agent should be created");
+    let context = super::ToolRuntimeExecutionContext {
+        principal: "user:ops",
+        device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAA",
+        channel: Some("cli"),
+        session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        run_id: "01ARZ3NDEKTSV4RRFFQ69G5FBA",
+        execution_backend: ExecutionBackendPreference::LocalSandbox,
+        backend_reason_code: "backend.default.local_sandbox",
+    };
+    ensure_tool_context_session(&state, &context);
+    let input = serde_json::to_vec(&json!({
+        "command": "echo",
+        "args": ["ok"],
+        "cwd": scenario.to_string_lossy(),
+    }))
+    .expect("input should serialize");
+
+    remember_process_runner_cwd_focus(&state, context, input.as_slice(), &state.config.tool_call)
+        .await;
+
+    let stored = state
+        .session_project_context_state(context.session_id.to_owned())
+        .await
+        .expect("project context state should load")
+        .expect("process cwd focus should be stored");
+    assert_eq!(stored.focus_paths.first().map(String::as_str), Some("scenarios/S041-20260613"));
 }
 
 async fn lock_session_compaction_test_guard() -> MutexGuard<'static, ()> {
