@@ -1671,6 +1671,11 @@ struct ToolResultPreviewRedaction {
 }
 
 fn redacted_tool_result_preview(tool_name: &str, output_json: &[u8], max_bytes: usize) -> String {
+    if tool_name == crate::gateway::BROWSER_OBSERVE_TOOL_NAME {
+        if let Some(preview) = browser_observe_selector_capture_preview(output_json, max_bytes) {
+            return preview;
+        }
+    }
     let redacted = match serde_json::from_slice::<Value>(output_json) {
         Ok(mut value) => {
             let redaction = ToolResultPreviewRedaction {
@@ -1687,6 +1692,50 @@ fn redacted_tool_result_preview(tool_name: &str, output_json: &[u8], max_bytes: 
         }
     };
     truncate_utf8(redacted.as_str(), max_bytes)
+}
+
+fn browser_observe_selector_capture_preview(
+    output_json: &[u8],
+    max_bytes: usize,
+) -> Option<String> {
+    let value = serde_json::from_slice::<Value>(output_json).ok()?;
+    let captures = value.get("element_captures").and_then(Value::as_array)?;
+    if captures.is_empty() {
+        return None;
+    }
+
+    let mut preview = Map::new();
+    for key in [
+        "success",
+        "page_url",
+        "element_captures",
+        "dom_truncated",
+        "accessibility_tree_truncated",
+        "visible_text_truncated",
+        "safety",
+        "error",
+    ] {
+        if let Some(entry) = value.get(key) {
+            preview.insert(key.to_owned(), entry.clone());
+        }
+    }
+
+    let mut omitted = Map::new();
+    for key in ["dom_snapshot", "accessibility_tree", "visible_text"] {
+        if let Some(text) = value.get(key).and_then(Value::as_str).filter(|text| !text.is_empty()) {
+            omitted.insert(format!("{key}_bytes"), json!(text.len()));
+        }
+    }
+    if !omitted.is_empty() {
+        preview.insert("omitted_observation_text".to_owned(), Value::Object(omitted));
+    }
+
+    let mut preview = Value::Object(preview);
+    redact_sensitive_json_value(
+        &mut preview,
+        ToolResultPreviewRedaction { preserve_workspace_read_text: false },
+    );
+    serde_json::to_string(&preview).ok().map(|rendered| truncate_utf8(rendered.as_str(), max_bytes))
 }
 
 // Workspace read results that the read tool already scanned and marked clean
@@ -1933,6 +1982,48 @@ mod tests {
         assert!(preview.contains("\"size_bytes\":3072"), "{preview}");
         assert!(preview.contains("\"image_base64\":\"<redacted:base64 chars=4096>\""), "{preview}");
         assert!(!preview.contains("AAAA"), "{preview}");
+    }
+
+    #[test]
+    fn browser_observe_preview_prioritizes_selector_captures() {
+        let output_json = serde_json::to_vec(&json!({
+            "success": true,
+            "dom_snapshot": "D".repeat(4096),
+            "accessibility_tree": "",
+            "visible_text": "",
+            "element_captures": [
+                {
+                    "selector": "#state-badge",
+                    "matched": true,
+                    "text": "done",
+                    "computed_style": {
+                        "opacity": "1",
+                    }
+                }
+            ],
+            "dom_truncated": true,
+            "accessibility_tree_truncated": false,
+            "visible_text_truncated": false,
+            "page_url": "http://127.0.0.1:8857/",
+            "safety": {
+                "redacted": false,
+            },
+            "error": "",
+        }))
+        .expect("test payload should serialize");
+
+        let preview = super::redacted_tool_result_preview(
+            crate::gateway::BROWSER_OBSERVE_TOOL_NAME,
+            output_json.as_slice(),
+            1024,
+        );
+
+        assert!(preview.contains("\"element_captures\""), "{preview}");
+        assert!(preview.contains("#state-badge"), "{preview}");
+        assert!(preview.contains("\"text\":\"done\""), "{preview}");
+        assert!(preview.contains("\"opacity\":\"1\""), "{preview}");
+        assert!(preview.contains("\"dom_snapshot_bytes\":4096"), "{preview}");
+        assert!(!preview.contains("DDDDDDDD"), "{preview}");
     }
 
     #[test]
