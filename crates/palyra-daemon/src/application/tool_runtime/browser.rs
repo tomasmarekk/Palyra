@@ -100,7 +100,7 @@ const BROWSER_DOWNLOAD_TOOL_MAX_BYTES: u64 = 512 * 1024;
 const BROWSER_OBSERVE_MAX_CAPTURE_SELECTORS: usize = 8;
 const BROWSER_OBSERVE_MAX_COMPUTED_STYLE_PROPERTIES: usize = 16;
 /// Env var listing extra OS roots (split like `PATH`) approved for browser
-/// file IO outside agent workspaces; replaces the implicit home-dir roots.
+/// file IO outside agent workspaces.
 const PALYRA_OS_FILE_ROOTS_ENV: &str = "PALYRA_OS_FILE_ROOTS";
 
 /// JavaScript/DOM capability report for the browserd engine serving a call.
@@ -985,21 +985,19 @@ fn nearest_existing_parent(path: &Path) -> Option<PathBuf> {
 /// User-owned OS roots where browser tools may read uploads or save outputs
 /// outside agent workspaces.
 ///
-/// Explicitly configured roots (`PALYRA_OS_FILE_ROOTS`) *replace* the
-/// implicit `USERPROFILE`/`HOME` roots rather than extending them, so an
-/// operator can narrow access below the default. Temp directories are always
-/// allowed.
+/// Explicitly configured roots (`PALYRA_OS_FILE_ROOTS`) extend the implicit
+/// `USERPROFILE`/`HOME` roots so fixture roots do not disable ordinary
+/// user-owned paths such as Downloads. Temp directories are always allowed.
 fn browser_user_owned_os_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(configured_roots) = configured_browser_user_os_roots() {
         for root in configured_roots {
             push_browser_canonical_root(&mut roots, root);
         }
-    } else {
-        for key in ["USERPROFILE", "HOME"] {
-            if let Some(value) = std::env::var_os(key) {
-                push_browser_canonical_root(&mut roots, PathBuf::from(value));
-            }
+    }
+    for key in ["USERPROFILE", "HOME"] {
+        if let Some(value) = std::env::var_os(key) {
+            push_browser_canonical_root(&mut roots, PathBuf::from(value));
         }
     }
     push_browser_canonical_root(&mut roots, std::env::temp_dir());
@@ -5661,7 +5659,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_user_owned_roots_respect_configured_os_file_roots() {
+    fn browser_user_owned_roots_extend_configured_os_file_roots() {
         let _guard = BROWSER_ENV_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -5686,8 +5684,8 @@ mod tests {
             "configured OS root should be included: {roots:?}"
         );
         assert!(
-            !roots.iter().any(|root| root == &canonical_home),
-            "implicit USERPROFILE/HOME roots must be suppressed when PALYRA_OS_FILE_ROOTS is set: {roots:?}"
+            roots.iter().any(|root| root == &canonical_home),
+            "implicit USERPROFILE/HOME roots should remain included when PALYRA_OS_FILE_ROOTS is set: {roots:?}"
         );
     }
 

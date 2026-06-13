@@ -3,7 +3,7 @@
 //! Unlike the workspace tools, this backend may reach outside the agent
 //! workspace -- but only into an explicit allowlist of roots: the resolved
 //! workspace roots (see `workspace_scope`), user-owned roots (`USERPROFILE`/
-//! `HOME` or the `PALYRA_OS_FILE_ROOTS` override), temp directories, and
+//! `HOME` plus configured `PALYRA_OS_FILE_ROOTS`), temp directories, and
 //! run-launch path-env roots. Every requested path must be absolute, free of
 //! `.`/`..` components, canonicalized (or resolved through its nearest
 //! existing ancestor for new targets), checked against a protected-OS-path
@@ -1255,21 +1255,20 @@ fn ensure_os_path_allowed(policy: &OsFilePolicy, path: &ResolvedOsPath) -> Resul
     ))
 }
 
-/// Builds the user-owned OS roots: `PALYRA_OS_FILE_ROOTS` when set
-/// (replacing -- not extending -- the implicit profile roots, so operators
-/// can narrow access), otherwise `USERPROFILE`/`HOME`, plus temp directories
-/// on every platform.
+/// Builds the user-owned OS roots from configured roots plus the operator's
+/// profile roots. Configured roots are additive so a test harness can approve
+/// fixture OS roots without disabling normal user-owned paths such as
+/// Downloads or per-user config directories.
 fn user_owned_os_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(configured_roots) = configured_user_os_roots() {
         for root in configured_roots {
             push_canonical_root(&mut roots, root);
         }
-    } else {
-        for key in ["USERPROFILE", "HOME"] {
-            if let Some(value) = std::env::var_os(key) {
-                push_canonical_root(&mut roots, PathBuf::from(value));
-            }
+    }
+    for key in ["USERPROFILE", "HOME"] {
+        if let Some(value) = std::env::var_os(key) {
+            push_canonical_root(&mut roots, PathBuf::from(value));
         }
     }
     push_canonical_root(&mut roots, std::env::temp_dir());
@@ -1989,7 +1988,7 @@ mod tests {
     }
 
     #[test]
-    fn os_file_configured_roots_replace_implicit_user_profile_root() {
+    fn os_file_configured_roots_extend_implicit_user_profile_root() {
         let _guard =
             OS_FILE_ENV_LOCK.get_or_init(|| Mutex::new(())).lock().expect("env lock poisoned");
         let configured_root = tempfile::tempdir().expect("configured root should be created");
@@ -2009,8 +2008,8 @@ mod tests {
             "configured OS file root should be allowed: {roots:?}"
         );
         assert!(
-            !roots.iter().any(|root| same_path(root.as_path(), real_home_root.as_path())),
-            "implicit user profile roots must be suppressed when PALYRA_OS_FILE_ROOTS is set: {roots:?}"
+            roots.iter().any(|root| same_path(root.as_path(), real_home_root.as_path())),
+            "implicit user profile roots should remain allowed when PALYRA_OS_FILE_ROOTS is set: {roots:?}"
         );
     }
 
