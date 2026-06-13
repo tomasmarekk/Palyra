@@ -3302,10 +3302,13 @@ fn parse_chromium_viewport_metrics(
     requested_height: u32,
     requested_device_scale_factor: f64,
 ) -> (u32, u32, f64) {
+    // In mobile emulation, `innerWidth` may still expose the page layout
+    // viewport (commonly 980px) before navigation/meta viewport state settles.
+    // The visual viewport is the CSS viewport the user asked to validate.
     let actual_width =
-        chromium_u32_metric_prefer(&value, "width", "visual_width").unwrap_or(requested_width);
+        chromium_u32_metric_prefer(&value, "visual_width", "width").unwrap_or(requested_width);
     let actual_height =
-        chromium_u32_metric_prefer(&value, "height", "visual_height").unwrap_or(requested_height);
+        chromium_u32_metric_prefer(&value, "visual_height", "height").unwrap_or(requested_height);
     let actual_device_scale_factor = value
         .get("device_scale_factor")
         .and_then(serde_json::Value::as_f64)
@@ -5388,20 +5391,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_chromium_viewport_metrics_keeps_layout_viewport_size() {
+    fn parse_chromium_viewport_metrics_prefers_visual_viewport_size() {
         let raw = serde_json::json!({
-            "visual_width": 531,
-            "visual_height": 944,
-            "width": 375,
-            "height": 667,
+            "visual_width": 390,
+            "visual_height": 844,
+            "width": 980,
+            "height": 2121,
             "device_scale_factor": 2.0
         });
 
         let (width, height, device_scale_factor) =
-            parse_chromium_viewport_metrics(raw, 375, 667, 1.0);
+            parse_chromium_viewport_metrics(raw, 390, 844, 1.0);
 
-        assert_eq!(width, 375);
-        assert_eq!(height, 667);
+        assert_eq!(width, 390);
+        assert_eq!(height, 844);
         assert_eq!(device_scale_factor, 2.0);
     }
 
