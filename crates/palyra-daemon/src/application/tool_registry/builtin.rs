@@ -1023,7 +1023,9 @@ fn browser_tool_description(tool_name: &str) -> &'static str {
             "Observe visible browser state, bounded DOM/accessibility visible text evidence, safe current form/storage state, and optional read-only selector geometry/computed-style captures for layout assertions."
         }
         "palyra.browser.storage" => "Inspect bounded visible cookies and localStorage for diagnostics.",
-        "palyra.browser.network_log" => "Read bounded browser network logs.",
+        "palyra.browser.network_log" => {
+            "Read bounded browser network logs. Entries include entry_id, phase=response, captured_at_unix_ms, status, latency, and request_url; use since_unix_ms after an action boundary to ignore stale entries."
+        }
         "palyra.browser.console_log" => "Read bounded browser console logs.",
         "palyra.browser.reset_state" => "Reset browser session state.",
         "palyra.browser.tabs.list" => "List browser tabs.",
@@ -1250,6 +1252,15 @@ fn browser_tool_schema(tool_name: &str) -> Value {
             properties.push(("max_cookie_bytes", json!({"type":"integer","minimum":1})));
             properties.push(("max_storage_bytes", json!({"type":"integer","minimum":1})));
         }
+        "palyra.browser.network_log" => {
+            properties.push(("limit", json!({"type":"integer","minimum":1})));
+            properties.push(("include_headers", json!({"type":"boolean","default":false})));
+            properties.push(("max_payload_bytes", json!({"type":"integer","minimum":1})));
+            properties.push((
+                "since_unix_ms",
+                json!({"type":"integer","minimum":0,"description":"Only return entries captured at or after this Unix millisecond timestamp. Use it after a click/reload/action boundary to avoid mixing stale network entries from earlier page states."}),
+            ));
+        }
         "palyra.browser.observe" => {
             properties.push((
                 "include_dom_snapshot",
@@ -1311,6 +1322,22 @@ mod tests {
             .expect("tab_id should explain where to get the value");
         assert!(description.contains("palyra.browser.tabs.list"));
         assert!(description.contains("exact tab_id"));
+    }
+
+    #[test]
+    fn browser_network_log_registry_exposes_since_filter() {
+        let entry = registry_entry("palyra.browser.network_log").expect("network_log entry exists");
+        let since = entry
+            .input_schema
+            .pointer("/properties/since_unix_ms")
+            .expect("since_unix_ms property should be visible");
+
+        assert_eq!(since.get("type").and_then(serde_json::Value::as_str), Some("integer"));
+        let description = since
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .expect("since_unix_ms should explain its boundary usage");
+        assert!(description.contains("click/reload/action boundary"));
     }
 
     #[test]

@@ -3066,6 +3066,7 @@ pub(crate) async fn execute_browser_tool(
                     );
                 }
             };
+            let since_unix_ms = payload.get("since_unix_ms").and_then(Value::as_u64).unwrap_or(0);
             let mut request = Request::new(browser_v1::NetworkLogRequest {
                 v: CANONICAL_PROTOCOL_MAJOR,
                 session_id: Some(common_v1::CanonicalId { ulid: session_id }),
@@ -3103,8 +3104,12 @@ pub(crate) async fn execute_browser_tool(
             match client.network_log(request).await {
                 Ok(response) => {
                     let response = response.into_inner();
-                    let exported_entries = response
-                        .entries
+                    let original_entry_count = response.entries.len();
+                    let entries =
+                        filter_browser_network_log_entries_since(response.entries, since_unix_ms);
+                    let filtered_before_since_count =
+                        original_entry_count.saturating_sub(entries.len());
+                    let exported_entries = entries
                         .into_iter()
                         .map(browser_network_log_entry_to_json)
                         .collect::<Vec<_>>();
@@ -3116,6 +3121,8 @@ pub(crate) async fn execute_browser_tool(
                         "success": response.success,
                         "entries": exported_entries.iter().map(|entry| entry.value.clone()).collect::<Vec<_>>(),
                         "truncated": response.truncated,
+                        "since_unix_ms": since_unix_ms,
+                        "filtered_before_since_count": filtered_before_since_count,
                         "safety": browser_safety_json(
                             &network_scan,
                             exported_entries.iter().any(|entry| entry.redacted),
@@ -4604,6 +4611,7 @@ fn browser_page_diagnostics_to_json(
 }
 
 fn browser_network_log_entry_to_json(entry: browser_v1::NetworkLogEntry) -> BrowserValueExport {
+    let entry_id = browser_network_log_entry_id(&entry);
     let raw_scan_input = {
         let mut buffer = String::new();
         buffer.push_str("request_url=");
@@ -4635,6 +4643,8 @@ fn browser_network_log_entry_to_json(entry: browser_v1::NetworkLogEntry) -> Brow
     let request_url = redact_url(entry.request_url.as_str());
     BrowserValueExport {
         value: json!({
+            "entry_id": entry_id,
+            "phase": "response",
             "request_url": request_url,
             "status_code": entry.status_code,
             "timing_bucket": entry.timing_bucket,
@@ -4646,6 +4656,27 @@ fn browser_network_log_entry_to_json(entry: browser_v1::NetworkLogEntry) -> Brow
         scan: scan.scan,
         redacted: scan.redacted || request_url != entry.request_url,
     }
+}
+
+fn browser_network_log_entry_id(entry: &browser_v1::NetworkLogEntry) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"palyra.browser.network_log.entry.v1");
+    hasher.update(entry.request_url.as_bytes());
+    hasher.update(entry.status_code.to_be_bytes());
+    hasher.update(entry.timing_bucket.as_bytes());
+    hasher.update(entry.latency_ms.to_be_bytes());
+    hasher.update(entry.captured_at_unix_ms.to_be_bytes());
+    format!("net_{}", &hex::encode(hasher.finalize())[..16])
+}
+
+fn filter_browser_network_log_entries_since(
+    entries: Vec<browser_v1::NetworkLogEntry>,
+    since_unix_ms: u64,
+) -> Vec<browser_v1::NetworkLogEntry> {
+    if since_unix_ms == 0 {
+        return entries;
+    }
+    entries.into_iter().filter(|entry| entry.captured_at_unix_ms >= since_unix_ms).collect()
 }
 
 fn browser_tab_to_json(tab: browser_v1::BrowserTab) -> Value {
@@ -4973,11 +5004,11 @@ mod tests {
         browser_tool_execution_outcome, browser_tool_reports_missing_session,
         browser_tool_requires_open_session, browser_url_targets_loopback,
         browser_user_owned_os_roots, browser_viewport_metric_mismatch_error,
-        canonical_file_path_is_inside_workspace_roots, normalize_browser_press_key_input,
-        parse_browser_download_artifact_id, parse_browser_observe_string_array,
-        resolve_browser_output_path, resolve_browser_upload_path,
-        validate_browser_workspace_relative_path, BrowserRuntimeCapabilities,
-        BROWSER_CALLER_PRINCIPAL_HEADER, PALYRA_OS_FILE_ROOTS_ENV,
+        canonical_file_path_is_inside_workspace_roots, filter_browser_network_log_entries_since,
+        normalize_browser_press_key_input, parse_browser_download_artifact_id,
+        parse_browser_observe_string_array, resolve_browser_output_path,
+        resolve_browser_upload_path, validate_browser_workspace_relative_path,
+        BrowserRuntimeCapabilities, BROWSER_CALLER_PRINCIPAL_HEADER, PALYRA_OS_FILE_ROOTS_ENV,
     };
     use crate::application::tool_runtime::workspace_scope::ActiveWorkspaceRoot;
     use crate::gateway::{
@@ -5051,8 +5082,40 @@ mod tests {
             }],
         });
         assert_eq!(exported.value["headers"][0]["value"], "<redacted>");
+        assert_eq!(exported.value["phase"], "response");
+        assert!(
+            exported
+                .value
+                .get("entry_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|entry_id| entry_id.starts_with("net_")),
+            "{}",
+            exported.value
+        );
         assert_eq!(exported.value["safety"]["action"], "redact");
         assert!(exported.redacted);
+    }
+
+    #[test]
+    fn network_log_since_filter_drops_older_entries() {
+        let entries = [10, 20, 30]
+            .into_iter()
+            .map(|captured_at_unix_ms| browser_v1::NetworkLogEntry {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                request_url: format!("https://example.test/{captured_at_unix_ms}"),
+                status_code: 200,
+                timing_bucket: "fast".to_owned(),
+                latency_ms: 1,
+                captured_at_unix_ms,
+                headers: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+
+        let filtered = filter_browser_network_log_entries_since(entries.clone(), 20);
+        let urls = filtered.iter().map(|entry| entry.request_url.as_str()).collect::<Vec<_>>();
+
+        assert_eq!(urls, vec!["https://example.test/20", "https://example.test/30"]);
+        assert_eq!(filter_browser_network_log_entries_since(entries, 0).len(), 3);
     }
 
     #[test]
