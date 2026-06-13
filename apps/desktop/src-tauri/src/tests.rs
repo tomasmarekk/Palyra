@@ -175,6 +175,61 @@ fn config_reload_watch_restarts_desired_runtime_on_config_change() {
 }
 
 #[test]
+fn browserd_port_fallback_restarts_gateway_for_new_endpoint() {
+    let fixture = TempFixtureDir::new();
+    let health_listener =
+        TcpListener::bind("127.0.0.1:0").expect("health fixture listener should bind");
+    let grpc_listener =
+        TcpListener::bind("127.0.0.1:0").expect("grpc fixture listener should bind");
+    let health_port =
+        health_listener.local_addr().expect("health fixture address should resolve").port();
+    let grpc_port = grpc_listener.local_addr().expect("grpc fixture address should resolve").port();
+    let config_path = write_config_file(
+        fixture.path(),
+        format!(
+            r#"
+version = 1
+
+[tool_call.browser_service]
+endpoint = "http://127.0.0.1:{grpc_port}"
+health_base_url = "http://127.0.0.1:{health_port}"
+"#
+        )
+        .as_str(),
+    );
+    let mut control_center = build_test_control_center(fixture.path());
+    control_center.active_profile.config_path = Some(config_path.clone());
+    control_center.config_reload_watch =
+        DesktopConfigReloadWatchState::from_profile(&control_center.active_profile);
+    control_center.runtime.browser_health_port = health_port;
+    control_center.runtime.browser_grpc_port = grpc_port;
+    control_center.browserd.bound_ports = vec![health_port, grpc_port];
+    control_center.gateway.desired_running = true;
+    control_center.gateway.next_restart_unix_ms = Some(i64::MAX);
+
+    control_center
+        .ensure_service_ports_available_before_spawn(ServiceKind::Browserd)
+        .expect("browserd port fallback should select free ports");
+
+    assert_ne!(control_center.runtime.browser_health_port, health_port);
+    assert_ne!(control_center.runtime.browser_grpc_port, grpc_port);
+    assert_ne!(control_center.gateway.next_restart_unix_ms, Some(i64::MAX));
+    assert!(control_center.gateway.logs.iter().any(|line| {
+        line.line.contains("browserd endpoint changed after port fallback")
+            && line.line.contains("restarting gateway")
+    }));
+    let config_toml =
+        std::fs::read_to_string(config_path.as_path()).expect("config should remain readable");
+    assert!(
+        config_toml.contains(
+            format!("endpoint = \"http://127.0.0.1:{}\"", control_center.runtime.browser_grpc_port)
+                .as_str()
+        ),
+        "config should point gateway at the fallback browserd gRPC endpoint: {config_toml}"
+    );
+}
+
+#[test]
 fn diagnostics_error_collection_deduplicates_and_respects_limit() {
     let payload = json!({
         "errors": ["auth token=abcdef", "auth token=abcdef", "network timeout"],

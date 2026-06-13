@@ -1094,6 +1094,36 @@ impl ControlCenter {
         self.start_all();
     }
 
+    fn request_service_restart(&mut self, kind: ServiceKind, reason: &str) {
+        let mut stop_error = None;
+        let should_restart = {
+            let service = self.service_mut(kind);
+            if !service.desired_running && !service.running() {
+                false
+            } else {
+                service.desired_running = true;
+                service.restart_attempt = 0;
+                service.next_restart_unix_ms = Some(unix_ms_now());
+                if let Some(child) = service.child.as_mut() {
+                    if let Err(error) = child.start_kill() {
+                        stop_error = Some(sanitize_log_line(
+                            format!("failed to stop {} process: {error}", kind.display_name())
+                                .as_str(),
+                        ));
+                    }
+                }
+                true
+            }
+        };
+
+        if should_restart {
+            self.append_supervisor_log(kind, reason);
+            if let Some(error) = stop_error {
+                self.append_supervisor_log(kind, error.as_str());
+            }
+        }
+    }
+
     fn stop_service(&mut self, kind: ServiceKind) {
         let mut log_message: Option<String> = None;
         {
@@ -1294,7 +1324,10 @@ impl ControlCenter {
         }
     }
 
-    fn ensure_service_ports_available_before_spawn(&mut self, kind: ServiceKind) -> Result<()> {
+    pub(crate) fn ensure_service_ports_available_before_spawn(
+        &mut self,
+        kind: ServiceKind,
+    ) -> Result<()> {
         match kind {
             ServiceKind::Gateway => {
                 let unavailable = palyra_common::local_runtime_ports::unavailable_ports(
@@ -1353,6 +1386,10 @@ impl ControlCenter {
                         ports.grpc
                     )
                     .as_str(),
+                );
+                self.request_service_restart(
+                    ServiceKind::Gateway,
+                    "browserd endpoint changed after port fallback; restarting gateway so agent browser tools reconnect to the new browserd endpoint",
                 );
                 Ok(())
             }
@@ -1420,8 +1457,9 @@ impl ControlCenter {
         }
         let rendered =
             toml::to_string_pretty(&document).context("failed to serialize daemon config")?;
-        fs::write(config_path.as_path(), rendered)
-            .with_context(|| format!("failed to persist daemon config {}", config_path.display()))?;
+        fs::write(config_path.as_path(), rendered).with_context(|| {
+            format!("failed to persist daemon config {}", config_path.display())
+        })?;
         self.config_reload_watch.record_supervisor_write(config_path.as_path());
         Ok(())
     }
