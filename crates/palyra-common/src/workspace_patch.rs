@@ -905,6 +905,7 @@ fn parse_patch_document(patch: &str) -> Result<Vec<PatchOperation>, WorkspacePat
                 if is_patch_header_or_end(body_line) {
                     break;
                 }
+                reject_structural_marker_in_full_file_body(body_line, index + 1, "add-file")?;
                 let content = full_file_body_content(body_line);
                 add_lines.push(content.to_owned());
                 index = index.saturating_add(1);
@@ -3256,6 +3257,49 @@ mod tests {
         assert_eq!(
             fs::read_to_string(workspace.join("report.txt")).expect("file should be created"),
             "hello\nworld\n"
+        );
+    }
+
+    #[test]
+    fn apply_workspace_patch_rejects_bare_add_file_hunk_marker() {
+        let temp = tempdir().expect("tempdir should be created");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        let patch = "*** Begin Patch\n*** Add File: src/server.js\n@@\nconsole.log('ready');\n*** End Patch\n";
+
+        let error = apply_workspace_patch(
+            std::slice::from_ref(&workspace),
+            &default_request(patch, false),
+            &default_limits(),
+        )
+        .expect_err("add-file body should reject bare hunk markers instead of writing them");
+
+        assert!(matches!(error, WorkspacePatchError::Parse { .. }));
+        assert!(
+            error.to_string().contains("add-file body contains a diff or conflict marker"),
+            "error should explain the full-file contract: {error}"
+        );
+        assert!(!workspace.join("src").join("server.js").exists());
+    }
+
+    #[test]
+    fn apply_workspace_patch_accepts_patch_prefixed_valid_json_file_content() {
+        let temp = tempdir().expect("tempdir should be created");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(workspace.join("reports")).expect("workspace reports dir should exist");
+        let patch = "*** Begin Patch\n*** Add File: reports/seen.json\n+{\"seen_ids\":[\"alpha\"]}\n*** End Patch\n";
+
+        apply_workspace_patch(
+            std::slice::from_ref(&workspace),
+            &default_request(patch, false),
+            &default_limits(),
+        )
+        .expect("patch-prefixed JSON content should be normalized before validation");
+
+        assert_eq!(
+            fs::read_to_string(workspace.join("reports").join("seen.json"))
+                .expect("JSON file should be written"),
+            "{\"seen_ids\":[\"alpha\"]}\n"
         );
     }
 
