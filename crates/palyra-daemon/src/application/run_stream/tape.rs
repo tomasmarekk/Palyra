@@ -1187,6 +1187,11 @@ fn needs_continuation_reason_code(message: &str) -> &'static str {
     {
         return "provider_error";
     }
+    if lower.contains("reason_code=tool_followup_timeout")
+        || lower.contains("tool follow-up model turn timed out")
+    {
+        return "tool_followup_timeout";
+    }
     "agent_loop_budget_exhausted"
 }
 
@@ -1486,6 +1491,23 @@ mod tests {
         assert_eq!(value["wire_kind"], "failed");
         assert_eq!(value["lifecycle_state"], "needs_continuation");
         assert_eq!(value["reason_code"], "provider_error");
+        assert_eq!(value["partial"], true);
+        assert_eq!(value["continuation_required"], true);
+    }
+
+    #[test]
+    fn tool_followup_status_tape_payload_uses_needs_continuation_reason() {
+        let payload = status_tape_payload(
+            common_v1::stream_status::StatusKind::Failed,
+            "Partial result: I ran 1 tool call, but the next model turn did not continue after tool results; needs_continuation=true reason_code=tool_followup_timeout; partial result summary: continue in the same session",
+        );
+        let value: Value =
+            serde_json::from_str(payload.as_str()).expect("status payload should be json");
+
+        assert_eq!(value["kind"], "needs_continuation");
+        assert_eq!(value["wire_kind"], "failed");
+        assert_eq!(value["lifecycle_state"], "needs_continuation");
+        assert_eq!(value["reason_code"], "tool_followup_timeout");
         assert_eq!(value["partial"], true);
         assert_eq!(value["continuation_required"], true);
     }

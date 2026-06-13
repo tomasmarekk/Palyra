@@ -83,6 +83,11 @@ const PROVIDER_FAILOVER_DEADLINE_GRACE_MS: u64 = 5_000;
 // should fail fast into the follow-up recovery path instead of pinning the
 // browser session for the full provider deadline.
 const BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS: u64 = 60_000;
+// Non-browser tool batches still need a bounded follow-up turn. Without this
+// guard, runs that already recorded file/schema/process evidence can stay
+// `in_progress` on generic provider heartbeats until the broad provider
+// deadline, with no actionable stall diagnostic for the operator.
+const TOOL_FOLLOWUP_PROVIDER_TIMEOUT_MS: u64 = 120_000;
 const MAX_BROWSER_FOLLOWUP_RECOVERY_ATTEMPTS: u8 = 1;
 const MAX_LENGTH_RECOVERY_ATTEMPTS: u8 = 3;
 
@@ -136,6 +141,8 @@ pub(crate) enum ProviderRequestTimeoutReason {
     Provider,
     /// The shorter browser follow-up deadline after browser tool results.
     BrowserFollowup,
+    /// The bounded follow-up deadline after non-browser tool results.
+    ToolFollowup,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,6 +272,17 @@ fn browser_followup_deadline_override(
     })
 }
 
+fn tool_followup_deadline_override(
+    enabled: bool,
+    config: &GatewayRuntimeConfigSnapshot,
+) -> Option<ProviderRequestDeadlineOverride> {
+    enabled.then(|| ProviderRequestDeadlineOverride {
+        timeout: provider_request_timeout(config)
+            .min(Duration::from_millis(TOOL_FOLLOWUP_PROVIDER_TIMEOUT_MS)),
+        reason: ProviderRequestTimeoutReason::ToolFollowup,
+    })
+}
+
 // Counts the provider attempts the lease layer may make for one logical turn
 // (selected provider plus eligible chat fallbacks). The outer deadline must
 // cover all of them, otherwise failover would be cut off mid-attempt. An
@@ -318,6 +336,13 @@ fn browser_followup_timeout_message(run_id: &str, timeout: Duration) -> String {
     )
 }
 
+fn tool_followup_timeout_message(run_id: &str, timeout: Duration) -> String {
+    let timeout_ms = duration_millis_u64(timeout);
+    format!(
+        "tool follow-up model turn timed out after {timeout_ms}ms for run {run_id}; tool results were already recorded, but the model did not produce the next tool proposal or final answer before the follow-up deadline"
+    )
+}
+
 fn provider_request_timeout_message(
     run_id: &str,
     timeout: Duration,
@@ -329,6 +354,9 @@ fn provider_request_timeout_message(
         }
         ProviderRequestTimeoutReason::BrowserFollowup => {
             browser_followup_timeout_message(run_id, timeout)
+        }
+        ProviderRequestTimeoutReason::ToolFollowup => {
+            tool_followup_timeout_message(run_id, timeout)
         }
     }
 }
@@ -344,6 +372,9 @@ fn provider_waiting_status_message(
     match reason {
         ProviderRequestTimeoutReason::BrowserFollowup => format!(
             "waiting for browser follow-up model response (elapsed_ms={elapsed_ms}, timeout_ms={timeout_ms}, provider_attempt_timeout_ms={provider_attempt_timeout_ms}, followup_deadline=true)"
+        ),
+        ProviderRequestTimeoutReason::ToolFollowup => format!(
+            "waiting for post-tool model response (elapsed_ms={elapsed_ms}, timeout_ms={timeout_ms}, provider_attempt_timeout_ms={provider_attempt_timeout_ms}, tool_followup_deadline=true)"
         ),
         ProviderRequestTimeoutReason::Provider if effective_timeout == provider_timeout => {
             format!(
@@ -1391,6 +1422,7 @@ pub(crate) async fn process_run_stream_message(
     let mut browser_followup_recovery_attempts = 0u8;
     let mut repeated_tool_failure_tracker = RepeatedToolFailureTracker::default();
     let mut pending_browser_followup_deadline = false;
+    let mut pending_tool_followup_deadline = false;
 
     loop {
         match runtime_state.is_orchestrator_cancel_requested(run_id.clone()).await {
@@ -1526,14 +1558,18 @@ pub(crate) async fn process_run_stream_message(
                 }
             }
         }
-        // The follow-up deadline applies to exactly one turn: the turn right
-        // after a batch that completed browser tools. Reset before the
-        // request so recovery turns fall back to the normal deadline.
+        // Follow-up deadlines apply to exactly one turn: the turn right after
+        // a tool batch. Browser batches keep their shorter specialized guard;
+        // other tools use the generic post-tool guard.
         let deadline_override = browser_followup_deadline_override(
             pending_browser_followup_deadline,
             &runtime_state.config,
-        );
+        )
+        .or_else(|| {
+            tool_followup_deadline_override(pending_tool_followup_deadline, &runtime_state.config)
+        });
         pending_browser_followup_deadline = false;
+        pending_tool_followup_deadline = false;
         let provider_response = match execute_run_stream_provider_request(
             sender,
             runtime_state,
@@ -1596,6 +1632,13 @@ pub(crate) async fn process_run_stream_message(
                     let fallback_summary = match reason {
                         ProviderRequestTimeoutReason::BrowserFollowup => {
                             browser_followup_timeout_partial_summary(
+                                message.as_str(),
+                                &loop_state,
+                                run_id.as_str(),
+                            )
+                        }
+                        ProviderRequestTimeoutReason::ToolFollowup => {
+                            tool_followup_timeout_partial_summary(
                                 message.as_str(),
                                 &loop_state,
                                 run_id.as_str(),
@@ -1942,10 +1985,12 @@ pub(crate) async fn process_run_stream_message(
                 let repeated_tool_failure =
                     repeated_tool_failure_tracker.observe(tool_result_messages.as_slice());
                 let tool_result_count = tool_result_messages.len();
-                // Arm the shorter follow-up deadline for the next turn when
-                // this batch ran any browser tool (see the constant above).
-                pending_browser_followup_deadline =
+                // Arm the next-turn follow-up deadline after tool results;
+                // browser tools use the shorter browser-specific guard.
+                let completed_browser_tool =
                     completed_tool_names.iter().any(|tool_name| is_browser_tool_name(tool_name));
+                pending_browser_followup_deadline = completed_browser_tool;
+                pending_tool_followup_deadline = tool_result_count > 0 && !completed_browser_tool;
                 loop_state.append_tool_result_messages(tool_result_messages);
                 if let Some(failure) = repeated_tool_failure {
                     terminate_run_stream_with_agent_loop_reason(
@@ -2721,6 +2766,19 @@ fn browser_followup_timeout_partial_summary(
     )
 }
 
+fn tool_followup_timeout_partial_summary(
+    message: &str,
+    loop_state: &AgentRunLoopState,
+    run_id: &str,
+) -> String {
+    let tool_count = loop_state.completed_tool_calls();
+    let tool_label = if tool_count == 1 { "tool call" } else { "tool calls" };
+    format!(
+        "Partial result: I ran {tool_count} {tool_label}, but the next model turn did not continue after the tool results before the follow-up timeout. Last issue: {}. The run tape for {run_id} contains the exact tool evidence. Resume this same session and reference run {run_id} if any requested artifact, validation, cleanup, or final summary is still missing.",
+        truncate_with_ellipsis(message.trim().replace(['\r', '\n'], " "), 512)
+    )
+}
+
 fn provider_timeout_termination_reason(
     reason: ProviderRequestTimeoutReason,
 ) -> AgentLoopTerminationReason {
@@ -2728,6 +2786,9 @@ fn provider_timeout_termination_reason(
         ProviderRequestTimeoutReason::Provider => AgentLoopTerminationReason::ProviderError,
         ProviderRequestTimeoutReason::BrowserFollowup => {
             AgentLoopTerminationReason::BrowserFollowupTimeout
+        }
+        ProviderRequestTimeoutReason::ToolFollowup => {
+            AgentLoopTerminationReason::ToolFollowupTimeout
         }
     }
 }
@@ -3187,10 +3248,11 @@ mod tests {
         provider_waiting_status_message, repeated_tool_failure_signature,
         should_emit_budget_exhausted_partial_summary, should_terminate_after_tool_budget_exhausted,
         terminal_tool_authorization_failure, tool_calls_finish_without_tool_payload,
-        tool_result_to_provider_message, truncated_final_answer_without_tools,
-        ProviderRequestDeadlineOverride, ProviderRequestTimeoutReason, RepeatedToolFailureTracker,
-        RunStreamToolResultForModel, BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS,
-        MAX_LENGTH_RECOVERY_ATTEMPTS,
+        tool_followup_timeout_partial_summary, tool_result_to_provider_message,
+        truncated_final_answer_without_tools, ProviderRequestDeadlineOverride,
+        ProviderRequestTimeoutReason, RepeatedToolFailureTracker, RunStreamToolResultForModel,
+        BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS, MAX_LENGTH_RECOVERY_ATTEMPTS,
+        TOOL_FOLLOWUP_PROVIDER_TIMEOUT_MS,
     };
     use super::{AgentLoopTerminationReason, AgentRunLoopState};
     use crate::application::run_stream::tape::RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE;
@@ -3358,6 +3420,50 @@ mod tests {
     }
 
     #[test]
+    fn tool_followup_deadline_caps_failover_deadline() {
+        let request = ProviderRequest::from_input_text(
+            "summarize file tool results".to_owned(),
+            false,
+            Vec::new(),
+            None,
+        );
+        let (deadline, reason) = effective_provider_request_deadline(
+            Duration::from_millis(180_000),
+            &route_selection_with_fallback(true),
+            &request,
+            Some(ProviderRequestDeadlineOverride {
+                timeout: Duration::from_millis(TOOL_FOLLOWUP_PROVIDER_TIMEOUT_MS),
+                reason: ProviderRequestTimeoutReason::ToolFollowup,
+            }),
+        );
+
+        assert_eq!(deadline, Duration::from_millis(TOOL_FOLLOWUP_PROVIDER_TIMEOUT_MS));
+        assert_eq!(reason, ProviderRequestTimeoutReason::ToolFollowup);
+    }
+
+    #[test]
+    fn tool_followup_deadline_respects_smaller_provider_timeout() {
+        let request = ProviderRequest::from_input_text(
+            "summarize file tool results".to_owned(),
+            false,
+            Vec::new(),
+            None,
+        );
+        let (deadline, reason) = effective_provider_request_deadline(
+            Duration::from_millis(5_000),
+            &route_selection_with_fallback(false),
+            &request,
+            Some(ProviderRequestDeadlineOverride {
+                timeout: Duration::from_millis(TOOL_FOLLOWUP_PROVIDER_TIMEOUT_MS),
+                reason: ProviderRequestTimeoutReason::ToolFollowup,
+            }),
+        );
+
+        assert_eq!(deadline, Duration::from_millis(5_000));
+        assert_eq!(reason, ProviderRequestTimeoutReason::ToolFollowup);
+    }
+
+    #[test]
     fn browser_followup_timeout_status_is_actionable() {
         let message = provider_request_timeout_message(
             "01ARZ3NDEKTSV4RRFFQ69G5FAV",
@@ -3367,6 +3473,21 @@ mod tests {
 
         assert!(message.contains("browser follow-up model turn timed out after 60000ms"));
         assert!(message.contains("browser tool results were already recorded"));
+        assert!(message.contains("01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+        assert!(!message.contains("model_provider.request_timeout_ms"));
+    }
+
+    #[test]
+    fn tool_followup_timeout_status_is_actionable() {
+        let message = provider_request_timeout_message(
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            Duration::from_millis(TOOL_FOLLOWUP_PROVIDER_TIMEOUT_MS),
+            ProviderRequestTimeoutReason::ToolFollowup,
+        );
+
+        assert!(message.contains("tool follow-up model turn timed out after 120000ms"));
+        assert!(message.contains("tool results were already recorded"));
+        assert!(message.contains("next tool proposal or final answer"));
         assert!(message.contains("01ARZ3NDEKTSV4RRFFQ69G5FAV"));
         assert!(!message.contains("model_provider.request_timeout_ms"));
     }
@@ -3384,6 +3505,22 @@ mod tests {
 
         assert!(message.contains("waiting for browser follow-up model response"));
         assert!(message.contains("followup_deadline=true"));
+        assert!(message.contains("provider_attempt_timeout_ms=180000"));
+    }
+
+    #[test]
+    fn tool_followup_waiting_status_names_followup_deadline() {
+        let message = provider_waiting_status_message(
+            ProviderRequestTimeoutReason::ToolFollowup,
+            20_000,
+            120_000,
+            180_000,
+            Duration::from_millis(120_000),
+            Duration::from_millis(180_000),
+        );
+
+        assert!(message.contains("waiting for post-tool model response"));
+        assert!(message.contains("tool_followup_deadline=true"));
         assert!(message.contains("provider_attempt_timeout_ms=180000"));
     }
 
@@ -3632,6 +3769,27 @@ mod tests {
     }
 
     #[test]
+    fn tool_followup_timeout_partial_summary_includes_resume_context() {
+        let state = loop_state_after_tool("create files and run tests", "palyra.fs.apply_patch");
+        let message = tool_followup_timeout_partial_summary(
+            "tool follow-up model turn timed out after 120000ms",
+            &state,
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        );
+
+        assert_eq!(
+            provider_timeout_termination_reason(ProviderRequestTimeoutReason::ToolFollowup),
+            AgentLoopTerminationReason::ToolFollowupTimeout
+        );
+        assert!(message.contains("Partial result: I ran 1 tool call"));
+        assert!(message.contains("after the tool results"));
+        assert!(message.contains("follow-up timeout"));
+        assert!(message.contains("exact tool evidence"));
+        assert!(message.contains("Resume this same session"));
+        assert!(message.contains("01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+    }
+
+    #[test]
     fn browser_followup_timeout_gets_one_recovery_prompt_after_tool_evidence() {
         let state = loop_state_after_tool(
             "Open a local marketing page, capture screenshots, write a report, and patch CSS.",
@@ -3668,6 +3826,16 @@ mod tests {
             )
             .is_none(),
             "generic provider timeouts should keep the existing partial-continuation path"
+        );
+        assert!(
+            browser_followup_timeout_recovery_prompt(
+                ProviderRequestTimeoutReason::ToolFollowup,
+                "tool follow-up model turn timed out after 120000ms",
+                &state,
+                0,
+            )
+            .is_none(),
+            "non-browser tool follow-up timeouts should terminate as explicit needs-continuation partials"
         );
     }
 
