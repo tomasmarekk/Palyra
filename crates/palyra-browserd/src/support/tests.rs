@@ -126,6 +126,12 @@ fn browserd_env_test_guard() -> std::sync::MutexGuard<'static, ()> {
     BROWSERD_ENV_TEST_LOCK.get_or_init(|| StdMutex::new(())).lock().expect("env test lock")
 }
 
+fn browser_runtime_state_for_tests(args: &Args) -> anyhow::Result<BrowserRuntimeState> {
+    // Runtime initialization reads browserd persistence env, so keep it serialized with env-mutating tests.
+    let _env_guard = browserd_env_test_guard();
+    BrowserRuntimeState::new(args)
+}
+
 async fn chromium_integration_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
     static CHROMIUM_INTEGRATION_TEST_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
         std::sync::OnceLock::new();
@@ -134,7 +140,7 @@ async fn chromium_integration_test_guard() -> tokio::sync::MutexGuard<'static, (
 
 fn simulated_runtime_for_tests() -> Arc<BrowserRuntimeState> {
     Arc::new(
-        BrowserRuntimeState::new(&Args {
+        browser_runtime_state_for_tests(&Args {
             bind: "127.0.0.1".to_owned(),
             port: 7143,
             grpc_bind: "127.0.0.1".to_owned(),
@@ -1384,7 +1390,7 @@ async fn browser_service_roundtrip_navigate_and_screenshot() {
         "<html><head><title>Integration Title</title></head><body>ok</body></html>",
     );
     let runtime = std::sync::Arc::new(
-        BrowserRuntimeState::new(&Args {
+        browser_runtime_state_for_tests(&Args {
             bind: "127.0.0.1".to_owned(),
             port: 7143,
             grpc_bind: "127.0.0.1".to_owned(),
@@ -1485,7 +1491,7 @@ function markFiltered(){document.getElementById('filter-status').textContent='fi
         8,
     );
     let runtime = std::sync::Arc::new(
-        BrowserRuntimeState::new(&Args {
+        browser_runtime_state_for_tests(&Args {
             bind: "127.0.0.1".to_owned(),
             port: 7143,
             grpc_bind: "127.0.0.1".to_owned(),
@@ -1786,7 +1792,7 @@ function exportCsv(){
         8,
     );
     let runtime = std::sync::Arc::new(
-        BrowserRuntimeState::new(&Args {
+        browser_runtime_state_for_tests(&Args {
             bind: "127.0.0.1".to_owned(),
             port: 7143,
             grpc_bind: "127.0.0.1".to_owned(),
@@ -1910,7 +1916,7 @@ window.addEventListener('DOMContentLoaded',render);
         8,
     );
     let state_dir = tempfile::tempdir().expect("state temp dir should be available");
-    let mut runtime_state = BrowserRuntimeState::new(&Args {
+    let mut runtime_state = browser_runtime_state_for_tests(&Args {
         bind: "127.0.0.1".to_owned(),
         port: 7143,
         grpc_bind: "127.0.0.1".to_owned(),
@@ -2082,7 +2088,7 @@ async fn browser_service_click_type_and_wait_for_on_fixture_page() {
             "<html><head><title>Actions</title></head><body><input id=\"email\" name=\"email\" /><button id=\"submit\">Submit</button></body></html>",
         );
     let runtime = std::sync::Arc::new(
-        BrowserRuntimeState::new(&Args {
+        browser_runtime_state_for_tests(&Args {
             bind: "127.0.0.1".to_owned(),
             port: 7143,
             grpc_bind: "127.0.0.1".to_owned(),
@@ -2313,7 +2319,7 @@ async fn browser_service_chromium_network_log_includes_same_origin_fetch_failure
     };
     let _guard = chromium_integration_test_guard().await;
     let runtime = std::sync::Arc::new(
-        BrowserRuntimeState::new(&Args {
+        browser_runtime_state_for_tests(&Args {
             bind: "127.0.0.1".to_owned(),
             port: 7143,
             grpc_bind: "127.0.0.1".to_owned(),
@@ -2434,7 +2440,7 @@ async fn browser_service_chromium_preserves_navigated_private_origin_for_user_fe
     };
     let _guard = chromium_integration_test_guard().await;
     let runtime = std::sync::Arc::new(
-        BrowserRuntimeState::new(&Args {
+        browser_runtime_state_for_tests(&Args {
             bind: "127.0.0.1".to_owned(),
             port: 7143,
             grpc_bind: "127.0.0.1".to_owned(),
@@ -2560,7 +2566,7 @@ async fn browser_service_chromium_refreshes_snapshot_before_allowlisted_actions(
     };
     let _guard = chromium_integration_test_guard().await;
     let runtime = std::sync::Arc::new(
-        BrowserRuntimeState::new(&Args {
+        browser_runtime_state_for_tests(&Args {
             bind: "127.0.0.1".to_owned(),
             port: 7143,
             grpc_bind: "127.0.0.1".to_owned(),
@@ -2659,7 +2665,7 @@ async fn browser_service_chromium_refreshes_snapshot_before_allowlisted_actions(
 #[tokio::test(flavor = "multi_thread")]
 async fn browser_service_clamps_untrusted_session_budgets() {
     let runtime = std::sync::Arc::new(
-        BrowserRuntimeState::new(&Args {
+        browser_runtime_state_for_tests(&Args {
             bind: "127.0.0.1".to_owned(),
             port: 7143,
             grpc_bind: "127.0.0.1".to_owned(),
@@ -2779,7 +2785,7 @@ async fn browser_service_rejects_oversized_type_input() {
         "<html><body><input id=\"name\" name=\"name\" /></body></html>",
     );
     let runtime = std::sync::Arc::new(
-        BrowserRuntimeState::new(&Args {
+        browser_runtime_state_for_tests(&Args {
             bind: "127.0.0.1".to_owned(),
             port: 7143,
             grpc_bind: "127.0.0.1".to_owned(),
@@ -2880,7 +2886,7 @@ async fn browser_service_rejects_oversized_type_input() {
 async fn browser_service_blocks_download_click_when_disabled() {
     let (url, handle) = spawn_static_http_server(200, PARITY_DOWNLOAD_TRIGGER_HTML);
     let runtime = std::sync::Arc::new(
-        BrowserRuntimeState::new(&Args {
+        browser_runtime_state_for_tests(&Args {
             bind: "127.0.0.1".to_owned(),
             port: 7143,
             grpc_bind: "127.0.0.1".to_owned(),
@@ -2969,7 +2975,7 @@ async fn browser_service_blocks_download_click_when_disabled() {
 async fn browser_service_observe_returns_stable_sanitized_snapshot() {
     let (url, handle) = spawn_static_http_server(200, PARITY_TRICKY_DOM_HTML);
     let runtime = std::sync::Arc::new(
-        BrowserRuntimeState::new(&Args {
+        browser_runtime_state_for_tests(&Args {
             bind: "127.0.0.1".to_owned(),
             port: 7143,
             grpc_bind: "127.0.0.1".to_owned(),
@@ -3136,7 +3142,7 @@ async fn browser_service_observe_truncates_deterministically_when_oversized() {
         );
     let (url, handle) = spawn_static_http_server(200, large_body.as_str());
     let runtime = std::sync::Arc::new(
-        BrowserRuntimeState::new(&Args {
+        browser_runtime_state_for_tests(&Args {
             bind: "127.0.0.1".to_owned(),
             port: 7143,
             grpc_bind: "127.0.0.1".to_owned(),
@@ -3246,7 +3252,7 @@ async fn browser_service_network_log_redacts_sensitive_values() {
         ],
     );
     let runtime = std::sync::Arc::new(
-        BrowserRuntimeState::new(&Args {
+        browser_runtime_state_for_tests(&Args {
             bind: "127.0.0.1".to_owned(),
             port: 7143,
             grpc_bind: "127.0.0.1".to_owned(),
@@ -3370,7 +3376,7 @@ async fn browser_service_network_log_redacts_sensitive_values() {
 async fn browser_service_reset_state_clears_cookie_jar_for_fixture_domain() {
     let (url, handle) = spawn_cookie_state_http_server();
     let runtime = std::sync::Arc::new(
-        BrowserRuntimeState::new(&Args {
+        browser_runtime_state_for_tests(&Args {
             bind: "127.0.0.1".to_owned(),
             port: 7143,
             grpc_bind: "127.0.0.1".to_owned(),
@@ -3542,7 +3548,7 @@ async fn browser_service_reset_state_clears_network_log_baseline() {
 #[tokio::test(flavor = "multi_thread")]
 async fn browser_service_permissions_default_to_deny() {
     let runtime = std::sync::Arc::new(
-        BrowserRuntimeState::new(&Args {
+        browser_runtime_state_for_tests(&Args {
             bind: "127.0.0.1".to_owned(),
             port: 7143,
             grpc_bind: "127.0.0.1".to_owned(),
@@ -3607,7 +3613,7 @@ async fn browser_service_tabs_keep_independent_state() {
         "<html><head><title>Secondary Tab</title></head><body>tab-two</body></html>",
     );
     let runtime = std::sync::Arc::new(
-        BrowserRuntimeState::new(&Args {
+        browser_runtime_state_for_tests(&Args {
             bind: "127.0.0.1".to_owned(),
             port: 7143,
             grpc_bind: "127.0.0.1".to_owned(),
@@ -3751,7 +3757,7 @@ async fn browser_service_tabs_keep_independent_state() {
 #[tokio::test(flavor = "multi_thread")]
 async fn browser_service_open_tab_enforces_session_tab_limit() {
     let runtime = std::sync::Arc::new(
-        BrowserRuntimeState::new(&Args {
+        browser_runtime_state_for_tests(&Args {
             bind: "127.0.0.1".to_owned(),
             port: 7143,
             grpc_bind: "127.0.0.1".to_owned(),
@@ -3840,7 +3846,7 @@ async fn browser_service_profile_persistence_roundtrip_restores_state() {
         "<html><head><title>Persisted Profile</title></head><body><p>persisted</p></body></html>",
     );
     let state_dir = tempfile::tempdir().expect("state temp dir should be available");
-    let mut runtime_state = BrowserRuntimeState::new(&Args {
+    let mut runtime_state = browser_runtime_state_for_tests(&Args {
         bind: "127.0.0.1".to_owned(),
         port: 7143,
         grpc_bind: "127.0.0.1".to_owned(),
@@ -3988,7 +3994,7 @@ async fn browser_service_profile_persistence_roundtrip_restores_state() {
 #[tokio::test(flavor = "multi_thread")]
 async fn browser_service_profile_session_create_uses_profile_id_as_persistence_id() {
     let state_dir = tempfile::tempdir().expect("state temp dir should be available");
-    let mut runtime_state = BrowserRuntimeState::new(&Args {
+    let mut runtime_state = browser_runtime_state_for_tests(&Args {
         bind: "127.0.0.1".to_owned(),
         port: 7143,
         grpc_bind: "127.0.0.1".to_owned(),
@@ -4666,7 +4672,7 @@ fn validate_restored_snapshot_against_profile_accepts_raw_persisted_hash() {
 #[tokio::test(flavor = "multi_thread")]
 async fn browser_service_profile_restore_rejects_snapshot_revision_rollback() {
     let state_dir = tempfile::tempdir().expect("state temp dir should be available");
-    let mut runtime_state = BrowserRuntimeState::new(&Args {
+    let mut runtime_state = browser_runtime_state_for_tests(&Args {
         bind: "127.0.0.1".to_owned(),
         port: 7143,
         grpc_bind: "127.0.0.1".to_owned(),
@@ -4795,7 +4801,7 @@ async fn browser_service_profile_restore_rejects_snapshot_revision_rollback() {
 #[tokio::test(flavor = "multi_thread")]
 async fn browser_service_relay_rejects_unsupported_action_kind() {
     let runtime = std::sync::Arc::new(
-        BrowserRuntimeState::new(&Args {
+        browser_runtime_state_for_tests(&Args {
             bind: "127.0.0.1".to_owned(),
             port: 7143,
             grpc_bind: "127.0.0.1".to_owned(),
@@ -4862,7 +4868,7 @@ async fn browser_service_relay_rejects_unsupported_action_kind() {
 #[tokio::test(flavor = "multi_thread")]
 async fn browser_service_relay_rejects_oversized_payload_budget() {
     let runtime = std::sync::Arc::new(
-        BrowserRuntimeState::new(&Args {
+        browser_runtime_state_for_tests(&Args {
             bind: "127.0.0.1".to_owned(),
             port: 7143,
             grpc_bind: "127.0.0.1".to_owned(),
@@ -4937,7 +4943,7 @@ async fn browser_service_relay_capture_selection_reports_exact_limit_without_tru
         "<html><head><title>Selection</title></head><body>selection body</body></html>",
     );
     let runtime = std::sync::Arc::new(
-        BrowserRuntimeState::new(&Args {
+        browser_runtime_state_for_tests(&Args {
             bind: "127.0.0.1".to_owned(),
             port: 7143,
             grpc_bind: "127.0.0.1".to_owned(),
@@ -5059,7 +5065,7 @@ async fn browser_service_relay_capture_selection_reports_exact_limit_without_tru
 async fn browser_service_relay_rejects_unsupported_action_kind_with_auth_token() {
     const AUTH_TOKEN: &str = "test-token";
     let runtime = std::sync::Arc::new(
-        BrowserRuntimeState::new(&Args {
+        browser_runtime_state_for_tests(&Args {
             bind: "127.0.0.1".to_owned(),
             port: 7143,
             grpc_bind: "127.0.0.1".to_owned(),
@@ -5131,7 +5137,7 @@ async fn browser_service_relay_rejects_unsupported_action_kind_with_auth_token()
 async fn browser_service_relay_rejects_oversized_payload_budget_with_auth_token() {
     const AUTH_TOKEN: &str = "test-token";
     let runtime = std::sync::Arc::new(
-        BrowserRuntimeState::new(&Args {
+        browser_runtime_state_for_tests(&Args {
             bind: "127.0.0.1".to_owned(),
             port: 7143,
             grpc_bind: "127.0.0.1".to_owned(),
@@ -5207,7 +5213,7 @@ async fn browser_service_relay_rejects_oversized_payload_budget_with_auth_token(
 async fn browser_service_relay_requires_valid_bearer_token_when_auth_enabled() {
     const AUTH_TOKEN: &str = "test-token";
     let runtime = std::sync::Arc::new(
-        BrowserRuntimeState::new(&Args {
+        browser_runtime_state_for_tests(&Args {
             bind: "127.0.0.1".to_owned(),
             port: 7143,
             grpc_bind: "127.0.0.1".to_owned(),
@@ -5309,7 +5315,7 @@ async fn browser_service_relay_open_tab_blocks_private_targets_even_with_auth_to
     const AUTH_TOKEN: &str = "test-token";
     let url = "http://127.0.0.1:8080/".to_owned();
     let runtime = std::sync::Arc::new(
-        BrowserRuntimeState::new(&Args {
+        browser_runtime_state_for_tests(&Args {
             bind: "127.0.0.1".to_owned(),
             port: 7143,
             grpc_bind: "127.0.0.1".to_owned(),
@@ -5390,7 +5396,7 @@ async fn browser_service_relay_send_snapshot_succeeds_with_auth_token() {
         "<html><head><title>Relay Snapshot</title></head><body>relay snapshot text</body></html>",
     );
     let runtime = std::sync::Arc::new(
-        BrowserRuntimeState::new(&Args {
+        browser_runtime_state_for_tests(&Args {
             bind: "127.0.0.1".to_owned(),
             port: 7143,
             grpc_bind: "127.0.0.1".to_owned(),
@@ -5487,7 +5493,7 @@ async fn browser_service_relay_send_snapshot_succeeds_with_auth_token() {
 #[tokio::test(flavor = "multi_thread")]
 async fn browser_service_download_allowlist_and_quarantine_artifacts() {
     let runtime = std::sync::Arc::new(
-        BrowserRuntimeState::new(&Args {
+        browser_runtime_state_for_tests(&Args {
             bind: "127.0.0.1".to_owned(),
             port: 7143,
             grpc_bind: "127.0.0.1".to_owned(),
@@ -5639,7 +5645,7 @@ async fn browser_service_download_allowlist_and_quarantine_artifacts() {
 #[tokio::test(flavor = "multi_thread")]
 async fn browser_service_rejects_downloads_that_exceed_max_file_bytes() {
     let runtime = std::sync::Arc::new(
-        BrowserRuntimeState::new(&Args {
+        browser_runtime_state_for_tests(&Args {
             bind: "127.0.0.1".to_owned(),
             port: 7143,
             grpc_bind: "127.0.0.1".to_owned(),
