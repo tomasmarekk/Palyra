@@ -210,6 +210,7 @@ const EXTERNAL_MARKER_NEEDLES: &[(&str, &str)] = &[
 const SENSITIVE_ASSIGNMENT_KEYS: &[&str] = &[
     "api_key",
     "apikey",
+    "auth_token",
     "access_token",
     "refresh_token",
     "client_secret",
@@ -895,11 +896,12 @@ fn detect_sensitive_header(line: &str, lowered: &str) -> Option<&'static str> {
 /// (env/vault indirection, placeholder, fixture) rather than secret material.
 fn detect_sensitive_assignment(line: &str) -> Option<&'static str> {
     let separator_index = sensitive_assignment_separator_index(line)?;
-    let key = assignment_key_identifier(line.get(..separator_index)?)?;
+    let raw_key = line.get(..separator_index)?;
+    let key = assignment_key_identifier(raw_key)?;
     let value = line.get(separator_index + 1..)?.trim();
     if value.is_empty()
         || key.ends_with("_ref")
-        || is_safe_secret_reference_value(key.as_str(), value)
+        || is_safe_secret_reference_value(raw_key, key.as_str(), value)
     {
         return None;
     }
@@ -975,6 +977,9 @@ fn classify_sensitive_assignment_key(key: &str) -> Option<&'static str> {
     if compact.contains("apikey") {
         return Some("api_key");
     }
+    if compact.contains("authtoken") {
+        return Some("auth_token");
+    }
     if compact.contains("accesstoken") {
         return Some("access_token");
     }
@@ -1007,7 +1012,7 @@ fn classify_sensitive_assignment_key(key: &str) -> Option<&'static str> {
 /// Recognizes assignment values that mention a secret without containing one:
 /// env/vault indirection, DOM reads, placeholders, fixtures, and non-literal
 /// source expressions.
-fn is_safe_secret_reference_value(key: &str, value: &str) -> bool {
+fn is_safe_secret_reference_value(raw_key: &str, key: &str, value: &str) -> bool {
     let normalized = value.trim().trim_end_matches(';').trim();
     if normalized.is_empty() {
         return false;
@@ -1021,7 +1026,7 @@ fn is_safe_secret_reference_value(key: &str, value: &str) -> bool {
         || is_env_getter_reference(normalized, "os.getenv")
         || is_os_environ_index_reference(normalized)
         || is_env_identifier_reference_expression(key, normalized)
-        || is_standalone_env_identifier_literal(normalized)
+        || is_safe_standalone_env_identifier_literal(raw_key, key, normalized)
         || is_vault_reference_value(normalized)
         || is_obvious_placeholder_secret_value(normalized)
         || is_benign_mock_credential_fixture_value(normalized)
@@ -1109,6 +1114,12 @@ fn is_env_identifier_reference_expression(key: &str, value: &str) -> bool {
     value.contains('(') || value.contains('[') || assignment_key_describes_env_identifier(key)
 }
 
+fn is_safe_standalone_env_identifier_literal(raw_key: &str, key: &str, value: &str) -> bool {
+    is_standalone_env_identifier_literal(value)
+        && (assignment_key_describes_env_identifier(key)
+            || is_source_declaration_assignment(raw_key))
+}
+
 // Requires SCREAMING_SNAKE shape (underscore, no lowercase) so ordinary words
 // and real secret values are not mistaken for env-var names.
 fn is_env_reference_identifier_literal(value: &str) -> bool {
@@ -1134,6 +1145,16 @@ fn is_standalone_env_identifier_literal(value: &str) -> bool {
 
 fn assignment_key_describes_env_identifier(key: &str) -> bool {
     key.contains("name") || key.contains("var") || key.contains("env") || key.contains("identifier")
+}
+
+fn is_source_declaration_assignment(raw_key: &str) -> bool {
+    let trimmed = raw_key.trim();
+    trimmed.starts_with("const ")
+        || trimmed.starts_with("let ")
+        || trimmed.starts_with("var ")
+        || trimmed.starts_with("static ")
+        || trimmed.starts_with("pub const ")
+        || trimmed.starts_with("pub static ")
 }
 
 fn is_obvious_placeholder_secret_value(value: &str) -> bool {
@@ -1656,6 +1677,7 @@ fn is_secret_like_marker_token(token: &str) -> bool {
     let normalized = token.to_ascii_lowercase();
     normalized.contains("palyra_test_secret")
         || normalized.contains("dummy_secret")
+        || normalized.contains("should_not_leak")
         || normalized.contains("secret_should_not_appear")
         || (normalized.contains("secret")
             && (normalized.contains("should_not_appear")
@@ -2219,6 +2241,36 @@ mod tests {
             .finding_codes()
             .iter()
             .any(|code| code == "secret_leak.assignment.api_key"));
+    }
+
+    #[test]
+    fn toml_api_key_and_auth_token_values_are_redacted() {
+        let source = "api_key = \"SHOULD_NOT_LEAK_WORKSPACE\"\n\
+                      auth_token = 'SHOULD_NOT_LEAK_HOME'\n\
+                      api_key_name = \"PALYRA_E2E_API_KEY\"";
+        let outcome = redact_text_for_export(
+            source,
+            SafetySourceKind::Workspace,
+            SafetyContentKind::WorkspaceDocument,
+            TrustLabel::TrustedLocal,
+        );
+
+        assert!(outcome.redacted);
+        assert!(outcome.redacted_text.contains("api_key = \"[REDACTED_SECRET]\""));
+        assert!(outcome.redacted_text.contains("auth_token = '[REDACTED_SECRET]'"));
+        assert!(outcome.redacted_text.contains("api_key_name = \"PALYRA_E2E_API_KEY\""));
+        assert!(!outcome.redacted_text.contains("SHOULD_NOT_LEAK_WORKSPACE"));
+        assert!(!outcome.redacted_text.contains("SHOULD_NOT_LEAK_HOME"));
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.api_key"));
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.auth_token"));
     }
 
     #[test]
