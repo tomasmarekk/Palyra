@@ -706,7 +706,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                     ),
                     (
                         "cwd",
-                        json!({"type":"string","description":"Workspace-confined working directory. Omit for the workspace root, or use /workspace and /workspace/subdir as virtual workspace aliases."}),
+                        json!({"type":"string","description":"Working directory. In sandbox mode, omit for the workspace root or use /workspace and /workspace/subdir as virtual workspace aliases. In host-access E2E mode, safe launch-context path prefixes such as %PALYRA_E2E_OS_ROOT%, $PALYRA_E2E_OS_ROOT, ${PALYRA_E2E_OS_ROOT}, and $PALYRA_E2E_HOME are also accepted."}),
                     ),
                     (
                         "env",

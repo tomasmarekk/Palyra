@@ -18,6 +18,7 @@
 #![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
 use std::{
+    collections::BTreeMap,
     fs,
     io::{self, Read},
     path::{Component, Path, PathBuf},
@@ -495,7 +496,7 @@ pub fn run_constrained_process_with_cancellation(
         });
     }
 
-    let input = parse_process_runner_input(input_json)?;
+    let mut input = parse_process_runner_input(input_json)?;
     validate_input_shape(&input)?;
     validate_allowed_executable(policy, input.command.as_str())?;
     validate_no_embedded_command_line_arg(&input)?;
@@ -505,16 +506,24 @@ pub fn run_constrained_process_with_cancellation(
     let host_access = process_runner_allows_host_access(policy);
     let workspace_root = canonical_workspace_root(policy.workspace_root.as_path())?;
     let host_access_roots = host_access.then(|| host_access_roots_for_input(&input));
+    let host_access_path_env = host_access.then(|| host_access_path_env_for_input(&input));
     let working_directory = if let Some(host_access_roots) = host_access_roots.as_ref() {
         resolve_host_working_directory_with_roots(
             workspace_root.as_path(),
             input.cwd.as_deref(),
             host_access_roots.as_slice(),
+            host_access_path_env.as_ref().expect("host path env should be initialized"),
         )?
     } else {
         resolve_working_directory(workspace_root.as_path(), input.cwd.as_deref())?
     };
     if let Some(host_access_roots) = host_access_roots.as_ref() {
+        let path_env = host_access_path_env.as_ref().expect("host path env should be initialized");
+        input.args = rewrite_host_access_process_args(
+            input.args.as_slice(),
+            workspace_root.as_path(),
+            path_env,
+        )?;
         validate_host_command_path_scope_with_roots(
             workspace_root.as_path(),
             working_directory.as_path(),
@@ -2160,13 +2169,15 @@ fn resolve_host_working_directory(
     cwd: Option<&str>,
 ) -> Result<PathBuf, SandboxProcessRunError> {
     let host_roots = user_owned_host_roots();
-    resolve_host_working_directory_with_roots(workspace_root, cwd, host_roots.as_slice())
+    let path_env = BTreeMap::new();
+    resolve_host_working_directory_with_roots(workspace_root, cwd, host_roots.as_slice(), &path_env)
 }
 
 fn resolve_host_working_directory_with_roots(
     workspace_root: &Path,
     cwd: Option<&str>,
     host_roots: &[PathBuf],
+    path_env: &BTreeMap<String, PathBuf>,
 ) -> Result<PathBuf, SandboxProcessRunError> {
     let cwd_value = cwd.unwrap_or(".");
     if cwd_value.contains('\0') {
@@ -2175,10 +2186,13 @@ fn resolve_host_working_directory_with_roots(
             message: "host process runner denied cwd with embedded NUL byte".to_owned(),
         });
     }
+    let expanded_cwd = expand_host_access_safe_env_path(cwd_value, path_env)?;
+    let resolved_cwd = expanded_cwd.as_ref().map(|path| path.to_string_lossy().to_string());
+    let cwd_for_resolution = resolved_cwd.as_deref().unwrap_or(cwd_value);
     let resolved = resolve_host_access_path_with_roots(
         workspace_root,
         workspace_root,
-        cwd_value,
+        cwd_for_resolution,
         true,
         host_roots,
     )?;
@@ -2956,6 +2970,22 @@ fn host_access_roots_for_input(input: &ProcessRunnerInput) -> Vec<PathBuf> {
     roots
 }
 
+fn host_access_path_env_for_input(input: &ProcessRunnerInput) -> BTreeMap<String, PathBuf> {
+    let mut path_env = BTreeMap::new();
+    for key in HOST_ACCESS_SAFE_PALYRA_ENV_KEYS {
+        let Some(value) = input.env.get(*key).filter(|value| !value.trim().is_empty()) else {
+            continue;
+        };
+        let Ok(canonical) = fs::canonicalize(Path::new(value)) else {
+            continue;
+        };
+        if canonical.is_dir() {
+            path_env.insert((*key).to_owned(), canonical);
+        }
+    }
+    path_env
+}
+
 // Host-access scope = operator-configured roots (PALYRA_OS_FILE_ROOTS) + the user profile +
 // temp directories. Roots that fail to canonicalize or are not directories are silently
 // dropped: a missing root must narrow the scope, never widen or break it.
@@ -3131,13 +3161,69 @@ fn named_virtual_workspace_path_suffix(raw: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+fn rewrite_host_access_process_args(
+    args: &[String],
+    workspace_root: &Path,
+    path_env: &BTreeMap<String, PathBuf>,
+) -> Result<Vec<String>, SandboxProcessRunError> {
+    args.iter()
+        .map(|arg| {
+            let expanded = rewrite_host_access_safe_env_arg(arg.as_str(), path_env)?;
+            rewrite_host_virtual_workspace_arg(expanded.as_str(), workspace_root)
+        })
+        .collect()
+}
+
 fn rewrite_host_virtual_workspace_args(
     args: &[String],
     workspace_root: &Path,
 ) -> Result<Vec<String>, SandboxProcessRunError> {
-    args.iter()
-        .map(|arg| rewrite_host_virtual_workspace_arg(arg.as_str(), workspace_root))
-        .collect()
+    rewrite_host_access_process_args(args, workspace_root, &BTreeMap::new())
+}
+
+fn rewrite_host_access_safe_env_arg(
+    arg: &str,
+    path_env: &BTreeMap<String, PathBuf>,
+) -> Result<String, SandboxProcessRunError> {
+    let trimmed = arg.trim();
+    if host_access_arg_starts_with_supported_path_env(trimmed) {
+        if let Some(path) = expand_host_access_safe_env_path(trimmed, path_env)? {
+            return Ok(path.to_string_lossy().to_string());
+        }
+    }
+
+    if let Some((name, value)) = trimmed.split_once('=') {
+        let value = value.trim();
+        if name.starts_with('-') && host_access_arg_starts_with_supported_path_env(value) {
+            let Some(path) = expand_host_access_safe_env_path(value, path_env)? else {
+                return Ok(arg.to_owned());
+            };
+            return Ok(format!("{name}={}", path.to_string_lossy()));
+        }
+    }
+
+    Ok(arg.to_owned())
+}
+
+fn host_access_arg_starts_with_supported_path_env(arg: &str) -> bool {
+    HOST_ACCESS_SAFE_PALYRA_ENV_KEYS.iter().any(|key| {
+        let windows_prefix = format!("%{key}%");
+        if arg.starts_with(windows_prefix.as_str()) {
+            return true;
+        }
+        let braced_prefix = format!("${{{key}}}");
+        if arg.starts_with(braced_prefix.as_str()) {
+            return true;
+        }
+        let bare_prefix = format!("${key}");
+        if !arg.starts_with(bare_prefix.as_str()) {
+            return false;
+        }
+        arg[bare_prefix.len()..]
+            .chars()
+            .next()
+            .is_none_or(|ch| !(ch.is_ascii_alphanumeric() || ch == '_'))
+    })
 }
 
 fn rewrite_host_virtual_workspace_arg(
@@ -3169,6 +3255,118 @@ fn resolve_host_virtual_workspace_arg_path(
 
     let resolved = resolve_scoped_path(workspace_root, workspace_root, raw, false)?;
     Ok(Some(resolved.to_string_lossy().to_string()))
+}
+
+fn expand_host_access_safe_env_path(
+    raw: &str,
+    path_env: &BTreeMap<String, PathBuf>,
+) -> Result<Option<PathBuf>, SandboxProcessRunError> {
+    let Some((key, suffix)) = host_access_path_env_prefix(raw)? else {
+        return Ok(None);
+    };
+    let Some(base) = path_env.get(key) else {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+            message: format!(
+                "host process runner path references unset or unsupported environment variable '{key}'"
+            ),
+        });
+    };
+    append_host_access_path_env_suffix(base.clone(), suffix).map(Some)
+}
+
+fn host_access_path_env_prefix(path: &str) -> Result<Option<(&str, &str)>, SandboxProcessRunError> {
+    if let Some(rest) = path.strip_prefix('%') {
+        let Some(end) = rest.find('%') else {
+            return Err(SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+                message: "host process runner path has malformed %VAR% environment prefix"
+                    .to_owned(),
+            });
+        };
+        let key = &rest[..end];
+        validate_host_access_path_env_key(key)?;
+        return Ok(Some((key, &rest[end + 1..])));
+    }
+    if let Some(rest) = path.strip_prefix("${") {
+        let Some(end) = rest.find('}') else {
+            return Err(SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+                message: "host process runner path has malformed ${VAR} environment prefix"
+                    .to_owned(),
+            });
+        };
+        let key = &rest[..end];
+        validate_host_access_path_env_key(key)?;
+        return Ok(Some((key, &rest[end + 1..])));
+    }
+    if let Some(rest) = path.strip_prefix('$') {
+        let key_len = rest
+            .char_indices()
+            .take_while(|(_, ch)| ch.is_ascii_alphanumeric() || *ch == '_')
+            .map(|(index, ch)| index + ch.len_utf8())
+            .last()
+            .unwrap_or(0);
+        if key_len == 0 {
+            return Err(SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+                message: "host process runner path has malformed $VAR environment prefix"
+                    .to_owned(),
+            });
+        }
+        let key = &rest[..key_len];
+        validate_host_access_path_env_key(key)?;
+        return Ok(Some((key, &rest[key_len..])));
+    }
+    Ok(None)
+}
+
+fn validate_host_access_path_env_key(key: &str) -> Result<(), SandboxProcessRunError> {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+            message: "host process runner path environment variable name is empty".to_owned(),
+        });
+    };
+    if !(first.is_ascii_alphabetic() || first == '_')
+        || !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+            message: "host process runner path environment variable name must use ASCII letters, digits, or underscores".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn append_host_access_path_env_suffix(
+    mut base: PathBuf,
+    suffix: &str,
+) -> Result<PathBuf, SandboxProcessRunError> {
+    let relative_suffix = suffix.trim_start_matches(['/', '\\']);
+    if relative_suffix.is_empty() {
+        return Ok(base);
+    }
+    for segment in relative_suffix.split(['/', '\\']) {
+        if segment.is_empty() {
+            continue;
+        }
+        if segment == "." || segment == ".." || segment.contains(':') {
+            return Err(SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+                message: "host process runner environment path suffix must stay relative to the expanded root".to_owned(),
+            });
+        }
+        if segment.chars().any(char::is_control) {
+            return Err(SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+                message: "host process runner path contains unsupported characters".to_owned(),
+            });
+        }
+        base.push(segment);
+    }
+    Ok(base)
 }
 
 fn nearest_existing_ancestor(path: &Path) -> Result<PathBuf, SandboxProcessRunError> {
@@ -4527,7 +4725,9 @@ fn build_process_command(
 ) -> Result<Command, SandboxProcessRunError> {
     if process_runner_allows_host_access(policy) {
         let program = resolve_tier_b_process_program(input.command.as_str(), cwd);
-        let args = rewrite_host_virtual_workspace_args(input.args.as_slice(), workspace_root)?;
+        let path_env = host_access_path_env_for_input(input);
+        let args =
+            rewrite_host_access_process_args(input.args.as_slice(), workspace_root, &path_env)?;
         let mut command = build_tier_b_process_command(program.as_path(), args.as_slice(), cwd)?;
         configure_host_access_process_environment(
             &mut command,
@@ -5392,8 +5592,9 @@ mod tests {
         collect_requested_egress_hosts, cpu_rlimit_seconds_from_usage_micros,
         host_access_roots_for_input, is_host_allowlisted, process_failure_message,
         process_runner_command_with_args_message, redacted_process_output_preview,
-        redacted_process_output_text, resolve_host_working_directory, resolve_scoped_path,
-        resolve_working_directory, rewrite_arguments_to_scoped_paths,
+        redacted_process_output_text, resolve_host_working_directory,
+        resolve_host_working_directory_with_roots, resolve_scoped_path, resolve_working_directory,
+        rewrite_arguments_to_scoped_paths, rewrite_host_access_process_args,
         rewrite_host_virtual_workspace_args, run_constrained_process,
         run_constrained_process_with_cancellation, validate_argument_workspace_scope,
         validate_cmd_invocation_shape, validate_host_argument_scope,
@@ -5609,6 +5810,37 @@ mod tests {
         .expect("host access should allow user-owned OS cwd");
 
         assert_eq!(resolved, canonical_outside);
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+        let _ = fs::remove_dir_all(outside.as_path());
+    }
+
+    #[test]
+    fn resolve_host_working_directory_expands_safe_env_root() {
+        let workspace = unique_temp_dir("workspace-host-env-cwd");
+        let outside = unique_temp_dir("outside-host-env-cwd");
+        let nested = outside.join("nested");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        fs::create_dir_all(nested.as_path()).expect("env cwd directory should be created");
+        let canonical_workspace = fs::canonicalize(workspace.as_path())
+            .expect("workspace root should canonicalize for host access");
+        let canonical_outside =
+            fs::canonicalize(outside.as_path()).expect("outside root should canonicalize");
+        let canonical_nested =
+            fs::canonicalize(nested.as_path()).expect("nested cwd should canonicalize");
+        let host_roots = vec![canonical_outside.clone()];
+        let path_env =
+            BTreeMap::from([("PALYRA_E2E_OS_ROOT".to_owned(), canonical_outside.clone())]);
+
+        let resolved = resolve_host_working_directory_with_roots(
+            canonical_workspace.as_path(),
+            Some("%PALYRA_E2E_OS_ROOT%\\nested"),
+            host_roots.as_slice(),
+            &path_env,
+        )
+        .expect("host access cwd should expand safe launch-context path env roots");
+
+        assert_eq!(resolved, canonical_nested);
 
         let _ = fs::remove_dir_all(workspace.as_path());
         let _ = fs::remove_dir_all(outside.as_path());
@@ -6000,6 +6232,91 @@ mod tests {
         assert_eq!(rewritten[2], host_absolute);
 
         let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    fn host_access_rewrites_safe_env_path_args() {
+        let workspace = unique_temp_dir("workspace-host-env-arg");
+        let outside = unique_temp_dir("outside-host-env-arg");
+        let nested = outside.join("fixtures");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        fs::create_dir_all(nested.as_path()).expect("env arg directory should be created");
+        let canonical_workspace = fs::canonicalize(workspace.as_path())
+            .expect("workspace root should canonicalize for host access");
+        let canonical_outside =
+            fs::canonicalize(outside.as_path()).expect("outside root should canonicalize");
+        let expected_fixture =
+            canonical_outside.join("fixtures").join("provider.toml").to_string_lossy().to_string();
+        let path_env =
+            BTreeMap::from([("PALYRA_E2E_OS_ROOT".to_owned(), canonical_outside.clone())]);
+        let args = vec![
+            "%PALYRA_E2E_OS_ROOT%/fixtures/provider.toml".to_owned(),
+            "--config=%PALYRA_E2E_OS_ROOT%\\fixtures\\provider.toml".to_owned(),
+        ];
+
+        let rewritten = rewrite_host_access_process_args(
+            args.as_slice(),
+            canonical_workspace.as_path(),
+            &path_env,
+        )
+        .expect("host access should rewrite safe path env args");
+
+        assert_eq!(rewritten[0], expected_fixture);
+        assert_eq!(rewritten[1], format!("--config={expected_fixture}"));
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+        let _ = fs::remove_dir_all(outside.as_path());
+    }
+
+    #[test]
+    fn host_access_preserves_unsupported_env_literal_args() {
+        let workspace = unique_temp_dir("workspace-host-env-literal-arg");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        let canonical_workspace = fs::canonicalize(workspace.as_path())
+            .expect("workspace root should canonicalize for host access");
+        let args = vec![
+            "$HOME".to_owned(),
+            "--message=$PALYRA_NOT_A_PATH_ROOT".to_owned(),
+            "%PALYRA_NOT_A_PATH_ROOT%\\fixture.txt".to_owned(),
+        ];
+
+        let rewritten = rewrite_host_access_process_args(
+            args.as_slice(),
+            canonical_workspace.as_path(),
+            &BTreeMap::new(),
+        )
+        .expect("unsupported env literals should not be treated as safe path env prefixes");
+
+        assert_eq!(rewritten, args);
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    fn host_access_rejects_traversal_in_safe_env_path_args() {
+        let workspace = unique_temp_dir("workspace-host-env-arg-traversal");
+        let outside = unique_temp_dir("outside-host-env-arg-traversal");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        fs::create_dir_all(outside.as_path()).expect("env root should be created");
+        let canonical_workspace = fs::canonicalize(workspace.as_path())
+            .expect("workspace root should canonicalize for host access");
+        let canonical_outside =
+            fs::canonicalize(outside.as_path()).expect("outside root should canonicalize");
+        let path_env = BTreeMap::from([("PALYRA_E2E_OS_ROOT".to_owned(), canonical_outside)]);
+        let args = vec!["%PALYRA_E2E_OS_ROOT%/../secret.txt".to_owned()];
+
+        let error = rewrite_host_access_process_args(
+            args.as_slice(),
+            canonical_workspace.as_path(),
+            &path_env,
+        )
+        .expect_err("safe path env suffix traversal must be denied");
+
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+        assert!(error.message.contains("suffix must stay relative"), "{}", error.message);
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+        let _ = fs::remove_dir_all(outside.as_path());
     }
 
     #[test]
