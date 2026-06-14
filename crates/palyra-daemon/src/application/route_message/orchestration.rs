@@ -80,7 +80,7 @@ async fn build_and_record_route_tool_catalog_snapshot(
     run_id: &str,
     provider_kind: &str,
     provider_model_id: Option<&str>,
-    remaining_tool_budget: u32,
+    _remaining_tool_budget: u32,
     tape_seq: &mut i64,
 ) -> Result<ModelVisibleToolCatalogSnapshot, Status> {
     let snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
@@ -97,7 +97,7 @@ async fn build_and_record_route_tool_catalog_snapshot(
         provider_kind,
         provider_model_id,
         surface: ToolExposureSurface::RouteMessage,
-        remaining_tool_budget,
+        remaining_tool_budget: None,
         created_at_unix_ms: current_unix_ms(),
     });
     runtime_state
@@ -475,7 +475,7 @@ pub(crate) async fn handle_routed_route_message(
     })
     .await?;
 
-    let mut remaining_tool_budget = runtime_state.config.tool_call.max_calls_per_run;
+    let mut remaining_tool_budget = 0_u32;
     let tool_catalog_snapshot = build_and_record_route_tool_catalog_snapshot(
         runtime_state,
         &route_request_context,

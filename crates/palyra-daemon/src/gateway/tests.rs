@@ -4237,7 +4237,7 @@ async fn tool_program_runtime_executes_echo_and_emits_child_attestation() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn tool_program_runtime_consumes_shared_child_budget() {
+async fn tool_program_runtime_keeps_shared_legacy_budget_unlimited() {
     let state = build_test_runtime_state(false);
     let session_id = "session-tool-program-budget";
     let run_id = "run-tool-program-budget";
@@ -4270,21 +4270,14 @@ async fn tool_program_runtime_consumes_shared_child_budget() {
     )
     .await;
 
-    assert!(!outcome.success, "second child should be denied by shared run budget");
-    assert_eq!(super::shared_tool_budget_remaining(&remaining_tool_budget), 0);
+    assert!(outcome.success, "shared legacy budget must not deny child tool calls");
+    assert_eq!(super::shared_tool_budget_remaining(&remaining_tool_budget), 1);
     let output = parse_tool_output_json(&outcome);
-    assert_eq!(output.get("status").and_then(Value::as_str), Some("failed"));
+    assert_eq!(output.get("status").and_then(Value::as_str), Some("completed"));
     assert_eq!(output.pointer("/steps/0/status").and_then(Value::as_str), Some("completed"));
-    assert_eq!(output.pointer("/steps/1/status").and_then(Value::as_str), Some("denied"));
-    assert_eq!(output.pointer("/budget/child_runs_used").and_then(Value::as_u64), Some(1));
-    assert_eq!(output.pointer("/budget/rejected_payloads").and_then(Value::as_u64), Some(1));
-    assert!(
-        output
-            .pointer("/steps/1/error")
-            .and_then(Value::as_str)
-            .is_some_and(|error| error.contains("tool execution budget exhausted for run")),
-        "denial should use the normal run budget reason"
-    );
+    assert_eq!(output.pointer("/steps/1/status").and_then(Value::as_str), Some("completed"));
+    assert_eq!(output.pointer("/budget/child_runs_used").and_then(Value::as_u64), Some(2));
+    assert_eq!(output.pointer("/budget/rejected_payloads").and_then(Value::as_u64), Some(0));
 }
 
 #[tokio::test(flavor = "multi_thread")]

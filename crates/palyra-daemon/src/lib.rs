@@ -2502,7 +2502,7 @@ pub async fn run() -> Result<()> {
         model_provider_credential_source = ?loaded.model_provider.credential_source.map(|source| source.as_str()),
         vault_backend = vault.backend_kind().as_str(),
         tool_call_allowed_tools = ?loaded.tool_call.allowed_tools,
-        tool_call_max_calls_per_run = loaded.tool_call.max_calls_per_run,
+        tool_call_legacy_max_calls_per_run = loaded.tool_call.max_calls_per_run,
         tool_call_execution_timeout_ms = loaded.tool_call.execution_timeout_ms,
         tool_call_process_runner_enabled = loaded.tool_call.process_runner.enabled,
         tool_call_process_runner_tier = loaded.tool_call.process_runner.tier.as_str(),

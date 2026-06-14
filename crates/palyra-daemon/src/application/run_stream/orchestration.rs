@@ -3,7 +3,7 @@
 //! [`process_run_stream_message`] accepts one client message on the gateway
 //! `RunStream` and runs the full agent loop: resolve session, plan usage
 //! routing, build the tool catalog, then alternate provider turns and tool
-//! batches (via `tool_flow`) until a final answer or a budget/termination
+//! batches (via `tool_flow`) until a final answer or a non-step termination
 //! reason from `agent_loop`. Every observable step is mirrored to the
 //! orchestrator tape through `tape` so runs replay deterministically.
 //!
@@ -794,7 +794,7 @@ async fn build_and_record_run_stream_tool_catalog_snapshot(
     run_id: &str,
     provider_kind: &str,
     provider_model_id: Option<&str>,
-    remaining_tool_budget: u32,
+    _remaining_tool_budget: u32,
     tape_seq: &mut i64,
 ) -> Result<ModelVisibleToolCatalogSnapshot, Status> {
     let snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
@@ -811,7 +811,7 @@ async fn build_and_record_run_stream_tool_catalog_snapshot(
         provider_kind,
         provider_model_id,
         surface: ToolExposureSurface::RunStream,
-        remaining_tool_budget,
+        remaining_tool_budget: None,
         created_at_unix_ms: current_unix_ms(),
     });
     runtime_state
@@ -968,10 +968,14 @@ fn agent_loop_terminal_status_message(
         reason.as_str(),
         run_id,
         snapshot.completed_tool_calls,
-        snapshot.remaining_model_turns,
-        snapshot.remaining_tool_calls,
+        remaining_count_label(snapshot.remaining_model_turns),
+        remaining_count_label(snapshot.remaining_tool_calls),
         run_id
     )
+}
+
+fn remaining_count_label(value: Option<u32>) -> String {
+    value.map_or_else(|| "unlimited".to_owned(), |remaining| remaining.to_string())
 }
 
 #[allow(clippy::result_large_err)]
@@ -1395,9 +1399,7 @@ pub(crate) async fn process_run_stream_message(
     }
     let mut loop_state = AgentRunLoopState::new(
         base_provider_request.effective_messages(),
-        AgentRunLoopState::default_model_turn_budget(
-            runtime_state.config.tool_call.max_calls_per_run,
-        ),
+        0,
         *remaining_tool_budget,
         DEFAULT_AGENT_LOOP_WALL_CLOCK_BUDGET_MS,
     );
@@ -1504,7 +1506,7 @@ pub(crate) async fn process_run_stream_message(
                 provider_model_override
                     .as_deref()
                     .or(Some(routing_decision.actual_model_id.as_str())),
-                loop_state.remaining_tool_calls(),
+                0,
                 tape_seq,
             )
             .await?
@@ -2002,40 +2004,6 @@ pub(crate) async fn process_run_stream_message(
                         &loop_state,
                         AgentLoopTerminationReason::RepeatedToolFailure,
                         failure.message.as_str(),
-                        provider_trace_ref,
-                    )
-                    .await?;
-                    return Ok(RunStreamMessageProcessingOutcome::Terminate);
-                }
-                if should_terminate_after_tool_budget_exhausted(&loop_state, tool_result_count) {
-                    let message = agent_loop_budget_exhausted_message(
-                        AgentLoopTerminationReason::MaxToolCalls,
-                        &loop_state,
-                        run_id.as_str(),
-                    );
-                    send_budget_exhausted_partial_summary_tokens(
-                        sender,
-                        runtime_state,
-                        request_context,
-                        session_id_for_message.as_str(),
-                        run_id.as_str(),
-                        tape_seq,
-                        model_token_tape_events,
-                        model_token_compaction_emitted,
-                        AgentLoopTerminationReason::MaxToolCalls,
-                        &loop_state,
-                        message.as_str(),
-                    )
-                    .await?;
-                    terminate_run_stream_with_agent_loop_reason(
-                        sender,
-                        runtime_state,
-                        run_state,
-                        run_id.as_str(),
-                        tape_seq,
-                        &loop_state,
-                        AgentLoopTerminationReason::MaxToolCalls,
-                        message.as_str(),
                         provider_trace_ref,
                     )
                     .await?;
@@ -2577,22 +2545,20 @@ fn agent_loop_budget_exhausted_message(
 ) -> String {
     let snapshot = loop_state.snapshot(run_id, Some(reason));
     let base = match reason {
-        AgentLoopTerminationReason::MaxTurns => "agent loop model turn limit reached",
-        AgentLoopTerminationReason::MaxToolCalls => "agent loop tool call limit reached",
         AgentLoopTerminationReason::WallClock => "agent loop wall-clock budget exhausted",
+        AgentLoopTerminationReason::MaxTurns | AgentLoopTerminationReason::MaxToolCalls => {
+            "legacy agent step-count limit observed"
+        }
         _ => "agent loop budget exhausted",
     };
     let tool_result_label =
         if snapshot.completed_tool_calls == 1 { "tool result" } else { "tool results" };
     let recovery_hint = match reason {
-        AgentLoopTerminationReason::MaxToolCalls => {
-            "Increase tool_call.max_calls_per_run only if the workflow genuinely needs more tool steps, or continue in the same session with a narrower resume prompt."
-        }
         AgentLoopTerminationReason::WallClock => {
-            "The tool-call limit was not the terminal condition; continue in the same session with a narrower resume prompt or increase the agent loop wall-clock budget for long process/browser workflows."
+            "Step count was not the terminal condition; continue in the same session with a narrower resume prompt or increase the agent loop wall-clock budget for long process/browser workflows."
         }
-        AgentLoopTerminationReason::MaxTurns => {
-            "Continue in the same session with a narrower resume prompt or increase the model-turn budget for unusually long reasoning workflows."
+        AgentLoopTerminationReason::MaxTurns | AgentLoopTerminationReason::MaxToolCalls => {
+            "Step-count limits are disabled for agent runs; inspect the run tape if an older replay produced this reason."
         }
         _ => "Continue in the same session with a narrower resume prompt.",
     };
@@ -2605,8 +2571,8 @@ fn agent_loop_budget_exhausted_message(
         "{base} after {} model turns and {} {tool_result_label}{continuation_marker}; partial result summary: run tape for {run_id} contains the exact tool evidence, remaining_model_turns={}, remaining_tool_calls={}, elapsed_ms={}. Continue in the same session and ask to resume from run {run_id}. {recovery_hint}",
         snapshot.current_turn,
         snapshot.completed_tool_calls,
-        snapshot.remaining_model_turns,
-        snapshot.remaining_tool_calls,
+        remaining_count_label(snapshot.remaining_model_turns),
+        remaining_count_label(snapshot.remaining_tool_calls),
         snapshot.elapsed_ms
     )
 }
@@ -2615,30 +2581,17 @@ fn should_emit_budget_exhausted_partial_summary(
     reason: AgentLoopTerminationReason,
     loop_state: &AgentRunLoopState,
 ) -> bool {
-    matches!(
-        reason,
-        AgentLoopTerminationReason::MaxTurns
-            | AgentLoopTerminationReason::MaxToolCalls
-            | AgentLoopTerminationReason::WallClock
-    ) && loop_state.completed_tool_calls() > 0
-}
-
-fn should_terminate_after_tool_budget_exhausted(
-    loop_state: &AgentRunLoopState,
-    tool_result_count: usize,
-) -> bool {
-    tool_result_count > 0 && loop_state.remaining_tool_calls() == 0
+    matches!(reason, AgentLoopTerminationReason::WallClock) && loop_state.completed_tool_calls() > 0
 }
 
 fn length_recovery_prompt(
     reason: AgentLoopTerminationReason,
     message: &str,
-    loop_state: &AgentRunLoopState,
+    _loop_state: &AgentRunLoopState,
     attempt_count: u8,
 ) -> Option<&'static str> {
     if attempt_count >= MAX_LENGTH_RECOVERY_ATTEMPTS
         || reason != AgentLoopTerminationReason::IncompleteFinalAnswer
-        || loop_state.remaining_model_turns() == 0
         || !message.contains("finish_reason=length")
     {
         return None;
@@ -2686,10 +2639,7 @@ fn final_answer_recovery_prompt(
     loop_state: &AgentRunLoopState,
     already_attempted: bool,
 ) -> Option<&'static str> {
-    if already_attempted
-        || loop_state.completed_tool_calls() == 0
-        || loop_state.remaining_model_turns() == 0
-    {
+    if already_attempted || loop_state.completed_tool_calls() == 0 {
         return None;
     }
 
@@ -2716,7 +2666,6 @@ fn browser_followup_timeout_recovery_prompt(
     if reason != ProviderRequestTimeoutReason::BrowserFollowup
         || attempt_count >= MAX_BROWSER_FOLLOWUP_RECOVERY_ATTEMPTS
         || loop_state.completed_tool_calls() == 0
-        || loop_state.remaining_model_turns() == 0
     {
         return None;
     }
@@ -3246,13 +3195,12 @@ mod tests {
         provider_request_deadline_timeout, provider_request_timeout_message,
         provider_request_timeout_status, provider_timeout_termination_reason,
         provider_waiting_status_message, repeated_tool_failure_signature,
-        should_emit_budget_exhausted_partial_summary, should_terminate_after_tool_budget_exhausted,
-        terminal_tool_authorization_failure, tool_calls_finish_without_tool_payload,
-        tool_followup_timeout_partial_summary, tool_result_to_provider_message,
-        truncated_final_answer_without_tools, ProviderRequestDeadlineOverride,
-        ProviderRequestTimeoutReason, RepeatedToolFailureTracker, RunStreamToolResultForModel,
-        BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS, MAX_LENGTH_RECOVERY_ATTEMPTS,
-        TOOL_FOLLOWUP_PROVIDER_TIMEOUT_MS,
+        should_emit_budget_exhausted_partial_summary, terminal_tool_authorization_failure,
+        tool_calls_finish_without_tool_payload, tool_followup_timeout_partial_summary,
+        tool_result_to_provider_message, truncated_final_answer_without_tools,
+        ProviderRequestDeadlineOverride, ProviderRequestTimeoutReason, RepeatedToolFailureTracker,
+        RunStreamToolResultForModel, BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS,
+        MAX_LENGTH_RECOVERY_ATTEMPTS, TOOL_FOLLOWUP_PROVIDER_TIMEOUT_MS,
     };
     use super::{AgentLoopTerminationReason, AgentRunLoopState};
     use crate::application::run_stream::tape::RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE;
@@ -3688,26 +3636,26 @@ mod tests {
     }
 
     #[test]
-    fn budget_exhausted_message_includes_resume_context() {
+    fn wall_clock_budget_message_includes_resume_context() {
         let state = loop_state_after_tool("build a browser app", "palyra.browser.navigate");
 
         let message = agent_loop_budget_exhausted_message(
-            AgentLoopTerminationReason::MaxTurns,
+            AgentLoopTerminationReason::WallClock,
             &state,
             "01ARZ3NDEKTSV4RRFFQ69G5FAV",
         );
 
-        assert!(message.contains("model turn limit reached"));
+        assert!(message.contains("wall-clock budget exhausted"));
         assert!(message.contains("1 tool result"));
         assert!(message.contains("needs_continuation=true"));
-        assert!(message.contains("reason_code=max_turns"));
+        assert!(message.contains("reason_code=wall_clock"));
         assert!(message.contains("partial result summary"));
         assert!(message.contains("resume from run 01ARZ3NDEKTSV4RRFFQ69G5FAV"));
-        assert!(message.contains("model-turn budget"));
+        assert!(message.contains("Step count was not the terminal condition"));
     }
 
     #[test]
-    fn tool_budget_exhausted_message_names_tool_call_limit() {
+    fn legacy_step_count_message_does_not_mark_needs_continuation() {
         let state = loop_state_after_tool("clean up generated files", "palyra.fs.apply_patch");
 
         let message = agent_loop_budget_exhausted_message(
@@ -3716,12 +3664,12 @@ mod tests {
             "01ARZ3NDEKTSV4RRFFQ69G5FAV",
         );
 
-        assert!(message.contains("tool call limit reached"));
-        assert!(message.contains("needs_continuation=true"));
-        assert!(message.contains("reason_code=max_tool_calls"));
+        assert!(message.contains("legacy agent step-count limit observed"));
+        assert!(!message.contains("needs_continuation=true"));
+        assert!(!message.contains("reason_code=max_tool_calls"));
         assert!(message.contains("partial result summary"));
         assert!(message.contains("resume from run 01ARZ3NDEKTSV4RRFFQ69G5FAV"));
-        assert!(message.contains("tool_call.max_calls_per_run"));
+        assert!(message.contains("Step-count limits are disabled for agent runs"));
     }
 
     #[test]
@@ -3739,9 +3687,9 @@ mod tests {
         assert!(message.contains("needs_continuation=true"));
         assert!(message.contains("reason_code=wall_clock"));
         assert!(message.contains("partial result summary"));
-        assert!(message.contains("remaining_tool_calls=8"));
+        assert!(message.contains("remaining_tool_calls=unlimited"));
         assert!(message.contains("elapsed_ms="));
-        assert!(message.contains("tool-call limit was not the terminal condition"));
+        assert!(message.contains("Step count was not the terminal condition"));
         assert!(!message.contains("tool_call.max_calls_per_run"));
     }
 
@@ -3887,7 +3835,7 @@ mod tests {
             AgentLoopTerminationReason::WallClock,
             &state
         ));
-        assert!(should_emit_budget_exhausted_partial_summary(
+        assert!(!should_emit_budget_exhausted_partial_summary(
             AgentLoopTerminationReason::MaxToolCalls,
             &state
         ));
@@ -3906,26 +3854,14 @@ mod tests {
         let state = AgentRunLoopState::new(vec![ProviderMessage::user_text("hello")], 4, 8, 10_000);
 
         let message = agent_loop_budget_exhausted_message(
-            AgentLoopTerminationReason::MaxTurns,
+            AgentLoopTerminationReason::WallClock,
             &state,
             "01ARZ3NDEKTSV4RRFFQ69G5FAV",
         );
 
-        assert!(message.contains("model turn limit reached"));
+        assert!(message.contains("wall-clock budget exhausted"));
         assert!(!message.contains("needs_continuation=true"));
-        assert!(!message.contains("reason_code=max_turns"));
-    }
-
-    #[test]
-    fn tool_budget_exhaustion_after_result_batch_terminates_loop() {
-        let mut state = loop_state_after_tool("clean up generated files", "palyra.fs.apply_patch");
-        state.sync_remaining_tool_calls(0);
-
-        assert!(should_terminate_after_tool_budget_exhausted(&state, 1));
-        assert!(!should_terminate_after_tool_budget_exhausted(&state, 0));
-
-        state.sync_remaining_tool_calls(1);
-        assert!(!should_terminate_after_tool_budget_exhausted(&state, 1));
+        assert!(!message.contains("reason_code=wall_clock"));
     }
 
     #[test]

@@ -508,9 +508,9 @@ mod tests {
     }
 
     #[test]
-    fn classify_error_maps_agent_budget_handoff_without_internal_error() {
+    fn classify_error_maps_agent_provider_handoff_without_internal_error() {
         let error = anyhow!(
-            "agent run needs continuation: agent loop tool call limit reached after 95 model turns and 96 tool results; needs_continuation=true reason_code=max_tool_calls; partial result summary: continue in the same session"
+            "agent run needs continuation: model provider failed after tool work; needs_continuation=true reason_code=provider_error; partial result summary: continue in the same session"
         );
 
         assert_eq!(classify_error(&error), CliExitCode::NeedsContinuation);

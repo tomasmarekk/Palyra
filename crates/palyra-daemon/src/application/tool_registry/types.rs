@@ -219,7 +219,7 @@ pub(crate) struct ModelVisibleToolCatalogSnapshot {
     pub(crate) surface: ToolExposureSurface,
     pub(crate) principal_hash: String,
     pub(crate) channel_hash: Option<String>,
-    pub(crate) remaining_tool_budget: u32,
+    pub(crate) remaining_tool_budget: Option<u32>,
     pub(crate) created_at_unix_ms: i64,
     pub(crate) tools: Vec<ModelVisibleTool>,
     pub(crate) filtered_tools: Vec<FilteredToolCatalogEntry>,
@@ -233,7 +233,7 @@ pub(crate) struct ToolCatalogBuildRequest<'a> {
     pub(crate) provider_kind: &'a str,
     pub(crate) provider_model_id: Option<&'a str>,
     pub(crate) surface: ToolExposureSurface,
-    pub(crate) remaining_tool_budget: u32,
+    pub(crate) remaining_tool_budget: Option<u32>,
     pub(crate) created_at_unix_ms: i64,
 }
 

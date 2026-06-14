@@ -639,7 +639,7 @@ pub(crate) fn build_contract_snapshot_suite() -> Value {
         provider_kind: "deterministic",
         provider_model_id: Some("contract-model"),
         surface: ToolExposureSurface::RunStream,
-        remaining_tool_budget: 2,
+        remaining_tool_budget: None,
         created_at_unix_ms: 42,
     });
     let channel_registry = ChannelCommandRegistry::builtin();

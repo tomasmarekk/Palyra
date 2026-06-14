@@ -935,7 +935,6 @@ fn apply_local_desktop_tool_defaults(
         "tool_call.allowed_tools",
         string_array_value(LOCAL_DESKTOP_DEFAULT_ALLOWED_TOOLS),
     )?;
-    set_value_at_path(document, "tool_call.max_calls_per_run", toml::Value::Integer(96))?;
     set_value_at_path(
         document,
         "tool_call.execution_timeout_ms",
@@ -5922,7 +5921,7 @@ mod agent_stream_output_tests {
             completed: false,
             cancelled: false,
             needs_continuation_message: Some(
-                "agent loop tool call limit reached; needs_continuation=true reason_code=max_tool_calls; partial result summary: continue in the same session".to_owned(),
+                "model provider failed after tool work; needs_continuation=true reason_code=provider_error; partial result summary: continue in the same session".to_owned(),
             ),
             failed_message: None,
         };
@@ -12508,7 +12507,7 @@ mod init_command_tests {
         assert_eq!(read_bool(&document, "tool_call.process_runner.enabled"), Some(true));
         assert_eq!(read_bool(&document, "tool_call.wasm_runtime.enabled"), Some(true));
         assert_eq!(read_bool(&document, "tool_call.wasm_runtime.allow_inline_modules"), Some(true));
-        assert_eq!(read_integer(&document, "tool_call.max_calls_per_run"), Some(96));
+        assert_eq!(read_integer(&document, "tool_call.max_calls_per_run"), None);
         assert_eq!(
             read_integer(&document, "tool_call.execution_timeout_ms"),
             Some(super::LOCAL_DESKTOP_TOOL_EXECUTION_TIMEOUT_MS)

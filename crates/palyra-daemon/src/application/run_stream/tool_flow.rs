@@ -234,10 +234,10 @@ pub(crate) async fn process_run_stream_tool_proposal_event(
 
 /// Validates, normalizes, and gates a tool proposal without executing it.
 ///
-/// Catalog rejections consume one unit of tool budget and complete the
-/// proposal immediately with a synthetic failure result so the model still
-/// receives structured feedback. Otherwise the proposal runs through the
-/// security evaluation and approval gate and comes back ready to execute.
+/// Catalog rejections complete the proposal immediately with a synthetic
+/// failure result so the model still receives structured feedback. Otherwise
+/// the proposal runs through the security evaluation and approval gate and
+/// comes back ready to execute.
 ///
 /// # Errors
 ///
@@ -273,7 +273,6 @@ pub(crate) async fn prepare_run_stream_tool_proposal_event(
         ) {
             Ok(normalized) => normalized,
             Err(rejection) => {
-                *remaining_tool_budget = (*remaining_tool_budget).saturating_sub(1);
                 let outcome = reject_run_stream_tool_call(
                     sender,
                     runtime_state,

@@ -711,17 +711,20 @@ pub(crate) struct ToolRuntimeExecutionContext<'a> {
     pub(crate) backend_reason_code: &'a str,
 }
 
-/// Remaining tool-call budget shared between a run loop and nested tool
-/// programs, so child calls draw down the same per-run allowance.
+/// Legacy tool-call counter shared between a run loop and nested tool
+/// programs.
+///
+/// Count-based run termination is disabled; the shared handle is retained so
+/// older audit paths and tool-program call sites can keep a stable shape.
 pub(crate) type SharedToolBudget = Arc<Mutex<u32>>;
 
-/// Wraps an initial remaining budget in the shared handle.
+/// Wraps an initial legacy counter in the shared handle.
 pub(crate) fn shared_tool_budget(remaining_tool_budget: u32) -> SharedToolBudget {
     Arc::new(Mutex::new(remaining_tool_budget))
 }
 
-/// Reads the current remaining budget (recovering from a poisoned lock, since
-/// a plain counter cannot be left inconsistent).
+/// Reads the current legacy counter (recovering from a poisoned lock, since a
+/// plain counter cannot be left inconsistent).
 pub(crate) fn shared_tool_budget_remaining(budget: &SharedToolBudget) -> u32 {
     *budget.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -792,9 +795,7 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation(
         let remaining_tool_budget = match remaining_tool_budget {
             Some(budget) => budget,
             None => {
-                fallback_budget = shared_tool_budget(
-                    runtime_state.config.tool_call.max_calls_per_run.saturating_sub(1),
-                );
+                fallback_budget = shared_tool_budget(0);
                 fallback_budget
             }
         };

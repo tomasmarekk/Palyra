@@ -5958,7 +5958,8 @@ async fn grpc_run_stream_stops_after_repeated_length_recovery_with_tool_evidence
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn grpc_run_stream_reports_partial_summary_when_tool_budget_is_exhausted() -> Result<()> {
+async fn grpc_run_stream_ignores_legacy_tool_budget_and_continues_after_tool_result() -> Result<()>
+{
     let first_response = serde_json::json!({
         "choices": [{
             "finish_reason": "tool_calls",
@@ -5975,8 +5976,19 @@ async fn grpc_run_stream_reports_partial_summary_when_tool_budget_is_exhausted()
         }]
     })
     .to_string();
-    let (openai_base_url, request_count, server_handle) =
-        spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(200, first_response)])?;
+    let second_response = serde_json::json!({
+        "choices": [{
+            "finish_reason": "stop",
+            "message": {
+                "content": "Echo completed after the tool result."
+            }
+        }]
+    })
+    .to_string();
+    let (openai_base_url, request_count, server_handle) = spawn_scripted_openai_server(vec![
+        ScriptedOpenAiResponse::immediate(200, first_response),
+        ScriptedOpenAiResponse::immediate(200, second_response),
+    ])?;
     let (child, admin_port, grpc_port, _journal_db_path) =
         spawn_palyrad_with_openai_provider_and_tool_policy(
             openai_base_url.as_str(),
@@ -6006,7 +6018,6 @@ async fn grpc_run_stream_reports_partial_summary_when_tool_budget_is_exhausted()
         client.run_stream(stream_request).await.context("failed to call RunStream")?.into_inner();
     let mut model_tokens = Vec::new();
     let mut final_token_count = 0usize;
-    let mut failed_messages = Vec::new();
     let mut saw_done = false;
     while let Some(event) = response_stream.next().await {
         let event = event.context("failed to read RunStream event")?;
@@ -6020,11 +6031,6 @@ async fn grpc_run_stream_reports_partial_summary_when_tool_budget_is_exhausted()
                     model_tokens.push(token.token);
                 }
                 common_v1::run_stream_event::Body::Status(status)
-                    if status.kind == common_v1::stream_status::StatusKind::Failed as i32 =>
-                {
-                    failed_messages.push(status.message);
-                }
-                common_v1::run_stream_event::Body::Status(status)
                     if status.kind == common_v1::stream_status::StatusKind::Done as i32 =>
                 {
                     saw_done = true;
@@ -6036,35 +6042,15 @@ async fn grpc_run_stream_reports_partial_summary_when_tool_budget_is_exhausted()
 
     let rendered = model_tokens.concat();
     assert!(
-        rendered.contains("tool call limit reached"),
-        "partial final token should explain tool budget exhaustion: {rendered}"
+        rendered.contains("Echo completed after the tool result."),
+        "run should continue to the final provider turn after the first tool result: {rendered}"
     );
-    assert!(
-        rendered.contains("partial result summary"),
-        "partial final token should include a user-visible summary: {rendered}"
-    );
-    assert!(
-        rendered.contains("needs_continuation=true"),
-        "partial final token should expose the continuation lifecycle marker: {rendered}"
-    );
-    assert!(
-        rendered.contains("tool_call.max_calls_per_run"),
-        "tool budget exhaustion should keep the correct recovery hint: {rendered}"
-    );
-    assert_eq!(final_token_count, 1, "budget summary should close with one final model token");
-    assert!(
-        failed_messages.iter().any(|message| {
-            message.contains("tool call limit reached")
-                && message.contains("needs_continuation=true")
-                && message.contains("partial result summary")
-        }),
-        "terminal status should carry the same needs-continuation summary: {failed_messages:?}"
-    );
-    assert!(!saw_done, "budget-exhausted run should remain failed");
+    assert_eq!(final_token_count, 1, "final answer should close with one final model token");
+    assert!(saw_done, "legacy tool-call config must not fail the agent run");
     assert_eq!(
         request_count.load(Ordering::Relaxed),
-        1,
-        "run must not ask the provider for another turn after tool budget exhaustion"
+        2,
+        "run must request the provider follow-up turn after the tool result"
     );
 
     server_handle.join().expect("scripted openai server thread should exit");

@@ -6,8 +6,8 @@
 //! execution launch -- and records every step in an [`ExecutionGateReport`]
 //! for journal/support-bundle output. The pipeline is fail-closed: the first
 //! blocking gate preempts policy evaluation, later gates report as skipped,
-//! and the run's tool budget is consumed only along the path whose decision
-//! actually allows execution. It runs alongside the legacy decision path
+//! and legacy budget counters are carried through without acting as terminal
+//! step limits. It runs alongside the legacy decision path
 //! during the `execution_gate_pipeline_v2` rollout;
 //! [`append_audit_finalization_step`] records whether both paths agreed so a
 //! mismatch can be triaged (and the rollout rolled back) from audit data.
@@ -33,7 +33,6 @@ use super::tool_security::{
 };
 
 const EXECUTION_GATE_PIPELINE_VERSION: &str = "v2";
-const BUDGET_DENY_REASON: &str = "tool execution budget exhausted for run";
 const UNSUPPORTED_TOOL_DENY_REASON: &str =
     "tool is allowlisted but unsupported by runtime executor";
 
@@ -83,8 +82,8 @@ pub(crate) struct ExecutionGateReport {
     pub(crate) steps: Vec<ExecutionGateStep>,
 }
 
-/// Pipeline result: the enforced decision, the post-decision tool budget,
-/// and the audit report.
+/// Pipeline result: the enforced decision, the legacy budget counter, and the
+/// audit report.
 #[derive(Debug, Clone)]
 pub(crate) struct ExecutionGatePipelineOutcome {
     pub(crate) decision: ToolDecision,
@@ -123,9 +122,9 @@ pub(crate) struct ExecutionGatePipelineInput<'a> {
 /// Gate precedence: a skill-gate denial preempts everything, then a disabled
 /// tool posture, then a backend capability denial; only when none of those
 /// fire is the policy engine consulted, with the approval state deciding
-/// between pending/granted/denied/channel-unavailable outcomes. Budget is
-/// consumed exactly once, on the policy evaluation whose decision is
-/// returned; blocked proposals leave the budget untouched.
+/// between pending/granted/denied/channel-unavailable outcomes. The legacy
+/// budget counter is threaded through for compatibility but is not a terminal
+/// step limit.
 pub(crate) fn evaluate_execution_gate_pipeline(
     input: ExecutionGatePipelineInput<'_>,
 ) -> ExecutionGatePipelineOutcome {
@@ -208,11 +207,10 @@ pub(crate) fn evaluate_execution_gate_pipeline(
     if preemptive_decision.is_none() {
         let posture_always_allow =
             effective_posture.effective_state == ToolPostureState::AlwaysAllow;
-        // Policy is evaluated twice against independent budget copies: once
-        // as-is (pre-approval view) and once with sensitivity overridden for
-        // the explicit-approval path. Only the budget of the path whose
-        // decision is ultimately returned is committed below, so a proposal
-        // never pays for both evaluations.
+        // Policy is evaluated twice against independent legacy budget copies:
+        // once as-is (pre-approval view) and once with sensitivity overridden
+        // for the explicit-approval path. Keeping the copies preserves audit
+        // parity with the legacy path while count-based debits stay disabled.
         let mut pre_policy_budget = remaining_budget;
         let pre_policy_decision = decide_tool_call(
             tool_call_config,
@@ -866,9 +864,6 @@ fn infer_policy_reason_code(reason: &str, allowed: bool) -> String {
     if allowed {
         return "policy.allowed".to_owned();
     }
-    if reason_matches_or_wraps_original(reason, BUDGET_DENY_REASON) {
-        return "policy.budget_exhausted".to_owned();
-    }
     if reason_matches_or_wraps_original(reason, UNSUPPORTED_TOOL_DENY_REASON) {
         return "policy.runtime.unsupported_tool".to_owned();
     }
@@ -928,10 +923,6 @@ fn policy_reason_code_remediation(
     match reason_code {
         "policy.denied_by_default" => Some(
             "Allowlist the tool for the active principal/scope before retrying the proposal."
-                .to_owned(),
-        ),
-        "policy.budget_exhausted" => Some(
-            "Start a fresh run or reduce the number of tool calls in the current run before retrying."
                 .to_owned(),
         ),
         "policy.runtime.unsupported_tool" => Some(
@@ -1146,7 +1137,7 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_allows_sensitive_tool_after_explicit_approval_and_consumes_budget_once() {
+    fn pipeline_allows_sensitive_tool_after_explicit_approval_without_debiting_legacy_budget() {
         let outcome = evaluate_execution_gate_pipeline(ExecutionGatePipelineInput {
             tool_call_config: &tool_call_config(&["palyra.process.run"]),
             request_context: &request_context(),
@@ -1164,7 +1155,7 @@ mod tests {
         });
         assert!(outcome.decision.allowed);
         assert!(outcome.decision.approval_required);
-        assert_eq!(outcome.remaining_budget, 1);
+        assert_eq!(outcome.remaining_budget, 2);
         assert_eq!(outcome.report.final_reason_code, "approval.granted");
         assert!(outcome
             .decision
@@ -1173,7 +1164,7 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_allows_proposal_only_approval_and_consumes_budget_once() {
+    fn pipeline_allows_proposal_only_approval_without_debiting_legacy_budget() {
         let outcome = evaluate_execution_gate_pipeline(ExecutionGatePipelineInput {
             tool_call_config: &tool_call_config(&["palyra.echo"]),
             request_context: &request_context(),
@@ -1192,7 +1183,7 @@ mod tests {
 
         assert!(outcome.decision.allowed);
         assert!(outcome.decision.approval_required);
-        assert_eq!(outcome.remaining_budget, 1);
+        assert_eq!(outcome.remaining_budget, 2);
         assert_eq!(outcome.report.final_reason_code, "approval.granted");
         assert!(outcome.decision.reason.contains("explicit approval granted for tool=palyra.echo"));
     }

@@ -1,10 +1,9 @@
 //! Pure budget and message state for the run-stream agent loop.
 //!
-//! [`AgentRunLoopState`] tracks model-turn, tool-call, and wall-clock budgets
-//! plus the growing provider message history; `orchestration` drives the
-//! actual loop. Termination reasons map to the lifecycle/tape contract:
-//! budget exhaustion after real tool work becomes `needs_continuation`
-//! (partial, resumable) rather than a plain failure. This module performs no
+//! [`AgentRunLoopState`] tracks wall-clock budget plus the growing provider
+//! message history; `orchestration` drives the actual loop. Step-count fields
+//! are intentionally serialized as unlimited so long-horizon runs cannot be
+//! terminated by a model-turn or tool-call ceiling. This module performs no
 //! I/O, which keeps every budget rule unit-testable.
 
 use std::{
@@ -20,11 +19,6 @@ use crate::{
     model_provider::{ProviderMessage, ProviderResponse, ProviderTurnOutput},
 };
 
-// The local setup configures a larger tool budget for app/browser workflows.
-// Keep extra model-turn headroom for recovery, final verification, and concise
-// partial summaries instead of failing immediately after the last tool batch.
-/// Hard ceiling on model turns per run; requested budgets are clamped to it.
-pub(crate) const DEFAULT_AGENT_LOOP_MAX_MODEL_TURNS: u32 = 128;
 /// Default wall-clock budget per run (15 minutes) covering long browser workflows.
 pub(crate) const DEFAULT_AGENT_LOOP_WALL_CLOCK_BUDGET_MS: u64 = 900_000;
 
@@ -38,7 +32,11 @@ const ROUTINES_CONTROL_TOOL_NAME: &str = "palyra.routines.control";
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AgentLoopTerminationReason {
     FinalAnswer,
+    /// Legacy replay reason retained for older tapes; runtime no longer
+    /// terminates agentic workflows by model-turn count.
     MaxTurns,
+    /// Legacy replay reason retained for older tapes; runtime no longer
+    /// terminates agentic workflows by tool-call count.
     MaxToolCalls,
     WallClock,
     Cancellation,
@@ -84,9 +82,7 @@ impl AgentLoopTerminationReason {
         completed_tool_calls > 0
             && matches!(
                 self,
-                Self::MaxTurns
-                    | Self::MaxToolCalls
-                    | Self::WallClock
+                Self::WallClock
                     | Self::ProviderError
                     | Self::IncompleteFinalAnswer
                     | Self::BrowserFollowupTimeout
@@ -117,8 +113,8 @@ pub(crate) struct AgentLoopSnapshot {
     pub(crate) schema_version: u32,
     pub(crate) run_id: String,
     pub(crate) current_turn: u32,
-    pub(crate) remaining_model_turns: u32,
-    pub(crate) remaining_tool_calls: u32,
+    pub(crate) remaining_model_turns: Option<u32>,
+    pub(crate) remaining_tool_calls: Option<u32>,
     pub(crate) completed_tool_calls: u32,
     pub(crate) message_count: usize,
     pub(crate) wall_clock_budget_ms: u64,
@@ -148,16 +144,15 @@ pub(crate) struct AgentLoopFinalizationEnvelope {
 /// Mutable budget and message state for one agent-loop run.
 ///
 /// Owns the provider message history (user input, assistant turns, tool
-/// results, recovery guidance) and enforces the model-turn, tool-call, and
-/// wall-clock budgets. All methods are synchronous and side-effect free
-/// beyond `self`.
+/// results, recovery guidance) and enforces only the wall-clock budget. All
+/// methods are synchronous and side-effect free beyond `self`.
 #[derive(Debug, Clone)]
 pub(crate) struct AgentRunLoopState {
     messages: Vec<ProviderMessage>,
-    max_model_turns: u32,
-    remaining_model_turns: u32,
-    max_tool_calls: u32,
-    remaining_tool_calls: u32,
+    max_model_turns: Option<u32>,
+    remaining_model_turns: Option<u32>,
+    max_tool_calls: Option<u32>,
+    remaining_tool_calls: Option<u32>,
     wall_clock_budget_ms: u64,
     started_at_unix_ms: i64,
     started_at: Instant,
@@ -169,22 +164,22 @@ pub(crate) struct AgentRunLoopState {
 impl AgentRunLoopState {
     /// Creates loop state seeded with the initial provider messages.
     ///
-    /// `max_model_turns` is clamped to `1..=DEFAULT_AGENT_LOOP_MAX_MODEL_TURNS`
-    /// and `wall_clock_budget_ms` is raised to at least 1 ms, so the loop can
-    /// never start with an already-exhausted budget.
+    /// Legacy model/tool count arguments are accepted for call-site
+    /// compatibility but intentionally ignored. `wall_clock_budget_ms` is
+    /// raised to at least 1 ms, so the loop cannot start with an already-spent
+    /// clock budget.
     pub(crate) fn new(
         messages: Vec<ProviderMessage>,
-        max_model_turns: u32,
-        max_tool_calls: u32,
+        _legacy_max_model_turns: u32,
+        _legacy_max_tool_calls: u32,
         wall_clock_budget_ms: u64,
     ) -> Self {
-        let bounded_model_turns = max_model_turns.clamp(1, DEFAULT_AGENT_LOOP_MAX_MODEL_TURNS);
         Self {
             messages,
-            max_model_turns: bounded_model_turns,
-            remaining_model_turns: bounded_model_turns,
-            max_tool_calls,
-            remaining_tool_calls: max_tool_calls,
+            max_model_turns: None,
+            remaining_model_turns: None,
+            max_tool_calls: None,
+            remaining_tool_calls: None,
             wall_clock_budget_ms: wall_clock_budget_ms.max(1),
             started_at_unix_ms: current_unix_ms(),
             started_at: Instant::now(),
@@ -194,30 +189,16 @@ impl AgentRunLoopState {
         }
     }
 
-    /// Derives the model-turn budget from the tool budget plus recovery headroom.
-    ///
-    /// The +8 turns leave room for length/final-answer recovery and a closing
-    /// summary after the last tool batch instead of failing on the next turn.
-    pub(crate) fn default_model_turn_budget(max_tool_calls: u32) -> u32 {
-        max_tool_calls.saturating_add(8).clamp(1, DEFAULT_AGENT_LOOP_MAX_MODEL_TURNS)
-    }
-
     /// Consumes one model turn and returns its 1-based turn id.
     ///
     /// # Errors
     ///
     /// Returns [`AgentLoopTerminationReason::WallClock`] when the wall-clock
-    /// budget is spent (checked first, so a stalled run terminates even with
-    /// turns left) or [`AgentLoopTerminationReason::MaxTurns`] when no model
-    /// turns remain.
+    /// budget is spent.
     pub(crate) fn start_model_turn(&mut self) -> Result<u32, AgentLoopTerminationReason> {
         if self.elapsed() > Duration::from_millis(self.wall_clock_budget_ms) {
             return Err(AgentLoopTerminationReason::WallClock);
         }
-        if self.remaining_model_turns == 0 {
-            return Err(AgentLoopTerminationReason::MaxTurns);
-        }
-        self.remaining_model_turns = self.remaining_model_turns.saturating_sub(1);
         self.current_turn = self.current_turn.saturating_add(1);
         Ok(self.current_turn)
     }
@@ -249,25 +230,14 @@ impl AgentRunLoopState {
         self.messages.clone()
     }
 
-    /// Remaining tool-call budget as last synced from the shared budget.
-    pub(crate) fn remaining_tool_calls(&self) -> u32 {
-        self.remaining_tool_calls
-    }
-
-    /// Remaining model-turn budget.
-    pub(crate) fn remaining_model_turns(&self) -> u32 {
-        self.remaining_model_turns
-    }
-
     /// Number of tool results appended so far in this run.
     pub(crate) fn completed_tool_calls(&self) -> u32 {
         self.completed_tool_calls
     }
 
-    /// Syncs the tool budget after tool execution; the shared run-stream
-    /// budget is authoritative, capped at this loop's configured maximum.
-    pub(crate) fn sync_remaining_tool_calls(&mut self, remaining_tool_calls: u32) {
-        self.remaining_tool_calls = remaining_tool_calls.min(self.max_tool_calls);
+    /// Accepts legacy tool-budget sync calls without making them terminal.
+    pub(crate) fn sync_remaining_tool_calls(&mut self, _remaining_tool_calls: u32) {
+        self.remaining_tool_calls = None;
     }
 
     /// Builds the serializable budget snapshot embedded in tape payloads.
@@ -339,6 +309,7 @@ impl AgentRunLoopState {
             "started_at_unix_ms": self.started_at_unix_ms,
             "max_model_turns": self.max_model_turns,
             "max_tool_calls": self.max_tool_calls,
+            "step_count_limit_active": false,
             "state": self.snapshot(run_id, None),
         }))
         .unwrap_or_else(|_| "{}".to_owned())
@@ -673,28 +644,26 @@ mod tests {
     };
 
     #[test]
-    fn loop_state_enforces_turn_budget_and_serializes_termination() {
+    fn loop_state_ignores_legacy_turn_budget_and_serializes_unlimited_snapshot() {
         let mut state =
             AgentRunLoopState::new(vec![ProviderMessage::user_text("hello")], 1, 2, 10_000);
-        assert_eq!(state.start_model_turn(), Ok(1));
-        assert_eq!(state.start_model_turn(), Err(AgentLoopTerminationReason::MaxTurns));
+        for expected_turn in 1..=200 {
+            assert_eq!(state.start_model_turn(), Ok(expected_turn));
+        }
 
-        let payload = state.termination_payload(
-            "run-01",
-            AgentLoopTerminationReason::MaxTurns,
-            "maximum model turns reached",
-            Some("provider-trace".to_owned()),
-        );
+        let payload = state.start_payload("run-01");
         let parsed: serde_json::Value =
-            serde_json::from_str(payload.as_str()).expect("termination payload should be JSON");
-        assert_eq!(parsed["event"], "agent_loop.terminated");
-        assert_eq!(parsed["state"]["termination_reason"], "max_turns");
-        assert_eq!(parsed["finalization"]["status"], "failed");
-        assert_eq!(parsed["finalization"]["provider_trace_ref"], "provider-trace");
+            serde_json::from_str(payload.as_str()).expect("start payload should be JSON");
+        assert_eq!(parsed["event"], "agent_loop.started");
+        assert_eq!(parsed["max_model_turns"], serde_json::Value::Null);
+        assert_eq!(parsed["max_tool_calls"], serde_json::Value::Null);
+        assert_eq!(parsed["step_count_limit_active"], false);
+        assert_eq!(parsed["state"]["remaining_model_turns"], serde_json::Value::Null);
+        assert_eq!(parsed["state"]["remaining_tool_calls"], serde_json::Value::Null);
     }
 
     #[test]
-    fn loop_state_marks_budget_exhaustion_after_tools_as_needs_continuation() {
+    fn loop_state_keeps_legacy_step_reasons_as_plain_failures() {
         let mut state =
             AgentRunLoopState::new(vec![ProviderMessage::user_text("hello")], 2, 1, 10_000);
         state.append_tool_result_messages(vec![ProviderMessage::tool_result(
@@ -705,18 +674,18 @@ mod tests {
         let payload = state.termination_payload(
             "run-01",
             AgentLoopTerminationReason::MaxToolCalls,
-            "agent loop tool call limit reached; needs_continuation=true",
+            "legacy step-count termination reason observed",
             None,
         );
         let parsed: serde_json::Value =
             serde_json::from_str(payload.as_str()).expect("termination payload should be JSON");
 
         assert_eq!(parsed["termination_reason"], "max_tool_calls");
-        assert_eq!(parsed["finalization"]["status"], "needs_continuation");
-        assert_eq!(parsed["finalization"]["lifecycle_state"], "needs_continuation");
+        assert_eq!(parsed["finalization"]["status"], "failed");
+        assert_eq!(parsed["finalization"]["lifecycle_state"], "failed");
         assert_eq!(parsed["finalization"]["reason_code"], "max_tool_calls");
-        assert_eq!(parsed["finalization"]["partial"], true);
-        assert_eq!(parsed["finalization"]["continuation_required"], true);
+        assert_eq!(parsed["finalization"]["partial"], false);
+        assert_eq!(parsed["finalization"]["continuation_required"], false);
         assert_eq!(parsed["finalization"]["tool_count"], 1);
     }
 
@@ -872,29 +841,6 @@ mod tests {
         assert_eq!(parsed["finalization"]["partial"], false);
         assert_eq!(parsed["finalization"]["continuation_required"], false);
         assert_eq!(parsed["finalization"]["tool_count"], 0);
-    }
-
-    #[test]
-    fn default_turn_budget_preserves_recovery_headroom() {
-        assert_eq!(AgentRunLoopState::default_model_turn_budget(64), 72);
-
-        let state =
-            AgentRunLoopState::new(vec![ProviderMessage::user_text("hello")], 192, 2, 10_000);
-        let snapshot = state.snapshot("run-01", None);
-
-        assert_eq!(snapshot.remaining_model_turns, DEFAULT_AGENT_LOOP_MAX_MODEL_TURNS);
-    }
-
-    #[test]
-    fn default_turn_budget_tracks_local_app_workflow_tool_budget() {
-        assert_eq!(AgentRunLoopState::default_model_turn_budget(96), 104);
-
-        let mut state =
-            AgentRunLoopState::new(vec![ProviderMessage::user_text("hello")], 104, 96, 10_000);
-        for expected_turn in 1..=104 {
-            assert_eq!(state.start_model_turn(), Ok(expected_turn));
-        }
-        assert_eq!(state.start_model_turn(), Err(AgentLoopTerminationReason::MaxTurns));
     }
 
     #[test]

@@ -1462,10 +1462,10 @@ mod tests {
     }
 
     #[test]
-    fn budget_status_tape_payload_uses_needs_continuation_lifecycle_kind() {
+    fn wall_clock_status_tape_payload_uses_needs_continuation_lifecycle_kind() {
         let payload = status_tape_payload(
             common_v1::stream_status::StatusKind::Failed,
-            "agent loop tool call limit reached after 95 model turns and 96 tool results; needs_continuation=true reason_code=max_tool_calls; partial result summary: continue in the same session",
+            "agent loop wall-clock budget exhausted after tool work; needs_continuation=true reason_code=wall_clock; partial result summary: continue in the same session",
         );
         let value: Value =
             serde_json::from_str(payload.as_str()).expect("status payload should be json");
@@ -1473,7 +1473,7 @@ mod tests {
         assert_eq!(value["kind"], "needs_continuation");
         assert_eq!(value["wire_kind"], "failed");
         assert_eq!(value["lifecycle_state"], "needs_continuation");
-        assert_eq!(value["reason_code"], "max_tool_calls");
+        assert_eq!(value["reason_code"], "wall_clock");
         assert_eq!(value["partial"], true);
         assert_eq!(value["continuation_required"], true);
     }

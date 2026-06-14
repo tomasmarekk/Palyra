@@ -70,7 +70,7 @@ fn catalog_snapshot_exposes_allowlisted_tools_with_schema_hashes() {
         provider_kind: "openai_compatible",
         provider_model_id: Some("gpt-test"),
         surface: ToolExposureSurface::RunStream,
-        remaining_tool_budget: 2,
+        remaining_tool_budget: None,
         created_at_unix_ms: 42,
     });
 
@@ -90,7 +90,7 @@ fn provider_payload_projects_native_openai_tools() {
         provider_kind: "openai_compatible",
         provider_model_id: None,
         surface: ToolExposureSurface::RunStream,
-        remaining_tool_budget: 1,
+        remaining_tool_budget: None,
         created_at_unix_ms: 42,
     });
     let payload = snapshot_to_provider_request_value(&snapshot);
@@ -113,7 +113,7 @@ fn process_run_allowlist_exposes_lifecycle_controls() {
         provider_kind: "openai_compatible",
         provider_model_id: None,
         surface: ToolExposureSurface::RunStream,
-        remaining_tool_budget: 4,
+        remaining_tool_budget: None,
         created_at_unix_ms: 42,
     });
     let tool_names = snapshot.tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>();
@@ -142,7 +142,7 @@ fn plugin_run_visibility_tracks_wasm_runtime_policy() {
         provider_kind: "openai_compatible",
         provider_model_id: None,
         surface: ToolExposureSurface::RunStream,
-        remaining_tool_budget: 1,
+        remaining_tool_budget: None,
         created_at_unix_ms: 42,
     });
 
@@ -165,7 +165,7 @@ fn plugin_run_visibility_tracks_wasm_runtime_policy() {
         provider_kind: "openai_compatible",
         provider_model_id: None,
         surface: ToolExposureSurface::RunStream,
-        remaining_tool_budget: 1,
+        remaining_tool_budget: None,
         created_at_unix_ms: 43,
     });
 
@@ -185,7 +185,7 @@ fn anthropic_catalog_exposes_http_fetch_with_boolean_additional_properties() {
         provider_kind: "anthropic",
         provider_model_id: Some("minimax-m2.7"),
         surface: ToolExposureSurface::RunStream,
-        remaining_tool_budget: 1,
+        remaining_tool_budget: None,
         created_at_unix_ms: 42,
     });
 
@@ -236,7 +236,7 @@ fn anthropic_catalog_exposes_browser_observe_without_default_keywords() {
         provider_kind: "anthropic",
         provider_model_id: Some("minimax-m2.7"),
         surface: ToolExposureSurface::RunStream,
-        remaining_tool_budget: 1,
+        remaining_tool_budget: None,
         created_at_unix_ms: 42,
     });
 
@@ -274,7 +274,7 @@ fn anthropic_catalog_exposes_browser_viewport_without_exclusive_bounds() {
         provider_kind: "anthropic",
         provider_model_id: Some("minimax-m2.7"),
         surface: ToolExposureSurface::RunStream,
-        remaining_tool_budget: 1,
+        remaining_tool_budget: None,
         created_at_unix_ms: 42,
     });
 
@@ -311,7 +311,7 @@ fn anthropic_catalog_exposes_routines_control_trigger_payload() {
         provider_kind: "anthropic",
         provider_model_id: Some("minimax-m2.7"),
         surface: ToolExposureSurface::RunStream,
-        remaining_tool_budget: 1,
+        remaining_tool_budget: None,
         created_at_unix_ms: 42,
     });
 
@@ -655,7 +655,7 @@ fn intake_normalizes_safe_scalar_arguments() {
         provider_kind: "openai_compatible",
         provider_model_id: None,
         surface: ToolExposureSurface::RunStream,
-        remaining_tool_budget: 1,
+        remaining_tool_budget: None,
         created_at_unix_ms: 42,
     });
 
@@ -681,7 +681,7 @@ fn intake_normalizes_apply_patch_raw_parameter_alias() {
         provider_kind: "anthropic",
         provider_model_id: Some("minimax-m2.7"),
         surface: ToolExposureSurface::RunStream,
-        remaining_tool_budget: 1,
+        remaining_tool_budget: None,
         created_at_unix_ms: 42,
     });
 
@@ -713,7 +713,7 @@ fn intake_preserves_embedded_apply_patch_parameter_markers_as_patch_content() {
         provider_kind: "anthropic",
         provider_model_id: Some("minimax-m2.7"),
         surface: ToolExposureSurface::RunStream,
-        remaining_tool_budget: 1,
+        remaining_tool_budget: None,
         created_at_unix_ms: 42,
     });
 
@@ -752,7 +752,7 @@ fn intake_normalizes_nested_apply_patch_raw_object() {
         provider_kind: "openai_compatible",
         provider_model_id: None,
         surface: ToolExposureSurface::RunStream,
-        remaining_tool_budget: 1,
+        remaining_tool_budget: None,
         created_at_unix_ms: 42,
     });
 
@@ -780,7 +780,7 @@ fn intake_rejects_runtime_unavailable_tool() {
         provider_kind: "openai_compatible",
         provider_model_id: None,
         surface: ToolExposureSurface::RunStream,
-        remaining_tool_budget: 1,
+        remaining_tool_budget: None,
         created_at_unix_ms: 42,
     });
     let rejection = validate_tool_call_against_catalog_snapshot(
@@ -804,7 +804,7 @@ fn intake_rejects_command_scalar_coercion() {
         provider_kind: "openai_compatible",
         provider_model_id: None,
         surface: ToolExposureSurface::RunStream,
-        remaining_tool_budget: 1,
+        remaining_tool_budget: None,
         created_at_unix_ms: 42,
     });
     let rejection = validate_tool_call_against_catalog_snapshot(

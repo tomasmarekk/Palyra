@@ -72,9 +72,6 @@ pub(crate) async fn process_route_tool_proposal_event(
         ) {
             Ok(normalized) => normalized,
             Err(rejection) => {
-                // Rejected calls still consume budget so a model emitting
-                // invalid calls cannot loop on free attempts forever.
-                *remaining_tool_budget = (*remaining_tool_budget).saturating_sub(1);
                 return reject_route_tool_call(
                     runtime_state,
                     run_id,

@@ -607,8 +607,8 @@ pub(crate) async fn evaluate_tool_proposal_security(
 }
 
 /// Resolves the legacy (pre-pipeline) decision: a gate denial passes through
-/// unchanged, otherwise the allowlist/budget policy decides, with
-/// always-allow posture suppressing the approval requirement.
+/// unchanged, otherwise the allowlist/policy check decides, with always-allow
+/// posture suppressing the approval requirement.
 #[allow(clippy::too_many_arguments)]
 fn resolve_tool_proposal_decision(
     remaining_tool_budget: &mut u32,
@@ -646,13 +646,13 @@ fn resolve_tool_proposal_decision(
     )
 }
 
-/// Produces the final decision for a proposal and debits the tool budget.
+/// Produces the final decision for a proposal.
 ///
 /// The legacy decision is always computed (on a scratch copy of the budget)
 /// even when the v2 execution-gate pipeline is rolled out: the pipeline
 /// report records the legacy outcome via `append_audit_finalization_step` so
 /// divergence between the two paths is auditable. The rollout flag picks
-/// which decision and budget become authoritative.
+/// which decision and legacy counter become authoritative.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_tool_proposal_decision_for_context(
     runtime_state: &Arc<GatewayRuntimeState>,

@@ -6405,7 +6405,7 @@ mod tests {
             "surface": "run_stream",
             "principal_hash": "principal_sha256",
             "channel_hash": null,
-            "remaining_tool_budget": 8,
+            "remaining_tool_budget": null,
             "created_at_unix_ms": created_at_unix_ms,
             "tools": [{
                 "name": "palyra.echo",

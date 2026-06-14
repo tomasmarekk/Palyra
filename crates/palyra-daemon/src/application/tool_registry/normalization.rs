@@ -17,7 +17,7 @@ use super::hashing::{canonical_json_bytes, stable_hash_bytes};
 use super::types::{
     ModelVisibleToolCatalogSnapshot, NormalizedToolCall, ToolArgumentNormalizationAudit,
     ToolArgumentNormalizationStep, ToolCallRejection, ToolCallRejectionKind,
-    ToolCatalogFilterReasonCode, ToolParallelismPolicy, TOOL_REJECTION_SCHEMA_VERSION,
+    ToolCatalogFilterReasonCode, TOOL_REJECTION_SCHEMA_VERSION,
 };
 
 /// Validates one proposed tool call against the catalog snapshot the model
@@ -25,9 +25,8 @@ use super::types::{
 ///
 /// # Errors
 /// Returns a [`ToolCallRejection`] when the tool was filtered from the
-/// snapshot for a runtime/schema/surface/budget reason, when a non-read-only
-/// call arrives with an exhausted budget, or when the arguments are not a
-/// JSON object or do not match the tool's internal schema.
+/// snapshot for a runtime/schema/surface reason, or when the arguments are
+/// not a JSON object or do not match the tool's internal schema.
 #[allow(clippy::result_large_err)]
 pub(crate) fn validate_tool_call_against_catalog_snapshot(
     snapshot: &ModelVisibleToolCatalogSnapshot,
@@ -55,23 +54,6 @@ pub(crate) fn validate_tool_call_against_catalog_snapshot(
         }
         return Err(rejection_for_missing_snapshot_tool(snapshot, tool_name, raw_json_hash));
     };
-    // Read-only tools stay callable on an exhausted budget; anything that can
-    // mutate state is cut off once the provider-turn budget hits zero.
-    if tool.parallelism_policy != ToolParallelismPolicy::ReadOnly
-        && snapshot.remaining_tool_budget == 0
-    {
-        return Err(ToolCallRejection {
-            schema_version: TOOL_REJECTION_SCHEMA_VERSION,
-            kind: ToolCallRejectionKind::UnsupportedParallelism,
-            tool_name: tool_name.to_owned(),
-            reason_code: "tool_call.parallelism_budget_exhausted".to_owned(),
-            message: "tool call was not executable under the provider-turn budget".to_owned(),
-            raw_json_hash,
-            snapshot_id: Some(snapshot.snapshot_id.clone()),
-            catalog_hash: Some(snapshot.catalog_hash.clone()),
-        });
-    }
-
     let raw_value =
         serde_json::from_slice::<Value>(input_json).map_err(|error| ToolCallRejection {
             schema_version: TOOL_REJECTION_SCHEMA_VERSION,

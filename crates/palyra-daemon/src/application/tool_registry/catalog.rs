@@ -35,85 +35,70 @@ pub(crate) fn build_model_visible_tool_catalog_snapshot(
     let allowed_tools = normalized_allowlist(request.config.allowed_tools.as_slice());
     let mut tools = Vec::new();
 
-    // An exhausted budget collapses the whole catalog: every known or
-    // allowlisted name is reported as filtered instead of evaluating gates.
-    if request.remaining_tool_budget == 0 {
-        for name in all_registry_and_allowlist_names(allowed_tools.iter().map(String::as_str)) {
+    for entry in registry_entries() {
+        if !allowed_tools.contains(entry.name.as_str()) {
             filtered_tools.push(filtered(
-                &name,
-                ToolCatalogFilterReasonCode::BudgetExhausted,
-                "start a new run or increase tool_call.max_calls_per_run",
-            ));
-        }
-    } else {
-        for entry in registry_entries() {
-            if !allowed_tools.contains(entry.name.as_str()) {
-                filtered_tools.push(filtered(
-                    entry.name.as_str(),
-                    ToolCatalogFilterReasonCode::NotAllowlisted,
-                    "add the tool to tool_call.allowed_tools for this runtime",
-                ));
-                continue;
-            }
-            if !entry.target_surfaces.contains(&request.surface) {
-                filtered_tools.push(filtered(
-                    entry.name.as_str(),
-                    ToolCatalogFilterReasonCode::SurfaceUnsupported,
-                    "call the tool from a supported surface",
-                ));
-                continue;
-            }
-            if !runtime_available(
-                request.config,
-                request.browser_service_enabled,
                 entry.name.as_str(),
-            ) {
+                ToolCatalogFilterReasonCode::NotAllowlisted,
+                "add the tool to tool_call.allowed_tools for this runtime",
+            ));
+            continue;
+        }
+        if !entry.target_surfaces.contains(&request.surface) {
+            filtered_tools.push(filtered(
+                entry.name.as_str(),
+                ToolCatalogFilterReasonCode::SurfaceUnsupported,
+                "call the tool from a supported surface",
+            ));
+            continue;
+        }
+        if !runtime_available(request.config, request.browser_service_enabled, entry.name.as_str())
+        {
+            filtered_tools.push(filtered(
+                entry.name.as_str(),
+                ToolCatalogFilterReasonCode::RuntimeUnavailable,
+                "enable the required runtime dependency before exposing this tool",
+            ));
+            continue;
+        }
+        let provider_schema = match sanitize_schema_for_provider(&entry.input_schema, dialect) {
+            Ok(schema) => schema,
+            Err(error) => {
                 filtered_tools.push(filtered(
                     entry.name.as_str(),
-                    ToolCatalogFilterReasonCode::RuntimeUnavailable,
-                    "enable the required runtime dependency before exposing this tool",
+                    ToolCatalogFilterReasonCode::ProviderSchemaIncompatible,
+                    error.message.as_str(),
                 ));
                 continue;
             }
-            let provider_schema = match sanitize_schema_for_provider(&entry.input_schema, dialect) {
-                Ok(schema) => schema,
-                Err(error) => {
-                    filtered_tools.push(filtered(
-                        entry.name.as_str(),
-                        ToolCatalogFilterReasonCode::ProviderSchemaIncompatible,
-                        error.message.as_str(),
-                    ));
-                    continue;
-                }
-            };
-            tools.push(ModelVisibleTool {
-                name: entry.name,
-                description_hash: stable_hash_bytes(entry.description.as_bytes()),
-                description: entry.description,
-                version: entry.version,
-                provenance: entry.provenance,
-                provider_schema_hash: stable_hash_value(&provider_schema),
-                internal_schema_hash: entry.schema_hash,
-                schema: entry.input_schema,
-                provider_schema,
-                capabilities: entry.capabilities,
-                approval_posture: entry.approval_posture,
-                projection_policy: entry.projection_policy,
-                parallelism_policy: entry.parallelism_policy,
-                exposure_reason: exposure_reason(entry.approval_posture).to_owned(),
-            });
-        }
+        };
+        tools.push(ModelVisibleTool {
+            name: entry.name,
+            description_hash: stable_hash_bytes(entry.description.as_bytes()),
+            description: entry.description,
+            version: entry.version,
+            provenance: entry.provenance,
+            provider_schema_hash: stable_hash_value(&provider_schema),
+            internal_schema_hash: entry.schema_hash,
+            schema: entry.input_schema,
+            provider_schema,
+            capabilities: entry.capabilities,
+            approval_posture: entry.approval_posture,
+            projection_policy: entry.projection_policy,
+            parallelism_policy: entry.parallelism_policy,
+            exposure_reason: exposure_reason(entry.approval_posture).to_owned(),
+        });
+    }
 
-        // Surface allowlisted names with no registry entry so operators see
-        // typos instead of tools silently never appearing.
-        for allowed in &allowed_tools {
-            if registry_entry(allowed.as_str()).is_none() {
-                filtered_tools.push(filtered(
-                    allowed.as_str(),
-                    ToolCatalogFilterReasonCode::UnknownTool,
-                    "remove the unknown tool from tool_call.allowed_tools or register metadata",
-                ));
-            }
+    // Surface allowlisted names with no registry entry so operators see
+    // typos instead of tools silently never appearing.
+    for allowed in &allowed_tools {
+        if registry_entry(allowed.as_str()).is_none() {
+            filtered_tools.push(filtered(
+                allowed.as_str(),
+                ToolCatalogFilterReasonCode::UnknownTool,
+                "remove the unknown tool from tool_call.allowed_tools or register metadata",
+            ));
         }
     }
 
@@ -265,14 +250,4 @@ fn normalized_allowlist(allowed_tools: &[String]) -> BTreeSet<String> {
         tools.insert(tool);
     }
     tools
-}
-
-/// Union of every builtin registry name and every allowlisted name, used to
-/// report a complete filtered set when the tool budget is exhausted.
-fn all_registry_and_allowlist_names<'a>(
-    allowlist: impl Iterator<Item = &'a str>,
-) -> BTreeSet<String> {
-    let mut names = registry_entries().into_iter().map(|entry| entry.name).collect::<BTreeSet<_>>();
-    names.extend(allowlist.map(ToOwned::to_owned));
-    names
 }

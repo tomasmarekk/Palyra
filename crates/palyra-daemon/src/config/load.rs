@@ -736,8 +736,7 @@ pub fn load_config() -> Result<LoadedConfig> {
                 )?;
             }
             if let Some(max_calls_per_run) = file_tool_call.max_calls_per_run {
-                tool_call.max_calls_per_run =
-                    parse_positive_u32(max_calls_per_run, "tool_call.max_calls_per_run")?;
+                tool_call.max_calls_per_run = max_calls_per_run;
             }
             if let Some(execution_timeout_ms) = file_tool_call.execution_timeout_ms {
                 tool_call.execution_timeout_ms =
@@ -1553,12 +1552,9 @@ pub fn load_config() -> Result<LoadedConfig> {
     }
 
     if let Ok(max_calls_per_run) = env::var("PALYRA_TOOL_CALL_MAX_CALLS_PER_RUN") {
-        tool_call.max_calls_per_run = parse_positive_u32(
-            max_calls_per_run
-                .parse::<u32>()
-                .context("PALYRA_TOOL_CALL_MAX_CALLS_PER_RUN must be a valid u32")?,
-            "PALYRA_TOOL_CALL_MAX_CALLS_PER_RUN",
-        )?;
+        tool_call.max_calls_per_run = max_calls_per_run
+            .parse::<u32>()
+            .context("PALYRA_TOOL_CALL_MAX_CALLS_PER_RUN must be a valid u32")?;
         source.push_str(" +env(PALYRA_TOOL_CALL_MAX_CALLS_PER_RUN)");
     }
 
@@ -4497,13 +4493,13 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_config_defaults_to_deny_by_default_with_execution_limits() {
+    fn tool_call_config_defaults_to_deny_by_default_with_legacy_step_limit_disabled() {
         let config = ToolCallConfig::default();
         assert!(
             config.allowed_tools.is_empty(),
             "tool call allowlist must default empty to enforce deny-by-default"
         );
-        assert_eq!(config.max_calls_per_run, 4);
+        assert_eq!(config.max_calls_per_run, 0);
         assert_eq!(config.execution_timeout_ms, 750);
         assert!(!config.process_runner.enabled, "sandbox process runner must default to disabled");
         assert_eq!(
@@ -4839,6 +4835,40 @@ state_key_vault_ref = "global/browser_state_key"
             loaded.tool_call.browser_service.state_key_secret_ref.is_none(),
             "legacy browser state-key vault ref should not be converted during config loading and then self-conflict"
         );
+    }
+
+    #[test]
+    fn load_config_accepts_legacy_tool_call_max_calls_without_enforcing_step_limit() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        for configured_limit in [0_u32, 96_u32] {
+            let tempdir = tempfile::tempdir().expect("temporary directory should be created");
+            let config_path = tempdir.path().join("palyra.toml");
+            std::fs::write(
+                config_path.as_path(),
+                format!(
+                    r#"
+version = 1
+
+[admin]
+require_auth = false
+
+[tool_call]
+max_calls_per_run = {configured_limit}
+"#
+                ),
+            )
+            .expect("legacy tool-call config should be written");
+
+            let _config = ScopedEnvVar::set(
+                "PALYRA_CONFIG",
+                config_path.to_str().expect("test path should be UTF-8"),
+            );
+            let _max_calls_env = ScopedEnvVar::unset("PALYRA_TOOL_CALL_MAX_CALLS_PER_RUN");
+
+            let loaded = super::load_config().expect("legacy max_calls_per_run config should load");
+
+            assert_eq!(loaded.tool_call.max_calls_per_run, configured_limit);
+        }
     }
 
     #[test]

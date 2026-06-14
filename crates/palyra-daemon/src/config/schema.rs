@@ -78,7 +78,7 @@ const DEFAULT_JOURNAL_DB_PATH: &str = "data/journal.sqlite3";
 const DEFAULT_JOURNAL_HASH_CHAIN_ENABLED: bool = true;
 const DEFAULT_MAX_JOURNAL_PAYLOAD_BYTES: usize = 256 * 1024;
 const DEFAULT_MAX_JOURNAL_EVENTS: usize = 10_000;
-const DEFAULT_TOOL_CALL_MAX_CALLS_PER_RUN: u32 = 4;
+const DEFAULT_TOOL_CALL_MAX_CALLS_PER_RUN: u32 = 0;
 const DEFAULT_TOOL_CALL_EXECUTION_TIMEOUT_MS: u64 = 750;
 const DEFAULT_PROCESS_RUNNER_ENABLED: bool = false;
 const DEFAULT_PROCESS_RUNNER_TIER: SandboxProcessRunnerTier = SandboxProcessRunnerTier::B;
@@ -516,10 +516,14 @@ pub struct MemoryRetentionConfig {
 }
 
 /// Tool execution broker policy: the tool allowlist (empty = deny all),
-/// per-run call/time budgets, and per-backend sub-configs.
+/// per-call time budget, legacy per-run call key, and per-backend sub-configs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCallConfig {
     pub allowed_tools: Vec<String>,
+    /// Legacy config key accepted for existing installations.
+    ///
+    /// Count-based agent-run limiting is disabled; `0` means unlimited and
+    /// non-zero historical values are not terminal step budgets.
     pub max_calls_per_run: u32,
     pub execution_timeout_ms: u64,
     pub process_runner: ProcessRunnerConfig,

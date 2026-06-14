@@ -227,11 +227,11 @@ pub(crate) async fn execute_granted_tool_rpc_call(
         budget_debit.refund();
         let denial_reason =
             nested_approval_denial_reason(request.tool_name.as_str(), decision.reason.as_str());
-        return (denied_response(request, denial_reason, true), budget_debit.consumed());
+        return (denied_response(request, denial_reason, true), 0);
     }
     if !decision.allowed {
         budget_debit.refund();
-        return (denied_response(request, decision.reason, false), budget_debit.consumed());
+        return (denied_response(request, decision.reason, false), 0);
     }
 
     let timeout = request.timeout_ms.map(Duration::from_millis);
@@ -268,7 +268,7 @@ pub(crate) async fn execute_granted_tool_rpc_call(
                         redacted_preview: String::new(),
                         attestation: None,
                     },
-                    budget_debit.consumed(),
+                    1,
                 );
             }
         },
@@ -294,12 +294,15 @@ pub(crate) async fn execute_granted_tool_rpc_call(
             redacted_preview,
             attestation: Some(ToolRpcAttestation::from(&outcome.attestation)),
         },
-        budget_debit.consumed(),
+        1,
     )
 }
 
-/// Runs `resolve` against the shared remaining tool budget, or against a
-/// local fallback counter when the caller did not thread a shared budget.
+/// Runs `resolve` against the shared legacy budget counter, or against a
+/// local fallback counter when the caller did not thread one.
+///
+/// The counter is retained for audit compatibility; step-count limits are not
+/// terminal for agentic execution.
 fn with_tool_rpc_budget<T>(
     remaining_tool_budget: Option<&SharedToolBudget>,
     fallback_budget: u32,
@@ -333,10 +336,6 @@ struct ToolRpcBudgetDebit {
 }
 
 impl ToolRpcBudgetDebit {
-    fn consumed(&self) -> u32 {
-        self.consumed
-    }
-
     fn refund(&mut self) {
         if self.consumed == 0 {
             return;

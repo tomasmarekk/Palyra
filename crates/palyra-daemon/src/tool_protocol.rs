@@ -2,7 +2,7 @@
 //! execution dispatch, per-tool input quotas, and attested outcomes.
 //!
 //! [`decide_tool_call`] gates every request through the deny-by-default Cedar
-//! policy evaluation plus the per-run call budget before anything executes.
+//! policy evaluation before anything executes.
 //! [`execute_tool_call`] runs the tools this executor implements directly
 //! (echo/sleep, the sandbox process runner, the wasm plugin runner) and
 //! returns explicit "requires gateway ... runtime context" failures for tools
@@ -42,11 +42,15 @@ use crate::sandbox_runner::{
 };
 use crate::wasm_plugin_runner::{run_wasm_plugin, WasmPluginRunErrorKind, WasmPluginRunnerPolicy};
 
-/// Per-run tool execution policy: the allowlist, call budget, timeout, and
-/// the sandbox/wasm runner policies applied to every call in the run.
+/// Tool execution policy: the allowlist, timeout, and the sandbox/wasm runner
+/// policies applied to every call in the run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCallConfig {
     pub allowed_tools: Vec<String>,
+    /// Legacy config key accepted for existing installations.
+    ///
+    /// Count-based agent-run limiting is disabled; this value is not used as
+    /// a terminal step budget.
     pub max_calls_per_run: u32,
     pub execution_timeout_ms: u64,
     pub process_runner: SandboxProcessRunnerPolicy,
@@ -107,7 +111,8 @@ pub struct ToolExecutionOutcome {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ToolCallPolicySnapshot {
     pub allowed_tools: Vec<String>,
-    pub max_calls_per_run: u32,
+    pub max_calls_per_run: Option<u32>,
+    pub step_count_limit_active: bool,
     pub execution_timeout_ms: u64,
     pub process_runner: ProcessRunnerPolicySnapshot,
     pub wasm_runtime: WasmRuntimePolicySnapshot,
@@ -147,7 +152,6 @@ pub struct WasmRuntimePolicySnapshot {
     pub allowed_channels: Vec<String>,
 }
 
-const BUDGET_DENY_REASON: &str = "tool execution budget exhausted for run";
 const UNSUPPORTED_TOOL_DENY_REASON: &str =
     "tool is allowlisted but unsupported by runtime executor";
 const TOOL_MAX_SLEEP_MS: u64 = 30_000;
@@ -182,7 +186,8 @@ const MAX_WASM_PLUGIN_TOOL_INPUT_BYTES: usize = 448 * 1024;
 pub fn tool_policy_snapshot(config: &ToolCallConfig) -> ToolCallPolicySnapshot {
     ToolCallPolicySnapshot {
         allowed_tools: config.allowed_tools.clone(),
-        max_calls_per_run: config.max_calls_per_run,
+        max_calls_per_run: None,
+        step_count_limit_active: false,
         execution_timeout_ms: config.execution_timeout_ms,
         process_runner: ProcessRunnerPolicySnapshot {
             enabled: config.process_runner.enabled,
@@ -217,29 +222,19 @@ pub fn tool_policy_snapshot(config: &ToolCallConfig) -> ToolCallPolicySnapshot {
     }
 }
 
-/// Gates one tool call through the per-run budget, the deny-by-default Cedar
-/// policy, and the runtime-support check, in that order.
+/// Gates one tool call through the deny-by-default Cedar policy and the
+/// runtime-support check, in that order.
 ///
-/// `remaining_budget` is decremented only when the decision is an allow, so
-/// denied calls never consume budget (pinned by tests). The caller owns
-/// synchronization of the budget counter across concurrent calls.
+/// `remaining_budget` is accepted for legacy call-site compatibility but no
+/// longer limits or debits agentic tool execution.
 pub fn decide_tool_call(
     config: &ToolCallConfig,
-    remaining_budget: &mut u32,
+    _remaining_budget: &mut u32,
     request_context: &ToolRequestContext,
     tool_name: &str,
     allow_sensitive_tools: bool,
 ) -> ToolDecision {
     let approval_required = tool_requires_approval(tool_name);
-    if *remaining_budget == 0 {
-        return ToolDecision {
-            allowed: false,
-            reason: BUDGET_DENY_REASON.to_owned(),
-            approval_required: false,
-            policy_enforced: true,
-        };
-    }
-
     let policy_request = PolicyRequest {
         principal: request_context.principal.clone(),
         action: "tool.execute".to_owned(),
@@ -306,7 +301,6 @@ pub fn decide_tool_call(
         };
     }
 
-    *remaining_budget = remaining_budget.saturating_sub(1);
     ToolDecision {
         allowed: true,
         reason: format_policy_reason(
@@ -1517,22 +1511,23 @@ mod tests {
     }
 
     #[test]
-    fn decide_tool_call_consumes_budget_for_allowed_tools() {
+    fn decide_tool_call_keeps_legacy_budget_for_allowed_tools() {
         let config = allowlisted_config();
         let mut budget = config.max_calls_per_run;
         let request_context = tool_request_context("user:ops");
         let first = decide_tool_call(&config, &mut budget, &request_context, "palyra.echo", false);
         assert!(first.allowed);
         assert!(!first.approval_required, "safe tools should not require approval by default");
-        assert_eq!(budget, 1);
+        assert_eq!(budget, 2, "allowed safe tool must not debit legacy budget");
         let second =
             decide_tool_call(&config, &mut budget, &request_context, "palyra.sleep", false);
         assert!(second.allowed);
         assert!(!second.approval_required, "safe tools should not require approval by default");
-        assert_eq!(budget, 0);
+        assert_eq!(budget, 2, "second safe tool must not debit legacy budget");
         let third = decide_tool_call(&config, &mut budget, &request_context, "palyra.echo", false);
-        assert!(!third.allowed, "third call should be denied by budget");
-        assert!(!third.approval_required, "budget exhaustion should not create an approval prompt");
+        assert!(third.allowed, "legacy budget must not deny long-horizon tool calls");
+        assert!(!third.approval_required, "safe tools should not require approval by default");
+        assert_eq!(budget, 2, "legacy budget should remain unchanged across allowed calls");
     }
 
     #[test]
@@ -1553,7 +1548,7 @@ mod tests {
             !decision.approval_required,
             "memory search should not require interactive approval"
         );
-        assert_eq!(budget, 0, "allowed tool should consume budget");
+        assert_eq!(budget, 1, "allowed tool must not debit legacy budget");
     }
 
     #[test]
@@ -1580,7 +1575,7 @@ mod tests {
             decision.approval_required,
             "approved execution should preserve sensitive-tool metadata"
         );
-        assert_eq!(budget, 0, "allowed tool should consume budget");
+        assert_eq!(budget, 1, "allowed tool must not debit legacy budget");
     }
 
     #[test]
@@ -1611,7 +1606,7 @@ mod tests {
 
             assert!(approved.allowed, "approved {tool_name} should be executable");
             assert!(approved.approval_required, "sensitive metadata should remain visible");
-            assert_eq!(budget, 0, "approved tool should consume budget");
+            assert_eq!(budget, 1, "approved tool must not debit legacy budget");
         }
     }
 
@@ -1642,7 +1637,7 @@ mod tests {
 
             assert!(approved.allowed, "approved {tool_name} should be executable");
             assert!(approved.approval_required, "sensitive metadata should remain visible");
-            assert_eq!(budget, 0, "approved tool should consume budget");
+            assert_eq!(budget, 1, "approved tool must not debit legacy budget");
         }
     }
 
@@ -1668,7 +1663,7 @@ mod tests {
 
         assert!(decision.allowed, "memory.reflect should remain executable without approval");
         assert!(!decision.approval_required, "memory.reflect should not write durable memory");
-        assert_eq!(budget, 0, "allowed tool should consume budget");
+        assert_eq!(budget, 1, "allowed tool must not debit legacy budget");
     }
 
     #[test]
@@ -1691,7 +1686,7 @@ mod tests {
             let approved =
                 decide_tool_call(&config, &mut budget, &request_context, tool_name, true);
             assert!(approved.allowed, "approved {tool_name} should be executable");
-            assert_eq!(budget, 0, "approved lifecycle tool should consume budget");
+            assert_eq!(budget, 1, "approved lifecycle tool must not debit legacy budget");
         }
     }
 
@@ -1716,7 +1711,7 @@ mod tests {
                 !decision.approval_required,
                 "{tool_name} should not need interactive approval"
             );
-            assert_eq!(budget, 0, "allowed read-only tool should consume budget");
+            assert_eq!(budget, 1, "allowed read-only tool must not debit legacy budget");
         }
     }
 
@@ -1792,7 +1787,7 @@ mod tests {
             decision.approval_required,
             "process execution should always require explicit approval"
         );
-        assert_eq!(budget, 1, "allowed decision should consume budget");
+        assert_eq!(budget, 2, "allowed decision must not debit legacy budget");
     }
 
     #[test]
@@ -1824,7 +1819,7 @@ mod tests {
 
         assert!(with_approval.allowed, "approved browser reload should pass policy gate");
         assert!(with_approval.approval_required);
-        assert_eq!(budget, 1, "allowed decision should consume budget");
+        assert_eq!(budget, 2, "allowed decision must not debit legacy budget");
     }
 
     #[test]
@@ -1869,7 +1864,7 @@ mod tests {
 
         assert!(decision.allowed, "patch tool should be allowed with explicit approval");
         assert!(decision.approval_required, "sensitive tool metadata should remain visible");
-        assert_eq!(budget, 1, "allowed decision should consume budget");
+        assert_eq!(budget, 2, "allowed decision must not debit legacy budget");
     }
 
     #[test]
@@ -1980,7 +1975,7 @@ mod tests {
 
         assert!(approved.allowed, "approved browser fill should pass the runtime support gate");
         assert!(approved.approval_required, "sensitive browser metadata should remain visible");
-        assert_eq!(budget, 0, "approved tool should consume budget");
+        assert_eq!(budget, 1, "approved tool must not debit legacy budget");
     }
 
     #[test]
@@ -2016,7 +2011,7 @@ mod tests {
 
             assert!(approved.allowed, "approved {tool_name} should pass the runtime support gate");
             assert!(approved.approval_required, "sensitive browser metadata should remain visible");
-            assert_eq!(budget, 0, "approved tool should consume budget");
+            assert_eq!(budget, 1, "approved tool must not debit legacy budget");
         }
     }
 
@@ -2873,7 +2868,8 @@ mod tests {
     fn tool_policy_snapshot_reflects_runtime_configuration() {
         let config = allowlisted_config();
         let snapshot = tool_policy_snapshot(&config);
-        assert_eq!(snapshot.max_calls_per_run, 2);
+        assert_eq!(snapshot.max_calls_per_run, None);
+        assert!(!snapshot.step_count_limit_active);
         assert_eq!(snapshot.execution_timeout_ms, 250);
         assert_eq!(snapshot.allowed_tools.len(), 2);
         assert!(!snapshot.wasm_runtime.enabled);
