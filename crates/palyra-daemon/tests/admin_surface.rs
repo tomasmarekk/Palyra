@@ -2131,7 +2131,7 @@ fn console_routine_test_run_preserves_disabled_and_before_first_run_gates() -> R
         .post(format!(
             "http://127.0.0.1:{admin_port}/console/v1/routines/{approval_routine_id}/test-run"
         ))
-        .header("Cookie", cookie)
+        .header("Cookie", cookie.clone())
         .header("x-palyra-csrf-token", csrf_token)
         .json(&serde_json::json!({}))
         .send()
@@ -2153,6 +2153,35 @@ fn console_routine_test_run_preserves_disabled_and_before_first_run_gates() -> R
         approval_test_run.get("approval").is_some(),
         "safe test-run denial should include the pending approval payload"
     );
+    let approval_run_id = approval_test_run
+        .get("run_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("before_first_run test-run response missing run_id"))?;
+    let approval_runs = client
+        .get(format!(
+            "http://127.0.0.1:{admin_port}/console/v1/routines/{approval_routine_id}/runs"
+        ))
+        .header("Cookie", cookie)
+        .send()
+        .context("failed to list before_first_run routine runs")?
+        .error_for_status()
+        .context("before_first_run routine runs returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse before_first_run routine runs response json")?;
+    let approval_run = approval_runs
+        .get("runs")
+        .and_then(Value::as_array)
+        .and_then(|runs| {
+            runs.iter()
+                .find(|run| run.get("run_id").and_then(Value::as_str) == Some(approval_run_id))
+        })
+        .ok_or_else(|| anyhow::anyhow!("before_first_run test-run missing from run history"))?;
+    assert_eq!(
+        approval_run.get("error_kind").and_then(Value::as_str),
+        Some("approval_required"),
+        "before_first_run denials must not be recorded as generic routine gates"
+    );
+    assert_eq!(approval_run.get("skip_reason").and_then(Value::as_str), Some("approval_required"));
 
     Ok(())
 }

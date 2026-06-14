@@ -103,7 +103,8 @@ pub const MEMORY_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 pub const MEMORY_EMBEDDINGS_BACKFILL_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const MEMORY_EMBEDDINGS_BACKFILL_BATCH_SIZE: usize = 64;
 const CRON_MAX_RUNS_EXHAUSTED_ERROR_KIND: &str = "cron_max_runs_exhausted";
-const ROUTINE_APPROVAL_REQUIRED_ERROR_KIND: &str = "approval_required";
+const ROUTINE_GATE_ERROR_KIND: &str = "routine_gate";
+pub(crate) const ROUTINE_APPROVAL_REQUIRED_ERROR_KIND: &str = "approval_required";
 const OBJECTIVE_BUDGET_EXHAUSTED_ERROR_KIND: &str = "objective_budget_exhausted";
 const OBJECTIVE_BUDGET_EXHAUSTED_ACTION: &str = "budget_exhausted";
 const ROUTINE_APPROVAL_TIMEOUT_SECONDS: u32 = 900;
@@ -2033,15 +2034,34 @@ fn is_reserved_cron_run_slot(run: &CronRunRecord) -> bool {
         && !is_scheduler_approval_required_denial(run))
 }
 
-/// Synthetic scheduler-side denial recorded while waiting for first-run
-/// approval: no orchestrator run and no tool activity ever happened, so it
-/// must not consume budget or run slots.
+/// Synthetic approval denial recorded while waiting for first-run approval:
+/// no orchestrator run and no tool activity ever happened, so it must not
+/// consume budget or run slots.
 fn is_scheduler_approval_required_denial(run: &CronRunRecord) -> bool {
     matches!(run.status, CronRunStatus::Denied)
-        && run.error_kind.as_deref() == Some(ROUTINE_APPROVAL_REQUIRED_ERROR_KIND)
         && run.orchestrator_run_id.is_none()
         && run.tool_calls == 0
         && run.tool_denies == 0
+        && (run.error_kind.as_deref() == Some(ROUTINE_APPROVAL_REQUIRED_ERROR_KIND)
+            || legacy_routine_gate_approval_denial(run))
+}
+
+fn legacy_routine_gate_approval_denial(run: &CronRunRecord) -> bool {
+    run.error_kind.as_deref() == Some(ROUTINE_GATE_ERROR_KIND)
+        && run.error_message_redacted.as_deref().is_some_and(|message| {
+            message.starts_with("routine approval is required before the first")
+        })
+}
+
+/// Maps routine gate outcomes to the cron run error kind consumed by budget
+/// accounting and diagnostics.
+#[must_use]
+pub(crate) fn routine_gate_error_kind(skip_reason: Option<&str>) -> &'static str {
+    if skip_reason == Some(ROUTINE_APPROVAL_REQUIRED_ERROR_KIND) {
+        ROUTINE_APPROVAL_REQUIRED_ERROR_KIND
+    } else {
+        ROUTINE_GATE_ERROR_KIND
+    }
 }
 
 async fn apply_cron_max_runs_exhaustion(
@@ -3938,16 +3958,17 @@ mod tests {
         effective_cron_session_label, load_periodic_reaudit_skills_index, max_runs_for_job,
         merged_parameter_delta_json, normalize_schedule, now_unix_ms_or_fallback,
         parse_skill_reaudit_interval, periodic_reaudit_targets, reserved_cron_run_slot_count,
-        routine_approval_subject_id, routine_parameter_delta_json, routines_automation_enabled,
-        scheduled_routine_requires_first_run_approval, scheduled_routine_run_metadata_upsert,
-        scheduler_attempt_failure, scheduler_retry_backoff_delay_ms,
-        should_disable_exhausted_scheduled_one_shot,
+        routine_approval_subject_id, routine_gate_error_kind, routine_parameter_delta_json,
+        routines_automation_enabled, scheduled_routine_requires_first_run_approval,
+        scheduled_routine_run_metadata_upsert, scheduler_attempt_failure,
+        scheduler_retry_backoff_delay_ms, should_disable_exhausted_scheduled_one_shot,
         should_pause_recurring_cron_after_policy_denied, should_repair_stale_cron_run,
         visible_cron_job_enabled, ConcurrencyDecision, CronMatcher, CronMisfireRecoveryAction,
         CronTimezoneMode, InstalledSkillRecord, InstalledSkillsIndex, SchedulerHealthInput,
         TriggerJobOptions, CRON_MAX_RUNS_EXHAUSTED_ERROR_KIND, MAX_RETRY_BACKOFF_MS,
         OBJECTIVE_BUDGET_EXHAUSTED_ERROR_KIND, ROUTINE_APPROVAL_REQUIRED_ERROR_KIND,
-        SCHEDULER_STALE_RUN_AFTER_MS, SKILLS_INDEX_FILE_NAME, SKILLS_LAYOUT_VERSION,
+        ROUTINE_GATE_ERROR_KIND, SCHEDULER_STALE_RUN_AFTER_MS, SKILLS_INDEX_FILE_NAME,
+        SKILLS_LAYOUT_VERSION,
     };
     use crate::access_control::{AccessRegistry, FEATURE_ROUTINES_AUTOMATION};
     use crate::gateway::proto::palyra::cron::v1 as cron_v1;
@@ -4059,6 +4080,24 @@ mod tests {
         ];
 
         assert_eq!(budgeted_cron_run_count(&runs), 3);
+    }
+
+    #[test]
+    fn routine_approval_gate_denials_do_not_consume_cron_run_budget() {
+        let mut approval_required_denied = sample_cron_run(CronRunStatus::Denied, 10);
+        approval_required_denied.error_kind =
+            Some(routine_gate_error_kind(Some(ROUTINE_APPROVAL_REQUIRED_ERROR_KIND)).to_owned());
+        let mut legacy_approval_required_denied = sample_cron_run(CronRunStatus::Denied, 20);
+        legacy_approval_required_denied.error_kind = Some(ROUTINE_GATE_ERROR_KIND.to_owned());
+        legacy_approval_required_denied.error_message_redacted =
+            Some("routine approval is required before the first run".to_owned());
+        let mut tool_denied = sample_cron_run(CronRunStatus::Denied, 30);
+        tool_denied.orchestrator_run_id = Some("orch-denied".to_owned());
+
+        let runs = vec![approval_required_denied, legacy_approval_required_denied, tool_denied];
+
+        assert_eq!(budgeted_cron_run_count(&runs), 1);
+        assert_eq!(reserved_cron_run_slot_count(&runs), 1);
     }
 
     #[test]

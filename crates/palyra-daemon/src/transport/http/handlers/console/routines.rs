@@ -2331,6 +2331,7 @@ async fn register_terminal_routine_run(
 ) -> Result<Value, Response> {
     let run_id = Ulid::new().to_string();
     let delivery_preview = routine_delivery_preview(&request.delivery);
+    let error_kind = cron::routine_gate_error_kind(request.skip_reason.as_deref()).to_owned();
     state
         .runtime
         .start_cron_run(CronRunStartRequest {
@@ -2340,7 +2341,7 @@ async fn register_terminal_routine_run(
             session_id: None,
             orchestrator_run_id: None,
             status: request.status,
-            error_kind: Some("routine_gate".to_owned()),
+            error_kind: Some(error_kind.clone()),
             error_message_redacted: Some(request.message.to_owned()),
         })
         .await
@@ -2350,7 +2351,7 @@ async fn register_terminal_routine_run(
         .finalize_cron_run(CronRunFinalizeRequest {
             run_id: run_id.clone(),
             status: request.status,
-            error_kind: Some("routine_gate".to_owned()),
+            error_kind: Some(error_kind),
             error_message_redacted: Some(request.message.to_owned()),
             model_tokens_in: 0,
             model_tokens_out: 0,
