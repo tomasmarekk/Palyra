@@ -3495,32 +3495,64 @@ fn resolve_host_executable_path_with_roots(
         });
     }
     let raw_path = Path::new(raw);
-    if raw_path.components().any(|component| matches!(component, Component::ParentDir)) {
-        return Err(SandboxProcessRunError {
-            kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
-            message: format!("host process runner denied executable path traversal for '{raw}'"),
-        });
+    let uses_parent_dir =
+        raw_path.components().any(|component| matches!(component, Component::ParentDir));
+    for candidate in host_executable_path_candidates(workspace_root, base, raw_path) {
+        if !candidate.exists() {
+            continue;
+        }
+        let executable =
+            fs::canonicalize(candidate.as_path()).map_err(|error| SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+                message: format!(
+                    "host process runner denied invalid executable path '{}': {error}",
+                    candidate.display()
+                ),
+            })?;
+        if uses_parent_dir && !path_starts_with_case_aware(executable.as_path(), workspace_root) {
+            return Err(SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+                message: format!(
+                    "host process runner denied executable path traversal outside workspace for '{raw}'"
+                ),
+            });
+        }
+        ensure_host_executable_path_allowed(workspace_root, executable.as_path(), host_roots)?;
+        return Ok(executable);
     }
-    let candidate = if raw_path.is_absolute() { PathBuf::from(raw) } else { base.join(raw) };
-    if !candidate.exists() {
-        return Err(SandboxProcessRunError {
-            kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
-            message: format!(
-                "host process runner executable path '{}' does not exist",
-                candidate.display()
-            ),
-        });
+    Err(SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+        message: format!("host process runner executable path '{raw}' does not exist"),
+    })
+}
+
+fn resolve_host_process_program_with_roots(
+    workspace_root: &Path,
+    cwd: &Path,
+    command: &str,
+    host_roots: &[PathBuf],
+) -> Result<PathBuf, SandboxProcessRunError> {
+    if command_has_path_separator(command) {
+        return resolve_host_executable_path_with_roots(workspace_root, cwd, command, host_roots);
     }
-    let executable =
-        fs::canonicalize(candidate.as_path()).map_err(|error| SandboxProcessRunError {
-            kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
-            message: format!(
-                "host process runner denied invalid executable path '{}': {error}",
-                candidate.display()
-            ),
-        })?;
-    ensure_host_executable_path_allowed(workspace_root, executable.as_path(), host_roots)?;
-    Ok(executable)
+    Ok(resolve_tier_b_process_program(command, cwd))
+}
+
+fn host_executable_path_candidates(
+    workspace_root: &Path,
+    base: &Path,
+    raw_path: &Path,
+) -> Vec<PathBuf> {
+    if raw_path.is_absolute() {
+        return vec![raw_path.to_path_buf()];
+    }
+    let base_candidate = base.join(raw_path);
+    let workspace_candidate = workspace_root.join(raw_path);
+    if same_path_case_aware(base_candidate.as_path(), workspace_candidate.as_path()) {
+        vec![base_candidate]
+    } else {
+        vec![base_candidate, workspace_candidate]
+    }
 }
 
 // Outside a host-hint context a bare token only counts as a host when it carries a numeric
@@ -4773,7 +4805,13 @@ fn build_process_command(
     cwd: &Path,
 ) -> Result<Command, SandboxProcessRunError> {
     if process_runner_allows_host_access(policy) {
-        let program = resolve_tier_b_process_program(input.command.as_str(), cwd);
+        let host_roots = host_access_roots_for_input(input);
+        let program = resolve_host_process_program_with_roots(
+            workspace_root,
+            cwd,
+            input.command.as_str(),
+            host_roots.as_slice(),
+        )?;
         let path_env = host_access_path_env_for_input(input);
         let args =
             rewrite_host_access_process_args(input.args.as_slice(), workspace_root, &path_env)?;
@@ -5767,19 +5805,20 @@ mod tests {
         collect_requested_egress_hosts, cpu_rlimit_seconds_from_usage_micros,
         host_access_roots_for_input, is_host_allowlisted, process_failure_message,
         process_runner_command_with_args_message, redacted_process_output_preview,
-        redacted_process_output_text, resolve_host_working_directory,
-        resolve_host_working_directory_with_roots, resolve_scoped_path, resolve_working_directory,
-        rewrite_arguments_to_scoped_paths, rewrite_host_access_process_args,
-        rewrite_host_virtual_workspace_args, run_constrained_process,
-        run_constrained_process_with_cancellation, validate_argument_workspace_scope,
-        validate_cmd_invocation_shape, validate_host_argument_scope,
-        validate_host_argument_scope_with_roots, validate_host_interpreter_argument_guardrails,
-        validate_interpreter_argument_guardrails, validate_no_embedded_command_line_arg,
-        validate_process_env_overrides, validate_process_termination_scope,
-        validate_runtime_egress_enforcement, EgressEnforcementMode, ProcessRunnerInput,
-        SandboxProcessRunErrorKind, SandboxProcessRunnerPolicy, SandboxProcessRunnerTier,
-        StreamCapture, BACKGROUND_MONITOR_POLL_MS, BACKGROUND_TERMINATION_WAIT_MS,
-        NODE_DISABLE_COMPILE_CACHE_ENV, PALYRA_OS_FILE_ROOTS_ENV,
+        redacted_process_output_text, resolve_host_executable_path_with_roots,
+        resolve_host_working_directory, resolve_host_working_directory_with_roots,
+        resolve_scoped_path, resolve_working_directory, rewrite_arguments_to_scoped_paths,
+        rewrite_host_access_process_args, rewrite_host_virtual_workspace_args,
+        run_constrained_process, run_constrained_process_with_cancellation,
+        validate_argument_workspace_scope, validate_cmd_invocation_shape,
+        validate_host_argument_scope, validate_host_argument_scope_with_roots,
+        validate_host_interpreter_argument_guardrails, validate_interpreter_argument_guardrails,
+        validate_no_embedded_command_line_arg, validate_process_env_overrides,
+        validate_process_termination_scope, validate_runtime_egress_enforcement,
+        EgressEnforcementMode, ProcessRunnerInput, SandboxProcessRunErrorKind,
+        SandboxProcessRunnerPolicy, SandboxProcessRunnerTier, StreamCapture,
+        BACKGROUND_MONITOR_POLL_MS, BACKGROUND_TERMINATION_WAIT_MS, NODE_DISABLE_COMPILE_CACHE_ENV,
+        PALYRA_OS_FILE_ROOTS_ENV,
     };
     #[cfg(windows)]
     use super::{
@@ -6833,6 +6872,124 @@ mod tests {
         )
         .expect("host command executable path should be validated separately from args");
 
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    fn resolve_host_executable_allows_workspace_relative_command_with_cwd() {
+        let workspace = unique_temp_dir("workspace-relative-command-cwd");
+        let executable = workspace.join("repo").join(".venv").join("Scripts").join("python.exe");
+        fs::create_dir_all(executable.parent().expect("executable should have parent"))
+            .expect("venv scripts directory should be created");
+        fs::write(executable.as_path(), "fake exe").expect("executable fixture should be written");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let cwd = fs::canonicalize(canonical_workspace.join("repo"))
+            .expect("repo cwd should canonicalize");
+        let expected =
+            fs::canonicalize(executable.as_path()).expect("executable should canonicalize");
+
+        let resolved = resolve_host_executable_path_with_roots(
+            canonical_workspace.as_path(),
+            cwd.as_path(),
+            "repo/.venv/Scripts/python.exe",
+            &[],
+        )
+        .expect("workspace-relative executable should resolve from workspace root when cwd lookup misses");
+
+        assert_eq!(resolved, expected);
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    fn resolve_host_executable_allows_parent_dir_inside_workspace() {
+        let workspace = unique_temp_dir("workspace-parent-command");
+        let executable = workspace.join(".venv").join("Scripts").join("python.exe");
+        fs::create_dir_all(executable.parent().expect("executable should have parent"))
+            .expect("venv scripts directory should be created");
+        fs::write(executable.as_path(), "fake exe").expect("executable fixture should be written");
+        fs::create_dir_all(workspace.join("repo")).expect("repo directory should be created");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let cwd = fs::canonicalize(canonical_workspace.join("repo"))
+            .expect("repo cwd should canonicalize");
+        let expected =
+            fs::canonicalize(executable.as_path()).expect("executable should canonicalize");
+
+        let resolved = resolve_host_executable_path_with_roots(
+            canonical_workspace.as_path(),
+            cwd.as_path(),
+            "../.venv/Scripts/python.exe",
+            &[],
+        )
+        .expect("parent-dir executable should be allowed when it remains inside workspace");
+
+        assert_eq!(resolved, expected);
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    fn resolve_host_executable_rejects_parent_dir_outside_workspace() {
+        let root = unique_temp_dir("workspace-parent-command-outside");
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        let executable = outside.join("tool.exe");
+        fs::create_dir_all(workspace.join("repo")).expect("repo directory should be created");
+        fs::create_dir_all(outside.as_path()).expect("outside directory should be created");
+        fs::write(executable.as_path(), "fake exe").expect("outside executable should be written");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let cwd = fs::canonicalize(canonical_workspace.join("repo"))
+            .expect("repo cwd should canonicalize");
+
+        let error = resolve_host_executable_path_with_roots(
+            canonical_workspace.as_path(),
+            cwd.as_path(),
+            "../../outside/tool.exe",
+            &[],
+        )
+        .expect_err("parent-dir executable outside workspace should be denied");
+
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+        assert!(
+            error.message.contains("outside workspace"),
+            "error should explain traversal boundary: {}",
+            error.message
+        );
+        let _ = fs::remove_dir_all(root.as_path());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn host_access_process_command_uses_resolved_workspace_command_path_with_cwd() {
+        let workspace = unique_temp_dir("workspace-relative-command-spawn");
+        let executable = workspace.join("repo").join(".venv").join("Scripts").join("python.exe");
+        fs::create_dir_all(executable.parent().expect("executable should have parent"))
+            .expect("venv scripts directory should be created");
+        fs::write(executable.as_path(), "fake exe").expect("executable fixture should be written");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let policy = host_access_policy(canonical_workspace.clone());
+        let input = ProcessRunnerInput {
+            command: "repo/.venv/Scripts/python.exe".to_owned(),
+            args: vec!["--version".to_owned()],
+            cwd: Some("repo".to_owned()),
+            env: BTreeMap::new(),
+            requested_egress_hosts: Vec::new(),
+            timeout_ms: None,
+            background: false,
+        };
+        let cwd =
+            resolve_host_working_directory(canonical_workspace.as_path(), input.cwd.as_deref())
+                .expect("host cwd should resolve");
+        let expected =
+            fs::canonicalize(executable.as_path()).expect("executable should canonicalize");
+
+        let command =
+            build_process_command(&policy, &input, canonical_workspace.as_path(), cwd.as_path())
+                .expect("host-access command should build with resolved executable path");
+
+        assert_eq!(PathBuf::from(command.get_program()), expected);
         let _ = fs::remove_dir_all(workspace.as_path());
     }
 
