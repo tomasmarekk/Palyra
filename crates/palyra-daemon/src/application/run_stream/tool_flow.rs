@@ -1518,7 +1518,8 @@ async fn project_tool_result_for_model(
     let default_sensitive =
         matches!(projection_policy, ToolResultProjectionPolicy::RedactedPreviewAndArtifact);
 
-    let sensitivity = tool_result_sensitivity(tool_name, default_sensitive);
+    let sensitivity =
+        tool_result_sensitivity(tool_name, outcome.output_json.as_slice(), default_sensitive);
     let preview = redacted_tool_result_preview(
         tool_name,
         outcome.output_json.as_slice(),
@@ -1630,7 +1631,11 @@ fn os_file_read_result_has_model_visible_text(value: &Value) -> bool {
         && value.get("bytes_base64").is_none_or(Value::is_null)
 }
 
-fn tool_result_sensitivity(tool_name: &str, default_sensitive: bool) -> ToolResultSensitivity {
+fn tool_result_sensitivity(
+    tool_name: &str,
+    output_json: &[u8],
+    default_sensitive: bool,
+) -> ToolResultSensitivity {
     if tool_name == crate::gateway::PROCESS_RUNNER_TOOL_NAME {
         ToolResultSensitivity::StdoutStderr
     } else if tool_name == crate::gateway::HTTP_FETCH_TOOL_NAME
@@ -1638,6 +1643,10 @@ fn tool_result_sensitivity(tool_name: &str, default_sensitive: bool) -> ToolResu
         || tool_name == "palyra.plugin.run"
     {
         ToolResultSensitivity::ProviderRawPayload
+    } else if tool_name == crate::gateway::WORKSPACE_READ_FILE_TOOL_NAME
+        && workspace_read_result_can_be_public_artifact(output_json)
+    {
+        ToolResultSensitivity::Public
     } else if tool_name == crate::gateway::WORKSPACE_PATCH_TOOL_NAME
         || tool_name == crate::gateway::WORKSPACE_READ_FILE_TOOL_NAME
         || tool_name == crate::gateway::WORKSPACE_LIST_DIR_TOOL_NAME
@@ -1649,6 +1658,38 @@ fn tool_result_sensitivity(tool_name: &str, default_sensitive: bool) -> ToolResu
     } else {
         ToolResultSensitivity::Public
     }
+}
+
+fn workspace_read_result_can_be_public_artifact(output_json: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<Value>(output_json) else {
+        return false;
+    };
+    if !workspace_read_text_already_sanitized(crate::gateway::WORKSPACE_READ_FILE_TOOL_NAME, &value)
+        || value.get("bytes_base64").is_some_and(|payload| !payload.is_null())
+    {
+        return false;
+    }
+    value.get("path").and_then(Value::as_str).is_some_and(workspace_read_display_path_is_model_safe)
+}
+
+fn workspace_read_display_path_is_model_safe(path: &str) -> bool {
+    let path = path.trim();
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.starts_with('\\')
+        || looks_like_windows_absolute_path(path)
+    {
+        return false;
+    }
+    path.split(['/', '\\']).all(|component| !matches!(component, "" | "." | ".."))
+}
+
+fn looks_like_windows_absolute_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\')
 }
 
 fn summarize_tool_result_for_model(
@@ -1822,7 +1863,7 @@ mod tests {
     };
     use crate::journal::{ApprovalDecision, ApprovalDecisionScope};
     use crate::tool_protocol::{ToolAttestation, ToolExecutionOutcome};
-    use palyra_common::runtime_contracts::ToolTurnBudget;
+    use palyra_common::runtime_contracts::{ToolResultSensitivity, ToolTurnBudget};
     use palyra_common::validate_canonical_id;
     use serde_json::json;
     use std::sync::{
@@ -2079,6 +2120,68 @@ mod tests {
 
         assert!(preview.contains("APP_SECRET=<redacted>"), "{preview}");
         assert!(!preview.contains("[REDACTED_SECRET]"), "{preview}");
+    }
+
+    #[test]
+    fn clean_workspace_read_file_text_artifacts_are_public() {
+        let output_json = serde_json::to_vec(&json!({
+            "path": "src/app.js",
+            "workspace_root_index": 0,
+            "offset_bytes": 0,
+            "returned_bytes": 29,
+            "size_bytes": 29,
+            "eof": true,
+            "chunk_sha256": "0".repeat(64),
+            "text": "export const ok = true;\n",
+            "binary": false,
+            "redacted": false,
+        }))
+        .expect("test payload should serialize");
+
+        assert_eq!(
+            super::tool_result_sensitivity(
+                crate::gateway::WORKSPACE_READ_FILE_TOOL_NAME,
+                output_json.as_slice(),
+                false,
+            ),
+            ToolResultSensitivity::Public
+        );
+    }
+
+    #[test]
+    fn unsafe_workspace_read_file_artifacts_stay_internal_path() {
+        let redacted_output = serde_json::to_vec(&json!({
+            "path": ".env",
+            "text": "APP_SECRET=[REDACTED_SECRET]\n",
+            "binary": false,
+            "redacted": true,
+        }))
+        .expect("test payload should serialize");
+        let binary_output = serde_json::to_vec(&json!({
+            "path": "assets/logo.bin",
+            "bytes_base64": "AAAA",
+            "binary": true,
+            "redacted": false,
+        }))
+        .expect("test payload should serialize");
+        let host_path_output = serde_json::to_vec(&json!({
+            "path": "C:\\Users\\alice\\repo\\src\\main.rs",
+            "text": "fn main() {}\n",
+            "binary": false,
+            "redacted": false,
+        }))
+        .expect("test payload should serialize");
+
+        for output_json in [redacted_output, binary_output, host_path_output] {
+            assert_eq!(
+                super::tool_result_sensitivity(
+                    crate::gateway::WORKSPACE_READ_FILE_TOOL_NAME,
+                    output_json.as_slice(),
+                    false,
+                ),
+                ToolResultSensitivity::InternalPath
+            );
+        }
     }
 
     #[test]
