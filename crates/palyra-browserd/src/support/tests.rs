@@ -2533,20 +2533,30 @@ async fn browser_service_chromium_preserves_navigated_private_origin_for_user_fe
         waited.error
     );
 
-    let mut network_log_request = Request::new(browser_v1::NetworkLogRequest {
-        v: 1,
-        session_id: Some(session_id),
-        limit: 20,
-        include_headers: false,
-        max_payload_bytes: 32 * 1024,
-    });
-    insert_principal(&mut network_log_request, "user:ops");
-    let network_log = service
-        .network_log(network_log_request)
-        .await
-        .expect("network_log should execute")
-        .into_inner();
-    assert!(network_log.success, "network log call should succeed: {}", network_log.error);
+    let network_log_deadline = Instant::now() + Duration::from_secs(5);
+    let network_log = loop {
+        let mut network_log_request = Request::new(browser_v1::NetworkLogRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            limit: 20,
+            include_headers: false,
+            max_payload_bytes: 32 * 1024,
+        });
+        insert_principal(&mut network_log_request, "user:ops");
+        let network_log = service
+            .network_log(network_log_request)
+            .await
+            .expect("network_log should execute")
+            .into_inner();
+        assert!(network_log.success, "network log call should succeed: {}", network_log.error);
+        let has_completed_json_fetch = network_log.entries.iter().any(|entry| {
+            entry.request_url.ends_with("/mock-data.json") && entry.status_code == 200
+        });
+        if has_completed_json_fetch || Instant::now() >= network_log_deadline {
+            break network_log;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
     assert!(
         network_log
             .entries
@@ -6521,11 +6531,14 @@ fn spawn_click_fetch_http_server() -> (String, thread::JoinHandle<()>) {
         let started_at = std::time::Instant::now();
         let mut root_seen = false;
         let mut data_seen = false;
-        while started_at.elapsed() < Duration::from_secs(10) && !(root_seen && data_seen) {
+        while started_at.elapsed() < Duration::from_secs(20) && !(root_seen && data_seen) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     stream.set_nonblocking(false).expect("accepted stream should become blocking");
                     let request = read_http_request(&mut stream);
+                    if request.trim().is_empty() {
+                        continue;
+                    }
                     let path = http_request_path(request.as_str());
                     if path.starts_with("/mock-data.json")
                         || path.contains("/mock-data.json")
