@@ -74,6 +74,7 @@ const BUILTIN_READ_FILE_MAX_BYTES: usize = 64 * 1024;
 const CAPTURE_POLL_INTERVAL_MS: u64 = 5;
 const CAPTURE_CHUNK_BYTES: usize = 4 * 1024;
 const PROCESS_FAILURE_OUTPUT_PREVIEW_BYTES: usize = 4 * 1024;
+const PROCESS_FAILURE_OUTPUT_TAIL_BYTES: usize = 4 * 1024;
 const BACKGROUND_STARTUP_CHECK_MS: u64 = 250;
 // Windows process startup and pipe readiness are noticeably slower, so the window for draining
 // startup output (port announcements etc.) before returning metadata is longer there.
@@ -718,17 +719,25 @@ fn process_failure_message(
     let stderr_preview = redacted_process_output_preview(stderr.bytes.as_slice())
         .map(|preview| format!(", stderr_preview={preview:?}"))
         .unwrap_or_default();
+    let stdout_tail = redacted_process_output_tail(stdout.bytes.as_slice())
+        .map(|tail| format!(", stdout_tail={tail:?}"))
+        .unwrap_or_default();
+    let stderr_tail = redacted_process_output_tail(stderr.bytes.as_slice())
+        .map(|tail| format!(", stderr_tail={tail:?}"))
+        .unwrap_or_default();
     let diagnostic_hint = process_failure_diagnostic_hint(stdout, stderr)
         .map(|hint| format!(", hint={hint:?}"))
         .unwrap_or_default();
     format!(
-        "sandbox process exited unsuccessfully (code={exit_code}, stdout_bytes={}, stdout_truncated={}, stderr_bytes={}, stderr_truncated={}{}{}{})",
+        "sandbox process exited unsuccessfully (code={exit_code}, stdout_bytes={}, stdout_truncated={}, stderr_bytes={}, stderr_truncated={}{}{}{}{}{})",
         stdout.bytes.len(),
         stdout.truncated,
         stderr.bytes.len(),
         stderr.truncated,
         stdout_preview,
         stderr_preview,
+        stdout_tail,
+        stderr_tail,
         diagnostic_hint,
     )
 }
@@ -761,8 +770,20 @@ fn redacted_process_output_preview(output: &[u8]) -> Option<String> {
         return None;
     }
     let take_len = output.len().min(PROCESS_FAILURE_OUTPUT_PREVIEW_BYTES);
-    let preview = String::from_utf8_lossy(&output[..take_len]);
-    let normalized = preview
+    redacted_process_output_single_line(&output[..take_len])
+}
+
+fn redacted_process_output_tail(output: &[u8]) -> Option<String> {
+    if output.len() <= PROCESS_FAILURE_OUTPUT_PREVIEW_BYTES {
+        return None;
+    }
+    let tail_start = output.len().saturating_sub(PROCESS_FAILURE_OUTPUT_TAIL_BYTES);
+    redacted_process_output_single_line(&output[tail_start..])
+}
+
+fn redacted_process_output_single_line(output: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(output);
+    let normalized = text
         .chars()
         .map(|character| if character.is_control() { ' ' } else { character })
         .collect::<String>();
@@ -9404,6 +9425,25 @@ mod tests {
         assert!(message.contains("AssertionError"), "{message}");
         assert!(!message.contains("stdout-secret"), "{message}");
         assert!(!message.contains("stderr-secret"), "{message}");
+        assert!(message.contains("<redacted>"), "{message}");
+    }
+
+    #[test]
+    fn process_failure_message_includes_redacted_stderr_tail_for_long_diagnostics() {
+        let stdout = StreamCapture { bytes: Vec::new(), truncated: false, read_error: None };
+        let mut stderr = b"Downloading crate progress line\n".repeat(260);
+        stderr.extend_from_slice(
+            b"error[E0425]: cannot find value `missing_symbol` in this scope\naccess_token=tail-secret\n",
+        );
+        let stderr = StreamCapture { bytes: stderr, truncated: false, read_error: None };
+
+        let message = process_failure_message(101, &stdout, &stderr);
+
+        assert!(message.contains("stderr_preview="), "{message}");
+        assert!(message.contains("stderr_tail="), "{message}");
+        assert!(message.contains("error[E0425]"), "{message}");
+        assert!(message.contains("missing_symbol"), "{message}");
+        assert!(!message.contains("tail-secret"), "{message}");
         assert!(message.contains("<redacted>"), "{message}");
     }
 
