@@ -2639,11 +2639,22 @@ fn final_answer_recovery_prompt(
     loop_state: &AgentRunLoopState,
     already_attempted: bool,
 ) -> Option<&'static str> {
-    if already_attempted || loop_state.completed_tool_calls() == 0 {
+    if already_attempted {
         return None;
     }
 
     let normalized = message.to_ascii_lowercase();
+    if loop_state.completed_tool_calls() == 0 {
+        if normalized.contains("planning or intent statement")
+            && user_requested_summary_only_closeout(loop_state.messages().as_slice())
+        {
+            return Some(
+                "The user asked for a summary-only closeout with no more tool calls. Do not propose future work, do not call tools, and do not claim fresh filesystem, command, browser, or test evidence. Answer now with the current session status from the conversation. If exact file, diff, test, or cleanup state is unknown, say that explicitly.",
+            );
+        }
+        return None;
+    }
+
     if !(normalized.contains("empty final answer after tool execution")
         || normalized.contains("bare acknowledgement instead of a final answer")
         || normalized.contains("planning or intent statement")
@@ -2655,6 +2666,72 @@ fn final_answer_recovery_prompt(
     Some(
         "The previous assistant turn did not provide a usable final answer after tool execution. Continue now using the existing tool evidence. If the requested work is complete, answer with a concise summary that lists changed files, validation results, and any unresolved partial state. If work is incomplete, issue the next minimal tool call needed to inspect, finish, validate, or clean up. Do not claim PASS or completion without direct successful tool evidence.",
     )
+}
+
+fn user_requested_summary_only_closeout(messages: &[ProviderMessage]) -> bool {
+    latest_user_message_text(messages).is_some_and(|message| {
+        let normalized = normalize_final_answer_text(message.as_str());
+        user_message_requests_closeout_summary(normalized.as_str())
+            && user_message_blocks_more_tool_work(normalized.as_str())
+    })
+}
+
+fn latest_user_message_text(messages: &[ProviderMessage]) -> Option<String> {
+    messages.iter().rev().find_map(|message| {
+        (message.role == ProviderMessageRole::User).then(|| message.text_content())
+    })
+}
+
+fn user_message_requests_closeout_summary(normalized: &str) -> bool {
+    const CLOSEOUT_SUMMARY_MARKERS: &[&str] = &[
+        "closeout",
+        "final summary",
+        "finalni summary",
+        "finalni shrnuti",
+        "shrnut",
+        "shrnuti",
+        "stav",
+        "status",
+        "stop summary",
+        "summarise",
+        "summarize",
+        "summary",
+    ];
+
+    CLOSEOUT_SUMMARY_MARKERS.iter().any(|marker| normalized.contains(marker))
+}
+
+fn user_message_blocks_more_tool_work(normalized: &str) -> bool {
+    const NO_MORE_TOOL_MARKERS: &[&str] = &[
+        "bez dalsich tool",
+        "bez dalsich toolu",
+        "bez tool callu",
+        "bez toolu",
+        "final-only",
+        "jen final",
+        "no further tool",
+        "no more tool",
+        "no tool calls",
+        "no tools",
+        "pouze final",
+        "without further tool",
+        "without running any more tool",
+        "without tool",
+    ];
+    const STOP_MARKERS: &[&str] = &[
+        "--abort-active-run",
+        "--interrupt-active-run",
+        "cancel active run",
+        "interrupt active run",
+        "stop active run",
+        "stop the active run",
+        "zastav",
+        "zrus aktivni run",
+        "zrusit aktivni run",
+    ];
+
+    NO_MORE_TOOL_MARKERS.iter().any(|marker| normalized.contains(marker))
+        || STOP_MARKERS.iter().any(|marker| normalized.contains(marker))
 }
 
 fn browser_followup_timeout_recovery_prompt(
@@ -4259,6 +4336,57 @@ mod tests {
         .expect("deferred work after tool execution should be recoverable once");
 
         assert!(prompt.contains("issue the next minimal tool call"));
+    }
+
+    #[test]
+    fn summary_only_closeout_without_tools_gets_recovery_prompt() {
+        let state = AgentRunLoopState::new(
+            vec![ProviderMessage::user_text(
+                "Stop the active run and provide a final-only summary without running any more tools.",
+            )],
+            4,
+            8,
+            10_000,
+        );
+
+        let prompt = final_answer_recovery_prompt(
+            "model returned a planning or intent statement as the final answer without executing any tools",
+            &state,
+            false,
+        )
+        .expect("summary-only closeout should get one no-tool recovery turn");
+
+        assert!(prompt.contains("summary-only closeout"));
+        assert!(prompt.contains("do not call tools"));
+        assert!(
+            final_answer_recovery_prompt(
+                "model returned a planning or intent statement as the final answer without executing any tools",
+                &state,
+                true,
+            )
+            .is_none(),
+            "summary-only recovery must still be bounded"
+        );
+    }
+
+    #[test]
+    fn ordinary_no_tool_deferred_work_does_not_get_recovery_prompt() {
+        let state = AgentRunLoopState::new(
+            vec![ProviderMessage::user_text("Create fixtures/cz-validator with tests.")],
+            4,
+            8,
+            10_000,
+        );
+
+        assert!(
+            final_answer_recovery_prompt(
+                "model returned a planning or intent statement as the final answer without executing any tools",
+                &state,
+                false,
+            )
+            .is_none(),
+            "ordinary implementation requests still need real tool evidence"
+        );
     }
 
     #[test]
