@@ -223,6 +223,23 @@ enum HunkLineKind {
     Remove,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingLineEnding {
+    Lf,
+    Crlf,
+    Cr,
+}
+
+impl ExistingLineEnding {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Lf => "\n",
+            Self::Crlf => "\r\n",
+            Self::Cr => "\r",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HunkLine {
     kind: HunkLineKind,
@@ -1732,6 +1749,7 @@ fn apply_hunks_to_bytes(
 ) -> Result<Vec<u8>, WorkspacePatchError> {
     let text = std::str::from_utf8(before)
         .map_err(|_| WorkspacePatchError::InvalidUtf8File { path: path_label.to_owned() })?;
+    let line_ending = detect_existing_line_ending(before);
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
     let had_trailing_newline = normalized.ends_with('\n');
     let body = normalized.strip_suffix('\n').unwrap_or(normalized.as_str());
@@ -1779,11 +1797,7 @@ fn apply_hunks_to_bytes(
         search_cursor = start.saturating_add(inserted_len);
     }
 
-    let mut output = lines.join("\n");
-    if had_trailing_newline {
-        output.push('\n');
-    }
-    Ok(output.into_bytes())
+    Ok(render_lines_with_existing_ending(&lines, had_trailing_newline, line_ending))
 }
 
 fn replace_exact_line_bytes(
@@ -1794,6 +1808,7 @@ fn replace_exact_line_bytes(
 ) -> Result<Vec<u8>, WorkspacePatchError> {
     let text = std::str::from_utf8(before)
         .map_err(|_| WorkspacePatchError::InvalidUtf8File { path: path_label.to_owned() })?;
+    let line_ending = detect_existing_line_ending(before);
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
     let had_trailing_newline = normalized.ends_with('\n');
     let body = normalized.strip_suffix('\n').unwrap_or(normalized.as_str());
@@ -1825,11 +1840,73 @@ fn replace_exact_line_bytes(
     }
 
     lines[index] = new.to_owned();
-    let mut output = lines.join("\n");
+    Ok(render_lines_with_existing_ending(&lines, had_trailing_newline, line_ending))
+}
+
+fn render_lines_with_existing_ending(
+    lines: &[String],
+    had_trailing_newline: bool,
+    line_ending: ExistingLineEnding,
+) -> Vec<u8> {
+    let separator = line_ending.as_str();
+    let mut output = lines.join(separator);
     if had_trailing_newline {
-        output.push('\n');
+        output.push_str(separator);
     }
-    Ok(output.into_bytes())
+    output.into_bytes()
+}
+
+fn detect_existing_line_ending(bytes: &[u8]) -> ExistingLineEnding {
+    let mut crlf_count = 0_usize;
+    let mut lf_count = 0_usize;
+    let mut cr_count = 0_usize;
+    let mut first = None::<ExistingLineEnding>;
+    let mut index = 0_usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\r' if bytes.get(index.saturating_add(1)) == Some(&b'\n') => {
+                crlf_count = crlf_count.saturating_add(1);
+                first.get_or_insert(ExistingLineEnding::Crlf);
+                index = index.saturating_add(2);
+            }
+            b'\r' => {
+                cr_count = cr_count.saturating_add(1);
+                first.get_or_insert(ExistingLineEnding::Cr);
+                index = index.saturating_add(1);
+            }
+            b'\n' => {
+                lf_count = lf_count.saturating_add(1);
+                first.get_or_insert(ExistingLineEnding::Lf);
+                index = index.saturating_add(1);
+            }
+            _ => {
+                index = index.saturating_add(1);
+            }
+        }
+    }
+
+    let max_count = crlf_count.max(lf_count).max(cr_count);
+    if max_count == 0 {
+        return ExistingLineEnding::Lf;
+    }
+    let mut winner = None::<ExistingLineEnding>;
+    let mut has_tie = false;
+    for (line_ending, count) in [
+        (ExistingLineEnding::Crlf, crlf_count),
+        (ExistingLineEnding::Lf, lf_count),
+        (ExistingLineEnding::Cr, cr_count),
+    ] {
+        if count != max_count {
+            continue;
+        }
+        if winner.replace(line_ending).is_some() {
+            has_tie = true;
+        }
+    }
+    if has_tie {
+        return first.unwrap_or(ExistingLineEnding::Lf);
+    }
+    winner.unwrap_or(ExistingLineEnding::Lf)
 }
 
 fn find_subsequence(haystack: &[String], needle: &[String], from: usize) -> Option<usize> {
@@ -2130,6 +2207,29 @@ mod tests {
     }
 
     #[test]
+    fn apply_workspace_patch_preserves_crlf_for_update_hunks() {
+        let temp = tempdir().expect("tempdir should be created");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        fs::write(workspace.join("app.ts"), b"alpha\r\nbeta\r\ngamma\r\n")
+            .expect("seed file should exist");
+
+        let patch = "*** Begin Patch\n*** Update File: app.ts\n@@\n beta\n-gamma\n+gamma();\n*** End Patch\n";
+        let outcome = apply_workspace_patch(
+            std::slice::from_ref(&workspace),
+            &default_request(patch, false),
+            &default_limits(),
+        )
+        .expect("CRLF update hunk should apply");
+
+        assert_eq!(attestation_by_path(&outcome, "app.ts").operation, "update");
+        assert_eq!(
+            fs::read(workspace.join("app.ts")).expect("updated file should read"),
+            b"alpha\r\nbeta\r\ngamma();\r\n"
+        );
+    }
+
+    #[test]
     fn apply_workspace_patch_rejects_zero_byte_add_file_placeholders() {
         let temp = tempdir().expect("tempdir should be created");
         let workspace = temp.path().join("workspace");
@@ -2322,6 +2422,30 @@ mod tests {
         assert_eq!(attestation.operation, "line_replace");
         assert!(attestation.before_sha256.is_some());
         assert!(attestation.after_sha256.is_some());
+    }
+
+    #[test]
+    fn apply_workspace_patch_preserves_crlf_for_replace_line() {
+        let temp = tempdir().expect("tempdir should be created");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        fs::write(workspace.join("app.js"), b"render();\r\nsave();\r\n")
+            .expect("seed file should exist");
+
+        let patch =
+            "*** Begin Patch\n*** Replace Line: app.js\n-save();\n+saveNow();\n*** End Patch\n";
+        let outcome = apply_workspace_patch(
+            std::slice::from_ref(&workspace),
+            &default_request(patch, false),
+            &default_limits(),
+        )
+        .expect("replace-line patch should apply");
+
+        assert_eq!(attestation_by_path(&outcome, "app.js").operation, "line_replace");
+        assert_eq!(
+            fs::read(workspace.join("app.js")).expect("patched file should read"),
+            b"render();\r\nsaveNow();\r\n"
+        );
     }
 
     #[test]
