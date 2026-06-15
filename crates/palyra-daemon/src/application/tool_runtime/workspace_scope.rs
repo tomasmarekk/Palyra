@@ -323,6 +323,9 @@ pub(crate) fn active_workspace_root_from_focus_paths(
         if focus_path == "." {
             continue;
         }
+        if workspace_focus_path_is_runtime_internal(focus_path.as_str()) {
+            continue;
+        }
         for root in &canonical_roots {
             let candidate = root.join(focus_path.as_str());
             let Some(directory) = nearest_existing_directory(candidate.as_path(), root) else {
@@ -429,6 +432,21 @@ pub(crate) fn workspace_root_override_targets_active_root(
         .is_some_and(|basename| normalized == basename)
 }
 
+pub(crate) fn workspace_focus_path_is_runtime_internal(path: &str) -> bool {
+    let Some(normalized) = normalize_relative_workspace_path(path) else {
+        return false;
+    };
+    normalized.split('/').any(workspace_focus_segment_is_runtime_internal)
+}
+
+fn workspace_focus_segment_is_runtime_internal(segment: &str) -> bool {
+    let normalized = segment.to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        ".pnpm" | ".venv" | ".yarn" | "__pycache__" | "node_modules" | "site-packages" | "venv"
+    )
+}
+
 fn canonicalize_workspace_roots(workspace_roots: &[PathBuf]) -> Vec<PathBuf> {
     workspace_roots
         .iter()
@@ -496,7 +514,8 @@ mod tests {
         launch_path_env_from_context, launch_workspace_roots_from_context,
         merge_launch_workspace_roots, relative_path_already_targets_active_root,
         relative_path_should_use_active_root, same_workspace_root,
-        workspace_root_override_targets_active_root, ActiveWorkspaceRoot, RunLaunchCliContext,
+        workspace_focus_path_is_runtime_internal, workspace_root_override_targets_active_root,
+        ActiveWorkspaceRoot, RunLaunchCliContext,
     };
     use std::{collections::BTreeMap, fs};
 
@@ -571,6 +590,22 @@ mod tests {
 
         assert_eq!(active.root, fs::canonicalize(project).expect("project should canonicalize"));
         assert_eq!(active.relative_path, "routine-workspace");
+    }
+
+    #[test]
+    fn active_workspace_root_ignores_runtime_internal_focus_paths() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let package = tempdir.path().join("repo").join("node_modules").join("vitest");
+        fs::create_dir_all(package.as_path()).expect("dependency package should exist");
+
+        let active = active_workspace_root_from_focus_paths(
+            &[tempdir.path().to_path_buf()],
+            &["repo/node_modules/vitest".to_owned()],
+        );
+
+        assert_eq!(active, None);
+        assert!(workspace_focus_path_is_runtime_internal("repo/node_modules/vitest"));
+        assert!(!workspace_focus_path_is_runtime_internal("repo/src"));
     }
 
     #[test]

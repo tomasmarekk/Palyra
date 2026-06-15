@@ -73,7 +73,7 @@ use crate::{
         inbound_coalescer::InboundCoalescer,
         tool_runtime::workspace_scope::{
             relative_path_already_targets_active_root, run_launch_context_path_env,
-            session_active_workspace_root,
+            session_active_workspace_root, workspace_focus_path_is_runtime_internal,
             workspace_roots_with_run_launch_context_for_agent_source, ActiveWorkspaceRoot,
         },
     },
@@ -1440,7 +1440,8 @@ fn workspace_focus_path_for_existing_dir(
             return None;
         }
         let relative = canonical_requested.strip_prefix(canonical_root.as_path()).ok()?;
-        process_workspace_relative_display_path(relative)
+        let focus_path = process_workspace_relative_display_path(relative)?;
+        (!workspace_focus_path_is_runtime_internal(focus_path.as_str())).then_some(focus_path)
     })
 }
 
