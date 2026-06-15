@@ -450,6 +450,14 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                     ),
                     ("offset_bytes", json!({"type":"integer","minimum":0})),
                     ("max_bytes", json!({"type":"integer","minimum":1})),
+                    (
+                        "line_start",
+                        json!({"type":"integer","minimum":1,"description":"Optional 1-based line number to start reading from. Use this to follow up on palyra.fs.search line hits."}),
+                    ),
+                    (
+                        "line_count",
+                        json!({"type":"integer","minimum":1,"description":"Optional number of lines to return when line_start is set."}),
+                    ),
                 ],
                 false,
             ),

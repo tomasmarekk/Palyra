@@ -64,6 +64,7 @@ const WORKSPACE_SEARCH_MAX_DIR_ENTRIES: usize = 2_000;
 const WORKSPACE_SEARCH_MAX_LINE_TEXT_BYTES: usize = 4 * 1024;
 const WORKSPACE_SEARCH_MAX_OUTPUT_BYTES: usize = 512 * 1024;
 const WORKSPACE_SEARCH_MATCH_JSON_OVERHEAD_BYTES: usize = 160;
+const WORKSPACE_READ_LINE_SCAN_BUFFER_BYTES: usize = 8 * 1024;
 // Well-known dependency/build directories whose contents are noise for search.
 const WORKSPACE_SEARCH_SKIPPED_DIRS: &[&str] =
     &[".git", "node_modules", "target", "dist", "build", ".next", ".svelte-kit"];
@@ -78,6 +79,10 @@ struct WorkspaceReadFileInput {
     offset_bytes: u64,
     #[serde(default)]
     max_bytes: Option<u64>,
+    #[serde(default)]
+    line_start: Option<u64>,
+    #[serde(default)]
+    line_count: Option<u64>,
 }
 
 /// List-dir tool input; field names are pinned by the tool JSON schema.
@@ -113,6 +118,10 @@ struct WorkspaceReadFileOutput {
     path: String,
     workspace_root_index: usize,
     offset_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line_start: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line_end: Option<u64>,
     returned_bytes: u64,
     size_bytes: u64,
     eof: bool,
@@ -170,6 +179,13 @@ struct WorkspaceListDirEntry {
     kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     size_bytes: Option<u64>,
+}
+
+struct WorkspaceReadWindow {
+    offset_bytes: u64,
+    read_limit: usize,
+    line_start: Option<u64>,
+    line_end: Option<u64>,
 }
 
 /// Executes the workspace read-file tool: resolves the scoped roots, reads a
@@ -494,6 +510,20 @@ fn parse_workspace_read_file_input(input_json: &[u8]) -> Result<WorkspaceReadFil
     }
     if matches!(input.max_bytes, Some(0)) {
         return Err(format!("{WORKSPACE_READ_FILE_TOOL_NAME} max_bytes must be >= 1"));
+    }
+    if matches!(input.line_start, Some(0)) {
+        return Err(format!("{WORKSPACE_READ_FILE_TOOL_NAME} line_start must be >= 1"));
+    }
+    if matches!(input.line_count, Some(0)) {
+        return Err(format!("{WORKSPACE_READ_FILE_TOOL_NAME} line_count must be >= 1"));
+    }
+    if input.line_count.is_some() && input.line_start.is_none() {
+        return Err(format!("{WORKSPACE_READ_FILE_TOOL_NAME} line_count requires line_start"));
+    }
+    if input.line_start.is_some() && input.offset_bytes != 0 {
+        return Err(format!(
+            "{WORKSPACE_READ_FILE_TOOL_NAME} line_start cannot be combined with offset_bytes"
+        ));
     }
     input.workspace_root = normalize_optional_workspace_root(input.workspace_root);
     input.path = normalize_workspace_path_input(input.path.as_str());
@@ -1824,18 +1854,18 @@ fn read_workspace_file_chunk(
             )
         })?
         .len();
-    file.seek(SeekFrom::Start(input.offset_bytes)).map_err(|error| {
+    let max_bytes = input.max_bytes.unwrap_or(MAX_WORKSPACE_READ_FILE_BYTES);
+    let read_limit = usize::try_from(max_bytes.min(MAX_WORKSPACE_READ_FILE_BYTES))
+        .expect("workspace read cap must fit usize");
+    let read_window = workspace_read_window_for_input(&mut file, input, size_bytes, read_limit)?;
+    file.seek(SeekFrom::Start(read_window.offset_bytes)).map_err(|error| {
         format!(
             "{WORKSPACE_READ_FILE_TOOL_NAME} failed to seek workspace file {}: {error}",
             input.path
         )
     })?;
-
-    let max_bytes = input.max_bytes.unwrap_or(MAX_WORKSPACE_READ_FILE_BYTES);
-    let read_limit = usize::try_from(max_bytes.min(MAX_WORKSPACE_READ_FILE_BYTES))
-        .expect("workspace read cap must fit usize");
-    let mut buffer = Vec::with_capacity(read_limit.min(8192));
-    file.take(read_limit as u64).read_to_end(&mut buffer).map_err(|error| {
+    let mut buffer = Vec::with_capacity(read_window.read_limit.min(8192));
+    file.take(read_window.read_limit as u64).read_to_end(&mut buffer).map_err(|error| {
         format!(
             "{WORKSPACE_READ_FILE_TOOL_NAME} failed to read workspace file {}: {error}",
             input.path
@@ -1844,7 +1874,7 @@ fn read_workspace_file_chunk(
 
     let returned_bytes =
         u64::try_from(buffer.len()).expect("returned workspace file chunk size must fit u64");
-    let eof = input.offset_bytes.saturating_add(returned_bytes) >= size_bytes;
+    let eof = read_window.offset_bytes.saturating_add(returned_bytes) >= size_bytes;
     let chunk_sha256 = hex::encode(Sha256::digest(buffer.as_slice()));
     // Redaction policy: only a confirmed secret-leak finding replaces the
     // text, and redacted text is marked non-authoritative so callers do not
@@ -1875,7 +1905,9 @@ fn read_workspace_file_chunk(
     Ok(WorkspaceReadFileOutput {
         path: display_path,
         workspace_root_index,
-        offset_bytes: input.offset_bytes,
+        offset_bytes: read_window.offset_bytes,
+        line_start: read_window.line_start,
+        line_end: read_window.line_end,
         returned_bytes,
         size_bytes,
         eof,
@@ -1886,6 +1918,91 @@ fn read_workspace_file_chunk(
         redacted,
         text_authoritative,
         redaction_notice,
+    })
+}
+
+fn workspace_read_window_for_input(
+    file: &mut File,
+    input: &WorkspaceReadFileInput,
+    size_bytes: u64,
+    read_limit: usize,
+) -> Result<WorkspaceReadWindow, String> {
+    if let Some(line_start) = input.line_start {
+        return workspace_line_read_window(
+            file,
+            input.path.as_str(),
+            line_start,
+            input.line_count,
+            size_bytes,
+            read_limit,
+        );
+    }
+    Ok(WorkspaceReadWindow {
+        offset_bytes: input.offset_bytes,
+        read_limit,
+        line_start: None,
+        line_end: None,
+    })
+}
+
+fn workspace_line_read_window(
+    file: &mut File,
+    path: &str,
+    line_start: u64,
+    line_count: Option<u64>,
+    size_bytes: u64,
+    read_limit: usize,
+) -> Result<WorkspaceReadWindow, String> {
+    file.seek(SeekFrom::Start(0)).map_err(|error| {
+        format!("{WORKSPACE_READ_FILE_TOOL_NAME} failed to seek workspace file {path}: {error}")
+    })?;
+
+    let requested_line_end =
+        line_count.map(|count| line_start.saturating_add(count).saturating_sub(1));
+    let mut current_line = 1_u64;
+    let mut absolute_offset = 0_u64;
+    let mut start_offset = (line_start == 1).then_some(0_u64);
+    let mut end_offset = None::<u64>;
+    let mut buffer = [0_u8; WORKSPACE_READ_LINE_SCAN_BUFFER_BYTES];
+
+    'scan: loop {
+        let bytes_read = file.read(&mut buffer).map_err(|error| {
+            format!("{WORKSPACE_READ_FILE_TOOL_NAME} failed to scan workspace file {path}: {error}")
+        })?;
+        if bytes_read == 0 {
+            break;
+        }
+        for (index, byte) in buffer[..bytes_read].iter().enumerate() {
+            let byte_offset = absolute_offset
+                .saturating_add(u64::try_from(index).expect("line scan buffer index must fit u64"));
+            if *byte != b'\n' {
+                continue;
+            }
+            if start_offset.is_some() && requested_line_end == Some(current_line) {
+                end_offset = Some(byte_offset.saturating_add(1));
+                break 'scan;
+            }
+            current_line = current_line.saturating_add(1);
+            if start_offset.is_none() && current_line == line_start {
+                start_offset = Some(byte_offset.saturating_add(1));
+            }
+        }
+        absolute_offset = absolute_offset
+            .saturating_add(u64::try_from(bytes_read).expect("line scan read length must fit u64"));
+    }
+
+    let offset_bytes = start_offset.unwrap_or(size_bytes);
+    let read_limit = end_offset
+        .and_then(|end| end.checked_sub(offset_bytes))
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .map(|bytes| bytes.min(read_limit))
+        .unwrap_or(read_limit);
+
+    Ok(WorkspaceReadWindow {
+        offset_bytes,
+        read_limit,
+        line_start: Some(line_start),
+        line_end: requested_line_end,
     })
 }
 
@@ -2363,6 +2480,8 @@ mod tests {
             workspace_root: None,
             offset_bytes: 0,
             max_bytes: None,
+            line_start: None,
+            line_count: None,
         };
 
         let output = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
@@ -2379,6 +2498,32 @@ mod tests {
     }
 
     #[test]
+    fn read_workspace_file_reads_line_range_from_search_hit() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let file_path = tempdir.path().join("module.go");
+        fs::write(file_path, "line one\nline two\nneedle line\nnext line\n")
+            .expect("workspace file should be written");
+        let input = WorkspaceReadFileInput {
+            path: "module.go".to_owned(),
+            workspace_root: None,
+            offset_bytes: 0,
+            max_bytes: None,
+            line_start: Some(3),
+            line_count: Some(2),
+        };
+
+        let output = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
+            .expect("workspace file should be readable by line range");
+
+        assert_eq!(output.text.as_deref(), Some("needle line\nnext line\n"));
+        assert_eq!(output.offset_bytes, "line one\nline two\n".len() as u64);
+        assert_eq!(output.line_start, Some(3));
+        assert_eq!(output.line_end, Some(4));
+        assert!(output.eof);
+        assert!(!output.binary);
+    }
+
+    #[test]
     fn read_workspace_file_returns_ansi_diagnostics_as_text() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let file_path = tempdir.path().join("typecheck.txt");
@@ -2389,6 +2534,8 @@ mod tests {
             workspace_root: None,
             offset_bytes: 0,
             max_bytes: None,
+            line_start: None,
+            line_count: None,
         };
 
         let output = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
@@ -2412,6 +2559,8 @@ mod tests {
             workspace_root: None,
             offset_bytes: 0,
             max_bytes: None,
+            line_start: None,
+            line_count: None,
         };
 
         let output = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
@@ -2440,6 +2589,8 @@ mod tests {
             workspace_root: None,
             offset_bytes: 0,
             max_bytes: None,
+            line_start: None,
+            line_count: None,
         };
 
         let output = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
@@ -2471,6 +2622,8 @@ mod tests {
             workspace_root: None,
             offset_bytes: 0,
             max_bytes: None,
+            line_start: None,
+            line_count: None,
         };
 
         let output = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
@@ -2494,6 +2647,8 @@ mod tests {
             workspace_root: None,
             offset_bytes: 0,
             max_bytes: None,
+            line_start: None,
+            line_count: None,
         };
 
         let output = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
@@ -2517,6 +2672,8 @@ mod tests {
             workspace_root: None,
             offset_bytes: 0,
             max_bytes: None,
+            line_start: None,
+            line_count: None,
         };
 
         let output = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
@@ -2544,6 +2701,8 @@ mod tests {
             workspace_root: None,
             offset_bytes: 0,
             max_bytes: None,
+            line_start: None,
+            line_count: None,
         };
 
         let output = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
@@ -2566,6 +2725,8 @@ mod tests {
             workspace_root: None,
             offset_bytes: 0,
             max_bytes: None,
+            line_start: None,
+            line_count: None,
         };
 
         let output = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
@@ -2586,6 +2747,8 @@ mod tests {
             workspace_root: None,
             offset_bytes: 0,
             max_bytes: None,
+            line_start: None,
+            line_count: None,
         };
 
         let output = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
@@ -2615,6 +2778,8 @@ mod tests {
             workspace_root: None,
             offset_bytes: 0,
             max_bytes: None,
+            line_start: None,
+            line_count: None,
         };
 
         let output = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
@@ -2636,6 +2801,8 @@ mod tests {
             workspace_root: None,
             offset_bytes: 0,
             max_bytes: None,
+            line_start: None,
+            line_count: None,
         };
 
         let output = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
@@ -2660,6 +2827,8 @@ mod tests {
             workspace_root: None,
             offset_bytes: 0,
             max_bytes: None,
+            line_start: None,
+            line_count: None,
         };
 
         let output = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
@@ -2684,6 +2853,8 @@ mod tests {
             workspace_root: None,
             offset_bytes: 0,
             max_bytes: None,
+            line_start: None,
+            line_count: None,
         };
 
         let output = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
@@ -2710,6 +2881,8 @@ mod tests {
             workspace_root: None,
             offset_bytes: 0,
             max_bytes: None,
+            line_start: None,
+            line_count: None,
         };
 
         let output = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
@@ -2730,6 +2903,8 @@ mod tests {
             workspace_root: None,
             offset_bytes: 2,
             max_bytes: Some(3),
+            line_start: None,
+            line_count: None,
         };
 
         let output = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
@@ -2753,6 +2928,8 @@ mod tests {
             workspace_root: None,
             offset_bytes: 0,
             max_bytes: None,
+            line_start: None,
+            line_count: None,
         };
 
         let output = read_workspace_file_from_roots(&[workspace], &input)
@@ -2908,6 +3085,8 @@ mod tests {
             workspace_root: None,
             offset_bytes: 0,
             max_bytes: None,
+            line_start: None,
+            line_count: None,
         };
 
         let error = read_workspace_file_from_roots(&[workspace], &input)
@@ -2933,6 +3112,8 @@ mod tests {
                 workspace_root: None,
                 offset_bytes: 0,
                 max_bytes: None,
+                line_start: None,
+                line_count: None,
             })
             .collect::<Vec<_>>();
 
@@ -2972,6 +3153,8 @@ mod tests {
             workspace_root: None,
             offset_bytes: 0,
             max_bytes: None,
+            line_start: None,
+            line_count: None,
         };
 
         let error = read_workspace_file_from_roots(&[workspace], &input)
@@ -2997,6 +3180,8 @@ mod tests {
             workspace_root: None,
             offset_bytes: 0,
             max_bytes: None,
+            line_start: None,
+            line_count: None,
         };
 
         let error = read_workspace_file_from_roots(&[workspace], &input)
@@ -3023,6 +3208,8 @@ mod tests {
             workspace_root: None,
             offset_bytes: 0,
             max_bytes: None,
+            line_start: None,
+            line_count: None,
         };
 
         let error = read_workspace_file_chunk(
