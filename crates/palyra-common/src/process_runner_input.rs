@@ -21,6 +21,8 @@ pub struct ProcessRunnerToolInput {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
+    pub prepend_path: Vec<String>,
+    #[serde(default)]
     pub requested_egress_hosts: Vec<String>,
     #[serde(default)]
     pub timeout_ms: Option<u64>,
@@ -127,6 +129,7 @@ mod tests {
         assert_eq!(parsed.args, vec!["-a"]);
         assert_eq!(parsed.cwd.as_deref(), Some("workspace"));
         assert!(parsed.env.is_empty());
+        assert!(parsed.prepend_path.is_empty());
         assert_eq!(parsed.requested_egress_hosts, vec!["api.example.com"]);
         assert_eq!(parsed.timeout_ms, None);
         assert!(!parsed.background);
@@ -140,6 +143,15 @@ mod tests {
             .expect("valid process-runner env payload should parse");
 
         assert_eq!(parsed.env.get("PALYRA_E2E_HOME").map(String::as_str), Some("C:\\tmp\\home"));
+    }
+
+    #[test]
+    fn parse_process_runner_tool_input_accepts_prepend_path() {
+        let input = br#"{"command":"pnpm","args":["test"],"prepend_path":["C:\\tools\\node","node_modules/.bin"]}"#;
+        let parsed = parse_process_runner_tool_input(input)
+            .expect("valid process-runner prepend_path payload should parse");
+
+        assert_eq!(parsed.prepend_path, vec!["C:\\tools\\node", "node_modules/.bin"]);
     }
 
     #[test]

@@ -19,6 +19,7 @@
 
 use std::{
     collections::{hash_map::DefaultHasher, BTreeMap},
+    ffi::{OsStr, OsString},
     fs,
     hash::{Hash, Hasher},
     io::{self, Read},
@@ -69,6 +70,8 @@ const MAX_ARG_LENGTH: usize = 4_096;
 const MAX_ENV_COUNT: usize = 32;
 const MAX_ENV_KEY_LENGTH: usize = 128;
 const MAX_ENV_VALUE_LENGTH: usize = 4_096;
+const MAX_PREPEND_PATH_COUNT: usize = 16;
+const MAX_PREPEND_PATH_LENGTH: usize = 1_024;
 const BUILTIN_LIST_MAX_ENTRIES: usize = 512;
 const BUILTIN_READ_FILE_MAX_BYTES: usize = 64 * 1024;
 const CAPTURE_POLL_INTERVAL_MS: u64 = 5;
@@ -1503,6 +1506,7 @@ fn validate_input_shape(input: &ProcessRunnerInput) -> Result<(), SandboxProcess
         });
     }
     validate_process_env_overrides(&input.env)?;
+    validate_process_prepend_path_shape(input.prepend_path.as_slice())?;
     if let Some(timeout_ms) = input.timeout_ms {
         if timeout_ms == 0 {
             return Err(SandboxProcessRunError {
@@ -1511,6 +1515,43 @@ fn validate_input_shape(input: &ProcessRunnerInput) -> Result<(), SandboxProcess
             });
         }
     }
+    Ok(())
+}
+
+fn validate_process_prepend_path_shape(paths: &[String]) -> Result<(), SandboxProcessRunError> {
+    if paths.len() > MAX_PREPEND_PATH_COUNT {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::InvalidInput,
+            message: format!(
+                "palyra.process.run prepend_path supports at most {MAX_PREPEND_PATH_COUNT} entries"
+            ),
+        });
+    }
+
+    for path in paths {
+        if path.trim().is_empty() || path.trim() != path {
+            return Err(SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::InvalidInput,
+                message: "palyra.process.run prepend_path entries must be non-empty paths without leading or trailing whitespace"
+                    .to_owned(),
+            });
+        }
+        if path.len() > MAX_PREPEND_PATH_LENGTH {
+            return Err(SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::InvalidInput,
+                message: format!(
+                    "palyra.process.run prepend_path entry exceeds {MAX_PREPEND_PATH_LENGTH} characters"
+                ),
+            });
+        }
+        if path.contains('\0') {
+            return Err(SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::InvalidInput,
+                message: "palyra.process.run prepend_path entry contains a NUL byte".to_owned(),
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -3055,6 +3096,61 @@ fn host_access_path_env_for_input(input: &ProcessRunnerInput) -> BTreeMap<String
     path_env
 }
 
+fn resolve_process_prepend_path_entries(
+    policy: &SandboxProcessRunnerPolicy,
+    input: &ProcessRunnerInput,
+    workspace_root: &Path,
+    cwd: &Path,
+) -> Result<Vec<PathBuf>, SandboxProcessRunError> {
+    if input.prepend_path.is_empty() {
+        return Ok(Vec::new());
+    }
+    if process_runner_allows_host_access(policy) {
+        let host_roots = host_access_roots_for_input(input);
+        let path_env = host_access_path_env_for_input(input);
+        return input
+            .prepend_path
+            .iter()
+            .map(|path| {
+                let expanded = expand_host_access_safe_env_path(path.as_str(), &path_env)?;
+                let resolved_path =
+                    expanded.as_ref().map(|path| path.to_string_lossy().to_string());
+                let raw = resolved_path.as_deref().unwrap_or(path.as_str());
+                let resolved = resolve_host_access_path_with_roots(
+                    workspace_root,
+                    cwd,
+                    raw,
+                    true,
+                    host_roots.as_slice(),
+                )?;
+                require_prepend_path_directory(path.as_str(), resolved)
+            })
+            .collect();
+    }
+
+    input
+        .prepend_path
+        .iter()
+        .map(|path| {
+            let resolved = resolve_scoped_path(workspace_root, cwd, path.as_str(), true)?;
+            require_prepend_path_directory(path.as_str(), resolved)
+        })
+        .collect()
+}
+
+fn require_prepend_path_directory(
+    raw: &str,
+    path: PathBuf,
+) -> Result<PathBuf, SandboxProcessRunError> {
+    if path.is_dir() {
+        return Ok(path);
+    }
+    Err(SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+        message: format!("palyra.process.run prepend_path entry '{raw}' is not a directory"),
+    })
+}
+
 // Host-access scope = operator-configured roots (PALYRA_OS_FILE_ROOTS) + the user profile +
 // temp directories. Roots that fail to canonicalize or are not directories are silently
 // dropped: a missing root must narrow the scope, never widen or break it.
@@ -3552,11 +3648,12 @@ fn resolve_host_process_program_with_roots(
     cwd: &Path,
     command: &str,
     host_roots: &[PathBuf],
+    prepend_path: &[PathBuf],
 ) -> Result<PathBuf, SandboxProcessRunError> {
     if command_has_path_separator(command) {
         return resolve_host_executable_path_with_roots(workspace_root, cwd, command, host_roots);
     }
-    Ok(resolve_tier_b_process_program(command, cwd))
+    Ok(resolve_tier_b_process_program(command, cwd, prepend_path))
 }
 
 fn host_executable_path_candidates(
@@ -4825,6 +4922,7 @@ fn build_process_command(
     workspace_root: &Path,
     cwd: &Path,
 ) -> Result<Command, SandboxProcessRunError> {
+    let prepend_path = resolve_process_prepend_path_entries(policy, input, workspace_root, cwd)?;
     if process_runner_allows_host_access(policy) {
         let host_roots = host_access_roots_for_input(input);
         let program = resolve_host_process_program_with_roots(
@@ -4832,6 +4930,7 @@ fn build_process_command(
             cwd,
             input.command.as_str(),
             host_roots.as_slice(),
+            prepend_path.as_slice(),
         )?;
         let path_env = host_access_path_env_for_input(input);
         let args =
@@ -4843,6 +4942,7 @@ fn build_process_command(
             program.as_path(),
             workspace_root,
         )?;
+        apply_process_path_prepend(&mut command, prepend_path.as_slice())?;
         apply_process_env_overrides(&mut command, input);
         configure_wsl_path_env_bridge(&mut command, input.command.as_str(), program.as_path());
         return Ok(command);
@@ -4880,11 +4980,13 @@ fn build_process_command(
             .env("LANG", "C")
             .env("LC_ALL", "C");
         configure_node_runtime_environment(&mut command);
+        apply_process_path_prepend(&mut command, prepend_path.as_slice())?;
         apply_process_env_overrides(&mut command, input);
         return Ok(command);
     }
 
-    let program = resolve_tier_b_process_program(input.command.as_str(), cwd);
+    let program =
+        resolve_tier_b_process_program(input.command.as_str(), cwd, prepend_path.as_slice());
     let mut command = build_tier_b_process_command(program.as_path(), scoped_args.as_slice(), cwd)?;
     configure_tier_b_process_environment(
         &mut command,
@@ -4892,9 +4994,50 @@ fn build_process_command(
         program.as_path(),
         policy,
     )?;
+    apply_process_path_prepend(&mut command, prepend_path.as_slice())?;
     apply_process_env_overrides(&mut command, input);
     configure_wsl_path_env_bridge(&mut command, input.command.as_str(), program.as_path());
     Ok(command)
+}
+
+fn apply_process_path_prepend(
+    command: &mut Command,
+    prepend_path: &[PathBuf],
+) -> Result<(), SandboxProcessRunError> {
+    if prepend_path.is_empty() {
+        return Ok(());
+    }
+    let existing_path = command_env_value_os(command, "PATH");
+    let mut entries = prepend_path.to_vec();
+    if let Some(existing_path) = existing_path.as_ref().filter(|value| !value.is_empty()) {
+        entries.extend(std::env::split_paths(existing_path));
+    }
+    let joined = std::env::join_paths(entries).map_err(|error| SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::InvalidInput,
+        message: format!("palyra.process.run prepend_path could not be joined into PATH: {error}"),
+    })?;
+    command.env("PATH", joined);
+    Ok(())
+}
+
+fn command_env_value_os(command: &Command, requested_key: &str) -> Option<OsString> {
+    command.get_envs().find_map(|(key, value)| {
+        if env_key_matches(key, requested_key) {
+            value.map(OsString::from)
+        } else {
+            None
+        }
+    })
+}
+
+#[cfg(windows)]
+fn env_key_matches(key: &OsStr, requested_key: &str) -> bool {
+    key.to_string_lossy().eq_ignore_ascii_case(requested_key)
+}
+
+#[cfg(not(windows))]
+fn env_key_matches(key: &OsStr, requested_key: &str) -> bool {
+    key == OsStr::new(requested_key)
 }
 
 // Applied last so explicit, already-validated overrides win over computed defaults; the
@@ -5267,14 +5410,16 @@ fn infer_desktop_cli_profiles_path(state_root: &Path) -> Option<PathBuf> {
     state_root.parent()?.parent().map(|root| root.join(CLI_PROFILES_RELATIVE_PATH))
 }
 
-fn resolve_tier_b_process_program(command: &str, cwd: &Path) -> PathBuf {
+fn resolve_tier_b_process_program(command: &str, cwd: &Path, prepend_path: &[PathBuf]) -> PathBuf {
     #[cfg(windows)]
     {
-        resolve_windows_process_program(command, cwd).unwrap_or_else(|| PathBuf::from(command))
+        resolve_windows_process_program(command, cwd, prepend_path)
+            .unwrap_or_else(|| PathBuf::from(command))
     }
     #[cfg(not(windows))]
     {
         let _ = cwd;
+        let _ = prepend_path;
         PathBuf::from(command)
     }
 }
@@ -5282,7 +5427,11 @@ fn resolve_tier_b_process_program(command: &str, cwd: &Path) -> PathBuf {
 // Resolves a bare command on Windows: workspace-cwd candidates first so project-local shims
 // (e.g. node_modules/.bin) win over globally installed tools, then PATH candidates.
 #[cfg(windows)]
-fn resolve_windows_process_program(command: &str, cwd: &Path) -> Option<PathBuf> {
+fn resolve_windows_process_program(
+    command: &str,
+    cwd: &Path,
+    prepend_path: &[PathBuf],
+) -> Option<PathBuf> {
     let command_path = Path::new(command);
     if command_path.components().count() != 1 {
         return None;
@@ -5292,7 +5441,28 @@ fn resolve_windows_process_program(command: &str, cwd: &Path) -> Option<PathBuf>
         .into_iter()
         .map(|candidate| cwd.join(candidate))
         .find(|candidate| candidate.is_file())
+        .or_else(|| {
+            windows_program_candidates_from_path_entries(command, prepend_path).into_iter().next()
+        })
         .or_else(|| windows_path_program_candidates(command).into_iter().next())
+}
+
+#[cfg(windows)]
+fn windows_program_candidates_from_path_entries(
+    command: &str,
+    path_entries: &[PathBuf],
+) -> Vec<PathBuf> {
+    let command_path = Path::new(command);
+    if command_path.components().count() != 1 {
+        return Vec::new();
+    }
+
+    let candidates = windows_command_candidates(command);
+    path_entries
+        .iter()
+        .flat_map(|directory| candidates.iter().map(move |candidate| directory.join(candidate)))
+        .filter(|candidate| candidate.is_file())
+        .collect()
 }
 
 #[cfg(windows)]
@@ -5823,23 +5993,23 @@ mod tests {
     use super::unix_pid_i32_from_u32;
     use super::{
         build_process_command, builtin_list_directory_stdout, canonical_workspace_root,
-        collect_requested_egress_hosts, cpu_rlimit_seconds_from_usage_micros,
+        collect_requested_egress_hosts, command_env_value_os, cpu_rlimit_seconds_from_usage_micros,
         host_access_roots_for_input, is_host_allowlisted, process_failure_message,
         process_runner_command_with_args_message, redacted_process_output_preview,
         redacted_process_output_text, resolve_host_executable_path_with_roots,
         resolve_host_working_directory, resolve_host_working_directory_with_roots,
         resolve_scoped_path, resolve_working_directory, rewrite_arguments_to_scoped_paths,
         rewrite_host_access_process_args, rewrite_host_virtual_workspace_args,
-        run_constrained_process, run_constrained_process_with_cancellation,
+        run_constrained_process, run_constrained_process_with_cancellation, same_path_case_aware,
         validate_argument_workspace_scope, validate_cmd_invocation_shape,
         validate_host_argument_scope, validate_host_argument_scope_with_roots,
         validate_host_interpreter_argument_guardrails, validate_interpreter_argument_guardrails,
         validate_no_embedded_command_line_arg, validate_process_env_overrides,
-        validate_process_termination_scope, validate_runtime_egress_enforcement,
-        EgressEnforcementMode, ProcessRunnerInput, SandboxProcessRunErrorKind,
-        SandboxProcessRunnerPolicy, SandboxProcessRunnerTier, StreamCapture,
-        BACKGROUND_MONITOR_POLL_MS, BACKGROUND_TERMINATION_WAIT_MS, NODE_DISABLE_COMPILE_CACHE_ENV,
-        PALYRA_OS_FILE_ROOTS_ENV,
+        validate_process_prepend_path_shape, validate_process_termination_scope,
+        validate_runtime_egress_enforcement, EgressEnforcementMode, ProcessRunnerInput,
+        SandboxProcessRunErrorKind, SandboxProcessRunnerPolicy, SandboxProcessRunnerTier,
+        StreamCapture, BACKGROUND_MONITOR_POLL_MS, BACKGROUND_TERMINATION_WAIT_MS,
+        MAX_PREPEND_PATH_COUNT, NODE_DISABLE_COMPILE_CACHE_ENV, PALYRA_OS_FILE_ROOTS_ENV,
     };
     #[cfg(windows)]
     use super::{
@@ -5930,6 +6100,7 @@ mod tests {
             args: args.iter().map(|arg| (*arg).to_owned()).collect(),
             cwd: None,
             env: BTreeMap::new(),
+            prepend_path: Vec::new(),
             requested_egress_hosts: Vec::new(),
             timeout_ms,
             background: false,
@@ -6412,6 +6583,7 @@ mod tests {
             args: vec!["/".to_owned(), "--config=/workspace/e2e-file-workflow/test.js".to_owned()],
             cwd: None,
             env: Default::default(),
+            prepend_path: Vec::new(),
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
@@ -6836,6 +7008,7 @@ mod tests {
             args: vec!["node -e \"(() => console.log('ok'))()\"".to_owned()],
             cwd: None,
             env: Default::default(),
+            prepend_path: Vec::new(),
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
@@ -6877,6 +7050,7 @@ mod tests {
             args: vec!["--version".to_owned()],
             cwd: None,
             env: BTreeMap::new(),
+            prepend_path: Vec::new(),
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
@@ -6996,6 +7170,7 @@ mod tests {
             args: vec!["--version".to_owned()],
             cwd: Some("repo".to_owned()),
             env: BTreeMap::new(),
+            prepend_path: Vec::new(),
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
@@ -7035,6 +7210,129 @@ mod tests {
     }
 
     #[test]
+    fn process_runner_prepend_path_shape_is_bounded() {
+        let too_many = vec!["tools/bin".to_owned(); MAX_PREPEND_PATH_COUNT + 1];
+        let error = validate_process_prepend_path_shape(too_many.as_slice())
+            .expect_err("oversized prepend_path should be rejected");
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::InvalidInput);
+
+        let error = validate_process_prepend_path_shape(&[" tools/bin".to_owned()])
+            .expect_err("whitespace-padded prepend_path should be rejected");
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn sandbox_prepend_path_must_stay_inside_workspace() {
+        let workspace = unique_temp_dir("workspace-prepend-path-sandbox");
+        let outside = unique_temp_dir("outside-prepend-path-sandbox");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        fs::create_dir_all(outside.as_path()).expect("outside directory should be created");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let policy = sandbox_policy_with_allowed_executables(
+            canonical_workspace.clone(),
+            vec!["node".to_owned()],
+        );
+        let input = ProcessRunnerInput {
+            command: "node".to_owned(),
+            args: Vec::new(),
+            cwd: None,
+            env: BTreeMap::new(),
+            prepend_path: vec![outside.to_string_lossy().into_owned()],
+            requested_egress_hosts: Vec::new(),
+            timeout_ms: None,
+            background: false,
+        };
+
+        let error = build_process_command(
+            &policy,
+            &input,
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+        )
+        .expect_err("sandbox prepend_path outside workspace should be denied");
+
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+        let _ = fs::remove_dir_all(workspace.as_path());
+        let _ = fs::remove_dir_all(outside.as_path());
+    }
+
+    #[test]
+    fn host_access_process_environment_prepends_validated_path() {
+        let workspace = unique_temp_dir("workspace-host-prepend-path");
+        let toolchain_bin = workspace.join("toolchain").join("bin");
+        fs::create_dir_all(toolchain_bin.as_path()).expect("toolchain bin should exist");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let canonical_toolchain_bin =
+            fs::canonicalize(toolchain_bin.as_path()).expect("toolchain bin should canonicalize");
+        let policy = host_access_policy(canonical_workspace.clone());
+        let input = ProcessRunnerInput {
+            command: "palyra-helper".to_owned(),
+            args: Vec::new(),
+            cwd: None,
+            env: BTreeMap::new(),
+            prepend_path: vec![toolchain_bin.to_string_lossy().into_owned()],
+            requested_egress_hosts: Vec::new(),
+            timeout_ms: None,
+            background: false,
+        };
+
+        let command = build_process_command(
+            &policy,
+            &input,
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+        )
+        .expect("host access command should build with prepend_path");
+        let path = command_env_value_os(&command, "PATH").expect("child PATH should be set");
+        let entries = std::env::split_paths(&path).collect::<Vec<_>>();
+
+        assert!(
+            entries.first().is_some_and(|entry| {
+                same_path_case_aware(entry.as_path(), canonical_toolchain_bin.as_path())
+            }),
+            "prepend_path entry should lead child PATH: {entries:?}"
+        );
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn host_access_prepend_path_resolves_bare_windows_command() {
+        let workspace = unique_temp_dir("workspace-host-prepend-command");
+        let toolchain_bin = workspace.join("toolchain").join("bin");
+        fs::create_dir_all(toolchain_bin.as_path()).expect("toolchain bin should exist");
+        let node = toolchain_bin.join("node.exe");
+        fs::write(node.as_path(), "fake exe").expect("node executable fixture should be written");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let expected = fs::canonicalize(node.as_path()).expect("node should canonicalize");
+        let policy = host_access_policy(canonical_workspace.clone());
+        let input = ProcessRunnerInput {
+            command: "node".to_owned(),
+            args: vec!["--version".to_owned()],
+            cwd: None,
+            env: BTreeMap::new(),
+            prepend_path: vec![toolchain_bin.to_string_lossy().into_owned()],
+            requested_egress_hosts: Vec::new(),
+            timeout_ms: None,
+            background: false,
+        };
+
+        let command = build_process_command(
+            &policy,
+            &input,
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+        )
+        .expect("host access command should resolve prepended node");
+
+        assert!(same_path_case_aware(Path::new(command.get_program()), expected.as_path()));
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
     fn host_access_process_environment_drops_runtime_auth_and_profile_env() {
         let _guard = PROCESS_ENV_LOCK
             .get_or_init(|| Mutex::new(()))
@@ -7061,6 +7359,7 @@ mod tests {
             args: Vec::new(),
             cwd: None,
             env: BTreeMap::new(),
+            prepend_path: Vec::new(),
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
@@ -7124,6 +7423,7 @@ mod tests {
                 ("PALYRA_E2E_HOME".to_owned(), e2e_home.to_string_lossy().into_owned()),
                 ("PALYRA_E2E_OS_ROOT".to_owned(), e2e_os_root.to_string_lossy().into_owned()),
             ]),
+            prepend_path: Vec::new(),
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
@@ -7220,6 +7520,7 @@ mod tests {
             args: Vec::new(),
             cwd: None,
             env: Default::default(),
+            prepend_path: Vec::new(),
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
@@ -7257,6 +7558,7 @@ mod tests {
             args: vec!["--version".to_owned()],
             cwd: None,
             env: BTreeMap::new(),
+            prepend_path: Vec::new(),
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
@@ -9281,6 +9583,7 @@ mod tests {
             ],
             cwd: None,
             env: Default::default(),
+            prepend_path: Vec::new(),
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,

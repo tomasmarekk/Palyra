@@ -726,6 +726,15 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                         }),
                     ),
                     (
+                        "prepend_path",
+                        json!({
+                            "type":"array",
+                            "items":{"type":"string"},
+                            "maxItems":16,
+                            "description":"Optional directories to prepend to the child PATH after runtime validation. Use this instead of env.PATH when a task requires a specific local toolchain such as bundled Node or pnpm. Each entry must be an existing directory inside the workspace, or inside approved host-access roots in host-access mode; entries also affect bare command resolution on Windows."
+                        }),
+                    ),
+                    (
                         "background",
                         json!({
                             "type":"boolean",
@@ -1412,6 +1421,15 @@ mod tests {
         assert!(env_description.contains("PALYRA_E2E_HOME"));
         assert!(env_description.contains("without shell syntax"));
         assert!(env_description.contains("PATH"));
+
+        let prepend_path_description = entry
+            .input_schema
+            .pointer("/properties/prepend_path/description")
+            .and_then(serde_json::Value::as_str)
+            .expect("prepend_path description should be visible to models");
+        assert!(prepend_path_description.contains("instead of env.PATH"));
+        assert!(prepend_path_description.contains("bundled Node"));
+        assert!(prepend_path_description.contains("bare command resolution"));
 
         let background_description = entry
             .input_schema
