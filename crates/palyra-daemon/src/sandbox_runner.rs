@@ -18,8 +18,9 @@
 #![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
 use std::{
-    collections::BTreeMap,
+    collections::{hash_map::DefaultHasher, BTreeMap},
     fs,
+    hash::{Hash, Hasher},
     io::{self, Read},
     path::{Component, Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
@@ -102,8 +103,9 @@ const HOST_ACCESS_SAFE_PALYRA_ENV_KEYS: &[&str] = &["PALYRA_E2E_HOME", "PALYRA_E
 const CLI_PROFILES_RELATIVE_PATH: &str = "cli/profiles.toml";
 const DESKTOP_CONTROL_CENTER_STATE_DIR: &str = "desktop-control-center";
 const DESKTOP_RUNTIME_STATE_DIR: &str = "runtime";
-const WORKSPACE_PYTHON_USER_BASE_RELATIVE_PATH: &[&str] = &[".palyra", "python-userbase"];
-const WORKSPACE_PIP_CACHE_RELATIVE_PATH: &[&str] = &[".palyra", "pip-cache"];
+const PROCESS_RUNNER_PYTHON_ENV_RELATIVE_PATH: &[&str] = &["process-runner", "python-env"];
+const PYTHON_USER_BASE_DIR: &str = "python-userbase";
+const PIP_CACHE_DIR: &str = "pip-cache";
 // URL path segments following one of these markers (e.g. a path like .../<marker>/<value>) are
 // treated as secret material and replaced before any output leaves the runner.
 const SENSITIVE_URL_PATH_MARKERS: &[&str] =
@@ -5029,8 +5031,7 @@ fn host_access_path() -> String {
         .unwrap_or_else(|| sandbox_process_path().to_owned())
 }
 
-// Pins pip user installs and caches inside the workspace so Python tooling cannot write into
-// the daemon user's real profile and runs stay reproducible per workspace.
+// Pins pip user installs and caches under runtime-owned state, not the target checkout.
 fn configure_workspace_python_environment(
     command: &mut Command,
     process_command: &str,
@@ -5059,17 +5060,34 @@ fn workspace_python_environment(
         return None;
     }
 
-    let workspace_root = child_process_path(workspace_root);
+    let environment_root = process_runner_python_environment_root(workspace_root);
     Some(WorkspacePythonEnvironment {
-        user_base: join_relative_components(
-            workspace_root.as_path(),
-            WORKSPACE_PYTHON_USER_BASE_RELATIVE_PATH,
-        ),
-        pip_cache: join_relative_components(
-            workspace_root.as_path(),
-            WORKSPACE_PIP_CACHE_RELATIVE_PATH,
-        ),
+        user_base: environment_root.join(PYTHON_USER_BASE_DIR),
+        pip_cache: environment_root.join(PIP_CACHE_DIR),
     })
+}
+
+fn process_runner_python_environment_root(workspace_root: &Path) -> PathBuf {
+    let workspace_key = process_runner_workspace_cache_key(workspace_root);
+    join_relative_components(
+        process_runner_runtime_root().as_path(),
+        PROCESS_RUNNER_PYTHON_ENV_RELATIVE_PATH,
+    )
+    .join(workspace_key)
+}
+
+fn process_runner_runtime_root() -> PathBuf {
+    std::env::var_os(PALYRA_STATE_ROOT_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(|path| child_process_path(path.as_path()))
+        .unwrap_or_else(|| std::env::temp_dir().join("palyra-process-runner"))
+}
+
+fn process_runner_workspace_cache_key(workspace_root: &Path) -> String {
+    let mut hasher = DefaultHasher::new();
+    child_process_path(workspace_root).hash(&mut hasher);
+    format!("workspace-{:016x}", hasher.finish())
 }
 
 fn join_relative_components(root: &Path, components: &[&str]) -> PathBuf {
@@ -7388,13 +7406,34 @@ mod tests {
     }
 
     #[test]
-    fn workspace_python_environment_scopes_userbase_and_cache_to_workspace() {
-        let workspace = PathBuf::from("workspace-root");
+    fn workspace_python_environment_keeps_userbase_and_cache_out_of_workspace() {
+        let _guard = PROCESS_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("process env lock should not be poisoned");
+        let workspace = unique_temp_dir("workspace-python-env");
+        let state_root = unique_temp_dir("state-python-env");
+        let _state_root = ScopedEnvVar::set(super::PALYRA_STATE_ROOT_ENV, state_root.as_os_str());
+
         let environment = super::workspace_python_environment("python", workspace.as_path())
             .expect("python commands should receive workspace-local Python environment");
 
-        assert_eq!(environment.user_base, workspace.join(".palyra").join("python-userbase"));
-        assert_eq!(environment.pip_cache, workspace.join(".palyra").join("pip-cache"));
+        let expected_root = super::join_relative_components(
+            state_root.as_path(),
+            super::PROCESS_RUNNER_PYTHON_ENV_RELATIVE_PATH,
+        );
+        assert!(environment.user_base.starts_with(expected_root.as_path()));
+        assert!(environment.pip_cache.starts_with(expected_root.as_path()));
+        assert!(!environment.user_base.starts_with(workspace.as_path()));
+        assert!(!environment.pip_cache.starts_with(workspace.as_path()));
+        assert_eq!(
+            environment.user_base.file_name().and_then(|name| name.to_str()),
+            Some(super::PYTHON_USER_BASE_DIR)
+        );
+        assert_eq!(
+            environment.pip_cache.file_name().and_then(|name| name.to_str()),
+            Some(super::PIP_CACHE_DIR)
+        );
     }
 
     #[test]
