@@ -4406,6 +4406,9 @@ where
             break;
         }
     }
+    let needs_continuation_message = needs_continuation_message.map(|message| {
+        enrich_agent_needs_continuation_message(message, &resolved.session, &resolved.request)
+    });
     Ok(AgentStreamOutcome { completed, cancelled, needs_continuation_message, failed_message })
 }
 
@@ -4758,6 +4761,74 @@ impl From<AgentApprovalModeArg> for AgentApprovalMode {
             AgentApprovalModeArg::AllowOnce => Self::AllowOnce,
         }
     }
+}
+
+fn enrich_agent_needs_continuation_message(
+    message: String,
+    session: &gateway_v1::SessionSummary,
+    request: &AgentRunInput,
+) -> String {
+    if message.contains("resume_command=") {
+        return message;
+    }
+    format!("{message}; resume_command={}", agent_resume_command(session, request))
+}
+
+fn agent_resume_command(session: &gateway_v1::SessionSummary, request: &AgentRunInput) -> String {
+    let mut args = vec!["palyra".to_owned(), "agent".to_owned(), "run".to_owned()];
+    if let Some(session_id) = session
+        .session_id
+        .as_ref()
+        .or(request.session_id.as_ref())
+        .map(|value| value.ulid.trim())
+        .filter(|value| !value.is_empty())
+    {
+        args.push("--session-id".to_owned());
+        args.push(session_id.to_owned());
+    } else if let Some(session_key) = non_empty_str(Some(session.session_key.as_str()))
+        .or_else(|| request.session_key.as_deref().and_then(|value| non_empty_str(Some(value))))
+    {
+        args.push("--session-key".to_owned());
+        args.push(session_key.to_owned());
+    }
+    args.push("--require-existing".to_owned());
+    if request.allow_sensitive_tools {
+        args.push("--allow-sensitive-tools".to_owned());
+    }
+    args.push("--approval-mode".to_owned());
+    args.push(agent_approval_mode_cli_value(request.approval_mode).to_owned());
+    args.push("--prompt".to_owned());
+    args.push(agent_resume_prompt(request.run_id.as_str()));
+    args.into_iter().map(|arg| quote_cli_arg(arg.as_str())).collect::<Vec<_>>().join(" ")
+}
+
+fn agent_resume_prompt(run_id: &str) -> String {
+    format!(
+        "Resume from run {run_id}. Inspect the run tape and continue the incomplete task from the latest successful tool evidence."
+    )
+}
+
+fn agent_approval_mode_cli_value(mode: AgentApprovalMode) -> &'static str {
+    match mode {
+        AgentApprovalMode::Prompt => "prompt",
+        AgentApprovalMode::Deny => "deny",
+        AgentApprovalMode::AllowOnce => "allow-once",
+    }
+}
+
+fn non_empty_str(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn quote_cli_arg(value: &str) -> String {
+    if value.chars().all(is_unquoted_cli_arg_char) {
+        return value.to_owned();
+    }
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn is_unquoted_cli_arg_char(value: char) -> bool {
+    value.is_ascii_alphanumeric() || matches!(value, '-' | '_' | '.' | '/' | '\\' | ':' | '=')
 }
 
 async fn prepare_agent_run_input(
@@ -5931,6 +6002,60 @@ mod agent_stream_output_tests {
             .expect_err("continuation handoff must be a distinct command error");
         assert!(error.to_string().contains("needs continuation"), "unexpected error: {error}");
         assert!(!error.to_string().contains("agent run failed"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn needs_continuation_message_includes_self_contained_resume_command() {
+        let session = gateway_v1::SessionSummary {
+            session_id: Some(common_v1::CanonicalId {
+                ulid: "01ARZ3NDEKTSV4RRFFQ69G5FAS".to_owned(),
+            }),
+            session_key: "ops:triage".to_owned(),
+            ..Default::default()
+        };
+        let request = build_agent_run_input(AgentRunInputArgs {
+            session_id: None,
+            session_key: Some("ops:triage".to_owned()),
+            session_label: None,
+            require_existing: true,
+            reset_session: false,
+            run_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
+            prompt: "original prompt with sensitive context".to_owned(),
+            allow_sensitive_tools: true,
+            interrupt_active_run: false,
+            approval_mode: AgentApprovalMode::AllowOnce,
+            origin_kind: None,
+            origin_run_id: None,
+            parameter_delta_json: None,
+        })
+        .expect("agent run input should build");
+
+        let message = enrich_agent_needs_continuation_message(
+            "wall_clock; needs_continuation=true".to_owned(),
+            &session,
+            &request,
+        );
+        let outcome = AgentStreamOutcome {
+            completed: false,
+            cancelled: false,
+            needs_continuation_message: Some(message),
+            failed_message: None,
+        };
+        let error = outcome
+            .ensure_success()
+            .expect_err("continuation handoff should fail with resume command");
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("resume_command=palyra agent run"), "{rendered}");
+        assert!(rendered.contains("--session-id 01ARZ3NDEKTSV4RRFFQ69G5FAS"), "{rendered}");
+        assert!(rendered.contains("--require-existing"), "{rendered}");
+        assert!(rendered.contains("--allow-sensitive-tools"), "{rendered}");
+        assert!(rendered.contains("--approval-mode allow-once"), "{rendered}");
+        assert!(rendered.contains("Resume from run 01ARZ3NDEKTSV4RRFFQ69G5FAV"), "{rendered}");
+        assert!(
+            !rendered.contains("original prompt with sensitive context"),
+            "resume command must not echo the original prompt: {rendered}"
+        );
     }
 
     #[test]
