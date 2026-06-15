@@ -103,6 +103,7 @@ const HOST_ACCESS_SAFE_PALYRA_ENV_KEYS: &[&str] = &["PALYRA_E2E_HOME", "PALYRA_E
 const CLI_PROFILES_RELATIVE_PATH: &str = "cli/profiles.toml";
 const DESKTOP_CONTROL_CENTER_STATE_DIR: &str = "desktop-control-center";
 const DESKTOP_RUNTIME_STATE_DIR: &str = "runtime";
+const PROCESS_RUNNER_TEMP_RELATIVE_PATH: &[&str] = &["process-runner", "tmp"];
 const PROCESS_RUNNER_PYTHON_ENV_RELATIVE_PATH: &[&str] = &["process-runner", "python-env"];
 const PYTHON_USER_BASE_DIR: &str = "python-userbase";
 const PIP_CACHE_DIR: &str = "pip-cache";
@@ -4782,7 +4783,7 @@ fn build_process_command(
             input.command.as_str(),
             program.as_path(),
             workspace_root,
-        );
+        )?;
         apply_process_env_overrides(&mut command, input);
         configure_wsl_path_env_bridge(&mut command, input.command.as_str(), program.as_path());
         return Ok(command);
@@ -4831,7 +4832,7 @@ fn build_process_command(
         input.command.as_str(),
         program.as_path(),
         policy,
-    );
+    )?;
     apply_process_env_overrides(&mut command, input);
     configure_wsl_path_env_bridge(&mut command, input.command.as_str(), program.as_path());
     Ok(command)
@@ -4942,11 +4943,11 @@ fn configure_tier_b_process_environment(
     process_command: &str,
     program: &Path,
     policy: &SandboxProcessRunnerPolicy,
-) {
+) -> Result<(), SandboxProcessRunError> {
     command.env_clear();
     #[cfg(windows)]
     {
-        configure_windows_tier_b_process_environment(command, program, policy);
+        configure_windows_tier_b_process_environment(command, program, policy)?;
     }
     #[cfg(not(windows))]
     {
@@ -4960,6 +4961,7 @@ fn configure_tier_b_process_environment(
         policy.workspace_root.as_path(),
     );
     configure_node_runtime_environment(command);
+    Ok(())
 }
 
 fn configure_host_access_process_environment(
@@ -4967,11 +4969,11 @@ fn configure_host_access_process_environment(
     process_command: &str,
     program: &Path,
     workspace_root: &Path,
-) {
-    configure_host_access_safe_environment(command, workspace_root);
+) -> Result<(), SandboxProcessRunError> {
+    configure_host_access_safe_environment(command, workspace_root)?;
     configure_workspace_python_environment(command, process_command, workspace_root);
     if !is_palyra_cli_program(program) {
-        return;
+        return Ok(());
     }
     // The daemon may run with PALYRA_CLI_PROFILE set but without the profiles-path companion
     // (e.g. desktop supervisor launch). A child `palyra` CLI would then fail to resolve the
@@ -4981,7 +4983,7 @@ fn configure_host_access_process_environment(
         std::env::var_os(PALYRA_CLI_PROFILE_ENV).as_deref(),
         std::env::var_os(PALYRA_CLI_PROFILES_PATH_ENV).as_deref(),
     ) {
-        return;
+        return Ok(());
     }
     if let Some(profiles_path) = std::env::var_os(PALYRA_STATE_ROOT_ENV)
         .map(PathBuf::from)
@@ -4992,11 +4994,15 @@ fn configure_host_access_process_environment(
     } else {
         command.env_remove(PALYRA_CLI_PROFILE_ENV);
     }
+    Ok(())
 }
 
 // Host-access children also start from env_clear, then copy only the allowlisted keys; this is
 // what keeps daemon admin tokens and provider keys out of unsandboxed processes (test-pinned).
-fn configure_host_access_safe_environment(command: &mut Command, workspace_root: &Path) {
+fn configure_host_access_safe_environment(
+    command: &mut Command,
+    workspace_root: &Path,
+) -> Result<(), SandboxProcessRunError> {
     command.env_clear();
     for key in HOST_ACCESS_SAFE_ENV_KEYS {
         copy_env_if_present(command, key);
@@ -5005,10 +5011,11 @@ fn configure_host_access_safe_environment(command: &mut Command, workspace_root:
         copy_env_if_present(command, key);
     }
     #[cfg(windows)]
-    configure_windows_host_access_safe_environment(command, workspace_root);
+    configure_windows_host_access_safe_environment(command, workspace_root)?;
     #[cfg(not(windows))]
-    configure_unix_host_access_safe_environment(command, workspace_root);
+    configure_unix_host_access_safe_environment(command, workspace_root)?;
     configure_node_runtime_environment(command);
+    Ok(())
 }
 
 // Node would otherwise persist an on-disk compile cache under the (scrubbed or redirected)
@@ -5035,15 +5042,19 @@ fn copy_env_if_present(command: &mut Command, key: &str) {
 }
 
 #[cfg(windows)]
-fn configure_windows_host_access_safe_environment(command: &mut Command, workspace_root: &Path) {
+fn configure_windows_host_access_safe_environment(
+    command: &mut Command,
+    workspace_root: &Path,
+) -> Result<(), SandboxProcessRunError> {
     for key in WINDOWS_HOST_ACCESS_SAFE_ENV_KEYS {
         copy_env_if_present(command, key);
     }
-    let temp_root = child_process_path(workspace_root);
+    let temp_root = process_runner_child_temp_root(workspace_root)?;
     command
         .env("PATH", host_access_path())
         .env("TEMP", temp_root.as_path())
         .env("TMP", temp_root.as_path());
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -5065,8 +5076,13 @@ const WINDOWS_HOST_ACCESS_SAFE_ENV_KEYS: &[&str] = &[
 ];
 
 #[cfg(not(windows))]
-fn configure_unix_host_access_safe_environment(command: &mut Command, workspace_root: &Path) {
-    command.env("PATH", host_access_path()).env("TMPDIR", workspace_root);
+fn configure_unix_host_access_safe_environment(
+    command: &mut Command,
+    workspace_root: &Path,
+) -> Result<(), SandboxProcessRunError> {
+    let temp_root = process_runner_child_temp_root(workspace_root)?;
+    command.env("PATH", host_access_path()).env("TMPDIR", temp_root.as_path());
+    Ok(())
 }
 
 fn host_access_path() -> String {
@@ -5119,6 +5135,25 @@ fn process_runner_python_environment_root(workspace_root: &Path) -> PathBuf {
         PROCESS_RUNNER_PYTHON_ENV_RELATIVE_PATH,
     )
     .join(workspace_key)
+}
+
+fn process_runner_child_temp_root(
+    workspace_root: &Path,
+) -> Result<PathBuf, SandboxProcessRunError> {
+    let workspace_key = process_runner_workspace_cache_key(workspace_root);
+    let temp_root = join_relative_components(
+        process_runner_runtime_root().as_path(),
+        PROCESS_RUNNER_TEMP_RELATIVE_PATH,
+    )
+    .join(workspace_key);
+    fs::create_dir_all(temp_root.as_path()).map_err(|error| SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::RuntimeFailure,
+        message: format!(
+            "palyra.process.run failed to create child temp directory {}: {error}",
+            temp_root.display()
+        ),
+    })?;
+    Ok(temp_root)
 }
 
 fn process_runner_runtime_root() -> PathBuf {
@@ -5363,19 +5398,20 @@ fn configure_windows_tier_b_process_environment(
     command: &mut Command,
     program: &Path,
     policy: &SandboxProcessRunnerPolicy,
-) {
+) -> Result<(), SandboxProcessRunError> {
     for key in WINDOWS_TIER_B_SAFE_ENV_KEYS {
         if let Some(value) = std::env::var_os(key) {
             command.env(key, value);
         }
     }
-    let temp_root = child_process_path(policy.workspace_root.as_path());
+    let temp_root = process_runner_child_temp_root(policy.workspace_root.as_path())?;
     command
         .env("PATH", windows_tier_b_process_path(program, policy))
         .env("TEMP", temp_root.as_path())
         .env("TMP", temp_root.as_path())
         .env("LANG", "C")
         .env("LC_ALL", "C");
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -7347,18 +7383,25 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    fn windows_tier_b_process_environment_deverbatims_temp_dirs() {
-        let workspace = PathBuf::from(
-            r"\\?\C:\Users\Palo\AppData\Local\Palyra-TestHarness\S033\memory-project",
-        );
-        let policy = sandbox_policy_with_allowed_executables(workspace, vec!["node".to_owned()]);
+    fn windows_tier_b_process_environment_uses_runtime_temp_dirs() {
+        let _guard = PROCESS_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("process env lock should not be poisoned");
+        let workspace = unique_temp_dir("workspace-tier-b-temp");
+        let verbatim_workspace = PathBuf::from(format!(r"\\?\{}", workspace.to_string_lossy()));
+        let state_root = unique_temp_dir("state-tier-b-temp");
+        let _state_root = ScopedEnvVar::set(super::PALYRA_STATE_ROOT_ENV, state_root.as_os_str());
+        let policy =
+            sandbox_policy_with_allowed_executables(verbatim_workspace, vec!["node".to_owned()]);
         let mut command = Command::new("node");
 
         super::configure_windows_tier_b_process_environment(
             &mut command,
             Path::new(r"C:\Tools\node.exe"),
             &policy,
-        );
+        )
+        .expect("tier-B environment should configure temp directories");
 
         let env = command
             .get_envs()
@@ -7370,9 +7413,24 @@ mod tests {
             })
             .collect::<BTreeMap<_, _>>();
 
-        let expected = r"C:\Users\Palo\AppData\Local\Palyra-TestHarness\S033\memory-project";
-        assert_eq!(env.get("TEMP").and_then(Option::as_deref), Some(expected));
-        assert_eq!(env.get("TMP").and_then(Option::as_deref), Some(expected));
+        let expected_root = super::join_relative_components(
+            state_root.as_path(),
+            super::PROCESS_RUNNER_TEMP_RELATIVE_PATH,
+        );
+        let temp = env
+            .get("TEMP")
+            .and_then(Option::as_deref)
+            .map(PathBuf::from)
+            .expect("TEMP should be set");
+        let tmp = env
+            .get("TMP")
+            .and_then(Option::as_deref)
+            .map(PathBuf::from)
+            .expect("TMP should be set");
+        assert!(temp.starts_with(expected_root.as_path()), "TEMP={}", temp.display());
+        assert!(tmp.starts_with(expected_root.as_path()), "TMP={}", tmp.display());
+        assert!(!temp.starts_with(workspace.as_path()), "TEMP must stay outside workspace");
+        assert!(!tmp.starts_with(workspace.as_path()), "TMP must stay outside workspace");
     }
 
     #[test]
@@ -7479,6 +7537,32 @@ mod tests {
             environment.pip_cache.file_name().and_then(|name| name.to_str()),
             Some(super::PIP_CACHE_DIR)
         );
+    }
+
+    #[test]
+    fn process_runner_child_temp_root_uses_state_root_outside_workspace() {
+        let _guard = PROCESS_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("process env lock should not be poisoned");
+        let workspace = unique_temp_dir("workspace-child-temp");
+        let state_root = unique_temp_dir("state-child-temp");
+        let _state_root = ScopedEnvVar::set(super::PALYRA_STATE_ROOT_ENV, state_root.as_os_str());
+
+        let temp_root = super::process_runner_child_temp_root(workspace.as_path())
+            .expect("child temp root should be created under state root");
+
+        let expected_root = super::join_relative_components(
+            state_root.as_path(),
+            super::PROCESS_RUNNER_TEMP_RELATIVE_PATH,
+        );
+        assert!(
+            temp_root.starts_with(expected_root.as_path()),
+            "temp_root={}",
+            temp_root.display()
+        );
+        assert!(!temp_root.starts_with(workspace.as_path()));
+        assert!(temp_root.is_dir(), "temp root should exist before process spawn");
     }
 
     #[test]
