@@ -1890,10 +1890,12 @@ fn read_workspace_file_chunk(
 }
 
 /// Returns true when the chunk contains control bytes that never appear in
-/// plain text (the C0 set minus tab/LF/CR, plus DEL); such chunks are
+/// plain text (the C0 set minus tab/LF/CR/ESC, plus DEL); such chunks are
 /// reported as base64 binary even when they happen to be valid UTF-8.
 fn chunk_has_binary_control_bytes(bytes: &[u8]) -> bool {
-    bytes.iter().any(|byte| matches!(*byte, 0x00..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F | 0x7F))
+    bytes
+        .iter()
+        .any(|byte| matches!(*byte, 0x00..=0x08 | 0x0B | 0x0C | 0x0E..=0x1A | 0x1C..=0x1F | 0x7F))
 }
 
 /// Containment check applied to every resolved target: a plain prefix match
@@ -2374,6 +2376,29 @@ mod tests {
         assert!(output.eof);
         assert_eq!(output.workspace_root_index, 0);
         assert!(!output.redacted);
+    }
+
+    #[test]
+    fn read_workspace_file_returns_ansi_diagnostics_as_text() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let file_path = tempdir.path().join("typecheck.txt");
+        let contents = "\x1b[31merror TS2322\x1b[0m: Type 'string' is not assignable\n";
+        fs::write(file_path, contents).expect("workspace diagnostics file should be written");
+        let input = WorkspaceReadFileInput {
+            path: "typecheck.txt".to_owned(),
+            workspace_root: None,
+            offset_bytes: 0,
+            max_bytes: None,
+        };
+
+        let output = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
+            .expect("workspace diagnostics file should be readable");
+
+        assert_eq!(output.text.as_deref(), Some(contents));
+        assert_eq!(output.bytes_base64, None);
+        assert!(!output.binary);
+        assert!(!output.redacted);
+        assert_eq!(output.text_authoritative, None);
     }
 
     #[test]
