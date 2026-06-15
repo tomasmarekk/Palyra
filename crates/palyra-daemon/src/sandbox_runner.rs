@@ -1795,8 +1795,8 @@ fn broad_process_kill_error() -> SandboxProcessRunError {
 
 // Interpreters get a second scan beyond ordinary argument scoping because their arguments can
 // embed absolute paths inside source text (e.g. open('/etc/passwd') passed as inline code):
-// shell-eval flags are denied outright, and any absolute-path-like substring must itself
-// resolve inside the workspace.
+// interpreter-level shell-eval flags are denied, and any absolute-path-like substring must
+// itself resolve inside the workspace.
 fn validate_interpreter_argument_guardrails(
     workspace_root: &Path,
     cwd: &Path,
@@ -1807,7 +1807,7 @@ fn validate_interpreter_argument_guardrails(
         return Ok(());
     }
 
-    if args.iter().any(|arg| is_blocked_eval_flag(arg.as_str())) {
+    if interpreter_args_contain_blocked_eval_flag(command, args) {
         return Err(interpreter_shell_eval_denied_error(command));
     }
 
@@ -1870,7 +1870,7 @@ fn validate_host_interpreter_argument_guardrails_with_roots(
         return Ok(());
     }
 
-    if args.iter().any(|arg| is_blocked_eval_flag(arg.as_str())) {
+    if interpreter_args_contain_blocked_eval_flag(command, args) {
         return Err(interpreter_shell_eval_denied_error(command));
     }
 
@@ -2075,8 +2075,9 @@ fn interpreter_path_list_components(raw: &str) -> Vec<&str> {
 }
 
 fn is_interpreter_executable(command: &str) -> bool {
-    let normalized = command.trim().to_ascii_lowercase();
+    let normalized = normalize_process_executable_token(command);
     INTERPRETER_EXECUTABLE_DENYLIST.contains(&normalized.as_str())
+        || normalized.starts_with("python3.")
 }
 
 fn interpreter_shell_eval_denied_error(command: &str) -> SandboxProcessRunError {
@@ -2092,6 +2093,50 @@ fn interpreter_shell_eval_denied_error(command: &str) -> SandboxProcessRunError 
 fn is_blocked_eval_flag(arg: &str) -> bool {
     let normalized = arg.trim().to_ascii_lowercase();
     matches!(normalized.as_str(), "-c" | "/c" | "--command" | "-command" | "--eval")
+}
+
+fn interpreter_args_contain_blocked_eval_flag(command: &str, args: &[String]) -> bool {
+    args.iter().enumerate().any(|(index, arg)| {
+        is_blocked_eval_flag(arg.as_str())
+            && !python_arg_is_after_execution_target(command, args, index)
+    })
+}
+
+fn python_arg_is_after_execution_target(command: &str, args: &[String], index: usize) -> bool {
+    if !is_python_interpreter_command(command) {
+        return false;
+    }
+    python_execution_target_index(args).is_some_and(|target_index| index > target_index)
+}
+
+fn is_python_interpreter_command(command: &str) -> bool {
+    let command = normalize_process_executable_token(command);
+    matches!(command.as_str(), "python" | "python3" | "py") || command.starts_with("python3.")
+}
+
+fn python_execution_target_index(args: &[String]) -> Option<usize> {
+    let mut index = 0;
+    while let Some(arg) = args.get(index).map(|arg| arg.trim()) {
+        if arg == "--" {
+            return args.get(index.saturating_add(1)).map(|_| index.saturating_add(1));
+        }
+        if arg.eq_ignore_ascii_case("-m") {
+            return args.get(index.saturating_add(1)).map(|_| index.saturating_add(1));
+        }
+        if is_blocked_eval_flag(arg) {
+            return None;
+        }
+        if !arg.starts_with('-') {
+            return Some(index);
+        }
+        index = index.saturating_add(if python_option_consumes_next_value(arg) { 2 } else { 1 });
+    }
+    None
+}
+
+fn python_option_consumes_next_value(arg: &str) -> bool {
+    let trimmed = arg.trim();
+    matches!(trimmed, "-W" | "-X" | "-Q") || trimmed == "--check-hash-based-pycs"
 }
 
 // Splits on whitespace and common code punctuation so absolute paths quoted inside inline
@@ -9190,6 +9235,47 @@ mod tests {
         assert!(error.message.contains("command='pwsh'"), "{}", error.message);
         assert!(error.message.contains("'-File'"), "{}", error.message);
         assert!(error.message.contains("scripts/check.ps1"), "{}", error.message);
+    }
+
+    #[test]
+    fn interpreter_guardrails_allow_python_module_downstream_config_flag() {
+        let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
+        let workspace_root = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let args = vec![
+            "-m".to_owned(),
+            "bandit".to_owned(),
+            "-c".to_owned(),
+            "_test_cache_config.yaml".to_owned(),
+            "package".to_owned(),
+        ];
+
+        validate_interpreter_argument_guardrails(
+            workspace_root.as_path(),
+            workspace_root.as_path(),
+            "python",
+            args.as_slice(),
+        )
+        .expect("python module application flags after -m <module> should be allowed");
+    }
+
+    #[test]
+    fn interpreter_guardrails_reject_absolute_python_exe_shell_eval_flags() {
+        let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
+        let workspace_root = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let args = vec!["-c".to_owned(), "print('blocked')".to_owned()];
+
+        let error = validate_interpreter_argument_guardrails(
+            workspace_root.as_path(),
+            workspace_root.as_path(),
+            "C:/workspace/.venv/Scripts/python.exe",
+            args.as_slice(),
+        )
+        .expect_err("absolute python.exe interpreter eval must stay blocked");
+
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+        assert!(error.message.contains("shell-eval flags"), "{}", error.message);
     }
 
     #[test]
