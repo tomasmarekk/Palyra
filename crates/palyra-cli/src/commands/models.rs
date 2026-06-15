@@ -1979,15 +1979,15 @@ fn probe_provider(
                         };
                         payload.message = if payload.discovered_model_ids.is_empty() {
                             if empty_minimax_discovery_with_configured_models {
-                                "provider connection succeeded; MiniMax-compatible model discovery returned no ids, so configured model registry remains the source of selectable models"
+                                "provider connection succeeded; MiniMax-compatible model discovery returned no ids, so configured model registry remains the source of selectable models. This probe does not verify chat generation quota or model-turn usability."
                                     .to_owned()
                             } else {
-                                "provider connection succeeded but model discovery returned no ids"
+                                "provider connection succeeded but model discovery returned no ids. This probe does not verify chat generation quota or model-turn usability."
                                     .to_owned()
                             }
                         } else {
                             format!(
-                                "provider connection succeeded and discovered {} model(s)",
+                                "provider connection and live model discovery succeeded with {} model(s). This probe does not verify chat generation quota or model-turn usability.",
                                 payload.discovered_model_ids.len()
                             )
                         };

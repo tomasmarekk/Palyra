@@ -1716,6 +1716,9 @@ fn classify_http_provider_failure(
         || normalized_body.contains("quota")
         || normalized_body.contains("billing")
         || normalized_body.contains("credits")
+        || normalized_body.contains("plan usage limit")
+        || normalized_body.contains("token plan usage limit")
+        || normalized_body.contains("usage limit reached")
     {
         (ProviderFailureClass::QuotaExceeded, ProviderFailureAction::UserActionRequired)
     } else if matches!(status_code, 400 | 413)
@@ -5891,6 +5894,17 @@ mod tests {
         assert_eq!(quota.class, "quota_exceeded");
         assert_eq!(quota.recovery.category, "quota");
         assert_eq!(quota.recovery.action, "ask_user");
+
+        let minimax_plan_limit = classify_http_provider_failure(
+            429,
+            false,
+            "minimax_chat_http",
+            "Token Plan usage limit reached",
+        )
+        .snapshot("redacted minimax quota".to_owned());
+        assert_eq!(minimax_plan_limit.class, "quota_exceeded");
+        assert_eq!(minimax_plan_limit.recovery.category, "quota");
+        assert_eq!(minimax_plan_limit.recovery.action, "ask_user");
 
         let context = classify_http_provider_failure(
             400,

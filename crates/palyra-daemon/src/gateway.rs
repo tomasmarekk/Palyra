@@ -2338,6 +2338,9 @@ fn run_failure_diagnostic(reason: &str) -> RunFailureDiagnostic {
         Some("rate_limited") => {
             "Retry after the provider rate limit clears or switch to a lower-pressure model/provider."
         }
+        Some("quota_exceeded") => {
+            "The provider reports exhausted plan, billing, credits, or generation quota; add quota or switch provider before retrying."
+        }
         Some("context_window_exceeded") => {
             "Reduce prompt or attachment size, then rerun the agent."
         }
@@ -2374,6 +2377,16 @@ mod run_failure_diagnostic_tests {
         assert_eq!(diagnostic.error_class.as_deref(), Some("provider_timeout"));
         assert_eq!(diagnostic.recommended_action.as_deref(), Some("retry"));
         assert!(diagnostic.diagnostic_hint.contains("timed out"));
+    }
+
+    #[test]
+    fn quota_failures_get_quota_hint() {
+        let diagnostic = run_failure_diagnostic(
+            "model provider request failed after 0 retries (retryable=false, class=quota_exceeded, action=ask_user): HTTP 429 Token Plan usage limit reached",
+        );
+
+        assert_eq!(diagnostic.error_class.as_deref(), Some("quota_exceeded"));
+        assert!(diagnostic.diagnostic_hint.contains("generation quota"));
     }
 }
 

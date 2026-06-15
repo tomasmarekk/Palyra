@@ -919,6 +919,10 @@ enabled = true
         "live test-connection should mark discovery as verified: {first_stdout}"
     );
     assert!(
+        first_stdout.contains("does not verify chat generation quota"),
+        "test-connection must not imply chat-generation quota readiness: {first_stdout}"
+    );
+    assert!(
         first_stdout.contains("\"cache_status\": \"miss\""),
         "first live probe should miss cache: {first_stdout}"
     );

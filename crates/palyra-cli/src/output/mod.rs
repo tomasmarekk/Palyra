@@ -313,6 +313,9 @@ pub(crate) fn classify_error(error: &anyhow::Error) -> CliExitCode {
     if is_provider_turn_timeout(&lower) {
         return CliExitCode::Connectivity;
     }
+    if is_provider_quota_or_rate_limit(&lower) {
+        return CliExitCode::Connectivity;
+    }
     if lower.contains("unauthorized")
         || lower.contains("forbidden")
         || lower.contains("authentication")
@@ -399,6 +402,17 @@ fn is_provider_turn_timeout(lower_error: &str) -> bool {
         || (lower_error.contains("provider")
             && lower_error.contains("timed out")
             && lower_error.contains("no model tokens"))
+}
+
+fn is_provider_quota_or_rate_limit(lower_error: &str) -> bool {
+    lower_error.contains("quota_exceeded")
+        || lower_error.contains("resource exhausted")
+        || lower_error.contains("insufficient_quota")
+        || lower_error.contains("usage limit reached")
+        || lower_error.contains("plan usage limit")
+        || lower_error.contains("token plan usage limit")
+        || lower_error.contains("rate_limited")
+        || lower_error.contains("rate limit")
 }
 
 fn classify_control_plane_error(cause: &(dyn std::error::Error + 'static)) -> Option<CliExitCode> {
@@ -502,6 +516,16 @@ mod tests {
         assert_eq!(
             classify_error(&anyhow!(
                 "agent run failed: model provider turn timed out after 60000ms for run 01ARZ3NDEKTSV4RRFFQ69G5FAV; no model tokens, tool proposals, or final answer arrived before the deadline."
+            )),
+            CliExitCode::Connectivity
+        );
+    }
+
+    #[test]
+    fn classify_error_maps_provider_usage_limit_before_token_auth_match() {
+        assert_eq!(
+            classify_error(&anyhow!(
+                "model provider request failed after 0 retries (retryable=false, class=quota_exceeded, action=ask_user): HTTP 429 Token Plan usage limit reached"
             )),
             CliExitCode::Connectivity
         );
