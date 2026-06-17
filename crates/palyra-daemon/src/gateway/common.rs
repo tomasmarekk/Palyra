@@ -29,6 +29,11 @@ pub(crate) fn map_orchestrator_store_error(operation: &str, error: JournalError)
                 "{payload_kind} payload exceeds maximum size ({actual_bytes} > {max_bytes})"
             ))
         }
+        JournalError::JournalCapacityExceeded { current_events, max_events } => {
+            Status::resource_exhausted(format!(
+                "journal capacity reached ({current_events} >= {max_events})"
+            ))
+        }
         JournalError::SessionIdentityMismatch { session_id } => Status::failed_precondition(
             format!("orchestrator session identity mismatch for session: {session_id}"),
         ),

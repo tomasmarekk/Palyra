@@ -4933,8 +4933,8 @@ allowed_credential_vault_refs = ["global/github_token", "principal:UserA/api_tok
             "journal payload limit should default to 256 KiB"
         );
         assert_eq!(
-            config.max_journal_events, 10_000,
-            "journal event capacity should default to a bounded fail-closed limit"
+            config.max_journal_events, 1_000_000,
+            "journal event capacity should default to a bounded long-workflow limit"
         );
         assert!(
             config.vault_dir.ends_with("vault"),

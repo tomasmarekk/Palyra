@@ -35,12 +35,13 @@ use crate::journal::{
     ApprovalPromptOption, ApprovalPromptRecord, ApprovalResolveRequest, ApprovalRiskLevel,
     ApprovalSubjectType, CronConcurrencyPolicy, CronJobCreateRequest, CronMisfirePolicy,
     CronRetryPolicy, CronRunStartRequest, CronRunStatus, CronScheduleType, JournalAppendRequest,
-    JournalConfig, JournalStore, MemoryItemCreateRequest, MemoryItemLifecycleUpdateRequest,
-    MemoryItemRecord, MemoryScoreBreakdown, MemorySearchHit, MemorySearchRequest, MemorySource,
-    OrchestratorBackgroundTaskCreateRequest, OrchestratorBackgroundTaskUpdateRequest,
-    OrchestratorRunStartRequest, OrchestratorSessionResolveRequest,
-    OrchestratorSessionUpsertRequest, OrchestratorTapeAppendRequest,
-    SessionProjectContextStateUpsertRequest, WorkspaceDocumentWriteRequest,
+    JournalConfig, JournalError, JournalStore, MemoryItemCreateRequest,
+    MemoryItemLifecycleUpdateRequest, MemoryItemRecord, MemoryScoreBreakdown, MemorySearchHit,
+    MemorySearchRequest, MemorySource, OrchestratorBackgroundTaskCreateRequest,
+    OrchestratorBackgroundTaskUpdateRequest, OrchestratorRunStartRequest,
+    OrchestratorSessionResolveRequest, OrchestratorSessionUpsertRequest,
+    OrchestratorTapeAppendRequest, SessionProjectContextStateUpsertRequest,
+    WorkspaceDocumentWriteRequest,
 };
 use tonic::{transport::Server as TonicServer, Code};
 use ulid::Ulid;
@@ -3359,6 +3360,17 @@ fn clear_memory_search_cache_recovers_from_poisoned_lock() {
         Err(poisoned) => poisoned.into_inner().is_empty(),
     };
     assert!(cache_is_empty, "cache clear should succeed even when lock is poisoned");
+}
+
+#[test]
+fn orchestrator_store_capacity_maps_to_resource_exhausted() {
+    let status = super::common::map_orchestrator_store_error(
+        "append orchestrator tape event",
+        JournalError::JournalCapacityExceeded { current_events: 10_000, max_events: 10_000 },
+    );
+
+    assert_eq!(status.code(), Code::ResourceExhausted);
+    assert_eq!(status.message(), "journal capacity reached (10000 >= 10000)");
 }
 
 #[test]
