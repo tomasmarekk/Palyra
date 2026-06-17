@@ -4134,6 +4134,44 @@ async fn successful_run_finalization_cleans_run_owned_resource_tracking() {
     assert_eq!(sequence, vec![(0, "status"), (1, "run.cleanup")]);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn successful_run_finalization_cleans_resources_when_done_status_channel_closed() {
+    let state = build_test_runtime_state(false);
+    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::new().to_string();
+    start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
+
+    state.record_run_browser_session(run_id.as_str(), "browser-session-closed-channel");
+
+    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    drop(receiver);
+    let mut run_state = RunStateMachine::default();
+    run_state.transition(RunTransition::Accept).expect("run state should accept");
+    run_state.transition(RunTransition::StartStreaming).expect("run state should start streaming");
+    let mut tape_seq = 0;
+
+    let error = finalize_run_stream_after_provider_response(
+        &sender,
+        &state,
+        &mut run_state,
+        run_id.as_str(),
+        &mut tape_seq,
+    )
+    .await
+    .expect_err("closed client channel should still be reported to caller");
+
+    assert_eq!(error.code(), tonic::Code::Cancelled);
+    assert_eq!(
+        error.message(),
+        crate::application::run_stream::tape::RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE
+    );
+    assert_eq!(run_state.state(), RunLifecycleState::Done);
+    assert!(
+        state.take_run_cleanup_resources(run_id.as_str()).is_empty(),
+        "client disconnect during Done status must not skip terminal cleanup"
+    );
+}
+
 #[test]
 fn tool_outcomes_record_and_forget_run_cleanup_resources() {
     let state = build_test_runtime_state(false);
