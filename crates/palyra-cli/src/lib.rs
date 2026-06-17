@@ -4157,38 +4157,67 @@ async fn execute_agent_stream_async(
     let ndjson = output::preferred_ndjson(false, ndjson);
     let json_output = !ndjson && output::preferred_json(false);
     let mut client = client::runtime::GatewayRuntimeClient::connect(connection).await?;
+    let mut request = request;
+    let mut continuation_count = 0usize;
     let outcome = if json_output {
         let mut events = AgentJsonStreamBuffer::default();
-        let outcome =
-            stream_agent_events_async(&mut client, request, |event| events.push_event(event))
-                .await
-                .map_err(|error| enrich_agent_principal_auth_error(error, principal.as_str()))?;
-        output::print_json_pretty(
-            &json!({ "events": events.into_events() }),
-            "failed to encode agent stream as JSON",
-        )?;
-        outcome.ensure_success()?;
-        outcome
+        loop {
+            let outcome =
+                stream_agent_events_async(&mut client, request, |event| events.push_event(event))
+                    .await
+                    .map_err(|error| {
+                        enrich_agent_principal_auth_error(error, principal.as_str())
+                    })?;
+            if let Some(next_request) =
+                next_agent_auto_continuation_request(&outcome, continuation_count)
+            {
+                continuation_count = continuation_count.saturating_add(1);
+                emit_agent_auto_resume_status(continuation_count, &next_request)?;
+                request = next_request;
+                continue;
+            }
+            output::print_json_pretty(
+                &json!({ "events": events.into_events() }),
+                "failed to encode agent stream as JSON",
+            )?;
+            outcome.ensure_success()?;
+            break outcome;
+        }
     } else {
         let mut text_emitter = AgentTextEmitter::default();
-        let outcome = stream_agent_events_async(&mut client, request, |event| {
-            if ndjson {
-                emit_acp_event_ndjson(event)
-            } else {
-                text_emitter.emit(event)
+        loop {
+            let outcome = stream_agent_events_async(&mut client, request, |event| {
+                if ndjson {
+                    emit_acp_event_ndjson(event)
+                } else {
+                    text_emitter.emit(event)
+                }
+            })
+            .await
+            .map_err(|error| enrich_agent_principal_auth_error(error, principal.as_str()))?;
+            if let Some(next_request) =
+                next_agent_auto_continuation_request(&outcome, continuation_count)
+            {
+                if !ndjson {
+                    text_emitter.finish()?;
+                    text_emitter = AgentTextEmitter::default();
+                }
+                continuation_count = continuation_count.saturating_add(1);
+                emit_agent_auto_resume_status(continuation_count, &next_request)?;
+                request = next_request;
+                continue;
             }
-        })
-        .await
-        .map_err(|error| enrich_agent_principal_auth_error(error, principal.as_str()))?;
-        if !ndjson {
-            text_emitter.finish()?;
+            if !ndjson {
+                text_emitter.finish()?;
+            }
+            outcome.ensure_success()?;
+            break outcome;
         }
-        outcome.ensure_success()?;
-        outcome
     };
     Ok(outcome)
 }
 
+const AGENT_AUTO_CONTINUATION_LIMIT: usize = 3;
 const AGENT_JSON_STREAM_MAX_EVENTS: usize = 20_000;
 const AGENT_JSON_STREAM_MAX_SERIALIZED_BYTES: usize = 16 * 1024 * 1024;
 
@@ -4406,10 +4435,28 @@ where
             break;
         }
     }
-    let needs_continuation_message = needs_continuation_message.map(|message| {
-        enrich_agent_needs_continuation_message(message, &resolved.session, &resolved.request)
-    });
-    Ok(AgentStreamOutcome { completed, cancelled, needs_continuation_message, failed_message })
+    let (needs_continuation_message, continuation_request) =
+        if let Some(message) = needs_continuation_message {
+            let continuation_request =
+                build_agent_auto_continuation_request(&resolved.session, &resolved.request)?;
+            (
+                Some(enrich_agent_needs_continuation_message(
+                    message,
+                    &resolved.session,
+                    &resolved.request,
+                )),
+                Some(continuation_request),
+            )
+        } else {
+            (None, None)
+        };
+    Ok(AgentStreamOutcome {
+        completed,
+        cancelled,
+        needs_continuation_message,
+        failed_message,
+        continuation_request,
+    })
 }
 
 fn enrich_agent_stream_transport_error(error: anyhow::Error, run_id: &str) -> anyhow::Error {
@@ -4806,6 +4853,66 @@ fn agent_resume_prompt(run_id: &str) -> String {
     format!(
         "Resume from run {run_id}. Inspect the run tape and continue the incomplete task from the latest successful tool evidence."
     )
+}
+
+fn build_agent_auto_continuation_request(
+    session: &gateway_v1::SessionSummary,
+    previous: &AgentRunInput,
+) -> Result<AgentRunInput> {
+    let session_id = session.session_id.clone().or_else(|| previous.session_id.clone());
+    let session_key = if session_id.is_some() {
+        None
+    } else {
+        non_empty_str(Some(session.session_key.as_str()))
+            .or_else(|| {
+                previous.session_key.as_deref().and_then(|value| non_empty_str(Some(value)))
+            })
+            .map(ToOwned::to_owned)
+    };
+    if session_id.is_none() && session_key.is_none() {
+        anyhow::bail!(
+            "cannot auto-resume agent continuation because the gateway did not return a session id or session key"
+        );
+    }
+
+    let prompt = agent_resume_prompt(previous.run_id.as_str());
+    build_agent_run_input(AgentRunInputArgs {
+        session_id,
+        session_key,
+        session_label: None,
+        require_existing: true,
+        reset_session: false,
+        run_id: None,
+        prompt,
+        allow_sensitive_tools: previous.allow_sensitive_tools,
+        interrupt_active_run: false,
+        approval_mode: previous.approval_mode,
+        origin_kind: Some("cli_auto_resume".to_owned()),
+        origin_run_id: Some(previous.run_id.clone()),
+        parameter_delta_json: previous.parameter_delta_json.clone(),
+    })
+}
+
+fn next_agent_auto_continuation_request(
+    outcome: &AgentStreamOutcome,
+    completed_continuations: usize,
+) -> Option<AgentRunInput> {
+    if outcome.needs_continuation_message.is_none()
+        || completed_continuations >= AGENT_AUTO_CONTINUATION_LIMIT
+    {
+        return None;
+    }
+    outcome.continuation_request.clone()
+}
+
+fn emit_agent_auto_resume_status(attempt: usize, next_request: &AgentRunInput) -> Result<()> {
+    eprintln!(
+        "agent.auto_resume attempt={attempt} max_attempts={} previous_run_id={} next_run_id={} reason=needs_continuation",
+        AGENT_AUTO_CONTINUATION_LIMIT,
+        next_request.origin_run_id.as_deref().unwrap_or(REDACTED),
+        next_request.run_id
+    );
+    std::io::stderr().flush().context("stderr flush failed")
 }
 
 fn agent_approval_mode_cli_value(mode: AgentApprovalMode) -> &'static str {
@@ -5977,6 +6084,7 @@ mod agent_stream_output_tests {
             failed_message: Some(
                 "model_provider_missing_auth: provider has no credential".to_owned(),
             ),
+            continuation_request: None,
         };
 
         let error = outcome.ensure_success().expect_err("failed run must fail the command");
@@ -5995,6 +6103,7 @@ mod agent_stream_output_tests {
                 "model provider failed after tool work; needs_continuation=true reason_code=provider_error; partial result summary: continue in the same session".to_owned(),
             ),
             failed_message: None,
+            continuation_request: None,
         };
 
         let error = outcome
@@ -6040,6 +6149,7 @@ mod agent_stream_output_tests {
             cancelled: false,
             needs_continuation_message: Some(message),
             failed_message: None,
+            continuation_request: None,
         };
         let error = outcome
             .ensure_success()
@@ -6059,12 +6169,132 @@ mod agent_stream_output_tests {
     }
 
     #[test]
+    fn auto_continuation_request_resumes_existing_session_with_origin() {
+        let session = gateway_v1::SessionSummary {
+            session_id: Some(common_v1::CanonicalId {
+                ulid: "01ARZ3NDEKTSV4RRFFQ69G5FAS".to_owned(),
+            }),
+            session_key: "ops:triage".to_owned(),
+            ..Default::default()
+        };
+        let previous = build_agent_run_input(AgentRunInputArgs {
+            session_id: None,
+            session_key: Some("ops:triage".to_owned()),
+            session_label: Some("Ops triage".to_owned()),
+            require_existing: true,
+            reset_session: false,
+            run_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
+            prompt: "original prompt with sensitive context".to_owned(),
+            allow_sensitive_tools: true,
+            interrupt_active_run: false,
+            approval_mode: AgentApprovalMode::AllowOnce,
+            origin_kind: None,
+            origin_run_id: None,
+            parameter_delta_json: Some(r#"{"cli_context":{"workspace_roots":[]}}"#.to_owned()),
+        })
+        .expect("previous run input should build");
+
+        let next = build_agent_auto_continuation_request(&session, &previous)
+            .expect("auto continuation request should build");
+
+        assert_eq!(
+            next.session_id.as_ref().map(|value| value.ulid.as_str()),
+            Some("01ARZ3NDEKTSV4RRFFQ69G5FAS")
+        );
+        assert!(next.session_key.is_none(), "session id should take precedence over key");
+        assert!(next.require_existing);
+        assert!(!next.reset_session);
+        assert!(!next.interrupt_active_run);
+        assert!(next.allow_sensitive_tools);
+        assert_eq!(next.approval_mode, AgentApprovalMode::AllowOnce);
+        assert_eq!(next.origin_kind.as_deref(), Some("cli_auto_resume"));
+        assert_eq!(next.origin_run_id.as_deref(), Some("01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+        assert!(next.prompt.contains("Resume from run 01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+        assert!(
+            !next.prompt.contains("original prompt with sensitive context"),
+            "auto resume prompt must not echo the original prompt"
+        );
+        assert!(
+            next.parameter_delta_json.as_deref()
+                == Some(r#"{"cli_context":{"workspace_roots":[]}}"#),
+            "auto resume should preserve launch parameter telemetry"
+        );
+    }
+
+    #[test]
+    fn auto_continuation_request_falls_back_to_session_key() {
+        let session = gateway_v1::SessionSummary {
+            session_key: "ops:triage".to_owned(),
+            ..Default::default()
+        };
+        let previous = build_agent_run_input(AgentRunInputArgs {
+            session_id: None,
+            session_key: Some("ops:triage".to_owned()),
+            session_label: None,
+            require_existing: true,
+            reset_session: false,
+            run_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
+            prompt: "continue task".to_owned(),
+            allow_sensitive_tools: false,
+            interrupt_active_run: false,
+            approval_mode: AgentApprovalMode::Deny,
+            origin_kind: None,
+            origin_run_id: None,
+            parameter_delta_json: None,
+        })
+        .expect("previous run input should build");
+
+        let next = build_agent_auto_continuation_request(&session, &previous)
+            .expect("auto continuation request should build");
+
+        assert!(next.session_id.is_none());
+        assert_eq!(next.session_key.as_deref(), Some("ops:triage"));
+        assert_eq!(next.approval_mode, AgentApprovalMode::Deny);
+    }
+
+    #[test]
+    fn auto_continuation_request_stops_at_limit() {
+        let continuation_request = build_agent_run_input(AgentRunInputArgs {
+            session_id: Some(common_v1::CanonicalId {
+                ulid: "01ARZ3NDEKTSV4RRFFQ69G5FAS".to_owned(),
+            }),
+            session_key: None,
+            session_label: None,
+            require_existing: true,
+            reset_session: false,
+            run_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned()),
+            prompt: "Resume from run 01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            allow_sensitive_tools: false,
+            interrupt_active_run: false,
+            approval_mode: AgentApprovalMode::AllowOnce,
+            origin_kind: Some("cli_auto_resume".to_owned()),
+            origin_run_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
+            parameter_delta_json: None,
+        })
+        .expect("continuation input should build");
+        let outcome = AgentStreamOutcome {
+            completed: false,
+            cancelled: false,
+            needs_continuation_message: Some("needs_continuation=true".to_owned()),
+            failed_message: None,
+            continuation_request: Some(continuation_request),
+        };
+
+        assert!(next_agent_auto_continuation_request(&outcome, AGENT_AUTO_CONTINUATION_LIMIT - 1)
+            .is_some());
+        assert!(
+            next_agent_auto_continuation_request(&outcome, AGENT_AUTO_CONTINUATION_LIMIT).is_none()
+        );
+    }
+
+    #[test]
     fn unterminated_stream_outcome_is_command_error() {
         let outcome = AgentStreamOutcome {
             completed: false,
             cancelled: false,
             needs_continuation_message: None,
             failed_message: None,
+            continuation_request: None,
         };
 
         let error =
@@ -6079,6 +6309,7 @@ mod agent_stream_output_tests {
             cancelled: true,
             needs_continuation_message: None,
             failed_message: None,
+            continuation_request: None,
         };
 
         outcome.ensure_success().expect("requested cancellation should not fail the command");
@@ -6902,6 +7133,7 @@ struct AgentStreamOutcome {
     cancelled: bool,
     needs_continuation_message: Option<String>,
     failed_message: Option<String>,
+    continuation_request: Option<AgentRunInput>,
 }
 
 impl AgentStreamOutcome {

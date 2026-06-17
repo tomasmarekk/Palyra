@@ -600,8 +600,13 @@ async fn execute_interactive_agent_stream(
     if !ndjson {
         text_emitter.finish()?;
     }
-    let outcome =
-        AgentStreamOutcome { completed, cancelled, needs_continuation_message, failed_message };
+    let outcome = AgentStreamOutcome {
+        completed,
+        cancelled,
+        needs_continuation_message,
+        failed_message,
+        continuation_request: None,
+    };
     // An interrupted run is expected to end without a successful terminal
     // status; the queued prompt (or exit) decides what happens next, so the
     // terminal-status and success checks are intentionally skipped.
