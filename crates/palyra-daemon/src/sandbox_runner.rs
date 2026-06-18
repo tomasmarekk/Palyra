@@ -8448,6 +8448,10 @@ mod tests {
 
     #[test]
     fn host_access_process_environment_prepends_validated_path() {
+        let _guard = PROCESS_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("process env lock should not be poisoned");
         let workspace = unique_temp_dir("workspace-host-prepend-path");
         let toolchain_bin = workspace.join("toolchain").join("bin");
         fs::create_dir_all(toolchain_bin.as_path()).expect("toolchain bin should exist");
@@ -8533,71 +8537,79 @@ mod tests {
             .expect("process env lock should not be poisoned");
         let workspace = unique_temp_dir("workspace-host-env");
         fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        let state_root = unique_temp_dir("state-host-env");
+        fs::create_dir_all(state_root.as_path()).expect("state root should be created");
         let e2e_home = workspace.join("fixture-home");
         let e2e_os_root = workspace.join("fixture-os-root");
-        let _admin_token = ScopedEnvVar::set("PALYRA_ADMIN_TOKEN", "admin-secret");
-        let _browser_token =
-            ScopedEnvVar::set("PALYRA_BROWSER_SERVICE_AUTH_TOKEN", "browser-secret");
-        let _model_key =
-            ScopedEnvVar::set("PALYRA_MODEL_PROVIDER_OPENAI_API_KEY", "provider-secret");
-        let _cli_profile = ScopedEnvVar::set("PALYRA_CLI_PROFILE", "desktop-local");
-        let _cli_profiles_path =
-            ScopedEnvVar::set("PALYRA_CLI_PROFILES_PATH", workspace.join("profiles.toml"));
-        let _state_root = ScopedEnvVar::set("PALYRA_STATE_ROOT", workspace.join("state"));
-        let _e2e_home = ScopedEnvVar::set("PALYRA_E2E_HOME", e2e_home.as_os_str());
-        let _e2e_os_root = ScopedEnvVar::set("PALYRA_E2E_OS_ROOT", e2e_os_root.as_os_str());
-        let policy = host_access_policy(workspace.clone());
-        let input = ProcessRunnerInput {
-            command: "palyra-helper".to_owned(),
-            args: Vec::new(),
-            cwd: None,
-            env: BTreeMap::new(),
-            prepend_path: Vec::new(),
-            requested_egress_hosts: Vec::new(),
-            timeout_ms: None,
-            background: false,
-            lifetime_mode: BackgroundLifetimeMode::RunOwned,
-            keep_running_after_run: false,
-        };
+        {
+            let _admin_token = ScopedEnvVar::set("PALYRA_ADMIN_TOKEN", "admin-secret");
+            let _browser_token =
+                ScopedEnvVar::set("PALYRA_BROWSER_SERVICE_AUTH_TOKEN", "browser-secret");
+            let _model_key =
+                ScopedEnvVar::set("PALYRA_MODEL_PROVIDER_OPENAI_API_KEY", "provider-secret");
+            let _cli_profile = ScopedEnvVar::set("PALYRA_CLI_PROFILE", "desktop-local");
+            let _cli_profiles_path =
+                ScopedEnvVar::set("PALYRA_CLI_PROFILES_PATH", workspace.join("profiles.toml"));
+            let _state_root = ScopedEnvVar::set("PALYRA_STATE_ROOT", state_root.as_os_str());
+            let _e2e_home = ScopedEnvVar::set("PALYRA_E2E_HOME", e2e_home.as_os_str());
+            let _e2e_os_root = ScopedEnvVar::set("PALYRA_E2E_OS_ROOT", e2e_os_root.as_os_str());
+            let policy = host_access_policy(workspace.clone());
+            let input = ProcessRunnerInput {
+                command: "palyra-helper".to_owned(),
+                args: Vec::new(),
+                cwd: None,
+                env: BTreeMap::new(),
+                prepend_path: Vec::new(),
+                requested_egress_hosts: Vec::new(),
+                timeout_ms: None,
+                background: false,
+                lifetime_mode: BackgroundLifetimeMode::RunOwned,
+                keep_running_after_run: false,
+            };
 
-        let command =
-            build_process_command(&policy, &input, workspace.as_path(), workspace.as_path())
-                .expect("host access command should build");
-        let env = command
-            .get_envs()
-            .map(|(key, value)| {
-                (
-                    key.to_string_lossy().into_owned(),
-                    value.map(|value| value.to_string_lossy().into_owned()),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
+            let command =
+                build_process_command(&policy, &input, workspace.as_path(), workspace.as_path())
+                    .expect("host access command should build");
+            let env = command
+                .get_envs()
+                .map(|(key, value)| {
+                    (
+                        key.to_string_lossy().into_owned(),
+                        value.map(|value| value.to_string_lossy().into_owned()),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
 
-        for key in [
-            "PALYRA_ADMIN_TOKEN",
-            "PALYRA_BROWSER_SERVICE_AUTH_TOKEN",
-            "PALYRA_MODEL_PROVIDER_OPENAI_API_KEY",
-            "PALYRA_CLI_PROFILE",
-            "PALYRA_CLI_PROFILES_PATH",
-            "PALYRA_STATE_ROOT",
-        ] {
-            assert!(
-                !env.contains_key(key),
-                "host-access process must not inherit runtime env key {key}"
+            for key in [
+                "PALYRA_ADMIN_TOKEN",
+                "PALYRA_BROWSER_SERVICE_AUTH_TOKEN",
+                "PALYRA_MODEL_PROVIDER_OPENAI_API_KEY",
+                "PALYRA_CLI_PROFILE",
+                "PALYRA_CLI_PROFILES_PATH",
+                "PALYRA_STATE_ROOT",
+            ] {
+                assert!(
+                    !env.contains_key(key),
+                    "host-access process must not inherit runtime env key {key}"
+                );
+            }
+            assert_eq!(
+                env.get("PALYRA_E2E_HOME").and_then(Option::as_deref),
+                Some(e2e_home.to_string_lossy().as_ref())
             );
+            assert_eq!(
+                env.get("PALYRA_E2E_OS_ROOT").and_then(Option::as_deref),
+                Some(e2e_os_root.to_string_lossy().as_ref())
+            );
+            assert_eq!(
+                env.get(NODE_DISABLE_COMPILE_CACHE_ENV).and_then(Option::as_deref),
+                Some("1")
+            );
+            assert!(env.contains_key("PATH"), "host-access process should keep a usable PATH");
         }
-        assert_eq!(
-            env.get("PALYRA_E2E_HOME").and_then(Option::as_deref),
-            Some(e2e_home.to_string_lossy().as_ref())
-        );
-        assert_eq!(
-            env.get("PALYRA_E2E_OS_ROOT").and_then(Option::as_deref),
-            Some(e2e_os_root.to_string_lossy().as_ref())
-        );
-        assert_eq!(env.get(NODE_DISABLE_COMPILE_CACHE_ENV).and_then(Option::as_deref), Some("1"));
-        assert!(env.contains_key("PATH"), "host-access process should keep a usable PATH");
 
         let _ = fs::remove_dir_all(workspace.as_path());
+        let _ = fs::remove_dir_all(state_root.as_path());
     }
 
     #[test]
@@ -9892,10 +9904,14 @@ mod tests {
         }) else {
             return;
         };
+        let _guard = PROCESS_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("process env lock should not be poisoned");
         let workspace = unique_temp_dir("workspace-background-startup-output");
         fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
         let script = format!(
-            "import time\nprint('PORT=54321', flush=True)\ntime.sleep({BACKGROUND_TEST_SCRIPT_SLEEP_SECS})\n"
+            "import time\nfor _ in range(20):\n    print('PORT=54321', flush=True)\n    time.sleep(0.05)\ntime.sleep({BACKGROUND_TEST_SCRIPT_SLEEP_SECS})\n"
         );
         fs::write(workspace.join("print_port.py"), script)
             .expect("startup output script should be written");
@@ -9929,7 +9945,10 @@ mod tests {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .replace("\r\n", "\n");
-        assert_eq!(stdout, "PORT=54321\n");
+        assert!(
+            stdout.lines().any(|line| line == "PORT=54321"),
+            "startup stdout should include the port line: {stdout:?}"
+        );
         assert_eq!(
             output.get("stdout_truncated").and_then(serde_json::Value::as_bool),
             Some(false)
@@ -10109,13 +10128,17 @@ mod tests {
         }) else {
             return;
         };
+        let _guard = PROCESS_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("process env lock should not be poisoned");
         let workspace = unique_temp_dir("workspace-background-windows-job-child");
         fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
         fs::write(workspace.join("child.py"), "import time\ntime.sleep(30)\n")
             .expect("child script should be written");
         fs::write(
             workspace.join("launcher.py"),
-            "import os, subprocess, sys, time\nsubprocess.Popen([sys.executable, 'child.py'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)\nprint('ready', flush=True)\ntime.sleep(6)\nos._exit(0)\n",
+            "import os, subprocess, sys, time\ntime.sleep(0.5)\nsubprocess.Popen([sys.executable, 'child.py'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)\nprint('ready', flush=True)\ntime.sleep(6)\nos._exit(0)\n",
         )
         .expect("launcher script should be written");
         let mut policy = sandbox_policy_with_allowed_executables(
@@ -10327,6 +10350,10 @@ mod tests {
         }) else {
             return;
         };
+        let _guard = PROCESS_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("process env lock should not be poisoned");
         let workspace = unique_temp_dir("workspace-background-escaped-child");
         fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
         let child_script = workspace.join("child.py");
@@ -10334,14 +10361,12 @@ mod tests {
         let child_pid_path = workspace.join("child.pid");
         fs::write(
             child_script.as_path(),
-            format!(
-                "import os, pathlib, sys, time\npathlib.Path(sys.argv[1]).write_text(str(os.getpid()), encoding='utf-8')\ntime.sleep({BACKGROUND_TEST_SCRIPT_SLEEP_SECS})\n"
-            ),
+            format!("import time\ntime.sleep({BACKGROUND_TEST_SCRIPT_SLEEP_SECS})\n"),
         )
         .expect("child script should be written");
         fs::write(
             launcher_script.as_path(),
-            "import pathlib, subprocess, sys, time\nroot = pathlib.Path(__file__).resolve().parent\npid_path = root / 'child.pid'\nchild = root / 'child.py'\nsubprocess.Popen([sys.executable, str(child), str(pid_path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\ndeadline = time.time() + 5\nwhile not pid_path.exists() and time.time() < deadline:\n    time.sleep(0.01)\nsys.exit(1)\n",
+            "import pathlib, subprocess, sys, time\nroot = pathlib.Path(__file__).resolve().parent\npid_path = root / 'child.pid'\nchild = root / 'child.py'\ntime.sleep(0.25)\nprocess = subprocess.Popen([sys.executable, str(child)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\npid_path.write_text(str(process.pid), encoding='utf-8')\nsys.exit(1)\n",
         )
         .expect("launcher script should be written");
         let mut policy =
@@ -10358,7 +10383,7 @@ mod tests {
 
         let error =
             run_constrained_process(&policy, input.as_slice(), background_test_execution_timeout())
-                .expect_err("launcher should exit before the background startup check");
+                .expect_err("launcher should fail during background startup checks");
 
         assert_eq!(error.kind, SandboxProcessRunErrorKind::RuntimeFailure);
         assert!(error.message.contains("exited before startup check"), "{}", error.message);
