@@ -4573,6 +4573,18 @@ fn spawn_background_process(
         )
         .unwrap_or(Duration::ZERO);
         let (stdout, stderr) = output_monitor.snapshot_after_startup_drain(startup_output_drain);
+        if status.success() {
+            reap_background_launcher_child(child);
+            release_background_process_tracking_if_stopped(pid);
+            return background_launcher_completed_successfully(
+                policy,
+                status,
+                &stdout,
+                &stderr,
+                started_at.elapsed(),
+                auto_background_reason,
+            );
+        }
         terminate_background_child(child);
         return Err(background_process_startup_failure(input, status, &stdout, &stderr));
     }
@@ -4593,6 +4605,18 @@ fn spawn_background_process(
     // Second exit probe after the output drain: catches commands that print something and then
     // die (e.g. an unknown-subcommand banner), which the first probe is too early to see.
     if let Some(status) = wait_for_background_process_exit(&mut child, post_output_exit_check)? {
+        if status.success() {
+            reap_background_launcher_child(child);
+            release_background_process_tracking_if_stopped(pid);
+            return background_launcher_completed_successfully(
+                policy,
+                status,
+                &stdout,
+                &stderr,
+                started_at.elapsed(),
+                auto_background_reason,
+            );
+        }
         terminate_background_child(child);
         return Err(background_process_startup_failure(input, status, &stdout, &stderr));
     }
@@ -4692,6 +4716,56 @@ fn background_lifetime_adjustment_note(reason: Option<&str>) -> &'static str {
         Some(_) => "Requested timeout_ms was normalized by background lifetime policy. ",
         None => "",
     }
+}
+
+fn background_launcher_completed_successfully(
+    policy: &SandboxProcessRunnerPolicy,
+    status: ExitStatus,
+    stdout: &StreamCapture,
+    stderr: &StreamCapture,
+    duration: Duration,
+    auto_background_reason: Option<&'static str>,
+) -> Result<SandboxProcessRunSuccess, SandboxProcessRunError> {
+    let RedactedProcessOutputText { text: stdout_text, redacted: stdout_redacted } =
+        redacted_process_output(stdout.bytes.as_slice());
+    let RedactedProcessOutputText { text: stderr_text, redacted: stderr_redacted } =
+        redacted_process_output(stderr.bytes.as_slice());
+    let auto_backgrounded = auto_background_reason.is_some();
+    let output_json = serde_json::to_vec(&json!({
+        "exit_code": status.code(),
+        "stdout": stdout_text,
+        "stderr": stderr_text,
+        "stdout_preview": redacted_process_output_preview(stdout.bytes.as_slice()),
+        "stderr_preview": redacted_process_output_preview(stderr.bytes.as_slice()),
+        "stdout_truncated": stdout.truncated,
+        "stderr_truncated": stderr.truncated,
+        "stdout_redacted": stdout_redacted,
+        "stderr_redacted": stderr_redacted,
+        "background_output_note": "stdout/stderr are bounded startup snapshots captured before the direct launcher exited successfully; verify any external service separately",
+        "duration_ms": duration.as_millis() as u64,
+        "background": true,
+        "auto_backgrounded": auto_backgrounded,
+        "auto_background_reason": auto_background_reason,
+        "foreground_request_backgrounded": auto_backgrounded,
+        "run_owned_lifetime": false,
+        "run_lifecycle_note": "The direct background launcher exited successfully and Palyra is not tracking a run-owned child process. Verify any external service separately and stop it with the service-specific cleanup command.",
+        "started": true,
+        "completed": true,
+        "launcher_completed_successfully": true,
+        "startup_success": true,
+        "process_state": "completed",
+        "tracked_pid": Value::Null,
+        "pid": Value::Null,
+        "cleanup": Value::Null,
+        "note": "direct launcher exited successfully; verify external service separately",
+        "tier": policy.tier.as_str(),
+        "sandbox_backend": process_runner_executor_name(policy),
+    }))
+    .map_err(|error| SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::RuntimeFailure,
+        message: format!("failed to serialize sandbox background launcher output JSON: {error}"),
+    })?;
+    Ok(SandboxProcessRunSuccess { output_json })
 }
 
 fn wait_for_background_process_exit(
@@ -4822,6 +4896,10 @@ fn spawn_background_capture_reader<R>(
 fn terminate_background_child(mut child: Child) {
     terminate_child_process_tree(&mut child);
     // Reap the direct child so a failed background startup never leaves a zombie behind.
+    let _ = child.wait();
+}
+
+fn reap_background_launcher_child(mut child: Child) {
     let _ = child.wait();
 }
 
@@ -9624,28 +9702,62 @@ mod tests {
 
     #[test]
     #[cfg(not(target_os = "macos"))]
-    fn run_constrained_process_rejects_background_process_that_exits_immediately() {
-        #[cfg(windows)]
-        let command = "where.exe";
-        #[cfg(not(windows))]
-        let command = "true";
-
-        if Command::new(command).output().is_err() {
+    fn run_constrained_process_accepts_successful_background_launcher() {
+        let Some(python) = ["python3", "python", "py"].into_iter().find(|command| {
+            Command::new(command)
+                .arg("--version")
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        }) else {
             return;
-        }
+        };
         let workspace = unique_temp_dir("workspace-background-immediate-exit");
         fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        fs::write(
+            workspace.join("launcher_ok.py"),
+            "print('launcher started external service', flush=True)\n",
+        )
+        .expect("launcher fixture should be written");
         let mut policy =
-            sandbox_policy_with_allowed_executables(workspace.clone(), vec![command.to_owned()]);
+            sandbox_policy_with_allowed_executables(workspace.clone(), vec![python.to_owned()]);
+        policy.allow_interpreters = true;
         policy.egress_enforcement_mode = EgressEnforcementMode::Preflight;
-        let input = format!(r#"{{"command":"{command}","args":[],"background":true}}"#);
+        let input = serde_json::to_vec(&serde_json::json!({
+            "command": python,
+            "args": ["launcher_ok.py"],
+            "background": true,
+            "timeout_ms": 60_000
+        }))
+        .expect("input should serialize");
 
-        let error =
-            run_constrained_process(&policy, input.as_bytes(), Duration::from_millis(1_000))
-                .expect_err("background=true should reject commands that exit before startup");
+        let result =
+            run_constrained_process(&policy, input.as_slice(), background_test_execution_timeout())
+                .expect("successful background launcher should not be reported as failure");
+        let output: serde_json::Value =
+            serde_json::from_slice(&result.output_json).expect("output should parse");
 
-        assert_eq!(error.kind, SandboxProcessRunErrorKind::RuntimeFailure);
-        assert!(error.message.contains("exited before startup check"), "{}", error.message);
+        assert_eq!(output.get("background").and_then(serde_json::Value::as_bool), Some(true));
+        assert_eq!(output.get("exit_code").and_then(serde_json::Value::as_i64), Some(0));
+        assert_eq!(output.get("completed").and_then(serde_json::Value::as_bool), Some(true));
+        assert_eq!(
+            output.get("launcher_completed_successfully").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            output.get("process_state").and_then(serde_json::Value::as_str),
+            Some("completed")
+        );
+        assert_eq!(output.get("tracked_pid"), Some(&serde_json::Value::Null));
+        assert_eq!(
+            output.get("run_owned_lifetime").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert!(output
+            .get("stdout")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .contains("launcher started external service"));
 
         let _ = fs::remove_dir_all(workspace.as_path());
     }
@@ -9718,7 +9830,7 @@ mod tests {
         .expect("child script should be written");
         fs::write(
             launcher_script.as_path(),
-            "import pathlib, subprocess, sys, time\nroot = pathlib.Path(__file__).resolve().parent\npid_path = root / 'child.pid'\nchild = root / 'child.py'\nsubprocess.Popen([sys.executable, str(child), str(pid_path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\ndeadline = time.time() + 5\nwhile not pid_path.exists() and time.time() < deadline:\n    time.sleep(0.01)\nsys.exit(0)\n",
+            "import pathlib, subprocess, sys, time\nroot = pathlib.Path(__file__).resolve().parent\npid_path = root / 'child.pid'\nchild = root / 'child.py'\nsubprocess.Popen([sys.executable, str(child), str(pid_path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\ndeadline = time.time() + 5\nwhile not pid_path.exists() and time.time() < deadline:\n    time.sleep(0.01)\nsys.exit(1)\n",
         )
         .expect("launcher script should be written");
         let mut policy =
