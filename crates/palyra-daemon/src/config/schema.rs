@@ -25,7 +25,7 @@ use crate::cron::CronTimezoneMode;
 use crate::media::MediaRuntimeConfig;
 use crate::model_provider::ModelProviderConfig;
 use crate::retrieval::RetrievalRuntimeConfig;
-use crate::sandbox_runner::{EgressEnforcementMode, SandboxProcessRunnerTier};
+use crate::sandbox_runner::{EgressEnforcementMode, PathAccessMode, SandboxProcessRunnerTier};
 
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 7142;
@@ -83,6 +83,7 @@ const DEFAULT_TOOL_CALL_EXECUTION_TIMEOUT_MS: u64 = 750;
 const DEFAULT_PROCESS_RUNNER_ENABLED: bool = false;
 const DEFAULT_PROCESS_RUNNER_TIER: SandboxProcessRunnerTier = SandboxProcessRunnerTier::B;
 const DEFAULT_PROCESS_RUNNER_WORKSPACE_ROOT: &str = ".";
+const DEFAULT_PROCESS_RUNNER_PATH_ACCESS_MODE: PathAccessMode = PathAccessMode::WorkspaceOnly;
 const DEFAULT_PROCESS_RUNNER_ALLOW_INTERPRETERS: bool = false;
 const DEFAULT_PROCESS_RUNNER_EGRESS_ENFORCEMENT_MODE: EgressEnforcementMode =
     EgressEnforcementMode::Strict;
@@ -539,6 +540,7 @@ pub struct ProcessRunnerConfig {
     pub enabled: bool,
     pub tier: SandboxProcessRunnerTier,
     pub workspace_root: PathBuf,
+    pub path_access_mode: PathAccessMode,
     /// Executable names permitted to run; a literal `"*"` entry grants host
     /// access to any executable.
     pub allowed_executables: Vec<String>,
@@ -811,6 +813,7 @@ impl Default for ProcessRunnerConfig {
             enabled: DEFAULT_PROCESS_RUNNER_ENABLED,
             tier: DEFAULT_PROCESS_RUNNER_TIER,
             workspace_root: PathBuf::from(DEFAULT_PROCESS_RUNNER_WORKSPACE_ROOT),
+            path_access_mode: DEFAULT_PROCESS_RUNNER_PATH_ACCESS_MODE,
             allowed_executables: Vec::new(),
             allow_interpreters: DEFAULT_PROCESS_RUNNER_ALLOW_INTERPRETERS,
             egress_enforcement_mode: DEFAULT_PROCESS_RUNNER_EGRESS_ENFORCEMENT_MODE,

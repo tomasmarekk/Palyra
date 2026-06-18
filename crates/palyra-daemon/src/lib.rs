@@ -2298,6 +2298,7 @@ pub async fn run() -> Result<()> {
                     enabled: loaded.tool_call.process_runner.enabled,
                     tier: loaded.tool_call.process_runner.tier,
                     workspace_root: loaded.tool_call.process_runner.workspace_root.clone(),
+                    path_access_mode: loaded.tool_call.process_runner.path_access_mode,
                     allowed_executables: loaded
                         .tool_call
                         .process_runner

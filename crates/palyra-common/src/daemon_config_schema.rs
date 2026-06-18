@@ -633,6 +633,7 @@ pub struct FileProcessRunnerConfig {
     pub enabled: Option<bool>,
     pub tier: Option<String>,
     pub workspace_root: Option<String>,
+    pub path_access_mode: Option<String>,
     pub allowed_executables: Option<Vec<String>>,
     pub allow_interpreters: Option<bool>,
     pub egress_enforcement_mode: Option<String>,

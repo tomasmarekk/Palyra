@@ -1067,6 +1067,7 @@ mod tests {
                 enabled: false,
                 tier: SandboxProcessRunnerTier::B,
                 workspace_root: Path::new(".").to_path_buf(),
+                path_access_mode: crate::sandbox_runner::PathAccessMode::WorkspaceOnly,
                 allowed_executables: Vec::new(),
                 allow_interpreters: false,
                 egress_enforcement_mode: EgressEnforcementMode::None,

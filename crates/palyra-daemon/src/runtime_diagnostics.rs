@@ -601,6 +601,7 @@ pub(crate) fn build_contract_snapshot_suite() -> Value {
             enabled: false,
             tier: crate::sandbox_runner::SandboxProcessRunnerTier::B,
             workspace_root: ".".into(),
+            path_access_mode: crate::sandbox_runner::PathAccessMode::WorkspaceOnly,
             allowed_executables: Vec::new(),
             allow_interpreters: false,
             egress_enforcement_mode: crate::sandbox_runner::EgressEnforcementMode::Strict,

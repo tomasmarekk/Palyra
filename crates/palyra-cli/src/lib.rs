@@ -959,6 +959,11 @@ fn apply_local_desktop_tool_defaults(
     )?;
     set_value_at_path(
         document,
+        "tool_call.process_runner.path_access_mode",
+        toml::Value::String("unrestricted_os".to_owned()),
+    )?;
+    set_value_at_path(
+        document,
         "tool_call.process_runner.allowed_executables",
         string_array_value(LOCAL_DESKTOP_DEFAULT_PROCESS_EXECUTABLES),
     )?;
@@ -12873,6 +12878,10 @@ mod init_command_tests {
         assert_eq!(
             read_string(&document, "tool_call.process_runner.egress_enforcement_mode").as_deref(),
             Some("none")
+        );
+        assert_eq!(
+            read_string(&document, "tool_call.process_runner.path_access_mode").as_deref(),
+            Some("unrestricted_os")
         );
         assert_eq!(
             read_integer(&document, "tool_call.process_runner.cpu_time_limit_ms"),

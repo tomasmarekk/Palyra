@@ -1587,6 +1587,7 @@ mod tests {
             enabled: true,
             tier: SandboxProcessRunnerTier::C,
             workspace_root: PathBuf::from("."),
+            path_access_mode: crate::sandbox_runner::PathAccessMode::WorkspaceOnly,
             allowed_executables: vec!["cargo".to_owned()],
             allow_interpreters: false,
             egress_enforcement_mode: EgressEnforcementMode::Preflight,

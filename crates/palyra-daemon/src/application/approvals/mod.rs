@@ -636,6 +636,7 @@ mod tests {
                 enabled: true,
                 tier: crate::sandbox_runner::SandboxProcessRunnerTier::B,
                 workspace_root: std::env::current_dir().expect("current_dir should resolve"),
+                path_access_mode: crate::sandbox_runner::PathAccessMode::WorkspaceOnly,
                 allowed_executables: vec!["cargo".to_owned()],
                 allow_interpreters: false,
                 egress_enforcement_mode: crate::sandbox_runner::EgressEnforcementMode::Preflight,

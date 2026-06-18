@@ -63,7 +63,7 @@ use crate::model_provider::{
 use crate::retrieval::{
     RetrievalBackendKind, RetrievalRuntimeConfig, RetrievalSourceScoringProfile,
 };
-use crate::sandbox_runner::{EgressEnforcementMode, SandboxProcessRunnerTier};
+use crate::sandbox_runner::{EgressEnforcementMode, PathAccessMode, SandboxProcessRunnerTier};
 
 /// Loads the daemon configuration by layering the config file (located via
 /// `PALYRA_CONFIG` or the default search paths) and `PALYRA_*` environment
@@ -106,6 +106,7 @@ pub fn load_config() -> Result<LoadedConfig> {
     let mut source = "defaults".to_owned();
     let mut config_version = 1_u32;
     let mut migrated_from_version = None;
+    let mut process_runner_path_access_mode_explicit = false;
 
     if let Some(path) = find_config_path()? {
         let content = fs::read_to_string(&path)
@@ -753,6 +754,14 @@ pub fn load_config() -> Result<LoadedConfig> {
                 if let Some(workspace_root) = file_process_runner.workspace_root {
                     tool_call.process_runner.workspace_root =
                         parse_workspace_root(workspace_root.as_str())?;
+                }
+                if let Some(path_access_mode) = file_process_runner.path_access_mode {
+                    tool_call.process_runner.path_access_mode =
+                        parse_process_runner_path_access_mode(
+                            path_access_mode.as_str(),
+                            "tool_call.process_runner.path_access_mode",
+                        )?;
+                    process_runner_path_access_mode_explicit = true;
                 }
                 if let Some(allowed_executables) = file_process_runner.allowed_executables {
                     tool_call.process_runner.allowed_executables =
@@ -2067,6 +2076,10 @@ pub fn load_config() -> Result<LoadedConfig> {
         &replay_capture,
         &networked_workers,
     )?;
+    if !process_runner_path_access_mode_explicit {
+        tool_call.process_runner.path_access_mode =
+            legacy_process_runner_path_access_mode(&tool_call.process_runner, deployment.mode);
+    }
     // Anchor relative storage paths against the state root only now, after
     // env overrides, so PALYRA_STATE_ROOT and path overrides compose.
     let runtime_state_root =
@@ -3227,6 +3240,42 @@ fn parse_process_runner_tier(raw: &str, source_name: &str) -> Result<SandboxProc
     }
 }
 
+fn parse_process_runner_path_access_mode(raw: &str, source_name: &str) -> Result<PathAccessMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "unrestricted_os" | "unrestricted-os" | "unrestricted" => {
+            Ok(PathAccessMode::UnrestrictedOs)
+        }
+        "approved_roots" | "approved-roots" | "host_access" | "host-access" => {
+            Ok(PathAccessMode::ApprovedRoots)
+        }
+        "workspace_only" | "workspace-only" | "workspace" => Ok(PathAccessMode::WorkspaceOnly),
+        _ => anyhow::bail!(
+            "{source_name} must be one of: unrestricted_os, approved_roots, workspace_only"
+        ),
+    }
+}
+
+fn legacy_process_runner_path_access_mode(
+    config: &ProcessRunnerConfig,
+    deployment_mode: DeploymentMode,
+) -> PathAccessMode {
+    let host_wildcard = config.allowed_executables.iter().any(|allowed| allowed.trim() == "*");
+    if matches!(deployment_mode, DeploymentMode::LocalDesktop)
+        && matches!(config.tier, SandboxProcessRunnerTier::B)
+        && matches!(config.egress_enforcement_mode, EgressEnforcementMode::None)
+        && host_wildcard
+    {
+        return PathAccessMode::UnrestrictedOs;
+    }
+    if matches!(config.tier, SandboxProcessRunnerTier::B)
+        && matches!(config.egress_enforcement_mode, EgressEnforcementMode::None)
+        && host_wildcard
+    {
+        return PathAccessMode::ApprovedRoots;
+    }
+    PathAccessMode::WorkspaceOnly
+}
+
 fn parse_process_runner_egress_enforcement_mode(
     raw: &str,
     source_name: &str,
@@ -3810,18 +3859,19 @@ mod tests {
     };
 
     use super::{
-        apply_feature_rollout_env_override, load_config, parse_anthropic_base_url,
-        parse_anthropic_model, parse_broadcast_strategy, parse_browser_service_endpoint,
-        parse_canvas_host_public_base_url, parse_content_type_allowlist, parse_cron_timezone_mode,
-        parse_default_memory_ttl_ms, parse_direct_message_policy, parse_dns_suffix_allowlist,
-        parse_exact_vault_ref_allowlist, parse_host_allowlist, parse_http_header_allowlist,
-        parse_journal_db_path, parse_memory_retention_vacuum_schedule,
-        parse_model_provider_auth_provider_kind, parse_model_provider_registry_entry,
-        parse_model_provider_registry_model, parse_openai_base_url, parse_openai_embeddings_dims,
-        parse_optional_auth_profile_id, parse_optional_browser_state_dir,
-        parse_optional_openai_embeddings_model, parse_optional_sha256_digest_field,
-        parse_optional_vault_ref_field, parse_positive_u32, parse_positive_usize,
-        parse_process_executable_allowlist, parse_process_runner_egress_enforcement_mode,
+        apply_feature_rollout_env_override, legacy_process_runner_path_access_mode, load_config,
+        parse_anthropic_base_url, parse_anthropic_model, parse_broadcast_strategy,
+        parse_browser_service_endpoint, parse_canvas_host_public_base_url,
+        parse_content_type_allowlist, parse_cron_timezone_mode, parse_default_memory_ttl_ms,
+        parse_direct_message_policy, parse_dns_suffix_allowlist, parse_exact_vault_ref_allowlist,
+        parse_host_allowlist, parse_http_header_allowlist, parse_journal_db_path,
+        parse_memory_retention_vacuum_schedule, parse_model_provider_auth_provider_kind,
+        parse_model_provider_registry_entry, parse_model_provider_registry_model,
+        parse_openai_base_url, parse_openai_embeddings_dims, parse_optional_auth_profile_id,
+        parse_optional_browser_state_dir, parse_optional_openai_embeddings_model,
+        parse_optional_sha256_digest_field, parse_optional_vault_ref_field, parse_positive_u32,
+        parse_positive_usize, parse_process_executable_allowlist,
+        parse_process_runner_egress_enforcement_mode, parse_process_runner_path_access_mode,
         parse_process_runner_tier, parse_root_file_config, parse_storage_prefix_allowlist,
         parse_tool_allowlist, parse_vault_dir, parse_vault_ref_allowlist,
         validate_runtime_preview_config, AdminConfig, AuxiliaryExecutorConfig,
@@ -3829,14 +3879,14 @@ mod tests {
         DeliveryArbitrationConfig, DeploymentConfig, DeploymentMode, FlowOrchestrationConfig,
         GatewayBindProfile, GatewayConfig, GatewayTlsConfig, HttpFetchConfig, IdentityConfig,
         MemoryConfig, ModelProviderConfig, NetworkedWorkersConfig, OrchestratorConfig,
-        PruningPolicyMatrixConfig, ReplayCaptureConfig, RetrievalDualPathConfig,
-        SessionQueuePolicyConfig, StorageConfig, ToolCallConfig,
+        ProcessRunnerConfig, PruningPolicyMatrixConfig, ReplayCaptureConfig,
+        RetrievalDualPathConfig, SessionQueuePolicyConfig, StorageConfig, ToolCallConfig,
     };
     use crate::channel_router::{BroadcastStrategy, DirectMessagePolicy};
     use crate::model_provider::{
         ModelProviderAuthProviderKind, ModelProviderKind, ProviderMetadataSource, ProviderModelRole,
     };
-    use crate::sandbox_runner::{EgressEnforcementMode, SandboxProcessRunnerTier};
+    use crate::sandbox_runner::{EgressEnforcementMode, PathAccessMode, SandboxProcessRunnerTier};
     use palyra_common::{
         daemon_config_schema::{
             FileModelProviderRegistryEntry, FileModelProviderRegistryModel, RootFileConfig,
@@ -4507,6 +4557,11 @@ mod tests {
             SandboxProcessRunnerTier::B,
             "process runner tier must default to tier b until operator opts into tier c"
         );
+        assert_eq!(
+            config.process_runner.path_access_mode,
+            PathAccessMode::WorkspaceOnly,
+            "process runner paths must stay workspace-only until config or local defaults broaden them"
+        );
         assert!(
             config.process_runner.allowed_executables.is_empty(),
             "sandbox process runner executable allowlist must default empty"
@@ -4662,6 +4717,7 @@ mod tests {
             r#"
             [tool_call.process_runner]
             tier = "c"
+            path_access_mode = "approved_roots"
             "#,
         )
         .expect("process runner tier override should parse");
@@ -4669,6 +4725,7 @@ mod tests {
         let process_runner =
             tool_call.process_runner.expect("process_runner section should be present");
         assert_eq!(process_runner.tier.as_deref(), Some("c"));
+        assert_eq!(process_runner.path_access_mode.as_deref(), Some("approved_roots"));
     }
 
     #[test]
@@ -5647,6 +5704,61 @@ state_dir = "browserd-state"
     fn parse_process_runner_tier_rejects_unknown_values() {
         let result = parse_process_runner_tier("strict", "tool_call.process_runner.tier");
         assert!(result.is_err(), "unsupported process runner tier must fail parsing");
+    }
+
+    #[test]
+    fn parse_process_runner_path_access_mode_accepts_supported_values() {
+        assert_eq!(
+            parse_process_runner_path_access_mode(
+                "unrestricted_os",
+                "tool_call.process_runner.path_access_mode",
+            )
+            .expect("unrestricted mode should parse"),
+            PathAccessMode::UnrestrictedOs
+        );
+        assert_eq!(
+            parse_process_runner_path_access_mode(
+                "approved_roots",
+                "tool_call.process_runner.path_access_mode",
+            )
+            .expect("approved roots mode should parse"),
+            PathAccessMode::ApprovedRoots
+        );
+        assert_eq!(
+            parse_process_runner_path_access_mode(
+                "workspace_only",
+                "tool_call.process_runner.path_access_mode",
+            )
+            .expect("workspace-only mode should parse"),
+            PathAccessMode::WorkspaceOnly
+        );
+    }
+
+    #[test]
+    fn legacy_local_wildcard_process_runner_defaults_to_unrestricted_os_paths() {
+        let mut config = ProcessRunnerConfig::default();
+        config.enabled = true;
+        config.allowed_executables = vec!["*".to_owned()];
+        config.allow_interpreters = true;
+        config.egress_enforcement_mode = EgressEnforcementMode::None;
+
+        assert_eq!(
+            legacy_process_runner_path_access_mode(&config, DeploymentMode::LocalDesktop),
+            PathAccessMode::UnrestrictedOs
+        );
+        assert_eq!(
+            legacy_process_runner_path_access_mode(&config, DeploymentMode::RemoteVps),
+            PathAccessMode::ApprovedRoots
+        );
+    }
+
+    #[test]
+    fn parse_process_runner_path_access_mode_rejects_unknown_values() {
+        let result = parse_process_runner_path_access_mode(
+            "everything",
+            "tool_call.process_runner.path_access_mode",
+        );
+        assert!(result.is_err(), "unsupported path access mode must fail parsing");
     }
 
     #[test]

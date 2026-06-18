@@ -37,8 +37,9 @@ use ulid::Ulid;
 
 use crate::sandbox_runner::{
     background_process_status_by_pid, process_runner_executor_name,
-    run_constrained_process_with_cancellation, stop_background_process_by_pid,
-    EgressEnforcementMode, SandboxProcessRunErrorKind, SandboxProcessRunnerPolicy,
+    process_runner_sandbox_enforcement_label, run_constrained_process_with_cancellation,
+    stop_background_process_by_pid, EgressEnforcementMode, SandboxProcessRunErrorKind,
+    SandboxProcessRunnerPolicy,
 };
 use crate::wasm_plugin_runner::{run_wasm_plugin, WasmPluginRunErrorKind, WasmPluginRunnerPolicy};
 
@@ -125,6 +126,7 @@ pub struct ProcessRunnerPolicySnapshot {
     pub enabled: bool,
     pub tier: String,
     pub workspace_root: String,
+    pub path_access_mode: String,
     pub allowed_executables: Vec<String>,
     pub allow_interpreters: bool,
     pub egress_enforcement_mode: String,
@@ -193,6 +195,7 @@ pub fn tool_policy_snapshot(config: &ToolCallConfig) -> ToolCallPolicySnapshot {
             enabled: config.process_runner.enabled,
             tier: config.process_runner.tier.as_str().to_owned(),
             workspace_root: config.process_runner.workspace_root.to_string_lossy().into_owned(),
+            path_access_mode: config.process_runner.path_access_mode.as_str().to_owned(),
             allowed_executables: config.process_runner.allowed_executables.clone(),
             allow_interpreters: config.process_runner.allow_interpreters,
             egress_enforcement_mode: config
@@ -1055,8 +1058,8 @@ fn tool_input_limit_bytes(tool_name: &str) -> usize {
 }
 
 // Sandbox-enforcement labels recorded in attestations; pinned by tests. For
-// process tools the label reflects the live policy: "host_access" when the
-// runner is allowed to escape the workspace, else the egress mode.
+// process tools the label reflects the live path posture when the runner may
+// leave workspace-only scoping, otherwise the egress mode.
 fn sandbox_enforcement_for_tool(config: &ToolCallConfig, tool_name: &str) -> String {
     if matches!(
         tool_name,
@@ -1065,11 +1068,7 @@ fn sandbox_enforcement_for_tool(config: &ToolCallConfig, tool_name: &str) -> Str
             | "palyra.process.status"
             | "palyra.process.list"
     ) {
-        if crate::sandbox_runner::process_runner_allows_host_access(&config.process_runner) {
-            "host_access".to_owned()
-        } else {
-            config.process_runner.egress_enforcement_mode.as_str().to_owned()
-        }
+        process_runner_sandbox_enforcement_label(&config.process_runner)
     } else if tool_name == "palyra.tool_program.run" {
         "nested_tool_policy".to_owned()
     } else if matches!(
@@ -1130,11 +1129,7 @@ async fn execute_process_runner_tool(
             "sandbox process runner uses preflight egress validation only; OS-level network egress is not enforced"
         );
     }
-    let sandbox_enforcement = if crate::sandbox_runner::process_runner_allows_host_access(&policy) {
-        "host_access".to_owned()
-    } else {
-        policy.egress_enforcement_mode.as_str().to_owned()
-    };
+    let sandbox_enforcement = process_runner_sandbox_enforcement_label(&policy);
     let input = input_json.to_vec();
     let timeout = Duration::from_millis(config.execution_timeout_ms);
     // The runner blocks on the child process, so it runs off the async
@@ -1407,7 +1402,7 @@ mod tests {
         ToolRequestContext,
     };
     use crate::sandbox_runner::{
-        EgressEnforcementMode, SandboxProcessRunnerPolicy, SandboxProcessRunnerTier,
+        EgressEnforcementMode, PathAccessMode, SandboxProcessRunnerPolicy, SandboxProcessRunnerTier,
     };
     use crate::wasm_plugin_runner::WasmPluginRunnerPolicy;
 
@@ -1429,6 +1424,7 @@ mod tests {
             enabled: false,
             tier: SandboxProcessRunnerTier::B,
             workspace_root: std::env::current_dir().unwrap_or_else(|_| ".".into()),
+            path_access_mode: PathAccessMode::WorkspaceOnly,
             allowed_executables: Vec::new(),
             allow_interpreters: false,
             egress_enforcement_mode: EgressEnforcementMode::Strict,
@@ -2481,6 +2477,7 @@ mod tests {
                 enabled: true,
                 tier: SandboxProcessRunnerTier::C,
                 workspace_root: std::env::current_dir().unwrap_or_else(|_| ".".into()),
+                path_access_mode: PathAccessMode::WorkspaceOnly,
                 allowed_executables: vec!["uname".to_owned()],
                 allow_interpreters: false,
                 egress_enforcement_mode: EgressEnforcementMode::Strict,
@@ -2571,6 +2568,7 @@ mod tests {
                 enabled: true,
                 tier: SandboxProcessRunnerTier::B,
                 workspace_root: std::env::current_dir().expect("current_dir should resolve"),
+                path_access_mode: PathAccessMode::WorkspaceOnly,
                 allowed_executables: vec!["uname".to_owned()],
                 allow_interpreters: false,
                 egress_enforcement_mode: EgressEnforcementMode::Preflight,
@@ -2613,6 +2611,7 @@ mod tests {
                 enabled: true,
                 tier: SandboxProcessRunnerTier::B,
                 workspace_root: std::env::current_dir().expect("current_dir should resolve"),
+                path_access_mode: PathAccessMode::WorkspaceOnly,
                 allowed_executables: vec!["uname".to_owned()],
                 allow_interpreters: false,
                 egress_enforcement_mode: EgressEnforcementMode::Preflight,
@@ -2660,6 +2659,7 @@ mod tests {
                 enabled: true,
                 tier: SandboxProcessRunnerTier::B,
                 workspace_root: std::env::current_dir().expect("current_dir should resolve"),
+                path_access_mode: PathAccessMode::WorkspaceOnly,
                 allowed_executables: vec!["uname".to_owned()],
                 allow_interpreters: false,
                 egress_enforcement_mode: EgressEnforcementMode::Strict,
@@ -2701,6 +2701,7 @@ mod tests {
                 enabled: true,
                 tier: SandboxProcessRunnerTier::B,
                 workspace_root: std::env::current_dir().expect("current_dir should resolve"),
+                path_access_mode: PathAccessMode::WorkspaceOnly,
                 allowed_executables: vec!["cat".to_owned()],
                 allow_interpreters: false,
                 egress_enforcement_mode: EgressEnforcementMode::Strict,
@@ -2872,6 +2873,7 @@ mod tests {
         assert!(!snapshot.step_count_limit_active);
         assert_eq!(snapshot.execution_timeout_ms, 250);
         assert_eq!(snapshot.allowed_tools.len(), 2);
+        assert_eq!(snapshot.process_runner.path_access_mode, "workspace_only");
         assert!(!snapshot.wasm_runtime.enabled);
     }
 

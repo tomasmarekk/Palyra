@@ -1107,19 +1107,9 @@ fn execute_process_list_tool(
         crate::sandbox_runner::process_runner_executor_name(
             &runtime_state.config.tool_call.process_runner,
         ),
-        if crate::sandbox_runner::process_runner_allows_host_access(
+        crate::sandbox_runner::process_runner_sandbox_enforcement_label(
             &runtime_state.config.tool_call.process_runner,
-        ) {
-            "host_access".to_owned()
-        } else {
-            runtime_state
-                .config
-                .tool_call
-                .process_runner
-                .egress_enforcement_mode
-                .as_str()
-                .to_owned()
-        },
+        ),
     )
 }
 

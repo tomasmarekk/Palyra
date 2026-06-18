@@ -24,6 +24,7 @@ fn config(allowed_tools: &[&str]) -> ToolCallConfig {
             enabled: false,
             tier: SandboxProcessRunnerTier::B,
             workspace_root: ".".into(),
+            path_access_mode: crate::sandbox_runner::PathAccessMode::WorkspaceOnly,
             allowed_executables: Vec::new(),
             allow_interpreters: false,
             egress_enforcement_mode: EgressEnforcementMode::Strict,
