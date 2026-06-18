@@ -8064,6 +8064,14 @@ async fn grpc_resolve_session_reset_clears_cached_tool_approval() -> Result<()> 
         saw_first_failed_result,
         "first run should complete after approval with the unsupported-tool failure"
     );
+    drop(first_sender);
+    while let Some(event) =
+        tokio::time::timeout(Duration::from_secs(5), first_response_stream.next())
+            .await
+            .context("first approval reset stream did not finish after approval")?
+    {
+        let _event = event.context("failed to drain first approval reset stream")?;
+    }
 
     let mut reset_request = tonic::Request::new(gateway_v1::ResolveSessionRequest {
         v: 1,
