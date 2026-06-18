@@ -14,12 +14,104 @@ use palyra_cli::workflow_regression::{
 };
 use palyra_common::runtime_preview::RuntimeAcceptanceScenario;
 
+const TASK01_HARNESS_SUBSYSTEMS: &[&str] = &[
+    "harness_path_runtime",
+    "harness_tool_output_streaming",
+    "harness_resume_state",
+    "harness_background_handoff",
+    "harness_runtime_risk_posture",
+    "harness_workspace_recovery",
+    "harness_redaction_image_observation",
+];
+
+const TASK01_HARNESS_SCENARIOS: &[(&str, &str)] = &[
+    ("harness_unrestricted_path_runtime", "harness_path_runtime"),
+    ("harness_tool_output_bounds", "harness_tool_output_streaming"),
+    ("harness_process_progress_events", "harness_tool_output_streaming"),
+    ("harness_resume_checkpoint_state", "harness_resume_state"),
+    ("harness_background_handoff", "harness_background_handoff"),
+    ("harness_docker_risk_metadata", "harness_runtime_risk_posture"),
+    ("harness_package_risk_metadata", "harness_runtime_risk_posture"),
+    ("harness_workspace_root_stability", "harness_workspace_recovery"),
+    ("harness_public_fixture_redaction", "harness_redaction_image_observation"),
+    ("harness_image_observation", "harness_redaction_image_observation"),
+    ("harness_image_observe_no_approval", "harness_redaction_image_observation"),
+];
+
 #[test]
 fn workflow_regression_manifest_and_compat_checklist_remain_consistent() -> Result<()> {
     let (_, manifest, checklist) = load_regression_assets()?;
     assert_eq!(checklist.matrix_manifest, "infra/release/workflow-regression-matrix.json");
     assert!(manifest.profiles.contains_key("fast"));
     assert!(manifest.profiles.contains_key("full"));
+    Ok(())
+}
+
+#[test]
+fn task01_harness_regression_matrix_contract() -> Result<()> {
+    let (_, manifest, checklist) = load_regression_assets()?;
+
+    for profile_id in ["fast", "full"] {
+        let profile = manifest
+            .profiles
+            .get(profile_id)
+            .with_context(|| format!("workflow profile '{profile_id}' should exist"))?;
+        for subsystem_id in TASK01_HARNESS_SUBSYSTEMS {
+            assert!(
+                profile.required_subsystems.iter().any(|entry| entry == subsystem_id),
+                "profile '{profile_id}' should require Task 01 subsystem '{subsystem_id}'"
+            );
+        }
+    }
+
+    for (scenario_id, subsystem_id) in TASK01_HARNESS_SCENARIOS {
+        let scenario =
+            manifest.scenarios.iter().find(|entry| entry.id == *scenario_id).with_context(
+                || format!("workflow regression manifest should contain '{scenario_id}'"),
+            )?;
+        assert_eq!(scenario.category, "harness");
+        assert_eq!(scenario.profiles, vec!["fast".to_owned(), "full".to_owned()]);
+        assert_eq!(scenario.subsystems, vec![(*subsystem_id).to_owned()]);
+        assert!(!scenario.chaos);
+        assert!(
+            scenario.acceptance_scenarios.is_empty(),
+            "Task 01 harness scenarios should not claim runtime-preview acceptance ids"
+        );
+        assert_exact_unit_test_command_is_fully_qualified(scenario);
+    }
+
+    for evidence_id in ["workflow_regression_fast", "workflow_regression_full"] {
+        let evidence =
+            checklist.evidence.iter().find(|entry| entry.id == evidence_id).with_context(|| {
+                format!("readiness checklist should contain evidence '{evidence_id}'")
+            })?;
+        for subsystem_id in TASK01_HARNESS_SUBSYSTEMS {
+            assert!(
+                evidence.required_subsystems.iter().any(|entry| entry == subsystem_id),
+                "evidence '{evidence_id}' should require Task 01 subsystem '{subsystem_id}'"
+            );
+        }
+        for (scenario_id, _) in TASK01_HARNESS_SCENARIOS {
+            assert!(
+                evidence.must_pass_scenarios.iter().any(|entry| entry == scenario_id),
+                "evidence '{evidence_id}' should require scenario '{scenario_id}'"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn exact_unit_test_commands_use_fully_qualified_names() -> Result<()> {
+    let (_, manifest, _) = load_regression_assets()?;
+
+    for scenario in &manifest.scenarios {
+        if is_exact_unit_test_command(&scenario.command) {
+            assert_exact_unit_test_command_is_fully_qualified(scenario);
+        }
+    }
+
     Ok(())
 }
 
@@ -196,4 +288,29 @@ fn contract_command(test_name: &str) -> Vec<String> {
     .into_iter()
     .map(str::to_owned)
     .collect()
+}
+
+fn is_exact_unit_test_command(command: &[String]) -> bool {
+    command.iter().any(|entry| entry == "--lib") && command.iter().any(|entry| entry == "--exact")
+}
+
+fn assert_exact_unit_test_command_is_fully_qualified(scenario: &WorkflowRegressionScenario) {
+    let filter = exact_cargo_test_filter(scenario.command.as_slice())
+        .unwrap_or_else(|| panic!("scenario '{}' should declare a cargo test filter", scenario.id));
+    assert!(
+        filter.starts_with("tests::") || filter.contains("::tests::"),
+        "scenario '{}' exact unit-test filter must be fully qualified, got '{filter}'",
+        scenario.id
+    );
+}
+
+fn exact_cargo_test_filter(command: &[String]) -> Option<&str> {
+    let test_separator = command.iter().position(|entry| entry == "--").unwrap_or(command.len());
+    command
+        .iter()
+        .take(test_separator)
+        .rev()
+        .find(|entry| !entry.starts_with('-'))
+        .map(String::as_str)
+        .filter(|entry| *entry != "test" && *entry != "cargo")
 }

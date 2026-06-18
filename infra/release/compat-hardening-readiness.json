@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "release_scope": "runtime_preview_acceptance_harness",
-  "updated_at": "2026-04-28",
+  "updated_at": "2026-06-18",
   "matrix_manifest": "infra/release/workflow-regression-matrix.json",
   "rollout_controls": [
     {
@@ -87,7 +87,14 @@
         "auxiliary_executor",
         "flow_orchestration",
         "delivery_arbitration",
-        "networked_workers"
+        "networked_workers",
+        "harness_path_runtime",
+        "harness_tool_output_streaming",
+        "harness_resume_state",
+        "harness_background_handoff",
+        "harness_runtime_risk_posture",
+        "harness_workspace_recovery",
+        "harness_redaction_image_observation"
       ],
       "must_pass_scenarios": [
         "queued_input_lifecycle_contract",
@@ -98,7 +105,18 @@
         "flow_transitions_contract",
         "routine_automation_smoke_contract",
         "delivery_arbitration_contract",
-        "networked_worker_preview_contract"
+        "networked_worker_preview_contract",
+        "harness_unrestricted_path_runtime",
+        "harness_tool_output_bounds",
+        "harness_process_progress_events",
+        "harness_resume_checkpoint_state",
+        "harness_background_handoff",
+        "harness_docker_risk_metadata",
+        "harness_package_risk_metadata",
+        "harness_workspace_root_stability",
+        "harness_public_fixture_redaction",
+        "harness_image_observation",
+        "harness_image_observe_no_approval"
       ]
     },
     {
@@ -115,7 +133,14 @@
         "auxiliary_executor",
         "flow_orchestration",
         "delivery_arbitration",
-        "networked_workers"
+        "networked_workers",
+        "harness_path_runtime",
+        "harness_tool_output_streaming",
+        "harness_resume_state",
+        "harness_background_handoff",
+        "harness_runtime_risk_posture",
+        "harness_workspace_recovery",
+        "harness_redaction_image_observation"
       ],
       "must_pass_scenarios": [
         "queued_input_lifecycle_contract",
@@ -134,7 +159,18 @@
         "delivery_arbitration_runtime_override",
         "networked_worker_inventory_runtime_preview",
         "networked_worker_degraded_runtime_preview",
-        "networked_worker_lifecycle_runtime_preview"
+        "networked_worker_lifecycle_runtime_preview",
+        "harness_unrestricted_path_runtime",
+        "harness_tool_output_bounds",
+        "harness_process_progress_events",
+        "harness_resume_checkpoint_state",
+        "harness_background_handoff",
+        "harness_docker_risk_metadata",
+        "harness_package_risk_metadata",
+        "harness_workspace_root_stability",
+        "harness_public_fixture_redaction",
+        "harness_image_observation",
+        "harness_image_observe_no_approval"
       ]
     },
     {

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "release_scope": "runtime_preview_acceptance_harness",
-  "updated_at": "2026-04-28",
+  "updated_at": "2026-06-18",
   "profiles": {
     "fast": {
       "description": "Per-push runtime preview acceptance baseline that keeps every canonical acceptance scenario wired through deterministic contract checks.",
@@ -13,7 +13,14 @@
         "auxiliary_executor",
         "flow_orchestration",
         "delivery_arbitration",
-        "networked_workers"
+        "networked_workers",
+        "harness_path_runtime",
+        "harness_tool_output_streaming",
+        "harness_resume_state",
+        "harness_background_handoff",
+        "harness_runtime_risk_posture",
+        "harness_workspace_recovery",
+        "harness_redaction_image_observation"
       ],
       "minimum_chaos_scenarios": 0
     },
@@ -27,7 +34,14 @@
         "auxiliary_executor",
         "flow_orchestration",
         "delivery_arbitration",
-        "networked_workers"
+        "networked_workers",
+        "harness_path_runtime",
+        "harness_tool_output_streaming",
+        "harness_resume_state",
+        "harness_background_handoff",
+        "harness_runtime_risk_posture",
+        "harness_workspace_recovery",
+        "harness_redaction_image_observation"
       ],
       "minimum_chaos_scenarios": 2
     }
@@ -64,6 +78,34 @@
     {
       "id": "networked_workers",
       "summary": "Networked worker preview inventory, lifecycle, and degrade posture stay fail-closed."
+    },
+    {
+      "id": "harness_path_runtime",
+      "summary": "Local agent process and OS file tools keep unrestricted OS access, container/runtime path arguments, and strict-mode fallbacks regression-tested."
+    },
+    {
+      "id": "harness_tool_output_streaming",
+      "summary": "Tool output bounds, foreground progress events, binary handling, and Windows text decoding remain model-safe and diagnosable."
+    },
+    {
+      "id": "harness_resume_state",
+      "summary": "Auto-resume checkpoints preserve produced/missing artifacts, failed attempts, and background process state across runtime interruptions."
+    },
+    {
+      "id": "harness_background_handoff",
+      "summary": "Background process launchers, run-owned cleanup, and durable detached service handoff stay explicit."
+    },
+    {
+      "id": "harness_runtime_risk_posture",
+      "summary": "Process risk metadata surfaces Docker, package-manager, credential, and target-runtime mismatch side effects without blocking out-of-box execution."
+    },
+    {
+      "id": "harness_workspace_recovery",
+      "summary": "Malformed patch recovery and workspace-root selection keep file tools anchored to explicit agent roots."
+    },
+    {
+      "id": "harness_redaction_image_observation",
+      "summary": "Public fixture redaction and image observation avoid false secret positives, large base64 payloads, and OCR workaround loops."
     }
   ],
   "runtime_acceptance_fixtures": [
@@ -487,6 +529,292 @@
       ]
     },
     {
+      "id": "harness_unrestricted_path_runtime",
+      "label": "Unrestricted local path runtime remains available out of the box",
+      "category": "harness",
+      "profiles": [
+        "fast",
+        "full"
+      ],
+      "subsystems": [
+        "harness_path_runtime"
+      ],
+      "chaos": false,
+      "acceptance_scenarios": [],
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "palyra-daemon",
+        "--lib",
+        "--locked",
+        "sandbox_runner::tests::process_run_unrestricted_does_not_validate_container_args",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "id": "harness_tool_output_bounds",
+      "label": "Tool output bounds keep large stdout model-visible payloads compact",
+      "category": "harness",
+      "profiles": [
+        "fast",
+        "full"
+      ],
+      "subsystems": [
+        "harness_tool_output_streaming"
+      ],
+      "chaos": false,
+      "acceptance_scenarios": [],
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "palyra-daemon",
+        "--lib",
+        "--locked",
+        "sandbox_runner::tests::process_success_output_summarizes_large_stdout",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "id": "harness_process_progress_events",
+      "label": "Foreground process progress events stay structured before completion",
+      "category": "harness",
+      "profiles": [
+        "fast",
+        "full"
+      ],
+      "subsystems": [
+        "harness_tool_output_streaming"
+      ],
+      "chaos": false,
+      "acceptance_scenarios": [],
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "palyra-daemon",
+        "--lib",
+        "--locked",
+        "application::run_stream::tool_flow::tests::process_progress_status_message_is_structured_json",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "id": "harness_resume_checkpoint_state",
+      "label": "Auto-resume checkpoints retain background process state",
+      "category": "harness",
+      "profiles": [
+        "fast",
+        "full"
+      ],
+      "subsystems": [
+        "harness_resume_state"
+      ],
+      "chaos": false,
+      "acceptance_scenarios": [],
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "palyra-daemon",
+        "--lib",
+        "--locked",
+        "application::run_stream::agent_loop::tests::progress_checkpoint_reports_background_process_state_after_wall_clock",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "id": "harness_background_handoff",
+      "label": "Detached background service handoff remains explicit and durable",
+      "category": "harness",
+      "profiles": [
+        "fast",
+        "full"
+      ],
+      "subsystems": [
+        "harness_background_handoff"
+      ],
+      "chaos": false,
+      "acceptance_scenarios": [],
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "palyra-daemon",
+        "--lib",
+        "--locked",
+        "sandbox_runner::tests::run_constrained_process_returns_detached_background_handoff",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "id": "harness_docker_risk_metadata",
+      "label": "Docker global mutations and host port publishing stay classified",
+      "category": "harness",
+      "profiles": [
+        "fast",
+        "full"
+      ],
+      "subsystems": [
+        "harness_runtime_risk_posture"
+      ],
+      "chaos": false,
+      "acceptance_scenarios": [],
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "palyra-common",
+        "--lib",
+        "--locked",
+        "process_risk::tests::docker_global_mutation_and_port_publish_are_separate_findings",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "id": "harness_package_risk_metadata",
+      "label": "Host package-manager mutations remain advisory and visible",
+      "category": "harness",
+      "profiles": [
+        "fast",
+        "full"
+      ],
+      "subsystems": [
+        "harness_runtime_risk_posture"
+      ],
+      "chaos": false,
+      "acceptance_scenarios": [],
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "palyra-common",
+        "--lib",
+        "--locked",
+        "process_risk::tests::pip_install_without_workspace_venv_is_host_mutation",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "id": "harness_workspace_root_stability",
+      "label": "Process cwd does not retarget follow-up workspace file tools",
+      "category": "harness",
+      "profiles": [
+        "fast",
+        "full"
+      ],
+      "subsystems": [
+        "harness_workspace_recovery"
+      ],
+      "chaos": false,
+      "acceptance_scenarios": [],
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "palyra-daemon",
+        "--lib",
+        "--locked",
+        "gateway::tests::process_runner_cwd_does_not_persist_focus_for_followup_workspace_tools",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "id": "harness_public_fixture_redaction",
+      "label": "Public benchmark password fixtures are not treated as user secrets",
+      "category": "harness",
+      "profiles": [
+        "fast",
+        "full"
+      ],
+      "subsystems": [
+        "harness_redaction_image_observation"
+      ],
+      "chaos": false,
+      "acceptance_scenarios": [],
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "palyra-safety",
+        "--lib",
+        "--locked",
+        "tests::public_benchmark_password_fixture_values_are_not_redacted",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "id": "harness_image_observation",
+      "label": "Image observation returns bounded metadata without model-visible base64",
+      "category": "harness",
+      "profiles": [
+        "fast",
+        "full"
+      ],
+      "subsystems": [
+        "harness_redaction_image_observation"
+      ],
+      "chaos": false,
+      "acceptance_scenarios": [],
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "palyra-daemon",
+        "--lib",
+        "--locked",
+        "application::tool_runtime::image_observe::tests::image_observe_reads_png_metadata_without_base64_payload",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "id": "harness_image_observe_no_approval",
+      "label": "Image observe remains read-only and available without user approval",
+      "category": "harness",
+      "profiles": [
+        "fast",
+        "full"
+      ],
+      "subsystems": [
+        "harness_redaction_image_observation"
+      ],
+      "chaos": false,
+      "acceptance_scenarios": [],
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "palyra-common",
+        "--lib",
+        "--locked",
+        "tool_catalog::tests::image_observe_is_read_only_without_approval",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
       "id": "pruning_decision_runtime_preview",
       "label": "Session compaction preview keeps pruning signals stable",
       "category": "runtime",
@@ -563,7 +891,7 @@
         "palyra-daemon",
         "--lib",
         "--locked",
-        "external_runtime_indexer_checkpoint_opens_ready_external_path",
+        "retrieval::external_index::tests::external_runtime_indexer_checkpoint_opens_ready_external_path",
         "--",
         "--exact"
       ]
@@ -589,7 +917,7 @@
         "palyra-daemon",
         "--lib",
         "--locked",
-        "routines_tool_flow_supports_upsert_listing_pause_resume_and_schedule_preview",
+        "gateway::tests::routines_tool_flow_supports_upsert_listing_pause_resume_and_schedule_preview",
         "--",
         "--exact"
       ]
@@ -615,7 +943,7 @@
         "palyra-daemon",
         "--lib",
         "--locked",
-        "routines_tool_test_run_and_replay_force_fresh_sessions_and_audit_only_delivery",
+        "gateway::tests::routines_tool_test_run_and_replay_force_fresh_sessions_and_audit_only_delivery",
         "--",
         "--exact"
       ]
@@ -641,7 +969,7 @@
         "palyra-daemon",
         "--lib",
         "--locked",
-        "networked_worker_inventory_is_available_only_with_attested_workers",
+        "execution_backends::tests::networked_worker_inventory_is_available_only_with_attested_workers",
         "--",
         "--exact"
       ]
@@ -667,7 +995,7 @@
         "palyra-daemon",
         "--lib",
         "--locked",
-        "preview_backend_inventory_is_degraded_without_healthy_nodes",
+        "execution_backends::tests::preview_backend_inventory_is_degraded_without_healthy_nodes",
         "--",
         "--exact"
       ]
@@ -693,7 +1021,7 @@
         "palyra-daemon",
         "--lib",
         "--locked",
-        "networked_worker_lifecycle_events_are_journaled",
+        "gateway::tests::networked_worker_lifecycle_events_are_journaled",
         "--",
         "--exact"
       ]
