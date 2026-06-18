@@ -5736,11 +5736,13 @@ state_dir = "browserd-state"
 
     #[test]
     fn legacy_local_wildcard_process_runner_defaults_to_unrestricted_os_paths() {
-        let mut config = ProcessRunnerConfig::default();
-        config.enabled = true;
-        config.allowed_executables = vec!["*".to_owned()];
-        config.allow_interpreters = true;
-        config.egress_enforcement_mode = EgressEnforcementMode::None;
+        let config = ProcessRunnerConfig {
+            enabled: true,
+            allowed_executables: vec!["*".to_owned()],
+            allow_interpreters: true,
+            egress_enforcement_mode: EgressEnforcementMode::None,
+            ..ProcessRunnerConfig::default()
+        };
 
         assert_eq!(
             legacy_process_runner_path_access_mode(&config, DeploymentMode::LocalDesktop),
