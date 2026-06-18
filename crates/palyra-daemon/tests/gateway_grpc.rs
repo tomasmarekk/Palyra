@@ -10318,6 +10318,8 @@ async fn grpc_run_stream_persists_orchestrator_snapshot_and_matches_golden_tape(
         [
             "progress:agent_loop.started",
             "progress:agent_loop.turn_started",
+            "progress:agent_loop.provider_request_preparing",
+            "progress:agent_loop.provider_request_ready",
             "progress:agent_loop.terminated",
         ],
         "RunStream should expose harness-owned progress events independently of model text"
@@ -10350,7 +10352,7 @@ async fn grpc_run_stream_persists_orchestrator_snapshot_and_matches_golden_tape(
             .get("tape_events")
             .and_then(Value::as_u64)
             .context("run snapshot missing tape_events")?,
-        expected_tape.as_array().context("golden tape must be a JSON array")?.len() as u64 + 4
+        expected_tape.as_array().context("golden tape must be a JSON array")?.len() as u64 + 6
     );
     assert!(
         run_snapshot.get("tape").is_none(),
@@ -10399,8 +10401,8 @@ async fn grpc_run_stream_persists_orchestrator_snapshot_and_matches_golden_tape(
         .collect::<Vec<_>>();
     assert_eq!(
         agent_loop_events.len(),
-        3,
-        "basic run should record start, turn start, and termination loop events"
+        5,
+        "basic run should record start, turn start, pre-provider, and termination loop events"
     );
     let termination_payload = agent_loop_events
         .iter()
