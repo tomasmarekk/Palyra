@@ -818,6 +818,14 @@ pub const TOOL_CATALOG: &[ToolCatalogEntry] = &[
         recommend_always_allow: false,
     },
     ToolCatalogEntry {
+        tool_name: "palyra.image.observe",
+        title: "Image observe",
+        description: "Returns image metadata or a structured OCR/vision capability error.",
+        category: "artifacts",
+        risk_level: ApprovalRiskLevel::Low,
+        recommend_always_allow: true,
+    },
+    ToolCatalogEntry {
         tool_name: "palyra.process.run",
         title: "Process runner",
         description: "Executes allowlisted local commands inside the configured sandbox tier.",

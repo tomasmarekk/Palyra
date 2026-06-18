@@ -57,7 +57,9 @@ use palyra_common::{
     },
     redaction::{redact_auth_error, redact_url_segments_in_text, REDACTED},
 };
-use palyra_safety::{redact_text_for_export, SafetyContentKind, SafetySourceKind, TrustLabel};
+use palyra_safety::{
+    redact_text_for_export, SafetyContentKind, SafetyFindingCategory, SafetySourceKind, TrustLabel,
+};
 use palyra_sandbox::{
     build_tier_c_command_plan, current_backend_capabilities, current_backend_executor,
     current_backend_kind, TierCBackendError, TierCCommandRequest, TierCPolicy,
@@ -1072,6 +1074,7 @@ fn redacted_process_output_single_line(output: &[u8]) -> Option<String> {
 struct RedactedProcessOutputText {
     text: String,
     redacted: bool,
+    redaction_reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1152,7 +1155,7 @@ fn process_stream_output_view(
     }
 
     let decoded = decode_process_output_text(stream.bytes.as_slice());
-    let RedactedProcessOutputText { text, redacted } =
+    let RedactedProcessOutputText { text, redacted, redaction_reasons } =
         redacted_process_output_text(decoded.text.as_str());
     let inline_truncated = text.len() > PROCESS_STREAM_INLINE_TEXT_BYTES;
     let model_text = if inline_truncated {
@@ -1183,6 +1186,7 @@ fn process_stream_output_view(
             "head": process_text_prefix(text.as_str(), PROCESS_STREAM_HEAD_BYTES),
             "tail": process_text_suffix(text.as_str(), PROCESS_STREAM_TAIL_BYTES),
             "redacted": redacted,
+            "redaction_reasons": redaction_reasons,
         }),
     }
 }
@@ -1210,7 +1214,7 @@ fn process_stream_diagnostic_summary(stream_name: &str, stream: &StreamCapture) 
     }
 
     let decoded = decode_process_output_text(stream.bytes.as_slice());
-    let RedactedProcessOutputText { text, redacted } =
+    let RedactedProcessOutputText { text, redacted, redaction_reasons } =
         redacted_process_output_text(decoded.text.as_str());
     json!({
         "size_bytes": size_bytes,
@@ -1221,6 +1225,7 @@ fn process_stream_diagnostic_summary(stream_name: &str, stream: &StreamCapture) 
         "sha256": sha256,
         "tail": process_text_suffix(text.as_str(), PROCESS_STREAM_TAIL_BYTES),
         "redacted": redacted,
+        "redaction_reasons": redaction_reasons,
         "stream": stream_name,
     })
 }
@@ -1240,6 +1245,13 @@ fn redacted_process_output_text(value: &str) -> RedactedProcessOutputText {
         SafetyContentKind::PlainText,
         TrustLabel::TrustedLocal,
     );
+    let redaction_reasons = process_redaction_reason_codes(
+        value,
+        redacted_urls.as_str(),
+        redacted_auth.as_str(),
+        redacted_paths.as_str(),
+        &export_redaction,
+    );
     let redacted_text =
         restore_process_output_trailing_line_endings(value, export_redaction.redacted_text);
     let redacted = redacted_urls != value
@@ -1247,7 +1259,40 @@ fn redacted_process_output_text(value: &str) -> RedactedProcessOutputText {
         || redacted_paths != redacted_auth
         || redacted_text != value;
 
-    RedactedProcessOutputText { text: redacted_text, redacted }
+    RedactedProcessOutputText { text: redacted_text, redacted, redaction_reasons }
+}
+
+fn process_redaction_reason_codes(
+    original: &str,
+    url_redacted: &str,
+    auth_redacted: &str,
+    path_redacted: &str,
+    export_redaction: &palyra_safety::ExportRedactionOutcome,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if url_redacted != original {
+        reasons.push("url_sensitive_segment".to_owned());
+    }
+    if auth_redacted != url_redacted {
+        reasons.push("auth_or_assignment_secret".to_owned());
+    }
+    if path_redacted != auth_redacted {
+        reasons.push("sensitive_url_path_segment".to_owned());
+    }
+    reasons.extend(
+        export_redaction
+            .scan
+            .findings
+            .iter()
+            .filter(|finding| finding.category == SafetyFindingCategory::SecretLeak)
+            .map(|finding| finding.code.clone()),
+    );
+    if reasons.is_empty() && export_redaction.redacted {
+        reasons.push("safety_export_redaction".to_owned());
+    }
+    reasons.sort();
+    reasons.dedup();
+    reasons
 }
 
 // Export redaction may normalize away the trailing newline run; consumers assert on exact
@@ -4703,10 +4748,16 @@ fn spawn_background_process(
     // when the remaining lifetime expires, so no background process can outlive its budget.
     thread::spawn(move || monitor_background_child_until_lifetime(child, remaining_lifetime));
 
-    let RedactedProcessOutputText { text: stdout_text, redacted: stdout_redacted } =
-        redacted_process_output(stdout.bytes.as_slice());
-    let RedactedProcessOutputText { text: stderr_text, redacted: stderr_redacted } =
-        redacted_process_output(stderr.bytes.as_slice());
+    let RedactedProcessOutputText {
+        text: stdout_text,
+        redacted: stdout_redacted,
+        redaction_reasons: stdout_redaction_reasons,
+    } = redacted_process_output(stdout.bytes.as_slice());
+    let RedactedProcessOutputText {
+        text: stderr_text,
+        redacted: stderr_redacted,
+        redaction_reasons: stderr_redaction_reasons,
+    } = redacted_process_output(stderr.bytes.as_slice());
     let max_lifetime_ms = max_lifetime.as_millis() as u64;
     let requested_lifetime_ms = input.timeout_ms;
     let durable_handoff = lifetime_mode.is_detached_handoff();
@@ -4738,6 +4789,8 @@ fn spawn_background_process(
         "stderr_truncated": stderr.truncated,
         "stdout_redacted": stdout_redacted,
         "stderr_redacted": stderr_redacted,
+        "stdout_redaction_reasons": stdout_redaction_reasons,
+        "stderr_redaction_reasons": stderr_redaction_reasons,
         "background_output_note": "stdout/stderr are bounded startup snapshots captured during the startup check, not command completion output; use an explicit fixed port if a dynamic port is not printed here",
         "duration_ms": 0,
         "background": true,
@@ -4987,10 +5040,16 @@ fn background_launcher_completed_successfully(
         lifetime_mode,
         process_risk,
     } = context;
-    let RedactedProcessOutputText { text: stdout_text, redacted: stdout_redacted } =
-        redacted_process_output(stdout.bytes.as_slice());
-    let RedactedProcessOutputText { text: stderr_text, redacted: stderr_redacted } =
-        redacted_process_output(stderr.bytes.as_slice());
+    let RedactedProcessOutputText {
+        text: stdout_text,
+        redacted: stdout_redacted,
+        redaction_reasons: stdout_redaction_reasons,
+    } = redacted_process_output(stdout.bytes.as_slice());
+    let RedactedProcessOutputText {
+        text: stderr_text,
+        redacted: stderr_redacted,
+        redaction_reasons: stderr_redaction_reasons,
+    } = redacted_process_output(stderr.bytes.as_slice());
     let auto_backgrounded = auto_background_reason.is_some();
     let output_json = serde_json::to_vec(&json!({
         "exit_code": status.code(),
@@ -5002,6 +5061,8 @@ fn background_launcher_completed_successfully(
         "stderr_truncated": stderr.truncated,
         "stdout_redacted": stdout_redacted,
         "stderr_redacted": stderr_redacted,
+        "stdout_redaction_reasons": stdout_redaction_reasons,
+        "stderr_redaction_reasons": stderr_redaction_reasons,
         "background_output_note": "stdout/stderr are bounded startup snapshots captured before the direct launcher exited successfully; verify any external service separately",
         "duration_ms": duration.as_millis() as u64,
         "background": true,
@@ -9371,6 +9432,10 @@ mod tests {
         assert!(redacted.text.contains("public_setting=true"), "{}", redacted.text);
         assert!(!redacted.text.contains("sk-test-secret-value"), "{}", redacted.text);
         assert!(redacted.text.contains("REDACTED"), "{}", redacted.text);
+        assert!(
+            redacted.redaction_reasons.iter().any(|reason| reason == "auth_or_assignment_secret"),
+            "{redacted:?}"
+        );
     }
 
     #[test]
@@ -9409,6 +9474,17 @@ mod tests {
         assert!(stdout.contains("REDACTED"), "{stdout}");
         assert_eq!(output.get("stdout_redacted").and_then(serde_json::Value::as_bool), Some(true));
         assert_eq!(output.get("stderr_redacted").and_then(serde_json::Value::as_bool), Some(false));
+        assert!(
+            output
+                .pointer("/streams/stdout/redaction_reasons")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|reasons| {
+                    reasons
+                        .iter()
+                        .any(|reason| reason.as_str() == Some("auth_or_assignment_secret"))
+                }),
+            "{output}"
+        );
 
         let _ = fs::remove_dir_all(workspace.as_path());
     }

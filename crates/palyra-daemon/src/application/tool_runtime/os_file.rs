@@ -291,11 +291,12 @@ fn read_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String
     // text plus `text_authoritative=false` and a notice, instead of a hard
     // failure that would dead-end the task. `chunk_sha256` above is computed
     // over the raw bytes, so it will not match the redacted text.
-    let (text, bytes_base64, redacted) = visible_file_content(buffer);
+    let (text, bytes_base64, redacted, redaction_reasons) = visible_file_content(buffer);
     let text_authoritative = text.as_ref().map(|_| !redacted);
     let redaction_notice = redacted.then(|| {
         "text contains redacted secret placeholders; use it for structure only and do not write the redacted text back verbatim".to_owned()
     });
+    let redaction_reasons = redacted.then_some(redaction_reasons);
     Ok(json!({
         "operation": "read",
         "path": display_path(path.requested_path.as_path()),
@@ -308,6 +309,7 @@ fn read_path(policy: &OsFilePolicy, input: &OsFileInput) -> Result<Value, String
         "text": text,
         "text_authoritative": text_authoritative,
         "redaction_notice": redaction_notice,
+        "redaction_reasons": redaction_reasons,
         "bytes_base64": bytes_base64,
         "redacted": redacted,
         "dry_run": false,
@@ -947,7 +949,7 @@ fn input_write_bytes(input: &OsFileInput) -> Result<Vec<u8>, String> {
 /// flags a leak, the redacted text replaces the raw text (model-visible, but
 /// marked non-authoritative by the caller). Non-UTF-8 content is returned
 /// base64-encoded instead.
-fn visible_file_content(buffer: Vec<u8>) -> (Option<String>, Option<String>, bool) {
+fn visible_file_content(buffer: Vec<u8>) -> (Option<String>, Option<String>, bool, Vec<String>) {
     match String::from_utf8(buffer) {
         Ok(text) => {
             let redaction = redact_text_for_export(
@@ -958,14 +960,22 @@ fn visible_file_content(buffer: Vec<u8>) -> (Option<String>, Option<String>, boo
             );
             let redacted = redaction.redacted
                 || redaction.scan.has_category(SafetyFindingCategory::SecretLeak);
+            let redaction_reasons = secret_redaction_reason_codes(&redaction);
             let visible_text = if redacted { redaction.redacted_text } else { text };
-            (Some(visible_text), None, redacted)
+            (
+                Some(visible_text),
+                None,
+                redacted,
+                if redacted { redaction_reasons } else { Vec::new() },
+            )
         }
         Err(error) => visible_non_utf8_file_content(error.into_bytes()),
     }
 }
 
-fn visible_non_utf8_file_content(bytes: Vec<u8>) -> (Option<String>, Option<String>, bool) {
+fn visible_non_utf8_file_content(
+    bytes: Vec<u8>,
+) -> (Option<String>, Option<String>, bool, Vec<String>) {
     let lossy_text = String::from_utf8_lossy(bytes.as_slice());
     let redaction = redact_text_for_export(
         lossy_text.as_ref(),
@@ -976,9 +986,23 @@ fn visible_non_utf8_file_content(bytes: Vec<u8>) -> (Option<String>, Option<Stri
     let redacted =
         redaction.redacted || redaction.scan.has_category(SafetyFindingCategory::SecretLeak);
     if redacted {
-        return (Some(redaction.redacted_text), None, true);
+        let redaction_reasons = secret_redaction_reason_codes(&redaction);
+        return (Some(redaction.redacted_text), None, true, redaction_reasons);
     }
-    (None, Some(BASE64_STANDARD.encode(bytes)), false)
+    (None, Some(BASE64_STANDARD.encode(bytes)), false, Vec::new())
+}
+
+fn secret_redaction_reason_codes(redaction: &palyra_safety::ExportRedactionOutcome) -> Vec<String> {
+    let mut reasons = redaction
+        .scan
+        .findings
+        .iter()
+        .filter(|finding| finding.category == SafetyFindingCategory::SecretLeak)
+        .map(|finding| finding.code.clone())
+        .collect::<Vec<_>>();
+    reasons.sort();
+    reasons.dedup();
+    reasons
 }
 
 fn required_target_path(input: &OsFileInput) -> Result<&str, String> {
@@ -1845,6 +1869,9 @@ mod tests {
             .get("redaction_notice")
             .and_then(Value::as_str)
             .is_some_and(|notice| notice.contains("structure only")));
+        assert!(read.get("redaction_reasons").and_then(Value::as_array).is_some_and(|reasons| {
+            reasons.iter().any(|reason| reason.as_str() == Some("secret_leak.assignment.key"))
+        }));
         assert!(text.contains("provider_key = \"[REDACTED_SECRET]\""));
         assert!(!text.contains("palyra_os_secret_abcdef"));
     }
@@ -1854,11 +1881,12 @@ mod tests {
         let mut bytes = vec![0xff, 0xfe, b'\n'];
         bytes.extend_from_slice(b"provider_key = \"palyra_os_secret_abcdef\"\n");
 
-        let (text, bytes_base64, redacted) = visible_file_content(bytes);
+        let (text, bytes_base64, redacted, redaction_reasons) = visible_file_content(bytes);
 
         let text = text.expect("secret-bearing lossy content should return redacted text");
         assert!(redacted);
         assert!(bytes_base64.is_none());
+        assert!(redaction_reasons.iter().any(|reason| reason == "secret_leak.assignment.key"));
         assert!(text.contains("provider_key = \"[REDACTED_SECRET]\""));
         assert!(!text.contains("palyra_os_secret_abcdef"));
     }
@@ -1896,7 +1924,43 @@ mod tests {
 
         assert_eq!(read.get("redacted").and_then(Value::as_bool), Some(false));
         assert_eq!(read.get("text_authoritative").and_then(Value::as_bool), Some(true));
+        assert_eq!(read.get("redaction_reasons"), Some(&Value::Null));
         assert_eq!(read.get("text").and_then(Value::as_str), Some(contents));
+    }
+
+    #[test]
+    fn os_file_read_preserves_public_password_fixture_values() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let policy = test_policy(tempdir.path());
+        let target = tempdir.path().join("Dockerfile");
+        let contents = "ENV PASSWORD=password1\nRUN echo password\n";
+        fs::write(target.as_path(), contents).expect("OS file should be written");
+
+        let read = execute_os_file_operation(
+            &policy,
+            &OsFileInput {
+                operation: OsFileOperation::Read,
+                path: target.to_string_lossy().into_owned(),
+                target_path: None,
+                content_text: None,
+                bytes_base64: None,
+                create_parent_dirs: None,
+                overwrite: None,
+                full_replace: None,
+                dry_run: None,
+                offset_bytes: None,
+                max_bytes: None,
+                query: None,
+                case_sensitive: None,
+                max_entries: None,
+                max_matches: None,
+            },
+        )
+        .expect("absolute user path read should succeed");
+
+        assert_eq!(read.get("redacted").and_then(Value::as_bool), Some(false));
+        assert_eq!(read.get("text").and_then(Value::as_str), Some(contents));
+        assert_eq!(read.get("redaction_reasons"), Some(&Value::Null));
     }
 
     #[test]

@@ -9,6 +9,7 @@ pub(crate) mod artifacts;
 pub(crate) mod browser;
 pub(crate) mod delegation;
 pub(crate) mod http_fetch;
+pub(crate) mod image_observe;
 pub(crate) mod memory;
 pub(crate) mod networked_worker;
 pub(crate) mod os_file;

@@ -438,6 +438,27 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
             ToolResultProjectionPolicy::InlineUnlessLarge,
         ),
         entry(
+            "palyra.image.observe",
+            "Observe an image path or artifact without returning base64; returns OCR/vision metadata when available, otherwise a structured vision_not_available capability error.",
+            object_schema(
+                &[],
+                vec![
+                    (
+                        "path",
+                        json!({"type":"string","description":"Workspace-relative image path or /workspace/path alias. Provide exactly one of path or artifact_id."}),
+                    ),
+                    (
+                        "artifact_id",
+                        json!({"type":"string","description":"Image artifact id returned by another tool. Provide exactly one of path or artifact_id."}),
+                    ),
+                    ("expected_digest_sha256", json!({"type":"string"})),
+                ],
+                false,
+            ),
+            ToolParallelismPolicy::ReadOnly,
+            ToolResultProjectionPolicy::InlineUnlessLarge,
+        ),
+        entry(
             "palyra.fs.read_file",
             "Read a bounded chunk from a file inside the current agent workspace root. Accepts relative paths and virtual workspace aliases such as /workspace/file.txt.",
             object_schema(
@@ -1228,7 +1249,7 @@ fn browser_tool_schema(tool_name: &str) -> Value {
             properties.push(("format", json!({"type":"string","enum":["png"],"default":"png"})));
             properties.push((
                 "output_path",
-                json!({"type":"string","description":"Optional workspace-relative path, or approved user-owned absolute OS path, where the daemon should write the PNG bytes. Use this when the user asks to save a screenshot; do not try to write image_base64 with file patch tools."}),
+                json!({"type":"string","description":"Optional workspace-relative path, or approved user-owned absolute OS path, where the daemon should write the PNG bytes. Use this when the user asks to save a screenshot or when visual/OCR follow-up should use palyra.image.observe; screenshot output omits model-visible image_base64."}),
             ));
         }
         "palyra.browser.pdf" => {

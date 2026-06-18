@@ -1187,7 +1187,10 @@ fn is_benign_mock_credential_fixture_value(value: &str) -> bool {
         .trim_matches(['"', '\'', '`'])
         .to_ascii_lowercase()
         .replace(['-', ' '], "_");
-    matches!(normalized.as_str(), "demo" | "demo/demo" | "test" | "test/test")
+    matches!(
+        normalized.as_str(),
+        "demo" | "demo/demo" | "test" | "test/test" | "password" | "password1" | "git"
+    )
 }
 
 /// Extracts the contents of all balanced `"…"`/`'…'` literals in `value`.
@@ -2563,6 +2566,32 @@ mod tests {
         assert_eq!(outcome.redacted_text, source);
         assert!(outcome.redacted_text.contains("demo/demo"));
         assert!(outcome.redacted_text.contains("password === \"demo\""));
+        assert!(!outcome.redacted_text.contains("[REDACTED_SECRET]"));
+        assert!(!outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code.starts_with("secret_leak.assignment.")));
+    }
+
+    #[test]
+    fn public_benchmark_password_fixture_values_are_not_redacted() {
+        let source = "ENV PASSWORD=password1\n\
+                      send \"password\\r\"\n\
+                      password: password\n\
+                      password=git\n\
+                      add_special_tokens=False";
+        let outcome = redact_text_for_export(
+            source,
+            SafetySourceKind::Workspace,
+            SafetyContentKind::WorkspaceDocument,
+            TrustLabel::TrustedLocal,
+        );
+
+        assert!(!outcome.redacted);
+        assert_eq!(outcome.redacted_text, source);
+        assert!(outcome.redacted_text.contains("PASSWORD=password1"));
+        assert!(outcome.redacted_text.contains("add_special_tokens=False"));
         assert!(!outcome.redacted_text.contains("[REDACTED_SECRET]"));
         assert!(!outcome
             .scan

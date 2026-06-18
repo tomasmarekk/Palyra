@@ -233,6 +233,7 @@ pub(crate) const PROCESS_STOP_TOOL_NAME: &str = "palyra.process.stop";
 pub(crate) const PROCESS_STATUS_TOOL_NAME: &str = "palyra.process.status";
 pub(crate) const PROCESS_LIST_TOOL_NAME: &str = "palyra.process.list";
 pub(crate) const HTTP_FETCH_TOOL_NAME: &str = "palyra.http.fetch";
+pub(crate) const IMAGE_OBSERVE_TOOL_NAME: &str = "palyra.image.observe";
 pub(crate) const TOOL_PROGRAM_RUN_TOOL_NAME: &str = "palyra.tool_program.run";
 pub(crate) const BROWSER_SESSION_CREATE_TOOL_NAME: &str = "palyra.browser.session.create";
 pub(crate) const BROWSER_SESSION_CLOSE_TOOL_NAME: &str = "palyra.browser.session.close";
@@ -957,6 +958,14 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
     } else if tool_name == HTTP_FETCH_TOOL_NAME {
         crate::application::tool_runtime::http_fetch::execute_http_fetch_tool(
             runtime_state,
+            proposal_id,
+            input_json,
+        )
+        .await
+    } else if tool_name == IMAGE_OBSERVE_TOOL_NAME {
+        crate::application::tool_runtime::image_observe::execute_image_observe_tool(
+            runtime_state,
+            context,
             proposal_id,
             input_json,
         )

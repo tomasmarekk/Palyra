@@ -720,6 +720,7 @@ const LOCAL_DESKTOP_DEFAULT_ALLOWED_TOOLS: &[&str] = &[
     "palyra.memory.replace",
     "palyra.memory.reflect",
     "palyra.artifact.read",
+    "palyra.image.observe",
     "palyra.delegation.query",
     "palyra.routines.query",
     "palyra.routines.control",
@@ -13169,6 +13170,10 @@ mod init_command_tests {
         assert!(
             allowed_tools.iter().any(|tool| tool == "palyra.fs.os_file"),
             "local init should expose audited OS file workflows for local desktop agents"
+        );
+        assert!(
+            allowed_tools.iter().any(|tool| tool == "palyra.image.observe"),
+            "local init should expose image observation for local visual artifacts"
         );
         assert!(
             allowed_tools.iter().any(|tool| tool == "palyra.browser.navigate"),

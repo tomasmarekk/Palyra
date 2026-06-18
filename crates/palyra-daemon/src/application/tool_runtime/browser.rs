@@ -55,7 +55,8 @@ use crate::{
         BROWSER_SESSION_CREATE_TOOL_NAME, BROWSER_STORAGE_TOOL_NAME, BROWSER_TABS_CLOSE_TOOL_NAME,
         BROWSER_TABS_LIST_TOOL_NAME, BROWSER_TABS_OPEN_TOOL_NAME, BROWSER_TABS_SWITCH_TOOL_NAME,
         BROWSER_TITLE_TOOL_NAME, BROWSER_TYPE_TOOL_NAME, BROWSER_UPLOAD_TOOL_NAME,
-        BROWSER_VIEWPORT_TOOL_NAME, BROWSER_WAIT_FOR_TOOL_NAME, MAX_BROWSER_TOOL_INPUT_BYTES,
+        BROWSER_VIEWPORT_TOOL_NAME, BROWSER_WAIT_FOR_TOOL_NAME, IMAGE_OBSERVE_TOOL_NAME,
+        MAX_BROWSER_TOOL_INPUT_BYTES,
     },
     sandbox_runner::process_runner_allows_host_access,
     tool_protocol::{ToolAttestation, ToolExecutionOutcome},
@@ -2666,6 +2667,8 @@ pub(crate) async fn execute_browser_tool(
                     } else {
                         None
                     };
+                    let image_observation =
+                        browser_screenshot_image_observation_hint(saved_file.as_ref());
                     let output = json!({
                         "success": success,
                         "mime_type": response.mime_type,
@@ -2673,8 +2676,8 @@ pub(crate) async fn execute_browser_tool(
                         "sha256": image_sha256,
                         "saved_file": saved_file,
                         "layout_metrics": response.layout_metrics.map(browser_layout_metrics_to_json),
-                        "image_base64": STANDARD
-                            .encode(response.image_bytes.as_slice()),
+                        "image_base64_omitted": true,
+                        "image_observation": image_observation,
                         "error": error,
                     });
                     (
@@ -4349,6 +4352,23 @@ fn browser_layout_metrics_to_json(metrics: browser_v1::BrowserLayoutMetrics) -> 
     })
 }
 
+fn browser_screenshot_image_observation_hint(saved_file: Option<&Value>) -> Value {
+    let path = saved_file
+        .and_then(|file| file.get("path"))
+        .and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty());
+    json!({
+        "tool": IMAGE_OBSERVE_TOOL_NAME,
+        "path": path,
+        "available_without_saved_file": false,
+        "message": if path.is_some() {
+            "Call palyra.image.observe with this saved_file path when OCR or visual interpretation is needed."
+        } else {
+            "Pass output_path to palyra.browser.screenshot, then call palyra.image.observe with the saved_file path when OCR or visual interpretation is needed."
+        },
+    })
+}
+
 /// Builds the agent-facing error for a viewport that browserd reported
 /// differently from what was requested; `None` when they match.
 fn browser_viewport_metric_mismatch_error(
@@ -4997,22 +5017,23 @@ mod tests {
         browser_element_captures_to_json, browser_file_url_to_path,
         browser_max_redirects_from_payload, browser_network_log_entry_to_json,
         browser_observe_include_visible_text, browser_output_with_runtime_capabilities,
-        browser_session_closed_error_message, browser_session_closed_output_json,
-        browser_session_persistence_from_payload, browser_session_profile_id_from_payload,
-        browser_tool_execution_outcome, browser_tool_reports_missing_session,
-        browser_tool_requires_open_session, browser_url_targets_loopback,
-        browser_user_owned_os_roots, browser_viewport_metric_mismatch_error,
-        canonical_file_path_is_inside_workspace_roots, filter_browser_network_log_entries_since,
-        normalize_browser_press_key_input, parse_browser_download_artifact_id,
-        parse_browser_observe_string_array, resolve_browser_output_path,
-        resolve_browser_upload_path, validate_browser_workspace_relative_path,
-        BrowserRuntimeCapabilities, BROWSER_CALLER_PRINCIPAL_HEADER, PALYRA_OS_FILE_ROOTS_ENV,
+        browser_screenshot_image_observation_hint, browser_session_closed_error_message,
+        browser_session_closed_output_json, browser_session_persistence_from_payload,
+        browser_session_profile_id_from_payload, browser_tool_execution_outcome,
+        browser_tool_reports_missing_session, browser_tool_requires_open_session,
+        browser_url_targets_loopback, browser_user_owned_os_roots,
+        browser_viewport_metric_mismatch_error, canonical_file_path_is_inside_workspace_roots,
+        filter_browser_network_log_entries_since, normalize_browser_press_key_input,
+        parse_browser_download_artifact_id, parse_browser_observe_string_array,
+        resolve_browser_output_path, resolve_browser_upload_path,
+        validate_browser_workspace_relative_path, BrowserRuntimeCapabilities,
+        BROWSER_CALLER_PRINCIPAL_HEADER, PALYRA_OS_FILE_ROOTS_ENV,
     };
     use crate::application::tool_runtime::workspace_scope::ActiveWorkspaceRoot;
     use crate::gateway::{
         BROWSER_CLICK_TOOL_NAME, BROWSER_DOWNLOADS_GET_TOOL_NAME, BROWSER_NAVIGATE_TOOL_NAME,
         BROWSER_OBSERVE_TOOL_NAME, BROWSER_RELOAD_TOOL_NAME, BROWSER_SESSION_CLOSE_TOOL_NAME,
-        BROWSER_SESSION_CREATE_TOOL_NAME, BROWSER_TABS_CLOSE_TOOL_NAME,
+        BROWSER_SESSION_CREATE_TOOL_NAME, BROWSER_TABS_CLOSE_TOOL_NAME, IMAGE_OBSERVE_TOOL_NAME,
     };
     use crate::transport::grpc::proto::palyra::browser::v1 as browser_v1;
     use palyra_common::CANONICAL_PROTOCOL_MAJOR;
@@ -5135,6 +5156,25 @@ mod tests {
         assert_eq!(capabilities.subresource_loading, Some(false));
         assert_eq!(capabilities.dom_interaction, Some(false));
         assert!(capabilities.warning.is_some_and(|warning| warning.contains("static_html_only")));
+    }
+
+    #[test]
+    fn browser_screenshot_hint_points_to_image_observe_without_base64() {
+        let saved_file = json!({
+            "path": "C:/workspace/evidence.png",
+            "mime_type": "image/png",
+            "size_bytes": 12,
+            "sha256": "abc",
+        });
+
+        let hint = browser_screenshot_image_observation_hint(Some(&saved_file));
+
+        assert_eq!(hint["tool"], IMAGE_OBSERVE_TOOL_NAME);
+        assert_eq!(hint["path"], "C:/workspace/evidence.png");
+        assert_eq!(hint["available_without_saved_file"], false);
+        assert!(hint["message"].as_str().is_some_and(|message| {
+            message.contains("palyra.image.observe") && !message.contains("base64")
+        }));
     }
 
     #[test]

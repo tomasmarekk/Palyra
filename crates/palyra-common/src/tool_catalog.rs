@@ -104,6 +104,10 @@ pub fn tool_metadata(tool_name: &str) -> Option<ToolMetadata> {
             capabilities: ARTIFACT_READ_CAPABILITIES,
             default_sensitive: false,
         }),
+        "palyra.image.observe" => Some(ToolMetadata {
+            capabilities: ARTIFACT_READ_CAPABILITIES,
+            default_sensitive: false,
+        }),
         "palyra.http.fetch" => Some(ToolMetadata {
             capabilities: HTTP_FETCH_TOOL_CAPABILITIES,
             default_sensitive: true,
@@ -303,6 +307,12 @@ mod tests {
             assert!(!tool_requires_approval(tool_name), "{tool_name} should be read-only");
             assert_eq!(tool_policy_capability_names(tool_name), vec!["filesystem_read"]);
         }
+    }
+
+    #[test]
+    fn image_observe_is_read_only_without_approval() {
+        assert!(!tool_requires_approval("palyra.image.observe"));
+        assert_eq!(tool_policy_capability_names("palyra.image.observe"), vec!["artifacts_read"]);
     }
 
     #[test]

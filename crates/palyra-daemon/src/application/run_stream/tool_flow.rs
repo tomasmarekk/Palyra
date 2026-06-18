@@ -597,6 +597,7 @@ pub(crate) fn classify_tool_parallelism(tool_name: &str, input_json: &[u8]) -> T
         | "palyra.session_search"
         | "palyra.routines.query"
         | "palyra.artifact.read"
+        | "palyra.image.observe"
         | "palyra.fs.read_file"
         | "palyra.fs.list_dir"
         | "palyra.fs.search"

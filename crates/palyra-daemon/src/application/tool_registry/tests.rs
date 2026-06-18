@@ -647,6 +647,16 @@ fn artifact_read_schema_defaults_to_text_preview() {
 }
 
 #[test]
+fn image_observe_schema_exposes_path_and_artifact_targets() {
+    let entry = registry_entry("palyra.image.observe").expect("image observe should be registered");
+
+    assert!(entry.input_schema["properties"].get("path").is_some());
+    assert!(entry.input_schema["properties"].get("artifact_id").is_some());
+    assert_eq!(entry.parallelism_policy, ToolParallelismPolicy::ReadOnly);
+    assert_eq!(entry.projection_policy, ToolResultProjectionPolicy::InlineUnlessLarge);
+}
+
+#[test]
 fn intake_normalizes_safe_scalar_arguments() {
     let config = config(&["palyra.sleep"]);
     let snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {

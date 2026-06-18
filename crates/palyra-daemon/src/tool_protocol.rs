@@ -183,6 +183,7 @@ const MAX_WORKSPACE_PATCH_TOOL_INPUT_BYTES: usize = 256 * 1024;
 const MAX_OS_FILE_TOOL_INPUT_BYTES: usize = 384 * 1024;
 const MAX_BROWSER_TOOL_INPUT_BYTES: usize = 128 * 1024;
 const MAX_ARTIFACT_READ_TOOL_INPUT_BYTES: usize = 16 * 1024;
+const MAX_IMAGE_OBSERVE_TOOL_INPUT_BYTES: usize = 16 * 1024;
 const MAX_WASM_PLUGIN_TOOL_INPUT_BYTES: usize = 448 * 1024;
 
 /// Builds the serializable policy snapshot exposed on console/status APIs.
@@ -776,6 +777,15 @@ async fn run_allowlisted_tool_with_cancellation(
             executor: "gateway_artifacts".to_owned(),
             sandbox_enforcement: "artifact_scope".to_owned(),
         },
+        "palyra.image.observe" => ToolExecutionRawResult {
+            success: false,
+            output_json: b"{}".to_vec(),
+            error: "palyra.image.observe requires gateway image observation runtime context"
+                .to_owned(),
+            timed_out: false,
+            executor: "image_observe".to_owned(),
+            sandbox_enforcement: "workspace_roots".to_owned(),
+        },
         "palyra.http.fetch" => ToolExecutionRawResult {
             success: false,
             output_json: b"{}".to_vec(),
@@ -925,6 +935,7 @@ fn is_runtime_supported_tool(tool_name: &str) -> bool {
             | "palyra.delegation.query"
             | "palyra.delegation.control"
             | "palyra.artifact.read"
+            | "palyra.image.observe"
             | "palyra.http.fetch"
             | "palyra.process.run"
             | "palyra.process.stop"
@@ -992,6 +1003,8 @@ fn tool_executor_name(config: &ToolCallConfig, tool_name: &str) -> String {
         "os_file".to_owned()
     } else if tool_name == "palyra.http.fetch" {
         "gateway_http_fetch".to_owned()
+    } else if tool_name == "palyra.image.observe" {
+        "image_observe".to_owned()
     } else if tool_name.starts_with("palyra.browser.") {
         "browser_broker".to_owned()
     } else if matches!(
@@ -1043,6 +1056,7 @@ fn tool_input_limit_bytes(tool_name: &str) -> usize {
         "palyra.delegation.query" => MAX_DELEGATION_QUERY_TOOL_INPUT_BYTES,
         "palyra.delegation.control" => MAX_DELEGATION_CONTROL_TOOL_INPUT_BYTES,
         "palyra.artifact.read" => MAX_ARTIFACT_READ_TOOL_INPUT_BYTES,
+        "palyra.image.observe" => MAX_IMAGE_OBSERVE_TOOL_INPUT_BYTES,
         "palyra.http.fetch" => MAX_HTTP_FETCH_TOOL_INPUT_BYTES,
         "palyra.process.run"
         | "palyra.process.stop"
@@ -1431,9 +1445,9 @@ fn current_unix_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        decide_tool_call, denied_execution_outcome, execute_tool_call, tool_metadata,
-        tool_policy_snapshot, tool_requires_approval, ToolCallConfig, ToolCapability,
-        ToolRequestContext,
+        decide_tool_call, denied_execution_outcome, execute_tool_call, is_runtime_supported_tool,
+        tool_input_limit_bytes, tool_metadata, tool_policy_snapshot, tool_requires_approval,
+        ToolCallConfig, ToolCapability, ToolRequestContext, MAX_IMAGE_OBSERVE_TOOL_INPUT_BYTES,
     };
     use crate::sandbox_runner::{
         EgressEnforcementMode, PathAccessMode, SandboxProcessRunnerPolicy, SandboxProcessRunnerTier,
@@ -1912,6 +1926,7 @@ mod tests {
         assert!(!tool_requires_approval("palyra.memory.reflect"));
         assert!(!tool_requires_approval("palyra.routines.query"));
         assert!(!tool_requires_approval("palyra.artifact.read"));
+        assert!(!tool_requires_approval("palyra.image.observe"));
         assert!(!tool_requires_approval("palyra.fs.read_file"));
         assert!(!tool_requires_approval("palyra.fs.list_dir"));
         assert!(!tool_requires_approval("palyra.fs.search"));
@@ -1966,6 +1981,19 @@ mod tests {
         assert_eq!(metadata.capabilities, &[ToolCapability::ArtifactsRead]);
         assert!(!metadata.default_sensitive);
         assert!(!tool_requires_approval("palyra.artifact.read"));
+    }
+
+    #[test]
+    fn image_observe_tool_exposes_artifact_capability_without_default_approval() {
+        let metadata = tool_metadata("palyra.image.observe").expect("image observe metadata");
+        assert_eq!(metadata.capabilities, &[ToolCapability::ArtifactsRead]);
+        assert!(!metadata.default_sensitive);
+        assert!(!tool_requires_approval("palyra.image.observe"));
+        assert!(is_runtime_supported_tool("palyra.image.observe"));
+        assert_eq!(
+            tool_input_limit_bytes("palyra.image.observe"),
+            MAX_IMAGE_OBSERVE_TOOL_INPUT_BYTES
+        );
     }
 
     #[test]

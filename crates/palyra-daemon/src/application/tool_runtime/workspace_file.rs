@@ -144,6 +144,8 @@ struct WorkspaceReadFileOutput {
     text_authoritative: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     redaction_notice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    redaction_reasons: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -176,6 +178,8 @@ struct WorkspaceSearchMatch {
     line_text: String,
     #[serde(skip_serializing_if = "is_false")]
     redacted: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    redaction_reasons: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1741,7 +1745,8 @@ fn search_workspace_line(
         let byte_index = search_start + relative_index;
         let column = line[..byte_index].chars().count() + 1;
         let excerpt = workspace_search_line_excerpt(line, byte_index, query_len);
-        let (line_text, redacted) = redact_workspace_search_line(excerpt.as_str());
+        let (line_text, redacted, redaction_reasons) =
+            redact_workspace_search_line(excerpt.as_str());
         if !state.reserve_match_output(path, line_text.as_str()) {
             return;
         }
@@ -1751,6 +1756,7 @@ fn search_workspace_line(
             column,
             line_text,
             redacted,
+            redaction_reasons,
         });
         if state.matches.len() >= state.max_matches {
             return;
@@ -1809,7 +1815,7 @@ fn floor_char_boundary(value: &str, mut index: usize) -> usize {
 /// Applies workspace-export secret redaction to one match line. Only a
 /// confirmed secret-leak finding swaps in the redacted text; other finding
 /// categories leave the line untouched.
-fn redact_workspace_search_line(line: &str) -> (String, bool) {
+fn redact_workspace_search_line(line: &str) -> (String, bool, Vec<String>) {
     let redaction = redact_text_for_export(
         line,
         SafetySourceKind::Workspace,
@@ -1817,11 +1823,25 @@ fn redact_workspace_search_line(line: &str) -> (String, bool) {
         TrustLabel::TrustedLocal,
     );
     let redacted = redaction.scan.has_category(SafetyFindingCategory::SecretLeak);
+    let redaction_reasons = secret_redaction_reason_codes(&redaction);
     if redacted {
-        (redaction.redacted_text, true)
+        (redaction.redacted_text, true, redaction_reasons)
     } else {
-        (line.to_owned(), false)
+        (line.to_owned(), false, Vec::new())
     }
+}
+
+fn secret_redaction_reason_codes(redaction: &palyra_safety::ExportRedactionOutcome) -> Vec<String> {
+    let mut reasons = redaction
+        .scan
+        .findings
+        .iter()
+        .filter(|finding| finding.category == SafetyFindingCategory::SecretLeak)
+        .map(|finding| finding.code.clone())
+        .collect::<Vec<_>>();
+    reasons.sort();
+    reasons.dedup();
+    reasons
 }
 
 /// Reads one bounded chunk from an already-resolved canonical file and
@@ -1885,35 +1905,60 @@ fn read_workspace_file_chunk(
     // Redaction policy: only a confirmed secret-leak finding replaces the
     // text, and redacted text is marked non-authoritative so callers do not
     // write the placeholder markers back into the workspace.
-    let (text, bytes_base64, bytes_base64_prefix, binary, binary_output_omitted, redacted) =
-        if chunk_has_binary_control_bytes(&buffer) {
-            (None, None, workspace_binary_base64_prefix(buffer.as_slice()), true, true, false)
-        } else {
-            match String::from_utf8(buffer) {
-                Ok(text) => {
-                    let redaction = redact_text_for_export(
-                        text.as_str(),
-                        SafetySourceKind::Workspace,
-                        SafetyContentKind::WorkspaceDocument,
-                        TrustLabel::TrustedLocal,
-                    );
-                    let redacted = redaction.scan.has_category(SafetyFindingCategory::SecretLeak);
-                    let visible_text = if redacted { redaction.redacted_text } else { text };
-                    (Some(visible_text), None, None, false, false, redacted)
-                }
-                Err(error) => {
-                    let bytes = error.into_bytes();
-                    (
-                        None,
-                        None,
-                        workspace_binary_base64_prefix(bytes.as_slice()),
-                        true,
-                        true,
-                        false,
-                    )
-                }
+    let (
+        text,
+        bytes_base64,
+        bytes_base64_prefix,
+        binary,
+        binary_output_omitted,
+        redacted,
+        redaction_reasons,
+    ) = if chunk_has_binary_control_bytes(&buffer) {
+        (
+            None,
+            None,
+            workspace_binary_base64_prefix(buffer.as_slice()),
+            true,
+            true,
+            false,
+            Vec::new(),
+        )
+    } else {
+        match String::from_utf8(buffer) {
+            Ok(text) => {
+                let redaction = redact_text_for_export(
+                    text.as_str(),
+                    SafetySourceKind::Workspace,
+                    SafetyContentKind::WorkspaceDocument,
+                    TrustLabel::TrustedLocal,
+                );
+                let redacted = redaction.scan.has_category(SafetyFindingCategory::SecretLeak);
+                let redaction_reasons = secret_redaction_reason_codes(&redaction);
+                let visible_text = if redacted { redaction.redacted_text } else { text };
+                (
+                    Some(visible_text),
+                    None,
+                    None,
+                    false,
+                    false,
+                    redacted,
+                    if redacted { redaction_reasons } else { Vec::new() },
+                )
             }
-        };
+            Err(error) => {
+                let bytes = error.into_bytes();
+                (
+                    None,
+                    None,
+                    workspace_binary_base64_prefix(bytes.as_slice()),
+                    true,
+                    true,
+                    false,
+                    Vec::new(),
+                )
+            }
+        }
+    };
     let text_authoritative = redacted.then_some(false);
     let redaction_notice = redacted.then(|| {
         "text contains redacted secret placeholders; use it for structure only and do not write the redacted text back verbatim".to_owned()
@@ -1937,6 +1982,7 @@ fn read_workspace_file_chunk(
         redacted,
         text_authoritative,
         redaction_notice,
+        redaction_reasons: redacted.then_some(redaction_reasons),
     })
 }
 
@@ -2790,9 +2836,37 @@ mod tests {
             .redaction_notice
             .as_deref()
             .is_some_and(|notice| notice.contains("do not write")));
+        assert!(output.redaction_reasons.as_ref().is_some_and(|reasons| reasons
+            .iter()
+            .any(|reason| reason.starts_with("secret_leak.assignment."))));
         assert!(text.contains("APP_SECRET=[REDACTED_SECRET]"));
         assert!(text.contains("VITE_PUBLIC_LABEL=Palyra Preview"));
         assert!(!text.contains("server-only-demo-secret"));
+    }
+
+    #[test]
+    fn read_workspace_file_preserves_public_benchmark_password_fixtures() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let file_path = tempdir.path().join("verify.sh");
+        let contents = "ENV PASSWORD=password1\nsend \"password\\r\"\npassword: password\n";
+        fs::write(file_path, contents).expect("workspace file should be written");
+        let input = WorkspaceReadFileInput {
+            path: "verify.sh".to_owned(),
+            workspace_root: None,
+            offset_bytes: 0,
+            max_bytes: None,
+            line_start: None,
+            line_count: None,
+        };
+
+        let output = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
+            .expect("workspace file should be readable");
+
+        assert!(!output.redacted);
+        assert_eq!(output.text.as_deref(), Some(contents));
+        assert_eq!(output.text_authoritative, None);
+        assert_eq!(output.redaction_notice, None);
+        assert_eq!(output.redaction_reasons, None);
     }
 
     #[test]
@@ -3457,6 +3531,10 @@ mod tests {
 
         assert_eq!(output.matches.len(), 1);
         assert!(output.matches[0].redacted);
+        assert!(output.matches[0]
+            .redaction_reasons
+            .iter()
+            .any(|reason| reason == "secret_leak.marker"));
         assert!(output.matches[0].line_text.contains("[REDACTED_SECRET]"));
         assert!(!output.matches[0].line_text.contains("DUMMY_SECRET_SHOULD_NOT_APPEAR"));
     }
