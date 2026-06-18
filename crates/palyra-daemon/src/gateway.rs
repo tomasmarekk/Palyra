@@ -106,9 +106,11 @@ use crate::{
         ProviderRequest, ProviderStatusSnapshot,
     },
     orchestrator::{RunLifecycleState, RunStateMachine, RunTransition},
+    sandbox_runner::ProcessProgressSink,
     tool_protocol::{
-        build_tool_execution_outcome, execute_tool_call, execute_tool_call_with_cancellation,
-        tool_policy_snapshot, ToolCallConfig, ToolCallPolicySnapshot, ToolExecutionOutcome,
+        build_tool_execution_outcome, execute_tool_call,
+        execute_tool_call_with_cancellation_and_progress, tool_policy_snapshot, ToolCallConfig,
+        ToolCallPolicySnapshot, ToolExecutionOutcome,
     },
 };
 
@@ -717,6 +719,13 @@ pub(crate) struct ToolRuntimeExecutionContext<'a> {
 /// older audit paths and tool-program call sites can keep a stable shape.
 pub(crate) type SharedToolBudget = Arc<Mutex<u32>>;
 
+/// Optional controls shared by gateway tool dispatch call sites.
+pub(crate) struct ToolRuntimeDispatchControls {
+    pub(crate) remaining_tool_budget: Option<SharedToolBudget>,
+    pub(crate) cancellation_requested: Option<Arc<AtomicBool>>,
+    pub(crate) process_progress_sink: Option<ProcessProgressSink>,
+}
+
 /// Wraps an initial legacy counter in the shared handle.
 pub(crate) fn shared_tool_budget(remaining_tool_budget: u32) -> SharedToolBudget {
     Arc::new(Mutex::new(remaining_tool_budget))
@@ -780,6 +789,29 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation(
     remaining_tool_budget: Option<SharedToolBudget>,
     cancellation_requested: Option<Arc<AtomicBool>>,
 ) -> ToolExecutionOutcome {
+    execute_tool_with_runtime_dispatch_with_cancellation_and_progress(
+        runtime_state,
+        context,
+        proposal_id,
+        tool_name,
+        input_json,
+        ToolRuntimeDispatchControls {
+            remaining_tool_budget,
+            cancellation_requested,
+            process_progress_sink: None,
+        },
+    )
+    .await
+}
+
+pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_progress(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: ToolRuntimeExecutionContext<'_>,
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+    controls: ToolRuntimeDispatchControls,
+) -> ToolExecutionOutcome {
     if context.execution_backend == ExecutionBackendPreference::NetworkedWorker {
         crate::application::tool_runtime::networked_worker::execute_networked_worker_tool(
             runtime_state,
@@ -791,7 +823,7 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation(
         .await
     } else if tool_name == TOOL_PROGRAM_RUN_TOOL_NAME {
         let fallback_budget;
-        let remaining_tool_budget = match remaining_tool_budget {
+        let remaining_tool_budget = match controls.remaining_tool_budget {
             Some(budget) => budget,
             None => {
                 fallback_budget = shared_tool_budget(0);
@@ -969,12 +1001,13 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation(
             process_runner_tool_config_for_session(runtime_state, context, input_json).await;
         let execution_input_json =
             process_runner_input_with_launch_context_env(runtime_state, context, input_json).await;
-        let outcome = execute_tool_call_with_cancellation(
+        let outcome = execute_tool_call_with_cancellation_and_progress(
             &config,
             proposal_id,
             tool_name,
             execution_input_json.as_slice(),
-            cancellation_requested,
+            controls.cancellation_requested,
+            controls.process_progress_sink,
         )
         .await;
         record_run_cleanup_resource_from_tool_outcome(

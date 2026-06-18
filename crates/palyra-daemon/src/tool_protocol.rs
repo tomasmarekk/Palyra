@@ -37,8 +37,9 @@ use ulid::Ulid;
 
 use crate::sandbox_runner::{
     background_process_status_by_pid, process_runner_executor_name,
-    process_runner_sandbox_enforcement_label, run_constrained_process_with_cancellation,
-    stop_background_process_by_pid, EgressEnforcementMode, SandboxProcessRunErrorKind,
+    process_runner_sandbox_enforcement_label,
+    run_constrained_process_with_cancellation_and_progress, stop_background_process_by_pid,
+    EgressEnforcementMode, ProcessProgressSink, SandboxProcessRunErrorKind,
     SandboxProcessRunnerPolicy,
 };
 use crate::wasm_plugin_runner::{run_wasm_plugin, WasmPluginRunErrorKind, WasmPluginRunnerPolicy};
@@ -442,6 +443,28 @@ pub async fn execute_tool_call_with_cancellation(
     input_json: &[u8],
     cancellation_requested: Option<Arc<AtomicBool>>,
 ) -> ToolExecutionOutcome {
+    execute_tool_call_with_cancellation_and_progress(
+        config,
+        proposal_id,
+        tool_name,
+        input_json,
+        cancellation_requested,
+        None,
+    )
+    .await
+}
+
+/// Executes an already-allowed tool call with optional foreground process progress.
+///
+/// `process_progress_sink` is used only by `palyra.process.run`; other tools ignore it.
+pub async fn execute_tool_call_with_cancellation_and_progress(
+    config: &ToolCallConfig,
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+    cancellation_requested: Option<Arc<AtomicBool>>,
+    process_progress_sink: Option<ProcessProgressSink>,
+) -> ToolExecutionOutcome {
     if let Some(raw) = reject_oversized_tool_input(config, tool_name, input_json) {
         return build_execution_outcome(proposal_id, tool_name, input_json, raw);
     }
@@ -456,6 +479,7 @@ pub async fn execute_tool_call_with_cancellation(
             tool_name,
             input_json,
             cancellation_requested,
+            process_progress_sink,
         )
         .await
     } else {
@@ -467,6 +491,7 @@ pub async fn execute_tool_call_with_cancellation(
                 tool_name,
                 input_json,
                 cancellation_requested,
+                process_progress_sink,
             ),
         )
         .await
@@ -624,6 +649,7 @@ async fn run_allowlisted_tool_with_cancellation(
     tool_name: &str,
     input_json: &[u8],
     cancellation_requested: Option<Arc<AtomicBool>>,
+    process_progress_sink: Option<ProcessProgressSink>,
 ) -> ToolExecutionRawResult {
     match tool_name {
         "palyra.echo" => match execute_echo_tool(input_json) {
@@ -759,7 +785,13 @@ async fn run_allowlisted_tool_with_cancellation(
             sandbox_enforcement: "ssrf_guard".to_owned(),
         },
         "palyra.process.run" => {
-            execute_process_runner_tool(config, input_json, cancellation_requested).await
+            execute_process_runner_tool(
+                config,
+                input_json,
+                cancellation_requested,
+                process_progress_sink,
+            )
+            .await
         }
         "palyra.process.stop" | "palyra.process.status" => {
             execute_process_lifecycle_tool(config, tool_name, input_json).await
@@ -1119,6 +1151,7 @@ async fn execute_process_runner_tool(
     config: &ToolCallConfig,
     input_json: &[u8],
     cancellation_requested: Option<Arc<AtomicBool>>,
+    process_progress_sink: Option<ProcessProgressSink>,
 ) -> ToolExecutionRawResult {
     let policy = config.process_runner.clone();
     let executor = process_runner_executor_name(&policy);
@@ -1135,11 +1168,12 @@ async fn execute_process_runner_tool(
     // The runner blocks on the child process, so it runs off the async
     // executor; the same timeout is enforced inside the runner itself.
     match tokio::task::spawn_blocking(move || {
-        run_constrained_process_with_cancellation(
+        run_constrained_process_with_cancellation_and_progress(
             &policy,
             input.as_slice(),
             timeout,
             cancellation_requested,
+            process_progress_sink,
         )
     })
     .await

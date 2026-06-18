@@ -42,6 +42,9 @@ use crate::{
 
 const HTTP_FETCH_HTML_SKIP_TAGS: &[&str] =
     &["head", "script", "style", "noscript", "template", "svg"];
+const HTTP_FETCH_MODEL_BODY_INLINE_BYTES: usize = 12 * 1024;
+const HTTP_FETCH_MODEL_BODY_HEAD_BYTES: usize = 4 * 1024;
+const HTTP_FETCH_MODEL_BODY_TAIL_BYTES: usize = 4 * 1024;
 
 /// Executes a `palyra.http.fetch` tool call.
 ///
@@ -660,6 +663,9 @@ pub(crate) async fn execute_http_fetch_tool(
             "truncated": body_truncated,
             "body_text": body_export.body_text,
             "body_text_format": model_body.format,
+            "body_text_model_truncated": body_export.model_truncated,
+            "body_text_original_bytes": body_export.original_bytes,
+            "body_text_sha256": body_export.sha256,
             "latency_ms": started_at.elapsed().as_millis() as u64,
             "request_headers": redacted_http_headers(request_headers.as_slice()),
             "cache": {
@@ -1343,6 +1349,9 @@ fn decode_numeric_html_entity(digits: &str, radix: u32) -> Option<String> {
 /// Redacted body text plus the safety-scan metadata attached to the output.
 struct HttpFetchBodyExport {
     body_text: String,
+    model_truncated: bool,
+    original_bytes: usize,
+    sha256: String,
     safety_json: Value,
 }
 
@@ -1356,8 +1365,15 @@ fn export_http_fetch_body(body_text: &str) -> HttpFetchBodyExport {
         SafetyContentKind::HttpResponse,
         TrustLabel::ExternalUntrusted,
     );
+    let sha256 = sha256_hex(outcome.redacted_text.as_bytes());
+    let original_bytes = outcome.redacted_text.len();
+    let (body_text, model_truncated) =
+        bounded_http_fetch_model_body_text(outcome.redacted_text.as_str());
     HttpFetchBodyExport {
-        body_text: outcome.redacted_text,
+        body_text,
+        model_truncated,
+        original_bytes,
+        sha256,
         safety_json: json!({
             "trust_label": outcome.scan.trust_label.as_str(),
             "action": outcome.scan.recommended_action.as_str(),
@@ -1365,6 +1381,44 @@ fn export_http_fetch_body(body_text: &str) -> HttpFetchBodyExport {
             "redacted": outcome.redacted,
         }),
     }
+}
+
+fn bounded_http_fetch_model_body_text(body_text: &str) -> (String, bool) {
+    if body_text.len() <= HTTP_FETCH_MODEL_BODY_INLINE_BYTES {
+        return (body_text.to_owned(), false);
+    }
+    let sha256 = sha256_hex(body_text.as_bytes());
+    let head = http_fetch_text_prefix(body_text, HTTP_FETCH_MODEL_BODY_HEAD_BYTES);
+    let tail = http_fetch_text_suffix(body_text, HTTP_FETCH_MODEL_BODY_TAIL_BYTES);
+    (
+        format!(
+            "{head}\n\n<http.fetch body omitted: original_bytes={} sha256={}>\n\n{tail}",
+            body_text.len(),
+            sha256
+        ),
+        true,
+    )
+}
+
+fn http_fetch_text_prefix(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    text.char_indices()
+        .take_while(|(index, character)| index.saturating_add(character.len_utf8()) <= max_bytes)
+        .map(|(_, character)| character)
+        .collect()
+}
+
+fn http_fetch_text_suffix(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let mut start = text.len().saturating_sub(max_bytes);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text[start..].to_owned()
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -1383,6 +1437,9 @@ mod tests {
     fn http_fetch_export_redacts_sensitive_body_text() {
         let exported = export_http_fetch_body("Authorization: Bearer super-secret-token-value");
         assert_eq!(exported.body_text, "Authorization: [REDACTED_SECRET]");
+        assert!(!exported.model_truncated);
+        assert_eq!(exported.original_bytes, exported.body_text.len());
+        assert_eq!(exported.sha256.len(), 64);
         assert_eq!(exported.safety_json["trust_label"], "external_untrusted");
         assert_eq!(exported.safety_json["action"], "redact");
         assert!(exported.safety_json["redacted"].as_bool().unwrap_or(false));
@@ -1396,6 +1453,23 @@ mod tests {
             findings.contains(&"secret_leak.header.authorization"),
             "authorization header leak should be reported"
         );
+    }
+
+    #[test]
+    fn http_fetch_export_bounds_large_body_text() {
+        let body =
+            format!("{}MIDDLE_SHOULD_BE_OMITTED{}", "head\n".repeat(3_000), "tail\n".repeat(3_000));
+
+        let exported = export_http_fetch_body(body.as_str());
+
+        assert!(exported.model_truncated);
+        assert_eq!(exported.original_bytes, body.len());
+        assert_eq!(exported.sha256.len(), 64);
+        assert!(exported.body_text.len() < 9 * 1024, "bounded body should stay compact");
+        assert!(exported.body_text.contains("head"));
+        assert!(exported.body_text.contains("tail"));
+        assert!(exported.body_text.contains("http.fetch body omitted"));
+        assert!(!exported.body_text.contains("MIDDLE_SHOULD_BE_OMITTED"));
     }
 
     #[test]

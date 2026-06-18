@@ -56,27 +56,29 @@ use crate::{
     gateway::{
         await_tool_approval_response, best_effort_mark_approval_error,
         build_and_ingest_tool_result_memory_summary,
-        execute_tool_with_runtime_dispatch_with_cancellation,
+        execute_tool_with_runtime_dispatch_with_cancellation_and_progress,
         record_tool_execution_outcome_metrics, shared_tool_budget, shared_tool_budget_remaining,
         tool_cancellation_requires_execution_drain, GatewayRuntimeState,
         RunStreamToolExecutionOutcome, SharedToolBudget, ToolApprovalOutcome,
-        ToolRuntimeExecutionContext, TOOL_APPROVAL_RESPONSE_TIMEOUT,
+        ToolRuntimeDispatchControls, ToolRuntimeExecutionContext, PROCESS_RUNNER_TOOL_NAME,
+        TOOL_APPROVAL_RESPONSE_TIMEOUT,
     },
     journal::{
         ApprovalCreateRequest, ApprovalResolveRequest, OrchestratorTapeAppendRequest,
         ToolResultArtifactCreateRequest,
     },
     orchestrator::RunStateMachine,
+    sandbox_runner::{ProcessProgressEvent, ProcessProgressSink},
     tool_protocol::{denied_execution_outcome, ToolExecutionOutcome},
-    transport::grpc::auth::RequestContext,
+    transport::grpc::{auth::RequestContext, proto::palyra::common::v1 as common_v1},
 };
 
 use super::{
     cancellation::transition_run_stream_to_cancelled,
     tape::{
-        send_tool_approval_request_with_tape, send_tool_approval_response_with_tape,
-        send_tool_attestation_with_tape, send_tool_decision_with_tape,
-        send_tool_proposal_with_tape, send_tool_result_with_tape,
+        send_status_with_tape, send_tool_approval_request_with_tape,
+        send_tool_approval_response_with_tape, send_tool_attestation_with_tape,
+        send_tool_decision_with_tape, send_tool_proposal_with_tape, send_tool_result_with_tape,
     },
 };
 
@@ -713,9 +715,11 @@ async fn execute_parallel_prepared_tool_group(
         let nested_tool_budget = nested_tool_budget.clone();
         join_set.spawn(async move {
             match execute_prepared_tool_runtime(
+                None,
                 &runtime_state,
                 &request_context,
                 run_id.as_str(),
+                None,
                 &prepared,
                 Some(nested_tool_budget),
             )
@@ -1269,6 +1273,63 @@ fn allow_sensitive_tools_approval_outcome() -> ToolApprovalOutcome {
     }
 }
 
+fn process_progress_channel_for_tool(
+    tool_name: &str,
+    enabled: bool,
+) -> (Option<ProcessProgressSink>, Option<mpsc::UnboundedReceiver<ProcessProgressEvent>>) {
+    if !enabled || tool_name != PROCESS_RUNNER_TOOL_NAME {
+        return (None, None);
+    }
+    let (sender, receiver) = mpsc::unbounded_channel();
+    let sink: ProcessProgressSink = Arc::new(move |progress| {
+        let _ = sender.send(progress);
+    });
+    (Some(sink), Some(receiver))
+}
+
+#[allow(clippy::result_large_err)]
+async fn send_process_progress_status_with_tape(
+    sender: &mpsc::Sender<
+        Result<crate::transport::grpc::proto::palyra::common::v1::RunStreamEvent, Status>,
+    >,
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    proposal_id: &str,
+    progress: &ProcessProgressEvent,
+) -> Result<(), Status> {
+    let message = process_progress_status_message(proposal_id, progress);
+    send_status_with_tape(
+        sender,
+        runtime_state,
+        run_id,
+        tape_seq,
+        common_v1::stream_status::StatusKind::InProgress,
+        message.as_str(),
+    )
+    .await
+}
+
+fn process_progress_status_message(proposal_id: &str, progress: &ProcessProgressEvent) -> String {
+    serde_json::to_string(&json!({
+        "event": "tool.process.progress",
+        "proposal_id": proposal_id,
+        "pid": progress.pid,
+        "elapsed_ms": progress.elapsed_ms,
+        "stdout_bytes": progress.stdout_bytes,
+        "stderr_bytes": progress.stderr_bytes,
+        "stdout_tail": progress.stdout_tail,
+        "stderr_tail": progress.stderr_tail,
+        "last_output_at_ms": progress.last_output_at_ms,
+    }))
+    .unwrap_or_else(|_| {
+        format!(
+            "tool.process.progress proposal_id={proposal_id} pid={} elapsed_ms={}",
+            progress.pid, progress.elapsed_ms
+        )
+    })
+}
+
 #[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 async fn execute_prepared_run_stream_tool_proposal(
@@ -1285,9 +1346,11 @@ async fn execute_prepared_run_stream_tool_proposal(
 ) -> Result<RunStreamToolExecutionOutcome, Status> {
     let nested_tool_budget = shared_tool_budget(*remaining_tool_budget);
     let execution_outcome = match execute_prepared_tool_runtime(
+        Some(sender),
         runtime_state,
         request_context,
         run_id,
+        Some(tape_seq),
         &prepared,
         Some(nested_tool_budget.clone()),
     )
@@ -1315,9 +1378,15 @@ async fn execute_prepared_run_stream_tool_proposal(
 
 #[allow(clippy::result_large_err)]
 async fn execute_prepared_tool_runtime(
+    progress_sender: Option<
+        &mpsc::Sender<
+            Result<crate::transport::grpc::proto::palyra::common::v1::RunStreamEvent, Status>,
+        >,
+    >,
     runtime_state: &Arc<GatewayRuntimeState>,
     request_context: &RequestContext,
     run_id: &str,
+    mut progress_tape_seq: Option<&mut i64>,
     prepared: &RunStreamPreparedToolExecution,
     remaining_tool_budget: Option<SharedToolBudget>,
 ) -> Result<Option<ToolExecutionOutcome>, Status> {
@@ -1349,8 +1418,10 @@ async fn execute_prepared_tool_runtime(
         execution_surface = "run_stream",
         status = tracing::field::Empty,
     );
+    let (process_progress_sink, mut process_progress_rx) =
+        process_progress_channel_for_tool(prepared.tool_name.as_str(), progress_sender.is_some());
     let mut execution_future = Box::pin(
-        execute_tool_with_runtime_dispatch_with_cancellation(
+        execute_tool_with_runtime_dispatch_with_cancellation_and_progress(
             runtime_state,
             ToolRuntimeExecutionContext {
                 principal: request_context.principal.as_str(),
@@ -1364,8 +1435,11 @@ async fn execute_prepared_tool_runtime(
             prepared.proposal_id.as_str(),
             prepared.tool_name.as_str(),
             prepared.input_json.as_slice(),
-            remaining_tool_budget,
-            Some(Arc::clone(&cancellation_requested)),
+            ToolRuntimeDispatchControls {
+                remaining_tool_budget,
+                cancellation_requested: Some(Arc::clone(&cancellation_requested)),
+                process_progress_sink,
+            },
         )
         .instrument(tool_span),
     );
@@ -1377,6 +1451,31 @@ async fn execute_prepared_tool_runtime(
         tokio::select! {
             result = &mut execution_future => {
                 break result;
+            }
+            progress = async {
+                match process_progress_rx.as_mut() {
+                    Some(receiver) => receiver.recv().await,
+                    None => None,
+                }
+            }, if process_progress_rx.is_some() => {
+                match progress {
+                    Some(progress) => {
+                        send_process_progress_status_with_tape(
+                            progress_sender.expect("progress receiver requires sender"),
+                            runtime_state,
+                            run_id,
+                            progress_tape_seq
+                                .as_deref_mut()
+                                .expect("progress receiver requires tape sequence"),
+                            prepared.proposal_id.as_str(),
+                            &progress,
+                        )
+                        .await?;
+                    }
+                    None => {
+                        process_progress_rx = None;
+                    }
+                }
             }
             _ = cancel_poll.tick() => {
                 match runtime_state.is_orchestrator_cancel_requested(run_id.to_owned()).await {
@@ -1807,16 +1906,22 @@ fn redact_sensitive_json_object(
     map: &mut Map<String, Value>,
     redaction: ToolResultPreviewRedaction,
 ) {
-    for (key, value) in map.iter_mut() {
+    for key in map.keys().cloned().collect::<Vec<_>>() {
         if is_sensitive_key(key.as_str()) {
-            *value = Value::String(REDACTED.to_owned());
+            if let Some(value) = map.get_mut(&key) {
+                *value = Value::String(REDACTED.to_owned());
+            }
         } else if is_stream_binary_payload_key(key.as_str()) {
-            *value = stream_binary_payload_placeholder(value);
+            if let Some(value) = map.remove(&key) {
+                let replacement_key =
+                    unique_omitted_binary_payload_key(map, stream_binary_payload_kind(&key));
+                map.insert(replacement_key, stream_binary_payload_placeholder(&key, &value));
+            }
         } else if redaction.preserve_workspace_read_text && key == "text" {
-            if let Value::String(text) = value {
+            if let Some(Value::String(text)) = map.get_mut(&key) {
                 *text = redact_url_segments_in_text(text.as_str());
             }
-        } else {
+        } else if let Some(value) = map.get_mut(&key) {
             redact_sensitive_json_value(value, redaction);
         }
     }
@@ -1838,9 +1943,43 @@ fn is_stream_binary_payload_key(key: &str) -> bool {
         || normalized.ends_with("_screenshot_base64")
 }
 
-fn stream_binary_payload_placeholder(value: &Value) -> Value {
+fn stream_binary_payload_kind(key: &str) -> &'static str {
+    let normalized = key.to_ascii_lowercase().replace(['-', '.'], "_");
+    if normalized.contains("screenshot") {
+        "screenshot"
+    } else if normalized.contains("image") {
+        "image"
+    } else if normalized.contains("pdf") {
+        "pdf"
+    } else if normalized.contains("bytes") {
+        "bytes"
+    } else {
+        "binary"
+    }
+}
+
+fn unique_omitted_binary_payload_key(map: &Map<String, Value>, kind: &str) -> String {
+    let base = format!("omitted_{kind}_payload");
+    if !map.contains_key(&base) {
+        return base;
+    }
+    for index in 2.. {
+        let candidate = format!("{base}_{index}");
+        if !map.contains_key(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("unbounded suffix search must find a free omitted payload key")
+}
+
+fn stream_binary_payload_placeholder(key: &str, value: &Value) -> Value {
     let char_len = value.as_str().map(str::len).unwrap_or_default();
-    Value::String(format!("<redacted:base64 chars={char_len}>"))
+    json!({
+        "omitted": true,
+        "kind": stream_binary_payload_kind(key),
+        "encoding": "base64",
+        "base64_chars": char_len,
+    })
 }
 
 fn truncate_utf8(value: &str, max_bytes: usize) -> String {
@@ -1859,13 +1998,14 @@ mod tests {
     use super::{
         allow_sensitive_tools_approval_outcome, classify_tool_parallelism,
         drain_parallel_tool_group_after_cancel, drain_parallel_tool_group_after_error,
-        ParallelToolExecutionTaskOutcome, ToolParallelism,
+        process_progress_status_message, ParallelToolExecutionTaskOutcome, ToolParallelism,
     };
     use crate::journal::{ApprovalDecision, ApprovalDecisionScope};
+    use crate::sandbox_runner::ProcessProgressEvent;
     use crate::tool_protocol::{ToolAttestation, ToolExecutionOutcome};
     use palyra_common::runtime_contracts::{ToolResultSensitivity, ToolTurnBudget};
     use palyra_common::validate_canonical_id;
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -1930,6 +2070,32 @@ mod tests {
         );
         validate_canonical_id(outcome.approval_id.as_str())
             .expect("auto approval id should be canonical");
+    }
+
+    #[test]
+    fn process_progress_status_message_is_structured_json() {
+        let message = process_progress_status_message(
+            "proposal-1",
+            &ProcessProgressEvent {
+                pid: 42,
+                elapsed_ms: 6_000,
+                stdout_bytes: 128,
+                stderr_bytes: 9,
+                stdout_tail: "progress line".to_owned(),
+                stderr_tail: "warning".to_owned(),
+                last_output_at_ms: Some(5_800),
+            },
+        );
+        let parsed: Value =
+            serde_json::from_str(message.as_str()).expect("progress status should be JSON");
+
+        assert_eq!(parsed["event"], "tool.process.progress");
+        assert_eq!(parsed["proposal_id"], "proposal-1");
+        assert_eq!(parsed["pid"], 42);
+        assert_eq!(parsed["elapsed_ms"], 6_000);
+        assert_eq!(parsed["stdout_tail"], "progress line");
+        assert_eq!(parsed["stderr_tail"], "warning");
+        assert_eq!(parsed["last_output_at_ms"], 5_800);
     }
 
     #[tokio::test]
@@ -2020,7 +2186,9 @@ mod tests {
         assert!(preview.contains("\"document_scroll_width\":980"), "{preview}");
         assert!(preview.contains("\"mime_type\":\"image/png\""), "{preview}");
         assert!(preview.contains("\"size_bytes\":3072"), "{preview}");
-        assert!(preview.contains("\"image_base64\":\"<redacted:base64 chars=4096>\""), "{preview}");
+        assert!(preview.contains("\"omitted_image_payload\""), "{preview}");
+        assert!(preview.contains("\"base64_chars\":4096"), "{preview}");
+        assert!(!preview.contains("image_base64"), "{preview}");
         assert!(!preview.contains("AAAA"), "{preview}");
     }
 

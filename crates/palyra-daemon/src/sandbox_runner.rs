@@ -25,7 +25,7 @@ use std::{
     path::{Component, Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     thread,
@@ -60,6 +60,7 @@ use palyra_sandbox::{
     current_backend_kind, TierCBackendError, TierCCommandRequest, TierCPolicy,
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 // Input-shape caps applied before any spawn. They bound attacker-controlled argv/env size and
 // the allocations derived from it; raising any of them is a security-review change.
@@ -77,6 +78,14 @@ const CAPTURE_POLL_INTERVAL_MS: u64 = 5;
 const CAPTURE_CHUNK_BYTES: usize = 4 * 1024;
 const PROCESS_FAILURE_OUTPUT_PREVIEW_BYTES: usize = 4 * 1024;
 const PROCESS_FAILURE_OUTPUT_TAIL_BYTES: usize = 4 * 1024;
+const PROCESS_STREAM_INLINE_TEXT_BYTES: usize = 8 * 1024;
+const PROCESS_STREAM_HEAD_BYTES: usize = 4 * 1024;
+const PROCESS_STREAM_TAIL_BYTES: usize = 4 * 1024;
+const PROCESS_STREAM_HEX_PREVIEW_BYTES: usize = 64;
+const PROCESS_PROGRESS_MIN_ELAPSED_MS: u64 = 5_000;
+const PROCESS_PROGRESS_INTERVAL_MS: u64 = 2_000;
+const PROCESS_PROGRESS_TAIL_BYTES: usize = 1024;
+const PROCESS_PROGRESS_NO_OUTPUT_MS: u64 = u64::MAX;
 const BACKGROUND_STARTUP_CHECK_MS: u64 = 250;
 // Windows process startup and pipe readiness are noticeably slower, so the window for draining
 // startup output (port announcements etc.) before returning metadata is longer there.
@@ -324,6 +333,21 @@ fn process_runner_accepts_host_path_fields(policy: &SandboxProcessRunnerPolicy) 
 
 type ProcessRunnerInput = ProcessRunnerToolInput;
 
+/// Callback used by run-stream execution to publish foreground process progress.
+pub type ProcessProgressSink = Arc<dyn Fn(ProcessProgressEvent) + Send + Sync + 'static>;
+
+/// Bounded foreground-process progress snapshot emitted before the process exits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessProgressEvent {
+    pub pid: u32,
+    pub elapsed_ms: u64,
+    pub stdout_bytes: u64,
+    pub stderr_bytes: u64,
+    pub stdout_tail: String,
+    pub stderr_tail: String,
+    pub last_output_at_ms: Option<u64>,
+}
+
 #[derive(Debug)]
 struct ProcessExecutionCapture {
     exit_status: ExitStatus,
@@ -335,17 +359,113 @@ struct ProcessExecutionCapture {
     duration_ms: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct StreamCapture {
     bytes: Vec<u8>,
     truncated: bool,
     read_error: Option<String>,
 }
 
+impl StreamCapture {
+    fn from_text(text: String) -> Self {
+        Self { bytes: text.into_bytes(), truncated: false, read_error: None }
+    }
+}
+
 #[derive(Debug)]
 struct BackgroundOutputMonitor {
     stdout: Arc<Mutex<StreamCapture>>,
     stderr: Arc<Mutex<StreamCapture>>,
+}
+
+#[derive(Debug)]
+struct ProcessProgressMonitor {
+    stdout: Arc<Mutex<StreamCapture>>,
+    stderr: Arc<Mutex<StreamCapture>>,
+    last_output_elapsed_ms: Arc<AtomicU64>,
+    started_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct ProcessProgressStreamCapture {
+    capture: Arc<Mutex<StreamCapture>>,
+    last_output_elapsed_ms: Arc<AtomicU64>,
+    started_at: Instant,
+}
+
+impl ProcessProgressMonitor {
+    fn new(started_at: Instant) -> Self {
+        Self {
+            stdout: Arc::new(Mutex::new(StreamCapture::default())),
+            stderr: Arc::new(Mutex::new(StreamCapture::default())),
+            last_output_elapsed_ms: Arc::new(AtomicU64::new(PROCESS_PROGRESS_NO_OUTPUT_MS)),
+            started_at,
+        }
+    }
+
+    fn stdout_capture(&self) -> ProcessProgressStreamCapture {
+        ProcessProgressStreamCapture {
+            capture: Arc::clone(&self.stdout),
+            last_output_elapsed_ms: Arc::clone(&self.last_output_elapsed_ms),
+            started_at: self.started_at,
+        }
+    }
+
+    fn stderr_capture(&self) -> ProcessProgressStreamCapture {
+        ProcessProgressStreamCapture {
+            capture: Arc::clone(&self.stderr),
+            last_output_elapsed_ms: Arc::clone(&self.last_output_elapsed_ms),
+            started_at: self.started_at,
+        }
+    }
+
+    fn snapshot(&self, pid: u32, elapsed_ms: u64) -> ProcessProgressEvent {
+        let stdout = stream_capture_snapshot(&self.stdout, "stdout");
+        let stderr = stream_capture_snapshot(&self.stderr, "stderr");
+        let last_output_at_ms = match self.last_output_elapsed_ms.load(Ordering::Relaxed) {
+            PROCESS_PROGRESS_NO_OUTPUT_MS => None,
+            value => Some(value),
+        };
+        ProcessProgressEvent {
+            pid,
+            elapsed_ms,
+            stdout_bytes: stdout.bytes.len() as u64,
+            stderr_bytes: stderr.bytes.len() as u64,
+            stdout_tail: process_progress_tail("stdout", stdout.bytes.as_slice()),
+            stderr_tail: process_progress_tail("stderr", stderr.bytes.as_slice()),
+            last_output_at_ms,
+        }
+    }
+}
+
+impl ProcessProgressStreamCapture {
+    fn record_bytes(&self, chunk: &[u8]) {
+        if chunk.is_empty() {
+            return;
+        }
+        if let Ok(mut capture) = self.capture.lock() {
+            capture.bytes.extend_from_slice(chunk);
+        }
+        self.record_output_timestamp();
+    }
+
+    fn mark_truncated(&self) {
+        if let Ok(mut capture) = self.capture.lock() {
+            capture.truncated = true;
+        }
+        self.record_output_timestamp();
+    }
+
+    fn record_read_error(&self, error: String) {
+        if let Ok(mut capture) = self.capture.lock() {
+            capture.read_error = Some(error);
+        }
+        self.record_output_timestamp();
+    }
+
+    fn record_output_timestamp(&self) {
+        self.last_output_elapsed_ms.store(elapsed_millis_u64(self.started_at), Ordering::Relaxed);
+    }
 }
 
 /// Liveness snapshot of a background process and its tracked descendants.
@@ -504,6 +624,40 @@ fn background_snapshot_has_output_or_error(snapshot: &(StreamCapture, StreamCapt
         || stderr.read_error.is_some()
 }
 
+fn stream_capture_snapshot(
+    capture: &Arc<Mutex<StreamCapture>>,
+    stream_name: &str,
+) -> StreamCapture {
+    capture.lock().map(|capture| capture.clone()).unwrap_or_else(|_| StreamCapture {
+        bytes: Vec::new(),
+        truncated: false,
+        read_error: Some(format!("{stream_name} progress capture lock poisoned")),
+    })
+}
+
+fn elapsed_millis_u64(started_at: Instant) -> u64 {
+    let elapsed = started_at.elapsed().as_millis();
+    elapsed.min(u128::from(u64::MAX)) as u64
+}
+
+fn process_progress_tail(stream_name: &str, output: &[u8]) -> String {
+    if output.is_empty() {
+        return String::new();
+    }
+    if process_output_looks_binary(output) {
+        return format!(
+            "<binary {stream_name} tail omitted: size_bytes={} sha256={} tail_hex={}>",
+            output.len(),
+            sha256_hex(output),
+            process_bytes_tail_hex(output)
+        );
+    }
+    let decoded = decode_process_output_text(output);
+    let RedactedProcessOutputText { text, .. } =
+        redacted_process_output_text(decoded.text.as_str());
+    process_text_suffix(text.as_str(), PROCESS_PROGRESS_TAIL_BYTES)
+}
+
 /// Test-only convenience wrapper over [`run_constrained_process_with_cancellation`] without a
 /// cancellation flag.
 #[cfg(test)]
@@ -537,6 +691,27 @@ pub fn run_constrained_process_with_cancellation(
     input_json: &[u8],
     execution_timeout: Duration,
     cancellation_requested: Option<Arc<AtomicBool>>,
+) -> Result<SandboxProcessRunSuccess, SandboxProcessRunError> {
+    run_constrained_process_with_cancellation_and_progress(
+        policy,
+        input_json,
+        execution_timeout,
+        cancellation_requested,
+        None,
+    )
+}
+
+/// Validates and executes one `palyra.process.run` invocation with optional progress snapshots.
+///
+/// See [`run_constrained_process_with_cancellation`] for the execution contract. When
+/// `progress_sink` is present, foreground process capture emits redacted, bounded progress
+/// events after the process has been running long enough to be user-visible.
+pub fn run_constrained_process_with_cancellation_and_progress(
+    policy: &SandboxProcessRunnerPolicy,
+    input_json: &[u8],
+    execution_timeout: Duration,
+    cancellation_requested: Option<Arc<AtomicBool>>,
+    progress_sink: Option<ProcessProgressSink>,
 ) -> Result<SandboxProcessRunSuccess, SandboxProcessRunError> {
     if !policy.enabled {
         return Err(SandboxProcessRunError {
@@ -693,6 +868,7 @@ pub fn run_constrained_process_with_cancellation(
         working_directory.as_path(),
         per_call_timeout,
         cancellation_requested,
+        progress_sink,
     )?;
     if capture.cancelled {
         return Err(SandboxProcessRunError {
@@ -704,8 +880,9 @@ pub fn run_constrained_process_with_cancellation(
         return Err(SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::TimedOut,
             message: format!(
-                "sandbox process timed out after {}ms and was terminated; for dev servers or intentional long-running services, rerun with background=true and an explicit timeout_ms lifetime, then poll or stop the returned process handle. Do not use background=true to verify tests or builds; rerun those foreground with a longer timeout after fixing the hang.",
-                per_call_timeout.as_millis()
+                "sandbox process timed out after {}ms and was terminated; process_output_summary={}; for dev servers or intentional long-running services, rerun with background=true and an explicit timeout_ms lifetime, then poll or stop the returned process handle. Do not use background=true to verify tests or builds; rerun those foreground with a longer timeout after fixing the hang.",
+                per_call_timeout.as_millis(),
+                process_output_diagnostic_summary(&capture.stdout, &capture.stderr)
             ),
         });
     }
@@ -713,8 +890,9 @@ pub fn run_constrained_process_with_cancellation(
         return Err(SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::QuotaExceeded,
             message: format!(
-                "sandbox process exceeded output quota (max_output_bytes={}) and was terminated",
-                policy.max_output_bytes
+                "sandbox process exceeded output quota (max_output_bytes={}) and was terminated; process_output_summary={}",
+                policy.max_output_bytes,
+                process_output_diagnostic_summary(&capture.stdout, &capture.stderr)
             ),
         });
     }
@@ -741,26 +919,18 @@ pub fn run_constrained_process_with_cancellation(
         });
     }
 
-    let RedactedProcessOutputText { text: stdout, redacted: stdout_redacted } =
-        redacted_process_output(capture.stdout.bytes.as_slice());
-    let RedactedProcessOutputText { text: stderr, redacted: stderr_redacted } =
-        redacted_process_output(capture.stderr.bytes.as_slice());
-    let output_json = serde_json::to_vec(&json!({
-        "exit_code": capture.exit_status.code().unwrap_or(0),
-        "stdout": stdout,
-        "stderr": stderr,
-        "stdout_truncated": capture.stdout.truncated,
-        "stderr_truncated": capture.stderr.truncated,
-        "stdout_redacted": stdout_redacted,
-        "stderr_redacted": stderr_redacted,
-        "duration_ms": capture.duration_ms,
-        "tier": policy.tier.as_str(),
-        "sandbox_backend": if matches!(policy.tier, SandboxProcessRunnerTier::C) {
+    let output_json = process_success_output_json(
+        capture.exit_status.code().unwrap_or(0),
+        &capture.stdout,
+        &capture.stderr,
+        capture.duration_ms,
+        policy.tier.as_str(),
+        if matches!(policy.tier, SandboxProcessRunnerTier::C) {
             current_backend_kind().as_str()
         } else {
             "tier_b_in_process"
         },
-    }))
+    )
     .map_err(|error| SandboxProcessRunError {
         kind: SandboxProcessRunErrorKind::RuntimeFailure,
         message: format!("failed to serialize sandbox process output JSON: {error}"),
@@ -806,12 +976,9 @@ fn process_failure_diagnostic_hint(
     stdout: &StreamCapture,
     stderr: &StreamCapture,
 ) -> Option<&'static str> {
-    let output = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(stdout.bytes.as_slice()),
-        String::from_utf8_lossy(stderr.bytes.as_slice())
-    )
-    .to_ascii_lowercase();
+    let stdout = decode_process_output_text(stdout.bytes.as_slice());
+    let stderr = decode_process_output_text(stderr.bytes.as_slice());
+    let output = format!("{}\n{}", stdout.text, stderr.text,).to_ascii_lowercase();
     if (output.contains("windows subsystem for linux") || output.contains("wsl"))
         && output.contains("no installed")
         && output.contains("distribution")
@@ -842,7 +1009,7 @@ fn redacted_process_output_tail(output: &[u8]) -> Option<String> {
 }
 
 fn redacted_process_output_single_line(output: &[u8]) -> Option<String> {
-    let text = String::from_utf8_lossy(output);
+    let text = decode_process_output_text(output).text;
     let normalized = text
         .chars()
         .map(|character| if character.is_control() { ' ' } else { character })
@@ -867,9 +1034,158 @@ struct RedactedProcessOutputText {
     redacted: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DecodedProcessOutputText {
+    text: String,
+    encoding: &'static str,
+    decode_replacement_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcessStreamOutputView {
+    model_text: String,
+    redacted: bool,
+    metadata: Value,
+}
+
+fn process_success_output_json(
+    exit_code: i32,
+    stdout: &StreamCapture,
+    stderr: &StreamCapture,
+    duration_ms: u64,
+    tier: &str,
+    sandbox_backend: &str,
+) -> serde_json::Result<Vec<u8>> {
+    let stdout_view = process_stream_output_view("stdout", stdout);
+    let stderr_view = process_stream_output_view("stderr", stderr);
+    serde_json::to_vec(&json!({
+        "schema_version": 2,
+        "exit_code": exit_code,
+        "stdout": stdout_view.model_text,
+        "stderr": stderr_view.model_text,
+        "stdout_truncated": stdout.truncated,
+        "stderr_truncated": stderr.truncated,
+        "stdout_redacted": stdout_view.redacted,
+        "stderr_redacted": stderr_view.redacted,
+        "stdout_bytes": stdout.bytes.len(),
+        "stderr_bytes": stderr.bytes.len(),
+        "duration_ms": duration_ms,
+        "tier": tier,
+        "sandbox_backend": sandbox_backend,
+        "streams": {
+            "stdout": stdout_view.metadata,
+            "stderr": stderr_view.metadata,
+        },
+    }))
+}
+
+fn process_stream_output_view(
+    stream_name: &str,
+    stream: &StreamCapture,
+) -> ProcessStreamOutputView {
+    let size_bytes = stream.bytes.len();
+    let sha256 = sha256_hex(stream.bytes.as_slice());
+    if process_output_looks_binary(stream.bytes.as_slice()) {
+        let model_text = if stream.bytes.is_empty() {
+            String::new()
+        } else {
+            format!("<binary {stream_name} omitted: size_bytes={size_bytes} sha256={sha256}>")
+        };
+        return ProcessStreamOutputView {
+            model_text,
+            redacted: false,
+            metadata: json!({
+                "size_bytes": size_bytes,
+                "captured_bytes": size_bytes,
+                "truncated": stream.truncated,
+                "binary": true,
+                "binary_output_omitted": !stream.bytes.is_empty(),
+                "encoding": null,
+                "decode_replacement_count": 0,
+                "sha256": sha256,
+                "head_hex": process_bytes_head_hex(stream.bytes.as_slice()),
+                "tail_hex": process_bytes_tail_hex(stream.bytes.as_slice()),
+            }),
+        };
+    }
+
+    let decoded = decode_process_output_text(stream.bytes.as_slice());
+    let RedactedProcessOutputText { text, redacted } =
+        redacted_process_output_text(decoded.text.as_str());
+    let inline_truncated = text.len() > PROCESS_STREAM_INLINE_TEXT_BYTES;
+    let model_text = if inline_truncated {
+        format!("<{stream_name} omitted: size_bytes={size_bytes} sha256={sha256}; see streams.{stream_name}.head and streams.{stream_name}.tail>")
+    } else {
+        text.clone()
+    };
+    let decode_warning = (decoded.decode_replacement_count > 0).then(|| {
+        format!(
+            "process {stream_name} decoding used replacement characters; inspect raw bytes by sha256"
+        )
+    });
+
+    ProcessStreamOutputView {
+        model_text,
+        redacted,
+        metadata: json!({
+            "size_bytes": size_bytes,
+            "captured_bytes": size_bytes,
+            "truncated": stream.truncated,
+            "binary": false,
+            "binary_output_omitted": false,
+            "encoding": decoded.encoding,
+            "decode_replacement_count": decoded.decode_replacement_count,
+            "decode_warning": decode_warning,
+            "sha256": sha256,
+            "inline_truncated": inline_truncated,
+            "head": process_text_prefix(text.as_str(), PROCESS_STREAM_HEAD_BYTES),
+            "tail": process_text_suffix(text.as_str(), PROCESS_STREAM_TAIL_BYTES),
+            "redacted": redacted,
+        }),
+    }
+}
+
+fn process_output_diagnostic_summary(stdout: &StreamCapture, stderr: &StreamCapture) -> String {
+    let summary = json!({
+        "stdout": process_stream_diagnostic_summary("stdout", stdout),
+        "stderr": process_stream_diagnostic_summary("stderr", stderr),
+    });
+    serde_json::to_string(&summary).unwrap_or_else(|_| "{}".to_owned())
+}
+
+fn process_stream_diagnostic_summary(stream_name: &str, stream: &StreamCapture) -> Value {
+    let size_bytes = stream.bytes.len();
+    let sha256 = sha256_hex(stream.bytes.as_slice());
+    if process_output_looks_binary(stream.bytes.as_slice()) {
+        return json!({
+            "size_bytes": size_bytes,
+            "truncated": stream.truncated,
+            "binary": true,
+            "binary_output_omitted": !stream.bytes.is_empty(),
+            "sha256": sha256,
+            "tail_hex": process_bytes_tail_hex(stream.bytes.as_slice()),
+        });
+    }
+
+    let decoded = decode_process_output_text(stream.bytes.as_slice());
+    let RedactedProcessOutputText { text, redacted } =
+        redacted_process_output_text(decoded.text.as_str());
+    json!({
+        "size_bytes": size_bytes,
+        "truncated": stream.truncated,
+        "binary": false,
+        "encoding": decoded.encoding,
+        "decode_replacement_count": decoded.decode_replacement_count,
+        "sha256": sha256,
+        "tail": process_text_suffix(text.as_str(), PROCESS_STREAM_TAIL_BYTES),
+        "redacted": redacted,
+        "stream": stream_name,
+    })
+}
+
 fn redacted_process_output(output: &[u8]) -> RedactedProcessOutputText {
-    let text = String::from_utf8_lossy(output).to_string();
-    redacted_process_output_text(text.as_str())
+    let decoded = decode_process_output_text(output);
+    redacted_process_output_text(decoded.text.as_str())
 }
 
 fn redacted_process_output_text(value: &str) -> RedactedProcessOutputText {
@@ -909,6 +1225,119 @@ fn restore_process_output_trailing_line_endings(original: &str, redacted: String
     let mut restored = redacted[..redacted_base_len].to_owned();
     restored.push_str(expected_suffix);
     restored
+}
+
+fn decode_process_output_text(output: &[u8]) -> DecodedProcessOutputText {
+    match std::str::from_utf8(output) {
+        Ok(text) => DecodedProcessOutputText {
+            text: text.to_owned(),
+            encoding: "utf-8",
+            decode_replacement_count: 0,
+        },
+        Err(_) => decode_windows_1252_process_output(output),
+    }
+}
+
+fn decode_windows_1252_process_output(output: &[u8]) -> DecodedProcessOutputText {
+    let mut text = String::with_capacity(output.len());
+    let mut decode_replacement_count = 0;
+    for byte in output {
+        match windows_1252_char(*byte) {
+            Some(character) => text.push(character),
+            None => {
+                text.push('\u{fffd}');
+                decode_replacement_count += 1;
+            }
+        }
+    }
+    DecodedProcessOutputText { text, encoding: "windows-1252", decode_replacement_count }
+}
+
+fn windows_1252_char(byte: u8) -> Option<char> {
+    match byte {
+        0x80 => Some('\u{20ac}'),
+        0x81 => None,
+        0x82 => Some('\u{201a}'),
+        0x83 => Some('\u{0192}'),
+        0x84 => Some('\u{201e}'),
+        0x85 => Some('\u{2026}'),
+        0x86 => Some('\u{2020}'),
+        0x87 => Some('\u{2021}'),
+        0x88 => Some('\u{02c6}'),
+        0x89 => Some('\u{2030}'),
+        0x8a => Some('\u{0160}'),
+        0x8b => Some('\u{2039}'),
+        0x8c => Some('\u{0152}'),
+        0x8d => None,
+        0x8e => Some('\u{017d}'),
+        0x8f => None,
+        0x90 => None,
+        0x91 => Some('\u{2018}'),
+        0x92 => Some('\u{2019}'),
+        0x93 => Some('\u{201c}'),
+        0x94 => Some('\u{201d}'),
+        0x95 => Some('\u{2022}'),
+        0x96 => Some('\u{2013}'),
+        0x97 => Some('\u{2014}'),
+        0x98 => Some('\u{02dc}'),
+        0x99 => Some('\u{2122}'),
+        0x9a => Some('\u{0161}'),
+        0x9b => Some('\u{203a}'),
+        0x9c => Some('\u{0153}'),
+        0x9d => None,
+        0x9e => Some('\u{017e}'),
+        0x9f => Some('\u{0178}'),
+        _ => char::from_u32(u32::from(byte)),
+    }
+}
+
+fn process_output_looks_binary(output: &[u8]) -> bool {
+    if output.is_empty() {
+        return false;
+    }
+    if output.contains(&0) {
+        return true;
+    }
+    let control_bytes = output
+        .iter()
+        .filter(|byte| matches!(**byte, 0x01..=0x08 | 0x0b | 0x0c | 0x0e..=0x1f | 0x7f))
+        .count();
+    control_bytes > 8 && control_bytes.saturating_mul(100) > output.len()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn process_bytes_head_hex(bytes: &[u8]) -> String {
+    let end = bytes.len().min(PROCESS_STREAM_HEX_PREVIEW_BYTES);
+    hex::encode(&bytes[..end])
+}
+
+fn process_bytes_tail_hex(bytes: &[u8]) -> String {
+    let start = bytes.len().saturating_sub(PROCESS_STREAM_HEX_PREVIEW_BYTES);
+    hex::encode(&bytes[start..])
+}
+
+fn process_text_prefix(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    text.char_indices()
+        .take_while(|(index, character)| index.saturating_add(character.len_utf8()) <= max_bytes)
+        .map(|(_, character)| character)
+        .collect()
+}
+
+fn process_text_suffix(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let mut start = text.len().saturating_sub(max_bytes);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text[start..].to_owned()
 }
 
 fn redact_sensitive_url_path_segments_in_text(value: &str) -> String {
@@ -995,16 +1424,16 @@ fn execute_builtin_process_command(
                     message: "palyra.process.run builtin 'pwd' does not accept args".to_owned(),
                 });
             }
-            format!("{}\n", cwd.to_string_lossy())
+            StreamCapture::from_text(format!("{}\n", cwd.to_string_lossy()))
         }
-        "echo" => format!("{}\n", input.args.join(" ")),
-        "ls" | "dir" => builtin_list_directory_stdout(
+        "echo" => StreamCapture::from_text(format!("{}\n", input.args.join(" "))),
+        "ls" | "dir" => StreamCapture::from_text(builtin_list_directory_stdout(
             path_access_mode,
             command,
             input.args.as_slice(),
             workspace_root,
             cwd,
-        )?,
+        )?),
         "cat" | "type" => builtin_read_files_stdout(
             path_access_mode,
             command,
@@ -1013,29 +1442,24 @@ fn execute_builtin_process_command(
             cwd,
             policy.max_output_bytes,
         )?,
-        "mkdir" => builtin_make_directory_stdout(
+        "mkdir" => StreamCapture::from_text(builtin_make_directory_stdout(
             path_access_mode,
             command,
             input.args.as_slice(),
             workspace_root,
             cwd,
-        )?,
+        )?),
         _ => return Ok(None),
     };
-    let RedactedProcessOutputText { text: stdout, redacted: stdout_redacted } =
-        redacted_process_output_text(stdout.as_str());
-    let output_json = serde_json::to_vec(&json!({
-        "exit_code": 0,
-        "stdout": stdout,
-        "stderr": "",
-        "stdout_truncated": false,
-        "stderr_truncated": false,
-        "stdout_redacted": stdout_redacted,
-        "stderr_redacted": false,
-        "duration_ms": 0,
-        "tier": policy.tier.as_str(),
-        "sandbox_backend": "builtin_portable",
-    }))
+    let stderr = StreamCapture::default();
+    let output_json = process_success_output_json(
+        0,
+        &stdout,
+        &stderr,
+        0,
+        policy.tier.as_str(),
+        "builtin_portable",
+    )
     .map_err(|error| SandboxProcessRunError {
         kind: SandboxProcessRunErrorKind::RuntimeFailure,
         message: format!("failed to serialize sandbox builtin process output JSON: {error}"),
@@ -1273,7 +1697,7 @@ fn builtin_read_files_stdout(
     workspace_root: &Path,
     cwd: &Path,
     max_output_bytes: u64,
-) -> Result<String, SandboxProcessRunError> {
+) -> Result<StreamCapture, SandboxProcessRunError> {
     let mut paths = Vec::new();
     let mut end_of_options = false;
     for arg in args {
@@ -1353,11 +1777,10 @@ fn builtin_read_files_stdout(
         output.extend_from_slice(chunk.as_slice());
     }
 
-    let mut stdout = String::from_utf8_lossy(output.as_slice()).to_string();
     if truncated {
-        stdout.push_str(&format!("\n... truncated after {max_bytes} bytes\n"));
+        output.extend_from_slice(format!("\n... truncated after {max_bytes} bytes\n").as_bytes());
     }
-    Ok(stdout)
+    Ok(StreamCapture { bytes: output, truncated, read_error: None })
 }
 
 fn builtin_list_directory_stdout(
@@ -4046,6 +4469,7 @@ fn execute_process(
     cwd: &Path,
     timeout: Duration,
     cancellation_requested: Option<Arc<AtomicBool>>,
+    progress_sink: Option<ProcessProgressSink>,
 ) -> Result<ProcessExecutionCapture, SandboxProcessRunError> {
     let mut command = build_process_command(policy, input, workspace_root, cwd)?;
     configure_child_process_group(&mut command);
@@ -4064,6 +4488,7 @@ fn execute_process(
         timeout,
         policy.max_output_bytes as usize,
         cancellation_requested,
+        progress_sink,
     )
 }
 
@@ -6002,6 +6427,7 @@ fn capture_child_output(
     timeout: Duration,
     max_output_bytes: usize,
     cancellation_requested: Option<Arc<AtomicBool>>,
+    progress_sink: Option<ProcessProgressSink>,
 ) -> Result<ProcessExecutionCapture, SandboxProcessRunError> {
     let stdout = child.stdout.take().ok_or_else(|| SandboxProcessRunError {
         kind: SandboxProcessRunErrorKind::RuntimeFailure,
@@ -6014,22 +6440,43 @@ fn capture_child_output(
 
     let quota_triggered = Arc::new(AtomicBool::new(false));
     let remaining_budget = Arc::new(AtomicUsize::new(max_output_bytes));
-    let stdout_reader =
-        spawn_capture_reader(stdout, Arc::clone(&remaining_budget), Arc::clone(&quota_triggered));
-    let stderr_reader =
-        spawn_capture_reader(stderr, Arc::clone(&remaining_budget), Arc::clone(&quota_triggered));
+    let started_at = Instant::now();
+    let progress_monitor = progress_sink.as_ref().map(|_| ProcessProgressMonitor::new(started_at));
+    let stdout_reader = spawn_capture_reader(
+        stdout,
+        Arc::clone(&remaining_budget),
+        Arc::clone(&quota_triggered),
+        progress_monitor.as_ref().map(ProcessProgressMonitor::stdout_capture),
+    );
+    let stderr_reader = spawn_capture_reader(
+        stderr,
+        Arc::clone(&remaining_budget),
+        Arc::clone(&quota_triggered),
+        progress_monitor.as_ref().map(ProcessProgressMonitor::stderr_capture),
+    );
 
     // Poll loop semantics: cancellation, output quota, and timeout each request a single
     // tree-wide kill (guarded by `termination_requested`), but the loop keeps running until the
     // child actually exits so the reader threads can drain the pipes and report truthful
     // truncation state. All three flags are sticky and reported with that priority by the
     // caller (cancelled > timed_out > quota_exceeded).
-    let started_at = Instant::now();
     let mut timed_out = false;
     let mut quota_exceeded = false;
     let mut cancelled = false;
     let mut termination_requested = false;
+    let mut last_progress_emitted_at = None;
+    let mut last_progress_stdout_bytes = 0_usize;
+    let mut last_progress_stderr_bytes = 0_usize;
     let exit_status = loop {
+        maybe_emit_process_progress(
+            progress_sink.as_ref(),
+            progress_monitor.as_ref(),
+            child.id(),
+            started_at,
+            &mut last_progress_emitted_at,
+            &mut last_progress_stdout_bytes,
+            &mut last_progress_stderr_bytes,
+        );
         if cancellation_requested
             .as_ref()
             .is_some_and(|requested| requested.load(Ordering::Relaxed))
@@ -6093,12 +6540,50 @@ fn capture_child_output(
     })
 }
 
+fn maybe_emit_process_progress(
+    progress_sink: Option<&ProcessProgressSink>,
+    progress_monitor: Option<&ProcessProgressMonitor>,
+    pid: u32,
+    started_at: Instant,
+    last_progress_emitted_at: &mut Option<Instant>,
+    last_progress_stdout_bytes: &mut usize,
+    last_progress_stderr_bytes: &mut usize,
+) {
+    let (Some(progress_sink), Some(progress_monitor)) = (progress_sink, progress_monitor) else {
+        return;
+    };
+    if started_at.elapsed() < Duration::from_millis(PROCESS_PROGRESS_MIN_ELAPSED_MS) {
+        return;
+    }
+    if last_progress_emitted_at.is_some_and(|emitted_at| {
+        emitted_at.elapsed() < Duration::from_millis(PROCESS_PROGRESS_INTERVAL_MS)
+    }) {
+        return;
+    }
+
+    let elapsed_ms = elapsed_millis_u64(started_at);
+    let event = progress_monitor.snapshot(pid, elapsed_ms);
+    let output_changed = event.stdout_bytes as usize != *last_progress_stdout_bytes
+        || event.stderr_bytes as usize != *last_progress_stderr_bytes;
+    if last_progress_emitted_at.is_some() && !output_changed {
+        progress_sink(event.clone());
+        *last_progress_emitted_at = Some(Instant::now());
+        return;
+    }
+
+    *last_progress_stdout_bytes = event.stdout_bytes as usize;
+    *last_progress_stderr_bytes = event.stderr_bytes as usize;
+    progress_sink(event);
+    *last_progress_emitted_at = Some(Instant::now());
+}
+
 // Reader threads stop consuming once the shared budget is exhausted; combined with the kill in
 // the capture loop this bounds both memory use and how long a chatty child can keep running.
 fn spawn_capture_reader<R>(
     mut reader: R,
     remaining_budget: Arc<AtomicUsize>,
     quota_triggered: Arc<AtomicBool>,
+    progress: Option<ProcessProgressStreamCapture>,
 ) -> thread::JoinHandle<StreamCapture>
 where
     R: Read + Send + 'static,
@@ -6114,14 +6599,23 @@ where
                     let granted = reserve_output_budget(remaining_budget.as_ref(), read_count);
                     if granted > 0 {
                         bytes.extend_from_slice(&buffer[..granted]);
+                        if let Some(progress) = progress.as_ref() {
+                            progress.record_bytes(&buffer[..granted]);
+                        }
                     }
                     if granted < read_count {
                         truncated = true;
                         quota_triggered.store(true, Ordering::Relaxed);
+                        if let Some(progress) = progress.as_ref() {
+                            progress.mark_truncated();
+                        }
                         break;
                     }
                 }
                 Err(error) => {
+                    if let Some(progress) = progress.as_ref() {
+                        progress.record_read_error(error.to_string());
+                    }
                     return StreamCapture { bytes, truncated, read_error: Some(error.to_string()) };
                 }
             }
@@ -6172,11 +6666,13 @@ mod tests {
     use super::{
         build_process_command, builtin_list_directory_stdout, canonical_workspace_root,
         collect_requested_egress_hosts, command_env_value_os, cpu_rlimit_seconds_from_usage_micros,
-        host_access_roots_for_input, is_host_allowlisted, process_failure_message,
-        process_runner_command_with_args_message, redacted_process_output_preview,
-        redacted_process_output_text, resolve_host_executable_path_with_roots,
-        resolve_host_working_directory, resolve_host_working_directory_with_roots,
-        resolve_scoped_path, resolve_unrestricted_working_directory, resolve_working_directory,
+        host_access_roots_for_input, is_host_allowlisted, maybe_emit_process_progress,
+        process_failure_message, process_output_diagnostic_summary,
+        process_runner_command_with_args_message, process_success_output_json,
+        redacted_process_output_preview, redacted_process_output_text,
+        resolve_host_executable_path_with_roots, resolve_host_working_directory,
+        resolve_host_working_directory_with_roots, resolve_scoped_path,
+        resolve_unrestricted_working_directory, resolve_working_directory,
         rewrite_arguments_to_scoped_paths, rewrite_host_access_process_args,
         rewrite_host_virtual_workspace_args, run_constrained_process,
         run_constrained_process_with_cancellation, same_path_case_aware,
@@ -6186,10 +6682,11 @@ mod tests {
         validate_no_embedded_command_line_arg, validate_process_env_overrides,
         validate_process_prepend_path_shape, validate_process_termination_scope,
         validate_runtime_egress_enforcement, EgressEnforcementMode, PathAccessMode,
-        ProcessRunnerInput, SandboxProcessRunErrorKind, SandboxProcessRunnerPolicy,
-        SandboxProcessRunnerTier, StreamCapture, BACKGROUND_MONITOR_POLL_MS,
-        BACKGROUND_TERMINATION_WAIT_MS, MAX_PREPEND_PATH_COUNT, NODE_DISABLE_COMPILE_CACHE_ENV,
-        PALYRA_OS_FILE_ROOTS_ENV,
+        ProcessProgressMonitor, ProcessProgressSink, ProcessRunnerInput,
+        SandboxProcessRunErrorKind, SandboxProcessRunnerPolicy, SandboxProcessRunnerTier,
+        StreamCapture, BACKGROUND_MONITOR_POLL_MS, BACKGROUND_TERMINATION_WAIT_MS,
+        MAX_PREPEND_PATH_COUNT, NODE_DISABLE_COMPILE_CACHE_ENV, PALYRA_OS_FILE_ROOTS_ENV,
+        PROCESS_PROGRESS_MIN_ELAPSED_MS,
     };
     #[cfg(windows)]
     use super::{
@@ -9967,6 +10464,155 @@ mod tests {
         assert!(!preview.contains("abc123"), "{preview}");
         assert!(!preview.contains("qwerty"), "{preview}");
         assert!(preview.contains("node failed"), "{preview}");
+    }
+
+    #[test]
+    fn process_success_output_summarizes_large_stdout() {
+        let stdout = StreamCapture {
+            bytes: b"package manager progress line\n".repeat(10_000),
+            truncated: false,
+            read_error: None,
+        };
+        let stderr = StreamCapture::default();
+
+        let output = process_success_output_json(0, &stdout, &stderr, 42, "b", "tier_b_in_process")
+            .expect("process output should serialize");
+        let rendered = String::from_utf8(output.clone()).expect("output should be utf-8 JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(output.as_slice()).expect("output should parse");
+
+        assert!(rendered.len() < 16 * 1024, "model-visible JSON should stay small");
+        assert!(
+            parsed["stdout"].as_str().is_some_and(|value| value.contains("stdout omitted")),
+            "large stdout should not stay fully inline: {rendered}"
+        );
+        assert_eq!(
+            parsed.pointer("/streams/stdout/inline_truncated").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert!(
+            parsed
+                .pointer("/streams/stdout/head")
+                .and_then(|v| v.as_str())
+                .is_some_and(|value| { value.contains("package manager progress line") }),
+            "summary should include head text"
+        );
+        assert!(
+            parsed
+                .pointer("/streams/stdout/tail")
+                .and_then(|v| v.as_str())
+                .is_some_and(|value| { value.contains("package manager progress line") }),
+            "summary should include tail text"
+        );
+    }
+
+    #[test]
+    fn process_success_output_omits_binary_stdout() {
+        let mut binary = b"\x7fELF".to_vec();
+        binary.extend_from_slice(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        binary.extend_from_slice(&[0; 256]);
+        let stdout = StreamCapture { bytes: binary, truncated: false, read_error: None };
+        let stderr = StreamCapture::default();
+
+        let output = process_success_output_json(0, &stdout, &stderr, 7, "b", "tier_b_in_process")
+            .expect("process output should serialize");
+        let rendered = String::from_utf8(output.clone()).expect("output should be utf-8 JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(output.as_slice()).expect("output should parse");
+
+        assert!(rendered.contains("binary stdout omitted"), "{rendered}");
+        assert!(!rendered.contains("\\u0000"), "raw binary escapes must not be model-visible");
+        assert_eq!(parsed.pointer("/streams/stdout/binary").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            parsed.pointer("/streams/stdout/binary_output_omitted").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert!(
+            parsed
+                .pointer("/streams/stdout/head_hex")
+                .and_then(|v| v.as_str())
+                .is_some_and(|value| value.starts_with("7f454c4600010203040506070809")),
+            "binary summary should expose hex metadata without raw control escapes"
+        );
+    }
+
+    #[test]
+    fn process_success_output_decodes_windows_1252_degree_symbol_with_metadata() {
+        let stdout = StreamCapture {
+            bytes: b"Station 101 mean temperature: -15.5\xb0C\n".to_vec(),
+            truncated: false,
+            read_error: None,
+        };
+        let stderr = StreamCapture::default();
+
+        let output = process_success_output_json(0, &stdout, &stderr, 3, "b", "tier_b_in_process")
+            .expect("process output should serialize");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(output.as_slice()).expect("output should parse");
+        let stdout = parsed["stdout"].as_str().expect("stdout should be string");
+
+        assert!(stdout.contains("-15.5°C"), "{stdout}");
+        assert!(!stdout.contains('\u{fffd}'), "{stdout}");
+        assert_eq!(
+            parsed.pointer("/streams/stdout/encoding").and_then(|v| v.as_str()),
+            Some("windows-1252")
+        );
+        assert_eq!(
+            parsed.pointer("/streams/stdout/decode_replacement_count").and_then(|v| v.as_u64()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn process_output_diagnostic_summary_includes_tail_after_timeout() {
+        let mut stdout = b"build progress\n".repeat(2_000);
+        stdout.extend_from_slice(b"last visible progress before timeout\n");
+        let stdout = StreamCapture { bytes: stdout, truncated: false, read_error: None };
+        let stderr = StreamCapture::default();
+
+        let summary = process_output_diagnostic_summary(&stdout, &stderr);
+
+        assert!(summary.contains("last visible progress before timeout"), "{summary}");
+        assert!(summary.contains("\"sha256\""), "{summary}");
+        assert!(summary.contains("\"tail\""), "{summary}");
+    }
+
+    #[test]
+    fn process_progress_event_reports_tail_and_byte_counts_after_threshold() {
+        let started_at =
+            Instant::now() - Duration::from_millis(PROCESS_PROGRESS_MIN_ELAPSED_MS + 50);
+        let monitor = ProcessProgressMonitor::new(started_at);
+        monitor.stdout_capture().record_bytes(b"line one\nline two\nlast visible progress\n");
+        monitor.stderr_capture().record_bytes(b"warning tail\n");
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+        let emitted_for_sink = Arc::clone(&emitted);
+        let sink: ProcessProgressSink = Arc::new(move |progress| {
+            emitted_for_sink.lock().expect("progress events lock").push(progress);
+        });
+        let mut last_progress_emitted_at = None;
+        let mut last_progress_stdout_bytes = 0;
+        let mut last_progress_stderr_bytes = 0;
+
+        maybe_emit_process_progress(
+            Some(&sink),
+            Some(&monitor),
+            1234,
+            started_at,
+            &mut last_progress_emitted_at,
+            &mut last_progress_stdout_bytes,
+            &mut last_progress_stderr_bytes,
+        );
+
+        let emitted = emitted.lock().expect("progress events lock");
+        let progress = emitted.first().expect("progress event should be emitted");
+        assert_eq!(progress.pid, 1234);
+        assert!(progress.elapsed_ms >= PROCESS_PROGRESS_MIN_ELAPSED_MS);
+        assert_eq!(progress.stdout_bytes, 40);
+        assert_eq!(progress.stderr_bytes, 13);
+        assert!(progress.stdout_tail.contains("last visible progress"), "{progress:?}");
+        assert!(progress.stderr_tail.contains("warning tail"), "{progress:?}");
+        assert!(progress.last_output_at_ms.is_some(), "{progress:?}");
+        assert!(last_progress_emitted_at.is_some());
     }
 
     #[test]

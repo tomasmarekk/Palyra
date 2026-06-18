@@ -65,6 +65,7 @@ const WORKSPACE_SEARCH_MAX_LINE_TEXT_BYTES: usize = 4 * 1024;
 const WORKSPACE_SEARCH_MAX_OUTPUT_BYTES: usize = 512 * 1024;
 const WORKSPACE_SEARCH_MATCH_JSON_OVERHEAD_BYTES: usize = 160;
 const WORKSPACE_READ_LINE_SCAN_BUFFER_BYTES: usize = 8 * 1024;
+const WORKSPACE_READ_BINARY_BASE64_PREFIX_BYTES: usize = 96;
 // Well-known dependency/build directories whose contents are noise for search.
 const WORKSPACE_SEARCH_SKIPPED_DIRS: &[&str] =
     &[".git", "node_modules", "target", "dist", "build", ".next", ".svelte-kit"];
@@ -110,9 +111,10 @@ struct WorkspaceSearchInput {
     max_matches: Option<u64>,
 }
 
-/// Read-file tool output. Exactly one of `text`/`bytes_base64` is set; when
-/// `redacted` is true, `text_authoritative` and `redaction_notice` warn the
-/// caller not to write the placeholder text back.
+/// Read-file tool output. Text reads set `text`; binary reads set metadata,
+/// digest, and a short base64 prefix only. When `redacted` is true,
+/// `text_authoritative` and `redaction_notice` warn the caller not to write the
+/// placeholder text back.
 #[derive(Debug, Serialize)]
 struct WorkspaceReadFileOutput {
     path: String,
@@ -130,8 +132,12 @@ struct WorkspaceReadFileOutput {
     text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     bytes_base64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes_base64_prefix: Option<String>,
     #[serde(skip_serializing_if = "is_false")]
     binary: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    binary_output_omitted: bool,
     #[serde(skip_serializing_if = "is_false")]
     redacted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1879,24 +1885,35 @@ fn read_workspace_file_chunk(
     // Redaction policy: only a confirmed secret-leak finding replaces the
     // text, and redacted text is marked non-authoritative so callers do not
     // write the placeholder markers back into the workspace.
-    let (text, bytes_base64, binary, redacted) = if chunk_has_binary_control_bytes(&buffer) {
-        (None, Some(BASE64_STANDARD.encode(buffer.as_slice())), true, false)
-    } else {
-        match String::from_utf8(buffer) {
-            Ok(text) => {
-                let redaction = redact_text_for_export(
-                    text.as_str(),
-                    SafetySourceKind::Workspace,
-                    SafetyContentKind::WorkspaceDocument,
-                    TrustLabel::TrustedLocal,
-                );
-                let redacted = redaction.scan.has_category(SafetyFindingCategory::SecretLeak);
-                let visible_text = if redacted { redaction.redacted_text } else { text };
-                (Some(visible_text), None, false, redacted)
+    let (text, bytes_base64, bytes_base64_prefix, binary, binary_output_omitted, redacted) =
+        if chunk_has_binary_control_bytes(&buffer) {
+            (None, None, workspace_binary_base64_prefix(buffer.as_slice()), true, true, false)
+        } else {
+            match String::from_utf8(buffer) {
+                Ok(text) => {
+                    let redaction = redact_text_for_export(
+                        text.as_str(),
+                        SafetySourceKind::Workspace,
+                        SafetyContentKind::WorkspaceDocument,
+                        TrustLabel::TrustedLocal,
+                    );
+                    let redacted = redaction.scan.has_category(SafetyFindingCategory::SecretLeak);
+                    let visible_text = if redacted { redaction.redacted_text } else { text };
+                    (Some(visible_text), None, None, false, false, redacted)
+                }
+                Err(error) => {
+                    let bytes = error.into_bytes();
+                    (
+                        None,
+                        None,
+                        workspace_binary_base64_prefix(bytes.as_slice()),
+                        true,
+                        true,
+                        false,
+                    )
+                }
             }
-            Err(error) => (None, Some(BASE64_STANDARD.encode(error.into_bytes())), true, false),
-        }
-    };
+        };
     let text_authoritative = redacted.then_some(false);
     let redaction_notice = redacted.then(|| {
         "text contains redacted secret placeholders; use it for structure only and do not write the redacted text back verbatim".to_owned()
@@ -1914,7 +1931,9 @@ fn read_workspace_file_chunk(
         chunk_sha256,
         text,
         bytes_base64,
+        bytes_base64_prefix,
         binary,
+        binary_output_omitted,
         redacted,
         text_authoritative,
         redaction_notice,
@@ -2004,6 +2023,14 @@ fn workspace_line_read_window(
         line_start: Some(line_start),
         line_end: requested_line_end,
     })
+}
+
+fn workspace_binary_base64_prefix(bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() {
+        return Some(String::new());
+    }
+    let prefix_len = bytes.len().min(WORKSPACE_READ_BINARY_BASE64_PREFIX_BYTES);
+    Some(BASE64_STANDARD.encode(&bytes[..prefix_len]))
 }
 
 /// Returns true when the chunk contains control bytes that never appear in
@@ -2549,7 +2576,7 @@ mod tests {
     }
 
     #[test]
-    fn read_workspace_file_returns_base64_for_binary_control_bytes() {
+    fn read_workspace_file_returns_metadata_for_binary_control_bytes() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let file_path = tempdir.path().join("app.wasm");
         let contents = b"\0asm\x01\0\0\0\x01\x04\x01`\0\0";
@@ -2567,8 +2594,10 @@ mod tests {
             .expect("workspace binary file should be readable");
 
         assert_eq!(output.text, None);
-        assert_eq!(output.bytes_base64, Some(BASE64_STANDARD.encode(contents)));
+        assert_eq!(output.bytes_base64, None);
+        assert_eq!(output.bytes_base64_prefix, Some(BASE64_STANDARD.encode(contents)));
         assert!(output.binary);
+        assert!(output.binary_output_omitted);
         assert!(!output.redacted);
         assert_eq!(output.text_authoritative, None);
         assert_eq!(output.redaction_notice, None);
