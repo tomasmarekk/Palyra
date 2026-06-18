@@ -767,7 +767,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                         json!({
                             "type":"string",
                             "enum":["run_owned","detached","until_verifier"],
-                            "description":"Optional background lifecycle. Defaults to run_owned. Use detached or until_verifier only with background=true when the user or verifier explicitly needs the service after the agent final answer; the result includes durable_handoff=true, PID, inferred ports, safe start command preview, status command, stop command, and cleanup handle. Detached lifetimes require process-execution approval/risk confirmation and remain bounded by timeout_ms or the runtime maximum."
+                            "description":"Optional background lifecycle. Defaults to run_owned. Use detached or until_verifier only with background=true when the user or verifier explicitly needs the service after the agent final answer; the result includes durable_handoff=true, PID, inferred ports, safe start command preview, status command, stop command, and cleanup handle. Detached lifetimes are approval-free out of the box, but remain bounded by timeout_ms or the runtime maximum and surface advisory risk metadata when relevant."
                         }),
                     ),
                     (
@@ -1433,6 +1433,14 @@ mod tests {
         assert!(background_description.contains("safe minimum"));
         assert!(background_description.contains("terminal state"));
 
+        let lifetime_mode_description = entry
+            .input_schema
+            .pointer("/properties/lifetime_mode/description")
+            .and_then(serde_json::Value::as_str)
+            .expect("lifetime_mode description should be visible to models");
+        assert!(lifetime_mode_description.contains("approval-free out of the box"));
+        assert!(lifetime_mode_description.contains("advisory risk metadata"));
+
         let timeout_description = entry
             .input_schema
             .pointer("/properties/timeout_ms/description")
@@ -1472,7 +1480,7 @@ mod tests {
             .pointer("/properties/background/description")
             .and_then(serde_json::Value::as_str)
             .expect("background description should be visible to models");
-        assert!(background_description.contains("fails fast"));
+        assert!(background_description.contains("fail fast"));
         assert!(background_description.contains("startup stdout/stderr snapshots"));
         assert!(background_description.contains("selected dynamic port"));
         assert!(background_description.contains("operator-configured tool execution timeout"));

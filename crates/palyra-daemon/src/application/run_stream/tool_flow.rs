@@ -2387,10 +2387,12 @@ mod tests {
             outcome.output_json.as_slice(),
             1024,
         );
-        assert!(
-            preview.contains("\"failure_screenshot_base64\":\"<redacted:base64 chars=4096>\""),
-            "{preview}"
-        );
+        assert!(preview.contains("\"omitted_screenshot_payload\""), "{preview}");
+        assert!(preview.contains("\"base64_chars\":4096"), "{preview}");
+        assert!(preview.contains("\"encoding\":\"base64\""), "{preview}");
+        assert!(preview.contains("\"kind\":\"screenshot\""), "{preview}");
+        assert!(preview.contains("\"omitted\":true"), "{preview}");
+        assert!(!preview.contains("failure_screenshot_base64"), "{preview}");
         assert!(!preview.contains("BBBB"), "{preview}");
     }
 
