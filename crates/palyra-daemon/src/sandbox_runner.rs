@@ -714,6 +714,7 @@ pub(crate) fn run_constrained_process(
 /// the failing stage: `Disabled`, `InvalidInput`, `WorkspaceScopeDenied`, `EgressDenied`,
 /// `UnsupportedPlatform`, `SpawnFailed`, `Cancelled`, `TimedOut`, `QuotaExceeded`, or
 /// `RuntimeFailure` (non-zero exit, capture failure, or serialization failure).
+#[cfg(test)]
 pub fn run_constrained_process_with_cancellation(
     policy: &SandboxProcessRunnerPolicy,
     input_json: &[u8],
@@ -731,9 +732,9 @@ pub fn run_constrained_process_with_cancellation(
 
 /// Validates and executes one `palyra.process.run` invocation with optional progress snapshots.
 ///
-/// See [`run_constrained_process_with_cancellation`] for the execution contract. When
-/// `progress_sink` is present, foreground process capture emits redacted, bounded progress
-/// events after the process has been running long enough to be user-visible.
+/// This follows the same execution contract as the test-only cancellation wrapper. When
+/// `progress_sink` is present, foreground process capture emits redacted, bounded progress events
+/// after the process has been running long enough to be user-visible.
 pub fn run_constrained_process_with_cancellation_and_progress(
     policy: &SandboxProcessRunnerPolicy,
     input_json: &[u8],
