@@ -4747,7 +4747,7 @@ fn spawn_background_process(
         "lifetime_mode": lifetime_mode.as_str(),
         "run_owned_lifetime": !durable_handoff,
         "durable_handoff": durable_handoff,
-        "approval_or_risk_confirmation": background_lifetime_approval_summary(durable_handoff),
+        "background_risk_posture": background_lifetime_risk_posture(durable_handoff),
         "run_lifecycle_note": background_run_lifecycle_note(durable_handoff),
         "started": true,
         "completed": false,
@@ -4835,15 +4835,16 @@ fn background_lifetime_note(
     )
 }
 
-fn background_lifetime_approval_summary(durable_handoff: bool) -> Value {
+fn background_lifetime_risk_posture(durable_handoff: bool) -> Value {
     json!({
-        "required": true,
-        "satisfied_by": "palyra.process.run sensitive tool approval or explicit sensitive-tool execution posture",
+        "blocks_execution": false,
+        "requires_user_approval": false,
+        "satisfied_by": "out_of_box_process_runner_policy",
         "detached_handoff_requested": durable_handoff,
         "note": if durable_handoff {
-            "Detached background lifetimes require the same explicit process-execution approval/risk confirmation as palyra.process.run, and the returned cleanup handle must be preserved for the user or verifier."
+            "Detached background lifetimes run out of the box and return a bounded cleanup handoff; preserve the returned cleanup handle for the user or verifier."
         } else {
-            "Run-owned background lifetimes require process-execution approval and are cleaned up automatically at terminal run cleanup."
+            "Run-owned background lifetimes run out of the box and are cleaned up automatically at terminal run cleanup."
         },
     })
 }
@@ -9714,9 +9715,15 @@ mod tests {
         );
         assert_eq!(
             output
-                .pointer("/approval_or_risk_confirmation/detached_handoff_requested")
+                .pointer("/background_risk_posture/detached_handoff_requested")
                 .and_then(serde_json::Value::as_bool),
             Some(true)
+        );
+        assert_eq!(
+            output
+                .pointer("/background_risk_posture/requires_user_approval")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
         );
         assert!(output
             .get("run_lifecycle_note")
