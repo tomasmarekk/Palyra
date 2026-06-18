@@ -51,6 +51,7 @@ use windows_sys::Win32::{
 };
 
 use palyra_common::{
+    process_risk::{classify_process_run, ProcessRiskContext, ProcessRiskReport},
     process_runner_input::{
         parse_process_runner_tool_input, BackgroundLifetimeMode, ProcessRunnerToolInput,
     },
@@ -400,10 +401,22 @@ struct BackgroundProcessSpawnRequest<'a> {
     input: &'a ProcessRunnerInput,
     workspace_root: &'a Path,
     cwd: &'a Path,
+    process_risk: &'a ProcessRiskReport,
     lifetime: Duration,
     max_lifetime: Duration,
     auto_background_reason: Option<&'static str>,
     lifetime_mode: BackgroundLifetimeMode,
+}
+
+struct BackgroundLauncherCompletedContext<'a> {
+    policy: &'a SandboxProcessRunnerPolicy,
+    status: ExitStatus,
+    stdout: &'a StreamCapture,
+    stderr: &'a StreamCapture,
+    duration: Duration,
+    auto_background_reason: Option<&'static str>,
+    lifetime_mode: BackgroundLifetimeMode,
+    process_risk: &'a ProcessRiskReport,
 }
 
 impl ProcessProgressMonitor {
@@ -763,6 +776,13 @@ pub fn run_constrained_process_with_cancellation_and_progress(
             resolve_working_directory(workspace_root.as_path(), input.cwd.as_deref())?
         }
     };
+    let process_risk = classify_process_run(
+        &input,
+        ProcessRiskContext {
+            workspace_root: Some(workspace_root.as_path()),
+            resolved_cwd: Some(working_directory.as_path()),
+        },
+    );
     match path_access_mode {
         PathAccessMode::UnrestrictedOs => {}
         PathAccessMode::ApprovedRoots => {
@@ -831,6 +851,7 @@ pub fn run_constrained_process_with_cancellation_and_progress(
         &input,
         workspace_root.as_path(),
         working_directory.as_path(),
+        &process_risk,
     )? {
         return Ok(result);
     }
@@ -851,6 +872,7 @@ pub fn run_constrained_process_with_cancellation_and_progress(
             input: &input,
             workspace_root: workspace_root.as_path(),
             cwd: working_directory.as_path(),
+            process_risk: &process_risk,
             lifetime: per_call_timeout,
             max_lifetime: max_background_lifetime,
             auto_background_reason: None,
@@ -868,6 +890,7 @@ pub fn run_constrained_process_with_cancellation_and_progress(
             input: &input,
             workspace_root: workspace_root.as_path(),
             cwd: working_directory.as_path(),
+            process_risk: &process_risk,
             lifetime: per_call_timeout,
             max_lifetime: max_background_lifetime,
             auto_background_reason: Some(auto_background_reason),
@@ -946,6 +969,7 @@ pub fn run_constrained_process_with_cancellation_and_progress(
         } else {
             "tier_b_in_process"
         },
+        &process_risk,
     )
     .map_err(|error| SandboxProcessRunError {
         kind: SandboxProcessRunErrorKind::RuntimeFailure,
@@ -1071,6 +1095,7 @@ fn process_success_output_json(
     duration_ms: u64,
     tier: &str,
     sandbox_backend: &str,
+    process_risk: &ProcessRiskReport,
 ) -> serde_json::Result<Vec<u8>> {
     let stdout_view = process_stream_output_view("stdout", stdout);
     let stderr_view = process_stream_output_view("stderr", stderr);
@@ -1088,6 +1113,7 @@ fn process_success_output_json(
         "duration_ms": duration_ms,
         "tier": tier,
         "sandbox_backend": sandbox_backend,
+        "process_risk": process_risk,
         "streams": {
             "stdout": stdout_view.metadata,
             "stderr": stderr_view.metadata,
@@ -1419,6 +1445,7 @@ fn execute_builtin_process_command(
     input: &ProcessRunnerInput,
     workspace_root: &Path,
     cwd: &Path,
+    process_risk: &ProcessRiskReport,
 ) -> Result<Option<SandboxProcessRunSuccess>, SandboxProcessRunError> {
     let command = input.command.trim();
     match command.to_ascii_lowercase().as_str() {
@@ -1475,6 +1502,7 @@ fn execute_builtin_process_command(
         0,
         policy.tier.as_str(),
         "builtin_portable",
+        process_risk,
     )
     .map_err(|error| SandboxProcessRunError {
         kind: SandboxProcessRunErrorKind::RuntimeFailure,
@@ -4544,6 +4572,7 @@ fn spawn_background_process(
         input,
         workspace_root,
         cwd,
+        process_risk,
         lifetime,
         max_lifetime,
         auto_background_reason,
@@ -4613,13 +4642,16 @@ fn spawn_background_process(
             reap_background_launcher_child(child);
             release_background_process_tracking_if_stopped(pid);
             return background_launcher_completed_successfully(
-                policy,
-                status,
-                &stdout,
-                &stderr,
-                started_at.elapsed(),
-                auto_background_reason,
-                lifetime_mode,
+                BackgroundLauncherCompletedContext {
+                    policy,
+                    status,
+                    stdout: &stdout,
+                    stderr: &stderr,
+                    duration: started_at.elapsed(),
+                    auto_background_reason,
+                    lifetime_mode,
+                    process_risk,
+                },
             );
         }
         terminate_background_child(child);
@@ -4646,13 +4678,16 @@ fn spawn_background_process(
             reap_background_launcher_child(child);
             release_background_process_tracking_if_stopped(pid);
             return background_launcher_completed_successfully(
-                policy,
-                status,
-                &stdout,
-                &stderr,
-                started_at.elapsed(),
-                auto_background_reason,
-                lifetime_mode,
+                BackgroundLauncherCompletedContext {
+                    policy,
+                    status,
+                    stdout: &stdout,
+                    stderr: &stderr,
+                    duration: started_at.elapsed(),
+                    auto_background_reason,
+                    lifetime_mode,
+                    process_risk,
+                },
             );
         }
         terminate_background_child(child);
@@ -4742,6 +4777,7 @@ fn spawn_background_process(
         "handoff": handoff,
         "tier": policy.tier.as_str(),
         "sandbox_backend": process_runner_executor_name(policy),
+        "process_risk": process_risk,
     }))
     .map_err(|error| SandboxProcessRunError {
         kind: SandboxProcessRunErrorKind::RuntimeFailure,
@@ -4938,14 +4974,18 @@ fn push_port_candidate(ports: &mut BTreeSet<u16>, raw: &str) {
 }
 
 fn background_launcher_completed_successfully(
-    policy: &SandboxProcessRunnerPolicy,
-    status: ExitStatus,
-    stdout: &StreamCapture,
-    stderr: &StreamCapture,
-    duration: Duration,
-    auto_background_reason: Option<&'static str>,
-    lifetime_mode: BackgroundLifetimeMode,
+    context: BackgroundLauncherCompletedContext<'_>,
 ) -> Result<SandboxProcessRunSuccess, SandboxProcessRunError> {
+    let BackgroundLauncherCompletedContext {
+        policy,
+        status,
+        stdout,
+        stderr,
+        duration,
+        auto_background_reason,
+        lifetime_mode,
+        process_risk,
+    } = context;
     let RedactedProcessOutputText { text: stdout_text, redacted: stdout_redacted } =
         redacted_process_output(stdout.bytes.as_slice());
     let RedactedProcessOutputText { text: stderr_text, redacted: stderr_redacted } =
@@ -4982,6 +5022,7 @@ fn background_launcher_completed_successfully(
         "note": "direct launcher exited successfully; verify external service separately",
         "tier": policy.tier.as_str(),
         "sandbox_backend": process_runner_executor_name(policy),
+        "process_risk": process_risk,
     }))
     .map_err(|error| SandboxProcessRunError {
         kind: SandboxProcessRunErrorKind::RuntimeFailure,
@@ -6997,6 +7038,19 @@ mod tests {
     const BACKGROUND_TEST_EXECUTION_TIMEOUT_MS: u64 = 10_000;
     const BACKGROUND_TEST_SCRIPT_SLEEP_SECS: u64 = 8;
     static PROCESS_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn empty_process_risk_report() -> palyra_common::process_risk::ProcessRiskReport {
+        palyra_common::process_risk::ProcessRiskReport {
+            schema_version: 1,
+            policy: "advisory_only".to_owned(),
+            execution_allowed: true,
+            blocks_execution: false,
+            requires_user_approval: false,
+            highest_severity: palyra_common::process_risk::ProcessRiskSeverity::Low,
+            target_runtime: None,
+            findings: Vec::new(),
+        }
+    }
 
     struct ScopedEnvVar {
         key: &'static str,
@@ -9217,6 +9271,39 @@ mod tests {
     }
 
     #[test]
+    fn run_constrained_process_output_surfaces_process_risk_metadata() {
+        let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
+        let policy = sandbox_policy_with_allowed_executables(workspace, vec!["echo".to_owned()]);
+        let input = br#"{"command":"echo","args":["~/.ssh/id_ed25519"]}"#;
+
+        let result = run_constrained_process(&policy, input, Duration::from_millis(1_000))
+            .expect("portable echo builtin should execute split command args");
+        let output: serde_json::Value =
+            serde_json::from_slice(&result.output_json).expect("output should parse");
+
+        assert_eq!(
+            output.pointer("/process_risk/policy").and_then(serde_json::Value::as_str),
+            Some("advisory_only")
+        );
+        assert_eq!(
+            output.pointer("/process_risk/blocks_execution").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            output
+                .pointer("/process_risk/requires_user_approval")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            output
+                .pointer("/process_risk/findings/0/risk_class")
+                .and_then(serde_json::Value::as_str),
+            Some("credential_namespace_mutation")
+        );
+    }
+
+    #[test]
     fn run_constrained_process_executes_portable_directory_listing_builtin() {
         let workspace = unique_temp_dir("workspace-list-builtin");
         let nested = workspace.join("src");
@@ -10929,8 +11016,16 @@ mod tests {
         };
         let stderr = StreamCapture::default();
 
-        let output = process_success_output_json(0, &stdout, &stderr, 42, "b", "tier_b_in_process")
-            .expect("process output should serialize");
+        let output = process_success_output_json(
+            0,
+            &stdout,
+            &stderr,
+            42,
+            "b",
+            "tier_b_in_process",
+            &empty_process_risk_report(),
+        )
+        .expect("process output should serialize");
         let rendered = String::from_utf8(output.clone()).expect("output should be utf-8 JSON");
         let parsed: serde_json::Value =
             serde_json::from_slice(output.as_slice()).expect("output should parse");
@@ -10968,8 +11063,16 @@ mod tests {
         let stdout = StreamCapture { bytes: binary, truncated: false, read_error: None };
         let stderr = StreamCapture::default();
 
-        let output = process_success_output_json(0, &stdout, &stderr, 7, "b", "tier_b_in_process")
-            .expect("process output should serialize");
+        let output = process_success_output_json(
+            0,
+            &stdout,
+            &stderr,
+            7,
+            "b",
+            "tier_b_in_process",
+            &empty_process_risk_report(),
+        )
+        .expect("process output should serialize");
         let rendered = String::from_utf8(output.clone()).expect("output should be utf-8 JSON");
         let parsed: serde_json::Value =
             serde_json::from_slice(output.as_slice()).expect("output should parse");
@@ -10999,8 +11102,16 @@ mod tests {
         };
         let stderr = StreamCapture::default();
 
-        let output = process_success_output_json(0, &stdout, &stderr, 3, "b", "tier_b_in_process")
-            .expect("process output should serialize");
+        let output = process_success_output_json(
+            0,
+            &stdout,
+            &stderr,
+            3,
+            "b",
+            "tier_b_in_process",
+            &empty_process_risk_report(),
+        )
+        .expect("process output should serialize");
         let parsed: serde_json::Value =
             serde_json::from_slice(output.as_slice()).expect("output should parse");
         let stdout = parsed["stdout"].as_str().expect("stdout should be string");

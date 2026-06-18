@@ -18,6 +18,7 @@ mod ids;
 pub mod local_runtime_ports;
 mod net;
 pub mod netguard;
+pub mod process_risk;
 pub mod process_runner_input;
 pub mod project_context;
 pub mod redaction;
