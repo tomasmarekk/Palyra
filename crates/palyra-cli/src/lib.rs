@@ -12343,6 +12343,7 @@ pinned_gateway_ca_fingerprint_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
         let _vault_dir =
             ScopedEnvVar::set("PALYRA_VAULT_DIR", vault_root.to_string_lossy().as_ref());
         let _vault_backend = ScopedEnvVar::set("PALYRA_VAULT_BACKEND", "encrypted_file");
+        let _state_root_env = ScopedEnvVar::unset("PALYRA_STATE_ROOT");
         #[cfg(not(windows))]
         let _state_root =
             ScopedEnvVar::set("XDG_STATE_HOME", state_root.to_string_lossy().as_ref());

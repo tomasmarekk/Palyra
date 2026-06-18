@@ -1563,6 +1563,28 @@ mod tests {
         }
     }
 
+    struct ScopedEnvVar {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = env::var_os(key);
+            env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            match self.previous.as_ref() {
+                Some(value) => env::set_var(self.key, value),
+                None => env::remove_var(self.key),
+            }
+        }
+    }
+
     #[test]
     fn explicit_root_options_override_profile_and_env_values() -> Result<()> {
         let _guard = super::test_env_lock_for_tests().lock().expect("env lock");
@@ -2255,7 +2277,7 @@ daemon_url = "http://127.0.0.1:8200"
         let mut guard = context_cell().lock().expect("context lock");
         *guard = Some(context);
         drop(guard);
-        env::set_var("PALYRA_STATE_ROOT", "../outside");
+        let _state_root_env = ScopedEnvVar::set("PALYRA_STATE_ROOT", "../outside");
 
         let registry_path = cli_profiles_registry_path()?;
 
