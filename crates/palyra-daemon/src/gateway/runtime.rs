@@ -602,6 +602,33 @@ impl RunCleanupResources {
     }
 }
 
+/// Detached background resources created by a run and intentionally left out
+/// of terminal run cleanup. They are reported in the terminal cleanup summary
+/// so post-run verifiers and users get explicit stop/status commands.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct RunDetachedResources {
+    pub(crate) background_processes: Vec<DetachedBackgroundProcessResource>,
+}
+
+impl RunDetachedResources {
+    /// True when the run did not create any detached handoff resources.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.background_processes.is_empty()
+    }
+}
+
+/// One detached background-process handoff record.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DetachedBackgroundProcessResource {
+    pub(crate) pid: u32,
+    pub(crate) lifetime_mode: String,
+    pub(crate) ports: Vec<u16>,
+    pub(crate) lifetime_ms: Option<u64>,
+    pub(crate) max_lifetime_ms: Option<u64>,
+    pub(crate) start_command: Value,
+    pub(crate) cleanup: Value,
+}
+
 /// Bounded dedupe ledger of browser sessions that already closed, so terminal
 /// run cleanup does not try to close them again. Insertion order is kept so
 /// the oldest entries can be evicted once capacity is reached.
@@ -699,6 +726,7 @@ pub struct GatewayRuntimeState {
     tool_approval_cache: Mutex<ToolApprovalCacheState>,
     run_parameter_delta_cache: Mutex<RunParameterDeltaCache>,
     run_cleanup_resources: Mutex<HashMap<String, RunCleanupResources>>,
+    run_detached_resources: Mutex<HashMap<String, RunDetachedResources>>,
     closed_browser_sessions: Mutex<ClosedBrowserSessionLedger>,
     worker_fleet: RwLock<WorkerFleetManager>,
     pub(crate) provider_leases: ProviderLeaseManager,
@@ -1738,6 +1766,7 @@ impl GatewayRuntimeState {
             tool_approval_cache: Mutex::new(ToolApprovalCacheState::default()),
             run_parameter_delta_cache: Mutex::new(RunParameterDeltaCache::default()),
             run_cleanup_resources: Mutex::new(HashMap::new()),
+            run_detached_resources: Mutex::new(HashMap::new()),
             closed_browser_sessions: Mutex::new(ClosedBrowserSessionLedger::default()),
             worker_fleet: RwLock::new(WorkerFleetManager::default()),
             provider_leases: ProviderLeaseManager::default(),
@@ -1992,6 +2021,63 @@ impl GatewayRuntimeState {
                     "failed to list background processes for run cleanup"
                 );
                 Vec::new()
+            }
+        }
+    }
+
+    /// Registers a detached background process for terminal handoff reporting
+    /// without adding it to terminal cleanup.
+    pub(crate) fn record_run_detached_background_process(
+        &self,
+        run_id: &str,
+        resource: DetachedBackgroundProcessResource,
+    ) {
+        let run_id = run_id.trim();
+        if run_id.is_empty() || resource.pid == 0 {
+            return;
+        }
+
+        match self.run_detached_resources.lock() {
+            Ok(mut resources_by_run) => {
+                let resources = resources_by_run.entry(run_id.to_owned()).or_default();
+                if let Some(existing) = resources
+                    .background_processes
+                    .iter_mut()
+                    .find(|existing| existing.pid == resource.pid)
+                {
+                    *existing = resource;
+                } else {
+                    resources.background_processes.push(resource);
+                }
+            }
+            Err(error) => {
+                warn!(
+                    run_id,
+                    pid = resource.pid,
+                    error = %error,
+                    "failed to record detached background process for run handoff"
+                );
+            }
+        }
+    }
+
+    /// Removes and returns detached resources for a terminal-run handoff
+    /// summary. The resources are not stopped here.
+    pub(crate) fn take_run_detached_resources(&self, run_id: &str) -> RunDetachedResources {
+        let run_id = run_id.trim();
+        if run_id.is_empty() {
+            return RunDetachedResources::default();
+        }
+
+        match self.run_detached_resources.lock() {
+            Ok(mut resources_by_run) => resources_by_run.remove(run_id).unwrap_or_default(),
+            Err(error) => {
+                warn!(
+                    run_id,
+                    error = %error,
+                    "failed to take detached background resources"
+                );
+                RunDetachedResources::default()
             }
         }
     }

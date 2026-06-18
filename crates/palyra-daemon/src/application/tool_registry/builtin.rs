@@ -738,7 +738,22 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                         "background",
                         json!({
                             "type":"boolean",
-                            "description":"Start an allowlisted local background process and return immediately. Use this instead of shell background syntax or nohup for temporary dev servers. The runtime returns bounded startup stdout/stderr snapshots, which may include a server URL or selected dynamic port. If the direct launcher exits during startup with code 0, the call succeeds with launcher_completed_successfully=true and no run-owned PID; verify any external service separately. Non-zero startup exits still fail fast. Long-running child lifetimes are run-owned: Palyra automatically stops them when the agent run reaches a terminal state, and may also stop them at the operator-configured tool execution timeout/runtime hard cap. Stop run-owned children with the returned cleanup.portable_stop_command and verify cleanup with cleanup.portable_status_command. For local browser verification, bind to 127.0.0.1 with an explicit port and omit timeout_ms unless a specific long lifetime is needed; short background timeout_ms values are raised to the safe minimum when the execution cap permits."
+                            "description":"Start an allowlisted local background process and return immediately. Use this instead of shell background syntax or nohup for temporary dev servers. The runtime returns bounded startup stdout/stderr snapshots, which may include a server URL or selected dynamic port. If the direct launcher exits during startup with code 0, the call succeeds with launcher_completed_successfully=true and no run-owned PID; verify any external service separately. Non-zero startup exits still fail fast. Long-running child lifetimes default to run-owned: Palyra automatically stops them when the agent run reaches a terminal state, and may also stop them at the operator-configured tool execution timeout/runtime hard cap. For services that must survive the final answer or a hidden verifier, set lifetime_mode='detached' or keep_running_after_run=true; detached processes are not registered for terminal run cleanup, but still auto-kill after the returned cleanup.auto_kill_after_ms and must be handed off with cleanup.portable_stop_command. For local browser verification, bind to 127.0.0.1 with an explicit port and omit timeout_ms unless a specific long lifetime is needed; short background timeout_ms values are raised to the safe minimum when the execution cap permits."
+                        }),
+                    ),
+                    (
+                        "lifetime_mode",
+                        json!({
+                            "type":"string",
+                            "enum":["run_owned","detached","until_verifier"],
+                            "description":"Optional background lifecycle. Defaults to run_owned. Use detached or until_verifier only with background=true when the user or verifier explicitly needs the service after the agent final answer; the result includes durable_handoff=true, PID, inferred ports, safe start command preview, status command, stop command, and cleanup handle. Detached lifetimes require process-execution approval/risk confirmation and remain bounded by timeout_ms or the runtime maximum."
+                        }),
+                    ),
+                    (
+                        "keep_running_after_run",
+                        json!({
+                            "type":"boolean",
+                            "description":"Compatibility alias for lifetime_mode='detached'. Use only with background=true when a service must survive terminal run cleanup for user or verifier handoff."
                         }),
                     ),
                     (

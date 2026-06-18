@@ -4026,34 +4026,37 @@ async fn run_cleanup_tape_event_records_background_process_outcomes() {
 
     super::append_run_cleanup_tape_event(
         &state,
-        run_id.as_str(),
-        "cancelled by request",
-        0,
-        1,
-        &[],
-        &[super::BackgroundProcessCleanupOutcome {
-            pid: 4242,
-            termination_attempted: true,
-            alive_after: Some(false),
-            status_before: Some(super::BackgroundProcessCleanupStatus {
-                alive: true,
-                direct_pid_alive: true,
-                process_tree_alive: true,
-                tracked_process_count: Some(1),
-            }),
-            status_after: Some(super::BackgroundProcessCleanupStatus {
-                alive: false,
-                direct_pid_alive: false,
-                process_tree_alive: false,
-                tracked_process_count: Some(0),
-            }),
-            pid_artifact_outcomes: vec![super::PidArtifactCleanupOutcome {
-                path: Some("C:/palyra/e2e/os-root/pids/preview.pid".to_owned()),
-                removed: true,
+        super::RunCleanupTapeEvent {
+            run_id: run_id.as_str(),
+            reason: "cancelled by request",
+            browser_session_count: 0,
+            background_process_count: 1,
+            browser_outcomes: &[],
+            background_process_outcomes: &[super::BackgroundProcessCleanupOutcome {
+                pid: 4242,
+                termination_attempted: true,
+                alive_after: Some(false),
+                status_before: Some(super::BackgroundProcessCleanupStatus {
+                    alive: true,
+                    direct_pid_alive: true,
+                    process_tree_alive: true,
+                    tracked_process_count: Some(1),
+                }),
+                status_after: Some(super::BackgroundProcessCleanupStatus {
+                    alive: false,
+                    direct_pid_alive: false,
+                    process_tree_alive: false,
+                    tracked_process_count: Some(0),
+                }),
+                pid_artifact_outcomes: vec![super::PidArtifactCleanupOutcome {
+                    path: Some("C:/palyra/e2e/os-root/pids/preview.pid".to_owned()),
+                    removed: true,
+                    error: None,
+                }],
                 error: None,
             }],
-            error: None,
-        }],
+            detached_background_process_outcomes: &[],
+        },
     )
     .await;
 
@@ -4104,6 +4107,17 @@ async fn run_cleanup_tape_event_records_background_process_outcomes() {
         Some(true)
     );
     assert_eq!(
+        payload.pointer("/background_resources/run_owned_stopped/0/pid").and_then(Value::as_u64),
+        Some(4242)
+    );
+    assert_eq!(
+        payload
+            .pointer("/background_resources/detached_running")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+    assert_eq!(
         payload
             .pointer("/background_processes/outcomes/0/pid_artifacts/outcomes/0/path")
             .and_then(Value::as_str),
@@ -4115,6 +4129,92 @@ async fn run_cleanup_tape_event_records_background_process_outcomes() {
             .and_then(Value::as_str)
             .is_some_and(|note| note.contains("PID files")),
         "cleanup event should explain process-owned artifacts may remain: {payload}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn run_cleanup_tape_event_records_detached_background_handoff() {
+    let state = build_test_runtime_state(false);
+    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::new().to_string();
+    start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
+    state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.clone(),
+            seq: 0,
+            event_type: "status".to_owned(),
+            payload_json: json!({"status":"done"}).to_string(),
+        })
+        .await
+        .expect("seed tape event should append");
+
+    super::append_run_cleanup_tape_event(
+        &state,
+        super::RunCleanupTapeEvent {
+            run_id: run_id.as_str(),
+            reason: "completed",
+            browser_session_count: 0,
+            background_process_count: 0,
+            browser_outcomes: &[],
+            background_process_outcomes: &[],
+            detached_background_process_outcomes: &[
+                super::DetachedBackgroundProcessHandoffOutcome {
+                    resource: super::DetachedBackgroundProcessResource {
+                        pid: 5678,
+                        lifetime_mode: "detached".to_owned(),
+                        ports: vec![5000],
+                        lifetime_ms: Some(120000),
+                        max_lifetime_ms: Some(180000),
+                        start_command: json!({
+                            "command": "python",
+                            "args": ["server.py"],
+                            "cwd": "/workspace",
+                            "env": {"omitted": true, "provided_key_count": 0}
+                        }),
+                        cleanup: json!({
+                            "portable_stop_command": {
+                                "command": "palyra.process.stop",
+                                "args": ["5678"]
+                            }
+                        }),
+                    },
+                    alive: Some(true),
+                    status: Some(super::BackgroundProcessCleanupStatus {
+                        alive: true,
+                        direct_pid_alive: true,
+                        process_tree_alive: true,
+                        tracked_process_count: Some(1),
+                    }),
+                },
+            ],
+        },
+    )
+    .await;
+
+    let tape = state.journal_store.orchestrator_tape(run_id.as_str()).expect("tape should load");
+    let cleanup = tape.last().expect("cleanup event should be appended after seed event");
+    assert_eq!(cleanup.event_type, "run.cleanup");
+    let payload: Value =
+        serde_json::from_str(cleanup.payload_json.as_str()).expect("cleanup payload should decode");
+    assert_eq!(
+        payload.pointer("/background_resources/detached_running/0/pid").and_then(Value::as_u64),
+        Some(5678)
+    );
+    assert_eq!(
+        payload
+            .pointer("/background_resources/detached_running/0/run_cleanup_behavior")
+            .and_then(Value::as_str),
+        Some("not_terminated_by_terminal_run_cleanup")
+    );
+    assert_eq!(
+        payload.pointer("/background_resources/detached_running/0/ports/0").and_then(Value::as_u64),
+        Some(5000)
+    );
+    assert_eq!(
+        payload
+            .pointer("/background_resources/cleanup_commands/0/command/command")
+            .and_then(Value::as_str),
+        Some("palyra.process.stop")
     );
 }
 
@@ -4283,6 +4383,40 @@ fn tool_outcomes_record_and_forget_run_cleanup_resources() {
         b"{}",
         &process_outcome,
     );
+    let detached_process_outcome = cleanup_test_tool_outcome(
+        true,
+        json!({
+            "background": true,
+            "durable_handoff": true,
+            "run_owned_lifetime": false,
+            "lifetime_mode": "detached",
+            "pid": 5678,
+            "ports": [5000],
+            "lifetime_ms": 120000,
+            "max_lifetime_ms": 180000,
+            "handoff": {
+                "start_command": {
+                    "command": "python",
+                    "args": ["server.py"],
+                    "cwd": "/workspace",
+                    "env": {"omitted": true, "provided_key_count": 0}
+                }
+            },
+            "cleanup": {
+                "portable_stop_command": {
+                    "command": "palyra.process.stop",
+                    "args": ["5678"]
+                }
+            }
+        }),
+    );
+    super::record_run_cleanup_resource_from_tool_outcome(
+        &state,
+        context,
+        super::PROCESS_RUNNER_TOOL_NAME,
+        b"{}",
+        &detached_process_outcome,
+    );
 
     let close_outcome = cleanup_test_tool_outcome(true, json!({ "closed": true }));
     let close_input =
@@ -4298,6 +4432,13 @@ fn tool_outcomes_record_and_forget_run_cleanup_resources() {
     let resources = state.take_run_cleanup_resources(run_id.as_str());
     assert!(resources.browser_session_ids.is_empty());
     assert_eq!(resources.background_process_pids, vec![1234]);
+    let detached_resources = state.take_run_detached_resources(run_id.as_str());
+    assert_eq!(detached_resources.background_processes.len(), 1);
+    let detached = &detached_resources.background_processes[0];
+    assert_eq!(detached.pid, 5678);
+    assert_eq!(detached.lifetime_mode, "detached");
+    assert_eq!(detached.ports, vec![5000]);
+    assert_eq!(detached.lifetime_ms, Some(120000));
     assert!(
         state.is_browser_session_closed(session_id.as_str()),
         "successful browser close outcomes must invalidate later action-channel reuse"

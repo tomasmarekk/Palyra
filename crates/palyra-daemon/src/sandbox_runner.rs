@@ -17,7 +17,7 @@
 #![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
 use std::{
-    collections::{hash_map::DefaultHasher, BTreeMap},
+    collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
     fs,
     hash::{Hash, Hasher},
@@ -51,7 +51,9 @@ use windows_sys::Win32::{
 };
 
 use palyra_common::{
-    process_runner_input::{parse_process_runner_tool_input, ProcessRunnerToolInput},
+    process_runner_input::{
+        parse_process_runner_tool_input, BackgroundLifetimeMode, ProcessRunnerToolInput,
+    },
     redaction::{redact_auth_error, redact_url_segments_in_text, REDACTED},
 };
 use palyra_safety::{redact_text_for_export, SafetyContentKind, SafetySourceKind, TrustLabel};
@@ -393,6 +395,17 @@ struct ProcessProgressStreamCapture {
     started_at: Instant,
 }
 
+struct BackgroundProcessSpawnRequest<'a> {
+    policy: &'a SandboxProcessRunnerPolicy,
+    input: &'a ProcessRunnerInput,
+    workspace_root: &'a Path,
+    cwd: &'a Path,
+    lifetime: Duration,
+    max_lifetime: Duration,
+    auto_background_reason: Option<&'static str>,
+    lifetime_mode: BackgroundLifetimeMode,
+}
+
 impl ProcessProgressMonitor {
     fn new(started_at: Instant) -> Self {
         Self {
@@ -722,6 +735,7 @@ pub fn run_constrained_process_with_cancellation_and_progress(
 
     let mut input = parse_process_runner_input(input_json)?;
     validate_input_shape(&input)?;
+    validate_background_lifetime_mode(&input)?;
     validate_allowed_executable(policy, input.command.as_str())?;
     validate_no_embedded_command_line_arg(&input)?;
     validate_cmd_invocation_shape(input.command.as_str(), input.args.as_slice())?;
@@ -832,15 +846,16 @@ pub fn run_constrained_process_with_cancellation_and_progress(
     if input.background {
         let per_call_timeout = background_process_lifetime(input.timeout_ms, execution_timeout);
         let max_background_lifetime = background_process_lifetime_limit(execution_timeout);
-        return spawn_background_process(
+        return spawn_background_process(BackgroundProcessSpawnRequest {
             policy,
-            &input,
-            workspace_root.as_path(),
-            working_directory.as_path(),
-            per_call_timeout,
-            max_background_lifetime,
-            None,
-        );
+            input: &input,
+            workspace_root: workspace_root.as_path(),
+            cwd: working_directory.as_path(),
+            lifetime: per_call_timeout,
+            max_lifetime: max_background_lifetime,
+            auto_background_reason: None,
+            lifetime_mode: input.effective_lifetime_mode(),
+        });
     }
 
     // Recognized dev servers requested as foreground runs are promoted to background so they
@@ -848,15 +863,16 @@ pub fn run_constrained_process_with_cancellation_and_progress(
     if let Some(auto_background_reason) = auto_background_reason_for_foreground_dev_server(&input) {
         let per_call_timeout = background_process_lifetime(input.timeout_ms, execution_timeout);
         let max_background_lifetime = background_process_lifetime_limit(execution_timeout);
-        return spawn_background_process(
+        return spawn_background_process(BackgroundProcessSpawnRequest {
             policy,
-            &input,
-            workspace_root.as_path(),
-            working_directory.as_path(),
-            per_call_timeout,
-            max_background_lifetime,
-            Some(auto_background_reason),
-        );
+            input: &input,
+            workspace_root: workspace_root.as_path(),
+            cwd: working_directory.as_path(),
+            lifetime: per_call_timeout,
+            max_lifetime: max_background_lifetime,
+            auto_background_reason: Some(auto_background_reason),
+            lifetime_mode: BackgroundLifetimeMode::RunOwned,
+        });
     }
 
     let per_call_timeout = foreground_process_timeout(input.timeout_ms, execution_timeout);
@@ -2006,6 +2022,22 @@ fn validate_input_shape(input: &ProcessRunnerInput) -> Result<(), SandboxProcess
                 message: "palyra.process.run timeout_ms must be greater than 0".to_owned(),
             });
         }
+    }
+    Ok(())
+}
+
+fn validate_background_lifetime_mode(
+    input: &ProcessRunnerInput,
+) -> Result<(), SandboxProcessRunError> {
+    let lifetime_mode = input.effective_lifetime_mode();
+    if lifetime_mode.is_detached_handoff() && !input.background {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::InvalidInput,
+            message: format!(
+                "palyra.process.run lifetime_mode='{}' requires background=true",
+                lifetime_mode.as_str()
+            ),
+        });
     }
     Ok(())
 }
@@ -4505,14 +4537,18 @@ fn configure_child_process_group(command: &mut Command) {
 fn configure_child_process_group(_command: &mut Command) {}
 
 fn spawn_background_process(
-    policy: &SandboxProcessRunnerPolicy,
-    input: &ProcessRunnerInput,
-    workspace_root: &Path,
-    cwd: &Path,
-    lifetime: Duration,
-    max_lifetime: Duration,
-    auto_background_reason: Option<&'static str>,
+    request: BackgroundProcessSpawnRequest<'_>,
 ) -> Result<SandboxProcessRunSuccess, SandboxProcessRunError> {
+    let BackgroundProcessSpawnRequest {
+        policy,
+        input,
+        workspace_root,
+        cwd,
+        lifetime,
+        max_lifetime,
+        auto_background_reason,
+        lifetime_mode,
+    } = request;
     let mut command = build_process_command(policy, input, workspace_root, cwd)?;
     configure_child_process_group(&mut command);
     command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -4583,6 +4619,7 @@ fn spawn_background_process(
                 &stderr,
                 started_at.elapsed(),
                 auto_background_reason,
+                lifetime_mode,
             );
         }
         terminate_background_child(child);
@@ -4615,6 +4652,7 @@ fn spawn_background_process(
                 &stderr,
                 started_at.elapsed(),
                 auto_background_reason,
+                lifetime_mode,
             );
         }
         terminate_background_child(child);
@@ -4636,6 +4674,21 @@ fn spawn_background_process(
         redacted_process_output(stderr.bytes.as_slice());
     let max_lifetime_ms = max_lifetime.as_millis() as u64;
     let requested_lifetime_ms = input.timeout_ms;
+    let durable_handoff = lifetime_mode.is_detached_handoff();
+    let ports = infer_background_handoff_ports(input, stdout_text.as_str(), stderr_text.as_str());
+    let handoff = if durable_handoff {
+        background_handoff_metadata(
+            input,
+            pid,
+            cleanup.clone(),
+            ports.as_slice(),
+            lifetime_ms,
+            max_lifetime_ms,
+            lifetime_mode,
+        )
+    } else {
+        Value::Null
+    };
     let background_lifetime_adjustment_reason =
         background_lifetime_adjustment_reason(requested_lifetime_ms, lifetime_ms);
     let background_lifetime_adjusted = background_lifetime_adjustment_reason.is_some();
@@ -4656,13 +4709,17 @@ fn spawn_background_process(
         "auto_backgrounded": auto_backgrounded,
         "auto_background_reason": auto_background_reason,
         "foreground_request_backgrounded": auto_backgrounded,
-        "run_owned_lifetime": true,
-        "run_lifecycle_note": "This background process is owned by the current agent run. Palyra automatically stops run-owned background processes when the run reaches a terminal state, so do not tell the user this PID or server will keep running after the final answer unless you explicitly stopped it first or a future detached-process feature says otherwise.",
+        "lifetime_mode": lifetime_mode.as_str(),
+        "run_owned_lifetime": !durable_handoff,
+        "durable_handoff": durable_handoff,
+        "approval_or_risk_confirmation": background_lifetime_approval_summary(durable_handoff),
+        "run_lifecycle_note": background_run_lifecycle_note(durable_handoff),
         "started": true,
         "completed": false,
         "startup_success": true,
         "process_state": "running",
         "pid": pid,
+        "ports": ports,
         "requested_lifetime_ms": requested_lifetime_ms,
         "lifetime_ms": lifetime_ms,
         "max_lifetime_ms": max_lifetime_ms,
@@ -4670,8 +4727,9 @@ fn spawn_background_process(
         "background_lifetime_adjusted": background_lifetime_adjusted,
         "background_lifetime_adjustment_reason": background_lifetime_adjustment_reason,
         "background_lifetime_note": format!(
-            "{}Palyra will auto-terminate this run-owned background process after {lifetime_ms}ms or when the current agent run reaches a terminal state, whichever happens first; omit timeout_ms for the default long-lived background server window, set timeout_ms up to {max_lifetime_ms}ms within the operator-configured tool execution timeout for long browser verification loops, and use cleanup.portable_stop_command when finished.",
-            background_lifetime_adjustment_note
+            "{}{}",
+            background_lifetime_adjustment_note,
+            background_lifetime_note(durable_handoff, lifetime_ms, max_lifetime_ms)
         ),
         "process_handle": {
             "kind": "pid",
@@ -4681,6 +4739,7 @@ fn spawn_background_process(
             "identity_note": "pid is the direct process spawned by palyra.process.run; a descendant process may own listening sockets"
         },
         "cleanup": cleanup,
+        "handoff": handoff,
         "tier": policy.tier.as_str(),
         "sandbox_backend": process_runner_executor_name(policy),
     }))
@@ -4718,6 +4777,166 @@ fn background_lifetime_adjustment_note(reason: Option<&str>) -> &'static str {
     }
 }
 
+fn background_run_lifecycle_note(durable_handoff: bool) -> &'static str {
+    if durable_handoff {
+        return "This background process is detached from terminal run cleanup and may keep running after the final answer. It remains bounded by auto_kill_after_ms and should be handed to the user or verifier with cleanup.portable_stop_command.";
+    }
+    "This background process is owned by the current agent run. Palyra automatically stops run-owned background processes when the run reaches a terminal state, so do not tell the user this PID or server will keep running after the final answer unless you explicitly stopped it first or requested a detached lifetime mode."
+}
+
+fn background_lifetime_note(
+    durable_handoff: bool,
+    lifetime_ms: u64,
+    max_lifetime_ms: u64,
+) -> String {
+    if durable_handoff {
+        return format!(
+            "Palyra will not stop this detached background process at terminal run cleanup, but it remains bounded: the runtime monitor will auto-terminate it after {lifetime_ms}ms unless cleanup.portable_stop_command stops it first. Set timeout_ms up to {max_lifetime_ms}ms within the operator-configured tool execution timeout for longer verifier handoff windows."
+        );
+    }
+    format!(
+        "Palyra will auto-terminate this run-owned background process after {lifetime_ms}ms or when the current agent run reaches a terminal state, whichever happens first; omit timeout_ms for the default long-lived background server window, set timeout_ms up to {max_lifetime_ms}ms within the operator-configured tool execution timeout for long browser verification loops, and use cleanup.portable_stop_command when finished."
+    )
+}
+
+fn background_lifetime_approval_summary(durable_handoff: bool) -> Value {
+    json!({
+        "required": true,
+        "satisfied_by": "palyra.process.run sensitive tool approval or explicit sensitive-tool execution posture",
+        "detached_handoff_requested": durable_handoff,
+        "note": if durable_handoff {
+            "Detached background lifetimes require the same explicit process-execution approval/risk confirmation as palyra.process.run, and the returned cleanup handle must be preserved for the user or verifier."
+        } else {
+            "Run-owned background lifetimes require process-execution approval and are cleaned up automatically at terminal run cleanup."
+        },
+    })
+}
+
+fn background_handoff_metadata(
+    input: &ProcessRunnerInput,
+    pid: u32,
+    cleanup: Value,
+    ports: &[u16],
+    lifetime_ms: u64,
+    max_lifetime_ms: u64,
+    lifetime_mode: BackgroundLifetimeMode,
+) -> Value {
+    json!({
+        "kind": "background_process",
+        "lifetime_mode": lifetime_mode.as_str(),
+        "pid": pid,
+        "ports": ports,
+        "ports_source": if ports.is_empty() {
+            "no explicit local port was inferred from args or startup output; verify the service with an explicit probe"
+        } else {
+            "inferred from args or bounded startup output; verify readiness with an explicit HTTP/browser probe"
+        },
+        "start_command": redacted_process_start_command(input),
+        "stop_command": cleanup.pointer("/portable_stop_command").cloned().unwrap_or(Value::Null),
+        "status_command": cleanup.pointer("/portable_status_command").cloned().unwrap_or(Value::Null),
+        "cleanup_handle": cleanup,
+        "auto_kill_after_ms": lifetime_ms,
+        "max_lifetime_ms": max_lifetime_ms,
+        "run_cleanup_behavior": "not_registered_for_terminal_run_cleanup",
+        "handoff_note": "This detached process may remain alive after the final answer; include the stop_command and any verified URL/port in the final answer."
+    })
+}
+
+fn redacted_process_start_command(input: &ProcessRunnerInput) -> Value {
+    json!({
+        "command": redacted_process_command_token(input.command.as_str()),
+        "args": input
+            .args
+            .iter()
+            .map(|arg| redacted_process_command_token(arg.as_str()))
+            .collect::<Vec<_>>(),
+        "cwd": input.cwd.as_deref().unwrap_or("/workspace"),
+        "env": {
+            "omitted": true,
+            "provided_key_count": input.env.len(),
+        },
+    })
+}
+
+fn redacted_process_command_token(raw: &str) -> String {
+    redacted_process_output_text(raw).text
+}
+
+fn infer_background_handoff_ports(
+    input: &ProcessRunnerInput,
+    stdout_text: &str,
+    stderr_text: &str,
+) -> Vec<u16> {
+    let mut ports = BTreeSet::new();
+    collect_ports_from_args(input.args.as_slice(), &mut ports);
+    collect_ports_from_text(stdout_text, &mut ports);
+    collect_ports_from_text(stderr_text, &mut ports);
+    ports.into_iter().collect()
+}
+
+fn collect_ports_from_args(args: &[String], ports: &mut BTreeSet<u16>) {
+    let mut index = 0usize;
+    while index < args.len() {
+        let arg = args[index].trim();
+        if matches!(arg, "--port" | "-p" | "--listen-port") {
+            if let Some(next) = args.get(index.saturating_add(1)) {
+                push_port_candidate(ports, next.as_str());
+            }
+            index = index.saturating_add(2);
+            continue;
+        }
+        if let Some((key, value)) = arg.split_once('=') {
+            if matches!(key, "--port" | "port" | "PORT" | "--listen-port") {
+                push_port_candidate(ports, value);
+            }
+        }
+        collect_ports_from_local_endpoint_token(arg, ports);
+        index = index.saturating_add(1);
+    }
+}
+
+fn collect_ports_from_text(text: &str, ports: &mut BTreeSet<u16>) {
+    for token in text.split_whitespace() {
+        let trimmed = token.trim_matches(|character: char| {
+            matches!(character, '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';')
+        });
+        collect_ports_from_local_endpoint_token(trimmed, ports);
+        if let Some((key, value)) = trimmed.split_once('=') {
+            if key.eq_ignore_ascii_case("port") || key.eq_ignore_ascii_case("PORT") {
+                push_port_candidate(ports, value);
+            }
+        }
+    }
+}
+
+fn collect_ports_from_local_endpoint_token(token: &str, ports: &mut BTreeSet<u16>) {
+    let normalized = token.to_ascii_lowercase();
+    for marker in ["localhost:", "127.0.0.1:", "0.0.0.0:", "[::1]:"] {
+        let Some(index) = normalized.find(marker) else {
+            continue;
+        };
+        let start = index.saturating_add(marker.len());
+        push_port_candidate(ports, &normalized[start..]);
+    }
+}
+
+fn push_port_candidate(ports: &mut BTreeSet<u16>, raw: &str) {
+    let digits = raw
+        .trim()
+        .trim_start_matches(':')
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    if digits.is_empty() || digits.len() > 5 {
+        return;
+    }
+    if let Ok(port) = digits.parse::<u16>() {
+        if port > 0 {
+            ports.insert(port);
+        }
+    }
+}
+
 fn background_launcher_completed_successfully(
     policy: &SandboxProcessRunnerPolicy,
     status: ExitStatus,
@@ -4725,6 +4944,7 @@ fn background_launcher_completed_successfully(
     stderr: &StreamCapture,
     duration: Duration,
     auto_background_reason: Option<&'static str>,
+    lifetime_mode: BackgroundLifetimeMode,
 ) -> Result<SandboxProcessRunSuccess, SandboxProcessRunError> {
     let RedactedProcessOutputText { text: stdout_text, redacted: stdout_redacted } =
         redacted_process_output(stdout.bytes.as_slice());
@@ -4747,7 +4967,9 @@ fn background_launcher_completed_successfully(
         "auto_backgrounded": auto_backgrounded,
         "auto_background_reason": auto_background_reason,
         "foreground_request_backgrounded": auto_backgrounded,
+        "lifetime_mode": lifetime_mode.as_str(),
         "run_owned_lifetime": false,
+        "durable_handoff": false,
         "run_lifecycle_note": "The direct background launcher exited successfully and Palyra is not tracking a run-owned child process. Verify any external service separately and stop it with the service-specific cleanup command.",
         "started": true,
         "completed": true,
@@ -6759,8 +6981,8 @@ mod tests {
         validate_host_interpreter_argument_guardrails, validate_interpreter_argument_guardrails,
         validate_no_embedded_command_line_arg, validate_process_env_overrides,
         validate_process_prepend_path_shape, validate_process_termination_scope,
-        validate_runtime_egress_enforcement, EgressEnforcementMode, PathAccessMode,
-        ProcessProgressMonitor, ProcessProgressSink, ProcessRunnerInput,
+        validate_runtime_egress_enforcement, BackgroundLifetimeMode, EgressEnforcementMode,
+        PathAccessMode, ProcessProgressMonitor, ProcessProgressSink, ProcessRunnerInput,
         SandboxProcessRunErrorKind, SandboxProcessRunnerPolicy, SandboxProcessRunnerTier,
         StreamCapture, BACKGROUND_MONITOR_POLL_MS, BACKGROUND_TERMINATION_WAIT_MS,
         MAX_PREPEND_PATH_COUNT, NODE_DISABLE_COMPILE_CACHE_ENV, PALYRA_OS_FILE_ROOTS_ENV,
@@ -6860,6 +7082,8 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms,
             background: false,
+            lifetime_mode: BackgroundLifetimeMode::RunOwned,
+            keep_running_after_run: false,
         }
     }
 
@@ -7425,6 +7649,8 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            lifetime_mode: BackgroundLifetimeMode::RunOwned,
+            keep_running_after_run: false,
         };
 
         let command = build_process_command(
@@ -7850,6 +8076,8 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            lifetime_mode: BackgroundLifetimeMode::RunOwned,
+            keep_running_after_run: false,
         };
 
         let error = validate_no_embedded_command_line_arg(&input)
@@ -7892,6 +8120,8 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            lifetime_mode: BackgroundLifetimeMode::RunOwned,
+            keep_running_after_run: false,
         };
 
         validate_input_shape(&input)
@@ -8012,6 +8242,8 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            lifetime_mode: BackgroundLifetimeMode::RunOwned,
+            keep_running_after_run: false,
         };
         let cwd =
             resolve_host_working_directory(canonical_workspace.as_path(), input.cwd.as_deref())
@@ -8080,6 +8312,8 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            lifetime_mode: BackgroundLifetimeMode::RunOwned,
+            keep_running_after_run: false,
         };
 
         let error = build_process_command(
@@ -8114,6 +8348,8 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            lifetime_mode: BackgroundLifetimeMode::RunOwned,
+            keep_running_after_run: false,
         };
 
         let command = build_process_command(
@@ -8156,6 +8392,8 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            lifetime_mode: BackgroundLifetimeMode::RunOwned,
+            keep_running_after_run: false,
         };
 
         let command = build_process_command(
@@ -8201,6 +8439,8 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            lifetime_mode: BackgroundLifetimeMode::RunOwned,
+            keep_running_after_run: false,
         };
 
         let command =
@@ -8265,6 +8505,8 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            lifetime_mode: BackgroundLifetimeMode::RunOwned,
+            keep_running_after_run: false,
         };
 
         let command =
@@ -8362,6 +8604,8 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            lifetime_mode: BackgroundLifetimeMode::RunOwned,
+            keep_running_after_run: false,
         };
         input.env.insert("PALYRA_E2E_OS_ROOT".to_owned(), env_root.to_string_lossy().into_owned());
         let host_roots = host_access_roots_for_input(&input);
@@ -8400,6 +8644,8 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            lifetime_mode: BackgroundLifetimeMode::RunOwned,
+            keep_running_after_run: false,
         };
 
         let command = build_process_command(
@@ -9311,6 +9557,100 @@ mod tests {
         assert!(output.pointer("/cleanup/manual_command/command").is_some());
 
         let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn run_constrained_process_returns_detached_background_handoff() {
+        let Some(python) = ["python3", "python", "py"].into_iter().find(|command| {
+            Command::new(command)
+                .arg("--version")
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        }) else {
+            return;
+        };
+        let workspace = unique_temp_dir("workspace-python-background-detached");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        fs::write(
+            workspace.join("detached_ready.py"),
+            format!(
+                "import time\nprint('listening http://127.0.0.1:54321', flush=True)\ntime.sleep({BACKGROUND_TEST_SCRIPT_SLEEP_SECS})\n"
+            ),
+        )
+        .expect("background script should be written");
+        let mut policy =
+            sandbox_policy_with_allowed_executables(workspace.clone(), vec![python.to_owned()]);
+        policy.allow_interpreters = true;
+        policy.egress_enforcement_mode = EgressEnforcementMode::Preflight;
+        let input = serde_json::to_vec(&serde_json::json!({
+            "command": python,
+            "args": ["detached_ready.py"],
+            "background": true,
+            "lifetime_mode": "detached",
+            "timeout_ms": BACKGROUND_TEST_EXECUTION_TIMEOUT_MS
+        }))
+        .expect("input should serialize");
+
+        let result =
+            run_constrained_process(&policy, input.as_slice(), background_test_execution_timeout())
+                .expect("detached background process should start");
+        let output: serde_json::Value =
+            serde_json::from_slice(&result.output_json).expect("output should parse");
+        let pid = output
+            .get("pid")
+            .and_then(serde_json::Value::as_u64)
+            .expect("detached background process should return pid") as u32;
+        let _ = super::stop_background_process_by_pid(pid);
+
+        assert_eq!(
+            output.get("lifetime_mode").and_then(serde_json::Value::as_str),
+            Some("detached")
+        );
+        assert_eq!(
+            output.get("run_owned_lifetime").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(output.get("durable_handoff").and_then(serde_json::Value::as_bool), Some(true));
+        assert_eq!(
+            output.pointer("/handoff/pid").and_then(serde_json::Value::as_u64),
+            Some(u64::from(pid))
+        );
+        assert_eq!(
+            output.pointer("/handoff/ports/0").and_then(serde_json::Value::as_u64),
+            Some(54321)
+        );
+        assert_eq!(
+            output.pointer("/handoff/stop_command/command").and_then(serde_json::Value::as_str),
+            Some("palyra.process.stop")
+        );
+        assert_eq!(
+            output
+                .pointer("/approval_or_risk_confirmation/detached_handoff_requested")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(output
+            .get("run_lifecycle_note")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .contains("after the final answer"));
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    fn run_constrained_process_rejects_detached_lifetime_without_background() {
+        let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
+        let policy = sandbox_policy_with_allowed_executables(workspace, vec!["echo".to_owned()]);
+        let input = br#"{"command":"echo","args":["ok"],"lifetime_mode":"detached"}"#;
+
+        let error = run_constrained_process(&policy, input, Duration::from_millis(1_000))
+            .expect_err("detached lifecycle must require background=true");
+
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::InvalidInput);
+        assert!(error.message.contains("requires background=true"), "{}", error.message);
     }
 
     #[test]
@@ -10459,6 +10799,8 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            lifetime_mode: BackgroundLifetimeMode::RunOwned,
+            keep_running_after_run: false,
         };
 
         let hosts = collect_requested_egress_hosts(&input)

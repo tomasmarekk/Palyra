@@ -1053,6 +1053,12 @@ fn record_run_cleanup_resource_from_tool_outcome(
 
     match tool_name {
         PROCESS_RUNNER_TOOL_NAME => {
+            if let Some(resource) =
+                detached_background_process_from_tool_output(outcome.output_json.as_slice())
+            {
+                runtime_state.record_run_detached_background_process(context.run_id, resource);
+                return;
+            }
             if let Some(pid) =
                 background_process_pid_from_tool_output(outcome.output_json.as_slice())
             {
@@ -1081,11 +1087,57 @@ fn background_process_pid_from_tool_output(output_json: &[u8]) -> Option<u32> {
     if payload.get("background").and_then(Value::as_bool) != Some(true) {
         return None;
     }
+    if payload.get("run_owned_lifetime").and_then(Value::as_bool) == Some(false) {
+        return None;
+    }
     let pid = payload
         .pointer("/process_handle/direct_process_pid")
         .and_then(Value::as_u64)
         .or_else(|| payload.get("pid").and_then(Value::as_u64))?;
     u32::try_from(pid).ok().filter(|pid| *pid > 0)
+}
+
+fn detached_background_process_from_tool_output(
+    output_json: &[u8],
+) -> Option<DetachedBackgroundProcessResource> {
+    let payload = serde_json::from_slice::<Value>(output_json).ok()?;
+    if payload.get("background").and_then(Value::as_bool) != Some(true)
+        || payload.get("durable_handoff").and_then(Value::as_bool) != Some(true)
+        || payload.get("run_owned_lifetime").and_then(Value::as_bool) != Some(false)
+    {
+        return None;
+    }
+    let pid = payload
+        .pointer("/process_handle/direct_process_pid")
+        .and_then(Value::as_u64)
+        .or_else(|| payload.get("pid").and_then(Value::as_u64))
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid > 0)?;
+    let ports = payload
+        .get("ports")
+        .and_then(Value::as_array)
+        .map(|ports| {
+            ports
+                .iter()
+                .filter_map(Value::as_u64)
+                .filter_map(|port| u16::try_from(port).ok())
+                .filter(|port| *port > 0)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Some(DetachedBackgroundProcessResource {
+        pid,
+        lifetime_mode: payload
+            .get("lifetime_mode")
+            .and_then(Value::as_str)
+            .unwrap_or("detached")
+            .to_owned(),
+        ports,
+        lifetime_ms: payload.get("lifetime_ms").and_then(Value::as_u64),
+        max_lifetime_ms: payload.get("max_lifetime_ms").and_then(Value::as_u64),
+        start_command: payload.pointer("/handoff/start_command").cloned().unwrap_or(Value::Null),
+        cleanup: payload.get("cleanup").cloned().unwrap_or(Value::Null),
+    })
 }
 
 fn execute_process_list_tool(
@@ -1661,7 +1713,8 @@ pub(crate) async fn cleanup_run_resources(
     reason: &str,
 ) {
     let resources = runtime_state.take_run_cleanup_resources(run_id);
-    if resources.is_empty() {
+    let detached_resources = runtime_state.take_run_detached_resources(run_id);
+    if resources.is_empty() && detached_resources.is_empty() {
         return;
     }
 
@@ -1669,6 +1722,15 @@ pub(crate) async fn cleanup_run_resources(
     let background_process_count = resources.background_process_pids.len();
     let mut browser_outcomes = Vec::new();
     let mut background_process_outcomes = Vec::new();
+    let detached_background_process_outcomes = detached_resources
+        .background_processes
+        .into_iter()
+        .map(|resource| {
+            let status = background_process_cleanup_status(resource.pid);
+            let alive = status.as_ref().map(|status| status.alive);
+            DetachedBackgroundProcessHandoffOutcome { resource, alive, status }
+        })
+        .collect::<Vec<_>>();
     for session_id in resources.browser_session_ids {
         match crate::application::tool_runtime::browser::close_browser_session_for_run_cleanup(
             runtime_state,
@@ -1773,12 +1835,15 @@ pub(crate) async fn cleanup_run_resources(
 
     append_run_cleanup_tape_event(
         runtime_state,
-        run_id,
-        reason,
-        browser_session_count,
-        background_process_count,
-        browser_outcomes.as_slice(),
-        background_process_outcomes.as_slice(),
+        RunCleanupTapeEvent {
+            run_id,
+            reason,
+            browser_session_count,
+            background_process_count,
+            browser_outcomes: browser_outcomes.as_slice(),
+            background_process_outcomes: background_process_outcomes.as_slice(),
+            detached_background_process_outcomes: detached_background_process_outcomes.as_slice(),
+        },
     )
     .await;
 
@@ -1787,6 +1852,7 @@ pub(crate) async fn cleanup_run_resources(
         reason,
         browser_session_count,
         background_process_count,
+        detached_background_process_count = detached_background_process_outcomes.len(),
         "cleaned up run-owned resources after terminal run"
     );
 }
@@ -1807,6 +1873,13 @@ struct BackgroundProcessCleanupOutcome {
     status_after: Option<BackgroundProcessCleanupStatus>,
     pid_artifact_outcomes: Vec<PidArtifactCleanupOutcome>,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DetachedBackgroundProcessHandoffOutcome {
+    resource: DetachedBackgroundProcessResource,
+    alive: Option<bool>,
+    status: Option<BackgroundProcessCleanupStatus>,
 }
 
 #[derive(Debug, Clone)]
@@ -2021,21 +2094,26 @@ fn path_dedup_key(path: &Path) -> String {
     }
 }
 
-async fn append_run_cleanup_tape_event(
-    runtime_state: &Arc<GatewayRuntimeState>,
-    run_id: &str,
-    reason: &str,
+struct RunCleanupTapeEvent<'a> {
+    run_id: &'a str,
+    reason: &'a str,
     browser_session_count: usize,
     background_process_count: usize,
-    browser_outcomes: &[BrowserCleanupOutcome],
-    background_process_outcomes: &[BackgroundProcessCleanupOutcome],
+    browser_outcomes: &'a [BrowserCleanupOutcome],
+    background_process_outcomes: &'a [BackgroundProcessCleanupOutcome],
+    detached_background_process_outcomes: &'a [DetachedBackgroundProcessHandoffOutcome],
+}
+
+async fn append_run_cleanup_tape_event(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    event: RunCleanupTapeEvent<'_>,
 ) {
-    let tape = match runtime_state.journal_store.orchestrator_tape(run_id) {
+    let tape = match runtime_state.journal_store.orchestrator_tape(event.run_id) {
         Ok(tape) => tape,
         Err(error) => {
             warn!(
-                run_id,
-                reason,
+                run_id = event.run_id,
+                reason = event.reason,
                 error = %error,
                 "failed to load run tape before recording cleanup event"
             );
@@ -2044,16 +2122,17 @@ async fn append_run_cleanup_tape_event(
     };
     let next_seq = tape.iter().map(|event| event.seq).max().unwrap_or(-1).saturating_add(1);
     let payload_json = run_cleanup_tape_payload(
-        run_id,
-        reason,
-        browser_session_count,
-        background_process_count,
-        browser_outcomes,
-        background_process_outcomes,
+        event.run_id,
+        event.reason,
+        event.browser_session_count,
+        event.background_process_count,
+        event.browser_outcomes,
+        event.background_process_outcomes,
+        event.detached_background_process_outcomes,
     );
     if let Err(error) = runtime_state
         .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
-            run_id: run_id.to_owned(),
+            run_id: event.run_id.to_owned(),
             seq: next_seq,
             event_type: "run.cleanup".to_owned(),
             payload_json,
@@ -2061,8 +2140,8 @@ async fn append_run_cleanup_tape_event(
         .await
     {
         warn!(
-            run_id,
-            reason,
+            run_id = event.run_id,
+            reason = event.reason,
             error = %error,
             "failed to record run cleanup tape event"
         );
@@ -2076,7 +2155,20 @@ fn run_cleanup_tape_payload(
     background_process_count: usize,
     browser_outcomes: &[BrowserCleanupOutcome],
     background_process_outcomes: &[BackgroundProcessCleanupOutcome],
+    detached_background_process_outcomes: &[DetachedBackgroundProcessHandoffOutcome],
 ) -> String {
+    let run_owned_stopped = background_process_outcomes
+        .iter()
+        .map(background_process_cleanup_outcome_json)
+        .collect::<Vec<_>>();
+    let detached_running = detached_background_process_outcomes
+        .iter()
+        .map(detached_background_process_handoff_json)
+        .collect::<Vec<_>>();
+    let cleanup_commands = detached_background_process_outcomes
+        .iter()
+        .filter_map(detached_background_process_cleanup_command_json)
+        .collect::<Vec<_>>();
     json!({
         "event": "run.cleanup",
         "run_id": run_id,
@@ -2093,36 +2185,74 @@ fn run_cleanup_tape_payload(
         },
         "background_processes": {
             "requested_count": background_process_count,
-            "outcomes": background_process_outcomes.iter().map(|outcome| {
-                json!({
-                    "pid": outcome.pid,
-                    "termination_attempted": outcome.termination_attempted,
-                    "alive_before": outcome.status_before.as_ref().map(|status| status.alive),
-                    "direct_pid_alive_before_cleanup": outcome.status_before.as_ref().map(|status| status.direct_pid_alive),
-                    "process_tree_alive_before_cleanup": outcome.status_before.as_ref().map(|status| status.process_tree_alive),
-                    "tracked_process_count_before_cleanup": outcome.status_before.as_ref().and_then(|status| status.tracked_process_count),
-                    "alive_after": outcome.alive_after,
-                    "direct_pid_alive_after_cleanup": outcome.status_after.as_ref().map(|status| status.direct_pid_alive),
-                    "process_tree_alive_after_cleanup": outcome.status_after.as_ref().map(|status| status.process_tree_alive),
-                    "tracked_process_count_after_cleanup": outcome.status_after.as_ref().and_then(|status| status.tracked_process_count),
-                    "error": outcome.error,
-                    "pid_artifacts": {
-                        "safe_roots_source": "run_launch_context_path_env",
-                        "matching_rule": "regular .pid files up to 1024 bytes whose trimmed content equals the terminated pid",
-                        "outcomes": outcome.pid_artifact_outcomes.iter().map(|artifact| {
-                            json!({
-                                "path": artifact.path,
-                                "removed": artifact.removed,
-                                "error": artifact.error,
-                            })
-                        }).collect::<Vec<_>>(),
-                    },
-                    "process_artifact_note": "Palyra stops run-owned process trees and removes matching small PID files under safe run launch path roots; logs and other process-created files remain unless an explicit tool removes them.",
-                })
-            }).collect::<Vec<_>>(),
+            "outcomes": run_owned_stopped.clone(),
+        },
+        "background_resources": {
+            "run_owned_requested_count": background_process_count,
+            "run_owned_stopped": run_owned_stopped,
+            "detached_running": detached_running,
+            "cleanup_commands": cleanup_commands,
         },
     })
     .to_string()
+}
+
+fn background_process_cleanup_outcome_json(outcome: &BackgroundProcessCleanupOutcome) -> Value {
+    json!({
+        "pid": outcome.pid,
+        "termination_attempted": outcome.termination_attempted,
+        "alive_before": outcome.status_before.as_ref().map(|status| status.alive),
+        "direct_pid_alive_before_cleanup": outcome.status_before.as_ref().map(|status| status.direct_pid_alive),
+        "process_tree_alive_before_cleanup": outcome.status_before.as_ref().map(|status| status.process_tree_alive),
+        "tracked_process_count_before_cleanup": outcome.status_before.as_ref().and_then(|status| status.tracked_process_count),
+        "alive_after": outcome.alive_after,
+        "direct_pid_alive_after_cleanup": outcome.status_after.as_ref().map(|status| status.direct_pid_alive),
+        "process_tree_alive_after_cleanup": outcome.status_after.as_ref().map(|status| status.process_tree_alive),
+        "tracked_process_count_after_cleanup": outcome.status_after.as_ref().and_then(|status| status.tracked_process_count),
+        "error": outcome.error,
+        "pid_artifacts": {
+            "safe_roots_source": "run_launch_context_path_env",
+            "matching_rule": "regular .pid files up to 1024 bytes whose trimmed content equals the terminated pid",
+            "outcomes": outcome.pid_artifact_outcomes.iter().map(|artifact| {
+                json!({
+                    "path": artifact.path,
+                    "removed": artifact.removed,
+                    "error": artifact.error,
+                })
+            }).collect::<Vec<_>>(),
+        },
+        "process_artifact_note": "Palyra stops run-owned process trees and removes matching small PID files under safe run launch path roots; logs and other process-created files remain unless an explicit tool removes them.",
+    })
+}
+
+fn detached_background_process_handoff_json(
+    outcome: &DetachedBackgroundProcessHandoffOutcome,
+) -> Value {
+    json!({
+        "pid": outcome.resource.pid,
+        "lifetime_mode": outcome.resource.lifetime_mode,
+        "alive": outcome.alive,
+        "direct_pid_alive": outcome.status.as_ref().map(|status| status.direct_pid_alive),
+        "process_tree_alive": outcome.status.as_ref().map(|status| status.process_tree_alive),
+        "tracked_process_count": outcome.status.as_ref().and_then(|status| status.tracked_process_count),
+        "ports": outcome.resource.ports,
+        "lifetime_ms": outcome.resource.lifetime_ms,
+        "max_lifetime_ms": outcome.resource.max_lifetime_ms,
+        "start_command": outcome.resource.start_command,
+        "cleanup": outcome.resource.cleanup,
+        "run_cleanup_behavior": "not_terminated_by_terminal_run_cleanup",
+        "handoff_note": "Detached background process remains outside run-owned cleanup; give the user or verifier the cleanup.portable_stop_command and a verified service URL when available.",
+    })
+}
+
+fn detached_background_process_cleanup_command_json(
+    outcome: &DetachedBackgroundProcessHandoffOutcome,
+) -> Option<Value> {
+    let command = outcome.resource.cleanup.pointer("/portable_stop_command")?.clone();
+    Some(json!({
+        "pid": outcome.resource.pid,
+        "command": command,
+    }))
 }
 
 async fn terminate_run_background_process(pid: u32) -> Result<(), String> {

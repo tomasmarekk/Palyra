@@ -9,6 +9,38 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Lifecycle policy for `background=true` process-runner invocations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundLifetimeMode {
+    /// Tie the process to the current agent run and stop it at terminal cleanup.
+    #[default]
+    RunOwned,
+    /// Leave the process running after terminal cleanup until its bounded lifetime expires.
+    Detached,
+    /// Keep the process available for an external verifier, with the same bounded handoff as
+    /// [`Detached`](Self::Detached).
+    UntilVerifier,
+}
+
+impl BackgroundLifetimeMode {
+    /// Returns the stable JSON spelling used in tool outputs and cleanup summaries.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RunOwned => "run_owned",
+            Self::Detached => "detached",
+            Self::UntilVerifier => "until_verifier",
+        }
+    }
+
+    /// True when the process must not be registered for terminal run cleanup.
+    #[must_use]
+    pub const fn is_detached_handoff(self) -> bool {
+        matches!(self, Self::Detached | Self::UntilVerifier)
+    }
+}
+
 /// Canonical input payload for `palyra.process.run`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -28,6 +60,25 @@ pub struct ProcessRunnerToolInput {
     pub timeout_ms: Option<u64>,
     #[serde(default)]
     pub background: bool,
+    #[serde(default)]
+    pub lifetime_mode: BackgroundLifetimeMode,
+    #[serde(default)]
+    pub keep_running_after_run: bool,
+}
+
+impl ProcessRunnerToolInput {
+    /// Returns the effective background lifecycle requested by the input.
+    ///
+    /// `keep_running_after_run=true` is a compatibility alias for
+    /// `lifetime_mode="detached"` so callers can use either shape.
+    #[must_use]
+    pub const fn effective_lifetime_mode(&self) -> BackgroundLifetimeMode {
+        if self.keep_running_after_run {
+            BackgroundLifetimeMode::Detached
+        } else {
+            self.lifetime_mode
+        }
+    }
 }
 
 /// Parse failure for a `palyra.process.run` payload (malformed JSON or unknown fields).
@@ -117,7 +168,9 @@ fn normalize_executable_token(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_process_runner_tool_input, ProcessRunnerToolInputParseError};
+    use super::{
+        parse_process_runner_tool_input, BackgroundLifetimeMode, ProcessRunnerToolInputParseError,
+    };
 
     #[test]
     fn parse_process_runner_tool_input_accepts_valid_payload() {
@@ -133,6 +186,7 @@ mod tests {
         assert_eq!(parsed.requested_egress_hosts, vec!["api.example.com"]);
         assert_eq!(parsed.timeout_ms, None);
         assert!(!parsed.background);
+        assert_eq!(parsed.effective_lifetime_mode(), BackgroundLifetimeMode::RunOwned);
     }
 
     #[test]
@@ -163,6 +217,26 @@ mod tests {
 
         assert_eq!(parsed.command, "python3");
         assert!(parsed.background);
+        assert_eq!(parsed.effective_lifetime_mode(), BackgroundLifetimeMode::RunOwned);
+    }
+
+    #[test]
+    fn parse_process_runner_tool_input_accepts_background_lifetime_mode() {
+        let input = br#"{"command":"python3","args":["server.py"],"background":true,"lifetime_mode":"until_verifier"}"#;
+        let parsed = parse_process_runner_tool_input(input)
+            .expect("valid background lifetime mode should parse");
+
+        assert_eq!(parsed.effective_lifetime_mode(), BackgroundLifetimeMode::UntilVerifier);
+    }
+
+    #[test]
+    fn parse_process_runner_tool_input_accepts_keep_running_alias() {
+        let input =
+            br#"{"command":"python3","args":["server.py"],"background":true,"keep_running_after_run":true}"#;
+        let parsed =
+            parse_process_runner_tool_input(input).expect("valid detached alias should parse");
+
+        assert_eq!(parsed.effective_lifetime_mode(), BackgroundLifetimeMode::Detached);
     }
 
     #[test]
