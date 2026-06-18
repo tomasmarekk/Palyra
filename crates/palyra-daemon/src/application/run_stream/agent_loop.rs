@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 
 use crate::{
     gateway::current_unix_ms,
-    model_provider::{ProviderMessage, ProviderResponse, ProviderTurnOutput},
+    model_provider::{ProviderMessage, ProviderMessageRole, ProviderResponse, ProviderTurnOutput},
 };
 
 /// Default wall-clock budget per run (15 minutes) covering long browser workflows.
@@ -24,8 +24,19 @@ pub(crate) const DEFAULT_AGENT_LOOP_WALL_CLOCK_BUDGET_MS: u64 = 900_000;
 
 const BROWSER_SESSION_CREATE_TOOL_NAME: &str = "palyra.browser.session.create";
 const BROWSER_SESSION_CLOSE_TOOL_NAME: &str = "palyra.browser.session.close";
+const OS_FILE_TOOL_NAME: &str = "palyra.fs.os_file";
+const PROCESS_RUN_TOOL_NAME: &str = "palyra.process.run";
+const PROCESS_STATUS_TOOL_NAME: &str = "palyra.process.status";
+const PROCESS_STOP_TOOL_NAME: &str = "palyra.process.stop";
 const ROUTINES_QUERY_TOOL_NAME: &str = "palyra.routines.query";
 const ROUTINES_CONTROL_TOOL_NAME: &str = "palyra.routines.control";
+const WORKSPACE_PATCH_TOOL_NAME: &str = "palyra.fs.apply_patch";
+const RUN_PROGRESS_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
+const RUN_PROGRESS_CHECKPOINT_MAX_BYTES: usize = 8 * 1024;
+const RUN_PROGRESS_MAX_PRODUCED_FILES: usize = 16;
+const RUN_PROGRESS_MAX_MISSING_ARTIFACTS: usize = 12;
+const RUN_PROGRESS_MAX_ACTIVE_PROCESSES: usize = 8;
+const RUN_PROGRESS_MAX_FAILED_ATTEMPTS: usize = 8;
 
 /// Why the agent loop stopped; serialized into tape payloads as `snake_case`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -138,7 +149,59 @@ pub(crate) struct AgentLoopFinalizationEnvelope {
     pub(crate) usage: AgentLoopUsageSnapshot,
     pub(crate) tool_count: u32,
     pub(crate) artifact_refs: Vec<String>,
+    pub(crate) progress_checkpoint: Option<RunProgressCheckpoint>,
     pub(crate) provider_trace_ref: Option<String>,
+}
+
+/// Structured continuation state inferred from already-recorded tool evidence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RunProgressCheckpoint {
+    pub(crate) schema_version: u32,
+    pub(crate) run_id: String,
+    pub(crate) task_goal_summary: String,
+    pub(crate) last_successful_tool: Option<RunProgressToolSummary>,
+    pub(crate) produced_files: Vec<RunProgressFileSummary>,
+    pub(crate) missing_artifacts: Vec<RunProgressMissingArtifact>,
+    pub(crate) active_processes: Vec<RunProgressProcessSummary>,
+    pub(crate) known_failed_attempts: Vec<String>,
+    pub(crate) recommended_next_action: String,
+}
+
+/// Last completed tool step worth handing to a continuation run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RunProgressToolSummary {
+    pub(crate) tool_name: String,
+    pub(crate) summary: String,
+    pub(crate) artifact_refs: Vec<String>,
+}
+
+/// File artifact produced or updated by a successful file-writing tool.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RunProgressFileSummary {
+    pub(crate) path: String,
+    pub(crate) root_label: String,
+    pub(crate) status: String,
+    pub(crate) operation: String,
+    pub(crate) sha256: Option<String>,
+    pub(crate) size_bytes: Option<u64>,
+}
+
+/// Artifact name inferred from the task prompt but not yet seen in tool output.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RunProgressMissingArtifact {
+    pub(crate) path: String,
+    pub(crate) root_label: String,
+    pub(crate) required_by: String,
+}
+
+/// Run-owned process state that may matter to a continuation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RunProgressProcessSummary {
+    pub(crate) pid: u32,
+    pub(crate) kind: String,
+    pub(crate) status: String,
+    pub(crate) cleanup: String,
+    pub(crate) log_artifact: Option<String>,
 }
 
 /// Mutable budget and message state for one agent-loop run.
@@ -278,11 +341,14 @@ impl AgentRunLoopState {
     /// completed, resumable partial (`needs_continuation`), or failed.
     pub(crate) fn finalization_envelope(
         &self,
+        run_id: &str,
         reason: AgentLoopTerminationReason,
         user_visible_message: impl Into<String>,
         provider_trace_ref: Option<String>,
     ) -> AgentLoopFinalizationEnvelope {
         let outcome = self.finalization_outcome(reason);
+        let progress_checkpoint =
+            outcome.continuation_required.then(|| self.progress_checkpoint(run_id, reason));
         AgentLoopFinalizationEnvelope {
             schema_version: 1,
             termination_reason: reason,
@@ -295,8 +361,36 @@ impl AgentRunLoopState {
             usage: self.usage.clone(),
             tool_count: self.completed_tool_calls,
             artifact_refs: Vec::new(),
+            progress_checkpoint,
             provider_trace_ref,
         }
+    }
+
+    /// Infers bounded continuation state from the provider message history.
+    pub(crate) fn progress_checkpoint(
+        &self,
+        run_id: &str,
+        reason: AgentLoopTerminationReason,
+    ) -> RunProgressCheckpoint {
+        build_run_progress_checkpoint(run_id, reason, self.messages.as_slice())
+    }
+
+    /// Serializes the model-visible checkpoint and keeps it under the prompt cap.
+    pub(crate) fn progress_checkpoint_json(
+        &self,
+        run_id: &str,
+        reason: AgentLoopTerminationReason,
+    ) -> String {
+        let mut checkpoint = self.progress_checkpoint(run_id, reason);
+        checkpoint.truncate_for_model();
+        serde_json::to_string(&checkpoint).unwrap_or_else(|_| {
+            json!({
+                "schema_version": RUN_PROGRESS_CHECKPOINT_SCHEMA_VERSION,
+                "run_id": run_id,
+                "recommended_next_action": "checkpoint serialization failed; inspect latest run status and continue from the last successful tool evidence",
+            })
+            .to_string()
+        })
     }
 
     /// Serializes the `agent_loop.started` tape payload.
@@ -338,6 +432,7 @@ impl AgentRunLoopState {
             "termination_reason": reason.as_str(),
             "state": self.snapshot(run_id, Some(reason)),
             "finalization": self.finalization_envelope(
+                run_id,
                 reason,
                 user_visible_message.to_owned(),
                 provider_trace_ref,
@@ -375,6 +470,529 @@ impl AgentRunLoopState {
 
     fn elapsed(&self) -> Duration {
         Instant::now().saturating_duration_since(self.started_at)
+    }
+}
+
+impl RunProgressCheckpoint {
+    fn truncate_for_model(&mut self) {
+        truncate_vec(&mut self.produced_files, RUN_PROGRESS_MAX_PRODUCED_FILES);
+        truncate_vec(&mut self.missing_artifacts, RUN_PROGRESS_MAX_MISSING_ARTIFACTS);
+        truncate_vec(&mut self.active_processes, RUN_PROGRESS_MAX_ACTIVE_PROCESSES);
+        truncate_vec(&mut self.known_failed_attempts, RUN_PROGRESS_MAX_FAILED_ATTEMPTS);
+        if let Some(last_successful_tool) = self.last_successful_tool.as_mut() {
+            last_successful_tool.summary =
+                checkpoint_text(last_successful_tool.summary.as_str(), 320);
+            truncate_vec(&mut last_successful_tool.artifact_refs, 8);
+        }
+        self.task_goal_summary = checkpoint_text(self.task_goal_summary.as_str(), 320);
+        self.recommended_next_action = checkpoint_text(self.recommended_next_action.as_str(), 480);
+
+        while serde_json::to_vec(self).map_or(usize::MAX, |bytes| bytes.len())
+            > RUN_PROGRESS_CHECKPOINT_MAX_BYTES
+        {
+            if self.produced_files.pop().is_some()
+                || self.known_failed_attempts.pop().is_some()
+                || self.active_processes.pop().is_some()
+                || self.missing_artifacts.pop().is_some()
+            {
+                continue;
+            }
+            self.task_goal_summary =
+                "continue the existing user request from session context".to_owned();
+            self.recommended_next_action =
+                "inspect the last successful tool evidence and continue the same session"
+                    .to_owned();
+            break;
+        }
+    }
+}
+
+fn truncate_vec<T>(items: &mut Vec<T>, max_len: usize) {
+    if items.len() > max_len {
+        items.truncate(max_len);
+    }
+}
+
+fn build_run_progress_checkpoint(
+    run_id: &str,
+    reason: AgentLoopTerminationReason,
+    messages: &[ProviderMessage],
+) -> RunProgressCheckpoint {
+    let mut tool_calls_by_id = BTreeMap::<String, ProviderMessageToolCallRef>::new();
+    let mut produced_files_by_path = BTreeMap::<String, RunProgressFileSummary>::new();
+    let mut process_by_pid = BTreeMap::<u32, RunProgressProcessSummary>::new();
+    let mut known_failed_attempts = Vec::<String>::new();
+    let mut last_successful_tool = None::<RunProgressToolSummary>;
+
+    for message in messages {
+        for tool_call in &message.tool_calls {
+            tool_calls_by_id.insert(
+                tool_call.proposal_id.clone(),
+                ProviderMessageToolCallRef { tool_name: tool_call.tool_name.clone() },
+            );
+        }
+
+        if message.role != ProviderMessageRole::Tool {
+            continue;
+        }
+        let Some(tool_call_id) = message.tool_call_id.as_deref() else {
+            continue;
+        };
+        let Some(tool_call) = tool_calls_by_id.get(tool_call_id) else {
+            continue;
+        };
+        let Ok(raw_output) = serde_json::from_str::<Value>(message.text_content().as_str()) else {
+            continue;
+        };
+        let output = model_visible_tool_result_payload(&raw_output);
+
+        if model_visible_tool_result_succeeded(&raw_output) {
+            collect_produced_files(
+                tool_call.tool_name.as_str(),
+                output,
+                &mut produced_files_by_path,
+            );
+            collect_process_progress(tool_call.tool_name.as_str(), output, &mut process_by_pid);
+            last_successful_tool = Some(tool_success_summary(tool_call.tool_name.as_str(), output));
+        } else if known_failed_attempts.len() < RUN_PROGRESS_MAX_FAILED_ATTEMPTS {
+            known_failed_attempts
+                .push(tool_failure_summary(tool_call.tool_name.as_str(), &raw_output));
+        }
+    }
+
+    let produced_files = produced_files_by_path.into_values().collect::<Vec<_>>();
+    let missing_artifacts = missing_artifacts_from_messages(messages, produced_files.as_slice());
+    RunProgressCheckpoint {
+        schema_version: RUN_PROGRESS_CHECKPOINT_SCHEMA_VERSION,
+        run_id: run_id.to_owned(),
+        task_goal_summary: checkpoint_task_goal_summary(messages),
+        last_successful_tool,
+        recommended_next_action: checkpoint_next_action(
+            reason,
+            missing_artifacts.as_slice(),
+            process_by_pid.values(),
+        ),
+        produced_files,
+        missing_artifacts,
+        active_processes: process_by_pid.into_values().collect(),
+        known_failed_attempts,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProviderMessageToolCallRef {
+    tool_name: String,
+}
+
+fn model_visible_tool_result_payload(output: &Value) -> &Value {
+    output
+        .get("output")
+        .filter(|_| output.get("tool_name").and_then(Value::as_str).is_some())
+        .unwrap_or(output)
+}
+
+fn model_visible_tool_result_succeeded(output: &Value) -> bool {
+    output.get("success").and_then(Value::as_bool) != Some(false)
+}
+
+fn collect_produced_files(
+    tool_name: &str,
+    output: &Value,
+    produced_files_by_path: &mut BTreeMap<String, RunProgressFileSummary>,
+) {
+    match tool_name {
+        WORKSPACE_PATCH_TOOL_NAME => collect_workspace_patch_files(output, produced_files_by_path),
+        OS_FILE_TOOL_NAME => collect_os_file_artifacts(output, produced_files_by_path),
+        _ => {}
+    }
+}
+
+fn collect_workspace_patch_files(
+    output: &Value,
+    produced_files_by_path: &mut BTreeMap<String, RunProgressFileSummary>,
+) {
+    if output.get("dry_run").and_then(Value::as_bool) == Some(true) {
+        return;
+    }
+    let Some(files) = output.get("files_touched").and_then(Value::as_array) else {
+        return;
+    };
+    for file in files {
+        let Some(path) = file.get("path").and_then(Value::as_str).map(checkpoint_path) else {
+            continue;
+        };
+        if path.is_empty() {
+            continue;
+        }
+        let operation =
+            file.get("operation").and_then(Value::as_str).unwrap_or("update").to_owned();
+        if matches!(operation.as_str(), "delete" | "no_op") {
+            continue;
+        }
+        produced_files_by_path.insert(
+            path.clone(),
+            RunProgressFileSummary {
+                path,
+                root_label: "app".to_owned(),
+                status: "exists".to_owned(),
+                operation,
+                sha256: file.get("after_sha256").and_then(Value::as_str).map(checkpoint_sha),
+                size_bytes: file.get("after_size_bytes").and_then(Value::as_u64),
+            },
+        );
+    }
+}
+
+fn collect_os_file_artifacts(
+    output: &Value,
+    produced_files_by_path: &mut BTreeMap<String, RunProgressFileSummary>,
+) {
+    if output.get("dry_run").and_then(Value::as_bool) == Some(true) {
+        return;
+    }
+    let operation = output.get("operation").and_then(Value::as_str).unwrap_or_default();
+    let path_key = match operation {
+        "write" | "mkdir" => "path",
+        "copy" | "move" => "target_path",
+        _ => return,
+    };
+    let Some(path) = output.get(path_key).and_then(Value::as_str).map(checkpoint_path) else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+    produced_files_by_path.insert(
+        path.clone(),
+        RunProgressFileSummary {
+            path,
+            root_label: "app".to_owned(),
+            status: "exists".to_owned(),
+            operation: operation.to_owned(),
+            sha256: output.get("content_sha256").and_then(Value::as_str).map(checkpoint_sha),
+            size_bytes: output
+                .get("bytes_written")
+                .and_then(Value::as_u64)
+                .or_else(|| output.get("size_bytes").and_then(Value::as_u64)),
+        },
+    );
+}
+
+fn collect_process_progress(
+    tool_name: &str,
+    output: &Value,
+    process_by_pid: &mut BTreeMap<u32, RunProgressProcessSummary>,
+) {
+    match tool_name {
+        PROCESS_RUN_TOOL_NAME => {
+            if output.get("background").and_then(Value::as_bool) != Some(true) {
+                return;
+            }
+            let Some(pid) = process_pid(output) else {
+                return;
+            };
+            process_by_pid.insert(
+                pid,
+                RunProgressProcessSummary {
+                    pid,
+                    kind: "background".to_owned(),
+                    status: "run_owned_background_started".to_owned(),
+                    cleanup: "terminal_run_cleanup_will_stop_process_if_still_running".to_owned(),
+                    log_artifact: output
+                        .get("log_artifact")
+                        .and_then(Value::as_str)
+                        .map(checkpoint_text_id),
+                },
+            );
+        }
+        PROCESS_STATUS_TOOL_NAME => {
+            let Some(pid) = process_pid(output) else {
+                return;
+            };
+            let status = match output.get("alive").and_then(Value::as_bool) {
+                Some(true) => "running",
+                Some(false) => "stopped",
+                None => "status_unknown",
+            };
+            process_by_pid
+                .entry(pid)
+                .and_modify(|process| process.status = status.to_owned())
+                .or_insert_with(|| RunProgressProcessSummary {
+                    pid,
+                    kind: "background".to_owned(),
+                    status: status.to_owned(),
+                    cleanup: "inspect_process_status_before_claiming_service_lifetime".to_owned(),
+                    log_artifact: None,
+                });
+        }
+        PROCESS_STOP_TOOL_NAME => {
+            let Some(pid) = process_pid(output) else {
+                return;
+            };
+            let status = if output.get("stopped").and_then(Value::as_bool) == Some(true) {
+                "stopped"
+            } else {
+                "stop_attempted_status_unknown"
+            };
+            process_by_pid
+                .entry(pid)
+                .and_modify(|process| process.status = status.to_owned())
+                .or_insert_with(|| RunProgressProcessSummary {
+                    pid,
+                    kind: "background".to_owned(),
+                    status: status.to_owned(),
+                    cleanup: "stop_command_already_attempted".to_owned(),
+                    log_artifact: None,
+                });
+        }
+        _ => {}
+    }
+}
+
+fn process_pid(output: &Value) -> Option<u32> {
+    let pid = output
+        .pointer("/process_handle/direct_process_pid")
+        .and_then(Value::as_u64)
+        .or_else(|| output.get("pid").and_then(Value::as_u64))?;
+    u32::try_from(pid).ok().filter(|pid| *pid > 0)
+}
+
+fn tool_success_summary(tool_name: &str, output: &Value) -> RunProgressToolSummary {
+    RunProgressToolSummary {
+        tool_name: tool_name.to_owned(),
+        summary: checkpoint_text(tool_success_summary_text(tool_name, output).as_str(), 384),
+        artifact_refs: artifact_refs_from_tool_output(output),
+    }
+}
+
+fn tool_success_summary_text(tool_name: &str, output: &Value) -> String {
+    match tool_name {
+        WORKSPACE_PATCH_TOOL_NAME => {
+            let files = output
+                .get("files_touched")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.get("path").and_then(Value::as_str))
+                        .take(6)
+                        .map(checkpoint_path)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if files.is_empty() {
+                "workspace patch completed".to_owned()
+            } else {
+                format!("workspace patch updated {}", files.join(", "))
+            }
+        }
+        OS_FILE_TOOL_NAME => {
+            let operation = output.get("operation").and_then(Value::as_str).unwrap_or("operation");
+            let path = output
+                .get("target_path")
+                .or_else(|| output.get("path"))
+                .and_then(Value::as_str)
+                .map(checkpoint_path)
+                .unwrap_or_else(|| "unknown path".to_owned());
+            format!("os_file {operation} completed for {path}")
+        }
+        PROCESS_RUN_TOOL_NAME => {
+            if output.get("background").and_then(Value::as_bool) == Some(true) {
+                process_pid(output).map_or_else(
+                    || "background process started with unknown pid".to_owned(),
+                    |pid| format!("run-owned background process pid={pid} started"),
+                )
+            } else {
+                let exit_code = output.get("exit_code").and_then(Value::as_i64).unwrap_or(0);
+                format!("process completed with exit_code={exit_code}")
+            }
+        }
+        PROCESS_STATUS_TOOL_NAME | PROCESS_STOP_TOOL_NAME => {
+            let pid =
+                process_pid(output).map_or_else(|| "unknown".to_owned(), |pid| pid.to_string());
+            format!("{tool_name} completed for pid={pid}")
+        }
+        _ => format!("{tool_name} completed successfully"),
+    }
+}
+
+fn artifact_refs_from_tool_output(output: &Value) -> Vec<String> {
+    let mut refs = BTreeSet::<String>::new();
+    collect_artifact_refs(output, &mut refs);
+    refs.into_iter().take(8).collect()
+}
+
+fn collect_artifact_refs(value: &Value, refs: &mut BTreeSet<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, value) in map {
+                if matches!(
+                    key.as_str(),
+                    "artifact_id"
+                        | "checkpoint_id"
+                        | "preflight_checkpoint_id"
+                        | "post_change_checkpoint_id"
+                        | "mutation_id"
+                ) {
+                    if let Some(raw) = value.as_str() {
+                        refs.insert(checkpoint_text_id(raw));
+                    }
+                }
+                collect_artifact_refs(value, refs);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_artifact_refs(item, refs);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn tool_failure_summary(tool_name: &str, output: &Value) -> String {
+    let error = output
+        .get("error")
+        .and_then(Value::as_str)
+        .or_else(|| output.get("message").and_then(Value::as_str))
+        .unwrap_or("tool failed without a structured error");
+    checkpoint_text(format!("{tool_name} failed: {error}").as_str(), 512)
+}
+
+fn missing_artifacts_from_messages(
+    messages: &[ProviderMessage],
+    produced_files: &[RunProgressFileSummary],
+) -> Vec<RunProgressMissingArtifact> {
+    let produced =
+        produced_files.iter().map(|file| file.path.to_ascii_lowercase()).collect::<BTreeSet<_>>();
+    let mut candidates = BTreeSet::<String>::new();
+    for message in messages.iter().filter(|message| message.role == ProviderMessageRole::User) {
+        for path in file_artifact_tokens(message.text_content().as_str()) {
+            if !produced.contains(path.to_ascii_lowercase().as_str()) {
+                candidates.insert(path);
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .take(RUN_PROGRESS_MAX_MISSING_ARTIFACTS)
+        .map(|path| RunProgressMissingArtifact {
+            path,
+            root_label: "app".to_owned(),
+            required_by: "task_prompt".to_owned(),
+        })
+        .collect()
+}
+
+fn file_artifact_tokens(text: &str) -> Vec<String> {
+    let mut tokens = Vec::<String>::new();
+    let mut token = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '/' | '\\') {
+            token.push(ch);
+        } else {
+            push_file_artifact_token(token.as_str(), &mut tokens);
+            token.clear();
+        }
+    }
+    push_file_artifact_token(token.as_str(), &mut tokens);
+    tokens
+}
+
+fn push_file_artifact_token(raw: &str, tokens: &mut Vec<String>) {
+    let token =
+        raw.trim_matches(['.', ',', ';', ':', ')', ']', '}', '"', '\'', '`']).replace('\\', "/");
+    if token.is_empty()
+        || token.contains("://")
+        || token.to_ascii_lowercase().contains(".palyra")
+        || !file_artifact_extension_allowed(token.as_str())
+    {
+        return;
+    }
+    let normalized = token.trim_start_matches("./").to_owned();
+    if !tokens.contains(&normalized) {
+        tokens.push(normalized);
+    }
+}
+
+fn file_artifact_extension_allowed(path: &str) -> bool {
+    let Some(extension) = path.rsplit('.').next() else {
+        return false;
+    };
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "css"
+            | "csv"
+            | "html"
+            | "js"
+            | "json"
+            | "jsx"
+            | "md"
+            | "py"
+            | "rs"
+            | "toml"
+            | "ts"
+            | "tsx"
+            | "txt"
+            | "yaml"
+            | "yml"
+    )
+}
+
+fn checkpoint_task_goal_summary(messages: &[ProviderMessage]) -> String {
+    let produced_files = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == ProviderMessageRole::User)
+        .map(|message| file_artifact_tokens(message.text_content().as_str()))
+        .unwrap_or_default();
+    if produced_files.is_empty() {
+        return "continue the existing user request from session context".to_owned();
+    }
+    checkpoint_text(format!("continue task involving {}", produced_files.join(", ")).as_str(), 320)
+}
+
+fn checkpoint_next_action<'a>(
+    reason: AgentLoopTerminationReason,
+    missing_artifacts: &[RunProgressMissingArtifact],
+    processes: impl Iterator<Item = &'a RunProgressProcessSummary>,
+) -> String {
+    if let Some(first_missing) = missing_artifacts.first() {
+        return checkpoint_text(
+            format!("create or verify missing artifact {} before final answer", first_missing.path)
+                .as_str(),
+            480,
+        );
+    }
+    let process_count = processes.count();
+    if process_count > 0 && reason == AgentLoopTerminationReason::WallClock {
+        return "verify run-owned background process state and continue validation before claiming the service is still running".to_owned();
+    }
+    "verify the latest successful tool evidence and produce a final answer if requested artifacts are complete".to_owned()
+}
+
+fn checkpoint_path(path: &str) -> String {
+    checkpoint_text(path.replace('\\', "/").as_str(), 260)
+}
+
+fn checkpoint_sha(value: &str) -> String {
+    checkpoint_text(value, 128)
+}
+
+fn checkpoint_text_id(value: &str) -> String {
+    checkpoint_text(value, 160)
+}
+
+fn checkpoint_text(value: &str, max_chars: usize) -> String {
+    let normalized = value.trim().replace(['\r', '\n'], " ");
+    let redacted = palyra_common::redaction::redact_internal_runtime_paths(normalized.as_str());
+    if redacted.chars().count() > max_chars {
+        let limit = max_chars.saturating_sub(3);
+        let mut output = redacted.chars().take(limit).collect::<String>();
+        output.push_str("...");
+        output
+    } else {
+        redacted
     }
 }
 
@@ -713,6 +1331,195 @@ mod tests {
         assert_eq!(parsed["finalization"]["partial"], true);
         assert_eq!(parsed["finalization"]["continuation_required"], true);
         assert_eq!(parsed["finalization"]["tool_count"], 1);
+    }
+
+    #[test]
+    fn progress_checkpoint_reports_produced_and_missing_artifacts() {
+        let mut state = AgentRunLoopState::new(
+            vec![ProviderMessage::user_text(
+                "Create extract.js and final solution.txt.".to_owned(),
+            )],
+            2,
+            4,
+            10_000,
+        );
+        state.append_assistant_turn(&ProviderTurnOutput {
+            full_text: String::new(),
+            content_parts: vec![crate::model_provider::ProviderOutputContentPart::ToolCall {
+                proposal_id: "call-patch".to_owned(),
+                tool_name: WORKSPACE_PATCH_TOOL_NAME.to_owned(),
+                input_json: serde_json::json!({"patch":"*** Begin Patch\n*** Add File: extract.js\n+console.log(1)\n*** End Patch"}),
+            }],
+            finish_reason: ProviderFinishReason::ToolCalls,
+            usage: ProviderUsage::new(0, 0, "test"),
+            raw_provider_refs: ProviderRawProviderRefs::default(),
+            redaction_state: Default::default(),
+        });
+        state.append_tool_result_messages(vec![ProviderMessage::tool_result(
+            "call-patch",
+            serde_json::json!({
+                "patch_sha256": "abc",
+                "dry_run": false,
+                "files_touched": [{
+                    "path": "extract.js",
+                    "workspace_root_index": 0,
+                    "operation": "create",
+                    "after_sha256": "sha",
+                    "after_size_bytes": 42
+                }],
+                "rollback_performed": false,
+                "redacted_preview": ""
+            })
+            .to_string(),
+        )]);
+
+        let checkpoint =
+            state.progress_checkpoint("run-01", AgentLoopTerminationReason::IncompleteFinalAnswer);
+
+        assert_eq!(checkpoint.produced_files[0].path, "extract.js");
+        assert_eq!(checkpoint.produced_files[0].status, "exists");
+        assert!(checkpoint
+            .missing_artifacts
+            .iter()
+            .any(|artifact| artifact.path == "solution.txt"));
+        assert_eq!(
+            checkpoint.last_successful_tool.as_ref().map(|tool| tool.tool_name.as_str()),
+            Some(WORKSPACE_PATCH_TOOL_NAME)
+        );
+    }
+
+    #[test]
+    fn progress_checkpoint_redacts_internal_runtime_paths_from_failed_attempts() {
+        let mut state = AgentRunLoopState::new(
+            vec![ProviderMessage::user_text("Write solution.txt".to_owned())],
+            2,
+            4,
+            10_000,
+        );
+        state.append_assistant_turn(&ProviderTurnOutput {
+            full_text: String::new(),
+            content_parts: vec![crate::model_provider::ProviderOutputContentPart::ToolCall {
+                proposal_id: "call-os-file".to_owned(),
+                tool_name: OS_FILE_TOOL_NAME.to_owned(),
+                input_json: serde_json::json!({"operation":"read","path":"solution.txt"}),
+            }],
+            finish_reason: ProviderFinishReason::ToolCalls,
+            usage: ProviderUsage::new(0, 0, "test"),
+            raw_provider_refs: ProviderRawProviderRefs::default(),
+            redaction_state: Default::default(),
+        });
+        state.append_tool_result_messages(vec![ProviderMessage::tool_result(
+            "call-os-file",
+            serde_json::json!({
+                "success": false,
+                "tool_name": OS_FILE_TOOL_NAME,
+                "error": r#"failed at C:\Users\Aftab Jafar Ansari\.palyra\sessions\01ABC\tape.ndjson"#,
+                "output": {}
+            })
+            .to_string(),
+        )]);
+
+        let checkpoint_json =
+            state.progress_checkpoint_json("run-01", AgentLoopTerminationReason::ProviderError);
+
+        assert!(!checkpoint_json.contains("Aftab Jafar Ansari"), "{checkpoint_json}");
+        assert!(!checkpoint_json.contains(".palyra"), "{checkpoint_json}");
+        assert!(checkpoint_json.contains("<palyra_internal_artifact_ref>"));
+    }
+
+    #[test]
+    fn progress_checkpoint_preserves_last_successful_tool_after_provider_error() {
+        let mut state = AgentRunLoopState::new(
+            vec![ProviderMessage::user_text("Create extract.js")],
+            2,
+            4,
+            10_000,
+        );
+        state.append_assistant_turn(&ProviderTurnOutput {
+            full_text: String::new(),
+            content_parts: vec![crate::model_provider::ProviderOutputContentPart::ToolCall {
+                proposal_id: "call-patch".to_owned(),
+                tool_name: WORKSPACE_PATCH_TOOL_NAME.to_owned(),
+                input_json: serde_json::json!({}),
+            }],
+            finish_reason: ProviderFinishReason::ToolCalls,
+            usage: ProviderUsage::new(0, 0, "test"),
+            raw_provider_refs: ProviderRawProviderRefs::default(),
+            redaction_state: Default::default(),
+        });
+        state.append_tool_result_messages(vec![ProviderMessage::tool_result(
+            "call-patch",
+            serde_json::json!({
+                "patch_sha256": "abc",
+                "dry_run": false,
+                "files_touched": [{
+                    "path": "extract.js",
+                    "workspace_root_index": 0,
+                    "operation": "create",
+                    "after_sha256": "sha",
+                    "after_size_bytes": 42
+                }],
+                "rollback_performed": false,
+                "redacted_preview": ""
+            })
+            .to_string(),
+        )]);
+
+        let payload = state.termination_payload(
+            "run-01",
+            AgentLoopTerminationReason::ProviderError,
+            "model provider reported finish_reason=tool_calls without a structured tool call payload",
+            None,
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(payload.as_str()).expect("termination payload should be JSON");
+
+        assert_eq!(
+            parsed["finalization"]["progress_checkpoint"]["last_successful_tool"]["tool_name"],
+            WORKSPACE_PATCH_TOOL_NAME
+        );
+        assert_eq!(
+            parsed["finalization"]["progress_checkpoint"]["produced_files"][0]["path"],
+            "extract.js"
+        );
+    }
+
+    #[test]
+    fn progress_checkpoint_reports_background_process_state_after_wall_clock() {
+        let mut state = AgentRunLoopState::new(
+            vec![ProviderMessage::user_text("Start dev server")],
+            2,
+            4,
+            10_000,
+        );
+        state.append_assistant_turn(&ProviderTurnOutput {
+            full_text: String::new(),
+            content_parts: vec![crate::model_provider::ProviderOutputContentPart::ToolCall {
+                proposal_id: "call-process".to_owned(),
+                tool_name: PROCESS_RUN_TOOL_NAME.to_owned(),
+                input_json: serde_json::json!({"command":"npm","args":["run","dev"],"background":true}),
+            }],
+            finish_reason: ProviderFinishReason::ToolCalls,
+            usage: ProviderUsage::new(0, 0, "test"),
+            raw_provider_refs: ProviderRawProviderRefs::default(),
+            redaction_state: Default::default(),
+        });
+        state.append_tool_result_messages(vec![ProviderMessage::tool_result(
+            "call-process",
+            serde_json::json!({
+                "background": true,
+                "pid": 12345,
+                "process_handle": {"direct_process_pid": 12345},
+                "run_lifecycle_note": "run-owned process"
+            })
+            .to_string(),
+        )]);
+
+        let checkpoint = state.progress_checkpoint("run-01", AgentLoopTerminationReason::WallClock);
+
+        assert_eq!(checkpoint.active_processes[0].pid, 12345);
+        assert_eq!(checkpoint.active_processes[0].status, "run_owned_background_started");
+        assert!(checkpoint.recommended_next_action.contains("background process state"));
     }
 
     #[test]

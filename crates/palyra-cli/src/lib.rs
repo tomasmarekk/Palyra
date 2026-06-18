@@ -143,8 +143,8 @@ use palyra_common::{
     },
     default_config_search_paths, parse_config_path, parse_daemon_bind_socket,
     redaction::{
-        is_sensitive_key, redact_auth_error, redact_url, redact_url_segments_in_text,
-        redact_url_strict, REDACTED,
+        is_sensitive_key, redact_auth_error, redact_internal_runtime_paths, redact_url,
+        redact_url_segments_in_text, redact_url_strict, REDACTED,
     },
     replay_bundle::{
         build_replay_bundle, canonical_replay_bundle_bytes, ensure_replay_report_passed,
@@ -2274,6 +2274,7 @@ fn resolve_doctor_admin_principal() -> String {
 fn sanitize_diagnostic_error(raw: &str) -> String {
     let mut sanitized = redact_auth_error(raw);
     sanitized = redact_url_segments_in_text(sanitized.as_str());
+    sanitized = redact_internal_runtime_paths(sanitized.as_str());
     sanitized = redact_diagnostic_sensitive_tokens(sanitized.as_str());
     truncate_utf8_chars(sanitized.as_str(), 1_024)
 }
@@ -4377,6 +4378,7 @@ where
     let mut request_stream_closed = false;
     let mut failed_message = None::<String>;
     let mut needs_continuation_message = None::<String>;
+    let mut needs_continuation_checkpoint = None::<AgentRunProgressCheckpoint>;
     let mut completed = false;
     let mut cancelled = false;
     let mut approval_mode = resolved.request.approval_mode;
@@ -4398,10 +4400,12 @@ where
         );
         if let Some(common_v1::run_stream_event::Body::Status(status)) = event.body.as_ref() {
             if status.kind == common_v1::stream_status::StatusKind::Failed as i32 {
+                let checkpoint = extract_agent_run_progress_checkpoint(status.message.as_str());
                 let message = sanitize_agent_failure_message(status.message.as_str());
                 if is_agent_cancellation_message(message.as_str()) {
                     cancelled = true;
                 } else if is_agent_needs_continuation_message(message.as_str()) {
+                    needs_continuation_checkpoint = checkpoint;
                     needs_continuation_message = Some(message);
                 } else {
                     failed_message = Some(message);
@@ -4442,13 +4446,17 @@ where
     }
     let (needs_continuation_message, continuation_request) =
         if let Some(message) = needs_continuation_message {
-            let continuation_request =
-                build_agent_auto_continuation_request(&resolved.session, &resolved.request)?;
+            let continuation_request = build_agent_auto_continuation_request(
+                &resolved.session,
+                &resolved.request,
+                needs_continuation_checkpoint.as_ref(),
+            )?;
             (
                 Some(enrich_agent_needs_continuation_message(
                     message,
                     &resolved.session,
                     &resolved.request,
+                    needs_continuation_checkpoint.as_ref(),
                 )),
                 Some(continuation_request),
             )
@@ -4459,6 +4467,7 @@ where
         completed,
         cancelled,
         needs_continuation_message,
+        needs_continuation_checkpoint,
         failed_message,
         continuation_request,
     })
@@ -4798,6 +4807,172 @@ fn build_agent_run_input(input: AgentRunInputArgs) -> Result<AgentRunInput> {
     })
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct AgentRunProgressCheckpoint {
+    schema_version: u32,
+    run_id: String,
+    task_goal_summary: String,
+    last_successful_tool: Option<AgentRunProgressToolSummary>,
+    #[serde(default)]
+    produced_files: Vec<AgentRunProgressFileSummary>,
+    #[serde(default)]
+    missing_artifacts: Vec<AgentRunProgressMissingArtifact>,
+    #[serde(default)]
+    active_processes: Vec<AgentRunProgressProcessSummary>,
+    #[serde(default)]
+    known_failed_attempts: Vec<String>,
+    recommended_next_action: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct AgentRunProgressToolSummary {
+    tool_name: String,
+    summary: String,
+    #[serde(default)]
+    artifact_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct AgentRunProgressFileSummary {
+    path: String,
+    #[serde(default)]
+    root_label: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    operation: String,
+    #[serde(default)]
+    sha256: Option<String>,
+    #[serde(default)]
+    size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct AgentRunProgressMissingArtifact {
+    path: String,
+    #[serde(default)]
+    root_label: String,
+    #[serde(default)]
+    required_by: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct AgentRunProgressProcessSummary {
+    pid: u32,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    cleanup: String,
+    #[serde(default)]
+    log_artifact: Option<String>,
+}
+
+impl AgentRunProgressCheckpoint {
+    fn resume_prompt_fragment(&self) -> String {
+        let mut parts = Vec::<String>::new();
+        let checkpoint_json = redact_internal_runtime_paths(
+            serde_json::to_string(self).unwrap_or_else(|_| "{}".to_owned()).as_str(),
+        );
+        parts.push(format!("checkpoint_json={}", checkpoint_json));
+        if !self.produced_files.is_empty() {
+            let produced = self
+                .produced_files
+                .iter()
+                .take(8)
+                .map(|file| {
+                    let status =
+                        if file.status.trim().is_empty() { "exists" } else { file.status.as_str() };
+                    format!("{} {status}", sanitize_checkpoint_prompt_text(file.path.as_str(), 160))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            parts.push(format!("Produced files: {produced}."));
+        }
+        if !self.missing_artifacts.is_empty() {
+            let missing = self
+                .missing_artifacts
+                .iter()
+                .take(8)
+                .map(|artifact| sanitize_checkpoint_prompt_text(artifact.path.as_str(), 160))
+                .collect::<Vec<_>>()
+                .join(", ");
+            parts.push(format!("Missing artifacts: {missing}."));
+        }
+        if let Some(last_successful_tool) = self.last_successful_tool.as_ref() {
+            parts.push(format!(
+                "Last successful tool: {} ({})",
+                sanitize_checkpoint_prompt_text(last_successful_tool.tool_name.as_str(), 120),
+                sanitize_checkpoint_prompt_text(last_successful_tool.summary.as_str(), 260)
+            ));
+        }
+        if !self.active_processes.is_empty() {
+            let processes = self
+                .active_processes
+                .iter()
+                .take(4)
+                .map(|process| format!("pid={} status={}", process.pid, process.status))
+                .collect::<Vec<_>>()
+                .join(", ");
+            parts.push(format!("Process state: {processes}."));
+        }
+        parts.push(format!(
+            "Recommended next action: {}.",
+            sanitize_checkpoint_prompt_text(self.recommended_next_action.as_str(), 360)
+        ));
+        parts.join(" ")
+    }
+}
+
+fn extract_agent_run_progress_checkpoint(message: &str) -> Option<AgentRunProgressCheckpoint> {
+    let raw_json = extract_balanced_marker_json(message, "run_progress_checkpoint=")?;
+    serde_json::from_str::<AgentRunProgressCheckpoint>(raw_json).ok()
+}
+
+fn extract_balanced_marker_json<'a>(message: &'a str, marker: &str) -> Option<&'a str> {
+    let marker_start = message.find(marker)?;
+    let value_start = marker_start + marker.len();
+    let value = message[value_start..].trim_start();
+    if !value.starts_with('{') {
+        return None;
+    }
+    let json_start = value_start + message[value_start..].len() - value.len();
+    let mut depth = 0_i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, ch) in message[json_start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let end = json_start + offset + ch.len_utf8();
+                    return Some(&message[json_start..end]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn sanitize_checkpoint_prompt_text(value: &str, max_chars: usize) -> String {
+    let redacted = redact_internal_runtime_paths(value).replace(['\r', '\n'], " ");
+    truncate_utf8_chars(redacted.as_str(), max_chars)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentApprovalMode {
     Prompt,
@@ -4819,14 +4994,19 @@ fn enrich_agent_needs_continuation_message(
     message: String,
     session: &gateway_v1::SessionSummary,
     request: &AgentRunInput,
+    checkpoint: Option<&AgentRunProgressCheckpoint>,
 ) -> String {
     if message.contains("resume_command=") {
         return message;
     }
-    format!("{message}; resume_command={}", agent_resume_command(session, request))
+    format!("{message}; resume_command={}", agent_resume_command(session, request, checkpoint))
 }
 
-fn agent_resume_command(session: &gateway_v1::SessionSummary, request: &AgentRunInput) -> String {
+fn agent_resume_command(
+    session: &gateway_v1::SessionSummary,
+    request: &AgentRunInput,
+    checkpoint: Option<&AgentRunProgressCheckpoint>,
+) -> String {
     let mut args = vec!["palyra".to_owned(), "agent".to_owned(), "run".to_owned()];
     if let Some(session_id) = session
         .session_id
@@ -4850,19 +5030,26 @@ fn agent_resume_command(session: &gateway_v1::SessionSummary, request: &AgentRun
     args.push("--approval-mode".to_owned());
     args.push(agent_approval_mode_cli_value(request.approval_mode).to_owned());
     args.push("--prompt".to_owned());
-    args.push(agent_resume_prompt(request.run_id.as_str()));
+    args.push(agent_resume_prompt(request.run_id.as_str(), checkpoint));
     args.into_iter().map(|arg| quote_cli_arg(arg.as_str())).collect::<Vec<_>>().join(" ")
 }
 
-fn agent_resume_prompt(run_id: &str) -> String {
-    format!(
-        "Resume from run {run_id}. Inspect the run tape and continue the incomplete task from the latest successful tool evidence."
-    )
+fn agent_resume_prompt(run_id: &str, checkpoint: Option<&AgentRunProgressCheckpoint>) -> String {
+    match checkpoint {
+        Some(checkpoint) => format!(
+            "Resume from run {run_id}. Do not restart. Use this run progress checkpoint as the authoritative state: {} Run tape remains available only for targeted evidence checks; do not reread the entire task unless the checkpoint is insufficient.",
+            checkpoint.resume_prompt_fragment()
+        ),
+        None => format!(
+            "Resume from run {run_id}. Inspect the run tape summary and continue the incomplete task from the latest successful tool evidence."
+        ),
+    }
 }
 
 fn build_agent_auto_continuation_request(
     session: &gateway_v1::SessionSummary,
     previous: &AgentRunInput,
+    checkpoint: Option<&AgentRunProgressCheckpoint>,
 ) -> Result<AgentRunInput> {
     let session_id = session.session_id.clone().or_else(|| previous.session_id.clone());
     let session_key = if session_id.is_some() {
@@ -4880,7 +5067,7 @@ fn build_agent_auto_continuation_request(
         );
     }
 
-    let prompt = agent_resume_prompt(previous.run_id.as_str());
+    let prompt = agent_resume_prompt(previous.run_id.as_str(), checkpoint);
     build_agent_run_input(AgentRunInputArgs {
         session_id,
         session_key,
@@ -4908,6 +5095,44 @@ fn next_agent_auto_continuation_request(
         return None;
     }
     outcome.continuation_request.clone()
+}
+
+fn agent_continuation_blocked_state(
+    message: &str,
+    checkpoint: Option<&AgentRunProgressCheckpoint>,
+) -> Value {
+    json!({
+        "status": "blocked",
+        "reason_code": agent_continuation_reason_code(message).unwrap_or("needs_continuation"),
+        "continuation_available": true,
+        "missing_artifacts": checkpoint
+            .map(|checkpoint| json!(checkpoint.missing_artifacts))
+            .unwrap_or_else(|| json!([])),
+        "last_successful_tool": checkpoint
+            .and_then(|checkpoint| checkpoint.last_successful_tool.as_ref())
+            .map(|tool| json!(tool))
+            .unwrap_or(Value::Null),
+        "resume_command": agent_continuation_resume_command(message),
+        "checkpoint_artifact_id": Value::Null,
+    })
+}
+
+fn agent_continuation_reason_code(message: &str) -> Option<&str> {
+    let marker = "reason_code=";
+    let start = message.find(marker)? + marker.len();
+    let rest = &message[start..];
+    let end = rest
+        .find(|ch: char| ch.is_whitespace() || matches!(ch, ';' | ',' | ')'))
+        .unwrap_or(rest.len());
+    let reason = rest[..end].trim();
+    (!reason.is_empty()).then_some(reason)
+}
+
+fn agent_continuation_resume_command(message: &str) -> Option<String> {
+    let marker = "resume_command=";
+    let start = message.find(marker)? + marker.len();
+    let command = message[start..].trim();
+    (!command.is_empty()).then(|| command.to_owned())
 }
 
 fn emit_agent_auto_resume_status(attempt: usize, next_request: &AgentRunInput) -> Result<()> {
@@ -5971,6 +6196,36 @@ mod agent_stream_output_tests {
         }
     }
 
+    fn sample_progress_checkpoint() -> AgentRunProgressCheckpoint {
+        AgentRunProgressCheckpoint {
+            schema_version: 1,
+            run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            task_goal_summary: "continue task involving extract.js, solution.txt".to_owned(),
+            last_successful_tool: Some(AgentRunProgressToolSummary {
+                tool_name: "palyra.fs.apply_patch".to_owned(),
+                summary: "workspace patch updated extract.js".to_owned(),
+                artifact_refs: Vec::new(),
+            }),
+            produced_files: vec![AgentRunProgressFileSummary {
+                path: "extract.js".to_owned(),
+                root_label: "app".to_owned(),
+                status: "exists".to_owned(),
+                operation: "create".to_owned(),
+                sha256: Some("abc".to_owned()),
+                size_bytes: Some(42),
+            }],
+            missing_artifacts: vec![AgentRunProgressMissingArtifact {
+                path: "solution.txt".to_owned(),
+                root_label: "app".to_owned(),
+                required_by: "task_prompt".to_owned(),
+            }],
+            active_processes: Vec::new(),
+            known_failed_attempts: Vec::new(),
+            recommended_next_action:
+                "create or verify missing artifact solution.txt before final answer".to_owned(),
+        }
+    }
+
     #[test]
     fn agent_json_stream_buffer_accepts_bounded_events() {
         let mut buffer = AgentJsonStreamBuffer::new(AgentJsonStreamLimits {
@@ -6086,6 +6341,7 @@ mod agent_stream_output_tests {
             completed: false,
             cancelled: false,
             needs_continuation_message: None,
+            needs_continuation_checkpoint: None,
             failed_message: Some(
                 "model_provider_missing_auth: provider has no credential".to_owned(),
             ),
@@ -6107,6 +6363,7 @@ mod agent_stream_output_tests {
             needs_continuation_message: Some(
                 "model provider failed after tool work; needs_continuation=true reason_code=provider_error; partial result summary: continue in the same session".to_owned(),
             ),
+            needs_continuation_checkpoint: None,
             failed_message: None,
             continuation_request: None,
         };
@@ -6148,11 +6405,13 @@ mod agent_stream_output_tests {
             "wall_clock; needs_continuation=true".to_owned(),
             &session,
             &request,
+            None,
         );
         let outcome = AgentStreamOutcome {
             completed: false,
             cancelled: false,
             needs_continuation_message: Some(message),
+            needs_continuation_checkpoint: None,
             failed_message: None,
             continuation_request: None,
         };
@@ -6171,6 +6430,63 @@ mod agent_stream_output_tests {
             !rendered.contains("original prompt with sensitive context"),
             "resume command must not echo the original prompt: {rendered}"
         );
+    }
+
+    #[test]
+    fn checkpoint_resume_prompt_mentions_produced_and_missing_artifacts() {
+        let checkpoint = sample_progress_checkpoint();
+        let checkpoint_json =
+            serde_json::to_string(&checkpoint).expect("checkpoint should serialize");
+        let message = format!(
+            "wall_clock; needs_continuation=true reason_code=wall_clock; run_progress_checkpoint={checkpoint_json}"
+        );
+
+        let parsed = extract_agent_run_progress_checkpoint(message.as_str())
+            .expect("checkpoint should parse from terminal status");
+        let prompt = agent_resume_prompt("01ARZ3NDEKTSV4RRFFQ69G5FAV", Some(&parsed));
+
+        assert!(prompt.contains("extract.js exists"), "{prompt}");
+        assert!(prompt.contains("Missing artifacts: solution.txt"), "{prompt}");
+        assert!(prompt.contains("Last successful tool: palyra.fs.apply_patch"), "{prompt}");
+        assert!(prompt.contains("Recommended next action"), "{prompt}");
+        assert!(!prompt.contains("Inspect the run tape and continue"), "{prompt}");
+    }
+
+    #[test]
+    fn continuation_error_includes_blocked_state_from_checkpoint() {
+        let checkpoint = sample_progress_checkpoint();
+        let message =
+            "wall_clock; needs_continuation=true reason_code=wall_clock; resume_command=palyra agent run --prompt \"Resume from run\""
+                .to_owned();
+        let outcome = AgentStreamOutcome {
+            completed: false,
+            cancelled: false,
+            needs_continuation_message: Some(message),
+            needs_continuation_checkpoint: Some(checkpoint),
+            failed_message: None,
+            continuation_request: None,
+        };
+
+        let error =
+            outcome.ensure_success().expect_err("needs continuation should be a command error");
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("\"status\":\"blocked\""), "{rendered}");
+        assert!(rendered.contains("\"reason_code\":\"wall_clock\""), "{rendered}");
+        assert!(rendered.contains("solution.txt"), "{rendered}");
+        assert!(rendered.contains("palyra.fs.apply_patch"), "{rendered}");
+        assert!(rendered.contains("\"checkpoint_artifact_id\":null"), "{rendered}");
+    }
+
+    #[test]
+    fn agent_failure_sanitizer_redacts_internal_runtime_paths() {
+        let message = sanitize_agent_failure_message(
+            r#"failed reading C:\Users\Aftab Jafar Ansari\.palyra\sessions\01ABC\tape.ndjson"#,
+        );
+
+        assert!(!message.contains("Aftab Jafar Ansari"), "{message}");
+        assert!(!message.contains(".palyra"), "{message}");
+        assert!(message.contains("<palyra_internal_artifact_ref>"), "{message}");
     }
 
     #[test]
@@ -6199,7 +6515,7 @@ mod agent_stream_output_tests {
         })
         .expect("previous run input should build");
 
-        let next = build_agent_auto_continuation_request(&session, &previous)
+        let next = build_agent_auto_continuation_request(&session, &previous, None)
             .expect("auto continuation request should build");
 
         assert_eq!(
@@ -6249,7 +6565,7 @@ mod agent_stream_output_tests {
         })
         .expect("previous run input should build");
 
-        let next = build_agent_auto_continuation_request(&session, &previous)
+        let next = build_agent_auto_continuation_request(&session, &previous, None)
             .expect("auto continuation request should build");
 
         assert!(next.session_id.is_none());
@@ -6281,6 +6597,7 @@ mod agent_stream_output_tests {
             completed: false,
             cancelled: false,
             needs_continuation_message: Some("needs_continuation=true".to_owned()),
+            needs_continuation_checkpoint: None,
             failed_message: None,
             continuation_request: Some(continuation_request),
         };
@@ -6298,6 +6615,7 @@ mod agent_stream_output_tests {
             completed: false,
             cancelled: false,
             needs_continuation_message: None,
+            needs_continuation_checkpoint: None,
             failed_message: None,
             continuation_request: None,
         };
@@ -6313,6 +6631,7 @@ mod agent_stream_output_tests {
             completed: false,
             cancelled: true,
             needs_continuation_message: None,
+            needs_continuation_checkpoint: None,
             failed_message: None,
             continuation_request: None,
         };
@@ -7137,6 +7456,7 @@ struct AgentStreamOutcome {
     completed: bool,
     cancelled: bool,
     needs_continuation_message: Option<String>,
+    needs_continuation_checkpoint: Option<AgentRunProgressCheckpoint>,
     failed_message: Option<String>,
     continuation_request: Option<AgentRunInput>,
 }
@@ -7151,7 +7471,15 @@ impl AgentStreamOutcome {
             return Ok(());
         }
         if let Some(message) = self.needs_continuation_message.as_ref() {
-            anyhow::bail!("agent run needs continuation: {message}");
+            let continuation_state = agent_continuation_blocked_state(
+                message,
+                self.needs_continuation_checkpoint.as_ref(),
+            );
+            let continuation_state_json =
+                serde_json::to_string(&continuation_state).unwrap_or_else(|_| "{}".to_owned());
+            anyhow::bail!(
+                "agent run needs continuation: {message}; continuation_state={continuation_state_json}"
+            );
         }
         if let Some(message) = self.failed_message.as_ref() {
             anyhow::bail!("agent run failed: {message}");

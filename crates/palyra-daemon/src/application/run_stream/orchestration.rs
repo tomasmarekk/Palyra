@@ -956,15 +956,20 @@ fn agent_loop_terminal_status_message(
     message: &str,
 ) -> String {
     let message = loop_state.message_with_cleanup_guidance(message);
-    if !reason.needs_continuation(loop_state.completed_tool_calls())
-        || message.to_ascii_lowercase().contains("needs_continuation=true")
-    {
+    if !reason.needs_continuation(loop_state.completed_tool_calls()) {
+        return message;
+    }
+    if message.to_ascii_lowercase().contains("run_progress_checkpoint=") {
         return message;
     }
 
     let snapshot = loop_state.snapshot(run_id, Some(reason));
+    let checkpoint_json = loop_state.progress_checkpoint_json(run_id, reason);
+    if message.to_ascii_lowercase().contains("needs_continuation=true") {
+        return format!("{}; run_progress_checkpoint={checkpoint_json}", message.trim_end());
+    }
     format!(
-        "{}; needs_continuation=true reason_code={}; partial result summary: run tape for {} contains the exact tool evidence, completed_tool_calls={}, remaining_model_turns={}, remaining_tool_calls={}. Continue in the same session and ask to resume from run {}.",
+        "{}; needs_continuation=true reason_code={}; run_progress_checkpoint={checkpoint_json}; partial result summary: run tape for {} remains available for targeted evidence, completed_tool_calls={}, remaining_model_turns={}, remaining_tool_calls={}. Continue in the same session and ask to resume from run {}.",
         message.trim_end(),
         reason.as_str(),
         run_id,

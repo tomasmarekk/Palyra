@@ -451,6 +451,7 @@ async fn execute_interactive_agent_stream(
     let mut text_emitter = AgentTextEmitter::default();
     let mut failed_message = None::<String>;
     let mut needs_continuation_message = None::<String>;
+    let mut needs_continuation_checkpoint = None::<AgentRunProgressCheckpoint>;
     let mut completed = false;
     let mut cancelled = false;
     let mut saw_terminal_status = false;
@@ -554,10 +555,12 @@ async fn execute_interactive_agent_stream(
                 );
                 if let Some(common_v1::run_stream_event::Body::Status(status)) = event.body.as_ref() {
                     if status.kind == common_v1::stream_status::StatusKind::Failed as i32 {
+                        let checkpoint = extract_agent_run_progress_checkpoint(status.message.as_str());
                         let message = sanitize_agent_failure_message(status.message.as_str());
                         if is_agent_cancellation_message(message.as_str()) {
                             cancelled = true;
                         } else if is_agent_needs_continuation_message(message.as_str()) {
+                            needs_continuation_checkpoint = checkpoint;
                             needs_continuation_message = Some(message);
                         } else {
                             failed_message = Some(message);
@@ -604,6 +607,7 @@ async fn execute_interactive_agent_stream(
         completed,
         cancelled,
         needs_continuation_message,
+        needs_continuation_checkpoint,
         failed_message,
         continuation_request: None,
     };

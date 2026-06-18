@@ -9,6 +9,8 @@ use std::borrow::Cow;
 
 /// Placeholder substituted for redacted values; pinned contract surface in fixtures.
 pub const REDACTED: &str = "<redacted>";
+/// Placeholder substituted for internal Palyra runtime storage paths.
+pub const REDACTED_INTERNAL_RUNTIME_PATH: &str = "<palyra_internal_artifact_ref>";
 
 const SENSITIVE_KEY_MARKERS: &[&str] = &[
     "access_token",
@@ -143,7 +145,21 @@ pub fn redact_auth_error_strict(message: &str) -> String {
 /// Strict full-text redaction for diagnostics: embedded URLs first, then inline assignments.
 #[must_use]
 pub fn redact_diagnostic_text(message: &str) -> String {
-    redact_auth_error_strict(redact_url_segments_in_text_strict(message).as_str())
+    redact_internal_runtime_paths(
+        redact_auth_error_strict(redact_url_segments_in_text_strict(message).as_str()).as_str(),
+    )
+}
+
+/// Redacts internal `.palyra/sessions` storage paths from model-visible diagnostics.
+#[must_use]
+pub fn redact_internal_runtime_paths(message: &str) -> String {
+    let mut redacted = message.to_owned();
+    while let Some((marker_start, marker_len)) = internal_runtime_path_marker(&redacted) {
+        let start = internal_runtime_path_start(redacted.as_str(), marker_start);
+        let end = internal_runtime_path_end(redacted.as_str(), marker_start + marker_len);
+        redacted.replace_range(start..end, REDACTED_INTERNAL_RUNTIME_PATH);
+    }
+    redacted
 }
 
 fn redact_auth_error_with_strictness(message: &str, strictness: RedactionStrictness) -> String {
@@ -175,6 +191,75 @@ fn redact_auth_error_with_strictness(message: &str, strictness: RedactionStrictn
         &mut redact_next_bearer,
     );
     output
+}
+
+fn internal_runtime_path_marker(message: &str) -> Option<(usize, usize)> {
+    const MARKERS: &[&str] = &[
+        ".palyra/sessions",
+        ".palyra\\sessions",
+        "%userprofile%/.palyra",
+        "%userprofile%\\.palyra",
+        "$home/.palyra",
+        "$home\\.palyra",
+        "${home}/.palyra",
+        "${home}\\.palyra",
+    ];
+
+    let lowered = message.to_ascii_lowercase();
+    MARKERS
+        .iter()
+        .filter_map(|marker| lowered.find(marker).map(|index| (index, marker.len())))
+        .min_by_key(|(index, _)| *index)
+}
+
+fn internal_runtime_path_start(message: &str, marker_start: usize) -> usize {
+    let prefix = &message[..marker_start];
+    let lowered_prefix = prefix.to_ascii_lowercase();
+    if let Some(index) = lowered_prefix.rfind("%userprofile%") {
+        return index;
+    }
+    if let Some(index) = lowered_prefix.rfind("${home}") {
+        return index;
+    }
+    if let Some(index) = lowered_prefix.rfind("$home") {
+        return index;
+    }
+    if let Some(index) = windows_drive_path_start(prefix) {
+        return index;
+    }
+    prefix
+        .char_indices()
+        .rev()
+        .find_map(|(index, ch)| internal_path_left_boundary(ch).then_some(index + ch.len_utf8()))
+        .unwrap_or(0)
+}
+
+fn windows_drive_path_start(prefix: &str) -> Option<usize> {
+    let bytes = prefix.as_bytes();
+    let mut index = bytes.len();
+    while index >= 2 {
+        let colon_index = index - 1;
+        if bytes[colon_index] == b':' && bytes[colon_index - 1].is_ascii_alphabetic() {
+            return Some(colon_index - 1);
+        }
+        index -= 1;
+    }
+    None
+}
+
+fn internal_runtime_path_end(message: &str, search_start: usize) -> usize {
+    message[search_start..]
+        .char_indices()
+        .find_map(|(offset, ch)| internal_path_right_boundary(ch).then_some(search_start + offset))
+        .unwrap_or(message.len())
+}
+
+fn internal_path_left_boundary(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, '"' | '\'' | '`' | '(' | '[' | '{' | '<' | '=')
+}
+
+fn internal_path_right_boundary(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, '"' | '\'' | '`' | ')' | ']' | '}' | '>' | ',' | ';')
 }
 
 /// Applies URL redaction to every URL-looking whitespace token embedded in free text.
@@ -467,7 +552,8 @@ fn normalize_key(key: &str) -> String {
 mod tests {
     use super::{
         is_sensitive_key, redact_auth_error, redact_auth_error_strict, redact_diagnostic_text,
-        redact_header, redact_url, redact_url_segments_in_text, redact_url_strict, REDACTED,
+        redact_header, redact_internal_runtime_paths, redact_url, redact_url_segments_in_text,
+        redact_url_strict, REDACTED, REDACTED_INTERNAL_RUNTIME_PATH,
     };
 
     #[test]
@@ -650,5 +736,26 @@ mod tests {
         assert!(redacted.contains("token=<redacted>"), "{redacted}");
         assert!(!redacted.contains("token=abc"), "{redacted}");
         assert!(!redacted.contains("token=alpha"), "{redacted}");
+    }
+
+    #[test]
+    fn internal_runtime_path_redaction_masks_foreign_windows_home_sessions_path() {
+        let redacted = redact_internal_runtime_paths(
+            r#"resume path C:\Users\Aftab Jafar Ansari\.palyra\sessions\01ABC\tape.ndjson should not leak"#,
+        );
+
+        assert!(redacted.contains(REDACTED_INTERNAL_RUNTIME_PATH), "{redacted}");
+        assert!(!redacted.contains("Aftab Jafar Ansari"), "{redacted}");
+        assert!(!redacted.contains(".palyra"), "{redacted}");
+    }
+
+    #[test]
+    fn internal_runtime_path_redaction_masks_home_env_runtime_paths() {
+        let redacted = redact_internal_runtime_paths(
+            "%USERPROFILE%\\.palyra\\sessions\\01ABC $HOME/.palyra/sessions/01DEF ${HOME}/.palyra/state.json",
+        );
+
+        assert_eq!(redacted.matches(REDACTED_INTERNAL_RUNTIME_PATH).count(), 3);
+        assert!(!redacted.to_ascii_lowercase().contains(".palyra"), "{redacted}");
     }
 }
