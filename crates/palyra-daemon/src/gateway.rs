@@ -19,7 +19,7 @@ use std::process::Command;
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, RwLock,
@@ -73,7 +73,7 @@ use crate::{
         inbound_coalescer::InboundCoalescer,
         tool_runtime::workspace_scope::{
             relative_path_already_targets_active_root, run_launch_context_path_env,
-            session_active_workspace_root, workspace_focus_path_is_runtime_internal,
+            session_active_workspace_root,
             workspace_roots_with_run_launch_context_for_agent_source, ActiveWorkspaceRoot,
         },
     },
@@ -98,8 +98,7 @@ use crate::{
         OrchestratorCancelRequest, OrchestratorRunStartRequest, OrchestratorRunStatusSnapshot,
         OrchestratorSessionRecord, OrchestratorSessionResolveOutcome,
         OrchestratorSessionResolveRequest, OrchestratorTapeAppendRequest, OrchestratorTapeRecord,
-        OrchestratorUsageDelta, SessionProjectContextStateRecord,
-        SessionProjectContextStateUpsertRequest, SkillStatusRecord, SkillStatusUpsertRequest,
+        OrchestratorUsageDelta, SkillStatusRecord, SkillStatusUpsertRequest,
     },
     media::MediaRuntimeConfig,
     model_provider::{
@@ -978,9 +977,6 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation(
             cancellation_requested,
         )
         .await;
-        if outcome.success {
-            remember_process_runner_cwd_focus(runtime_state, context, input_json, &config).await;
-        }
         record_run_cleanup_resource_from_tool_outcome(
             runtime_state,
             context,
@@ -1326,134 +1322,6 @@ fn process_runner_workspace_root_for_input(
         .iter()
         .find_map(|arg| workspace_root_containing_process_path(arg.as_str(), workspace_roots))
         .or_else(|| workspace_roots.first().cloned())
-}
-
-async fn remember_process_runner_cwd_focus(
-    runtime_state: &Arc<GatewayRuntimeState>,
-    context: ToolRuntimeExecutionContext<'_>,
-    input_json: &[u8],
-    config: &ToolCallConfig,
-) {
-    let workspace_roots =
-        process_runner_workspace_roots_for_session(runtime_state, context, config).await;
-    let Some(focus_path) = process_runner_cwd_focus_path(input_json, workspace_roots.as_slice())
-    else {
-        return;
-    };
-    let state =
-        match runtime_state.session_project_context_state(context.session_id.to_owned()).await {
-            Ok(Some(state)) => state,
-            Ok(None) => SessionProjectContextStateRecord::new(context.session_id),
-            Err(status) => {
-                warn!(
-                    run_id = %context.run_id,
-                    session_id = %context.session_id,
-                    error = %status.message(),
-                    "failed to load session project context before recording process cwd focus"
-                );
-                return;
-            }
-        };
-    let mut focus_paths = state.focus_paths.clone();
-    focus_paths
-        .retain(|path| !process_focus_path_equivalent(path, focus_path.as_str()).unwrap_or(false));
-    focus_paths.insert(0, focus_path.clone());
-    if focus_paths == state.focus_paths {
-        return;
-    }
-    if let Err(status) = runtime_state
-        .upsert_session_project_context_state(SessionProjectContextStateUpsertRequest {
-            session_id: context.session_id.to_owned(),
-            focus_paths,
-            disabled_entry_ids: state.disabled_entry_ids,
-            approved_entry_ids: state.approved_entry_ids,
-            last_refreshed_at_unix_ms: state.last_refreshed_at_unix_ms,
-        })
-        .await
-    {
-        warn!(
-            run_id = %context.run_id,
-            session_id = %context.session_id,
-            focus_path = %focus_path,
-            error = %status.message(),
-            "failed to record process cwd as session project focus"
-        );
-    }
-}
-
-fn process_runner_cwd_focus_path(input_json: &[u8], workspace_roots: &[PathBuf]) -> Option<String> {
-    let input = parse_process_runner_tool_input(input_json).ok()?;
-    let cwd = input.cwd.as_deref()?.trim().trim_matches('"').trim_matches('\'');
-    if cwd.is_empty() || workspace_roots.is_empty() {
-        return None;
-    }
-    let requested = Path::new(cwd);
-    if requested.is_absolute() {
-        return workspace_focus_path_for_existing_dir(requested, workspace_roots);
-    }
-    let relative = process_runner_relative_cwd(cwd)?;
-    workspace_roots.iter().find_map(|root| {
-        let candidate = root.join(relative.as_path());
-        workspace_focus_path_for_existing_dir(candidate.as_path(), workspace_roots)
-    })
-}
-
-fn process_runner_relative_cwd(raw_cwd: &str) -> Option<PathBuf> {
-    let normalized = raw_cwd.trim().replace('\\', "/");
-    let trimmed = normalized.trim_start_matches("./").trim_start_matches('/');
-    let trimmed = trimmed.strip_prefix("workspace/").unwrap_or(trimmed).trim_matches('/');
-    if trimmed.is_empty() || matches!(trimmed, "." | "workspace") {
-        return None;
-    }
-    let relative = PathBuf::from(trimmed);
-    if relative.components().any(|component| {
-        matches!(component, Component::ParentDir | Component::Prefix(_) | Component::RootDir)
-    }) {
-        return None;
-    }
-    Some(relative)
-}
-
-fn workspace_focus_path_for_existing_dir(
-    requested: &Path,
-    workspace_roots: &[PathBuf],
-) -> Option<String> {
-    let canonical_requested = fs::canonicalize(requested).ok()?;
-    if !canonical_requested.is_dir() {
-        return None;
-    }
-    workspace_roots.iter().find_map(|root| {
-        let canonical_root = fs::canonicalize(root).ok()?;
-        if canonical_requested == canonical_root
-            || !canonical_requested.starts_with(canonical_root.as_path())
-        {
-            return None;
-        }
-        let relative = canonical_requested.strip_prefix(canonical_root.as_path()).ok()?;
-        let focus_path = process_workspace_relative_display_path(relative)?;
-        (!workspace_focus_path_is_runtime_internal(focus_path.as_str())).then_some(focus_path)
-    })
-}
-
-fn process_workspace_relative_display_path(path: &Path) -> Option<String> {
-    let mut parts = Vec::new();
-    for component in path.components() {
-        let Component::Normal(value) = component else {
-            return None;
-        };
-        let value = value.to_str()?;
-        if value.is_empty() {
-            return None;
-        }
-        parts.push(value.to_owned());
-    }
-    (!parts.is_empty()).then(|| parts.join("/"))
-}
-
-fn process_focus_path_equivalent(left: &str, right: &str) -> Option<bool> {
-    let left = process_runner_relative_cwd(left)?;
-    let right = process_runner_relative_cwd(right)?;
-    Some(left == right)
 }
 
 fn workspace_root_containing_process_path(

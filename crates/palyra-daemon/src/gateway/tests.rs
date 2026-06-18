@@ -50,9 +50,8 @@ use super::vault::vault_get_requires_approval;
 use super::{
     approval_failure_decision, best_effort_mark_approval_error, common_v1, constant_time_eq,
     enforce_vault_get_approval_policy, enforce_vault_scope_access, ingest_memory_best_effort,
-    matching_tool_approval_response_id, process_runner_cwd_focus_path,
-    process_runner_input_should_use_active_root, process_runner_input_with_path_env,
-    process_runner_workspace_root_for_input, remember_process_runner_cwd_focus,
+    matching_tool_approval_response_id, process_runner_input_should_use_active_root,
+    process_runner_input_with_path_env, process_runner_workspace_root_for_input,
     resolve_cron_job_channel_for_create, tool_approval_response_proposal_id,
     workspace_patch_metrics_from_output, CachedMemorySearchEntry, GatewayAuthConfig,
     GatewayJournalConfigSnapshot, GatewayRuntimeConfigSnapshot, GatewayRuntimeState,
@@ -101,6 +100,7 @@ use crate::application::{
         },
         os_file::execute_os_file_tool,
         routines::execute_routines_tool,
+        workspace_file::execute_workspace_list_dir_tool,
         workspace_patch::{
             execute_workspace_patch_tool, extend_patch_string_defaults,
             parse_patch_string_array_field,
@@ -270,52 +270,23 @@ fn process_runner_workspace_root_follows_absolute_cwd_inside_agent_root() {
     assert_eq!(selected, second_root);
 }
 
-#[test]
-fn process_runner_cwd_focus_path_follows_absolute_cwd_inside_agent_root() {
-    let tempdir = tempfile::tempdir().expect("tempdir should be created");
-    let harness_root = tempdir.path().join("Palyra-TestHarness");
-    let scenario = harness_root.join("scenarios").join("S041-20260613");
-    fs::create_dir_all(scenario.join("reports")).expect("scenario reports dir should exist");
-    let input = serde_json::to_vec(&json!({
-        "command": "echo",
-        "args": ["ok"],
-        "cwd": scenario.to_string_lossy(),
-    }))
-    .expect("input should serialize");
-
-    let focus = process_runner_cwd_focus_path(&input, std::slice::from_ref(&harness_root))
-        .expect("absolute cwd inside the harness root should become a session focus");
-
-    assert_eq!(focus, "scenarios/S041-20260613");
-}
-
-#[test]
-fn process_runner_cwd_focus_path_ignores_workspace_root_cwd() {
-    let tempdir = tempfile::tempdir().expect("tempdir should be created");
-    let workspace_root = tempdir.path().join("workspace");
-    fs::create_dir_all(workspace_root.as_path()).expect("workspace root should exist");
-    let input = serde_json::to_vec(&json!({
-        "command": "echo",
-        "args": ["ok"],
-        "cwd": workspace_root.to_string_lossy(),
-    }))
-    .expect("input should serialize");
-
-    assert!(process_runner_cwd_focus_path(&input, &[workspace_root]).is_none());
-}
-
 #[tokio::test(flavor = "multi_thread")]
-async fn process_runner_cwd_focus_is_persisted_for_followup_workspace_tools() {
-    let state = build_test_runtime_state(false);
-    let harness_root = tempfile::tempdir().expect("harness root should be created");
-    let scenario = harness_root.path().join("scenarios").join("S041-20260613");
-    fs::create_dir_all(scenario.join("reports")).expect("scenario reports dir should exist");
+async fn process_runner_cwd_does_not_persist_focus_for_followup_workspace_tools() {
+    let mut tool_call = default_test_tool_call_config();
+    tool_call.allowed_tools = vec![super::PROCESS_RUNNER_TOOL_NAME.to_owned()];
+    tool_call.process_runner.enabled = true;
+    tool_call.process_runner.allowed_executables = vec!["pwd".to_owned()];
+    let state = build_test_runtime_state_with_tool_call_config(false, tool_call);
+    let tempdir = tempfile::tempdir().expect("workspace root should be created");
+    let app = tempdir.path().join("app");
+    let repo = app.join("repo");
+    fs::create_dir_all(repo.as_path()).expect("repo dir should exist");
     state
         .create_agent(AgentCreateRequest {
-            agent_id: "process-focus-s041".to_owned(),
-            display_name: "Process Focus S041".to_owned(),
+            agent_id: "process-cwd-no-focus".to_owned(),
+            display_name: "Process Cwd No Focus".to_owned(),
             agent_dir: None,
-            workspace_roots: vec![harness_root.path().to_string_lossy().into_owned()],
+            workspace_roots: vec![app.to_string_lossy().into_owned()],
             default_model_profile: None,
             execution_backend_preference: None,
             default_tool_allowlist: Vec::new(),
@@ -335,22 +306,88 @@ async fn process_runner_cwd_focus_is_persisted_for_followup_workspace_tools() {
         backend_reason_code: "backend.default.local_sandbox",
     };
     ensure_tool_context_session(&state, &context);
-    let input = serde_json::to_vec(&json!({
-        "command": "echo",
-        "args": ["ok"],
-        "cwd": scenario.to_string_lossy(),
+    let process_input = serde_json::to_vec(&json!({
+        "command": "pwd",
+        "args": [],
+        "cwd": "repo",
     }))
     .expect("input should serialize");
 
-    remember_process_runner_cwd_focus(&state, context, input.as_slice(), &state.config.tool_call)
-        .await;
+    let process_outcome = super::execute_tool_with_runtime_dispatch(
+        &state,
+        context,
+        "01ARZ3NDEKTSV4RRFFQ69G5FB1",
+        super::PROCESS_RUNNER_TOOL_NAME,
+        process_input.as_slice(),
+        None,
+    )
+    .await;
+    assert!(process_outcome.success, "process.run should succeed: {}", process_outcome.error);
 
-    let stored = state
+    let stored_focus = state
         .session_project_context_state(context.session_id.to_owned())
         .await
-        .expect("project context state should load")
-        .expect("process cwd focus should be stored");
-    assert_eq!(stored.focus_paths.first().map(String::as_str), Some("scenarios/S041-20260613"));
+        .expect("project context state should load");
+    assert!(stored_focus.is_none(), "process cwd must not create session focus state");
+
+    let list_root_input =
+        serde_json::to_vec(&json!({"path": "."})).expect("list input should serialize");
+    let list_root_outcome = execute_workspace_list_dir_tool(
+        &state,
+        context,
+        "01ARZ3NDEKTSV4RRFFQ69G5FB2",
+        list_root_input.as_slice(),
+    )
+    .await;
+    assert!(list_root_outcome.success, "list root should succeed: {}", list_root_outcome.error);
+    let list_root_payload: Value =
+        serde_json::from_slice(&list_root_outcome.output_json).expect("list root output parses");
+    assert_eq!(list_root_payload.get("path").and_then(Value::as_str), Some("."));
+    let root_entries = list_root_payload
+        .get("entries")
+        .and_then(Value::as_array)
+        .expect("list root entries should be present");
+    assert!(
+        root_entries.iter().any(|entry| entry.get("name").and_then(Value::as_str) == Some("repo")),
+        "root listing should show repo entry: {root_entries:?}"
+    );
+
+    let list_repo_input =
+        serde_json::to_vec(&json!({"path": "repo"})).expect("list input should serialize");
+    let list_repo_outcome = execute_workspace_list_dir_tool(
+        &state,
+        context,
+        "01ARZ3NDEKTSV4RRFFQ69G5FB3",
+        list_repo_input.as_slice(),
+    )
+    .await;
+    assert!(list_repo_outcome.success, "list repo should succeed: {}", list_repo_outcome.error);
+    let list_repo_payload: Value =
+        serde_json::from_slice(&list_repo_outcome.output_json).expect("list repo output parses");
+    assert_eq!(list_repo_payload.get("path").and_then(Value::as_str), Some("repo"));
+
+    let patch = concat!(
+        "*** Begin Patch\n",
+        "*** Add File: secret.txt\n",
+        "+top-level\n",
+        "*** End Patch\n",
+    );
+    let patch_input =
+        serde_json::to_vec(&json!({ "patch": patch })).expect("patch input should serialize");
+    let patch_outcome = execute_workspace_patch_tool(
+        &state,
+        workspace_patch_test_request("01ARZ3NDEKTSV4RRFFQ69G5FB4", patch_input.as_slice()),
+    )
+    .await;
+    assert!(patch_outcome.success, "patch should apply at app root: {}", patch_outcome.error);
+    assert_eq!(
+        fs::read_to_string(app.join("secret.txt")).expect("app-level secret should exist"),
+        "top-level\n"
+    );
+    assert!(
+        !repo.join("secret.txt").exists(),
+        "process cwd must not silently re-root follow-up workspace writes"
+    );
 }
 
 async fn lock_session_compaction_test_guard() -> MutexGuard<'static, ()> {
@@ -480,10 +517,71 @@ fn strict_process_runner_policy() -> SandboxProcessRunnerPolicy {
     }
 }
 
+fn default_test_tool_call_config() -> crate::tool_protocol::ToolCallConfig {
+    crate::tool_protocol::ToolCallConfig {
+        allowed_tools: vec!["palyra.echo".to_owned()],
+        max_calls_per_run: 4,
+        execution_timeout_ms: 250,
+        process_runner: crate::sandbox_runner::SandboxProcessRunnerPolicy {
+            enabled: false,
+            tier: crate::sandbox_runner::SandboxProcessRunnerTier::B,
+            workspace_root: PathBuf::from("."),
+            path_access_mode: crate::sandbox_runner::PathAccessMode::WorkspaceOnly,
+            allowed_executables: Vec::new(),
+            allow_interpreters: false,
+            egress_enforcement_mode: crate::sandbox_runner::EgressEnforcementMode::Strict,
+            allowed_egress_hosts: Vec::new(),
+            allowed_dns_suffixes: Vec::new(),
+            cpu_time_limit_ms: 2_000,
+            memory_limit_bytes: 256 * 1024 * 1024,
+            max_output_bytes: 64 * 1024,
+        },
+        wasm_runtime: crate::wasm_plugin_runner::WasmPluginRunnerPolicy {
+            enabled: false,
+            allow_inline_modules: false,
+            max_module_size_bytes: 256 * 1024,
+            fuel_budget: 10_000_000,
+            max_memory_bytes: 64 * 1024 * 1024,
+            max_table_elements: 100_000,
+            max_instances: 256,
+            allowed_http_hosts: Vec::new(),
+            allowed_secrets: Vec::new(),
+            allowed_storage_prefixes: Vec::new(),
+            allowed_channels: Vec::new(),
+        },
+    }
+}
+
 fn build_test_runtime_state_with_runtime_overrides(
     hash_chain_enabled: bool,
     allow_private_targets: bool,
     feature_rollouts: crate::config::FeatureRolloutsConfig,
+) -> std::sync::Arc<GatewayRuntimeState> {
+    build_test_runtime_state_with_tool_call_config_and_runtime_overrides(
+        hash_chain_enabled,
+        allow_private_targets,
+        feature_rollouts,
+        default_test_tool_call_config(),
+    )
+}
+
+fn build_test_runtime_state_with_tool_call_config(
+    hash_chain_enabled: bool,
+    tool_call: crate::tool_protocol::ToolCallConfig,
+) -> std::sync::Arc<GatewayRuntimeState> {
+    build_test_runtime_state_with_tool_call_config_and_runtime_overrides(
+        hash_chain_enabled,
+        false,
+        crate::config::FeatureRolloutsConfig::default(),
+        tool_call,
+    )
+}
+
+fn build_test_runtime_state_with_tool_call_config_and_runtime_overrides(
+    hash_chain_enabled: bool,
+    allow_private_targets: bool,
+    feature_rollouts: crate::config::FeatureRolloutsConfig,
+    tool_call: crate::tool_protocol::ToolCallConfig,
 ) -> std::sync::Arc<GatewayRuntimeState> {
     let db_path = unique_temp_journal_path();
     let state_root = std::env::temp_dir().join(format!(
@@ -528,38 +626,7 @@ fn build_test_runtime_state_with_runtime_overrides(
             networked_workers: crate::config::NetworkedWorkersConfig::default(),
             channel_router: crate::channel_router::ChannelRouterConfig::default(),
             media: MediaRuntimeConfig::default(),
-            tool_call: crate::tool_protocol::ToolCallConfig {
-                allowed_tools: vec!["palyra.echo".to_owned()],
-                max_calls_per_run: 4,
-                execution_timeout_ms: 250,
-                process_runner: crate::sandbox_runner::SandboxProcessRunnerPolicy {
-                    enabled: false,
-                    tier: crate::sandbox_runner::SandboxProcessRunnerTier::B,
-                    workspace_root: PathBuf::from("."),
-                    path_access_mode: crate::sandbox_runner::PathAccessMode::WorkspaceOnly,
-                    allowed_executables: Vec::new(),
-                    allow_interpreters: false,
-                    egress_enforcement_mode: crate::sandbox_runner::EgressEnforcementMode::Strict,
-                    allowed_egress_hosts: Vec::new(),
-                    allowed_dns_suffixes: Vec::new(),
-                    cpu_time_limit_ms: 2_000,
-                    memory_limit_bytes: 256 * 1024 * 1024,
-                    max_output_bytes: 64 * 1024,
-                },
-                wasm_runtime: crate::wasm_plugin_runner::WasmPluginRunnerPolicy {
-                    enabled: false,
-                    allow_inline_modules: false,
-                    max_module_size_bytes: 256 * 1024,
-                    fuel_budget: 10_000_000,
-                    max_memory_bytes: 64 * 1024 * 1024,
-                    max_table_elements: 100_000,
-                    max_instances: 256,
-                    allowed_http_hosts: Vec::new(),
-                    allowed_secrets: Vec::new(),
-                    allowed_storage_prefixes: Vec::new(),
-                    allowed_channels: Vec::new(),
-                },
-            },
+            tool_call,
             http_fetch: super::HttpFetchRuntimeConfig {
                 allow_private_targets,
                 connect_timeout_ms: 1_500,

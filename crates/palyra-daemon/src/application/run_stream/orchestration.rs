@@ -2362,6 +2362,8 @@ const REPEATED_TOOL_FAILURE_LIMIT: u32 = 3;
 struct RepeatedToolFailureTracker {
     last_signature: Option<RepeatedToolFailureSignature>,
     repeated_count: u32,
+    last_successful_tool: Option<String>,
+    modified_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2380,6 +2382,15 @@ impl RepeatedToolFailureTracker {
         let mut termination = None;
         for message in tool_result_messages {
             let Some(signature) = repeated_tool_failure_signature(message) else {
+                if let Some(recovery) = successful_tool_recovery(message) {
+                    self.reset_failure_episode();
+                    self.last_successful_tool = Some(recovery.tool_name);
+                    if !recovery.modified_files.is_empty() {
+                        self.modified_files = recovery.modified_files;
+                    }
+                } else if is_tool_result_message(message) {
+                    self.reset_failure_episode();
+                }
                 continue;
             };
             if self.last_signature.as_ref() == Some(&signature) {
@@ -2390,12 +2401,28 @@ impl RepeatedToolFailureTracker {
             }
             if self.repeated_count >= REPEATED_TOOL_FAILURE_LIMIT {
                 termination = Some(RepeatedToolFailure {
-                    message: repeated_tool_failure_message(&signature, self.repeated_count),
+                    message: repeated_tool_failure_message(
+                        &signature,
+                        self.repeated_count,
+                        self.last_successful_tool.as_deref(),
+                        self.modified_files.as_slice(),
+                    ),
                 });
             }
         }
         termination
     }
+
+    fn reset_failure_episode(&mut self) {
+        self.last_signature = None;
+        self.repeated_count = 0;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SuccessfulToolRecovery {
+    tool_name: String,
+    modified_files: Vec<String>,
 }
 
 fn repeated_tool_failure_signature(
@@ -2437,6 +2464,66 @@ fn repeated_tool_failure_signature(
     Some(RepeatedToolFailureSignature { tool_name: tool_name.to_owned(), failure_kind })
 }
 
+fn successful_tool_recovery(message: &ProviderMessage) -> Option<SuccessfulToolRecovery> {
+    if message.role != crate::model_provider::ProviderMessageRole::Tool {
+        return None;
+    }
+    let value = serde_json::from_str::<Value>(message.text_content().as_str()).ok()?;
+    if !value.get("success").and_then(Value::as_bool).unwrap_or(false) {
+        return None;
+    }
+    let tool_name = value.get("tool_name").and_then(Value::as_str)?.to_owned();
+    if !tool_success_resets_patch_failure_episode(tool_name.as_str()) {
+        return None;
+    }
+    let output = value.get("output").unwrap_or(&value);
+    Some(SuccessfulToolRecovery {
+        tool_name,
+        modified_files: modified_files_from_tool_output(output),
+    })
+}
+
+fn is_tool_result_message(message: &ProviderMessage) -> bool {
+    message.role == crate::model_provider::ProviderMessageRole::Tool
+}
+
+fn tool_success_resets_patch_failure_episode(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        crate::gateway::WORKSPACE_PATCH_TOOL_NAME
+            | crate::gateway::OS_FILE_TOOL_NAME
+            | crate::gateway::PROCESS_RUNNER_TOOL_NAME
+    )
+}
+
+fn modified_files_from_tool_output(output: &Value) -> Vec<String> {
+    let mut files = Vec::new();
+    collect_modified_file_paths(output.get("files_touched"), &mut files);
+    collect_modified_file_paths(output.get("modified_files"), &mut files);
+    collect_modified_file_paths(output.get("path"), &mut files);
+    files.sort();
+    files.dedup();
+    files
+}
+
+fn collect_modified_file_paths(value: Option<&Value>, files: &mut Vec<String>) {
+    match value {
+        Some(Value::String(path)) if !path.trim().is_empty() => files.push(path.clone()),
+        Some(Value::Array(entries)) => {
+            for entry in entries {
+                if let Some(path) = entry.as_str().filter(|path| !path.trim().is_empty()) {
+                    files.push(path.to_owned());
+                } else if let Some(path) = entry.get("path").and_then(Value::as_str) {
+                    if !path.trim().is_empty() {
+                        files.push(path.to_owned());
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn normalize_repeated_tool_failure_kind(value: &str) -> String {
     let normalized = value.to_ascii_lowercase();
     if normalized.contains("expected '*** end patch'") {
@@ -2457,9 +2544,17 @@ fn normalize_repeated_tool_failure_kind(value: &str) -> String {
 fn repeated_tool_failure_message(
     signature: &RepeatedToolFailureSignature,
     repeated_count: u32,
+    last_successful_tool: Option<&str>,
+    modified_files: &[String],
 ) -> String {
+    let last_successful_tool = last_successful_tool.unwrap_or("none");
+    let modified_files = if modified_files.is_empty() {
+        "[]".to_owned()
+    } else {
+        format!("[{}]", modified_files.join(","))
+    };
     format!(
-        "model_behavior_abort: stopped after {repeated_count} repeated malformed {tool} calls ({kind}). The failing patch was not applied. Earlier successful tool calls, if any, already ran and remain in the workspace and run tape; inspect the run tape or continue in the same session with a narrower repair prompt.",
+        "model_behavior_abort: stopped after {repeated_count} repeated malformed {tool} calls ({kind}). The failing patch was not applied. recovery_state={{last_successful_tool:{last_successful_tool},modified_files:{modified_files},resume_hint:continue_same_session_with_narrow_patch}}. Earlier successful tool calls, if any, already ran and remain in the workspace and run tape; inspect the run tape or continue in the same session with a narrower repair prompt.",
         tool = signature.tool_name,
         kind = signature.failure_kind,
     )
@@ -3690,6 +3785,82 @@ mod tests {
         assert!(failure.message.contains("workspace_patch_parse.expected_begin_patch"));
     }
 
+    #[test]
+    fn repeated_tool_failure_tracker_resets_after_successful_patch_recovery() {
+        let malformed = workspace_patch_parse_error_tool_message(
+            "toolu_patch_01",
+            "palyra.fs.apply_patch failed: patch parse error at line 3, column 1: expected '*** End Patch'",
+            "Remove any duplicate terminator or text after the final '*** End Patch', then retry with one complete patch.",
+        );
+        let successful_patch = successful_tool_message(
+            "toolu_patch_02",
+            crate::gateway::WORKSPACE_PATCH_TOOL_NAME,
+            json!({
+                "files_touched": [
+                    {"path": "src/lib.rs"}
+                ]
+            }),
+        );
+        let mut tracker = RepeatedToolFailureTracker::default();
+
+        assert!(tracker.observe(std::slice::from_ref(&malformed)).is_none());
+        assert!(tracker.observe(std::slice::from_ref(&malformed)).is_none());
+        assert!(tracker.observe(std::slice::from_ref(&successful_patch)).is_none());
+        assert!(tracker.observe(std::slice::from_ref(&malformed)).is_none());
+        assert!(tracker.observe(std::slice::from_ref(&malformed)).is_none());
+        let failure = tracker
+            .observe(std::slice::from_ref(&malformed))
+            .expect("a new contiguous episode can still terminate after success reset");
+
+        assert!(failure.message.contains("last_successful_tool:palyra.fs.apply_patch"));
+        assert!(failure.message.contains("modified_files:[src/lib.rs]"));
+        assert!(failure.message.contains("resume_hint:continue_same_session_with_narrow_patch"));
+    }
+
+    #[test]
+    fn repeated_tool_failure_tracker_resets_after_successful_os_file_write() {
+        let malformed = workspace_patch_parse_error_tool_message(
+            "toolu_patch_01",
+            "palyra.fs.apply_patch failed: patch parse error at line 3, column 1: expected '*** End Patch'",
+            "Remove any duplicate terminator or text after the final '*** End Patch', then retry with one complete patch.",
+        );
+        let successful_write = successful_tool_message(
+            "toolu_os_file_01",
+            crate::gateway::OS_FILE_TOOL_NAME,
+            json!({"path": "C:/work/output.txt"}),
+        );
+        let mut tracker = RepeatedToolFailureTracker::default();
+
+        assert!(tracker.observe(std::slice::from_ref(&malformed)).is_none());
+        assert!(tracker.observe(std::slice::from_ref(&successful_write)).is_none());
+        assert!(tracker.observe(std::slice::from_ref(&malformed)).is_none());
+        assert!(tracker.observe(std::slice::from_ref(&malformed)).is_none());
+
+        assert!(
+            tracker.observe(std::slice::from_ref(&malformed)).is_some(),
+            "third malformed patch after the os-file recovery starts a fresh episode"
+        );
+    }
+
+    #[test]
+    fn repeated_tool_failure_tracker_does_not_count_noncontiguous_signatures() {
+        let expected_end = workspace_patch_parse_error_tool_message(
+            "toolu_patch_01",
+            "palyra.fs.apply_patch failed: patch parse error at line 3, column 1: expected '*** End Patch'",
+            "Remove any duplicate terminator or text after the final '*** End Patch', then retry with one complete patch.",
+        );
+        let expected_begin = workspace_patch_parse_error_tool_message(
+            "toolu_patch_02",
+            "palyra.fs.apply_patch failed: patch parse error at line 1, column 1: expected '*** Begin Patch'",
+            "Start the patch with exactly '*** Begin Patch' on its own line, not a Markdown-decorated variant.",
+        );
+        let mut tracker = RepeatedToolFailureTracker::default();
+
+        assert!(tracker.observe(std::slice::from_ref(&expected_end)).is_none());
+        assert!(tracker.observe(std::slice::from_ref(&expected_begin)).is_none());
+        assert!(tracker.observe(std::slice::from_ref(&expected_end)).is_none());
+    }
+
     fn workspace_patch_parse_error_tool_message(
         proposal_id: &str,
         error: &str,
@@ -3708,6 +3879,23 @@ mod tests {
                     },
                     "recovery_hint": recovery_hint
                 }
+            })
+            .to_string(),
+        )
+    }
+
+    fn successful_tool_message(
+        proposal_id: &str,
+        tool_name: &str,
+        output: Value,
+    ) -> ProviderMessage {
+        ProviderMessage::tool_result(
+            proposal_id,
+            json!({
+                "success": true,
+                "tool_name": tool_name,
+                "error": "",
+                "output": output
             })
             .to_string(),
         )
