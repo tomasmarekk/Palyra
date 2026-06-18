@@ -58,6 +58,7 @@ pub(crate) enum AgentLoopTerminationReason {
     RepeatedToolFailure,
     BrowserFollowupTimeout,
     ToolFollowupTimeout,
+    RunLoopPhaseTimeout,
 }
 
 impl AgentLoopTerminationReason {
@@ -77,6 +78,7 @@ impl AgentLoopTerminationReason {
             Self::RepeatedToolFailure => "repeated_tool_failure",
             Self::BrowserFollowupTimeout => "browser_followup_timeout",
             Self::ToolFollowupTimeout => "tool_followup_timeout",
+            Self::RunLoopPhaseTimeout => "run_loop_phase_timeout",
         }
     }
 
@@ -98,6 +100,7 @@ impl AgentLoopTerminationReason {
                     | Self::IncompleteFinalAnswer
                     | Self::BrowserFollowupTimeout
                     | Self::ToolFollowupTimeout
+                    | Self::RunLoopPhaseTimeout
             )
     }
 }
@@ -1576,6 +1579,37 @@ mod tests {
         assert_eq!(parsed["finalization"]["partial"], true);
         assert_eq!(parsed["finalization"]["continuation_required"], true);
         assert_eq!(parsed["finalization"]["tool_count"], 1);
+    }
+
+    #[test]
+    fn loop_state_marks_run_loop_phase_timeout_after_tools_as_needs_continuation() {
+        let mut state = AgentRunLoopState::new(
+            vec![ProviderMessage::user_text("create files and run tests")],
+            2,
+            1,
+            10_000,
+        );
+        state.append_tool_result_messages(vec![ProviderMessage::tool_result(
+            "call-01",
+            r#"{"ok":true}"#,
+        )]);
+
+        let payload = state.termination_payload(
+            "run-01",
+            AgentLoopTerminationReason::RunLoopPhaseTimeout,
+            "Partial result: tool catalog snapshot timed out.",
+            None,
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(payload.as_str()).expect("termination payload should be JSON");
+
+        assert_eq!(parsed["termination_reason"], "run_loop_phase_timeout");
+        assert_eq!(parsed["finalization"]["status"], "needs_continuation");
+        assert_eq!(parsed["finalization"]["reason_code"], "run_loop_phase_timeout");
+        assert_eq!(parsed["finalization"]["partial"], true);
+        assert_eq!(parsed["finalization"]["continuation_required"], true);
+        assert_eq!(parsed["finalization"]["tool_count"], 1);
+        assert!(parsed["finalization"]["progress_checkpoint"].is_object());
     }
 
     #[test]

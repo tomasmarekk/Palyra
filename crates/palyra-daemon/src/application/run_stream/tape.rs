@@ -1192,6 +1192,11 @@ fn needs_continuation_reason_code(message: &str) -> &'static str {
     {
         return "tool_followup_timeout";
     }
+    if lower.contains("reason_code=run_loop_phase_timeout")
+        || lower.contains("agent loop phase timed out")
+    {
+        return "run_loop_phase_timeout";
+    }
     "agent_loop_budget_exhausted"
 }
 

@@ -13,7 +13,7 @@
 //! the run terminates with a `needs_continuation` summary that points back at
 //! the run tape.
 
-use std::{sync::Arc, time::Duration};
+use std::{future::Future, sync::Arc, time::Duration};
 
 use serde_json::{json, Value};
 use tokio::{
@@ -88,6 +88,7 @@ const BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS: u64 = 60_000;
 // `in_progress` on generic provider heartbeats until the broad provider
 // deadline, with no actionable stall diagnostic for the operator.
 const TOOL_FOLLOWUP_PROVIDER_TIMEOUT_MS: u64 = 120_000;
+const TOOL_CATALOG_SNAPSHOT_PHASE_TIMEOUT_MS: u64 = 30_000;
 const MAX_BROWSER_FOLLOWUP_RECOVERY_ATTEMPTS: u8 = 1;
 const MAX_LENGTH_RECOVERY_ATTEMPTS: u8 = 3;
 
@@ -143,6 +144,36 @@ pub(crate) enum ProviderRequestTimeoutReason {
     BrowserFollowup,
     /// The bounded follow-up deadline after non-browser tool results.
     ToolFollowup,
+}
+
+/// Agent-loop phase covered by a local deadline before the provider watchdog starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunLoopPhase {
+    ToolCatalogSnapshot,
+}
+
+impl RunLoopPhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ToolCatalogSnapshot => "tool_catalog_snapshot",
+        }
+    }
+}
+
+/// Result of a phase-deadline guarded operation.
+#[derive(Debug, Clone)]
+enum RunLoopPhaseOutcome<T> {
+    Completed(T),
+    TimedOut { phase: RunLoopPhase, elapsed_ms: u64, timeout_ms: u64, message: String },
+    Cancelled,
+}
+
+struct RunLoopPhaseDeadlineContext<'a> {
+    sender: &'a mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
+    runtime_state: &'a Arc<GatewayRuntimeState>,
+    run_state: &'a mut RunStateMachine,
+    run_id: &'a str,
+    tape_seq: &'a mut i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -320,6 +351,111 @@ fn provider_request_deadline_attempt_count(
 
 fn duration_millis_u64(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn tool_catalog_snapshot_phase_timeout() -> Duration {
+    test_override_duration_ms(
+        "PALYRA_TEST_RUN_STREAM_TOOL_CATALOG_TIMEOUT_MS",
+        TOOL_CATALOG_SNAPSHOT_PHASE_TIMEOUT_MS,
+    )
+}
+
+fn phase_heartbeat_interval(timeout: Duration) -> Duration {
+    let half_timeout_ms = duration_millis_u64(timeout).saturating_div(2).max(1);
+    Duration::from_millis(half_timeout_ms.min(PROVIDER_PROGRESS_HEARTBEAT_MS))
+}
+
+fn run_loop_phase_waiting_status_message(
+    phase: RunLoopPhase,
+    elapsed_ms: u64,
+    timeout_ms: u64,
+) -> String {
+    format!(
+        "progress:agent_loop.phase_waiting phase={} elapsed_ms={elapsed_ms} timeout_ms={timeout_ms}",
+        phase.as_str()
+    )
+}
+
+fn run_loop_phase_timeout_message(
+    run_id: &str,
+    phase: RunLoopPhase,
+    elapsed_ms: u64,
+    timeout_ms: u64,
+) -> String {
+    format!(
+        "agent loop phase timed out before provider response: phase={} run_id={run_id} elapsed_ms={elapsed_ms} timeout_ms={timeout_ms}. Inspect run tape and retry after checking daemon logs.",
+        phase.as_str()
+    )
+}
+
+fn run_loop_phase_timeout_partial_summary(
+    phase: RunLoopPhase,
+    message: &str,
+    loop_state: &AgentRunLoopState,
+    run_id: &str,
+) -> String {
+    let tool_count = loop_state.completed_tool_calls();
+    let tool_label = if tool_count == 1 { "tool call" } else { "tool calls" };
+    format!(
+        "Partial result: I ran {tool_count} {tool_label}, but the run loop timed out in phase {} before the next provider response. Last issue: {}. The run tape for {run_id} contains the exact tool evidence. Resume this same session and reference run {run_id} if any requested artifact, validation, cleanup, or final summary is still missing.",
+        phase.as_str(),
+        truncate_with_ellipsis(message.trim().replace(['\r', '\n'], " "), 512)
+    )
+}
+
+fn run_loop_phase_timeout_payload(
+    run_id: &str,
+    phase: RunLoopPhase,
+    elapsed_ms: u64,
+    timeout_ms: u64,
+    loop_state: &AgentRunLoopState,
+) -> String {
+    let checkpoint = (loop_state.completed_tool_calls() > 0).then(|| {
+        serde_json::from_str::<Value>(
+            loop_state
+                .progress_checkpoint_json(run_id, AgentLoopTerminationReason::RunLoopPhaseTimeout)
+                .as_str(),
+        )
+        .unwrap_or_else(|_| json!({ "serialization": "failed" }))
+    });
+    let snapshot =
+        loop_state.snapshot(run_id, Some(AgentLoopTerminationReason::RunLoopPhaseTimeout));
+    serde_json::to_string(&json!({
+        "schema_version": 1,
+        "event": "agent_loop.phase_timeout",
+        "run_id": run_id,
+        "phase": phase.as_str(),
+        "elapsed_ms": elapsed_ms,
+        "timeout_ms": timeout_ms,
+        "completed_tool_calls": snapshot.completed_tool_calls,
+        "turn_index": snapshot.current_turn,
+        "last_checkpoint": checkpoint,
+    }))
+    .unwrap_or_else(|_| "{}".to_owned())
+}
+
+fn record_run_progress_heartbeat(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    summary: &str,
+) {
+    runtime_state.record_self_healing_heartbeat(WorkHeartbeatUpdate {
+        kind: WorkHeartbeatKind::Run,
+        object_id: run_id.to_owned(),
+        summary: format!("run {run_id} {summary}"),
+    });
+}
+
+fn test_override_duration_ms(_env_name: &str, default_ms: u64) -> Duration {
+    #[cfg(debug_assertions)]
+    {
+        if let Ok(raw) = std::env::var(_env_name) {
+            if let Ok(parsed) = raw.parse::<u64>() {
+                return Duration::from_millis(parsed.max(1));
+            }
+        }
+    }
+    Duration::from_millis(default_ms.max(1))
 }
 
 fn provider_request_timeout_status(run_id: &str, timeout: Duration) -> Status {
@@ -740,12 +876,90 @@ async fn execute_run_stream_provider_request(
                         provider_deadline_timeout,
                         provider_timeout,
                     );
-                    send_status_with_tape(
+                    send_run_loop_status_with_tape(
                         sender,
                         runtime_state,
                         run_id,
                         tape_seq,
-                        common_v1::stream_status::StatusKind::InProgress,
+                        message.as_str(),
+                    )
+                    .await?;
+                }
+            }
+        }
+    }
+}
+
+// Protects short pre-provider phases after `agent_loop.turn_started`. Without
+// this guard, a stalled catalog build can leave the user at the previous
+// turn-started status and never reach the provider watchdog.
+#[allow(clippy::result_large_err)]
+async fn run_with_phase_deadline<T, F>(
+    context: RunLoopPhaseDeadlineContext<'_>,
+    phase: RunLoopPhase,
+    timeout: Duration,
+    operation: F,
+) -> Result<RunLoopPhaseOutcome<T>, Status>
+where
+    F: Future<Output = Result<T, Status>>,
+{
+    let RunLoopPhaseDeadlineContext { sender, runtime_state, run_state, run_id, tape_seq } =
+        context;
+    let timeout = timeout.max(Duration::from_millis(1));
+    let mut operation = Box::pin(operation);
+    let started_at = TokioInstant::now();
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    let mut cancel_poll = interval(Duration::from_millis(100));
+    cancel_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let heartbeat_every = phase_heartbeat_interval(timeout);
+    let mut progress_heartbeat =
+        interval_at(TokioInstant::now() + heartbeat_every, heartbeat_every);
+    progress_heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            result = &mut operation => {
+                return result.map(RunLoopPhaseOutcome::Completed);
+            }
+            _ = &mut deadline => {
+                let elapsed_ms = duration_millis_u64(started_at.elapsed());
+                let timeout_ms = duration_millis_u64(timeout);
+                let message = run_loop_phase_timeout_message(run_id, phase, elapsed_ms, timeout_ms);
+                return Ok(RunLoopPhaseOutcome::TimedOut {
+                    phase,
+                    elapsed_ms,
+                    timeout_ms,
+                    message,
+                });
+            }
+            _ = cancel_poll.tick() => {
+                match runtime_state.is_orchestrator_cancel_requested(run_id.to_owned()).await {
+                    Ok(true) => {
+                        transition_run_stream_to_cancelled(
+                            sender,
+                            runtime_state,
+                            run_state,
+                            run_id,
+                            tape_seq,
+                        )
+                        .await?;
+                        return Ok(RunLoopPhaseOutcome::Cancelled);
+                    }
+                    Ok(false) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            _ = progress_heartbeat.tick() => {
+                if run_state.state() == RunLifecycleState::InProgress {
+                    let elapsed_ms = duration_millis_u64(started_at.elapsed());
+                    let timeout_ms = duration_millis_u64(timeout);
+                    let message = run_loop_phase_waiting_status_message(phase, elapsed_ms, timeout_ms);
+                    send_run_loop_status_with_tape(
+                        sender,
+                        runtime_state,
+                        run_id,
+                        tape_seq,
                         message.as_str(),
                     )
                     .await?;
@@ -788,7 +1002,7 @@ async fn ensure_run_stream_in_progress(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn build_and_record_run_stream_tool_catalog_snapshot(
+async fn build_run_stream_tool_catalog_snapshot(
     runtime_state: &Arc<GatewayRuntimeState>,
     request_context: &RequestContext,
     session_id: &str,
@@ -796,9 +1010,11 @@ async fn build_and_record_run_stream_tool_catalog_snapshot(
     provider_kind: &str,
     provider_model_id: Option<&str>,
     _remaining_tool_budget: u32,
-    tape_seq: &mut i64,
+    allow_test_delay: bool,
 ) -> Result<ModelVisibleToolCatalogSnapshot, Status> {
-    let snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
+    maybe_delay_run_stream_phase_for_tests(RunLoopPhase::ToolCatalogSnapshot, allow_test_delay)
+        .await;
+    Ok(build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
         config: &runtime_state.config.tool_call,
         browser_service_enabled: runtime_state.config.browser_service.enabled,
         request_context: &ToolRequestContext {
@@ -814,17 +1030,71 @@ async fn build_and_record_run_stream_tool_catalog_snapshot(
         surface: ToolExposureSurface::RunStream,
         remaining_tool_budget: None,
         created_at_unix_ms: current_unix_ms(),
-    });
+    }))
+}
+
+async fn record_run_stream_tool_catalog_snapshot(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    snapshot: &ModelVisibleToolCatalogSnapshot,
+) -> Result<(), Status> {
     runtime_state
         .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
             run_id: run_id.to_owned(),
             seq: *tape_seq,
             event_type: "tool_catalog_snapshot".to_owned(),
-            payload_json: tool_catalog_tape_payload(&snapshot),
+            payload_json: tool_catalog_tape_payload(snapshot),
         })
         .await?;
     *tape_seq = (*tape_seq).saturating_add(1);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_and_record_run_stream_tool_catalog_snapshot(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    request_context: &RequestContext,
+    session_id: &str,
+    run_id: &str,
+    provider_kind: &str,
+    provider_model_id: Option<&str>,
+    remaining_tool_budget: u32,
+    tape_seq: &mut i64,
+) -> Result<ModelVisibleToolCatalogSnapshot, Status> {
+    let snapshot = build_run_stream_tool_catalog_snapshot(
+        runtime_state,
+        request_context,
+        session_id,
+        run_id,
+        provider_kind,
+        provider_model_id,
+        remaining_tool_budget,
+        false,
+    )
+    .await?;
+    record_run_stream_tool_catalog_snapshot(runtime_state, run_id, tape_seq, &snapshot).await?;
     Ok(snapshot)
+}
+
+#[cfg(debug_assertions)]
+async fn maybe_delay_run_stream_phase_for_tests(phase: RunLoopPhase, is_follow_up_catalog: bool) {
+    if !is_follow_up_catalog {
+        return;
+    }
+    if std::env::var("PALYRA_TEST_RUN_STREAM_DELAY_PHASE").ok().as_deref() != Some(phase.as_str()) {
+        return;
+    }
+    let delay_ms = std::env::var("PALYRA_TEST_RUN_STREAM_DELAY_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1_000);
+    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+}
+
+#[cfg(not(debug_assertions))]
+async fn maybe_delay_run_stream_phase_for_tests(_phase: RunLoopPhase, _is_follow_up_catalog: bool) {
 }
 
 #[allow(clippy::result_large_err)]
@@ -848,12 +1118,12 @@ async fn append_agent_loop_tape_event(
 }
 
 #[allow(clippy::result_large_err)]
-async fn send_agent_loop_progress_status(
+async fn send_run_loop_status_with_tape(
     sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
     runtime_state: &Arc<GatewayRuntimeState>,
     run_id: &str,
     tape_seq: &mut i64,
-    phase: &str,
+    message: &str,
 ) -> Result<(), Status> {
     send_status_with_tape(
         sender,
@@ -861,6 +1131,26 @@ async fn send_agent_loop_progress_status(
         run_id,
         tape_seq,
         common_v1::stream_status::StatusKind::InProgress,
+        message,
+    )
+    .await?;
+    record_run_progress_heartbeat(runtime_state, run_id, message);
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+async fn send_agent_loop_progress_status(
+    sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    phase: &str,
+) -> Result<(), Status> {
+    send_run_loop_status_with_tape(
+        sender,
+        runtime_state,
+        run_id,
+        tape_seq,
         format!("progress:{phase}").as_str(),
     )
     .await
@@ -1503,20 +1793,152 @@ pub(crate) async fn process_run_stream_message(
         {
             snapshot
         } else {
-            build_and_record_run_stream_tool_catalog_snapshot(
+            send_agent_loop_progress_status(
+                sender,
                 runtime_state,
-                request_context,
-                session_id_for_message.as_str(),
                 run_id.as_str(),
-                lease_provider_kind.as_str(),
-                provider_model_override
-                    .as_deref()
-                    .or(Some(routing_decision.actual_model_id.as_str())),
-                0,
                 tape_seq,
+                "agent_loop.tool_catalog_snapshot.started",
+            )
+            .await?;
+            match run_with_phase_deadline(
+                RunLoopPhaseDeadlineContext {
+                    sender,
+                    runtime_state,
+                    run_state,
+                    run_id: run_id.as_str(),
+                    tape_seq,
+                },
+                RunLoopPhase::ToolCatalogSnapshot,
+                tool_catalog_snapshot_phase_timeout(),
+                build_run_stream_tool_catalog_snapshot(
+                    runtime_state,
+                    request_context,
+                    session_id_for_message.as_str(),
+                    run_id.as_str(),
+                    lease_provider_kind.as_str(),
+                    provider_model_override
+                        .as_deref()
+                        .or(Some(routing_decision.actual_model_id.as_str())),
+                    0,
+                    true,
+                ),
             )
             .await?
+            {
+                RunLoopPhaseOutcome::Completed(snapshot) => {
+                    record_run_stream_tool_catalog_snapshot(
+                        runtime_state,
+                        run_id.as_str(),
+                        tape_seq,
+                        &snapshot,
+                    )
+                    .await?;
+                    send_agent_loop_progress_status(
+                        sender,
+                        runtime_state,
+                        run_id.as_str(),
+                        tape_seq,
+                        "agent_loop.tool_catalog_snapshot.applied",
+                    )
+                    .await?;
+                    snapshot
+                }
+                RunLoopPhaseOutcome::TimedOut { phase, elapsed_ms, timeout_ms, message } => {
+                    append_agent_loop_tape_event(
+                        runtime_state,
+                        run_id.as_str(),
+                        tape_seq,
+                        "agent_loop.phase_timeout",
+                        run_loop_phase_timeout_payload(
+                            run_id.as_str(),
+                            phase,
+                            elapsed_ms,
+                            timeout_ms,
+                            &loop_state,
+                        ),
+                    )
+                    .await?;
+                    let timeout_phase = format!(
+                        "agent_loop.phase_timeout phase={} timeout_ms={timeout_ms}",
+                        phase.as_str()
+                    );
+                    send_agent_loop_progress_status(
+                        sender,
+                        runtime_state,
+                        run_id.as_str(),
+                        tape_seq,
+                        timeout_phase.as_str(),
+                    )
+                    .await?;
+                    if loop_state.completed_tool_calls() > 0 {
+                        let fallback_summary = run_loop_phase_timeout_partial_summary(
+                            phase,
+                            message.as_str(),
+                            &loop_state,
+                            run_id.as_str(),
+                        );
+                        send_deferred_final_reply_tokens(
+                            sender,
+                            runtime_state,
+                            request_context,
+                            session_id_for_message.as_str(),
+                            run_id.as_str(),
+                            tape_seq,
+                            model_token_tape_events,
+                            model_token_compaction_emitted,
+                            fallback_summary.as_str(),
+                        )
+                        .await?;
+                        terminate_run_stream_with_agent_loop_reason(
+                            sender,
+                            runtime_state,
+                            run_state,
+                            run_id.as_str(),
+                            tape_seq,
+                            &loop_state,
+                            AgentLoopTerminationReason::RunLoopPhaseTimeout,
+                            fallback_summary.as_str(),
+                            None,
+                        )
+                        .await?;
+                        return Ok(RunStreamMessageProcessingOutcome::Terminate);
+                    }
+                    terminate_run_stream_with_agent_loop_reason(
+                        sender,
+                        runtime_state,
+                        run_state,
+                        run_id.as_str(),
+                        tape_seq,
+                        &loop_state,
+                        AgentLoopTerminationReason::RunLoopPhaseTimeout,
+                        message.as_str(),
+                        None,
+                    )
+                    .await?;
+                    return Err(Status::deadline_exceeded(message));
+                }
+                RunLoopPhaseOutcome::Cancelled => {
+                    return Ok(RunStreamMessageProcessingOutcome::Terminate);
+                }
+            }
         };
+        append_agent_loop_tape_event(
+            runtime_state,
+            run_id.as_str(),
+            tape_seq,
+            "agent_loop.provider_request_preparing",
+            loop_state.turn_payload(run_id.as_str(), "agent_loop.provider_request_preparing"),
+        )
+        .await?;
+        send_agent_loop_progress_status(
+            sender,
+            runtime_state,
+            run_id.as_str(),
+            tape_seq,
+            "agent_loop.provider_request_preparing",
+        )
+        .await?;
         let mut provider_request = ProviderRequest::from_input_text(
             base_provider_request.input_text.clone(),
             base_provider_request.json_mode,
@@ -1576,6 +1998,22 @@ pub(crate) async fn process_run_stream_message(
         .or_else(|| {
             tool_followup_deadline_override(pending_tool_followup_deadline, &runtime_state.config)
         });
+        append_agent_loop_tape_event(
+            runtime_state,
+            run_id.as_str(),
+            tape_seq,
+            "agent_loop.provider_request_ready",
+            loop_state.turn_payload(run_id.as_str(), "agent_loop.provider_request_ready"),
+        )
+        .await?;
+        send_agent_loop_progress_status(
+            sender,
+            runtime_state,
+            run_id.as_str(),
+            tape_seq,
+            "agent_loop.provider_request_ready",
+        )
+        .await?;
         pending_browser_followup_deadline = false;
         pending_tool_followup_deadline = false;
         let provider_response = match execute_run_stream_provider_request(
@@ -3368,17 +3806,21 @@ mod tests {
         effective_provider_request_deadline, final_answer_recovery_fallback_summary,
         final_answer_recovery_prompt, incomplete_final_answer_without_tools,
         incomplete_terminal_final_answer, is_browser_tool_name,
-        is_run_stream_response_channel_closed, length_recovery_prompt,
+        is_run_stream_response_channel_closed, length_recovery_prompt, phase_heartbeat_interval,
         provider_error_partial_summary, provider_model_override_for_routing,
         provider_request_deadline_timeout, provider_request_timeout_message,
         provider_request_timeout_status, provider_timeout_termination_reason,
         provider_waiting_status_message, repeated_tool_failure_signature,
+        run_loop_phase_timeout_message, run_loop_phase_timeout_partial_summary,
+        run_loop_phase_timeout_payload, run_loop_phase_waiting_status_message,
         should_emit_budget_exhausted_partial_summary, terminal_tool_authorization_failure,
-        tool_calls_finish_without_tool_payload, tool_followup_timeout_partial_summary,
-        tool_result_to_provider_message, truncated_final_answer_without_tools,
-        ProviderRequestDeadlineOverride, ProviderRequestTimeoutReason, RepeatedToolFailureTracker,
+        tool_calls_finish_without_tool_payload, tool_catalog_snapshot_phase_timeout,
+        tool_followup_timeout_partial_summary, tool_result_to_provider_message,
+        truncated_final_answer_without_tools, ProviderRequestDeadlineOverride,
+        ProviderRequestTimeoutReason, RepeatedToolFailureTracker, RunLoopPhase,
         RunStreamToolResultForModel, BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS,
-        MAX_LENGTH_RECOVERY_ATTEMPTS, TOOL_FOLLOWUP_PROVIDER_TIMEOUT_MS,
+        MAX_LENGTH_RECOVERY_ATTEMPTS, TOOL_CATALOG_SNAPSHOT_PHASE_TIMEOUT_MS,
+        TOOL_FOLLOWUP_PROVIDER_TIMEOUT_MS,
     };
     use super::{AgentLoopTerminationReason, AgentRunLoopState};
     use crate::application::run_stream::tape::RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE;
@@ -3648,6 +4090,52 @@ mod tests {
         assert!(message.contains("waiting for post-tool model response"));
         assert!(message.contains("tool_followup_deadline=true"));
         assert!(message.contains("provider_attempt_timeout_ms=180000"));
+    }
+
+    #[test]
+    fn tool_catalog_snapshot_phase_timeout_uses_bounded_default() {
+        assert_eq!(
+            tool_catalog_snapshot_phase_timeout(),
+            Duration::from_millis(TOOL_CATALOG_SNAPSHOT_PHASE_TIMEOUT_MS)
+        );
+        assert_eq!(
+            phase_heartbeat_interval(Duration::from_millis(30_000)),
+            Duration::from_millis(15_000)
+        );
+        assert_eq!(
+            phase_heartbeat_interval(Duration::from_millis(60_000)),
+            Duration::from_millis(20_000)
+        );
+    }
+
+    #[test]
+    fn run_loop_phase_waiting_status_is_machine_readable() {
+        let message = run_loop_phase_waiting_status_message(
+            RunLoopPhase::ToolCatalogSnapshot,
+            15_000,
+            30_000,
+        );
+
+        assert_eq!(
+            message,
+            "progress:agent_loop.phase_waiting phase=tool_catalog_snapshot elapsed_ms=15000 timeout_ms=30000"
+        );
+    }
+
+    #[test]
+    fn run_loop_phase_timeout_status_is_actionable() {
+        let message = run_loop_phase_timeout_message(
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            RunLoopPhase::ToolCatalogSnapshot,
+            30_001,
+            30_000,
+        );
+
+        assert!(message.contains("agent loop phase timed out before provider response"));
+        assert!(message.contains("phase=tool_catalog_snapshot"));
+        assert!(message.contains("timeout_ms=30000"));
+        assert!(message.contains("01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+        assert!(message.contains("Inspect run tape"));
     }
 
     #[test]
@@ -4006,6 +4494,49 @@ mod tests {
         assert!(message.contains("exact tool evidence"));
         assert!(message.contains("Resume this same session"));
         assert!(message.contains("01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+    }
+
+    #[test]
+    fn phase_timeout_after_tool_evidence_emits_needs_continuation_checkpoint() {
+        let state = loop_state_after_tool("create files and run tests", "palyra.fs.apply_patch");
+        let partial = run_loop_phase_timeout_partial_summary(
+            RunLoopPhase::ToolCatalogSnapshot,
+            "agent loop phase timed out before provider response: phase=tool_catalog_snapshot",
+            &state,
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        );
+        let message = agent_loop_terminal_status_message(
+            AgentLoopTerminationReason::RunLoopPhaseTimeout,
+            &state,
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            partial.as_str(),
+        );
+
+        assert!(message.contains("Partial result: I ran 1 tool call"));
+        assert!(message.contains("run loop timed out in phase tool_catalog_snapshot"));
+        assert!(message.contains("needs_continuation=true"));
+        assert!(message.contains("reason_code=run_loop_phase_timeout"));
+        assert!(message.contains("run_progress_checkpoint="));
+    }
+
+    #[test]
+    fn run_loop_phase_timeout_payload_includes_checkpoint_after_tool_evidence() {
+        let state = loop_state_after_tool("create files and run tests", "palyra.fs.apply_patch");
+        let payload = run_loop_phase_timeout_payload(
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            RunLoopPhase::ToolCatalogSnapshot,
+            30_001,
+            30_000,
+            &state,
+        );
+        let parsed: Value =
+            serde_json::from_str(payload.as_str()).expect("phase timeout payload should be JSON");
+
+        assert_eq!(parsed["event"], "agent_loop.phase_timeout");
+        assert_eq!(parsed["phase"], "tool_catalog_snapshot");
+        assert_eq!(parsed["completed_tool_calls"], 1);
+        assert_eq!(parsed["timeout_ms"], 30_000);
+        assert_eq!(parsed["last_checkpoint"]["run_id"], "01ARZ3NDEKTSV4RRFFQ69G5FAV");
     }
 
     #[test]

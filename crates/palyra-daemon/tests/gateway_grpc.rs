@@ -5830,6 +5830,263 @@ async fn grpc_run_stream_reports_partial_summary_when_provider_timeout_follows_t
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn grpc_run_stream_times_out_when_tool_catalog_snapshot_stalls_after_turn_started(
+) -> Result<()> {
+    let response_body =
+        openai_tool_call_response("palyra.echo", &serde_json::json!({ "text": "hello" }))?;
+    let (openai_base_url, request_count, server_handle) =
+        spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(200, response_body)])?;
+    let (child, admin_port, grpc_port, _journal_db_path) =
+        spawn_palyrad_with_openai_provider_and_tool_policy_with_provider_timeout_and_env(
+            openai_base_url.as_str(),
+            OPENAI_API_KEY,
+            "palyra.echo",
+            2,
+            250,
+            2_000,
+            &[
+                ("PALYRA_TEST_RUN_STREAM_DELAY_PHASE", "tool_catalog_snapshot"),
+                ("PALYRA_TEST_RUN_STREAM_DELAY_MS", "1000"),
+                ("PALYRA_TEST_RUN_STREAM_TOOL_CATALOG_TIMEOUT_MS", "250"),
+            ],
+        )?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+
+    let mut stream_request =
+        tonic::Request::new(tokio_stream::iter(vec![sample_run_stream_request_with_text(
+            "call echo, then summarize the result".to_owned(),
+        )]));
+    stream_request.metadata_mut().insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
+    stream_request.metadata_mut().insert("x-palyra-principal", "user:ops".parse()?);
+    stream_request.metadata_mut().insert("x-palyra-device-id", DEVICE_ID.parse()?);
+    stream_request.metadata_mut().insert("x-palyra-channel", "cli".parse()?);
+
+    let mut response_stream =
+        client.run_stream(stream_request).await.context("failed to call RunStream")?.into_inner();
+    let mut model_tokens = Vec::new();
+    let mut progress_statuses = Vec::new();
+    let mut failed_messages = Vec::new();
+    loop {
+        let Some(event) = tokio::time::timeout(Duration::from_secs(5), response_stream.next())
+            .await
+            .context("run stream hung while waiting for phase timeout")?
+        else {
+            break;
+        };
+        let event = event.context("run stream should end with status events, not a gRPC error")?;
+        if let Some(body) = event.body {
+            match body {
+                common_v1::run_stream_event::Body::ModelToken(token) => {
+                    model_tokens.push(token.token);
+                }
+                common_v1::run_stream_event::Body::Status(status)
+                    if status.kind == common_v1::stream_status::StatusKind::InProgress as i32 =>
+                {
+                    progress_statuses.push(status.message);
+                }
+                common_v1::run_stream_event::Body::Status(status)
+                    if status.kind == common_v1::stream_status::StatusKind::Failed as i32 =>
+                {
+                    failed_messages.push(status.message);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let rendered = model_tokens.concat();
+    assert!(rendered.contains("Partial result"), "phase timeout summary missing: {rendered}");
+    assert!(
+        rendered.contains("run loop timed out in phase tool_catalog_snapshot"),
+        "phase timeout summary should name the stalled phase: {rendered}"
+    );
+    assert!(
+        progress_statuses
+            .iter()
+            .any(|status| status == "progress:agent_loop.tool_catalog_snapshot.started"),
+        "stream should expose tool catalog phase start: {progress_statuses:?}"
+    );
+    assert!(
+        progress_statuses.iter().any(|status| {
+            status.starts_with("progress:agent_loop.phase_waiting phase=tool_catalog_snapshot")
+        }),
+        "stream should expose phase waiting heartbeat: {progress_statuses:?}"
+    );
+    assert!(
+        progress_statuses.iter().any(|status| {
+            status.starts_with(
+                "progress:agent_loop.phase_timeout phase=tool_catalog_snapshot timeout_ms=250",
+            )
+        }),
+        "stream should expose phase timeout status: {progress_statuses:?}"
+    );
+    assert!(
+        failed_messages.iter().any(|message| {
+            message.contains("needs_continuation=true")
+                && message.contains("reason_code=run_loop_phase_timeout")
+                && message.contains("run_progress_checkpoint=")
+        }),
+        "failed status should carry continuation checkpoint: {failed_messages:?}"
+    );
+
+    let run_snapshot = admin_get_json_async(admin_port, format!("/admin/v1/runs/{RUN_ID}")).await?;
+    assert_eq!(
+        run_snapshot.get("state").and_then(Value::as_str),
+        Some("failed"),
+        "run must not remain in_progress after phase timeout"
+    );
+    let tape_snapshot =
+        admin_get_json_async(admin_port, format!("/admin/v1/runs/{RUN_ID}/tape")).await?;
+    let events = tape_snapshot
+        .get("events")
+        .and_then(Value::as_array)
+        .context("run tape snapshot missing events")?;
+    let phase_timeout_payload = events
+        .iter()
+        .find(|event| {
+            event.get("event_type").and_then(Value::as_str) == Some("agent_loop.phase_timeout")
+        })
+        .and_then(|event| event.get("payload_json").and_then(Value::as_str))
+        .context("run tape should include agent_loop.phase_timeout event")?;
+    let phase_timeout: Value = serde_json::from_str(phase_timeout_payload)
+        .context("phase timeout payload must be JSON")?;
+    assert_eq!(phase_timeout["phase"], "tool_catalog_snapshot");
+    assert_eq!(phase_timeout["completed_tool_calls"], 1);
+    assert_eq!(phase_timeout["timeout_ms"], 250);
+    assert_eq!(
+        request_count.load(Ordering::Relaxed),
+        1,
+        "stall before provider request must not send a second provider request"
+    );
+
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_run_stream_cancel_preempts_phase_guard_after_turn_started() -> Result<()> {
+    let response_body =
+        openai_tool_call_response("palyra.echo", &serde_json::json!({ "text": "hello" }))?;
+    let (openai_base_url, request_count, server_handle) =
+        spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(200, response_body)])?;
+    let (child, admin_port, grpc_port, _journal_db_path) =
+        spawn_palyrad_with_openai_provider_and_tool_policy_with_provider_timeout_and_env(
+            openai_base_url.as_str(),
+            OPENAI_API_KEY,
+            "palyra.echo",
+            2,
+            250,
+            2_000,
+            &[
+                ("PALYRA_TEST_RUN_STREAM_DELAY_PHASE", "tool_catalog_snapshot"),
+                ("PALYRA_TEST_RUN_STREAM_DELAY_MS", "5000"),
+                ("PALYRA_TEST_RUN_STREAM_TOOL_CATALOG_TIMEOUT_MS", "5000"),
+            ],
+        )?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+
+    let mut stream_request =
+        tonic::Request::new(tokio_stream::iter(vec![sample_run_stream_request_with_text(
+            "call echo, then wait for cancellation".to_owned(),
+        )]));
+    stream_request.metadata_mut().insert("authorization", format!("Bearer {ADMIN_TOKEN}").parse()?);
+    stream_request.metadata_mut().insert("x-palyra-principal", "user:ops".parse()?);
+    stream_request.metadata_mut().insert("x-palyra-device-id", DEVICE_ID.parse()?);
+    stream_request.metadata_mut().insert("x-palyra-channel", "cli".parse()?);
+
+    let mut response_stream =
+        client.run_stream(stream_request).await.context("failed to call RunStream")?.into_inner();
+    loop {
+        let Some(event) = tokio::time::timeout(Duration::from_secs(5), response_stream.next())
+            .await
+            .context("run stream did not reach phase guard before cancellation")?
+        else {
+            anyhow::bail!("run stream ended before tool catalog snapshot phase started");
+        };
+        let event = event.context("failed to read RunStream event before cancellation")?;
+        if let Some(common_v1::run_stream_event::Body::Status(status)) = event.body {
+            if status.message == "progress:agent_loop.tool_catalog_snapshot.started" {
+                break;
+            }
+        }
+    }
+
+    let cancel_started_at = Instant::now();
+    let cancel_snapshot = admin_post_json_async(
+        admin_port,
+        format!("/admin/v1/runs/{RUN_ID}/cancel"),
+        serde_json::json!({ "reason": "integration_cancel_during_phase_guard" }),
+    )
+    .await?;
+    assert_eq!(
+        cancel_snapshot.get("cancel_requested").and_then(Value::as_bool),
+        Some(true),
+        "admin cancel endpoint should persist cancel flag during phase guard"
+    );
+
+    let mut saw_failed = false;
+    loop {
+        let Some(event) = tokio::time::timeout(Duration::from_secs(2), response_stream.next())
+            .await
+            .context("run stream did not terminate quickly after phase guard cancellation")?
+        else {
+            break;
+        };
+        let event = event.context("failed to read RunStream event after cancellation")?;
+        if let Some(common_v1::run_stream_event::Body::Status(status)) = event.body {
+            if status.kind == common_v1::stream_status::StatusKind::Failed as i32 {
+                saw_failed = true;
+                break;
+            }
+        }
+    }
+
+    assert!(
+        cancel_started_at.elapsed() < Duration::from_secs(2),
+        "cancel should preempt phase guard before timeout"
+    );
+    assert!(saw_failed, "cancelled run should emit failed status");
+    assert_eq!(
+        request_count.load(Ordering::Relaxed),
+        1,
+        "phase guard cancellation must not trigger another provider request"
+    );
+    let run_snapshot = admin_get_json_async(admin_port, format!("/admin/v1/runs/{RUN_ID}")).await?;
+    assert_eq!(
+        run_snapshot.get("state").and_then(Value::as_str),
+        Some("cancelled"),
+        "cancelled phase guard run must not be rewritten as failed timeout"
+    );
+    let tape_snapshot =
+        admin_get_json_async(admin_port, format!("/admin/v1/runs/{RUN_ID}/tape")).await?;
+    let events = tape_snapshot
+        .get("events")
+        .and_then(Value::as_array)
+        .context("run tape snapshot missing events")?;
+    assert!(
+        !events.iter().any(|event| {
+            event.get("event_type").and_then(Value::as_str) == Some("agent_loop.phase_timeout")
+        }),
+        "cancel preemption must not record a phase timeout"
+    );
+
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn grpc_run_stream_stops_after_repeated_length_recovery_with_tool_evidence() -> Result<()> {
     let first_response = serde_json::json!({
         "choices": [{
@@ -11254,6 +11511,26 @@ fn spawn_palyrad_with_openai_provider_and_tool_policy_with_provider_timeout(
     execution_timeout_ms: u64,
     provider_request_timeout_ms: u64,
 ) -> Result<(Child, u16, u16, PathBuf)> {
+    spawn_palyrad_with_openai_provider_and_tool_policy_with_provider_timeout_and_env(
+        openai_base_url,
+        openai_api_key,
+        allowed_tools,
+        max_calls_per_run,
+        execution_timeout_ms,
+        provider_request_timeout_ms,
+        &[],
+    )
+}
+
+fn spawn_palyrad_with_openai_provider_and_tool_policy_with_provider_timeout_and_env(
+    openai_base_url: &str,
+    openai_api_key: &str,
+    allowed_tools: &str,
+    max_calls_per_run: u32,
+    execution_timeout_ms: u64,
+    provider_request_timeout_ms: u64,
+    extra_env: &[(&str, &str)],
+) -> Result<(Child, u16, u16, PathBuf)> {
     spawn_palyrad_with_openai_provider_and_tool_policy_with_execution_gate_rollout_retries_and_console(
         openai_base_url,
         openai_api_key,
@@ -11264,6 +11541,7 @@ fn spawn_palyrad_with_openai_provider_and_tool_policy_with_provider_timeout(
         0,
         None,
         Some(provider_request_timeout_ms),
+        extra_env,
     )
 }
 
@@ -11286,6 +11564,7 @@ fn spawn_palyrad_with_openai_provider_and_tool_policy_with_execution_gate_rollou
         max_retries,
         None,
         None,
+        &[],
     )
 }
 
@@ -11308,6 +11587,7 @@ fn spawn_palyrad_with_openai_provider_tool_policy_and_console_principal(
         0,
         Some(bound_console_principal),
         None,
+        &[],
     )
 }
 
@@ -11322,6 +11602,7 @@ fn spawn_palyrad_with_openai_provider_and_tool_policy_with_execution_gate_rollou
     max_retries: u32,
     bound_console_principal: Option<&str>,
     provider_request_timeout_ms: Option<u64>,
+    extra_env: &[(&str, &str)],
 ) -> Result<(Child, u16, u16, PathBuf)> {
     let config_path = write_base_daemon_config()?;
     let journal_db_path = unique_temp_journal_db_path();
@@ -11372,6 +11653,9 @@ fn spawn_palyrad_with_openai_provider_and_tool_policy_with_execution_gate_rollou
     }
     if let Some(timeout_ms) = provider_request_timeout_ms {
         command.env("PALYRA_MODEL_PROVIDER_REQUEST_TIMEOUT_MS", timeout_ms.to_string());
+    }
+    for (key, value) in extra_env {
+        command.env(key, value);
     }
     let mut child = command
         .env("RUST_LOG", "info")

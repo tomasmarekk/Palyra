@@ -17,6 +17,7 @@
         "harness_path_runtime",
         "harness_tool_output_streaming",
         "harness_resume_state",
+        "harness_run_loop_recovery",
         "harness_background_handoff",
         "harness_runtime_risk_posture",
         "harness_workspace_recovery",
@@ -38,6 +39,7 @@
         "harness_path_runtime",
         "harness_tool_output_streaming",
         "harness_resume_state",
+        "harness_run_loop_recovery",
         "harness_background_handoff",
         "harness_runtime_risk_posture",
         "harness_workspace_recovery",
@@ -90,6 +92,10 @@
     {
       "id": "harness_resume_state",
       "summary": "Auto-resume checkpoints preserve produced/missing artifacts, failed attempts, and background process state across runtime interruptions."
+    },
+    {
+      "id": "harness_run_loop_recovery",
+      "summary": "Run-stream phase watchdogs keep post-tool provider turns from stalling silently after agent-loop turn start."
     },
     {
       "id": "harness_background_handoff",
@@ -627,6 +633,32 @@
         "--lib",
         "--locked",
         "application::run_stream::agent_loop::tests::progress_checkpoint_reports_background_process_state_after_wall_clock",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "id": "harness_run_loop_phase_timeout",
+      "label": "Agent run loop phase timeouts terminate silent post-tool stalls",
+      "category": "harness",
+      "profiles": [
+        "fast",
+        "full"
+      ],
+      "subsystems": [
+        "harness_run_loop_recovery"
+      ],
+      "chaos": false,
+      "acceptance_scenarios": [],
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "palyra-daemon",
+        "--lib",
+        "--locked",
+        "application::run_stream::orchestration::tests::phase_timeout_after_tool_evidence_emits_needs_continuation_checkpoint",
         "--",
         "--exact",
         "--test-threads=1"
